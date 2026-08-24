@@ -1,0 +1,35 @@
+{
+  "name": "bb-plugin-provider-agy",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Run bb threads with agy, the Antigravity CLI.",
+  "engines": {
+    "bb": ">=0.39",
+    "bbPluginSdk": ">=0.4.8"
+  },
+  "bb": {
+    "name": "Antigravity provider",
+    "description": "Run bb threads with agy, the Antigravity CLI.",
+    "branding": {
+      "icon": "./icons/agy.svg"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "host": "./host.ts"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.8",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "@types/react": "^19.0.0"
+  }
+}
