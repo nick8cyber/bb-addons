@@ -181,3 +181,57 @@ bb thread output <thread>
 - **Reasoning levels** are folded into agy's `low|medium|high`, and because
   every model id already names one, the picker's level is effectively ignored
   when a model is selected.
+
+## `write_to_file` and `ArtifactMetadata` (agy 1.1.19)
+
+`write_to_file` is two tools behind one name. Called with
+`TargetFile`/`CodeContent` it writes into the workspace. The moment the model
+*also* emits an `ArtifactMetadata` field, agy validates `TargetFile` against the
+conversation's artifact directory and the turn dies before the tool runs:
+
+```
+declaring permissions: cortex tool write_to_file: convert tool call for
+permissions: model output error: invalid tool call error (invalid_args)
+<project path> is not a valid artifact path; artifacts must be in
+~/.gemini/antigravity-cli/brain/<conversation>/
+```
+
+What it is **not** about, all four ruled out by measurement:
+
+* `--add-dir` — the refused turn was spawned with `--add-dir` on the project
+  root (pid 463863: `--add-dir /home/ubuntu/work/sandbox`) and the target was
+  `/home/ubuntu/work/sandbox/bb-addons/.../QuickFavoritesAction.tsx`, inside it;
+* the process cwd — it was the project root too (`/proc/463863/cwd`);
+* worktrees — the thread ran in `Working locally`, not in a worktree;
+* the file being new — the refused call had `Overwrite: true` on a file that
+  existed, and a fresh conversation creates
+  `deep/nested/src/Foo.tsx` happily.
+
+The refused args and a successful one differ by exactly one field
+(conversation 693cd8c3 step 109 versus 14cd35c2 step 3):
+
+```
+refused:  {"ArtifactMetadata":{…}, "CodeContent":…, "Overwrite":true, "TargetFile":"/home/ubuntu/work/sandbox/…/QuickFavoritesAction.tsx", …}
+accepted: {                        "CodeContent":…, "Overwrite":true, "TargetFile":"/home/ubuntu/work/agyfix/deep/nested/src/Foo.tsx",   …}
+```
+
+`--mode accept-edits` does not help; seven of the conversations on this host
+have hit it, always on `.tsx` files. The model does not learn from the refusal:
+thr_54vswmyikz produced the identical refusal on three consecutive user turns.
+
+Twice measured, the refused call was a **duplicate**: the model wrote the file
+correctly and then emitted the artifact-shaped call that killed the turn, so the
+work was already on disk. That is what the bridge leans on:
+
+1. one re-drive per refused turn, telling the model to look at the named file
+   and to say so if it is already right (`writeRetryNudge`);
+2. a turn that streamed an answer settles as **completed** — agy is reporting
+   one rejected tool call as the turn's status, and failing it would kill a live
+   thread over finished work;
+3. a turn that answered nothing still fails, with the cause spelled out;
+4. every later turn of that session carries a one-line rule against
+   `ArtifactMetadata` (`WRITE_GUARDRAIL`).
+
+`node harness-artifact.mjs` drives all three shapes against a fake agy, for free.
+An existing thread keeps the bridge build its own worker process was started
+with, so the fix reaches a running thread only after that session restarts.

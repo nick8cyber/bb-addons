@@ -193,6 +193,16 @@ interface Turn {
   toolErrors: Set<string>;
   /** A tool step settled after one of `toolErrors` — the agent recovered. */
   toolRecovered: boolean;
+  /**
+   * How many times this turn was re-driven after agy refused a `write_to_file`
+   * as an artifact write (see ARTIFACT_PATH_REFUSAL).
+   */
+  artifactRetries: number;
+  /**
+   * The turn streamed assistant text. An artifact refusal on a turn that
+   * answered is agy talking about one rejected tool call, not about the turn.
+   */
+  producedText: boolean;
 }
 
 /** What a child was spawned with, kept so a dead one can be rebuilt. */
@@ -223,6 +233,13 @@ interface Session {
   lastFailure: string | null;
   /** agy's own last words, which usually name the real cause. */
   lastStderr: string | null;
+  /**
+   * Set once this conversation has produced an artifact-shaped
+   * `write_to_file`; every later turn then carries WRITE_GUARDRAIL so the
+   * model does not repeat it. Off by default: a session that never hit the
+   * bug pays nothing and is never told about a field it was not using.
+   */
+  writeGuardrail: boolean;
 }
 
 const sessions = new Map<string, Session>();
@@ -545,6 +562,7 @@ function handleStepUpdate(
     });
   }
   if (event.textDelta !== null && event.textDelta.length > 0) {
+    turn.producedText = true;
     item.text += event.textDelta;
     emit(session, {
       type: "item/agentMessage/delta",
@@ -575,6 +593,108 @@ function closeOpenItems(session: Session, turn: Turn): void {
     });
     turn.items.delete(stepIndex);
   }
+}
+
+/**
+ * agy's `write_to_file` is two tools behind one name. With
+ * `TargetFile`/`CodeContent` it writes into the workspace; the moment the
+ * model also emits `ArtifactMetadata`, agy's permission converter validates
+ * `TargetFile` against the conversation's artifact directory and the turn dies
+ * before the tool ever runs:
+ *
+ *   declaring permissions: cortex tool write_to_file: convert tool call for
+ *   permissions: model output error: invalid tool call error (invalid_args)
+ *   <project path> is not a valid artifact path; artifacts must be in
+ *   ~/.gemini/antigravity-cli/brain/<conversation>/
+ *
+ * Confirmed on thread thr_54vswmyikz / conversation 693cd8c3: the refused call
+ * carried `ArtifactMetadata` plus a perfectly good absolute `TargetFile` under
+ * the project root, and the same model writes the same file happily when the
+ * field is absent. It is not about `--add-dir`, the cwd, a worktree, or the
+ * file being new — both were right in that thread. And the model does not
+ * learn: three consecutive user turns produced the identical refusal.
+ *
+ * There is no back channel to fix the tool call, so the bridge does the only
+ * thing it can: re-drive the turn with the field named, and keep naming it for
+ * the rest of the session.
+ */
+const ARTIFACT_PATH_REFUSAL = /is not a valid artifact path/u;
+
+/**
+ * Re-drives per turn. One, not more: the re-drive exists to make the model
+ * LOOK at the file, and measured against agy 1.1.19 the refusal comes back on
+ * the re-drive too (the rejected call is replayed while permissions are
+ * declared) even when the model answers correctly. A second re-drive buys
+ * another refusal and another slice of the quota.
+ */
+const MAX_ARTIFACT_RETRIES = 1;
+
+/**
+ * Sent as its own turn to unstick a refused write.
+ *
+ * It leads with "check the file", not "write it again", because the refused
+ * call is usually a duplicate: measured twice against agy 1.1.19 (files
+ * Qux.tsx and Quux.tsx under a probe workspace), the model wrote the file
+ * correctly and THEN emitted the artifact-shaped call that killed the turn —
+ * the work was already on disk. Telling it to check first lets the turn finish
+ * on the truth instead of rewriting a file that is already right, and it still
+ * names the working call shape for the case where nothing landed.
+ */
+function writeRetryNudge(path: string | null): string {
+  const target = path === null ? "the file it was writing" : path;
+  return (
+    `Your last write_to_file was rejected before it ran: the call carried an ` +
+    `ArtifactMetadata field, so agy validated TargetFile against the artifact ` +
+    `brain directory instead of the workspace. Look at ${target} on disk now. ` +
+    `If it already has the content you intended, say so in one line and stop. ` +
+    `If it does not, write it with write_to_file carrying only TargetFile, ` +
+    `CodeContent, Overwrite and Description — no ArtifactMetadata — or with ` +
+    `replace_file_content. Do not ask for confirmation.`
+  );
+}
+
+/** The path agy named in the refusal, so the nudge can point at it. */
+function artifactRefusalPath(message: string | null): string | null {
+  const match = /(\S+) is not a valid artifact path/u.exec(message ?? "");
+  return match?.[1] ?? null;
+}
+
+/** Prefixed to later turns of a session that already hit the refusal. */
+const WRITE_GUARDRAIL =
+  "[workspace rule] When you write files with write_to_file, never include " +
+  "ArtifactMetadata: this session is editing a real workspace, and that field " +
+  "makes agy reject the call as an artifact write.";
+
+function isArtifactPathRefusal(message: string | null): boolean {
+  return message !== null && ARTIFACT_PATH_REFUSAL.test(message);
+}
+
+/**
+ * Put the refused turn back at the head of the queue and drive it again. The
+ * turn keeps its id and its clientRequestId, so bb sees one turn that took a
+ * little longer rather than a failure followed by a mystery turn.
+ */
+function retryArtifactRefusal(
+  session: Session,
+  turn: Turn,
+  refusalPath: string | null,
+): boolean {
+  const child = session.child;
+  if (child === null || session.turns.length > 0) {
+    // With another turn already queued behind this one, agy has its stdin
+    // line and will answer it first: a nudge appended now would be matched
+    // against the wrong turn. Fail honestly instead of mis-threading.
+    return false;
+  }
+  turn.artifactRetries += 1;
+  session.writeGuardrail = true;
+  session.turns.unshift(turn);
+  log(
+    `turn ${turn.turnId}: agy refused a write_to_file as an artifact write; ` +
+      `re-driving it (attempt ${turn.artifactRetries} of ${MAX_ARTIFACT_RETRIES})`,
+  );
+  child.stdin.write(agyUserMessageLine(writeRetryNudge(refusalPath)));
+  return true;
 }
 
 /** One `result` per input line: this bridge's turn boundary. */
@@ -620,11 +740,31 @@ function handleResult(
   // thread on work that succeeded, so it settles as completed and the tool
   // error stays visible as the `provider/raw` step that carried it.
   const recovered =
-    event.error !== null &&
-    turn.toolErrors.has(event.error) &&
-    turn.toolRecovered;
+    (event.error !== null &&
+      turn.toolErrors.has(event.error) &&
+      turn.toolRecovered) ||
+    // An artifact refusal on a turn that streamed an answer: agy ran the turn
+    // to its response and is reporting one rejected tool call as the turn's
+    // status. Measured on agy 1.1.19 (conversation c1c61bae): the re-driven
+    // turn answered "the file already contains the intended content", the file
+    // on disk was correct, and the result still came back ERROR with this
+    // refusal. Failing that kills a live thread over work that is done - and
+    // it is what killed thr_54vswmyikz three turns running.
+    (isArtifactPathRefusal(event.error) &&
+      turn.producedText &&
+      turn.artifactRetries > 0);
   const failed =
     event.status !== null && event.status !== "SUCCESS" && !recovered;
+  if (
+    failed &&
+    isArtifactPathRefusal(event.error) &&
+    turn.artifactRetries < MAX_ARTIFACT_RETRIES &&
+    retryArtifactRefusal(session, turn, artifactRefusalPath(event.error))
+  ) {
+    // The turn is live again: no turn/completed, and the next `result`
+    // settles it. Items opened before the refusal are already closed.
+    return;
+  }
   if (recovered) {
     log(
       `turn ${turn.turnId}: agy reported a recovered tool error as the turn's ` +
@@ -632,9 +772,22 @@ function handleResult(
     );
   }
   if (failed) {
-    const message = event.error ?? `agy turn ended with status ${
+    let message = event.error ?? `agy turn ended with status ${
       event.status ?? "unknown"
     }`;
+    if (isArtifactPathRefusal(event.error)) {
+      // Only reachable when the turn produced no text at all: a turn that
+      // answered settles as completed above.
+      // Exhausted the re-drives. Say what happened in words the reader can
+      // act on, and do not claim the work is undone: the refused call is
+      // often a duplicate of a write that already landed.
+      message +=
+        ` — agy refused its own write_to_file call because the call carried` +
+        ` an ArtifactMetadata field (an agy bug, not a permission and not a` +
+        ` workspace problem). The bridge re-drove the turn and it still` +
+        ` produced no answer. Check the file named above on disk: a write` +
+        ` earlier in the same turn may have already landed.`;
+    }
     emit(session, {
       type: "provider/error",
       ...base(session),
@@ -719,7 +872,13 @@ function enqueueTurn(session: Session, turn: Turn): void {
   if (wasIdle) {
     emitTurnStarted(session, turn);
   }
-  child.stdin.write(agyUserMessageLine(turn.prompt));
+  child.stdin.write(
+    agyUserMessageLine(
+      session.writeGuardrail
+        ? `${WRITE_GUARDRAIL}\n\n${turn.prompt}`
+        : turn.prompt,
+    ),
+  );
 }
 
 function createTurn(args: {
@@ -735,6 +894,8 @@ function createTurn(args: {
     itemOrdinal: 0,
     toolErrors: new Set<string>(),
     toolRecovered: false,
+    artifactRetries: 0,
+    producedText: false,
   };
 }
 
@@ -863,6 +1024,7 @@ const handlers: Record<string, RequestHandler> = {
       },
       lastFailure: null,
       lastStderr: null,
+      writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
     if (data.input !== undefined && data.input.length > 0) {
@@ -928,6 +1090,7 @@ const handlers: Record<string, RequestHandler> = {
       },
       lastFailure: null,
       lastStderr: null,
+      writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
     startChild({
