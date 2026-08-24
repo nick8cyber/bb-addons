@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /usr/bin/node ~/dev/bb-plugin-provider-agy/fake-agy.mjs "$@"
+exec /usr/bin/node <workspace>/bb-addons/plugins/bb-plugin-provider-agy/fake-agy.mjs "$@"
