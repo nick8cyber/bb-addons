@@ -1,0 +1,290 @@
+/* Arctic Ledger — a quiet, high-contrast blue light palette for bb.
+ * It also includes a matching dark appearance for automatic mode switching. */
+
+:root,
+.light {
+  --canvas: #ffffff;
+  --ink: #14213d;
+  --background: #ffffff;
+  --card: #edf2f8;
+  --popover: #ffffff;
+  --secondary: #e2eaf4;
+  --accent: #cfdef0;
+  --muted: #b9cce1;
+  --input: #9fb8d1;
+  --surface-recessed: #e8f0f8;
+  --surface-recessed-solid: #e8f0f8;
+  --surface-recessed-soft-solid: #f1f5fa;
+  --surface-raised: #ffffff;
+  --surface-raised-solid: #ffffff;
+  --surface-scrim: #e8f0f9e8;
+  --agent-surface-background: #f2f6fb;
+  --agent-surface-border: #c4d4e5;
+  --state-hover: #dce8f5;
+  --state-active: #bfd7ee;
+  --surface-selected: #c6ddf3;
+  --surface-selected-border: #5b8fbd;
+  --border-seam: #d0dbe7;
+  --border-seam-vertical: #c2d1e0;
+  --border: #afc2d5;
+  --border-hairline: #98b0c7;
+  --foreground: #14213d;
+  --muted-foreground: #284665;
+  --readback-foreground: #496784;
+  --subtle-foreground: #667f99;
+  --accent-foreground: #14213d;
+  --secondary-foreground: #1c3856;
+  --primary: #1b5a96;
+  --primary-foreground: #ffffff;
+  --timeline-accent: #1b5a96;
+  --file-accent: #1b5a96;
+  --ring: #2e77b3;
+  --sidebar-ring: #9bc7ee;
+  --sidebar-search-match: #6289ba;
+  --sidebar-search-match-border: #a7cdf0;
+  --resource-source-shelf-card-hover-border: #5b8fbd;
+  --destructive: #b4233c;
+  --destructive-foreground: #ffffff;
+  --destructive-text: #a61b34;
+  --warning: #9a6500;
+  --warning-text: #875900;
+  --attention: #9a6500;
+  --success: #197447;
+  --success-foreground: #ffffff;
+  --diff-added: #197447;
+  --diff-removed: #b4233c;
+  --pr-merged: #6941a5;
+  --surface-destructive: #fcebed;
+  --surface-destructive-border: #e99ba7;
+  --surface-attention: #fff4d8;
+  /* Screenshot reference: the navigation is a clearly separate indigo rail,
+   * with a soft cornflower-blue current selection. */
+  --sidebar: #2d4477;
+  --sidebar-foreground: #e2eafa;
+  --sidebar-accent: #7fa8d3;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #20355f;
+  --pill-surface: linear-gradient(to bottom, #ffffff, #f3f8fd);
+  --pill-surface-border: #c7d8e9;
+  --pill-foreground: #1c3856;
+  --pill-icon: #496784;
+  --pill-surface-selected: linear-gradient(to bottom, #dcecfb, #d3e5f7);
+  --pill-surface-selected-border: #8eb5dc;
+  --ansi-0: #edf4fb; --ansi-1: #b4233c; --ansi-2: #197447; --ansi-3: #9a6500;
+  --ansi-4: #1d6099; --ansi-5: #6941a5; --ansi-6: #087e8b; --ansi-7: #385575;
+  --ansi-8: #7189a3; --ansi-9: #d13b54; --ansi-10: #27875a; --ansi-11: #b67700;
+  --ansi-12: #2877b4; --ansi-13: #835db5; --ansi-14: #0a94a4; --ansi-15: #172b4d;
+  --ansi-bg-fg-0: #172b4d; --ansi-bg-fg-1: #ffffff; --ansi-bg-fg-2: #ffffff;
+  --ansi-bg-fg-3: #172b4d; --ansi-bg-fg-4: #ffffff; --ansi-bg-fg-5: #ffffff;
+  --ansi-bg-fg-6: #ffffff; --ansi-bg-fg-7: #ffffff; --ansi-bg-fg-8: #172b4d;
+  --ansi-bg-fg-9: #ffffff; --ansi-bg-fg-10: #ffffff; --ansi-bg-fg-11: #172b4d;
+  --ansi-bg-fg-12: #ffffff; --ansi-bg-fg-13: #ffffff; --ansi-bg-fg-14: #ffffff;
+  --ansi-bg-fg-15: #ffffff;
+  --diffs-addition-color-override: #197447;
+  --diffs-deletion-color-override: #b4233c;
+  --diffs-modified-color-override: #9a6500;
+  --diffs-bg-context-override: #f7faff;
+  --diffs-bg-context-gutter-override: #edf4fb;
+  --diffs-bg-buffer-override: #edf4fb;
+  --diffs-bg-separator-override: #d9e4f0;
+  --diffs-bg-addition-override: #e5f5ec;
+  --diffs-bg-addition-emphasis-override: #cdebd9;
+  --diffs-bg-deletion-override: #fcebed;
+  --diffs-bg-deletion-emphasis-override: #f7d0d7;
+  --diffs-bg-hover-override: #e6f0fa;
+  --diffs-bg-selection-override: #cfe2f5;
+  --diffs-bg-addition-number-override: #edf4fb;
+  --diffs-bg-deletion-number-override: #edf4fb;
+  --diffs-bg-selection-number-override: #dceaf8;
+  --diffs-fg-number-override: #55708e;
+  --diffs-fg-number-addition-override: #197447;
+  --diffs-fg-number-deletion-override: #b4233c;
+  --diffs-fg-conflict-marker-override: #9a6500;
+  --trees-status-added-override: #197447;
+  --trees-status-untracked-override: #197447;
+  --trees-status-renamed-override: #197447;
+  --trees-status-modified-override: #9a6500;
+  --trees-status-deleted-override: #b4233c;
+  --trees-status-ignored-override: #7189a3;
+  --trees-input-bg-override: #ffffff;
+  --trees-accent-override: #1b5a96;
+  --trees-indent-guide-bg-override: #afc2d5;
+  --trees-fg-muted-override: #496784;
+  --trees-focus-ring-color-override: #2e77b3;
+  --trees-file-icon-color: #496784;
+  --trees-file-icon-vermilion: #496784;
+  --trees-file-icon-cyan: #496784;
+}
+
+.dark {
+  --canvas: #101c2c;
+  --ink: #e3effc;
+  --background: #101c2c;
+  --card: #0c1624;
+  --popover: #142235;
+  --secondary: #1b3048;
+  --accent: #24415f;
+  --muted: #34516f;
+  --input: #42617f;
+  --surface-recessed: #142235;
+  --surface-recessed-solid: #142235;
+  --surface-recessed-soft-solid: #17283d;
+  --surface-raised: #1b3048;
+  --surface-raised-solid: #1b3048;
+  --surface-scrim: #09111de8;
+  --agent-surface-background: #142235;
+  --agent-surface-border: #26415e;
+  --state-hover: #1d344d;
+  --state-active: #294967;
+  --surface-selected: #203b58;
+  --surface-selected-border: #5889b7;
+  --border-seam: #203750;
+  --border-seam-vertical: #29435e;
+  --border: #304d69;
+  --border-hairline: #3e5e7b;
+  --foreground: #e3effc;
+  --muted-foreground: #bfd0e2;
+  --readback-foreground: #91a9c2;
+  --subtle-foreground: #6d87a2;
+  --accent-foreground: #e3effc;
+  --secondary-foreground: #d6e5f3;
+  --primary: #73b8ee;
+  --primary-foreground: #0b1a2a;
+  --timeline-accent: #73b8ee;
+  --file-accent: #73b8ee;
+  --ring: #8cc8f5;
+  --sidebar-ring: #8cc8f5;
+  --sidebar-search-match: #2c5f8d;
+  --sidebar-search-match-border: #548fbe;
+  --resource-source-shelf-card-hover-border: #5889b7;
+  --destructive: #f17d91;
+  --destructive-foreground: #0b1a2a;
+  --destructive-text: #ff9dad;
+  --warning: #f0bf6c;
+  --warning-text: #f5cc7c;
+  --attention: #f0bf6c;
+  --success: #65c795;
+  --success-foreground: #0b1a2a;
+  --diff-added: #65c795;
+  --diff-removed: #f17d91;
+  --pr-merged: #c5a4f4;
+  --surface-destructive: #532938;
+  --surface-destructive-border: #985064;
+  --surface-attention: #45371f;
+  --sidebar: #0c1624;
+  --sidebar-foreground: #bfd0e2;
+  --sidebar-accent: #1b3048;
+  --sidebar-accent-foreground: #e3effc;
+  --sidebar-border: #203750;
+  --pill-surface: linear-gradient(to bottom, #1b3048, #162940);
+  --pill-surface-border: #304d69;
+  --pill-foreground: #e3effc;
+  --pill-icon: #bfd0e2;
+  --pill-surface-selected: linear-gradient(to bottom, #294967, #24415f);
+  --pill-surface-selected-border: #5889b7;
+  --ansi-0: #0c1624; --ansi-1: #f17d91; --ansi-2: #65c795; --ansi-3: #f0bf6c;
+  --ansi-4: #73b8ee; --ansi-5: #c5a4f4; --ansi-6: #72d6df; --ansi-7: #bfd0e2;
+  --ansi-8: #6d87a2; --ansi-9: #ff9dad; --ansi-10: #87dda9; --ansi-11: #f5cc7c;
+  --ansi-12: #8cc8f5; --ansi-13: #d4bbf7; --ansi-14: #91e2e8; --ansi-15: #e3effc;
+  --ansi-bg-fg-0: #e3effc; --ansi-bg-fg-1: #0b1a2a; --ansi-bg-fg-2: #0b1a2a;
+  --ansi-bg-fg-3: #0b1a2a; --ansi-bg-fg-4: #0b1a2a; --ansi-bg-fg-5: #0b1a2a;
+  --ansi-bg-fg-6: #0b1a2a; --ansi-bg-fg-7: #0b1a2a; --ansi-bg-fg-8: #e3effc;
+  --ansi-bg-fg-9: #0b1a2a; --ansi-bg-fg-10: #0b1a2a; --ansi-bg-fg-11: #0b1a2a;
+  --ansi-bg-fg-12: #0b1a2a; --ansi-bg-fg-13: #0b1a2a; --ansi-bg-fg-14: #0b1a2a;
+  --ansi-bg-fg-15: #0b1a2a;
+  --diffs-addition-color-override: #65c795;
+  --diffs-deletion-color-override: #f17d91;
+  --diffs-modified-color-override: #f0bf6c;
+  --diffs-bg-context-override: #101c2c;
+  --diffs-bg-context-gutter-override: #0c1624;
+  --diffs-bg-buffer-override: #0c1624;
+  --diffs-bg-separator-override: #203750;
+  --diffs-bg-addition-override: #1d493b;
+  --diffs-bg-addition-emphasis-override: #29634f;
+  --diffs-bg-deletion-override: #4d2734;
+  --diffs-bg-deletion-emphasis-override: #693243;
+  --diffs-bg-hover-override: #1d344d;
+  --diffs-bg-selection-override: #294967;
+  --diffs-bg-addition-number-override: #0c1624;
+  --diffs-bg-deletion-number-override: #0c1624;
+  --diffs-bg-selection-number-override: #1b3048;
+  --diffs-fg-number-override: #91a9c2;
+  --diffs-fg-number-addition-override: #65c795;
+  --diffs-fg-number-deletion-override: #f17d91;
+  --diffs-fg-conflict-marker-override: #f0bf6c;
+  --trees-status-added-override: #65c795;
+  --trees-status-untracked-override: #65c795;
+  --trees-status-renamed-override: #65c795;
+  --trees-status-modified-override: #f0bf6c;
+  --trees-status-deleted-override: #f17d91;
+  --trees-status-ignored-override: #6d87a2;
+  --trees-input-bg-override: #142235;
+  --trees-accent-override: #73b8ee;
+  --trees-indent-guide-bg-override: #304d69;
+  --trees-fg-muted-override: #91a9c2;
+  --trees-focus-ring-color-override: #8cc8f5;
+  --trees-file-icon-color: #91a9c2;
+  --trees-file-icon-vermilion: #91a9c2;
+  --trees-file-icon-cyan: #91a9c2;
+}
+
+diffs-container {
+  --diffs-light-bg: #f7faff;
+  --diffs-light: #172b4d;
+  --diffs-dark-bg: #101c2c;
+  --diffs-dark: #e3effc;
+}
+
+/* --sidebar is shared with xterm by BB. Preserve the reference's blue rail,
+ * while making terminal cells a deliberate dark, high-contrast code surface. */
+.xterm,
+.xterm .xterm-viewport,
+.xterm .xterm-screen {
+  background-color: #14213d !important;
+}
+
+.xterm .xterm-rows,
+.xterm .xterm-helper-textarea {
+  color: #e7f0fb !important;
+}
+
+/* bb's sidebar contains components that use global semantic tokens. Set the
+ * full semantic ladder on the actual sidebar containers, not on individual
+ * utility classes, so every label and icon gets the correct contrast. */
+[data-sidebar="sidebar"],
+.bg-sidebar {
+  --foreground: #edf4ff;
+  --secondary-foreground: #edf4ff;
+  --muted-foreground: #c8d8ed;
+  --readback-foreground: #b7cae2;
+  --subtle-foreground: #9fb6d1;
+  --success: #aee4c2;
+  --warning: #f6d486;
+  --destructive: #ffb1c0;
+  --state-active: #6f9dce;
+  --sidebar-accent: #6f9dce;
+}
+
+/* Selected rows must not inherit a low-emphasis foreground from their parent. */
+[data-sidebar="sidebar"] .bg-sidebar-accent,
+[data-sidebar="sidebar"] .bg-state-active,
+.bg-sidebar .bg-sidebar-accent,
+.bg-sidebar .bg-state-active {
+  --foreground: #ffffff;
+  --secondary-foreground: #ffffff;
+  --muted-foreground: #ffffff;
+  --readback-foreground: #ffffff;
+}
+
+/* The fixed sidebar trigger is rendered outside the sidebar DOM subtree. */
+[data-testid="app-sidebar-trigger-overlay"] {
+  color: #edf4ff;
+}
+
+/* BB marks the current thread with data-active rather than the colour utility
+ * classes used by ordinary menu items. Keep the selected row fully legible. */
+[data-sidebar="sidebar"] [data-sidebar="menu-button"][data-active="true"] {
+  background-color: #6f9dce;
+  color: #ffffff;
+}
+
