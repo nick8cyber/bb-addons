@@ -1,0 +1,787 @@
+[
+ {
+  "en": "browserTabs.length === 0 ? null : (",
+  "ru": "browserTabs.length === 0 ? null : (",
+  "context": "components/plugin/PluginPanelRightPanelHost.tsx"
+ },
+ {
+  "en": "buildDiffFileTarget(target, mergeBaseRef), [target, mergeBaseRef], ); return useMemo",
+  "ru": "buildDiffFileTarget(target, mergeBaseRef), [target, mergeBaseRef], ); return useMemo",
+  "context": "components/secondary-panel/git-diff/useDiffFileContentsRequester.ts"
+ },
+ {
+  "en": "buildMessageDirectiveRegistry(messageDirectiveSlots), [messageDirectiveSlots], ); const resolveSegmentLinkHref = useMemo",
+  "ru": "buildMessageDirectiveRegistry(messageDirectiveSlots), [messageDirectiveSlots], ); const resolveSegmentLinkHref = useMemo",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "buildQueuedMessagePreviewText(queuedMessage.content), [queuedMessage.content], ); return (",
+  "ru": "buildQueuedMessagePreviewText(queuedMessage.content), [queuedMessage.content], ); return (",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "buildRenderedFileChange(change), [change], ); const renderablePatch = renderedChange.renderablePatch; const cardPresentation = useMemo",
+  "ru": "buildRenderedFileChange(change), [change], ); const renderablePatch = renderedChange.renderablePatch; const cardPresentation = useMemo",
+  "context": "components/thread/timeline/TimelineFileDiffBlock.tsx"
+ },
+ {
+  "en": "can't be null at the call site.",
+  "ru": "не может быть null в точке вызова.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "candidate.chrome.pluginId === content.pluginId && candidate.chrome.path === content.panelPath, ); const panel = panelEntry?.panel ?? undefined; const panelChrome = panelEntry?.chrome; const body = (",
+  "ru": "candidate.chrome.pluginId === content.pluginId && candidate.chrome.path === content.panelPath, ); const panel = panelEntry?.panel ?? undefined; const panelChrome = panelEntry?.chrome; const body = (",
+  "context": "views/thread-detail/SplitThreadArea.tsx"
+ },
+ {
+  "en": "candidate.id === providerId, ); const ProviderIcon = getProviderIconInfo( providerId, providerInfo ?? null, )?.icon; return (",
+  "ru": "candidate.id === providerId, ); const ProviderIcon = getProviderIconInfo( providerId, providerInfo ?? null, )?.icon; return (",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "clampRange(range, text.length)) .filter((range): range is NonNullable",
+  "ru": "clampRange(range, text.length)) .filter((range): range is NonNullable",
+  "context": "components/sidebar/ThreadSearchResultRow.tsx"
+ },
+ {
+  "en": "clearThreadBannerActivity(thread, threadId, kind)), ); queryClient.setQueriesData",
+  "ru": "clearThreadBannerActivity(thread, threadId, kind)), ); queryClient.setQueriesData",
+  "context": "hooks/cache-owners/thread-runtime-cache-owner.ts"
+ },
+ {
+  "en": "collapsedSplitIndicator.miniMap ? (",
+  "ru": "collapsedSplitIndicator.miniMap ? (",
+  "context": "components/sidebar/SidebarSectionRow.tsx"
+ },
+ {
+  "en": "command, and a skill that teaches every agent to use it.",
+  "ru": "команду, а также навык, который научит каждого агента им пользоваться.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "connectedHostIds.includes(hostId)) : connectedHostIds; return (",
+  "ru": "connectedHostIds.includes(hostId)) : connectedHostIds; return (",
+  "context": "components/settings/InstallCliSkillsDialog.tsx"
+ },
+ {
+  "en": "const cart = makeCart([item]);",
+  "ru": "const cart = makeCart([item]);",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "createInitialFormState(questions), ); const [currentIndex, setCurrentIndex] = useState(0); const [activeInteractionId, setActiveInteractionId] = useState(interactionId); const rootRef = useRef",
+  "ru": "createInitialFormState(questions), ); const [currentIndex, setCurrentIndex] = useState(0); const [activeInteractionId, setActiveInteractionId] = useState(interactionId); const rootRef = useRef",
+  "context": "components/thread/user-questions/UserQuestionInteractionContent.tsx"
+ },
+ {
+  "en": "createPaneSecondaryPanelRegistry(), [], ); const routeThread = useMemo",
+  "ru": "createPaneSecondaryPanelRegistry(), [], ); const routeThread = useMemo",
+  "context": "views/thread-detail/SplitThreadArea.tsx"
+ },
+ {
+  "en": "currentHeight === nextHeight ? currentHeight : nextHeight, ); const list = listRef.current; const scroll = scrollRef.current; const editorElement = list?.querySelector",
+  "ru": "currentHeight === nextHeight ? currentHeight : nextHeight, ); const list = listRef.current; const scroll = scrollRef.current; const editorElement = list?.querySelector",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "currentProjects ? applyProjectToProjectList(currentProjects, project) : [project], ); queryClient.setQueryData",
+  "ru": "currentProjects ? applyProjectToProjectList(currentProjects, project) : [project], ); queryClient.setQueryData",
+  "context": "hooks/cache-owners/project-cache-owner.ts"
+ },
+ {
+  "en": "currentProjects ? removeProjectFromProjectList(currentProjects, projectId) : currentProjects, ); queryClient.setQueryData",
+  "ru": "currentProjects ? removeProjectFromProjectList(currentProjects, projectId) : currentProjects, ); queryClient.setQueryData",
+  "context": "hooks/cache-owners/project-cache-owner.ts"
+ },
+ {
+  "en": "emphasized.has(index) ? (",
+  "ru": "emphasized.has(index) ? (",
+  "context": "components/commands/CommandPalette.tsx"
+ },
+ {
+  "en": "enabled ? (",
+  "ru": "enabled ? (",
+  "context": "components/git-diff/PierreLineSelectionActions.tsx"
+ },
+ {
+  "en": "environmentLabel ? (",
+  "ru": "environmentLabel ? (",
+  "context": "views/thread-detail/ThreadDetailPromptArea.tsx"
+ },
+ {
+  "en": "extends ScrollOverflowSentinelRefs",
+  "ru": "extends ScrollOverflowSentinelRefs",
+  "context": "components/thread/timeline/useScrollOverflowState.ts"
+ },
+ {
+  "en": "file.path === scrollToPath); if (index",
+  "ru": "file.path === scrollToPath); if (index",
+  "context": "components/secondary-panel/git-diff/DiffFilesPanel.tsx"
+ },
+ {
+  "en": "fileRead",
+  "ru": "fileRead",
+  "context": "timeline-activity-intents.ts"
+ },
+ {
+  "en": "for src=\"[\"^]+",
+  "ru": "for src=\"[\"^]+",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "function adjacent(this: Element, ...nodes: Array",
+  "ru": "function adjacent(this: Element, ...nodes: Array",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "function append(this: ParentNode, ...nodes: Array",
+  "ru": "function append(this: ParentNode, ...nodes: Array",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "function replaceChildren( this: ParentNode, ...nodes: Array",
+  "ru": "function replaceChildren( this: ParentNode, ...nodes: Array",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "getBbDesktopInfo()); const [desktopInfo, setDesktopInfo] = useState",
+  "ru": "getBbDesktopInfo()); const [desktopInfo, setDesktopInfo] = useState",
+  "context": "hooks/useDesktopUpdateInfo.ts"
+ },
+ {
+  "en": "getDesktopBrowserApi(), []); const previousTabIdsRef = useRef",
+  "ru": "getDesktopBrowserApi(), []); const previousTabIdsRef = useRef",
+  "context": "components/secondary-panel/BrowserTabDeck.tsx"
+ },
+ {
+  "en": "getDesktopBrowserApi(), [], ); const contentRef = useRef",
+  "ru": "getDesktopBrowserApi(), [], ); const contentRef = useRef",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "group.phase !== null, ); if (groups.length === 0) return null; const runningKey = activePhaseKey(groups, currentPhaseIndex); return (",
+  "ru": "group.phase !== null, ); if (groups.length === 0) return null; const runningKey = activePhaseKey(groups, currentPhaseIndex); return (",
+  "context": "components/ui/workflow-progress.tsx"
+ },
+ {
+  "en": "handleOpenUrlByPreference(href), [handleOpenUrlByPreference], ); const handleTimelineTitleAction = useCallback",
+  "ru": "handleOpenUrlByPreference(href), [handleOpenUrlByPreference], ); const handleTimelineTitleAction = useCallback",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "hasAnyThreadMetadata(metadata, hasForks) ? (",
+  "ru": "hasAnyThreadMetadata(metadata, hasForks) ? (",
+  "context": "views/thread-detail/ThreadDetailSecondaryContent.tsx"
+ },
+ {
+  "en": "have been playing with doing tiling window management for agents conversations. it is a little too unhinged but i think there is something here.",
+  "ru": "играюсь с тайловым управлением окнами для диалогов агентов. это чересчур безумно, но мне кажется, тут что-то есть.",
+  "context": "blog/tweets.ts"
+ },
+ {
+  "en": "host.id === parsedEnvironment.hostId) ?? primaryHost) : primaryHost; const isLocalHost = selectedHost ? isLocalDaemonHost(selectedHost.id) : false; const machines = useMemo",
+  "ru": "host.id === parsedEnvironment.hostId) ?? primaryHost) : primaryHost; const isLocalHost = selectedHost ? isLocalDaemonHost(selectedHost.id) : false; const machines = useMemo",
+  "context": "components/promptbox/NewThreadPromptBox.tsx"
+ },
+ {
+  "en": "host.id === selectedHostId) ?? hosts[0]; return (",
+  "ru": "host.id === selectedHostId) ?? hosts[0]; return (",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "host.id), [hosts], ); const [selectedHostIds, setSelectedHostIds] = useState",
+  "ru": "host.id), [hosts], ); const [selectedHostIds, setSelectedHostIds] = useState",
+  "context": "components/settings/InstallCliSkillsDialog.tsx"
+ },
+ {
+  "en": "host.status === \"connected\", ).length; const projectPathDialog = useDialogState",
+  "ru": "host.status === \"connected\", ).length; const projectPathDialog = useDialogState",
+  "context": "hooks/useLocalPathPicker.tsx"
+ },
+ {
+  "en": "id !== inlineEditor.queuedMessageId) : combinedIds, [combinedIds, inlineEditor], ); const sortingStrategy = useCallback",
+  "ru": "id !== inlineEditor.queuedMessageId) : combinedIds, [combinedIds, inlineEditor], ); const sortingStrategy = useCallback",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "isRecentExpanded ? recentItems : recentItems.slice(0, THREAD_RECENT_ITEMS_VISIBLE_LIMIT), [isRecentExpanded, recentItems], ); const recentEntries = useMemo",
+  "ru": "isRecentExpanded ? recentItems : recentItems.slice(0, THREAD_RECENT_ITEMS_VISIBLE_LIMIT), [isRecentExpanded, recentItems], ); const recentEntries = useMemo",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "item, ); export const collapsedProjectIdsAtom = atomWithStorage",
+  "ru": "item, ); export const collapsedProjectIdsAtom = atomWithStorage",
+  "context": "components/sidebar/sidebarCollapsedAtoms.ts"
+ },
+ {
+  "en": "item.id === activeId); const sampledIndices = new Set",
+  "ru": "item.id === activeId); const sampledIndices = new Set",
+  "context": "components/thread/toc/ThreadTableOfContents.tsx"
+ },
+ {
+  "en": "items.map(getItemKey), [items]); const rowCountContext = useMemo",
+  "ru": "items.map(getItemKey), [items]); const rowCountContext = useMemo",
+  "context": "components/sidebar/ProjectRow.tsx"
+ },
+ {
+  "en": "layout === \"detail\" ? (",
+  "ru": "layout === \"detail\" ? (",
+  "context": "components/ui/resource/row.tsx"
+ },
+ {
+  "en": "left.index - right.index, ); return (",
+  "ru": "left.index - right.index, ); return (",
+  "context": "components/thread/timeline/TimelineWindowedItems.tsx"
+ },
+ {
+  "en": "makeAttachmentsConfig(), []); const history = useMemo",
+  "ru": "makeAttachmentsConfig(), []); const history = useMemo",
+  "context": "components/thread/timeline/StoryDraftPromptBox.tsx"
+ },
+ {
+  "en": "model.isDefault) ?? availableModels[0]; const reasoningOptions: PickerOption",
+  "ru": "model.isDefault) ?? availableModels[0]; const reasoningOptions: PickerOption",
+  "context": "hooks/thread-creation-options/model-catalog-selection.ts"
+ },
+ {
+  "en": "new Set()); const touchedThreadFieldsRef = useRef",
+  "ru": "new Set()); const touchedThreadFieldsRef = useRef",
+  "context": "hooks/useThreadCreationOptions.ts"
+ },
+ {
+  "en": "new Set(collapsedMachineKeyList), [collapsedMachineKeyList], ); const toggleMachineCollapsed = useCallback",
+  "ru": "new Set(collapsedMachineKeyList), [collapsedMachineKeyList], ); const toggleMachineCollapsed = useCallback",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "new Set(collapsedProjectIdList), [collapsedProjectIdList], ); const toggleProjectCollapsed = useCallback",
+  "ru": "new Set(collapsedProjectIdList), [collapsedProjectIdList], ); const toggleProjectCollapsed = useCallback",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "new Set(filePaths), [filePaths]); const filePathSetRef = useRef",
+  "ru": "new Set(filePaths), [filePaths]); const filePathSetRef = useRef",
+  "context": "components/secondary-panel/useThreadStorageBrowser.ts"
+ },
+ {
+  "en": "normalizePromptBlockquoteBoundaries(promptMentionSubstitution.content), [promptMentionSubstitution.content], ); const components = useMemo",
+  "ru": "normalizePromptBlockquoteBoundaries(promptMentionSubstitution.content), [promptMentionSubstitution.content], ); const components = useMemo",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "on the bb server&rsquo;s machine.",
+  "ru": "на машине сервера bb.",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "onBeginPaneDrag(paneId, event, label) : undefined, [onBeginPaneDrag, paneId], ); const secondaryPanelHost = useMemo",
+  "ru": "onBeginPaneDrag(paneId, event, label) : undefined, [onBeginPaneDrag, paneId], ); const secondaryPanelHost = useMemo",
+  "context": "views/thread-detail/SplitThreadArea.tsx"
+ },
+ {
+  "en": "opener.extensions))].sort(), [fileOpeners], ); if (extensions.length === 0) return null; return (",
+  "ru": "opener.extensions))].sort(), [fileOpeners], ); if (extensions.length === 0) return null; return (",
+  "context": "components/settings/FileOpenersSettingsSection.tsx"
+ },
+ {
+  "en": "opener.extensions.includes(extension)); const location = getExperimentalFileLocationStart(intent.location); return (",
+  "ru": "opener.extensions.includes(extension)); const location = getExperimentalFileLocationStart(intent.location); return (",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "option.environmentId === value) ?? null, [options, value], ); const triggerLabel = activeOption?.name ?? activeOption?.branchName ?? \"Pick a worktree\"; return (",
+  "ru": "option.environmentId === value) ?? null, [options, value], ); const triggerLabel = activeOption?.name ?? activeOption?.branchName ?? \"Pick a worktree\"; return (",
+  "context": "components/pickers/WorktreePicker.tsx"
+ },
+ {
+  "en": "option.key === preference) ?? BUILT_IN_OPTION; return (",
+  "ru": "option.key === preference) ?? BUILT_IN_OPTION; return (",
+  "context": "components/settings/SidebarThreadListSetting.tsx"
+ },
+ {
+  "en": "option.key === preference) ?? builtInOption; return (",
+  "ru": "option.key === preference) ?? builtInOption; return (",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "option.key === preference) ?? options[1]; if (selected === undefined) return null; return (",
+  "ru": "option.key === preference) ?? options[1]; if (selected === undefined) return null; return (",
+  "context": "components/settings/FileOpenersSettingsSection.tsx"
+ },
+ {
+  "en": "option.value === value); const selectedLabel = selectedOption?.label ?? value; const selectedMonoPrefix = selectedOption?.monoPrefix; return (",
+  "ru": "option.value === value); const selectedLabel = selectedOption?.label ?? value; const selectedMonoPrefix = selectedOption?.monoPrefix; return (",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "orderActionGroups(actions, usageCounts), [actions, usageCounts], ); const [overflowOpen, setOverflowOpen] = useState(false); const [openPluginOrder, setOpenPluginOrder] = useState",
+  "ru": "orderActionGroups(actions, usageCounts), [actions, usageCounts], ); const [overflowOpen, setOverflowOpen] = useState(false); const [openPluginOrder, setOpenPluginOrder] = useState",
+  "context": "components/plugin/PluginComposerActions.tsx"
+ },
+ {
+  "en": "panel === null ? null : (",
+  "ru": "panel === null ? null : (",
+  "context": "components/plugin/PluginPanelRightPanelHost.tsx"
+ },
+ {
+  "en": "part !== null); return (",
+  "ru": "part !== null); return (",
+  "context": "components/dialogs/ThreadDeleteDialog.tsx"
+ },
+ {
+  "en": "path is covered now.",
+  "ru": "теперь путь покрыт.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "path:&lt;directory&gt;",
+  "ru": "path:&lt;directory&gt;",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "pathSuggestions.suggestions .filter(isFilePathSuggestion) .map(toFileSearchSuggestion), [pathSuggestions.suggestions], ); const suggestions = useMemo",
+  "ru": "pathSuggestions.suggestions .filter(isFilePathSuggestion) .map(toFileSearchSuggestion), [pathSuggestions.suggestions], ); const suggestions = useMemo",
+  "context": "hooks/useFileSearchSuggestions.ts"
+ },
+ {
+  "en": "pendingSkillIds.has(skill.id) ? (",
+  "ru": "pendingSkillIds.has(skill.id) ? (",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "permissionModeRank(mode)",
+  "ru": "permissionModeRank(mode)",
+  "context": "hooks/useThreadCreationOptions.ts"
+ },
+ {
+  "en": "promptBoxRef.current?.getTextBeforeCursor(), [promptBoxRef], ); const transcribeAfterCompletionTransition = useCallback( async (args: Parameters",
+  "ru": "promptBoxRef.current?.getTextBeforeCursor(), [promptBoxRef], ); const transcribeAfterCompletionTransition = useCallback( async (args: Parameters",
+  "context": "components/promptbox/usePromptVoice.ts"
+ },
+ {
+  "en": "promptDecorations",
+  "ru": "promptDecorations",
+  "context": "components/promptbox/editor/prompt-decoration-extension.ts"
+ },
+ {
+  "en": "promptMentions ? substitutePromptMentions(content, promptMentions.mentions) : null, [content, promptMentions], ); const resolvedPromptMentions = useMemo",
+  "ru": "promptMentions ? substitutePromptMentions(content, promptMentions.mentions) : null, [content, promptMentions], ); const resolvedPromptMentions = useMemo",
+  "context": "components/ui/markdown-preview.tsx"
+ },
+ {
+  "en": "provider.id === providerId)?.capabilities .modelCatalogScope; for (const [, options] of queryClient.getQueriesData",
+  "ru": "provider.id === providerId)?.capabilities .modelCatalogScope; for (const [, options] of queryClient.getQueriesData",
+  "context": "hooks/queries/system-queries.ts"
+ },
+ {
+  "en": "query.state.dataUpdatedAt",
+  "ru": "query.state.dataUpdatedAt",
+  "context": "hooks/cache-owners/system-cache-effects.ts"
+ },
+ {
+  "en": "query.state.dataUpdatedAt !== 0 && query.state.dataUpdatedAt",
+  "ru": "query.state.dataUpdatedAt !== 0 && query.state.dataUpdatedAt",
+  "context": "hooks/cache-owners/system-cache-effects.ts"
+ },
+ {
+  "en": "queuedMessage.id === request.queuedMessageId); const optimisticUpdatedAt = previousQueuedMessage ? Math.max(Date.now(), previousQueuedMessage.updatedAt + 1) : null; queryClient.setQueryData",
+  "ru": "queuedMessage.id === request.queuedMessageId); const optimisticUpdatedAt = previousQueuedMessage ? Math.max(Date.now(), previousQueuedMessage.updatedAt + 1) : null; queryClient.setQueryData",
+  "context": "hooks/cache-owners/thread-runtime-cache-owner.ts"
+ },
+ {
+  "en": "queuedMessage.id); if (ids.length",
+  "ru": "queuedMessage.id); if (ids.length",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "rawStringLocalStorage.getItem(CHANGELOG_DISMISSED_VERSION_STORAGE_KEY, \"\"), ); const [dismissal, setDismissal] = useState",
+  "ru": "rawStringLocalStorage.getItem(CHANGELOG_DISMISSED_VERSION_STORAGE_KEY, \"\"), ); const [dismissal, setDismissal] = useState",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "readSectionIdFromLocationState(location.state)); const [lastCreatedThreadId, setLastCreatedThreadId] = useState",
+  "ru": "readSectionIdFromLocationState(location.state)); const [lastCreatedThreadId, setLastCreatedThreadId] = useState",
+  "context": "views/RootComposeView.tsx"
+ },
+ {
+  "en": "readonly QueryKey[] | void; interface ExecuteRealtimeDirtyHandlersArgs",
+  "ru": "readonly QueryKey[] | void; interface ExecuteRealtimeDirtyHandlersArgs",
+  "context": "hooks/cache-owners/realtime-cache-registry.ts"
+ },
+ {
+  "en": "registered panel + bb tasks CLI",
+  "ru": "зарегистрировал панель + CLI bb tasks",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "released from",
+  "ru": "освобождён от",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "resolvedGetScrollElement()?.scrollTop ?? 0, [resolvedGetScrollElement], ); const virtualizer = useVirtualizer",
+  "ru": "resolvedGetScrollElement()?.scrollTop ?? 0, [resolvedGetScrollElement], ); const virtualizer = useVirtualizer",
+  "context": "components/thread/timeline/TimelineWindowedItems.tsx"
+ },
+ {
+  "en": "reviews a GitHub PR, checks changed files, runs focused tests, and returns blocking findings first",
+  "ru": "рецензирует пул-реквест на GitHub, проверяет изменённые файлы, запускает прицельные тесты и сначала выдаёт блокирующие замечания",
+  "context": "components/create-via-prompt-examples.tsx"
+ },
+ {
+  "en": "section.id === \"archived\") ? (",
+  "ru": "section.id === \"archived\") ? (",
+  "context": "components/settings/SettingsSidebar.tsx"
+ },
+ {
+  "en": "section.pluginId === plugin.id, ); const settingsAvailable = plugin.enabled && PLUGIN_STATUSES_WITH_SETTINGS.includes(plugin.status); if (!plugin.hasSettings && !hasSettingsSections) return null; return (",
+  "ru": "section.pluginId === plugin.id, ); const settingsAvailable = plugin.enabled && PLUGIN_STATUSES_WITH_SETTINGS.includes(plugin.status); if (!plugin.hasSettings && !hasSettingsSections) return null; return (",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "section.pluginId === pluginId, ); if (sections.length === 0) return null; return",
+  "ru": "section.pluginId === pluginId, ); if (sections.length === 0) return null; return",
+  "context": "components/plugin/PluginSettingsSections.tsx"
+ },
+ {
+  "en": "section.rows.length ? (",
+  "ru": "section.rows.length ? (",
+  "context": "components/sidebar/SidebarThreadSearchPanel.tsx"
+ },
+ {
+  "en": "segment.rawThreadId !== null ? (",
+  "ru": "segment.rawThreadId !== null ? (",
+  "context": "components/thread/ThreadTitleMentions.tsx"
+ },
+ {
+  "en": "select(listSidebarNavigationThreads(navigation)), [select], ); const result = useQuery",
+  "ru": "select(listSidebarNavigationThreads(navigation)), [select], ); const result = useQuery",
+  "context": "hooks/queries/sidebar-navigation-query.ts"
+ },
+ {
+  "en": "shouldStartComposingFromLocationState(location.state), ); const [navigateToThreadAfterCreate] = useNavigateToThreadAfterCreatePreference(); const [forkSeed, setForkSeed] = useState",
+  "ru": "shouldStartComposingFromLocationState(location.state), ); const [navigateToThreadAfterCreate] = useNavigateToThreadAfterCreatePreference(); const [forkSeed, setForkSeed] = useState",
+  "context": "views/RootComposeView.tsx"
+ },
+ {
+  "en": "slot.isMe && slot.isFocused, ); return (",
+  "ru": "slot.isMe && slot.isFocused, ); return (",
+  "context": "components/sidebar/SplitPaneMiniMap.tsx"
+ },
+ {
+  "en": "spawn a thread to fix the failing CI on main",
+  "ru": "создай тред, чтобы починить падающий CI в main",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "string | null; containerRef: RefObject",
+  "ru": "string | null; containerRef: RefObject",
+  "context": "components/git-diff/PierreLineSelectionActions.tsx"
+ },
+ {
+  "en": "string, ): SyncStorage",
+  "ru": "string, ): SyncStorage",
+  "context": "components/sidebar/sidebarCollapsedAtoms.ts"
+ },
+ {
+  "en": "sum + size, 0); const difference = 1 - currentTotal; if (Math.abs(difference)",
+  "ru": "sum + size, 0); const difference = 1 - currentTotal; if (Math.abs(difference)",
+  "context": "lib/split-layout/ops.ts"
+ },
+ {
+  "en": "sum + size, 0); if (!Number.isFinite(total) || total",
+  "ru": "sum + size, 0); if (!Number.isFinite(total) || total",
+  "context": "lib/split-layout/ops.ts"
+ },
+ {
+  "en": "sum + size, 0); return ( Math.abs(total - 1)",
+  "ru": "sum + size, 0); return ( Math.abs(total - 1)",
+  "context": "components/secondary-panel/sidebarSplitLayout.ts"
+ },
+ {
+  "en": "tab.id)), [browserTabs], ); const isThreadRoot = isRootThread(thread); const [ parentThreadsRequestedForThreadId, setParentThreadsRequestedForThreadId, ] = useState",
+  "ru": "tab.id)), [browserTabs], ); const isThreadRoot = isRootThread(thread); const [ parentThreadsRequestedForThreadId, setParentThreadsRequestedForThreadId, ] = useState",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "tab.id), [tabs]); const storageKey = sidebarSplitStorageKey(panelStateId); const [initialStorageValue] = useState",
+  "ru": "tab.id), [tabs]); const storageKey = sidebarSplitStorageKey(panelStateId); const [initialStorageValue] = useState",
+  "context": "components/secondary-panel/SidebarSplitContainer.tsx"
+ },
+ {
+  "en": "tab.isHidden !== true, ); const hasActiveSurfaceTab = activeSurfaceTab !== undefined; return (",
+  "ru": "tab.isHidden !== true, ); const hasActiveSurfaceTab = activeSurfaceTab !== undefined; return (",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "that lets you reach your own machine from somewhere else.",
+  "ru": "который позволяет добраться до своей машины из другого места.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "thread.id)); const threadIdsWithChildren = new Set",
+  "ru": "thread.id)); const threadIdsWithChildren = new Set",
+  "context": "components/sidebar/ProjectRow.tsx"
+ },
+ {
+  "en": "throws. Reproduced.",
+  "ru": "падает с ошибкой. Воспроизведено.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "truncation.renderedLineCount); const renderedFile = useMemo",
+  "ru": "truncation.renderedLineCount); const renderedFile = useMemo",
+  "context": "components/code/BbSourceCode.tsx"
+ },
+ {
+  "en": "typeof window === \"undefined\" ? null : window.localStorage.getItem(storageKey), ); const [state, setState] = useState",
+  "ru": "typeof window === \"undefined\" ? null : window.localStorage.getItem(storageKey), ); const [state, setState] = useState",
+  "context": "components/secondary-panel/SidebarSplitContainer.tsx"
+ },
+ {
+  "en": "using a terminal?",
+  "ru": "предпочитаешь терминал?",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "value === \"light\" || value === \"dark\" || value === \"system\", ); const themePreferenceAtom = atomWithStorage",
+  "ru": "value === \"light\" || value === \"dark\" || value === \"system\", ); const themePreferenceAtom = atomWithStorage",
+  "context": "hooks/useTheme.ts"
+ },
+ {
+  "en": "viewportRect.bottom + overscan; if (!isOffscreen || rowRect.height",
+  "ru": "viewportRect.bottom + overscan; if (!isOffscreen || rowRect.height",
+  "context": "views/thread-detail/SplitThreadArea.tsx"
+ },
+ {
+  "en": "void) | null = null; let paintedPromise = new Promise",
+  "ru": "void) | null = null; let paintedPromise = new Promise",
+  "context": "lib/route-content-paint.ts"
+ },
+ {
+  "en": "void) | null, deps: PluginFrontendReconcileDeps, ): Promise",
+  "ru": "void) | null, deps: PluginFrontendReconcileDeps, ): Promise",
+  "context": "lib/plugin-frontend.ts"
+ },
+ {
+  "en": "void) | null; export const PromptMentionLinkContext = createContext",
+  "ru": "void) | null; export const PromptMentionLinkContext = createContext",
+  "context": "components/promptbox/editor/prompt-mention-link.ts"
+ },
+ {
+  "en": "void, ): Promise",
+  "ru": "void, ): Promise",
+  "context": "landing/endpoints.ts"
+ },
+ {
+  "en": "void; const InAppBrowserUrlOpenContext = createContext",
+  "ru": "void; const InAppBrowserUrlOpenContext = createContext",
+  "context": "lib/url-open-routing.tsx"
+ },
+ {
+  "en": "void; const RouteNavigationContext = createContext",
+  "ru": "void; const RouteNavigationContext = createContext",
+  "context": "components/ui/app-route-anchor.tsx"
+ },
+ {
+  "en": "void; const listenersByStorageKey = new Map",
+  "ru": "void; const listenersByStorageKey = new Map",
+  "context": "lib/composer-focus-requests.ts"
+ },
+ {
+  "en": "void; const overflowListenersByElement = new Map",
+  "ru": "void; const overflowListenersByElement = new Map",
+  "context": "components/thread/timeline/conversation-message-overflow.tsx"
+ },
+ {
+  "en": "void; const themePreferenceStorage = createLocalStorageEnumStorage",
+  "ru": "void; const themePreferenceStorage = createLocalStorageEnumStorage",
+  "context": "hooks/useTheme.ts"
+ },
+ {
+  "en": "void; export const QueuedEditorTypeaheadLayoutContext = createContext",
+  "ru": "void; export const QueuedEditorTypeaheadLayoutContext = createContext",
+  "context": "components/promptbox/queued-editor-typeahead-layout.tsx"
+ },
+ {
+  "en": "void; export interface SyncStorage",
+  "ru": "void; export interface SyncStorage",
+  "context": "lib/browser-storage.ts"
+ },
+ {
+  "en": "void; haspopup: \"menu\" | \"dialog\"; children: React.ReactNode; onClick?: React.MouseEventHandler",
+  "ru": "void; haspopup: \"menu\" | \"dialog\"; children: React.ReactNode; onClick?: React.MouseEventHandler",
+  "context": "components/ui/responsive-overlay.tsx"
+ },
+ {
+  "en": "void; inlineEditingQueuedMessage: InlineQueuedMessageEditState | null; inlineEditingQueuedMessageRef: React.RefObject",
+  "ru": "void; inlineEditingQueuedMessage: InlineQueuedMessageEditState | null; inlineEditingQueuedMessageRef: React.RefObject",
+  "context": "components/thread/embedded-chat/useComposerAttachmentUploads.ts"
+ },
+ {
+  "en": "void; inputRef: ReturnType",
+  "ru": "void; inputRef: ReturnType",
+  "context": "components/settings/MachineRenameDialog.tsx"
+ },
+ {
+  "en": "void; interface UseThreadCreationOptionsResult",
+  "ru": "void; interface UseThreadCreationOptionsResult",
+  "context": "hooks/useThreadCreationOptions.ts"
+ },
+ {
+  "en": "void; isActive?: boolean; id?: string; onPointerEnter?: PointerEventHandler",
+  "ru": "void; isActive?: boolean; id?: string; onPointerEnter?: PointerEventHandler",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "void; isActive?: boolean; id?: string; role?: React.AriaRole; onPointerEnter?: PointerEventHandler",
+  "ru": "void; isActive?: boolean; id?: string; role?: React.AriaRole; onPointerEnter?: PointerEventHandler",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "void; let sharedViewportObserver: IntersectionObserver | null = null; const viewportEntryCallbacks = new Map",
+  "ru": "void; let sharedViewportObserver: IntersectionObserver | null = null; const viewportEntryCallbacks = new Map",
+  "context": "components/ui/markdown-mermaid-render-cache.ts"
+ },
+ {
+  "en": "void; onPointerDown: (event: ReactPointerEvent",
+  "ru": "void; onPointerDown: (event: ReactPointerEvent",
+  "context": "components/promptbox/PromptBoxInternal.tsx"
+ },
+ {
+  "en": "void; onPointerDown?: (event: ReactPointerEvent",
+  "ru": "void; onPointerDown?: (event: ReactPointerEvent",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "void; onPointerDown?: PointerEventHandler",
+  "ru": "void; onPointerDown?: PointerEventHandler",
+  "context": "components/plugin/PluginNavSidebarItems.tsx"
+ },
+ {
+  "en": "void; onPointerDownCapture: (event: ReactPointerEvent",
+  "ru": "void; onPointerDownCapture: (event: ReactPointerEvent",
+  "context": "components/git-diff/PierreLineSelectionActions.tsx"
+ },
+ {
+  "en": "void; onPointerEnter?: PointerEventHandler",
+  "ru": "void; onPointerEnter?: PointerEventHandler",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "void; onPointerMoveCapture: (event: ReactPointerEvent",
+  "ru": "void; onPointerMoveCapture: (event: ReactPointerEvent",
+  "context": "components/git-diff/PierreLineSelectionActions.tsx"
+ },
+ {
+  "en": "void; onPointerUpCapture: (event: ReactPointerEvent",
+  "ru": "void; onPointerUpCapture: (event: ReactPointerEvent",
+  "context": "components/git-diff/PierreLineSelectionActions.tsx"
+ },
+ {
+  "en": "void; onSubmit: (event: FormEvent",
+  "ru": "void; onSubmit: (event: FormEvent",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "void; original: ReactNode; replacement: ResolvedReplacement",
+  "ru": "void; original: ReactNode; replacement: ResolvedReplacement",
+  "context": "components/plugin/PluginReplacementSlot.tsx"
+ },
+ {
+  "en": "void; pending: boolean; statusByHostId: ReadonlyMap",
+  "ru": "void; pending: boolean; statusByHostId: ReadonlyMap",
+  "context": "components/settings/InstallCliSkillsDialog.tsx"
+ },
+ {
+  "en": "void; pinned: BuiltInSidebarSectionOptions; threads: Omit",
+  "ru": "void; pinned: BuiltInSidebarSectionOptions; threads: Omit",
+  "context": "components/sidebar/ProjectRow.tsx"
+ },
+ {
+  "en": "void; platform: HostPlatform | null; projectPathDialog: ReturnType",
+  "ru": "void; platform: HostPlatform | null; projectPathDialog: ReturnType",
+  "context": "hooks/useLocalPathPicker.tsx"
+ },
+ {
+  "en": "void; promptBoxRef?: Ref",
+  "ru": "void; promptBoxRef?: Ref",
+  "context": "components/promptbox/NewThreadPromptBox.tsx"
+ },
+ {
+  "en": "void; providerStates?: Readonly",
+  "ru": "void; providerStates?: Readonly",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "void; registerHandler: ( command: AppCommandId, registration: Omit",
+  "ru": "void; registerHandler: ( command: AppCommandId, registration: Omit",
+  "context": "components/commands/AppCommandProvider.tsx"
+ },
+ {
+  "en": "void; resourceById: ReadonlyMap",
+  "ru": "void; resourceById: ReadonlyMap",
+  "context": "components/thread/ThreadTitleMentions.tsx"
+ },
+ {
+  "en": "void; state: Extract",
+  "ru": "void; state: Extract",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "void; supported: boolean; supportByProvider?: Record",
+  "ru": "void; supported: boolean; supportByProvider?: Record",
+  "context": "components/promptbox/ExecutionControls.tsx"
+ },
+ {
+  "en": "void; thread?: Thread; updateEnvironment: ReturnType",
+  "ru": "void; thread?: Thread; updateEnvironment: ReturnType",
+  "context": "components/secondary-panel/git-diff/useEnvironmentMergeBase.ts"
+ },
+ {
+  "en": "void; type ComposerInputLockOwner = string | symbol; const inputLocksByStorageKey = new Map",
+  "ru": "void; type ComposerInputLockOwner = string | symbol; const inputLocksByStorageKey = new Map",
+  "context": "lib/plugin-sdk-hooks.ts"
+ },
+ {
+  "en": "void; type OpenInEditorHandler = NonNullable",
+  "ru": "void; type OpenInEditorHandler = NonNullable",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "void; type ThreadRowStatusOwner = string | symbol; const statusesByThreadId = new Map",
+  "ru": "void; type ThreadRowStatusOwner = string | symbol; const statusesByThreadId = new Map",
+  "context": "lib/plugin-thread-row-status.ts"
+ },
+ {
+  "en": "wrote plugin: tasks",
+  "ru": "написал плагин: tasks",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "you@example.com",
+  "ru": "you@example.com",
+  "context": "landing/cta.tsx"
+ },
+ {
+  "en": "z.union([paneNodeSchema, splitNodeSchema]), ); const splitNodeSchema: z.ZodType",
+  "ru": "z.union([paneNodeSchema, splitNodeSchema]), ); const splitNodeSchema: z.ZodType",
+  "context": "lib/split-layout/persistence.ts"
+ },
+ {
+  "en": "→ compare side by side",
+  "ru": "→ сравнить бок о бок",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "→ fix thread opened",
+  "ru": "→ тред с исправлением открыт",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "→ rendering first cut",
+  "ru": "→ рендерим первый вариант",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ }
+]

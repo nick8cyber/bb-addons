@@ -1,0 +1,662 @@
+[
+ {
+  "en": "Project name:",
+  "ru": "Имя проекта:",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Projects, sections, and nested threads.",
+  "ru": "Проекты, разделы и вложенные треды.",
+  "context": "components/settings/SidebarThreadListSetting.tsx"
+ },
+ {
+  "en": "Pull request",
+  "ru": "Пул-реквест",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Purple",
+  "ru": "Фиолетовая",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Queued",
+  "ru": "В очереди",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "Quick palette",
+  "ru": "Быстрая палитра",
+  "context": "components/commands/CommandPalette.tsx"
+ },
+ {
+  "en": "Raw",
+  "ru": "Без форматирования",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Rebase and merge",
+  "ru": "Сделать ребейз и влить",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Red",
+  "ru": "Красная",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Refresh",
+  "ru": "Обновить",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Release",
+  "ru": "Релиз",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Release notes",
+  "ru": "Примечания к релизу",
+  "context": "components/create-via-prompt-examples.tsx"
+ },
+ {
+  "en": "Reload",
+  "ru": "Перезагрузить",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Reload bb",
+  "ru": "Перезагрузить bb",
+  "context": "components/AppErrorBoundary.tsx"
+ },
+ {
+  "en": "Reload usage data",
+  "ru": "Перезагрузить данные о расходе",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Remove project?",
+  "ru": "Удалить проект?",
+  "context": "components/dialogs/ProjectDeleteDialog.tsx"
+ },
+ {
+  "en": "Remove section?",
+  "ru": "Удалить раздел?",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Remove source?",
+  "ru": "Удалить источник?",
+  "context": "components/dialogs/ProjectSourceDeleteDialog.tsx"
+ },
+ {
+  "en": "Rename section",
+  "ru": "Переименовать раздел",
+  "context": "components/dialogs/ThreadSectionCreateDialog.tsx"
+ },
+ {
+  "en": "Rendering diagram...",
+  "ru": "Отрисовка диаграммы...",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Reply…",
+  "ru": "Ответить…",
+  "context": "components/thread/embedded-chat/EmbeddedThreadChat.tsx"
+ },
+ {
+  "en": "Reset all",
+  "ru": "Сбросить все",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Resolving the listed source…",
+  "ru": "Разрешение указанного источника…",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "Restarting",
+  "ru": "Перезапуск",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Retry loading threads",
+  "ru": "Повторить загрузку тредов",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Reuse existing worktree",
+  "ru": "Использовать существующее рабочее дерево",
+  "context": "components/pickers/WorktreePicker.tsx"
+ },
+ {
+  "en": "Review",
+  "ru": "Ревью",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Root threads",
+  "ru": "Корневые треды",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Scheduled jobs",
+  "ru": "Запланированные задачи",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Search archived threads…",
+  "ru": "Поиск архивированных тредов…",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Search branches",
+  "ru": "Поиск веток",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Search shortcuts",
+  "ru": "Поиск горячих клавиш",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "See all",
+  "ru": "Смотреть все",
+  "context": "components/ui/resource/collection.tsx"
+ },
+ {
+  "en": "Send to main thread",
+  "ru": "Отправить в главный тред",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "Sent attachments",
+  "ru": "Отправленные вложения",
+  "context": "components/thread/timeline/ConversationMessageContent.tsx"
+ },
+ {
+  "en": "Service",
+  "ru": "Служба",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Set up a project on it →",
+  "ru": "Настроить проект на ней →",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Set up remote access",
+  "ru": "Настроить удалённый доступ",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Setup guide",
+  "ru": "Руководство по настройке",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Show less",
+  "ru": "Показать меньше",
+  "context": "components/thread/timeline/ToolCallDetailBlock.tsx"
+ },
+ {
+  "en": "Show more",
+  "ru": "Показать больше",
+  "context": "components/thread/timeline/ToolCallDetailBlock.tsx"
+ },
+ {
+  "en": "Show the branch's GitHub pull request in the Info tab",
+  "ru": "Показывать пул-реквест ветки на GitHub во вкладке «Инфо»",
+  "context": "components/secondary-panel/ThreadMetadataContent.fixtures.tsx"
+ },
+ {
+  "en": "Sidebar plugin crashed",
+  "ru": "Плагин боковой панели аварийно завершил работу",
+  "context": "components/sidebar/PluginThreadList.tsx"
+ },
+ {
+  "en": "Skill name",
+  "ru": "Название навыка",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Some terminal output was unavailable after reconnect",
+  "ru": "Часть вывода терминала была недоступна после переподключёния",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "Something went wrong. Please close this window and try again.",
+  "ru": "Что-то пошло не так. Закрой это окно и попробуй снова.",
+  "context": "views/AuthCallbackView.tsx"
+ },
+ {
+  "en": "Source code",
+  "ru": "Исходный код",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "Squash merge this branch into the selected merge base.",
+  "ru": "Влить эту ветку со сквошем в выбранную базу слияния.",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Start from an example",
+  "ru": "Начать с примера",
+  "context": "components/plugin/browse-hero/BrowseArchetypeCards.tsx"
+ },
+ {
+  "en": "Start from:",
+  "ru": "Начать с:",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Start terminal",
+  "ru": "Запустить терминал",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "Status",
+  "ru": "Статус",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Status unavailable",
+  "ru": "Статус недоступен",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Stop requested",
+  "ru": "Запрошена остановка",
+  "context": "components/thread/timeline/ThreadTimelineSurface.tsx"
+ },
+ {
+  "en": "Stopped",
+  "ru": "Остановлено",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Succeeded",
+  "ru": "Успешно",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "System",
+  "ru": "Системная",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "System Message",
+  "ru": "Системное сообщение",
+  "context": "components/thread/timeline/GeneratedConversationMessage.tsx"
+ },
+ {
+  "en": "Teal",
+  "ru": "Бирюзовая",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Terminal connection lost; reconnecting...",
+  "ru": "Соединение с терминалом потеряно; переподключёние...",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "Terminal exited",
+  "ru": "Терминал завершил работу",
+  "context": "components/thread/terminal/ThreadTerminalContent.tsx"
+ },
+ {
+  "en": "Terminal received an invalid server message",
+  "ru": "Терминал получил некорректное сообщение от сервера",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "Terminal reconnected",
+  "ru": "Терминал переподключён",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "Terminal running",
+  "ru": "Терминал работает",
+  "context": "components/thread/terminal/ThreadTerminalContent.tsx"
+ },
+ {
+  "en": "Terminal starting",
+  "ru": "Запуск терминала",
+  "context": "components/thread/terminal/ThreadTerminalContent.tsx"
+ },
+ {
+  "en": "The file target is not available on its declared host.",
+  "ru": "Целевой файл недоступен на указанном хосте.",
+  "context": "components/plugin/AppFileExternalNavigationDispatcher.tsx"
+ },
+ {
+  "en": "The source does not include SKILL.md content.",
+  "ru": "Источник не содержит содержимого SKILL.md.",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "This diff was truncated for display.",
+  "ru": "Этот дифф был сокращён для отображения.",
+  "context": "components/secondary-panel/git-diff/DiffFileCard.tsx"
+ },
+ {
+  "en": "This file was deleted.",
+  "ru": "Этот файл был удалён.",
+  "context": "components/git-diff/GitDiffCardBody.tsx"
+ },
+ {
+  "en": "This pane has no right panel.",
+  "ru": "В этой области нет правой панели.",
+  "context": "views/thread-detail/SplitWorkspaceSecondaryPanelHost.tsx"
+ },
+ {
+  "en": "This panel view is unavailable.",
+  "ru": "Этот вид панели недоступен.",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "This plugin does not describe itself.",
+  "ru": "Этот плагин не содержит описания.",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "This plugin is not installed.",
+  "ru": "Этот плагин не установлен.",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Thread storage",
+  "ru": "Хранилище треда",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Throughput",
+  "ru": "Пропускная способность",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Toggle Sidebar",
+  "ru": "Переключить боковую панель",
+  "context": "components/ui/sidebar.tsx"
+ },
+ {
+  "en": "Try again",
+  "ru": "Попробовать снова",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Type to search mentions",
+  "ru": "Введи текст для поиска упоминаний",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": "Type your own answer…",
+  "ru": "Введи свой ответ…",
+  "context": "components/thread/user-questions/UserQuestionInteractionContent.tsx"
+ },
+ {
+  "en": "Unavailable",
+  "ru": "Недоступно",
+  "context": "components/settings/ProvidersSettingsSection.tsx"
+ },
+ {
+  "en": "Unavailable while offline",
+  "ru": "Недоступно в автономном режиме",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Undo",
+  "ru": "Отменить",
+  "context": "components/thread/ThreadActionsProvider.tsx"
+ },
+ {
+  "en": "Update bb to install this plugin",
+  "ru": "Обнови bb, чтобы установить этот плагин",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Update didn&apos;t finish",
+  "ru": "Обновлёние не завершилось",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Update this app to reconnect",
+  "ru": "Обнови это приложение, чтобы переподключиться",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Updated at",
+  "ru": "Дата изменения",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Updating…",
+  "ru": "Обновлёние…",
+  "context": "components/promptbox/banner/ProviderCliVersionBanner.tsx"
+ },
+ {
+  "en": "Use branch name",
+  "ru": "Использовать имя ветки",
+  "context": "components/dialogs/EnvironmentRenameDialog.tsx"
+ },
+ {
+  "en": "Version",
+  "ru": "Версия",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Video",
+  "ru": "Видео",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Voice Input",
+  "ru": "Голосовой ввод",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "Waiting for the machine to connect…",
+  "ru": "Ожидание подключёния машины…",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "We'll show the next bb release here.",
+  "ru": "Здесь появится следующий релиз bb.",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Web",
+  "ru": "Веб",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "What's new",
+  "ru": "Что нового",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Working for you",
+  "ru": "Работает для тебя",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Workspace unavailable",
+  "ru": "Рабочее пространство недоступно",
+  "context": "components/secondary-panel/ThreadSecondaryPanelTabContent.tsx"
+ },
+ {
+  "en": "Yellow",
+  "ru": "Жёлтая",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "You can close this window.",
+  "ru": "Можно закрыть это окно.",
+  "context": "views/AuthCallbackView.tsx"
+ },
+ {
+  "en": "You're all caught up",
+  "ru": "Всё просмотрено",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Your messages",
+  "ru": "Твои сообщения",
+  "context": "components/thread/toc/ThreadTableOfContents.tsx"
+ },
+ {
+  "en": "additionalMention.start",
+  "ru": "",
+  "context": "components/promptbox/PromptBoxInternal.tsx"
+ },
+ {
+  "en": "bb daemon",
+  "ru": "Демон bb",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "bb hit an error and stopped",
+  "ru": "bb столкнулся с ошибкой и остановился",
+  "context": "components/AppErrorBoundary.tsx"
+ },
+ {
+  "en": "block.kind === \"list\" ? (",
+  "ru": "",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "captions and music added",
+  "ru": "субтитры и музыка добавлены",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "collapsedSplitIndicator.miniMap ? (",
+  "ru": "",
+  "context": "components/sidebar/SidebarSectionRow.tsx"
+ },
+ {
+  "en": "collects logs, recent deploys, and failing checks before proposing the smallest fix",
+  "ru": "собирает логи, недавние деплои и упавшие проверки перед тем, как предложить минимальное исправление",
+  "context": "components/create-via-prompt-examples.tsx"
+ },
+ {
+  "en": "emphasized.has(index) ? (",
+  "ru": "",
+  "context": "components/commands/CommandPalette.tsx"
+ },
+ {
+  "en": "enabled ? (",
+  "ru": "",
+  "context": "components/git-diff/PierreLineSelectionActions.tsx"
+ },
+ {
+  "en": "environmentLabel ? (",
+  "ru": "",
+  "context": "views/thread-detail/ThreadDetailPromptArea.tsx"
+ },
+ {
+  "en": "first cut · 00:42",
+  "ru": "черновой монтаж · 00:42",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "git:&lt;url&gt;[@&lt;ref&gt;]",
+  "ru": "",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "hasAnyThreadMetadata(metadata, hasForks) ? (",
+  "ru": "",
+  "context": "views/thread-detail/ThreadDetailSecondaryContent.tsx"
+ },
+ {
+  "en": "its Settings page",
+  "ru": "его страницу настроек",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "its plugin page",
+  "ru": "его страницу плагина",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "layout === \"detail\" ? (",
+  "ru": "",
+  "context": "components/ui/resource/row.tsx"
+ },
+ {
+  "en": "needs you",
+  "ru": "требует внимания",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "not resolved",
+  "ru": "не разрешено",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "not running",
+  "ru": "не запущен",
+  "context": "components/plugin/management/InstalledPluginsTab.tsx"
+ },
+ {
+  "en": "npm package",
+  "ru": "пакет npm",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "on the bb server&rsquo;s machine.",
+  "ru": "на машине сервера bb.",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "path:&lt;directory&gt;",
+  "ru": "",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "pendingSkillIds.has(skill.id) ? (",
+  "ru": "",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "reply drafted",
+  "ru": "черновик ответа готов",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "resolves to commit",
+  "ru": "разрешается в коммит",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "resolves to tag",
+  "ru": "разрешается в тег",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "section.id === \"archived\") ? (",
+  "ru": "",
+  "context": "components/settings/SettingsSidebar.tsx"
+ },
+ {
+  "en": "section.rows.length ? (",
+  "ru": "",
+  "context": "components/sidebar/SidebarThreadSearchPanel.tsx"
+ },
+ {
+  "en": "semver range",
+  "ru": "диапазон semver",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "third-party marketplace",
+  "ru": "сторонний маркетплейс",
+  "context": "components/plugin/management/BrowsePluginsTab.tsx"
+ },
+ {
+  "en": "turns merged PRs into concise customer-facing release notes with links and risk notes",
+  "ru": "превращает влитые PR в краткие примечания к релизу для пользователей со ссылками и описанием рисков",
+  "context": "components/create-via-prompt-examples.tsx"
+ }
+]

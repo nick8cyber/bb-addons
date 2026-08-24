@@ -1,0 +1,662 @@
+[
+ {
+  "en": "Add to chat",
+  "ru": "Добавить в чат",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "Machine",
+  "ru": "Машина",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Message actions",
+  "ru": "Действия с сообщением",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "New thread",
+  "ru": "Новый тред",
+  "context": "components/commands/AppCommandShortcutHint.stories.tsx"
+ },
+ {
+  "en": "Archived",
+  "ru": "В архиве",
+  "context": "components/layout/AppLayout.tsx"
+ },
+ {
+  "en": "Copy message",
+  "ru": "Копировать сообщение",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "Fork into new thread",
+  "ru": "Форкнуть в новый тред",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "Rename",
+  "ru": "Переименовать",
+  "context": "components/project/ProjectActionsMenu.tsx"
+ },
+ {
+  "en": "Close pane",
+  "ru": "Закрыть область",
+  "context": "components/ui/icon.stories.tsx"
+ },
+ {
+  "en": "Create new thread in this worktree",
+  "ru": "Создать новый тред в этом рабочем дереве",
+  "context": "components/promptbox/ThreadEnvironmentSummary.tsx"
+ },
+ {
+  "en": "Delete",
+  "ru": "Удалить",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "Plan",
+  "ru": "План",
+  "context": "components/promptbox/PromptBoxActionsMenu.tsx"
+ },
+ {
+  "en": "Retry",
+  "ru": "Повторить",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "Terminal",
+  "ru": "Терминал",
+  "context": "components/thread/ThreadWorkspaceOpenButton.stories.tsx"
+ },
+ {
+  "en": "Cancel",
+  "ru": "Отмена",
+  "context": "components/dialogs/ConfirmDeleteDialog.tsx"
+ },
+ {
+  "en": "Close",
+  "ru": "Закрыть",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "Environment",
+  "ru": "Окружение",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Mermaid diagram",
+  "ru": "Диаграмма Mermaid",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Open source",
+  "ru": "Исходный код",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Remove",
+  "ru": "Убрать",
+  "context": "components/project/ProjectActionsMenu.tsx"
+ },
+ {
+  "en": "Search files",
+  "ru": "Поиск файлов",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Search threads",
+  "ru": "Поиск тредов",
+  "context": "components/commands/AppCommandShortcutHint.stories.tsx"
+ },
+ {
+  "en": "Thread actions",
+  "ru": "Действия с тредом",
+  "context": "components/thread/ThreadActionsMenu.tsx"
+ },
+ {
+  "en": "Automations",
+  "ru": "Автоматизации",
+  "context": "components/layout/AppLayout.tsx"
+ },
+ {
+  "en": "BB Official",
+  "ru": "Официальные BB",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Branch",
+  "ru": "Ветка",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Bulk update actions",
+  "ru": "Массовые действия обновлёния",
+  "context": "components/settings/UpdatesSettingsSection.stories.tsx"
+ },
+ {
+  "en": "Diff",
+  "ru": "Дифф",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.stories.tsx"
+ },
+ {
+  "en": "Goal",
+  "ru": "Цель",
+  "context": "components/promptbox/PromptBoxActionsMenu.tsx"
+ },
+ {
+  "en": "Included",
+  "ru": "В комплекте",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Loading models",
+  "ru": "Загрузка моделей",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Loading…",
+  "ru": "Загрузка…",
+  "context": "components/plugin/ExperimentalFileLink.tsx"
+ },
+ {
+  "en": "Machines",
+  "ru": "Машины",
+  "context": "components/settings/MachinesSettingsSection.tsx"
+ },
+ {
+  "en": "Merge base",
+  "ru": "База слияния",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "More plugin actions",
+  "ru": "Другие действия плагина",
+  "context": "components/plugin/PluginComposerActions.tsx"
+ },
+ {
+  "en": "Open in external browser",
+  "ru": "Открыть во внешнем браузере",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Palette",
+  "ru": "Палитра",
+  "context": "components/git-diff/GitDiffCard.stories.tsx"
+ },
+ {
+  "en": "Project",
+  "ru": "Проект",
+  "context": "components/pickers/ProjectSelector.tsx"
+ },
+ {
+  "en": "Project path",
+  "ru": "Путь к проекту",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Prompt actions",
+  "ru": "Действия с промптом",
+  "context": "components/promptbox/PromptBoxActionsMenu.tsx"
+ },
+ {
+  "en": "Reasoning",
+  "ru": "Рассуждение",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Remove machine",
+  "ru": "Убрать машину",
+  "context": "components/settings/MachinesSettingsSection.tsx"
+ },
+ {
+  "en": "Sort by",
+  "ru": "Сортировка",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Update",
+  "ru": "Обновить",
+  "context": "components/plugin/management/PluginUpdatesCard.tsx"
+ },
+ {
+  "en": "Update failed",
+  "ru": "Не удалось обновить",
+  "context": "components/plugin/management/PluginRowSignal.stories.tsx"
+ },
+ {
+  "en": "Add local path",
+  "ru": "Добавить локальный путь",
+  "context": "components/project/ProjectActionsMenu.tsx"
+ },
+ {
+  "en": "Background services",
+  "ru": "Фоновые службы",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Default",
+  "ru": "По умолчанию",
+  "context": "components/settings/ProvidersSettingsSection.tsx"
+ },
+ {
+  "en": "Failed",
+  "ru": "Ошибка",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Favicon color",
+  "ru": "Цвет иконки",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Find in page",
+  "ru": "Найти на странице",
+  "context": "components/secondary-panel/BrowserFindBar.tsx"
+ },
+ {
+  "en": "Git status",
+  "ru": "Статус Git",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Imported",
+  "ru": "Импортировано",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Messages above send together",
+  "ru": "Сообщения выше отправляются вместе",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "Model",
+  "ru": "Модель",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "New tab",
+  "ru": "Новая вкладка",
+  "context": "components/plugin/PluginPanelRightPanelHost.tsx"
+ },
+ {
+  "en": "No diff to display.",
+  "ru": "Нет диффа для отображения.",
+  "context": "components/secondary-panel/ThreadSecondaryPanelTabContent.tsx"
+ },
+ {
+  "en": "Organize",
+  "ru": "Упорядочить",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Permission limit",
+  "ru": "Лимит прав доступа",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Project settings",
+  "ru": "Настройки проекта",
+  "context": "components/layout/AppLayout.tsx"
+ },
+ {
+  "en": "Provider CLIs",
+  "ru": "CLI провайдеров",
+  "context": "components/settings/UpdatesSettingsSection.stories.tsx"
+ },
+ {
+  "en": "Recently visited",
+  "ru": "Недавно открытые",
+  "context": "components/secondary-panel/BrowserNewTabScreen.tsx"
+ },
+ {
+  "en": "Report a bug",
+  "ru": "Сообщить об ошибке",
+  "context": "components/sidebar/AppSidebar.tsx"
+ },
+ {
+  "en": "Search models",
+  "ru": "Поиск моделей",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Show keyboard hints when holding CMD / Control",
+  "ru": "Показывать подсказки клавиш при удержании CMD / Control",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Sidebar",
+  "ru": "Боковая панель",
+  "context": "components/settings/SidebarThreadListSetting.tsx"
+ },
+ {
+  "en": "Skills",
+  "ru": "Навыки",
+  "context": "components/layout/AppLayout.tsx"
+ },
+ {
+  "en": "Squash merge",
+  "ru": "Слияние squash",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Theme",
+  "ru": "Тема",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Threads",
+  "ru": "Треды",
+  "context": "components/layout/AppLayout.tsx"
+ },
+ {
+  "en": "target ? (",
+  "ru": "",
+  "context": "components/dialogs/EnvironmentRenameDialog.tsx"
+ },
+ {
+  "en": "this machine",
+  "ru": "эта машина",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "About",
+  "ru": "О программе",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Add a machine",
+  "ru": "Добавить машину",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Appearance",
+  "ru": "Внешний вид",
+  "context": "components/settings/settings-nav.tsx"
+ },
+ {
+  "en": "Archived threads",
+  "ru": "Архив тредов",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Attached image preview",
+  "ru": "Превью прикреплённого изображения",
+  "context": "components/promptbox/AttachmentPreview.tsx"
+ },
+ {
+  "en": "Automatic",
+  "ru": "Автоматически",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "Breadcrumb",
+  "ru": "Навигация",
+  "context": "components/layout/AppBreadcrumbs.tsx"
+ },
+ {
+  "en": "Browser navigation",
+  "ru": "Навигация в браузере",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "By machine",
+  "ru": "По машинам",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "By project",
+  "ru": "По проектам",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Cancel fork",
+  "ru": "Отменить форк",
+  "context": "views/RootComposeView.tsx"
+ },
+ {
+  "en": "Cancel new folder",
+  "ru": "Отменить создание папки",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Capabilities",
+  "ru": "Возможности",
+  "context": "components/create-via-prompt-examples.tsx"
+ },
+ {
+  "en": "Choose pull request merge method",
+  "ru": "Выбери способ слияния пул-реквеста",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Clear active Goal",
+  "ru": "Очистить активную цель",
+  "context": "components/promptbox/banner/ThreadGoalCard.tsx"
+ },
+ {
+  "en": "Clear parent thread",
+  "ru": "Очистить родительский тред",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Clear recently visited",
+  "ru": "Очистить недавно открытые",
+  "context": "components/secondary-panel/BrowserNewTabScreen.tsx"
+ },
+ {
+  "en": "Clone destination",
+  "ru": "Папка назначения для клонирования",
+  "context": "components/dialogs/ProjectMachineSetupDialog.tsx"
+ },
+ {
+  "en": "Close image preview",
+  "ru": "Закрыть превью изображения",
+  "context": "components/ui/image-lightbox.tsx"
+ },
+ {
+  "en": "Close search",
+  "ru": "Закрыть поиск",
+  "context": "components/secondary-panel/ThreadStorageBrowser.tsx"
+ },
+ {
+  "en": "Collapse prompt box",
+  "ru": "Свёрнуть поле ввода",
+  "context": "components/promptbox/PromptBoxInternal.tsx"
+ },
+ {
+  "en": "Commands",
+  "ru": "Команды",
+  "context": "components/commands/CommandPalette.tsx"
+ },
+ {
+  "en": "Community",
+  "ru": "Сообщество",
+  "context": "components/settings/CommunitySettingsSection.tsx"
+ },
+ {
+  "en": "Configuration",
+  "ru": "Конфигурация",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Connection not secure",
+  "ru": "Незащищённое подключёние",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Copy Mermaid source",
+  "ru": "Копировать исходный код Mermaid",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Copy file name",
+  "ru": "Копировать имя файла",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Copy file path",
+  "ru": "Копировать путь к файлу",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Create a plugin options",
+  "ru": "Параметры создания плагина",
+  "context": "components/plugin/management/BrowsePluginsTab.tsx"
+ },
+ {
+  "en": "Create folder",
+  "ru": "Создать папку",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Create new folder",
+  "ru": "Создать папку",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Desktop",
+  "ru": "Рабочий стол",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Diff view mode",
+  "ru": "Режим просмотра диффа",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "Dismiss model fallback",
+  "ru": "Скрыть резервную модель",
+  "context": "components/promptbox/banner/ThreadModelFallbackCard.tsx"
+ },
+ {
+  "en": "Edit path",
+  "ru": "Изменить путь",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Existing worktree",
+  "ru": "Существующее рабочее дерево",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Exit plan mode",
+  "ru": "Выйти из режима плана",
+  "context": "components/promptbox/banner/ThreadPromptModeCard.tsx"
+ },
+ {
+  "en": "Experiments",
+  "ru": "Эксперименты",
+  "context": "components/settings/settings-nav.tsx"
+ },
+ {
+  "en": "Extensions",
+  "ru": "Расширения",
+  "context": "components/plugin/PluginNavSidebarItems.tsx"
+ },
+ {
+  "en": "File Preferences",
+  "ru": "Параметры файлов",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "File search results",
+  "ru": "Результаты поиска файлов",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "Files",
+  "ru": "Файлы",
+  "context": "components/settings/settings-nav.tsx"
+ },
+ {
+  "en": "General",
+  "ru": "Общие",
+  "context": "components/settings/settings-nav.tsx"
+ },
+ {
+  "en": "GitHub",
+  "ru": "GitHub",
+  "context": "components/settings/CommunitySettingsSection.tsx"
+ },
+ {
+  "en": "Go back",
+  "ru": "Назад",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Go forward",
+  "ru": "Вперёд",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Go to next page",
+  "ru": "Перейти на следующую страницу",
+  "context": "components/ui/pagination.tsx"
+ },
+ {
+  "en": "Go to parent folder",
+  "ru": "Перейти в родительскую папку",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Go to path",
+  "ru": "Перейти по пути",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Go to previous page",
+  "ru": "Перейти на предыдущую страницу",
+  "context": "components/ui/pagination.tsx"
+ },
+ {
+  "en": "Goal controls",
+  "ru": "Управление целью",
+  "context": "components/promptbox/banner/ThreadGoalCard.tsx"
+ },
+ {
+  "en": "In progress",
+  "ru": "В процессе",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Info",
+  "ru": "Информация",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.stories.tsx"
+ },
+ {
+  "en": "Install from source",
+  "ru": "Установить из исходного кода",
+  "context": "components/plugin/PluginsOverview.tsx"
+ },
+ {
+  "en": "Installing plugin",
+  "ru": "Установка плагина",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "Load diff",
+  "ru": "Загрузить дифф",
+  "context": "components/git-diff/GitDiffCardBody.tsx"
+ },
+ {
+  "en": "Loading sidebar navigation",
+  "ru": "Загрузка навигации боковой панели",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Loading thread",
+  "ru": "Загрузка треда",
+  "context": "components/thread/timeline/ThreadTimelineSurface.tsx"
+ },
+ {
+  "en": "Machine name",
+  "ru": "Имя машины",
+  "context": "components/settings/MachineRenameDialog.tsx"
+ },
+ {
+  "en": "Manually",
+  "ru": "Вручную",
+  "context": "components/sidebar/ProjectList.tsx"
+ }
+]

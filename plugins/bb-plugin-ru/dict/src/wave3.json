@@ -1,0 +1,532 @@
+[
+ {
+  "en": "Ask a follow-up",
+  "ru": "Задать уточняющий вопрос",
+  "context": "components/plugin/PluginComposerActions.stories.tsx"
+ },
+ {
+  "en": "Queue follow-up (Enter)",
+  "ru": "В очередь уточнения (Enter)",
+  "context": "components/promptbox/FollowUpPromptBox.tsx"
+ },
+ {
+  "en": "Automatically use matching plugins, or choose a viewer for each file type. Right-click a file link for a one-off choice.",
+  "ru": "Автоматически использовать подходящие плагины или выбрать просмотрщик для каждого типа файлов. Кликни правой кнопкой по ссылке на файл для разового выбора.",
+  "context": "components/settings/FileOpenersSettingsSection.tsx"
+ },
+ {
+  "en": "Built an empty-cart fixture",
+  "ru": "Собрана фикстура пустой корзины",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Dispatched the changelog follow-up. Nothing else needs you.",
+  "ru": "Уточнение по списку изменений отправлено. Больше ничего не требуется.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Fresher models, cross-provider questions",
+  "ru": "Более свежие модели, вопросы между провайдерами",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Pair the bb mobile app over bb connect: shows Add mobile device under Remote access and enables bb connect machine-code.",
+  "ru": "Связать мобильное приложение bb через bb connect: показывает «Добавить мобильное устройство» в разделе «Удалённый доступ» и включает bb connect machine-code.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Pushed the guard and a follow-up. Re-running the suite.",
+  "ru": "Отправлены защита и уточнение. Набор тестов перезапускается.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Renders plugin-provided content inside thread messages.",
+  "ru": "Отображает содержимое из плагинов внутри сообщений треда.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Sentry triage is re-running tests; LIN-482 is verifying.",
+  "ru": "Триаж Sentry перезапускает тесты; LIN-482 выполняет проверку.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Shared in-flight promise",
+  "ru": "Общий выполняющийся промис",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Sidebar tab groups must map one-to-one to panes",
+  "ru": "Группы вкладок боковой панели должны однозначно соответствовать областям",
+  "context": "components/secondary-panel/sidebarSplitLayout.ts"
+ },
+ {
+  "en": "Use Enter to steer the current run and Command+Enter to queue a follow-up.",
+  "ru": "Нажми Enter для управления текущим запуском и Command+Enter для постановки уточнения в очередь.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "1 machine, all in sync",
+  "ru": "1 машина, всё синхронизировано",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "14 user-facing commits since yesterday. Grouped them by area.",
+  "ru": "14 пользовательских коммитов со вчерашнего дня. Сгруппированы по разделам.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "A persistent second-model reviewer for bb coding threads.",
+  "ru": "Постоянный ревьюер на базе второй модели для тредов кодинга bb.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Adds rich-text behavior while composing a message.",
+  "ru": "Добавляет форматирование текста при наборе сообщения.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Choose answer 1",
+  "ru": "Выбрать вариант 1",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 2",
+  "ru": "Выбрать вариант 2",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 3",
+  "ru": "Выбрать вариант 3",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 4",
+  "ru": "Выбрать вариант 4",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 5",
+  "ru": "Выбрать вариант 5",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 6",
+  "ru": "Выбрать вариант 6",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 7",
+  "ru": "Выбрать вариант 7",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 8",
+  "ru": "Выбрать вариант 8",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose answer 9",
+  "ru": "Выбрать вариант 9",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 1 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 1, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 2 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 2, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 3 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 3, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 4 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 4, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 5 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 5, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 6 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 6, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 7 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 7, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 8 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 8, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Choose visible answer 9 when bb asks a question.",
+  "ru": "Выбрать видимый вариант ответа 9, когда bb задает вопрос.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Connected machines follow the server version automatically.",
+  "ru": "Подключённые машины автоматически обновляются вслед за версией сервера.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Enable the new first-run guide for agent setup and project selection.",
+  "ru": "Включить новый справочник первого запуска для настройки агентов и выбора проекта.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Expand a one-liner and route it to the right project as a new thread.",
+  "ru": "Развёрнуть краткое описание и направить в нужный проект как новый тред.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 1",
+  "ru": "Фокус на области чата 1",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 1 in reading order.",
+  "ru": "Перевести фокус на 1-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 2",
+  "ru": "Фокус на области чата 2",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 2 in reading order.",
+  "ru": "Перевести фокус на 2-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 3",
+  "ru": "Фокус на области чата 3",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 3 in reading order.",
+  "ru": "Перевести фокус на 3-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 4",
+  "ru": "Фокус на области чата 4",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 4 in reading order.",
+  "ru": "Перевести фокус на 4-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 5",
+  "ru": "Фокус на области чата 5",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 5 in reading order.",
+  "ru": "Перевести фокус на 5-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 6",
+  "ru": "Фокус на области чата 6",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 6 in reading order.",
+  "ru": "Перевести фокус на 6-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 7",
+  "ru": "Фокус на области чата 7",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 7 in reading order.",
+  "ru": "Перевести фокус на 7-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 8",
+  "ru": "Фокус на области чата 8",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Focus chat pane 8 in reading order.",
+  "ru": "Перевести фокус на 8-ю область чата по порядку чтения.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Free, open source, and local-first. Install in under a minute.",
+  "ru": "Бесплатно, с открытым исходным кодом и упором на локальную работу. Установка меньше чем за минуту.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Grill the user relentlessly about a plan, decision, or idea. Use when the user wants to stress-test their thinking, or uses any 'grill' trigger phrases.",
+  "ru": "Устроить пользователю жесткий допрос по поводу плана, решения или идеи. Используй, когда пользователь хочет проверить свои мысли на прочность или использует любые триггерные фразы со словом «grill».",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Htop",
+  "ru": "Htop",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Independent expert help and phase-bounded perspective synthesis for bb agents.",
+  "ru": "Независимая экспертная помощь и синтез перспектив по фазам для агентов bb.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Inter, sans-serif",
+  "ru": "",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Investigate a question against high-trust primary sources and capture the findings as a Markdown file in the repo. Use when the user wants a topic researched, docs or API facts gathered, or reading legwork delegated to a background agent.",
+  "ru": "Исследовать вопрос по надежным первоисточникам и сохранить выводы в репозитории в виде Markdown-файла. Используй, когда пользователь хочет исследовать тему, собрать факты о документации или API либо поручить фоновому агенту изучение материалов.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Let any provider ask the user a multiple-choice question, the way Claude Code's AskUserQuestion does natively.",
+  "ru": "Позволяет любому провайдеру задавать пользователю вопрос с выбором варианта ответа, аналогично встроенному инструменту AskUserQuestion в Claude Code.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Manage scheduled bb work across projects and folders. Automations run recurring or one-time tasks without manual prompting.",
+  "ru": "Управление запланированными задачами bb по проектам и папкам. Автоматизации выполняют регулярные или разовые задачи без ручного ввода промптов.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Mock CLI Traffic",
+  "ru": "Mock CLI Traffic",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "New onboarding",
+  "ru": "Новый онбординг",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open links in the in-app browser",
+  "ru": "Открывать ссылки во встроенном браузере",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Open thread 1",
+  "ru": "Открыть тред 1",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 2",
+  "ru": "Открыть тред 2",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 3",
+  "ru": "Открыть тред 3",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 4",
+  "ru": "Открыть тред 4",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 5",
+  "ru": "Открыть тред 5",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 6",
+  "ru": "Открыть тред 6",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 7",
+  "ru": "Открыть тред 7",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 8",
+  "ru": "Открыть тред 8",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open thread 9",
+  "ru": "Открыть тред 9",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 1.",
+  "ru": "Открыть 1-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 2.",
+  "ru": "Открыть 2-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 3.",
+  "ru": "Открыть 3-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 4.",
+  "ru": "Открыть 4-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 5.",
+  "ru": "Открыть 5-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 6.",
+  "ru": "Открыть 6-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 7.",
+  "ru": "Открыть 7-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 8.",
+  "ru": "Открыть 8-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Open visible sidebar thread 9.",
+  "ru": "Открыть 9-й тред из боковой панели.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Opens supported files in a plugin-provided viewer.",
+  "ru": "Открывает поддерживаемые файлы в просмотрщике из плагина.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Palettes change bb's colors, including syntax colors in diffs and file previews. Choose a built-in palette or create one from a prompt.",
+  "ru": "Палитры меняют цвета bb, включая цвета подсветки синтаксиса в диффах и предпросмотрах файлов. Выбери встроенную палитру или создай свою по промпту.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Pick a different destination, or use the existing-folder option to point at what's already there.",
+  "ru": "Выбери другое место назначения или используй вариант существующей папки, чтобы указать на то, что там уже есть.",
+  "context": "components/dialogs/ProjectMachineSetupDialog.tsx"
+ },
+ {
+  "en": "Plugins run as full-trust code with access to your computer. Only install from sources you trust.",
+  "ru": "Плагины выполняются как доверенный код с полным доступом к твоему компьютеру. Устанавливай их только из надежных источников.",
+  "context": "components/plugin/management/plugin-ui.tsx"
+ },
+ {
+  "en": "Press a non-modifier key.",
+  "ru": "Нажми клавишу, не являющуюся модификатором.",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Provider-independent durable memory for agents. We recommend disabling provider-native memory when using this plugin.",
+  "ru": "Долговременная память для агентов, не зависящая от провайдера. Мы рекомендуем отключить встроенную память провайдера при использовании этого плагина.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Release, capabilities, and health live on",
+  "ru": "",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Remote",
+  "ru": "Remote",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Reply to messages in hidden side-chat forks rendered in a thread panel.",
+  "ru": "Отвечать на сообщения в скрытых форках сайд-чата, отображаемых в панели треда.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Retry by sending a follow-up message",
+  "ru": "Повторить, отправив уточняющее сообщение",
+  "context": "components/promptbox/follow-up-placeholder.ts"
+ },
+ {
+  "en": "Route Claude Code through CLI-style traffic.",
+  "ru": "Маршрутизировать Claude Code через CLI-трафик.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Schedule recurring and one-shot agent or script work.",
+  "ru": "Планирование повторяющейся и разовой работы агентов или скриптов.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Send a follow-up",
+  "ru": "Отправить уточнение",
+  "context": "components/promptbox/follow-up-placeholder.ts"
+ },
+ {
+  "en": "Singleton context-management group has no message",
+  "ru": "В синглтон-группе управления контекстом нет сообщения",
+  "context": "completed-turn-grouping.ts"
+ },
+ {
+  "en": "Smart skill index compaction — usage-ranked, budget-capped skill lists.",
+  "ru": "Умное сжатие индекса навыков — списки навыков с ранжированием по частоте использования и ограничением бюджета.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "Stop. That last message did not land: re-pitch it.",
+  "ru": "Стоп. Последнее сообщение не дошло: сформулируй иначе.",
+  "context": "видно в интерфейсе (замер покрытия)"
+ },
+ {
+  "en": "The access tokens that keep you signed in to GitHub, and your bb sign-in sessions. A session record includes the IP address and the browser user agent that created it.",
+  "ru": "Токены доступа, поддерживающие вход в GitHub, и сессии входа в bb. Запись о сессии включает IP-адрес и user agent браузера, создавшего её.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "The in-app web browser runs in the bb desktop app. Open this thread there to browse the web.",
+  "ru": "Встроенный веб-браузер работает в приложении bb для ПК. Открой этот тред в нем для просмотра веб-страниц.",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "This file opener is not available. The plugin may still be loading, or it has been disabled or removed — reopen the file to use the built-in preview.",
+  "ru": "Этот обработчик открытия файлов недоступен. Возможно, плагин все ещё загружается либо был отключён или удалён — открой файл заново, чтобы использовать встроенный предпросмотр.",
+  "context": "components/plugin/PluginPanelActions.tsx"
+ },
+ {
+  "en": "Thread timeline turn-state context is missing",
+  "ru": "Отсутствует контекст состояния хода в ленте треда",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "max-h-[240px]",
+  "ru": "",
+  "context": "components/ui/detail-scroll-size.ts"
+ },
+ {
+  "en": "svg]:shrink-0\"; const ARRANGEMENT_REGION_CLASS: Record",
+  "ru": "",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "svg]:shrink-0\"; const SidebarMenuButton = React.forwardRef",
+  "ru": "",
+  "context": "components/ui/sidebar.tsx"
+ }
+]

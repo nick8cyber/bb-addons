@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Clear shortcut for Close panel tab",
+  "ru": "Очистить горячую клавишу для «Закрыть вкладку панели»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Cycle model backward",
+  "ru": "Очистить горячую клавишу для «Предыдущая модель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Cycle model forward",
+  "ru": "Очистить горячую клавишу для «Следующая модель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Cycle provider backward",
+  "ru": "Очистить горячую клавишу для «Предыдущий провайдер»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Cycle provider forward",
+  "ru": "Очистить горячую клавишу для «Следующий провайдер»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Cycle reasoning effort backward",
+  "ru": "Очистить горячую клавишу для «Уменьшить уровень рассуждения»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Cycle reasoning effort forward",
+  "ru": "Очистить горячую клавишу для «Увеличить уровень рассуждения»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Focus composer",
+  "ru": "Очистить горячую клавишу для «Фокус на поле ввода»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Focus location",
+  "ru": "Очистить горячую клавишу для «Фокус на строке расположения»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Focus next chat pane",
+  "ru": "Очистить горячую клавишу для «Фокус на следующей области чата»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Focus previous chat pane",
+  "ru": "Очистить горячую клавишу для «Фокус на предыдущей области чата»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for New panel tab",
+  "ru": "Очистить горячую клавишу для «Новая вкладка панели»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for New thread",
+  "ru": "Очистить горячую клавишу для «Новый тред»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for New window",
+  "ru": "Очистить горячую клавишу для «Новое окно»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Next thread",
+  "ru": "Очистить горячую клавишу для «Следующий тред»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Open in preferred app",
+  "ru": "Очистить горячую клавишу для «Открыть в предпочитаемом приложении»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Open server settings",
+  "ru": "Очистить горячую клавишу для «Открыть настройки сервера»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Open settings",
+  "ru": "Очистить горячую клавишу для «Открыть настройки»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Open terminal",
+  "ru": "Очистить горячую клавишу для «Открыть терминал»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Previous thread",
+  "ru": "Очистить горячую клавишу для «Предыдущий тред»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Quick open file",
+  "ru": "Очистить горячую клавишу для «Быстрое открытие файла»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Reload page",
+  "ru": "Очистить горячую клавишу для «Перезагрузить страницу»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Rename thread",
+  "ru": "Очистить горячую клавишу для «Переименовать тред»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Search threads",
+  "ru": "Очистить горячую клавишу для «Поиск по тредам»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Toggle diff",
+  "ru": "Очистить горячую клавишу для «Показать/скрыть дифф»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Toggle focused chat pane size",
+  "ru": "Очистить горячую клавишу для «Развёрнуть/свёрнуть текущую область чата»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Toggle model picker",
+  "ru": "Очистить горячую клавишу для «Показать/скрыть выбор модели»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Toggle panel",
+  "ru": "Очистить горячую клавишу для «Показать/скрыть панель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Toggle sidebar",
+  "ru": "Очистить горячую клавишу для «Показать/скрыть боковую панель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Command",
+  "ru": "Команда",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Commit SHA copied",
+  "ru": "SHA коммита скопирован",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Connected",
+  "ru": "Подключёно",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Consulted advisor",
+  "ru": "Консультация с советником завершёна",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Consulting advisor",
+  "ru": "Консультация с советником…",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Context compaction interrupted",
+  "ru": "Сжатие контекста прервано",
+  "context": "operation-projection.ts"
+ },
+ {
+  "en": "Copy branch name: master",
+  "ru": "Копировать имя ветки: master",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Could not load models.",
+  "ru": "Не удалось загрузить модели.",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Could not load the project's execution defaults.",
+  "ru": "Не удалось загрузить параметры выполнения проекта по умолчанию.",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Could not reach the server. Check that it is running and try again.",
+  "ru": "Не удалось связаться с сервером. Убедись, что он запущен, и попробуй снова.",
+  "context": "lib/mutation-errors.test.ts"
+ },
+ {
+  "en": "Couldn't load more from skills.sh.",
+  "ru": "Не удалось загрузить больше с skills.sh.",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "Couldn't load skill.",
+  "ru": "Не удалось загрузить навык.",
+  "context": "components/tools/SkillsLibrary.tsx"
+ },
+ {
+  "en": "Couldn't load skills.sh.",
+  "ru": "Не удалось загрузить skills.sh.",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "Couldn't rename the machine.",
+  "ru": "Не удалось переименовать машину.",
+  "context": "components/settings/MachinesSettingsSection.tsx"
+ },
+ {
+  "en": "Create a new, distinct bb skill using the skills.sh entry below as a reference.",
+  "ru": "Создай новый отдельный навык bb, используя запись skills.sh ниже в качестве примера.",
+  "context": "lib/skills-registry.test.ts"
+ },
+ {
+  "en": "Create a section for threads.",
+  "ru": "Создать раздел для тредов.",
+  "context": "components/dialogs/ThreadSectionCreateDialog.tsx"
+ },
+ {
+  "en": "Create new branch",
+  "ru": "Создать новую ветку",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Create one from a local folder",
+  "ru": "Создать проект из локальной папки",
+  "context": "views/RootComposeEmptyWelcome.tsx"
+ },
+ {
+  "en": "Debounce holds for 200ms. One call, asserted.",
+  "ru": "Задержка устранения дребезга 200 мс. Зафиксирован один вызов.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Default shortcut for Close focused chat pane",
+  "ru": "Горячая клавиша по умолчанию для «Закрыть текущую область чата»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Close panel tab",
+  "ru": "Горячая клавиша по умолчанию для «Закрыть вкладку панели»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Cycle model backward",
+  "ru": "Горячая клавиша по умолчанию для «Предыдущая модель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Cycle model forward",
+  "ru": "Горячая клавиша по умолчанию для «Следующая модель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Cycle provider backward",
+  "ru": "Горячая клавиша по умолчанию для «Предыдущий провайдер»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Cycle provider forward",
+  "ru": "Горячая клавиша по умолчанию для «Следующий провайдер»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Cycle reasoning effort backward",
+  "ru": "Горячая клавиша по умолчанию для «Уменьшить уровень рассуждения»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Cycle reasoning effort forward",
+  "ru": "Горячая клавиша по умолчанию для «Увеличить уровень рассуждения»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Focus composer",
+  "ru": "Горячая клавиша по умолчанию для «Фокус на поле ввода»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Focus location",
+  "ru": "Горячая клавиша по умолчанию для «Фокус на строке расположения»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for New panel tab",
+  "ru": "Горячая клавиша по умолчанию для «Новая вкладка панели»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for New window",
+  "ru": "Горячая клавиша по умолчанию для «Новое окно»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Open in preferred app",
+  "ru": "Горячая клавиша по умолчанию для «Открыть в предпочитаемом приложении»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Open settings",
+  "ru": "Горячая клавиша по умолчанию для «Открыть настройки»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Quick open file",
+  "ru": "Горячая клавиша по умолчанию для «Быстрое открытие файла»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Reload page",
+  "ru": "Горячая клавиша по умолчанию для «Перезагрузить страницу»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Search threads",
+  "ru": "Горячая клавиша по умолчанию для «Поиск по тредам»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Toggle diff",
+  "ru": "Горячая клавиша по умолчанию для «Показать/скрыть дифф»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Toggle focused chat pane size",
+  "ru": "Горячая клавиша по умолчанию для «Развёрнуть/свёрнуть текущую область чата»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Toggle model picker",
+  "ru": "Горячая клавиша по умолчанию для «Показать/скрыть выбор модели»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Toggle panel",
+  "ru": "Горячая клавиша по умолчанию для «Показать/скрыть панель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcut for Toggle sidebar",
+  "ru": "Горячая клавиша по умолчанию для «Показать/скрыть боковую панель»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcuts for New thread",
+  "ru": "Горячие клавиши по умолчанию для «Новый тред»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcuts for Next thread",
+  "ru": "Горячие клавиши по умолчанию для «Следующий тред»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcuts for Open terminal",
+  "ru": "Горячие клавиши по умолчанию для «Открыть терминал»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Default shortcuts for Previous thread",
+  "ru": "Горячие клавиши по умолчанию для «Предыдущий тред»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Defaults:",
+  "ru": "По умолчанию:",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Degraded",
+  "ru": "Сниженная производительность",
+  "context": "components/plugin/management/PluginRowSignal.test.tsx"
+ },
+ {
+  "en": "Desired changes: [Replace this with how the new skill should differ from the reference.]",
+  "ru": "Желаемые изменения: [Опишите, чем новый навык должен отличаться от образца.]",
+  "context": "lib/skills-registry.test.ts"
+ },
+ {
+  "en": "Detached",
+  "ru": "Откреплённый HEAD",
+  "context": "views/root-compose-branch-ui.test.ts"
+ },
+ {
+  "en": "Details — source, versions",
+  "ru": "Подробности — источник, версии",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "Disconnect",
+  "ru": "Отключить",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Disconnecting forgets this bb's credential.",
+  "ru": "При отключёнии удаляются учётные данные этого bb.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Discord",
+  "ru": "Discord",
+  "context": "components/settings/CommunitySettingsSection.tsx"
+ },
+ {
+  "en": "Do not install, modify, or overwrite the reference skill, and do not copy its contents verbatim. Create a separate skill with its own name and files.",
+  "ru": "Не устанавливай, не изменяй и не перезаписывай исходный навык и не копируй его содержимое дословно. Создай отдельный навык с собственным именем и файлами.",
+  "context": "lib/skills-registry.test.ts"
+ },
+ {
+  "en": "Do this later",
+  "ru": "Сделать позже",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Document the plugin API",
+  "ru": "Задокументировать API плагинов",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Don&apos;t work in a project",
+  "ru": "Не работать в проекте",
+  "context": "components/pickers/ProjectSelector.stories.tsx"
+ },
+ {
+  "en": "Done. Tasks is live, and your agents can use it.",
+  "ru": "Готово. Плагин Tasks запущен, и агенты могут его использовать.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Download for macOS",
+  "ru": "Скачать для macOS",
+  "context": "landing/site-chrome.tsx"
+ },
+ {
+  "en": "Draft",
+  "ru": "Черновик",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Dwite",
+  "ru": "Dwite",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Each sidebar pane must reference one unique tab group",
+  "ru": "Каждая область боковой панели должна ссылаться на одну уникальную группу вкладок",
+  "context": "components/secondary-panel/sidebarSplitLayout.ts"
+ },
+ {
+  "en": "Early features that are off by default. Opt in to try them.",
+  "ru": "Ранние функции, отключённые по умолчанию. Включи их, чтобы опробовать.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Edit a sent message and replace the conversation from that point. Workspace changes are kept.",
+  "ru": "Отредактируй отправленное сообщение и начни диалог заново с этого момента. Изменения в рабочей области сохранятся.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Edited promo.test.ts",
+  "ru": "Отредактирован promo.test.ts",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Enter a folder name.",
+  "ru": "Введи имя папки.",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Enter a prompt or attach a file.",
+  "ru": "Введи промпт или прикрепи файл.",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Explored 14 commits",
+  "ru": "Изучено 14 коммитов",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Explored 4 files",
+  "ru": "Изучено 4 файла",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Expose a port",
+  "ru": "Открыть порт",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Express",
+  "ru": "Express",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Extensions Page and Plugin Marketplaces",
+  "ru": "Страница расширений и каталоги плагинов",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Failed subagent:",
+  "ru": "Ошибка субагента:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Failed to copy commit SHA",
+  "ru": "Не удалось скопировать SHA коммита",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Failed to copy file name",
+  "ru": "Не удалось скопировать имя файла",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Failed to copy path.",
+  "ru": "Не удалось скопировать путь.",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Failed to copy value",
+  "ru": "Не удалось скопировать значение",
+  "context": "components/promptbox/ThreadEnvironmentSummary.tsx"
+ },
+ {
+  "en": "Failed to create section.",
+  "ru": "Не удалось создать раздел.",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Failed to group queued messages",
+  "ru": "Не удалось сгруппировать сообщения в очереди",
+  "context": "components/thread/embedded-chat/useQueuedMessageActions.ts"
+ },
+ {
+  "en": "Failed to load models",
+  "ru": "Не удалось загрузить модели",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Failed to load thread storage",
+  "ru": "Не удалось загрузить хранилище треда",
+  "context": "components/secondary-panel/ThreadStorageBrowser.tsx"
+ },
+ {
+  "en": "Failed to queue message",
+  "ru": "Не удалось поместить сообщение в очередь",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Failed to rename section.",
+  "ru": "Не удалось переименовать раздел.",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Failed to reorder queued message",
+  "ru": "Не удалось изменить порядок сообщения в очереди",
+  "context": "components/thread/embedded-chat/useQueuedMessageActions.ts"
+ },
+ {
+  "en": "Failed to send message.",
+  "ru": "Не удалось отправить сообщение.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to update appearance.",
+  "ru": "Не удалось обновить тему оформления.",
+  "context": "hooks/mutations/settings-mutations.ts"
+ },
+ {
+  "en": "Failed to update environment.",
+  "ru": "Не удалось обновить окружение.",
+  "context": "components/sidebar/ProjectRow.tsx"
+ },
+ {
+  "en": "Failed to update pull request",
+  "ru": "Не удалось обновить пул-реквест",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Failed to update queued message",
+  "ru": "Не удалось обновить сообщение в очереди",
+  "context": "components/thread/embedded-chat/useQueuedMessageActions.ts"
+ },
+ {
+  "en": "Failed workflow:",
+  "ru": "Ошибка воркфлоу:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Faster large threads and a long list of fixes",
+  "ru": "Ускорение больших тредов и длинный список исправлений",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "File attachment",
+  "ru": "Вложение файла",
+  "context": "components/thread/toc/ThreadTableOfContents.tsx"
+ },
+ {
+  "en": "File name copied",
+  "ru": "Имя файла скопировано",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "File opener",
+  "ru": "Открытие файлов",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Find repos touched in the last 30 days",
+  "ru": "Найти репозитории, изменённые за последние 30 дней",
+  "context": "views/RootComposeEmptyWelcome.tsx"
+ },
+ {
+  "en": "Fix the plugin, then reload it.",
+  "ru": "Исправь плагин, затем перезагрузи его.",
+  "context": "components/plugin/management/plugin-status.test.ts"
+ },
+ {
+  "en": "Fixes and improvements",
+  "ru": "Исправления и улучшения",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Fork implement into a new bb skill",
+  "ru": "Форкнуть implement в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork research into a new bb skill",
+  "ru": "Форкнуть research в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork teach into a new bb skill",
+  "ru": "Форкнуть teach в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork triage into a new bb skill",
+  "ru": "Форкнуть triage в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork wayfinder into a new bb skill",
+  "ru": "Форкнуть wayfinder в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork wizard into a new bb skill",
+  "ru": "Форкнуть wizard в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Forked from …",
+  "ru": "Форкнуто от …",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.stories.tsx"
+ },
+ {
+  "en": "Found the duplicate fetch. Two ways to fix it.",
+  "ru": "Обнаружен повторный запрос. Два способа исправить.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Fully customizable.",
+  "ru": "Полная настройка под себя.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Get a tour of its capabilities",
+  "ru": "Познакомься с возможностями",
+  "context": "views/RootComposeEmptyWelcome.tsx"
+ },
+ {
+  "en": "Get new posts in your inbox. No spam.",
+  "ru": "Получай новые статьи на почту. Без спама.",
+  "context": "routes/blog.tsx"
+ },
+ {
+  "en": "Guided",
+  "ru": "С подсказками",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Handed the repro back to the parent thread.",
+  "ru": "Воспроизведение передано обратно в родительский тред.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Hide the custom models from config.json in every model picker, so a screen share does not show them.",
+  "ru": "Скрывать пользовательские модели из config.json во всех меню выбора модели, чтобы они не были видны при демонстрации экрана.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Homepage section",
+  "ru": "Раздел главной страницы",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Idle provider session release",
+  "ru": "Освобождение неактивной сессии провайдера",
+  "context": "views/SettingsView.experiments.test.tsx"
+ },
+ {
+  "en": "Implement a piece of work based on a spec or set of tickets.",
+  "ru": "Выполни задачу на основе спецификации или набора тикетов.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Included with BB; disable this plugin instead.",
+  "ru": "Входит в состав BB; вместо этого отключи этот плагин.",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Infra › CI",
+  "ru": "Инфраструктура › CI",
+  "context": "components/sidebar/ThreadSearchResultRow.stories.tsx"
+ },
+ {
+  "en": "Install Message Timestamps",
+  "ru": "Установить Message Timestamps",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Monaco",
+  "ru": "Установить Monaco",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Needs Attention",
+  "ru": "Установить Needs Attention",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Noema",
+  "ru": "Установить Noema",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install date unavailable",
+  "ru": "Дата установки недоступна",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Install this plugin, bundled with BB.",
+  "ru": "Установи этот плагин, поставляемый вместе с BB.",
+  "context": "components/plugin/management/AddPluginDialog.test.tsx"
+ },
+ {
+  "en": "Installed version unknown",
+  "ru": "Установленная версия неизвестна",
+  "context": "components/provider-cli/provider-cli-install.tsx"
+ },
+ {
+  "en": "Installing the plugin failed",
+  "ru": "Не удалось установить плагин",
+  "context": "components/plugin/management/AddPluginDialog.test.tsx"
+ },
+ {
+  "en": "Interrupted subagent:",
+  "ru": "Субагент прерван:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Interrupted workflow:",
+  "ru": "Воркфлоу прерван:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Its catalog and cached icons are deleted. Plugins installed from it keep running as direct installs and keep checking for updates from their recorded source.",
+  "ru": "Его каталог и кэшированные иконки будут удалёны. Установленные из него плагины продолжат работать как прямые установки и будут проверять обновлёния из сохранённого источника.",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Join the server for support, feedback, and announcements.",
+  "ru": "Присоединяйся к серверу для поддержки, обратной связи и новостей.",
+  "context": "components/settings/CommunitySettingsSection.tsx"
+ }
+]

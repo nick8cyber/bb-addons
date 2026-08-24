@@ -1,0 +1,994 @@
+[
+ {
+  "en": ".markdown files",
+  "ru": "файлы .markdown"
+ },
+ {
+  "en": ".md files",
+  "ru": "файлы .md"
+ },
+ {
+  "en": ".mdx files",
+  "ru": "файлы .mdx"
+ },
+ {
+  "en": "A dark Monokai-family palette for bb: one meaning per hue, a single text ladder, and a matching terminal.",
+  "ru": "Тёмная палитра семейства Monokai для bb: один смысл на оттенок, единая шкала текста и подходящий терминал."
+ },
+ {
+  "en": "ACP providers",
+  "ru": "Провайдеры ACP"
+ },
+ {
+  "en": "Add",
+  "ru": "Добавить"
+ },
+ {
+  "en": "Add persistent custom instructions to agent tasks on this bb host.",
+  "ru": "Добавляет постоянные пользовательские инструкции к задачам агентов на этом хосте bb."
+ },
+ {
+  "en": "Add to chat",
+  "ru": "Добавить в чат"
+ },
+ {
+  "en": "Adds an action that opens a panel beside a thread.",
+  "ru": "Добавляет действие, которое открывает панель рядом с тредом."
+ },
+ {
+  "en": "Adds an action to the app sidebar.",
+  "ru": "Добавляет кнопку в боковую панель приложения."
+ },
+ {
+  "en": "Adopt agent session",
+  "ru": "Перенять сессию агента"
+ },
+ {
+  "en": "Agent usage limits",
+  "ru": "Лимиты расхода агентов"
+ },
+ {
+  "en": "Archive",
+  "ru": "В архив"
+ },
+ {
+  "en": "Archive worktree",
+  "ru": "Рабочее дерево в архив"
+ },
+ {
+  "en": "Archived",
+  "ru": "В архиве"
+ },
+ {
+  "en": "Ask User Question",
+  "ru": "Вопрос пользователю"
+ },
+ {
+  "en": "Ask anything.",
+  "ru": "Спроси о чём угодно."
+ },
+ {
+  "en": "Ask anything. @ to mention files, folders, or sections",
+  "ru": "Спроси о чём угодно. @ — упомянуть файлы, папки или разделы"
+ },
+ {
+  "en": "Ask for a follow-up. @ to mention files, folders, sections, or threads",
+  "ru": "Задай уточняющий вопрос. @ — упомянуть файлы, папки, разделы или треды"
+ },
+ {
+  "en": "Attached image preview",
+  "ru": "Превью прикреплённого изображения"
+ },
+ {
+  "en": "Automatic (Markdown)",
+  "ru": "Автоматически (Markdown)"
+ },
+ {
+  "en": "Automations",
+  "ru": "Автоматизации"
+ },
+ {
+  "en": "BB Community",
+  "ru": "Сообщество BB"
+ },
+ {
+  "en": "BB Official",
+  "ru": "Официальные BB"
+ },
+ {
+  "en": "BB actions",
+  "ru": "Действия BB"
+ },
+ {
+  "en": "Back to app",
+  "ru": "Назад в приложение"
+ },
+ {
+  "en": "Blue",
+  "ru": "Синий"
+ },
+ {
+  "en": "Branch",
+  "ru": "Ветка"
+ },
+ {
+  "en": "Browse plugins",
+  "ru": "Каталог плагинов"
+ },
+ {
+  "en": "Browse skills",
+  "ru": "Каталог навыков"
+ },
+ {
+  "en": "Bulk update actions",
+  "ru": "Действия массового обновления"
+ },
+ {
+  "en": "By:",
+  "ru": "Автор:"
+ },
+ {
+  "en": "Calm, configurable sounds for AI turns and attention events.",
+  "ru": "Спокойные настраиваемые звуки для ходов агента и событий, требующих внимания."
+ },
+ {
+  "en": "Cancel",
+  "ru": "Отмена"
+ },
+ {
+  "en": "Chat with other bb users and follow development on GitHub.",
+  "ru": "Общайся с другими пользователями bb и следи за разработкой на GitHub."
+ },
+ {
+  "en": "Checked just now",
+  "ru": "Проверено только что"
+ },
+ {
+  "en": "Checking checkout",
+  "ru": "Проверка переключения"
+ },
+ {
+  "en": "Chief of staff",
+  "ru": "Помощник"
+ },
+ {
+  "en": "Choose another app to open workspace",
+  "ru": "Выбрать другое приложение для рабочей области"
+ },
+ {
+  "en": "Choose local fonts and tune typography independently of your BB theme.",
+  "ru": "Выбирает локальные шрифты и настраивает типографику независимо от темы BB."
+ },
+ {
+  "en": "Claude Code provider",
+  "ru": "Провайдер Claude Code"
+ },
+ {
+  "en": "Claude usage is rate limited right now. Try again shortly.",
+  "ru": "Расход Claude сейчас ограничен. Попробуй чуть позже."
+ },
+ {
+  "en": "Close",
+  "ru": "Закрыть"
+ },
+ {
+  "en": "Close pane",
+  "ru": "Закрыть область"
+ },
+ {
+  "en": "Codex provider",
+  "ru": "Провайдер Codex"
+ },
+ {
+  "en": "Commit",
+  "ru": "Коммит"
+ },
+ {
+  "en": "Connection not secure",
+  "ru": "Незащищённое подключение"
+ },
+ {
+  "en": "Continue a session from another agent — Claude Code, Codex, Gemini CLI, OpenCode…",
+  "ru": "Продолжить сессию другого агента — Claude Code, Codex, Gemini CLI, OpenCode…"
+ },
+ {
+  "en": "Continue turns after Codex and Claude Code subscription limits reset.",
+  "ru": "Продолжает ходы после того, как сбросятся лимиты подписки Codex и Claude Code."
+ },
+ {
+  "en": "Copy",
+  "ru": "Копировать"
+ },
+ {
+  "en": "Copy branch name",
+  "ru": "Копировать имя ветки"
+ },
+ {
+  "en": "Copy message",
+  "ru": "Копировать сообщение"
+ },
+ {
+  "en": "Create",
+  "ru": "Создать"
+ },
+ {
+  "en": "Create and edit Markdown documents across local and connected-host vaults.",
+  "ru": "Создаёт и правит документы Markdown в хранилищах на локальной и подключённых машинах."
+ },
+ {
+  "en": "Create custom dark palette",
+  "ru": "Создать свою тёмную палитру"
+ },
+ {
+  "en": "Create custom light palette",
+  "ru": "Создать свою светлую палитру"
+ },
+ {
+  "en": "Create new thread in this worktree",
+  "ru": "Новый тред в этом рабочем дереве"
+ },
+ {
+  "en": "Current",
+  "ru": "Текущая"
+ },
+ {
+  "en": "Custom instructions",
+  "ru": "Пользовательские инструкции"
+ },
+ {
+  "en": "Defaults:",
+  "ru": "По умолчанию:"
+ },
+ {
+  "en": "Delete",
+  "ru": "Удалить"
+ },
+ {
+  "en": "Diff",
+  "ru": "Дифф"
+ },
+ {
+  "en": "Disable",
+  "ru": "Отключить"
+ },
+ {
+  "en": "Docs",
+  "ru": "Документация"
+ },
+ {
+  "en": "Done",
+  "ru": "Готово"
+ },
+ {
+  "en": "Edit",
+  "ru": "Изменить"
+ },
+ {
+  "en": "Enable",
+  "ru": "Включить"
+ },
+ {
+  "en": "Environment",
+  "ru": "Окружение"
+ },
+ {
+  "en": "Error",
+  "ru": "Ошибка"
+ },
+ {
+  "en": "Fast mode",
+  "ru": "Быстрый режим"
+ },
+ {
+  "en": "Filters",
+  "ru": "Фильтры"
+ },
+ {
+  "en": "Fork",
+  "ru": "Форк"
+ },
+ {
+  "en": "Fork into new thread",
+  "ru": "Форкнуть в новый тред"
+ },
+ {
+  "en": "Full",
+  "ru": "Полный"
+ },
+ {
+  "en": "Full Access",
+  "ru": "Полный доступ"
+ },
+ {
+  "en": "Go forward",
+  "ru": "Вперёд"
+ },
+ {
+  "en": "Goal",
+  "ru": "Цель"
+ },
+ {
+  "en": "Green",
+  "ru": "Зелёный"
+ },
+ {
+  "en": "Hand off from here",
+  "ru": "Передать отсюда"
+ },
+ {
+  "en": "Hide right panel (Ctrl + J)",
+  "ru": "Скрыть правую панель (Ctrl + J)"
+ },
+ {
+  "en": "High",
+  "ru": "Высокое"
+ },
+ {
+  "en": "Inline visualizations",
+  "ru": "Встроенные визуализации"
+ },
+ {
+  "en": "Install",
+  "ru": "Установить"
+ },
+ {
+  "en": "Installed",
+  "ru": "Установлен"
+ },
+ {
+  "en": "Keep Awake",
+  "ru": "Не давать уснуть"
+ },
+ {
+  "en": "Keeps selected macOS hosts awake while bb is running.",
+  "ru": "Не даёт выбранным хостам macOS уснуть, пока работает bb."
+ },
+ {
+  "en": "Keeps threads in the smart zone, by tracking context against a limit you set rather than the provider's full window.",
+  "ru": "Держит треды в комфортной зоне: считает контекст относительно заданного тобой предела, а не полного окна провайдера."
+ },
+ {
+  "en": "Let any provider ask the user a multiple-choice question, the way Claude Code's AskUserQuestion does natively.",
+  "ru": "Позволяет любому провайдеру задать пользователю вопрос с вариантами ответа — так же, как это умеет AskUserQuestion в Claude Code."
+ },
+ {
+  "en": "Loading",
+  "ru": "Загрузка"
+ },
+ {
+  "en": "Loading models...",
+  "ru": "Загрузка моделей..."
+ },
+ {
+  "en": "Loading more…",
+  "ru": "Загрузка ещё…"
+ },
+ {
+  "en": "Loading plugins",
+  "ru": "Загрузка плагинов"
+ },
+ {
+  "en": "Loading…",
+  "ru": "Загрузка…"
+ },
+ {
+  "en": "Local",
+  "ru": "Локально"
+ },
+ {
+  "en": "Low",
+  "ru": "Низкое"
+ },
+ {
+  "en": "Machine",
+  "ru": "Машина"
+ },
+ {
+  "en": "Machines",
+  "ru": "Машины"
+ },
+ {
+  "en": "Make prompt box larger",
+  "ru": "Увеличить поле ввода"
+ },
+ {
+  "en": "Make prompt box smaller",
+  "ru": "Уменьшить поле ввода"
+ },
+ {
+  "en": "Max",
+  "ru": "Максимальное"
+ },
+ {
+  "en": "Medium",
+  "ru": "Среднее"
+ },
+ {
+  "en": "Memory",
+  "ru": "Память"
+ },
+ {
+  "en": "Merge base",
+  "ru": "База слияния"
+ },
+ {
+  "en": "Message actions",
+  "ru": "Действия с сообщением"
+ },
+ {
+  "en": "Mock CLI Traffic",
+  "ru": "Подменять трафик CLI"
+ },
+ {
+  "en": "Model",
+  "ru": "Модель"
+ },
+ {
+  "en": "Models",
+  "ru": "Модели"
+ },
+ {
+  "en": "Move a session between agents and machines, in both directions — hand off a bb thread to another provider (and optionally another enrolled machine, carrying uncommitted work), or adopt an outside Claude Code / Codex / Gemini CLI / OpenCode session, local or remote, as a bb thread.",
+  "ru": "Переносит сессию между агентами и машинами в обе стороны: отдаёт тред bb другому провайдеру (и при желании на другую подключённую машину, вместе с незакоммиченной работой) либо принимает внешнюю сессию Claude Code / Codex / Gemini CLI / OpenCode, локальную или удалённую, как тред bb."
+ },
+ {
+  "en": "New automation",
+  "ru": "Новая автоматизация"
+ },
+ {
+  "en": "New automation options",
+  "ru": "Параметры новой автоматизации"
+ },
+ {
+  "en": "New thread",
+  "ru": "Новый тред"
+ },
+ {
+  "en": "New thread (Ctrl + Shift + O)",
+  "ru": "Новый тред (Ctrl + Shift + O)"
+ },
+ {
+  "en": "No automations installed.",
+  "ru": "Автоматизаций нет."
+ },
+ {
+  "en": "No issues",
+  "ru": "Проблем нет"
+ },
+ {
+  "en": "No project",
+  "ru": "Без проекта"
+ },
+ {
+  "en": "Nothing needs your attention right now.",
+  "ru": "Сейчас ничего не требует внимания."
+ },
+ {
+  "en": "Open",
+  "ru": "Открыть"
+ },
+ {
+  "en": "Open in external browser",
+  "ru": "Открыть во внешнем браузере"
+ },
+ {
+  "en": "Open new tab (Ctrl + T)",
+  "ru": "Новая вкладка (Ctrl + T)"
+ },
+ {
+  "en": "Open split thread 1",
+  "ru": "Открыть тред 1 рядом"
+ },
+ {
+  "en": "Open split thread 2",
+  "ru": "Открыть тред 2 рядом"
+ },
+ {
+  "en": "Open split thread 3",
+  "ru": "Открыть тред 3 рядом"
+ },
+ {
+  "en": "Open split thread 4",
+  "ru": "Открыть тред 4 рядом"
+ },
+ {
+  "en": "Open split thread 5",
+  "ru": "Открыть тред 5 рядом"
+ },
+ {
+  "en": "Open split thread 6",
+  "ru": "Открыть тред 6 рядом"
+ },
+ {
+  "en": "Open split thread 7",
+  "ru": "Открыть тред 7 рядом"
+ },
+ {
+  "en": "Open split thread 8",
+  "ru": "Открыть тред 8 рядом"
+ },
+ {
+  "en": "Open split thread 9",
+  "ru": "Открыть тред 9 рядом"
+ },
+ {
+  "en": "Open thread 1",
+  "ru": "Открыть тред 1"
+ },
+ {
+  "en": "Open thread 2",
+  "ru": "Открыть тред 2"
+ },
+ {
+  "en": "Open thread 3",
+  "ru": "Открыть тред 3"
+ },
+ {
+  "en": "Open thread 4",
+  "ru": "Открыть тред 4"
+ },
+ {
+  "en": "Open thread 5",
+  "ru": "Открыть тред 5"
+ },
+ {
+  "en": "Open thread 6",
+  "ru": "Открыть тред 6"
+ },
+ {
+  "en": "Open thread 7",
+  "ru": "Открыть тред 7"
+ },
+ {
+  "en": "Open thread 8",
+  "ru": "Открыть тред 8"
+ },
+ {
+  "en": "Open thread 9",
+  "ru": "Открыть тред 9"
+ },
+ {
+  "en": "Open visible sidebar thread 1.",
+  "ru": "Открыть 1-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 2.",
+  "ru": "Открыть 2-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 3.",
+  "ru": "Открыть 3-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 4.",
+  "ru": "Открыть 4-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 5.",
+  "ru": "Открыть 5-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 6.",
+  "ru": "Открыть 6-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 7.",
+  "ru": "Открыть 7-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 8.",
+  "ru": "Открыть 8-й тред из боковой панели."
+ },
+ {
+  "en": "Open visible sidebar thread 9.",
+  "ru": "Открыть 9-й тред из боковой панели."
+ },
+ {
+  "en": "Opens this plugin's configuration.",
+  "ru": "Открывает настройки этого плагина."
+ },
+ {
+  "en": "Orange",
+  "ru": "Оранжевый"
+ },
+ {
+  "en": "Palette",
+  "ru": "Палитра"
+ },
+ {
+  "en": "Permission mode: Full Access - No sandbox and no approvals — the agent can run anything on your machine.",
+  "ru": "Режим доступа: полный доступ — без песочницы и подтверждений, агент может запустить на твоей машине что угодно."
+ },
+ {
+  "en": "Pi provider",
+  "ru": "Провайдер Pi"
+ },
+ {
+  "en": "Pin",
+  "ru": "Закрепить"
+ },
+ {
+  "en": "Pink",
+  "ru": "Розовый"
+ },
+ {
+  "en": "Plan",
+  "ru": "План"
+ },
+ {
+  "en": "Plan and track work in BB, delegate tasks to agents, and keep task context connected to worker threads.",
+  "ru": "Планирует и отслеживает работу в BB, раздаёт задачи агентам и держит контекст задачи связанным с рабочими тредами."
+ },
+ {
+  "en": "Plugin",
+  "ru": "Плагин"
+ },
+ {
+  "en": "Plugins",
+  "ru": "Плагины"
+ },
+ {
+  "en": "Project",
+  "ru": "Проект"
+ },
+ {
+  "en": "Project path",
+  "ru": "Путь к проекту"
+ },
+ {
+  "en": "Projects",
+  "ru": "Проекты"
+ },
+ {
+  "en": "Prompt actions",
+  "ru": "Действия с промптом"
+ },
+ {
+  "en": "Provider",
+  "ru": "Провайдер"
+ },
+ {
+  "en": "Provider retry",
+  "ru": "Повтор у провайдера"
+ },
+ {
+  "en": "Provider, model and reasoning (Ctrl + Shift + M)",
+  "ru": "Провайдер, модель и рассуждение (Ctrl + Shift + M)"
+ },
+ {
+  "en": "Provider-independent durable memory for agents. We recommend disabling provider-native memory when using this plugin.",
+  "ru": "Постоянная память агентов, не зависящая от провайдера. Вместе с этим плагином встроенную память провайдера лучше отключить."
+ },
+ {
+  "en": "Purple",
+  "ru": "Фиолетовый"
+ },
+ {
+  "en": "Question for you",
+  "ru": "Вопрос для тебя"
+ },
+ {
+  "en": "Reasoning",
+  "ru": "Рассуждение"
+ },
+ {
+  "en": "Red",
+  "ru": "Красный"
+ },
+ {
+  "en": "Refresh agent usage",
+  "ru": "Обновить данные о расходе"
+ },
+ {
+  "en": "Remote access",
+  "ru": "Удалённый доступ"
+ },
+ {
+  "en": "Remote access via getbb.app — this bb becomes reachable at https://<handle>.getbb.app. Disable to cut off all remote access.",
+  "ru": "Удалённый доступ через getbb.app — этот bb становится доступен по адресу https://<handle>.getbb.app. Отключение обрывает весь удалённый доступ."
+ },
+ {
+  "en": "Remove",
+  "ru": "Убрать"
+ },
+ {
+  "en": "Rename",
+  "ru": "Переименовать"
+ },
+ {
+  "en": "Render workspace HTML visualizations inline in assistant messages.",
+  "ru": "Показывает HTML-визуализации из рабочей области прямо в сообщениях агента."
+ },
+ {
+  "en": "Rendering diagram...",
+  "ru": "Отрисовка диаграммы..."
+ },
+ {
+  "en": "Reply in side chat",
+  "ru": "Ответить в сайд-чате"
+ },
+ {
+  "en": "Reply to messages in hidden side-chat forks rendered in a thread panel.",
+  "ru": "Отвечает на сообщения в скрытых форках сайд-чата, показанных в панели треда."
+ },
+ {
+  "en": "Retry",
+  "ru": "Повторить"
+ },
+ {
+  "en": "Review and manage provider-independent global and project memories.",
+  "ru": "Просматривай и правь глобальную память и память проектов, не зависящую от провайдера."
+ },
+ {
+  "en": "Run bb threads with ACP agents (supports Cursor, opencode, omp and more).",
+  "ru": "Ведёт треды bb на агентах ACP (поддерживаются Cursor, opencode, omp и другие)."
+ },
+ {
+  "en": "Run bb threads with Claude Code.",
+  "ru": "Ведёт треды bb на Claude Code."
+ },
+ {
+  "en": "Run bb threads with Codex.",
+  "ru": "Ведёт треды bb на Codex."
+ },
+ {
+  "en": "Run bb threads with Pi.",
+  "ru": "Ведёт треды bb на Pi."
+ },
+ {
+  "en": "Run durable, provider-independent agent workflows.",
+  "ru": "Запускает устойчивые воркфлоу агентов, не зависящие от провайдера."
+ },
+ {
+  "en": "Save",
+  "ru": "Сохранить"
+ },
+ {
+  "en": "Schedule recurring and one-shot agent or script work.",
+  "ru": "Планирует повторяющиеся и разовые запуски агентов и скриптов."
+ },
+ {
+  "en": "Search",
+  "ru": "Поиск"
+ },
+ {
+  "en": "Search archived threads",
+  "ru": "Поиск по архивным тредам"
+ },
+ {
+  "en": "Search archived threads…",
+  "ru": "Поиск по архивным тредам…"
+ },
+ {
+  "en": "Search automations",
+  "ru": "Поиск автоматизаций"
+ },
+ {
+  "en": "Search files",
+  "ru": "Поиск файлов"
+ },
+ {
+  "en": "Search threads",
+  "ru": "Поиск по тредам"
+ },
+ {
+  "en": "Search threads (Ctrl + K)",
+  "ru": "Поиск по тредам (Ctrl + K)"
+ },
+ {
+  "en": "Secrets",
+  "ru": "Секреты"
+ },
+ {
+  "en": "Securely request credentials from a user and reconcile them into dotenv files.",
+  "ru": "Безопасно запрашивает у пользователя учётные данные и складывает их в файлы dotenv."
+ },
+ {
+  "en": "See what's taking up disk space on the bb server host, with drill-down by directory.",
+  "ru": "Показывает, что занимает место на диске хоста сервера bb, с разбором по каталогам."
+ },
+ {
+  "en": "Send",
+  "ru": "Отправить"
+ },
+ {
+  "en": "Settings",
+  "ru": "Настройки"
+ },
+ {
+  "en": "Show diff panel (Ctrl + D)",
+  "ru": "Показать панель диффа (Ctrl + D)"
+ },
+ {
+  "en": "Show more",
+  "ru": "Показать ещё"
+ },
+ {
+  "en": "Show right panel",
+  "ru": "Показать правую панель"
+ },
+ {
+  "en": "Show right panel (Ctrl + J)",
+  "ru": "Показать правую панель (Ctrl + J)"
+ },
+ {
+  "en": "Show thread info panel",
+  "ru": "Показать панель информации о треде"
+ },
+ {
+  "en": "Side chat",
+  "ru": "Сайд-чат"
+ },
+ {
+  "en": "Sidebar display options",
+  "ru": "Параметры отображения боковой панели"
+ },
+ {
+  "en": "Skills",
+  "ru": "Навыки"
+ },
+ {
+  "en": "Sort by",
+  "ru": "Сортировка"
+ },
+ {
+  "en": "Stop",
+  "ru": "Остановить"
+ },
+ {
+  "en": "Submit (Enter)",
+  "ru": "Отправить (Enter)"
+ },
+ {
+  "en": "Tasks",
+  "ru": "Задачи"
+ },
+ {
+  "en": "Teal",
+  "ru": "Бирюзовый"
+ },
+ {
+  "en": "Terminal",
+  "ru": "Терминал"
+ },
+ {
+  "en": "Terminal reconnected",
+  "ru": "Терминал переподключён"
+ },
+ {
+  "en": "The three ayu themes — Light, Dark, Mirage — with a palette explorer panel and a `bb ayu` colour lookup.",
+  "ru": "Три темы ayu — Light, Dark и Mirage — с панелью обзора палитры и поиском цвета через `bb ayu`."
+ },
+ {
+  "en": "This diff was truncated for display.",
+  "ru": "Этот дифф сокращён для отображения."
+ },
+ {
+  "en": "This file was deleted.",
+  "ru": "Этот файл был удалён."
+ },
+ {
+  "en": "This plugin shares memory across providers. We recommend disabling provider-native memory under Settings → Providers to avoid duplicate or conflicting stores.",
+  "ru": "Этот плагин делит память между провайдерами. Встроенную память провайдера лучше отключить в «Настройки → Провайдеры», чтобы не держать дублирующие и спорящие хранилища."
+ },
+ {
+  "en": "This plugin shares memory across providers. We recommend disabling provider-native memory under Settings → Providers.",
+  "ru": "Этот плагин делит память между провайдерами. Встроенную память провайдера лучше отключить в «Настройки → Провайдеры»."
+ },
+ {
+  "en": "Thread",
+  "ru": "Тред"
+ },
+ {
+  "en": "Thread actions",
+  "ru": "Действия с тредом"
+ },
+ {
+  "en": "Thread context before sending",
+  "ru": "Контекст треда перед отправкой"
+ },
+ {
+  "en": "Thread working",
+  "ru": "Тред работает"
+ },
+ {
+  "en": "Threads",
+  "ru": "Треды"
+ },
+ {
+  "en": "Top threads needing you on the homepage: errors, pending input, unread finished turns.",
+  "ru": "Показывает на главной треды, которым нужен ты: ошибки, ожидание ввода, непрочитанные завершённые ходы."
+ },
+ {
+  "en": "Turn finished — reply needed",
+  "ru": "Ход завершён — нужен ответ"
+ },
+ {
+  "en": "Unarchive",
+  "ru": "Из архива"
+ },
+ {
+  "en": "Unarchive thread",
+  "ru": "Вернуть тред из архива"
+ },
+ {
+  "en": "Unassigned",
+  "ru": "Не назначено"
+ },
+ {
+  "en": "Unlimited",
+  "ru": "Без лимита"
+ },
+ {
+  "en": "Unpin",
+  "ru": "Открепить"
+ },
+ {
+  "en": "Unread",
+  "ru": "Непрочитанные"
+ },
+ {
+  "en": "Unread thread succeeded",
+  "ru": "Непрочитанный тред завершён успешно"
+ },
+ {
+  "en": "Untracked",
+  "ru": "Не отслеживается"
+ },
+ {
+  "en": "Update",
+  "ru": "Обновить"
+ },
+ {
+  "en": "Update failed",
+  "ru": "Обновление не удалось"
+ },
+ {
+  "en": "Video editor",
+  "ru": "Видеоредактор"
+ },
+ {
+  "en": "Work in a project",
+  "ru": "Работать в проекте"
+ },
+ {
+  "en": "Work locally",
+  "ru": "Работать локально"
+ },
+ {
+  "en": "Workflows",
+  "ru": "Воркфлоу"
+ },
+ {
+  "en": "Working locally",
+  "ru": "Работа локально"
+ },
+ {
+  "en": "Working...",
+  "ru": "Работаю..."
+ },
+ {
+  "en": "Worktree",
+  "ru": "Рабочее дерево"
+ },
+ {
+  "en": "Yellow",
+  "ru": "Жёлтый"
+ },
+ {
+  "en": "a kanban board",
+  "ru": "канбан-доска"
+ },
+ {
+  "en": "bb reads plugin catalogs from these marketplaces. Adding one validates and caches its catalog; it never installs plugin code.",
+  "ru": "bb читает каталоги плагинов из этих маркетплейсов. Добавление проверяет и кэширует каталог, но не устанавливает код плагина."
+ },
+ {
+  "en": "just now",
+  "ru": "только что"
+ },
+ {
+  "en": "open menu",
+  "ru": "открыть меню"
+ }
+]

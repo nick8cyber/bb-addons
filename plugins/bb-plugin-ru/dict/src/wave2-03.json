@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Estimated context",
+  "ru": "Примерный контекст",
+  "context": "components/thread/timeline/ThreadContextWindowIndicator.stories.tsx"
+ },
+ {
+  "en": "Ethan Greenfeld",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Explored 3 files",
+  "ru": "Просмотрено 3 файла",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Fade out splits that do not have focus.",
+  "ru": "Затенять неактивные области.",
+  "context": "components/settings/SplitDimmingSetting.test.tsx"
+ },
+ {
+  "en": "Failed to archive thread and children",
+  "ru": "Не удалось переместить в архив тред и дочерние элементы",
+  "context": "components/thread/ThreadActionsProvider.tsx"
+ },
+ {
+  "en": "Failed to copy file path",
+  "ru": "Не удалось скопировать путь к файлу",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Failed to load diff",
+  "ru": "Не удалось загрузить дифф",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Failed to update merge base",
+  "ru": "Не удалось обновить базу слияния",
+  "context": "components/ui/sonner.stories.tsx"
+ },
+ {
+  "en": "Failed to update thread.",
+  "ru": "Не удалось обновить тред.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "File path copied",
+  "ru": "Путь к файлу скопирован",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Fix auth bug",
+  "ru": "Исправить баг аутентификации",
+  "context": "components/thread/timeline/GeneratedConversationMessage.test.ts"
+ },
+ {
+  "en": "Focus composer",
+  "ru": "Фокус на поле ввода",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus location",
+  "ru": "Фокус на адресной строке",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus next chat pane",
+  "ru": "Фокус на следующей области чата",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus previous chat pane",
+  "ru": "Фокус на предыдущей области чата",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus the active composer's input and move the caret to the end.",
+  "ru": "Перевести фокус в активное поле ввода и переместить курсор в конец.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus the embedded browser address bar.",
+  "ru": "Перевести фокус в адресную строку встроенного браузера.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus the next chat pane in reading order.",
+  "ru": "Перевести фокус на следующую область чата по порядку чтения.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus the previous chat pane in reading order.",
+  "ru": "Перевести фокус на предыдущую область чата по порядку чтения.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Focus the sidebar thread search.",
+  "ru": "Фокус на поиске тредов в боковой панели.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Fork grilling into a new bb skill",
+  "ru": "Форкнуть grilling в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork handoff into a new bb skill",
+  "ru": "Форкнуть handoff в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork prototype into a new bb skill",
+  "ru": "Форкнуть prototype в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fork tdd into a new bb skill",
+  "ru": "Форкнуть tdd в новый навык bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Guilherme J. Tramontina",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Image attachment",
+  "ru": "Вложение-изображение",
+  "context": "components/thread/toc/ThreadTableOfContents.test.tsx"
+ },
+ {
+  "en": "Install Agentation",
+  "ru": "Установить Agentation",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Agentation → Mentions",
+  "ru": "Установить Agentation → Mentions",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Amp",
+  "ru": "Установить Amp",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Arc Switcher",
+  "ru": "Установить Arc Switcher",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Ayu",
+  "ru": "Установить Ayu",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install BB UI Reference",
+  "ru": "Установить BB UI Reference",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Better LaTeX",
+  "ru": "Установить Better LaTeX",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Call Stacks",
+  "ru": "Установить Call Stacks",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Cascade",
+  "ru": "Установить Cascade",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Checklists",
+  "ru": "Установить Checklists",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Chime",
+  "ru": "Установить Chime",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Context Meter",
+  "ru": "Установить Context Meter",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Dependabot",
+  "ru": "Установить Dependabot",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Disk Usage",
+  "ru": "Установить Disk Usage",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Docs",
+  "ru": "Установить Docs",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Emoji React",
+  "ru": "Установить Emoji React",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Floating Terminal",
+  "ru": "Установить Floating Terminal",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Fonts",
+  "ru": "Установить Fonts",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install GTD Sidebar",
+  "ru": "Установить GTD Sidebar",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install GitHub",
+  "ru": "Установить GitHub",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install GitHub Stack",
+  "ru": "Установить GitHub Stack",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install GitLab",
+  "ru": "Установить GitLab",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Global Workflows",
+  "ru": "Установить Global Workflows",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install Image Preview",
+  "ru": "Установить Image Preview",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install bb Monokai",
+  "ru": "Установить bb Monokai",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Installed plugins",
+  "ru": "Установленные плагины",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Interactive preview of the bb app",
+  "ru": "Интерактивный предпросмотр приложения bb",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "July 14, 2026",
+  "ru": "14 июля 2026 г.",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Kanban board",
+  "ru": "Канбан-доска",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Keep planning",
+  "ru": "Продолжить планирование",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.test.tsx"
+ },
+ {
+  "en": "Loading grilling",
+  "ru": "Загрузка grilling",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading handoff",
+  "ru": "Загрузка handoff",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading microphones",
+  "ru": "Загрузка микрофонов",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "Loading microphones.",
+  "ru": "Загрузка микрофонов.",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "Loading models from the selected machine...",
+  "ru": "Загрузка моделей с выбранной машины...",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Loading plugin",
+  "ru": "Загрузка плагина",
+  "context": "views/ToolsView.tsx"
+ },
+ {
+  "en": "Loading prototype",
+  "ru": "Загрузка prototype",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading skill",
+  "ru": "Загрузка навыка",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Loading skills.sh skills",
+  "ru": "Загрузка навыков skills.sh",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "Loading tdd",
+  "ru": "Загрузка tdd",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading usage…",
+  "ru": "Загрузка расхода…",
+  "context": "components/settings/UsageLimitsSettingsSection.test.tsx"
+ },
+ {
+  "en": "Marius Nouchet",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Markdown formatting in prompt box",
+  "ru": "Форматирование Markdown в поле ввода",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Maximize the focused chat pane or restore its split layout.",
+  "ru": "Развёрнуть активную область чата или восстановить её разделение.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Message from",
+  "ru": "Сообщение от",
+  "context": "components/thread/timeline/GeneratedConversationMessage.tsx"
+ },
+ {
+  "en": "Mobile bb preview: a prompt asks for a task management system, and the agent builds it as a plugin",
+  "ru": "Мобильный предпросмотр bb: промпт запрашивает систему управления задачами, и агент создаёт её в виде плагина",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Name",
+  "ru": "Имя",
+  "context": "components/secondary-panel/FilePreview.test.tsx"
+ },
+ {
+  "en": "Navigate to threads on creation",
+  "ru": "Переходить к тредам при создании",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "New branch",
+  "ru": "Новая ветка",
+  "context": "components/pickers/BranchPicker.stories.tsx"
+ },
+ {
+  "en": "New panel tab",
+  "ru": "Новая вкладка панели",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "New window",
+  "ru": "Новое окно",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Nicolas Charpentier",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "No archived threads match these filters.",
+  "ru": "Нет архивных тредов, соответствующих этим фильтрам.",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "No branches found.",
+  "ru": "Ветки не найдены.",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "No local app can open directories.",
+  "ru": "Нет локальных приложений для открытия папок.",
+  "context": "hooks/useLocalOpenTargets.ts"
+ },
+ {
+  "en": "No local app can open files.",
+  "ru": "Нет локальных приложений для открытия файлов.",
+  "context": "hooks/useLocalOpenTargets.ts"
+ },
+ {
+  "en": "No microphones found.",
+  "ru": "Микрофоны не найдены.",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "One page",
+  "ru": "Одна страница",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Open ACP providers details",
+  "ru": "Сведения о плагине ACP providers",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Advisor details",
+  "ru": "Сведения о плагине Advisor",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Agent Proxy details",
+  "ru": "Сведения о плагине Agent Proxy",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Agentation details",
+  "ru": "Сведения о плагине Agentation",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Agentation → Mentions details",
+  "ru": "Сведения о плагине Agentation → Mentions",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Amp details",
+  "ru": "Сведения о плагине Amp",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Arc Switcher details",
+  "ru": "Сведения о плагине Arc Switcher",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Ask User Question details",
+  "ru": "Сведения о плагине Ask User Question",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Automations details",
+  "ru": "Сведения о плагине Automations",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Ayu details",
+  "ru": "Сведения о плагине Ayu",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open BB UI Reference details",
+  "ru": "Сведения о плагине BB UI Reference",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Better LaTeX details",
+  "ru": "Сведения о плагине Better LaTeX",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Call Stacks details",
+  "ru": "Сведения о плагине Call Stacks",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Cascade details",
+  "ru": "Сведения о плагине Cascade",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Checklists details",
+  "ru": "Сведения о плагине Checklists",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Chime details",
+  "ru": "Сведения о плагине Chime",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Claude Code provider details",
+  "ru": "Сведения о провайдере Claude Code",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Codex provider details",
+  "ru": "Сведения о провайдере Codex",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Context Meter details",
+  "ru": "Сведения о плагине Context Meter",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Create custom light palette",
+  "ru": "Открыть создание светлой палитры",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Create custom light palette (unsubmitted draft)",
+  "ru": "Открыть создание светлой палитры (неотправленный черновик)",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Custom instructions details",
+  "ru": "Сведения о плагине Custom instructions",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Dependabot details",
+  "ru": "Сведения о плагине Dependabot",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Disk Usage details",
+  "ru": "Сведения о плагине Disk Usage",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Dispatch details",
+  "ru": "Сведения о плагине Dispatch",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Docs details",
+  "ru": "Сведения о плагине Docs",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Emoji React details",
+  "ru": "Сведения о плагине Emoji React",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Floating Terminal details",
+  "ru": "Сведения о плагине Floating Terminal",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Fonts details",
+  "ru": "Сведения о плагине Fonts",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open GTD Sidebar details",
+  "ru": "Сведения о плагине GTD Sidebar",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open GitHub Stack details",
+  "ru": "Сведения о плагине GitHub Stack",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open GitHub details",
+  "ru": "Сведения о плагине GitHub",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open GitLab details",
+  "ru": "Сведения о плагине GitLab",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Global Workflows details",
+  "ru": "Сведения о плагине Global Workflows",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Handoff details",
+  "ru": "Сведения о плагине Handoff",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Headroom details",
+  "ru": "Сведения о плагине Headroom",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Image Preview details",
+  "ru": "Сведения о плагине Image Preview",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Inline visualizations details",
+  "ru": "Сведения о плагине Inline visualizations",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Keep Awake details",
+  "ru": "Сведения о плагине Keep Awake",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Memory details",
+  "ru": "Сведения о плагине Memory",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Pi provider details",
+  "ru": "Сведения о провайдере Pi",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Provider retry details",
+  "ru": "Сведения о плагине Provider retry",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Remote access details",
+  "ru": "Сведения о плагине Remote access",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Secrets details",
+  "ru": "Сведения о плагине Secrets",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Side chat details",
+  "ru": "Сведения о плагине Side chat",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Tasks details",
+  "ru": "Сведения о плагине Tasks",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Workflows details",
+  "ru": "Сведения о плагине Workflows",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Workspace",
+  "ru": "Открыть рабочую область",
+  "context": "components/thread/ThreadWorkspaceOpenButton.tsx"
+ },
+ {
+  "en": "Open a tab in the secondary panel.",
+  "ru": "Открыть вкладку во вторичной панели.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open a terminal in the secondary panel.",
+  "ru": "Открыть терминал во вторичной панели.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open another bb desktop window.",
+  "ru": "Открыть ещё одно окно bb.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open bb Monokai details",
+  "ru": "Сведения о плагине bb Monokai",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open bb settings.",
+  "ru": "Открыть настройки bb.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open in preferred app",
+  "ru": "Открыть в предпочитаемом приложении",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open new tab",
+  "ru": "Новая вкладка",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.collapseControl.test.tsx"
+ },
+ {
+  "en": "Open or close the environment diff.",
+  "ru": "Открыть или закрыть дифф окружения.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open or close the focused composer's model picker.",
+  "ru": "Открыть или закрыть выбор модели в активном поле ввода.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open server settings",
+  "ru": "Открыть настройки серверов",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open settings",
+  "ru": "Открыть настройки",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open settings to add or manage bb servers.",
+  "ru": "Открыть настройки для добавления серверов bb или управления ими.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open the next visible sidebar thread.",
+  "ru": "Открыть следующий видимый тред в боковой панели.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open the previous visible sidebar thread.",
+  "ru": "Открыть предыдущий видимый тред в боковой панели.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open the workspace in the preferred editor or terminal.",
+  "ru": "Открыть рабочую область в предпочитаемом редакторе или терминале.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Opens this plugin's configuration.",
+  "ru": "Открывает настройки этого плагина.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Out of date",
+  "ru": "Устарело",
+  "context": "components/settings/CliSkillsSettingsSection.test.tsx"
+ },
+ {
+  "en": "Patrick Lee",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Phosphor",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Pi",
+  "ru": "Pi",
+  "context": "components/pickers/ModelReasoningPicker.test.tsx"
+ },
+ {
+  "en": "Plugin not found.",
+  "ru": "Плагин не найден.",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Previous thread",
+  "ru": "Предыдущий тред",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Prototyping lab",
+  "ru": "Лаборатория прототипирования",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Questions",
+  "ru": "Вопросы",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Quick open file",
+  "ru": "Быстрое открытие файла",
+  "context": "lib/app-command-metadata.ts"
+ }
+]

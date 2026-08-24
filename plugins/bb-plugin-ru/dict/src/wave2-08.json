@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Checking",
+  "ru": "Проверка",
+  "context": "views/root-compose-branch-ui.ts"
+ },
+ {
+  "en": "Checking for plugin updates failed",
+  "ru": "Не удалось проверить обновлёния плагинов",
+  "context": "components/plugin/management/CheckPluginUpdatesButton.tsx"
+ },
+ {
+  "en": "Checking for updates…",
+  "ru": "Проверка обновлёний…",
+  "context": "components/plugin/management/CheckPluginUpdatesButton.tsx"
+ },
+ {
+  "en": "Checking pending interactions...",
+  "ru": "Проверка ожидающих взаимодействий...",
+  "context": "components/promptbox/FollowUpPromptBox.tsx"
+ },
+ {
+  "en": "Checking skill source",
+  "ru": "Проверка источника навыка",
+  "context": "components/tools/SkillsLibrary.tsx"
+ },
+ {
+  "en": "Checking target branch",
+  "ru": "Проверка целевой ветки",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Checkout an existing branch",
+  "ru": "Переключиться на существующую ветку",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Child threads will be deleted.",
+  "ru": "Дочерние треды будут удалёны.",
+  "context": "components/dialogs/ThreadDeleteDialog.tsx"
+ },
+ {
+  "en": "Children",
+  "ru": "Дети",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Choose a folder.",
+  "ru": "Выбери папку.",
+  "context": "components/dialogs/ProjectMachineSetupDialog.tsx"
+ },
+ {
+  "en": "Choose a project folder.",
+  "ru": "Выбери папку проекта.",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "CircleCheck",
+  "ru": "",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "CircleX",
+  "ru": "",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Claim your account address first.",
+  "ru": "Сначала займи адрес аккаунта.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Claim your address",
+  "ru": "Занять адрес",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Claude Code, Codex, Cursor, Pi, OpenCode, Grok, omp, and Hermes all live in bb. Give a task to whichever fits, and have one agent spawn and manage another, each in its own thread.",
+  "ru": "Claude Code, Codex, Cursor, Pi, OpenCode, Grok, omp и Hermes живут прямо в bb. Дай задачу тому, кто больше подходит, и позволь одному агенту создавать и вести другого — каждый в своём треде.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Click to collapse",
+  "ru": "Нажми, чтобы свёрнуть",
+  "context": "components/ui/expandable-line.tsx"
+ },
+ {
+  "en": "Closed",
+  "ru": "Закрыт",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Code",
+  "ru": "",
+  "context": "lib/provider-icon.ts"
+ },
+ {
+  "en": "Codex 0.145.0 → 0.146.0",
+  "ru": "Codex 0.145.0 → 0.146.0",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Codex: Loading models...",
+  "ru": "Codex: загрузка моделей...",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Collapse all files",
+  "ru": "Свёрнуть все файлы",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "Command finished without reporting success.",
+  "ru": "Команда завершилась, не сообщив об успехе.",
+  "context": "components/provider-cli/provider-cli-install-store.ts"
+ },
+ {
+  "en": "Command:",
+  "ru": "Команда:",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.tsx"
+ },
+ {
+  "en": "Commit + squash merge",
+  "ru": "Коммит + squash-слияние",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Commit queued",
+  "ru": "Коммит добавлен в очередь",
+  "context": "views/thread-detail/useThreadGitActions.ts"
+ },
+ {
+  "en": "Computers that can run your tasks. Pair a machine to run projects and threads on it.",
+  "ru": "Компьютеры, которые могут выполнять твои задачи. Подключи машину, чтобы запускать на ней проекты и треды.",
+  "context": "components/settings/MachinesSettingsSection.tsx"
+ },
+ {
+  "en": "Configuration warning",
+  "ru": "Предупреждение конфигурации",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Connect this browser to bb on this device so it can discover installed editors. bb only contacts the local helper after you choose Enable; your browser may ask for local network access.",
+  "ru": "Подключи этот браузер к bb на этом устройстве, чтобы тот мог находить установленные редакторы. bb обращается к локальному хелперу только после того, как ты выберешь «Включить»; браузер может запросить доступ к локальной сети.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Contact",
+  "ru": "Контакты",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Context clear interrupted",
+  "ru": "Очистка контекста прервана",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Context compaction failed",
+  "ru": "Сжатие контекста не удалось",
+  "context": "operation-projection.ts"
+ },
+ {
+  "en": "Context compaction skipped",
+  "ru": "Сжатие контекста пропущено",
+  "context": "operation-projection.ts"
+ },
+ {
+  "en": "Context window",
+  "ru": "Окно контекста",
+  "context": "components/thread/timeline/ThreadContextWindowIndicator.tsx"
+ },
+ {
+  "en": "Context window exceeded",
+  "ru": "Превышено окно контекста",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Continue with GitHub",
+  "ru": "Продолжить с GitHub",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Converting pull request to draft",
+  "ru": "Преобразование пул-реквеста в черновик",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Copied to clipboard",
+  "ru": "Скопировано в буфер обмена",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Copy HTML source",
+  "ru": "Копировать HTML-исходник",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Copy checkout value",
+  "ru": "Копировать значение переключения",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Copy commit SHA",
+  "ru": "Копировать SHA коммита",
+  "context": "lib/workspace-checkout-display.ts"
+ },
+ {
+  "en": "Copy file contents",
+  "ru": "Копировать содержимое файла",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Copy markdown",
+  "ru": "Копировать Markdown",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Copy the upgrade command",
+  "ru": "Копировать команду обновлёния",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Copy to clipboard",
+  "ru": "Копировать в буфер обмена",
+  "context": "components/ui/copy-button.tsx"
+ },
+ {
+  "en": "Could not add you to the list.",
+  "ru": "Не удалось добавить в список.",
+  "context": "landing/endpoints.ts"
+ },
+ {
+  "en": "Could not authenticate",
+  "ru": "Не удалось пройти аутентификацию",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Could not claim that address. Try another.",
+  "ru": "Не удалось занять этот адрес. Попробуй другой.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Could not derive a project name from that path.",
+  "ru": "Не удалось получить имя проекта из этого пути.",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Could not reach the authentication service",
+  "ru": "Не удалось связаться со службой аутентификации",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Could not reach the server. Try again.",
+  "ru": "Не удалось связаться с сервером. Попробуй ещё раз.",
+  "context": "landing/cta.tsx"
+ },
+ {
+  "en": "Could not reach the signup service.",
+  "ru": "Не удалось связаться со службой регистрации.",
+  "context": "landing/endpoints.ts"
+ },
+ {
+  "en": "Couldn&apos;t check for updates",
+  "ru": "Не удалось проверить обновлёния",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Couldn&apos;t load surrounding context.",
+  "ru": "Не удалось загрузить окружающий контекст.",
+  "context": "components/git-diff/GitDiffCardBody.tsx"
+ },
+ {
+  "en": "Couldn&apos;t load usage right now. Make sure the selected machine is connected, then reload usage.",
+  "ru": "Сейчас не удалось загрузить расход. Убедись, что выбранная машина подключёна, затем обнови расход.",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Couldn't copy upgrade command",
+  "ru": "Не удалось скопировать команду обновлёния",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Couldn't create a join code.",
+  "ru": "Не удалось создать код подключёния.",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Couldn't create that folder.",
+  "ru": "Не удалось создать эту папку.",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Couldn't load plugins.",
+  "ru": "Не удалось загрузить плагины.",
+  "context": "components/plugin/PluginsOverview.tsx"
+ },
+ {
+  "en": "Couldn't load providers or usage right now.",
+  "ru": "Сейчас не удалось загрузить провайдеров или расход.",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Couldn't load skills.",
+  "ru": "Не удалось загрузить навыки.",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Couldn't load the installed plugin.",
+  "ru": "Не удалось загрузить установленный плагин.",
+  "context": "views/ToolsView.tsx"
+ },
+ {
+  "en": "Couldn't read this folder.",
+  "ru": "Не удалось прочитать эту папку.",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Couldn’t sync tabs",
+  "ru": "Не удалось синхронизировать вкладки",
+  "context": "lib/thread-tabs-sync.ts"
+ },
+ {
+  "en": "Create an account",
+  "ru": "Создать аккаунт",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Create local account",
+  "ru": "Создать локальный аккаунт",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Create section",
+  "ru": "Создать раздел",
+  "context": "components/dialogs/ThreadSectionCreateDialog.tsx"
+ },
+ {
+  "en": "Current (",
+  "ru": "Текущая (",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Current: master",
+  "ru": "Текущая: master",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Data held by the bb apps is yours. Deleting the iOS app removes its profiles, preferences, and drafts from the device.",
+  "ru": "Данные приложений bb принадлежат тебе. Удалёние приложения для iOS стирает с устройства его профили, настройки и черновики.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Default shortcut",
+  "ru": "Сочетание клавиш по умолчанию",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Default shortcuts",
+  "ru": "Сочетания клавиш по умолчанию",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Delegate your backlog and get briefed on only what needs you.",
+  "ru": "Делегируй свой бэклог и получай сводки только о том, что требует твоего внимания.",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Delete skill",
+  "ru": "Удалить навык",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Delivering answer",
+  "ru": "Передача ответа",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Delivering answers to",
+  "ru": "Передача ответов для",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Delivering permission",
+  "ru": "Передача разрешения",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Delivering permissions",
+  "ru": "Передача разрешений",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Describe a product flow and compare working prototypes side by side.",
+  "ru": "Опиши сценарий продукта и сравни рабочие прототипы рядом.",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Design Changelog Page",
+  "ru": "Дизайн страницы changelog",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Desloppify High-Priority Worker",
+  "ru": "Desloppify-воркер высокого приоритета",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Did I cook??",
+  "ru": "Я справился??",
+  "context": "blog/tweets.ts"
+ },
+ {
+  "en": "Directory copied",
+  "ru": "Каталог скопирован",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Disable Advisor",
+  "ru": "Отключить Advisor",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Disable diff line wrap",
+  "ru": "Отключить перенос строк в диффе",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "Disconnect your bb?",
+  "ru": "Отвязать свой bb?",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Disconnect…",
+  "ru": "Отвязать…",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Do you want to grant this permission?",
+  "ru": "Выдать это разрешение?",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.tsx"
+ },
+ {
+  "en": "Do you want to make these changes?",
+  "ru": "Внести эти изменения?",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.tsx"
+ },
+ {
+  "en": "Do you want to run this command?",
+  "ru": "Запустить эту команду?",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.tsx"
+ },
+ {
+  "en": "Download",
+  "ru": "Скачать",
+  "context": "landing/site-chrome.tsx"
+ },
+ {
+  "en": "Drag down to dock the queue",
+  "ru": "Потяни вниз, чтобы закрепить очередь",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "Drop in raw clips and let agents assemble a polished first cut.",
+  "ru": "Загрузи сырые клипы — и агенты соберут отполированный первый монтаж.",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "EDGE_EPSILON_PX; const canScrollRight = isScrollable && scrollLeft",
+  "ru": "",
+  "context": "components/secondary-panel/SecondaryPanelTabStrip.tsx"
+ },
+ {
+  "en": "Each runs on your own subscription: the provider plan you already pay for, billed by them, not bb.",
+  "ru": "Каждый работает по твоей собственной подписке: тариф провайдера, который ты уже оплачиваешь; счёта выставляет провайдер, а не bb.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Edit messages",
+  "ru": "Редактирование сообщений",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Editing 4 files, deleting 1 file",
+  "ru": "Изменяет 4 файла, удаляет 1 файл",
+  "context": "timeline-view.ts"
+ },
+ {
+  "en": "Element type is invalid",
+  "ru": "Недопустимый тип элемента",
+  "context": "lib/plugin-sdk-deprecated-aliases.ts"
+ },
+ {
+  "en": "Email",
+  "ru": "Эл. почта",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Email signup is not configured.",
+  "ru": "Регистрация по эл. почте не настроена.",
+  "context": "landing/endpoints.ts"
+ },
+ {
+  "en": "Empty file.",
+  "ru": "Пустой файл.",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Enable this plugin",
+  "ru": "Включить этот плагин",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Enable this plugin to edit its settings.",
+  "ru": "Включи этот плагин, чтобы изменять его настройки.",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Enter a valid email address.",
+  "ru": "Введи корректный адрес эл. почты.",
+  "context": "landing/endpoints.ts"
+ },
+ {
+  "en": "Enter your name",
+  "ru": "Введи своё имя",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Environment name",
+  "ru": "Имя окружения",
+  "context": "components/dialogs/EnvironmentRenameDialog.tsx"
+ },
+ {
+  "en": "Environment update requires at least one field",
+  "ru": "Для обновлёния окружения нужно хотя бы одно поле",
+  "context": "hooks/mutations/environment-mutations.ts"
+ },
+ {
+  "en": "Environment: Working locally",
+  "ru": "Окружение: локальная работа",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Error event",
+  "ru": "Событие ошибки",
+  "context": "parse-error-message.ts"
+ },
+ {
+  "en": "Expand all files",
+  "ru": "Развёрнуть все файлы",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "Expanded image",
+  "ru": "Развёрнутое изображение",
+  "context": "components/ui/markdown-preview.tsx"
+ },
+ {
+  "en": "Expected commit action response.",
+  "ru": "Ожидался ответ на действие коммита.",
+  "context": "views/thread-detail/useThreadGitActions.ts"
+ },
+ {
+  "en": "Expected parsed prompt input",
+  "ru": "Ожидался разобранный ввод промпта",
+  "context": "user-message-parsing.ts"
+ },
+ {
+  "en": "Expected pull request draft action response.",
+  "ru": "Ожидался ответ на действие перевода пул-реквеста в черновик.",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Expected pull request merge action response.",
+  "ru": "Ожидался ответ на действие слияния пул-реквеста.",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Expected pull request ready action response.",
+  "ru": "Ожидался ответ на действие готовности пул-реквеста.",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Expected squash merge action response.",
+  "ru": "Ожидался ответ на действие squash-слияния.",
+  "context": "views/thread-detail/useThreadGitActions.ts"
+ },
+ {
+  "en": "Explored",
+  "ru": "Исследовано",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Exploring",
+  "ru": "Исследует",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Fade inactive splits",
+  "ru": "Приглушать неактивные области",
+  "context": "components/settings/SplitDimmingSetting.tsx"
+ },
+ {
+  "en": "Failed to add local source.",
+  "ru": "Не удалось добавить локальный источник.",
+  "context": "hooks/mutations/project-mutations.ts"
+ },
+ {
+  "en": "Failed to apply the code theme to the Pierre worker pool",
+  "ru": "Не удалось применить тему кода к пулу воркеров Pierre",
+  "context": "lib/pierre-worker-pool-theme.ts"
+ },
+ {
+  "en": "Failed to archive thread",
+  "ru": "Не удалось архивировать тред",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Failed to archive thread and children.",
+  "ru": "Не удалось архивировать тред и дочерние треды.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to archive threads.",
+  "ru": "Не удалось архивировать треды.",
+  "context": "hooks/mutations/environment-mutations.ts"
+ },
+ {
+  "en": "Failed to assign parent thread.",
+  "ru": "Не удалось назначить родительский тред.",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Failed to check thread state",
+  "ru": "Не удалось проверить состояние треда",
+  "context": "components/thread/ThreadActionsProvider.tsx"
+ },
+ {
+  "en": "Failed to clear Goal.",
+  "ru": "Не удалось очистить цель.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to close terminal.",
+  "ru": "Не удалось закрыть терминал.",
+  "context": "hooks/queries/thread-terminal-queries.ts"
+ },
+ {
+  "en": "Failed to copy branch name",
+  "ru": "Не удалось скопировать имя ветки",
+  "context": "lib/workspace-checkout-display.ts"
+ },
+ {
+  "en": "Failed to copy directory",
+  "ru": "Не удалось скопировать каталог",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Failed to create project.",
+  "ru": "Не удалось создать проект.",
+  "context": "hooks/mutations/project-mutations.ts"
+ },
+ {
+  "en": "Failed to create thread",
+  "ru": "Не удалось создать тред",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Failed to create thread.",
+  "ru": "Не удалось создать тред.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to delete plugin",
+  "ru": "Не удалось удалить плагин",
+  "context": "views/ToolsView.tsx"
+ },
+ {
+  "en": "Failed to delete queued message",
+  "ru": "Не удалось удалить сообщение из очереди",
+  "context": "components/thread/embedded-chat/useQueuedMessageActions.ts"
+ },
+ {
+  "en": "Failed to delete queued message.",
+  "ru": "Не удалось удалить сообщение из очереди.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to delete skill.",
+  "ru": "Не удалось удалить навык.",
+  "context": "hooks/queries/skills-queries.ts"
+ },
+ {
+  "en": "Failed to delete thread.",
+  "ru": "Не удалось удалить тред.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to edit message",
+  "ru": "Не удалось изменить сообщение",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Failed to edit the message",
+  "ru": "Не удалось изменить сообщение",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Failed to edit the message.",
+  "ru": "Не удалось изменить сообщение.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to exit Plan mode.",
+  "ru": "Не удалось выйти из режима плана.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to group queued messages.",
+  "ru": "Не удалось сгруппировать сообщения в очереди.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to install the bb CLI skills.",
+  "ru": "Не удалось установить навыки bb CLI.",
+  "context": "hooks/mutations/settings-mutations.ts"
+ },
+ {
+  "en": "Failed to load HTML preview.",
+  "ru": "Не удалось загрузить HTML-предпросмотр.",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Failed to load commands",
+  "ru": "Не удалось загрузить команды",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": "Failed to load file",
+  "ru": "Не удалось загрузить файл",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Failed to load file diff",
+  "ru": "Не удалось загрузить дифф файла",
+  "context": "hooks/queries/use-environment-diff-patches.ts"
+ },
+ {
+  "en": "Failed to load suggestions",
+  "ru": "Не удалось загрузить подсказки",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": "Failed to load this file's diff.",
+  "ru": "Не удалось загрузить дифф этого файла.",
+  "context": "components/secondary-panel/git-diff/DiffFileCard.tsx"
+ },
+ {
+  "en": "Failed to load thread.",
+  "ru": "Не удалось загрузить тред.",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Failed to load turn summary details.",
+  "ru": "Не удалось загрузить детали сводки хода.",
+  "context": "hooks/queries/thread-queries.ts"
+ },
+ {
+  "en": "Failed to mark thread read",
+  "ru": "Не удалось отметить тред прочитанным",
+  "context": "components/thread/ThreadActionsProvider.tsx"
+ },
+ {
+  "en": "Failed to mark thread read.",
+  "ru": "Не удалось отметить тред прочитанным.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to mark thread unread",
+  "ru": "Не удалось отметить тред непрочитанным",
+  "context": "components/thread/ThreadActionsProvider.tsx"
+ },
+ {
+  "en": "Failed to mark thread unread.",
+  "ru": "Не удалось отметить тред непрочитанным.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ }
+]

@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Promise",
+  "ru": "",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Provider, model and reasoning",
+  "ru": "Провайдер, модель и рассуждение",
+  "context": "components/pickers/ModelReasoningPicker.test.tsx"
+ },
+ {
+  "en": "Hide right panel",
+  "ru": "Скрыть правую панель",
+  "context": "components/plugin/PluginPanelRightPanelHost.test.tsx"
+ },
+ {
+  "en": "Claude Code",
+  "ru": "Claude Code",
+  "context": "components/dialogs/ProviderCliInstallLogDialog.stories.tsx"
+ },
+ {
+  "en": "Thread name",
+  "ru": "Название треда",
+  "context": "components/sidebar/ThreadRow.test.tsx"
+ },
+ {
+  "en": "Queued messages",
+  "ru": "Сообщения в очереди",
+  "context": "components/promptbox/FollowUpPromptBox.test.tsx"
+ },
+ {
+  "en": "Expand context",
+  "ru": "Развёрнуть контекст",
+  "context": "components/git-diff/GitDiffCardBody.tsx"
+ },
+ {
+  "en": "Frontend Parent",
+  "ru": "Родительский Frontend",
+  "context": "components/dialogs/ThreadDeleteDialog.stories.tsx"
+ },
+ {
+  "en": "GitHub",
+  "ru": "GitHub",
+  "context": "components/plugin/PluginsOverview.test.tsx"
+ },
+ {
+  "en": "Tasks",
+  "ru": "Задачи",
+  "context": "components/plugin/PluginNavSidebarItems.test.tsx"
+ },
+ {
+  "en": "Codex Parent",
+  "ru": "Родительский Codex",
+  "context": "components/secondary-panel/ThreadMetadataContent.fixtures.tsx"
+ },
+ {
+  "en": "Keep Awake",
+  "ru": "Keep Awake",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Remote access",
+  "ru": "Удалённый доступ",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Custom instructions",
+  "ru": "Пользовательские инструкции",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "My skills",
+  "ru": "Мои навыки",
+  "context": "components/layout/AppLayout.tools-breadcrumbs.test.ts"
+ },
+ {
+  "en": "Parent thread unavailable",
+  "ru": "Родительский тред недоступен",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Provider error",
+  "ru": "Ошибка провайдера",
+  "context": "components/thread/timeline/rows/System.stories.tsx"
+ },
+ {
+  "en": "Request failed",
+  "ru": "Запрос не удался",
+  "context": "components/thread/embedded-chat/useComposerAttachmentUploads.ts"
+ },
+ {
+  "en": "Cancel transcription",
+  "ru": "Отменить транскрипцию",
+  "context": "components/promptbox/PromptBoxInternal.test.tsx"
+ },
+ {
+  "en": "Codex",
+  "ru": "Codex",
+  "context": "components/pickers/ModelReasoningPicker.test.tsx"
+ },
+ {
+  "en": "Included in plugin",
+  "ru": "Входит в состав плагина",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Parent thread",
+  "ru": "Родительский тред",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.stories.tsx"
+ },
+ {
+  "en": "Workspace no longer exists.",
+  "ru": "Рабочее пространство больше не существует.",
+  "context": "components/workspace/workspace-status.test.ts"
+ },
+ {
+  "en": "Cancel recording",
+  "ru": "Отменить запись",
+  "context": "components/promptbox/PromptBoxInternal.test.tsx"
+ },
+ {
+  "en": "Clone & continue",
+  "ru": "Клонировать и продолжить",
+  "context": "components/dialogs/ProjectMachineSetupDialog.test.tsx"
+ },
+ {
+  "en": "Collapse queued messages",
+  "ru": "Свёрнуть сообщения в очереди",
+  "context": "components/promptbox/banner/QueuedMessagesList.test.tsx"
+ },
+ {
+  "en": "Toggle panel",
+  "ru": "Показать/скрыть панель",
+  "context": "components/commands/CommandPalette.test.tsx"
+ },
+ {
+  "en": "All changes",
+  "ru": "Все изменения",
+  "context": "components/secondary-panel/git-diff/gitDiffPanelHelpers.test.ts"
+ },
+ {
+  "en": "BB Community",
+  "ru": "BB Community",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Current checkout",
+  "ru": "Текущее состояние",
+  "context": "components/promptbox/NewThreadEnvironmentOptions.stories.tsx"
+ },
+ {
+  "en": "Search plugins",
+  "ru": "Поиск плагинов",
+  "context": "components/plugin/PluginsOverview.test.tsx"
+ },
+ {
+  "en": "The thread is still starting.",
+  "ru": "Тред все ещё запускается.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Workspace cleaning up",
+  "ru": "Очистка рабочего пространства",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Workspace is being cleaned up.",
+  "ru": "Рабочее пространство очищается.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Context compacted",
+  "ru": "Контекст сжат",
+  "context": "components/thread/timeline/rows/System.stories.tsx"
+ },
+ {
+  "en": "Cursor",
+  "ru": "Cursor",
+  "context": "components/pickers/ModelReasoningPicker.test.tsx"
+ },
+ {
+  "en": "Default App",
+  "ru": "Приложение по умолчанию",
+  "context": "components/thread/ThreadWorkspaceOpenButton.stories.tsx"
+ },
+ {
+  "en": "Not installed",
+  "ru": "Не установлено",
+  "context": "components/settings/CliSkillsSettingsSection.test.tsx"
+ },
+ {
+  "en": "Provisioned thread",
+  "ru": "Подготовленный тред",
+  "context": "components/thread/timeline/ProminenceRamp.stories.tsx"
+ },
+ {
+  "en": "Reload page",
+  "ru": "Перезагрузить страницу",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Retry update",
+  "ru": "Повторить обновлёние",
+  "context": "components/settings/MachinesSettingsSection.test.tsx"
+ },
+ {
+  "en": "Add project",
+  "ru": "Добавить проект",
+  "context": "components/dialogs/ProjectPathDialog.test.tsx"
+ },
+ {
+  "en": "Checkout blocked by uncommitted changes",
+  "ru": "Переключение заблокировано незакоммиченными изменениями",
+  "context": "components/promptbox/NewThreadEnvironmentOptions.stories.tsx"
+ },
+ {
+  "en": "Compacting context",
+  "ru": "Сжатие контекста",
+  "context": "components/thread/timeline/rows/System.stories.tsx"
+ },
+ {
+  "en": "Details",
+  "ru": "Подробности",
+  "context": "components/plugin/PluginPanelRightPanelHost.test.tsx"
+ },
+ {
+  "en": "Edited",
+  "ru": "Изменено",
+  "context": "hooks/cache-owners/thread-runtime-cache-owner.test.ts"
+ },
+ {
+  "en": "Failed to send message",
+  "ru": "Не удалось отправить сообщение",
+  "context": "components/thread/embedded-chat/EmbeddedThreadChat.tsx"
+ },
+ {
+  "en": "Resize stacked right panel panes",
+  "ru": "Изменить размер областей правой панели",
+  "context": "components/secondary-panel/SidebarSplitContainer.test.tsx"
+ },
+ {
+  "en": "Search skills",
+  "ru": "Поиск навыков",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "Thread is archived",
+  "ru": "Тред в архиве",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.stories.tsx"
+ },
+ {
+  "en": "Thread starting",
+  "ru": "Запуск треда",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Update all",
+  "ru": "Обновить все",
+  "context": "components/provider-cli/provider-cli-install.tsx"
+ },
+ {
+  "en": "Update available",
+  "ru": "Доступно обновлёние",
+  "context": "components/plugin/management/PluginRowSignal.test.tsx"
+ },
+ {
+  "en": "Workspace is still starting.",
+  "ru": "Рабочее пространство все ещё запускается.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Workspace is unavailable.",
+  "ru": "Рабочее пространство недоступно.",
+  "context": "components/ui/sonner.stories.tsx"
+ },
+ {
+  "en": "Workspace setup failed",
+  "ru": "Сбой настройки рабочего пространства",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Workspace setup failed.",
+  "ru": "Сбой настройки рабочего пространства.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Workspace starting",
+  "ru": "Запуск рабочего пространства",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "void | Promise",
+  "ru": "",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "ACP providers",
+  "ru": "Провайдеры ACP",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Add persistent custom instructions to agent tasks on this bb host.",
+  "ru": "Добавляй постоянные пользовательские инструкции к задачам агентов на этом хосте bb.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Ask User Question",
+  "ru": "Ask User Question",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Browser",
+  "ru": "Браузер",
+  "context": "components/secondary-panel/SecondaryPanelTabStrip.test.ts"
+ },
+ {
+  "en": "Claude Code provider",
+  "ru": "Провайдер Claude Code",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Codex provider",
+  "ru": "Провайдер Codex",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Continue turns after Codex and Claude Code subscription limits reset.",
+  "ru": "Продолжай ходы после сброса лимитов подписки Codex и Claude Code.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Failed to copy",
+  "ru": "Не удалось скопировать",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "Hide from sidebar",
+  "ru": "Скрыть с боковой панели",
+  "context": "components/plugin/PluginNavSidebarItems.test.tsx"
+ },
+ {
+  "en": "Inline visualizations",
+  "ru": "Встроенные визуализации",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Keeps selected macOS hosts awake while bb is running.",
+  "ru": "Не дает выбранным хостам macOS уснуть, пока запущен bb.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Next thread",
+  "ru": "Следующий тред",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "No threads",
+  "ru": "Нет тредов",
+  "context": "components/sidebar/ProjectList.modes.test.tsx"
+ },
+ {
+  "en": "Pi provider",
+  "ru": "Провайдер Pi",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Plan and track work in BB, delegate tasks to agents, and keep task context connected to worker threads.",
+  "ru": "Планируй и отслеживай работу в BB, делегируй задачи агентам и связывай контекст задач с рабочими тредами.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Provider rate limit reached",
+  "ru": "Достигнут лимит запросов к провайдеру",
+  "context": "components/thread/timeline/timeline-auto-expand.test.ts"
+ },
+ {
+  "en": "Provider retry",
+  "ru": "Provider retry",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Provisioning thread",
+  "ru": "Подготовка треда",
+  "context": "components/thread/timeline/ProminenceRamp.stories.tsx"
+ },
+ {
+  "en": "Queued message not found",
+  "ru": "Сообщение в очереди не найдено",
+  "context": "hooks/mutations/thread-runtime-mutations.test.tsx"
+ },
+ {
+  "en": "Render workspace HTML visualizations inline in assistant messages.",
+  "ru": "Отображай HTML-визуализации из рабочего пространства прямо в сообщениях ассистента.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Replace this chat",
+  "ru": "Заменить этот чат",
+  "context": "lib/split-drag/zones.test.ts"
+ },
+ {
+  "en": "Run bb threads with ACP agents (supports Cursor, opencode, omp and more).",
+  "ru": "Запускай треды bb с агентами ACP (поддерживаются Cursor, opencode, omp и другие).",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Run bb threads with Claude Code.",
+  "ru": "Запускай треды bb с Claude Code.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Run bb threads with Codex.",
+  "ru": "Запускай треды bb с Codex.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Run bb threads with Pi.",
+  "ru": "Запускай треды bb с Pi.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Secrets",
+  "ru": "Секреты",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Securely request credentials from a user and reconcile them into dotenv files.",
+  "ru": "Безопасно запрашивай учётные данные у пользователя и сохраняй их в файлы .env.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Show diff panel",
+  "ru": "Показать панель диффа",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.collapseControl.test.tsx"
+ },
+ {
+  "en": "Side chat",
+  "ru": "Сайд-чат",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Toggle sidebar",
+  "ru": "Показать/скрыть боковую панель",
+  "context": "components/layout/AppLayout.tsx"
+ },
+ {
+  "en": "Up to date",
+  "ru": "Обновлёно",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "User",
+  "ru": "Пользовательские",
+  "context": "components/plugin/PluginsOverview.test.tsx"
+ },
+ {
+  "en": "View log",
+  "ru": "Посмотреть лог",
+  "context": "components/dialogs/ProviderCliInstallLogDialog.stories.tsx"
+ },
+ {
+  "en": "atomWithStorage",
+  "ru": "",
+  "context": "components/secondary-panel/threadRecentItems.ts"
+ },
+ {
+  "en": "new Map",
+  "ru": "",
+  "context": "components/layout/AppLayout.root-compose-project.test.tsx"
+ },
+ {
+  "en": "Back to app",
+  "ru": "Назад к приложению",
+  "context": "components/settings/SettingsSidebar.tsx"
+ },
+ {
+  "en": "Background work running",
+  "ru": "Выполняется фоновая работа",
+  "context": "components/thread/timeline/ThreadTimelinePanelContent.test.tsx"
+ },
+ {
+  "en": "Committed changes",
+  "ru": "Закоммиченные изменения",
+  "context": "components/secondary-panel/git-diff/gitDiffPanelHelpers.test.ts"
+ },
+ {
+  "en": "Copy URL",
+  "ru": "Копировать URL",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Current (detached)",
+  "ru": "Текущая (отделенный HEAD)",
+  "context": "components/promptbox/NewThreadEnvironmentOptions.stories.tsx"
+ },
+ {
+  "en": "Current (empty repo)",
+  "ru": "Текущий (пустой репозиторий)",
+  "context": "components/promptbox/NewThreadEnvironmentOptions.stories.tsx"
+ },
+ {
+  "en": "Disable line wrap",
+  "ru": "Отключить перенос строк",
+  "context": "components/secondary-panel/FilePreview.test.tsx"
+ },
+ {
+  "en": "Edited 1 file",
+  "ru": "Изменен 1 файл",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Failed to open file locally",
+  "ru": "Не удалось открыть файл локально",
+  "context": "components/ui/sonner.stories.tsx"
+ },
+ {
+  "en": "Host removed",
+  "ru": "Хост удалён",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "No terminals",
+  "ru": "Нет терминалов",
+  "context": "components/thread/terminal/ThreadTerminalContent.test.tsx"
+ },
+ {
+  "en": "Open in editor",
+  "ru": "Открыть в редакторе",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Ran tool",
+  "ru": "Инструмент выполнен",
+  "context": "components/thread/timeline/ThreadTimelineRows.presentation.test.tsx"
+ },
+ {
+  "en": "Uncommitted changes",
+  "ru": "Незакоммиченные изменения",
+  "context": "components/secondary-panel/git-diff/gitDiffPanelHelpers.test.ts"
+ },
+ {
+  "en": "Unknown",
+  "ru": "Неизвестно",
+  "context": "components/workspace/workspace-status.test.ts"
+ },
+ {
+  "en": "Window and layout",
+  "ru": "Окно и расположение",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Archive thread",
+  "ru": "В архив",
+  "context": "components/thread/ThreadArchiveQuickAction.test.tsx"
+ },
+ {
+  "en": "Current (main)",
+  "ru": "Текущая (main)",
+  "context": "components/pickers/BranchPicker.stories.tsx"
+ },
+ {
+  "en": "Dirty",
+  "ru": "С изменениями",
+  "context": "components/dialogs/ThreadGitActionDialog.stories.tsx"
+ },
+ {
+  "en": "Expand queued messages",
+  "ru": "Развёрнуть сообщения в очереди",
+  "context": "components/promptbox/banner/QueuedMessagesList.test.tsx"
+ },
+ {
+  "en": "Extra High",
+  "ru": "Очень высокий",
+  "context": "components/pickers/OptionPicker.stories.tsx"
+ },
+ {
+  "en": "Included with",
+  "ru": "Входит в состав",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Live dashboard",
+  "ru": "Интерактивный дашборд",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Loading branches...",
+  "ru": "Загрузка веток...",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Needs attention",
+  "ru": "Требует внимания",
+  "context": "components/plugin/management/plugin-status.test.ts"
+ },
+ {
+  "en": "Needs configuration",
+  "ru": "Требует настройки",
+  "context": "components/plugin/management/plugin-status.test.ts"
+ },
+ {
+  "en": "Open terminal",
+  "ru": "Открыть терминал",
+  "context": "components/commands/CommandPalette.test.tsx"
+ },
+ {
+  "en": "Permission denied:",
+  "ru": "Доступ запрещен:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Please try again",
+  "ru": "Пожалуйста, попробуй снова",
+  "context": "components/ui/sonner.stories.tsx"
+ },
+ {
+  "en": "Remove from bb",
+  "ru": "Убрать из bb",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Request failed.",
+  "ru": "Запрос не удался.",
+  "context": "lib/mutation-errors.test.ts"
+ },
+ {
+  "en": "Sawyer Hood",
+  "ru": "",
+  "context": "blog/tweets.ts"
+ },
+ {
+  "en": "Search installed plugins",
+  "ru": "Поиск установленных плагинов",
+  "context": "components/plugin/PluginsOverview.test.tsx"
+ },
+ {
+  "en": "Select branch",
+  "ru": "Выбрать ветку",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Show queued messages",
+  "ru": "Показать сообщения в очереди",
+  "context": "components/promptbox/banner/QueuedMessagesList.test.tsx"
+ },
+ {
+  "en": "Sign in",
+  "ru": "Войти",
+  "context": "components/plugin/PluginPermissionModePicker.test.tsx"
+ },
+ {
+  "en": "Squash merge failed",
+  "ru": "Слияние squash не удалось",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Toggle diff",
+  "ru": "Показать/скрыть дифф",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Turn bb into",
+  "ru": "Преврати bb в",
+  "context": "components/plugin/browse-hero/BrowseHeroCarousel.test.tsx"
+ },
+ {
+  "en": "Use folder & continue",
+  "ru": "Использовать папку и продолжить",
+  "context": "components/dialogs/ProjectMachineSetupDialog.test.tsx"
+ },
+ {
+  "en": "Wrap lines",
+  "ru": "Переносить строки",
+  "context": "components/secondary-panel/FilePreview.test.tsx"
+ },
+ {
+  "en": "void; inputRef: RefObject",
+  "ru": "",
+  "context": "components/dialogs/EnvironmentRenameDialog.tsx"
+ },
+ {
+  "en": "ACP providers plugin details",
+  "ru": "Сведения о плагине ACP providers",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Active child thread:",
+  "ru": "Активный дочерний тред:",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.test.tsx"
+ },
+ {
+  "en": "Advisor plugin details",
+  "ru": "Сведения о плагине Advisor",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Agent Proxy plugin details",
+  "ru": "Сведения о плагине Agent Proxy",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Already open — focus pane",
+  "ru": "Уже открыто — переключиться на область",
+  "context": "lib/split-drag/zones.test.ts"
+ },
+ {
+  "en": "Ask User Question plugin details",
+  "ru": "Сведения о плагине Ask User Question",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Automations plugin details",
+  "ru": "Сведения о плагине Automations",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Blog",
+  "ru": "Блог",
+  "context": "landing/site-chrome.tsx"
+ },
+ {
+  "en": "Branch from: default",
+  "ru": "Ветка-источник: по умолчанию",
+  "context": "views/root-compose-branch-ui.ts"
+ },
+ {
+  "en": "Changes",
+  "ru": "Изменения",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Checkout blocked before the first commit",
+  "ru": "Переключение заблокировано до первого коммита",
+  "context": "components/promptbox/NewThreadEnvironmentOptions.stories.tsx"
+ },
+ {
+  "en": "Checkout blocked by unresolved conflicts",
+  "ru": "Переключение заблокировано неразрешенными конфликтами",
+  "context": "views/root-compose-branch-ui.test.ts"
+ },
+ {
+  "en": "Checkout blocked while HEAD is detached",
+  "ru": "Переключение заблокировано при отделенном HEAD",
+  "context": "components/promptbox/NewThreadEnvironmentOptions.stories.tsx"
+ },
+ {
+  "en": "Checkout state is unavailable",
+  "ru": "Состояние рабочей копии недоступно",
+  "context": "views/root-compose-branch-ui.ts"
+ },
+ {
+  "en": "Checks pending",
+  "ru": "Проверки выполняются",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.test.tsx"
+ },
+ {
+  "en": "Choose a thread that is not a child of this thread.",
+  "ru": "Выбери тред, который не является дочерним для этого треда.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Choose another app",
+  "ru": "Выбрать другое приложение",
+  "context": "components/thread/ThreadWorkspaceOpenButton.tsx"
+ },
+ {
+  "en": "Claude",
+  "ru": "Claude",
+  "context": "components/pickers/ModelReasoningPicker.test.tsx"
+ },
+ {
+  "en": "Claude Code provider plugin details",
+  "ru": "Сведения о плагине Claude Code provider",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Click a shortcut, then press its new keys. Changes sync to every bb window.",
+  "ru": "Нажми на горячую клавишу, затем нажми новую комбинацию. Изменения синхронизируются во всех окнах bb.",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Close focused chat pane",
+  "ru": "Закрыть текущую область чата",
+  "context": "components/commands/AppCommandProvider.tsx"
+ }
+]

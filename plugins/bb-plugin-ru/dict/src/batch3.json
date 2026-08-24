@@ -1,0 +1,662 @@
+[
+ {
+  "en": "Create a commit from the current workspace changes.",
+  "ru": "Создать коммит из текущих изменений в рабочем пространстве.",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Create a plugin",
+  "ru": "Создать плагин",
+  "context": "components/plugin/management/BrowsePluginsTab.tsx"
+ },
+ {
+  "en": "Created at",
+  "ru": "Дата создания",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Creating a join code…",
+  "ru": "Создание кода подключёния…",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Creating thread",
+  "ru": "Создание треда",
+  "context": "views/RootComposeMobileRecents.tsx"
+ },
+ {
+  "en": "Custom",
+  "ru": "Пользовательские",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Danger zone",
+  "ru": "Опасная зона",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Dark",
+  "ru": "Тёмная",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Debug",
+  "ru": "Отладка",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Delete skill?",
+  "ru": "Удалить навык?",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Deploys",
+  "ru": "Деплои",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Describe the plugin you want to build…",
+  "ru": "Опиши плагин, который хочешь создать…",
+  "context": "components/plugin/browse-hero/BrowseHeroCarousel.tsx"
+ },
+ {
+  "en": "Diffs",
+  "ru": "Диффы",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "Directory",
+  "ru": "Каталог",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Directory default",
+  "ru": "Каталог по умолчанию",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Dismiss",
+  "ru": "Закрыть",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Don&apos;t work in a project",
+  "ru": "Не работать в проекте",
+  "context": "components/pickers/ProjectSelector.tsx"
+ },
+ {
+  "en": "Done",
+  "ru": "Готово",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Download failed",
+  "ru": "Ошибка скачивания",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Draft Pull Request",
+  "ru": "Черновик пул-реквеста",
+  "context": "components/pull-request/PullRequestStatusPill.tsx"
+ },
+ {
+  "en": "Edit local path",
+  "ru": "Изменить локальный путь",
+  "context": "views/project-settings/ProjectSourceRow.tsx"
+ },
+ {
+  "en": "Edit message",
+  "ru": "Изменить сообщение",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "Editing message",
+  "ru": "Редактирование сообщения",
+  "context": "views/thread-detail/ThreadDetailPromptArea.tsx"
+ },
+ {
+  "en": "Enable the Connect plugin",
+  "ru": "Включить плагин Connect",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Enter a URL",
+  "ru": "Введи URL",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Environment archived",
+  "ru": "Окружение в архиве",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Error details",
+  "ru": "Подробности ошибки",
+  "context": "components/AppErrorBoundary.tsx"
+ },
+ {
+  "en": "Every machine is offline. Bring one online to browse its folders.",
+  "ru": "Все машины офлайн. Включи одну из них, чтобы просматривать папки.",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Examples",
+  "ru": "Примеры",
+  "context": "components/create-via-prompt-examples.tsx"
+ },
+ {
+  "en": "Exit Full Screen",
+  "ru": "Выйти из полноэкранного режима",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Expanded Mermaid diagram preview with zoom and pan controls.",
+  "ru": "Развёрнутый просмотр диаграммы Mermaid с масштабированием и панорамированием.",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Expanded image preview",
+  "ru": "Развёрнутый просмотр изображения",
+  "context": "components/ui/markdown-preview.tsx"
+ },
+ {
+  "en": "Explore plugin capabilities",
+  "ru": "Возможности плагина",
+  "context": "components/plugin/browse-hero/BrowseArchetypeCards.tsx"
+ },
+ {
+  "en": "Failed to load git diff",
+  "ru": "Не удалось загрузить Git-дифф",
+  "context": "components/secondary-panel/ThreadSecondaryPanelTabContent.tsx"
+ },
+ {
+  "en": "Failed to load projects.",
+  "ru": "Не удалось загрузить проекты.",
+  "context": "views/RootComposeView.tsx"
+ },
+ {
+  "en": "Failed to load terminals.",
+  "ru": "Не удалось загрузить терминалы.",
+  "context": "components/thread/terminal/ThreadTerminalContent.tsx"
+ },
+ {
+  "en": "Failed to load timeline",
+  "ru": "Не удалось загрузить ленту",
+  "context": "components/thread/timeline/ThreadTimelineSurface.tsx"
+ },
+ {
+  "en": "Failed to load turn details.",
+  "ru": "Не удалось загрузить подробности хода.",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "File default",
+  "ru": "Файл по умолчанию",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "File openers",
+  "ru": "Способы открытия файлов",
+  "context": "components/settings/FileOpenersSettingsSection.tsx"
+ },
+ {
+  "en": "Find and restore archived threads from across your projects.",
+  "ru": "Находи и восстанавливай архивные треды из всех своих проектов.",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Folder name",
+  "ru": "Имя папки",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Forks",
+  "ru": "Форки",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Full Screen",
+  "ru": "Полноэкранный режим",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Full changelog",
+  "ru": "Полная история изменений",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Generate a new code",
+  "ru": "Сгенерировать новый код",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "GitHub repository URL · npm:package[@version] · ./local/path",
+  "ru": "URL репозитория GitHub · npm:package[@version] · ./local/path",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "Green",
+  "ru": "Зелёный",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Handoff to new thread",
+  "ru": "Передать в новый тред",
+  "context": "views/thread-detail/ThreadDetailPromptArea.tsx"
+ },
+ {
+  "en": "Image preview unavailable.",
+  "ru": "Предпросмотр изображения недоступен.",
+  "context": "components/thread/timeline/TimelineRowDetails.tsx"
+ },
+ {
+  "en": "Inbox",
+  "ru": "Входящие",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Incident debug",
+  "ru": "Отладка инцидента",
+  "context": "components/create-via-prompt-examples.tsx"
+ },
+ {
+  "en": "Install bb CLI skills",
+  "ru": "Установить навыки bb CLI",
+  "context": "components/settings/InstallCliSkillsDialog.tsx"
+ },
+ {
+  "en": "Installed",
+  "ru": "Установлено",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Invalid local path",
+  "ru": "Недопустимый локальный путь",
+  "context": "views/project-settings/ProjectSourceRow.tsx"
+ },
+ {
+  "en": "Keyboard",
+  "ru": "Клавиатура",
+  "context": "components/settings/settings-nav.tsx"
+ },
+ {
+  "en": "Keyboard shortcuts",
+  "ru": "Горячие клавиши",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Launch video",
+  "ru": "Смотреть видео",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Learn what bb can do",
+  "ru": "Узнай, что умеет bb",
+  "context": "views/RootComposeEmptyWelcome.tsx"
+ },
+ {
+  "en": "Light",
+  "ru": "Светлая",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Load full file",
+  "ru": "Загрузить файл целиком",
+  "context": "components/code/BbSourceCode.tsx"
+ },
+ {
+  "en": "Load microphones",
+  "ru": "Загрузить микрофоны",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "Loading archived threads…",
+  "ru": "Загрузка архивных тредов…",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Loading context…",
+  "ru": "Загрузка контекста…",
+  "context": "components/git-diff/GitDiffCardBody.tsx"
+ },
+ {
+  "en": "Loading more…",
+  "ru": "Загрузка…",
+  "context": "components/ui/resource-pagination.tsx"
+ },
+ {
+  "en": "Loading plugin settings…",
+  "ru": "Загрузка настроек плагина…",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Loading providers…",
+  "ru": "Загрузка провайдеров…",
+  "context": "components/settings/ProvidersSettingsSection.tsx"
+ },
+ {
+  "en": "Loading threads…",
+  "ru": "Загрузка тредов…",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Loading turn details...",
+  "ru": "Загрузка деталей хода...",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "Local editor integration",
+  "ru": "Интеграция с локальным редактором",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Machine information",
+  "ru": "Информация о машине",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Machine is no longer paired.",
+  "ru": "Машина больше не сопряжена.",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Make default",
+  "ru": "Сделать основным",
+  "context": "components/settings/ProvidersSettingsSection.tsx"
+ },
+ {
+  "en": "Math.abs(previous - nextMargin)",
+  "ru": "",
+  "context": "components/thread/timeline/TimelineWindowedItems.tsx"
+ },
+ {
+  "en": "Merge",
+  "ru": "Слияние",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Merged Pull Request",
+  "ru": "Влитый пул-реквест",
+  "context": "components/pull-request/PullRequestStatusPill.tsx"
+ },
+ {
+  "en": "Model fallback",
+  "ru": "Резервная модель",
+  "context": "components/promptbox/banner/ThreadModelFallbackCard.tsx"
+ },
+ {
+  "en": "More",
+  "ru": "Ещё",
+  "context": "components/ui/breadcrumb.tsx"
+ },
+ {
+  "en": "More models",
+  "ru": "Больше моделей",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "More pages",
+  "ru": "Больше страниц",
+  "context": "components/ui/pagination.tsx"
+ },
+ {
+  "en": "Move",
+  "ru": "Переместить",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Move bottom",
+  "ru": "Вниз",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Move left",
+  "ru": "Влево",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Move right",
+  "ru": "Вправо",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Move top",
+  "ru": "Вверх",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Needs input",
+  "ru": "Требуется ввод",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "New plugin",
+  "ru": "Новый плагин",
+  "context": "components/plugin/PluginsOverview.tsx"
+ },
+ {
+  "en": "New thread — open in split",
+  "ru": "Новый тред — открыть рядом",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Next match",
+  "ru": "Следующее совпадение",
+  "context": "components/secondary-panel/BrowserFindBar.tsx"
+ },
+ {
+  "en": "Next slide",
+  "ru": "Следующий слайд",
+  "context": "components/ui/carousel.tsx"
+ },
+ {
+  "en": "No agent provider is enabled. Enable a provider plugin under Plugins.",
+  "ru": "Ни один провайдер агентов не включён. Включи плагин провайдера в разделе «Плагины».",
+  "context": "components/settings/ProvidersSettingsSection.tsx"
+ },
+ {
+  "en": "No answer",
+  "ru": "Нет ответа",
+  "context": "components/thread/timeline/QuestionWorkRowBody.tsx"
+ },
+ {
+  "en": "No diff available.",
+  "ru": "Дифф недоступен.",
+  "context": "components/thread/timeline/TimelineFileDiffBlock.tsx"
+ },
+ {
+  "en": "No file preview content provided.",
+  "ru": "Нет содержимого для предпросмотра файла.",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "No machines yet.",
+  "ru": "Машин пока нет.",
+  "context": "components/settings/MachinesSettingsSection.tsx"
+ },
+ {
+  "en": "No matching commands",
+  "ru": "Команды не найдены",
+  "context": "components/commands/CommandPalette.tsx"
+ },
+ {
+  "en": "No matching mentions",
+  "ru": "Упоминания не найдены",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": "No models match your search",
+  "ru": "Модели по запросу не найдены",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "No renderable diff for this file.",
+  "ru": "Для этого файла нет отображаемого диффа.",
+  "context": "components/secondary-panel/git-diff/DiffFileCard.tsx"
+ },
+ {
+  "en": "No sources configured.",
+  "ru": "Источники не настроены.",
+  "context": "views/ProjectSettingsView.tsx"
+ },
+ {
+  "en": "No usage limits reported for this plan.",
+  "ru": "Для этого тарифа нет данных о лимитах расхода.",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "No worktrees in this project yet.",
+  "ru": "В этом проекте пока нет рабочих деревьев.",
+  "context": "components/pickers/WorktreePicker.tsx"
+ },
+ {
+  "en": "None",
+  "ru": "Нет",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "None installed",
+  "ru": "Ничего не установлено",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Not found",
+  "ru": "Не найдено",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Not installed on this machine.",
+  "ru": "Не установлено на этой машине.",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Not now",
+  "ru": "Не сейчас",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "Not set up for this project",
+  "ru": "Не настроено для этого проекта",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Official",
+  "ru": "Официальные",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Open PRs",
+  "ru": "Открытые PR",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Open Pull Request",
+  "ru": "Открытый пул-реквест",
+  "context": "components/pull-request/PullRequestStatusPill.tsx"
+ },
+ {
+  "en": "Open browser",
+  "ru": "Открыть браузер",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "Open in split",
+  "ru": "Открыть рядом",
+  "context": "components/thread/ThreadActionsMenu.tsx"
+ },
+ {
+  "en": "Open preview",
+  "ru": "Открыть предпросмотр",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Open with",
+  "ru": "Открыть с помощью",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Open with built-in preview",
+  "ru": "Открыть во встроенном предпросмотре",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Opens these files in a plugin-provided viewer:",
+  "ru": "Открывает эти файлы в просмотрщике из плагина:",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Orange",
+  "ru": "Оранжевый",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Other options",
+  "ru": "Другие варианты",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "PR review",
+  "ru": "Ревью PR",
+  "context": "components/create-via-prompt-examples.tsx"
+ },
+ {
+  "en": "Parent",
+  "ru": "Родительский тред",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Permission mode",
+  "ru": "Режим доступа",
+  "context": "components/pickers/PermissionModePicker.tsx"
+ },
+ {
+  "en": "Pink",
+  "ru": "Розовый",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Pinned",
+  "ru": "Закреплённые",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Plans, mockups, and files you open will show up here.",
+  "ru": "Здесь появятся планы, макеты и открытые файлы.",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "Plugin details",
+  "ru": "Сведения о плагине",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Plugins",
+  "ru": "Плагины",
+  "context": "components/settings/SettingsSidebar.tsx"
+ },
+ {
+  "en": "Preview",
+  "ru": "Предпросмотр",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Previous match",
+  "ru": "Предыдущее совпадение",
+  "context": "components/secondary-panel/BrowserFindBar.tsx"
+ },
+ {
+  "en": "Previous slide",
+  "ru": "Предыдущий слайд",
+  "context": "components/ui/carousel.tsx"
+ },
+ {
+  "en": "Primary",
+  "ru": "Основная",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Project Sources",
+  "ru": "Источники проекта",
+  "context": "views/ProjectSettingsView.tsx"
+ }
+]

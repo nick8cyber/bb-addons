@@ -1,0 +1,787 @@
+[
+ {
+  "en": "July 17, 2026",
+  "ru": "17 июля 2026 г.",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "July 21, 2026",
+  "ru": "21 июля 2026 г.",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "July 28, 2026",
+  "ru": "28 июля 2026 г.",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "July 9, 2026",
+  "ru": "9 июля 2026 г.",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Loading implement",
+  "ru": "Загрузка implement",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading providers and usage…",
+  "ru": "Загрузка провайдеров и расхода…",
+  "context": "components/settings/UsageLimitsSettingsSection.test.tsx"
+ },
+ {
+  "en": "Loading research",
+  "ru": "Загрузка research",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading skills",
+  "ru": "Загрузка навыков",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Loading teach",
+  "ru": "Загрузка teach",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading triage",
+  "ru": "Загрузка triage",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading wayfinder",
+  "ru": "Загрузка wayfinder",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Loading wizard",
+  "ru": "Загрузка wizard",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Local commits pending merge.",
+  "ru": "Локальные коммиты ожидают слияния.",
+  "context": "components/workspace/workspace-status.tsx"
+ },
+ {
+  "en": "Mergeability unknown",
+  "ru": "Возможность слияния неизвестна",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Message",
+  "ru": "Сообщение",
+  "context": "lib/plugin-app-definition.test.ts"
+ },
+ {
+  "en": "Microphone",
+  "ru": "Микрофон",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Microphone devices unavailable",
+  "ru": "Микрофоны недоступны",
+  "context": "hooks/useAudioInputDevices.ts"
+ },
+ {
+  "en": "Microphone permission denied",
+  "ru": "Доступ к микрофону запрещён",
+  "context": "hooks/useAudioInputDevices.ts"
+ },
+ {
+  "en": "Mobile app",
+  "ru": "Мобильное приложение",
+  "context": "views/SettingsView.experiments.test.tsx"
+ },
+ {
+  "en": "More agents, more models, redesigned Settings",
+  "ru": "Больше агентов, больше моделей, переработанные настройки",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Mount only nearby rows in long timelines and expanded timeline details.",
+  "ru": "Подгружать только соседние строки в длинных лентах и развёрнутых деталях ленты.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Multi-machine workflows and bb Connect",
+  "ru": "Воркфлоу на нескольких машинах и bb Connect",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Needs your input:",
+  "ru": "Нужен твой ввод:",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.test.tsx"
+ },
+ {
+  "en": "New bb skill options",
+  "ru": "Новые опции навыков bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "New plugin options",
+  "ru": "Новые опции плагинов",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "New worktrees require a Git repository with at least one commit",
+  "ru": "Для новых рабочих деревьев нужен Git-репозиторий хотя бы с одним коммитом",
+  "context": "views/RootComposeView.test.ts"
+ },
+ {
+  "en": "Nightly changelog",
+  "ru": "Ченджлог ночной сборки",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Nightly changelog draft",
+  "ru": "Черновик ченджлога ночной сборки",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "No changes",
+  "ru": "Нет изменений",
+  "context": "components/workspace/workspace-change-summary.tsx"
+ },
+ {
+  "en": "No checks",
+  "ru": "Нет проверок",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "No editor configured",
+  "ru": "Редактор не настроен",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "No files yet.",
+  "ru": "Пока нет файлов.",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "No machines available.",
+  "ru": "Нет доступных машин.",
+  "context": "components/settings/UpdatesSettingsSection.test.tsx"
+ },
+ {
+  "en": "No memories stored yet.",
+  "ru": "В памяти пока нет записей.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "No models available",
+  "ru": "Нет доступных моделей",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "No new occurrences in the last 10 minutes.",
+  "ru": "За последние 10 минут новых появлений нет.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "No results match your search.",
+  "ru": "Ничего не найдено по этому запросу.",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "No review",
+  "ru": "Нет ревью",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "No skills match these filters.",
+  "ru": "Ни один навык не соответствует фильтрам.",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "One request in flight; everyone awaits it. Simplest.",
+  "ru": "Один запрос в работе; все его ждут. Самый простой вариант.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "One thread is waiting on you:",
+  "ru": "Один тред ждёт ответа:",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Open Lanes details",
+  "ru": "Открыть подробности Lanes",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Message Timestamps details",
+  "ru": "Открыть подробности меток времени сообщений",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Monaco details",
+  "ru": "Открыть подробности Monaco",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Needs Attention details",
+  "ru": "Открыть подробности «Требуют внимания»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open Noema details",
+  "ru": "Открыть подробности Noema",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Open file",
+  "ru": "Открыть файл",
+  "context": "components/secondary-panel/git-diff/DiffFileCard.tsx"
+ },
+ {
+  "en": "Open web links inside bb.",
+  "ru": "Открывать веб-ссылки внутри bb.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "OpenAI",
+  "ru": "",
+  "context": "landing/icons.tsx"
+ },
+ {
+  "en": "Opus 4.8 (1M)",
+  "ru": "",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Other requirements",
+  "ru": "Другие требования",
+  "context": "components/plugin/management/PluginUpdatesCard.tsx"
+ },
+ {
+  "en": "Pair again…",
+  "ru": "Повторить сопряжение…",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Pane IDs must be unique",
+  "ru": "Идентификаторы областей должны быть уникальными",
+  "context": "lib/split-layout/persistence.ts"
+ },
+ {
+  "en": "Panel",
+  "ru": "Панель",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Parent …",
+  "ru": "Родитель…",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.stories.tsx"
+ },
+ {
+  "en": "Plan a huge chunk of work (more than one agent session can hold) as a shared map of decision tickets on your issue tracker, and resolve them one at a time until the way to the destination is clear.",
+  "ru": "Планируй большой объём работы (больше, чем вмещает одна сессия агента) как общую карту тикетов с решениями в своём трекере задач и закрывай их по одному, пока путь к цели не станет ясен.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Please try again.",
+  "ru": "Попробуй ещё раз.",
+  "context": "lib/thread-tabs-sync.ts"
+ },
+ {
+  "en": "Plugins add app surfaces, commands, services, schedules, and skills to bb. Install an official plugin, or describe your own and build it from a prompt.",
+  "ru": "Плагины добавляют в bb элементы интерфейса, команды, службы, расписания и навыки. Установи официальный плагин или опиши свой и собери его из промпта.",
+  "context": "components/plugin/plugins-collection-copy.ts"
+ },
+ {
+  "en": "Plugins → connect",
+  "ru": "Плагины → подключёние",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Plus",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Port the settings panel",
+  "ru": "Перенести панель настроек",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Press keys",
+  "ru": "Нажми клавиши",
+  "context": "components/settings/KeyboardSettingsSection.test.tsx"
+ },
+ {
+  "en": "Privacy",
+  "ru": "Конфиденциальность",
+  "context": "landing/site-chrome.tsx"
+ },
+ {
+  "en": "Prompt mentions",
+  "ru": "Упоминания в промптах",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Provider turn stopped responding",
+  "ru": "Провайдер перестал отвечать",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Provisioning thread failed",
+  "ru": "Не удалось подготовить тред",
+  "context": "build-thread-timeline.ts"
+ },
+ {
+  "en": "Provisioning thread interrupted",
+  "ru": "Подготовка треда прервана",
+  "context": "build-thread-timeline.ts"
+ },
+ {
+  "en": "Provisioning thread...",
+  "ru": "Подготовка треда...",
+  "context": "components/thread/embedded-chat/EmbeddedThreadChat.tsx"
+ },
+ {
+  "en": "Pull request was not updated",
+  "ru": "Пул-реквест не обновлён",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Quieter updates and safer approvals",
+  "ru": "Ненавязчивые обновлёния и более безопасные подтверждения",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Ran",
+  "ru": "Выполнено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Ran 12 tests",
+  "ru": "Прогнано 12 тестов",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Ran 48 tests",
+  "ru": "Прогнано 48 тестов",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Ran background agent:",
+  "ru": "Запущен фоновый агент:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Ran background command:",
+  "ru": "Выполнена фоновая команда:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Ran subagent:",
+  "ru": "Запущен субагент:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Ran web search:",
+  "ru": "Выполнен веб-поиск:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Ran workflow:",
+  "ru": "Запущен воркфлоу:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Re-checked the stack trace",
+  "ru": "Трассировка стека перепроверена",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Re-pair",
+  "ru": "Повторить сопряжение",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Read LIN-482",
+  "ru": "Прочитан LIN-482",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Read applyPromo.ts",
+  "ru": "Прочитан applyPromo.ts",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Ready to code?",
+  "ru": "Пора кодить?",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.test.tsx"
+ },
+ {
+  "en": "Ready to merge",
+  "ru": "Готов к слиянию",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Record shortcut for Archive thread, current shortcut unassigned",
+  "ru": "Записать сочетание для архивации треда, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Close focused chat pane, current shortcut Ctrl + Shift + X",
+  "ru": "Записать сочетание для закрытия активной области чата, текущее сочетание Ctrl + Shift + X",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Close panel tab, current shortcut Ctrl + W",
+  "ru": "Записать сочетание для закрытия вкладки панели, текущее сочетание Ctrl + W",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Cycle model backward, current shortcut Alt + Shift + M",
+  "ru": "Записать сочетание для переключения модели назад, текущее сочетание Alt + Shift + M",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Cycle model forward, current shortcut Alt + M",
+  "ru": "Записать сочетание для переключения модели вперёд, текущее сочетание Alt + M",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Cycle provider backward, current shortcut Alt + Shift + P",
+  "ru": "Записать сочетание для переключения провайдера назад, текущее сочетание Alt + Shift + P",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Cycle provider forward, current shortcut Alt + P",
+  "ru": "Записать сочетание для переключения провайдера вперёд, текущее сочетание Alt + P",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Cycle reasoning effort backward, current shortcut Alt + Shift + T",
+  "ru": "Записать сочетание для переключения уровня рассуждений назад, текущее сочетание Alt + Shift + T",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Cycle reasoning effort forward, current shortcut Alt + T",
+  "ru": "Записать сочетание для переключения уровня рассуждений вперёд, текущее сочетание Alt + T",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Focus composer, current shortcut Ctrl + Shift + C",
+  "ru": "Записать сочетание для фокуса на поле ввода, текущее сочетание Ctrl + Shift + C",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Focus location, current shortcut unassigned",
+  "ru": "Записать сочетание для фокуса на поле адреса, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Focus next chat pane, current shortcut unassigned",
+  "ru": "Записать сочетание для фокуса на следующей области чата, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Focus previous chat pane, current shortcut unassigned",
+  "ru": "Записать сочетание для фокуса на предыдущей области чата, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for New panel tab, current shortcut Ctrl + T",
+  "ru": "Записать сочетание для создания новой вкладки панели, текущее сочетание Ctrl + T",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for New thread, current shortcut Ctrl + Shift + O",
+  "ru": "Записать сочетание для создания нового треда, текущее сочетание Ctrl + Shift + O",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for New window, current shortcut unassigned",
+  "ru": "Записать сочетание для создания нового окна, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Next thread, current shortcut Ctrl + Shift + ]",
+  "ru": "Записать сочетание для перехода к следующему треду, текущее сочетание Ctrl + Shift + ]",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Open in preferred app, current shortcut Ctrl + O",
+  "ru": "Записать сочетание для открытия в предпочитаемом приложении, текущее сочетание Ctrl + O",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Open server settings, current shortcut unassigned",
+  "ru": "Записать сочетание для открытия настроек сервера, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Open settings, current shortcut Ctrl + ,",
+  "ru": "Записать сочетание для открытия настроек, текущее сочетание Ctrl + ,",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Open terminal, current shortcut Ctrl + Shift + Enter",
+  "ru": "Записать сочетание для открытия терминала, текущее сочетание Ctrl + Shift + Enter",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Previous thread, current shortcut Ctrl + Shift + [",
+  "ru": "Записать сочетание для перехода к предыдущему треду, текущее сочетание Ctrl + Shift + [",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Quick open file, current shortcut Ctrl + P",
+  "ru": "Записать сочетание для быстрого открытия файла, текущее сочетание Ctrl + P",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Reload page, current shortcut unassigned",
+  "ru": "Записать сочетание для перезагрузки страницы, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Rename thread, current shortcut unassigned",
+  "ru": "Записать сочетание для переименования треда, текущее сочетание не назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Search threads, current shortcut Ctrl + K",
+  "ru": "Записать сочетание для поиска по тредам, текущее сочетание Ctrl + K",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Toggle diff, current shortcut Ctrl + D",
+  "ru": "Записать сочетание для показа/скрытия диффа, текущее сочетание Ctrl + D",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Toggle focused chat pane size, current shortcut Ctrl + Shift + E",
+  "ru": "Записать сочетание для изменения размера активной области чата, текущее сочетание Ctrl + Shift + E",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Toggle model picker, current shortcut Ctrl + Shift + M",
+  "ru": "Записать сочетание для показа/скрытия выбора модели, текущее сочетание Ctrl + Shift + M",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Record shortcut for Toggle panel, current shortcut Ctrl + J",
+  "ru": "Записать сочетание для показа/скрытия панели, текущее сочетание Ctrl + J",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Refactor the timeline cache to drop the duplicate fetch.",
+  "ru": "Переработай кеш ленты, чтобы убрать дублирующий запрос.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Refresh BB Community",
+  "ru": "Обновить BB Community",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Refreshing the marketplace failed",
+  "ru": "Не удалось обновить маркетплейс",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Release restorable provider sessions after 30 idle minutes. A change can take up to five minutes.",
+  "ru": "Освобождать восстановимые сессии провайдеров после 30 минут простоя. Изменение может занять до пяти минут.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Reload the plugin. If it still fails, remove it and install it again.",
+  "ru": "Перезагрузи плагин. Если он по-прежнему не работает, убери его и установи заново.",
+  "context": "components/plugin/management/plugin-status.test.ts"
+ },
+ {
+  "en": "Remove the plugin, then install it again from its source.",
+  "ru": "Убери плагин, а затем установи его заново из источника.",
+  "context": "components/plugin/management/plugin-status.test.ts"
+ },
+ {
+  "en": "Replying to side chat",
+  "ru": "Ответ в сайд-чате",
+  "context": "components/thread/timeline/ConversationMessageContent.tsx"
+ },
+ {
+  "en": "Reproduce the null cart in applyPromo.",
+  "ru": "Воспроизведи null-корзину в applyPromo.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Required settings are incomplete.",
+  "ru": "Обязательные настройки заполнены не полностью.",
+  "context": "components/plugin/management/plugin-status.test.ts"
+ },
+ {
+  "en": "Reset shortcut for Archive thread",
+  "ru": "Сбросить сочетание для архивации треда",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Close focused chat pane",
+  "ru": "Сбросить сочетание для закрытия активной области чата",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Close panel tab",
+  "ru": "Сбросить сочетание для закрытия вкладки панели",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Cycle model backward",
+  "ru": "Сбросить сочетание для переключения модели назад",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Cycle model forward",
+  "ru": "Сбросить сочетание для переключения модели вперёд",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Cycle provider backward",
+  "ru": "Сбросить сочетание для переключения провайдера назад",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Cycle provider forward",
+  "ru": "Сбросить сочетание для переключения провайдера вперёд",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Cycle reasoning effort backward",
+  "ru": "Сбросить сочетание для переключения уровня рассуждений назад",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Cycle reasoning effort forward",
+  "ru": "Сбросить сочетание для переключения уровня рассуждений вперёд",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Focus composer",
+  "ru": "Сбросить сочетание для фокуса на поле ввода",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Focus location",
+  "ru": "Сбросить сочетание для фокуса на поле адреса",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Focus next chat pane",
+  "ru": "Сбросить сочетание для фокуса на следующей области чата",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Focus previous chat pane",
+  "ru": "Сбросить сочетание для фокуса на предыдущей области чата",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for New panel tab",
+  "ru": "Сбросить сочетание для создания новой вкладки панели",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for New thread",
+  "ru": "Сбросить сочетание для создания нового треда",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for New window",
+  "ru": "Сбросить сочетание для создания нового окна",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Next thread",
+  "ru": "Сбросить сочетание для перехода к следующему треду",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Open in preferred app",
+  "ru": "Сбросить сочетание для открытия в предпочитаемом приложении",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Open server settings",
+  "ru": "Сбросить сочетание для открытия настроек сервера",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Open settings",
+  "ru": "Сбросить сочетание для открытия настроек",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Open terminal",
+  "ru": "Сбросить сочетание для открытия терминала",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Previous thread",
+  "ru": "Сбросить сочетание для перехода к предыдущему треду",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Quick open file",
+  "ru": "Сбросить сочетание для быстрого открытия файла",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Reload page",
+  "ru": "Сбросить сочетание для перезагрузки страницы",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Rename thread",
+  "ru": "Сбросить сочетание для переименования треда",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Search threads",
+  "ru": "Сбросить сочетание для поиска по тредам",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Toggle diff",
+  "ru": "Сбросить сочетание для показа/скрытия диффа",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Toggle focused chat pane size",
+  "ru": "Сбросить сочетание для изменения размера активной области чата",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Toggle model picker",
+  "ru": "Сбросить сочетание для показа/скрытия выбора модели",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Toggle panel",
+  "ru": "Сбросить сочетание для показа/скрытия панели",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Reset shortcut for Toggle sidebar",
+  "ru": "Сбросить сочетание для показа/скрытия боковой панели",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Resize right panel panes",
+  "ru": "Изменение размера областей правой панели",
+  "context": "components/secondary-panel/SidebarSplitContainer.test.tsx"
+ },
+ {
+  "en": "Reuse worktree",
+  "ru": "Переиспользовать рабочее дерево",
+  "context": "components/pickers/EnvironmentPicker.stories.tsx"
+ },
+ {
+  "en": "Review pending",
+  "ru": "Ожидается ревью",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ }
+]

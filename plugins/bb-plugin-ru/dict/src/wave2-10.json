@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Open as full thread",
+  "ru": "Открыть как полный тред",
+  "context": "lib/side-chat-plugin.ts"
+ },
+ {
+  "en": "Open on skills.sh",
+  "ru": "Открыть на skills.sh",
+  "context": "components/tools/SkillDetailView.tsx"
+ },
+ {
+  "en": "Open quick palette",
+  "ru": "Открыть быструю палитру",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open server and daemon logs",
+  "ru": "Открыть логи сервера и демона",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open the desktop log viewer for the bb server and host daemon.",
+  "ru": "Открыть просмотрщик логов сервера bb и демона хоста.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open the find bar for the active embedded browser page.",
+  "ru": "Открыть панель поиска на активной странице встроенного браузера.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Open workspace in Htop (Ctrl + O)",
+  "ru": "Открыть рабочую область в Htop (Ctrl + O)",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Operation interrupted",
+  "ru": "Операция прервана",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Operation update",
+  "ru": "Обновление операции",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Opus 4.8",
+  "ru": "",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Opus 4.8 1M",
+  "ru": "",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Ownership change completed",
+  "ru": "Смена владельца завершена",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Ownership change failed",
+  "ru": "Не удалось сменить владельца",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Ownership change …",
+  "ru": "Смена владельца …",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Page blocked",
+  "ru": "Страница заблокирована",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Page unavailable",
+  "ru": "Страница недоступна",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Pair a machine to run projects and threads on it.",
+  "ru": "Подключи машину, чтобы запускать на ней проекты и треды.",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Pair again",
+  "ru": "Повторить сопряжение",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Pair the new bb",
+  "ru": "Подключить новый bb",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Panel tab",
+  "ru": "Вкладка панели",
+  "context": "components/secondary-panel/SidebarSplitContainer.tsx"
+ },
+ {
+  "en": "Parent change operation message requires a status",
+  "ru": "Сообщению об операции смены родителя нужен статус",
+  "context": "build-thread-timeline.ts"
+ },
+ {
+  "en": "Password",
+  "ru": "Пароль",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Pause company logos",
+  "ru": "Приостановить показ логотипов",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Permission denied",
+  "ru": "Доступ запрещён",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Permission grant interrupted",
+  "ru": "Выдача доступа прервана",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Permission grant interrupted:",
+  "ru": "Выдача доступа прервана:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Permission granted",
+  "ru": "Доступ выдан",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Permission granted:",
+  "ru": "Доступ выдан:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Permission request",
+  "ru": "Запрос доступа",
+  "context": "pending-interaction-presentation.ts"
+ },
+ {
+  "en": "Pick a worktree",
+  "ru": "Выбери рабочее дерево",
+  "context": "components/pickers/WorktreePicker.tsx"
+ },
+ {
+  "en": "Pick its address — every bb gets its own URL.",
+  "ru": "Выбери адрес — у каждого bb свой URL.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Pick your address",
+  "ru": "Выбери свой адрес",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Plan ready for review",
+  "ru": "План готов к проверке",
+  "context": "pending-interaction-presentation.ts"
+ },
+ {
+  "en": "Plugin interaction pending",
+  "ru": "Ожидается взаимодействие с плагином",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Plugin not found",
+  "ru": "Плагин не найден",
+  "context": "hooks/cache-owners/plugin-cache-owner.ts"
+ },
+ {
+  "en": "Plugin removed from bb",
+  "ru": "Плагин убран из bb",
+  "context": "views/ToolsView.tsx"
+ },
+ {
+  "en": "Plugin settings saved",
+  "ru": "Настройки плагина сохранены",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Plugin uninstalled",
+  "ru": "Плагин удалён",
+  "context": "views/ToolsView.tsx"
+ },
+ {
+  "en": "Port module to TS",
+  "ru": "Перевести модуль на TS",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Post front matter is not closed",
+  "ru": "Front matter поста не закрыт",
+  "context": "blog/parse-post.ts"
+ },
+ {
+  "en": "Post must start with --- front matter",
+  "ru": "Пост должен начинаться с front matter ---",
+  "context": "blog/parse-post.ts"
+ },
+ {
+  "en": "Preferences and drafts",
+  "ru": "Настройки и черновики",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Press ⌘C",
+  "ru": "Нажми ⌘C",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Previous over the list",
+  "ru": "Предыдущий в списке",
+  "context": "components/pickers/modelPickerCycle.ts"
+ },
+ {
+  "en": "Privacy — bb",
+  "ru": "Приватность — bb",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Product updates and what we&rsquo;re building next. No spam.",
+  "ru": "Новости продукта и планы на будущее. Без спама.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Progress update",
+  "ru": "Обновление прогресса",
+  "context": "exec-lifecycle.ts"
+ },
+ {
+  "en": "Project commands",
+  "ru": "Команды проекта",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": "Project source unavailable",
+  "ru": "Источник проекта недоступен",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Project: BB",
+  "ru": "Проект: BB",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Projects unavailable",
+  "ru": "Проекты недоступны",
+  "context": "components/sidebar/ProjectListProjects.tsx"
+ },
+ {
+  "en": "Provider authorization failed",
+  "ru": "Ошибка авторизации у провайдера",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider billing issue",
+  "ru": "Проблема с оплатой у провайдера",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider budget exceeded",
+  "ru": "Превышен бюджет провайдера",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider connection failed",
+  "ru": "Не удалось подключиться к провайдеру",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider failed after too many attempts",
+  "ru": "Провайдер не ответил после слишком многих попыток",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider icon",
+  "ru": "Иконка провайдера",
+  "context": "lib/provider-icon.ts"
+ },
+ {
+  "en": "Provider internal error",
+  "ru": "Внутренняя ошибка провайдера",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider logo",
+  "ru": "Логотип провайдера",
+  "context": "lib/provider-icon.ts"
+ },
+ {
+  "en": "Provider output token limit reached",
+  "ru": "Достигнут лимит выходных токенов провайдера",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider overloaded",
+  "ru": "Провайдер перегружен",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider policy blocked request",
+  "ru": "Политика провайдера заблокировала запрос",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider rejected request",
+  "ru": "Провайдер отклонил запрос",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider sandbox error",
+  "ru": "Ошибка песочницы провайдера",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Provider stream disconnected",
+  "ru": "Поток от провайдера прервался",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Pull request was not merged",
+  "ru": "Пул-реквест не был влит",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Put the numbers your team actually checks on the bb homepage.",
+  "ru": "Вынеси на главную bb те цифры, которые команда правда смотрит.",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Put your agents to work.",
+  "ru": "Отправь агентов работать.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "QuickCreateProjectProvider is required",
+  "ru": "",
+  "context": "hooks/useQuickCreateProject.tsx"
+ },
+ {
+  "en": "Ran ...",
+  "ru": "Выполнено ...",
+  "context": "timeline-view.ts"
+ },
+ {
+  "en": "Ran bb status --json",
+  "ru": "Выполнено bb status --json",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Ran command",
+  "ru": "Команда выполнена",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Read",
+  "ru": "Читать",
+  "context": "routes/blog.tsx"
+ },
+ {
+  "en": "Read 1 path",
+  "ru": "Прочитан 1 путь",
+  "context": "pending-interaction-formatting.ts"
+ },
+ {
+  "en": "Read file",
+  "ru": "Файл прочитан",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Read x",
+  "ru": "Прочитан x",
+  "context": "timeline-activity-intents.ts"
+ },
+ {
+  "en": "ReadonlySet",
+  "ru": "",
+  "context": "lib/plugin-frontend.ts"
+ },
+ {
+  "en": "Rebase merging pull request",
+  "ru": "Выполняется слияние пул-реквеста с ребейзом",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Recording",
+  "ru": "Запись",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Recording too short (minimum 1 second)",
+  "ru": "Запись слишком короткая (минимум 1 секунда)",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "Refactor the auth flow",
+  "ru": "Отрефакторить поток авторизации",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Refreshing agent usage",
+  "ru": "Обновление расхода агента",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Relaunch bb to finish updating",
+  "ru": "Перезапусти bb, чтобы завершить обновление",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Relaunch failed",
+  "ru": "Не удалось перезапустить",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Reload the plugin. If it still fails, restart bb.",
+  "ru": "Перезагрузи плагин. Если ошибка повторяется, перезапусти bb.",
+  "context": "components/plugin/management/plugin-status.ts"
+ },
+ {
+  "en": "Reloading usage data",
+  "ru": "Обновление данных о расходе",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Remove image.png",
+  "ru": "Убрать image.png",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Remove project",
+  "ru": "Удалить проект",
+  "context": "components/dialogs/ProjectDeleteDialog.tsx"
+ },
+ {
+  "en": "Remove section",
+  "ru": "Удалить раздел",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Remove source",
+  "ru": "Удалить источник",
+  "context": "components/dialogs/ProjectSourceDeleteDialog.tsx"
+ },
+ {
+  "en": "Remove this address?",
+  "ru": "Удалить этот адрес?",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Remove…",
+  "ru": "Удалить…",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Removing the marketplace failed",
+  "ru": "Не удалось удалить маркетплейс",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Renders a custom interaction inside a thread.",
+  "ru": "Отрисовывает своё взаимодействие внутри треда.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Replaces how diffs are displayed everywhere in the app.",
+  "ru": "Заменяет отображение диффов во всём приложении.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Replaces how source code is displayed everywhere in the app.",
+  "ru": "Заменяет отображение исходного кода во всём приложении.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Requested by",
+  "ru": "Запросил",
+  "context": "components/plugin/PluginPendingInteractionComposer.tsx"
+ },
+ {
+  "en": "Resetting now",
+  "ru": "Сбрасывается сейчас",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Results pagination",
+  "ru": "Постраничная навигация по результатам",
+  "context": "components/ui/resource-pagination.tsx"
+ },
+ {
+  "en": "Resume company logos",
+  "ru": "Продолжить показ логотипов",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Retry all",
+  "ru": "Повторить все",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Retry the download",
+  "ru": "Повторить загрузку",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Retrying update…",
+  "ru": "Повтор обновления…",
+  "context": "components/settings/MachinesSettingsSection.tsx"
+ },
+ {
+  "en": "Reusing existing worktree",
+  "ru": "Используется существующее рабочее дерево",
+  "context": "components/promptbox/PromptBoxInternal.tsx"
+ },
+ {
+  "en": "Review requested permissions",
+  "ru": "Проверь запрошенные права",
+  "context": "pending-interaction-presentation.ts"
+ },
+ {
+  "en": "Revoke",
+  "ru": "Отозвать",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Run this command on the machine you want to add. It installs bb and keeps the machine connected to this server.",
+  "ru": "Выполни эту команду на машине, которую хочешь добавить. Она установит bb и будет держать машину подключённой к этому серверу.",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Running tool:",
+  "ru": "Выполняется инструмент:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Running web search:",
+  "ru": "Выполняется веб-поиск:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Runningpnpm test",
+  "ru": "",
+  "context": "components/thread/timeline/TimelineTitleView.tsx"
+ },
+ {
+  "en": "STATUS_SORT_RANK[a.status] - STATUS_SORT_RANK[b.status], ); return (",
+  "ru": "",
+  "context": "components/promptbox/banner/ThreadTodoCard.tsx"
+ },
+ {
+  "en": "Saving plugin settings failed",
+  "ru": "Не удалось сохранить настройки плагина",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Sawyer&rsquo;s Hermes",
+  "ru": "",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Sawyer&rsquo;s MacBook Air",
+  "ru": "",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Sawyer&rsquo;s MacBook Pro",
+  "ru": "",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Search and run bb commands from the keyboard.",
+  "ru": "Ищи и запускай команды bb с клавиатуры.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Search commands",
+  "ru": "Поиск команд",
+  "context": "components/commands/CommandPalette.tsx"
+ },
+ {
+  "en": "Search my home directory (max depth 3) for git repositories touched in the last 30 days and import only those projects into bb using the cli",
+  "ru": "Найди в моей домашней папке (глубина до 3) git-репозитории, которые менялись за последние 30 дней, и импортируй в bb только эти проекты через cli",
+  "context": "views/RootComposeEmptyWelcome.tsx"
+ },
+ {
+  "en": "SearchBar",
+  "ru": "",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "SearchBar.tsx",
+  "ru": "",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Searched",
+  "ru": "Выполнен поиск",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Searched for src=\"[\"^]+",
+  "ru": "Выполнен поиск src=\"[\"^]+",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Searched for y",
+  "ru": "Выполнен поиск y",
+  "context": "timeline-activity-intents.ts"
+ },
+ {
+  "en": "Searching commands…",
+  "ru": "Поиск команд…",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": "Searching files...",
+  "ru": "Поиск файлов…",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "Searching mentions…",
+  "ru": "Поиск упоминаний…",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": "Section name already exists.",
+  "ru": "Раздел с таким названием уже есть.",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Section name cannot be empty.",
+  "ru": "Название раздела не может быть пустым.",
+  "context": "components/dialogs/ThreadSectionCreateDialog.tsx"
+ },
+ {
+  "en": "Select a machine",
+  "ru": "Выбери машину",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Select a model.",
+  "ru": "Выбери модель.",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Select a project…",
+  "ru": "Выбери проект…",
+  "context": "components/plugin/PluginSettings.tsx"
+ },
+ {
+  "en": "Select a provider.",
+  "ru": "Выбери провайдера.",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Selected microphone was not found",
+  "ru": "Выбранный микрофон не найден",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "Sent a BB system message",
+  "ru": "Отправлено системное сообщение BB",
+  "context": "components/thread/timeline/GeneratedConversationMessage.tsx"
+ },
+ {
+  "en": "Sent an agent message",
+  "ru": "Отправлено сообщение агента",
+  "context": "components/thread/timeline/GeneratedConversationMessage.tsx"
+ },
+ {
+  "en": "Server profiles",
+  "ru": "Профили на сервере",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Set up remote access first, then come back here to get a pairing command that works from anywhere.",
+  "ru": "Сначала настрой удалённый доступ, затем вернись сюда за командой сопряжения, которая работает откуда угодно.",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Setting up workspace...",
+  "ru": "Настройка рабочей области…",
+  "context": "components/promptbox/follow-up-placeholder.ts"
+ },
+ {
+  "en": "Setting up...",
+  "ru": "Настройка…",
+  "context": "components/promptbox/follow-up-placeholder.ts"
+ },
+ {
+  "en": "Ship the release",
+  "ru": "Выкатить релиз",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Short-lived pairing codes, and an audit log of account actions such as enrolling or revoking a machine.",
+  "ru": "Недолговечные коды сопряжения и журнал действий с аккаунтом — например, подключение или отзыв машины.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Show changes",
+  "ru": "Показать изменения",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Showing cached catalog results because the latest search failed.",
+  "ru": "Показаны результаты из кэша каталога, потому что последний поиск не удался.",
+  "context": "components/plugin/management/BrowsePluginsTab.tsx"
+ },
+ {
+  "en": "Sign in with email",
+  "ru": "Войти по почте",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Sign out",
+  "ru": "Выйти",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Someone on this page renders a diff",
+  "ru": "",
+  "context": "lib/pierre-worker-pool-gate.ts"
+ },
+ {
+  "en": "Something went wrong. Try again.",
+  "ru": "Что-то пошло не так. Попробуй ещё раз.",
+  "context": "landing/cta.tsx"
+ },
+ {
+  "en": "Sonnet 4.6",
+  "ru": "",
+  "context": "components/pickers/model-brand-prefix.ts"
+ },
+ {
+  "en": "Sort: Automation name, ascending",
+  "ru": "Сортировка: название автоматизации, по возрастанию",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Source",
+  "ru": "Исходный код",
+  "context": "components/secondary-panel/rightPanelFileVisuals.ts"
+ },
+ {
+  "en": "Spawned a subagent:",
+  "ru": "Запущен субагент:",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Special Case Handling",
+  "ru": "Обработка особых случаев",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Squash merge queued",
+  "ru": "Слияние squash поставлено в очередь",
+  "context": "views/thread-detail/useThreadGitActions.ts"
+ },
+ {
+  "en": "Squash merge requires a local target branch.",
+  "ru": "Для слияния squash нужна локальная целевая ветка.",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Squash merge requires an existing local target branch.",
+  "ru": "Для слияния squash нужна существующая локальная целевая ветка.",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Squash merging",
+  "ru": "Выполняется слияние squash",
+  "context": "views/thread-detail/useThreadGitActions.ts"
+ },
+ {
+  "en": "Squash merging pull request",
+  "ru": "Выполняется слияние squash пул-реквеста",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ }
+]

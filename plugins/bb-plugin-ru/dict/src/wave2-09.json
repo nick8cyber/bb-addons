@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Failed to merge pull request",
+  "ru": "Не удалось влить пул-реквест",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Failed to open file externally",
+  "ru": "Не удалось открыть файл во внешней программе",
+  "context": "components/plugin/AppFileExternalNavigationDispatcher.tsx"
+ },
+ {
+  "en": "Failed to open terminal",
+  "ru": "Не удалось открыть терминал",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Failed to pin thread.",
+  "ru": "Не удалось закрепить тред.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to queue message.",
+  "ru": "Не удалось поставить сообщение в очередь.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to reload plugin",
+  "ru": "Не удалось перезагрузить плагин",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Failed to remove project.",
+  "ru": "Не удалось удалить проект.",
+  "context": "hooks/mutations/project-mutations.ts"
+ },
+ {
+  "en": "Failed to remove section.",
+  "ru": "Не удалось удалить раздел.",
+  "context": "hooks/mutations/thread-section-mutations.ts"
+ },
+ {
+  "en": "Failed to remove source.",
+  "ru": "Не удалось удалить источник.",
+  "context": "hooks/mutations/project-mutations.ts"
+ },
+ {
+  "en": "Failed to rename terminal.",
+  "ru": "Не удалось переименовать терминал.",
+  "context": "hooks/queries/thread-terminal-queries.ts"
+ },
+ {
+  "en": "Failed to reorder pinned threads.",
+  "ru": "Не удалось изменить порядок закреплённых тредов.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to reorder queued message.",
+  "ru": "Не удалось изменить порядок сообщений в очереди.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to resolve pending interaction",
+  "ru": "Не удалось обработать ожидающее взаимодействие",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.tsx"
+ },
+ {
+  "en": "Failed to resolve pending interaction.",
+  "ru": "Не удалось обработать ожидающее взаимодействие.",
+  "context": "hooks/mutations/thread-interaction-mutations.ts"
+ },
+ {
+  "en": "Failed to resolve plan review",
+  "ru": "Не удалось завершить проверку плана",
+  "context": "components/thread/pending-interactions/ThreadPendingInteractionBanner.tsx"
+ },
+ {
+  "en": "Failed to run environment action.",
+  "ru": "Не удалось выполнить действие с окружением.",
+  "context": "hooks/mutations/environment-mutations.ts"
+ },
+ {
+  "en": "Failed to send queued message.",
+  "ru": "Не удалось отправить сообщение из очереди.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to start git action",
+  "ru": "Не удалось запустить действие Git",
+  "context": "views/thread-detail/useThreadGitActions.ts"
+ },
+ {
+  "en": "Failed to start terminal.",
+  "ru": "Не удалось запустить терминал.",
+  "context": "hooks/queries/thread-terminal-queries.ts"
+ },
+ {
+  "en": "Failed to start voice recording",
+  "ru": "Не удалось начать голосовую запись",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "Failed to stop thread",
+  "ru": "Не удалось остановить тред",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Failed to stop thread.",
+  "ru": "Не удалось остановить тред.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to submit answer",
+  "ru": "Не удалось отправить ответ",
+  "context": "components/thread/user-questions/UserQuestionInteractionContent.tsx"
+ },
+ {
+  "en": "Failed to submit response",
+  "ru": "Не удалось отправить ответ",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Failed to unarchive thread.",
+  "ru": "Не удалось восстановить тред из архива.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to unpin and move thread.",
+  "ru": "Не удалось открепить и переместить тред.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to unpin thread.",
+  "ru": "Не удалось открепить тред.",
+  "context": "hooks/mutations/thread-state-mutations.ts"
+ },
+ {
+  "en": "Failed to update experiments.",
+  "ru": "Не удалось обновить эксперименты.",
+  "context": "hooks/mutations/settings-mutations.ts"
+ },
+ {
+  "en": "Failed to update general settings.",
+  "ru": "Не удалось обновить основные настройки.",
+  "context": "hooks/mutations/settings-mutations.ts"
+ },
+ {
+  "en": "Failed to update keyboard shortcuts.",
+  "ru": "Не удалось обновить сочетания клавиш.",
+  "context": "hooks/mutations/settings-mutations.ts"
+ },
+ {
+  "en": "Failed to update local source.",
+  "ru": "Не удалось обновить локальный источник.",
+  "context": "hooks/mutations/project-mutations.ts"
+ },
+ {
+  "en": "Failed to update merge base branch",
+  "ru": "Не удалось обновить ветку базы слияния",
+  "context": "components/secondary-panel/git-diff/useEnvironmentMergeBase.ts"
+ },
+ {
+  "en": "Failed to update project.",
+  "ru": "Не удалось обновить проект.",
+  "context": "hooks/mutations/project-mutations.ts"
+ },
+ {
+  "en": "Failed to update queued message.",
+  "ru": "Не удалось обновить сообщение в очереди.",
+  "context": "hooks/mutations/thread-runtime-mutations.ts"
+ },
+ {
+  "en": "Failed to upload attachment.",
+  "ru": "Не удалось загрузить вложение.",
+  "context": "hooks/mutations/project-mutations.ts"
+ },
+ {
+  "en": "Fetching URL",
+  "ru": "Получение URL",
+  "context": "pending-interaction-tool-use.ts"
+ },
+ {
+  "en": "Fewer models",
+  "ru": "Меньше моделей",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "File Manager",
+  "ru": "Файловый менеджер",
+  "context": "components/workspace-open-target/workspace-open-target-display.ts"
+ },
+ {
+  "en": "File changes pending approval",
+  "ru": "Изменения файлов ожидают подтверждения",
+  "context": "pending-interaction-presentation.ts"
+ },
+ {
+  "en": "File not found.",
+  "ru": "Файл не найден.",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "First-principles codebase simplification",
+  "ru": "Упрощение кодовой базы от первых принципов",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Fix CI on main",
+  "ru": "Починить CI в main",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Fix auth bug assigned to parent",
+  "ru": "Исправить баг аутентификации, назначенный родительскому треду",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Folder names can't contain slashes.",
+  "ru": "Имена папок не могут содержать слэши.",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "Fork it. Make it your own.",
+  "ru": "Форкни и настрой под себя.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Get new posts by email",
+  "ru": "Получать новые статьи по почте",
+  "context": "routes/blog.tsx"
+ },
+ {
+  "en": "Get release notes by email",
+  "ru": "Получать примечания к релизу по почте",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Get release notes in your inbox. No spam.",
+  "ru": "Получай примечания к релизу на почту. Без спама.",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "Give your bb a private URL and open it from any browser. Your code and data never leave your machine.",
+  "ru": "Задай своему bb приватный URL и открывай его из любого браузера. Твой код и данные не покидают машину.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Grok Build",
+  "ru": "",
+  "context": "landing/icons.tsx"
+ },
+ {
+  "en": "Group tab here",
+  "ru": "Сгруппировать вкладку здесь",
+  "context": "components/secondary-panel/SidebarSplitContainer.tsx"
+ },
+ {
+  "en": "HTMLElement | null) | null; itemKeys: readonly string[]; measurements: Map",
+  "ru": "",
+  "context": "components/thread/timeline/TimelineWindowedItemsLoader.tsx"
+ },
+ {
+  "en": "Hermes Agent",
+  "ru": "",
+  "context": "landing/icons.tsx"
+ },
+ {
+  "en": "Highest permission mode any thread on the selected machine may run with. Threads that ask for more resolve down to it, and a provider that supports nothing this low can't run here.",
+  "ru": "Максимальный режим доступа для тредов на выбранной машине. Для тредов, запрашивающих больше, он понижается до этого уровня, а неподдерживающие его провайдеры не смогут здесь работать.",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Host file preview target is incomplete",
+  "ru": "Цель предпросмотра файла на хосте указана не полностью",
+  "context": "hooks/queries/host-file-preview-query.ts"
+ },
+ {
+  "en": "How should I dedupe the timeline fetch?",
+  "ru": "Как устранить дублирование запросов ленты?",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "I'll build it as a bb plugin and mount it in your sidebar.",
+  "ru": "Я соберу это как плагин для bb и добавлю в твою боковую панель.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "I'll keep dispatching and ping you when something needs a call.",
+  "ru": "Я продолжу распределять задачи и напишу, когда понадобится твоё решение.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "If you give us your email address to follow releases, we keep it to send you those emails, and nothing else. Every email has an unsubscribe link.",
+  "ru": "Если ты укажешь свой адрес эл. почты, чтобы следить за релизами, мы будем использовать его только для этих рассылок. В каждом письме есть ссылка для отписки.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Ignored invalid realtime message",
+  "ru": "Некорректное сообщение реального времени проигнорировано",
+  "context": "lib/ws.ts"
+ },
+ {
+  "en": "In another project",
+  "ru": "В другом проекте",
+  "context": "components/sidebar/ThreadRow.tsx"
+ },
+ {
+  "en": "Incompatible",
+  "ru": "Несовместимо",
+  "context": "components/plugin/management/plugin-status.ts"
+ },
+ {
+  "en": "Inspect advisor configuration and review history",
+  "ru": "Просмотр конфигурации советника и истории проверок",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Install a version compatible with this bb.",
+  "ru": "Установи версию, совместимую с этой версией bb.",
+  "context": "components/plugin/management/plugin-status.ts"
+ },
+ {
+  "en": "Install from npm, a Git repository, or a local path.",
+  "ru": "Установить из npm, Git-репозитория или локального пути.",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "Install this plugin from the source its marketplace lists.",
+  "ru": "Установить этот плагин из источника, указанного в его маркетплейсе.",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "Installed plugin id is unavailable",
+  "ru": "Идентификатор установленного плагина недоступен",
+  "context": "components/plugin/management/BrowsePluginsTab.tsx"
+ },
+ {
+  "en": "IntelliJ IDEA",
+  "ru": "",
+  "context": "components/workspace-open-target/workspace-open-target-display.ts"
+ },
+ {
+  "en": "Interrupted fetch:",
+  "ru": "Прерванное получение:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Interrupted image view:",
+  "ru": "Прерванный просмотр изображения:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Interrupted web search:",
+  "ru": "Прерванный веб-поиск:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Invalid hook call",
+  "ru": "Недопустимый вызов хука",
+  "context": "lib/plugin-frontend.ts"
+ },
+ {
+  "en": "Is the sidebar visible",
+  "ru": "Видна ли боковая панель",
+  "context": "components/ui/sidebar.tsx"
+ },
+ {
+  "en": "It runs on your machine, and is waiting for you when you&rsquo;re back.",
+  "ru": "Он работает на твоей машине и ждёт твоего возвращения.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "JetBrainsMono Nerd Font Mono",
+  "ru": "",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "Join Discord",
+  "ru": "Вступить в Discord",
+  "context": "components/settings/CommunitySettingsSection.tsx"
+ },
+ {
+  "en": "July 31, 2026",
+  "ru": "31 июля 2026 г.",
+  "context": "blog/tweets.ts"
+ },
+ {
+  "en": "Keeping and deleting data",
+  "ru": "Хранение и удалёние данных",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Liberation Mono",
+  "ru": "",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "List files",
+  "ru": "Список файлов",
+  "context": "pending-interaction-formatting.ts"
+ },
+ {
+  "en": "Load more",
+  "ru": "Загрузить ещё",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Load older messages",
+  "ru": "Загрузить более ранние сообщения",
+  "context": "components/thread/timeline/ThreadTimelineSurface.tsx"
+ },
+ {
+  "en": "Loading files...",
+  "ru": "Загрузка файлов...",
+  "context": "components/secondary-panel/ThreadStorageBrowser.tsx"
+ },
+ {
+  "en": "Loading older messages...",
+  "ru": "Загрузка более ранних сообщений...",
+  "context": "components/thread/timeline/ThreadTimelineSurface.tsx"
+ },
+ {
+  "en": "Loading older messages…",
+  "ru": "Загрузка более ранних сообщений…",
+  "context": "components/thread/timeline/ThreadTimelineSurface.tsx"
+ },
+ {
+  "en": "Loading projects",
+  "ru": "Загрузка проектов",
+  "context": "components/pickers/ProjectSelector.tsx"
+ },
+ {
+  "en": "Loading projects…",
+  "ru": "Загрузка проектов…",
+  "context": "components/pickers/ProjectSelector.tsx"
+ },
+ {
+  "en": "Loading registry skill",
+  "ru": "Загрузка навыка из реестра",
+  "context": "components/tools/SkillsLibrary.tsx"
+ },
+ {
+  "en": "Loading the project's execution defaults...",
+  "ru": "Загрузка параметров запуска проекта по умолчанию...",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Loading threads...",
+  "ru": "Загрузка тредов...",
+  "context": "components/sidebar/SidebarThreadSearchPanel.tsx"
+ },
+ {
+  "en": "Local host daemon is unavailable.",
+  "ru": "Демон локального хоста недоступен.",
+  "context": "hooks/useLocalOpenTargets.ts"
+ },
+ {
+  "en": "Lowercase letters, numbers, and dashes only.",
+  "ru": "Только строчные буквы, цифры и дефисы.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "MODEL_SEARCH_MIN_OPTIONS; return (",
+  "ru": "",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Manage machines in bb",
+  "ru": "Управление машинами в bb",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Many of bb&rsquo;s own features are built with the same tools you have. The GitHub integration, agent memory, scheduled jobs, and even remote access are all plugins.",
+  "ru": "Многие встроенные возможности bb созданы с помощью тех же инструментов, что доступны и тебе. Интеграция с GitHub, память агента, задачи по расписанию и даже удалённый доступ — всё это плагины.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Mark read",
+  "ru": "Пометить прочитанным",
+  "context": "components/thread/ThreadActionsMenu.tsx"
+ },
+ {
+  "en": "Mark ready",
+  "ru": "Пометить готовым",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Mark unread",
+  "ru": "Пометить непрочитанным",
+  "context": "components/thread/ThreadActionsMenu.tsx"
+ },
+ {
+  "en": "Markdown view mode",
+  "ru": "Режим просмотра Markdown",
+  "context": "components/secondary-panel/FilePreview.tsx"
+ },
+ {
+  "en": "Marketplace refreshed",
+  "ru": "Маркетплейс обновлён",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Marketplace removed",
+  "ru": "Маркетплейс удалён",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Marking pull request ready",
+  "ru": "Пометка пул-реквеста как готового",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "Math.abs(dx) || chromeRect === null || y",
+  "ru": "",
+  "context": "components/secondary-panel/SidebarSplitContainer.tsx"
+ },
+ {
+  "en": "Math.abs(previous - nextMargin)",
+  "ru": "",
+  "context": "components/thread/timeline/TimelineWindowedItems.tsx"
+ },
+ {
+  "en": "Maximum turns reached",
+  "ru": "Достигнут лимит ходов",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Merge pull request",
+  "ru": "Влить пул-реквест",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Mergeable",
+  "ru": "Можно влить",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Merged",
+  "ru": "Влит",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Merging pull request",
+  "ru": "Слияние пул-реквеста",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "MesloLGS NF",
+  "ru": "",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "Message this thread",
+  "ru": "Написать в этот тред",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Method not allowed.",
+  "ru": "Метод не поддерживается.",
+  "context": "landing/endpoints.ts"
+ },
+ {
+  "en": "Microphone is already in use",
+  "ru": "Микрофон уже используется",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "Missing",
+  "ru": "Отсутствует",
+  "context": "components/plugin/management/plugin-status.ts"
+ },
+ {
+  "en": "Moving attachments to the selected project...",
+  "ru": "Перемещёние вложений в выбранный проект...",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Network access",
+  "ru": "Доступ к сети",
+  "context": "pending-interaction-formatting.ts"
+ },
+ {
+  "en": "Never connected",
+  "ru": "Никогда не подключалось",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Never refreshed",
+  "ru": "Никогда не обновлялось",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "New Tab",
+  "ru": "Новая вкладка",
+  "context": "components/secondary-panel/NewTabPage.tsx"
+ },
+ {
+  "en": "New branch from:",
+  "ru": "Новая ветка от:",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "New branches are unavailable right now.",
+  "ru": "Создание новых веток сейчас недоступно.",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "New features, improvements, and fixes in every bb release.",
+  "ru": "Новые возможности, улучшения и исправления в каждом релизе bb.",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "New to this local Cloud?",
+  "ru": "Впервые в этом локальном облаке?",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Newest compatible",
+  "ru": "Новейшая совместимая",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "No archived threads match your search.",
+  "ru": "Нет архивных тредов, соответствующих поиску.",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "No audio was captured",
+  "ru": "Звук не записан",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "No changed files detected.",
+  "ru": "Изменённых файлов не обнаружено.",
+  "context": "components/thread/WorkspaceChangesList.tsx"
+ },
+ {
+  "en": "No diff was available for this file.",
+  "ru": "Для этого файла нет доступного диффа.",
+  "context": "hooks/queries/use-environment-diff-patches.ts"
+ },
+ {
+  "en": "No files match search.",
+  "ru": "Нет файлов, соответствующих поиску.",
+  "context": "components/secondary-panel/ThreadStorageBrowser.tsx"
+ },
+ {
+  "en": "No goal objective.",
+  "ru": "Цель не задана.",
+  "context": "components/promptbox/banner/ThreadGoalCard.tsx"
+ },
+ {
+  "en": "No host",
+  "ru": "Нет хоста",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "No host connected",
+  "ru": "Хост не подключён",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "No local branches found.",
+  "ru": "Локальные ветки не найдены.",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "No local changes.",
+  "ru": "Нет локальных изменений.",
+  "context": "components/workspace/workspace-status.tsx"
+ },
+ {
+  "en": "No machine is online. Start one to choose a project folder.",
+  "ru": "Ни одна машина не в сети. Запусти машину, чтобы выбрать папку проекта.",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "No machines",
+  "ru": "Нет машин",
+  "context": "components/secondary-panel/TerminalHostSelector.tsx"
+ },
+ {
+  "en": "No matching threads",
+  "ru": "Треды не найдены",
+  "context": "components/sidebar/SidebarThreadSearchPanel.tsx"
+ },
+ {
+  "en": "No microphone was found",
+  "ru": "Микрофон не найден",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "No microphones found",
+  "ru": "Микрофоны не найдены",
+  "context": "hooks/useAudioInputDevices.ts"
+ },
+ {
+  "en": "No plugins match this search.",
+  "ru": "Плагины не найдены.",
+  "context": "components/plugin/management/BrowsePluginsTab.tsx"
+ },
+ {
+  "en": "No projects",
+  "ru": "Нет проектов",
+  "context": "components/sidebar/ProjectListProjects.tsx"
+ },
+ {
+  "en": "No prompt text.",
+  "ru": "Нет текста промпта.",
+  "context": "components/promptbox/banner/ThreadPromptModeCard.tsx"
+ },
+ {
+  "en": "No providers available.",
+  "ru": "Нет доступных провайдеров.",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "No renderable diff",
+  "ru": "Нет диффа для отображения",
+  "context": "components/secondary-panel/git-diff/DiffFileCard.tsx"
+ },
+ {
+  "en": "No searchable source",
+  "ru": "Нет источника для поиска",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "No searchable source is available.",
+  "ru": "Нет доступного источника для поиска.",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "No skills in your library.",
+  "ru": "В твоей библиотеке нет навыков.",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "No skills.sh resources available.",
+  "ru": "Ресурсы skills.sh недоступны.",
+  "context": "components/tools/SkillsBrowse.tsx"
+ },
+ {
+  "en": "No worktrees in this project yet",
+  "ru": "В этом проекте пока нет рабочих деревьев",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Notes on building the IDE that builds itself.",
+  "ru": "Заметки о создании IDE, которая создаёт саму себя.",
+  "context": "routes/blog.tsx"
+ },
+ {
+  "en": "Nothing is stopping you from building your ideal workbench.",
+  "ru": "Ничто не мешает тебе создать свою идеальную рабочую среду.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Number(left.id !== localDaemonHostId) - Number(right.id !== localDaemonHostId), ), [hosts, localDaemonHostId], ); const now = Date.now(); return (",
+  "ru": "",
+  "context": "components/pickers/MachinePicker.tsx"
+ },
+ {
+  "en": "Number(left.id !== machines.localDaemonHostId) - Number(right.id !== machines.localDaemonHostId), ); return (",
+  "ru": "",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "On it. Spawning a worker thread.",
+  "ru": "Делаю. Создаю рабочий тред.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "One-click, no terminal",
+  "ru": "В один клик, без терминала",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Only SKILL.md can be edited",
+  "ru": "Редактировать можно только SKILL.md",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Open Create custom light palette — Thread working",
+  "ru": "Открыть «Создать пользовательскую светлую палитру» — тред работает",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ }
+]

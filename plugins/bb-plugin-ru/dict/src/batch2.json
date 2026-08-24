@@ -1,0 +1,662 @@
+[
+ {
+  "en": "Marketplace source",
+  "ru": "Источник маркетплейса",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "More actions",
+  "ru": "Другие действия",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "Move pane",
+  "ru": "Переместить область",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "New",
+  "ru": "Создать",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "New bb skill",
+  "ru": "Новый навык bb",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "New folder",
+  "ru": "Новая папка",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "New folder name",
+  "ru": "Имя новой папки",
+  "context": "components/dialogs/RemotePathBrowser.tsx"
+ },
+ {
+  "en": "New messages",
+  "ru": "Новые сообщения",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "New project",
+  "ru": "Новый проект",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "New section",
+  "ru": "Новый раздел",
+  "context": "components/dialogs/ThreadSectionCreateDialog.tsx"
+ },
+ {
+  "en": "New worktree",
+  "ru": "Новое рабочее дерево",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Next",
+  "ru": "Далее",
+  "context": "components/ui/pagination.tsx"
+ },
+ {
+  "en": "Next image",
+  "ru": "Следующее изображение",
+  "context": "components/ui/image-lightbox.tsx"
+ },
+ {
+  "en": "No preview available for this image.",
+  "ru": "Предпросмотр этого изображения недоступен.",
+  "context": "components/git-diff/GitDiffCardBody.tsx"
+ },
+ {
+  "en": "No thread details available.",
+  "ru": "Сведения о треде недоступны.",
+  "context": "views/RootComposeView.tsx"
+ },
+ {
+  "en": "Offline",
+  "ru": "Не в сети",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Open Mermaid diagram",
+  "ru": "Открыть диаграмму Mermaid",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Open externally",
+  "ru": "Открыть во внешнем приложении",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Open in",
+  "ru": "Открыть в",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Pane arrangement",
+  "ru": "Расположение областей",
+  "context": "views/thread-detail/PaneMaximizeButton.tsx"
+ },
+ {
+  "en": "Plan mode controls",
+  "ru": "Управление режимом плана",
+  "context": "components/promptbox/banner/ThreadPromptModeCard.tsx"
+ },
+ {
+  "en": "Plugin",
+  "ru": "Плагин",
+  "context": "components/promptbox/PromptBoxActionsMenu.tsx"
+ },
+ {
+  "en": "Plugin marketplaces",
+  "ru": "Маркетплейсы плагинов",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Plugin name",
+  "ru": "Название плагина",
+  "context": "components/plugin/PluginsOverview.tsx"
+ },
+ {
+  "en": "Plugin source",
+  "ru": "Источник плагина",
+  "context": "components/plugin/management/AddPluginDialog.tsx"
+ },
+ {
+  "en": "Previous",
+  "ru": "Назад",
+  "context": "components/ui/pagination.tsx"
+ },
+ {
+  "en": "Previous image",
+  "ru": "Предыдущее изображение",
+  "context": "components/ui/image-lightbox.tsx"
+ },
+ {
+  "en": "Project folder not found",
+  "ru": "Папка проекта не найдена",
+  "context": "components/sidebar/ProjectRow.tsx"
+ },
+ {
+  "en": "Projects",
+  "ru": "Проекты",
+  "context": "components/sidebar/SidebarViewOptionsMenu.stories.tsx"
+ },
+ {
+  "en": "Provider",
+  "ru": "Провайдер",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "Providers",
+  "ru": "Провайдеры",
+  "context": "components/settings/ProvidersSettingsSection.tsx"
+ },
+ {
+  "en": "Recent",
+  "ru": "Недавние",
+  "context": "components/sidebar/SidebarThreadSearchPanel.tsx"
+ },
+ {
+  "en": "Rename machine",
+  "ru": "Переименовать машину",
+  "context": "components/settings/MachineRenameDialog.tsx"
+ },
+ {
+  "en": "Reset view",
+  "ru": "Сбросить масштаб",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Resize right panel",
+  "ru": "Изменить размер правой панели",
+  "context": "views/thread-detail/SplitWorkspaceSecondaryPanelHost.tsx"
+ },
+ {
+  "en": "Resize thread and right panel",
+  "ru": "Изменить размер треда и правой панели",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "Right panel views",
+  "ru": "Виды правой панели",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "Running",
+  "ru": "Выполняется",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Saved prompt",
+  "ru": "Сохранённый промпт",
+  "context": "components/ui/resource/detail-shell.tsx"
+ },
+ {
+  "en": "Scheduled",
+  "ru": "Запланировано",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Scroll to latest event",
+  "ru": "К последнему событию",
+  "context": "components/ui/scroll-to-bottom-button.tsx"
+ },
+ {
+  "en": "Search archived threads",
+  "ru": "Поиск по архивным тредам",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Search keyboard shortcuts",
+  "ru": "Поиск горячих клавиш",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Section name",
+  "ru": "Название раздела",
+  "context": "components/dialogs/ThreadSectionCreateDialog.tsx"
+ },
+ {
+  "en": "Secure connection",
+  "ru": "Защищённое соединение",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "Send now",
+  "ru": "Отправить сейчас",
+  "context": "components/promptbox/banner/QueuedMessagesList.tsx"
+ },
+ {
+  "en": "Setup method",
+  "ru": "Способ настройки",
+  "context": "components/dialogs/ProjectMachineSetupDialog.tsx"
+ },
+ {
+  "en": "Ships with bb",
+  "ru": "В комплекте с bb",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Show Mermaid source",
+  "ru": "Показать исходный код Mermaid",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Sidebar thread list",
+  "ru": "Список тредов в боковой панели",
+  "context": "components/settings/SidebarThreadListSetting.tsx"
+ },
+ {
+  "en": "Source actions",
+  "ru": "Действия с источником",
+  "context": "views/project-settings/ProjectSourceRow.tsx"
+ },
+ {
+  "en": "Split diff view",
+  "ru": "Разделённый дифф",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "Stacked diff view",
+  "ru": "Совмещённый дифф",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "Start voice input",
+  "ru": "Начать голосовой ввод",
+  "context": "components/promptbox/PromptBoxInternal.tsx"
+ },
+ {
+  "en": "Stop run",
+  "ru": "Остановить выполнение",
+  "context": "components/promptbox/PromptBoxInternal.tsx"
+ },
+ {
+  "en": "Switch changed files bucket",
+  "ru": "Переключить список изменённых файлов",
+  "context": "components/workspace/ChangedFilesDetailRow.tsx"
+ },
+ {
+  "en": "Terminal disconnected",
+  "ru": "Терминал отключён",
+  "context": "components/thread/terminal/ThreadTerminalContent.tsx"
+ },
+ {
+  "en": "This machine",
+  "ru": "Эта машина",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "This thread is no longer available.",
+  "ru": "Этот тред больше недоступен.",
+  "context": "components/plugin/PluginThreadChat.tsx"
+ },
+ {
+  "en": "Thread info",
+  "ru": "Информация о треде",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.stories.tsx"
+ },
+ {
+  "en": "Thread search results",
+  "ru": "Результаты поиска тредов",
+  "context": "components/sidebar/SidebarThreadSearchPanel.tsx"
+ },
+ {
+  "en": "Thread storage file tree",
+  "ru": "Дерево файлов хранилища треда",
+  "context": "components/secondary-panel/ThreadStorageFileTree.tsx"
+ },
+ {
+  "en": "Thread storage path is not available yet.",
+  "ru": "Путь к хранилищу треда пока недоступен.",
+  "context": "components/ui/sonner.stories.tsx"
+ },
+ {
+  "en": "Thread table of contents",
+  "ru": "Содержание треда",
+  "context": "components/thread/toc/ThreadTableOfContents.tsx"
+ },
+ {
+  "en": "Todo",
+  "ru": "Задачи",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Type",
+  "ru": "Тип",
+  "context": "components/plugin/PluginsOverview.tsx"
+ },
+ {
+  "en": "Unarchive thread",
+  "ru": "Из архива",
+  "context": "components/thread/ThreadUnarchiveButton.tsx"
+ },
+ {
+  "en": "Update blocked",
+  "ru": "Обновлёние заблокировано",
+  "context": "components/plugin/management/PluginUpdatesCard.tsx"
+ },
+ {
+  "en": "Update needs attention",
+  "ru": "Обновлёние требует внимания",
+  "context": "components/plugin/management/PluginUpdatesCard.tsx"
+ },
+ {
+  "en": "Updates",
+  "ru": "Обновлёния",
+  "context": "components/settings/settings-nav.tsx"
+ },
+ {
+  "en": "Usage limits",
+  "ru": "Лимиты расхода",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Usage limits machine",
+  "ru": "Машина лимитов расхода",
+  "context": "components/settings/UsageLimitsSettingsSection.tsx"
+ },
+ {
+  "en": "Use this destination",
+  "ru": "Использовать это назначение",
+  "context": "components/dialogs/ProjectMachineSetupDialog.tsx"
+ },
+ {
+  "en": "Worktree",
+  "ru": "Рабочее дерево",
+  "context": "components/pickers/WorktreePicker.tsx"
+ },
+ {
+  "en": "Worktree actions",
+  "ru": "Действия с рабочим деревом",
+  "context": "components/sidebar/ProjectRow.tsx"
+ },
+ {
+  "en": "Zoom in",
+  "ru": "Приблизить",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "Zoom out",
+  "ru": "Отдалить",
+  "context": "components/ui/markdown-mermaid-diagram.tsx"
+ },
+ {
+  "en": "bb (built-in)",
+  "ru": "bb (встроенный)",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "new Map",
+  "ru": "",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "Add on a machine",
+  "ru": "Добавить на машину",
+  "context": "views/ProjectSettingsView.tsx"
+ },
+ {
+  "en": "Add to chat inserts a quote here",
+  "ru": "«В чат» вставляет цитату сюда",
+  "context": "components/thread/timeline/StoryDraftPromptBox.tsx"
+ },
+ {
+  "en": "Agent messages",
+  "ru": "Сообщения агента",
+  "context": "components/thread/toc/ThreadTableOfContents.tsx"
+ },
+ {
+  "en": "All projects",
+  "ru": "Все проекты",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "All threads",
+  "ru": "Все треды",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Alphabetical",
+  "ru": "По алфавиту",
+  "context": "components/sidebar/ProjectList.tsx"
+ },
+ {
+  "en": "Already added",
+  "ru": "Уже добавлено",
+  "context": "views/ProjectSettingsView.tsx"
+ },
+ {
+  "en": "An https manifest URL,",
+  "ru": "URL-адрес манифеста https,",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Another machine cannot use this address.",
+  "ru": "Другая машина не может использовать этот адрес.",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Archive worktree",
+  "ru": "В архив",
+  "context": "components/sidebar/ProjectRow.tsx"
+ },
+ {
+  "en": "Archiving environment...",
+  "ru": "Перемещёние окружения в архив...",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Assign parent thread",
+  "ru": "Назначить родительский тред",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Attach files",
+  "ru": "Прикрепить файлы",
+  "context": "components/promptbox/PromptBoxActionsMenu.tsx"
+ },
+ {
+  "en": "Audio",
+  "ru": "Аудио",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Authentication completed",
+  "ru": "Аутентификация завершёна",
+  "context": "views/AuthCallbackView.tsx"
+ },
+ {
+  "en": "Authentication failed",
+  "ru": "Ошибка аутентификации",
+  "context": "views/AuthCallbackView.tsx"
+ },
+ {
+  "en": "Automatically import my projects",
+  "ru": "Автоматически импортировать мои проекты",
+  "context": "views/RootComposeEmptyWelcome.tsx"
+ },
+ {
+  "en": "Automation",
+  "ru": "Автоматизация",
+  "context": "components/promptbox/PromptBoxActionsMenu.tsx"
+ },
+ {
+  "en": "Available",
+  "ru": "Доступно",
+  "context": "components/plugin/management/PluginUpdatesCard.tsx"
+ },
+ {
+  "en": "BB preview",
+  "ru": "Предпросмотр BB",
+  "context": "components/plugin/ExperimentalFileLinkMenu.tsx"
+ },
+ {
+  "en": "Back",
+  "ru": "Назад",
+  "context": "components/thread/user-questions/UserQuestionInteractionContent.tsx"
+ },
+ {
+  "en": "Background agent",
+  "ru": "Фоновый агент",
+  "context": "components/promptbox/banner/ThreadBackgroundCommandsCard.tsx"
+ },
+ {
+  "en": "Background command",
+  "ru": "Фоновая команда",
+  "context": "components/promptbox/banner/ThreadBackgroundCommandsCard.tsx"
+ },
+ {
+  "en": "Blue",
+  "ru": "Синий",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Branch from:",
+  "ru": "Ветка-источник:",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Browse",
+  "ru": "Обзор",
+  "context": "components/ui/resource/collection.tsx"
+ },
+ {
+  "en": "Browser tabs need the desktop app",
+  "ru": "Для вкладок браузера нужно приложение для ПК",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "CI pass",
+  "ru": "CI пройден",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Captions",
+  "ru": "Субтитры",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Category",
+  "ru": "Категория",
+  "context": "components/plugin/management/BrowsePluginsTab.tsx"
+ },
+ {
+  "en": "Checking…",
+  "ru": "Проверка…",
+  "context": "views/MachineSettingsView.tsx"
+ },
+ {
+  "en": "Checkout",
+  "ru": "Переключиться",
+  "context": "components/pickers/BranchPicker.tsx"
+ },
+ {
+  "en": "Checkout flow",
+  "ru": "Оформление заказа",
+  "context": "components/plugin/browse-hero/MiniAppScenes.tsx"
+ },
+ {
+  "en": "Child threads",
+  "ru": "Дочерние треды",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Clear",
+  "ru": "Очистить",
+  "context": "components/secondary-panel/BrowserNewTabScreen.tsx"
+ },
+ {
+  "en": "Clone from the project remote",
+  "ru": "Клонировать из удалённого репозитория проекта",
+  "context": "components/dialogs/ProjectMachineSetupDialog.tsx"
+ },
+ {
+  "en": "Close find bar",
+  "ru": "Закрыть строку поиска",
+  "context": "components/secondary-panel/BrowserFindBar.tsx"
+ },
+ {
+  "en": "Closed Pull Request",
+  "ru": "Закрытый пул-реквест",
+  "context": "components/pull-request/PullRequestStatusPill.tsx"
+ },
+ {
+  "en": "Code expired",
+  "ru": "Срок действия кода истёк",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "Commit and squash merge",
+  "ru": "Закоммитить и влить со сквошем",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Commit changes",
+  "ru": "Закоммитить изменения",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Commit the current workspace changes, then squash merge this branch.",
+  "ru": "Закоммитить текущие изменения в рабочей области и влить эту ветку со сквошем.",
+  "context": "components/dialogs/ThreadGitActionDialog.tsx"
+ },
+ {
+  "en": "Commits",
+  "ru": "Коммиты",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Committed",
+  "ru": "Закоммичено",
+  "context": "components/workspace/workspace-change-summary.tsx"
+ },
+ {
+  "en": "Compatible with your bb and plugin SDK",
+  "ru": "Совместимо с вашей версией bb и plugin SDK",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "Convert to draft",
+  "ru": "Преобразовать в черновик",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "Copy code",
+  "ru": "Копировать код",
+  "context": "components/ui/markdown-preview.tsx"
+ },
+ {
+  "en": "Copy directory",
+  "ru": "Копировать папку",
+  "context": "components/secondary-panel/ThreadMetadataContent.tsx"
+ },
+ {
+  "en": "Copy setup log",
+  "ru": "Копировать лог установки",
+  "context": "components/dialogs/ProviderCliInstallLogDialog.tsx"
+ },
+ {
+  "en": "Could not determine whether this workspace uses Git.",
+  "ru": "Не удалось определить, используется ли Git в этой рабочей области.",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.tsx"
+ },
+ {
+  "en": "Couldn&apos;t check for updates",
+  "ru": "Не удалось проверить наличие обновлёний",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Couldn&apos;t load surrounding context.",
+  "ru": "Не удалось загрузить окружающий контекст.",
+  "context": "components/git-diff/GitDiffCardBody.tsx"
+ },
+ {
+  "en": "Create",
+  "ru": "Создать",
+  "context": "views/SettingsView.tsx"
+ }
+]

@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Reload the active embedded browser page.",
+  "ru": "Перезагрузить активную страницу встроенного браузера.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Remote access isn't ready yet.",
+  "ru": "Удалённый доступ ещё не готов.",
+  "context": "components/dialogs/AddMachineDialog.test.tsx"
+ },
+ {
+  "en": "Remove plugin from bb?",
+  "ru": "Убрать плагин из bb?",
+  "context": "views/ToolsView.plugin-detail.test.tsx"
+ },
+ {
+  "en": "Rename the focused thread.",
+  "ru": "Переименовать тред в фокусе.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Reproduce the null cart",
+  "ru": "Воспроизвести ошибку с пустой корзиной",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Restart bb. If the files are still missing, reinstall bb.",
+  "ru": "Перезапусти bb. Если файлы по-прежнему отсутствуют, переустанови bb.",
+  "context": "components/plugin/management/plugin-status.test.ts"
+ },
+ {
+  "en": "Rewrite localhost links",
+  "ru": "Преобразовывать ссылки localhost",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Roger Serra",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Running background command:",
+  "ru": "Выполняется фоновая команда:",
+  "context": "components/promptbox/banner/ThreadBackgroundCommandsCard.tsx"
+ },
+ {
+  "en": "Salem Sayed Abdel Gawad",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Scott Sunarto",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Search workspace files in a new panel tab.",
+  "ru": "Искать файлы рабочего пространства в новой вкладке панели.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Select model",
+  "ru": "Выбрать модель",
+  "context": "components/pickers/ModelReasoningPicker.tsx"
+ },
+ {
+  "en": "Select the next higher supported reasoning effort, wrapping after the highest.",
+  "ru": "Выбрать следующий более высокий поддерживаемый уровень рассуждения, после максимального перейти к минимальному.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Select the next lower supported reasoning effort, wrapping before the lowest.",
+  "ru": "Выбрать следующий более низкий поддерживаемый уровень рассуждения, перед минимальным перейти к максимальному.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Select the next model of the composer's provider, wrapping at the end.",
+  "ru": "Выбрать следующую модель текущего провайдера в поле ввода, после последней перейти к первой.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Select the next provider for the composer, wrapping at the end.",
+  "ru": "Выбрать следующего провайдера для поля ввода, после последнего перейти к первому.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Select the previous model of the composer's provider, wrapping at the beginning.",
+  "ru": "Выбрать предыдущую модель текущего провайдера в поле ввода, перед первой перейти к последней.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Select the previous provider for the composer, wrapping at the beginning.",
+  "ru": "Выбрать предыдущего провайдера для поля ввода, перед первым перейти к последнему.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Sender thread unavailable",
+  "ru": "Тред отправителя недоступен",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Shane Logsdon",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Show full description",
+  "ru": "Показать полное описание",
+  "context": "components/tools/detail-page-recipes.test.tsx"
+ },
+ {
+  "en": "Show full diff",
+  "ru": "Показать полный дифф",
+  "context": "components/secondary-panel/git-diff/DiffFileCard.tsx"
+ },
+ {
+  "en": "Show in sidebar",
+  "ru": "Показать на боковой панели",
+  "context": "components/plugin/PluginNavSidebarItems.test.tsx"
+ },
+ {
+  "en": "Show or hide the app sidebar.",
+  "ru": "Показать или скрыть боковую панель приложения.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Show or hide the secondary panel.",
+  "ru": "Показать или скрыть дополнительную панель.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Show unhandled provider events",
+  "ru": "Показывать необработанные события провайдера",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Skill not found.",
+  "ru": "Навык не найден.",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Sort: Plugin name, ascending",
+  "ru": "Сортировка: имя плагина, по возрастанию",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Squash merge completed",
+  "ru": "Сквош-слияние завершено",
+  "context": "components/ui/sonner.stories.tsx"
+ },
+ {
+  "en": "Start a thread in the active project.",
+  "ru": "Создать тред в активном проекте.",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Starting terminal...",
+  "ru": "Запуск терминала...",
+  "context": "components/thread/terminal/ThreadTerminalPanel.stories.tsx"
+ },
+ {
+  "en": "Steer running threads on Enter",
+  "ru": "Отправлять инструкции выполняющимся тредам по Enter",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Stop editing queued message",
+  "ru": "Завершить изменение сообщения в очереди",
+  "context": "components/promptbox/banner/QueuedMessagesList.test.tsx"
+ },
+ {
+  "en": "Stop editing sent message",
+  "ru": "Завершить изменение отправленного сообщения",
+  "context": "views/thread-detail/ThreadDetailPromptArea.test.tsx"
+ },
+ {
+  "en": "Stop loading",
+  "ru": "Остановить загрузку",
+  "context": "components/secondary-panel/BrowserTabContent.chrome.test.tsx"
+ },
+ {
+  "en": "Stop turn",
+  "ru": "Остановить ход",
+  "context": "components/plugin/PluginPendingInteractionComposer.tsx"
+ },
+ {
+  "en": "Support inbox",
+  "ru": "Обращения в поддержку",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "System default",
+  "ru": "Системное значение",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "Technical details",
+  "ru": "Технические сведения",
+  "context": "components/plugin/management/PluginUpdatesCard.test.tsx"
+ },
+ {
+  "en": "Texting the Crunch bot, which spawns a bb thread",
+  "ru": "Написать боту Crunch, который создаёт тред bb",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "That parent thread no longer exists.",
+  "ru": "Этого родительского треда больше нет.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "That parent thread was deleted.",
+  "ru": "Этот родительский тред был удалён.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "The plugins installed on this bb host. Turn one on or off, apply updates, or open it for settings and details.",
+  "ru": "Плагины, установленные на этом хосте bb. Включай и отключай их, устанавливай обновления или открывай настройки и сведения.",
+  "context": "components/plugin/plugins-collection-copy.ts"
+ },
+ {
+  "en": "The sender thread no longer exists.",
+  "ru": "Треда отправителя больше нет.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "This registry skill is no longer available from its source.",
+  "ru": "Этот навык из реестра больше недоступен в исходном источнике.",
+  "context": "components/tools/ExtensionsDetailStates.stories.tsx"
+ },
+ {
+  "en": "Thread file links are only available when the thread has an environment.",
+  "ru": "Ссылки на файлы треда доступны, только когда у треда есть окружение.",
+  "context": "lib/thread-local-file-links.test.ts"
+ },
+ {
+  "en": "Thread file links must use absolute file paths.",
+  "ru": "В ссылках на файлы треда нужно указывать абсолютные пути.",
+  "context": "lib/thread-local-file-links.test.ts"
+ },
+ {
+  "en": "Toggle focused chat pane size",
+  "ru": "Переключить размер области чата в фокусе",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Toggle model picker",
+  "ru": "Открыть или закрыть выбор модели",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Turn the current conversation into a spec and publish it to the project issue tracker: no interview, just synthesis of what you've already discussed.",
+  "ru": "Преобразовать текущий разговор в спецификацию и опубликовать её в трекере задач проекта: без интервью, только обобщение уже обсуждённого.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Unarchive the parent thread first or choose another parent.",
+  "ru": "Сначала извлеки родительский тред из архива или выбери другого родителя.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Uninstall ACP providers",
+  "ru": "Удалить провайдеры ACP",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Advisor",
+  "ru": "Удалить Advisor",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Agent Proxy",
+  "ru": "Удалить Agent Proxy",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Ask User Question",
+  "ru": "Удалить Ask User Question",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Automations",
+  "ru": "Удалить автоматизации",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Claude Code provider",
+  "ru": "Удалить провайдер Claude Code",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Codex provider",
+  "ru": "Удалить провайдер Codex",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Custom instructions",
+  "ru": "Удалить пользовательские инструкции",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Dispatch",
+  "ru": "Удалить Dispatch",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Handoff",
+  "ru": "Удалить Handoff",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Headroom",
+  "ru": "Удалить Headroom",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Inline visualizations",
+  "ru": "Удалить встроенные визуализации",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Keep Awake",
+  "ru": "Удалить Keep Awake",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Memory",
+  "ru": "Удалить память",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Pi provider",
+  "ru": "Удалить провайдер Pi",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Provider retry",
+  "ru": "Удалить повторные попытки провайдера",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Remote access",
+  "ru": "Удалить удалённый доступ",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Secrets",
+  "ru": "Удалить секреты",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Side chat",
+  "ru": "Удалить сайд-чат",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Tasks",
+  "ru": "Удалить задачи",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Uninstall Workflows",
+  "ru": "Удалить воркфлоу",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Unknown checkout",
+  "ru": "Неизвестная рабочая копия",
+  "context": "components/promptbox/NewThreadPromptBox.test.tsx"
+ },
+ {
+  "en": "Update bb",
+  "ru": "Обновить bb",
+  "context": "components/plugin/management/PluginUpdatesCard.test.tsx"
+ },
+ {
+  "en": "Update check incomplete",
+  "ru": "Проверка обновлений не завершена",
+  "context": "components/plugin/management/CheckPluginUpdatesButton.test.tsx"
+ },
+ {
+  "en": "Updates with bb",
+  "ru": "Обновляется вместе с bb",
+  "context": "components/tools/PluginDetail.tsx"
+ },
+ {
+  "en": "Usage not provided.",
+  "ru": "Данные о расходе не предоставлены.",
+  "context": "components/settings/UsageLimitsSettingsSection.test.tsx"
+ },
+ {
+  "en": "User commands",
+  "ru": "Пользовательские команды",
+  "context": "components/promptbox/PromptBoxInternal.test.tsx"
+ },
+ {
+  "en": "Vedran Burojevic",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Vedran Burojević",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Video editor",
+  "ru": "Видеоредактор",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "View details for grilling",
+  "ru": "Показать сведения о grilling",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "View details for handoff",
+  "ru": "Показать сведения о handoff",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "View details for prototype",
+  "ru": "Показать сведения о prototype",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "View details for tdd",
+  "ru": "Показать сведения о tdd",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Wait a moment, then reload the plugin.",
+  "ru": "Подожди немного, затем перезагрузи плагин.",
+  "context": "components/plugin/management/plugin-status.ts"
+ },
+ {
+  "en": "Waiting for approval",
+  "ru": "Ожидание одобрения",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Workflows",
+  "ru": "Воркфлоу",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Workspace",
+  "ru": "Рабочее пространство",
+  "context": "lib/app-command-metadata.ts"
+ },
+ {
+  "en": "Workspace status unavailable.",
+  "ru": "Статус рабочего пространства недоступен.",
+  "context": "components/workspace/workspace-status.test.ts"
+ },
+ {
+  "en": "Zhen Huang",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "a live dashboard",
+  "ru": "интерактивная панель мониторинга",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "bb connect",
+  "ru": "",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "target ? (",
+  "ru": "",
+  "context": "components/dialogs/EnvironmentRenameDialog.tsx"
+ },
+ {
+  "en": "void; itemRefs: React.MutableRefObject",
+  "ru": "",
+  "context": "components/promptbox/mentions/MentionMenu.tsx"
+ },
+ {
+  "en": ". Install one and every agent you use in bb can run it.",
+  "ru": ". Установи один из них, и любой используемый в bb агент сможет его запускать.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": ": Loading models...",
+  "ru": ": Загрузка моделей...",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "A review is running right now. Nothing has been checked yet.",
+  "ru": "Сейчас выполняется проверка. Пока ничего не проверено.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "A thread cannot be its own parent.",
+  "ru": "Тред не может быть родителем самого себя.",
+  "context": "lib/lifecycle-errors.test.ts"
+ },
+ {
+  "en": "Add label filters",
+  "ru": "Добавить фильтры по меткам",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Add source",
+  "ru": "Добавить источник",
+  "context": "components/dialogs/ProjectPathDialog.stories.tsx"
+ },
+ {
+  "en": "Add the required configuration, then reload the plugin.",
+  "ru": "Добавь необходимые настройки, затем перезагрузи плагин.",
+  "context": "components/plugin/management/plugin-status.ts"
+ },
+ {
+  "en": "Added a case for an empty cart with an active promo.",
+  "ru": "Добавлена обработка пустой корзины с активной промоакцией.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Added the debounce and a test. Verifying.",
+  "ru": "Добавил дебаунс и тест. Проверяю.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Address",
+  "ru": "Адрес",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Adds a page to the app sidebar.",
+  "ru": "Добавляет страницу на боковую панель приложения.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Adds an action beside the thread composer.",
+  "ru": "Добавляет действие рядом с полем ввода треда.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Adds an action that opens a panel beside a thread.",
+  "ru": "Добавляет действие, открывающее панель рядом с тредом.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Adds an action to the app sidebar.",
+  "ru": "Добавляет действие на боковую панель приложения.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Adds an action to thread headers.",
+  "ru": "Добавляет действие в заголовки тредов.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Advisor verdict",
+  "ru": "Вердикт Advisor",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Advisor: Should fix. Sidebar warning and destructive counters are now indistinguishable from success counters. The advisor found a real problem worth fixing, but not a blocking one.",
+  "ru": "Advisor: Стоит исправить. Теперь предупреждение на боковой панели и счётчики разрушительных действий неотличимы от счётчиков успеха. Advisor обнаружил реальную проблему, которую стоит исправить, но она не блокирует работу.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Agent tool",
+  "ru": "Инструмент агента",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "All Threads",
+  "ru": "Все треды",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Andrew Chan",
+  "ru": "",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Anything can kick off work.",
+  "ru": "Работу может запустить что угодно.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Anything need me?",
+  "ru": "Нужна моя помощь?",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Applies to file diffs in threads, the diff panel, and plugin views.",
+  "ru": "Применяется к диффам файлов в тредах, панели диффов и представлениях плагинов.",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "Ask which skill or flow fits your situation. A router over the skills in this repo.",
+  "ru": "Спроси, какой навык или сценарий подходит для твоей ситуации. Это маршрутизатор по навыкам в этом репозитории.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Attached image",
+  "ru": "Прикреплённое изображение",
+  "context": "components/promptbox/AttachmentPreview.tsx"
+ },
+ {
+  "en": "August 11, 2026",
+  "ru": "11 августа 2026 года",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "August 15, 2026",
+  "ru": "15 августа 2026 года",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "August 19, 2026",
+  "ru": "19 августа 2026 года",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "August 4, 2026",
+  "ru": "4 августа 2026 года",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "August 8, 2026",
+  "ru": "8 августа 2026 года",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "Background agent failed:",
+  "ru": "Фоновый агент завершился с ошибкой:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Background agent interrupted:",
+  "ru": "Работа фонового агента прервана:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Background command failed:",
+  "ru": "Фоновая команда завершилась с ошибкой:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Background command interrupted:",
+  "ru": "Выполнение фоновой команды прервано:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Background service",
+  "ru": "Фоновый сервис",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Blocked",
+  "ru": "Заблокирован",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Branch has diverged.",
+  "ru": "Ветка разошлась.",
+  "context": "components/workspace/workspace-status.tsx"
+ },
+ {
+  "en": "Branch is behind its merge base.",
+  "ru": "Ветка отстаёт от базы слияния.",
+  "context": "components/workspace/workspace-status.tsx"
+ },
+ {
+  "en": "Brian Lovin",
+  "ru": "",
+  "context": "blog/tweets.ts"
+ },
+ {
+  "en": "Build a tasks plugin",
+  "ru": "Создать плагин задач",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Cache the result for a few seconds, then refetch.",
+  "ru": "Кэшировать результат несколько секунд, затем запросить заново.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Cancelling the timer on unmount so there's no leak.",
+  "ru": "Отменяю таймер при размонтировании, чтобы не было утечки.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Changelog preview",
+  "ru": "Предпросмотр журнала изменений",
+  "context": "views/SettingsView.experiments.test.tsx"
+ },
+ {
+  "en": "Changes requested",
+  "ru": "Запрошены изменения",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Chat with other bb users and follow development on GitHub.",
+  "ru": "Общайся с другими пользователями bb и следи за разработкой на GitHub.",
+  "context": "components/settings/CommunitySettingsSection.tsx"
+ },
+ {
+  "en": "Checked Sentry for new events",
+  "ru": "Проверил новые события в Sentry",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Checked for blockers",
+  "ru": "Проверил наличие блокеров",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Checked just now",
+  "ru": "Проверено только что",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Checked the other call sites",
+  "ru": "Проверил остальные места вызова",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Checking Git support…",
+  "ru": "Проверка поддержки Git…",
+  "context": "components/secondary-panel/ThreadSecondaryPanel.collapseControl.test.tsx"
+ },
+ {
+  "en": "Checking checkout state",
+  "ru": "Проверка состояния рабочей копии",
+  "context": "views/root-compose-branch-ui.ts"
+ },
+ {
+  "en": "Checks failing",
+  "ru": "Проверки не пройдены",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Checks passing",
+  "ru": "Проверки пройдены",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Checks unknown",
+  "ru": "Статус проверок неизвестен",
+  "context": "lib/pull-request-display.ts"
+ },
+ {
+  "en": "Chief",
+  "ru": "Руководитель",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Choose a new name for this section.",
+  "ru": "Выбери новое имя для этого раздела.",
+  "context": "components/dialogs/ThreadSectionCreateDialog.tsx"
+ },
+ {
+  "en": "Choose automatic activation, BB's list, or a specific plugin on this device.",
+  "ru": "Выбери автоматическую активацию, список BB или конкретный плагин на этом устройстве.",
+  "context": "components/settings/SidebarThreadListSetting.tsx"
+ },
+ {
+  "en": "Choose automatic activation, BB's viewer, or a specific plugin on this device.",
+  "ru": "Выбери автоматическую активацию, встроенный просмотрщик BB или конкретный плагин на этом устройстве.",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "Claude usage is rate limited right now. Try again shortly.",
+  "ru": "Сейчас для Claude действует ограничение частоты запросов. Повтори попытку чуть позже.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Archive thread",
+  "ru": "Очистить сочетание клавиш для «В архив»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Clear shortcut for Close focused chat pane",
+  "ru": "Очистить сочетание клавиш для «Закрыть область чата в фокусе»",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ }
+]

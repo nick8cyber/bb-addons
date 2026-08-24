@@ -1,0 +1,42 @@
+[
+ {
+  "en": "its Settings page",
+  "why": "Текст ссылки внутри английской фразы «This plugin is configured from its Settings page» — точная подмена даёт «…configured from его страницу настроек»: полуанглийский и не в том падеже."
+ },
+ {
+  "en": "its plugin page",
+  "why": "То же: ссылка внутри «Release, capabilities, and health live on its plugin page»."
+ },
+ {
+  "en": "on the bb server’s machine.",
+  "why": "Хвост предложения, начало которого — inline-код; перевести целиком нельзя, а по частям получается мешанина."
+ },
+ {
+  "en": "An https manifest URL,",
+  "why": "Начало того же предложения, разрезанного тегами <code>."
+ },
+ {
+  "en": "This plugin is configured from",
+  "why": "Начало фразы, которая заканчивается ссылкой «its Settings page» (она тоже исключена). Перевести половину — получить смесь языков."
+ },
+ {
+  "en": ". Install one and every agent you use in bb can run it.",
+  "why": "Хвост предложения, начало которого — ссылка на каталог навыков."
+ },
+ {
+  "en": "Release, capabilities, and health live on",
+  "why": "Начало фразы, которая заканчивается ссылкой «its plugin page»."
+ },
+ {
+  "en": "a kanban board",
+  "why": "Обрывок фразы из демо-сцены на странице каталога плагинов."
+ },
+ {
+  "en": "a live dashboard",
+  "why": "Обрывок фразы из демо-сцены на странице каталога плагинов."
+ },
+ {
+  "en": "and opened PR #418.",
+  "why": "Хвост предложения из демо-сцены, начало которого — отдельный узел."
+ }
+]

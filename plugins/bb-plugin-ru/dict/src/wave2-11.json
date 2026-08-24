@@ -1,0 +1,787 @@
+[
+ {
+  "en": "Start a new thread",
+  "ru": "Начать новый тред",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Steer current run (Enter)",
+  "ru": "Направить текущий запуск (Enter)",
+  "context": "components/promptbox/FollowUpPromptBox.tsx"
+ },
+ {
+  "en": "Stopped — host daemon restarted",
+  "ru": "Остановлено — демон хоста перезапущен",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Stopped — provider turn stopped responding",
+  "ru": "Остановлено — ход провайдера перестал отвечать",
+  "context": "parse-operation-message.ts"
+ },
+ {
+  "en": "Stopping run...",
+  "ru": "Остановка запуска...",
+  "context": "components/promptbox/FollowUpPromptBox.tsx"
+ },
+ {
+  "en": "Streamer mode",
+  "ru": "Режим стримера",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Structured output retries exhausted",
+  "ru": "Исчерпаны попытки получить структурированный вывод",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Sublime Text",
+  "ru": "Sublime Text",
+  "context": "components/workspace-open-target/workspace-open-target-display.ts"
+ },
+ {
+  "en": "Symbols Nerd Font Mono",
+  "ru": "Symbols Nerd Font Mono",
+  "context": "components/thread/terminal/ThreadTerminalView.tsx"
+ },
+ {
+  "en": "Syntax highlighting and gutters from the bb code theme.",
+  "ru": "Подсветка синтаксиса и поля из темы кода bb.",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "System error",
+  "ru": "Системная ошибка",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "T | Promise",
+  "ru": "T | Promise",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "T, ): SidebarNavigationThreadSelection",
+  "ru": "T, ): SidebarNavigationThreadSelection",
+  "context": "hooks/queries/sidebar-navigation-query.ts"
+ },
+ {
+  "en": "T; type AppendChild =",
+  "ru": "T; type AppendChild =",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "T; type AppendLike = (...nodes: Array",
+  "ru": "T; type AppendLike = (...nodes: Array",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "T; type InsertBefore =",
+  "ru": "T; type InsertBefore =",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "T; type ReplaceChild =",
+  "ru": "T; type ReplaceChild =",
+  "context": "lib/foreign-dom-mutation-guard.ts"
+ },
+ {
+  "en": "TMessage; identity: BufferedTextInstanceIdentity | null; meta: EventMeta; mode: \"delta\" | \"final\"; refs: BufferedTextProjectionRefs",
+  "ru": "TMessage; identity: BufferedTextInstanceIdentity | null; meta: EventMeta; mode: \"delta\" | \"final\"; refs: BufferedTextProjectionRefs",
+  "context": "buffered-text-projection.ts"
+ },
+ {
+  "en": "Teach bb to …",
+  "ru": "Научить bb …",
+  "context": "components/showcase-hero/showcase-archetype.ts"
+ },
+ {
+  "en": "Terminals unavailable.",
+  "ru": "Терминалы недоступны.",
+  "context": "components/thread/terminal/useThreadTerminalController.ts"
+ },
+ {
+  "en": "That name is reserved. Pick another.",
+  "ru": "Это имя зарезервировано. Выбери другое.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "The Connect plugin is disabled, so remote access is off. Enable it, then come back here to get a pairing command that works from anywhere.",
+  "ru": "Плагин Connect отключён, поэтому удалённый доступ не работает. Включи его, затем вернись сюда, чтобы получить команду сопряжения, которая работает откуда угодно.",
+  "context": "components/dialogs/AddMachineDialog.tsx"
+ },
+ {
+  "en": "The IDE that builds itself",
+  "ru": "IDE, которая создаёт сама себя",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "The agent asks through",
+  "ru": "Агент спрашивает через",
+  "context": "components/plugin/PluginPendingInteractionComposer.tsx"
+ },
+ {
+  "en": "The app asks for the camera, the microphone, and the photo library only when you attach an image or dictate a prompt. That content goes to your bb server. It does not go to us.",
+  "ru": "Приложение запрашивает доступ к камере, микрофону и медиатеке, только когда ты прикрепляешь изображение или диктуешь промпт. Этот контент отправляется на твой сервер bb. К нам он не поступает.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "The bb apps",
+  "ru": "Приложения bb",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "The browser could not load this page. Try reloading or opening it externally.",
+  "ru": "Браузеру не удалось загрузить эту страницу. Попробуй перезагрузить её или открыть во внешнем браузере.",
+  "context": "components/secondary-panel/BrowserTabContent.tsx"
+ },
+ {
+  "en": "The changelog has no releases",
+  "ru": "В журнале изменений нет выпусков",
+  "context": "components/settings/changelog-preview.ts"
+ },
+ {
+  "en": "The iOS app keeps this on the device:",
+  "ru": "Приложение iOS хранит на устройстве:",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "The iOS app sends no analytics, no telemetry, and no crash reports to us.",
+  "ru": "Приложение iOS не отправляет нам аналитику, телеметрию и отчёты о сбоях.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "The message being edited is no longer available.",
+  "ru": "Редактируемое сообщение больше недоступно.",
+  "context": "views/thread-detail/ThreadDetailView.tsx"
+ },
+ {
+  "en": "The new version",
+  "ru": "Новая версия",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "The plugin is marked &ldquo;Update failed&rdquo; in the installed list until an update succeeds.",
+  "ru": "До успешного обновления плагин помечен как &ldquo;Обновление не удалось&rdquo; в списке установленных.",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "The sender thread is archived.",
+  "ru": "Тред-отправитель архивирован.",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "The sender thread was deleted.",
+  "ru": "Тред-отправитель удалён.",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "The skills on this bb host — yours, your providers', and those bundled with plugins. They work with every agent you use in bb.",
+  "ru": "Навыки на этом хосте bb — твои, твоих провайдеров и встроенные в плагины. Они работают с каждым агентом, которого ты используешь в bb.",
+  "context": "components/tools/SkillsCollection.tsx"
+ },
+ {
+  "en": "The update couldn’t be completed.",
+  "ru": "Не удалось завершить обновление.",
+  "context": "components/plugin/management/UpdatePluginDialog.tsx"
+ },
+ {
+  "en": "This action cannot be undone.",
+  "ru": "Это действие нельзя отменить.",
+  "context": "components/dialogs/ThreadDeleteDialog.tsx"
+ },
+ {
+  "en": "This bb will live at",
+  "ru": "Этот bb будет доступен по адресу",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "This becomes your bb&rsquo;s permanent URL. Lowercase letters, numbers, and dashes.",
+  "ru": "Это станет постоянным URL твоего bb. Только строчные буквы, цифры и дефисы.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "This browser does not expose microphone devices.",
+  "ru": "Этот браузер не предоставляет доступ к микрофонам.",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "This environment is being archived.",
+  "ru": "Это окружение перемещается в архив.",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "This plugin isn't running, so its commands, settings, agent tools, app surfaces, and thread integrations can't be listed.",
+  "ru": "Этот плагин не запущен, поэтому нельзя получить список его команд, настроек, агентских инструментов, разделов приложения и интеграций с тредами.",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "This plugin panel is not available. The plugin may have been disabled or removed.",
+  "ru": "Эта панель плагина недоступна. Возможно, плагин отключён или удалён.",
+  "context": "views/PluginPanelView.tsx"
+ },
+ {
+  "en": "This plugin tab is not available. The plugin may still be loading, or it has been disabled or removed.",
+  "ru": "Эта вкладка плагина недоступна. Возможно, плагин ещё загружается, отключён или удалён.",
+  "context": "components/plugin/PluginPanelActions.tsx"
+ },
+ {
+  "en": "This policy covers three separate things. You can use the first one alone.",
+  "ru": "Эта политика охватывает три разные вещи. Первую можно использовать отдельно.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "This registry skill could not be loaded.",
+  "ru": "Не удалось загрузить этот навык из реестра.",
+  "context": "components/tools/SkillsLibrary.tsx"
+ },
+ {
+  "en": "This thread is a child of",
+  "ru": "Этот тред — дочерний для",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "This thread is a side chat of",
+  "ru": "Этот тред — сайд-чат для",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "This thread was forked from",
+  "ru": "Этот тред форкнут от",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "This website",
+  "ru": "Этот сайт",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Thread details",
+  "ru": "Сведения о треде",
+  "context": "views/thread-detail/ThreadDetailSecondaryContent.tsx"
+ },
+ {
+  "en": "Thread integration",
+  "ru": "Интеграция с тредами",
+  "context": "components/tools/PluginCapabilities.tsx"
+ },
+ {
+  "en": "Thread rollback failed",
+  "ru": "Не удалось откатить тред",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Thread timeline renderer context is missing",
+  "ru": "Отсутствует контекст рендерера ленты треда",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "Thread timeline sender metadata context is missing",
+  "ru": "Отсутствует контекст метаданных отправителя ленты треда",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "Tightening the type so",
+  "ru": "Уточняем тип, чтобы",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "To-do list",
+  "ru": "Список дел",
+  "context": "components/promptbox/banner/ThreadTodoCard.tsx"
+ },
+ {
+  "en": "Tool execution interrupted",
+  "ru": "Выполнение инструмента прервано",
+  "context": "tool-activity-projection.ts"
+ },
+ {
+  "en": "Transcribing",
+  "ru": "Расшифровка",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Triage user reports into fixes without leaving bb.",
+  "ru": "Разбирай обращения пользователей и превращай их в исправления, не покидая bb.",
+  "context": "components/plugin/browse-hero/browse-hero-archetypes.ts"
+ },
+ {
+  "en": "Turn is not steerable",
+  "ru": "Этот ход нельзя направить",
+  "context": "error-display.ts"
+ },
+ {
+  "en": "Type to search files.",
+  "ru": "Введи текст для поиска файлов.",
+  "context": "components/secondary-panel/NewTabFileSearch.tsx"
+ },
+ {
+  "en": "Type to search threads.",
+  "ru": "Введи текст для поиска тредов.",
+  "context": "components/sidebar/SidebarThreadSearchPanel.tsx"
+ },
+ {
+  "en": "Unified and split diffs from the bb code theme.",
+  "ru": "Единые и раздельные диффы из темы кода bb.",
+  "context": "components/settings/CodeRendererSettings.tsx"
+ },
+ {
+  "en": "Uninstall plugin?",
+  "ru": "Удалить плагин?",
+  "context": "views/ToolsView.tsx"
+ },
+ {
+  "en": "Unknown error",
+  "ru": "Неизвестная ошибка",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "Unknown project",
+  "ru": "Неизвестный проект",
+  "context": "components/settings/ArchivedThreadsSettingsSection.tsx"
+ },
+ {
+  "en": "Update check failed",
+  "ru": "Не удалось проверить обновления",
+  "context": "components/settings/app-update-check-store.ts"
+ },
+ {
+  "en": "Update didn&apos;t finish",
+  "ru": "Обновление не завершено",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Update project path",
+  "ru": "Обновить путь к проекту",
+  "context": "components/dialogs/ProjectPathDialog.tsx"
+ },
+ {
+  "en": "Update retry failed",
+  "ru": "Не удалось повторить обновление",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Update x.y.z",
+  "ru": "Обновить до x.y.z",
+  "context": "components/plugin/management/InstalledPluginsTab.tsx"
+ },
+ {
+  "en": "Updated plan",
+  "ru": "План обновлён",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Upgrade command copied",
+  "ru": "Команда обновления скопирована",
+  "context": "components/settings/UpdatesSettingsSection.tsx"
+ },
+ {
+  "en": "Uploading attachments...",
+  "ru": "Загрузка вложений...",
+  "context": "components/promptbox/NewThreadComposer.tsx"
+ },
+ {
+  "en": "Use Command, Control, or Alt with a key.",
+  "ru": "Используй Command, Control или Alt в сочетании с клавишей.",
+  "context": "components/settings/KeyboardSettingsSection.tsx"
+ },
+ {
+  "en": "Use template",
+  "ru": "Использовать шаблон",
+  "context": "components/ui/resource/collection.tsx"
+ },
+ {
+  "en": "Use this bb from any device, anywhere — powered by getbb.app.",
+  "ru": "Используй этот bb на любом устройстве откуда угодно — благодаря getbb.app.",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "Used by builders at",
+  "ru": "Используют разработчики из",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Used for prompt voice input.",
+  "ru": "Используется для голосового ввода промптов.",
+  "context": "components/settings/VoiceInputSettingsSection.tsx"
+ },
+ {
+  "en": "User answer requested",
+  "ru": "Запрошен ответ пользователя",
+  "context": "pending-interaction-presentation.ts"
+ },
+ {
+  "en": "View on X",
+  "ru": "Посмотреть в X",
+  "context": "blog/post-body.tsx"
+ },
+ {
+  "en": "View the source →",
+  "ru": "Посмотреть исходный код →",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Viewing image:",
+  "ru": "Просмотр изображения:",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Voice capture was aborted",
+  "ru": "Запись голоса прервана",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "Voice recording failed",
+  "ru": "Не удалось записать голос",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "Voice transcription returned an empty result.",
+  "ru": "Расшифровка голоса вернула пустой результат.",
+  "context": "hooks/useVoiceInput.ts"
+ },
+ {
+  "en": "Voice transcription was cancelled",
+  "ru": "Расшифровка голоса отменена",
+  "context": "components/promptbox/usePromptVoice.ts"
+ },
+ {
+  "en": "WORKSPACE_CHANGES_LIST_MAX_ROWS ? files.slice(0, WORKSPACE_CHANGES_LIST_MAX_ROWS) : files; const hiddenFileCount = files.length - visibleFiles.length; return (",
+  "ru": "WORKSPACE_CHANGES_LIST_MAX_ROWS ? files.slice(0, WORKSPACE_CHANGES_LIST_MAX_ROWS) : files; const hiddenFileCount = files.length - visibleFiles.length; return (",
+  "context": "components/thread/WorkspaceChangesList.tsx"
+ },
+ {
+  "en": "Waiting for answer",
+  "ru": "Ожидание ответа",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Waiting for answers to",
+  "ru": "Ожидание ответов на",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Waiting for approval to edit",
+  "ru": "Ожидание разрешения на изменение",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Waiting for host to reconnect...",
+  "ru": "Ожидание переподключения хоста...",
+  "context": "components/promptbox/follow-up-placeholder.ts"
+ },
+ {
+  "en": "Waiting for it to connect… this dialog closes itself.",
+  "ru": "Ожидание подключения… это окно закроется автоматически.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Waiting for it to connect… this page updates automatically.",
+  "ru": "Ожидание подключения… эта страница обновится автоматически.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Waiting for permission",
+  "ru": "Ожидание разрешения",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Waiting for permissions",
+  "ru": "Ожидание разрешений",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "We do not read, store, or train on your prompts, your code, or your agent conversations.",
+  "ru": "Мы не читаем и не храним твои промпты, код и разговоры с агентами, а также не обучаемся на них.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "We do not sell your data.",
+  "ru": "Мы не продаём твои данные.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "We do not share it with advertisers.",
+  "ru": "Мы не передаём их рекламодателям.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "We will update this page when the product changes, and we will move the date at the top. bb is open source, so you can also read the history of this page in the repository.",
+  "ru": "Мы обновим эту страницу, когда продукт изменится, и изменим дату вверху. bb имеет открытый исходный код, поэтому историю этой страницы также можно прочитать в репозитории.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "What bb collects, what stays on your own machines, and what bb connect can see.",
+  "ru": "Что собирает bb, что остаётся на твоих машинах и что может видеть bb connect.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "What can bb do, and how can you (my agent) interact with it? Summarize bb's capabilities and how you'd use the bb CLI to work with threads and projects.",
+  "ru": "Что умеет bb и как ты (мой агент) можешь с ним взаимодействовать? Кратко опиши возможности bb и то, как ты использовал бы bb CLI для работы с тредами и проектами.",
+  "context": "views/RootComposeEmptyWelcome.tsx"
+ },
+ {
+  "en": "What the relay can see.",
+  "ru": "Что может видеть ретранслятор.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "What we do not do",
+  "ru": "Чего мы не делаем",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "When you sign in to bb connect, we store:",
+  "ru": "При входе в bb connect мы храним:",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Windows (via WSL), Linux &amp; remote machines",
+  "ru": "Windows (через WSL), Linux и удалённые машины",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Work in checkout",
+  "ru": "Работать в рабочей копии",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Work on host",
+  "ru": "Работать на хосте",
+  "context": "components/pickers/EnvironmentPicker.tsx"
+ },
+ {
+  "en": "Work › Q3",
+  "ru": "Работа › Q3",
+  "context": "components/sidebar/SidebarSectionRow.tsx"
+ },
+ {
+  "en": "Worked for (8m 14s)",
+  "ru": "Работа заняла (8 мин 14 с)",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Worked for …",
+  "ru": "Работал …",
+  "context": "timeline-row-title.ts"
+ },
+ {
+  "en": "Worked for...",
+  "ru": "Работал...",
+  "context": "components/thread/timeline/ThreadTimelineRows.tsx"
+ },
+ {
+  "en": "Worker thread",
+  "ru": "Рабочий тред",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Working tree",
+  "ru": "Рабочее дерево",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Works with",
+  "ru": "Работает с",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Workspace status unavailable",
+  "ru": "Статус рабочего пространства недоступен",
+  "context": "lib/lifecycle-errors.ts"
+ },
+ {
+  "en": "Wrap diff lines",
+  "ru": "Переносить строки диффа",
+  "context": "components/secondary-panel/GitDiffToolbar.tsx"
+ },
+ {
+  "en": "Write 1 path",
+  "ru": "Записать 1 путь",
+  "context": "pending-interaction-formatting.ts"
+ },
+ {
+  "en": "Write release notes",
+  "ru": "Написать примечания к выпуску",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "Write to",
+  "ru": "Записывать в",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Wrote",
+  "ru": "Записал",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "You can revoke any machine at any time from the connect dashboard. Revoking it ends its address immediately.",
+  "ru": "Любую машину можно в любой момент отозвать в панели bb connect. После отзыва её адрес сразу перестанет работать.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "You&rsquo;re on the list. We&rsquo;ll be in touch.",
+  "ru": "Ты в списке. Мы свяжемся с тобой.",
+  "context": "landing/cta.tsx"
+ },
+ {
+  "en": "You've already claimed an address on this account.",
+  "ru": "Для этого аккаунта уже получен адрес.",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Your GitHub account details: name, email address, GitHub login, and avatar URL.",
+  "ru": "Данные твоего аккаунта GitHub: имя, адрес электронной почты, логин GitHub и URL аватара.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "Your bb will live at",
+  "ru": "Твой bb будет доступен по адресу",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Your bb, reachable anywhere",
+  "ru": "Твой bb доступен откуда угодно",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Your bbs",
+  "ru": "Твои bb",
+  "context": "routes/dashboard.tsx"
+ },
+ {
+  "en": "Your browser blocked access to bb on this device. Allow local network access for this site in browser settings, then reload bb.",
+  "ru": "Браузер заблокировал доступ к bb на этом устройстве. Разреши этому сайту доступ к локальной сети в настройках браузера, затем перезагрузи bb.",
+  "context": "views/SettingsView.tsx"
+ },
+ {
+  "en": "Your handle, and a record of each machine and server you enroll: its name, its subdomain, and a hash of its credential. We do not store the credential itself.",
+  "ru": "Твой ник и запись о каждой зарегистрированной машине и сервере: название, поддомен и хеш учётных данных. Сами учётные данные мы не храним.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "a kanban board",
+  "ru": "канбан-доска",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "action.kind === \"copy\" ? ( onCopied ? (",
+  "ru": "action.kind === \"copy\" ? ( onCopied ? (",
+  "context": "components/thread/timeline/MessageActionBar.tsx"
+ },
+ {
+  "en": "action.method === selectedMethod, ) ?? PULL_REQUEST_MERGE_ACTIONS[0]; return (",
+  "ru": "action.method === selectedMethod, ) ?? PULL_REQUEST_MERGE_ACTIONS[0]; return (",
+  "context": "components/promptbox/banner/ThreadPromptContextBanner.tsx"
+ },
+ {
+  "en": "addPermissionModeCompactLabels(options), [options], ); if ( !supported || value === undefined || (!showWhenSingleOption && options.length",
+  "ru": "addPermissionModeCompactLabels(options), [options], ); if ( !supported || value === undefined || (!showWhenSingleOption && options.length",
+  "context": "components/pickers/PermissionModePicker.tsx"
+ },
+ {
+  "en": "additionalMention.start",
+  "ru": "additionalMention.start",
+  "context": "components/promptbox/PromptBoxInternal.tsx"
+ },
+ {
+  "en": "advisor_review",
+  "ru": "advisor_review",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "and opened PR #418.",
+  "ru": "и открыл пул-реквест #418.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "applyPromo",
+  "ru": "applyPromo",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "assigned to",
+  "ru": "назначено",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "bb advisor",
+  "ru": "советник bb",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "bb can control, customize, and automate itself, laying the groundwork for your own software factory.",
+  "ru": "bb может управлять собой, настраивать и автоматизировать себя, создавая основу для твоей собственной фабрики ПО.",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "bb is a developer tool. It is not directed at children under 13, and we do not knowingly collect their data.",
+  "ru": "bb — инструмент для разработчиков. Он не предназначен для детей младше 13 лет, и мы сознательно не собираем их данные.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "bb is free and open source (MIT)",
+  "ru": "bb бесплатен и имеет открытый исходный код (MIT)",
+  "context": "landing/site-chrome.tsx"
+ },
+ {
+  "en": "bb reads plugin catalogs from these marketplaces. Adding one validates and caches its catalog; it never installs, updates, or runs plugin code.",
+  "ru": "bb считывает каталоги плагинов из этих маркетплейсов. При добавлении маркетплейса его каталог проверяется и кэшируется; код плагинов при этом никогда не устанавливается, не обновляется и не запускается.",
+  "context": "components/settings/MarketplacesSettingsSection.tsx"
+ },
+ {
+  "en": "bb ru",
+  "ru": "bb ru",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "bb runs on your own machines. Your prompts, your code, and your files go to the bb server that you run, and from there to the AI provider that you choose. They do not come to us.",
+  "ru": "bb работает на твоих машинах. Твои промпты, код и файлы отправляются на запущенный тобой сервер bb, а оттуда — выбранному тобой провайдеру ИИ. К нам они не поступают.",
+  "context": "routes/privacy.tsx"
+ },
+ {
+  "en": "bb spawn \"fix CI on main\"",
+  "ru": "bb spawn \"fix CI on main\"",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "bb status --json",
+  "ru": "bb status --json",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "bb tasks",
+  "ru": "bb tasks",
+  "context": "routes/index.tsx"
+ },
+ {
+  "en": "bb —",
+  "ru": "bb —",
+  "context": "видно в интерфейсе (собрано копилкой)"
+ },
+ {
+  "en": "block.kind === \"paragraph\" ? (",
+  "ru": "block.kind === \"paragraph\" ? (",
+  "context": "routes/changelog.tsx"
+ },
+ {
+  "en": "boolean, ): ResolvedReplacement",
+  "ru": "boolean, ): ResolvedReplacement",
+  "context": "lib/plugin-slot-resolvers.ts"
+ },
+ {
+  "en": "boolean; const PluginThreadPanelNavigationContext = createContext",
+  "ru": "boolean; const PluginThreadPanelNavigationContext = createContext",
+  "context": "components/plugin/plugin-thread-panel-navigation.tsx"
+ },
+ {
+  "en": "boolean; state: AssistantStreamProjectionState; visibleKeys: Set",
+  "ru": "boolean; state: AssistantStreamProjectionState; visibleKeys: Set",
+  "context": "assistant-stream-projection.ts"
+ },
+ {
+  "en": "boolean; type MarkdownAnchorEvent = ReactMouseEvent",
+  "ru": "boolean; type MarkdownAnchorEvent = ReactMouseEvent",
+  "context": "components/ui/markdown-preview.tsx"
+ }
+]
