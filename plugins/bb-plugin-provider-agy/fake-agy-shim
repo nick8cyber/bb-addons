@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/node ~/dev/bb-plugin-provider-agy/fake-agy.mjs "$@"
