@@ -1,6 +1,6 @@
 # bb-addons
 
-Plugins and themes for [bb](https://getbb.app). Three plugins, one theme, all
+Plugins and themes for [bb](https://getbb.app). Four plugins, one theme, all
 usable independently.
 
 Install any of them straight from this repository:
@@ -9,6 +9,7 @@ Install any of them straight from this repository:
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin ru
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin favorite-models
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-agy
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin pi-gateways
 ```
 
 Or from a local clone — handy while developing, since bb reloads a `path:`
@@ -49,6 +50,23 @@ PATH and an authenticated `~/.gemini`.
 The README also documents a real trap worth reading before writing any provider
 bridge: how a refused `write_to_file` argument silently costs you a whole run —
 [plugins/bb-plugin-provider-agy/README.md](plugins/bb-plugin-provider-agy/README.md).
+
+### `pi-gateways`
+
+Offers the free models of **OpenCode Zen** and the **Kilo Code gateway** to the
+`pi` provider over their HTTP APIs, so neither CLI has to run — on our machine
+that took two 650 MB bridge processes out of the picture. Credentials are read
+from the stores those CLIs already keep and are never copied into config;
+`models.json` holds only a reader command. Selection is by price, so paid models
+are never offered.
+
+```bash
+bb pi-gateways status
+bb pi-gateways refresh
+```
+
+Design notes, including the two traps it exists to avoid, are in
+[plugins/bb-plugin-pi-gateways/README.md](plugins/bb-plugin-pi-gateways/README.md).
 
 ## Themes
 
