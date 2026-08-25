@@ -3,8 +3,21 @@
   "schemaVersion": 1,
   "name": "bb-addons",
   "plugins": [
-    { "name": "ru", "source": "./plugins/bb-plugin-ru" },
-    { "name": "favorite-models", "source": "./plugins/bb-plugin-favorite-models" },
-    { "name": "provider-agy", "source": "./plugins/bb-plugin-provider-agy" }
+    {
+      "name": "ru",
+      "source": "./plugins/bb-plugin-ru"
+    },
+    {
+      "name": "favorite-models",
+      "source": "./plugins/bb-plugin-favorite-models"
+    },
+    {
+      "name": "provider-agy",
+      "source": "./plugins/bb-plugin-provider-agy"
+    },
+    {
+      "name": "pi-gateways",
+      "source": "./plugins/bb-plugin-pi-gateways"
+    }
   ]
 }
