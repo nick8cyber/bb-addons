@@ -251,8 +251,7 @@ diffs-container {
 /* bb's sidebar contains components that use global semantic tokens. Set the
  * full semantic ladder on the actual sidebar containers, not on individual
  * utility classes, so every label and icon gets the correct contrast. */
-[data-sidebar="sidebar"],
-.bg-sidebar {
+[data-sidebar="sidebar"] {
   --foreground: #edf4ff;
   --secondary-foreground: #edf4ff;
   --muted-foreground: #c8d8ed;
@@ -267,9 +266,7 @@ diffs-container {
 
 /* Selected rows must not inherit a low-emphasis foreground from their parent. */
 [data-sidebar="sidebar"] .bg-sidebar-accent,
-[data-sidebar="sidebar"] .bg-state-active,
-.bg-sidebar .bg-sidebar-accent,
-.bg-sidebar .bg-state-active {
+[data-sidebar="sidebar"] .bg-state-active {
   --foreground: #ffffff;
   --secondary-foreground: #ffffff;
   --muted-foreground: #ffffff;
@@ -288,3 +285,24 @@ diffs-container {
   color: #ffffff;
 }
 
+/* Handoff opens in the thread-detail side panel. It is not navigation: give
+ * it the same calm light canvas and dark text as the main work area. */
+#thread-detail-secondary-panel {
+  --sidebar: #f4f8fc;
+  --sidebar-foreground: #14213d;
+  --sidebar-accent: #d7e7f6;
+  --sidebar-accent-foreground: #14213d;
+  --sidebar-border: #b7cce0;
+  --foreground: #14213d;
+  --secondary-foreground: #1c3856;
+  --muted-foreground: #496784;
+  --readback-foreground: #5d7894;
+  --subtle-foreground: #7088a1;
+  --state-hover: #e4eef8;
+  --state-active: #c7ddf1;
+  --surface-selected: #dceaf7;
+  --surface-selected-border: #78a2c8;
+  --card: #ffffff;
+  --popover: #ffffff;
+  --input: #a9c1d9;
+}
