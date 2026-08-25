@@ -13,7 +13,7 @@ export interface FavoritesState {
   showQuickBar: boolean;
 }
 
-const STORAGE_KEY = "bb-plugin-favorite-models:v1";
+const STORAGE_KEY = "bb-plugin-favorite-models:v2";
 const RPC_ENDPOINT = "/api/v1/plugins/favorite-models/rpc";
 
 const DEFAULT_STATE: FavoritesState = {
@@ -22,6 +22,99 @@ const DEFAULT_STATE: FavoritesState = {
   pinToTop: true,
   showQuickBar: true,
 };
+
+/**
+ * Strips keyboard-shortcut residue (e.g. "⇧-⌘-m", "Alt+M", "Ctrl+Shift+P")
+ * that leaks into model labels captured from picker DOM.
+ */
+export function cleanModelText(text: string): string {
+  let out = (text || "")
+    .replace(/\s*(⇧|⌘|⌥|⌃)([+\s\-]*(⇧|⌘|⌥|⌃|[a-zа-я0-9]))*/gi, "")
+    .replace(/\s*\b(ctrl|control|alt|option|shift|cmd|meta)\b([+\-][a-z0-9]+)+/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  // Drop trailing dangling separators like "-" or "·"
+  out = out.replace(/[\s·\-]+$/g, "").trim();
+  return out;
+}
+
+export function getProviderDisplayName(providerId: string): string {
+  const clean = (providerId || "").toLowerCase().trim();
+  switch (clean) {
+    case "codex":
+      return "Codex (OpenAI)";
+    case "provider-claude-code":
+    case "claude-code":
+    case "claude":
+      return "Claude Code (Anthropic)";
+    case "agy":
+    case "provider-agy":
+    case "antigravity":
+      return "Antigravity (AGY)";
+    case "provider-pi":
+    case "pi":
+      return "Pi (Inflection)";
+    case "opencode":
+      return "OpenCode";
+    case "acp-cursor":
+      return "Cursor";
+    case "default":
+      return "Текущий провайдер";
+    default:
+      if (clean.includes("⌘") || clean.includes("⇧") || clean.includes("alt") || clean.includes("ctrl")) {
+        return "Другие";
+      }
+      return providerId.charAt(0).toUpperCase() + providerId.slice(1);
+  }
+}
+
+export function sanitizeFavoritesMap(raw: Record<string, string[]>): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const [key, models] of Object.entries(raw || {})) {
+    if (!Array.isArray(models) || models.length === 0) continue;
+    let prov = key.trim().toLowerCase();
+
+    // Normalize keys that captured model text: "kilo-gateway/auto-free" -> "kilo-gateway"
+    if (prov.includes("/")) {
+      prov = prov.split("/")[0].trim();
+    }
+
+    // If key contains shortcut characters or garbage, infer provider from model names or map to claude
+    if (
+      prov.includes("⌘") ||
+      prov.includes("⇧") ||
+      prov.includes("alt") ||
+      prov.includes("ctrl") ||
+      prov.includes("shift")
+    ) {
+      const sample = models.join(" ").toLowerCase();
+      if (sample.includes("gpt") || sample.includes("o1") || sample.includes("o3") || sample.includes("o4")) {
+        prov = "codex";
+      } else if (sample.includes("gemini")) {
+        prov = "agy";
+      } else {
+        prov = "provider-claude-code";
+      }
+    } else if (prov.includes("codex") || prov === "openai") {
+      prov = "codex";
+    } else if (prov.includes("claude") || prov === "anthropic") {
+      prov = "provider-claude-code";
+    } else if (prov.includes("antigravity") || prov === "agy" || prov.includes("gemini")) {
+      prov = "agy";
+    } else if (prov.includes("pi")) {
+      prov = "provider-pi";
+    }
+
+    const existing = result[prov] || [];
+    for (const m of models) {
+      if (typeof m === "string" && m.trim() && !existing.includes(m.trim())) {
+        existing.push(m.trim());
+      }
+    }
+    result[prov] = existing;
+  }
+  return result;
+}
 
 let currentState: FavoritesState = loadInitialState();
 const listeners = new Set<(state: FavoritesState) => void>();
@@ -34,12 +127,45 @@ function loadInitialState(): FavoritesState {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULT_STATE };
     const parsed = JSON.parse(raw);
-    return {
-      favorites: typeof parsed.favorites === "object" && parsed.favorites !== null ? parsed.favorites : {},
-      modelLabels: typeof parsed.modelLabels === "object" && parsed.modelLabels !== null ? parsed.modelLabels : {},
+    const favs = typeof parsed.favorites === "object" && parsed.favorites !== null ? parsed.favorites : {};
+    const favorites = sanitizeFavoritesMap(favs);
+    const modelLabels =
+      typeof parsed.modelLabels === "object" && parsed.modelLabels !== null ? parsed.modelLabels : {};
+
+    // Migration: strip shortcut residue from stored model ids/labels and
+    // drop favorites whose id was pure shortcut garbage.
+    let needsRewrite = false;
+    for (const [prov, list] of Object.entries(favorites)) {
+      const cleaned: string[] = [];
+      for (const id of list) {
+        const c = cleanModelText(id);
+        if (!c) {
+          needsRewrite = true;
+          continue;
+        }
+        if (c !== id) needsRewrite = true;
+        if (!cleaned.includes(c)) cleaned.push(c);
+      }
+      if (cleaned.length === 0) delete favorites[prov];
+      else favorites[prov] = cleaned;
+    }
+    for (const [key, label] of Object.entries(modelLabels)) {
+      if (typeof label !== "string") continue;
+      const c = cleanModelText(label);
+      if (c !== label) {
+        modelLabels[key] = c;
+        needsRewrite = true;
+      }
+    }
+
+    const nextState: FavoritesState = {
+      favorites,
+      modelLabels,
       pinToTop: typeof parsed.pinToTop === "boolean" ? parsed.pinToTop : true,
       showQuickBar: typeof parsed.showQuickBar === "boolean" ? parsed.showQuickBar : true,
     };
+    if (needsRewrite) persistState(nextState);
+    return nextState;
   } catch (err) {
     console.warn("[favorite-models] Error reading localStorage:", err);
     return { ...DEFAULT_STATE };
@@ -117,7 +243,7 @@ export function getFavoritesCount(): number {
 
 export function getModelLabel(providerId: string, modelId: string): string {
   const key = `${providerId}:${modelId}`;
-  return currentState.modelLabels[key] || modelId;
+  return cleanModelText(currentState.modelLabels[key] || modelId);
 }
 
 export function toggleFavorite(providerId: string, modelId: string, label?: string): boolean {
@@ -288,7 +414,7 @@ export function initBackendSync(): void {
     config: { pinToTop: boolean; showQuickBar: boolean };
   }>("getFavorites", null).then((res) => {
     if (!res) return;
-    const mergedFavorites = { ...res.favorites, ...currentState.favorites };
+    const mergedFavorites = sanitizeFavoritesMap({ ...res.favorites, ...currentState.favorites });
     const mergedLabels = { ...res.modelLabels, ...currentState.modelLabels };
     currentState = {
       ...currentState,
@@ -299,5 +425,13 @@ export function initBackendSync(): void {
     };
     persistState(currentState);
     notify();
+
+    // If backend had shortcut keys like ⇧-⌘-m, update backend with clean sanitized map
+    if (Object.keys(res.favorites || {}).some((k) => k.includes("⌘") || k.includes("⇧"))) {
+      void callRpc("setFavorites", {
+        favorites: mergedFavorites,
+        modelLabels: mergedLabels,
+      });
+    }
   });
 }
