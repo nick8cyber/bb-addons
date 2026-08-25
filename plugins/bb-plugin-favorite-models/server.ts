@@ -73,8 +73,47 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  function cleanProviderId(providerId: string): string {
+    let clean = (providerId || "").toLowerCase().trim();
+    if (
+      clean.includes("⌘") ||
+      clean.includes("⇧") ||
+      clean.includes("alt") ||
+      clean.includes("ctrl") ||
+      clean.includes("shift")
+    ) {
+      return "provider-claude-code";
+    }
+    if (clean.includes("codex") || clean === "openai") return "codex";
+    if (clean.includes("claude") || clean === "anthropic") return "provider-claude-code";
+    if (clean.includes("antigravity") || clean === "agy" || clean.includes("gemini")) return "agy";
+    if (clean.includes("pi")) return "provider-pi";
+    return clean.replace(/\s+/g, "-");
+  }
+
+  function sanitizeFavoritesStore(raw: Record<string, string[]>): Record<string, string[]> {
+    const result: Record<string, string[]> = {};
+    for (const [key, models] of Object.entries(raw || {})) {
+      if (!Array.isArray(models) || models.length === 0) continue;
+      const cleanProv = cleanProviderId(key);
+      const existing = result[cleanProv] || [];
+      for (const m of models) {
+        if (typeof m === "string" && m.trim() && !existing.includes(m.trim())) {
+          existing.push(m.trim());
+        }
+      }
+      result[cleanProv] = existing;
+    }
+    return result;
+  }
+
   const getFavoritesStore = async (): Promise<Record<string, string[]>> => {
-    return (await bb.storage.kv.get<Record<string, string[]>>("favorites:map")) ?? {};
+    const raw = (await bb.storage.kv.get<Record<string, string[]>>("favorites:map")) ?? {};
+    const sanitized = sanitizeFavoritesStore(raw);
+    if (JSON.stringify(raw) !== JSON.stringify(sanitized)) {
+      await bb.storage.kv.set("favorites:map", sanitized);
+    }
+    return sanitized;
   };
 
   const getConfigStore = async () => {
@@ -96,10 +135,11 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     toggleFavorite: async ({ providerId, modelId, label }) => {
+      const cleanProv = cleanProviderId(providerId);
       const favorites = await getFavoritesStore();
       const modelLabels = (await bb.storage.kv.get<Record<string, string>>("favorites:labels")) ?? {};
 
-      const list = favorites[providerId] || [];
+      const list = favorites[cleanProv] || [];
       const exists = list.includes(modelId);
 
       let nextList: string[];
@@ -110,18 +150,18 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       if (nextList.length === 0) {
-        delete favorites[providerId];
+        delete favorites[cleanProv];
       } else {
-        favorites[providerId] = nextList;
+        favorites[cleanProv] = nextList;
       }
 
       if (label) {
-        modelLabels[`${providerId}:${modelId}`] = label;
+        modelLabels[`${cleanProv}:${modelId}`] = label;
         await bb.storage.kv.set("favorites:labels", modelLabels);
       }
 
       await bb.storage.kv.set("favorites:map", favorites);
-      bb.log.info(`Favorite toggled: ${providerId}/${modelId} -> ${!exists}`);
+      bb.log.info(`Favorite toggled: ${cleanProv}/${modelId} -> ${!exists}`);
 
       return {
         isFavorite: !exists,
@@ -130,7 +170,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     setFavorites: async ({ favorites, modelLabels }) => {
-      await bb.storage.kv.set("favorites:map", favorites);
+      const sanitized = sanitizeFavoritesStore(favorites);
+      await bb.storage.kv.set("favorites:map", sanitized);
       if (modelLabels) {
         await bb.storage.kv.set("favorites:labels", modelLabels);
       }

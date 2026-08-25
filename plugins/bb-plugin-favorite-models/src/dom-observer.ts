@@ -4,6 +4,7 @@
  */
 
 import {
+  cleanModelText,
   getState,
   isFavorite,
   toggleFavorite,
@@ -25,24 +26,55 @@ const STAR_OUTLINE_SVG = `
 
 let observer: MutationObserver | null = null;
 let isReordering = false;
+// Window during which DOM writes performed by this plugin are ignored by the
+// observer, preventing feedback loops (our own star injections / reordering).
+let suppressUntil = 0;
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function suppress(): void {
+  suppressUntil = Date.now() + 150;
+}
+
+function scheduleRefresh(): void {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    suppress();
+    refreshAllOpenPickers();
+  }, 80);
+}
 
 export function initDomObserver(): () => void {
   // Listen for state changes (e.g. user toggles a favorite in settings or via star)
   const unsubscribeState = subscribe((_state) => {
+    suppress();
     refreshAllOpenPickers();
   });
 
-  // Observe DOM for newly mounted popovers or list changes
+  // Observe DOM for newly mounted popovers or list changes. React often
+  // reuses existing row nodes (e.g. while filtering via the search box),
+  // stripping injected stars without adding new nodes — so any relevant
+  // mutation schedules a debounced full refresh of open pickers.
   observer = new MutationObserver((mutations) => {
-    if (isReordering) return;
+    if (isReordering || Date.now() < suppressUntil) return;
 
     for (const mutation of mutations) {
-      if (mutation.type === "childList") {
-        for (const node of mutation.addedNodes) {
-          if (node instanceof HTMLElement) {
-            checkAndEnhanceElement(node);
-          }
+      if (mutation.type !== "childList") continue;
+      const changed = [...mutation.addedNodes, ...mutation.removedNodes];
+      const external = changed.some((node) => {
+        if (!(node instanceof HTMLElement)) return false;
+        if (
+          node.classList.contains("bb-fav-star-btn") ||
+          node.classList.contains("bb-fav-section-badge") ||
+          node.classList.contains("bb-fav-divider")
+        ) {
+          return false;
         }
+        return true;
+      });
+      if (external) {
+        scheduleRefresh();
+        return;
       }
     }
   });
@@ -57,6 +89,10 @@ export function initDomObserver(): () => void {
 
   return () => {
     unsubscribeState();
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
     if (observer) {
       observer.disconnect();
       observer = null;
@@ -93,17 +129,33 @@ function refreshAllOpenPickers(): void {
   }
 }
 
-function detectActiveProvider(container: HTMLElement): string {
-  // 1. Look for provider tabs in header inside the popover
-  const popover = container.closest('[data-radix-popover-content]') || container;
-  const tabStrip = popover.querySelector('div.flex.items-center.gap-0\\.5, div[class*="border-b"]');
-  if (tabStrip) {
-    const activeTab = tabStrip.querySelector<HTMLButtonElement>(
-      'button.border-foreground, button[class*="border-foreground"], button[class*="text-foreground"]'
-    );
-    if (activeTab) {
-      const title = activeTab.getAttribute("title") || activeTab.textContent?.trim();
-      if (title) return normalizeProviderId(title);
+export function detectActiveProvider(container?: HTMLElement): string {
+  // 1. If popover container is present, look for active provider tab in header
+  if (container) {
+    const popover = container.closest('[data-radix-popover-content]') || container;
+    const tabStrip = popover.querySelector('div.flex.items-center.gap-0\\.5, div[class*="border-b"]');
+    if (tabStrip) {
+      // Only real provider tabs: skip model option rows (role="option") and
+      // anything whose title looks like a model name ("x/y", "x · y").
+      const tabs = Array.from(tabStrip.querySelectorAll<HTMLButtonElement>("button")).filter(
+        (b) =>
+          b.getAttribute("role") !== "option" &&
+          !b.querySelector('[role="option"]') &&
+          (() => {
+            const t = (b.getAttribute("title") || b.textContent || "").trim();
+            return t !== "" && !t.includes("/") && !t.includes("·");
+          })()
+      );
+      const activeTab =
+        tabs.find((b) => b.className.includes("border-foreground")) ||
+        tabs.find((b) => b.className.includes("text-foreground"));
+      if (activeTab) {
+        const title = activeTab.getAttribute("title") || activeTab.textContent?.trim();
+        if (title) {
+          const norm = normalizeProviderId(title);
+          if (norm !== "default") return norm;
+        }
+      }
     }
   }
 
@@ -112,31 +164,80 @@ function detectActiveProvider(container: HTMLElement): string {
     'button[aria-label*="Provider, model" i], button[aria-label*="Model" i]'
   );
   if (triggerBtn) {
-    const title = triggerBtn.getAttribute("title") || "";
-    // e.g. "Codex: gpt-5.4" or "Claude Code: claude-opus"
-    if (title.includes(":")) {
-      const provPart = title.split(":")[0].trim();
-      if (provPart) return normalizeProviderId(provPart);
+    const titleElem = triggerBtn.hasAttribute("title")
+      ? triggerBtn
+      : triggerBtn.querySelector("[title]");
+    const fullTitle = titleElem?.getAttribute("title") || "";
+    // Format: "Provider Name: Model Name"
+    if (fullTitle.includes(":")) {
+      const provPart = fullTitle.split(":")[0].trim();
+      const norm = normalizeProviderId(provPart);
+      if (norm !== "default") return norm;
     }
-    const aria = triggerBtn.getAttribute("aria-label") || "";
-    if (aria.includes("(") && aria.includes(")")) {
-      const match = aria.match(/\((.*?)\)/);
-      if (match && match[1]) return normalizeProviderId(match[1]);
+  }
+
+  // 3. Look globally for open model picker popover tab strip
+  const tabStrip = document.querySelector(
+    '[data-radix-popover-content] div.border-b, [role="listbox"] div.border-b'
+  );
+  if (tabStrip) {
+    const tabs = Array.from(tabStrip.querySelectorAll<HTMLButtonElement>("button")).filter(
+      (b) =>
+        b.getAttribute("role") !== "option" &&
+        (() => {
+          const t = (b.getAttribute("title") || b.textContent || "").trim();
+          return t !== "" && !t.includes("/") && !t.includes("·");
+        })()
+    );
+    const activeTab =
+      tabs.find((b) => b.className.includes("border-foreground")) ||
+      tabs.find((b) => b.className.includes("text-foreground"));
+    if (activeTab) {
+      const title = activeTab.getAttribute("title") || activeTab.textContent?.trim();
+      if (title) {
+        const norm = normalizeProviderId(title);
+        if (norm !== "default") return norm;
+      }
     }
   }
 
   return "default";
 }
 
-function normalizeProviderId(name: string): string {
-  const clean = name.toLowerCase().trim();
+export function normalizeProviderId(name: string): string {
+  let clean = (name || "").toLowerCase().trim();
+  // Filter out shortcut strings (like ⇧-⌘-m, Alt+M)
+  if (
+    clean.includes("⌘") ||
+    clean.includes("⇧") ||
+    clean.includes("alt") ||
+    clean.includes("ctrl") ||
+    clean.includes("shift")
+  ) {
+    return "default";
+  }
+  // Drop model qualifiers: "Provider / Model" and "Model · qualifier" both
+  // reduce to the provider part, keeping keys consistent across contexts.
+  if (clean.includes(" · ")) clean = clean.split(" · ")[0].trim();
+  if (clean.includes("/")) clean = clean.split("/")[0].trim();
   if (clean.includes("codex") || clean === "openai") return "codex";
   if (clean.includes("claude") || clean === "anthropic") return "provider-claude-code";
-  if (clean.includes("antigravity") || clean === "agy") return "agy";
+  if (clean.includes("antigravity") || clean === "agy" || clean.includes("gemini")) return "agy";
   if (clean.includes("pi")) return "provider-pi";
   if (clean.includes("opencode")) return "opencode";
   if (clean.includes("cursor") || clean.includes("acp")) return "acp-cursor";
   return clean.replace(/\s+/g, "-");
+}
+
+function firstTextNodeText(el: HTMLElement): string {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let node: Node | null = walker.nextNode();
+  while (node) {
+    const text = node.textContent?.trim();
+    if (text) return text;
+    node = walker.nextNode();
+  }
+  return "";
 }
 
 function extractModelIdFromButton(btn: HTMLButtonElement): { modelId: string; label: string } {
@@ -146,12 +247,18 @@ function extractModelIdFromButton(btn: HTMLButtonElement): { modelId: string; la
   //     gpt-5.4
   //     <span class="ml-1.5 text-subtle-foreground">...</span>
   //   </span>
-  //   ...
+  //   <span>⇧-⌘-m</span>  <- shortcut, must be excluded
   // </button>
 
   const truncateSpan = btn.querySelector<HTMLElement>("span.truncate, span[title]");
-  let fullTitle = truncateSpan?.getAttribute("title") || truncateSpan?.textContent || btn.textContent || "";
-  fullTitle = fullTitle.trim();
+  // Prefer the clean title attribute, then the first text node (model name
+  // only), and only then the full textContent as a last resort.
+  let fullTitle =
+    truncateSpan?.getAttribute("title") ||
+    (truncateSpan ? firstTextNodeText(truncateSpan) : "") ||
+    btn.textContent ||
+    "";
+  fullTitle = cleanModelText(fullTitle.trim());
 
   // If title has " · qualifier", split
   let label = fullTitle;
@@ -170,6 +277,8 @@ function extractModelIdFromButton(btn: HTMLButtonElement): { modelId: string; la
 }
 
 function enhanceModelPickerContainer(container: HTMLElement, forceRefresh = false): void {
+  // Our own DOM writes (star injection, reordering) must not retrigger the observer
+  suppress();
   // Check if this container is indeed a model picker popover or listbox
   const searchInput = container.querySelector('input[placeholder*="models" i], input[aria-label*="models" i]');
   const optionButtons = Array.from(
@@ -180,6 +289,18 @@ function enhanceModelPickerContainer(container: HTMLElement, forceRefresh = fals
 
   // If no option buttons and no search input, skip
   if (optionButtons.length === 0 && !searchInput) return;
+
+  // Widen the picker popover so model names are not squeezed by the star column
+  const popper =
+    container.closest<HTMLElement>("[data-radix-popper-content-wrapper]") || container;
+  if (optionButtons.length > 0 && !popper.dataset.favWidened) {
+    popper.dataset.favWidened = "true";
+    const current = popper.getBoundingClientRect().width;
+    const desired = Math.round(Math.max(current + 40, 340));
+    popper.style.width = `${desired}px`;
+    popper.style.minWidth = `${desired}px`;
+    popper.style.maxWidth = `${desired}px`;
+  }
 
   // Find the list container that actually holds the option buttons
   const listContainer =
@@ -367,6 +488,23 @@ function reorderOptionsWithFavorites(
 }
 
 /**
+ * Open the native BB composer model picker popover.
+ */
+export function openNativeModelPicker(): void {
+  const triggerBtn = document.querySelector<HTMLButtonElement>(
+    'button[aria-label*="Provider, model" i], button[aria-label*="Model" i]'
+  );
+  if (!triggerBtn) return;
+
+  const isAlreadyOpen = !!document.querySelector(
+    '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
+  );
+  if (!isAlreadyOpen) {
+    triggerBtn.click();
+  }
+}
+
+/**
  * Fast programmatic model switcher:
  * Opens the composer's model picker, clicks the matching model option, and closes it.
  */
@@ -377,37 +515,58 @@ export async function switchComposerModel(modelId: string, providerId?: string):
   if (!triggerBtn) return false;
 
   // Open the popover if not open
-  triggerBtn.click();
-
-  // Wait a tick for popover to mount
-  await new Promise((r) => setTimeout(r, 40));
-
-  const popover = document.querySelector<HTMLElement>(
+  const isAlreadyOpen = !!document.querySelector(
     '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
   );
+  if (!isAlreadyOpen) {
+    triggerBtn.click();
+  }
+
+  // Wait for popover to mount (polling up to 200ms)
+  let popover: HTMLElement | null = null;
+  for (let i = 0; i < 8; i++) {
+    popover = document.querySelector<HTMLElement>(
+      '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
+    );
+    if (popover) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
   if (!popover) return false;
 
   // If providerId specified, check if we need to click provider tab
+  let switchedTab = false;
   if (providerId) {
     const tabs = Array.from(popover.querySelectorAll<HTMLButtonElement>("div.border-b button, button[title]"));
     for (const tab of tabs) {
       const tabTitle = tab.getAttribute("title") || tab.textContent || "";
       if (normalizeProviderId(tabTitle) === normalizeProviderId(providerId)) {
         tab.click();
-        await new Promise((r) => setTimeout(r, 30));
+        switchedTab = true;
         break;
       }
     }
   }
 
-  // Find option matching modelId
-  const options = Array.from(popover.querySelectorAll<HTMLButtonElement>('button[role="option"], button[id*="-opt-"]'));
-  for (const opt of options) {
-    const { modelId: id, label } = extractModelIdFromButton(opt);
-    if (id === modelId || label === modelId || opt.textContent?.includes(modelId)) {
-      opt.click();
-      return true;
+  // Find option matching modelId. A provider tab click re-renders the option
+  // list asynchronously, so poll for the target instead of betting on one delay.
+  const attempts = switchedTab ? 12 : 1;
+  for (let i = 0; i < attempts; i++) {
+    // Re-query: the popover subtree can be replaced during the tab switch.
+    const live =
+      document.querySelector<HTMLElement>(
+        '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
+      ) || popover;
+    const options = Array.from(
+      live.querySelectorAll<HTMLButtonElement>('button[role="option"], button[id*="-opt-"]')
+    );
+    for (const opt of options) {
+      const { modelId: id, label } = extractModelIdFromButton(opt);
+      if (id === modelId || label === modelId || opt.textContent?.includes(modelId)) {
+        opt.click();
+        return true;
+      }
     }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 25));
   }
 
   return false;
