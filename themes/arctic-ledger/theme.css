@@ -306,3 +306,16 @@ diffs-container {
   --popover: #ffffff;
   --input: #a9c1d9;
 }
+
+/* The usage tracker sits in the indigo rail, but its expanded card is white.
+ * Keep its compact strip light-on-blue while restoring dark text inside the
+ * white details surface. */
+.usage-tracker-sidebar__details {
+  --usage-sidebar-raised: #ffffff;
+  --usage-sidebar-text: #14213d;
+  --usage-sidebar-muted: #496784;
+  --usage-sidebar-line: #afc2d5;
+  --usage-sidebar-hover: #dceaf8;
+  --usage-sidebar-focus: #2e77b3;
+  color: #14213d;
+}
