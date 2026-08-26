@@ -87,7 +87,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (clean.includes("codex") || clean === "openai") return "codex";
     if (clean.includes("claude") || clean === "anthropic") return "provider-claude-code";
     if (clean.includes("antigravity") || clean === "agy" || clean.includes("gemini")) return "agy";
-    if (clean.includes("pi")) return "provider-pi";
+    if (clean === "pi" || clean === "provider-pi" || clean.startsWith("pi-") || clean.includes("inflection"))
+      return "provider-pi";
     return clean.replace(/\s+/g, "-");
   }
 
