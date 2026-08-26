@@ -250,15 +250,28 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
   // Only the new-thread screen, where no thread exists yet, lists every provider.
   const isSession = threadId !== null;
   const activeProvider = sdkProvider ?? domProvider;
+  // "default" is not a provider — it means neither the host nor the DOM could
+  // name one (thread archived, from another project, or simply absent from the
+  // sidebar's list). Scoping the menu to that key would blank it while
+  // favorites exist, so the unresolved case lists everything instead.
+  const sidebarLoading = sidebar.status === "loading";
+  const providerUnknown = activeProvider === "default";
   const providerFavs = getFavoritesForProvider(activeProvider);
+  // Trigger on the source of the resolution, not on the result being empty:
+  // every host provider id normalises onto an existing store key, so a
+  // non-null sdkProvider is trustworthy and an empty list there genuinely
+  // means "nothing starred for this provider" — say so instead of dumping
+  // every other provider. Skip while the sidebar loads, or a menu opened in
+  // that window would flash the full list before snapping back.
+  const needsFallback = !sidebarLoading && sdkProvider === null;
   const otherProviders =
-    !isSession && isNewThread
+    needsFallback || (!isSession && isNewThread)
       ? Object.entries(state.favorites).filter(
           ([p, list]) => p !== activeProvider && list.length > 0
         )
       : [];
 
-  // Active provider first, then the remaining ones (new-thread composer only).
+  // Active provider first, then the remaining ones.
   // Headers only appear once more than one provider is on screen.
   const groups: Array<[string, string[]]> = [];
   if (providerFavs.length > 0) groups.push([activeProvider, providerFavs]);
@@ -289,7 +302,11 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
     >
       {groups.length === 0 ? (
         <div className="px-3 py-2.5 text-xs text-muted-foreground">
-          Нет избранного для текущего провайдера
+          {sidebarLoading
+            ? "Определяем провайдера…"
+            : providerUnknown
+              ? "Не удалось определить провайдера"
+              : "Нет избранного для текущего провайдера"}
         </div>
       ) : (
         groups.map(([prov, models], groupIndex) => (
