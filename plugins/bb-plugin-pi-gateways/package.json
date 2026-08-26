@@ -1,27 +1,35 @@
 {
   "name": "bb-plugin-pi-gateways",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Free OpenCode Zen and Kilo Code models inside bb through pi, by token, without running their CLIs.",
+  "description": "Free OpenCode Zen and Kilo Code models — plus any OpenAI-compatible endpoint — inside bb through pi, by token, without running their CLIs.",
   "engines": {
     "bb": ">=0.39",
     "bbPluginSdk": ">=0.4.8"
   },
   "bb": {
     "name": "Pi Gateways",
-    "description": "Adds OpenCode Zen and Kilo Code free models to the pi provider over their HTTP APIs, so neither CLI has to run.",
+    "description": "Adds OpenCode Zen, Kilo Code and user-defined OpenAI-compatible endpoints to the pi provider over their HTTP APIs, so neither CLI has to run.",
     "branding": {
       "icon": "./icons/gateway.svg"
     },
     "server": "./server.ts",
-    "host": "./host.ts"
+    "host": "./host.ts",
+    "app": "./app.tsx"
   },
   "dependencies": {
+    "@radix-ui/react-slot": "^1.3.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.4.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.4.8",
     "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "sonner": "^2.0.8",
     "typescript": "^5.7.0"
   }
 }

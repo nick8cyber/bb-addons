@@ -3,8 +3,7 @@
  * gateways runs here, in the daemon worker on the execution host — that is the
  * only place where the credential stores and pi's models.json actually live.
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { z } from "zod";
@@ -15,20 +14,29 @@ import {
   buildProviderBlock,
   dropProviders,
   fetchCatalogue,
+  fetchModelCatalogue,
   mergeProviders,
   selectFreeModels,
   type ProviderBlock,
 } from "./src/gateways.js";
 import { installReaders } from "./src/readers.js";
+import { contractSchemas } from "./src/contract.js";
+import { writeFileAtomic } from "./src/fsutil.js";
+import {
+  buildKeyRef,
+  discoverReservedProviderIds,
+  isCustomDef,
+  loadManifest,
+  normalizeBaseUrl,
+  probeEndpoint,
+  resolveToken,
+  saveManifest,
+  selectModelsForSave,
+  validateCustomId,
+  type CustomEndpointDef,
+} from "./src/custom.js";
 
-const gatewayReport = z.object({
-  id: z.string(),
-  label: z.string(),
-  credentialFound: z.boolean(),
-  inModelsJson: z.boolean(),
-  modelCount: z.number(),
-  error: z.string().optional(),
-});
+const gatewayReport = contractSchemas.status.output.shape.gateways.element;
 
 function readModelsJson(): Record<string, unknown> | null {
   if (!existsSync(MODELS_JSON)) return null;
@@ -39,16 +47,8 @@ function readModelsJson(): Record<string, unknown> | null {
   }
 }
 
-/** Back the file up before every write; a bad merge must never be one-way. */
-function writeModelsJson(next: Record<string, unknown>): string | undefined {
-  let backup: string | undefined;
-  if (existsSync(MODELS_JSON)) {
-    backup = `${MODELS_JSON}.bak-pi-gateways`;
-    copyFileSync(MODELS_JSON, backup);
-  }
-  mkdirSync(dirname(MODELS_JSON), { recursive: true });
-  writeFileSync(MODELS_JSON, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-  return backup;
+function providersOf(file: Record<string, unknown> | null): Record<string, unknown> {
+  return (file?.providers as Record<string, unknown>) ?? {};
 }
 
 /** Ask a reader for its token without ever returning the value. */
@@ -65,32 +65,8 @@ function tokenFor(readerPath: string): string | null {
   }
 }
 
-function providersOf(file: Record<string, unknown> | null): Record<string, unknown> {
-  return (file?.providers as Record<string, unknown>) ?? {};
-}
-
 export default experimental_defineHostEntry({
-  contract: {
-    status: {
-      input: z.object({}),
-      output: z.object({
-        modelsJsonPath: z.string(),
-        gateways: z.array(gatewayReport),
-      }),
-    },
-    refresh: {
-      input: z.object({ only: z.array(z.string()).optional() }),
-      output: z.object({
-        modelsJsonPath: z.string(),
-        backupPath: z.string().optional(),
-        gateways: z.array(gatewayReport),
-      }),
-    },
-    remove: {
-      input: z.object({}),
-      output: z.object({ removed: z.array(z.string()), backupPath: z.string().optional() }),
-    },
-  },
+  contract: contractSchemas,
 
   handlers: {
     status: async (_input, context) => {
@@ -172,8 +148,12 @@ export default experimental_defineHostEntry({
 
       let backupPath: string | undefined;
       if (Object.keys(blocks).length > 0) {
+        if (existsSync(MODELS_JSON)) {
+          backupPath = `${MODELS_JSON}.bak-pi-gateways`;
+          copyFileSync(MODELS_JSON, backupPath);
+        }
         const merged = mergeProviders(readModelsJson(), blocks);
-        backupPath = writeModelsJson(merged);
+        writeFileAtomic(MODELS_JSON, `${JSON.stringify(merged, null, 2)}\n`);
       }
       return { modelsJsonPath: MODELS_JSON, backupPath, gateways: reports };
     },
@@ -183,8 +163,196 @@ export default experimental_defineHostEntry({
         readModelsJson(),
         GATEWAYS.map((gateway) => gateway.id),
       );
-      const backupPath = removed.length > 0 ? writeModelsJson(next) : undefined;
+      let backupPath: string | undefined;
+      if (removed.length > 0) {
+        backupPath = existsSync(MODELS_JSON) ? `${MODELS_JSON}.bak-pi-gateways` : undefined;
+        if (backupPath) copyFileSync(MODELS_JSON, backupPath);
+        writeFileAtomic(MODELS_JSON, `${JSON.stringify(next, null, 2)}\n`);
+      }
       return { removed, backupPath };
+    },
+
+    reservedIds: async () => discoverReservedProviderIds(),
+
+    probe: async (input, context) => probeEndpoint(input, context.signal),
+
+    saveCustom: async (input, context) => {
+      const dataDir = context.experimental_paths.dataDir;
+
+      // Discovery failure means we cannot prove the id is safe to use: refuse
+      // rather than silently allow a collision that would flood the picker.
+      const reserved = discoverReservedProviderIds();
+      if (!reserved.complete) {
+        throw new Error(
+          `could not locate pi's bundled provider catalogue (${reserved.source}); refusing to guess whether "${input.id}" collides`,
+        );
+      }
+
+      // Refuse bad ids before touching credentials or the network.
+      const manifest = loadManifest(dataDir);
+      const reason = validateCustomId(input.id, {
+        reserved: new Set(reserved.ids),
+        presentInModelsJson: providersOf(readModelsJson())[input.id] !== undefined,
+        ownedIds: new Set(Object.keys(manifest.owned)),
+      });
+      if (reason) throw new Error(reason);
+
+      const keyRef = buildKeyRef(dataDir, input.keySource);
+
+      const credentials = resolveToken(input.keySource);
+      if (!credentials.ok) throw new Error(credentials.error);
+
+      const catalogue = await fetchModelCatalogue({
+        baseUrl: input.baseUrl,
+        label: input.name,
+        api: input.api,
+        token: credentials.token,
+        signal: context.signal,
+      });
+
+      const def: CustomEndpointDef = {
+        id: input.id,
+        name: input.name,
+        baseUrl: normalizeBaseUrl(input.baseUrl),
+        api: input.api,
+        keySource: input.keySource,
+        keyRef,
+        freeOnly: input.freeOnly,
+        selectionMode: input.selectionMode,
+        selectedModelIds: input.selectedModelIds,
+      };
+
+      const models = selectModelsForSave(catalogue.entries, def);
+
+      if (existsSync(MODELS_JSON)) copyFileSync(MODELS_JSON, `${MODELS_JSON}.bak-pi-gateways`);
+      const merged = mergeProviders(readModelsJson(), {
+        [def.id]: { name: def.name, baseUrl: def.baseUrl, api: def.api, apiKey: def.keyRef, models },
+      });
+      writeFileAtomic(MODELS_JSON, `${JSON.stringify(merged, null, 2)}\n`);
+
+      try {
+        const next = loadManifest(dataDir);
+        next.owned[def.id] = def;
+        saveManifest(dataDir, next);
+      } catch (error) {
+        // models.json already carries the new block; say so, because a retry
+        // of the same save is what repairs ownership recording.
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`saved into models.json but could not update the plugin manifest (${detail}); run the same save again`);
+      }
+
+      return {
+        modelsJsonPath: MODELS_JSON,
+        backupPath: existsSync(`${MODELS_JSON}.bak-pi-gateways`) ? `${MODELS_JSON}.bak-pi-gateways` : undefined,
+        id: def.id,
+        modelCount: models.length,
+        warning: def.freeOnly
+          ? undefined
+          : "paid models were saved — every one of them can spend real money on this endpoint",
+      };
+    },
+
+    refreshCustom: async (input, context) => {
+      const dataDir = context.experimental_paths.dataDir;
+      const manifest = loadManifest(dataDir);
+      const ids = input.ids?.length
+        ? input.ids
+        : Object.keys(manifest.owned).filter((id) => isCustomDef(manifest.owned[id]));
+
+      const results: Array<{ id: string; ok: boolean; modelCount?: number; error?: string }> = [];
+      let wroteAny = false;
+
+      for (const id of ids) {
+        const entry = manifest.owned[id];
+        if (!isCustomDef(entry)) {
+          results.push({
+            id,
+            ok: false,
+            error: entry?.builtin ? "built-ins are refreshed by `bb pi-gateways refresh`" : "unknown endpoint",
+          });
+          continue;
+        }
+        try {
+          const credentials = resolveToken(entry.keySource);
+          if (!credentials.ok) throw new Error(credentials.error);
+          const catalogue = await fetchModelCatalogue({
+            baseUrl: entry.baseUrl,
+            label: entry.name,
+            api: entry.api,
+            token: credentials.token,
+            signal: context.signal,
+          });
+          const models = selectModelsForSave(catalogue.entries, entry);
+          if (existsSync(MODELS_JSON)) copyFileSync(MODELS_JSON, `${MODELS_JSON}.bak-pi-gateways`);
+          const merged = mergeProviders(readModelsJson(), {
+            [id]: { name: entry.name, baseUrl: entry.baseUrl, api: entry.api, apiKey: entry.keyRef, models },
+          });
+          writeFileAtomic(MODELS_JSON, `${JSON.stringify(merged, null, 2)}\n`);
+          wroteAny = true;
+          results.push({ id, ok: true, modelCount: models.length });
+        } catch (error) {
+          results.push({ id, ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      return {
+        modelsJsonPath: MODELS_JSON,
+        backupPath: wroteAny && existsSync(`${MODELS_JSON}.bak-pi-gateways`) ? `${MODELS_JSON}.bak-pi-gateways` : undefined,
+        results,
+      };
+    },
+
+    deleteCustom: async (input, context) => {
+      const dataDir = context.experimental_paths.dataDir;
+      const manifest = loadManifest(dataDir);
+      const entry = manifest.owned[input.id];
+      if (!entry) throw new Error(`"${input.id}" is not a known endpoint`);
+      if (!isCustomDef(entry)) {
+        throw new Error("built-in gateways are managed by `bb pi-gateways remove`, not deleted here");
+      }
+
+      const { next, removed } = dropProviders(readModelsJson(), [input.id]);
+      let backupPath: string | undefined;
+      if (removed.length > 0) {
+        backupPath = existsSync(MODELS_JSON) ? `${MODELS_JSON}.bak-pi-gateways` : undefined;
+        if (backupPath) copyFileSync(MODELS_JSON, backupPath);
+        writeFileAtomic(MODELS_JSON, `${JSON.stringify(next, null, 2)}\n`);
+      }
+
+      const nextManifest = loadManifest(dataDir);
+      delete nextManifest.owned[input.id];
+      saveManifest(dataDir, nextManifest);
+
+      return { removed, backupPath };
+    },
+
+    listCustom: async (_input, context) => {
+      const dataDir = context.experimental_paths.dataDir;
+      const manifest = loadManifest(dataDir);
+      const providers = providersOf(readModelsJson());
+      return {
+        modelsJsonPath: MODELS_JSON,
+        endpoints: Object.entries(manifest.owned)
+          .filter(([, entry]) => isCustomDef(entry))
+          .map(([id, entry]) => ({ ...entry, id }))
+          .filter((def): def is CustomEndpointDef => isCustomDef(def))
+          .map((def) => {
+            const block = providers[def.id] as ProviderBlock | undefined;
+            return {
+              id: def.id,
+              name: def.name,
+              baseUrl: def.baseUrl,
+              api: def.api,
+              keyRef: def.keyRef,
+              freeOnly: def.freeOnly,
+              selectionMode: def.selectionMode,
+              inModelsJson: block !== undefined,
+              modelCount: Array.isArray(block?.models) ? block.models.length : 0,
+            };
+          })
+          .sort((a, b) => a.id.localeCompare(b.id)),
+      };
     },
   },
 });
+
