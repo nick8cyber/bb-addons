@@ -12,7 +12,7 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 export default function plugin(bb: BbPluginApi) {
-  bb.agents.experimental_registerProvider({
+  bb.providers.register({
     id: "agy",
     displayName: "Antigravity (agy)",
     // A plugin-relative .svg path, which bb serves to clients as
