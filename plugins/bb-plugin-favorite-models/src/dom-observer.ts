@@ -223,7 +223,8 @@ export function normalizeProviderId(name: string): string {
   if (clean.includes("codex") || clean === "openai") return "codex";
   if (clean.includes("claude") || clean === "anthropic") return "provider-claude-code";
   if (clean.includes("antigravity") || clean === "agy" || clean.includes("gemini")) return "agy";
-  if (clean.includes("pi")) return "provider-pi";
+  if (clean === "pi" || clean === "provider-pi" || clean.startsWith("pi-") || clean.includes("inflection"))
+    return "provider-pi";
   if (clean.includes("opencode")) return "opencode";
   if (clean.includes("cursor") || clean.includes("acp")) return "acp-cursor";
   return clean.replace(/\s+/g, "-");
@@ -490,15 +491,11 @@ function reorderOptionsWithFavorites(
 /**
  * Open the native BB composer model picker popover.
  */
-export function openNativeModelPicker(): void {
-  const triggerBtn = document.querySelector<HTMLButtonElement>(
-    'button[aria-label*="Provider, model" i], button[aria-label*="Model" i]'
-  );
-  if (!triggerBtn) return;
+export function openNativeModelPicker(anchor?: HTMLElement | null): void {
+  const triggerBtn = findModelTrigger(anchor);
+  if (!triggerBtn || triggerBtn.disabled) return;
 
-  const isAlreadyOpen = !!document.querySelector(
-    '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
-  );
+  const isAlreadyOpen = !!document.querySelector(POPOVER_SELECTOR);
   if (!isAlreadyOpen) {
     triggerBtn.click();
   }
@@ -508,66 +505,107 @@ export function openNativeModelPicker(): void {
  * Fast programmatic model switcher:
  * Opens the composer's model picker, clicks the matching model option, and closes it.
  */
-export async function switchComposerModel(modelId: string, providerId?: string): Promise<boolean> {
-  const triggerBtn = document.querySelector<HTMLButtonElement>(
-    'button[aria-label*="Provider, model" i], button[aria-label*="Model" i]'
+export type SwitchFailure =
+  | "no-trigger"
+  | "trigger-disabled"
+  | "no-popover"
+  | "provider-tab-missing"
+  | "model-not-found";
+
+export interface SwitchResult {
+  ok: boolean;
+  reason?: SwitchFailure;
+}
+
+/** BB marks each composer root with this attribute (primary vs secondary). */
+const COMPOSER_ROOT_SELECTOR = "[data-app-composer-role]";
+/** BB's trigger carries aria-label "Provider, model and reasoning (<shortcut>)". */
+const MODEL_TRIGGER_SELECTOR = 'button[aria-label*="Provider, model" i]';
+const POPOVER_SELECTOR =
+  '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]';
+
+function findModelTrigger(anchor?: HTMLElement | null): HTMLButtonElement | null {
+  // Scope to the composer the caller lives in: several composers (thread,
+  // side chat, queued message) can be mounted at once and a bare
+  // document.querySelector would drive whichever happens to come first.
+  const root = anchor?.closest<HTMLElement>(COMPOSER_ROOT_SELECTOR) ?? null;
+  return (
+    root?.querySelector<HTMLButtonElement>(MODEL_TRIGGER_SELECTOR) ??
+    document.querySelector<HTMLButtonElement>(MODEL_TRIGGER_SELECTOR)
   );
-  if (!triggerBtn) return false;
+}
+
+/**
+ * Fast programmatic model switcher:
+ * Opens the composer's model picker, clicks the matching model option, and closes it.
+ * Returns a reason on failure so the caller can say what actually went wrong.
+ */
+export async function switchComposerModel(
+  modelId: string,
+  providerId?: string,
+  anchor?: HTMLElement | null
+): Promise<SwitchResult> {
+  const triggerBtn = findModelTrigger(anchor);
+  if (!triggerBtn) return { ok: false, reason: "no-trigger" };
+  // BB disables the trigger while the model is locked (e.g. mid-run); a click
+  // on a disabled button is silently swallowed, so report it instead.
+  if (triggerBtn.disabled || triggerBtn.getAttribute("aria-disabled") === "true") {
+    return { ok: false, reason: "trigger-disabled" };
+  }
 
   // Open the popover if not open
-  const isAlreadyOpen = !!document.querySelector(
-    '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
-  );
-  if (!isAlreadyOpen) {
+  if (!document.querySelector(POPOVER_SELECTOR)) {
     triggerBtn.click();
   }
 
-  // Wait for popover to mount (polling up to 200ms)
+  // Wait for popover to mount. Models can load asynchronously, so allow ~1s.
   let popover: HTMLElement | null = null;
-  for (let i = 0; i < 8; i++) {
-    popover = document.querySelector<HTMLElement>(
-      '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
-    );
+  for (let i = 0; i < 40; i++) {
+    popover = document.querySelector<HTMLElement>(POPOVER_SELECTOR);
     if (popover) break;
     await new Promise((r) => setTimeout(r, 25));
   }
-  if (!popover) return false;
+  if (!popover) return { ok: false, reason: "no-popover" };
 
-  // If providerId specified, check if we need to click provider tab
-  let switchedTab = false;
-  if (providerId) {
-    const tabs = Array.from(popover.querySelectorAll<HTMLButtonElement>("div.border-b button, button[title]"));
-    for (const tab of tabs) {
-      const tabTitle = tab.getAttribute("title") || tab.textContent || "";
-      if (normalizeProviderId(tabTitle) === normalizeProviderId(providerId)) {
-        tab.click();
-        switchedTab = true;
-        break;
+  // Provider tabs render only when the composer offers more than one provider.
+  // Each tab shows an icon or a single letter, so title is the only usable key.
+  const wantProvider = providerId ? normalizeProviderId(providerId) : null;
+  if (wantProvider) {
+    const tabs = Array.from(
+      popover.querySelectorAll<HTMLButtonElement>("div.border-b button[title], button[title]")
+    ).filter((b) => b.getAttribute("role") !== "option");
+    const target = tabs.find(
+      (tab) => normalizeProviderId(tab.getAttribute("title") || "") === wantProvider
+    );
+    if (target) {
+      const isActive = target.className.includes("border-foreground");
+      if (!isActive) {
+        target.click();
       }
+    } else if (tabs.length > 0) {
+      // Tabs exist but none is the provider we were asked for.
+      return { ok: false, reason: "provider-tab-missing" };
     }
+    // No tabs at all: single-provider composer, nothing to switch.
   }
 
-  // Find option matching modelId. A provider tab click re-renders the option
-  // list asynchronously, so poll for the target instead of betting on one delay.
-  const attempts = switchedTab ? 12 : 1;
-  for (let i = 0; i < attempts; i++) {
+  // Find the option. A provider tab click re-renders the list asynchronously,
+  // and the list itself may still be loading, so poll rather than guess a delay.
+  for (let i = 0; i < 40; i++) {
     // Re-query: the popover subtree can be replaced during the tab switch.
-    const live =
-      document.querySelector<HTMLElement>(
-        '[role="listbox"], [data-radix-popover-content], [data-radix-popper-content-wrapper]'
-      ) || popover;
+    const live = document.querySelector<HTMLElement>(POPOVER_SELECTOR) || popover;
     const options = Array.from(
       live.querySelectorAll<HTMLButtonElement>('button[role="option"], button[id*="-opt-"]')
     );
     for (const opt of options) {
       const { modelId: id, label } = extractModelIdFromButton(opt);
-      if (id === modelId || label === modelId || opt.textContent?.includes(modelId)) {
+      if (id === modelId || label === modelId) {
         opt.click();
-        return true;
+        return { ok: true };
       }
     }
-    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 25));
+    await new Promise((r) => setTimeout(r, 25));
   }
 
-  return false;
+  return { ok: false, reason: "model-not-found" };
 }

@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useRef, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
-import { useComposerView } from "@get-bb/plugin-sdk/app";
+import {
+  useComposerView,
+  useBbContext,
+  experimental_useSidebarThreads,
+  type ComposerView,
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import {
   getState,
@@ -10,7 +15,13 @@ import {
   getProviderDisplayName,
   type FavoritesState,
 } from "./favorites-manager.js";
-import { switchComposerModel, openNativeModelPicker, detectActiveProvider } from "./dom-observer.js";
+import {
+  switchComposerModel,
+  openNativeModelPicker,
+  detectActiveProvider,
+  normalizeProviderId,
+  type SwitchFailure,
+} from "./dom-observer.js";
 import { StarFilledIcon, StarOutlineIcon } from "./icons.js";
 
 export function QuickFavoritesAction() {
@@ -39,14 +50,34 @@ class ComposerViewBoundary extends React.Component<
 function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: boolean }) {
   const [state, setState] = useState<FavoritesState>(getState());
   const [isOpen, setIsOpen] = useState(false);
-  const [activeProvider, setActiveProvider] = useState<string>("default");
+  const [domProvider, setDomProvider] = useState<string>("default");
 
   // New-thread composer shows favorites of all providers; a session (thread,
   // queued message, side chat) composer shows only the active provider's.
-  const view = assumeSession
-    ? null
-    : (useComposerView() as { scope?: { kind?: string } } | null);
-  const isNewThread = view?.scope?.kind === "new-thread";
+  const view = assumeSession ? null : (useComposerView() as ComposerView | null);
+  const scope = view?.scope;
+  const isNewThread = scope?.kind === "new-thread";
+  // Resolve the thread from the composer's own scope. bbContext.threadId is the
+  // route's thread, which can still point at the last open thread while the
+  // new-thread screen is up — scoping to that would pick the wrong provider.
+  const scopeThreadId =
+    scope?.kind === "thread" || scope?.kind === "queued-message"
+      ? scope.threadId
+      : scope?.kind === "side-chat"
+        ? scope.childThreadId
+        : null;
+
+  // The host knows which provider a thread runs on. Ask it instead of reading
+  // the provider back out of the composer's DOM, which only works when the
+  // picker happens to be open and mislabels everything else as "default".
+  const bbContext = useBbContext();
+  const sidebar = experimental_useSidebarThreads();
+  const threadId = isNewThread ? null : (scopeThreadId ?? bbContext.threadId);
+  const sdkProvider = (() => {
+    if (!threadId) return null;
+    const thread = sidebar.threads.find((t) => t.id === threadId);
+    return thread ? normalizeProviderId(thread.providerId) : null;
+  })();
   const [coords, setCoords] = useState<{
     top?: number;
     bottom?: number;
@@ -169,8 +200,9 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
     e.preventDefault();
     e.stopPropagation();
 
-    const prov = detectActiveProvider();
-    setActiveProvider(prov);
+    // Only consult the DOM when the host could not tell us (new-thread screen).
+    const prov = sdkProvider ?? detectActiveProvider();
+    setDomProvider(prov);
 
     const providerFavs = getFavoritesForProvider(prov);
     const allFavs = Object.entries(state.favorites).filter(([_, list]) => list.length > 0);
@@ -179,7 +211,7 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
       toast.info("Нет избранных моделей", {
         description: "Откройте список моделей и нажмите ⭐ рядом с нужной моделью.",
       });
-      openNativeModelPicker();
+      openNativeModelPicker(buttonRef.current);
       return;
     }
 
@@ -199,31 +231,32 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
     const label = getModelLabel(targetProv, modelId);
     toast.loading(`Переключение на ${label}...`, { id: "fav-switch" });
 
-    const success = await switchComposerModel(modelId, targetProv);
-    if (success) {
+    const result = await switchComposerModel(modelId, targetProv, buttonRef.current);
+    if (result.ok) {
       toast.success(`Выбрана модель: ${label}`, { id: "fav-switch" });
-    } else {
-      toast.info(`Откройте список моделей и выберите ${label}`, {
-        id: "fav-switch",
-      });
+      return;
     }
+    toast.info(describeSwitchFailure(result.reason, label, targetProv), {
+      id: "fav-switch",
+    });
   };
 
   const handleOpenAllModels = () => {
     setIsOpen(false);
-    openNativeModelPicker();
+    openNativeModelPicker(buttonRef.current);
   };
 
+  // Inside a thread the provider is fixed, so the menu stays scoped to it.
+  // Only the new-thread screen, where no thread exists yet, lists every provider.
+  const isSession = threadId !== null;
+  const activeProvider = sdkProvider ?? domProvider;
   const providerFavs = getFavoritesForProvider(activeProvider);
-  // "default" means provider detection failed (no open picker, no "Provider: Model"
-  // trigger title). Nothing is ever stored under that key, so scoping to it would
-  // hide every favorite — fall back to showing all of them instead.
-  const showAllProviders = isNewThread || activeProvider === "default";
-  const otherProviders = showAllProviders
-    ? Object.entries(state.favorites).filter(
-        ([p, list]) => p !== activeProvider && list.length > 0
-      )
-    : [];
+  const otherProviders =
+    !isSession && isNewThread
+      ? Object.entries(state.favorites).filter(
+          ([p, list]) => p !== activeProvider && list.length > 0
+        )
+      : [];
 
   // Active provider first, then the remaining ones (new-thread composer only).
   // Headers only appear once more than one provider is on screen.
@@ -325,4 +358,26 @@ function QuickFavoritesActionInner({ assumeSession = false }: { assumeSession?: 
       {popupMenu}
     </div>
   );
+}
+
+/** Turn a failed switch into something the user can act on. */
+function describeSwitchFailure(
+  reason: SwitchFailure | undefined,
+  label: string,
+  providerId: string
+): string {
+  switch (reason) {
+    case "trigger-disabled":
+      return `Модель сейчас нельзя сменить — переключатель заблокирован (обычно во время ответа агента)`;
+    case "no-trigger":
+      return `В этом композере нет переключателя модели`;
+    case "no-popover":
+      return `Список моделей не открылся — попробуйте ещё раз`;
+    case "provider-tab-missing":
+      return `Провайдер «${getProviderDisplayName(providerId)}» недоступен в этом треде`;
+    case "model-not-found":
+      return `Модель ${label} не найдена в списке провайдера`;
+    default:
+      return `Откройте список моделей и выберите ${label}`;
+  }
 }
