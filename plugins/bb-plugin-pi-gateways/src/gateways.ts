@@ -10,6 +10,9 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { ApiKind } from "./contract.js";
+
+export type { ApiKind };
 
 export interface Gateway {
   /** Provider id written into models.json. */
@@ -45,9 +48,9 @@ export const GATEWAYS: readonly Gateway[] = [
 export const MODELS_JSON = join(homedir(), ".pi", "agent", "models.json");
 
 /** Model kinds a coding agent cannot drive, however free they are. */
-const NOT_A_CHAT_MODEL = /lyria|veo-|-tts|whisper|embed|rerank|moderation|image-\d/i;
+export const NOT_A_CHAT_MODEL = /lyria|veo-|-tts|whisper|embed|rerank|moderation|image-\d/i;
 
-interface CatalogueEntry {
+export interface CatalogueEntry {
   readonly id?: string;
   readonly name?: string;
   readonly context_length?: number;
@@ -96,23 +99,53 @@ export async function fetchCatalogue(
   token: string,
   signal?: AbortSignal,
 ): Promise<CatalogueEntry[]> {
-  const response = await fetch(`${gateway.baseUrl}/models`, {
-    headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+  const { entries } = await fetchModelCatalogue({
+    baseUrl: gateway.baseUrl,
+    label: gateway.label,
+    token,
     signal,
   });
+  return entries;
+}
+
+/**
+ * Catalogue fetch shared by the built-in gateways and user-defined endpoints.
+ * The request shape depends on the API kind: Anthropic-style endpoints
+ * authenticate with x-api-key instead of a bearer token.
+ */
+export async function fetchModelCatalogue(opts: {
+  baseUrl: string;
+  label?: string;
+  api?: "openai-completions" | "openai-responses" | "anthropic-messages";
+  token: string;
+  signal?: AbortSignal;
+}): Promise<{ httpStatus: number; entries: CatalogueEntry[] }> {
+  const base = opts.baseUrl.replace(/\/+$/, "");
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (opts.api === "anthropic-messages") {
+    headers["x-api-key"] = opts.token;
+    headers["anthropic-version"] = "2023-06-01";
+  } else {
+    headers.authorization = `Bearer ${opts.token}`;
+  }
+  const response = await fetch(`${base}/models`, {
+    headers,
+    signal: opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+  });
   if (!response.ok) {
-    throw new Error(`${gateway.label} answered HTTP ${response.status} for /models`);
+    throw new Error(`${opts.label ?? base} answered HTTP ${response.status} for /models`);
   }
   const body = (await response.json()) as { data?: CatalogueEntry[] } | CatalogueEntry[];
   const items = Array.isArray(body) ? body : body.data;
-  if (!Array.isArray(items)) throw new Error(`${gateway.label} returned no model list`);
-  return items;
+  if (!Array.isArray(items)) throw new Error(`${opts.label ?? base} returned no model list`);
+  return { httpStatus: response.status, entries: items };
 }
 
 export interface ProviderBlock {
   name: string;
   baseUrl: string;
-  api: "openai-completions";
+  /** Custom endpoints may pick another wire format; built-ins stay completions-based. */
+  api: ApiKind;
   apiKey: string;
   models: ModelEntry[];
 }
