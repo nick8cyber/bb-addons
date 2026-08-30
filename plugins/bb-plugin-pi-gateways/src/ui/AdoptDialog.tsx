@@ -17,6 +17,7 @@ import { SAVED_PROVIDER_PRESETS } from "../presets.js";
 import {
   EMPTY_KEY_SOURCE,
   KeySourceFields,
+  keyKindLabel,
   keySourceOf,
   type KeySourceState,
   type RpcCall,
@@ -28,15 +29,15 @@ import { ActionBar, Block, Choice, Mono, Note, Spacer, ToneText } from "./kit.js
 function keyStorySummary(row: ProviderRow): string {
   switch (row.keyRefKind) {
     case "command":
-      return "The command string is copied into the plugin's own record. It is configuration that already sits in models.json in clear text — copying it exposes nothing new — and it keeps running only when pi starts a session.";
+      return "The command itself is copied into this panel's own record. It already sits in models.json in clear text, so copying it exposes nothing new, and it runs only when pi starts a session.";
     case "env":
-      return "Only the environment variable's name is recorded. The value is read by pi at run time and never leaves your machine's environment.";
+      return "Only the name of the variable is recorded. Its value is read by pi when it runs and never leaves your machine.";
     case "env-template":
-      return "Nothing about the key is copied. The template stays only in models.json and is resolved in memory whenever a probe or refresh needs it.";
+      return "Nothing about the key is copied. The template stays in models.json and is filled in from memory whenever it is needed.";
     case "literal":
-      return "The key is written literally in models.json. This plugin will not copy it anywhere — choose below whether it stays exactly where it is, or is replaced by a reference now.";
+      return "The key is written out in models.json. This panel will not copy it anywhere — choose below whether it stays there or is replaced by a reference now.";
     case "none":
-      return "This block carries no key at all. Probes and refreshes will send no credential, which is what local gateways usually expect.";
+      return "This entry carries no key at all. Tests and refreshes will send no credential, which is what local gateways usually expect.";
   }
 }
 
@@ -79,8 +80,8 @@ export function AdoptDialog({ row, call, busy, runBusy, onClose, onChanged, onWr
         if (migrating) onWrote();
         toast.success(
           result.inPlaceKey
-            ? `${row.id} adopted — its key stays only in models.json`
-            : `${row.id} adopted`,
+            ? `${row.id} is now managed here — its key stays in models.json`
+            : `${row.id} is now managed here`,
         );
         setMismatch(undefined);
         await onChanged();
@@ -100,26 +101,25 @@ export function AdoptDialog({ row, call, busy, runBusy, onClose, onChanged, onWr
   return (
     <div className="space-y-4">
       <div className="space-y-1.5 rounded-md bg-surface-recessed px-3 py-2.5 text-xs">
-        <h4 className="text-xs font-semibold text-foreground">What adoption records</h4>
+        <h4 className="text-xs font-semibold text-foreground">What this changes</h4>
         <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
           <li>
-            models.json is left exactly as it is — adoption writes nothing
-            {canMigrate && mode === "migrate" ? ", except the key rewrite below" : ""}. Forgetting it later is a
-            perfect undo.
+            models.json is left exactly as it is — nothing is written
+            {canMigrate && mode === "migrate" ? ", except the key change you pick below" : ""}. "Stop managing" undoes
+            this completely.
           </li>
           <li>
-            Its current models are kept verbatim as an explicit list; automatic free-model selection is never turned
-            on.
+            Its models are kept exactly as they are. The "every free model" mode is never switched on for you.
           </li>
           <li>
-            Key reference: <Mono>{row.keyRefDisplay}</Mono> (<code>{row.keyRefKind}</code>).
+            Key: <Mono>{row.keyRefDisplay}</Mono> (<code>{keyKindLabel(row.keyRefKind)}</code>).
           </li>
-          {row.hasHeaders && <li>Custom headers stay on the block, untouched and never displayed.</li>}
+          {row.hasHeaders && <li>Custom headers are kept as they are and never shown.</li>}
           {!row.apiSupported && (
             <li>
               <ToneText tone="warn">
-                Its protocol ({row.api ?? "unset"}) is not one this plugin speaks: rename, manual model edits and
-                delete will work; test and refresh will not.
+                Its protocol ({row.api ?? "unset"}) is not one this panel speaks. Rename, model edits and delete will
+                work; test and refresh will not.
               </ToneText>
             </li>
           )}
@@ -128,7 +128,7 @@ export function AdoptDialog({ row, call, busy, runBusy, onClose, onChanged, onWr
       </div>
 
       {canMigrate && (
-        <Block title="How should the key be handled?">
+        <Block title="What happens to the key?">
           <Choice
             checked={mode === "in-place"}
             onSelect={() => {
@@ -136,7 +136,7 @@ export function AdoptDialog({ row, call, busy, runBusy, onClose, onChanged, onWr
               setMismatch(undefined);
             }}
             disabled={busy}
-            title="Adopt in place"
+            title="Leave the key in models.json"
             description="The key stays only in models.json. Nothing is copied, and rotating it by hand keeps working."
           />
           <Choice
@@ -146,8 +146,8 @@ export function AdoptDialog({ row, call, busy, runBusy, onClose, onChanged, onWr
               setMismatch(undefined);
             }}
             disabled={busy}
-            title="Migrate to a reference"
-            description="Rewrites the block so models.json holds a reference instead of the key. This is the one adoption path that writes to the file."
+            title="Replace the key with a reference"
+            description="models.json then holds a reference instead of the key itself. This is the only choice here that writes to the file."
           />
           {migrating && (
             <KeySourceFields
@@ -169,19 +169,19 @@ export function AdoptDialog({ row, call, busy, runBusy, onClose, onChanged, onWr
           onSelect={() => setLinkPreset(!linkPreset)}
           disabled={busy}
           title={`Treat as ${presetMatch.name}`}
-          description={`Its URL matches this preset; linking inherits its pricing rules (${presetMatch.pricing === "unknown" ? "prices unknown, explicit selection required" : "catalogue pricing"}) for later refreshes.`}
+          description={`Its URL matches this preset; linking inherits its pricing rules (${presetMatch.pricing === "unknown" ? "prices are not published, so you pick the models yourself" : "prices come from the catalogue"}) for later refreshes.`}
         />
       )}
 
       {mismatch && (
         <Note tone="warn" boxed>
-          {mismatch} Press Adopt again to rewrite the block with the new reference.
+          {mismatch} Press "Manage anyway" to write the new reference regardless.
         </Note>
       )}
 
       <ActionBar>
         <Button size="sm" disabled={busy || (migrating && !keySource)} onClick={() => void adopt()}>
-          {mismatch ? "Adopt anyway" : "Adopt"}
+          {mismatch ? "Manage anyway" : "Manage here"}
         </Button>
         <Spacer />
         <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
