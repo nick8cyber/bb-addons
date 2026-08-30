@@ -19,19 +19,19 @@ const GROUPS: Array<{ key: string; title: string; hint: string; owns: readonly O
   {
     key: "builtin",
     title: "Built-in",
-    hint: "Shipped with the plugin; credentials come from the vendor CLI.",
+    hint: "Come with the plugin. The key is found for you.",
     owns: ["builtin"],
   },
   {
     key: "managed",
-    title: "Managed",
-    hint: "Created or adopted here.",
+    title: "Managed here",
+    hint: "You can edit these.",
     owns: ["owned", "adopted", "orphaned"],
   },
   {
     key: "unmanaged",
-    title: "Unmanaged",
-    hint: "In models.json but not managed here.",
+    title: "In the file only",
+    hint: "Already in models.json. Start managing one to edit it here.",
     owns: ["foreign", "reserved"],
   },
 ];
@@ -94,7 +94,7 @@ export function ProviderList({
             <GroupHeading title={group.title} count={rows.length} hint={group.hint} />
             {rows.length === 0 ? (
               <EmptyState>
-                Nothing here yet — add a provider, or adopt one that already lives in models.json.
+                Nothing here yet. Add a provider, or start managing one that is already in models.json.
               </EmptyState>
             ) : (
               <div className="divide-y divide-border-hairline overflow-hidden rounded-lg border border-border bg-card">
@@ -154,7 +154,7 @@ function Row({
         onAdopt(row);
       }}
     >
-      Adopt
+      Manage here
     </Button>
   );
 
@@ -166,9 +166,9 @@ function Row({
           <span className="truncate text-sm font-medium text-foreground">{row.name ?? row.id}</span>
           {row.ownership === "orphaned" && <Badge tone="warn">missing from models.json</Badge>}
           {row.ownership === "reserved" && <Badge tone="neutral">reserved by pi</Badge>}
-          {row.drifted && <Badge tone="warn">changed outside</Badge>}
+          {row.drifted && <Badge tone="warn">edited outside bb</Badge>}
           {!row.apiSupported && row.ownership !== "builtin" && <Badge tone="neutral">unsupported protocol</Badge>}
-          {!row.inModelsJson && row.ownership !== "orphaned" && <Badge tone="neutral">not written</Badge>}
+          {!row.inModelsJson && row.ownership !== "orphaned" && <Badge tone="neutral">not in models.json</Badge>}
         </div>
         <MetaLine
           items={[<Mono>{row.id}</Mono>, endpointHost(row.baseUrl), apiLabel(row.api), `${row.modelCount} models`]}

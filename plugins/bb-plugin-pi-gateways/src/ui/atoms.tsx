@@ -30,6 +30,38 @@ export function apiLabel(api: string | undefined): string {
   return API_OPTIONS.find((option) => option.value === api)?.label ?? api;
 }
 
+/** How a key is referenced, in words — the raw enum must never reach the screen. */
+export function keyKindLabel(kind: string): string {
+  switch (kind) {
+    case "env":
+      return "environment variable";
+    case "command":
+      return "shell command";
+    case "env-template":
+      return "variable inside a template";
+    case "literal":
+      return "written in the file";
+    case "none":
+      return "no key";
+    default:
+      return kind;
+  }
+}
+
+/** Where a provider's prices come from, in words — the raw enum must never reach the screen. */
+export function pricingLabel(policy: string): string {
+  switch (policy) {
+    case "catalogue":
+      return "taken from the catalogue";
+    case "gateway-default":
+      return "whatever this gateway charges";
+    case "unknown":
+      return "not published";
+    default:
+      return policy;
+  }
+}
+
 export function endpointHost(baseUrl: string | undefined): string {
   if (!baseUrl) return "";
   try {
@@ -78,9 +110,9 @@ export function providerTone(row: ProviderRow): Tone {
 
 export const OWNERSHIP_LABEL: Record<Ownership, string> = {
   builtin: "built-in",
-  owned: "managed",
-  adopted: "adopted",
-  foreign: "not managed",
+  owned: "managed here",
+  adopted: "managed here",
+  foreign: "not managed here",
   orphaned: "missing from models.json",
   reserved: "reserved by pi",
 };

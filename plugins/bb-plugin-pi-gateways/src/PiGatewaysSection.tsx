@@ -181,8 +181,8 @@ export function PiGatewaysSection() {
 
       {!reservedComplete && (
         <Note tone="warn" boxed>
-          pi's bundled catalogue could not be located, so an id collision cannot be ruled out. Adding and adopting stay
-          blocked until it can be checked.
+          pi's own catalogue could not be found, so a name clash cannot be ruled out. Adding and taking over entries
+          stays blocked until it can be checked.
         </Note>
       )}
 

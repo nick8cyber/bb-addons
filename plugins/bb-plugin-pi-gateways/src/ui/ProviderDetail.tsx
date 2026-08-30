@@ -24,8 +24,10 @@ import {
   KeySourceFields,
   ModelPriceChip,
   apiLabel,
+  keyKindLabel,
   keySourceOf,
   modelSizeSummary,
+  pricingLabel,
   type KeySourceState,
   type RpcCall,
   type RunBusy,
@@ -182,7 +184,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
 
   const runProbe = () =>
     runBusy(async () => {
-      if (!row || !row.apiSupported) throw new Error("this provider's protocol is not one the plugin can speak");
+      if (!row || !row.apiSupported) throw new Error("this protocol is not one this panel can speak");
       if (!baseUrl.trim()) throw new Error("a base URL is required to test the connection");
       setProbing(true);
       setProbe(undefined);
@@ -350,8 +352,8 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
     <div className="space-y-5">
       {row.drifted && (
         <Note tone="warn" boxed>
-          Changed outside the plugin since it was last written here. Saving or refreshing overwrites those changes and
-          asks twice.
+          Edited outside bb since this panel last wrote it. Saving or refreshing overwrites those edits, and asks
+          twice first.
         </Note>
       )}
       {row.error && (
@@ -366,12 +368,12 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
       ))}
       {row.ownership === "foreign" && (
         <Note tone="warn" boxed>
-          Read-only until adopted. Press Adopt in the row above to edit or test it.
+          Read-only. Press "Manage here" in the row above to edit or test it.
         </Note>
       )}
       {row.ownership === "reserved" && (
         <Note tone="warn" boxed>
-          This id is reserved by pi and cannot be adopted or edited here.
+          pi reserves this name for itself. It cannot be edited here.
         </Note>
       )}
 
@@ -400,22 +402,22 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
             <>
               <dt className="text-subtle-foreground">Preset</dt>
               <dd className="min-w-0 text-foreground">
-                <Mono>{row.presetId}</Mono> — its URL is fixed by the preset
+                <Mono>{row.presetId}</Mono> — the preset fixes its URL
               </dd>
             </>
           )}
           {row.pricingPolicy && (
             <>
               <dt className="text-subtle-foreground">Pricing</dt>
-              <dd className="min-w-0 text-foreground">{row.pricingPolicy}</dd>
+              <dd className="min-w-0 text-foreground">{pricingLabel(row.pricingPolicy)}</dd>
             </>
           )}
           {detail.manifest && (
             <>
-              <dt className="text-subtle-foreground">Origin</dt>
+              <dt className="text-subtle-foreground">Managed since</dt>
               <dd className="min-w-0 text-foreground">
-                {detail.manifest.origin === "adopted" ? "Adopted" : "Created"} here
-                {detail.manifest.adoptedAt ? ` on ${detail.manifest.adoptedAt.slice(0, 10)}` : ""}
+                {detail.manifest.adoptedAt ? `${detail.manifest.adoptedAt.slice(0, 10)} · ` : ""}
+                {detail.manifest.origin === "adopted" ? "already existed" : "created here"}
                 {detail.manifest.updatedAt ? `, last written ${detail.manifest.updatedAt.slice(0, 10)}` : ""}
               </dd>
             </>
@@ -424,12 +426,12 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
             <>
               <dt className="text-subtle-foreground">Headers</dt>
               <dd className="min-w-0 text-foreground">
-                {detail.headerNames.join(", ")} — carried forward, never read out
+                {detail.headerNames.join(", ")} — kept as they are, never shown
               </dd>
             </>
           )}
         </dl>
-        <Note>The protocol is never editable: a different protocol is a different provider.</Note>
+        <Note>The protocol cannot be changed — a different protocol is a different provider.</Note>
         {baseUrlChanged && <Note tone="warn">A changed service URL must be tested before it can be saved.</Note>}
       </Block>
 
@@ -437,12 +439,12 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <KeyIcon className="text-muted-foreground" />
           <Mono className="min-w-0 break-all">{row.keyRefDisplay}</Mono>
-          <Badge>{row.keyRefKind}</Badge>
+          <Badge>{keyKindLabel(row.keyRefKind)}</Badge>
         </div>
         {inlineKey && (
           <Note>
-            Lives only in models.json. The plugin never copies it — it is read live when needed and carried forward on
-            every write.
+            The key itself sits in models.json. It is never copied out — it is read when needed and written back
+            unchanged.
           </Note>
         )}
         {editable && !migrateKey && (
@@ -455,7 +457,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
               setMismatch(undefined);
             }}
           >
-            {inlineKey ? "Migrate key" : "Change key"}
+            {inlineKey ? "Move the key out of models.json" : "Point at a different key"}
           </Button>
         )}
         {editable && migrateKey && (
@@ -566,7 +568,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
           selected={selected}
           onToggle={toggleModel}
           disabled={!editable || busy || selectionMode === "all-free"}
-          empty="Nothing is written for this provider yet. Test the connection to see what the gateway offers."
+          empty="Nothing is saved for this provider yet. Test the connection to see what the gateway offers."
         />
         <MetaLine items={[`${selected.size} of ${editorRows.length} selected`]} />
 
@@ -575,7 +577,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
         )}
         {touchedModels && selectionMode === "explicit" && unverifiedSelection && (
           <Note tone="warn">
-            Some ticked models are not in any catalogue this plugin has seen; they will be written by id alone.
+            Some ticked models are in no catalogue seen here. They will be saved by name only.
           </Note>
         )}
         {editorRows.some((model) => model.priceKnown === false) && (
@@ -598,18 +600,18 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
       {pending === "delete" && (
         <Note tone="danger">
           {row.ownership === "foreign"
-            ? "This block is not managed here and may be rewritten by whatever generates it. Press Confirm delete to force it."
-            : "Removes the provider block and everything this plugin remembers about it."}
+            ? "This entry is not managed here, so whatever wrote it may write it back. Press Confirm delete to remove it anyway."
+            : "Deletes the entry from models.json, and everything this panel remembers about it."}
         </Note>
       )}
       {pending === "disown" && (
-        <Note tone="warn">Leaves the models.json block exactly as it is and only stops managing it here.</Note>
+        <Note tone="warn">models.json is left exactly as it is. Only this panel stops controlling the entry.</Note>
       )}
       {pending === "save-drift" && (
-        <Note tone="warn">Saving overwrites the changes made outside the plugin.</Note>
+        <Note tone="warn">Saving overwrites the edits made outside bb.</Note>
       )}
       {pending === "refresh-drift" && (
-        <Note tone="warn">Refreshing overwrites the changes made outside the plugin.</Note>
+        <Note tone="warn">Refreshing overwrites the edits made outside bb.</Note>
       )}
 
       {(editable || canRefresh || canForget || canDelete) && (
@@ -632,7 +634,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
           <Spacer />
           {canForget && (
             <Button variant="ghost" size="sm" disabled={busy} onClick={disown}>
-              {pending === "disown" ? "Confirm forget" : "Forget"}
+              {pending === "disown" ? "Confirm" : "Stop managing"}
             </Button>
           )}
           {canDelete && (

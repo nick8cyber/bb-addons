@@ -208,7 +208,7 @@ export function AddProviderForm({ call, busy, runBusy, takenIds, reservedComplet
       subtitle={<span className="text-xs text-muted-foreground">Start from a known service, or connect another endpoint.</span>}
       onClose={onClose}
     >
-      <Block title="Service">
+      <Block title="Which service">
         <div className="grid gap-2 sm:grid-cols-3">
           {SAVED_PROVIDER_PRESETS.map((preset) => (
             <ChoiceTile
@@ -221,7 +221,7 @@ export function AddProviderForm({ call, busy, runBusy, takenIds, reservedComplet
           ))}
           <ChoiceTile
             selected={form.presetId === "custom"}
-            title="Custom"
+            title="Other"
             description="Another supported API endpoint."
             onSelect={() => choosePreset("custom")}
           />
@@ -260,13 +260,13 @@ export function AddProviderForm({ call, busy, runBusy, takenIds, reservedComplet
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 rounded-md bg-surface-recessed px-3 py-2 text-2xs sm:col-span-2">
             {reservedComplete ? (
               <>
-                <span className="text-subtle-foreground">Internal key</span>
+                <span className="text-subtle-foreground">Saved as</span>
                 <Mono>{generatedId}</Mono>
-                <span className="text-subtle-foreground">assigned automatically, collision-safe</span>
+                <span className="text-subtle-foreground">chosen automatically so it cannot clash</span>
               </>
             ) : (
               <ToneText tone="warn">
-                pi's bundled catalogue was not found — saving is blocked until it can be checked.
+                pi's own catalogue was not found — saving is blocked until it can be checked.
               </ToneText>
             )}
           </div>
@@ -301,7 +301,7 @@ export function AddProviderForm({ call, busy, runBusy, takenIds, reservedComplet
                 items={[
                   `HTTP ${probe.httpStatus}`,
                   `${probe.totalCount} compatible models`,
-                  pricingNotGuaranteed ? "pricing not guaranteed" : `${probe.freeCount} free`,
+                  pricingNotGuaranteed ? "prices not published" : `${probe.freeCount} free`,
                   probe.sampleCall ? (
                     probe.sampleCall.ok ? (
                       <ToneText tone="ok">live call OK ({probe.sampleCall.status})</ToneText>
@@ -312,7 +312,7 @@ export function AddProviderForm({ call, busy, runBusy, takenIds, reservedComplet
                       </ToneText>
                     )
                   ) : (
-                    "nothing to live-test"
+                    "no model to test with"
                   ),
                 ]}
               />
@@ -360,14 +360,14 @@ export function AddProviderForm({ call, busy, runBusy, takenIds, reservedComplet
                     ? `${selected.size} of ${selectableModels.length} selected`
                     : requiresExplicitModels
                       ? "Tick at least one model"
-                      : "Everything free will be saved",
+                      : "Every free model will be saved",
                 ]}
               />
               {probe.models.some((m) => !m.priceKnown) && (
                 <Note>
                   {strictCataloguePricing
-                    ? "* no published price: not classified as free"
-                    : "* no published price: custom gateway compatibility treats it as free because some gateways list only what your credential may use"}
+                    ? "* no price published, so it does not count as free."
+                    : "* no price published. Treated as free here, because some gateways list only what your key may already use."}
                 </Note>
               )}
             </Block>
