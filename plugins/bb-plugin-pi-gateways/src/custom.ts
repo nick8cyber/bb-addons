@@ -32,40 +32,72 @@ import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   GATEWAYS,
   NOT_A_CHAT_MODEL,
+  classifyCataloguePrice,
+  fetchModelCatalogue,
   selectFreeModels,
   type CatalogueEntry,
   type ModelEntry,
 } from "./gateways.js";
-import type { ApiKind, KeySource } from "./contract.js";
-import { writeFileAtomic } from "./fsutil.js";
+import { API_KINDS, type ApiKind, type KeySource, type ManifestKeySource, type Ownership, type PricingPolicy } from "./contract.js";
+import { fingerprintValue, writeFileAtomic } from "./fsutil.js";
+import {
+  displayKeyRef,
+  keyRefWarnings,
+  parseKeyRef,
+  resolveKeyRefValue,
+  type KeyRefKind,
+} from "./keyref.js";
 
 export interface CustomEndpointDef {
   id: string;
+  /** Optional shared-catalogue origin; absent on every pre-preset manifest entry. */
+  presetId?: string;
   name: string;
   baseUrl: string;
-  api: ApiKind;
-  keySource: KeySource;
-  /** The exact reference string written into models.json; contains no secret. */
-  keyRef: string;
+  /**
+   * Widened to a plain string: an adopted block may speak a protocol neither
+   * pi nor this plugin knows, and such an entry is still worth managing (the
+   * user usually adopted it in order to rename or delete it).
+   */
+  api: string;
+  keySource: ManifestKeySource;
+  /**
+   * The exact reference string written into models.json; contains no secret.
+   * Absent for `inline` entries, where the reference is whatever the live
+   * block already holds and is carried forward untouched on every write.
+   */
+  keyRef?: string;
   freeOnly: boolean;
   selectionMode: "all-free" | "explicit";
   selectedModelIds?: string[];
+  /** Saved so refresh applies the same price-safety policy as the original save. */
+  pricingPolicy?: PricingPolicy;
+  requiresExplicitModels?: boolean;
+  /** How the entry entered the manifest. v1 entries are all `created`. */
+  origin: ManifestOrigin;
+  /** sha256 of the canonical block as last written or adopted by us; drift detector. */
+  fingerprint?: string;
+  adoptedAt?: string;
+  updatedAt?: string;
 }
 
-type OwnedEntry = { builtin: true } | CustomEndpointDef;
+export type ManifestOrigin = "created" | "adopted";
+
+export type OwnedEntry = { builtin: true } | CustomEndpointDef;
 
 /** The union is shaped so only builtin entries carry the key at all. */
 export function isCustomDef(entry: OwnedEntry | undefined): entry is CustomEndpointDef {
   return entry !== undefined && !("builtin" in entry);
 }
 
-interface Manifest {
-  version: 1;
+export interface Manifest {
+  version: 2;
   /** ids this plugin owns in models.json; builtins recorded so they can never be taken over. */
   owned: Record<string, OwnedEntry>;
 }
 
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
+const SUPPORTED_MANIFEST_VERSIONS = [1, 2];
 /** Providers pi instantiates without a static catalogue file — still forbidden as ids. */
 const DYNAMIC_RESERVED_IDS = ["radius"];
 export const ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}$/;
@@ -78,7 +110,11 @@ export function manifestPath(dataDir: string): string {
 }
 
 function emptyManifest(): Manifest {
-  return { version: MANIFEST_VERSION, owned: {} };
+  // Built-ins are recorded from the very first load, including after a corrupt
+  // file is reseeded: their ids must never look adoptable to anyone.
+  const manifest: Manifest = { version: MANIFEST_VERSION, owned: {} };
+  ensureBuiltinsOwned(manifest);
+  return manifest;
 }
 
 export function loadManifest(dataDir: string): Manifest {
@@ -97,15 +133,39 @@ export function loadManifest(dataDir: string): Manifest {
     return emptyManifest();
   }
   const manifest = parsed as Manifest;
-  if (manifest?.version !== MANIFEST_VERSION || typeof manifest.owned !== "object" || manifest.owned === null) {
+  if (
+    !SUPPORTED_MANIFEST_VERSIONS.includes(manifest?.version as number) ||
+    typeof manifest.owned !== "object" ||
+    manifest.owned === null
+  ) {
     throw new Error(`${path} has an unsupported format; fix or remove it by hand`);
   }
+  // v1 → v2 in memory only; the file is rewritten as v2 by the next save. Every
+  // v1 entry was written by saveCustom, so `created` is the truthful origin,
+  // and no fingerprint means "never verified" rather than "drifted".
+  for (const entry of Object.values(manifest.owned)) {
+    if (isCustomDef(entry) && !entry.origin) entry.origin = "created";
+  }
+  manifest.version = MANIFEST_VERSION;
   ensureBuiltinsOwned(manifest);
   return manifest;
 }
 
 export function saveManifest(dataDir: string, manifest: Manifest): void {
-  writeFileAtomic(manifestPath(dataDir), `${JSON.stringify(manifest, null, 2)}\n`);
+  writeFileAtomic(
+    manifestPath(dataDir),
+    `${JSON.stringify({ ...manifest, version: MANIFEST_VERSION }, null, 2)}\n`,
+  );
+}
+
+/** Remove the manifest entry and nothing else: the exact inverse of adoption. */
+export function disownProvider(dataDir: string, id: string): boolean {
+  const manifest = loadManifest(dataDir);
+  const entry = manifest.owned[id];
+  if (!isCustomDef(entry)) return false;
+  delete manifest.owned[id];
+  saveManifest(dataDir, manifest);
+  return true;
 }
 
 function ensureBuiltinsOwned(manifest: Manifest): void {
@@ -298,9 +358,18 @@ export function buildKeyRef(dataDir: string, source: KeySource): string {
 }
 
 /** Resolve a source to the token value, in memory only — mirrors how pi resolves references. */
-export function resolveToken(source: KeySource): { ok: true; token: string } | { ok: false; error: string } {
+export function resolveToken(
+  source: ManifestKeySource,
+): { ok: true; token: string } | { ok: false; error: string } {
   try {
     switch (source.type) {
+      case "inline":
+        // Nothing was copied into the manifest, so there is nothing to resolve
+        // from here: the caller must read the live block instead.
+        return {
+          ok: false,
+          error: "this provider keeps its credential in models.json; resolve it from the live block",
+        };
       case "env": {
         const token = process.env[source.name];
         if (!token) return { ok: false, error: `environment variable ${source.name} is not set on this host` };
@@ -313,9 +382,10 @@ export function resolveToken(source: KeySource): { ok: true; token: string } | {
         return { ok: true, token };
       }
       case "command": {
-        // Same shape as pi's own command resolution: shell out, take stdout,
-        // ten-second ceiling. The output never leaves this function.
-        const raw = execFileSync("bash", ["-c", source.command], {
+        // Same shape as pi's own command resolution: `/bin/sh`, stdout only, a
+        // ten-second ceiling. The shell matters — pi runs these through sh, so
+        // a bash-only command that passed here would fail in a real session.
+        const raw = execFileSync("/bin/sh", ["-c", source.command], {
           encoding: "utf8",
           timeout: 10_000,
           stdio: ["ignore", "pipe", "ignore"],
@@ -350,6 +420,9 @@ export function normalizeBaseUrl(raw: string): string {
 }
 
 function authHeaders(api: ApiKind, token: string): Record<string, string> {
+  if (api === "google-generative-ai") {
+    return { "x-goog-api-key": token };
+  }
   if (api === "anthropic-messages") {
     return { "x-api-key": token, "anthropic-version": "2023-06-01" };
   }
@@ -361,14 +434,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   return fetch(url, { ...init, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
 }
 
-interface Pricing {
-  prompt?: string | number;
-  completion?: string | number;
-}
-
-interface CatalogueEntryWithPrice extends CatalogueEntry {
-  pricing?: Pricing;
-}
+type CatalogueEntryWithPrice = CatalogueEntry;
 
 /**
  * Free means a listed zero price on both sides. A missing pricing block also
@@ -376,36 +442,12 @@ interface CatalogueEntryWithPrice extends CatalogueEntry {
  * entitled to — but such models carry priceKnown=false so the UI can say that
  * no price was actually published.
  */
-export function classifyModel(entry: CatalogueEntryWithPrice): { free: boolean; priceKnown: boolean } {
-  const pricing = entry.pricing;
-  if (!pricing || (pricing.prompt === undefined && pricing.completion === undefined)) {
-    return { free: true, priceKnown: false };
-  }
-  const prompt = Number(pricing.prompt ?? NaN);
-  const completion = Number(pricing.completion ?? NaN);
-  return { free: prompt === 0 && completion === 0, priceKnown: true };
-}
-
-export async function fetchCatalogueEntries(opts: {
-  baseUrl: string;
-  api: ApiKind;
-  token: string;
-  signal?: AbortSignal;
-}): Promise<{ httpStatus: number; entries: CatalogueEntryWithPrice[] }> {
-  const base = normalizeBaseUrl(opts.baseUrl);
-  const response = await fetchWithTimeout(
-    `${base}/models`,
-    { headers: { accept: "application/json", ...authHeaders(opts.api, opts.token) } },
-    15_000,
-    opts.signal,
-  );
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} from ${base}/models${response.status === 401 ? " — the credential was rejected" : ""}`);
-  }
-  const body = (await response.json()) as { data?: CatalogueEntryWithPrice[] } | CatalogueEntryWithPrice[];
-  const items = Array.isArray(body) ? body : body.data;
-  if (!Array.isArray(items)) throw new Error("the endpoint returned no model list");
-  return { httpStatus: response.status, entries: items };
+export function classifyModel(
+  entry: CatalogueEntryWithPrice,
+  api: ApiKind,
+  pricingPolicy: PricingPolicy = api === "google-generative-ai" ? "unknown" : "gateway-default",
+): { free: boolean; priceKnown: boolean } {
+  return classifyCataloguePrice(entry, api, pricingPolicy);
 }
 
 /** One cheap live call, because a catalogue listing proves nothing about inference. */
@@ -438,6 +480,14 @@ export async function sampleChatCall(opts: {
           url: `${base}/messages`,
           body: JSON.stringify({ model: opts.modelId, max_tokens: 1, messages: [{ role: "user", content: "ping" }] }),
         };
+      case "google-generative-ai":
+        return {
+          url: `${base}/models/${encodeURIComponent(opts.modelId)}:generateContent`,
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: "ping" }] }],
+            generationConfig: { maxOutputTokens: 1 },
+          }),
+        };
     }
   };
 
@@ -465,22 +515,49 @@ export interface ProbeResult {
   ok: boolean;
   httpStatus?: number;
   error?: string;
-  models: Array<{ id: string; name?: string; contextWindow?: number; free: boolean; priceKnown: boolean }>;
+  models: Array<{
+    id: string;
+    name?: string;
+    contextWindow?: number;
+    maxTokens?: number;
+    free: boolean;
+    priceKnown: boolean;
+  }>;
   freeCount: number;
   totalCount: number;
   sampleCall?: { ok: boolean; status?: number; error?: string };
 }
 
 export async function probeEndpoint(
-  input: { baseUrl: string; api: ApiKind; keySource: KeySource },
+  input: {
+    baseUrl: string;
+    api: ApiKind;
+    keySource?: ManifestKeySource;
+    /**
+     * Already-resolved credential, used for inline-keyed providers whose value
+     * only exists in models.json. Never logged, never returned.
+     */
+    token?: string;
+    pricingPolicy?: PricingPolicy;
+    requiresExplicitModels?: boolean;
+  },
   signal?: AbortSignal,
 ): Promise<ProbeResult> {
-  const credentials = resolveToken(input.keySource);
+  const credentials = input.token
+    ? ({ ok: true, token: input.token } as const)
+    : input.keySource
+      ? resolveToken(input.keySource)
+      : ({ ok: false, error: "no credential source was given" } as const);
   if (!credentials.ok) return { ok: false, models: [], freeCount: 0, totalCount: 0, error: credentials.error };
 
-  let catalogue: Awaited<ReturnType<typeof fetchCatalogueEntries>>;
+  let catalogue: Awaited<ReturnType<typeof fetchModelCatalogue>>;
   try {
-    catalogue = await fetchCatalogueEntries({ baseUrl: input.baseUrl, api: input.api, token: credentials.token, signal });
+    catalogue = await fetchModelCatalogue({
+      baseUrl: normalizeBaseUrl(input.baseUrl),
+      api: input.api,
+      token: credentials.token,
+      signal,
+    });
   } catch (error) {
     return { ok: false, models: [], freeCount: 0, totalCount: 0, error: error instanceof Error ? error.message : String(error) };
   }
@@ -490,19 +567,24 @@ export async function probeEndpoint(
       id: entry.id ?? "",
       name: entry.name,
       contextWindow: typeof entry.context_length === "number" && entry.context_length > 0 ? entry.context_length : undefined,
-      ...classifyModel(entry),
+      maxTokens: typeof entry.max_tokens === "number" && entry.max_tokens > 0 ? entry.max_tokens : undefined,
+      ...classifyModel(entry, input.api, input.pricingPolicy),
     }))
     .filter((model) => model.id)
     .sort((a, b) => a.id.localeCompare(b.id));
 
-  const chatCapableFree = models.filter((model) => model.free && !NOT_A_CHAT_MODEL.test(model.id));
+  const chatCapable = models.filter((model) => !NOT_A_CHAT_MODEL.test(`${model.id} ${model.name ?? ""}`));
+  const freeModels = chatCapable.filter((model) => model.free);
+  const smokeCandidates = input.requiresExplicitModels || input.api === "google-generative-ai"
+    ? chatCapable
+    : freeModels;
 
   let sampleCall: ProbeResult["sampleCall"];
-  if (chatCapableFree.length > 0) {
+  if (smokeCandidates.length > 0) {
     sampleCall = await sampleChatCall({
       baseUrl: input.baseUrl,
       api: input.api,
-      modelId: chatCapableFree[0]!.id,
+      modelId: smokeCandidates[0]!.id,
       token: credentials.token,
       signal,
     });
@@ -512,7 +594,7 @@ export async function probeEndpoint(
     ok: true,
     httpStatus: catalogue.httpStatus,
     models,
-    freeCount: chatCapableFree.length,
+    freeCount: freeModels.length,
     totalCount: models.length,
     sampleCall,
   };
@@ -521,35 +603,99 @@ export async function probeEndpoint(
 // ---------------------------------------------------------------------------
 // Selection for saving
 
+export interface SelectionPolicy {
+  api: ApiKind;
+  freeOnly: boolean;
+  selectionMode: "all-free" | "explicit";
+  selectedModelIds?: string[];
+  pricingPolicy?: PricingPolicy;
+  requiresExplicitModels?: boolean;
+}
+
+export interface SelectionOptions {
+  /**
+   * `save` refuses to write a selection the catalogue no longer backs; `refresh`
+   * keeps such ids verbatim and reports them. A single delisted model used to
+   * brick the refresh of an entire provider, which is the opposite of safe.
+   */
+  mode?: "save" | "refresh";
+  /** The live block's model entries, so kept ids retain their existing metadata. */
+  liveModels?: readonly unknown[];
+  /** Allow pinning ids the catalogue does not list (unreachable catalogue, limited entry). */
+  allowUnverifiedModels?: boolean;
+}
+
+export interface SelectionResult {
+  models: ModelEntry[];
+  /** Selected ids the catalogue no longer lists but which were kept anyway. */
+  missing: string[];
+}
+
+function liveModelById(liveModels: readonly unknown[] | undefined, id: string): ModelEntry {
+  for (const entry of liveModels ?? []) {
+    if (entry && typeof entry === "object" && (entry as { id?: unknown }).id === id) {
+      const source = entry as Record<string, unknown>;
+      const model: ModelEntry = { id };
+      if (typeof source.name === "string") model.name = source.name;
+      if (typeof source.contextWindow === "number") model.contextWindow = source.contextWindow;
+      if (typeof source.maxTokens === "number") model.maxTokens = source.maxTokens;
+      return model;
+    }
+  }
+  return { id };
+}
+
 export function selectModelsForSave(
   entries: readonly CatalogueEntryWithPrice[],
-  def: Pick<CustomEndpointDef, "freeOnly" | "selectionMode" | "selectedModelIds">,
-): ModelEntry[] {
+  def: SelectionPolicy,
+  opts: SelectionOptions = {},
+): SelectionResult {
+  const mode = opts.mode ?? "save";
+  const pricingPolicy = effectivePricingPolicy(def);
+  if (
+    requiresExplicitModelSelection(def) &&
+    (def.selectionMode !== "explicit" || !def.selectedModelIds?.length)
+  ) {
+    throw new Error(
+      "catalogue pricing is not guaranteed; explicitly select at least one model before saving",
+    );
+  }
   let models: ModelEntry[];
+  const missing: string[] = [];
   if (def.selectionMode === "explicit") {
     const wanted = new Set(def.selectedModelIds ?? []);
     const byId = new Map(entries.filter((entry) => entry.id).map((entry) => [entry.id!, entry]));
-    const missing = [...wanted].filter((id) => !byId.has(id));
-    if (missing.length > 0) {
-      throw new Error(`catalogue no longer lists: ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? "…" : ""}`);
+    const absent = [...wanted].filter((id) => !byId.has(id));
+    if (absent.length > 0) {
+      const tolerated = mode === "refresh" || opts.allowUnverifiedModels === true;
+      if (!tolerated) {
+        throw new Error(`catalogue no longer lists: ${absent.slice(0, 5).join(", ")}${absent.length > 5 ? "…" : ""}`);
+      }
+      missing.push(...absent);
     }
     if (def.freeOnly) {
       // Never trust the client's claim that these are free: re-check against
       // the fresh catalogue, otherwise a stale UI list could spend money.
-      const paid = [...wanted].filter((id) => !classifyModel(byId.get(id)!).free);
+      const paid = [...wanted].filter(
+        (id) => byId.has(id) && !classifyModel(byId.get(id)!, def.api, pricingPolicy).free,
+      );
       if (paid.length > 0) {
         throw new Error(`refusing to save paid models while free-only is on: ${paid.slice(0, 5).join(", ")}`);
       }
     }
     models = [...wanted].sort().map((id) => {
-      const entry = byId.get(id)!;
+      const entry = byId.get(id);
+      // Kept-but-delisted ids are copied out of the live block rather than
+      // rebuilt, so nothing the user or another writer set on them is lost.
+      if (!entry) return liveModelById(opts.liveModels, id);
       const model: ModelEntry = { id };
       if (entry.name) model.name = entry.name;
       if (typeof entry.context_length === "number" && entry.context_length > 0) model.contextWindow = entry.context_length;
+      if (typeof entry.max_tokens === "number" && entry.max_tokens > 0) model.maxTokens = entry.max_tokens;
       return model;
     });
   } else if (def.freeOnly) {
-    models = selectFreeModels(entries);
+    models = selectFreeModels(entries, def.api, pricingPolicy);
   } else {
     models = entries
       .filter((entry) => entry.id && !NOT_A_CHAT_MODEL.test(entry.id))
@@ -557,16 +703,252 @@ export function selectModelsForSave(
         const model: ModelEntry = { id: entry.id! };
         if (entry.name) model.name = entry.name;
         if (typeof entry.context_length === "number" && entry.context_length > 0) model.contextWindow = entry.context_length;
+        if (typeof entry.max_tokens === "number" && entry.max_tokens > 0) model.maxTokens = entry.max_tokens;
         return model;
       })
       .sort((a, b) => a.id.localeCompare(b.id));
   }
   if (models.length === 0) {
     throw new Error(
-      def.freeOnly
+      requiresExplicitModelSelection(def)
+        ? "explicitly select at least one model — catalogue pricing is not guaranteed"
+        : def.freeOnly
         ? "the catalogue currently lists no zero-priced model — nothing would be saved"
         : "no selectable models found in the catalogue",
     );
   }
-  return models;
+  return { models, missing };
+}
+
+export function effectivePricingPolicy(
+  def: { api: string; pricingPolicy?: PricingPolicy },
+): PricingPolicy {
+  return def.pricingPolicy ?? (def.api === "google-generative-ai" ? "unknown" : "gateway-default");
+}
+
+export function requiresExplicitModelSelection(
+  def: { api: string; requiresExplicitModels?: boolean },
+): boolean {
+  return def.requiresExplicitModels ?? def.api === "google-generative-ai";
+}
+
+
+// ---------------------------------------------------------------------------
+// Managed entries: credentials, protocol support, ownership
+
+/**
+ * Resolve the credential for a managed entry.
+ *
+ * For `inline` entries the value only ever exists in models.json, so it is
+ * read from the block passed in — which callers must have read *fresh*, inside
+ * the same critical section as the write that follows. A token cached from an
+ * earlier read could be a key the user has since rotated by hand.
+ */
+export function resolveEntryToken(
+  entry: CustomEndpointDef,
+  liveBlock: Record<string, unknown> | undefined,
+): { ok: true; token: string } | { ok: false; error: string } {
+  if (entry.keySource.type !== "inline") return resolveToken(entry.keySource);
+  const raw = liveBlock?.apiKey;
+  if (typeof raw !== "string" || raw.length === 0) {
+    return { ok: false, error: `${entry.id} has no apiKey in models.json to resolve` };
+  }
+  return resolveKeyRefValue(raw);
+}
+
+export function asApiKind(api: string | undefined): ApiKind | undefined {
+  return API_KINDS.includes(api as ApiKind) ? (api as ApiKind) : undefined;
+}
+
+export const UNSUPPORTED_API_ERROR = "unsupported wire protocol — this provider can be renamed or deleted, but not probed or refreshed";
+
+/**
+ * Derive the ownership state. Never stored: models.json and the manifest are
+ * written by different actors at different times, and a cached enum would
+ * quietly describe a world that no longer exists.
+ */
+export function deriveOwnership(args: {
+  id: string;
+  entry: OwnedEntry | undefined;
+  inModelsJson: boolean;
+  reserved: ReadonlySet<string>;
+}): Ownership {
+  if (isBuiltinId(args.id)) return "builtin";
+  if (isCustomDef(args.entry)) {
+    if (!args.inModelsJson) return "orphaned";
+    return args.entry.origin === "adopted" ? "adopted" : "owned";
+  }
+  if (args.reserved.has(args.id)) return "reserved";
+  return "foreign";
+}
+
+/** True when the live block differs from what we last wrote or adopted. */
+export function isDrifted(entry: CustomEndpointDef, liveBlock: unknown): boolean {
+  if (!entry.fingerprint || liveBlock === undefined) return false;
+  return fingerprintValue(liveBlock) !== entry.fingerprint;
+}
+
+export const DRIFT_ERROR_SUFFIX =
+  "this provider changed in models.json since the plugin last wrote it; refreshing would overwrite those changes — retry with drift accepted";
+
+// ---------------------------------------------------------------------------
+// Adoption
+
+export interface AdoptionPlan {
+  entry: CustomEndpointDef;
+  warnings: string[];
+  keyRefKind: KeyRefKind;
+  /** True when the credential stays in models.json and is read live on demand. */
+  inPlaceKey: boolean;
+  /** Set only for migrate-on-adopt: the new reference string to write. */
+  rewriteApiKey?: string;
+  apiSupported: boolean;
+}
+
+export interface AdoptionOptions {
+  dataDir: string;
+  id: string;
+  block: Record<string, unknown>;
+  reserved: ReadonlySet<string>;
+  ownedIds: ReadonlySet<string>;
+  /** Migrate the key to a real reference as part of adoption (the only writing variant). */
+  keyMigration?: KeySource;
+  confirmMismatch?: boolean;
+  linkPreset?: { id: string; pricing: PricingPolicy; requiresExplicitModels: boolean; baseUrl: string };
+}
+
+/**
+ * Decide what adopting a foreign block records, and whether that requires
+ * touching models.json at all (it does not, except for a key migration).
+ *
+ * Adoption is deliberately lossy in one direction only: it never invents
+ * permission. A block whose pricing semantics we cannot know is adopted with
+ * its current model list pinned explicitly, never with auto-free selection.
+ */
+export function planAdoption(opts: AdoptionOptions): AdoptionPlan {
+  const { id, block } = opts;
+  if (isBuiltinId(id)) {
+    throw new Error(`"${id}" is one of the plugin's built-in gateways, not an adoptable block`);
+  }
+  if (opts.ownedIds.has(id)) throw new Error(`"${id}" is already managed by this plugin`);
+  if (opts.reserved.has(id)) {
+    throw new Error(
+      "pi ships its own catalogue under this id and would merge every paid model in the moment it sees a credential — this block cannot be adopted",
+    );
+  }
+
+  const warnings: string[] = [];
+  const rawKey = typeof block.apiKey === "string" ? block.apiKey : undefined;
+  const info = parseKeyRef(rawKey);
+  warnings.push(...keyRefWarnings(rawKey));
+
+  const api = typeof block.api === "string" ? block.api : "openai-completions";
+  const apiSupported = asApiKind(api) !== undefined;
+  if (!apiSupported) {
+    warnings.push(`this block declares api "${api}", which this plugin cannot probe or refresh — it can still be renamed or deleted`);
+  }
+
+  const baseUrl = typeof block.baseUrl === "string" ? block.baseUrl : "";
+  const name = typeof block.name === "string" && block.name.trim() ? block.name.trim() : id;
+
+  const liveModels = Array.isArray(block.models) ? block.models : [];
+  const selectedModelIds = liveModels
+    .filter((entry): entry is { id: string } =>
+      Boolean(entry) && typeof entry === "object" && typeof (entry as { id?: unknown }).id === "string")
+    .map((entry) => entry.id);
+
+  let keySource: ManifestKeySource;
+  let rewriteApiKey: string | undefined;
+
+  if (opts.keyMigration) {
+    // The one adoption path that writes: replace the literal with a reference.
+    const replacement = resolveToken(opts.keyMigration);
+    if (!replacement.ok) throw new Error(replacement.error);
+    const current = rawKey ? resolveKeyRefValue(rawKey) : undefined;
+    if (current?.ok && current.token !== replacement.token && !opts.confirmMismatch) {
+      throw new Error(
+        "the new key source resolves to a different token than the block currently uses — the key may have been rotated; confirm to rewrite the block with the new reference anyway",
+      );
+    }
+    if (current?.ok && current.token !== replacement.token) {
+      warnings.push("the new key source resolved to a different token than the block used before");
+    }
+    keySource = opts.keyMigration;
+    rewriteApiKey = buildKeyRef(opts.dataDir, opts.keyMigration);
+  } else {
+    switch (info.kind) {
+      case "command":
+        // Already a command in the config file: copying the string into the
+        // manifest exposes nothing that was not exposed a moment ago.
+        if (/[\r\n]/.test(info.command)) {
+          throw new Error("this block's key command spans several lines; adopt it after simplifying the command");
+        }
+        keySource = { type: "command", command: info.command };
+        break;
+      case "env":
+        keySource = { type: "env", name: info.name };
+        break;
+      case "env-template":
+        keySource = { type: "inline" };
+        warnings.push(
+          `the key is a template over ${info.names.join(", ")}; it stays in models.json untouched because this plugin can only record a single reference`,
+        );
+        break;
+      case "literal":
+        keySource = { type: "inline" };
+        warnings.push(
+          "the credential is written literally in models.json; it stays there untouched — migrate it to an environment variable or key file to get it out of the file",
+        );
+        break;
+      case "none":
+        keySource = { type: "inline" };
+        warnings.push("this block carries no credential; probes and refreshes will send no authorization header");
+        break;
+    }
+  }
+
+  const preset = opts.linkPreset && opts.linkPreset.baseUrl === baseUrl ? opts.linkPreset : undefined;
+  if (opts.linkPreset && !preset) {
+    warnings.push(`the block's base URL does not match preset "${opts.linkPreset.id}"; the preset was not linked`);
+  }
+
+  const now = new Date().toISOString();
+  const entry: CustomEndpointDef = {
+    id,
+    presetId: preset?.id,
+    name,
+    baseUrl,
+    api,
+    keySource,
+    keyRef: rewriteApiKey ?? (keySource.type === "inline" ? undefined : rawKey),
+    // Adoption never grants auto-free-selection: the gateway's pricing
+    // semantics are unknown, so what is offered stays exactly what is offered.
+    freeOnly: false,
+    selectionMode: "explicit",
+    selectedModelIds,
+    pricingPolicy: preset?.pricing ?? "unknown",
+    requiresExplicitModels: preset?.requiresExplicitModels ?? true,
+    origin: "adopted",
+    adoptedAt: now,
+  };
+
+  return {
+    entry,
+    warnings,
+    keyRefKind: info.kind,
+    inPlaceKey: keySource.type === "inline",
+    rewriteApiKey,
+    apiSupported,
+  };
+}
+
+/** The redacted key rendering for a provider row, whatever its ownership. */
+export function keyRefDisplayFor(entry: CustomEndpointDef | undefined, liveBlock: Record<string, unknown> | undefined): {
+  kind: KeyRefKind;
+  display: string;
+} {
+  const raw = typeof liveBlock?.apiKey === "string"
+    ? (liveBlock.apiKey as string)
+    : entry?.keyRef;
+  return { kind: parseKeyRef(raw).kind, display: displayKeyRef(raw) };
 }
