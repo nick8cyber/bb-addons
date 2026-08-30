@@ -4,23 +4,25 @@
  * adoption will record — because for a key written literally into models.json
  * the honest answer is "nothing about the key at all, unless you ask us to
  * migrate it", and that choice must be made explicitly rather than defaulted.
+ *
+ * Rendered inline inside the expanded row of the provider list: content only,
+ * no card or panel chrome of its own.
  */
 import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import type { AdoptOutput, ProviderRow } from "../contract.js";
 import { SAVED_PROVIDER_PRESETS } from "../presets.js";
 import {
   EMPTY_KEY_SOURCE,
   KeySourceFields,
-  apiLabel,
   keySourceOf,
   type KeySourceState,
   type RpcCall,
   type RunBusy,
-} from "./AddProviderForm.js";
+} from "./atoms.js";
+import { ActionBar, Block, Choice, Mono, Note, Spacer, ToneText } from "./kit.js";
 
 /** What the manifest ends up holding for each way a key can be referenced. */
 function keyStorySummary(row: ProviderRow): string {
@@ -96,136 +98,96 @@ export function AdoptDialog({ row, call, busy, runBusy, onClose, onChanged, onWr
     });
 
   return (
-    <Card className="border-primary">
-      <CardContent className="space-y-4 pt-6">
-        <div className="flex flex-wrap items-start justify-between gap-2">
-          <div>
-            <div className="font-medium">Adopt {row.name ?? row.id}</div>
-            <div className="mt-0.5 text-xs text-muted-foreground">
-              <code>{row.id}</code>
-              {row.baseUrl ? ` · ${row.baseUrl}` : ""} · {apiLabel(row.api)} · {row.modelCount} models
-            </div>
-          </div>
-          <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
-            Close
-          </Button>
-        </div>
-
-        <div className="space-y-2 rounded-md border border-border p-3 text-xs">
-          <div className="font-medium">What adoption records</div>
-          <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
+    <div className="space-y-4">
+      <div className="space-y-1.5 rounded-md bg-surface-recessed px-3 py-2.5 text-xs">
+        <h4 className="text-xs font-semibold text-foreground">What adoption records</h4>
+        <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
+          <li>
+            models.json is left exactly as it is — adoption writes nothing
+            {canMigrate && mode === "migrate" ? ", except the key rewrite below" : ""}. Forgetting it later is a
+            perfect undo.
+          </li>
+          <li>
+            Its current models are kept verbatim as an explicit list; automatic free-model selection is never turned
+            on.
+          </li>
+          <li>
+            Key reference: <Mono>{row.keyRefDisplay}</Mono> (<code>{row.keyRefKind}</code>).
+          </li>
+          {row.hasHeaders && <li>Custom headers stay on the block, untouched and never displayed.</li>}
+          {!row.apiSupported && (
             <li>
-              The provider stays exactly as it is in models.json — adoption itself writes nothing to the file
-              {canMigrate && mode === "migrate" ? ", except the key rewrite you chose below" : ""}. Forgetting it later
-              is a perfect undo.
+              <ToneText tone="warn">
+                Its protocol ({row.api ?? "unset"}) is not one this plugin speaks: rename, manual model edits and
+                delete will work; test and refresh will not.
+              </ToneText>
             </li>
-            <li>
-              Its current models are kept verbatim as an explicit list. Adoption never turns on automatic free-model
-              selection: this plugin cannot know what the gateway charges for.
-            </li>
-            <li>
-              Key reference: <span className="font-mono text-foreground">{row.keyRefDisplay}</span> ({row.keyRefKind}).
-            </li>
-            {row.hasHeaders && <li>Custom headers stay on the block untouched and are never copied or displayed.</li>}
-            {!row.apiSupported && (
-              <li className="text-amber-600 dark:text-amber-400">
-                Its protocol ({row.api ?? "unset"}) is not one this plugin can speak. It will be adopted with limited
-                capability: rename, manual model edits and delete work; probe and refresh do not.
-              </li>
-            )}
-          </ul>
-          <div className="text-muted-foreground">{keyStorySummary(row)}</div>
-        </div>
+          )}
+        </ul>
+        <Note>{keyStorySummary(row)}</Note>
+      </div>
 
-        {canMigrate && (
-          <div className="space-y-3 rounded-md border border-border p-3">
-            <div className="text-xs font-medium">How should the key be handled?</div>
-            <label className="flex cursor-pointer items-start gap-2.5">
-              <input
-                type="radio"
-                className="mt-0.5"
-                checked={mode === "in-place"}
-                onChange={() => {
-                  setMode("in-place");
-                  setMismatch(undefined);
-                }}
-              />
-              <span className="text-xs">
-                Adopt in place (key stays only in models.json)
-                <span className="mt-0.5 block text-muted-foreground">
-                  Nothing is copied. Probes, refreshes and every later write re-read the value from the file and carry
-                  it forward unchanged, so rotating it by hand keeps working.
-                </span>
-              </span>
-            </label>
-            <label className="flex cursor-pointer items-start gap-2.5">
-              <input
-                type="radio"
-                className="mt-0.5"
-                checked={mode === "migrate"}
-                onChange={() => {
-                  setMode("migrate");
-                  setMismatch(undefined);
-                }}
-              />
-              <span className="text-xs">
-                Migrate to a reference now
-                <span className="mt-0.5 block text-muted-foreground">
-                  Rewrites the block so models.json holds a reference instead of the key itself. This is the one
-                  adoption path that writes to the file.
-                </span>
-              </span>
-            </label>
-            {migrating && (
-              <KeySourceFields
-                value={keyForm}
-                onChange={(patch) => {
-                  setKeyForm((previous) => ({ ...previous, ...patch }));
-                  setMismatch(undefined);
-                }}
-                label="Where the key should live from now on — the current literal value is replaced by this reference:"
-              />
-            )}
-          </div>
-        )}
-
-        {presetMatch && (
-          <label className="flex cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              className="mt-0.5 size-4"
-              checked={linkPreset}
-              onChange={(e) => setLinkPreset(e.target.checked)}
+      {canMigrate && (
+        <Block title="How should the key be handled?">
+          <Choice
+            checked={mode === "in-place"}
+            onSelect={() => {
+              setMode("in-place");
+              setMismatch(undefined);
+            }}
+            disabled={busy}
+            title="Adopt in place"
+            description="The key stays only in models.json. Nothing is copied, and rotating it by hand keeps working."
+          />
+          <Choice
+            checked={mode === "migrate"}
+            onSelect={() => {
+              setMode("migrate");
+              setMismatch(undefined);
+            }}
+            disabled={busy}
+            title="Migrate to a reference"
+            description="Rewrites the block so models.json holds a reference instead of the key. This is the one adoption path that writes to the file."
+          />
+          {migrating && (
+            <KeySourceFields
+              value={keyForm}
+              onChange={(patch) => {
+                setKeyForm((previous) => ({ ...previous, ...patch }));
+                setMismatch(undefined);
+              }}
+              label="Where the key should live from now on"
             />
-            <span className="text-xs">
-              Treat as {presetMatch.name}
-              <span className="mt-0.5 block text-muted-foreground">
-                Its URL matches the {presetMatch.name} preset. Linking inherits that preset's pricing rules
-                ({presetMatch.pricing === "unknown" ? "prices unknown, explicit selection required" : "catalogue pricing"})
-                for later refreshes.
-              </span>
-            </span>
-          </label>
-        )}
+          )}
+        </Block>
+      )}
 
-        {mismatch && (
-          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
-            {mismatch}
-            <div className="mt-1 text-muted-foreground">
-              Press Adopt again to rewrite the block with the new reference anyway.
-            </div>
-          </div>
-        )}
+      {presetMatch && (
+        <Choice
+          type="checkbox"
+          checked={linkPreset}
+          onSelect={() => setLinkPreset(!linkPreset)}
+          disabled={busy}
+          title={`Treat as ${presetMatch.name}`}
+          description={`Its URL matches this preset; linking inherits its pricing rules (${presetMatch.pricing === "unknown" ? "prices unknown, explicit selection required" : "catalogue pricing"}) for later refreshes.`}
+        />
+      )}
 
-        <div className="flex flex-wrap items-center gap-2">
-          <Button size="sm" disabled={busy || (migrating && !keySource)} onClick={() => void adopt()}>
-            {mismatch ? "Adopt anyway" : "Adopt"}
-          </Button>
-          <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
-            Cancel
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
+      {mismatch && (
+        <Note tone="warn" boxed>
+          {mismatch} Press Adopt again to rewrite the block with the new reference.
+        </Note>
+      )}
+
+      <ActionBar>
+        <Button size="sm" disabled={busy || (migrating && !keySource)} onClick={() => void adopt()}>
+          {mismatch ? "Adopt anyway" : "Adopt"}
+        </Button>
+        <Spacer />
+        <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
+          Cancel
+        </Button>
+      </ActionBar>
+    </div>
   );
 }

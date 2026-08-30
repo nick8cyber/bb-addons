@@ -11,7 +11,7 @@ export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "pi-gateways",
     title: "Pi Gateways",
-    description: "Google AI Studio, TokenRouter, OpenRouter, NVIDIA Build, OpenCode Zen, Kilo Code, and custom endpoints served through pi.",
+    description: "Model endpoints pi can reach, and what each one is allowed to offer.",
     component: PiGatewaysSection,
   });
 });
