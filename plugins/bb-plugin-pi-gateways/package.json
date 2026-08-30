@@ -1,15 +1,20 @@
 {
   "name": "bb-plugin-pi-gateways",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Free OpenCode Zen and Kilo Code models — plus any OpenAI-compatible endpoint — inside bb through pi, by token, without running their CLIs.",
+  "description": "Google AI Studio, TokenRouter, OpenRouter, NVIDIA Build, OpenCode Zen, Kilo Code, and custom model endpoints inside bb through pi.",
+  "scripts": {
+    "build": "npm run typecheck",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --import ./tests/ts-resolver.mjs --test tests/*.test.ts"
+  },
   "engines": {
     "bb": ">=0.39",
     "bbPluginSdk": ">=0.4.8"
   },
   "bb": {
     "name": "Pi Gateways",
-    "description": "Adds OpenCode Zen, Kilo Code and user-defined OpenAI-compatible endpoints to the pi provider over their HTTP APIs, so neither CLI has to run.",
+    "description": "Adds Google AI Studio, TokenRouter, OpenRouter, NVIDIA Build, OpenCode Zen, Kilo Code, and custom endpoints to pi over HTTP APIs.",
     "branding": {
       "icon": "./icons/gateway.svg"
     },

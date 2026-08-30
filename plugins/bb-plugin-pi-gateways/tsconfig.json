@@ -4,6 +4,7 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
     "jsx": "react-jsx",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["node"],
@@ -13,5 +14,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["server.ts", "host.ts", "app.tsx", "src", "components", "lib"]
+  "include": ["server.ts", "host.ts", "app.tsx", "src", "components", "lib", "tests"]
 }
