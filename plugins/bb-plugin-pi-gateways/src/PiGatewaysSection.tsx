@@ -2,28 +2,44 @@
  * The "Pi Gateways" settings section. It owns only the frame: which machine to
  * talk to, the one call that loads the provider inventory, and which panel is
  * currently open. Everything with an opinion about providers lives in src/ui.
+ *
+ * Layout-wise the frame is deliberately thin — a summary bar, any standing
+ * notice, then the list. Adding opens a panel above the list; inspecting and
+ * adopting open inside the row they belong to, so the page never asks the user
+ * to look somewhere else to find out what they just clicked.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
+import { Button } from "@/components/ui/button";
 import type { ListProvidersOutput, ProviderRow } from "./contract.js";
 import { AddProviderForm } from "./ui/AddProviderForm.js";
 import { AdoptDialog } from "./ui/AdoptDialog.js";
 import { ProviderDetail } from "./ui/ProviderDetail.js";
 import { ProviderList } from "./ui/ProviderList.js";
+import type { RpcCall } from "./ui/atoms.js";
+import { PlusIcon, RefreshIcon } from "./ui/icons.js";
+import { MetaLine, Mono, Note, Select } from "./ui/kit.js";
 import { rpc } from "../lib/rpc.js";
+import { formatHomePathForDisplay } from "../lib/utils.js";
+
+/** Which row is expanded, and what it is showing. */
+interface OpenPanel {
+  id: string;
+  mode: "detail" | "adopt";
+}
 
 export function PiGatewaysSection() {
   const [hosts, setHosts] = useState<Array<{ id: string; name: string }>>([]);
   const [host, setHost] = useState<string | undefined>(undefined);
   const [inventory, setInventory] = useState<ListProvidersOutput | undefined>(undefined);
-  const [detailId, setDetailId] = useState<string | undefined>(undefined);
-  const [adopting, setAdopting] = useState<ProviderRow | undefined>(undefined);
+  const [open, setOpen] = useState<OpenPanel | undefined>(undefined);
+  const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [showPickerNotice, setShowPickerNotice] = useState(false);
 
   /** Every call goes through here so the host picker applies uniformly. */
-  const call = useCallback(
+  const call = useCallback<RpcCall>(
     async <T,>(method: string, input: object = {}): Promise<T> => rpc<T>(method, { ...input, host }),
     [host],
   );
@@ -59,102 +75,162 @@ export function PiGatewaysSection() {
   }, []);
 
   const providers = inventory?.providers ?? [];
+  const reservedComplete = inventory?.reservedComplete ?? false;
   const takenIds = useMemo(() => new Set(providers.map((provider) => provider.id)), [providers]);
+  const modelTotal = useMemo(
+    () => providers.reduce((total, provider) => total + provider.modelCount, 0),
+    [providers],
+  );
   const armPickerNotice = useCallback(() => setShowPickerNotice(true), []);
+  const modelsJsonPath = inventory?.modelsJsonPath ?? "";
+
+  const refreshBuiltins = () =>
+    runBusy(async () => {
+      await call("refresh");
+      armPickerNotice();
+      toast.success("built-in gateways refreshed");
+      await reload();
+    });
+
+  /**
+   * The expanded half of a row. Adoption and inspection are the same gesture as
+   * far as the list is concerned, so the shell decides which one a row shows and
+   * the list only makes room for it.
+   */
+  const renderPanel = (row: ProviderRow) => {
+    if (open?.id !== row.id) return null;
+    if (open.mode === "adopt") {
+      return (
+        <AdoptDialog
+          row={row}
+          call={call}
+          busy={busy}
+          runBusy={runBusy}
+          onClose={() => setOpen(undefined)}
+          onChanged={reload}
+          onWrote={armPickerNotice}
+        />
+      );
+    }
+    return (
+      <ProviderDetail
+        key={row.id}
+        id={row.id}
+        call={call}
+        busy={busy}
+        runBusy={runBusy}
+        onClose={() => setOpen(undefined)}
+        onChanged={reload}
+        onWrote={armPickerNotice}
+      />
+    );
+  };
 
   return (
-    <div className="space-y-6 text-sm">
-      {showPickerNotice && (
-        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-foreground">
-          Existing pi bridge workers keep the catalogue they loaded at startup. A newly started worker reads the updated file.
-          For an immediate refresh, restart bb only when no pi turn is running:
-          <code className="ml-1 rounded bg-background/60 px-1 py-0.5">systemctl --user restart bb.service</code>
-          <div className="mt-2">
-            <button className="text-muted-foreground underline hover:text-foreground" onClick={() => setShowPickerNotice(false)}>
-              dismiss
-            </button>
+    <div className="space-y-4 text-sm">
+      <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-3">
+        <div className="min-w-0">
+          <MetaLine
+            items={[
+              `${providers.length} ${providers.length === 1 ? "provider" : "providers"}`,
+              `${modelTotal} ${modelTotal === 1 ? "model" : "models"}`,
+            ]}
+          />
+          <div className="mt-0.5 min-w-0 truncate" title={modelsJsonPath}>
+            <Mono className="text-subtle-foreground">{formatHomePathForDisplay(modelsJsonPath)}</Mono>
           </div>
-          <div className="mt-1 text-muted-foreground">Restarting or terminating the bridge during an active pi turn interrupts that turn.</div>
         </div>
+
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {hosts.length > 1 && (
+            <Select
+              value={host ?? ""}
+              aria-label="Machine"
+              className="h-8 w-auto text-xs"
+              onChange={(event) => {
+                setHost(event.target.value || undefined);
+                setOpen(undefined);
+                setAdding(false);
+              }}
+            >
+              <option value="">This machine</option>
+              {hosts.map((entry) => (
+                <option key={entry.id} value={entry.id}>
+                  {entry.name}
+                </option>
+              ))}
+            </Select>
+          )}
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => void refreshBuiltins()}>
+            <RefreshIcon />
+            Refresh built-ins
+          </Button>
+          <Button
+            size="sm"
+            disabled={busy || !reservedComplete}
+            onClick={() => {
+              setOpen(undefined);
+              setAdding(true);
+            }}
+          >
+            <PlusIcon />
+            Add provider
+          </Button>
+        </div>
+      </div>
+
+      {!reservedComplete && (
+        <Note tone="warn" boxed>
+          pi's bundled catalogue could not be located, so an id collision cannot be ruled out. Adding and adopting stay
+          blocked until it can be checked.
+        </Note>
       )}
 
-      {hosts.length > 1 && (
-        <label className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">Machine:</span>
-          <select
-            value={host ?? ""}
-            onChange={(event) => {
-              setHost(event.target.value || undefined);
-              setDetailId(undefined);
-              setAdopting(undefined);
-            }}
-            className="rounded-md border border-input bg-transparent px-2 py-1 text-xs"
-          >
-            <option value="">default</option>
-            {hosts.map((h) => (
-              <option key={h.id} value={h.id}>
-                {h.name}
-              </option>
-            ))}
-          </select>
-        </label>
+      {showPickerNotice && (
+        <Note tone="neutral" boxed onDismiss={() => setShowPickerNotice(false)}>
+          A pi worker that is already running keeps the catalogue it loaded at startup; the next one to start reads this
+          change. To apply it now, restart bb while no pi turn is in flight —{" "}
+          <code className="rounded-sm bg-card px-1 py-0.5 font-mono text-2xs">systemctl --user restart bb.service</code>{" "}
+          — restarting during a turn interrupts that turn.
+        </Note>
+      )}
+
+      {adding && (
+        <AddProviderForm
+          call={call}
+          busy={busy}
+          runBusy={runBusy}
+          takenIds={takenIds}
+          reservedComplete={reservedComplete}
+          onClose={() => setAdding(false)}
+          onSaved={async () => {
+            armPickerNotice();
+            setAdding(false);
+            await reload();
+          }}
+        />
       )}
 
       <ProviderList
         providers={providers}
-        modelsJsonPath={inventory?.modelsJsonPath ?? ""}
-        reservedComplete={inventory?.reservedComplete ?? false}
+        reservedComplete={reservedComplete}
         busy={busy}
         call={call}
         runBusy={runBusy}
-        openId={detailId}
-        onDetails={(id) => {
-          setAdopting(undefined);
-          setDetailId((previous) => (previous === id ? undefined : id));
+        openId={open?.id}
+        onToggle={(id) => {
+          setAdding(false);
+          setOpen((previous) => (previous?.id === id && previous.mode === "detail" ? undefined : { id, mode: "detail" }));
         }}
         onAdopt={(row) => {
-          setDetailId(undefined);
-          setAdopting(row);
+          setAdding(false);
+          setOpen((previous) =>
+            previous?.id === row.id && previous.mode === "adopt" ? undefined : { id: row.id, mode: "adopt" },
+          );
         }}
         onChanged={reload}
         onWrote={armPickerNotice}
-      />
-
-      {adopting && (
-        <AdoptDialog
-          row={adopting}
-          call={call}
-          busy={busy}
-          runBusy={runBusy}
-          onClose={() => setAdopting(undefined)}
-          onChanged={reload}
-          onWrote={armPickerNotice}
-        />
-      )}
-
-      {detailId && (
-        <ProviderDetail
-          key={detailId}
-          id={detailId}
-          call={call}
-          busy={busy}
-          runBusy={runBusy}
-          onClose={() => setDetailId(undefined)}
-          onChanged={reload}
-          onWrote={armPickerNotice}
-        />
-      )}
-
-      <AddProviderForm
-        call={call}
-        busy={busy}
-        runBusy={runBusy}
-        takenIds={takenIds}
-        reservedComplete={inventory?.reservedComplete ?? false}
-        onSaved={async () => {
-          armPickerNotice();
-          await reload();
-        }}
+        renderPanel={renderPanel}
       />
     </div>
   );

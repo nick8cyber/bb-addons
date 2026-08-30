@@ -1,15 +1,16 @@
 /**
- * The expanded card for one provider: what it is connected to, where its key
- * reference points, which models are written for it, and the destructive
- * actions. The model editor deliberately shows the union of what is saved and
- * what the gateway currently lists, so a model that quietly vanished from the
- * catalogue is visible rather than silently dropped on the next write.
+ * The expanded detail of one provider row: what it is connected to, where its
+ * key reference points, which models are written for it, and the destructive
+ * actions. It renders content only — the row above it carries the name and the
+ * chevron that closes it. The model editor deliberately shows the union of what
+ * is saved and what the gateway currently lists, so a model that quietly
+ * vanished from the catalogue is visible rather than silently dropped on the
+ * next write.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import type {
   ApiKind,
@@ -22,14 +23,28 @@ import {
   EMPTY_KEY_SOURCE,
   KeySourceFields,
   ModelPriceChip,
-  StateBadge,
   apiLabel,
   keySourceOf,
   modelSizeSummary,
   type KeySourceState,
   type RpcCall,
   type RunBusy,
-} from "./AddProviderForm.js";
+} from "./atoms.js";
+import { KeyIcon, SpinnerIcon } from "./icons.js";
+import {
+  ActionBar,
+  Badge,
+  Block,
+  Choice,
+  Field,
+  MetaLine,
+  ModelPicker,
+  Mono,
+  Note,
+  Segmented,
+  Spacer,
+  ToneText,
+} from "./kit.js";
 
 interface EditorRow {
   id: string;
@@ -307,69 +322,65 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
 
   if (loadError) {
     return (
-      <Card className="border-primary">
-        <CardContent className="flex items-start justify-between gap-2 pt-6 text-xs">
-          <span className="text-red-600 dark:text-red-400">{loadError}</span>
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Close
-          </Button>
-        </CardContent>
-      </Card>
+      <div className="space-y-3">
+        <Note tone="danger" boxed>
+          {loadError}
+        </Note>
+        <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
+          Close
+        </Button>
+      </div>
     );
   }
 
   if (!detail || !row) {
     return (
-      <Card className="border-primary">
-        <CardContent className="pt-6 text-xs text-muted-foreground">Loading {id}…</CardContent>
-      </Card>
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <SpinnerIcon /> Loading…
+      </div>
     );
   }
 
+  const canRefresh =
+    row.apiSupported && (row.ownership === "owned" || row.ownership === "adopted" || row.ownership === "orphaned");
+  const canForget = row.ownership === "adopted" || row.ownership === "orphaned";
+  const canDelete = row.ownership === "owned" || row.ownership === "adopted" || row.ownership === "foreign";
+
   return (
-    <Card className="border-primary">
-      <CardContent className="space-y-4 pt-6">
-        <div className="flex flex-wrap items-start justify-between gap-2">
-          <div className="min-w-0">
-            <div className="font-medium">{row.name ?? row.id}</div>
-            <div className="truncate text-xs text-muted-foreground">
-              <code>{row.id}</code> · {apiLabel(row.api)} · {row.modelCount} models ·{" "}
-              {row.inModelsJson ? <StateBadge ok>in models.json</StateBadge> : <StateBadge ok={false}>not in models.json</StateBadge>}
-            </div>
-          </div>
-          <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
-            Close
-          </Button>
-        </div>
+    <div className="space-y-5">
+      {row.drifted && (
+        <Note tone="warn" boxed>
+          Changed outside the plugin since it was last written here. Saving or refreshing overwrites those changes and
+          asks twice.
+        </Note>
+      )}
+      {row.error && (
+        <Note tone="danger" boxed>
+          {row.error}
+        </Note>
+      )}
+      {row.warnings.map((warning) => (
+        <Note key={warning} tone="warn">
+          {warning}
+        </Note>
+      ))}
+      {row.ownership === "foreign" && (
+        <Note tone="warn" boxed>
+          Read-only until adopted. Press Adopt in the row above to edit or test it.
+        </Note>
+      )}
+      {row.ownership === "reserved" && (
+        <Note tone="warn" boxed>
+          This id is reserved by pi and cannot be adopted or edited here.
+        </Note>
+      )}
 
-        {row.drifted && (
-          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
-            This block changed outside the plugin since it was last written here. Saving or refreshing overwrites those
-            changes, and asks for a second press before doing so.
-          </div>
-        )}
-        {row.error && <div className="text-xs text-red-600 dark:text-red-400">{row.error}</div>}
-        {row.warnings.map((warning) => (
-          <div key={warning} className="text-xs text-amber-600 dark:text-amber-400">
-            {warning}
-          </div>
-        ))}
-        {(row.ownership === "foreign" || row.ownership === "reserved") && (
-          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
-            {row.ownership === "foreign"
-              ? "This provider is read-only until it is adopted. Close details and press Adopt in the provider list before testing or editing it."
-              : "This provider id is reserved by pi and cannot be adopted or edited here."}
-          </div>
-        )}
-
-        {/* ---- Connection ------------------------------------------------------ */}
+      <Block title="Connection">
         <div className="grid gap-3 sm:grid-cols-2">
-          <label className="space-y-1">
-            <span className="text-xs text-muted-foreground">Display name</span>
+          <Field label="Display name">
             <Input value={name} disabled={!editable || busy} onChange={(e) => setName(e.target.value)} />
-          </label>
-          <label className="space-y-1">
-            <span className="text-xs text-muted-foreground">Service URL</span>
+          </Field>
+          <Field label="Service URL">
             <Input
               value={baseUrl}
               disabled={!editable || busy || Boolean(row.presetId)}
@@ -378,296 +389,265 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
                 setProbe(undefined);
               }}
             />
-          </label>
-          <div className="sm:col-span-2 space-y-1 rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
-            <div>
-              Protocol: {apiLabel(row.api)}
-              {!row.apiSupported && (
-                <span className="ml-1 text-amber-600 dark:text-amber-400">
-                  — not one this plugin can speak; probe and refresh are unavailable
-                </span>
-              )}
-              . The protocol is never editable: a different one is a different provider.
-            </div>
-            {row.presetId && (
-              <div>
-                Linked preset: <code>{row.presetId}</code> — its URL is fixed by the preset.
-              </div>
-            )}
-            {row.pricingPolicy && <div>Pricing policy: {row.pricingPolicy}</div>}
-            {detail.manifest && (
-              <div>
+          </Field>
+        </div>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md bg-surface-recessed px-3 py-2 text-2xs">
+          <dt className="text-subtle-foreground">Protocol</dt>
+          <dd className="min-w-0 text-foreground">
+            {apiLabel(row.api)} {!row.apiSupported && <ToneText tone="warn">not supported here</ToneText>}
+          </dd>
+          {row.presetId && (
+            <>
+              <dt className="text-subtle-foreground">Preset</dt>
+              <dd className="min-w-0 text-foreground">
+                <Mono>{row.presetId}</Mono> — its URL is fixed by the preset
+              </dd>
+            </>
+          )}
+          {row.pricingPolicy && (
+            <>
+              <dt className="text-subtle-foreground">Pricing</dt>
+              <dd className="min-w-0 text-foreground">{row.pricingPolicy}</dd>
+            </>
+          )}
+          {detail.manifest && (
+            <>
+              <dt className="text-subtle-foreground">Origin</dt>
+              <dd className="min-w-0 text-foreground">
                 {detail.manifest.origin === "adopted" ? "Adopted" : "Created"} here
                 {detail.manifest.adoptedAt ? ` on ${detail.manifest.adoptedAt.slice(0, 10)}` : ""}
                 {detail.manifest.updatedAt ? `, last written ${detail.manifest.updatedAt.slice(0, 10)}` : ""}
-              </div>
-            )}
-            {detail.headerNames.length > 0 && (
-              <div>
-                Custom headers: {detail.headerNames.map((header) => `${header}: «set»`).join(", ")} — carried forward
-                verbatim on every write and never read out.
-              </div>
-            )}
-            {baseUrlChanged && (
-              <div className="text-amber-600 dark:text-amber-400">
-                A changed service URL must be tested before it can be saved.
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* ---- Key reference --------------------------------------------------- */}
-        <div className="space-y-2 rounded-md border border-border p-3">
-          <div className="text-xs">
-            Key reference: <span className="font-mono">{row.keyRefDisplay}</span>{" "}
-            <span className="text-muted-foreground">({row.keyRefKind})</span>
-          </div>
-          {inlineKey && (
-            <div className="text-xs text-muted-foreground">
-              This key lives only in models.json — the plugin has never copied it. It is read live whenever a probe or
-              refresh needs it, and carried forward unchanged on every write.
-            </div>
-          )}
-          {editable && (
-            <>
-              {!migrateKey ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => {
-                    setMigrateKey(true);
-                    setMismatch(undefined);
-                  }}
-                >
-                  {inlineKey ? "Migrate key reference" : "Point at a different key"}
-                </Button>
-              ) : (
-                <>
-                  <KeySourceFields
-                    value={keyForm}
-                    onChange={(patch) => {
-                      setKeyForm((previous) => ({ ...previous, ...patch }));
-                      setMismatch(undefined);
-                    }}
-                    label="Where the key should live from now on — saving rewrites the block to reference it:"
-                  />
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => {
-                      setMigrateKey(false);
-                      setKeyForm(EMPTY_KEY_SOURCE);
-                      setMismatch(undefined);
-                    }}
-                  >
-                    Keep the current reference
-                  </Button>
-                </>
-              )}
+              </dd>
             </>
           )}
-          {mismatch && (
-            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs">
-              {mismatch}
-              <div className="mt-1 text-muted-foreground">Press Save again to rewrite it with the new reference anyway.</div>
-            </div>
+          {detail.headerNames.length > 0 && (
+            <>
+              <dt className="text-subtle-foreground">Headers</dt>
+              <dd className="min-w-0 text-foreground">
+                {detail.headerNames.join(", ")} — carried forward, never read out
+              </dd>
+            </>
           )}
+        </dl>
+        <Note>The protocol is never editable: a different protocol is a different provider.</Note>
+        {baseUrlChanged && <Note tone="warn">A changed service URL must be tested before it can be saved.</Note>}
+      </Block>
+
+      <Block title="Key">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <KeyIcon className="text-muted-foreground" />
+          <Mono className="min-w-0 break-all">{row.keyRefDisplay}</Mono>
+          <Badge>{row.keyRefKind}</Badge>
         </div>
+        {inlineKey && (
+          <Note>
+            Lives only in models.json. The plugin never copies it — it is read live when needed and carried forward on
+            every write.
+          </Note>
+        )}
+        {editable && !migrateKey && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              setMigrateKey(true);
+              setMismatch(undefined);
+            }}
+          >
+            {inlineKey ? "Migrate key" : "Change key"}
+          </Button>
+        )}
+        {editable && migrateKey && (
+          <>
+            <KeySourceFields
+              value={keyForm}
+              onChange={(patch) => {
+                setKeyForm((previous) => ({ ...previous, ...patch }));
+                setMismatch(undefined);
+              }}
+              label="Where the key should live from now on"
+            />
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() => {
+                setMigrateKey(false);
+                setKeyForm(EMPTY_KEY_SOURCE);
+                setMismatch(undefined);
+              }}
+            >
+              Cancel
+            </Button>
+          </>
+        )}
+        {mismatch && (
+          <Note tone="warn" boxed>
+            {mismatch} Press Save again to rewrite it with the new reference.
+          </Note>
+        )}
+      </Block>
 
-        {/* ---- Models ---------------------------------------------------------- */}
-        <div className="space-y-2 rounded-md border border-border p-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-xs font-medium">Models written for this provider</div>
-            <div className="flex gap-2">
-              {editable && row.apiSupported && (
-                <Button variant="secondary" size="sm" disabled={busy || probing} onClick={() => void runProbe()}>
-                  {probing ? "Probing…" : "Test connection"}
-                </Button>
-              )}
-              {editable && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => {
-                    setTouchedModels(true);
-                    setSelectionMode("explicit");
-                    setSelected(new Set(editorRows.filter((model) => model.fresh || model.saved).map((model) => model.id)));
-                  }}
-                >
-                  Select all listed
-                </Button>
-              )}
-              {editable && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => {
-                    setTouchedModels(true);
-                    setSelectionMode("explicit");
-                    setSelected(new Set());
-                  }}
-                >
-                  Clear
-                </Button>
-              )}
-            </div>
-          </div>
-
-          {editable && !requiresExplicitModels && (
-            <label className="flex cursor-pointer items-center gap-2 text-xs">
-              <input
-                type="radio"
-                checked={selectionMode === "all-free"}
-                onChange={() => {
-                  setTouchedModels(true);
-                  setSelectionMode("all-free");
-                }}
-              />
-              Keep every free model the gateway lists
-              <input
-                type="radio"
-                className="ml-4"
-                checked={selectionMode === "explicit"}
-                onChange={() => {
+      <Block
+        title="Models"
+        actions={
+          <>
+            {editable && row.apiSupported && (
+              <Button variant="outline" size="sm" disabled={busy || probing} onClick={() => void runProbe()}>
+                {probing ? (
+                  <>
+                    <SpinnerIcon /> Testing…
+                  </>
+                ) : (
+                  "Test"
+                )}
+              </Button>
+            )}
+            {editable && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={() => {
                   setTouchedModels(true);
                   setSelectionMode("explicit");
+                  setSelected(new Set(editorRows.filter((model) => model.fresh || model.saved).map((model) => model.id)));
                 }}
-              />
-              Only the models ticked below
-            </label>
-          )}
-
-          {probe && !probe.ok && (
-            <div className="text-xs text-red-600 dark:text-red-400">Probe failed: {probe.error}</div>
-          )}
-
-          <div className="max-h-64 space-y-1 overflow-y-auto">
-            {editorRows.map((model) => (
-              <label
-                key={model.id}
-                className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 text-xs hover:bg-accent"
               >
-                <input
-                  type="checkbox"
-                  disabled={!editable || busy || selectionMode === "all-free"}
-                  checked={selected.has(model.id)}
-                  onChange={() => toggleModel(model.id)}
-                />
-                <span className="truncate font-mono">{model.id}</span>
-                {modelSizeSummary(model) && <span className="text-muted-foreground">{modelSizeSummary(model)}</span>}
-                {probedOk && model.saved && !model.fresh && (
-                  <span className="text-amber-600 dark:text-amber-400">saved · delisted</span>
-                )}
-                {model.fresh && !model.saved && <span className="text-emerald-600 dark:text-emerald-400">new in catalogue</span>}
-                <ModelPriceChip free={model.free} priceKnown={model.priceKnown} />
-              </label>
-            ))}
-            {editorRows.length === 0 && (
-              <div className="py-2 text-xs text-muted-foreground">
-                Nothing is written for this provider yet. Test the connection to list what the gateway offers.
-              </div>
+                Select all
+              </Button>
             )}
-          </div>
-
-          {!probedOk && (
-            <div className="text-xs text-muted-foreground">
-              Prices are shown once the connection has been tested — the list above is what models.json holds today.
-            </div>
-          )}
-          {touchedModels && selectionMode === "explicit" && unverifiedSelection && (
-            <div className="text-xs text-amber-600 dark:text-amber-400">
-              Some ticked models are not in a catalogue this plugin has seen; they will be written by id alone.
-            </div>
-          )}
-          {editorRows.some((model) => model.priceKnown === false) && (
-            <div className="text-xs text-muted-foreground">* no published price: not classified as free</div>
-          )}
-        </div>
-
+            {editable && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={() => {
+                  setTouchedModels(true);
+                  setSelectionMode("explicit");
+                  setSelected(new Set());
+                }}
+              >
+                Clear
+              </Button>
+            )}
+          </>
+        }
+      >
         {editable && !requiresExplicitModels && (
-          <label className="flex cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={freeOnly}
-              disabled={busy}
-              onChange={(e) => setFreeOnly(e.target.checked)}
-              className="mt-0.5 size-4"
-            />
-            <span className="text-xs">
-              Free models only (zero-priced)
-              {!freeOnly && (
-                <span className="mt-0.5 block font-medium text-red-600 dark:text-red-400">
-                  Paid models will be offered too — picking one spends real money on this endpoint.
-                </span>
-              )}
-            </span>
-          </label>
+          <Segmented
+            value={selectionMode}
+            options={[
+              { value: "all-free", label: "Every free model" },
+              { value: "explicit", label: "Only ticked" },
+            ]}
+            onChange={(mode) => {
+              setTouchedModels(true);
+              setSelectionMode(mode);
+            }}
+          />
         )}
 
-        <div className="flex flex-wrap items-center gap-2">
+        {probe && !probe.ok && <Note tone="danger">Probe failed: {probe.error}</Note>}
+
+        <ModelPicker
+          rows={editorRows.map((model) => ({
+            id: model.id,
+            size: modelSizeSummary(model),
+            price: <ModelPriceChip free={model.free} priceKnown={model.priceKnown} />,
+            tags:
+              probedOk && model.saved && !model.fresh ? (
+                <Badge tone="warn">delisted</Badge>
+              ) : model.fresh && !model.saved ? (
+                <Badge tone="ok">new</Badge>
+              ) : undefined,
+          }))}
+          selected={selected}
+          onToggle={toggleModel}
+          disabled={!editable || busy || selectionMode === "all-free"}
+          empty="Nothing is written for this provider yet. Test the connection to see what the gateway offers."
+        />
+        <MetaLine items={[`${selected.size} of ${editorRows.length} selected`]} />
+
+        {!probedOk && (
+          <Note>Prices appear once the connection is tested — the list above is what models.json holds today.</Note>
+        )}
+        {touchedModels && selectionMode === "explicit" && unverifiedSelection && (
+          <Note tone="warn">
+            Some ticked models are not in any catalogue this plugin has seen; they will be written by id alone.
+          </Note>
+        )}
+        {editorRows.some((model) => model.priceKnown === false) && (
+          <Note>* no published price: not classified as free</Note>
+        )}
+
+        {editable && !requiresExplicitModels && (
+          <Choice
+            type="checkbox"
+            checked={freeOnly}
+            disabled={busy}
+            onSelect={() => setFreeOnly((previous) => !previous)}
+            title="Free models only (zero-priced)"
+            tone="danger"
+            description={!freeOnly ? "Paid models will be offered too — picking one spends real money." : undefined}
+          />
+        )}
+      </Block>
+
+      {pending === "delete" && (
+        <Note tone="danger">
+          {row.ownership === "foreign"
+            ? "This block is not managed here and may be rewritten by whatever generates it. Press Confirm delete to force it."
+            : "Removes the provider block and everything this plugin remembers about it."}
+        </Note>
+      )}
+      {pending === "disown" && (
+        <Note tone="warn">Leaves the models.json block exactly as it is and only stops managing it here.</Note>
+      )}
+      {pending === "save-drift" && (
+        <Note tone="warn">Saving overwrites the changes made outside the plugin.</Note>
+      )}
+      {pending === "refresh-drift" && (
+        <Note tone="warn">Refreshing overwrites the changes made outside the plugin.</Note>
+      )}
+
+      {(editable || canRefresh || canForget || canDelete) && (
+        <ActionBar>
           {editable && (
             <Button size="sm" disabled={busy || probing} onClick={save}>
               {pending === "save-drift" ? "Overwrite and save" : mismatch ? "Save anyway" : "Save"}
             </Button>
           )}
-          {row.apiSupported && (row.ownership === "owned" || row.ownership === "adopted" || row.ownership === "orphaned") && (
+          {canRefresh && (
             <Button variant="outline" size="sm" disabled={busy} onClick={refresh}>
               {pending === "refresh-drift" ? "Overwrite and refresh" : "Refresh"}
             </Button>
           )}
-          {(pending === "save-drift" || pending === "refresh-drift") && (
+          {pending !== undefined && (
             <Button variant="ghost" size="sm" disabled={busy} onClick={() => setPending(undefined)}>
               Cancel
             </Button>
           )}
-        </div>
-
-        {/* ---- Danger zone ----------------------------------------------------- */}
-        {(row.ownership === "owned" || row.ownership === "adopted" || row.ownership === "orphaned" || row.ownership === "foreign") && (
-          <div className="space-y-2 rounded-md border border-red-500/40 p-3">
-            <div className="text-xs font-medium text-red-600 dark:text-red-400">Danger zone</div>
-            {pending === "delete" && (
-              <div className="text-xs text-red-600 dark:text-red-400">
-                {row.ownership === "foreign"
-                  ? "This block is not managed here. Deleting it may simply be rewritten by whatever generates it — press Confirm delete to force it."
-                  : "The provider block and everything this plugin remembers about it will be removed."}
-              </div>
-            )}
-            {pending === "disown" && (
-              <div className="text-xs text-amber-600 dark:text-amber-400">
-                Forgetting leaves the models.json block exactly as it is and only stops managing it here.
-              </div>
-            )}
-            <div className="flex flex-wrap gap-2">
-              {row.ownership !== "orphaned" && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={busy}
-                  className="text-red-600 dark:text-red-400"
-                  onClick={remove}
-                >
-                  {pending === "delete" ? "Confirm delete" : "Delete"}
-                </Button>
-              )}
-              {(row.ownership === "adopted" || row.ownership === "orphaned") && (
-                <Button variant="outline" size="sm" disabled={busy} onClick={disown}>
-                  {pending === "disown" ? "Confirm forget" : "Forget (keep the block)"}
-                </Button>
-              )}
-              {(pending === "delete" || pending === "disown") && (
-                <Button variant="ghost" size="sm" disabled={busy} onClick={() => setPending(undefined)}>
-                  Cancel
-                </Button>
-              )}
-            </div>
-          </div>
-        )}
-      </CardContent>
-    </Card>
+          <Spacer />
+          {canForget && (
+            <Button variant="ghost" size="sm" disabled={busy} onClick={disown}>
+              {pending === "disown" ? "Confirm forget" : "Forget"}
+            </Button>
+          )}
+          {canDelete && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              className="text-destructive-text hover:text-destructive-text"
+              onClick={remove}
+            >
+              {pending === "delete" ? "Confirm delete" : "Delete"}
+            </Button>
+          )}
+        </ActionBar>
+      )}
+    </div>
   );
 }
