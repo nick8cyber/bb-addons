@@ -136,8 +136,8 @@ export function PiGatewaysSection() {
 
       {!reservedComplete && (
         <Note tone="warn" boxed>
-          pi's own catalogue could not be found, so a name clash cannot be ruled out. Adding and taking over entries
-          stays blocked until it can be checked.
+          pi's own catalogue could not be found, so a name clash cannot be ruled out. Adding a provider stays
+          blocked until it can be checked.
         </Note>
       )}
 

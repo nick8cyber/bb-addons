@@ -130,12 +130,10 @@ function Row({
   const state = rowState(row);
   const facts = `${modelSummary(row)} · ${keySummary(row)}`;
 
-  const badge =
-    row.ownership === "builtin" ? (
-      <QuietBadge>built-in</QuietBadge>
-    ) : row.ownership === "foreign" || row.ownership === "reserved" ? (
-      <QuietBadge>models.json</QuietBadge>
-    ) : null;
+  // "built-in" earns its badge: it tells the user why there is no key to set.
+  // Where an entry came from otherwise is this plugin's bookkeeping, not a fact
+  // the user can act on, so it is not shown.
+  const badge = row.ownership === "builtin" ? <QuietBadge>built-in</QuietBadge> : null;
 
   // The action cannot legally nest inside the row <button>, so the button spans
   // the full row and the action floats above it. The floating layer ignores
