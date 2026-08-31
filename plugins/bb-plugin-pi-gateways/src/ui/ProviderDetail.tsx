@@ -7,9 +7,10 @@
  * vanished from the catalogue is visible rather than silently dropped on the
  * next write.
  *
- * An entry this plugin did not write gets no ceremony: the editor opens on one
- * note and a `Start editing` button that adopts it in place — no key migration,
- * nothing written to models.json — and then re-renders as the normal form.
+ * An entry this plugin did not write gets no ceremony at all: opening the editor
+ * takes it over in place — no key migration, nothing written to models.json —
+ * and the user never sees the word for it. Whether bb keeps its own record of an
+ * entry is bookkeeping, and bookkeeping is not a decision to put on screen.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -94,11 +95,21 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
   // Destructive actions and drift overwrites confirm on a second press of the same
   // button rather than through window.confirm: a native dialog is suppressed in some
   // host contexts, where the click then silently does nothing, and it cannot be styled.
-  const [pending, setPending] = useState<"delete" | "disown" | "save-drift" | "refresh-drift" | undefined>(undefined);
+  const [pending, setPending] = useState<"delete" | "save-drift" | "refresh-drift" | undefined>(undefined);
 
   const load = useCallback(async () => {
     try {
-      const result = await call<ProviderDetailOutput>("providerDetail", { id });
+      let result = await call<ProviderDetailOutput>("providerDetail", { id });
+      // An entry this plugin did not write is taken over here rather than through
+      // a ceremony the user has to learn: opening the editor is the intent to
+      // edit it. Adoption itself writes nothing to models.json — only Save does —
+      // so onWrote() stays unarmed and there is nothing to confirm.
+      if (result.row.ownership === "foreign") {
+        const adopted = await call<AdoptOutput>("adopt", { id });
+        for (const warning of adopted.warnings ?? []) toast.warning(warning);
+        await onChanged();
+        result = await call<ProviderDetailOutput>("providerDetail", { id });
+      }
       setDetail(result);
       setLoadError(undefined);
       setName(result.row.name ?? result.row.id);
@@ -115,7 +126,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : String(error));
     }
-  }, [call, id]);
+  }, [call, id, onChanged]);
 
   useEffect(() => {
     void load();
@@ -310,34 +321,6 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
     });
   };
 
-  const disown = () => {
-    if (!row) return;
-    if (pending !== "disown") {
-      setPending("disown");
-      return;
-    }
-    setPending(undefined);
-    void runBusy(async () => {
-      await call("disown", { id: row.id });
-      toast.success(`${row.id} is no longer managed here — models.json is untouched`);
-      await onChanged();
-      onClose();
-    });
-  };
-
-  // Adoption without a key migration writes nothing to models.json, so the
-  // picker-restart notice (onWrote) is deliberately not armed here.
-  const startEditing = () => {
-    if (!row) return;
-    return runBusy(async () => {
-      const result = await call<AdoptOutput>("adopt", { id: row.id });
-      for (const warning of result.warnings) toast.warning(warning);
-      toast.success(`${row.id} is now managed here`);
-      await onChanged();
-      await load();
-    });
-  };
-
   if (loadError) {
     return (
       <div className="space-y-3">
@@ -367,28 +350,8 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
     );
   }
 
-  if (row.ownership === "foreign") {
-    return (
-      <div className="space-y-4">
-        <Note tone="accent" boxed>
-          bb will manage this entry from now on. Its models and key stay exactly as they are, and Stop managing
-          undoes it.
-        </Note>
-        <ActionBar>
-          <Button size="sm" disabled={busy} onClick={() => void startEditing()}>
-            Start editing
-          </Button>
-          <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
-            Cancel
-          </Button>
-        </ActionBar>
-      </div>
-    );
-  }
-
   const canRefresh =
     row.apiSupported && (row.ownership === "owned" || row.ownership === "adopted" || row.ownership === "orphaned");
-  const canForget = row.ownership === "adopted" || row.ownership === "orphaned";
   // Widened: the foreign early return above narrows the type, but the delete
   // guard keeps its foreign branch verbatim in case that reachability changes.
   const ownership = row.ownership as Ownership;
@@ -468,18 +431,8 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
             <Input value={apiLabel(row.api)} disabled readOnly />
           </Field>
         )}
-        {(detail.manifest || detail.headerNames.length > 0) && (
+        {detail.headerNames.length > 0 && (
           <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md bg-surface-recessed px-3 py-2 text-2xs">
-            {detail.manifest && (
-              <>
-                <dt className="text-subtle-foreground">Managed since</dt>
-                <dd className="min-w-0 text-foreground">
-                  {detail.manifest.adoptedAt ? `${detail.manifest.adoptedAt.slice(0, 10)} · ` : ""}
-                  {detail.manifest.origin === "adopted" ? "already existed" : "created here"}
-                  {detail.manifest.updatedAt ? `, last written ${detail.manifest.updatedAt.slice(0, 10)}` : ""}
-                </dd>
-              </>
-            )}
             {detail.headerNames.length > 0 && (
               <>
                 <dt className="text-subtle-foreground">Headers</dt>
@@ -516,7 +469,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
             </div>
           </Note>
         )}
-        {editable && !migrateKey && (
+        {editable && !migrateKey && row.keyRefKind !== "literal" && (
           <Button
             variant="outline"
             size="sm"
@@ -682,13 +635,8 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
 
       {pending === "delete" && (
         <Note tone="danger">
-          {ownership === "foreign"
-            ? "This entry is not managed here, so whatever wrote it may write it back. Press Confirm delete to remove it anyway."
-            : "Deletes the entry from models.json, and everything this panel remembers about it."}
+          Deletes the entry from models.json. pi stops offering these models, and this cannot be undone.
         </Note>
-      )}
-      {pending === "disown" && (
-        <Note tone="warn">models.json is left exactly as it is. Only this panel stops controlling the entry.</Note>
       )}
       {pending === "save-drift" && (
         <Note tone="warn">Saving overwrites the edits made outside bb.</Note>
@@ -697,7 +645,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
         <Note tone="warn">Refreshing overwrites the edits made outside bb.</Note>
       )}
 
-      {(editable || canForget || canDelete) && (
+      {(editable || canDelete) && (
         <ActionBar>
           {editable && (
             <Button size="sm" disabled={busy || probing} onClick={save}>
@@ -710,11 +658,6 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
             </Button>
           )}
           <Spacer />
-          {canForget && (
-            <Button variant="ghost" size="sm" disabled={busy} onClick={disown}>
-              {pending === "disown" ? "Confirm" : "Stop managing"}
-            </Button>
-          )}
           {canDelete && (
             <Button
               variant="ghost"

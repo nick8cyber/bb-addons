@@ -10,7 +10,7 @@
 import type { ReactNode } from "react";
 
 import { Input } from "@/components/ui/input";
-import type { ApiKind, EditableKeySource, Ownership, ProviderRow } from "../contract.js";
+import type { ApiKind, EditableKeySource, ProviderRow } from "../contract.js";
 import { Field, Mono, Note, Segmented, ToneText, type Tone } from "./kit.js";
 
 /** Every RPC in this section goes through the shell so the host picker applies uniformly. */
@@ -107,15 +107,6 @@ export function providerTone(row: ProviderRow): Tone {
   if (!row.inModelsJson) return "neutral";
   return "ok";
 }
-
-export const OWNERSHIP_LABEL: Record<Ownership, string> = {
-  builtin: "built-in",
-  owned: "managed here",
-  adopted: "managed here",
-  foreign: "not managed here",
-  orphaned: "missing from models.json",
-  reserved: "reserved by pi",
-};
 
 /* -- key sources ----------------------------------------------------------- */
 
