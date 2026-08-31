@@ -1,12 +1,12 @@
 /**
  * The "Pi Gateways" settings section. It owns only the frame: which machine to
- * talk to, the one call that loads the provider inventory, and which panel is
+ * talk to, the one call that loads the provider inventory, and which row is
  * currently open. Everything with an opinion about providers lives in src/ui.
  *
- * Layout-wise the frame is deliberately thin — a summary bar, any standing
- * notice, then the list. Adding opens a panel above the list; inspecting and
- * adopting open inside the row they belong to, so the page never asks the user
- * to look somewhere else to find out what they just clicked.
+ * Layout-wise the frame is deliberately thin — a header row, any standing
+ * notice, then the list and one quiet footer line. Adding opens above the
+ * list; editing opens inside the row it belongs to, so the page never asks the
+ * user to look somewhere else to find out what they just clicked.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -14,26 +14,20 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import type { ListProvidersOutput, ProviderRow } from "./contract.js";
 import { AddProviderForm } from "./ui/AddProviderForm.js";
-import { AdoptDialog } from "./ui/AdoptDialog.js";
 import { ProviderDetail } from "./ui/ProviderDetail.js";
 import { ProviderList } from "./ui/ProviderList.js";
 import type { RpcCall } from "./ui/atoms.js";
-import { PlusIcon, RefreshIcon } from "./ui/icons.js";
-import { MetaLine, Mono, Note, Select } from "./ui/kit.js";
+import { PlusIcon } from "./ui/icons.js";
+import { Mono, Note, Select } from "./ui/kit.js";
 import { rpc } from "../lib/rpc.js";
 import { formatHomePathForDisplay } from "../lib/utils.js";
-
-/** Which row is expanded, and what it is showing. */
-interface OpenPanel {
-  id: string;
-  mode: "detail" | "adopt";
-}
 
 export function PiGatewaysSection() {
   const [hosts, setHosts] = useState<Array<{ id: string; name: string }>>([]);
   const [host, setHost] = useState<string | undefined>(undefined);
   const [inventory, setInventory] = useState<ListProvidersOutput | undefined>(undefined);
-  const [open, setOpen] = useState<OpenPanel | undefined>(undefined);
+  /** The id of the row whose editor is expanded, if any. */
+  const [open, setOpen] = useState<string | undefined>(undefined);
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [showPickerNotice, setShowPickerNotice] = useState(false);
@@ -84,34 +78,9 @@ export function PiGatewaysSection() {
   const armPickerNotice = useCallback(() => setShowPickerNotice(true), []);
   const modelsJsonPath = inventory?.modelsJsonPath ?? "";
 
-  const refreshBuiltins = () =>
-    runBusy(async () => {
-      await call("refresh");
-      armPickerNotice();
-      toast.success("built-in gateways refreshed");
-      await reload();
-    });
-
-  /**
-   * The expanded half of a row. Adoption and inspection are the same gesture as
-   * far as the list is concerned, so the shell decides which one a row shows and
-   * the list only makes room for it.
-   */
+  /** The expanded half of a row: always the editor, which also handles take-over. */
   const renderPanel = (row: ProviderRow) => {
-    if (open?.id !== row.id) return null;
-    if (open.mode === "adopt") {
-      return (
-        <AdoptDialog
-          row={row}
-          call={call}
-          busy={busy}
-          runBusy={runBusy}
-          onClose={() => setOpen(undefined)}
-          onChanged={reload}
-          onWrote={armPickerNotice}
-        />
-      );
-    }
+    if (open !== row.id) return null;
     return (
       <ProviderDetail
         key={row.id}
@@ -128,18 +97,8 @@ export function PiGatewaysSection() {
 
   return (
     <div className="space-y-4 text-sm">
-      <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-3">
-        <div className="min-w-0">
-          <MetaLine
-            items={[
-              `${providers.length} ${providers.length === 1 ? "provider" : "providers"}`,
-              `${modelTotal} ${modelTotal === 1 ? "model" : "models"}`,
-            ]}
-          />
-          <div className="mt-0.5 min-w-0 truncate" title={modelsJsonPath}>
-            <Mono className="text-subtle-foreground">{formatHomePathForDisplay(modelsJsonPath)}</Mono>
-          </div>
-        </div>
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+        <h4 className="text-xs font-semibold text-foreground">Providers</h4>
 
         <div className="flex shrink-0 flex-wrap items-center gap-2">
           {hosts.length > 1 && (
@@ -161,10 +120,6 @@ export function PiGatewaysSection() {
               ))}
             </Select>
           )}
-          <Button variant="outline" size="sm" disabled={busy} onClick={() => void refreshBuiltins()}>
-            <RefreshIcon />
-            Refresh built-ins
-          </Button>
           <Button
             size="sm"
             disabled={busy || !reservedComplete}
@@ -196,19 +151,21 @@ export function PiGatewaysSection() {
       )}
 
       {adding && (
-        <AddProviderForm
-          call={call}
-          busy={busy}
-          runBusy={runBusy}
-          takenIds={takenIds}
-          reservedComplete={reservedComplete}
-          onClose={() => setAdding(false)}
-          onSaved={async () => {
-            armPickerNotice();
-            setAdding(false);
-            await reload();
-          }}
-        />
+        <div className="rounded-md border border-border bg-card px-3 py-3">
+          <AddProviderForm
+            call={call}
+            busy={busy}
+            runBusy={runBusy}
+            takenIds={takenIds}
+            reservedComplete={reservedComplete}
+            onClose={() => setAdding(false)}
+            onSaved={async () => {
+              armPickerNotice();
+              setAdding(false);
+              await reload();
+            }}
+          />
+        </div>
       )}
 
       <ProviderList
@@ -217,21 +174,25 @@ export function PiGatewaysSection() {
         busy={busy}
         call={call}
         runBusy={runBusy}
-        openId={open?.id}
+        openId={open}
         onToggle={(id) => {
           setAdding(false);
-          setOpen((previous) => (previous?.id === id && previous.mode === "detail" ? undefined : { id, mode: "detail" }));
-        }}
-        onAdopt={(row) => {
-          setAdding(false);
-          setOpen((previous) =>
-            previous?.id === row.id && previous.mode === "adopt" ? undefined : { id: row.id, mode: "adopt" },
-          );
+          setOpen((previous) => (previous === id ? undefined : id));
         }}
         onChanged={reload}
         onWrote={armPickerNotice}
         renderPanel={renderPanel}
       />
+
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-2xs text-subtle-foreground">
+        <span>
+          {providers.length} {providers.length === 1 ? "provider" : "providers"} · {modelTotal}{" "}
+          {modelTotal === 1 ? "model" : "models"}
+        </span>
+        <span className="min-w-0 truncate" title={modelsJsonPath}>
+          <Mono>{formatHomePathForDisplay(modelsJsonPath)}</Mono>
+        </span>
+      </div>
     </div>
   );
 }

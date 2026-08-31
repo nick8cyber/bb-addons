@@ -15,7 +15,7 @@
  *
  * Nothing here knows anything about providers; the domain lives in atoms.tsx.
  */
-import type { ComponentProps, ReactNode } from "react";
+import { useState, type ComponentProps, type ReactNode } from "react";
 
 import { cn } from "../../lib/utils";
 import { AlertIcon, CheckIcon, ChevronDownIcon, CloseIcon, InfoIcon } from "./icons.js";
@@ -305,20 +305,88 @@ export function EmptyState({ className, children }: { className?: string; childr
   );
 }
 
+/**
+ * Metadata, not health: bb's SettingsBadge shape, deliberately quieter than
+ * `Badge`. Origin ("built-in", "models.json") is metadata; a failing endpoint is
+ * not, and must stay a toned `Badge` or a `Dot`.
+ */
+export function QuietBadge({ className, children }: { className?: string; children: ReactNode }) {
+  return (
+    <span
+      className={cn(
+        "shrink-0 rounded-sm border border-border bg-muted/40 px-1.5 py-0.5 text-2xs leading-none whitespace-nowrap text-subtle-foreground",
+        className,
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+/**
+ * The collapsed region for the fields a user almost never touches. Same
+ * geometry as bb's own DetailsDisclosure, so an "Advanced" block here looks like
+ * one anywhere else in the app.
+ */
+export function DetailsDisclosure({
+  summary,
+  defaultExpanded = false,
+  className,
+  children,
+}: {
+  summary: ReactNode;
+  defaultExpanded?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultExpanded);
+  return (
+    <div className={cn("overflow-hidden rounded-lg border border-border-seam text-xs", className)}>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((previous) => !previous)}
+        className="flex w-full cursor-pointer items-center justify-between gap-2 bg-muted/40 px-3 py-2 text-left text-muted-foreground transition-colors duration-150 hover:text-foreground hover:duration-0"
+      >
+        <span className="min-w-0 truncate">{summary}</span>
+        <ChevronDownIcon className={cn("size-3.5 shrink-0 transition-transform duration-150", open && "rotate-180")} />
+      </button>
+      {open && <div className="space-y-3 border-t border-border-seam px-3 py-2.5">{children}</div>}
+    </div>
+  );
+}
+
 /* -- form controls --------------------------------------------------------- */
 
 /** Label above, control below, optional hint under it. The only field shape. */
 export function Field({
   label,
   hint,
+  layout = "above",
   className,
   children,
 }: {
   label: ReactNode;
   hint?: ReactNode;
+  /**
+   * bb's settings idiom is label beside control, collapsing to stacked on a
+   * narrow screen; stacked is reserved for wide inputs that need the full row.
+   */
+  layout?: "above" | "beside";
   className?: string;
   children: ReactNode;
 }) {
+  if (layout === "beside") {
+    return (
+      <label className={cn("flex min-w-0 flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between sm:gap-5", className)}>
+        <span className="min-w-0">
+          <span className="block text-sm font-normal text-foreground">{label}</span>
+          {hint && <span className="mt-0.5 block text-xs leading-snug text-subtle-foreground/75">{hint}</span>}
+        </span>
+        <span className="min-w-0 shrink-0 sm:w-64">{children}</span>
+      </label>
+    );
+  }
   return (
     <label className={cn("flex min-w-0 flex-col gap-1.5", className)}>
       <span className="text-xs font-medium text-foreground">{label}</span>
