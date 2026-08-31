@@ -6,6 +6,10 @@
  * is saved and what the gateway currently lists, so a model that quietly
  * vanished from the catalogue is visible rather than silently dropped on the
  * next write.
+ *
+ * An entry this plugin did not write gets no ceremony: the editor opens on one
+ * note and a `Start editing` button that adopts it in place — no key migration,
+ * nothing written to models.json — and then re-renders as the normal form.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -13,7 +17,9 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type {
+  AdoptOutput,
   ApiKind,
+  Ownership,
   ProbeOutput,
   ProviderDetailOutput,
   RefreshCustomOutput,
@@ -24,10 +30,8 @@ import {
   KeySourceFields,
   ModelPriceChip,
   apiLabel,
-  keyKindLabel,
   keySourceOf,
   modelSizeSummary,
-  pricingLabel,
   type KeySourceState,
   type RpcCall,
   type RunBusy,
@@ -38,6 +42,7 @@ import {
   Badge,
   Block,
   Choice,
+  DetailsDisclosure,
   Field,
   MetaLine,
   ModelPicker,
@@ -45,7 +50,6 @@ import {
   Note,
   Segmented,
   Spacer,
-  ToneText,
 } from "./kit.js";
 
 interface EditorRow {
@@ -119,7 +123,6 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
 
   const row = detail?.row;
   const editable = row?.ownership === "owned" || row?.ownership === "adopted" || row?.ownership === "orphaned";
-  const inlineKey = detail?.manifest?.keySource.type === "inline";
   const requiresExplicitModels = row?.requiresExplicitModels ?? true;
   const keySource = keySourceOf(keyForm);
   const baseUrlChanged = Boolean(row) && baseUrl.trim() !== (row?.baseUrl ?? "");
@@ -322,6 +325,19 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
     });
   };
 
+  // Adoption without a key migration writes nothing to models.json, so the
+  // picker-restart notice (onWrote) is deliberately not armed here.
+  const startEditing = () => {
+    if (!row) return;
+    return runBusy(async () => {
+      const result = await call<AdoptOutput>("adopt", { id: row.id });
+      for (const warning of result.warnings) toast.warning(warning);
+      toast.success(`${row.id} is now managed here`);
+      await onChanged();
+      await load();
+    });
+  };
+
   if (loadError) {
     return (
       <div className="space-y-3">
@@ -343,10 +359,62 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
     );
   }
 
+  if (row.ownership === "reserved") {
+    return (
+      <Note tone="warn" boxed>
+        pi reserves this name for itself. It cannot be edited here.
+      </Note>
+    );
+  }
+
+  if (row.ownership === "foreign") {
+    return (
+      <div className="space-y-4">
+        <Note tone="accent" boxed>
+          bb will manage this entry from now on. Its models and key stay exactly as they are, and Stop managing
+          undoes it.
+        </Note>
+        <ActionBar>
+          <Button size="sm" disabled={busy} onClick={() => void startEditing()}>
+            Start editing
+          </Button>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>
+            Cancel
+          </Button>
+        </ActionBar>
+      </div>
+    );
+  }
+
   const canRefresh =
     row.apiSupported && (row.ownership === "owned" || row.ownership === "adopted" || row.ownership === "orphaned");
   const canForget = row.ownership === "adopted" || row.ownership === "orphaned";
-  const canDelete = row.ownership === "owned" || row.ownership === "adopted" || row.ownership === "foreign";
+  // Widened: the foreign early return above narrows the type, but the delete
+  // guard keeps its foreign branch verbatim in case that reachability changes.
+  const ownership = row.ownership as Ownership;
+  const canDelete = ownership === "owned" || ownership === "adopted" || ownership === "foreign";
+
+  const keyStateLine = (() => {
+    switch (row.keyRefKind) {
+      case "literal":
+        return <>Written in models.json</>;
+      case "none":
+        return <>No key</>;
+      case "env":
+      case "env-template":
+        return (
+          <>
+            Read from <Mono>{row.keyRefDisplay}</Mono> — never stored by bb
+          </>
+        );
+      case "command":
+        return detail.manifest?.keySource.type === "file" ? (
+          <>Read from a file — never stored by bb</>
+        ) : (
+          <>Read from a command — never stored by bb</>
+        );
+    }
+  })();
 
   return (
     <div className="space-y-5">
@@ -366,85 +434,86 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
           {warning}
         </Note>
       ))}
-      {row.ownership === "foreign" && (
+      {row.ownership === "orphaned" && (
         <Note tone="warn" boxed>
-          Read-only. Press "Manage here" in the row above to edit or test it.
-        </Note>
-      )}
-      {row.ownership === "reserved" && (
-        <Note tone="warn" boxed>
-          pi reserves this name for itself. It cannot be edited here.
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span>Missing from models.json.</span>
+            <Button variant="outline" size="sm" disabled={busy} onClick={refresh}>
+              {pending === "refresh-drift" ? "Overwrite and refresh" : "Write it back"}
+            </Button>
+          </div>
         </Note>
       )}
 
-      <Block title="Connection">
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Display name">
-            <Input value={name} disabled={!editable || busy} onChange={(e) => setName(e.target.value)} />
+      <Block title="Connection" className="max-w-2xl">
+        <Field layout="beside" label="Display name">
+          <Input value={name} disabled={!editable || busy} onChange={(e) => setName(e.target.value)} />
+        </Field>
+        <Field
+          layout="beside"
+          label="Service URL"
+          hint={row.presetId ? "Fixed by the service you picked" : undefined}
+        >
+          <Input
+            value={baseUrl}
+            disabled={!editable || busy || Boolean(row.presetId)}
+            onChange={(e) => {
+              setBaseUrl(e.target.value);
+              setProbe(undefined);
+            }}
+          />
+        </Field>
+        {!row.presetId && (
+          <Field layout="beside" label="API format">
+            <Input value={apiLabel(row.api)} disabled readOnly />
           </Field>
-          <Field label="Service URL">
-            <Input
-              value={baseUrl}
-              disabled={!editable || busy || Boolean(row.presetId)}
-              onChange={(e) => {
-                setBaseUrl(e.target.value);
-                setProbe(undefined);
-              }}
-            />
-          </Field>
-        </div>
-        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md bg-surface-recessed px-3 py-2 text-2xs">
-          <dt className="text-subtle-foreground">Protocol</dt>
-          <dd className="min-w-0 text-foreground">
-            {apiLabel(row.api)} {!row.apiSupported && <ToneText tone="warn">not supported here</ToneText>}
-          </dd>
-          {row.presetId && (
-            <>
-              <dt className="text-subtle-foreground">Preset</dt>
-              <dd className="min-w-0 text-foreground">
-                <Mono>{row.presetId}</Mono> — the preset fixes its URL
-              </dd>
-            </>
-          )}
-          {row.pricingPolicy && (
-            <>
-              <dt className="text-subtle-foreground">Pricing</dt>
-              <dd className="min-w-0 text-foreground">{pricingLabel(row.pricingPolicy)}</dd>
-            </>
-          )}
-          {detail.manifest && (
-            <>
-              <dt className="text-subtle-foreground">Managed since</dt>
-              <dd className="min-w-0 text-foreground">
-                {detail.manifest.adoptedAt ? `${detail.manifest.adoptedAt.slice(0, 10)} · ` : ""}
-                {detail.manifest.origin === "adopted" ? "already existed" : "created here"}
-                {detail.manifest.updatedAt ? `, last written ${detail.manifest.updatedAt.slice(0, 10)}` : ""}
-              </dd>
-            </>
-          )}
-          {detail.headerNames.length > 0 && (
-            <>
-              <dt className="text-subtle-foreground">Headers</dt>
-              <dd className="min-w-0 text-foreground">
-                {detail.headerNames.join(", ")} — kept as they are, never shown
-              </dd>
-            </>
-          )}
-        </dl>
-        <Note>The protocol cannot be changed — a different protocol is a different provider.</Note>
+        )}
+        {(detail.manifest || detail.headerNames.length > 0) && (
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md bg-surface-recessed px-3 py-2 text-2xs">
+            {detail.manifest && (
+              <>
+                <dt className="text-subtle-foreground">Managed since</dt>
+                <dd className="min-w-0 text-foreground">
+                  {detail.manifest.adoptedAt ? `${detail.manifest.adoptedAt.slice(0, 10)} · ` : ""}
+                  {detail.manifest.origin === "adopted" ? "already existed" : "created here"}
+                  {detail.manifest.updatedAt ? `, last written ${detail.manifest.updatedAt.slice(0, 10)}` : ""}
+                </dd>
+              </>
+            )}
+            {detail.headerNames.length > 0 && (
+              <>
+                <dt className="text-subtle-foreground">Headers</dt>
+                <dd className="min-w-0 text-foreground">
+                  {detail.headerNames.join(", ")} — kept as they are, never shown
+                </dd>
+              </>
+            )}
+          </dl>
+        )}
         {baseUrlChanged && <Note tone="warn">A changed service URL must be tested before it can be saved.</Note>}
       </Block>
 
-      <Block title="Key">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
+      <Block title="API key">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-foreground">
           <KeyIcon className="text-muted-foreground" />
-          <Mono className="min-w-0 break-all">{row.keyRefDisplay}</Mono>
-          <Badge>{keyKindLabel(row.keyRefKind)}</Badge>
+          <span className="min-w-0">{keyStateLine}</span>
         </div>
-        {inlineKey && (
+        {row.keyRefKind === "literal" && editable && !migrateKey && (
           <Note>
-            The key itself sits in models.json. It is never copied out — it is read when needed and written back
-            unchanged.
+            <div className="flex flex-wrap items-center gap-2">
+              <span>This key is written in models.json. Replace it with a reference?</span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                onClick={() => {
+                  setMigrateKey(true);
+                  setMismatch(undefined);
+                }}
+              >
+                Replace
+              </Button>
+            </div>
           </Note>
         )}
         {editable && !migrateKey && (
@@ -457,7 +526,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
               setMismatch(undefined);
             }}
           >
-            {inlineKey ? "Move the key out of models.json" : "Point at a different key"}
+            Change
           </Button>
         )}
         {editable && migrateKey && (
@@ -506,6 +575,11 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
                 )}
               </Button>
             )}
+            {canRefresh && (
+              <Button variant="outline" size="sm" disabled={busy} onClick={refresh}>
+                {pending === "refresh-drift" ? "Overwrite and refresh" : "Refresh models"}
+              </Button>
+            )}
             {editable && (
               <Button
                 variant="ghost"
@@ -551,7 +625,16 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
           />
         )}
 
-        {probe && !probe.ok && <Note tone="danger">Probe failed: {probe.error}</Note>}
+        {probe && !probe.ok && (
+          <>
+            <Note tone="danger">Probe failed: {probe.error?.split("\n")[0] ?? "unknown error"}</Note>
+            {probe.error && (
+              <DetailsDisclosure summary="Show details">
+                <Mono className="break-all text-foreground">{probe.error}</Mono>
+              </DetailsDisclosure>
+            )}
+          </>
+        )}
 
         <ModelPicker
           rows={editorRows.map((model) => ({
@@ -599,7 +682,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
 
       {pending === "delete" && (
         <Note tone="danger">
-          {row.ownership === "foreign"
+          {ownership === "foreign"
             ? "This entry is not managed here, so whatever wrote it may write it back. Press Confirm delete to remove it anyway."
             : "Deletes the entry from models.json, and everything this panel remembers about it."}
         </Note>
@@ -614,16 +697,11 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
         <Note tone="warn">Refreshing overwrites the edits made outside bb.</Note>
       )}
 
-      {(editable || canRefresh || canForget || canDelete) && (
+      {(editable || canForget || canDelete) && (
         <ActionBar>
           {editable && (
             <Button size="sm" disabled={busy || probing} onClick={save}>
               {pending === "save-drift" ? "Overwrite and save" : mismatch ? "Save anyway" : "Save"}
-            </Button>
-          )}
-          {canRefresh && (
-            <Button variant="outline" size="sm" disabled={busy} onClick={refresh}>
-              {pending === "refresh-drift" ? "Overwrite and refresh" : "Refresh"}
             </Button>
           )}
           {pending !== undefined && (
@@ -642,7 +720,7 @@ export function ProviderDetail({ id, call, busy, runBusy, onClose, onChanged, on
               variant="ghost"
               size="sm"
               disabled={busy}
-              className="text-destructive-text hover:text-destructive-text"
+              className="text-destructive-text hover:bg-surface-destructive"
               onClick={remove}
             >
               {pending === "delete" ? "Confirm delete" : "Delete"}
