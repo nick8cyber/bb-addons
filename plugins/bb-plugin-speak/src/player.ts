@@ -29,6 +29,7 @@ import {
   type SynthesisErrorCode,
   type SynthesizeOutput,
 } from "./contract.js";
+import { chunkForSynthesis } from "./chunk.js";
 import { detectLanguage, toSpeakable } from "./speakable.js";
 
 /** Which engine produced the sound. */
@@ -735,12 +736,13 @@ function setSpeed(speed: number): void {
 }
 
 /**
- * Parallel pipelining: chunks are pre-fetched up to 3 in parallel ahead of playback.
- * This guarantees continuous, gapless audio even at 1.5x / 2.0x speeds.
+ * Parallel pipelining: chunks are pre-fetched immediately in parallel.
+ * As soon as the user clicks, chunks 0, 1, 2, 3... are sent concurrently.
  */
 async function streamChunks(
   mine: number,
   text: string,
+  totalChunks: number,
   prefs: Prefs,
 ): Promise<boolean | null> {
   const chunkRequests = new Map<number, Promise<ChunkRequestResult>>();
@@ -754,18 +756,19 @@ async function streamChunks(
     return req;
   }
 
-  // Pre-trigger chunk 0 immediately
-  getOrFetch(0);
+  // Pre-fetch all initial chunks concurrently right at start (T=0)
+  for (let i = 0; i < Math.min(totalChunks, 5); i += 1) {
+    getOrFetch(i);
+  }
 
   let index = 0;
   let heard = false;
-  let totalChunks: number | null = null;
 
   for (;;) {
     setState({
       stage: index === 0 && !heard ? "generating" : "playing",
       chunkIndex: index,
-      chunkCount: totalChunks ?? Math.max(index + 1, state.chunkCount),
+      chunkCount: totalChunks,
     });
 
     const result = await getOrFetch(index);
@@ -792,8 +795,8 @@ async function streamChunks(
 
     totalChunks = output.chunkCount;
 
-    // Parallel prefetching: trigger next 3 chunks concurrently in background
-    for (let ahead = index + 1; ahead < Math.min(totalChunks, index + 4); ahead += 1) {
+    // Immediately launch parallel pre-fetch for all remaining chunks in the message!
+    for (let ahead = index + 1; ahead < Math.min(totalChunks, index + 6); ahead += 1) {
       getOrFetch(ahead);
     }
 
@@ -822,6 +825,9 @@ async function speak(args: { messageId: string; text: string }): Promise<void> {
     return;
   }
 
+  const pieces = chunkForSynthesis(text);
+  if (pieces.length === 0) return;
+
   // The ordering below is the whole reason two voices cannot end up in the
   // room together: silence what is playing FIRST, and only then decide
   // whether this click was a toggle. Deciding first and stopping second
@@ -838,14 +844,14 @@ async function speak(args: { messageId: string; text: string }): Promise<void> {
     messageId: args.messageId,
     stage: "generating",
     chunkIndex: 0,
-    chunkCount: 1,
+    chunkCount: pieces.length,
     speed: currentSpeed,
   });
 
   const prefs = await loadPrefs();
   if (mine !== generation) return;
 
-  const heard = await streamChunks(mine, text, prefs);
+  const heard = await streamChunks(mine, text, pieces.length, prefs);
   if (heard === null || mine !== generation) return;
   setState({ speaking: false, messageId: null, stage: "idle" });
   if (!heard) {
