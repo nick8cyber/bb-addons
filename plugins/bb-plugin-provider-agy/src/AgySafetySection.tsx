@@ -74,7 +74,9 @@ function Step({ n, title, children }: { n: number; title: string; children: Reac
       </span>
       <div className="min-w-0 flex-1 space-y-1">
         <div className="font-medium text-foreground">{title}</div>
-        <div className="text-muted-foreground">{children}</div>
+        {/* A step may take several paragraphs; they need to read as separate
+            thoughts rather than one run-on block. */}
+        <div className="space-y-1.5 text-muted-foreground">{children}</div>
       </div>
     </li>
   );
@@ -98,11 +100,21 @@ export function AgySafetySection() {
             Run <Cmd>agy</Cmd> once. There is no login subcommand: the first
             run opens a browser, and over SSH it prints a URL and takes the
             code you paste back. It needs a Google account with Antigravity
-            access, and the credential is kept by the machine's keyring — bb
-            never sees it. For a headless host, agy also accepts{" "}
-            <Cmd>GEMINI_API_KEY</Cmd> with{" "}
+            access.
+          </p>
+          <p>
+            The credential stays on that machine — bb never handles it. agy
+            keeps it in the OS keyring where one is reachable, and falls back
+            to a file where one is not:{" "}
+            <Cmd>~/.gemini/antigravity-cli/antigravity-oauth-token</Cmd>, mode
+            600. A headless Linux host gets the file, so treat that path as a
+            credential when you back the machine up.
+          </p>
+          <p>
+            A host with no browser at all can skip the account: set{" "}
             <Cmd>"modelProvider": "gemini"</Cmd> in{" "}
-            <Cmd>~/.gemini/antigravity-cli/settings.json</Cmd>.
+            <Cmd>~/.gemini/antigravity-cli/settings.json</Cmd> and export{" "}
+            <Cmd>GEMINI_API_KEY</Cmd> to use the Gemini API directly.
           </p>
         </Step>
         <Step n={3} title="Check it took">
