@@ -60,3 +60,26 @@ export function planModels(
 export function isQuotaFailure(code: string): boolean {
   return code === "rate_limited";
 }
+
+/** A burst that Google gave no delay for; long enough to outlast a minute window. */
+const BURST_COOLDOWN_MS = 90_000;
+
+/**
+ * How long to stop offering a model that just returned 429.
+ *
+ * The daily allowance and the per-minute one arrive as the same status, and
+ * the player fires several chunks at once, which is exactly what trips the
+ * minute. So only a 429 that names the *day* earns a bench until the Pacific
+ * rollover; anything else gets Google's own retryDelay, or a minute and a
+ * half. Getting this backwards would take a model out of service for a day
+ * over one busy second.
+ */
+export function cooldownUntil(
+  failure: { quotaScope?: "day" | "burst"; retryAfterMs?: number },
+  now: Date = new Date(),
+): number {
+  if (failure.quotaScope === "day") return nextQuotaReset(now);
+  const asked = failure.retryAfterMs;
+  const wait = typeof asked === "number" && asked > 0 ? asked : BURST_COOLDOWN_MS;
+  return now.getTime() + Math.min(wait, nextQuotaReset(now) - now.getTime());
+}

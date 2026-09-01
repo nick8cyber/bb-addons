@@ -27,7 +27,7 @@ import {
   type Prefs,
 } from "./src/contract.js";
 import { chunkForSynthesis } from "./src/chunk.js";
-import { isQuotaFailure, nextQuotaReset, planModels } from "./src/model-chain.js";
+import { cooldownUntil, isQuotaFailure, planModels } from "./src/model-chain.js";
 import { synthesizeChunk } from "./src/gemini-tts.js";
 
 const PREFS_KEY = "prefs";
@@ -80,19 +80,26 @@ export default async function plugin(bb: BbPluginApi) {
    * the knowledge survives a reload and so the other chunks of the same
    * message do not each re-discover it at the cost of a wasted round trip.
    */
-  const COOLDOWN_KEY = "quota-cooldown";
-  const readCooldowns = async (): Promise<Record<string, number>> => {
-    const stored = await bb.storage.kv.get<unknown>(COOLDOWN_KEY);
-    if (stored === null || typeof stored !== "object") return {};
-    const out: Record<string, number> = {};
-    for (const [model, until] of Object.entries(stored as Record<string, unknown>)) {
-      if (typeof until === "number" && Number.isFinite(until)) out[model] = until;
-    }
-    return out;
+  /**
+   * One key per model rather than a map: five chunks can be in flight at once
+   * and a read-modify-write on a shared map would be a lost update waiting to
+   * happen the moment this holds anything but a timestamp.
+   */
+  const cooldownKey = (model: string): string => `quota-cooldown:${model}`;
+  const cooldownFor = async (model: string): Promise<number> => {
+    const until = await bb.storage.kv.get<unknown>(cooldownKey(model));
+    return typeof until === "number" && Number.isFinite(until) ? until : 0;
   };
-  const markExhausted = async (model: string): Promise<void> => {
-    const until = nextQuotaReset();
-    await bb.storage.kv.set(COOLDOWN_KEY, { ...(await readCooldowns()), [model]: until });
+  const markExhausted = async (
+    model: string,
+    failure: { quotaScope?: "day" | "burst"; retryAfterMs?: number },
+  ): Promise<void> => {
+    const until = cooldownUntil(failure);
+    await bb.storage.kv.set(cooldownKey(model), until);
+    bb.log.warn(
+      `${model} benched until ${new Date(until).toISOString()} ` +
+        `(${failure.quotaScope === "day" ? "daily allowance spent" : "burst limit"})`,
+    );
   };
 
   /** Non-secret preferences live in kv; anything unreadable becomes defaults. */
@@ -184,12 +191,15 @@ export default async function plugin(bb: BbPluginApi) {
 
       const prefs = await readPrefs();
       const endpoint = await baseUrl();
-      const cooldowns = await readCooldowns();
       const now = Date.now();
+      const benched = new Map<string, number>();
+      for (const model of [prefs.model, prefs.fallbackModel]) {
+        if (model) benched.set(model, await cooldownFor(model));
+      }
       const chain = planModels(
         prefs.model,
         prefs.fallbackModel,
-        (model) => (cooldowns[model] ?? 0) > now,
+        (model) => (benched.get(model) ?? 0) > now,
       );
 
       let result = undefined as Awaited<ReturnType<typeof synthesizeChunk>> | undefined;
@@ -208,11 +218,7 @@ export default async function plugin(bb: BbPluginApi) {
         // unreachable proxy fails identically on the next one, and retrying
         // would just double the wait before the browser voice takes over.
         if (!isQuotaFailure(result.code)) break;
-        await markExhausted(model);
-        bb.log.warn(
-          `${model} is out of quota across the whole pool; ` +
-            `chunk ${chunkIndex + 1}/${pieces.length} moves on`,
-        );
+        await markExhausted(model, result);
       }
 
       if (result === undefined) {
