@@ -8,6 +8,10 @@
  * same hook that hands the player a deterministic `./speakable.js` and a
  * `sonner` whose toasts land in an array instead of on a screen.
  *
+ * The `fetch` stub is the interesting half now that the player streams: it
+ * records every request, honours the abort signal, and can hold a chunk back
+ * so a test can decide exactly when it lands.
+ *
  *   node --experimental-strip-types --test tests/player.test.ts
  */
 
@@ -43,9 +47,9 @@ export const toast = Object.assign(record("message"), {
 `;
 
 /**
- * Always virtual, even once the real `src/speakable.ts` lands: this file tests
- * the player's control flow, and it should not start failing because someone
- * taught the markdown stripper a new trick.
+ * Always virtual, even though the real `src/speakable.ts` is right there: this
+ * file tests the player's control flow, and it should not start failing
+ * because someone taught the markdown stripper a new trick.
  */
 const SPEAKABLE_SOURCE = `
 export function toSpeakable(markdown) {
@@ -131,13 +135,25 @@ class FakeUtterance {
   }
 }
 
+/** One trip to the plugin's RPC endpoint, and how it ended. */
+interface RequestRecord {
+  method: string;
+  chunkIndex: number | null;
+  settled: boolean;
+  aborted: boolean;
+}
+
 interface Harness {
   toasts: ToastRecord[];
   audios: FakeAudio[];
   utterances: FakeUtterance[];
   created: string[];
   revoked: string[];
+  blobs: Blob[];
+  requests: RequestRecord[];
   cancels: number;
+  /** The most `synthesize` calls that were ever open at the same moment. */
+  maxOpen: number;
   restore(): void;
 }
 
@@ -179,7 +195,10 @@ function install(options: HarnessOptions): Harness {
     utterances: [],
     created: [],
     revoked: [],
+    blobs: [],
+    requests: [],
     cancels: 0,
+    maxOpen: 0,
     restore() {
       for (const entry of saved) {
         if (entry.had) scope[entry.key] = entry.value;
@@ -191,14 +210,45 @@ function install(options: HarnessOptions): Harness {
     },
   };
 
-  scope.fetch = async (input: unknown, init?: { body?: string }) => {
+  let open = 0;
+  scope.fetch = async (
+    input: unknown,
+    init?: { body?: string; signal?: AbortSignal },
+  ) => {
     const url = String(input);
     const method = url.slice(url.lastIndexOf("/") + 1);
     const body = init?.body ? (JSON.parse(init.body) as Record<string, unknown>) : {};
-    // A throwing handler is a network failure: the rpc wrapper sees a
-    // rejected fetch, which is exactly the shape it guards against.
-    const result = options.rpc(method, body);
-    return { status: 200, json: async () => ({ ok: true, result }) };
+    const record: RequestRecord = {
+      method,
+      chunkIndex: typeof body.chunkIndex === "number" ? body.chunkIndex : null,
+      settled: false,
+      aborted: false,
+    };
+    harness.requests.push(record);
+    if (method === "synthesize") {
+      open += 1;
+      harness.maxOpen = Math.max(harness.maxOpen, open);
+    }
+    try {
+      // A handler may return a value, return a promise a test resolves later,
+      // or throw. All three are things a real endpoint does; a throw is a
+      // network failure, which is exactly what the rpc paths guard against.
+      const result = await new Promise((resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          record.aborted = true;
+          reject(new Error("AbortError"));
+        });
+        try {
+          Promise.resolve(options.rpc(method, body)).then(resolve, reject);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      return { status: 200, json: async () => ({ ok: true, result }) };
+    } finally {
+      record.settled = true;
+      if (method === "synthesize") open -= 1;
+    }
   };
 
   scope.Audio = function Audio(this: unknown, src: string) {
@@ -208,10 +258,13 @@ function install(options: HarnessOptions): Harness {
   } as unknown as typeof globalThis.Audio;
 
   let counter = 0;
-  urlApi.createObjectURL = () => {
+  urlApi.createObjectURL = (blob: Blob) => {
     counter += 1;
     const url = `blob:speak-test/${counter}`;
     harness.created.push(url);
+    // Kept so a test can read back what was actually handed to the speakers,
+    // which is the only way to prove the chunks played in order.
+    harness.blobs.push(blob);
     return url;
   };
   urlApi.revokeObjectURL = (url: string) => {
@@ -256,16 +309,78 @@ function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function okAudio(chunks: string[]) {
-  return { ok: true, mimeType: "audio/mpeg", voice: "en-US-Wavenet-F", chunks };
+/** The `synthesize` calls, in the order they were made. */
+function chunkCalls(harness: Harness): (number | null)[] {
+  return harness.requests
+    .filter((request) => request.method === "synthesize")
+    .map((request) => request.chunkIndex);
+}
+
+/** What actually reached the speakers, decoded, in playback order. */
+async function played(harness: Harness): Promise<string[]> {
+  return Promise.all(harness.blobs.map((blob) => blob.text()));
+}
+
+function okChunk(index: number, count: number, payload: string) {
+  return {
+    ok: true,
+    mimeType: "audio/wav",
+    voice: "Kore",
+    chunkIndex: index,
+    chunkCount: count,
+    audioBase64: b64(payload),
+  };
 }
 
 function statusWith(overrides: Record<string, unknown> = {}) {
   return {
     configured: true,
-    prefs: { voices: {}, speakingRate: 1, fallbackEnabled: true, ...overrides },
-    autoLanguages: ["ru-RU", "en-US"],
-    defaultVoices: {},
+    prefs: {
+      voice: "Kore",
+      model: "gemini-2.5-flash-preview-tts",
+      browserRate: 1,
+      fallbackEnabled: true,
+      ...overrides,
+    },
+    voices: ["Kore", "Puck", "Zephyr"],
+    models: ["gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"],
+  };
+}
+
+/** A server that answers `synthesize` out of a list of chunk payloads. */
+function serve(payloads: string[], prefs: Record<string, unknown> = {}): RpcHandler {
+  return (method, body) => {
+    if (method === "status") return statusWith(prefs);
+    if (method !== "synthesize") throw new Error(`unexpected method ${method}`);
+    const index = Number(body.chunkIndex);
+    const payload = payloads[index];
+    if (payload === undefined) throw new Error(`no chunk ${index}`);
+    return okChunk(index, payloads.length, payload);
+  };
+}
+
+/**
+ * Chunk responses a test releases by hand, so it can hold one open and look at
+ * what the player did in the meantime.
+ */
+function makeGate() {
+  const resolvers = new Map<number, (value: unknown) => void>();
+  const promises = new Map<number, Promise<unknown>>();
+  const hold = (index: number): Promise<unknown> => {
+    let promise = promises.get(index);
+    if (!promise) {
+      promise = new Promise((resolve) => resolvers.set(index, resolve));
+      promises.set(index, promise);
+    }
+    return promise;
+  };
+  return {
+    hold,
+    /** Answer chunk `index`, whether or not it has been asked for yet. */
+    release(index: number, value: unknown): void {
+      hold(index);
+      resolvers.get(index)?.(value);
+    },
   };
 }
 
@@ -278,10 +393,7 @@ async function reset(): Promise<void> {
 // --- tests ------------------------------------------------------------------
 
 test("clicking the same message twice stops instead of speaking it twice", async () => {
-  const harness = install({
-    autoEnd: false,
-    rpc: (method) => (method === "status" ? statusWith() : okAudio([b64("one")])),
-  });
+  const harness = install({ autoEnd: false, rpc: serve(["one"]) });
   try {
     await reset();
 
@@ -311,10 +423,7 @@ test("clicking the same message twice stops instead of speaking it twice", async
 });
 
 test("a different message interrupts the one that is playing", async () => {
-  const harness = install({
-    autoEnd: false,
-    rpc: (method) => (method === "status" ? statusWith() : okAudio([b64("one")])),
-  });
+  const harness = install({ autoEnd: false, rpc: serve(["one"]) });
   try {
     await reset();
 
@@ -365,10 +474,10 @@ test("an unreachable server falls back to the browser voice", async () => {
   }
 });
 
-test("the browser voice picks a Russian voice for Russian text", async () => {
+test("the browser voice picks a Russian voice for Russian text, at browserRate", async () => {
   const harness = install({
     rpc: (method) => {
-      if (method === "status") return statusWith({ speakingRate: 1.4 });
+      if (method === "status") return statusWith({ browserRate: 1.4 });
       return { ok: false, code: "not_configured", message: "no key" };
     },
   });
@@ -380,7 +489,7 @@ test("the browser voice picks a Russian voice for Russian text", async () => {
     const utterance = harness.utterances[0]!;
     assert.equal(utterance.lang, "ru-RU");
     assert.equal(utterance.voice?.name, "Milena");
-    assert.equal(utterance.rate, 1.4, "the cached speaking rate is applied");
+    assert.equal(utterance.rate, 1.4, "the rate reaches the browser voice, and only it");
     assert.match(harness.toasts[0]!.message, /Settings → Extensions → Speak/);
   } finally {
     player.stop();
@@ -417,7 +526,7 @@ test("a missing key is announced once, not on every click", async () => {
     rpc: (method) =>
       method === "status"
         ? statusWith()
-        : { ok: false, code: "not_configured", message: "No Google API key yet." },
+        : { ok: false, code: "not_configured", message: "No Gemini API key yet." },
   });
   try {
     await reset();
@@ -475,7 +584,7 @@ test("fallbackEnabled: false keeps the browser voice out of it", async () => {
     assert.equal(harness.utterances.length, 0);
     assert.equal(player.getState().speaking, false);
     assert.equal(harness.toasts.length, 1);
-    assert.match(harness.toasts[0]!.message, /Add a Google Cloud API key/);
+    assert.match(harness.toasts[0]!.message, /Add a Gemini API key/);
     assert.doesNotMatch(harness.toasts[0]!.message, /browser's own voice/);
   } finally {
     player.stop();
@@ -506,17 +615,16 @@ test("no speechSynthesis at all names both what failed and what is missing", asy
   }
 });
 
-test("chunks play back to back, in order, and every object URL is revoked", async () => {
-  const harness = install({
-    rpc: (method) =>
-      method === "status" ? statusWith() : okAudio([b64("one"), b64("two"), b64("three")]),
-  });
+test("chunks are fetched one by one and play back to back, in order", async () => {
+  const harness = install({ rpc: serve(["one", "two", "three"]) });
   try {
     await reset();
 
     await player.speak({ messageId: "m1", text: "three chunks worth" });
 
+    assert.deepEqual(chunkCalls(harness), [0, 1, 2], "one call per chunk, in order");
     assert.equal(harness.audios.length, 3);
+    assert.deepEqual(await played(harness), ["one", "two", "three"]);
     assert.deepEqual(
       harness.audios.map((audio) => audio.src),
       harness.created,
@@ -524,32 +632,290 @@ test("chunks play back to back, in order, and every object URL is revoked", asyn
     );
     assert.deepEqual(harness.revoked, harness.created, "every URL created is revoked");
     assert.equal(player.getState().speaking, false);
+    assert.equal(harness.toasts.length, 0);
   } finally {
     player.stop();
     harness.restore();
   }
 });
 
-test("stop() between chunks prevents the next one", async () => {
+test("the next chunk is fetched while the current one is still playing", async () => {
+  const harness = install({ autoEnd: false, rpc: serve(["one", "two", "three"]) });
+  try {
+    await reset();
+
+    void player.speak({ messageId: "m1", text: "three chunks worth" });
+    await tick();
+
+    assert.equal(harness.audios.length, 1, "only the first chunk is playing");
+    assert.deepEqual(
+      chunkCalls(harness),
+      [0, 1],
+      "chunk 1 is already asked for while chunk 0 plays",
+    );
+
+    // Chunk 1's answer is here early; it waits its turn rather than doubling up.
+    assert.equal(harness.audios.length, 1);
+    harness.audios[0]!.end();
+    await tick();
+
+    assert.equal(harness.audios.length, 2);
+    assert.deepEqual(await played(harness), ["one", "two"], "held, then played in order");
+    assert.deepEqual(chunkCalls(harness), [0, 1, 2]);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("chunks play in order even when a later answer is ready first", async () => {
+  const gate = makeGate();
   const harness = install({
     autoEnd: false,
-    rpc: (method) =>
-      method === "status" ? statusWith() : okAudio([b64("one"), b64("two"), b64("three")]),
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      return gate.hold(Number(body.chunkIndex));
+    },
   });
+  try {
+    await reset();
+
+    void player.speak({ messageId: "m1", text: "two chunks worth" });
+    await tick();
+    assert.deepEqual(chunkCalls(harness), [0]);
+
+    // Make chunk 1 ready before chunk 0. The player still cannot ask for it
+    // until chunk 0 establishes chunkCount, and cannot play it before chunk 0.
+    gate.release(1, okChunk(1, 2, "two"));
+    gate.release(0, okChunk(0, 2, "one"));
+    await tick();
+
+    assert.deepEqual(chunkCalls(harness), [0, 1]);
+    assert.equal(harness.audios.length, 1, "the ready later chunk waits its turn");
+    assert.deepEqual(await played(harness), ["one"]);
+
+    harness.audios[0]!.end();
+    await tick();
+    assert.equal(harness.audios.length, 2);
+    assert.deepEqual(await played(harness), ["one", "two"]);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("an early fetch-ahead rejection is observed until playback reaches it", async () => {
+  const harness = install({
+    autoEnd: false,
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      if (Number(body.chunkIndex) === 0) return okChunk(0, 2, "one");
+      return Promise.reject(new Error("connect ECONNREFUSED 127.0.0.1:7777"));
+    },
+  });
+  try {
+    await reset();
+
+    const speaking = player.speak({ messageId: "m1", text: "two chunks worth" });
+    await tick();
+    await tick();
+
+    assert.equal(harness.audios.length, 1);
+    assert.deepEqual(player.getState(), { speaking: true, messageId: "m1" });
+    assert.equal(harness.toasts.length, 0, "the current chunk is allowed to finish first");
+
+    harness.audios[0]!.end();
+    await speaking;
+
+    assert.equal(harness.utterances.length, 0, "the browser voice does not restart the message");
+    assert.equal(harness.toasts.length, 1);
+    assert.match(harness.toasts[0]!.message, /stopped part-way through/);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("never more than one chunk request is outstanding", async () => {
+  const gate = makeGate();
+  const harness = install({
+    autoEnd: false,
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      const index = Number(body.chunkIndex);
+      return gate.hold(index);
+    },
+  });
+  try {
+    await reset();
+
+    void player.speak({ messageId: "m1", text: "four chunks worth" });
+    await tick();
+    assert.deepEqual(chunkCalls(harness), [0], "nothing else is asked for until chunk 0 lands");
+
+    for (const index of [0, 1, 2]) {
+      gate.release(index, okChunk(index, 4, `chunk-${index}`));
+      await tick();
+      // The chunk that just landed is playing; exactly one more is in flight.
+      assert.equal(harness.audios.length, index + 1);
+      assert.deepEqual(chunkCalls(harness), [0, 1, 2, 3].slice(0, index + 2));
+      harness.audios[index]!.end();
+      await tick();
+    }
+
+    gate.release(3, okChunk(3, 4, "chunk-3"));
+    await tick();
+    harness.audios[3]!.end();
+    await tick();
+
+    assert.equal(harness.maxOpen, 1, "a second in-flight request would race the rate limit");
+    assert.deepEqual(await played(harness), ["chunk-0", "chunk-1", "chunk-2", "chunk-3"]);
+    assert.equal(player.getState().speaking, false);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("playback that catches up with the fetching waits, silently", async () => {
+  const gate = makeGate();
+  const harness = install({
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      const index = Number(body.chunkIndex);
+      return index === 0 ? okChunk(0, 2, "one") : gate.hold(index);
+    },
+  });
+  try {
+    await reset();
+
+    void player.speak({ messageId: "m1", text: "two chunks worth" });
+    await tick();
+
+    // Chunk 0 has played out and chunk 1 is not here yet: the player is parked.
+    assert.equal(harness.audios.length, 1);
+    assert.deepEqual(player.getState(), { speaking: true, messageId: "m1" });
+    assert.equal(harness.toasts.length, 0, "a pause is not worth telling anyone about");
+
+    gate.release(1, okChunk(1, 2, "two"));
+    await tick();
+
+    assert.deepEqual(await played(harness), ["one", "two"]);
+    assert.equal(player.getState().speaking, false);
+    assert.equal(harness.toasts.length, 0);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("stop() aborts the request in flight and starts nothing further", async () => {
+  const gate = makeGate();
+  const harness = install({
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      return gate.hold(Number(body.chunkIndex));
+    },
+  });
+  try {
+    await reset();
+
+    void player.speak({ messageId: "m1", text: "a message nobody waits for" });
+    await tick();
+    const request = harness.requests.find((entry) => entry.method === "synthesize")!;
+    assert.equal(request.aborted, false);
+
+    player.stop();
+    assert.equal(request.aborted, true, "the outstanding chunk request is cancelled");
+    assert.equal(player.getState().speaking, false, "stop() is synchronous");
+
+    // Even if the server answers anyway, nothing may come of it.
+    gate.release(0, okChunk(0, 3, "one"));
+    await tick();
+    await tick();
+
+    assert.equal(harness.audios.length, 0, "no audio from a request that was cancelled");
+    assert.equal(harness.utterances.length, 0, "an abort is not a failure to fall back from");
+    assert.deepEqual(chunkCalls(harness), [0], "and no chunk 1");
+    assert.equal(harness.toasts.length, 0);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("stop() mid-chunk aborts the fetch-ahead and prevents the next chunk", async () => {
+  const harness = install({ autoEnd: false, rpc: serve(["one", "two", "three"]) });
   try {
     await reset();
 
     void player.speak({ messageId: "m1", text: "three chunks worth" });
     await tick();
     assert.equal(harness.audios.length, 1);
+    assert.deepEqual(chunkCalls(harness), [0, 1]);
 
     player.stop();
-    assert.equal(player.getState().speaking, false, "stop() is synchronous");
-
     await tick();
+    await tick();
+
     assert.equal(harness.audios.length, 1, "the queue must not resume after a stop");
     assert.equal(harness.audios[0]?.paused, true);
+    assert.deepEqual(chunkCalls(harness), [0, 1], "chunk 2 is never asked for");
     assert.deepEqual(harness.revoked, harness.created);
+    assert.equal(harness.toasts.length, 0);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("a failure on a later chunk stops and says so, rather than starting over", async () => {
+  const harness = install({
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      const index = Number(body.chunkIndex);
+      // Retryable on purpose: even a code the browser voice could have taken
+      // over is not worth re-reading the opening the user already heard.
+      if (index === 0) return okChunk(0, 3, "one");
+      return { ok: false, code: "rate_limited", message: "429 quota exceeded" };
+    },
+  });
+  try {
+    await reset();
+
+    await player.speak({ messageId: "m1", text: "three chunks worth" });
+
+    assert.equal(harness.audios.length, 1, "what was already fetched still played");
+    assert.equal(harness.utterances.length, 0, "no restart with the browser voice");
+    assert.equal(player.getState().speaking, false);
+    assert.equal(harness.toasts.length, 1);
+    assert.equal(harness.toasts[0]?.level, "error");
+    assert.match(harness.toasts[0]!.message, /stopped part-way through/);
+    assert.doesNotMatch(harness.toasts[0]!.message, /429/, "no raw server text");
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("an unreachable server on a later chunk is cut short, not failed over", async () => {
+  const harness = install({
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      if (Number(body.chunkIndex) === 0) return okChunk(0, 2, "one");
+      throw new Error("connect ECONNREFUSED 127.0.0.1:7777");
+    },
+  });
+  try {
+    await reset();
+
+    await player.speak({ messageId: "m1", text: "two chunks worth" });
+
+    assert.equal(harness.utterances.length, 0);
+    assert.equal(harness.toasts.length, 1);
+    assert.equal(harness.toasts[0]?.level, "error");
+    assert.match(harness.toasts[0]!.message, /stopped part-way through/);
+    assert.equal(player.getState().speaking, false);
   } finally {
     player.stop();
     harness.restore();
@@ -581,10 +947,7 @@ test("a voice list that arrives late is still waited for", async () => {
 });
 
 test("audio that will not play is a toast, not silence", async () => {
-  const harness = install({
-    refusePlay: true,
-    rpc: (method) => (method === "status" ? statusWith() : okAudio([b64("one")])),
-  });
+  const harness = install({ refusePlay: true, rpc: serve(["one"]) });
   try {
     await reset();
 
@@ -617,6 +980,7 @@ test("nothing speakable is a note, not a request", async () => {
 
     assert.equal(harness.audios.length, 0);
     assert.equal(harness.utterances.length, 0);
+    assert.equal(chunkCalls(harness).length, 0);
     assert.equal(player.getState().speaking, false);
     assert.equal(harness.toasts.length, 1);
     assert.equal(harness.toasts[0]?.level, "info");
@@ -626,11 +990,52 @@ test("nothing speakable is a note, not a request", async () => {
   }
 });
 
-test("stop() with nothing playing is a no-op, and a throwing listener is contained", async () => {
+test("preview plays the clip it is handed, without a synthesize call", async () => {
   const harness = install({
-    autoEnd: false,
-    rpc: (method) => (method === "status" ? statusWith() : okAudio([b64("one")])),
+    rpc: (method) => {
+      if (method === "status") return statusWith();
+      throw new Error("a settings audition must not go through speak()");
+    },
   });
+  try {
+    await reset();
+
+    const heard = await player.preview(b64("sample"), "audio/wav");
+
+    assert.equal(heard, true);
+    assert.equal(harness.audios.length, 1);
+    assert.deepEqual(await played(harness), ["sample"]);
+    assert.deepEqual(harness.revoked, harness.created);
+    assert.equal(chunkCalls(harness).length, 0);
+    assert.equal(player.getState().speaking, false);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("a reading and an audition share the one pair of speakers", async () => {
+  const harness = install({ autoEnd: false, rpc: serve(["one"]) });
+  try {
+    await reset();
+
+    void player.speak({ messageId: "m1", text: "hello there" });
+    await tick();
+    assert.equal(harness.audios.length, 1);
+
+    void player.preview(b64("sample"));
+    await tick();
+
+    assert.equal(harness.audios[0]?.paused, true, "the reading is silenced first");
+    assert.equal(harness.audios.length, 2);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("stop() with nothing playing is a no-op, and a throwing listener is contained", async () => {
+  const harness = install({ autoEnd: false, rpc: serve(["one"]) });
   try {
     await reset();
 
