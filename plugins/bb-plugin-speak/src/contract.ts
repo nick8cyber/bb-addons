@@ -34,11 +34,11 @@ export const PCM_BYTES_PER_CHAR = 3584;
 
 /**
  * The first chunk is deliberately short: it is the one the user waits for
- * before hearing anything. The rest are longer, because by then playback is
- * already running and the only thing that matters is staying ahead of it.
+ * before hearing anything. The rest are sized so generation stays well ahead
+ * of audio playback with zero stutter.
  */
-export const FIRST_CHUNK_CHARS = 180;
-export const CHUNK_CHARS = 450;
+export const FIRST_CHUNK_CHARS = 100;
+export const CHUNK_CHARS = 260;
 
 /** How much text one click may send, across all its chunks. */
 export const MAX_SPEAKABLE_CHARS = 20_000;
