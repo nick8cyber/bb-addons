@@ -8,11 +8,32 @@
  * is bundled into dist/app.js by `bb plugin build`.
  */
 
+import "./app.css";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 
 import { SpeakSection } from "./src/SpeakSection.js";
 import { mountSpeakOverlay } from "./src/SpeakOverlay.js";
 import { player } from "./src/player.js";
+
+function syncButtonState(stage: string) {
+  if (typeof document === "undefined") return;
+  const buttons = document.querySelectorAll(
+    'button:has([data-plugin-icon-asset*="speak"]), button[title="Read aloud"]',
+  );
+  buttons.forEach((btn) => {
+    if (stage === "idle") {
+      btn.removeAttribute("data-speak-state");
+    } else {
+      btn.setAttribute("data-speak-state", stage);
+    }
+  });
+}
+
+if (typeof window !== "undefined") {
+  player.subscribe((state) => {
+    syncButtonState(state.stage);
+  });
+}
 
 export default definePluginApp((app) => {
   app.contentScripts.register({
