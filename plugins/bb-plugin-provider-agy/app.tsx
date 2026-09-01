@@ -39,14 +39,15 @@ export default definePluginApp((app) => {
     providerId: "agy",
     icon: AntigravityIcon,
   });
-  // The provider's standing notice. It says what a turn on agy may do without
-  // asking and what the bridge logs — facts the picker has no room for and
-  // that a user should not have to read the source to learn.
+  // The provider's own page: the two setup steps bb cannot do for the user
+  // (install the CLI, sign it in on the machine that runs the turn), then
+  // what a thread on agy may do once they are done. Neither belongs in the
+  // picker, and neither should require reading the source.
   app.slots.settingsSection({
     id: "agy-safety",
     title: "Antigravity (agy)",
     description:
-      "What a thread on this provider may do without asking, and what the bridge writes down.",
+      "How to install and sign in to the agy CLI, and what a thread on this provider may do once you have.",
     component: AgySafetySection,
   });
 });

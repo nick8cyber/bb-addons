@@ -1,17 +1,24 @@
 /**
- * The provider's standing notice, rendered as a settings section.
+ * The provider's settings section: how to make agy work, then what it is
+ * allowed to do once it does.
  *
- * Two facts a user of this provider is entitled to before a turn runs, and
- * neither is discoverable from the picker: threads on agy execute tools with
- * no approval step, and the bridge keeps a local log. Both are consequences
- * of agy's stream-json dialect rather than choices this plugin could undo, so
- * they are stated where the provider is configured instead of buried in the
- * README of a repository most users will never open.
+ * Installing this plugin does not install the CLI, and bb cannot sign in on
+ * the user's behalf — the credential belongs to the machine that runs the
+ * turn. Without those two steps the picker simply has no models, which looks
+ * like a broken plugin and is not, so the steps come first and name the
+ * machine explicitly.
  *
- * No controls: there is nothing here to toggle. A section that only tells the
- * truth is still the right surface — it is the one place bb renders a
- * plugin's own copy next to the provider it describes.
+ * Then two facts a user is entitled to before a turn runs, neither of them
+ * visible from the picker: threads on agy execute tools with no approval
+ * step, and the bridge keeps a local log. Both follow from agy's stream-json
+ * dialect rather than from choices this plugin could undo.
+ *
+ * No controls anywhere: there is nothing here to toggle. A section that only
+ * tells the truth is still the right surface — it is the one place bb renders
+ * a plugin's own copy next to the provider it describes.
  */
+
+import type { ReactNode } from "react";
 
 function AlertGlyph({ className }: { className?: string }) {
   return (
@@ -51,9 +58,63 @@ function InfoGlyph({ className }: { className?: string }) {
   );
 }
 
+function Cmd({ children }: { children: string }) {
+  return (
+    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] break-all">
+      {children}
+    </code>
+  );
+}
+
+function Step({ n, title, children }: { n: number; title: string; children: ReactNode }) {
+  return (
+    <li className="flex gap-2.5">
+      <span className="mt-px flex size-4 shrink-0 items-center justify-center rounded-full border text-[10px] font-medium text-muted-foreground">
+        {n}
+      </span>
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="font-medium text-foreground">{title}</div>
+        <div className="text-muted-foreground">{children}</div>
+      </div>
+    </li>
+  );
+}
+
 export function AgySafetySection() {
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-4">
+      <ol className="flex flex-col gap-3 text-xs leading-relaxed">
+        <Step n={1} title="Install the agy CLI on the machine that runs your threads">
+          <p>
+            <Cmd>curl -fsSL https://antigravity.google/cli/install.sh | bash</Cmd>{" "}
+            — Windows uses the PowerShell installer from the same page. It
+            lands at <Cmd>~/.local/bin/agy</Cmd>, which this provider checks
+            before it checks <Cmd>PATH</Cmd>; set <Cmd>AGY_PATH</Cmd> to point
+            it somewhere else.
+          </p>
+        </Step>
+        <Step n={2} title="Sign in, on that same machine">
+          <p>
+            Run <Cmd>agy</Cmd> once. There is no login subcommand: the first
+            run opens a browser, and over SSH it prints a URL and takes the
+            code you paste back. It needs a Google account with Antigravity
+            access, and the credential is kept by the machine's keyring — bb
+            never sees it. For a headless host, agy also accepts{" "}
+            <Cmd>GEMINI_API_KEY</Cmd> with{" "}
+            <Cmd>"modelProvider": "gemini"</Cmd> in{" "}
+            <Cmd>~/.gemini/antigravity-cli/settings.json</Cmd>.
+          </p>
+        </Step>
+        <Step n={3} title="Check it took">
+          <p>
+            <Cmd>agy models</Cmd> on that machine lists the models; the same
+            list is what this provider offers in the picker. An empty picker
+            here means one of the two steps above has not happened on the
+            machine bb is asking.
+          </p>
+        </Step>
+      </ol>
+      <div className="border-t" />
       <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed">
         <AlertGlyph className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-500" />
         <div className="min-w-0 flex-1 text-foreground">
