@@ -355,7 +355,8 @@ test("an unreachable server falls back to the browser voice", async () => {
     assert.equal(player.getState().speaking, false);
 
     assert.equal(harness.toasts.length, 1, "one toast, not one per failure hop");
-    assert.equal(harness.toasts[0]?.level, "error");
+    // Something is about to speak, so the hand-off is news, not a fault.
+    assert.equal(harness.toasts[0]?.level, "info");
     assert.match(harness.toasts[0]!.message, /browser's own voice/);
     assert.doesNotMatch(harness.toasts[0]!.message, /ECONNREFUSED/, "no raw server text");
   } finally {
@@ -410,6 +411,54 @@ for (const code of ["empty", "too_long"] as const) {
     }
   });
 }
+
+test("a missing key is announced once, not on every click", async () => {
+  const harness = install({
+    rpc: (method) =>
+      method === "status"
+        ? statusWith()
+        : { ok: false, code: "not_configured", message: "No Google API key yet." },
+  });
+  try {
+    await reset();
+
+    await player.speak({ messageId: "m1", text: "first" });
+    await player.speak({ messageId: "m2", text: "second" });
+    await player.speak({ messageId: "m3", text: "third" });
+
+    assert.equal(harness.utterances.length, 3, "every click still speaks");
+    assert.equal(harness.toasts.length, 1, "having no key is a steady state, not three events");
+    assert.equal(harness.toasts[0]?.level, "info");
+
+    // A save may well be the key arriving, so the notice speaks again.
+    await refreshPrefs();
+    await player.speak({ messageId: "m4", text: "fourth" });
+    assert.equal(harness.toasts.length, 2);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("a rejected key is announced every time, unlike a missing one", async () => {
+  const harness = install({
+    rpc: (method) =>
+      method === "status"
+        ? statusWith()
+        : { ok: false, code: "auth", message: "Google rejected the API key." },
+  });
+  try {
+    await reset();
+
+    await player.speak({ messageId: "m1", text: "first" });
+    await player.speak({ messageId: "m2", text: "second" });
+
+    // A key that is present and refused is a fault someone has to go and fix.
+    assert.equal(harness.toasts.length, 2);
+    assert.equal(harness.toasts[0]?.level, "info");
+  } finally {
+    harness.restore();
+  }
+});
 
 test("fallbackEnabled: false keeps the browser voice out of it", async () => {
   const harness = install({
