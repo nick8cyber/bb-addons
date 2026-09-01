@@ -54,11 +54,12 @@ bridge.start?.({ pluginId: "provider-agy", dataDir: root, tempDir: root });
 const send = (m) => bridge.handleLine(JSON.stringify(m));
 const pol = { permissionMode: "full", permissionScope: "full", approvalReviewer: null, permissionEscalation: null };
 const options = { model: "fake-model", ...pol };
-const events = (threadId) =>
+const deltas = (threadId) =>
   messages
-    .filter((m) => m.method === "thread/event" && m.params.threadId === threadId)
-    .map((m) => m.params.event);
-const completed = (threadId) => events(threadId).filter((e) => e.type === "turn/completed");
+    .filter((m) => m.method === "thread/delta" && m.params.threadId === threadId)
+    .flatMap((m) => m.params.deltas);
+const completed = (threadId) =>
+  deltas(threadId).filter((delta) => delta.kind === "turn.boundary");
 
 async function waitFor(predicate, ms, label) {
   const deadline = Date.now() + ms;
@@ -78,7 +79,7 @@ let nextId = 10;
 let creqSeq = 0;
 async function drive(mode, prompts) {
   const threadId = `t-${mode}`;
-  send({ jsonrpc: "2.0", id: nextId++, method: "initialize", params: { protocolVersion: 1, client: { name: "fake", version: "1" } } });
+  send({ jsonrpc: "2.0", id: nextId++, method: "initialize", params: { protocolVersion: 2, grammarVersions: [3, 3], client: { name: "fake", version: "1" } } });
   const startId = nextId++;
   send({ jsonrpc: "2.0", id: startId, method: "thread/start", params: { threadId, cwd: workspace(mode), options, instructionMode: "append" } });
   await waitFor(() => messages.some((m) => m.id === startId), 15_000, `${mode}: thread/start`);
@@ -109,8 +110,8 @@ const silentFail = completed(silent).find((t) => t.status === "failed");
 
 const checks = [
   ["recover/turn-completes", completed(recover).length === 2 && completed(recover).every((t) => t.status === "completed"), JSON.stringify(completed(recover).map((t) => t.status))],
-  ["recover/one-turn-id-per-message", new Set(completed(recover).map((t) => t.scope.turnId)).size === 2, ""],
-  ["recover/no-error-surfaced", events(recover).filter((e) => e.type === "provider/error").length === 0, ""],
+  ["recover/one-turn-id-per-message", new Set(completed(recover).map((t) => t.providerTurnId)).size === 2, ""],
+  ["recover/no-error-surfaced", deltas(recover).filter((delta) => delta.kind === "provider.error").length === 0, ""],
   ["recover/nudge-names-the-file", lines.some((l) => /Look at .*src\/Foo\.tsx on disk now/.test(l)), JSON.stringify(lines.find((l) => l.startsWith("Your last")) ?? "").slice(0, 90)],
   ["recover/guardrail-on-later-turns", lines.some((l) => l.startsWith("[workspace rule]") && l.endsWith("now also src/Bar.tsx")), ""],
   ["recover/no-guardrail-before-the-refusal", lines[0] === "create src/Foo.tsx", JSON.stringify(lines[0] ?? "")],

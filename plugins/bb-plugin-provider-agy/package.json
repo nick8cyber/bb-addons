@@ -4,8 +4,8 @@
   "type": "module",
   "description": "Run bb threads with agy, the Antigravity CLI.",
   "engines": {
-    "bb": ">=0.39",
-    "bbPluginSdk": ">=0.4.8"
+    "bb": ">=0.40",
+    "bbPluginSdk": ">=0.4.21"
   },
   "bb": {
     "name": "Antigravity provider",
@@ -24,12 +24,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@get-bb/plugin-sdk": "0.4.21",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.4.8",
     "@types/node": "^22.0.0",
-    "typescript": "^5.7.0",
-    "@types/react": "^19.0.0"
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0"
   }
 }

@@ -4,22 +4,21 @@
 plus a provider bridge, the same shape `provider-claude-code` and
 `provider-codex` use. No ACP in the path.
 
-Built and verified against **bb 0.39.0** (`@get-bb/plugin-sdk` 0.4.8), which
-speaks **provider bridge protocol version 1** and the `thread/event` grammar.
-The `thread/delta` / grammar-v3 protocol described on bb's `main` branch is a
-later, unreleased revision — a v3 bridge would be refused by this bb.
+Built and verified against **bb 0.40.0** (`@get-bb/plugin-sdk` 0.4.21), which
+speaks **provider bridge protocol version 2** and thread-delta grammar v3.
 
 ## Layout
 
 | file | what it is |
 | --- | --- |
-| `server.ts` | the provider declaration (`bb.agents.experimental_registerProvider`) |
+| `server.ts` | the provider declaration (`bb.providers.register`) |
 | `host.ts` | the `bb.host` artifact; exports `experimental_providerBridge` |
-| `src/provider-bridge.ts` | the bridge: JSON-RPC handlers, session/turn state, agy → `thread/event` translation |
+| `src/provider-bridge.ts` | the bridge: JSON-RPC handlers, session/turn state, agy → `thread/delta` translation |
 | `src/agy-cli.ts` | everything that knows agy's argv and its NDJSON dialect |
 | `app.tsx` | the `bb.app` frontend; registers the provider mark inline |
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
-| `harness.mjs` | offline protocol suite (see below) |
+| `harness.mjs` | protocol suite against the real agy (see below) |
+| `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
 
@@ -77,6 +76,62 @@ Facts that shape the bridge:
 - There is no back channel in stream-json for tool approvals (no
   `control_request`/`control_response` in the binary), so phase one runs
   `--dangerously-skip-permissions` and declares `permissionModes: ["full"]`.
+
+## Steering: one queue, owned by the bridge
+
+agy's stream-json is one turn per stdin line, so there is no way to reach the
+model inside a running turn. The bridge therefore declares
+`steerMode: "queue"` and honours it literally: a `turn/steer` that names a live
+turn is **accepted** and becomes the next turn of the session. Refusing it (what
+this bridge did before) loses the request — the runtime drops a rejected steer
+on the bridge's own `staleTurn` hint, and the text the user typed goes nowhere.
+
+The queue is the bridge's, not the child's stdin buffer:
+
+- only the **head** of the queue is written to agy, so a queued turn cannot
+  race the turn ahead of it however agy buffers its input;
+- a queued turn is announced (`turn.open`, then `input.accepted` carrying its
+  own `providerTurnId`) at the moment it reaches the head, so no delta ever
+  names a turn agy has not been asked to run;
+- the same holds for a second `turn/start` arriving mid-turn, and it is what
+  lets an artifact-refusal re-drive stay safe with work queued behind it.
+
+Only a steer whose turn is already gone is refused, and then with the typed hint
+the runtime keys on rather than error text:
+
+```
+{"code":-32001,"message":"turn … is not live on thread …",
+ "data":{"recovery":{"kind":"staleTurn","message":"…","retryable":false}}}
+```
+
+What a steer still cannot do is change the turn it was aimed at: that turn runs
+to its own answer first. `harness-steer.mjs` is the proof for all of it.
+
+## When agy dies and the conversation does not
+
+agy is a child process with its own timeouts, and it can be gone while the
+conversation it was running is still on disk. The next turn rebuilds a child
+against that same `conversation_id` rather than failing the thread — and the
+rebuild is a **new provider session**, even though its id is the old one:
+
+- `session/replaced` goes out **before** the spawn, so nothing the replacement
+  says can arrive ahead of the news that it exists (`contextLost: false`: the
+  conversation survived, only the process did not);
+- the replacement's `init` re-announces `thread/identity` and emits
+  `session.reset`, because the runtime's assembler keeps item and turn maps,
+  settled ids and open streams until a reset says to drop them — an unchanged
+  conversation id is not a reason to assemble a new process's items into the
+  old id space;
+- the turn that triggered the rebuild waits in the bridge's `pending` queue
+  until that announcement, so no `turn.open` is ever emitted into an id space
+  the runtime is about to drop;
+- the usage baseline restarts with the child: agy counts tokens cumulatively
+  per process, so carrying the old reading over would clamp every later turn's
+  `last` to zero.
+
+`harness-rebuild.mjs` is the proof: a first turn whose fake agy exits the
+moment it has answered, then a second turn that can only run on a rebuilt
+child.
 
 ## The workspace (`--add-dir`) and agy's recovered tool errors
 
@@ -137,27 +192,52 @@ claims, in four mid-tone hues that carry on both themes.
 
 ## Verification
 
-`node harness.mjs [model]` drives the **built** `dist/host.js` in-process. bb
-0.39's conformance kit is private to the monorepo (`@bb/provider-bridge-protocol/conformance`)
-and is not published in SDK 0.4.8, so the harness reimplements its scenarios
-under the same rule names and adds the agy-specific ones. 17/17 pass:
+`node harness.mjs [model]` drives the **built** `dist/host.js` in-process and
+checks the public protocol-v2/thread-delta rules plus the agy-specific ones:
 
 ```
 rpc/unknown-method, rpc/invalid-params, rpc/non-json-ignored,
 rpc/response-not-request, handshake/initialize, model/list,
-session/start-identity, ordering/identity-precedes-events, turn/lifecycle,
+session/start-identity, ordering/identity-precedes-deltas, session/reset-first, turn/lifecycle,
 item/opens-before-delta, stream/deltas-arrive, item/settles-with-text,
-usage/reported, events/schema-valid, steer/typed-refusal,
+usage/reported, deltas/schema-valid, steer/queued-while-active,
+steer/runs-after-the-turn-it-steered, steer/stale-turn-refused,
 stop/release-not-interrupted, session/resume
 ```
 
-`AGY_PATH=$PWD/fake-agy-shim node harness-fake.mjs` replays the dialect from
+Pass a model agy currently lists (`agy models`); the argument is not optional
+in practice, because agy retires model ids between releases.
+
+20/20 pass on agy 1.1.23 with `gemini-3.7-flash-low`. The two steer rules that
+need a live turn report **skip** rather than fail if agy settles the steered
+turn before the steer goes out — a real CLI cannot be made slow on demand, and
+`harness-steer.mjs` proves the same rules deterministically.
+
+`node harness-fake.mjs` replays the dialect from
 `fake-agy.mjs` — **no account, no network, no quota** — with four streamed
 chunks per turn, so a real one-token answer cannot hide a bridge that forwards
 only the last piece. 7/7 pass: every chunk forwarded as its own
 `item/agentMessage/delta`, one item per turn, the item settling with the full
 text, two turns down one session with distinct turn ids, and usage where
 `total` is cumulative and `last` is the turn's own slice.
+
+`node harness-rebuild.mjs` proves the rebuild path, which needs a child that
+dies on cue: a prompt containing `[[die]]` makes `fake-agy.mjs` answer in full
+and then exit, the way a crashed or timed-out agy leaves a live conversation
+behind. 12/12 pass — the crash settles nothing it should not, the next turn
+announces `session/replaced` before the spawn, the replacement re-announces
+`thread/identity` and `session.reset`, every delta of the rebuilt turn lands
+after that reset, the same conversation gets the turn's text, and usage is
+counted from the new child's own zero.
+
+`node harness-steer.mjs` proves the steer path with the same fake, and it is
+the one suite that can: a prompt containing `[[hold]]` makes `fake-agy.mjs`
+stream its first chunk and then stop until the harness releases it, so the two
+steers it sends are provably aimed at a turn that is still running. 13/13
+pass — both steers accepted (never `NO_ACTIVE_TURN`), neither announced nor
+written to agy's stdin while the held turn owns it, then three turns settling
+in order with each `input.accepted` naming its own turn, and a steer for the
+settled turn refused with the typed `staleTurn` hint.
 
 End to end in bb itself:
 
@@ -175,8 +255,10 @@ bb thread output <thread>
   `checkpoint` and `agent_response`; if agy gains per-tool steps they arrive as
   `provider/raw` (`coverage: "unknown"`) and are visible in debug UI rather
   than silently dropped.
-- **Steering** is refused with `NO_ACTIVE_TURN`, so bb turns a steer into the
-  next turn — which agy runs in order. Real mid-turn injection needs agy support.
+- **Mid-turn injection.** `turn/steer` is honoured as `steerMode: "queue"` —
+  accepted while a turn is live and run as the next turn (see below) — but agy
+  has no channel for reaching the model *inside* a running turn, so the steer
+  cannot change what the current turn does. That needs agy support.
 - **Fork, archive, rename, manual compaction** are all declared off.
 - **Reasoning levels** are folded into agy's `low|medium|high`, and because
   every model id already names one, the picker's level is effectively ignored

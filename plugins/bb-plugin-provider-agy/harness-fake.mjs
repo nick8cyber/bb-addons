@@ -4,13 +4,22 @@
  * bridge streams every chunk (a real one-token answer cannot show that), runs
  * two turns down one session, and accounts usage per turn.
  *
- * Usage: AGY_PATH=$PWD/fake-agy-shim node harness-fake.mjs
+ * Usage: node harness-fake.mjs
  */
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const workspace = mkdtempSync(join(tmpdir(), "agy-fake-"));
+// The shim is written here, next to the fake it runs: an AGY_PATH pointing at
+// some other checkout's fake is a test that proves nothing about this one.
+const shim = join(workspace, "agy-shim");
+writeFileSync(
+  shim,
+  `#!/bin/sh\nexec /usr/bin/node ${new URL("./fake-agy.mjs", import.meta.url).pathname} "$@"\n`,
+);
+chmodSync(shim, 0o755);
+process.env.AGY_PATH = shim;
 const messages = [];
 const originalWrite = process.stdout.write.bind(process.stdout);
 let tail = "";
@@ -45,8 +54,10 @@ const pol = {
   permissionEscalation: null,
 };
 const options = { model: "fake-model", ...pol };
-const events = () =>
-  messages.filter((m) => m.method === "thread/event").map((m) => m.params.event);
+const deltas = () =>
+  messages
+    .filter((m) => m.method === "thread/delta" && m.params.threadId === "t1")
+    .flatMap((m) => m.params.deltas);
 
 async function waitFor(predicate, ms, label) {
   const deadline = Date.now() + ms;
@@ -62,7 +73,7 @@ async function waitFor(predicate, ms, label) {
   }
 }
 
-send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, client: { name: "fake", version: "1" } } });
+send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 2, grammarVersions: [3, 3], client: { name: "fake", version: "1" } } });
 send({
   jsonrpc: "2.0",
   id: 2,
@@ -87,9 +98,9 @@ for (const [id, creq] of [[3, "creq_aaaaaaaaaa"], [4, "creq_bbbbbbbbbb"]]) {
   const want = id === 3 ? 1 : 2;
   await waitFor(
     (m) =>
-      m.method === "thread/event" &&
-      m.params.event.type === "turn/completed" &&
-      events().filter((e) => e.type === "turn/completed").length >= want,
+      m.method === "thread/delta" &&
+      m.params.deltas.some((delta) => delta.kind === "turn.boundary") &&
+      deltas().filter((delta) => delta.kind === "turn.boundary").length >= want,
     15_000,
     `turn ${want} completed`,
   );
@@ -99,21 +110,21 @@ send({ jsonrpc: "2.0", id: 9, method: "thread/stop", params: { threadId: "t1", p
 bridge.onClose?.();
 process.stdout.write = originalWrite;
 
-const all = events();
-const deltas = all.filter((e) => e.type === "item/agentMessage/delta");
-const settled = all.filter((e) => e.type === "item/completed");
-const turns = all.filter((e) => e.type === "turn/completed");
-const usage = all.filter((e) => e.type === "thread/tokenUsage/updated");
-const starts = all.filter((e) => e.type === "item/started");
+const all = deltas();
+const textDeltas = all.filter((delta) => delta.kind === "item.textDelta");
+const settled = all.filter((delta) => delta.kind === "item.close");
+const turns = all.filter((delta) => delta.kind === "turn.boundary");
+const usage = all.filter((delta) => delta.kind === "usage");
+const starts = all.filter((delta) => delta.kind === "item.open");
 
 const checks = [
-  ["stream/every-chunk-forwarded", deltas.length === 8, `${deltas.length} deltas: ${JSON.stringify(deltas.map((d) => d.delta))}`],
-  ["stream/one-item-per-turn", starts.length === 2, `${starts.length} item/started`],
+  ["stream/every-chunk-forwarded", textDeltas.length === 8, `${textDeltas.length} deltas: ${JSON.stringify(textDeltas.map((d) => d.text))}`],
+  ["stream/one-item-per-turn", starts.length === 2, `${starts.length} item.open`],
   ["item/settles-with-full-text", settled.every((e) => e.item.text === "alpha beta gamma delta"), JSON.stringify(settled.map((e) => e.item.text))],
-  ["turn/two-turns-one-session", turns.length === 2 && new Set(turns.map((t) => t.scope.turnId)).size === 2, JSON.stringify(turns.map((t) => [t.status, t.scope.turnId]))],
-  ["usage/total-cumulative", usage.length === 2 && usage[1].tokenUsage.total.totalTokens > usage[0].tokenUsage.total.totalTokens, JSON.stringify(usage.map((u) => u.tokenUsage.total.totalTokens))],
-  ["usage/last-is-this-turn", usage.length === 2 && usage[1].tokenUsage.last.totalTokens < usage[1].tokenUsage.total.totalTokens, JSON.stringify(usage.map((u) => u.tokenUsage.last.totalTokens))],
-  ["ordering/delta-before-settle", all.findIndex((e) => e.type === "item/agentMessage/delta") < all.findIndex((e) => e.type === "item/completed"), ""],
+  ["turn/two-turns-one-session", turns.length === 2 && new Set(turns.map((t) => t.providerTurnId)).size === 2, JSON.stringify(turns.map((t) => [t.status, t.providerTurnId]))],
+  ["usage/total-cumulative", usage.length === 2 && usage[1].total.totalTokens > usage[0].total.totalTokens, JSON.stringify(usage.map((u) => u.total.totalTokens))],
+  ["usage/last-is-this-turn", usage.length === 2 && usage[1].last.totalTokens < usage[1].total.totalTokens, JSON.stringify(usage.map((u) => u.last.totalTokens))],
+  ["ordering/delta-before-settle", all.findIndex((delta) => delta.kind === "item.textDelta") < all.findIndex((delta) => delta.kind === "item.close"), ""],
 ];
 
 say("==== fake-agy translation report ====");
