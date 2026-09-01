@@ -44,11 +44,11 @@ export const CHUNK_CHARS = 260;
 export const MAX_SPEAKABLE_CHARS = 20_000;
 
 export const TTS_MODELS = [
+  "gemini-3.1-flash-tts-preview",
   "gemini-2.5-flash-preview-tts",
   "gemini-2.5-pro-preview-tts",
-  "gemini-3.1-flash-tts-preview",
 ] as const;
-export const DEFAULT_MODEL = "gemini-2.5-flash-preview-tts";
+export const DEFAULT_MODEL = "gemini-3.1-flash-tts-preview";
 
 /**
  * The thirty prebuilt voices, taken from the API's own rejection message

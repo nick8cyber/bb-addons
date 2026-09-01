@@ -77,11 +77,22 @@ export default async function plugin(bb: BbPluginApi) {
     const stored = await bb.storage.kv.get<unknown>(PREFS_KEY);
     if (stored === undefined) return DEFAULT_PREFS;
     const parsed = prefsSchema.safeParse(stored);
-    if (parsed.success) return parsed.data;
+    if (parsed.success) {
+      if (parsed.data.model === "gemini-2.5-flash-preview-tts") {
+        const updated = { ...parsed.data, model: DEFAULT_MODEL };
+        await bb.storage.kv.set(PREFS_KEY, updated);
+        bb.log.info(`migrated model from gemini-2.5-flash-preview-tts to ${DEFAULT_MODEL}`);
+        return updated;
+      }
+      return parsed.data;
+    }
     const legacy = typeof stored === "object" && stored !== null ? (stored as Record<string, unknown>) : {};
     const migrated: Prefs = {
       voice: typeof legacy.voice === "string" ? legacy.voice : DEFAULT_PREFS.voice,
-      model: typeof legacy.model === "string" ? legacy.model : DEFAULT_PREFS.model,
+      model:
+        typeof legacy.model === "string" && legacy.model !== "gemini-2.5-flash-preview-tts"
+          ? legacy.model
+          : DEFAULT_PREFS.model,
       browserRate:
         typeof legacy.browserRate === "number"
           ? legacy.browserRate
@@ -152,15 +163,28 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       const prefs = await readPrefs();
-      const result = await synthesizeChunk({
+      let result = await synthesizeChunk({
         baseUrl: await baseUrl(),
         apiKey: key,
         text: piece,
         voice: prefs.voice,
         model: prefs.model,
       });
+
+      // If the selected model fails with auth/quota/unavailable on proxy, retry with default model
+      if (!result.ok && prefs.model !== DEFAULT_MODEL) {
+        bb.log.warn(`chunk ${chunkIndex}/${pieces.length} on ${prefs.model} failed (${result.message}); retrying with ${DEFAULT_MODEL}`);
+        result = await synthesizeChunk({
+          baseUrl: await baseUrl(),
+          apiKey: key,
+          text: piece,
+          voice: prefs.voice,
+          model: DEFAULT_MODEL,
+        });
+      }
+
       if (!result.ok) {
-        bb.log.warn(`chunk ${chunkIndex}/${pieces.length} failed: ${result.code}`);
+        bb.log.warn(`chunk ${chunkIndex}/${pieces.length} failed: ${result.code} — ${result.message}`);
         return { ok: false as const, code: result.code, message: result.message };
       }
       bb.log.info(`synthesized chunk ${chunkIndex + 1}/${pieces.length} as ${prefs.voice}`);
