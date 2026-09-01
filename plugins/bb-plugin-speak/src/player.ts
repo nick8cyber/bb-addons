@@ -34,9 +34,16 @@ import { detectLanguage, toSpeakable } from "./speakable.js";
 /** Which engine produced the sound. */
 export type SpeakSource = "gemini" | "browser";
 
+export type PlaybackStage = "idle" | "generating" | "playing" | "paused";
+
 export interface PlaybackState {
   speaking: boolean;
   messageId: string | null;
+  stage: PlaybackStage;
+  chunkIndex: number;
+  chunkCount: number;
+  speed: number;
+  voice: string;
 }
 
 /**
@@ -70,7 +77,16 @@ function isRetryable(code: SynthesisErrorCode): boolean {
   );
 }
 
-let state: PlaybackState = { speaking: false, messageId: null };
+let currentSpeed = 1;
+let state: PlaybackState = {
+  speaking: false,
+  messageId: null,
+  stage: "idle",
+  chunkIndex: 0,
+  chunkCount: 0,
+  speed: 1,
+  voice: DEFAULT_PREFS.voice,
+};
 const listeners = new Set<(state: PlaybackState) => void>();
 
 /**
@@ -101,10 +117,20 @@ let inFlight: AbortController | null = null;
 /** Object URLs handed to an `<audio>` and not yet revoked. */
 const liveUrls = new Set<string>();
 
-function setState(next: PlaybackState): void {
-  if (next.speaking === state.speaking && next.messageId === state.messageId)
+function setState(next: Partial<PlaybackState>): void {
+  const merged: PlaybackState = { ...state, ...next };
+  if (
+    merged.speaking === state.speaking &&
+    merged.messageId === state.messageId &&
+    merged.stage === state.stage &&
+    merged.chunkIndex === state.chunkIndex &&
+    merged.chunkCount === state.chunkCount &&
+    merged.speed === state.speed &&
+    merged.voice === state.voice
+  ) {
     return;
-  state = next;
+  }
+  state = merged;
   // Snapshot: a listener is allowed to unsubscribe itself from inside the call.
   for (const listener of [...listeners]) {
     try {
@@ -587,7 +613,68 @@ function stop(): void {
 
   cancelBrowserVoice();
   revokeAll();
-  setState({ speaking: false, messageId: null });
+  setState({
+    speaking: false,
+    messageId: null,
+    stage: "idle",
+    chunkIndex: 0,
+    chunkCount: 0,
+  });
+}
+
+function pause(): void {
+  if (state.stage !== "playing") return;
+  const ctx = getAudioContext();
+  if (ctx && ctx.state === "running") {
+    void ctx.suspend().catch(() => {});
+  }
+  if (currentAudio) {
+    try {
+      currentAudio.pause();
+    } catch {}
+  }
+  const scope = globalThis as { speechSynthesis?: SpeechSynthesis };
+  if (scope.speechSynthesis?.speaking) {
+    try {
+      scope.speechSynthesis.pause();
+    } catch {}
+  }
+  setState({ stage: "paused" });
+}
+
+function resume(): void {
+  if (state.stage !== "paused") return;
+  const ctx = getAudioContext();
+  if (ctx && ctx.state === "suspended") {
+    void ctx.resume().catch(() => {});
+  }
+  if (currentAudio) {
+    try {
+      void currentAudio.play();
+    } catch {}
+  }
+  const scope = globalThis as { speechSynthesis?: SpeechSynthesis };
+  if (scope.speechSynthesis?.paused) {
+    try {
+      scope.speechSynthesis.resume();
+    } catch {}
+  }
+  setState({ stage: "playing" });
+}
+
+function setSpeed(speed: number): void {
+  currentSpeed = speed;
+  if (currentBufferSource) {
+    try {
+      currentBufferSource.playbackRate.value = speed;
+    } catch {}
+  }
+  if (currentAudio) {
+    try {
+      currentAudio.playbackRate = speed;
+    } catch {}
+  }
+  setState({ speed });
 }
 
 /**
@@ -607,6 +694,12 @@ async function streamChunks(
   let heard = false;
 
   for (;;) {
+    setState({
+      stage: "generating",
+      chunkIndex: index,
+      chunkCount: Math.max(index + 1, state.chunkCount),
+    });
+
     // If the fetching has fallen behind the playing, this is where the loop
     // waits — silently. A pause is not worth a toast.
     const result = await request;
@@ -639,6 +732,13 @@ async function streamChunks(
     const ahead =
       next < output.chunkCount ? startChunkRequest(text, next) : null;
 
+    setState({
+      stage: "playing",
+      chunkIndex: index,
+      chunkCount: output.chunkCount,
+      voice: output.voice || prefs.voice,
+    });
+
     heard = (await playAudio(output.audioBase64, output.mimeType, mine)) || heard;
     if (mine !== generation) return null;
 
@@ -669,14 +769,21 @@ async function speak(args: { messageId: string; text: string }): Promise<void> {
 
   // `stop()` has just bumped the generation; this run owns the new one.
   const mine = generation;
-  setState({ speaking: true, messageId: args.messageId });
+  setState({
+    speaking: true,
+    messageId: args.messageId,
+    stage: "generating",
+    chunkIndex: 0,
+    chunkCount: 1,
+    speed: currentSpeed,
+  });
 
   const prefs = await loadPrefs();
   if (mine !== generation) return;
 
   const heard = await streamChunks(mine, text, prefs);
   if (heard === null || mine !== generation) return;
-  setState({ speaking: false, messageId: null });
+  setState({ speaking: false, messageId: null, stage: "idle" });
   if (!heard) {
     // Gemini answered, the audio did not arrive at the speakers, and the user
     // is looking at a button that appeared to do nothing. Say so.
@@ -701,9 +808,9 @@ async function preview(audioBase64: string, mimeType: string = AUDIO_MIME): Prom
   unlockAudio();
   stop();
   const mine = generation;
-  setState({ speaking: true, messageId: PREVIEW_MESSAGE_ID });
+  setState({ speaking: true, messageId: PREVIEW_MESSAGE_ID, stage: "playing" });
   const heard = await playAudio(audioBase64, mimeType, mine);
-  if (mine === generation) setState({ speaking: false, messageId: null });
+  if (mine === generation) setState({ speaking: false, messageId: null, stage: "idle" });
   return heard;
 }
 
@@ -712,6 +819,12 @@ export const player = {
   speak,
   preview,
   stop,
+  pause,
+  resume,
+  setSpeed,
+  getSpeed(): number {
+    return currentSpeed;
+  },
   getState(): PlaybackState {
     return state;
   },
