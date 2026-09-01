@@ -78,8 +78,26 @@ export default async function plugin(bb: BbPluginApi) {
     if (stored === undefined) return DEFAULT_PREFS;
     const parsed = prefsSchema.safeParse(stored);
     if (parsed.success) return parsed.data;
-    bb.log.warn("stored preferences did not validate; falling back to the defaults");
-    return DEFAULT_PREFS;
+    const legacy = typeof stored === "object" && stored !== null ? (stored as Record<string, unknown>) : {};
+    const migrated: Prefs = {
+      voice: typeof legacy.voice === "string" ? legacy.voice : DEFAULT_PREFS.voice,
+      model: typeof legacy.model === "string" ? legacy.model : DEFAULT_PREFS.model,
+      browserRate:
+        typeof legacy.browserRate === "number"
+          ? legacy.browserRate
+          : typeof legacy.speakingRate === "number"
+            ? legacy.speakingRate
+            : DEFAULT_PREFS.browserRate,
+      fallbackEnabled:
+        typeof legacy.fallbackEnabled === "boolean"
+          ? legacy.fallbackEnabled
+          : DEFAULT_PREFS.fallbackEnabled,
+    };
+    const validated = prefsSchema.safeParse(migrated);
+    const result = validated.success ? validated.data : DEFAULT_PREFS;
+    bb.log.info(`migrated legacy speak preferences to current schema (voice ${result.voice}, model ${result.model})`);
+    await bb.storage.kv.set(PREFS_KEY, result);
+    return result;
   };
 
   const notConfigured = () => ({
