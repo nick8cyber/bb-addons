@@ -38,13 +38,13 @@ export function SpeakOverlay() {
   };
 
   return (
-    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 pointer-events-auto">
-      <div className="flex items-center gap-3 rounded-full border border-border bg-background/95 px-4 py-2 shadow-2xl backdrop-blur-md text-xs font-medium text-foreground transition-all duration-200 ease-out select-none">
+    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 pointer-events-auto max-w-[calc(100vw-1.5rem)] touch-manipulation">
+      <div className="flex items-center gap-2.5 sm:gap-3 rounded-full border border-border bg-background/95 px-3.5 sm:px-4 py-2 shadow-2xl backdrop-blur-md text-xs font-medium text-foreground transition-all duration-200 ease-out select-none">
         {/* Status icon / Spinner */}
         {isGenerating ? (
           <div className="flex items-center gap-2 text-amber-500 dark:text-amber-400">
             <svg
-              className="size-4 animate-spin"
+              className="size-4 animate-spin shrink-0"
               viewBox="0 0 24 24"
               fill="none"
               stroke="currentColor"
@@ -57,10 +57,10 @@ export function SpeakOverlay() {
                 d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
               />
             </svg>
-            <span className="font-medium text-foreground">
+            <span className="font-medium text-foreground whitespace-nowrap">
               Синтез речи…
               {playback.chunkCount > 1
-                ? ` (чанк ${playback.chunkIndex + 1}/${playback.chunkCount})`
+                ? ` (${playback.chunkIndex + 1}/${playback.chunkCount})`
                 : ""}
             </span>
           </div>
@@ -69,7 +69,7 @@ export function SpeakOverlay() {
             {/* Play/Pause Button */}
             <button
               type="button"
-              className="flex size-7 items-center justify-center rounded-full bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+              className="flex size-8 items-center justify-center rounded-full bg-primary text-primary-foreground hover:bg-primary/90 active:scale-95 transition-all shrink-0"
               onClick={() => {
                 if (isPaused) {
                   player.resume();
@@ -80,11 +80,11 @@ export function SpeakOverlay() {
               title={isPaused ? "Продолжить" : "Пауза"}
             >
               {isPaused ? (
-                <svg className="size-3.5 fill-current ml-0.5" viewBox="0 0 24 24">
+                <svg className="size-4 fill-current ml-0.5" viewBox="0 0 24 24">
                   <polygon points="5 3 19 12 5 21 5 3" />
                 </svg>
               ) : (
-                <svg className="size-3.5 fill-current" viewBox="0 0 24 24">
+                <svg className="size-4 fill-current" viewBox="0 0 24 24">
                   <rect x="6" y="4" width="4" height="16" rx="1" />
                   <rect x="14" y="4" width="4" height="16" rx="1" />
                 </svg>
@@ -92,8 +92,8 @@ export function SpeakOverlay() {
             </button>
 
             {/* Playback info */}
-            <div className="flex items-center gap-1.5 px-1">
-              <span className="text-muted-foreground">
+            <div className="flex items-center gap-1.5 px-0.5 whitespace-nowrap">
+              <span className="text-muted-foreground hidden sm:inline">
                 {isPaused ? "Пауза" : "Воспроизведение"}
               </span>
               <span className="font-semibold text-foreground">
@@ -109,7 +109,7 @@ export function SpeakOverlay() {
             {/* Speed toggle */}
             <button
               type="button"
-              className="rounded-md border border-border/80 bg-muted/60 px-2 py-0.5 text-[11px] font-mono hover:bg-muted transition-colors text-foreground"
+              className="rounded-md border border-border/80 bg-muted/60 px-2 py-1 text-[11px] font-mono hover:bg-muted active:scale-95 transition-all text-foreground shrink-0"
               onClick={nextSpeed}
               title="Изменить скорость воспроизведения"
             >
@@ -119,16 +119,16 @@ export function SpeakOverlay() {
         )}
 
         {/* Separator */}
-        <div className="h-4 w-px bg-border/60" />
+        <div className="h-4 w-px bg-border/60 shrink-0" />
 
         {/* Stop / Close Button */}
         <button
           type="button"
-          className="flex size-5 items-center justify-center rounded-full text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          className="flex size-6 items-center justify-center rounded-full text-muted-foreground hover:text-foreground hover:bg-muted active:scale-95 transition-all shrink-0"
           onClick={() => player.stop()}
           title="Закрыть плеер"
         >
-          <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+          <svg className="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
             <line x1="18" y1="6" x2="6" y2="18" />
             <line x1="6" y1="6" x2="18" y2="18" />
           </svg>
