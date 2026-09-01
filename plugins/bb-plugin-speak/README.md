@@ -25,6 +25,40 @@ over playback speed, pause/resume, and chunk progress.
 2. **Pick a Voice**:
    Choose your favorite voice (`Kore`, `Aoede`, `Fenrir`, `Puck`, `Charon`) in settings.
 
+## When a daily quota runs out
+
+AI Studio meters each TTS model separately on its free tier, so 3.1 running dry
+says nothing about 2.5. Settings has two pickers for this: **Model**, and
+**When spent** — the one to move to. Leave *When spent* empty and the reading
+stops at the browser's own voice instead.
+
+The switch is deliberately narrow. Only a spent quota changes model: a rejected
+key or an unreachable endpoint fails identically on the second model, and
+retrying would just double the wait before the browser voice takes over.
+
+Google answers both a spent *daily* allowance and a tripped *per-minute* limit
+with the same HTTP 429, and they deserve very different treatment — the player
+fetches several chunks at once, which is exactly what trips the minute. So the
+metric named in the error body decides:
+
+| What Google says ran out | How long that model is skipped |
+| --- | --- |
+| a violation naming the day | until the next midnight, Pacific — where Google rolls daily quotas over |
+| a per-minute limit | the `retryDelay` it asked for, or ninety seconds |
+| a 429 naming neither | ninety seconds — the cheaper of the two wrong guesses |
+
+A per-minute cooldown never outlives the day it sits inside. And if every model
+is benched the chain is tried anyway rather than refusing: the cooldown is this
+plugin's guess about a clock it does not own.
+
+Behind a CLIProxyAPI this reads on the pool rather than on one account. Its
+`max-retry-credentials: 0` — "try all available credentials" in its own
+documentation — means a quota error reaching the plugin is every account in the
+pool being out for that model, not one unlucky key.
+
+`bb speak status` prints both models and, when one is benched, the time it
+comes back.
+
 ## Layout
 
 | Path | What lives there |
@@ -50,5 +84,19 @@ npx tsc --noEmit
 node --experimental-strip-types --test tests/*.test.ts
 ```
 
-`bb speak status` reports whether a key is configured and what the current
-preferences are, without printing the key.
+`bb speak status` reports whether a key is configured, both models and any
+quota cooldown on them, and the rest of the current preferences — never the key
+itself.
+
+The model is a preference rather than a plugin setting, so it is not reachable
+through `bb plugin config` (which owns only `geminiApiKey` and `baseUrl`).
+Change it in the settings section, or post a complete preferences object —
+`prefsSchema` validates all five fields together and rejects a partial one:
+
+```bash
+curl -X POST http://127.0.0.1:<bb-port>/api/v1/plugins/speak/rpc/savePrefs \
+  -H 'content-type: application/json' \
+  -d '{"prefs":{"voice":"Kore","model":"gemini-2.5-flash-preview-tts",
+       "fallbackModel":"gemini-3.1-flash-tts-preview","browserRate":1,
+       "fallbackEnabled":true}}'
+```
