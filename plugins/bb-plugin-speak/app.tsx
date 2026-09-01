@@ -11,9 +11,15 @@
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 
 import { SpeakSection } from "./src/SpeakSection.js";
+import { mountSpeakOverlay } from "./src/SpeakOverlay.js";
 import { player } from "./src/player.js";
 
 export default definePluginApp((app) => {
+  app.contentScripts.register({
+    id: "speak-overlay",
+    mount: mountSpeakOverlay,
+  });
+
   app.slots.messageAction({
     id: "speak",
     title: "Read aloud",

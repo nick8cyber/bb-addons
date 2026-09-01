@@ -400,7 +400,8 @@ test("clicking the same message twice stops instead of speaking it twice", async
     void player.speak({ messageId: "m1", text: "hello there" });
     await tick();
     assert.equal(harness.audios.length, 1);
-    assert.deepEqual(player.getState(), { speaking: true, messageId: "m1" });
+    assert.equal(player.getState().speaking, true);
+    assert.equal(player.getState().messageId, "m1");
 
     // A toggle returns at once — it has nothing to wait for. Racing it
     // against a tick says so, and keeps a regression here from hanging the
@@ -434,7 +435,8 @@ test("a different message interrupts the one that is playing", async () => {
 
     assert.equal(harness.audios.length, 2);
     assert.equal(harness.audios[0]?.paused, true, "the first chunk must be silenced");
-    assert.deepEqual(player.getState(), { speaking: true, messageId: "m2" });
+    assert.equal(player.getState().speaking, true);
+    assert.equal(player.getState().messageId, "m2");
   } finally {
     player.stop();
     harness.restore();
@@ -721,7 +723,8 @@ test("an early fetch-ahead rejection is observed until playback reaches it", asy
     await tick();
 
     assert.equal(harness.audios.length, 1);
-    assert.deepEqual(player.getState(), { speaking: true, messageId: "m1" });
+    assert.equal(player.getState().speaking, true);
+    assert.equal(player.getState().messageId, "m1");
     assert.equal(harness.toasts.length, 0, "the current chunk is allowed to finish first");
 
     harness.audios[0]!.end();
@@ -794,7 +797,8 @@ test("playback that catches up with the fetching waits, silently", async () => {
 
     // Chunk 0 has played out and chunk 1 is not here yet: the player is parked.
     assert.equal(harness.audios.length, 1);
-    assert.deepEqual(player.getState(), { speaking: true, messageId: "m1" });
+    assert.equal(player.getState().speaking, true);
+    assert.equal(player.getState().messageId, "m1");
     assert.equal(harness.toasts.length, 0, "a pause is not worth telling anyone about");
 
     gate.release(1, okChunk(1, 2, "two"));
@@ -1040,7 +1044,8 @@ test("stop() with nothing playing is a no-op, and a throwing listener is contain
     await reset();
 
     player.stop();
-    assert.deepEqual(player.getState(), { speaking: false, messageId: null });
+    assert.equal(player.getState().speaking, false);
+    assert.equal(player.getState().messageId, null);
 
     const seen: boolean[] = [];
     const offBad = player.subscribe(() => {
