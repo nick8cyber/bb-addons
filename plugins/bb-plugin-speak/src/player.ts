@@ -364,6 +364,24 @@ async function fetchChunk(
   }
 }
 
+type ChunkRequestResult = { output: SynthesizeOutput } | { error: true };
+
+/**
+ * Observe rejection as soon as fetch-ahead starts, even though the playback
+ * loop may not inspect the result until the current chunk has finished. A raw
+ * rejected promise left parked for several seconds would otherwise reach the
+ * browser as an `unhandledrejection` before the loop got around to its catch.
+ */
+function startChunkRequest(
+  text: string,
+  chunkIndex: number,
+): Promise<ChunkRequestResult> {
+  return fetchChunk(text, chunkIndex).then(
+    (output) => ({ output }),
+    () => ({ error: true }),
+  );
+}
+
 // --- the public surface -----------------------------------------------------
 
 /**
@@ -478,17 +496,15 @@ async function streamChunks(
   text: string,
   prefs: Prefs,
 ): Promise<boolean | null> {
-  let request = fetchChunk(text, 0);
+  let request = startChunkRequest(text, 0);
   let index = 0;
   let heard = false;
 
   for (;;) {
-    let output: SynthesizeOutput;
-    try {
-      // If the fetching has fallen behind the playing, this is where the loop
-      // waits — silently. A pause is not worth a toast.
-      output = await request;
-    } catch {
+    // If the fetching has fallen behind the playing, this is where the loop
+    // waits — silently. A pause is not worth a toast.
+    const result = await request;
+    if ("error" in result) {
       // An abort lands here too, and the guard below is what tells the two
       // apart: a stop has already bumped the generation.
       if (mine !== generation) return null;
@@ -500,6 +516,7 @@ async function streamChunks(
       return null;
     }
     if (mine !== generation) return null;
+    const output = result.output;
 
     if (!output.ok) {
       if (index === 0) {
@@ -513,7 +530,8 @@ async function streamChunks(
     // Ask for the next one before playing this one — that overlap is the whole
     // point of the loop — but only while this run still owns the speakers.
     const next = index + 1;
-    const ahead = next < output.chunkCount ? fetchChunk(text, next) : null;
+    const ahead =
+      next < output.chunkCount ? startChunkRequest(text, next) : null;
 
     heard = (await playAudio(output.audioBase64, output.mimeType, mine)) || heard;
     if (mine !== generation) return null;

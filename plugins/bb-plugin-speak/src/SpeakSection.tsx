@@ -188,7 +188,7 @@ export function SpeakSection() {
               <option key={voice} value={voice}>
                 {/* Thirty star names in alphabetical order give a reader no
                     reason to start anywhere in particular. This is the one. */}
-                {voice === DEFAULT_VOICE ? `${voice} — default` : voice}
+                {voice === DEFAULT_VOICE ? `${voice} — Hermes default` : voice}
               </option>
             ))}
           </select>

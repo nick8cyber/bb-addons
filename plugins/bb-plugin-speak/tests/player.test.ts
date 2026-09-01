@@ -668,6 +668,74 @@ test("the next chunk is fetched while the current one is still playing", async (
   }
 });
 
+test("chunks play in order even when a later answer is ready first", async () => {
+  const gate = makeGate();
+  const harness = install({
+    autoEnd: false,
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      return gate.hold(Number(body.chunkIndex));
+    },
+  });
+  try {
+    await reset();
+
+    void player.speak({ messageId: "m1", text: "two chunks worth" });
+    await tick();
+    assert.deepEqual(chunkCalls(harness), [0]);
+
+    // Make chunk 1 ready before chunk 0. The player still cannot ask for it
+    // until chunk 0 establishes chunkCount, and cannot play it before chunk 0.
+    gate.release(1, okChunk(1, 2, "two"));
+    gate.release(0, okChunk(0, 2, "one"));
+    await tick();
+
+    assert.deepEqual(chunkCalls(harness), [0, 1]);
+    assert.equal(harness.audios.length, 1, "the ready later chunk waits its turn");
+    assert.deepEqual(await played(harness), ["one"]);
+
+    harness.audios[0]!.end();
+    await tick();
+    assert.equal(harness.audios.length, 2);
+    assert.deepEqual(await played(harness), ["one", "two"]);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
+test("an early fetch-ahead rejection is observed until playback reaches it", async () => {
+  const harness = install({
+    autoEnd: false,
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      if (Number(body.chunkIndex) === 0) return okChunk(0, 2, "one");
+      return Promise.reject(new Error("connect ECONNREFUSED 127.0.0.1:7777"));
+    },
+  });
+  try {
+    await reset();
+
+    const speaking = player.speak({ messageId: "m1", text: "two chunks worth" });
+    await tick();
+    await tick();
+
+    assert.equal(harness.audios.length, 1);
+    assert.deepEqual(player.getState(), { speaking: true, messageId: "m1" });
+    assert.equal(harness.toasts.length, 0, "the current chunk is allowed to finish first");
+
+    harness.audios[0]!.end();
+    await speaking;
+
+    assert.equal(harness.utterances.length, 0, "the browser voice does not restart the message");
+    assert.equal(harness.toasts.length, 1);
+    assert.match(harness.toasts[0]!.message, /stopped part-way through/);
+  } finally {
+    player.stop();
+    harness.restore();
+  }
+});
+
 test("never more than one chunk request is outstanding", async () => {
   const gate = makeGate();
   const harness = install({
