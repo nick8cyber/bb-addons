@@ -7,6 +7,41 @@ plus a provider bridge, the same shape `provider-claude-code` and
 Built and verified against **bb 0.40.0** (`@get-bb/plugin-sdk` 0.4.21), which
 speaks **provider bridge protocol version 2** and thread-delta grammar v3.
 
+## Setup
+
+Installing the plugin does not install the CLI, and bb cannot sign in for you:
+the credential belongs to the machine that runs the turn. Both steps happen
+**on that machine**, not in bb.
+
+1. **Install agy.**
+
+   ```
+   curl -fsSL https://antigravity.google/cli/install.sh | bash
+   ```
+
+   Windows uses the PowerShell installer from the same page. The binary lands
+   at `~/.local/bin/agy`, which is the first place this bridge looks; after
+   that it walks `PATH`, and `AGY_PATH` overrides both
+   (`resolveAgyCommand` in `src/agy-cli.ts`).
+
+2. **Sign in.** Run `agy` once. There is no `login` subcommand — the first run
+   opens a browser, and over SSH it prints a URL and takes the code you paste
+   back. It needs a Google account with Antigravity access, and the token is
+   kept by the machine's keyring; bb never sees it. A headless host can use
+   `GEMINI_API_KEY` with `"modelProvider": "gemini"` in
+   `~/.gemini/antigravity-cli/settings.json` instead.
+
+3. **Check.** `agy models` lists the models on that machine, and the same list
+   is what the provider offers in bb's picker. An empty picker means step 1 or
+   2 has not happened on the machine bb is asking — the bridge reports the
+   failure rather than hiding it, and `bb provider models agy` shows the same
+   answer the picker gets.
+
+The same three steps are rendered in bb under Settings, in this provider's own
+section, so the plugin explains itself where it is configured. `server.ts`
+also declares the `signInHint` / `expiredHint` / `installUrl` strings bb shows
+on its own surfaces when a host has no working agy.
+
 ## Before you install it
 
 **Threads on this provider run without approval prompts.** agy's stream-json
@@ -27,9 +62,9 @@ variables passed to a thread are never written to it: only argv is logged, and
 the passthrough travels in the child's environment. The log stays on the
 machine that ran the turn; this plugin sends nothing anywhere.
 
-The same two paragraphs are rendered in bb under Settings, as the provider's
-own section (`app.tsx` → `src/AgySafetySection.tsx`), so they are visible
-where the provider is configured and not only here.
+Both paragraphs are rendered in bb under Settings too, below the setup steps
+(`app.tsx` → `src/AgySafetySection.tsx`), so they are visible where the
+provider is configured and not only here.
 
 ## Layout
 
@@ -40,7 +75,7 @@ where the provider is configured and not only here.
 | `src/provider-bridge.ts` | the bridge: JSON-RPC handlers, session/turn state, agy → `thread/delta` translation |
 | `src/agy-cli.ts` | everything that knows agy's argv and its NDJSON dialect |
 | `app.tsx` | the `bb.app` frontend; registers the provider mark inline and the settings notice |
-| `src/AgySafetySection.tsx` | that notice: what a turn may do without asking, and what gets logged |
+| `src/AgySafetySection.tsx` | that section: the setup steps, then what a turn may do without asking and what gets logged |
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |

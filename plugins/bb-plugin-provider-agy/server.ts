@@ -34,6 +34,18 @@ export default function plugin(bb: BbPluginApi) {
       // agy's own ladder; the model list encodes the effort in the model id.
       reasoningLevels: ["low", "medium", "high"],
     },
+    // What bb says when a host has no working agy. The CLI has no `login`
+    // subcommand: running `agy` once is the sign-in, because that is what
+    // opens the browser flow (over SSH it prints a URL and takes a pasted
+    // code instead). Both hints name the machine on purpose — the credential
+    // lives on the host that runs the turn, not in bb.
+    strings: {
+      signInHint:
+        "Run `agy` once on the machine to sign in with a Google account that has Antigravity access.",
+      expiredHint:
+        "agy's sign-in is no longer valid. Run `agy` on the machine to sign in again.",
+      installUrl: "https://antigravity.google/docs/cli/getting-started",
+    },
     composerActions: [],
   });
 }
