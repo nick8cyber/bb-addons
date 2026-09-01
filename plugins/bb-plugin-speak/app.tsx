@@ -17,10 +17,11 @@ export default definePluginApp((app) => {
   app.slots.messageAction({
     id: "speak",
     title: "Read aloud",
-    // "Play" on purpose. bb's icon set (ICON_NAMES in the app bundle) has no
-    // speaker, volume or ear glyph — an unknown name does not warn, it
-    // silently degrades to a generic icon, so "Volume2" would look like a
-    // rendering bug rather than a typo. Check the set before changing this.
+    // Only the text-selection menu reads this name; bb's icon set has no
+    // speaker, so `Play` is the nearest thing there. The button in the action
+    // bar ignores it entirely and masks this plugin's own branding SVG
+    // (`icons/speak.svg`) into a 12px span — which is where the speaker
+    // actually comes from, and why that file is drawn for 12px.
     icon: "Play",
     run: (context) => {
       // The action appears on user messages too. The SDK offers no predicate
