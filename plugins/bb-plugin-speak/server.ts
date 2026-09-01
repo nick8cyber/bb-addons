@@ -5,48 +5,54 @@
  * `secret` plugin setting, which the SDK keeps in a 0600 file outside the
  * database and never includes in any payload sent to a frontend. So the app
  * posts text here, and this file is the only place that holds a key, builds a
- * Google URL, or sees an error body that might quote one back.
+ * Gemini URL, or sees an error body that might quote one back.
+ *
+ * One call synthesizes one chunk. The split is a pure function of the text, so
+ * the client sends nothing but an index and this file re-derives the very same
+ * boundaries — see `src/chunk.ts`.
  */
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 
 import {
   AUDIO_MIME,
-  AUTO_LANGUAGES,
   DEFAULT_PREFS,
-  DEFAULT_VOICES,
+  GEMINI_VOICES,
   MAX_SPEAKABLE_CHARS,
+  TTS_MODELS,
   contract,
   prefsSchema,
-  type AutoLanguage,
   type Prefs,
 } from "./src/contract.js";
 import { chunkForSynthesis } from "./src/chunk.js";
-import { listVoices, synthesizeChunk } from "./src/google-tts.js";
+import { synthesizeChunk } from "./src/gemini-tts.js";
 
 const PREFS_KEY = "prefs";
 
 /** Where a human is told to go when there is no key. */
 const WHERE_TO_PUT_THE_KEY = "Settings → Extensions → Speak";
 
+/** Short enough to audition a voice in a second or two, long enough to judge it. */
+const PROBE_TEXT = "Проверка голоса: так это будет звучать вслух.";
+
 export const rpcContract = defineRpcContract(contract);
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    googleApiKey: {
+    geminiApiKey: {
       type: "string",
       // `secret: true` is the whole reason this plugin has a server half: the
       // value stays in a 0600 file, out of bb.db and out of every frontend
       // payload, so synthesis has to happen here rather than in the browser.
       secret: true,
-      label: "Google Cloud API key",
+      label: "Gemini API key",
       description:
-        "An API key from a Google Cloud project with the Cloud Text-to-Speech API enabled — enable the Cloud Text-to-Speech API on the project the key belongs to, or every request comes back as 403. Restrict the key to that one API.",
+        "A Gemini API key from Google AI Studio — https://aistudio.google.com/app/apikey. This is not a Google Cloud console key: a Cloud Text-to-Speech key pasted here is rejected, because the engine is Gemini's TTS on generativelanguage.googleapis.com, a different API on a different key.",
     },
   });
 
   /** The key, or undefined when it is absent or blank. Never logged. */
   const apiKey = async (): Promise<string | undefined> => {
-    const value = (await settings.get()).googleApiKey;
+    const value = (await settings.get()).geminiApiKey;
     const trimmed = typeof value === "string" ? value.trim() : "";
     return trimmed.length > 0 ? trimmed : undefined;
   };
@@ -61,47 +67,28 @@ export default async function plugin(bb: BbPluginApi) {
     return DEFAULT_PREFS;
   };
 
-  /**
-   * An explicit preference wins; otherwise the two languages the plugin knows
-   * get their curated voice, and anything else is left for Google to choose.
-   */
-  const resolveVoice = (prefs: Prefs, languageCode: string): string | undefined => {
-    const chosen = prefs.voices[languageCode]?.trim();
-    if (chosen) return chosen;
-    if ((AUTO_LANGUAGES as readonly string[]).includes(languageCode)) {
-      return DEFAULT_VOICES[languageCode as AutoLanguage];
-    }
-    return undefined;
-  };
+  const notConfigured = () => ({
+    ok: false as const,
+    code: "not_configured" as const,
+    message: `No Gemini API key yet. Add one in ${WHERE_TO_PUT_THE_KEY}.`,
+  });
 
   bb.rpc.register(rpcContract, {
     status: async () => ({
       configured: (await apiKey()) !== undefined,
       prefs: await readPrefs(),
-      autoLanguages: [...AUTO_LANGUAGES],
-      defaultVoices: { ...DEFAULT_VOICES },
+      voices: [...GEMINI_VOICES],
+      models: [...TTS_MODELS],
     }),
 
     savePrefs: async ({ prefs }) => {
       const validated = prefsSchema.parse(prefs);
       await bb.storage.kv.set(PREFS_KEY, validated);
-      bb.log.info(`preferences saved (rate ${validated.speakingRate})`);
+      bb.log.info(`preferences saved (voice ${validated.voice}, model ${validated.model})`);
       return { prefs: validated };
     },
 
-    voices: async ({ languageCode }) => {
-      const key = await apiKey();
-      if (!key) {
-        return {
-          ok: false as const,
-          code: "not_configured" as const,
-          message: `No Google API key yet. Add one in ${WHERE_TO_PUT_THE_KEY}.`,
-        };
-      }
-      return await listVoices({ apiKey: key, languageCode });
-    },
-
-    synthesize: async ({ text, languageCode }) => {
+    synthesize: async ({ text, chunkIndex }) => {
       if (text.trim().length === 0) {
         return { ok: false as const, code: "empty" as const, message: "There is nothing to read." };
       }
@@ -113,46 +100,68 @@ export default async function plugin(bb: BbPluginApi) {
         };
       }
       const key = await apiKey();
-      if (!key) {
-        return {
-          ok: false as const,
-          code: "not_configured" as const,
-          message: `No Google API key yet. Add one in ${WHERE_TO_PUT_THE_KEY}.`,
-        };
-      }
+      if (!key) return notConfigured();
 
-      const prefs = await readPrefs();
-      const voiceName = resolveVoice(prefs, languageCode);
       const pieces = chunkForSynthesis(text);
       if (pieces.length === 0) {
         return { ok: false as const, code: "empty" as const, message: "There is nothing to read." };
       }
-
-      const chunks: string[] = [];
-      // Sequentially: firing a long message's chunks in parallel trips
-      // Google's per-minute quota, and the audio has to be ordered anyway.
-      for (const piece of pieces) {
-        const result = await synthesizeChunk({
-          apiKey: key,
-          text: piece,
-          languageCode,
-          voiceName,
-          speakingRate: prefs.speakingRate,
-        });
-        if (!result.ok) {
-          bb.log.warn(`synthesis stopped after ${chunks.length}/${pieces.length} chunks: ${result.code}`);
-          return { ok: false as const, code: result.code, message: result.message };
-        }
-        chunks.push(result.audioBase64);
+      const piece = pieces[chunkIndex];
+      if (piece === undefined) {
+        // The client asked past the end of a split it derived from the same
+        // text with the same function, so either the text changed underneath
+        // it or the two halves have drifted. Either way, say which it was.
+        return {
+          ok: false as const,
+          code: "request_failed" as const,
+          message: `Chunk ${chunkIndex} does not exist; this text has ${pieces.length} chunk(s).`,
+        };
       }
-      bb.log.info(`synthesized ${chunks.length} chunk(s) for ${languageCode}`);
-      return { ok: true as const, mimeType: AUDIO_MIME as typeof AUDIO_MIME, voice: voiceName ?? "", chunks };
+
+      const prefs = await readPrefs();
+      const result = await synthesizeChunk({
+        apiKey: key,
+        text: piece,
+        voice: prefs.voice,
+        model: prefs.model,
+      });
+      if (!result.ok) {
+        bb.log.warn(`chunk ${chunkIndex}/${pieces.length} failed: ${result.code}`);
+        return { ok: false as const, code: result.code, message: result.message };
+      }
+      bb.log.info(`synthesized chunk ${chunkIndex + 1}/${pieces.length} as ${prefs.voice}`);
+      return {
+        ok: true as const,
+        mimeType: AUDIO_MIME as typeof AUDIO_MIME,
+        voice: prefs.voice,
+        chunkIndex,
+        chunkCount: pieces.length,
+        audioBase64: result.wavBase64,
+      };
+    },
+
+    probe: async ({ voice, model }) => {
+      const key = await apiKey();
+      if (!key) return notConfigured();
+      // Deliberately the arguments and not the saved preferences: the point of
+      // Test is to hear a voice before committing to it.
+      const result = await synthesizeChunk({ apiKey: key, text: PROBE_TEXT, voice, model });
+      if (!result.ok) {
+        bb.log.warn(`probe of ${voice} on ${model} failed: ${result.code}`);
+        return { ok: false as const, code: result.code, message: result.message };
+      }
+      bb.log.info(`probed ${voice} on ${model}`);
+      return {
+        ok: true as const,
+        mimeType: AUDIO_MIME as typeof AUDIO_MIME,
+        audioBase64: result.wavBase64,
+      };
     },
   });
 
   bb.cli.register({
     name: "speak",
-    summary: "Read chat messages aloud through Google Cloud Text-to-Speech",
+    summary: "Read chat messages aloud through Gemini TTS",
     commands: [
       { name: "status", summary: "Show whether a key is configured, and the current voice settings", usage: "bb speak status" },
     ],
@@ -169,14 +178,11 @@ export default async function plugin(bb: BbPluginApi) {
       const lines = [
         // Only ever the boolean: printing any part of the key would put it in
         // a shell history and a terminal scrollback.
-        `Google API key: ${configured ? "configured" : `not set — add it in ${WHERE_TO_PUT_THE_KEY}`}`,
-        `speaking rate:  ${prefs.speakingRate}`,
-        `browser voice fallback: ${prefs.fallbackEnabled ? "on" : "off"}`,
-        "voices:",
+        `Gemini API key: ${configured ? "configured" : `not set — add it in ${WHERE_TO_PUT_THE_KEY}`}`,
+        `voice:          ${prefs.voice}`,
+        `model:          ${prefs.model}`,
+        `browser voice fallback: ${prefs.fallbackEnabled ? `on (rate ${prefs.browserRate})` : "off"}`,
       ];
-      const entries = Object.entries(prefs.voices);
-      if (entries.length === 0) lines.push("  (none chosen; Google picks per language)");
-      for (const [language, voice] of entries) lines.push(`  ${language.padEnd(8)} ${voice}`);
       return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
     },
   });
