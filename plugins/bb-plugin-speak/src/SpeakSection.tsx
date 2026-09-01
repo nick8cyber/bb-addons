@@ -109,6 +109,7 @@ export function SpeakSection() {
       const result = await rpc<ProbeOutput>("probe", {
         voice: form.voice,
         model: form.model,
+        fallbackModel: form.fallbackModel,
       });
       if (!result.ok) {
         toast.error(FAILURE_COPY[result.code]);
@@ -219,6 +220,35 @@ export function SpeakSection() {
             ))}
           </select>
         </div>
+
+        <div className="flex items-center gap-2">
+          <label className="w-28 shrink-0 font-medium text-foreground" htmlFor="speak-fallback-model">
+            When spent
+          </label>
+          <select
+            id="speak-fallback-model"
+            className="min-w-0 flex-1 rounded-md border bg-background px-2 py-1 font-mono text-[11px]"
+            value={form.fallbackModel}
+            onChange={(event) => setForm({ ...form, fallbackModel: event.target.value })}
+          >
+            <option value="">stop and use the browser voice</option>
+            {withSelected(status.models, form.fallbackModel)
+              .filter((model) => model !== form.model)
+              .map((model) => (
+                <option key={model} value={model}>
+                  {model}
+                </option>
+              ))}
+          </select>
+        </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          Each model has its own daily free-tier allowance, so one running out
+          says nothing about the other. The proxy tries every account in the
+          pool before it reports a quota as spent, so when that happens the
+          reading moves to the second model and stays there until the
+          allowance rolls over at midnight Pacific.
+        </p>
 
         <p className="text-[11px] text-muted-foreground">
           {status.configured

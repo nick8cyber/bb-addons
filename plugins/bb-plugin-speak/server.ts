@@ -17,6 +17,7 @@ import {
   AUDIO_MIME,
   DEFAULT_MODEL,
   DEFAULT_PREFS,
+  FALLBACK_MODEL,
   GEMINI_BASE_URL,
   GEMINI_VOICES,
   MAX_SPEAKABLE_CHARS,
@@ -26,6 +27,7 @@ import {
   type Prefs,
 } from "./src/contract.js";
 import { chunkForSynthesis } from "./src/chunk.js";
+import { isQuotaFailure, nextQuotaReset, planModels } from "./src/model-chain.js";
 import { synthesizeChunk } from "./src/gemini-tts.js";
 
 const PREFS_KEY = "prefs";
@@ -73,27 +75,44 @@ export default async function plugin(bb: BbPluginApi) {
     return trimmed.length > 0 ? trimmed : GEMINI_BASE_URL;
   };
 
+  /**
+   * Which models are known to be out of quota, and until when. Kept in kv so
+   * the knowledge survives a reload and so the other chunks of the same
+   * message do not each re-discover it at the cost of a wasted round trip.
+   */
+  const COOLDOWN_KEY = "quota-cooldown";
+  const readCooldowns = async (): Promise<Record<string, number>> => {
+    const stored = await bb.storage.kv.get<unknown>(COOLDOWN_KEY);
+    if (stored === null || typeof stored !== "object") return {};
+    const out: Record<string, number> = {};
+    for (const [model, until] of Object.entries(stored as Record<string, unknown>)) {
+      if (typeof until === "number" && Number.isFinite(until)) out[model] = until;
+    }
+    return out;
+  };
+  const markExhausted = async (model: string): Promise<void> => {
+    const until = nextQuotaReset();
+    await bb.storage.kv.set(COOLDOWN_KEY, { ...(await readCooldowns()), [model]: until });
+  };
+
   /** Non-secret preferences live in kv; anything unreadable becomes defaults. */
   const readPrefs = async (): Promise<Prefs> => {
     const stored = await bb.storage.kv.get<unknown>(PREFS_KEY);
     if (stored === undefined) return DEFAULT_PREFS;
     const parsed = prefsSchema.safeParse(stored);
-    if (parsed.success) {
-      if (parsed.data.model === "gemini-2.5-flash-preview-tts") {
-        const updated = { ...parsed.data, model: DEFAULT_MODEL };
-        await bb.storage.kv.set(PREFS_KEY, updated);
-        bb.log.info(`migrated model from gemini-2.5-flash-preview-tts to ${DEFAULT_MODEL}`);
-        return updated;
-      }
-      return parsed.data;
-    }
+    // Deliberately no rewriting of a saved model here. An earlier version
+    // forced 2.5 back to 3.1 on every read, which made 2.5 impossible to
+    // choose — and it is now the fallback, so it has to survive being stored.
+    if (parsed.success) return parsed.data;
     const legacy = typeof stored === "object" && stored !== null ? (stored as Record<string, unknown>) : {};
     const migrated: Prefs = {
       voice: typeof legacy.voice === "string" ? legacy.voice : DEFAULT_PREFS.voice,
-      model:
-        typeof legacy.model === "string" && legacy.model !== "gemini-2.5-flash-preview-tts"
-          ? legacy.model
-          : DEFAULT_PREFS.model,
+      model: typeof legacy.model === "string" && legacy.model.length > 0
+        ? legacy.model
+        : DEFAULT_PREFS.model,
+      fallbackModel: typeof legacy.fallbackModel === "string"
+        ? legacy.fallbackModel
+        : DEFAULT_PREFS.fallbackModel,
       browserRate:
         typeof legacy.browserRate === "number"
           ? legacy.browserRate
@@ -164,35 +183,57 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       const prefs = await readPrefs();
-      let result = await synthesizeChunk({
-        baseUrl: await baseUrl(),
-        apiKey: key,
-        text: piece,
-        voice: prefs.voice,
-        model: prefs.model,
-      });
+      const endpoint = await baseUrl();
+      const cooldowns = await readCooldowns();
+      const now = Date.now();
+      const chain = planModels(
+        prefs.model,
+        prefs.fallbackModel,
+        (model) => (cooldowns[model] ?? 0) > now,
+      );
 
-      // If the selected model fails with auth/quota/unavailable on proxy, retry with default model
-      if (!result.ok && prefs.model !== DEFAULT_MODEL) {
-        bb.log.warn(`chunk ${chunkIndex}/${pieces.length} on ${prefs.model} failed (${result.message}); retrying with ${DEFAULT_MODEL}`);
+      let result = undefined as Awaited<ReturnType<typeof synthesizeChunk>> | undefined;
+      let spokenBy = prefs.model;
+      for (const model of chain) {
         result = await synthesizeChunk({
-          baseUrl: await baseUrl(),
+          baseUrl: endpoint,
           apiKey: key,
           text: piece,
           voice: prefs.voice,
-          model: DEFAULT_MODEL,
+          model,
         });
+        spokenBy = model;
+        if (result.ok) break;
+        // Only a spent quota is worth a second model. A rejected key or an
+        // unreachable proxy fails identically on the next one, and retrying
+        // would just double the wait before the browser voice takes over.
+        if (!isQuotaFailure(result.code)) break;
+        await markExhausted(model);
+        bb.log.warn(
+          `${model} is out of quota across the whole pool; ` +
+            `chunk ${chunkIndex + 1}/${pieces.length} moves on`,
+        );
       }
 
+      if (result === undefined) {
+        return {
+          ok: false as const,
+          code: "request_failed" as const,
+          message: "No TTS model is configured to try.",
+        };
+      }
       if (!result.ok) {
         bb.log.warn(`chunk ${chunkIndex}/${pieces.length} failed: ${result.code} — ${result.message}`);
         return { ok: false as const, code: result.code, message: result.message };
       }
-      bb.log.info(`synthesized chunk ${chunkIndex + 1}/${pieces.length} as ${prefs.voice}`);
+      bb.log.info(
+        `synthesized chunk ${chunkIndex + 1}/${pieces.length} as ${prefs.voice} on ${spokenBy}`,
+      );
       return {
         ok: true as const,
         mimeType: AUDIO_MIME as typeof AUDIO_MIME,
         voice: prefs.voice,
+        model: spokenBy,
         chunkIndex,
         chunkCount: pieces.length,
         audioBase64: result.wavBase64,

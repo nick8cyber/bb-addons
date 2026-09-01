@@ -51,6 +51,13 @@ export const TTS_MODELS = [
 export const DEFAULT_MODEL = "gemini-3.1-flash-tts-preview";
 
 /**
+ * Where the reading goes when the primary's daily quota is spent. 2.5 is
+ * metered separately from 3.1 on the free tier, so it is a genuinely fresh
+ * allowance rather than the same wall under another name.
+ */
+export const FALLBACK_MODEL = "gemini-2.5-flash-preview-tts";
+
+/**
  * The thirty prebuilt voices, taken from the API's own rejection message
  * rather than from documentation. The API matches them case-insensitively;
  * these are the display forms.
@@ -70,6 +77,8 @@ export const prefsSchema = z.object({
   /** One voice for every language: Gemini's voices are multilingual. */
   voice: z.string().min(1),
   model: z.string().min(1),
+  /** Tried when `model` reports its daily quota spent. Empty disables it. */
+  fallbackModel: z.string(),
   /**
    * Gemini's TTS takes no rate parameter — pace is a matter of prompt
    * direction — so this reaches only the browser's fallback voice.
@@ -82,6 +91,7 @@ export type Prefs = z.infer<typeof prefsSchema>;
 export const DEFAULT_PREFS: Prefs = {
   voice: DEFAULT_VOICE,
   model: DEFAULT_MODEL,
+  fallbackModel: FALLBACK_MODEL,
   browserRate: 1,
   fallbackEnabled: true,
 };
@@ -142,6 +152,8 @@ export const contract = {
         ok: z.literal(true),
         mimeType: z.literal(AUDIO_MIME),
         voice: z.string(),
+        /** Which model actually spoke — the primary, or the fallback. */
+        model: z.string(),
         chunkIndex: z.number().int().min(0),
         chunkCount: z.number().int().min(1),
         audioBase64: z.string(),
