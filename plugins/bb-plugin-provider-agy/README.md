@@ -7,6 +7,30 @@ plus a provider bridge, the same shape `provider-claude-code` and
 Built and verified against **bb 0.40.0** (`@get-bb/plugin-sdk` 0.4.21), which
 speaks **provider bridge protocol version 2** and thread-delta grammar v3.
 
+## Before you install it
+
+**Threads on this provider run without approval prompts.** agy's stream-json
+has no approval back channel — there is no message the bridge could answer a
+permission request with — so the bridge declares a single permission mode,
+`full`, and starts agy with `--dangerously-skip-permissions`. A thread on agy
+reads, writes and runs commands in its workspace directory without asking
+first. Give it a directory you would let an unattended process edit. This is a
+property of the CLI's dialect, not a default this plugin could flip; if agy
+grows a `control_request`/`control_response` channel, the bridge can declare
+the narrower modes and this paragraph goes away.
+
+**What the bridge writes down.** `bridge.log`, in the plugin's data directory,
+records the agy command line, `HOME`, `PATH` and agy's stderr — the daemon
+captures a bridge's stderr nowhere, and without that log "agy did not report a
+conversation id" is an unfalsifiable claim. The **values** of environment
+variables passed to a thread are never written to it: only argv is logged, and
+the passthrough travels in the child's environment. The log stays on the
+machine that ran the turn; this plugin sends nothing anywhere.
+
+The same two paragraphs are rendered in bb under Settings, as the provider's
+own section (`app.tsx` → `src/AgySafetySection.tsx`), so they are visible
+where the provider is configured and not only here.
+
 ## Layout
 
 | file | what it is |
@@ -15,7 +39,8 @@ speaks **provider bridge protocol version 2** and thread-delta grammar v3.
 | `host.ts` | the `bb.host` artifact; exports `experimental_providerBridge` |
 | `src/provider-bridge.ts` | the bridge: JSON-RPC handlers, session/turn state, agy → `thread/delta` translation |
 | `src/agy-cli.ts` | everything that knows agy's argv and its NDJSON dialect |
-| `app.tsx` | the `bb.app` frontend; registers the provider mark inline |
+| `app.tsx` | the `bb.app` frontend; registers the provider mark inline and the settings notice |
+| `src/AgySafetySection.tsx` | that notice: what a turn may do without asking, and what gets logged |
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
