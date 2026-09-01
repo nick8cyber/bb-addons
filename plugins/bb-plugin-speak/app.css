@@ -1,0 +1,12 @@
+/* Minimal, subtle feedback on the message button */
+button[data-speak-state="generating"] {
+  opacity: 0.6;
+}
+
+button[data-speak-state="playing"] {
+  color: #3b82f6 !important;
+}
+
+button[data-speak-state="paused"] {
+  opacity: 0.5;
+}

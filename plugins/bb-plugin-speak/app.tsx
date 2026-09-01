@@ -29,7 +29,8 @@ function syncButtonState(stage: string) {
   });
 }
 
-if (typeof window !== "undefined") {
+if (typeof document !== "undefined") {
+  mountSpeakOverlay();
   player.subscribe((state) => {
     syncButtonState(state.stage);
   });
