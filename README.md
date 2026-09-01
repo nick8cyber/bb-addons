@@ -1,6 +1,6 @@
 # bb-addons
 
-Plugins and themes for [bb](https://getbb.app). Four plugins, one theme, all
+Plugins and themes for [bb](https://getbb.app). Five plugins, one theme, all
 usable independently.
 
 Install any of them straight from this repository:
@@ -10,6 +10,7 @@ bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin 
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin favorite-models
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-agy
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin pi-gateways
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin speak
 ```
 
 Or from a local clone — handy while developing, since bb reloads a `path:`
@@ -67,6 +68,25 @@ bb pi-gateways refresh
 
 Design notes, including the two traps it exists to avoid, are in
 [plugins/bb-plugin-pi-gateways/README.md](plugins/bb-plugin-pi-gateways/README.md).
+
+### `speak` 🔊
+
+A play button under every chat message that reads it aloud. The Markdown is
+stripped to prose first — code blocks skipped, links read as their label, table
+pipes and emoji dropped — then spoken by **Google Cloud Text-to-Speech**, or by
+the browser's own voice when no key is configured. The language is guessed from
+the script, so a Russian answer gets a Russian voice without being told.
+
+The key is a `secret` plugin setting: it stays in a 0600 file on the server, is
+never sent to a browser, and is redacted out of any error text the plugin
+quotes. Which engine spoke — and therefore whether the text left the machine —
+is stated in the settings section rather than left to be inferred.
+
+```bash
+bb speak status
+```
+
+Details in [plugins/bb-plugin-speak/README.md](plugins/bb-plugin-speak/README.md).
 
 ## Themes
 

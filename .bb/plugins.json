@@ -18,6 +18,10 @@
     {
       "name": "pi-gateways",
       "source": "./plugins/bb-plugin-pi-gateways"
+    },
+    {
+      "name": "speak",
+      "source": "./plugins/bb-plugin-speak"
     }
   ]
 }
