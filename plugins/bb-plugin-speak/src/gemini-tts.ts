@@ -29,7 +29,20 @@ const TIMEOUT_MS = 60_000;
 /** Google's error bodies can be long; the first few lines say what is wrong. */
 const MAX_QUOTED = 300;
 
-export type TtsFailure = { ok: false; code: SynthesisErrorCode; message: string };
+export type TtsFailure = {
+  ok: false;
+  code: SynthesisErrorCode;
+  message: string;
+  /**
+   * For a 429 only: whether the allowance that ran out is the daily one or the
+   * per-minute one. They arrive as the same status and mean very different
+   * things — a burst of parallel chunks trips the minute, and treating that as
+   * the day would bench a model until midnight over a momentary spike.
+   */
+  quotaScope?: "day" | "burst";
+  /** What Google's RetryInfo asked for, in ms, when it said. */
+  retryAfterMs?: number;
+};
 
 /** Strip anything that could be the key out of text on its way to a human. */
 function redact(text: string, apiKey: string): string {
@@ -38,8 +51,23 @@ function redact(text: string, apiKey: string): string {
   return safe;
 }
 
-function fail(code: SynthesisErrorCode, message: string): TtsFailure {
-  return { ok: false, code, message };
+function fail(code: SynthesisErrorCode, message: string, extra: Partial<TtsFailure> = {}): TtsFailure {
+  return { ok: false, code, message, ...extra };
+}
+
+/**
+ * Which allowance a 429 is about. Google names the metric in the body —
+ * `...PerDay` / `PerDayPerProject` for the daily one, `PerMinute` for the
+ * other — and usually attaches a RetryInfo. When it names neither, assume the
+ * cheaper reading: a burst, recoverable in a minute, rather than a day gone.
+ */
+export function readQuotaScope(body: string): { scope: "day" | "burst"; retryAfterMs?: number } {
+  const retry = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i.exec(body);
+  const retryAfterMs = retry ? Math.round(Number(retry[1]) * 1000) : undefined;
+  const perDay = /per[_\s-]?day|PerDayPerProject|RequestsPerDay/i.test(body);
+  const perMinute = /per[_\s-]?minute|PerMinutePerProject|RequestsPerMinute/i.test(body);
+  if (perDay && !perMinute) return { scope: "day", retryAfterMs };
+  return { scope: "burst", retryAfterMs };
 }
 
 function endpoint(baseUrl: string, model: string, apiKey: string): string {
@@ -75,7 +103,12 @@ function mapStatus(status: number, body: string, apiKey: string): TtsFailure {
     return fail("auth", `Google rejected the Gemini API key (HTTP ${status}): ${detail}`);
   }
   if (status === 429 || /RESOURCE_EXHAUSTED/i.test(body)) {
-    return fail("rate_limited", `Google is rate-limiting this key (HTTP ${status}): ${detail}`);
+    const quota = readQuotaScope(body);
+    return fail(
+      "rate_limited",
+      `Google is rate-limiting this key (HTTP ${status}): ${detail}`,
+      quota,
+    );
   }
   return fail("request_failed", `Gemini TTS failed (HTTP ${status}): ${detail}`);
 }

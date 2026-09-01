@@ -22,7 +22,8 @@ registerHooks({
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const { planModels, nextQuotaReset, isQuotaFailure } = await import("../src/model-chain.js");
+const { planModels, nextQuotaReset, isQuotaFailure, cooldownUntil } = await import("../src/model-chain.js");
+const { readQuotaScope } = await import("../src/gemini-tts.js");
 const { DEFAULT_MODEL, FALLBACK_MODEL } = await import("../src/contract.js");
 
 const never = () => false;
@@ -82,4 +83,55 @@ test("the cooldown is always in the future and never more than a day", () => {
     assert.ok(delta > 0, `${iso}: cooldown must be in the future`);
     assert.ok(delta <= 86_400_000, `${iso}: cooldown must not exceed a day`);
   }
+});
+
+// --- how long a 429 benches a model ----------------------------------------
+// This is the part with teeth: the player fires five chunks at once, which is
+// exactly what trips a per-minute limit, and benching 3.1 until midnight over
+// one busy second would be worse than the problem the fallback exists to fix.
+
+const AT = new Date("2026-03-02T00:30:00Z"); // 16:30 Pacific; midnight is 7.5h off
+
+test("a per-day 429 benches the model until the Pacific rollover", () => {
+  const until = cooldownUntil({ quotaScope: "day" }, AT);
+  assert.equal(until, nextQuotaReset(AT));
+});
+
+test("a burst 429 benches it for a minute and a half, not a day", () => {
+  const minutes = (cooldownUntil({ quotaScope: "burst" }, AT) - AT.getTime()) / 60_000;
+  assert.equal(minutes, 1.5);
+});
+
+test("Google's own retryDelay wins when it gives one", () => {
+  const seconds = (cooldownUntil({ quotaScope: "burst", retryAfterMs: 21_000 }, AT) - AT.getTime()) / 1000;
+  assert.equal(seconds, 21);
+});
+
+test("a burst cooldown never outlives the daily rollover", () => {
+  const justBefore = new Date("2026-03-02T07:59:00Z"); // one minute to midnight Pacific
+  const until = cooldownUntil({ quotaScope: "burst", retryAfterMs: 3_600_000 }, justBefore);
+  assert.ok(until <= nextQuotaReset(justBefore));
+});
+
+test("an unlabelled 429 is read as a burst, the cheaper of the two guesses", () => {
+  const minutes = (cooldownUntil({}, AT) - AT.getTime()) / 60_000;
+  assert.equal(minutes, 1.5);
+});
+
+test("the scope is read out of Google's own error body", () => {
+  const perDay = JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED", details: [
+    { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: [
+      { quotaMetric: "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+        quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }]}]}});
+  assert.equal(readQuotaScope(perDay).scope, "day");
+
+  const perMinute = JSON.stringify({ error: { code: 429, details: [
+    { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: [
+      { quotaId: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" }]},
+    { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "34s" }]}});
+  const read = readQuotaScope(perMinute);
+  assert.equal(read.scope, "burst");
+  assert.equal(read.retryAfterMs, 34_000);
+
+  assert.equal(readQuotaScope("plain 429, no detail at all").scope, "burst");
 });
