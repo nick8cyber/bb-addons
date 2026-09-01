@@ -9,7 +9,7 @@
     "types": ["node"],
     "paths": { "@/*": ["./*"] },
     "noEmit": true,
-    "skipLibCheck": false
+    "skipLibCheck": true
   },
   "include": ["server.ts", "app.tsx", "src", "lib", "tests"]
 }
