@@ -320,10 +320,34 @@ function getAudioContext(): AudioContext | null {
 
 function unlockAudio(): void {
   try {
-    getAudioContext();
+    const ctx = getAudioContext();
+    if (ctx) {
+      if (ctx.state === "suspended") {
+        void ctx.resume().catch(() => {});
+      }
+      // Play 1 silent frame to unlock iOS Web Audio hardware pipeline
+      const buffer = ctx.createBuffer(1, 1, 22050);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+    }
   } catch {
     // Ignore environments without Web Audio
   }
+}
+
+// Auto-warm audio on the first user interaction anywhere on mobile
+if (typeof document !== "undefined") {
+  const warmUp = () => {
+    unlockAudio();
+    document.removeEventListener("touchstart", warmUp);
+    document.removeEventListener("touchend", warmUp);
+    document.removeEventListener("click", warmUp);
+  };
+  document.addEventListener("touchstart", warmUp, { passive: true, once: true });
+  document.addEventListener("touchend", warmUp, { passive: true, once: true });
+  document.addEventListener("click", warmUp, { passive: true, once: true });
 }
 
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
