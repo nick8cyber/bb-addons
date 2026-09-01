@@ -77,14 +77,26 @@ function isRetryable(code: SynthesisErrorCode): boolean {
   );
 }
 
-let currentSpeed = 1;
+const SPEED_STORAGE_KEY = "bb_speak_playback_speed";
+
+function loadSavedSpeed(): number {
+  if (typeof localStorage === "undefined") return 1;
+  try {
+    const saved = Number(localStorage.getItem(SPEED_STORAGE_KEY));
+    return [0.75, 1, 1.25, 1.5, 2].includes(saved) ? saved : 1;
+  } catch {
+    return 1;
+  }
+}
+
+let currentSpeed = loadSavedSpeed();
 let state: PlaybackState = {
   speaking: false,
   messageId: null,
   stage: "idle",
   chunkIndex: 0,
   chunkCount: 0,
-  speed: 1,
+  speed: currentSpeed,
   voice: DEFAULT_PREFS.voice,
 };
 const listeners = new Set<(state: PlaybackState) => void>();
@@ -427,14 +439,25 @@ async function playWithAudioContext(base64: string, mine: number): Promise<boole
 }
 
 /** Resolves with whether the chunk actually reached the speakers. */
-/** Resolves with whether the chunk actually reached the speakers. */
 function playOne(url: string, mine: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const audio = new Audio(url);
-    audio.preservesPitch = true;
-    (audio as unknown as { webkitPreservesPitch?: boolean }).webkitPreservesPitch = true;
-    (audio as unknown as { mozPreservesPitch?: boolean }).mozPreservesPitch = true;
-    audio.playbackRate = currentSpeed;
+
+    const applySpeed = () => {
+      try {
+        audio.preservesPitch = true;
+        (audio as unknown as { webkitPreservesPitch?: boolean }).webkitPreservesPitch = true;
+        (audio as unknown as { mozPreservesPitch?: boolean }).mozPreservesPitch = true;
+        audio.playbackRate = currentSpeed;
+      } catch {}
+    };
+
+    applySpeed();
+    if (typeof audio.addEventListener === "function") {
+      audio.addEventListener("loadedmetadata", applySpeed);
+      audio.addEventListener("canplay", applySpeed);
+      audio.addEventListener("play", applySpeed);
+    }
 
     let settled = false;
     const finish = (heard: boolean) => {
@@ -457,7 +480,9 @@ function playOne(url: string, mine: number): Promise<boolean> {
     // A rejected `play()` is an autoplay refusal. It is not supposed to happen
     // behind a click, and when it does the user hears nothing at all — so it
     // is counted, not swallowed.
-    void Promise.resolve(audio.play()).catch(silence);
+    void Promise.resolve(audio.play())
+      .then(applySpeed)
+      .catch(silence);
   });
 }
 
@@ -699,6 +724,11 @@ function resume(): void {
 
 function setSpeed(speed: number): void {
   currentSpeed = speed;
+  if (typeof localStorage !== "undefined") {
+    try {
+      localStorage.setItem(SPEED_STORAGE_KEY, String(speed));
+    } catch {}
+  }
   if (currentAudio) {
     try {
       currentAudio.preservesPitch = true;
