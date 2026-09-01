@@ -427,9 +427,15 @@ async function playWithAudioContext(base64: string, mine: number): Promise<boole
 }
 
 /** Resolves with whether the chunk actually reached the speakers. */
+/** Resolves with whether the chunk actually reached the speakers. */
 function playOne(url: string, mine: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const audio = new Audio(url);
+    audio.preservesPitch = true;
+    (audio as unknown as { webkitPreservesPitch?: boolean }).webkitPreservesPitch = true;
+    (audio as unknown as { mozPreservesPitch?: boolean }).mozPreservesPitch = true;
+    audio.playbackRate = currentSpeed;
+
     let settled = false;
     const finish = (heard: boolean) => {
       if (settled) return;
@@ -464,20 +470,25 @@ async function playAudio(
   // A stop that lands between two chunks must not start the next one.
   if (mine !== generation) return false;
 
+  // Prefer HTMLAudioElement for native WSOLA pitch preservation (no chipmunk effect)
+  const url = URL.createObjectURL(base64ToBlob(base64, mimeType));
+  liveUrls.add(url);
+  try {
+    const heard = await playOne(url, mine);
+    if (heard) return true;
+    if (mine !== generation) return false;
+  } finally {
+    revoke(url);
+  }
+
+  // Fallback to Web Audio Context if HTMLAudio is unsupported in environment
   const scope = globalThis as unknown as { AudioContext?: unknown; webkitAudioContext?: unknown };
   if (scope.AudioContext || scope.webkitAudioContext) {
     const heard = await playWithAudioContext(base64, mine);
     if (heard) return true;
-    if (mine !== generation) return false;
   }
 
-  const url = URL.createObjectURL(base64ToBlob(base64, mimeType));
-  liveUrls.add(url);
-  try {
-    return await playOne(url, mine);
-  } finally {
-    revoke(url);
-  }
+  return false;
 }
 
 /**
@@ -688,14 +699,17 @@ function resume(): void {
 
 function setSpeed(speed: number): void {
   currentSpeed = speed;
+  if (currentAudio) {
+    try {
+      currentAudio.preservesPitch = true;
+      (currentAudio as unknown as { webkitPreservesPitch?: boolean }).webkitPreservesPitch = true;
+      (currentAudio as unknown as { mozPreservesPitch?: boolean }).mozPreservesPitch = true;
+      currentAudio.playbackRate = speed;
+    } catch {}
+  }
   if (currentBufferSource) {
     try {
       currentBufferSource.playbackRate.value = speed;
-    } catch {}
-  }
-  if (currentAudio) {
-    try {
-      currentAudio.playbackRate = speed;
     } catch {}
   }
   setState({ speed });
