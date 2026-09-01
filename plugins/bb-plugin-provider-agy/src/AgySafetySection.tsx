@@ -89,12 +89,17 @@ export function AgySafetySection() {
         <Step n={1} title="Install the agy CLI on the machine that runs your threads">
           <p>
             <Cmd>curl -fsSL https://antigravity.google/cli/install.sh | bash</Cmd>
-            , or on Windows{" "}
-            <Cmd>irm https://antigravity.google/cli/install.ps1 | iex</Cmd>. It
-            lands at <Cmd>~/.local/bin/agy</Cmd> — on Windows{" "}
-            <Cmd>%LOCALAPPDATA%\agy\bin</Cmd> — and that is the first place
-            this provider looks, before <Cmd>PATH</Cmd>; set{" "}
-            <Cmd>AGY_PATH</Cmd> to point it somewhere else.
+            . It lands at <Cmd>~/.local/bin/agy</Cmd>, which is the one path
+            this provider knows by heart: it is checked before{" "}
+            <Cmd>PATH</Cmd>, and only <Cmd>AGY_PATH</Cmd> comes first.
+          </p>
+          <p>
+            Windows installs with{" "}
+            <Cmd>irm https://antigravity.google/cli/install.ps1 | iex</Cmd> to{" "}
+            <Cmd>%LOCALAPPDATA%\agy\bin</Cmd>. That path is not one the
+            provider guesses — it is found through <Cmd>PATH</Cmd>, so if the
+            installer did not extend yours, point <Cmd>AGY_PATH</Cmd> straight
+            at the binary.
           </p>
         </Step>
         <Step n={2} title="Sign in, on that same machine">
