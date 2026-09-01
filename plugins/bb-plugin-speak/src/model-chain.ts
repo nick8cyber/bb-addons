@@ -16,26 +16,41 @@
 /** Milliseconds in a day; the reset interval Google meters against. */
 const DAY_MS = 86_400_000;
 
-/**
- * When the exhausted model can be tried again: the next midnight in Pacific
- * time, which is where Google rolls free-tier daily quotas over. Computed from
- * the wall clock there rather than from a fixed offset, so it survives the
- * twice-yearly hour.
- */
-export function nextQuotaReset(now: Date = new Date()): number {
+/** Milliseconds elapsed since midnight Pacific, from the wall clock there. */
+function elapsedPacificMs(at: Date): number {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Los_Angeles",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-  }).formatToParts(now);
-  const at = (type: string): number =>
+  }).formatToParts(at);
+  const value = (type: string): number =>
     Number(parts.find((part) => part.type === type)?.value ?? 0);
   // Some ICU builds render midnight as hour 24 rather than 0.
-  const elapsed = ((at("hour") % 24) * 3600 + at("minute") * 60 + at("second")) * 1000;
-  return now.getTime() + (DAY_MS - elapsed);
+  return ((value("hour") % 24) * 3600 + value("minute") * 60 + value("second")) * 1000;
 }
+
+/**
+ * When an exhausted model can be tried again: the next midnight in Pacific
+ * time, where Google rolls free-tier daily quotas over.
+ *
+ * Adding "a day minus what has elapsed" is wrong twice a year — the Pacific
+ * day is 23 or 25 hours long on the transition dates, and that first guess
+ * lands an hour off. So the guess is then corrected against the Pacific wall
+ * clock at the guessed instant, which is the only clock that knows.
+ */
+export function nextQuotaReset(now: Date = new Date()): number {
+  let guess = now.getTime() + (DAY_MS - elapsedPacificMs(now));
+  // Two passes are enough: the first correction is at most an hour.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const elapsed = elapsedPacificMs(new Date(guess));
+    if (elapsed === 0) break;
+    guess += elapsed > DAY_MS / 2 ? DAY_MS - elapsed : -elapsed;
+  }
+  return guess;
+}
+
 
 /**
  * The models to try, best first. A model in cooldown is skipped — but if that

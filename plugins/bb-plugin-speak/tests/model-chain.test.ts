@@ -185,3 +185,20 @@ test("a burst names the minute alone", () => {
   assert.equal(read.quotaScope, "burst");
   assert.equal(read.retryAfterMs, 9_000);
 });
+
+test("the rollover survives both DST transitions", () => {
+  // The Pacific day is 23 hours long on 8 March and 25 on 1 November 2026, so
+  // "now plus a day minus what has elapsed" lands an hour off on each. Found
+  // by an independent audit, which is the only reason these two dates are
+  // here rather than a vague property check.
+  assert.equal(
+    new Date(nextQuotaReset(new Date("2026-03-08T09:00:00Z"))).toISOString(),
+    "2026-03-09T07:00:00.000Z",
+    "spring forward",
+  );
+  assert.equal(
+    new Date(nextQuotaReset(new Date("2026-11-01T08:30:00Z"))).toISOString(),
+    "2026-11-02T08:00:00.000Z",
+    "fall back",
+  );
+});
