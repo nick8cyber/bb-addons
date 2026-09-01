@@ -19,14 +19,21 @@ the credential belongs to the machine that runs the turn. Both steps happen
    curl -fsSL https://antigravity.google/cli/install.sh | bash
    ```
 
-   Windows uses the PowerShell installer from the same page. The binary lands
-   at `~/.local/bin/agy`, which is the first place this bridge looks; after
-   that it walks `PATH`, and `AGY_PATH` overrides both
-   (`resolveAgyCommand` in `src/agy-cli.ts`).
+   The script's own `TARGET_DIR` is `$HOME/.local/bin`, which is the first
+   place this bridge looks; after that it walks `PATH`, and `AGY_PATH`
+   overrides both (`resolveAgyCommand` in `src/agy-cli.ts`). Windows:
+
+   ```
+   irm https://antigravity.google/cli/install.ps1 | iex
+   ```
+
+   which installs to `%LOCALAPPDATA%\agy\bin` instead.
 
 2. **Sign in.** Run `agy` once. There is no `login` subcommand — the first run
-   opens a browser, and over SSH it prints a URL and takes the code you paste
-   back. It needs a Google account with Antigravity access.
+   opens a browser. Where it cannot, it falls back to printing the link: the
+   CLI's own prompts are *"Please visit the following URL to authorize the
+   application"* and *"Enter the authorization code:"*, which is the flow an
+   SSH session gets. It needs a Google account with Antigravity access.
 
    The credential stays on that machine; bb never handles it. agy stores it in
    the OS keyring when one is reachable and **falls back to a file when one is

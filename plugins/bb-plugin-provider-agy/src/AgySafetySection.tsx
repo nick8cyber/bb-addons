@@ -88,19 +88,22 @@ export function AgySafetySection() {
       <ol className="flex flex-col gap-3 text-xs leading-relaxed">
         <Step n={1} title="Install the agy CLI on the machine that runs your threads">
           <p>
-            <Cmd>curl -fsSL https://antigravity.google/cli/install.sh | bash</Cmd>{" "}
-            — Windows uses the PowerShell installer from the same page. It
-            lands at <Cmd>~/.local/bin/agy</Cmd>, which this provider checks
-            before it checks <Cmd>PATH</Cmd>; set <Cmd>AGY_PATH</Cmd> to point
-            it somewhere else.
+            <Cmd>curl -fsSL https://antigravity.google/cli/install.sh | bash</Cmd>
+            , or on Windows{" "}
+            <Cmd>irm https://antigravity.google/cli/install.ps1 | iex</Cmd>. It
+            lands at <Cmd>~/.local/bin/agy</Cmd> — on Windows{" "}
+            <Cmd>%LOCALAPPDATA%\agy\bin</Cmd> — and that is the first place
+            this provider looks, before <Cmd>PATH</Cmd>; set{" "}
+            <Cmd>AGY_PATH</Cmd> to point it somewhere else.
           </p>
         </Step>
         <Step n={2} title="Sign in, on that same machine">
           <p>
             Run <Cmd>agy</Cmd> once. There is no login subcommand: the first
-            run opens a browser, and over SSH it prints a URL and takes the
-            code you paste back. It needs a Google account with Antigravity
-            access.
+            run opens a browser, and where it cannot it prints the link
+            instead and asks for the code back (&ldquo;Enter the authorization
+            code:&rdquo;) — that is what an SSH session gets. It needs a Google
+            account with Antigravity access.
           </p>
           <p>
             The credential stays on that machine — bb never handles it. agy
