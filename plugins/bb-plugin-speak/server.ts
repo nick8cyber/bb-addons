@@ -16,6 +16,7 @@ import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import {
   AUDIO_MIME,
   DEFAULT_PREFS,
+  GEMINI_BASE_URL,
   GEMINI_VOICES,
   MAX_SPEAKABLE_CHARS,
   TTS_MODELS,
@@ -48,6 +49,12 @@ export default async function plugin(bb: BbPluginApi) {
       description:
         "A Gemini API key from Google AI Studio — https://aistudio.google.com/app/apikey. This is not a Google Cloud console key: a Cloud Text-to-Speech key pasted here is rejected, because the engine is Gemini's TTS on generativelanguage.googleapis.com, a different API on a different key.",
     },
+    baseUrl: {
+      type: "string",
+      label: "Gemini endpoint",
+      description:
+        "Leave empty for Google's own https://generativelanguage.googleapis.com/v1beta. Point it at a CLIProxyAPI instead — e.g. http://127.0.0.1:8318/v1beta — to spread the reading across a pool of AI Studio keys rather than one; the proxy speaks the same v1beta shape, so the key above becomes the proxy's gateway key.",
+    },
   });
 
   /** The key, or undefined when it is absent or blank. Never logged. */
@@ -55,6 +62,14 @@ export default async function plugin(bb: BbPluginApi) {
     const value = (await settings.get()).geminiApiKey;
     const trimmed = typeof value === "string" ? value.trim() : "";
     return trimmed.length > 0 ? trimmed : undefined;
+  };
+
+  /** The configured endpoint, or Google's own. Trailing slashes are a common
+   *  paste artefact and would produce a double slash in the path. */
+  const baseUrl = async (): Promise<string> => {
+    const value = (await settings.get()).baseUrl;
+    const trimmed = typeof value === "string" ? value.trim().replace(/\/+$/, "") : "";
+    return trimmed.length > 0 ? trimmed : GEMINI_BASE_URL;
   };
 
   /** Non-secret preferences live in kv; anything unreadable becomes defaults. */
@@ -120,6 +135,7 @@ export default async function plugin(bb: BbPluginApi) {
 
       const prefs = await readPrefs();
       const result = await synthesizeChunk({
+        baseUrl: await baseUrl(),
         apiKey: key,
         text: piece,
         voice: prefs.voice,
@@ -145,7 +161,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (!key) return notConfigured();
       // Deliberately the arguments and not the saved preferences: the point of
       // Test is to hear a voice before committing to it.
-      const result = await synthesizeChunk({ apiKey: key, text: PROBE_TEXT, voice, model });
+      const result = await synthesizeChunk({
+      apiKey: key, text: PROBE_TEXT, voice, model, baseUrl: await baseUrl(),
+    });
       if (!result.ok) {
         bb.log.warn(`probe of ${voice} on ${model} failed: ${result.code}`);
         return { ok: false as const, code: result.code, message: result.message };
