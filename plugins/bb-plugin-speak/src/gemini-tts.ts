@@ -42,8 +42,8 @@ function fail(code: SynthesisErrorCode, message: string): TtsFailure {
   return { ok: false, code, message };
 }
 
-function endpoint(model: string, apiKey: string): string {
-  const url = new URL(`${GEMINI_BASE_URL}/models/${model}:generateContent`);
+function endpoint(baseUrl: string, model: string, apiKey: string): string {
+  const url = new URL(`${baseUrl}/models/${model}:generateContent`);
   url.search = new URLSearchParams({ key: apiKey }).toString();
   return url.toString();
 }
@@ -129,18 +129,21 @@ function findInlineAudio(body: unknown): string | undefined {
 }
 
 export async function synthesizeChunk(args: {
+  /** Where the Gemini surface lives. A cliproxy in front of a key
+   *  pool speaks the same v1beta shape, so this is all that has to change. */
+  baseUrl?: string;
   apiKey: string;
   text: string;
   voice: string;
   model: string;
   signal?: AbortSignal;
 }): Promise<{ ok: true; wavBase64: string } | TtsFailure> {
-  const { apiKey, text, voice, model, signal } = args;
+  const { apiKey, text, voice, model, signal, baseUrl = GEMINI_BASE_URL } = args;
 
   let response: Response;
   let raw: string;
   try {
-    response = await fetch(endpoint(model, apiKey), {
+    response = await fetch(endpoint(baseUrl, model, apiKey), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
