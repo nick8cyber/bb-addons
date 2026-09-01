@@ -6,17 +6,23 @@
  * playback lives here, as a module-level singleton, and anything that wants to
  * render it subscribes.
  *
- * Two engines sit behind one `speak()`. Google Cloud Text-to-Speech is the
- * good one and needs a key; the browser's own `speechSynthesis` is the one
- * that is always there. Which of the two spoke is not a detail — the text
- * leaves the machine in the first case and does not in the second — so every
- * hand-off between them is announced.
+ * Two engines sit behind one `speak()`. Gemini's TTS is the good one and needs
+ * a key; the browser's own `speechSynthesis` is the one that is always there.
+ * Which of the two spoke is not a detail — the text leaves the machine in the
+ * first case and does not in the second — so every hand-off between them is
+ * announced.
+ *
+ * Gemini answers with uncompressed 24 kHz audio: about 4.8 KB of base64 per
+ * character of input, which makes a whole message in one response megabytes of
+ * silence to wait through. So the message goes chunk by chunk, and this file
+ * is the loop that keeps one chunk in flight while the previous one plays.
  */
 
 import { toast } from "sonner";
 
-import { rpc } from "../lib/rpc.js";
+import { PLUGIN_RPC_ENDPOINT, rpc } from "../lib/rpc.js";
 import {
+  AUDIO_MIME,
   DEFAULT_PREFS,
   type Prefs,
   type StatusOutput,
@@ -26,7 +32,7 @@ import {
 import { detectLanguage, toSpeakable } from "./speakable.js";
 
 /** Which engine produced the sound. */
-export type SpeakSource = "google" | "browser";
+export type SpeakSource = "gemini" | "browser";
 
 export interface PlaybackState {
   speaking: boolean;
@@ -42,12 +48,11 @@ export interface PlaybackState {
 const VOICE_LIST_TIMEOUT_MS = 1000;
 
 /** What the user can be told to do about each way synthesis can fail. */
-const FAILURE_COPY: Record<SynthesisErrorCode, string> = {
-  not_configured:
-    "Add a Google Cloud API key in Settings → Extensions → Speak.",
-  auth: "Google rejected that API key. Check it in Settings → Extensions → Speak.",
-  rate_limited: "Google is rate-limiting this key. Try again in a moment.",
-  request_failed: "Google Text-to-Speech could not be reached.",
+export const FAILURE_COPY: Record<SynthesisErrorCode, string> = {
+  not_configured: "Add a Gemini API key in Settings → Extensions → Speak.",
+  auth: "Google rejected that Gemini API key. Check it in Settings → Extensions → Speak.",
+  rate_limited: "Gemini is rate-limiting this key. Try again in a moment.",
+  request_failed: "Gemini text-to-speech could not be reached.",
   empty: "There was nothing in this message to read aloud.",
   too_long: "This message is too long to read aloud in one go.",
 };
@@ -84,6 +89,14 @@ let currentAudio: HTMLAudioElement | null = null;
  * rather than leaving the loop parked on a promise that will never settle.
  */
 let endCurrent: (() => void) | null = null;
+
+/**
+ * The one chunk request that may be outstanding. `stop()` aborts it: a chunk
+ * nobody will play is a Gemini call nobody should pay for, and letting it land
+ * after the speakers have been taken is how a stopped message starts talking
+ * again.
+ */
+let inFlight: AbortController | null = null;
 
 /** Object URLs handed to an `<audio>` and not yet revoked. */
 const liveUrls = new Set<string>();
@@ -132,8 +145,8 @@ function loadPrefs(): Promise<Prefs> {
 
 /**
  * Drop the cached preferences and read them back. The settings page calls this
- * after a save: a stale copy here would send the old speaking rate, or fall
- * back to the browser voice right after the user switched that off.
+ * after a save: a stale copy here would send the old voice, or fall back to
+ * the browser voice right after the user switched that off.
  */
 export async function refreshPrefs(): Promise<void> {
   cachedPrefs = null;
@@ -232,7 +245,9 @@ async function speakWithBrowserVoice(
 
   const utterance = new voice.Utterance(text);
   utterance.lang = languageCode;
-  utterance.rate = prefs.speakingRate;
+  // Gemini takes no rate parameter, so this is the only engine the setting can
+  // reach — hence its name.
+  utterance.rate = prefs.browserRate;
   if (installed) utterance.voice = installed;
 
   await new Promise<void>((resolve) => {
@@ -252,7 +267,7 @@ async function speakWithBrowserVoice(
   if (mine === generation) setState({ speaking: false, messageId: null });
 }
 
-// --- Google's audio ---------------------------------------------------------
+// --- Gemini's audio ---------------------------------------------------------
 
 function base64ToBlob(base64: string, mimeType: string): Blob {
   const binary = atob(base64);
@@ -302,25 +317,51 @@ function playOne(url: string, mine: number): Promise<boolean> {
   });
 }
 
-/** Resolves with whether any chunk made a sound. */
-async function playChunks(
-  chunks: string[],
+/** Decode, play, and give the object URL back. Resolves with whether it sounded. */
+async function playAudio(
+  base64: string,
   mimeType: string,
   mine: number,
 ): Promise<boolean> {
-  let heard = false;
-  for (const chunk of chunks) {
-    // A stop that lands between two chunks must not start the next one.
-    if (mine !== generation) return heard;
-    const url = URL.createObjectURL(base64ToBlob(chunk, mimeType));
-    liveUrls.add(url);
-    try {
-      heard = (await playOne(url, mine)) || heard;
-    } finally {
-      revoke(url);
-    }
+  // A stop that lands between two chunks must not start the next one.
+  if (mine !== generation) return false;
+  const url = URL.createObjectURL(base64ToBlob(base64, mimeType));
+  liveUrls.add(url);
+  try {
+    return await playOne(url, mine);
+  } finally {
+    revoke(url);
   }
-  return heard;
+}
+
+/**
+ * One chunk, cancellably.
+ *
+ * `rpc()` has no signal parameter and is shared with the settings page, so the
+ * one call that must be abortable does its own fetch against the same
+ * endpoint. Everything else about the envelope is the same.
+ */
+async function fetchChunk(
+  text: string,
+  chunkIndex: number,
+): Promise<SynthesizeOutput> {
+  const controller = new AbortController();
+  inFlight = controller;
+  try {
+    const response = await fetch(`${PLUGIN_RPC_ENDPOINT}/synthesize`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text, chunkIndex }),
+      signal: controller.signal,
+    });
+    const body = (await response.json()) as
+      | { ok: true; result: SynthesizeOutput }
+      | { ok: false; error?: unknown };
+    if (!body?.ok) throw new Error(`synthesize failed (HTTP ${response.status})`);
+    return body.result;
+  } finally {
+    if (inFlight === controller) inFlight = null;
+  }
 }
 
 // --- the public surface -----------------------------------------------------
@@ -353,7 +394,6 @@ async function failOver(
   mine: number,
   code: SynthesisErrorCode,
   text: string,
-  languageCode: string,
   prefs: Prefs,
 ): Promise<void> {
   if (mine !== generation) return;
@@ -374,11 +414,36 @@ async function failOver(
   }
 
   announce(code, "browser");
-  await speakWithBrowserVoice(mine, text, languageCode, prefs, voice);
+  // The only thing `detectLanguage` is still for: Gemini's voices are
+  // multilingual and need no hint, but the browser's are one language each.
+  await speakWithBrowserVoice(mine, text, detectLanguage(text), prefs, voice);
+}
+
+/**
+ * A chunk after the first failed. The user has already heard the opening
+ * sentences, so the fallback is the wrong answer here: starting the browser
+ * voice on the same text would read that opening a second time, and starting
+ * it on the remainder would need a boundary only the server knows. Saying
+ * nothing is worse still — a message that stops halfway through looks like it
+ * ended there. So: stop, and say that it was cut short.
+ */
+function cutShort(code: SynthesisErrorCode, chunkIndex: number): void {
+  setState({ speaking: false, messageId: null });
+  toast.error(
+    `${FAILURE_COPY[code]} The reading stopped part-way through this message ` +
+      `(chunk ${chunkIndex + 1}); the rest was not read aloud.`,
+  );
 }
 
 function stop(): void {
   generation += 1;
+
+  // Before anything else: nothing new should arrive for a playback that is
+  // over. `abort()` rejects the pending fetch, and the loop's generation guard
+  // turns that rejection into a silent return rather than a failure notice.
+  const request = inFlight;
+  inFlight = null;
+  request?.abort();
 
   const audio = currentAudio;
   currentAudio = null;
@@ -399,6 +464,64 @@ function stop(): void {
   cancelBrowserVoice();
   revokeAll();
   setState({ speaking: false, messageId: null });
+}
+
+/**
+ * Chunk 0, then chunk 1 while chunk 0 plays, and so on: at most one request
+ * outstanding, because playback can only consume one at a time and a second
+ * would race Gemini's rate limit for no gain. Resolves with whether anything
+ * reached the speakers, or `null` when the run has already reported its own
+ * failure and the caller should say nothing more.
+ */
+async function streamChunks(
+  mine: number,
+  text: string,
+  prefs: Prefs,
+): Promise<boolean | null> {
+  let request = fetchChunk(text, 0);
+  let index = 0;
+  let heard = false;
+
+  for (;;) {
+    let output: SynthesizeOutput;
+    try {
+      // If the fetching has fallen behind the playing, this is where the loop
+      // waits — silently. A pause is not worth a toast.
+      output = await request;
+    } catch {
+      // An abort lands here too, and the guard below is what tells the two
+      // apart: a stop has already bumped the generation.
+      if (mine !== generation) return null;
+      if (index === 0) {
+        await failOver(mine, "request_failed", text, prefs);
+        return null;
+      }
+      cutShort("request_failed", index);
+      return null;
+    }
+    if (mine !== generation) return null;
+
+    if (!output.ok) {
+      if (index === 0) {
+        await failOver(mine, output.code, text, prefs);
+        return null;
+      }
+      cutShort(output.code, index);
+      return null;
+    }
+
+    // Ask for the next one before playing this one — that overlap is the whole
+    // point of the loop — but only while this run still owns the speakers.
+    const next = index + 1;
+    const ahead = next < output.chunkCount ? fetchChunk(text, next) : null;
+
+    heard = (await playAudio(output.audioBase64, output.mimeType, mine)) || heard;
+    if (mine !== generation) return null;
+
+    if (!ahead) return heard;
+    request = ahead;
+    index = next;
+  }
 }
 
 async function speak(args: { messageId: string; text: string }): Promise<void> {
@@ -423,41 +546,45 @@ async function speak(args: { messageId: string; text: string }): Promise<void> {
   const mine = generation;
   setState({ speaking: true, messageId: args.messageId });
 
-  const languageCode = detectLanguage(text);
   const prefs = await loadPrefs();
   if (mine !== generation) return;
 
-  let output: SynthesizeOutput;
-  try {
-    output = await rpc<SynthesizeOutput>("synthesize", { text, languageCode });
-  } catch {
-    // The thrown message quotes the server at the user. Ours says what to do.
-    await failOver(mine, "request_failed", text, languageCode, prefs);
-    return;
-  }
-  if (mine !== generation) return;
-
-  if (!output.ok) {
-    await failOver(mine, output.code, text, languageCode, prefs);
-    return;
-  }
-
-  const heard = await playChunks(output.chunks, output.mimeType, mine);
-  if (mine !== generation) return;
+  const heard = await streamChunks(mine, text, prefs);
+  if (heard === null || mine !== generation) return;
   setState({ speaking: false, messageId: null });
   if (!heard) {
-    // Google answered, the audio did not arrive at the speakers, and the user
+    // Gemini answered, the audio did not arrive at the speakers, and the user
     // is looking at a button that appeared to do nothing. Say so.
     toast.error(
-      "Google returned audio this browser would not play. Try again, or turn on " +
+      "Gemini returned audio this browser would not play. Try again, or turn on " +
         "the browser voice in Settings → Extensions → Speak.",
     );
   }
 }
 
+/** No message has this id, so no message button lights up for an audition. */
+export const PREVIEW_MESSAGE_ID = "speak:preview";
+
+/**
+ * Play one ready-made clip — what the settings page's Test button does with
+ * the audio `probe` hands back. It goes through this rather than through
+ * `speak()` so that an audition uses the unsaved voice in the form, and still
+ * shares the one pair of speakers: a Test interrupts a reading, and a reading
+ * interrupts a Test.
+ */
+async function preview(audioBase64: string, mimeType: string = AUDIO_MIME): Promise<boolean> {
+  stop();
+  const mine = generation;
+  setState({ speaking: true, messageId: PREVIEW_MESSAGE_ID });
+  const heard = await playAudio(audioBase64, mimeType, mine);
+  if (mine === generation) setState({ speaking: false, messageId: null });
+  return heard;
+}
+
 export const player = {
   /** Speak this text. Clicking the message that is already speaking stops it. */
   speak,
+  preview,
   stop,
   getState(): PlaybackState {
     return state;
