@@ -34,8 +34,13 @@ const TEST_SENTENCES: Record<string, string> = {
 
 const FALLBACK_TEST_SENTENCE = "Voice check. This is roughly how a message will sound read aloud.";
 
-/** A language's voice list: still loading, unreachable, or here. */
-type Catalog = "loading" | "failed" | VoiceRow[];
+/**
+ * A language's voice list: waiting on a key, still loading, unreachable, or
+ * here. `nokey` is separate from `failed` because without a key the call can
+ * only ever come back `not_configured`, and reporting that as Google being out
+ * of reach blames the wrong party.
+ */
+type Catalog = "nokey" | "loading" | "failed" | VoiceRow[];
 
 function AlertGlyph({ className }: { className?: string }) {
   return (
@@ -113,6 +118,12 @@ function VoiceCatalogRow({
           Google&rsquo;s voice list is out of reach right now. The saved voice is kept as it is.
         </p>
       ) : null}
+      {catalog === "nokey" ? (
+        <p className="pl-16 text-[11px] text-muted-foreground">
+          The voice list comes from Google, so it arrives with the key. Test still works — the
+          browser&rsquo;s own voice answers it.
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -142,6 +153,12 @@ export function SpeakSection() {
 
   useEffect(() => {
     if (!status) return;
+    if (!status.configured) {
+      // No key, no catalog: the call would spend a round trip to be told what
+      // the boolean above already said.
+      setCatalogs(Object.fromEntries(status.autoLanguages.map((code) => [code, "nokey"])));
+      return;
+    }
     let cancelled = false;
     setCatalogs(Object.fromEntries(status.autoLanguages.map((code) => [code, "loading"])));
     // Lazily — the catalogs are only worth a round trip once the server has
@@ -308,7 +325,8 @@ export function SpeakSection() {
         Where the words go: with a key configured, the text of the message is sent to Google to be
         turned into audio. With the browser voice, it never leaves this machine. Which of the two
         just happened is worth knowing before you press the button on something you would not
-        paste into a search box — so the button says so whenever it changes engines mid-click.
+        paste into a search box — so a hand-off to the browser voice says so. Running with no key
+        at all says it once a session rather than on every click, because then it is not an event.
       </p>
     </div>
   );

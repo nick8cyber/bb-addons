@@ -138,6 +138,9 @@ function loadPrefs(): Promise<Prefs> {
 export async function refreshPrefs(): Promise<void> {
   cachedPrefs = null;
   inFlightPrefs = null;
+  // A save may well be the key arriving. Let the one-shot notices speak again
+  // rather than staying silent about a hand-off that now means something else.
+  announcedOnce.clear();
   await loadPrefs();
 }
 
@@ -322,13 +325,28 @@ async function playChunks(
 
 // --- the public surface -----------------------------------------------------
 
+/**
+ * Codes already announced for a hand-off in this session. `not_configured` is
+ * a steady state, not an event: someone running deliberately without a key
+ * should be told once, not on every click for the rest of the session.
+ */
+const announcedOnce = new Set<SynthesisErrorCode>();
+const ANNOUNCE_ONCE: ReadonlySet<SynthesisErrorCode> = new Set(["not_configured"]);
+
 function announce(code: SynthesisErrorCode, next: SpeakSource | null): void {
   const reason = FAILURE_COPY[code];
-  toast.error(
-    next === "browser"
-      ? `${reason} Reading with the browser's own voice instead.`
-      : reason,
-  );
+  if (next !== "browser") {
+    toast.error(reason);
+    return;
+  }
+  if (ANNOUNCE_ONCE.has(code)) {
+    if (announcedOnce.has(code)) return;
+    announcedOnce.add(code);
+  }
+  // Not an error: something is about to speak. The hand-off is announced
+  // because it decides whether the text leaves the machine, and that is
+  // information, not a fault.
+  toast.info(`${reason} Reading with the browser's own voice instead.`);
 }
 
 async function failOver(
