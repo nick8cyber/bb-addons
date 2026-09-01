@@ -71,16 +71,12 @@ Design notes, including the two traps it exists to avoid, are in
 
 ### `speak` 🔊
 
-A play button under every chat message that reads it aloud. The Markdown is
-stripped to prose first — code blocks skipped, links read as their label, table
-pipes and emoji dropped — then spoken by **Google Cloud Text-to-Speech**, or by
-the browser's own voice when no key is configured. The language is guessed from
-the script, so a Russian answer gets a Russian voice without being told.
+A speech button under every chat message that reads it aloud using **Gemini TTS**
+(`gemini-3.1-flash-tts-preview`) with natural high-definition voices (Kore, Aoede, Fenrir, Puck, Charon),
+or the browser's own voice when offline.
 
-The key is a `secret` plugin setting: it stays in a 0600 file on the server, is
-never sent to a browser, and is redacted out of any error text the plugin
-quotes. Which engine spoke — and therefore whether the text left the machine —
-is stated in the settings section rather than left to be inferred.
+Features a floating overlay player with Play/Pause, speed selection (`0.75×`–`2.0×` with pitch preservation),
+instant parallel chunk synthesis at T=0, and mobile audio support.
 
 ```bash
 bb speak status
