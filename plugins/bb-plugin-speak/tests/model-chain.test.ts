@@ -123,15 +123,28 @@ test("the scope is read out of Google's own error body", () => {
     { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: [
       { quotaMetric: "generativelanguage.googleapis.com/generate_content_free_tier_requests",
         quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }]}]}});
-  assert.equal(readQuotaScope(perDay).scope, "day");
+  assert.equal(readQuotaScope(perDay).quotaScope, "day");
 
   const perMinute = JSON.stringify({ error: { code: 429, details: [
     { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: [
       { quotaId: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" }]},
     { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "34s" }]}});
   const read = readQuotaScope(perMinute);
-  assert.equal(read.scope, "burst");
+  assert.equal(read.quotaScope, "burst");
   assert.equal(read.retryAfterMs, 34_000);
 
-  assert.equal(readQuotaScope("plain 429, no detail at all").scope, "burst");
+  assert.equal(readQuotaScope("plain 429, no detail at all").quotaScope, "burst");
+});
+
+test("what mapStatus puts on the failure is what cooldownUntil reads", () => {
+  // The names drifted once: readQuotaScope returned `scope`, the failure type
+  // declared `quotaScope`, and a spread carried the wrong one through — so a
+  // spent day was benched for ninety seconds. A spread does not get excess
+  // property checking, so only this catches it.
+  const body = JSON.stringify({ error: { details: [{ violations: [
+    { quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }]}]}});
+  const read = readQuotaScope(body);
+  assert.ok("quotaScope" in read, "the field must be named as the failure declares it");
+  const at = new Date("2026-03-02T00:30:00Z");
+  assert.equal(cooldownUntil(read, at), nextQuotaReset(at), "a spent day must reach the rollover");
 });
