@@ -269,6 +269,46 @@ async function speakWithBrowserVoice(
 
 // --- Gemini's audio ---------------------------------------------------------
 
+let sharedAudioCtx: AudioContext | null = null;
+let currentBufferSource: AudioBufferSourceNode | null = null;
+
+function getAudioContext(): AudioContext | null {
+  const scope = globalThis as unknown as {
+    AudioContext?: typeof AudioContext;
+    webkitAudioContext?: typeof AudioContext;
+  };
+  const AudioCtx = scope.AudioContext || scope.webkitAudioContext;
+  if (!AudioCtx) return null;
+  if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
+    try {
+      sharedAudioCtx = new AudioCtx();
+    } catch {
+      return null;
+    }
+  }
+  if (sharedAudioCtx.state === "suspended") {
+    void sharedAudioCtx.resume().catch(() => {});
+  }
+  return sharedAudioCtx;
+}
+
+function unlockAudio(): void {
+  try {
+    getAudioContext();
+  } catch {
+    // Ignore environments without Web Audio
+  }
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
+}
+
 function base64ToBlob(base64: string, mimeType: string): Blob {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -286,6 +326,54 @@ function revoke(url: string): void {
 
 function revokeAll(): void {
   for (const url of [...liveUrls]) revoke(url);
+}
+
+async function playWithAudioContext(base64: string, mine: number): Promise<boolean> {
+  const ctx = getAudioContext();
+  if (!ctx) return false;
+  if (ctx.state === "suspended") {
+    await ctx.resume().catch(() => {});
+  }
+  const arrayBuffer = base64ToArrayBuffer(base64);
+  let audioBuffer: AudioBuffer;
+  try {
+    audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+  } catch {
+    return false;
+  }
+  if (mine !== generation) return false;
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    currentBufferSource = source;
+
+    const finish = (heard: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (currentBufferSource === source) currentBufferSource = null;
+      if (endCurrent === silence) endCurrent = null;
+      resolve(heard);
+    };
+    const silence = () => {
+      try {
+        source.stop();
+      } catch {
+        // Ignored
+      }
+      finish(false);
+    };
+
+    endCurrent = silence;
+    source.onended = () => finish(true);
+    try {
+      source.start(0);
+    } catch {
+      silence();
+    }
+  });
 }
 
 /** Resolves with whether the chunk actually reached the speakers. */
@@ -325,6 +413,14 @@ async function playAudio(
 ): Promise<boolean> {
   // A stop that lands between two chunks must not start the next one.
   if (mine !== generation) return false;
+
+  const scope = globalThis as unknown as { AudioContext?: unknown; webkitAudioContext?: unknown };
+  if (scope.AudioContext || scope.webkitAudioContext) {
+    const heard = await playWithAudioContext(base64, mine);
+    if (heard) return true;
+    if (mine !== generation) return false;
+  }
+
   const url = URL.createObjectURL(base64ToBlob(base64, mimeType));
   liveUrls.add(url);
   try {
@@ -463,6 +559,16 @@ function stop(): void {
   inFlight = null;
   request?.abort();
 
+  const source = currentBufferSource;
+  currentBufferSource = null;
+  if (source) {
+    try {
+      source.stop();
+    } catch {
+      // Ignored
+    }
+  }
+
   const audio = currentAudio;
   currentAudio = null;
   if (audio) {
@@ -543,6 +649,7 @@ async function streamChunks(
 }
 
 async function speak(args: { messageId: string; text: string }): Promise<void> {
+  unlockAudio();
   const text = toSpeakable(args.text);
   if (!text) {
     toast.info(
@@ -591,6 +698,7 @@ export const PREVIEW_MESSAGE_ID = "speak:preview";
  * interrupts a Test.
  */
 async function preview(audioBase64: string, mimeType: string = AUDIO_MIME): Promise<boolean> {
+  unlockAudio();
   stop();
   const mine = generation;
   setState({ speaking: true, messageId: PREVIEW_MESSAGE_ID });
