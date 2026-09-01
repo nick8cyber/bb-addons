@@ -15,6 +15,7 @@ import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 
 import {
   AUDIO_MIME,
+  DEFAULT_MODEL,
   DEFAULT_PREFS,
   GEMINI_BASE_URL,
   GEMINI_VOICES,
