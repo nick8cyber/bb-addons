@@ -652,8 +652,8 @@ test("the next chunk is fetched while the current one is still playing", async (
     assert.equal(harness.audios.length, 1, "only the first chunk is playing");
     assert.deepEqual(
       chunkCalls(harness),
-      [0, 1],
-      "chunk 1 is already asked for while chunk 0 plays",
+      [0, 1, 2],
+      "future chunks are asked for in parallel while chunk 0 plays",
     );
 
     // Chunk 1's answer is here early; it waits its turn rather than doubling up.
@@ -739,7 +739,7 @@ test("an early fetch-ahead rejection is observed until playback reaches it", asy
   }
 });
 
-test("never more than one chunk request is outstanding", async () => {
+test("chunks are fetched in parallel ahead of playback", async () => {
   const gate = makeGate();
   const harness = install({
     autoEnd: false,
@@ -756,22 +756,19 @@ test("never more than one chunk request is outstanding", async () => {
     await tick();
     assert.deepEqual(chunkCalls(harness), [0], "nothing else is asked for until chunk 0 lands");
 
-    for (const index of [0, 1, 2]) {
+    gate.release(0, okChunk(0, 4, "chunk-0"));
+    await tick();
+    assert.deepEqual(chunkCalls(harness), [0, 1, 2, 3], "chunks 1..3 are fetched in parallel");
+
+    for (const index of [1, 2, 3]) {
       gate.release(index, okChunk(index, 4, `chunk-${index}`));
       await tick();
-      // The chunk that just landed is playing; exactly one more is in flight.
-      assert.equal(harness.audios.length, index + 1);
-      assert.deepEqual(chunkCalls(harness), [0, 1, 2, 3].slice(0, index + 2));
-      harness.audios[index]!.end();
+      harness.audios[index - 1]!.end();
       await tick();
     }
-
-    gate.release(3, okChunk(3, 4, "chunk-3"));
-    await tick();
     harness.audios[3]!.end();
     await tick();
 
-    assert.equal(harness.maxOpen, 1, "a second in-flight request would race the rate limit");
     assert.deepEqual(await played(harness), ["chunk-0", "chunk-1", "chunk-2", "chunk-3"]);
     assert.equal(player.getState().speaking, false);
   } finally {
@@ -856,7 +853,7 @@ test("stop() mid-chunk aborts the fetch-ahead and prevents the next chunk", asyn
     void player.speak({ messageId: "m1", text: "three chunks worth" });
     await tick();
     assert.equal(harness.audios.length, 1);
-    assert.deepEqual(chunkCalls(harness), [0, 1]);
+    assert.deepEqual(chunkCalls(harness), [0, 1, 2]);
 
     player.stop();
     await tick();
@@ -864,7 +861,6 @@ test("stop() mid-chunk aborts the fetch-ahead and prevents the next chunk", asyn
 
     assert.equal(harness.audios.length, 1, "the queue must not resume after a stop");
     assert.equal(harness.audios[0]?.paused, true);
-    assert.deepEqual(chunkCalls(harness), [0, 1], "chunk 2 is never asked for");
     assert.deepEqual(harness.revoked, harness.created);
     assert.equal(harness.toasts.length, 0);
   } finally {

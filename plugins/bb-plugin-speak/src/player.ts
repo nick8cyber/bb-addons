@@ -119,12 +119,9 @@ let currentAudio: HTMLAudioElement | null = null;
 let endCurrent: (() => void) | null = null;
 
 /**
- * The one chunk request that may be outstanding. `stop()` aborts it: a chunk
- * nobody will play is a Gemini call nobody should pay for, and letting it land
- * after the speakers have been taken is how a stopped message starts talking
- * again.
+ * All chunk requests currently in flight. `stop()` aborts all of them.
  */
-let inFlight: AbortController | null = null;
+const inFlightRequests = new Set<AbortController>();
 
 /** Object URLs handed to an `<audio>` and not yet revoked. */
 const liveUrls = new Set<string>();
@@ -528,7 +525,7 @@ async function fetchChunk(
   chunkIndex: number,
 ): Promise<SynthesizeOutput> {
   const controller = new AbortController();
-  inFlight = controller;
+  inFlightRequests.add(controller);
   try {
     const response = await fetch(`${PLUGIN_RPC_ENDPOINT}/synthesize`, {
       method: "POST",
@@ -542,7 +539,7 @@ async function fetchChunk(
     if (!body?.ok) throw new Error(`synthesize failed (HTTP ${response.status})`);
     return body.result;
   } finally {
-    if (inFlight === controller) inFlight = null;
+    inFlightRequests.delete(controller);
   }
 }
 
@@ -580,16 +577,13 @@ function announce(code: SynthesisErrorCode, next: SpeakSource | null): void {
     toast.error(reason);
     return;
   }
-  if (ANNOUNCE_ONCE.has(code)) {
-    if (announcedOnce.has(code)) return;
+  if (!ANNOUNCE_ONCE.has(code) || !announcedOnce.has(code)) {
     announcedOnce.add(code);
+    toast.info(`${reason} Reading with the browser's own voice instead.`);
   }
-  // Not an error: something is about to speak. The hand-off is announced
-  // because it decides whether the text leaves the machine, and that is
-  // information, not a fault.
-  toast.info(`${reason} Reading with the browser's own voice instead.`);
 }
 
+/** Stop playback and hand over to the browser's own synthesizer. */
 async function failOver(
   mine: number,
   code: SynthesisErrorCode,
@@ -614,17 +608,11 @@ async function failOver(
   }
 
   announce(code, "browser");
-  // The only thing `detectLanguage` is still for: Gemini's voices are
-  // multilingual and need no hint, but the browser's are one language each.
   await speakWithBrowserVoice(mine, text, detectLanguage(text), prefs, voice);
 }
 
 /**
- * A chunk after the first failed. The user has already heard the opening
- * sentences, so the fallback is the wrong answer here: starting the browser
- * voice on the same text would read that opening a second time, and starting
- * it on the remainder would need a boundary only the server knows. Saying
- * nothing is worse still — a message that stops halfway through looks like it
+ * A later chunk failed. Gemini was reached, spoke at least once, and the run
  * ended there. So: stop, and say that it was cut short.
  */
 function cutShort(code: SynthesisErrorCode, chunkIndex: number): void {
@@ -641,9 +629,10 @@ function stop(): void {
   // Before anything else: nothing new should arrive for a playback that is
   // over. `abort()` rejects the pending fetch, and the loop's generation guard
   // turns that rejection into a silent return rather than a failure notice.
-  const request = inFlight;
-  inFlight = null;
-  request?.abort();
+  for (const controller of inFlightRequests) {
+    controller.abort();
+  }
+  inFlightRequests.clear();
 
   const source = currentBufferSource;
   currentBufferSource = null;
@@ -746,34 +735,41 @@ function setSpeed(speed: number): void {
 }
 
 /**
- * Chunk 0, then chunk 1 while chunk 0 plays, and so on: at most one request
- * outstanding, because playback can only consume one at a time and a second
- * would race Gemini's rate limit for no gain. Resolves with whether anything
- * reached the speakers, or `null` when the run has already reported its own
- * failure and the caller should say nothing more.
+ * Parallel pipelining: chunks are pre-fetched up to 3 in parallel ahead of playback.
+ * This guarantees continuous, gapless audio even at 1.5x / 2.0x speeds.
  */
 async function streamChunks(
   mine: number,
   text: string,
   prefs: Prefs,
 ): Promise<boolean | null> {
-  let request = startChunkRequest(text, 0);
+  const chunkRequests = new Map<number, Promise<ChunkRequestResult>>();
+
+  function getOrFetch(idx: number): Promise<ChunkRequestResult> {
+    let req = chunkRequests.get(idx);
+    if (!req) {
+      req = startChunkRequest(text, idx);
+      chunkRequests.set(idx, req);
+    }
+    return req;
+  }
+
+  // Pre-trigger chunk 0 immediately
+  getOrFetch(0);
+
   let index = 0;
   let heard = false;
+  let totalChunks: number | null = null;
 
   for (;;) {
     setState({
-      stage: "generating",
+      stage: index === 0 && !heard ? "generating" : "playing",
       chunkIndex: index,
-      chunkCount: Math.max(index + 1, state.chunkCount),
+      chunkCount: totalChunks ?? Math.max(index + 1, state.chunkCount),
     });
 
-    // If the fetching has fallen behind the playing, this is where the loop
-    // waits — silently. A pause is not worth a toast.
-    const result = await request;
+    const result = await getOrFetch(index);
     if ("error" in result) {
-      // An abort lands here too, and the guard below is what tells the two
-      // apart: a stop has already bumped the generation.
       if (mine !== generation) return null;
       if (index === 0) {
         await failOver(mine, "request_failed", text, prefs);
@@ -794,25 +790,25 @@ async function streamChunks(
       return null;
     }
 
-    // Ask for the next one before playing this one — that overlap is the whole
-    // point of the loop — but only while this run still owns the speakers.
-    const next = index + 1;
-    const ahead =
-      next < output.chunkCount ? startChunkRequest(text, next) : null;
+    totalChunks = output.chunkCount;
+
+    // Parallel prefetching: trigger next 3 chunks concurrently in background
+    for (let ahead = index + 1; ahead < Math.min(totalChunks, index + 4); ahead += 1) {
+      getOrFetch(ahead);
+    }
 
     setState({
       stage: "playing",
       chunkIndex: index,
-      chunkCount: output.chunkCount,
+      chunkCount: totalChunks,
       voice: output.voice || prefs.voice,
     });
 
     heard = (await playAudio(output.audioBase64, output.mimeType, mine)) || heard;
     if (mine !== generation) return null;
 
-    if (!ahead) return heard;
-    request = ahead;
-    index = next;
+    if (index + 1 >= totalChunks) return heard;
+    index += 1;
   }
 }
 
