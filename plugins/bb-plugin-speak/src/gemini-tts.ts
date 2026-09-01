@@ -55,11 +55,37 @@ function fail(code: SynthesisErrorCode, message: string, extra: Partial<TtsFailu
   return { ok: false, code, message, ...extra };
 }
 
+/** `GenerateRequestsPerDayPerProjectPerModel-FreeTier` and friends. */
+function isDailyQuotaId(quotaId: string): boolean {
+  return /per[_-]?day/i.test(quotaId);
+}
+
+/** Every `quotaId` Google listed, or [] when the body is not its usual shape. */
+function quotaIds(body: string): string[] {
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: { details?: Array<{ violations?: Array<{ quotaId?: unknown }> }> };
+    };
+    return (parsed.error?.details ?? [])
+      .flatMap((detail) => detail.violations ?? [])
+      .map((violation) => violation.quotaId)
+      .filter((id): id is string => typeof id === "string");
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Which allowance a 429 is about. Google names the metric in the body —
- * `...PerDay` / `PerDayPerProject` for the daily one, `PerMinute` for the
- * other — and usually attaches a RetryInfo. When it names neither, assume the
- * cheaper reading: a burst, recoverable in a minute, rather than a day gone.
+ * Which allowance a 429 is about.
+ *
+ * Read off the `quotaId`s Google lists rather than off the prose, and note the
+ * asymmetry that a live 429 taught us: when the day is genuinely spent the
+ * limit is zero, so *every* meter reports a violation — the per-minute ones
+ * included. A real daily exhaustion therefore names both. Only a body naming
+ * the minute alone is a burst, and a day violation anywhere wins.
+ *
+ * The `retryDelay` Google attaches to a spent day is about the minute meter,
+ * so `cooldownUntil` ignores it in that case and waits for the rollover.
  */
 export function readQuotaScope(body: string): {
   quotaScope: "day" | "burst";
@@ -67,10 +93,17 @@ export function readQuotaScope(body: string): {
 } {
   const retry = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i.exec(body);
   const retryAfterMs = retry ? Math.round(Number(retry[1]) * 1000) : undefined;
-  const perDay = /per[_\s-]?day|PerDayPerProject|RequestsPerDay/i.test(body);
-  const perMinute = /per[_\s-]?minute|PerMinutePerProject|RequestsPerMinute/i.test(body);
-  if (perDay && !perMinute) return { quotaScope: "day", retryAfterMs };
-  return { quotaScope: "burst", retryAfterMs };
+
+  const ids = quotaIds(body);
+  if (ids.length > 0) {
+    return { quotaScope: ids.some(isDailyQuotaId) ? "day" : "burst", retryAfterMs };
+  }
+
+  // No structured violations to read — fall back to the prose, where naming
+  // the day and not the minute is the only safe reading.
+  const perDay = /per[_\s-]?day/i.test(body);
+  const perMinute = /per[_\s-]?minute/i.test(body);
+  return { quotaScope: perDay && !perMinute ? "day" : "burst", retryAfterMs };
 }
 
 function endpoint(baseUrl: string, model: string, apiKey: string): string {

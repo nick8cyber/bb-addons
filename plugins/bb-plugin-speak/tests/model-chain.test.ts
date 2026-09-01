@@ -21,6 +21,7 @@ registerHooks({
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 
 const { planModels, nextQuotaReset, isQuotaFailure, cooldownUntil } = await import("../src/model-chain.js");
 const { readQuotaScope } = await import("../src/gemini-tts.js");
@@ -147,4 +148,40 @@ test("what mapStatus puts on the failure is what cooldownUntil reads", () => {
   assert.ok("quotaScope" in read, "the field must be named as the failure declares it");
   const at = new Date("2026-03-02T00:30:00Z");
   assert.equal(cooldownUntil(read, at), nextQuotaReset(at), "a spent day must reach the rollover");
+});
+
+test("a real Google 429 for a spent day is read as a day, not a burst", () => {
+  // Captured from the live API, not written by hand — and the thing it taught
+  // us is the asymmetry: at a limit of zero every meter reports, so a genuine
+  // daily exhaustion names the per-minute quotas too. The first version of
+  // this parser required "day and not minute" and therefore classified the
+  // real thing as a burst, benching a spent day for fifty-six seconds.
+  const body = readFileSync(new URL("./fixtures/google-429-day-exhausted.json", import.meta.url), "utf8");
+  const ids = JSON.parse(body).error.details
+    .flatMap((d: { violations?: Array<{ quotaId?: string }> }) => d.violations ?? [])
+    .map((v: { quotaId?: string }) => v.quotaId);
+  assert.ok(ids.some((id: string) => /PerDay/i.test(id)), "fixture must name a per-day quota");
+  assert.ok(ids.some((id: string) => /PerMinute/i.test(id)), "and a per-minute one alongside it");
+
+  const read = readQuotaScope(body);
+  assert.equal(read.quotaScope, "day");
+  assert.equal(read.retryAfterMs, 56_000, "Google's retryDelay is still read");
+
+  const at = new Date("2026-03-02T00:30:00Z");
+  assert.equal(
+    cooldownUntil(read, at),
+    nextQuotaReset(at),
+    "and it is ignored for a spent day, which waits for the rollover",
+  );
+});
+
+test("a burst names the minute alone", () => {
+  const body = JSON.stringify({ error: { code: 429, details: [
+    { "@type": "type.googleapis.com/google.rpc.QuotaFailure", violations: [
+      { quotaId: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" },
+      { quotaId: "GenerateContentInputTokensPerModelPerMinute-FreeTier" }]},
+    { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "9s" }]}});
+  const read = readQuotaScope(body);
+  assert.equal(read.quotaScope, "burst");
+  assert.equal(read.retryAfterMs, 9_000);
 });
