@@ -1,5 +1,7 @@
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 
+import { AgySafetySection } from "./src/AgySafetySection.js";
+
 /**
  * The provider mark, drawn inline. Two routes exist and this is the better
  * one: `icons/agy.svg` reaches clients as a `logoUrl` and is drawn through
@@ -36,5 +38,15 @@ export default definePluginApp((app) => {
   app.slots.experimental_providerIcon({
     providerId: "agy",
     icon: AntigravityIcon,
+  });
+  // The provider's standing notice. It says what a turn on agy may do without
+  // asking and what the bridge logs — facts the picker has no room for and
+  // that a user should not have to read the source to learn.
+  app.slots.settingsSection({
+    id: "agy-safety",
+    title: "Antigravity (agy)",
+    description:
+      "What a thread on this provider may do without asking, and what the bridge writes down.",
+    component: AgySafetySection,
   });
 });
