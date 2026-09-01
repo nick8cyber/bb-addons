@@ -263,4 +263,18 @@ Done!`;
 
     assert.equal(toSpeakable(mixedInput), expected);
   });
+
+  it("converts a heading that itself contains a hash", () => {
+    // The heading rule used to refuse any line with a second `#`, which left
+    // the markers in for the engine to pronounce as "hash hash".
+    assert.equal(toSpeakable("## Issue #23 is closed"), "Issue #23 is closed.");
+    assert.equal(toSpeakable("# C# notes"), "C# notes.");
+    assert.equal(toSpeakable("## Done ##"), "Done.");
+  });
+
+  it("consumes a link URL that carries balanced parentheses", () => {
+    // Stopping at the first `)` left the second one stranded in the prose.
+    assert.equal(toSpeakable("see [docs](https://ex.com/a_(b)) now"), "see docs now");
+    assert.equal(toSpeakable("![shot](https://ex.com/a_(b)) gone"), "gone");
+  });
 });

@@ -178,13 +178,13 @@ export function toSpeakable(markdown: string): string {
   text = text.replace(/\[\^[^\]]+\]/g, "");
 
   // Images: removed entirely including alt text
-  text = text.replace(/!\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])/g, "");
+  text = text.replace(/!\[[^\]]*\](?:\((?:[^()]|\([^()]*\))*\)|\[[^\]]*\])/g, "");
 
   // Link definitions, autolinks, reference links, inline links, bare URLs
   text = text.replace(/^[ \t]*\[[^\]]+\]:[ \t]+.*$/gm, "");
   text = text.replace(/<[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^>]+>/g, "");
   text = text.replace(/<mailto:[^>]+>/g, "");
-  text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  text = text.replace(/\[([^\]]+)\]\((?:[^()]|\([^()]*\))*\)/g, "$1");
   text = text.replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1");
   text = text.replace(/\bhttps?:\/\/[^\s<>()]+(?=[.,;:!?]?(?:\s|$))/g, "");
 
@@ -196,7 +196,7 @@ export function toSpeakable(markdown: string): string {
     ensureTerminalPunctuation(heading),
   );
   text = text.replace(
-    /^[ \t]{0,3}#{1,6}[ \t]+([^\n#]*?)(?:[ \t]+#+)?[ \t]*$/gm,
+    /^[ \t]{0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+[ \t]*)?$/gm,
     (_m, heading) => ensureTerminalPunctuation(heading),
   );
 
