@@ -61,13 +61,16 @@ function fail(code: SynthesisErrorCode, message: string, extra: Partial<TtsFailu
  * other — and usually attaches a RetryInfo. When it names neither, assume the
  * cheaper reading: a burst, recoverable in a minute, rather than a day gone.
  */
-export function readQuotaScope(body: string): { scope: "day" | "burst"; retryAfterMs?: number } {
+export function readQuotaScope(body: string): {
+  quotaScope: "day" | "burst";
+  retryAfterMs?: number;
+} {
   const retry = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i.exec(body);
   const retryAfterMs = retry ? Math.round(Number(retry[1]) * 1000) : undefined;
   const perDay = /per[_\s-]?day|PerDayPerProject|RequestsPerDay/i.test(body);
   const perMinute = /per[_\s-]?minute|PerMinutePerProject|RequestsPerMinute/i.test(body);
-  if (perDay && !perMinute) return { scope: "day", retryAfterMs };
-  return { scope: "burst", retryAfterMs };
+  if (perDay && !perMinute) return { quotaScope: "day", retryAfterMs };
+  return { quotaScope: "burst", retryAfterMs };
 }
 
 function endpoint(baseUrl: string, model: string, apiKey: string): string {
