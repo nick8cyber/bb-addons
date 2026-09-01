@@ -267,6 +267,10 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  /** A model on cooldown is the thing a human checking status wants to see. */
+  const benchedNote = (until: number): string =>
+    until > Date.now() ? `  (out of quota until ${new Date(until).toLocaleString()})` : "";
+
   bb.cli.register({
     name: "speak",
     summary: "Read chat messages aloud through Gemini TTS",
@@ -288,7 +292,12 @@ export default async function plugin(bb: BbPluginApi) {
         // a shell history and a terminal scrollback.
         `Gemini API key: ${configured ? "configured" : `not set — add it in ${WHERE_TO_PUT_THE_KEY}`}`,
         `voice:          ${prefs.voice}`,
-        `model:          ${prefs.model}`,
+        `model:          ${prefs.model}${benchedNote(await cooldownFor(prefs.model))}`,
+        `when spent:     ${
+          prefs.fallbackModel
+            ? `${prefs.fallbackModel}${benchedNote(await cooldownFor(prefs.fallbackModel))}`
+            : "nothing — the browser voice takes over"
+        }`,
         `browser voice fallback: ${prefs.fallbackEnabled ? `on (rate ${prefs.browserRate})` : "off"}`,
       ];
       return { exitCode: 0, stdout: `${lines.join("\n")}\n` };
