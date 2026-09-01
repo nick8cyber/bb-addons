@@ -1,0 +1,35 @@
+{
+  "name": "bb-plugin-speak",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Read any chat message out loud: one button, Google Cloud Text-to-Speech, and the browser's own voice when that is not available.",
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "engines": {
+    "bb": ">=0.40",
+    "bbPluginSdk": ">=0.4.21"
+  },
+  "bb": {
+    "name": "Speak",
+    "description": "Adds a play button to every chat message that reads it aloud through Google Cloud Text-to-Speech, falling back to the browser's built-in voice.",
+    "branding": {
+      "icon": "./icons/speak.svg"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.21",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "sonner": "^2.0.8",
+    "typescript": "^5.7.0"
+  }
+}
