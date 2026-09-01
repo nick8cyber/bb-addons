@@ -1,0 +1,85 @@
+/**
+ * The quota chain, without a plugin host.
+ *
+ *   node --experimental-strip-types --test tests/model-chain.test.ts
+ */
+import { registerHooks } from "node:module";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith(".") && specifier.endsWith(".js") && context.parentURL) {
+      const candidate = new URL(`${specifier.slice(0, -3)}.ts`, context.parentURL);
+      if (existsSync(fileURLToPath(candidate))) {
+        return { url: candidate.href, format: "module-typescript", shortCircuit: true };
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+const { planModels, nextQuotaReset, isQuotaFailure } = await import("../src/model-chain.js");
+const { DEFAULT_MODEL, FALLBACK_MODEL } = await import("../src/contract.js");
+
+const never = () => false;
+
+test("both models are offered, primary first", () => {
+  assert.deepEqual(planModels(DEFAULT_MODEL, FALLBACK_MODEL, never), [DEFAULT_MODEL, FALLBACK_MODEL]);
+});
+
+test("a model in cooldown is skipped", () => {
+  assert.deepEqual(
+    planModels(DEFAULT_MODEL, FALLBACK_MODEL, (m) => m === DEFAULT_MODEL),
+    [FALLBACK_MODEL],
+  );
+});
+
+test("everything in cooldown still tries, rather than refusing to speak", () => {
+  // The cooldown is a guess about Google's clock, not a fact about it.
+  assert.deepEqual(planModels(DEFAULT_MODEL, FALLBACK_MODEL, () => true), [
+    DEFAULT_MODEL,
+    FALLBACK_MODEL,
+  ]);
+});
+
+test("an empty fallback means there is only one model", () => {
+  assert.deepEqual(planModels(DEFAULT_MODEL, "", never), [DEFAULT_MODEL]);
+  assert.deepEqual(planModels(DEFAULT_MODEL, "   ", never), [DEFAULT_MODEL]);
+});
+
+test("the same model named twice is tried once", () => {
+  assert.deepEqual(planModels(DEFAULT_MODEL, DEFAULT_MODEL, never), [DEFAULT_MODEL]);
+});
+
+test("only a spent quota changes model", () => {
+  assert.equal(isQuotaFailure("rate_limited"), true);
+  for (const code of ["auth", "request_failed", "not_configured", "empty", "too_long"]) {
+    assert.equal(isQuotaFailure(code), false, `${code} must not switch model`);
+  }
+});
+
+test("the cooldown ends at the next Pacific midnight", () => {
+  // 2026-03-02T00:30:00Z is 16:30 on 2026-03-01 in Pacific (UTC-8), so the
+  // reset is 7.5 hours away.
+  const at = new Date("2026-03-02T00:30:00Z");
+  const hours = (nextQuotaReset(at) - at.getTime()) / 3_600_000;
+  assert.ok(Math.abs(hours - 7.5) < 0.01, `expected 7.5 hours, got ${hours}`);
+});
+
+test("the cooldown is always in the future and never more than a day", () => {
+  for (const iso of [
+    "2026-03-02T07:59:00Z", // a minute before Pacific midnight
+    "2026-03-02T08:01:00Z", // a minute after it
+    "2026-07-15T12:00:00Z", // daylight saving, UTC-7
+    "2026-11-05T09:00:00Z",
+  ]) {
+    const at = new Date(iso);
+    const delta = nextQuotaReset(at) - at.getTime();
+    assert.ok(delta > 0, `${iso}: cooldown must be in the future`);
+    assert.ok(delta <= 86_400_000, `${iso}: cooldown must not exceed a day`);
+  }
+});
