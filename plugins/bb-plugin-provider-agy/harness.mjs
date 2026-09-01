@@ -1,15 +1,13 @@
 /**
  * Offline harness: drives the BUILT bridge artifact (dist/host.js) in-process
- * through the protocol rules the v1 conformance kit checks, plus one real agy
- * turn. The published SDK 0.4.8 does not ship the conformance kit (it lands in
- * 0.4.16 as @get-bb/plugin-sdk/provider-bridge/testing), so the scenarios are
- * reimplemented here against the same rule names.
+ * through the protocol-v2/thread-delta rules, plus one real agy turn.
  *
  * Usage: node harness.mjs <model>
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { experimental_createBridgeDeltaEventCollector } from "@get-bb/plugin-sdk/provider-bridge/testing";
 
 const MODEL = process.argv[2] ?? "gemini-3.5-flash-low";
 const workspace = mkdtempSync(join(tmpdir(), "agy-conformance-"));
@@ -60,13 +58,30 @@ async function waitFor(predicate, timeoutMs, label) {
   }
 }
 
+async function waitUntil(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await sleep(100);
+  }
+  return predicate();
+}
+
 const results = [];
 const check = (id, ok, detail = "") =>
   results.push({ id, status: ok ? "pass" : "FAIL", detail });
+/** A rule this run could not put in a position to observe (see steering). */
+const skip = (id, detail) => results.push({ id, status: "skip", detail });
 
 const responseFor = (id) => messages.find((m) => m.id === id);
-const events = () =>
-  messages.filter((m) => m.method === "thread/event").map((m) => m.params);
+const deltaNotifications = (threadId) =>
+  messages
+    .filter(
+      (m) =>
+        m.method === "thread/delta" &&
+        (threadId === undefined || m.params.threadId === threadId),
+    );
+const deltas = (threadId) =>
+  deltaNotifications(threadId).flatMap((m) => m.params.deltas);
 const notifications = (method) => messages.filter((m) => m.method === method);
 
 const permissionPolicy = {
@@ -108,12 +123,17 @@ send({
   jsonrpc: "2.0",
   id: "init",
   method: "initialize",
-  params: { protocolVersion: 1, client: { name: "harness", version: "1.0.0" } },
+  params: {
+    protocolVersion: 2,
+    grammarVersions: [3, 3],
+    client: { name: "harness", version: "1.0.0" },
+  },
 });
 const handshake = responseFor("init")?.result;
 check(
   "handshake/initialize",
-  handshake?.protocolVersion === 1 && handshake?.capabilities !== undefined,
+  handshake?.protocolVersion === 2 &&
+    JSON.stringify(handshake?.capabilities?.grammarVersions) === "[3,3]",
   JSON.stringify(handshake),
 );
 
@@ -149,11 +169,16 @@ check(
 );
 
 const identityIndex = messages.findIndex((m) => m.method === "thread/identity");
-const firstEventIndex = messages.findIndex((m) => m.method === "thread/event");
+const firstDeltaIndex = messages.findIndex((m) => m.method === "thread/delta");
 check(
-  "ordering/identity-precedes-events",
-  identityIndex !== -1 && (firstEventIndex === -1 || identityIndex < firstEventIndex),
-  `identity@${identityIndex} firstEvent@${firstEventIndex}`,
+  "ordering/identity-precedes-deltas",
+  identityIndex !== -1 && (firstDeltaIndex === -1 || identityIndex < firstDeltaIndex),
+  `identity@${identityIndex} firstDelta@${firstDeltaIndex}`,
+);
+check(
+  "session/reset-first",
+  deltas(threadId)[0]?.kind === "session.reset",
+  JSON.stringify(deltas(threadId)[0]),
 );
 
 send({
@@ -169,29 +194,38 @@ send({
   },
 });
 await waitFor(
-  (m) => m.method === "thread/event" && m.params.event.type === "turn/completed",
+  (m) =>
+    m.method === "thread/delta" &&
+    m.params.threadId === threadId &&
+    m.params.deltas.some((delta) => delta.kind === "turn.boundary"),
   120_000,
   "turn/completed",
 );
 
-const turnEvents = events().map((p) => p.event);
-const accepted = turnEvents.find((e) => e.type === "turn/input/accepted");
-const started = turnEvents.find((e) => e.type === "turn/started");
-const completed = turnEvents.find((e) => e.type === "turn/completed");
+const turnDeltas = deltas(threadId);
+const accepted = turnDeltas.find((delta) => delta.kind === "input.accepted");
+const started = turnDeltas.find((delta) => delta.kind === "turn.open");
+const completed = turnDeltas.find((delta) => delta.kind === "turn.boundary");
+const acceptedIdx = turnDeltas.findIndex(
+  (delta) => delta.kind === "input.accepted",
+);
+const startedIdx = turnDeltas.findIndex((delta) => delta.kind === "turn.open");
 check(
   "turn/lifecycle",
   accepted?.clientRequestId === "creq_abcdefghij" &&
     started !== undefined &&
+    startedIdx !== -1 &&
+    acceptedIdx > startedIdx &&
     completed?.status === "completed" &&
-    accepted.scope.turnId === completed.scope.turnId,
-  `accepted=${Boolean(accepted)} started=${Boolean(started)} status=${completed?.status}`,
+    accepted.providerTurnId === completed.providerTurnId,
+  `accepted=${Boolean(accepted)} started=${Boolean(started)} order=${startedIdx}<${acceptedIdx} status=${completed?.status}`,
 );
 
-const itemStartedIdx = turnEvents.findIndex((e) => e.type === "item/started");
-const firstDeltaIdx = turnEvents.findIndex(
-  (e) => e.type === "item/agentMessage/delta",
+const itemStartedIdx = turnDeltas.findIndex((delta) => delta.kind === "item.open");
+const firstDeltaIdx = turnDeltas.findIndex(
+  (delta) => delta.kind === "item.textDelta",
 );
-const deltas = turnEvents.filter((e) => e.type === "item/agentMessage/delta");
+const textDeltas = turnDeltas.filter((delta) => delta.kind === "item.textDelta");
 check(
   "item/opens-before-delta",
   itemStartedIdx !== -1 && firstDeltaIdx > itemStartedIdx,
@@ -199,27 +233,66 @@ check(
 );
 check(
   "stream/deltas-arrive",
-  deltas.length > 0,
-  `${deltas.length} deltas: ${JSON.stringify(deltas.map((d) => d.delta))}`,
+  textDeltas.length > 0,
+  `${textDeltas.length} deltas: ${JSON.stringify(textDeltas.map((d) => d.text))}`,
 );
-const finalItem = turnEvents.findLast?.((e) => e.type === "item/completed");
+const finalItem = turnDeltas.findLast?.((delta) => delta.kind === "item.close");
 check(
   "item/settles-with-text",
   typeof finalItem?.item?.text === "string" && finalItem.item.text.length > 0,
   JSON.stringify(finalItem?.item?.text),
 );
-const usageEvent = turnEvents.find((e) => e.type === "thread/tokenUsage/updated");
+const usageEvent = turnDeltas.find((delta) => delta.kind === "usage");
 check(
   "usage/reported",
-  usageEvent?.tokenUsage?.total?.totalTokens > 0,
-  JSON.stringify(usageEvent?.tokenUsage?.total),
+  usageEvent?.total?.totalTokens > 0,
+  JSON.stringify(usageEvent?.total),
 );
+let deltasAreSchemaValid = true;
+try {
+  const collector = experimental_createBridgeDeltaEventCollector("agy");
+  for (const message of deltaNotifications(threadId)) {
+    collector.assembleMessage(message);
+  }
+} catch {
+  deltasAreSchemaValid = false;
+}
 check(
-  "events/schema-valid",
-  turnEvents.every((e) => typeof e.type === "string" && typeof e.threadId === "string"),
+  "deltas/schema-valid",
+  deltasAreSchemaValid,
 );
 
-// --- steer refusal --------------------------------------------------------
+// --- steering: queued while live, refused when stale ----------------------
+// The bridge declares `steerMode: "queue"`, so a steer aimed at a running turn
+// must be ACCEPTED and become the next turn. Nothing here fakes the timing:
+// the steer goes out while the second turn is still streaming.
+const beforeSteer = deltas(threadId).length;
+const since = () => deltas(threadId).slice(beforeSteer);
+send({
+  jsonrpc: "2.0",
+  id: "turn2",
+  method: "turn/start",
+  params: {
+    threadId,
+    providerThreadId,
+    input: [
+      {
+        type: "text",
+        text: "count from 1 to 40, one number per line, nothing else",
+        mentions: [],
+      },
+    ],
+    clientRequestId: "creq_bcdefghijk",
+    options,
+  },
+});
+// `turn.open` is the moment the turn is live. Waiting for streamed text
+// instead would be too late: agy 1.1.23 flushes a whole answer in one
+// `agent_response` delta at DONE, so the first delta and the turn's `result`
+// arrive together and there is no live turn left to steer.
+await waitUntil(() => since().some((d) => d.kind === "turn.open"), 30_000);
+const liveTurnId = since().find((d) => d.kind === "turn.open")?.providerTurnId;
+const alreadySettled = since().some((d) => d.kind === "turn.boundary");
 send({
   jsonrpc: "2.0",
   id: "steer",
@@ -227,34 +300,86 @@ send({
   params: {
     threadId,
     providerThreadId,
-    input: [{ type: "text", text: "nope", mentions: [] }],
-    clientRequestId: "creq_bcdefghijk",
-    expectedTurnId: completed?.scope?.turnId ?? "x",
+    input: [{ type: "text", text: "stop counting and say STOPPED", mentions: [] }],
+    clientRequestId: "creq_cdefghijkm",
+    expectedTurnId: liveTurnId ?? "x",
+    options,
+  },
+});
+if (alreadySettled) {
+  // A turn short enough to finish inside one poll is not a steerable turn;
+  // reporting a stale steer as a steer failure would be a lie about the rule.
+  // harness-steer.mjs proves this deterministically against the fake.
+  const detail = "the steered turn settled before the steer went out";
+  skip("steer/queued-while-active", detail);
+  skip("steer/runs-after-the-turn-it-steered", detail);
+} else {
+  const queued =
+    responseFor("steer")?.result !== undefined &&
+    responseFor("steer")?.error === undefined;
+  check("steer/queued-while-active", queued, JSON.stringify(responseFor("steer")));
+  // A refused steer produces no second turn, so wait for what this run can
+  // still reach rather than stalling on a turn that will never open.
+  await waitUntil(
+    () =>
+      since().filter((d) => d.kind === "turn.boundary").length >=
+      (queued ? 2 : 1),
+    180_000,
+  );
+  const steerOpen = since().filter((d) => d.kind === "turn.open")[1];
+  const firstBoundaryIdx = since().findIndex((d) => d.kind === "turn.boundary");
+  const steerOpenIdx = since().findIndex(
+    (d) => d.kind === "turn.open" && d.providerTurnId === steerOpen?.providerTurnId,
+  );
+  const steerAccepted = since().find(
+    (d) => d.kind === "input.accepted" && d.clientRequestId === "creq_cdefghijkm",
+  );
+  check(
+    "steer/runs-after-the-turn-it-steered",
+    steerOpen !== undefined &&
+      steerOpen.providerTurnId !== liveTurnId &&
+      firstBoundaryIdx !== -1 &&
+      firstBoundaryIdx < steerOpenIdx &&
+      steerAccepted?.providerTurnId === steerOpen.providerTurnId,
+    `live=${liveTurnId} steerTurn=${steerOpen?.providerTurnId} boundary@${firstBoundaryIdx} open@${steerOpenIdx}`,
+  );
+}
+send({
+  jsonrpc: "2.0",
+  id: "stale",
+  method: "turn/steer",
+  params: {
+    threadId,
+    providerThreadId,
+    input: [{ type: "text", text: "too late", mentions: [] }],
+    clientRequestId: "creq_defghijkmn",
+    expectedTurnId: completed?.providerTurnId ?? "x",
     options,
   },
 });
 check(
-  "steer/typed-refusal",
-  responseFor("steer")?.error?.code === -32001,
-  JSON.stringify(responseFor("steer")?.error?.code),
+  "steer/stale-turn-refused",
+  responseFor("stale")?.error?.code === -32001 &&
+    responseFor("stale")?.error?.data?.recovery?.kind === "staleTurn",
+  JSON.stringify(responseFor("stale")?.error),
 );
 
 // --- release stop fabricates nothing -------------------------------------
-const beforeStop = events().length;
+const beforeStop = deltas(threadId).length;
 send({
   jsonrpc: "2.0",
   id: "stop",
   method: "thread/stop",
   params: { threadId, providerThreadId, intent: "release", activeTurnId: null },
 });
-const afterStop = events().slice(beforeStop).map((p) => p.event);
+const afterStop = deltas(threadId).slice(beforeStop);
 check(
   "stop/release-not-interrupted",
   responseFor("stop")?.result !== undefined &&
     !afterStop.some(
-      (e) => e.type === "turn/completed" && e.status === "interrupted",
+      (delta) => delta.kind === "turn.boundary" && delta.status === "interrupted",
     ),
-  JSON.stringify(afterStop.map((e) => e.type)),
+  JSON.stringify(afterStop.map((delta) => delta.kind)),
 );
 
 // --- resume the same agy conversation ------------------------------------
@@ -291,11 +416,15 @@ process.stdout.write = originalWrite;
 
 say("\n==== harness report ====");
 for (const r of results) {
-  say(`${r.status.padEnd(4)} ${r.id.padEnd
-    ? r.id.padEnd(34) : r.id}  ${r.detail}`);
+  say(`${r.status.padEnd(4)} ${r.id.padEnd(34)}  ${r.detail}`);
 }
-const failed = results.filter((r) => r.status !== "pass");
-say(`\n${results.length - failed.length}/${results.length} passed`);
+const failed = results.filter((r) => r.status === "FAIL");
+const skipped = results.filter((r) => r.status === "skip");
+say(
+  `\n${results.length - failed.length - skipped.length}/${
+    results.length - skipped.length
+  } passed${skipped.length === 0 ? "" : `, ${skipped.length} skipped`}`,
+);
 say("\n---- final assistant text ----");
 say(String(finalItem?.item?.text ?? "(none)"));
 process.exit(failed.length === 0 ? 0 : 1);

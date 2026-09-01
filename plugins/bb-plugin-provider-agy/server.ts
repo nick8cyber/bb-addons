@@ -28,7 +28,6 @@ export default function plugin(bb: BbPluginApi) {
       supportsManualCompaction: false,
       supportsThreadArchive: false,
       supportsThreadRename: false,
-      supportsWorkflows: false,
       // agy's stream-json has no approval back channel, so the only mode the
       // bridge can honestly run is the unrestricted one.
       permissionModes: ["full"],

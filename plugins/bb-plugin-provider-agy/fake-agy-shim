@@ -1,2 +1,3 @@
 #!/bin/sh
-exec /usr/bin/node /home/ubuntu/work/sandbox/bb-addons/plugins/bb-plugin-provider-agy/fake-agy.mjs "$@"
+# Runs the fake agy that sits next to this shim, whatever checkout that is.
+exec /usr/bin/node "$(dirname "$0")/fake-agy.mjs" "$@"

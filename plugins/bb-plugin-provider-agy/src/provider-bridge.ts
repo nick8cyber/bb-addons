@@ -1,8 +1,7 @@
 /**
  * The `agy` provider bridge: Antigravity's CLI as a first-class bb provider,
  * speaking the bb Provider Bridge Protocol natively (line-delimited JSON-RPC
- * 2.0 on stdin/stdout, protocol version 1, `thread/event` grammar — the
- * version bb 0.39 runs).
+ * 2.0 on stdin/stdout, protocol version 2, `thread/delta` grammar.
  *
  * Topology: one bridge process serves every thread on this provider, and each
  * thread owns one `agy` child held open in stream-json mode. A turn is one
@@ -14,11 +13,16 @@
  * - Hygiene: unknown method → METHOD_NOT_FOUND, invalid params →
  *   INVALID_PARAMS with the issues, non-JSON and response-shaped lines
  *   ignored without taking the bridge down.
- * - Ids: every turn and item id is minted here, with per-process entropy, and
- *   item ids are scoped by their turn — never an agy identifier.
- * - Grammar: every accepted turn settles exactly once; every item emits
- *   `item/started` before any delta; `thread/identity` precedes the thread's
- *   first event; a `release` stop fabricates no interruption.
+ * - Ids: provider turn and item ids are minted here, with per-process entropy,
+ *   and the runtime maps them into its own canonical id space.
+ * - Grammar: every accepted turn settles exactly once; every item opens before
+ *   any text delta; `thread/identity` and `session.reset` precede the thread's
+ *   first delta; a `release` stop fabricates no interruption.
+ * - Steering: `steerMode: "queue"`. agy cannot inject into a running turn, so
+ *   an accepted `turn/steer` becomes the next turn in this bridge's own queue
+ *   — never a dropped request. Only a steer that names a turn the session is
+ *   no longer running is refused, with the `staleTurn` hint the runtime keys
+ *   on.
  * - Child processes: finalize on `close`, not `exit`; a stale child's output
  *   can never reach a fresh session (`generation` is checked in every
  *   callback); the child's env is derived from this process's, not inherited
@@ -26,12 +30,14 @@
  */
 import {
   type PromptInput,
-  type ThreadEvent,
+  type ThreadDelta,
   type ThreadEventTokenUsageBreakdown,
   BRIDGE_JSON_RPC_ERRORS,
   BRIDGE_NOTIFICATION_METHODS,
   BRIDGE_REQUEST_METHODS,
   PROVIDER_BRIDGE_PROTOCOL_VERSION,
+  THREAD_DELTA_GRAMMAR_V3,
+  THREAD_DELTA_NOTIFICATION_METHOD,
   experimental_defineProviderBridge,
   initializeParamsSchema,
   modelListParamsSchema,
@@ -105,6 +111,18 @@ function log(message: string): void {
       // A log that cannot be written must never break a turn.
     }
   }
+}
+
+/**
+ * A `turn/steer` that names a turn this session is not running any more. The
+ * typed `staleTurn` hint is what the runtime keys on — it drops the steer
+ * instead of pattern-matching error text — and `retryable: false` says a
+ * second attempt would be just as stale.
+ */
+function refuseStaleSteer(id: JsonRpcId, message: string): void {
+  respondError(id, BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN, message, {
+    recovery: { kind: "staleTurn", message, retryable: false },
+  });
 }
 
 function invalidParams(id: JsonRpcId, method: string, issues: unknown): void {
@@ -220,6 +238,15 @@ interface Session {
   child: ChildProcessWithoutNullStreams | null;
   /** Bumped on every child construction; stale callbacks check it (#1402). */
   generation: number;
+  /**
+   * Whether the CURRENT child has announced itself (`thread/identity` +
+   * `session.reset`). Cleared by every child construction, including a
+   * rebuild onto the same conversation: the id may be unchanged, but the
+   * provider session behind it is new, and the runtime's assembler keeps
+   * item/turn maps and open streams until the reset says otherwise. Nothing
+   * from a child may be emitted before its own announcement.
+   */
+  identityAnnounced: boolean;
   /** agy runs one turn per stdin line, in order, so a FIFO is exact. */
   turns: Turn[];
   usageTotal: ThreadEventTokenUsageBreakdown;
@@ -244,10 +271,10 @@ interface Session {
 
 const sessions = new Map<string, Session>();
 
-function emit(session: Session, event: ThreadEvent): void {
-  notify(BRIDGE_NOTIFICATION_METHODS.threadEvent, {
+function emitDeltas(session: Session, ...deltas: ThreadDelta[]): void {
+  notify(THREAD_DELTA_NOTIFICATION_METHOD, {
     threadId: session.threadId,
-    event,
+    deltas,
   });
 }
 
@@ -261,18 +288,6 @@ function providerRaw(
     coverage,
     payload,
   });
-}
-
-/** The fields every provider event on this session carries. */
-function base(session: Session): {
-  threadId: string;
-  providerThreadId: string;
-} {
-  return {
-    threadId: session.threadId,
-    // Only reachable once identity is known: nothing is emitted before that.
-    providerThreadId: session.providerThreadId ?? "",
-  };
 }
 
 function promptText(input: readonly PromptInput[]): string {
@@ -315,6 +330,12 @@ function startChild(args: StartChildArgs): void {
     envVars: args.envVars,
   };
   session.generation += 1;
+  // A new provider session starts unannounced, and its usage baseline starts
+  // at zero: agy counts tokens cumulatively per process, so a rebuilt child
+  // counts from zero again and a carried-over baseline would clamp every
+  // later turn's `last` to nothing. Both are the `session.reset` boundary.
+  session.identityAnnounced = false;
+  session.usageTotal = ZERO_USAGE;
   const generation = session.generation;
   const command = resolveAgyCommand(process.env);
   const spawnArgs = agySpawnArgs({
@@ -407,12 +428,10 @@ function failSession(session: Session, message: string): void {
   log(`session ${session.threadId} failed: ${message}`);
   session.lastFailure = message;
   if (session.providerThreadId !== null) {
-    emit(session, {
-      type: "provider/error",
-      ...base(session),
+    emitDeltas(session, {
+      kind: "provider.error",
       message,
-      // A session-level failure is not one turn's fault: thread scope.
-      scope: { kind: "thread" },
+      threadScoped: true,
     });
   }
   const turns = [...session.turns, ...session.pending];
@@ -426,12 +445,11 @@ function failSession(session: Session, message: string): void {
       emitTurnStarted(session, turn);
     }
     closeOpenItems(session, turn);
-    emit(session, {
-      type: "turn/completed",
-      ...base(session),
+    emitDeltas(session, {
+      kind: "turn.boundary",
+      providerTurnId: turn.turnId,
       status: "failed",
       error: { message },
-      scope: { kind: "turn", turnId: turn.turnId },
     });
   }
   const waiters = session.identityWaiters;
@@ -477,22 +495,28 @@ function handleAgyLine(
 }
 
 /**
- * Identity precedes traffic. A resumed session already knows its id and only
- * confirms it here; a fresh one learns it from `init` and only then may drain
- * the turns that were waiting for a session to exist.
+ * Identity precedes traffic. A fresh session learns its id from `init`; a
+ * resumed or rebuilt one confirms the id it already carried. Either way this
+ * is the child's announcement, and it is made once per child: the id being
+ * unchanged does not make the provider session behind it the same one, so a
+ * rebuild resets the id space too. Only after it may the turns that were
+ * waiting for a session to exist be drained.
  */
 function adoptIdentity(session: Session, conversationId: string | null): void {
   if (conversationId === null) {
     return;
   }
-  const isNew = session.providerThreadId !== conversationId;
+  const announce =
+    !session.identityAnnounced || session.providerThreadId !== conversationId;
   session.providerThreadId = conversationId;
-  if (isNew) {
+  if (announce) {
+    session.identityAnnounced = true;
     notify(BRIDGE_NOTIFICATION_METHODS.threadIdentity, {
       threadId: session.threadId,
       providerThreadId: conversationId,
       sessionRestorable: true,
     });
+    emitDeltas(session, { kind: "session.reset" });
   }
   const waiters = session.identityWaiters;
   session.identityWaiters = [];
@@ -554,30 +578,31 @@ function handleStepUpdate(
     turn.items.set(stepIndex, item);
     // Every item's first event is item/started — agy streams delta-first, so
     // the opening event is synthesized here.
-    emit(session, {
-      type: "item/started",
-      ...base(session),
-      item: { type: "agentMessage", id: item.itemId, text: "" },
-      scope: { kind: "turn", turnId: turn.turnId },
+    emitDeltas(session, {
+      kind: "item.open",
+      providerTurnId: turn.turnId,
+      key: { providerItemId: item.itemId },
+      item: { type: "agentMessage", text: "" },
     });
   }
   if (event.textDelta !== null && event.textDelta.length > 0) {
     turn.producedText = true;
     item.text += event.textDelta;
-    emit(session, {
-      type: "item/agentMessage/delta",
-      ...base(session),
-      itemId: item.itemId,
-      delta: event.textDelta,
-      scope: { kind: "turn", turnId: turn.turnId },
+    emitDeltas(session, {
+      kind: "item.textDelta",
+      providerTurnId: turn.turnId,
+      key: { providerItemId: item.itemId },
+      channel: "agentMessage",
+      text: event.textDelta,
     });
   }
   if (event.state === "DONE") {
-    emit(session, {
-      type: "item/completed",
-      ...base(session),
-      item: { type: "agentMessage", id: item.itemId, text: item.text },
-      scope: { kind: "turn", turnId: turn.turnId },
+    emitDeltas(session, {
+      kind: "item.close",
+      providerTurnId: turn.turnId,
+      key: { providerItemId: item.itemId },
+      item: { type: "agentMessage", text: item.text },
+      status: "completed",
     });
     turn.items.delete(stepIndex);
   }
@@ -585,11 +610,12 @@ function handleStepUpdate(
 
 function closeOpenItems(session: Session, turn: Turn): void {
   for (const [stepIndex, item] of [...turn.items]) {
-    emit(session, {
-      type: "item/completed",
-      ...base(session),
-      item: { type: "agentMessage", id: item.itemId, text: item.text },
-      scope: { kind: "turn", turnId: turn.turnId },
+    emitDeltas(session, {
+      kind: "item.close",
+      providerTurnId: turn.turnId,
+      key: { providerItemId: item.itemId },
+      item: { type: "agentMessage", text: item.text },
+      status: "completed",
     });
     turn.items.delete(stepIndex);
   }
@@ -680,12 +706,12 @@ function retryArtifactRefusal(
   refusalPath: string | null,
 ): boolean {
   const child = session.child;
-  if (child === null || session.turns.length > 0) {
-    // With another turn already queued behind this one, agy has its stdin
-    // line and will answer it first: a nudge appended now would be matched
-    // against the wrong turn. Fail honestly instead of mis-threading.
+  if (child === null) {
     return false;
   }
+  // Queued turns behind this one are safe: the bridge holds their text until
+  // they reach the head (see enqueueTurn), so the nudge written now is the
+  // only line agy has and it can only be matched against this turn.
   turn.artifactRetries += 1;
   session.writeGuardrail = true;
   session.turns.unshift(turn);
@@ -726,11 +752,12 @@ function handleResult(
     const total = toBreakdown(event.usage);
     const last = subtractUsage(total, session.usageTotal);
     session.usageTotal = total;
-    emit(session, {
-      type: "thread/tokenUsage/updated",
-      ...base(session),
-      tokenUsage: { total, last, modelContextWindow: null },
-      scope: { kind: "turn", turnId: turn.turnId },
+    emitDeltas(session, {
+      kind: "usage",
+      providerTurnId: turn.turnId,
+      total,
+      last,
+      modelContextWindow: null,
     });
   }
 
@@ -788,31 +815,32 @@ function handleResult(
         ` produced no answer. Check the file named above on disk: a write` +
         ` earlier in the same turn may have already landed.`;
     }
-    emit(session, {
-      type: "provider/error",
-      ...base(session),
+    emitDeltas(session, {
+      kind: "provider.error",
+      providerTurnId: turn.turnId,
       message,
-      scope: { kind: "turn", turnId: turn.turnId },
+      settlesTurn: false,
     });
-    emit(session, {
-      type: "turn/completed",
-      ...base(session),
+    emitDeltas(session, {
+      kind: "turn.boundary",
+      providerTurnId: turn.turnId,
       status: "failed",
       error: { message },
-      scope: { kind: "turn", turnId: turn.turnId },
     });
   } else {
-    emit(session, {
-      type: "turn/completed",
-      ...base(session),
+    emitDeltas(session, {
+      kind: "turn.boundary",
+      providerTurnId: turn.turnId,
       status: "completed",
-      scope: { kind: "turn", turnId: turn.turnId },
     });
   }
-  // The next queued turn is now the live one.
+  // The next queued turn is now the live one: it is announced and only now
+  // handed to agy, so a queued turn (a steer, or a second turn/start) cannot
+  // race the one that was running.
   const next = session.turns[0];
   if (next !== undefined && !next.started) {
     emitTurnStarted(session, next);
+    writeTurn(session, next);
   }
 }
 
@@ -822,55 +850,33 @@ function handleResult(
 
 function emitTurnStarted(session: Session, turn: Turn): void {
   turn.started = true;
+  const deltas: ThreadDelta[] = [
+    {
+      kind: "turn.open",
+      providerTurnId: turn.turnId,
+    },
+  ];
   if (turn.clientRequestId !== undefined) {
-    emit(session, {
-      type: "turn/input/accepted",
-      ...base(session),
+    deltas.push({
+      kind: "input.accepted",
       clientRequestId: turn.clientRequestId,
-      scope: { kind: "turn", turnId: turn.turnId },
+      providerTurnId: turn.turnId,
     });
   }
-  emit(session, {
-    type: "turn/started",
-    ...base(session),
-    scope: { kind: "turn", turnId: turn.turnId },
-  });
+  emitDeltas(session, ...deltas);
 }
 
 /**
- * Hand a turn to the child. agy consumes one line per turn strictly in
- * order, so the queue position is the truth about which turn its events
- * belong to; only the head has been announced as started.
+ * Write one turn's text to the child. Called for the head of the queue only:
+ * the bridge, not the child's stdin buffer, is what decides which turn is
+ * live, so a queued turn's text is held here until the turn ahead of it
+ * settles. That is what makes `steerMode: "queue"` exact rather than a bet on
+ * how agy buffers its input.
  */
-function enqueueTurn(session: Session, turn: Turn): void {
-  if (session.child === null && session.providerThreadId !== null) {
-    // The child died (agy crash, its own timeout, an OOM kill) but the
-    // conversation is on disk. Rebuild it against the same conversation and
-    // say so: a silent replacement is the #1268 incident.
-    log(`rebuilding agy child for thread ${session.threadId}`);
-    startChild({
-      session,
-      model: session.spawnConfig.model,
-      reasoningLevel: session.spawnConfig.reasoningLevel,
-      conversationId: session.providerThreadId,
-      envVars: session.spawnConfig.envVars,
-    });
-    notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
-      threadId: session.threadId,
-      providerThreadId: session.providerThreadId,
-      reason: "the agy process was gone and has been restarted",
-      contextLost: false,
-    });
-  }
+function writeTurn(session: Session, turn: Turn): void {
   const child = session.child;
-  if (child === null || session.providerThreadId === null) {
-    session.pending.push(turn);
+  if (child === null) {
     return;
-  }
-  const wasIdle = session.turns.length === 0;
-  session.turns.push(turn);
-  if (wasIdle) {
-    emitTurnStarted(session, turn);
   }
   child.stdin.write(
     agyUserMessageLine(
@@ -879,6 +885,54 @@ function enqueueTurn(session: Session, turn: Turn): void {
         : turn.prompt,
     ),
   );
+}
+
+/**
+ * Hand a turn to the child, or queue it. agy consumes one line per turn
+ * strictly in order, so the queue position is the truth about which turn its
+ * events belong to; only the head is announced as started and only the head
+ * has been written.
+ */
+function enqueueTurn(session: Session, turn: Turn): void {
+  if (session.child === null && session.providerThreadId !== null) {
+    // The child died (agy crash, its own timeout, an OOM kill) but the
+    // conversation is on disk. Rebuild it against the same conversation and
+    // say so: a silent replacement is the #1268 incident. The notification
+    // goes out before the spawn, so nothing the replacement says can precede
+    // the announcement that it exists.
+    log(`rebuilding agy child for thread ${session.threadId}`);
+    notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+      threadId: session.threadId,
+      providerThreadId: session.providerThreadId,
+      reason: "the agy process was gone and is being restarted",
+      contextLost: false,
+    });
+    startChild({
+      session,
+      model: session.spawnConfig.model,
+      reasoningLevel: session.spawnConfig.reasoningLevel,
+      conversationId: session.providerThreadId,
+      envVars: session.spawnConfig.envVars,
+    });
+  }
+  const child = session.child;
+  // A child that has not announced itself yet owns nothing: its turns wait in
+  // `pending` until `init` brings `thread/identity` and `session.reset`, so a
+  // turn is never opened in an id space the runtime is about to drop.
+  if (
+    child === null ||
+    session.providerThreadId === null ||
+    !session.identityAnnounced
+  ) {
+    session.pending.push(turn);
+    return;
+  }
+  const wasIdle = session.turns.length === 0;
+  session.turns.push(turn);
+  if (wasIdle) {
+    emitTurnStarted(session, turn);
+    writeTurn(session, turn);
+  }
 }
 
 function createTurn(args: {
@@ -967,6 +1021,11 @@ const handlers: Record<string, RequestHandler> = {
         // agy's stream-json carries no approval channel, so the bridge runs
         // it with permissions skipped and bb's runtime owns policy.
         approvalEnforcedBy: "runtime",
+        grammarVersions: [
+          THREAD_DELTA_GRAMMAR_V3,
+          THREAD_DELTA_GRAMMAR_V3,
+        ],
+        steerMode: "queue",
       },
     });
   },
@@ -1012,6 +1071,7 @@ const handlers: Record<string, RequestHandler> = {
       cwd: data.cwd,
       child: null,
       generation: 0,
+      identityAnnounced: false,
       turns: [],
       usageTotal: ZERO_USAGE,
       pending: [],
@@ -1078,6 +1138,7 @@ const handlers: Record<string, RequestHandler> = {
       cwd: data.cwd,
       child: null,
       generation: 0,
+      identityAnnounced: false,
       turns: [],
       usageTotal: ZERO_USAGE,
       pending: [],
@@ -1148,14 +1209,50 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnSteer, parsed.error.issues);
       return;
     }
-    // agy's stream-json has no way to inject into a running turn: each line
-    // is a turn and the next one is read only after the current one settles.
-    // The typed refusal is honest, and the runtime turns the steer into a
-    // fresh turn — which agy will run next, in order.
-    respondError(
-      id,
-      BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN,
-      `agy cannot steer a running turn (expected ${parsed.data.expectedTurnId})`,
+    const data = parsed.data;
+    const session = sessions.get(data.threadId);
+    if (session === undefined) {
+      // No session at all: the steer cannot be delivered and cannot be
+      // queued, so it is stale by definition.
+      refuseStaleSteer(
+        id,
+        `No session for thread ${data.threadId}; nothing to steer`,
+      );
+      return;
+    }
+    // A steer names the turn the client believes is running. If that turn has
+    // already settled, the steer is about a turn that no longer exists: the
+    // runtime drops it on the `staleTurn` hint rather than letting it land as
+    // an answer to something else. A turn that is still queued counts as live
+    // — two steers in a row are ordinary.
+    const live =
+      session.turns.some((queued) => queued.turnId === data.expectedTurnId) ||
+      session.pending.some((queued) => queued.turnId === data.expectedTurnId);
+    if (!live) {
+      refuseStaleSteer(
+        id,
+        `turn ${data.expectedTurnId} is not live on thread ${data.threadId}`,
+      );
+      return;
+    }
+    // steerMode is `queue`: agy's stream-json cannot inject into a running
+    // turn (each line IS a turn), so the steer is accepted and becomes the
+    // next turn of this session. Refusing it here is what used to lose the
+    // request outright (#PLUG-26); accepting it is what the declared
+    // capability promises. The turn is announced (`turn.open` +
+    // `input.accepted`) and handed to agy only when it reaches the head, so
+    // the steer runs strictly after the turn it was aimed at.
+    respondResult(id, {});
+    log(
+      `thread ${data.threadId}: steer for turn ${data.expectedTurnId} queued ` +
+        `as the next turn`,
+    );
+    enqueueTurn(
+      session,
+      createTurn({
+        prompt: promptText(data.input),
+        clientRequestId: data.clientRequestId,
+      }),
     );
   },
 
@@ -1186,11 +1283,10 @@ const handlers: Record<string, RequestHandler> = {
           emitTurnStarted(session, turn);
         }
         closeOpenItems(session, turn);
-        emit(session, {
-          type: "turn/completed",
-          ...base(session),
+        emitDeltas(session, {
+          kind: "turn.boundary",
+          providerTurnId: turn.turnId,
           status: "interrupted",
-          scope: { kind: "turn", turnId: turn.turnId },
         });
       }
     }
