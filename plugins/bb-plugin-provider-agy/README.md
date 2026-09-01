@@ -26,10 +26,20 @@ the credential belongs to the machine that runs the turn. Both steps happen
 
 2. **Sign in.** Run `agy` once. There is no `login` subcommand — the first run
    opens a browser, and over SSH it prints a URL and takes the code you paste
-   back. It needs a Google account with Antigravity access, and the token is
-   kept by the machine's keyring; bb never sees it. A headless host can use
-   `GEMINI_API_KEY` with `"modelProvider": "gemini"` in
-   `~/.gemini/antigravity-cli/settings.json` instead.
+   back. It needs a Google account with Antigravity access.
+
+   The credential stays on that machine; bb never handles it. agy stores it in
+   the OS keyring when one is reachable and **falls back to a file when one is
+   not**: `~/.gemini/antigravity-cli/antigravity-oauth-token`, JSON, mode 600.
+   A headless Linux host with no Secret Service gets the file — that is what
+   this plugin was developed against — so treat that path as a credential when
+   you back the machine up or share it.
+
+   A host with no browser at all can skip the account entirely: set
+   `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` and
+   export `GEMINI_API_KEY`. agy then talks to the Gemini API directly, and says
+   so — "you are using the Gemini API directly with `GEMINI_API_KEY`, so there
+   is no session to log out of".
 
 3. **Check.** `agy models` lists the models on that machine, and the same list
    is what the provider offers in bb's picker. An empty picker means step 1 or
