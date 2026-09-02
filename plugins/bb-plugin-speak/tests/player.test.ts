@@ -1103,3 +1103,38 @@ test("a transport failure stays generic — plumbing is not actionable", async (
     harness.restore();
   }
 });
+
+test("a reading that dies mid-way cancels the chunks queued behind it", async () => {
+  // Audit PLUG-36, Medium. The loop fetches several chunks ahead; a failure on
+  // chunk 1 used to leave the speculative ones running for audio nobody would
+  // hear, against a pool metered at roughly ten requests a day per account.
+  const harness = install({
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      const index = Number((body as { chunkIndex?: number }).chunkIndex ?? 0);
+      if (index === 0) return okChunk(0, 5, "first");
+      if (index === 1) return { ok: false, code: "request_failed", message: "boom" };
+      // Held open, so they are genuinely in flight when chunk 1 fails.
+      return new Promise(() => {});
+    },
+  });
+  try {
+    await reset();
+    await player.speak({ messageId: "m1", text: "a".repeat(1500) });
+    await tick();
+
+    const speculative = harness.requests.filter(
+      (r) => r.method === "synthesize" && (r.chunkIndex ?? 0) >= 2,
+    );
+    assert.ok(speculative.length > 0, "the loop must have fetched ahead at all");
+    const leaked = speculative.filter((r) => !r.aborted && !r.settled);
+    assert.deepEqual(
+      leaked.map((r) => r.chunkIndex),
+      [],
+      "every chunk queued behind the failure must be cancelled",
+    );
+    assert.equal(player.getState().stage, "idle");
+  } finally {
+    harness.restore();
+  }
+});

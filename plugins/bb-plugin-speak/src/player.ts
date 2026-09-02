@@ -627,6 +627,9 @@ async function failOver(
   detail?: string,
 ): Promise<void> {
   if (mine !== generation) return;
+  // Whatever happens next, the chunks queued behind this one will never be
+  // played. Stop paying for them.
+  abortInFlight();
 
   if (!isRetryable(code) || !prefs.fallbackEnabled) {
     setState({ speaking: false, messageId: null, stage: "idle" });
@@ -652,6 +655,7 @@ async function failOver(
  * ended there. So: stop, and say that it was cut short.
  */
 function cutShort(code: SynthesisErrorCode, chunkIndex: number, detail?: string): void {
+  abortInFlight();
   setState({ speaking: false, messageId: null, stage: "idle" });
   toast.error(
     `${FAILURE_COPY[code]}${detailSuffix(detail, FAILURE_COPY[code], code)} ` +
@@ -660,16 +664,29 @@ function cutShort(code: SynthesisErrorCode, chunkIndex: number, detail?: string)
   );
 }
 
+/**
+ * Drop every chunk request still in flight, without ending the playback the
+ * way `stop()` does.
+ *
+ * The loop fetches up to five chunks ahead, so a reading that dies on chunk 1
+ * leaves four speculative requests running for audio nobody will hear. Against
+ * a pool metered at roughly ten requests a day per model per account, that is
+ * the difference between one wasted request and five.
+ */
+function abortInFlight(): void {
+  for (const controller of inFlightRequests) {
+    controller.abort();
+  }
+  inFlightRequests.clear();
+}
+
 function stop(): void {
   generation += 1;
 
   // Before anything else: nothing new should arrive for a playback that is
   // over. `abort()` rejects the pending fetch, and the loop's generation guard
   // turns that rejection into a silent return rather than a failure notice.
-  for (const controller of inFlightRequests) {
-    controller.abort();
-  }
-  inFlightRequests.clear();
+  abortInFlight();
 
   const source = currentBufferSource;
   currentBufferSource = null;
