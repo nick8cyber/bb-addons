@@ -48,6 +48,24 @@ export type TtsFailure = {
 export type TtsAborted = { ok: false; code: "aborted" };
 
 /** Strip anything that could be the key out of text on its way to a human. */
+/**
+ * Every spelling of the key that could plausibly appear in a body.
+ *
+ * A key with reserved characters comes back percent-encoded when the far end
+ * echoes a URL it parsed — `a+b/c?` as `a%2Bb%2Fc%3F` — and that spelling
+ * used to walk straight past a substring search for the raw one.
+ */
+function keySpellings(key: string): string[] {
+  const forms = new Set<string>([
+    key,
+    encodeURIComponent(key),
+    encodeURI(key),
+    // A query parser that rendered spaces as plus signs, then re-encoded.
+    encodeURIComponent(key).replace(/%20/g, "+"),
+  ]);
+  return [...forms].filter((form) => form.length > 0).sort((a, b) => b.length - a.length);
+}
+
 export function redact(text: string, apiKey: string): string {
   const key = apiKey.trim();
   const safe = text.replace(/key=[^&\s"'`)\]}]*/gi, "key=REDACTED");
@@ -59,10 +77,16 @@ export function redact(text: string, apiKey: string): string {
   // the key really is in there, withhold the whole detail instead: an
   // unhelpful message beats a leaked credential, and any gateway using a key
   // this short has a worse problem than a terse error.
+  const spellings = keySpellings(key);
   if (key.length < 8) {
-    return safe.includes(key) ? "(details withheld: they quoted the API key)" : safe;
+    return spellings.some((form) => safe.includes(form))
+      ? "(details withheld: they quoted the API key)"
+      : safe;
   }
-  return safe.split(key).join("REDACTED");
+  // Longest first, so an encoded form is not half-eaten by the raw one.
+  let out = safe;
+  for (const form of spellings) out = out.split(form).join("REDACTED");
+  return out;
 }
 
 function fail(code: SynthesisErrorCode, message: string, extra: Partial<TtsFailure> = {}): TtsFailure {
