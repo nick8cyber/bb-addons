@@ -782,10 +782,24 @@ function pause(): void {
  * stage set to "playing" regardless, so the user watched
  * "Воспроизведение" in silence with no error. Staying paused is both true and
  * useful: the button still says Resume, so they can try again.
+ *
+ * Called from two places with the stage in two different states — the
+ * synchronous throw happens before `setState({stage: "playing"})`, the
+ * rejection after it — so this must not key off the stage, which an earlier
+ * version did and thereby stayed silent on the synchronous path. It keys off
+ * the generation instead: a refusal that lands after the user has moved on to
+ * another reading has nothing to correct.
  */
-function resumeRefused(reason: unknown): void {
-  if (state.stage !== "playing") return;
+let resumeAttempt = 0;
+let refusalReported = false;
+
+function resumeRefused(attempt: number, reason: unknown): void {
+  if (attempt !== resumeAttempt || generation !== attempt) return;
+  if (state.stage === "idle") return;
   setState({ stage: "paused" });
+  // Both the context and the element can refuse the same attempt; one notice.
+  if (refusalReported) return;
+  refusalReported = true;
   toast.error(
     "This browser refused to resume the audio. Press play again, or start the " +
       "reading over." +
@@ -797,16 +811,21 @@ function resumeRefused(reason: unknown): void {
 
 function resume(): void {
   if (state.stage !== "paused") return;
+  resumeAttempt = generation;
+  refusalReported = false;
+  const attempt = resumeAttempt;
   const ctx = getAudioContext();
   if (ctx && ctx.state === "suspended") {
-    void ctx.resume().catch(resumeRefused);
+    void ctx.resume().catch((error: unknown) => resumeRefused(attempt, error));
   }
   if (currentAudio) {
     try {
       const started = currentAudio.play() as unknown;
-      if (started instanceof Promise) started.catch(resumeRefused);
+      if (started instanceof Promise) {
+        started.catch((error: unknown) => resumeRefused(attempt, error));
+      }
     } catch (error) {
-      resumeRefused(error);
+      resumeRefused(attempt, error);
       return;
     }
   }

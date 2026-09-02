@@ -40,8 +40,14 @@ registerHooks({
         format: "module",
         shortCircuit: true,
         source:
-          "export const toast = Object.assign(() => {}, " +
-          "{ info() {}, error() {}, success() {}, warning() {} });",
+          // Recorded rather than discarded: a fix that stays silent is a
+          // failure mode of its own, so the tests have to be able to see it.
+          "const sink = () => (globalThis.__plug39Toasts ??= []);\n" +
+          "const record = (level) => (message) => " +
+          "{ sink().push({ level, message: String(message) }); };\n" +
+          "export const toast = Object.assign(record(\"message\"), " +
+          "{ info: record(\"info\"), error: record(\"error\"), " +
+          "success: record(\"success\"), warning: record(\"warning\") });",
       };
     }
     if (url === VIRTUAL_SPEAKABLE) {
@@ -68,8 +74,14 @@ class ResumeAudio {
   onended: (() => void) | null = null;
   onerror: (() => void) | null = null;
   rejectNextPlay = false;
+  /** A browser that refuses synchronously rather than with a rejection. */
+  throwNextPlay = false;
 
   play(): Promise<void> {
+    if (this.throwNextPlay) {
+      this.throwNextPlay = false;
+      throw Object.assign(new Error("NotAllowedError"), { name: "NotAllowedError" });
+    }
     if (!this.rejectNextPlay) return Promise.resolve();
     this.rejectNextPlay = false;
     const rejected = Promise.reject(new Error("NotAllowedError"));
@@ -82,7 +94,16 @@ class ResumeAudio {
   pause(): void {}
 }
 
-function installResumeHarness(): { audios: ResumeAudio[]; restore(): void } {
+interface ToastRecord {
+  level: string;
+  message: string;
+}
+
+function installResumeHarness(): {
+  audios: ResumeAudio[];
+  toasts: ToastRecord[];
+  restore(): void;
+} {
   const scope = globalThis as unknown as Record<string, unknown>;
   const urlApi = URL as unknown as Record<string, unknown>;
   const savedKeys = ["fetch", "Audio", "speechSynthesis", "SpeechSynthesisUtterance"];
@@ -90,6 +111,8 @@ function installResumeHarness(): { audios: ResumeAudio[]; restore(): void } {
   const savedCreate = urlApi.createObjectURL;
   const savedRevoke = urlApi.revokeObjectURL;
   const audios: ResumeAudio[] = [];
+  const toasts = ((globalThis as Record<string, unknown>).__plug39Toasts ??= []) as ToastRecord[];
+  toasts.length = 0;
 
   scope.fetch = async (input: unknown) => {
     const method = String(input).slice(String(input).lastIndexOf("/") + 1);
@@ -130,6 +153,7 @@ function installResumeHarness(): { audios: ResumeAudio[]; restore(): void } {
 
   return {
     audios,
+    toasts,
     restore() {
       for (const entry of saved) {
         if (entry.had) scope[entry.key] = entry.value;
@@ -180,4 +204,38 @@ test("RUN: percent-encoded short credentials must not survive redaction", () => 
     "(details withheld: they quoted the API key)",
     `recoverable credential reached the user as ${visible}`,
   );
+});
+
+test("a synchronous play() refusal is announced too, not swallowed", async () => {
+  // The rejection path was fixed first; this one was quieter. The throw
+  // happens before the stage is set to "playing", so a handler that keyed off
+  // the stage returned immediately: nothing played, nothing was said, and the
+  // bar sat at Пауза as though the user had never pressed anything.
+  const harness = installResumeHarness();
+  let run: Promise<void> | undefined;
+  try {
+    player.stop();
+    await refreshPrefs();
+    run = player.speak({ messageId: "resume-throw", text: "hello" });
+    for (let attempt = 0; attempt < 5 && player.getState().stage !== "playing"; attempt += 1) {
+      await tick();
+    }
+    assert.equal(player.getState().stage, "playing", "the initial play started");
+
+    player.pause();
+    const toastsBefore = harness.toasts.length;
+    harness.audios[0]!.throwNextPlay = true;
+    player.resume();
+    await tick();
+
+    assert.notEqual(player.getState().stage, "playing", "it cannot claim to play");
+    assert.ok(
+      harness.toasts.length > toastsBefore,
+      "and the user has to be told why nothing happened",
+    );
+  } finally {
+    player.stop();
+    await run;
+    harness.restore();
+  }
 });
