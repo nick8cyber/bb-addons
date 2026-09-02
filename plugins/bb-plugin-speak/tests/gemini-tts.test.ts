@@ -23,7 +23,7 @@ registerHooks({
   },
 });
 
-const { synthesizeChunk, wrapPcmAsWav } = await import("../src/gemini-tts");
+const { synthesizeChunk, wrapPcmAsWav, redact } = await import("../src/gemini-tts");
 const { PCM_CHANNELS, PCM_SAMPLE_RATE, PCM_SAMPLE_WIDTH } = await import("../src/contract");
 
 const KEY = "AIzaSy-super-secret-key-0123456789";
@@ -368,4 +368,27 @@ test("the key never appears in a returned message", async () => {
       assert.match(result.message, /key=REDACTED/);
     },
   );
+});
+
+test("a short gateway key is redacted too, not waved through", async () => {
+  // Audit PLUG-36, reproduced by the auditor with `short7`. The old guard only
+  // substituted keys of eight characters or more, so anything shorter that a
+  // proxy echoed back in prose reached the user verbatim.
+  const short = "short7";
+  const quoted = `Gateway rejected ${short} for this model`;
+  const out = redact(quoted, short);
+  assert.doesNotMatch(out, /short7/, "the key must not survive at any length");
+
+  // A key that is not in the text leaves the text alone.
+  assert.equal(redact("nothing to see", short), "nothing to see");
+
+  // The long path still substitutes rather than withholding.
+  const long = "AIzaSyD-1234567890abcdefghijklmnopqrstu";
+  assert.equal(redact(`bad ${long} here`, long), "bad REDACTED here");
+
+  // And the query form is caught whatever the length.
+  assert.match(redact(`https://x/y?key=${short}`, short), /key=REDACTED/);
+
+  // An empty key must not turn every character into REDACTED.
+  assert.equal(redact("untouched", ""), "untouched");
 });

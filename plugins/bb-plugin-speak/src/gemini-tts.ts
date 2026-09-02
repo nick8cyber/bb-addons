@@ -48,10 +48,21 @@ export type TtsFailure = {
 export type TtsAborted = { ok: false; code: "aborted" };
 
 /** Strip anything that could be the key out of text on its way to a human. */
-function redact(text: string, apiKey: string): string {
-  let safe = text.replace(/key=[^&\s"'`)\]}]*/gi, "key=REDACTED");
-  if (apiKey.length >= 8) safe = safe.split(apiKey).join("REDACTED");
-  return safe;
+export function redact(text: string, apiKey: string): string {
+  const key = apiKey.trim();
+  const safe = text.replace(/key=[^&\s"'`)\]}]*/gi, "key=REDACTED");
+  if (key.length === 0) return safe;
+
+  // A very short key cannot be substituted out without shredding the message
+  // around it — splitting on "ab" would hit every ordinary word containing it.
+  // The old threshold of eight simply gave up and let such a key through. When
+  // the key really is in there, withhold the whole detail instead: an
+  // unhelpful message beats a leaked credential, and any gateway using a key
+  // this short has a worse problem than a terse error.
+  if (key.length < 8) {
+    return safe.includes(key) ? "(details withheld: they quoted the API key)" : safe;
+  }
+  return safe.split(key).join("REDACTED");
 }
 
 function fail(code: SynthesisErrorCode, message: string, extra: Partial<TtsFailure> = {}): TtsFailure {
