@@ -202,3 +202,15 @@ test("the rollover survives both DST transitions", () => {
     "fall back",
   );
 });
+
+test("a proxy that has benched every key is a quota failure, whatever its status", () => {
+  // CLIProxyAPI substitutes its own body once all credentials for a model are
+  // cooling down, with none of Google's quota detail. An audit flagged that as
+  // making the model switch unreachable; matching on the body rather than on
+  // the status means the chain moves on regardless of which code it picks.
+  const body = JSON.stringify({
+    error: { code: "model_cooldown", message: "All credentials for model gemini-3.1-flash-tts-preview are cooling down" },
+  });
+  const read = readQuotaScope(body);
+  assert.equal(read.quotaScope, "burst", "the proxy's own cooldown, not Google's day");
+});
