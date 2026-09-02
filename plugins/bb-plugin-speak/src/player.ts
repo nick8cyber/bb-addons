@@ -581,13 +581,18 @@ const ANNOUNCE_ONCE: ReadonlySet<SynthesisErrorCode> = new Set(["not_configured"
  * someone looking at their network instead of their model setting. The server
  * has already redacted the key out of this and capped it.
  */
-const DETAIL_ADDS_NOTHING: ReadonlySet<SynthesisErrorCode> = new Set([
-  // For these the generic copy already says both what happened and what to do,
-  // and the server's wording only repeats it at greater length.
-  "empty",
-  "too_long",
-  "not_configured",
-  "rate_limited",
+/**
+ * The only codes whose generic copy cannot say *what* happened, and which
+ * therefore earn the server's own wording appended.
+ *
+ * An allowlist on purpose. As a denylist this had the same four members
+ * excluded and behaved identically today — but a code added later would have
+ * defaulted to appending, which is the wrong default for text that goes in
+ * front of a user.
+ */
+const DETAIL_WORTH_SHOWING: ReadonlySet<SynthesisErrorCode> = new Set([
+  "auth",
+  "request_failed",
 ]);
 
 function detailSuffix(
@@ -595,7 +600,7 @@ function detailSuffix(
   reason: string,
   code: SynthesisErrorCode,
 ): string {
-  if (DETAIL_ADDS_NOTHING.has(code)) return "";
+  if (!DETAIL_WORTH_SHOWING.has(code)) return "";
   const trimmed = (detail ?? "").trim();
   if (trimmed.length === 0) return "";
   if (reason.toLowerCase().includes(trimmed.toLowerCase())) return "";
