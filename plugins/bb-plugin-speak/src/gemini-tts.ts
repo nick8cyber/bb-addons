@@ -138,6 +138,21 @@ function mapStatus(status: number, body: string, apiKey: string): TtsFailure {
   if (status === 401 || status === 403 || (status === 400 && invalidKey)) {
     return fail("auth", `Google rejected the Gemini API key (HTTP ${status}): ${detail}`);
   }
+  // A CLIProxyAPI in front of a key pool answers with a body of its own once
+  // every credential for the model is benched — `{"error":{"code":
+  // "model_cooldown", ...}}`, "All credentials for model X are cooling down"
+  // — and it carries none of Google's quota detail. Which HTTP status it uses
+  // is not something this plugin should have to know: the meaning is a spent
+  // allowance either way, so match on the body and let the model chain move
+  // on. Treated as a burst, because the proxy's cooldown is its own and
+  // usually shorter than a day.
+  if (/model_cooldown|are cooling down/i.test(body)) {
+    return fail(
+      "rate_limited",
+      `Every key in the pool is cooling down for this model: ${detail}`,
+      { quotaScope: "burst" },
+    );
+  }
   if (status === 429 || /RESOURCE_EXHAUSTED/i.test(body)) {
     const quota = readQuotaScope(body);
     return fail(
