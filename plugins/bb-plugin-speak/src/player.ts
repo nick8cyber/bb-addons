@@ -300,7 +300,7 @@ async function speakWithBrowserVoice(
     voice.synth.speak(utterance);
   });
 
-  if (mine === generation) setState({ speaking: false, messageId: null });
+  if (mine === generation) setState({ speaking: false, messageId: null, stage: "idle" });
 }
 
 // --- Gemini's audio ---------------------------------------------------------
@@ -594,14 +594,14 @@ async function failOver(
   if (mine !== generation) return;
 
   if (!isRetryable(code) || !prefs.fallbackEnabled) {
-    setState({ speaking: false, messageId: null });
+    setState({ speaking: false, messageId: null, stage: "idle" });
     announce(code, null);
     return;
   }
 
   const voice = browserVoice();
   if (!voice) {
-    setState({ speaking: false, messageId: null });
+    setState({ speaking: false, messageId: null, stage: "idle" });
     toast.error(
       `${FAILURE_COPY[code]} This browser has no speech synthesis of its own to fall back on.`,
     );
@@ -617,7 +617,7 @@ async function failOver(
  * ended there. So: stop, and say that it was cut short.
  */
 function cutShort(code: SynthesisErrorCode, chunkIndex: number): void {
-  setState({ speaking: false, messageId: null });
+  setState({ speaking: false, messageId: null, stage: "idle" });
   toast.error(
     `${FAILURE_COPY[code]} The reading stopped part-way through this message ` +
       `(chunk ${chunkIndex + 1}); the rest was not read aloud.`,
@@ -670,6 +670,30 @@ function stop(): void {
     chunkIndex: 0,
     chunkCount: 0,
   });
+}
+
+/** Resolves on the next state change, whatever it is. */
+function onceStateChanged(): Promise<void> {
+  return new Promise((resolve) => {
+    const listener = (): void => {
+      listeners.delete(listener);
+      resolve();
+    };
+    listeners.add(listener);
+  });
+}
+
+/**
+ * Holds while the reading is paused.
+ *
+ * Without this the loop walks straight on to the next chunk and overwrites the
+ * paused stage with "playing" — the bar says paused and the voice keeps
+ * reading, which is worse than the pause button not existing.
+ */
+async function awaitResume(mine: number): Promise<void> {
+  while (state.stage === "paused" && mine === generation) {
+    await onceStateChanged();
+  }
 }
 
 function pause(): void {
@@ -765,6 +789,11 @@ async function streamChunks(
   let heard = false;
 
   for (;;) {
+    // A pause taken in the gap between two chunks has to hold here, before
+    // anything overwrites the stage or starts the next piece of audio.
+    await awaitResume(mine);
+    if (mine !== generation) return null;
+
     setState({
       stage: index === 0 && !heard ? "generating" : "playing",
       chunkIndex: index,
@@ -799,6 +828,9 @@ async function streamChunks(
     for (let ahead = index + 1; ahead < Math.min(totalChunks, index + 6); ahead += 1) {
       getOrFetch(ahead);
     }
+
+    await awaitResume(mine);
+    if (mine !== generation) return null;
 
     setState({
       stage: "playing",
