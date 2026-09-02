@@ -24,7 +24,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 
 const { planModels, nextQuotaReset, isQuotaFailure, cooldownUntil } = await import("../src/model-chain.js");
-const { readQuotaScope } = await import("../src/gemini-tts.js");
+const { readQuotaScope, readRetryAfterMs } = await import("../src/gemini-tts.js");
 const { DEFAULT_MODEL, FALLBACK_MODEL } = await import("../src/contract.js");
 
 const never = () => false;
@@ -213,4 +213,35 @@ test("a proxy that has benched every key is a quota failure, whatever its status
   });
   const read = readQuotaScope(body);
   assert.equal(read.quotaScope, "burst", "the proxy's own cooldown, not Google's day");
+});
+
+test("the proxy's own stated reset is honoured, not flattened to the default", () => {
+  // Without this the dead primary is re-offered every ninety seconds all day
+  // instead of settling on the fallback — hundreds of pointless round trips
+  // and an extra hop of waiting before every reading.
+  const body = JSON.stringify({
+    error: { code: "model_cooldown", message: "All credentials for model X are cooling down" },
+    reset_seconds: 1800,
+  });
+  assert.equal(readRetryAfterMs(body), 1_800_000);
+
+  const at = new Date("2026-03-02T00:30:00Z");
+  const until = cooldownUntil({ quotaScope: "burst", retryAfterMs: readRetryAfterMs(body) }, at);
+  assert.equal((until - at.getTime()) / 60_000, 30);
+});
+
+test("Retry-After is read when the body says nothing", () => {
+  const seconds = new Headers({ "retry-after": "45" });
+  assert.equal(readRetryAfterMs("{}", seconds), 45_000);
+
+  const asDate = new Headers({ "retry-after": new Date(Date.now() + 120_000).toUTCString() });
+  const ms = readRetryAfterMs("{}", asDate) ?? 0;
+  assert.ok(Math.abs(ms - 120_000) < 2_000, `expected about two minutes, got ${ms}`);
+
+  assert.equal(readRetryAfterMs("{}"), undefined, "and nothing is invented when nobody said");
+});
+
+test("Google's retryDelay still wins over a header", () => {
+  const body = JSON.stringify({ error: { details: [{ retryDelay: "7s" }] } });
+  assert.equal(readRetryAfterMs(body, new Headers({ "retry-after": "900" })), 7_000);
 });
