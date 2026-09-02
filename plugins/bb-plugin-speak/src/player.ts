@@ -573,8 +573,41 @@ function startChunkRequest(
 const announcedOnce = new Set<SynthesisErrorCode>();
 const ANNOUNCE_ONCE: ReadonlySet<SynthesisErrorCode> = new Set(["not_configured"]);
 
-function announce(code: SynthesisErrorCode, next: SpeakSource | null): void {
-  const reason = FAILURE_COPY[code];
+/**
+ * The server's own message, when it says more than our generic copy does.
+ *
+ * FAILURE_COPY tells the user what to do; it cannot tell them what happened,
+ * and "could not be reached" in place of "unknown provider for model X" sends
+ * someone looking at their network instead of their model setting. The server
+ * has already redacted the key out of this and capped it.
+ */
+const DETAIL_ADDS_NOTHING: ReadonlySet<SynthesisErrorCode> = new Set([
+  // For these the generic copy already says both what happened and what to do,
+  // and the server's wording only repeats it at greater length.
+  "empty",
+  "too_long",
+  "not_configured",
+  "rate_limited",
+]);
+
+function detailSuffix(
+  detail: string | undefined,
+  reason: string,
+  code: SynthesisErrorCode,
+): string {
+  if (DETAIL_ADDS_NOTHING.has(code)) return "";
+  const trimmed = (detail ?? "").trim();
+  if (trimmed.length === 0) return "";
+  if (reason.toLowerCase().includes(trimmed.toLowerCase())) return "";
+  return ` (${trimmed.length > 160 ? `${trimmed.slice(0, 159)}…` : trimmed})`;
+}
+
+function announce(
+  code: SynthesisErrorCode,
+  next: SpeakSource | null,
+  detail?: string,
+): void {
+  const reason = FAILURE_COPY[code] + detailSuffix(detail, FAILURE_COPY[code], code);
   if (next !== "browser") {
     toast.error(reason);
     return;
@@ -591,12 +624,13 @@ async function failOver(
   code: SynthesisErrorCode,
   text: string,
   prefs: Prefs,
+  detail?: string,
 ): Promise<void> {
   if (mine !== generation) return;
 
   if (!isRetryable(code) || !prefs.fallbackEnabled) {
     setState({ speaking: false, messageId: null, stage: "idle" });
-    announce(code, null);
+    announce(code, null, detail);
     return;
   }
 
@@ -609,7 +643,7 @@ async function failOver(
     return;
   }
 
-  announce(code, "browser");
+  announce(code, "browser", detail);
   await speakWithBrowserVoice(mine, text, detectLanguage(text), prefs, voice);
 }
 
@@ -617,10 +651,11 @@ async function failOver(
  * A later chunk failed. Gemini was reached, spoke at least once, and the run
  * ended there. So: stop, and say that it was cut short.
  */
-function cutShort(code: SynthesisErrorCode, chunkIndex: number): void {
+function cutShort(code: SynthesisErrorCode, chunkIndex: number, detail?: string): void {
   setState({ speaking: false, messageId: null, stage: "idle" });
   toast.error(
-    `${FAILURE_COPY[code]} The reading stopped part-way through this message ` +
+    `${FAILURE_COPY[code]}${detailSuffix(detail, FAILURE_COPY[code], code)} ` +
+      `The reading stopped part-way through this message ` +
       `(chunk ${chunkIndex + 1}); the rest was not read aloud.`,
   );
 }
@@ -816,10 +851,10 @@ async function streamChunks(
 
     if (!output.ok) {
       if (index === 0) {
-        await failOver(mine, output.code, text, prefs);
+        await failOver(mine, output.code, text, prefs, output.message);
         return null;
       }
-      cutShort(output.code, index);
+      cutShort(output.code, index, output.message);
       return null;
     }
 

@@ -1060,3 +1060,46 @@ test("stop() with nothing playing is a no-op, and a throwing listener is contain
     harness.restore();
   }
 });
+
+test("a request_failed carries the server's own reason, not just the generic copy", async () => {
+  // Audit PLUG-34 #4: a live probe with a bad model returned "unknown provider
+  // for model", and the user was shown "could not be reached" — which sends
+  // someone to look at their network instead of their model setting.
+  const harness = install({
+    rpc: (method) =>
+      method === "status"
+        ? statusWith()
+        : {
+            ok: false,
+            code: "request_failed",
+            message: "unknown provider for model gemini-2.5-pro-preview-tts",
+          },
+  });
+  try {
+    await reset();
+    await player.speak({ messageId: "m1", text: "read this" });
+
+    const said = harness.toasts.map((t) => t.message).join(" | ");
+    assert.match(said, /unknown provider for model/, "the server's reason must reach the user");
+    assert.match(said, /browser's own voice/, "and the hand-off is still announced");
+  } finally {
+    harness.restore();
+  }
+});
+
+test("a transport failure stays generic — plumbing is not actionable", async () => {
+  const harness = install({
+    rpc: (method) => {
+      if (method === "status") return statusWith();
+      throw new Error("connect ECONNREFUSED 127.0.0.1:7777");
+    },
+  });
+  try {
+    await reset();
+    await player.speak({ messageId: "m1", text: "read this" });
+    const said = harness.toasts.map((t) => t.message).join(" | ");
+    assert.doesNotMatch(said, /ECONNREFUSED/, "no socket detail in a toast");
+  } finally {
+    harness.restore();
+  }
+});
