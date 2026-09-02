@@ -29,6 +29,9 @@
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "better-sqlite3": "^12.11.1",
+    "cron-parser": "^5.10.0",
+    "hono": "^4.13.5",
     "sonner": "^2.0.8",
     "typescript": "^5.7.0"
   }

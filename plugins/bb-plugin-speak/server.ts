@@ -10,6 +10,14 @@
  * One call synthesizes one chunk. The split is a pure function of the text, so
  * the client sends nothing but an index and this file re-derives the very same
  * boundaries — see `src/chunk.ts`.
+ *
+ * Synthesis has two doors into the same function. Stop has to reach Google, and
+ * an rpc handler is handed nothing but its validated input — no context, no
+ * signal (`PluginRpcHandlers`, SDK 0.4.21) — so it cannot tell a listening
+ * caller from one that hung up. An `bb.http` route is handed the whole Hono
+ * context, whose `req.raw.signal` the node adapter aborts the moment the
+ * client connection closes. So the player goes through the route, and the rpc
+ * method stays for callers that have nothing to cancel.
  */
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 
@@ -25,6 +33,8 @@ import {
   contract,
   prefsSchema,
   type Prefs,
+  type SynthesizeInput,
+  type SynthesizeOutput,
 } from "./src/contract.js";
 import { chunkForSynthesis } from "./src/chunk.js";
 import { cooldownUntil, isQuotaFailure, planModels } from "./src/model-chain.js";
@@ -144,6 +154,148 @@ export default async function plugin(bb: BbPluginApi) {
     message: `No Gemini API key yet. Add one in ${WHERE_TO_PUT_THE_KEY}.`,
   });
 
+  /**
+   * No audio, because the person who asked for it has gone. Only ever returned
+   * to a caller that could not be cancelled — the rpc door — since the route
+   * answers a vanished client with a status and no body at all.
+   */
+  const cancelledOutput = {
+    ok: false as const,
+    code: "request_failed" as const,
+    message: "The reading was stopped.",
+  };
+
+  /**
+   * One chunk, on whichever model is still in quota. `null` means the caller
+   * abandoned the request: that is control flow rather than a failure, so it
+   * earns no log line, no second model, and no cooldown.
+   */
+  const synthesize = async (
+    { text, chunkIndex }: SynthesizeInput,
+    signal?: AbortSignal,
+  ): Promise<SynthesizeOutput | null> => {
+    if (text.trim().length === 0) {
+      return { ok: false as const, code: "empty" as const, message: "There is nothing to read." };
+    }
+    if (text.length > MAX_SPEAKABLE_CHARS) {
+      return {
+        ok: false as const,
+        code: "too_long" as const,
+        message: `This message is ${text.length} characters; the limit for one click is ${MAX_SPEAKABLE_CHARS}.`,
+      };
+    }
+    const key = await apiKey();
+    if (!key) return notConfigured();
+
+    const pieces = chunkForSynthesis(text);
+    if (pieces.length === 0) {
+      return { ok: false as const, code: "empty" as const, message: "There is nothing to read." };
+    }
+    const piece = pieces[chunkIndex];
+    if (piece === undefined) {
+      // The client asked past the end of a split it derived from the same
+      // text with the same function, so either the text changed underneath
+      // it or the two halves have drifted. Either way, say which it was.
+      return {
+        ok: false as const,
+        code: "request_failed" as const,
+        message: `Chunk ${chunkIndex} does not exist; this text has ${pieces.length} chunk(s).`,
+      };
+    }
+
+    const prefs = await readPrefs();
+    const endpoint = await baseUrl();
+    const now = Date.now();
+    const benched = new Map<string, number>();
+    for (const model of [prefs.model, prefs.fallbackModel]) {
+      if (model) benched.set(model, await cooldownFor(model));
+    }
+    const chain = planModels(
+      prefs.model,
+      prefs.fallbackModel,
+      (model) => (benched.get(model) ?? 0) > now,
+    );
+
+    let result = undefined as Awaited<ReturnType<typeof synthesizeChunk>> | undefined;
+    let spokenBy = prefs.model;
+    for (const model of chain) {
+      // Five chunks are in flight at once and the reads above are awaited, so
+      // Stop can land between planning the chain and calling anyone on it.
+      if (signal?.aborted) return null;
+      result = await synthesizeChunk({
+        baseUrl: endpoint,
+        apiKey: key,
+        text: piece,
+        voice: prefs.voice,
+        model,
+        signal,
+      });
+      spokenBy = model;
+      if (result.ok) break;
+      if (result.cancelled) return null;
+      // Only a spent quota is worth a second model. A rejected key or an
+      // unreachable proxy fails identically on the next one, and retrying
+      // would just double the wait before the browser voice takes over.
+      if (!isQuotaFailure(result.code)) break;
+      await markExhausted(model, result);
+    }
+
+    if (result === undefined) {
+      return {
+        ok: false as const,
+        code: "request_failed" as const,
+        message: "No TTS model is configured to try.",
+      };
+    }
+    if (!result.ok) {
+      bb.log.warn(`chunk ${chunkIndex}/${pieces.length} failed: ${result.code} — ${result.message}`);
+      return { ok: false as const, code: result.code, message: result.message };
+    }
+    bb.log.info(
+      `synthesized chunk ${chunkIndex + 1}/${pieces.length} as ${prefs.voice} on ${spokenBy}`,
+    );
+    return {
+      ok: true as const,
+      mimeType: AUDIO_MIME as typeof AUDIO_MIME,
+      voice: prefs.voice,
+      model: spokenBy,
+      chunkIndex,
+      chunkCount: pieces.length,
+      audioBase64: result.wavBase64,
+    };
+  };
+
+  /**
+   * The cancellable half of `synthesize`, answering in the same envelope the
+   * rpc route uses so the client reads both the same way. `context.req.raw`
+   * is what carries the browser's abort down to Google: touching `.signal`
+   * here is also what makes the node adapter start watching the connection.
+   */
+  bb.http.route("POST", "/synthesize", async (context) => {
+    let body: unknown;
+    try {
+      body = await context.req.json();
+    } catch {
+      return context.json(
+        { ok: false, error: { code: "invalid_input", message: "the body must be JSON" } },
+        400,
+      );
+    }
+    const parsed = contract.synthesize.input.safeParse(body);
+    if (!parsed.success) {
+      return context.json(
+        { ok: false, error: { code: "invalid_input", message: "text and chunkIndex are required" } },
+        400,
+      );
+    }
+    const result = await synthesize(parsed.data, context.req.raw.signal);
+    // 499, the nginx spelling of "the client left": nothing is waiting for a
+    // body, and a 2xx would only invite a reply written to a closed socket.
+    // Built by hand because Hono's helpers only type the registered statuses.
+    if (result === null) return new Response(null, { status: 499 });
+    return context.json({ ok: true, result });
+  });
+
   bb.rpc.register(rpcContract, {
     status: async () => ({
       configured: (await apiKey()) !== undefined,
@@ -159,92 +311,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { prefs: validated };
     },
 
-    synthesize: async ({ text, chunkIndex }) => {
-      if (text.trim().length === 0) {
-        return { ok: false as const, code: "empty" as const, message: "There is nothing to read." };
-      }
-      if (text.length > MAX_SPEAKABLE_CHARS) {
-        return {
-          ok: false as const,
-          code: "too_long" as const,
-          message: `This message is ${text.length} characters; the limit for one click is ${MAX_SPEAKABLE_CHARS}.`,
-        };
-      }
-      const key = await apiKey();
-      if (!key) return notConfigured();
-
-      const pieces = chunkForSynthesis(text);
-      if (pieces.length === 0) {
-        return { ok: false as const, code: "empty" as const, message: "There is nothing to read." };
-      }
-      const piece = pieces[chunkIndex];
-      if (piece === undefined) {
-        // The client asked past the end of a split it derived from the same
-        // text with the same function, so either the text changed underneath
-        // it or the two halves have drifted. Either way, say which it was.
-        return {
-          ok: false as const,
-          code: "request_failed" as const,
-          message: `Chunk ${chunkIndex} does not exist; this text has ${pieces.length} chunk(s).`,
-        };
-      }
-
-      const prefs = await readPrefs();
-      const endpoint = await baseUrl();
-      const now = Date.now();
-      const benched = new Map<string, number>();
-      for (const model of [prefs.model, prefs.fallbackModel]) {
-        if (model) benched.set(model, await cooldownFor(model));
-      }
-      const chain = planModels(
-        prefs.model,
-        prefs.fallbackModel,
-        (model) => (benched.get(model) ?? 0) > now,
-      );
-
-      let result = undefined as Awaited<ReturnType<typeof synthesizeChunk>> | undefined;
-      let spokenBy = prefs.model;
-      for (const model of chain) {
-        result = await synthesizeChunk({
-          baseUrl: endpoint,
-          apiKey: key,
-          text: piece,
-          voice: prefs.voice,
-          model,
-        });
-        spokenBy = model;
-        if (result.ok) break;
-        // Only a spent quota is worth a second model. A rejected key or an
-        // unreachable proxy fails identically on the next one, and retrying
-        // would just double the wait before the browser voice takes over.
-        if (!isQuotaFailure(result.code)) break;
-        await markExhausted(model, result);
-      }
-
-      if (result === undefined) {
-        return {
-          ok: false as const,
-          code: "request_failed" as const,
-          message: "No TTS model is configured to try.",
-        };
-      }
-      if (!result.ok) {
-        bb.log.warn(`chunk ${chunkIndex}/${pieces.length} failed: ${result.code} — ${result.message}`);
-        return { ok: false as const, code: result.code, message: result.message };
-      }
-      bb.log.info(
-        `synthesized chunk ${chunkIndex + 1}/${pieces.length} as ${prefs.voice} on ${spokenBy}`,
-      );
-      return {
-        ok: true as const,
-        mimeType: AUDIO_MIME as typeof AUDIO_MIME,
-        voice: prefs.voice,
-        model: spokenBy,
-        chunkIndex,
-        chunkCount: pieces.length,
-        audioBase64: result.wavBase64,
-      };
-    },
+    synthesize: async (input) => (await synthesize(input)) ?? cancelledOutput,
 
     probe: async ({ voice, model }) => {
       const key = await apiKey();

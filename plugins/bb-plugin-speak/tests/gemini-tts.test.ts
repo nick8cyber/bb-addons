@@ -315,11 +315,33 @@ test("a network throw is a request_failed", async () => {
       assert.ok(!result.ok);
       assert.equal(result.code, "request_failed");
       assert.match(result.message, /unreachable/);
+      // Nobody cancelled anything: this one is a failure the app should hear
+      // about, and fail over on.
+      assert.equal(result.cancelled, undefined);
     },
   );
 });
 
-test("an abort is a request_failed, not a thrown error", async () => {
+test("the caller's signal reaches fetch", async () => {
+  const controller = new AbortController();
+  await withFetch(
+    async (call) => {
+      assert.ok(call.init?.signal, "no signal was passed to fetch");
+      assert.equal(call.init.signal.aborted, false);
+      controller.abort();
+      assert.equal(call.init.signal.aborted, true, "aborting the caller aborts the fetch");
+      call.init.signal.throwIfAborted();
+      return json(audioReply("inlineData"));
+    },
+    async () => {
+      const result = await speak({ signal: controller.signal });
+      assert.ok(!result.ok);
+      assert.equal(result.cancelled, true);
+    },
+  );
+});
+
+test("an abort is a cancellation, not a failure to report", async () => {
   const controller = new AbortController();
   controller.abort();
   await withFetch(
@@ -331,7 +353,28 @@ test("an abort is a request_failed, not a thrown error", async () => {
     async () => {
       const result = await speak({ signal: controller.signal });
       assert.ok(!result.ok);
+      // Still a failure — there is no audio — but flagged as the caller's own
+      // doing, which is what keeps it out of the log and off the model chain.
       assert.equal(result.code, "request_failed");
+      assert.equal(result.cancelled, true);
+    },
+  );
+});
+
+test("a reply that lands after the abort is still a cancellation", async () => {
+  // The race the parallel chunks make real: Google answers, and a 429 read out
+  // of that answer would bench a model on behalf of a request nobody made.
+  const controller = new AbortController();
+  await withFetch(
+    () => {
+      controller.abort();
+      return json({ error: { message: "Quota exceeded" } }, 429);
+    },
+    async () => {
+      const result = await speak({ signal: controller.signal });
+      assert.ok(!result.ok);
+      assert.equal(result.cancelled, true);
+      assert.equal(result.quotaScope, undefined, "a cancelled call reports no quota");
     },
   );
 });

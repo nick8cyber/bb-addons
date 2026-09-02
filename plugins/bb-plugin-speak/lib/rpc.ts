@@ -7,6 +7,13 @@
  */
 export const PLUGIN_RPC_ENDPOINT = "/api/v1/plugins/speak/rpc";
 
+/**
+ * Synthesis has its own door. An rpc handler is handed nothing but its input,
+ * so it cannot see this fetch being aborted; the plugin's http route is handed
+ * the request, and passes its signal on to Google. Same envelope, same auth.
+ */
+export const PLUGIN_SYNTHESIZE_ENDPOINT = "/api/v1/plugins/speak/http/synthesize";
+
 type RpcEnvelope<T> = { ok: true; result: T } | { ok: false; error: unknown };
 
 function messageOf(error: unknown): string {

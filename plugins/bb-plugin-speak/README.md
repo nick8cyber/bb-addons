@@ -69,11 +69,25 @@ comes back.
 | `src/gemini-tts.ts` | Gemini TTS client and 24kHz PCM-to-WAV converter |
 | `src/player.ts` | Parallel streaming player, pitch-preserving audio pipeline, speed control |
 | `src/SpeakOverlay.ts` | Vanilla DOM floating player overlay |
-| `server.ts` | Server RPC endpoints (`synthesize`, `probe`, `status`, `savePrefs`) |
+| `server.ts` | Server RPC endpoints (`synthesize`, `probe`, `status`, `savePrefs`) and the cancellable `POST http/synthesize` route |
 
 | `src/SpeakSection.tsx` | the settings section |
 | `app.tsx` | the two slot registrations |
 | `lib/rpc.ts` | fetch wrapper — `useRpc` is a hook and `run()` is not a component |
+
+## Why synthesis has two doors
+
+`bb.rpc` hands a handler its validated input and nothing else — no request, no
+signal — so it cannot tell a listening caller from one that hung up. Stop
+therefore used to reach only the browser: up to five chunks kept generating on
+Google's side, and spending quota, after the audio went quiet.
+
+`bb.http` hands the handler the whole request, whose signal the server aborts
+when the client connection closes. The player posts its chunks there
+(`/api/v1/plugins/speak/http/synthesize`, same envelope, same local-origin
+auth) and passes that signal down to `fetch`. A cancellation is deliberately
+not a failure: no warning is logged, no second model is tried, and no model is
+benched — the route just answers 499 to a client that is already gone.
 
 ## Verification
 

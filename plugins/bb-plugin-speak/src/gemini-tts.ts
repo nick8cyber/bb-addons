@@ -42,6 +42,13 @@ export type TtsFailure = {
   quotaScope?: "day" | "burst";
   /** What Google's RetryInfo asked for, in ms, when it said. */
   retryAfterMs?: number;
+  /**
+   * The caller's own signal fired: whoever asked for this audio is no longer
+   * listening. It is still a failure — there is no audio — but it is nobody's
+   * fault, so it must not be logged, failed over, or counted against a model.
+   * Our own 60s deadline is not this: that is an ordinary `request_failed`.
+   */
+  cancelled?: true;
 };
 
 /** Strip anything that could be the key out of text on its way to a human. */
@@ -53,6 +60,13 @@ function redact(text: string, apiKey: string): string {
 
 function fail(code: SynthesisErrorCode, message: string, extra: Partial<TtsFailure> = {}): TtsFailure {
   return { ok: false, code, message, ...extra };
+}
+
+/** The caller stopped listening. Carries a code only so the shape is uniform. */
+function cancelled(): TtsFailure {
+  return fail("request_failed", "The reading was stopped before Gemini answered.", {
+    cancelled: true,
+  });
 }
 
 /**
@@ -272,11 +286,18 @@ export async function synthesizeChunk(args: {
     });
     raw = await response.text();
   } catch (error) {
-    // An abort — ours or the caller's — arrives here too, and is no different
-    // from a dead socket as far as the app is concerned.
+    // An abort arrives here too. Whose it was decides what it means: the
+    // caller's is a cancellation nobody needs to hear about, ours (the 60s
+    // deadline) is a request that failed like any dead socket would.
+    if (signal?.aborted) return cancelled();
     const reason = error instanceof Error ? error.message : String(error);
     return fail("request_failed", `Gemini TTS is unreachable: ${redact(reason, apiKey)}`);
   }
+
+  // The upstream can also win the race and answer just as the caller leaves.
+  // Nobody is waiting for that audio, and a 429 read out of it would bench a
+  // model on behalf of a request that was never really made.
+  if (signal?.aborted) return cancelled();
 
   if (!response.ok) return mapStatus(response.status, raw, apiKey, response.headers);
 
