@@ -55,6 +55,29 @@ function fail(code: SynthesisErrorCode, message: string, extra: Partial<TtsFailu
   return { ok: false, code, message, ...extra };
 }
 
+/**
+ * How long the far end says to wait, in ms, from wherever it chose to say it:
+ * Google's `RetryInfo.retryDelay`, a CLIProxyAPI's `reset_seconds`, or the
+ * standard `Retry-After` header (seconds, or an HTTP date). Undefined when
+ * none of them said.
+ */
+export function readRetryAfterMs(body: string, headers?: Headers): number | undefined {
+  const retryDelay = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i.exec(body);
+  if (retryDelay) return Math.round(Number(retryDelay[1]) * 1000);
+
+  const resetSeconds = /"reset_seconds"\s*:\s*(\d+(?:\.\d+)?)/i.exec(body);
+  if (resetSeconds) return Math.round(Number(resetSeconds[1]) * 1000);
+
+  const header = headers?.get("retry-after");
+  if (header) {
+    const seconds = Number(header.trim());
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+    const at = Date.parse(header);
+    if (Number.isFinite(at)) return Math.max(0, at - Date.now());
+  }
+  return undefined;
+}
+
 /** `GenerateRequestsPerDayPerProjectPerModel-FreeTier` and friends. */
 function isDailyQuotaId(quotaId: string): boolean {
   return /per[_-]?day/i.test(quotaId);
@@ -87,12 +110,11 @@ function quotaIds(body: string): string[] {
  * The `retryDelay` Google attaches to a spent day is about the minute meter,
  * so `cooldownUntil` ignores it in that case and waits for the rollover.
  */
-export function readQuotaScope(body: string): {
-  quotaScope: "day" | "burst";
-  retryAfterMs?: number;
-} {
-  const retry = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i.exec(body);
-  const retryAfterMs = retry ? Math.round(Number(retry[1]) * 1000) : undefined;
+export function readQuotaScope(
+  body: string,
+  headers?: Headers,
+): { quotaScope: "day" | "burst"; retryAfterMs?: number } {
+  const retryAfterMs = readRetryAfterMs(body, headers);
 
   const ids = quotaIds(body);
   if (ids.length > 0) {
@@ -130,7 +152,7 @@ function quote(body: string, apiKey: string): string {
   return redact(message, apiKey).trim().slice(0, MAX_QUOTED);
 }
 
-function mapStatus(status: number, body: string, apiKey: string): TtsFailure {
+function mapStatus(status: number, body: string, apiKey: string, headers?: Headers): TtsFailure {
   const detail = quote(body, apiKey);
   // A 400 is usually about the request — an unknown voice, an unknown model —
   // and only counts as `auth` when Google names the key as the thing at fault.
@@ -150,11 +172,14 @@ function mapStatus(status: number, body: string, apiKey: string): TtsFailure {
     return fail(
       "rate_limited",
       `Every key in the pool is cooling down for this model: ${detail}`,
-      { quotaScope: "burst" },
+      // Honour whatever reset the proxy stated. Without it every proxy
+      // cooldown would get the same ninety seconds, and the dead primary
+      // would be re-offered all day instead of settling on the fallback.
+      { quotaScope: "burst", retryAfterMs: readRetryAfterMs(body, headers) },
     );
   }
   if (status === 429 || /RESOURCE_EXHAUSTED/i.test(body)) {
-    const quota = readQuotaScope(body);
+    const quota = readQuotaScope(body, headers);
     return fail(
       "rate_limited",
       `Google is rate-limiting this key (HTTP ${status}): ${detail}`,
@@ -247,7 +272,7 @@ export async function synthesizeChunk(args: {
     return fail("request_failed", `Gemini TTS is unreachable: ${redact(reason, apiKey)}`);
   }
 
-  if (!response.ok) return mapStatus(response.status, raw, apiKey);
+  if (!response.ok) return mapStatus(response.status, raw, apiKey, response.headers);
 
   let body: unknown;
   try {
