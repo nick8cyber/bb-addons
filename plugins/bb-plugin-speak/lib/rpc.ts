@@ -6,6 +6,7 @@
  * instead — one code path, callable from anywhere.
  */
 export const PLUGIN_RPC_ENDPOINT = "/api/v1/plugins/speak/rpc";
+export const PLUGIN_SYNTHESIZE_ENDPOINT = "/api/v1/plugins/speak/http/synthesize";
 
 type RpcEnvelope<T> = { ok: true; result: T } | { ok: false; error: unknown };
 

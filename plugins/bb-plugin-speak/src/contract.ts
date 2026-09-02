@@ -176,5 +176,6 @@ export const contract = {
 } as const;
 
 export type StatusOutput = z.infer<typeof contract.status.output>;
+export type SynthesizeInput = z.infer<typeof contract.synthesize.input>;
 export type SynthesizeOutput = z.infer<typeof contract.synthesize.output>;
 export type ProbeOutput = z.infer<typeof contract.probe.output>;
