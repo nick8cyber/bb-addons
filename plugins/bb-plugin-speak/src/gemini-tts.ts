@@ -65,6 +65,12 @@ export function readRetryAfterMs(body: string, headers?: Headers): number | unde
   const retryDelay = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i.exec(body);
   if (retryDelay) return Math.round(Number(retryDelay[1]) * 1000);
 
+  // Speculative. `reset_seconds` is a string in the CLIProxyAPI binary, but
+  // the cooldown body it actually emits is only
+  // `{"error":{"code":"model_cooldown","message":"…"}}` — no reset field has
+  // been observed in one. Reading it costs nothing when absent, and if the
+  // proxy never sends it a pool-wide cooldown falls to BURST_COOLDOWN_MS.
+  // Capture a real cooled-pool response, headers included, to settle it.
   const resetSeconds = /"reset_seconds"\s*:\s*(\d+(?:\.\d+)?)/i.exec(body);
   if (resetSeconds) return Math.round(Number(resetSeconds[1]) * 1000);
 
