@@ -72,11 +72,21 @@ Design notes, including the two traps it exists to avoid, are in
 ### `speak` 🔊
 
 A speech button under every chat message that reads it aloud using **Gemini TTS**
-(`gemini-3.1-flash-tts-preview`) with natural high-definition voices (Kore, Aoede, Fenrir, Puck, Charon),
-or the browser's own voice when offline.
+(`gemini-3.1-flash-tts-preview`) with one of thirty prebuilt voices — Kore by
+default. The Markdown is stripped to prose first, so code blocks are skipped,
+links read as their label, and table pipes and emoji are dropped.
 
-Features a floating overlay player with Play/Pause, speed selection (`0.75×`–`2.0×` with pitch preservation),
-instant parallel chunk synthesis at T=0, and mobile audio support.
+The browser's own voice takes over whenever Gemini will not answer: no key, a
+rejected key, a spent rate limit, an unreachable endpoint. Every hand-off is
+announced, because it decides whether the text leaves the machine.
+
+Each model has its own daily free-tier allowance, so a second model can be named
+to move to when the first runs dry — and pointed at a CLIProxyAPI, the reading
+spreads across a pool of keys instead of leaning on one.
+
+A floating player gives Play/Pause and speed (`0.75×`–`2.0×`, pitch preserved).
+Long messages are cut into chunks and fetched ahead, so the reading starts
+before the whole message has been synthesised.
 
 ```bash
 bb speak status
