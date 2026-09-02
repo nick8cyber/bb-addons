@@ -29,17 +29,29 @@ function syncButtonState(stage: string) {
   });
 }
 
-if (typeof document !== "undefined") {
-  mountSpeakOverlay();
-  player.subscribe((state) => {
-    syncButtonState(state.stage);
-  });
-}
-
 export default definePluginApp((app) => {
+  // Both of these used to run at module scope, next to a content script that
+  // mounted the overlay a second time. The overlay removes its predecessor's
+  // DOM by id, so nothing visibly duplicated — but each mount subscribes to
+  // the player, and only the disposer the host holds ever unsubscribes. Two
+  // mounts, one disposer, one listener rendering into a detached element for
+  // the life of the tab, and another on every reload.
+  //
+  // A content script is the sanctioned place for this: the host calls the
+  // returned disposer exactly once per generation, so whatever is set up here
+  // is taken back down.
   app.contentScripts.register({
     id: "speak-overlay",
-    mount: mountSpeakOverlay,
+    mount: () => {
+      const unmountOverlay = mountSpeakOverlay();
+      const unsyncButtons = player.subscribe((state) => {
+        syncButtonState(state.stage);
+      });
+      return () => {
+        unsyncButtons();
+        unmountOverlay();
+      };
+    },
   });
 
   app.slots.messageAction({
