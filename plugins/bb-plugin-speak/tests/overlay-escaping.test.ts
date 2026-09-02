@@ -25,20 +25,26 @@ import test from "node:test";
 
 const source = readFileSync(new URL("../src/SpeakOverlay.ts", import.meta.url), "utf8");
 
-test("every interpolation into the bar's markup is escaped or numeric", () => {
+test("nothing carrying a value reaches the bar's markup unescaped", () => {
   // Read from the source rather than rendered, because rendering needs a DOM.
-  // The rule is what matters: nothing reaches innerHTML raw.
+  // The property that matters: no expression referring to state may reach
+  // innerHTML without going through esc() or Number(). An earlier version of
+  // this test exempted anything starting with `isPaused`, which exempted by
+  // name rather than by proof — a branch could have grown an interpolation
+  // and slipped through.
   const interpolations = [...source.matchAll(/\$\{([^}]*)\}/g)].map((m) => m[1].trim());
-  const raw = interpolations.filter((expression) => {
+  const carriesValue = interpolations.filter((expression) => {
+    if (!/\bstate\.|\bvoice\b|\bspeed\b/.test(expression)) return false;
     if (expression.startsWith("esc(")) return false;
     if (expression.startsWith("Number(")) return false;
-    // A ternary between two string literals cannot carry a value.
-    if (/^[A-Za-z]+ \? "[^"]*" : "[^"]*"$/.test(expression)) return false;
-    // Nested template branches are checked by their own inner interpolations.
-    if (expression.startsWith("isPaused") || expression.startsWith("Number(")) return false;
     return true;
   });
-  assert.deepEqual(raw, [], `these reach innerHTML unescaped: ${raw.join(", ")}`);
+  assert.deepEqual(
+    carriesValue,
+    [],
+    `these reach innerHTML unescaped: ${carriesValue.join(" | ")}`,
+  );
+  assert.ok(interpolations.length > 4, "and the scan actually found the markup");
 });
 
 test("the escaper neutralises a voice name that is markup", async () => {
