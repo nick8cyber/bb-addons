@@ -20,7 +20,7 @@
 
 import { toast } from "sonner";
 
-import { PLUGIN_RPC_ENDPOINT, rpc } from "../lib/rpc.js";
+import { PLUGIN_SYNTHESIZE_ENDPOINT, rpc } from "../lib/rpc.js";
 import {
   AUDIO_MIME,
   DEFAULT_PREFS,
@@ -517,9 +517,10 @@ async function playAudio(
 /**
  * One chunk, cancellably.
  *
- * `rpc()` has no signal parameter and is shared with the settings page, so the
- * one call that must be abortable does its own fetch against the same
- * endpoint. Everything else about the envelope is the same.
+ * `rpc()` has no signal parameter. The cancellable synthesis path therefore
+ * uses the plugin's HTTP route, whose Hono request signal stays linked to this
+ * fetch and is forwarded to Gemini. Everything else about the envelope is the
+ * same.
  */
 async function fetchChunk(
   text: string,
@@ -528,7 +529,7 @@ async function fetchChunk(
   const controller = new AbortController();
   inFlightRequests.add(controller);
   try {
-    const response = await fetch(`${PLUGIN_RPC_ENDPOINT}/synthesize`, {
+    const response = await fetch(PLUGIN_SYNTHESIZE_ENDPOINT, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text, chunkIndex }),

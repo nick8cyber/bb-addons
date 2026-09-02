@@ -44,6 +44,9 @@ export type TtsFailure = {
   retryAfterMs?: number;
 };
 
+/** A caller went away. This is control flow, not a synthesis failure. */
+export type TtsAborted = { ok: false; code: "aborted" };
+
 /** Strip anything that could be the key out of text on its way to a human. */
 function redact(text: string, apiKey: string): string {
   let safe = text.replace(/key=[^&\s"'`)\]}]*/gi, "key=REDACTED");
@@ -252,7 +255,7 @@ export async function synthesizeChunk(args: {
   voice: string;
   model: string;
   signal?: AbortSignal;
-}): Promise<{ ok: true; wavBase64: string } | TtsFailure> {
+}): Promise<{ ok: true; wavBase64: string } | TtsFailure | TtsAborted> {
   const { apiKey, text, voice, model, signal, baseUrl = GEMINI_BASE_URL } = args;
 
   let response: Response;
@@ -272,11 +275,17 @@ export async function synthesizeChunk(args: {
     });
     raw = await response.text();
   } catch (error) {
-    // An abort — ours or the caller's — arrives here too, and is no different
-    // from a dead socket as far as the app is concerned.
+    // Stop is neutral: the caller has gone away, so do not turn its abort into
+    // a request failure that could trigger failover, cooldown, or a warning.
+    // Our own 60s deadline remains an ordinary request failure.
+    if (signal?.aborted) return { ok: false, code: "aborted" };
     const reason = error instanceof Error ? error.message : String(error);
     return fail("request_failed", `Gemini TTS is unreachable: ${redact(reason, apiKey)}`);
   }
+
+  // A mock/proxy may finish while cancellation races with the response. The
+  // caller still went away, so do not classify or persist that late reply.
+  if (signal?.aborted) return { ok: false, code: "aborted" };
 
   if (!response.ok) return mapStatus(response.status, raw, apiKey, response.headers);
 

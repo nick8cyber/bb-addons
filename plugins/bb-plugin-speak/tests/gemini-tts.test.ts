@@ -297,7 +297,7 @@ test("any other non-2xx status is a request_failed", async () => {
       () => json({ error: { message: "boom" } }, status),
       async () => {
         const result = await speak();
-        assert.ok(!result.ok);
+        assert.ok(!result.ok && result.code !== "aborted");
         assert.equal(result.code, "request_failed");
         assert.match(result.message, new RegExp(`HTTP ${status}`));
       },
@@ -312,14 +312,14 @@ test("a network throw is a request_failed", async () => {
     },
     async () => {
       const result = await speak();
-      assert.ok(!result.ok);
+      assert.ok(!result.ok && result.code !== "aborted");
       assert.equal(result.code, "request_failed");
       assert.match(result.message, /unreachable/);
     },
   );
 });
 
-test("an abort is a request_failed, not a thrown error", async () => {
+test("a caller abort is neutral, not a request failure", async () => {
   const controller = new AbortController();
   controller.abort();
   await withFetch(
@@ -330,8 +330,7 @@ test("an abort is a request_failed, not a thrown error", async () => {
     },
     async () => {
       const result = await speak({ signal: controller.signal });
-      assert.ok(!result.ok);
-      assert.equal(result.code, "request_failed");
+      assert.deepEqual(result, { ok: false, code: "aborted" });
     },
   );
 });
@@ -350,7 +349,7 @@ test("the key never appears in a returned message", async () => {
       () => new Response(body, { status }),
       async () => {
         const result = await speak();
-        assert.ok(!result.ok);
+        assert.ok(!result.ok && result.code !== "aborted");
         assert.ok(!result.message.includes(KEY), `the key leaked in: ${result.message}`);
         assert.ok(!result.message.includes("AIzaSy"), `a key prefix leaked in: ${result.message}`);
       },
@@ -364,7 +363,7 @@ test("the key never appears in a returned message", async () => {
     },
     async () => {
       const result = await speak();
-      assert.ok(!result.ok);
+      assert.ok(!result.ok && result.code !== "aborted");
       assert.ok(!result.message.includes(KEY), result.message);
       assert.match(result.message, /key=REDACTED/);
     },
