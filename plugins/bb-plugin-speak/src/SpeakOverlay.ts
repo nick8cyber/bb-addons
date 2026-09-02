@@ -9,6 +9,25 @@ import { player, type PlaybackState } from "./player.js";
 
 const SPEEDS = [0.75, 1, 1.25, 1.5, 2];
 
+/**
+ * Escape a value on its way into the bar's markup.
+ *
+ * `voice` is the one interpolated string that is not a literal: it comes from
+ * the saved preferences, and `prefsSchema` accepts any non-empty string, so a
+ * voice named `<img src=x onerror=…>` would be injected here. Only the user
+ * can set their own preferences, so this is self-inflicted rather than remote
+ * — but it costs one function to close, and "you would have to attack
+ * yourself" is a poor reason to leave an injection in.
+ */
+export function esc(value: string | number): string {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export function mountSpeakOverlay(): () => void {
   if (typeof document === "undefined") return () => {};
 
@@ -65,7 +84,7 @@ export function mountSpeakOverlay(): () => void {
             <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25"></circle>
             <path d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" fill="currentColor"></path>
           </svg>
-          <span style="color: #ffffff;">Генерация речи… ${state.chunkCount > 1 ? `(${state.chunkIndex + 1}/${state.chunkCount})` : ""}</span>
+          <span style="color: #ffffff;">Генерация речи… ${Number(state.chunkCount) > 1 ? `(${Number(state.chunkIndex) + 1}/${Number(state.chunkCount)})` : ""}</span>
         </div>
         <div style="width: 1px; height: 14px; background: rgba(255, 255, 255, 0.2);"></div>
         <button id="bb-speak-btn-close" style="background: none; border: none; color: #a1a1aa; cursor: pointer; padding: 2px 4px; display: flex; align-items: center; border-radius: 4px;" title="Отмена">
@@ -86,11 +105,11 @@ export function mountSpeakOverlay(): () => void {
         </button>
         <div style="display: flex; align-items: center; gap: 6px;">
           <span style="color: #a1a1aa;">${isPaused ? "Пауза" : "Воспроизведение"}</span>
-          <span style="color: #ffffff; font-weight: 600;">${state.voice || "Gemini"}</span>
-          ${state.chunkCount > 1 ? `<span style="color: #71717a; font-size: 11px;">• ${state.chunkIndex + 1}/${state.chunkCount}</span>` : ""}
+          <span style="color: #ffffff; font-weight: 600;">${esc(state.voice || "Gemini")}</span>
+          ${Number(state.chunkCount) > 1 ? `<span style="color: #71717a; font-size: 11px;">• ${Number(state.chunkIndex) + 1}/${Number(state.chunkCount)}</span>` : ""}
         </div>
         <button id="bb-speak-btn-speed" style="background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.15); color: #ffffff; border-radius: 4px; padding: 2px 6px; font-size: 11px; font-family: monospace; cursor: pointer;" title="Скорость">
-          ${state.speed}×
+          ${esc(state.speed)}×
         </button>
         <div style="width: 1px; height: 14px; background: rgba(255, 255, 255, 0.2);"></div>
         <button id="bb-speak-btn-close" style="background: none; border: none; color: #a1a1aa; cursor: pointer; padding: 2px 4px; display: flex; align-items: center; border-radius: 4px;" title="Закрыть">
