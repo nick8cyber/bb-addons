@@ -215,7 +215,11 @@ test("a proxy that has benched every key is a quota failure, whatever its status
   assert.equal(read.quotaScope, "burst", "the proxy's own cooldown, not Google's day");
 });
 
-test("the proxy's own stated reset is honoured, not flattened to the default", () => {
+test("a stated reset is honoured, not flattened to the default", () => {
+  // The `reset_seconds` shape here is UNCONFIRMED — the cooldown body the
+  // proxy is known to emit carries only `code` and `message`. This pins the
+  // reader's behaviour if the field ever appears; it is not evidence that it
+  // does.
   // Without this the dead primary is re-offered every ninety seconds all day
   // instead of settling on the fallback — hundreds of pointless round trips
   // and an extra hop of waiting before every reading.
