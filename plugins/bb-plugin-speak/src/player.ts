@@ -774,16 +774,41 @@ function pause(): void {
   setState({ stage: "paused" });
 }
 
+/**
+ * The bar must not claim to be playing when nothing is.
+ *
+ * A resumed `play()` can be refused — an autoplay policy that expired while
+ * paused, a device taken away. The rejection used to be discarded and the
+ * stage set to "playing" regardless, so the user watched
+ * "Воспроизведение" in silence with no error. Staying paused is both true and
+ * useful: the button still says Resume, so they can try again.
+ */
+function resumeRefused(reason: unknown): void {
+  if (state.stage !== "playing") return;
+  setState({ stage: "paused" });
+  toast.error(
+    "This browser refused to resume the audio. Press play again, or start the " +
+      "reading over." +
+      (reason instanceof Error && reason.name === "NotAllowedError"
+        ? " Browsers only allow audio that a click asked for."
+        : ""),
+  );
+}
+
 function resume(): void {
   if (state.stage !== "paused") return;
   const ctx = getAudioContext();
   if (ctx && ctx.state === "suspended") {
-    void ctx.resume().catch(() => {});
+    void ctx.resume().catch(resumeRefused);
   }
   if (currentAudio) {
     try {
-      void currentAudio.play();
-    } catch {}
+      const started = currentAudio.play() as unknown;
+      if (started instanceof Promise) started.catch(resumeRefused);
+    } catch (error) {
+      resumeRefused(error);
+      return;
+    }
   }
   const scope = globalThis as { speechSynthesis?: SpeechSynthesis };
   if (scope.speechSynthesis?.paused) {

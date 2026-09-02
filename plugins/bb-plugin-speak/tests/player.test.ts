@@ -1138,3 +1138,37 @@ test("a reading that dies mid-way cancels the chunks queued behind it", async ()
     harness.restore();
   }
 });
+
+test("a first-chunk failure cancels the prefetch too, not just a later one", async () => {
+  // Audit PLUG-39 #4: my earlier test failed chunk 1, which exercises only
+  // cutShort(). The client derives the split locally and prefetches up to five
+  // chunks at T=0, before chunk 0 has answered — so a chunk-0 failure, which
+  // goes through failOver(), also leaves speculative requests running. The two
+  // terminal paths needed covering separately.
+  const harness = install({
+    rpc: (method, body) => {
+      if (method === "status") return statusWith();
+      const index = Number((body as { chunkIndex?: number }).chunkIndex ?? 0);
+      if (index === 0) return { ok: false, code: "request_failed", message: "boom" };
+      return new Promise(() => {});
+    },
+  });
+  try {
+    await reset();
+    await player.speak({ messageId: "m1", text: "a".repeat(1500) });
+    await tick();
+
+    const speculative = harness.requests.filter(
+      (r) => r.method === "synthesize" && (r.chunkIndex ?? 0) >= 1,
+    );
+    assert.ok(speculative.length > 0, "the loop must have prefetched at T=0");
+    const leaked = speculative.filter((r) => !r.aborted && !r.settled);
+    assert.deepEqual(
+      leaked.map((r) => r.chunkIndex),
+      [],
+      "failOver must cancel the prefetch as cutShort does",
+    );
+  } finally {
+    harness.restore();
+  }
+});
