@@ -268,6 +268,18 @@ interface Session {
    */
   lastReportedError: string | null;
   /**
+   * Every error text this conversation has surfaced across turns (not just the
+   * last one). agy 1.1.27 glues a conversation's earlier quota rejection --
+   * frozen countdown and all -- onto the result of every later turn that
+   * actually answers (reproduced live on conversation 44069b14: its real
+   * 1h13m29s quota text replayed hours later over a "pong" that was answered
+   * normally). Byte-identical re-arrival plus a completed agent response is
+   * that defect's fingerprint, and settling those turns as completed instead
+   * of failing them again is what lets a thread keep working after its quota
+   * reset without re-showing the stale banner.
+   */
+  seenErrors: Set<string>;
+  /**
    * Set once this conversation has produced an artifact-shaped
    * `write_to_file`; every later turn then carries WRITE_GUARDRAIL so the
    * model does not repeat it. Off by default: a session that never hit the
@@ -383,6 +395,7 @@ function reportError(
     return;
   }
   session.lastReportedError = text;
+  session.seenErrors.add(text);
   const category = classifyError(text);
   log(
     `reporting error from ${source} for thread ${session.threadId}: ${text}`,
@@ -919,6 +932,25 @@ function handleResult(
   // ran to its response and the files are on disk. Failing it would end the
   // thread on work that succeeded, so it settles as completed and the tool
   // error stays visible as the `provider/raw` step that carried it.
+  //
+  // agy 1.1.27 defect: once a conversation has been rejected for quota, the
+  // CLI re-attaches THAT verbatim error -- frozen "Resets in X" and all -- to
+  // the result of every later turn in the same conversation, even when the
+  // model just answered normally (reproduced live on conversation 44069b14:
+  // its real 1h13m29s quota text replayed over a "pong" that answered fine
+  // hours after the window opened). The fingerprint is a byte-identical error
+  // text the session already surfaced PLUS an agent response that actually
+  // streamed on this turn. Trusting the streamed content keeps the thread
+  // alive after the quota resets; the reader was already told on the turn
+  // that really hit the limit. A new occurrence (a different countdown, a
+  // different message) is not in seenErrors and still fails the turn
+  // honestly.
+  const staleResidue =
+    event.error !== null &&
+    turn.producedText &&
+    session.seenErrors.has(event.error) &&
+    !turn.toolErrors.has(event.error) &&
+    !isArtifactPathRefusal(event.error);
   const recovered =
     (event.error !== null &&
       turn.toolErrors.has(event.error) &&
@@ -932,7 +964,10 @@ function handleResult(
     // it is what killed thr_54vswmyikz three turns running.
     (isArtifactPathRefusal(event.error) &&
       turn.producedText &&
-      turn.artifactRetries > 0);
+      turn.artifactRetries > 0) ||
+    // An ERROR result whose error is a byte-identical copy of one already
+    // surfaced for this conversation, with fresh content on this turn.
+    staleResidue;
   const failed =
     event.status !== null && event.status !== "SUCCESS" && !recovered;
   if (
@@ -947,8 +982,12 @@ function handleResult(
   }
   if (recovered) {
     log(
-      `turn ${turn.turnId}: agy reported a recovered tool error as the turn's ` +
-        `status; settling it as completed (${event.error ?? ""})`,
+      staleResidue
+        ? `turn ${turn.turnId}: agy re-attached a quota error already surfaced ` +
+            `for this conversation (${event.error ?? ""}); settling the turn as ` +
+            `completed on the response that actually streamed`
+        : `turn ${turn.turnId}: agy reported a recovered tool error as the turn's ` +
+          `status; settling it as completed (${event.error ?? ""})`,
     );
   }
   if (failed) {
@@ -975,6 +1014,7 @@ function handleResult(
     const alreadyShown = message === session.lastReportedError;
     if (!alreadyShown) {
       session.lastReportedError = message;
+      session.seenErrors.add(message);
       emitDeltas(session, {
         kind: "provider.error",
         providerTurnId: turn.turnId,
@@ -1250,6 +1290,7 @@ const handlers: Record<string, RequestHandler> = {
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,
+      seenErrors: new Set(),
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
@@ -1318,6 +1359,7 @@ const handlers: Record<string, RequestHandler> = {
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,
+      seenErrors: new Set(),
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);

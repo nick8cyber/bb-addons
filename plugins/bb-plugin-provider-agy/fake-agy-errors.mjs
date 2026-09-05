@@ -15,6 +15,13 @@
  *            name the message
  *   noinit-error-null-status  the same, with `status` absent entirely — the
  *            shape the bridge used to drop as noise
+ *   residue  the agy 1.1.27 quota-residue defect, reproduced live on real
+ *            conversation 44069b14: turn 1 is the genuine quota hit (ERROR
+ *            result, no answer); turns 2-3 then answer normally yet get the
+ *            SAME verbatim error re-attached; turn 4 answers normally and gets
+ *            a DIFFERENT verbatim error — the bridge must surface the first
+ *            error once, settle the residue turns completed, and surface turn
+ *            4's new text like the fresh failure it is
  *
  * Every stdin line is echoed to AGY_FAKE_TRANSCRIPT so the harness can prove
  * WHAT the bridge sent.
@@ -35,6 +42,9 @@ const transcript = process.env.AGY_FAKE_TRANSCRIPT ?? "/dev/null";
 const QUOTA =
   "⚠ Individual quota reached. Please upgrade your subscription to " +
   "increase your limits. Resets in 8m11s.";
+const FRESH_QUOTA =
+  "⚠ Individual quota reached. Please upgrade your subscription to " +
+  "increase your limits. Resets in 4m2s.";
 const REJECTED =
   "shots fired: the backend refused this session while quota is exhausted";
 
@@ -109,6 +119,60 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
           },
         });
       }
+    }
+    if (mode === "residue") {
+      // Turn 1 is the genuine quota hit: a failed tool call, no answer, and
+      // the ERROR result that ends it. Turns 2-3 answer normally but agy
+      // re-attaches the SAME frozen text to their result; turn 4 answers
+      // normally and carries a DIFFERENT frozen text.
+      if (turns === 1) {
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "ERROR",
+            step_type: "tool",
+            tool_name: "write_to_file",
+            tool_info: { name: "write_to_file", error: { message: QUOTA } },
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "ERROR",
+            response: "",
+            num_turns: turns,
+            error: QUOTA,
+            usage,
+          },
+        });
+      } else {
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "DONE",
+            step_type: "agent_response",
+            text_delta: `answered ${turns}`,
+            usage,
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "ERROR",
+            response: `answered ${turns}`,
+            num_turns: turns,
+            error: turns === 4 ? FRESH_QUOTA : QUOTA,
+            usage,
+          },
+        });
+      }
+      return;
     }
     out({
       event: "step_update",
