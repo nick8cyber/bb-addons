@@ -96,6 +96,7 @@ provider is configured and not only here.
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
+| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
 
@@ -241,12 +242,42 @@ complete, and `result.status` is still `ERROR` carrying the first call's message
 verbatim. Failing the turn on that ends a bb thread on work that succeeded, so
 `handleResult` settles it as completed when the result error is verbatim a tool
 error this turn recovered from (a later tool step reached `DONE`); anything else
-still fails. The tool error itself is not hidden — it travels as the
-`provider/raw` step that carried it, and the bridge log names every turn it let
-through.
+still fails. The tool error is not hidden: it travels as the `provider/raw`
+step that carried it, it is surfaced to the thread as a scoped `provider.error`
+(see below), and the bridge log names every turn it let through.
 
 Editing existing files never hits this: `view_file` + `replace_file_content`
 comes back `SUCCESS`.
+
+## Errors reach the thread
+
+agy reports a real failure (quota, auth, an overloaded backend) through several
+channels at once, and each used to be handled only for its own bookkeeping —
+a failed tool step was remembered for the recovered-turn judgement, stderr was
+logged, and a turn-less `ERROR` result with a null status was dropped as noise.
+None of that put the words in front of the reader.
+
+A single path (`reportError`) now turns error text from ANY of those channels
+into a thread-visible `provider.error`:
+
+- a `tool` step that settles `ERROR` is surfaced even when the turn itself
+  recovers and completes;
+- agy's **stderr** is line-reassembled (data chunks do not respect line
+  boundaries) then surfaced; its `warning:`-prefixed protocol chatter is logged
+  but not surfaced; ANSI paint is stripped;
+- a stdout line that is not JSON at all and reads like an error is surfaced;
+- a turn-less `ERROR` result before identity fails the session and the
+  `thread/start` / `thread/resume` reply names the message — nothing may be
+  emitted before the child announced itself, so this is the one path that
+  reports through the start reply rather than a thread delta.
+
+The `⚠ Individual quota reached. … Resets in 8m11s.` notice arrives with its
+`rate-limit` category, so bb treats it as the rate-limit error it is. The same
+message reaching the thread on two channels within one turn is reported once
+(per-turn dedup); the next turn is free to report it again.
+
+`node harness-errors.mjs` drives all four shapes against `fake-agy-errors.mjs`,
+no account, no network, no quota.
 
 ## The icon
 
@@ -394,3 +425,10 @@ work was already on disk. That is what the bridge leans on:
 `node harness-artifact.mjs` drives all three shapes against a fake agy, for free.
 An existing thread keeps the bridge build its own worker process was started
 with, so the fix reaches a running thread only after that session restarts.
+
+`node harness-errors.mjs` proves the error paths with no account and no quota —
+14/14: a failed tool step inside a turn that then completes reaches the thread
+exactly once per turn with its `rate-limit` category, the ⚠ banner on stderr
+reaches the thread while a `warning:` line beside it does not, and a turn-less
+`ERROR` result — with either an explicit or a missing `status` — fails the
+session with the message named.
