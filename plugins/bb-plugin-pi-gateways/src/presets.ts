@@ -77,6 +77,18 @@ export const PROVIDER_PRESETS = [
     requiresExplicitModels: true,
   },
   {
+    id: "radeon-cloud",
+    kind: "saved",
+    name: "Radeon Cloud",
+    description: "AMD GPU Cloud foundation models (Qwen, DeepSeek) over an OpenAI-compatible API (prices unknown; explicit model selection required).",
+    baseUrl: "https://developer.amd.com.cn/radeon/api/v1",
+    api: "openai-completions",
+    keyEnv: "RADEON_API_KEY",
+    idStem: "radeon",
+    pricing: "unknown",
+    requiresExplicitModels: true,
+  },
+  {
     id: "opencode-zen",
     kind: "builtin",
     name: "OpenCode Zen",
