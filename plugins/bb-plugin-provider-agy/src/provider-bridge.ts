@@ -261,6 +261,13 @@ interface Session {
   /** agy's own last words, which usually name the real cause. */
   lastStderr: string | null;
   /**
+   * The last error text surfaced to the thread as a `provider.error`, so a
+   * tool error, an ERROR result and a stderr banner all carrying the same
+   * message do not become three identical error rows. Reset on every
+   * `turn.open` so a genuinely new occurrence on a later turn still shows.
+   */
+  lastReportedError: string | null;
+  /**
    * Set once this conversation has produced an artifact-shaped
    * `write_to_file`; every later turn then carries WRITE_GUARDRAIL so the
    * model does not repeat it. Off by default: a session that never hit the
@@ -287,6 +294,109 @@ function providerRaw(
     threadId: session.threadId,
     coverage,
     payload,
+  });
+}
+
+/**
+ * agy reports real failures in far more places than its `result.error`: a
+ * backend rejection (quota, auth, overload) shows up as a failed `tool` step,
+ * a stderr banner, a turn-less ERROR result before `init`, or even a stdout
+ * line that is not JSON at all. Each channel used to be handled only for its
+ * own bookkeeping — a tool error was remembered, stderr was logged, a null
+ * status was dropped as noise — so the reader of the thread could end up with
+ * nothing but a failed turn and no idea why. This is the single path that
+ * turns error text from ANY of those channels into a thread-visible
+ * `provider.error`. It is thread-scoped (it never touches turn accounting),
+ * dedupes the same text within one turn, and honours the dialect's own rule
+ * that nothing may be emitted before the child announced its identity — until
+ * then the text has already been recorded on the session, which is what the
+ * `thread/start` / `thread/resume` error path surfaces.
+ */
+const ACTIONABLE_ERROR =
+  /(?:error|fail|quota|limit|exceed|overload|unavail|busy|refus|denied|denial|reject|reset|resets in|unexpected|invalid|401|403|429|resource exhausted|⚠)/iu;
+
+/** Lines agy prints while it is still running normally, not failures. */
+const BENIGN_STDERR = /^warning[: ]/iu;
+
+function classifyError(message: string):
+  | "rate-limit"
+  | "unauthorized"
+  | "billing"
+  | "overloaded"
+  | undefined {
+  const text = message.toLowerCase();
+  if (
+    /\bquota\b|rate.?limit|resets? in|resource exhausted|\b429\b|try again later/u.test(
+      text,
+    )
+  ) {
+    return "rate-limit";
+  }
+  if (
+    /unauthori|not authorized|sign in|logged in|login|\b401\b|\b403\b|token/u.test(
+      text,
+    )
+  ) {
+    return "unauthorized";
+  }
+  if (
+    /upgrade your subscription|increase your limits|billing|payment|credits?/u.test(
+      text,
+    )
+  ) {
+    return "billing";
+  }
+  if (/overloaded|busy|temporar|degenerat|can't satisfy|no capacity/u.test(text)) {
+    return "overloaded";
+  }
+  return undefined;
+}
+
+function reportError(
+  session: Session,
+  message: string,
+  source: string,
+): void {
+  // agy may paint its banner with ANSI SGR colours even off a tty; the thread
+  // should see the words, not the paint.
+  const text = message.replace(/\u001b\[[0-9;]*m/gu, "").trim();
+  if (text.length === 0) {
+    return;
+  }
+  // agy's own stream-input warnings are it explaining its own protocol back
+  // to us; they live in the bridge log, not the thread.
+  if (BENIGN_STDERR.test(text)) {
+    log(`stderr (${session.threadId}) is process chatter, not a thread error: ${text}`);
+    return;
+  }
+  if (!ACTIONABLE_ERROR.test(text)) {
+    return;
+  }
+  // Identity first: the runtime drops anything emitted before the child
+  // announced itself (threadIdentity + session.reset). Until then the text
+  // has already been recorded on the session and reaches the thread through
+  // the start/resume reply instead.
+  if (session.providerThreadId === null || !session.identityAnnounced) {
+    return;
+  }
+  if (session.lastReportedError === text) {
+    return;
+  }
+  session.lastReportedError = text;
+  const category = classifyError(text);
+  log(
+    `reporting error from ${source} for thread ${session.threadId}: ${text}`,
+  );
+  emitDeltas(session, {
+    kind: "provider.error",
+    message: text,
+    threadScoped: true,
+    ...(category === undefined
+      ? {}
+      : {
+          category,
+          errorInfo: { category, providerCode: null, httpStatusCode: null },
+        }),
   });
 }
 
@@ -384,12 +494,36 @@ function startChild(args: StartChildArgs): void {
     }
   });
 
+  // agy's stderr is where its banners live (the ⚠ quota notice, auth
+  // failures, API rejections) and "data" can split them across chunks, so it
+  // is reassembled line by line: the last complete line becomes the session's
+  // last words for the exit message, and every error-looking line is also
+  // surfaced to the thread as a scoped provider.error, not just logged.
   child.stderr.setEncoding("utf8");
+  let stderrTail = "";
   child.stderr.on("data", (chunk: string) => {
-    const text = chunk.trim();
-    if (text.length > 0) {
-      session.lastStderr = text.slice(0, 2000);
-      log(`agy stderr (${session.threadId}): ${text}`);
+    if (session.generation !== generation) {
+      return;
+    }
+    stderrTail += chunk;
+    for (;;) {
+      const newline = stderrTail.indexOf("\n");
+      if (newline === -1) {
+        break;
+      }
+      const line = stderrTail.slice(0, newline).trim();
+      stderrTail = stderrTail.slice(newline + 1);
+      if (line.length === 0) {
+        continue;
+      }
+      session.lastStderr = line.slice(0, 2000);
+      log(`agy stderr (${session.threadId}): ${line}`);
+      reportError(session, line, "agy stderr");
+    }
+    // A trailing line with no newline is kept for the exit message even
+    // though it never completes on its own.
+    if (stderrTail.trim().length > 0) {
+      session.lastStderr = stderrTail.slice(0, 2000);
     }
   });
 
@@ -489,6 +623,12 @@ function handleAgyLine(
       // A line the dialect parser did not recognize is also the one place agy
       // reports a startup failure, so it is logged as well as forwarded.
       log(`agy said something unrecognized: ${JSON.stringify(event.payload).slice(0, 500)}`);
+      if (
+        typeof event.payload === "string" &&
+        ACTIONABLE_ERROR.test(event.payload)
+      ) {
+        reportError(session, event.payload, "agy stdout");
+      }
       providerRaw(session, "unknown", event.payload);
     }
   }
@@ -559,6 +699,10 @@ function handleStepUpdate(
       // what lets handleResult tell that apart from a turn that really died.
       if (event.state === "ERROR" && event.toolError !== null) {
         turn.toolErrors.add(event.toolError);
+        // The error is recorded above for the recovered-step judgement and
+        // surfaced here, so the reader sees a tool step fail even when the
+        // turn itself recovers and settles completed.
+        reportError(session, event.toolError, "agy tool step");
       } else if (event.state === "DONE" && turn.toolErrors.size > 0) {
         turn.toolRecovered = true;
       }
@@ -731,11 +875,20 @@ function handleResult(
   const turn = session.turns.shift();
   if (turn === undefined) {
     // agy reports a rejected session (a bad flag combination, a model it will
-    // not run) as an ERROR result with an empty conversation id, before any
-    // turn exists. Reporting that as droppable noise is how a dead session
-    // looks healthy — it is a session failure and must say so.
-    if (event.status !== null && event.status !== "SUCCESS") {
-      failSession(session, event.error ?? `agy refused the session (${event.status})`);
+    // not run, a dead quota) as an ERROR result with an empty conversation id,
+    // before any turn exists. Reporting that as droppable noise is how a dead
+    // session looks healthy — it is a session failure and must say so. The
+    // error may arrive with a status agy left null, so a present error alone
+    // is enough to fail the session rather than vanish.
+    if (
+      event.error !== null ||
+      (event.status !== null && event.status !== "SUCCESS")
+    ) {
+      failSession(
+        session,
+        event.error ??
+          `agy refused the session (${event.status ?? "unknown status"})`,
+      );
       return;
     }
     providerRaw(session, "noise", event);
@@ -815,12 +968,20 @@ function handleResult(
         ` produced no answer. Check the file named above on disk: a write` +
         ` earlier in the same turn may have already landed.`;
     }
-    emitDeltas(session, {
-      kind: "provider.error",
-      providerTurnId: turn.turnId,
-      message,
-      settlesTurn: false,
-    });
+    // A failed turn whose message was already surfaced as a thread error
+    // (a tool step or stderr banner carrying the same text) does not need a
+    // second, turn-scoped copy of it: the boundary below still names the
+    // error, and the reader has already been told once.
+    const alreadyShown = message === session.lastReportedError;
+    if (!alreadyShown) {
+      session.lastReportedError = message;
+      emitDeltas(session, {
+        kind: "provider.error",
+        providerTurnId: turn.turnId,
+        message,
+        settlesTurn: false,
+      });
+    }
     emitDeltas(session, {
       kind: "turn.boundary",
       providerTurnId: turn.turnId,
@@ -850,6 +1011,10 @@ function handleResult(
 
 function emitTurnStarted(session: Session, turn: Turn): void {
   turn.started = true;
+  // A new turn may legitimately meet the same quota notice again; the dedup
+  // is a per-turn guard against three channels telling the same story, not a
+  // lifetime mute.
+  session.lastReportedError = null;
   const deltas: ThreadDelta[] = [
     {
       kind: "turn.open",
@@ -1084,6 +1249,7 @@ const handlers: Record<string, RequestHandler> = {
       },
       lastFailure: null,
       lastStderr: null,
+      lastReportedError: null,
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
@@ -1151,6 +1317,7 @@ const handlers: Record<string, RequestHandler> = {
       },
       lastFailure: null,
       lastStderr: null,
+      lastReportedError: null,
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
