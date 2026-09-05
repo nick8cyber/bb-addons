@@ -96,7 +96,7 @@ provider is configured and not only here.
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
-| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects |
+| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
 
@@ -276,7 +276,23 @@ The `⚠ Individual quota reached. … Resets in 8m11s.` notice arrives with its
 message reaching the thread on two channels within one turn is reported once
 (per-turn dedup); the next turn is free to report it again.
 
-`node harness-errors.mjs` drives all four shapes against `fake-agy-errors.mjs`,
+### The quota-residue replay (agy 1.1.27)
+
+Once a conversation has been rejected for quota, agy re-attaches THAT verbatim
+error — frozen `Resets in X` and all — to the result of every later turn in
+that conversation, even when the model just answered normally. Reproduced live
+on real conversation `44069b14-fdd2-4404-bf99-08a1825cbceb`: its genuine
+`Resets in 1h13m29s.` text from 18:36 kept showing up verbatim at 21:56 and
+22:18, after the window had long since opened.
+
+The fingerprint is a byte-identical error text the session already surfaced
+(`seenErrors`) plus an agent response that actually streamed on this turn.
+Such a result settles **completed** on the content that streamed, and the stale
+banner is not shown again — the reader was told once, on the turn that really
+hit the limit. A *different* countdown or a different message is not a replay
+and still fails the turn with its text surfaced.
+
+`node harness-errors.mjs` drives all five shapes against `fake-agy-errors.mjs`,
 no account, no network, no quota.
 
 ## The icon
@@ -427,8 +443,10 @@ An existing thread keeps the bridge build its own worker process was started
 with, so the fix reaches a running thread only after that session restarts.
 
 `node harness-errors.mjs` proves the error paths with no account and no quota —
-14/14: a failed tool step inside a turn that then completes reaches the thread
+18/18: a failed tool step inside a turn that then completes reaches the thread
 exactly once per turn with its `rate-limit` category, the ⚠ banner on stderr
-reaches the thread while a `warning:` line beside it does not, and a turn-less
+reaches the thread while a `warning:` line beside it does not, a turn-less
 `ERROR` result — with either an explicit or a missing `status` — fails the
-session with the message named.
+session with the message named, and the quota-residue replay settles answering
+turns completed after the genuine hit was surfaced once while a different
+countdown still fails and surfaces.

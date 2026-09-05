@@ -1,8 +1,9 @@
 /**
  * Proves error text reaches the thread through every channel agy can carry
- * it — a failed tool step, a stderr banner, and a turn-less ERROR result at
- * session start — at no quota cost. Four threads, four shapes (see
- * fake-agy-errors.mjs).
+ * it — a failed tool step, a stderr banner, a turn-less ERROR result at
+ * session start, and (residue) agy re-attaching a conversation's earlier
+ * frozen quota rejection to later turns that actually answer — at no quota
+ * cost. Five threads, five shapes (see fake-agy-errors.mjs).
  *
  * Usage: node harness-errors.mjs
  */
@@ -28,6 +29,9 @@ const workspace = (mode) => {
 const QUOTA =
   "⚠ Individual quota reached. Please upgrade your subscription to " +
   "increase your limits. Resets in 8m11s.";
+const FRESH_QUOTA =
+  "⚠ Individual quota reached. Please upgrade your subscription to " +
+  "increase your limits. Resets in 4m2s.";
 
 const messages = [];
 const originalWrite = process.stdout.write.bind(process.stdout);
@@ -123,11 +127,22 @@ stop(stderr.threadId);
 const noinit = await start("noinit-error");
 const noinitNull = await start("noinit-error-null-status");
 
+// residue mode: the genuine quota hit, then agy re-attaching the frozen text
+// to answering turns, then a new countdown that must fail honestly.
+const residue = await start("residue");
+await turn(residue.threadId, "one", 1);
+await turn(residue.threadId, "two", 2);
+await turn(residue.threadId, "three", 3);
+await turn(residue.threadId, "four", 4);
+stop(residue.threadId);
+
 bridge.onClose?.();
 process.stdout.write = originalWrite;
 
 const toolErrors = errors(tool.threadId);
 const stderrErrors = errors(stderr.threadId);
+const residueErrors = errors(residue.threadId);
+const residueBoundaries = completed(residue.threadId);
 
 const checks = [
   ["tool/step-error-reaches-thread", toolErrors.length === 2 && toolErrors.every((e) => e.message === QUOTA), JSON.stringify(toolErrors.map((e) => e.message)).slice(0, 120)],
@@ -144,6 +159,10 @@ const checks = [
   ["noinit/nothing-emitted-before-identity", messages.filter((m) => m.method === "thread/delta" && m.params.threadId === noinit.threadId).length === 0, ""],
   ["noinit-null-status/session-refused-naming-the-cause", noinitNull.startMsg?.error !== undefined && typeof noinitNull.startMsg.error.message === "string" && noinitNull.startMsg.error.message.includes("shots fired"), JSON.stringify(noinitNull.startMsg?.error?.message ?? "").slice(0, 120)],
   ["all/no-start-failure-leaks-deltas", messages.filter((m) => m.method === "thread/delta" && (m.params.threadId === noinit.threadId || m.params.threadId === noinitNull.threadId)).length === 0, ""],
+  ["residue/genuine-hit-surfaced-exactly-once", residueErrors.filter((e) => e.message === QUOTA).length === 1, JSON.stringify(residueErrors.map((e) => e.message))],
+  ["residue/answering-turns-recover", residueBoundaries.length === 4 && residueBoundaries[1].status === "completed" && residueBoundaries[2].status === "completed", JSON.stringify(residueBoundaries.map((b) => b.status))],
+  ["residue/its-first-turn-still-failed", residueBoundaries[0]?.status === "failed", JSON.stringify(residueBoundaries[0]?.status ?? "")],
+  ["residue/a-fresh-countdown-still-fails-and-surfaces", residueBoundaries[3]?.status === "failed" && residueErrors.filter((e) => e.message === FRESH_QUOTA).length === 1, JSON.stringify(residueBoundaries[3] ?? "")],
 ];
 
 say("==== error-surfacing report ====");
