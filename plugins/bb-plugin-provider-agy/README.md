@@ -292,6 +292,12 @@ banner is not shown again — the reader was told once, on the turn that really
 hit the limit. A *different* countdown or a different message is not a replay
 and still fails the turn with its text surfaced.
 
+The fingerprint lives on the in-memory session, so a conversation that is
+resumed as a brand-new session (thread stopped and restarted after a bridge
+reload) can fail once on its first answering turn before recovering on the
+next — the reader sees the stale banner exactly one more time there, not on
+every later turn.
+
 `node harness-errors.mjs` drives all five shapes against `fake-agy-errors.mjs`,
 no account, no network, no quota.
 
