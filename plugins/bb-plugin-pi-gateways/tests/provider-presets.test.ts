@@ -36,6 +36,13 @@ test("OpenRouter and NVIDIA Build presets use official connection metadata", () 
   assert.equal(nvidia?.keyEnv, "NVIDIA_API_KEY");
   assert.equal(nvidia?.pricing, "unknown");
   assert.equal(nvidia?.requiresExplicitModels, true);
+
+  const radeon = findSavedProviderPreset("radeon-cloud");
+  assert.equal(radeon?.baseUrl, "https://developer.amd.com.cn/radeon/api/v1");
+  assert.equal(radeon?.api, "openai-completions");
+  assert.equal(radeon?.keyEnv, "RADEON_API_KEY");
+  assert.equal(radeon?.pricing, "unknown");
+  assert.equal(radeon?.requiresExplicitModels, true);
 });
 
 test("strict preset pricing never classifies an unpriced model as free", () => {
