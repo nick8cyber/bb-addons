@@ -20,6 +20,8 @@ writeFileSync(
 );
 chmodSync(shim, 0o755);
 process.env.AGY_PATH = shim;
+// hermetic: the host may or may not have an agent-proxy core to auto-detect
+process.env.AGY_CLIPROXY = "0";
 const messages = [];
 const originalWrite = process.stdout.write.bind(process.stdout);
 let tail = "";

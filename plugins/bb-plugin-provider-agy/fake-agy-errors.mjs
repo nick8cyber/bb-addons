@@ -66,6 +66,18 @@ const REJECTED =
 const out = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Env recording for the relay harness: the selected HOME / GEMINI_API_KEY /
+// GOOGLE_GEMINI_BASE_URL the shim actually ran with, before any traffic.
+const recordEnv = process.env.AGY_FAKE_RECORD_ENV ?? "";
+if (recordEnv.length > 0) {
+  const names = recordEnv.split(",").map((n) => n.trim()).filter(Boolean);
+  const snapshot = {};
+  for (const name of names) {
+    snapshot[name] = process.env[name] ?? null;
+  }
+  appendFileSync(transcript, `${JSON.stringify({ __env: snapshot })}\n`);
+}
+
 if (mode.startsWith("noinit")) {
   out({
     event: "result",

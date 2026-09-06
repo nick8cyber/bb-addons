@@ -22,6 +22,8 @@ const fake = new URL("./fake-agy-artifact.mjs", import.meta.url).pathname;
 writeFileSync(shim, `#!/bin/sh\nexec /usr/bin/node ${fake} "$@"\n`);
 chmodSync(shim, 0o755);
 process.env.AGY_PATH = shim;
+// hermetic: the host may or may not have an agent-proxy core to auto-detect
+process.env.AGY_CLIPROXY = "0";
 process.env.AGY_FAKE_TRANSCRIPT = transcript;
 const workspace = (mode) => {
   const dir = join(root, `ws-${mode}`);
