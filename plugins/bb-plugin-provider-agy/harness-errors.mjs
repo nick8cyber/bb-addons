@@ -128,12 +128,14 @@ const noinit = await start("noinit-error");
 const noinitNull = await start("noinit-error-null-status");
 
 // residue mode: the genuine quota hit, then agy re-attaching the frozen text
-// to answering turns, then a new countdown that must fail honestly.
+// to answering turns; a no-reply turn with a new countdown must fail honestly,
+// and a replying turn carrying that same new text must complete.
 const residue = await start("residue");
 await turn(residue.threadId, "one", 1);
 await turn(residue.threadId, "two", 2);
 await turn(residue.threadId, "three", 3);
 await turn(residue.threadId, "four", 4);
+await turn(residue.threadId, "five", 5);
 stop(residue.threadId);
 
 bridge.onClose?.();
@@ -159,10 +161,11 @@ const checks = [
   ["noinit/nothing-emitted-before-identity", messages.filter((m) => m.method === "thread/delta" && m.params.threadId === noinit.threadId).length === 0, ""],
   ["noinit-null-status/session-refused-naming-the-cause", noinitNull.startMsg?.error !== undefined && typeof noinitNull.startMsg.error.message === "string" && noinitNull.startMsg.error.message.includes("shots fired"), JSON.stringify(noinitNull.startMsg?.error?.message ?? "").slice(0, 120)],
   ["all/no-start-failure-leaks-deltas", messages.filter((m) => m.method === "thread/delta" && (m.params.threadId === noinit.threadId || m.params.threadId === noinitNull.threadId)).length === 0, ""],
-  ["residue/genuine-hit-surfaced-exactly-once", residueErrors.filter((e) => e.message === QUOTA).length === 1, JSON.stringify(residueErrors.map((e) => e.message))],
-  ["residue/answering-turns-recover", residueBoundaries.length === 4 && residueBoundaries[1].status === "completed" && residueBoundaries[2].status === "completed", JSON.stringify(residueBoundaries.map((b) => b.status))],
+  ["residue/genuine-hit-surfaced-once", residueErrors.filter((e) => e.message === QUOTA).length === 1, JSON.stringify(residueErrors.map((e) => e.message))],
+  ["residue/answering-turns-recover", residueBoundaries.length === 5 && residueBoundaries[1].status === "completed" && residueBoundaries[2].status === "completed", JSON.stringify(residueBoundaries.map((b) => b.status))],
   ["residue/its-first-turn-still-failed", residueBoundaries[0]?.status === "failed", JSON.stringify(residueBoundaries[0]?.status ?? "")],
-  ["residue/a-fresh-countdown-still-fails-and-surfaces", residueBoundaries[3]?.status === "failed" && residueErrors.filter((e) => e.message === FRESH_QUOTA).length === 1, JSON.stringify(residueBoundaries[3] ?? "")],
+  ["residue/no-reply-new-countdown-still-fails-and-surfaces", residueBoundaries[3]?.status === "failed" && residueErrors.filter((e) => e.message === FRESH_QUOTA).length === 1, JSON.stringify(residueBoundaries[3]?.error?.message ?? "")],
+  ["residue/reply-with-the-new-text-completes", residueBoundaries[4]?.status === "completed" && residueErrors.filter((e) => e.message === FRESH_QUOTA).length === 1, JSON.stringify(residueBoundaries.map((b) => b.status))],
 ];
 
 say("==== error-surfacing report ====");
