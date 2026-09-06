@@ -31,7 +31,7 @@
   --foreground: #14213d;
   --muted-foreground: #284665;
   --readback-foreground: #496784;
-  --subtle-foreground: #57708b;
+  --subtle-foreground: #526a83;
   --accent-foreground: #14213d;
   --secondary-foreground: #1c3856;
   --primary: #1b5a96;
@@ -343,6 +343,12 @@ diffs-container {
 
 .dark [data-sidebar="panel"] [data-sidebar="sidebar"] .hover\:text-sidebar-accent-foreground:hover {
   color: #e3effc;
+}
+
+/* Dark rows hover on --sidebar-accent, so without this they would render
+ * exactly like the selection. Keep hover a step below selected. */
+.dark [data-sidebar="panel"] [data-sidebar="sidebar"] .hover\:bg-sidebar-accent:hover {
+  background-color: #1d344d;
 }
 
 /* Composer hints: clearly secondary, still readable (~3.8:1) in both
