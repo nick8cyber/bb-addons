@@ -39,7 +39,8 @@
  * WHAT the bridge sent.
  */
 import { createInterface } from "node:readline";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const mode = process.env.AGY_FAKE_ERROR_MODE ?? "stderr";
 const conversationId =
@@ -75,7 +76,10 @@ if (recordEnv.length > 0) {
   for (const name of names) {
     snapshot[name] = process.env[name] ?? null;
   }
-  appendFileSync(transcript, `${JSON.stringify({ __env: snapshot })}\n`);
+  appendFileSync(
+    transcript,
+    `${JSON.stringify({ __env: snapshot, __argv: process.argv.slice(2) })}\n`,
+  );
 }
 
 if (mode.startsWith("noinit")) {
@@ -284,6 +288,62 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
             ...scope,
             status: "SUCCESS",
             response: "recovered after quota",
+            num_turns: turns,
+            usage,
+          },
+        });
+      }
+      return;
+    }
+    if (mode === "pool-retry") {
+      // The pool shape: EVERY account refuses its first request (each home
+      // gets one quota hit, marked by a sentinel in that home) and works
+      // afterwards. The bridge must cool the burnt account, rotate to a
+      // sibling home, and — when the fresh conversation finally lands on an
+      // already-punished home — complete. Success also proves the proxy and
+      // HOME env actually followed the account.
+      const sentinel = join(process.env.HOME ?? "/tmp", ".pool-rejected");
+      if (!existsSync(sentinel)) {
+        writeFileSync(sentinel, `${process.pid}\n`);
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "DONE",
+            step_type: "user_input",
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "ERROR",
+            response: "",
+            num_turns: turns,
+            error: QUOTA_SHORT,
+            usage,
+          },
+        });
+        setTimeout(() => process.exit(1), 100);
+      } else {
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "DONE",
+            step_type: "agent_response",
+            text_delta: "pool recovered",
+            usage,
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "SUCCESS",
+            response: "pool recovered",
             num_turns: turns,
             usage,
           },

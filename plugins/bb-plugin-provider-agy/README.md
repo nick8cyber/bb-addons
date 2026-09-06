@@ -347,6 +347,55 @@ and immediate.
 `node harness-errors.mjs` drives all five shapes against `fake-agy-errors.mjs`,
 no account, no network, no quota.
 
+### The account pool: many accounts, each a native agy install
+
+Direct mode ties every turn to the ONE credential in the machine's
+`~/.gemini/antigravity-cli/`. The pool removes that ceiling while keeping
+agy itself the client Google sees — no proxy in the middle, no impersonation
+beyond what the CLI already is. The pool is a directory of complete agy
+homes under the plugin's data dir:
+
+```
+accounts/<label>/.gemini/antigravity-cli/antigravity-oauth-token   the credential
+accounts/<label>/proxy                                             optional egress proxy
+```
+
+Every parallel thread session gets pinned to its own account (least
+recently used among the healthy ones), so its requests, token refreshes and
+installation identity all live in that home — nothing shared, nothing to
+race on (agy REWRITES its token file on refresh, which is exactly why the
+pool is homes and not one swapped file). A `proxy` file next to the home
+(one URL per line worth: `socks5://user:pass@host:port`) gives that account
+its own egress IP via the standard proxy envs.
+
+When a turn fails on a quota whose reset agy names, the burnt account is
+cooled down until the window reopens (recorded in `accounts-state.json`,
+which also remembers which account owns which conversation) and:
+
+- **another healthy account exists** — the turn re-runs on it immediately,
+  on a FRESH conversation (a conversation belongs to the account that made
+  it; `session/replaced` goes out with `contextLost: true`), and the
+  session stays on the new account;
+- **the whole pool is burnt** — the turn re-runs when the earliest window
+  reopens (the quota auto-retry bounds below apply); the conversation
+  resumes.
+
+Accounts come in through `scripts/import-accounts.mjs` (from the opencode
+antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single
+token file) or by logging in directly into a home:
+`HOME=accounts/<label> agy`. New accounts are picked up on the next spawn.
+
+Mode precedence, each level falling back to the next: **pool** (non-empty;
+`AGY_ACCOUNTS=0` skips) → **cliproxy relay** (below; `AGY_CLIPROXY=0`
+skips) → the real HOME, exactly as before the pool existed. Old
+conversations from before the pool still resume: `thread/resume` looks the
+account up in the ledger and falls back when unknown.
+
+`node harness-pool.mjs` proves the whole ride without a network: three
+accounts that each refuse their first request, the rotation across homes
+with the proxy following its account, cooldowns in the ledger, and a sticky
+second turn that reuses the live child.
+
 ### Running through the agent-proxy core (many accounts, many IPs)
 
 Direct mode ties every turn to the ONE credential in the machine's
