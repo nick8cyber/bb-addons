@@ -61,6 +61,20 @@ import {
   parseAgyModelsOutput,
   resolveAgyCommand,
 } from "./agy-cli.js";
+import {
+  accountByLabel,
+  accountsEnabled,
+  listAccounts,
+  loadLedger,
+  markAccountCooldown,
+  markAccountUse,
+  pickAccount,
+  rememberConversation,
+  conversationAccount,
+  saveLedger,
+  type AccountHome,
+  type AccountsLedger,
+} from "./accounts.js";
 
 // ---------------------------------------------------------------------------
 // Wire plumbing. One stdout writer, protocol traffic only — a stray log line
@@ -313,6 +327,19 @@ interface Session {
    * thread clears it.
    */
   autoRetryTimer: NodeJS.Timeout | null;
+  /**
+   * The pool account this session is pinned to, or null when the pool is
+   * empty/disabled and the session runs on the relay home or the real one.
+   * Sticky for the session's lifetime: a conversation belongs to the account
+   * that created it, so only an explicit quota rotation moves it.
+   */
+  accountLabel: string | null;
+  /**
+   * Set when the queued quota retry re-runs on a DIFFERENT account: the
+   * conversation cannot follow, so the wake rebuilds without
+   * `--conversation` and announces the replacement with `contextLost: true`.
+   */
+  retryFreshConversation: boolean;
 }
 
 const sessions = new Map<string, Session>();
@@ -574,24 +601,56 @@ function scheduleQuotaRetry(
   if (resetAtMs === null) {
     return false;
   }
+  // Pool first: cool the burnt account down and, when a sibling is healthy,
+  // rotate to it NOW — sitting out the window is only for a pool with
+  // nothing left. A rotation starts a fresh conversation: the old one
+  // belongs to the burnt account and cannot follow.
+  let switchTo: AccountHome | null = null;
+  if (
+    cliproxyRelayDataDir !== null &&
+    accountsEnabled(process.env) &&
+    session.accountLabel !== null
+  ) {
+    const ledger = loadLedger(cliproxyRelayDataDir);
+    markAccountCooldown(
+      ledger,
+      session.accountLabel,
+      resetAtMs + QUOTA_RETRY_JITTER_MS,
+      message,
+    );
+    const accounts = listAccounts(cliproxyRelayDataDir);
+    const candidate = pickAccount(ledger, accounts, session.accountLabel);
+    if (
+      candidate !== null &&
+      (ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0) <= Date.now()
+    ) {
+      switchTo = candidate;
+    }
+    saveLedger(cliproxyRelayDataDir, ledger);
+  }
   const maxAttempts = quotaRetryMaxAttempts();
-  if (session.autoRetryCount >= maxAttempts) {
+  if (switchTo === null && session.autoRetryCount >= maxAttempts) {
     log(
       `turn ${failedTurn.turnId}: quota retry budget spent (${session.autoRetryCount}/${maxAttempts}); failing`,
     );
     return false;
   }
-  const waitMs = Math.max(
-    resetAtMs + QUOTA_RETRY_JITTER_MS - Date.now(),
-    1_000,
-  );
+  const waitMs =
+    switchTo !== null
+      ? 1_000
+      : Math.max(resetAtMs + QUOTA_RETRY_JITTER_MS - Date.now(), 1_000);
   if (waitMs > quotaRetryMaxWaitMs()) {
     log(
       `turn ${failedTurn.turnId}: quota reopens in ${Math.round(waitMs / 1000)}s, past the ${Math.round(quotaRetryMaxWaitMs() / 1000)}s auto-retry cap; failing`,
     );
     return false;
   }
-  session.autoRetryCount += 1;
+  // The budget counts WINDOW WAITS, not rotations: a rotation is bounded by
+  // the pool itself (each switch cools one account) and should never be
+  // throttled by a counter meant for sitting on one's hands.
+  if (switchTo === null) {
+    session.autoRetryCount += 1;
+  }
   const retryTurn = createTurn({
     prompt: failedTurn.prompt,
     clientRequestId: undefined,
@@ -603,24 +662,31 @@ function scheduleQuotaRetry(
   while (session.turns.length > 0) {
     session.pending.push(session.turns.shift() as Turn);
   }
+  if (switchTo !== null) {
+    session.accountLabel = switchTo.label;
+    session.retryFreshConversation = true;
+  }
   const attempt = session.autoRetryCount;
   session.autoRetryTimer = setTimeout(() => {
-    wakeQuotaRetry(session, attempt, waitMs);
+    wakeQuotaRetry(session, attempt, waitMs, switchTo !== null);
   }, waitMs);
   session.autoRetryTimer.unref();
   log(
-    `turn ${failedTurn.turnId}: quota until ${new Date(resetAtMs).toISOString()}; ` +
-      `retry ${attempt}/${maxAttempts} queued as turn ${retryTurn.turnId} in ${Math.round(waitMs / 1000)}s`,
+    switchTo !== null
+      ? `turn ${failedTurn.turnId}: quota on the session's account; rotating to account ${switchTo.label} in ${Math.round(waitMs / 1000)}s (turn ${retryTurn.turnId}, fresh conversation)`
+      : `turn ${failedTurn.turnId}: quota until ${new Date(resetAtMs).toISOString()}; ` +
+        `retry ${attempt}/${maxAttempts} queued as turn ${retryTurn.turnId} in ${Math.round(waitMs / 1000)}s`,
   );
   return true;
 }
 
-/** The window reopened: rebuild the child on the same conversation and let
- * `drainPending` run the queued retry turn (plus anything queued behind it). */
+/** The window reopened (or a sibling account took over): rebuild the child
+ * and let `drainPending` run the queued retry turn plus anything behind it. */
 function wakeQuotaRetry(
   session: Session,
   attempt: number,
   waitMs: number,
+  freshConversation: boolean,
 ): void {
   session.autoRetryTimer = null;
   // The session may have been stopped, or replaced by a fresh thread/start,
@@ -635,20 +701,23 @@ function wakeQuotaRetry(
     return;
   }
   log(
-    `quota retry ${attempt}: window reopened after ${Math.round(waitMs / 1000)}s; ` +
-      `rebuilding agy for thread ${session.threadId}`,
+    freshConversation
+      ? `quota retry ${attempt}: rotating to account ${session.accountLabel ?? "?"} after ${Math.round(waitMs / 1000)}s; rebuilding agy for thread ${session.threadId} on a fresh conversation`
+      : `quota retry ${attempt}: window reopened after ${Math.round(waitMs / 1000)}s; rebuilding agy for thread ${session.threadId}`,
   );
   notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
     threadId: session.threadId,
     providerThreadId: session.providerThreadId,
-    reason: "the quota window reopened; the turn is being re-run on the resumed conversation",
-    contextLost: false,
+    reason: freshConversation
+      ? "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over"
+      : "the quota window reopened; the turn is being re-run on the resumed conversation",
+    contextLost: freshConversation,
   });
   startChild({
     session,
     model: session.spawnConfig.model,
     reasoningLevel: session.spawnConfig.reasoningLevel,
-    conversationId: session.providerThreadId,
+    conversationId: freshConversation ? undefined : session.providerThreadId,
     envVars: session.spawnConfig.envVars,
   });
 }
@@ -830,6 +899,38 @@ function cliproxyChildEnvOverlay(): Record<string, string> {
   };
 }
 
+/**
+ * The account-pool overlay, and the first word on where a child lives: when
+ * the pool has accounts, every session is pinned to one and runs agy as a
+ * native Antigravity install in that account's own HOME — its own token, its
+ * own installation id, its own egress (`HTTPS_PROXY` from the account's
+ * `proxy` file). Only when the pool yields nothing do the cliproxy relay and
+ * then the real HOME get their turn. `AGY_ACCOUNTS=0` skips the pool.
+ */
+function childEnvOverlay(session: Session): Record<string, string> {
+  if (cliproxyRelayDataDir !== null && accountsEnabled(process.env)) {
+    const accounts = listAccounts(cliproxyRelayDataDir);
+    if (accounts.length > 0) {
+      if (session.accountLabel === null) {
+        const ledger = loadLedger(cliproxyRelayDataDir);
+        session.accountLabel = pickAccount(ledger, accounts)?.label ?? null;
+      }
+      const account = accountByLabel(accounts, session.accountLabel);
+      if (account !== null) {
+        const overlay: Record<string, string> = { HOME: account.home };
+        if (account.proxy !== null) {
+          overlay.HTTPS_PROXY = account.proxy;
+          overlay.https_proxy = account.proxy;
+          overlay.HTTP_PROXY = account.proxy;
+          overlay.http_proxy = account.proxy;
+        }
+        return overlay;
+      }
+    }
+  }
+  return cliproxyChildEnvOverlay();
+}
+
 // ---------------------------------------------------------------------------
 // The agy child
 // ---------------------------------------------------------------------------
@@ -870,14 +971,14 @@ function startChild(args: StartChildArgs): void {
   // (#1366, #1545): this process's env minus the runtime's own markers, plus
   // the session's declared passthrough.
   const env = withoutBridgeRuntimeEnv(process.env);
-  for (const [key, value] of Object.entries(cliproxyChildEnvOverlay())) {
+  for (const [key, value] of Object.entries(childEnvOverlay(session))) {
     env[key] = value;
   }
   for (const [key, value] of Object.entries(args.envVars ?? {})) {
     env[key] = value;
   }
   log(
-    `spawning ${command} ${spawnArgs.map((a) => JSON.stringify(a)).join(" ")} (cwd ${session.cwd})`,
+    `spawning ${command} ${spawnArgs.map((a) => JSON.stringify(a)).join(" ")} (cwd ${session.cwd}, HOME ${env.HOME ?? "<unset>"}${session.accountLabel ? `, account ${session.accountLabel}` : ""})`,
   );
   const child = spawn(command, spawnArgs, {
     cwd: session.cwd,
@@ -1099,6 +1200,12 @@ function adoptIdentity(session: Session, conversationId: string | null): void {
       sessionRestorable: true,
     });
     emitDeltas(session, { kind: "session.reset" });
+  }
+  if (cliproxyRelayDataDir !== null && session.accountLabel !== null) {
+    const ledger = loadLedger(cliproxyRelayDataDir);
+    rememberConversation(ledger, conversationId, session.accountLabel);
+    markAccountUse(ledger, session.accountLabel);
+    saveLedger(cliproxyRelayDataDir, ledger);
   }
   const waiters = session.identityWaiters;
   session.identityWaiters = [];
@@ -1623,8 +1730,24 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
   }
   return new Promise((resolve) => {
     const env = withoutBridgeRuntimeEnv(process.env);
-    for (const [key, value] of Object.entries(cliproxyChildEnvOverlay())) {
-      env[key] = value;
+    // The catalog is account-independent enough; whichever home the pool or
+    // the relay offers first reads it, so a pooled host lists what its own
+    // accounts can actually serve.
+    if (cliproxyRelayDataDir !== null && accountsEnabled(process.env)) {
+      const ledger = loadLedger(cliproxyRelayDataDir);
+      const account = pickAccount(ledger, listAccounts(cliproxyRelayDataDir));
+      if (account !== null) {
+        env.HOME = account.home;
+        if (account.proxy !== null) {
+          env.HTTPS_PROXY = account.proxy;
+          env.https_proxy = account.proxy;
+        }
+      }
+    }
+    if (env.HOME === process.env.HOME) {
+      for (const [key, value] of Object.entries(cliproxyChildEnvOverlay())) {
+        env[key] = value;
+      }
     }
     const child = spawn(resolveAgyCommand(process.env), ["models"], {
       env,
@@ -1750,8 +1873,15 @@ const handlers: Record<string, RequestHandler> = {
       writeGuardrail: false,
       autoRetryCount: 0,
       autoRetryTimer: null,
+      accountLabel: null,
+      retryFreshConversation: false,
     };
     sessions.set(data.threadId, session);
+    if (accountsEnabled(process.env) && cliproxyRelayDataDir !== null) {
+      session.accountLabel =
+        pickAccount(loadLedger(cliproxyRelayDataDir), listAccounts(cliproxyRelayDataDir))?.label ??
+        null;
+    }
     if (data.input !== undefined && data.input.length > 0) {
       // The first turn carries no clientRequestId — only turn/start and
       // turn/steer do — so it emits no turn/input/accepted.
@@ -1822,8 +1952,16 @@ const handlers: Record<string, RequestHandler> = {
       writeGuardrail: false,
       autoRetryCount: 0,
       autoRetryTimer: null,
+      accountLabel: null,
+      retryFreshConversation: false,
     };
     sessions.set(data.threadId, session);
+    if (cliproxyRelayDataDir !== null) {
+      session.accountLabel = conversationAccount(
+        loadLedger(cliproxyRelayDataDir),
+        data.providerThreadId,
+      );
+    }
     startChild({
       session,
       model: data.options.model,
