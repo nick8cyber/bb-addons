@@ -308,9 +308,54 @@ diffs-container {
   color: #10203a;
 }
 
+/* Dark appearance: the cornflower selection above is tuned for the light rail.
+ * Give the same states a dark-appropriate accent so the rail stays in palette
+ * when the app resolves to .dark. */
+.dark [data-sidebar="panel"] [data-sidebar="sidebar"] {
+  --state-hover: #1d344d;
+  --state-active: #294967;
+  --sidebar-accent: #294967;
+}
+
+.dark [data-sidebar="panel"] [data-sidebar="sidebar"] .bg-sidebar-accent,
+.dark [data-sidebar="panel"] [data-sidebar="sidebar"] .bg-state-active {
+  --foreground: #e3effc;
+  --secondary-foreground: #d6e5f3;
+  --muted-foreground: #bfd0e2;
+  --readback-foreground: #91a9c2;
+  --subtle-foreground: #6d87a2;
+  --sidebar-foreground: #e3effc;
+  --sidebar-accent-foreground: #e3effc;
+  color: #e3effc;
+}
+
+.dark [data-sidebar="panel"] [data-sidebar="sidebar"] [data-sidebar="menu-button"][data-active="true"] {
+  background-color: #294967;
+  color: #e3effc;
+  --foreground: #e3effc;
+  --secondary-foreground: #d6e5f3;
+  --muted-foreground: #bfd0e2;
+  --readback-foreground: #91a9c2;
+  --subtle-foreground: #6d87a2;
+  --sidebar-foreground: #e3effc;
+  --sidebar-accent-foreground: #e3effc;
+}
+
+.dark [data-sidebar="panel"] [data-sidebar="sidebar"] .hover\:text-sidebar-accent-foreground:hover {
+  color: #e3effc;
+}
+
+/* Composer hints: clearly secondary, still readable (~3.8:1) in both
+ * appearances. The app dims them to 0.7, which measured 2.86:1. */
+.ProseMirror p.is-empty::before,
+.ProseMirror p.is-editor-empty::before {
+  opacity: 0.85;
+}
+
 /* Handoff opens in the thread-detail side panel. It is not navigation: give
- * it the same calm light canvas and dark text as the main work area. */
-#thread-detail-secondary-panel {
+ * it the same calm light canvas and dark text as the main work area. The
+ * light canvas is a light-appearance choice; dark keeps its own tokens. */
+:root:not(.dark) #thread-detail-secondary-panel {
   --sidebar: #f4f8fc;
   --sidebar-foreground: #14213d;
   --sidebar-accent: #d7e7f6;
