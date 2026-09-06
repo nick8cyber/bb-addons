@@ -1,9 +1,11 @@
 /**
  * Proves error text reaches the thread through every channel agy can carry
  * it — a failed tool step, a stderr banner, a turn-less ERROR result at
- * session start, and (residue) agy re-attaching a conversation's earlier
- * frozen quota rejection to later turns that actually answer — at no quota
- * cost. Five threads, five shapes (see fake-agy-errors.mjs).
+ * session start, (residue) agy re-attaching a conversation's earlier
+ * frozen quota rejection to later turns that actually answer, and
+ * (reject-then-exit) a genuine immediate reject whose ERROR result is
+ * followed by the child exiting 1 without a raw exit banner added — at no
+ * quota cost. Six threads, six shapes (see fake-agy-errors.mjs).
  *
  * Usage: node harness-errors.mjs
  */
@@ -138,6 +140,14 @@ await turn(residue.threadId, "four", 4);
 await turn(residue.threadId, "five", 5);
 stop(residue.threadId);
 
+// reject-then-exit mode: the genuine immediate reject on a fresh child, where
+// the child exits 1 right after its ERROR result -- the parsed quota text must
+// be the only banner; the raw "agy exited" must not be layered on top of it.
+const rejectExit = await start("reject-then-exit");
+await turn(rejectExit.threadId, "one", 1);
+await sleep(300);
+stop(rejectExit.threadId);
+
 bridge.onClose?.();
 process.stdout.write = originalWrite;
 
@@ -145,6 +155,8 @@ const toolErrors = errors(tool.threadId);
 const stderrErrors = errors(stderr.threadId);
 const residueErrors = errors(residue.threadId);
 const residueBoundaries = completed(residue.threadId);
+const rejectErrors = errors(rejectExit.threadId);
+const rejectBoundaries = completed(rejectExit.threadId);
 
 const checks = [
   ["tool/step-error-reaches-thread", toolErrors.length === 2 && toolErrors.every((e) => e.message === QUOTA), JSON.stringify(toolErrors.map((e) => e.message)).slice(0, 120)],
@@ -166,6 +178,9 @@ const checks = [
   ["residue/its-first-turn-still-failed", residueBoundaries[0]?.status === "failed", JSON.stringify(residueBoundaries[0]?.status ?? "")],
   ["residue/no-reply-new-countdown-still-fails-and-surfaces", residueBoundaries[3]?.status === "failed" && residueErrors.filter((e) => e.message === FRESH_QUOTA).length === 1, JSON.stringify(residueBoundaries[3]?.error?.message ?? "")],
   ["residue/reply-with-the-new-text-completes", residueBoundaries[4]?.status === "completed" && residueErrors.filter((e) => e.message === FRESH_QUOTA).length === 1, JSON.stringify(residueBoundaries.map((b) => b.status))],
+  ["reject-exit/parsed-quota-surfaced-once", rejectErrors.filter((e) => e.message === QUOTA).length === 1, JSON.stringify(rejectErrors.map((e) => e.message))],
+  ["reject-exit/turn-failed-with-the-quota-text", rejectBoundaries[0]?.status === "failed" && rejectBoundaries[0]?.error?.message === QUOTA, JSON.stringify(rejectBoundaries[0] ?? "")],
+  ["reject-exit/raw-exit-banner-suppressed", rejectErrors.filter((e) => e.message.includes("exited")).length === 0, JSON.stringify(rejectErrors.map((e) => e.message))],
 ];
 
 say("==== error-surfacing report ====");
