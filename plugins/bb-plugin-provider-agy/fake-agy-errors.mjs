@@ -16,12 +16,13 @@
  *   noinit-error-null-status  the same, with `status` absent entirely — the
  *            shape the bridge used to drop as noise
  *   residue  the agy 1.1.27 quota-residue defect, reproduced live on real
- *            conversation 44069b14: turn 1 is the genuine quota hit (ERROR
- *            result, no answer); turns 2-3 then answer normally yet get the
- *            SAME verbatim error re-attached; turn 4 answers normally and gets
- *            a DIFFERENT verbatim error — the bridge must surface the first
- *            error once, settle the residue turns completed, and surface turn
- *            4's new text like the fresh failure it is
+ *            conversation 44069b14: turn 1 is the genuine quota hit (failed
+ *            tool call, NO reply, ERROR result); turns 2-3 then answer yet get
+ *            the SAME verbatim error re-attached — the reply completed, so the
+ *            bridge must complete them and NOT show the banner again; turn 4
+ *            has no reply and a DIFFERENT new countdown and must fail with the
+ *            new text surfaced; turn 5 answers and carries that same new text
+ *            and must complete (a completed reply makes the error baggage)
  *
  * Every stdin line is echoed to AGY_FAKE_TRANSCRIPT so the harness can prove
  * WHAT the bridge sent.
@@ -121,22 +122,28 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       }
     }
     if (mode === "residue") {
-      // Turn 1 is the genuine quota hit: a failed tool call, no answer, and
-      // the ERROR result that ends it. Turns 2-3 answer normally but agy
-      // re-attaches the SAME frozen text to their result; turn 4 answers
-      // normally and carries a DIFFERENT frozen text.
-      if (turns === 1) {
-        out({
-          event: "step_update",
-          step_update: {
-            ...scope,
-            step_index: step++,
-            state: "ERROR",
-            step_type: "tool",
-            tool_name: "write_to_file",
-            tool_info: { name: "write_to_file", error: { message: QUOTA } },
-          },
-        });
+      // Turn 1 is the genuine quota hit: a failed tool call, NO reply, and
+      // the ERROR result that ends it. Turns 2-3 answer yet agy re-attaches
+      // the SAME frozen text to their result — the reply completed, so the
+      // bridge completes them and does not re-show the banner. Turn 4 has no
+      // reply and a DIFFERENT countdown: a genuinely dead turn that must fail
+      // and surface the new text. Turn 5 answers and carries that same new
+      // text: a completed reply makes it baggage too.
+      const fresh = turns === 4 || turns === 5;
+      if (turns === 1 || turns === 4) {
+        if (turns === 1) {
+          out({
+            event: "step_update",
+            step_update: {
+              ...scope,
+              step_index: step++,
+              state: "ERROR",
+              step_type: "tool",
+              tool_name: "write_to_file",
+              tool_info: { name: "write_to_file", error: { message: QUOTA } },
+            },
+          });
+        }
         out({
           event: "result",
           result: {
@@ -144,7 +151,7 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
             status: "ERROR",
             response: "",
             num_turns: turns,
-            error: QUOTA,
+            error: fresh ? FRESH_QUOTA : QUOTA,
             usage,
           },
         });
@@ -167,7 +174,7 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
             status: "ERROR",
             response: `answered ${turns}`,
             num_turns: turns,
-            error: turns === 4 ? FRESH_QUOTA : QUOTA,
+            error: fresh ? FRESH_QUOTA : QUOTA,
             usage,
           },
         });

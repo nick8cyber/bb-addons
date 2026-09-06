@@ -283,20 +283,19 @@ error — frozen `Resets in X` and all — to the result of every later turn in
 that conversation, even when the model just answered normally. Reproduced live
 on real conversation `44069b14-fdd2-4404-bf99-08a1825cbceb`: its genuine
 `Resets in 1h13m29s.` text from 18:36 kept showing up verbatim at 21:56 and
-22:18, after the window had long since opened.
+22:18, after the window had long since opened — and `bb.db` shows that even the
+conversation's very first reject (18:32) landed only after several completed
+assistant items had streamed.
 
-The fingerprint is a byte-identical error text the session already surfaced
-(`seenErrors`) plus an agent response that actually streamed on this turn.
+The discriminator is the reply, not the text: a turn whose `agent_response`
+step ran to `DONE` with text streamed real content, so an `ERROR` result on top
+of it is agy talking about the conversation's history, not about this turn.
 Such a result settles **completed** on the content that streamed, and the stale
-banner is not shown again — the reader was told once, on the turn that really
-hit the limit. A *different* countdown or a different message is not a replay
-and still fails the turn with its text surfaced.
-
-The fingerprint lives on the in-memory session, so a conversation that is
-resumed as a brand-new session (thread stopped and restarted after a bridge
-reload) can fail once on its first answering turn before recovering on the
-next — the reader sees the stale banner exactly one more time there, not on
-every later turn.
+banner is not shown again. A turn whose reply never completed still fails
+honestly, new countdown or not — proving them apart uses only what this turn
+streamed, so the rule is stable across sessions, plugins reloads and reboots:
+there is no first-turn-replays-once edge case, and recovery is unconditional
+and immediate.
 
 `node harness-errors.mjs` drives all five shapes against `fake-agy-errors.mjs`,
 no account, no network, no quota.
@@ -449,10 +448,10 @@ An existing thread keeps the bridge build its own worker process was started
 with, so the fix reaches a running thread only after that session restarts.
 
 `node harness-errors.mjs` proves the error paths with no account and no quota —
-18/18: a failed tool step inside a turn that then completes reaches the thread
+19/19: a failed tool step inside a turn that then completes reaches the thread
 exactly once per turn with its `rate-limit` category, the ⚠ banner on stderr
 reaches the thread while a `warning:` line beside it does not, a turn-less
 `ERROR` result — with either an explicit or a missing `status` — fails the
 session with the message named, and the quota-residue replay settles answering
-turns completed after the genuine hit was surfaced once while a different
+turns completed on the reply that streamed while a no-reply turn with a fresh
 countdown still fails and surfaces.

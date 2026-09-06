@@ -221,6 +221,15 @@ interface Turn {
    * answered is agy talking about one rejected tool call, not about the turn.
    */
   producedText: boolean;
+  /**
+   * The turn's agent_response step ran to DONE with text on the wire. A
+   * `result` whose status is ERROR on top of a completed reply is agy's
+   * conversation-level baggage (the quota-rejection text it re-attaches to
+   * every later turn, reproduced live on conversation 44069b14), not a dead
+   * turn: the content actually streamed, so the turn settles completed on it.
+   * A turn whose reply never completed still fails honestly.
+   */
+  responseCompleted: boolean;
 }
 
 /** What a child was spawned with, kept so a dead one can be rebuilt. */
@@ -267,18 +276,6 @@ interface Session {
    * `turn.open` so a genuinely new occurrence on a later turn still shows.
    */
   lastReportedError: string | null;
-  /**
-   * Every error text this conversation has surfaced across turns (not just the
-   * last one). agy 1.1.27 glues a conversation's earlier quota rejection --
-   * frozen countdown and all -- onto the result of every later turn that
-   * actually answers (reproduced live on conversation 44069b14: its real
-   * 1h13m29s quota text replayed hours later over a "pong" that was answered
-   * normally). Byte-identical re-arrival plus a completed agent response is
-   * that defect's fingerprint, and settling those turns as completed instead
-   * of failing them again is what lets a thread keep working after its quota
-   * reset without re-showing the stale banner.
-   */
-  seenErrors: Set<string>;
   /**
    * Set once this conversation has produced an artifact-shaped
    * `write_to_file`; every later turn then carries WRITE_GUARDRAIL so the
@@ -395,7 +392,6 @@ function reportError(
     return;
   }
   session.lastReportedError = text;
-  session.seenErrors.add(text);
   const category = classifyError(text);
   log(
     `reporting error from ${source} for thread ${session.threadId}: ${text}`,
@@ -754,6 +750,9 @@ function handleStepUpdate(
     });
   }
   if (event.state === "DONE") {
+    if (turn.producedText) {
+      turn.responseCompleted = true;
+    }
     emitDeltas(session, {
       kind: "item.close",
       providerTurnId: turn.turnId,
@@ -936,19 +935,18 @@ function handleResult(
   // agy 1.1.27 defect: once a conversation has been rejected for quota, the
   // CLI re-attaches THAT verbatim error -- frozen "Resets in X" and all -- to
   // the result of every later turn in the same conversation, even when the
-  // model just answered normally (reproduced live on conversation 44069b14:
-  // its real 1h13m29s quota text replayed over a "pong" that answered fine
-  // hours after the window opened). The fingerprint is a byte-identical error
-  // text the session already surfaced PLUS an agent response that actually
-  // streamed on this turn. Trusting the streamed content keeps the thread
-  // alive after the quota resets; the reader was already told on the turn
-  // that really hit the limit. A new occurrence (a different countdown, a
-  // different message) is not in seenErrors and still fails the turn
-  // honestly.
+  // model just answered (reproduced live on conversation 44069b14: its real
+  // 1h13m29s quota text replayed over a "pong" that answered fine hours after
+  // the window opened; the db shows the very first reject in that
+  // conversation also landed only after several completed assistant items).
+  // The discriminator is not the text but the reply: a turn whose agent
+  // response ran to DONE streamed real content, and an ERROR result on top of
+  // it is conversation baggage. Settling it completed on that content keeps
+  // the thread alive; the model actually said its piece. A turn whose reply
+  // never completed still fails honestly, new text or not.
   const staleResidue =
     event.error !== null &&
-    turn.producedText &&
-    session.seenErrors.has(event.error) &&
+    turn.responseCompleted &&
     !turn.toolErrors.has(event.error) &&
     !isArtifactPathRefusal(event.error);
   const recovered =
@@ -965,8 +963,8 @@ function handleResult(
     (isArtifactPathRefusal(event.error) &&
       turn.producedText &&
       turn.artifactRetries > 0) ||
-    // An ERROR result whose error is a byte-identical copy of one already
-    // surfaced for this conversation, with fresh content on this turn.
+    // An ERROR result on top of a completed agent response: the reply
+    // streamed, the error is agy's conversation baggage.
     staleResidue;
   const failed =
     event.status !== null && event.status !== "SUCCESS" && !recovered;
@@ -983,9 +981,9 @@ function handleResult(
   if (recovered) {
     log(
       staleResidue
-        ? `turn ${turn.turnId}: agy re-attached a quota error already surfaced ` +
-            `for this conversation (${event.error ?? ""}); settling the turn as ` +
-            `completed on the response that actually streamed`
+        ? `turn ${turn.turnId}: agy tagged a completed reply's result as ` +
+            `ERROR (${event.error ?? ""}); settling it as completed on the ` +
+            `content that streamed`
         : `turn ${turn.turnId}: agy reported a recovered tool error as the turn's ` +
           `status; settling it as completed (${event.error ?? ""})`,
     );
@@ -1014,7 +1012,6 @@ function handleResult(
     const alreadyShown = message === session.lastReportedError;
     if (!alreadyShown) {
       session.lastReportedError = message;
-      session.seenErrors.add(message);
       emitDeltas(session, {
         kind: "provider.error",
         providerTurnId: turn.turnId,
@@ -1155,6 +1152,7 @@ function createTurn(args: {
     toolRecovered: false,
     artifactRetries: 0,
     producedText: false,
+    responseCompleted: false,
   };
 }
 
@@ -1290,7 +1288,6 @@ const handlers: Record<string, RequestHandler> = {
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,
-      seenErrors: new Set(),
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
@@ -1359,7 +1356,6 @@ const handlers: Record<string, RequestHandler> = {
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,
-      seenErrors: new Set(),
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
