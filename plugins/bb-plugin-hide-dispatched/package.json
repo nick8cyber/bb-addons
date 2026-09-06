@@ -1,0 +1,33 @@
+{
+  "name": "bb-plugin-hide-dispatched",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Автоматически прячет из сайдбара треды, порождённые раздачей задач (bb tasks dispatch), переводя их в visibility: hidden.",
+  "scripts": {
+    "build": "npm run typecheck",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "bb": ">=0.39",
+    "bbPluginSdk": ">=0.4.8"
+  },
+  "bb": {
+    "name": "Hide Dispatched",
+    "description": "Автоматически прячет из сайдбара треды, порождённые раздачей задач (bb tasks dispatch), переводя их в visibility: hidden.",
+    "branding": {
+      "icon": "EyeOff"
+    },
+    "server": "./server.ts"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.8",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.2.18",
+    "better-sqlite3": "^12.11.1",
+    "hono": "^4.13.7",
+    "react": "^19.2.8",
+    "typescript": "^5.7.0",
+    "zod": "^4.5.4"
+  }
+}
