@@ -191,7 +191,11 @@ export function writeAccountHome(
   refreshToken: string,
   accessToken = "",
 ): string {
-  if (!/^[A-Za-z0-9._@+-]+$/u.test(label)) {
+  if (
+    !/^[A-Za-z0-9._@+-]+$/u.test(label) ||
+    label === "." ||
+    label === ".."
+  ) {
     throw new Error(`unsafe account label: ${label}`);
   }
   const home = join(accountsDir(dataDir), label);
