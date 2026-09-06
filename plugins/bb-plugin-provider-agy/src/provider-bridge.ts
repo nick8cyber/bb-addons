@@ -286,6 +286,13 @@ interface Session {
    */
   lastTurnFailed: boolean;
   /**
+   * Whether the thread currently shows agy's quota as blocked via
+   * `provider/rateLimits/updated`. Cleared by a later turn settling
+   * completed, so the reader sees the window reopen instead of a stale
+   * block that never goes away.
+   */
+  rateLimitsBlocked: boolean;
+  /**
    * Set once this conversation has produced an artifact-shaped
    * `write_to_file`; every later turn then carries WRITE_GUARDRAIL so the
    * model does not repeat it. Off by default: a session that never hit the
@@ -370,6 +377,128 @@ function classifyError(message: string):
   return undefined;
 }
 
+/** The HTTP code bb's native `errorInfo` can hang on a classified message. */
+function httpStatusCodeFor(
+  category: ReturnType<typeof classifyError>,
+): number | null {
+  switch (category) {
+    case "rate-limit":
+      return 429;
+    case "unauthorized":
+      return 401;
+    case "billing":
+      return 402;
+    case "overloaded":
+      return 503;
+    default:
+      return null;
+  }
+}
+
+/** The native `errorInfo` a provider.error should carry, when it can. */
+function nativeErrorInfo(
+  message: string,
+): Extract<ThreadDelta, { kind: "provider.error" }>["errorInfo"] {
+  const category = classifyError(message);
+  if (category === undefined) {
+    return undefined;
+  }
+  return {
+    category,
+    providerCode: null,
+    httpStatusCode: httpStatusCodeFor(category),
+  };
+}
+
+/**
+ * agy's quota messages say when the window reopens: "Resets in 1h13m29s.",
+ * "Resets in 47m42s.", "Resets in 8m11s.". bb's native rate-limit snapshot
+ * takes that as a clock time.
+ */
+const RESETS_IN = /resets? in (?:(\d+)h)?(?:(\d+)m)?(\d+)s?\b/iu;
+
+function quotaResetAtMs(message: string): number | null {
+  const m = RESETS_IN.exec(message);
+  if (m === null) {
+    return null;
+  }
+  const h = m[1] === undefined ? 0 : Number(m[1]);
+  const min = m[2] === undefined ? 0 : Number(m[2]);
+  const s = Number(m[3]);
+  if (h === 0 && min === 0 && s === 0) {
+    return null;
+  }
+  return Date.now() + (h * 3600 + min * 60 + s) * 1000;
+}
+
+/**
+ * Tell bb natively that agy's quota is spent. The runtime stores
+ * `provider/rateLimits/updated` as thread state (latest snapshot wins) —
+ * that is what makes the provider read as "blocked by a subscription window
+ * until T" instead of just carrying an error string with nothing to key off.
+ * The blocked label is cleared (see clearRateLimit) once a turn plainly
+ * succeeds again.
+ */
+function emitRateLimitBlocked(session: Session, message: string): void {
+  session.rateLimitsBlocked = true;
+  emitDeltas(session, {
+    kind: "provider.rateLimits",
+    rateLimits: {
+      providerId: "agy",
+      status: "blocked",
+      kind: "subscription-window",
+      windows: [
+        {
+          providerKey: null,
+          label: "Gemini individual quota",
+          status: "blocked",
+          resetsAtMs: quotaResetAtMs(message),
+        },
+      ],
+      reachedReason: message,
+      overageStatus: null,
+      overageReason: null,
+    },
+  });
+}
+
+/** Clear the blocked snapshot once the account is plainly working again. */
+function clearRateLimit(session: Session): void {
+  if (!session.rateLimitsBlocked) {
+    return;
+  }
+  session.rateLimitsBlocked = false;
+  emitDeltas(session, {
+    kind: "provider.rateLimits",
+    rateLimits: {
+      providerId: "agy",
+      status: "allowed",
+      kind: "subscription-window",
+      windows: [
+        {
+          providerKey: null,
+          label: "Gemini individual quota",
+          status: "allowed",
+          resetsAtMs: null,
+        },
+      ],
+      reachedReason: null,
+      overageStatus: null,
+      overageReason: null,
+    },
+  });
+}
+
+/** Surface classification only after identity; nothing pre-identity may go out. */
+function maybeEmitRateLimitBlocked(session: Session, message: string): void {
+  if (session.providerThreadId === null || !session.identityAnnounced) {
+    return;
+  }
+  if (classifyError(message) === "rate-limit") {
+    emitRateLimitBlocked(session, message);
+  }
+}
+
 function reportError(
   session: Session,
   message: string,
@@ -413,9 +542,14 @@ function reportError(
       ? {}
       : {
           category,
-          errorInfo: { category, providerCode: null, httpStatusCode: null },
+          errorInfo: {
+            category,
+            providerCode: null,
+            httpStatusCode: httpStatusCodeFor(category),
+          },
         }),
   });
+  maybeEmitRateLimitBlocked(session, text);
 }
 
 function promptText(input: readonly PromptInput[]): string {
@@ -599,8 +733,12 @@ function failSession(
       kind: "provider.error",
       message,
       threadScoped: true,
+      ...(nativeErrorInfo(message) === undefined
+        ? {}
+        : { errorInfo: nativeErrorInfo(message) }),
     });
   }
+  maybeEmitRateLimitBlocked(session, message);
   const turns = [...session.turns, ...session.pending];
   session.turns = [];
   session.pending = [];
@@ -1041,8 +1179,12 @@ function handleResult(
         providerTurnId: turn.turnId,
         message,
         settlesTurn: false,
+        ...(nativeErrorInfo(message) === undefined
+          ? {}
+          : { errorInfo: nativeErrorInfo(message) }),
       });
     }
+    maybeEmitRateLimitBlocked(session, message);
     emitDeltas(session, {
       kind: "turn.boundary",
       providerTurnId: turn.turnId,
@@ -1057,6 +1199,7 @@ function handleResult(
       status: "completed",
     });
     session.lastTurnFailed = false;
+    clearRateLimit(session);
   }
   // The next queued turn is now the live one: it is announced and only now
   // handed to agy, so a queued turn (a steer, or a second turn/start) cannot
@@ -1316,6 +1459,7 @@ const handlers: Record<string, RequestHandler> = {
       lastStderr: null,
       lastReportedError: null,
       lastTurnFailed: false,
+      rateLimitsBlocked: false,
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
@@ -1385,6 +1529,7 @@ const handlers: Record<string, RequestHandler> = {
       lastStderr: null,
       lastReportedError: null,
       lastTurnFailed: false,
+      rateLimitsBlocked: false,
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);

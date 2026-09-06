@@ -96,7 +96,7 @@ provider is configured and not only here.
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
-| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay, the immediate reject whose exit 1 must not add a raw banner |
+| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay, the immediate reject whose exit 1 must not add a raw banner, and the native `provider/rateLimits/updated` blocked→allowed snapshot |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
 
@@ -276,6 +276,22 @@ The `⚠ Individual quota reached. … Resets in 8m11s.` notice arrives with its
 message reaching the thread on two channels within one turn is reported once
 (per-turn dedup); the next turn is free to report it again.
 
+A period of blocked quota is reported to bb NESTATIVELY, not just as error
+text. When the classified message carries the reset window — `Resets in
+1h13m29s.`, `Resets in 47m42s.`, `Resets in 8m11s.` — the bridge opens the
+`provider/rateLimits/updated` snapshot on the thread: `blocked`,
+`subscription-window`, `windows[0].resetsAtMs` set to the clock time the
+window reopens, and the quota text as `reachedReason`. The same failure's
+`provider.error` then carries `errorInfo: { category: "rate-limit",
+providerCode: null, httpStatusCode: 429 }`. When a later turn settles
+completed after that block (the window reopened, the child rebuilt, the
+account is plainly working again), the snapshot clears to `allowed` — a stale
+blocked state would otherwise stick to the thread forever. Note this is
+visibility, not retry: the bridge has no access to the provider's rate-limit
+state model, and this plugin ships no `provider-retry` behavior, so the
+reader seeing `blocked until T` is exactly what the thread gets; a retry only
+happens when someone resumes the thread after the window opens.
+
 ### The quota-residue replay (agy 1.1.27)
 
 Once a conversation has been rejected for quota, agy re-attaches THAT verbatim
@@ -448,7 +464,7 @@ An existing thread keeps the bridge build its own worker process was started
 with, so the fix reaches a running thread only after that session restarts.
 
 `node harness-errors.mjs` proves the error paths with no account and no quota —
-22/22: a failed tool step inside a turn that then completes reaches the thread
+25/25: a failed tool step inside a turn that then completes reaches the thread
 exactly once per turn with its `rate-limit` category, the ⚠ banner on stderr
 reaches the thread while a `warning:` line beside it does not, a turn-less
 `ERROR` result — with either an explicit or a missing `status` — fails the
@@ -456,4 +472,8 @@ session with the message named, the quota-residue replay settles answering
 turns completed on the reply that streamed while a no-reply turn with a fresh
 countdown still fails and surfaces, and a genuine immediate reject whose child
 then exits 1 surfaces only the parsed quota text — the raw `agy exited`
-banner is suppressed because the ERROR result already explained the exit.
+banner is suppressed because the ERROR result already explained the exit. It
+ends with the native rate-limit shape: the reject's `provider.error` carries
+`errorInfo` `httpStatusCode 429`, a `provider/rateLimits/updated` snapshot
+opens `blocked` with `resetsAtMs` set from the `Resets in 8m11s.` countdown,
+and a follow-up turn on a rebuilt child clears it to `allowed`.

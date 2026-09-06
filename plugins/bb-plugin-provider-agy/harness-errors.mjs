@@ -68,6 +68,8 @@ const errors = (threadId) =>
   deltas(threadId).filter((delta) => delta.kind === "provider.error");
 const completed = (threadId) =>
   deltas(threadId).filter((delta) => delta.kind === "turn.boundary");
+const rateLimits = (threadId) =>
+  deltas(threadId).filter((delta) => delta.kind === "provider.rateLimits");
 
 async function waitFor(predicate, ms, label) {
   const deadline = Date.now() + ms;
@@ -143,9 +145,15 @@ stop(residue.threadId);
 // reject-then-exit mode: the genuine immediate reject on a fresh child, where
 // the child exits 1 right after its ERROR result -- the parsed quota text must
 // be the only banner; the raw "agy exited" must not be layered on top of it.
+// It also proves the native rate-limit snapshot: blocked with the "Resets in
+// 8m11s." window opened onto the clock, then cleared once the account is
+// plain old working again (the rebuild child answers a fresh turn).
 const rejectExit = await start("reject-then-exit");
 await turn(rejectExit.threadId, "one", 1);
 await sleep(300);
+process.env.AGY_FAKE_ERROR_MODE = "succeed";
+await turn(rejectExit.threadId, "two", 2);
+await sleep(200);
 stop(rejectExit.threadId);
 
 bridge.onClose?.();
@@ -157,6 +165,8 @@ const residueErrors = errors(residue.threadId);
 const residueBoundaries = completed(residue.threadId);
 const rejectErrors = errors(rejectExit.threadId);
 const rejectBoundaries = completed(rejectExit.threadId);
+const rejectLimits = rateLimits(rejectExit.threadId);
+const resetAt = rejectLimits[0]?.rateLimits?.windows?.[0]?.resetsAtMs ?? null;
 
 const checks = [
   ["tool/step-error-reaches-thread", toolErrors.length === 2 && toolErrors.every((e) => e.message === QUOTA), JSON.stringify(toolErrors.map((e) => e.message)).slice(0, 120)],
@@ -181,6 +191,9 @@ const checks = [
   ["reject-exit/parsed-quota-surfaced-once", rejectErrors.filter((e) => e.message === QUOTA).length === 1, JSON.stringify(rejectErrors.map((e) => e.message))],
   ["reject-exit/turn-failed-with-the-quota-text", rejectBoundaries[0]?.status === "failed" && rejectBoundaries[0]?.error?.message === QUOTA, JSON.stringify(rejectBoundaries[0] ?? "")],
   ["reject-exit/raw-exit-banner-suppressed", rejectErrors.filter((e) => e.message.includes("exited")).length === 0, JSON.stringify(rejectErrors.map((e) => e.message))],
+  ["reject-exit/native-error-coded-429", rejectErrors.length === 1 && rejectErrors[0]?.errorInfo?.category === "rate-limit" && rejectErrors[0]?.errorInfo?.httpStatusCode === 429 && rejectErrors[0]?.errorInfo?.providerCode === null, JSON.stringify(rejectErrors[0]?.errorInfo ?? "")],
+  ["reject-exit/blocked-snapshot-with-reset-time", rejectLimits.length === 2 && rejectLimits[0]?.rateLimits?.status === "blocked" && rejectLimits[0]?.rateLimits?.kind === "subscription-window" && rejectLimits[0]?.rateLimits?.reachedReason === QUOTA && resetAt !== null && resetAt > Date.now() - 60_000 && resetAt < Date.now() + 9 * 60_000, JSON.stringify(rejectLimits[0]?.rateLimits ?? "")],
+  ["reject-exit/allowed-after-recovery", rejectLimits.length === 2 && rejectLimits[1]?.rateLimits?.status === "allowed" && rejectBoundaries[1]?.status === "completed", JSON.stringify(rejectLimits.map((r) => r?.rateLimits?.status))],
 ];
 
 say("==== error-surfacing report ====");
