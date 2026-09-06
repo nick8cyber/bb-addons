@@ -286,11 +286,42 @@ window reopens, and the quota text as `reachedReason`. The same failure's
 providerCode: null, httpStatusCode: 429 }`. When a later turn settles
 completed after that block (the window reopened, the child rebuilt, the
 account is plainly working again), the snapshot clears to `allowed` — a stale
-blocked state would otherwise stick to the thread forever. Note this is
-visibility, not retry: the bridge has no access to the provider's rate-limit
-state model, and this plugin ships no `provider-retry` behavior, so the
-reader seeing `blocked until T` is exactly what the thread gets; a retry only
-happens when someone resumes the thread after the window opens.
+blocked state would otherwise stick to the thread forever.
+
+### The quota auto-retry
+
+Visibility alone still left the thread dead until a human typed again after
+the window opened. The bridge now re-runs the turn itself: when a turn fails
+on a rate-limit whose reset is parsed and near enough, the failure settles
+honestly (the reader keeps the quota text and the blocked snapshot), and a
+retry turn carrying the SAME prompt is queued behind a timer set to the reset
+plus a 5s grace. When the window reopens, the child is rebuilt against the
+same conversation — the standard rebuild path, `session/replaced` +
+`thread/identity` + `session.reset` — and the retry turn re-runs on it as an
+ordinary first-turn-shaped turn (no `input/accepted`: the original input was
+accepted once, on the turn that failed). From there everything is normal:
+the retry streams, settles, and its completion clears the blocked snapshot.
+
+Bounds, so a burnt window cannot hold a thread hostage:
+
+- **Wait cap** — a reset further out than 55 minutes (`AGY_AUTO_RETRY_MAX_WAIT_MS`)
+  just fails, the old way.
+- **Budget** — 2 retries per session (`AGY_AUTO_RETRY_MAX`); `0` disables the
+  feature entirely. The budget resets when a turn plainly completes.
+- Turns already queued behind the failed one ride the same closed window:
+  they move behind the retry and run, in order, on the rebuilt child. A turn
+  sent while the timer sleeps queues the same way — no child is ever spawned
+  into a window that is still shut.
+- Stopping the thread cancels the pending retry; a session failure
+  (unparseable child death, spawn error) beats the retry and settles
+  everything failed; a stale wake whose session was replaced in the meantime
+  owns nothing.
+
+`harness-errors.mjs` covers both directions: `quota-retry` (a 2s-window
+reject whose queued re-run completes on the rebuilt child: one error row,
+`session/replaced` before the spawn, blocked-then-allowed, no raw exit
+banner) and `quota-retry-always` (every child refuses, so the budget runs
+out and the second attempt fails honestly, with exactly one retry run).
 
 ### The quota-residue replay (agy 1.1.27)
 

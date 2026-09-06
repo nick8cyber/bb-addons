@@ -299,6 +299,20 @@ interface Session {
    * bug pays nothing and is never told about a field it was not using.
    */
   writeGuardrail: boolean;
+  /**
+   * How many quota auto-retries this session has already run. Reset when a
+   * turn plainly completes, so one burnt window does not spend the budget of
+   * the next one.
+   */
+  autoRetryCount: number;
+  /**
+   * The pending quota-retry timer, while one is scheduled. While it is set
+   * the failed turn is already settled, a retry turn waits in `pending`, and
+   * the session is between children: no raw exit banner may fire, no new
+   * turn may spawn a child into the still-dead window, and stopping the
+   * thread clears it.
+   */
+  autoRetryTimer: NodeJS.Timeout | null;
 }
 
 const sessions = new Map<string, Session>();
@@ -499,6 +513,146 @@ function maybeEmitRateLimitBlocked(session: Session, message: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Quota auto-retry
+// ---------------------------------------------------------------------------
+
+/** Land this long after the stated reset, so the reopened window is real. */
+const QUOTA_RETRY_JITTER_MS = 5_000;
+/**
+ * agy's individual window runs about 50 minutes ("Resets in 49m10s"); a wait
+ * past this cap fails the turn the old way instead of holding the thread for
+ * a window nobody asked to sit through. `AGY_AUTO_RETRY_MAX_WAIT_MS` overrides.
+ */
+const DEFAULT_QUOTA_RETRY_MAX_WAIT_MS = 3_300_000;
+/** Retries per session (not per turn); `AGY_AUTO_RETRY_MAX` overrides. */
+const DEFAULT_QUOTA_RETRY_MAX = 2;
+
+function quotaRetryMaxAttempts(): number {
+  const raw = Number(process.env.AGY_AUTO_RETRY_MAX);
+  return Number.isFinite(raw) && raw >= 0
+    ? Math.floor(raw)
+    : DEFAULT_QUOTA_RETRY_MAX;
+}
+
+function quotaRetryMaxWaitMs(): number {
+  const raw = Number(process.env.AGY_AUTO_RETRY_MAX_WAIT_MS);
+  return Number.isFinite(raw) && raw > 0
+    ? raw
+    : DEFAULT_QUOTA_RETRY_MAX_WAIT_MS;
+}
+
+function clearQuotaRetryTimer(session: Session): void {
+  if (session.autoRetryTimer !== null) {
+    clearTimeout(session.autoRetryTimer);
+    session.autoRetryTimer = null;
+  }
+}
+
+/**
+ * A dead quota does not have to end the thread's work. When agy names the
+ * minute the window reopens and that minute is close enough, a retry turn
+ * carrying the same prompt is queued behind a timer. Call this after the
+ * failed turn has been settled: the reader keeps the honest failure (the
+ * quota text and the blocked snapshot), and the retry runs later as its own
+ * turn. When the timer fires, the child is rebuilt against the same
+ * conversation — the standard rebuild path — and the retry turn re-runs on
+ * it as an ordinary first-turn-shaped turn (no input/accepted: the original
+ * input was accepted once, on the turn that failed).
+ *
+ * Returns true when the retry was queued.
+ */
+function scheduleQuotaRetry(
+  session: Session,
+  failedTurn: Turn,
+  message: string,
+): boolean {
+  if (classifyError(message) !== "rate-limit") {
+    return false;
+  }
+  const resetAtMs = quotaResetAtMs(message);
+  if (resetAtMs === null) {
+    return false;
+  }
+  const maxAttempts = quotaRetryMaxAttempts();
+  if (session.autoRetryCount >= maxAttempts) {
+    log(
+      `turn ${failedTurn.turnId}: quota retry budget spent (${session.autoRetryCount}/${maxAttempts}); failing`,
+    );
+    return false;
+  }
+  const waitMs = Math.max(
+    resetAtMs + QUOTA_RETRY_JITTER_MS - Date.now(),
+    1_000,
+  );
+  if (waitMs > quotaRetryMaxWaitMs()) {
+    log(
+      `turn ${failedTurn.turnId}: quota reopens in ${Math.round(waitMs / 1000)}s, past the ${Math.round(quotaRetryMaxWaitMs() / 1000)}s auto-retry cap; failing`,
+    );
+    return false;
+  }
+  session.autoRetryCount += 1;
+  const retryTurn = createTurn({
+    prompt: failedTurn.prompt,
+    clientRequestId: undefined,
+  });
+  session.pending.push(retryTurn);
+  // Turns already queued behind the failed one ride the same closed window:
+  // move them into `pending` so the wake re-runs everything in order on the
+  // rebuilt child, instead of writing them into a child that is mid-exit.
+  while (session.turns.length > 0) {
+    session.pending.push(session.turns.shift() as Turn);
+  }
+  const attempt = session.autoRetryCount;
+  session.autoRetryTimer = setTimeout(() => {
+    wakeQuotaRetry(session, attempt, waitMs);
+  }, waitMs);
+  session.autoRetryTimer.unref();
+  log(
+    `turn ${failedTurn.turnId}: quota until ${new Date(resetAtMs).toISOString()}; ` +
+      `retry ${attempt}/${maxAttempts} queued as turn ${retryTurn.turnId} in ${Math.round(waitMs / 1000)}s`,
+  );
+  return true;
+}
+
+/** The window reopened: rebuild the child on the same conversation and let
+ * `drainPending` run the queued retry turn (plus anything queued behind it). */
+function wakeQuotaRetry(
+  session: Session,
+  attempt: number,
+  waitMs: number,
+): void {
+  session.autoRetryTimer = null;
+  // The session may have been stopped, or replaced by a fresh thread/start,
+  // while the timer slept; a stale wake owns nothing.
+  if (sessions.get(session.threadId) !== session) {
+    return;
+  }
+  if (session.stopping || session.providerThreadId === null) {
+    return;
+  }
+  if (session.pending.length === 0) {
+    return;
+  }
+  log(
+    `quota retry ${attempt}: window reopened after ${Math.round(waitMs / 1000)}s; ` +
+      `rebuilding agy for thread ${session.threadId}`,
+  );
+  notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+    threadId: session.threadId,
+    providerThreadId: session.providerThreadId,
+    reason: "the quota window reopened; the turn is being re-run on the resumed conversation",
+    contextLost: false,
+  });
+  startChild({
+    session,
+    model: session.spawnConfig.model,
+    reasoningLevel: session.spawnConfig.reasoningLevel,
+    conversationId: session.providerThreadId,
+    envVars: session.spawnConfig.envVars,
+  });
+}
+
 function reportError(
   session: Session,
   message: string,
@@ -696,6 +850,13 @@ function startChild(args: StartChildArgs): void {
     if (session.stopping) {
       return;
     }
+    if (session.autoRetryTimer !== null) {
+      // A quota retry owns the story now: the failed turn is settled, the
+      // retry turn is queued, and the code-1 exit is the quota tail this
+      // feature exists to sit out. Neither the raw exit banner nor a session
+      // failure may land on work that is scheduled, not lost.
+      return;
+    }
     const detail = session.lastStderr === null ? "" : `: ${session.lastStderr}`;
     const message = `agy exited (code ${String(code)}, signal ${String(
       signal,
@@ -727,6 +888,9 @@ function failSession(
 ): void {
   const surfaceError = opts.surfaceError ?? true;
   log(`session ${session.threadId} failed: ${message}`);
+  // A session failure is the verdict, whatever retry was pending: settle
+  // everything failed (including the queued retry turn) and stop the timer.
+  clearQuotaRetryTimer(session);
   session.lastFailure = message;
   if (surfaceError && session.providerThreadId !== null) {
     emitDeltas(session, {
@@ -1192,6 +1356,10 @@ function handleResult(
       error: { message },
     });
     session.lastTurnFailed = true;
+    // The failure is out; if agy named a near-enough reset, queue the same
+    // prompt to re-run when the window reopens instead of leaving the thread
+    // dead until a human retries it.
+    scheduleQuotaRetry(session, turn, message);
   } else {
     emitDeltas(session, {
       kind: "turn.boundary",
@@ -1199,6 +1367,7 @@ function handleResult(
       status: "completed",
     });
     session.lastTurnFailed = false;
+    session.autoRetryCount = 0;
     clearRateLimit(session);
   }
   // The next queued turn is now the live one: it is announced and only now
@@ -1266,6 +1435,13 @@ function writeTurn(session: Session, turn: Turn): void {
  * has been written.
  */
 function enqueueTurn(session: Session, turn: Turn): void {
+  if (session.autoRetryTimer !== null) {
+    // A quota retry is pending and owns the next child: queue behind it, so
+    // the FIFO stays exact and no rebuild spawns a child into the window
+    // that is still closed. The wake rebuild serves the whole queue.
+    session.pending.push(turn);
+    return;
+  }
   if (session.child === null && session.providerThreadId !== null) {
     // The child died (agy crash, its own timeout, an OOM kill) but the
     // conversation is on disk. Rebuild it against the same conversation and
@@ -1461,6 +1637,8 @@ const handlers: Record<string, RequestHandler> = {
       lastTurnFailed: false,
       rateLimitsBlocked: false,
       writeGuardrail: false,
+      autoRetryCount: 0,
+      autoRetryTimer: null,
     };
     sessions.set(data.threadId, session);
     if (data.input !== undefined && data.input.length > 0) {
@@ -1531,6 +1709,8 @@ const handlers: Record<string, RequestHandler> = {
       lastTurnFailed: false,
       rateLimitsBlocked: false,
       writeGuardrail: false,
+      autoRetryCount: 0,
+      autoRetryTimer: null,
     };
     sessions.set(data.threadId, session);
     startChild({
@@ -1678,6 +1858,7 @@ const handlers: Record<string, RequestHandler> = {
 };
 
 function killChild(session: Session): void {
+  clearQuotaRetryTimer(session);
   const child = session.child;
   session.child = null;
   session.generation += 1;
