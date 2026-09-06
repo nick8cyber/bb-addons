@@ -23,6 +23,11 @@
  *            has no reply and a DIFFERENT new countdown and must fail with the
  *            new text surfaced; turn 5 answers and carries that same new text
  *            and must complete (a completed reply makes the error baggage)
+ *   reject-then-exit  the genuine immediate reject on a fresh child, as agy
+ *            really behaves with a dead quota: identity announces, the turn
+ *            is refused on the first call, an ERROR result with no reply
+ *            names the quota, then the process exits 1 — the raw exit must
+ *            not add a second banner over the text that already explained it
  *
  * Every stdin line is echoed to AGY_FAKE_TRANSCRIPT so the harness can prove
  * WHAT the bridge sent.
@@ -178,6 +183,34 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
             usage,
           },
         });
+      }
+      return;
+    }
+    if (mode === "reject-then-exit") {
+      // Identity announces, the turn is refused on the first call, the ERROR
+      // result with no reply names the quota — and only then does agy exit 1.
+      if (turns === 1) {
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "DONE",
+            step_type: "user_input",
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "ERROR",
+            response: "",
+            num_turns: turns,
+            error: QUOTA,
+            usage,
+          },
+        });
+        setTimeout(() => process.exit(1), 100);
       }
       return;
     }

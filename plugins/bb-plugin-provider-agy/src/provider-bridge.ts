@@ -277,6 +277,15 @@ interface Session {
    */
   lastReportedError: string | null;
   /**
+   * The last result settled this session's live turn as failed (turned
+   * boundary "failed" with the parsed message). A non-zero child exit right
+   * after that — in the immediate-reject shapes agy's own ERROR result is
+   * precisely what makes it exit 1 — is the tail of that already-explained
+   * failure, not a new one, so the raw `agy exited (code 1, signal null)`
+   * banner is suppressed instead of layered over the actionable text.
+   */
+  lastTurnFailed: boolean;
+  /**
    * Set once this conversation has produced an artifact-shaped
    * `write_to_file`; every later turn then carries WRITE_GUARDRAIL so the
    * model does not repeat it. Off by default: a session that never hit the
@@ -553,12 +562,16 @@ function startChild(args: StartChildArgs): void {
     if (session.stopping) {
       return;
     }
-    failSession(
-      session,
-      `agy exited (code ${String(code)}, signal ${String(signal)})${
-        session.lastStderr === null ? "" : `: ${session.lastStderr}`
-      }`,
-    );
+    const detail = session.lastStderr === null ? "" : `: ${session.lastStderr}`;
+    const message = `agy exited (code ${String(code)}, signal ${String(
+      signal,
+    )})${detail}`;
+    const explained =
+      code !== 0 &&
+      session.lastTurnFailed &&
+      session.lastReportedError !== null &&
+      session.lastReportedError !== message;
+    failSession(session, message, { surfaceError: !explained });
   });
 }
 
@@ -566,11 +579,22 @@ function startChild(args: StartChildArgs): void {
  * The child is gone or unusable: settle everything in flight as failed so no
  * accepted turn is left without a terminal state, then release identity
  * waiters so a pending thread/start cannot hang.
+ *
+ * `surfaceError: false` skips the provider.error delta but still records the
+ * failure and settles turns: used when the exit that triggered this was the
+ * ordinary tail of a turn that already failed with a parsed, surfaced message
+ * (an ERROR result whose own text was delivered), so the raw exit would only
+ * bury the actionable text in the reader's error list.
  */
-function failSession(session: Session, message: string): void {
+function failSession(
+  session: Session,
+  message: string,
+  opts: { surfaceError?: boolean } = {},
+): void {
+  const surfaceError = opts.surfaceError ?? true;
   log(`session ${session.threadId} failed: ${message}`);
   session.lastFailure = message;
-  if (session.providerThreadId !== null) {
+  if (surfaceError && session.providerThreadId !== null) {
     emitDeltas(session, {
       kind: "provider.error",
       message,
@@ -1025,12 +1049,14 @@ function handleResult(
       status: "failed",
       error: { message },
     });
+    session.lastTurnFailed = true;
   } else {
     emitDeltas(session, {
       kind: "turn.boundary",
       providerTurnId: turn.turnId,
       status: "completed",
     });
+    session.lastTurnFailed = false;
   }
   // The next queued turn is now the live one: it is announced and only now
   // handed to agy, so a queued turn (a steer, or a second turn/start) cannot
@@ -1052,6 +1078,7 @@ function emitTurnStarted(session: Session, turn: Turn): void {
   // is a per-turn guard against three channels telling the same story, not a
   // lifetime mute.
   session.lastReportedError = null;
+  session.lastTurnFailed = false;
   const deltas: ThreadDelta[] = [
     {
       kind: "turn.open",
@@ -1288,6 +1315,7 @@ const handlers: Record<string, RequestHandler> = {
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,
+      lastTurnFailed: false,
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);
@@ -1356,6 +1384,7 @@ const handlers: Record<string, RequestHandler> = {
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,
+      lastTurnFailed: false,
       writeGuardrail: false,
     };
     sessions.set(data.threadId, session);

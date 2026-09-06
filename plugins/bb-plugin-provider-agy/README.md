@@ -96,7 +96,7 @@ provider is configured and not only here.
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
-| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay |
+| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay, the immediate reject whose exit 1 must not add a raw banner |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
 
@@ -448,10 +448,12 @@ An existing thread keeps the bridge build its own worker process was started
 with, so the fix reaches a running thread only after that session restarts.
 
 `node harness-errors.mjs` proves the error paths with no account and no quota —
-19/19: a failed tool step inside a turn that then completes reaches the thread
+22/22: a failed tool step inside a turn that then completes reaches the thread
 exactly once per turn with its `rate-limit` category, the ⚠ banner on stderr
 reaches the thread while a `warning:` line beside it does not, a turn-less
 `ERROR` result — with either an explicit or a missing `status` — fails the
-session with the message named, and the quota-residue replay settles answering
+session with the message named, the quota-residue replay settles answering
 turns completed on the reply that streamed while a no-reply turn with a fresh
-countdown still fails and surfaces.
+countdown still fails and surfaces, and a genuine immediate reject whose child
+then exits 1 surfaces only the parsed quota text — the raw `agy exited`
+banner is suppressed because the ERROR result already explained the exit.
