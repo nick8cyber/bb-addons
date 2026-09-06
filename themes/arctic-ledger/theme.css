@@ -260,17 +260,26 @@ diffs-container {
   --success: #aee4c2;
   --warning: #f6d486;
   --destructive: #ffb1c0;
-  --state-active: #6f9dce;
-  --sidebar-accent: #6f9dce;
+  /* Hover fills stay dark enough to keep the light rail text readable. */
+  --state-hover: #3a568f;
+  /* The current selection is the reference's soft cornflower. It is a light
+   * fill on a dark rail, so it demands dark ink from the row rules below. */
+  --state-active: #7fa8d3;
+  --sidebar-accent: #7fa8d3;
 }
 
-/* Selected rows must not inherit a low-emphasis foreground from their parent. */
+/* Selected rows flip to dark ink on the cornflower fill. Every text tier must
+ * follow, including --sidebar-foreground, which thread-title spans resolve. */
 [data-sidebar="panel"] [data-sidebar="sidebar"] .bg-sidebar-accent,
 [data-sidebar="panel"] [data-sidebar="sidebar"] .bg-state-active {
-  --foreground: #ffffff;
-  --secondary-foreground: #ffffff;
-  --muted-foreground: #ffffff;
-  --readback-foreground: #ffffff;
+  --foreground: #10203a;
+  --secondary-foreground: #1c3856;
+  --muted-foreground: #1c3856;
+  --readback-foreground: #28425f;
+  --subtle-foreground: #28425f;
+  --sidebar-foreground: #10203a;
+  --sidebar-accent-foreground: #10203a;
+  color: #10203a;
 }
 
 /* The fixed sidebar trigger is rendered outside the sidebar DOM subtree. */
@@ -281,8 +290,22 @@ diffs-container {
 /* BB marks the current thread with data-active rather than the colour utility
  * classes used by ordinary menu items. Keep the selected row fully legible. */
 [data-sidebar="panel"] [data-sidebar="sidebar"] [data-sidebar="menu-button"][data-active="true"] {
-  background-color: #6f9dce;
-  color: #ffffff;
+  background-color: #7fa8d3;
+  color: #10203a;
+  --foreground: #10203a;
+  --secondary-foreground: #1c3856;
+  --muted-foreground: #1c3856;
+  --readback-foreground: #28425f;
+  --subtle-foreground: #28425f;
+  --sidebar-foreground: #10203a;
+  --sidebar-accent-foreground: #10203a;
+}
+
+/* Row hover lives in variant utilities (hover:bg-sidebar-accent), which the
+ * static class selectors above cannot match. Their background already
+ * resolves to the cornflower var, so only the hover ink needs pinning. */
+[data-sidebar="panel"] [data-sidebar="sidebar"] .hover\:text-sidebar-accent-foreground:hover {
+  color: #10203a;
 }
 
 /* Handoff opens in the thread-detail side panel. It is not navigation: give
