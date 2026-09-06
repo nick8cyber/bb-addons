@@ -339,7 +339,6 @@ interface Session {
    * conversation cannot follow, so the wake rebuilds without
    * `--conversation` and announces the replacement with `contextLost: true`.
    */
-  retryFreshConversation: boolean;
   /**
    * Last time the session did anything (a turn arrived, a result settled,
    * the child announced itself). The idle sweep releases children that have
@@ -671,7 +670,6 @@ function scheduleQuotaRetry(
   }
   if (switchTo !== null) {
     session.accountLabel = switchTo.label;
-    session.retryFreshConversation = true;
   }
   const attempt = session.autoRetryCount;
   session.autoRetryTimer = setTimeout(() => {
@@ -830,7 +828,7 @@ let cliproxyRelaySignature = "";
 
 function firstListedApiKey(yaml: string): string | null {
   const m = /^api-keys?:\s*\n\s*-\s+(\S+)/m.exec(yaml);
-  return m === null ? null : (m[1] ?? null);
+  return m === null ? null : m[1].replace(/^["']|["']$/gu, "");
 }
 
 function resolveCliproxyRelay(dataDir: string): CliproxyRelay | null {
@@ -942,6 +940,17 @@ function childEnvOverlay(session: Session): Record<string, string> {
 // The agy child
 // ---------------------------------------------------------------------------
 
+/** Overlay keys a session's envVars passthrough may not override. */
+const PROTECTED_CHILD_ENV = new Set([
+  "HOME",
+  "GEMINI_API_KEY",
+  "GOOGLE_GEMINI_BASE_URL",
+  "HTTPS_PROXY",
+  "https_proxy",
+  "HTTP_PROXY",
+  "http_proxy",
+]);
+
 interface StartChildArgs {
   session: Session;
   model: string | undefined;
@@ -957,6 +966,12 @@ function startChild(args: StartChildArgs): void {
     reasoningLevel: args.reasoningLevel,
     envVars: args.envVars,
   };
+  // A live predecessor must not survive the spawn: residue-mode agy keeps
+  // running after a quota rejection, and two processes on one HOME would
+  // race the very token file the pool exists to keep exclusive.
+  if (session.child !== null) {
+    killChild(session);
+  }
   session.generation += 1;
   // A new provider session starts unannounced, and its usage baseline starts
   // at zero: agy counts tokens cumulatively per process, so a rebuilt child
@@ -978,11 +993,22 @@ function startChild(args: StartChildArgs): void {
   // (#1366, #1545): this process's env minus the runtime's own markers, plus
   // the session's declared passthrough.
   const env = withoutBridgeRuntimeEnv(process.env);
-  for (const [key, value] of Object.entries(childEnvOverlay(session))) {
-    env[key] = value;
-  }
+  const overlay = childEnvOverlay(session);
   for (const [key, value] of Object.entries(args.envVars ?? {})) {
     env[key] = value;
+  }
+  // The overlay's identity keys get the last word: a passthrough HOME or
+  // proxy would silently strand the conversation outside the pinned account.
+  for (const [key, value] of Object.entries(overlay)) {
+    if (PROTECTED_CHILD_ENV.has(key)) {
+      env[key] = value;
+    }
+  }
+  if (!("GEMINI_API_KEY" in overlay) && args.envVars?.GEMINI_API_KEY === undefined) {
+    // agy's Gemini-API mode keys off these; an inherited stray (the daemon
+    // env, another plugin) must not flip a direct/pool child into it.
+    delete env.GEMINI_API_KEY;
+    delete env.GOOGLE_GEMINI_BASE_URL;
   }
   log(
     `spawning ${command} ${spawnArgs.map((a) => JSON.stringify(a)).join(" ")} (cwd ${session.cwd}, HOME ${env.HOME ?? "<unset>"}${session.accountLabel ? `, account ${session.accountLabel}` : ""})`,
@@ -992,6 +1018,11 @@ function startChild(args: StartChildArgs): void {
     env,
     stdio: ["pipe", "pipe", "pipe"],
   }) as ChildProcessWithoutNullStreams;
+  // A write racing the child's exit is an expected EPIPE, not a bridge
+  // crash: the close handler owns the session's fate.
+  child.stdin.on("error", (error: Error) => {
+    log(`stdin write failed (${session.threadId}): ${error.message}`);
+  });
   session.child = child;
 
   let stdoutTail = "";
@@ -1884,14 +1915,20 @@ const handlers: Record<string, RequestHandler> = {
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
-      retryFreshConversation: false,
       lastActivityAt: Date.now(),
     };
     sessions.set(data.threadId, session);
     if (accountsEnabled(process.env) && cliproxyRelayDataDir !== null) {
-      session.accountLabel =
-        pickAccount(loadLedger(cliproxyRelayDataDir), listAccounts(cliproxyRelayDataDir))?.label ??
-        null;
+      const ledger = loadLedger(cliproxyRelayDataDir);
+      const picked = pickAccount(ledger, listAccounts(cliproxyRelayDataDir));
+      session.accountLabel = picked?.label ?? null;
+      if (picked !== null) {
+        // Reserve at pick time, not at init: N simultaneous thread/start
+        // requests are processed sequentially here, and each must see the
+        // previous one's account as used or they all pin to the same LRU.
+        markAccountUse(ledger, picked.label);
+        saveLedger(cliproxyRelayDataDir, ledger);
+      }
     }
     if (data.input !== undefined && data.input.length > 0) {
       // The first turn carries no clientRequestId — only turn/start and
@@ -1914,6 +1951,7 @@ const handlers: Record<string, RequestHandler> = {
     // and agy is the only thing that can name the conversation.
     awaitIdentity(session, (providerThreadId) => {
       if (providerThreadId === null) {
+        killChild(session);
         sessions.delete(data.threadId);
         respondError(
           id,
@@ -1964,7 +2002,6 @@ const handlers: Record<string, RequestHandler> = {
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
-      retryFreshConversation: false,
       lastActivityAt: Date.now(),
     };
     sessions.set(data.threadId, session);
@@ -1983,6 +2020,7 @@ const handlers: Record<string, RequestHandler> = {
     });
     awaitIdentity(session, (providerThreadId) => {
       if (providerThreadId === null) {
+        killChild(session);
         sessions.delete(data.threadId);
         respondError(
           id,
@@ -2157,7 +2195,7 @@ const DEFAULT_IDLE_KILL_MS = 1_800_000;
 
 function idleKillMs(): number {
   const raw = Number(process.env.AGY_IDLE_KILL_MS);
-  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_IDLE_KILL_MS;
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_IDLE_KILL_MS;
 }
 
 function sweepIdleSessions(): void {

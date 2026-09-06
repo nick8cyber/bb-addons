@@ -20,7 +20,7 @@
  * Usage: node scripts/import-accounts.mjs [--opencode | --cliproxy [dir] |
  *         --file <path> --label <label>] [--overwrite] [--data-dir <dir>]
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -47,7 +47,11 @@ function refreshTokenOf(record) {
 /** The agy credential shape; the access token is left stale on purpose —
  * agy refreshes it from the refresh token on first use. */
 function writeAccountHome(label, refreshToken) {
-  if (!/^[A-Za-z0-9._@+-]+$/u.test(label)) {
+  if (
+    !/^[A-Za-z0-9._@+-]+$/u.test(label) ||
+    label === "." ||
+    label === ".."
+  ) {
     throw new Error(`unsafe account label: ${label}`);
   }
   const cliDir = join(dataDir, "accounts", label, ".gemini", "antigravity-cli");
@@ -86,9 +90,13 @@ if (flag("--opencode")) {
   }
 } else if (flag("--file")) {
   const path = value("--file");
+  if (!path) {
+    console.log("--file requires a path");
+    process.exit(1);
+  }
   const label = value("--label") ?? basename(path).replace(/\.[a-z]+$/iu, "");
   const raw = readFileSync(path, "utf8");
-  jobs.push([label, refreshTokenOf(raw) ?? refreshTokenOf(JSON.parse(raw))]);
+  jobs.push([label, refreshTokenOf(raw)]);
 } else {
   console.log(
     "nothing to do: pass --opencode, --cliproxy [dir], or --file <path> --label <label>",
