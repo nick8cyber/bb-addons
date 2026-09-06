@@ -28,6 +28,7 @@ process.env.AGY_FAKE_TRANSCRIPT = join(root, "envlog.ndjson");
 process.env.AGY_CLIPROXY = "0";
 process.env.AGY_AUTO_RETRY_MAX = "1";
 process.env.AGY_FAKE_ERROR_MODE = "pool-retry";
+process.env.AGY_IDLE_KILL_MS = "1500";
 
 // The pool: a2 is the one with an egress proxy.
 for (const label of ["a1", "a2", "a3"]) {
@@ -111,7 +112,11 @@ send({
 await waitFor(() => boundaries("t-pool").length >= 4 && boundaries("t-pool")[3].status === "completed", 40_000, "rotation completes");
 await sleep(200);
 
-// Turn two: the same session, same (alive) child, no new spawn, no rotation.
+// Turn two arrives after the idle sweep has released the child: the bridge
+// must rebuild the SAME account's home with --conversation (opencode-style
+// sleep/restore) and complete on it.
+await sleep(3_000);
+const spawnsBeforeTurnTwo = readEnvs().length;
 send({
   jsonrpc: "2.0", id: 4, method: "turn/start",
   params: {
@@ -132,14 +137,15 @@ const ledger = JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"
 const replacedList = replaced();
 
 const checks = [
-  ["pool/homes-visited-in-order", envs.length === 4 && ["a1", "a2", "a3", "a3"].every((l, i) => envs[i]?.__env?.HOME === join(root, "accounts", l)), JSON.stringify(envs.map((e) => e?.__env?.HOME))],
+  ["pool/homes-visited-in-order", envs.length === 5 && ["a1", "a2", "a3", "a3", "a3"].every((l, i) => envs[i]?.__env?.HOME === join(root, "accounts", l)), JSON.stringify(envs.map((e) => e?.__env?.HOME))],
   ["pool/failures-then-completion", bs.length === 5 && bs.slice(0, 3).every((b) => b.status === "failed") && bs[3].status === "completed" && bs[4].status === "completed", JSON.stringify(bs.map((b) => b.status))],
   ["pool/proxy-follows-account", envs[1]?.__env?.HTTPS_PROXY === "http://proxy-a2:9" && envs[0]?.__env?.HTTPS_PROXY == null && envs[2]?.__env?.HTTPS_PROXY == null && envs[3]?.__env?.HTTPS_PROXY == null, JSON.stringify(envs.map((e) => e?.__env?.HTTPS_PROXY))],
   ["pool/rotations-fresh-resume-last", envs[1]?.__argv?.includes("--conversation") !== true && envs[2]?.__argv?.includes("--conversation") !== true && envs[3]?.__argv?.includes("--conversation") === true, JSON.stringify([envs[1]?.__argv?.includes("--conversation"), envs[2]?.__argv?.includes("--conversation"), envs[3]?.__argv?.includes("--conversation")])],
-  ["pool/replaced-announced-thrice", replacedList.length === 3 && replacedList[0].params.contextLost === true && replacedList[1].params.contextLost === true && replacedList[2].params.contextLost === false, JSON.stringify(replacedList.map((m) => m.params.contextLost))],
+  ["pool/replaced-announced-four-times", replacedList.length === 4 && replacedList[0].params.contextLost === true && replacedList[1].params.contextLost === true && replacedList[2].params.contextLost === false && replacedList[3].params.contextLost === false, JSON.stringify(replacedList.map((m) => m.params.contextLost))],
   ["pool/cooldowns-recorded", (ledger.accounts.a1?.cooldownUntilMs ?? 0) > 0 && (ledger.accounts.a2?.cooldownUntilMs ?? 0) > 0 && (ledger.accounts.a3?.cooldownUntilMs ?? 0) > 0, JSON.stringify(ledger.accounts)],
   ["pool/conversation-mapped-to-a3", ledger.conversations["fake-conv-errors"] === "a3", JSON.stringify(ledger.conversations)],
-  ["pool/sticky-second-turn-no-respawn", envs.length === 4, `${envs.length} spawns for two turns`],
+  ["pool/idle-released-the-child", spawnsBeforeTurnTwo === 4, `${spawnsBeforeTurnTwo} spawns before the idle gap`],
+  ["pool/idle-restore-same-home-resume", envs.length === 5 && envs[4]?.__env?.HOME === join(root, "accounts", "a3") && envs[4]?.__argv?.includes("--conversation") === true, JSON.stringify(envs[4] ?? {})],
 ];
 
 say("==== account pool report ====");
