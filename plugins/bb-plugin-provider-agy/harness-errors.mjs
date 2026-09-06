@@ -24,6 +24,8 @@ const fake = new URL("./fake-agy-errors.mjs", import.meta.url).pathname;
 writeFileSync(shim, `#!/bin/sh\nexec /usr/bin/node ${fake} "$@"\n`);
 chmodSync(shim, 0o755);
 process.env.AGY_PATH = shim;
+// hermetic: the host may or may not have an agent-proxy core to auto-detect
+process.env.AGY_CLIPROXY = "0";
 process.env.AGY_FAKE_TRANSCRIPT = transcript;
 // The quota auto-retry is OFF for the legacy scenarios: they prove the
 // failure paths, and a scheduled re-run would sit behind a real timer. The

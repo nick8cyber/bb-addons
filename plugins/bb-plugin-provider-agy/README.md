@@ -347,6 +347,64 @@ and immediate.
 `node harness-errors.mjs` drives all five shapes against `fake-agy-errors.mjs`,
 no account, no network, no quota.
 
+### Running through the agent-proxy core (many accounts, many IPs)
+
+Direct mode ties every turn to the ONE credential in the machine's
+`~/.gemini/antigravity-cli/`. When an [agent-proxy](https://github.com/smsunarto/bb-plugins)
+core (CLIProxyAPI) is installed, the bridge instead runs agy in its Gemini-API
+mode pointed at the local core, and the core owns everything multi-account:
+
+- **token storage** — the antigravity OAuth credentials live in the core's
+  `auth/` directory; adding accounts is the core's `-antigravity-login` flow
+  (or dropping credential JSONs there), not another `agy` login;
+- **rotation and quota** — the core picks the credential per request
+  (`routing.strategy`), cools a credential that hit its quota and moves on,
+  and answers from the next account; a 429 from one account no longer ends
+  a turn;
+- **different IPs** — each credential JSON takes a `"proxy_url"` field
+  (`"proxy_url": "socks5://user:pass@host:port"`), and that account's traffic
+  egresses through it.
+
+Detection is automatic: the bridge reads the core's local API key from the
+agent-proxy plugin's managed config (`~/.bb/plugins/agent-proxy/core/config.yaml`,
+first `api-keys:` entry), defaults the endpoint to `http://127.0.0.1:8317`,
+and lays `GEMINI_API_KEY` + `GOOGLE_GEMINI_BASE_URL` over every child it
+spawns, with `HOME` moved to the plugin data dir's `cliproxy-home/` — a home
+that carries only the settings file flipping agy into Gemini-API mode. The
+env is re-resolved per spawn, so adding the key or killing the switch applies
+to new children without a reload. Overrides: `AGY_CLIPROXY_URL`,
+`AGY_CLIPROXY_API_KEY`, and `AGY_CLIPROXY=0` for direct mode.
+
+One config line makes the model names line up — agy speaks bare ids and
+`-preview` utility names, the core registers the ids its credentials actually
+serve. In the core's `config.yaml`:
+
+```yaml
+oauth-model-alias:
+  antigravity:
+    - name: gemini-3.6-flash-high
+      alias: gemini-3.6-flash
+    - name: gemini-3.8-flash-high
+      alias: gemini-3.8-flash
+    - name: gemini-3.7-flash-high
+      alias: gemini-3.7-flash
+    - name: gemini-3.1-flash-lite
+      alias: gemini-3.1-flash-lite-preview
+    - name: gemini-3.1-pro-low
+      alias: gemini-3.1-pro-preview
+```
+
+Migration note: a conversation created in direct mode lives under the old
+HOME and will not resume inside the relay home — threads from before the
+switch should start fresh (the same is true in reverse when turning the
+relay off). The quota auto-retry above still applies in relay mode when an
+error carries a parseable reset; most quota handling, though, happens inside
+the core before agy ever sees a failure.
+
+`node harness-relay.mjs` proves the wiring with no network: the relay env
+reaches the child, the relay home's settings flip agy's provider, and
+`AGY_CLIPROXY=0` leaves the child env exactly as it was.
+
 ## The icon
 
 `icon` on the declaration takes the same two shapes as `bb.branding.icon`: a

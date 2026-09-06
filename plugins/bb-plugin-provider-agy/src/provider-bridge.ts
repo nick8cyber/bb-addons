@@ -50,7 +50,7 @@ import {
 } from "@get-bb/plugin-sdk/provider-bridge";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   AGY_NOISE_STEP_TYPES,
@@ -727,6 +727,110 @@ function promptText(input: readonly PromptInput[]): string {
 }
 
 // ---------------------------------------------------------------------------
+// Cliproxy relay mode
+// ---------------------------------------------------------------------------
+
+/**
+ * When an agent-proxy core (CLIProxyAPI) is reachable, the child does not have
+ * to talk to Antigravity with its own single HOME credential: agy runs in its
+ * Gemini-API mode pointed at the local core, and the CORE owns the accounts
+ * (its auth dir), the rotation, the quota cooldowns and the per-credential
+ * `proxy_url` egress — many accounts, many IPs, nothing keyed to this HOME.
+ *
+ * Detection, in order: `AGY_CLIPROXY=0` forces direct mode; `AGY_CLIPROXY_API_KEY`
+ * names the key outright; otherwise the agent-proxy plugin's managed config
+ * (`~/.bb/plugins/agent-proxy/core/config.yaml`, the only place its local API
+ * keys live) is read for its first `api-keys:` entry. Resolved once at start.
+ */
+interface CliproxyRelay {
+  baseUrl: string;
+  apiKey: string;
+  home: string;
+}
+
+let cliproxyRelayDataDir: string | null = null;
+let cliproxyRelay: CliproxyRelay | null = null;
+let cliproxyRelaySignature = "";
+
+function firstListedApiKey(yaml: string): string | null {
+  const m = /^api-keys?:\s*\n\s*-\s+(\S+)/m.exec(yaml);
+  return m === null ? null : (m[1] ?? null);
+}
+
+function resolveCliproxyRelay(dataDir: string): CliproxyRelay | null {
+  if (process.env.AGY_CLIPROXY === "0") {
+    return null;
+  }
+  const baseUrl = (
+    process.env.AGY_CLIPROXY_URL ?? "http://127.0.0.1:8317"
+  ).replace(/\/+$/u, "");
+  let apiKey = process.env.AGY_CLIPROXY_API_KEY;
+  if ((apiKey ?? "").length === 0) {
+    apiKey = undefined;
+    const managedConfig = join(
+      process.env.HOME ?? "",
+      ".bb",
+      "plugins",
+      "agent-proxy",
+      "core",
+      "config.yaml",
+    );
+    try {
+      const yaml = readFileSync(managedConfig, "utf8");
+      apiKey = firstListedApiKey(yaml) ?? undefined;
+    } catch {
+      return null;
+    }
+  }
+  if ((apiKey ?? "").length === 0) {
+    return null;
+  }
+  // agy reads its provider switch from the HOME-scoped settings file; the
+  // relay home carries nothing else — no token, nothing to rotate.
+  const home = join(dataDir, "cliproxy-home");
+  const settingsDir = join(home, ".gemini", "antigravity-cli");
+  try {
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(
+      join(settingsDir, "settings.json"),
+      `${JSON.stringify({ modelProvider: "gemini" })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  } catch {
+    return null;
+  }
+  return { baseUrl, apiKey: apiKey as string, home };
+}
+
+/** The relay env laid over a child's environment, or nothing in direct mode.
+ * Re-resolved per spawn: a key added to the managed config, or the
+ * AGY_CLIPROXY=0 kill switch, reaches new children without a plugin reload. */
+function cliproxyChildEnvOverlay(): Record<string, string> {
+  if (cliproxyRelayDataDir === null) {
+    return {};
+  }
+  const relay = resolveCliproxyRelay(cliproxyRelayDataDir);
+  const signature = relay === null ? "off" : `${relay.baseUrl}:${relay.home}`;
+  if (signature !== cliproxyRelaySignature) {
+    log(
+      relay === null
+        ? "cliproxy relay off: direct Antigravity mode"
+        : `cliproxy relay on: ${relay.baseUrl}`,
+    );
+    cliproxyRelaySignature = signature;
+  }
+  cliproxyRelay = relay;
+  if (relay === null) {
+    return {};
+  }
+  return {
+    HOME: relay.home,
+    GEMINI_API_KEY: relay.apiKey,
+    GOOGLE_GEMINI_BASE_URL: relay.baseUrl,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The agy child
 // ---------------------------------------------------------------------------
 
@@ -766,6 +870,9 @@ function startChild(args: StartChildArgs): void {
   // (#1366, #1545): this process's env minus the runtime's own markers, plus
   // the session's declared passthrough.
   const env = withoutBridgeRuntimeEnv(process.env);
+  for (const [key, value] of Object.entries(cliproxyChildEnvOverlay())) {
+    env[key] = value;
+  }
   for (const [key, value] of Object.entries(args.envVars ?? {})) {
     env[key] = value;
   }
@@ -1515,8 +1622,12 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
     return Promise.resolve(cachedModels);
   }
   return new Promise((resolve) => {
+    const env = withoutBridgeRuntimeEnv(process.env);
+    for (const [key, value] of Object.entries(cliproxyChildEnvOverlay())) {
+      env[key] = value;
+    }
     const child = spawn(resolveAgyCommand(process.env), ["models"], {
-      env: withoutBridgeRuntimeEnv(process.env),
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -1973,10 +2084,12 @@ export const experimental_providerBridge = experimental_defineProviderBridge({
   handleLine,
   start(context) {
     logFile = join(context.dataDir, "bridge.log");
+    cliproxyRelayDataDir = context.dataDir;
+    const relayOn = Object.keys(cliproxyChildEnvOverlay()).length > 0;
     log(
       `bridge started for plugin ${context.pluginId}; agy=${resolveAgyCommand(
         process.env,
-      )} HOME=${process.env.HOME ?? "<unset>"} PATH=${process.env.PATH ?? "<unset>"}`,
+      )} HOME=${process.env.HOME ?? "<unset>"} PATH=${process.env.PATH ?? "<unset>"}${relayOn ? "" : "; direct mode"}`,
     );
   },
   onClose: shutdown,
