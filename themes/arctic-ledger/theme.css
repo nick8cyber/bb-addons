@@ -31,7 +31,7 @@
   --foreground: #14213d;
   --muted-foreground: #284665;
   --readback-foreground: #496784;
-  --subtle-foreground: #667f99;
+  --subtle-foreground: #57708b;
   --accent-foreground: #14213d;
   --secondary-foreground: #1c3856;
   --primary: #1b5a96;
@@ -319,8 +319,10 @@ diffs-container {
   --foreground: #14213d;
   --secondary-foreground: #1c3856;
   --muted-foreground: #496784;
-  --readback-foreground: #5d7894;
-  --subtle-foreground: #7088a1;
+  --readback-foreground: #43596f;
+  --subtle-foreground: #4c647e;
+  /* Success badges here are text-on-light, not white-on-success-fill. */
+  --success-foreground: #197447;
   --state-hover: #e4eef8;
   --state-active: #c7ddf1;
   --surface-selected: #dceaf7;
