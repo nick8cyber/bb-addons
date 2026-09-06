@@ -340,6 +340,13 @@ interface Session {
    * `--conversation` and announces the replacement with `contextLost: true`.
    */
   retryFreshConversation: boolean;
+  /**
+   * Last time the session did anything (a turn arrived, a result settled,
+   * the child announced itself). The idle sweep releases children that have
+   * been idle past AGY_IDLE_KILL_MS — the conversation stays on disk and
+   * the next turn rebuilds the child against it, opencode-style.
+   */
+  lastActivityAt: number;
 }
 
 const sessions = new Map<string, Session>();
@@ -1189,6 +1196,7 @@ function adoptIdentity(session: Session, conversationId: string | null): void {
   if (conversationId === null) {
     return;
   }
+  session.lastActivityAt = Date.now();
   const announce =
     !session.identityAnnounced || session.providerThreadId !== conversationId;
   session.providerThreadId = conversationId;
@@ -1424,6 +1432,7 @@ function handleResult(
   session: Session,
   event: Extract<ReturnType<typeof parseAgyLine>, { event: "result" }>,
 ): void {
+  session.lastActivityAt = Date.now();
   const turn = session.turns.shift();
   if (turn === undefined) {
     // agy reports a rejected session (a bad flag combination, a model it will
@@ -1649,6 +1658,7 @@ function writeTurn(session: Session, turn: Turn): void {
  * has been written.
  */
 function enqueueTurn(session: Session, turn: Turn): void {
+  session.lastActivityAt = Date.now();
   if (session.autoRetryTimer !== null) {
     // A quota retry is pending and owns the next child: queue behind it, so
     // the FIFO stays exact and no rebuild spawns a child into the window
@@ -1875,6 +1885,7 @@ const handlers: Record<string, RequestHandler> = {
       autoRetryTimer: null,
       accountLabel: null,
       retryFreshConversation: false,
+      lastActivityAt: Date.now(),
     };
     sessions.set(data.threadId, session);
     if (accountsEnabled(process.env) && cliproxyRelayDataDir !== null) {
@@ -1954,6 +1965,7 @@ const handlers: Record<string, RequestHandler> = {
       autoRetryTimer: null,
       accountLabel: null,
       retryFreshConversation: false,
+      lastActivityAt: Date.now(),
     };
     sessions.set(data.threadId, session);
     if (cliproxyRelayDataDir !== null) {
@@ -2126,6 +2138,66 @@ function killChild(session: Session): void {
   grace.unref();
 }
 
+// ---------------------------------------------------------------------------
+// Idle sweep — opencode-style: release the child after a quiet period, keep
+// the session, rebuild on demand.
+// ---------------------------------------------------------------------------
+
+/**
+ * Idle children cost ~200 MB of RSS each while doing nothing. After
+ * AGY_IDLE_KILL_MS (default 30 minutes, 0 disables) without any turn, the
+ * sweep SIGTERMs the child exactly like a thread stop would — but keeps the
+ * session: the conversation is on disk, and the next `turn/start` hits the
+ * ordinary rebuild path (session/replaced + identity + `--conversation`) and
+ * continues as if nothing had slept. Busy sessions — turns queued, a retry
+ * pending, a child still announcing itself — are skipped.
+ */
+const IDLE_SWEEP_INTERVAL_MS = 1_000;
+const DEFAULT_IDLE_KILL_MS = 1_800_000;
+
+function idleKillMs(): number {
+  const raw = Number(process.env.AGY_IDLE_KILL_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_IDLE_KILL_MS;
+}
+
+function sweepIdleSessions(): void {
+  const idleMs = idleKillMs();
+  if (idleMs <= 0) {
+    return;
+  }
+  const now = Date.now();
+  for (const session of sessions.values()) {
+    if (
+      session.child === null ||
+      session.stopping ||
+      session.providerThreadId === null ||
+      session.autoRetryTimer !== null ||
+      session.turns.length > 0 ||
+      session.pending.length > 0
+    ) {
+      continue;
+    }
+    if (now - session.lastActivityAt < idleMs) {
+      continue;
+    }
+    log(
+      `session ${session.threadId} idle for ${Math.round((now - session.lastActivityAt) / 1000)}s: ` +
+        `releasing the agy child (conversation ${session.providerThreadId} stays; the next turn rebuilds it)`,
+    );
+    killChild(session);
+  }
+}
+
+let idleSweep: NodeJS.Timeout | null = null;
+
+function armIdleSweep(): void {
+  if (idleSweep !== null) {
+    return;
+  }
+  idleSweep = setInterval(sweepIdleSessions, IDLE_SWEEP_INTERVAL_MS);
+  idleSweep.unref();
+}
+
 function awaitIdentity(
   session: Session,
   settle: (providerThreadId: string | null) => void,
@@ -2223,6 +2295,7 @@ export const experimental_providerBridge = experimental_defineProviderBridge({
   start(context) {
     logFile = join(context.dataDir, "bridge.log");
     cliproxyRelayDataDir = context.dataDir;
+    armIdleSweep();
     const relayOn = Object.keys(cliproxyChildEnvOverlay()).length > 0;
     log(
       `bridge started for plugin ${context.pluginId}; agy=${resolveAgyCommand(
