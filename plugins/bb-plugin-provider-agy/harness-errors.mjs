@@ -4,8 +4,11 @@
  * session start, (residue) agy re-attaching a conversation's earlier
  * frozen quota rejection to later turns that actually answer, and
  * (reject-then-exit) a genuine immediate reject whose ERROR result is
- * followed by the child exiting 1 without a raw exit banner added — at no
- * quota cost. Six threads, six shapes (see fake-agy-errors.mjs).
+ * followed by the child exiting 1 without a raw exit banner added — plus the
+ * quota auto-retry: a 2s-window reject whose queued re-run completes on a
+ * rebuilt child (quota-retry), and a budget-exhaustion run where the retry
+ * itself fails and settles honestly (quota-retry-always). Eight threads,
+ * eight shapes (see fake-agy-errors.mjs).
  *
  * Usage: node harness-errors.mjs
  */
@@ -22,6 +25,10 @@ writeFileSync(shim, `#!/bin/sh\nexec /usr/bin/node ${fake} "$@"\n`);
 chmodSync(shim, 0o755);
 process.env.AGY_PATH = shim;
 process.env.AGY_FAKE_TRANSCRIPT = transcript;
+// The quota auto-retry is OFF for the legacy scenarios: they prove the
+// failure paths, and a scheduled re-run would sit behind a real timer. The
+// dedicated quota-retry scenarios below re-enable it (short countdowns).
+process.env.AGY_AUTO_RETRY_MAX = "0";
 const workspace = (mode) => {
   const dir = join(root, `ws-${mode}`);
   mkdirSync(dir, { recursive: true });
@@ -34,6 +41,9 @@ const QUOTA =
 const FRESH_QUOTA =
   "⚠ Individual quota reached. Please upgrade your subscription to " +
   "increase your limits. Resets in 4m2s.";
+const QUOTA_SHORT =
+  "⚠ Individual quota reached. Please upgrade your subscription to " +
+  "increase your limits. Resets in 2s.";
 
 const messages = [];
 const originalWrite = process.stdout.write.bind(process.stdout);
@@ -156,6 +166,67 @@ await turn(rejectExit.threadId, "two", 2);
 await sleep(200);
 stop(rejectExit.threadId);
 
+// quota-retry mode: the auto-retry itself. The first turn is refused with a
+// 2s window and the child exits 1; the bridge must settle that turn failed,
+// queue a retry turn behind the reset, sit out the window, rebuild the child
+// on the SAME conversation (session/replaced, context intact), re-run the
+// same prompt, and complete — one error row, blocked-then-allowed snapshots,
+// and no raw exit banner anywhere.
+delete process.env.AGY_AUTO_RETRY_MAX;
+const retryCount = () =>
+  messages.filter(
+    (m) => m.method === "session/replaced" && m.params.threadId === "t-quota-retry",
+  ).length;
+const retry = await start("quota-retry");
+{
+  const id = nextId++;
+  send({
+    jsonrpc: "2.0", id, method: "turn/start",
+    params: {
+      threadId: retry.threadId, providerThreadId: "fake-conv-errors",
+      input: [{ type: "text", text: "one", mentions: [] }],
+      clientRequestId: `creq_${"zyxwvutsrq".slice(0, 9)}${"zyxwvutsrq"[creqSeq++ % 10]}`, options,
+    },
+  });
+  await waitFor(
+    () => {
+      const bs = completed(retry.threadId);
+      return bs.length >= 2 && bs[1].status === "completed";
+    },
+    30_000,
+    "quota-retry: re-run completes",
+  );
+  await waitFor(() => retryCount() >= 1, 5_000, "quota-retry: session/replaced");
+  await sleep(200);
+  stop(retry.threadId);
+}
+
+// quota-retry-always mode: the budget path. Every child refuses, so the one
+// permitted retry must run, fail, and settle honestly — no third child, no
+// completed boundary, and the exit banner still suppressed.
+process.env.AGY_AUTO_RETRY_MAX = "1";
+const alwaysReplaced = () =>
+  messages.filter(
+    (m) =>
+      m.method === "session/replaced" &&
+      m.params.threadId === "t-quota-retry-always",
+  ).length;
+const always = await start("quota-retry-always");
+{
+  const id = nextId++;
+  send({
+    jsonrpc: "2.0", id, method: "turn/start",
+    params: {
+      threadId: always.threadId, providerThreadId: "fake-conv-errors",
+      input: [{ type: "text", text: "one", mentions: [] }],
+      clientRequestId: `creq_${"zyxwvutsrq".slice(0, 9)}${"zyxwvutsrq"[creqSeq++ % 10]}`, options,
+    },
+  });
+  await waitFor(() => completed(always.threadId).length >= 2, 30_000, "quota-retry-always: both failures settle");
+  await sleep(300);
+  stop(always.threadId);
+}
+
 bridge.onClose?.();
 process.stdout.write = originalWrite;
 
@@ -167,6 +238,13 @@ const rejectErrors = errors(rejectExit.threadId);
 const rejectBoundaries = completed(rejectExit.threadId);
 const rejectLimits = rateLimits(rejectExit.threadId);
 const resetAt = rejectLimits[0]?.rateLimits?.windows?.[0]?.resetsAtMs ?? null;
+const retryErrors = errors(retry.threadId);
+const retryBoundaries = completed(retry.threadId);
+const retryLimits = rateLimits(retry.threadId);
+const alwaysErrors = errors(always.threadId);
+const alwaysBoundaries = completed(always.threadId);
+const retryRawExits = (tid) =>
+  errors(tid).filter((e) => e.message.includes("exited"));
 
 const checks = [
   ["tool/step-error-reaches-thread", toolErrors.length === 2 && toolErrors.every((e) => e.message === QUOTA), JSON.stringify(toolErrors.map((e) => e.message)).slice(0, 120)],
@@ -194,6 +272,16 @@ const checks = [
   ["reject-exit/native-error-coded-429", rejectErrors.length === 1 && rejectErrors[0]?.errorInfo?.category === "rate-limit" && rejectErrors[0]?.errorInfo?.httpStatusCode === 429 && rejectErrors[0]?.errorInfo?.providerCode === null, JSON.stringify(rejectErrors[0]?.errorInfo ?? "")],
   ["reject-exit/blocked-snapshot-with-reset-time", rejectLimits.length === 2 && rejectLimits[0]?.rateLimits?.status === "blocked" && rejectLimits[0]?.rateLimits?.kind === "subscription-window" && rejectLimits[0]?.rateLimits?.reachedReason === QUOTA && resetAt !== null && resetAt > Date.now() - 60_000 && resetAt < Date.now() + 9 * 60_000, JSON.stringify(rejectLimits[0]?.rateLimits ?? "")],
   ["reject-exit/allowed-after-recovery", rejectLimits.length === 2 && rejectLimits[1]?.rateLimits?.status === "allowed" && rejectBoundaries[1]?.status === "completed", JSON.stringify(rejectLimits.map((r) => r?.rateLimits?.status))],
+  ["retry/failed-turn-settles-honestly", retryBoundaries[0]?.status === "failed" && retryBoundaries[0]?.error?.message === QUOTA_SHORT, JSON.stringify(retryBoundaries[0] ?? "")],
+  ["retry/re-run-completes", retryBoundaries.length === 2 && retryBoundaries[1]?.status === "completed", JSON.stringify(retryBoundaries.map((b) => b.status))],
+  ["retry/session-replaced-before-the-spawn", retryCount() === 1, `${retryCount()} session/replaced`],
+  ["retry/one-error-row-no-exit-banner", retryErrors.length === 1 && retryErrors[0].message === QUOTA_SHORT && retryRawExits(retry.threadId).length === 0, JSON.stringify(retryErrors.map((e) => e.message))],
+  ["retry/blocked-then-allowed", retryLimits.length === 2 && retryLimits[0]?.rateLimits?.status === "blocked" && retryLimits[1]?.rateLimits?.status === "allowed", JSON.stringify(retryLimits.map((r) => r?.rateLimits?.status))],
+  ["retry/same-prompt-re-run", messages.some((m) => m.method === "session/replaced" && m.params.threadId === retry.threadId), ""],
+  ["always/second-attempt-fails-honestly", alwaysBoundaries.length === 2 && alwaysBoundaries[0]?.status === "failed" && alwaysBoundaries[1]?.status === "failed" && alwaysBoundaries[1]?.error?.message === QUOTA_SHORT, JSON.stringify(alwaysBoundaries.map((b) => b.status))],
+  ["always/retry-ran-exactly-once", alwaysReplaced() === 1, `${alwaysReplaced()} session/replaced`],
+  ["always/no-completed-boundary", alwaysBoundaries.every((b) => b.status === "failed"), JSON.stringify(alwaysBoundaries.map((b) => b.status))],
+  ["always/no-exit-banner", alwaysErrors.length === 2 && alwaysErrors.every((e) => e.message === QUOTA_SHORT) && retryRawExits(always.threadId).length === 0, JSON.stringify(alwaysErrors.map((e) => e.message))],
 ];
 
 say("==== error-surfacing report ====");

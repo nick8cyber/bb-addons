@@ -28,6 +28,12 @@
  *            is refused on the first call, an ERROR result with no reply
  *            names the quota, then the process exits 1 — the raw exit must
  *            not add a second banner over the text that already explained it
+ *   quota-retry  the same reject but with a SHORT window ("Resets in 2s."),
+ *            close enough for the bridge's quota auto-retry: a resumed child
+ *            (--conversation present) answers successfully, so the queued
+ *            retry turn must re-run and complete
+ *   quota-retry-always  every child rejects, so the retry budget runs out:
+ *            the second attempt must fail honestly with no further retries
  *
  * Every stdin line is echoed to AGY_FAKE_TRANSCRIPT so the harness can prove
  * WHAT the bridge sent.
@@ -51,6 +57,9 @@ const QUOTA =
 const FRESH_QUOTA =
   "⚠ Individual quota reached. Please upgrade your subscription to " +
   "increase your limits. Resets in 4m2s.";
+const QUOTA_SHORT =
+  "⚠ Individual quota reached. Please upgrade your subscription to " +
+  "increase your limits. Resets in 2s.";
 const REJECTED =
   "shots fired: the backend refused this session while quota is exhausted";
 
@@ -211,6 +220,62 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
           },
         });
         setTimeout(() => process.exit(1), 100);
+      }
+      return;
+    }
+    if (mode === "quota-retry" || mode === "quota-retry-always") {
+      // The auto-retry shape: a fresh child rejects the first turn with a
+      // SHORT window ("Resets in 2s.") and exits 1, exactly like
+      // reject-then-exit but close enough for the bridge's quota auto-retry
+      // to schedule a re-run. A child spawned WITH --conversation is that
+      // re-run: quota-retry answers it successfully; quota-retry-always
+      // rejects again, so the retry budget runs out and the turn must fail
+      // honestly on the second attempt.
+      const resumed = process.argv.includes("--conversation");
+      if (!resumed || mode === "quota-retry-always") {
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "DONE",
+            step_type: "user_input",
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "ERROR",
+            response: "",
+            num_turns: turns,
+            error: QUOTA_SHORT,
+            usage,
+          },
+        });
+        setTimeout(() => process.exit(1), 100);
+      } else {
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "DONE",
+            step_type: "agent_response",
+            text_delta: "recovered after quota",
+            usage,
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "SUCCESS",
+            response: "recovered after quota",
+            num_turns: turns,
+            usage,
+          },
+        });
       }
       return;
     }
