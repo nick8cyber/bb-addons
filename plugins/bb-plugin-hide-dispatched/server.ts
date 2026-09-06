@@ -62,7 +62,7 @@ export default async function plugin(bb: BbPluginApi) {
   const renderStatus = (state: KvState) =>
     `enabled: ${state.enabled}\n` +
     `tracked originPluginIds: ${state.tracked.join(", ") || "(none)"}\n` +
-    `hidden since start: ${state.hiddenCount}\n`;
+    `hidden total: ${state.hiddenCount}\n`;
 
   bb.cli.register({
     name: "hide-dispatched",
@@ -70,7 +70,7 @@ export default async function plugin(bb: BbPluginApi) {
     commands: [
       {
         name: "status",
-        summary: "Show whether hiding is on, which originPluginIds are tracked, and how many threads were hidden",
+        summary: "Show whether hiding is on, which originPluginIds are tracked, and how many threads were hidden in total",
         usage: "bb hide-dispatched status [--json]",
       },
       {
@@ -160,7 +160,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         return {
           exitCode: 0,
-          stdout: `Sweep: hid ${hiddenNow} thread(s). Total hidden since start: ${final.hiddenCount}.\n`,
+          stdout: `Sweep: hid ${hiddenNow} thread(s). Hidden in total: ${final.hiddenCount}.\n`,
         };
       }
 
