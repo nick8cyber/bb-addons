@@ -251,7 +251,7 @@ diffs-container {
 /* bb's sidebar contains components that use global semantic tokens. Set the
  * full semantic ladder on the actual sidebar containers, not on individual
  * utility classes, so every label and icon gets the correct contrast. */
-[data-sidebar="sidebar"] {
+[data-sidebar="panel"] [data-sidebar="sidebar"] {
   --foreground: #edf4ff;
   --secondary-foreground: #edf4ff;
   --muted-foreground: #c8d8ed;
@@ -265,8 +265,8 @@ diffs-container {
 }
 
 /* Selected rows must not inherit a low-emphasis foreground from their parent. */
-[data-sidebar="sidebar"] .bg-sidebar-accent,
-[data-sidebar="sidebar"] .bg-state-active {
+[data-sidebar="panel"] [data-sidebar="sidebar"] .bg-sidebar-accent,
+[data-sidebar="panel"] [data-sidebar="sidebar"] .bg-state-active {
   --foreground: #ffffff;
   --secondary-foreground: #ffffff;
   --muted-foreground: #ffffff;
@@ -280,7 +280,7 @@ diffs-container {
 
 /* BB marks the current thread with data-active rather than the colour utility
  * classes used by ordinary menu items. Keep the selected row fully legible. */
-[data-sidebar="sidebar"] [data-sidebar="menu-button"][data-active="true"] {
+[data-sidebar="panel"] [data-sidebar="sidebar"] [data-sidebar="menu-button"][data-active="true"] {
   background-color: #6f9dce;
   color: #ffffff;
 }
