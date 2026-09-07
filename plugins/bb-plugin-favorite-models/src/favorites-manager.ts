@@ -406,6 +406,11 @@ export function importFavoritesJson(jsonStr: string): boolean {
 
 /**
  * Initialize sync with backend RPC on boot.
+ *
+ * The server copy is authoritative: every client converges on it, so
+ * favorites made on one device appear on the others. localStorage is only
+ * a fast-start snapshot and an offline fallback — it never overrides the
+ * server state on boot.
  */
 export function initBackendSync(): void {
   void callRpc<{
@@ -414,12 +419,13 @@ export function initBackendSync(): void {
     config: { pinToTop: boolean; showQuickBar: boolean };
   }>("getFavorites", null).then((res) => {
     if (!res) return;
-    const mergedFavorites = sanitizeFavoritesMap({ ...res.favorites, ...currentState.favorites });
-    const mergedLabels = { ...res.modelLabels, ...currentState.modelLabels };
+    const favorites = sanitizeFavoritesMap(res.favorites || {});
+    const modelLabels =
+      typeof res.modelLabels === "object" && res.modelLabels !== null ? res.modelLabels : {};
     currentState = {
       ...currentState,
-      favorites: mergedFavorites,
-      modelLabels: mergedLabels,
+      favorites,
+      modelLabels,
       pinToTop: res.config?.pinToTop ?? currentState.pinToTop,
       showQuickBar: res.config?.showQuickBar ?? currentState.showQuickBar,
     };
@@ -429,8 +435,8 @@ export function initBackendSync(): void {
     // If backend had shortcut keys like ⇧-⌘-m, update backend with clean sanitized map
     if (Object.keys(res.favorites || {}).some((k) => k.includes("⌘") || k.includes("⇧"))) {
       void callRpc("setFavorites", {
-        favorites: mergedFavorites,
-        modelLabels: mergedLabels,
+        favorites,
+        modelLabels,
       });
     }
   });
