@@ -451,4 +451,62 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
       { method: "archive", threadId: "t-1" },
     ]);
   });
+
+  it("reorders projects by dragging their headers", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const threads = [
+      makeThread({ id: "t-1", title: "Thread 1", projectId: "proj-1" }),
+      makeThread({ id: "t-2", title: "Thread 2", projectId: "proj-2" }),
+    ];
+    const projects = [
+      makeProject({ id: "proj-1", name: "Project One" }),
+      makeProject({ id: "proj-2", name: "Project Two" }),
+    ];
+
+    const slot = renderSlot(
+      app.threadLists[0]!,
+      {
+        activeThreadId: null,
+        activeProjectId: null,
+        isCompactViewport: false,
+        onNavigate: () => {},
+        searchQuery: "",
+        Original: () => <div>bb list</div>,
+      },
+      {
+        rpc: { reorder_project: () => ({ ok: true as const }) },
+        settings: { visibleThreads: 5 },
+        sidebarThreads: { status: "ready", threads, projects },
+      },
+    );
+
+    const header = (name: string): HTMLElement => {
+      const found = slot.getByText(name).closest("[draggable]");
+      if (found === null) {
+        throw new Error(`no draggable header for ${name}`);
+      }
+      return found as HTMLElement;
+    };
+    const dataTransfer = {
+      effectAllowed: "",
+      dropEffect: "",
+      setData: () => {},
+      getData: () => "proj-2",
+    };
+
+    fireEvent.dragStart(header("Project Two"), { dataTransfer });
+    fireEvent.dragOver(header("Project One"), { dataTransfer });
+    fireEvent.drop(header("Project One"), { dataTransfer });
+
+    expect(slot.inspection.rpcCalls).toEqual([
+      {
+        method: "reorder_project",
+        input: {
+          projectId: "proj-2",
+          previousProjectId: null,
+          nextProjectId: "proj-1",
+        },
+      },
+    ]);
+  });
 });

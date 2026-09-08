@@ -1,4 +1,18 @@
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
+
+/** Project drag-and-drop is not part of the frontend sidebar API, so the list
+ *  hands the move to the backend, which owns `bb.sdk`. */
+export const rpcContract = defineRpcContract({
+  reorder_project: {
+    input: z.object({
+      projectId: z.string().min(1),
+      previousProjectId: z.string().min(1).nullable(),
+      nextProjectId: z.string().min(1).nullable(),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+});
 
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
@@ -38,9 +52,19 @@ export default async function plugin(bb: BbPluginApi) {
     showThreadCount: {
       type: "boolean",
       label: "Show the chat count next to a project",
-      description:
-        "Дописывать в заголовок проекта число его корневых чатов.",
+      description: "Дописывать в заголовок проекта число его корневых чатов.",
       default: false,
+    },
+  });
+
+  bb.rpc.register(rpcContract, {
+    reorder_project: async ({ projectId, previousProjectId, nextProjectId }) => {
+      await bb.sdk.projects.reorder({
+        projectId,
+        previousProjectId,
+        nextProjectId,
+      });
+      return { ok: true } as const;
     },
   });
 

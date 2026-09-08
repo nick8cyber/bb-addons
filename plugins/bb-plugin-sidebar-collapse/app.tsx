@@ -5,8 +5,10 @@ import {
   experimental_useSidebarThreads,
   experimental_useSidebarThreadSplit,
   useBbNavigate,
+  useRpc,
   useSettings,
 } from "@get-bb/plugin-sdk/app";
+import type { rpcContract } from "./server";
 import type {
   PluginSidebarThread,
   PluginSidebarThreadActions,
@@ -464,6 +466,36 @@ function CollapsedThreadList({
     () => new Set(),
   );
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
+  // Project drag-and-drop: the frontend sidebar API has no reorder action, so
+  // the move goes to this plugin's backend, which owns `bb.sdk.projects`.
+  const rpc = useRpc<typeof rpcContract>();
+  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(
+    null,
+  );
+  const [dropTarget, setDropTarget] = useState<{
+    projectId: string;
+    edge: "after" | "before";
+  } | null>(null);
+
+  const moveProject = (
+    movedProjectId: string,
+    targetProjectId: string,
+    edge: "after" | "before",
+  ) => {
+    const rest = projects.filter((p) => p.id !== movedProjectId);
+    const at = rest.findIndex((p) => p.id === targetProjectId);
+    if (at === -1) {
+      return;
+    }
+    const insertAt = edge === "before" ? at : at + 1;
+    const previous = rest[insertAt - 1] ?? null;
+    const next = rest[insertAt] ?? null;
+    void rpc.call("reorder_project", {
+      projectId: movedProjectId,
+      previousProjectId: previous === null ? null : previous.id,
+      nextProjectId: next === null ? null : next.id,
+    });
+  };
 
   const groups: readonly GroupingGroup<PluginSidebarThread>[] = useMemo(
     () =>
@@ -539,7 +571,58 @@ function CollapsedThreadList({
     <div className="flex flex-col gap-2 p-1">
       {groups.map((group: GroupingGroup<PluginSidebarThread>) => (
         <div key={group.key} className="flex flex-col gap-0.5">
-          <div className="group/header flex h-7 items-center gap-1.5 px-2 text-xs font-medium text-muted-foreground">
+          <div
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/plain", group.projectId);
+              setDraggingProjectId(group.projectId);
+            }}
+            onDragEnd={() => {
+              setDraggingProjectId(null);
+              setDropTarget(null);
+            }}
+            onDragOver={(e) => {
+              if (
+                draggingProjectId === null ||
+                draggingProjectId === group.projectId
+              ) {
+                return;
+              }
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              const box = e.currentTarget.getBoundingClientRect();
+              setDropTarget({
+                projectId: group.projectId,
+                edge:
+                  e.clientY - box.top > box.height / 2 ? "after" : "before",
+              });
+            }}
+            onDragLeave={() => {
+              setDropTarget((prev) =>
+                prev?.projectId === group.projectId ? null : prev,
+              );
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              const moved = draggingProjectId;
+              const target = dropTarget;
+              setDraggingProjectId(null);
+              setDropTarget(null);
+              if (moved === null || target === null || moved === group.projectId) {
+                return;
+              }
+              moveProject(moved, target.projectId, target.edge);
+            }}
+            className={cn(
+              "group/header flex h-7 cursor-grab items-center gap-1.5 px-2 text-xs font-medium text-muted-foreground",
+              draggingProjectId === group.projectId && "opacity-50",
+              dropTarget?.projectId === group.projectId &&
+                (dropTarget.edge === "before"
+                  ? "border-t border-sidebar-primary"
+                  : "border-b border-sidebar-primary"),
+            )}
+          >
             <button
               type="button"
               aria-expanded={!group.isFolded}
