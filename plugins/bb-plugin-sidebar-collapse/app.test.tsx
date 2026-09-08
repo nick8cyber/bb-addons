@@ -421,4 +421,34 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     expect(on.queryByText("feature/collapse")).toBeTruthy();
     expect(on.queryByText("1")).toBeTruthy();
   });
+
+  it("archives from the row's quick action without opening a menu", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const threads = [
+      makeThread({ id: "t-1", title: "Thread 1", projectId: "proj-1" }),
+    ];
+    const projects = [makeProject({ id: "proj-1", name: "Project One" })];
+
+    const slot = renderSlot(
+      app.threadLists[0]!,
+      {
+        activeThreadId: null,
+        activeProjectId: null,
+        isCompactViewport: false,
+        onNavigate: () => {},
+        searchQuery: "",
+        Original: () => <div>bb list</div>,
+      },
+      {
+        settings: { visibleThreads: 5 },
+        sidebarThreads: { status: "ready", threads, projects },
+      },
+    );
+
+    fireEvent.click(slot.getByLabelText("Archive Thread 1"));
+
+    expect(slot.inspection.sidebarActionCalls).toEqual([
+      { method: "archive", threadId: "t-1" },
+    ]);
+  });
 });

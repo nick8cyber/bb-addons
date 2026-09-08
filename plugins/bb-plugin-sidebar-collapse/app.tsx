@@ -242,6 +242,15 @@ function ThreadMenuItems({
   );
 }
 
+/** bb's own rows keep quick actions hidden until the row is hovered or
+ *  focused, and always visible on touch. */
+function hoverActionClassName(isCompactViewport: boolean): string {
+  return cn(
+    "flex size-5 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-focus-within/row:opacity-100 group-hover/row:opacity-100 data-[state=open]:opacity-100",
+    isCompactViewport ? "opacity-100" : "opacity-0",
+  );
+}
+
 function ThreadRow({
   row,
   activeThreadId,
@@ -366,15 +375,31 @@ function ThreadRow({
           ) : null}
 
           {!isRenaming ? (
+            <button
+              type="button"
+              aria-label={`Archive ${displayTitle}`}
+              title="Archive"
+              className={hoverActionClassName(isCompactViewport)}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                actions.archive(thread.id);
+              }}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+              }}
+            >
+              <Icon name="Archive" className="size-3.5" />
+            </button>
+          ) : null}
+
+          {!isRenaming ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
                   aria-label="Thread actions"
-                  className={cn(
-                    "flex size-5 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-focus-within/row:opacity-100 group-hover/row:opacity-100 data-[state=open]:opacity-100",
-                    isCompactViewport ? "opacity-100" : "opacity-0",
-                  )}
+                  className={hoverActionClassName(isCompactViewport)}
                   onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
