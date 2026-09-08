@@ -61,6 +61,7 @@ function IndicatorDot({
   }
   return (
     <span
+      role={label === null ? undefined : "img"}
       aria-label={label ?? undefined}
       className={cn(
         "size-2 shrink-0 rounded-full",
