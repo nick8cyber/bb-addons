@@ -53,13 +53,16 @@
 - миникарта размещения сплитов (`layout.panes`);
 - перетаскивание тредов между проектами и переупорядочивание закреплённых.
 
-Вернуть родной список bb можно без удаления плагина:
-**Settings → Appearance → Sidebar** — там выбирается, чей список рисовать.
+Вернуть родной список bb можно без удаления плагина — двумя способами:
+`bb plugin config sidebar-collapse set useCollapsedList false` или
+**Settings → Appearance → Sidebar**, где выбирается, чей список рисовать.
 
 ## Настройки
 
 Настройки объявляются в `server.ts` и редактируются через настройки bb или CLI:
 
+- `useCollapsedList` (`boolean`, по умолчанию `true`): выключи, чтобы вернуть
+  родной список тредов bb, не удаляя плагин.
 - `visibleThreads` (`number`, по умолчанию `5`): сколько чатов проекта видно до нажатия «Show more». Значение `0` показывает все треды без свёртки.
 - `keepAttention` (`boolean`, по умолчанию `true`): не скрывать под «Show more» чаты, которые ждут ответа или завершились с ошибкой.
 
@@ -68,6 +71,7 @@
 ```bash
 bb plugin config sidebar-collapse
 bb plugin config sidebar-collapse set visibleThreads 10
+bb plugin config sidebar-collapse set useCollapsedList false   # вернуть список bb
 bb plugin reload sidebar-collapse
 ```
 

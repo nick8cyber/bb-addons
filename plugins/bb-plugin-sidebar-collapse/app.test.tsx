@@ -343,4 +343,36 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
       title: "New Renamed Title",
     });
   });
+
+  it("renders bb's own list when useCollapsedList is turned off", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const threads = Array.from({ length: 8 }, (_, i) =>
+      makeThread({
+        id: `t-${i + 1}`,
+        title: `Thread ${i + 1}`,
+        projectId: "proj-1",
+      }),
+    );
+    const projects = [makeProject({ id: "proj-1", name: "Project One" })];
+
+    const slot = renderSlot(
+      app.threadLists[0]!,
+      {
+        activeThreadId: null,
+        activeProjectId: null,
+        isCompactViewport: false,
+        onNavigate: () => {},
+        searchQuery: "",
+        Original: () => <div>bb list</div>,
+      },
+      {
+        settings: { useCollapsedList: false, visibleThreads: 5 },
+        sidebarThreads: { status: "ready", threads, projects },
+      },
+    );
+
+    expect(slot.queryByText("bb list")).toBeTruthy();
+    expect(slot.queryByText("Thread 1")).toBeNull();
+    expect(slot.queryByText("Show more (3)")).toBeNull();
+  });
 });

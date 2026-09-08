@@ -482,6 +482,10 @@ function CollapsedThreadList({
     });
   };
 
+  if (values?.useCollapsedList === false) {
+    return <Original />;
+  }
+
   if (status === "loading") {
     return (
       <div role="status" className="px-3 py-2 text-xs text-muted-foreground">
