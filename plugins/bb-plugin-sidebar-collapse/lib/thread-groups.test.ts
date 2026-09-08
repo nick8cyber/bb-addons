@@ -238,13 +238,20 @@ describe("groupSidebarThreads", () => {
     expect(groups[0].rows[1].depth).toBe(1);
   });
 
-  it("цикл a.parent = b, b.parent = a не вешает функцию", () => {
+  it("цикл a.parent = b, b.parent = a не вешает функцию и не теряет треды", () => {
     const a = makeThread({ id: "a", parentThreadId: "b" });
     const b = makeThread({ id: "b", parentThreadId: "a" });
-    // Neither has a null parent nor a parent outside the filtered set, so neither
-    // is a root. The function must terminate and produce no groups.
+    // Neither has a null parent nor a parent outside the filtered set, so the
+    // cycle is unreachable from every root: the first member in input order is
+    // promoted to a root and the other stays its child.
     expect(() => groupSidebarThreads(makeInput({ threads: [a, b] }))).not.toThrow();
-    expect(groupSidebarThreads(makeInput({ threads: [a, b] }))).toEqual([]);
+    const groups = groupSidebarThreads(makeInput({ threads: [a, b] }));
+    expect(groups).toHaveLength(1);
+    expect(groups[0].rootCount).toBe(1);
+    expect(groups[0].rows).toEqual([
+      { thread: a, depth: 0 },
+      { thread: b, depth: 1 },
+    ]);
   });
 
   it("цикл с внешним корнем: потомок цикла рисуется под корнем без зависания", () => {

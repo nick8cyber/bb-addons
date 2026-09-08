@@ -94,7 +94,7 @@ export function groupSidebarThreads<T extends GroupingThread>(
     }
   }
 
-  const roots = filtered.filter((t) => parentOf.get(t.id) === null);
+  const roots: T[] = filtered.filter((t) => parentOf.get(t.id) === null);
 
   // Children map (only filtered children whose effective parent is this thread).
   const children = new Map<string, T[]>();
@@ -116,6 +116,42 @@ export function groupSidebarThreads<T extends GroupingThread>(
   // Sort children by createdAt asc, id asc.
   for (const list of children.values()) {
     list.sort((a, b) => compareChildren(a, b));
+  }
+
+  // A `parentThreadId` cycle leaves its members unreachable from every root, so
+  // without this pass they would silently vanish from the sidebar. Promote the
+  // first unreachable thread in input order to a root and detach it from its
+  // former parent, then repeat until every thread is reachable.
+  const reachable = new Set<string>();
+  const markReachable = (id: string): void => {
+    if (reachable.has(id)) {
+      return;
+    }
+    reachable.add(id);
+    for (const kid of children.get(id) ?? []) {
+      markReachable(kid.id);
+    }
+  };
+  for (const root of roots) {
+    markReachable(root.id);
+  }
+  for (const thread of filtered) {
+    if (reachable.has(thread.id)) {
+      continue;
+    }
+    const formerParent = parentOf.get(thread.id);
+    if (formerParent !== null && formerParent !== undefined) {
+      const siblings = children.get(formerParent);
+      if (siblings !== undefined) {
+        const at = siblings.indexOf(thread);
+        if (at !== -1) {
+          siblings.splice(at, 1);
+        }
+      }
+    }
+    parentOf.set(thread.id, null);
+    roots.push(thread);
+    markReachable(thread.id);
   }
 
   // Determine forced visibility for each root.
