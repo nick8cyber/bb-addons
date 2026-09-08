@@ -4,6 +4,16 @@ export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
   bb.settings.define({
+    // Off switch reachable without a browser:
+    // `bb plugin config sidebar-collapse set useCollapsedList false` hands the
+    // sidebar back to bb's own list while leaving the plugin installed.
+    useCollapsedList: {
+      type: "boolean",
+      label: "Use the collapsed sidebar list",
+      description:
+        "Выключи, чтобы вернуть родной список тредов bb, не удаляя плагин.",
+      default: true,
+    },
     visibleThreads: {
       type: "number",
       label: "Chats shown per project",
