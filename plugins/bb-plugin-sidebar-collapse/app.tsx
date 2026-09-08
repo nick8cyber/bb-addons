@@ -246,6 +246,7 @@ function ThreadRow({
   row,
   activeThreadId,
   isCompactViewport,
+  showBranchName,
   onNavigate,
   actions,
   renamingThreadId,
@@ -254,6 +255,7 @@ function ThreadRow({
   row: GroupingRow<PluginSidebarThread>;
   activeThreadId: string | null;
   isCompactViewport: boolean;
+  showBranchName: boolean;
   onNavigate: () => void;
   actions: PluginSidebarThreadActions;
   renamingThreadId: string | null;
@@ -349,7 +351,7 @@ function ThreadRow({
             </span>
           )}
 
-          {!isRenaming && thread.environment?.branchName ? (
+          {showBranchName && !isRenaming && thread.environment?.branchName ? (
             <span className="flex max-w-[100px] shrink-0 items-center gap-0.5 truncate text-[11px] text-muted-foreground">
               <Icon name="GitBranch" className="size-3 shrink-0" />
               <span className="truncate">{thread.environment.branchName}</span>
@@ -427,6 +429,8 @@ function CollapsedThreadList({
       ? Math.floor(raw)
       : 5;
   const keepAttention = values?.keepAttention !== false;
+  const showBranchName = values?.showBranchName === true;
+  const showThreadCount = values?.showThreadCount === true;
 
   const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(
     () => new Set(),
@@ -538,9 +542,11 @@ function CollapsedThreadList({
             >
               {group.projectName}
             </button>
-            <span className="shrink-0 text-[11px] text-muted-foreground/70">
-              {group.rootCount}
-            </span>
+            {showThreadCount ? (
+              <span className="shrink-0 text-[11px] text-muted-foreground/70">
+                {group.rootCount}
+              </span>
+            ) : null}
             <button
               type="button"
               aria-label={`New thread in ${group.projectName}`}
@@ -566,6 +572,7 @@ function CollapsedThreadList({
                   row={row}
                   activeThreadId={activeThreadId}
                   isCompactViewport={isCompactViewport}
+                  showBranchName={showBranchName}
                   onNavigate={onNavigate}
                   actions={actions}
                   renamingThreadId={renamingThreadId}

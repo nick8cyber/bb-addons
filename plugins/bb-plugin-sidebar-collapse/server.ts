@@ -28,6 +28,20 @@ export default async function plugin(bb: BbPluginApi) {
         "Не скрывать под «Show more» чаты, которые ждут ответа или упали с ошибкой.",
       default: true,
     },
+    showBranchName: {
+      type: "boolean",
+      label: "Show the git branch in a row",
+      description:
+        "Дописывать в строку чата имя ветки его окружения. Родной список bb ветку не показывает.",
+      default: false,
+    },
+    showThreadCount: {
+      type: "boolean",
+      label: "Show the chat count next to a project",
+      description:
+        "Дописывать в заголовок проекта число его корневых чатов.",
+      default: false,
+    },
   });
 
   bb.onDispose(() => {
