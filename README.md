@@ -1,6 +1,6 @@
 # bb-addons
 
-Plugins and themes for [bb](https://getbb.app). Five plugins, one theme, all
+Plugins and themes for [bb](https://getbb.app). Six plugins, one theme, all
 usable independently.
 
 Install any of them straight from this repository:
@@ -11,6 +11,7 @@ bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin 
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin provider-agy
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin pi-gateways
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin speak
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin sidebar-collapse
 ```
 
 Or from a local clone — handy while developing, since bb reloads a `path:`
@@ -93,6 +94,28 @@ bb speak status
 ```
 
 Details in [plugins/bb-plugin-speak/README.md](plugins/bb-plugin-speak/README.md).
+
+### `sidebar-collapse`
+
+The sidebar keeps the first five chats of every project and folds the rest
+behind **Show more (N)**, the way Claude's sidebar does; the expanded group
+switches the button to **Show less**. Pinned chats, the chat you are in, and
+anything waiting on you are never folded away, so the limit only ever hides
+chats you are done with.
+
+It replaces bb's thread list through the exclusive
+`experimental_threadList` slot, so it also rebuilds what a row does: open,
+open in split, pin, read/unread, inline rename, archive, delete, the status
+indicator and bb's keyboard-shortcut DOM contract. What it does not rebuild —
+list virtualization, project sections, pull-request badges — is listed in the
+plugin README, along with the Settings switch that brings bb's own list back.
+
+```bash
+bb plugin config sidebar-collapse set visibleThreads 10
+```
+
+Details in
+[plugins/bb-plugin-sidebar-collapse/README.md](plugins/bb-plugin-sidebar-collapse/README.md).
 
 ## Themes
 
