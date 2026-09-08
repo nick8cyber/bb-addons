@@ -375,4 +375,50 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     expect(slot.queryByText("Thread 1")).toBeNull();
     expect(slot.queryByText("Show more (3)")).toBeNull();
   });
+
+  it("hides the branch name and the project chat count unless their settings are on", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const threads = [
+      makeThread({
+        id: "t-1",
+        title: "Thread 1",
+        projectId: "proj-1",
+        environment: {
+          id: "env-1",
+          name: "Worktree",
+          branchName: "feature/collapse",
+          workspaceDisplayKind: "managed-worktree",
+        },
+      }),
+    ];
+    const projects = [makeProject({ id: "proj-1", name: "Project One" })];
+    const props = {
+      activeThreadId: null,
+      activeProjectId: null,
+      isCompactViewport: false,
+      onNavigate: () => {},
+      searchQuery: "",
+      Original: () => <div>bb list</div>,
+    };
+
+    const off = renderSlot(app.threadLists[0]!, props, {
+      settings: { visibleThreads: 5 },
+      sidebarThreads: { status: "ready", threads, projects },
+    });
+    expect(off.queryByText("Thread 1")).toBeTruthy();
+    expect(off.queryByText("feature/collapse")).toBeNull();
+    expect(off.queryByText("1")).toBeNull();
+    off.lifecycle.unmount();
+
+    const on = renderSlot(app.threadLists[0]!, props, {
+      settings: {
+        visibleThreads: 5,
+        showBranchName: true,
+        showThreadCount: true,
+      },
+      sidebarThreads: { status: "ready", threads, projects },
+    });
+    expect(on.queryByText("feature/collapse")).toBeTruthy();
+    expect(on.queryByText("1")).toBeTruthy();
+  });
 });
