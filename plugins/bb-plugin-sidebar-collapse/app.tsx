@@ -568,7 +568,7 @@ function CollapsedThreadList({
   }
 
   return (
-    <div className="flex flex-col gap-2 p-1">
+    <div className="flex flex-col gap-3 p-1">
       {groups.map((group: GroupingGroup<PluginSidebarThread>) => (
         <div key={group.key} className="flex flex-col gap-0.5">
           <div
@@ -615,7 +615,7 @@ function CollapsedThreadList({
               moveProject(moved, target.projectId, target.edge);
             }}
             className={cn(
-              "group/header flex h-7 cursor-grab items-center gap-1.5 px-2 text-xs font-medium text-muted-foreground",
+              "group/header flex h-6 cursor-grab items-center gap-1 rounded-md px-1 text-xs font-medium text-sidebar-foreground/75",
               draggingProjectId === group.projectId && "opacity-50",
               dropTarget?.projectId === group.projectId &&
                 (dropTarget.edge === "before"
@@ -639,7 +639,6 @@ function CollapsedThreadList({
                 className="size-3.5 shrink-0"
               />
             </button>
-            <Icon name="Folder" className="size-3.5 shrink-0" />
             <button
               type="button"
               onClick={() => {
@@ -693,17 +692,11 @@ function CollapsedThreadList({
                   type="button"
                   aria-expanded={group.isExpanded}
                   onClick={() => toggleExpand(group.key)}
-                  className="flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
+                  className="flex h-6 w-full cursor-pointer items-center rounded-md pl-2 text-left text-[11px] text-sidebar-foreground/55 hover:text-sidebar-foreground"
                 >
-                  <Icon
-                    name={group.isExpanded ? "ChevronsUp" : "ChevronDown"}
-                    className="size-3.5 shrink-0"
-                  />
-                  <span>
-                    {group.isExpanded
-                      ? "Show less"
-                      : `Show more (${group.hiddenCount})`}
-                  </span>
+                  {group.isExpanded
+                    ? "Show less"
+                    : `Show more (${group.hiddenCount})`}
                 </button>
               )}
             </div>
