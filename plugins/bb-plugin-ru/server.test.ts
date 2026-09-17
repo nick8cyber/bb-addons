@@ -116,3 +116,62 @@ describe("bb ru", () => {
     expect(result.stderr).toContain("неизвестная команда");
   });
 });
+
+describe("рекомендации аудита на русском", () => {
+  function agentContext(title: string | null) {
+    return {
+      pluginMetadata: {},
+      thread: {
+        id: "thread-test",
+        title,
+        parentThreadId: null,
+        sourceThreadId: null,
+      },
+      project: {
+        id: "project-test",
+        kind: "standard" as const,
+        name: "test",
+        gitRemoteUrl: null,
+      },
+      environment: {
+        id: "env-test",
+        name: null,
+        path: null,
+        branchName: null,
+        workspaceProvisionType: null,
+      },
+      host: { id: "host-test", name: "test" },
+      provider: {
+        id: "provider-test",
+        model: "model-test",
+        capabilities: { supportsNativeUserQuestion: false },
+      },
+      origin: { kind: null, pluginId: null },
+    };
+  }
+
+  it("по умолчанию добавляет указание ревьюеру Advisor", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.resolveAgentConfiguration(
+      agentContext("Advisor · Мой тред"),
+    );
+    expect(result.instructions).toContain("русском");
+  });
+
+  it("не трогает обычные треды", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.resolveAgentConfiguration(
+      agentContext("Мой обычный тред"),
+    );
+    expect(result.instructions).toBeNull();
+  });
+
+  it("выключается настройкой advisorRussian", async () => {
+    const { harness } = await load({ advisorRussian: false });
+    const result = await harness.behavior.resolveAgentConfiguration(
+      agentContext("Advisor · Мой тред"),
+    );
+    expect(result.instructions).toBeNull();
+  });
+});
+
