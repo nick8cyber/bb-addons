@@ -108,6 +108,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (!title.startsWith(ADVISOR_TITLE_PREFIX)) {
       return { tools: [], skills: [] };
     }
+    bb.log.info(`инструкция на русском добавлена треду ${context.thread.id}`);
     return { tools: [], skills: [], instructions: ADVISOR_RUSSIAN_INSTRUCTIONS };
   });
 
