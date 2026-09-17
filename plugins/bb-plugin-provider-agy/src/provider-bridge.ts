@@ -507,6 +507,11 @@ function quotaResetAtMs(message: string): number | null {
  */
 function emitRateLimitBlocked(session: Session, message: string): void {
   session.rateLimitsBlocked = true;
+  const resetsAtMs = quotaResetAtMs(message);
+  const oneLine = message.replace(/[\r\n]+/gu, " ").slice(0, 160);
+  log(
+    `rateLimits blocked for thread ${session.threadId}: resetsAtMs=${resetsAtMs === null ? "unknown" : new Date(resetsAtMs).toISOString()} text="${oneLine}"`,
+  );
   emitDeltas(session, {
     kind: "provider.rateLimits",
     rateLimits: {
@@ -534,6 +539,9 @@ function clearRateLimit(session: Session): void {
     return;
   }
   session.rateLimitsBlocked = false;
+  log(
+    `rateLimits cleared for thread ${session.threadId}: quota window reopened`,
+  );
   emitDeltas(session, {
     kind: "provider.rateLimits",
     rateLimits: {
@@ -598,6 +606,7 @@ function clearQuotaRetryTimer(session: Session): void {
   if (session.autoRetryTimer !== null) {
     clearTimeout(session.autoRetryTimer);
     session.autoRetryTimer = null;
+    log(`quota retry timer cancelled for thread ${session.threadId}`);
   }
 }
 
@@ -716,18 +725,27 @@ function wakeQuotaRetry(
   // The session may have been stopped, or replaced by a fresh thread/start,
   // while the timer slept; a stale wake owns nothing.
   if (sessions.get(session.threadId) !== session) {
+    log(
+      `quota retry ${attempt}: stale wake, session for thread ${session.threadId} was replaced; dropping`,
+    );
     return;
   }
   if (session.stopping || session.providerThreadId === null) {
+    log(
+      `quota retry ${attempt}: stale wake for thread ${session.threadId} (stopping=${session.stopping}); dropping`,
+    );
     return;
   }
   if (session.pending.length === 0) {
+    log(
+      `quota retry ${attempt}: nothing queued for thread ${session.threadId}; dropping`,
+    );
     return;
   }
   log(
     freshConversation
-      ? `quota retry ${attempt}: rotating to account ${session.accountLabel ?? "?"} after ${Math.round(waitMs / 1000)}s; rebuilding agy for thread ${session.threadId} on a fresh conversation`
-      : `quota retry ${attempt}: window reopened after ${Math.round(waitMs / 1000)}s; rebuilding agy for thread ${session.threadId}`,
+      ? `quota retry ${attempt}: sessionReplaced for thread ${session.threadId} (contextLost=true), rotating to account ${session.accountLabel ?? "?"} after ${Math.round(waitMs / 1000)}s; rebuilding agy on a fresh conversation`
+      : `quota retry ${attempt}: sessionReplaced for thread ${session.threadId} (contextLost=false), window reopened after ${Math.round(waitMs / 1000)}s; rebuilding agy on conversation ${session.providerThreadId ?? "?"}`,
   );
   notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
     threadId: session.threadId,
@@ -937,9 +955,18 @@ function childEnvOverlay(session: Session): Record<string, string> {
     if (accounts.length > 0) {
       if (session.accountLabel === null) {
         const ledger = loadLedger(cliproxyRelayDataDir);
-        session.accountLabel = pickAccount(ledger, accounts)?.label ?? null;
+        const picked = pickAccount(ledger, accounts);
+        session.accountLabel = picked?.label ?? null;
+        log(
+          `session ${session.threadId}: pinned to account ${session.accountLabel ?? "none"} (pool ${accounts.length})`,
+        );
       }
       const account = accountByLabel(accounts, session.accountLabel);
+      if (account === null) {
+        log(
+          `session ${session.threadId}: account ${session.accountLabel ?? "none"} not in pool (${accounts.length}); falling back to relay/direct`,
+        );
+      }
       if (account !== null) {
         const overlay: Record<string, string> = { HOME: account.home };
         if (account.proxy !== null) {
@@ -1030,7 +1057,7 @@ function startChild(args: StartChildArgs): void {
     delete env.GOOGLE_GEMINI_BASE_URL;
   }
   log(
-    `spawning ${command} ${spawnArgs.map((a) => JSON.stringify(a)).join(" ")} (cwd ${session.cwd}, HOME ${env.HOME ?? "<unset>"}${session.accountLabel ? `, account ${session.accountLabel}` : ""})`,
+    `spawn gen ${generation} conv ${args.conversationId ?? "fresh"} account ${session.accountLabel ?? "none"} env ${"GEMINI_API_KEY" in overlay ? "relay" : session.accountLabel !== null ? "pool" : "direct"} HOME ${env.HOME ?? "<unset>"} proxy ${"HTTPS_PROXY" in overlay ? "yes" : "no"}: ${command} ${spawnArgs.map((a) => JSON.stringify(a)).join(" ")} (cwd ${session.cwd})`,
   );
   const child = spawn(command, spawnArgs, {
     cwd: session.cwd,
@@ -1152,7 +1179,9 @@ function failSession(
   opts: { surfaceError?: boolean } = {},
 ): void {
   const surfaceError = opts.surfaceError ?? true;
-  log(`session ${session.threadId} failed: ${message}`);
+  const failCategory = classifyError(message) ?? "unclassified";
+  const failOneLine = message.replace(/[\r\n]+/gu, " ").slice(0, 300);
+  log(`session ${session.threadId} failed [${failCategory}]: ${failOneLine}`);
   // A session failure is the verdict, whatever retry was pending: settle
   // everything failed (including the queued retry turn) and stop the timer.
   clearQuotaRetryTimer(session);
@@ -1821,7 +1850,9 @@ function enqueueTurn(session: Session, turn: Turn): void {
     // say so: a silent replacement is the #1268 incident. The notification
     // goes out before the spawn, so nothing the replacement says can precede
     // the announcement that it exists.
-    log(`rebuilding agy child for thread ${session.threadId}`);
+    log(
+      `sessionReplaced for thread ${session.threadId}: child gone, restarting on conversation ${session.providerThreadId} (contextLost=false)`,
+    );
     notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
       threadId: session.threadId,
       providerThreadId: session.providerThreadId,
@@ -2040,7 +2071,8 @@ const handlers: Record<string, RequestHandler> = {
     sessions.set(data.threadId, session);
     if (accountsEnabled(process.env) && cliproxyRelayDataDir !== null) {
       const ledger = loadLedger(cliproxyRelayDataDir);
-      const picked = pickAccount(ledger, listAccounts(cliproxyRelayDataDir));
+      const accounts = listAccounts(cliproxyRelayDataDir);
+      const picked = pickAccount(ledger, accounts);
       session.accountLabel = picked?.label ?? null;
       if (picked !== null) {
         // Reserve at pick time, not at init: N simultaneous thread/start
@@ -2048,7 +2080,18 @@ const handlers: Record<string, RequestHandler> = {
         // previous one's account as used or they all pin to the same LRU.
         markAccountUse(ledger, picked.label);
         saveLedger(cliproxyRelayDataDir, ledger);
+        log(
+          `session ${session.threadId}: pinned to account ${picked.label} (pool ${accounts.length}, HOME ${picked.home}, proxy ${picked.proxy !== null ? "yes" : "no"})`,
+        );
+      } else {
+        log(
+          `session ${session.threadId}: no pool account pinned (pool ${accounts.length}); relay/direct mode`,
+        );
       }
+    } else {
+      log(
+        `session ${session.threadId}: account pool disabled or no data dir; relay/direct mode`,
+      );
     }
     if (data.input !== undefined && data.input.length > 0) {
       // The first turn carries no clientRequestId — only turn/start and
@@ -2129,6 +2172,9 @@ const handlers: Record<string, RequestHandler> = {
       session.accountLabel = conversationAccount(
         loadLedger(cliproxyRelayDataDir),
         data.providerThreadId,
+      );
+      log(
+        `session ${session.threadId}: resumed conversation ${data.providerThreadId} on account ${session.accountLabel ?? "none (relay/direct)"}`,
       );
     }
     startChild({
