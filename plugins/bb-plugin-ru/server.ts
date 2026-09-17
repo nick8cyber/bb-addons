@@ -11,11 +11,27 @@ import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 /** Больше этого в одной пачке не принимаем. */
-const MAX_BATCH = 200;
-/** Строки длиннее — не подписи интерфейса. */
+const MAX_BATCH = 200;/** Строки длиннее — не подписи интерфейса. */
 const MAX_TEXT_LENGTH = 200;
 /** Верхняя граница таблицы, чтобы копилка не росла бесконечно. */
 const MAX_ROWS = 5000;
+
+/**
+ * Префикс заголовков тредов ревьюера Advisor — тот же ADVISOR_TITLE_PREFIX,
+ * с которым плагин advisor спавнит свои скрытые треды проверки
+ * (`title: "Advisor · …"`). Единственный сигнал в контексте агента,
+ * позволяющий отличить сессию ревьюера от обычного треда.
+ */
+const ADVISOR_TITLE_PREFIX = "Advisor · ";
+
+/**
+ * Указание ревьюеру писать выводы по-русски. Машиночитаемые поля
+ * (severity, key, resolved) трогать запрещено — только человекочитаемый текст.
+ */
+const ADVISOR_RUSSIAN_INSTRUCTIONS =
+  "Пиши выводы проверки на русском языке: поля summary и details результата " +
+  "ADVISOR_RESULT, а также любые пояснения пользователю — на русском. " +
+  "Технические поля (severity, key, resolved) и имена собственные оставь без изменений.";
 
 const missingRow = z.object({
   text: z.string(),
@@ -64,6 +80,35 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Собирать непереведённые строки",
       default: false,
     },
+    advisorRussian: {
+      type: "boolean",
+      label: "Рекомендации аудита на русском",
+      description:
+        "Добавлять ревьюеру Advisor указание писать выводы проверки на русском языке.",
+      default: true,
+    },
+  });
+
+  // Кэш для синхронного bb.agents.configure: сам колбэк асинхронным быть не
+  // может, поэтому читаем один раз при старте и обновляем по onChange.
+  let advisorRussian = (await settings.get()).advisorRussian;
+  settings.onChange((next) => {
+    if (typeof next.advisorRussian === "boolean") {
+      advisorRussian = next.advisorRussian;
+    }
+  });
+
+  // Ревьюер Advisor — обычная агентская сессия в скрытом треде с заголовком
+  // "Advisor · …". Когда опция включена, добавляем ему указание отвечать
+  // по-русски: summary/details попадают в панель аудита и в очередь советов
+  // основному агенту уже на русском.
+  bb.agents.configure((context) => {
+    if (!advisorRussian) return { tools: [], skills: [] };
+    const title = context.thread.title ?? "";
+    if (!title.startsWith(ADVISOR_TITLE_PREFIX)) {
+      return { tools: [], skills: [] };
+    }
+    return { tools: [], skills: [], instructions: ADVISOR_RUSSIAN_INSTRUCTIONS };
   });
 
   const db = bb.storage.database();
