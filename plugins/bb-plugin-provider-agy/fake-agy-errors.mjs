@@ -136,6 +136,20 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       process.stderr.write("warning: the model is behind and may be slow\n");
     }
     if (mode === "tool") {
+      // A live start first, then twice verbatim: the bridge must stream the
+      // tool's name and its ACTIVE/DONE settle live, and still report the
+      // message once per turn.
+      out({
+        event: "step_update",
+        step_update: {
+          ...scope,
+          step_index: step++,
+          state: "ACTIVE",
+          step_type: "tool",
+          tool_name: "write_to_file",
+          tool_info: { name: "write_to_file" },
+        },
+      });
       // Twice, verbatim: the bridge must report the message once per turn.
       for (let i = 0; i < 2; i += 1) {
         out({
@@ -147,6 +161,7 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
             step_type: "tool",
             tool_name: "write_to_file",
             tool_info: { name: "write_to_file", error: { message: QUOTA } },
+            duration_seconds: 1.5,
           },
         });
       }
