@@ -96,7 +96,7 @@ provider is configured and not only here.
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
-| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay, the immediate reject whose exit 1 must not add a raw banner, and the native `provider/rateLimits/updated` blocked→allowed snapshot |
+| `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay, the immediate reject whose exit 1 must not add a raw banner, the native `provider/rateLimits/updated` blocked→allowed snapshot, and live named `tool` items with settle progress |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
 
@@ -107,8 +107,9 @@ Output:
 
 ```
 {"event":"init","conversation_id":"…","init":{"model":…,"cwd":…,"tools":[…],"permission_mode":…}}
-{"event":"step_update","step_update":{"conversation_id":…,"step_index":N,"state":"ACTIVE"|"DONE",
-   "step_type":"user_input"|"checkpoint"|"agent_response","text_delta":"…","usage":{…},"duration_seconds":…}}
+{"event":"step_update","step_update":{"conversation_id":…,"step_index":N,"state":"ACTIVE"|"DONE"|"ERROR",
+   "step_type":"user_input"|"checkpoint"|"agent_response"|"tool","text_delta":"…","usage":{…},"duration_seconds":…,
+   "tool_name":"…","tool_info":{"name":"…","error":{"message":"…"}}}}
 {"event":"result","result":{"conversation_id":…,"status":"SUCCESS"|"ERROR","response":"…","error":"…",
    "num_turns":N,"usage":{"input_tokens":…,"output_tokens":…,"thinking_tokens":…,
    "cache_read_tokens":…,"total_tokens":…}}}
@@ -261,7 +262,13 @@ A single path (`reportError`) now turns error text from ANY of those channels
 into a thread-visible `provider.error`:
 
 - a `tool` step that settles `ERROR` is surfaced even when the turn itself
-  recovers and completes;
+  recovers and completes; every tool step also streams live as its own `tool`
+  item — `item.open` names the tool on first sight, `item.progress` says
+  `running <tool>` on `ACTIVE` and `<tool> finished|failed` on settle, and
+  `item.close` carries the name, the error and `durationMs` from
+  `duration_seconds`. agy sends no args and no call output, so those fields
+  stay absent rather than invented; a step that starts but never settles is
+  closed with the turn;
 - agy's **stderr** is line-reassembled (data chunks do not respect line
   boundaries) then surfaced; its `warning:`-prefixed protocol chatter is logged
   but not surfaced; ANSI paint is stripped;
@@ -276,7 +283,7 @@ The `⚠ Individual quota reached. … Resets in 8m11s.` notice arrives with its
 message reaching the thread on two channels within one turn is reported once
 (per-turn dedup); the next turn is free to report it again.
 
-A period of blocked quota is reported to bb NESTATIVELY, not just as error
+A period of blocked quota is reported to bb natively, not just as error
 text. When the classified message carries the reset window — `Resets in
 1h13m29s.`, `Resets in 47m42s.`, `Resets in 8m11s.` — the bridge opens the
 `provider/rateLimits/updated` snapshot on the thread: `blocked`,
@@ -534,10 +541,10 @@ bb thread output <thread>
 
 - **Tool approvals.** Needs a back channel agy's stream-json does not have; until
   then only `permissionModes: ["full"]`.
-- **Tool-call rows.** agy's `step_update` only reports `user_input`,
-  `checkpoint` and `agent_response`; if agy gains per-tool steps they arrive as
-  `provider/raw` (`coverage: "unknown"`) and are visible in debug UI rather
-  than silently dropped.
+- **Tool-call rows.** Done for what agy sends: `tool` steps stream live as
+  named `tool` items with `ACTIVE`/settle progress, error and `durationMs`.
+  What is still missing is on agy's side — no args and no call output travel
+  in `step_update`, so those fields stay absent rather than invented.
 - **Mid-turn injection.** `turn/steer` is honoured as `steerMode: "queue"` —
   accepted while a turn is live and run as the next turn (see below) — but agy
   has no channel for reaching the model *inside* a running turn, so the steer
@@ -602,8 +609,9 @@ An existing thread keeps the bridge build its own worker process was started
 with, so the fix reaches a running thread only after that session restarts.
 
 `node harness-errors.mjs` proves the error paths with no account and no quota —
-25/25: a failed tool step inside a turn that then completes reaches the thread
-exactly once per turn with its `rate-limit` category, the ⚠ banner on stderr
+40/40: a failed tool step inside a turn that then completes reaches the thread
+exactly once per turn with its `rate-limit` category, and the same steps stream
+live as named `tool` items with `ACTIVE`/settle progress and `durationMs`, the ⚠ banner on stderr
 reaches the thread while a `warning:` line beside it does not, a turn-less
 `ERROR` result — with either an explicit or a missing `status` — fails the
 session with the message named, the quota-residue replay settles answering

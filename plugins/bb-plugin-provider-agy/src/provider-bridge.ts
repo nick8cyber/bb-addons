@@ -207,6 +207,14 @@ interface OpenItem {
   text: string;
 }
 
+/** A tool step currently shown live as a `tool` item in the thread. */
+interface OpenToolItem {
+  itemId: string;
+  name: string;
+  error: string | null;
+  durationMs: number | null;
+}
+
 interface Turn {
   turnId: string;
   /** Absent for the first turn carried on thread/start. */
@@ -217,6 +225,17 @@ interface Turn {
   /** agy step_index → the assistant-message item that step streams into. */
   items: Map<number, OpenItem>;
   itemOrdinal: number;
+  /**
+   * agy step_index (or a negative fallback when the step carries none) → the
+   * live `tool` item for a tool step. agy reports tool calls as bare
+   * start/settle step_updates — no args, no output — so the item carries the
+   * one thing the step does name: which tool ran, when it started, and how it
+   * settled. Entries leave the map when the step settles; whatever is still
+   * open at the turn's end is closed with the turn.
+   */
+  toolItems: Map<number, OpenToolItem>;
+  /** Distinct keys for tool steps that arrive without a step_index. */
+  toolOrdinal: number;
   /**
    * Tool-step errors seen in this turn, verbatim. agy's `result.error` is the
    * last one of these even when the agent retried and finished the work, so
@@ -1294,6 +1313,7 @@ function handleStepUpdate(
       } else if (event.state === "DONE" && turn.toolErrors.size > 0) {
         turn.toolRecovered = true;
       }
+      handleToolStep(session, turn, event);
     }
     providerRaw(
       session,
@@ -1343,6 +1363,98 @@ function handleStepUpdate(
   }
 }
 
+/**
+ * Stream a tool step into the thread as it happens: `item.open` names the
+ * tool the moment its step first shows up, `item.progress` says it started
+ * (`ACTIVE`) and how it settled (`DONE`/`ERROR`), and `item.close` settles
+ * the row with the tool's name, error and duration. agy never sends args or
+ * output for the call, so those fields stay absent rather than invented.
+ */
+function handleToolStep(
+  session: Session,
+  turn: Turn,
+  event: Extract<ReturnType<typeof parseAgyLine>, { event: "step_update" }>,
+): void {
+  const name = event.toolName ?? "tool";
+  // A step without an index still gets its own row: negative keys can never
+  // collide with agy's non-negative step_index values.
+  let key: number;
+  if (event.stepIndex !== null) {
+    key = event.stepIndex;
+  } else {
+    turn.toolOrdinal += 1;
+    key = -turn.toolOrdinal;
+  }
+  let item = turn.toolItems.get(key);
+  if (item === undefined) {
+    turn.itemOrdinal += 1;
+    item = {
+      itemId: `${turn.turnId}_item_${turn.itemOrdinal}`,
+      name,
+      error: null,
+      durationMs: null,
+    };
+    turn.toolItems.set(key, item);
+    emitDeltas(session, {
+      kind: "item.open",
+      providerTurnId: turn.turnId,
+      key: { providerItemId: item.itemId },
+      item: { type: "tool", tool: name },
+    });
+  }
+  if (event.toolError !== null) {
+    item.error = event.toolError;
+  }
+  if (event.durationMs !== null) {
+    item.durationMs = event.durationMs;
+  }
+  const state = event.state ?? "";
+  if (state === "ACTIVE") {
+    emitDeltas(session, {
+      kind: "item.progress",
+      providerTurnId: turn.turnId,
+      key: { providerItemId: item.itemId },
+      message: `running ${item.name}`,
+    });
+    return;
+  }
+  if (state === "DONE" || state === "ERROR") {
+    emitDeltas(session, {
+      kind: "item.progress",
+      providerTurnId: turn.turnId,
+      key: { providerItemId: item.itemId },
+      message:
+        state === "ERROR" ? `${item.name} failed` : `${item.name} finished`,
+    });
+    closeToolItem(session, turn, key, state === "ERROR");
+  }
+}
+
+function closeToolItem(
+  session: Session,
+  turn: Turn,
+  key: number,
+  failed: boolean,
+): void {
+  const item = turn.toolItems.get(key);
+  if (item === undefined) {
+    return;
+  }
+  turn.toolItems.delete(key);
+  emitDeltas(session, {
+    kind: "item.close",
+    providerTurnId: turn.turnId,
+    key: { providerItemId: item.itemId },
+    item: {
+      type: "tool",
+      tool: item.name,
+      ...(item.error === null ? {} : { error: item.error }),
+      ...(item.durationMs === null ? {} : { durationMs: item.durationMs }),
+    },
+    status: failed ? "failed" : "completed",
+  });
+}
+
 function closeOpenItems(session: Session, turn: Turn): void {
   for (const [stepIndex, item] of [...turn.items]) {
     emitDeltas(session, {
@@ -1353,6 +1465,12 @@ function closeOpenItems(session: Session, turn: Turn): void {
       status: "completed",
     });
     turn.items.delete(stepIndex);
+  }
+  // A tool step that started but never settled (no DONE/ERROR arrived before
+  // the result) still gets its row closed: failed when the turn saw tool
+  // errors, completed otherwise.
+  for (const key of [...turn.toolItems.keys()]) {
+    closeToolItem(session, turn, key, turn.toolErrors.size > 0);
   }
 }
 
@@ -1749,6 +1867,8 @@ function createTurn(args: {
     started: false,
     items: new Map(),
     itemOrdinal: 0,
+    toolItems: new Map(),
+    toolOrdinal: 0,
     toolErrors: new Set<string>(),
     toolRecovered: false,
     artifactRetries: 0,

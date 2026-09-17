@@ -82,6 +82,12 @@ const completed = (threadId) =>
   deltas(threadId).filter((delta) => delta.kind === "turn.boundary");
 const rateLimits = (threadId) =>
   deltas(threadId).filter((delta) => delta.kind === "provider.rateLimits");
+const opens = (threadId) =>
+  deltas(threadId).filter((delta) => delta.kind === "item.open");
+const progresses = (threadId) =>
+  deltas(threadId).filter((delta) => delta.kind === "item.progress");
+const closes = (threadId) =>
+  deltas(threadId).filter((delta) => delta.kind === "item.close");
 
 async function waitFor(predicate, ms, label) {
   const deadline = Date.now() + ms;
@@ -233,6 +239,9 @@ bridge.onClose?.();
 process.stdout.write = originalWrite;
 
 const toolErrors = errors(tool.threadId);
+const toolOpens = opens(tool.threadId).filter((d) => d.item?.type === "tool");
+const toolProgress = progresses(tool.threadId);
+const toolCloses = closes(tool.threadId).filter((d) => d.item?.type === "tool");
 const stderrErrors = errors(stderr.threadId);
 const residueErrors = errors(residue.threadId);
 const residueBoundaries = completed(residue.threadId);
@@ -255,6 +264,11 @@ const checks = [
   ["tool/exactly-one-report-per-turn", toolErrors.length === 2, `${toolErrors.length} error rows for a twice-repeated step error over two turns`],
   ["tool/reported-again-on-the-next-turn", toolErrors.length === 2, `${toolErrors.length} error rows; the per-turn dedup must not cross turns`],
   ["tool/turns-complete-despite-the-error", completed(tool.threadId).length === 2 && completed(tool.threadId).every((t) => t.status === "completed"), JSON.stringify(completed(tool.threadId).map((t) => t.status))],
+  ["tool/live-names-every-action", toolOpens.length === 6 && toolOpens.every((d) => d.item?.tool === "write_to_file"), JSON.stringify(toolOpens.map((d) => d.item?.tool))],
+  ["tool/live-active-progress", toolProgress.some((d) => d.message === "running write_to_file"), JSON.stringify(toolProgress.map((d) => d.message))],
+  ["tool/live-settle-progress", toolProgress.filter((d) => d.message === "write_to_file failed").length === 4, JSON.stringify(toolProgress.map((d) => d.message))],
+  ["tool/live-closes-failed", toolCloses.length === 6 && toolCloses.every((d) => d.status === "failed"), JSON.stringify(toolCloses.map((d) => d.status))],
+  ["tool/live-duration-surfaced", toolCloses.filter((d) => d.item?.durationMs === 1500).length === 4, JSON.stringify(toolCloses.map((d) => d.item?.durationMs ?? null))],
   ["stderr/banner-reaches-thread", stderrErrors.length === 1 && stderrErrors[0].message === QUOTA, JSON.stringify(stderrErrors.map((e) => e.message)).slice(0, 120)],
   ["stderr/error-scoped-and-categorized", stderrErrors.length === 1 && stderrErrors[0].threadScoped === true && stderrErrors[0].category === "rate-limit", ""],
   ["stderr/warning-line-is-not-a-thread-error", stderrErrors.length === 1, `${stderrErrors.length} error rows; the warning: line must add none`],

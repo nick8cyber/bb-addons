@@ -180,6 +180,8 @@ export type AgyEvent =
       state: string | null;
       textDelta: string | null;
       usage: AgyUsage | null;
+      /** `duration_seconds` on the step, as whole milliseconds. */
+      durationMs: number | null;
       /** `tool_info.name` on a `tool` step. */
       toolName: string | null;
       /** `tool_info.error.message` on a `tool` step that failed. */
@@ -272,6 +274,12 @@ export function parseAgyLine(line: string): AgyEvent {
       state: str(step.state),
       textDelta: typeof step.text_delta === "string" ? step.text_delta : null,
       usage: usage(step.usage),
+      durationMs:
+        typeof step.duration_seconds === "number" &&
+        Number.isFinite(step.duration_seconds) &&
+        step.duration_seconds >= 0
+          ? Math.round(step.duration_seconds * 1000)
+          : null,
       toolName: str(step.tool_name) ?? str(toolInfo.name),
       toolError: str(toolError.message),
     };
