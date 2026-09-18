@@ -366,19 +366,25 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       }
       return;
     }
-    if (mode === "pool-bare-once" || mode === "pool-exit-once") {
+    if (mode === "pool-bare-once" || mode === "pool-exit-once" || mode === "pool-exit-trailing") {
       // PLUG-58 shapes: a quota WITHOUT any "Resets in" countdown, fired
       // ONCE per data dir (root sentinel file) so the bridge must rotate to
       // a sibling on classification alone. pool-bare-once refuses via an
       // ERROR result carrying a bare 429 text; pool-exit-once dies BEFORE
-      // any result, leaving only a stderr banner behind.
+      // any result, leaving only a stderr banner behind; pool-exit-trailing
+      // is the same death but buries the banner under a trailing
+      // non-quota stderr line (the auditor's blind spot: lastStderr alone
+      // no longer names the quota).
       const BARE = "⚠ Rate limit reached (429): slow down and try again later.";
       const onceFile =
         process.env.AGY_FAKE_ONCE_FILE ?? `/tmp/agy-${mode}-done`;
       if (!existsSync(onceFile)) {
         writeFileSync(onceFile, `${process.pid}\n`);
-        if (mode === "pool-exit-once") {
+        if (mode === "pool-exit-once" || mode === "pool-exit-trailing") {
           process.stderr.write(`${BARE}\n`);
+          if (mode === "pool-exit-trailing") {
+            process.stderr.write(`info: cleaning up and shutting down\n`);
+          }
           setTimeout(() => process.exit(1), 100);
         } else {
           out({
