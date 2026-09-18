@@ -48,7 +48,11 @@ import {
   turnSteerParamsSchema,
   withoutBridgeRuntimeEnv,
 } from "@get-bb/plugin-sdk/provider-bridge";
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import {
+  type ChildProcessWithoutNullStreams,
+  execFileSync,
+  spawn,
+} from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -359,6 +363,12 @@ interface Session {
    * `--conversation` and announces the replacement with `contextLost: true`.
    */
   /**
+   * Assistant text streamed so far this session (sliding window, capped):
+   * the raw material a quota-rotation handoff summarizes so the next
+   * account does not restart blind. Bounded — never the full history.
+   */
+  recentAssistantText: string;
+  /**
    * Last time the session did anything (a turn arrived, a result settled,
    * the child announced itself). The idle sweep releases children that have
    * been idle past AGY_IDLE_KILL_MS — the conversation stays on disk and
@@ -602,6 +612,122 @@ function quotaRetryMaxWaitMs(): number {
     : DEFAULT_QUOTA_RETRY_MAX_WAIT_MS;
 }
 
+/**
+ * Cooldown booked on the burnt account when a classified rate-limit names
+ * no reset countdown: without a "Resets in …" to parse, the window is
+ * assumed to be agy's usual ~50-minute individual one, so half of that.
+ */
+const DEFAULT_QUOTA_COOLDOWN_MS = 1_800_000;
+
+/** Sliding window of streamed assistant text kept for the rotation handoff. */
+const HANDOFF_STREAMED_TEXT_CAP = 4_000;
+
+/** Marker so harnesses (and readers) can tell a handoff prompt apart. */
+const HANDOFF_TAG = "[quota-rotation-handoff]";
+
+/**
+ * `git diff --stat` for the handoff, or null when git cannot say (not a
+ * repo, no binary, timeout). Stat names only, never content — and capped.
+ */
+function gitDiffStat(cwd: string): string | null {
+  try {
+    const out = execFileSync("git", ["-C", cwd, "diff", "--stat"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      maxBuffer: 64 * 1024,
+    });
+    return out.trim().slice(0, 1500);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compact handoff for a turn re-run on a fresh account: the old
+ * conversation is gone, so the retry carries what the bridge actually
+ * knows — the interrupted prompt, the assistant text already streamed this
+ * session, and the working-tree stat. Bounded (~8 KB); never the history.
+ * (No native restore/import exists in agy's stream-json: stdin takes only
+ * `user` lines and `/fork` is a TUI slash command, so a prompt handoff is
+ * the only cross-account context transfer. Copying the conversation DB
+ * between HOMEs is deliberately out of scope.)
+ */
+function buildQuotaHandoffPrompt(session: Session, failedTurn: Turn): string {
+  const goal = failedTurn.prompt.slice(0, 2000);
+  const streamed =
+    session.recentAssistantText.length > 0
+      ? session.recentAssistantText.slice(-HANDOFF_STREAMED_TEXT_CAP)
+      : "(nothing streamed yet)";
+  const stat = gitDiffStat(session.cwd);
+  const tree =
+    stat === null
+      ? "(git unavailable or not a repo)"
+      : stat.length === 0
+        ? "(clean)"
+        : stat;
+  const followers =
+    session.turns.length > 0
+      ? ` ${session.turns.length} more queued turn(s) will follow with their original prompts.`
+      : "";
+  return (
+    `${HANDOFF_TAG} your previous conversation is gone — quota rotation ` +
+    `moved this thread to a different account with NO history. ` +
+    `Do not ask for confirmation; continue the work below.\n` +
+    `GOAL (the interrupted turn's original prompt):\n${goal}\n` +
+    `WHAT WAS ALREADY DONE (partial assistant output streamed before the quota hit):\n${streamed}\n` +
+    `WORKING-TREE STATE (git diff --stat in ${session.cwd}):\n${tree}\n` +
+    `NEXT STEP: continue from the state above without redoing completed work.${followers}`
+  );
+}
+
+/**
+ * Point-2 guard: before (re)spawning onto the session's pinned account,
+ * check its pool cooldown. A cooled account rotates to a free sibling NOW
+ * instead of restarting on a dead HOME. Returns the rotation, or null when
+ * the pinned account is usable (or the pool does not apply).
+ */
+function rotateCooldownAccount(
+  session: Session,
+  where: string,
+): { from: string; to: string } | null {
+  if (
+    cliproxyRelayDataDir === null ||
+    !accountsEnabled(process.env) ||
+    session.accountLabel === null
+  ) {
+    return null;
+  }
+  const ledger = loadLedger(cliproxyRelayDataDir);
+  const untilMs = ledger.accounts[session.accountLabel]?.cooldownUntilMs ?? 0;
+  if (untilMs <= Date.now()) {
+    return null;
+  }
+  const accounts = listAccounts(cliproxyRelayDataDir);
+  const candidate = pickAccount(ledger, accounts, session.accountLabel);
+  if (candidate === null) {
+    return null;
+  }
+  const candidateUntilMs =
+    ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0;
+  if (candidateUntilMs > Date.now()) {
+    // pickAccount names the soonest-opening sibling when all are cooling;
+    // that is still a dead HOME, so stay and let the caller wait it out.
+    log(
+      `${where}: account ${session.accountLabel} cools until ${new Date(untilMs).toISOString()} and no sibling is free ` +
+        `(best ${candidate.label} until ${new Date(candidateUntilMs).toISOString()}); staying`,
+    );
+    return null;
+  }
+  const from = session.accountLabel;
+  session.accountLabel = candidate.label;
+  markAccountUse(ledger, candidate.label);
+  saveLedger(cliproxyRelayDataDir, ledger);
+  log(
+    `${where}: account ${from} cools until ${new Date(untilMs).toISOString()}; rotated to free sibling ${candidate.label}`,
+  );
+  return { from, to: candidate.label };
+}
+
 function clearQuotaRetryTimer(session: Session): void {
   if (session.autoRetryTimer !== null) {
     clearTimeout(session.autoRetryTimer);
@@ -629,11 +755,21 @@ function scheduleQuotaRetry(
   message: string,
 ): boolean {
   if (classifyError(message) !== "rate-limit") {
+    log(
+      `turn ${failedTurn.turnId}: not a classified rate-limit; no quota retry`,
+    );
     return false;
   }
-  const resetAtMs = quotaResetAtMs(message);
-  if (resetAtMs === null) {
-    return false;
+  // The rotation trigger is the CLASSIFICATION, not the countdown text: a
+  // rate-limit that names no reset still cools the burnt account (default
+  // 30 minutes) and still rotates when a sibling is free.
+  const parsedResetAtMs = quotaResetAtMs(message);
+  const resetAtMs = parsedResetAtMs ?? Date.now() + DEFAULT_QUOTA_COOLDOWN_MS;
+  if (parsedResetAtMs === null) {
+    log(
+      `turn ${failedTurn.turnId}: rate-limit without a parseable "Resets in" countdown; ` +
+        `cooling the account for the default ${Math.round(DEFAULT_QUOTA_COOLDOWN_MS / 60000)}m`,
+    );
   }
   // Pool first: cool the burnt account down and, when a sibling is healthy,
   // rotate to it NOW — sitting out the window is only for a pool with
@@ -659,8 +795,18 @@ function scheduleQuotaRetry(
       (ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0) <= Date.now()
     ) {
       switchTo = candidate;
+    } else if (candidate !== null) {
+      log(
+        `turn ${failedTurn.turnId}: pool candidate ${candidate.label} still cools until ` +
+          `${new Date(ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0).toISOString()}; no rotation`,
+      );
     }
     saveLedger(cliproxyRelayDataDir, ledger);
+  } else {
+    log(
+      `turn ${failedTurn.turnId}: no pool rotation (dataDir=${cliproxyRelayDataDir === null ? "none" : "ok"} ` +
+        `accounts=${accountsEnabled(process.env) ? "on" : "off"} account=${session.accountLabel ?? "none"}); same-account wait only`,
+    );
   }
   const maxAttempts = quotaRetryMaxAttempts();
   if (switchTo === null && session.autoRetryCount >= maxAttempts) {
@@ -686,7 +832,10 @@ function scheduleQuotaRetry(
     session.autoRetryCount += 1;
   }
   const retryTurn = createTurn({
-    prompt: failedTurn.prompt,
+    prompt:
+      switchTo !== null
+        ? buildQuotaHandoffPrompt(session, failedTurn)
+        : failedTurn.prompt,
     clientRequestId: undefined,
   });
   session.pending.push(retryTurn);
@@ -706,7 +855,7 @@ function scheduleQuotaRetry(
   session.autoRetryTimer.unref();
   log(
     switchTo !== null
-      ? `turn ${failedTurn.turnId}: quota on the session's account; rotating to account ${switchTo.label} in ${Math.round(waitMs / 1000)}s (turn ${retryTurn.turnId}, fresh conversation)`
+      ? `turn ${failedTurn.turnId}: quota on the session's account; rotating to account ${switchTo.label} in ${Math.round(waitMs / 1000)}s (turn ${retryTurn.turnId}, fresh conversation, compact handoff)`
       : `turn ${failedTurn.turnId}: quota until ${new Date(resetAtMs).toISOString()}; ` +
         `retry ${attempt}/${maxAttempts} queued as turn ${retryTurn.turnId} in ${Math.round(waitMs / 1000)}s`,
   );
@@ -1149,6 +1298,32 @@ function startChild(args: StartChildArgs): void {
       // failure may land on work that is scheduled, not lost.
       return;
     }
+    // An exit before `result` with a rate-limit in agy's last words is the
+    // same quota story as a failed result: route it into the rotation
+    // instead of failing the session on a dead HOME.
+    const exitStderr = session.lastStderr;
+    if (
+      session.providerThreadId !== null &&
+      exitStderr !== null &&
+      classifyError(exitStderr) === "rate-limit" &&
+      (session.turns.length > 0 || session.pending.length > 0)
+    ) {
+      log(
+        `agy child closed (code ${String(code)}, signal ${String(signal)}) before result with a rate-limit in stderr; routing to quota rotation`,
+      );
+      const liveTurn = session.turns.shift() ?? session.pending.shift();
+      if (liveTurn !== undefined) {
+        // Settle the head turn honestly first (the boundary the missing
+        // `result` never brought), then queue the rotation retry behind it —
+        // the same order as the failed-result path.
+        settleTurnFailed(session, liveTurn, exitStderr);
+        if (scheduleQuotaRetry(session, liveTurn, exitStderr)) {
+          return;
+        }
+        // Scheduling refused (cap/budget): the head turn already failed
+        // above, so the fallthrough below only owns what is left.
+      }
+    }
     const detail = session.lastStderr === null ? "" : `: ${session.lastStderr}`;
     const message = `agy exited (code ${String(code)}, signal ${String(
       signal,
@@ -1160,6 +1335,45 @@ function startChild(args: StartChildArgs): void {
       session.lastReportedError !== message;
     failSession(session, message, { surfaceError: !explained });
   });
+}
+
+/**
+ * Settle one live turn as failed outside `handleResult` (the close
+ * handler's quota-rotation path): the same surfacing — one provider.error
+ * unless the text is already on the thread, the blocked snapshot, the
+ * boundary — so an exit before `result` reads exactly like the result that
+ * never arrived.
+ */
+function settleTurnFailed(
+  session: Session,
+  turn: Turn,
+  message: string,
+): void {
+  if (!turn.started) {
+    emitTurnStarted(session, turn);
+  }
+  closeOpenItems(session, turn);
+  const alreadyShown = message === session.lastReportedError;
+  if (!alreadyShown) {
+    session.lastReportedError = message;
+    emitDeltas(session, {
+      kind: "provider.error",
+      providerTurnId: turn.turnId,
+      message,
+      settlesTurn: false,
+      ...(nativeErrorInfo(message) === undefined
+        ? {}
+        : { errorInfo: nativeErrorInfo(message) }),
+    });
+  }
+  maybeEmitRateLimitBlocked(session, message);
+  emitDeltas(session, {
+    kind: "turn.boundary",
+    providerTurnId: turn.turnId,
+    status: "failed",
+    error: { message },
+  });
+  session.lastTurnFailed = true;
 }
 
 /**
@@ -1369,6 +1583,14 @@ function handleStepUpdate(
   if (event.textDelta !== null && event.textDelta.length > 0) {
     turn.producedText = true;
     item.text += event.textDelta;
+    // Feed the rotation handoff's sliding window: what streamed is what a
+    // fresh account needs to avoid redoing.
+    session.recentAssistantText += event.textDelta;
+    if (session.recentAssistantText.length > HANDOFF_STREAMED_TEXT_CAP) {
+      session.recentAssistantText = session.recentAssistantText.slice(
+        -HANDOFF_STREAMED_TEXT_CAP,
+      );
+    }
     emitDeltas(session, {
       kind: "item.textDelta",
       providerTurnId: turn.turnId,
@@ -1850,22 +2072,40 @@ function enqueueTurn(session: Session, turn: Turn): void {
     // say so: a silent replacement is the #1268 incident. The notification
     // goes out before the spawn, so nothing the replacement says can precede
     // the announcement that it exists.
+    //
+    // ...unless the pinned account is still cooling: restarting on it would
+    // repeat the quota hit, so rotate to a free sibling and rebuild fresh
+    // (the old conversation belongs to the burnt account and cannot follow).
+    const cooldownRotation = rotateCooldownAccount(
+      session,
+      `enqueueTurn rebuild for thread ${session.threadId}`,
+    );
     log(
-      `sessionReplaced for thread ${session.threadId}: child gone, restarting on conversation ${session.providerThreadId} (contextLost=false)`,
+      cooldownRotation !== null
+        ? `sessionReplaced for thread ${session.threadId}: child gone, restarting on free sibling ${cooldownRotation.to} (account ${cooldownRotation.from} still cools; contextLost=true)`
+        : `sessionReplaced for thread ${session.threadId}: child gone, restarting on conversation ${session.providerThreadId} (contextLost=false)`,
     );
     notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
       threadId: session.threadId,
       providerThreadId: session.providerThreadId,
-      reason: "the agy process was gone and is being restarted",
-      contextLost: false,
+      reason:
+        cooldownRotation !== null
+          ? `the session's account ${cooldownRotation.from} is in quota cooldown; the turn is being re-run on account ${cooldownRotation.to}, so the conversation context does not carry over`
+          : "the agy process was gone and is being restarted",
+      contextLost: cooldownRotation !== null,
     });
     startChild({
       session,
       model: session.spawnConfig.model,
       reasoningLevel: session.spawnConfig.reasoningLevel,
-      conversationId: session.providerThreadId,
+      conversationId:
+        cooldownRotation !== null ? undefined : session.providerThreadId,
       envVars: session.spawnConfig.envVars,
     });
+    if (cooldownRotation !== null) {
+      // The new account has no history: the turn carries the handoff.
+      turn.prompt = buildQuotaHandoffPrompt(session, turn);
+    }
   }
   const child = session.child;
   // A child that has not announced itself yet owns nothing: its turns wait in
@@ -2066,6 +2306,7 @@ const handlers: Record<string, RequestHandler> = {
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
+      recentAssistantText: "",
       lastActivityAt: Date.now(),
     };
     sessions.set(data.threadId, session);
@@ -2165,6 +2406,7 @@ const handlers: Record<string, RequestHandler> = {
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
+      recentAssistantText: "",
       lastActivityAt: Date.now(),
     };
     sessions.set(data.threadId, session);
@@ -2177,11 +2419,18 @@ const handlers: Record<string, RequestHandler> = {
         `session ${session.threadId}: resumed conversation ${data.providerThreadId} on account ${session.accountLabel ?? "none (relay/direct)"}`,
       );
     }
+    // A resume that lands on a still-cooling account must not restart on a
+    // dead HOME: rotate to a free sibling and start fresh there instead.
+    const resumeRotation = rotateCooldownAccount(
+      session,
+      `thread/resume ${data.threadId}`,
+    );
     startChild({
       session,
       model: data.options.model,
       reasoningLevel: data.options.reasoningLevel,
-      conversationId: data.providerThreadId,
+      conversationId:
+        resumeRotation !== null ? undefined : data.providerThreadId,
       envVars: data.options.envVars,
     });
     awaitIdentity(session, (providerThreadId) => {
@@ -2196,6 +2445,16 @@ const handlers: Record<string, RequestHandler> = {
           }`,
         );
         return;
+      }
+      if (resumeRotation !== null) {
+        notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+          threadId: session.threadId,
+          providerThreadId,
+          reason:
+            `resumed conversation ${data.providerThreadId} belongs to account ${resumeRotation.from}, ` +
+            `still in quota cooldown; resumed on free sibling ${resumeRotation.to} instead, so the conversation context does not carry over`,
+          contextLost: true,
+        });
       }
       respondResult(id, { providerThreadId, sessionRestorable: true });
     });
