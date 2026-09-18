@@ -366,6 +366,68 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       }
       return;
     }
+    if (mode === "pool-bare-once" || mode === "pool-exit-once") {
+      // PLUG-58 shapes: a quota WITHOUT any "Resets in" countdown, fired
+      // ONCE per data dir (root sentinel file) so the bridge must rotate to
+      // a sibling on classification alone. pool-bare-once refuses via an
+      // ERROR result carrying a bare 429 text; pool-exit-once dies BEFORE
+      // any result, leaving only a stderr banner behind.
+      const BARE = "⚠ Rate limit reached (429): slow down and try again later.";
+      const onceFile =
+        process.env.AGY_FAKE_ONCE_FILE ?? `/tmp/agy-${mode}-done`;
+      if (!existsSync(onceFile)) {
+        writeFileSync(onceFile, `${process.pid}\n`);
+        if (mode === "pool-exit-once") {
+          process.stderr.write(`${BARE}\n`);
+          setTimeout(() => process.exit(1), 100);
+        } else {
+          out({
+            event: "step_update",
+            step_update: {
+              ...scope,
+              step_index: step++,
+              state: "DONE",
+              step_type: "user_input",
+            },
+          });
+          out({
+            event: "result",
+            result: {
+              ...scope,
+              status: "ERROR",
+              response: "",
+              num_turns: turns,
+              error: BARE,
+              usage,
+            },
+          });
+          setTimeout(() => process.exit(1), 100);
+        }
+      } else {
+        out({
+          event: "step_update",
+          step_update: {
+            ...scope,
+            step_index: step++,
+            state: "DONE",
+            step_type: "agent_response",
+            text_delta: "pool recovered",
+            usage,
+          },
+        });
+        out({
+          event: "result",
+          result: {
+            ...scope,
+            status: "SUCCESS",
+            response: "pool recovered",
+            num_turns: turns,
+            usage,
+          },
+        });
+      }
+      return;
+    }
     out({
       event: "step_update",
       step_update: {
