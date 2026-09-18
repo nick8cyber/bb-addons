@@ -13,6 +13,11 @@
  * the same rotation — one failed boundary, no raw "exited" banner, retry
  * completes on the sibling.
  *
+ * Phase D (t-trailing, pool-exit-trailing): the same death, but a trailing
+ * non-quota stderr line buries the banner (lastStderr no longer names the
+ * quota). The close handler must still rotate via the recorded error text —
+ * same assertions as Phase B.
+ *
  * Phase C (t-rebuild, succeed): a healthy turn streams an answer; the
  * pinned account is then cooled by hand and the child idles out. The next
  * turn's rebuild must NOT restart on the dead HOME — it rotates to a free
@@ -256,6 +261,28 @@ await sleep(200);
 const spawnsB = spawns().slice(spawnsBeforeB);
 stop("t-exit");
 
+// ---- Phase D: 429 banner buried under trailing chatter → still rotates
+process.env.AGY_FAKE_ERROR_MODE = "pool-exit-trailing";
+process.env.AGY_FAKE_ONCE_FILE = join(root, ".exit-trailing-once-done");
+{
+  // Phases A/B cooled two accounts for 30m; free them so this phase owns a
+  // start account plus one free sibling to rotate to.
+  const ledger = readLedger();
+  for (const label of ["a1", "a2", "a3"]) {
+    if (ledger.accounts[label] === undefined) {
+      ledger.accounts[label] = { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null };
+    }
+    ledger.accounts[label].cooldownUntilMs = 0;
+  }
+  writeFileSync(join(root, "accounts-state.json"), `${JSON.stringify(ledger, null, 1)}\n`);
+}
+const spawnsBeforeD = spawns().length;
+await startThread("t-trailing");
+await turn("t-trailing", "hello trailing", 2);
+await sleep(200);
+const spawnsD = spawns().slice(spawnsBeforeD);
+stop("t-trailing");
+
 // ---- Phase C: rebuild on a cooled account rotates instead of restarting dead
 process.env.AGY_FAKE_ERROR_MODE = "succeed";
 await startThread("t-rebuild");
@@ -291,11 +318,14 @@ process.stdout.write = originalWrite;
 
 const bsA = boundaries("t-bare");
 const bsB = boundaries("t-exit");
+const bsD = boundaries("t-trailing");
 const bsC = boundaries("t-rebuild");
 const repA = replacedFor("t-bare");
 const repB = replacedFor("t-exit");
+const repD = replacedFor("t-trailing");
 const repC = replacedFor("t-rebuild");
 const errB = errorsFor("t-exit");
+const errD = errorsFor("t-trailing");
 
 const checks = [
   [
@@ -357,6 +387,37 @@ const checks = [
     replacedFor("t-exit").length === 1 &&
       replacedFor("t-exit")[0].params.contextLost === true,
     JSON.stringify(replacedFor("t-exit").map((m) => m.params.contextLost)),
+  ],
+  [
+    "trailing/rotates-despite-buried-banner",
+    spawnsD.length === 2 &&
+      spawnsD[0]?.__env?.HOME !== spawnsD[1]?.__env?.HOME &&
+      spawnsD[1]?.__argv?.includes("--conversation") !== true,
+    JSON.stringify(
+      spawnsD.map((s) => ({
+        home: homeLabel(s?.__env?.HOME),
+        resumed: s?.__argv?.includes("--conversation") === true,
+      })),
+    ),
+  ],
+  [
+    "trailing/failed-then-completed",
+    bsD.length === 2 && bsD[0].status === "failed" && bsD[1].status === "completed",
+    JSON.stringify(bsD.map((b) => b.status)),
+  ],
+  [
+    "trailing/one-quota-error-no-exit-banner",
+    errD.length === 1 &&
+      errD[0].message === BARE &&
+      errD.every((e) => !e.message.includes("exited")) &&
+      errD.every((e) => !e.message.includes("cleaning up")),
+    JSON.stringify(errD.map((e) => e.message)),
+  ],
+  [
+    "trailing/replaced-context-lost",
+    replacedFor("t-trailing").length === 1 &&
+      replacedFor("t-trailing")[0].params.contextLost === true,
+    JSON.stringify(replacedFor("t-trailing").map((m) => m.params.contextLost)),
   ],
   [
     "rebuild/rotates-off-cooled-account",

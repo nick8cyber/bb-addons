@@ -626,12 +626,13 @@ const HANDOFF_STREAMED_TEXT_CAP = 4_000;
 const HANDOFF_TAG = "[quota-rotation-handoff]";
 
 /**
- * `git diff --stat` for the handoff, or null when git cannot say (not a
- * repo, no binary, timeout). Stat names only, never content — and capped.
+ * `git diff HEAD --stat` for the handoff, or null when git cannot say (not
+ * a repo, no binary, no commits yet, timeout). HEAD (not bare `diff`) so
+ * staged changes are included. Stat names only, never content — and capped.
  */
 function gitDiffStat(cwd: string): string | null {
   try {
-    const out = execFileSync("git", ["-C", cwd, "diff", "--stat"], {
+    const out = execFileSync("git", ["-C", cwd, "diff", "HEAD", "--stat"], {
       encoding: "utf8",
       timeout: 5_000,
       maxBuffer: 64 * 1024,
@@ -653,7 +654,13 @@ function gitDiffStat(cwd: string): string | null {
  * between HOMEs is deliberately out of scope.)
  */
 function buildQuotaHandoffPrompt(session: Session, failedTurn: Turn): string {
-  const goal = failedTurn.prompt.slice(0, 2000);
+  // A cascaded rotation re-runs a turn whose prompt is already a handoff:
+  // strip the previous marker prefix so tags never nest.
+  let goalSource = failedTurn.prompt;
+  while (goalSource.startsWith(HANDOFF_TAG)) {
+    goalSource = goalSource.slice(HANDOFF_TAG.length).trimStart();
+  }
+  const goal = goalSource.slice(0, 2000);
   const streamed =
     session.recentAssistantText.length > 0
       ? session.recentAssistantText.slice(-HANDOFF_STREAMED_TEXT_CAP)
@@ -776,6 +783,10 @@ function scheduleQuotaRetry(
   // nothing left. A rotation starts a fresh conversation: the old one
   // belongs to the burnt account and cannot follow.
   let switchTo: AccountHome | null = null;
+  // Best sibling even when it is still cooling: when every account cools,
+  // the wait below targets the earliest reopening window, not the burnt
+  // account's own (which may name hours while a sibling opens in minutes).
+  let candidateUntilMs: number | null = null;
   if (
     cliproxyRelayDataDir !== null &&
     accountsEnabled(process.env) &&
@@ -795,10 +806,15 @@ function scheduleQuotaRetry(
       (ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0) <= Date.now()
     ) {
       switchTo = candidate;
+      // Claim the sibling now, not at child start 1–2s later: two sessions
+      // hitting quota at once must not both pick the same LRU candidate.
+      markAccountUse(ledger, candidate.label);
     } else if (candidate !== null) {
+      candidateUntilMs =
+        ledger.accounts[candidate.label]?.cooldownUntilMs ?? null;
       log(
         `turn ${failedTurn.turnId}: pool candidate ${candidate.label} still cools until ` +
-          `${new Date(ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0).toISOString()}; no rotation`,
+          `${new Date(candidateUntilMs ?? 0).toISOString()}; no rotation`,
       );
     }
     saveLedger(cliproxyRelayDataDir, ledger);
@@ -815,10 +831,16 @@ function scheduleQuotaRetry(
     );
     return false;
   }
+  // Same-account wait targets the earliest reopening window known: the
+  // burnt account's own, or a still-cooling sibling's when that opens first.
+  const waitTargetMs =
+    candidateUntilMs !== null
+      ? Math.min(resetAtMs, candidateUntilMs)
+      : resetAtMs;
   const waitMs =
     switchTo !== null
       ? 1_000
-      : Math.max(resetAtMs + QUOTA_RETRY_JITTER_MS - Date.now(), 1_000);
+      : Math.max(waitTargetMs + QUOTA_RETRY_JITTER_MS - Date.now(), 1_000);
   if (waitMs > quotaRetryMaxWaitMs()) {
     log(
       `turn ${failedTurn.turnId}: quota reopens in ${Math.round(waitMs / 1000)}s, past the ${Math.round(quotaRetryMaxWaitMs() / 1000)}s auto-retry cap; failing`,
@@ -838,10 +860,13 @@ function scheduleQuotaRetry(
         : failedTurn.prompt,
     clientRequestId: undefined,
   });
-  session.pending.push(retryTurn);
+  session.pending.unshift(retryTurn);
   // Turns already queued behind the failed one ride the same closed window:
-  // move them into `pending` so the wake re-runs everything in order on the
-  // rebuilt child, instead of writing them into a child that is mid-exit.
+  // move them into `pending` BEHIND the retry so the wake re-runs the failed
+  // head first, then everything else in order, on the rebuilt child —
+  // instead of writing them into a child that is mid-exit. (A push here
+  // would corrupt FIFO: an already-queued turn would run ahead of the
+  // failed head, on a fresh account with no handoff.)
   while (session.turns.length > 0) {
     session.pending.push(session.turns.shift() as Turn);
   }
@@ -879,7 +904,7 @@ function wakeQuotaRetry(
     );
     return;
   }
-  if (session.stopping || session.providerThreadId === null) {
+  if (session.stopping || (session.providerThreadId === null && !freshConversation)) {
     log(
       `quota retry ${attempt}: stale wake for thread ${session.threadId} (stopping=${session.stopping}); dropping`,
     );
@@ -908,7 +933,11 @@ function wakeQuotaRetry(
     session,
     model: session.spawnConfig.model,
     reasoningLevel: session.spawnConfig.reasoningLevel,
-    conversationId: freshConversation ? undefined : session.providerThreadId,
+    // Guarded above: a same-conversation wake always has an identity; the
+    // `?? undefined` is only for the type checker.
+    conversationId: freshConversation
+      ? undefined
+      : (session.providerThreadId ?? undefined),
     envVars: session.spawnConfig.envVars,
   });
 }
@@ -1300,12 +1329,27 @@ function startChild(args: StartChildArgs): void {
     }
     // An exit before `result` with a rate-limit in agy's last words is the
     // same quota story as a failed result: route it into the rotation
-    // instead of failing the session on a dead HOME.
+    // instead of failing the session on a dead HOME. `lastStderr` is only
+    // the LAST stderr line — a 429 banner followed by shutdown chatter would
+    // bury it, so fall back to the last actionable error text (the banner
+    // reportError recorded) and the blocked flag it raised. No identity
+    // gate: a first turn that dies to quota before `init` still has work
+    // queued in `pending` worth rotating.
     const exitStderr = session.lastStderr;
+    const exitRateLimitMsg =
+      exitStderr !== null && classifyError(exitStderr) === "rate-limit"
+        ? exitStderr
+        : session.lastReportedError !== null &&
+            classifyError(session.lastReportedError) === "rate-limit"
+          ? session.lastReportedError
+          : null;
+    const exitQuotaMsg =
+      exitRateLimitMsg ??
+      (session.rateLimitsBlocked && session.lastReportedError !== null
+        ? session.lastReportedError
+        : null);
     if (
-      session.providerThreadId !== null &&
-      exitStderr !== null &&
-      classifyError(exitStderr) === "rate-limit" &&
+      exitQuotaMsg !== null &&
       (session.turns.length > 0 || session.pending.length > 0)
     ) {
       log(
@@ -1316,8 +1360,8 @@ function startChild(args: StartChildArgs): void {
         // Settle the head turn honestly first (the boundary the missing
         // `result` never brought), then queue the rotation retry behind it —
         // the same order as the failed-result path.
-        settleTurnFailed(session, liveTurn, exitStderr);
-        if (scheduleQuotaRetry(session, liveTurn, exitStderr)) {
+        settleTurnFailed(session, liveTurn, exitQuotaMsg);
+        if (scheduleQuotaRetry(session, liveTurn, exitQuotaMsg)) {
           return;
         }
         // Scheduling refused (cap/budget): the head turn already failed
