@@ -15468,6 +15468,13 @@ function providerUsagePlugin(bb) {
               });
             }
           }
+          const windowOrder = {
+            "Gemini 5h": 0,
+            "Claude 5h": 1,
+            "Gemini Weekly": 2,
+            "Claude Weekly": 3
+          };
+          windows.sort((a, b) => (windowOrder[a.label] ?? 99) - (windowOrder[b.label] ?? 99));
           const item = {
             loadedAt: Date.now(),
             usage: {
