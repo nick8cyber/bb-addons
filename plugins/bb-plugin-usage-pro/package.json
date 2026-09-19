@@ -1,0 +1,45 @@
+{
+  "name": "bb-plugin-usage-pro",
+  "version": "0.1.0",
+  "engines": {
+    "bb": ">=0.0",
+    "bbPluginSdk": ">=0.4.90"
+  },
+  "bb": {
+    "name": "Provider usage (Pro)",
+    "description": "Multi-account provider usage: Codex (Personal + Team), Antigravity (all Google accounts), Claude Code",
+    "branding": {
+      "icon": "ChartColumn"
+    },
+    "server": "./dist/server.js",
+    "app": "./dist/app.js"
+  },
+  "private": true,
+  "type": "module",
+  "description": "Multi-account provider usage: Codex (Personal + Team), Antigravity (all Google accounts), Claude Code",
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc --noEmit",
+    "prepare:bundled": "bb-plugin-build prepare-bundled"
+  },
+  "dependencies": {
+    "@bb/shared-ui": "workspace:*",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@bb/plugin-build": "workspace:*",
+    "@get-bb/plugin-sdk": "workspace:*",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "jsdom": "^29.0.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vitest": "^4.1.1"
+  }
+}
