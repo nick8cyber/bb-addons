@@ -86,7 +86,7 @@ if (flag("--opencode")) {
     (f) => f.startsWith("antigravity-") && f.endsWith(".json"),
   )) {
     const record = JSON.parse(readFileSync(join(dir, f), "utf8"));
-    jobs.push([record.email ?? basename(f, ".json"), record.refresh_token]);
+    jobs.push([record.email ?? basename(f, ".json"), record.refresh_token, record.proxy_url]);
   }
 } else if (flag("--file")) {
   const path = value("--file");
@@ -96,7 +96,7 @@ if (flag("--opencode")) {
   }
   const label = value("--label") ?? basename(path).replace(/\.[a-z]+$/iu, "");
   const raw = readFileSync(path, "utf8");
-  jobs.push([label, refreshTokenOf(raw)]);
+  jobs.push([label, refreshTokenOf(raw), undefined]);
 } else {
   console.log(
     "nothing to do: pass --opencode, --cliproxy [dir], or --file <path> --label <label>",
@@ -105,7 +105,7 @@ if (flag("--opencode")) {
 }
 
 let done = 0;
-for (const [label, refreshToken] of jobs) {
+for (const [label, refreshToken, proxy] of jobs) {
   if (!refreshToken) {
     console.log(`FAIL ${label}: no refresh token in the record`);
     continue;
@@ -121,9 +121,15 @@ for (const [label, refreshToken] of jobs) {
     );
     if (existsSync(tokenPath) && !overwrite) {
       console.log(`     ${label} -> skip (exists)`);
+      if (proxy) {
+        writeFileSync(join(dataDir, "accounts", label, "proxy"), `${proxy.trim()}\n`, { encoding: "utf8", mode: 0o600 });
+      }
       continue;
     }
     writeAccountHome(label, refreshToken);
+    if (proxy) {
+      writeFileSync(join(dataDir, "accounts", label, "proxy"), `${proxy.trim()}\n`, { encoding: "utf8", mode: 0o600 });
+    }
     console.log(`OK   ${label} -> accounts/${label}`);
     done += 1;
   } catch (e) {

@@ -10,10 +10,12 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type {
+  PluginSidebarProject,
   PluginSidebarThread,
   PluginSidebarThreadActions,
   PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
+import { toast } from "sonner";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -139,15 +141,32 @@ function InlineRenameInput({
   );
 }
 
+/** Same shape as bb's native "Copy thread link": the personal project
+ *  hosts its threads at `/threads/<id>`, every other project nests them. */
+function threadLinkHref(
+  thread: PluginSidebarThread,
+  projects: readonly PluginSidebarProject[],
+): string {
+  const isPersonal = projects.some(
+    (p) => p.id === thread.projectId && p.isPersonal,
+  );
+  const path = isPersonal
+    ? `/threads/${thread.id}`
+    : `/projects/${thread.projectId}/threads/${thread.id}`;
+  return new URL(path, window.location.origin).toString();
+}
+
 function ThreadMenuItems({
   menuType,
   thread,
+  projects,
   isAvailable,
   actions,
   onRename,
 }: {
   menuType: "context" | "dropdown";
   thread: PluginSidebarThread;
+  projects: readonly PluginSidebarProject[];
   isAvailable: boolean;
   actions: PluginSidebarThreadActions;
   onRename: () => void;
@@ -169,6 +188,17 @@ function ThreadMenuItems({
           },
         ]
       : []),
+    {
+      key: "copy-link",
+      label: "Copy thread link",
+      icon: "Copy" as const,
+      onSelect: () => {
+        navigator.clipboard
+          .writeText(threadLinkHref(thread, projects))
+          .then(() => toast.success("Thread link copied"))
+          .catch(() => toast.error("Failed to copy thread link"));
+      },
+    },
     {
       key: "pin",
       label: thread.isPinned ? "Unpin" : "Pin",
@@ -255,6 +285,7 @@ function hoverActionClassName(isCompactViewport: boolean): string {
 
 function ThreadRow({
   row,
+  projects,
   activeThreadId,
   isCompactViewport,
   showBranchName,
@@ -264,6 +295,7 @@ function ThreadRow({
   setRenamingThreadId,
 }: {
   row: GroupingRow<PluginSidebarThread>;
+  projects: readonly PluginSidebarProject[];
   activeThreadId: string | null;
   isCompactViewport: boolean;
   showBranchName: boolean;
@@ -417,6 +449,7 @@ function ThreadRow({
                 <ThreadMenuItems
                   menuType="dropdown"
                   thread={thread}
+                  projects={projects}
                   isAvailable={isAvailable}
                   actions={actions}
                   onRename={() => setRenamingThreadId(thread.id)}
@@ -430,6 +463,7 @@ function ThreadRow({
         <ThreadMenuItems
           menuType="context"
           thread={thread}
+          projects={projects}
           isAvailable={isAvailable}
           actions={actions}
           onRename={() => setRenamingThreadId(thread.id)}
@@ -677,6 +711,7 @@ function CollapsedThreadList({
                 <ThreadRow
                   key={row.thread.id}
                   row={row}
+                  projects={projects}
                   activeThreadId={activeThreadId}
                   isCompactViewport={isCompactViewport}
                   showBranchName={showBranchName}
