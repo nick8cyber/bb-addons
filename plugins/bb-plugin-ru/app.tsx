@@ -19,7 +19,6 @@ import {
   setEnabled,
   stats,
   subscribe,
-  toggle,
   DICTIONARY_SIZE,
   type MissingRow,
 } from "./src/runtime";
@@ -142,15 +141,5 @@ export default definePluginApp((app) => {
     description:
       "Перевод подписей интерфейса bb. Переключается на месте, без перезагрузки окна.",
     component: SettingsSection,
-  });
-
-  app.slots.sidebarFooterAction({
-    id: "toggle",
-    title: "Русский / English",
-    icon: "Globe",
-    run: () => {
-      const enabled = toggle();
-      toast.success(enabled ? "Интерфейс переведён" : "Интерфейс на английском");
-    },
   });
 });
