@@ -15267,6 +15267,16 @@ function resourceProvider(resource, measurement, pluginId, providers) {
   };
 }
 function providerUsagePlugin(bb) {
+  if (bb.settings?.define) {
+    bb.settings.define({
+      hideClaudeModels: {
+        type: "boolean",
+        label: "Скрывать Claude-модели в статистике",
+        description: "Не показывать устаревшие лимиты сторонних моделей (Claude / GPT) во вкладке Google / Antigravity.",
+        default: true
+      }
+    });
+  }
   const nodeProcess = require("node:process");
   const getUserHome = () => "/home/ubuntu";
 
