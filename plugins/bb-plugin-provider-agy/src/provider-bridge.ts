@@ -59,6 +59,7 @@ import { join } from "node:path";
 import {
   AGY_NOISE_STEP_TYPES,
   type AgyUsage,
+  agyModelContextWindow,
   agySpawnArgs,
   agyUserMessageLine,
   parseAgyLine,
@@ -202,6 +203,65 @@ function subtractUsage(
   };
 }
 
+/**
+ * The context-window size for what this session actually runs: the model agy
+ * announced in `init` when it has, else the requested one. Null names no
+ * verified model, and no size is invented for it.
+ */
+function sessionContextWindow(session: Session): number | null {
+  return agyModelContextWindow(session.agyModel ?? session.spawnConfig.model);
+}
+
+/**
+ * The thread's Context Meter feed. `used` is the cumulative totalTokens and
+ * `size` the window from {@link sessionContextWindow}; an unknown model
+ * reports size null with estimated true, and the snapshot — whose schema
+ * requires a positive window — is sent only when the window is known.
+ */
+function emitContextWindow(
+  session: Session,
+  turn: Turn,
+  usedTokens: number,
+): void {
+  const size = sessionContextWindow(session);
+  if (size === null) {
+    emitDeltas(session, {
+      kind: "contextWindow",
+      used: usedTokens,
+      size: null,
+      estimated: true,
+      attach: "currentOrLast",
+      providerTurnId: turn.turnId,
+    });
+    return;
+  }
+  const model = session.agyModel ?? session.spawnConfig.model ?? "unknown";
+  const providerSessionId = session.providerThreadId;
+  emitDeltas(session, {
+    kind: "contextWindow",
+    used: usedTokens,
+    size,
+    estimated: false,
+    attach: "currentOrLast",
+    providerTurnId: turn.turnId,
+    ...(providerSessionId === null || model === "unknown"
+      ? {}
+      : {
+          snapshot: {
+            capturedAt: new Date().toISOString(),
+            providerSessionId,
+            providerTurnId: turn.turnId,
+            model,
+            usedTokens,
+            contextWindowTokens: size,
+            autoCompactAtTokens: null,
+            estimated: false,
+            categories: [],
+          },
+        }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Sessions and turns
 // ---------------------------------------------------------------------------
@@ -302,6 +362,13 @@ interface Session {
   identityWaiters: ((providerThreadId: string | null) => void)[];
   stopping: boolean;
   spawnConfig: SpawnConfig;
+  /**
+   * The model the CURRENT child announced in its `init` event. Preferred over
+   * the requested `spawnConfig.model` when resolving the context window: an
+   * unknown `--model` id silently falls back to agy's default, so the request
+   * is not always what runs. Null until the child's `init` arrives.
+   */
+  agyModel: string | null;
   /** Why the child died, so a rejected thread/start can say what happened. */
   lastFailure: string | null;
   /** agy's own last words, which usually name the real cause. */
@@ -1495,6 +1562,9 @@ function handleAgyLine(
   }
   switch (event.event) {
     case "init": {
+      if (event.model !== null) {
+        session.agyModel = event.model;
+      }
       adoptIdentity(session, event.conversationId);
       return;
     }
@@ -1642,6 +1712,17 @@ function handleStepUpdate(
       channel: "agentMessage",
       text: event.textDelta,
     });
+  }
+  if (event.usage !== null) {
+    // A step's usage is this turn's slice (see agy-cli.ts), so the meter's
+    // cumulative figure is the prior turns' total plus this slice. The
+    // result stays the source of truth; this only moves the meter mid-turn.
+    const slice = toBreakdown(event.usage);
+    emitContextWindow(
+      session,
+      turn,
+      session.usageTotal.totalTokens + slice.totalTokens,
+    );
   }
   if (event.state === "DONE") {
     if (turn.producedText) {
@@ -1906,7 +1987,8 @@ function handleResult(
 
   if (event.usage !== null) {
     // agy's result usage is cumulative for the conversation, so the running
-    // total is what it reports and this turn's slice is the difference.
+    // total is what it reports and this turn's slice is the difference. The
+    // same cumulative total feeds the Context Meter beside the usage delta.
     const total = toBreakdown(event.usage);
     const last = subtractUsage(total, session.usageTotal);
     session.usageTotal = total;
@@ -1915,8 +1997,9 @@ function handleResult(
       providerTurnId: turn.turnId,
       total,
       last,
-      modelContextWindow: null,
+      modelContextWindow: sessionContextWindow(session),
     });
+    emitContextWindow(session, turn, total.totalTokens);
   }
 
   // A non-SUCCESS status whose error is verbatim a tool error the agent then
@@ -2341,6 +2424,7 @@ const handlers: Record<string, RequestHandler> = {
         reasoningLevel: undefined,
         envVars: undefined,
       },
+      agyModel: null,
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,
@@ -2441,6 +2525,7 @@ const handlers: Record<string, RequestHandler> = {
         reasoningLevel: undefined,
         envVars: undefined,
       },
+      agyModel: null,
       lastFailure: null,
       lastStderr: null,
       lastReportedError: null,

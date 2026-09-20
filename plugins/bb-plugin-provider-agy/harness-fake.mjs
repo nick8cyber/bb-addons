@@ -56,10 +56,11 @@ const pol = {
   permissionEscalation: null,
 };
 const options = { model: "fake-model", ...pol };
-const deltas = () =>
+const deltasFor = (tid) =>
   messages
-    .filter((m) => m.method === "thread/delta" && m.params.threadId === "t1")
+    .filter((m) => m.method === "thread/delta" && m.params.threadId === tid)
     .flatMap((m) => m.params.deltas);
+const deltas = () => deltasFor("t1");
 
 async function waitFor(predicate, ms, label) {
   const deadline = Date.now() + ms;
@@ -109,6 +110,38 @@ for (const [id, creq] of [[3, "creq_aaaaaaaaaa"], [4, "creq_bbbbbbbbbb"]]) {
 }
 
 send({ jsonrpc: "2.0", id: 9, method: "thread/stop", params: { threadId: "t1", providerThreadId: "fake-conv-0001", intent: "release", activeTurnId: null } });
+
+// A second thread on a known model: its meter must carry the verified window
+// (gemini-3.x-flash → 1M) while t1's unknown "fake-model" must invent none.
+const options2 = { model: "gemini-3.7-flash", ...pol };
+send({
+  jsonrpc: "2.0",
+  id: 10,
+  method: "thread/start",
+  params: { threadId: "t2", cwd: workspace, options: options2, instructionMode: "append" },
+});
+await waitFor((m) => m.id === 10, 15_000, "thread/start t2");
+send({
+  jsonrpc: "2.0",
+  id: 11,
+  method: "turn/start",
+  params: {
+    threadId: "t2",
+    providerThreadId: "fake-conv-0001",
+    input: [{ type: "text", text: "go", mentions: [] }],
+    clientRequestId: "creq_cccccccccc",
+    options: options2,
+  },
+});
+await waitFor(
+  (m) =>
+    m.method === "thread/delta" &&
+    m.params.threadId === "t2" &&
+    m.params.deltas.some((delta) => delta.kind === "turn.boundary"),
+  15_000,
+  "turn t2 completed",
+);
+send({ jsonrpc: "2.0", id: 12, method: "thread/stop", params: { threadId: "t2", providerThreadId: "fake-conv-0001", intent: "release", activeTurnId: null } });
 bridge.onClose?.();
 process.stdout.write = originalWrite;
 
@@ -118,6 +151,9 @@ const settled = all.filter((delta) => delta.kind === "item.close");
 const turns = all.filter((delta) => delta.kind === "turn.boundary");
 const usage = all.filter((delta) => delta.kind === "usage");
 const starts = all.filter((delta) => delta.kind === "item.open");
+const cw1 = all.filter((delta) => delta.kind === "contextWindow");
+const usage2 = deltasFor("t2").filter((delta) => delta.kind === "usage");
+const cw2 = deltasFor("t2").filter((delta) => delta.kind === "contextWindow");
 
 const checks = [
   ["stream/every-chunk-forwarded", textDeltas.length === 8, `${textDeltas.length} deltas: ${JSON.stringify(textDeltas.map((d) => d.text))}`],
@@ -127,6 +163,14 @@ const checks = [
   ["usage/total-cumulative", usage.length === 2 && usage[1].total.totalTokens > usage[0].total.totalTokens, JSON.stringify(usage.map((u) => u.total.totalTokens))],
   ["usage/last-is-this-turn", usage.length === 2 && usage[1].last.totalTokens < usage[1].total.totalTokens, JSON.stringify(usage.map((u) => u.last.totalTokens))],
   ["ordering/delta-before-settle", all.findIndex((delta) => delta.kind === "item.textDelta") < all.findIndex((delta) => delta.kind === "item.close"), ""],
+  ["contextWindow/emitted-for-unknown-model", cw1.length >= usage.length && usage.length === 2, `${cw1.length} contextWindow vs ${usage.length} usage`],
+  ["contextWindow/unknown-model-size-null", cw1.length > 0 && cw1.every((d) => d.size === null && d.estimated === true), JSON.stringify(cw1.map((d) => [d.used, d.size, d.estimated]))],
+  ["contextWindow/used-tracks-totals", usage.length === 2 && usage.every((u) => cw1.some((d) => d.used === u.total.totalTokens)), `totals ${JSON.stringify(usage.map((u) => u.total.totalTokens))} vs used ${JSON.stringify(cw1.map((d) => d.used))}`],
+  ["usage/model-context-window-null-when-unknown", usage.length === 2 && usage.every((u) => u.modelContextWindow === null), JSON.stringify(usage.map((u) => u.modelContextWindow))],
+  ["usage/known-model-window", usage2.length === 1 && usage2.every((u) => u.modelContextWindow === 1048576), JSON.stringify(usage2.map((u) => u.modelContextWindow))],
+  ["contextWindow/known-model-size", cw2.length > 0 && cw2.every((d) => d.size === 1048576 && d.estimated === false), JSON.stringify(cw2.map((d) => [d.used, d.size, d.estimated]))],
+  ["contextWindow/known-model-used-tracks-total", usage2.length === 1 && cw2.some((d) => d.used === usage2[0].total.totalTokens), `total ${JSON.stringify(usage2.map((u) => u.total.totalTokens))} vs used ${JSON.stringify(cw2.map((d) => d.used))}`],
+  ["contextWindow/snapshot", cw2.some((d) => d.snapshot?.contextWindowTokens === 1048576 && d.snapshot?.usedTokens === d.used && d.snapshot?.model === "gemini-3.7-flash" && d.snapshot?.providerSessionId === "fake-conv-0001" && d.snapshot?.estimated === false), JSON.stringify(cw2.map((d) => d.snapshot ?? null))],
 ];
 
 say("==== fake-agy translation report ====");

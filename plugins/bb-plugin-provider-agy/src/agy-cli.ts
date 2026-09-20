@@ -335,3 +335,47 @@ export function parseAgyModelsOutput(
   }
   return models;
 }
+
+/**
+ * Context-window sizes by model, for the thread's Context Meter. agy never
+ * reports the window itself, so the bridge maps the model id it runs.
+ *
+ * Verified September 2026:
+ * - Every current Gemini 3.x model (Flash 3.5/3.6/3.7/3.8, Pro 3.1) ships a
+ *   1,048,576-token window (Google AI docs, DeepMind model cards).
+ * - Claude Sonnet 4.6 and Opus 4.6 ship a 1,000,000-token window at standard
+ *   pricing with no beta header (Anthropic docs, March 2026).
+ * - GPT-OSS 120B natively supports 131,072 tokens (OpenAI model card).
+ *
+ * Anything unrecognized maps to null: the delta then carries size null with
+ * estimated true, and no window is invented.
+ */
+export const AGY_GEMINI_CONTEXT_WINDOW = 1_048_576;
+export const AGY_CLAUDE_46_CONTEXT_WINDOW = 1_000_000;
+export const AGY_GPT_OSS_CONTEXT_WINDOW = 131_072;
+
+/**
+ * The model's context-window size in tokens, or null when the id names no
+ * verified model. Matches display names ("Gemini 3.7 Flash (High)",
+ * "Claude Opus 4.6 (Thinking)"), runtime ids ("gemini-3.7-flash-tiered",
+ * "claude-opus-4-6-thinking", "gpt-oss-120b-medium") and effort-suffixed ids
+ * alike: separators are normalized, so "4.6" and "4-6" are the same token.
+ */
+export function agyModelContextWindow(
+  model: string | undefined | null,
+): number | null {
+  if (model === undefined || model === null || model.length === 0) {
+    return null;
+  }
+  const id = model.toLowerCase().replaceAll(/[\s_.-]+/gu, "-");
+  if (id.includes("gemini")) {
+    return AGY_GEMINI_CONTEXT_WINDOW;
+  }
+  if (id.includes("gpt-oss")) {
+    return AGY_GPT_OSS_CONTEXT_WINDOW;
+  }
+  if (id.includes("claude") && id.includes("4-6")) {
+    return AGY_CLAUDE_46_CONTEXT_WINDOW;
+  }
+  return null;
+}
