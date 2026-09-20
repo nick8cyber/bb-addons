@@ -202,6 +202,22 @@ function subtractUsage(
   };
 }
 
+/**
+ * Context-window size by model family, in tokens. agy never reports the
+ * window itself, so every size here is an estimate — enough for the thread's
+ * usage meter, never a billing claim. Unknown families stay null rather than
+ * invented: the meter then shows usage without a denominator.
+ */
+function contextWindowSize(model: string | undefined): number | null {
+  if (model === undefined) {
+    return null;
+  }
+  if (/gemini/i.test(model)) {
+    return 1_000_000;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Sessions and turns
 // ---------------------------------------------------------------------------
@@ -1910,12 +1926,41 @@ function handleResult(
     const total = toBreakdown(event.usage);
     const last = subtractUsage(total, session.usageTotal);
     session.usageTotal = total;
+    // The thread's context meter reads the window from here: without a
+    // modelContextWindow the usage row carries no denominator, and without
+    // the contextWindow delta there is no used/size snapshot at all.
+    const window = contextWindowSize(session.spawnConfig.model);
     emitDeltas(session, {
       kind: "usage",
       providerTurnId: turn.turnId,
       total,
       last,
-      modelContextWindow: null,
+      modelContextWindow: window,
+    });
+    // attach binds the window to the turn's usage row; estimated is honest:
+    // agy never reports its window, the size comes from the family map above.
+    emitDeltas(session, {
+      kind: "contextWindow",
+      providerTurnId: turn.turnId,
+      attach: "currentOrLast",
+      estimated: true,
+      used: total.totalTokens,
+      size: window,
+      ...(window === null || session.providerThreadId === null
+        ? {}
+        : {
+            snapshot: {
+              autoCompactAtTokens: null,
+              capturedAt: new Date().toISOString(),
+              categories: [],
+              contextWindowTokens: window,
+              estimated: true,
+              model: session.spawnConfig.model ?? "unknown",
+              providerSessionId: session.providerThreadId,
+              providerTurnId: turn.turnId,
+              usedTokens: total.totalTokens,
+            },
+          }),
     });
   }
 

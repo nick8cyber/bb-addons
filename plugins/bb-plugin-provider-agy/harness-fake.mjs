@@ -56,9 +56,10 @@ const pol = {
   permissionEscalation: null,
 };
 const options = { model: "fake-model", ...pol };
-const deltas = () =>
+const geminiOptions = { model: "gemini-3.8-flash-high", ...pol };
+const deltas = (threadId = "t1") =>
   messages
-    .filter((m) => m.method === "thread/delta" && m.params.threadId === "t1")
+    .filter((m) => m.method === "thread/delta" && m.params.threadId === threadId)
     .flatMap((m) => m.params.deltas);
 
 async function waitFor(predicate, ms, label) {
@@ -109,6 +110,33 @@ for (const [id, creq] of [[3, "creq_aaaaaaaaaa"], [4, "creq_bbbbbbbbbb"]]) {
 }
 
 send({ jsonrpc: "2.0", id: 9, method: "thread/stop", params: { threadId: "t1", providerThreadId: "fake-conv-0001", intent: "release", activeTurnId: null } });
+
+// A second thread on a Gemini model: its usage must carry the estimated
+// window and a contextWindow snapshot, so the reader gets the meter.
+send({
+  jsonrpc: "2.0", id: 10, method: "thread/start",
+  params: { threadId: "t2", cwd: workspace, options: geminiOptions, instructionMode: "append" },
+});
+await waitFor((m) => m.id === 10, 15_000, "thread/start t2");
+send({
+  jsonrpc: "2.0", id: 11, method: "turn/start",
+  params: {
+    threadId: "t2",
+    providerThreadId: "fake-conv-0001",
+    input: [{ type: "text", text: "go", mentions: [] }],
+    clientRequestId: "creq_cccccccccc",
+    options: geminiOptions,
+  },
+});
+await waitFor(
+  (m) =>
+    m.method === "thread/delta" &&
+    m.params.threadId === "t2" &&
+    m.params.deltas.some((delta) => delta.kind === "turn.boundary"),
+  15_000,
+  "t2 turn completed",
+);
+send({ jsonrpc: "2.0", id: 12, method: "thread/stop", params: { threadId: "t2", providerThreadId: "fake-conv-0001", intent: "release", activeTurnId: null } });
 bridge.onClose?.();
 process.stdout.write = originalWrite;
 
@@ -118,6 +146,12 @@ const settled = all.filter((delta) => delta.kind === "item.close");
 const turns = all.filter((delta) => delta.kind === "turn.boundary");
 const usage = all.filter((delta) => delta.kind === "usage");
 const starts = all.filter((delta) => delta.kind === "item.open");
+const windows = (threadId) =>
+  deltas(threadId).filter((delta) => delta.kind === "contextWindow");
+const t1usage = usage;
+const t2usage = deltas("t2").filter((delta) => delta.kind === "usage");
+const t1windows = windows("t1");
+const t2windows = windows("t2");
 
 const checks = [
   ["stream/every-chunk-forwarded", textDeltas.length === 8, `${textDeltas.length} deltas: ${JSON.stringify(textDeltas.map((d) => d.text))}`],
@@ -126,6 +160,8 @@ const checks = [
   ["turn/two-turns-one-session", turns.length === 2 && new Set(turns.map((t) => t.providerTurnId)).size === 2, JSON.stringify(turns.map((t) => [t.status, t.providerTurnId]))],
   ["usage/total-cumulative", usage.length === 2 && usage[1].total.totalTokens > usage[0].total.totalTokens, JSON.stringify(usage.map((u) => u.total.totalTokens))],
   ["usage/last-is-this-turn", usage.length === 2 && usage[1].last.totalTokens < usage[1].total.totalTokens, JSON.stringify(usage.map((u) => u.last.totalTokens))],
+  ["meter/unknown-model-has-no-window", t1usage.every((u) => u.modelContextWindow === null) && t1windows.length === 2 && t1windows.every((w, i) => w.size === null && w.snapshot === undefined && w.used === t1usage[i].total.totalTokens), JSON.stringify(t1windows.map((w) => [w.used, w.size]))],
+  ["meter/gemini-window-estimated-1m", t2usage.length === 1 && t2usage[0].modelContextWindow === 1000000 && t2windows.length === 1 && t2windows[0].used === t2usage[0].total.totalTokens && t2windows[0].size === 1000000 && t2windows[0].snapshot?.estimated === true && t2windows[0].snapshot?.contextWindowTokens === 1000000, JSON.stringify(t2windows.map((w) => [w.used, w.size, w.snapshot?.estimated]))],
   ["ordering/delta-before-settle", all.findIndex((delta) => delta.kind === "item.textDelta") < all.findIndex((delta) => delta.kind === "item.close"), ""],
 ];
 

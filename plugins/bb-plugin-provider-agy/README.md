@@ -506,10 +506,13 @@ turn before the steer goes out — a real CLI cannot be made slow on demand, and
 `node harness-fake.mjs` replays the dialect from
 `fake-agy.mjs` — **no account, no network, no quota** — with four streamed
 chunks per turn, so a real one-token answer cannot hide a bridge that forwards
-only the last piece. 7/7 pass: every chunk forwarded as its own
+only the last piece. 9/9 pass: every chunk forwarded as its own
 `item/agentMessage/delta`, one item per turn, the item settling with the full
-text, two turns down one session with distinct turn ids, and usage where
-`total` is cumulative and `last` is the turn's own slice.
+text, two turns down one session with distinct turn ids, usage where
+`total` is cumulative and `last` is the turn's own slice, and the context
+meter: a Gemini-model thread carries an estimated 1M `modelContextWindow`
+with a `contextWindow` snapshot (`used` = cumulative total), while an
+unknown model reports usage with a null window rather than an invented one.
 
 `node harness-rebuild.mjs` proves the rebuild path, which needs a child that
 dies on cue: a prompt containing `[[die]]` makes `fake-agy.mjs` answer in full
