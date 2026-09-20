@@ -511,7 +511,9 @@ only the last piece. 9/9 pass: every chunk forwarded as its own
 text, two turns down one session with distinct turn ids, usage where
 `total` is cumulative and `last` is the turn's own slice, and the context
 meter: a Gemini-model thread carries an estimated 1M `modelContextWindow`
-with a `contextWindow` snapshot (`used` = cumulative total), while an
+with a `contextWindow` snapshot (`used` = the turn's own slice, which is the
+honest window occupancy since agy re-sends the full history as input every
+turn — never the lifetime cumulative total), while an
 unknown model reports usage with a null window rather than an invented one.
 
 `node harness-rebuild.mjs` proves the rebuild path, which needs a child that
