@@ -160,8 +160,8 @@ const checks = [
   ["turn/two-turns-one-session", turns.length === 2 && new Set(turns.map((t) => t.providerTurnId)).size === 2, JSON.stringify(turns.map((t) => [t.status, t.providerTurnId]))],
   ["usage/total-cumulative", usage.length === 2 && usage[1].total.totalTokens > usage[0].total.totalTokens, JSON.stringify(usage.map((u) => u.total.totalTokens))],
   ["usage/last-is-this-turn", usage.length === 2 && usage[1].last.totalTokens < usage[1].total.totalTokens, JSON.stringify(usage.map((u) => u.last.totalTokens))],
-  ["meter/unknown-model-has-no-window", t1usage.every((u) => u.modelContextWindow === null) && t1windows.length === 2 && t1windows.every((w, i) => w.size === null && w.snapshot === undefined && w.used === t1usage[i].total.totalTokens), JSON.stringify(t1windows.map((w) => [w.used, w.size]))],
-  ["meter/gemini-window-estimated-1m", t2usage.length === 1 && t2usage[0].modelContextWindow === 1000000 && t2windows.length === 1 && t2windows[0].used === t2usage[0].total.totalTokens && t2windows[0].size === 1000000 && t2windows[0].snapshot?.estimated === true && t2windows[0].snapshot?.contextWindowTokens === 1000000, JSON.stringify(t2windows.map((w) => [w.used, w.size, w.snapshot?.estimated]))],
+  ["meter/unknown-model-has-no-window", t1usage.every((u) => u.modelContextWindow === null) && t1windows.length === 2 && t1windows.every((w, i) => w.size === null && w.snapshot === undefined && w.used === t1usage[i].last.totalTokens), JSON.stringify(t1windows.map((w) => [w.used, w.size]))],
+  ["meter/gemini-window-estimated-1m", t2usage.length === 1 && t2usage[0].modelContextWindow === 1000000 && t2windows.length === 1 && t2windows[0].used === t2usage[0].last.totalTokens && t2windows[0].size === 1000000 && t2windows[0].snapshot?.estimated === true && t2windows[0].snapshot?.contextWindowTokens === 1000000, JSON.stringify(t2windows.map((w) => [w.used, w.size, w.snapshot?.estimated]))],
   ["ordering/delta-before-settle", all.findIndex((delta) => delta.kind === "item.textDelta") < all.findIndex((delta) => delta.kind === "item.close"), ""],
 ];
 

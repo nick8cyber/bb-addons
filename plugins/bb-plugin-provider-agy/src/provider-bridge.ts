@@ -1939,12 +1939,15 @@ function handleResult(
     });
     // attach binds the window to the turn's usage row; estimated is honest:
     // agy never reports its window, the size comes from the family map above.
+    // used is this turn's slice, not the lifetime cumulative total: agy
+    // re-sends the full history as input every turn, so the turn's own
+    // tokens are the honest occupancy of the window right now.
     emitDeltas(session, {
       kind: "contextWindow",
       providerTurnId: turn.turnId,
       attach: "currentOrLast",
       estimated: true,
-      used: total.totalTokens,
+      used: last.totalTokens,
       size: window,
       ...(window === null || session.providerThreadId === null
         ? {}
@@ -1958,7 +1961,7 @@ function handleResult(
               model: session.spawnConfig.model ?? "unknown",
               providerSessionId: session.providerThreadId,
               providerTurnId: turn.turnId,
-              usedTokens: total.totalTokens,
+              usedTokens: last.totalTokens,
             },
           }),
     });
