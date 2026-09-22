@@ -283,6 +283,15 @@ interface Turn {
    * A turn whose reply never completed still fails honestly.
    */
   responseCompleted: boolean;
+  /**
+   * The input of the most recent agy API call this turn, from a step's own
+   * usage. That single number is what the model actually saw last — the
+   * honest occupancy of the context window right now. The turn's slice (the
+   * cumulative diff) instead sums every call's input, so one heavy multi-tool
+   * turn reads as a full window even right after a "/compact" (measured
+   * 22.09 on the duty thread: slice 747,867 while the window held ~70k).
+   */
+  lastStepInputTokens: number | null;
 }
 
 /** What a child was spawned with, kept so a dead one can be rebuilt. */
@@ -1598,6 +1607,16 @@ function handleStepUpdate(
     providerRaw(session, "noise", event);
     return;
   }
+  // A step's usage is that API call's own numbers. The window occupancy is
+  // the call's whole input — fresh and cache-served alike (cached input is
+  // still fed to the model, it is just billed/read differently) — so both
+  // parts sum into the freshest reading this turn has. Kept on the turn for
+  // the result-time meter.
+  const stepUsage = event.usage;
+  if (stepUsage !== null && stepUsage.inputTokens !== null) {
+    turn.lastStepInputTokens =
+      (stepUsage.inputTokens ?? 0) + (stepUsage.cacheReadTokens ?? 0);
+  }
   const stepType = event.stepType ?? "";
   if (stepType !== "agent_response") {
     if (stepType === "tool") {
@@ -1939,15 +1958,17 @@ function handleResult(
     });
     // attach binds the window to the turn's usage row; estimated is honest:
     // agy never reports its window, the size comes from the family map above.
-    // used is this turn's slice, not the lifetime cumulative total: agy
-    // re-sends the full history as input every turn, so the turn's own
-    // tokens are the honest occupancy of the window right now.
+    // used is what the model saw on this turn's most recent API call — the
+    // real occupancy of the window right now. The turn's slice would sum
+    // every call's input and read as a full window after one heavy multi-tool
+    // turn even when the context is small (say, right after a "/compact").
+    const usedTokens = turn.lastStepInputTokens ?? last.totalTokens;
     emitDeltas(session, {
       kind: "contextWindow",
       providerTurnId: turn.turnId,
       attach: "currentOrLast",
       estimated: true,
-      used: last.totalTokens,
+      used: usedTokens,
       size: window,
       ...(window === null || session.providerThreadId === null
         ? {}
@@ -1961,7 +1982,7 @@ function handleResult(
               model: session.spawnConfig.model ?? "unknown",
               providerSessionId: session.providerThreadId,
               providerTurnId: turn.turnId,
-              usedTokens: last.totalTokens,
+              usedTokens,
             },
           }),
     });
@@ -2237,6 +2258,7 @@ function createTurn(args: {
     artifactRetries: 0,
     producedText: false,
     responseCompleted: false,
+    lastStepInputTokens: null,
   };
 }
 
