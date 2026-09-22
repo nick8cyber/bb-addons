@@ -25,7 +25,13 @@ export default function plugin(bb: BbPluginApi) {
       supportsServiceTier: false,
       supportsNativeUserQuestion: false,
       fork: "none",
-      supportsManualCompaction: false,
+      // agy executes a standalone "/compact" user turn in stream-json as its
+      // own compaction: the model summarizes the conversation and the stored
+      // context shrinks — verified live against agy 1.2.8, where the turn
+      // after "/compact" cost a 4k input slice against ~62k before it. The
+      // bridge forwards turn prompts verbatim, so bb's built-in compact
+      // command lands on agy as-is.
+      supportsManualCompaction: true,
       supportsThreadArchive: false,
       supportsThreadRename: false,
       // agy's stream-json has no approval back channel, so the only mode the
