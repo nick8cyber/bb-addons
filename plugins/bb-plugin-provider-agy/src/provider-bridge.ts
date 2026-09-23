@@ -396,10 +396,20 @@ interface Session {
   /**
    * Last time the session did anything (a turn arrived, a result settled,
    * the child announced itself). The idle sweep releases children that have
-   * been idle past AGY_IDLE_KILL_MS — the conversation stays on disk and
-   * the next turn rebuilds the child against it, opencode-style.
+   * been idle past AGY_IDLE_KILL_MS — the conversation stays on disk and the
+   * next turn rebuilds the child against it, opencode-style.
    */
   lastActivityAt: number;
+  /**
+   * Last time the child produced ANY stdout/stderr bytes — not turn
+   * activity, pure process liveness. A turn whose tool blocks forever (a
+   * `systemctl start` waiting on a systemd password prompt, 23.09 on the CI
+   * duty thread) emits nothing until the result that never comes, and
+   * `--print-timeout 24h` would let it sit a day. The stall sweep kills the
+   * child past AGY_STALL_KILL_MS of silence DURING a turn and fails the turn
+   * naming the silence; between turns only the idle sweep applies.
+   */
+  lastChildOutputAt: number;
 }
 
 const sessions = new Map<string, Session>();
@@ -1273,6 +1283,9 @@ function startChild(args: StartChildArgs): void {
     log(`stdin write failed (${session.threadId}): ${error.message}`);
   });
   session.child = child;
+  // The silence budget starts at spawn: a child that never says a word is
+  // exactly the stall the sweep must catch once a turn is waiting on it.
+  session.lastChildOutputAt = Date.now();
 
   let stdoutTail = "";
   child.stdout.setEncoding("utf8");
@@ -1280,6 +1293,7 @@ function startChild(args: StartChildArgs): void {
     if (session.generation !== generation) {
       return;
     }
+    session.lastChildOutputAt = Date.now();
     stdoutTail += chunk;
     for (;;) {
       const newline = stdoutTail.indexOf("\n");
@@ -1306,6 +1320,7 @@ function startChild(args: StartChildArgs): void {
     if (session.generation !== generation) {
       return;
     }
+    session.lastChildOutputAt = Date.now();
     stderrTail += chunk;
     for (;;) {
       const newline = stderrTail.indexOf("\n");
@@ -2422,6 +2437,7 @@ const handlers: Record<string, RequestHandler> = {
       accountLabel: null,
       recentAssistantText: "",
       lastActivityAt: Date.now(),
+      lastChildOutputAt: Date.now(),
     };
     sessions.set(data.threadId, session);
     if (accountsEnabled(process.env) && cliproxyRelayDataDir !== null) {
@@ -2522,6 +2538,7 @@ const handlers: Record<string, RequestHandler> = {
       accountLabel: null,
       recentAssistantText: "",
       lastActivityAt: Date.now(),
+      lastChildOutputAt: Date.now(),
     };
     sessions.set(data.threadId, session);
     if (cliproxyRelayDataDir !== null) {
@@ -2767,11 +2784,73 @@ function sweepIdleSessions(): void {
 
 let idleSweep: NodeJS.Timeout | null = null;
 
+/**
+ * Stall kill — the complement of the idle sweep: idle covers silence BETWEEN
+ * turns, this covers silence DURING one. A tool that blocks forever (a
+ * `systemctl start` waiting on a systemd password prompt — 23.09 on the CI
+ * duty thread, agy silent for the whole hang) produces no stdout, no stderr,
+ * no result; `--print-timeout 24h` would let the turn sit a full day while
+ * the thread reads "running". Past AGY_STALL_KILL_MS (default 10 minutes,
+ * 0 disables) of child silence with a turn in flight — written or queued,
+ * even one still waiting for identity — the session fails with a message
+ * naming the silence, and the child is killed like an idle release: the
+ * conversation stays on disk and the next turn rebuilds it.
+ *
+ * A legitimately long tool also looks like silence — the threshold is a
+ * tradeoff, not a proof; raise AGY_STALL_KILL_MS for sessions that run
+ * multi-quarter commands inside agy, or set it to 0 to opt out.
+ */
+const DEFAULT_STALL_KILL_MS = 600_000;
+
+function stallKillMs(): number {
+  const raw = Number(process.env.AGY_STALL_KILL_MS);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_STALL_KILL_MS;
+}
+
+function sweepStalledTurns(): void {
+  const stallMs = stallKillMs();
+  if (stallMs <= 0) {
+    return;
+  }
+  const now = Date.now();
+  for (const session of sessions.values()) {
+    if (
+      session.child === null ||
+      session.stopping ||
+      session.autoRetryTimer !== null
+    ) {
+      continue;
+    }
+    if (session.turns.length === 0 && session.pending.length === 0) {
+      continue;
+    }
+    const silentMs = now - session.lastChildOutputAt;
+    if (silentMs < stallMs) {
+      continue;
+    }
+    const silentSec = Math.round(silentMs / 1000);
+    log(
+      `session ${session.threadId} silent for ${silentSec}s with a turn in flight: ` +
+        `failing the turn and killing the agy child (conversation ${session.providerThreadId ?? "none"} stays; the next turn rebuilds it)`,
+    );
+    failSession(
+      session,
+      `agy stalled: no output for ${silentSec}s during a turn ` +
+        `(a blocked tool — e.g. a password prompt — hangs exactly like this); ` +
+        `the child is being killed, the next turn rebuilds the conversation`,
+    );
+    killChild(session);
+  }
+}
+
 function armIdleSweep(): void {
   if (idleSweep !== null) {
     return;
   }
-  idleSweep = setInterval(sweepIdleSessions, IDLE_SWEEP_INTERVAL_MS);
+  idleSweep = setInterval(() => {
+    sweepStalledTurns();
+    sweepIdleSessions();
+  }, IDLE_SWEEP_INTERVAL_MS);
   idleSweep.unref();
 }
 

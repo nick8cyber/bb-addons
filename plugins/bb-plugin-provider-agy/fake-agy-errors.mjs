@@ -34,6 +34,11 @@
  *            retry turn must re-run and complete
  *   quota-retry-always  every child rejects, so the retry budget runs out:
  *            the second attempt must fail honestly with no further retries
+ *   stall   the turn opens with a live tool item and then the process says
+ *            NOTHING — no result, no stderr, alive but mute — exactly a tool
+ *            blocked on a password prompt. The stall sweep must fail the
+ *            turn naming the silence, kill this child, and leave the session
+ *            rebuildable (the harness then answers the next turn).
  *
  * Every stdin line is echoed to AGY_FAKE_TRANSCRIPT so the harness can prove
  * WHAT the bridge sent.
@@ -308,6 +313,22 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
           },
         });
       }
+      return;
+    }
+    if (mode === "stall") {
+      // One live tool item, then permanent silence: no result ever. The
+      // harness's AGY_STALL_KILL_MS decides when the bridge gives up on us.
+      out({
+        event: "step_update",
+        step_update: {
+          ...scope,
+          step_index: step++,
+          state: "ACTIVE",
+          step_type: "tool",
+          tool_name: "run_command",
+          tool_info: { name: "run_command" },
+        },
+      });
       return;
     }
     if (mode === "pool-retry") {
