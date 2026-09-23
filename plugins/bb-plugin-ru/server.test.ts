@@ -118,7 +118,10 @@ describe("bb ru", () => {
 });
 
 describe("рекомендации аудита на русском", () => {
-  function agentContext(title: string | null) {
+  function agentContext(
+    title: string | null,
+    originPluginId: string | null = null,
+  ) {
     return {
       pluginMetadata: {},
       thread: {
@@ -146,7 +149,10 @@ describe("рекомендации аудита на русском", () => {
         model: "model-test",
         capabilities: { supportsNativeUserQuestion: false },
       },
-      origin: { kind: null, pluginId: null },
+      origin: {
+        kind: originPluginId === null ? null : ("fork" as const),
+        pluginId: originPluginId,
+      },
     };
   }
 
@@ -156,12 +162,29 @@ describe("рекомендации аудита на русском", () => {
       agentContext("Advisor · Мой тред"),
     );
     expect(result.instructions).toContain("русском");
+    expect(result.instructions).toContain("даже если исходный промпт");
+  });
+
+  it("распознаёт Advisor по origin, даже если заголовок изменился", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.resolveAgentConfiguration(
+      agentContext("Внутренний аудит", "advisor"),
+    );
+    expect(result.instructions).toContain("ОБЯЗАТЕЛЬНО");
   });
 
   it("не трогает обычные треды", async () => {
     const { harness } = await load();
     const result = await harness.behavior.resolveAgentConfiguration(
       agentContext("Мой обычный тред"),
+    );
+    expect(result.instructions).toBeNull();
+  });
+
+  it("не трогает скрытые треды других плагинов", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.resolveAgentConfiguration(
+      agentContext("Внутренний тред", "other-plugin"),
     );
     expect(result.instructions).toBeNull();
   });
@@ -174,4 +197,3 @@ describe("рекомендации аудита на русском", () => {
     expect(result.instructions).toBeNull();
   });
 });
-
