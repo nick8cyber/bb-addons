@@ -17,10 +17,8 @@ const MAX_TEXT_LENGTH = 200;
 const MAX_ROWS = 5000;
 
 /**
- * Префикс заголовков тредов ревьюера Advisor — тот же ADVISOR_TITLE_PREFIX,
- * с которым плагин advisor спавнит свои скрытые треды проверки
- * (`title: "Advisor · …"`). Единственный сигнал в контексте агента,
- * позволяющий отличить сессию ревьюера от обычного треда.
+ * Старые версии Advisor распознаём и по заголовку. В актуальном BB основной
+ * сигнал надёжнее: `context.origin.pluginId === "advisor"`.
  */
 const ADVISOR_TITLE_PREFIX = "Advisor · ";
 
@@ -29,9 +27,11 @@ const ADVISOR_TITLE_PREFIX = "Advisor · ";
  * (severity, key, resolved) трогать запрещено — только человекочитаемый текст.
  */
 const ADVISOR_RUSSIAN_INSTRUCTIONS =
-  "Пиши выводы проверки на русском языке: поля summary и details результата " +
-  "ADVISOR_RESULT, а также любые пояснения пользователю — на русском. " +
-  "Технические поля (severity, key, resolved) и имена собственные оставь без изменений.";
+  "Отвечай на русском языке. В результате ADVISOR_RESULT поля summary и details " +
+  "ОБЯЗАТЕЛЬНО пиши по-русски, даже если исходный промпт, focus, timeline или цитаты " +
+  "даны на английском. Не возвращай английские пояснения или выводы; без перевода " +
+  "оставляй только код, идентификаторы, имена собственные и технические значения " +
+  "полей severity, key и resolved.";
 
 const missingRow = z.object({
   text: z.string(),
@@ -98,14 +98,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
 
-  // Ревьюер Advisor — обычная агентская сессия в скрытом треде с заголовком
-  // "Advisor · …". Когда опция включена, добавляем ему указание отвечать
-  // по-русски: summary/details попадают в панель аудита и в очередь советов
-  // основному агенту уже на русском.
+  // Ревьюер Advisor — агентская сессия, порождённая плагином advisor. Заголовок
+  // оставляем запасным признаком для совместимости со старыми версиями BB.
   bb.agents.configure((context) => {
     if (!advisorRussian) return { tools: [], skills: [] };
     const title = context.thread.title ?? "";
-    if (!title.startsWith(ADVISOR_TITLE_PREFIX)) {
+    const isAdvisor =
+      context.origin.pluginId === "advisor" ||
+      title.startsWith(ADVISOR_TITLE_PREFIX);
+    if (!isAdvisor) {
       return { tools: [], skills: [] };
     }
     bb.log.info(`инструкция на русском добавлена треду ${context.thread.id}`);
