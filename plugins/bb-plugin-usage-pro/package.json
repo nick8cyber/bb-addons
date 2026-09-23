@@ -12,7 +12,7 @@
       "icon": "ChartColumn"
     },
     "server": "./dist/server.js",
-    "app": "./dist/app.js"
+    "app": "./app.js"
   },
   "private": true,
   "type": "module",
@@ -23,7 +23,8 @@
   "scripts": {
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc --noEmit",
-    "prepare:bundled": "bb-plugin-build prepare-bundled"
+    "prepare:bundled": "bb-plugin-build prepare-bundled",
+    "build": "bb plugin build ."
   },
   "dependencies": {
     "@bb/shared-ui": "workspace:*",
