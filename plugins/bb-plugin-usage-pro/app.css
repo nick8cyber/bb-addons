@@ -1,0 +1,123 @@
+/* Persisted source CSS: bb plugin build regenerates dist/app.css from this file. */
+
+section[data-testid*="usage-pro"] {
+  height: 20rem !important;
+  max-height: 20rem !important;
+  min-height: 20rem !important;
+  transition: none !important;
+}
+
+section[data-testid*="usage-pro"] > div,
+div:has(> [data-bb-plugin="usage-pro"]) {
+  overflow: hidden !important;
+  height: 20rem !important;
+  max-height: 20rem !important;
+  min-height: 20rem !important;
+}
+
+[data-bb-plugin="usage-pro"] {
+  height: 20rem !important;
+  max-height: 20rem !important;
+  min-height: 20rem !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+[data-bb-plugin="usage-pro"] [data-provider-usage-header] {
+  flex-shrink: 0 !important;
+  height: 2.5rem !important;
+}
+
+[data-bb-plugin="usage-pro"] [role="tablist"] {
+  overflow: visible !important;
+}
+
+[data-bb-plugin="usage-pro"] [role="tab"] {
+  cursor: pointer !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+[data-bb-plugin="usage-pro"] [role="tabpanel"] {
+  flex: 1 1 0% !important;
+  min-height: 0 !important;
+  height: calc(20rem - 2.5rem) !important;
+  max-height: calc(20rem - 2.5rem) !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior: contain !important;
+  scrollbar-width: thin !important;
+  scrollbar-color: var(--sidebar-border) transparent !important;
+  padding-right: 0.5rem !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-window {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 4px !important;
+  padding: 6px 0 !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-header {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 8px !important;
+  font-size: 0.72rem !important;
+  line-height: 1rem !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-label {
+  min-width: 0 !important;
+  flex: 1 1 auto !important;
+  overflow: hidden !important;
+  color: var(--sidebar-foreground) !important;
+  font-weight: 500 !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-pct {
+  flex-shrink: 0 !important;
+  color: var(--sidebar-foreground) !important;
+  font-variant-numeric: tabular-nums !important;
+  font-weight: 600 !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-bar-track {
+  width: 100% !important;
+  height: 5px !important;
+  overflow: hidden !important;
+  border-radius: 9999px !important;
+  background-color: var(--sidebar-border) !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-bar-fill {
+  height: 100% !important;
+  border-radius: 9999px !important;
+  transition: width 0.3s ease !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-footer {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 8px !important;
+  color: var(--subtle-foreground) !important;
+  font-size: 0.675rem !important;
+  line-height: 1rem !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-reset-date {
+  min-width: 0 !important;
+  overflow: hidden !important;
+  color: var(--subtle-foreground) !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+[data-bb-plugin="usage-pro"] .usage-pro-remain {
+  flex-shrink: 0 !important;
+  font-variant-numeric: tabular-nums !important;
+  opacity: 0.9 !important;
+}
