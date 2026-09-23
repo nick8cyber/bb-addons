@@ -31,6 +31,10 @@ process.env.AGY_FAKE_TRANSCRIPT = transcript;
 // failure paths, and a scheduled re-run would sit behind a real timer. The
 // dedicated quota-retry scenarios below re-enable it (short countdowns).
 process.env.AGY_AUTO_RETRY_MAX = "0";
+// Stall sweep on a harness-sized leash: the fake answers in milliseconds, so
+// only the `stall` scenario (mute after one tool item) ever reaches it, while
+// production keeps the 10-minute default.
+process.env.AGY_STALL_KILL_MS = "1200";
 const workspace = (mode) => {
   const dir = join(root, `ws-${mode}`);
   mkdirSync(dir, { recursive: true });
@@ -123,7 +127,7 @@ async function turn(threadId, text, ordinal) {
     params: {
       threadId, providerThreadId: "fake-conv-errors",
       input: [{ type: "text", text, mentions: [] }],
-      clientRequestId: `creq_${"zyxwvutsrq".slice(0, 9)}${"zyxwvutsrq"[creqSeq++]}`,
+      clientRequestId: `creq_${"zyxwvutsrq".slice(0, 9)}${"zyxwvutsrq"[creqSeq++ % 10]}`,
       options,
     },
   });
@@ -235,6 +239,22 @@ const always = await start("quota-retry-always");
   stop(always.threadId);
 }
 
+// stall mode: a turn whose child goes permanently silent after one live tool
+// item — the systemd-password-prompt hang, reproduced. The stall sweep must
+// fail the turn naming the silence, kill the child, and leave the session
+// rebuildable: the next turn (mode switched back to succeed) completes on a
+// fresh child against the same conversation.
+const stall = await start("stall");
+await turn(stall.threadId, "one", 1);
+process.env.AGY_FAKE_ERROR_MODE = "succeed";
+await turn(stall.threadId, "two", 2);
+await sleep(200);
+const stallReplaced = () =>
+  messages.filter(
+    (m) => m.method === "session/replaced" && m.params.threadId === stall.threadId,
+  ).length;
+stop(stall.threadId);
+
 bridge.onClose?.();
 process.stdout.write = originalWrite;
 
@@ -254,6 +274,9 @@ const retryBoundaries = completed(retry.threadId);
 const retryLimits = rateLimits(retry.threadId);
 const alwaysErrors = errors(always.threadId);
 const alwaysBoundaries = completed(always.threadId);
+const stallErrors = errors(stall.threadId);
+const stallBoundaries = completed(stall.threadId);
+const stallStalled = stallErrors.filter((e) => e.message.includes("agy stalled"));
 const retryRawExits = (tid) =>
   errors(tid).filter((e) => e.message.includes("exited"));
 
@@ -298,6 +321,10 @@ const checks = [
   ["always/retry-ran-exactly-once", alwaysReplaced() === 1, `${alwaysReplaced()} session/replaced`],
   ["always/no-completed-boundary", alwaysBoundaries.every((b) => b.status === "failed"), JSON.stringify(alwaysBoundaries.map((b) => b.status))],
   ["always/no-exit-banner", alwaysErrors.length === 2 && alwaysErrors.every((e) => e.message === QUOTA_SHORT) && retryRawExits(always.threadId).length === 0, JSON.stringify(alwaysErrors.map((e) => e.message))],
+  ["stall/turn-failed-naming-the-silence", stallBoundaries[0]?.status === "failed" && (stallBoundaries[0]?.error?.message ?? "").includes("agy stalled") && (stallBoundaries[0]?.error?.message ?? "").includes("no output"), JSON.stringify(stallBoundaries[0] ?? "").slice(0, 200)],
+  ["stall/surfaced-once", stallStalled.length === 1 && stallStalled[0].threadScoped === true, JSON.stringify(stallErrors.map((e) => e.message)).slice(0, 160)],
+  ["stall/child-killed-and-session-rebuilds", stallReplaced() >= 1 && stallBoundaries.length === 2 && stallBoundaries[1].status === "completed", `${stallReplaced()} session/replaced; statuses ${JSON.stringify(stallBoundaries.map((b) => b.status))}`],
+  ["stall/no-raw-exit-banner", retryRawExits(stall.threadId).length === 0, JSON.stringify(stallErrors.map((e) => e.message)).slice(0, 160)],
 ];
 
 say("==== error-surfacing report ====");
