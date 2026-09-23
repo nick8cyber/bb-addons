@@ -15368,7 +15368,7 @@ function providerUsagePlugin(bb) {
       if (!codexTeamInFlight) {
         codexTeamInFlight = doFetchCodexTeam().finally(() => { codexTeamInFlight = null; });
       }
-      return codexTeamCache.data;
+      return codexTeamInFlight;
     }
     if (codexTeamInFlight) {
       return codexTeamInFlight;
@@ -15570,9 +15570,9 @@ function providerUsagePlugin(bb) {
           );
         }
         if (staleLabels.length > 0) {
-          Promise.all(
+          await Promise.all(
             staleLabels.map(label => runAgySingleAccount(baseDir, label, agyBin, statePath))
-          ).catch(() => {});
+          );
         }
       }
 
@@ -15673,7 +15673,7 @@ function providerUsagePlugin(bb) {
       }
     const selected = [...inventories.values()].flatMap(
       (source) => source.resources.filter((resource) => {
-        if (resource.providerId.includes("cursor")) return false;
+        if (resource.providerId.startsWith("acp-")) return false;
         const machineId = resource.scope.kind === "shared" ? (hosts[0]?.id ?? `source:${source.pluginId}`) : resource.scope.hostId;
         return (request.providerId === null || resource.providerId === request.providerId) && (request.machineIds === null || request.machineIds.includes(machineId)) && (resource.scope.kind === "shared" || hosts.some(
           (host) => resource.scope.kind === "host" && host.id === resource.scope.hostId && host.status === "connected"
@@ -15799,7 +15799,7 @@ function providerUsagePlugin(bb) {
           console.error("[usage-pro] Error adding agy accounts:", e);
         }
       }
-      machine.providers = machine.providers.filter((p) => !p.providerId.includes("cursor"));
+      machine.providers = machine.providers.filter((p) => !p.providerId.startsWith("acp-"));
     }
     const providerOrder = new Map([
       ["codex", 0],
