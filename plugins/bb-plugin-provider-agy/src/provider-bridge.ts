@@ -2790,7 +2790,7 @@ let idleSweep: NodeJS.Timeout | null = null;
  * `systemctl start` waiting on a systemd password prompt — 23.09 on the CI
  * duty thread, agy silent for the whole hang) produces no stdout, no stderr,
  * no result; `--print-timeout 24h` would let the turn sit a full day while
- * the thread reads "running". Past AGY_STALL_KILL_MS (default 10 minutes,
+ * the thread reads "running". Past AGY_STALL_KILL_MS (default 15 minutes,
  * 0 disables) of child silence with a turn in flight — written or queued,
  * even one still waiting for identity — the session fails with a message
  * naming the silence, and the child is killed like an idle release: the
@@ -2800,7 +2800,7 @@ let idleSweep: NodeJS.Timeout | null = null;
  * tradeoff, not a proof; raise AGY_STALL_KILL_MS for sessions that run
  * multi-quarter commands inside agy, or set it to 0 to opt out.
  */
-const DEFAULT_STALL_KILL_MS = 600_000;
+const DEFAULT_STALL_KILL_MS = 900_000;
 
 function stallKillMs(): number {
   const raw = Number(process.env.AGY_STALL_KILL_MS);
