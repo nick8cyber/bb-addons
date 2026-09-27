@@ -643,6 +643,6 @@ output. Past `AGY_STALL_KILL_MS` of child silence with a turn in flight the
 bridge fails the turn with a message naming the silence and kills the child —
 the conversation stays on disk and the next turn rebuilds it.
 
-- Default: `600000` (10 minutes); `0` disables.
+- Default: `900000` (15 minutes); `0` disables.
 - A legitimately long silent tool looks the same as a hang — raise the value
   for sessions that run long quiet commands inside agy, or set `0`.
