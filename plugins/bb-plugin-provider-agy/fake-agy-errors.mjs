@@ -36,9 +36,15 @@
  *            the second attempt must fail honestly with no further retries
  *   stall   the turn opens with a live tool item and then the process says
  *            NOTHING — no result, no stderr, alive but mute — exactly a tool
- *            blocked on a password prompt. The stall sweep must fail the
- *            turn naming the silence, kill this child, and leave the session
- *            rebuildable (the harness then answers the next turn).
+ *            blocked on a password prompt (and indistinguishable from a
+ *            working quiet tool). The tool-tier stall budget
+ *            (AGY_TOOL_STALL_MS) must fail the turn naming the silence,
+ *            kill this child, and leave the session rebuildable (the
+ *            harness then answers the next turn). Crucially the model-tier
+ *            budget must NOT fire while the tool is open — mid-work kills
+ *            are the bug this pair exists to prevent.
+ *   stall-quiet  a turn the child never answers: no tool item at all. The
+ *            model-tier budget (AGY_STALL_KILL_MS) must fail it.
  *
  * Every stdin line is echoed to AGY_FAKE_TRANSCRIPT so the harness can prove
  * WHAT the bridge sent.
@@ -316,8 +322,10 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       return;
     }
     if (mode === "stall") {
-      // One live tool item, then permanent silence: no result ever. The
-      // harness's AGY_STALL_KILL_MS decides when the bridge gives up on us.
+      // One live tool item, then permanent silence: no result ever — a tool
+      // the bridge cannot tell apart from a working quiet one (agy does not
+      // stream tool output). AGY_TOOL_STALL_MS (the tool budget, not the
+      // model's AGY_STALL_KILL_MS) decides when the bridge gives up.
       out({
         event: "step_update",
         step_update: {
@@ -329,6 +337,12 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
           tool_info: { name: "run_command" },
         },
       });
+      return;
+    }
+    if (mode === "stall-quiet") {
+      // A turn the child never answers at all: no tool item, no result, no
+      // stderr — the model tier (AGY_STALL_KILL_MS, no tool in flight) must
+      // fail it.
       return;
     }
     if (mode === "pool-retry") {

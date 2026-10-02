@@ -614,7 +614,7 @@ An existing thread keeps the bridge build its own worker process was started
 with, so the fix reaches a running thread only after that session restarts.
 
 `node harness-errors.mjs` proves the error paths with no account and no quota —
-44/44: a failed tool step inside a turn that then completes reaches the thread
+47/47: a failed tool step inside a turn that then completes reaches the thread
 exactly once per turn with its `rate-limit` category, and the same steps stream
 live as named `tool` items with `ACTIVE`/settle progress and `durationMs`, the ⚠ banner on stderr
 reaches the thread while a `warning:` line beside it does not, a turn-less
@@ -628,21 +628,28 @@ ends with the native rate-limit shape: the reject's `provider.error` carries
 `errorInfo` `httpStatusCode 429`, a `provider/rateLimits/updated` snapshot
 opens `blocked` with `resetsAtMs` set from the `Resets in 8m11s.` countdown,
 and a follow-up turn on a rebuilt child clears it to `allowed`. Finally the
-stall shape: a turn whose child goes permanently silent after one live tool
-item (the `systemctl start` waiting on a systemd password prompt, 23.09) is
-failed with `agy stalled: no output for …` and the child is killed, while the
-next turn rebuilds the same conversation and completes.
+two stall shapes: a turn whose child goes permanently silent **after one live
+tool item** survives the model budget while the tool stays open, then is
+failed by the tool budget — `agy stalled: no output for … in flight` — with
+the next turn rebuilding the same conversation; and a turn the child never
+answers at all (**no tool**) is failed by the model budget on its own.
 
-### Stall kill (`AGY_STALL_KILL_MS`)
+### Stall kill (`AGY_STALL_KILL_MS` / `AGY_TOOL_STALL_MS`)
 
 The idle sweep releases quiet children **between** turns; the stall sweep
-covers silence **during** a turn. `--print-timeout 24h` means a tool that
-blocks forever (a password prompt under `systemctl`, a lock nobody will ever
-release) would otherwise hold the thread "running" for a day with zero
-output. Past `AGY_STALL_KILL_MS` of child silence with a turn in flight the
-bridge fails the turn with a message naming the silence and kills the child —
-the conversation stays on disk and the next turn rebuilds it.
+covers silence **during** one — under two budgets, because agy never streams
+tool output: a tool step opens and the child says nothing until it settles,
+so a working quiet tool and a blocked one (a password prompt under
+`systemctl`, a lock nobody will ever release) wear the same face.
 
-- Default: `900000` (15 minutes); `0` disables.
-- A legitimately long silent tool looks the same as a hang — raise the value
-  for sessions that run long quiet commands inside agy, or set `0`.
+- **Model tier** — no tool in flight: the model itself stopped answering.
+  `AGY_STALL_KILL_MS`, default `900000` (15 minutes); `0` disables.
+- **Tool tier** — a tool call open in some turn. `AGY_TOOL_STALL_MS`,
+  default `7200000` (2 hours); `0` disables. Mid-work kills are what the
+  split exists to prevent: the model's budget must never end a long quiet
+  tool.
+
+Past the budget the bridge fails the turn with `agy stalled: no output for …`
+naming which case fired, and kills the child — the conversation stays on disk
+and the next turn rebuilds it. With both budgets off, `--print-timeout 24h`
+remains the absolute backstop.
