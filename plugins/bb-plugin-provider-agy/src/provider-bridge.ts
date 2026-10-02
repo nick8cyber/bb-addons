@@ -402,12 +402,13 @@ interface Session {
   lastActivityAt: number;
   /**
    * Last time the child produced ANY stdout/stderr bytes — not turn
-   * activity, pure process liveness. A turn whose tool blocks forever (a
-   * `systemctl start` waiting on a systemd password prompt, 23.09 on the CI
-   * duty thread) emits nothing until the result that never comes, and
-   * `--print-timeout 24h` would let it sit a day. The stall sweep kills the
-   * child past AGY_STALL_KILL_MS of silence DURING a turn and fails the turn
-   * naming the silence; between turns only the idle sweep applies.
+   * activity, pure process liveness. The stall sweep reads it DURING a turn
+   * against two budgets: silence with NO tool in flight past
+   * AGY_STALL_KILL_MS (the model itself is frozen), and silence with a tool
+   * in flight past AGY_TOOL_STALL_MS — agy does not stream tool output, so a
+   * working tool and a blocked one (`systemctl start` waiting on a password
+   * prompt, 23.09 on the CI duty thread) look identical until the cap.
+   * Between turns only the idle sweep applies.
    */
   lastChildOutputAt: number;
 }
@@ -2785,31 +2786,39 @@ function sweepIdleSessions(): void {
 let idleSweep: NodeJS.Timeout | null = null;
 
 /**
- * Stall kill — the complement of the idle sweep: idle covers silence BETWEEN
- * turns, this covers silence DURING one. A tool that blocks forever (a
- * `systemctl start` waiting on a systemd password prompt — 23.09 on the CI
- * duty thread, agy silent for the whole hang) produces no stdout, no stderr,
- * no result; `--print-timeout 24h` would let the turn sit a full day while
- * the thread reads "running". Past AGY_STALL_KILL_MS (default 15 minutes,
- * 0 disables) of child silence with a turn in flight — written or queued,
- * even one still waiting for identity — the session fails with a message
- * naming the silence, and the child is killed like an idle release: the
- * conversation stays on disk and the next turn rebuilds it.
+ * Stall kill — the complement to the idle sweep: idle covers silence BETWEEN
+ * turns, this covers silence DURING one. Two budgets, because two hangs wear
+ * the same face (agy never streams tool output — a tool step opens and the
+ * child says nothing until it settles):
  *
- * A legitimately long tool also looks like silence — the threshold is a
- * tradeoff, not a proof; raise AGY_STALL_KILL_MS for sessions that run
- * multi-quarter commands inside agy, or set it to 0 to opt out.
+ * - No tool in flight (the model is between steps or has stopped answering):
+ *   AGY_STALL_KILL_MS, default 15 minutes, 0 disables.
+ * - A tool call open in some turn: AGY_TOOL_STALL_MS, default 2 hours, 0
+ *   disables — a working long tool and a blocked one (a password prompt under
+ *   `systemctl start`, 23.09) are indistinguishable from silence, so mid-tool
+ *   kills get their own, far longer leash instead of firing on the model's
+ *   budget while the agent is legitimately at work.
+ *
+ * Either way the session fails with a message naming the silence, the child
+ * is killed like an idle release, and the conversation stays on disk for the
+ * next turn to rebuild. `--print-timeout 24h` remains the absolute backstop
+ * when both budgets are off.
  */
 const DEFAULT_STALL_KILL_MS = 900_000;
+const DEFAULT_TOOL_STALL_KILL_MS = 7_200_000;
 
 function stallKillMs(): number {
   const raw = Number(process.env.AGY_STALL_KILL_MS);
   return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_STALL_KILL_MS;
 }
 
+function toolStallMs(): number {
+  const raw = Number(process.env.AGY_TOOL_STALL_MS);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_TOOL_STALL_KILL_MS;
+}
+
 function sweepStalledTurns(): void {
-  const stallMs = stallKillMs();
-  if (stallMs <= 0) {
+  if (stallKillMs() <= 0 && toolStallMs() <= 0) {
     return;
   }
   const now = Date.now();
@@ -2824,19 +2833,37 @@ function sweepStalledTurns(): void {
     if (session.turns.length === 0 && session.pending.length === 0) {
       continue;
     }
+    // An open tool item means agy announced a tool step and never settled
+    // it: working or blocked, that is the tool budget's case.
+    let activeTool: string | null = null;
+    for (const turn of session.turns) {
+      const open = turn.toolItems.values().next();
+      if (!open.done) {
+        activeTool = open.value.name;
+        break;
+      }
+    }
+    const limitMs = activeTool === null ? stallKillMs() : toolStallMs();
+    if (limitMs <= 0) {
+      continue;
+    }
     const silentMs = now - session.lastChildOutputAt;
-    if (silentMs < stallMs) {
+    if (silentMs < limitMs) {
       continue;
     }
     const silentSec = Math.round(silentMs / 1000);
+    const reason =
+      activeTool === null
+        ? "during a turn (nothing streamed and no tool is running — the agent itself is frozen)"
+        : `while the tool ${activeTool} is in flight (agy does not stream tool output — ` +
+          "a blocked tool, e.g. a password prompt, hangs exactly like this)";
     log(
       `session ${session.threadId} silent for ${silentSec}s with a turn in flight: ` +
         `failing the turn and killing the agy child (conversation ${session.providerThreadId ?? "none"} stays; the next turn rebuilds it)`,
     );
     failSession(
       session,
-      `agy stalled: no output for ${silentSec}s during a turn ` +
-        `(a blocked tool — e.g. a password prompt — hangs exactly like this); ` +
+      `agy stalled: no output for ${silentSec}s ${reason}; ` +
         `the child is being killed, the next turn rebuilds the conversation`,
     );
     killChild(session);

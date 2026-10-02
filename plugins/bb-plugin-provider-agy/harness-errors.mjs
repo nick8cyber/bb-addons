@@ -7,8 +7,10 @@
  * followed by the child exiting 1 without a raw exit banner added — plus the
  * quota auto-retry: a 2s-window reject whose queued re-run completes on a
  * rebuilt child (quota-retry), and a budget-exhaustion run where the retry
- * itself fails and settles honestly (quota-retry-always). Eight threads,
- * eight shapes (see fake-agy-errors.mjs).
+ * itself fails and settles honestly (quota-retry-always), plus the two stall
+ * shapes — one open tool item then silence (tool tier), and silence with no
+ * tool at all (model tier). Ten threads, ten shapes (see
+ * fake-agy-errors.mjs).
  *
  * Usage: node harness-errors.mjs
  */
@@ -32,9 +34,13 @@ process.env.AGY_FAKE_TRANSCRIPT = transcript;
 // dedicated quota-retry scenarios below re-enable it (short countdowns).
 process.env.AGY_AUTO_RETRY_MAX = "0";
 // Stall sweep on a harness-sized leash: the fake answers in milliseconds, so
-// only the `stall` scenario (mute after one tool item) ever reaches it, while
-// production keeps the 10-minute default.
+// only the `stall` scenarios (mute after a tool item / mute with none) ever
+// reach it, while production keeps the 15-minute model default.
 process.env.AGY_STALL_KILL_MS = "1200";
+// The tool tier starts DISABLED: the stall scenario's open tool must survive
+// the model budget — killing mid-work is the bug this split exists to fix —
+// and the harness then raises this cap to prove the tool tier kills.
+process.env.AGY_TOOL_STALL_MS = "0";
 const workspace = (mode) => {
   const dir = join(root, `ws-${mode}`);
   mkdirSync(dir, { recursive: true });
@@ -120,7 +126,7 @@ async function start(mode) {
   return { threadId, startId, startMsg: messages.find((m) => m.id === startId) };
 }
 
-async function turn(threadId, text, ordinal) {
+function sendTurn(threadId, text) {
   const id = nextId++;
   send({
     jsonrpc: "2.0", id, method: "turn/start",
@@ -131,6 +137,11 @@ async function turn(threadId, text, ordinal) {
       options,
     },
   });
+  return id;
+}
+
+async function turn(threadId, text, ordinal) {
+  sendTurn(threadId, text);
   await waitFor(() => completed(threadId).length >= ordinal, 15_000, `${threadId}: turn ${ordinal}`);
 }
 
@@ -239,13 +250,21 @@ const always = await start("quota-retry-always");
   stop(always.threadId);
 }
 
-// stall mode: a turn whose child goes permanently silent after one live tool
-// item — the systemd-password-prompt hang, reproduced. The stall sweep must
-// fail the turn naming the silence, kill the child, and leave the session
-// rebuildable: the next turn (mode switched back to succeed) completes on a
-// fresh child against the same conversation.
+// stall mode: a turn whose child opens one live tool item and then goes
+// permanently silent — the systemd-password-prompt hang, reproduced, and
+// also what every long quiet tool looks like (agy never streams tool
+// output). Phase A: with the tool budget off, the model tier must look at
+// the open tool and stand down — killing mid-work is the bug this split
+// exists to fix. Phase B: raising the tool budget must fail the turn naming
+// the in-flight tool, kill the child, and leave the session rebuildable:
+// the next turn (mode switched back to succeed) completes on a fresh child
+// against the same conversation.
 const stall = await start("stall");
-await turn(stall.threadId, "one", 1);
+sendTurn(stall.threadId, "one");
+await sleep(2600); // >2x AGY_STALL_KILL_MS — long enough for a wrong-tier kill
+const stallSurvivedModelTier = completed(stall.threadId).length === 0;
+process.env.AGY_TOOL_STALL_MS = "1200";
+await waitFor(() => completed(stall.threadId).length >= 1, 15_000, "stall: tool-tier kill");
 process.env.AGY_FAKE_ERROR_MODE = "succeed";
 await turn(stall.threadId, "two", 2);
 await sleep(200);
@@ -254,6 +273,13 @@ const stallReplaced = () =>
     (m) => m.method === "session/replaced" && m.params.threadId === stall.threadId,
   ).length;
 stop(stall.threadId);
+
+// stall-quiet mode: a turn the child never answers — no tool in flight, so
+// the model tier must fire on its own budget without the tool tier's help.
+const quiet = await start("stall-quiet");
+await turn(quiet.threadId, "one", 1);
+await sleep(200);
+stop(quiet.threadId);
 
 bridge.onClose?.();
 process.stdout.write = originalWrite;
@@ -277,6 +303,9 @@ const alwaysBoundaries = completed(always.threadId);
 const stallErrors = errors(stall.threadId);
 const stallBoundaries = completed(stall.threadId);
 const stallStalled = stallErrors.filter((e) => e.message.includes("agy stalled"));
+const quietErrors = errors(quiet.threadId);
+const quietBoundaries = completed(quiet.threadId);
+const quietStalled = quietErrors.filter((e) => e.message.includes("agy stalled"));
 const retryRawExits = (tid) =>
   errors(tid).filter((e) => e.message.includes("exited"));
 
@@ -321,10 +350,13 @@ const checks = [
   ["always/retry-ran-exactly-once", alwaysReplaced() === 1, `${alwaysReplaced()} session/replaced`],
   ["always/no-completed-boundary", alwaysBoundaries.every((b) => b.status === "failed"), JSON.stringify(alwaysBoundaries.map((b) => b.status))],
   ["always/no-exit-banner", alwaysErrors.length === 2 && alwaysErrors.every((e) => e.message === QUOTA_SHORT) && retryRawExits(always.threadId).length === 0, JSON.stringify(alwaysErrors.map((e) => e.message))],
-  ["stall/turn-failed-naming-the-silence", stallBoundaries[0]?.status === "failed" && (stallBoundaries[0]?.error?.message ?? "").includes("agy stalled") && (stallBoundaries[0]?.error?.message ?? "").includes("no output"), JSON.stringify(stallBoundaries[0] ?? "").slice(0, 200)],
+  ["stall/tool-open-survives-model-tier", stallSurvivedModelTier === true, `turn must still be in flight after 2x AGY_STALL_KILL_MS with a tool open; statuses ${JSON.stringify(stallBoundaries.map((b) => b.status))}`],
+  ["stall/turn-failed-naming-the-silence", stallBoundaries[0]?.status === "failed" && (stallBoundaries[0]?.error?.message ?? "").includes("agy stalled") && (stallBoundaries[0]?.error?.message ?? "").includes("no output") && (stallBoundaries[0]?.error?.message ?? "").includes("in flight"), JSON.stringify(stallBoundaries[0]?.error?.message ?? "").slice(0, 200)],
   ["stall/surfaced-once", stallStalled.length === 1 && stallStalled[0].threadScoped === true, JSON.stringify(stallErrors.map((e) => e.message)).slice(0, 160)],
   ["stall/child-killed-and-session-rebuilds", stallReplaced() >= 1 && stallBoundaries.length === 2 && stallBoundaries[1].status === "completed", `${stallReplaced()} session/replaced; statuses ${JSON.stringify(stallBoundaries.map((b) => b.status))}`],
   ["stall/no-raw-exit-banner", retryRawExits(stall.threadId).length === 0, JSON.stringify(stallErrors.map((e) => e.message)).slice(0, 160)],
+  ["stall-quiet/turn-failed-by-model-tier", quietBoundaries[0]?.status === "failed" && (quietBoundaries[0]?.error?.message ?? "").includes("agy stalled") && (quietBoundaries[0]?.error?.message ?? "").includes("no output") && !((quietBoundaries[0]?.error?.message ?? "").includes("in flight")), JSON.stringify(quietBoundaries[0]?.error?.message ?? "").slice(0, 200)],
+  ["stall-quiet/surfaced-once", quietStalled.length === 1 && quietStalled[0].threadScoped === true, JSON.stringify(quietErrors.map((e) => e.message)).slice(0, 160)],
 ];
 
 say("==== error-surfacing report ====");
