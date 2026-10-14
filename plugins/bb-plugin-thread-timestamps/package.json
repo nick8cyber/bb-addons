@@ -1,0 +1,39 @@
+{
+  "name": "bb-plugin-thread-timestamps",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Постоянные дата и время у сообщений пользователя и агента в тредах BB.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nick8cyber/bb-addons.git",
+    "directory": "plugins/bb-plugin-thread-timestamps"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "bb plugin build"
+  },
+  "engines": {
+    "bb": ">=0.45",
+    "bbPluginSdk": ">=0.6.15"
+  },
+  "bb": {
+    "name": "Thread Timestamps",
+    "description": "Дата и время каждого сообщения пользователя и агента, всегда видимые.",
+    "branding": {
+      "icon": "Clock"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.15",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7",
+    "jsdom": "^30.0.1"
+  }
+}

@@ -22,6 +22,10 @@
     {
       "name": "speak",
       "source": "./plugins/bb-plugin-speak"
+    },
+    {
+      "name": "thread-timestamps",
+      "source": "./plugins/bb-plugin-thread-timestamps"
     }
   ]
 }
