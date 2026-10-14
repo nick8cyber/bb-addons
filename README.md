@@ -1,7 +1,6 @@
 # bb-addons
 
-Plugins and themes for [bb](https://getbb.app). Six plugins, one theme, all
-usable independently.
+Independently usable plugins and themes for [bb](https://getbb.app).
 
 Install any of them straight from this repository:
 
@@ -116,6 +115,18 @@ bb plugin config sidebar-collapse set visibleThreads 10
 
 Details in
 [plugins/bb-plugin-sidebar-collapse/README.md](plugins/bb-plugin-sidebar-collapse/README.md).
+
+### `thread-timestamps`
+
+Always-visible date and time above every user and assistant message, in the
+browser's local time zone: `13.10.2026 20:11`. Covers new messages, history,
+and split panes without opening a menu or hovering over action buttons.
+
+An independently maintained fork of bighitbiker3's Message Timestamps, with
+bounded history requests, caching and cleanup on disable.
+
+Details in
+[plugins/bb-plugin-thread-timestamps/README.md](plugins/bb-plugin-thread-timestamps/README.md).
 
 ## Themes
 
