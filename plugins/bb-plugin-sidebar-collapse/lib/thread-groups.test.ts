@@ -51,6 +51,84 @@ const fruits = (n: number) => {
 };
 
 describe("groupSidebarThreads", () => {
+  it.each([undefined, false, true])("unreadFirst=%s keeps legacy order unless enabled", (unreadFirst) => {
+    const threads = [
+      makeThread({ id: "read", updatedAt: 20 }),
+      makeThread({ id: "unread", isUnread: true, updatedAt: 1 }),
+    ];
+    const groups = groupSidebarThreads(makeInput({ threads, unreadFirst }));
+    expect(groups[0].rows.map((r) => r.thread.id)).toEqual(
+      unreadFirst ? ["unread", "read"] : ["read", "unread"],
+    );
+    expect(threads.map((t) => t.id)).toEqual(["read", "unread"]);
+  });
+
+  it("keeps pins first and activity/id order inside each read-state group", () => {
+    const threads = [
+      makeThread({ id: "read", updatedAt: 100 }),
+      makeThread({ id: "pin", isPinned: true }),
+      makeThread({ id: "unread-b", isUnread: true, updatedAt: 10 }),
+      makeThread({ id: "unread-a", isUnread: true, updatedAt: 10 }),
+      makeThread({ id: "unread-new", isUnread: true, updatedAt: 20 }),
+    ];
+    const groups = groupSidebarThreads(makeInput({ threads, unreadFirst: true, limit: 0 }));
+    expect(groups[0].rows.map((r) => r.thread.id)).toEqual([
+      "pin", "unread-new", "unread-a", "unread-b", "read",
+    ]);
+  });
+
+  it("promotes unread descendant branches while preserving child order and nesting", () => {
+    const threads = [
+      makeThread({ id: "recent", updatedAt: 100 }),
+      makeThread({ id: "parent" }),
+      makeThread({ id: "child", parentThreadId: "parent", createdAt: 1 }),
+      makeThread({ id: "grandchild", parentThreadId: "child", isUnread: true }),
+      makeThread({ id: "sibling", parentThreadId: "parent", createdAt: 2 }),
+    ];
+    const groups = groupSidebarThreads(makeInput({ threads, unreadFirst: true }));
+    expect(groups[0].rows.map((r) => [r.thread.id, r.depth])).toEqual([
+      ["parent", 0], ["child", 1], ["grandchild", 2], ["sibling", 1], ["recent", 0],
+    ]);
+  });
+
+  it("ignores archived unread children when ranking branches", () => {
+    const threads = [
+      makeThread({ id: "recent", updatedAt: 100 }),
+      makeThread({ id: "parent" }),
+      makeThread({ id: "archived", parentThreadId: "parent", isUnread: true, isArchived: true }),
+    ];
+    const groups = groupSidebarThreads(makeInput({ threads, unreadFirst: true }));
+    expect(groups[0].rows.map((r) => r.thread.id)).toEqual(["recent", "parent"]);
+  });
+
+  it("applies unread priority before the limit and preserves active/attention branches", () => {
+    const threads = [
+      makeThread({ id: "recent", updatedAt: 100 }),
+      makeThread({ id: "unread", isUnread: true }),
+      makeThread({ id: "active" }),
+      makeThread({ id: "attention", hasPendingInteraction: true }),
+    ];
+    const groups = groupSidebarThreads(makeInput({
+      threads, unreadFirst: true, limit: 1, activeThreadId: "active", keepAttention: true,
+    }));
+    expect(groups[0].rows.map((r) => r.thread.id)).toEqual(["unread", "active", "attention"]);
+    expect(groups[0].hiddenCount).toBe(1);
+  });
+
+  it("preserves project order and handles unread cycles without duplicating rows", () => {
+    const threads = [
+      makeThread({ id: "a", parentThreadId: "b" }),
+      makeThread({ id: "b", parentThreadId: "a", isUnread: true }),
+      makeThread({ id: "other", projectId: "p2", updatedAt: 100 }),
+    ];
+    const groups = groupSidebarThreads(makeInput({
+      threads, unreadFirst: true,
+      projects: [{ id: "p2", name: "Other", isPersonal: false }, { id: "p1", name: "First", isPersonal: false }],
+    }));
+    expect(groups.map((g) => g.projectId)).toEqual(["p2", "p1"]);
+    expect(groups[1].rows.map((r) => r.thread.id)).toEqual(["a", "b"]);
+  });
+
   it("пустой ввод → пустой массив групп", () => {
     expect(groupSidebarThreads(makeInput({}))).toEqual([]);
   });

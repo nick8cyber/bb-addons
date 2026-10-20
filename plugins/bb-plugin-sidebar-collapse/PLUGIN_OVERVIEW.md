@@ -1,21 +1,13 @@
-Keep a todo list beside the work it belongs to, in the sidebar and in
-your agent threads.
+Компактный список чатов BB: в каждом проекте видны первые N обычных веток, остальные раскрываются кнопкой «Показать ещё».
 
-## What you get
+## Возможности
 
-- An **Example todos** page in the left sidebar that adds, completes, and
-  removes todos.
-- A `bb sidebar-collapse` command that does the same from a terminal.
-- Live updates, so a change made in one place reaches every open page at once.
+- Закреплённые и активные чаты остаются видимыми; по настройке не скрываются ветки, требующие ответа или завершившиеся с ошибкой.
+- «Непрочитанные сверху» поднимает ветки с непрочитанными чатами, сохраняя закреплённые первыми и дочерние чаты под родителем. По умолчанию выключено.
+- Проекты можно сворачивать и переставлять; доступны переименование, закрепление, отметка прочтения, ссылка, открытие рядом и архивирование тредов.
 
-## How it works
+## Настройка
 
-The todos live in this plugin's own storage on the BB server, one list per
-installation. Nothing leaves the machine, and the plugin needs no account, API
-key, or external service.
+Открой настройки Sidebar Collapse. `visibleThreads` задаёт лимит; 0 показывает все чаты. `unreadFirst` включает сортировку по непрочитанным. `useCollapsedList` возвращает штатный список без удаления плагина.
 
-## For agents
-
-The bundled skill tells an agent to read the list with `bb sidebar-collapse list`, add
-one todo at a time with `bb sidebar-collapse add`, and close finished work with
-`bb sidebar-collapse done`.
+Настройки хранятся в BB; отдельные аккаунты и внешние сервисы не нужны.

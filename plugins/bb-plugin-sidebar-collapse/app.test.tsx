@@ -60,6 +60,28 @@ function makeProject(
 }
 
 describe("bb-plugin-sidebar-collapse frontend tests", () => {
+  it.each([false, true])("renders unreadFirst=%s through plugin settings", async (unreadFirst) => {
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.threadLists[0]!, {
+      activeThreadId: null, activeProjectId: null, isCompactViewport: false,
+      onNavigate: () => {}, searchQuery: "", Original: () => <div>bb list</div>,
+    }, {
+      settings: { unreadFirst, visibleThreads: 1, keepAttention: false },
+      sidebarThreads: {
+        status: "ready", projects: [makeProject()],
+        threads: [
+          makeThread({ id: "read", title: "Read thread", updatedAt: 10000, latestAttentionAt: 10000 }),
+          makeThread({ id: "unread", title: "Unread thread", isUnread: true, updatedAt: 1, latestAttentionAt: 1 }),
+        ],
+      },
+    });
+    const rowIds = () => Array.from(slot.container.querySelectorAll("a[data-sidebar-thread-id]"))
+      .map((row) => row.getAttribute("data-sidebar-thread-id"));
+    expect(rowIds()).toEqual(unreadFirst ? ["unread"] : ["read"]);
+    fireEvent.click(slot.getByText("Show more (1)"));
+    expect(rowIds()).toEqual(unreadFirst ? ["unread", "read"] : ["read", "unread"]);
+  });
+
   it("renders 5 threads and 'Show more (3)' when there are 8 threads and visibleThreads is 5", async () => {
     const app = await loadPluginApp(() => import("./app"));
     const threads = Array.from({ length: 8 }, (_, i) =>
