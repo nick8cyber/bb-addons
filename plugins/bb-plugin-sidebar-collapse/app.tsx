@@ -490,6 +490,7 @@ function CollapsedThreadList({
       ? Math.floor(raw)
       : 5;
   const keepAttention = values?.keepAttention !== false;
+  const unreadFirst = values?.unreadFirst === true;
   const showBranchName = values?.showBranchName === true;
   const showThreadCount = values?.showThreadCount === true;
 
@@ -539,6 +540,7 @@ function CollapsedThreadList({
         activeThreadId,
         limit,
         keepAttention,
+        unreadFirst,
         expandedGroupKeys,
         foldedProjectIds,
       }),
@@ -548,6 +550,7 @@ function CollapsedThreadList({
       activeThreadId,
       limit,
       keepAttention,
+      unreadFirst,
       expandedGroupKeys,
       foldedProjectIds,
     ],

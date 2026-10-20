@@ -42,6 +42,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Не скрывать под «Show more» чаты, которые ждут ответа или упали с ошибкой.",
       default: true,
     },
+    unreadFirst: {
+      type: "boolean",
+      label: "Непрочитанные сверху",
+      description:
+        "В каждом проекте показывать ветки с непрочитанными чатами выше прочитанных. Закреплённые остаются первыми.",
+      default: false,
+    },
     showBranchName: {
       type: "boolean",
       label: "Show the git branch in a row",
