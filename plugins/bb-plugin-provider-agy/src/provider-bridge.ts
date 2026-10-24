@@ -331,6 +331,8 @@ interface Session {
   lastFailure: string | null;
   /** agy's own last words, which usually name the real cause. */
   lastStderr: string | null;
+  /** Stderr framing and diagnostics for this child, since its current turn began. */
+  childStderr: { tail: string; history: string };
   /**
    * The last error text surfaced to the thread as a `provider.error`, so a
    * tool error, an ERROR result and a stderr banner all carrying the same
@@ -455,6 +457,37 @@ const ACTIONABLE_ERROR =
 /** Lines agy prints while it is still running normally, not failures. */
 const BENIGN_STDERR = /^warning[: ]/iu;
 
+/** A network failure during the eligibility check alone is not an auth failure. */
+function isAccountIneligible(message: string): boolean {
+  return /not eligible for Antigravity|verify your account/iu.test(message);
+}
+
+/** Extract one eligibility diagnostic, excluding earlier quota/tool chatter. */
+function ineligibleStderrBlock(stderr: string): string | null {
+  const lines = stderr.replace(/\u001b\[[0-9;]*m/gu, "")
+    .split(/\r?\n/u).map((line) => line.trim());
+  let start = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (/Eligibility check failed/iu.test(lines[index]) ||
+        (start === -1 && isAccountIneligible(lines[index]))) {
+      start = index;
+    }
+  }
+  if (start === -1) return null;
+  const tail = lines.slice(start);
+  let end = tail.findIndex((line) => /https:\/\/accounts\.google\.com\//u.test(line));
+  if (end === -1) {
+    // Location has no URL. End at the last eligibility instruction, not at
+    // unrelated shutdown chatter; preserve intermediate diagnostic lines.
+    end = 0;
+    tail.forEach((line, index) => {
+      if (isAccountIneligible(line) || /^Alternatively,/iu.test(line)) end = index;
+    });
+  }
+  const message = tail.slice(0, end + 1).join("\n");
+  return isAccountIneligible(message) ? message : null;
+}
+
 function classifyError(message: string):
   | "rate-limit"
   | "unauthorized"
@@ -470,6 +503,7 @@ function classifyError(message: string):
     return "rate-limit";
   }
   if (
+    isAccountIneligible(message) ||
     /unauthori|not authorized|sign in|logged in|login|\b401\b|\b403\b|token/u.test(
       text,
     )
@@ -655,6 +689,25 @@ function quotaRetryMaxWaitMs(): number {
  */
 const DEFAULT_QUOTA_COOLDOWN_MS = 1_800_000;
 
+/** Read per failure so operators can disable parking without a bridge restart. */
+function ineligibleCooldownMs(location: boolean): number {
+  const variable = location ? "AGY_LOCATION_COOLDOWN_MS" : "AGY_INELIGIBLE_COOLDOWN_MS";
+  const raw = Number(process.env[variable]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : (location ? 7_200_000 : 86_400_000);
+}
+
+function ineligibleBreakerWindowMs(): number {
+  const raw = Number(process.env.AGY_INELIGIBLE_BREAKER_WINDOW_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 600_000;
+}
+
+function ineligibleBreakerMax(): number {
+  const raw = Number(process.env.AGY_INELIGIBLE_BREAKER_MAX);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3;
+}
+
+type AccountRetryReason = "quota" | "ineligible";
+
 /** Sliding window of streamed assistant text kept for the rotation handoff. */
 const HANDOFF_STREAMED_TEXT_CAP = 4_000;
 
@@ -732,7 +785,7 @@ function buildQuotaHandoffPrompt(session: Session, failedTurn: Turn): string {
 function rotateCooldownAccount(
   session: Session,
   where: string,
-): { from: string; to: string } | null {
+): { from: string; to: string; cause: "quota" | "ineligible" } | null {
   if (
     cliproxyRelayDataDir === null ||
     !accountsEnabled(process.env) ||
@@ -762,13 +815,26 @@ function rotateCooldownAccount(
     return null;
   }
   const from = session.accountLabel;
+  // Why the account is parked: an eligibility refusal stores its own text.
+  const cause: "quota" | "ineligible" = isAccountIneligible(
+    ledger.accounts[from]?.lastError ?? "",
+  )
+    ? "ineligible"
+    : "quota";
   session.accountLabel = candidate.label;
   markAccountUse(ledger, candidate.label);
   saveLedger(cliproxyRelayDataDir, ledger);
   log(
     `${where}: account ${from} cools until ${new Date(untilMs).toISOString()}; rotated to free sibling ${candidate.label}`,
   );
-  return { from, to: candidate.label };
+  return { from, to: candidate.label, cause };
+}
+
+/** How a cooldown rotation explains the parked account to the thread. */
+function parkedAccountPhrase(rotation: { from: string; cause: "quota" | "ineligible" }): string {
+  return rotation.cause === "ineligible"
+    ? `${rotation.from} is parked after failing Google's Antigravity eligibility check`
+    : `${rotation.from} is in quota cooldown`;
 }
 
 function clearQuotaRetryTimer(session: Session): void {
@@ -780,7 +846,9 @@ function clearQuotaRetryTimer(session: Session): void {
 }
 
 /**
- * A dead quota does not have to end the thread's work. When agy names the
+ * A quota or eligibility failure does not have to end the thread's work.
+ * Eligibility failures only rotate to free pool siblings, without quota
+ * waits or retry limits. For quota, when agy names the
  * minute the window reopens and that minute is close enough, a retry turn
  * carrying the same prompt is queued behind a timer. Call this after the
  * failed turn has been settled: the reader keeps the honest failure (the
@@ -792,25 +860,51 @@ function clearQuotaRetryTimer(session: Session): void {
  *
  * Returns true when the retry was queued.
  */
-function scheduleQuotaRetry(
+function scheduleAccountRetry(
   session: Session,
-  failedTurn: Turn,
+  failedTurn: Turn | null,
   message: string,
 ): boolean {
-  if (classifyError(message) !== "rate-limit") {
+  const turnId = failedTurn?.turnId ?? `idle:${session.threadId}`;
+  // Keep quota classification first, including messages mentioning both causes.
+  const reason: AccountRetryReason =
+    classifyError(message) === "rate-limit" ? "quota" : "ineligible";
+  if (reason === "ineligible" && failedTurn?.toolErrors.has(message)) {
+    log(`turn ${turnId}: tool error, not account eligibility; no account retry`);
+    return false;
+  }
+  if (reason === "ineligible" && !isAccountIneligible(message)) {
     log(
-      `turn ${failedTurn.turnId}: not a classified rate-limit; no quota retry`,
+      `turn ${turnId}: not a classified rate-limit; no quota retry`,
     );
+    return false;
+  }
+  if (reason === "quota" && failedTurn === null) return false;
+  if (reason === "ineligible") {
+    // Keep the verification link visible even when parking is disabled or
+    // refused by the breaker, including errors delivered only via result.
+    for (const url of message.match(/https:\/\/accounts\.google\.com\/[^\s]+/gu) ?? []) {
+      log(url);
+    }
+  }
+  const location = /not currently available in your location/iu.test(message) &&
+    !/verify your account|https:\/\/accounts\.google\.com\//iu.test(message);
+  const eligibilityReason = location ? "location" : "verification required";
+  const cooldownMs = reason === "ineligible" ? ineligibleCooldownMs(location) : 0;
+  if (reason === "ineligible" && cooldownMs === 0) {
+    log(`account ${session.accountLabel ?? "none"} is not eligible for Antigravity (${eligibilityReason}); parking disabled, failing`);
     return false;
   }
   // The rotation trigger is the CLASSIFICATION, not the countdown text: a
   // rate-limit that names no reset still cools the burnt account (default
   // 30 minutes) and still rotates when a sibling is free.
-  const parsedResetAtMs = quotaResetAtMs(message);
-  const resetAtMs = parsedResetAtMs ?? Date.now() + DEFAULT_QUOTA_COOLDOWN_MS;
-  if (parsedResetAtMs === null) {
+  const parsedResetAtMs = reason === "quota" ? quotaResetAtMs(message) : null;
+  const resetAtMs =
+    parsedResetAtMs ??
+    Date.now() + (reason === "quota" ? DEFAULT_QUOTA_COOLDOWN_MS : cooldownMs);
+  if (reason === "quota" && parsedResetAtMs === null) {
     log(
-      `turn ${failedTurn.turnId}: rate-limit without a parseable "Resets in" countdown; ` +
+      `turn ${turnId}: rate-limit without a parseable "Resets in" countdown; ` +
         `cooling the account for the default ${Math.round(DEFAULT_QUOTA_COOLDOWN_MS / 60000)}m`,
     );
   }
@@ -823,20 +917,39 @@ function scheduleQuotaRetry(
   // the wait below targets the earliest reopening window, not the burnt
   // account's own (which may name hours while a sibling opens in minutes).
   let candidateUntilMs: number | null = null;
+  let parked = false;
   if (
     cliproxyRelayDataDir !== null &&
     accountsEnabled(process.env) &&
     session.accountLabel !== null
   ) {
     const ledger = loadLedger(cliproxyRelayDataDir);
+    const now = Date.now();
+    if (reason === "ineligible") {
+      const windowMs = ineligibleBreakerWindowMs();
+      const parkedCount = Object.values(ledger.accounts).filter((entry) =>
+        typeof entry.ineligibleAtMs === "number" &&
+        entry.ineligibleAtMs > now - windowMs && entry.ineligibleAtMs <= now,
+      ).length;
+      if (parkedCount >= ineligibleBreakerMax()) {
+        log(`ineligible breaker open: ${parkedCount} accounts parked in the last ${windowMs / 60_000}m — suspect egress/network, not parking ${session.accountLabel}`);
+        return false;
+      }
+    }
     markAccountCooldown(
       ledger,
       session.accountLabel,
-      resetAtMs + QUOTA_RETRY_JITTER_MS,
+      resetAtMs + (reason === "quota" ? QUOTA_RETRY_JITTER_MS : 0),
       message,
     );
+    if (reason === "ineligible") {
+      ledger.accounts[session.accountLabel].ineligibleAtMs = now;
+      parked = true;
+    }
     const accounts = listAccounts(cliproxyRelayDataDir);
-    const candidate = pickAccount(ledger, accounts, session.accountLabel);
+    const candidate = failedTurn === null
+      ? null
+      : pickAccount(ledger, accounts, session.accountLabel);
     if (
       candidate !== null &&
       (ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0) <= Date.now()
@@ -849,21 +962,37 @@ function scheduleQuotaRetry(
       candidateUntilMs =
         ledger.accounts[candidate.label]?.cooldownUntilMs ?? null;
       log(
-        `turn ${failedTurn.turnId}: pool candidate ${candidate.label} still cools until ` +
+        `turn ${turnId}: pool candidate ${candidate.label} still cools until ` +
           `${new Date(candidateUntilMs ?? 0).toISOString()}; no rotation`,
       );
     }
     saveLedger(cliproxyRelayDataDir, ledger);
   } else {
     log(
-      `turn ${failedTurn.turnId}: no pool rotation (dataDir=${cliproxyRelayDataDir === null ? "none" : "ok"} ` +
+      `turn ${turnId}: no pool rotation (dataDir=${cliproxyRelayDataDir === null ? "none" : "ok"} ` +
         `accounts=${accountsEnabled(process.env) ? "on" : "off"} account=${session.accountLabel ?? "none"}); same-account wait only`,
     );
   }
-  const maxAttempts = quotaRetryMaxAttempts();
+  // Verification failures never wait for a quota window or spend its budget.
+  if (reason === "ineligible") {
+    if (parked) {
+      log(
+        `account ${session.accountLabel} is not eligible for Antigravity (${eligibilityReason}); ` +
+          `parked for ${cooldownMs / 3_600_000}h` +
+          (failedTurn === null
+            ? "; no turn queued, failing"
+            : switchTo === null ? "; no free sibling, failing" : `, rotating to ${switchTo.label}`),
+      );
+    }
+    if (switchTo === null) {
+      return false;
+    }
+  }
+  if (failedTurn === null) return false;
+  const maxAttempts = reason === "quota" ? quotaRetryMaxAttempts() : 0;
   if (switchTo === null && session.autoRetryCount >= maxAttempts) {
     log(
-      `turn ${failedTurn.turnId}: quota retry budget spent (${session.autoRetryCount}/${maxAttempts}); failing`,
+      `turn ${turnId}: quota retry budget spent (${session.autoRetryCount}/${maxAttempts}); failing`,
     );
     return false;
   }
@@ -877,9 +1006,9 @@ function scheduleQuotaRetry(
     switchTo !== null
       ? 1_000
       : Math.max(waitTargetMs + QUOTA_RETRY_JITTER_MS - Date.now(), 1_000);
-  if (waitMs > quotaRetryMaxWaitMs()) {
+  if (reason === "quota" && waitMs > quotaRetryMaxWaitMs()) {
     log(
-      `turn ${failedTurn.turnId}: quota reopens in ${Math.round(waitMs / 1000)}s, past the ${Math.round(quotaRetryMaxWaitMs() / 1000)}s auto-retry cap; failing`,
+      `turn ${turnId}: quota reopens in ${Math.round(waitMs / 1000)}s, past the ${Math.round(quotaRetryMaxWaitMs() / 1000)}s auto-retry cap; failing`,
     );
     return false;
   }
@@ -891,7 +1020,7 @@ function scheduleQuotaRetry(
   }
   const retryTurn = createTurn({
     prompt:
-      switchTo !== null
+      switchTo !== null && (reason === "quota" || session.providerThreadId !== null)
         ? buildQuotaHandoffPrompt(session, failedTurn)
         : failedTurn.prompt,
     clientRequestId: undefined,
@@ -911,13 +1040,13 @@ function scheduleQuotaRetry(
   }
   const attempt = session.autoRetryCount;
   session.autoRetryTimer = setTimeout(() => {
-    wakeQuotaRetry(session, attempt, waitMs, switchTo !== null);
+    wakeAccountRetry(session, attempt, waitMs, switchTo !== null, reason);
   }, waitMs);
   session.autoRetryTimer.unref();
   log(
     switchTo !== null
-      ? `turn ${failedTurn.turnId}: quota on the session's account; rotating to account ${switchTo.label} in ${Math.round(waitMs / 1000)}s (turn ${retryTurn.turnId}, fresh conversation, compact handoff)`
-      : `turn ${failedTurn.turnId}: quota until ${new Date(resetAtMs).toISOString()}; ` +
+      ? `turn ${turnId}: ${reason} on the session's account; rotating to account ${switchTo.label} in ${Math.round(waitMs / 1000)}s (turn ${retryTurn.turnId}, autoRetryCount=${attempt}, fresh conversation)`
+      : `turn ${turnId}: quota until ${new Date(resetAtMs).toISOString()}; ` +
         `retry ${attempt}/${maxAttempts} queued as turn ${retryTurn.turnId} in ${Math.round(waitMs / 1000)}s`,
   );
   return true;
@@ -925,11 +1054,12 @@ function scheduleQuotaRetry(
 
 /** The window reopened (or a sibling account took over): rebuild the child
  * and let `drainPending` run the queued retry turn plus anything behind it. */
-function wakeQuotaRetry(
+function wakeAccountRetry(
   session: Session,
   attempt: number,
   waitMs: number,
   freshConversation: boolean,
+  reason: AccountRetryReason,
 ): void {
   session.autoRetryTimer = null;
   // The session may have been stopped, or replaced by a fresh thread/start,
@@ -952,19 +1082,26 @@ function wakeQuotaRetry(
     );
     return;
   }
+  const hadConversation = session.providerThreadId !== null;
+  const contextLost = freshConversation && (reason === "quota" || hadConversation);
   log(
     freshConversation
-      ? `quota retry ${attempt}: sessionReplaced for thread ${session.threadId} (contextLost=true), rotating to account ${session.accountLabel ?? "?"} after ${Math.round(waitMs / 1000)}s; rebuilding agy on a fresh conversation`
+      ? `${reason} retry ${attempt}: rebuilding thread ${session.threadId} (contextLost=${contextLost}), rotating to account ${session.accountLabel ?? "?"} after ${Math.round(waitMs / 1000)}s on a fresh conversation`
       : `quota retry ${attempt}: sessionReplaced for thread ${session.threadId} (contextLost=false), window reopened after ${Math.round(waitMs / 1000)}s; rebuilding agy on conversation ${session.providerThreadId ?? "?"}`,
   );
-  notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
-    threadId: session.threadId,
-    providerThreadId: session.providerThreadId,
-    reason: freshConversation
-      ? "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over"
-      : "the quota window reopened; the turn is being re-run on the resumed conversation",
-    contextLost: freshConversation,
-  });
+  // Before the first init there is no conversation context to lose.
+  if (reason === "quota" || hadConversation) {
+    notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+      threadId: session.threadId,
+      providerThreadId: session.providerThreadId,
+      reason: freshConversation
+        ? reason === "ineligible"
+          ? "this account failed Google's Antigravity eligibility check; the turn is being re-run on another account, so the conversation context does not carry over"
+          : "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over"
+        : "the quota window reopened; the turn is being re-run on the resumed conversation",
+      contextLost,
+    });
+  }
   startChild({
     session,
     model: session.spawnConfig.model,
@@ -1239,8 +1376,19 @@ function startChild(args: StartChildArgs): void {
   // later turn's `last` to nothing. Both are the `session.reset` boundary.
   session.identityAnnounced = false;
   session.usageTotal = ZERO_USAGE;
+  session.lastStderr = null;
+  session.lastReportedError = null;
+  session.lastTurnFailed = false;
+  const childStderr = { tail: "", history: "" };
+  session.childStderr = childStderr;
   const generation = session.generation;
-  const command = resolveAgyCommand(process.env);
+  let command: string;
+  try {
+    command = resolveAgyCommand(process.env);
+  } catch (error) {
+    failSession(session, error instanceof Error ? error.message : String(error));
+    return;
+  }
   const spawnArgs = agySpawnArgs({
     model: args.model,
     reasoningLevel: args.reasoningLevel,
@@ -1316,20 +1464,22 @@ function startChild(args: StartChildArgs): void {
   // last words for the exit message, and every error-looking line is also
   // surfaced to the thread as a scoped provider.error, not just logged.
   child.stderr.setEncoding("utf8");
-  let stderrTail = "";
+  // Keep the multi-line verification diagnostic, including its URL, even
+  // before init (reportError deliberately cannot publish it at that point).
   child.stderr.on("data", (chunk: string) => {
     if (session.generation !== generation) {
       return;
     }
     session.lastChildOutputAt = Date.now();
-    stderrTail += chunk;
+    childStderr.tail += chunk;
+    childStderr.history = (childStderr.history + chunk).slice(-16_384);
     for (;;) {
-      const newline = stderrTail.indexOf("\n");
+      const newline = childStderr.tail.indexOf("\n");
       if (newline === -1) {
         break;
       }
-      const line = stderrTail.slice(0, newline).trim();
-      stderrTail = stderrTail.slice(newline + 1);
+      const line = childStderr.tail.slice(0, newline).trim();
+      childStderr.tail = childStderr.tail.slice(newline + 1);
       if (line.length === 0) {
         continue;
       }
@@ -1339,8 +1489,8 @@ function startChild(args: StartChildArgs): void {
     }
     // A trailing line with no newline is kept for the exit message even
     // though it never completes on its own.
-    if (stderrTail.trim().length > 0) {
-      session.lastStderr = stderrTail.slice(0, 2000);
+    if (childStderr.tail.trim().length > 0) {
+      session.lastStderr = childStderr.tail.slice(0, 2000);
     }
   });
 
@@ -1368,27 +1518,35 @@ function startChild(args: StartChildArgs): void {
       // failure may land on work that is scheduled, not lost.
       return;
     }
-    // An exit before `result` with a rate-limit in agy's last words is the
-    // same quota story as a failed result: route it into the rotation
-    // instead of failing the session on a dead HOME. `lastStderr` is only
-    // the LAST stderr line — a 429 banner followed by shutdown chatter would
-    // bury it, so fall back to the last actionable error text (the banner
-    // reportError recorded) and the blocked flag it raised. No identity
-    // gate: a first turn that dies to quota before `init` still has work
-    // queued in `pending` worth rotating.
-    const exitStderr = session.lastStderr;
-    const exitRateLimitMsg =
-      exitStderr !== null && classifyError(exitStderr) === "rate-limit"
-        ? exitStderr
+    // These diagnostics belong ONLY to this child generation. Session-level
+    // error deduplication and the blocked snapshot can outlive a rotation.
+    // Prefer the isolated eligibility block over any earlier quota chatter.
+    const ineligibleMessage = ineligibleStderrBlock(childStderr.history);
+    if (ineligibleMessage !== null) {
+      const liveTurn = session.turns.shift() ?? session.pending.shift();
+      if (liveTurn !== undefined) {
+        settleTurnFailed(session, liveTurn, ineligibleMessage);
+      }
+      if (scheduleAccountRetry(session, liveTurn ?? null, ineligibleMessage)) return;
+      failSession(session, ineligibleMessage, {
+        surfaceError: session.lastReportedError !== ineligibleMessage,
+      });
+      return;
+    }
+    // Quota keeps main's rule: agy's LAST stderr words, then the last
+    // actionable error of this turn (a tool-step 429). Scanning the whole
+    // stderr window is for the eligibility block only: a 429 banner that
+    // trails a completed turn can land after the next turn was written, and
+    // must not turn that turn's unrelated crash into a quota rotation. Both
+    // sources reset per spawn and per turn; the session-level blocked flag
+    // is deliberately not consulted (it outlives a rotation).
+    const exitQuotaMsg =
+      session.lastStderr !== null && classifyError(session.lastStderr) === "rate-limit"
+        ? session.lastStderr
         : session.lastReportedError !== null &&
             classifyError(session.lastReportedError) === "rate-limit"
           ? session.lastReportedError
           : null;
-    const exitQuotaMsg =
-      exitRateLimitMsg ??
-      (session.rateLimitsBlocked && session.lastReportedError !== null
-        ? session.lastReportedError
-        : null);
     if (
       exitQuotaMsg !== null &&
       (session.turns.length > 0 || session.pending.length > 0)
@@ -1398,15 +1556,10 @@ function startChild(args: StartChildArgs): void {
       );
       const liveTurn = session.turns.shift() ?? session.pending.shift();
       if (liveTurn !== undefined) {
-        // Settle the head turn honestly first (the boundary the missing
-        // `result` never brought), then queue the rotation retry behind it —
-        // the same order as the failed-result path.
         settleTurnFailed(session, liveTurn, exitQuotaMsg);
-        if (scheduleQuotaRetry(session, liveTurn, exitQuotaMsg)) {
+        if (scheduleAccountRetry(session, liveTurn, exitQuotaMsg)) {
           return;
         }
-        // Scheduling refused (cap/budget): the head turn already failed
-        // above, so the fallthrough below only owns what is left.
       }
     }
     const detail = session.lastStderr === null ? "" : `: ${session.lastStderr}`;
@@ -1940,6 +2093,13 @@ function handleResult(
       event.error !== null ||
       (event.status !== null && event.status !== "SUCCESS")
     ) {
+      if (event.error !== null && isAccountIneligible(event.error)) {
+        const pending = session.pending.shift();
+        if (pending !== undefined) {
+          settleTurnFailed(session, pending, event.error);
+        }
+        if (scheduleAccountRetry(session, pending ?? null, event.error)) return;
+      }
       failSession(
         session,
         event.error ??
@@ -2111,7 +2271,7 @@ function handleResult(
     // The failure is out; if agy named a near-enough reset, queue the same
     // prompt to re-run when the window reopens instead of leaving the thread
     // dead until a human retries it.
-    scheduleQuotaRetry(session, turn, message);
+    scheduleAccountRetry(session, turn, message);
   } else {
     emitDeltas(session, {
       kind: "turn.boundary",
@@ -2171,6 +2331,11 @@ function writeTurn(session: Session, turn: Turn): void {
   if (child === null) {
     return;
   }
+  // A completed turn's diagnostics must never classify a later crash.
+  // Reset framing too: an unterminated stderr line belongs to the old turn.
+  session.childStderr.tail = "";
+  session.childStderr.history = "";
+  session.lastStderr = null;
   child.stdin.write(
     agyUserMessageLine(
       session.writeGuardrail
@@ -2219,10 +2384,16 @@ function enqueueTurn(session: Session, turn: Turn): void {
       providerThreadId: session.providerThreadId,
       reason:
         cooldownRotation !== null
-          ? `the session's account ${cooldownRotation.from} is in quota cooldown; the turn is being re-run on account ${cooldownRotation.to}, so the conversation context does not carry over`
+          ? `the session's account ${parkedAccountPhrase(cooldownRotation)}; the turn is being re-run on account ${cooldownRotation.to}, so the conversation context does not carry over`
           : "the agy process was gone and is being restarted",
       contextLost: cooldownRotation !== null,
     });
+    if (cooldownRotation !== null) {
+      turn.prompt = buildQuotaHandoffPrompt(session, turn);
+    }
+    // Own this input before spawning: synchronous configuration failures
+    // (such as an invalid AGY_PATH) must settle it too.
+    session.pending.push(turn);
     startChild({
       session,
       model: session.spawnConfig.model,
@@ -2231,10 +2402,7 @@ function enqueueTurn(session: Session, turn: Turn): void {
         cooldownRotation !== null ? undefined : session.providerThreadId,
       envVars: session.spawnConfig.envVars,
     });
-    if (cooldownRotation !== null) {
-      // The new account has no history: the turn carries the handoff.
-      turn.prompt = buildQuotaHandoffPrompt(session, turn);
-    }
+    return;
   }
   const child = session.child;
   // A child that has not announced itself yet owns nothing: its turns wait in
@@ -2396,6 +2564,9 @@ const handlers: Record<string, RequestHandler> = {
         })),
         selectedOnlyModels: [],
       });
+    }).catch((error: unknown) => {
+      respondError(id, BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
+        error instanceof Error ? error.message : String(error));
     });
   },
 
@@ -2429,6 +2600,7 @@ const handlers: Record<string, RequestHandler> = {
       },
       lastFailure: null,
       lastStderr: null,
+      childStderr: { tail: "", history: "" },
       lastReportedError: null,
       lastTurnFailed: false,
       rateLimitsBlocked: false,
@@ -2530,6 +2702,7 @@ const handlers: Record<string, RequestHandler> = {
       },
       lastFailure: null,
       lastStderr: null,
+      childStderr: { tail: "", history: "" },
       lastReportedError: null,
       lastTurnFailed: false,
       rateLimitsBlocked: false,
@@ -2583,8 +2756,8 @@ const handlers: Record<string, RequestHandler> = {
           threadId: session.threadId,
           providerThreadId,
           reason:
-            `resumed conversation ${data.providerThreadId} belongs to account ${resumeRotation.from}, ` +
-            `still in quota cooldown; resumed on free sibling ${resumeRotation.to} instead, so the conversation context does not carry over`,
+            `resumed conversation ${data.providerThreadId} belongs to account ${parkedAccountPhrase(resumeRotation)}; ` +
+            `resumed on free sibling ${resumeRotation.to} instead, so the conversation context does not carry over`,
           contextLost: true,
         });
       }
@@ -2885,6 +3058,10 @@ function awaitIdentity(
   session: Session,
   settle: (providerThreadId: string | null) => void,
 ): void {
+  if (session.child === null && session.lastFailure !== null) {
+    settle(null);
+    return;
+  }
   if (session.providerThreadId !== null) {
     settle(session.providerThreadId);
     return;
@@ -2980,10 +3157,16 @@ export const experimental_providerBridge = experimental_defineProviderBridge({
     cliproxyRelayDataDir = context.dataDir;
     armIdleSweep();
     const relayOn = Object.keys(cliproxyChildEnvOverlay()).length > 0;
+    // A bad AGY_PATH is a per-spawn failure (startChild settles the session
+    // with the message); it must never take the whole bridge down here.
+    let agy: string;
+    try {
+      agy = resolveAgyCommand(process.env);
+    } catch (error) {
+      agy = `<error: ${error instanceof Error ? error.message : String(error)}>`;
+    }
     log(
-      `bridge started for plugin ${context.pluginId}; agy=${resolveAgyCommand(
-        process.env,
-      )} HOME=${process.env.HOME ?? "<unset>"} PATH=${process.env.PATH ?? "<unset>"}${relayOn ? "" : "; direct mode"}`,
+      `bridge started for plugin ${context.pluginId}; agy=${agy} HOME=${process.env.HOME ?? "<unset>"} PATH=${process.env.PATH ?? "<unset>"}${relayOn ? "" : "; direct mode"}`,
     );
   },
   onClose: shutdown,

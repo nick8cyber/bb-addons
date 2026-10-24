@@ -35,6 +35,8 @@ export interface AccountLedgerEntry {
   cooldownUntilMs: number;
   lastUsedMs: number;
   lastError: string | null;
+  /** Last eligibility parking, persisted for the cross-session breaker. */
+  ineligibleAtMs?: number;
 }
 
 export interface AccountsLedger {

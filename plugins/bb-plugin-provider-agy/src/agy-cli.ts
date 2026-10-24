@@ -18,7 +18,7 @@
  * cumulative for the whole conversation, while a step's `usage` is that
  * turn's.
  */
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 
 /** Reasoning levels bb may send, folded onto agy's three efforts. */
@@ -47,7 +47,10 @@ export function agyEffort(reasoningLevel: string | undefined): string | null {
  */
 export function resolveAgyCommand(env: NodeJS.ProcessEnv): string {
   const pinned = env.AGY_PATH;
-  if (pinned !== undefined && pinned.length > 0 && isExecutable(pinned)) {
+  if (pinned !== undefined && pinned.length > 0) {
+    if (!isExecutable(pinned)) {
+      throw new Error(`AGY_PATH=${pinned} is not executable`);
+    }
     return pinned;
   }
   const home = env.HOME;
@@ -72,7 +75,7 @@ export function resolveAgyCommand(env: NodeJS.ProcessEnv): string {
 function isExecutable(path: string): boolean {
   try {
     accessSync(path, constants.X_OK);
-    return true;
+    return statSync(path).isFile();
   } catch {
     return false;
   }
