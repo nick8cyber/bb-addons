@@ -387,6 +387,26 @@ which also remembers which account owns which conversation) and:
   reopens (the quota auto-retry bounds below apply); the conversation
   resumes.
 
+#### Account not eligible
+
+If agy reports `not eligible for Antigravity` or `verify your account`, the bridge parks that pool account and re-runs the failed turn on a free sibling after about one second. Verification refusals use a 24-hour cooldown. The refusal `not eligible for Antigravity, because it is not currently available in your location` uses a separate 2-hour cooldown and is logged with reason `location`; it may have no verification URL. A refusal that also requests verification or supplies a verification URL uses the verification cooldown.
+
+| Environment variable | Default | Behaviour |
+| --- | ---: | --- |
+| `AGY_INELIGIBLE_COOLDOWN_MS` | `86400000` (24 hours) | Verification cooldown; `0` disables parking and rotation for this kind only. |
+| `AGY_LOCATION_COOLDOWN_MS` | `7200000` (2 hours) | Location cooldown; `0` disables parking and rotation for this kind only. |
+| `AGY_INELIGIBLE_BREAKER_WINDOW_MS` | `600000` (10 minutes) | Positive time window for counting distinct accounts parked after either kind of eligibility refusal. |
+| `AGY_INELIGIBLE_BREAKER_MAX` | `3` | Positive integer threshold: after this many distinct accounts were parked within the window, the next refusal fails without parking or rotation. |
+
+All four variables are read for each failure. Eligibility retries do not spend the quota retry budget or wait for a quota window. The breaker reads each account's `ineligibleAtMs` from `accounts-state.json`, so the count survives bridge restarts; repeated parking of one label counts as one account. Events outside the window do not count. An open breaker logs `ineligible breaker open: N accounts parked in the last Xm — suspect egress/network, not parking <label>` and preserves the original diagnostic in the thread.
+
+If the old account already had a conversation, the retry uses a fresh conversation with a compact handoff and announces `session/replaced` with `contextLost: true`. Before the first `init`, the retry keeps the original prompt. If no sibling is free, the account is still parked and the log says `parked for …h; no free sibling, failing`. When the pool is disabled/unavailable, a cooldown is disabled, or the breaker is open, the session fails with the original diagnostic, including any verification URL.
+
+Close handling uses only the current child generation's stderr. Only the eligibility diagnostic block is stored as the account's `lastError`; earlier 429 messages and later shutdown chatter are excluded. A SOCKS/network failure during the check and a tool error containing `verify your account` do not trigger eligibility parking or rotation.
+
+> [!TIP] Restore a verified account
+> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then set that account's `cooldownUntilMs` to `0` in `bridge-data/accounts-state.json`, or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
+
 Accounts come in through `scripts/import-accounts.mjs` (from the opencode
 antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single
 token file) or by logging in directly into a home:

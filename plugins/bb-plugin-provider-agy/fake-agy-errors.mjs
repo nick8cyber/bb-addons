@@ -45,15 +45,29 @@
  *            are the bug this pair exists to prevent.
  *   stall-quiet  a turn the child never answers: no tool item at all. The
  *            model-tier budget (AGY_STALL_KILL_MS) must fail it.
+ *   ineligible  four stderr lines then exit 1 before init, only on the HOME
+ *            ending in FAKE_INELIGIBLE_LABEL. FAKE_INELIGIBLE_AFTER_TURN
+ *            defers the refusal until that input, to test existing context.
+ *   ineligible-result / ineligible-noinit-result  the same refusal via result.
+ *   ineligible-location  location restriction before init, without a URL.
+ *   network-eligibility  a SOCKS error during the check, never an auth error.
+ *   race429                      turn 1 succeeds, then a 429 banner trails its
+ *                                result; turn 2 crashes before its result
+ *   stale429 / stale-ineligible  turn 1 reports stderr but succeeds; turn 2
+ *            crashes with a fatal stderr line before result.
+ *   tool-quota-exit  tool ERROR quota on stdout, exit before result.
  *
  * Every stdin line is echoed to AGY_FAKE_TRANSCRIPT so the harness can prove
  * WHAT the bridge sent.
  */
 import { createInterface } from "node:readline";
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
-const mode = process.env.AGY_FAKE_ERROR_MODE ?? "stderr";
+// Account-specific modes reproduce failures across multiple child generations.
+const homeLabel = basename(process.env.HOME ?? "");
+const modesByLabel = JSON.parse(process.env.AGY_FAKE_MODE_BY_LABEL ?? "{}");
+const mode = modesByLabel[homeLabel] ?? process.env.AGY_FAKE_ERROR_MODE ?? "stderr";
 const conversationId =
   process.argv.includes("--conversation")
     ? process.argv[process.argv.indexOf("--conversation") + 1]
@@ -78,6 +92,53 @@ const REJECTED =
 const out = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const INELIGIBLE = [
+  "error: Eligibility check failed: Your current account is not eligible for Antigravity. Verify your account to continue.",
+  "Alternatively, try signing in with another personal Google account.",
+  "Please verify your account in your browser to continue:",
+  "https://accounts.google.com/v3/signin/continue?plt=fake-verification&continue=https://developers.google.com/gemini-code-assist/auth/auth_success_gemini",
+].join("\n");
+const NETWORK_ELIGIBILITY = 'Eligibility check failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": socks connect tcp 203.0.113.10:1080->example:443: unknown error general SOCKS server failure';
+const LOCATION_ELIGIBILITY = "error: Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.";
+const ineligibleHome = Object.hasOwn(modesByLabel, homeLabel) ||
+  (Boolean(process.env.FAKE_INELIGIBLE_LABEL) &&
+    (process.env.HOME ?? "").endsWith(`/${process.env.FAKE_INELIGIBLE_LABEL}`));
+
+async function refuseEligibility() {
+  if (mode.includes("result")) {
+    out({
+      event: "result",
+      result: {
+        conversation_id: mode === "ineligible-noinit-result" ? "" : conversationId,
+        status: "ERROR", response: "", num_turns: 0,
+        // Mixed case and only the second detector phrase prove both rules.
+        error: mode === "ineligible-result"
+          ? "Please VERIFY YOUR ACCOUNT to continue."
+          : mode === "ineligible-result-not-eligible"
+            ? "Your current account is NOT ELIGIBLE FOR ANTIGRAVITY."
+            : INELIGIBLE,
+      },
+    });
+  } else {
+    // Separate chunks, and no newline on the URL: neither the first nor last
+    // stderr line alone is the complete diagnostic from the incident.
+    let diagnostic = mode === "network-eligibility"
+      ? NETWORK_ELIGIBILITY
+      : mode === "ineligible-location" ? LOCATION_ELIGIBILITY : INELIGIBLE;
+    if (mode === "ineligible-noisy-stderr") {
+      diagnostic = diagnostic.replace("\nAlternatively,", "\nAdditional account eligibility details from the backend.\nAlternatively,");
+      diagnostic = `warning: earlier call hit a rate limit (429), try again later\n${diagnostic}\ninfo: cleaning up after refusal`;
+    }
+    const lines = diagnostic.split("\n");
+    for (let i = 0; i < lines.length; i += 1) {
+      process.stderr.write(lines[i] + (i < lines.length - 1 ? "\n" : ""));
+      await sleep(15);
+    }
+  }
+  await sleep(30);
+  process.exit(1);
+}
+
 // Env recording for the relay harness: the selected HOME / GEMINI_API_KEY /
 // GOOGLE_GEMINI_BASE_URL the shim actually ran with, before any traffic.
 const recordEnv = process.env.AGY_FAKE_RECORD_ENV ?? "";
@@ -91,6 +152,11 @@ if (recordEnv.length > 0) {
     transcript,
     `${JSON.stringify({ __env: snapshot, __argv: process.argv.slice(2) })}\n`,
   );
+}
+
+if ((mode.startsWith("ineligible") || mode === "network-eligibility") &&
+    ineligibleHome && !process.env.FAKE_INELIGIBLE_AFTER_TURN && !mode.startsWith("ineligible-result")) {
+  await refuseEligibility();
 }
 
 if (mode.startsWith("noinit")) {
@@ -138,6 +204,59 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       cache_read_tokens: 0,
       total_tokens: 10 * turns + 2,
     };
+    if (mode === "race429") {
+      if (turns === 1) {
+        // The result lands first; the 429 banner trails it, after the bridge
+        // has already written the queued turn 2.
+        out({ event: "step_update", step_update: { ...scope, step_index: step++, state: "DONE",
+          step_type: "agent_response", text_delta: "answered 1", usage } });
+        out({ event: "result", result: { ...scope, status: "SUCCESS", response: "answered 1", num_turns: turns, usage } });
+        process.stderr.write("⚠ Rate limit reached (429): slow down and try again later.\n");
+        return;
+      }
+      process.stderr.write("fatal: backend stream reset by peer\n");
+      setTimeout(() => process.exit(1), 50);
+      return;
+    }
+    if (mode === "stale429" || mode === "stale-ineligible") {
+      if (turns === 1) {
+        process.stderr.write((mode === "stale429"
+          ? "⚠ Rate limit reached (429): slow down and try again later."
+          : INELIGIBLE) + "\n");
+        // Continue to the ordinary successful result below.
+      } else {
+        process.stderr.write("fatal: backend stream reset by peer\n");
+        setTimeout(() => process.exit(1), 50);
+        return;
+      }
+    }
+    if (mode === "tool-quota-exit") {
+      const message = "⚠ Rate limit reached (429): slow down and try again later.";
+      out({ event: "step_update", step_update: {
+        ...scope, step_index: step++, state: "ERROR", step_type: "tool",
+        tool_name: "run_command", tool_info: { error: { message } },
+      } });
+      setTimeout(() => process.exit(1), 50);
+      return;
+    }
+    if (mode === "tool-ineligible") {
+      const message = "npm: verify your account to publish this package";
+      out({
+        event: "step_update",
+        step_update: {
+          ...scope, step_index: step++, state: "ERROR", step_type: "tool",
+          tool_name: "run_command", tool_info: { error: { message } },
+        },
+      });
+      out({ event: "result", result: { ...scope, status: "ERROR", response: "", error: message, num_turns: turns, usage } });
+      setTimeout(() => process.exit(1), 100);
+      return;
+    }
+    if ((mode.startsWith("ineligible") || mode === "network-eligibility") &&
+        ineligibleHome && turns >= Number(process.env.FAKE_INELIGIBLE_AFTER_TURN ?? 1)) {
+      void refuseEligibility();
+      return;
+    }
     if (mode === "stderr" && !bannerSent) {
       // The banner arrives mid-turn, after the session asked real work: that
       // is when agy's model call actually fails, and it guarantees identity
