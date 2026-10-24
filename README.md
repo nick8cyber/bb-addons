@@ -97,8 +97,9 @@ Details in [plugins/bb-plugin-speak/README.md](plugins/bb-plugin-speak/README.md
 ### `sidebar-collapse`
 
 The sidebar keeps the first five chats of every project and folds the rest
-behind **Show more (N)**, the way Claude's sidebar does; the expanded group
-switches the button to **Show less**. Pinned chats, the chat you are in, and
+behind **Ещё N**. Expanding reaches the next decade, then adds ten roots
+at a time; **Меньше** removes one batch. Both buttons share a row with the
+visible/total root count. Pinned chats, the chat you are in, and
 anything waiting on you are never folded away, so the limit only ever hides
 chats you are done with.
 

@@ -33,8 +33,8 @@ export interface GroupingInput<T extends GroupingThread = GroupingThread> {
   keepAttention: boolean;
   /** Непрочитанные ветки выше прочитанных; закреплённые всегда первыми. */
   unreadFirst?: boolean;
-  /** Ключи групп, где пользователь нажал «Show more». */
-  expandedGroupKeys: ReadonlySet<string>;
+  /** Бюджеты обычных корней в раскрытых группах. */
+  groupBudgets: ReadonlyMap<string, number>;
   /** projectId проектов, свёрнутых целиком. */
   foldedProjectIds: ReadonlySet<string>;
 }
@@ -61,6 +61,9 @@ export interface GroupingGroup<T extends GroupingThread = GroupingThread> {
   rootCount: number;
   /** Сколько корневых тредов сейчас скрыто лимитом (0, если ничего). */
   hiddenCount: number;
+  budget: number;
+  ordinaryCount: number;
+  shownCount: number;
 }
 
 const ATTENTION_INDICATORS = new Set(["waiting-for-input", "unread-error"]);
@@ -68,7 +71,7 @@ const ATTENTION_INDICATORS = new Set(["waiting-for-input", "unread-error"]);
 export function groupSidebarThreads<T extends GroupingThread>(
   input: GroupingInput<T>,
 ): readonly GroupingGroup<T>[] {
-  const { threads, projects, activeThreadId, limit, keepAttention, unreadFirst = false, expandedGroupKeys, foldedProjectIds } = input;
+  const { threads, projects, activeThreadId, limit, keepAttention, unreadFirst = false, groupBudgets, foldedProjectIds } = input;
 
   if (threads.length === 0) {
     return [];
@@ -259,15 +262,18 @@ export function groupSidebarThreads<T extends GroupingThread>(
     const isPersonal = meta ? meta.isPersonal : false;
     const key = `project:${pid}`;
     const isFolded = foldedProjectIds.has(pid);
-    const isExpanded = expandedGroupKeys.has(key);
+    const budget = limit === 0 ? 0 : Math.max(limit, groupBudgets.get(key) ?? limit);
+    const isExpanded = limit > 0 && budget > limit;
 
     const rootCount = projRoots.length;
+    const ordinaryCount = projRoots.filter(root => !forcedVisible.has(root.id)).length;
+    const shownCount = limit === 0 ? rootCount : Math.min(budget, ordinaryCount) + rootCount - ordinaryCount;
 
     let rows: GroupingRow<T>[] = [];
     let hiddenCount = 0;
 
     if (!isFolded) {
-      if (isExpanded || limit <= 0) {
+      if (limit <= 0) {
         // all roots shown
         rows = flattenRoots(projRoots, children, byId);
         hiddenCount = 0;
@@ -278,7 +284,7 @@ export function groupSidebarThreads<T extends GroupingThread>(
         const orderedShown: T[] = [];
         for (const r of projRoots) {
           const forced = forcedVisible.has(r.id);
-          if (count < limit || forced) {
+          if (count < budget || forced) {
             shown.set(r.id, r);
             orderedShown.push(r);
             if (!forced) {
@@ -301,6 +307,9 @@ export function groupSidebarThreads<T extends GroupingThread>(
       rows,
       rootCount,
       hiddenCount,
+      budget,
+      ordinaryCount,
+      shownCount,
     });
   }
 
