@@ -31,7 +31,7 @@ function makeInput(overrides: Partial<GroupingInput<GroupingThread>>): GroupingI
     activeThreadId: null,
     limit: 5,
     keepAttention: false,
-    expandedGroupKeys: new Set<string>(),
+    groupBudgets: new Map<string, number>(),
     foldedProjectIds: new Set<string>(),
     ...overrides,
   };
@@ -181,13 +181,13 @@ describe("groupSidebarThreads", () => {
     expect(groups[0].rootCount).toBe(8);
   });
 
-  it("expandedGroupKeys → все ряды, hiddenCount === 0", () => {
+  it("бюджет 10 → все 8 корней, hiddenCount === 0", () => {
     const threads = fruits(8).map((id) => makeThread({ id }));
     const groups = groupSidebarThreads(
       makeInput({
         threads,
         limit: 5,
-        expandedGroupKeys: new Set(["project:p1"]),
+        groupBudgets: new Map([["project:p1", 10]]),
       }),
     );
     expect(groups[0].rows.length).toBe(8);
@@ -354,7 +354,7 @@ describe("groupSidebarThreads", () => {
         threads,
         projects,
         limit: 3,
-        expandedGroupKeys: new Set(["project:p1"]),
+        groupBudgets: new Map([["project:p1", 10]]),
         foldedProjectIds: new Set(),
       }),
     );

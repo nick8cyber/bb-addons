@@ -1,11 +1,17 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, screen } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type {
   PluginSidebarProject,
   PluginSidebarThread,
 } from "@get-bb/plugin-sdk/app";
+
+let appPromise: ReturnType<typeof loadPluginApp>;
+beforeAll(async () => {
+  appPromise = loadPluginApp(() => import("./app"));
+  await appPromise;
+}, 60_000);
 
 afterEach(() => {
   cleanup();
@@ -61,7 +67,7 @@ function makeProject(
 
 describe("bb-plugin-sidebar-collapse frontend tests", () => {
   it.each([false, true])("renders unreadFirst=%s through plugin settings", async (unreadFirst) => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const slot = renderSlot(app.threadLists[0]!, {
       activeThreadId: null, activeProjectId: null, isCompactViewport: false,
       onNavigate: () => {}, searchQuery: "", Original: () => <div>bb list</div>,
@@ -78,12 +84,12 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     const rowIds = () => Array.from(slot.container.querySelectorAll("a[data-sidebar-thread-id]"))
       .map((row) => row.getAttribute("data-sidebar-thread-id"));
     expect(rowIds()).toEqual(unreadFirst ? ["unread"] : ["read"]);
-    fireEvent.click(slot.getByText("Show more (1)"));
+    fireEvent.click(slot.getByText("Ещё 1"));
     expect(rowIds()).toEqual(unreadFirst ? ["unread", "read"] : ["read", "unread"]);
   });
 
-  it("renders 5 threads and 'Show more (3)' when there are 8 threads and visibleThreads is 5", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+  it("renders 5 threads and 'Ещё 3' when there are 8 threads and visibleThreads is 5", async () => {
+    const app = await appPromise;
     const threads = Array.from({ length: 8 }, (_, i) =>
       makeThread({
         id: `t-${i + 1}`,
@@ -116,11 +122,11 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
       expect(slot.queryByText(`Thread ${i}`)).toBeNull();
     }
 
-    expect(slot.queryByText("Show more (3)")).toBeTruthy();
+    expect(slot.queryByText("Ещё 3")).toBeTruthy();
   });
 
   it("expands to show all 8 threads on 'Show more' click, changes to 'Show less', and collapses on second click", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = Array.from({ length: 8 }, (_, i) =>
       makeThread({
         id: `t-${i + 1}`,
@@ -147,7 +153,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     );
 
     const showMoreButton = slot.getByRole("button", {
-      name: /Show more \(3\)/,
+      name: /Ещё 3/,
     });
     fireEvent.click(showMoreButton);
 
@@ -155,7 +161,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
       expect(slot.queryByText(`Thread ${i}`)).toBeTruthy();
     }
 
-    const showLessButton = slot.getByRole("button", { name: "Show less" });
+    const showLessButton = slot.getByRole("button", { name: /Меньше/ });
     expect(showLessButton).toBeTruthy();
 
     fireEvent.click(showLessButton);
@@ -166,11 +172,11 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     for (let i = 6; i <= 8; i++) {
       expect(slot.queryByText(`Thread ${i}`)).toBeNull();
     }
-    expect(slot.queryByText("Show more (3)")).toBeTruthy();
+    expect(slot.queryByText("Ещё 3")).toBeTruthy();
   });
 
   it("records { method: 'open', threadId: id } on thread row click", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = [
       makeThread({ id: "t-1", title: "Thread 1", projectId: "proj-1" }),
     ];
@@ -207,7 +213,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
   });
 
   it("calls setPinned with { method: 'setPinned', threadId, pinned: true } on Pin menu item", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = [
       makeThread({
         id: "t-1",
@@ -251,7 +257,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
   });
 
   it("shows loading placeholder on status loading, and renders Original on status error", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
 
     const loadingSlot = renderSlot(
       app.threadLists[0]!,
@@ -290,7 +296,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
   });
 
   it("shows all threads and no 'Show more' button when visibleThreads is 0", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = Array.from({ length: 8 }, (_, i) =>
       makeThread({
         id: `t-${i + 1}`,
@@ -320,15 +326,15 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
       expect(slot.queryByText(`Thread ${i}`)).toBeTruthy();
     }
     expect(
-      slot.queryByRole("button", { name: /Show more/ }),
+      slot.queryByRole("button", { name: /Ещё/ }),
     ).toBeNull();
     expect(
-      slot.queryByRole("button", { name: /Show less/ }),
+      slot.queryByRole("button", { name: /Меньше/ }),
     ).toBeNull();
   });
 
   it("supports inline rename on double click: Enter saves, Escape cancels", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = [
       makeThread({ id: "t-1", title: "Original Title", projectId: "proj-1" }),
     ];
@@ -367,7 +373,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
   });
 
   it("renders bb's own list when useCollapsedList is turned off", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = Array.from({ length: 8 }, (_, i) =>
       makeThread({
         id: `t-${i + 1}`,
@@ -395,11 +401,11 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
 
     expect(slot.queryByText("bb list")).toBeTruthy();
     expect(slot.queryByText("Thread 1")).toBeNull();
-    expect(slot.queryByText("Show more (3)")).toBeNull();
+    expect(slot.queryByText("Ещё 3")).toBeNull();
   });
 
   it("hides the branch name and the project chat count unless their settings are on", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = [
       makeThread({
         id: "t-1",
@@ -445,7 +451,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
   });
 
   it("archives from the row's quick action without opening a menu", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = [
       makeThread({ id: "t-1", title: "Thread 1", projectId: "proj-1" }),
     ];
@@ -475,7 +481,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
   });
 
   it("reorders projects by dragging their headers", async () => {
-    const app = await loadPluginApp(() => import("./app"));
+    const app = await appPromise;
     const threads = [
       makeThread({ id: "t-1", title: "Thread 1", projectId: "proj-1" }),
       makeThread({ id: "t-2", title: "Thread 2", projectId: "proj-2" }),

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   definePluginApp,
   experimental_useSidebarThreadActions,
@@ -32,6 +32,7 @@ import { Icon } from "./components/ui/icon";
 import type { IconName } from "./components/ui/icon";
 import { Input } from "./components/ui/input";
 import { cn } from "./lib/utils";
+import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib/pagination";
 import {
   groupSidebarThreads,
   threadDisplayTitle,
@@ -473,6 +474,58 @@ function ThreadRow({
   );
 }
 
+function PaginationControls({
+  group, base, onBudget, focusFold,
+}: {
+  group: GroupingGroup<PluginSidebarThread>;
+  base: number;
+  onBudget: (budget: number) => void;
+  focusFold: () => void;
+}) {
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const lessRef = useRef<HTMLButtonElement>(null);
+  const pressedRef = useRef<HTMLButtonElement | null>(null);
+  const steps = pageSteps(base, group.budget, group.ordinaryCount);
+  useLayoutEffect(() => {
+    const pressed = pressedRef.current;
+    pressedRef.current = null;
+    if (pressed && !pressed.isConnected) {
+      const target = moreRef.current ?? lessRef.current;
+      if (target) target.focus({ preventScroll: true });
+      else focusFold();
+    }
+  });
+  const change = (button: HTMLButtonElement, budget: number) => {
+    pressedRef.current = document.activeElement === button ? button : null;
+    onBudget(budget);
+  };
+  if (base === 0 || (steps.more === 0 && !steps.canLess)) return null;
+  const buttonClass = "flex h-7 shrink-0 cursor-pointer items-center gap-1 rounded-md px-1 text-[11px] text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring";
+  return (
+    <div data-sidebar-pagination={group.projectId} className="flex min-w-0 items-center justify-between gap-1 pl-1">
+      {steps.more > 0 ? (
+        <button key="more" ref={moreRef} type="button" aria-expanded={group.isExpanded}
+          aria-label={`Ещё ${steps.more} — ${group.projectName}`}
+          onClick={event => change(event.currentTarget, steps.next)} className={buttonClass}>
+          <Icon name="Plus" aria-hidden className="size-3" />
+          <span>Ещё {steps.more}</span>
+        </button>
+      ) : <span key="more-placeholder" />}
+      <span data-pagination-count className="min-w-0 whitespace-nowrap text-[10px] tabular-nums text-sidebar-foreground/50">
+        {group.shownCount} из {group.rootCount}
+      </span>
+      {steps.canLess ? (
+        <button key="less" ref={lessRef} type="button" aria-expanded={group.isExpanded}
+          aria-label={`Меньше — ${group.projectName}`}
+          onClick={event => change(event.currentTarget, steps.previous)} className={buttonClass}>
+          <Icon name="Minus" aria-hidden className="size-3" />
+          <span>Меньше</span>
+        </button>
+      ) : <span key="less-placeholder" />}
+    </div>
+  );
+}
+
 function CollapsedThreadList({
   activeThreadId,
   isCompactViewport,
@@ -494,9 +547,10 @@ function CollapsedThreadList({
   const showBranchName = values?.showBranchName === true;
   const showThreadCount = values?.showThreadCount === true;
 
-  const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
+  const [pageState, setPageState] = useState(() => createPageState(limit));
+  const pages = reconcilePages(pageState, limit, projects.map(project => project.id), status === "ready");
+  if (pages !== pageState) setPageState(pages);
+  const foldButtons = useRef(new Map<string, HTMLButtonElement>());
   const [foldedProjectIds, setFoldedProjectIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -541,7 +595,7 @@ function CollapsedThreadList({
         limit,
         keepAttention,
         unreadFirst,
-        expandedGroupKeys,
+        groupBudgets: pages.budgets,
         foldedProjectIds,
       }),
     [
@@ -551,7 +605,7 @@ function CollapsedThreadList({
       limit,
       keepAttention,
       unreadFirst,
-      expandedGroupKeys,
+      pages.budgets,
       foldedProjectIds,
     ],
   );
@@ -563,18 +617,6 @@ function CollapsedThreadList({
         next.delete(projectId);
       } else {
         next.add(projectId);
-      }
-      return next;
-    });
-  };
-
-  const toggleExpand = (groupKey: string) => {
-    setExpandedGroupKeys((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) {
-        next.delete(groupKey);
-      } else {
-        next.add(groupKey);
       }
       return next;
     });
@@ -607,7 +649,7 @@ function CollapsedThreadList({
   return (
     <div className="flex flex-col gap-3 p-1">
       {groups.map((group: GroupingGroup<PluginSidebarThread>) => (
-        <div key={group.key} className="flex flex-col gap-0.5">
+        <div key={group.key} data-sidebar-project={group.projectId} className="flex flex-col gap-0.5">
           <div
             draggable
             onDragStart={(e) => {
@@ -663,6 +705,10 @@ function CollapsedThreadList({
             <button
               type="button"
               aria-expanded={!group.isFolded}
+              ref={button => {
+                if (button) foldButtons.current.set(group.key, button);
+                else foldButtons.current.delete(group.key);
+              }}
               aria-label={
                 group.isFolded
                   ? `Expand ${group.projectName}`
@@ -725,18 +771,9 @@ function CollapsedThreadList({
                 />
               ))}
 
-              {(group.hiddenCount > 0 || group.isExpanded) && (
-                <button
-                  type="button"
-                  aria-expanded={group.isExpanded}
-                  onClick={() => toggleExpand(group.key)}
-                  className="flex h-6 w-full cursor-pointer items-center rounded-md pl-2 text-left text-[11px] text-sidebar-foreground/55 hover:text-sidebar-foreground"
-                >
-                  {group.isExpanded
-                    ? "Show less"
-                    : `Show more (${group.hiddenCount})`}
-                </button>
-              )}
+              <PaginationControls group={group} base={limit}
+                onBudget={budget => setPageState(previous => setPageBudget(previous, group.key, budget))}
+                focusFold={() => foldButtons.current.get(group.key)?.focus({ preventScroll: true })} />
             </div>
           )}
         </div>
@@ -750,7 +787,7 @@ export default definePluginApp((app) => {
     id: "collapsed",
     title: "Collapsed thread list",
     description:
-      "Показывает первые N чатов проекта, остальные — под «Show more».",
+      "Показывает первые N чатов проекта, раскрывает и сворачивает порциями по 10.",
     component: CollapsedThreadList,
   });
 });
