@@ -25,6 +25,12 @@ Boolean hideNavigationRail (default false) скрывает только узк�
 
 ## Проверки и поставка
 
+### Уточнение по живой проверке Original
+
+В BB 0.46.1 и SDK 0.6.49 Original больше не передаётся в thread-list slot (хотя зафиксированный SDK 0.4.87 обещает его в типах). Не рендерить отсутствующий компонент. Для useCollapsedList false/true серверный settings.onChange последовательно переключает публичную UI preference sidebar.threadListProvider между thread-list/thread-list и sidebar-collapse/collapsed, с optimistic revision и без изменения иных настроек. Если выбран сторонний провайдер списка, его выбор не перезаписывать. Обработчик защищён от dispose и не переключает список при загрузке плагина.
+
+На ошибке данных без Original показывать контролируемый fallback с кнопкой перехода на штатный список через schema-validated RPC. Проверить отсутствие Original, смену false→true, сохранение hideNavigationRail, сохранение стороннего выбора, CAS error, dispose и отсутствие startup writes. Старый Original допустим только при фактическом наличии для совместимости с прежним хостом. Применение fallback не должно падать и не должно скрывать настройки.
+
 - [ ] Unit/SDK regression: все тесты пагинации и старого rail; 0.47 grid, Top list, переходы, missing markers, очистка, mobile/desktop и macOS.
 - [ ] npm ci, npm test, npm run typecheck, bb plugin build, git diff --check относительно документной базы.
 - [ ] Реальный Chromium: 0.46.1 desktop/mobile light/dark; false→true→false; Settings/Home, collapse, native-list fallback, reload, отсутствие ошибок и перекрытий; пагинация остаётся работающей.
