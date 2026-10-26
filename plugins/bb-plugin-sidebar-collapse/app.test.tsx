@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { toast } from "sonner";
+const testViewport = vi.hoisted(() => ({ compact: false }));
+vi.mock("./components/ui/hooks/use-compact-viewport.js", () => ({ useIsCompactViewport: () => testViewport.compact }));
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type {
   PluginSidebarProject,
@@ -14,6 +17,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterEach(() => {
+  testViewport.compact = false;
   cleanup();
 });
 
@@ -64,6 +68,92 @@ function makeProject(
     ...overrides,
   };
 }
+
+
+describe("persistent row controls", () => {
+  const oldClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  afterEach(() => {
+    if (oldClipboard) Object.defineProperty(navigator, "clipboard", oldClipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+    vi.restoreAllMocks();
+  });
+  async function rowFixture(compact = false, personal = false) {
+    testViewport.compact = compact;
+    const app = await appPromise;
+    const onNavigate = vi.fn();
+    const slot = renderSlot(app.threadLists[0]!, {
+      activeThreadId: null, activeProjectId: null, isCompactViewport: compact,
+      onNavigate, searchQuery: "", Original: () => <div>native</div>,
+    }, {
+      settings: { visibleThreads: 3, keepAttention: false },
+      sidebarThreads: { status: "ready", threads: [makeThread()], projects: [makeProject({isPersonal: personal})] },
+    });
+    return {slot, onNavigate, row: slot.container.querySelector('a[data-sidebar-thread-id="thread-1"]')!};
+  }
+  it.each([false, true])("renders Copy -> Archive -> More without hover (compact=%s)", async compact => {
+    const {row} = await rowFixture(compact);
+    const buttons = [...row.querySelectorAll<HTMLButtonElement>("button[data-bb-sidebar-row-action]")];
+    expect(buttons.map(b=>b.dataset.bbSidebarRowAction)).toEqual(["copy","archive","menu"]);
+    for (const b of buttons) {
+      expect(b.className).toContain("opacity-100");
+      expect(b.className).not.toContain("opacity-0");
+      expect(b.className).toContain(compact ? "size-7" : "size-6");
+    }
+  });
+  it.each([false, true])("copies the canonical URL and never navigates (personal=%s)", async personal => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText}});
+    const {slot,row,onNavigate} = await rowFixture(false,personal);
+    fireEvent.click(row.querySelector('[data-bb-sidebar-row-action="copy"]')!);
+    await waitFor(()=>expect(writeText).toHaveBeenCalledExactlyOnceWith(new URL(
+      personal ? "/threads/thread-1" : "/projects/proj-1/threads/thread-1", window.location.origin).toString()));
+    expect(onNavigate).not.toHaveBeenCalled();
+    expect(slot.inspection.sidebarActionCalls).toEqual([]);
+  });
+  it.each(["missing","rejected"])("reports clipboard %s without navigating", async kind => {
+    const error = vi.spyOn(toast,"error").mockReturnValue("test-toast");
+    Object.defineProperty(navigator,"clipboard",{configurable:true,value:kind==="missing"?undefined:{writeText:vi.fn().mockRejectedValue(Error("denied"))}});
+    const {row,onNavigate}=await rowFixture();
+    fireEvent.click(row.querySelector('[data-bb-sidebar-row-action="copy"]')!);
+    await waitFor(()=>expect(error).toHaveBeenCalledWith("Failed to copy thread link"));
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+  it("keeps archive on the host action without navigation and opens More", async () => {
+    const {slot,row,onNavigate}=await rowFixture();
+    fireEvent.click(row.querySelector('[data-bb-sidebar-row-action="archive"]')!);
+    expect(slot.inspection.sidebarActionCalls).toContainEqual({method:"archive",threadId:"thread-1"});
+    expect(onNavigate).not.toHaveBeenCalled();
+    fireEvent.pointerDown(row.querySelector('[data-bb-sidebar-row-action="menu"]')!,{button:0,ctrlKey:false,pointerType:"mouse"});
+    expect(await slot.findByText("Copy thread link")).toBeTruthy();
+  });
+  it("hides controls during inline rename", async () => {
+    const {row}=await rowFixture();
+    fireEvent.doubleClick(row.querySelector("span.min-w-0")!);
+    expect(row.querySelectorAll("[data-bb-sidebar-row-action]")).toHaveLength(0);
+  });
+  it("opens compact More on click without cancelling its trigger or navigating", async () => {
+    const {row,onNavigate}=await rowFixture(true);
+    fireEvent.click(row.querySelector('[data-bb-sidebar-row-action="menu"]')!);
+    expect(await screen.findByRole("menuitem",{name:"Copy thread link"})).toBeTruthy();
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+  it("does not hijack Enter from nested buttons into opening the thread", async () => {
+    const {slot,row,onNavigate}=await rowFixture();
+    for(const action of ["copy","archive"]) {
+      expect(fireEvent.keyDown(row.querySelector(`[data-bb-sidebar-row-action="${action}"]`)!,{key:"Enter"})).toBe(true);
+    }
+    fireEvent.keyDown(row.querySelector('[data-bb-sidebar-row-action="menu"]')!,{key:"Enter"});
+    expect(await screen.findByRole("menuitem",{name:"Copy thread link"})).toBeTruthy();
+    expect(slot.inspection.sidebarActionCalls).toEqual([]);
+    expect(onNavigate).not.toHaveBeenCalled();
+  });
+  it("still opens a thread when Enter is pressed on the row itself", async () => {
+    const {slot,row,onNavigate}=await rowFixture();
+    fireEvent.keyDown(row,{key:"Enter"});
+    expect(slot.inspection.sidebarActionCalls).toContainEqual({method:"open",threadId:"thread-1"});
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("bb-plugin-sidebar-collapse frontend tests", () => {
   it("does not crash without Original on current BB and offers native fallback", async () => {

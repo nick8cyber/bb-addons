@@ -35,6 +35,7 @@ import { Input } from "./components/ui/input";
 import { cn } from "./lib/utils";
 import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib/pagination";
 import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridgeValue } from "./lib/navigation-rail";
+import { mountSidebarControls } from "./lib/sidebar-controls";
 import {
   groupSidebarThreads,
   threadDisplayTitle,
@@ -159,6 +160,15 @@ function threadLinkHref(
   return new URL(path, window.location.origin).toString();
 }
 
+async function copyThreadLink(thread: PluginSidebarThread, projects: readonly PluginSidebarProject[]) {
+  try {
+    await navigator.clipboard.writeText(threadLinkHref(thread, projects));
+    toast.success("Thread link copied");
+  } catch {
+    toast.error("Failed to copy thread link");
+  }
+}
+
 function ThreadMenuItems({
   menuType,
   thread,
@@ -196,10 +206,7 @@ function ThreadMenuItems({
       label: "Copy thread link",
       icon: "Copy" as const,
       onSelect: () => {
-        navigator.clipboard
-          .writeText(threadLinkHref(thread, projects))
-          .then(() => toast.success("Thread link copied"))
-          .catch(() => toast.error("Failed to copy thread link"));
+        void copyThreadLink(thread, projects);
       },
     },
     {
@@ -277,12 +284,11 @@ function ThreadMenuItems({
   );
 }
 
-/** bb's own rows keep quick actions hidden until the row is hovered or
- *  focused, and always visible on touch. */
-function hoverActionClassName(isCompactViewport: boolean): string {
+/** Keep all three controls discoverable, including desktop-like PWA viewports. */
+function rowActionClassName(isCompactViewport: boolean): string {
   return cn(
-    "flex size-5 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-focus-within/row:opacity-100 group-hover/row:opacity-100 data-[state=open]:opacity-100",
-    isCompactViewport ? "opacity-100" : "opacity-0",
+    "flex shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring",
+    isCompactViewport ? "size-7" : "size-6",
   );
 }
 
@@ -328,7 +334,8 @@ function ThreadRow({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLAnchorElement>) => {
-    if (isRenaming) return;
+    // Enter on a nested action belongs to that button, not to opening the row.
+    if (e.target !== e.currentTarget || isRenaming) return;
     if (e.key === "Enter") {
       const isSplit = (e.metaKey || e.ctrlKey) && isAvailable;
       if (isSplit) {
@@ -412,11 +419,22 @@ function ThreadRow({
           ) : null}
 
           {!isRenaming ? (
+            <button type="button" data-bb-sidebar-row-action="copy"
+              aria-label={`Скопировать ссылку — ${displayTitle}`} title="Скопировать ссылку"
+              className={rowActionClassName(isCompactViewport)}
+              onClick={e => { e.preventDefault(); e.stopPropagation(); void copyThreadLink(thread, projects); }}
+              onPointerDown={e => e.stopPropagation()}>
+              <Icon name="Copy" className="size-3.5" />
+            </button>
+          ) : null}
+
+          {!isRenaming ? (
             <button
               type="button"
+              data-bb-sidebar-row-action="archive"
               aria-label={`Archive ${displayTitle}`}
               title="Archive"
-              className={hoverActionClassName(isCompactViewport)}
+              className={rowActionClassName(isCompactViewport)}
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -435,10 +453,11 @@ function ThreadRow({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
+                  data-bb-sidebar-row-action="menu"
                   aria-label="Thread actions"
-                  className={hoverActionClassName(isCompactViewport)}
+                  className={rowActionClassName(isCompactViewport)}
                   onClick={(e) => {
-                    e.preventDefault();
+                    // MobileTrigger opens on click only while default is not prevented.
                     e.stopPropagation();
                   }}
                   onPointerDown={(e) => {
@@ -815,6 +834,7 @@ export function registerNavigationRail(app: PluginAppBuilder): void {
 }
 
 export default definePluginApp((app) => {
+  app.contentScripts.register({ id: "sidebar-controls", mount: ({signal}) => mountSidebarControls(signal) });
   app.slots.experimental_threadList({
     id: "collapsed",
     title: "Collapsed thread list",
@@ -825,7 +845,7 @@ export default definePluginApp((app) => {
   app.slots.sidebarFooterAction({
     id: "sidebar-collapse-settings",
     title: "Настройки Sidebar Collapse",
-    icon: "Settings",
+    icon: "ChevronsUp",
     run: ({ openSettings }) => openSettings(),
   });
   registerNavigationRail(app);

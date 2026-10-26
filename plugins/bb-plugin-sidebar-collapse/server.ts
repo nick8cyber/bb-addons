@@ -75,7 +75,7 @@ export default async function plugin(bb: BbPluginApi) {
     hideNavigationRail: {
       type: "boolean",
       label: "Скрыть полосу навигации",
-      description: "Скрывает узкую полосу Home/Tasks/More в развёрнутом списке чатов. Настройки доступны через шестерёнку Sidebar Collapse внизу. Нативный Top list BB не меняет.",
+      description: "Скрывает узкую полосу Home/Tasks/More в развёрнутом списке чатов. Настройки доступны через Settings или кнопку Sidebar Collapse внизу. Нативный Top list BB не меняет.",
       default: false,
     },
     showThreadCount: {
