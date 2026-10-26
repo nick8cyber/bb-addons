@@ -66,6 +66,23 @@ function makeProject(
 }
 
 describe("bb-plugin-sidebar-collapse frontend tests", () => {
+  it("does not crash without Original on current BB and offers native fallback", async () => {
+    const app = await appPromise;
+    const registration = app.threadLists[0]!;
+    const Component = registration.component;
+    let called = false;
+    const slot = renderSlot({ ...registration, component: props => <Component {...props} Original={undefined as never} /> }, {
+      activeThreadId: null, activeProjectId: null, isCompactViewport: false,
+      onNavigate: () => {}, searchQuery: "", Original: () => <div>old host</div>,
+    }, {
+      settings: { useCollapsedList: false },
+      sidebarThreads: { status: "error", projects: [], threads: [] },
+      rpc: { show_native_list: () => { called = true; return { ok: true }; } },
+    });
+    fireEvent.click(await slot.findByText("Показать штатный список BB"));
+    expect(called).toBe(true);
+    slot.lifecycle.unmount();
+  });
   it.each([false, true])("renders unreadFirst=%s through plugin settings", async (unreadFirst) => {
     const app = await appPromise;
     const slot = renderSlot(app.threadLists[0]!, {
