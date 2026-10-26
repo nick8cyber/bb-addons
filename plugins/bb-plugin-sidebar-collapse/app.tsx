@@ -10,6 +10,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type {
+  PluginAppBuilder,
   PluginSidebarProject,
   PluginSidebarThread,
   PluginSidebarThreadActions,
@@ -33,6 +34,7 @@ import type { IconName } from "./components/ui/icon";
 import { Input } from "./components/ui/input";
 import { cn } from "./lib/utils";
 import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib/pagination";
+import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridgeValue } from "./lib/navigation-rail";
 import {
   groupSidebarThreads,
   threadDisplayTitle,
@@ -558,6 +560,14 @@ function CollapsedThreadList({
   // Project drag-and-drop: the frontend sidebar API has no reorder action, so
   // the move goes to this plugin's backend, which owns `bb.sdk.projects`.
   const rpc = useRpc<typeof rpcContract>();
+  const fallback = () => typeof Original === "function" ? <Original /> : (
+    <div role="status" className="space-y-2 px-3 py-2 text-xs text-muted-foreground">
+      <p>Штатный список BB выбирается отдельно от списка плагина.</p>
+      <button type="button" className="cursor-pointer underline" onClick={() => {
+        void rpc.call("show_native_list", {}).catch(() => toast.error("Не удалось переключить список BB. Попробуйте ещё раз."));
+      }}>Показать штатный список BB</button>
+    </div>
+  );
   const [draggingProjectId, setDraggingProjectId] = useState<string | null>(
     null,
   );
@@ -623,7 +633,7 @@ function CollapsedThreadList({
   };
 
   if (values?.useCollapsedList === false) {
-    return <Original />;
+    return fallback();
   }
 
   if (status === "loading") {
@@ -635,7 +645,7 @@ function CollapsedThreadList({
   }
 
   if (status === "error") {
-    return <Original />;
+    return fallback();
   }
 
   if (groups.length === 0) {
@@ -782,6 +792,28 @@ function CollapsedThreadList({
   );
 }
 
+/**
+ * App-wide setting bridge; independent from the selected thread-list provider.
+ */
+function NavigationRailBridge() {
+  const { values } = useSettings();
+  const hidden = values?.hideNavigationRail === true;
+  useEffect(() => { setNavigationRailBridgeValue(hidden); }, [hidden]);
+  useEffect(() => () => clearNavigationRailBridge(), []);
+  return null;
+}
+
+export function registerNavigationRail(app: PluginAppBuilder): void {
+  if (typeof app.slots.experimental_appOverlay !== "function") return;
+  app.contentScripts.register({
+    id: "navigation-rail",
+    mount: ({ signal }) => mountNavigationRail(signal),
+  });
+  app.slots.experimental_appOverlay({
+    id: "navigation-rail", component: NavigationRailBridge,
+  });
+}
+
 export default definePluginApp((app) => {
   app.slots.experimental_threadList({
     id: "collapsed",
@@ -790,4 +822,11 @@ export default definePluginApp((app) => {
       "Показывает первые N чатов проекта, раскрывает и сворачивает порциями по 10.",
     component: CollapsedThreadList,
   });
+  app.slots.sidebarFooterAction({
+    id: "sidebar-collapse-settings",
+    title: "Настройки Sidebar Collapse",
+    icon: "Settings",
+    run: ({ openSettings }) => openSettings(),
+  });
+  registerNavigationRail(app);
 });
