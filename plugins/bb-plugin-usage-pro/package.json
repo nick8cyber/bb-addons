@@ -9,14 +9,14 @@
   },
   "bb": {
     "name": "Provider usage (Pro)",
-    "description": "Multi-account provider usage and bounded Codex workspace-credit retries",
+    "description": "Multi-account provider usage and bounded Codex workspace-limit retries",
     "branding": {
       "icon": "ChartColumn"
     },
     "server": "./server.ts",
     "app": "./app.js"
   },
-  "description": "Multi-account provider usage and bounded Codex workspace-credit retries",
+  "description": "Multi-account provider usage and bounded Codex workspace-limit retries",
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
