@@ -36,6 +36,14 @@ export function creditRetryAt(attemptNumber: number, now: number, random: number
   return now + DELAYS_MINUTES[attemptNumber - 1]! * 60_000 + Math.floor(Math.max(0, Math.min(random, 1)) * 30_000);
 }
 
+/** Later scheduled drafts do not replace a retry; every other queue entry takes precedence. */
+type RetryQueue = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["queue"]["list"]>>;
+export function queueBlocksRetry(queue: Readonly<RetryQueue>, retryAt: number): boolean {
+  return queue.some(row => row.payload.kind !== "inline" || row.groupWithNext
+    || row.state !== "scheduled" || row.waitingOn?.kind !== "time"
+    || row.sendAt === null || !Number.isFinite(row.sendAt) || row.sendAt <= retryAt);
+}
+
 export function registerCreditRetry(bb: BbPluginApi) {
   let disposed = false;
   const inFlight = new Set<string>();
@@ -50,18 +58,23 @@ export function registerCreditRetry(bb: BbPluginApi) {
   bb.events.on("turn.failed", async event => {
     if (disposed || !isWorkspaceCreditFailure(event) || inFlight.has(event.threadId)) return;
     inFlight.add(event.threadId);
+    let saved: SavedState | undefined;
+    let stateLoaded = false;
+    let queueCommitted = false;
+    const key = stateKey(event.threadId);
+    const token = event.requestId + ":" + event.attemptNumber;
+    const record = async (outcome: Diagnostic["outcome"], reason: string, sendAt: number | null = null) => {
+      if (disposed) return;
+      await bb.storage.kv.set(key, {
+        seen: outcome === "scheduled" ? [...(saved?.seen ?? []), token].slice(-32) : saved?.seen ?? [],
+        last: { requestId: event.requestId, attemptNumber: event.attemptNumber, recordedAt: Date.now(), outcome, reason, sendAt },
+      } satisfies SavedState);
+      if (outcome === "declined") bb.log.info("Codex retry skipped for " + event.threadId + ": " + reason);
+    };
     try {
-      const key = stateKey(event.threadId);
-      const token = event.requestId + ":" + event.attemptNumber;
-      const saved = await bb.storage.kv.get<SavedState>(key);
+      saved = await bb.storage.kv.get<SavedState>(key);
+      stateLoaded = true;
       if (saved?.seen.includes(token)) return; // Cancellation/reload must not resurrect this attempt.
-      const record = async (outcome: Diagnostic["outcome"], reason: string, sendAt: number | null = null) => {
-        if (disposed) return;
-        await bb.storage.kv.set(key, {
-          seen: outcome === "scheduled" ? [...(saved?.seen ?? []), token].slice(-32) : saved?.seen ?? [],
-          last: { requestId: event.requestId, attemptNumber: event.attemptNumber, recordedAt: Date.now(), outcome, reason, sendAt },
-        } satisfies SavedState);
-      };
       const sendAt = creditRetryAt(event.attemptNumber, Date.now(), Math.random());
       if (sendAt === null) { await record("declined", "attempts-exhausted"); return; }
 
@@ -81,23 +94,35 @@ export function registerCreditRetry(bb: BbPluginApi) {
         if (availability.kind !== "not-routed") { await record("declined", "pool-owned"); return; }
       }
 
-      const thread = await bb.sdk.threads.get({ threadId: event.threadId });
-      if (thread.providerId !== "codex" || thread.status !== "error" || thread.archivedAt !== null || thread.deletedAt !== null) {
-        await record("declined", "thread-no-longer-eligible"); return;
-      }
-      if ((await bb.sdk.threads.queue.list({ threadId: event.threadId })).length > 0) {
-        await record("declined", "queue-not-empty"); return;
+      const eligible = async () => {
+        const thread = await bb.sdk.threads.get({ threadId: event.threadId });
+        if (thread.providerId !== "codex" || thread.status !== "error" || thread.archivedAt !== null || thread.deletedAt !== null) {
+          await record("declined", "thread-no-longer-eligible"); return false;
+        }
+        if (queueBlocksRetry(await bb.sdk.threads.queue.list({ threadId: event.threadId }), sendAt)) {
+          await record("declined", "queue-takes-precedence"); return false;
+        }
+        return true;
+      };
+      if (!await eligible() || !await eligible()) {
+        return;
       }
       if (disposed) return;
       // Core validates the failed request again and atomically enforces one live retry in its chain.
       await bb.sdk.threads.retry({
         threadId: event.threadId, turnRequestId: event.requestId, sendAt,
-        reason: "Кредиты Codex исчерпаны — автоматический повтор",
+        reason: "Временный отказ Codex — автоматический повтор",
       });
+      queueCommitted = true;
+      if (!disposed) bb.log.info("Codex retry queued for " + event.threadId + " at " + new Date(sendAt).toISOString());
       await record("scheduled", "workspace-member-credits", sendAt);
-      if (!disposed) bb.log.info("Codex credit retry queued for " + event.threadId + " at " + new Date(sendAt).toISOString());
     } catch (error) {
-      if (!disposed) bb.log.warn("Codex credit retry could not be queued for " + event.threadId + ": " + String(error));
+      if (!disposed) {
+        if (stateLoaded && !queueCommitted) {
+          try { await record("declined", "scheduling-error"); } catch { /* Storage may be the original failure. Keep the log below. */ }
+        }
+        bb.log.warn((queueCommitted ? "Codex retry queued but diagnostic could not be saved for " : "Codex retry could not be queued for ") + event.threadId + ": " + String(error));
+      }
     } finally {
       inFlight.delete(event.threadId);
     }
