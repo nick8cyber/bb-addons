@@ -36,6 +36,7 @@ import { cn } from "./lib/utils";
 import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib/pagination";
 import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridgeValue } from "./lib/navigation-rail";
 import { mountSidebarControls } from "./lib/sidebar-controls";
+import { bindGitHeader, type GitHeaderSnapshot } from "./lib/git-header";
 import {
   groupSidebarThreads,
   threadDisplayTitle,
@@ -284,7 +285,7 @@ function ThreadMenuItems({
   );
 }
 
-/** Keep all three controls discoverable, including desktop-like PWA viewports. */
+/** Keep quick controls discoverable, including desktop-like PWA viewports. */
 function rowActionClassName(isCompactViewport: boolean): string {
   return cn(
     "flex shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring",
@@ -321,7 +322,8 @@ function ThreadRow({
   const isActive = thread.id === activeThreadId;
 
   const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
-    if (isRenaming) return;
+    // React portals bubble menu clicks through the row despite living outside its DOM.
+    if (isRenaming || !e.currentTarget.contains(e.target as Node)) return;
     const isSplit = (e.metaKey || e.ctrlKey) && isAvailable;
     if (isSplit) {
       e.preventDefault();
@@ -425,26 +427,6 @@ function ThreadRow({
               onClick={e => { e.preventDefault(); e.stopPropagation(); void copyThreadLink(thread, projects); }}
               onPointerDown={e => e.stopPropagation()}>
               <Icon name="Copy" className="size-3.5" />
-            </button>
-          ) : null}
-
-          {!isRenaming ? (
-            <button
-              type="button"
-              data-bb-sidebar-row-action="archive"
-              aria-label={`Archive ${displayTitle}`}
-              title="Archive"
-              className={rowActionClassName(isCompactViewport)}
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                actions.archive(thread.id);
-              }}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-              }}
-            >
-              <Icon name="Archive" className="size-3.5" />
             </button>
           ) : null}
 
@@ -833,8 +815,30 @@ export function registerNavigationRail(app: PluginAppBuilder): void {
   });
 }
 
+function GitHeader({ threadId }: { threadId: string }) {
+  const anchor = useRef<HTMLSpanElement>(null);
+  const controller = useRef<ReturnType<typeof bindGitHeader> | null>(null);
+  const [snapshot, setSnapshot] = useState<GitHeaderSnapshot | null>(null);
+  useEffect(() => {
+    if (!anchor.current) return;
+    const binding = bindGitHeader(anchor.current, setSnapshot);
+    controller.current = binding;
+    return () => { controller.current = null; binding.dispose(); };
+  }, [threadId]);
+  return <span ref={anchor} data-bb-git-header="">
+    {snapshot ? <button type="button" aria-label={snapshot.label} title={snapshot.label}
+      aria-expanded={snapshot.expanded} aria-controls="thread-prompt-banner-git-body"
+      disabled={snapshot.disabled} onClick={() => controller.current?.toggle()}>
+      <Icon name="FileDiff" className="size-3.5 shrink-0" />
+      <span data-bb-git-header-summary="" className="truncate">{snapshot.summary}</span>
+      <span data-bb-git-header-count="">{snapshot.count}</span>
+    </button> : null}
+  </span>;
+}
+
 export default definePluginApp((app) => {
   app.contentScripts.register({ id: "sidebar-controls", mount: ({signal}) => mountSidebarControls(signal) });
+  app.slots.experimental_threadHeaderAction({ id: "changed-files", title: "Изменённые файлы", component: GitHeader });
   app.slots.experimental_threadList({
     id: "collapsed",
     title: "Collapsed thread list",

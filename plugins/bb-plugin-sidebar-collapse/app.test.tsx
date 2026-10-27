@@ -90,10 +90,10 @@ describe("persistent row controls", () => {
     });
     return {slot, onNavigate, row: slot.container.querySelector('a[data-sidebar-thread-id="thread-1"]')!};
   }
-  it.each([false, true])("renders Copy -> Archive -> More without hover (compact=%s)", async compact => {
+  it.each([false, true])("renders Copy -> More without a quick archive (compact=%s)", async compact => {
     const {row} = await rowFixture(compact);
     const buttons = [...row.querySelectorAll<HTMLButtonElement>("button[data-bb-sidebar-row-action]")];
-    expect(buttons.map(b=>b.dataset.bbSidebarRowAction)).toEqual(["copy","archive","menu"]);
+    expect(buttons.map(b=>b.dataset.bbSidebarRowAction)).toEqual(["copy","menu"]);
     for (const b of buttons) {
       expect(b.className).toContain("opacity-100");
       expect(b.className).not.toContain("opacity-0");
@@ -118,13 +118,14 @@ describe("persistent row controls", () => {
     await waitFor(()=>expect(error).toHaveBeenCalledWith("Failed to copy thread link"));
     expect(onNavigate).not.toHaveBeenCalled();
   });
-  it("keeps archive on the host action without navigation and opens More", async () => {
+  it("keeps archive in More on the host action without navigation", async () => {
     const {slot,row,onNavigate}=await rowFixture();
-    fireEvent.click(row.querySelector('[data-bb-sidebar-row-action="archive"]')!);
-    expect(slot.inspection.sidebarActionCalls).toContainEqual({method:"archive",threadId:"thread-1"});
-    expect(onNavigate).not.toHaveBeenCalled();
+    expect(row.querySelector('[data-bb-sidebar-row-action="archive"]')).toBeNull();
     fireEvent.pointerDown(row.querySelector('[data-bb-sidebar-row-action="menu"]')!,{button:0,ctrlKey:false,pointerType:"mouse"});
     expect(await slot.findByText("Copy thread link")).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", {name: "Archive"}));
+    expect(slot.inspection.sidebarActionCalls).toContainEqual({method:"archive",threadId:"thread-1"});
+    expect(onNavigate).not.toHaveBeenCalled();
   });
   it("hides controls during inline rename", async () => {
     const {row}=await rowFixture();
@@ -139,7 +140,7 @@ describe("persistent row controls", () => {
   });
   it("does not hijack Enter from nested buttons into opening the thread", async () => {
     const {slot,row,onNavigate}=await rowFixture();
-    for(const action of ["copy","archive"]) {
+    for(const action of ["copy"]) {
       expect(fireEvent.keyDown(row.querySelector(`[data-bb-sidebar-row-action="${action}"]`)!,{key:"Enter"})).toBe(true);
     }
     fireEvent.keyDown(row.querySelector('[data-bb-sidebar-row-action="menu"]')!,{key:"Enter"});
@@ -557,7 +558,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     expect(on.queryByText("1")).toBeTruthy();
   });
 
-  it("archives from the row's quick action without opening a menu", async () => {
+  it("does not expose an accidental archive button on the row", async () => {
     const app = await appPromise;
     const threads = [
       makeThread({ id: "t-1", title: "Thread 1", projectId: "proj-1" }),
@@ -580,11 +581,8 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
       },
     );
 
-    fireEvent.click(slot.getByLabelText("Archive Thread 1"));
-
-    expect(slot.inspection.sidebarActionCalls).toEqual([
-      { method: "archive", threadId: "t-1" },
-    ]);
+    expect(slot.queryByLabelText("Archive Thread 1")).toBeNull();
+    expect(slot.inspection.sidebarActionCalls).toEqual([]);
   });
 
   it("reorders projects by dragging their headers", async () => {
