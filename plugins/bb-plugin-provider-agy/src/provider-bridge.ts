@@ -237,6 +237,13 @@ interface OpenToolItem {
 
 interface Turn {
   turnId: string;
+  /**
+   * bb's "/compact" — agy runs it as its own compaction. Its failures are
+   * never tagged for bb's provider-retry (that re-run is "Please continue.",
+   * a normal agent turn, not a compaction), and a rotation re-runs it
+   * verbatim, never wrapped in a work handoff.
+   */
+  compact: boolean;
   /** Absent for the first turn carried on thread/start. */
   clientRequestId: string | undefined;
   prompt: string;
@@ -592,6 +599,36 @@ function nativeErrorInfo(
     providerCode: null,
     httpStatusCode: httpStatusCodeFor(category, message),
   };
+}
+
+/**
+ * Is bb's "/compact" the turn this error belongs to? The settled turn when
+ * known; otherwise the head of the line — written or still waiting in
+ * `pending` (a child spawned for it can fail before `init`).
+ */
+function compactInFlight(session: Session, turn?: Turn): boolean {
+  return (turn ?? session.turns[0] ?? session.pending[0])?.compact ?? false;
+}
+
+/**
+ * The errorInfo a session may publish: the auto-retry tags (`internal`,
+ * `stream-disconnected`) are dropped while bb's "/compact" is the turn in
+ * flight — provider-retry would answer a failed compaction with "Please
+ * continue.", which is a fresh agent turn, not a compaction.
+ */
+function sessionErrorInfo(
+  session: Session,
+  info: ReturnType<typeof nativeErrorInfo>,
+  turn?: Turn,
+): ReturnType<typeof nativeErrorInfo> {
+  if (
+    compactInFlight(session, turn) &&
+    info !== undefined &&
+    (info.category === "internal" || info.category === "stream-disconnected")
+  ) {
+    return undefined;
+  }
+  return info;
 }
 
 /**
@@ -1057,8 +1094,12 @@ function scheduleAccountRetry(
     session.autoRetryCount += 1;
   }
   const retryTurn = createTurn({
+    // A "/compact" is re-run verbatim: wrapped in a work handoff it would
+    // become "continue the work" for the agent on the new conversation.
     prompt:
-      switchTo !== null && (reason === "quota" || session.providerThreadId !== null)
+      switchTo !== null &&
+      !failedTurn.compact &&
+      (reason === "quota" || session.providerThreadId !== null)
         ? buildQuotaHandoffPrompt(session, failedTurn)
         : failedTurn.prompt,
     clientRequestId: undefined,
@@ -1184,9 +1225,11 @@ function reportError(
     return;
   }
   session.lastReportedError = text;
-  const category = classifyError(text, {
+  const classified = classifyError(text, {
     toolError: source === "agy tool step",
   });
+  const category =
+    classified === "internal" && compactInFlight(session) ? undefined : classified;
   log(
     `reporting error from ${source} for thread ${session.threadId}: ${text}`,
   );
@@ -1639,9 +1682,9 @@ function settleTurnFailed(
       providerTurnId: turn.turnId,
       message,
       settlesTurn: false,
-      ...(nativeErrorInfo(message) === undefined
+      ...(sessionErrorInfo(session, nativeErrorInfo(message), turn) === undefined
         ? {}
-        : { errorInfo: nativeErrorInfo(message) }),
+        : { errorInfo: sessionErrorInfo(session, nativeErrorInfo(message), turn) }),
     });
   }
   maybeEmitRateLimitBlocked(session, message);
@@ -1675,7 +1718,10 @@ function failSession(
   } = {},
 ): void {
   const surfaceError = opts.surfaceError ?? true;
-  const errorInfo = opts.errorInfo ?? nativeErrorInfo(message);
+  const errorInfo = sessionErrorInfo(
+    session,
+    opts.errorInfo ?? nativeErrorInfo(message),
+  );
   const failCategory = errorInfo?.category ?? "unclassified";
   const failOneLine = message.replace(/[\r\n]+/gu, " ").slice(0, 300);
   log(`session ${session.threadId} failed [${failCategory}]: ${failOneLine}`);
@@ -2298,9 +2344,9 @@ function handleResult(
         providerTurnId: turn.turnId,
         message,
         settlesTurn: false,
-        ...(nativeErrorInfo(message, turn.toolErrors.has(message)) === undefined
+        ...(sessionErrorInfo(session, nativeErrorInfo(message, turn.toolErrors.has(message)), turn) === undefined
           ? {}
-          : { errorInfo: nativeErrorInfo(message, turn.toolErrors.has(message)) }),
+          : { errorInfo: sessionErrorInfo(session, nativeErrorInfo(message, turn.toolErrors.has(message)), turn) }),
       });
     }
     maybeEmitRateLimitBlocked(session, message);
@@ -2437,7 +2483,7 @@ function enqueueTurn(session: Session, turn: Turn): void {
           : "the agy process was gone and is being restarted",
       contextLost: cooldownRotation !== null,
     });
-    if (cooldownRotation !== null) {
+    if (cooldownRotation !== null && !turn.compact) {
       turn.prompt = buildQuotaHandoffPrompt(session, turn);
     }
     // Own this input before spawning: synchronous configuration failures
@@ -2481,6 +2527,7 @@ function createTurn(args: {
     turnId: mintTurnId(),
     clientRequestId: args.clientRequestId,
     prompt: args.prompt,
+    compact: args.prompt.trim() === "/compact",
     started: false,
     items: new Map(),
     itemOrdinal: 0,
@@ -3102,7 +3149,8 @@ function sweepStalledTurns(): void {
       session.turns.length === 1 &&
       session.pending.length === 0 &&
       session.turns[0].started &&
-      session.turns[0].clientRequestId !== undefined;
+      session.turns[0].clientRequestId !== undefined &&
+      !session.turns[0].compact;
     failSession(
       session,
       `agy stalled: no output for ${silentSec}s ${reason}; ` +
