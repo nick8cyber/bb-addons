@@ -189,6 +189,26 @@ await turn(rejectExit.threadId, "two", 2);
 await sleep(200);
 stop(rejectExit.threadId);
 
+// server-500-exit / server-503-result: Google's transient server failures
+// must carry errorInfo {internal, 5xx} so bb's provider-retry re-runs the
+// turn (01.11 incident: [unclassified] -> "not-retryable", thread stood still).
+const server500 = await start("server-500-exit");
+await turn(server500.threadId, "one", 1);
+await sleep(400);
+stop(server500.threadId);
+const server503 = await start("server-503-result");
+await turn(server503.threadId, "one", 1);
+await sleep(300);
+stop(server503.threadId);
+const overloaded503 = await start("server-503-overloaded");
+await turn(overloaded503.threadId, "one", 1);
+await sleep(300);
+stop(overloaded503.threadId);
+const tool5xx = await start("tool-5xx");
+await turn(tool5xx.threadId, "one", 1);
+await sleep(300);
+stop(tool5xx.threadId);
+
 // quota-retry mode: the auto-retry itself. The first turn is refused with a
 // 2s window and the child exits 1; the bridge must settle that turn failed,
 // queue a retry turn behind the reset, sit out the window, rebuild the child
@@ -357,6 +377,14 @@ const checks = [
   ["stall/no-raw-exit-banner", retryRawExits(stall.threadId).length === 0, JSON.stringify(stallErrors.map((e) => e.message)).slice(0, 160)],
   ["stall-quiet/turn-failed-by-model-tier", quietBoundaries[0]?.status === "failed" && (quietBoundaries[0]?.error?.message ?? "").includes("agy stalled") && (quietBoundaries[0]?.error?.message ?? "").includes("no output") && !((quietBoundaries[0]?.error?.message ?? "").includes("in flight")), JSON.stringify(quietBoundaries[0]?.error?.message ?? "").slice(0, 200)],
   ["stall-quiet/surfaced-once", quietStalled.length === 1 && quietStalled[0].threadScoped === true, JSON.stringify(quietErrors.map((e) => e.message)).slice(0, 160)],
+  ["server-500/error-coded-internal-500", errors(server500.threadId).length > 0 && errors(server500.threadId).every((e) => e.errorInfo?.category === "internal" && e.errorInfo?.httpStatusCode === 500), JSON.stringify(errors(server500.threadId).map((e) => e.errorInfo ?? null))],
+  ["server-500/turn-failed", completed(server500.threadId)[0]?.status === "failed", JSON.stringify(completed(server500.threadId).map((b) => b.status))],
+  ["server-503/error-coded-internal-503", errors(server503.threadId).length > 0 && errors(server503.threadId).every((e) => e.errorInfo?.category === "internal" && e.errorInfo?.httpStatusCode === 503), JSON.stringify(errors(server503.threadId).map((e) => e.errorInfo ?? null))],
+  ["server-503/turn-failed", completed(server503.threadId)[0]?.status === "failed", JSON.stringify(completed(server503.threadId).map((b) => b.status))],
+  ["server-500/last-error-before-failed-turn-is-internal", (() => { const d = deltas(server500.threadId); const i = d.findIndex((x) => x.kind === "turn.boundary" && x.status === "failed"); const last = d.slice(0, i).filter((x) => x.kind === "provider.error").at(-1); return last?.errorInfo?.category === "internal" && last?.errorInfo?.httpStatusCode === 500; })(), ""],
+  ["server-503-overloaded/stays-overloaded", errors(overloaded503.threadId).length > 0 && errors(overloaded503.threadId).every((e) => e.errorInfo?.category === "overloaded"), JSON.stringify(errors(overloaded503.threadId).map((e) => e.errorInfo ?? null))],
+  ["tool-5xx/never-tagged-for-auto-retry", errors(tool5xx.threadId).length > 0 && errors(tool5xx.threadId).every((e) => e.errorInfo?.category !== "internal"), JSON.stringify(errors(tool5xx.threadId).map((e) => e.errorInfo ?? null))],
+  ["tool-5xx/turn-failed", completed(tool5xx.threadId)[0]?.status === "failed", JSON.stringify(completed(tool5xx.threadId).map((b) => b.status))],
 ];
 
 say("==== error-surfacing report ====");

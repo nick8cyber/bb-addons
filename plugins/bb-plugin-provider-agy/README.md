@@ -481,6 +481,23 @@ the core before agy ever sees a failure.
 reaches the child, the relay home's settings flip agy's provider, and
 `AGY_CLIPROXY=0` leaves the child env exactly as it was.
 
+
+### Google server errors are retried by bb (`internal` + 5xx)
+
+A Google-side failure in agy's own framing — `API error (attempt N): INTERNAL
+(code 500): …`, `UNAVAILABLE (code 503)`, 502, 504, also inside agy's
+`AGY_ERROR` JSON — reaches bb as `errorInfo { category: "internal",
+httpStatusCode: 50x }`. That is what bb's builtin `provider-retry` re-runs by
+itself (about 1 minute, doubling, at most 4 attempts; see
+`bb provider-retry status|explain <thread>`), so a thread no longer stands
+still until someone types after a transient 500. agy's own
+`"retryable": false` is deliberately overridden: these 500s are one-off.
+
+Not tagged, on purpose: a tool step's error (a command's `504 Gateway
+Timeout` re-run as a whole turn would repeat its commands), bare phrases
+such as `deadline exceeded` without agy's framing, and 5xx texts that also
+name eligibility, auth or billing (those stay unclassified/`unauthorized`/
+`billing`) or `overloaded` (stays `overloaded`, retried faster).
 ## The icon
 
 `icon` on the declaration takes the same two shapes as `bb.branding.icon`: a

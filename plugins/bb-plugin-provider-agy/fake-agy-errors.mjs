@@ -356,6 +356,38 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       }
       return;
     }
+    if (mode === "server-500-exit") {
+      // The 01.11 incident's shape: Google's 500 on stderr with agy's
+      // AGY_ERROR JSON tail, the ERROR result, then exit 3.
+      if (turns === 1) {
+        const err = "API error (attempt 1): INTERNAL (code 500): Internal error encountered.";
+        process.stderr.write(`error: ${err}\n`);
+        process.stderr.write(`AGY_ERROR: {"short_error":"${err}","retryable":false,"error_id":"fake-500"}\n`);
+        out({ event: "result", result: { ...scope, status: "ERROR", response: "", num_turns: turns, error: err, usage } });
+        setTimeout(() => process.exit(3), 100);
+        return;
+      }
+    }
+    if (mode === "server-503-result" || mode === "server-503-overloaded") {
+      if (turns === 1) {
+        out({ event: "result", result: { ...scope, status: "ERROR", response: "", num_turns: turns,
+          error: mode === "server-503-result"
+            ? "API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable."
+            : "API error (attempt 1): UNAVAILABLE (code 503): The model is overloaded.", usage } });
+        return;
+      }
+    }
+    if (mode === "tool-5xx") {
+      // A tool's own 5xx (agy-framed, worst case) that agy then reports as
+      // the turn's error: must NOT be tagged for an automatic whole-turn re-run.
+      if (turns === 1) {
+        const err = "API error (attempt 1): UNAVAILABLE (code 503): upstream 504 Gateway Timeout, context deadline exceeded";
+        out({ event: "step_update", step_update: { ...scope, step_index: step++, state: "ERROR", step_type: "tool",
+          tool_name: "run_command", tool_info: { name: "run_command", error: { message: err } }, duration_seconds: 0.5 } });
+        out({ event: "result", result: { ...scope, status: "ERROR", response: "", num_turns: turns, error: err, usage } });
+        return;
+      }
+    }
     if (mode === "reject-then-exit") {
       // Identity announces, the turn is refused on the first call, the ERROR
       // result with no reply names the quota — and only then does agy exit 1.
