@@ -402,6 +402,20 @@ check("location/native-401-without-url",
 stop("t-ineligible-location");
 process.env.AGY_FAKE_ERROR_MODE = "ineligible";
 
+// A "/compact" that hits the refusal is re-run verbatim on the sibling —
+// never wrapped in a work handoff ("continue the work" for the agent).
+resetPool();
+process.env.FAKE_INELIGIBLE_AFTER_TURN = "2";
+await startThread("t-ineligible-compact");
+await turn("t-ineligible-compact", "first successful turn", 1);
+promptOffset = userPrompts().length;
+await turn("t-ineligible-compact", "/compact", 3);
+const compactPrompts = userPrompts().slice(promptOffset);
+check("ineligible/compact-rerun-verbatim",
+  compactPrompts.length === 2 && compactPrompts.every((p) => p === "/compact") &&
+  statuses("t-ineligible-compact") === "completed,failed,completed", JSON.stringify(compactPrompts).slice(0, 160) + " " + statuses("t-ineligible-compact"));
+stop("t-ineligible-compact");
+
 // An existing conversation must get a handoff; queued inputs follow the retry.
 resetPool();
 process.env.FAKE_INELIGIBLE_AFTER_TURN = "2";

@@ -159,6 +159,15 @@ if ((mode.startsWith("ineligible") || mode === "network-eligibility") &&
   await refuseEligibility();
 }
 
+if (mode === "server-500-noinit") {
+  // A child spawned for a turn that dies to Google's 500 before init.
+  const err = "API error (attempt 1): INTERNAL (code 500): Internal error encountered.";
+  process.stderr.write(`error: ${err}\n`);
+  process.stderr.write(`AGY_ERROR: {"short_error":"${err}","retryable":false,"error_id":"fake-500-noinit"}\n`);
+  await sleep(30);
+  process.exit(3);
+}
+
 if (mode.startsWith("noinit")) {
   out({
     event: "result",

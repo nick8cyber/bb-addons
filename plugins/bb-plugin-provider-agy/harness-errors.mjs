@@ -196,6 +196,28 @@ const server500 = await start("server-500-exit");
 await turn(server500.threadId, "one", 1);
 await sleep(400);
 stop(server500.threadId);
+// A failed bb "/compact" is never tagged for provider-retry: its re-run
+// would be "Please continue." — a fresh agent turn, not a compaction.
+const compact500 = await start("server-500-exit", "-compact");
+await turn(compact500.threadId, "/compact", 1);
+await sleep(400);
+stop(compact500.threadId);
+// The nightly shape: the child was released while idle, "/compact" spawns a
+// fresh one, and that child dies to a 500 before init — still not tagged.
+const compactNoinit = await start("succeed", "-compact-noinit");
+await turn(compactNoinit.threadId, "one", 1);
+process.env.AGY_IDLE_KILL_MS = "300";
+await sleep(1600); // >= one idle sweep past the budget: the child is released
+delete process.env.AGY_IDLE_KILL_MS;
+process.env.AGY_FAKE_ERROR_MODE = "server-500-noinit";
+await turn(compactNoinit.threadId, "/compact", 2);
+await sleep(300);
+stop(compactNoinit.threadId);
+// A stall during "/compact" is not tagged either.
+const compactStall = await start("stall-quiet", "-compact");
+await turn(compactStall.threadId, "/compact", 1);
+await sleep(200);
+stop(compactStall.threadId);
 const server503 = await start("server-503-result");
 await turn(server503.threadId, "one", 1);
 await sleep(300);
@@ -408,6 +430,10 @@ const checks = [
   ["server-500/error-coded-internal-500", errors(server500.threadId).length > 0 && errors(server500.threadId).every((e) => e.errorInfo?.category === "internal" && e.errorInfo?.httpStatusCode === 500), JSON.stringify(errors(server500.threadId).map((e) => e.errorInfo ?? null))],
   ["server-500/turn-failed", completed(server500.threadId)[0]?.status === "failed", JSON.stringify(completed(server500.threadId).map((b) => b.status))],
   ["server-503/error-coded-internal-503", errors(server503.threadId).length > 0 && errors(server503.threadId).every((e) => e.errorInfo?.category === "internal" && e.errorInfo?.httpStatusCode === 503), JSON.stringify(errors(server503.threadId).map((e) => e.errorInfo ?? null))],
+  ["compact-500/not-tagged-for-auto-retry", errors(compact500.threadId).length > 0 && errors(compact500.threadId).every((e) => e.errorInfo?.category !== "internal" && e.category !== "internal"), JSON.stringify(errors(compact500.threadId).map((e) => e.errorInfo ?? null))],
+  ["compact-500/turn-failed", completed(compact500.threadId)[0]?.status === "failed", JSON.stringify(completed(compact500.threadId).map((b) => b.status))],
+  ["compact-noinit/respawned-child-500-not-tagged", completed(compactNoinit.threadId).map((b) => b.status).join(",") === "completed,failed" && errors(compactNoinit.threadId).length > 0 && errors(compactNoinit.threadId).every((e) => e.errorInfo?.category !== "internal" && e.category !== "internal"), JSON.stringify(completed(compactNoinit.threadId).map((b) => b.status)) + " " + JSON.stringify(errors(compactNoinit.threadId).map((e) => e.errorInfo ?? null))],
+  ["compact-stall/not-tagged-for-auto-retry", (() => { const st = errors(compactStall.threadId).filter((e) => e.message.includes("agy stalled")); return st.length === 1 && st[0].errorInfo === undefined; })(), JSON.stringify(errors(compactStall.threadId).map((e) => e.errorInfo ?? null))],
   ["server-503/turn-failed", completed(server503.threadId)[0]?.status === "failed", JSON.stringify(completed(server503.threadId).map((b) => b.status))],
   ["server-500/last-error-before-failed-turn-is-internal", (() => { const d = deltas(server500.threadId); const i = d.findIndex((x) => x.kind === "turn.boundary" && x.status === "failed"); const last = d.slice(0, i).filter((x) => x.kind === "provider.error").at(-1); return last?.errorInfo?.category === "internal" && last?.errorInfo?.httpStatusCode === 500; })(), ""],
   ["server-503-overloaded/stays-overloaded", errors(overloaded503.threadId).length > 0 && errors(overloaded503.threadId).every((e) => e.errorInfo?.category === "overloaded"), JSON.stringify(errors(overloaded503.threadId).map((e) => e.errorInfo ?? null))],

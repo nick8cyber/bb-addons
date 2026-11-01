@@ -591,7 +591,14 @@ bb thread output <thread>
   accepted while a turn is live and run as the next turn (see below) — but agy
   has no channel for reaching the model *inside* a running turn, so the steer
   cannot change what the current turn does. That needs agy support.
-- **Fork, archive, rename, manual compaction** are all declared off.
+- **Fork, archive, rename** are declared off. Manual compaction is on: bb's
+  `/compact` reaches agy verbatim and agy runs it as its own compaction (the
+  model summarizes the conversation; agy logs `expanded slash command
+  "compact"`). A failed `/compact` is never tagged for bb's provider-retry —
+  its re-run would be "Please continue.", a normal agent turn, not another
+  compaction — including when it is the turn that respawns an idle-released
+  child and dies before `init`. When an account rotation re-runs it, it is
+  re-sent as `/compact`, never wrapped in a work handoff.
 - **Reasoning levels** are folded into agy's `low|medium|high`, and because
   every model id already names one, the picker's level is effectively ignored
   when a model is selected.
