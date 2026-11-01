@@ -218,6 +218,22 @@ const compactStall = await start("stall-quiet", "-compact");
 await turn(compactStall.threadId, "/compact", 1);
 await sleep(200);
 stop(compactStall.threadId);
+// Compaction fallback through the non-result paths: "/compact" stalls (the
+// stall watchdog fails it) or agy exits with no result — both hand over to
+// the summary + fresh-conversation fallback instead of failing the session.
+process.env.AGY_FAKE_FRESH_IDS = "1";
+const cfResults = {};
+for (const compactMode of ["stall", "exit"]) {
+  process.env.AGY_FAKE_COMPACT_MODE = compactMode;
+  const t = await start("compact-fail", `-${compactMode}`);
+  await turn(t.threadId, "one", 1);
+  await turn(t.threadId, "/compact", 4);
+  cfResults[compactMode] = { statuses: completed(t.threadId).map((b) => b.status).join(","),
+    replaced: messages.filter((m) => m.method === "session/replaced" && m.params.threadId === t.threadId).map((m) => m.params.contextLost) };
+  stop(t.threadId);
+}
+delete process.env.AGY_FAKE_COMPACT_MODE;
+delete process.env.AGY_FAKE_FRESH_IDS;
 const server503 = await start("server-503-result");
 await turn(server503.threadId, "one", 1);
 await sleep(300);
@@ -434,6 +450,8 @@ const checks = [
   ["compact-500/turn-failed", completed(compact500.threadId)[0]?.status === "failed", JSON.stringify(completed(compact500.threadId).map((b) => b.status))],
   ["compact-noinit/respawned-child-500-not-tagged", completed(compactNoinit.threadId).map((b) => b.status).join(",") === "completed,failed" && errors(compactNoinit.threadId).length > 0 && errors(compactNoinit.threadId).every((e) => e.errorInfo?.category !== "internal" && e.category !== "internal"), JSON.stringify(completed(compactNoinit.threadId).map((b) => b.status)) + " " + JSON.stringify(errors(compactNoinit.threadId).map((e) => e.errorInfo ?? null))],
   ["compact-stall/not-tagged-for-auto-retry", (() => { const st = errors(compactStall.threadId).filter((e) => e.message.includes("agy stalled")); return st.length === 1 && st[0].errorInfo === undefined; })(), JSON.stringify(errors(compactStall.threadId).map((e) => e.errorInfo ?? null))],
+  ["compact-fallback/stall-hands-over", cfResults.stall?.statuses === "completed,failed,completed,completed" && JSON.stringify(cfResults.stall?.replaced) === "[false,true]", JSON.stringify(cfResults.stall)],
+  ["compact-fallback/exit-without-result-hands-over", cfResults.exit?.statuses === "completed,failed,completed,completed" && JSON.stringify(cfResults.exit?.replaced) === "[false,true]", JSON.stringify(cfResults.exit)],
   ["server-503/turn-failed", completed(server503.threadId)[0]?.status === "failed", JSON.stringify(completed(server503.threadId).map((b) => b.status))],
   ["server-500/last-error-before-failed-turn-is-internal", (() => { const d = deltas(server500.threadId); const i = d.findIndex((x) => x.kind === "turn.boundary" && x.status === "failed"); const last = d.slice(0, i).filter((x) => x.kind === "provider.error").at(-1); return last?.errorInfo?.category === "internal" && last?.errorInfo?.httpStatusCode === 500; })(), ""],
   ["server-503-overloaded/stays-overloaded", errors(overloaded503.threadId).length > 0 && errors(overloaded503.threadId).every((e) => e.errorInfo?.category === "overloaded"), JSON.stringify(errors(overloaded503.threadId).map((e) => e.errorInfo ?? null))],

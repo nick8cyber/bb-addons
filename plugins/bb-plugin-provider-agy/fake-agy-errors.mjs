@@ -61,7 +61,7 @@
  * WHAT the bridge sent.
  */
 import { createInterface } from "node:readline";
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 // Account-specific modes reproduce failures across multiple child generations.
@@ -71,7 +71,9 @@ const mode = modesByLabel[homeLabel] ?? process.env.AGY_FAKE_ERROR_MODE ?? "stde
 const conversationId =
   process.argv.includes("--conversation")
     ? process.argv[process.argv.indexOf("--conversation") + 1]
-    : "fake-conv-errors";
+    : process.env.AGY_FAKE_FRESH_IDS === "1"
+      ? `fake-conv-${process.pid}`
+      : "fake-conv-errors";
 const model = process.argv.includes("--model")
   ? process.argv[process.argv.indexOf("--model") + 1]
   : "fake-model";
@@ -190,6 +192,16 @@ if (mode.startsWith("noinit")) {
   process.exit(1);
 }
 
+// AGY_FAKE_PREINIT_ARM: the next FRESH child (no --conversation) dies to a
+// quota banner before init, once — a seed that cannot even start.
+if (process.env.AGY_FAKE_PREINIT_ARM && existsSync(process.env.AGY_FAKE_PREINIT_ARM) &&
+    !process.argv.includes("--conversation")) {
+  unlinkSync(process.env.AGY_FAKE_PREINIT_ARM);
+  process.stderr.write(`${QUOTA_SHORT}\n`);
+  await sleep(30);
+  process.exit(1);
+}
+
 out({
   event: "init",
   conversation_id: conversationId,
@@ -213,6 +225,70 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       cache_read_tokens: 0,
       total_tokens: 10 * turns + 2,
     };
+    if (mode === "compact-fail") {
+      // The nightly incident: "/compact" dies to Google's 500 (stderr +
+      // AGY_ERROR, ERROR result, exit 3). The bridge's summary request is
+      // answered per AGY_FAKE_SUMMARY_MODE (ok | empty | fail); anything else
+      // is an ordinary turn.
+      let content = "";
+      try { content = JSON.parse(line).message?.content ?? ""; } catch {}
+      const err = "API error (attempt 1): INTERNAL (code 500): Internal error encountered.";
+      const die = () => {
+        process.stderr.write(`error: ${err}\n`);
+        process.stderr.write(`AGY_ERROR: {"short_error":"${err}","retryable":false,"error_id":"fake-compact"}\n`);
+        out({ event: "result", result: { ...scope, status: "ERROR", response: "", num_turns: turns, error: err, usage } });
+        setTimeout(() => process.exit(3), 100);
+      };
+      if (content.trim() === "/compact") {
+        // AGY_FAKE_COMPACT_MODE: die (result + exit 3, default), exit (exit 3
+        // with no result), stall (never answers).
+        const compactMode = process.env.AGY_FAKE_COMPACT_MODE ?? "die";
+        if (compactMode === "stall") return;
+        if (compactMode === "billing" || compactMode === "overloaded") {
+          const text = compactMode === "billing"
+            ? "Your billing account is disabled; add credits to continue."
+            : "API error (attempt 1): UNAVAILABLE (code 503): The model is overloaded.";
+          out({ event: "result", result: { ...scope, status: "ERROR", response: "", num_turns: turns, error: text, usage } });
+          setTimeout(() => process.exit(3), 100);
+          return;
+        }
+        if (compactMode === "exit") {
+          process.stderr.write(`error: ${err}\n`);
+          setTimeout(() => process.exit(3), 50);
+          return;
+        }
+        die();
+        return;
+      }
+      if (content.startsWith("[compaction-handoff]") && process.env.AGY_FAKE_SEED_MODE === "fail") {
+        die();
+        return;
+      }
+      if (content.startsWith("[compaction-fallback]")) {
+        const summaryMode = process.env.AGY_FAKE_SUMMARY_MODE ?? "ok";
+        if (summaryMode === "fail") {
+          die();
+          return;
+        }
+        if (summaryMode === "quota") {
+          out({ event: "result", result: { ...scope, status: "ERROR", response: "", num_turns: turns, error: QUOTA_SHORT, usage } });
+          setTimeout(() => process.exit(1), 100);
+          return;
+        }
+        if (summaryMode === "quota-exit") {
+          process.stderr.write(`${QUOTA_SHORT}\n`);
+          setTimeout(() => process.exit(1), 50);
+          return;
+        }
+        const text = summaryMode === "empty" ? "" : "SUMMARY-OF-WORK: goal G; done D; next N";
+        if (text.length > 0) {
+          out({ event: "step_update", step_update: { ...scope, step_index: step++, state: "DONE",
+            step_type: "agent_response", text_delta: text, usage } });
+        }
+        out({ event: "result", result: { ...scope, status: "SUCCESS", response: text, num_turns: turns, usage } });
+        return;
+      }
+    }
     if (mode === "race429") {
       if (turns === 1) {
         // The result lands first; the 429 banner trails it, after the bridge

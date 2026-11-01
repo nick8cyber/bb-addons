@@ -244,6 +244,15 @@ interface Turn {
    * verbatim, never wrapped in a work handoff.
    */
   compact: boolean;
+  /**
+   * A bridge-made step of the compaction fallback (see startCompactFallback):
+   * "summary" asks the agent, on the conversation that could not be
+   * compacted, for its own summary; "seed" opens a fresh conversation with
+   * that summary (or the bridge's memo when there is none).
+   */
+  compactFallback: "summary" | "seed" | undefined;
+  /** Everything this turn streamed as agent text (capped). */
+  fullText: string;
   /** Absent for the first turn carried on thread/start. */
   clientRequestId: string | undefined;
   prompt: string;
@@ -370,6 +379,13 @@ interface Session {
    * bug pays nothing and is never told about a field it was not using.
    */
   writeGuardrail: boolean;
+  /**
+   * Compaction fallback bookkeeping: the conversation the thread had before
+   * the fallback opened a fresh one (so a fresh start that cannot be
+   * established can go back to it), and how many seed attempts were made.
+   */
+  compactFallbackOld: string | null;
+  compactSeedAttempts: number;
   /**
    * How many quota auto-retries this session has already run. Reset when a
    * turn plainly completes, so one burnt window does not spend the budget of
@@ -607,7 +623,8 @@ function nativeErrorInfo(
  * `pending` (a child spawned for it can fail before `init`).
  */
 function compactInFlight(session: Session, turn?: Turn): boolean {
-  return (turn ?? session.turns[0] ?? session.pending[0])?.compact ?? false;
+  const t = turn ?? session.turns[0] ?? session.pending[0];
+  return t !== undefined && (t.compact || t.compactFallback !== undefined);
 }
 
 /**
@@ -624,7 +641,9 @@ function sessionErrorInfo(
   if (
     compactInFlight(session, turn) &&
     info !== undefined &&
-    (info.category === "internal" || info.category === "stream-disconnected")
+    (info.category === "internal" ||
+      info.category === "stream-disconnected" ||
+      info.category === "overloaded")
   ) {
     return undefined;
   }
@@ -805,6 +824,274 @@ function gitDiffStat(cwd: string): string | null {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Compaction fallback. bb's "/compact" reaches agy verbatim and agy runs its
+// own compaction; when Google refuses it (500/503 on one large conversation,
+// night after night, until the thread moves to another conversation), the
+// bridge does the compaction by hand:
+//   1. "summary": restart agy on the SAME conversation and ask the agent for
+//      its own summary of the work (ordinary turns on it still work — only
+//      the compaction request fails);
+//   2. "seed": open a FRESH conversation whose first turn is that summary.
+// If the summary turn fails or comes back empty, the seed carries the
+// bridge's memo instead (last streamed text + git status). AGY_COMPACT_FALLBACK=0
+// keeps the old behaviour (the failed compaction just stays failed).
+// ---------------------------------------------------------------------------
+
+const COMPACT_FALLBACK_TAG = "[compaction-fallback]";
+const COMPACT_HANDOFF_TAG = "[compaction-handoff]";
+const COMPACT_SUMMARY_CAP = 20_000;
+
+function compactFallbackEnabled(): boolean {
+  return process.env.AGY_COMPACT_FALLBACK !== "0";
+}
+
+function compactSummaryPrompt(): string {
+  return (
+    `${COMPACT_FALLBACK_TAG} Compacting this conversation failed, ` +
+    `so it will be continued in a NEW conversation that starts from your summary ` +
+    `alone. Write that summary now as your reply — do not call tools and do not ` +
+    `change files. Use the language of this conversation. Cover: the overall goal ` +
+    `and the standing instructions you follow (and which files hold them); what is ` +
+    `done, with exact file paths, branches, commits, PR/issue numbers and commands ` +
+    `that matter; decisions and constraints; what is in progress and the exact next ` +
+    `steps; anything you must not forget. Be complete but concise (at most about ` +
+    `1500 words).`
+  );
+}
+
+/**
+ * How the agent on the fresh conversation can read the old one back: bb
+ * passes BB_THREAD_ID / BB_CLI to agy, and this bb thread's own history (user
+ * messages and the agent's replies, newest first) is one command away.
+ */
+function threadHistoryHint(session: Session): string {
+  // Bounded on purpose: `--all` on a long thread is megabytes, which would
+  // refill the fresh conversation with exactly what compaction removed.
+  return (
+    `\`timeout 60 bb thread messages ${session.threadId} --limit 30\` ` +
+    `(newest first; at most \`--limit 100\`; one message with its tool details: ` +
+    `\`--message <seq> --format verbose\`; never \`--all\`; if \`bb\` is not on ` +
+    `PATH use "$BB_CLI")`
+  );
+}
+
+function compactSeedPrompt(summary: string, session: Session): string {
+  return (
+    `${COMPACT_HANDOFF_TAG} This is a fresh conversation: the previous one could ` +
+    `not be compacted, so the bridge replaced it. Below is your own summary of ` +
+    `everything so far — treat it as your memory and continue from it. Do not ` +
+    `call tools in this turn: reply only with "OK". Later, before acting, re-read ` +
+    `the instruction files it names; if you then need a detail the summary leaves ` +
+    `out, look it up in this thread's history — ${threadHistoryHint(session)} — as ` +
+    `reference only, never as a list of things to redo.\n\n` +
+    `${summary.slice(0, COMPACT_SUMMARY_CAP)}`
+  );
+}
+
+/** Variant A: no summary from the agent, so the bridge writes the memo. */
+function compactMemoPrompt(session: Session): string {
+  const streamed =
+    session.recentAssistantText.length > 0
+      ? session.recentAssistantText.slice(-HANDOFF_STREAMED_TEXT_CAP)
+      : "(nothing streamed)";
+  const stat = gitDiffStat(session.cwd);
+  const tree =
+    stat === null
+      ? "(git unavailable or not a repo)"
+      : stat.length === 0
+        ? "(clean)"
+        : stat;
+  return (
+    `${COMPACT_HANDOFF_TAG} This is a fresh conversation: the previous one could ` +
+    `not be compacted and the agent could not summarize it either, so the bridge ` +
+    `replaced it with NO history. Restore your context NOW, in this turn, before ` +
+    `anything else: read this thread's history — ${threadHistoryHint(session)} — ` +
+    `until you know the goal, your standing instructions, what is done and what is ` +
+    `next; then re-read the instruction and briefing files it names. This turn is ` +
+    `READ-ONLY: only \`bb thread messages\` and reading files — no git, ssh, ` +
+    `deploys or other network actions, no file changes, no messages to other ` +
+    `threads. The history is reference, not a to-do list: carry out nothing from ` +
+    `it until the user's next message. Then reply with one short line: what you ` +
+    `are working on and the next step.\n` +
+    `LAST ASSISTANT OUTPUT (before the replacement):\n${streamed}\n` +
+    `WORKING-TREE STATE (git diff --stat in ${session.cwd}):\n${tree}`
+  );
+}
+
+/**
+ * Queue the next fallback step at the head of the line and rebuild agy for it
+ * a second later — the same timer the account retries use, so the dying
+ * child's exit is ignored and anything queued behind runs after it, in order.
+ */
+function startCompactFallback(
+  session: Session,
+  failedTurn: Turn,
+  stage: "summary" | "seed",
+  seedPrompt?: string,
+  seedKind: "summary" | "memo" | "retry" = "memo",
+): boolean {
+  if (
+    !compactFallbackEnabled() ||
+    session.stopping ||
+    sessions.get(session.threadId) !== session ||
+    session.providerThreadId === null ||
+    session.autoRetryTimer !== null
+  ) {
+    return false;
+  }
+  if (stage === "seed") {
+    // The conversation to go back to if no fresh one can be established.
+    session.compactFallbackOld ??= session.providerThreadId;
+    session.compactSeedAttempts += 1;
+  }
+  const next = createTurn({
+    prompt: stage === "summary" ? compactSummaryPrompt() : (seedPrompt ?? compactMemoPrompt(session)),
+    clientRequestId: undefined,
+    compactFallback: stage,
+  });
+  session.pending.unshift(next);
+  while (session.turns.length > 0) {
+    session.pending.push(session.turns.shift() as Turn);
+  }
+  session.autoRetryTimer = setTimeout(() => {
+    wakeCompactFallback(session, stage);
+  }, 1_000);
+  session.autoRetryTimer.unref();
+  log(
+    stage === "summary"
+      ? `turn ${failedTurn.turnId}: compaction failed; asking the agent for its own summary on conversation ${session.providerThreadId} (turn ${next.turnId})`
+      : `turn ${failedTurn.turnId}: compaction fallback: opening a fresh conversation seeded with ${seedKind === "summary" ? "the agent's summary" : seedKind === "retry" ? "the same seed again" : "the bridge's memo"} (attempt ${session.compactSeedAttempts}, turn ${next.turnId})`,
+  );
+  return true;
+}
+
+function wakeCompactFallback(
+  session: Session,
+  stage: "summary" | "seed" | "restore",
+): void {
+  session.autoRetryTimer = null;
+  if (sessions.get(session.threadId) !== session || session.stopping) {
+    log(`compaction fallback (${stage}): stale wake for thread ${session.threadId}; dropping`);
+    return;
+  }
+  if (stage !== "restore" && session.pending.length === 0) {
+    log(`compaction fallback (${stage}): nothing queued for thread ${session.threadId}; dropping`);
+    return;
+  }
+  const conversationId =
+    stage === "seed"
+      ? undefined
+      : stage === "restore"
+        ? (session.compactFallbackOld ?? undefined)
+        : (session.providerThreadId ?? undefined);
+  notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+    threadId: session.threadId,
+    providerThreadId: session.providerThreadId,
+    reason:
+      stage === "seed"
+        ? "agy could not compact this conversation; the thread continues on a fresh conversation that starts from the agent's own summary of the old one"
+        : stage === "restore"
+          ? "the compaction fallback could not open a fresh conversation; the thread goes back to its previous, uncompacted conversation"
+          : "agy could not compact this conversation; restarting it on the same conversation to ask the agent for its own summary",
+    contextLost: stage === "seed",
+  });
+  if (stage === "restore") {
+    session.compactFallbackOld = null;
+    session.compactSeedAttempts = 0;
+  }
+  startChild({
+    session,
+    model: session.spawnConfig.model,
+    reasoningLevel: session.spawnConfig.reasoningLevel,
+    conversationId,
+    envVars: session.spawnConfig.envVars,
+  });
+}
+
+/** How many times a seed may be tried on a fresh conversation. */
+const COMPACT_SEED_MAX_ATTEMPTS = 2;
+
+/**
+ * Which fallback step a failure of this head turn leads to, or null when the
+ * ordinary paths own it. Quota and eligibility refusals ride the account
+ * retry (which keeps the step's mark); a /compact that fails for billing or
+ * auth is not Google failing to compact, so it just stays failed.
+ */
+function compactFallbackStage(
+  session: Session,
+  turn: Turn | undefined,
+  message: string,
+): "summary" | "seed" | "seed-retry" | "restore" | null {
+  if (turn === undefined) return null;
+  const category = classifyError(message);
+  if (category === "rate-limit" || isAccountIneligible(message)) return null;
+  if (turn.compact && turn.compactFallback === undefined) {
+    // Auth matched narrowly: classifyError's bare `token` would also catch
+    // "input token count exceeds the maximum", which compaction by hand fixes.
+    const auth = /unauthori|not authorized|invalid token|sign in|logged in|login|\b401\b|\b403\b/iu.test(message);
+    return category === "billing" || auth ? null : "summary";
+  }
+  if (turn.compactFallback === "summary") return "seed";
+  if (turn.compactFallback === "seed") {
+    return session.compactSeedAttempts < COMPACT_SEED_MAX_ATTEMPTS ? "seed-retry" : "restore";
+  }
+  return null;
+}
+
+/** Run the fallback step a failed head turn leads to. */
+function runCompactFallbackStage(
+  session: Session,
+  failedTurn: Turn,
+  stage: "summary" | "seed" | "seed-retry" | "restore",
+): boolean {
+  switch (stage) {
+    case "summary":
+      session.compactFallbackOld = null;
+      session.compactSeedAttempts = 0;
+      return startCompactFallback(session, failedTurn, "summary");
+    case "seed":
+      return startCompactFallback(session, failedTurn, "seed", compactMemoPrompt(session));
+    case "seed-retry":
+      return startCompactFallback(session, failedTurn, "seed", failedTurn.prompt, "retry");
+    case "restore":
+      return restoreCompactConversation(session, failedTurn);
+  }
+}
+
+/**
+ * The fresh conversation could not be established: go back to the old one,
+ * on the account that owns it, so queued turns land in a conversation that
+ * still knows everything rather than in an empty one.
+ */
+function restoreCompactConversation(session: Session, failedTurn: Turn): boolean {
+  const old = session.compactFallbackOld;
+  if (
+    old === null ||
+    session.stopping ||
+    sessions.get(session.threadId) !== session ||
+    session.autoRetryTimer !== null
+  ) {
+    return false;
+  }
+  if (cliproxyRelayDataDir !== null && accountsEnabled(process.env)) {
+    const owner = conversationAccount(loadLedger(cliproxyRelayDataDir), old);
+    if (owner !== null) session.accountLabel = owner;
+  }
+  while (session.turns.length > 0) {
+    session.pending.push(session.turns.shift() as Turn);
+  }
+  session.autoRetryTimer = setTimeout(() => {
+    wakeCompactFallback(session, "restore");
+  }, 1_000);
+  session.autoRetryTimer.unref();
+  log(
+    `turn ${failedTurn.turnId}: compaction fallback could not open a fresh conversation ` +
+      `after ${session.compactSeedAttempts} attempt(s); going back to conversation ${old}`,
+  );
+  return true;
 }
 
 /**
@@ -1093,16 +1380,26 @@ function scheduleAccountRetry(
   if (switchTo === null) {
     session.autoRetryCount += 1;
   }
+  // A compaction-fallback summary moved to another account would ask an empty
+  // conversation for a summary: it becomes the bridge's memo seed instead.
+  const summaryToSeed = failedTurn.compactFallback === "summary" && switchTo !== null;
+  if (summaryToSeed) {
+    session.compactFallbackOld ??= session.providerThreadId;
+    session.compactSeedAttempts += 1;
+  }
   const retryTurn = createTurn({
-    // A "/compact" is re-run verbatim: wrapped in a work handoff it would
-    // become "continue the work" for the agent on the new conversation.
-    prompt:
-      switchTo !== null &&
-      !failedTurn.compact &&
-      (reason === "quota" || session.providerThreadId !== null)
+    // A "/compact" (and a fallback step) is re-run verbatim: wrapped in a
+    // work handoff it would become "continue the work" for the agent.
+    prompt: summaryToSeed
+      ? compactMemoPrompt(session)
+      : switchTo !== null &&
+          !failedTurn.compact &&
+          failedTurn.compactFallback === undefined &&
+          (reason === "quota" || session.providerThreadId !== null)
         ? buildQuotaHandoffPrompt(session, failedTurn)
         : failedTurn.prompt,
     clientRequestId: undefined,
+    compactFallback: summaryToSeed ? "seed" : failedTurn.compactFallback,
   });
   session.pending.unshift(retryTurn);
   // Turns already queued behind the failed one ride the same closed window:
@@ -1119,7 +1416,17 @@ function scheduleAccountRetry(
   }
   const attempt = session.autoRetryCount;
   session.autoRetryTimer = setTimeout(() => {
-    wakeAccountRetry(session, attempt, waitMs, switchTo !== null, reason);
+    // A seed's whole point is a fresh conversation: re-open one even when the
+    // retry waits on the same account (before the seed's init the session
+    // still names the OLD conversation, which a same-conversation wake would
+    // resume — the uncompacted one, told it is fresh).
+    wakeAccountRetry(
+      session,
+      attempt,
+      waitMs,
+      switchTo !== null || retryTurn.compactFallback === "seed",
+      reason,
+    );
   }, waitMs);
   session.autoRetryTimer.unref();
   log(
@@ -1173,7 +1480,9 @@ function wakeAccountRetry(
     notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
       threadId: session.threadId,
       providerThreadId: session.providerThreadId,
-      reason: freshConversation
+      reason: freshConversation && session.pending[0]?.compactFallback === "seed"
+        ? "the compaction fallback's fresh conversation is being opened again after an account refusal; it starts from the agent's summary of the old one"
+        : freshConversation
         ? reason === "ineligible"
           ? "this account failed Google's Antigravity eligibility check; the turn is being re-run on another account, so the conversation context does not carry over"
           : "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over"
@@ -1717,6 +2026,22 @@ function failSession(
     errorInfo?: ReturnType<typeof nativeErrorInfo>;
   } = {},
 ): void {
+  // A compaction (or its summary) that dies outside a result — agy's exit
+  // before `result`, a stall kill — hands over to the compaction fallback
+  // instead of failing the whole session; the turns queued behind it wait.
+  const fallbackHead = session.turns[0] ?? session.pending[0];
+  const fallbackStage = compactFallbackStage(session, fallbackHead, message);
+  if (fallbackHead !== undefined && fallbackStage !== null && compactFallbackEnabled() &&
+      !session.stopping && session.autoRetryTimer === null &&
+      (session.providerThreadId !== null || fallbackStage === "restore")) {
+    if (session.turns[0] === fallbackHead) session.turns.shift();
+    else session.pending.shift();
+    settleTurnFailed(session, fallbackHead, message);
+    if (runCompactFallbackStage(session, fallbackHead, fallbackStage)) {
+      log(`session ${session.threadId}: ${fallbackHead.compact ? "compaction" : `compaction ${fallbackHead.compactFallback ?? ""}`} failed outside a result (${message.replace(/[\r\n]+/gu, " ").slice(0, 200)}); compaction fallback takes over`);
+      return;
+    }
+  }
   const surfaceError = opts.surfaceError ?? true;
   const errorInfo = sessionErrorInfo(
     session,
@@ -1920,6 +2245,9 @@ function handleStepUpdate(
   if (event.textDelta !== null && event.textDelta.length > 0) {
     turn.producedText = true;
     item.text += event.textDelta;
+    if (turn.compactFallback === "summary" && turn.fullText.length < COMPACT_SUMMARY_CAP) {
+      turn.fullText = (turn.fullText + event.textDelta).slice(0, COMPACT_SUMMARY_CAP);
+    }
     // Feed the rotation handoff's sliding window: what streamed is what a
     // fresh account needs to avoid redoing.
     session.recentAssistantText += event.textDelta;
@@ -2357,6 +2685,12 @@ function handleResult(
       error: { message },
     });
     session.lastTurnFailed = true;
+    // A failed compaction (or a failed summary for it) hands over to the
+    // compaction fallback; the summary step never rides an account retry.
+    const fallbackStage = compactFallbackStage(session, turn, message);
+    if (fallbackStage !== null && runCompactFallbackStage(session, turn, fallbackStage)) {
+      return;
+    }
     // The failure is out; if agy named a near-enough reset, queue the same
     // prompt to re-run when the window reopens instead of leaving the thread
     // dead until a human retries it.
@@ -2370,6 +2704,24 @@ function handleResult(
     session.lastTurnFailed = false;
     session.autoRetryCount = 0;
     clearRateLimit(session);
+    if (turn.compactFallback === "summary") {
+      const summary = turn.fullText.trim();
+      if (
+        startCompactFallback(
+          session,
+          turn,
+          "seed",
+          summary.length > 0 ? compactSeedPrompt(summary, session) : compactMemoPrompt(session),
+          summary.length > 0 ? "summary" : "memo",
+        )
+      ) {
+        return;
+      }
+    } else if (turn.compactFallback === "seed") {
+      session.compactFallbackOld = null;
+      session.compactSeedAttempts = 0;
+      log(`turn ${turn.turnId}: compaction fallback complete; thread ${session.threadId} continues on conversation ${session.providerThreadId ?? "?"}`);
+    }
   }
   // The next queued turn is now the live one: it is announced and only now
   // handed to agy, so a queued turn (a steer, or a second turn/start) cannot
@@ -2483,7 +2835,7 @@ function enqueueTurn(session: Session, turn: Turn): void {
           : "the agy process was gone and is being restarted",
       contextLost: cooldownRotation !== null,
     });
-    if (cooldownRotation !== null && !turn.compact) {
+    if (cooldownRotation !== null && !turn.compact && turn.compactFallback === undefined) {
       turn.prompt = buildQuotaHandoffPrompt(session, turn);
     }
     // Own this input before spawning: synchronous configuration failures
@@ -2522,12 +2874,15 @@ function enqueueTurn(session: Session, turn: Turn): void {
 function createTurn(args: {
   prompt: string;
   clientRequestId: string | undefined;
+  compactFallback?: "summary" | "seed";
 }): Turn {
   return {
     turnId: mintTurnId(),
     clientRequestId: args.clientRequestId,
     prompt: args.prompt,
     compact: args.prompt.trim() === "/compact",
+    compactFallback: args.compactFallback,
+    fullText: "",
     started: false,
     items: new Map(),
     itemOrdinal: 0,
@@ -2701,6 +3056,8 @@ const handlers: Record<string, RequestHandler> = {
       lastTurnFailed: false,
       rateLimitsBlocked: false,
       writeGuardrail: false,
+      compactFallbackOld: null,
+      compactSeedAttempts: 0,
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
@@ -2803,6 +3160,8 @@ const handlers: Record<string, RequestHandler> = {
       lastTurnFailed: false,
       rateLimitsBlocked: false,
       writeGuardrail: false,
+      compactFallbackOld: null,
+      compactSeedAttempts: 0,
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
@@ -3151,6 +3510,9 @@ function sweepStalledTurns(): void {
       session.turns[0].started &&
       session.turns[0].clientRequestId !== undefined &&
       !session.turns[0].compact;
+    // Kill first: failSession may hand a stalled compaction over to the
+    // compaction fallback, whose timer a later killChild would cancel.
+    killChild(session);
     failSession(
       session,
       `agy stalled: no output for ${silentSec}s ${reason}; ` +
@@ -3165,7 +3527,6 @@ function sweepStalledTurns(): void {
           }
         : {},
     );
-    killChild(session);
   }
 }
 
