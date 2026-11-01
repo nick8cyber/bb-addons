@@ -349,6 +349,56 @@ describe("russian translation rejection", () => {
     }
   });
 
+  it("rejects empty, whitespace or none replacements for real prose", () => {
+    const { parse } = prepareRussianTranslation({
+      summary: "The function returns early.",
+      details: "The write occurs before the transaction starts.",
+    });
+
+    for (const output of [
+      { summary: "", details: "Запись происходит до транзакции." },
+      { summary: "   ", details: "Запись происходит до транзакции." },
+      { summary: "none", details: "Запись происходит до транзакции." },
+      { summary: "Функция возвращается раньше.", details: "" },
+      { summary: "Функция возвращается раньше.", details: "  \n\t" },
+      { summary: "Функция возвращается раньше.", details: "none" },
+      { summary: "", details: "" },
+    ]) {
+      expect(parse(JSON.stringify(output))).toBeNull();
+    }
+  });
+
+  it("allows an empty original details field to stay empty or none", () => {
+    const { parse } = prepareRussianTranslation({
+      summary: "The function returns early.",
+      details: "",
+    });
+
+    expect(
+      parse(
+        JSON.stringify({
+          summary: "Функция возвращается раньше.",
+          details: "",
+        }),
+      ),
+    ).not.toBeNull();
+    expect(
+      parse(
+        JSON.stringify({
+          summary: "Функция возвращается раньше.",
+          details: "none",
+        }),
+      ),
+    ).not.toBeNull();
+  });
+
+  it("keeps summary substantive even when the original summary is empty", () => {
+    const { parse } = prepareRussianTranslation({ summary: "", details: "" });
+    expect(
+      parse(JSON.stringify({ summary: "none", details: "" })),
+    ).toBeNull();
+  });
+
   it("rejects a translation that is still english", () => {
     const { parse } = prepareRussianTranslation({
       summary: "The function returns early.",
