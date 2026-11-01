@@ -116,8 +116,8 @@ async function waitFor(predicate, ms, label) {
 let nextId = 10;
 let creqSeq = 0;
 
-async function start(mode) {
-  const threadId = `t-${mode}`;
+async function start(mode, suffix = "") {
+  const threadId = `t-${mode}${suffix}`;
   send({ jsonrpc: "2.0", id: nextId++, method: "initialize", params: { protocolVersion: 2, grammarVersions: [3, 3], client: { name: "fake", version: "1" } } });
   const startId = nextId++;
   process.env.AGY_FAKE_ERROR_MODE = mode;
@@ -300,6 +300,14 @@ const quiet = await start("stall-quiet");
 await turn(quiet.threadId, "one", 1);
 await sleep(200);
 stop(quiet.threadId);
+// stall-quiet with a steer queued behind the frozen turn: not tagged for
+// bb's auto-retry, or the "Please continue." re-run would drop the steer.
+const quietQueued = await start("stall-quiet", "-queued");
+sendTurn(quietQueued.threadId, "one");
+sendTurn(quietQueued.threadId, "steer queued behind the frozen turn");
+await waitFor(() => completed(quietQueued.threadId).length >= 2, 15_000, `${quietQueued.threadId}: two boundaries`);
+await sleep(200);
+stop(quietQueued.threadId);
 
 bridge.onClose?.();
 process.stdout.write = originalWrite;
@@ -377,6 +385,10 @@ const checks = [
   ["stall/no-raw-exit-banner", retryRawExits(stall.threadId).length === 0, JSON.stringify(stallErrors.map((e) => e.message)).slice(0, 160)],
   ["stall-quiet/turn-failed-by-model-tier", quietBoundaries[0]?.status === "failed" && (quietBoundaries[0]?.error?.message ?? "").includes("agy stalled") && (quietBoundaries[0]?.error?.message ?? "").includes("no output") && !((quietBoundaries[0]?.error?.message ?? "").includes("in flight")), JSON.stringify(quietBoundaries[0]?.error?.message ?? "").slice(0, 200)],
   ["stall-quiet/surfaced-once", quietStalled.length === 1 && quietStalled[0].threadScoped === true, JSON.stringify(quietErrors.map((e) => e.message)).slice(0, 160)],
+  ["stall-quiet/tagged-for-bb-auto-retry", quietStalled.length === 1 && quietStalled[0].errorInfo?.category === "stream-disconnected", JSON.stringify(quietStalled.map((e) => e.errorInfo ?? null))],
+  ["stall-quiet/last-error-before-failed-turn-is-stream-disconnected", (() => { const d = deltas(quiet.threadId); const i = d.findIndex((x) => x.kind === "turn.boundary" && x.status === "failed"); const last = d.slice(0, i === -1 ? d.length : i).filter((x) => x.kind === "provider.error").at(-1) ?? errors(quiet.threadId).at(-1); return last?.errorInfo?.category === "stream-disconnected"; })(), ""],
+  ["stall-quiet/queued-steer-not-auto-retried", (() => { const st = errors(quietQueued.threadId).filter((e) => e.message.includes("agy stalled")); return st.length === 1 && st[0].errorInfo === undefined && completed(quietQueued.threadId).every((b) => b.status === "failed"); })(), JSON.stringify(errors(quietQueued.threadId).map((e) => e.errorInfo ?? null))],
+  ["stall/tool-tier-not-auto-retried", stallStalled.length === 1 && stallStalled[0].errorInfo === undefined, JSON.stringify(stallStalled.map((e) => e.errorInfo ?? null))],
   ["server-500/error-coded-internal-500", errors(server500.threadId).length > 0 && errors(server500.threadId).every((e) => e.errorInfo?.category === "internal" && e.errorInfo?.httpStatusCode === 500), JSON.stringify(errors(server500.threadId).map((e) => e.errorInfo ?? null))],
   ["server-500/turn-failed", completed(server500.threadId)[0]?.status === "failed", JSON.stringify(completed(server500.threadId).map((b) => b.status))],
   ["server-503/error-coded-internal-503", errors(server503.threadId).length > 0 && errors(server503.threadId).every((e) => e.errorInfo?.category === "internal" && e.errorInfo?.httpStatusCode === 503), JSON.stringify(errors(server503.threadId).map((e) => e.errorInfo ?? null))],
