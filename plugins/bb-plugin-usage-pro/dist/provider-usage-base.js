@@ -1,6 +1,11 @@
 import { createRequire as __createRequire } from "node:module";
 import { dirname as __pathDirname } from "node:path";
 import { fileURLToPath as __fileURLToPath } from "node:url";
+import {
+  codexAccountKey,
+  actualPlanLabel,
+  selectAccountResources
+} from "../usage-policy.js";
 const require = __createRequire(import.meta.url);
 var __filename = __fileURLToPath(import.meta.url);
 var __dirname = __pathDirname(__filename);
@@ -12923,7 +12928,8 @@ var usageProviderSchema = external_exports.strictObject({
   strings: external_exports.strictObject({ iconTint: external_exports.nullable(iconTintSchema) }),
   signInHint: nonemptyStringSchema,
   expiredHint: nonemptyStringSchema,
-  usage: external_exports.nullable(providerUsageSchema)
+  usage: external_exports.nullable(providerUsageSchema),
+  warning: external_exports.optional(external_exports.nullable(nonemptyStringSchema))
 });
 var usageMachineSchema = external_exports.strictObject({
   id: nonemptyStringSchema,
@@ -15231,7 +15237,7 @@ function normalizedUsage(usage) {
       };
   }
 }
-function normalizedProvider(provider, usage) {
+function normalizedProvider(provider, usage, warning = null) {
   return {
     id: provider.id,
     providerId: provider.id,
@@ -15242,31 +15248,50 @@ function normalizedProvider(provider, usage) {
     strings: { iconTint: normalizedTint(provider.strings?.iconTint) },
     signInHint: provider.strings?.signInHint ?? "Sign in to " + provider.displayName + ", then reload usage.",
     expiredHint: provider.strings?.expiredHint ?? "Your " + provider.displayName + " session expired. Sign in again, then reload usage.",
-    usage: normalizedUsage(usage)
+    usage: normalizedUsage(usage),
+    warning: warning ?? null
   };
 }
-function resourceProvider(resource, measurement, pluginId, providers) {
+function resourceProvider(resource, measurement, pluginId, providers, warning = null, sourceName = null) {
   const metadata = providers.find(
     (provider) => provider.id === resource.providerId
   );
-  return {
+  const prov = {
     ...normalizedProvider(
       metadata ?? {
         id: resource.providerId,
         displayName: resource.providerId,
         logoUrl: null
       },
-      measurement?.usage
+      measurement?.usage,
+      warning
     ),
     ...resource.scope.kind === "shared" ? {
-      signInHint: "Sign in to this account in the source plugin\u2019s settings, then reload usage.",
-      expiredHint: "This account\u2019s session expired. Sign in again in the source plugin\u2019s settings, then reload usage."
+      signInHint: "Sign in to this account in the source plugin's settings, then reload usage.",
+      expiredHint: "This account's session expired. Sign in again in the source plugin's settings, then reload usage."
     } : {},
     id: `${pluginId}:${resource.id}`,
-    accountLabel: resource.scope.kind === "shared" ? measurement?.usage.accountEmail ?? resource.label : null
+    accountLabel: resource.scope.kind === "shared" ? measurement?.usage?.accountEmail ?? resource.label : null,
+    warning: warning ?? null
+  };
+
+  if (prov.usage && prov.usage.status === "error" && sourceName) {
+    const rawMsg = prov.usage.message || "Usage could not be collected.";
+    if (!rawMsg.startsWith(sourceName)) {
+      prov.usage.message = `${sourceName}: ${rawMsg}`;
+    }
+  }
+
+  return prov;
+}
+
+function createProviderUsagePlugin(options = {}) {
+  return async (bb) => {
+    await providerUsagePlugin(bb, options);
   };
 }
-function providerUsagePlugin(bb) {
+
+function providerUsagePlugin(bb, options = {}) {
   if (bb.settings?.define) {
     bb.settings.define({
       hideClaudeModels: {
@@ -15278,103 +15303,374 @@ function providerUsagePlugin(bb) {
     });
   }
   const nodeProcess = require("node:process");
-  const getUserHome = () => "/home/ubuntu";
-
+  const getUserHome = () => {
+    if (typeof options.userHome === "function") return options.userHome();
+    if (typeof options.userHome === "string") return options.userHome;
+    return "/home/ubuntu";
+  };
+  const getNow = () => {
+    if (typeof options.now === "function") return options.now();
+    return Date.now();
+  };
   const getAgyPath = () => {
+    if (typeof options.agyPath === "function") return options.agyPath();
+    if (typeof options.agyPath === "string") return options.agyPath;
     const fs = require("node:fs");
     if (fs.existsSync("/home/ubuntu/.local/bin/agy")) return "/home/ubuntu/.local/bin/agy";
     return "agy";
   };
+  const customFetch = (url, init) => {
+    if (typeof options.fetch === "function") {
+      return options.fetch(url, init);
+    }
+    return globalThis.fetch(url, init);
+  };
+  const runExecFileSync = (file, args, opts) => {
+    if (typeof options.execFile === "function") {
+      return options.execFile(file, args, opts);
+    }
+    if (typeof options.runner === "function") {
+      return options.runner(file, args, opts);
+    }
+    const cp = require("node:child_process");
+    return cp.execFileSync(file, args, opts);
+  };
+  const runSpawn = (bin, args, opts) => {
+    if (typeof options.spawn === "function") {
+      return options.spawn(bin, args, opts);
+    }
+    if (typeof options.runner === "function") {
+      return options.runner(bin, args, opts);
+    }
+    const cp = require("node:child_process");
+    return cp.spawn(bin, args, opts);
+  };
 
-  const codexTeamCache = { loadedAt: 0, data: null };
-  let codexTeamInFlight = null;
+  let codexPiCache = {
+    accountId: null,
+    accountKey: null,
+    loadedAt: 0,
+    data: null,
+    observedAt: null,
+    warning: null
+  };
+  let codexPiInFlight = null;
+  let piFetchGen = 0;
 
-  const doFetchCodexTeam = async () => {
+  const readPiAuthEntry = () => {
     try {
       const fs = require("node:fs");
       const path = require("node:path");
-      const cp = require("node:child_process");
       const home = getUserHome();
       const piAuthPath = path.join(home, ".pi", "agent", "auth.json");
-      if (fs.existsSync(piAuthPath)) {
-        const authRaw = JSON.parse(fs.readFileSync(piAuthPath, "utf8"));
-        const entry = authRaw["openai-codex"];
-        if (entry && entry.access) {
-          let token = entry.access;
-          let accountId = entry.accountId;
-          if (entry.expires && Date.now() >= entry.expires - 60000) {
-            try {
-              token = cp.execFileSync("pi", ["auth", "print-bearer-token", "--provider", "openai-codex"], {
-                encoding: "utf8",
-                timeout: 10000,
-                env: { ...(nodeProcess.env || {}), PATH: "/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin" }
-              }).trim();
-              const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
-              accountId = claims["https://api.openai.com/auth"]?.chatgpt_account_id || accountId;
-            } catch {}
-          }
-          const piRes = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-            headers: {
-              "Authorization": "Bearer " + token,
-              "chatgpt-account-id": accountId,
-              "User-Agent": "codex_cli_rs",
-              "Accept": "application/json"
-            },
-            signal: AbortSignal.timeout(10000)
-          });
-          if (piRes.ok) {
-            const piData = await piRes.json();
-            const windows = [];
-            if (piData.rate_limit?.primary_window) {
-              windows.push({
-                label: "Current session",
-                usedPercent: piData.rate_limit.primary_window.used_percent ?? 0,
-                resetsAt: piData.rate_limit.primary_window.reset_at ? new Date(piData.rate_limit.primary_window.reset_at * 1000).toISOString() : null,
-                cost: null
-              });
-            }
-            if (piData.rate_limit?.secondary_window) {
-              windows.push({
-                label: "Weekly limit",
-                usedPercent: piData.rate_limit.secondary_window.used_percent ?? 0,
-                resetsAt: piData.rate_limit.secondary_window.reset_at ? new Date(piData.rate_limit.secondary_window.reset_at * 1000).toISOString() : null,
-                cost: null
-              });
-            }
-            const data = {
-              status: "ok",
-              accountEmail: piData.email || null,
-              planLabel: "Team",
-              windows
-            };
-            codexTeamCache.loadedAt = Date.now();
-            codexTeamCache.data = data;
-            return data;
-          }
-        }
-      }
-    } catch (e) {
-      console.error("[usage-pro] Codex Team fetch error:", e);
+      if (!fs.existsSync(piAuthPath)) return null;
+      const authRaw = JSON.parse(fs.readFileSync(piAuthPath, "utf8"));
+      return authRaw["openai-codex"] ?? null;
+    } catch {
+      return null;
     }
-    return codexTeamCache.data;
   };
 
-  const fetchCodexTeamUsage = async (force, maxAgeMs) => {
+  const handlePiTransportFailure = (accountId, canonicalKey) => {
+    if (codexPiCache.accountId === accountId && codexPiCache.data && codexPiCache.data.status === "ok") {
+      codexPiCache.warning = "Usage could not be refreshed. Showing last known data.";
+      codexPiCache.loadedAt = getNow();
+      return {
+        accountKey: canonicalKey,
+        usage: codexPiCache.data,
+        observedAt: codexPiCache.observedAt,
+        warning: codexPiCache.warning
+      };
+    }
+    const errData = {
+      status: "error",
+      message: "Usage could not be refreshed."
+    };
+    codexPiCache = {
+      accountId,
+      accountKey: canonicalKey,
+      loadedAt: getNow(),
+      data: errData,
+      observedAt: null,
+      warning: null
+    };
+    return {
+      accountKey: canonicalKey,
+      usage: errData,
+      observedAt: null,
+      warning: null
+    };
+  };
+
+  const doFetchCodexPi = async () => {
+    const entry = readPiAuthEntry();
+    if (!entry) {
+      return null;
+    }
+    const rawAccountId = typeof entry.accountId === "string" ? entry.accountId.trim() : "";
+    if (rawAccountId.length === 0 || !entry.access || typeof entry.access !== "string" || entry.access.trim() === "") {
+      return {
+        accountKey: null,
+        usage: { status: "unauthenticated" },
+        observedAt: null,
+        warning: null
+      };
+    }
+
+    let requestAccountId = rawAccountId;
+    let canonicalKey = codexAccountKey(requestAccountId);
+
+    if (codexPiCache.accountId !== null && codexPiCache.accountId !== requestAccountId) {
+      codexPiCache = {
+        accountId: requestAccountId,
+        accountKey: canonicalKey,
+        loadedAt: 0,
+        data: null,
+        observedAt: null,
+        warning: null
+      };
+    }
+
+    const thisFetchGen = ++piFetchGen;
+
+    let token = entry.access;
+    let claims = null;
+
+    if (entry.expires && getNow() >= entry.expires - 60000) {
+      try {
+        const refreshedToken = runExecFileSync("pi", ["auth", "print-bearer-token", "--provider", "openai-codex"], {
+          encoding: "utf8",
+          timeout: 10000,
+          env: { ...(nodeProcess.env || {}), PATH: "/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin" }
+        });
+        token = (typeof refreshedToken === "string" ? refreshedToken : refreshedToken.toString()).trim();
+        try {
+          const parts = token.split(".");
+          if (parts.length >= 2) {
+            claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+            const refreshedAccountId = claims["https://api.openai.com/auth"]?.chatgpt_account_id;
+            if (refreshedAccountId && typeof refreshedAccountId === "string" && refreshedAccountId.trim().length > 0) {
+              requestAccountId = refreshedAccountId.trim();
+              canonicalKey = codexAccountKey(requestAccountId);
+              if (codexPiCache.accountId !== null && codexPiCache.accountId !== requestAccountId) {
+                codexPiCache = {
+                  accountId: requestAccountId,
+                  accountKey: canonicalKey,
+                  loadedAt: 0,
+                  data: null,
+                  observedAt: null,
+                  warning: null
+                };
+              }
+            }
+          }
+        } catch {}
+      } catch {
+        const currentEntry = readPiAuthEntry();
+        const currentAccountId = typeof currentEntry?.accountId === "string" ? currentEntry.accountId.trim() : "";
+        if (currentAccountId !== rawAccountId || thisFetchGen !== piFetchGen) {
+          return null;
+        }
+        const expiredData = { status: "expired" };
+        codexPiCache = {
+          accountId: requestAccountId,
+          accountKey: canonicalKey,
+          loadedAt: getNow(),
+          data: expiredData,
+          observedAt: null,
+          warning: null
+        };
+        return {
+          accountKey: canonicalKey,
+          usage: expiredData,
+          observedAt: null,
+          warning: null
+        };
+      }
+    }
+
+    if (token && !claims) {
+      try {
+        const parts = token.split(".");
+        if (parts.length >= 2) {
+          claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+        }
+      } catch {}
+    }
+
+    const jwtAccountId = claims?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+
+    try {
+      const piRes = await customFetch("https://chatgpt.com/backend-api/wham/usage", {
+        headers: {
+          "Authorization": "Bearer " + token,
+          "chatgpt-account-id": requestAccountId,
+          "User-Agent": "codex_cli_rs",
+          "Accept": "application/json"
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+
+      const currentEntry = readPiAuthEntry();
+      const currentAccountId = typeof currentEntry?.accountId === "string" ? currentEntry.accountId.trim() : "";
+      if (currentAccountId !== rawAccountId || thisFetchGen !== piFetchGen) {
+        return null;
+      }
+
+      if (piRes.status === 401 || piRes.status === 403) {
+        const expiredData = { status: "expired" };
+        codexPiCache = {
+          accountId: requestAccountId,
+          accountKey: canonicalKey,
+          loadedAt: getNow(),
+          data: expiredData,
+          observedAt: null,
+          warning: null
+        };
+        return {
+          accountKey: canonicalKey,
+          usage: expiredData,
+          observedAt: null,
+          warning: null
+        };
+      }
+
+      if (!piRes.ok) {
+        return handlePiTransportFailure(requestAccountId, canonicalKey);
+      }
+
+      let piData;
+      try {
+        piData = await piRes.json();
+      } catch {
+        return handlePiTransportFailure(requestAccountId, canonicalKey);
+      }
+
+      const postEntry = readPiAuthEntry();
+      const postAccountId = typeof postEntry?.accountId === "string" ? postEntry.accountId.trim() : "";
+      if (postAccountId !== rawAccountId || thisFetchGen !== piFetchGen) {
+        return null;
+      }
+
+      const windows = [];
+      if (piData.rate_limit?.primary_window) {
+        windows.push({
+          label: "Five-hour limit",
+          usedPercent: piData.rate_limit.primary_window.used_percent ?? 0,
+          resetsAt: piData.rate_limit.primary_window.reset_at ? new Date(piData.rate_limit.primary_window.reset_at * 1000).toISOString() : null,
+          cost: null
+        });
+      }
+      if (piData.rate_limit?.secondary_window) {
+        windows.push({
+          label: "Weekly limit",
+          usedPercent: piData.rate_limit.secondary_window.used_percent ?? 0,
+          resetsAt: piData.rate_limit.secondary_window.reset_at ? new Date(piData.rate_limit.secondary_window.reset_at * 1000).toISOString() : null,
+          cost: null
+        });
+      }
+
+      const apiPlanType = piData.plan_type || piData.plan?.id || piData.rate_limit?.plan_type;
+      let jwtPlan = null;
+      if (claims && jwtAccountId === requestAccountId) {
+        jwtPlan = claims["https://api.openai.com/auth"]?.chatgpt_plan_type || claims.plan_type;
+      }
+      const planLabel = actualPlanLabel(apiPlanType ?? jwtPlan);
+
+      const successData = {
+        status: "ok",
+        accountEmail: piData.email || null,
+        planLabel,
+        windows
+      };
+      const nowMs = getNow();
+      codexPiCache = {
+        accountId: requestAccountId,
+        accountKey: canonicalKey,
+        loadedAt: nowMs,
+        data: successData,
+        observedAt: nowMs,
+        warning: null
+      };
+      return {
+        accountKey: canonicalKey,
+        usage: successData,
+        observedAt: nowMs,
+        warning: null
+      };
+    } catch {
+      const currentEntry = readPiAuthEntry();
+      const currentAccountId = typeof currentEntry?.accountId === "string" ? currentEntry.accountId.trim() : "";
+      if (currentAccountId !== rawAccountId || thisFetchGen !== piFetchGen) {
+        return null;
+      }
+      return handlePiTransportFailure(requestAccountId, canonicalKey);
+    }
+  };
+
+  const fetchCodexPiUsage = async (force, maxAgeMs) => {
+    const entry = readPiAuthEntry();
+    if (!entry) return null;
+    const rawAccountId = typeof entry.accountId === "string" ? entry.accountId.trim() : "";
+    if (rawAccountId.length === 0 || !entry.access) {
+      return {
+        accountKey: null,
+        usage: { status: "unauthenticated" },
+        observedAt: null,
+        warning: null
+      };
+    }
+    const canonicalKey = codexAccountKey(rawAccountId);
+
+    if (codexPiCache.accountId !== null && codexPiCache.accountId !== rawAccountId) {
+      codexPiCache = {
+        accountId: rawAccountId,
+        accountKey: canonicalKey,
+        loadedAt: 0,
+        data: null,
+        observedAt: null,
+        warning: null
+      };
+    }
+
     const ttl = Math.max(maxAgeMs || 0, 120000);
-    if (!force && codexTeamCache.data) {
-      if (Date.now() - codexTeamCache.loadedAt < ttl) {
-        return codexTeamCache.data;
-      }
-      if (!codexTeamInFlight) {
-        codexTeamInFlight = doFetchCodexTeam().finally(() => { codexTeamInFlight = null; });
-      }
-      return codexTeamInFlight;
+    if (!force && codexPiCache.data && (getNow() - codexPiCache.loadedAt < ttl)) {
+      return {
+        accountKey: codexPiCache.accountKey,
+        usage: codexPiCache.data,
+        observedAt: codexPiCache.observedAt,
+        warning: codexPiCache.warning
+      };
     }
-    if (codexTeamInFlight) {
-      return codexTeamInFlight;
+
+    if (codexPiInFlight) {
+      return codexPiInFlight;
     }
-    codexTeamInFlight = doFetchCodexTeam().finally(() => { codexTeamInFlight = null; });
-    return codexTeamInFlight;
+    codexPiInFlight = doFetchCodexPi().finally(() => { codexPiInFlight = null; });
+    return codexPiInFlight;
+  };
+
+  const getCachedCodexPi = () => {
+    const entry = readPiAuthEntry();
+    if (!entry) return null;
+    const rawAccountId = typeof entry.accountId === "string" ? entry.accountId.trim() : "";
+    if (rawAccountId.length === 0 || !entry.access) {
+      return {
+        accountKey: null,
+        usage: { status: "unauthenticated" },
+        observedAt: null,
+        warning: null
+      };
+    }
+    if (codexPiCache.accountId === rawAccountId && codexPiCache.data) {
+      return {
+        accountKey: codexPiCache.accountKey,
+        usage: codexPiCache.data,
+        observedAt: codexPiCache.observedAt,
+        warning: codexPiCache.warning
+      };
+    }
+    return null;
   };
 
   const agyAccountsCache = new Map();
@@ -15410,7 +15706,6 @@ function providerUsagePlugin(bb) {
       try {
         const fs = require("node:fs");
         const path = require("node:path");
-        const cp = require("node:child_process");
         const accDir = path.join(baseDir, label);
         let proxyUrl = null;
         let proxySummary = null;
@@ -15434,14 +15729,14 @@ function providerUsagePlugin(bb) {
             PATH: "/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
             ...(proxyUrl ? { HTTPS_PROXY: proxyUrl, HTTP_PROXY: proxyUrl } : {})
           };
-          const proc = cp.spawn(agyBin, ["--output-format", "json", "-p", "/usage"], {
+          const proc = runSpawn(agyBin, ["--output-format", "json", "-p", "/usage"], {
             env,
             timeout: 15000
           });
           let stdout = "";
           let stderr = "";
-          proc.stdout.on("data", d => stdout += d.toString());
-          proc.stderr.on("data", d => stderr += d.toString());
+          proc.stdout?.on("data", d => stdout += d.toString());
+          proc.stderr?.on("data", d => stderr += d.toString());
           proc.on("error", err => resolve({ ok: false, error: err.message }));
           proc.on("close", code => {
             if (code === 0) {
@@ -15486,7 +15781,7 @@ function providerUsagePlugin(bb) {
           };
           windows.sort((a, b) => (windowOrder[a.label] ?? 99) - (windowOrder[b.label] ?? 99));
           const item = {
-            loadedAt: Date.now(),
+            loadedAt: getNow(),
             usage: {
               status: "ok",
               accountEmail: label,
@@ -15498,9 +15793,9 @@ function providerUsagePlugin(bb) {
           return item;
         } else {
           const cdUntil = state.accounts?.[label]?.cooldownUntilMs || 0;
-          const isCooling = cdUntil > Date.now();
+          const isCooling = cdUntil > getNow();
           const item = {
-            loadedAt: Date.now(),
+            loadedAt: getNow(),
             usage: {
               status: "ok",
               accountEmail: label,
@@ -15554,7 +15849,7 @@ function providerUsagePlugin(bb) {
         const cached = agyAccountsCache.get(label);
         if (!cached) {
           missingLabels.push(label);
-        } else if (Date.now() - cached.loadedAt >= ttl) {
+        } else if (getNow() - cached.loadedAt >= ttl) {
           staleLabels.push(label);
         }
       }
@@ -15586,11 +15881,17 @@ function providerUsagePlugin(bb) {
     }
   };
 
-  const inventories = /* @__PURE__ */ new Map();
-  const measurements = /* @__PURE__ */ new Map();
-  const failures = /* @__PURE__ */ new Set();
-  const pending = /* @__PURE__ */ new Map();
+  const inventories = new Map();
+  const measurements = new Map();
+  const lastKnownAccountKey = new Map();
+  const resourceEpoch = new Map();
+  const pending = new Map();
   const keyOf = (pluginId, resourceId) => JSON.stringify([pluginId, resourceId]);
+
+  const bumpEpoch = (key) => {
+    resourceEpoch.set(key, (resourceEpoch.get(key) || 0) + 1);
+  };
+
   const fetchResource = async (pluginId, resourceId, force) => {
     const key = keyOf(pluginId, resourceId);
     const running = pending.get(key);
@@ -15599,6 +15900,20 @@ function providerUsagePlugin(bb) {
       await running.promise.catch(() => void 0);
       return fetchResource(pluginId, resourceId, force);
     }
+
+    const startEpoch = resourceEpoch.get(key) || 0;
+    const startKey = lastKnownAccountKey.get(key);
+
+    const isStillValid = () => {
+      const currentEpoch = resourceEpoch.get(key) || 0;
+      if (currentEpoch !== startEpoch) return false;
+      const currentKey = lastKnownAccountKey.get(key);
+      if (startKey !== undefined && currentKey !== startKey) return false;
+      const source = inventories.get(pluginId);
+      if (!source || !source.resources.some((r) => r.id === resourceId)) return false;
+      return true;
+    };
+
     const promise3 = bb.sdk.plugins.callRpc({
       pluginId,
       method: usageFetchMethod,
@@ -15606,16 +15921,61 @@ function providerUsagePlugin(bb) {
       outputSchema: usageSourceRpcContract[usageFetchMethod].output,
       signal: AbortSignal.timeout(45e3)
     }).then((raw) => {
+      if (!isStillValid()) {
+        return measurements.get(key)?.value ?? null;
+      }
+
       const value = normalizeUsageMeasurement(raw);
-      if (value.usage.status === "error")
-        throw new Error("Usage could not be refreshed.");
-      measurements.set(key, { value, loadedAt: Date.now() });
-      failures.delete(key);
+
+      if (value.accountKey !== null && value.accountKey !== undefined) {
+        if (lastKnownAccountKey.get(key) && lastKnownAccountKey.get(key) !== value.accountKey) {
+          measurements.delete(key);
+          bumpEpoch(key);
+        }
+        lastKnownAccountKey.set(key, value.accountKey);
+      } else {
+        if (value.usage.status === "ok") {
+          lastKnownAccountKey.delete(key);
+          value.accountKey = null;
+        } else {
+          value.accountKey = lastKnownAccountKey.get(key) ?? null;
+        }
+      }
+
+      if (raw.providerId === "codex" || value.usage.status === "ok") {
+        if (value.usage.planLabel) {
+          value.usage.planLabel = actualPlanLabel(value.usage.planLabel, value.usage.plan?.id);
+        }
+      }
+
+      measurements.set(key, { value, loadedAt: getNow(), warning: null });
       return value;
+    }).catch(() => {
+      if (!isStillValid()) {
+        return measurements.get(key)?.value ?? null;
+      }
+
+      const cached = measurements.get(key);
+      if (cached?.value?.usage?.status === "ok") {
+        cached.warning = "Usage could not be refreshed. Showing last known data.";
+        return cached.value;
+      }
+      const errVal = {
+        accountKey: lastKnownAccountKey.get(key) ?? null,
+        observedAt: null,
+        usage: {
+          status: "error",
+          message: "Usage could not be refreshed."
+        }
+      };
+      measurements.set(key, { value: errVal, loadedAt: getNow(), warning: null });
+      return errVal;
     }).finally(() => pending.delete(key));
+
     pending.set(key, { force, promise: promise3 });
     return promise3;
   };
+
   const readUsage = async (request) => {
     const hostId = request.machineIds?.find((id) => !id.startsWith("source:"));
     const [hosts, sources, providers, config2] = await Promise.all([
@@ -15626,12 +15986,18 @@ function providerUsagePlugin(bb) {
       ).catch(() => []),
       bb.sdk.system.config().catch(() => null)
     ]);
+
+    const primaryHostId = config2?.primaryHostId;
     hosts.sort(
-      (a, b) => Number(b.id === config2?.primaryHostId) - Number(a.id === config2?.primaryHostId)
+      (a, b) => Number(b.id === primaryHostId) - Number(a.id === primaryHostId)
     );
-    for (const id of inventories.keys())
-      if (!sources.some((source) => source.pluginId === id))
+
+    for (const id of inventories.keys()) {
+      if (!sources.some((source) => source.pluginId === id)) {
         inventories.delete(id);
+      }
+    }
+
     for (let offset = 0; offset < sources.length; offset += 3) {
       await Promise.all(
         sources.slice(offset, offset + 3).map(async (source) => {
@@ -15661,40 +16027,86 @@ function providerUsagePlugin(bb) {
         })
       );
     }
-    const keys = new Set(
+
+    const currentKeys = new Set(
       [...inventories.values()].flatMap(
         (source) => source.resources.map((resource) => keyOf(source.pluginId, resource.id))
       )
     );
-    for (const key of measurements.keys())
-      if (!keys.has(key)) {
-        measurements.delete(key);
-        failures.delete(key);
+
+    for (const key of lastKnownAccountKey.keys()) {
+      if (!currentKeys.has(key)) {
+        lastKnownAccountKey.delete(key);
+        bumpEpoch(key);
       }
+    }
+    for (const key of measurements.keys()) {
+      if (!currentKeys.has(key)) {
+        measurements.delete(key);
+        bumpEpoch(key);
+      }
+    }
+
+    for (const source of inventories.values()) {
+      for (const resource of source.resources) {
+        const key = keyOf(source.pluginId, resource.id);
+        if (resource.accountKey !== null && resource.accountKey !== undefined) {
+          const prevKey = lastKnownAccountKey.get(key);
+          if (prevKey && prevKey !== resource.accountKey) {
+            measurements.delete(key);
+            bumpEpoch(key);
+          }
+          lastKnownAccountKey.set(key, resource.accountKey);
+        }
+      }
+    }
+
     const selected = [...inventories.values()].flatMap(
       (source) => source.resources.filter((resource) => {
         if (resource.providerId.startsWith("acp-")) return false;
         const machineId = resource.scope.kind === "shared" ? (hosts[0]?.id ?? `source:${source.pluginId}`) : resource.scope.hostId;
-        return (request.providerId === null || resource.providerId === request.providerId) && (request.machineIds === null || request.machineIds.includes(machineId)) && (resource.scope.kind === "shared" || hosts.some(
-          (host) => resource.scope.kind === "host" && host.id === resource.scope.hostId && host.status === "connected"
-        ));
+        return (request.providerId === null || resource.providerId === request.providerId) &&
+               (request.machineIds === null || request.machineIds.includes(machineId)) &&
+               (resource.scope.kind === "shared" || hosts.some(
+                 (host) => resource.scope.kind === "host" && host.id === resource.scope.hostId && host.status === "connected"
+               ));
       }).map((resource) => ({ source, resource }))
     );
+
     for (let offset = 0; offset < selected.length; offset += 3) {
       await Promise.all(
         selected.slice(offset, offset + 3).map(async ({ source, resource }) => {
           const key = keyOf(source.pluginId, resource.id);
           const cached2 = measurements.get(key);
-          if (!request.force && cached2 && Date.now() - cached2.loadedAt < request.maxAgeMs)
+          if (!request.force && cached2 && (getNow() - cached2.loadedAt < request.maxAgeMs)) {
             return;
+          }
           try {
             await fetchResource(source.pluginId, resource.id, request.force);
           } catch {
-            failures.add(key);
+            // Handled inside fetchResource
           }
         })
       );
     }
+
+    const shouldFetchCodex = request.providerId === null || request.providerId === "codex";
+    const shouldFetchAgy = request.providerId === null || request.providerId === "agy";
+
+    let piResult = null;
+    if (shouldFetchCodex) {
+      piResult = await fetchCodexPiUsage(request.force, request.maxAgeMs);
+    } else {
+      piResult = getCachedCodexPi();
+    }
+
+    let agyAccounts = [];
+    if (shouldFetchAgy) {
+      agyAccounts = await fetchAgyAccountsUsage(request.force, request.maxAgeMs);
+    } else {
+      agyAccounts = getCachedAgyAccounts();
+    }
+
     const machines = hosts.map((host) => ({
       id: host.id,
       displayName: host.name,
@@ -15702,85 +16114,130 @@ function providerUsagePlugin(bb) {
       providers: [],
       error: null
     }));
-    const candidates = [];
+
     for (const source of inventories.values()) {
+      const sourceName = source.label ?? sources.find((item) => item.pluginId === source.pluginId)?.displayName ?? source.pluginId;
       const hasShared = source.label !== null || source.resources.some((resource) => resource.scope.kind === "shared");
-      if (hosts.length === 0 && (hasShared || source.error !== null && source.resources.length === 0))
+
+      if (source.error !== null && source.resources.length === 0) {
         machines.push({
           id: `source:${source.pluginId}`,
-          displayName: source.label ?? sources.find((item) => item.pluginId === source.pluginId)?.displayName ?? source.pluginId,
+          displayName: sourceName,
           status: "connected",
           providers: [],
-          error: source.error
+          error: `${sourceName}: ${source.error}`
         });
-      for (const resource of source.resources) {
-        const machineId = resource.scope.kind === "shared" ? (hosts[0]?.id ?? `source:${source.pluginId}`) : resource.scope.hostId;
-        candidates.push({ source, resource, machineId });
+      } else if (hosts.length === 0 && hasShared) {
+        machines.push({
+          id: `source:${source.pluginId}`,
+          displayName: sourceName,
+          status: "connected",
+          providers: [],
+          error: null
+        });
       }
     }
+
     for (const machine of machines) {
-      const visible = selectUsageResources(
-        candidates.filter((candidate) => candidate.machineId === machine.id),
-        ({ source, resource }) => ({
-          ...resource,
-          accountKey: measurements.has(keyOf(source.pluginId, resource.id)) ? measurements.get(keyOf(source.pluginId, resource.id)).value.accountKey : resource.accountKey
-        })
-      );
-      for (const { source, resource } of visible) {
-        const key = keyOf(source.pluginId, resource.id);
-        const cached2 = measurements.get(key);
-        machine.providers.push(
-          resourceProvider(resource, cached2?.value, source.pluginId, providers)
-        );
-        if (source.error !== null || failures.has(key))
-          machine.error = "Some usage could not be refreshed.";
+      const candidates = [];
+
+      for (const source of inventories.values()) {
+        const sourceName = source.label ?? sources.find((item) => item.pluginId === source.pluginId)?.displayName ?? source.pluginId;
+
+        for (const resource of source.resources) {
+          if (resource.providerId.startsWith("acp-")) continue;
+
+          const machineId = resource.scope.kind === "shared" ? (hosts[0]?.id ?? `source:${source.pluginId}`) : resource.scope.hostId;
+          if (machineId !== machine.id) continue;
+
+          const key = keyOf(source.pluginId, resource.id);
+          const cached = measurements.get(key);
+          const measurement = cached?.value ?? null;
+          let warning = cached?.warning ?? null;
+
+          if (source.error !== null) {
+            warning = `${sourceName}: ${source.error}`;
+          }
+
+          let effectiveKey = measurement?.accountKey ?? resource.accountKey ?? lastKnownAccountKey.get(key) ?? null;
+          if (measurement && measurement.usage.status === "ok" && measurement.accountKey === null) {
+            effectiveKey = null;
+          }
+
+          candidates.push({
+            kind: "native",
+            source,
+            sourceName,
+            resource,
+            machineId: machine.id,
+            providerId: resource.providerId,
+            accountKey: effectiveKey,
+            scopeKind: resource.scope.kind,
+            usageStatus: measurement?.usage?.status ?? null,
+            observedAt: measurement?.observedAt ?? null,
+            route: resource.providerId === "codex" ? "native" : "other",
+            measurement,
+            warning
+          });
+        }
+      }
+
+      if (machine.id === primaryHostId && piResult !== null) {
+        const codexMeta = providers.find((p) => p.id === "codex");
+        candidates.push({
+          kind: "pi",
+          machineId: machine.id,
+          providerId: "codex",
+          accountKey: piResult.accountKey,
+          scopeKind: "host",
+          usageStatus: piResult.usage?.status ?? null,
+          observedAt: piResult.observedAt ?? null,
+          route: "pi",
+          usage: piResult.usage,
+          warning: piResult.warning ?? null,
+          meta: codexMeta
+        });
+      }
+
+      const visible = selectAccountResources(candidates, (c) => ({
+        machineId: c.machineId,
+        providerId: c.providerId,
+        accountKey: c.accountKey,
+        scopeKind: c.scopeKind,
+        usageStatus: c.usageStatus,
+        observedAt: c.observedAt,
+        route: c.route
+      }));
+
+      for (const winner of visible) {
+        if (winner.kind === "native") {
+          const prov = resourceProvider(winner.resource, winner.measurement, winner.source.pluginId, providers, winner.warning, winner.sourceName);
+          if (winner.resource.providerId === "codex") {
+            if (prov.usage && prov.usage.status === "ok") {
+              prov.usage.planLabel = actualPlanLabel(prov.usage.planLabel);
+            }
+          }
+          machine.providers.push(prov);
+        } else if (winner.kind === "pi") {
+          machine.providers.push({
+            id: "codex:pi-team",
+            providerId: "codex",
+            displayName: winner.meta?.displayName ?? "Codex",
+            accountLabel: null,
+            logoUrl: winner.meta?.logoUrl ?? null,
+            icon: winner.meta?.icon ?? null,
+            strings: { iconTint: null },
+            signInHint: "Sign in with pi auth login --provider openai-codex",
+            expiredHint: "Team session expired. Run pi auth login --provider openai-codex",
+            usage: winner.usage ? normalizedUsage(winner.usage) : null,
+            warning: winner.warning ?? null
+          });
+        }
       }
 
       if (!machine.id.startsWith("source:")) {
-        // Relabel default Codex to Plus
-        for (const p of machine.providers) {
-          if (p.providerId === "codex" && !p.accountLabel) {
-            p.accountLabel = "Plus";
-          }
-        }
-
-        const shouldFetchCodex = request.providerId === null || request.providerId === "codex";
-        const shouldFetchAgy = request.providerId === null || request.providerId === "agy";
-
-        // Add Codex Team if available
-        try {
-          const codexMeta = providers.find((p) => p.id === "codex");
-          let teamUsage = codexTeamCache.data;
-          if (shouldFetchCodex) {
-            teamUsage = await fetchCodexTeamUsage(request.force, request.maxAgeMs);
-          }
-          if (teamUsage) {
-            machine.providers.push({
-              id: "codex:pi-team",
-              providerId: "codex",
-              displayName: codexMeta?.displayName ?? "Codex",
-              accountLabel: "Team",
-              logoUrl: codexMeta?.logoUrl ?? null,
-              icon: codexMeta?.icon ?? null,
-              strings: { iconTint: null },
-              signInHint: "Sign in with pi auth login --provider openai-codex",
-              expiredHint: "Team session expired. Run pi auth login --provider openai-codex",
-              usage: teamUsage
-            });
-          }
-        } catch (e) {
-          console.error("[usage-pro] Error adding Codex Team:", e);
-        }
-
-        // Add Antigravity (agy) accounts
         try {
           const agyMeta = providers.find((p) => p.id === "agy");
-          let agyAccounts = [];
-          if (shouldFetchAgy) {
-            agyAccounts = await fetchAgyAccountsUsage(request.force, request.maxAgeMs);
-          } else {
-            agyAccounts = getCachedAgyAccounts();
-          }
           for (const acc of agyAccounts) {
             machine.providers.push({
               id: "agy:" + acc.label,
@@ -15799,33 +16256,41 @@ function providerUsagePlugin(bb) {
           console.error("[usage-pro] Error adding agy accounts:", e);
         }
       }
+
       machine.providers = machine.providers.filter((p) => !p.providerId.startsWith("acp-"));
     }
+
     const providerOrder = new Map([
       ["codex", 0],
       ["claude-code", 1],
       ["agy", 2]
     ]);
-    for (const machine of machines)
+    for (const machine of machines) {
       machine.providers.sort(
         (a, b) => (providerOrder.get(a.providerId) ?? Number.MAX_SAFE_INTEGER) - (providerOrder.get(b.providerId) ?? Number.MAX_SAFE_INTEGER)
       );
+    }
     return { machines };
   };
+
   bb.rpc.register(providerUsageRpcContract, { getUsage: readUsage });
   const markDirty = () => {
     for (const value of measurements.values()) value.loadedAt = 0;
-    codexTeamCache.loadedAt = 0;
+    codexPiCache.loadedAt = 0;
     for (const v of agyAccountsCache.values()) v.loadedAt = 0;
   };
   bb.events.on("thread.idle", markDirty);
   bb.events.on("thread.failed", markDirty);
-  // Pre-warm caches in background so initial tab switches are instant
-  fetchCodexTeamUsage(false, 300000).catch(() => {});
-  fetchAgyAccountsUsage(false, 300000).catch(() => {});
+
+  if (options.prewarm !== false) {
+    fetchCodexPiUsage(false, 300000).catch(() => {});
+    fetchAgyAccountsUsage(false, 300000).catch(() => {});
+  }
 }
+
 export {
   providerUsagePlugin as default,
+  createProviderUsagePlugin,
   providerUsageRpcContract
 };
 // Existing usage collector artifact, preserved as the backend baseline.

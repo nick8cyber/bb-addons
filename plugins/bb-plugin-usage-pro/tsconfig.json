@@ -18,6 +18,10 @@
     "server.ts",
     "credit-retry.ts",
     "credit-retry.test.ts",
+    "usage-policy.ts",
+    "usage-policy.test.ts",
+    "collector-adapter.ts",
+    "usage-integration.test.ts",
     "dist/provider-usage-base.d.ts"
   ]
 }
