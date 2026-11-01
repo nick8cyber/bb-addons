@@ -22,14 +22,14 @@ const INLINE_CODE = /(`+)([^`\n]+?)\1/g;
 const BLOCKQUOTE = /^[ \t]{0,3}>[^\n]*$/gm;
 const URL = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"“”«»`]+/g;
 const PATH =
-  /(?:(?<![\w.-])(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\/|\\)[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*|\b[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+)(?::[0-9]+(?:-[0-9]+)?)?/g;
+  /(?<![\p{L}\p{N}\p{M}_.-])(?:(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\/|\\)[\p{L}\p{N}\p{M}_.-]+(?:[\\/][\p{L}\p{N}\p{M}_.-]+)*|[\p{L}\p{N}\p{M}_.-]+(?:[\\/][\p{L}\p{N}\p{M}_.-]+)+)(?::[0-9]+(?:-[0-9]+)?)?/gu;
 const FILE_WITH_LINE =
-  /\b[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}(?::[0-9]+(?:-[0-9]+)?)?\b/g;
-const BARE_LINE = /\b[A-Za-z0-9_.-]+:[0-9]+(?:-[0-9]+)?\b/g;
+  /(?<![\p{L}\p{N}\p{M}_.-])[\p{L}\p{N}\p{M}_.-]+\.[\p{L}\p{N}]{1,8}(?::[0-9]+(?:-[0-9]+)?)?(?![\p{L}\p{N}\p{M}_-])/gu;
+const BARE_LINE = /(?<![\p{L}\p{N}\p{M}_.-])[\p{L}\p{N}\p{M}_.-]+:[0-9]+(?:-[0-9]+)?(?!\d)/gu;
 const DOUBLE_QUOTED = /"(?:[^"\\\n]|\\.)*"/g;
 const CURLY_DOUBLE_QUOTED = /“[^”\n]*”/g;
 const GUILLEMET_QUOTED = /«[^»\n]*»/g;
-const NUMBERS = /\bv?\d+(?:[.,:/]\d+)*\b/g;
+const NUMBERS = /[+-]?v?\d+(?:[.,:/]\d+)*(?:[eE][+-]?\d+)?(?:%|[\p{L}]+)?/gu;
 
 const IDENTIFIERS =
   /\b[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+\b|\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b|\b[A-Za-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b|\b[A-Z][A-Z0-9]{1,}\b/g;
@@ -305,6 +305,18 @@ function parseTranslation(
     summary: restoreField(parsed.summary, "summary", records),
     details: restoreField(parsed.details, "details", records),
   };
+  for (const field of ["summary", "details"] as const) {
+    // Keeping each token is insufficient: adjacent text can extend a URL,
+    // path or numeric literal after restoration. Check whole literals too.
+    const expected = records.filter((record) => record.field === field)
+      .map((record) => record.original).sort();
+    const actual = findProtectedRanges(restored[field])
+      .map((range) => restored[field].slice(range.start, range.end)).sort();
+    if (expected.length !== actual.length ||
+        expected.some((literal, index) => literal !== actual[index])) {
+      return null;
+    }
+  }
   if (!hasSubstantiveText(restored.summary)) return null;
   if (
     hasSubstantiveText(original.details) &&
