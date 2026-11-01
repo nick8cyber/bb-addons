@@ -4,6 +4,10 @@
   "name": "bb-addons",
   "plugins": [
     {
+      "name": "usage-pro",
+      "source": "./plugins/bb-plugin-usage-pro"
+    },
+    {
       "name": "advisor",
       "source": "./plugins/bb-plugin-advisor"
     },
