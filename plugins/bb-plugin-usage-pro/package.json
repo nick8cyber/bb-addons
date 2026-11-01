@@ -1,46 +1,38 @@
 {
   "name": "bb-plugin-usage-pro",
   "version": "0.1.0",
+  "type": "module",
+  "private": true,
   "engines": {
-    "bb": ">=0.0",
-    "bbPluginSdk": ">=0.4.90"
+    "bb": ">=0.46.1",
+    "bbPluginSdk": ">=0.6.49"
   },
   "bb": {
     "name": "Provider usage (Pro)",
-    "description": "Multi-account provider usage: Codex (Personal + Team), Antigravity (all Google accounts), Claude Code",
+    "description": "Multi-account provider usage and bounded Codex workspace-limit retries",
     "branding": {
       "icon": "ChartColumn"
     },
-    "server": "./dist/server.js",
+    "server": "./server.ts",
     "app": "./app.js"
   },
-  "private": true,
-  "type": "module",
-  "description": "Multi-account provider usage: Codex (Personal + Team), Antigravity (all Google accounts), Claude Code",
-  "keywords": [
-    "bb-plugin"
-  ],
+  "description": "Multi-account provider usage and bounded Codex workspace-limit retries",
   "scripts": {
-    "test": "vitest run --config vitest.config.ts",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "prepare:bundled": "bb-plugin-build prepare-bundled",
     "build": "bb plugin build ."
   },
   "dependencies": {
-    "@bb/shared-ui": "workspace:*",
+    "@get-bb/plugin-sdk": "0.6.49",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@bb/plugin-build": "workspace:*",
-    "@get-bb/plugin-sdk": "workspace:*",
-    "@testing-library/react": "^16.3.2",
+    "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "jsdom": "^29.0.1",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "vitest": "^4.1.1"
+    "better-sqlite3": "^12.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9"
   }
 }
