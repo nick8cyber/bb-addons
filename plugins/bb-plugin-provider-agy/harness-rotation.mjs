@@ -402,6 +402,195 @@ check("location/native-401-without-url",
 stop("t-ineligible-location");
 process.env.AGY_FAKE_ERROR_MODE = "ineligible";
 
+// Compaction fallback: "/compact" dies to Google's 500, the bridge asks the
+// agent for its own summary on the same conversation, then seeds a fresh
+// conversation with it; a turn queued behind "/compact" runs after, there.
+{
+  const saved = { mode: process.env.AGY_FAKE_ERROR_MODE, label: process.env.FAKE_INELIGIBLE_LABEL };
+  delete process.env.FAKE_INELIGIBLE_LABEL;
+  process.env.AGY_FAKE_ERROR_MODE = "compact-fail";
+  process.env.AGY_FAKE_FRESH_IDS = "1";
+  const identities = (id) => messages.filter((m) => m.method === "thread/identity" && m.params.threadId === id).map((m) => m.params.providerThreadId);
+  const runFallback = async (id, summaryMode) => {
+    resetPool();
+    process.env.AGY_FAKE_SUMMARY_MODE = summaryMode;
+    await startThread(id);
+    await turn(id, "first successful turn", 1);
+    const so = spawns().length;
+    const po = userPrompts().length;
+    send({ jsonrpc: "2.0", id: nextId++, method: "turn/start", params: { threadId: id, providerThreadId: "fake-conv-rotation",
+      input: [{ type: "text", text: "/compact", mentions: [] }], clientRequestId: creq(), options } });
+    await turn(id, "queued user turn", 5);
+    return { prompts: userPrompts().slice(po), spawns: spawns().slice(so) };
+  };
+
+  const ok = await runFallback("t-cf-ok", "ok");
+  check("compact-fallback/sequence", statuses("t-cf-ok") === "completed,failed,completed,completed,completed", statuses("t-cf-ok"));
+  check("compact-fallback/prompts-in-order",
+    ok.prompts.length === 4 && ok.prompts[0] === "/compact" && ok.prompts[1].startsWith("[compaction-fallback]") &&
+    ok.prompts[2].startsWith("[compaction-handoff]") && ok.prompts[2].includes("SUMMARY-OF-WORK: goal G; done D; next N") &&
+    ok.prompts[3] === "queued user turn", JSON.stringify(ok.prompts.map((p) => p.slice(0, 40))));
+  check("compact-fallback/summary-on-same-then-fresh-conversation",
+    ok.spawns.length === 2 && ok.spawns[0].__argv.includes("--conversation") && !ok.spawns[1].__argv.includes("--conversation"),
+    JSON.stringify(ok.spawns.map((x) => x.__argv.includes("--conversation"))));
+  const ids = identities("t-cf-ok");
+  check("compact-fallback/thread-moves-to-new-conversation", ids.length >= 2 && ids.at(-1) !== ids[0], JSON.stringify(ids));
+  const rep = replacedFor("t-cf-ok");
+  check("compact-fallback/replaced-notices", rep.length === 2 && rep[0].params.contextLost === false && rep[1].params.contextLost === true &&
+    rep[1].params.reason.includes("agent's own summary"), JSON.stringify(rep.map((m) => m.params.contextLost)));
+  check("compact-fallback/no-auto-retry-tags", errorsFor("t-cf-ok").length > 0 && errorsFor("t-cf-ok").every((e) => e.errorInfo?.category !== "internal" && e.category !== "internal"),
+    JSON.stringify(errorsFor("t-cf-ok").map((e) => e.errorInfo ?? null)));
+  stop("t-cf-ok");
+
+  const failed = await runFallback("t-cf-fail", "fail");
+  check("compact-fallback/summary-fails-memo-seed", statuses("t-cf-fail") === "completed,failed,failed,completed,completed" &&
+    failed.prompts[2]?.startsWith("[compaction-handoff]") && failed.prompts[2].includes("could not summarize") &&
+    failed.prompts[2].includes("LAST ASSISTANT OUTPUT") && failed.prompts[3] === "queued user turn",
+    statuses("t-cf-fail") + " " + JSON.stringify(failed.prompts.map((p) => p.slice(0, 40))));
+  check("compact-fallback/memo-on-fresh-conversation", failed.spawns.length === 2 && !failed.spawns[1].__argv.includes("--conversation"));
+  check("compact-fallback/memo-tells-agent-to-read-thread-history",
+    failed.prompts[2]?.includes("timeout 60 bb thread messages t-cf-fail --limit 30") && failed.prompts[2].includes("Restore your context NOW") &&
+    failed.prompts[2].includes("$BB_CLI") && failed.prompts[2].includes("READ-ONLY") && failed.prompts[2].includes("not a to-do list") &&
+    failed.prompts[2].includes("never `--all`") && failed.prompts[2].split("--all").length === 2, (failed.prompts[2] ?? "").slice(0, 400));
+  check("compact-fallback/summary-seed-points-to-thread-history",
+    ok.prompts[2]?.includes("timeout 60 bb thread messages t-cf-ok --limit 30") && ok.prompts[2].includes("Do not call tools in this turn") &&
+    !ok.prompts[2].includes("Restore your context NOW"), (ok.prompts[2] ?? "").slice(0, 400));
+  stop("t-cf-fail");
+
+  const empty = await runFallback("t-cf-empty", "empty");
+  check("compact-fallback/empty-summary-memo-seed", statuses("t-cf-empty") === "completed,failed,completed,completed,completed" &&
+    empty.prompts[2]?.includes("could not summarize"), statuses("t-cf-empty"));
+  stop("t-cf-empty");
+
+  // A /compact refused for billing is not Google failing to compact.
+  process.env.AGY_FAKE_COMPACT_MODE = "billing";
+  resetPool();
+  await startThread("t-cf-billing");
+  await turn("t-cf-billing", "first successful turn", 1);
+  const billPrompts = userPrompts().length;
+  await turn("t-cf-billing", "/compact", 2);
+  await sleep(1500);
+  check("compact-fallback/billing-stays-failed", statuses("t-cf-billing") === "completed,failed" && userPrompts().length === billPrompts + 1,
+    statuses("t-cf-billing"));
+  stop("t-cf-billing");
+
+  // 503 "overloaded" on /compact: the fallback runs, bb's auto-retry tag is dropped.
+  process.env.AGY_FAKE_COMPACT_MODE = "overloaded";
+  await runFallback("t-cf-overloaded", "ok");
+  check("compact-fallback/overloaded-not-tagged-and-handled",
+    statuses("t-cf-overloaded") === "completed,failed,completed,completed,completed" &&
+    errorsFor("t-cf-overloaded").every((e) => e.errorInfo?.category !== "overloaded" && e.category !== "overloaded"),
+    statuses("t-cf-overloaded") + " " + JSON.stringify(errorsFor("t-cf-overloaded").map((e) => e.errorInfo ?? null)));
+  stop("t-cf-overloaded");
+  delete process.env.AGY_FAKE_COMPACT_MODE;
+
+  // Quota on the summary step (as a result, and as an exit before one): the
+  // account is parked and the memo seed opens a fresh conversation on a sibling.
+  const savedWait = process.env.AGY_AUTO_RETRY_MAX_WAIT_MS;
+  delete process.env.AGY_AUTO_RETRY_MAX_WAIT_MS;
+  for (const summaryMode of ["quota", "quota-exit"]) {
+    const id = `t-cf-${summaryMode}`;
+    const r = await runFallback(id, summaryMode);
+    check(`compact-fallback/${summaryMode}-on-summary-memo-on-sibling`,
+      statuses(id) === "completed,failed,failed,completed,completed" &&
+      r.prompts[2]?.startsWith("[compaction-handoff]") && r.prompts[2].includes("could not summarize") &&
+      r.prompts[3] === "queued user turn" &&
+      r.spawns.length === 2 && homeLabel(r.spawns[1].__env.HOME) !== homeLabel(r.spawns[0].__env.HOME) &&
+      !r.spawns[1].__argv.includes("--conversation") && readLedger().accounts[homeLabel(r.spawns[0].__env.HOME)].cooldownUntilMs > Date.now(),
+      statuses(id) + " " + JSON.stringify(r.prompts.map((p) => p.slice(0, 30))) + " " + JSON.stringify(r.spawns.map((x) => homeLabel(x.__env.HOME))));
+    stop(id);
+  }
+  process.env.AGY_AUTO_RETRY_MAX_WAIT_MS = savedWait;
+
+  // A seed that fails twice: the thread goes back to its old conversation,
+  // and the queued turn lands there — never in an empty one.
+  process.env.AGY_FAKE_SEED_MODE = "fail";
+  resetPool();
+  process.env.AGY_FAKE_SUMMARY_MODE = "ok";
+  await startThread("t-cf-restore");
+  await turn("t-cf-restore", "first successful turn", 1);
+  const oldConv = identities("t-cf-restore")[0];
+  const rso = spawns().length;
+  send({ jsonrpc: "2.0", id: nextId++, method: "turn/start", params: { threadId: "t-cf-restore", providerThreadId: "fake-conv-rotation",
+    input: [{ type: "text", text: "/compact", mentions: [] }], clientRequestId: creq(), options } });
+  await turn("t-cf-restore", "queued user turn", 6);
+  const rs = spawns().slice(rso);
+  check("compact-fallback/seed-fails-twice-back-to-old-conversation",
+    statuses("t-cf-restore") === "completed,failed,completed,failed,failed,completed" &&
+    rs.length === 4 && rs[3].__argv.includes("--conversation") && rs[3].__argv[rs[3].__argv.indexOf("--conversation") + 1] === oldConv &&
+    identities("t-cf-restore").at(-1) === oldConv && userPrompts().at(-1) === "queued user turn",
+    statuses("t-cf-restore") + " " + JSON.stringify(rs.map((x) => x.__argv.includes("--conversation"))));
+  check("compact-fallback/restore-notice", replacedFor("t-cf-restore").at(-1)?.params.reason.includes("goes back to its previous") === true &&
+    replacedFor("t-cf-restore").at(-1)?.params.contextLost === false);
+  stop("t-cf-restore");
+  delete process.env.AGY_FAKE_SEED_MODE;
+
+  // Quota on the seed BEFORE its init, no free sibling: the same-account retry
+  // must still open a FRESH conversation, never resume the old one.
+  {
+    resetPool();
+    process.env.AGY_FAKE_SUMMARY_MODE = "ok";
+    const savedMax = process.env.AGY_AUTO_RETRY_MAX;
+    const savedWait = process.env.AGY_AUTO_RETRY_MAX_WAIT_MS;
+    process.env.AGY_AUTO_RETRY_MAX = "1";
+    delete process.env.AGY_AUTO_RETRY_MAX_WAIT_MS;
+    await startThread("t-cf-seedquota");
+    await turn("t-cf-seedquota", "first successful turn", 1);
+    const oldConv = identities("t-cf-seedquota")[0];
+    const pinned = homeLabel(spawns().at(-1).__env.HOME);
+    const ledger = readLedger();
+    for (const label of ["a1", "a2", "a3"]) {
+      if (label !== pinned) ledger.accounts[label] = { cooldownUntilMs: Date.now() + 3_600_000, lastUsedMs: 0, lastError: null };
+    }
+    writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+    const arm = join(root, "preinit-arm");
+    writeFileSync(arm, "x");
+    process.env.AGY_FAKE_PREINIT_ARM = arm;
+    const so = spawns().length;
+    send({ jsonrpc: "2.0", id: nextId++, method: "turn/start", params: { threadId: "t-cf-seedquota", providerThreadId: "fake-conv-rotation",
+      input: [{ type: "text", text: "/compact", mentions: [] }], clientRequestId: creq(), options } });
+    await turn("t-cf-seedquota", "queued user turn", 6);
+    const sq = spawns().slice(so);
+    check("compact-fallback/seed-quota-before-init-still-fresh",
+      statuses("t-cf-seedquota") === "completed,failed,completed,failed,completed,completed" &&
+      sq.length === 3 && sq.slice(1).every((x) => !x.__argv.includes("--conversation")) &&
+      identities("t-cf-seedquota").at(-1) !== oldConv && userPrompts().at(-1) === "queued user turn",
+      statuses("t-cf-seedquota") + " " + JSON.stringify(sq.map((x) => x.__argv.includes("--conversation"))) + " " + JSON.stringify(identities("t-cf-seedquota")));
+    stop("t-cf-seedquota");
+    delete process.env.AGY_FAKE_PREINIT_ARM;
+    process.env.AGY_AUTO_RETRY_MAX = savedMax;
+    process.env.AGY_AUTO_RETRY_MAX_WAIT_MS = savedWait;
+  }
+
+  // thread/stop inside the 1 s window: nothing more is spawned.
+  resetPool();
+  await startThread("t-cf-stop");
+  await turn("t-cf-stop", "first successful turn", 1);
+  await turn("t-cf-stop", "/compact", 2);
+  const stopSpawns = spawns().length;
+  stop("t-cf-stop");
+  await sleep(1800);
+  check("compact-fallback/stop-in-window-cancels", spawns().length === stopSpawns && statuses("t-cf-stop") === "completed,failed",
+    `${spawns().length - stopSpawns} extra spawns; ${statuses("t-cf-stop")}`);
+
+  // AGY_COMPACT_FALLBACK=0: the failed compaction just stays failed.
+  resetPool();
+  process.env.AGY_COMPACT_FALLBACK = "0";
+  await startThread("t-cf-off");
+  await turn("t-cf-off", "first successful turn", 1);
+  const offPrompts = userPrompts().length;
+  await turn("t-cf-off", "/compact", 2);
+  await sleep(1500);
+  check("compact-fallback/disabled-keeps-old-behaviour", statuses("t-cf-off") === "completed,failed" && userPrompts().length === offPrompts + 1,
+    statuses("t-cf-off"));
+  stop("t-cf-off");
+  delete process.env.AGY_COMPACT_FALLBACK;
+  delete process.env.AGY_FAKE_SUMMARY_MODE;
+  delete process.env.AGY_FAKE_FRESH_IDS;
+  process.env.AGY_FAKE_ERROR_MODE = saved.mode;
+  process.env.FAKE_INELIGIBLE_LABEL = saved.label;
+}
+
 // A "/compact" that hits the refusal is re-run verbatim on the sibling —
 // never wrapped in a work handoff ("continue the work" for the agent).
 resetPool();

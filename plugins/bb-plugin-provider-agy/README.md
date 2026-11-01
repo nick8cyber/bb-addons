@@ -599,9 +599,58 @@ bb thread output <thread>
   compaction — including when it is the turn that respawns an idle-released
   child and dies before `init`. When an account rotation re-runs it, it is
   re-sent as `/compact`, never wrapped in a work handoff.
+
 - **Reasoning levels** are folded into agy's `low|medium|high`, and because
   every model id already names one, the picker's level is effectively ignored
   when a model is selected.
+
+## When agy cannot compact: the compaction fallback
+
+Google sometimes refuses the compaction request for one large conversation
+(500/503) night after night, until the thread happens to move to another
+conversation. The bridge then compacts by hand:
+
+1. `/compact` fails (an ERROR result, agy exiting without a result, or a
+   stall kill). The turn shows the failure. A `/compact` refused for billing
+   or auth is not this case and just stays failed; quota and eligibility
+   refusals ride the ordinary account rotation.
+2. **Summary.** A second later the bridge restarts agy on the SAME
+   conversation (`session/replaced`, context kept) and sends one turn,
+   `[compaction-fallback] …`, asking the agent to write its own summary —
+   goal, standing instructions and their files, what is done (paths,
+   branches, commits, PR numbers), decisions, next steps — without tools.
+   Ordinary turns on that conversation still work; only compaction fails.
+3. **Seed.** It then opens a FRESH conversation (`session/replaced`,
+   `contextLost: true`) whose first turn is `[compaction-handoff] …` + that
+   summary; the agent replies "OK". Turns queued meanwhile run after it, on
+   the new conversation.
+4. If the summary turn fails or is empty — or hits quota and has to move to
+   another account, where there is nothing to summarize — the seed carries
+   the bridge's memo instead (the last streamed assistant text and
+   `git diff --stat`) and tells the agent to restore its context in that
+   same turn by reading this bb thread's own history (`timeout 60 bb thread
+   messages <thread> --limit 30`, newest first, at most `--limit 100`, never
+   `--all` — megabytes on a long thread would refill the fresh conversation),
+   then its instruction files. That turn is read-only: no git, ssh, deploys,
+   network actions, file changes or messages to other threads, and the
+   history is reference, not a to-do list. The thread id is written into the
+   prompt; `bb` is on the bridge's PATH (and the thread's env normally
+   carries `BB_CLI`). The summary seed asks for "OK" only and names the same
+   command for later, when a detail the summary left out is needed.
+5. A seed that fails is tried once more on a fresh conversation (a quota
+   retry of a seed, even on the same account, always opens a fresh one); if
+   that fails too, the thread goes BACK to its previous, uncompacted
+   conversation on the account that owns it, so queued turns never land in
+   an empty one. If that owner is itself still in quota cooldown, the first
+   queued turn rides the ordinary account rotation from there (a fresh
+   conversation with the usual work handoff) — never an empty one, but not
+   the full old history either.
+
+No step is tagged for bb's provider-retry (`internal`, `overloaded`,
+`stream-disconnected` are dropped while a compaction step is in flight), and
+an account rotation re-sends each step verbatim with its mark.
+`AGY_COMPACT_FALLBACK=0` turns it off (the failed compaction just stays
+failed, as before).
 
 ## `write_to_file` and `ArtifactMetadata` (agy 1.1.19)
 
