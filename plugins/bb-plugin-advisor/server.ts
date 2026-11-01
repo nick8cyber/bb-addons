@@ -2041,6 +2041,7 @@ export default async function plugin(bb: BbPluginApi) {
       text: withTranslationFailureNotice(review),
     });
     if (signal?.aborted) return keep("cancelled");
+    let expired = false;
     const stopReviewer = (): void => {
       void bb.sdk.threads
         .stop({ threadId: advisorThreadId })
@@ -2056,6 +2057,7 @@ export default async function plugin(bb: BbPluginApi) {
       fireDeadline = (outcome) => reject(new TranslationDeadline(outcome));
     });
     const onAbort = (): void => {
+      expired = true;
       stopReviewer();
       fireDeadline("cancelled");
     };
@@ -2063,9 +2065,18 @@ export default async function plugin(bb: BbPluginApi) {
     // The window is bounded on its own: even a reviewer that never goes idle is
     // stopped here, so a stuck translation cannot outlive the deadline.
     const timeout = setTimeout(() => {
+      expired = true;
       stopReviewer();
       fireDeadline("failed");
     }, TRANSLATION_TIMEOUT_MS);
+    const ensureCurrent = (): void => {
+      if (expired || signal?.aborted) {
+        // A late send may have started the remote turn after the first stop.
+        // Stop again and never advance to the next SDK stage.
+        stopReviewer();
+        throw new TranslationDeadline(signal?.aborted ? "cancelled" : "failed");
+      }
+    };
     // A single stage carries the whole exchange, so the deadline applies to
     // send, wait, and output alike rather than to each in isolation.
     const stage = (async (): Promise<ReviewText | null> => {
@@ -2074,12 +2085,14 @@ export default async function plugin(bb: BbPluginApi) {
         mode: "start",
         input: [{ type: "text", text: prepared.prompt, mentions: [] }],
       });
+      ensureCurrent();
       const waited: unknown = await bb.sdk.threads.wait({
         threadId: advisorThreadId,
         status: "idle",
         timeoutMs: TRANSLATION_TIMEOUT_MS,
         ...(signal ? { signal } : {}),
       });
+      ensureCurrent();
       // When the host reports the wait expired instead of reaching idle, there
       // is nothing to read: an output fetch here would decode a stale review.
       if (
@@ -2093,6 +2106,7 @@ export default async function plugin(bb: BbPluginApi) {
       const { output } = await bb.sdk.threads.output({
         threadId: advisorThreadId,
       });
+      ensureCurrent();
       return output === null ? null : prepared.parse(output);
     })();
     // If the deadline already settled the outcome, a late stage rejection must
@@ -2107,10 +2121,20 @@ export default async function plugin(bb: BbPluginApi) {
         ),
         deadline,
       ]);
+      if (signal?.aborted) {
+        expired = true;
+        stopReviewer();
+        return keep("cancelled");
+      }
+      if (won.status !== "translated") {
+        expired = true;
+        stopReviewer();
+      }
       return won;
     } catch (error) {
       // Both a stage failure and a fired deadline end the pass here: the
       // reviewer thread is stopped either way, and the outcome states which.
+      expired = true;
       stopReviewer();
       return keep(
         error instanceof TranslationDeadline
