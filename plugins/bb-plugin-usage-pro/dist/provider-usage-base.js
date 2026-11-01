@@ -15539,17 +15539,26 @@ function providerUsagePlugin(bb, options = {}) {
         return handlePiTransportFailure(requestAccountId, canonicalKey);
       }
 
-      let piData;
-      try {
-        piData = await piRes.json();
-      } catch {
-        return handlePiTransportFailure(requestAccountId, canonicalKey);
-      }
+      // The outer catch checks the current auth scope even when JSON parsing rejects.
+      const piData = await piRes.json();
 
       const postEntry = readPiAuthEntry();
       const postAccountId = typeof postEntry?.accountId === "string" ? postEntry.accountId.trim() : "";
       if (postAccountId !== rawAccountId || thisFetchGen !== piFetchGen) {
         return null;
+      }
+
+      if (!piData || typeof piData !== "object" || Array.isArray(piData) ||
+          !piData.rate_limit || typeof piData.rate_limit !== "object" || Array.isArray(piData.rate_limit)) {
+        throw new Error("Malformed usage response.");
+      }
+      for (const window of [piData.rate_limit.primary_window, piData.rate_limit.secondary_window]) {
+        if (window == null) continue;
+        if (typeof window !== "object" || Array.isArray(window) ||
+            typeof window.used_percent !== "number" || !Number.isFinite(window.used_percent) || window.used_percent < 0 ||
+            (window.reset_at != null && (typeof window.reset_at !== "number" || !Number.isFinite(window.reset_at) || window.reset_at < 0))) {
+          throw new Error("Malformed usage window.");
+        }
       }
 
       const windows = [];
@@ -15886,6 +15895,8 @@ function providerUsagePlugin(bb, options = {}) {
   const lastKnownAccountKey = new Map();
   const resourceEpoch = new Map();
   const pending = new Map();
+  let previousResourceKeys = new Set();
+  const inventoryEpoch = new Map();
   const keyOf = (pluginId, resourceId) => JSON.stringify([pluginId, resourceId]);
 
   const bumpEpoch = (key) => {
@@ -15895,7 +15906,7 @@ function providerUsagePlugin(bb, options = {}) {
   const fetchResource = async (pluginId, resourceId, force) => {
     const key = keyOf(pluginId, resourceId);
     const running = pending.get(key);
-    if (running) {
+    if (running && running.epoch === (resourceEpoch.get(key) || 0)) {
       if (!force || running.force) return running.promise;
       await running.promise.catch(() => void 0);
       return fetchResource(pluginId, resourceId, force);
@@ -15926,6 +15937,10 @@ function providerUsagePlugin(bb, options = {}) {
       }
 
       const value = normalizeUsageMeasurement(raw);
+      const resource = inventories.get(pluginId)?.resources.find((item) => item.id === resourceId);
+      if (resource?.accountKey && value.accountKey && resource.accountKey !== value.accountKey) {
+        throw new Error("Usage belongs to a previous account scope.");
+      }
 
       if (value.accountKey !== null && value.accountKey !== undefined) {
         if (lastKnownAccountKey.get(key) && lastKnownAccountKey.get(key) !== value.accountKey) {
@@ -15942,10 +15957,8 @@ function providerUsagePlugin(bb, options = {}) {
         }
       }
 
-      if (raw.providerId === "codex" || value.usage.status === "ok") {
-        if (value.usage.planLabel) {
-          value.usage.planLabel = actualPlanLabel(value.usage.planLabel, value.usage.plan?.id);
-        }
+      if (resource?.providerId === "codex" && value.usage.status === "ok") {
+        value.usage.planLabel = actualPlanLabel(value.usage.plan?.id, value.usage.planLabel);
       }
 
       measurements.set(key, { value, loadedAt: getNow(), warning: null });
@@ -15970,9 +15983,11 @@ function providerUsagePlugin(bb, options = {}) {
       };
       measurements.set(key, { value: errVal, loadedAt: getNow(), warning: null });
       return errVal;
-    }).finally(() => pending.delete(key));
+    }).finally(() => {
+      if (pending.get(key)?.promise === promise3) pending.delete(key);
+    });
 
-    pending.set(key, { force, promise: promise3 });
+    pending.set(key, { force, promise: promise3, epoch: startEpoch });
     return promise3;
   };
 
@@ -15992,15 +16007,18 @@ function providerUsagePlugin(bb, options = {}) {
       (a, b) => Number(b.id === primaryHostId) - Number(a.id === primaryHostId)
     );
 
-    for (const id of inventories.keys()) {
+    for (const id of new Set([...inventories.keys(), ...inventoryEpoch.keys()])) {
       if (!sources.some((source) => source.pluginId === id)) {
         inventories.delete(id);
+        inventoryEpoch.set(id, (inventoryEpoch.get(id) || 0) + 1);
       }
     }
 
     for (let offset = 0; offset < sources.length; offset += 3) {
       await Promise.all(
         sources.slice(offset, offset + 3).map(async (source) => {
+          const epoch = (inventoryEpoch.get(source.pluginId) || 0) + 1;
+          inventoryEpoch.set(source.pluginId, epoch);
           try {
             const inventory = await bb.sdk.plugins.callRpc({
               pluginId: source.pluginId,
@@ -16009,6 +16027,7 @@ function providerUsagePlugin(bb, options = {}) {
               outputSchema: usageSourceRpcContract[usageListMethod].output,
               signal: AbortSignal.timeout(45e3)
             });
+            if (inventoryEpoch.get(source.pluginId) !== epoch) return;
             inventories.set(source.pluginId, {
               pluginId: source.pluginId,
               label: inventory.label ?? null,
@@ -16016,6 +16035,7 @@ function providerUsagePlugin(bb, options = {}) {
               error: null
             });
           } catch {
+            if (inventoryEpoch.get(source.pluginId) !== epoch) return;
             const previous = inventories.get(source.pluginId);
             inventories.set(source.pluginId, {
               pluginId: source.pluginId,
@@ -16033,6 +16053,15 @@ function providerUsagePlugin(bb, options = {}) {
         (source) => source.resources.map((resource) => keyOf(source.pluginId, resource.id))
       )
     );
+
+    // Track membership even before a resource has an identity or measurement.
+    for (const key of previousResourceKeys) {
+      if (!currentKeys.has(key)) bumpEpoch(key);
+    }
+    for (const key of currentKeys) {
+      if (!previousResourceKeys.has(key)) bumpEpoch(key);
+    }
+    previousResourceKeys = currentKeys;
 
     for (const key of lastKnownAccountKey.keys()) {
       if (!currentKeys.has(key)) {
@@ -16052,7 +16081,7 @@ function providerUsagePlugin(bb, options = {}) {
         const key = keyOf(source.pluginId, resource.id);
         if (resource.accountKey !== null && resource.accountKey !== undefined) {
           const prevKey = lastKnownAccountKey.get(key);
-          if (prevKey && prevKey !== resource.accountKey) {
+          if (prevKey !== resource.accountKey) {
             measurements.delete(key);
             bumpEpoch(key);
           }
@@ -16228,7 +16257,7 @@ function providerUsagePlugin(bb, options = {}) {
             icon: winner.meta?.icon ?? null,
             strings: { iconTint: null },
             signInHint: "Sign in with pi auth login --provider openai-codex",
-            expiredHint: "Team session expired. Run pi auth login --provider openai-codex",
+            expiredHint: "Codex session expired. Sign in again with Pi, then reload usage.",
             usage: winner.usage ? normalizedUsage(winner.usage) : null,
             warning: winner.warning ?? null
           });

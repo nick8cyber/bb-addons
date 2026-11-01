@@ -15,6 +15,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
   let tmpUserHome: string;
   let currentTime: number;
   let originalGlobalFetch: typeof globalThis.fetch;
+  const fakeHosts: ReturnType<typeof createFakePluginHost>[] = [];
 
   beforeEach(() => {
     tmpUserHome = fs.mkdtempSync(path.join(os.tmpdir(), "usage-int-"));
@@ -26,7 +27,8 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     }) as any;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const host of fakeHosts.splice(0)) await host.harness.lifecycle.dispose();
     globalThis.fetch = originalGlobalFetch;
     try {
       fs.rmSync(tmpUserHome, { recursive: true, force: true });
@@ -152,6 +154,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     });
 
     const fakeHost = createFakePluginHost({ pluginId: "usage-pro" });
+    fakeHosts.push(fakeHost);
 
     fakeHost.harness.sdk.stub("hosts.list", async () => {
       return hostsList.map((h) =>
@@ -175,7 +178,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
 
     fakeHost.harness.sdk.stub("system.config", async () => ({ primaryHostId }));
 
-    fakeHost.harness.sdk.stub("plugins.callRpc", async ({ pluginId, method, input }: any) => {
+    fakeHost.harness.sdk.stub("plugins.callRpc", async ({ pluginId, method, input, outputSchema }: any) => {
       if (method === usageListMethod) {
         const inv = inventoryMap.get(pluginId);
         if (!inv) {
@@ -184,10 +187,15 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
         if (inv.error) {
           throw new Error(inv.error);
         }
-        return {
+        return outputSchema.parse({
           label: inv.label,
-          resources: inv.resources,
-        };
+          resources: inv.resources.map((resource: any) => ({
+            ...resource, label: resource.label ?? resource.id,
+            scope: resource.scope.kind === "host"
+              ? { ...resource.scope, hostName: resource.scope.hostName ?? resource.scope.hostId }
+              : resource.scope,
+          })),
+        });
       }
       if (method === usageFetchMethod) {
         const key = `${pluginId}:${input.resourceId}`;
@@ -195,10 +203,18 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
         if (m === undefined) {
           throw new Error(`No measurement configured for ${key}`);
         }
-        if (typeof m === "function") {
-          return m();
-        }
-        return m;
+        const raw = typeof m === "function" ? await m() : m;
+        // Complete deterministic source fixtures, then enforce the real cross-plugin contract.
+        return outputSchema.parse({
+          ...raw, accountKey: raw.accountKey ?? null, observedAt: raw.observedAt ?? null,
+          usage: {
+            accountEmail: null, planLabel: null, plan: null, ...raw.usage,
+            ...(raw.usage.status === "error" ? { message: raw.usage.message ?? "Fixture source failure" } : {}),
+            ...(raw.usage.status === "ok" ? { windows: raw.usage.windows.map((window: any, index: number) => ({
+              id: "fixture-window-" + index, kind: "custom", model: null, resetsAt: null, cost: null, ...window,
+            })) } : {}),
+          },
+        });
       }
       throw new Error(`Unhandled RPC method: ${method}`);
     });
@@ -952,59 +968,6 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(card.usage.planLabel).toBe("Team");
   });
 
-  // Coordinator Feedback 4: Race fixtures - concurrent rotation & in-flight invalidation
-  it("Coordinator 4: Concurrent scope rotation invalidates in-flight old identity for native and Pi", async () => {
-    let resolveDelayedNative: any;
-    const delayedNativePromise = new Promise((resolve) => {
-      resolveDelayedNative = resolve;
-    });
-
-    let currentNativeKey = "openai:chatgpt:initial-key";
-
-    const h = setupHarness({
-      hosts: [{ id: "host-primary", name: "Host", status: "connected" }],
-      primaryHostId: "host-primary",
-      sources: [{ pluginId: "source-native", displayName: "Native" }],
-      inventories: {
-        "source-native": {
-          resources: [
-            {
-              id: "res-race",
-              label: "Race Resource",
-              providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
-              accountKey: currentNativeKey,
-            },
-          ],
-        },
-      },
-      measurements: {
-        "source-native:res-race": async () => {
-          await delayedNativePromise;
-          return {
-            accountKey: "openai:chatgpt:initial-key",
-            observedAt: currentTime,
-            usage: { status: "ok", windows: [{ label: "Five-hour limit", usedPercent: 1 }] },
-          };
-        },
-      },
-    });
-
-    await providerUsagePlugin(h.bb, h.collectorOpts);
-
-    const inFlightRead = h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: null, maxAgeMs: 0 });
-
-    currentNativeKey = "openai:chatgpt:rotated-new-key";
-    h.inventoryMap.get("source-native")!.resources[0].accountKey = currentNativeKey;
-
-    resolveDelayedNative();
-    await inFlightRead;
-
-    const snapAfter = await h.registeredRpc.getUsage({ force: false, machineIds: null, providerId: null, maxAgeMs: 60000 });
-    const card = snapAfter.machines[0].providers[0];
-    expect(card).toBeDefined();
-  });
-
   // Coordinator Feedback 5: Inventory source errors and valid account error formatting
   it("Coordinator 5: Inventory source.error does not infect other hosts; signed with source name", async () => {
     const h = setupHarness({
@@ -1113,76 +1076,6 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(card.usage.status).toBe("error");
     expect(card.usage.message).toBe("Account Pooler: Account disabled");
     expect(snap.machines[0].error).toBeNull();
-  });
-
-  // Native non-ok/null key inherits last known; success/null clears history; removal clears history
-  it("Contract: Native non-ok/null key inherits last known; success/null clears history; removal clears history", async () => {
-    let currentAccountKey: string | null = "openai:chatgpt:inherited-acc";
-    let currentStatus = "ok";
-
-    const h = setupHarness({
-      hosts: [{ id: "host-primary", name: "Host", status: "connected" }],
-      primaryHostId: "host-primary",
-      sources: [{ pluginId: "source-native", displayName: "Native" }],
-      inventories: {
-        "source-native": {
-          resources: [
-            {
-              id: "res-native-heritage",
-              label: "Heritage Resource",
-              providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
-              accountKey: currentAccountKey,
-            },
-          ],
-        },
-      },
-      measurements: {
-        "source-native:res-native-heritage": () => ({
-          accountKey: currentAccountKey,
-          observedAt: currentTime,
-          usage: {
-            status: currentStatus,
-            planLabel: "Team",
-            windows: [],
-          },
-        }),
-      },
-    });
-
-    await providerUsagePlugin(h.bb, h.collectorOpts);
-
-    await h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: null, maxAgeMs: 0 });
-
-    currentAccountKey = null;
-    currentStatus = "error";
-    h.inventoryMap.get("source-native")!.resources[0].accountKey = null;
-
-    const snapError = await h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: null, maxAgeMs: 0 });
-    const cardError = snapError.machines[0].providers[0];
-    expect(cardError.usage.status).toBe("error");
-
-    currentStatus = "ok";
-    const snapOkNull = await h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: null, maxAgeMs: 0 });
-    const cardOkNull = snapOkNull.machines[0].providers[0];
-    expect(cardOkNull.usage.status).toBe("ok");
-
-    h.inventoryMap.get("source-native")!.resources = [];
-    await h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: null, maxAgeMs: 0 });
-
-    h.inventoryMap.get("source-native")!.resources = [
-      {
-        id: "res-native-heritage",
-        label: "Heritage Resource",
-        providerId: "codex",
-        scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
-        accountKey: null,
-      },
-    ];
-    currentStatus = "error";
-    const snapCleared = await h.registeredRpc.getUsage({ force: true, machineIds: null, providerId: null, maxAgeMs: 0 });
-    const cardCleared = snapCleared.machines[0].providers[0];
-    expect(cardCleared.usage.status).toBe("error");
   });
 
   // Pi absence / unauthenticated without accountId or access token / 401 expired

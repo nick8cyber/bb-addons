@@ -22,6 +22,7 @@
     "usage-policy.test.ts",
     "collector-adapter.ts",
     "usage-integration.test.ts",
+    "usage-races.test.ts",
     "dist/provider-usage-base.d.ts"
   ]
 }
