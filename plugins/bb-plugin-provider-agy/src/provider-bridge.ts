@@ -2379,6 +2379,12 @@ function writeTurn(session: Session, turn: Turn): void {
   session.childStderr.tail = "";
   session.childStderr.history = "";
   session.lastStderr = null;
+  // The stall clock measures silence DURING a turn: it starts when the turn
+  // is handed to agy, not at agy's last output. A child kept alive between
+  // turns (up to AGY_IDLE_KILL_MS) was otherwise killed on the first sweep
+  // tick after any pause of 15–30 min — the new turn lost before agy saw it
+  // (CI/CD thread, 5 times 26.10–01.11).
+  session.lastChildOutputAt = Date.now();
   child.stdin.write(
     agyUserMessageLine(
       session.writeGuardrail

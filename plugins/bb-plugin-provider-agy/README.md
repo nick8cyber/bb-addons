@@ -691,6 +691,11 @@ naming which case fired, and kills the child — the conversation stays on disk
 and the next turn rebuilds it. With both budgets off, `--print-timeout 24h`
 remains the absolute backstop.
 
+The stall clock starts when a turn is handed to agy (or at agy's last output
+during that turn), never at output from before the turn: a child kept alive
+between turns (`AGY_IDLE_KILL_MS`, 30 min) used to be killed the moment a new
+turn arrived after a 15–30 min pause.
+
 After a model-tier kill (nothing streamed, no tool open) of the only turn in
 flight, one bb already holds as accepted input, the thread error carries
 `errorInfo { category: "stream-disconnected" }`: bb's builtin

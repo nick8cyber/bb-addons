@@ -620,26 +620,35 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on(
       }
       return;
     }
-    out({
-      event: "step_update",
-      step_update: {
-        ...scope,
-        step_index: step++,
-        state: "DONE",
-        step_type: "agent_response",
-        text_delta: `answered ${turns}`,
-        usage,
-      },
-    });
-    out({
-      event: "result",
-      result: {
-        ...scope,
-        status: "SUCCESS",
-        response: `answered ${turns}`,
-        num_turns: turns,
-        usage,
-      },
-    });
+    const reply = () => {
+      out({
+        event: "step_update",
+        step_update: {
+          ...scope,
+          step_index: step++,
+          state: "DONE",
+          step_type: "agent_response",
+          text_delta: `answered ${turns}`,
+          usage,
+        },
+      });
+      out({
+        event: "result",
+        result: {
+          ...scope,
+          status: "SUCCESS",
+          response: `answered ${turns}`,
+          num_turns: turns,
+          usage,
+        },
+      });
+    };
+    // slow-reply: think silently for a while before answering, like the real
+    // model does; long enough for the bridge's 1s stall sweep to look.
+    if (mode === "slow-reply") {
+      setTimeout(reply, Number(process.env.AGY_FAKE_REPLY_DELAY_MS ?? "1500"));
+      return;
+    }
+    reply();
   },
 );
