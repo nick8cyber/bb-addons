@@ -488,11 +488,15 @@ function ineligibleStderrBlock(stderr: string): string | null {
   return isAccountIneligible(message) ? message : null;
 }
 
-function classifyError(message: string):
+function classifyError(
+  message: string,
+  opts: { toolError?: boolean } = {},
+):
   | "rate-limit"
   | "unauthorized"
   | "billing"
   | "overloaded"
+  | "internal"
   | undefined {
   const text = message.toLowerCase();
   if (
@@ -502,6 +506,29 @@ function classifyError(message: string):
   ) {
     return "rate-limit";
   }
+  const billing =
+    /upgrade your subscription|increase your limits|billing|payment|credits?/u;
+  const overloaded =
+    /overloaded|busy|temporar|degenerat|can't satisfy|no capacity/u;
+  // Google's own server-side failure, in agy's own framing only ("API error
+  // (attempt 1): INTERNAL (code 500): …", also inside its AGY_ERROR JSON):
+  // transient, so it must reach bb as `internal` + the HTTP code — what bb's
+  // provider-retry needs to re-run the turn by itself. Never for a tool
+  // step's error (a command's "504" re-run as a whole turn would repeat the
+  // commands), and never when the text also names a cause that must not be
+  // retried this way (eligibility, auth, billing) or a faster one
+  // (overloaded). Checked before the generic `token` match below, which
+  // would otherwise swallow agy's JSON tail.
+  if (
+    !opts.toolError &&
+    serverErrorCode(message) !== null &&
+    !isAccountIneligible(message) &&
+    !/unauthori|not authorized|invalid token|sign in|logged in|login|\b401\b|\b403\b/u.test(text) &&
+    !billing.test(text) &&
+    !overloaded.test(text)
+  ) {
+    return "internal";
+  }
   if (
     isAccountIneligible(message) ||
     /unauthori|not authorized|sign in|logged in|login|\b401\b|\b403\b|token/u.test(
@@ -510,24 +537,34 @@ function classifyError(message: string):
   ) {
     return "unauthorized";
   }
-  if (
-    /upgrade your subscription|increase your limits|billing|payment|credits?/u.test(
-      text,
-    )
-  ) {
+  if (billing.test(text)) {
     return "billing";
   }
-  if (/overloaded|busy|temporar|degenerat|can't satisfy|no capacity/u.test(text)) {
+  if (overloaded.test(text)) {
     return "overloaded";
   }
   return undefined;
 }
 
+/**
+ * The 5xx code of a Google server-side failure reported in agy's own
+ * "API error (attempt N): … (code 50x)" framing, or null. Bare phrases such
+ * as "deadline exceeded" or "gateway timeout" are deliberately not enough:
+ * they are just as likely a tool's or a fetched page's own text.
+ */
+function serverErrorCode(message: string): number | null {
+  const framed = /api error \(attempt \d+\):[^\n]*?\(code (50[0234])\)/iu.exec(message);
+  return framed === null ? null : Number(framed[1]);
+}
+
 /** The HTTP code bb's native `errorInfo` can hang on a classified message. */
 function httpStatusCodeFor(
   category: ReturnType<typeof classifyError>,
+  message = "",
 ): number | null {
   switch (category) {
+    case "internal":
+      return serverErrorCode(message) ?? 500;
     case "rate-limit":
       return 429;
     case "unauthorized":
@@ -544,15 +581,16 @@ function httpStatusCodeFor(
 /** The native `errorInfo` a provider.error should carry, when it can. */
 function nativeErrorInfo(
   message: string,
+  toolError = false,
 ): Extract<ThreadDelta, { kind: "provider.error" }>["errorInfo"] {
-  const category = classifyError(message);
+  const category = classifyError(message, { toolError });
   if (category === undefined) {
     return undefined;
   }
   return {
     category,
     providerCode: null,
-    httpStatusCode: httpStatusCodeFor(category),
+    httpStatusCode: httpStatusCodeFor(category, message),
   };
 }
 
@@ -1146,7 +1184,9 @@ function reportError(
     return;
   }
   session.lastReportedError = text;
-  const category = classifyError(text);
+  const category = classifyError(text, {
+    toolError: source === "agy tool step",
+  });
   log(
     `reporting error from ${source} for thread ${session.threadId}: ${text}`,
   );
@@ -1161,7 +1201,7 @@ function reportError(
           errorInfo: {
             category,
             providerCode: null,
-            httpStatusCode: httpStatusCodeFor(category),
+            httpStatusCode: httpStatusCodeFor(category, text),
           },
         }),
   });
@@ -2255,9 +2295,9 @@ function handleResult(
         providerTurnId: turn.turnId,
         message,
         settlesTurn: false,
-        ...(nativeErrorInfo(message) === undefined
+        ...(nativeErrorInfo(message, turn.toolErrors.has(message)) === undefined
           ? {}
-          : { errorInfo: nativeErrorInfo(message) }),
+          : { errorInfo: nativeErrorInfo(message, turn.toolErrors.has(message)) }),
       });
     }
     maybeEmitRateLimitBlocked(session, message);
