@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import {
   needsRussianTranslation,
   prepareRussianTranslation,
@@ -455,5 +456,74 @@ describe("translation failure notice", () => {
       summary: "The migration is not atomic",
       details: `none\n\n${NOTICE}`,
     });
+  });
+});
+
+describe("protected literal boundary regressions from independent review", () => {
+  it.each([".evil", "?redirect=evil", "/extra"])("rejects an appended URL suffix %s", (suffix) => {
+    const prepared = prepareRussianTranslation({
+      summary: "Check https://example.com before returning.", details: "none",
+    });
+    const token = tokensIn(protectedPayload(prepared.prompt).summary)[0]!;
+    expect(prepared.parse(JSON.stringify({
+      summary: "Проверь " + token + suffix + " перед возвратом.", details: "none",
+    }))).toBeNull();
+  });
+
+  it("protects numbers with units and rejects changing their values", () => {
+    const prepared = prepareRussianTranslation({
+      summary: "The timeout is 100ms before returning.", details: "none",
+    });
+    const payload = protectedPayload(prepared.prompt);
+    const [token] = tokensIn(payload.summary);
+    expect(token).toBeDefined();
+    expect(payload.summary).not.toContain("100ms");
+    expect(prepared.parse(JSON.stringify({
+      summary: "Таймаут составляет " + token + " перед возвратом.", details: "none",
+    }))).toEqual({ summary: "Таймаут составляет 100ms перед возвратом.", details: "none" });
+    expect(prepared.parse(JSON.stringify({
+      summary: "Таймаут составляет 900ms перед возвратом.", details: "none",
+    }))).toBeNull();
+  });
+
+  it.each(["900ms", "2s", "1e9", "100%", "5сек"])("rejects a newly introduced numeric literal %s", (literal) => {
+    const prepared = prepareRussianTranslation({
+      summary: "The function returns too early.", details: "none",
+    });
+    expect(prepared.parse(JSON.stringify({
+      summary: "Функция завершается через " + literal + " слишком рано.", details: "none",
+    }))).toBeNull();
+  });
+
+  it.each([
+    "/tmp/данные",
+    "C:\\работа\\данные.txt",
+    "данные/файл.yaml:42",
+    "настройки.yaml",
+    "/tmp/и\u0306мя",
+  ])("protects the entire Unicode path or filename %s", (path) => {
+    const prepared = prepareRussianTranslation({
+      summary: "Check " + path + " before returning.", details: "none",
+    });
+    const payload = protectedPayload(prepared.prompt);
+    const [token] = tokensIn(payload.summary);
+    expect(token).toBeDefined();
+    expect(payload.summary).not.toContain("данные");
+    expect(prepared.parse(JSON.stringify({
+      summary: "Проверь " + token + " перед возвратом.", details: "none",
+    }))).toEqual({ summary: "Проверь " + path + " перед возвратом.", details: "none" });
+    expect(prepared.parse(JSON.stringify({
+      summary: "Проверь " + token + "/другие перед возвратом.", details: "none",
+    }))).toBeNull();
+  });
+
+  it("rejects numeric token suffixes that extend the original number", () => {
+    const prepared = prepareRussianTranslation({
+      summary: "The timeout is 100ms before returning.", details: "none",
+    });
+    const token = tokensIn(protectedPayload(prepared.prompt).summary)[0]!;
+    expect(prepared.parse(JSON.stringify({
+      summary: "Таймаут составляет " + token + "extra перед возвратом.", details: "none",
+    }))).toBeNull();
   });
 });
