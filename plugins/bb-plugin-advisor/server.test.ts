@@ -7,6 +7,7 @@ import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import plugin, { parseRuntimeSettings } from "./server.js";
 
 const primaryContext = {
+  pluginMetadata: {},
   thread: {
     id: "thread-primary",
     title: "Implement feature",
@@ -27,7 +28,11 @@ const primaryContext = {
     branchName: null,
   },
   host: { id: "host-test", name: "Test host" },
-  provider: { id: "codex", model: "gpt-5.6" },
+  provider: {
+    id: "codex",
+    model: "gpt-5.6",
+    capabilities: { supportsNativeUserQuestion: false },
+  },
   origin: { kind: null, pluginId: null },
 } satisfies PluginAgentConfigurationContext;
 
@@ -57,7 +62,9 @@ async function loadAdvisor(
   );
   const host = createFakePluginHost({
     pluginId: "advisor",
-    settings: { autoReview: false, ...storedSettings },
+    // Language-neutral baseline: the dedicated language tests below opt in to
+    // "ru" explicitly, since English fixtures still need a translation pass.
+    settings: { autoReview: false, outputLanguage: "auto", ...storedSettings },
     sdk: {
       threads: {
         timeline: async () => timeline(timelineSeq),
@@ -243,6 +250,7 @@ describe("advisor settings compatibility", () => {
       autoContinue: false,
       advisorReasoning: "inherit",
       severityThreshold: "nit",
+      outputLanguage: "ru",
       watchdogFile: "WATCHDOG.md",
     };
     expect(
@@ -411,7 +419,7 @@ END_ADVISOR_RESULT`);
           // Both acceptable modes on offer: the reviewer must take the
           // narrower one.
           capabilities: {
-            supportedPermissionModes: ["readonly", "accept-edits", "full"],
+            permissionModes: ["accept-edits", "full"],
           },
         },
       ],
@@ -432,7 +440,7 @@ END_ADVISOR_RESULT`);
         projectId: "project-test",
         providerId: "codex",
         model: "gpt-5.6",
-        permissionMode: "readonly",
+        permissionMode: "accept-edits",
         environment: { type: "reuse", environmentId: "environment-test" },
         visibility: "hidden",
       }),
@@ -893,7 +901,7 @@ describe("advisor session environment binding", () => {
           displayName: "Codex",
           available: true,
           capabilities: {
-            supportedPermissionModes: ["accept-edits", "auto", "full"],
+            permissionModes: ["accept-edits", "auto", "full"],
           },
         },
       ],
@@ -923,7 +931,7 @@ describe("advisor session environment binding", () => {
           id: "codex",
           displayName: "Codex",
           available: true,
-          capabilities: { supportedPermissionModes: modes },
+          capabilities: { permissionModes: modes },
         },
       ],
       models: [],
@@ -1024,7 +1032,7 @@ describe("advisor unavailability", () => {
           id: "codex",
           displayName: "Codex",
           available: true,
-          capabilities: { supportedPermissionModes: ["full"] },
+          capabilities: { permissionModes: ["full"] },
         },
       ],
       models: [],
@@ -2139,7 +2147,7 @@ END_ADVISOR_RESULT`);
         id: "codex",
         displayName: "Codex",
         available: true,
-        capabilities: { supportedPermissionModes: ["readonly"] },
+        capabilities: { permissionModes: ["readonly"] },
       },
     ]);
     harness.sdk.stub("providers.models", async () => ({
@@ -2148,7 +2156,7 @@ END_ADVISOR_RESULT`);
           id: "codex",
           displayName: "Codex",
           available: true,
-          capabilities: { supportedPermissionModes: ["readonly"] },
+          capabilities: { permissionModes: ["readonly"] },
         },
       ],
       models: [
@@ -2281,13 +2289,13 @@ END_ADVISOR_RESULT`);
         id: "codex",
         displayName: "Codex",
         available: true,
-        capabilities: { supportedPermissionModes: ["readonly"] },
+        capabilities: { permissionModes: ["readonly"] },
       },
       {
         id: "pi",
         displayName: "Pi",
         available: true,
-        capabilities: { supportedPermissionModes: ["full"] },
+        capabilities: { permissionModes: ["full"] },
       },
     ]);
     harness.sdk.stub("providers.models", async () => ({
@@ -2296,7 +2304,7 @@ END_ADVISOR_RESULT`);
           id: "codex",
           displayName: "Codex",
           available: true,
-          capabilities: { supportedPermissionModes: ["readonly"] },
+          capabilities: { permissionModes: ["readonly"] },
         },
       ],
       models: [
@@ -2346,7 +2354,7 @@ END_ADVISOR_RESULT`);
         id: "codex",
         displayName: "Codex",
         available: true,
-        capabilities: { supportedPermissionModes: ["readonly"] },
+        capabilities: { permissionModes: ["readonly"] },
       },
     ]);
     harness.sdk.stub("providers.models", async () => ({
@@ -2355,7 +2363,7 @@ END_ADVISOR_RESULT`);
           id: "codex",
           displayName: "Codex",
           available: true,
-          capabilities: { supportedPermissionModes: ["readonly"] },
+          capabilities: { permissionModes: ["readonly"] },
         },
       ],
       models: [
