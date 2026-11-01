@@ -209,6 +209,22 @@ await turn(tool5xx.threadId, "one", 1);
 await sleep(300);
 stop(tool5xx.threadId);
 
+// idle-gap: a live child that went quiet BETWEEN turns for longer than
+// AGY_STALL_KILL_MS must not be killed the moment the next turn arrives —
+// the stall clock starts at the write, not at agy's last output.
+// The reply takes 1.5s (silent thinking, like the real model) so the 1s
+// sweep surely looks while the turn is in flight; the budget is 3s, so only
+// the idle gap before the turn could make it look stalled.
+process.env.AGY_STALL_KILL_MS = "3000";
+process.env.AGY_FAKE_REPLY_DELAY_MS = "1500";
+const idleGap = await start("slow-reply", "-idle-gap");
+await turn(idleGap.threadId, "one", 1);
+await sleep(4000); // > AGY_STALL_KILL_MS of silence between turns, child alive
+await turn(idleGap.threadId, "two after a long pause", 2);
+stop(idleGap.threadId);
+process.env.AGY_STALL_KILL_MS = "1200";
+delete process.env.AGY_FAKE_REPLY_DELAY_MS;
+
 // quota-retry mode: the auto-retry itself. The first turn is refused with a
 // 2s window and the child exits 1; the bridge must settle that turn failed,
 // queue a retry turn behind the reset, sit out the window, rebuild the child
@@ -397,6 +413,7 @@ const checks = [
   ["server-503-overloaded/stays-overloaded", errors(overloaded503.threadId).length > 0 && errors(overloaded503.threadId).every((e) => e.errorInfo?.category === "overloaded"), JSON.stringify(errors(overloaded503.threadId).map((e) => e.errorInfo ?? null))],
   ["tool-5xx/never-tagged-for-auto-retry", errors(tool5xx.threadId).length > 0 && errors(tool5xx.threadId).every((e) => e.errorInfo?.category !== "internal"), JSON.stringify(errors(tool5xx.threadId).map((e) => e.errorInfo ?? null))],
   ["tool-5xx/turn-failed", completed(tool5xx.threadId)[0]?.status === "failed", JSON.stringify(completed(tool5xx.threadId).map((b) => b.status))],
+  ["idle-gap/next-turn-not-killed-as-stalled", completed(idleGap.threadId).map((b) => b.status).join(",") === "completed,completed" && errors(idleGap.threadId).every((e) => !e.message.includes("agy stalled")), JSON.stringify(completed(idleGap.threadId).map((b) => b.status)) + " " + JSON.stringify(errors(idleGap.threadId).map((e) => e.message.slice(0, 60)))],
 ];
 
 say("==== error-surfacing report ====");
