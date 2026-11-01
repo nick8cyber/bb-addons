@@ -1,9 +1,9 @@
 import { z } from "zod";
-import { defineRpcContract } from "@bb/plugin-sdk";
+import { defineRpcContract } from "@get-bb/plugin-sdk";
 import type {
   BbPluginApi,
   PluginAgentConfigurationContext,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import {
   formatReview,
   formatTimelineRows,
@@ -14,6 +14,13 @@ import {
   type AdvisorFinding,
   type AdvisorSeverity,
 } from "./src/review.js";
+import {
+  needsRussianTranslation,
+  prepareRussianTranslation,
+  russianReviewInstruction,
+  withTranslationFailureNotice,
+  type ReviewText,
+} from "./src/language.js";
 
 const PLUGIN_ID = "advisor";
 const ADVISOR_TOOL = "advisor_review";
@@ -38,6 +45,16 @@ type AdvisorPermissionMode = NonNullable<
 const PENDING_ADVICE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const CANCELLED_REASON =
   "the primary turn was cancelled before the review finished";
+/** One limited translation pass; it never inherits the longer review budget. */
+const TRANSLATION_TIMEOUT_MS = 30_000;
+/** How the advisor's human-readable text is produced for one review. */
+type OutputLanguage = "ru" | "auto";
+/**
+ * Translation is a separate outcome from the verdict. A cancelled translation
+ * still yields the original finding, but callers must not start a follow-up
+ * turn for work the user has already interrupted.
+ */
+type TranslationStatus = "none" | "translated" | "failed" | "cancelled";
 /**
  * Advice must carry this much normalized text before it can join a repeat
  * chain. Chaining is text equality, so a terse generic line ("rename the
@@ -373,6 +390,7 @@ interface RuntimeSettings {
   autoContinue: boolean;
   advisorReasoning: "inherit" | "low" | "medium" | "high" | "xhigh";
   severityThreshold: AdvisorSeverity;
+  outputLanguage: OutputLanguage;
   watchdogFile: string;
   timeoutSeconds: number;
   transcriptSize: number;
@@ -432,6 +450,7 @@ const runtimeSettingsSchema: z.ZodType<RuntimeSettings> = z.object({
   autoContinue: z.boolean(),
   advisorReasoning: z.enum(["inherit", "low", "medium", "high", "xhigh"]),
   severityThreshold: z.enum(["pass", "nit", "concern", "blocker"]),
+  outputLanguage: z.enum(["ru", "auto"]),
   watchdogFile: z.string(),
   timeoutSeconds: numericSetting(TIMEOUT_OPTIONS, 120),
   transcriptSize: numericSetting(TRANSCRIPT_OPTIONS, 60_000),
@@ -473,7 +492,7 @@ function chainKeyOf(row: { id: number; repeat_of: number | null }): number {
  * as approval.
  */
 type AdvisorOutcome =
-  | { kind: "reviewed"; row: ReviewRow }
+  | { kind: "reviewed"; row: ReviewRow; translation: TranslationStatus }
   | { kind: "unavailable"; reason: string };
 
 /**
@@ -561,6 +580,7 @@ function buildAdvisorPrompt(args: {
   focus: string;
   watchdogFile: string;
   timeoutSeconds: number;
+  outputLanguage: OutputLanguage;
   openFindings: readonly { key: string; summary: string }[];
   openFindingsTruncated: boolean;
 }): string {
@@ -652,6 +672,14 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Minimum severity",
       options: ["nit", "concern", "blocker"],
       default: "nit",
+    },
+    outputLanguage: {
+      type: "select",
+      label: "Review language",
+      description:
+        "Russian summary and details in every review prompt, with one limited translation pass when the reviewer answers in English. Auto leaves the language to the reviewer.",
+      options: ["ru", "auto"],
+      default: "ru",
     },
     watchdogFile: {
       type: "string",
