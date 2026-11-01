@@ -62,8 +62,19 @@ What it handles on its own (details in the plugin README):
   and a frozen agy (stall-kill with no tool running) reach bb tagged so its
   builtin `provider-retry` re-runs the turn (about 1 minute, doubling, up to
   4 retries) instead of the thread standing still until someone types.
-- **Stall watchdog.** 15 minutes of silence with no tool running, 2 hours
-  with a tool in flight (`AGY_STALL_KILL_MS` / `AGY_TOOL_STALL_MS`).
+- **Stall watchdog.** 15 minutes of silence during a turn with no tool
+  running, 2 hours with a tool in flight (`AGY_STALL_KILL_MS` /
+  `AGY_TOOL_STALL_MS`); the clock starts when the turn is handed to agy.
+- **Compaction.** bb's `/compact` runs as agy's own compaction. When Google
+  refuses it, the bridge compacts by hand: the agent summarizes the old
+  conversation and the thread continues on a fresh one that starts from that
+  summary (or, without one, from a read-only look at the thread's own recent
+  history); failing that, it goes back to the old conversation.
+
+Behaviour contract and decisions:
+[spec](docs/specs/provider-agy-recovery.md),
+[ADR 0002](docs/adr/0002-provider-agy-failure-recovery.md),
+[ADR 0003](docs/adr/0003-provider-agy-compaction-fallback.md).
 
 The README also documents a real trap worth reading before writing any provider
 bridge: how a refused `write_to_file` argument silently costs you a whole run —
