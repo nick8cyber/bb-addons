@@ -96,7 +96,7 @@ export function prepareRussianTranslation(review: ReviewText): {
     prompt: buildTranslationPrompt(protectedReview),
     parse(output: string): ReviewText | null {
       try {
-        return parseTranslation(output, records);
+        return parseTranslation(output, records, review);
       } catch {
         return null;
       }
@@ -114,9 +114,13 @@ export function withTranslationFailureNotice(review: ReviewText): ReviewText {
   return { summary: review.summary, details };
 }
 
-function fieldNeedsTranslation(text: string): boolean {
+function hasSubstantiveText(text: string): boolean {
   const trimmed = text.trim();
-  if (trimmed.length === 0 || NONE_OR_EMPTY.test(trimmed)) return false;
+  return trimmed.length > 0 && !NONE_OR_EMPTY.test(trimmed);
+}
+
+function fieldNeedsTranslation(text: string): boolean {
+  if (!hasSubstantiveText(text)) return false;
 
   const prose = stripProtectedText(text);
   const cyrillic = countMatches(prose, CYRILLIC_LETTERS);
@@ -259,6 +263,7 @@ function buildTranslationPrompt(review: ReviewText): string {
 function parseTranslation(
   output: string,
   records: ProtectedToken[],
+  original: ReviewText,
 ): ReviewText | null {
   if (typeof output !== "string") return null;
   if (Buffer.byteLength(output, "utf8") > MAX_TRANSLATION_JSON_BYTES) {
@@ -300,6 +305,13 @@ function parseTranslation(
     summary: restoreField(parsed.summary, "summary", records),
     details: restoreField(parsed.details, "details", records),
   };
+  if (!hasSubstantiveText(restored.summary)) return null;
+  if (
+    hasSubstantiveText(original.details) &&
+    !hasSubstantiveText(restored.details)
+  ) {
+    return null;
+  }
   if (needsRussianTranslation(restored)) return null;
   return restored;
 }
