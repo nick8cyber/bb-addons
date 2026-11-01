@@ -32,7 +32,7 @@ const ADVISOR_TITLE_PREFIX = "Advisor · ";
  * it would make every review report unavailable on a bb that predates it,
  * while pinning `accept-edits` would keep handing the reviewer workspace write
  * access forever on a bb that has something narrower. Picking the value out of
- * the provider's own `supportedPermissionModes` also keeps this typed on both
+ * the provider's own `permissionModes` also keeps this typed on both
  * versions without a cast.
  */
 const ADVISOR_PERMISSION_MODE_PREFERENCE = ["readonly", "accept-edits"];
@@ -628,6 +628,7 @@ ${args.transcript}
 
 Return exactly one result in this format. Use pass and silence-equivalent details when there is no actionable issue. Do not repeat old advice merely to have something to say.
 
+${args.outputLanguage === "ru" ? `${russianReviewInstruction()}\n` : ""}
 ADVISOR_RESULT
 severity: pass|nit|concern|blocker
 key: a short stable slug naming the defect itself, anchored to where it lives, e.g. server-ts-runreview-timeout-untested. Use the SAME key whenever you raise the same underlying defect again, even if you reword it or rate it differently. Use "none" for a pass.
@@ -1019,7 +1020,7 @@ export default async function plugin(bb: BbPluginApi) {
     const providers = (await bb.sdk.providers.list({ hostId })).filter(
       (provider) =>
         provider.available &&
-        narrowestReviewMode(provider.capabilities.supportedPermissionModes) !==
+        narrowestReviewMode(provider.capabilities.permissionModes) !==
           null,
     );
     const optionGroups = await Promise.all(
@@ -1750,7 +1751,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!provider) return "unknown";
       if (!provider.available) return "unsupported";
       const permissionMode = narrowestReviewMode(
-        provider.capabilities.supportedPermissionModes,
+        provider.capabilities.permissionModes,
       );
       return permissionMode === null
         ? "unsupported"
@@ -1812,7 +1813,7 @@ export default async function plugin(bb: BbPluginApi) {
       const permissionMode =
         selectedProvider?.available === true
           ? narrowestReviewMode(
-              selectedProvider.capabilities.supportedPermissionModes,
+              selectedProvider.capabilities.permissionModes,
             )
           : null;
       const selectedModel = catalog.models.find(
@@ -2016,12 +2017,124 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  /**
+   * One bounded translation pass inside the reviewer's own session. It reviews
+   * nothing: the prompt and the JSON-only parse come from the language module.
+   * Send → wait → output races one hard 30-second deadline, so a hung SDK call
+   * cannot hold the outcome hostage no matter how the SDK reacts to a stopped
+   * thread. Anything that goes wrong — send, wait, output, parse, timeout,
+   * cancel — keeps the original finding intact with an explicit Russian
+   * notice, so a translation can never cost the user the verdict they are
+   * owed. Cancelled is surfaced separately so callers never auto-continue work
+   * the user interrupted; after a deadline fires, a late resolution of the
+   * in-flight stage is dropped instead of sending or reading anything new.
+   */
+  async function translateFinding(args: {
+    advisorThreadId: string;
+    review: ReviewText;
+    prepared: { prompt: string; parse(output: string): ReviewText | null };
+    signal: AbortSignal | undefined;
+  }): Promise<{ status: "translated" | "failed" | "cancelled"; text: ReviewText }> {
+    const { advisorThreadId, review, prepared, signal } = args;
+    const keep = (status: "failed" | "cancelled") => ({
+      status,
+      text: withTranslationFailureNotice(review),
+    });
+    if (signal?.aborted) return keep("cancelled");
+    const stopReviewer = (): void => {
+      void bb.sdk.threads
+        .stop({ threadId: advisorThreadId })
+        .catch(() => undefined);
+    };
+    class TranslationDeadline extends Error {
+      constructor(readonly outcome: "failed" | "cancelled") {
+        super(outcome);
+      }
+    }
+    let fireDeadline: (outcome: "failed" | "cancelled") => void = () => {};
+    const deadline = new Promise<never>((_, reject) => {
+      fireDeadline = (outcome) => reject(new TranslationDeadline(outcome));
+    });
+    const onAbort = (): void => {
+      stopReviewer();
+      fireDeadline("cancelled");
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    // The window is bounded on its own: even a reviewer that never goes idle is
+    // stopped here, so a stuck translation cannot outlive the deadline.
+    const timeout = setTimeout(() => {
+      stopReviewer();
+      fireDeadline("failed");
+    }, TRANSLATION_TIMEOUT_MS);
+    // A single stage carries the whole exchange, so the deadline applies to
+    // send, wait, and output alike rather than to each in isolation.
+    const stage = (async (): Promise<ReviewText | null> => {
+      await bb.sdk.threads.send({
+        threadId: advisorThreadId,
+        mode: "start",
+        input: [{ type: "text", text: prepared.prompt, mentions: [] }],
+      });
+      const waited: unknown = await bb.sdk.threads.wait({
+        threadId: advisorThreadId,
+        status: "idle",
+        timeoutMs: TRANSLATION_TIMEOUT_MS,
+        ...(signal ? { signal } : {}),
+      });
+      // When the host reports the wait expired instead of reaching idle, there
+      // is nothing to read: an output fetch here would decode a stale review.
+      if (
+        typeof waited === "object" &&
+        waited !== null &&
+        "matched" in waited &&
+        (waited as { matched: unknown }).matched === false
+      ) {
+        return null;
+      }
+      const { output } = await bb.sdk.threads.output({
+        threadId: advisorThreadId,
+      });
+      return output === null ? null : prepared.parse(output);
+    })();
+    // If the deadline already settled the outcome, a late stage rejection must
+    // not surface as an unhandled error.
+    stage.catch(() => undefined);
+    try {
+      const won = await Promise.race([
+        stage.then((parsed) =>
+          parsed
+            ? { status: "translated" as const, text: parsed }
+            : keep(signal?.aborted ? "cancelled" : "failed"),
+        ),
+        deadline,
+      ]);
+      return won;
+    } catch (error) {
+      // Both a stage failure and a fired deadline end the pass here: the
+      // reviewer thread is stopped either way, and the outcome states which.
+      stopReviewer();
+      return keep(
+        error instanceof TranslationDeadline
+          ? error.outcome
+          : signal?.aborted
+            ? "cancelled"
+            : "failed",
+      );
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
   async function runReview(
     primaryThreadId: string,
     focus: string,
     timeline: { rows: readonly object[]; maxSeq: number },
     signal: AbortSignal | undefined,
   ): Promise<AdvisorOutcome> {
+    // The language of this review is fixed at its start, before any await: a
+    // settings change mid-review must not mix a Russian prompt with an
+    // untranslated answer.
+    const outputLanguage = currentSettings.outputLanguage;
     // Every non-review exit goes through here, so a failure is always recorded
     // as an incident and can never be silently absent from the panel.
     const unavailable = (reason: string): AdvisorOutcome => {
@@ -2052,6 +2165,7 @@ export default async function plugin(bb: BbPluginApi) {
       focus,
       watchdogFile: currentSettings.watchdogFile.trim() || "WATCHDOG.md",
       timeoutSeconds: currentSettings.timeoutSeconds,
+      outputLanguage,
       openFindings: openFindings
         .slice(0, MAX_PROMPTED_OPEN_FINDINGS)
         .map((finding) => ({
@@ -2105,7 +2219,10 @@ export default async function plugin(bb: BbPluginApi) {
             {
               type: "text",
               visibility: "agent-only",
-              text: "FINALIZE NOW. Stop all inspection and return the required ADVISOR_RESULT block immediately using the evidence already collected. Do not send progress text.",
+              text:
+                outputLanguage === "ru"
+                  ? "FINALIZE NOW. Stop all inspection and return the required ADVISOR_RESULT block immediately using the evidence already collected. Do not send progress text. Keep summary and details in Russian with the service labels, key and resolved values exactly as instructed."
+                  : "FINALIZE NOW. Stop all inspection and return the required ADVISOR_RESULT block immediately using the evidence already collected. Do not send progress text.",
               mentions: [],
             },
           ],
@@ -2207,6 +2324,25 @@ export default async function plugin(bb: BbPluginApi) {
     const severity = root
       ? strongerSeverity(root.severity, review.severity)
       : review.severity;
+    // The chain above is already computed from the original parsed review:
+    // normalized text, key lookup and severity never move with a translation,
+    // so a reworded round stays in its chain whether or not one succeeds.
+    const originalText: ReviewText = {
+      summary: review.summary,
+      details: review.details,
+    };
+    let storedText = originalText;
+    let translation: TranslationStatus = "none";
+    if (outputLanguage === "ru" && needsRussianTranslation(originalText)) {
+      const attempt = await translateFinding({
+        advisorThreadId,
+        review: originalText,
+        prepared: prepareRussianTranslation(originalText),
+        signal,
+      });
+      translation = attempt.status;
+      storedText = attempt.text;
+    }
     const result = db
       .prepare(
         `INSERT INTO advisor_reviews (
@@ -2221,8 +2357,8 @@ export default async function plugin(bb: BbPluginApi) {
         primaryThreadId,
         timeline.maxSeq,
         severity,
-        review.summary,
-        review.details,
+        storedText.summary,
+        storedText.details,
         normalized,
         Date.now(),
         repeatOf,
@@ -2250,7 +2386,7 @@ export default async function plugin(bb: BbPluginApi) {
       timeline.maxSeq,
     );
     publishThreadChanged(primaryThreadId);
-    return { kind: "reviewed", row: reviewRowSchema.parse(result) };
+    return { kind: "reviewed", row: reviewRowSchema.parse(result), translation };
   }
 
   /**
@@ -2280,7 +2416,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { kind: "unavailable", reason };
     }
     const existing = readReview(primaryThreadId, timeline.maxSeq);
-    if (existing) return { kind: "reviewed", row: existing };
+    if (existing) return { kind: "reviewed", row: existing, translation: "none" };
 
     const key = `${primaryThreadId} ${timeline.maxSeq}`;
     const inflight = inFlight.get(key);
@@ -2324,7 +2460,9 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     publishThreadChanged(primaryThreadId);
-    if (currentSettings.autoContinue) {
+    // A cancelled translation means the user already stopped this turn: the
+    // finding is recorded and shown, but no unattended follow-up may start.
+    if (currentSettings.autoContinue && outcome.translation !== "cancelled") {
       try {
         await continueWithFinding(primaryThreadId, row.id, true);
       } catch (error) {
