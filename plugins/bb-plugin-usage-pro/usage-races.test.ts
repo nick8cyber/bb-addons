@@ -26,7 +26,7 @@ afterEach(async () => {
   for (const p of homes.splice(0)) rmSync(p, { recursive: true, force: true });
   vi.unstubAllGlobals();
 });
-async function setup(native: boolean, fetchImpl?: typeof fetch) {
+async function setup(native: boolean, fetchImpl?: typeof fetch, execFileImpl?: () => string) {
   const home = mkdtempSync(join(tmpdir(), "usage-race-auth-")); homes.push(home);
   const entered = gate<void>(), result = gate<any>();
   let inventory = native ? [resource(null)] : [];
@@ -52,7 +52,7 @@ async function setup(native: boolean, fetchImpl?: typeof fetch) {
   } }); hosts.push(h);
   const forbidden = () => { throw new Error("Real process forbidden"); };
   await plugin(h.bb, { userHome: home, prewarm: false, now: () => now, fetch: fetchImpl ?? forbidden as any,
-    execFile: forbidden, spawn: forbidden });
+    execFile: execFileImpl ?? forbidden, spawn: forbidden });
   return { ...h, home, entered, result, setInventory: (r: ReturnType<typeof resource>[]) => { inventory = r; },
     setInventoryHandler: (fn: typeof inventoryHandler) => { inventoryHandler = fn; },
     setMeasurement: (value: typeof nextMeasurement) => { nextMeasurement = value; },
@@ -62,11 +62,47 @@ async function setup(native: boolean, fetchImpl?: typeof fetch) {
 function oldQuota(s: any) {
   return s.machines.flatMap((m: any) => m.providers).some((p: any) => p.usage?.windows?.some((w: any) => w.usedPercent === 1));
 }
-function auth(home: string, id: string) {
+function auth(home: string, id: string, expires = now + 3600000) {
   const dir = join(home, ".pi", "agent"); mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "auth.json"), JSON.stringify({ "openai-codex": { accountId: id, access: "fixture-token", expires: now + 3600000 } }));
+  writeFileSync(join(dir, "auth.json"), JSON.stringify({ "openai-codex": { accountId: id, access: "fixture-token", expires } }));
 }
 describe("independent real SDK races", () => {
+  it.each([200, 503, 401])("uses the existing token after a refresh failure and handles actual API status %s", async (status) => {
+    let apiStatus = 200;
+    const fetchStub = vi.fn(async () => ({ ok: apiStatus === 200, status: apiStatus,
+      json: async () => ({ plan_type: "team", rate_limit: { primary_window: { used_percent: 42 } } }) })) as any;
+    const execFile = vi.fn((): string => { throw new Error("Fixture refresh timeout"); });
+    const h = await setup(false, fetchStub, execFile); auth(h.home, "A");
+    await h.call();
+    auth(h.home, "A", now + 30000); apiStatus = status;
+    const data = await h.call();
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(fetchStub.mock.calls[1][1].headers.Authorization).toBe("Bearer fixture-token");
+    const card = data.machines[0].providers[0];
+    expect(card.usage.status).toBe(status === 401 ? "expired" : "ok");
+    if (status !== 401) expect(card.usage.windows[0].usedPercent).toBe(42);
+    expect(Boolean(card.warning)).toBe(status === 503);
+  });
+  it("keeps cards in the first response when concurrent inventories finish in start order", async () => {
+    const h = await setup(true);
+    h.setInventory([resource("openai:chatgpt:A")]);
+    h.result.resolve(measurement("openai:chatgpt:A", 1));
+    h.setMeasurement(measurement("openai:chatgpt:A", 1));
+    const entered1 = gate<void>(), entered2 = gate<void>(), firstList = gate<void>(), secondList = gate<void>();
+    let calls = 0;
+    h.setInventoryHandler(async (resources) => {
+      if (++calls === 1) { entered1.resolve(); await firstList.promise; }
+      else { entered2.resolve(); await secondList.promise; }
+      return { resources };
+    });
+    const first = h.call(); await entered1.promise;
+    const second = h.call(); await entered2.promise;
+    firstList.resolve(); const firstResponse = await first;
+    secondList.resolve(); const secondResponse = await second;
+    expect(firstResponse.machines[0].providers).toHaveLength(1);
+    expect(secondResponse.machines[0].providers).toHaveLength(1);
+  });
   it("rejects an old initially unknown native response after a known account appears", async () => {
     const h = await setup(true);
     const pending = h.call(); await h.entered.promise;

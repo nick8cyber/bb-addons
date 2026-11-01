@@ -15471,21 +15471,8 @@ function providerUsagePlugin(bb, options = {}) {
         if (currentAccountId !== rawAccountId || thisFetchGen !== piFetchGen) {
           return null;
         }
-        const expiredData = { status: "expired" };
-        codexPiCache = {
-          accountId: requestAccountId,
-          accountKey: canonicalKey,
-          loadedAt: getNow(),
-          data: expiredData,
-          observedAt: null,
-          warning: null
-        };
-        return {
-          accountKey: canonicalKey,
-          usage: expiredData,
-          observedAt: null,
-          warning: null
-        };
+        // A failed refresh does not establish expiry; let the usage API decide.
+        token = entry.access;
       }
     }
 
@@ -15897,6 +15884,7 @@ function providerUsagePlugin(bb, options = {}) {
   const pending = new Map();
   let previousResourceKeys = new Set();
   const inventoryEpoch = new Map();
+  const appliedInventoryEpoch = new Map();
   const keyOf = (pluginId, resourceId) => JSON.stringify([pluginId, resourceId]);
 
   const bumpEpoch = (key) => {
@@ -16011,6 +15999,7 @@ function providerUsagePlugin(bb, options = {}) {
       if (!sources.some((source) => source.pluginId === id)) {
         inventories.delete(id);
         inventoryEpoch.set(id, (inventoryEpoch.get(id) || 0) + 1);
+        appliedInventoryEpoch.set(id, inventoryEpoch.get(id));
       }
     }
 
@@ -16027,7 +16016,8 @@ function providerUsagePlugin(bb, options = {}) {
               outputSchema: usageSourceRpcContract[usageListMethod].output,
               signal: AbortSignal.timeout(45e3)
             });
-            if (inventoryEpoch.get(source.pluginId) !== epoch) return;
+            if (epoch < (appliedInventoryEpoch.get(source.pluginId) || 0)) return;
+            appliedInventoryEpoch.set(source.pluginId, epoch);
             inventories.set(source.pluginId, {
               pluginId: source.pluginId,
               label: inventory.label ?? null,
@@ -16035,7 +16025,8 @@ function providerUsagePlugin(bb, options = {}) {
               error: null
             });
           } catch {
-            if (inventoryEpoch.get(source.pluginId) !== epoch) return;
+            if (epoch < (appliedInventoryEpoch.get(source.pluginId) || 0)) return;
+            appliedInventoryEpoch.set(source.pluginId, epoch);
             const previous = inventories.get(source.pluginId);
             inventories.set(source.pluginId, {
               pluginId: source.pluginId,
