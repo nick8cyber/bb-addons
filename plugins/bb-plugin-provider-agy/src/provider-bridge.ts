@@ -1668,10 +1668,15 @@ function settleTurnFailed(
 function failSession(
   session: Session,
   message: string,
-  opts: { surfaceError?: boolean } = {},
+  opts: {
+    surfaceError?: boolean;
+    /** Overrides the text classification (e.g. a model-tier stall). */
+    errorInfo?: ReturnType<typeof nativeErrorInfo>;
+  } = {},
 ): void {
   const surfaceError = opts.surfaceError ?? true;
-  const failCategory = classifyError(message) ?? "unclassified";
+  const errorInfo = opts.errorInfo ?? nativeErrorInfo(message);
+  const failCategory = errorInfo?.category ?? "unclassified";
   const failOneLine = message.replace(/[\r\n]+/gu, " ").slice(0, 300);
   log(`session ${session.threadId} failed [${failCategory}]: ${failOneLine}`);
   // A session failure is the verdict, whatever retry was pending: settle
@@ -1683,9 +1688,7 @@ function failSession(
       kind: "provider.error",
       message,
       threadScoped: true,
-      ...(nativeErrorInfo(message) === undefined
-        ? {}
-        : { errorInfo: nativeErrorInfo(message) }),
+      ...(errorInfo === undefined ? {} : { errorInfo }),
     });
   }
   maybeEmitRateLimitBlocked(session, message);
@@ -3074,10 +3077,39 @@ function sweepStalledTurns(): void {
       `session ${session.threadId} silent for ${silentSec}s with a turn in flight: ` +
         `failing the turn and killing the agy child (conversation ${session.providerThreadId ?? "none"} stays; the next turn rebuilds it)`,
     );
+    // Tag a model-tier stall as a dropped stream so bb's provider-retry
+    // re-runs it by itself (first retry after ~1-2 min, then doubling; up to
+    // 4 retries) instead of the thread standing still until someone types —
+    // but only when exactly one turn is in flight and bb already holds it as
+    // accepted input: bb then continues with "Please continue." on the same
+    // conversation. Not tagged:
+    // - a tool-tier stall: a re-run would repeat the commands, and a blocked
+    //   tool (a password prompt) blocks again;
+    // - queued turns or steers behind the frozen one: failSession marks them
+    //   accepted, so a "Please continue." re-run would silently drop the
+    //   user's text that never reached agy;
+    // - the thread's first turn (no clientRequestId, never input.accepted):
+    //   bb would re-send the whole task into a conversation where its steps
+    //   may already have run.
+    const retryable =
+      activeTool === null &&
+      session.turns.length === 1 &&
+      session.pending.length === 0 &&
+      session.turns[0].started &&
+      session.turns[0].clientRequestId !== undefined;
     failSession(
       session,
       `agy stalled: no output for ${silentSec}s ${reason}; ` +
         `the child is being killed, the next turn rebuilds the conversation`,
+      retryable
+        ? {
+            errorInfo: {
+              category: "stream-disconnected",
+              providerCode: null,
+              httpStatusCode: null,
+            },
+          }
+        : {},
     );
     killChild(session);
   }

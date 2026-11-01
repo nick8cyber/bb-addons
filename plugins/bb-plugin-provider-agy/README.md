@@ -690,3 +690,15 @@ Past the budget the bridge fails the turn with `agy stalled: no output for …`
 naming which case fired, and kills the child — the conversation stays on disk
 and the next turn rebuilds it. With both budgets off, `--print-timeout 24h`
 remains the absolute backstop.
+
+After a model-tier kill (nothing streamed, no tool open) of the only turn in
+flight, one bb already holds as accepted input, the thread error carries
+`errorInfo { category: "stream-disconnected" }`: bb's builtin
+`provider-retry` then continues it by itself ("Please continue." on the same
+conversation; first retry after about 1-2 minutes, then doubling, up to 4
+retries after the original attempt) instead of the thread standing still
+until someone types. Deliberately not tagged: a tool-tier kill (a re-run would
+repeat the commands; a blocked tool would block again), a kill with turns or
+steers queued behind the frozen one (the re-run would drop that text), and the
+thread's first turn (bb would re-send the whole task into a conversation whose
+steps may already have run).
