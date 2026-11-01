@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { EventEmitter } from "node:events";
+import { createFakePluginHost, makeHostResponse } from "@get-bb/plugin-sdk/testing";
 import providerUsagePlugin, { createProviderUsagePlugin } from "./dist/provider-usage-base.js";
 import { codexAccountKey, actualPlanLabel, selectAccountResources } from "./usage-policy";
 import type { CollectorOptions } from "./collector-adapter";
@@ -81,8 +82,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
             resources: [
               {
                 id: "res-native-1",
+                label: "Codex Native Primary",
                 providerId: "codex",
-                scope: { kind: "host", hostId: "host-primary" },
+                scope: { kind: "host", hostId: "host-primary", hostName: "Stockholm Server" },
                 accountKey: "openai:chatgpt:team-acc-1",
               },
             ],
@@ -149,68 +151,57 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       return proc;
     });
 
-    const registeredRpc: Record<string, any> = {};
-    const eventHandlers: Record<string, Function[]> = {};
+    const fakeHost = createFakePluginHost({ pluginId: "usage-pro" });
 
-    const bb: any = {
-      settings: {
-        define: vi.fn(),
-      },
-      sdk: {
-        hosts: {
-          list: vi.fn(async () => hostsList),
-        },
-        plugins: {
-          experimental_discoverRpc: vi.fn(async ({ method }: { method: string }) => {
-            if (method === usageListMethod) {
-              return sourcesList;
-            }
-            return [];
-          }),
-          callRpc: vi.fn(async ({ pluginId, method, input }: any) => {
-            if (method === usageListMethod) {
-              const inv = inventoryMap.get(pluginId);
-              if (!inv) {
-                throw new Error(`Plugin ${pluginId} listing failed`);
-              }
-              if (inv.error) {
-                throw new Error(inv.error);
-              }
-              return inv;
-            }
-            if (method === usageFetchMethod) {
-              const key = `${pluginId}:${input.resourceId}`;
-              const m = measurementMap.get(key);
-              if (m === undefined) {
-                throw new Error(`No measurement configured for ${key}`);
-              }
-              if (typeof m === "function") {
-                return m();
-              }
-              return m;
-            }
-            throw new Error(`Unhandled RPC method: ${method}`);
-          }),
-        },
-        providers: {
-          list: vi.fn(async () => providersList),
-        },
-        system: {
-          config: vi.fn(async () => ({ primaryHostId })),
-        },
-      },
-      rpc: {
-        register: vi.fn((_contract: any, handlers: any) => {
-          Object.assign(registeredRpc, handlers);
+    fakeHost.harness.sdk.stub("hosts.list", async () => {
+      return hostsList.map((h) =>
+        makeHostResponse({
+          id: h.id,
+          name: h.name,
+          status: h.status,
+          type: (h.type ?? "persistent") as any,
         }),
-      },
-      events: {
-        on: vi.fn((evt: string, handler: Function) => {
-          eventHandlers[evt] = eventHandlers[evt] || [];
-          eventHandlers[evt].push(handler);
-        }),
-      },
-    };
+      );
+    });
+
+    fakeHost.harness.sdk.stub("plugins.experimental_discoverRpc", async ({ method }: { method: string }) => {
+      if (method === usageListMethod) {
+        return sourcesList;
+      }
+      return [];
+    });
+
+    fakeHost.harness.sdk.stub("providers.list", async () => providersList);
+
+    fakeHost.harness.sdk.stub("system.config", async () => ({ primaryHostId }));
+
+    fakeHost.harness.sdk.stub("plugins.callRpc", async ({ pluginId, method, input }: any) => {
+      if (method === usageListMethod) {
+        const inv = inventoryMap.get(pluginId);
+        if (!inv) {
+          throw new Error(`Plugin ${pluginId} listing failed`);
+        }
+        if (inv.error) {
+          throw new Error(inv.error);
+        }
+        return {
+          label: inv.label,
+          resources: inv.resources,
+        };
+      }
+      if (method === usageFetchMethod) {
+        const key = `${pluginId}:${input.resourceId}`;
+        const m = measurementMap.get(key);
+        if (m === undefined) {
+          throw new Error(`No measurement configured for ${key}`);
+        }
+        if (typeof m === "function") {
+          return m();
+        }
+        return m;
+      }
+      throw new Error(`Unhandled RPC method: ${method}`);
+    });
 
     const collectorOpts: CollectorOptions = {
       userHome: () => tmpUserHome,
@@ -222,10 +213,15 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       prewarm: false,
     };
 
+    const registeredRpc = {
+      getUsage: (input: any) => fakeHost.harness.behavior.callRpc("getUsage", input) as Promise<any>,
+    };
+
     return {
-      bb,
+      bb: fakeHost.bb,
+      fakeHost,
+      harness: fakeHost.harness,
       registeredRpc,
-      eventHandlers,
       inventoryMap,
       measurementMap,
       mockFetch,
@@ -249,8 +245,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-native-1",
+              label: "Codex Native Primary",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Stockholm Server" },
               accountKey: canonicalKey,
             },
           ],
@@ -334,14 +331,16 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-native-1",
+              label: "Codex Native Alpha",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Primary" },
               accountKey: "openai:chatgpt:id-alpha",
             },
             {
               id: "res-unknown-2",
+              label: "Codex Native Unknown",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Primary" },
               accountKey: null,
             },
           ],
@@ -416,14 +415,16 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-stockholm",
+              label: "Stockholm Codex",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-stockholm" },
+              scope: { kind: "host", hostId: "host-stockholm", hostName: "Stockholm" },
               accountKey: "openai:chatgpt:stockholm-acc",
             },
             {
               id: "res-dubai",
+              label: "Dubai Codex",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-dubai" },
+              scope: { kind: "host", hostId: "host-dubai", hostName: "Dubai" },
               accountKey: "openai:chatgpt:dubai-acc",
             },
           ],
@@ -484,8 +485,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-1",
+              label: "Codex Resource",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
               accountKey: sameKey,
             },
           ],
@@ -619,8 +621,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-codex-healthy",
+              label: "Healthy Codex Account",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Stockholm" },
               accountKey: "openai:chatgpt:healthy-codex",
             },
           ],
@@ -629,8 +632,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-pool-disabled",
+              label: "Disabled Pool Account",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Stockholm" },
               accountKey: "openai:chatgpt:d42622fa-disabled",
             },
           ],
@@ -692,8 +696,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-1",
+              label: "Codex Stale Resource",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
               accountKey: "openai:chatgpt:stale-test-acc",
             },
           ],
@@ -754,8 +759,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-codex",
+              label: "Codex Resource",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
               accountKey: "openai:chatgpt:codex-1",
             },
           ],
@@ -764,8 +770,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-claude",
+              label: "Claude Resource",
               providerId: "claude-code",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
               accountKey: "claude:acc-1",
             },
           ],
@@ -963,8 +970,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-race",
+              label: "Race Resource",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
               accountKey: currentNativeKey,
             },
           ],
@@ -1014,8 +1022,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-healthy",
+              label: "Healthy Resource",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Primary Host" },
               accountKey: "openai:chatgpt:healthy-1",
             },
           ],
@@ -1029,8 +1038,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-known",
+              label: "Known Resource",
               providerId: "claude-code",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Primary Host" },
               accountKey: "claude:known-1",
             },
           ],
@@ -1079,8 +1089,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-pool",
+              label: "Pool Resource",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
               accountKey: "openai:chatgpt:pool-err",
             },
           ],
@@ -1118,8 +1129,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           resources: [
             {
               id: "res-native-heritage",
+              label: "Heritage Resource",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary" },
+              scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
               accountKey: currentAccountKey,
             },
           ],
@@ -1161,8 +1173,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     h.inventoryMap.get("source-native")!.resources = [
       {
         id: "res-native-heritage",
+        label: "Heritage Resource",
         providerId: "codex",
-        scope: { kind: "host", hostId: "host-primary" },
+        scope: { kind: "host", hostId: "host-primary", hostName: "Host" },
         accountKey: null,
       },
     ];
@@ -1282,5 +1295,26 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
 
     await pluginFactory(h.bb);
     expect(h.registeredRpc.getUsage).toBeDefined();
+
+    const snap = await h.registeredRpc.getUsage({
+      force: false,
+      machineIds: null,
+      providerId: null,
+      maxAgeMs: 60000,
+    });
+    expect(snap.machines).toBeDefined();
+    expect(snap.machines).toHaveLength(1);
+  });
+
+  // Frontend regression: app.bundle.js client schema and card warning renderer
+  it("Frontend: app.bundle.js client schema supports optional warning and card renderer displays it", () => {
+    const bundlePath = path.resolve(__dirname, "app.bundle.js");
+    const bundleContent = fs.readFileSync(bundlePath, "utf8");
+
+    // Im schema in app.bundle.js includes warning: x.optional(x.nullable(P))
+    expect(bundleContent).toContain("warning:x.optional(x.nullable(P))");
+
+    // Xm card renderer displays warning in amber styling above card content
+    expect(bundleContent).toContain('text-2xs text-amber-500 mb-1 leading-tight');
   });
 });
