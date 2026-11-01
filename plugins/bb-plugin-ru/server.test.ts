@@ -117,7 +117,7 @@ describe("bb ru", () => {
   });
 });
 
-describe("рекомендации аудита на русском", () => {
+describe("языком ревью управляет Advisor", () => {
   function agentContext(
     title: string | null,
     originPluginId: string | null = null,
@@ -156,21 +156,20 @@ describe("рекомендации аудита на русском", () => {
     };
   }
 
-  it("по умолчанию добавляет указание ревьюеру Advisor", async () => {
+  it("не добавляет прежнюю инструкцию по заголовку Advisor", async () => {
     const { harness } = await load();
     const result = await harness.behavior.resolveAgentConfiguration(
       agentContext("Advisor · Мой тред"),
     );
-    expect(result.instructions).toContain("русском");
-    expect(result.instructions).toContain("даже если исходный промпт");
+    expect(result.instructions).toBeNull();
   });
 
-  it("распознаёт Advisor по origin, даже если заголовок изменился", async () => {
+  it("не добавляет прежнюю инструкцию по origin Advisor", async () => {
     const { harness } = await load();
     const result = await harness.behavior.resolveAgentConfiguration(
       agentContext("Внутренний аудит", "advisor"),
     );
-    expect(result.instructions).toContain("ОБЯЗАТЕЛЬНО");
+    expect(result.instructions).toBeNull();
   });
 
   it("не трогает обычные треды", async () => {
@@ -189,7 +188,7 @@ describe("рекомендации аудита на русском", () => {
     expect(result.instructions).toBeNull();
   });
 
-  it("выключается настройкой advisorRussian", async () => {
+  it("сохраняет совместимость прежней настройки без внедрения инструкции", async () => {
     const { harness } = await load({ advisorRussian: false });
     const result = await harness.behavior.resolveAgentConfiguration(
       agentContext("Advisor · Мой тред"),

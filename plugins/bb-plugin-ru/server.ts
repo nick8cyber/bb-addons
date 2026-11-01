@@ -16,23 +16,6 @@ const MAX_TEXT_LENGTH = 200;
 /** Верхняя граница таблицы, чтобы копилка не росла бесконечно. */
 const MAX_ROWS = 5000;
 
-/**
- * Старые версии Advisor распознаём и по заголовку. В актуальном BB основной
- * сигнал надёжнее: `context.origin.pluginId === "advisor"`.
- */
-const ADVISOR_TITLE_PREFIX = "Advisor · ";
-
-/**
- * Указание ревьюеру писать выводы по-русски. Машиночитаемые поля
- * (severity, key, resolved) трогать запрещено — только человекочитаемый текст.
- */
-const ADVISOR_RUSSIAN_INSTRUCTIONS =
-  "Отвечай на русском языке. В результате ADVISOR_RESULT поля summary и details " +
-  "ОБЯЗАТЕЛЬНО пиши по-русски, даже если исходный промпт, focus, timeline или цитаты " +
-  "даны на английском. Не возвращай английские пояснения или выводы; без перевода " +
-  "оставляй только код, идентификаторы, имена собственные и технические значения " +
-  "полей severity, key и resolved.";
-
 const missingRow = z.object({
   text: z.string(),
   count: z.number().int().nonnegative(),
@@ -82,35 +65,11 @@ export default async function plugin(bb: BbPluginApi) {
     },
     advisorRussian: {
       type: "boolean",
-      label: "Рекомендации аудита на русском",
+      label: "Устарело: рекомендации аудита на русском",
       description:
-        "Добавлять ревьюеру Advisor указание писать выводы проверки на русском языке.",
+        "Язык ревью теперь задаётся в настройках Advisor: outputLanguage. Этот прежний переключатель больше не действует.",
       default: true,
     },
-  });
-
-  // Кэш для синхронного bb.agents.configure: сам колбэк асинхронным быть не
-  // может, поэтому читаем один раз при старте и обновляем по onChange.
-  let advisorRussian = (await settings.get()).advisorRussian;
-  settings.onChange((next) => {
-    if (typeof next.advisorRussian === "boolean") {
-      advisorRussian = next.advisorRussian;
-    }
-  });
-
-  // Ревьюер Advisor — агентская сессия, порождённая плагином advisor. Заголовок
-  // оставляем запасным признаком для совместимости со старыми версиями BB.
-  bb.agents.configure((context) => {
-    if (!advisorRussian) return { tools: [], skills: [] };
-    const title = context.thread.title ?? "";
-    const isAdvisor =
-      context.origin.pluginId === "advisor" ||
-      title.startsWith(ADVISOR_TITLE_PREFIX);
-    if (!isAdvisor) {
-      return { tools: [], skills: [] };
-    }
-    bb.log.info(`инструкция на русском добавлена треду ${context.thread.id}`);
-    return { tools: [], skills: [], instructions: ADVISOR_RUSSIAN_INSTRUCTIONS };
   });
 
   const db = bb.storage.database();
