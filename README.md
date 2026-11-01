@@ -48,6 +48,23 @@ than through ACP: a provider declaration plus a provider bridge, the same shape
 the built-in `provider-claude-code` and `provider-codex` use. Requires `agy` on
 PATH and an authenticated `~/.gemini`.
 
+What it handles on its own (details in the plugin README):
+
+- **Account pool.** Several Google accounts, one agy HOME each; a thread is
+  pinned to the least-used free account, and on a quota limit the turn moves
+  to a free sibling with a compact handoff.
+- **Accounts Google refuses.** "Not eligible for Antigravity" parks the
+  account (2 h for a location refusal, 24 h when verification is required,
+  with the verification link in `bridge.log`) and re-runs the turn on a free
+  sibling; a breaker stops parking after 3 accounts in 10 minutes, so a
+  network fault cannot park the whole pool.
+- **Transient failures are retried by bb itself.** Google's own 5xx errors
+  and a frozen agy (stall-kill with no tool running) reach bb tagged so its
+  builtin `provider-retry` re-runs the turn (about 1 minute, doubling, up to
+  4 retries) instead of the thread standing still until someone types.
+- **Stall watchdog.** 15 minutes of silence with no tool running, 2 hours
+  with a tool in flight (`AGY_STALL_KILL_MS` / `AGY_TOOL_STALL_MS`).
+
 The README also documents a real trap worth reading before writing any provider
 bridge: how a refused `write_to_file` argument silently costs you a whole run —
 [plugins/bb-plugin-provider-agy/README.md](plugins/bb-plugin-provider-agy/README.md).
