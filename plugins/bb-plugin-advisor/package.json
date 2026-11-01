@@ -22,6 +22,7 @@
     "app.tsx",
     "server.ts",
     "src/review.ts",
+    "src/language.ts",
     "dist/app.css",
     "dist/app.js",
     "dist/app.meta.json",

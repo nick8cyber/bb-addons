@@ -676,9 +676,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     outputLanguage: {
       type: "select",
-      label: "Review language",
+      label: "Язык ревью",
       description:
-        "Russian summary and details in every review prompt, with one limited translation pass when the reviewer answers in English. Auto leaves the language to the reviewer.",
+        "Русский язык для новых ревью. При сбое перевода показывается оригинал. Auto — язык без проверки.",
       options: ["ru", "auto"],
       default: "ru",
     },
