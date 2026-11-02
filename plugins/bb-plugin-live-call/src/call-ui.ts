@@ -98,9 +98,9 @@ class TurnPlayer {
       const source = this.ctx.createBufferSource();
       source.buffer = item.buffer;
       source.connect(this.ctx.destination);
-      // Курсор: старт строго после конца предыдущего куска.
-      const start = Math.max(this.ctx.currentTime + 0.02, this.nextStart);
-      this.nextStart = start + item.buffer.duration + 0.03;
+      // Курсор: куски встык (любая пауза = щелчок на склейке), без зазоров.
+      const start = Math.max(this.ctx.currentTime + 0.015, this.nextStart);
+      this.nextStart = start + item.buffer.duration;
       this.playing += 1;
       source.onended = () => {
         this.playing = Math.max(0, this.playing - 1);
@@ -219,6 +219,7 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
               if (v > peak) peak = v;
               i16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
             }
+            overlay.setOrbLevel(peak * 2.2);
             // Диагностика: предупреждение только пока владелец ещё ни разу не был услышан —
             // после паузы оно лишь путает (инцидент 02.11).
             if (peak > 0.01) {
@@ -289,6 +290,7 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
         break;
       case "state":
         overlay.stateLine.textContent = stateLabel(frame.state, frame.detail);
+        overlay.setOrbState(frame.state);
         break;
       case "transcript":
         overlay.addTranscript(frame.role, frame.text, frame.final);
@@ -348,6 +350,73 @@ function stateLabel(state: string, detail?: string): string {
   return map[state] ?? state;
 }
 
+const ORB_CSS = `
+  @keyframes lc-orb-listen {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.06); }
+  }
+  @keyframes lc-orb-think {
+    to { transform: rotate(360deg); }
+  }
+  @keyframes lc-orb-speak {
+    0%, 100% { transform: scale(1); filter: brightness(1); }
+    33% { transform: scale(1.1); filter: brightness(1.25); }
+    66% { transform: scale(0.96); filter: brightness(0.95); }
+  }
+  #lc-orb {
+    width: 56px; height: 56px; border-radius: 50%;
+    margin: 0 auto; position: relative; flex: none;
+    transition: background 0.35s ease, box-shadow 0.35s ease;
+    background:
+      radial-gradient(circle at 50% 42%,
+        color-mix(in srgb, var(--lc-accent, #7aa2ff) 85%, #ffffff 15%) 0%,
+        var(--lc-accent, #7aa2ff) 45%,
+        color-mix(in srgb, var(--lc-accent, #7aa2ff) 55%, #0a0c14 45%) 100%);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--lc-accent, #7aa2ff) 45%, transparent);
+  }
+  #lc-orb::after {
+    content: ""; position: absolute; inset: -6px; border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--lc-accent, #7aa2ff) 55%, transparent);
+    opacity: 0; transition: opacity 0.3s ease;
+  }
+  #lc-orb[data-state="listening"] {
+    animation: lc-orb-listen 1.6s ease-in-out infinite;
+    transform: scale(calc(1 + var(--lc-level, 0) * 0.22));
+  }
+  #lc-orb[data-state="thinking"] {
+    background:
+      radial-gradient(circle at 50% 42%, #ffd98a 0%, #f5a623 45%, #7a4a00 100%);
+    box-shadow: 0 0 18px rgba(245, 166, 35, 0.5);
+  }
+  #lc-orb[data-state="thinking"]::after {
+    opacity: 1;
+    border-color: transparent;
+    border-top-color: #ffd98a;
+    animation: lc-orb-think 0.9s linear infinite;
+  }
+  #lc-orb[data-state="speaking"] {
+    background:
+      radial-gradient(circle at 50% 42%, #b6ffd9 0%, #34d399 45%, #0a5c3c 100%);
+    box-shadow: 0 0 22px rgba(52, 211, 153, 0.55);
+    animation: lc-orb-speak 1.05s ease-in-out infinite;
+  }
+  #lc-orb[data-state="speaking"]::after { opacity: 0; }
+  #lc-orb[data-state="muted"] {
+    background: radial-gradient(circle at 50% 42%, #6b7280 0%, #374151 55%, #111827 100%);
+    box-shadow: none;
+  }
+  #lc-orb[data-state="reconnecting"] {
+    background: radial-gradient(circle at 50% 42%, #fecaca 0%, #ef4444 45%, #7f1d1d 100%);
+    box-shadow: 0 0 18px rgba(239, 68, 68, 0.5);
+    animation: lc-orb-listen 0.7s ease-in-out infinite;
+  }
+  .lc-btn-muted {
+    background: rgba(239, 68, 68, 0.18) !important;
+    border-color: rgba(239, 68, 68, 0.55) !important;
+    color: #fca5a5 !important;
+  }
+`;
+
 function buildOverlay() {
   const button = document.getElementById(BUTTON_ID) as HTMLButtonElement | null;
   if (button) button.style.display = "none";
@@ -362,12 +431,27 @@ function buildOverlay() {
     box-shadow: 0 12px 40px rgba(0,0,0,.4); font-family: system-ui, -apple-system, sans-serif;
     font-size: 13px; overflow: hidden; pointer-events: auto;
   `;
+  const style = document.createElement("style");
+  style.textContent = ORB_CSS;
+  document.head.append(style);
+
   const header = document.createElement("div");
-  header.style.cssText = "padding:10px 12px; display:flex; align-items:center; gap:8px; border-bottom:1px solid rgba(255,255,255,.1); font-weight:600;";
-  header.innerHTML = `📞 Звонок <span id="lc-mode" style="opacity:.6;font-weight:400"></span>
-    <span id="lc-state" style="margin-left:auto;opacity:.7;font-weight:400"></span>`;
-  const modeLine = header.querySelector("#lc-mode") as HTMLElement;
-  const stateLine = header.querySelector("#lc-state") as HTMLElement;
+  header.style.cssText = "padding:12px 12px 8px; display:flex; flex-direction:column; align-items:center; gap:6px; border-bottom:1px solid rgba(255,255,255,.1);";
+  const orbRow = document.createElement("div");
+  orbRow.style.cssText = "display:flex; align-items:center; gap:10px; width:100%;";
+  const title = document.createElement("div");
+  title.style.cssText = "font-weight:600; display:flex; align-items:center; gap:6px;";
+  title.textContent = "📞 Звонок";
+  const modeLine = document.createElement("span");
+  modeLine.style.cssText = "opacity:.55; font-weight:400;";
+  title.append(modeLine);
+  const orb = document.createElement("div");
+  orb.id = "lc-orb";
+  orb.dataset.state = "listening";
+  const stateLine = document.createElement("div");
+  stateLine.style.cssText = "opacity:.75; font-size:12px; text-align:center; min-height:16px;";
+  orbRow.append(title, orb);
+  header.append(orbRow, stateLine);
 
   const threadLine = document.createElement("div");
   threadLine.style.cssText = "padding:4px 12px; opacity:.5; font-size:11px;";
@@ -391,7 +475,7 @@ function buildOverlay() {
     b.style.cssText = "flex:1; padding:8px 6px; border-radius:8px; border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06); color:inherit; cursor:pointer; font-size:12px;";
     return b;
   };
-  const muteBtn = mkBtn("🎙 Микрофон", "Приглушить/вернуть микрофон");
+  const muteBtn = mkBtn("🎙 Микрофон включён", "Выключить микрофон (вас не слышно, агент продолжает говорить)");
   const modeBtn = mkBtn("🧠 Extended", "Переключить режим");
   const endBtn = mkBtn("■ Завершить", "Завершить звонок");
   endBtn.style.borderColor = "rgba(255,100,100,.4)";
@@ -409,9 +493,16 @@ function buildOverlay() {
     end(): void;
   } | null = null;
 
+  const setMuteView = (m: boolean) => {
+    muteBtn.textContent = m ? "🎙 Микрофон выключен" : "🎙 Микрофон включён";
+    muteBtn.classList.toggle("lc-btn-muted", m);
+    muteBtn.title = m ? "Включить микрофон" : "Выключить микрофон (вас не слышно, агент продолжает говорить)";
+    if (m) orb.dataset.state = "muted";
+    else orb.dataset.state = "listening";
+  };
   muteBtn.onclick = () => {
     muted = !muted;
-    muteBtn.textContent = muted ? "🎙 Выкл" : "🎙 Микрофон";
+    setMuteView(muted);
     handlers?.mute(muted);
   };
   modeBtn.onclick = () => {
@@ -428,13 +519,20 @@ function buildOverlay() {
     micWarning,
     micSelect,
     addTranscript(role: "owner" | "agent", text: string, final: boolean) {
-      // Куски одной реплики дописываются в последнюю строку своей роли,
-      // а не рисуются отдельными сообщениями (репорт владельца 02.11).
+      // Одна реплика — одна строка: куски дописываются, финал ПЕРЕЗАПИСЫВАЕТ ту же
+      // строку целиком, а не добавляет дубль (репорт владельца 02.11).
       const prefix = role === "agent" ? "Агент: " : "Вы: ";
       const last = log.lastElementChild as HTMLElement | null;
-      if (!final && last && last.dataset.role === role && !last.dataset.final) {
-        last.textContent = `${prefix}${last.dataset.text ?? ""}${text}`;
-        last.dataset.text = (last.dataset.text ?? "") + text;
+      const reusable = last && last.dataset.role === role && !last.dataset.final;
+      if (reusable) {
+        if (final) {
+          last.dataset.final = "1";
+          last.dataset.text = text;
+          last.textContent = `${prefix}${text}`;
+        } else {
+          last.dataset.text = (last.dataset.text ?? "") + text;
+          last.textContent = `${prefix}${last.dataset.text}`;
+        }
       } else {
         const row = document.createElement("div");
         row.style.cssText = `white-space:pre-wrap; ${role === "agent" ? "opacity:.92" : "opacity:.6;"}`;
@@ -473,6 +571,18 @@ function buildOverlay() {
       confirmation.style.display = "none";
       currentConfirmationId = null;
       void verdict;
+    },
+    setOrbState(state: string) {
+      if (muted && state !== "ended") {
+        orb.dataset.state = "muted";
+        return;
+      }
+      orb.dataset.state = state === "connecting" || state === "ended" ? "listening" : state;
+      stateLine.textContent = stateLabel(state);
+      orb.style.setProperty("--lc-level", "0");
+    },
+    setOrbLevel(level: number) {
+      if (orb.dataset.state === "listening") orb.style.setProperty("--lc-level", String(Math.min(1, level)));
     },
     setHandlers(h: typeof handlers) {
       handlers = h;
