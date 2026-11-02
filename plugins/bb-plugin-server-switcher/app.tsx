@@ -9,12 +9,6 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import {
-  defaultRings,
-  resolveRing,
-  type Ring,
-  type RingSetting,
-} from "./rings.js";
-import {
   accountServerRows,
   accountServersSchema,
   bbAccountStatusSchema,
@@ -30,10 +24,7 @@ import {
 
 import {
   publishAccount,
-  RingPopover,
-  ringKey,
   useAccountRevision,
-  useRings,
   watchAccount,
 } from "./avatar-ui.js";
 
@@ -141,20 +132,25 @@ function useDesktopChoices(
   return state;
 }
 
+function ServerGlyph({ row }: { row: ServerRow }) {
+  return (
+    <span aria-hidden="true" className={cn("relative flex size-8 shrink-0 items-center justify-center text-muted-foreground", row.live === false && "opacity-50")}>
+      <Icon name="ComputerCloud" className="size-5" />
+      {row.live === null ? null : (
+        <span className={cn("absolute bottom-0.5 right-0.5 size-1.5 rounded-full", row.live ? "bg-success" : "bg-muted-foreground")} />
+      )}
+    </span>
+  );
+}
+
 function CurrentServerCard({
   row,
-  ring,
   expanded,
   onToggle,
-  canReset,
-  onRingChange,
 }: {
   row: ServerRow;
-  ring: Ring | null;
   expanded: boolean;
   onToggle: () => void;
-  canReset: boolean;
-  onRingChange: (ring: RingSetting | null) => void;
 }) {
   return (
     <div
@@ -163,13 +159,7 @@ function CurrentServerCard({
         expanded ? "py-2 pl-1.75 pr-3" : "py-1.5 pl-1.75 pr-2.5",
       )}
     >
-      <RingPopover
-        row={row}
-        ring={ring}
-        size={expanded ? "lg" : "sm"}
-        canReset={canReset}
-        onChange={onRingChange}
-      />
+      <ServerGlyph row={row} />
       <button
         type="button"
         aria-current="true"
@@ -202,31 +192,19 @@ function CurrentServerCard({
 
 function ServerRowButton({
   row,
-  ring,
   interactive,
   onSelect,
-  canReset,
-  onRingChange,
 }: {
   row: ServerRow;
-  ring: Ring | null;
   interactive: boolean;
   onSelect: (row: ServerRow) => void;
-  canReset: boolean;
-  onRingChange: (ring: RingSetting | null) => void;
 }) {
   const offline = row.live === false;
   const disabled = !interactive || offline;
   return (
     <li className="flex flex-col">
       <div className="flex min-w-0 items-center gap-2.5 rounded-md py-1 pl-0.75 pr-2 hover:bg-state-hover">
-        <RingPopover
-          row={row}
-          ring={ring}
-          size="sm"
-          canReset={canReset}
-          onChange={onRingChange}
-        />
+        <ServerGlyph row={row} />
         <button
           type="button"
           disabled={disabled}
@@ -266,7 +244,6 @@ function PanelBody({
   onRetry: (() => void) | null;
   accountHandles: readonly string[] | null;
 }) {
-  const { rings, save } = useRings();
   const [expanded, setExpanded] = useState(false);
 
   if (state.status === "loading") {
@@ -313,14 +290,6 @@ function PanelBody({
       </div>
     );
   }
-  const defaults = defaultRings(
-    accountHandles ?? state.rows.filter((row) => row.account).map(ringKey),
-  );
-  const ringProps = (row: ServerRow) => ({
-    ring: resolveRing(rings, ringKey(row), defaults.get(ringKey(row)) ?? null),
-    canReset: row.account && rings[ringKey(row)] !== undefined,
-    onRingChange: (ring: RingSetting | null) => save(ringKey(row), ring),
-  });
   const current = state.rows.find((row) => row.current) ?? null;
   const others = state.rows.filter((row) => !row.current);
   const showList = expanded || current === null;
@@ -329,7 +298,6 @@ function PanelBody({
       {current === null ? null : (
         <CurrentServerCard
           row={current}
-          {...ringProps(current)}
           expanded={expanded}
           onToggle={() => {
             if (!expanded) onRetry?.();
@@ -350,7 +318,6 @@ function PanelBody({
                 <ServerRowButton
                   key={row.id}
                   row={row}
-                  {...ringProps(row)}
                   interactive={interactive}
                   onSelect={onSelect}
                 />
