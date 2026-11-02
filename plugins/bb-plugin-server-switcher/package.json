@@ -1,0 +1,72 @@
+{
+  "name": "bb-plugin-server-switcher",
+  "version": "0.1.3-local.1",
+  "description": "Shows the bb server you are on and switches between the servers on your bb account from the sidebar.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "files": [
+    "app.tsx",
+    "server.ts",
+    "avatar-ui.tsx",
+    "rings.ts",
+    "ring-store.ts",
+    "servers.ts",
+    "components",
+    "lib",
+    "tsconfig.json",
+    "dist",
+    "docs",
+    "icons",
+    "skills",
+    "PLUGIN_OVERVIEW.md",
+    "README.md"
+  ],
+  "engines": {
+    "bb": ">=0.46.0",
+    "bbPluginSdk": "^0.6.104"
+  },
+  "bb": {
+    "name": "Server Switcher",
+    "description": "Shows the bb server you are on and switches between the servers on your bb account from the sidebar.",
+    "branding": {
+      "icon": "ComputerCloud",
+      "experimental_icons": {
+        "bb-mark": "./icons/bb-mark.svg"
+      }
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "bb plugin build .",
+    "verify": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.3.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.104",
+    "@radix-ui/react-popover": "^1.1.19",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "better-sqlite3": "12.11.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "tailwind-merge": "^3.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  }
+}

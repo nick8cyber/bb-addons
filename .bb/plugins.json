@@ -34,6 +34,10 @@
     {
       "name": "thread-timestamps",
       "source": "./plugins/bb-plugin-thread-timestamps"
+    },
+    {
+      "name": "server-switcher",
+      "source": "./plugins/bb-plugin-server-switcher"
     }
   ]
 }
