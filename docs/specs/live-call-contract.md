@@ -122,7 +122,8 @@ type ToolResult =
 | `watch_thread` | доложить о завершении треда |
 | `list_tasks` | задачи трекера по статусу (tasks.`listTasks`) |
 | `read_task` | задача с описанием и комментами (tasks.`getTaskByKey`) |
-| `search_memory` | память BB (memory.`search`) |
+| `search_memory` | память BB. У memory-плагина RPC только админский — поиск идёт через его CLI `bb memory search` на сервере |
+| `remember` | факт в память BB через CLI `bb memory add --scope global` |
 | `system_health` | активные/упавшие треды + провайдеры |
 | `pr_status` | PR-статус треда (threads.get → pullRequest) |
 | `provider_status` | провайдеры моделей |
@@ -151,7 +152,6 @@ type ToolResult =
 | `task_comment` | комментарий к задаче (tasks.`createComment`) |
 | `task_status` | сменить статус задачи (tasks.`updateTask`) |
 | `task_due` | срок задачи (tasks.`updateTask`) |
-| `remember` | факт в память BB (memory.`add`) |
 | `call_note` | пометка в итог звонка |
 | `confirm_action` | только режим `normal` (§2.1 спеки) |
 
@@ -168,7 +168,7 @@ type ToolResult =
 
 **Отложено с причинами (не объявлять модели в v1):**
 - `doc_search` — в docs-RPC нет метода поиска (только vaults/list/pull); вернуться, когда появится.
-- `set_reminder` / `list_reminders` / `cancel_reminder` / `run_automation` — RPC-имена automations (`createAutomation`, `deleteAutomation`…) найдены, но формы входа не сверены; внести в Ф4 по факту сверки.
+- `set_reminder` / `list_reminders` / `cancel_reminder` / `run_automation` — RPC-имена automations (`createAutomation`, `deleteAutomation`…) найдены, но формы входа не сверены; внести в Ф4 по факту сверки. Память тем же путём: RPC memory админский, search/add — через CLI (уже сделано).
 - `task_reassign` — форма обновления исполнителя не сверена; Ф4.
 - `recent_commits` / `ci_status` — в SDK нет git/CI-поверхности; только через агентов в тредах.
 - push, merge, деплой, удаление — никогда (правило владельца).

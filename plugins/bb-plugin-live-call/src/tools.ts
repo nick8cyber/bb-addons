@@ -111,6 +111,28 @@ type InteractionListResult = { interactions?: Array<Record<string, unknown>> } |
 type InteractionsArea = { list(a: { threadId: string }): Promise<InteractionListResult> };
 
 /** Вызов RPC внешнего плагина с честной ошибкой вместо падения. */
+/**
+ * Memory не даёт search/add по RPC (только админские list/update/delete) —
+ * работаем через его CLI: он ходит на этот же сервер локально.
+ */
+async function memoryCli(ctx: ToolContext, args: string[]): Promise<ToolResult> {
+  try {
+    const { spawn } = await import("node:child_process");
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = spawn("bb", ["memory", ...args], { timeout: 15000 });
+      let out = "";
+      child.stdout.on("data", (d) => (out += String(d)));
+      child.stderr.on("data", (d) => (out += String(d)));
+      child.on("error", reject);
+      child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(out.trim().slice(0, 300) || `exit ${code}`))));
+    });
+    void ctx;
+    return truncate(stdout.trim());
+  } catch (e) {
+    return { ok: false, error: { code: "memory_cli_failed", message: String(e).slice(0, 300) } };
+  }
+}
+
 async function pluginRpc(ctx: ToolContext, pluginId: string, method: string, input: Record<string, unknown>): Promise<ToolResult> {
   try {
     const res = await withTimeout(
@@ -439,7 +461,7 @@ export const TOOLS: ToolDef[] = [
     description: "Поиск по памяти BB. До 5 записей.",
     parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     async execute(args, ctx) {
-      return pluginRpc(ctx, "memory", "search", { query: args.query, limit: 5 });
+      return memoryCli(ctx, ["search", String(args.query)]);
     },
   },
   {
@@ -468,7 +490,442 @@ export const TOOLS: ToolDef[] = [
       return truncate({ ending: true });
     },
   },
+  {
+    name: "thread_updates",
+    cls: "R",
+    word: "",
+    description: "События треда с момента N минут назад: завершения, падения, сообщения. До 10.",
+    parameters: {
+      type: "object",
+      properties: { thread: { type: "string" }, sinceMinutes: { type: "number" } },
+      required: ["thread"],
+    },
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      const since = Date.now() - Number(args.sinceMinutes ?? 30) * 60_000;
+      const events = await withTimeout(
+        (ctx.sdk.threads as unknown as { events: { list(a: { threadId: string }): Promise<unknown> } }).events.list({ threadId }),
+      );
+      const rows = asArray(events)
+        .filter((e) => Number(e.createdAt ?? e.ts ?? 0) >= since)
+        .slice(-10)
+        .map((e) => ({ at: e.createdAt ?? e.ts, kind: String(e.type ?? e.kind ?? ""), text: String(e.text ?? e.summary ?? "").slice(0, 200) }));
+      return truncate({ threadId, events: rows });
+    },
+  },
+  {
+    name: "read_task",
+    cls: "R",
+    word: "",
+    description: "Детали задачи трекера по ключу (например PLUG-89): описание, статус, комментарии.",
+    parameters: { type: "object", properties: { key: { type: "string" } }, required: ["key"] },
+    async execute(args, ctx) {
+      return pluginRpc(ctx, "tasks", "getTaskByKey", { key: args.key });
+    },
+  },
+  {
+    name: "system_health",
+    cls: "R",
+    word: "",
+    description: "Здоровье BB: активные и упавшие треды, провайдеры моделей.",
+    parameters: { type: "object", properties: {} },
+    async execute(_args, ctx) {
+      const providers = (await withTimeout(ctx.sdk.providers.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
+      const running = asArray(await withTimeout(ctx.sdk.threads.listRunning() as Promise<Array<Record<string, unknown>>>));
+      return truncate({
+        running: running.length,
+        failed: running.filter((t) => t.status === "error").map((t) => String(t.title ?? t.id)).slice(0, 5),
+        providers: providers.slice(0, 8).map((pr) => ({ id: pr.id, enabled: pr.enabled !== false })),
+      });
+    },
+  },
+  {
+    name: "pr_status",
+    cls: "R",
+    word: "",
+    description: "Статус pull request треда.",
+    parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const t = ref.thread as Record<string, unknown>;
+      return truncate({ thread: briefOf(t), pr: (t.pullRequest ?? {}) as Record<string, unknown> });
+    },
+  },
+  {
+    name: "provider_status",
+    cls: "R",
+    word: "",
+    description: "Провайдеры моделей: какие включены.",
+    parameters: { type: "object", properties: {} },
+    async execute(_args, ctx) {
+      const providers = (await withTimeout(ctx.sdk.providers.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
+      return truncate(providers.map((pr) => ({ id: pr.id, name: pr.name ?? pr.id, enabled: pr.enabled !== false })));
+    },
+  },
+  {
+    name: "plugin_status",
+    cls: "R",
+    word: "",
+    description: "Установленные плагины BB и их состояние.",
+    parameters: { type: "object", properties: {} },
+    async execute(_args, ctx) {
+      const res = (await withTimeout(ctx.sdk.plugins.list({}) as Promise<{ plugins?: Array<Record<string, unknown>> }>)) ?? {};
+      const plugins = (res.plugins ?? []) as Array<Record<string, unknown>>;
+      return truncate(plugins.slice(0, 25).map((pl) => ({ id: pl.id, name: pl.name ?? pl.id, status: pl.status ?? (pl.enabled === false ? "disabled" : "running") })));
+    },
+  },
+  {
+    name: "skills_list",
+    cls: "R",
+    word: "",
+    description: "Установленные скиллы BB. До 20.",
+    parameters: { type: "object", properties: {} },
+    async execute(_args, ctx) {
+      const sys = (await withTimeout((ctx.sdk as unknown as { system: { config(): Promise<{ primaryHostId?: string }> } }).system.config())) as { primaryHostId?: string };
+      const skills = (await withTimeout(ctx.sdk.skills.list({ projectId: "personal", environmentId: sys.primaryHostId ?? "" } as never) as Promise<unknown>)) ?? [];
+      return truncate(asArray(skills).slice(0, 20).map((sk) => ({ id: sk.id, name: sk.name ?? sk.id })));
+    },
+  },
+  {
+    name: "prompt_history",
+    cls: "R",
+    word: "",
+    description: "Последние промпты владельца в проекте. До 10.",
+    parameters: { type: "object", properties: { project: { type: "string" } } },
+    async execute(args, ctx) {
+      const projects = (await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
+      const ref = String(args.project ?? "").trim().toLowerCase();
+      const project = ref ? projects.find((p) => String(p.id ?? "").toLowerCase() === ref || String(p.name ?? "").toLowerCase().includes(ref)) : projects[0];
+      if (!project) return { ok: false, error: { code: "not_found", message: `проект «${String(args.project ?? "")}» не найден` } };
+      const res = await withTimeout(
+        (ctx.sdk as unknown as { experimental_promptHistory: { list(a: { projectId: string }): Promise<unknown> } }).experimental_promptHistory.list({ projectId: String(project.id) }),
+      );
+      const rows = asArray(res).slice(0, 10).map((r) => String(r.prompt ?? r.text ?? "").slice(0, 200));
+      return truncate({ project: String(project.name ?? project.id), prompts: rows });
+    },
+  },
+  {
+    name: "project_branches",
+    cls: "R",
+    word: "",
+    description: "Ветки проекта.",
+    parameters: { type: "object", properties: { project: { type: "string" } }, required: ["project"] },
+    async execute(args, ctx) {
+      const projects = (await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
+      const ref = String(args.project ?? "").trim().toLowerCase();
+      const project = projects.find((p) => String(p.id ?? "").toLowerCase() === ref || String(p.name ?? "").toLowerCase().includes(ref));
+      if (!project) return { ok: false, error: { code: "not_found", message: `проект «${String(args.project)}» не найден` } };
+      const res = await withTimeout(
+        (ctx.sdk.projects as unknown as { branches(a: { projectId: string }): Promise<unknown> }).branches({ projectId: String(project.id) }),
+      );
+      return truncate({ project: String(project.name ?? project.id), branches: res });
+    },
+  },
+  {
+    name: "search_all",
+    cls: "R",
+    word: "",
+    description: "Единый поиск: треды + задачи + память одним вызовом. До 5 в каждой категории.",
+    parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+    async execute(args, ctx) {
+      const q = String(args.query ?? "").trim();
+      const threads = await withTimeout(ctx.sdk.threads.search({ query: q } as never) as Promise<unknown>).catch(() => [] as unknown);
+      const memory = await memoryCli(ctx, ["search", q]);
+      const tasks = await pluginRpc(ctx, "tasks", "listTasks", { query: q, limit: 5 });
+      return truncate({ threads: asArray(threads).slice(0, 5).map(briefOf), memory, tasks });
+    },
+  },
+  {
+    name: "task_comment",
+    cls: "C",
+    word: "да",
+    description: "Комментарий к задаче трекера.",
+    parameters: {
+      type: "object",
+      properties: { key: { type: "string" }, body: { type: "string" } },
+      required: ["key", "body"],
+    },
+    confirmSay: (args) => `Комментарий к задаче ${String(args.key)}: «${String(args.body).slice(0, 200)}». Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      return pluginRpc(ctx, "tasks", "createComment", { key: args.key, body: args.body });
+    },
+  },
+  {
+    name: "task_status",
+    cls: "C",
+    word: "да",
+    description: "Перевести задачу в статус: backlog, in_progress, in_review, done, canceled.",
+    parameters: {
+      type: "object",
+      properties: { key: { type: "string" }, status: { type: "string", enum: ["backlog", "in_progress", "in_review", "done", "canceled"] } },
+      required: ["key", "status"],
+    },
+    confirmSay: (args) => `Перевести задачу ${String(args.key)} в «${String(args.status)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, status: args.status });
+    },
+  },
+  {
+    name: "task_due",
+    cls: "C",
+    word: "да",
+    description: "Установить срок задачи (YYYY-MM-DD).",
+    parameters: {
+      type: "object",
+      properties: { key: { type: "string" }, due: { type: "string" } },
+      required: ["key", "due"],
+    },
+    confirmSay: (args) => `Срок задачи ${String(args.key)} — ${String(args.due)}? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, dueDate: args.due });
+    },
+  },
+  {
+    name: "archive_thread",
+    cls: "C",
+    word: "да",
+    description: "Тред в архив (не удаляет).",
+    parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    confirmSay: (args) => `Архивировать тред «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      await withTimeout(ctx.sdk.threads.archive({ threadId }) as Promise<unknown>);
+      ctx.reportAction("archive_thread", "C", "done", `Архивировал «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ archived: true });
+    },
+  },
+  {
+    name: "compact_thread",
+    cls: "C",
+    word: "да",
+    description: "Сжать контекст длинного треда (штатный /compact).",
+    parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    confirmSay: (args) => `Сжать контекст треда «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      await withTimeout(ctx.sdk.threads.compact({ threadId }) as Promise<unknown>);
+      ctx.reportAction("compact_thread", "C", "done", `Сжал контекст «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ compacted: true });
+    },
+  },
+  {
+    name: "queue_message",
+    cls: "C",
+    word: "да",
+    description: "Сообщение в очередь треда — доставится, когда тред освободится; работу не запускает.",
+    parameters: {
+      type: "object",
+      properties: { thread: { type: "string" }, text: { type: "string" } },
+      required: ["thread", "text"],
+    },
+    confirmSay: (args) => `В очередь треда «${String(args.thread)}»: «${String(args.text).slice(0, 200)}». Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      await withTimeout(
+        (ctx.sdk.threads as unknown as { queuedMessages: { create(a: { threadId: string; text: string }): Promise<unknown> } }).queuedMessages.create({ threadId, text: `[голос] ${String(args.text)}` }),
+      );
+      ctx.reportAction("queue_message", "C", "done", `В очередь «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ queued: true, threadId });
+    },
+  },
+  {
+    name: "pin_thread",
+    cls: "C",
+    word: "да",
+    description: "Закрепить или открепить тред в сайдбаре.",
+    parameters: {
+      type: "object",
+      properties: { thread: { type: "string" }, unpin: { type: "boolean" } },
+      required: ["thread"],
+    },
+    confirmSay: (args) => `${args.unpin ? "Открепить" : "Закрепить"} тред «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      const threads = ctx.sdk.threads as unknown as { pin(a: { threadId: string }): Promise<unknown>; unpin(a: { threadId: string }): Promise<unknown> };
+      if (args.unpin) await withTimeout(threads.unpin({ threadId }));
+      else await withTimeout(threads.pin({ threadId }));
+      ctx.reportAction("pin_thread", "C", "done", `${args.unpin ? "Открепил" : "Закрепил"} «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ pinned: !args.unpin });
+    },
+  },
+  {
+    name: "thread_rename",
+    cls: "C",
+    word: "да",
+    description: "Переименовать тред.",
+    parameters: {
+      type: "object",
+      properties: { thread: { type: "string" }, title: { type: "string" } },
+      required: ["thread", "title"],
+    },
+    confirmSay: (args) => `Переименовать «${String(args.thread)}» в «${String(args.title)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      await withTimeout(ctx.sdk.threads.update({ threadId, title: String(args.title) } as never));
+      ctx.reportAction("thread_rename", "C", "done", `Переименовал в «${String(args.title)}»`, threadId);
+      return truncate({ renamed: true });
+    },
+  },
+  {
+    name: "thread_hide",
+    cls: "C",
+    word: "да",
+    description: "Скрыть или вернуть тред в сайдбаре (не архив).",
+    parameters: {
+      type: "object",
+      properties: { thread: { type: "string" }, unhide: { type: "boolean" } },
+      required: ["thread"],
+    },
+    confirmSay: (args) => `${args.unhide ? "Вернуть" : "Скрыть"} тред «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      await withTimeout(ctx.sdk.threads.update({ threadId, visibility: args.unhide ? "visible" : "hidden" } as never));
+      ctx.reportAction("thread_hide", "C", "done", `${args.unhide ? "Вернул" : "Скрыл"} «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ hidden: !args.unhide });
+    },
+  },
+  {
+    name: "remember",
+    cls: "C",
+    word: "да",
+    description: "Записать факт в память BB (глобально).",
+    parameters: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+    },
+    confirmSay: (args) => `Запомнить: «${String(args.text).slice(0, 200)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      const name = `voice-${Date.now().toString(36)}`;
+      return memoryCli(ctx, [
+        "add", "--scope", "global", "--name", name,
+        "--summary", String(args.text).slice(0, 400),
+        "--details", String(args.text),
+        "--reason", "добавлено голосом в звонке",
+        "--kind", "fact",
+      ]);
+    },
+  },
+  {
+    name: "call_note",
+    cls: "C",
+    word: "да",
+    description: "Пометка в итог текущего звонка.",
+    parameters: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+    },
+    confirmSay: (args) => `Отметить в итоге звонка: «${String(args.text).slice(0, 200)}»? Скажи «да» или «отмена».`,
+    async execute(args, ctx) {
+      ctx.ledger.add("system", `Пометка: ${String(args.text)}`);
+      ctx.reportAction("call_note", "C", "done", `Пометка: ${String(args.text).slice(0, 80)}`);
+      return truncate({ noted: true });
+    },
+  },
+  {
+    name: "retry_thread",
+    cls: "L",
+    word: "запускай",
+    description: "Перезапустить упавший тред. Класс L: только «запускай».",
+    parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    confirmSay: (args) => `Перезапустить тред «${String(args.thread)}»? Скажи «запускай» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const threadId = String(ref.thread.id);
+      await withTimeout(ctx.sdk.threads.retry({ threadId }) as Promise<unknown>);
+      ctx.reportAction("retry_thread", "L", "done", `Перезапустил «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ retried: true, threadId });
+    },
+  },
+  {
+    name: "stop_all_agents",
+    cls: "L",
+    word: "запускай",
+    description: "Остановить ВСЕ активные треды кроме треда звонка. Массовая операция, класс L.",
+    parameters: { type: "object", properties: {} },
+    confirmSay: () => "Остановить все активные треды? Скажи «запускай» или «отмена».",
+    async execute(_args, ctx) {
+      const running = asArray(await withTimeout(ctx.sdk.threads.listRunning() as Promise<Array<Record<string, unknown>>>));
+      const stopped: string[] = [];
+      for (const t of running) {
+        if (t.status === "error") continue;
+        try {
+          await withTimeout(ctx.sdk.threads.stop({ threadId: String(t.id) }) as Promise<unknown>);
+          stopped.push(String(t.title ?? t.id));
+        } catch {
+          // тред мог закрыться между listRunning и stop
+        }
+      }
+      ctx.reportAction("stop_all_agents", "L", "done", `Остановил ${stopped.length}: ${stopped.slice(0, 5).join("; ")}`);
+      return truncate({ stopped });
+    },
+  },
+  {
+    name: "handoff_thread",
+    cls: "L",
+    word: "запускай",
+    description: "Передать тред другой модели: новый тред с контекстом старого (в BB модель треда сменить нельзя).",
+    parameters: {
+      type: "object",
+      properties: { thread: { type: "string" }, model: { type: "string" } },
+      required: ["thread", "model"],
+    },
+    confirmSay: (args) => `Передать тред «${String(args.thread)}» на ${String(args.model)} в новом треде? Скажи «запускай» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const source = ref.thread as Record<string, unknown>;
+      const out = await withTimeout(ctx.sdk.threads.output({ threadId: String(source.id) }) as Promise<{ output: string | null }>);
+      const brief = String(out.output ?? "").slice(-1500);
+      const thread = await withTimeout(
+        ctx.sdk.threads.spawn({
+          projectId: String(source.projectId),
+          prompt: `Продолжи работу из треда ${String(source.id)} («${String(source.title ?? "")}»). Последнее состояние:\n${brief}\nСначала прочитай исходный тред, потом продолжай.`,
+          title: `[хендофф ${String(args.model)}] ${String(source.title ?? "").slice(0, 50)}`,
+          environment: { type: "project-default" },
+        } as never),
+      );
+      const threadId = String((thread as unknown as { id: string }).id);
+      ctx.reportAction("handoff_thread", "L", "done", `Передал на ${String(args.model)}: ${threadId}`, threadId);
+      return truncate({ threadId, from: String(source.id) });
+    },
+  },
+  {
+    name: "fork_thread",
+    cls: "L",
+    word: "запускай",
+    description: "Клонировать тред с контекстом для отдельной доработки.",
+    parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    confirmSay: (args) => `Клонировать тред «${String(args.thread)}»? Скажи «запускай» или «отмена».`,
+    async execute(args, ctx) {
+      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      const source = ref.thread as Record<string, unknown>;
+      const res = await withTimeout(ctx.sdk.threads.fork({ sourceThreadId: String(source.id) } as never) as Promise<{ id: string }>);
+      const threadId = String(res.id);
+      ctx.reportAction("fork_thread", "L", "done", `Клонировал «${String(source.title ?? source.id)}»`, threadId);
+      return truncate({ threadId, from: String(source.id) });
+    },
+  },
 ];
+
 
 export function toolByName(name: string): ToolDef | undefined {
   return TOOLS.find((t) => t.name === name);
