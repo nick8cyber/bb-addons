@@ -23,7 +23,9 @@ const WORKLET_SOURCE = `
 class LiveCallCapture extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Целевая частота 16 кГц; sampleRate глобален в worklet-реалме.
+    // Прореживание input rate -> 16 кГц: один выходной сэмпл на каждые ratio входных.
+    // Раньше цикл был навыворот и КОПИРОВАЛ каждый сэмпл ratio раз — Gemini получал
+    // голос, ускоренный в 3 раза, и не распознавал ни слова (инцидент 02.11).
     this.ratio = sampleRate / 16000;
     this.buffer = new Float32Array(2048);
     this.filled = 0;
@@ -34,10 +36,10 @@ class LiveCallCapture extends AudioWorkletProcessor {
     if (!input || input.length === 0) return true;
     const ch = input[0];
     for (let i = 0; i < ch.length; i++) {
-      this.pos += this.ratio;
-      while (this.pos >= 1 && this.filled < this.buffer.length) {
-        this.pos -= 1;
-        this.buffer[this.filled++] = ch[i];
+      this.pos += 1;
+      if (this.pos >= this.ratio) {
+        this.pos -= this.ratio;
+        if (this.filled < this.buffer.length) this.buffer[this.filled++] = ch[i];
       }
       if (this.filled === this.buffer.length) {
         this.port.postMessage(this.buffer.slice(0, this.filled));
