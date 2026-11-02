@@ -244,7 +244,7 @@ function PanelBody({
   onRetry: (() => void) | null;
   accountHandles: readonly string[] | null;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
 
   if (state.status === "loading") {
     return (
