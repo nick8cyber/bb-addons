@@ -844,4 +844,109 @@ describe("advisor compact composer banner", () => {
     });
   });
 
+  it("keeps buttons locked and blocks second click until reload completes after successful resolve", async () => {
+    let resolveRpcDone: (val: any) => void;
+    let deferredReloadDone: (val: any) => void;
+    let reloadStarted = false;
+
+    const slot = renderBanner({
+      advice: pendingAdviceItem({ id: 1, chainId: 10 }),
+      rpc: {
+        resolveFinding: () =>
+          new Promise((resolve) => {
+            resolveRpcDone = resolve;
+          }),
+        pendingAdvice: () => {
+          if (!reloadStarted) {
+            return { advice: pendingAdviceItem({ id: 1, chainId: 10 }) };
+          }
+          return new Promise((resolve) => {
+            deferredReloadDone = resolve;
+          });
+        },
+      },
+    });
+
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    const notAnIssue = (await q(slot).findByText("Not an issue")) as HTMLButtonElement;
+
+    // First click triggers resolveFinding
+    fireEvent.click(notAnIssue);
+    expect(slot.rpcCalls.filter((c) => c.method === "resolveFinding").length).toBe(1);
+
+    // resolveFinding resolves, but reload (pendingAdvice) is deferred
+    reloadStarted = true;
+    resolveRpcDone!({ ok: true as const, resolved: true });
+
+    // Wait for resolveFinding promise to settle and reload to start
+    await waitFor(() => {
+      expect(slot.rpcCalls.filter((c) => c.method === "pendingAdvice").length).toBe(2);
+    });
+
+    // Second click while reload is still in flight: must be blocked!
+    fireEvent.click(notAnIssue);
+    expect(slot.rpcCalls.filter((c) => c.method === "resolveFinding").length).toBe(1);
+    expect(notAnIssue.disabled).toBe(true);
+
+    // Now deferred reload resolves
+    deferredReloadDone!({ advice: null });
+  });
+
+  it("allows overlapping mutations on t1 and t2 where t1 completion does not unlock t2", async () => {
+    let resolveT1Done: (val: any) => void;
+    let resolveT2Done: (val: any) => void;
+
+    const slot = renderBanner({
+      threadId: "t1",
+      advice: pendingAdviceItem({ id: 1, summary: "Thread 1 advice" }),
+      rpc: {
+        resolveFinding: () =>
+          new Promise((resolve) => {
+            resolveT1Done = resolve;
+          }),
+        dismissAdvice: () =>
+          new Promise((resolve) => {
+            resolveT2Done = resolve;
+          }),
+        pendingAdvice: ({ threadId }: any) => ({
+          advice:
+            threadId === "t1"
+              ? pendingAdviceItem({ id: 1, summary: "Thread 1 advice" })
+              : pendingAdviceItem({ id: 2, summary: "Thread 2 advice" }),
+        }),
+      },
+    });
+
+    // Start mutation on t1
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    fireEvent.click(await q(slot).findByText("Not an issue"));
+    expect(slot.rpcCalls.filter((c) => c.method === "resolveFinding").length).toBe(1);
+
+    // Switch to t2 while t1 mutation is still pending
+    await slot.setComposerScope({ kind: "thread", threadId: "t2" });
+    expect(await q(slot).findByText("Thread 2 advice")).toBeTruthy();
+
+    // Expand t2 card and click Dismiss
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    const dismissT2 = (await q(slot).findByText("Dismiss")) as HTMLButtonElement;
+    expect(dismissT2.disabled).toBe(false);
+
+    // Click dismiss on t2: should NOT be blocked by t1's in-flight mutation!
+    fireEvent.click(dismissT2);
+    await waitFor(() => {
+      expect(slot.rpcCalls.filter((c) => c.method === "dismissAdvice").length).toBe(1);
+    });
+    expect(dismissT2.disabled).toBe(true);
+
+    // Now t1 mutation completes
+    resolveT1Done!({ ok: true as const, resolved: true });
+
+    // Verify t2 remains busy/disabled and is not unlocked by t1's completion
+    await waitFor(() => {
+      expect(dismissT2.disabled).toBe(true);
+    });
+
+    // Finally t2 completes
+    resolveT2Done!({ ok: true as const });
+  });
 });

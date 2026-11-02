@@ -499,15 +499,17 @@ function AdvisorComposerBanner() {
   const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>(
     {},
   );
-  const [mutationState, setMutationState] = useState<{
-    threadId: string;
-    adviceId: number;
-    busyAction: "dismiss" | "continue" | "not-an-issue" | null;
-    error: string | null;
-  } | null>(null);
+  const [mutationStateByCard, setMutationStateByCard] = useState<
+    Record<
+      string,
+      {
+        busyAction: "dismiss" | "continue" | "not-an-issue" | null;
+        error: string | null;
+      }
+    >
+  >({});
 
-  const busyMutationRef = useRef<string | null>(null);
-  const activeMutationRef = useRef<string | null>(null);
+  const busyMutationsRef = useRef<Set<string>>(new Set());
 
   if (!threadId) return null;
 
@@ -547,68 +549,77 @@ function AdvisorComposerBanner() {
     }));
   };
 
-  const currentMutation =
-    mutationState &&
-    mutationState.threadId === threadId &&
-    mutationState.adviceId === advice.id
-      ? mutationState
-      : null;
-
+  const currentMutation = mutationStateByCard[cardKey];
   const busyAction = currentMutation?.busyAction ?? null;
-  const mutationBusy = busyAction !== null;
+  const mutationBusy =
+    busyAction !== null || busyMutationsRef.current.has(cardKey);
   const mutationError = currentMutation?.error ?? null;
   const activeError = mutationError ?? error;
 
   const clearMutationError = () => {
-    setMutationState((prev) =>
-      prev && prev.threadId === threadId && prev.adviceId === advice.id
-        ? { ...prev, error: null }
-        : null,
-    );
+    setMutationStateByCard((prev) => {
+      const existing = prev[cardKey];
+      if (!existing || !existing.error) return prev;
+      return {
+        ...prev,
+        [cardKey]: { ...existing, error: null },
+      };
+    });
   };
 
   const repeated = advice.repeatCount > 1;
   const detailsId = `advisor-banner-details-${advice.id}`;
 
   const handleDismiss = async () => {
-    if (busyMutationRef.current !== null || mutationBusy) return;
-    busyMutationRef.current = cardKey;
-    activeMutationRef.current = cardKey;
-    setMutationState({
-      threadId,
-      adviceId: advice.id,
-      busyAction: "dismiss",
-      error: null,
-    });
+    if (busyMutationsRef.current.has(cardKey) || mutationBusy) return;
+    busyMutationsRef.current.add(cardKey);
+    setMutationStateByCard((prev) => ({
+      ...prev,
+      [cardKey]: {
+        busyAction: "dismiss",
+        error: null,
+      },
+    }));
     try {
       await rpc.call("dismissAdvice", { threadId, adviceId: advice.id });
-      busyMutationRef.current = null;
-      if (activeMutationRef.current !== cardKey) return;
-      setMutationState(null);
-      void reload();
+      await reload();
     } catch (caught) {
-      busyMutationRef.current = null;
-      if (activeMutationRef.current !== cardKey) return;
       const msg = caught instanceof Error ? caught.message : String(caught);
-      setMutationState({
-        threadId,
-        adviceId: advice.id,
-        busyAction: null,
-        error: msg,
+      setMutationStateByCard((prev) => ({
+        ...prev,
+        [cardKey]: {
+          busyAction: null,
+          error: msg,
+        },
+      }));
+    } finally {
+      busyMutationsRef.current.delete(cardKey);
+      setMutationStateByCard((prev) => {
+        const existing = prev[cardKey];
+        if (existing?.error) {
+          return {
+            ...prev,
+            [cardKey]: { ...existing, busyAction: null },
+          };
+        }
+        return {
+          ...prev,
+          [cardKey]: { busyAction: null, error: null },
+        };
       });
     }
   };
 
   const handleNotAnIssue = async () => {
-    if (busyMutationRef.current !== null || mutationBusy) return;
-    busyMutationRef.current = cardKey;
-    activeMutationRef.current = cardKey;
-    setMutationState({
-      threadId,
-      adviceId: advice.id,
-      busyAction: "not-an-issue",
-      error: null,
-    });
+    if (busyMutationsRef.current.has(cardKey) || mutationBusy) return;
+    busyMutationsRef.current.add(cardKey);
+    setMutationStateByCard((prev) => ({
+      ...prev,
+      [cardKey]: {
+        busyAction: "not-an-issue",
+        error: null,
+      },
+    }));
     try {
       const result = await rpc.call("resolveFinding", {
         threadId,
@@ -617,57 +628,79 @@ function AdvisorComposerBanner() {
         reason: "",
         decision: "not-an-issue",
       });
-      busyMutationRef.current = null;
-      if (activeMutationRef.current !== cardKey) return;
       if (!result || result.resolved !== true) {
         throw new Error("This finding is no longer open.");
       }
-      setMutationState(null);
-      void reload();
+      await reload();
     } catch (caught) {
-      busyMutationRef.current = null;
-      if (activeMutationRef.current !== cardKey) return;
       const msg = caught instanceof Error ? caught.message : String(caught);
-      setMutationState({
-        threadId,
-        adviceId: advice.id,
-        busyAction: null,
-        error: msg,
+      setMutationStateByCard((prev) => ({
+        ...prev,
+        [cardKey]: {
+          busyAction: null,
+          error: msg,
+        },
+      }));
+    } finally {
+      busyMutationsRef.current.delete(cardKey);
+      setMutationStateByCard((prev) => {
+        const existing = prev[cardKey];
+        if (existing?.error) {
+          return {
+            ...prev,
+            [cardKey]: { ...existing, busyAction: null },
+          };
+        }
+        return {
+          ...prev,
+          [cardKey]: { busyAction: null, error: null },
+        };
       });
     }
   };
 
   const handleFixInNewTurn = async () => {
-    if (busyMutationRef.current !== null || mutationBusy) return;
-    busyMutationRef.current = cardKey;
-    activeMutationRef.current = cardKey;
-    setMutationState({
-      threadId,
-      adviceId: advice.id,
-      busyAction: "continue",
-      error: null,
-    });
+    if (busyMutationsRef.current.has(cardKey) || mutationBusy) return;
+    busyMutationsRef.current.add(cardKey);
+    setMutationStateByCard((prev) => ({
+      ...prev,
+      [cardKey]: {
+        busyAction: "continue",
+        error: null,
+      },
+    }));
     try {
       const result = await rpc.call("continueFinding", {
         threadId,
         reviewId: advice.id,
       });
-      busyMutationRef.current = null;
-      if (activeMutationRef.current !== cardKey) return;
       if (!result.started && result.reason !== "already-started") {
         throw new Error("This finding is no longer open.");
       }
-      setMutationState(null);
-      void reload();
+      await reload();
     } catch (caught) {
-      busyMutationRef.current = null;
-      if (activeMutationRef.current !== cardKey) return;
       const msg = caught instanceof Error ? caught.message : String(caught);
-      setMutationState({
-        threadId,
-        adviceId: advice.id,
-        busyAction: null,
-        error: msg,
+      setMutationStateByCard((prev) => ({
+        ...prev,
+        [cardKey]: {
+          busyAction: null,
+          error: msg,
+        },
+      }));
+    } finally {
+      busyMutationsRef.current.delete(cardKey);
+      setMutationStateByCard((prev) => {
+        const existing = prev[cardKey];
+        if (existing?.error) {
+          return {
+            ...prev,
+            [cardKey]: { ...existing, busyAction: null },
+          };
+        }
+        return {
+          ...prev,
+          [cardKey]: { busyAction: null, error: null },
+        };
       });
     }
   };
