@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --gap: 14px; }
+  * { box-sizing: border-box; }
+  .wrap { max-width: 704px; display: flex; flex-direction: column; gap: 28px; }
+  h2 { font-size: 15px; margin: 0 0 4px; font-weight: 650; }
+  .lede { color: var(--muted-foreground); margin: 0 0 12px; font-size: 13px; line-height: 1.45; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--secondary); color: var(--secondary-foreground); margin-right: 6px; vertical-align: 1px; }
+  .board { background: var(--surface-recessed, var(--muted)); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; position: relative; overflow: hidden; }
+  .row { display: flex; gap: var(--gap); flex-wrap: wrap; }
+  .col { display: flex; flex-direction: column; gap: 10px; }
+  .muted { color: var(--muted-foreground); }
+  .small { font-size: 12px; }
+  .tiny { font-size: 11px; }
+  .mono { font-family: var(--font-mono); }
+  .principles { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  .pr { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; font-size: 13px; line-height: 1.4; }
+  .pr b { display: block; margin-bottom: 2px; }
+
+  /* fake app */
+  .app { display: grid; grid-template-columns: 150px 1fr; height: 430px; background: var(--background); border: 1px solid var(--border); border-radius: calc(var(--radius) + 2px); overflow: hidden; position: relative; }
+  .side { border-right: 1px solid var(--border); padding: 12px 10px; display: flex; flex-direction: column; gap: 6px; background: var(--card); }
+  .side .it { font-size: 12px; padding: 6px 8px; border-radius: 6px; color: var(--muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .side .it.on { background: var(--accent); color: var(--accent-foreground); }
+  .side .call { margin-top: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 7px 8px; border-radius: 8px; background: var(--primary); color: var(--primary-foreground); font-weight: 600; }
+  .main { padding: 14px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .main .hdr { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 600; }
+  .iconbtn { width: 26px; height: 26px; border-radius: 7px; display: inline-grid; place-items: center; border: 1px solid var(--border); background: var(--card); font-size: 13px; }
+  .bar { height: 9px; border-radius: 5px; background: var(--muted); }
+
+  /* dock */
+  .dock { position: absolute; right: 14px; bottom: 14px; width: 318px; background: var(--popover); color: var(--popover-foreground); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-lg); display: flex; flex-direction: column; overflow: hidden; }
+  .dock-h { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .dock-b { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow: hidden; }
+  .dock-f { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-top: 1px solid var(--border); }
+  .state { font-size: 12.5px; font-weight: 650; }
+  .timer { font-size: 11px; color: var(--muted-foreground); font-family: var(--font-mono); }
+  .grow { flex: 1; }
+
+  /* orb */
+  .orb { --c: var(--brand); width: 22px; height: 22px; border-radius: 50%; background: radial-gradient(circle at 35% 35%, color-mix(in srgb, var(--c) 55%, white), var(--c)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 22%, transparent); flex: none; }
+  .orb.big { width: 64px; height: 64px; box-shadow: 0 0 0 8px color-mix(in srgb, var(--c) 18%, transparent), 0 0 0 16px color-mix(in srgb, var(--c) 8%, transparent); }
+  .orb.huge { width: 120px; height: 120px; box-shadow: 0 0 0 14px color-mix(in srgb, var(--c) 16%, transparent), 0 0 0 30px color-mix(in srgb, var(--c) 7%, transparent); }
+  .s-listen { --c: var(--brand); animation: pulse 1.6s ease-in-out infinite; }
+  .s-think { --c: var(--chart-4, #8b5cf6); animation: breathe 2.8s ease-in-out infinite; }
+  .s-speak { --c: var(--chart-2, #10b981); animation: pulse .7s ease-in-out infinite; }
+  .s-work { --c: var(--chart-3, #f59e0b); }
+  .s-reconnect { --c: var(--warning, #f59e0b); animation: blink 1s steps(2) infinite; }
+  .s-muted { --c: var(--muted-foreground); }
+  @keyframes pulse { 50% { transform: scale(1.08); } }
+  @keyframes breathe { 50% { transform: scale(1.12); filter: brightness(1.15); } }
+  @keyframes blink { 50% { opacity: .45; } }
+  @media (prefers-reduced-motion: reduce) { .orb { animation: none !important; } }
+
+  /* segmented */
+  .seg { display: inline-flex; padding: 2px; border-radius: 9px; background: var(--muted); border: 1px solid var(--border); font-size: 11.5px; }
+  .seg span { padding: 3px 8px; border-radius: 7px; color: var(--muted-foreground); white-space: nowrap; }
+  .seg span.on { background: var(--card); color: var(--foreground); box-shadow: var(--shadow-xs); font-weight: 600; }
+  .seg.lg { font-size: 13px; }
+  .seg.lg span { padding: 6px 12px; }
+  .seg .sw { background: linear-gradient(90deg, var(--card) 55%, transparent 55%); color: var(--foreground); font-weight: 600; }
+
+  /* transcript */
+  .msg { font-size: 12.5px; line-height: 1.4; }
+  .msg .who { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--subtle-foreground, var(--muted-foreground)); margin-bottom: 1px; }
+  .msg.me { align-self: flex-end; text-align: right; max-width: 85%; }
+  .msg.me .t { background: var(--secondary); color: var(--secondary-foreground); padding: 6px 9px; border-radius: 10px 10px 2px 10px; display: inline-block; }
+  .msg.ai .t { padding: 0; }
+  .act { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+  .act .ic { font-size: 13px; }
+  .act .lnk { margin-left: auto; color: var(--brand); font-size: 11.5px; white-space: nowrap; }
+  .act.ok { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+  .act.run { border-style: dashed; }
+  .lvl { display: flex; gap: 2px; align-items: flex-end; height: 16px; }
+  .lvl i { width: 3px; background: var(--brand); border-radius: 2px; display: block; }
+  .btn { font-size: 12px; padding: 6px 11px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--foreground); font-weight: 600; white-space: nowrap; }
+  .btn.pri { background: var(--primary); color: var(--primary-foreground); border-color: transparent; }
+  .btn.dng { background: var(--destructive); color: var(--destructive-foreground, white); border-color: transparent; }
+  .btn.lg { font-size: 14px; padding: 10px 16px; border-radius: 10px; }
+
+  /* pill */
+  .pill { display: inline-flex; align-items: center; gap: 9px; padding: 7px 10px 7px 8px; border-radius: 999px; background: var(--popover); border: 1px solid var(--border); box-shadow: var(--shadow-md); font-size: 12px; }
+
+  /* cards */
+  .card { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .confirm { border: 1.5px solid var(--brand); }
+  .word { display: inline-block; font-weight: 750; font-size: 15px; padding: 3px 10px; border-radius: 8px; background: color-mix(in srgb, var(--brand) 14%, transparent); color: var(--foreground); }
+  .mic { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; padding: 3px 8px; border-radius: 999px; background: var(--muted); }
+  .mic.open { background: color-mix(in srgb, var(--success) 18%, transparent); }
+  .kv { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px; font-size: 12.5px; }
+  .kv .k { color: var(--muted-foreground); }
+  .toast { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--popover); box-shadow: var(--shadow-sm); font-size: 12.5px; line-height: 1.4; }
+  .toast .ic { font-size: 16px; line-height: 1.2; }
+  .toast.warn { border-color: color-mix(in srgb, var(--warning) 55%, var(--border)); }
+  .toast.err { border-color: color-mix(in srgb, var(--destructive) 55%, var(--border)); }
+  .toast.good { border-color: color-mix(in srgb, var(--success) 55%, var(--border)); }
+
+  /* phone */
+  .phone { width: 300px; height: 580px; border-radius: 34px; border: 8px solid var(--foreground); background: var(--background); position: relative; overflow: hidden; display: flex; flex-direction: column; }
+  .phone .notch { position: absolute; top: 6px; left: 50%; transform: translateX(-50%); width: 90px; height: 20px; background: var(--foreground); border-radius: 12px; }
+  .phone .scr { padding: 38px 16px 18px; display: flex; flex-direction: column; flex: 1; gap: 12px; }
+  .sheet { position: absolute; left: 0; right: 0; bottom: 0; background: var(--popover); border-top-left-radius: 20px; border-top-right-radius: 20px; border-top: 1px solid var(--border); padding: 14px 16px 20px; box-shadow: var(--shadow-lg); }
+  .grab { width: 38px; height: 4px; border-radius: 3px; background: var(--border); margin: 0 auto 10px; }
+  .round { width: 56px; height: 56px; border-radius: 50%; display: grid; place-items: center; font-size: 22px; border: 1px solid var(--border); background: var(--card); }
+  .round.end { background: var(--destructive); color: var(--destructive-foreground, white); border-color: transparent; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); background: var(--card); }
+  .chip.x::after { content: " ×"; color: var(--muted-foreground); }
+  .setrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .setrow:last-child { border-bottom: 0; }
+  .setrow .d { font-size: 11.5px; color: var(--muted-foreground); margin-top: 2px; }
+  .sel { font-size: 12px; padding: 5px 9px; border-radius: 7px; border: 1px solid var(--input, var(--border)); background: var(--background); white-space: nowrap; }
+  .health { display: flex; gap: 2px; }
+  .health i { width: 7px; height: 14px; border-radius: 2px; background: var(--success); display: block; }
+  .health i.c { background: var(--warning); }
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12.5px; }
+  .flow .st { padding: 6px 10px; border-radius: 8px; background: var(--card); border: 1px solid var(--border); }
+  .flow .ar { color: var(--muted-foreground); }
+  .note { font-size: 12px; color: var(--muted-foreground); line-height: 1.45; margin-top: 10px; }
+  .note b { color: var(--foreground); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <section>
+    <h2>Live Call — макеты UI/UX <span class="tag">v0.1 черновик</span></h2>
+    <p class="lede">Звонок — это слой поверх BB, а не отдельный экран. Говоришь и одновременно смотришь треды. Пять правил, на которых держатся все макеты:</p>
+    <div class="principles">
+      <div class="pr"><b>1. Состояние видно всегда</b>Шар + слово + цвет: слушаю / думаю / говорю / работаю. Не только цветом.</div>
+      <div class="pr"><b>2. Одно главное действие</b>На каждом экране одна яркая кнопка. Всё прочее вторично.</div>
+      <div class="pr"><b>3. Каждое действие агента — карточка</b>Прочитал, отправил, запустил — со ссылкой на тред. Ничего не происходит «молча».</div>
+      <div class="pr"><b>4. Запуск — только явным словом</b>Карточка подтверждения называет нужное слово крупно и дублирует его кнопкой.</div>
+      <div class="pr"><b>5. Режим — один тап</b>⚡ Обычный ↔ 🧠 Extended прямо в шапке звонка, голосом или клавишей.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>1. Десктоп: звонок поверх треда</h2>
+    <p class="lede">Док в правом нижнем углу, тред под ним остаётся рабочим. Справа сверху свёрнутое состояние — пилюля.</p>
+    <div class="board">
+      <div class="app">
+        <div class="side">
+          <div class="it" style="font-weight:600;color:var(--foreground)">BB</div>
+          <div class="it on">бот-A: фикс фоллбэка</div>
+          <div class="it">проект B: миграция БД</div>
+          <div class="it">BB voice: план</div>
+          <div class="it">проект C: квоты</div>
+          <div class="call">📞 Позвонить <span class="tiny" style="opacity:.75;margin-left:auto">⌘⇧L</span></div>
+        </div>
+        <div class="main">
+          <div class="hdr">бот-A: фикс фоллбэка <span style="display:flex;gap:6px"><span class="iconbtn" title="Позвонить">📞</span><span class="iconbtn">⋯</span></span></div>
+          <div class="bar" style="width:70%"></div><div class="bar" style="width:92%"></div><div class="bar" style="width:54%"></div>
+          <div class="bar" style="width:80%;margin-top:10px"></div><div class="bar" style="width:66%"></div>
+          <div class="pill" style="position:absolute;right:14px;top:14px">
+            <div class="orb s-listen" style="width:16px;height:16px"></div><b>Слушаю</b><span class="timer">04:12</span><span class="seg"><span>⚡</span><span class="on">🧠</span></span><span>🎙</span><span style="color:var(--destructive)">⏹</span>
+          </div>
+        </div>
+        <div class="dock">
+          <div class="dock-h">
+            <div class="orb s-work"></div>
+            <div class="col" style="gap:0"><span class="state">Работаю</span><span class="timer">04:12 · ключ 7/20</span></div>
+            <div class="grow"></div>
+            <span class="seg"><span>⚡ Обычный</span><span class="on">🧠 Extended</span></span>
+            <span class="iconbtn" title="Свернуть">▾</span>
+          </div>
+          <div class="dock-b">
+            <div class="msg me"><div class="who">ты</div><div class="t">Что там с бот-Aом, он закончил?</div></div>
+            <div class="act ok"><span class="ic">📖</span>Прочитал «бот-A: фикс фоллбэка»<span class="lnk">открыть →</span></div>
+            <div class="msg ai"><div class="who">агент</div><div class="t">Закончил: 142 из 142 тестов зелёные. Ждёт твоего слова на push.</div></div>
+            <div class="msg me"><div class="who">ты</div><div class="t">Напиши проект B, пусть прогонит тесты</div></div>
+            <div class="act run"><span class="ic">✉️</span>Отправляю в «проект B: миграция БД»…<span class="lnk tiny muted">0,8 с</span></div>
+          </div>
+          <div class="dock-f">
+            <div class="lvl"><i style="height:5px"></i><i style="height:11px"></i><i style="height:16px"></i><i style="height:9px"></i><i style="height:13px"></i><i style="height:6px"></i></div>
+            <span class="tiny muted">микрофон</span>
+            <div class="grow"></div>
+            <span class="btn">🎙 Выкл</span><span class="btn dng">⏹ Завершить</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note"><b>Решения.</b> Звонок не привязан к треду: координатор видит весь BB. Кнопка 📞 есть в сайдбаре и в шапке любого треда, клавиша ⌘/Ctrl + Shift + L — работает и при фокусе в поле ввода, и в русской раскладке. Ссылка «открыть →» в карточке действия открывает тред, звонок при этом не прерывается.</p>
+  </section>
+
+  <section>
+    <h2>2. Переключатель режима</h2>
+    <p class="lede">Режим — свойство звонка, а не настройка где-то глубоко. Три способа переключить, переключение посреди разговора занимает ~1 с.</p>
+    <div class="board">
+      <div class="row" style="align-items:flex-start">
+        <div class="col" style="flex:1;min-width:300px">
+          <div class="row" style="align-items:center;gap:10px"><span class="seg lg"><span class="on">⚡ Обычный</span><span>🧠 Extended</span></span><span class="small muted">выбран Обычный</span></div>
+          <div class="row" style="align-items:center;gap:10px"><span class="seg lg"><span>⚡ Обычный</span><span class="on">🧠 Extended</span></span><span class="small muted">выбран Extended</span></div>
+          <div class="row" style="align-items:center;gap:10px"><span class="seg lg"><span>⚡ Обычный</span><span class="sw">🧠 Переключаю…</span></span><span class="small muted">~1 с, голос: «Переключилась»</span></div>
+          <div class="card small" style="margin-top:4px">
+            <b>Три способа</b>
+            <div class="kv" style="margin-top:6px"><span class="k">Тап</span><span>сегмент в шапке дока</span><span class="k">Голос</span><span>«переключись на Extended» / «давай быстрый режим»</span><span class="k">Клавиша</span><span class="mono">⌘/Ctrl + Shift + K</span></div>
+          </div>
+        </div>
+        <div class="card" style="width:300px">
+          <div class="small" style="font-weight:650;margin-bottom:8px">Подсказка по наведению</div>
+          <div class="col" style="gap:10px">
+            <div><b>⚡ Обычный</b> · <span class="muted small">gemini-3.8-live</span><div class="small" style="margin-top:3px">Отвечает быстрее всего (~1 с). Сам решает, какой инструмент вызвать. Для команд и статусов.</div></div>
+            <div><b>🧠 Extended</b> · <span class="muted small">3.8 Extended Thinking</span><div class="small" style="margin-top:3px">Думает глубже, отвечает за ~1,5–2 с. Инструменты вызывает помощник по твоим словам. Сам Extended ничего не запускает: он предлагает, решаешь ты.</div></div>
+            <div class="tiny muted">По умолчанию — последний выбранный. Меняется в настройках.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note"><b>Как это работает.</b> Модель задаётся при открытии сессии, поэтому переключение = новая сессия с пересказом разговора, тот же механизм, что при смене ключа. Транскрипт и карточки остаются, в ленте появляется разделитель «— Extended с 04:12 —». Переключение в момент, когда ждёт подтверждение, заблокировано: сначала ответ.</p>
+  </section>
+
+  <section>
+    <h2>3. Состояния звонка</h2>
+    <p class="lede">Шар — главный индикатор. Форма движения различается, поэтому состояние читается и без цвета.</p>
+    <div class="board">
+      <div class="row" style="justify-content:space-between">
+        <div class="col" style="align-items:center;width:100px;text-align:center"><div class="orb big s-listen"></div><b class="small">Слушаю</b><span class="tiny muted">пульс в такт голосу</span></div>
+        <div class="col" style="align-items:center;width:100px;text-align:center"><div class="orb big s-think"></div><b class="small">Думаю</b><span class="tiny muted">медленное «дыхание», только 🧠</span></div>
+        <div class="col" style="align-items:center;width:100px;text-align:center"><div class="orb big s-speak"></div><b class="small">Говорю</b><span class="tiny muted">быстрый пульс, перебивай голосом</span></div>
+        <div class="col" style="align-items:center;width:100px;text-align:center"><div class="orb big s-work"></div><b class="small">Работаю</b><span class="tiny muted">+ карточка «Читаю…»</span></div>
+        <div class="col" style="align-items:center;width:100px;text-align:center"><div class="orb big s-reconnect"></div><b class="small">Переподключаюсь</b><span class="tiny muted">мигает, обычно &lt; 1,5 с</span></div>
+        <div class="col" style="align-items:center;width:100px;text-align:center"><div class="orb big s-muted"></div><b class="small">Микрофон выкл.</b><span class="tiny muted">серый, «🎙 Вкл» в доке</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. Подтверждение действия</h2>
+    <p class="lede">Самое важное место. Пока агент задаёт вопрос, микрофон закрыт: иначе его же голос из динамика может «ответить». Нужное слово показано крупно, кнопка — запасной путь.</p>
+    <div class="board">
+      <div class="row">
+        <div class="card confirm" style="flex:1;min-width:300px">
+          <div class="row" style="align-items:center;gap:8px"><span>🚀</span><b>Запуск агента</b><div class="grow"></div><span class="mic">🔇 микрофон закрыт — звучит вопрос</span></div>
+          <div class="kv" style="margin:10px 0"><span class="k">Проект</span><span>проект A</span><span class="k">Задача</span><span>починить фоллбэк бота</span><span class="k">Пресет</span><span>gemini-38-wt</span></div>
+          <div class="small muted">Агент говорит: «Запускаю агента в проект A — починить фоллбэк. Скажи «запускай» или «отмена».»</div>
+        </div>
+        <div class="card confirm" style="flex:1;min-width:300px">
+          <div class="row" style="align-items:center;gap:8px"><span>🚀</span><b>Запуск агента</b><div class="grow"></div>
+            <svg width="30" height="30" viewBox="0 0 36 36" aria-label="осталось 42 секунды"><circle cx="18" cy="18" r="15" fill="none" stroke="var(--border)" stroke-width="3"/><circle cx="18" cy="18" r="15" fill="none" stroke="var(--brand)" stroke-width="3" stroke-dasharray="66 94" transform="rotate(-90 18 18)" stroke-linecap="round"/><text x="18" y="22" text-anchor="middle" font-size="11" fill="currentColor">42</text></svg>
+          </div>
+          <div class="kv" style="margin:10px 0"><span class="k">Проект</span><span>проект A</span><span class="k">Задача</span><span>починить фоллбэк бота</span></div>
+          <div class="row" style="align-items:center;gap:8px;margin-bottom:10px"><span class="mic open">🎙 слушаю ответ</span><span class="small">Скажи</span><span class="word">«запускай»</span></div>
+          <div class="row" style="gap:8px"><span class="btn pri grow" style="text-align:center">Запустить</span><span class="btn">Отмена</span></div>
+          <div class="tiny muted" style="margin-top:8px">«Да» не запускает — так задумано. Отказ, шум или неясная фраза = отмена.</div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div class="card" style="flex:1;min-width:300px;border:1.5px solid var(--border)">
+          <div class="row" style="align-items:center;gap:8px"><span>✉️</span><b class="small">Отправить в «проект B: миграция БД»?</b><div class="grow"></div><span class="word" style="font-size:13px">«да»</span></div>
+          <div class="small muted" style="margin:6px 0 8px">«прогони тесты» · класс «подтверждение»</div>
+          <div class="row" style="gap:8px"><span class="btn pri">Отправить</span><span class="btn">Отмена</span></div>
+        </div>
+        <div class="card" style="flex:1;min-width:300px;border:1.5px solid var(--warning)">
+          <div class="row" style="align-items:center;gap:8px"><span>🔐</span><b class="small">Агент просит разрешение</b><div class="grow"></div><span class="word" style="font-size:13px">«разрешаю»</span></div>
+          <div class="small mono" style="margin:6px 0 8px">rm -rf ./build && npm ci</div>
+          <div class="row" style="gap:8px"><span class="btn pri">Разрешить</span><span class="btn">Запретить</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="note"><b>Решения.</b> Слово у каждого класса своё и видно сразу: «да» — отправить, «разрешаю» — разрешение, «запускай» — запуск. Цвет рамки: синий — запуск, жёлтый — разрешение агенту. Таймер на 60 с, по истечении — тихая отмена с карточкой «Не дождался ответа, отменил». Если док свёрнут, при подтверждении он сам разворачивается.</p>
+  </section>
+
+  <section>
+    <h2>5. События и сбои</h2>
+    <p class="lede">Агент докладывает сам, когда тред закончил. Если ты говоришь, доклад ждёт паузы, а в пилюле горит счётчик новостей.</p>
+    <div class="board">
+      <div class="col">
+        <div class="toast good"><span class="ic">✅</span><div class="grow"><b>бот-A закончил</b> · 142/142 тестов, ждёт слова на push<div class="tiny muted">озвучено в 04:31 · следил с 02:10</div></div><span class="btn">Открыть</span></div>
+        <div class="toast"><span class="ic">💬</span><div class="grow"><b>проект B спрашивает</b>: какую схему миграции брать — A или B?<div class="tiny muted">в очереди: озвучу после твоей фразы</div></div><span class="pill" style="box-shadow:none;padding:3px 8px">🔔 1</span></div>
+        <div class="toast warn"><span class="ic">🔄</span><div class="grow"><b>Сменил ключ</b> · 7 → 8, ключ 7 упёрся в лимит токенов в минуту. Пауза 1,2 с.<div class="tiny muted">в разговоре: «секунду, переподключаюсь»</div></div></div>
+        <div class="toast warn"><span class="ic">🧠</span><div class="grow"><b>Extended не отвечает</b> · перейти на ⚡ Обычный? Разговор сохранится.</div><span class="btn pri">Перейти</span><span class="btn">Ждать</span></div>
+        <div class="toast err"><span class="ic">🎙</span><div class="grow"><b>Нет доступа к микрофону</b> · браузер запретил. Нажми 🔒 в адресной строке → Микрофон → Разрешить.</div><span class="btn">Повторить</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>6. Телефон</h2>
+    <p class="lede">На телефоне звонок на весь экран: большой шар, крупные кнопки, транскрипт выдвигается снизу. Подтверждение — нижний лист с огромной кнопкой.</p>
+    <div class="board">
+      <div class="row" style="justify-content:center;gap:24px">
+        <div class="phone"><div class="notch"></div><div class="scr">
+          <div class="row" style="justify-content:space-between;align-items:center"><span class="timer">04:12</span><span class="seg"><span>⚡</span><span class="on">🧠 Extended</span></span></div>
+          <div class="col" style="align-items:center;margin-top:46px;gap:22px"><div class="orb huge s-speak"></div><b style="font-size:17px">Говорю</b></div>
+          <div class="small" style="text-align:center;padding:0 6px;margin-top:6px">«бот-A закончил: 142 из 142 тестов. Ждёт твоего слова на push.»</div>
+          <div class="act ok" style="margin-top:4px"><span class="ic">📖</span>Прочитал «бот-A»<span class="lnk">→</span></div>
+          <div class="grow"></div>
+          <div class="row" style="justify-content:space-around;align-items:center"><span class="round">🎙</span><span class="round end">⏹</span><span class="round">💬</span></div>
+        </div></div>
+        <div class="phone"><div class="notch"></div><div class="scr">
+          <div class="row" style="justify-content:space-between;align-items:center"><span class="timer">05:02</span><span class="seg"><span>⚡</span><span class="on">🧠</span></span></div>
+          <div class="col" style="align-items:center;margin-top:30px;gap:16px"><div class="orb big s-listen"></div><b>Слушаю ответ</b></div>
+        </div>
+          <div class="sheet">
+            <div class="grab"></div>
+            <div class="row" style="align-items:center;gap:8px"><span>🚀</span><b>Запуск агента</b><div class="grow"></div><span class="timer">42 с</span></div>
+            <div class="small" style="margin:8px 0">проект A · починить фоллбэк бота</div>
+            <div class="row" style="align-items:center;gap:8px;margin-bottom:12px"><span class="small">Скажи</span><span class="word">«запускай»</span></div>
+            <div class="btn pri lg" style="text-align:center;margin-bottom:8px">Запустить</div>
+            <div class="btn lg" style="text-align:center">Отмена</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note"><b>Ограничение.</b> Мобильный браузер выключает микрофон, когда гаснет экран. Звонок «телефон в кармане» — это Ф5 (своё приложение, Telegram, SIP). В вебе держим экран включённым через Wake Lock и предупреждаем об этом при старте.</p>
+  </section>
+
+  <section>
+    <h2>7. После звонка</h2>
+    <p class="lede">Итог — то, что нужно, чтобы не переслушивать: решения, действия, хвосты.</p>
+    <div class="board">
+      <div class="card">
+        <div class="row" style="align-items:center;gap:8px"><b>Звонок 12:40–12:58</b><span class="tiny muted">18 мин · 🧠 14 мин, ⚡ 4 мин · 2 ключа</span><div class="grow"></div><span class="btn">Перезвонить</span></div>
+        <div class="row" style="margin-top:12px;gap:18px;align-items:flex-start">
+          <div class="col" style="flex:1;min-width:190px;gap:6px"><span class="tiny muted">РЕШЕНИЯ</span><div class="small">• Push проект A-фикса — после ревью</div><div class="small">• Миграция проект B — схема B</div></div>
+          <div class="col" style="flex:1;min-width:190px;gap:6px"><span class="tiny muted">ДЕЙСТВИЯ</span><div class="act ok"><span class="ic">🚀</span>Запущен агент «проект A: фоллбэк»<span class="lnk">→</span></div><div class="act ok"><span class="ic">✉️</span>проект B: «схема B»<span class="lnk">→</span></div></div>
+          <div class="col" style="flex:1;min-width:150px;gap:6px"><span class="tiny muted">ХВОСТЫ</span><div class="small">☐ Слово на push проект A</div><div class="small">☐ Ответ проект C</div></div>
+        </div>
+        <div class="row" style="margin-top:12px;gap:8px"><span class="btn">Полный транскрипт</span><span class="btn">Тред «Звонки»</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>8. Настройки</h2>
+    <div class="board">
+      <div class="card" style="padding:4px 16px">
+        <div class="setrow"><div>Режим по умолчанию<div class="d">Переключается и в самом звонке</div></div><span class="seg"><span class="on">⚡ Обычный</span><span>🧠 Extended</span></span></div>
+        <div class="setrow"><div>Глубина Extended<div class="d">Выше — дольше думает до ответа</div></div><span class="seg"><span class="on">LOW</span><span>MEDIUM</span><span>HIGH</span></span></div>
+        <div class="setrow"><div>Голос и язык</div><span class="sel">Kore · русский ▾</span></div>
+        <div class="setrow"><div>Если Extended не отвечает<div class="d">Решение владельца — §10</div></div><span class="sel">Спросить ▾</span></div>
+        <div class="setrow"><div>Эхо<div class="d">Для динамиков без наушников</div></div><span class="sel">Авто ▾</span></div>
+        <div class="setrow"><div>Ключи AI Studio<div class="d">20 подключено · 18 готовы · 2 остывают до 12:47</div></div><div class="health"><i></i><i></i><i></i><i></i><i></i><i></i><i class="c"></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="c"></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+        <div class="setrow"><div>Слова запуска<div class="d">Можно дополнить, нельзя очистить</div></div><div class="chips"><span class="chip x">запускай</span><span class="chip x">запусти</span><span class="chip x">раздай</span><span class="chip">+</span></div></div>
+        <div class="setrow"><div>Лимит звонка</div><span class="sel">60 мин ▾</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>9. Главный сценарий</h2>
+    <div class="flow">
+      <span class="st">📞 ⌘⇧L</span><span class="ar">→</span><span class="st">«Что горит?»</span><span class="ar">→</span><span class="st">📖 карточки чтения</span><span class="ar">→</span><span class="st">«Запусти агента на X»</span><span class="ar">→</span><span class="st">🚀 подтверждение «запускай»</span><span class="ar">→</span><span class="st">✅ доклад сам</span><span class="ar">→</span><span class="st">⏹ итог звонка</span>
+    </div>
+    <p class="note">Цель для первой версии: от нажатия 📞 до первого ответа по делу — до 3 с, без единого клика после старта.</p>
+  </section>
+
+</div>
+</body>
+</html>

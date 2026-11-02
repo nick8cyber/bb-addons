@@ -122,6 +122,20 @@ bb speak status
 
 Details in [plugins/bb-plugin-speak/README.md](plugins/bb-plugin-speak/README.md).
 
+### `live-call` 📞 — in design, not installable yet
+
+A live voice call with the bb coordinator over the Gemini Live API: talk, interrupt,
+and let it read threads, message agents, and start them — the last only after you
+say «запускай». The call is relayed by the bb server, so Google sees the bb host,
+never your device. Two modes: ⚡ normal (`gemini-3.8-live`) and 🧠 Extended Thinking
+with a tool router, because Extended does not deliver native tool calls today.
+
+[Spec](docs/specs/live-call.md),
+[ADR 0005](docs/adr/0005-live-call-server-relay.md),
+[ADR 0006](docs/adr/0006-live-call-extended-router.md),
+[ADR 0007](docs/adr/0007-live-call-thread-provider.md),
+[design and research](plugins/bb-plugin-live-call/README.md).
+
 ### `sidebar-collapse`
 
 The sidebar keeps the first five chats of every project and folds the rest
