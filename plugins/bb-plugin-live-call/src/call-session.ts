@@ -220,7 +220,9 @@ export class CallSession extends EventEmitter {
     const ctx = this.toolContext();
     client.on("setupComplete", () => {
       // Приветствие только после setupComplete: всё, что ушло раньше, Gemini теряет.
-      client.sendClientContent("Система: звонок начат. Кратко поздоровайся и спроси, что происходит в BB.", true);
+      // Без инструментов и вопросов: одна фраза и молчание, иначе модель сама начинает
+      // обзор и говорит над владельцем (воспроизведено живым звонком 02.11).
+      client.sendClientContent("Система: звонок начат. Поздоровайся одной короткой фразой и жди, что скажет владелец. Ничего не проверяй и инструменты пока не вызывай.", true);
     });
     client.on("audio", (turnSeq: number, pcm: Uint8Array) => {
       this.gate.onModelAudio(turnSeq, pcm.length);
@@ -292,6 +294,9 @@ export class CallSession extends EventEmitter {
     void ctx;
   }
 
+  /** Число вызовов инструментов в текущем ходе владельца (защита от циклов). */
+  private toolCallsThisTurn = 0;
+
   /** native: вызовы инструментов голосовой сессией. */
   private async handleNativeCalls(client: LiveClient, calls: Array<{ id?: string; name: string; args: Record<string, unknown> }>) {
     this.setState("working");
@@ -301,9 +306,17 @@ export class CallSession extends EventEmitter {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` });
         continue;
       }
+      if (this.toolCallsThisTurn >= 6) {
+        client.sendToolResponse(call.id, { error: "слишком много вызовов подряд: ответь владельцу тем, что уже известно" }, "WHEN_IDLE");
+        continue;
+      }
+      this.toolCallsThisTurn += 1;
       const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
       // Голосовая сессия должна отреагировать на результат: WHEN_IDLE (SILENT запрещает ответ).
       client.sendToolResponse(call.id, result, "WHEN_IDLE");
+      if (!result.ok && "error" in result) {
+        this.deps.store.event(this.deps.callId, "tool_error", { tool: def.name, args: call.args, code: result.error.code, message: result.error.message.slice(0, 300) });
+      }
       if (def.cls !== "R") this.deps.store.event(this.deps.callId, "confirm", { tool: def.name });
     }
     this.setState("listening");
@@ -505,6 +518,7 @@ export class CallSession extends EventEmitter {
   /** 700 мс тишины во входном транскрипте — реплика владельца закончена. */
   private finalizeOwnerUtterance() {
     this.ownerUtteranceTimer = null;
+    this.toolCallsThisTurn = 0;
     const u = this.ownerUtterance;
     this.ownerUtterance = null;
     if (!u || !u.text.trim()) return;

@@ -64,13 +64,40 @@ export async function resolveThreadRef(
   sdk: BbPluginApi["sdk"],
   ref: string,
 ): Promise<{ ok: true; thread: Record<string, unknown> } | { ok: false; message: string; candidates: ThreadBrief[] }> {
-  const refLower = ref.trim().toLowerCase();
-  const list = await sdk.threads.list({ limit: 50 });
-  const threads = ((list as unknown as { threads?: Record<string, unknown>[]; items?: Record<string, unknown>[] }).threads ??
-    (list as unknown as { items?: Record<string, unknown>[] }).items ??
-    []) as Record<string, unknown>[];
-  const exact = threads.find((t) => String(t.id ?? "").toLowerCase() === refLower);
-  if (exact) return { ok: true, thread: exact };
+  const refTrim = ref.trim();
+  const refLower = refTrim.toLowerCase();
+
+  // 1. Явный id: threads.get напрямую — list() может не отдать тред первой страницей.
+  if (refLower.startsWith("thr_")) {
+    try {
+      const t = (await sdk.threads.get({ threadId: refTrim })) as unknown as Record<string, unknown>;
+      if (t?.id) return { ok: true, thread: t };
+    } catch {
+      // id не существует — ищем по названию ниже.
+    }
+  }
+
+  // 2. Активные треды — самый частый случай (listRunning отдаёт массив).
+  const collect = (arr: unknown): Array<Record<string, unknown>> =>
+    Array.isArray(arr) ? (arr as Array<Record<string, unknown>>) : [];
+  try {
+    const running = collect(await sdk.threads.listRunning());
+    const byId = running.find((t) => String(t.id ?? "").toLowerCase() === refLower);
+    if (byId) return { ok: true, thread: byId };
+    const byTitle = running.filter((t) => String(t.title ?? "").toLowerCase().includes(refLower));
+    if (byTitle.length === 1) return { ok: true, thread: byTitle[0] };
+    if (byTitle.length > 1) {
+      return { ok: false, message: `несколько тредов подходят под «${ref}»: ${byTitle.slice(0, 3).map((t) => String(t.title ?? "")).join("; ")}`, candidates: byTitle.slice(0, 3).map(briefOf) };
+    }
+  } catch {
+    // listRunning недоступен — ищем по общему списку.
+  }
+
+  // 3. Общий список.
+  const list = await sdk.threads.list({ limit: 100 });
+  const threads = collect(list);
+  const byId = threads.find((t) => String(t.id ?? "").toLowerCase() === refLower);
+  if (byId) return { ok: true, thread: byId };
   const matches = threads.filter((t) => String(t.title ?? "").toLowerCase().includes(refLower));
   if (matches.length === 1) return { ok: true, thread: matches[0] };
   const candidates = matches.slice(0, 3).map(briefOf);

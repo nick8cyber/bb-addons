@@ -177,6 +177,8 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
         ui.stream = stream;
         const ctxIn = new AudioContext();
         ui.audioCtxIn = ctxIn;
+        // Браузер создаёт контексты suspended, даже после клика — без resume микрофон молчит.
+        await ctxIn.resume();
         await ctxIn.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })));
         const source = ctxIn.createMediaStreamSource(stream);
         const worklet = new AudioWorkletNode(ctxIn, "live-call-capture");
@@ -193,6 +195,7 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
         source.connect(worklet);
         worklet.connect(ctxIn.destination); // worklet требует выхода, но молчит
         audioCtxOut = new AudioContext({ sampleRate: 24000 });
+        await audioCtxOut.resume();
         player = new TurnPlayer(audioCtxOut, (turnSeq) => {
           if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "playback_drained", turnSeq }));
         });
