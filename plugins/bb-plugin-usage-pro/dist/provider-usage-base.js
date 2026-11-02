@@ -15885,6 +15885,10 @@ function providerUsagePlugin(bb, options = {}) {
   let previousResourceKeys = new Set();
   const inventoryEpoch = new Map();
   const appliedInventoryEpoch = new Map();
+  const poolAccountStatesSchema = external_exports2.array(external_exports2.object({
+    id: external_exports2.string().min(1),
+    enabled: external_exports2.boolean()
+  }));
   const keyOf = (pluginId, resourceId) => JSON.stringify([pluginId, resourceId]);
 
   const bumpEpoch = (key) => {
@@ -16016,12 +16020,28 @@ function providerUsagePlugin(bb, options = {}) {
               outputSchema: usageSourceRpcContract[usageListMethod].output,
               signal: AbortSignal.timeout(45e3)
             });
+            let resources = inventory.resources;
+            if (source.pluginId === "account-pool") {
+              try {
+                const accounts = await bb.sdk.plugins.callRpc({
+                  pluginId: source.pluginId,
+                  method: "account.list",
+                  input: null,
+                  outputSchema: poolAccountStatesSchema,
+                  signal: AbortSignal.timeout(5e3)
+                });
+                const disabled = new Set(accounts.filter((account) => account.enabled === false).map((account) => account.id));
+                resources = resources.filter((resource) => !disabled.has(resource.id));
+              } catch {
+                // Missing metadata cannot establish that an account is disabled.
+              }
+            }
             if (epoch < (appliedInventoryEpoch.get(source.pluginId) || 0)) return;
             appliedInventoryEpoch.set(source.pluginId, epoch);
             inventories.set(source.pluginId, {
               pluginId: source.pluginId,
               label: inventory.label ?? null,
-              resources: inventory.resources,
+              resources,
               error: null
             });
           } catch {
