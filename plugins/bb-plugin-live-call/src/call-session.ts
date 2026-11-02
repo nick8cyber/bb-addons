@@ -203,10 +203,11 @@ export class CallSession extends EventEmitter {
       sdk: this.deps.sdk,
       gate: this.gate,
       ledger: this.ledger,
-      reportAction: (tool: string, cls: ToolClass, status: "running" | "done" | "failed" | "cancelled", summary: string, threadId?: string) => {
+      newActionId: (tool: string) => this.newActionId(tool),
+      reportAction: (tool: string, cls: ToolClass, status: "running" | "done" | "failed" | "cancelled", summary: string, threadId?: string, actionId?: string) => {
         this.frame({
           type: "action",
-          actionId: `${tool}:${Date.now().toString(36)}`,
+          actionId: actionId ?? this.newActionId(tool),
           tool,
           class: cls,
           status,
@@ -454,7 +455,30 @@ export class CallSession extends EventEmitter {
     }
   }
 
+  private actionSeq = 0;
+  private newActionId(tool: string): string {
+    this.actionSeq += 1;
+    return `${tool}:${this.actionSeq}`;
+  }
+
+  /** Вердикт и время — реплика, которая подтвердила или вызвала подсказку, в ROUTER не идёт. */
+  private lastVerdict: { verdict: string; at: number } | null = null;
+
+  /**
+   * Пока ждёт подтверждение, ответ владельца — только для ConfirmationGate (спека §2.1 п. 2).
+   * Иначе ROUTER слышит «запускай» как новую команду и вызывает инструмент второй раз
+   * (воспроизведено 02.11; прежнее условие isMicOpen() пропускало ответ в открытом окне).
+   * Отказ снимает pending раньше, чем реплика дойдёт сюда, — она уходит в ROUTER как обычная.
+   */
+  private routerMayHearOwner(): boolean {
+    if (this.gate.pendingConfirmation()) return false;
+    const v = this.lastVerdict;
+    if (v && (v.verdict === "approved" || v.verdict === "hint") && Date.now() - v.at < 2500) return false;
+    return true;
+  }
+
   private async onVerdict(p: PendingConfirmation, verdict: "approved" | "hint" | "cancelled" | "expired" | "not_confirmed") {
+    this.lastVerdict = { verdict, at: Date.now() };
     this.frame({ type: "confirmation_result", confirmationId: p.confirmationId, verdict });
     this.deps.store.event(this.deps.callId, "verdict", { tool: p.tool, verdict });
     if (verdict !== "approved") {
@@ -471,7 +495,8 @@ export class CallSession extends EventEmitter {
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
     const def = toolByName(p.tool);
     if (!def) return;
-    this.frame({ type: "action", actionId: `${p.tool}:${Date.now().toString(36)}`, tool: p.tool, class: p.class, status: "running", summary: p.say });
+    const actionId = this.newActionId(p.tool);
+    this.frame({ type: "action", actionId, tool: p.tool, class: p.class, status: "running", summary: p.say });
     let result: ToolResult;
     try {
       result = await def.execute(this.storedArgsOf(p), this.toolContext());
@@ -481,7 +506,7 @@ export class CallSession extends EventEmitter {
     this.gate.consume(p.confirmationId);
     this.frame({
       type: "action",
-      actionId: `${p.tool}:${Date.now().toString(36)}`,
+      actionId,
       tool: p.tool,
       class: p.class,
       status: result.ok ? "done" : "failed",
@@ -549,7 +574,7 @@ export class CallSession extends EventEmitter {
       outgoing = new Uint8Array(ducked.buffer);
     }
     this.voice?.sendAudio(outgoing);
-    if (this.mode === "extended" && this.deps.routerInput === "audio") this.router?.sendAudio(pcm);
+    if (this.mode === "extended" && this.deps.routerInput === "audio" && this.routerMayHearOwner()) this.router?.sendAudio(pcm);
     if (this.state === "listening") this.setState("listening");
   }
 
@@ -607,7 +632,7 @@ export class CallSession extends EventEmitter {
     if (this.ended || !text.trim()) return;
     this.ledger.add("owner", text);
     this.deps.store.event(this.deps.callId, "owner_line", { text });
-    if (this.mode === "extended" && this.router && this.deps.routerInput === "text" && this.gate.isMicOpen()) {
+    if (this.mode === "extended" && this.router && this.deps.routerInput === "text" && this.routerMayHearOwner()) {
       this.router.sendRealtimeText(`[голос сказал: «${this.lastVoiceLine}»] Владелец: ${text}`);
     }
     void this.advanceThreadAfterFirst(text);

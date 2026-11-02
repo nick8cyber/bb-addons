@@ -320,6 +320,10 @@ export default async function plugin(bb: BbPluginApi) {
             if (frame.type === "mute") s.setMuted(frame.muted);
             else if (frame.type === "playback_drained") s.onPlaybackDrained(frame.turnSeq);
             else if (frame.type === "switch_mode") await s.switchMode(frame.mode);
+            else if (frame.type === "client_log") {
+              bb.log.warn(`браузер: ${frame.event}${frame.detail ? ` — ${frame.detail}` : ""}`);
+              store.event(state.session?.callId ?? "browser", "client_log", { event: frame.event, detail: frame.detail });
+            }
             else if (frame.type === "confirm") s.decideConfirmation(frame.confirmationId, frame.decision);
             else if (frame.type === "end") await s.end("owner");
             return;
