@@ -70,7 +70,7 @@ type CallUi = {
  */
 class TurnPlayer {
   private pending: Array<{ turnSeq: number; buffer: AudioBuffer }> = [];
-  private playing = 0;
+  private sources: Array<{ turnSeq: number; source: AudioBufferSourceNode }> = [];
   private lastTurnSeq: number | null = null;
   private drainedSent = new Set<number>();
   private nextStart = 0;
@@ -101,26 +101,34 @@ class TurnPlayer {
       // Курсор: куски встык (любая пауза = щелчок на склейке), без зазоров.
       const start = Math.max(this.ctx.currentTime + 0.015, this.nextStart);
       this.nextStart = start + item.buffer.duration;
-      this.playing += 1;
+      const turnSeq = item.turnSeq;
       source.onended = () => {
-        this.playing = Math.max(0, this.playing - 1);
+        this.sources = this.sources.filter((p) => p.source !== source);
         if (this.lastTurnSeq !== null) this.maybeDrain(this.lastTurnSeq);
       };
+      this.sources.push({ turnSeq, source });
       source.start(start);
     }
   }
 
   private maybeDrain(turnSeq: number) {
-    if (this.pending.length > 0 || this.playing > 0) return;
+    if (this.pending.length > 0 || this.sources.length > 0) return;
     if (this.drainedSent.has(turnSeq)) return;
     this.drainedSent.add(turnSeq);
     this.drained(turnSeq);
   }
 
   interrupted() {
-    // Быстрый сброс: источники остановить нельзя выборочно — стопаем всё и чистим курсор.
+    // ПЕРЕБИВАНИЕ: старая речь обязана замолчать — иначе она звучит поверх новой.
+    for (const p of this.sources) {
+      try {
+        p.source.stop();
+      } catch {
+        // Источник уже закончился.
+      }
+    }
+    this.sources = [];
     this.pending = [];
-    this.playing = 0;
     this.nextStart = this.ctx.currentTime;
     this.drainedSent.clear();
   }
