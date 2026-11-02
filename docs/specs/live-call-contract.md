@@ -18,7 +18,7 @@ tags: [live-call, contract]
 
 | Ключ (`bb.settings.define`) | Тип | По умолчанию | Правила |
 |---|---|---|---|
-| `geminiKeys` | secret, строки | — | 1–2 ключа AI Studio, по одному на строку. Первый — основной, второй — запасной. Нет ключей → `needsConfiguration` |
+| `geminiKeys` | secret, строки | — | 1–2 ключа AI Studio, по одному на строку. Первый — основной, второй — запасной. Нет ключей → `needsConfiguration`. В extended нужны оба (VOICE=k1, ROUTER=k2): старт звонка в extended с одним ключом → фоллбэк в normal + `warning { code: "extended_unavailable" }` |
 | `defaultMode` | `"normal" \| "extended"` | `"normal"` | Режим нового звонка. После звонка сохраняется последний выбранный (`lastMode` в хранилище плагина) |
 | `extendedThinkingLevel` | `"LOW" \| "MEDIUM" \| "HIGH"` | `"LOW"` | Только для VOICE в режиме `extended` |
 | `voice` | строка из 30 голосов | `"Algenib"` | `speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName` |
@@ -62,7 +62,8 @@ bytes 5..   PCM16 LE, моно: 0x01 — 16 кГц, 20 мс = 640 байт; 0x02
 
 | `type` | Поля |
 |---|---|
-| `ready` | `callId`, `threadId`, `mode`, `voice`, `keys: { active: 1\|2, of: 1\|2 }` |
+| `ready` | `callId`, `mode`, `voice`, `keys: { active: 1\|2, of: 1\|2 }` — число настроенных ключей. В extended VOICE и ROUTER всегда на k1 и k2, запаса нет |
+| `thread` | `threadId` — тред звонка создан (первая законченная реплика владельца); до этого кадра треда нет |
 | `state` | `state: "connecting"\|"listening"\|"thinking"\|"speaking"\|"working"\|"reconnecting"\|"muted"\|"ended"`, `detail?` |
 | `transcript` | `role: "owner"\|"agent"`, `text`, `final: boolean`, `turnSeq?` |
 | `interrupted` | `turnSeq` — клиент сразу сбрасывает буфер плеера |
@@ -72,7 +73,7 @@ bytes 5..   PCM16 LE, моно: 0x01 — 16 кГц, 20 мс = 640 байт; 0x02
 | `event` | `kind: "thread.idle"\|"thread.failed"\|"interaction.pending"`, `threadId`, `summary`, `queued: boolean` |
 | `mode` | `mode`, `switching: boolean` |
 | `key` | `active`, `of`, `reason: "quota"\|"unavailable"` — переход на запасной ключ |
-| `warning` | `code: "tpm_near_limit"\|"call_ending"`, `message` |
+| `warning` | `code: "tpm_near_limit"\|"call_ending"\|"extended_unavailable"`, `message` |
 | `error` | `code`, `message`, `retryable: boolean` |
 | `ended` | `callId`, `threadId`, `reason: "owner"\|"limit"\|"error"` |
 
@@ -89,6 +90,9 @@ bytes 5..   PCM16 LE, моно: 0x01 — 16 кГц, 20 мс = 640 байт; 0x02
 | `extended` VOICE | `models/gemini-3.8-live-extended-thinking` | `thinkingConfig.thinkingLevel` (§1), **без `tools`** |
 | `extended` ROUTER | `models/gemini-3.8-live` | `tools` (§4), `systemInstruction` маршрутизатора (§8), звук выбрасывается |
 
+- Вставка текста в сессию, два кадра и правило выбора:
+  - `clientContent { role: "user", turns: [text], turnComplete }` — всё, что инициирует сервер: `[СИСТЕМА]`-пакеты результатов, проактивные события, итог при смене ключа (`turnComplete: true` — модель отвечает голосом); сводка «что сейчас в BB» на старте и пересказ при handover (`turnComplete: false` — модель молчит, ждёт владельца). `clientContent`, а не `realtimeInput.text`, чтобы вставки не попадали во `inputTranscription` и не засоряли транскрипт звонка;
+  - `realtimeInput { text }` — только реплика владельца в ROUTER (вариант А): транскрипт ROUTER никому не виден, его звук выбрасывается.
 - `goAway` → переподключение тем же ключом с последним `newHandle` до истечения `timeLeft`.
 - 429 / `RESOURCE_EXHAUSTED` / закрытие с кодом квоты → `KeyPool` переходит на запасной ключ: новая сессия + пересказ из `ContextLedger` (последние 10 реплик + сводка ≤800 токенов, `clientContent`, `turnComplete: false`). Запасного нет → `error { code: "quota_all_keys" }`.
 - `usageMetadata` суммируется за скользящие 60 с. Больше 50 000 → `warning { code: "tpm_near_limit" }`. Ключ заранее не меняется.
@@ -126,7 +130,9 @@ type ToolResult =
 
 **Граница правила «запускай».** `send_to_thread` и `tasks_create` доставляют или записывают текст, который владелец утвердил: фраза-вопрос `say` зачитывает текст сообщения целиком. Запуск работы в треде-получателе — решение получателя, как при обычном сообщении в BB, поэтому класс C. Создание и раздача агентов (`start_thread`, `tasks_dispatch`) — класс L: только «запускай»/«раздай».
 
-Сигнатуры SDK (сверено с типами 0.6.49): вопрос агента — `threads.interactions.respond({ interactionId, threadId, value })` (`value: JsonValue`); запрос разрешения — `threads.interactions.resolve({ interactionId, threadId, resolution })` (`resolution: PendingInteractionResolution`). Глобального списка ожидающих в SDK нет: снимок — `threads.listRunning` + `threads.interactions.list({ threadId })` по каждому; в реальном времени — realtime-событие `interaction.pending` (несёт `{ thread, interaction }`), его кеширует `EventBridge`.
+**Внешние плагины.** `tasks_create`, `tasks_dispatch` и `search_memory` идут через `bb.sdk.plugins.callRpc({ pluginId, method, input, outputSchema })` (`pluginId: "tasks"` и `"memory"`). Точные имена методов и схемы входа/выхода сверяются с установленными плагинами в начале Ф4 и дописываются в эту таблицу; до сверки envelope ответа — как в таблице, ошибка RPC → `error.code: "rpc_failed"`.
+
+Сигнатуры SDK (сверено с типами 0.6.49): вопрос агента — `threads.interactions.respond({ interactionId, threadId, value })` (`value: JsonValue`); запрос разрешения — `threads.interactions.resolve({ interactionId, threadId, resolution })` (`resolution: PendingInteractionResolution`): при `grant: true` — `{ kind: "approval", decision: "allow_once", grantedPermissions }`, где `grantedPermissions` копируется из payload ожидающего запроса (`{ fileSystem: { read, write } | null, network: { enabled | null } | null }`), при отказе — `decision: "deny"`; текстовый ответ на вопрос — `{ kind: "user_answer", answers: { [questionId]: { freeText: answer } } }` (questionId — из payload). Глобального списка ожидающих в SDK нет: снимок — `threads.listRunning` + `threads.interactions.list({ threadId })` по каждому; в реальном времени — realtime-событие `interaction.pending` (несёт `{ thread, interaction }`), его кеширует `EventBridge`.
 
 ## 5. ConfirmationGate
 
@@ -143,7 +149,7 @@ interface ConfirmationGate {
 type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 ```
 
-Константы: TTL — 60 с, отступ окна — 300 мс, конец реплики — 700 мс тишины, ожидание транскрипта — до 3 с, длина реплики — не больше 6 слов. Классификатор — чистая функция `classify(text, cls, words) → Verdict`, покрыта тестами из приёмки Ф3.
+Константы: TTL — 60 с, отступ окна — 300 мс, конец реплики — 700 мс тишины, ожидание транскрипта — до 3 с, длина реплики — не больше 6 слов, окно дедупликации после вердикта — 5 мин. `argsHash` — SHA-256 канонического JSON аргументов (ключи отсортированы, без пробелов). Повтор вызова записи с тем же `argsHash` в течение 5 мин после исполнения или отмены возвращает «уже выполнено» / «отменено владельцем» без нового pending. Классификатор — чистая функция `classify(text, cls, words) → Verdict`, покрыта тестами из приёмки Ф3.
 
 **Зачёт только «свежих» реплик.** Сервер ставит отметку времени на каждый кусок `inputTranscription` и собирает реплику из кусков подряд. Вердикт ищется только по реплике, **первый кусок которой пришёл после открытия окна**: опоздавший хвост речи, начатой до вопроса, не склеивается с новой репликой и в зачёт не идёт, каким бы долгим ни был лаг транскрипта.
 
@@ -159,7 +165,7 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 
 - Сервер пишет `<dataDir>/plugins/live-call/bridge-data/server.json = { "url": bb.server.loopbackBaseUrl, "protocol": 1 }` при загрузке.
 - Мост читает файл (повтор раз в секунду, пока файла нет) и подключается к WS `/bridge` (`auth: "local"`, без `Origin`).
-- Мост → сервер: `hello { pid, protocol: 1 }`, `own { threadId }` (после `thread/start` и `thread/resume`), `turn { threadId, providerTurnId, text }`, `turn_closed { threadId, providerTurnId, status }`.
+- Мост → сервер: `hello { pid, protocol: 1 }`, `own { threadId }` (после `thread/start` и `thread/resume`), `turn { threadId, providerTurnId, text }`, `turn_closed { threadId, providerTurnId, status }`. Мост шлёт `turn_closed`, когда закрыл открытый ход: по `end` сервера, при закрытии хода ради следующего (новая реплика после `end`) или при `thread/stop interrupt` (тогда `status: "interrupted"`).
 - Сервер → мост: `say { threadId, text }`, `end { threadId }`. Сообщения идут только процессу-владельцу треда (`own`).
 - Рукопожатие: `grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3]`, `steerMode: "queue"`. У `item.close` обязателен `status`. Каждая пачка дельт в тестах проходит `threadDeltaSchema`.
 - Скрытие: `experimental_visibility: "installed"`, `maintenance: { health: true }`, `provider/health → status: "not_installed"`. Обычное сообщение, напечатанное в тред звонка вне звонка, получает ответ «Это запись звонка. Новый звонок — кнопкой 📞» и ход закрывается.
@@ -188,7 +194,7 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 
 | Раздел контракта | Этап | Приёмка (спека §9) |
 |---|---|---|
-| §1–3 | Ф1 | 15 мин без обрыва, перебивание < 300 мс, переход на запасной ключ ≤ 1,5 с |
-| §4, §8 (normal, ROUTER) | Ф2 | ответ голосом ≤ 3 с, маршрутизатор не зацикливается |
-| §5, §6 | Ф3 | все негативные тесты ConfirmationGate, звонок = тред |
-| §7, §9 | Ф4 | `bb plugin build`, тесты, ревью ОК |
+| §1 настройки без tasks/memory, §2 WS-протокол, §3 Gemini (`end_call`, KeyPool, handover) | Ф1 | 15 мин без обрыва, перебивание < 300 мс, переход на запасной ключ ≤ 1,5 с |
+| §3 вставки (`clientContent`/`realtimeInput`), §4 инструменты чтения (`bb_overview`, `list_threads`, `read_thread`, `list_pending`, `switch_mode`), §8 (normal, ROUTER) | Ф2 | ответ голосом ≤ 3 с, маршрутизатор не зацикливается |
+| §4 инструменты действий (`watch_thread`, `send_to_thread`, `answer_interaction`, `stop_thread`, `start_thread`, `confirm_action`), §5, §6, §7 (мост) | Ф3 | все негативные тесты ConfirmationGate, звонок = тред |
+| §4 плагины (`tasks_create`, `tasks_dispatch`, `search_memory`), §9 | Ф4 | `bb plugin build`, тесты, ревью ОК |
