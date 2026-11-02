@@ -21,7 +21,9 @@ export interface ToolContext {
   gate: ConfirmationGate;
   ledger: ContextLedger;
   /** Карточка действия в оверлей и транскрипт звонка. */
-  reportAction: (tool: string, cls: ToolClass, status: "running" | "done" | "failed" | "cancelled", summary: string, threadId?: string) => void;
+  reportAction: (tool: string, cls: ToolClass, status: "running" | "done" | "failed" | "cancelled", summary: string, threadId?: string, actionId?: string) => void;
+  /** Один id на всё действие: «идёт» и «готово» обновляют одну карточку. */
+  newActionId?: (tool: string) => string;
   callsProjectId: () => string | null;
   /** Аргументы ожидающего подтверждения — сервер хранит их сам, модель не подменит. */
   rememberArgs?: (argsHash: string, args: Record<string, unknown>) => void;
@@ -361,6 +363,26 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "list_tasks",
+    cls: "R",
+    word: "",
+    description: "Задачи трекера по статусу: backlog, in_progress, in_review, done. До 15.",
+    parameters: {
+      type: "object",
+      properties: { status: { type: "string", description: "статус задач, например backlog или in_progress" } },
+    },
+    async execute(args, ctx) {
+      const res = await withTimeout(
+        (ctx.sdk.plugins as unknown as { callRpc(a: unknown): Promise<unknown> }).callRpc({
+          pluginId: "tasks",
+          method: "listTasks",
+          input: { status: args.status, limit: 15 },
+        } as never),
+      ).catch((e: unknown) => ({ error: String(e) }));
+      return truncate(res);
+    },
+  },
+  {
     name: "tasks_create",
     cls: "C",
     word: "да",
@@ -480,13 +502,18 @@ export async function runToolCall(
   ctx: ToolContext,
 ): Promise<{ result: ToolResult; executed: boolean }> {
   if (def.cls === "R") {
-    ctx.reportAction(def.name, "R", "running", def.description);
+    const actionId = ctx.newActionId?.(def.name);
+    const label = readActionLabel(def.name, args);
+    if (label) ctx.reportAction(def.name, "R", "running", label.running, undefined, actionId);
     try {
       const result = await def.execute(args, ctx);
-      ctx.reportAction(def.name, "R", result.ok ? "done" : "failed", def.description);
+      if (label) {
+        const threadId = result.ok ? threadIdOf(result.data) : undefined;
+        ctx.reportAction(def.name, "R", result.ok ? "done" : "failed", result.ok ? label.done : `${label.failed}: ${"error" in result ? result.error.message : ""}`.slice(0, 160), threadId, actionId);
+      }
       return { result, executed: result.ok };
     } catch (e) {
-      ctx.reportAction(def.name, "R", "failed", String(e));
+      if (label) ctx.reportAction(def.name, "R", "failed", `${label.failed}: ${String(e)}`.slice(0, 160), undefined, actionId);
       return { result: { ok: false, error: { code: "internal", message: String(e) } }, executed: false };
     }
   }
@@ -503,4 +530,38 @@ export async function runToolCall(
     return { result, executed: result.ok };
   }
   return { result: { ok: false, needsConfirmation: { confirmationId: req.pending.confirmationId, say } }, executed: false };
+}
+
+
+/**
+ * Подписи карточек для инструментов чтения: что агент делает, а не описание
+ * инструмента (баг 02.11: в карточке было «Статус и последний вывод треда, усечение…»).
+ * null — инструмент карточку не рисует (switch_mode, end_call рисуют свои).
+ */
+export function readActionLabel(
+  name: string,
+  args: Record<string, unknown>,
+): { running: string; done: string; failed: string } | null {
+  const q = (v: unknown) => String(v ?? "").trim().slice(0, 60);
+  switch (name) {
+    case "bb_overview":
+      return { running: "Смотрю, что происходит в BB", done: "Посмотрел, что происходит в BB", failed: "Не удалось посмотреть BB" };
+    case "list_threads": {
+      const parts = [args.project ? `в «${q(args.project)}»` : "", args.query ? `«${q(args.query)}»` : ""].filter(Boolean).join(" ");
+      return { running: `Ищу треды${parts ? ` ${parts}` : ""}`, done: `Нашёл треды${parts ? ` ${parts}` : ""}`, failed: "Не удалось найти треды" };
+    }
+    case "read_thread":
+      return { running: `Читаю «${q(args.thread)}»`, done: `Прочитал «${q(args.thread)}»`, failed: `Не удалось прочитать «${q(args.thread)}»` };
+    case "list_pending":
+      return { running: "Смотрю, что ждёт ответа", done: "Посмотрел, что ждёт ответа", failed: "Не удалось получить ожидающие" };
+    case "search_memory":
+      return { running: `Ищу в памяти «${q(args.query)}»`, done: `Нашёл в памяти «${q(args.query)}»`, failed: "Поиск в памяти не удался" };
+    default:
+      return null;
+  }
+}
+
+function threadIdOf(data: unknown): string | undefined {
+  const d = data as { thread?: { id?: unknown } } | null;
+  return d && typeof d === "object" && d.thread && typeof d.thread.id === "string" ? d.thread.id : undefined;
 }
