@@ -633,7 +633,7 @@ describe("advisor compact composer banner", () => {
     fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
     fireEvent.click(await q(slot).findByText("Not an issue"));
 
-    expect(await q(slot).findByText("Failed to resolve finding.")).toBeTruthy();
+    expect(await q(slot).findByText("This finding is no longer open.")).toBeTruthy();
 
     // Card is NOT replaced: user can still collapse/expand
     const toggle = await q(slot).findByRole("button", { name: "Show less" });
@@ -641,7 +641,7 @@ describe("advisor compact composer banner", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
 
     // Error remains visible even when collapsed
-    expect(await q(slot).findByText("Failed to resolve finding.")).toBeTruthy();
+    expect(await q(slot).findByText("This finding is no longer open.")).toBeTruthy();
 
     // Retry button clears error and refetches without re-invoking resolveFinding
     const initialResolveCalls = slot.rpcCalls.filter(
@@ -650,7 +650,7 @@ describe("advisor compact composer banner", () => {
     fireEvent.click(await q(slot).findByText("Retry"));
 
     await waitFor(() => {
-      expect(q(slot).queryByText("Failed to resolve finding.")).toBeNull();
+      expect(q(slot).queryByText("This finding is no longer open.")).toBeNull();
     });
     // No second resolveFinding call from Retry!
     expect(
@@ -805,6 +805,42 @@ describe("advisor compact composer banner", () => {
     // Error does not leak to t2
     await waitFor(() => {
       expect(q(slot).queryByText("Old mutation failure on t1")).toBeNull();
+    });
+  });
+
+  it("discards deferred mutation late success on t1 after switching to t2 and preserves t2 card", async () => {
+    let resolveT1Mutation: (val: any) => void;
+    const slot = renderBanner({
+      threadId: "t1",
+      advice: pendingAdviceItem({ id: 1, summary: "Thread 1 advice" }),
+      rpc: {
+        resolveFinding: () =>
+          new Promise((resolve) => {
+            resolveT1Mutation = resolve;
+          }),
+        pendingAdvice: ({ threadId }: any) => ({
+          advice:
+            threadId === "t1"
+              ? pendingAdviceItem({ id: 1, summary: "Thread 1 advice" })
+              : pendingAdviceItem({ id: 2, summary: "Thread 2 advice" }),
+        }),
+      },
+    });
+
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    fireEvent.click(await q(slot).findByText("Not an issue"));
+
+    // Switch to thread t2 while t1 mutation is still in flight
+    await slot.setComposerScope({ kind: "thread", threadId: "t2" });
+    expect(await q(slot).findByText("Thread 2 advice")).toBeTruthy();
+
+    // Now t1 mutation resolves late with success
+    resolveT1Mutation!({ ok: true as const, resolved: true });
+
+    // Ensure thread 2 advice remains displayed, not wiped by stale reload from t1
+    await waitFor(() => {
+      expect(q(slot).getByText("Thread 2 advice")).toBeTruthy();
+      expect(q(slot).queryByText("Thread 1 advice")).toBeNull();
     });
   });
 });

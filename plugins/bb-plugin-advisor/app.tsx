@@ -303,6 +303,7 @@ function useThreadAdvisor<
   }, []);
 
   const load = useCallback(async () => {
+    if (currentThreadIdRef.current !== threadId) return;
     if (threadId === null) {
       if (mountedRef.current) {
         setState({ threadId: null, data: null, error: null });
@@ -505,6 +506,7 @@ function AdvisorComposerBanner() {
     error: string | null;
   } | null>(null);
 
+  const busyMutationRef = useRef<string | null>(null);
   const activeMutationRef = useRef<string | null>(null);
 
   if (!threadId) return null;
@@ -569,7 +571,8 @@ function AdvisorComposerBanner() {
   const detailsId = `advisor-banner-details-${advice.id}`;
 
   const handleDismiss = async () => {
-    if (mutationBusy) return;
+    if (busyMutationRef.current !== null || mutationBusy) return;
+    busyMutationRef.current = cardKey;
     activeMutationRef.current = cardKey;
     setMutationState({
       threadId,
@@ -579,10 +582,12 @@ function AdvisorComposerBanner() {
     });
     try {
       await rpc.call("dismissAdvice", { threadId, adviceId: advice.id });
+      busyMutationRef.current = null;
       if (activeMutationRef.current !== cardKey) return;
       setMutationState(null);
       void reload();
     } catch (caught) {
+      busyMutationRef.current = null;
       if (activeMutationRef.current !== cardKey) return;
       const msg = caught instanceof Error ? caught.message : String(caught);
       setMutationState({
@@ -595,7 +600,8 @@ function AdvisorComposerBanner() {
   };
 
   const handleNotAnIssue = async () => {
-    if (mutationBusy) return;
+    if (busyMutationRef.current !== null || mutationBusy) return;
+    busyMutationRef.current = cardKey;
     activeMutationRef.current = cardKey;
     setMutationState({
       threadId,
@@ -611,13 +617,15 @@ function AdvisorComposerBanner() {
         reason: "",
         decision: "not-an-issue",
       });
+      busyMutationRef.current = null;
       if (activeMutationRef.current !== cardKey) return;
       if (!result || result.resolved !== true) {
-        throw new Error("Failed to resolve finding.");
+        throw new Error("This finding is no longer open.");
       }
       setMutationState(null);
       void reload();
     } catch (caught) {
+      busyMutationRef.current = null;
       if (activeMutationRef.current !== cardKey) return;
       const msg = caught instanceof Error ? caught.message : String(caught);
       setMutationState({
@@ -630,7 +638,8 @@ function AdvisorComposerBanner() {
   };
 
   const handleFixInNewTurn = async () => {
-    if (mutationBusy) return;
+    if (busyMutationRef.current !== null || mutationBusy) return;
+    busyMutationRef.current = cardKey;
     activeMutationRef.current = cardKey;
     setMutationState({
       threadId,
@@ -643,6 +652,7 @@ function AdvisorComposerBanner() {
         threadId,
         reviewId: advice.id,
       });
+      busyMutationRef.current = null;
       if (activeMutationRef.current !== cardKey) return;
       if (!result.started && result.reason !== "already-started") {
         throw new Error("This finding is no longer open.");
@@ -650,6 +660,7 @@ function AdvisorComposerBanner() {
       setMutationState(null);
       void reload();
     } catch (caught) {
+      busyMutationRef.current = null;
       if (activeMutationRef.current !== cardKey) return;
       const msg = caught instanceof Error ? caught.message : String(caught);
       setMutationState({
