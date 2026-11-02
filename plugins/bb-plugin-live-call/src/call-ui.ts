@@ -143,7 +143,6 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
   const overlay = buildOverlay();
   const ui: Partial<CallUi> = { sock };
   let player: TurnPlayer | null = null;
-  let audioCtxOut: AudioContext | null = null;
   let ownerHeard = false;
   let currentMode: "normal" | "extended" = "normal";
 
@@ -154,7 +153,6 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
       // поток уже остановлен
     }
     try {
-      audioCtxOut?.close();
       ui.audioCtxIn?.close();
     } catch {
       // контексты уже закрыты
@@ -247,12 +245,13 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
           sourceRef.source = ctxIn.createMediaStreamSource(stream);
           sourceRef.source.connect(worklet);
           worklet.connect(ctxIn.destination); // worklet требует выхода, но молчит
-          audioCtxOut = new AudioContext({ sampleRate: 24000 });
-          await audioCtxOut.resume();
-          player = new TurnPlayer(audioCtxOut, (turnSeq) => {
+          // Плеер работает на ТОМ ЖЕ контексте, что и захват: играющий голос попадает
+          // в опорный сигнал AEC браузера и вычитается из микрофона (как в Meet).
+          // Буферы хранят 24 кГц — AudioBufferSourceNode сам ресемплирует под контекст.
+          player = new TurnPlayer(ctxIn, (turnSeq) => {
             if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "playback_drained", turnSeq }));
           });
-          ui.audioCtxOut = audioCtxOut;
+          ui.audioCtxOut = ctxIn;
           overlay.setModeView(currentMode, false);
           overlay.stateLine.textContent = "Готов: говорите";
 
