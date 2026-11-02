@@ -477,7 +477,9 @@ describe("advisor compact composer banner", () => {
     });
 
     expect(await q(slot).findByText("Must fix")).toBeTruthy();
-    const toggle = await q(slot).findByRole("button", { name: "Show more" });
+    const toggle = await q(slot).findByRole("button", {
+      name: "Show more", description: "Migration is not atomic",
+    });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     const controlsId = toggle.getAttribute("aria-controls");
     expect(controlsId).toBe("advisor-banner-details-1");
@@ -494,6 +496,9 @@ describe("advisor compact composer banner", () => {
     fireEvent.click(preview);
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     expect(details?.hasAttribute("hidden")).toBe(false);
+    expect(q(slot).getByRole("button", {
+      name: "Show less", description: "Migration is not atomic",
+    })).toBe(toggle);
   });
 
   it("toggles expand and collapse on click, Enter, and Space without calling RPC", async () => {

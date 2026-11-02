@@ -714,7 +714,7 @@ function AdvisorComposerBanner() {
         type="button"
         aria-expanded={isExpanded}
         aria-controls={detailsId}
-        aria-describedby={summaryId}
+        aria-describedby={isExpanded ? `${summaryId}-full` : summaryId}
         aria-label={isExpanded ? "Show less" : "Show more"}
         title={isExpanded ? "Show less" : "Show more"}
         onClick={toggleExpanded}
@@ -754,7 +754,7 @@ function AdvisorComposerBanner() {
       </button>
 
       {activeError ? (
-        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-surface-destructive-border bg-surface-destructive px-3 py-2 text-xs text-destructive-text">
+        <div className={`${isExpanded ? "" : "mb-2"} mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-surface-destructive-border bg-surface-destructive px-3 py-2 text-xs text-destructive-text`}>
           <span className="min-w-0 flex-1 break-words">
             {activeError}
           </span>
@@ -778,7 +778,7 @@ function AdvisorComposerBanner() {
         style={isExpanded ? { maxHeight: "30dvh" } : undefined}
       >
         {isExpanded && (
-          <p className="text-xs break-words font-medium text-foreground">
+          <p id={`${summaryId}-full`} className="text-xs break-words font-medium text-foreground">
             {advice.summary}
           </p>
         )}
