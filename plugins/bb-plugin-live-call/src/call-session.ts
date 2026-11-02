@@ -70,6 +70,8 @@ export class CallSession extends EventEmitter {
   private routerBusyCount = 0;
   private pendingToolResponses = new Map<string, { functionId?: string; def: string; args: Record<string, unknown> }>();
   private tpmWarned = false;
+  /** Приветствие один раз за звонок, независимо от переподключений. */
+  private greeted = false;
   /** Сборка реплики владельца из кусков inputTranscription; конец — 700 мс тишины. */
   private ownerUtterance: { text: string; firstAt: number; lastAt: number } | null = null;
   private ownerUtteranceTimer: NodeJS.Timeout | null = null;
@@ -219,6 +221,8 @@ export class CallSession extends EventEmitter {
   private wireVoice(client: LiveClient) {
     const ctx = this.toolContext();
     client.on("setupComplete", () => {
+      if (this.greeted) return; // после переподключений приветствие не повторяем
+      this.greeted = true;
       // Приветствие только после setupComplete: всё, что ушло раньше, Gemini теряет.
       // Без инструментов и вопросов: одна фраза и молчание, иначе модель сама начинает
       // обзор и говорит над владельцем (воспроизведено живым звонком 02.11).
@@ -249,6 +253,7 @@ export class CallSession extends EventEmitter {
         await this.maybeSpawnThreadOnFirstUtterance();
         const line = agentBuf.trim();
         agentBuf = "";
+        this.reconnectAttempts = 0;
         if (!line) return;
         this.frame({ type: "transcript", role: "agent", text: line, final: true });
         this.lastVoiceLine = line.slice(0, 300);
@@ -282,14 +287,31 @@ export class CallSession extends EventEmitter {
     });
     client.on("close", (code: number, reason: string) => {
       if (this.ended) return;
-      if (String(code) === "429" || reason.includes("RESOURCE_EXHAUSTED")) this.switchKeyOnQuota("quota");
-      else void this.reconnectVoice(2);
+      const text = reason ?? "";
+      // Gemini отдаёт квоту по-разному: 429, RESOURCE_EXHAUSTED, 1011 "Resource has been exhausted".
+      if (String(code) === "429" || /exhausted|quota/i.test(text)) {
+        this.switchKeyOnQuota("quota");
+        return;
+      }
+      if (code === 1008) {
+        // "session not found": handle мёртв (привязан к умершей сессии/ключу).
+        // Пересоздаём БЕЗ handle с пересказом; при повторе — смена ключа.
+        this.reconnect1008 += 1;
+        if (this.reconnect1008 >= 2) {
+          this.reconnect1008 = 0;
+          this.switchKeyOnQuota("unavailable");
+          return;
+        }
+        void this.reconnectVoice(0.2, undefined);
+        return;
+      }
+      void this.reconnectVoice(2);
     });
     client.on("error", (message: string) => {
       this.frame({ type: "error", code: "google_unreachable", message, retryable: true });
     });
-    client.on("sendDropped", (readyState: unknown, preview: string) => {
-      console.error(`[live-call] send dropped (readyState=${readyState}): ${preview}`);
+    client.on("sendDropped", () => {
+      // Кадры при мёртвом сокете — ожидаемо во время переподключения, не спамим.
     });
     void ctx;
   }
@@ -564,17 +586,22 @@ export class CallSession extends EventEmitter {
   }
 
   private reconnectTimer: NodeJS.Timeout | null = null;
-  /** goAway: переподключение с handle до обрыва (спека §4). */
-  private async reconnectVoice(timeLeftSec: number) {
+  private reconnect1008 = 0;
+  private reconnectAttempts = 0;
+  /** goAway/обрыв: переподключение; handle опционален — после 1008 сессия не возобновляется. */
+  private async reconnectVoice(timeLeftSec: number, handle?: string) {
     if (this.ended || this.reconnectTimer) return;
-    const waitMs = Math.max(0, Math.min(timeLeftSec * 1000, 10_000)) - 1500;
-    this.setState("reconnecting", `goAway через ${timeLeftSec} с`);
+    // Backoff: 1, 2, 4, 8, 10 c; успешный ход сбрасывает счётчик.
+    this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, 5);
+    const backoff = Math.min(500 * 2 ** this.reconnectAttempts, 10_000);
+    const waitMs = Math.max(backoff, Math.min(timeLeftSec * 1000, 10_000) - 1500);
+    this.setState("reconnecting", "переподключаюсь");
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      const handle = this.voice?.sessionHandle ?? undefined;
+      const useHandle = handle === undefined ? this.voice?.sessionHandle ?? undefined : handle;
       this.voice?.close();
       try {
-        await this.openSessions(handle);
+        await this.openSessions(useHandle);
         this.voice?.sendClientContent(`[СИСТЕМА] Переподключение. Пересказ:\n${this.ledger.handoverSummary()}`, false);
       } catch {
         this.frame({ type: "error", code: "google_unreachable", message: "не удалось переподключиться", retryable: true });
@@ -586,9 +613,9 @@ export class CallSession extends EventEmitter {
   private switchKeyOnQuota(reason: "quota" | "unavailable") {
     try {
       this.pool.switchOnQuota();
-      const handle = this.voice?.sessionHandle ?? undefined;
+      // Новый ключ — новый handle: старая сессия не возобновляется, нужен пересказ.
       this.voice?.close();
-      void this.openSessions(handle).then(() => {
+      void this.openSessions(undefined).then(() => {
         this.voice?.sendClientContent(`[СИСТЕМА] Смена ключа. Пересказ:\n${this.ledger.handoverSummary()}`, false);
         this.setState("listening");
       });
