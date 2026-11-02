@@ -10,7 +10,7 @@ updated: 2026-11-02
 
 На старте плагин регистрирует только штатный disclosure в footer. Не вызывать open() или toggle() в setup, effects, account watchers или timers. Панель открывается и закрывается штатным нажатием на её иконку; при первом заходе и после закрытия/reload остаётся закрытой. Не заменять другую открытую footer-панель. Label Servers, disclosure id servers и pluginId server-switcher сохранить.
 
-Footer icon — стандартный BB ComputerCloud, монохромный outline/currentColor, размер и hit area задаёт host как у соседних Settings/Usage. Server отсутствует в каталоге BB0.48.1, поэтому он не используется. Не регистрировать server-switcher-avatar как footer icon и не оставлять generic fallback. Аватары и цветные rings внутри списка сохраняются. WatchAccount нужен для актуальности списка и не удаляется.
+Footer icon — стандартный BB ComputerCloud, монохромный outline/currentColor, размер и hit area задаёт host как у соседних Settings/Usage. Server отсутствует в каталоге BB0.48.1, поэтому он не используется. Не регистрировать server-switcher-avatar как footer icon и не оставлять generic fallback. По прямому указанию владельца аватары и цветные rings внутри списка также заменяются монохромным ComputerCloud (20px), с сохранением индикатора доступности. Настройка обводок в интерфейсе не показывается; сохранённые данные и RPC остаются совместимыми. WatchAccount нужен для актуальности списка и не удаляется.
 
 ## 2. Поведение и данные
 
