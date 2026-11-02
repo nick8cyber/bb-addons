@@ -143,37 +143,19 @@ function ServerGlyph({ row }: { row: ServerRow }) {
   );
 }
 
-function CurrentServerCard({
-  row,
-  expanded,
-  onToggle,
-}: {
-  row: ServerRow;
-  expanded: boolean;
-  onToggle: () => void;
-}) {
+function CurrentServerCard({ row }: { row: ServerRow }) {
   return (
     <div
-      className={cn(
-        "flex w-full min-w-0 items-center gap-2.5",
-        expanded ? "py-2 pl-1.75 pr-3" : "py-1.5 pl-1.75 pr-2.5",
-      )}
+      className="flex w-full min-w-0 items-center gap-2.5 py-2 pl-1.75 pr-3"
     >
       <ServerGlyph row={row} />
-      <button
-        type="button"
+      <div
         aria-current="true"
-        aria-expanded={expanded}
-        onClick={onToggle}
-        title={expanded ? "Hide servers" : "Switch server"}
-        className="flex min-w-0 flex-1 items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+        className="flex min-w-0 flex-1 items-center gap-2 text-left"
       >
         <span className="flex min-w-0 flex-col">
           <span
-            className={cn(
-              "truncate font-medium text-sidebar-foreground",
-              expanded ? "text-sm" : "text-xs",
-            )}
+            className="truncate text-sm font-medium text-sidebar-foreground"
           >
             {row.name}
           </span>
@@ -181,11 +163,7 @@ function CurrentServerCard({
             {row.detail}
           </span>
         </span>
-        <Icon
-          name={expanded ? "ChevronDown" : "ChevronUp"}
-          className="ml-auto size-3.5 shrink-0 text-muted-foreground"
-        />
-      </button>
+      </div>
     </div>
   );
 }
@@ -244,7 +222,6 @@ function PanelBody({
   onRetry: (() => void) | null;
   accountHandles: readonly string[] | null;
 }) {
-  const [expanded, setExpanded] = useState(true);
 
   if (state.status === "loading") {
     return (
@@ -292,21 +269,12 @@ function PanelBody({
   }
   const current = state.rows.find((row) => row.current) ?? null;
   const others = state.rows.filter((row) => !row.current);
-  const showList = expanded || current === null;
   return (
     <div className="flex flex-col">
       {current === null ? null : (
-        <CurrentServerCard
-          row={current}
-          expanded={expanded}
-          onToggle={() => {
-            if (!expanded) onRetry?.();
-            setExpanded(!expanded);
-          }}
-        />
+        <CurrentServerCard row={current} />
       )}
-      {showList ? (
-        <>
+      <>
           <div className="flex h-7 items-center gap-1 border-t border-sidebar-border pl-1.75 pr-3 pt-1">
             <span className="text-2xs font-medium text-muted-foreground">
               {others.length === 0 ? "No other servers" : "Switch to"}
@@ -329,8 +297,7 @@ function PanelBody({
               Switch servers from the bb app's server list.
             </p>
           )}
-        </>
-      ) : null}
+      </>
     </div>
   );
 }
