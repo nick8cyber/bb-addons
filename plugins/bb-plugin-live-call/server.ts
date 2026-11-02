@@ -90,6 +90,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   let active: { session: CallSession; startedAt: number } | null = null;
   const eventBridge = new EventBridge();
+  /** Кеш id проекта «Звонки»: фильтр автопрочтения (треды звонков не должны маячить непрочитанными). */
+  let callsProjectCache: string | null = null;
 
   /** bridge-data/server.json: мост без BB_* переменных читает URL отсюда (контракт §7). */
   const writeServerJson = () => {
@@ -133,6 +135,7 @@ export default async function plugin(bb: BbPluginApi) {
       projects: { create(a: { name: string; source: { type: "local_path"; hostId: string; path: string } }): Promise<{ id: string }> };
     }).projects.create({ name: "Звонки", source: { type: "local_path", hostId, path } })) as { id: string };
     await settings.experimental_set({ callsProjectId: created.id });
+    callsProjectCache = created.id;
     bb.log.info(`создан проект «Звонки» ${created.id}`);
     return created.id;
   };
@@ -391,16 +394,69 @@ export default async function plugin(bb: BbPluginApi) {
     maintenance: { health: true },
   });
 
+  /**
+   * Треды звонков всегда прочитаны (решение владельца 02.11: не должны маячить).
+   * Прочитанное отмечается при создании треда и после каждого завершённого хода.
+   */
+  const markCallThreadRead = async (threadId: string): Promise<void> => {
+    try {
+      await bb.sdk.threads.markRead({ threadId });
+    } catch (e) {
+      bb.log.warn(`markRead ${threadId} failed: ${String(e)}`);
+    }
+  };
+
+  const isCallThread = async (threadId: string, projectId?: string): Promise<boolean> => {
+    if (active?.session.threadId === threadId) return true;
+    let pid = projectId;
+    if (!pid) {
+      try {
+        const t = (await bb.sdk.threads.get({ threadId })) as unknown as { projectId?: string; providerId?: string };
+        pid = t.projectId;
+        if (t.providerId && t.providerId !== "live-call") return false;
+      } catch {
+        return false;
+      }
+    }
+    if (!callsProjectCache) {
+      const saved = str((await settings_get()).callsProjectId, "");
+      callsProjectCache = saved || null;
+    }
+    return pid !== undefined && pid === callsProjectCache;
+  };
+
+  void (async () => {
+    // Зачистка при загрузке: всё непрочитанное в проекте «Звонки» — прочитано.
+    try {
+      const saved = str((await settings_get()).callsProjectId, "");
+      if (!saved) return;
+      callsProjectCache = saved;
+      const threads = (await bb.sdk.threads.list({ projectId: saved, limit: 100 }) as unknown as Array<{ id: string; lastReadAt: number | null; latestAttentionAt?: number }>) ?? [];
+      for (const t of threads) {
+        if (t.latestAttentionAt && (!t.lastReadAt || t.latestAttentionAt > t.lastReadAt)) {
+          await markCallThreadRead(t.id);
+        }
+      }
+    } catch (e) {
+      bb.log.warn(`unread sweep failed: ${String(e)}`);
+    }
+  })();
+
   /** События BB: доклады о тредах и pending-вопросах (спека §4 EventBridge). */
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     if (active?.session && thread.id !== active.session.threadId) {
       eventBridge.onThreadIdle(thread.id, (lastAssistantText ?? "тред закончил").slice(0, 300));
     }
+    void isCallThread(thread.id, thread.projectId).then(async (yes) => { if (yes) await markCallThreadRead(thread.id); });
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     if (active?.session && thread.id !== active.session.threadId) {
       eventBridge.onThreadFailed(thread.id, (error ?? "тред упал").slice(0, 300));
     }
+    void isCallThread(thread.id, thread.projectId).then(async (yes) => { if (yes) await markCallThreadRead(thread.id); });
+  });
+  bb.events.on("thread.created", ({ thread }) => {
+    void isCallThread(thread.id, thread.projectId).then(async (yes) => { if (yes) await markCallThreadRead(thread.id); });
   });
   bb.events.on("interaction.pending" as never, ((payload: { thread: { id: string; title?: string }; interaction: { payload?: Record<string, unknown>; kind?: string } }) => {
     const kind = payload.interaction?.payload?.kind === "approval" ? "permission" : "question";
