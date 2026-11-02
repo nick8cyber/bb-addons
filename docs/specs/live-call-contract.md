@@ -112,16 +112,19 @@ type ToolResult =
 | `list_pending` | — | R | `{ threadId; title; kind: "question"\|"permission"; prompt }[]` |
 | `watch_thread` | `thread: string` | R | `{ watching: true }` |
 | `send_to_thread` | `thread: string`, `text: string` | C | `{ sent: true; threadId }` |
-| `answer_interaction` | `thread: string`, `answer: string`, `grant?: boolean` | C, или P при `grant: true` | `{ resolved: true }` |
+| `answer_interaction` | `thread: string`, `answer: string`, `interactionId?: string`, `grant?: boolean` | C, или P при `grant: true` | `{ resolved: true }`. Вызов SDK — `interactions.respond` (вопрос) или `interactions.resolve` (разрешение). Без `interactionId`: у треда одно ожидающее → берём его; несколько или ноль → `error.code: "ambiguous"` |
 | `stop_thread` | `thread: string` | C | `{ stopped: true }` |
 | `start_thread` | `project: string`, `task: string`, `preset?: string` | L | `{ threadId; title }` |
 | `tasks_create` | `title: string`, `spec: string`, `project?: string` | C | `{ key }` |
 | `tasks_dispatch` | `key: string`, `preset: string` | L | `{ threadId }` |
 | `search_memory` | `query: string` | R | `{ items: { name; summary }[] }`, до 5 |
 | `switch_mode` | `mode: "normal"\|"extended"` | R | `{ switching: true }` |
+| `confirm_action` | `confirmationId: string` | — | `{ confirmed: true }`. Объявляется модели только в режиме `normal`; в режиме `extended` сервер исполняет действие сам при `approved` (§2.1 спеки) |
 | `end_call` | — | R | `{ ending: true }` |
 
 `ThreadBrief = { id; title; project; status; updatedAt }`. Имя треда из речи сопоставляется с открытыми тредами нечётким поиском. Двусмысленность → `ok: false, error.code: "ambiguous"` со списком до 3 кандидатов в `message`. Сообщения, отправленные голосом, начинаются с `[голос] `. Таймаут исполнителя — 20 с → `error.code: "timeout"`.
+
+**Граница правила «запускай».** `send_to_thread` и `tasks_create` доставляют или записывают текст, который владелец утвердил: фраза-вопрос `say` зачитывает текст сообщения целиком. Запуск работы в треде-получателе — решение получателя, как при обычном сообщении в BB, поэтому класс C. Создание и раздача агентов (`start_thread`, `tasks_dispatch`) — класс L: только «запускай»/«раздай».
 
 Сигнатуры SDK (сверено с типами 0.6.49): вопрос агента — `threads.interactions.respond({ interactionId, threadId, value })` (`value: JsonValue`); запрос разрешения — `threads.interactions.resolve({ interactionId, threadId, resolution })` (`resolution: PendingInteractionResolution`). Глобального списка ожидающих в SDK нет: снимок — `threads.listRunning` + `threads.interactions.list({ threadId })` по каждому; в реальном времени — realtime-событие `interaction.pending` (несёт `{ thread, interaction }`), его кеширует `EventBridge`.
 
@@ -142,11 +145,13 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 
 Константы: TTL — 60 с, отступ окна — 300 мс, конец реплики — 700 мс тишины, ожидание транскрипта — до 3 с, длина реплики — не больше 6 слов. Классификатор — чистая функция `classify(text, cls, words) → Verdict`, покрыта тестами из приёмки Ф3.
 
+**Зачёт только «свежих» реплик.** Сервер ставит отметку времени на каждый кусок `inputTranscription` и собирает реплику из кусков подряд. Вердикт ищется только по реплике, **первый кусок которой пришёл после открытия окна**: опоздавший хвост речи, начатой до вопроса, не склеивается с новой репликой и в зачёт не идёт, каким бы долгим ни был лаг транскрипта.
+
 ## 6. Тред звонка (провайдер `live-call`)
 
 1. `callsProjectId` пуст → папка `callsWorkspacePath` создаётся на основном хосте (`sdk.system.config().primaryHostId`), затем `bb.sdk.projects.create({ name: "Звонки", source: { type: "local_path", hostId, path } })`, id сохраняется в настройку. Окружение создавать не нужно: `projects.create` с `local_path` сама даёт проекту окружение `project-checkout` (unmanaged workspace по пути проекта), и `threads.spawn({ projectId })` без явного `environmentId` подхватывает его. Проверено спайком 02.11 (проект создан, тред заспавнен, окружение `project-checkout` присвоено автоматически).
-2. Первая законченная реплика владельца → `threads.spawn({ projectId, providerId: "live-call", model: "live", title: "📞 Звонок ДД.ММ ЧЧ:ММ", prompt })`.
-3. Следующая реплика: сервер шлёт мосту `end` для открытого хода, ждёт `turn/completed`, затем `threads.send({ threadId, mode: "start", input: [{ type: "text", text, mentions: [] }] })`.
+2. Первая законченная реплика владельца → `threads.spawn({ projectId, providerId: "live-call", model: "live", title: "📞 Звонок ДД.ММ ЧЧ:ММ", prompt, environment: { type: "project-default" } })`. `environment` обязателен в SDK (`createThreadRequestSchema`): `project-default` подхватывает окружение `project-checkout`, которое `projects.create` делает само (см. п. 1).
+3. Следующая реплика: сервер шлёт мосту `end` для открытого хода, ждёт `turn_closed`, затем `threads.send({ threadId, mode: "start", input: [{ type: "text", text, mentions: [] }] })`.
 4. Реплики агента, действия и события — `say` в открытый ход. Действия выглядят так: `✉️ Отправил в «…»`, `📖 Прочитал «…»`, `🚀 Запустил «…»` — со ссылкой `@thread`.
 5. Конец звонка → `say` с итогом (решения, действия, хвосты), потом `end`. Заголовок дополняется темами: «📞 Звонок 02.11 12:40 — проект A, проект B».
 
