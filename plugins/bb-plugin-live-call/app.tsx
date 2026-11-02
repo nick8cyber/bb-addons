@@ -1,47 +1,54 @@
 /**
- * Фронтенд live-call: плавающая кнопка 📞 и оверлей звонка (React, движок звонка
- * в src/ui/engine.ts), раздел настроек со статусом и пробой Extended (спека §6).
+ * Фронтенд live-call. Вход в звонок — штатными поверхностями BB, без своей
+ * плавающей кнопки: иконка в футере сайдбара, кнопка в шапке треда, команды
+ * палитры с горячими клавишами. Док рисует experimental_appOverlay — так у него
+ * есть контекст BB (навигация к тредам, тема).
  */
 import "./app.css";
-import { createRoot } from "react-dom/client";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 
 import { CallOverlay } from "./src/ui/CallOverlay.js";
 import { SettingsSection } from "./src/ui/SettingsSection.js";
 import { callEngine } from "./src/ui/engine.js";
 
-export default definePluginApp((app) => {
-  app.contentScripts.register({
-    id: "live-call-overlay",
-    mount: () => {
-      // Кнопка 📞 + React-оверлей (док/пилюля/мобильный экран; idle — ничего не рисует).
-      const btn = document.createElement("button");
-      btn.id = "bb-live-call-button";
-      btn.title = "Позвонить координатору (живой голос)";
-      btn.textContent = "📞";
-      btn.style.cssText = [
-        "position: fixed", "right: 24px", "bottom: 24px", "z-index: 999998",
-        "width: 44px", "height: 44px", "border-radius: 50%",
-        "border: 1px solid rgba(255,255,255,.15)",
-        "background: var(--color-primary, #4f6ef7)", "color: #fff",
-        "font-size: 20px", "cursor: pointer",
-        "box-shadow: 0 6px 20px rgba(0,0,0,.35)", "pointer-events: auto",
-      ].join(";");
-      btn.addEventListener("click", () => callEngine.start());
-      document.body.append(btn);
+const PHONE_ICON = "live-call/phone";
 
-      const host = document.createElement("div");
-      host.id = "bb-live-call-host";
-      document.body.append(host);
-      const root = createRoot(host);
-      root.render(<CallOverlay />);
-      return () => {
-        root.unmount();
-        callEngine.dismiss();
-        host.remove();
-        btn.remove();
-      };
-    },
+/** Нет звонка — позвонить; звонок идёт — развернуть док. */
+const callOrFocus = () => (callEngine.isActive() ? callEngine.requestExpand() : callEngine.start());
+
+export default definePluginApp((app) => {
+  app.slots.experimental_appOverlay({ id: "live-call", component: CallOverlay });
+
+  app.experimental_sidebarFooter.register({
+    kind: "action",
+    id: "call",
+    label: "Позвонить координатору",
+    icon: PHONE_ICON,
+    onActivate: callOrFocus,
+  });
+
+  app.slots.experimental_threadAction({
+    id: "call",
+    title: "Позвонить координатору",
+    icon: PHONE_ICON,
+    group: "live-call",
+    placement: "header",
+    item: () => ({ label: "Позвонить", icon: PHONE_ICON, run: callOrFocus }),
+  });
+
+  app.commands.register({
+    id: "call-toggle",
+    title: "Live Call: позвонить / завершить звонок",
+    defaultShortcut: { key: "l", mod: true, shift: true },
+    run: () => (callEngine.isActive() ? callEngine.end() : callEngine.start()),
+  });
+
+  app.commands.register({
+    id: "call-mode",
+    title: "Live Call: переключить режим (Обычный ↔ Extended)",
+    defaultShortcut: { key: "k", mod: true, shift: true },
+    isAvailable: () => callEngine.getSnapshot().phase === "live",
+    run: () => callEngine.toggleMode(),
   });
 
   app.slots.settingsSection({

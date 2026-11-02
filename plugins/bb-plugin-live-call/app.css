@@ -39,7 +39,8 @@
 .lc-dock {
   right: 16px;
   bottom: 16px;
-  width: 340px;
+  width: 380px;
+  max-width: calc(100vw - 32px);
   max-height: min(560px, calc(100vh - 32px));
   border-radius: var(--lc-radius);
   display: flex;
@@ -77,6 +78,7 @@
   font-size: 18px;
 }
 .lc-sub {
+  white-space: nowrap;
   color: var(--muted-foreground);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
@@ -656,7 +658,7 @@
 .lc-mobile {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  z-index: 70; /* над шапкой BB: иначе её кнопки просвечивают поверх звонка */
   display: flex;
   flex-direction: column;
   background: var(--background);
@@ -740,7 +742,7 @@
   left: 0;
   right: 0;
   bottom: 0;
-  z-index: 41;
+  z-index: 71;
   max-height: 72vh;
   display: flex;
   flex-direction: column;
@@ -774,6 +776,7 @@
   font-size: 14px !important;
 }
 .lc-mbar {
+  z-index: 70;
   top: max(8px, env(safe-area-inset-top));
   left: 8px;
   right: 8px;

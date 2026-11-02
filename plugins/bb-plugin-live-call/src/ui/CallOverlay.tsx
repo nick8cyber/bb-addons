@@ -153,7 +153,8 @@ function ModeSwitch({ view, compact = false }: { view: CallView; compact?: boole
 function StatusLine({ view }: { view: CallView }) {
   const elapsed = useElapsed(view);
   const parts = [elapsed];
-  if (view.keys && view.keys.of > 1) parts.push(`ключ ${view.keys.active}/${view.keys.of}`);
+  // Номер ключа виден, только когда звонок ушёл на запасной: основной — норма, не новость.
+  if (view.keys && view.keys.active > 1) parts.push("запасной ключ");
   if (view.orb === "reconnecting" && view.stateDetail) parts.push(view.stateDetail);
   return <span className="lc-sub">{parts.join(" · ")}</span>;
 }
@@ -280,7 +281,7 @@ function DockFooter({ view }: { view: CallView }) {
       ) : (
         <span className="lc-sub lc-grow">микрофон</span>
       )}
-      <MuteButton view={view} />
+      <MuteButton view={view} iconOnly />
       <EndButton />
     </footer>
   );
@@ -367,7 +368,12 @@ function FeedRow({ item }: { item: FeedItem }) {
       return (
         <div className={`lc-notice lc-notice--${item.tone}`}>
           <Icon name={item.tone === "info" ? "check" : "alert"} size={13} />
-          <span>{item.text}</span>
+          <span className="lc-grow">{item.text}</span>
+          {item.action === "to-normal" && (
+            <button type="button" className="lc-link" onClick={() => callEngine.switchMode("normal")}>
+              Перейти на Обычный
+            </button>
+          )}
         </div>
       );
     case "divider":
@@ -473,7 +479,7 @@ function Summary({ view }: { view: CallView }) {
           ))}
         </div>
       ) : (
-        <p className="lc-sub">{reads > 0 ? `Только чтение: ${reads} запрос(ов) к BB, ничего не менял.` : "Действий не было."}</p>
+        <p className="lc-sub">{reads > 0 ? `Только чтение: ${reads} ${plural(reads, "запрос", "запроса", "запросов")} к BB, ничего не менял.` : "Действий не было."}</p>
       )}
       <div className="lc-summary__actions">
         {view.threadId && (
@@ -616,4 +622,11 @@ function MobileCall({ view, minimized, onMinimize }: { view: CallView; minimized
       )}
     </section>
   );
+}
+
+function plural(n: number, one: string, few: string, many: string): string {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
 }

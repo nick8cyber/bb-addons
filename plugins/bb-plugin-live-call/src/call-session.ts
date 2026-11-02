@@ -294,11 +294,20 @@ export class CallSession extends EventEmitter {
       this.pool.addUsage(promptTokens);
     });
     client.on("close", (code: number, reason: string) => {
-      if (this.ended) return;
+      // Сессию закрыли мы сами (смена режима или ключа) — её закрытие не повод переподключаться.
+      if (this.ended || this.voice !== client) return;
       const text = reason ?? "";
       // Gemini отдаёт квоту по-разному: 429, RESOURCE_EXHAUSTED, 1011 "Resource has been exhausted".
       if (String(code) === "429" || /exhausted|quota/i.test(text)) {
         this.switchKeyOnQuota("quota");
+        return;
+      }
+      if (code === 1007) {
+        // Google отверг настройку сессии — переподключение с тем же setup бессмысленно.
+        bb_log(this.deps, `gemini отверг setup: ${text.slice(0, 160)}`);
+        this.frame({ type: "error", code: this.mode === "extended" ? "extended_unavailable" : "internal", message: `Google отверг настройку сессии: ${text.slice(0, 120)}`, retryable: false });
+        if (this.mode === "extended") return;
+        void this.end("error");
         return;
       }
       if (code === 1008) {
@@ -354,22 +363,36 @@ export class CallSession extends EventEmitter {
 
   private wireRouter(client: LiveClient) {
     const ctx = this.toolContext();
+    client.on("setupComplete", () => {
+      this.routerReconnects = 0;
+    });
     client.on("toolCall", (calls: Array<{ id?: string; name: string; args: Record<string, unknown> }>) => {
       void this.handleRouterCalls(client, calls);
     });
     client.on("usage", (tokens: number) => this.pool.addUsage(tokens));
-    client.on("close", (code: number) => {
-      if (this.ended) return;
-      if (String(code) === "429") {
-        try {
-          this.pool.switchOnQuota();
-          this.router = this.makeRouterSession();
-        } catch {
-          this.frame({ type: "error", code: "quota_all_keys", message: "квота обоих ключей исчерпана", retryable: false });
-        }
-      } else {
-        this.router = this.makeRouterSession();
+    client.on("close", (code: number, reason?: string) => {
+      if (this.ended || this.router !== client) return;
+      this.router = null;
+      // Квота ключа ROUTER (429 или 1011 «exceeded your current quota»): у Extended
+      // второго ключа больше нет — честно говорим и предлагаем Обычный, а не долбим Google
+      // переподключениями без паузы (было: 6 попыток за 0,4 с, приёмка 02.11).
+      if (String(code) === "429" || /exhausted|quota/i.test(reason ?? "")) {
+        this.frame({
+          type: "warning",
+          code: "extended_unavailable",
+          message: "Extended недоступен: второй ключ упёрся в квоту. Переключись на Обычный.",
+        });
+        return;
       }
+      this.routerReconnects += 1;
+      if (this.routerReconnects > 5) {
+        this.frame({ type: "warning", code: "extended_unavailable", message: "Помощник Extended не подключается. Переключись на Обычный." });
+        return;
+      }
+      const wait = Math.min(500 * 2 ** this.routerReconnects, 10_000);
+      setTimeout(() => {
+        if (!this.ended && this.mode === "extended" && !this.router) this.router = this.makeRouterSession();
+      }, wait);
     });
     void ctx;
   }
@@ -595,8 +618,9 @@ export class CallSession extends EventEmitter {
         this.micBytes = 0;
         if (bytes === 0) return;
         bb_log(this.deps, `микрофон: ${bytes} байт/5с, пик ${peak}`);
-        if (peak < 40 && bytes > 10_000) {
-          this.frame({ type: "warning", code: "tpm_near_limit", message: "микрофон почти молчит: проверь, не замучен ли он в системе и в браузере" });
+        // Тишина после того, как владелец уже говорил, — пауза, а не сломанный микрофон.
+        if (peak < 40 && bytes > 10_000 && this.ledger.lastOwnerUtterances(1).length === 0) {
+          this.frame({ type: "warning", code: "mic_silent", message: "микрофон почти молчит: проверь, не замучен ли он в системе и в браузере" });
         }
       }, 5000);
       this.micReporter.unref?.();
@@ -650,14 +674,16 @@ export class CallSession extends EventEmitter {
       return;
     }
     this.frame({ type: "mode", mode, switching: true });
-    const handle = this.voice?.sessionHandle ?? undefined;
     this.mode = mode;
     this.modeHistory.push(mode);
     this.deps.store.setModeHistory(this.deps.callId, this.modeHistory);
     this.router?.close();
     this.router = null;
     this.voice?.close();
-    await this.openSessions(handle);
+    // Handle возобновления привязан к модели и живой сессии: с другой моделью Google
+    // отвечает 1008 «already connected», затем 1007 (приёмка 02.11). При смене режима —
+    // новая сессия без handle, контекст переносит пересказ ниже.
+    await this.openSessions(undefined);
     // Пересказ новой сессии: тот же механизм, что смена ключа (спека §2.1).
     this.voice?.sendClientContent(`[СИСТЕМА] Разговор продолжается. Пересказ:\n${this.ledger.handoverSummary()}`, false);
     this.frame({ type: "mode", mode, switching: false });
@@ -667,6 +693,7 @@ export class CallSession extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnect1008 = 0;
   private reconnectAttempts = 0;
+  private routerReconnects = 0;
   /** goAway/обрыв: переподключение; handle опционален — после 1008 сессия не возобновляется. */
   private async reconnectVoice(timeLeftSec: number, handle?: string) {
     if (this.ended || this.reconnectTimer) return;

@@ -61,6 +61,35 @@ function briefOf(t: Record<string, unknown>): ThreadBrief {
   };
 }
 
+/** Имя треда из речи: без кавычек, пунктуации и регистра, ё→е. */
+export function normalizeTitle(s: string): string {
+  return s.toLowerCase().replace(/ё/g, "е").replace(/[«»"'“”„.,!?:;()\[\]]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Треды звонков (провайдер live-call) — не рабочие треды; в поиске и списках не нужны. */
+const isCallThread = (t: Record<string, unknown>) => t.providerId === "live-call";
+
+/**
+ * Поиск BB по названию и сообщениям (`threads.search`): находит тред в любом
+ * проекте, а не только в первых 100 из threads.list — там их вытесняли треды
+ * звонков (баг приёмки 02.11: координатор не нашёл существующий тред по имени).
+ */
+export async function searchThreads(sdk: BbPluginApi["sdk"], query: string): Promise<Array<Record<string, unknown>>> {
+  const q = query.trim();
+  if (!q) return [];
+  try {
+    const res = (await (sdk.threads as unknown as { search(a: { query: string }): Promise<unknown> }).search({ query: q })) as {
+      active?: { results?: Array<{ thread?: Record<string, unknown> }> };
+      archived?: { results?: Array<{ thread?: Record<string, unknown> }> };
+    };
+    const pick = (g?: { results?: Array<{ thread?: Record<string, unknown> }> }) =>
+      (g?.results ?? []).map((r) => r.thread).filter((x): x is Record<string, unknown> => Boolean(x?.id));
+    return [...pick(res.active), ...pick(res.archived)].filter((x) => !isCallThread(x));
+  } catch {
+    return [];
+  }
+}
+
 /** Нечёткое сопоставление имени из речи с открытыми тредами (контракт §4). */
 export async function resolveThreadRef(
   sdk: BbPluginApi["sdk"],
@@ -79,7 +108,18 @@ export async function resolveThreadRef(
     }
   }
 
-  // 2. Активные треды — самый частый случай (listRunning отдаёт массив).
+  // 2. Поиск BB: точное или единственное совпадение по названию.
+  const want = normalizeTitle(refTrim);
+  const found = await searchThreads(sdk, refTrim);
+  if (found.length > 0) {
+    const exact = found.filter((t) => normalizeTitle(String(t.title ?? "")) === want);
+    if (exact.length === 1) return { ok: true, thread: exact[0] };
+    const prefix = found.filter((t) => normalizeTitle(String(t.title ?? "")).startsWith(want) || want.startsWith(normalizeTitle(String(t.title ?? ""))));
+    if (prefix.length === 1) return { ok: true, thread: prefix[0] };
+    if (found.length === 1) return { ok: true, thread: found[0] };
+  }
+
+  // 3. Активные треды (listRunning отдаёт массив).
   const collect = (arr: unknown): Array<Record<string, unknown>> =>
     Array.isArray(arr) ? (arr as Array<Record<string, unknown>>) : [];
   try {
@@ -194,11 +234,15 @@ export const TOOLS: ToolDef[] = [
       },
     },
     async execute(args, ctx) {
-      const res = await withTimeout(ctx.sdk.threads.list({ limit: 15 }) as Promise<Array<Record<string, unknown>> | { threads?: Record<string, unknown>[] }>);
-      const raw = Array.isArray(res) ? res : ((res as { threads?: Record<string, unknown>[] }).threads ?? []);
+      const q = String(args.query ?? "").trim();
+      let raw: Array<Record<string, unknown>>;
+      if (q) {
+        raw = await searchThreads(ctx.sdk, q);
+      } else {
+        const res = await withTimeout(ctx.sdk.threads.list({ limit: 60 }) as Promise<Array<Record<string, unknown>> | { threads?: Record<string, unknown>[] }>);
+        raw = (Array.isArray(res) ? res : ((res as { threads?: Record<string, unknown>[] }).threads ?? [])).filter((x) => !isCallThread(x));
+      }
       let items = raw.map(briefOf);
-      const q = String(args.query ?? "").toLowerCase();
-      if (q) items = items.filter((t) => t.title.toLowerCase().includes(q));
       const status = String(args.status ?? "any");
       if (status !== "any") {
         const map: Record<string, string> = { active: "active", waiting: "waiting", error: "error" };
@@ -963,7 +1007,9 @@ export async function runToolCall(
       const result = await def.execute(args, ctx);
       if (label) {
         const threadId = result.ok ? threadIdOf(result.data) : undefined;
-        ctx.reportAction(def.name, "R", result.ok ? "done" : "failed", result.ok ? label.done : `${label.failed}: ${"error" in result ? result.error.message : ""}`.slice(0, 160), threadId, actionId);
+        const title = result.ok ? threadTitleOf(result.data) : undefined;
+        const done = title && def.name === "read_thread" ? `Прочитал «${title.slice(0, 60)}»` : label.done;
+        ctx.reportAction(def.name, "R", result.ok ? "done" : "failed", result.ok ? done : `${label.failed}: ${"error" in result ? result.error.message : ""}`.slice(0, 160), threadId, actionId);
       }
       return { result, executed: result.ok };
     } catch (e) {
@@ -1018,4 +1064,9 @@ export function readActionLabel(
 function threadIdOf(data: unknown): string | undefined {
   const d = data as { thread?: { id?: unknown } } | null;
   return d && typeof d === "object" && d.thread && typeof d.thread.id === "string" ? d.thread.id : undefined;
+}
+
+function threadTitleOf(data: unknown): string | undefined {
+  const d = data as { thread?: { title?: unknown } } | null;
+  return d && typeof d === "object" && d.thread && typeof d.thread.title === "string" && d.thread.title ? d.thread.title : undefined;
 }

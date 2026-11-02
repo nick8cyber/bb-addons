@@ -107,16 +107,17 @@ export class LiveClient extends EventEmitter {
       voiceConfig: { prebuiltVoiceConfig: { voiceName: this.opts.voice } },
       languageCode: this.opts.languageCode,
     };
+    // thinkingConfig — тоже внутри generationConfig: в корне setup Google отвечает
+    // 1007 "Unknown name thinkingConfig at 'setup'" (найдено живой проверкой Extended 02.11).
+    const generationConfig: Record<string, unknown> = { responseModalities: ["AUDIO"], speechConfig };
+    if (this.opts.thinkingLevel) generationConfig.thinkingConfig = { thinkingLevel: this.opts.thinkingLevel };
     const setup: Record<string, unknown> = {
       model: `models/${this.opts.model}`,
-      generationConfig: { responseModalities: ["AUDIO"], speechConfig },
+      generationConfig,
       inputAudioTranscription: {},
       outputAudioTranscription: {},
       systemInstruction: { parts: [{ text: this.opts.systemInstruction }] },
     };
-    if (this.opts.thinkingLevel) {
-      setup.thinkingConfig = { thinkingLevel: this.opts.thinkingLevel };
-    }
     if (this.opts.tools?.length) setup.tools = this.opts.tools;
     if (this.handle) setup.sessionResumption = { handle: this.handle };
     if (this.opts.contextWindowCompression) {

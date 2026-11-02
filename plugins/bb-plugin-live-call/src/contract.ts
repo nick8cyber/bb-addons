@@ -133,7 +133,7 @@ export const serverFrame = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("warning"),
-    code: z.enum(["tpm_near_limit", "call_ending", "extended_unavailable"]),
+    code: z.enum(["tpm_near_limit", "call_ending", "extended_unavailable", "mic_silent"]),
     message: z.string(),
   }),
   z.object({ type: z.literal("error"), code: z.string(), message: z.string(), retryable: z.boolean() }),

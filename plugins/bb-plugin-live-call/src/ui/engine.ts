@@ -32,7 +32,7 @@ export type FeedItem =
   | { kind: "line"; id: string; role: "owner" | "agent"; text: string; final: boolean }
   | { kind: "action"; id: string; tool: string; cls: "R" | ConfirmClass; status: ActionStatus; summary: string; threadId?: string }
   | { kind: "event"; id: string; eventKind: "thread.idle" | "thread.failed" | "interaction.pending"; threadId: string; summary: string }
-  | { kind: "notice"; id: string; tone: "info" | "warn" | "error"; text: string }
+  | { kind: "notice"; id: string; tone: "info" | "warn" | "error"; text: string; action?: "to-normal" }
   | { kind: "divider"; id: string; text: string };
 
 export interface Confirmation {
@@ -239,6 +239,9 @@ export class CallEngine {
   }
 
   private push(item: FeedItem) {
+    // Одинаковое предупреждение среди последних строк — не повторяем (было: четыре
+    // «микрофон почти молчит» подряд).
+    if (item.kind === "notice" && this.view.feed.slice(-6).some((f) => f.kind === "notice" && f.text === item.text)) return;
     const feed = [...this.view.feed, item];
     this.patch({ feed: feed.length > FEED_LIMIT ? feed.slice(feed.length - FEED_LIMIT) : feed });
   }
@@ -480,11 +483,24 @@ export class CallEngine {
         });
         break;
       case "warning":
-        this.push({ kind: "notice", id: this.nextId("n"), tone: "warn", text: frame.message });
+        this.push({
+          kind: "notice",
+          id: this.nextId("n"),
+          tone: "warn",
+          text: frame.message,
+          ...(frame.code === "extended_unavailable" && this.view.mode === "extended" ? { action: "to-normal" as const } : {}),
+        });
         break;
       case "error":
         if (this.view.phase === "connecting") this.patch({ error: { code: frame.code, message: frame.message } });
-        else this.push({ kind: "notice", id: this.nextId("n"), tone: "error", text: frame.message });
+        else
+          this.push({
+            kind: "notice",
+            id: this.nextId("n"),
+            tone: "error",
+            text: frame.message,
+            ...(frame.code === "extended_unavailable" && this.view.mode === "extended" ? { action: "to-normal" as const } : {}),
+          });
         if (frame.code === "pending_confirmation") this.patch({ switching: false });
         break;
       case "ended":
@@ -512,13 +528,29 @@ export class CallEngine {
   private onTranscript(role: "owner" | "agent", text: string, final: boolean) {
     if (role === "owner" && final) this.ownerHeard = true;
     const feed = this.view.feed;
-    const last = feed[feed.length - 1];
-    if (last && last.kind === "line" && last.role === role && !last.final) {
-      const merged: FeedItem = { ...last, text: final ? text : last.text + text, final };
-      this.patch({ feed: [...feed.slice(0, -1), merged] });
+    // Открытая (не финальная) реплика той же стороны — даже если после неё уже
+    // встала карточка действия или реплика другой стороны (баг приёмки 02.11:
+    // реплики рвались на куски и повторялись строкой ниже).
+    let open = -1;
+    for (let i = feed.length - 1; i >= Math.max(0, feed.length - 12); i--) {
+      const f = feed[i];
+      if (f.kind !== "line" || f.role !== role) continue;
+      if (!f.final) open = i;
+      break;
+    }
+    if (open >= 0) {
+      const cur = feed[open] as Extract<FeedItem, { kind: "line" }>;
+      const merged: FeedItem = { ...cur, text: final ? text || cur.text : cur.text + text, final };
+      this.patch({ feed: [...feed.slice(0, open), merged, ...feed.slice(open + 1)] });
       return;
     }
-    if (!text.trim() && !final) return;
+    if (!text.trim()) return;
+    if (final) {
+      // Повтор того же финала (сервер шлёт финал и по таймеру, и по turnComplete) — не дублируем.
+      const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+      const prev = [...feed].reverse().find((f) => f.kind === "line" && f.role === role) as Extract<FeedItem, { kind: "line" }> | undefined;
+      if (prev && norm(prev.text) === norm(text)) return;
+    }
     this.push({ kind: "line", id: this.nextId("l"), role, text, final });
   }
 

@@ -12,7 +12,10 @@
     "name": "Live Call",
     "description": "Голосовые звонки с координатором BB через Gemini Live API",
     "branding": {
-      "icon": "Phone"
+      "icon": "./icons/phone.svg",
+      "experimental_icons": {
+        "phone": "./icons/phone.svg"
+      }
     },
     "server": "./server.ts",
     "app": "./app.tsx",
