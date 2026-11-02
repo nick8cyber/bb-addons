@@ -30,6 +30,19 @@ function fixture(name = "one", other = false) {
 }
 
 describe("native git header binding", () => {
+  it("keeps the native merge-base picker in the Git popover without a separate composer row", async () => {
+    const f = fixture(); disposers.push(mountSidebarControls());
+    const action = document.createElement("div"); action.setAttribute("data-promptbox-hide-compact", "");
+    const icon = document.createElement("span"); icon.dataset.icon = "GitMerge";
+    const picker = document.createElement("button"); picker.textContent = "main";
+    const select = vi.fn(); picker.onclick = select; action.append(icon, picker); f.section.append(action);
+    await waitFor(() => expect(action.hasAttribute("data-bb-git-action")).toBe(true));
+    expect(f.section.dataset.bbGitSection).toBe("only");
+    expect(getComputedStyle(f.section).display).toBe("none");
+    f.binding.toggle(); await waitFor(() => expect(f.state()?.expanded).toBe(true));
+    picker.click(); expect(select).toHaveBeenCalledOnce();
+    f.binding.dispose(); expect(action.hasAttribute("data-bb-git-action")).toBe(false);
+  });
   it("uses the host disclosure, tracks text/state/disabled, and cleans only owned changes", async () => {
     const f = fixture(); disposers.push(mountSidebarControls());
     expect(f.state()).toMatchObject({ summary: "Untracked · 813 files", count: "813", expanded: false });

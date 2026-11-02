@@ -46,18 +46,21 @@ export function bindGitHeader(
     const p = pane!.getBoundingClientRect();
     const h = anchor.closest("header")?.getBoundingClientRect();
     if (!h) return;
-    const viewWidth = doc.documentElement.clientWidth || win.innerWidth;
-    const viewHeight = win.visualViewport?.height ?? win.innerHeight;
-    const minLeft = Math.max(8, p.left + 8);
-    const right = Math.min(p.right, viewWidth) - 8;
+    const view = win.visualViewport;
+    const viewLeft = view?.offsetLeft ?? 0;
+    const viewTop = view?.offsetTop ?? 0;
+    const viewWidth = view?.width ?? (doc.documentElement.clientWidth || win.innerWidth);
+    const viewHeight = view?.height ?? win.innerHeight;
+    const minLeft = Math.max(viewLeft + 8, p.left + 8);
+    const right = Math.min(p.right, viewLeft + viewWidth) - 8;
     const width = Math.max(0, Math.min(500, right - minLeft));
     const left = Math.max(minLeft, Math.min(anchor.getBoundingClientRect().right - width, right - width));
-    const top = Math.max(0, h.bottom + 4);
+    const top = Math.max(viewTop + 8, h.bottom + 4);
     const target = section.getAttribute("data-bb-git-section") === "only" ? section : body;
     if (target) {
       for (const [key, value] of Object.entries({
         "--bb-git-left": left + "px", "--bb-git-top": top + "px",
-        "--bb-git-width": width + "px", "--bb-git-height": Math.max(80, viewHeight - top - 12) + "px",
+        "--bb-git-width": width + "px", "--bb-git-height": Math.max(44, Math.min(p.bottom, viewTop + viewHeight) - top - 12) + "px",
       })) if (target.style.getPropertyValue(key) !== value) target.style.setProperty(key, value);
     }
     mark(anchor, "data-bb-git-compact", String(p.width < 620));
@@ -85,8 +88,12 @@ export function bindGitHeader(
       return;
     }
     // Unknown plugin segments and static status text must also remain accessible.
+    const mergeActions = Array.from(section.querySelectorAll<HTMLElement>("[data-promptbox-hide-compact]"))
+      .filter(el => el.querySelector('[data-icon="GitMerge"]'));
+    for (const action of mergeActions) mark(action, "data-bb-git-action", "");
     const hasOtherContent = (node: Node): boolean => {
       if (node === source || node === body) return false;
+      if (mergeActions.includes(node as HTMLElement)) return false;
       if (node.nodeType === 3) return Boolean(node.textContent?.trim());
       if (node instanceof win.Element && node.matches('button,a,input,select,textarea,[role="button"]')) return true;
       return Array.from(node.childNodes).some(hasOtherContent);
@@ -146,6 +153,7 @@ export function bindGitHeader(
   doc.addEventListener("pointerdown", onPointerDown, true);
   win.addEventListener("resize", position);
   win.visualViewport?.addEventListener("resize", position);
+  win.visualViewport?.addEventListener("scroll", position);
   update();
   return {
     toggle() { if (!disposed && source && !source.disabled) source.click(); },
@@ -159,6 +167,7 @@ export function bindGitHeader(
       doc.removeEventListener("pointerdown", onPointerDown, true);
       win.removeEventListener("resize", position);
       win.visualViewport?.removeEventListener("resize", position);
+      win.visualViewport?.removeEventListener("scroll", position);
       clear();
     },
   };
