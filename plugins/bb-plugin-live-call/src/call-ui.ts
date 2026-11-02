@@ -297,7 +297,7 @@ function buildOverlay() {
   root.id = OVERLAY_ID;
   root.style.cssText = `
     position: fixed; right: 24px; bottom: 24px; z-index: 999999;
-    width: 360px; max-height: 70vh; display: flex; flex-direction: column;
+    width: 360px; max-width: calc(100vw - 16px); max-height: 70vh; display: flex; flex-direction: column;
     background: var(--color-canvas, #16171a); color: var(--color-ink, #e8e8ea);
     border: 1px solid rgba(255,255,255,.12); border-radius: 14px;
     box-shadow: 0 12px 40px rgba(0,0,0,.4); font-family: system-ui, -apple-system, sans-serif;
@@ -406,7 +406,12 @@ function buildOverlay() {
   };
 }
 
-/** Кнопка 📞 в углу: вход в звонок без привязки к треду (спека §6). */
+/**
+ * Кнопка 📞: на десктопе правый нижний угол, на узких экранах — правый верхний,
+ * под шапкой: внизу она накрывает кнопку отправки композера (баг-репорт владельца).
+ */
+const MOBILE_QUERY = "(max-width: 700px)";
+
 export function mountCallButton(): () => void {
   if (typeof document === "undefined") return () => {};
   const existing = document.getElementById(BUTTON_ID);
@@ -416,12 +421,29 @@ export function mountCallButton(): () => void {
   btn.title = "Позвонить координатору (живой голос)";
   btn.textContent = "📞";
   btn.style.cssText = `
-    position: fixed; right: 24px; bottom: 24px; z-index: 999998;
+    position: fixed; z-index: 999998;
     width: 44px; height: 44px; border-radius: 50%; border: 1px solid rgba(255,255,255,.15);
     background: var(--color-primary, #4f6ef7); color: #fff; font-size: 20px; cursor: pointer;
     box-shadow: 0 6px 20px rgba(0,0,0,.35); pointer-events: auto;
   `;
+  const place = () => {
+    if (window.matchMedia(MOBILE_QUERY).matches) {
+      btn.style.cssText += `
+        right: 12px; top: 68px; width: 40px; height: 40px; font-size: 18px;
+      `;
+    } else {
+      btn.style.cssText += `
+        right: 24px; bottom: 24px; width: 44px; height: 44px; font-size: 20px;
+      `;
+    }
+  };
+  place();
+  const mq = window.matchMedia(MOBILE_QUERY);
+  mq.addEventListener?.("change", place);
   btn.onclick = () => void startCall();
   document.body.append(btn);
-  return () => btn.remove();
+  return () => {
+    mq.removeEventListener?.("change", place);
+    btn.remove();
+  };
 }
