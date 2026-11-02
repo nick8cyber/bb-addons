@@ -37,6 +37,7 @@ import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib
 import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridgeValue } from "./lib/navigation-rail";
 import { mountSidebarControls } from "./lib/sidebar-controls";
 import { bindGitHeader, type GitHeaderSnapshot } from "./lib/git-header";
+import { bindActivityHeader, mountCompactQueue, type ActivitySnapshot } from "./lib/chat-compact";
 import {
   groupSidebarThreads,
   threadDisplayTitle,
@@ -836,9 +837,32 @@ function GitHeader({ threadId }: { threadId: string }) {
   </span>;
 }
 
+function ActivityHeader({ threadId }: { threadId: string }) {
+  const anchor = useRef<HTMLSpanElement>(null);
+  const controller = useRef<ReturnType<typeof bindActivityHeader> | null>(null);
+  const [snapshot, setSnapshot] = useState<ActivitySnapshot | null>(null);
+  useEffect(() => {
+    if (!anchor.current) return;
+    const binding = bindActivityHeader(anchor.current, setSnapshot);
+    controller.current = binding;
+    return () => { controller.current = null; binding.dispose(); };
+  }, [threadId]);
+  return <span ref={anchor} data-bb-activity-header="">
+    {snapshot ? <button type="button" aria-label={snapshot.label} title={snapshot.label}
+      aria-expanded={snapshot.expanded} aria-controls={snapshot.controlsId}
+      onClick={() => controller.current?.toggle()}>
+      <Icon name="Terminal" className="size-3.5 shrink-0" />
+      <span data-bb-activity-label="">Фон</span>
+      <span aria-hidden="true" className="size-1.5 rounded-full bg-success" />
+    </button> : null}
+  </span>;
+}
+
 export default definePluginApp((app) => {
   app.contentScripts.register({ id: "sidebar-controls", mount: ({signal}) => mountSidebarControls(signal) });
+  app.contentScripts.register({ id: "compact-queue", mount: ({signal}) => mountCompactQueue(signal) });
   app.slots.experimental_threadHeaderAction({ id: "changed-files", title: "Изменённые файлы", component: GitHeader });
+  app.slots.experimental_threadHeaderAction({ id: "background-activity", title: "Фоновая активность", component: ActivityHeader });
   app.slots.experimental_threadList({
     id: "collapsed",
     title: "Collapsed thread list",

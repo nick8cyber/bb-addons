@@ -53,6 +53,42 @@ export const SIDEBAR_CONTROLS_CSS = `
   [data-bb-git-header-summary] { display: none; }
   [data-bb-git-header-count] { display: inline; }
 }
+/* Compact queue keeps BB's own trigger, preview, count and inert state. */
+section:has(> header[data-queued-messages-mode="collapsed"]) {
+  height: 32px !important; min-height: 32px !important;
+  margin-bottom: 0 !important; padding-bottom: 0 !important;
+  border-radius: 8px !important;
+}
+header[data-queued-messages-mode="collapsed"] > button {
+  height: 30px !important; min-height: 30px !important; padding-block: 0 !important;
+}
+section:has(> header[data-queued-messages-mode="collapsed"]) > [data-queued-messages-scroll-frame] { display: none !important; }
+[data-bb-git-section="mixed"] [data-bb-git-action] { display: none !important; }
+[data-bb-activity-card][data-bb-activity-open="false"] { display: none !important; }
+[data-bb-activity-card][data-bb-activity-open="true"] {
+  position: fixed !important;
+  left: var(--bb-activity-left); top: var(--bb-activity-top); width: var(--bb-activity-width);
+  max-height: var(--bb-activity-height); overflow: auto !important; z-index: 45;
+  background: var(--background); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 24px #0003;
+}
+[data-bb-activity-header] { display: inline-flex; min-width: 0; }
+[data-bb-activity-header] button {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px;
+  padding: 0 7px; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 12px; color: var(--foreground); cursor: pointer;
+}
+[data-bb-activity-header] button:hover { background: var(--accent); }
+[data-bb-activity-header] button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+@media (max-width: 767px), (pointer: coarse) {
+  [data-bb-git-header] button, [data-bb-activity-header] button { height: 44px; min-width: 44px; }
+  [data-bb-activity-label] { display: none; }
+  section:has(> header[data-queued-messages-mode="collapsed"]) { height: 44px !important; min-height: 44px !important; }
+  header[data-queued-messages-mode="collapsed"] > button { height: 42px !important; min-height: 42px !important; }
+  [data-queued-message-row] > div { flex-wrap: wrap; }
+  [data-queued-message-actions] { margin-left: auto; }
+  [data-queued-message-actions] > button { min-width: 44px; min-height: 44px; }
+}
 `;
 export function mountSidebarControls(signal?: AbortSignal, doc: Document = document): () => void {
   if (signal?.aborted) return () => {};
