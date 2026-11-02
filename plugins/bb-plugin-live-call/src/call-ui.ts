@@ -9,6 +9,8 @@ import { FRAME_PLAYBACK, packFrame, type ServerFrame } from "./contract.js";
 const CALL_WS_PATH = "/api/v1/plugins/live-call/http/call";
 const OVERLAY_ID = "bb-live-call-overlay";
 const BUTTON_ID = "bb-live-call-button";
+const MIC_PREF_KEY = "lc-mic-id";
+const isIphoneMic = (label: string) => /iphone|continuity/i.test(label);
 
 export function esc(value: string | number): string {
   return String(value)
@@ -176,16 +178,34 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
     switch (frame.type) {
       case "ready": {
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+          // macOS с Continuity делает iPhone микрофоном по умолчанию — браузер берёт
+          // системный дефолт и получает телефон. Обходим: сохранённый выбор владельца,
+          // иначе — первое не-iPhone устройство (репорт владельца 02.11).
+          const savedMic = localStorage.getItem(MIC_PREF_KEY) ?? "";
+          const base: MediaTrackConstraints = {
+            echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1,
+          };
+          let stream = await navigator.mediaDevices.getUserMedia({
+            audio: savedMic ? { ...base, deviceId: { exact: savedMic } } : base,
           });
+          if (!savedMic && isIphoneMic(stream.getAudioTracks()[0]?.label ?? "")) {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const better = devices.find((d) => d.kind === "audioinput" && !isIphoneMic(d.label));
+            if (better) {
+              stream.getTracks().forEach((t) => t.stop());
+              stream = await navigator.mediaDevices.getUserMedia({ audio: { ...base, deviceId: { exact: better.deviceId } } });
+              overlay.micWarning.textContent = `Микрофон по умолчанию — iPhone, взял «${better.label.slice(0, 40)}». Сменить — селектор под статусом`;
+            }
+          }
+          const track = stream.getAudioTracks()[0];
+          localStorage.setItem(MIC_PREF_KEY, track?.getSettings().deviceId ?? "");
           ui.stream = stream;
           const ctxIn = new AudioContext();
           ui.audioCtxIn = ctxIn;
           // Браузер создаёт контексты suspended, даже после клика — без resume микрофон молчит.
           await ctxIn.resume();
           await ctxIn.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })));
-          const source = ctxIn.createMediaStreamSource(stream);
+          const sourceRef: { source: MediaStreamAudioSourceNode } = { source: null as unknown as MediaStreamAudioSourceNode };
           const worklet = new AudioWorkletNode(ctxIn, "live-call-capture");
           let silentSeconds = 0;
           worklet.port.onmessage = (e: MessageEvent<Float32Array>) => {
@@ -213,7 +233,8 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
             }
             sock.send(packFrame(0x01, 0, new Uint8Array(i16.buffer)));
           };
-          source.connect(worklet);
+          sourceRef.source = ctxIn.createMediaStreamSource(stream);
+          sourceRef.source.connect(worklet);
           worklet.connect(ctxIn.destination); // worklet требует выхода, но молчит
           audioCtxOut = new AudioContext({ sampleRate: 24000 });
           await audioCtxOut.resume();
@@ -222,6 +243,40 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
           });
           ui.audioCtxOut = audioCtxOut;
           overlay.stateLine.textContent = "Готов: говорите";
+
+          // Селектор микрофона: после первого разрешения подписи устройств доступны.
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const inputs = devices.filter((d) => d.kind === "audioinput");
+          if (inputs.length > 1) {
+            overlay.micSelect.innerHTML = "";
+            for (const d of inputs) {
+              const opt = document.createElement("option");
+              opt.value = d.deviceId;
+              opt.textContent = d.label || "Микрофон";
+              overlay.micSelect.append(opt);
+            }
+            const activeId = track.getSettings().deviceId ?? "";
+            for (const opt of [...overlay.micSelect.options]) opt.selected = opt.value === activeId;
+            overlay.micSelect.style.display = "block";
+            overlay.micSelect.onchange = async () => {
+              const deviceId = overlay.micSelect.value;
+              if (!deviceId) return;
+              try {
+                localStorage.setItem(MIC_PREF_KEY, deviceId);
+                const next = await navigator.mediaDevices.getUserMedia({
+                  audio: { ...base, deviceId: { exact: deviceId } },
+                });
+                (ui.stream as MediaStream).getTracks().forEach((t) => t.stop());
+                ui.stream = next;
+                sourceRef.source.disconnect();
+                sourceRef.source = ctxIn.createMediaStreamSource(next);
+                sourceRef.source.connect(worklet);
+                overlay.micWarning.textContent = "";
+              } catch (e) {
+                overlay.micWarning.textContent = `Не удалось переключить микрофон: ${e instanceof Error ? e.message : String(e)}`;
+              }
+            };
+          }
         } catch (e) {
           const message = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
           overlay.stateLine.textContent = `Микрофон недоступен: ${message}`;
@@ -318,6 +373,8 @@ function buildOverlay() {
   threadLine.style.cssText = "padding:4px 12px; opacity:.5; font-size:11px;";
   const micWarning = document.createElement("div");
   micWarning.style.cssText = "padding:0 12px 4px; color:#ffb46e; font-size:11px; min-height:0;";
+  const micSelect = document.createElement("select");
+  micSelect.style.cssText = "margin:0 12px 6px; max-width: calc(100% - 24px); font-size:11px; display:none; background:var(--color-canvas,#16171a); color:inherit; border:1px solid rgba(255,255,255,.15); border-radius:6px; padding:2px;";
 
   const log = document.createElement("div");
   log.style.cssText = "flex:1; overflow-y:auto; padding:8px 12px; display:flex; flex-direction:column; gap:6px; min-height:120px;";
@@ -339,7 +396,7 @@ function buildOverlay() {
   const endBtn = mkBtn("■ Завершить", "Завершить звонок");
   endBtn.style.borderColor = "rgba(255,100,100,.4)";
   controls.append(muteBtn, modeBtn, endBtn);
-  root.append(header, threadLine, micWarning, log, confirmation, controls);
+  root.append(header, threadLine, micWarning, micSelect, log, confirmation, controls);
   document.body.append(root);
 
   let muted = false;
@@ -369,6 +426,7 @@ function buildOverlay() {
     stateLine,
     threadLine,
     micWarning,
+    micSelect,
     addTranscript(role: "owner" | "agent", text: string, final: boolean) {
       // Куски одной реплики дописываются в последнюю строку своей роли,
       // а не рисуются отдельными сообщениями (репорт владельца 02.11).
