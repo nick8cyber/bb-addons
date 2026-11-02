@@ -36,7 +36,9 @@ Pi: нет auth entry — нет дополнительного ресурса; 
 
 ## 3. Ошибки и предупреждения
 
-Валидный provider measurement со status=error — данные отдельного ресурса. Сохранять его в measurements и показывать existing account error UI, включая понятный источник в сообщении/подписи. Не бросать на нём transport exception и не поднимать machine.error. Так отключённый Pool account остаётся видимым с собственной ошибкой, а здоровые Codex/Claude/Google вкладки не получают общую плашку.
+Валидный provider measurement со status=error — данные отдельного ресурса. Сохранять его в measurements и показывать existing account error UI, включая понятный источник в сообщении/подписи. Не бросать на нём transport exception и не поднимать machine.error. Ошибка включённого аккаунта остаётся локальной и не вызывает общей плашки на здоровых вкладках.
+
+Уточнение владельца 2026-11-02: отключённые аккаунты Account Pooler не относятся к отображаемым квотам. Для source pluginId=account-pool читать публичный RPC account.list (input=null, только id/enabled); исключать из inventory и сбора usage только resource.id с явным enabled=false. Аккаунты и их credentials/settings/routing не менять. Включённые и неизвестные IDs не скрывать, даже при status=error; при недоступных/невалидных metadata сохранить обычный inventory. После включения аккаунт возвращается при следующем чтении, без перезагрузки. Не фильтровать по email, тексту ошибки, тарифу или accountKey. Старый cache исключённого ресурса очищается штатной inventory-reconciliation. Проверить disabled+active error, повторное enable/disable без reload, metadata failure и совпадающий id другого source.
 
 Transport/getResource exception также локализовать на соответствующем ресурсе. Если есть старое успешное измерение того же accountKey, сохранить его как last-known и явно показать локальное предупреждение об устаревании/неудачном обновлении; если измерения нет — account error card. Нельзя выдавать stale за свежие, терять действительную ошибку, помечать запрос успешным без данных или удалять неисправные подключения. После успешного refresh локальная ошибка очищается. Проблема одного ресурса не переносится на другую карточку/вкладку/host.
 
@@ -87,7 +89,7 @@ DI передаётся в factory ДО запуска любого prewarm: use
 | Разные hosts и server origin | Pi только на своём host; разные hosts не смешиваются |
 | Свежий healthy vs stale/error duplicate | Один актуальный набор окон, без суммирования |
 | Identity rotation и cache | Старые квоты не приписываются новому account |
-| Pool error + healthy others | Локальный account error, нет постоянного общего banner |
+| Pool disabled / enabled error + healthy others | Disabled скрыт; enabled error локален, нет общего banner |
 | Source transport error + stale data | Локальное честное предупреждение, recovery очищает его |
 | Inventory/RPC/offline failure | Реальная ошибка остаётся видимой |
 | Credit retry | Прежние tests/поведение и уже созданная очередь сохранены |
@@ -100,4 +102,4 @@ DI передаётся в factory ДО запуска любого prewarm: use
 
 Точная цель: <bb-addons>/plugins/bb-plugin-usage-pro; добавить usage-pro в .bb/plugins.json, затем bb plugin install path:<bb-addons> --plugin usage-pro --yes --json. Откат: bb plugin install path:<worktrees>/bb-addons-codex-retry-queue/plugins/bb-plugin-usage-pro --yes --json (старый источник не редактируется). Private backup: ~/.bb/thread-storage/<thread>/usage-display-backup; dirty-main-hashes.json содержит сохранённые отпечатки двух main artifacts, также сверять с advisor-language-backup/preexisting-dirty-hashes.json.
 
-Live: у host-1 один healthy Codex account 0000aaaa… с Team и одним набором окон; legacy disabled account … отдельно как error, без machine.error. У host-2 нет скопированной Pi source карточки a1. Настоящие transport ошибки не маскировать. Сравнить quota identity/window counts с исходными sources и убедиться, что auth/settings/routes/очередь не менялись. Если подключить другой account, его карточка должна сохраняться (fake tests, без смены живого аккаунта).
+Live: у host-1 один healthy Codex account 0000aaaa… с Team и одним набором окон; legacy disabled account … отсутствует в виджете, сохранён в Account Pooler и не меняет machine.error. У host-2 нет скопированной Pi source карточки a1. Настоящие transport ошибки включённых аккаунтов не маскировать. Сравнить quota identity/window counts с исходными sources и убедиться, что auth/settings/routes/очередь не менялись. Если подключить другой account, его карточка должна сохраняться (fake tests, без смены живого аккаунта).
