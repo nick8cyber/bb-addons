@@ -185,7 +185,10 @@ export class LiveClient extends EventEmitter {
       }
       if (content.inputTranscription?.text) this.emit("inputTranscript", content.inputTranscription.text, false);
       if (content.outputTranscription?.text) this.emit("outputTranscript", content.outputTranscription.text, false);
-      if (content.turnComplete || content.generationComplete) {
+      // Только turnComplete — конец реплики. generationComplete приходит между
+      // предложениями: если считать его концом хода, ответ дробится на отдельные
+      // сообщения, а аудио сегментов накладывается друг на друга (инцидент 02.11 20:4x).
+      if (content.turnComplete) {
         if (this.openTurnSeq !== null) {
           this.emit("audio", this.openTurnSeq, new Uint8Array(0)); // нулевой кусок = конец хода
           this.openTurnSeq = null;

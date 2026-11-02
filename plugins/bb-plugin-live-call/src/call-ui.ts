@@ -61,22 +61,28 @@ type CallUi = {
   addTranscript: (role: "owner" | "agent", text: string) => void;
 };
 
-/** Плеер: очередь источников по ходам; drained — когда ход доигран и новых кусков нет. */
+/**
+ * Плеер: один курсор воспроизведения — каждый следующий кусок начинается строго
+ * после предыдущего, ходы не накладываются (инцидент 02.11: сегменты одного ответа
+ * играли одновременно). playback_drained уходит, когда весь ход доигран.
+ */
 class TurnPlayer {
   private pending: Array<{ turnSeq: number; buffer: AudioBuffer }> = [];
-  private playing: Array<{ turnSeq: number; source: AudioBufferSourceNode }> = [];
+  private playing = 0;
+  private lastTurnSeq: number | null = null;
   private drainedSent = new Set<number>();
-  private openTurn: number | null = null;
+  private nextStart = 0;
 
   constructor(private ctx: AudioContext, private drained: (turnSeq: number) => void) {}
 
   enqueue(turnSeq: number, pcm: Uint8Array) {
     if (pcm.length === 0) {
-      this.maybeDrain(turnSeq, true);
+      this.maybeDrain(turnSeq);
       return;
     }
-    if (this.openTurn === null) this.openTurn = turnSeq;
+    this.lastTurnSeq = turnSeq;
     const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+    if (samples.length === 0) return;
     const buffer = this.ctx.createBuffer(1, samples.length, 24000);
     const data = buffer.getChannelData(0);
     for (let i = 0; i < samples.length; i++) data[i] = samples[i] / 32768;
@@ -90,36 +96,31 @@ class TurnPlayer {
       const source = this.ctx.createBufferSource();
       source.buffer = item.buffer;
       source.connect(this.ctx.destination);
-      const turnSeq = item.turnSeq;
+      // Курсор: старт строго после конца предыдущего куска.
+      const start = Math.max(this.ctx.currentTime + 0.02, this.nextStart);
+      this.nextStart = start + item.buffer.duration + 0.03;
+      this.playing += 1;
       source.onended = () => {
-        this.playing = this.playing.filter((p) => p.source !== source);
-        this.maybeDrain(turnSeq, false);
+        this.playing = Math.max(0, this.playing - 1);
+        if (this.lastTurnSeq !== null) this.maybeDrain(this.lastTurnSeq);
       };
-      const delay = this.playing.reduce((max, p) => Math.max(max, (p.source.buffer?.duration ?? 0)), 0);
-      source.start(this.ctx.currentTime + 0.02 + (this.playing.length > 0 ? delay : 0));
-      this.playing.push({ turnSeq, source });
+      source.start(start);
     }
   }
 
-  private maybeDrain(turnSeq: number, immediate: boolean) {
-    if (this.pending.length > 0) return;
-    if (this.playing.some((p) => p.turnSeq === turnSeq)) return;
+  private maybeDrain(turnSeq: number) {
+    if (this.pending.length > 0 || this.playing > 0) return;
     if (this.drainedSent.has(turnSeq)) return;
     this.drainedSent.add(turnSeq);
-    if (immediate || this.playing.length === 0) this.drained(turnSeq);
+    this.drained(turnSeq);
   }
 
   interrupted() {
-    for (const p of this.playing) {
-      try {
-        p.source.stop();
-      } catch {
-        // Источник уже остановился.
-      }
-    }
-    this.playing = [];
+    // Быстрый сброс: источники остановить нельзя выборочно — стопаем всё и чистим курсор.
     this.pending = [];
-    this.openTurn = null;
+    this.playing = 0;
+    this.nextStart = this.ctx.currentTime;
+    this.drainedSent.clear();
   }
 }
 
@@ -133,6 +134,7 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
   const ui: Partial<CallUi> = { sock };
   let player: TurnPlayer | null = null;
   let audioCtxOut: AudioContext | null = null;
+  let ownerHeard = false;
 
   const teardown = () => {
     try {
@@ -197,13 +199,14 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
               if (v > peak) peak = v;
               i16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
             }
-            // Диагностика: если микрофон молчит — сказать об этом явно, а не молчать вместе с ним.
+            // Диагностика: предупреждение только пока владелец ещё ни разу не был услышан —
+            // после паузы оно лишь путает (инцидент 02.11).
             if (peak > 0.01) {
               silentSeconds = 0;
-              if (overlay.micWarning) overlay.micWarning.textContent = "";
+              if (ownerHeard && overlay.micWarning) overlay.micWarning.textContent = "";
             } else {
               silentSeconds += 1;
-              if (silentSeconds === 25) { // ~25 буферов по 128 мс ≈ 3 с тишины
+              if (silentSeconds === 25 && !ownerHeard) { // ≈3 с тишины до первой реплики
                 overlay.micWarning.textContent = "⚠ Микрофон молчит: проверь, не замучен ли он в системе/браузере";
                 sock.send(JSON.stringify({ type: "client_log", event: "mic_silent", detail: "peak=0 около 3 c" }));
               }
@@ -233,7 +236,8 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
         overlay.stateLine.textContent = stateLabel(frame.state, frame.detail);
         break;
       case "transcript":
-        overlay.addTranscript(frame.role, frame.text);
+        overlay.addTranscript(frame.role, frame.text, frame.final);
+        if (frame.role === "owner" && frame.final) ownerHeard = true;
         break;
       case "interrupted":
         player?.interrupted();
@@ -365,11 +369,23 @@ function buildOverlay() {
     stateLine,
     threadLine,
     micWarning,
-    addTranscript(role: "owner" | "agent", text: string) {
-      const row = document.createElement("div");
-      row.style.cssText = `white-space:pre-wrap; ${role === "agent" ? "opacity:.92" : "opacity:.6;"}`;
-      row.textContent = `${role === "agent" ? "Агент: " : "Вы: "}${text}`;
-      log.append(row);
+    addTranscript(role: "owner" | "agent", text: string, final: boolean) {
+      // Куски одной реплики дописываются в последнюю строку своей роли,
+      // а не рисуются отдельными сообщениями (репорт владельца 02.11).
+      const prefix = role === "agent" ? "Агент: " : "Вы: ";
+      const last = log.lastElementChild as HTMLElement | null;
+      if (!final && last && last.dataset.role === role && !last.dataset.final) {
+        last.textContent = `${prefix}${last.dataset.text ?? ""}${text}`;
+        last.dataset.text = (last.dataset.text ?? "") + text;
+      } else {
+        const row = document.createElement("div");
+        row.style.cssText = `white-space:pre-wrap; ${role === "agent" ? "opacity:.92" : "opacity:.6;"}`;
+        row.dataset.role = role;
+        row.dataset.text = text;
+        if (final) row.dataset.final = "1";
+        row.textContent = `${prefix}${text}`;
+        log.append(row);
+      }
       log.scrollTop = log.scrollHeight;
     },
     addAction(icon: string, text: string) {
