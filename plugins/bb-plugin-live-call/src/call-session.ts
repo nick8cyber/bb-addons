@@ -531,6 +531,10 @@ export class CallSession extends EventEmitter {
       // Шлюз закрыт: в Gemini идёт тишина, транскрипт отбрасывается (спека §7.1 п. 3.1).
       return;
     }
+    // Полудуплекс по умолчанию: пока агент говорит, микрофон в модель не идёт.
+    // Иначе модель слышит себя из колонок владельца, принимает за речь владельца
+    // и перебивает сама себя — ответ идёт «в параллель» (инцидент 02.11 21:2x).
+    if (this.state === "speaking") return;
     if (pcm.length > MIC_FRAME_BYTES * 8) return; // защита от некадренного потока
     this.voice?.sendAudio(pcm);
     if (this.mode === "extended" && this.deps.routerInput === "audio") this.router?.sendAudio(pcm);
