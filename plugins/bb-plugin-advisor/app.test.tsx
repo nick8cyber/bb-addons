@@ -487,9 +487,13 @@ describe("advisor compact composer banner", () => {
     expect(details?.hasAttribute("hidden")).toBe(true);
 
     // Truncated preview is visible in the container
-    expect(await q(slot).findByText("Migration is not atomic")).toBeTruthy();
+    const preview = await q(slot).findByText("Migration is not atomic");
+    expect(preview).toBeTruthy();
     // Action buttons exist in DOM inside the hidden section
     expect(details?.querySelector("button")).toBeTruthy();
+    fireEvent.click(preview);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(details?.hasAttribute("hidden")).toBe(false);
   });
 
   it("toggles expand and collapse on click, Enter, and Space without calling RPC", async () => {

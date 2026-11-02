@@ -569,6 +569,7 @@ function AdvisorComposerBanner() {
 
   const repeated = advice.repeatCount > 1;
   const detailsId = `advisor-banner-details-${advice.id}`;
+  const summaryId = `advisor-banner-summary-${advice.id}`;
 
   const handleDismiss = async () => {
     if (busyMutationsRef.current.has(cardKey) || mutationBusy) return;
@@ -706,60 +707,51 @@ function AdvisorComposerBanner() {
   };
 
   return (
-    <div className="w-full max-w-full rounded-lg border border-border bg-card px-3 py-2.5 sm:px-4 sm:py-3 text-xs text-muted-foreground box-border">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+    <div
+      className={`w-full max-w-full rounded-lg border border-border bg-card text-xs text-muted-foreground box-border ${isExpanded ? "px-3 py-2.5 sm:px-4 sm:py-3" : "px-2 py-0"}`}
+    >
+      <button
+        type="button"
+        aria-expanded={isExpanded}
+        aria-controls={detailsId}
+        aria-describedby={summaryId}
+        aria-label={isExpanded ? "Show less" : "Show more"}
+        title={isExpanded ? "Show less" : "Show more"}
+        onClick={toggleExpanded}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            toggleExpanded();
+          }
+        }}
+        className="flex min-h-[44px] w-full items-center gap-2 rounded-md text-left text-muted-foreground hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-[32px]"
+      >
+        <span className="shrink-0">
           <SeverityChip severity={advice.severity}>
             {repeated
               ? `${SEVERITY_LABEL[advice.severity]} · ${advice.repeatCount}×`
               : SEVERITY_LABEL[advice.severity]}
           </SeverityChip>
-          <h3 className="min-w-0 flex-1 text-sm font-semibold text-foreground truncate">
-            <span className="hidden sm:inline">Advisor reviewed your last turn</span>
-            <span className="sm:hidden">Review</span>
-          </h3>
-        </div>
-        <button
-          type="button"
-          aria-expanded={isExpanded}
-          aria-controls={detailsId}
-          aria-label={isExpanded ? "Show less" : "Show more"}
-          title={isExpanded ? "Show less" : "Show more"}
-          onClick={toggleExpanded}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              toggleExpanded();
-            }
-          }}
-          className="inline-flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        </span>
+        <span id={summaryId} className="min-w-0 flex-1 truncate text-xs text-foreground" title={advice.summary}>
+          {isExpanded ? "Review" : advice.summary}
+        </span>
+        <span className="sr-only">
+          {isExpanded ? "Show less" : "Show more"}
+        </span>
+        <svg
+          className={`h-4 w-4 shrink-0 transition-transform duration-150 ${isExpanded ? "rotate-180" : ""}`}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
         >
-          <span className="sr-only">
-            {isExpanded ? "Show less" : "Show more"}
-          </span>
-          <svg
-            className={`h-4 w-4 transition-transform duration-150 ${isExpanded ? "rotate-180" : ""}`}
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <polyline points="6 9 12 15 18 9" />
-          </svg>
-        </button>
-      </div>
-
-      {!isExpanded && (
-        <p
-          className="mt-1 text-xs text-foreground truncate"
-          title={advice.summary}
-        >
-          {advice.summary}
-        </p>
-      )}
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
 
       {activeError ? (
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-surface-destructive-border bg-surface-destructive px-3 py-2 text-xs text-destructive-text">
