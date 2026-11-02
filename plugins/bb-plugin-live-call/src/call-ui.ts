@@ -171,36 +171,57 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
     }
     switch (frame.type) {
       case "ready": {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-        ui.stream = stream;
-        const ctxIn = new AudioContext();
-        ui.audioCtxIn = ctxIn;
-        // Браузер создаёт контексты suspended, даже после клика — без resume микрофон молчит.
-        await ctxIn.resume();
-        await ctxIn.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })));
-        const source = ctxIn.createMediaStreamSource(stream);
-        const worklet = new AudioWorkletNode(ctxIn, "live-call-capture");
-        worklet.port.onmessage = (e: MessageEvent<Float32Array>) => {
-          if (sock.readyState !== WebSocket.OPEN) return;
-          const f32 = e.data;
-          const i16 = new Int16Array(f32.length);
-          for (let i = 0; i < f32.length; i++) {
-            const s = Math.max(-1, Math.min(1, f32[i]));
-            i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-          }
-          sock.send(packFrame(0x01, 0, new Uint8Array(i16.buffer)));
-        };
-        source.connect(worklet);
-        worklet.connect(ctxIn.destination); // worklet требует выхода, но молчит
-        audioCtxOut = new AudioContext({ sampleRate: 24000 });
-        await audioCtxOut.resume();
-        player = new TurnPlayer(audioCtxOut, (turnSeq) => {
-          if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "playback_drained", turnSeq }));
-        });
-        ui.audioCtxOut = audioCtxOut;
-        overlay.stateLine.textContent = "Готов: говорите";
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+          });
+          ui.stream = stream;
+          const ctxIn = new AudioContext();
+          ui.audioCtxIn = ctxIn;
+          // Браузер создаёт контексты suspended, даже после клика — без resume микрофон молчит.
+          await ctxIn.resume();
+          await ctxIn.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })));
+          const source = ctxIn.createMediaStreamSource(stream);
+          const worklet = new AudioWorkletNode(ctxIn, "live-call-capture");
+          let silentSeconds = 0;
+          worklet.port.onmessage = (e: MessageEvent<Float32Array>) => {
+            if (sock.readyState !== WebSocket.OPEN) return;
+            const f32 = e.data;
+            const i16 = new Int16Array(f32.length);
+            let peak = 0;
+            for (let i = 0; i < f32.length; i++) {
+              const x = Math.max(-1, Math.min(1, f32[i]));
+              const v = Math.abs(x);
+              if (v > peak) peak = v;
+              i16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
+            }
+            // Диагностика: если микрофон молчит — сказать об этом явно, а не молчать вместе с ним.
+            if (peak > 0.01) {
+              silentSeconds = 0;
+              if (overlay.micWarning) overlay.micWarning.textContent = "";
+            } else {
+              silentSeconds += 1;
+              if (silentSeconds === 25) { // ~25 буферов по 128 мс ≈ 3 с тишины
+                overlay.micWarning.textContent = "⚠ Микрофон молчит: проверь, не замучен ли он в системе/браузере";
+                sock.send(JSON.stringify({ type: "client_log", event: "mic_silent", detail: "peak=0 около 3 c" }));
+              }
+            }
+            sock.send(packFrame(0x01, 0, new Uint8Array(i16.buffer)));
+          };
+          source.connect(worklet);
+          worklet.connect(ctxIn.destination); // worklet требует выхода, но молчит
+          audioCtxOut = new AudioContext({ sampleRate: 24000 });
+          await audioCtxOut.resume();
+          player = new TurnPlayer(audioCtxOut, (turnSeq) => {
+            if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "playback_drained", turnSeq }));
+          });
+          ui.audioCtxOut = audioCtxOut;
+          overlay.stateLine.textContent = "Готов: говорите";
+        } catch (e) {
+          const message = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+          overlay.stateLine.textContent = `Микрофон недоступен: ${message}`;
+          sock.send(JSON.stringify({ type: "client_log", event: "mic_error", detail: message.slice(0, 200) }));
+        }
         break;
       }
       case "thread":
@@ -289,6 +310,8 @@ function buildOverlay() {
 
   const threadLine = document.createElement("div");
   threadLine.style.cssText = "padding:4px 12px; opacity:.5; font-size:11px;";
+  const micWarning = document.createElement("div");
+  micWarning.style.cssText = "padding:0 12px 4px; color:#ffb46e; font-size:11px; min-height:0;";
 
   const log = document.createElement("div");
   log.style.cssText = "flex:1; overflow-y:auto; padding:8px 12px; display:flex; flex-direction:column; gap:6px; min-height:120px;";
@@ -310,7 +333,7 @@ function buildOverlay() {
   const endBtn = mkBtn("■ Завершить", "Завершить звонок");
   endBtn.style.borderColor = "rgba(255,100,100,.4)";
   controls.append(muteBtn, modeBtn, endBtn);
-  root.append(header, threadLine, log, confirmation, controls);
+  root.append(header, threadLine, micWarning, log, confirmation, controls);
   document.body.append(root);
 
   let muted = false;
@@ -339,6 +362,7 @@ function buildOverlay() {
     modeLine,
     stateLine,
     threadLine,
+    micWarning,
     addTranscript(role: "owner" | "agent", text: string) {
       const row = document.createElement("div");
       row.style.cssText = `white-space:pre-wrap; ${role === "agent" ? "opacity:.92" : "opacity:.6;"}`;

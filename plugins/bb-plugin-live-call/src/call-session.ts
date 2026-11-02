@@ -72,6 +72,10 @@ export class CallSession extends EventEmitter {
   private tpmWarned = false;
   /** Приветствие один раз за звонок, независимо от переподключений. */
   private greeted = false;
+  /** Диагностика микрофона: байты и пиковая амплитуда за отчётный интервал. */
+  private micBytes = 0;
+  private micPeak = 0;
+  private micReporter: NodeJS.Timeout | null = null;
   /** Сборка реплики владельца из кусков inputTranscription; конец — 700 мс тишины. */
   private ownerUtterance: { text: string; firstAt: number; lastAt: number } | null = null;
   private ownerUtteranceTimer: NodeJS.Timeout | null = null;
@@ -521,6 +525,7 @@ export class CallSession extends EventEmitter {
 
   /** Аудио владельца из браузера. */
   onBrowserAudio(pcm: Uint8Array) {
+    this.trackMic(pcm);
     if (this.ended || this.muted) return;
     if (!this.gate.isMicOpen()) {
       // Шлюз закрыт: в Gemini идёт тишина, транскрипт отбрасывается (спека §7.1 п. 3.1).
@@ -530,6 +535,31 @@ export class CallSession extends EventEmitter {
     this.voice?.sendAudio(pcm);
     if (this.mode === "extended" && this.deps.routerInput === "audio") this.router?.sendAudio(pcm);
     if (this.state === "listening") this.setState("listening");
+  }
+
+  private trackMic(pcm: Uint8Array) {
+    this.micBytes += pcm.length;
+    // pcm идёт со смещением 5 байт от начала WS-кадра — Int16Array требует кратность 2,
+    // поэтому пиковая амплитуда через DataView (иначе RangeError убивает весь поток).
+    const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    for (let i = 0; i + 1 < view.byteLength; i += 8) {
+      const v = Math.abs(view.getInt16(i, true));
+      if (v > this.micPeak) this.micPeak = v;
+    }
+    if (!this.micReporter) {
+      this.micReporter = setInterval(() => {
+        const peak = this.micPeak;
+        this.micPeak = 0;
+        const bytes = this.micBytes;
+        this.micBytes = 0;
+        if (bytes === 0) return;
+        bb_log(this.deps, `микрофон: ${bytes} байт/5с, пик ${peak}`);
+        if (peak < 40 && bytes > 10_000) {
+          this.frame({ type: "warning", code: "tpm_near_limit", message: "микрофон почти молчит: проверь, не замучен ли он в системе и в браузере" });
+        }
+      }, 5000);
+      this.micReporter.unref?.();
+    }
   }
 
   /** Кадр playback_drained из браузера: открывает окно подтверждения. */
@@ -649,6 +679,10 @@ export class CallSession extends EventEmitter {
     }
     this.voice?.close();
     this.router?.close();
+    if (this.micReporter) {
+      clearInterval(this.micReporter);
+      this.micReporter = null;
+    }
     this.deps.store.endCall(this.deps.callId, reason);
     this.frame({ type: "ended", callId: this.deps.callId, threadId: this.threadId, reason });
     this.setState("ended");
@@ -678,3 +712,12 @@ export class CallSession extends EventEmitter {
 }
 
 export const PLAYBACK_BYTES_PER_SECOND = BYTES_PER_SECOND_24K;
+
+/** Диагностическая строка в хранилище звонка (видно в bb call transcript). */
+function bb_log(deps: CallSessionDeps, message: string): void {
+  try {
+    deps.store.event(deps.callId, "mic", { message });
+  } catch {
+    // журнал не критичен
+  }
+}

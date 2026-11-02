@@ -90,11 +90,12 @@ ws.onmessage = async (e) => {
       put(s16);
       put(silence.subarray(0, 16000));
       let i = 0;
+      let sent = 0;
       const tick = setInterval(() => {
-        if (i >= all.length) { clearInterval(tick); log("аудио отправлено"); return; }
+        if (i >= all.length) { clearInterval(tick); log(`аудио отправлено: ${sent} кадров`); return; }
         const chunk = all.subarray(i, i + 320);
         i += 320;
-        ws.send(frame(chunk));
+        try { ws.send(frame(chunk)); sent += 1; } catch (e) { log(`send error: ${e.message}`); clearInterval(tick); }
       }, 20);
       break;
     case "thread":

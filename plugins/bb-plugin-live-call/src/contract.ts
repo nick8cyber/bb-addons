@@ -66,6 +66,8 @@ export const clientFrame = z.discriminatedUnion("type", [
     decision: z.enum(["approve", "cancel"]),
   }),
   z.object({ type: z.literal("end") }),
+  // Диагностика браузера: ошибки микрофона, уровень сигнала. Сервер пишет в журнал звонка.
+  z.object({ type: z.literal("client_log"), event: z.string().min(1), detail: z.string().max(500).optional() }),
 ]);
 export type ClientFrame = z.infer<typeof clientFrame>;
 
