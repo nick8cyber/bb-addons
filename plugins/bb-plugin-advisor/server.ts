@@ -184,6 +184,7 @@ const incidentSchema = z.object({
 
 const pendingAdviceSchema = z.object({
   id: z.number().int(),
+  chainId: z.number().int(),
   severity: severitySchema,
   summary: z.string(),
   details: z.string(),
@@ -1437,6 +1438,7 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         advice: {
           id: row.id,
+          chainId: chainKeyOf(row),
           severity: row.severity,
           summary: row.summary,
           details: row.details,

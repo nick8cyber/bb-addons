@@ -1239,6 +1239,58 @@ describe("post-turn review scope", () => {
 });
 
 describe("thread surfaces", () => {
+  it("returns the root identity for repeated advice and keeps overrides thread scoped", async () => {
+    const { harness, setTimelineSeq } = await loadAutoAdvisor(BLOCKER_OUTPUT);
+    const thread = makeThreadResponse({
+      id: "thread-primary", projectId: "project-test",
+      environmentId: "environment-test", providerId: "codex", visibility: "visible",
+    });
+    await harness.emitThreadEvent("thread.idle", {
+      thread, lastAssistantText: "Everything passes.",
+    });
+    // Dismiss only the first notification, keeping its finding open. The next
+    // notification then belongs to the repeat while retaining the first root.
+    const first = await harness.callRpc("pendingAdvice", {
+      threadId: "thread-primary",
+    }) as { advice: { id: number } };
+    await harness.callRpc("dismissAdvice", {
+      threadId: "thread-primary", adviceId: first.advice.id,
+    });
+    setTimelineSeq(43);
+    await harness.emitThreadEvent("thread.idle", {
+      thread, lastAssistantText: "Everything passes again.",
+    });
+    const panel = await harness.callRpc("threadReviews", {
+      threadId: "thread-primary",
+    }) as { reviews: { id: number; chainId: number }[] };
+    const pending = await harness.callRpc("pendingAdvice", {
+      threadId: "thread-primary",
+    }) as { advice: { id: number; chainId: number; repeatCount: number } };
+    expect(pending.advice).toMatchObject({
+      id: panel.reviews[0]!.id,
+      chainId: panel.reviews[0]!.chainId,
+      repeatCount: 2,
+    });
+    expect(pending.advice.id).not.toBe(pending.advice.chainId);
+    expect(await harness.callRpc("pendingAdvice", {
+      threadId: "another-thread",
+    })).toEqual({ advice: null });
+    expect(await harness.callRpc("resolveFinding", {
+      threadId: "another-thread", chainId: pending.advice.chainId,
+      resolved: true, reason: "", decision: "not-an-issue",
+    })).toEqual({ ok: true, resolved: false });
+    expect(await harness.callRpc("pendingAdvice", {
+      threadId: "thread-primary",
+    })).toEqual(pending);
+    expect(await harness.callRpc("resolveFinding", {
+      threadId: "thread-primary", chainId: pending.advice.chainId,
+      resolved: true, reason: "", decision: "not-an-issue",
+    })).toEqual({ ok: true, resolved: true });
+    expect(await harness.callRpc("pendingAdvice", {
+      threadId: "thread-primary",
+    })).toEqual({ advice: null });
+  });
+
   it("collapses a repeat chain into one row carrying its count and origin", async () => {
     const { harness, setTimelineSeq } = await loadAdvisor(BLOCKER_OUTPUT);
     await harness.callAgentTool(
