@@ -137,6 +137,7 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
   let player: TurnPlayer | null = null;
   let audioCtxOut: AudioContext | null = null;
   let ownerHeard = false;
+  let currentMode: "normal" | "extended" = "normal";
 
   const teardown = () => {
     try {
@@ -177,6 +178,7 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
     }
     switch (frame.type) {
       case "ready": {
+        currentMode = frame.mode;
         try {
           // macOS с Continuity делает iPhone микрофоном по умолчанию — браузер берёт
           // системный дефолт и получает телефон. Обходим: сохранённый выбор владельца,
@@ -243,6 +245,7 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
             if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "playback_drained", turnSeq }));
           });
           ui.audioCtxOut = audioCtxOut;
+          overlay.setModeView(currentMode, false);
           overlay.stateLine.textContent = "Готов: говорите";
 
           // Селектор микрофона: после первого разрешения подписи устройств доступны.
@@ -310,7 +313,8 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
         overlay.addAction(frame.status === "done" ? "✅" : frame.status === "failed" ? "⚠️" : "⏳", frame.summary);
         break;
       case "mode":
-        overlay.modeLine.textContent = frame.switching ? "Переключаюсь…" : frame.mode === "extended" ? "🧠 Extended" : "⚡ Обычный";
+        currentMode = frame.mode;
+        overlay.setModeView(frame.mode, frame.switching);
         break;
       case "warning":
         overlay.addAction("⚠️", frame.message);
@@ -331,7 +335,11 @@ export async function startCall(mode?: "normal" | "extended"): Promise<void> {
     confirm: (id) => sock.send(JSON.stringify({ type: "confirm", confirmationId: id, decision: "approve" })),
     cancel: (id) => sock.send(JSON.stringify({ type: "confirm", confirmationId: id, decision: "cancel" })),
     mute: (muted) => sock.send(JSON.stringify({ type: "mute", muted })),
-    switchMode: (mode) => sock.send(JSON.stringify({ type: "switch_mode", mode })),
+    switchMode: (mode) => {
+      currentMode = mode;
+      overlay.setModeView(mode, true);
+      sock.send(JSON.stringify({ type: "switch_mode", mode }));
+    },
     end: () => sock.send(JSON.stringify({ type: "end" })),
   });
 }
@@ -440,11 +448,8 @@ function buildOverlay() {
   const orbRow = document.createElement("div");
   orbRow.style.cssText = "display:flex; align-items:center; gap:10px; width:100%;";
   const title = document.createElement("div");
-  title.style.cssText = "font-weight:600; display:flex; align-items:center; gap:6px;";
+  title.style.cssText = "font-weight:600;";
   title.textContent = "📞 Звонок";
-  const modeLine = document.createElement("span");
-  modeLine.style.cssText = "opacity:.55; font-weight:400;";
-  title.append(modeLine);
   const orb = document.createElement("div");
   orb.id = "lc-orb";
   orb.dataset.state = "listening";
@@ -475,11 +480,32 @@ function buildOverlay() {
     b.style.cssText = "flex:1; padding:8px 6px; border-radius:8px; border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06); color:inherit; cursor:pointer; font-size:12px;";
     return b;
   };
-  const muteBtn = mkBtn("🎙 Микрофон включён", "Выключить микрофон (вас не слышно, агент продолжает говорить)");
-  const modeBtn = mkBtn("🧠 Extended", "Переключить режим");
+  const muteBtn = mkBtn("🎙 Микрофон", "Выключить микрофон (вас не слышно, агент продолжает говорить)");
+  muteBtn.style.flex = "0.8";
   const endBtn = mkBtn("■ Завершить", "Завершить звонок");
   endBtn.style.borderColor = "rgba(255,100,100,.4)";
-  controls.append(muteBtn, modeBtn, endBtn);
+
+  // Режим: сегментный переключатель с подсветкой активного (макеты, раздел 2).
+  const modeSeg = document.createElement("div");
+  modeSeg.style.cssText = "display:flex; border:1px solid rgba(255,255,255,.15); border-radius:8px; overflow:hidden; flex:1.2;";
+  const segNormal = document.createElement("button");
+  const segExtended = document.createElement("button");
+  const segStyle = (active: boolean, el: HTMLElement) => {
+    el.style.cssText = `
+      padding:8px 4px; font-size:11px; cursor:pointer; border:none; flex:1;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+      background: ${active ? "var(--color-primary, #4f6ef7)" : "rgba(255,255,255,.04)"};
+      color: ${active ? "#fff" : "inherit"};
+      opacity: ${active ? 1 : 0.6};
+      font-weight: ${active ? 600 : 400};
+    `;
+  };
+  segNormal.textContent = "⚡ Обычный";
+  segExtended.textContent = "🧠 Extended";
+  segNormal.title = "Базовая модель: сама вызывает инструменты, отвечает быстрее";
+  segExtended.title = "Extended Thinking: думает глубже, инструменты выбирает вторая модель";
+  modeSeg.append(segNormal, segExtended);
+  controls.append(muteBtn, modeSeg, endBtn);
   root.append(header, threadLine, micWarning, micSelect, log, confirmation, controls);
   document.body.append(root);
 
@@ -494,7 +520,7 @@ function buildOverlay() {
   } | null = null;
 
   const setMuteView = (m: boolean) => {
-    muteBtn.textContent = m ? "🎙 Микрофон выключен" : "🎙 Микрофон включён";
+    muteBtn.textContent = m ? "🎙 Микрофон выкл" : "🎙 Микрофон";
     muteBtn.classList.toggle("lc-btn-muted", m);
     muteBtn.title = m ? "Включить микрофон" : "Выключить микрофон (вас не слышно, агент продолжает говорить)";
     if (m) orb.dataset.state = "muted";
@@ -505,15 +531,14 @@ function buildOverlay() {
     setMuteView(muted);
     handlers?.mute(muted);
   };
-  modeBtn.onclick = () => {
-    handlers?.switchMode(modeBtn.textContent?.includes("Extended") ? "normal" : "extended");
-  };
+  segNormal.onclick = () => handlers?.switchMode("normal");
+  segExtended.onclick = () => handlers?.switchMode("extended");
   endBtn.onclick = () => handlers?.end();
 
   return {
     root,
     button: button as HTMLButtonElement,
-    modeLine,
+
     stateLine,
     threadLine,
     micWarning,
@@ -571,6 +596,14 @@ function buildOverlay() {
       confirmation.style.display = "none";
       currentConfirmationId = null;
       void verdict;
+    },
+    setModeView(mode: string, switching: boolean) {
+      segStyle(mode === "normal", segNormal);
+      segStyle(mode === "extended", segExtended);
+      segNormal.textContent = switching && mode === "normal" ? "⚡ Переключаюсь…" : "⚡ Обычный";
+      segExtended.textContent = switching && mode === "extended" ? "🧠 Переключаюсь…" : "🧠 Extended";
+      modeSeg.style.opacity = switching ? "0.6" : "1";
+      modeSeg.style.pointerEvents = switching ? "none" : "auto";
     },
     setOrbState(state: string) {
       if (muted && state !== "ended") {
