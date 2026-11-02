@@ -123,6 +123,8 @@ type ToolResult =
 
 `ThreadBrief = { id; title; project; status; updatedAt }`. Имя треда из речи сопоставляется с открытыми тредами нечётким поиском. Двусмысленность → `ok: false, error.code: "ambiguous"` со списком до 3 кандидатов в `message`. Сообщения, отправленные голосом, начинаются с `[голос] `. Таймаут исполнителя — 20 с → `error.code: "timeout"`.
 
+Сигнатуры SDK (сверено с типами 0.6.49): вопрос агента — `threads.interactions.respond({ interactionId, threadId, value })` (`value: JsonValue`); запрос разрешения — `threads.interactions.resolve({ interactionId, threadId, resolution })` (`resolution: PendingInteractionResolution`). Глобального списка ожидающих в SDK нет: снимок — `threads.listRunning` + `threads.interactions.list({ threadId })` по каждому; в реальном времени — realtime-событие `interaction.pending` (несёт `{ thread, interaction }`), его кеширует `EventBridge`.
+
 ## 5. ConfirmationGate
 
 Правила — спека §7.1, здесь только интерфейс:
@@ -142,7 +144,7 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 
 ## 6. Тред звонка (провайдер `live-call`)
 
-1. `callsProjectId` пуст → папка `callsWorkspacePath` создаётся на основном хосте (`sdk.system.config().primaryHostId`), затем `bb.sdk.projects.create({ name: "Звонки", source: { type: "local_path", hostId, path } })`, id сохраняется в настройку. **Ф0(з):** проверить, какое окружение принимает `threads.spawn` для этого проекта (checkout папки или `reuse`), и записать сюда.
+1. `callsProjectId` пуст → папка `callsWorkspacePath` создаётся на основном хосте (`sdk.system.config().primaryHostId`), затем `bb.sdk.projects.create({ name: "Звонки", source: { type: "local_path", hostId, path } })`, id сохраняется в настройку. Окружение создавать не нужно: `projects.create` с `local_path` сама даёт проекту окружение `project-checkout` (unmanaged workspace по пути проекта), и `threads.spawn({ projectId })` без явного `environmentId` подхватывает его. Проверено спайком 02.11 (проект создан, тред заспавнен, окружение `project-checkout` присвоено автоматически).
 2. Первая законченная реплика владельца → `threads.spawn({ projectId, providerId: "live-call", model: "live", title: "📞 Звонок ДД.ММ ЧЧ:ММ", prompt })`.
 3. Следующая реплика: сервер шлёт мосту `end` для открытого хода, ждёт `turn/completed`, затем `threads.send({ threadId, mode: "start", input: [{ type: "text", text, mentions: [] }] })`.
 4. Реплики агента, действия и события — `say` в открытый ход. Действия выглядят так: `✉️ Отправил в «…»`, `📖 Прочитал «…»`, `🚀 Запустил «…»` — со ссылкой `@thread`.
@@ -173,7 +175,7 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 
 ## 9. Хранилище и CLI
 
-- `bb.storage` (SQLite): `calls(id, thread_id, started_at, ended_at, mode_history JSON, key_switches INT, end_reason)`, `call_events(call_id, seq, ts, kind, payload JSON)`. Хранится 90 дней.
+- `bb.storage` — доступ плагина к своему SQLite: `bb.storage.database()` открывает `<dataDir>/plugins/live-call/data.db` (better-sqlite3, WAL, busy_timeout 5000, один хэндл на загрузку плагина); миграции — `bb.storage.migrate(db, statements)` (append-only). Схема: `calls(id, thread_id, started_at, ended_at, mode_history JSON, key_switches INT, end_reason)`, `call_events(call_id, seq, ts, kind, payload JSON)`. Хранится 90 дней. Мелкие настройки (последний режим) — `bb.storage.kv` (значения ≤256 КБ).
 - RPC (`bb.rpc`): `status → { configured, keys: 0|1|2, activeCall: { callId, threadId, mode, startedAt } | null }`, `probe → { extendedNativeTools: boolean, checkedAt }`.
 - CLI `bb call`: `status`, `calls [--limit N]`, `transcript <callId>`, `probe [--json]` — проверка нативных вызовов Extended одной сессией, только отчёт, режимы не меняет.
 
