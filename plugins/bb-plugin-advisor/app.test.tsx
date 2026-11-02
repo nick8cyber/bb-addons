@@ -18,11 +18,54 @@ function q(slot: { container: HTMLElement }) {
 
 const badgeSlot = app.threadHeaderActions[0]!;
 const panelSlot = app.threadPanelActions[0]!;
+const bannerSlot = app.composerCustomizations[0]!.banners[0]!;
 const badgeProps = {
   threadId: "t1",
   projectId: "p1",
   isCompactViewport: false,
 };
+
+function pendingAdviceItem(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 1,
+    chainId: 10,
+    severity: "concern" as const,
+    summary: "Verification is incomplete",
+    details: "- Run the test.",
+    repeatCount: 1,
+    ...overrides,
+  };
+}
+
+function renderBanner(
+  options: {
+    threadId?: string;
+    advice?: unknown;
+    rpc?: Record<string, unknown>;
+    realtimeConnectionState?: "connected" | "connecting" | "disconnected";
+  } = {},
+) {
+  const threadId = options.threadId ?? "t1";
+  return renderSlot(
+    bannerSlot,
+    {},
+    {
+      composer: {
+        scope: { kind: "thread", threadId },
+      },
+      rpc: {
+        pendingAdvice: () => ({
+          advice:
+            options.advice !== undefined
+              ? (options.advice as any)
+              : pendingAdviceItem(),
+        }),
+        ...(options.rpc as any),
+      },
+      realtimeConnectionState: options.realtimeConnectionState,
+    },
+  );
+}
 
 function emptyBadge() {
   return {
@@ -420,5 +463,348 @@ describe("advisor model settings", () => {
         },
       }),
     );
+  });
+});
+
+describe("advisor compact composer banner", () => {
+  it("renders collapsed by default with severity, single-line preview, and accessible toggle control", async () => {
+    const slot = renderBanner({
+      advice: pendingAdviceItem({
+        id: 1,
+        severity: "blocker",
+        summary: "Migration is not atomic",
+      }),
+    });
+
+    expect(await q(slot).findByText("Must fix")).toBeTruthy();
+    const toggle = await q(slot).findByRole("button", { name: "Show more" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const controlsId = toggle.getAttribute("aria-controls");
+    expect(controlsId).toBe("advisor-banner-details-1");
+
+    const details = slot.container.querySelector(`#${controlsId}`);
+    expect(details).toBeTruthy();
+    expect(details?.hasAttribute("hidden")).toBe(true);
+
+    // Truncated preview is visible in the container
+    expect(await q(slot).findByText("Migration is not atomic")).toBeTruthy();
+    // Action buttons exist in DOM inside the hidden section
+    expect(details?.querySelector("button")).toBeTruthy();
+  });
+
+  it("toggles expand and collapse on click, Enter, and Space without calling RPC", async () => {
+    let rpcCount = 0;
+    const slot = renderBanner({
+      rpc: {
+        pendingAdvice: () => {
+          rpcCount++;
+          return { advice: pendingAdviceItem({ id: 1 }) };
+        },
+      },
+    });
+
+    const toggle = await q(slot).findByRole("button", { name: "Show more" });
+    const initialCalls = slot.rpcCalls.length;
+
+    // Click to expand
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(await q(slot).findByRole("button", { name: "Show less" })).toBeTruthy();
+    const details = slot.container.querySelector("#advisor-banner-details-1");
+    expect(details?.hasAttribute("hidden")).toBe(false);
+    expect(slot.rpcCalls.length).toBe(initialCalls);
+
+    // Enter to collapse
+    fireEvent.keyDown(toggle, { key: "Enter" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(details?.hasAttribute("hidden")).toBe(true);
+    expect(slot.rpcCalls.length).toBe(initialCalls);
+
+    // Space to expand
+    fireEvent.keyDown(toggle, { key: " " });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(details?.hasAttribute("hidden")).toBe(false);
+    expect(slot.rpcCalls.length).toBe(initialCalls);
+  });
+
+  it("preserves expanded state when the same card refetches", async () => {
+    let currentAdvice = pendingAdviceItem({
+      id: 1,
+      summary: "First summary",
+    });
+
+    const slot = renderBanner({
+      rpc: {
+        pendingAdvice: () => ({ advice: currentAdvice }),
+      },
+    });
+
+    const toggle = await q(slot).findByRole("button", { name: "Show more" });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+
+    // Server updates advice for the same card id
+    currentAdvice = pendingAdviceItem({
+      id: 1,
+      summary: "Updated summary",
+    });
+    await slot.emitRealtime("thread-changed", { threadId: "t1" });
+
+    // Summary updated, expanded state preserved!
+    expect(await q(slot).findByText("Updated summary")).toBeTruthy();
+    const toggleAfter = await q(slot).findByRole("button", { name: "Show less" });
+    expect(toggleAfter.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("starts collapsed when advice or thread changes without state leaking", async () => {
+    let currentAdvice = pendingAdviceItem({ id: 1, summary: "Card 1" });
+    const slot = renderBanner({
+      threadId: "t1",
+      rpc: {
+        pendingAdvice: ({ threadId }: any) => ({
+          advice:
+            threadId === "t1"
+              ? currentAdvice
+              : pendingAdviceItem({ id: 2, summary: "Card on thread 2" }),
+        }),
+      },
+    });
+
+    const toggle = await q(slot).findByRole("button", { name: "Show more" });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+
+    // Switch scope to thread t2
+    await slot.setComposerScope({ kind: "thread", threadId: "t2" });
+
+    // On t2, banner starts collapsed!
+    expect(await q(slot).findByText("Card on thread 2")).toBeTruthy();
+    const toggleT2 = await q(slot).findByRole("button", { name: "Show more" });
+    expect(toggleT2.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("lets user resolve finding with Not an issue passing exact chainId and refetches", async () => {
+    let refetched = false;
+    const slot = renderBanner({
+      advice: pendingAdviceItem({
+        id: 7,
+        chainId: 99,
+        repeatCount: 3,
+        summary: "Repeated warning",
+      }),
+      rpc: {
+        resolveFinding: () => ({ ok: true as const, resolved: true }),
+        pendingAdvice: () => {
+          refetched = true;
+          return {
+            advice: pendingAdviceItem({ id: 7, chainId: 99 }),
+          };
+        },
+      },
+    });
+
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    const notAnIssue = await q(slot).findByText("Not an issue");
+    fireEvent.click(notAnIssue);
+
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "resolveFinding",
+        input: {
+          threadId: "t1",
+          chainId: 99,
+          resolved: true,
+          reason: "",
+          decision: "not-an-issue",
+        },
+      }),
+    );
+    expect(refetched).toBe(true);
+  });
+
+  it("treats resolved: false as an error, shows error without replacing card, and allows retry", async () => {
+    const slot = renderBanner({
+      advice: pendingAdviceItem({ id: 1, chainId: 10 }),
+      rpc: {
+        resolveFinding: () => ({ ok: true as const, resolved: false }),
+      },
+    });
+
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    fireEvent.click(await q(slot).findByText("Not an issue"));
+
+    expect(await q(slot).findByText("Failed to resolve finding.")).toBeTruthy();
+
+    // Card is NOT replaced: user can still collapse/expand
+    const toggle = await q(slot).findByRole("button", { name: "Show less" });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+
+    // Error remains visible even when collapsed
+    expect(await q(slot).findByText("Failed to resolve finding.")).toBeTruthy();
+
+    // Retry button clears error and refetches without re-invoking resolveFinding
+    const initialResolveCalls = slot.rpcCalls.filter(
+      (c) => c.method === "resolveFinding",
+    ).length;
+    fireEvent.click(await q(slot).findByText("Retry"));
+
+    await waitFor(() => {
+      expect(q(slot).queryByText("Failed to resolve finding.")).toBeNull();
+    });
+    // No second resolveFinding call from Retry!
+    expect(
+      slot.rpcCalls.filter((c) => c.method === "resolveFinding").length,
+    ).toBe(initialResolveCalls);
+  });
+
+  it("blocks concurrent mutations while a request is in flight", async () => {
+    let resolveMutation: (val: any) => void;
+    const slot = renderBanner({
+      advice: pendingAdviceItem({ id: 1, chainId: 10 }),
+      rpc: {
+        resolveFinding: () =>
+          new Promise((resolve) => {
+            resolveMutation = resolve;
+          }),
+      },
+    });
+
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    const notAnIssue = (await q(slot).findByText("Not an issue")) as HTMLButtonElement;
+    const dismiss = (await q(slot).findByText("Dismiss")) as HTMLButtonElement;
+    const fixInNewTurn = (await q(slot).findByText("Fix in new turn")) as HTMLButtonElement;
+
+    fireEvent.click(notAnIssue);
+    // Double click
+    fireEvent.click(notAnIssue);
+
+    await waitFor(() => {
+      expect(notAnIssue.disabled).toBe(true);
+      expect(dismiss.disabled).toBe(true);
+      expect(fixInNewTurn.disabled).toBe(true);
+    });
+
+    const calls = slot.rpcCalls.filter((c) => c.method === "resolveFinding");
+    expect(calls.length).toBe(1);
+
+    resolveMutation!({ ok: true as const, resolved: true });
+  });
+
+  it("preserves Dismiss, View review, and Fix in new turn semantics", async () => {
+    const slot = renderBanner({
+      advice: pendingAdviceItem({ id: 4, chainId: 10 }),
+      rpc: {
+        dismissAdvice: () => ({ ok: true as const }),
+        continueFinding: () => ({
+          started: true as const,
+          reason: "started" as const,
+        }),
+      },
+    });
+
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+
+    // View review opens thread panel
+    fireEvent.click(await q(slot).findByText("View review"));
+    expect(slot.navigateCalls).toContainEqual({
+      method: "openThreadPanel",
+      options: { actionId: "reviews" },
+    });
+
+    // Dismiss calls dismissAdvice
+    fireEvent.click(await q(slot).findByText("Dismiss"));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "dismissAdvice",
+        input: { threadId: "t1", adviceId: 4 },
+      }),
+    );
+
+    // Fix in new turn calls continueFinding
+    fireEvent.click(await q(slot).findByText("Fix in new turn"));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "continueFinding",
+        input: { threadId: "t1", reviewId: 4 },
+      }),
+    );
+  });
+
+  it("useThreadAdvisor binds data to threadId and discards late responses after thread switch", async () => {
+    let resolveT1: (val: any) => void;
+    const slot = renderSlot(
+      bannerSlot,
+      {},
+      {
+        composer: {
+          scope: { kind: "thread", threadId: "t1" },
+        },
+        rpc: {
+          pendingAdvice: ({ threadId }: any) => {
+            if (threadId === "t1") {
+              return new Promise((resolve) => {
+                resolveT1 = resolve;
+              });
+            }
+            return {
+              advice: pendingAdviceItem({ id: 2, summary: "Thread 2 advice" }),
+            };
+          },
+        },
+      },
+    );
+
+    // Switch to t2 before t1 deferred response arrives
+    await slot.setComposerScope({ kind: "thread", threadId: "t2" });
+
+    // t2 response renders
+    expect(await q(slot).findByText("Thread 2 advice")).toBeTruthy();
+
+    // Now t1 deferred response resolves late
+    resolveT1!({
+      advice: pendingAdviceItem({ id: 1, summary: "Stale thread 1 advice" }),
+    });
+
+    // Wait and ensure t2 advice stays, t1 is discarded
+    await waitFor(() => {
+      expect(q(slot).queryByText("Stale thread 1 advice")).toBeNull();
+      expect(q(slot).getByText("Thread 2 advice")).toBeTruthy();
+    });
+  });
+
+  it("scopes mutation error and busy state to threadId and adviceId", async () => {
+    let rejectMutation: (err: any) => void;
+    const slot = renderBanner({
+      threadId: "t1",
+      advice: pendingAdviceItem({ id: 1 }),
+      rpc: {
+        resolveFinding: () =>
+          new Promise((_, reject) => {
+            rejectMutation = reject;
+          }),
+        pendingAdvice: ({ threadId }: any) => ({
+          advice:
+            threadId === "t1"
+              ? pendingAdviceItem({ id: 1 })
+              : pendingAdviceItem({ id: 2, summary: "Thread 2 advice" }),
+        }),
+      },
+    });
+
+    fireEvent.click(await q(slot).findByRole("button", { name: "Show more" }));
+    fireEvent.click(await q(slot).findByText("Not an issue"));
+
+    // Switch to t2 while mutation on t1 is pending
+    await slot.setComposerScope({ kind: "thread", threadId: "t2" });
+    expect(await q(slot).findByText("Thread 2 advice")).toBeTruthy();
+
+    // Old mutation fails late
+    rejectMutation!(new Error("Old mutation failure on t1"));
+
+    // Error does not leak to t2
+    await waitFor(() => {
+      expect(q(slot).queryByText("Old mutation failure on t1")).toBeNull();
+    });
   });
 });
