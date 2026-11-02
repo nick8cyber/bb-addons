@@ -72,6 +72,8 @@ export class CallSession extends EventEmitter {
   private tpmWarned = false;
   /** Приветствие один раз за звонок, независимо от переподключений. */
   private greeted = false;
+  /** Момент последней законченной реплики агента — окно фильтра эха (3 с). */
+  private lastAgentLineAt = 0;
   /** Диагностика микрофона: байты и пиковая амплитуда за отчётный интервал. */
   private micBytes = 0;
   private micPeak = 0;
@@ -263,6 +265,7 @@ export class CallSession extends EventEmitter {
         this.lastVoiceLine = line.slice(0, 300);
         this.ledger.add("agent", line);
         this.deps.store.event(this.deps.callId, "agent_line", { text: line });
+        this.lastAgentLineAt = Date.now();
         await this.deps.sayCallThread(line);
       })();
     });
@@ -531,10 +534,21 @@ export class CallSession extends EventEmitter {
       // Шлюз закрыт: в Gemini идёт тишина, транскрипт отбрасывается (спека §7.1 п. 3.1).
       return;
     }
-    // Полный дуплекс: владелец может перебивать голосом. Эхо-петля гасится
-    // корректной обработкой interrupted на клиенте (старая речь глушится).
+    // Полный дуплекс с приглушением: пока агент говорит, микрофон ×0.25 —
+    // эхо из динамиков падает ниже порога VAD Gemini, а громкая речь владельца
+    // пробивается (перебивание голосом работает). Слой 1 из 2 против эха.
     if (pcm.length > MIC_FRAME_BYTES * 8) return; // защита от некадренного потока
-    this.voice?.sendAudio(pcm);
+    let outgoing = pcm;
+    if (this.state === "speaking") {
+      const ducked = new Int16Array(pcm.length >> 1);
+      const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      for (let i = 0; i + 1 < pcm.byteLength; i += 2) {
+        const v = Math.round(view.getInt16(i, true) * 0.25);
+        ducked[i >> 1] = Math.max(-32768, Math.min(32767, v));
+      }
+      outgoing = new Uint8Array(ducked.buffer);
+    }
+    this.voice?.sendAudio(outgoing);
     if (this.mode === "extended" && this.deps.routerInput === "audio") this.router?.sendAudio(pcm);
     if (this.state === "listening") this.setState("listening");
   }
@@ -576,8 +590,16 @@ export class CallSession extends EventEmitter {
     const u = this.ownerUtterance;
     this.ownerUtterance = null;
     if (!u || !u.text.trim()) return;
-    this.frame({ type: "transcript", role: "owner", text: u.text, final: true });
-    this.onOwnerUtteranceFinal(u.text.trim());
+    const text = u.text.trim();
+    // Слой 2 против эха: реплика, совпадающая с тем, что агент только что говорил,
+    // — это его голос из динамиков, а не владелец. Отбрасываем и не провоцируем ответ.
+    if (Date.now() - this.lastAgentLineAt < 3000 && isEcho(text, this.lastVoiceLine)) {
+      this.deps.store.event(this.deps.callId, "echo_dropped", { text: text.slice(0, 200) });
+      this.voice?.sendClientContent("[СИСТЕМА] Предыдущая реплика была эхом твоего ответа из динамиков, а не словами владельца. Игнорируй её и жди владельца.", false);
+      return;
+    }
+    this.frame({ type: "transcript", role: "owner", text, final: true });
+    this.onOwnerUtteranceFinal(text);
   }
 
   /** Реплика владельца завершена (VAD или транскрипт-таймер): ROUTER, вариант А. */
@@ -714,6 +736,22 @@ export class CallSession extends EventEmitter {
 }
 
 export const PLAYBACK_BYTES_PER_SECOND = BYTES_PER_SECOND_24K;
+
+/**
+ * Похожа ли реплика владельца на последнюю реплику агента (эхо из динамиков).
+ * Пересечение значимых слов ≥ 60 % меньшей стороны. Чистая функция — покрыта тестом.
+ */
+export function isEcho(ownerText: string, agentText: string): boolean {
+  const norm = (t: string) =>
+    t.toLowerCase().replaceAll("ё", "е").replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length > 2);
+  const owner = new Set(norm(ownerText));
+  const agent = new Set(norm(agentText));
+  if (owner.size === 0 || agent.size === 0) return false;
+  let overlap = 0;
+  for (const w of owner) if (agent.has(w)) overlap += 1;
+  const smaller = Math.min(owner.size, agent.size);
+  return overlap / smaller >= 0.6;
+}
 
 /** Диагностическая строка в хранилище звонка (видно в bb call transcript). */
 function bb_log(deps: CallSessionDeps, message: string): void {
