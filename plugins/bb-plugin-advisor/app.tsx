@@ -719,14 +719,14 @@ function AdvisorComposerBanner() {
         </button>
       </div>
 
-      <p
-        className={`mt-1 text-xs text-foreground ${
-          isExpanded ? "break-words font-medium" : "truncate"
-        }`}
-        title={advice.summary}
-      >
-        {advice.summary}
-      </p>
+      {!isExpanded && (
+        <p
+          className="mt-1 text-xs text-foreground truncate"
+          title={advice.summary}
+        >
+          {advice.summary}
+        </p>
+      )}
 
       {activeError ? (
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-surface-destructive-border bg-surface-destructive px-3 py-2 text-xs text-destructive-text">
@@ -749,10 +749,16 @@ function AdvisorComposerBanner() {
       <div
         id={detailsId}
         hidden={!isExpanded}
-        className={!isExpanded ? "hidden" : "mt-2"}
+        className={!isExpanded ? "hidden" : "mt-2 max-h-[30dvh] overflow-y-auto"}
+        style={isExpanded ? { maxHeight: "30dvh" } : undefined}
       >
+        {isExpanded && (
+          <p className="text-xs break-words font-medium text-foreground">
+            {advice.summary}
+          </p>
+        )}
         {repeated ? (
-          <p className="text-xs text-destructive-text break-words">
+          <p className="mt-1 text-xs text-destructive-text break-words">
             The agent was told this before and did not resolve it.
           </p>
         ) : null}

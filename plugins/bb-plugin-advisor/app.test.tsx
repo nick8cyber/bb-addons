@@ -843,4 +843,25 @@ describe("advisor compact composer banner", () => {
       expect(q(slot).queryByText("Thread 1 advice")).toBeNull();
     });
   });
+
+  it("constrains expanded details to max-h-[30dvh] with overflow-y-auto keeping header/toggle outside scroll", async () => {
+    const slot = renderBanner({
+      advice: pendingAdviceItem({
+        id: 1,
+        summary: "Very long summary ".repeat(20),
+      }),
+    });
+
+    const toggle = await q(slot).findByRole("button", { name: "Show more" });
+    fireEvent.click(toggle);
+
+    const details = slot.container.querySelector("#advisor-banner-details-1") as HTMLElement;
+    expect(details).toBeTruthy();
+    expect(details.className).toContain("max-h-[30dvh]");
+    expect(details.className).toContain("overflow-y-auto");
+    expect(details.style.maxHeight).toBe("30dvh");
+
+    // Header and toggle button are outside the details scroll container
+    expect(details.contains(toggle)).toBe(false);
+  });
 });
