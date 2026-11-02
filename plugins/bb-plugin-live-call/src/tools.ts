@@ -101,11 +101,12 @@ export const TOOLS: ToolDef[] = [
     description: "Обзор BB: проекты, активные треды, ожидающие ответа, ошибки. До 10 в каждой группе.",
     parameters: { type: "object", properties: {} },
     async execute(_args, ctx) {
-      const projects = await withTimeout(ctx.sdk.projects.list() as Promise<{ projects?: Record<string, unknown>[] }>);
-      const running = await withTimeout(ctx.sdk.threads.listRunning() as Promise<{ threads?: Record<string, unknown>[] }>);
-      const list = (running.threads ?? []).slice(0, 10).map(briefOf);
+      // SDK возвращает голые массивы (ProjectResponse[] / ThreadRunningResponse).
+      const projects = (await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
+      const running = (await withTimeout(ctx.sdk.threads.listRunning() as Promise<Array<Record<string, unknown>>>)) ?? [];
+      const list = (Array.isArray(running) ? running : []).slice(0, 10).map(briefOf);
       return truncate({
-        projects: (projects.projects ?? []).slice(0, 10).map((p) => ({ id: p.id, name: p.name })),
+        projects: (Array.isArray(projects) ? projects : []).slice(0, 10).map((p) => ({ id: p.id, name: p.name })),
         running: list,
         waiting: [],
         failed: list.filter((t) => t.status === "error"),
@@ -126,8 +127,9 @@ export const TOOLS: ToolDef[] = [
       },
     },
     async execute(args, ctx) {
-      const res = await withTimeout(ctx.sdk.threads.list({ limit: 15 }) as Promise<{ threads?: Record<string, unknown>[] }>);
-      let items = (res.threads ?? []).map(briefOf);
+      const res = await withTimeout(ctx.sdk.threads.list({ limit: 15 }) as Promise<Array<Record<string, unknown>> | { threads?: Record<string, unknown>[] }>);
+      const raw = Array.isArray(res) ? res : ((res as { threads?: Record<string, unknown>[] }).threads ?? []);
+      let items = raw.map(briefOf);
       const q = String(args.query ?? "").toLowerCase();
       if (q) items = items.filter((t) => t.title.toLowerCase().includes(q));
       const status = String(args.status ?? "any");
@@ -148,8 +150,8 @@ export const TOOLS: ToolDef[] = [
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
       const t = ref.thread;
-      const out = await withTimeout(ctx.sdk.threads.output({ threadId: String(t.id) }) as Promise<{ output?: string; text?: string }>);
-      const lastOutput = String(out.output ?? out.text ?? "").slice(0, 4000);
+      const out = await withTimeout(ctx.sdk.threads.output({ threadId: String(t.id) }) as Promise<{ output: string | null }>);
+      const lastOutput = String(out.output ?? "").slice(0, 4000);
       return truncate({ thread: briefOf(t), lastOutput });
     },
   },
@@ -160,9 +162,9 @@ export const TOOLS: ToolDef[] = [
     description: "Вопросы и запросы разрешений от агентов, ожидающие владельца.",
     parameters: { type: "object", properties: {} },
     async execute(_args, ctx) {
-      const res = await withTimeout(ctx.sdk.threads.listRunning() as Promise<{ threads?: Record<string, unknown>[] }>);
+      const res = await withTimeout(ctx.sdk.threads.listRunning() as Promise<Array<Record<string, unknown>>>);
       const pending: Array<{ threadId: string; title: string; kind: string; prompt: string }> = [];
-      for (const t of (res.threads ?? []).slice(0, 10)) {
+      for (const t of (Array.isArray(res) ? res : []).slice(0, 10)) {
         try {
           const ints = await withTimeout(
             (ctx.sdk.threads as unknown as { interactions: { list(a: { threadId: string }): Promise<{ interactions?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>> } }).interactions.list({ threadId: String(t.id) }),
@@ -311,9 +313,9 @@ export const TOOLS: ToolDef[] = [
     },
     confirmSay: (args) => `Запускаю агента в проекте «${String(args.project)}» с задачей: «${String(args.task).slice(0, 200)}». Скажи «запускай» или «отмена».`,
     async execute(args, ctx) {
-      const projects = await withTimeout(ctx.sdk.projects.list() as Promise<{ projects?: Array<Record<string, unknown>> }>);
+      const projects = (await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
       const ref = String(args.project ?? "").trim().toLowerCase();
-      const project = (projects.projects ?? []).find(
+      const project = (Array.isArray(projects) ? projects : []).find(
         (p) => String(p.id ?? "").toLowerCase() === ref || String(p.name ?? "").toLowerCase().includes(ref),
       );
       if (!project) return { ok: false, error: { code: "not_found", message: `проект «${String(args.project)}» не найден` } };

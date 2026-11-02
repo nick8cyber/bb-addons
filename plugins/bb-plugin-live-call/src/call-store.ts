@@ -88,13 +88,17 @@ export class CallStore {
 
   calls(limit = 20): CallRow[] {
     return this.db
-      .prepare("SELECT * FROM calls ORDER BY started_at DESC LIMIT ?")
+      .prepare(
+        "SELECT id, thread_id AS threadId, started_at AS startedAt, ended_at AS endedAt, mode_history AS modeHistory, key_switches AS keySwitches, end_reason AS endReason FROM calls ORDER BY started_at DESC LIMIT ?",
+      )
       .all(limit) as unknown as CallRow[];
   }
 
   transcript(callId: string): CallEventRow[] {
     return this.db
-      .prepare("SELECT * FROM call_events WHERE call_id = ? ORDER BY seq")
+      .prepare(
+        "SELECT call_id AS callId, seq, ts, kind, payload FROM call_events WHERE call_id = ? ORDER BY seq",
+      )
       .all(callId) as unknown as CallEventRow[];
   }
 

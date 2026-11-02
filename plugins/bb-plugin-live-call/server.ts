@@ -234,7 +234,15 @@ export default async function plugin(bb: BbPluginApi) {
       sdk: bb.sdk,
       toBrowser: toBrowserRef,
       sendBrowserAudio: (turnSeq, pcm) => sock.send(packFrame(FRAME_PLAYBACK, turnSeq, pcm)),
-      wsFactory: (url) => new WebSocket(url),
+      wsFactory: (url) => {
+        bb.log.info(`gemini ws connect ${url.replace(/key=[^&]+/, "key=…")}`);
+        const w = new WebSocket(url);
+        w.addEventListener("open", () => bb.log.info("gemini ws open"));
+        w.addEventListener("close", (ev) => bb.log.warn(`gemini ws close ${(ev as CloseEvent).code} ${(ev as CloseEvent).reason}`));
+        w.addEventListener("error", () => bb.log.warn("gemini ws error"));
+        (w as unknown as { _liveClientRef?: unknown });
+        return w;
+      },
       ...sessionThreadHelpers(sessionRef),
     });
     sessionRef.current = session;

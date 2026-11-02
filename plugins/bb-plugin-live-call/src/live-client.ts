@@ -65,7 +65,20 @@ export class LiveClient extends EventEmitter {
       this.sendSetup();
       this.emit("open");
     });
-    ws.addEventListener("message", (ev) => this.onMessage(String(ev.data)));
+    ws.addEventListener("message", (ev) => {
+      // Рантайм bb-сервера доставляет кадры Gemini бинарными — принимаем и строки, и байты.
+      const d = (ev as MessageEvent).data;
+      if (typeof d === "string") {
+        this.onMessage(d);
+        return;
+      }
+      if (d instanceof Blob) {
+        void d.text().then((t) => this.onMessage(t));
+        return;
+      }
+      const bytes = d instanceof ArrayBuffer ? new Uint8Array(d) : (d as Uint8Array);
+      this.onMessage(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("utf8"));
+    });
     ws.addEventListener("close", (ev) => {
       this.ws = null;
       this.emit("close", (ev as CloseEvent).code, (ev as CloseEvent).reason);
@@ -74,19 +87,29 @@ export class LiveClient extends EventEmitter {
   }
 
   private send(msg: unknown) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+    try {
+      const openConst = (WebSocket as unknown as { OPEN?: number }).OPEN;
+      const open = typeof openConst === "number" ? openConst : 1;
+      if (this.ws && this.ws.readyState === open) {
+        this.ws.send(JSON.stringify(msg));
+      } else {
+        this.emit("sendDropped", this.ws ? this.ws.readyState : "no-socket", JSON.stringify(msg).slice(0, 80));
+      }
+    } catch (e) {
+      this.emit("error", `send failed: ${String(e)}`);
     }
   }
 
   private setupMessage(): unknown {
+    // У 3.8-live speechConfig живёт ВНУТРИ generationConfig (проверено живой пробой:
+    // setup.speechConfig отклоняется 1007 "Unknown name").
+    const speechConfig = {
+      voiceConfig: { prebuiltVoiceConfig: { voiceName: this.opts.voice } },
+      languageCode: this.opts.languageCode,
+    };
     const setup: Record<string, unknown> = {
       model: `models/${this.opts.model}`,
-      generationConfig: { responseModalities: ["AUDIO"] },
-      speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName: this.opts.voice } },
-        languageCode: this.opts.languageCode,
-      },
+      generationConfig: { responseModalities: ["AUDIO"], speechConfig },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
       systemInstruction: { parts: [{ text: this.opts.systemInstruction }] },

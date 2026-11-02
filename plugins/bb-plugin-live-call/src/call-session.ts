@@ -70,6 +70,9 @@ export class CallSession extends EventEmitter {
   private routerBusyCount = 0;
   private pendingToolResponses = new Map<string, { functionId?: string; def: string; args: Record<string, unknown> }>();
   private tpmWarned = false;
+  /** Сборка реплики владельца из кусков inputTranscription; конец — 700 мс тишины. */
+  private ownerUtterance: { text: string; firstAt: number; lastAt: number } | null = null;
+  private ownerUtteranceTimer: NodeJS.Timeout | null = null;
 
   constructor(private deps: CallSessionDeps) {
     super();
@@ -125,8 +128,6 @@ export class CallSession extends EventEmitter {
       keys: { active: this.pool.active, of: this.pool.of },
     });
     this.setState("listening");
-    // Сводка BB на старте: модель молчит, ждёт владельца (контракт §3).
-    this.voice?.sendClientContent("Система: звонок начат. Кратко поздоровайся и спроси, что происходит в BB.", true);
     this.gateTicker();
   }
 
@@ -217,6 +218,10 @@ export class CallSession extends EventEmitter {
 
   private wireVoice(client: LiveClient) {
     const ctx = this.toolContext();
+    client.on("setupComplete", () => {
+      // Приветствие только после setupComplete: всё, что ушло раньше, Gemini теряет.
+      client.sendClientContent("Система: звонок начат. Кратко поздоровайся и спроси, что происходит в BB.", true);
+    });
     client.on("audio", (turnSeq: number, pcm: Uint8Array) => {
       this.gate.onModelAudio(turnSeq, pcm.length);
       if (pcm.length > 0) this.deps.sendBrowserAudio(turnSeq, pcm);
@@ -226,26 +231,42 @@ export class CallSession extends EventEmitter {
       this.frame({ type: "interrupted", turnSeq: turnSeq ?? 0 });
       this.setState("listening");
     });
-    client.on("outputTranscript", (text: string, final: boolean) => {
+    let agentBuf = "";
+    client.on("outputTranscript", (text: string) => {
       if (!text) return;
-      this.frame({ type: "transcript", role: "agent", text, final });
-      if (final) {
-        this.lastVoiceLine = text.slice(0, 300);
-        this.ledger.add("agent", text);
-        this.deps.store.event(this.deps.callId, "agent_line", { text });
-        void this.deps.sayCallThread(text);
-        this.setState("listening");
-      }
-    });
-    client.on("inputTranscript", (text: string) => {
-      if (this.gate.isMicOpen()) {
-        this.frame({ type: "transcript", role: "owner", text, final: false });
-        this.gate.onOwnerTranscriptChunk(text);
-      }
+      // Транскрипт приходит и кусками, и кумулятивно в аудио-сообщениях:
+      // кумулятивный кусок, начинающийся с накопленного, ЗАМЕНЯЕТ его, а не дублирует.
+      if (text.startsWith(agentBuf) && agentBuf.length > 0) agentBuf = text;
+      else if (agentBuf.startsWith(text)) return; // кусок уже внутри накопленного
+      else agentBuf += text;
+      this.frame({ type: "transcript", role: "agent", text, final: false });
     });
     client.on("turnComplete", () => {
-      void this.maybeSpawnThreadOnFirstUtterance();
-      this.setState("listening");
+      void (async () => {
+        // Сначала тред: иначе первая же реплика агента уйдёт в say до его создания и потеряется.
+        await this.maybeSpawnThreadOnFirstUtterance();
+        const line = agentBuf.trim();
+        agentBuf = "";
+        if (!line) return;
+        this.frame({ type: "transcript", role: "agent", text: line, final: true });
+        this.lastVoiceLine = line.slice(0, 300);
+        this.ledger.add("agent", line);
+        this.deps.store.event(this.deps.callId, "agent_line", { text: line });
+        await this.deps.sayCallThread(line);
+      })();
+    });
+    client.on("inputTranscript", (text: string) => {
+      if (!this.gate.isMicOpen()) return;
+      this.frame({ type: "transcript", role: "owner", text, final: false });
+      this.gate.onOwnerTranscriptChunk(text);
+      const now = Date.now();
+      if (!this.ownerUtterance) this.ownerUtterance = { text, firstAt: now, lastAt: now };
+      else {
+        this.ownerUtterance.text += text;
+        this.ownerUtterance.lastAt = now;
+      }
+      if (this.ownerUtteranceTimer) clearTimeout(this.ownerUtteranceTimer);
+      this.ownerUtteranceTimer = setTimeout(() => this.finalizeOwnerUtterance(), 700);
     });
     client.on("toolCall", (calls: Array<{ id?: string; name: string; args: Record<string, unknown> }>) => {
       if (this.mode !== "normal") return; // Extended инструментов не имеет; на всякий случай игнор.
@@ -265,6 +286,9 @@ export class CallSession extends EventEmitter {
     client.on("error", (message: string) => {
       this.frame({ type: "error", code: "google_unreachable", message, retryable: true });
     });
+    client.on("sendDropped", (readyState: unknown, preview: string) => {
+      console.error(`[live-call] send dropped (readyState=${readyState}): ${preview}`);
+    });
     void ctx;
   }
 
@@ -277,9 +301,10 @@ export class CallSession extends EventEmitter {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` });
         continue;
       }
-      const { result, executed } = await runToolCall(def, call.args, call.id, this.toolContext());
-      client.sendToolResponse(call.id, result, executed ? "SILENT" : "WHEN_IDLE");
-      if (def.cls !== "R") this.deps.store.event(this.deps.callId, "confirm", { tool: def.name, executed });
+      const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
+      // Голосовая сессия должна отреагировать на результат: WHEN_IDLE (SILENT запрещает ответ).
+      client.sendToolResponse(call.id, result, "WHEN_IDLE");
+      if (def.cls !== "R") this.deps.store.event(this.deps.callId, "confirm", { tool: def.name });
     }
     this.setState("listening");
   }
@@ -421,12 +446,12 @@ export class CallSession extends EventEmitter {
       summary: p.say,
     });
     this.resolvePendingToolResponse(p.argsHash, result);
-    if (this.mode === "extended") {
-      const text = result.ok
-        ? `выполнено: ${p.tool}. ${JSON.stringify(result.data).slice(0, 600)}`
-        : `не выполнено: ${"error" in result ? result.error.message : "нужно подтверждение"}`;
-      this.voice?.sendClientContent(`[СИСТЕМА] ${text}`, true);
-    }
+    // Модель узнаёт результат через вставку [СИСТЕМА] в обоих режимах:
+    // в native toolResponse уже отдан как needsConfirmation, повторять его некому.
+    const text = result.ok
+      ? `выполнено: ${p.tool}. ${JSON.stringify(result.data).slice(0, 600)}`
+      : `не выполнено: ${"error" in result ? result.error.message : "нужно подтверждение"}`;
+    this.voice?.sendClientContent(`[СИСТЕМА] ${text}`, true);
   }
 
   /** Аргументы сохранённого вызова записи — они же в argsHash, подмена исключена. */
@@ -475,6 +500,16 @@ export class CallSession extends EventEmitter {
   /** Кадр playback_drained из браузера: открывает окно подтверждения. */
   onPlaybackDrained(turnSeq: number) {
     this.gate.onPlaybackDrained(turnSeq);
+  }
+
+  /** 700 мс тишины во входном транскрипте — реплика владельца закончена. */
+  private finalizeOwnerUtterance() {
+    this.ownerUtteranceTimer = null;
+    const u = this.ownerUtterance;
+    this.ownerUtterance = null;
+    if (!u || !u.text.trim()) return;
+    this.frame({ type: "transcript", role: "owner", text: u.text, final: true });
+    this.onOwnerUtteranceFinal(u.text.trim());
   }
 
   /** Реплика владельца завершена (VAD или транскрипт-таймер): ROUTER, вариант А. */

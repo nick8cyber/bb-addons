@@ -21,8 +21,8 @@ tags: [live-call, contract]
 | `geminiKeys` | secret, строки | — | 1–2 ключа AI Studio, по одному на строку. Первый — основной, второй — запасной. Нет ключей → `needsConfiguration`. В extended нужны оба (VOICE=k1, ROUTER=k2): старт звонка в extended с одним ключом → фоллбэк в normal + `warning { code: "extended_unavailable" }` |
 | `defaultMode` | `"normal" \| "extended"` | `"normal"` | Режим нового звонка. После звонка сохраняется последний выбранный (`lastMode` в хранилище плагина) |
 | `extendedThinkingLevel` | `"LOW" \| "MEDIUM" \| "HIGH"` | `"LOW"` | Только для VOICE в режиме `extended` |
-| `voice` | строка из 30 голосов | `"Algenib"` | `speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName` |
-| `languageCode` | строка | `"ru-RU"` | `speechConfig.languageCode` |
+| `voice` | строка из 30 голосов | `"Algenib"` | `generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName` (у 3.8-live speechConfig внутри generationConfig — проверено пробой 02.11, в корне setup отклоняется 1007) |
+| `languageCode` | строка | `"ru-RU"` | `generationConfig.speechConfig.languageCode` |
 | `echoMode` | `"auto" \| "headphones" \| "duck"` | `"auto"` | `duck` — микрофон приглушается, пока говорит агент |
 | `maxCallMinutes` | число 5–120 | `60` | За 2 мин до конца агент предупреждает, на лимите — `end_call` |
 | `callsProjectId` | строка | пусто | Пусто → при первом звонке плагин создаёт проект «Звонки» (§6) и записывает его id |
@@ -82,7 +82,7 @@ bytes 5..   PCM16 LE, моно: 0x01 — 16 кГц, 20 мс = 640 байт; 0x02
 ## 3. Gemini Live (сервер → Google)
 
 - `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=…`. Ключ из `geminiKeys`. Клиентские заголовки не пересылаются (ADR-0005).
-- Общий `setup`: `generationConfig.responseModalities: ["AUDIO"]`, `speechConfig` (§1), `inputAudioTranscription: {}`, `outputAudioTranscription: {}`, `sessionResumption: { handle? }`, `contextWindowCompression: { triggerTokens: 20000, slidingWindow: { targetTokens: 10000 } }` (числа уточняет Ф0).
+- Общий `setup`: `generationConfig: { responseModalities: ["AUDIO"], speechConfig (§1) }`, `inputAudioTranscription: {}`, `outputAudioTranscription: {}`, `sessionResumption: { handle? }`, `contextWindowCompression: { triggerTokens: 20000, slidingWindow: { targetTokens: 10000 } }` (числа уточняет Ф0).
 
 | Сессия | `model` | Отличия `setup` |
 |---|---|---|
