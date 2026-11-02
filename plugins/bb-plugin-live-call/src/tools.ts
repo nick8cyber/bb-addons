@@ -110,6 +110,22 @@ export async function resolveThreadRef(
 type InteractionListResult = { interactions?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>;
 type InteractionsArea = { list(a: { threadId: string }): Promise<InteractionListResult> };
 
+/** Вызов RPC внешнего плагина с честной ошибкой вместо падения. */
+async function pluginRpc(ctx: ToolContext, pluginId: string, method: string, input: Record<string, unknown>): Promise<ToolResult> {
+  try {
+    const res = await withTimeout(
+      (ctx.sdk.plugins as unknown as { callRpc(a: unknown): Promise<unknown> }).callRpc({ pluginId, method, input } as never),
+    );
+    return truncate(res);
+  } catch (e) {
+    return { ok: false, error: { code: "rpc_failed", message: `${pluginId}.${method}: ${String(e)}` } };
+  }
+}
+
+/** Массив или {поле: массив} → массив (SDK возвращает разные формы). */
+const asArray = (v: unknown): Array<Record<string, unknown>> =>
+  Array.isArray(v) ? (v as Array<Record<string, unknown>>) : (((v as Record<string, unknown> | null)?.items ?? (v as Record<string, unknown> | null)?.threads ?? []) as Array<Record<string, unknown>>);
+
 async function withTimeout<T>(p: Promise<T>, ms = TOOL_TIMEOUT_MS): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -394,15 +410,9 @@ export const TOOLS: ToolDef[] = [
     },
     confirmSay: (args) => `Создать задачу «${String(args.title)}»? Скажи «да» или «отмена».`,
     async execute(args, ctx) {
-      const res = await withTimeout(
-        (ctx.sdk.plugins as unknown as { callRpc(a: unknown): Promise<unknown> }).callRpc({
-          pluginId: "tasks",
-          method: "createTask",
-          input: { title: args.title, description: args.spec, project: args.project },
-        } as never),
-      ).catch((e: unknown) => ({ error: String(e) }));
-      ctx.reportAction("tasks_create", "C", "done", `Создал задачу «${String(args.title)}»`);
-      return truncate(res);
+      const res = await pluginRpc(ctx, "tasks", "createTask", { title: args.title, description: args.spec, project: args.project });
+      ctx.reportAction("tasks_create", "C", res.ok ? "done" : "failed", `Создал задачу «${String(args.title)}»`);
+      return res;
     },
   },
   {
@@ -417,15 +427,9 @@ export const TOOLS: ToolDef[] = [
     },
     confirmSay: (args) => `Раздать задачу ${String(args.key)} исполнителю (${String(args.preset)})? Скажи «запускай» или «отмена».`,
     async execute(args, ctx) {
-      const res = await withTimeout(
-        (ctx.sdk.plugins as unknown as { callRpc(a: unknown): Promise<unknown> }).callRpc({
-          pluginId: "tasks",
-          method: "dispatch",
-          input: { key: args.key, preset: args.preset },
-        } as never),
-      ).catch((e: unknown) => ({ error: String(e) }));
-      ctx.reportAction("tasks_dispatch", "L", "done", `Раздал задачу ${String(args.key)}`);
-      return truncate(res);
+      const res = await pluginRpc(ctx, "tasks", "dispatch", { key: args.key, preset: args.preset });
+      ctx.reportAction("tasks_dispatch", "L", res.ok ? "done" : "failed", `Раздал задачу ${String(args.key)}`);
+      return res;
     },
   },
   {
@@ -435,14 +439,7 @@ export const TOOLS: ToolDef[] = [
     description: "Поиск по памяти BB. До 5 записей.",
     parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     async execute(args, ctx) {
-      const res = await withTimeout(
-        (ctx.sdk.plugins as unknown as { callRpc(a: unknown): Promise<unknown> }).callRpc({
-          pluginId: "memory",
-          method: "search",
-          input: { query: args.query, limit: 5 },
-        } as never),
-      ).catch((e: unknown) => ({ error: String(e) }));
-      return truncate(res);
+      return pluginRpc(ctx, "memory", "search", { query: args.query, limit: 5 });
     },
   },
   {

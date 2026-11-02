@@ -108,23 +108,70 @@ type ToolResult =
   | { ok: false; needsConfirmation: { confirmationId: string; say: string } };
 ```
 
-| Имя | Параметры | Класс | `data` |
-|---|---|---|---|
-| `bb_overview` | — | R | `{ projects: {id,name}[]; running: ThreadBrief[]; waiting: ThreadBrief[]; failed: ThreadBrief[] }`, до 10 в каждом |
-| `list_threads` | `project?: string`, `status?: "active"\|"waiting"\|"error"\|"any"`, `query?: string` | R | `ThreadBrief[]`, до 15 |
-| `read_thread` | `thread: string` (id или название) | R | `{ thread: ThreadBrief; lastOutput: string }`, `lastOutput` ≤ 4000 символов |
-| `list_pending` | — | R | `{ threadId; title; kind: "question"\|"permission"; prompt }[]` |
-| `watch_thread` | `thread: string` | R | `{ watching: true }` |
-| `send_to_thread` | `thread: string`, `text: string` | C | `{ sent: true; threadId }` |
-| `answer_interaction` | `thread: string`, `answer: string`, `interactionId?: string`, `grant?: boolean` | C, или P при `grant: true` | `{ resolved: true }`. Вызов SDK — `interactions.respond` (вопрос) или `interactions.resolve` (разрешение). Без `interactionId`: у треда одно ожидающее → берём его; несколько или ноль → `error.code: "ambiguous"` |
-| `stop_thread` | `thread: string` | C | `{ stopped: true }` |
-| `start_thread` | `project: string`, `task: string`, `preset?: string` | L | `{ threadId; title }` |
-| `tasks_create` | `title: string`, `spec: string`, `project?: string` | C | `{ key }` |
-| `tasks_dispatch` | `key: string`, `preset: string` | L | `{ threadId }` |
-| `search_memory` | `query: string` | R | `{ items: { name; summary }[] }`, до 5 |
-| `switch_mode` | `mode: "normal"\|"extended"` | R | `{ switching: true }` |
-| `confirm_action` | `confirmationId: string` | — | `{ confirmed: true }`. Объявляется модели только в режиме `normal`; в режиме `extended` сервер исполняет действие сам при `approved` (§2.1 спеки) |
-| `end_call` | — | R | `{ ending: true }` |
+Каталог утверждён владельцем 02.11 (три раунда согласования). RPC-имена внешних плагинов сверены с их бандлами.
+
+**Чтение (R) — исполняются сразу:**
+
+| Имя | Что делает |
+|---|---|
+| `bb_overview` | проекты, активные треды, ошибки |
+| `list_threads` | треды по проекту/статусу/поиску |
+| `read_thread` | статус и последний вывод треда |
+| `thread_updates` | события треда с момента N минут |
+| `list_pending` | ожидающие вопросы/разрешения агентов |
+| `watch_thread` | доложить о завершении треда |
+| `list_tasks` | задачи трекера по статусу (tasks.`listTasks`) |
+| `read_task` | задача с описанием и комментами (tasks.`getTaskByKey`) |
+| `search_memory` | память BB (memory.`search`) |
+| `system_health` | активные/упавшие треды + провайдеры |
+| `pr_status` | PR-статус треда (threads.get → pullRequest) |
+| `provider_status` | провайдеры моделей |
+| `plugin_status` | плагины и их состояние |
+| `skills_list` | установленные скиллы |
+| `prompt_history` | последние промпты владельца в проекте |
+| `project_branches` | ветки проекта |
+| `search_all` | единый поиск: треды + задачи + память |
+| `switch_mode` | режим звонка |
+| `end_call` | завершить звонок |
+
+**После «да» (C):**
+
+| Имя | Что делает |
+|---|---|
+| `send_to_thread` | сообщение в тред с меткой `[голос]` |
+| `queue_message` | сообщение в очередь треда (без запуска работы) |
+| `answer_interaction` | ответ агенту / разрешение (`grant: true` → P) |
+| `stop_thread` | остановить тред |
+| `archive_thread` | тред в архив |
+| `compact_thread` | сжать контекст треда |
+| `pin_thread` | закрепить/открепить |
+| `thread_rename` | переименовать |
+| `thread_hide` | скрыть/вернуть в сайдбаре |
+| `tasks_create` | создать задачу (tasks.`createTask`) |
+| `task_comment` | комментарий к задаче (tasks.`createComment`) |
+| `task_status` | сменить статус задачи (tasks.`updateTask`) |
+| `task_due` | срок задачи (tasks.`updateTask`) |
+| `remember` | факт в память BB (memory.`add`) |
+| `call_note` | пометка в итог звонка |
+| `confirm_action` | только режим `normal` (§2.1 спеки) |
+
+**Только «запускай» (L):**
+
+| Имя | Что делает |
+|---|---|
+| `start_thread` | новый агент: проект + задача |
+| `tasks_dispatch` | раздать задачу исполнителю (tasks.`dispatch`) |
+| `retry_thread` | перезапустить упавший тред |
+| `stop_all_agents` | остановить все активные треды (массовая) |
+| `handoff_thread` | передать тред другой модели в новом треде (в BB модель треда сменить нельзя) |
+| `fork_thread` | клонировать тред с контекстом |
+
+**Отложено с причинами (не объявлять модели в v1):**
+- `doc_search` — в docs-RPC нет метода поиска (только vaults/list/pull); вернуться, когда появится.
+- `set_reminder` / `list_reminders` / `cancel_reminder` / `run_automation` — RPC-имена automations (`createAutomation`, `deleteAutomation`…) найдены, но формы входа не сверены; внести в Ф4 по факту сверки.
+- `task_reassign` — форма обновления исполнителя не сверена; Ф4.
+- `recent_commits` / `ci_status` — в SDK нет git/CI-поверхности; только через агентов в тредах.
+- push, merge, деплой, удаление — никогда (правило владельца).
 
 `ThreadBrief = { id; title; project; status; updatedAt }`. Имя треда из речи сопоставляется с открытыми тредами нечётким поиском. Двусмысленность → `ok: false, error.code: "ambiguous"` со списком до 3 кандидатов в `message`. Сообщения, отправленные голосом, начинаются с `[голос] `. Таймаут исполнителя — 20 с → `error.code: "timeout"`.
 
