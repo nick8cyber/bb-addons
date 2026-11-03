@@ -520,6 +520,11 @@ export class CallSession extends EventEmitter {
     });
     client.on("audio", (turnSeq: number, pcm: Uint8Array) => {
       this.gate.onModelAudio(turnSeq, pcm.length);
+      if (pcm.length > 0) {
+        if (this.turnAudioBytes === 0) this.turnFirstAudioAt = Date.now();
+        this.turnAudioBytes += pcm.length;
+        this.lastAudioTurnSeq = turnSeq;
+      }
       if (pcm.length > 0) this.deps.sendBrowserAudio(turnSeq, pcm);
       if (pcm.length > 0) this.voiceTalking = true;
       if (this.state !== "speaking" && pcm.length > 0) this.setState("speaking");
@@ -527,6 +532,8 @@ export class CallSession extends EventEmitter {
     client.on("interrupted", (turnSeq: number | null) => {
       this.voiceTalking = false;
       this.frame({ type: "interrupted", turnSeq: turnSeq ?? 0 });
+      this.turnAudioBytes = 0;
+      if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
       this.setState("listening");
     });
     let agentBuf = "";
@@ -541,9 +548,10 @@ export class CallSession extends EventEmitter {
     });
     client.on("turnComplete", () => {
       this.voiceTalking = false;
-      // Аудит PLUG-108: без этого состояние оставалось «speaking» до конца звонка,
-      // и речь владельца уходила в Gemini приглушённой ×0.25.
-      if (this.state === "speaking") this.setState("listening");
+      // Аудит PLUG-108: состояние оставалось «speaking» до конца звонка — речь владельца уходила ×0.25.
+      // Но снимать приглушение по turnComplete рано: браузер ещё доигрывает звук, эхо пошло бы в Gemini.
+      // Поэтому: нет звука в ходе (текст) — сразу; есть — по playback_drained, запасной таймер по длине звука.
+      this.scheduleListenAfterPlayback();
       this.flushQuietQueue();
       void (async () => {
         // Сначала тред: иначе первая же реплика агента уйдёт в say до его создания и потеряется.
@@ -838,7 +846,8 @@ export class CallSession extends EventEmitter {
             ? "отменено: истёк срок подтверждения"
             : "владелец не подтвердил";
       this.resolvePendingToolResponse(p.argsHash, { ok: false, error: { code: "cancelled", message } });
-      if (this.mode === "extended") this.injectWhenQuiet(`[СИСТЕМА] ${message}.`);
+      // Аудит PLUG-108: в одной сессии модель тоже должна узнать об отмене (раньше — только в Extended).
+      this.injectWhenQuiet(`[СИСТЕМА] ${message}. Не повторяй этот вызов без новой просьбы владельца.`);
       return;
     }
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
@@ -967,6 +976,32 @@ export class CallSession extends EventEmitter {
   /** Кадр playback_drained из браузера: открывает окно подтверждения. */
   onPlaybackDrained(turnSeq: number) {
     this.gate.onPlaybackDrained(turnSeq);
+    if (this.lastAudioTurnSeq === null || turnSeq >= this.lastAudioTurnSeq) {
+      if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
+      if (this.state === "speaking" && !this.voiceTalking) this.setState("listening");
+    }
+  }
+
+  /** Длина звука текущего хода и запасной переход в «listening», если браузер не прислал playback_drained. */
+  private turnAudioBytes = 0;
+  private turnFirstAudioAt = 0;
+  private lastAudioTurnSeq: number | null = null;
+  private listenFallback: NodeJS.Timeout | null = null;
+  private scheduleListenAfterPlayback() {
+    const bytes = this.turnAudioBytes;
+    this.turnAudioBytes = 0;
+    if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
+    if (bytes === 0) {
+      if (this.state === "speaking") this.setState("listening");
+      return;
+    }
+    const audioMs = (bytes / BYTES_PER_SECOND_24K) * 1000;
+    const remaining = Math.max(0, audioMs - (Date.now() - this.turnFirstAudioAt));
+    this.listenFallback = setTimeout(() => {
+      this.listenFallback = null;
+      if (this.state === "speaking" && !this.voiceTalking) this.setState("listening");
+    }, remaining + 2500);
+    this.listenFallback.unref?.();
   }
 
   /** 700 мс тишины во входном транскрипте — реплика владельца закончена. */
@@ -1102,6 +1137,7 @@ export class CallSession extends EventEmitter {
   }
 
   async end(reason: "owner" | "limit" | "error"): Promise<void> {
+    if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
     if (this.ended) return;
     this.ended = true;
     if (this.reconnectTimer) {

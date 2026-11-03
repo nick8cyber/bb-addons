@@ -140,16 +140,84 @@ describe("состояние после ответа (аудит PLUG-108)", () 
   });
   afterEach(() => vi.useRealTimers());
 
-  it("turnComplete возвращает «listening» — микрофон больше не приглушён", async () => {
+  const st = (s: unknown) => (s as { state: string }).state;
+  const audio = btoa("\x00\x01".repeat(24000)); // 48000 байт = 1 с звука
+
+  it("со звуком: после turnComplete приглушение держится, пока браузер не доиграл (эхо)", async () => {
     const { s } = make();
     await s.start();
     await vi.advanceTimersByTimeAsync(10);
     const ws = FakeWs.all[0];
-    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: btoa("\x00\x01\x02\x03") } }] } } });
-    expect((s as unknown as { state: string }).state).toBe("speaking");
+    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: audio } }] } } });
+    expect(st(s)).toBe("speaking");
     ws.server({ serverContent: { turnComplete: true } });
     await vi.advanceTimersByTimeAsync(10);
-    expect((s as unknown as { state: string }).state).toBe("listening");
+    expect(st(s)).toBe("speaking");
+    s.onPlaybackDrained(1_000_000);
+    expect(st(s)).toBe("listening");
+    await s.end("owner");
+  });
+
+  it("со звуком, но без playback_drained: запасной таймер по длине звука возвращает «listening»", async () => {
+    const { s } = make();
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: audio } }] } } });
+    ws.server({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(st(s)).toBe("speaking");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(st(s)).toBe("listening");
+    await s.end("owner");
+  });
+
+  it("без звука (ответ текстом): «listening» сразу после turnComplete", async () => {
+    const { s } = make();
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    (s as unknown as { setState(x: string): void }).setState("speaking");
+    ws.server({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(st(s)).toBe("listening");
+    await s.end("owner");
+  });
+});
+
+describe("«Отмена» кнопкой на уровне сессии (аудит PLUG-108)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("ожидание снято, модель получает отмену один раз, следующая запись снова спрашивает подтверждение", async () => {
+    const frames: Array<Record<string, unknown>> = [];
+    const store = new CallStore(new Database(":memory:"));
+    const s = new CallSession({
+      callId: "call_cx", keys: ["k1"], voice: "Algenib", languageCode: "ru-RU", thinkingLevel: "LOW",
+      mode: "normal", routerInput: "text", maxCallMinutes: 60, store, sdk: {} as never,
+      toBrowser: (f) => frames.push(f as never), sendBrowserAudio: () => {},
+      spawnCallThread: async () => null, advanceCallThread: async () => {}, sayCallThread: async () => {}, endCallThread: async () => {},
+      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+    });
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    ws.server({ toolCall: { functionCalls: [{ id: "f1", name: "remember", args: { text: "раз" } }] } });
+    await vi.advanceTimersByTimeAsync(50);
+    const c1 = frames.filter((f) => f.type === "confirmation").at(-1) as { confirmationId: string };
+    s.decideConfirmation(c1.confirmationId, "cancel");
+    await vi.advanceTimersByTimeAsync(50);
+    ws.server({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(50);
+    expect((s as unknown as { gate: { pendingConfirmation(): unknown } }).gate.pendingConfirmation()).toBeNull();
+    const cancels = clientContents(ws).filter((x) => x.includes("отменил"));
+    expect(cancels.length).toBe(1);
+    ws.server({ toolCall: { functionCalls: [{ id: "f2", name: "remember", args: { text: "два" } }] } });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(frames.filter((f) => f.type === "confirmation").length).toBe(2);
     await s.end("owner");
   });
 });
