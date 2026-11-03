@@ -229,3 +229,27 @@ describe("argsHash", () => {
     expect(argsHash("t", { a: 1 })).not.toBe(argsHash("t", { a: 2 }));
   });
 });
+
+describe("кнопки подтверждения (аудит PLUG-108)", () => {
+  it("«Отмена» сразу снимает ожидание: микрофон открыт, следующая запись не получает pending_exists", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    const r = gate.request("send_to_thread", { thread: "A", text: "x" }, "C", "отправить?");
+    expect("pending" in r).toBe(true);
+    if (!("pending" in r)) return;
+    expect(gate.decide(r.pending.confirmationId, "cancel")).toBe("cancelled");
+    expect(gate.pendingConfirmation()).toBeNull();
+    expect(gate.isMicOpen()).toBe(true);
+    const r2 = gate.request("send_to_thread", { thread: "B", text: "y" }, "C", "отправить?");
+    expect("pending" in r2).toBe(true);
+  });
+
+  it("«Подтвердить» кнопкой сразу открывает микрофон, не дожидаясь конца исполнения", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    const r = gate.request("send_to_thread", { thread: "A", text: "x" }, "C", "отправить?");
+    if (!("pending" in r)) throw new Error("нет pending");
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("approved");
+    expect(gate.isMicOpen()).toBe(true);
+  });
+});

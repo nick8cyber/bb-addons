@@ -284,8 +284,13 @@ export class ConfirmationGate {
     if (p.expiresAt <= this.clock.now()) return this.burn(p, "expired");
     const verdict: Verdict = decision === "approve" ? "approved" : "cancelled";
     p.verdict = verdict;
+    // Аудит PLUG-108: решение кнопкой сразу открывает микрофон — владелец не говорит в пустоту
+    // до конца исполнения или истечения срока.
+    this.micOpen = true;
     this.events.onVerdict?.(p, verdict);
-    // Исполняет кнопка сервер немедленно в обоих режимах; consume() после исполнения.
+    // Отмена: исполнения нет — запись сгорает сразу, следующая запись не получает pending_exists.
+    if (verdict === "cancelled") return this.burn(p, "cancelled");
+    // Подтверждение: исполняет сервер немедленно; consume() после исполнения.
     return verdict;
   }
 

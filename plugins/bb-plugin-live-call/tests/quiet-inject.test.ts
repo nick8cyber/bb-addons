@@ -132,3 +132,24 @@ describe("подтверждение кнопкой раньше вопроса 
     await s.end("owner");
   });
 });
+
+describe("состояние после ответа (аудит PLUG-108)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("turnComplete возвращает «listening» — микрофон больше не приглушён", async () => {
+    const { s } = make();
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: btoa("\x00\x01\x02\x03") } }] } } });
+    expect((s as unknown as { state: string }).state).toBe("speaking");
+    ws.server({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(10);
+    expect((s as unknown as { state: string }).state).toBe("listening");
+    await s.end("owner");
+  });
+});

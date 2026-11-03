@@ -541,6 +541,9 @@ export class CallSession extends EventEmitter {
     });
     client.on("turnComplete", () => {
       this.voiceTalking = false;
+      // Аудит PLUG-108: без этого состояние оставалось «speaking» до конца звонка,
+      // и речь владельца уходила в Gemini приглушённой ×0.25.
+      if (this.state === "speaking") this.setState("listening");
       this.flushQuietQueue();
       void (async () => {
         // Сначала тред: иначе первая же реплика агента уйдёт в say до его создания и потеряется.
