@@ -375,6 +375,12 @@ export class CallEngine {
 
   switchMode(mode: CallMode) {
     if (mode === this.view.mode || this.view.switching || this.view.confirmation) return;
+    // Фантомный тап на iOS: экран звонка появляется под пальцем, и касание кнопки
+    // «Позвонить» достаётся переключателю режима (приёмка 03.11: Extended включился
+    // сам через 2 с после старта). Первые 1,5 с переключатель не реагирует.
+    if (Date.now() - this.liveSince < 1500) return;
+    // Старый голос замолкает сразу, а не доигрывает буфер поверх нового.
+    this.player?.interrupted();
     this.patch({ switching: true });
     this.send({ type: "switch_mode", mode });
   }

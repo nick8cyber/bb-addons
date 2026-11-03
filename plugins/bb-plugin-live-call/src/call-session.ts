@@ -699,7 +699,12 @@ export class CallSession extends EventEmitter {
     // новая сессия без handle, контекст переносит пересказ ниже.
     await this.openSessions(undefined);
     // Пересказ новой сессии: тот же механизм, что смена ключа (спека §2.1).
-    this.voice?.sendClientContent(`[СИСТЕМА] Разговор продолжается. Пересказ:\n${this.ledger.handoverSummary()}`, false);
+    // Новая сессия продолжает разговор, а не начинает его: без приветствия, иначе владелец
+    // слышит «второго агента» другим голосом (приёмка 03.11).
+    this.voice?.sendClientContent(
+      `[СИСТЕМА] Режим звонка переключён. Ты продолжаешь тот же разговор. Не здоровайся, не представляйся, не повторяй сказанное — молчи, пока владелец не заговорит. Пересказ:\n${this.ledger.handoverSummary()}`,
+      false,
+    );
     this.frame({ type: "mode", mode, switching: false });
     this.setState("listening");
   }
