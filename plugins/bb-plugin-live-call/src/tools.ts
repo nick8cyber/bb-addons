@@ -129,6 +129,9 @@ async function threadIndex(sdk: BbPluginApi["sdk"], projectId?: string): Promise
     return true;
   });
   const threads = raw
+    // projectId есть в схеме threads.list, но фильтруем и сами: без этого «треды BB» снова
+    // превратились бы в треды всего BB, если параметр перестанут учитывать.
+    .filter((x) => !projectId || String(x.projectId ?? "") === projectId)
     .filter((x) => !isCallThread(x) && !x.archivedAt && !x.deletedAt && x.visibility !== "hidden")
     .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
   return { threads, projectNames };

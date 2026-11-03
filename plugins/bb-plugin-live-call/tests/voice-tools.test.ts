@@ -14,7 +14,8 @@ const threads = [
 const sdk = {
   projects: { list: async () => projects },
   threads: {
-    list: async (a: { projectId?: string }) => threads.filter((t) => !a.projectId || t.projectId === a.projectId),
+    // Нарочно игнорирует projectId: тест держится на фильтре в threadIndex, а не на фейке.
+    list: async () => threads,
     get: async ({ threadId }: { threadId: string }) => threads.find((t) => t.id === threadId),
     listRunning: async () => threads.filter((t) => t.status === "active"),
     output: async () => ({ output: "Упёрся в 5-часовой лимит, жду сброса." }),

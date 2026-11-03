@@ -135,7 +135,9 @@ const HEALTH_STATUS = (process.env.LC_HEALTH ?? "not_installed") as string;
 
 const handlers: Record<string, (id: Id, p: Record<string, unknown>) => void> = {
   ["provider/health"]: (id) => {
+    // Схема ответа — дискриминированное объединение по supported (лог сервера: «Invalid discriminator value»).
     ok(id, {
+      supported: true,
       health: {
         accountEmail: null,
         canInstall: false,
