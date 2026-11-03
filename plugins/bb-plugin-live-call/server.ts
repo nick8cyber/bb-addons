@@ -27,6 +27,7 @@ import { EventBridge } from "./src/event-bridge.js";
 import { LiveClient } from "./src/live-client.js";
 import { argsHash } from "./src/confirmation-gate.js";
 import { decideHello } from "./src/reattach.js";
+import { toolByName } from "./src/tools.js";
 
 const rpcContract = defineRpcContract({
   status: {
@@ -592,6 +593,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "calls", summary: "Последние звонки", usage: "bb call calls [--limit N]" },
       { name: "transcript", summary: "Транскрипт звонка", usage: "bb call transcript <callId>" },
       { name: "probe", summary: "Доставляет ли Extended Thinking toolCall", usage: "bb call probe" },
+      { name: "tool", summary: "Выполнить инструмент чтения без звонка (отладка данных)", usage: "bb call tool <имя> [json-аргументы]" },
     ],
     async run(argv) {
       const cmd = argv[0] ?? "status";
@@ -623,6 +625,21 @@ export default async function plugin(bb: BbPluginApi) {
         if (keys.length === 0) return { exitCode: 1, stdout: "нет ключей\n" };
         const r = await probeExtended(keys[0], bb);
         return { exitCode: r.extendedNativeTools ? 0 : 1, stdout: `extendedNativeTools: ${r.extendedNativeTools}\n${r.detail ?? ""}\n` };
+      }
+      if (cmd === "tool") {
+        // Только класс R: отладка того, что инструменты отдают модели. Записи — только в звонке через подтверждение.
+        const def = toolByName(argv[1] ?? "");
+        if (!def) return { exitCode: 2, stdout: "usage: bb call tool <имя> [json]\n" };
+        if (def.cls !== "R") return { exitCode: 2, stdout: `${def.name} — класс ${def.cls}, вне звонка не выполняется\n` };
+        let args: Record<string, unknown> = {};
+        try {
+          args = argv[2] ? (JSON.parse(argv.slice(2).join(" ")) as Record<string, unknown>) : {};
+        } catch {
+          return { exitCode: 2, stdout: "аргументы — JSON\n" };
+        }
+        const ctx = { sdk: bb.sdk, reportAction: () => {}, callsProjectId: () => null } as unknown as Parameters<typeof def.execute>[1];
+        const result = await def.execute(args, ctx);
+        return { exitCode: result.ok ? 0 : 1, stdout: JSON.stringify(result, null, 1).slice(0, 8000) + "\n" };
       }
       return { exitCode: 2, stdout: "usage: bb call status|calls|transcript <callId>|probe\n" };
     },

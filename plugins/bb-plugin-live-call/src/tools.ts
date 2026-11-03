@@ -90,6 +90,60 @@ export async function searchThreads(sdk: BbPluginApi["sdk"], query: string): Pro
   }
 }
 
+/** Человеческий статус треда для голоса: что владельцу важно знать. */
+function stateOf(t: Record<string, unknown>): "работает" | "ждёт тебя" | "ошибка" | "свободен" {
+  if (t.hasPendingInteraction) return "ждёт тебя";
+  if (t.status === "active") return "работает";
+  if (t.status === "error") return "ошибка";
+  return "свободен";
+}
+
+function minutesAgo(ts: unknown): number | null {
+  const n = Number(ts);
+  return Number.isFinite(n) && n > 0 ? Math.max(0, Math.round((Date.now() - n) / 60000)) : null;
+}
+
+/**
+ * Индекс тредов для голоса: видимые, не архивные, без тредов звонков, новые сверху,
+ * с названием проекта и человеческим статусом. Раньше list_threads брал 60 тредов
+ * со всего BB и игнорировал project — модель говорила «в BB нет запущенных тредов»,
+ * когда они были (приёмка 03.11).
+ */
+async function threadIndex(sdk: BbPluginApi["sdk"], projectId?: string): Promise<{ threads: Array<Record<string, unknown>>; projectNames: Map<string, string> }> {
+  const projects = ((await withTimeout(sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? []) as Array<Record<string, unknown>>;
+  const projectNames = new Map((Array.isArray(projects) ? projects : []).map((p) => [String(p.id), String(p.name ?? p.id)]));
+  const res = await withTimeout(sdk.threads.list({ limit: 200, ...(projectId ? { projectId } : {}) } as never) as Promise<unknown>);
+  const raw = (Array.isArray(res) ? res : ((res as { threads?: unknown[] })?.threads ?? [])) as Array<Record<string, unknown>>;
+  const threads = raw
+    .filter((x) => !isCallThread(x) && !x.archivedAt && !x.deletedAt && x.visibility !== "hidden")
+    .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
+  return { threads, projectNames };
+}
+
+function voiceBrief(t: Record<string, unknown>, projectNames: Map<string, string>) {
+  return {
+    id: String(t.id ?? ""),
+    title: String(t.title ?? t.titleFallback ?? "").slice(0, 120),
+    project: projectNames.get(String(t.projectId ?? "")) ?? String(t.projectId ?? ""),
+    state: stateOf(t),
+    updatedMinutesAgo: minutesAgo(t.updatedAt),
+  };
+}
+
+/** Проект из речи («BB», «бб», id) → id. */
+async function resolveProjectId(sdk: BbPluginApi["sdk"], ref: string): Promise<string | undefined> {
+  const r = normalizeTitle(ref);
+  if (!r) return undefined;
+  if (ref.startsWith("proj_")) return ref;
+  const projects = ((await withTimeout(sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? []) as Array<Record<string, unknown>>;
+  const lat = (s: string) => s.replace(/б/g, "b").replace(/в/g, "b").replace(/с/g, "c").replace(/к/g, "k").replace(/р/g, "r").replace(/м/g, "m");
+  const hit =
+    projects.find((p) => normalizeTitle(String(p.name ?? "")) === r) ??
+    projects.find((p) => lat(normalizeTitle(String(p.name ?? ""))) === lat(r)) ??
+    projects.find((p) => normalizeTitle(String(p.name ?? "")).includes(r));
+  return hit ? String(hit.id) : undefined;
+}
+
 /** Нечёткое сопоставление имени из речи с открытыми тредами (контракт §4). */
 export async function resolveThreadRef(
   sdk: BbPluginApi["sdk"],
@@ -205,18 +259,28 @@ export const TOOLS: ToolDef[] = [
     name: "bb_overview",
     cls: "R",
     word: "",
-    description: "Обзор BB: проекты, активные треды, ожидающие ответа, ошибки. До 10 в каждой группе.",
+    description: "Обзор BB по проектам: что работает, что ждёт владельца, что упало. Новые сверху.",
     parameters: { type: "object", properties: {} },
     async execute(_args, ctx) {
-      // SDK возвращает голые массивы (ProjectResponse[] / ThreadRunningResponse).
-      const projects = (await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
-      const running = (await withTimeout(ctx.sdk.threads.listRunning() as Promise<Array<Record<string, unknown>>>)) ?? [];
-      const list = (Array.isArray(running) ? running : []).slice(0, 10).map(briefOf);
+      const { threads, projectNames } = await threadIndex(ctx.sdk);
+      const byProject = new Map<string, { project: string; working: number; waiting: number; failed: number; total: number }>();
+      for (const t of threads) {
+        const name = projectNames.get(String(t.projectId ?? "")) ?? "без проекта";
+        const row = byProject.get(name) ?? { project: name, working: 0, waiting: 0, failed: 0, total: 0 };
+        const st = stateOf(t);
+        if (st === "работает") row.working += 1;
+        if (st === "ждёт тебя") row.waiting += 1;
+        if (st === "ошибка") row.failed += 1;
+        row.total += 1;
+        byProject.set(name, row);
+      }
+      const pick = (st: string, n: number) => threads.filter((t) => stateOf(t) === st).slice(0, n).map((t) => voiceBrief(t, projectNames));
       return truncate({
-        projects: (Array.isArray(projects) ? projects : []).slice(0, 10).map((p) => ({ id: p.id, name: p.name })),
-        running: list,
-        waiting: [],
-        failed: list.filter((t) => t.status === "error"),
+        projects: [...byProject.values()].sort((a, b) => b.working + b.waiting - (a.working + a.waiting)),
+        working: pick("работает", 10),
+        waitingForOwner: pick("ждёт тебя", 10),
+        recentErrors: pick("ошибка", 5),
+        note: "state: работает — ход идёт сейчас; ждёт тебя — агент задал вопрос; ошибка — последний ход упал (мог быть давно, смотри updatedMinutesAgo).",
       });
     },
   },
@@ -224,31 +288,31 @@ export const TOOLS: ToolDef[] = [
     name: "list_threads",
     cls: "R",
     word: "",
-    description: "Треды по проекту, статусу или поиску. До 15.",
+    description: "Треды проекта или всего BB с состоянием (работает / ждёт тебя / ошибка / свободен), новые сверху. До 15.",
     parameters: {
       type: "object",
       properties: {
-        project: { type: "string", description: "имя или id проекта" },
-        status: { type: "string", enum: ["active", "waiting", "error", "any"] },
-        query: { type: "string", description: "поиск по названию" },
+        project: { type: "string", description: "название проекта, например BB" },
+        status: { type: "string", enum: ["working", "waiting", "error", "idle", "any"] },
+        query: { type: "string", description: "поиск по названию треда" },
       },
     },
     async execute(args, ctx) {
       const q = String(args.query ?? "").trim();
-      let raw: Array<Record<string, unknown>>;
+      const projectRef = String(args.project ?? "").trim();
+      const projectId = projectRef ? await resolveProjectId(ctx.sdk, projectRef) : undefined;
+      if (projectRef && !projectId) return { ok: false, error: { code: "not_found", message: `нет проекта «${projectRef}»` } };
+      const { threads, projectNames } = await threadIndex(ctx.sdk, projectId);
+      let list = threads;
       if (q) {
-        raw = await searchThreads(ctx.sdk, q);
-      } else {
-        const res = await withTimeout(ctx.sdk.threads.list({ limit: 60 }) as Promise<Array<Record<string, unknown>> | { threads?: Record<string, unknown>[] }>);
-        raw = (Array.isArray(res) ? res : ((res as { threads?: Record<string, unknown>[] }).threads ?? [])).filter((x) => !isCallThread(x));
+        const found = new Set((await searchThreads(ctx.sdk, q)).map((x) => String(x.id)));
+        list = list.filter((x) => found.has(String(x.id)));
       }
-      let items = raw.map(briefOf);
+      const map: Record<string, string> = { working: "работает", waiting: "ждёт тебя", error: "ошибка", idle: "свободен" };
       const status = String(args.status ?? "any");
-      if (status !== "any") {
-        const map: Record<string, string> = { active: "active", waiting: "waiting", error: "error" };
-        items = items.filter((t) => t.status === (map[status] ?? status));
-      }
-      return truncate(items.slice(0, 15));
+      let items = list.map((x) => voiceBrief(x, projectNames));
+      if (status !== "any" && map[status]) items = items.filter((x) => x.state === map[status]);
+      return truncate({ total: items.length, threads: items.slice(0, 15) });
     },
   },
   {
@@ -263,7 +327,34 @@ export const TOOLS: ToolDef[] = [
       const t = ref.thread;
       const out = await withTimeout(ctx.sdk.threads.output({ threadId: String(t.id) }) as Promise<{ output: string | null }>);
       const lastOutput = String(out.output ?? "").slice(0, 4000);
-      return truncate({ thread: briefOf(t), lastOutput });
+      const state = stateOf(t);
+      let currentTask: string | undefined;
+      if (state === "работает" || state === "ждёт тебя") {
+        // Что тред делает сейчас: последняя поставленная ему задача (событие запроса хода).
+        try {
+          const ev = (await withTimeout(
+            (ctx.sdk.threads as unknown as { events: { list(a: Record<string, unknown>): Promise<unknown> } }).events.list({
+              threadId: String(t.id),
+              order: "desc",
+              types: ["client/turn/requested"],
+              limit: 1,
+            }),
+          )) as unknown;
+          const rows = (Array.isArray(ev) ? ev : ((ev as { events?: unknown[] })?.events ?? [])) as Array<{ data?: { input?: Array<{ text?: string }> } }>;
+          currentTask = rows[0]?.data?.input?.map((x) => x.text ?? "").join(" ").trim().slice(0, 600) || undefined;
+        } catch {
+          currentTask = undefined;
+        }
+      }
+      return truncate({
+        thread: { ...briefOf(t), state, updatedMinutesAgo: minutesAgo(t.updatedAt) },
+        ...(currentTask ? { currentTask } : {}),
+        lastOutput,
+        note:
+          state === "работает"
+            ? "Тред СЕЙЧАС работает над currentTask. lastOutput — ответ ПРОШЛОГО хода, он может быть устаревшим (например, старое сообщение о лимите). Не выдавай его за текущее состояние."
+            : "lastOutput — последний законченный ответ треда.",
+      });
     },
   },
   {
