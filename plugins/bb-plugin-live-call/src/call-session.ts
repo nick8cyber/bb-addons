@@ -223,6 +223,25 @@ export class CallSession extends EventEmitter {
             /* окружение недоступно — мозговой центр не получит worktree и не запустится */
           }
         }
+        // BB запоминает «не git» на момент создания окружения: после `git init` в папке проекта
+        // флаг остаётся false. Проверяем саму папку (тот же хост) — тогда мозговой центр получит worktree.
+        const envPath = typeof envObj.path === "string" ? envObj.path : "";
+        if (!envObj.isGitRepo && envPath) {
+          const { existsSync } = await import("node:fs");
+          const { join: pjoin } = await import("node:path");
+          if (existsSync(pjoin(envPath, ".git"))) {
+            envObj = { ...envObj, isGitRepo: true };
+            if (!envObj.branchName) {
+              try {
+                const { execFileSync } = await import("node:child_process");
+                const br = execFileSync("git", ["-C", envPath, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", timeout: 3000 }).trim();
+                if (br && br !== "HEAD") envObj = { ...envObj, branchName: br };
+              } catch {
+                /* ветку не узнали — worktree от ветки по умолчанию */
+              }
+            }
+          }
+        }
         let projectTitle: string | undefined = undefined;
         if (targetProjectId) {
           try {

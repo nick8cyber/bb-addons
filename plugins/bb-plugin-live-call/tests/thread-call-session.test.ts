@@ -356,3 +356,27 @@ describe("Extended отключён (ADR-0006, пересмотр 2)", () => {
     expect(s.mode).not.toBe("extended");
   });
 });
+
+describe("git после создания окружения (git init, 03.11)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("BB помнит isGitRepo=false, но в папке есть .git → мозговой центр в managed-worktree", async () => {
+    const { mkdtempSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "lc-gitinit-"));
+    mkdirSync(join(dir, ".git"));
+    const spawned: Array<Record<string, unknown>> = [];
+    const { s } = makeThreadCall("thr_target_gitinit", { id: "env_test", isGitRepo: false, path: dir }, spawned);
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(spawned).toHaveLength(1);
+    expect(JSON.stringify(spawned[0].environment)).toContain("managed-worktree");
+    expect(s.brain?.canModify).toBe(true);
+    await s.end("owner");
+  });
+});
