@@ -160,6 +160,10 @@ export class CallSession extends EventEmitter {
   }
 
   private async openSessions(handle?: string) {
+    // Прежние сессии закрываются ВСЕГДА: раньше в Extended новый помощник поднимался
+    // поверх старого, а старый оставался открытым у Google, пока тот не закрывал его
+    // по тайм-ауту («1011 Deadline expired», приёмка 03.11) — и держал лимит ключа.
+    this.closeSessions();
     if (this.mode === "normal") {
       this.voice = this.makeVoiceSession(handle);
     } else {
@@ -176,6 +180,21 @@ export class CallSession extends EventEmitter {
       this.voice = this.makeVoiceSession(handle);
       this.router = this.makeRouterSession();
     }
+  }
+
+  /** Закрыть голос и помощника; закрытие заменённой сессии не вызывает переподключение. */
+  private closeSessions() {
+    const voice = this.voice;
+    const router = this.router;
+    this.voice = null;
+    this.router = null;
+    voice?.close();
+    router?.close();
+  }
+
+  /** Сколько сессий Gemini открыто у звонка (для тестов на утечки). */
+  openSessionCount(): number {
+    return (this.voice ? 1 : 0) + (this.router ? 1 : 0);
   }
 
   private makeVoiceSession(handle?: string): LiveClient {
@@ -725,9 +744,12 @@ export class CallSession extends EventEmitter {
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
       const useHandle = handle === undefined ? this.voice?.sessionHandle ?? undefined : handle;
-      this.voice?.close();
+      const old = this.voice;
+      this.voice = null;
+      old?.close();
       try {
-        await this.openSessions(useHandle);
+        // Переподключается только голос; помощник Extended жив и не дублируется.
+        this.voice = this.makeVoiceSession(useHandle);
         this.voice?.sendClientContent(`[СИСТЕМА] Переподключение. Пересказ:\n${this.ledger.handoverSummary()}`, false);
       } catch {
         this.frame({ type: "error", code: "google_unreachable", message: "не удалось переподключиться", retryable: true });
