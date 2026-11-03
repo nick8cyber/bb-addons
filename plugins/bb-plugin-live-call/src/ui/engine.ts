@@ -281,6 +281,8 @@ export class CallEngine {
   }
 
   private endRequested = false;
+  /** Сервер ответил «звонка нет» на возврат (его перезапустили) — начать новый, не роняя владельца. */
+  private restartPending = false;
   private reconnectTries = 0;
   private liveSince = 0;
 
@@ -327,6 +329,12 @@ export class CallEngine {
       // держит звонок 20 с — возвращаемся в тот же звонок, звук и лента не трогаются.
       const lived = Math.round((Date.now() - this.liveSince) / 1000);
       this.diag("ws_closed_live", `code=${ev.code} reason=${ev.reason || "-"} после ${lived} с; попытка ${this.reconnectTries + 1}`);
+      if (this.restartPending && !this.endRequested) {
+        this.restartPending = false;
+        this.patch({ orb: "reconnecting", stateDetail: "сервер перезапустился — новый звонок" });
+        this.openSocket({ mode: this.view.mode });
+        return;
+      }
       if (!this.endRequested && this.view.callId && this.reconnectTries < 5 && ev.code !== 4009) {
         this.reconnectTries += 1;
         this.player?.interrupted();
@@ -441,6 +449,15 @@ export class CallEngine {
     switch (frame.type) {
       case "ready": {
         const resumed = this.view.phase === "live" && this.view.callId === frame.callId;
+        if (this.view.phase === "live" && !resumed) {
+          // Новый звонок вместо потерянного: микрофон и плеер те же, контекст разговора новый.
+          this.reconnectTries = 0;
+          this.liveSince = Date.now();
+          this.patch({ orb: "listening", stateDetail: null, mode: frame.mode, keys: frame.keys, callId: frame.callId, threadId: null });
+          this.push({ kind: "divider", id: this.nextId("d"), text: "сервер перезапустился — новый звонок, прошлый разговор агент не помнит" });
+          if (this.view.muted) this.send({ type: "mute", muted: true });
+          break;
+        }
         this.liveSince = Date.now();
         if (resumed) {
           // Возврат после обрыва: микрофон и плеер уже работают, лента та же.
@@ -547,6 +564,10 @@ export class CallEngine {
         });
         break;
       case "error":
+        if (frame.code === "call_gone" && this.view.phase === "live") {
+          this.restartPending = true;
+          break;
+        }
         if (this.view.phase === "connecting") this.patch({ error: { code: frame.code, message: frame.message } });
         else
           this.push({

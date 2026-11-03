@@ -65,6 +65,11 @@ export class CallStore {
     this.db.prepare("UPDATE calls SET thread_id = ? WHERE id = ?").run(threadId, callId);
   }
 
+  /** Звонки, оставшиеся «идущими» после перезагрузки плагина или сервера, — закрыть. */
+  closeStale(reason = "restart", endedAt = Date.now()): number {
+    return this.db.prepare("UPDATE calls SET ended_at = ?, end_reason = ? WHERE ended_at IS NULL").run(endedAt, reason).changes;
+  }
+
   endCall(callId: string, reason: string, endedAt = Date.now()): void {
     this.db
       .prepare("UPDATE calls SET ended_at = ?, end_reason = ? WHERE id = ?")

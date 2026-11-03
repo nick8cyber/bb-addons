@@ -26,6 +26,7 @@ import { CallStore } from "./src/call-store.js";
 import { EventBridge } from "./src/event-bridge.js";
 import { LiveClient } from "./src/live-client.js";
 import { argsHash } from "./src/confirmation-gate.js";
+import { decideHello } from "./src/reattach.js";
 
 const rpcContract = defineRpcContract({
   status: {
@@ -305,6 +306,22 @@ export default async function plugin(bb: BbPluginApi) {
     return session;
   };
 
+  // Перезагрузка или выключение плагина: идущий звонок закрываем по-честному (журнал,
+  // тред звонка, сессии Gemini), а не бросаем «идущим» навсегда (приёмка 03.11).
+  try {
+    const stale = store.closeStale();
+    if (stale > 0) bb.log.warn(`закрыл ${stale} звонков, оставшихся от прошлого запуска`);
+  } catch (e) {
+    bb.log.warn(`closeStale: ${String(e)}`);
+  }
+  bb.onDispose(async () => {
+    if (!active) return;
+    // Браузеру «ended» не шлём: он переподключится, получит call_gone и сам начнёт
+    // новый звонок — владелец остаётся на линии (приёмка 03.11: reload оборвал звонок).
+    active.link.sock = { send() {}, close() {} } as unknown as Sock;
+    await active.session.end("error").catch(() => {});
+  });
+
   /** Один активный звонок на хост; второе подключение — busy + 4009 (контракт §2). */
   bb.http.experimental_websocket(
     "/call",
@@ -334,24 +351,30 @@ export default async function plugin(bb: BbPluginApi) {
             const frame = parsed.data;
             if (frame.type === "hello") {
               if (state.helloTimer) clearTimeout(state.helloTimer);
-              if (frame.resume) {
-                // Возврат после обрыва: тот же звонок, новые сокет и кадры.
-                if (active && active.detached && active.session.callId === frame.resume) {
-                  if (active.grace) clearTimeout(active.grace);
-                  active.grace = null;
-                  active.detached = false;
-                  active.link.sock = sock;
-                  state.session = active.session;
-                  bb.log.info(`браузер вернулся в звонок ${frame.resume}`);
-                  store.event(frame.resume, "client_log", { event: "reattached" });
-                  active.session.resendReady();
-                } else {
-                  sock.send(JSON.stringify({ type: "error", code: "call_gone", message: "звонок уже завершён", retryable: false } satisfies ServerFrame));
-                  sock.close(BUSY_CLOSE_CODE, "call gone");
-                }
+              const decision = decideHello(
+                active ? { callId: active.session.callId, detached: active.detached } : null,
+                frame.resume,
+              );
+              if (decision === "reattach" && active) {
+                // Возврат после обрыва: тот же звонок, новые сокет и кадры. Так же — после
+                // перезагрузки страницы (WebView на iOS): новый hello без resume подхватывает
+                // ждущий звонок, а не получает busy.
+                if (active.grace) clearTimeout(active.grace);
+                active.grace = null;
+                active.detached = false;
+                active.link.sock = sock;
+                state.session = active.session;
+                bb.log.info(`браузер вернулся в звонок ${active.session.callId}${frame.resume ? "" : " (новая страница)"}`);
+                store.event(active.session.callId, "client_log", { event: "reattached", detail: frame.resume ? "resume" : "new page" });
+                active.session.resendReady();
                 return;
               }
-              if (active) {
+              if (decision === "gone") {
+                sock.send(JSON.stringify({ type: "error", code: "call_gone", message: "звонок уже завершён", retryable: false } satisfies ServerFrame));
+                sock.close(BUSY_CLOSE_CODE, "call gone");
+                return;
+              }
+              if (decision === "busy") {
                 sock.send(JSON.stringify({ type: "error", code: "busy", message: "уже идёт звонок", retryable: false } satisfies ServerFrame));
                 sock.close(BUSY_CLOSE_CODE, "busy");
                 return;
