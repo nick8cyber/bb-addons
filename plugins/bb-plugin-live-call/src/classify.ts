@@ -28,13 +28,36 @@ export const POLITE_WORDS = ["ну", "пожалуйста", "конечно", "
 
 export type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 
+/**
+ * Короткие ответы, которые распознавание Gemini иногда пишет латиницей
+ * («Да.» → «da», приёмка 02.11). Без этого «да» на подтверждение отправки
+ * засчитывалось как шум — отмена. Только целые слова и только ответы.
+ */
+const LATIN_ANSWERS: Record<string, string> = {
+  da: "да",
+  net: "нет",
+  ok: "ок",
+  okay: "окей",
+  okey: "окей",
+  stop: "стоп",
+  otmena: "отмена",
+  davai: "давай",
+  davay: "давай",
+  zapuskay: "запускай",
+  zapuskai: "запускай",
+  zapusti: "запусти",
+  razreshayu: "разрешаю",
+  razreshaju: "разрешаю",
+};
+
 export function normalizeUtterance(text: string): string[] {
   return text
     .toLowerCase()
     .replaceAll("ё", "е")
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .split(/\s+/)
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((w) => LATIN_ANSWERS[w] ?? w);
 }
 
 export function classify(

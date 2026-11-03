@@ -76,6 +76,9 @@ export const realClock: GateClock = {
   clearTimeout: (h) => clearTimeout(h as NodeJS.Timeout),
 };
 
+/** Запас поверх оценки, если playback_drained так и не пришёл. */
+export const DRAINED_LOST_SLACK_MS = 2500;
+
 export class ConfirmationGate {
   private pending: PendingConfirmation | null = null;
   private micOpen = true;
@@ -289,7 +292,23 @@ export class ConfirmationGate {
   tick(): void {
     const p = this.pending;
     if (!p) return;
-    if (p.expiresAt <= this.clock.now()) this.burn(p, "expired");
+    const now = this.clock.now();
+    if (p.expiresAt <= now) {
+      this.burn(p, "expired");
+      return;
+    }
+    // Резерв: playback_drained не пришёл (фон на телефоне, потерянный кадр) — окно
+    // открывается по оценке сервера с запасом (спека §7.1 п. 3.7). Без этого микрофон
+    // оставался закрыт до конца TTL и голосом ответить было нельзя (приёмка 02.11).
+    if (this.windowOpenAt !== null || this.turnAudio.size === 0 || this.lastAudioAt === null) return;
+    const estimate = this.estimateWindowAt();
+    if (estimate === null) return;
+    const quiet = now - this.lastAudioAt >= WINDOW_PADDING_MS;
+    if (quiet && now >= estimate + DRAINED_LOST_SLACK_MS) {
+      this.windowOpenAt = now + WINDOW_PADDING_MS;
+      this.micOpen = true;
+      this.events.onConfirmationUpdate?.(p, "listening");
+    }
   }
 
   /** Драйвер исполнил действие — запись сгорает, id больше не действует. */

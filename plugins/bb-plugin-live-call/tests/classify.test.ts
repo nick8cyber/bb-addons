@@ -92,3 +92,14 @@ describe("неоднозначное и шум", () => {
     expect(classify("привет как дела", "C", words)).toBe("cancelled");
   });
 });
+
+describe("латиница распознавания", () => {
+  it("«da» = «да»: для отправки — approved, для запуска — подсказка, не запуск", () => {
+    expect(classify("da", "C", DEFAULT_WORDS)).toBe("approved");
+    expect(classify("da", "L", DEFAULT_WORDS)).toBe("hint");
+  });
+  it("«net» — отмена, «zapuskay» — запуск", () => {
+    expect(classify("net", "C", DEFAULT_WORDS)).toBe("cancelled");
+    expect(classify("zapuskay", "L", DEFAULT_WORDS)).toBe("approved");
+  });
+});

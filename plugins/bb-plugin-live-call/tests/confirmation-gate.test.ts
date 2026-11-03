@@ -97,8 +97,25 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
     const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
     gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
     gate.onModelAudio(1, 48000, t.now);
-    t.advance(5000);
+    t.advance(3000);
+    gate.tick();
     expect(gate.windowOpen()).toBe(false);
+  });
+
+  it("playback_drained потерян — окно открывается по резервной оценке, «запускай» засчитывается", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    gate.onModelAudio(1, 48000, t.now);
+    // 1 с аудио + 1 с запас оценки + 2,5 с резерв
+    t.advance(4600);
+    gate.tick();
+    t.advance(400);
+    expect(gate.windowOpen()).toBe(true);
+    expect(gate.isMicOpen()).toBe(true);
+    gate.onOwnerTranscriptChunk("запускай", t.now);
+    t.advance(800);
+    expect(gate.pendingConfirmation()?.verdict).toBe("approved");
   });
 
   it("реплика, начатая до открытия окна, не идёт в зачёт даже с хвостом после", () => {
