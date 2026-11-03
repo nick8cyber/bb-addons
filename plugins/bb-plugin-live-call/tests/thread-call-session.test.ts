@@ -32,7 +32,7 @@ class FakeWs {
   }
 }
 
-function makeThreadCall(targetThreadId?: string) {
+function makeThreadCall(targetThreadId?: string, env?: Record<string, unknown>, spawned?: Array<Record<string, unknown>>) {
   const store = new CallStore(new Database(":memory:"));
   const frames: ServerFrame[] = [];
   const fakeSdk = {
@@ -42,7 +42,12 @@ function makeThreadCall(targetThreadId?: string) {
         title: "Оптимизация логики агента",
         projectId: "proj_test",
         status: "idle",
+        ...(env ? { environmentId: "env_test" } : {}),
       }),
+      spawn: async (a: Record<string, unknown>) => {
+        spawned?.push(a);
+        return { id: "thr_brain_spawned" };
+      },
       list: async () => [],
       events: {
         list: async () => [
@@ -54,6 +59,7 @@ function makeThreadCall(targetThreadId?: string) {
     projects: {
       list: async () => [{ id: "proj_test", name: "Тестовый проект" }],
     },
+    environments: { get: async () => env ?? {} },
   };
 
   const s = new CallSession({
@@ -278,3 +284,49 @@ describe("сессия звонка по треду (§12.1, §12.3, §12.5, §1
     }
   });
 });
+
+describe("звонок по треду без мозгового центра (§12.11 п.1, приёмка 03.11)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("не-git тред → мозгового центра нет, голос не ждёт сводку и сразу говорит по сообщениям", async () => {
+    const { s, store } = makeThreadCall("thr_target_nogit");
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(s.brain).toBeNull();
+    expect(store.transcript("call_tc").some((e) => e.kind === "brain_skipped")).toBe(true);
+    const ws = FakeWs.all[0];
+    ws.fire("message", { data: JSON.stringify({ setupComplete: {} }) });
+    await vi.advanceTimersByTimeAsync(10);
+    const greet = ws.sent.filter((x) => x.includes('"clientContent"')).join("\n");
+    expect(greet).toContain("Мозговой центр недоступен");
+    expect(greet).not.toContain("обрабатываю информацию");
+    await s.end("owner");
+  });
+});
+
+describe("мозговой центр: признак git берётся из окружения треда (приёмка 03.11)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("тред в git-окружении → мозговой центр запускается в managed-worktree от ветки треда", async () => {
+    const spawned: Array<Record<string, unknown>> = [];
+    const { s } = makeThreadCall("thr_target_git", { id: "env_test", isGitRepo: true, branchName: "feat/x", hostId: "host_1" }, spawned);
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(spawned).toHaveLength(1);
+    const env = JSON.stringify(spawned[0].environment);
+    expect(env).toContain("managed-worktree");
+    expect(env).toContain("feat/x");
+    expect(env).not.toContain("project-default");
+    expect(s.brain?.canModify).toBe(true);
+    await s.end("owner");
+  });
+});
+

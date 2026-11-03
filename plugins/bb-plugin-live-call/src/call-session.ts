@@ -205,6 +205,17 @@ export class CallSession extends EventEmitter {
         const t = (raw && typeof raw === "object" && "thread" in raw && raw.thread ? raw.thread : raw) as Record<string, unknown>;
         envObj = (raw && typeof raw === "object" && "environment" in raw && raw.environment ? raw.environment : {}) as Record<string, unknown>;
         targetProjectId = String(t?.projectId ?? envObj?.projectId ?? "");
+        // Тред хранит только environmentId; isGitRepo / branchName / hostId — в самом окружении (§12.11 п.1, приёмка 03.11).
+        const envId = t?.environmentId ? String(t.environmentId) : "";
+        if (envId && envObj.isGitRepo === undefined) {
+          try {
+            const er = (await (this.deps.sdk as unknown as { environments: { get(a: { environmentId: string }): Promise<unknown> } }).environments.get({ environmentId: envId })) as Record<string, unknown>;
+            const e = (er && typeof er === "object" && "environment" in er && er.environment ? er.environment : er) as Record<string, unknown>;
+            if (e && typeof e === "object") envObj = { ...e, ...envObj };
+          } catch {
+            /* окружение недоступно — мозговой центр не получит worktree и не запустится */
+          }
+        }
         let projectTitle: string | undefined = undefined;
         if (targetProjectId) {
           try {
@@ -286,7 +297,18 @@ export class CallSession extends EventEmitter {
         );
       };
 
-      void this.brain.start();
+      void this.brain.start().then((id) => {
+        if (id) return;
+        // Мозговой центр не запустился (не-git проект или worktree не создался, §12.11 п.1):
+        // инструменты получают brain=null, голос не ждёт сводку и работает по сообщениям треда.
+        this.brain = null;
+        if (this.greeted) {
+          this.voice?.sendClientContent(
+            "[СИСТЕМА] Мозговой центр в этом звонке недоступен. Скажи владельцу об этом одной фразой и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.",
+            true,
+          );
+        }
+      });
     } else {
       this.deps.store.startCall(this.deps.callId);
     }
@@ -481,7 +503,11 @@ export class CallSession extends EventEmitter {
       this.greeted = true;
       if (this.targetThreadId) {
         // §12.11 п. 3: Голос сразу представляется: «Привет, сейчас обрабатываю информацию по треду».
-        client.sendClientContent("Система: звонок начат. Скажи: «Привет, сейчас обрабатываю информацию по треду». Больше ничего не добавляй.", true);
+        if (this.brain) {
+          client.sendClientContent("Система: звонок начат. Скажи: «Привет, сейчас обрабатываю информацию по треду». Больше ничего не добавляй.", true);
+        } else {
+          client.sendClientContent("Система: звонок начат. Мозговой центр недоступен. Скажи «Привет» и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.", true);
+        }
       } else {
         // Модель молчит до первого слова владельца: любая просьба «поздоровайся»
         // приводила к тому, что она сама запускала обзор поверх владельца (02.11).
