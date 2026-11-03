@@ -80,6 +80,11 @@ section:has(> header[data-queued-messages-mode="collapsed"]) > [data-queued-mess
 }
 [data-bb-activity-header] button:hover { background: var(--accent); }
 [data-bb-activity-header] button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+[data-bb-activity-card] div[aria-label] { flex-wrap: wrap; }
+[data-bb-activity-card] [title] {
+  white-space: normal !important; overflow: visible !important;
+  text-overflow: clip !important; overflow-wrap: anywhere;
+}
 @media (max-width: 767px), (pointer: coarse) {
   [data-bb-git-header] button, [data-bb-activity-header] button { height: 44px; min-width: 44px; }
   [data-bb-activity-label] { display: none; }
