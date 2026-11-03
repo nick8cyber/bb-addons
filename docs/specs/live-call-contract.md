@@ -249,3 +249,18 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 ## Память голосового агента (03.11)
 
 `remember` (класс C) пишет в собственную память звонков — таблица `voice_memory` в хранилище плагина. Глобальную и проектную память BB голосовой агент не меняет: её получают все агенты. Записи памяти звонков (до 40 последних) входят в системную инструкцию каждого звонка вместе с проектами владельца и списком умений.
+
+## 11. Журнал звонка и отладка (03.11)
+
+| Событие | Когда |
+|---|---|
+| `owner_line` / `agent_line` | реплика законченная |
+| `action` / `confirm` / `verdict` | инструмент, подтверждение, вердикт |
+| `system_batch` | результат помощника поставлен в очередь |
+| `system_injected { waited }` | вставка реально ушла в голос; `waited=true` — ждала конца хода |
+| `mode_switch { to, source, msSinceStart }` / `client_log switch_mode_ui` | смена режима и её источник |
+| `client_log` | браузер: `audio_ready`, `mic_silent`, `mic_error`, `ws_closed_live`, `ws_open_timeout`, `detached`, `reattached` |
+
+CLI: `bb call tool <имя> [json]` — выполнить инструмент чтения вне звонка (классы C/P/L отклоняются).
+
+Системные инструкции (§8) теперь собираются из `PromptContext` на старте звонка — `src/prompt.ts`, ADR-0008.

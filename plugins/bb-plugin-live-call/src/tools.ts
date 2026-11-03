@@ -613,7 +613,7 @@ export const TOOLS: ToolDef[] = [
     name: "search_memory",
     cls: "R",
     word: "",
-    description: "Поиск по памяти BB. До 5 записей.",
+    description: "Поиск по ОБЩЕЙ базе знаний BB (память и заметки всех агентов) по конкретному вопросу. НЕ твоя память звонков — её ты уже знаешь из инструкции. До 5 записей.",
     parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     async execute(args, ctx) {
       return memoryCli(ctx, ["search", String(args.query)]);
@@ -1189,7 +1189,7 @@ function threadTitleOf(data: unknown): string | undefined {
 const HUMAN: Record<string, string> = {
   bb_overview: "обзор BB по проектам", list_threads: "список тредов проекта", read_thread: "прочитать тред",
   list_pending: "что ждёт ответа владельца", watch_thread: "следить за тредом и доложить", thread_updates: "что нового в треде",
-  list_tasks: "задачи трекера", read_task: "прочитать задачу", search_memory: "поиск в памяти и базе знаний BB",
+  list_tasks: "задачи трекера", read_task: "прочитать задачу", search_memory: "поиск в общей базе знаний BB (не моя память звонков)",
   system_health: "состояние системы", pr_status: "статус PR", provider_status: "состояние провайдеров моделей",
   plugin_status: "состояние плагинов", skills_list: "список навыков", prompt_history: "история запросов",
   project_branches: "ветки проекта", search_all: "поиск по тредам и сообщениям", switch_mode: "сменить режим звонка",

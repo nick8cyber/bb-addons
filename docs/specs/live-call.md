@@ -398,3 +398,15 @@ bb-addons/plugins/bb-plugin-live-call/
 - [Live API — session management](https://ai.google.dev/gemini-api/docs/live-api/session-management)
 - [Ephemeral tokens](https://ai.google.dev/gemini-api/docs/ephemeral-tokens)
 - [Live API reference](https://ai.google.dev/api/live)
+
+## 13. Устройство агента в звонке (03.11)
+
+Решения по живым звонкам — в [ADR-0008](../adr/0008-live-call-voice-agent-runtime.md):
+- своя память звонков (`voice_memory`), а не общая память BB;
+- системная инструкция собирается на старте: проекты, умения, память, состояния тредов, стиль «по названию, без id»;
+- вставки в голос — только между ходами (`injectWhenQuiet`);
+- сессии Gemini не утекают;
+- звонок переживает обрыв WebSocket, перезагрузку страницы и перезагрузку плагина;
+- диагностика в журнале звонка, `bb call tool`.
+
+Режимы — Extended (по умолчанию) и «Быстрый», [ADR-0006](../adr/0006-live-call-extended-router.md), пересмотр 03.11.
