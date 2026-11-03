@@ -292,21 +292,31 @@ describe("звонок по треду без мозгового центра (�
   });
   afterEach(() => vi.useRealTimers());
 
-  it("не-git тред → мозгового центра нет, голос не ждёт сводку и сразу говорит по сообщениям", async () => {
-    const { s, store } = makeThreadCall("thr_target_nogit");
+  it("не-git тред → мозговой центр в отдельной папке: голос ждёт сводку, изменения недоступны", async () => {
+    const spawned: Array<Record<string, unknown>> = [];
+    const { s } = makeThreadCall("thr_target_nogit", { id: "env_test", isGitRepo: false }, spawned);
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(spawned).toHaveLength(1);
+    expect(JSON.stringify(spawned[0].environment)).toContain('"personal"');
+    expect(s.brain?.canModify).toBe(false);
+    const instr = JSON.parse(FakeWs.all[0].sent[0]).setup.systemInstruction.parts[0].text as string;
+    expect(instr).toContain("обрабатываю информацию");
+    await s.end("owner");
+  });
+
+  it("мозговой центр не запустился (ошибка spawn) → голос не ждёт сводку", async () => {
+    const { s, store } = makeThreadCall("thr_target_fail");
+    (s as unknown as { deps: { sdk: { threads: { spawn: unknown } } } }).deps.sdk.threads.spawn = async () => { throw new Error("spawn failed"); };
     await s.start();
     await vi.advanceTimersByTimeAsync(10);
     expect(s.brain).toBeNull();
-    expect(store.transcript("call_tc").some((e) => e.kind === "brain_skipped")).toBe(true);
+    expect(store.transcript("call_tc").some((e) => e.kind === "brain_failed")).toBe(true);
     const ws = FakeWs.all[0];
-    const instr = JSON.parse(ws.sent[0]).setup.systemInstruction.parts[0].text as string;
-    expect(instr).not.toContain("обрабатываю информацию");
-    expect(instr).toContain("Мозгового центра и сводки в этом звонке нет");
     ws.fire("message", { data: JSON.stringify({ setupComplete: {} }) });
     await vi.advanceTimersByTimeAsync(10);
     const greet = ws.sent.filter((x) => x.includes('"clientContent"')).join("\n");
     expect(greet).toContain("Мозговой центр недоступен");
-    expect(greet).not.toContain("обрабатываю информацию");
     await s.end("owner");
   });
 });

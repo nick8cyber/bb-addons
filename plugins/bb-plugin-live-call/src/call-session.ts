@@ -272,7 +272,7 @@ export class CallSession extends EventEmitter {
         chars: formatted.chars,
       });
 
-      this.brainExpected = Boolean(envObj.isGitRepo);
+      this.brainExpected = true; // и в не-git проекте — в отдельной пустой папке (03.11)
       this.brain = new BrainCenter({
         sdk: this.deps.sdk,
         store: this.deps.store,

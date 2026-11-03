@@ -43,12 +43,9 @@ export class BrainCenter {
   constructor(private opts: BrainCenterOptions) {}
 
   async start(): Promise<string | null> {
-    // Не-git проект: отдельного worktree быть не может, а общая папка проекта запрещена (§12.11 п.1) —
-    // мозговой центр не запускается, голос работает по 10+20 сообщениям.
-    if (!this.opts.isGitRepo) {
-      this.opts.store.event(this.opts.callId, "brain_skipped", { reason: "not_git" });
-      return null;
-    }
+    // Не-git проект: worktree быть не может, общая папка проекта запрещена (§12.11 п.1).
+    // Мозговой центр идёт в отдельную пустую папку (workspace personal): сводка и вопросы работают
+    // по файлу переписки, изменений проекта нет (canModify=false). Решение владельца 03.11.
     this.startedAt = Date.now();
     try {
       mkdirSync(this.opts.storageDir, { recursive: true });
@@ -70,7 +67,7 @@ ${historyFile}
 5. Открытые вопросы.
 
 Отвечай предельно ёмко, естественно и технически точно, без списков и markdown-разметки (твой ответ будет сразу пересказан голосом).
-После составления сводки жди следующих вопросов.${this.opts.isGitRepo ? "" : "\n\nВАЖНО: ты работаешь в общей папке проекта без отдельной копии репозитория. Файлы НЕ изменяй, команды с записью НЕ выполняй — только читай и отвечай."}`;
+После составления сводки жди следующих вопросов.${this.opts.isGitRepo ? "" : "\n\nВАЖНО: ты работаешь в отдельной пустой папке, файлов проекта здесь нет — только переписка треда в файле выше. Изменения проекта недоступны: файлы проекта не ищи и не трогай, только анализируй переписку и отвечай."}`;
 
       const environment = this.opts.isGitRepo
         ? {
@@ -83,7 +80,11 @@ ${historyFile}
                 : { kind: "default" as const },
             },
           }
-        : { type: "project-default" as const };
+        : {
+            type: "host" as const,
+            ...(this.opts.targetHostId ? { hostId: this.opts.targetHostId } : {}),
+            workspace: { type: "personal" as const },
+          };
 
       let spawned: { id: string };
       try {

@@ -201,14 +201,20 @@ describe("BrainCenter — изоляция (§12.11 п.1, приёмка 03.11)"
     expect(b.canModify).toBe(false);
   });
 
-  it("не-git проект → мозговой центр не запускается (общая папка проекта запрещена)", async () => {
-    const spawn = vi.fn(async () => ({ id: "thr_brain_never" }));
-    const b = mk(spawn, false);
-    expect(await b.start()).toBeNull();
-    expect(spawn).not.toHaveBeenCalled();
+  it("не-git проект → мозговой центр в отдельной пустой папке (personal), без права изменений", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    let prompt = "";
+    const b = mk(async (a) => { calls.push(a); prompt = String(a.prompt); return { id: "thr_brain_personal" }; }, false);
+    expect(await b.start()).toBe("thr_brain_personal");
+    const env = JSON.stringify(calls[0].environment);
+    expect(env).toContain('"personal"');
+    expect(env).not.toContain("project-default");
+    expect(env).not.toContain("managed-worktree");
     expect(b.canModify).toBe(false);
+    expect(prompt).toContain("файлов проекта здесь нет");
     const r = await b.task("создай файл", async () => false);
     expect(r.ok).toBe(false);
+    expect(JSON.stringify(r)).toContain("changes_unavailable");
   });
 
   it("git-проект и worktree создан → изменения разрешены", async () => {
