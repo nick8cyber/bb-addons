@@ -292,13 +292,14 @@ describe("звонок по треду без мозгового центра (�
   });
   afterEach(() => vi.useRealTimers());
 
-  it("не-git тред → мозговой центр в отдельной папке: голос ждёт сводку, изменения недоступны", async () => {
+  it("не-git тред → мозговой центр в проекте «Звонки»: голос ждёт сводку, изменения недоступны", async () => {
     const spawned: Array<Record<string, unknown>> = [];
     const { s } = makeThreadCall("thr_target_nogit", { id: "env_test", isGitRepo: false }, spawned);
+    (s as unknown as { deps: { callsProjectId?: string } }).deps.callsProjectId = "proj_calls_test";
     await s.start();
     await vi.advanceTimersByTimeAsync(10);
     expect(spawned).toHaveLength(1);
-    expect(JSON.stringify(spawned[0].environment)).toContain('"personal"');
+    expect(spawned[0].projectId).toBe("proj_calls_test");
     expect(s.brain?.canModify).toBe(false);
     const instr = JSON.parse(FakeWs.all[0].sent[0]).setup.systemInstruction.parts[0].text as string;
     expect(instr).toContain("обрабатываю информацию");

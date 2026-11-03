@@ -54,6 +54,8 @@ export interface CallSessionDeps {
   wsFactory?: (url: string) => WebSocket;
   targetThreadId?: string;
   storageDir?: string;
+  /** Проект «Звонки» — сюда идёт мозговой центр для не-git треда (служебная папка плагина). */
+  callsProjectId?: string;
   log?: { info(s: string): void; warn(s: string): void; error(s: string): void };
 }
 
@@ -283,6 +285,7 @@ export class CallSession extends EventEmitter {
         targetHostId: envObj.hostId ? String(envObj.hostId) : undefined,
         targetBranchName: envObj.branchName ? String(envObj.branchName) : undefined,
         isGitRepo: Boolean(envObj.isGitRepo),
+        fallbackProjectId: this.deps.callsProjectId,
         allMessages: this.threadMessages,
         storageDir: this.deps.storageDir ?? join(tmpdir(), "bb-live-call-brain"),
         log: this.deps.log,

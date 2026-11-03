@@ -19,6 +19,8 @@ export interface BrainCenterOptions {
   targetThreadTitle: string;
   targetProjectId: string;
   targetHostId?: string;
+  /** Проект «Звонки»: сюда идёт мозговой центр, если тред не в git (BB не даёт пустую папку вне личного проекта). */
+  fallbackProjectId?: string;
   targetBranchName?: string;
   isGitRepo?: boolean;
   allMessages: ThreadMessage[];
@@ -43,8 +45,12 @@ export class BrainCenter {
   constructor(private opts: BrainCenterOptions) {}
 
   async start(): Promise<string | null> {
+    if (!this.opts.isGitRepo && !this.opts.fallbackProjectId) {
+      this.opts.store.event(this.opts.callId, "brain_failed", { error: "не-git тред, проект «Звонки» не задан" });
+      return null;
+    }
     // Не-git проект: worktree быть не может, общая папка проекта запрещена (§12.11 п.1).
-    // Мозговой центр идёт в отдельную пустую папку (workspace personal): сводка и вопросы работают
+    // Мозговой центр идёт в служебный проект «Звонки» (его папка, не папка проекта треда): сводка и вопросы работают
     // по файлу переписки, изменений проекта нет (canModify=false). Решение владельца 03.11.
     this.startedAt = Date.now();
     try {
@@ -67,7 +73,7 @@ ${historyFile}
 5. Открытые вопросы.
 
 Отвечай предельно ёмко, естественно и технически точно, без списков и markdown-разметки (твой ответ будет сразу пересказан голосом).
-После составления сводки жди следующих вопросов.${this.opts.isGitRepo ? "" : "\n\nВАЖНО: ты работаешь в отдельной пустой папке, файлов проекта здесь нет — только переписка треда в файле выше. Изменения проекта недоступны: файлы проекта не ищи и не трогай, только анализируй переписку и отвечай."}`;
+После составления сводки жди следующих вопросов.${this.opts.isGitRepo ? "" : "\n\nВАЖНО: ты работаешь в служебной папке звонков, файлов проекта треда здесь нет — только переписка треда в файле выше. Изменения проекта недоступны: файлы проекта не ищи и не трогай, только анализируй переписку и отвечай."}`;
 
       const environment = this.opts.isGitRepo
         ? {
@@ -80,16 +86,13 @@ ${historyFile}
                 : { kind: "default" as const },
             },
           }
-        : {
-            type: "host" as const,
-            ...(this.opts.targetHostId ? { hostId: this.opts.targetHostId } : {}),
-            workspace: { type: "personal" as const },
-          };
+        : { type: "project-default" as const };
 
       let spawned: { id: string };
       try {
         spawned = (await this.opts.sdk.threads.spawn({
-          projectId: this.opts.targetProjectId,
+          // не-git: служебный проект «Звонки» (его папка не связана с проектом треда)
+          projectId: this.opts.isGitRepo ? this.opts.targetProjectId : this.opts.fallbackProjectId,
           providerId: "agy",
           model: "gemini-3.8-flash-medium",
           visibility: "hidden",

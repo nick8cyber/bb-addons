@@ -241,6 +241,7 @@ export default async function plugin(bb: BbPluginApi) {
       mode,
       routerInput: str(cfg.routerInput, "text") === "audio" ? "audio" : "text",
       maxCallMinutes: Math.min(120, Math.max(5, num(cfg.maxCallMinutes, 60))),
+      callsProjectId: str(cfg.callsProjectId, "") || undefined,
       store,
       sdk: bb.sdk,
       targetThreadId,
