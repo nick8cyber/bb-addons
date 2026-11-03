@@ -31,8 +31,10 @@ export interface GroupingInput<T extends GroupingThread = GroupingThread> {
   limit: number;
   /** Не скрывать треды, которые ждут пользователя. */
   keepAttention: boolean;
-  /** Ключи групп, где пользователь нажал «Show more». */
-  expandedGroupKeys: ReadonlySet<string>;
+  /** Непрочитанные ветки выше прочитанных; закреплённые всегда первыми. */
+  unreadFirst?: boolean;
+  /** Бюджеты обычных корней в раскрытых группах. */
+  groupBudgets: ReadonlyMap<string, number>;
   /** projectId проектов, свёрнутых целиком. */
   foldedProjectIds: ReadonlySet<string>;
 }
@@ -59,6 +61,9 @@ export interface GroupingGroup<T extends GroupingThread = GroupingThread> {
   rootCount: number;
   /** Сколько корневых тредов сейчас скрыто лимитом (0, если ничего). */
   hiddenCount: number;
+  budget: number;
+  ordinaryCount: number;
+  shownCount: number;
 }
 
 const ATTENTION_INDICATORS = new Set(["waiting-for-input", "unread-error"]);
@@ -66,7 +71,7 @@ const ATTENTION_INDICATORS = new Set(["waiting-for-input", "unread-error"]);
 export function groupSidebarThreads<T extends GroupingThread>(
   input: GroupingInput<T>,
 ): readonly GroupingGroup<T>[] {
-  const { threads, projects, activeThreadId, limit, keepAttention, expandedGroupKeys, foldedProjectIds } = input;
+  const { threads, projects, activeThreadId, limit, keepAttention, unreadFirst = false, groupBudgets, foldedProjectIds } = input;
 
   if (threads.length === 0) {
     return [];
@@ -158,11 +163,13 @@ export function groupSidebarThreads<T extends GroupingThread>(
   // forced if: pinned, own subtree contains activeThreadId, or
   // keepAttention && any self/descendant has pending interaction or attention indicator.
   const forcedVisible = new Set<string>();
+  const unreadRoots = new Set<string>();
 
   // Walk each root's subtree (cycle-safe via visited ids).
   const visitRoot = (root: T) => {
     let attention = root.hasPendingInteraction || ATTENTION_INDICATORS.has(root.indicator);
     let containsActive = root.id === activeThreadId;
+    let hasUnread = root.isUnread;
 
     const stack = [root.id];
     const visited = new Set<string>([root.id]);
@@ -174,6 +181,9 @@ export function groupSidebarThreads<T extends GroupingThread>(
       }
       if (curThread.id === activeThreadId) {
         containsActive = true;
+      }
+      if (curThread.isUnread) {
+        hasUnread = true;
       }
       if (curThread.hasPendingInteraction || ATTENTION_INDICATORS.has(curThread.indicator)) {
         attention = true;
@@ -195,6 +205,9 @@ export function groupSidebarThreads<T extends GroupingThread>(
     }
     if (forced) {
       forcedVisible.add(root.id);
+    }
+    if (hasUnread) {
+      unreadRoots.add(root.id);
     }
   };
 
@@ -221,7 +234,7 @@ export function groupSidebarThreads<T extends GroupingThread>(
 
   // Sort roots within each project (rule 4): pinned first, then by max(latestAttentionAt, updatedAt) desc, id asc.
   for (const list of rootsByProject.values()) {
-    list.sort((a, b) => compareRoots(a, b));
+    list.sort((a, b) => compareRoots(a, b, unreadFirst ? unreadRoots : undefined));
   }
 
   // Determine group order.
@@ -249,15 +262,18 @@ export function groupSidebarThreads<T extends GroupingThread>(
     const isPersonal = meta ? meta.isPersonal : false;
     const key = `project:${pid}`;
     const isFolded = foldedProjectIds.has(pid);
-    const isExpanded = expandedGroupKeys.has(key);
+    const budget = limit === 0 ? 0 : Math.max(limit, groupBudgets.get(key) ?? limit);
+    const isExpanded = limit > 0 && budget > limit;
 
     const rootCount = projRoots.length;
+    const ordinaryCount = projRoots.filter(root => !forcedVisible.has(root.id)).length;
+    const shownCount = limit === 0 ? rootCount : Math.min(budget, ordinaryCount) + rootCount - ordinaryCount;
 
     let rows: GroupingRow<T>[] = [];
     let hiddenCount = 0;
 
     if (!isFolded) {
-      if (isExpanded || limit <= 0) {
+      if (limit <= 0) {
         // all roots shown
         rows = flattenRoots(projRoots, children, byId);
         hiddenCount = 0;
@@ -268,7 +284,7 @@ export function groupSidebarThreads<T extends GroupingThread>(
         const orderedShown: T[] = [];
         for (const r of projRoots) {
           const forced = forcedVisible.has(r.id);
-          if (count < limit || forced) {
+          if (count < budget || forced) {
             shown.set(r.id, r);
             orderedShown.push(r);
             if (!forced) {
@@ -291,15 +307,21 @@ export function groupSidebarThreads<T extends GroupingThread>(
       rows,
       rootCount,
       hiddenCount,
+      budget,
+      ordinaryCount,
+      shownCount,
     });
   }
 
   return groups;
 }
 
-function compareRoots<T extends GroupingThread>(a: T, b: T): number {
+function compareRoots<T extends GroupingThread>(a: T, b: T, unreadRoots?: ReadonlySet<string>): number {
   if (a.isPinned !== b.isPinned) {
     return a.isPinned ? -1 : 1;
+  }
+  if (unreadRoots?.has(a.id) !== unreadRoots?.has(b.id)) {
+    return unreadRoots?.has(a.id) ? -1 : 1;
   }
   const am = Math.max(a.latestAttentionAt, a.updatedAt);
   const bm = Math.max(b.latestAttentionAt, b.updatedAt);

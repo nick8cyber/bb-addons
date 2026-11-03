@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   definePluginApp,
   experimental_useSidebarThreadActions,
@@ -10,6 +10,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type {
+  PluginAppBuilder,
   PluginSidebarProject,
   PluginSidebarThread,
   PluginSidebarThreadActions,
@@ -32,6 +33,10 @@ import { Icon } from "./components/ui/icon";
 import type { IconName } from "./components/ui/icon";
 import { Input } from "./components/ui/input";
 import { cn } from "./lib/utils";
+import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib/pagination";
+import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridgeValue } from "./lib/navigation-rail";
+import { mountSidebarControls } from "./lib/sidebar-controls";
+import { bindGitHeader, type GitHeaderSnapshot } from "./lib/git-header";
 import {
   groupSidebarThreads,
   threadDisplayTitle,
@@ -156,6 +161,15 @@ function threadLinkHref(
   return new URL(path, window.location.origin).toString();
 }
 
+async function copyThreadLink(thread: PluginSidebarThread, projects: readonly PluginSidebarProject[]) {
+  try {
+    await navigator.clipboard.writeText(threadLinkHref(thread, projects));
+    toast.success("Thread link copied");
+  } catch {
+    toast.error("Failed to copy thread link");
+  }
+}
+
 function ThreadMenuItems({
   menuType,
   thread,
@@ -193,10 +207,7 @@ function ThreadMenuItems({
       label: "Copy thread link",
       icon: "Copy" as const,
       onSelect: () => {
-        navigator.clipboard
-          .writeText(threadLinkHref(thread, projects))
-          .then(() => toast.success("Thread link copied"))
-          .catch(() => toast.error("Failed to copy thread link"));
+        void copyThreadLink(thread, projects);
       },
     },
     {
@@ -274,12 +285,11 @@ function ThreadMenuItems({
   );
 }
 
-/** bb's own rows keep quick actions hidden until the row is hovered or
- *  focused, and always visible on touch. */
-function hoverActionClassName(isCompactViewport: boolean): string {
+/** Keep quick controls discoverable, including desktop-like PWA viewports. */
+function rowActionClassName(isCompactViewport: boolean): string {
   return cn(
-    "flex size-5 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-focus-within/row:opacity-100 group-hover/row:opacity-100 data-[state=open]:opacity-100",
-    isCompactViewport ? "opacity-100" : "opacity-0",
+    "flex shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring",
+    isCompactViewport ? "size-7" : "size-6",
   );
 }
 
@@ -312,7 +322,8 @@ function ThreadRow({
   const isActive = thread.id === activeThreadId;
 
   const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
-    if (isRenaming) return;
+    // React portals bubble menu clicks through the row despite living outside its DOM.
+    if (isRenaming || !e.currentTarget.contains(e.target as Node)) return;
     const isSplit = (e.metaKey || e.ctrlKey) && isAvailable;
     if (isSplit) {
       e.preventDefault();
@@ -325,7 +336,8 @@ function ThreadRow({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLAnchorElement>) => {
-    if (isRenaming) return;
+    // Enter on a nested action belongs to that button, not to opening the row.
+    if (e.target !== e.currentTarget || isRenaming) return;
     if (e.key === "Enter") {
       const isSplit = (e.metaKey || e.ctrlKey) && isAvailable;
       if (isSplit) {
@@ -409,21 +421,12 @@ function ThreadRow({
           ) : null}
 
           {!isRenaming ? (
-            <button
-              type="button"
-              aria-label={`Archive ${displayTitle}`}
-              title="Archive"
-              className={hoverActionClassName(isCompactViewport)}
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                actions.archive(thread.id);
-              }}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-              }}
-            >
-              <Icon name="Archive" className="size-3.5" />
+            <button type="button" data-bb-sidebar-row-action="copy"
+              aria-label={`Скопировать ссылку — ${displayTitle}`} title="Скопировать ссылку"
+              className={rowActionClassName(isCompactViewport)}
+              onClick={e => { e.preventDefault(); e.stopPropagation(); void copyThreadLink(thread, projects); }}
+              onPointerDown={e => e.stopPropagation()}>
+              <Icon name="Copy" className="size-3.5" />
             </button>
           ) : null}
 
@@ -432,10 +435,11 @@ function ThreadRow({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
+                  data-bb-sidebar-row-action="menu"
                   aria-label="Thread actions"
-                  className={hoverActionClassName(isCompactViewport)}
+                  className={rowActionClassName(isCompactViewport)}
                   onClick={(e) => {
-                    e.preventDefault();
+                    // MobileTrigger opens on click only while default is not prevented.
                     e.stopPropagation();
                   }}
                   onPointerDown={(e) => {
@@ -473,6 +477,58 @@ function ThreadRow({
   );
 }
 
+function PaginationControls({
+  group, base, onBudget, focusFold,
+}: {
+  group: GroupingGroup<PluginSidebarThread>;
+  base: number;
+  onBudget: (budget: number) => void;
+  focusFold: () => void;
+}) {
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const lessRef = useRef<HTMLButtonElement>(null);
+  const pressedRef = useRef<HTMLButtonElement | null>(null);
+  const steps = pageSteps(base, group.budget, group.ordinaryCount);
+  useLayoutEffect(() => {
+    const pressed = pressedRef.current;
+    pressedRef.current = null;
+    if (pressed && !pressed.isConnected) {
+      const target = moreRef.current ?? lessRef.current;
+      if (target) target.focus({ preventScroll: true });
+      else focusFold();
+    }
+  });
+  const change = (button: HTMLButtonElement, budget: number) => {
+    pressedRef.current = document.activeElement === button ? button : null;
+    onBudget(budget);
+  };
+  if (base === 0 || (steps.more === 0 && !steps.canLess)) return null;
+  const buttonClass = "flex h-7 shrink-0 cursor-pointer items-center gap-1 rounded-md px-1 text-[11px] text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring";
+  return (
+    <div data-sidebar-pagination={group.projectId} className="flex min-w-0 items-center justify-between gap-1 pl-1">
+      {steps.more > 0 ? (
+        <button key="more" ref={moreRef} type="button" aria-expanded={group.isExpanded}
+          aria-label={`Ещё ${steps.more} — ${group.projectName}`}
+          onClick={event => change(event.currentTarget, steps.next)} className={buttonClass}>
+          <Icon name="Plus" aria-hidden className="size-3" />
+          <span>Ещё {steps.more}</span>
+        </button>
+      ) : <span key="more-placeholder" />}
+      <span data-pagination-count className="min-w-0 whitespace-nowrap text-[10px] tabular-nums text-sidebar-foreground/50">
+        {group.shownCount} из {group.rootCount}
+      </span>
+      {steps.canLess ? (
+        <button key="less" ref={lessRef} type="button" aria-expanded={group.isExpanded}
+          aria-label={`Меньше — ${group.projectName}`}
+          onClick={event => change(event.currentTarget, steps.previous)} className={buttonClass}>
+          <Icon name="Minus" aria-hidden className="size-3" />
+          <span>Меньше</span>
+        </button>
+      ) : <span key="less-placeholder" />}
+    </div>
+  );
+}
+
 function CollapsedThreadList({
   activeThreadId,
   isCompactViewport,
@@ -490,12 +546,14 @@ function CollapsedThreadList({
       ? Math.floor(raw)
       : 5;
   const keepAttention = values?.keepAttention !== false;
+  const unreadFirst = values?.unreadFirst === true;
   const showBranchName = values?.showBranchName === true;
   const showThreadCount = values?.showThreadCount === true;
 
-  const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
+  const [pageState, setPageState] = useState(() => createPageState(limit));
+  const pages = reconcilePages(pageState, limit, projects.map(project => project.id), status === "ready");
+  if (pages !== pageState) setPageState(pages);
+  const foldButtons = useRef(new Map<string, HTMLButtonElement>());
   const [foldedProjectIds, setFoldedProjectIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -503,6 +561,14 @@ function CollapsedThreadList({
   // Project drag-and-drop: the frontend sidebar API has no reorder action, so
   // the move goes to this plugin's backend, which owns `bb.sdk.projects`.
   const rpc = useRpc<typeof rpcContract>();
+  const fallback = () => typeof Original === "function" ? <Original /> : (
+    <div role="status" className="space-y-2 px-3 py-2 text-xs text-muted-foreground">
+      <p>Штатный список BB выбирается отдельно от списка плагина.</p>
+      <button type="button" className="cursor-pointer underline" onClick={() => {
+        void rpc.call("show_native_list", {}).catch(() => toast.error("Не удалось переключить список BB. Попробуйте ещё раз."));
+      }}>Показать штатный список BB</button>
+    </div>
+  );
   const [draggingProjectId, setDraggingProjectId] = useState<string | null>(
     null,
   );
@@ -539,7 +605,8 @@ function CollapsedThreadList({
         activeThreadId,
         limit,
         keepAttention,
-        expandedGroupKeys,
+        unreadFirst,
+        groupBudgets: pages.budgets,
         foldedProjectIds,
       }),
     [
@@ -548,7 +615,8 @@ function CollapsedThreadList({
       activeThreadId,
       limit,
       keepAttention,
-      expandedGroupKeys,
+      unreadFirst,
+      pages.budgets,
       foldedProjectIds,
     ],
   );
@@ -565,20 +633,8 @@ function CollapsedThreadList({
     });
   };
 
-  const toggleExpand = (groupKey: string) => {
-    setExpandedGroupKeys((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) {
-        next.delete(groupKey);
-      } else {
-        next.add(groupKey);
-      }
-      return next;
-    });
-  };
-
   if (values?.useCollapsedList === false) {
-    return <Original />;
+    return fallback();
   }
 
   if (status === "loading") {
@@ -590,7 +646,7 @@ function CollapsedThreadList({
   }
 
   if (status === "error") {
-    return <Original />;
+    return fallback();
   }
 
   if (groups.length === 0) {
@@ -604,7 +660,7 @@ function CollapsedThreadList({
   return (
     <div className="flex flex-col gap-3 p-1">
       {groups.map((group: GroupingGroup<PluginSidebarThread>) => (
-        <div key={group.key} className="flex flex-col gap-0.5">
+        <div key={group.key} data-sidebar-project={group.projectId} className="flex flex-col gap-0.5">
           <div
             draggable
             onDragStart={(e) => {
@@ -660,6 +716,10 @@ function CollapsedThreadList({
             <button
               type="button"
               aria-expanded={!group.isFolded}
+              ref={button => {
+                if (button) foldButtons.current.set(group.key, button);
+                else foldButtons.current.delete(group.key);
+              }}
               aria-label={
                 group.isFolded
                   ? `Expand ${group.projectName}`
@@ -722,18 +782,9 @@ function CollapsedThreadList({
                 />
               ))}
 
-              {(group.hiddenCount > 0 || group.isExpanded) && (
-                <button
-                  type="button"
-                  aria-expanded={group.isExpanded}
-                  onClick={() => toggleExpand(group.key)}
-                  className="flex h-6 w-full cursor-pointer items-center rounded-md pl-2 text-left text-[11px] text-sidebar-foreground/55 hover:text-sidebar-foreground"
-                >
-                  {group.isExpanded
-                    ? "Show less"
-                    : `Show more (${group.hiddenCount})`}
-                </button>
-              )}
+              <PaginationControls group={group} base={limit}
+                onBudget={budget => setPageState(previous => setPageBudget(previous, group.key, budget))}
+                focusFold={() => foldButtons.current.get(group.key)?.focus({ preventScroll: true })} />
             </div>
           )}
         </div>
@@ -742,12 +793,64 @@ function CollapsedThreadList({
   );
 }
 
+/**
+ * App-wide setting bridge; independent from the selected thread-list provider.
+ */
+function NavigationRailBridge() {
+  const { values } = useSettings();
+  const hidden = values?.hideNavigationRail === true;
+  useEffect(() => { setNavigationRailBridgeValue(hidden); }, [hidden]);
+  useEffect(() => () => clearNavigationRailBridge(), []);
+  return null;
+}
+
+export function registerNavigationRail(app: PluginAppBuilder): void {
+  if (typeof app.slots.experimental_appOverlay !== "function") return;
+  app.contentScripts.register({
+    id: "navigation-rail",
+    mount: ({ signal }) => mountNavigationRail(signal),
+  });
+  app.slots.experimental_appOverlay({
+    id: "navigation-rail", component: NavigationRailBridge,
+  });
+}
+
+function GitHeader({ threadId }: { threadId: string }) {
+  const anchor = useRef<HTMLSpanElement>(null);
+  const controller = useRef<ReturnType<typeof bindGitHeader> | null>(null);
+  const [snapshot, setSnapshot] = useState<GitHeaderSnapshot | null>(null);
+  useEffect(() => {
+    if (!anchor.current) return;
+    const binding = bindGitHeader(anchor.current, setSnapshot);
+    controller.current = binding;
+    return () => { controller.current = null; binding.dispose(); };
+  }, [threadId]);
+  return <span ref={anchor} data-bb-git-header="">
+    {snapshot ? <button type="button" aria-label={snapshot.label} title={snapshot.label}
+      aria-expanded={snapshot.expanded} aria-controls="thread-prompt-banner-git-body"
+      disabled={snapshot.disabled} onClick={() => controller.current?.toggle()}>
+      <Icon name="FileDiff" className="size-3.5 shrink-0" />
+      <span data-bb-git-header-summary="" className="truncate">{snapshot.summary}</span>
+      <span data-bb-git-header-count="">{snapshot.count}</span>
+    </button> : null}
+  </span>;
+}
+
 export default definePluginApp((app) => {
+  app.contentScripts.register({ id: "sidebar-controls", mount: ({signal}) => mountSidebarControls(signal) });
+  app.slots.experimental_threadHeaderAction({ id: "changed-files", title: "Изменённые файлы", component: GitHeader });
   app.slots.experimental_threadList({
     id: "collapsed",
     title: "Collapsed thread list",
     description:
-      "Показывает первые N чатов проекта, остальные — под «Show more».",
+      "Показывает первые N чатов проекта, раскрывает и сворачивает порциями по 10.",
     component: CollapsedThreadList,
   });
+  app.slots.sidebarFooterAction({
+    id: "sidebar-collapse-settings",
+    title: "Настройки Sidebar Collapse",
+    icon: "ChevronsUp",
+    run: ({ openSettings }) => openSettings(),
+  });
+  registerNavigationRail(app);
 });

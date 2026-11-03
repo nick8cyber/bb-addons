@@ -129,6 +129,7 @@ const CORE_ICON_MAP = {
   MessageSquarePlus: BubbleChatAddIcon,
   MessageSquare: BubbleChatIcon,
   MoreHorizontal: MoreHorizontalIcon,
+  Minus: [["path", { d: "M5 12h14", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", key: "0" }]],
   PanelLeft: SidebarLeftIcon,
   Search: Search01Icon,
   SectionAdd: SectionAddStrokeRoundedIcon,
