@@ -35,6 +35,11 @@ export interface FormattedThreadBlock {
   chars: number;
 }
 
+export function formatAllThreadMessagesText(messages: ThreadMessage[]): string {
+  if (messages.length === 0) return "(нет сообщений)";
+  return messages.map(formatSingleMessage).join("\n\n");
+}
+
 export function formatThreadMessagesBlock(messages: ThreadMessage[]): FormattedThreadBlock {
   if (messages.length === 0) {
     const block = "(нет сообщений)";

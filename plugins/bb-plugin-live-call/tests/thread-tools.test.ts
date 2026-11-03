@@ -12,10 +12,12 @@ import {
 import type { ThreadMessage } from "../src/thread-messages.js";
 
 describe("инструменты звонка по треду (контракт §12.4)", () => {
-  it("в звонке по треду объявлены только 6 инструментов (§12.10, без switch_mode)", () => {
+  it("в звонке по треду объявлены инструменты треда и мозгового центра (§12.10, §12.11, без switch_mode)", () => {
     const decls = nativeDeclarations("thr_target") as Array<{ functionDeclarations: Array<{ name: string }> }>;
     const names = decls.flatMap((d) => d.functionDeclarations.map((f) => f.name));
     expect(names.sort()).toEqual([
+      "brain_ask",
+      "brain_task",
       "end_call",
       "recall",
       "remember",

@@ -244,6 +244,8 @@ export default async function plugin(bb: BbPluginApi) {
       store,
       sdk: bb.sdk,
       targetThreadId,
+      storageDir: join(bb.server.experimental_dataDir, "plugins", "live-call", "brain-files"),
+      log: bb.log,
       toBrowser: toBrowserRef,
       sendBrowserAudio: (turnSeq, pcm) => {
         try {

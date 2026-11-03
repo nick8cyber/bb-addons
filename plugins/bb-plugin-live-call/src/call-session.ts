@@ -22,6 +22,9 @@ import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
 import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
+import { BrainCenter } from "./brain-center.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export type CallState =
   | "connecting" | "listening" | "thinking" | "speaking" | "working" | "reconnecting" | "muted" | "ended";
@@ -48,6 +51,8 @@ export interface CallSessionDeps {
   endCallThread: (summary: string) => Promise<void>;
   wsFactory?: (url: string) => WebSocket;
   targetThreadId?: string;
+  storageDir?: string;
+  log?: { info(s: string): void; warn(s: string): void; error(s: string): void };
 }
 
 const COMPRESSION = { triggerTokens: 20000, targetTokens: 10000 };
@@ -104,6 +109,13 @@ export class CallSession extends EventEmitter {
   /** Сборка реплики владельца из кусков inputTranscription; конец — 700 мс тишины. */
   private ownerUtterance: { text: string; firstAt: number; lastAt: number } | null = null;
   private ownerUtteranceTimer: NodeJS.Timeout | null = null;
+  /** Мозговой центр звонка по треду (§12.11). */
+  brain: BrainCenter | null = null;
+  brainSummary: string | null = null;
+  /** Последний упавший инструмент (§12.12 п. 3: запрет молчаливого повтора). */
+  private lastFailedTool: string | null = null;
+  /** Счётчик вызовов инструментов в текущем ходе владельца (§12.12 п. 4). */
+  private toolCallsInCurrentTurn = 0;
 
   constructor(private deps: CallSessionDeps) {
     super();
@@ -186,17 +198,21 @@ export class CallSession extends EventEmitter {
       this.deps.store.startCall(this.deps.callId);
       this.deps.store.event(this.deps.callId, "call_started", { targetThreadId: this.targetThreadId });
       this.nowUtc = new Date().toISOString();
+      let envObj: Record<string, unknown> = {};
+      let targetProjectId = "";
       try {
         const raw = (await this.deps.sdk.threads.get({ threadId: this.targetThreadId })) as unknown as Record<string, unknown>;
         const t = (raw && typeof raw === "object" && "thread" in raw && raw.thread ? raw.thread : raw) as Record<string, unknown>;
+        envObj = (raw && typeof raw === "object" && "environment" in raw && raw.environment ? raw.environment : {}) as Record<string, unknown>;
+        targetProjectId = String(t?.projectId ?? envObj?.projectId ?? "");
         let projectTitle: string | undefined = undefined;
-        if (t?.projectId) {
+        if (targetProjectId) {
           try {
             const projects = ((await this.deps.sdk.projects.list() as unknown) ?? []) as Array<Record<string, unknown>>;
-            const p = projects.find((x) => String(x.id) === String(t.projectId));
-            projectTitle = p?.name ? String(p.name) : String(t.projectId);
+            const p = projects.find((x) => String(x.id) === targetProjectId);
+            projectTitle = p?.name ? String(p.name) : targetProjectId;
           } catch {
-            projectTitle = String(t.projectId);
+            projectTitle = targetProjectId;
           }
         }
         let stateStr = "свободен";
@@ -239,6 +255,38 @@ export class CallSession extends EventEmitter {
         skipped: formatted.skippedCount,
         chars: formatted.chars,
       });
+
+      this.brain = new BrainCenter({
+        sdk: this.deps.sdk,
+        store: this.deps.store,
+        callId: this.deps.callId,
+        targetThreadId: this.targetThreadId,
+        targetThreadTitle: this.threadMeta?.title ?? "Тред",
+        targetProjectId,
+        targetHostId: envObj.hostId ? String(envObj.hostId) : undefined,
+        targetBranchName: envObj.branchName ? String(envObj.branchName) : undefined,
+        isGitRepo: Boolean(envObj.isGitRepo),
+        allMessages: this.threadMessages,
+        storageDir: this.deps.storageDir ?? join(tmpdir(), "bb-live-call-brain"),
+        log: this.deps.log,
+      });
+
+      this.brain.onSummaryReady = (summaryText, ms) => {
+        this.brainSummary = summaryText;
+        this.voice?.sendClientContent(
+          `[СИСТЕМА] Мозговой центр подготовил сводку по треду (${ms} мс):\n${summaryText}\n\nСейчас же перескажи эту сводку владельцу своими словами: цель треда, что сделано, на чём остановились, что ждёт владельца, открытые вопросы.`,
+          true,
+        );
+      };
+
+      this.brain.onSummaryTimeout = () => {
+        this.voice?.sendClientContent(
+          `[СИСТЕМА] Сводка мозгового центра не успела сформироваться за 60 секунд. Скажи владельцу: «Сводка не успела подготовиться вовремя, ориентируюсь по сообщениям треда» и продолжай разговор по сообщениям треда.`,
+          true,
+        );
+      };
+
+      void this.brain.start();
     } else {
       this.deps.store.startCall(this.deps.callId);
     }
@@ -319,6 +367,7 @@ export class CallSession extends EventEmitter {
           threadState: this.threadState,
           messagesBlock: this.threadMessagesBlock,
           memory: this.promptContext.memory,
+          brainSummary: this.brainSummary ?? undefined,
         })
       : this.mode === "normal"
         ? voiceInstructionNormal(this.promptContext)
@@ -389,6 +438,16 @@ export class CallSession extends EventEmitter {
       ledger: this.ledger,
       targetThreadId: this.targetThreadId ?? undefined,
       threadMessages: this.threadMessages,
+      brain: this.brain ?? undefined,
+      isTargetThreadActive: async () => {
+        if (!this.targetThreadId) return false;
+        const res = (await this.deps.sdk.threads.get({ threadId: this.targetThreadId }).catch(() => null)) as unknown as {
+          thread?: { status?: string };
+          status?: string;
+        } | null;
+        const st = res?.thread?.status ?? res?.status;
+        return st === "active";
+      },
       newActionId: (tool: string) => this.newActionId(tool),
       voiceMemory: {
         add: (text: string) => this.deps.store.addMemory(text),
@@ -420,10 +479,15 @@ export class CallSession extends EventEmitter {
     client.on("setupComplete", () => {
       if (this.greeted) return; // после переподключений приветствие не повторяем
       this.greeted = true;
-      // Модель молчит до первого слова владельца: любая просьба «поздоровайся»
-      // приводила к тому, что она сама запускала обзор поверх владельца (02.11).
-      // turnComplete: false — контекст получен, ответа не требуется.
-      client.sendClientContent("Система: звонок начат. Жди первого слова владельца и отвечай только ему.", false);
+      if (this.targetThreadId) {
+        // §12.11 п. 3: Голос сразу представляется: «Привет, сейчас обрабатываю информацию по треду».
+        client.sendClientContent("Система: звонок начат. Скажи: «Привет, сейчас обрабатываю информацию по треду». Больше ничего не добавляй.", true);
+      } else {
+        // Модель молчит до первого слова владельца: любая просьба «поздоровайся»
+        // приводила к тому, что она сама запускала обзор поверх владельца (02.11).
+        // turnComplete: false — контекст получен, ответа не требуется.
+        client.sendClientContent("Система: звонок начат. Жди первого слова владельца и отвечай только ему.", false);
+      }
     });
     client.on("audio", (turnSeq: number, pcm: Uint8Array) => {
       this.gate.onModelAudio(turnSeq, pcm.length);
@@ -534,6 +598,16 @@ export class CallSession extends EventEmitter {
   private async handleNativeCalls(client: LiveClient, calls: Array<{ id?: string; name: string; args: Record<string, unknown> }>) {
     this.setState("working");
     for (const call of calls) {
+      if (this.lastFailedTool === call.name) {
+        // §12.12 п. 3: Запрет повторного вызова того же инструмента после ok:false без реплики владельца
+        client.sendToolResponse(
+          call.id,
+          { ok: false, error: "сначала сообщи владельцу" },
+          "WHEN_IDLE",
+          call.name,
+        );
+        continue;
+      }
       const def = toolByName(call.name, this.targetThreadId ?? undefined);
       if (!def) {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "WHEN_IDLE", call.name);
@@ -548,7 +622,10 @@ export class CallSession extends EventEmitter {
       // Голосовая сессия должна отреагировать на результат: WHEN_IDLE (SILENT запрещает ответ).
       client.sendToolResponse(call.id, result, "WHEN_IDLE", call.name);
       if (!result.ok && "error" in result) {
+        this.lastFailedTool = call.name;
         this.deps.store.event(this.deps.callId, "tool_error", { tool: def.name, args: call.args, code: result.error.code, message: result.error.message.slice(0, 300) });
+      } else if (result.ok) {
+        this.lastFailedTool = null;
       }
       if (def.cls !== "R") this.deps.store.event(this.deps.callId, "confirm", { tool: def.name });
     }
@@ -879,6 +956,8 @@ export class CallSession extends EventEmitter {
   /** Реплика владельца завершена (VAD или транскрипт-таймер): ROUTER, вариант А. */
   onOwnerUtteranceFinal(text: string) {
     if (this.ended || !text.trim()) return;
+    this.lastFailedTool = null;
+    this.toolCallsThisTurn = 0;
     this.ledger.add("owner", text);
     this.deps.store.event(this.deps.callId, "owner_line", { text });
     if (this.mode === "extended" && this.router && this.deps.routerInput === "text" && this.routerMayHearOwner()) {
@@ -1006,6 +1085,17 @@ export class CallSession extends EventEmitter {
         // Тихий пропуск недопустим: ошибка пишется в журнал звонка (контракт §13.1)
         this.deps.store.event(this.deps.callId, "thread_close_failed", {
           threadId: this.threadId,
+          error: String((e as { message?: unknown })?.message ?? e),
+        });
+      }
+    }
+    const brain = this.brain;
+    this.brain = null;
+    if (brain) {
+      try {
+        await brain.archive();
+      } catch (e) {
+        this.deps.store.event(this.deps.callId, "brain_archive_failed", {
           error: String((e as { message?: unknown })?.message ?? e),
         });
       }

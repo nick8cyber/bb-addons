@@ -4,6 +4,7 @@
  * Запуск агентов — класс L: только «запускай».
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import type { BrainCenter } from "./brain-center.js";
 import { TOOL_RESULT_MAX_CHARS, TOOL_TIMEOUT_MS, type Json, type ToolClass, type ToolResult } from "./contract.js";
 import { argsHash, type ConfirmationGate } from "./confirmation-gate.js";
 import type { ContextLedger } from "./context-ledger.js";
@@ -37,6 +38,9 @@ export interface ToolContext {
   /** Таймаут проверки доставки (мс), по умолчанию 5000. */
   deliveryTimeoutMs?: number;
   deliveryIntervalMs?: number;
+  /** Мозговой центр звонка по треду (§12.11). */
+  brain?: BrainCenter;
+  isTargetThreadActive?: () => Promise<boolean>;
 }
 
 export interface ToolDef {
@@ -51,7 +55,7 @@ export interface ToolDef {
   execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 }
 
-function truncate(value: unknown): ToolResult {
+export function truncate(value: unknown): ToolResult {
   const text = JSON.stringify(value ?? null);
   if (text.length <= TOOL_RESULT_MAX_CHARS) return { ok: true, data: value as Json, truncated: false };
   return {
@@ -1403,10 +1407,76 @@ export const threadAnswerTool: ToolDef = {
   },
 };
 
+export const brainAskTool: ToolDef = {
+  name: "brain_ask",
+  cls: "R",
+  word: "",
+  description: "Задать вопрос или задачу на анализ мозговому центру звонка (Antigravity). Мозговой центр изучает весь контекст треда и кодовую базу в изолированном worktree.",
+  parameters: {
+    type: "object",
+    properties: {
+      question: { type: "string", description: "Вопрос или аналитическая задача для мозгового центра" },
+    },
+    required: ["question"],
+  },
+  async execute(args, ctx) {
+    const q = String(args.question ?? "").trim();
+    if (!q) return { ok: false, error: { code: "invalid_argument", message: "укажи вопрос для мозгового центра" } };
+    ctx.ledger.add("tool", `brain_ask: ${q}`);
+    ctx.reportAction("brain_ask", "R", "running", `Спрашиваю у мозгового центра: «${q.slice(0, 80)}»`);
+    if (!ctx.brain) {
+      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не доступен");
+      return { ok: false, error: { code: "not_found", message: "мозговой центр не доступен" } };
+    }
+    const res = await ctx.brain.ask(q);
+    if (res.ok) {
+      ctx.reportAction("brain_ask", "R", "done", `Мозговой центр ответил на «${q.slice(0, 80)}»`);
+    } else {
+      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не смог ответить");
+    }
+    return res;
+  },
+};
+
+export const brainTaskTool: ToolDef = {
+  name: "brain_task",
+  cls: "C",
+  word: "да",
+  description: "Поставить задачу с изменениями (файлы, код, коммит, команды) мозговому центру в отдельном worktree. Требует подтверждения владельца «да».",
+  confirmSay: (args) => `Поставить задачу мозговому центру: «${args.task}»? Скажи «да» или «отмена».`,
+  parameters: {
+    type: "object",
+    properties: {
+      task: { type: "string", description: "Задание с изменениями: файлы, код, коммит, команды" },
+    },
+    required: ["task"],
+  },
+  async execute(args, ctx) {
+    const t = String(args.task ?? "").trim();
+    if (!t) return { ok: false, error: { code: "invalid_argument", message: "укажи задачу для мозгового центра" } };
+    ctx.ledger.add("tool", `brain_task: ${t}`);
+    ctx.reportAction("brain_task", "C", "running", `Мозговой центр выполняет: «${t.slice(0, 80)}»`);
+    if (!ctx.brain) {
+      ctx.reportAction("brain_task", "C", "failed", "Мозговой центр не доступен");
+      return { ok: false, error: { code: "not_found", message: "мозговой центр не доступен" } };
+    }
+    const res = await ctx.brain.task(t, () => ctx.isTargetThreadActive?.() ?? Promise.resolve(false));
+    if (res.ok) {
+      ctx.reportAction("brain_task", "C", "done", `Мозговой центр выполнил: «${t.slice(0, 80)}»`);
+    } else {
+      const errMsg = "error" in res ? res.error.message : "ошибка";
+      ctx.reportAction("brain_task", "C", "failed", `Мозговой центр не смог выполнить: ${errMsg}`);
+    }
+    return res;
+  },
+};
+
 export const THREAD_SPECIFIC_TOOLS: ToolDef[] = [
   threadReadMessagesTool,
   threadSendTool,
   threadAnswerTool,
+  brainAskTool,
+  brainTaskTool,
 ];
 
 export function getThreadTools(): ToolDef[] {
@@ -1515,6 +1585,10 @@ export function readActionLabel(
       return { running: "Смотрю свою память звонков", done: "Посмотрел свою память звонков", failed: "Не удалось прочитать память звонков" };
     case "thread_read_messages":
       return { running: "Читаю сообщения треда", done: "Прочитал сообщения треда", failed: "Не удалось прочитать сообщения треда" };
+    case "brain_ask":
+      return { running: `Спрашиваю у мозгового центра: «${q(args.question)}»`, done: `Мозговой центр ответил на «${q(args.question)}»`, failed: "Мозговой центр не смог ответить" };
+    case "brain_task":
+      return { running: `Мозговой центр выполняет: «${q(args.task)}»`, done: `Мозговой центр выполнил: «${q(args.task)}»`, failed: "Мозговой центр не смог выполнить задачу" };
     default:
       return null;
   }
@@ -1549,6 +1623,8 @@ const HUMAN: Record<string, string> = {
   thread_read_messages: "прочитать сообщения треда",
   thread_send: "написать в этот тред",
   thread_answer: "ответить агенту в этом треде",
+  brain_ask: "вопрос или анализ мозговому центру",
+  brain_task: "задание мозговому центру в отдельном worktree",
 };
 
 export function capabilityList(targetThreadId?: string): { read: string[]; confirm: string[]; launch: string[] } {
