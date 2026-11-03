@@ -175,3 +175,13 @@ bb theme set arctic-ledger
 plugins/           one directory per plugin, each with its own README
 themes/            one directory per theme
 ```
+
+### `server-switcher` — Compact server selector
+
+A monochrome footer icon opens the current server and all switch targets in one click. Closed by default; no avatar rings or nested dropdown. Offline servers are disabled. MIT-licensed maintained fork.
+
+```bash
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin server-switcher --yes
+```
+
+Details and upstream attribution: [Server Switcher](plugins/bb-plugin-server-switcher/README.md).
