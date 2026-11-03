@@ -18,3 +18,6 @@ Headless Chromium (Playwright) открывает BB, подменяет мик�
 | `keycheck.mjs` | живы ли ключи плагина (`F=<файл ключей>`) |
 
 Перед любым `bb plugin reload` — `bb call status`: перезагрузка рвёт идущий звонок.
+
+> [!WARNING]
+> Прямые прогоны к Gemini (`ext-prompt-ab.mjs`, `keycheck.mjs`) — только на ключах пула, не на ключах из секретов плагина. Иначе тест отнимает квоту у живого звонка. Перед прогоном — `bb call status`.
