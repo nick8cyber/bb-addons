@@ -7,6 +7,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { TOOL_RESULT_MAX_CHARS, TOOL_TIMEOUT_MS, type Json, type ToolClass, type ToolResult } from "./contract.js";
 import { argsHash, type ConfirmationGate } from "./confirmation-gate.js";
 import type { ContextLedger } from "./context-ledger.js";
+import { fetchThreadMessages, formatMessageTime, type ThreadMessage } from "./thread-messages.js";
 
 export interface ThreadBrief {
   id: string;
@@ -29,6 +30,13 @@ export interface ToolContext {
   voiceMemory?: { add(text: string): { id: number; duplicate: boolean }; list(): Array<{ id: number; text: string }> };
   /** Аргументы ожидающего подтверждения — сервер хранит их сам, модель не подменит. */
   rememberArgs?: (argsHash: string, args: Record<string, unknown>) => void;
+  /** id целевого треда для звонка по треду (§12). */
+  targetThreadId?: string;
+  /** Кэшированные сообщения треда для звонка по треду. */
+  threadMessages?: ThreadMessage[];
+  /** Таймаут проверки доставки (мс), по умолчанию 5000. */
+  deliveryTimeoutMs?: number;
+  deliveryIntervalMs?: number;
 }
 
 export interface ToolDef {
@@ -264,8 +272,116 @@ async function pluginRpc(ctx: ToolContext, pluginId: string, method: string, inp
 }
 
 /** Массив или {поле: массив} → массив (SDK возвращает разные формы). */
-const asArray = (v: unknown): Array<Record<string, unknown>> =>
-  Array.isArray(v) ? (v as Array<Record<string, unknown>>) : (((v as Record<string, unknown> | null)?.items ?? (v as Record<string, unknown> | null)?.threads ?? []) as Array<Record<string, unknown>>);
+export function toArray(v: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(v)) return v as Array<Record<string, unknown>>;
+  if (!v || typeof v !== "object") return [];
+  const obj = v as Record<string, unknown>;
+  if (Array.isArray(obj.items)) return obj.items as Array<Record<string, unknown>>;
+  if (Array.isArray(obj.events)) return obj.events as Array<Record<string, unknown>>;
+  if (Array.isArray(obj.messages)) return obj.messages as Array<Record<string, unknown>>;
+  if (Array.isArray(obj.threads)) return obj.threads as Array<Record<string, unknown>>;
+  return [];
+}
+const asArray = toArray;
+
+/** Проверяет наличие текста сообщения в событии любого типа (turn requested, steer, provider message и др.). */
+export function eventContainsText(e: Record<string, unknown>, needle: string): boolean {
+  if (!needle) return false;
+  try {
+    const data = e.data ?? e;
+    if (typeof data === "string") return data.includes(needle);
+    if (typeof data === "object" && data !== null) {
+      const obj = data as Record<string, unknown>;
+      // Стандартный input массива реплик (client/turn/requested и др.)
+      const input = obj.input as Array<{ text?: string }> | undefined;
+      if (Array.isArray(input)) {
+        const text = input.map((x) => x?.text ?? "").join(" ");
+        if (text.includes(needle)) return true;
+      }
+      // Очередь или steer в rawEvent (например, provider/unhandled с queue_update / steering как в thr_testshort1)
+      const rawEvent = obj.rawEvent as { params?: { message?: { steering?: string[]; followUp?: string[] } } } | undefined;
+      const steering = rawEvent?.params?.message?.steering;
+      if (Array.isArray(steering) && steering.some((s) => typeof s === "string" && s.includes(needle))) {
+        return true;
+      }
+      // Текстовые поля
+      if (typeof obj.text === "string" && obj.text.includes(needle)) return true;
+      if (typeof obj.message === "string" && obj.message.includes(needle)) return true;
+      // Универсальный fallback через сериализацию
+      return JSON.stringify(obj).includes(needle);
+    }
+  } catch {
+    // Игнорируем ошибки сериализации
+  }
+  return false;
+}
+
+/**
+ * Проверка доставки сообщения в тред после sdk.threads.send (до ~5 с).
+ * Ищет текст среди ВСЕХ типов событий треда (turn requested, steer, provider message и др.)
+ * или сообщение в очереди с этим текстом.
+ */
+export async function verifyThreadDelivery(
+  sdk: BbPluginApi["sdk"],
+  threadId: string,
+  text: string,
+  startTime: number,
+  timeoutMs = 5000,
+  intervalMs = 250,
+): Promise<boolean> {
+  const cleanNeedle = text.trim();
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    // 1. Проверяем события треда (поиск по ВСЕМ типам событий: turn, steer, provider и др.)
+    try {
+      const eventsArea = (sdk.threads as unknown as { events?: { list(a: Record<string, unknown>): Promise<unknown> } })?.events;
+      if (eventsArea && typeof eventsArea.list === "function") {
+        const res = await eventsArea.list({ threadId });
+        const rows = toArray(res);
+        for (let i = rows.length - 1; i >= 0 && i >= rows.length - 20; i--) {
+          const e = rows[i];
+          const createdAt = Number(e.createdAt ?? (e as { ts?: unknown }).ts ?? 0);
+          if (!createdAt || createdAt >= startTime - 1000) {
+            if (eventContainsText(e, cleanNeedle)) {
+              return true;
+            }
+          }
+        }
+      }
+    } catch {
+      // Игнорируем ошибки опроса событий
+    }
+
+    // 2. Проверяем сообщения в очереди треда (queuedMessages или queue)
+    try {
+      const threadsArea = sdk.threads as unknown as {
+        queuedMessages?: { list(a: Record<string, unknown>): Promise<unknown> };
+        queue?: { list(a?: Record<string, unknown>): Promise<unknown> };
+      };
+      const qRows: Array<Record<string, unknown>> = [];
+      if (typeof threadsArea?.queuedMessages?.list === "function") {
+        const qRes = await threadsArea.queuedMessages.list({ threadId });
+        qRows.push(...toArray(qRes));
+      }
+      if (typeof threadsArea?.queue?.list === "function") {
+        const qRes = await threadsArea.queue.list({ threadId });
+        qRows.push(...toArray(qRes));
+      }
+      for (const q of qRows) {
+        if (eventContainsText(q, cleanNeedle)) return true;
+      }
+    } catch {
+      // Игнорируем ошибки опроса очереди
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remaining)));
+  }
+
+  return false;
+}
 
 async function withTimeout<T>(p: Promise<T>, ms = TOOL_TIMEOUT_MS): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
@@ -442,10 +558,29 @@ export const TOOLS: ToolDef[] = [
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
       const threadId = String(ref.thread.id);
-      await withTimeout(
-        ctx.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: `[голос] ${String(args.text)}`, mentions: [] }] } as never),
+      const text = String(args.text ?? "");
+      const startTime = Date.now();
+      try {
+        await withTimeout(
+          ctx.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: `[голос] ${text}`, mentions: [] }] } as never),
+        );
+      } catch {
+        ctx.reportAction("send_to_thread", "C", "failed", "не доставлено", threadId);
+        return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
+      }
+      const delivered = await verifyThreadDelivery(
+        ctx.sdk,
+        threadId,
+        text,
+        startTime,
+        ctx.deliveryTimeoutMs ?? 5000,
+        ctx.deliveryIntervalMs ?? 250,
       );
-      ctx.ledger.add("tool", `send_to_thread → ${threadId}: ${String(args.text).slice(0, 200)}`);
+      if (!delivered) {
+        ctx.reportAction("send_to_thread", "C", "failed", "не доставлено", threadId);
+        return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
+      }
+      ctx.ledger.add("tool", `send_to_thread → ${threadId}: ${text.slice(0, 200)}`);
       ctx.reportAction("send_to_thread", "C", "done", `Отправил в «${String(ref.thread.title ?? threadId)}»`, threadId);
       return truncate({ sent: true, threadId });
     },
@@ -1106,14 +1241,189 @@ export const TOOLS: ToolDef[] = [
   },
 ];
 
+export const threadReadMessagesTool: ToolDef = {
+  name: "thread_read_messages",
+  cls: "R",
+  word: "",
+  description: "Сообщения треда по номерам from-to (до 10 за вызов) или по query (подстрока, до 5 совпадений), целиком.",
+  parameters: {
+    type: "object",
+    properties: {
+      from: { type: "integer", description: "номер первого сообщения (1..N)" },
+      to: { type: "integer", description: "номер последнего сообщения (1..N, до 10 за вызов)" },
+      query: { type: "string", description: "поиск по подстроке в тексте сообщений (до 5 совпадений)" },
+    },
+  },
+  async execute(args, ctx) {
+    const threadId = ctx.targetThreadId ?? (typeof args.thread === "string" ? String(args.thread) : undefined);
+    let messages = ctx.threadMessages;
+    if (!messages && threadId) {
+      messages = await fetchThreadMessages(ctx.sdk, threadId);
+    }
+    const msgs = messages ?? [];
+    if (args.query && typeof args.query === "string" && args.query.trim()) {
+      const q = args.query.trim().toLowerCase();
+      const matched = msgs.filter((m) => m.text.toLowerCase().includes(q)).slice(0, 5);
+      return truncate({
+        query: args.query,
+        count: matched.length,
+        messages: matched.map((m) => ({
+          number: m.number,
+          role: m.role,
+          text: m.text,
+          time: formatMessageTime(m.createdAt),
+        })),
+      });
+    }
 
-export function toolByName(name: string): ToolDef | undefined {
-  return TOOLS.find((t) => t.name === name);
+    const start = Math.max(1, typeof args.from === "number" ? Math.floor(args.from) : 1);
+    const requestedTo = typeof args.to === "number" ? Math.floor(args.to) : start + 9;
+    const end = Math.min(requestedTo, start + 9);
+    const matched = msgs.filter((m) => m.number >= start && m.number <= end);
+    return truncate({
+      from: start,
+      to: end,
+      count: matched.length,
+      messages: matched.map((m) => ({
+        number: m.number,
+        role: m.role,
+        text: m.text,
+        time: formatMessageTime(m.createdAt),
+      })),
+    });
+  },
+};
+
+export const threadSendTool: ToolDef = {
+  name: "thread_send",
+  cls: "C",
+  word: "да",
+  description: "Сообщение в этот тред от владельца с меткой [голос]. Запуск работы решает получатель.",
+  parameters: {
+    type: "object",
+    properties: {
+      text: { type: "string", description: "точный текст сообщения" },
+    },
+    required: ["text"],
+  },
+  confirmSay: (args) => `Отправить в тред сообщение: «${String(args.text ?? "")}»? Скажи «да» или «отмена».`,
+  async execute(args, ctx) {
+    const threadId = ctx.targetThreadId;
+    if (!threadId) {
+      return { ok: false, error: { code: "not_found", message: "тред звонка не определён" } };
+    }
+    const text = String(args.text ?? "");
+    const startTime = Date.now();
+    try {
+      await withTimeout(
+        ctx.sdk.threads.send({
+          threadId,
+          mode: "auto",
+          input: [{ type: "text", text: `[голос] ${text}`, mentions: [] }],
+        } as never),
+      );
+    } catch {
+      ctx.reportAction("thread_send", "C", "failed", "не доставлено", threadId);
+      return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
+    }
+    const delivered = await verifyThreadDelivery(
+      ctx.sdk,
+      threadId,
+      text,
+      startTime,
+      ctx.deliveryTimeoutMs ?? 5000,
+      ctx.deliveryIntervalMs ?? 250,
+    );
+    if (!delivered) {
+      ctx.reportAction("thread_send", "C", "failed", "не доставлено", threadId);
+      return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
+    }
+    ctx.ledger.add("tool", `thread_send → ${threadId}: ${text.slice(0, 200)}`);
+    ctx.reportAction("thread_send", "C", "done", `Отправил в тред: «${text.slice(0, 60)}»`, threadId);
+    return truncate({ sent: true, threadId });
+  },
+};
+
+export const threadAnswerTool: ToolDef = {
+  name: "thread_answer",
+  cls: "C",
+  word: "да",
+  description: "Ответ на вопрос агента или решение запроса разрешения для этого треда. grant: true — класс P, только «разрешаю».",
+  parameters: {
+    type: "object",
+    properties: {
+      answer: { type: "string", description: "текст ответа для вопроса" },
+      interactionId: { type: "string", description: "id ожидающего взаимодействия, если известно" },
+      grant: { type: "boolean", description: "true — разрешить агенту действие (класс P)" },
+    },
+  },
+  confirmSay: (args) =>
+    args.grant
+      ? "Разрешить агенту действие? Скажи «разрешаю» или «отмена»."
+      : `Ответить агенту: «${String(args.answer ?? "")}». Скажи «да» или «отмена».`,
+  async execute(args, ctx) {
+    const threadId = ctx.targetThreadId;
+    if (!threadId) {
+      return { ok: false, error: { code: "not_found", message: "тред звонка не определён" } };
+    }
+    const interactions = ctx.sdk.threads.interactions;
+    const listed = await withTimeout((interactions as unknown as InteractionsArea).list({ threadId }));
+    const rows = (Array.isArray(listed) ? listed : (listed.interactions ?? [])) as Array<Record<string, unknown>>;
+    let target: Record<string, unknown> | undefined;
+    const wantedId = args.interactionId ? String(args.interactionId) : null;
+    if (wantedId) target = rows.find((i) => String(i.id) === wantedId);
+    else if (rows.length === 1) target = rows[0];
+    else if (rows.length > 1) {
+      return { ok: false, error: { code: "ambiguous", message: `у треда ${rows.length} ожидающих взаимодействий, назови какое` } };
+    }
+    if (!target) return { ok: false, error: { code: "not_found", message: "у треда нет ожидающих взаимодействий" } };
+    const interactionId = String(target.id);
+    const payload = (target.payload ?? {}) as Record<string, unknown>;
+    if (args.grant) {
+      await withTimeout(
+        (interactions as unknown as { resolve(a: unknown): Promise<unknown> }).resolve({
+          interactionId,
+          threadId,
+          resolution: { kind: "approval", decision: "allow_once", grantedPermissions: payload.grantedPermissions ?? null },
+        }),
+      );
+    } else {
+      await withTimeout(
+        (interactions as unknown as { respond(a: unknown): Promise<unknown> }).respond({
+          interactionId,
+          threadId,
+          value: { kind: "user_answer", answers: { default: { freeText: String(args.answer ?? "") } } },
+        }),
+      );
+    }
+    ctx.ledger.add("tool", `thread_answer ${threadId}: ${args.grant ? "разрешено" : String(args.answer ?? "").slice(0, 200)}`);
+    ctx.reportAction("thread_answer", args.grant ? "P" : "C", "done", args.grant ? "Разрешил агенту" : "Ответил агенту", threadId);
+    return truncate({ resolved: true });
+  },
+};
+
+export const THREAD_SPECIFIC_TOOLS: ToolDef[] = [
+  threadReadMessagesTool,
+  threadSendTool,
+  threadAnswerTool,
+];
+
+export function getThreadTools(): ToolDef[] {
+  const common = TOOLS.filter((t) => ["switch_mode", "end_call", "remember", "recall"].includes(t.name));
+  return [...THREAD_SPECIFIC_TOOLS, ...common];
+}
+
+export function toolByName(name: string, targetThreadId?: string): ToolDef | undefined {
+  if (targetThreadId) {
+    return getThreadTools().find((t) => t.name === name);
+  }
+  return TOOLS.find((t) => t.name === name) ?? THREAD_SPECIFIC_TOOLS.find((t) => t.name === name);
 }
 
 /** Объявления для setup в режиме native (контракт §3): behavior NON_BLOCKING. */
-export function nativeDeclarations(): unknown[] {
-  return TOOLS.filter((t) => t.name !== "confirm_action").map((t) => ({
+export function nativeDeclarations(targetThreadId?: string): unknown[] {
+  const list = targetThreadId ? getThreadTools() : TOOLS.filter((t) => t.name !== "confirm_action");
+  return list.map((t) => ({
     functionDeclarations: [
       {
         name: t.name,
@@ -1154,7 +1464,8 @@ export async function runToolCall(
     }
   }
   const say = def.confirmSay ? def.confirmSay(args) : `${def.description} Подтвердите.`;
-  const req = ctx.gate.request(def.name, args, def.cls, say);
+  const cls = (def.name === "answer_interaction" || def.name === "thread_answer") && args.grant ? "P" : def.cls;
+  const req = ctx.gate.request(def.name, args, cls, say);
   if ("rejected" in req) {
     return { result: { ok: false, error: { code: req.rejected, message: req.message } }, executed: false };
   }
@@ -1194,6 +1505,8 @@ export function readActionLabel(
       return { running: `Ищу в базе знаний BB «${q(args.query)}»`, done: `Искал в базе знаний BB «${q(args.query)}»`, failed: "Поиск в базе знаний BB не удался" };
     case "recall":
       return { running: "Смотрю свою память звонков", done: "Посмотрел свою память звонков", failed: "Не удалось прочитать память звонков" };
+    case "thread_read_messages":
+      return { running: "Читаю сообщения треда", done: "Прочитал сообщения треда", failed: "Не удалось прочитать сообщения треда" };
     default:
       return null;
   }
@@ -1225,11 +1538,15 @@ const HUMAN: Record<string, string> = {
   call_note: "заметка в итог звонка", start_thread: "запустить нового агента", tasks_dispatch: "раздать задачу исполнителю",
   retry_thread: "перезапустить упавший ход", stop_all_agents: "остановить всех агентов", handoff_thread: "передать тред другому агенту",
   fork_thread: "ответвить тред",
+  thread_read_messages: "прочитать сообщения треда",
+  thread_send: "написать в этот тред",
+  thread_answer: "ответить агенту в этом треде",
 };
 
-export function capabilityList(): { read: string[]; confirm: string[]; launch: string[] } {
+export function capabilityList(targetThreadId?: string): { read: string[]; confirm: string[]; launch: string[] } {
+  const list = targetThreadId ? getThreadTools() : TOOLS;
   const out = { read: [] as string[], confirm: [] as string[], launch: [] as string[] };
-  for (const d of TOOLS) {
+  for (const d of list) {
     const h = HUMAN[d.name] ?? d.name;
     if (d.cls === "R") out.read.push(h);
     else if (d.cls === "L") out.launch.push(h);

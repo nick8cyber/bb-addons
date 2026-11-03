@@ -58,6 +58,7 @@ export const clientFrame = z.discriminatedUnion("type", [
     mode: z.enum(["normal", "extended"]).optional(),
     /** Переподключение к идущему звонку после обрыва WS (мобильная сеть, Connect). */
     resume: z.string().min(1).optional(),
+    threadId: z.string().min(1).optional(),
   }),
   z.object({ type: z.literal("mute"), muted: z.boolean() }),
   z.object({ type: z.literal("playback_drained"), turnSeq: z.number().int().nonnegative() }),
@@ -67,6 +68,7 @@ export const clientFrame = z.discriminatedUnion("type", [
     confirmationId: z.string().min(1),
     decision: z.enum(["approve", "cancel"]),
   }),
+  z.object({ type: z.literal("text"), text: z.string().min(1).max(4000) }),
   z.object({ type: z.literal("end") }),
   // Диагностика браузера: ошибки микрофона, уровень сигнала. Сервер пишет в журнал звонка.
   z.object({ type: z.literal("client_log"), event: z.string().min(1), detail: z.string().max(500).optional() }),

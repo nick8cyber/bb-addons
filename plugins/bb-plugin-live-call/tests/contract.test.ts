@@ -21,8 +21,14 @@ describe("бинарные кадры (контракт §2.1)", () => {
 describe("JSON-кадры", () => {
   it("hello и confirm валидны", () => {
     expect(clientFrame.safeParse({ type: "hello", protocol: 1 }).success).toBe(true);
+    expect(clientFrame.safeParse({ type: "hello", protocol: 1, threadId: "thr_test123" }).success).toBe(true);
     expect(clientFrame.safeParse({ type: "confirm", confirmationId: "x", decision: "approve" }).success).toBe(true);
     expect(clientFrame.safeParse({ type: "hello", protocol: 2 }).success).toBe(false);
+  });
+  it("кадр text валиден (1..4000 символов)", () => {
+    expect(clientFrame.safeParse({ type: "text", text: "Привет" }).success).toBe(true);
+    expect(clientFrame.safeParse({ type: "text", text: "" }).success).toBe(false);
+    expect(clientFrame.safeParse({ type: "text", text: "a".repeat(4001) }).success).toBe(false);
   });
   it("ready без threadId — ок; thread-кадр отдельный", () => {
     expect(serverFrame.safeParse({ type: "ready", callId: "c", mode: "normal", voice: "Algenib", keys: { active: 1, of: 2 } }).success).toBe(true);

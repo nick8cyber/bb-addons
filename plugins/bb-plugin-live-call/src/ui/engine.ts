@@ -263,21 +263,23 @@ export class CallEngine {
     this.patch({ expandSignal: this.view.expandSignal + 1 });
   }
 
-  start(mode?: CallMode) {
+  start(opts?: CallMode | { mode?: CallMode; threadId?: string }) {
     if (this.isActive()) {
       this.requestExpand();
       return;
     }
+    const mode = typeof opts === "string" ? opts : opts?.mode;
+    const threadId = typeof opts === "object" ? opts?.threadId : undefined;
     this.releaseAudio();
     this.ownerHeard = false;
     this.endRequested = false;
-    this.view = { ...IDLE, phase: "connecting", orb: "connecting", expandSignal: this.view.expandSignal + 1 };
+    this.view = { ...IDLE, phase: "connecting", orb: "connecting", threadId: threadId ?? null, expandSignal: this.view.expandSignal + 1 };
     this.patch({});
     // iOS WebKit (Safari и приложение BB): звук живёт, только если AudioContext
     // создан и запущен прямо в нажатии. Раньше он создавался после ответа сервера —
     // на айфоне оставался «спящим», микрофон и динамик молчали.
     this.unlockAudio();
-    this.openSocket(mode ? { mode } : {});
+    this.openSocket({ ...(mode ? { mode } : {}), ...(threadId ? { threadId } : {}) });
   }
 
   private endRequested = false;
@@ -287,7 +289,7 @@ export class CallEngine {
   private liveSince = 0;
 
   /** Сокет звонка: первый вход ({mode}) или возврат после обрыва ({resume: callId}). */
-  private openSocket(hello: { mode?: CallMode; resume?: string }) {
+  private openSocket(hello: { mode?: CallMode; resume?: string; threadId?: string }) {
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     const sock = new WebSocket(`${wsProto}//${location.host}${CALL_WS_PATH}`);
     sock.binaryType = "arraybuffer";

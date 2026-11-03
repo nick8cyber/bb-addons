@@ -29,11 +29,15 @@ export default definePluginApp((app) => {
 
   app.slots.experimental_threadAction({
     id: "call",
-    title: "Позвонить координатору",
+    title: "Позвонить по треду",
     icon: PHONE_ICON,
     group: "live-call",
     placement: "header",
-    item: () => ({ label: "Позвонить", icon: PHONE_ICON, run: callOrFocus }),
+    item: ({ thread }) => ({
+      label: "Позвонить по треду",
+      icon: PHONE_ICON,
+      run: () => (callEngine.isActive() ? callEngine.requestExpand() : callEngine.start({ threadId: thread.id })),
+    }),
   });
 
   app.commands.register({

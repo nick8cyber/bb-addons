@@ -28,6 +28,7 @@ import { LiveClient } from "./src/live-client.js";
 import { argsHash } from "./src/confirmation-gate.js";
 import { decideHello } from "./src/reattach.js";
 import { toolByName } from "./src/tools.js";
+import { createCallThreadManager, closeStaleCallThreads } from "./src/thread-lifecycle.js";
 
 const rpcContract = defineRpcContract({
   status: {
@@ -176,58 +177,42 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
-  /** Следующая реплика: закрыть открытый ход (end + turn_closed), затем threads.send mode start. */
-  const advanceCallThread = async (threadId: string, utterance: string): Promise<void> => {
-    const owner = bridgeOwner.get(threadId);
-    if (owner) {
-      // Waiter ставится ДО end: turn_closed может прийти раньше возврата send.
-      const closed = new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 3000);
-        turnClosedWaiters.set(threadId, () => {
-          clearTimeout(timer);
-          turnClosedWaiters.delete(threadId);
-          resolve();
-        });
-      });
-      owner.send(JSON.stringify({ type: "end", threadId }));
-      await closed;
-    }
-    await bb.sdk.threads.send({
-      threadId,
-      mode: "start",
-      input: [{ type: "text", text: utterance, mentions: [] }],
-    } as never);
-  };
+  const threadManager = createCallThreadManager({
+    sdk: bb.sdk,
+    store,
+    bridgeOwner,
+    turnClosedWaiters,
+    log: bb.log,
+  });
 
-  const sayCallThread = async (threadId: string, text: string): Promise<void> => {
-    const owner = bridgeOwner.get(threadId);
-    owner?.send(JSON.stringify({ type: "say", threadId, text }));
-  };
-
-  const endCallThread = async (threadId: string, summary: string): Promise<void> => {
-    const owner = bridgeOwner.get(threadId);
-    owner?.send(JSON.stringify({ type: "say", threadId, text: summary }));
-    owner?.send(JSON.stringify({ type: "end", threadId }));
-  };
+  const advanceCallThread = threadManager.advanceCallThread;
+  const sayCallThread = threadManager.sayCallThread;
+  const endCallThread = threadManager.endCallThread;
 
   /** Обёртки для активной сессии; ссылка заполняется сразу после конструктора. */
   const sessionThreadHelpers = (sessionRef: { current: CallSession | null }) => ({
     spawnCallThread: async (firstUtterance: string) => spawnCallThread(firstUtterance),
     advanceCallThread: async (utterance: string) => {
       const t = sessionRef.current?.threadId;
-      if (t) await advanceCallThread(t, utterance);
+      if (t && t !== sessionRef.current?.targetThreadId) {
+        await advanceCallThread(t, utterance);
+      }
     },
     sayCallThread: async (text: string) => {
       const t = sessionRef.current?.threadId;
-      if (t) await sayCallThread(t, text);
+      if (t && t !== sessionRef.current?.targetThreadId) {
+        await sayCallThread(t, text);
+      }
     },
     endCallThread: async (summary: string) => {
       const t = sessionRef.current?.threadId;
-      if (t) await endCallThread(t, summary);
+      if (t && t !== sessionRef.current?.targetThreadId) {
+        await endCallThread(t, summary, sessionRef.current?.callId);
+      }
     },
   });
 
-  const startCall = async (sock: Sock, mode: "normal" | "extended"): Promise<CallSession> => {
+  const startCall = async (sock: Sock, mode: "normal" | "extended", targetThreadId?: string): Promise<CallSession> => {
     const keys = await keysList();
     if (keys.length === 0) {
       const frame: ServerFrame = { type: "error", code: "no_keys", message: "нет ключей Gemini в настройках плагина", retryable: false };
@@ -258,6 +243,7 @@ export default async function plugin(bb: BbPluginApi) {
       maxCallMinutes: Math.min(120, Math.max(5, num(cfg.maxCallMinutes, 60))),
       store,
       sdk: bb.sdk,
+      targetThreadId,
       toBrowser: toBrowserRef,
       sendBrowserAudio: (turnSeq, pcm) => {
         try {
@@ -307,13 +293,17 @@ export default async function plugin(bb: BbPluginApi) {
     return session;
   };
 
-  // Перезагрузка или выключение плагина: идущий звонок закрываем по-честному (журнал,
-  // тред звонка, сессии Gemini), а не бросаем «идущим» навсегда (приёмка 03.11).
+  // Перезагрузка или выключение плагина: закрываем звонки в SQLite и останавливаем их треды в BB (контракт §13.2).
   try {
-    const stale = store.closeStale();
-    if (stale > 0) bb.log.warn(`закрыл ${stale} звонков, оставшихся от прошлого запуска`);
+    void (async () => {
+      const projId = await ensureCallsProject().catch(() => null);
+      const stopped = await closeStaleCallThreads(store, bb.sdk, projId, bb.log);
+      if (stopped.length > 0) {
+        bb.log.warn(`closeStale: остановлено ${stopped.length} зависших тредов в BB: ${stopped.join(", ")}`);
+      }
+    })();
   } catch (e) {
-    bb.log.warn(`closeStale: ${String(e)}`);
+    bb.log.warn(`closeStaleCallThreads: ${String(e)}`);
   }
   bb.onDispose(async () => {
     if (!active) return;
@@ -380,10 +370,29 @@ export default async function plugin(bb: BbPluginApi) {
                 sock.close(BUSY_CLOSE_CODE, "busy");
                 return;
               }
+              if (frame.threadId) {
+                let targetThread: Record<string, unknown> | null = null;
+                try {
+                  const t = (await bb.sdk.threads.get({ threadId: frame.threadId })) as unknown as Record<string, unknown>;
+                  if (t?.id) targetThread = t;
+                } catch {
+                  targetThread = null;
+                }
+                if (!targetThread) {
+                  sock.send(JSON.stringify({
+                    type: "error",
+                    code: "thread_not_found",
+                    message: `тред ${frame.threadId} не найден`,
+                    retryable: false,
+                  } satisfies ServerFrame));
+                  sock.close(BUSY_CLOSE_CODE, "thread not found");
+                  return;
+                }
+              }
               // Extended — по умолчанию (владелец 03.11); «Быстрый» (normal) — только если выбран явно.
               const fallback = str((await settings_get()).defaultMode, "extended") === "normal" ? "normal" : "extended";
               try {
-                state.session = await startCall(sock, frame.mode ?? fallback);
+                state.session = await startCall(sock, frame.mode ?? fallback, frame.threadId);
               } catch {
                 // Ошибка уже ушла фреймом и соединение закрыто.
               }
@@ -398,6 +407,7 @@ export default async function plugin(bb: BbPluginApi) {
               bb.log.warn(`браузер: ${frame.event}${frame.detail ? ` — ${frame.detail}` : ""}`);
               store.event(state.session?.callId ?? "browser", "client_log", { event: frame.event, detail: frame.detail });
             }
+            else if (frame.type === "text") s.sendUserMessage(frame.text);
             else if (frame.type === "confirm") s.decideConfirmation(frame.confirmationId, frame.decision);
             else if (frame.type === "end") await s.end("owner");
             return;
@@ -453,6 +463,7 @@ export default async function plugin(bb: BbPluginApi) {
           bb.log.info(`bridge turn on ${m.threadId}`);
         } else if (m.type === "turn_closed" && m.threadId) {
           turnClosedWaiters.get(m.threadId)?.();
+          void threadManager.processAdvanceQueue(m.threadId);
         }
       },
       onClose: (sock: Sock) => {

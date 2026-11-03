@@ -61,10 +61,10 @@ export class CallStore {
     }
   }
 
-  startCall(id: string, startedAt = Date.now()): void {
+  startCall(id: string, startedAt = Date.now(), threadId: string | null = null): void {
     this.db
-      .prepare("INSERT OR REPLACE INTO calls (id, thread_id, started_at) VALUES (?, NULL, ?)")
-      .run(id, startedAt);
+      .prepare("INSERT OR REPLACE INTO calls (id, thread_id, started_at) VALUES (?, ?, ?)")
+      .run(id, threadId, startedAt);
     this.seq = 0;
   }
 
@@ -72,9 +72,13 @@ export class CallStore {
     this.db.prepare("UPDATE calls SET thread_id = ? WHERE id = ?").run(threadId, callId);
   }
 
-  /** Звонки, оставшиеся «идущими» после перезагрузки плагина или сервера, — закрыть. */
-  closeStale(reason = "restart", endedAt = Date.now()): number {
-    return this.db.prepare("UPDATE calls SET ended_at = ?, end_reason = ? WHERE ended_at IS NULL").run(endedAt, reason).changes;
+  /** Звонки, оставшиеся «идущими» после перезагрузки плагина или сервера, — закрыть. Возвращает thread_id незакрытых звонков. */
+  closeStale(reason = "restart", endedAt = Date.now()): string[] {
+    const rows = this.db
+      .prepare("SELECT id, thread_id as threadId FROM calls WHERE ended_at IS NULL")
+      .all() as Array<{ id: string; threadId: string | null }>;
+    this.db.prepare("UPDATE calls SET ended_at = ?, end_reason = ? WHERE ended_at IS NULL").run(endedAt, reason);
+    return rows.map((r) => r.threadId).filter((t): t is string => Boolean(t));
   }
 
   /** Память голосового агента: добавить запись (без дублей). */

@@ -15,12 +15,13 @@ import { ConfirmationGate, argsHash, type PendingConfirmation } from "./confirma
 import { ContextLedger } from "./context-ledger.js";
 import { KeyPool, QuotaExhaustedError } from "./key-pool.js";
 import { LiveClient } from "./live-client.js";
-import { EMPTY_CONTEXT, routerInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
+import { EMPTY_CONTEXT, routerInstruction, threadRouterInstruction, threadVoiceInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
 import { TOOLS, capabilityList, nativeDeclarations, runToolCall, toolByName } from "./tools.js";
 import type { ToolClass, ToolResult } from "./contract.js";
 import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
+import { fetchThreadMessages, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
 
 export type CallState =
   | "connecting" | "listening" | "thinking" | "speaking" | "working" | "reconnecting" | "muted" | "ended";
@@ -46,6 +47,7 @@ export interface CallSessionDeps {
   sayCallThread: (text: string) => Promise<void>;
   endCallThread: (summary: string) => Promise<void>;
   wsFactory?: (url: string) => WebSocket;
+  targetThreadId?: string;
 }
 
 const COMPRESSION = { triggerTokens: 20000, targetTokens: 10000 };
@@ -54,6 +56,10 @@ export class CallSession extends EventEmitter {
   state: CallState = "connecting";
   mode: "normal" | "extended";
   threadId: string | null = null;
+  readonly targetThreadId: string | null = null;
+  private threadMessages: ThreadMessage[] = [];
+  private threadMeta: { id: string; title: string; project?: string; state?: string } | null = null;
+  private threadMessagesBlock = "";
   private voice: LiveClient | null = null;
   private router: LiveClient | null = null;
   private pool: KeyPool;
@@ -87,6 +93,7 @@ export class CallSession extends EventEmitter {
 
   constructor(private deps: CallSessionDeps) {
     super();
+    this.targetThreadId = deps.targetThreadId ?? null;
     this.mode = deps.mode;
     this.modeHistory = [deps.mode];
     this.pool = new KeyPool(deps.keys, {
@@ -156,11 +163,52 @@ export class CallSession extends EventEmitter {
     } catch {
       memory = [];
     }
-    return { projects, capabilities: capabilityList(), memory, mode: this.mode };
+    return { projects, capabilities: capabilityList(this.targetThreadId ?? undefined), memory, mode: this.mode };
   }
 
   async start() {
-    this.deps.store.startCall(this.deps.callId);
+    if (this.targetThreadId) {
+      this.deps.store.startCall(this.deps.callId);
+      this.deps.store.event(this.deps.callId, "call_started", { targetThreadId: this.targetThreadId });
+      try {
+        const t = (await this.deps.sdk.threads.get({ threadId: this.targetThreadId })) as unknown as Record<string, unknown>;
+        let projectTitle: string | undefined = undefined;
+        if (t?.projectId) {
+          try {
+            const projects = ((await this.deps.sdk.projects.list() as unknown) ?? []) as Array<Record<string, unknown>>;
+            const p = projects.find((x) => String(x.id) === String(t.projectId));
+            projectTitle = p?.name ? String(p.name) : String(t.projectId);
+          } catch {
+            projectTitle = String(t.projectId);
+          }
+        }
+        let stateStr = "свободен";
+        if (t?.hasPendingInteraction) stateStr = "ждёт тебя";
+        else if (t?.status === "active") stateStr = "работает";
+        else if (t?.status === "error") stateStr = "ошибка";
+
+        this.threadMeta = {
+          id: this.targetThreadId,
+          title: String(t?.title ?? t?.id ?? "Тред"),
+          project: projectTitle,
+          state: stateStr,
+        };
+      } catch {
+        this.threadMeta = { id: this.targetThreadId, title: "Тред" };
+      }
+
+      this.threadMessages = await fetchThreadMessages(this.deps.sdk, this.targetThreadId);
+      const formatted = formatThreadMessagesBlock(this.threadMessages);
+      this.threadMessagesBlock = formatted.block;
+      this.deps.store.event(this.deps.callId, "thread_context", {
+        messages: formatted.messagesCount,
+        skipped: formatted.skippedCount,
+        chars: formatted.chars,
+      });
+    } else {
+      this.deps.store.startCall(this.deps.callId);
+    }
+
     this.promptContext = await this.buildPromptContext();
     this.deps.store.setModeHistory(this.deps.callId, this.modeHistory);
     try {
@@ -176,6 +224,9 @@ export class CallSession extends EventEmitter {
       voice: this.deps.voice,
       keys: { active: this.pool.active, of: this.pool.of },
     });
+    if (this.threadId) {
+      this.frame({ type: "thread", threadId: this.threadId });
+    }
     this.setState("listening");
     this.gateTicker();
   }
@@ -226,14 +277,25 @@ export class CallSession extends EventEmitter {
 
   private makeVoiceSession(handle?: string): LiveClient {
     this.voiceTalking = false;
+    const systemInstruction = this.targetThreadId
+      ? threadVoiceInstruction({
+          thread: this.threadMeta ?? { id: this.targetThreadId, title: "Тред" },
+          messagesBlock: this.threadMessagesBlock,
+          memory: this.promptContext.memory,
+          mode: this.mode,
+        })
+      : this.mode === "normal"
+        ? voiceInstructionNormal(this.promptContext)
+        : voiceInstructionExtended(this.promptContext);
+
     const client = new LiveClient({
       key: this.pool.activeKey,
       model: this.mode === "normal" ? "gemini-3.8-live" : "gemini-3.8-live-extended-thinking",
       voice: this.deps.voice,
       languageCode: this.deps.languageCode,
-      systemInstruction: this.mode === "normal" ? voiceInstructionNormal(this.promptContext) : voiceInstructionExtended(this.promptContext),
+      systemInstruction,
       thinkingLevel: this.mode === "normal" ? undefined : this.deps.thinkingLevel,
-      tools: this.mode === "normal" ? nativeDeclarations() : undefined,
+      tools: this.mode === "normal" ? (nativeDeclarations(this.targetThreadId ?? undefined) as unknown[]) : undefined,
       sessionHandle: handle,
       contextWindowCompression: COMPRESSION,
       wsFactory: this.deps.wsFactory,
@@ -244,13 +306,19 @@ export class CallSession extends EventEmitter {
   }
 
   private makeRouterSession(): LiveClient {
+    const systemInstruction = this.targetThreadId
+      ? threadRouterInstruction({
+          thread: this.threadMeta ?? { id: this.targetThreadId, title: "Тред" },
+        })
+      : routerInstruction(this.promptContext);
+
     const client = new LiveClient({
       key: this.pool.key(1),
       model: "gemini-3.8-live",
       voice: this.deps.voice,
       languageCode: this.deps.languageCode,
-      systemInstruction: routerInstruction(this.promptContext),
-      tools: nativeDeclarations(),
+      systemInstruction,
+      tools: nativeDeclarations(this.targetThreadId ?? undefined) as unknown[],
       contextWindowCompression: COMPRESSION,
       wsFactory: this.deps.wsFactory,
     });
@@ -259,11 +327,13 @@ export class CallSession extends EventEmitter {
     return client;
   }
 
-  private toolContext() {
+  private toolContext(): ToolContext {
     return {
       sdk: this.deps.sdk,
       gate: this.gate,
       ledger: this.ledger,
+      targetThreadId: this.targetThreadId ?? undefined,
+      threadMessages: this.threadMessages,
       newActionId: (tool: string) => this.newActionId(tool),
       voiceMemory: {
         add: (text: string) => this.deps.store.addMemory(text),
@@ -409,7 +479,7 @@ export class CallSession extends EventEmitter {
   private async handleNativeCalls(client: LiveClient, calls: Array<{ id?: string; name: string; args: Record<string, unknown> }>) {
     this.setState("working");
     for (const call of calls) {
-      const def = toolByName(call.name);
+      const def = toolByName(call.name, this.targetThreadId ?? undefined);
       if (!def) {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` });
         continue;
@@ -480,7 +550,7 @@ export class CallSession extends EventEmitter {
     this.setState("working");
     const seen = new Map<string, boolean>();
     for (const call of calls) {
-      const def = toolByName(call.name);
+      const def = toolByName(call.name, this.targetThreadId ?? undefined);
       if (!def) {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "SILENT");
         continue;
@@ -608,7 +678,7 @@ export class CallSession extends EventEmitter {
       return;
     }
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
-    const def = toolByName(p.tool);
+    const def = toolByName(p.tool, this.targetThreadId ?? undefined);
     if (!def) return;
     const actionId = this.newActionId(p.tool);
     this.frame({ type: "action", actionId, tool: p.tool, class: p.class, status: "running", summary: p.say });
@@ -664,6 +734,14 @@ export class CallSession extends EventEmitter {
       }
     })();
     await this.spawnPromise;
+  }
+
+  /** Прямой текстовый ввод владельца (из UI чата или тестового скрипта, контракт §12.5). */
+  sendUserMessage(text: string) {
+    if (this.ended || !text.trim()) return;
+    this.frame({ type: "transcript", role: "owner", text: text.trim(), final: true });
+    this.onOwnerUtteranceFinal(text.trim());
+    this.voice?.sendClientContent(text.trim(), true);
   }
 
   /** Аудио владельца из браузера. */
@@ -839,6 +917,10 @@ export class CallSession extends EventEmitter {
     this.gate.decide(confirmationId, decision);
   }
 
+  pendingConfirmation(): PendingConfirmation | null {
+    return this.gate.pendingConfirmation();
+  }
+
   setMuted(muted: boolean) {
     this.muted = muted;
     this.setState(muted ? "muted" : "listening");
@@ -849,10 +931,16 @@ export class CallSession extends EventEmitter {
     this.ended = true;
     const minutes = Math.round((Date.now() - this.startedAt) / 60000);
     const summary = `Звонок завершён (${reason === "owner" ? "по просьбе владельца" : reason === "limit" ? "лимит времени" : "ошибка"}), ${minutes} мин.`;
-    try {
-      await this.deps.endCallThread(summary);
-    } catch {
-      // Тред мог не создаться, если владелец молчал.
+    if (this.threadId && this.threadId !== this.targetThreadId) {
+      try {
+        await this.deps.endCallThread(summary);
+      } catch (e) {
+        // Тихий пропуск недопустим: ошибка пишется в журнал звонка (контракт §13.1)
+        this.deps.store.event(this.deps.callId, "thread_close_failed", {
+          threadId: this.threadId,
+          error: String((e as { message?: unknown })?.message ?? e),
+        });
+      }
     }
     this.voice?.close();
     this.router?.close();
