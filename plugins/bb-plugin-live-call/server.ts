@@ -38,6 +38,11 @@ const rpcContract = defineRpcContract({
         .nullable(),
     }),
   },
+  /** Диагностика браузера, когда WebSocket звонка не открылся (iOS, Connect). */
+  clientLog: {
+    input: z.object({ event: z.string().min(1).max(60), detail: z.string().max(500).optional() }).strict(),
+    output: z.object({ ok: z.boolean() }),
+  },
   probe: {
     input: z.object({}).strict(),
     output: z.object({
@@ -88,7 +93,15 @@ export default async function plugin(bb: BbPluginApi) {
   const bridgeOwner = new Map<string, Sock>();
   const turnClosedWaiters = new Map<string, () => void>();
 
-  let active: { session: CallSession; startedAt: number } | null = null;
+  /** link.sock меняется при переподключении браузера; detached — браузер отвалился, ждём возврата. */
+  let active: {
+    session: CallSession;
+    startedAt: number;
+    link: { sock: Sock };
+    detached: boolean;
+    grace: NodeJS.Timeout | null;
+  } | null = null;
+  const REATTACH_GRACE_MS = 20_000;
   const eventBridge = new EventBridge();
   /** Кеш id проекта «Звонки»: фильтр автопрочтения (треды звонков не должны маячить непрочитанными). */
   let callsProjectCache: string | null = null;
@@ -223,7 +236,15 @@ export default async function plugin(bb: BbPluginApi) {
     const cfg = await settings_get();
     const callId = `call_${Date.now().toString(36)}`;
     const sessionRef: { current: CallSession | null } = { current: null };
-    const toBrowserRef = (f: ServerFrame) => sock.send(JSON.stringify(f));
+    const link = { sock };
+    // Пока браузер отвалился, кадры некуда слать — молча отбрасываем, звонок живёт.
+    const toBrowserRef = (f: ServerFrame) => {
+      try {
+        link.sock.send(JSON.stringify(f));
+      } catch {
+        // сокет закрыт
+      }
+    };
     const session = new CallSession({
       callId,
       keys,
@@ -236,7 +257,13 @@ export default async function plugin(bb: BbPluginApi) {
       store,
       sdk: bb.sdk,
       toBrowser: toBrowserRef,
-      sendBrowserAudio: (turnSeq, pcm) => sock.send(packFrame(FRAME_PLAYBACK, turnSeq, pcm)),
+      sendBrowserAudio: (turnSeq, pcm) => {
+        try {
+          link.sock.send(packFrame(FRAME_PLAYBACK, turnSeq, pcm));
+        } catch {
+          // браузер отвалился
+        }
+      },
       wsFactory: (url) => {
         bb.log.info(`gemini ws connect ${url.replace(/key=[^&]+/, "key=…")}`);
         const w = new WebSocket(url);
@@ -252,7 +279,7 @@ export default async function plugin(bb: BbPluginApi) {
     session.on("ended", () => {
       active = null;
     });
-    active = { session, startedAt: Date.now() };
+    active = { session, startedAt: Date.now(), link, detached: false, grace: null };
     await session.start();
     // Лимит минут: проверка раз в 30 с (спека §4).
     const interval = setInterval(() => {
@@ -285,7 +312,7 @@ export default async function plugin(bb: BbPluginApi) {
       const state: { session: CallSession | null; helloTimer: NodeJS.Timeout | null } = { session: null, helloTimer: null };
       return {
         onOpen: (sock: Sock) => {
-          if (active) {
+          if (active && !active.detached) {
             sock.send(JSON.stringify({ type: "error", code: "busy", message: "уже идёт звонок", retryable: false } satisfies ServerFrame));
             sock.close(BUSY_CLOSE_CODE, "busy");
             return;
@@ -307,6 +334,28 @@ export default async function plugin(bb: BbPluginApi) {
             const frame = parsed.data;
             if (frame.type === "hello") {
               if (state.helloTimer) clearTimeout(state.helloTimer);
+              if (frame.resume) {
+                // Возврат после обрыва: тот же звонок, новые сокет и кадры.
+                if (active && active.detached && active.session.callId === frame.resume) {
+                  if (active.grace) clearTimeout(active.grace);
+                  active.grace = null;
+                  active.detached = false;
+                  active.link.sock = sock;
+                  state.session = active.session;
+                  bb.log.info(`браузер вернулся в звонок ${frame.resume}`);
+                  store.event(frame.resume, "client_log", { event: "reattached" });
+                  active.session.resendReady();
+                } else {
+                  sock.send(JSON.stringify({ type: "error", code: "call_gone", message: "звонок уже завершён", retryable: false } satisfies ServerFrame));
+                  sock.close(BUSY_CLOSE_CODE, "call gone");
+                }
+                return;
+              }
+              if (active) {
+                sock.send(JSON.stringify({ type: "error", code: "busy", message: "уже идёт звонок", retryable: false } satisfies ServerFrame));
+                sock.close(BUSY_CLOSE_CODE, "busy");
+                return;
+              }
               const fallback = str((await settings_get()).defaultMode, "normal") === "extended" ? "extended" : "normal";
               try {
                 state.session = await startCall(sock, frame.mode ?? fallback);
@@ -337,9 +386,19 @@ export default async function plugin(bb: BbPluginApi) {
             // Мусорный кадр игнорируем: протокол требует строгого заголовка.
           }
         },
-        onClose: () => {
+        onClose: (sock: Sock) => {
           if (state.helloTimer) clearTimeout(state.helloTimer);
-          void state.session?.end("error");
+          const s = state.session;
+          if (!s || !active || active.session !== s || active.link.sock !== sock) return;
+          // Обрыв браузера (мобильная сеть, Connect, свернули приложение): звонок не рвём,
+          // ждём возврата 20 с — фронтенд переподключается сам с hello { resume }.
+          active.detached = true;
+          bb.log.warn(`браузер отвалился от звонка ${s.callId}, жду возврата ${REATTACH_GRACE_MS / 1000} с`);
+          store.event(s.callId, "client_log", { event: "detached" });
+          const a = active;
+          a.grace = setTimeout(() => {
+            if (active === a && a.detached) void s.end("error");
+          }, REATTACH_GRACE_MS);
         },
       };
     },
@@ -488,6 +547,10 @@ export default async function plugin(bb: BbPluginApi) {
             }
           : null,
       };
+    },
+    clientLog: async ({ event, detail }) => {
+      bb.log.warn(`браузер (rpc): ${event}${detail ? ` — ${detail}` : ""}`);
+      return { ok: true };
     },
     probe: async () => {
       const keys = await keysList();

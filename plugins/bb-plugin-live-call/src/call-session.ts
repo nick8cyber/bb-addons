@@ -119,6 +119,20 @@ export class CallSession extends EventEmitter {
     this.frame({ type: "state", state: s, detail });
   }
 
+  /** Браузер вернулся после обрыва WS: повторить ready, тред и состояние (сессии Gemini живы). */
+  resendReady() {
+    if (this.ended) return;
+    this.frame({
+      type: "ready",
+      callId: this.deps.callId,
+      mode: this.mode,
+      voice: this.deps.voice,
+      keys: { active: this.pool.active, of: this.pool.of },
+    });
+    if (this.threadId) this.frame({ type: "thread", threadId: this.threadId });
+    this.setState(this.muted ? "muted" : "listening");
+  }
+
   async start() {
     this.deps.store.startCall(this.deps.callId);
     this.deps.store.setModeHistory(this.deps.callId, this.modeHistory);

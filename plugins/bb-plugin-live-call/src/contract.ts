@@ -56,6 +56,8 @@ export const clientFrame = z.discriminatedUnion("type", [
     type: z.literal("hello"),
     protocol: z.literal(PROTOCOL_VERSION),
     mode: z.enum(["normal", "extended"]).optional(),
+    /** Переподключение к идущему звонку после обрыва WS (мобильная сеть, Connect). */
+    resume: z.string().min(1).optional(),
   }),
   z.object({ type: z.literal("mute"), muted: z.boolean() }),
   z.object({ type: z.literal("playback_drained"), turnSeq: z.number().int().nonnegative() }),

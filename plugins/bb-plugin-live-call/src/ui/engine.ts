@@ -270,36 +270,80 @@ export class CallEngine {
     }
     this.releaseAudio();
     this.ownerHeard = false;
+    this.endRequested = false;
     this.view = { ...IDLE, phase: "connecting", orb: "connecting", expandSignal: this.view.expandSignal + 1 };
     this.patch({});
+    // iOS WebKit (Safari и приложение BB): звук живёт, только если AudioContext
+    // создан и запущен прямо в нажатии. Раньше он создавался после ответа сервера —
+    // на айфоне оставался «спящим», микрофон и динамик молчали.
+    this.unlockAudio();
+    this.openSocket(mode ? { mode } : {});
+  }
+
+  private endRequested = false;
+  private reconnectTries = 0;
+  private liveSince = 0;
+
+  /** Сокет звонка: первый вход ({mode}) или возврат после обрыва ({resume: callId}). */
+  private openSocket(hello: { mode?: CallMode; resume?: string }) {
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     const sock = new WebSocket(`${wsProto}//${location.host}${CALL_WS_PATH}`);
     sock.binaryType = "arraybuffer";
     this.sock = sock;
-    sock.onopen = () => sock.send(JSON.stringify({ type: "hello", protocol: 1, ...(mode ? { mode } : {}) }));
+    let opened = false;
+    const openTimer = setTimeout(() => {
+      if (opened || this.sock !== sock) return;
+      this.diag("ws_open_timeout", `12 с без открытия; host=${location.host}; resume=${hello.resume ?? "-"}`);
+      if (!hello.resume) this.patch({ error: { code: "connect", message: "Сервер звонка не ответил за 12 с" } });
+      sock.close();
+    }, 12_000);
+    sock.onopen = () => {
+      opened = true;
+      clearTimeout(openTimer);
+      sock.send(JSON.stringify({ type: "hello", protocol: 1, ...hello }));
+    };
     sock.onmessage = (ev: MessageEvent) => void this.onMessage(ev);
     sock.onerror = () => {
       if (this.view.phase === "connecting") {
         this.patch({ error: { code: "connect", message: "Не удалось подключиться к серверу звонка" } });
       }
     };
-    sock.onclose = () => {
+    sock.onclose = (ev: CloseEvent) => {
+      clearTimeout(openTimer);
       if (this.sock !== sock) return;
       this.sock = null;
-      this.releaseAudio();
       if (this.view.phase === "connecting") {
+        this.diag("ws_closed_before_ready", `code=${ev.code} reason=${ev.reason || "-"} opened=${opened}`);
+        this.releaseAudio();
         this.patch({
           phase: "failed",
           orb: "ended",
           error: this.view.error ?? { code: "connect", message: "Соединение со звонком закрылось до начала" },
         });
-      } else if (this.view.phase === "live") {
-        this.patch({ phase: "ended", orb: "ended", endedAt: Date.now(), endReason: this.view.endReason ?? "connection", confirmation: null });
+        return;
       }
+      if (this.view.phase !== "live") return;
+      // Обрыв посреди звонка (мобильная сеть, Connect, свернули приложение): сервер
+      // держит звонок 20 с — возвращаемся в тот же звонок, звук и лента не трогаются.
+      const lived = Math.round((Date.now() - this.liveSince) / 1000);
+      this.diag("ws_closed_live", `code=${ev.code} reason=${ev.reason || "-"} после ${lived} с; попытка ${this.reconnectTries + 1}`);
+      if (!this.endRequested && this.view.callId && this.reconnectTries < 5 && ev.code !== 4009) {
+        this.reconnectTries += 1;
+        this.player?.interrupted();
+        this.patch({ orb: "reconnecting", stateDetail: "связь прервалась" });
+        const callId = this.view.callId;
+        setTimeout(() => {
+          if (this.view.phase === "live" && !this.sock) this.openSocket({ resume: callId });
+        }, Math.min(500 * 2 ** (this.reconnectTries - 1), 4000));
+        return;
+      }
+      this.releaseAudio();
+      this.patch({ phase: "ended", orb: "ended", endedAt: Date.now(), endReason: this.view.endReason ?? "connection", confirmation: null });
     };
   }
 
   end() {
+    this.endRequested = true;
     if (this.sock?.readyState === WebSocket.OPEN) this.send({ type: "end" });
     else if (this.view.phase === "connecting") {
       this.sock?.close();
@@ -395,7 +439,17 @@ export class CallEngine {
       return;
     }
     switch (frame.type) {
-      case "ready":
+      case "ready": {
+        const resumed = this.view.phase === "live" && this.view.callId === frame.callId;
+        this.liveSince = Date.now();
+        if (resumed) {
+          // Возврат после обрыва: микрофон и плеер уже работают, лента та же.
+          this.reconnectTries = 0;
+          this.patch({ orb: this.view.muted ? "muted" : "listening", stateDetail: null, mode: frame.mode, keys: frame.keys });
+          this.push({ kind: "notice", id: this.nextId("n"), tone: "info", text: "Связь восстановлена" });
+          if (this.view.muted) this.send({ type: "mute", muted: true });
+          break;
+        }
         this.patch({
           phase: "live",
           orb: "listening",
@@ -406,6 +460,7 @@ export class CallEngine {
         });
         await this.startAudio();
         break;
+      }
       case "thread":
         this.patch({ threadId: frame.threadId });
         break;
@@ -554,6 +609,75 @@ export class CallEngine {
     this.push({ kind: "line", id: this.nextId("l"), role, text, final });
   }
 
+  /** Создать и разбудить AudioContext синхронно в нажатии (обязательно для iOS). */
+  private unlockAudio() {
+    try {
+      const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AC) return;
+      const ctx = new AC();
+      this.ctx = ctx;
+      void ctx.resume().catch(() => {});
+      // Тихий сэмпл в том же нажатии — iOS после этого считает звук разрешённым.
+      const buf = ctx.createBuffer(1, 1, 22050);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start(0);
+    } catch {
+      this.ctx = null;
+    }
+  }
+
+  /**
+   * Диагностика браузера в журнал сервера. Пока WS не открыт — через RPC
+   * (обычный запрос BB, работает и там, где WebSocket плагина не прошёл).
+   */
+  private diag(event: string, detail: string) {
+    const env = [
+      `ua=${navigator.userAgent.slice(0, 120)}`,
+      `secure=${String(window.isSecureContext)}`,
+      `mediaDevices=${String(Boolean(navigator.mediaDevices?.getUserMedia))}`,
+      `worklet=${String(typeof AudioWorkletNode !== "undefined")}`,
+      `ctx=${this.ctx?.state ?? "none"}`,
+    ].join(" ");
+    const payload = { event, detail: `${detail} | ${env}`.slice(0, 500) };
+    if (this.sock?.readyState === WebSocket.OPEN) {
+      this.send({ type: "client_log", ...payload });
+      return;
+    }
+    void fetch("/api/v1/plugins/live-call/rpc/clientLog", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  }
+
+  /** Обработка куска микрофона (общая для AudioWorklet и запасного ScriptProcessor). */
+  private onMicChunk(f32: Float32Array, state: { silent: number }) {
+    const sock = this.sock;
+    if (!sock || sock.readyState !== WebSocket.OPEN) return;
+    const i16 = new Int16Array(f32.length);
+    let peak = 0;
+    for (let i = 0; i < f32.length; i++) {
+      const x = Math.max(-1, Math.min(1, f32[i]));
+      const v = Math.abs(x);
+      if (v > peak) peak = v;
+      i16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
+    }
+    this.level.set(this.view.muted ? 0 : Math.min(1, peak * 2.2));
+    if (peak > 0.01) {
+      state.silent = 0;
+      if (this.ownerHeard && this.view.micWarning?.startsWith("Микрофон молчит")) this.patch({ micWarning: null });
+    } else {
+      state.silent += 1;
+      if (state.silent === 25 && !this.ownerHeard) {
+        this.patch({ micWarning: "Микрофон молчит — проверь, не выключен ли он в системе или браузере" });
+        this.diag("mic_silent", "peak=0 около 3 c");
+      }
+    }
+    sock.send(packFrame(0x01, 0, new Uint8Array(i16.buffer)));
+  }
+
   private async startAudio() {
     const sock = this.sock;
     if (!sock) return;
@@ -574,7 +698,7 @@ export class CallEngine {
           this.patch({ micWarning: `Микрофон по умолчанию — iPhone, взял «${better.label.slice(0, 40)}»` });
         }
       }
-      if (this.sock !== sock) {
+      if (this.view.phase !== "live") {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
@@ -582,45 +706,50 @@ export class CallEngine {
       const micId = track?.getSettings().deviceId ?? "";
       localStorage.setItem(MIC_PREF_KEY, micId);
       this.stream = stream;
-      const ctx = new AudioContext();
-      this.ctx = ctx;
-      await ctx.resume();
-      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })));
-      const worklet = new AudioWorkletNode(ctx, "live-call-capture");
-      this.worklet = worklet;
-      let silentChunks = 0;
-      worklet.port.onmessage = (e: MessageEvent<Float32Array>) => {
-        if (sock.readyState !== WebSocket.OPEN) return;
-        const f32 = e.data;
-        const i16 = new Int16Array(f32.length);
-        let peak = 0;
-        for (let i = 0; i < f32.length; i++) {
-          const x = Math.max(-1, Math.min(1, f32[i]));
-          const v = Math.abs(x);
-          if (v > peak) peak = v;
-          i16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
-        }
-        this.level.set(this.view.muted ? 0 : Math.min(1, peak * 2.2));
-        if (peak > 0.01) {
-          silentChunks = 0;
-          if (this.ownerHeard && this.view.micWarning?.startsWith("Микрофон молчит")) this.patch({ micWarning: null });
-        } else {
-          silentChunks += 1;
-          if (silentChunks === 25 && !this.ownerHeard) {
-            this.patch({ micWarning: "Микрофон молчит — проверь, не выключен ли он в системе или браузере" });
-            this.send({ type: "client_log", event: "mic_silent", detail: "peak=0 около 3 c" });
+      let ctx = this.ctx;
+      if (!ctx || ctx.state === "closed") {
+        ctx = new AudioContext();
+        this.ctx = ctx;
+      }
+      await ctx.resume().catch(() => {});
+      const micState = { silent: 0 };
+      let capture: AudioNode;
+      try {
+        if (!ctx.audioWorklet) throw new Error("AudioWorklet недоступен");
+        await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })));
+        const worklet = new AudioWorkletNode(ctx, "live-call-capture");
+        worklet.port.onmessage = (e: MessageEvent<Float32Array>) => this.onMicChunk(e.data, micState);
+        capture = worklet;
+      } catch (e) {
+        // Запасной путь (старый WebKit, WebView без AudioWorklet): ScriptProcessor + то же прореживание до 16 кГц.
+        this.diag("worklet_fallback", e instanceof Error ? e.message : String(e));
+        const proc = ctx.createScriptProcessor(4096, 1, 1);
+        const ratio = ctx.sampleRate / 16000;
+        let pos = 0;
+        proc.onaudioprocess = (ev: AudioProcessingEvent) => {
+          const ch = ev.inputBuffer.getChannelData(0);
+          const out: number[] = [];
+          for (let i = 0; i < ch.length; i++) {
+            pos += 1;
+            if (pos >= ratio) {
+              pos -= ratio;
+              out.push(ch[i]);
+            }
           }
-        }
-        sock.send(packFrame(0x01, 0, new Uint8Array(i16.buffer)));
-      };
+          this.onMicChunk(Float32Array.from(out), micState);
+        };
+        capture = proc;
+      }
+      this.worklet = capture as AudioWorkletNode;
       this.source = ctx.createMediaStreamSource(stream);
-      this.source.connect(worklet);
-      worklet.connect(ctx.destination); // worklet требует выхода, но молчит
+      this.source.connect(capture);
+      capture.connect(ctx.destination); // узлу захвата нужен выход, но он молчит
       // Плеер на ТОМ ЖЕ контексте, что и захват: голос агента — опорный сигнал AEC.
       this.player = new TurnPlayer(ctx, (turnSeq) => this.send({ type: "playback_drained", turnSeq }));
       const devices = await navigator.mediaDevices.enumerateDevices();
       const mics = devices.filter((d) => d.kind === "audioinput").map((d, i) => ({ id: d.deviceId, label: d.label || `Микрофон ${i + 1}` }));
       this.patch({ mics, micId });
+      this.diag("audio_ready", `rate=${ctx.sampleRate} track=${(track?.label ?? "").slice(0, 40)}`);
       const nav = navigator as Navigator & { wakeLock?: { request(type: "screen"): Promise<{ release(): Promise<void> }> } };
       this.wakeLock = (await nav.wakeLock?.request("screen").catch(() => null)) ?? null;
     } catch (e) {
@@ -631,7 +760,7 @@ export class CallEngine {
           ? "Браузер не дал доступ к микрофону: нажми на замок в адресной строке → Микрофон → Разрешить"
           : `Микрофон недоступен: ${message}`,
       });
-      this.send({ type: "client_log", event: "mic_error", detail: message.slice(0, 200) });
+      this.diag("mic_error", message.slice(0, 200));
     }
   }
 }

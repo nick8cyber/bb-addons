@@ -51,7 +51,7 @@ bytes 5..   PCM16 LE, моно: 0x01 — 16 кГц, 20 мс = 640 байт; 0x02
 
 | `type` | Поля | Смысл |
 |---|---|---|
-| `hello` | `protocol: 1`, `mode?: "normal"\|"extended"` | Первый кадр. Без него через 5 с соединение закрывается |
+| `hello` | `protocol: 1`, `mode?: "normal"\|"extended"`, `resume?: callId` — возврат в идущий звонок после обрыва (сервер ждёт 20 с, иначе `error { code: "call_gone" }` + 4009) | Первый кадр. Без него через 5 с соединение закрывается |
 | `mute` | `muted: boolean` | Микрофон выключен: сервер шлёт в Gemini тишину |
 | `playback_drained` | `turnSeq: number` | Плеер доиграл последний кадр хода (§7.1 п. 3 спеки) |
 | `switch_mode` | `mode` | Переключение режима, отклоняется при pending (`error { code: "pending_confirmation" }`) |
