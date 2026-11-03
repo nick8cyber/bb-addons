@@ -59,6 +59,7 @@ export const clientFrame = z.discriminatedUnion("type", [
     /** Переподключение к идущему звонку после обрыва WS (мобильная сеть, Connect). */
     resume: z.string().min(1).optional(),
     threadId: z.string().min(1).optional(),
+    projectId: z.string().min(1).optional(),
   }),
   z.object({ type: z.literal("mute"), muted: z.boolean() }),
   z.object({ type: z.literal("playback_drained"), turnSeq: z.number().int().nonnegative() }),
@@ -87,6 +88,7 @@ export const serverFrame = z.discriminatedUnion("type", [
     voice: z.string(),
     keys: z.object({ active: z.number().int().min(1).max(2), of: z.number().int().min(1).max(2) }),
     targetThreadId: z.string().optional(),
+    targetProjectId: z.string().optional(),
   }),
   z.object({ type: z.literal("thread"), threadId: z.string() }),
   z.object({ type: z.literal("state"), state: stateSchema, detail: z.string().optional() }),

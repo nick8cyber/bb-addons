@@ -29,6 +29,7 @@ import { argsHash } from "./src/confirmation-gate.js";
 import { decideHello } from "./src/reattach.js";
 import { toolByName } from "./src/tools.js";
 import { createCallThreadManager, closeStaleCallThreads } from "./src/thread-lifecycle.js";
+import { ProjectRegistryManager } from "./src/project-registry.js";
 
 const rpcContract = defineRpcContract({
   status: {
@@ -52,6 +53,34 @@ const rpcContract = defineRpcContract({
       extendedNativeTools: z.boolean(),
       checkedAt: z.string(),
       detail: z.string().optional(),
+    }),
+  },
+  projectCallsList: {
+    input: z.object({}).strict(),
+    output: z.object({
+      projects: z.array(
+        z.object({
+          projectId: z.string(),
+          title: z.string(),
+          state: z.enum(["approved", "pending", "invalid"]),
+          hash: z.string().optional(),
+          diff: z.array(z.string()).optional(),
+          error: z.string().optional(),
+        }),
+      ),
+    }),
+  },
+  projectCallsApprove: {
+    input: z.object({ projectId: z.string(), hash: z.string() }).strict(),
+    output: z.object({
+      ok: z.boolean(),
+      error: z.string().optional(),
+    }),
+  },
+  projectCallsReject: {
+    input: z.object({ projectId: z.string() }).strict(),
+    output: z.object({
+      ok: z.boolean(),
     }),
   },
 });
@@ -82,6 +111,17 @@ export default async function plugin(bb: BbPluginApi) {
     },
     callsProjectId: { type: "string", label: "Проект «Звонки»", description: "Оставь пустым: плагин создаст проект сам при первом звонке." },
     callsWorkspacePath: { type: "string", label: "Папка проекта «Звонки»", description: "Пустая папка на основном хосте, код в ней не живёт." },
+    projectCalls: {
+      type: "string",
+      label: "Реестр звонков по проектам",
+      description: "JSON-реестр звонков по проектам (§15.2)",
+    },
+    projectSecrets: {
+      type: "string",
+      secret: true,
+      label: "Секреты коннекторов проектов",
+      description: "Секреты для коннекторов проектов (§15.2): KEY=VALUE построчно или JSON",
+    },
   });
 
   const str = (v: unknown, fallback: string): string => {
@@ -92,6 +132,7 @@ export default async function plugin(bb: BbPluginApi) {
     typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
 
   const store = new CallStore(bb.storage.database());
+  const projectRegistry = new ProjectRegistryManager(store);
   const bridges = new Set<Sock>();
   const bridgeOwner = new Map<string, Sock>();
   const turnClosedWaiters = new Map<string, () => void>();
@@ -126,6 +167,31 @@ export default async function plugin(bb: BbPluginApi) {
     const raw = (await settings_get()).geminiKeys;
     if (typeof raw !== "string") return [];
     return raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 2);
+  };
+
+  const getProjectSecrets = async (): Promise<Record<string, string>> => {
+    const raw = str((await settings_get()).projectSecrets, "");
+    if (!raw) return {};
+    try {
+      const obj = JSON.parse(raw) as Record<string, unknown>;
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(obj)) out[k] = String(v ?? "");
+        return out;
+      }
+    } catch {
+      // Построчный формат KEY=VALUE
+    }
+    const out: Record<string, string> = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const idx = trimmed.indexOf("=");
+      if (idx !== -1) {
+        out[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
+      }
+    }
+    return out;
   };
 
   /** Проект «Звонки»: создаётся при первом звонке (контракт §6 п. 1). */
@@ -212,7 +278,12 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  const startCall = async (sock: Sock, mode: "normal" | "extended", targetThreadId?: string): Promise<CallSession> => {
+  const startCall = async (
+    sock: Sock,
+    mode: "normal" | "extended",
+    targetThreadId?: string,
+    targetProjectId?: string,
+  ): Promise<CallSession> => {
     const keys = await keysList();
     if (keys.length === 0) {
       const frame: ServerFrame = { type: "error", code: "no_keys", message: "нет ключей Gemini в настройках плагина", retryable: false };
@@ -221,6 +292,17 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("no keys");
     }
     const cfg = await settings_get();
+    const rawRegistry = typeof cfg.projectCalls === "string" ? cfg.projectCalls : "";
+    const list = projectRegistry.listProjects(rawRegistry);
+    const pendingChanges = list
+      .filter((p) => p.state === "pending" && p.hash && p.diff && p.diff.length > 0)
+      .map((p) => ({
+        projectId: p.projectId,
+        title: p.title,
+        hash: p.hash!,
+        diff: p.diff!,
+      }));
+    const projectSecrets = await getProjectSecrets();
     const callId = `call_${Date.now().toString(36)}`;
     const sessionRef: { current: CallSession | null } = { current: null };
     const link = { sock };
@@ -245,6 +327,21 @@ export default async function plugin(bb: BbPluginApi) {
       store,
       sdk: bb.sdk,
       targetThreadId,
+      targetProjectId,
+      projectRegistry,
+      projectSecrets,
+      rawProjectRegistry: rawRegistry,
+      pendingRegistryChanges: pendingChanges,
+      onApproveRegistry: (pid, h) => {
+        projectRegistry.approve(pid, h, rawRegistry);
+        bb.log.info(`реестр проекта ${pid} подтверждён голосом`);
+        store.event("registry", "registry_approved", { projectId: pid, hash: h });
+      },
+      onRejectRegistry: (pid) => {
+        projectRegistry.reject(pid);
+        bb.log.info(`реестр проекта ${pid} отклонён голосом`);
+        store.event("registry", "registry_rejected", { projectId: pid });
+      },
       storageDir: join(bb.server.experimental_dataDir, "plugins", "live-call", "brain-files"),
       log: bb.log,
       toBrowser: toBrowserRef,
@@ -375,6 +472,42 @@ export default async function plugin(bb: BbPluginApi) {
                 sock.close(BUSY_CLOSE_CODE, "busy");
                 return;
               }
+              if (frame.threadId && frame.projectId) {
+                sock.send(JSON.stringify({
+                  type: "error",
+                  code: "bad_hello",
+                  message: "в одном hello не бывает и threadId, и projectId",
+                  retryable: false,
+                } satisfies ServerFrame));
+                sock.close(BUSY_CLOSE_CODE, "bad hello");
+                return;
+              }
+              if (frame.projectId) {
+                const cfg = await settings_get();
+                const raw = typeof cfg.projectCalls === "string" ? cfg.projectCalls : "";
+                const projects = projectRegistry.listProjects(raw);
+                const item = projects.find((p) => p.projectId === frame.projectId);
+                if (!item) {
+                  sock.send(JSON.stringify({
+                    type: "error",
+                    code: "project_not_configured",
+                    message: `для проекта ${frame.projectId} звонок не настроен`,
+                    retryable: false,
+                  } satisfies ServerFrame));
+                  sock.close(BUSY_CLOSE_CODE, "project not configured");
+                  return;
+                }
+                if (item.state === "invalid") {
+                  sock.send(JSON.stringify({
+                    type: "error",
+                    code: "invalid_registry",
+                    message: item.error ?? "ошибка в настройках реестра проекта",
+                    retryable: false,
+                  } satisfies ServerFrame));
+                  sock.close(BUSY_CLOSE_CODE, "invalid registry");
+                  return;
+                }
+              }
               if (frame.threadId) {
                 let targetThread: Record<string, unknown> | null = null;
                 try {
@@ -400,7 +533,7 @@ export default async function plugin(bb: BbPluginApi) {
               // («системная ошибка», нет инструментов). Любой звонок — одна сессия gemini-3.8-live.
               const callMode = "normal" as const;
               try {
-                state.session = await startCall(sock, callMode, frame.threadId);
+                state.session = await startCall(sock, callMode, frame.threadId, frame.projectId);
               } catch {
                 // Ошибка уже ушла фреймом и соединение закрыто.
               }
@@ -603,6 +736,27 @@ export default async function plugin(bb: BbPluginApi) {
       if (keys.length === 0) return { extendedNativeTools: false, checkedAt: new Date().toISOString(), detail: "нет ключей" };
       const result = await probeExtended(keys[0], bb);
       return { ...result, checkedAt: new Date().toISOString() };
+    },
+    projectCallsList: async () => {
+      const cfg = await settings_get();
+      const raw = typeof cfg.projectCalls === "string" ? cfg.projectCalls : "";
+      const projects = projectRegistry.listProjects(raw);
+      return { projects };
+    },
+    projectCallsApprove: async ({ projectId, hash }) => {
+      const cfg = await settings_get();
+      const raw = typeof cfg.projectCalls === "string" ? cfg.projectCalls : "";
+      const res = projectRegistry.approve(projectId, hash, raw);
+      if (res.ok) {
+        bb.log.info(`реестр проекта ${projectId} подтверждён (hash=${hash.slice(0, 8)})`);
+        store.event("registry", "registry_approved", { projectId, hash });
+      }
+      return res;
+    },
+    projectCallsReject: async ({ projectId }) => {
+      bb.log.info(`реестр проекта ${projectId} отклонён`);
+      store.event("registry", "registry_rejected", { projectId });
+      return projectRegistry.reject(projectId);
     },
   });
 

@@ -12,17 +12,20 @@ import {
   type ServerFrame,
 } from "./contract.js";
 import { ConfirmationGate, argsHash, type PendingConfirmation } from "./confirmation-gate.js";
+import { classify } from "./classify.js";
 import { ContextLedger } from "./context-ledger.js";
 import { KeyPool, QuotaExhaustedError } from "./key-pool.js";
 import { LiveClient } from "./live-client.js";
-import { EMPTY_CONTEXT, routerInstruction, threadRouterInstruction, threadVoiceInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
-import { TOOLS, capabilityList, nativeDeclarations, runToolCall, toolByName } from "./tools.js";
+import { EMPTY_CONTEXT, projectVoiceInstruction, routerInstruction, threadRouterInstruction, threadVoiceInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
+import { TOOLS, capabilityList, getProjectTools, nativeDeclarations, runToolCall, toolByName, type ToolDef } from "./tools.js";
 import type { ToolClass, ToolResult } from "./contract.js";
 import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
 import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
 import { BrainCenter } from "./brain-center.js";
+import { McpClient, makeConnectorToolName, mcpSchemaToGeminiParameters } from "./mcp-client.js";
+import { ProjectRegistryManager, readProjectRepoConfig, resolveStrictClass, type ProjectConfig } from "./project-registry.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -53,6 +56,13 @@ export interface CallSessionDeps {
   endCallThread: (summary: string) => Promise<void>;
   wsFactory?: (url: string) => WebSocket;
   targetThreadId?: string;
+  targetProjectId?: string;
+  projectRegistry?: ProjectRegistryManager;
+  projectSecrets?: Record<string, string>;
+  rawProjectRegistry?: string;
+  pendingRegistryChanges?: Array<{ projectId: string; title: string; hash: string; diff: string[] }>;
+  onApproveRegistry?: (projectId: string, hash: string) => void;
+  onRejectRegistry?: (projectId: string) => void;
   storageDir?: string;
   /** Проект «Звонки» — сюда идёт мозговой центр для не-git треда (служебная папка плагина). */
   callsProjectId?: string;
@@ -66,6 +76,13 @@ export class CallSession extends EventEmitter {
   mode: "normal" | "extended";
   threadId: string | null = null;
   readonly targetThreadId: string | null = null;
+  readonly targetProjectId: string | null = null;
+  private projectTitle: string | null = null;
+  private repoPromptMd: string | null = null;
+  private connectorClients: McpClient[] = [];
+  private projectConnectorTools: ToolDef[] = [];
+  private failedConnectorIds: string[] = [];
+  private pendingRegistry: { projectId: string; title: string; hash: string; diff: string[] } | null = null;
   private threadMessages: ThreadMessage[] = [];
   private threadMeta: {
     id: string;
@@ -126,8 +143,12 @@ export class CallSession extends EventEmitter {
   constructor(private deps: CallSessionDeps) {
     super();
     this.targetThreadId = deps.targetThreadId ?? null;
+    this.targetProjectId = deps.targetProjectId ?? null;
+    if (deps.pendingRegistryChanges && deps.pendingRegistryChanges.length > 0) {
+      this.pendingRegistry = deps.pendingRegistryChanges[0];
+    }
     // Extended отключён (ADR-0006, пересмотр 2): без allowExtended любой звонок — normal.
-    this.mode = this.targetThreadId || (deps.mode === "extended" && !deps.allowExtended) ? "normal" : deps.mode;
+    this.mode = this.targetThreadId || this.targetProjectId || (deps.mode === "extended" && !deps.allowExtended) ? "normal" : deps.mode;
     this.modeHistory = [this.mode];
     this.pool = new KeyPool(deps.keys, {
       onWarning: (m) => this.frame({ type: "warning", code: "tpm_near_limit", message: m }),
@@ -172,6 +193,7 @@ export class CallSession extends EventEmitter {
       voice: this.deps.voice,
       keys: { active: this.pool.active, of: this.pool.of },
       targetThreadId: this.targetThreadId ?? undefined,
+      targetProjectId: this.targetProjectId ?? undefined,
     });
     if (this.threadId) this.frame({ type: "thread", threadId: this.threadId });
     this.setState(this.muted ? "muted" : "listening");
@@ -337,6 +359,14 @@ export class CallSession extends EventEmitter {
           );
         }
       });
+      if (targetProjectId) {
+        await this.initProjectConnectors(targetProjectId);
+      }
+    } else if (this.targetProjectId) {
+      this.deps.store.startCall(this.deps.callId);
+      this.deps.store.event(this.deps.callId, "call_started", { projectId: this.targetProjectId });
+      this.nowUtc = new Date().toISOString();
+      await this.initProjectConnectors(this.targetProjectId);
     } else {
       this.deps.store.startCall(this.deps.callId);
     }
@@ -356,6 +386,7 @@ export class CallSession extends EventEmitter {
       voice: this.deps.voice,
       keys: { active: this.pool.active, of: this.pool.of },
       targetThreadId: this.targetThreadId ?? undefined,
+      targetProjectId: this.targetProjectId ?? undefined,
     });
     if (this.threadId) {
       this.frame({ type: "thread", threadId: this.threadId });
@@ -408,21 +439,124 @@ export class CallSession extends EventEmitter {
     return (this.voice ? 1 : 0) + (this.router ? 1 : 0);
   }
 
+  private async initProjectConnectors(projectId: string): Promise<void> {
+    for (const c of this.connectorClients) {
+      try {
+        c.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.connectorClients = [];
+    this.projectConnectorTools = [];
+    this.failedConnectorIds = [];
+
+    let projectTitle = projectId;
+    let projectRoot = "";
+    try {
+      const p = (await this.deps.sdk.projects.get({ projectId })) as Record<string, unknown>;
+      if (p?.name) projectTitle = String(p.name);
+      const sources = (p?.sources ?? []) as Array<{ path?: string; isDefault?: boolean }>;
+      projectRoot = sources.find((s) => s.isDefault)?.path ?? sources[0]?.path ?? "";
+    } catch {
+      // fallback
+    }
+    this.projectTitle = projectTitle;
+    const repoEnv = readProjectRepoConfig(projectRoot);
+    this.repoPromptMd = repoEnv.promptMd ?? null;
+
+    const approved = this.deps.projectRegistry?.getApprovedConfig(projectId);
+    if (!approved) return;
+
+    const connectorResults: Array<{ id: string; tools: string[]; ok: boolean }> = [];
+    for (const connCfg of approved.config.connectors) {
+      const client = new McpClient(connCfg, this.deps.projectSecrets, this.deps.log);
+      this.connectorClients.push(client);
+      try {
+        const tools = await client.start(10_000);
+        const toolNames: string[] = [];
+        const connTools = connCfg.tools as Record<string, any> | undefined;
+        for (const t of tools) {
+          const regCls = (connTools?.[t.name] ?? connCfg.defaultClass) as any;
+          const strictCls = resolveStrictClass(regCls, repoEnv.tools?.[t.name]);
+          if (strictCls === "deny") continue;
+          toolNames.push(t.name);
+          const toolDef: ToolDef = {
+            name: makeConnectorToolName(connCfg.id, t.name),
+            cls: strictCls as ToolClass,
+            word: strictCls === "C" ? "да" : strictCls === "P" ? "разрешаю" : strictCls === "L" ? "запускай" : "",
+            description: t.description || `Ручка ${t.name} коннектора ${connCfg.id}`,
+            parameters: mcpSchemaToGeminiParameters(t.inputSchema),
+            confirmSay: () => `Выполнить ${t.name} в ${connCfg.id}?`,
+            execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+              const startMs = Date.now();
+              const res = await client.callTool(t.name, args, 30_000);
+              const ms = Date.now() - startMs;
+              this.deps.store.event(this.deps.callId, "connector_call", {
+                connector: connCfg.id,
+                tool: t.name,
+                cls: strictCls,
+                ms,
+                ok: res.ok,
+              });
+              if (!res.ok) {
+                return {
+                  ok: false,
+                  error: res.error ?? { code: "connector_error", message: "ошибка вызова коннектора" },
+                };
+              }
+              return { ok: true, data: res.data ?? { result: "" } };
+            },
+          };
+          this.projectConnectorTools.push(toolDef);
+        }
+        connectorResults.push({ id: connCfg.id, tools: toolNames, ok: true });
+      } catch (e) {
+        this.failedConnectorIds.push(connCfg.id);
+        connectorResults.push({ id: connCfg.id, tools: [], ok: false });
+        this.deps.log?.warn?.(`коннектор ${connCfg.id} недоступен: ${String(e)}`);
+      }
+    }
+    if (connectorResults.length > 0) {
+      this.deps.store.event(this.deps.callId, "project_context", { connectors: connectorResults });
+    }
+  }
+
+  private resolveTool(name: string): ToolDef | undefined {
+    const extra = this.projectConnectorTools.find((t) => t.name === name);
+    if (extra) return extra;
+    return toolByName(name, this.targetThreadId ?? undefined, this.projectConnectorTools, Boolean(this.targetProjectId));
+  }
+
   private makeVoiceSession(handle?: string): LiveClient {
     this.voiceTalking = false;
-    const systemInstruction = this.targetThreadId
-      ? threadVoiceInstruction({
-          thread: this.threadMeta ?? { id: this.targetThreadId, title: "Тред" },
+    const systemInstruction = this.targetProjectId
+      ? projectVoiceInstruction({
+          projectTitle: this.projectTitle ?? this.targetProjectId,
+          projectId: this.targetProjectId,
+          promptMd: this.repoPromptMd ?? undefined,
           nowUtc: this.nowUtc,
-          threadState: this.threadState,
-          messagesBlock: this.threadMessagesBlock,
           memory: this.promptContext.memory,
-          brainSummary: this.brainSummary ?? undefined,
-          brainAvailable: this.brain !== null && this.brainExpected,
+          failedConnectors: this.failedConnectorIds.length > 0 ? this.failedConnectorIds : undefined,
+          availableTools: this.projectConnectorTools.map((t) => t.name),
         })
-      : this.mode === "normal"
-        ? voiceInstructionNormal(this.promptContext)
-        : voiceInstructionExtended(this.promptContext);
+      : this.targetThreadId
+        ? threadVoiceInstruction({
+            thread: this.threadMeta ?? { id: this.targetThreadId, title: "Тред" },
+            nowUtc: this.nowUtc,
+            threadState: this.threadState,
+            messagesBlock: this.threadMessagesBlock,
+            memory: this.promptContext.memory,
+            brainSummary: this.brainSummary ?? undefined,
+            brainAvailable: this.brain !== null && this.brainExpected,
+            projectToolsLine:
+              this.projectConnectorTools.length > 0
+                ? `доступны ручки проекта «${this.threadMeta?.project ?? "проекта"}»: ${this.projectConnectorTools.map((t) => t.name).join(", ")}.`
+                : undefined,
+          })
+        : this.mode === "normal"
+          ? voiceInstructionNormal(this.promptContext)
+          : voiceInstructionExtended(this.promptContext);
 
     const client = new LiveClient({
       key: this.pool.activeKey,
@@ -431,7 +565,14 @@ export class CallSession extends EventEmitter {
       languageCode: this.deps.languageCode,
       systemInstruction,
       thinkingLevel: this.mode === "normal" ? undefined : this.deps.thinkingLevel,
-      tools: this.mode === "normal" ? (nativeDeclarations(this.targetThreadId ?? undefined) as unknown[]) : undefined,
+      tools:
+        this.mode === "normal"
+          ? (nativeDeclarations(
+              this.targetThreadId ?? undefined,
+              this.projectConnectorTools,
+              Boolean(this.targetProjectId),
+            ) as unknown[])
+          : undefined,
       sessionHandle: handle,
       contextWindowCompression: COMPRESSION,
       wsFactory: this.deps.wsFactory,
@@ -488,6 +629,7 @@ export class CallSession extends EventEmitter {
       gate: this.gate,
       ledger: this.ledger,
       targetThreadId: this.targetThreadId ?? undefined,
+      targetProjectId: this.targetProjectId ?? undefined,
       threadMessages: this.threadMessages,
       brain: this.brain ?? undefined,
       isTargetThreadActive: async () => {
@@ -530,7 +672,24 @@ export class CallSession extends EventEmitter {
     client.on("setupComplete", () => {
       if (this.greeted) return; // после переподключений приветствие не повторяем
       this.greeted = true;
-      if (this.targetThreadId) {
+      if (this.targetProjectId) {
+        if (this.failedConnectorIds.length > 0) {
+          client.sendClientContent(
+            `Система: звонок по проекту ${this.projectTitle ?? this.targetProjectId} начат. ${this.failedConnectorIds.map((c) => `коннектор ${c} недоступен`).join(", ")}. Скажи об этом владельцу и отвечай только на его вопросы.`,
+            true,
+          );
+        } else if (this.pendingRegistry) {
+          client.sendClientContent(
+            `[СИСТЕМА] В начале звонка скажи владельцу одной фразой: «реестр проекта изменился, подтверди изменения в настройках плагина». Больше ничего не добавляй и жди слов владельца.`,
+            true,
+          );
+        } else {
+          client.sendClientContent(
+            `Система: звонок по проекту ${this.projectTitle ?? this.targetProjectId} начат. Жди первого слова владельца и отвечай только ему.`,
+            false,
+          );
+        }
+      } else if (this.targetThreadId) {
         // §12.11 п. 3: Голос сразу представляется: «Привет, сейчас обрабатываю информацию по треду».
         if (this.brain) {
           client.sendClientContent("Система: звонок начат. Скажи: «Привет, сейчас обрабатываю информацию по треду». Больше ничего не добавляй.", true);
@@ -538,10 +697,14 @@ export class CallSession extends EventEmitter {
           client.sendClientContent("Система: звонок начат. Мозговой центр недоступен. Скажи «Привет» и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.", true);
         }
       } else {
-        // Модель молчит до первого слова владельца: любая просьба «поздоровайся»
-        // приводила к тому, что она сама запускала обзор поверх владельца (02.11).
-        // turnComplete: false — контекст получен, ответа не требуется.
-        client.sendClientContent("Система: звонок начат. Жди первого слова владельца и отвечай только ему.", false);
+        if (this.pendingRegistry) {
+          client.sendClientContent(
+            `[СИСТЕМА] В начале звонка скажи владельцу одной фразой: «реестр проекта изменился, подтверди изменения в настройках плагина». Больше ничего не добавляй и жди слов владельца.`,
+            true,
+          );
+        } else {
+          client.sendClientContent("Система: звонок начат. Жди первого слова владельца и отвечай только ему.", false);
+        }
       }
     });
     client.on("audio", (turnSeq: number, pcm: Uint8Array) => {
@@ -674,7 +837,7 @@ export class CallSession extends EventEmitter {
         );
         continue;
       }
-      const def = toolByName(call.name, this.targetThreadId ?? undefined);
+      const def = this.resolveTool(call.name);
       if (!def) {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "WHEN_IDLE", call.name);
         continue;
@@ -748,7 +911,7 @@ export class CallSession extends EventEmitter {
     this.setState("working");
     const seen = new Map<string, boolean>();
     for (const call of calls) {
-      const def = toolByName(call.name, this.targetThreadId ?? undefined);
+      const def = this.resolveTool(call.name);
       if (!def) {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "SILENT", call.name);
         continue;
@@ -877,7 +1040,7 @@ export class CallSession extends EventEmitter {
       return;
     }
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
-    const def = toolByName(p.tool, this.targetThreadId ?? undefined);
+    const def = this.resolveTool(p.tool);
     if (!def) return;
     const actionId = this.newActionId(p.tool);
     this.frame({ type: "action", actionId, tool: p.tool, class: p.class, status: "running", summary: p.say });
@@ -942,7 +1105,7 @@ export class CallSession extends EventEmitter {
   sendUserMessage(text: string) {
     if (this.ended || !text.trim()) return;
     this.frame({ type: "transcript", role: "owner", text: text.trim(), final: true });
-    this.onOwnerUtteranceFinal(text.trim());
+    this.onOwnerUtteranceFinal(text.trim(), "text_frame");
     this.voice?.sendClientContent(text.trim(), true);
   }
 
@@ -1050,16 +1213,19 @@ export class CallSession extends EventEmitter {
       return;
     }
     this.frame({ type: "transcript", role: "owner", text, final: true });
-    this.onOwnerUtteranceFinal(text);
+    this.onOwnerUtteranceFinal(text, "speech");
   }
 
   /** Реплика владельца завершена (VAD или транскрипт-таймер): ROUTER, вариант А. */
-  onOwnerUtteranceFinal(text: string) {
+  onOwnerUtteranceFinal(text: string, source: "speech" | "text_frame" = "speech") {
     if (this.ended || !text.trim()) return;
     this.lastFailedTool = null;
     this.toolCallsThisTurn = 0;
     this.ledger.add("owner", text);
     this.deps.store.event(this.deps.callId, "owner_line", { text });
+
+    // §15.2 п. 4: Реплики звонка (речь, кадр text, кадр confirm) изменение реестра не подтверждают — только кнопка в настройках.
+
     if (this.mode === "extended" && this.router && this.deps.routerInput === "text" && this.routerMayHearOwner()) {
       this.router.sendRealtimeText(`[голос сказал: «${this.lastVoiceLine}»] Владелец: ${text}`);
     }
@@ -1208,6 +1374,14 @@ export class CallSession extends EventEmitter {
     const r = this.router;
     this.router = null;
     r?.close();
+    for (const c of this.connectorClients) {
+      try {
+        c.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.connectorClients = [];
     if (this.micReporter) {
       clearInterval(this.micReporter);
       this.micReporter = null;

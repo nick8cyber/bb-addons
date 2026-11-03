@@ -48,6 +48,13 @@ const MIGRATIONS = [
     text TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );`,
+  // Подтверждённые хеши реестра звонков по проектам (§15.2).
+  `CREATE TABLE IF NOT EXISTS project_registry_hashes (
+    project_id TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    approved_at INTEGER NOT NULL,
+    config_json TEXT NOT NULL
+  );`,
 ];
 
 const RETENTION_DAYS = 90;
@@ -101,6 +108,25 @@ export class CallStore {
     return this.db.prepare("DELETE FROM voice_memory WHERE id = ?").run(id).changes > 0;
   }
 
+  getApprovedProject(projectId: string): { hash: string; approvedAt: number; configJson: string } | null {
+    const row = this.db
+      .prepare("SELECT hash, approved_at AS approvedAt, config_json AS configJson FROM project_registry_hashes WHERE project_id = ?")
+      .get(projectId) as { hash: string; approvedAt: number; configJson: string } | undefined;
+    return row ?? null;
+  }
+
+  setApprovedProject(projectId: string, hash: string, configJson: string, approvedAt = Date.now()): void {
+    this.db
+      .prepare(
+        "INSERT INTO project_registry_hashes (project_id, hash, approved_at, config_json) VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET hash = excluded.hash, approved_at = excluded.approved_at, config_json = excluded.config_json",
+      )
+      .run(projectId, hash, approvedAt, configJson);
+  }
+
+  deleteApprovedProject(projectId: string): boolean {
+    return this.db.prepare("DELETE FROM project_registry_hashes WHERE project_id = ?").run(projectId).changes > 0;
+  }
+
   endCall(callId: string, reason: string, endedAt = Date.now()): void {
     this.db
       .prepare("UPDATE calls SET ended_at = ?, end_reason = ? WHERE id = ?")
@@ -116,10 +142,11 @@ export class CallStore {
   }
 
   event(callId: string, kind: string, payload: unknown, ts = Date.now()): void {
-    this.seq += 1;
+    const row = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM call_events WHERE call_id = ?").get(callId) as { maxSeq: number } | undefined;
+    const nextSeq = (row?.maxSeq ?? 0) + 1;
     this.db
       .prepare("INSERT INTO call_events (call_id, seq, ts, kind, payload) VALUES (?, ?, ?, ?, ?)")
-      .run(callId, this.seq, ts, kind, JSON.stringify(payload ?? null));
+      .run(callId, nextSeq, ts, kind, JSON.stringify(payload ?? null));
   }
 
   calls(limit = 20): CallRow[] {

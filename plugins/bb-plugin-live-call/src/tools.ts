@@ -33,6 +33,8 @@ export interface ToolContext {
   rememberArgs?: (argsHash: string, args: Record<string, unknown>) => void;
   /** id целевого треда для звонка по треду (§12). */
   targetThreadId?: string;
+  /** id целевого проекта для звонка по проекту (§15). */
+  targetProjectId?: string;
   /** Кэшированные сообщения треда для звонка по треду. */
   threadMessages?: ThreadMessage[];
   /** Таймаут проверки доставки (мс), по умолчанию 5000. */
@@ -446,8 +448,10 @@ export const TOOLS: ToolDef[] = [
     async execute(args, ctx) {
       const q = String(args.query ?? "").trim();
       const projectRef = String(args.project ?? "").trim();
-      const projectId = projectRef ? await resolveProjectId(ctx.sdk, projectRef) : undefined;
-      if (projectRef && !projectId) return { ok: false, error: { code: "not_found", message: `нет проекта «${projectRef}»` } };
+      const projectId = ctx.targetProjectId
+        ? ctx.targetProjectId
+        : (projectRef ? await resolveProjectId(ctx.sdk, projectRef) : undefined);
+      if (projectRef && !projectId && !ctx.targetProjectId) return { ok: false, error: { code: "not_found", message: `нет проекта «${projectRef}»` } };
       const { threads, projectNames } = await threadIndex(ctx.sdk, projectId);
       let list = threads;
       if (q) {
@@ -471,6 +475,9 @@ export const TOOLS: ToolDef[] = [
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
       const t = ref.thread;
+      if (ctx.targetProjectId && t.projectId && String(t.projectId) !== ctx.targetProjectId) {
+        return { ok: false, error: { code: "not_found", message: "тред не принадлежит этому проекту" } };
+      }
       const out = await withTimeout(ctx.sdk.threads.output({ threadId: String(t.id) }) as Promise<{ output: string | null }>);
       const lastOutput = String(out.output ?? "").slice(0, 4000);
       const state = stateOf(t);
@@ -1484,7 +1491,20 @@ export function getThreadTools(): ToolDef[] {
   return [...THREAD_SPECIFIC_TOOLS, ...common];
 }
 
-export function toolByName(name: string, targetThreadId?: string): ToolDef | undefined {
+/** Ручки звонка по проекту (§15.4 п. 3). */
+export function getProjectTools(connectorTools: ToolDef[] = []): ToolDef[] {
+  const common = TOOLS.filter((t) => ["end_call", "remember", "recall", "list_threads", "read_thread"].includes(t.name));
+  return [...connectorTools, ...common];
+}
+
+export function toolByName(name: string, targetThreadId?: string, extraTools?: ToolDef[], isProjectCall?: boolean): ToolDef | undefined {
+  if (extraTools) {
+    const extra = extraTools.find((t) => t.name === name);
+    if (extra) return extra;
+  }
+  if (isProjectCall) {
+    return getProjectTools().find((t) => t.name === name);
+  }
   if (targetThreadId) {
     return getThreadTools().find((t) => t.name === name);
   }
@@ -1492,8 +1512,15 @@ export function toolByName(name: string, targetThreadId?: string): ToolDef | und
 }
 
 /** Объявления для setup в режиме native (контракт §3): behavior NON_BLOCKING. */
-export function nativeDeclarations(targetThreadId?: string): unknown[] {
-  const list = (targetThreadId ? getThreadTools() : TOOLS.filter((t) => t.name !== "confirm_action")).filter((t) => t.name !== "switch_mode");
+export function nativeDeclarations(targetThreadId?: string, extraTools?: ToolDef[], isProjectCall?: boolean): unknown[] {
+  let list: ToolDef[];
+  if (isProjectCall) {
+    list = getProjectTools(extraTools ?? []);
+  } else if (targetThreadId) {
+    list = [...getThreadTools(), ...(extraTools ?? [])];
+  } else {
+    list = [...TOOLS.filter((t) => t.name !== "confirm_action"), ...(extraTools ?? [])].filter((t) => t.name !== "switch_mode");
+  }
   return list.map((t) => ({
     functionDeclarations: [
       {
