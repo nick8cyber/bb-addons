@@ -1,35 +1,19 @@
 ---
 name: server-switcher
-description: Explain the sidebar server switcher that lists the bb servers on the user's bb account, switches between them, and colors each server's avatar ring.
+description: Explain the compact sidebar server switcher, its one-click server list, online indicators, and native browser/desktop/mobile switching behavior.
 ---
 
 # Server switcher
 
-The Server switcher uses a standard monochrome Servers icon in the sidebar footer. The panel is closed by default and opens only when its icon is clicked. It never opens itself on registration or reload. The panel lists the current server and the other account servers. Avatars and rings remain inside the list.
+The standard monochrome Servers icon in the sidebar footer opens the current server and all switch targets immediately. The panel starts closed and never opens itself on registration or reload. It has no inner disclosure or arrow, avatar images, colored rings, or color picker.
 
-- In a browser or on a `https://<handle>.getbb.app` URL, choosing a server
-  navigates the tab to that server's URL.
-- In the desktop app, the list is the desktop app's own server list, and
-  choosing a server switches through the desktop app.
-- Inside the bb mobile app the list is read-only.
+- In a browser, selecting an online server navigates to its URL.
+- In the desktop app, switching goes through the native server list.
+- In the native mobile app the list is read-only.
+- Offline servers are visible and disabled.
 
-## Ring colors
+The list comes from the bundled `connect` plugin. BB must be signed in to its account. `bb connect servers` lists the same account servers.
 
-Each server's avatar has a colored ring: one color or a two-stop gradient.
-Account servers start with a default gradient, assigned by sorted handle so
-servers on one account get distinct colors. Click a server's avatar to open
-the picker beside the sidebar: click a swatch, click the bar to add a second
-color, click a stop to change it, use the dashed swatch for no ring, or Reset
-to return to the default. Rings are saved on the server you are viewing, keyed
-by server handle.
+The original `bb server-switcher ring list | set | clear | reset` CLI and saved ring data remain compatible; those rings are not rendered by this fork.
 
-```
-bb server-switcher ring list                               # saved overrides only
-bb server-switcher ring set <server> <color> [<color>]     # hex, e.g. #3b82f6
-bb server-switcher ring clear <server>                     # no ring
-bb server-switcher ring reset <server>                     # back to the default
-```
-
-The server list comes from the bundled `connect` plugin and the avatar from
-`bb-account`, so bb must be signed in (`bb account login`). List the same
-servers with `bb connect servers`.
+The maintained plugin is MIT-licensed in `nick8cyber/bb-addons`, under `plugins/bb-plugin-server-switcher`.
