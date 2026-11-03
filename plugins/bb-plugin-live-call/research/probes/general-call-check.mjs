@@ -12,6 +12,7 @@ let asked = false;
 let lastAgent = Date.now();
 let sysErr = false;
 let prefaceAt = 0;
+let prefaceText = "";
 let firstAudioAfterPreface = 0;
 const finish = () => {
   log(`RESULT systemError=${sysErr}`);
@@ -25,7 +26,7 @@ ws.onmessage = (ev) => {
   if (typeof ev.data !== "string") {
     lastAgent = Date.now();
     // реальная пауза: первый звук голоса после законченного вступления
-    if (prefaceAt && !firstAudioAfterPreface && Date.now() - prefaceAt > 300) { firstAudioAfterPreface = Date.now(); log(`первый звук ответа через ${((firstAudioAfterPreface - prefaceAt) / 1000).toFixed(1)} с после вступления`); }
+    if (prefaceAt && !firstAudioAfterPreface && Date.now() - prefaceAt > 300) { firstAudioAfterPreface = Date.now(); log(`первый звук после реплики «${prefaceText.slice(0, 60)}» через ${((firstAudioAfterPreface - prefaceAt) / 1000).toFixed(1)} с`); }
     return;
   }
   const f = JSON.parse(ev.data);
@@ -38,7 +39,7 @@ ws.onmessage = (ev) => {
     lastAgent = Date.now();
     if (/системн\S* ошибк/i.test(f.text)) sysErr = true;
     log("[agent]", String(f.text).slice(0, 220));
-    if (!prefaceAt) prefaceAt = Date.now();
+    if (!prefaceAt) { prefaceAt = Date.now(); prefaceText = String(f.text); }
   }
   if (f.type === "action") log("[action]", f.tool, f.status);
   if (f.type === "error") log("[error]", f.code, f.message);
