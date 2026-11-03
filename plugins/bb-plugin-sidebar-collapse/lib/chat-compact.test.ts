@@ -36,7 +36,7 @@ describe("compact native queue", () => {
     const c = new AbortController(); disposers.push(mountCompactQueue(c.signal));
     const f = queue(); f.trigger.disabled = true;
     await new Promise(r => setTimeout(r, 0)); expect(f.trigger.getAttribute("aria-expanded")).toBe("true");
-    f.trigger.disabled = false; f.card.append(document.createElement("div"));
+    f.trigger.disabled = false;
     await waitFor(() => expect(f.trigger.getAttribute("aria-expanded")).toBe("false"));
     c.abort(); const g = queue(); await new Promise(r => setTimeout(r, 0)); expect(g.trigger.getAttribute("aria-expanded")).toBe("true");
   });
