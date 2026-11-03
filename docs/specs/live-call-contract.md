@@ -325,7 +325,9 @@ CLI: `bb call tool <имя> [json]` — выполнить инструмент 
 
 ### 12.7 Журнал
 
-`call_started`/запись звонка получает `threadId` звонка по треду. Событие `thread_context { messages, skipped, chars }` пишется на старте.
+- Журнал звонка по треду ведётся **как в обычном звонке**: свой тред звонка в проекте «Звонки» (`calls.thread_id`, `spawnCallThread`/`advanceCallThread`/`sayCallThread`). Целевой тред туда **не** подставляется.
+- Id целевого треда хранится отдельно (`targetThreadId`; событие `call_started { targetThreadId }`). В целевой тред пишут только `thread_send` и `thread_answer` после подтверждения — никакие реплики звонка туда не попадают.
+- Событие `thread_context { messages, skipped, chars }` пишется на старте.
 
 ### 12.8 Приёмка
 
