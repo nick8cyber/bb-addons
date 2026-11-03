@@ -68,10 +68,10 @@ export default async function plugin(bb: BbPluginApi) {
     },
     defaultMode: {
       type: "string",
-      label: "Режим по умолчанию",
-      description: "extended (по умолчанию) — Extended Thinking с помощником для инструментов; normal — «Быстрый»: базовая gemini-3.8-live.",
+      label: "Режим (не используется — Extended отключён)",
+      description: "Extended отключён (ADR-0006, пересмотр 2): любой звонок — одна сессия gemini-3.8-live.",
     },
-    extendedThinkingLevel: { type: "string", label: "Уровень мышления Extended", description: "Только для VOICE в режиме extended." },
+    extendedThinkingLevel: { type: "string", label: "Уровень мышления Extended (не используется)", description: "Extended отключён (ADR-0006, пересмотр 2)." },
     voice: { type: "string", label: "Голос", description: "По умолчанию Algenib — выбор владельца 02.11." },
     languageCode: { type: "string", label: "Язык", description: "ru-RU по умолчанию." },
     maxCallMinutes: { type: "number", label: "Максимум минут", description: "За 2 мин до конца агент предупреждает." },

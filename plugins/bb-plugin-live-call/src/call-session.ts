@@ -856,7 +856,8 @@ export class CallSession extends EventEmitter {
       tool: p.tool,
       class: p.class,
       status: result.ok ? "done" : "failed",
-      summary: p.say,
+      // карточка показывает итог, а не вопрос: «Поставить задачу …? Скажи «да»…» после выполнения путало владельца
+      summary: result.ok ? `Выполнено: ${p.tool}` : `Не выполнено: ${p.tool}`,
     });
     this.resolvePendingToolResponse(p.argsHash, result);
     // Модель узнаёт результат через вставку [СИСТЕМА] в обоих режимах:
@@ -864,7 +865,9 @@ export class CallSession extends EventEmitter {
     const text = result.ok
       ? `выполнено: ${p.tool}. ${JSON.stringify(result.data).slice(0, 600)}`
       : `не выполнено: ${"error" in result ? result.error.message : "нужно подтверждение"}`;
-    this.injectWhenQuiet(`[СИСТЕМА] ${text}`);
+    // Если владелец подтвердил раньше, чем голос успел задать вопрос (кнопка), голос мог позже
+    // зачитать уже решённый вопрос и получить второе «да» (живая проверка 03.11).
+    this.injectWhenQuiet(`[СИСТЕМА] ${text} Вопрос подтверждения уже решён владельцем — НЕ задавай его снова и не вызывай ${p.tool} повторно.`);
   }
 
   /** Аргументы сохранённого вызова записи — они же в argsHash, подмена исключена. */

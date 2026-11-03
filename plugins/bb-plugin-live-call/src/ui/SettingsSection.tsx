@@ -67,7 +67,7 @@ export function SettingsSection() {
             <span className="lc-sub">проверяю…</span>
           ) : status.configured ? (
             <span>
-              {status.keys} {status.keys === 1 ? "ключ — Extended недоступен, нужен второй" : "ключа: основной и запасной"}
+              {status.keys} {status.keys === 1 ? "ключ" : "ключа: основной и запасной"}
             </span>
           ) : (
             <span className="lc-bad">не заданы — добавь в поле «Ключи Gemini» выше</span>
@@ -75,7 +75,7 @@ export function SettingsSection() {
         </Row>
         <Row label="Звонок">
           {status?.activeCall ? (
-            <span className="lc-ok">идёт · {status.activeCall.mode === "extended" ? "Extended" : "Быстрый"}</span>
+            <span className="lc-ok">идёт · звонок</span>
           ) : (
             <span className="lc-sub">нет</span>
           )}
@@ -91,10 +91,7 @@ export function SettingsSection() {
           <Icon name="phone" />
           Позвонить
         </button>
-        <button type="button" className="lc-btn lc-btn--ghost" disabled={probe.running} onClick={() => void runProbe()}>
-          {probe.running ? <Icon name="loader" className="lc-spin" /> : <Icon name="sparkles" />}
-          {probe.running ? "Проверяю Extended…" : "Проверить Extended"}
-        </button>
+        {/* Проба Extended убрана: Extended отключён (ADR-0006, пересмотр 2); `bb call probe` остался в CLI. */}
       </div>
       {probe.result && (
         <p className={probe.result.extendedNativeTools ? "lc-ok" : "lc-sub"}>

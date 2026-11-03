@@ -96,3 +96,39 @@ describe("память голосового агента", () => {
     expect(store.listMemory().map((m) => m.text)).toEqual(["Отвечать коротко", "Называть треды по названию"]);
   });
 });
+
+describe("подтверждение кнопкой раньше вопроса (живая проверка 03.11)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("после approve голос получает «вопрос уже решён», карточка — итог, а не вопрос", async () => {
+    const frames: Array<Record<string, unknown>> = [];
+    const store = new CallStore(new Database(":memory:"));
+    const s = new CallSession({
+      callId: "call_cf", keys: ["k1"], voice: "Algenib", languageCode: "ru-RU", thinkingLevel: "LOW",
+      mode: "normal", routerInput: "text", maxCallMinutes: 60, store, sdk: {} as never,
+      toBrowser: (f) => frames.push(f as never), sendBrowserAudio: () => {},
+      spawnCallThread: async () => null, advanceCallThread: async () => {}, sayCallThread: async () => {}, endCallThread: async () => {},
+      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+    });
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    ws.server({ toolCall: { functionCalls: [{ id: "f1", name: "remember", args: { text: "тест" } }] } });
+    await vi.advanceTimersByTimeAsync(50);
+    const conf = frames.find((f) => f.type === "confirmation") as { confirmationId: string } | undefined;
+    expect(conf).toBeTruthy();
+    s.decideConfirmation(conf!.confirmationId, "approve");
+    await vi.advanceTimersByTimeAsync(50);
+    ws.server({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(50);
+    const injected = clientContents(ws).join("\n");
+    expect(injected).toContain("НЕ задавай его снова");
+    const doneCard = frames.filter((f) => f.type === "action" && f.tool === "remember" && f.status === "done").at(-1) as { summary: string } | undefined;
+    expect(doneCard?.summary).not.toMatch(/Скажи «да»/);
+    await s.end("owner");
+  });
+});
