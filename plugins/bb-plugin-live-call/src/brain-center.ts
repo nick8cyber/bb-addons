@@ -28,6 +28,8 @@ export interface BrainCenterOptions {
 
 export class BrainCenter {
   threadId: string | null = null;
+  /** Изменения разрешены только в отдельном worktree (§12.11 п.1). Не-git проект или worktree не создался → false. */
+  canModify = false;
   lastWorktreePath: string | null = null;
   summary: string | null = null;
   summaryMs: number | null = null;
@@ -62,7 +64,7 @@ ${historyFile}
 5. Открытые вопросы.
 
 Отвечай предельно ёмко, естественно и технически точно, без списков и markdown-разметки (твой ответ будет сразу пересказан голосом).
-После составления сводки жди следующих вопросов.`;
+После составления сводки жди следующих вопросов.${this.opts.isGitRepo ? "" : "\n\nВАЖНО: ты работаешь в общей папке проекта без отдельной копии репозитория. Файлы НЕ изменяй, команды с записью НЕ выполняй — только читай и отвечай."}`;
 
       const environment = this.opts.isGitRepo
         ? {
@@ -89,18 +91,12 @@ ${historyFile}
           prompt,
         } as never)) as unknown as { id: string };
       } catch (e) {
-        // Fallback если managed-worktree не поддерживается в проекте
-        this.opts.log?.warn?.(`brain worktree spawn fallback to project-default: ${String(e)}`);
-        spawned = (await this.opts.sdk.threads.spawn({
-          projectId: this.opts.targetProjectId,
-          providerId: "agy",
-          model: "gemini-3.8-flash-medium",
-          visibility: "hidden",
-          title: `🧠 Мозговой центр: ${this.opts.targetThreadTitle}`,
-          environment: { type: "project-default" },
-          prompt,
-        } as never)) as unknown as { id: string };
+        // Без отдельного worktree мозговой центр НЕ запускается в общей папке проекта (§12.11 п.1).
+        this.opts.log?.warn?.(`brain spawn failed, no fallback to project folder: ${String(e)}`);
+        this.opts.store.event(this.opts.callId, "brain_failed", { error: String(e).slice(0, 300) });
+        return null;
       }
+      this.canModify = Boolean(this.opts.isGitRepo);
 
       this.threadId = String(spawned.id);
       this.opts.store.event(this.opts.callId, "brain_started", { threadId: this.threadId });
@@ -187,6 +183,9 @@ ${historyFile}
   }
 
   async task(taskDescription: string, checkTargetActive: () => Promise<boolean>): Promise<ToolResult> {
+    if (!this.canModify) {
+      return { ok: false, error: { code: "changes_unavailable", message: "изменения недоступны: у мозгового центра нет отдельной копии репозитория (проект не git или копия не создалась). Вопросы задавать можно." } };
+    }
     if (!this.threadId) {
       return { ok: false, error: { code: "not_found", message: "мозговой центр не запущен" } };
     }

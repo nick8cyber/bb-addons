@@ -153,6 +153,7 @@ describe("BrainCenter (§12.11)", () => {
       storageDir: testDir,
     });
     brain.threadId = "thr_brain_3";
+    brain.canModify = true; // worktree создан (start() в этом тесте не вызывается)
 
     // 1) Целевой тред активен -> ошибка target_active
     const busyRes = await brain.task("создай файл", async () => true);
@@ -172,5 +173,48 @@ describe("BrainCenter (§12.11)", () => {
     expect(sdk.threads.send).toHaveBeenCalled();
     const ev = store.events.find((e) => e.type === "brain_answer" && (e.payload as Record<string, unknown>).tool === "brain_task");
     expect(ev).toBeDefined();
+  });
+});
+
+describe("BrainCenter — изоляция (§12.11 п.1, приёмка 03.11)", () => {
+  const mk = (spawn: (a: Record<string, unknown>) => Promise<unknown>, isGitRepo: boolean) =>
+    new BrainCenter({
+      sdk: { threads: { spawn: vi.fn(spawn), get: vi.fn(async () => ({})), wait: vi.fn(async () => ({ matched: true })), output: vi.fn(async () => ({ output: "ok" })), stop: vi.fn(async () => ({})), archive: vi.fn(async () => ({})) } } as never,
+      store: mockStore() as never,
+      callId: "call_iso",
+      targetThreadId: "thr_target_iso",
+      targetThreadTitle: "Тред",
+      targetProjectId: "proj_iso",
+      targetBranchName: "feat/x",
+      isGitRepo,
+      allMessages: [{ number: 1, role: "owner", text: "Привет", createdAt: 0 }],
+      storageDir: join(tmpdir(), `test-brain-iso-${Date.now()}-${Math.random()}`),
+    });
+
+  it("worktree не создался → в общую папку проекта не уходит, мозгового центра нет", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const b = mk(async (a) => { calls.push(a); throw new Error("worktree unsupported"); }, true);
+    expect(await b.start()).toBeNull();
+    expect(calls.length).toBe(1);
+    expect(JSON.stringify(calls[0].environment)).toContain("managed-worktree");
+    expect(calls.some((a) => JSON.stringify(a.environment).includes("project-default"))).toBe(false);
+    expect(b.canModify).toBe(false);
+  });
+
+  it("не-git проект → brain_task возвращает changes_unavailable, мозговой центр только читает", async () => {
+    let prompt = "";
+    const b = mk(async (a) => { prompt = String(a.prompt); return { id: "thr_brain_ro" }; }, false);
+    expect(await b.start()).toBe("thr_brain_ro");
+    expect(b.canModify).toBe(false);
+    expect(prompt).toContain("Файлы НЕ изменяй");
+    const r = await b.task("создай файл", async () => false);
+    expect(r.ok).toBe(false);
+    expect(JSON.stringify(r)).toContain("changes_unavailable");
+  });
+
+  it("git-проект и worktree создан → изменения разрешены", async () => {
+    const b = mk(async () => ({ id: "thr_brain_rw" }), true);
+    await b.start();
+    expect(b.canModify).toBe(true);
   });
 });
