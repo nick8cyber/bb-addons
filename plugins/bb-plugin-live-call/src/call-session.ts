@@ -196,7 +196,7 @@ export class CallSession extends EventEmitter {
     } else {
       if (this.pool.count < 2) {
         // Фоллбэк: extended требует двух ключей (контракт §1).
-        this.frame({ type: "warning", code: "extended_unavailable", message: "Extended требует два ключа, работаю в обычном режиме" });
+        this.frame({ type: "warning", code: "extended_unavailable", message: "Extended требует два ключа, работаю в режиме «Быстрый»" });
         this.mode = "normal";
         this.modeHistory.push("normal");
         this.deps.store.setModeHistory(this.deps.callId, this.modeHistory);
@@ -527,6 +527,7 @@ export class CallSession extends EventEmitter {
       this.quietQueue.push(text);
       return;
     }
+    this.deps.store.event(this.deps.callId, "system_injected", { waited: false, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, true);
   }
 
@@ -534,6 +535,7 @@ export class CallSession extends EventEmitter {
     if (this.quietQueue.length === 0) return;
     const text = this.quietQueue.join("\n\n").slice(0, 6000);
     this.quietQueue = [];
+    this.deps.store.event(this.deps.callId, "system_injected", { waited: true, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, true);
   }
 
