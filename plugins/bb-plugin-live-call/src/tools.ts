@@ -112,8 +112,22 @@ function minutesAgo(ts: unknown): number | null {
 async function threadIndex(sdk: BbPluginApi["sdk"], projectId?: string): Promise<{ threads: Array<Record<string, unknown>>; projectNames: Map<string, string> }> {
   const projects = ((await withTimeout(sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? []) as Array<Record<string, unknown>>;
   const projectNames = new Map((Array.isArray(projects) ? projects : []).map((p) => [String(p.id), String(p.name ?? p.id)]));
-  const res = await withTimeout(sdk.threads.list({ limit: 200, ...(projectId ? { projectId } : {}) } as never) as Promise<unknown>);
-  const raw = (Array.isArray(res) ? res : ((res as { threads?: unknown[] })?.threads ?? [])) as Array<Record<string, unknown>>;
+  // Без проекта — по каждому проекту отдельно: один threads.list отдаёт не больше 200
+  // тредов из всего BB, и работающие туда могли не попасть (приёмка 03.11: из 324
+  // тредов выборка не содержала ни проекта BB, ни одного из 13 работающих).
+  const listOne = async (pid?: string) => {
+    const res = await withTimeout(sdk.threads.list({ limit: 200, ...(pid ? { projectId: pid } : {}) } as never) as Promise<unknown>);
+    return (Array.isArray(res) ? res : ((res as { threads?: unknown[] })?.threads ?? [])) as Array<Record<string, unknown>>;
+  };
+  const ids = projectId ? [projectId] : [...projectNames.keys()];
+  const chunks = await Promise.all(ids.map((pid) => listOne(pid).catch(() => [] as Array<Record<string, unknown>>)));
+  const seen = new Set<string>();
+  const raw = chunks.flat().filter((x) => {
+    const id = String(x.id ?? "");
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
   const threads = raw
     .filter((x) => !isCallThread(x) && !x.archivedAt && !x.deletedAt && x.visibility !== "hidden")
     .sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0));
@@ -279,7 +293,8 @@ export const TOOLS: ToolDef[] = [
         projects: [...byProject.values()].sort((a, b) => b.working + b.waiting - (a.working + a.waiting)),
         working: pick("работает", 10),
         waitingForOwner: pick("ждёт тебя", 10),
-        recentErrors: pick("ошибка", 5),
+        // Ошибки старше 3 суток — история, не новость для звонка.
+        recentErrors: pick("ошибка", 20).filter((x) => (x.updatedMinutesAgo ?? 0) <= 3 * 24 * 60).slice(0, 5),
         note: "state: работает — ход идёт сейчас; ждёт тебя — агент задал вопрос; ошибка — последний ход упал (мог быть давно, смотри updatedMinutesAgo).",
       });
     },
