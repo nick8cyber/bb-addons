@@ -1,9 +1,9 @@
 {
   "name": "bb-plugin-server-switcher",
-  "version": "0.1.3-local.1",
+  "version": "0.1.3",
   "description": "Shows the bb server you are on and switches between the servers on your bb account from the sidebar.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": true,
   "files": [
     "app.tsx",
@@ -20,7 +20,9 @@
     "icons",
     "skills",
     "PLUGIN_OVERVIEW.md",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "bb": ">=0.46.0",
