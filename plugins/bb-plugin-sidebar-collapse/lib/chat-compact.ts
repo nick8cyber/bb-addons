@@ -137,7 +137,7 @@ export function mountCompactQueue(signal?: AbortSignal, doc: Document = document
     queued = true; queueMicrotask(() => { queued = false; update(); });
   });
   observer.observe(doc.body, { subtree: true, childList: true, attributes: true,
-    attributeFilter: ["aria-expanded", "data-queued-messages-mode", "data-queued-message-failed"] });
+    attributeFilter: ["aria-expanded", "aria-controls", "disabled", "data-queued-messages-mode", "data-queued-message-failed"] });
   const dispose = () => { if (disposed) return; disposed = true; observer.disconnect(); signal?.removeEventListener("abort", dispose); };
   signal?.addEventListener("abort", dispose, { once: true }); update();
   return dispose;
