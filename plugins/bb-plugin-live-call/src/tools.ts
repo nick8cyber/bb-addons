@@ -228,16 +228,22 @@ type InteractionsArea = { list(a: { threadId: string }): Promise<InteractionList
  * Memory не даёт search/add по RPC (только админские list/update/delete) —
  * работаем через его CLI: он ходит на этот же сервер локально.
  */
+export const SHARED_KB_SOURCE =
+  "ОБЩАЯ база знаний BB — заметки и правила всех агентов-кодеров. Это НЕ твоя память звонков: не говори «у меня в памяти», говори «в базе знаний BB нашлось».";
+export const OWN_MEMORY_SOURCE = "ТВОЯ память звонков — только это ты помнишь о владельце. Ничего сверх списка не добавляй.";
+
 async function memoryCli(ctx: ToolContext, args: string[]): Promise<ToolResult> {
   try {
     const { spawn } = await import("node:child_process");
     const stdout = await new Promise<string>((resolve, reject) => {
       const child = spawn("bb", ["memory", ...args], { timeout: 15000 });
       let out = "";
+      let err = "";
       child.stdout.on("data", (d) => (out += String(d)));
-      child.stderr.on("data", (d) => (out += String(d)));
+      // stderr — предупреждения CLI («customAcpAgents … no longer read»): в результат не идут, только в ошибку.
+      child.stderr.on("data", (d) => (err += String(d)));
       child.on("error", reject);
-      child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(out.trim().slice(0, 300) || `exit ${code}`))));
+      child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error((err || out).trim().slice(0, 300) || `exit ${code}`))));
     });
     void ctx;
     return truncate(stdout.trim());
@@ -616,7 +622,11 @@ export const TOOLS: ToolDef[] = [
     description: "Поиск по ОБЩЕЙ базе знаний BB (память и заметки всех агентов) по конкретному вопросу. НЕ твоя память звонков — её ты уже знаешь из инструкции. До 5 записей.",
     parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     async execute(args, ctx) {
-      return memoryCli(ctx, ["search", String(args.query)]);
+      const r = await memoryCli(ctx, ["search", String(args.query)]);
+      if (!r.ok) return r;
+      // Метка источника идёт ПЕРВОЙ: голос получает её даже в обрезанной вставке [СИСТЕМА].
+      // 03.11 голос выдал правила агентов-кодеров из общей памяти за «мою память».
+      return truncate({ source: SHARED_KB_SOURCE, results: r.data });
     },
   },
   {
@@ -963,6 +973,18 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "recall",
+    cls: "R",
+    word: "",
+    description: "Что записано в ТВОЕЙ памяти звонков (предпочтения владельца из прошлых звонков). Вызывай на «что у тебя в памяти / что ты помнишь / что запомнил». Общую базу знаний BB не трогает.",
+    parameters: { type: "object", properties: {} },
+    async execute(_args, ctx) {
+      if (!ctx.voiceMemory) return { ok: false, error: { code: "no_memory", message: "память звонков недоступна" } };
+      const items = ctx.voiceMemory.list().map((m) => m.text);
+      return truncate({ source: OWN_MEMORY_SOURCE, count: items.length, items });
+    },
+  },
+  {
     name: "remember",
     cls: "C",
     word: "да",
@@ -1169,7 +1191,9 @@ export function readActionLabel(
     case "list_pending":
       return { running: "Смотрю, что ждёт ответа", done: "Посмотрел, что ждёт ответа", failed: "Не удалось получить ожидающие" };
     case "search_memory":
-      return { running: `Ищу в памяти «${q(args.query)}»`, done: `Нашёл в памяти «${q(args.query)}»`, failed: "Поиск в памяти не удался" };
+      return { running: `Ищу в базе знаний BB «${q(args.query)}»`, done: `Искал в базе знаний BB «${q(args.query)}»`, failed: "Поиск в базе знаний BB не удался" };
+    case "recall":
+      return { running: "Смотрю свою память звонков", done: "Посмотрел свою память звонков", failed: "Не удалось прочитать память звонков" };
     default:
       return null;
   }
@@ -1197,7 +1221,7 @@ const HUMAN: Record<string, string> = {
   answer_interaction: "ответить агенту на вопрос", stop_thread: "остановить тред", archive_thread: "архивировать тред",
   compact_thread: "сжать контекст треда", pin_thread: "закрепить тред", thread_rename: "переименовать тред",
   thread_hide: "скрыть тред", tasks_create: "создать задачу", task_comment: "комментарий к задаче",
-  task_status: "сменить статус задачи", task_due: "срок задачи", remember: "запомнить в свою память",
+  task_status: "сменить статус задачи", task_due: "срок задачи", remember: "запомнить в свою память", recall: "что я помню о владельце (моя память звонков)",
   call_note: "заметка в итог звонка", start_thread: "запустить нового агента", tasks_dispatch: "раздать задачу исполнителю",
   retry_thread: "перезапустить упавший ход", stop_all_agents: "остановить всех агентов", handoff_thread: "передать тред другому агенту",
   fork_thread: "ответвить тред",

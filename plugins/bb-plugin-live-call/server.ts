@@ -638,7 +638,13 @@ export default async function plugin(bb: BbPluginApi) {
         } catch {
           return { exitCode: 2, stdout: "аргументы — JSON\n" };
         }
-        const ctx = { sdk: bb.sdk, reportAction: () => {}, callsProjectId: () => null } as unknown as Parameters<typeof def.execute>[1];
+        const ctx = {
+          sdk: bb.sdk,
+          reportAction: () => {},
+          callsProjectId: () => null,
+          // только чтение: recall вне звонка показывает ту же память звонков, add здесь недостижим (класс C отклонён выше)
+          voiceMemory: { add: () => ({ id: 0, duplicate: true }), list: () => store.listMemory() },
+        } as unknown as Parameters<typeof def.execute>[1];
         const result = await def.execute(args, ctx);
         return { exitCode: result.ok ? 0 : 1, stdout: JSON.stringify(result, null, 1).slice(0, 8000) + "\n" };
       }
