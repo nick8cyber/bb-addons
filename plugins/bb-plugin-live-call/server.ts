@@ -289,6 +289,8 @@ export default async function plugin(bb: BbPluginApi) {
       const events = eventBridge.drain();
       for (const e of events) {
         toBrowserRef({ type: "event", kind: e.kind as "thread.idle" | "thread.failed" | "interaction.pending", threadId: e.threadId, summary: e.summary, queued: e.queued });
+        // Звонок по треду: события чужих тредов голосу не нужны (живой звонок 03.11).
+        if (session.targetThreadId && e.threadId !== session.targetThreadId) continue;
         session.injectWhenQuiet(`[СОБЫТИЕ] ${e.kind} ${e.threadId}: ${e.summary}`);
       }
     }, 1500);

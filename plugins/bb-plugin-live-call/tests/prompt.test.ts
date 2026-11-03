@@ -79,3 +79,15 @@ describe("системная инструкция", () => {
     expect(t).toContain("У наших инструментов пустой результат — это ok:false с кодом not_found, ошибка — ok:false с ambiguous, timeout, not_delivered и другими кодами; для правила 3 это то же самое.");
   });
 });
+
+describe("звонок по треду без мозгового центра (живой звонок 03.11)", () => {
+  it("инструкция не обещает сводку и не велит говорить «обрабатываю»", async () => {
+    const { threadVoiceInstruction } = await import("../src/prompt.js");
+    const base = { thread: { id: "t", title: "Тред" }, nowUtc: "2026-11-03T00:00:00Z", threadState: { status: "свободен" }, messagesBlock: "[1] Владелец: привет", memory: [] } as never;
+    const off = threadVoiceInstruction({ ...(base as object), brainAvailable: false } as never);
+    expect(off).not.toContain("обрабатываю информацию");
+    expect(off).toContain("Мозгового центра и сводки в этом звонке нет");
+    const on = threadVoiceInstruction({ ...(base as object), brainAvailable: true } as never);
+    expect(on).toContain("обрабатываю информацию");
+  });
+});

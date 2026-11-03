@@ -113,6 +113,8 @@ export class CallSession extends EventEmitter {
   private ownerUtteranceTimer: NodeJS.Timeout | null = null;
   /** Мозговой центр звонка по треду (§12.11). */
   brain: BrainCenter | null = null;
+  /** Мозговой центр ожидается (git-окружение треда) — для инструкции голоса. */
+  private brainExpected = false;
   brainSummary: string | null = null;
   /** Последний упавший инструмент (§12.12 п. 3: запрет молчаливого повтора). */
   private lastFailedTool: string | null = null;
@@ -270,6 +272,7 @@ export class CallSession extends EventEmitter {
         chars: formatted.chars,
       });
 
+      this.brainExpected = Boolean(envObj.isGitRepo);
       this.brain = new BrainCenter({
         sdk: this.deps.sdk,
         store: this.deps.store,
@@ -393,6 +396,7 @@ export class CallSession extends EventEmitter {
           messagesBlock: this.threadMessagesBlock,
           memory: this.promptContext.memory,
           brainSummary: this.brainSummary ?? undefined,
+          brainAvailable: this.brain !== null && this.brainExpected,
         })
       : this.mode === "normal"
         ? voiceInstructionNormal(this.promptContext)
