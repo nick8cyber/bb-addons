@@ -1,7 +1,6 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   definePluginApp,
-  experimental_useSidebarThreadActions,
   experimental_useSidebarThreads,
   experimental_useSidebarThreadSplit,
   useBbNavigate,
@@ -13,7 +12,6 @@ import type {
   PluginAppBuilder,
   PluginSidebarProject,
   PluginSidebarThread,
-  PluginSidebarThreadActions,
   PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
@@ -38,6 +36,7 @@ import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridge
 import { mountSidebarControls } from "./lib/sidebar-controls";
 import { bindGitHeader, type GitHeaderSnapshot } from "./lib/git-header";
 import { bindActivityHeader, mountCompactQueue, type ActivitySnapshot } from "./lib/chat-compact";
+import { useSidebarRowActions, registerHeaderControl, type SidebarRowActions } from "./lib/host-compat";
 import {
   groupSidebarThreads,
   threadDisplayTitle,
@@ -183,7 +182,7 @@ function ThreadMenuItems({
   thread: PluginSidebarThread;
   projects: readonly PluginSidebarProject[];
   isAvailable: boolean;
-  actions: PluginSidebarThreadActions;
+  actions: SidebarRowActions;
   onRename: () => void;
 }) {
   const items: Array<{
@@ -311,7 +310,7 @@ function ThreadRow({
   isCompactViewport: boolean;
   showBranchName: boolean;
   onNavigate: () => void;
-  actions: PluginSidebarThreadActions;
+  actions: SidebarRowActions;
   renamingThreadId: string | null;
   setRenamingThreadId: (id: string | null) => void;
 }) {
@@ -535,9 +534,9 @@ function CollapsedThreadList({
   isCompactViewport,
   onNavigate,
   Original,
-}: PluginThreadListProps) {
+}: PluginThreadListProps & { Original?: ComponentType }) {
   const { status, threads, projects } = experimental_useSidebarThreads();
-  const actions = experimental_useSidebarThreadActions();
+  const actions = useSidebarRowActions();
   const navigate = useBbNavigate();
   const { values } = useSettings();
 
@@ -861,8 +860,8 @@ function ActivityHeader({ threadId }: { threadId: string }) {
 export default definePluginApp((app) => {
   app.contentScripts.register({ id: "sidebar-controls", mount: ({signal}) => mountSidebarControls(signal) });
   app.contentScripts.register({ id: "compact-queue", mount: ({signal}) => mountCompactQueue(signal) });
-  app.slots.experimental_threadHeaderAction({ id: "changed-files", title: "Изменённые файлы", component: GitHeader });
-  app.slots.experimental_threadHeaderAction({ id: "background-activity", title: "Фоновая активность", component: ActivityHeader });
+  registerHeaderControl(app, { id: "changed-files", title: "Изменённые файлы", component: GitHeader });
+  registerHeaderControl(app, { id: "background-activity", title: "Фоновая активность", component: ActivityHeader });
   app.slots.experimental_threadList({
     id: "collapsed",
     title: "Collapsed thread list",
