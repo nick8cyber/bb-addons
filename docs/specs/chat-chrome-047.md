@@ -1,7 +1,7 @@
 ---
 title: Компактные панели чата BB 0.47
-status: in progress
-updated: 2026-10-26
+status: completed
+updated: 2026-11-03
 ---
 
 # Компактные панели чата
@@ -24,3 +24,5 @@ updated: 2026-10-26
 - Сохранить пользовательские настройки. Проверить running/compatible, browser errors; advisor один раз после реализации и проверок, исправить замечания. Запушить ветку в bb-addons и проверить SHA.
 
 Откат: `path:<worktrees>/bb-addons-sidebar-controls/plugins/bb-plugin-sidebar-collapse` @da0d06c.
+
+Завершение и адаптация под BB0.48: [контракт](compact-chat-complete.md), [проверка](../reports/compact-chat-2026-11-03.md).

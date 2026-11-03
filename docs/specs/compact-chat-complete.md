@@ -1,6 +1,6 @@
 ---
 title: Компактный интерфейс чата — завершение
-status: implementation
+status: verified
 updated: 2026-11-02
 ---
 
@@ -21,3 +21,5 @@ Focused tests: первая свёртка/ручное раскрытие/ре�
 Свести старую опубликованную ветку `fix/chat-chrome-047` и завершение в основную ветку, source установки перевести в canonical `bb-addons/plugins/bb-plugin-sidebar-collapse`, сохранить настройки. Публиковать компактность без случайного включения локального UNLICENSED Server Switcher: для публичной ветки использовать актуальный `origin/main` и только изменения компактности. Не заявлять push локального форка Server Switcher.
 
 Совместимость: SDK зафиксирован на 0.6.104; старые public runtime callbacks BB0.48 для собственного списка/React header controls изолированы в `lib/host-compat.ts`, поскольку SDK исключил их TypeScript-декларации, но поддерживает исполнение. Навигация, rename и native confirmation остаются у host. `Original` опционален; на новом host используется существующий штатный выбор списка. Чистая установка включает `cron-parser`, требуемый testing SDK.
+
+Результаты и ограничения проверки: [отчёт 2026-11-03](../reports/compact-chat-2026-11-03.md).
