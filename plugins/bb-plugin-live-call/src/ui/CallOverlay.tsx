@@ -144,8 +144,8 @@ function ModeSwitch({ view, compact = false }: { view: CallView; compact?: boole
   };
   return (
     <div className={`lc-seg${compact ? " lc-seg--compact" : ""}${view.switching ? " is-switching" : ""}`} role="group" aria-label="Режим звонка">
-      {seg("normal", "zap", "Обычный", "Обычный: gemini-3.8-live, отвечает быстрее всего, сам вызывает инструменты")}
       {seg("extended", "sparkles", "Extended", "Extended Thinking: думает глубже, отвечает за 1,5–2 с; инструменты вызывает помощник по твоим словам")}
+      {seg("normal", "zap", "Быстрый", "Быстрый: gemini-3.8-live, отвечает быстрее всего, сам вызывает инструменты")}
     </div>
   );
 }
@@ -371,7 +371,7 @@ function FeedRow({ item }: { item: FeedItem }) {
           <span className="lc-grow">{item.text}</span>
           {item.action === "to-normal" && (
             <button type="button" className="lc-link" onClick={() => callEngine.switchMode("normal", "notice")}>
-              Перейти на Обычный
+              Перейти на Быстрый
             </button>
           )}
         </div>

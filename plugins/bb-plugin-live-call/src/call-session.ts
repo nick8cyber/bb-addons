@@ -388,19 +388,19 @@ export class CallSession extends EventEmitter {
       if (this.ended || this.router !== client) return;
       this.router = null;
       // Квота ключа ROUTER (429 или 1011 «exceeded your current quota»): у Extended
-      // второго ключа больше нет — честно говорим и предлагаем Обычный, а не долбим Google
+      // второго ключа больше нет — честно говорим и предлагаем Быстрый, а не долбим Google
       // переподключениями без паузы (было: 6 попыток за 0,4 с, приёмка 02.11).
       if (String(code) === "429" || /exhausted|quota/i.test(reason ?? "")) {
         this.frame({
           type: "warning",
           code: "extended_unavailable",
-          message: "Extended недоступен: второй ключ упёрся в квоту. Переключись на Обычный.",
+          message: "Extended недоступен: второй ключ упёрся в квоту. Переключись на Быстрый.",
         });
         return;
       }
       this.routerReconnects += 1;
       if (this.routerReconnects > 5) {
-        this.frame({ type: "warning", code: "extended_unavailable", message: "Помощник Extended не подключается. Переключись на Обычный." });
+        this.frame({ type: "warning", code: "extended_unavailable", message: "Помощник Extended не подключается. Переключись на Быстрый." });
         return;
       }
       const wait = Math.min(500 * 2 ** this.routerReconnects, 10_000);

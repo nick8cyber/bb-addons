@@ -45,7 +45,7 @@ export default definePluginApp((app) => {
 
   app.commands.register({
     id: "call-mode",
-    title: "Live Call: переключить режим (Обычный ↔ Extended)",
+    title: "Live Call: переключить режим (Extended ↔ Быстрый)",
     defaultShortcut: { key: "k", mod: true, shift: true },
     isAvailable: () => callEngine.getSnapshot().phase === "live",
     run: () => callEngine.toggleMode(),

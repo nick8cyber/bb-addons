@@ -19,7 +19,7 @@ tags: [live-call, contract]
 | Ключ (`bb.settings.define`) | Тип | По умолчанию | Правила |
 |---|---|---|---|
 | `geminiKeys` | secret, строки | — | 1–2 ключа AI Studio, по одному на строку. Первый — основной, второй — запасной. Нет ключей → `needsConfiguration`. В extended нужны оба (VOICE=k1, ROUTER=k2): старт звонка в extended с одним ключом → фоллбэк в normal + `warning { code: "extended_unavailable" }` |
-| `defaultMode` | `"normal" \| "extended"` | `"normal"` | Режим нового звонка. После звонка сохраняется последний выбранный (`lastMode` в хранилище плагина) |
+| `defaultMode` | `"normal" \| "extended"` | `"extended"` (владелец 03.11; `normal` в интерфейсе — «Быстрый») | Режим нового звонка. После звонка сохраняется последний выбранный (`lastMode` в хранилище плагина) |
 | `extendedThinkingLevel` | `"LOW" \| "MEDIUM" \| "HIGH"` | `"LOW"` | Только для VOICE в режиме `extended` |
 | `voice` | строка из 30 голосов | `"Algenib"` | `generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName` (у 3.8-live speechConfig внутри generationConfig — проверено пробой 02.11, в корне setup отклоняется 1007) |
 | `languageCode` | строка | `"ru-RU"` | `generationConfig.speechConfig.languageCode` |

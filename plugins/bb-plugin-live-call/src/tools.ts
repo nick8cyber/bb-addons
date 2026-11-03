@@ -621,7 +621,7 @@ export const TOOLS: ToolDef[] = [
     name: "switch_mode",
     cls: "R",
     word: "",
-    description: "Переключить режим звонка: normal или extended.",
+    description: "Переключить режим звонка: extended (по умолчанию, думает глубже) или normal — режим «Быстрый». «Быстрый режим» владельца = normal.",
     parameters: {
       type: "object",
       properties: { mode: { type: "string", enum: ["normal", "extended"] } },

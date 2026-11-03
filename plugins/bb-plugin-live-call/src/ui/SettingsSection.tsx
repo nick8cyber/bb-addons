@@ -75,7 +75,7 @@ export function SettingsSection() {
         </Row>
         <Row label="Звонок">
           {status?.activeCall ? (
-            <span className="lc-ok">идёт · {status.activeCall.mode === "extended" ? "Extended" : "Обычный"}</span>
+            <span className="lc-ok">идёт · {status.activeCall.mode === "extended" ? "Extended" : "Быстрый"}</span>
           ) : (
             <span className="lc-sub">нет</span>
           )}

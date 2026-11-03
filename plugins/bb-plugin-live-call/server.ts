@@ -68,7 +68,7 @@ export default async function plugin(bb: BbPluginApi) {
     defaultMode: {
       type: "string",
       label: "Режим по умолчанию",
-      description: "normal — базовая gemini-3.8-live с инструментами; extended — Extended Thinking с маршрутизатором.",
+      description: "extended (по умолчанию) — Extended Thinking с помощником для инструментов; normal — «Быстрый»: базовая gemini-3.8-live.",
     },
     extendedThinkingLevel: { type: "string", label: "Уровень мышления Extended", description: "Только для VOICE в режиме extended." },
     voice: { type: "string", label: "Голос", description: "По умолчанию Algenib — выбор владельца 02.11." },
@@ -380,7 +380,8 @@ export default async function plugin(bb: BbPluginApi) {
                 sock.close(BUSY_CLOSE_CODE, "busy");
                 return;
               }
-              const fallback = str((await settings_get()).defaultMode, "normal") === "extended" ? "extended" : "normal";
+              // Extended — по умолчанию (владелец 03.11); «Быстрый» (normal) — только если выбран явно.
+              const fallback = str((await settings_get()).defaultMode, "extended") === "normal" ? "normal" : "extended";
               try {
                 state.session = await startCall(sock, frame.mode ?? fallback);
               } catch {
