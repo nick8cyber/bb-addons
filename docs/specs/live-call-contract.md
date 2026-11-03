@@ -550,3 +550,22 @@ CLI: `bb call tool <имя> [json]` — выполнить инструмент 
 ### 15.7 TODO (не в этой задаче)
 
 - Переключение проекта посреди звонка: новая сессия с инструментами другого проекта плюс выжимка разговора от сервера, пауза ~1 с.
+
+### 15.8 Интерфейс ↔ сервер (для параллельной работы, 03.11)
+
+Сервер (исполнитель A) добавляет в `rpcContract` (`server.ts`, `bb.rpc.register`) методы. Интерфейс (исполнитель B) вызывает их через тот же `rpc()`, что и `SettingsSection.tsx`.
+
+| Метод | Вход | Выход |
+|---|---|---|
+| `projectCallsList` | `{}` | `{ projects: Array<{ projectId: string; title: string; state: "approved" \| "pending" \| "invalid"; diff?: string[]; error?: string }> }` |
+| `projectCallsApprove` | `{ projectId: string; hash: string }` | `{ ok: boolean; error?: string }` — `hash` из `projectCallsList` (поле `hash` у `pending`), иначе `stale` |
+| `projectCallsReject` | `{ projectId: string }` | `{ ok: boolean }` |
+
+- `state`:
+  - `approved` — реестр проекта подтверждён, звонок разрешён;
+  - `pending` — изменён и ждёт подтверждения, `diff` — строки для показа;
+  - `invalid` — ошибка разбора, звонок запрещён.
+- Подтверждение кнопкой — через `projectCallsApprove`. Голосовое «разрешаю» в начале звонка (§15.2) делает A на сервере.
+- Звонок по проекту начинает интерфейс: `callEngine.start({ projectId })`, кадр `hello { projectId }` (§15.1). Сервер отвечает `project_not_configured` или `registry_pending`, если реестр не подтверждён.
+- События `window` (§15.1) публикует интерфейс по данным `projectCallsList`: при загрузке, после подтверждения и раз в 60 с.
+- До готовности сервера B тестирует на подменённом `rpc`.
