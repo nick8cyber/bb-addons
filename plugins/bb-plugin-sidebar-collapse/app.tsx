@@ -529,6 +529,39 @@ function PaginationControls({
   );
 }
 
+/**
+ * Необязательная интеграция с плагином звонка live-call (его контракт §15.1).
+ * Плагин звонка публикует в window `bb-live-call:projects { projects: [{ projectId }] }`
+ * и слушает `bb-live-call:start-project { projectId }`. Нет плагина звонка — нет событий и нет иконки.
+ */
+const LIVE_CALL_PROJECTS_EVENT = "bb-live-call:projects";
+const LIVE_CALL_PROJECTS_REQUEST_EVENT = "bb-live-call:projects-request";
+const LIVE_CALL_START_EVENT = "bb-live-call:start-project";
+
+export function useLiveCallProjects(): ReadonlySet<string> {
+  const [ids, setIds] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onProjects = (event: Event) => {
+      const list = (event as CustomEvent<{ projects?: Array<{ projectId?: unknown }> }>).detail?.projects;
+      setIds(new Set(Array.isArray(list) ? list.map(p => String(p?.projectId ?? "")).filter(Boolean) : []));
+    };
+    window.addEventListener(LIVE_CALL_PROJECTS_EVENT, onProjects);
+    // плагин звонка мог опубликовать список раньше, чем смонтировался сайдбар
+    window.dispatchEvent(new CustomEvent(LIVE_CALL_PROJECTS_REQUEST_EVENT));
+    return () => window.removeEventListener(LIVE_CALL_PROJECTS_EVENT, onProjects);
+  }, []);
+  return ids;
+}
+
+function PhoneGlyph() {
+  return (
+    <svg aria-hidden viewBox="0 0 24 24" className="size-3.5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z" />
+    </svg>
+  );
+}
+
 function CollapsedThreadList({
   activeThreadId,
   isCompactViewport,
@@ -536,6 +569,7 @@ function CollapsedThreadList({
   Original,
 }: PluginThreadListProps & { Original?: ComponentType }) {
   const { status, threads, projects } = experimental_useSidebarThreads();
+  const liveCallProjects = useLiveCallProjects();
   const actions = useSidebarRowActions();
   const navigate = useBbNavigate();
   const { values } = useSettings();
@@ -747,6 +781,20 @@ function CollapsedThreadList({
               <span className="shrink-0 text-[11px] text-muted-foreground/70">
                 {group.rootCount}
               </span>
+            ) : null}
+            {liveCallProjects.has(group.projectId) ? (
+              <button
+                type="button"
+                aria-label={`Call in ${group.projectName}`}
+                title={`Call in ${group.projectName}`}
+                data-sidebar-live-call={group.projectId}
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent(LIVE_CALL_START_EVENT, { detail: { projectId: group.projectId } }));
+                }}
+                className="flex size-5 shrink-0 cursor-pointer items-center justify-center rounded hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+              >
+                <PhoneGlyph />
+              </button>
             ) : null}
             <button
               type="button"

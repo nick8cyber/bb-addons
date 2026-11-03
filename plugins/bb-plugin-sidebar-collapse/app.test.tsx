@@ -643,3 +643,44 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     ]);
   });
 });
+
+describe("необязательная иконка звонка live-call", () => {
+  const props = {
+    activeThreadId: null, activeProjectId: null, isCompactViewport: false,
+    onNavigate: () => {}, searchQuery: "", Original: () => <div>bb list</div>,
+  };
+  const env = { settings: {}, sidebarThreads: { status: "ready" as const, projects: [makeProject()], threads: [makeThread({ id: "t1", title: "One" })] } };
+
+  it("без событий плагина звонка иконки нет", async () => {
+    const app = await appPromise;
+    const slot = renderSlot(app.threadLists[0]!, props, env);
+    expect(slot.container.querySelector("[data-sidebar-live-call]")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("проект из bb-live-call:projects получает телефон слева от «+»; клик шлёт bb-live-call:start-project", async () => {
+    const app = await appPromise;
+    let requested = false;
+    const onReq = () => { requested = true; };
+    window.addEventListener("bb-live-call:projects-request", onReq);
+    const slot = renderSlot(app.threadLists[0]!, props, env);
+    expect(requested).toBe(true);
+    window.dispatchEvent(new CustomEvent("bb-live-call:projects", { detail: { projects: [{ projectId: "proj-1" }] } }));
+    const phone = await waitFor(() => {
+      const el = slot.container.querySelector('[data-sidebar-live-call="proj-1"]');
+      if (!el) throw new Error("нет иконки");
+      return el as HTMLButtonElement;
+    });
+    expect(phone.nextElementSibling?.getAttribute("aria-label")).toBe("New thread in Project One");
+    let started: unknown = null;
+    const onStart = (e: Event) => { started = (e as CustomEvent).detail; };
+    window.addEventListener("bb-live-call:start-project", onStart);
+    fireEvent.click(phone);
+    expect(started).toEqual({ projectId: "proj-1" });
+    window.dispatchEvent(new CustomEvent("bb-live-call:projects", { detail: { projects: [] } }));
+    await waitFor(() => expect(slot.container.querySelector("[data-sidebar-live-call]")).toBeNull());
+    window.removeEventListener("bb-live-call:start-project", onStart);
+    window.removeEventListener("bb-live-call:projects-request", onReq);
+    slot.lifecycle.unmount();
+  });
+});
