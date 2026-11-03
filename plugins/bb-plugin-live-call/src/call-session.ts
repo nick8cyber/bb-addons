@@ -976,6 +976,7 @@ export class CallSession extends EventEmitter {
   /** Кадр playback_drained из браузера: открывает окно подтверждения. */
   onPlaybackDrained(turnSeq: number) {
     this.gate.onPlaybackDrained(turnSeq);
+    this.lastDrainedSeq = Math.max(this.lastDrainedSeq ?? turnSeq, turnSeq);
     if (this.lastAudioTurnSeq === null || turnSeq >= this.lastAudioTurnSeq) {
       if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
       if (this.state === "speaking" && !this.voiceTalking) this.setState("listening");
@@ -987,11 +988,14 @@ export class CallSession extends EventEmitter {
   private turnFirstAudioAt = 0;
   private lastAudioTurnSeq: number | null = null;
   private listenFallback: NodeJS.Timeout | null = null;
+  private lastDrainedSeq: number | null = null;
   private scheduleListenAfterPlayback() {
     const bytes = this.turnAudioBytes;
     this.turnAudioBytes = 0;
     if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
-    if (bytes === 0) {
+    // Браузер мог доиграть звук раньше, чем пришёл turnComplete: второго playback_drained не будет.
+    const drainedAlready = this.lastAudioTurnSeq !== null && this.lastDrainedSeq !== null && this.lastDrainedSeq >= this.lastAudioTurnSeq;
+    if (bytes === 0 || drainedAlready) {
       if (this.state === "speaking") this.setState("listening");
       return;
     }

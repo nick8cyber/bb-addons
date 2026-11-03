@@ -153,7 +153,7 @@ describe("состояние после ответа (аудит PLUG-108)", () 
     ws.server({ serverContent: { turnComplete: true } });
     await vi.advanceTimersByTimeAsync(10);
     expect(st(s)).toBe("speaking");
-    s.onPlaybackDrained(1_000_000);
+    s.onPlaybackDrained((s as unknown as { lastAudioTurnSeq: number }).lastAudioTurnSeq);
     expect(st(s)).toBe("listening");
     await s.end("owner");
   });
@@ -168,6 +168,22 @@ describe("состояние после ответа (аудит PLUG-108)", () 
     await vi.advanceTimersByTimeAsync(2000);
     expect(st(s)).toBe("speaking");
     await vi.advanceTimersByTimeAsync(2000);
+    expect(st(s)).toBe("listening");
+    await s.end("owner");
+  });
+
+  it("браузер доиграл раньше turnComplete (настоящий turnSeq) → «listening» сразу, без запасного таймера", async () => {
+    const { s } = make();
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: audio } }] } } });
+    const seq = (s as unknown as { lastAudioTurnSeq: number }).lastAudioTurnSeq;
+    expect(typeof seq).toBe("number");
+    s.onPlaybackDrained(seq);
+    expect(st(s)).toBe("speaking"); // голос ещё в ходе — переход ждёт turnComplete
+    ws.server({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(10);
     expect(st(s)).toBe("listening");
     await s.end("owner");
   });
