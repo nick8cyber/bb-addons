@@ -11,6 +11,8 @@ const ws = new WebSocket(WS_URL);
 let asked = false;
 let lastAgent = Date.now();
 let sysErr = false;
+let prefaceAt = 0;
+let firstAudioAfterPreface = 0;
 const finish = () => {
   log(`RESULT systemError=${sysErr}`);
   try { ws.send(JSON.stringify({ type: "end" })); } catch {}
@@ -20,7 +22,12 @@ setTimeout(finish, 150_000);
 setInterval(() => { if (asked && Date.now() - lastAgent > 15_000) finish(); }, 1000);
 ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1 }));
 ws.onmessage = (ev) => {
-  if (typeof ev.data !== "string") { lastAgent = Date.now(); return; } // аудио голоса — он ещё говорит
+  if (typeof ev.data !== "string") {
+    lastAgent = Date.now();
+    // реальная пауза: первый звук голоса после законченного вступления
+    if (prefaceAt && !firstAudioAfterPreface && Date.now() - prefaceAt > 300) { firstAudioAfterPreface = Date.now(); log(`первый звук ответа через ${((firstAudioAfterPreface - prefaceAt) / 1000).toFixed(1)} с после вступления`); }
+    return;
+  }
   const f = JSON.parse(ev.data);
   if (f.type === "transcript" && f.role === "agent") lastAgent = Date.now();
   if (f.type === "ready") {
@@ -31,6 +38,7 @@ ws.onmessage = (ev) => {
     lastAgent = Date.now();
     if (/системн\S* ошибк/i.test(f.text)) sysErr = true;
     log("[agent]", String(f.text).slice(0, 220));
+    if (!prefaceAt) prefaceAt = Date.now();
   }
   if (f.type === "action") log("[action]", f.tool, f.status);
   if (f.type === "error") log("[error]", f.code, f.message);
