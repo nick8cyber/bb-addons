@@ -74,4 +74,52 @@ describe("routerMayHearOwner", () => {
     expect(sent[0]).toContain("Владелец: что в проекте BB?");
     await s.end("owner");
   });
+
+  it("повторный вызов инструмента после approved отклоняется сервером и не исполняется дважды (§12.10.5)", async () => {
+    let executeCount = 0;
+    const { DEFAULT_WORDS } = await import("../src/classify.js");
+    const { ConfirmationGate } = await import("../src/confirmation-gate.js");
+    const { runToolCall } = await import("../src/tools.js");
+    const fakeTool = {
+      name: "test_action",
+      cls: "L" as const,
+      word: "запускай",
+      description: "Тестовое действие",
+      parameters: { type: "object", properties: { p: { type: "string" } } },
+      execute: async () => {
+        executeCount++;
+        return { ok: true as const, data: { done: true } };
+      },
+    };
+    const gate = new ConfirmationGate(DEFAULT_WORDS);
+
+    // Первый вызов — требует подтверждения
+    const r1 = await runToolCall(fakeTool, { p: "val" }, "call_1", {
+      sdk: {} as never,
+      gate,
+      ledger: {} as never,
+      reportAction: () => {},
+      callsProjectId: () => null,
+    });
+    expect(r1.result.ok).toBe(false);
+    expect("needsConfirmation" in r1.result && r1.result.needsConfirmation).toBeTruthy();
+
+    // Одобряем подтверждение
+    const p = gate.pendingConfirmation()!;
+    gate.decide(p.confirmationId, "approve");
+    expect(p.verdict).toBe("approved");
+
+    // Модель повторно шлёт toolCall: runToolCall должен вернуть already_running и НЕ вызывать execute
+    const r2 = await runToolCall(fakeTool, { p: "val" }, "call_1", {
+      sdk: {} as never,
+      gate,
+      ledger: {} as never,
+      reportAction: () => {},
+      callsProjectId: () => null,
+    });
+    expect(r2.result.ok).toBe(false);
+    expect("error" in r2.result && r2.result.error.code).toBe("already_running");
+    expect(r2.executed).toBe(false);
+    expect(executeCount).toBe(0);
+  });
 });

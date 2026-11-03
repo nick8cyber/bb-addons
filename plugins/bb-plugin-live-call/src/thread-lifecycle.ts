@@ -22,8 +22,13 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
   const { sdk, store, bridgeOwner, turnClosedWaiters, log } = opts;
   const advanceQueues = new Map<string, string[]>();
   const advanceProcessing = new Set<string>();
+  const endedThreads = new Set<string>();
 
   const processAdvanceQueue = async (threadId: string): Promise<void> => {
+    if (endedThreads.has(threadId)) {
+      advanceQueues.delete(threadId);
+      return;
+    }
     if (advanceProcessing.has(threadId)) return;
     const queue = advanceQueues.get(threadId);
     if (!queue || queue.length === 0) return;
@@ -31,6 +36,11 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
     advanceProcessing.add(threadId);
     try {
       while (queue.length > 0) {
+        if (endedThreads.has(threadId)) {
+          queue.length = 0;
+          advanceQueues.delete(threadId);
+          break;
+        }
         const utterance = queue[0];
         try {
           const owner = bridgeOwner.get(threadId);
@@ -47,6 +57,12 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
             await closed;
           }
 
+          if (endedThreads.has(threadId)) {
+            queue.length = 0;
+            advanceQueues.delete(threadId);
+            break;
+          }
+
           await sdk.threads.send({
             threadId,
             mode: "start",
@@ -55,11 +71,20 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
 
           queue.shift();
         } catch (e: unknown) {
+          if (endedThreads.has(threadId)) {
+            queue.length = 0;
+            advanceQueues.delete(threadId);
+            break;
+          }
           const msg = String((e as { message?: unknown })?.message ?? e);
           const status = (e as { status?: unknown })?.status;
           if (status === 409 || msg.includes("409") || msg.includes("already active")) {
             log?.warn(`advanceCallThread 409 for ${threadId}: turn is active, utterance queued`);
-            setTimeout(() => void processAdvanceQueue(threadId), 1500);
+            setTimeout(() => {
+              if (!endedThreads.has(threadId)) {
+                void processAdvanceQueue(threadId);
+              }
+            }, 1500);
             break;
           } else {
             log?.error(`advanceCallThread error for ${threadId}: ${msg}`);
@@ -75,6 +100,7 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
   };
 
   const advanceCallThread = async (threadId: string, utterance: string): Promise<void> => {
+    if (endedThreads.has(threadId)) return;
     try {
       let q = advanceQueues.get(threadId);
       if (!q) {
@@ -89,6 +115,7 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
   };
 
   const sayCallThread = async (threadId: string, text: string): Promise<void> => {
+    if (endedThreads.has(threadId)) return;
     try {
       const owner = bridgeOwner.get(threadId);
       owner?.send(JSON.stringify({ type: "say", threadId, text }));
@@ -98,6 +125,8 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
   };
 
   const endCallThread = async (threadId: string, summary: string, callId?: string): Promise<void> => {
+    endedThreads.add(threadId);
+    advanceQueues.delete(threadId);
     let closed = false;
     const owner = bridgeOwner.get(threadId);
     if (owner) {
@@ -130,6 +159,14 @@ export function createCallThreadManager(opts: ThreadManagerOptions) {
         if (!st || st === "active" || st === "starting") {
           log?.info(`endCallThread fallback: stopping thread ${threadId} (status: ${st ?? "unknown"}) via sdk.threads.stop`);
           await sdk.threads.stop({ threadId });
+          for (let i = 0; i < 15; i++) {
+            await new Promise((r) => setTimeout(r, 100));
+            const check = (await sdk.threads.get({ threadId }).catch(() => null)) as unknown as { thread?: { status?: string }; status?: string } | null;
+            const curSt = check?.thread?.status ?? check?.status;
+            if (curSt && curSt !== "active" && curSt !== "starting") {
+              break;
+            }
+          }
         }
         closed = true;
       } catch (e) {

@@ -124,11 +124,12 @@ describe("сбор сообщений треда (контракт §12.2)", () 
       expect(res.messagesCount).toBe(25);
       expect(res.skippedCount).toBe(0);
       expect(res.block).not.toContain("пропущено");
+      expect(res.block).toContain("ПОСЛЕДНИЕ СООБЩЕНИЯ (1–25)");
       expect(res.block).toContain("[1] Владелец");
       expect(res.block).toContain("[25] Владелец");
     });
 
-    it("больше 30 сообщений: первые 10 + строка пропуска + последние 20", () => {
+    it("больше 30 сообщений: первые 10 + строка пропуска + последние 20 с заголовками (§12.10, §12.2)", () => {
       const messages: ThreadMessage[] = Array.from({ length: 47 }, (_, i) => ({
         number: i + 1,
         role: i % 2 === 0 ? "owner" : "agent",
@@ -139,7 +140,9 @@ describe("сбор сообщений треда (контракт §12.2)", () 
       const res = formatThreadMessagesBlock(messages);
       expect(res.messagesCount).toBe(30);
       expect(res.skippedCount).toBe(17);
-      expect(res.block).toContain("… пропущено 17 сообщений (дочитай инструментом) …");
+      expect(res.block).toContain("НАЧАЛО ТРЕДА (1–10)");
+      expect(res.block).toContain("… пропущено 17 (дочитай `thread_read_messages`) …");
+      expect(res.block).toContain("ПОСЛЕДНИЕ СООБЩЕНИЯ (28–47)");
 
       // Первые 10
       expect(res.block).toContain("[1] Владелец");

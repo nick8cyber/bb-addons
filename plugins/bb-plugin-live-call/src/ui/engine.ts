@@ -56,6 +56,7 @@ export interface CallView {
   endedAt: number | null;
   callId: string | null;
   threadId: string | null;
+  targetThreadId: string | null;
   keys: { active: number; of: number } | null;
   feed: FeedItem[];
   confirmation: Confirmation | null;
@@ -79,6 +80,7 @@ const IDLE: CallView = {
   endedAt: null,
   callId: null,
   threadId: null,
+  targetThreadId: null,
   keys: null,
   feed: [],
   confirmation: null,
@@ -273,7 +275,7 @@ export class CallEngine {
     this.releaseAudio();
     this.ownerHeard = false;
     this.endRequested = false;
-    this.view = { ...IDLE, phase: "connecting", orb: "connecting", threadId: threadId ?? null, expandSignal: this.view.expandSignal + 1 };
+    this.view = { ...IDLE, phase: "connecting", orb: "connecting", targetThreadId: threadId ?? null, expandSignal: this.view.expandSignal + 1 };
     this.patch({});
     // iOS WebKit (Safari и приложение BB): звук живёт, только если AudioContext
     // создан и запущен прямо в нажатии. Раньше он создавался после ответа сервера —
@@ -376,7 +378,7 @@ export class CallEngine {
   }
 
   switchMode(mode: CallMode, source: "button" | "command" | "notice" = "button") {
-    if (mode === this.view.mode || this.view.switching || this.view.confirmation) return;
+    if (this.view.targetThreadId || mode === this.view.mode || this.view.switching || this.view.confirmation) return;
     const sinceReady = Date.now() - this.liveSince;
     // Источник каждого переключения — в журнал звонка: причина самопроизвольного
     // Extended (03.11) пока гипотеза, следующий звонок её подтвердит или опровергнет.
@@ -388,6 +390,7 @@ export class CallEngine {
   }
 
   toggleMode() {
+    if (this.view.targetThreadId) return;
     this.switchMode(this.view.mode === "normal" ? "extended" : "normal", "command");
   }
 
@@ -481,6 +484,7 @@ export class CallEngine {
           mode: frame.mode,
           callId: frame.callId,
           keys: frame.keys,
+          targetThreadId: frame.targetThreadId ?? this.view.targetThreadId ?? null,
           startedAt: Date.now(),
         });
         await this.startAudio();

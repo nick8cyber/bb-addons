@@ -21,7 +21,7 @@ import type { ToolClass, ToolResult } from "./contract.js";
 import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
-import { fetchThreadMessages, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
+import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
 
 export type CallState =
   | "connecting" | "listening" | "thinking" | "speaking" | "working" | "reconnecting" | "muted" | "ended";
@@ -58,7 +58,21 @@ export class CallSession extends EventEmitter {
   threadId: string | null = null;
   readonly targetThreadId: string | null = null;
   private threadMessages: ThreadMessage[] = [];
-  private threadMeta: { id: string; title: string; project?: string; state?: string } | null = null;
+  private threadMeta: {
+    id: string;
+    title: string;
+    project?: string;
+    state?: string;
+    providerId?: string;
+    model?: string;
+  } | null = null;
+  private threadState: {
+    status: string;
+    lastMessageTime?: string;
+    lastOwnerMessageIndex?: number;
+    lastAgentMessageIndex?: number;
+  } = { status: "свободен" };
+  private nowUtc = "";
   private threadMessagesBlock = "";
   private voice: LiveClient | null = null;
   private router: LiveClient | null = null;
@@ -94,8 +108,8 @@ export class CallSession extends EventEmitter {
   constructor(private deps: CallSessionDeps) {
     super();
     this.targetThreadId = deps.targetThreadId ?? null;
-    this.mode = deps.mode;
-    this.modeHistory = [deps.mode];
+    this.mode = this.targetThreadId ? "normal" : deps.mode;
+    this.modeHistory = [this.mode];
     this.pool = new KeyPool(deps.keys, {
       onWarning: (m) => this.frame({ type: "warning", code: "tpm_near_limit", message: m }),
       onKeySwitch: (active, of, reason) => {
@@ -138,6 +152,7 @@ export class CallSession extends EventEmitter {
       mode: this.mode,
       voice: this.deps.voice,
       keys: { active: this.pool.active, of: this.pool.of },
+      targetThreadId: this.targetThreadId ?? undefined,
     });
     if (this.threadId) this.frame({ type: "thread", threadId: this.threadId });
     this.setState(this.muted ? "muted" : "listening");
@@ -170,8 +185,10 @@ export class CallSession extends EventEmitter {
     if (this.targetThreadId) {
       this.deps.store.startCall(this.deps.callId);
       this.deps.store.event(this.deps.callId, "call_started", { targetThreadId: this.targetThreadId });
+      this.nowUtc = new Date().toISOString();
       try {
-        const t = (await this.deps.sdk.threads.get({ threadId: this.targetThreadId })) as unknown as Record<string, unknown>;
+        const raw = (await this.deps.sdk.threads.get({ threadId: this.targetThreadId })) as unknown as Record<string, unknown>;
+        const t = (raw && typeof raw === "object" && "thread" in raw && raw.thread ? raw.thread : raw) as Record<string, unknown>;
         let projectTitle: string | undefined = undefined;
         if (t?.projectId) {
           try {
@@ -192,6 +209,8 @@ export class CallSession extends EventEmitter {
           title: String(t?.title ?? t?.id ?? "Тред"),
           project: projectTitle,
           state: stateStr,
+          providerId: t?.providerId ? String(t.providerId) : undefined,
+          model: (t?.model ?? (t?.runtime as Record<string, unknown>)?.model) ? String(t?.model ?? (t?.runtime as Record<string, unknown>)?.model) : undefined,
         };
       } catch {
         this.threadMeta = { id: this.targetThreadId, title: "Тред" };
@@ -200,6 +219,21 @@ export class CallSession extends EventEmitter {
       this.threadMessages = await fetchThreadMessages(this.deps.sdk, this.targetThreadId);
       const formatted = formatThreadMessagesBlock(this.threadMessages);
       this.threadMessagesBlock = formatted.block;
+
+      let lastOwnerIndex: number | undefined;
+      let lastAgentIndex: number | undefined;
+      for (const m of this.threadMessages) {
+        if (m.role === "owner") lastOwnerIndex = m.number;
+        else if (m.role === "agent") lastAgentIndex = m.number;
+      }
+      const lastMsg = this.threadMessages[this.threadMessages.length - 1];
+      this.threadState = {
+        status: this.threadMeta?.state ?? "свободен",
+        lastMessageTime: lastMsg ? formatMessageTime(lastMsg.createdAt) : undefined,
+        lastOwnerMessageIndex: lastOwnerIndex,
+        lastAgentMessageIndex: lastAgentIndex,
+      };
+
       this.deps.store.event(this.deps.callId, "thread_context", {
         messages: formatted.messagesCount,
         skipped: formatted.skippedCount,
@@ -223,6 +257,7 @@ export class CallSession extends EventEmitter {
       mode: this.mode,
       voice: this.deps.voice,
       keys: { active: this.pool.active, of: this.pool.of },
+      targetThreadId: this.targetThreadId ?? undefined,
     });
     if (this.threadId) {
       this.frame({ type: "thread", threadId: this.threadId });
@@ -280,9 +315,10 @@ export class CallSession extends EventEmitter {
     const systemInstruction = this.targetThreadId
       ? threadVoiceInstruction({
           thread: this.threadMeta ?? { id: this.targetThreadId, title: "Тред" },
+          nowUtc: this.nowUtc,
+          threadState: this.threadState,
           messagesBlock: this.threadMessagesBlock,
           memory: this.promptContext.memory,
-          mode: this.mode,
         })
       : this.mode === "normal"
         ? voiceInstructionNormal(this.promptContext)
@@ -306,9 +342,28 @@ export class CallSession extends EventEmitter {
   }
 
   private makeRouterSession(): LiveClient {
+    let messagesInfo: { firstRange?: string; lastRange?: string; total: number } | undefined;
+    if (this.threadMessages.length > 0) {
+      const total = this.threadMessages.length;
+      if (total > 30) {
+        const k = total - 19;
+        messagesInfo = {
+          firstRange: "1–10",
+          lastRange: `${k}–${total}`,
+          total,
+        };
+      } else {
+        messagesInfo = {
+          firstRange: `1–${total}`,
+          total,
+        };
+      }
+    }
+
     const systemInstruction = this.targetThreadId
       ? threadRouterInstruction({
           thread: this.threadMeta ?? { id: this.targetThreadId, title: "Тред" },
+          messagesInfo,
         })
       : routerInstruction(this.promptContext);
 
@@ -481,17 +536,17 @@ export class CallSession extends EventEmitter {
     for (const call of calls) {
       const def = toolByName(call.name, this.targetThreadId ?? undefined);
       if (!def) {
-        client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` });
+        client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "WHEN_IDLE", call.name);
         continue;
       }
       if (this.toolCallsThisTurn >= 6) {
-        client.sendToolResponse(call.id, { error: "слишком много вызовов подряд: ответь владельцу тем, что уже известно" }, "WHEN_IDLE");
+        client.sendToolResponse(call.id, { error: "слишком много вызовов подряд: ответь владельцу тем, что уже известно" }, "WHEN_IDLE", call.name);
         continue;
       }
       this.toolCallsThisTurn += 1;
       const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
       // Голосовая сессия должна отреагировать на результат: WHEN_IDLE (SILENT запрещает ответ).
-      client.sendToolResponse(call.id, result, "WHEN_IDLE");
+      client.sendToolResponse(call.id, result, "WHEN_IDLE", call.name);
       if (!result.ok && "error" in result) {
         this.deps.store.event(this.deps.callId, "tool_error", { tool: def.name, args: call.args, code: result.error.code, message: result.error.message.slice(0, 300) });
       }
@@ -543,7 +598,7 @@ export class CallSession extends EventEmitter {
    */
   private async handleRouterCalls(client: LiveClient, calls: Array<{ id?: string; name: string; args: Record<string, unknown> }>) {
     if (this.routerBusyCount >= 3) {
-      for (const c of calls) client.sendToolResponse(c.id, { error: "превышен лимит вызовов на реплику" }, "SILENT");
+      for (const c of calls) client.sendToolResponse(c.id, { error: "превышен лимит вызовов на реплику" }, "SILENT", c.name);
       return;
     }
     this.routerBusyCount += 1;
@@ -552,18 +607,18 @@ export class CallSession extends EventEmitter {
     for (const call of calls) {
       const def = toolByName(call.name, this.targetThreadId ?? undefined);
       if (!def) {
-        client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "SILENT");
+        client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "SILENT", call.name);
         continue;
       }
       const hash = argsHash(def.name, call.args);
       if (seen.has(hash)) {
-        client.sendToolResponse(call.id, { info: "уже выполнено, больше не вызывай" }, "SILENT");
+        client.sendToolResponse(call.id, { info: "уже выполнено, больше не вызывай" }, "SILENT", call.name);
         continue;
       }
       seen.set(hash, true);
       if (def.cls === "R") {
         const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
-        client.sendToolResponse(call.id, result, "SILENT");
+        client.sendToolResponse(call.id, result, "SILENT", call.name);
         this.enqueueSystem(def.name, result);
       } else {
         // Запись: toolResponse откладывается до вердикта (спека §2.1 п. 4).
@@ -716,7 +771,7 @@ export class CallSession extends EventEmitter {
     const wait = this.pendingToolResponses.get(hash);
     if (!wait) return;
     this.pendingToolResponses.delete(hash);
-    this.router?.sendToolResponse(wait.functionId, result, "SILENT");
+    this.router?.sendToolResponse(wait.functionId, result, "SILENT", wait.def);
   }
 
   /** Первая законченная реплика владельца создаёт тред звонка (контракт §6 п. 2). */
@@ -838,7 +893,7 @@ export class CallSession extends EventEmitter {
   }
 
   async switchMode(mode: "normal" | "extended", source: "browser" | "tool" = "browser") {
-    if (mode === this.mode || this.ended) return;
+    if (this.targetThreadId || mode === this.mode || this.ended) return;
     this.deps.store.event(this.deps.callId, "mode_switch", { to: mode, source, msSinceStart: Date.now() - this.startedAt });
     if (this.gate.pendingConfirmation()) {
       this.frame({ type: "error", code: "pending_confirmation", message: "дождись ответа на подтверждение", retryable: false });
@@ -880,6 +935,7 @@ export class CallSession extends EventEmitter {
     this.setState("reconnecting", "переподключаюсь");
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
+      if (this.ended) return;
       const useHandle = handle === undefined ? this.voice?.sessionHandle ?? undefined : handle;
       const old = this.voice;
       this.voice = null;
@@ -901,6 +957,10 @@ export class CallSession extends EventEmitter {
       // Новый ключ — новый handle: старая сессия не возобновляется, нужен пересказ.
       this.voice?.close();
       void this.openSessions(undefined).then(() => {
+        if (this.ended) {
+          this.closeSessions();
+          return;
+        }
         this.voice?.sendClientContent(`[СИСТЕМА] Смена ключа. Пересказ:\n${this.ledger.handoverSummary()}`, false);
         this.setState("listening");
       });
@@ -929,6 +989,14 @@ export class CallSession extends EventEmitter {
   async end(reason: "owner" | "limit" | "error"): Promise<void> {
     if (this.ended) return;
     this.ended = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ownerUtteranceTimer) {
+      clearTimeout(this.ownerUtteranceTimer);
+      this.ownerUtteranceTimer = null;
+    }
     const minutes = Math.round((Date.now() - this.startedAt) / 60000);
     const summary = `Звонок завершён (${reason === "owner" ? "по просьбе владельца" : reason === "limit" ? "лимит времени" : "ошибка"}), ${minutes} мин.`;
     if (this.threadId && this.threadId !== this.targetThreadId) {
@@ -942,8 +1010,12 @@ export class CallSession extends EventEmitter {
         });
       }
     }
-    this.voice?.close();
-    this.router?.close();
+    const v = this.voice;
+    this.voice = null;
+    v?.close();
+    const r = this.router;
+    this.router = null;
+    r?.close();
     if (this.micReporter) {
       clearInterval(this.micReporter);
       this.micReporter = null;

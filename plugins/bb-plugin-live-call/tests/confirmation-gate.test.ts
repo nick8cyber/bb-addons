@@ -201,6 +201,24 @@ describe("кнопки и одноразовость", () => {
     gate.consume(r.pending.confirmationId);
     expect(await gate.confirmAction(r.pending.confirmationId)).toBe("expired");
   });
+
+  it("повторный decide() при уже вынесенном вердикте не вызывает onVerdict повторно (§12.10.5)", () => {
+    const t = fakeClock();
+    let verdictCount = 0;
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: () => {
+        verdictCount++;
+      },
+    });
+    const r = gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    if (!("pending" in r)) throw new Error("no pending");
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("approved");
+    expect(verdictCount).toBe(1);
+
+    // Второй вызов decide до сжигания: вердикт уже вынесен, onVerdict не вызывается повторно
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("approved");
+    expect(verdictCount).toBe(1);
+  });
 });
 
 describe("argsHash", () => {

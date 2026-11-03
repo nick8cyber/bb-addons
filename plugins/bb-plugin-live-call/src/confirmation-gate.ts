@@ -280,6 +280,7 @@ export class ConfirmationGate {
   decide(confirmationId: string, decision: "approve" | "cancel"): Verdict {
     const p = this.pending;
     if (!p || p.confirmationId !== confirmationId) return this.usedIds.has(confirmationId) ? "expired" : "not_confirmed";
+    if (p.verdict !== null) return p.verdict;
     if (p.expiresAt <= this.clock.now()) return this.burn(p, "expired");
     const verdict: Verdict = decision === "approve" ? "approved" : "cancelled";
     p.verdict = verdict;

@@ -124,6 +124,7 @@ function Orb({ state, size = "sm" }: { state: OrbState; size?: "sm" | "lg" }) {
 }
 
 function ModeSwitch({ view, compact = false }: { view: CallView; compact?: boolean }) {
+  if (view.targetThreadId) return null;
   const disabled = view.phase !== "live" || view.switching || Boolean(view.confirmation);
   const title = view.confirmation ? "Сначала ответь на подтверждение" : undefined;
   const seg = (mode: CallMode, icon: "zap" | "sparkles", label: string, hint: string) => {

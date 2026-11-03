@@ -86,6 +86,7 @@ export const serverFrame = z.discriminatedUnion("type", [
     mode: z.enum(["normal", "extended"]),
     voice: z.string(),
     keys: z.object({ active: z.number().int().min(1).max(2), of: z.number().int().min(1).max(2) }),
+    targetThreadId: z.string().optional(),
   }),
   z.object({ type: z.literal("thread"), threadId: z.string() }),
   z.object({ type: z.literal("state"), state: stateSchema, detail: z.string().optional() }),

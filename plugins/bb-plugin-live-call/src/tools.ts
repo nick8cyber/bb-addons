@@ -1279,6 +1279,7 @@ export const threadReadMessagesTool: ToolDef = {
     const start = Math.max(1, typeof args.from === "number" ? Math.floor(args.from) : 1);
     const requestedTo = typeof args.to === "number" ? Math.floor(args.to) : start + 9;
     const end = Math.min(requestedTo, start + 9);
+
     const matched = msgs.filter((m) => m.number >= start && m.number <= end);
     return truncate({
       from: start,
@@ -1409,7 +1410,7 @@ export const THREAD_SPECIFIC_TOOLS: ToolDef[] = [
 ];
 
 export function getThreadTools(): ToolDef[] {
-  const common = TOOLS.filter((t) => ["switch_mode", "end_call", "remember", "recall"].includes(t.name));
+  const common = TOOLS.filter((t) => ["end_call", "remember", "recall"].includes(t.name));
   return [...THREAD_SPECIFIC_TOOLS, ...common];
 }
 
@@ -1471,10 +1472,17 @@ export async function runToolCall(
   }
   ctx.rememberArgs?.(req.pending.argsHash, args);
   if (req.pending.verdict === "approved") {
-    // Кнопка «Подтвердить» или повтор голосом после verdict: исполняет сервер.
-    const result = await def.execute(args, ctx);
-    ctx.gate.consume(req.pending.confirmationId);
-    return { result, executed: result.ok };
+    // Исполняет только CallSession.onVerdict. Повторный вызов от модели отклоняем, чтобы не дублировать действие.
+    return {
+      result: {
+        ok: false,
+        error: {
+          code: "already_running",
+          message: "владелец подтвердил, сервер уже выполняет действие — не вызывай повторно",
+        },
+      },
+      executed: false,
+    };
   }
   return { result: { ok: false, needsConfirmation: { confirmationId: req.pending.confirmationId, say } }, executed: false };
 }

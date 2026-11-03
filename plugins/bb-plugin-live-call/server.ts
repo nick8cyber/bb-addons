@@ -389,10 +389,12 @@ export default async function plugin(bb: BbPluginApi) {
                   return;
                 }
               }
-              // Extended — по умолчанию (владелец 03.11); «Быстрый» (normal) — только если выбран явно.
+              // Звонок по треду (§12.10) — строго normal (одна сессия gemini-3.8-live с инструментами).
+              // Для общего звонка: Extended по умолчанию; «Быстрый» (normal) — если выбран явно.
               const fallback = str((await settings_get()).defaultMode, "extended") === "normal" ? "normal" : "extended";
+              const callMode = frame.threadId ? "normal" : (frame.mode ?? fallback);
               try {
-                state.session = await startCall(sock, frame.mode ?? fallback, frame.threadId);
+                state.session = await startCall(sock, callMode, frame.threadId);
               } catch {
                 // Ошибка уже ушла фреймом и соединение закрыто.
               }
@@ -402,7 +404,9 @@ export default async function plugin(bb: BbPluginApi) {
             if (!s) return;
             if (frame.type === "mute") s.setMuted(frame.muted);
             else if (frame.type === "playback_drained") s.onPlaybackDrained(frame.turnSeq);
-            else if (frame.type === "switch_mode") await s.switchMode(frame.mode);
+            else if (frame.type === "switch_mode") {
+              if (!s.targetThreadId) await s.switchMode(frame.mode);
+            }
             else if (frame.type === "client_log") {
               bb.log.warn(`браузер: ${frame.event}${frame.detail ? ` — ${frame.detail}` : ""}`);
               store.event(state.session?.callId ?? "browser", "client_log", { event: frame.event, detail: frame.detail });

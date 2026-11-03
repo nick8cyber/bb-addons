@@ -114,22 +114,23 @@ describe("сессия звонка по треду (§12.1, §12.3, §12.5, §1
     expect(frames.some((f) => f.type === "ready")).toBe(true);
     expect(frames.some((f) => f.type === "thread")).toBe(false);
 
-    // 4. Сессии Gemini: VOICE получает threadVoiceInstruction, ROUTER получает threadRouterInstruction
-    expect(FakeWs.all).toHaveLength(2);
+    // 4. Сессия Gemini: ровно 1 сессия (gemini-3.8-live) с инструментами, без ROUTER (§12.10)
+    expect(FakeWs.all).toHaveLength(1);
     const voiceSetup = JSON.parse(FakeWs.all[0].sent[0]);
+    expect(voiceSetup.setup.model).toBe("models/gemini-3.8-live");
     const voiceInstruction = voiceSetup.setup.systemInstruction.parts[0].text;
     expect(voiceInstruction).toContain("Оптимизация логики агента");
     expect(voiceInstruction).toContain("Тестовый проект");
+    expect(voiceInstruction).toContain("СОСТОЯНИЕ ТРЕДА:");
     expect(voiceInstruction).toContain("СООБЩЕНИЯ ТРЕДА:");
     expect(voiceInstruction).toContain("Здравствуйте");
 
-    const routerSetup = JSON.parse(FakeWs.all[1].sent[0]);
-    const routerInstruction = routerSetup.setup.systemInstruction.parts[0].text;
-    expect(routerInstruction).toContain("Оптимизация логики агента");
-    expect(routerInstruction).toContain("thread_read_messages");
-    expect(routerInstruction).toContain("thread_send");
-    expect(routerInstruction).not.toContain("СООБЩЕНИЯ ТРЕДА:");
-    expect(routerInstruction).not.toContain("Здравствуйте");
+    const toolNames = voiceSetup.setup.tools.flatMap((t: { functionDeclarations: Array<{ name: string }> }) => t.functionDeclarations.map((f) => f.name));
+    expect(toolNames).toContain("thread_read_messages");
+    expect(toolNames).toContain("thread_send");
+    expect(toolNames).toContain("thread_answer");
+    expect(toolNames).not.toContain("switch_mode");
+    expect(toolNames).not.toContain("start_thread");
   });
 
   it("sendUserMessage (кадр text): транскрипт, owner_line, clientContent, без подтверждений", async () => {
@@ -165,30 +166,21 @@ describe("сессия звонка по треду (§12.1, §12.3, §12.5, §1
     expect(s.pendingConfirmation()).toBeNull();
   });
 
-  it("переключение Extended → «Быстрый» посреди звонка сохраняет контекст треда", async () => {
+  it("в звонке по треду режим строго normal (§12.10), switchMode игнорируется", async () => {
     const { s } = makeThreadCall("thr_testlong01");
     await s.start();
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(s.mode).toBe("extended");
-    expect(FakeWs.all).toHaveLength(2);
+    expect(s.mode).toBe("normal");
+    expect(FakeWs.all).toHaveLength(1);
 
-    // Переключаем в normal
-    await s.switchMode("normal");
+    // Попытка переключить в extended отклоняется
+    await s.switchMode("extended");
     await vi.advanceTimersByTimeAsync(10);
 
     expect(s.mode).toBe("normal");
     expect(s.targetThreadId).toBe("thr_testlong01");
-
-    // Новая сессия normal имеет threadVoiceInstruction и нативные инструменты звонка по треду
-    const newVoiceWs = FakeWs.all[FakeWs.all.length - 1];
-    const newSetup = JSON.parse(newVoiceWs.sent[0]);
-    expect(newSetup.setup.systemInstruction.parts[0].text).toContain("Оптимизация логики агента");
-    expect(newSetup.setup.systemInstruction.parts[0].text).toContain("РЕЖИМ: «Быстрый»");
-    const toolNames = newSetup.setup.tools.flatMap((t: { functionDeclarations: Array<{ name: string }> }) => t.functionDeclarations.map((f) => f.name));
-    expect(toolNames).toContain("thread_read_messages");
-    expect(toolNames).toContain("thread_send");
-    expect(toolNames).not.toContain("start_thread");
+    expect(FakeWs.all).toHaveLength(1);
   });
 
   it("в звонке по треду реплика владельца НЕ вызывает advanceCallThread/sayCallThread для целевого треда", async () => {

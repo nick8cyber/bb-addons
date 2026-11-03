@@ -12,14 +12,13 @@ import {
 import type { ThreadMessage } from "../src/thread-messages.js";
 
 describe("инструменты звонка по треду (контракт §12.4)", () => {
-  it("в звонке по треду объявлены только 7 инструментов", () => {
+  it("в звонке по треду объявлены только 6 инструментов (§12.10, без switch_mode)", () => {
     const decls = nativeDeclarations("thr_target") as Array<{ functionDeclarations: Array<{ name: string }> }>;
     const names = decls.flatMap((d) => d.functionDeclarations.map((f) => f.name));
     expect(names.sort()).toEqual([
       "end_call",
       "recall",
       "remember",
-      "switch_mode",
       "thread_answer",
       "thread_read_messages",
       "thread_send",
@@ -107,6 +106,46 @@ describe("инструменты звонка по треду (контракт 
       const label = readActionLabel("thread_read_messages", {});
       expect(label?.running).toBe("Читаю сообщения треда");
       expect(label?.done).toBe("Прочитал сообщения треда");
+    });
+
+    it("§12.10 п. 4: справка, а не приказ — результат thread_read_messages возвращается с номерами и временем сообщений", async () => {
+      const tool = toolByName("thread_read_messages", "thr_target")!;
+      const longThreadMessages: ThreadMessage[] = Array.from({ length: 264 }, (_, i) => ({
+        number: i + 1,
+        role: i % 2 === 0 ? "owner" : "agent",
+        text: `Сообщение ${i + 1}`,
+        createdAt: 1700000000000 + i * 1000,
+      }));
+
+      const ctx = {
+        targetThreadId: "thr_target",
+        threadMessages: longThreadMessages,
+        reportAction: vi.fn(),
+      };
+
+      // 1. Запрос 1..5 — возвращает сообщения с номерами, временем и текстом
+      const res1to5 = (await tool.execute({ from: 1, to: 5 }, ctx as never)) as {
+        ok: true;
+        data: { from: number; to: number; count: number; messages: Array<{ number: number; text: string; time: string; role: string }> };
+      };
+      expect(res1to5.ok).toBe(true);
+      expect(res1to5.data.count).toBe(5);
+      expect(res1to5.data.from).toBe(1);
+      expect(res1to5.data.to).toBe(5);
+      expect(res1to5.data.messages).toHaveLength(5);
+      expect(res1to5.data.messages[0].number).toBe(1);
+      expect(res1to5.data.messages[0].text).toBe("Сообщение 1");
+      expect(res1to5.data.messages[0].time).toBeTruthy();
+
+      // 2. Запрос 250..259 — возвращает сообщения
+      const resLast = (await tool.execute({ from: 250, to: 259 }, ctx as never)) as {
+        ok: true;
+        data: { from: number; to: number; count: number; messages: Array<{ number: number; text: string }> };
+      };
+      expect(resLast.ok).toBe(true);
+      expect(resLast.data.count).toBe(10);
+      expect(resLast.data.messages[0].number).toBe(250);
+      expect(resLast.data.messages[9].number).toBe(259);
     });
   });
 

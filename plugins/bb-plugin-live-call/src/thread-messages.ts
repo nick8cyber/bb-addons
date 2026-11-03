@@ -36,8 +36,21 @@ export interface FormattedThreadBlock {
 }
 
 export function formatThreadMessagesBlock(messages: ThreadMessage[]): FormattedThreadBlock {
+  if (messages.length === 0) {
+    const block = "(нет сообщений)";
+    return {
+      block,
+      messagesCount: 0,
+      skippedCount: 0,
+      chars: block.length,
+    };
+  }
+
   if (messages.length <= 30) {
-    const block = messages.map(formatSingleMessage).join("\n\n");
+    const lastN = messages[messages.length - 1].number;
+    const header = `ПОСЛЕДНИЕ СООБЩЕНИЯ (1–${lastN})`;
+    const formatted = messages.map(formatSingleMessage).join("\n\n");
+    const block = `${header}\n\n${formatted}`;
     return {
       block,
       messagesCount: messages.length,
@@ -48,10 +61,16 @@ export function formatThreadMessagesBlock(messages: ThreadMessage[]): FormattedT
 
   const first10 = messages.slice(0, 10).map(formatSingleMessage).join("\n\n");
   const skipped = messages.length - 30;
-  const marker = `… пропущено ${skipped} сообщений (дочитай инструментом) …`;
-  const last20 = messages.slice(messages.length - 20).map(formatSingleMessage).join("\n\n");
+  const marker = `… пропущено ${skipped} (дочитай \`thread_read_messages\`) …`;
+  const last20Messages = messages.slice(messages.length - 20);
+  const last20 = last20Messages.map(formatSingleMessage).join("\n\n");
+  const k = last20Messages[0].number;
+  const n = last20Messages[last20Messages.length - 1].number;
 
-  const block = `${first10}\n\n${marker}\n\n${last20}`;
+  const headerFirst = "НАЧАЛО ТРЕДА (1–10)";
+  const headerLast = `ПОСЛЕДНИЕ СООБЩЕНИЯ (${k}–${n})`;
+
+  const block = `${headerFirst}\n\n${first10}\n\n${marker}\n\n${headerLast}\n\n${last20}`;
   return {
     block,
     messagesCount: 30,

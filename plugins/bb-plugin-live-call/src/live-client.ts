@@ -148,7 +148,9 @@ export class LiveClient extends EventEmitter {
       }
     }
     if (msg.goAway !== undefined) {
-      this.emit("goAway", (msg.goAway as { timeLeft?: string | number }).timeLeft ?? 0);
+      const raw = (msg.goAway as { timeLeft?: string | number }).timeLeft ?? 0;
+      const parsed = typeof raw === "number" ? raw : parseFloat(String(raw)) || 0;
+      this.emit("goAway", parsed);
     }
     if (msg.usageMetadata !== undefined) {
       const u = msg.usageMetadata as { promptTokenCount?: number };
@@ -223,8 +225,10 @@ export class LiveClient extends EventEmitter {
     this.send({ clientContent: { turns: [{ role: "user", parts: [{ text }] }], turnComplete } });
   }
 
-  sendToolResponse(functionId: string | undefined, response: unknown, scheduling: "SILENT" | "WHEN_IDLE" | "INTERRUPT" = "SILENT"): void {
-    const call = functionId !== undefined ? { id: functionId } : {};
+  sendToolResponse(functionId: string | undefined, response: unknown, scheduling: "SILENT" | "WHEN_IDLE" | "INTERRUPT" = "SILENT", functionName?: string): void {
+    const call: Record<string, unknown> = {};
+    if (functionId !== undefined) call.id = functionId;
+    if (functionName !== undefined) call.name = functionName;
     this.send({
       toolResponse: {
         functionResponses: [{ ...call, response, scheduling }],

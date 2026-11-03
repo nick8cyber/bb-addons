@@ -61,10 +61,14 @@ describe("жизненный цикл треда звонка (контракт 
       const bridgeOwner = new Map<string, SockLike>(); // моста нет
       const turnClosedWaiters = new Map<string, () => void>();
 
+      let stopped = false;
       const mockSdk = {
         threads: {
-          get: vi.fn(async () => ({ thread: { id: "thr_call_2", status: "active" } })),
-          stop: vi.fn(async () => ({ ok: true })),
+          get: vi.fn(async () => ({ thread: { id: "thr_call_2", status: stopped ? "idle" : "active" } })),
+          stop: vi.fn(async () => {
+            stopped = true;
+            return { ok: true };
+          }),
           send: vi.fn(async () => ({ ok: true })),
         },
       };
@@ -282,6 +286,58 @@ describe("жизненный цикл треда звонка (контракт 
       });
       // Очередь очистилась после успешной отправки
       expect(manager.getQueue("thr_active")).toHaveLength(0);
+    });
+
+    it("endCallThread очищает advanceQueues и предотвращает отправку отложенных 409 реплик после конца звонка", async () => {
+      const db = createTestDb();
+      const store = new CallStore(db);
+      const bridgeOwner = new Map<string, SockLike>();
+      const turnClosedWaiters = new Map<string, () => void>();
+
+      let sendAttempts = 0;
+      let threadStopped = false;
+      const mockSdk = {
+        threads: {
+          get: vi.fn(async () => ({ thread: { status: threadStopped ? "idle" : "active" } })),
+          stop: vi.fn(async () => {
+            threadStopped = true;
+            return { ok: true };
+          }),
+          send: vi.fn(async () => {
+            sendAttempts++;
+            const err = new Error("HTTP 409 Thread is already active");
+            (err as unknown as { status: number }).status = 409;
+            throw err;
+          }),
+        },
+      };
+
+      const manager = createCallThreadManager({
+        sdk: mockSdk as never,
+        store,
+        bridgeOwner,
+        turnClosedWaiters,
+      });
+
+      // Реплика получает 409 и встаёт в очередь
+      await manager.advanceCallThread("thr_queue_end", "Отложенная реплика 409");
+      expect(manager.getQueue("thr_queue_end")).toHaveLength(1);
+
+      // Завершаем звонок
+      await manager.endCallThread("thr_queue_end", "Звонок завершён", "call_q");
+
+      // Очередь должна быть очищена
+      expect(manager.getQueue("thr_queue_end")).toHaveLength(0);
+
+      // Попытка вызвать processAdvanceQueue (например, по сработавшему таймеру 1500ms) не шлёт send
+      const sendCountBefore = sendAttempts;
+      await manager.processAdvanceQueue("thr_queue_end");
+      expect(sendAttempts).toBe(sendCountBefore);
+
+      // Новые реплики в завершённый тред игнорируются
+      await manager.advanceCallThread("thr_queue_end", "Ещё реплика после конца");
+      expect(manager.getQueue("thr_queue_end")).toHaveLength(0);
+      expect(sendAttempts).toBe(sendCountBefore);
     });
   });
 });
