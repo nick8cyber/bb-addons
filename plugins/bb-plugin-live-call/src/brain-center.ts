@@ -43,6 +43,12 @@ export class BrainCenter {
   constructor(private opts: BrainCenterOptions) {}
 
   async start(): Promise<string | null> {
+    // Не-git проект: отдельного worktree быть не может, а общая папка проекта запрещена (§12.11 п.1) —
+    // мозговой центр не запускается, голос работает по 10+20 сообщениям.
+    if (!this.opts.isGitRepo) {
+      this.opts.store.event(this.opts.callId, "brain_skipped", { reason: "not_git" });
+      return null;
+    }
     this.startedAt = Date.now();
     try {
       mkdirSync(this.opts.storageDir, { recursive: true });
