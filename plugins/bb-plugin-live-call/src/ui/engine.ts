@@ -373,8 +373,12 @@ export class CallEngine {
     this.send({ type: "mute", muted });
   }
 
-  switchMode(mode: CallMode) {
+  switchMode(mode: CallMode, source: "button" | "command" | "notice" = "button") {
     if (mode === this.view.mode || this.view.switching || this.view.confirmation) return;
+    const sinceReady = Date.now() - this.liveSince;
+    // Источник каждого переключения — в журнал звонка: причина самопроизвольного
+    // Extended (03.11) пока гипотеза, следующий звонок её подтвердит или опровергнет.
+    this.diag("switch_mode_ui", `to=${mode} source=${source} msSinceReady=${sinceReady}${sinceReady < 1500 ? " IGNORED" : ""}`);
     // Фантомный тап на iOS: экран звонка появляется под пальцем, и касание кнопки
     // «Позвонить» достаётся переключателю режима (приёмка 03.11: Extended включился
     // сам через 2 с после старта). Первые 1,5 с переключатель не реагирует.
@@ -386,7 +390,7 @@ export class CallEngine {
   }
 
   toggleMode() {
-    this.switchMode(this.view.mode === "normal" ? "extended" : "normal");
+    this.switchMode(this.view.mode === "normal" ? "extended" : "normal", "command");
   }
 
   confirm(id: string) {

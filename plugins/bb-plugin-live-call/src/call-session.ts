@@ -230,7 +230,7 @@ export class CallSession extends EventEmitter {
         });
         this.deps.store.event(this.deps.callId, "action", { tool, cls, status, summary, threadId });
         if (tool === "end_call" && status === "done") void this.end("owner");
-        if (tool === "switch_mode" && status === "running") void this.switchMode(summary === "extended" ? "extended" : "normal");
+        if (tool === "switch_mode" && status === "running") void this.switchMode(summary === "extended" ? "extended" : "normal", "tool");
       },
       callsProjectId: () => null,
       rememberArgs: (hash: string, args: Record<string, unknown>) => {
@@ -681,8 +681,9 @@ export class CallSession extends EventEmitter {
     else await this.deps.advanceCallThread(text);
   }
 
-  async switchMode(mode: "normal" | "extended") {
+  async switchMode(mode: "normal" | "extended", source: "browser" | "tool" = "browser") {
     if (mode === this.mode || this.ended) return;
+    this.deps.store.event(this.deps.callId, "mode_switch", { to: mode, source, msSinceStart: Date.now() - this.startedAt });
     if (this.gate.pendingConfirmation()) {
       this.frame({ type: "error", code: "pending_confirmation", message: "дождись ответа на подтверждение", retryable: false });
       return;

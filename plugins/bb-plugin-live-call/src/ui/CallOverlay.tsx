@@ -370,7 +370,7 @@ function FeedRow({ item }: { item: FeedItem }) {
           <Icon name={item.tone === "info" ? "check" : "alert"} size={13} />
           <span className="lc-grow">{item.text}</span>
           {item.action === "to-normal" && (
-            <button type="button" className="lc-link" onClick={() => callEngine.switchMode("normal")}>
+            <button type="button" className="lc-link" onClick={() => callEngine.switchMode("normal", "notice")}>
               Перейти на Обычный
             </button>
           )}
