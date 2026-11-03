@@ -299,6 +299,9 @@ describe("звонок по треду без мозгового центра (�
     expect(s.brain).toBeNull();
     expect(store.transcript("call_tc").some((e) => e.kind === "brain_skipped")).toBe(true);
     const ws = FakeWs.all[0];
+    const instr = JSON.parse(ws.sent[0]).setup.systemInstruction.parts[0].text as string;
+    expect(instr).not.toContain("обрабатываю информацию");
+    expect(instr).toContain("Мозгового центра и сводки в этом звонке нет");
     ws.fire("message", { data: JSON.stringify({ setupComplete: {} }) });
     await vi.advanceTimersByTimeAsync(10);
     const greet = ws.sent.filter((x) => x.includes('"clientContent"')).join("\n");
@@ -326,6 +329,8 @@ describe("мозговой центр: признак git берётся из о
     expect(env).toContain("feat/x");
     expect(env).not.toContain("project-default");
     expect(s.brain?.canModify).toBe(true);
+    const instr = JSON.parse(FakeWs.all[0].sent[0]).setup.systemInstruction.parts[0].text as string;
+    expect(instr).toContain("обрабатываю информацию");
     await s.end("owner");
   });
 });
