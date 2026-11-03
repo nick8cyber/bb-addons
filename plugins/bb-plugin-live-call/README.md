@@ -10,7 +10,7 @@
 | Решение | Где |
 |---|---|
 | Браузер ↔ сервер BB ↔ Gemini Live. Google видит только IP хоста BB | [ADR-0005](../../docs/adr/0005-live-call-server-relay.md) |
-| Режимы ⚡ Обычный (`gemini-3.8-live`, нативные инструменты) и 🧠 Extended (Extended Thinking + маршрутизатор) | [ADR-0006](../../docs/adr/0006-live-call-extended-router.md) |
+| Режимы ⚡ Быстрый (`gemini-3.8-live`, нативные инструменты) и 🧠 Extended (Extended Thinking + маршрутизатор) | [ADR-0006](../../docs/adr/0006-live-call-extended-router.md) |
 | Звонок = тред BB в проекте «Звонки» на своём провайдере «Live Call», транскрипт нативный | [ADR-0007](../../docs/adr/0007-live-call-thread-provider.md) |
 | Запись и запуск — только после подтверждения, его проверяет сервер (`ConfirmationGate`) | спека §7.1 |
 

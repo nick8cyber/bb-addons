@@ -73,7 +73,7 @@ bytes 5..   PCM16 LE, моно: 0x01 — 16 кГц, 20 мс = 640 байт; 0x02
 | `event` | `kind: "thread.idle"\|"thread.failed"\|"interaction.pending"`, `threadId`, `summary`, `queued: boolean` |
 | `mode` | `mode`, `switching: boolean` |
 | `key` | `active`, `of`, `reason: "quota"\|"unavailable"` — переход на запасной ключ |
-| `warning` | `code: "tpm_near_limit"\|"call_ending"\|"extended_unavailable"\|"mic_silent"`, `message`. `mic_silent` — только пока владелец ни разу не был услышан; `extended_unavailable` — интерфейс предлагает «Перейти на Обычный», сам режим не меняет |
+| `warning` | `code: "tpm_near_limit"\|"call_ending"\|"extended_unavailable"\|"mic_silent"`, `message`. `mic_silent` — только пока владелец ни разу не был услышан; `extended_unavailable` — интерфейс предлагает «Перейти на Быстрый», сам режим не меняет |
 | `error` | `code`, `message`, `retryable: boolean` |
 | `ended` | `callId`, `threadId`, `reason: "owner"\|"limit"\|"error"` |
 
