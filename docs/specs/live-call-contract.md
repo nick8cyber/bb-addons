@@ -557,7 +557,7 @@ CLI: `bb call tool <имя> [json]` — выполнить инструмент 
 
 | Метод | Вход | Выход |
 |---|---|---|
-| `projectCallsList` | `{}` | `{ projects: Array<{ projectId: string; title: string; state: "approved" \| "pending" \| "invalid"; diff?: string[]; error?: string }> }` |
+| `projectCallsList` | `{}` | `{ projects: Array<{ projectId: string; title: string; state: "approved" \| "pending" \| "invalid"; hash?: string; diff?: string[]; error?: string }> }` |
 | `projectCallsApprove` | `{ projectId: string; hash: string }` | `{ ok: boolean; error?: string }` — `hash` из `projectCallsList` (поле `hash` у `pending`), иначе `stale` |
 | `projectCallsReject` | `{ projectId: string }` | `{ ok: boolean }` |
 
