@@ -170,7 +170,7 @@ function Dock({ view, onCollapse }: { view: CallView; onCollapse: () => void }) 
           <span className="lc-state">{view.phase === "failed" ? "Звонок не начался" : STATE_LABEL[done ? "ended" : view.orb]}</span>
           {!done && <StatusLine view={view} />}
         </div>
-        {!done && <ModeSwitch view={view} />}
+        {/* Extended отключён (ADR-0006, пересмотр 2): переключателя режима нет */}
         {done ? (
           <button type="button" className="lc-icon-btn" title="Закрыть" aria-label="Закрыть" onClick={() => callEngine.dismiss()}>
             <Icon name="x" />
@@ -206,7 +206,7 @@ function Pill({ view, onExpand }: { view: CallView; onExpand: () => void }) {
         <span className="lc-state">{STATE_LABEL[view.orb]}</span>
         <span className="lc-sub">{elapsed}</span>
       </button>
-      <ModeSwitch view={view} compact />
+      {/* переключателя режима нет */}
       <MuteButton view={view} iconOnly />
       <EndButton iconOnly />
       <button type="button" className="lc-icon-btn" title="Развернуть" aria-label="Развернуть" onClick={onExpand}>
@@ -555,7 +555,7 @@ function MobileCall({ view, minimized, onMinimize }: { view: CallView; minimized
     <section className="lc-root lc-mobile" aria-label="Звонок координатору">
       <header className="lc-mobile__top">
         <span className="lc-sub">{done ? "" : elapsed}</span>
-        {!done && <ModeSwitch view={view} />}
+        {/* Extended отключён (ADR-0006, пересмотр 2): переключателя режима нет */}
         {done ? (
           <button type="button" className="lc-icon-btn" aria-label="Закрыть" onClick={() => callEngine.dismiss()}>
             <Icon name="x" size={18} />

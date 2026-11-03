@@ -73,7 +73,7 @@ const IDLE: CallView = {
   phase: "idle",
   orb: "connecting",
   stateDetail: null,
-  mode: "extended",
+  mode: "normal",
   switching: false,
   muted: false,
   startedAt: null,

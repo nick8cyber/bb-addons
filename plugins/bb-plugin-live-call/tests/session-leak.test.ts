@@ -38,6 +38,7 @@ function makeSession() {
     languageCode: "ru-RU",
     thinkingLevel: "LOW",
     mode: "extended",
+    allowExtended: true,
     routerInput: "text",
     maxCallMinutes: 60,
     store: new CallStore(new Database(":memory:")),

@@ -36,6 +36,8 @@ export interface CallSessionDeps {
   languageCode: string;
   thinkingLevel: "LOW" | "MEDIUM" | "HIGH";
   mode: "normal" | "extended";
+  /** Extended отключён в проде (ADR-0006, пересмотр 2); true — только для тестов старого пути. */
+  allowExtended?: boolean;
   /** Вход маршрутизатора: text — из транскрипта VOICE, audio — то же аудио в обе сессии. */
   routerInput: "text" | "audio";
   maxCallMinutes: number;
@@ -120,7 +122,8 @@ export class CallSession extends EventEmitter {
   constructor(private deps: CallSessionDeps) {
     super();
     this.targetThreadId = deps.targetThreadId ?? null;
-    this.mode = this.targetThreadId ? "normal" : deps.mode;
+    // Extended отключён (ADR-0006, пересмотр 2): без allowExtended любой звонок — normal.
+    this.mode = this.targetThreadId || (deps.mode === "extended" && !deps.allowExtended) ? "normal" : deps.mode;
     this.modeHistory = [this.mode];
     this.pool = new KeyPool(deps.keys, {
       onWarning: (m) => this.frame({ type: "warning", code: "tpm_near_limit", message: m }),
@@ -998,6 +1001,7 @@ export class CallSession extends EventEmitter {
   }
 
   async switchMode(mode: "normal" | "extended", source: "browser" | "tool" = "browser") {
+    if (mode === "extended" && !this.deps.allowExtended) return; // Extended отключён (ADR-0006, пересмотр 2)
     if (this.targetThreadId || mode === this.mode || this.ended) return;
     this.deps.store.event(this.deps.callId, "mode_switch", { to: mode, source, msSinceStart: Date.now() - this.startedAt });
     if (this.gate.pendingConfirmation()) {

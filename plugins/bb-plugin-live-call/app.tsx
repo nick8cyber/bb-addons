@@ -47,13 +47,7 @@ export default definePluginApp((app) => {
     run: () => (callEngine.isActive() ? callEngine.end() : callEngine.start()),
   });
 
-  app.commands.register({
-    id: "call-mode",
-    title: "Live Call: переключить режим (Extended ↔ Быстрый)",
-    defaultShortcut: { key: "k", mod: true, shift: true },
-    isAvailable: () => callEngine.getSnapshot().phase === "live" && !callEngine.getSnapshot().targetThreadId,
-    run: () => callEngine.toggleMode(),
-  });
+  // Команда переключения режима убрана: Extended отключён (ADR-0006, пересмотр 2).
 
   app.slots.settingsSection({
     id: "live-call",

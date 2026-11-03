@@ -330,3 +330,13 @@ describe("мозговой центр: признак git берётся из о
   });
 });
 
+
+describe("Extended отключён (ADR-0006, пересмотр 2)", () => {
+  it("без allowExtended сессия не переходит в extended, switch_mode не объявлен", async () => {
+    const { nativeDeclarations } = await import("../src/tools.js");
+    expect(JSON.stringify(nativeDeclarations())).not.toContain('"switch_mode"');
+    const { s } = makeThreadCall();
+    await s.switchMode("extended", "tool");
+    expect(s.mode).not.toBe("extended");
+  });
+});

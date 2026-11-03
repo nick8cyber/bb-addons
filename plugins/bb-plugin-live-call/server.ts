@@ -393,8 +393,9 @@ export default async function plugin(bb: BbPluginApi) {
               }
               // Звонок по треду (§12.10) — строго normal (одна сессия gemini-3.8-live с инструментами).
               // Для общего звонка: Extended по умолчанию; «Быстрый» (normal) — если выбран явно.
-              const fallback = str((await settings_get()).defaultMode, "extended") === "normal" ? "normal" : "extended";
-              const callMode = frame.threadId ? "normal" : (frame.mode ?? fallback);
+              // Extended отключён (владелец 03.11, ADR-0006 пересмотр 2): модель Google ломается
+              // («системная ошибка», нет инструментов). Любой звонок — одна сессия gemini-3.8-live.
+              const callMode = "normal" as const;
               try {
                 state.session = await startCall(sock, callMode, frame.threadId);
               } catch {
@@ -407,7 +408,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (frame.type === "mute") s.setMuted(frame.muted);
             else if (frame.type === "playback_drained") s.onPlaybackDrained(frame.turnSeq);
             else if (frame.type === "switch_mode") {
-              if (!s.targetThreadId) await s.switchMode(frame.mode);
+              /* Extended отключён — переключение режима не выполняется (ADR-0006, пересмотр 2). */
             }
             else if (frame.type === "client_log") {
               bb.log.warn(`браузер: ${frame.event}${frame.detail ? ` — ${frame.detail}` : ""}`);

@@ -1493,7 +1493,7 @@ export function toolByName(name: string, targetThreadId?: string): ToolDef | und
 
 /** Объявления для setup в режиме native (контракт §3): behavior NON_BLOCKING. */
 export function nativeDeclarations(targetThreadId?: string): unknown[] {
-  const list = targetThreadId ? getThreadTools() : TOOLS.filter((t) => t.name !== "confirm_action");
+  const list = (targetThreadId ? getThreadTools() : TOOLS.filter((t) => t.name !== "confirm_action")).filter((t) => t.name !== "switch_mode");
   return list.map((t) => ({
     functionDeclarations: [
       {

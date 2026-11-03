@@ -39,7 +39,7 @@ const clientContents = (ws: FakeWs) => ws.sent.filter((s) => s.includes('"client
 function make(store = new CallStore(new Database(":memory:"))) {
   const s = new CallSession({
     callId: "call_g", keys: ["k1", "k2"], voice: "Algenib", languageCode: "ru-RU", thinkingLevel: "LOW",
-    mode: "extended", routerInput: "text", maxCallMinutes: 60, store, sdk: {} as never,
+    mode: "extended", allowExtended: true, routerInput: "text", maxCallMinutes: 60, store, sdk: {} as never,
     toBrowser: () => {}, sendBrowserAudio: () => {},
     spawnCallThread: async () => null, advanceCallThread: async () => {}, sayCallThread: async () => {}, endCallThread: async () => {},
     wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,

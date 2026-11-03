@@ -75,7 +75,7 @@ function memory(ctx: PromptContext, extended: boolean): string[] {
 }
 
 export function voiceInstructionNormal(ctx: PromptContext = EMPTY_CONTEXT): string {
-  return [...identity(ctx), ...style(), ...rules(), ...capabilities(ctx, false), ...memory(ctx, false), "РЕЖИМ: «Быстрый» — инструменты ты вызываешь напрямую."].join("\n\n");
+  return [OWNER_RULES_BLOCK + "\n\n" + OWNER_RULES_CORRESPONDENCE, ...identity(ctx), ...style(), ...rules(), ...capabilities(ctx, false), ...memory(ctx, false), "Инструменты ты вызываешь напрямую."].join("\n\n");
 }
 
 export function voiceInstructionExtended(ctx: PromptContext = EMPTY_CONTEXT): string {
