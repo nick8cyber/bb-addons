@@ -245,3 +245,7 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 | §3 вставки (`clientContent`/`realtimeInput`), §4 инструменты чтения (`bb_overview`, `list_threads`, `read_thread`, `list_pending`, `switch_mode`), §8 (normal, ROUTER) | Ф2 | ответ голосом ≤ 3 с, маршрутизатор не зацикливается |
 | §4 инструменты действий (`watch_thread`, `send_to_thread`, `answer_interaction`, `stop_thread`, `start_thread`, `confirm_action`), §5, §6, §7 (мост) | Ф3 | все негативные тесты ConfirmationGate, звонок = тред |
 | §4 плагины (`tasks_create`, `tasks_dispatch`, `search_memory`), §9 | Ф4 | `bb plugin build`, тесты, ревью ОК |
+
+## Память голосового агента (03.11)
+
+`remember` (класс C) пишет в собственную память звонков — таблица `voice_memory` в хранилище плагина. Глобальную и проектную память BB голосовой агент не меняет: её получают все агенты. Записи памяти звонков (до 40 последних) входят в системную инструкцию каждого звонка вместе с проектами владельца и списком умений.

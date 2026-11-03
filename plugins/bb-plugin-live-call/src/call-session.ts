@@ -15,8 +15,8 @@ import { ConfirmationGate, argsHash, type PendingConfirmation } from "./confirma
 import { ContextLedger } from "./context-ledger.js";
 import { KeyPool, QuotaExhaustedError } from "./key-pool.js";
 import { LiveClient } from "./live-client.js";
-import { routerInstruction, voiceInstructionExtended, voiceInstructionNormal } from "./prompt.js";
-import { TOOLS, nativeDeclarations, runToolCall, toolByName } from "./tools.js";
+import { EMPTY_CONTEXT, routerInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
+import { TOOLS, capabilityList, nativeDeclarations, runToolCall, toolByName } from "./tools.js";
 import type { ToolClass, ToolResult } from "./contract.js";
 import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
@@ -66,6 +66,9 @@ export class CallSession extends EventEmitter {
   private lastVoiceLine = "";
   /** Накопленные результаты инструментов одной реплики: уходит в VOICE одним пакетом. */
   private systemBatch: string[] = [];
+  /** Голос сейчас генерирует ответ: вставка с turnComplete=true оборвала бы его на полуслове. */
+  private voiceTalking = false;
+  private quietQueue: string[] = [];
   private systemBatchTimer: NodeJS.Timeout | null = null;
   private routerBusyCount = 0;
   private pendingToolResponses = new Map<string, { functionId?: string; def: string; args: Record<string, unknown> }>();
@@ -133,8 +136,32 @@ export class CallSession extends EventEmitter {
     this.setState(this.muted ? "muted" : "listening");
   }
 
+  private promptContext: PromptContext = EMPTY_CONTEXT;
+
+  /** Контекст для инструкций: проекты BB, умения, своя память — из реальных данных на старте звонка. */
+  private async buildPromptContext(): Promise<PromptContext> {
+    let projects: string[] = [];
+    try {
+      const list = (await Promise.race([
+        this.deps.sdk.projects.list() as Promise<Array<Record<string, unknown>>>,
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 3000)),
+      ])) as Array<Record<string, unknown>>;
+      projects = (Array.isArray(list) ? list : []).map((p) => String(p.name ?? "")).filter((n) => n && n !== "Звонки");
+    } catch {
+      projects = [];
+    }
+    let memory: string[] = [];
+    try {
+      memory = this.deps.store.listMemory(40).map((m) => m.text).reverse();
+    } catch {
+      memory = [];
+    }
+    return { projects, capabilities: capabilityList(), memory, mode: this.mode };
+  }
+
   async start() {
     this.deps.store.startCall(this.deps.callId);
+    this.promptContext = await this.buildPromptContext();
     this.deps.store.setModeHistory(this.deps.callId, this.modeHistory);
     try {
       await this.openSessions();
@@ -198,12 +225,13 @@ export class CallSession extends EventEmitter {
   }
 
   private makeVoiceSession(handle?: string): LiveClient {
+    this.voiceTalking = false;
     const client = new LiveClient({
       key: this.pool.activeKey,
       model: this.mode === "normal" ? "gemini-3.8-live" : "gemini-3.8-live-extended-thinking",
       voice: this.deps.voice,
       languageCode: this.deps.languageCode,
-      systemInstruction: this.mode === "normal" ? voiceInstructionNormal() : voiceInstructionExtended(),
+      systemInstruction: this.mode === "normal" ? voiceInstructionNormal(this.promptContext) : voiceInstructionExtended(this.promptContext),
       thinkingLevel: this.mode === "normal" ? undefined : this.deps.thinkingLevel,
       tools: this.mode === "normal" ? nativeDeclarations() : undefined,
       sessionHandle: handle,
@@ -221,7 +249,7 @@ export class CallSession extends EventEmitter {
       model: "gemini-3.8-live",
       voice: this.deps.voice,
       languageCode: this.deps.languageCode,
-      systemInstruction: routerInstruction(),
+      systemInstruction: routerInstruction(this.promptContext),
       tools: nativeDeclarations(),
       contextWindowCompression: COMPRESSION,
       wsFactory: this.deps.wsFactory,
@@ -237,6 +265,10 @@ export class CallSession extends EventEmitter {
       gate: this.gate,
       ledger: this.ledger,
       newActionId: (tool: string) => this.newActionId(tool),
+      voiceMemory: {
+        add: (text: string) => this.deps.store.addMemory(text),
+        list: () => this.deps.store.listMemory(),
+      },
       reportAction: (tool: string, cls: ToolClass, status: "running" | "done" | "failed" | "cancelled", summary: string, threadId?: string, actionId?: string) => {
         this.frame({
           type: "action",
@@ -271,9 +303,11 @@ export class CallSession extends EventEmitter {
     client.on("audio", (turnSeq: number, pcm: Uint8Array) => {
       this.gate.onModelAudio(turnSeq, pcm.length);
       if (pcm.length > 0) this.deps.sendBrowserAudio(turnSeq, pcm);
+      if (pcm.length > 0) this.voiceTalking = true;
       if (this.state !== "speaking" && pcm.length > 0) this.setState("speaking");
     });
     client.on("interrupted", (turnSeq: number | null) => {
+      this.voiceTalking = false;
       this.frame({ type: "interrupted", turnSeq: turnSeq ?? 0 });
       this.setState("listening");
     });
@@ -288,6 +322,8 @@ export class CallSession extends EventEmitter {
       this.frame({ type: "transcript", role: "agent", text, final: false });
     });
     client.on("turnComplete", () => {
+      this.voiceTalking = false;
+      this.flushQuietQueue();
       void (async () => {
         // Сначала тред: иначе первая же реплика агента уйдёт в say до его создания и потеряется.
         await this.maybeSpawnThreadOnFirstUtterance();
@@ -480,6 +516,27 @@ export class CallSession extends EventEmitter {
     this.systemBatchTimer = setTimeout(() => this.flushSystemSoon(), 300);
   }
 
+  /**
+   * Вставка в голос, которая требует ответа (turnComplete=true), — только между ходами.
+   * Раньше результат помощника уходил посреди ответа и обрывал голос на полуслове:
+   * «Привет! Всё отлично, готов…» → сразу про треды (приёмка 03.11).
+   */
+  injectWhenQuiet(text: string) {
+    if (this.ended) return;
+    if (this.voiceTalking) {
+      this.quietQueue.push(text);
+      return;
+    }
+    this.voice?.sendClientContent(text, true);
+  }
+
+  private flushQuietQueue() {
+    if (this.quietQueue.length === 0) return;
+    const text = this.quietQueue.join("\n\n").slice(0, 6000);
+    this.quietQueue = [];
+    this.voice?.sendClientContent(text, true);
+  }
+
   private flushSystemSoon() {
     if (this.systemBatch.length === 0) return;
     const batch = this.systemBatch;
@@ -487,7 +544,7 @@ export class CallSession extends EventEmitter {
     const text = `[СИСТЕМА] ${batch.join("\n")}`.slice(0, 4000);
     this.ledger.add("tool", text);
     this.deps.store.event(this.deps.callId, "system_batch", { text: text.slice(0, 300) });
-    this.voice?.sendClientContent(text, true);
+    this.injectWhenQuiet(text);
   }
 
   private onConfirmationUpdate(p: PendingConfirmation, phase: "asking" | "listening") {
@@ -505,7 +562,7 @@ export class CallSession extends EventEmitter {
     if (phase === "asking") {
       // В режиме router вопрос зачитывает VOICE по [СИСТЕМА] с готовой фразой.
       if (this.mode === "extended") {
-        this.voice?.sendClientContent(`[СИСТЕМА] Скажи владельцу: ${p.say}`, true);
+        this.injectWhenQuiet(`[СИСТЕМА] Скажи владельцу: ${p.say}`);
       }
       this.ledger.add("system", p.say);
     }
@@ -545,7 +602,7 @@ export class CallSession extends EventEmitter {
             ? "отменено: истёк срок подтверждения"
             : "владелец не подтвердил";
       this.resolvePendingToolResponse(p.argsHash, { ok: false, error: { code: "cancelled", message } });
-      if (this.mode === "extended") this.voice?.sendClientContent(`[СИСТЕМА] ${message}.`, true);
+      if (this.mode === "extended") this.injectWhenQuiet(`[СИСТЕМА] ${message}.`);
       return;
     }
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
@@ -574,7 +631,7 @@ export class CallSession extends EventEmitter {
     const text = result.ok
       ? `выполнено: ${p.tool}. ${JSON.stringify(result.data).slice(0, 600)}`
       : `не выполнено: ${"error" in result ? result.error.message : "нужно подтверждение"}`;
-    this.voice?.sendClientContent(`[СИСТЕМА] ${text}`, true);
+    this.injectWhenQuiet(`[СИСТЕМА] ${text}`);
   }
 
   /** Аргументы сохранённого вызова записи — они же в argsHash, подмена исключена. */

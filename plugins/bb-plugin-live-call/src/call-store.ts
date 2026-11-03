@@ -41,6 +41,13 @@ const MIGRATIONS = [
     PRIMARY KEY (call_id, seq)
   );`,
   `CREATE INDEX IF NOT EXISTS idx_call_events_call ON call_events (call_id, seq);`,
+  // Своя память голосового агента: предпочтения владельца для звонков. Не общая память BB —
+  // её читают все агенты всех проектов (приёмка 03.11: remember писал в --scope global).
+  `CREATE TABLE IF NOT EXISTS voice_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );`,
 ];
 
 const RETENTION_DAYS = 90;
@@ -68,6 +75,26 @@ export class CallStore {
   /** Звонки, оставшиеся «идущими» после перезагрузки плагина или сервера, — закрыть. */
   closeStale(reason = "restart", endedAt = Date.now()): number {
     return this.db.prepare("UPDATE calls SET ended_at = ?, end_reason = ? WHERE ended_at IS NULL").run(endedAt, reason).changes;
+  }
+
+  /** Память голосового агента: добавить запись (без дублей). */
+  addMemory(text: string, at = Date.now()): { id: number; duplicate: boolean } {
+    const clean = text.trim().slice(0, 600);
+    const dup = this.db.prepare("SELECT id FROM voice_memory WHERE text = ?").get(clean) as { id: number } | undefined;
+    if (dup) return { id: dup.id, duplicate: true };
+    const r = this.db.prepare("INSERT INTO voice_memory (text, created_at) VALUES (?, ?)").run(clean, at);
+    return { id: Number(r.lastInsertRowid), duplicate: false };
+  }
+
+  /** Последние записи памяти голосового агента (для системной инструкции звонка). */
+  listMemory(limit = 40): Array<{ id: number; text: string; createdAt: number }> {
+    return this.db
+      .prepare("SELECT id, text, created_at AS createdAt FROM voice_memory ORDER BY id DESC LIMIT ?")
+      .all(limit) as Array<{ id: number; text: string; createdAt: number }>;
+  }
+
+  forgetMemory(id: number): boolean {
+    return this.db.prepare("DELETE FROM voice_memory WHERE id = ?").run(id).changes > 0;
   }
 
   endCall(callId: string, reason: string, endedAt = Date.now()): void {

@@ -25,6 +25,8 @@ export interface ToolContext {
   /** Один id на всё действие: «идёт» и «готово» обновляют одну карточку. */
   newActionId?: (tool: string) => string;
   callsProjectId: () => string | null;
+  /** Своя память голосового агента (хранилище плагина), не общая память BB. */
+  voiceMemory?: { add(text: string): { id: number; duplicate: boolean }; list(): Array<{ id: number; text: string }> };
   /** Аргументы ожидающего подтверждения — сервер хранит их сам, модель не подменит. */
   rememberArgs?: (argsHash: string, args: Record<string, unknown>) => void;
 }
@@ -735,11 +737,19 @@ export const TOOLS: ToolDef[] = [
     cls: "R",
     word: "",
     description: "Установленные скиллы BB. До 20.",
-    parameters: { type: "object", properties: {} },
-    async execute(_args, ctx) {
-      const sys = (await withTimeout((ctx.sdk as unknown as { system: { config(): Promise<{ primaryHostId?: string }> } }).system.config())) as { primaryHostId?: string };
-      const skills = (await withTimeout(ctx.sdk.skills.list({ projectId: "personal", environmentId: sys.primaryHostId ?? "" } as never) as Promise<unknown>)) ?? [];
-      return truncate(asArray(skills).slice(0, 20).map((sk) => ({ id: sk.id, name: sk.name ?? sk.id })));
+    parameters: { type: "object", properties: { project: { type: "string", description: "название проекта; по умолчанию первый" } } },
+    async execute(args, ctx) {
+      // Было: projectId "personal" и id хоста вместо окружения — BB отвечал 404 Project not found.
+      const projectRef = String(args.project ?? "").trim();
+      let projectId = projectRef ? await resolveProjectId(ctx.sdk, projectRef) : undefined;
+      if (!projectId) {
+        const projects = ((await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? []) as Array<Record<string, unknown>>;
+        projectId = projects.length > 0 ? String(projects[0].id) : undefined;
+      }
+      if (!projectId) return { ok: false, error: { code: "not_found", message: "нет проектов" } };
+      const res = (await withTimeout(ctx.sdk.skills.list({ projectId, environmentId: null } as never) as Promise<unknown>)) as { skills?: unknown[] } | unknown[] | null;
+      const skills = Array.isArray(res) ? res : ((res as { skills?: unknown[] } | null)?.skills ?? []);
+      return truncate({ total: skills.length, skills: asArray(skills).slice(0, 30).map((sk) => String(sk.name ?? sk.id)) });
     },
   },
   {
@@ -956,22 +966,17 @@ export const TOOLS: ToolDef[] = [
     name: "remember",
     cls: "C",
     word: "да",
-    description: "Записать факт в память BB (глобально).",
+    description: "Запомнить предпочтение или факт владельца в СВОЮ память голосового агента (только для звонков, не общая память BB). Помнится во всех следующих звонках.",
     parameters: {
       type: "object",
-      properties: { text: { type: "string" } },
+      properties: { text: { type: "string", description: "что запомнить, одной фразой" } },
       required: ["text"],
     },
-    confirmSay: (args) => `Запомнить: «${String(args.text).slice(0, 200)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Запомнить в мою память звонков: «${String(args.text).slice(0, 200)}»? Скажи «да» или «отмена».`,
     async execute(args, ctx) {
-      const name = `voice-${Date.now().toString(36)}`;
-      return memoryCli(ctx, [
-        "add", "--scope", "global", "--name", name,
-        "--summary", String(args.text).slice(0, 400),
-        "--details", String(args.text),
-        "--reason", "добавлено голосом в звонке",
-        "--kind", "fact",
-      ]);
+      if (!ctx.voiceMemory) return { ok: false, error: { code: "no_memory", message: "память звонков недоступна" } };
+      const r = ctx.voiceMemory.add(String(args.text ?? ""));
+      return { ok: true, data: { saved: true, duplicate: r.duplicate, where: "память голосового агента (только звонки)" } };
     },
   },
   {
@@ -1178,4 +1183,33 @@ function threadIdOf(data: unknown): string | undefined {
 function threadTitleOf(data: unknown): string | undefined {
   const d = data as { thread?: { title?: unknown } } | null;
   return d && typeof d === "object" && d.thread && typeof d.thread.title === "string" && d.thread.title ? d.thread.title : undefined;
+}
+
+/** Человеческие названия умений для системной инструкции (что агент может сказать о себе). */
+const HUMAN: Record<string, string> = {
+  bb_overview: "обзор BB по проектам", list_threads: "список тредов проекта", read_thread: "прочитать тред",
+  list_pending: "что ждёт ответа владельца", watch_thread: "следить за тредом и доложить", thread_updates: "что нового в треде",
+  list_tasks: "задачи трекера", read_task: "прочитать задачу", search_memory: "поиск в памяти и базе знаний BB",
+  system_health: "состояние системы", pr_status: "статус PR", provider_status: "состояние провайдеров моделей",
+  plugin_status: "состояние плагинов", skills_list: "список навыков", prompt_history: "история запросов",
+  project_branches: "ветки проекта", search_all: "поиск по тредам и сообщениям", switch_mode: "сменить режим звонка",
+  end_call: "завершить звонок", send_to_thread: "написать в тред агента", queue_message: "поставить сообщение в очередь треда",
+  answer_interaction: "ответить агенту на вопрос", stop_thread: "остановить тред", archive_thread: "архивировать тред",
+  compact_thread: "сжать контекст треда", pin_thread: "закрепить тред", thread_rename: "переименовать тред",
+  thread_hide: "скрыть тред", tasks_create: "создать задачу", task_comment: "комментарий к задаче",
+  task_status: "сменить статус задачи", task_due: "срок задачи", remember: "запомнить в свою память",
+  call_note: "заметка в итог звонка", start_thread: "запустить нового агента", tasks_dispatch: "раздать задачу исполнителю",
+  retry_thread: "перезапустить упавший ход", stop_all_agents: "остановить всех агентов", handoff_thread: "передать тред другому агенту",
+  fork_thread: "ответвить тред",
+};
+
+export function capabilityList(): { read: string[]; confirm: string[]; launch: string[] } {
+  const out = { read: [] as string[], confirm: [] as string[], launch: [] as string[] };
+  for (const d of TOOLS) {
+    const h = HUMAN[d.name] ?? d.name;
+    if (d.cls === "R") out.read.push(h);
+    else if (d.cls === "L") out.launch.push(h);
+    else out.confirm.push(h);
+  }
+  return out;
 }

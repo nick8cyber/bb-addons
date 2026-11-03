@@ -301,7 +301,7 @@ export default async function plugin(bb: BbPluginApi) {
       const events = eventBridge.drain();
       for (const e of events) {
         toBrowserRef({ type: "event", kind: e.kind as "thread.idle" | "thread.failed" | "interaction.pending", threadId: e.threadId, summary: e.summary, queued: e.queued });
-        (session as unknown as { voice: LiveClient | null }).voice?.sendClientContent(`[СОБЫТИЕ] ${e.kind} ${e.threadId}: ${e.summary}`, true);
+        session.injectWhenQuiet(`[СОБЫТИЕ] ${e.kind} ${e.threadId}: ${e.summary}`);
       }
     }, 1500);
     return session;
