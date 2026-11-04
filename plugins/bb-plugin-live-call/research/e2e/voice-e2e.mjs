@@ -1,7 +1,7 @@
 /**
  * Приёмка звонка живым (синтезированным) голосом в настоящем Chromium — без ключа Gemini.
  *
- * FIX=<папка с фикстурами *.pcm 24 кГц> SCENARIO=<general|barge|early|echo|fail|button-early> [THREAD_ID=thr_…]
+ * FIX=<папка с фикстурами *.pcm 24 кГц> SCENARIO=<general|barge|early|echo|fail|button-early|open> [THREAD_ID=thr_…]
  * [ECHO=0.6] [OUT=./out] node research/e2e/voice-e2e.mjs
  *
  * - Фразы владельца — готовые PCM-фикстуры (синтезирует куратор), подаются в подменённый микрофон
@@ -165,8 +165,20 @@ for (let i = 0; i < 40 && !callId; i++) {
 check("звонок начался", callId, callId ?? "");
 if (!callId) { await browser.close(); process.exit(1); }
 log("callId", callId);
-await waitEvent("agent_line", 0, 20000); // приветствие
+const greeting = await waitEvent("agent_line", 0, 25000); // приветствие (в звонке по треду — пересказ, §12.11 п. 3)
 await sleep(1500);
+
+if (SCENARIO === "open") {
+  // §12.11 п. 3: без вопроса владельца голос пересказывает ответ агента на последний запрос владельца.
+  const evs = threadEvents(["--all"]);
+  const lastAgent = [...evs].reverse().find((e) => e.type === "item/completed" && e.data?.item?.type === "agentMessage");
+  const agentText = String(lastAgent?.data?.item?.text ?? "");
+  const words = [...new Set(agentText.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((w) => w.length >= 5))];
+  const first = events("agent_line").slice(0, 3).map((e) => e.p.text).join(" ").toLowerCase();
+  const hits = words.filter((w) => first.includes(w.slice(0, 6)));
+  check("первая реплика — не «обрабатываю информацию»", greeting && !/обрабатываю информацию/i.test(greeting.p.text), greeting?.p.text ?? "");
+  check("пересказ последнего ответа агента без вопроса владельца", events("owner_line").length === 0 && hits.length >= 2, `совпало слов: ${hits.slice(0, 8).join(", ")}`);
+}
 
 if (SCENARIO === "general") {
   const s = await say("q_projects");
