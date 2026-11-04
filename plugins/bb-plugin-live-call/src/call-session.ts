@@ -184,6 +184,7 @@ export class CallSession extends EventEmitter {
       undefined,
       {
         onConfirmationUpdate: (p, phase) => this.onConfirmationUpdate(p, phase),
+        onQuestionHeardAt: (p, at) => this.deps.store.event(this.deps.callId, "question_heard", { tool: p.tool, at }),
         onVerdict: (p, verdict) => void this.onVerdict(p, verdict),
       },
     );
@@ -1189,6 +1190,8 @@ export class CallSession extends EventEmitter {
   }
 
   private onConfirmationUpdate(p: PendingConfirmation, phase: "asking" | "listening") {
+    // Журнал для приёмки: открытие окна ответа отделяет перебивание от ответа после вопроса.
+    this.deps.store.event(this.deps.callId, "confirm_phase", { tool: p.tool, phase });
     const word = p.class === "L" ? "запускай" : p.class === "P" ? "разрешаю" : "да";
     this.frame({
       type: "confirmation",

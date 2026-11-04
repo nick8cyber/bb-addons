@@ -75,6 +75,8 @@ export interface GateEvents {
   onConfirmationUpdate?: (pending: PendingConfirmation, phase: "asking" | "listening") => void;
   /** Вердикт определён. Исполнение — на вызывающей стороне. */
   onVerdict?: (p: PendingConfirmation, verdict: Verdict) => void;
+  /** Расчётный момент, когда вопрос зазвучит у владельца (для журнала и приёмки). */
+  onQuestionHeardAt?: (p: PendingConfirmation, at: number) => void;
 }
 
 export interface GateClock {
@@ -303,7 +305,14 @@ export class ConfirmationGate {
       const spoken = new Set(words);
       let hits = 0;
       for (const w of this.questionWords) if (spoken.has(w)) hits++;
-      if (hits >= need) this.questionAudioOffset = this.audioSinceRequest;
+      if (hits >= need) {
+        this.questionAudioOffset = this.audioSinceRequest;
+        const playFrom = Math.max(this.firstAudioAt ?? at, this.priorPlaybackEnd);
+        this.events.onQuestionHeardAt?.(
+          this.pending,
+          playFrom + (this.questionAudioOffset / BYTES_PER_SECOND_24K) * 1000 + QUESTION_HEARD_SLACK_MS,
+        );
+      }
     }
     // Хранится только то, что ещё может вернуться эхом.
     this.modelSpeech = this.modelSpeech.filter((c) => at - c.at <= MODEL_ECHO_MEMORY_MS);
