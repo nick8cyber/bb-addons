@@ -129,6 +129,33 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       expect(gate.pendingConfirmation()).not.toBeNull();
     });
 
+    it("филлер модели до вызова («Да, сейчас отправлю») — его эхо после запроса не подтверждает", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.onModelTranscript("Да, сейчас отправлю", t.now);
+      t.advance(500);
+      gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      t.advance(2000);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
+    it("старая речь модели (раньше 15 с до запроса) не мешает настоящему «да»", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.onModelTranscript("Да, всё понятно", t.now);
+      t.advance(20_000);
+      gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      t.advance(2000);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual(["approved"]);
+    });
+
     it("отказ и шум во время вопроса не отменяют — отказ после вопроса или кнопкой", () => {
       const { gate, verdicts, sayNow } = setup();
       sayNow("отмена", 2000);

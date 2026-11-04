@@ -81,6 +81,9 @@ export const realClock: GateClock = {
 
 /** Запас поверх оценки, если playback_drained так и не пришёл. */
 export const DRAINED_LOST_SLACK_MS = 2500;
+/** Речь модели за столько до запроса подтверждения тоже считается возможным эхом (филлер перед вызовом). */
+export const MODEL_ECHO_BEFORE_REQUEST_MS = 15_000;
+const MODEL_ECHO_MEMORY_MS = 60_000;
 
 export class ConfirmationGate {
   private pending: PendingConfirmation | null = null;
@@ -95,8 +98,12 @@ export class ConfirmationGate {
   private currentUtterance: Utterance | null = null;
   private utteranceTimer: unknown = null;
   private bargeUtterance: Utterance | null = null;
-  /** Слова, сказанные моделью после запроса подтверждения: эхо из динамиков не может быть ответом. */
-  private modelWords = new Set<string>();
+  /**
+   * Недавняя речь модели с отметкой времени: эхо из динамиков не может быть ответом.
+   * Копится всегда, не только во время pending: филлер «Да, сейчас отправлю…» звучит
+   * до вызова инструмента, а доигрывается и распознаётся уже после request().
+   */
+  private modelSpeech: Array<{ at: number; words: string[] }> = [];
   private bargeTimer: unknown = null;
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
   private usedIds = new Set<string>();
@@ -147,7 +154,6 @@ export class ConfirmationGate {
     // в onOwnerTranscriptChunk: до открытия окна засчитывается только согласие,
     // не раньше BARGE_IN_MIN_MS и не совпадающее со словами самого вопроса.
     this.resetWindow();
-    this.modelWords.clear();
     this.micOpen = true;
     this.events.onConfirmationUpdate?.(this.pending, "asking");
     return { pending: this.pending };
@@ -229,10 +235,12 @@ export class ConfirmationGate {
     this.utteranceTimer = this.clock.setTimeout(() => this.finalizeUtterance(), UTTERANCE_SILENCE_MS);
   }
 
-  /** Выходной транскрипт модели во время pending (кусками или кумулятивно — набор слов всё равно тот же). */
-  onModelTranscript(text: string) {
-    if (!this.pending) return;
-    for (const w of normalizeUtterance(text)) this.modelWords.add(w);
+  /** Выходной транскрипт модели (кусками или кумулятивно — набор слов всё равно тот же). */
+  onModelTranscript(text: string, at = this.clock.now()) {
+    const words = normalizeUtterance(text);
+    if (words.length > 0) this.modelSpeech.push({ at, words });
+    // Хранится только то, что ещё может вернуться эхом.
+    this.modelSpeech = this.modelSpeech.filter((c) => at - c.at <= MODEL_ECHO_MEMORY_MS);
   }
 
   /**
@@ -263,7 +271,11 @@ export class ConfirmationGate {
     if (!u || !p || p.verdict !== null) return;
     // Эхо: все слова реплики есть в самом вопросе — это голос агента из динамиков.
     // Модель говорит вопрос своими словами («Да, конечно. Отправить…?») — её слова тоже эхо.
-    const sayWords = new Set([...normalizeUtterance(`${p.say} ${p.card ?? ""}`), ...this.modelWords]);
+    const since = p.createdAt - MODEL_ECHO_BEFORE_REQUEST_MS;
+    const sayWords = new Set([
+      ...normalizeUtterance(`${p.say} ${p.card ?? ""}`),
+      ...this.modelSpeech.filter((c) => c.at >= since).flatMap((c) => c.words),
+    ]);
     const words = normalizeUtterance(u.text);
     if (words.length === 0 || words.every((w) => sayWords.has(w))) return;
     if (classify(u.text, p.class, this.words) !== "approved") return;
