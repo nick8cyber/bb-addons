@@ -447,11 +447,17 @@ describe("приёмка 04.11: сводка не обрывает ответ, �
     let release!: () => void;
     const slow = new Promise<void>((r) => { release = r; });
     s.brain!.archive = () => slow;
+    const events: string[] = [];
+    s.on("ending", () => events.push("ending"));
+    s.on("ended", () => events.push("ended"));
     const done = s.end("owner");
     await vi.advanceTimersByTimeAsync(0);
     expect(frames.some((f) => f.type === "ended")).toBe(true);
     expect(ws.readyState).toBe(3);
+    // хост освобождён до конца уборки: новый звонок не получит busy
+    expect(events).toEqual(["ending"]);
     release();
     await done;
+    expect(events).toEqual(["ending", "ended"]);
   });
 });

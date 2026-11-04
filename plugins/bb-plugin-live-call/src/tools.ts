@@ -328,9 +328,10 @@ export function eventContainsText(e: Record<string, unknown>, needle: string): b
  * или сообщение в очереди с этим текстом.
  */
 /** Ответ threads.send — подтверждение сервера BB: сообщение принято (sent) или в очереди (queued). */
-export function sendAcknowledged(res: unknown): boolean {
+export function sendAcknowledged(res: unknown): false | "sent" | "queued" {
   const r = res as { ok?: unknown; delivery?: unknown } | null | undefined;
-  return r?.ok === true && (r.delivery === "sent" || r.delivery === "queued");
+  if (r?.ok !== true) return false;
+  return r.delivery === "sent" || r.delivery === "queued" ? r.delivery : false;
 }
 
 export async function verifyThreadDelivery(
@@ -580,7 +581,7 @@ export const TOOLS: ToolDef[] = [
       const threadId = String(ref.thread.id);
       const text = String(args.text ?? "");
       const startTime = Date.now();
-      let ack = false;
+      let ack: false | "sent" | "queued" = false;
       try {
         ack = sendAcknowledged(await withTimeout(
           ctx.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: `[голос] ${text}`, mentions: [] }] } as never),
@@ -602,8 +603,9 @@ export const TOOLS: ToolDef[] = [
         return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
       }
       ctx.ledger.add("tool", `send_to_thread → ${threadId}: ${text.slice(0, 200)}`);
-      ctx.reportAction("send_to_thread", "C", "done", `Отправил в «${String(ref.thread.title ?? threadId)}»`, threadId);
-      return truncate({ sent: true, threadId });
+      // queued — сообщение стоит в очереди за текущим ходом агента: так и говорим.
+      ctx.reportAction("send_to_thread", "C", "done", `${ack === "queued" ? "В очереди" : "Отправил в"} «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ sent: true, queued: ack === "queued", threadId });
     },
   },
   {
@@ -1336,7 +1338,7 @@ export const threadSendTool: ToolDef = {
     }
     const text = String(args.text ?? "");
     const startTime = Date.now();
-    let ack = false;
+    let ack: false | "sent" | "queued" = false;
     try {
       ack = sendAcknowledged(await withTimeout(
         ctx.sdk.threads.send({
@@ -1362,8 +1364,8 @@ export const threadSendTool: ToolDef = {
       return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
     }
     ctx.ledger.add("tool", `thread_send → ${threadId}: ${text.slice(0, 200)}`);
-    ctx.reportAction("thread_send", "C", "done", `Отправил в тред: «${text.slice(0, 60)}»`, threadId);
-    return truncate({ sent: true, threadId });
+    ctx.reportAction("thread_send", "C", "done", `${ack === "queued" ? "В очереди треда" : "Отправил в тред"}: «${text.slice(0, 60)}»`, threadId);
+    return truncate({ sent: true, queued: ack === "queued", threadId });
   },
 };
 

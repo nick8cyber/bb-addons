@@ -366,9 +366,13 @@ export default async function plugin(bb: BbPluginApi) {
       ...sessionThreadHelpers(sessionRef),
     });
     sessionRef.current = session;
-    session.on("ended", () => {
+    const release = () => {
+      if (active?.session !== session) return;
+      if (active.grace) clearTimeout(active.grace);
       active = null;
-    });
+    };
+    session.on("ending", release);
+    session.on("ended", release);
     active = { session, startedAt: Date.now(), link, detached: false, grace: null };
     await session.start();
     // Лимит минут: проверка раз в 30 с (спека §4).

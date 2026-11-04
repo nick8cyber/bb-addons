@@ -255,8 +255,10 @@ describe("инструменты звонка по треду (контракт 
           deliveryTimeoutMs: 50,
           deliveryIntervalMs: 10,
         };
-        const res = (await tool.execute({ text: "Решение владельца" }, ctx as never)) as { ok: boolean };
+        const res = (await tool.execute({ text: "Решение владельца" }, ctx as never)) as { ok: boolean; data?: { queued?: boolean } };
         expect(res.ok).toBe(true);
+        expect(JSON.stringify(res)).toContain(`"queued":${delivery === "queued"}`);
+        if (delivery === "queued") expect(reportAction).toHaveBeenCalledWith("thread_send", "C", "done", expect.stringContaining("В очереди треда"), "thr_target");
         expect(list).not.toHaveBeenCalled();
         expect(reportAction).toHaveBeenCalledWith("thread_send", "C", "done", expect.stringContaining("Решение владельца"), "thr_target");
       }

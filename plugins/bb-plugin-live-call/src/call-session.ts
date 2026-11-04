@@ -1377,6 +1377,9 @@ export class CallSession extends EventEmitter {
     this.deps.store.endCall(this.deps.callId, reason);
     this.frame({ type: "ended", callId: this.deps.callId, threadId: this.threadId, reason });
     this.setState("ended");
+    // Хост освобождается сразу: новый звонок не получает busy, а закрытие сокета
+    // браузером после ended не запускает ожидание возврата. Уборка ниже идёт фоном.
+    this.emit("ending");
     if (this.threadId && this.threadId !== this.targetThreadId) {
       try {
         await this.deps.endCallThread(summary);
