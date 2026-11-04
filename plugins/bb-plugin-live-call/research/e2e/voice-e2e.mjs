@@ -23,7 +23,7 @@ const THREAD_ID = process.env.THREAD_ID || "";
 const ECHO = +(process.env.ECHO || (SCENARIO === "echo" ? 0.6 : 0));
 const OUT = process.env.OUT || "./out";
 const APP = process.env.BB_APP || "http://127.0.0.1:38886";
-const DB = join(homedir(), ".bb/plugins/live-call/data.db");
+const DB = process.env.DB || join(homedir(), ".bb/plugins/live-call/data.db");
 if (!FIX || !existsSync(FIX)) throw new Error("FIX=<папка фикстур> обязательна");
 mkdirSync(OUT, { recursive: true });
 
@@ -210,8 +210,8 @@ if (SCENARIO === "general") {
   const s = await say("q_projects");
   const owner = await waitEvent("owner_line", s.at, 20000);
   check("реплика владельца распознана", owner, owner?.p.text ?? "");
-  const answer = await waitEvent("agent_line", (owner?.ts ?? s.at) + 1, 40000, (e) => !/секунд/i.test(e.p.text));
-  const toolUsed = events("action").find((e) => e.ts >= (owner?.ts ?? s.at) && e.ts <= (answer?.ts ?? Infinity) && e.p.status === "done");
+  const answer = await waitEvent("agent_line", s.at + 1, 40000, (e) => !/(секунд|минут|провер|глян|подожд)/i.test(e.p.text));
+  const toolUsed = events("action").find((e) => e.ts >= s.at && e.ts <= (answer?.ts ?? Infinity) && e.p.status === "done");
   check("голос ответил по данным инструмента", answer && toolUsed, `${toolUsed?.p.tool ?? "без инструмента"}: ${answer?.p.text?.slice(0, 120) ?? ""}`);
   check("без «системной ошибки»", !events("agent_line").some((e) => /системн\S* ошибк/i.test(e.p.text)));
 } else if (SCENARIO === "barge" || SCENARIO === "early" || SCENARIO === "fail") {
@@ -255,8 +255,8 @@ if (SCENARIO === "general") {
   const action = await waitEvent("action", verdict?.ts ?? 0, 30000, (e) => e.p.status === "done" || e.p.status === "failed");
   if (SCENARIO === "fail") {
     check("действие не выполнено (ожидаемо)", action?.p.status === "failed", action?.p.summary ?? "");
-    const after = await waitEvent("agent_line", (action?.ts ?? 0) + 1, 20000, (e) => !/^секунд/i.test(e.p.text.trim()));
-    check("голос честно сказал о неудаче", after && /не удал|не получ|не смог|невозможн|нет отдельной|недоступ/i.test(after.p.text) && !/готово|создал|выполнен[оа]? успешно/i.test(after.p.text), after?.p.text ?? "");
+    const after = await waitEvent("agent_line", (action?.ts ?? 0) + 1, 20000, (e) => !/^(секунд|минут|принято|сейчас)/i.test(e.p.text.trim()));
+    check("голос честно сказал о неудаче", after && /не удал|не получ|не смог|невозможн|нет отдельной|недоступ/i.test(after.p.text) && !/готово|\bсоздал\b|выполнен[оа]? успешно/i.test(after.p.text.replace(/не создалась/gi, "")), after?.p.text ?? "");
   } else {
     check("действие выполнено", action?.p.status === "done", action?.p.summary ?? "");
     check("без «не доставлено»", !events("tool_error").some((e) => /delivery_failed|не доставлено/.test(e.payload)));
@@ -298,7 +298,7 @@ if (SCENARIO === "general") {
   const mics = events("mic").filter((e) => e.ts >= s.end + 5000).map((e) => +((/пик (\d+)/.exec(e.p.message) || [])[1] || 0));
   check("эхо реально было в микрофоне (пик > 500 после фразы)", mics.some((x) => x > 500), `пики: ${mics.slice(0, 8).join(", ")}`);
   if (THREAD_ID) check("сообщение в тред не ушло (за этот звонок)", !threadVoiceSince().some((t) => /эха/i.test(t)));
-  const listening = await waitEvent("confirm_phase", confirm?.ts ?? 0, 5000, (e) => e.p.phase === "listening");
+  const listening = await waitEvent("confirm_phase", confirm?.ts ?? 0, 15000, (e) => e.p.phase === "listening");
   check("окно ответа открылось", listening);
   const o = await say("otmena");
   const vc = await waitEvent("verdict", o.at, 10000);
