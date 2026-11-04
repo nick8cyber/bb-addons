@@ -3,6 +3,8 @@
  * Использование: node test-12-9-live-call.mjs "<вопрос>" [targetThreadId]
  */
 
+import { execSync as __exec } from "node:child_process";
+const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
 const targetThreadId = process.argv[3] || "thr_testlong02";
 const question = process.argv[2] || "что сейчас происходит?";
 const WS_URL = "ws://127.0.0.1:38886/api/v1/plugins/live-call/http/call";
@@ -43,6 +45,7 @@ async function runCall() {
       console.log("[WS] Connected. Sending hello (extended)...");
       ws.send(JSON.stringify({
         type: "hello",
+        token: TOKEN,
         protocol: 1,
         mode: "extended",
         threadId: targetThreadId,

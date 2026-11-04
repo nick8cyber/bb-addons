@@ -62,7 +62,7 @@ const frame = (pcm) => {
 
 ws.onopen = () => {
   log("ws open → hello");
-  ws.send(JSON.stringify({ type: "hello", protocol: 1 }));
+  ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN }));
 };
 ws.onmessage = async (e) => {
   const d = e.data;

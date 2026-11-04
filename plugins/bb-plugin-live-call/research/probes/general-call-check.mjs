@@ -3,6 +3,8 @@
  * node research/probes/general-call-check.mjs ["вопрос"] — кадр text, без синтеза речи.
  * Печатает режим, реплики голоса, инструменты; ищет «системная ошибка». Запускать фоном, перед — bb call status.
  */
+import { execSync as __exec } from "node:child_process";
+const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
 const WS_URL = "ws://127.0.0.1:38886/api/v1/plugins/live-call/http/call";
 const question = process.argv[2] || "Привет. Расскажи подробно по каждому проекту в BB, что там происходит.";
 const t0 = Date.now();
@@ -21,7 +23,7 @@ const finish = () => {
 };
 setTimeout(finish, 150_000);
 setInterval(() => { if (asked && Date.now() - lastAgent > 15_000) finish(); }, 1000);
-ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1 }));
+ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN }));
 ws.onmessage = (ev) => {
   if (typeof ev.data !== "string") {
     lastAgent = Date.now();

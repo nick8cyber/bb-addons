@@ -7,6 +7,8 @@
  * Использование: node research/probes/test-12-11-call2.mjs <testThreadId>
  */
 
+import { execSync as __exec } from "node:child_process";
+const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
 const testThreadId = process.argv[2];
 if (!testThreadId) {
   console.error("Usage: node test-12-11-call2.mjs <testThreadId>");
@@ -41,6 +43,7 @@ async function runCall() {
       console.log("[WS] Connected. Sending hello...");
       ws.send(JSON.stringify({
         type: "hello",
+        token: TOKEN,
         protocol: 1,
         mode: "normal",
         threadId: testThreadId,

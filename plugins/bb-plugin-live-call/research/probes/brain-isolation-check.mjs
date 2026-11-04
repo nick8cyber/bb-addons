@@ -12,6 +12,8 @@ import { homedir } from "node:os";
 
 const target = process.argv[2];
 if (!target) throw new Error("usage: brain-isolation-check.mjs <testThreadId>");
+import { execSync as __exec } from "node:child_process";
+const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
 const WS_URL = "ws://127.0.0.1:38886/api/v1/plugins/live-call/http/call";
 const DB = join(homedir(), ".bb/plugins/live-call/data.db");
 const t0 = Date.now();
@@ -32,7 +34,7 @@ const finish = (code) => {
 };
 setTimeout(() => { log("TIMEOUT"); finish(2); }, 240_000);
 
-ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1, mode: "normal", threadId: target }));
+ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN, mode: "normal", threadId: target }));
 ws.onmessage = (ev) => {
   if (typeof ev.data !== "string") return;
   const f = JSON.parse(ev.data);

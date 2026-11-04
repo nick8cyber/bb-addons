@@ -3,6 +3,8 @@
  * Использование: node test-12-10-live-call.mjs "<вопрос>" [targetThreadId] [--confirm]
  */
 
+import { execSync as __exec } from "node:child_process";
+const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
 const question = process.argv[2] || "что сейчас происходит?";
 const targetThreadId = (process.argv[3] && !process.argv[3].startsWith("--")) ? process.argv[3] : "thr_mock_target";
 const autoConfirm = process.argv.includes("--confirm") || process.argv[3] === "--confirm";
@@ -46,6 +48,7 @@ async function runCall() {
       console.log("[WS] Connected. Sending hello (normal)...");
       ws.send(JSON.stringify({
         type: "hello",
+        token: TOKEN,
         protocol: 1,
         mode: "normal",
         threadId: targetThreadId,
