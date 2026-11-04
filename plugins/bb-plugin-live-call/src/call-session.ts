@@ -828,6 +828,8 @@ export class CallSession extends EventEmitter {
       void this.reconnectVoice(2);
     });
     client.on("error", (message: string) => {
+      // Сокет закрыли мы сами (конец звонка, смена ключа) — ошибка закрытия не новость для браузера.
+      if (this.ended || this.voice !== client) return;
       this.frame({ type: "error", code: "google_unreachable", message, retryable: true });
     });
     client.on("sendDropped", () => {
