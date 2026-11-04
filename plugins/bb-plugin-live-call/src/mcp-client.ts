@@ -251,11 +251,7 @@ export function toGeminiSchema(schema?: unknown, isTwoStep = false): Record<stri
       res.properties = props;
 
       if (Array.isArray(target.required)) {
-        res.required = target.required.filter((k): k is string => {
-          if (typeof k !== "string") return false;
-          if (isTwoStep && (k === "confirm" || k === "confirm_token")) return false;
-          return true;
-        });
+        res.required = target.required.filter((k): k is string => typeof k === "string");
       }
     }
 
@@ -268,6 +264,12 @@ export function toGeminiSchema(schema?: unknown, isTwoStep = false): Record<stri
   }
   if (!root.properties) {
     root.properties = {};
+  }
+  // Для двухшаговых ручек снимаем confirm и confirm_token из required ТОЛЬКО на корневом уровне (§14.10)
+  if (isTwoStep && Array.isArray(root.required)) {
+    root.required = (root.required as string[]).filter(
+      (k) => k !== "confirm" && k !== "confirm_token",
+    );
   }
   return root;
 }

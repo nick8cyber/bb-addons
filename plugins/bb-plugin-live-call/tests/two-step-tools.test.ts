@@ -1574,26 +1574,52 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
     await session.end("owner");
   });
 
-  it("F-07: схема Gemini для двухшаговых ручек принудительно снимает confirm и confirm_token из required", () => {
+  it("F-07: схема Gemini для двухшаговых ручек принудительно снимает confirm и confirm_token из required только в корне", () => {
     const inputSchema = {
       type: "object",
       properties: {
         title: { type: "string" },
         confirm: { type: "boolean" },
         confirm_token: { type: "string" },
+        payload: {
+          type: "object",
+          properties: {
+            confirm: { type: "boolean" },
+            confirm_token: { type: "string" },
+            body: { type: "string" },
+          },
+          required: ["confirm", "confirm_token", "body"],
+        },
+        records: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              confirm: { type: "boolean" },
+              id: { type: "string" },
+            },
+            required: ["confirm", "id"],
+          },
+        },
       },
-      required: ["title", "confirm", "confirm_token"],
+      required: ["title", "payload", "records", "confirm", "confirm_token"],
     };
 
-    // Для двухшаговой ручки (isTwoStep = true) confirm и confirm_token исключаются из required
-    const twoStepGemini = toGeminiSchema(inputSchema, true);
+    // Для двухшаговой ручки (isTwoStep = true):
+    // confirm и confirm_token исключаются ТОЛЬКО из корневого required;
+    // вложенный required объекта и items массива сохраняется полностью (§14.10, Round-4 P2)
+    const twoStepGemini: any = toGeminiSchema(inputSchema, true);
     expect(twoStepGemini).not.toBeNull();
-    expect(twoStepGemini!.required).toEqual(["title"]);
+    expect(twoStepGemini.required).toEqual(["title", "payload", "records"]);
+    expect(twoStepGemini.properties.payload.required).toEqual(["confirm", "confirm_token", "body"]);
+    expect(twoStepGemini.properties.records.items.required).toEqual(["confirm", "id"]);
 
-    // Для обычной ручки (isTwoStep = false) required не модифицируется
-    const normalGemini = toGeminiSchema(inputSchema, false);
+    // Для обычной ручки (isTwoStep = false) required не модифицируется ни на каком уровне
+    const normalGemini: any = toGeminiSchema(inputSchema, false);
     expect(normalGemini).not.toBeNull();
-    expect(normalGemini!.required).toEqual(["title", "confirm", "confirm_token"]);
+    expect(normalGemini.required).toEqual(["title", "payload", "records", "confirm", "confirm_token"]);
+    expect(normalGemini.properties.payload.required).toEqual(["confirm", "confirm_token", "body"]);
+    expect(normalGemini.properties.records.items.required).toEqual(["confirm", "id"]);
   });
 
   it("после «да» execute получает сохранённые аргументы с confirm:true и токеном (§14.10 п. 5)", async () => {
