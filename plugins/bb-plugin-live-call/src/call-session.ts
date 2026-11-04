@@ -222,7 +222,8 @@ export class CallSession extends EventEmitter {
     if (v && typeof v === "object") {
       const res: Record<string, unknown> = {};
       for (const [key, val] of Object.entries(v as Record<string, unknown>)) {
-        res[key] = this.sanitizeTokensInValue(val);
+        const safeKey = this.sanitizeTokens(key);
+        res[safeKey] = this.sanitizeTokensInValue(val);
       }
       return res as T;
     }
@@ -662,7 +663,8 @@ export class CallSession extends EventEmitter {
         }
 
         // Проверка схемы параметров Gemini (§14.4, review п. 6)
-        const geminiParams = toGeminiSchema(t.inputSchema);
+        const isTwoStep = Boolean(connCfg.twoStep && connCfg.twoStep.includes(t.name));
+        const geminiParams = toGeminiSchema(t.inputSchema, isTwoStep);
         if (!geminiParams) {
           this.recordEvent( "connector_tool_skipped", {
             id: connCfg.id,
@@ -670,6 +672,11 @@ export class CallSession extends EventEmitter {
             reason: "schema_unsupported",
           });
           continue;
+        }
+        if (isTwoStep && Array.isArray((geminiParams as any)?.required)) {
+          (geminiParams as any).required = (geminiParams as any).required.filter(
+            (k: string) => k !== "confirm" && k !== "confirm_token",
+          );
         }
 
         // Класс ручки (Object.hasOwn, review п. 7)
@@ -679,7 +686,6 @@ export class CallSession extends EventEmitter {
         if (strictCls === "deny") continue;
 
         toolNames.push(t.name);
-        const isTwoStep = Boolean(connCfg.twoStep && connCfg.twoStep.includes(t.name));
         const toolDef: ToolDef = {
           name: candidateName,
           cls: strictCls as ToolClass,
@@ -851,10 +857,16 @@ export class CallSession extends EventEmitter {
   }
 
   private toolContext(): ToolContext {
+    const wrappedLedger: ContextLedger = {
+      add: (role, text, at) => this.ledger.add(role, this.sanitizeTokens(text), at),
+      lastOwnerUtterances: (n) => this.ledger.lastOwnerUtterances(n).map((s) => this.sanitizeTokens(s)),
+      handoverSummary: () => this.sanitizeTokens(this.ledger.handoverSummary()),
+    } as ContextLedger;
+
     return {
       sdk: this.deps.sdk,
       gate: this.gate,
-      ledger: this.ledger,
+      ledger: wrappedLedger,
       targetThreadId: this.targetThreadId ?? undefined,
       targetProjectId: this.targetProjectId ?? undefined,
       threadMessages: this.threadMessages,
@@ -870,20 +882,21 @@ export class CallSession extends EventEmitter {
       },
       newActionId: (tool: string) => this.newActionId(tool),
       voiceMemory: {
-        add: (text: string) => this.deps.store.addMemory(text),
+        add: (text: string) => this.deps.store.addMemory(this.sanitizeTokens(text)),
         list: () => this.deps.store.listMemory(),
       },
       reportAction: (tool: string, cls: ToolClass, status: "running" | "done" | "failed" | "cancelled", summary: string, threadId?: string, actionId?: string) => {
+        const safeSummary = this.sanitizeTokens(summary);
         this.frame({
           type: "action",
           actionId: actionId ?? this.newActionId(tool),
           tool,
           class: cls,
           status,
-          summary,
+          summary: safeSummary,
           threadId,
         });
-        this.recordEvent( "action", { tool, cls, status, summary, threadId });
+        this.recordEvent( "action", { tool, cls, status, summary: safeSummary, threadId });
         if (tool === "end_call" && status === "done") void this.end("owner");
         if (tool === "switch_mode" && status === "running") void this.switchMode(summary === "extended" ? "extended" : "normal", "tool");
       },
@@ -970,19 +983,72 @@ export class CallSession extends EventEmitter {
       this.frame({ type: "interrupted", turnSeq: turnSeq ?? 0 });
       this.turnAudioBytes = 0;
       if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
+      agentBuf = "";
+      streamPending = "";
       this.setState("listening");
     });
     let agentBuf = "";
-    client.on("outputTranscript", (text: string) => {
+    let streamPending = "";
+    const utf8Decoder = new TextDecoder("utf-8", { fatal: false });
+
+    const flushStream = (final: boolean) => {
+      if (this.knownTokens.size === 0) {
+        if (streamPending) {
+          const out = streamPending;
+          streamPending = "";
+          this.frame({ type: "transcript", role: "agent", text: out, final: false });
+        }
+        return;
+      }
+      streamPending = this.sanitizeTokens(streamPending);
+      if (final) {
+        if (streamPending) {
+          const out = streamPending;
+          streamPending = "";
+          this.frame({ type: "transcript", role: "agent", text: out, final: false });
+        }
+        return;
+      }
+      let maxTokenLen = 0;
+      for (const tok of this.knownTokens) {
+        if (tok.length > maxTokenLen) maxTokenLen = tok.length;
+      }
+      const tailLen = Math.max(0, maxTokenLen - 1);
+      if (streamPending.length > tailLen) {
+        let safeLen = streamPending.length - tailLen;
+        const code = streamPending.charCodeAt(safeLen - 1);
+        if (code >= 0xd800 && code <= 0xdbff) {
+          safeLen -= 1;
+        }
+        if (safeLen > 0) {
+          const out = streamPending.slice(0, safeLen);
+          streamPending = streamPending.slice(safeLen);
+          this.frame({ type: "transcript", role: "agent", text: out, final: false });
+        }
+      }
+    };
+
+    client.on("outputTranscript", (rawText: string | Uint8Array) => {
+      const text = typeof rawText === "string" ? rawText : utf8Decoder.decode(rawText, { stream: true });
       if (!text) return;
       // Транскрипт приходит и кусками, и кумулятивно в аудио-сообщениях:
       // кумулятивный кусок, начинающийся с накопленного, ЗАМЕНЯЕТ его, а не дублирует.
-      if (text.startsWith(agentBuf) && agentBuf.length > 0) agentBuf = text;
-      else if (agentBuf.startsWith(text)) return; // кусок уже внутри накопленного
-      else agentBuf += text;
+      let delta = "";
+      if (text.startsWith(agentBuf) && agentBuf.length > 0) {
+        delta = text.slice(agentBuf.length);
+        agentBuf = text;
+      } else if (agentBuf.startsWith(text)) {
+        return; // кусок уже внутри накопленного
+      } else {
+        delta = text;
+        agentBuf += text;
+      }
       // Шлюзу — склеенный текст хода: кусок может резать слово («ок»+«ей»), ревью PLUG-113.
       this.gate.onModelTranscript(agentBuf);
-      this.frame({ type: "transcript", role: "agent", text, final: false });
+      if (delta) {
+        streamPending += delta;
+        flushStream(false);
+      }
     });
     client.on("turnComplete", () => {
       this.voiceTalking = false;
@@ -992,11 +1058,13 @@ export class CallSession extends EventEmitter {
       // Поэтому: нет звука в ходе (текст) — сразу; есть — по playback_drained, запасной таймер по длине звука.
       this.scheduleListenAfterPlayback();
       this.flushQuietQueue();
+      flushStream(true);
       void (async () => {
         // Сначала тред: иначе первая же реплика агента уйдёт в say до его создания и потеряется.
         await this.maybeSpawnThreadOnFirstUtterance();
         const line = agentBuf.trim();
         agentBuf = "";
+        streamPending = "";
         this.reconnectAttempts = 0;
         if (!line) return;
         this.frame({ type: "transcript", role: "agent", text: line, final: true });
@@ -1208,8 +1276,11 @@ export class CallSession extends EventEmitter {
 
   /** Результат R-инструментов: один пакет [СИСТЕМА] в VOICE. */
   private enqueueSystem(tool: string, result: ToolResult) {
-    const text = result.ok ? JSON.stringify(result.data) : `ошибка: ${"error" in result ? result.error.message : "нужно подтверждение"}`;
-    this.systemBatch.push(`инструмент ${tool}: ${text}`);
+    const rawData = result.ok ? this.sanitizeTokensInValue(result.data) : null;
+    const text = result.ok
+      ? JSON.stringify(rawData)
+      : `ошибка: ${"error" in result ? this.sanitizeTokens(result.error.message) : "нужно подтверждение"}`;
+    this.systemBatch.push(this.sanitizeTokens(`инструмент ${tool}: ${text}`));
     if (this.systemBatchTimer) clearTimeout(this.systemBatchTimer);
     this.systemBatchTimer = setTimeout(() => this.flushSystemSoon(), 300);
   }
@@ -1221,17 +1292,18 @@ export class CallSession extends EventEmitter {
    */
   injectWhenQuiet(text: string) {
     if (this.ended) return;
+    const safeText = this.sanitizeTokens(text);
     // Ждём и конца речи, и ответа на только что сказанное владельцем: вставка сразу после его
     // реплики перебивала ещё не начатый ответ, и голос молчал (регрессия 04.11: сводка пришла
     // в ту же секунду, что и вопрос «что было последним в треде?»).
     const awaiting = Date.now() < this.awaitingReplyUntil;
     if (this.voiceTalking || awaiting) {
-      this.quietQueue.push(text);
+      this.quietQueue.push(safeText);
       if (awaiting && !this.voiceTalking) this.scheduleQuietFallback();
       return;
     }
-    this.recordEvent( "system_injected", { waited: false, text: text.slice(0, 120) });
-    this.voice?.sendClientContent(text, true);
+    this.recordEvent( "system_injected", { waited: false, text: safeText.slice(0, 120) });
+    this.voice?.sendClientContent(safeText, true);
   }
 
   /** Ответа на реплику владельца так и не было — вставка уходит по запасному таймеру. */
@@ -1254,17 +1326,18 @@ export class CallSession extends EventEmitter {
   /** Справка в голос без хода модели (turnComplete=false) — только между ходами. */
   injectContextWhenQuiet(text: string) {
     if (this.ended) return;
+    const safeText = this.sanitizeTokens(text);
     if (this.voiceTalking || Date.now() < this.awaitingReplyUntil) {
-      this.quietContext.push(text);
+      this.quietContext.push(safeText);
       return;
     }
-    this.recordEvent("system_context", { waited: false, text: text.slice(0, 120) });
-    this.voice?.sendClientContent(text, false);
+    this.recordEvent("system_context", { waited: false, text: safeText.slice(0, 120) });
+    this.voice?.sendClientContent(safeText, false);
   }
 
   private flushQuietContext() {
     if (this.quietContext.length === 0) return;
-    const text = this.quietContext.join("\n\n").slice(0, 8000);
+    const text = this.sanitizeTokens(this.quietContext.join("\n\n")).slice(0, 8000);
     this.quietContext = [];
     this.recordEvent("system_context", { waited: true, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, false);
@@ -1277,7 +1350,7 @@ export class CallSession extends EventEmitter {
       this.quietFallback = null;
     }
     if (this.quietQueue.length === 0) return;
-    const text = this.quietQueue.join("\n\n").slice(0, 6000);
+    const text = this.sanitizeTokens(this.quietQueue.join("\n\n")).slice(0, 6000);
     this.quietQueue = [];
     this.recordEvent( "system_injected", { waited: true, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, true);
@@ -1287,8 +1360,8 @@ export class CallSession extends EventEmitter {
     if (this.systemBatch.length === 0) return;
     const batch = this.systemBatch;
     this.systemBatch = [];
-    const text = `[СИСТЕМА] ${batch.join("\n")}`.slice(0, 4000);
-    this.ledger.add("tool", this.sanitizeTokens(text));
+    const text = this.sanitizeTokens(`[СИСТЕМА] ${batch.join("\n")}`).slice(0, 4000);
+    this.ledger.add("tool", text);
     this.recordEvent( "system_batch", { text: text.slice(0, 300) });
     this.injectWhenQuiet(text);
   }
@@ -1405,16 +1478,17 @@ export class CallSession extends EventEmitter {
           this.twoStepPreviews.delete(k);
         }
       }
-      this.storedArgs.delete(p.argsHash);
     }
 
     try {
-      const rawRes = await def.execute(this.storedArgsOf(p), this.toolContext());
+      const rawRes = await def.execute(stored, this.toolContext());
       result = rawRes.ok
         ? { ok: true, data: rawRes.data, ...(rawRes.truncated !== undefined ? { truncated: rawRes.truncated } : {}) }
         : rawRes;
     } catch (e) {
       result = { ok: false, error: { code: "internal", message: String(e) } };
+    } finally {
+      this.storedArgs.delete(p.argsHash);
     }
     this.gate.consume(p.confirmationId);
     this.frame({
@@ -1628,7 +1702,7 @@ export class CallSession extends EventEmitter {
     // Новая сессия продолжает разговор, а не начинает его: без приветствия, иначе владелец
     // слышит «второго агента» другим голосом (приёмка 03.11).
     this.voice?.sendClientContent(
-      `[СИСТЕМА] Режим звонка переключён. Ты продолжаешь тот же разговор. Не здоровайся, не представляйся, не повторяй сказанное — молчи, пока владелец не заговорит. Пересказ:\n${this.ledger.handoverSummary()}`,
+      `[СИСТЕМА] Режим звонка переключён. Ты продолжаешь тот же разговор. Не здоровайся, не представляйся, не повторяй сказанное — молчи, пока владелец не заговорит. Пересказ:\n${this.sanitizeTokens(this.ledger.handoverSummary())}`,
       false,
     );
     this.frame({ type: "mode", mode, switching: false });
@@ -1657,7 +1731,7 @@ export class CallSession extends EventEmitter {
       try {
         // Переподключается только голос; помощник Extended жив и не дублируется.
         this.voice = this.makeVoiceSession(useHandle);
-        this.voice?.sendClientContent(`[СИСТЕМА] Переподключение. Пересказ:\n${this.ledger.handoverSummary()}`, false);
+        this.voice?.sendClientContent(`[СИСТЕМА] Переподключение. Пересказ:\n${this.sanitizeTokens(this.ledger.handoverSummary())}`, false);
       } catch {
         this.frame({ type: "error", code: "google_unreachable", message: "не удалось переподключиться", retryable: true });
       }
@@ -1675,7 +1749,7 @@ export class CallSession extends EventEmitter {
           this.closeSessions();
           return;
         }
-        this.voice?.sendClientContent(`[СИСТЕМА] Смена ключа. Пересказ:\n${this.ledger.handoverSummary()}`, false);
+        this.voice?.sendClientContent(`[СИСТЕМА] Смена ключа. Пересказ:\n${this.sanitizeTokens(this.ledger.handoverSummary())}`, false);
         this.setState("listening");
       });
     } catch (e) {
@@ -1707,6 +1781,7 @@ export class CallSession extends EventEmitter {
   /** Вставка с обрывом текущего хода: голос замолкает, браузер сбрасывает буфер. */
   private interruptAndInject(text: string) {
     if (this.ended) return;
+    const safeText = this.sanitizeTokens(text);
     if (this.voiceTalking) {
       this.voiceTalking = false;
       this.frame({ type: "interrupted", turnSeq: 0 });
@@ -1714,7 +1789,7 @@ export class CallSession extends EventEmitter {
     }
     const queued = this.quietQueue;
     this.quietQueue = [];
-    const all = [text, ...queued].join("\n\n").slice(0, 6000);
+    const all = this.sanitizeTokens([safeText, ...queued].join("\n\n")).slice(0, 6000);
     this.recordEvent( "system_injected", { waited: false, interrupted: true, text: all.slice(0, 120) });
     this.voice?.sendClientContent(all, true);
   }

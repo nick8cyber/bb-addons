@@ -110,7 +110,7 @@ const SUPPORTED_PRIMITIVE_TYPES = new Set(["string", "number", "integer", "boole
  * Неподдержанные схемы ($ref, oneOf, allOf, иной anyOf, patternProperties, корень не object,
  * числовой enum, свойство без type) → null (§14.4, review п. 6).
  */
-export function toGeminiSchema(schema?: unknown): Record<string, unknown> | null {
+export function toGeminiSchema(schema?: unknown, isTwoStep = false): Record<string, unknown> | null {
   if (schema === undefined || schema === null) {
     return { type: "object", properties: {} };
   }
@@ -251,7 +251,11 @@ export function toGeminiSchema(schema?: unknown): Record<string, unknown> | null
       res.properties = props;
 
       if (Array.isArray(target.required)) {
-        res.required = target.required.filter((k): k is string => typeof k === "string");
+        res.required = target.required.filter((k): k is string => {
+          if (typeof k !== "string") return false;
+          if (isTwoStep && (k === "confirm" || k === "confirm_token")) return false;
+          return true;
+        });
       }
     }
 
@@ -271,8 +275,8 @@ export function toGeminiSchema(schema?: unknown): Record<string, unknown> | null
 /**
  * Обратная совместимость для вызова mcpSchemaToGeminiParameters.
  */
-export function mcpSchemaToGeminiParameters(schema?: Record<string, unknown>): Record<string, unknown> {
-  const res = toGeminiSchema(schema);
+export function mcpSchemaToGeminiParameters(schema?: Record<string, unknown>, isTwoStep = false): Record<string, unknown> {
+  const res = toGeminiSchema(schema, isTwoStep);
   return res ?? { type: "object", properties: {} };
 }
 

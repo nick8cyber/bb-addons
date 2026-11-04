@@ -8,7 +8,7 @@ import { CallSession, makePreviewKey } from "../src/call-session.js";
 import { CallStore } from "../src/call-store.js";
 import { ConfirmationGate } from "../src/confirmation-gate.js";
 import type { ServerFrame, ToolResult } from "../src/contract.js";
-import { McpClient, extractConfirmToken } from "../src/mcp-client.js";
+import { McpClient, extractConfirmToken, toGeminiSchema } from "../src/mcp-client.js";
 import {
   ProjectRegistryManager,
   canonicalizeJson,
@@ -554,7 +554,7 @@ describe("2. Логика превью и подтверждения двухш�
       advanceCallThread: async () => {},
       sayCallThread: async () => {},
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     const enqueueSpy = vi.spyOn(session as any, "enqueueSystem");
@@ -623,7 +623,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
       advanceCallThread: async () => {},
       sayCallThread: async () => {},
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     await session.start();
@@ -690,6 +690,15 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
     const doneActionFrame = sentFrames.find((f) => f.type === "action" && f.status === "done") as any;
     expect(doneActionFrame).toBeDefined();
     expect(doneActionFrame.summary).toContain("Выполнено: test__create_record");
+
+    // Проверяем, что исполнение реально создало запись в test-connector, а не вернуло превью
+    const allDbEventsBeforeEnd = (store as any).db.prepare("SELECT kind, payload FROM call_events WHERE call_id = ?").all(callId);
+    const injectedEvents = allDbEventsBeforeEnd.filter((e: any) => e.kind === "system_injected");
+    expect(injectedEvents.length).toBeGreaterThan(0);
+    const hasSuccessResult = injectedEvents.some((e: any) => e.payload && String(e.payload).includes("успешно создана"));
+    expect(hasSuccessResult).toBe(true);
+    const hasPreviewLeak = injectedEvents.some((e: any) => e.payload && String(e.payload).includes("Превью создания записи"));
+    expect(hasPreviewLeak).toBe(false);
 
     // Превью удалено после approved (одноразовое)
     expect(session.getTwoStepPreview("test__create_record", token)).toBeUndefined();
@@ -771,7 +780,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
       advanceCallThread: async () => {},
       sayCallThread: async () => {},
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     await session.start();
@@ -849,7 +858,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
       advanceCallThread: async () => {},
       sayCallThread: async () => {},
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     await session.start();
@@ -927,7 +936,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
         advanceCallThread: async () => {},
         sayCallThread: async () => {},
         endCallThread: async () => {},
-        wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+        wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
       });
 
     const sessionA = makeSession("call_session_a");
@@ -1015,7 +1024,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
         saidLines.push(line);
       },
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     await session.start();
@@ -1100,7 +1109,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
       advanceCallThread: async () => {},
       sayCallThread: async () => {},
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     await session.start();
@@ -1156,7 +1165,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
       advanceCallThread: async () => {},
       sayCallThread: async () => {},
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     const token = "review-token-synthetic-inflight-12345";
@@ -1247,7 +1256,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
       advanceCallThread: async () => {},
       sayCallThread: async () => {},
       endCallThread: async () => {},
-      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
     });
 
     const token = "review-token-synthetic-expired-99999";
@@ -1329,6 +1338,339 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
     } finally {
       Date.now = originalNow;
     }
+
+    await session.end("owner");
+  });
+
+  it("F-03: превью двухшаговой ручки в Router-режиме не утекает в systemBatch и голосовые вставки [СИСТЕМА]", async () => {
+    const frames: any[] = [];
+    const clientSentContents: string[] = [];
+    const session = new CallSession({
+      callId: "call_router_preview_leak",
+      keys: ["k1"],
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      thinkingLevel: "LOW",
+      mode: "extended",
+      routerInput: "text",
+      maxCallMinutes: 60,
+      store: {
+        event: () => {},
+        endCall: () => {},
+      } as any,
+      sdk: {} as never,
+      toBrowser: (f: any) => frames.push(f),
+      sendBrowserAudio: () => {},
+      spawnCallThread: async () => null,
+      advanceCallThread: async () => {},
+      sayCallThread: async () => {},
+      endCallThread: async () => {},
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
+    });
+
+    const token = "router-secret-token-123456789";
+    const twoStepDef: ToolDef = {
+      name: "test__write",
+      word: "записать",
+      cls: "C",
+      twoStep: true,
+      description: "write something",
+      parameters: {},
+      confirmSay: () => "write: title=sample?",
+      execute: async () => ({
+        ok: true,
+        data: { result: "preview-data", confirm_token: token },
+        confirm_token: token,
+        previewText: "preview " + token,
+      }),
+    };
+
+    (session as any).projectConnectorTools = [twoStepDef];
+
+    // Мокаем voice клиента для отслеживания sendClientContent
+    (session as any).voice = {
+      sendClientContent: vi.fn((content: string) => {
+        clientSentContents.push(content);
+      }),
+      interrupt: () => {},
+      close: () => {},
+    };
+
+    const mockRouterClient = {
+      sendToolResponse: vi.fn(),
+    };
+
+    // Вызываем handleRouterCalls с двухшаговой ручкой (превью)
+    await (session as any).handleRouterCalls(mockRouterClient as any, [
+      { id: "call_r1", name: twoStepDef.name, args: { title: "Item" } },
+    ]);
+
+    // Проверяем, что в systemBatch токен замаскирован
+    const systemBatch = (session as any).systemBatch as string[];
+    for (const item of systemBatch) {
+      expect(item).not.toContain(token);
+      expect(item).toContain("***");
+    }
+
+    // Принудительно сбрасываем пакет
+    (session as any).flushSystemSoon();
+
+    for (const content of clientSentContents) {
+      expect(content).not.toContain(token);
+      expect(content).toContain("***");
+    }
+
+    await session.end("owner");
+  });
+
+  it("F06 (а): потоковый фильтр outputTranscript удерживает хвост и маскирует токен, разбитый на части", async () => {
+    const frames: any[] = [];
+    const session = new CallSession({
+      callId: "call_streaming_transcript_leak",
+      keys: ["k1"],
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      thinkingLevel: "LOW",
+      mode: "normal",
+      routerInput: "text",
+      maxCallMinutes: 60,
+      store: {
+        event: () => {},
+        endCall: () => {},
+      } as any,
+      sdk: {} as never,
+      toBrowser: (f: any) => frames.push(f),
+      sendBrowserAudio: () => {},
+      spawnCallThread: async () => null,
+      advanceCallThread: async () => {},
+      sayCallThread: async () => {},
+      endCallThread: async () => {},
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
+    });
+
+    const token = "stream-token-synthetic-xyz-123";
+    (session as any).knownTokens.add(token);
+
+    // Подключаем фиктивный voice client
+    const { LiveClient } = await import("../src/live-client.js");
+    const liveClient = new LiveClient({
+      key: "k1",
+      model: "gemini-2.0-flash-exp",
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      systemInstruction: "test",
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
+    } as any);
+    (session as any).wireVoice(liveClient);
+
+    const tokenPart1 = token.slice(0, 15);
+    const tokenPart2 = token.slice(15);
+
+    // Модель отдаёт транскрипт двумя кусками
+    liveClient.emit("outputTranscript", "Код для подтверждения: " + tokenPart1, false);
+    liveClient.emit("outputTranscript", tokenPart2 + " используйте для входа", false);
+    liveClient.emit("turnComplete");
+
+    const transcriptFrames = frames.filter((f) => f.type === "transcript" && f.role === "agent");
+    expect(transcriptFrames.length).toBeGreaterThan(0);
+
+    // Ни один отдельный кадр не должен содержать токен
+    for (const f of transcriptFrames) {
+      expect(f.text).not.toContain(token);
+    }
+
+    // Конкатенация всех non-final кадров не должна содержать токен
+    const nonFinalConcat = transcriptFrames
+      .filter((f) => !f.final)
+      .map((f) => f.text)
+      .join("");
+    expect(nonFinalConcat).not.toContain(token);
+    expect(nonFinalConcat).toContain("***");
+
+    await session.end("owner");
+  });
+
+  it("F06 (б): токен в ключе JSON-объекта аргументов маскируется в tool_error", async () => {
+    const events: any[] = [];
+    const session = new CallSession({
+      callId: "call_key_json_leak",
+      keys: ["k1"],
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      thinkingLevel: "LOW",
+      mode: "normal",
+      routerInput: "text",
+      maxCallMinutes: 60,
+      store: {
+        event: (_id: string, kind: string, payload: unknown) => events.push({ kind, payload }),
+        endCall: () => {},
+      } as any,
+      sdk: {} as never,
+      toBrowser: () => {},
+      sendBrowserAudio: () => {},
+      spawnCallThread: async () => null,
+      advanceCallThread: async () => {},
+      sayCallThread: async () => {},
+      endCallThread: async () => {},
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
+    });
+
+    const token = "key-token-secret-987654";
+    (session as any).knownTokens.add(token);
+
+    const fakeClient = { sendToolResponse: vi.fn() };
+
+    // Вызываем инструмент brain_ask с ключом объекта, равным токену (brain_ask упадёт, т.к. brain null)
+    await (session as any).handleNativeCalls(fakeClient as any, [
+      { id: "call_brain_1", name: "brain_ask", args: { question: "test", [token]: "secret_value" } },
+    ]);
+
+    const errorEvent = events.find((e) => e.kind === "tool_error");
+    expect(errorEvent).toBeDefined();
+
+    const serialized = JSON.stringify(errorEvent);
+    expect(serialized).not.toContain(token);
+    expect(serialized).toContain("***");
+
+    await session.end("owner");
+  });
+
+  it("F06 (в): вызов инструмента с токеном защищает ctx.ledger и handoverSummary от попадания токена", async () => {
+    const session = new CallSession({
+      callId: "call_ledger_wrapper_test",
+      keys: ["k1"],
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      thinkingLevel: "LOW",
+      mode: "normal",
+      routerInput: "text",
+      maxCallMinutes: 60,
+      store: {
+        event: () => {},
+        endCall: () => {},
+      } as any,
+      sdk: {} as never,
+      toBrowser: () => {},
+      sendBrowserAudio: () => {},
+      spawnCallThread: async () => null,
+      advanceCallThread: async () => {},
+      sayCallThread: async () => {},
+      endCallThread: async () => {},
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
+    });
+
+    const token = "ledger-token-sensitive-555";
+    (session as any).knownTokens.add(token);
+
+    const ctx = (session as any).toolContext();
+
+    // Инструмент напрямую пишет в ctx.ledger
+    ctx.ledger.add("tool", `brain_ask: ${token}`);
+
+    const summary = (session as any).ledger.handoverSummary();
+    expect(summary).not.toContain(token);
+    expect(summary).toContain("***");
+
+    await session.end("owner");
+  });
+
+  it("F-07: схема Gemini для двухшаговых ручек принудительно снимает confirm и confirm_token из required", () => {
+    const inputSchema = {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        confirm: { type: "boolean" },
+        confirm_token: { type: "string" },
+      },
+      required: ["title", "confirm", "confirm_token"],
+    };
+
+    // Для двухшаговой ручки (isTwoStep = true) confirm и confirm_token исключаются из required
+    const twoStepGemini = toGeminiSchema(inputSchema, true);
+    expect(twoStepGemini).not.toBeNull();
+    expect(twoStepGemini!.required).toEqual(["title"]);
+
+    // Для обычной ручки (isTwoStep = false) required не модифицируется
+    const normalGemini = toGeminiSchema(inputSchema, false);
+    expect(normalGemini).not.toBeNull();
+    expect(normalGemini!.required).toEqual(["title", "confirm", "confirm_token"]);
+  });
+
+  it("после «да» execute получает сохранённые аргументы с confirm:true и токеном (§14.10 п. 5)", async () => {
+    const executeCalls: any[] = [];
+    const session = new CallSession({
+      callId: "call_approved_exec_args",
+      keys: ["k1"],
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      thinkingLevel: "LOW",
+      mode: "normal",
+      routerInput: "text",
+      maxCallMinutes: 60,
+      store: {
+        event: () => {},
+        endCall: () => {},
+      } as any,
+      sdk: {} as never,
+      toBrowser: () => {},
+      sendBrowserAudio: () => {},
+      spawnCallThread: async () => null,
+      advanceCallThread: async () => {},
+      sayCallThread: async () => {},
+      endCallThread: async () => {},
+      wsFactory: (url: string) => new FakeWs(url) as unknown as WebSocket,
+    });
+
+    const token = "approved-synthetic-token-777";
+    const writeDef: ToolDef = {
+      name: "test__write",
+      word: "записать",
+      cls: "C",
+      twoStep: true,
+      description: "write test",
+      parameters: {},
+      confirmSay: () => "write: title=sample?",
+      execute: async (args: any) => {
+        executeCalls.push({ ...args });
+        return {
+          ok: true,
+          data: { result: "ok" },
+          confirm_token: token,
+          previewText: "preview " + token,
+        };
+      },
+    };
+
+    (session as any).projectConnectorTools = [writeDef];
+    const ctx = (session as any).toolContext();
+
+    // 1. Превью
+    await runToolCall(writeDef, { title: "sample" }, "call_prev", ctx);
+    // 2. Запрос подтверждения
+    await runToolCall(
+      writeDef,
+      { title: "sample", confirm: true, confirm_token: token },
+      "call_conf",
+      ctx,
+    );
+
+    const pending = session.pendingConfirmation();
+    expect(pending).not.toBeNull();
+
+    // 3. Одобрение владельца
+    session.decideConfirmation(pending!.confirmationId, "approve");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Проверяем, что execute был вызван 2 раза: 1-й — превью, 2-й — исполнение
+    expect(executeCalls.length).toBe(2);
+    // Первый вызов — аргументы превью без confirm*
+    expect(executeCalls[0]).toEqual({ title: "sample" });
+    // Второй вызов ПОСЛЕ «да» — ДОЛЖЕН получить сохранённые аргументы с confirm: true и confirm_token!
+    expect(executeCalls[1]).toEqual({
+      title: "sample",
+      confirm: true,
+      confirm_token: token,
+    });
 
     await session.end("owner");
   });
