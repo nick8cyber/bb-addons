@@ -1535,8 +1535,17 @@ export class CallSession extends EventEmitter {
     // Кнопка нажата, пока голос ещё говорит (часто — сам вопрос): ход модели обрываем, иначе
     // голос дочитывал уже решённый вопрос и «да» владельца уходило модели как новая реплика
     // (живая проверка 04.11). Результат действия вставится сразу, а не после конца хода.
-    this.decidedByButtonId = confirmationId;
-    this.gate.decide(confirmationId, decision);
+    const before = this.gate.pendingConfirmation();
+    const fresh = before?.confirmationId === confirmationId && before.verdict === null;
+    this.decidedByButtonId = fresh ? confirmationId : null;
+    const verdict = this.gate.decide(confirmationId, decision);
+    // Подтверждение: обрываем ход СРАЗУ, не дожидаясь исполнения — медленное действие
+    // (мозговой центр, коннектор) иначе давало голосу дочитать решённый вопрос.
+    // Результат действия придёт позже обычной вставкой между ходами.
+    if (verdict === "approved" && this.decidedByButtonId === confirmationId) {
+      this.decidedByButtonId = null;
+      this.interruptAndInject("[СИСТЕМА] Владелец подтвердил действие кнопкой — оно уже выполняется. Вопрос подтверждения НЕ задавай; скажи одной короткой фразой, что выполняешь, и жди результата.");
+    }
   }
 
   /** Вставка с обрывом текущего хода: голос замолкает, браузер сбрасывает буфер. */

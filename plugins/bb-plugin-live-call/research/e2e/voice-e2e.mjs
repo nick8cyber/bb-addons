@@ -1,7 +1,7 @@
 /**
  * Приёмка звонка живым (синтезированным) голосом в настоящем Chromium — без ключа Gemini.
  *
- * FIX=<папка с фикстурами *.pcm 24 кГц> SCENARIO=<general|barge|early|echo|fail|button-slow> [THREAD_ID=thr_…]
+ * FIX=<папка с фикстурами *.pcm 24 кГц> SCENARIO=<general|barge|early|echo|fail|button-early> [THREAD_ID=thr_…]
  * [ECHO=0.6] [OUT=./out] node research/e2e/voice-e2e.mjs
  *
  * - Фразы владельца — готовые PCM-фикстуры (синтезирует куратор), подаются в подменённый микрофон
@@ -62,7 +62,10 @@ await page.addInitScript((echoGainValue) => {
       setInterval(() => {
         meter.getFloatTimeDomainData(buf);
         let sum = 0; for (const v of buf) sum += v * v;
-        if (Math.sqrt(sum / buf.length) > 0.01) played.push(Date.now());
+        // Порог низкий, чтобы паузы внутри речи меньше занижали счёт. Считаем именно кадры со
+        // звуком, а не время от первого звука: иначе пауза генерации между филлером и вопросом
+        // засчиталась бы как «вопрос звучал» (ложный PASS). Ошибка — в сторону ложного FAIL.
+        if (Math.sqrt(sum / buf.length) > 0.003) played.push(Date.now());
       }, 20);
     }
     while (taps.length) {
@@ -218,9 +221,10 @@ if (SCENARIO === "general") {
     check("без «не доставлено»", !events("tool_error").some((e) => /delivery_failed|не доставлено/.test(e.payload)));
     if (THREAD_ID) check("сообщение [голос] в треде (этого звонка)", threadVoiceSince(startedAfter).some((t) => /перебиван/i.test(t)));
   }
-} else if (SCENARIO === "button-slow") {
-  // Кнопка «Подтвердить» раньше вопроса при медленном действии (задача мозговому центру):
-  // голос не должен дочитывать решённый вопрос.
+} else if (SCENARIO === "button-early") {
+  // Кнопка «Подтвердить» на карточке раньше вопроса: голос не должен дочитывать решённый вопрос.
+  // В проекте без git действие падает быстро — медленное действие покрыто юнит-тестом
+  // (quiet-inject: «кнопка «Подтвердить» при медленном действии»).
   const s = await say("brain_fail");
   const confirm = await waitEvent("confirm", s.at, 30000);
   check("запрошено подтверждение", confirm);

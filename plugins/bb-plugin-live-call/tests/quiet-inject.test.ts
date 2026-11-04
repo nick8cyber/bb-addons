@@ -306,3 +306,43 @@ describe("кнопка подтверждения, пока голос гово�
     await s.end("owner");
   });
 });
+
+describe("кнопка «Подтвердить» при медленном действии (ревью advisor)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("ход голоса обрывается сразу по кнопке, до конца исполнения; результат — после", async () => {
+    const frames: Array<{ type: string }> = [];
+    const store = new CallStore(new Database(":memory:"));
+    const s = new CallSession({
+      callId: "call_slow", keys: ["k1"], voice: "Algenib", languageCode: "ru-RU", thinkingLevel: "LOW",
+      mode: "normal", routerInput: "text", maxCallMinutes: 60, store, sdk: {} as never,
+      toBrowser: (f) => frames.push(f as never), sendBrowserAudio: () => {},
+      spawnCallThread: async () => null, advanceCallThread: async () => {}, sayCallThread: async () => {}, endCallThread: async () => {},
+      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+    });
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    const slow = {
+      name: "slow_action", cls: "C", word: "да", description: "медленное", parameters: { type: "object", properties: {} },
+      execute: () => new Promise((r) => setTimeout(() => r({ ok: true, data: { done: true } }), 5000)),
+    };
+    (s as unknown as { resolveTool: () => unknown }).resolveTool = () => slow;
+    const gate = (s as unknown as { gate: { request: (...a: unknown[]) => { pending: { confirmationId: string } } } }).gate;
+    const { pending } = gate.request("slow_action", {}, "C", "Медленное действие?");
+    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: btoa("\x00\x01") } }] } } });
+    s.decideConfirmation(pending.confirmationId, "approve");
+    // до конца исполнения: ход оборван, голосу сказано «уже выполняется»
+    expect(frames.some((f) => f.type === "interrupted")).toBe(true);
+    expect(ws.sent.some((x) => x.includes("уже выполняется"))).toBe(true);
+    expect(ws.sent.some((x) => x.includes("выполнено: slow_action"))).toBe(false);
+    await vi.advanceTimersByTimeAsync(5100);
+    ws.server({ serverContent: { turnComplete: true } });
+    expect(ws.sent.some((x) => x.includes("выполнено: slow_action"))).toBe(true);
+    await s.end("owner");
+  });
+});
