@@ -435,9 +435,9 @@ function ConfirmCard({ c, sheet = false }: { c: Confirmation; sheet?: boolean })
       <p className="lc-confirm__summary">{c.summary}</p>
       <div className="lc-confirm__say">
         {c.phase === "asking" ? (
-          <span className="lc-chip">
-            <Icon name="mic-off" size={12} />
-            звучит вопрос — микрофон закрыт
+          <span className="lc-chip lc-chip--live">
+            <Icon name="mic" size={12} />
+            звучит вопрос — можно перебить
           </span>
         ) : (
           <span className="lc-chip lc-chip--live">

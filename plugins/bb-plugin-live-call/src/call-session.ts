@@ -1002,7 +1002,7 @@ export class CallSession extends EventEmitter {
       confirmationId: p.confirmationId,
       class: p.class,
       tool: p.tool,
-      summary: p.say,
+      summary: p.card ?? p.say,
       word,
       expiresAt: new Date(p.expiresAt).toISOString(),
       phase,

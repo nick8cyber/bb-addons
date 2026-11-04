@@ -334,6 +334,15 @@ export function sendAcknowledged(res: unknown): false | "sent" | "queued" {
   return r.delivery === "sent" || r.delivery === "queued" ? r.delivery : false;
 }
 
+/**
+ * Вопрос подтверждения вслух — коротко: первые слова текста, полный текст на карточке
+ * (решение владельца 04.11: долгий дословный вопрос нельзя было перебить).
+ */
+export function brief(v: unknown, words = 8): string {
+  const all = String(v ?? "").trim().split(/\s+/).filter(Boolean);
+  return all.length <= words ? all.join(" ") : `${all.slice(0, words).join(" ")}…`;
+}
+
 export async function verifyThreadDelivery(
   sdk: BbPluginApi["sdk"],
   threadId: string,
@@ -574,7 +583,7 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, text: { type: "string", description: "точный текст сообщения" } },
       required: ["thread", "text"],
     },
-    confirmSay: (args) => `Отправить в «${String(args.thread)}» сообщение: «${String(args.text)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Отправить в «${String(args.thread)}»: «${brief(args.text)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -625,8 +634,8 @@ export const TOOLS: ToolDef[] = [
     },
     confirmSay: (args) =>
       args.grant
-        ? `Разрешить агенту в «${String(args.thread)}»? Скажи «разрешаю» или «отмена».`
-        : `Ответить агенту в «${String(args.thread)}»: «${String(args.answer ?? "")}». Скажи «да» или «отмена».`,
+        ? `Разрешить агенту в «${String(args.thread)}»?`
+        : `Ответить агенту в «${String(args.thread)}»: «${brief(args.answer)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -674,7 +683,7 @@ export const TOOLS: ToolDef[] = [
     word: "да",
     description: "Остановить тред. Подтверждение: «да» или «останавливай».",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
-    confirmSay: (args) => `Остановить тред «${String(args.thread)}»? Скажи «да», «останавливай» или «отмена».`,
+    confirmSay: (args) => `Остановить тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -697,7 +706,7 @@ export const TOOLS: ToolDef[] = [
       },
       required: ["project", "task"],
     },
-    confirmSay: (args) => `Запускаю агента в проекте «${String(args.project)}» с задачей: «${String(args.task).slice(0, 200)}». Скажи «запускай» или «отмена».`,
+    confirmSay: (args) => `Запустить агента в «${String(args.project)}»: «${brief(args.task)}»?`,
     async execute(args, ctx) {
       const projects = (await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
       const ref = String(args.project ?? "").trim().toLowerCase();
@@ -749,7 +758,7 @@ export const TOOLS: ToolDef[] = [
       properties: { title: { type: "string" }, spec: { type: "string" }, project: { type: "string" } },
       required: ["title", "spec"],
     },
-    confirmSay: (args) => `Создать задачу «${String(args.title)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Создать задачу «${String(args.title)}»?`,
     async execute(args, ctx) {
       const res = await pluginRpc(ctx, "tasks", "createTask", { title: args.title, description: args.spec, project: args.project });
       ctx.reportAction("tasks_create", "C", res.ok ? "done" : "failed", `Создал задачу «${String(args.title)}»`);
@@ -766,7 +775,7 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, preset: { type: "string" } },
       required: ["key", "preset"],
     },
-    confirmSay: (args) => `Раздать задачу ${String(args.key)} исполнителю (${String(args.preset)})? Скажи «запускай» или «отмена».`,
+    confirmSay: (args) => `Раздать задачу ${String(args.key)} исполнителю (${String(args.preset)})?`,
     async execute(args, ctx) {
       const res = await pluginRpc(ctx, "tasks", "dispatch", { key: args.key, preset: args.preset });
       ctx.reportAction("tasks_dispatch", "L", res.ok ? "done" : "failed", `Раздал задачу ${String(args.key)}`);
@@ -979,7 +988,7 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, body: { type: "string" } },
       required: ["key", "body"],
     },
-    confirmSay: (args) => `Комментарий к задаче ${String(args.key)}: «${String(args.body).slice(0, 200)}». Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Комментарий к задаче ${String(args.key)}: «${brief(args.body)}»?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "createComment", { key: args.key, body: args.body });
     },
@@ -994,7 +1003,7 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, status: { type: "string", enum: ["backlog", "in_progress", "in_review", "done", "canceled"] } },
       required: ["key", "status"],
     },
-    confirmSay: (args) => `Перевести задачу ${String(args.key)} в «${String(args.status)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Перевести задачу ${String(args.key)} в «${String(args.status)}»?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, status: args.status });
     },
@@ -1009,7 +1018,7 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, due: { type: "string" } },
       required: ["key", "due"],
     },
-    confirmSay: (args) => `Срок задачи ${String(args.key)} — ${String(args.due)}? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Срок задачи ${String(args.key)} — ${String(args.due)}?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, dueDate: args.due });
     },
@@ -1020,7 +1029,7 @@ export const TOOLS: ToolDef[] = [
     word: "да",
     description: "Тред в архив (не удаляет).",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
-    confirmSay: (args) => `Архивировать тред «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Архивировать тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1036,7 +1045,7 @@ export const TOOLS: ToolDef[] = [
     word: "да",
     description: "Сжать контекст длинного треда (штатный /compact).",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
-    confirmSay: (args) => `Сжать контекст треда «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Сжать контекст треда «${String(args.thread)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1056,7 +1065,7 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, text: { type: "string" } },
       required: ["thread", "text"],
     },
-    confirmSay: (args) => `В очередь треда «${String(args.thread)}»: «${String(args.text).slice(0, 200)}». Скажи «да» или «отмена».`,
+    confirmSay: (args) => `В очередь треда «${String(args.thread)}»: «${brief(args.text)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1078,7 +1087,7 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, unpin: { type: "boolean" } },
       required: ["thread"],
     },
-    confirmSay: (args) => `${args.unpin ? "Открепить" : "Закрепить"} тред «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `${args.unpin ? "Открепить" : "Закрепить"} тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1100,7 +1109,7 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, title: { type: "string" } },
       required: ["thread", "title"],
     },
-    confirmSay: (args) => `Переименовать «${String(args.thread)}» в «${String(args.title)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Переименовать «${String(args.thread)}» в «${String(args.title)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1120,7 +1129,7 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, unhide: { type: "boolean" } },
       required: ["thread"],
     },
-    confirmSay: (args) => `${args.unhide ? "Вернуть" : "Скрыть"} тред «${String(args.thread)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `${args.unhide ? "Вернуть" : "Скрыть"} тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1152,7 +1161,7 @@ export const TOOLS: ToolDef[] = [
       properties: { text: { type: "string", description: "что запомнить, одной фразой" } },
       required: ["text"],
     },
-    confirmSay: (args) => `Запомнить в мою память звонков: «${String(args.text).slice(0, 200)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Запомнить: «${brief(args.text)}»?`,
     async execute(args, ctx) {
       if (!ctx.voiceMemory) return { ok: false, error: { code: "no_memory", message: "память звонков недоступна" } };
       const r = ctx.voiceMemory.add(String(args.text ?? ""));
@@ -1169,7 +1178,7 @@ export const TOOLS: ToolDef[] = [
       properties: { text: { type: "string" } },
       required: ["text"],
     },
-    confirmSay: (args) => `Отметить в итоге звонка: «${String(args.text).slice(0, 200)}»? Скажи «да» или «отмена».`,
+    confirmSay: (args) => `Отметить в итоге звонка: «${brief(args.text)}»?`,
     async execute(args, ctx) {
       ctx.ledger.add("system", `Пометка: ${String(args.text)}`);
       ctx.reportAction("call_note", "C", "done", `Пометка: ${String(args.text).slice(0, 80)}`);
@@ -1182,7 +1191,7 @@ export const TOOLS: ToolDef[] = [
     word: "запускай",
     description: "Перезапустить упавший тред. Класс L: только «запускай».",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
-    confirmSay: (args) => `Перезапустить тред «${String(args.thread)}»? Скажи «запускай» или «отмена».`,
+    confirmSay: (args) => `Перезапустить тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1198,7 +1207,7 @@ export const TOOLS: ToolDef[] = [
     word: "запускай",
     description: "Остановить ВСЕ активные треды кроме треда звонка. Массовая операция, класс L.",
     parameters: { type: "object", properties: {} },
-    confirmSay: () => "Остановить все активные треды? Скажи «запускай» или «отмена».",
+    confirmSay: () => "Остановить все активные треды?",
     async execute(_args, ctx) {
       const running = asArray(await withTimeout(ctx.sdk.threads.listRunning() as Promise<Array<Record<string, unknown>>>));
       const stopped: string[] = [];
@@ -1225,7 +1234,7 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, model: { type: "string" } },
       required: ["thread", "model"],
     },
-    confirmSay: (args) => `Передать тред «${String(args.thread)}» на ${String(args.model)} в новом треде? Скажи «запускай» или «отмена».`,
+    confirmSay: (args) => `Передать тред «${String(args.thread)}» на ${String(args.model)} в новом треде?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1251,7 +1260,7 @@ export const TOOLS: ToolDef[] = [
     word: "запускай",
     description: "Клонировать тред с контекстом для отдельной доработки.",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
-    confirmSay: (args) => `Клонировать тред «${String(args.thread)}»? Скажи «запускай» или «отмена».`,
+    confirmSay: (args) => `Клонировать тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
       if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
@@ -1330,7 +1339,7 @@ export const threadSendTool: ToolDef = {
     },
     required: ["text"],
   },
-  confirmSay: (args) => `Отправить в тред сообщение: «${String(args.text ?? "")}»? Скажи «да» или «отмена».`,
+  confirmSay: (args) => `Отправить в тред: «${brief(args.text)}»?`,
   async execute(args, ctx) {
     const threadId = ctx.targetThreadId;
     if (!threadId) {
@@ -1384,8 +1393,8 @@ export const threadAnswerTool: ToolDef = {
   },
   confirmSay: (args) =>
     args.grant
-      ? "Разрешить агенту действие? Скажи «разрешаю» или «отмена»."
-      : `Ответить агенту: «${String(args.answer ?? "")}». Скажи «да» или «отмена».`,
+      ? "Разрешить агенту действие?"
+      : `Ответить агенту: «${brief(args.answer)}»?`,
   async execute(args, ctx) {
     const threadId = ctx.targetThreadId;
     if (!threadId) {
@@ -1463,7 +1472,7 @@ export const brainTaskTool: ToolDef = {
   cls: "C",
   word: "да",
   description: "Поставить задачу с изменениями (файлы, код, коммит, команды) мозговому центру в отдельном worktree. Требует подтверждения владельца «да».",
-  confirmSay: (args) => `Поставить задачу мозговому центру: «${args.task}»? Скажи «да» или «отмена».`,
+  confirmSay: (args) => `Задача мозговому центру: «${brief(args.task)}»?`,
   parameters: {
     type: "object",
     properties: {
@@ -1576,7 +1585,10 @@ export async function runToolCall(
   }
   const say = def.confirmSay ? def.confirmSay(args) : `${def.description} Подтвердите.`;
   const cls = (def.name === "answer_interaction" || def.name === "thread_answer") && args.grant ? "P" : def.cls;
-  const req = ctx.gate.request(def.name, args, cls, say);
+  // Вслух — короткий вопрос, на карточке — полный текст, который уйдёт.
+  const full = ["text", "answer", "task", "body"].map((k) => args[k]).find((v) => typeof v === "string" && v.trim());
+  const card = typeof full === "string" && brief(full) !== full.trim() ? `${say}\n«${full.trim()}»` : say;
+  const req = ctx.gate.request(def.name, args, cls, say, card);
   if ("rejected" in req) {
     return { result: { ok: false, error: { code: req.rejected, message: req.message } }, executed: false };
   }

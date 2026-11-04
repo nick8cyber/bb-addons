@@ -22,6 +22,8 @@ export const CONFIRM_TTL_MS = 60_000;
 export const WINDOW_PADDING_MS = 300;
 export const WINDOW_SERVER_SLACK_MS = 1000;
 export const UTTERANCE_SILENCE_MS = 700;
+/** Перебивание вопроса подтверждения: реплика раньше этого срока от запроса — хвост просьбы, не ответ. */
+export const BARGE_IN_MIN_MS = 1500;
 export const TRANSCRIPT_WAIT_MS = 3000;
 export const MAX_UTTERANCE_WORDS = 6;
 /** Окно дедупликации записи по argsHash после вердикта (спека §7.1 п. 1). */

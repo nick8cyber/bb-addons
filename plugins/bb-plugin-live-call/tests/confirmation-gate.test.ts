@@ -81,15 +81,67 @@ describe("request: pending, повторы и дедупликация", () => {
 });
 
 describe("шлюз микрофона и окно ответа (§7.1 п. 3)", () => {
-  it("микрофон закрыт с момента pending и до открытия окна", () => {
+  it("микрофон открыт и во время вопроса — его можно перебить (решение владельца 04.11)", () => {
     const t = fakeClock();
     const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
-    expect(gate.isMicOpen()).toBe(true);
     gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
-    expect(gate.isMicOpen()).toBe(false);
+    expect(gate.isMicOpen()).toBe(true);
+    expect(gate.windowOpen()).toBe(false);
     openWindow(gate, t);
     expect(gate.isMicOpen()).toBe(true);
     expect(gate.windowOpen()).toBe(true);
+  });
+
+  describe("перебивание вопроса", () => {
+    const setup = (cls: "C" | "L" = "C", say = "Отправить в тред: «Уведомления о сбоях куратору»?") => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.request("thread_send", { text: "Уведомления о сбоях куратору" }, cls, say);
+      gate.onModelAudio(1, 48000 * 5, t.now); // вопрос звучит 5 с, окно не открыто
+      const sayNow = (text: string, afterMs: number) => {
+        t.advance(afterMs);
+        gate.onOwnerTranscriptChunk(text, t.now);
+        t.advance(800);
+      };
+      return { t, gate, verdicts, sayNow };
+    };
+
+    it("«да» посреди вопроса засчитывается сразу", () => {
+      const { gate, verdicts, sayNow } = setup();
+      sayNow("Да.", 2000);
+      expect(verdicts).toEqual(["approved"]);
+      expect(gate.windowOpen()).toBe(false);
+    });
+
+    it("эхо вопроса из динамиков не решает ничего", () => {
+      const { gate, verdicts, sayNow } = setup();
+      sayNow("уведомления о сбоях", 2000);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
+    it("отказ и шум во время вопроса не отменяют — отказ после вопроса или кнопкой", () => {
+      const { gate, verdicts, sayNow } = setup();
+      sayNow("отмена", 2000);
+      sayNow("ну что там такое вообще происходит", 1000);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
+    it("«да» раньше 1,5 с от запроса — хвост просьбы владельца, не ответ", () => {
+      const { verdicts, sayNow } = setup();
+      sayNow("да", 500);
+      expect(verdicts).toEqual([]);
+    });
+
+    it("запуск (L): перебить можно только «запускай», одно «да» не запускает", () => {
+      const { verdicts, sayNow } = setup("L", "Запустить агента в «A»: «x»?");
+      sayNow("да", 2000);
+      expect(verdicts).toEqual([]);
+      sayNow("запускай", 1000);
+      expect(verdicts).toEqual(["approved"]);
+    });
   });
 
   it("окно не открывается по turnComplete без playback_drained", () => {

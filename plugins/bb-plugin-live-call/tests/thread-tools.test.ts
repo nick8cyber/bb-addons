@@ -323,7 +323,8 @@ describe("инструменты звонка по треду (контракт 
 
     it("разрешение действия: grant=true классифицируется как P («разрешаю»)", async () => {
       const tool = toolByName("thread_answer", "thr_target")!;
-      expect(tool.confirmSay?.({ grant: true })).toContain("«разрешаю»");
+      // Вопрос вслух короткий, без «Скажи … или «отмена»» (решение владельца 04.11); слово — на карточке.
+      expect(tool.confirmSay?.({ grant: true })).toBe("Разрешить агенту действие?");
 
       let resolvedPayload: unknown = null;
       const fakeSdk = {
@@ -352,7 +353,7 @@ describe("инструменты звонка по треду (контракт 
 
       // runToolCall с grant: true передает класс P в gate.request
       await runToolCall(tool, { grant: true }, "call_1", ctx as never);
-      expect(gate.request).toHaveBeenCalledWith("thread_answer", { grant: true }, "P", expect.any(String));
+      expect(gate.request).toHaveBeenCalledWith("thread_answer", { grant: true }, "P", expect.any(String), expect.any(String));
 
       // При исполнении вызывает resolve
       const res = (await tool.execute({ grant: true }, ctx as never)) as { ok: true };
@@ -608,5 +609,18 @@ describe("инструменты звонка по треду (контракт 
       expect(eventContainsText({ data: { text: "прямой текст" } }, "прямой текст")).toBe(true);
       expect(eventContainsText({ data: { message: "произвольное сообщение" } }, "сообщение")).toBe(true);
     });
+  });
+});
+
+describe("вопрос подтверждения короткий, полный текст — на карточке (решение владельца 04.11)", () => {
+  it("вслух первые 8 слов без «Скажи … или «отмена»», карточка — весь текст", async () => {
+    const tool = toolByName("thread_send", "thr_target")!;
+    const text = "Пожалуйста, исследуй раздельные лимиты для моделей семейств OpenRouter и NVIDIA в OpenCode";
+    const say = tool.confirmSay!({ text });
+    expect(say).toBe("Отправить в тред: «Пожалуйста, исследуй раздельные лимиты для моделей семейств OpenRouter…»?");
+    expect(say).not.toContain("Скажи");
+    const request = vi.fn(() => ({ pending: { confirmationId: "cf_1", argsHash: "h", verdict: null } }));
+    await runToolCall(tool, { text }, "call_1", { gate: { request }, reportAction: vi.fn() } as never);
+    expect(request).toHaveBeenCalledWith("thread_send", { text }, "C", say, `${say}\n«${text}»`);
   });
 });

@@ -12,12 +12,13 @@ import {
   ARGS_HASH_DEDUP_MS,
   BYTES_PER_SECOND_24K,
   CONFIRM_TTL_MS,
+  BARGE_IN_MIN_MS,
   TRANSCRIPT_WAIT_MS,
   UTTERANCE_SILENCE_MS,
   WINDOW_PADDING_MS,
   WINDOW_SERVER_SLACK_MS,
 } from "./contract.js";
-import { classify, type ConfirmClass, type ConfirmWords, type Verdict } from "./classify.js";
+import { classify, normalizeUtterance, type ConfirmClass, type ConfirmWords, type Verdict } from "./classify.js";
 
 export interface PendingConfirmation {
   confirmationId: string;
@@ -25,6 +26,8 @@ export interface PendingConfirmation {
   argsHash: string;
   class: ConfirmClass;
   say: string;
+  /** Полный текст для карточки; вслух — короткий say. */
+  card?: string;
   createdAt: number;
   expiresAt: number;
   /** Вердикт владельца; до него null. */
@@ -91,6 +94,8 @@ export class ConfirmationGate {
   private windowTimer: unknown = null;
   private currentUtterance: Utterance | null = null;
   private utteranceTimer: unknown = null;
+  private bargeUtterance: Utterance | null = null;
+  private bargeTimer: unknown = null;
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
   private usedIds = new Set<string>();
   private confirmWaiters = new Map<string, Array<{ resolve: (v: Verdict) => void; timer: unknown }>>();
@@ -110,7 +115,7 @@ export class ConfirmationGate {
    * возвращает ту же запись; другой вызов записи отклоняется до вердикта;
    * тот же argsHash в течение 5 мин после вердикта — «уже выполнено» / «отменено».
    */
-  request(tool: string, args: Record<string, unknown>, cls: ConfirmClass, say: string): RequestResult {
+  request(tool: string, args: Record<string, unknown>, cls: ConfirmClass, say: string, card?: string): RequestResult {
     const hash = argsHash(tool, args);
     const recent = this.recentVerdicts.get(hash);
     if (recent && this.clock.now() - recent.at < ARGS_HASH_DEDUP_MS) {
@@ -130,13 +135,17 @@ export class ConfirmationGate {
       argsHash: hash,
       class: cls,
       say,
+      card,
       createdAt: now,
       expiresAt: now + CONFIRM_TTL_MS,
       verdict: null,
     };
-    // Шлюз микрофона закрывается до окончания вопроса (спека §7.1 п. 3.1).
+    // Микрофон во время вопроса открыт: владелец может перебить вопрос словом
+    // подтверждения (решение владельца 04.11, спека §7.1 п. 3.1). Защита от эха —
+    // в onOwnerTranscriptChunk: до открытия окна засчитывается только согласие,
+    // не раньше BARGE_IN_MIN_MS и не совпадающее со словами самого вопроса.
     this.resetWindow();
-    this.micOpen = false;
+    this.micOpen = true;
     this.events.onConfirmationUpdate?.(this.pending, "asking");
     return { pending: this.pending };
   }
@@ -202,7 +211,11 @@ export class ConfirmationGate {
    * Реплика завершается по 700 мс тишины — тогда classify.
    */
   onOwnerTranscriptChunk(text: string, at = this.clock.now()) {
-    if (!this.pending || this.windowOpenAt === null || at < this.windowOpenAt) return;
+    if (!this.pending) return;
+    if (this.windowOpenAt === null || at < this.windowOpenAt) {
+      this.onBargeInChunk(text, at);
+      return;
+    }
     if (!this.currentUtterance) {
       this.currentUtterance = { firstChunkAt: at, lastChunkAt: at, text };
     } else {
@@ -211,6 +224,42 @@ export class ConfirmationGate {
     }
     if (this.utteranceTimer !== null) this.clock.clearTimeout(this.utteranceTimer);
     this.utteranceTimer = this.clock.setTimeout(() => this.finalizeUtterance(), UTTERANCE_SILENCE_MS);
+  }
+
+  /**
+   * Перебивание вопроса (окно ещё не открыто). Засчитывается только согласие:
+   * отказ, шум и длинные фразы здесь ничего не решают — иначе эхо вопроса из
+   * динамиков отменяло бы действие. Отказ — после вопроса или кнопкой.
+   */
+  private onBargeInChunk(text: string, at: number) {
+    const p = this.pending;
+    if (!p || p.verdict !== null) return;
+    if (!this.bargeUtterance) {
+      // Хвост реплики-просьбы владельца, пришедший после вызова, — не ответ.
+      if (at - p.createdAt < BARGE_IN_MIN_MS) return;
+      this.bargeUtterance = { firstChunkAt: at, lastChunkAt: at, text };
+    } else {
+      this.bargeUtterance.text += text;
+      this.bargeUtterance.lastChunkAt = at;
+    }
+    if (this.bargeTimer !== null) this.clock.clearTimeout(this.bargeTimer);
+    this.bargeTimer = this.clock.setTimeout(() => this.finalizeBargeIn(), UTTERANCE_SILENCE_MS);
+  }
+
+  private finalizeBargeIn() {
+    this.bargeTimer = null;
+    const u = this.bargeUtterance;
+    this.bargeUtterance = null;
+    const p = this.pending;
+    if (!u || !p || p.verdict !== null) return;
+    // Эхо: все слова реплики есть в самом вопросе — это голос агента из динамиков.
+    const sayWords = new Set(normalizeUtterance(`${p.say} ${p.card ?? ""}`));
+    const words = normalizeUtterance(u.text);
+    if (words.length === 0 || words.every((w) => sayWords.has(w))) return;
+    if (classify(u.text, p.class, this.words) !== "approved") return;
+    p.verdict = "approved";
+    this.micOpen = true;
+    this.events.onVerdict?.(p, "approved");
   }
 
   /** Явный конец реплики от транспорта (VAD), не ждём 700 мс. */
@@ -349,6 +398,11 @@ export class ConfirmationGate {
     if (this.utteranceTimer !== null) {
       this.clock.clearTimeout(this.utteranceTimer);
       this.utteranceTimer = null;
+    }
+    this.bargeUtterance = null;
+    if (this.bargeTimer !== null) {
+      this.clock.clearTimeout(this.bargeTimer);
+      this.bargeTimer = null;
     }
     if (this.windowTimer !== null) {
       this.clock.clearTimeout(this.windowTimer);
