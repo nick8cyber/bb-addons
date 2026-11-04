@@ -44,7 +44,10 @@ rl.on("line", (line) => {
           description: "Получить диагностическую информацию о тестовом сервисе",
           inputSchema: {
             type: "object",
-            properties: {},
+            properties: {
+              long: { type: "boolean", description: "длинный вывод" },
+              secret_echo: { type: "string", description: "эхо секрета" },
+            },
           },
         },
         {
@@ -86,8 +89,15 @@ rl.on("line", (line) => {
     const toolName = params?.name;
     const args = params?.arguments ?? {};
     if (toolName === "get_info") {
+      let text = "test-connector status: OK, items: 3";
+      if (args.secret_echo) {
+        text += ` secret=${args.secret_echo}`;
+      }
+      if (args.long) {
+        text += " " + "Diagnostic info data. ".repeat(60);
+      }
       sendResult(id, {
-        content: [{ type: "text", text: "test-connector status: OK, items: 3" }],
+        content: [{ type: "text", text }],
         isError: false,
       });
     } else if (toolName === "set_status") {

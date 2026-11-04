@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { CallSession, makePreviewKey } from "../src/call-session.js";
 import { CallStore } from "../src/call-store.js";
 import { ConfirmationGate } from "../src/confirmation-gate.js";
-import type { ServerFrame } from "../src/contract.js";
+import type { ServerFrame, ToolResult } from "../src/contract.js";
 import { McpClient, extractConfirmToken } from "../src/mcp-client.js";
 import {
   ProjectRegistryManager,
@@ -784,7 +784,7 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
     };
 
     await (session as any).handleNativeCalls(fakeClient as any, [
-      { id: "call_r_get_info", name: "test__get_info", args: {} },
+      { id: "call_r_get_info", name: "test__get_info", args: { long: true, secret_echo: SECRET } },
     ]);
 
     expect(toolResponse).toBeDefined();
@@ -794,6 +794,9 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
     expect(toolResponse.raw).toBeUndefined();
     expect(toolResponse.rawText).toBeUndefined();
     expect(toolResponse.data.result.length).toBeLessThanOrEqual(500);
+    expect(toolResponse.data.result).not.toContain(SECRET);
+    expect(toolResponse.data.result).toContain("***");
+    expect(toolResponse.data.result.endsWith("…")).toBe(true);
 
     await session.end("owner");
   });
@@ -1122,6 +1125,210 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
     // Текст превью обрезан до 500
     expect(previewResponse.data.result.length).toBeLessThanOrEqual(500);
     expect(previewResponse.data.result.endsWith("…")).toBe(true);
+
+    await session.end("owner");
+  });
+
+  it("Дефект 1: завершение звонка во время вызова, который возвращает/повторяет токен — в журнале значения токена быть не должно", async () => {
+    const frames: any[] = [];
+    const events: any[] = [];
+    const session = new CallSession({
+      callId: "call_inflight_end_leak",
+      keys: ["k1"],
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      thinkingLevel: "LOW",
+      mode: "normal",
+      routerInput: "text",
+      maxCallMinutes: 60,
+      store: {
+        event: (_id: string, kind: string, payload: unknown) => {
+          events.push({ kind, payload });
+        },
+        endCall: () => {},
+      } as any,
+      sdk: {} as never,
+      toBrowser: (f: any) => {
+        frames.push(f);
+      },
+      sendBrowserAudio: () => {},
+      spawnCallThread: async () => null,
+      advanceCallThread: async () => {},
+      sayCallThread: async () => {},
+      endCallThread: async () => {},
+      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+    });
+
+    const token = "review-token-synthetic-inflight-12345";
+    const twoStepDef: ToolDef = {
+      name: "test__write",
+      word: "записать",
+      cls: "C",
+      twoStep: true,
+      description: "write something",
+      parameters: {},
+      confirmSay: () => "write: title=sample?",
+      execute: async () => ({
+        ok: true,
+        data: { result: "preview" },
+        confirm_token: token,
+        previewText: "preview " + token,
+      }),
+    };
+
+    let finishRead: (v: ToolResult) => void = () => {};
+    const readDef: ToolDef = {
+      name: "test__read",
+      word: "прочитать",
+      cls: "R",
+      description: "read something",
+      parameters: {},
+      execute: () =>
+        new Promise<ToolResult>((resolve) => {
+          finishRead = resolve;
+        }),
+    };
+
+    (session as any).projectConnectorTools = [twoStepDef, readDef];
+    const ctx = (session as any).toolContext();
+
+    // 1. Модель делает превью двухшаговой ручки -> токен попадает в knownTokens
+    await runToolCall(twoStepDef, { title: "sample" }, "call_prev", ctx);
+    expect((session as any).knownTokens.has(token)).toBe(true);
+
+    // 2. Запускаем R-вызов, который подвисает
+    const inflightPromise = (session as any).handleNativeCalls(
+      { sendToolResponse() {} } as any,
+      [{ id: "call_read_1", name: readDef.name, args: {} }],
+    );
+
+    // 3. Завершаем звонок со стороны владельца
+    await session.end("owner");
+
+    // 4. Подвисший вызов завершается ошибкой, содержащей токен
+    finishRead({
+      ok: false,
+      error: { code: "connector_error", message: "server echoed " + token },
+    });
+    await inflightPromise;
+
+    // 5. Проверяем, что точное значение токена нигде не утекло: ни в событиях store, ни в кадрах браузера
+    const leakedEvent = events.find((e) => JSON.stringify(e).includes(token));
+    expect(leakedEvent).toBeUndefined();
+
+    const leakedFrame = frames.find((f) => JSON.stringify(f).includes(token));
+    expect(leakedFrame).toBeUndefined();
+  });
+
+  it("Дефект 2: естественный expired удаляет превью; повтор с confirm:true после expired и после dedup отклоняется как invalid_argument без needsConfirmation", async () => {
+    const frames: any[] = [];
+    const events: any[] = [];
+    const session = new CallSession({
+      callId: "call_expired_preview_delete",
+      keys: ["k1"],
+      voice: "Algenib",
+      languageCode: "ru-RU",
+      thinkingLevel: "LOW",
+      mode: "normal",
+      routerInput: "text",
+      maxCallMinutes: 60,
+      store: {
+        event: (_id: string, kind: string, payload: unknown) => {
+          events.push({ kind, payload });
+        },
+        endCall: () => {},
+      } as any,
+      sdk: {} as never,
+      toBrowser: (f: any) => {
+        frames.push(f);
+      },
+      sendBrowserAudio: () => {},
+      spawnCallThread: async () => null,
+      advanceCallThread: async () => {},
+      sayCallThread: async () => {},
+      endCallThread: async () => {},
+      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+    });
+
+    const token = "review-token-synthetic-expired-99999";
+    const writeDef: ToolDef = {
+      name: "test__write",
+      word: "записать",
+      cls: "C",
+      twoStep: true,
+      description: "write something",
+      parameters: {},
+      confirmSay: () => "write: title=sample?",
+      execute: async () => ({
+        ok: true,
+        data: { result: "preview" },
+        confirm_token: token,
+        previewText: "preview " + token,
+      }),
+    };
+
+    (session as any).projectConnectorTools = [writeDef];
+    const ctx = (session as any).toolContext();
+
+    // 1. Превью двухшаговой ручки
+    await runToolCall(writeDef, { title: "sample" }, "call_prev", ctx);
+    expect(session.getTwoStepPreview(writeDef.name, token)).toBeDefined();
+
+    // 2. Запрос подтверждения
+    const confResult = await runToolCall(
+      writeDef,
+      { title: "sample", confirm: true, confirm_token: token },
+      "call_conf",
+      ctx,
+    );
+    expect(confResult.result.ok).toBe(false);
+    expect((confResult.result as any).needsConfirmation).toBeDefined();
+
+    const pending = session.pendingConfirmation();
+    expect(pending).not.toBeNull();
+
+    // 3. Естественное истечение времени: переводим часы на expiresAt + 1 и вызываем gate.tick()
+    const originalNow = Date.now;
+    try {
+      let now = pending!.expiresAt + 1;
+      Date.now = () => now;
+
+      (session as any).gate.tick();
+
+      // Pending должен очиститься
+      expect(session.pendingConfirmation()).toBeNull();
+      // Превью должно быть удалено из session.twoStepPreviews!
+      expect(session.getTwoStepPreview(writeDef.name, token)).toBeUndefined();
+
+      // Повтор сразу после истечения (в пределах 5-минутного окна dedup)
+      const retryImmediate = await runToolCall(
+        writeDef,
+        { title: "sample", confirm: true, confirm_token: token },
+        "call_retry_immediate",
+        ctx,
+      );
+      expect(retryImmediate.result.ok).toBe(false);
+      expect((retryImmediate.result as any).error?.code).toBe("invalid_argument");
+      expect((retryImmediate.result as any).error?.message).toContain("превью не найдено");
+      expect((retryImmediate.result as any).needsConfirmation).toBeUndefined();
+
+      // Переводим часы за пределы 5-минутного dedup окна
+      now += 5 * 60 * 1000 + 1;
+
+      // Повтор после окончания 5-минутного dedup окна
+      const retryAfterDedup = await runToolCall(
+        writeDef,
+        { title: "sample", confirm: true, confirm_token: token },
+        "call_retry_after_dedup",
+        ctx,
+      );
+      expect(retryAfterDedup.result.ok).toBe(false);
+      expect((retryAfterDedup.result as any).error?.code).toBe("invalid_argument");
+      expect((retryAfterDedup.result as any).error?.message).toContain("превью не найдено");
+      expect((retryAfterDedup.result as any).needsConfirmation).toBeUndefined();
+    } finally {
+      Date.now = originalNow;
+    }
 
     await session.end("owner");
   });

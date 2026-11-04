@@ -1102,6 +1102,7 @@ export class CallSession extends EventEmitter {
       }
       this.toolCallsThisTurn += 1;
       const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
+      if (this.ended) return;
       // Голосовая сессия должна отреагировать на результат: WHEN_IDLE (SILENT запрещает ответ).
       client.sendToolResponse(call.id, result, "WHEN_IDLE", call.name);
       if (!result.ok && "error" in result) {
@@ -1184,6 +1185,7 @@ export class CallSession extends EventEmitter {
       }
       seen.set(hash, true);
       const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
+      if (this.ended) return;
       if (result.ok) {
         client.sendToolResponse(call.id, result, "SILENT", call.name);
         this.enqueueSystem(def.name, result);
@@ -1349,9 +1351,17 @@ export class CallSession extends EventEmitter {
 
     if (verdict !== "approved") {
       // после approved/cancelled/expired запись удаляется: превью одноразовое (§14.10 п. 5)
-      if (isTwoStep && previewKey) {
-        this.twoStepPreviews.delete(previewKey);
+      if (isTwoStep) {
+        if (previewKey) {
+          this.twoStepPreviews.delete(previewKey);
+        }
+        for (const [k, v] of this.twoStepPreviews) {
+          if (v.tool === p.tool && (token ? v.token === token : true)) {
+            this.twoStepPreviews.delete(k);
+          }
+        }
       }
+      this.storedArgs.delete(p.argsHash);
       const message =
         verdict === "cancelled"
           ? "владелец отменил действие"
@@ -1389,7 +1399,13 @@ export class CallSession extends EventEmitter {
         return;
       }
       // после approved/cancelled/expired запись удаляется: превью одноразовое (§14.10 п. 5)
-      this.twoStepPreviews.delete(previewKey);
+      if (previewKey) this.twoStepPreviews.delete(previewKey);
+      for (const [k, v] of this.twoStepPreviews) {
+        if (v.tool === p.tool && (token ? v.token === token : true)) {
+          this.twoStepPreviews.delete(k);
+        }
+      }
+      this.storedArgs.delete(p.argsHash);
     }
 
     try {
@@ -1725,7 +1741,6 @@ export class CallSession extends EventEmitter {
     if (this.ended) return;
     this.ended = true;
     this.twoStepPreviews.clear();
-    this.knownTokens.clear();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
