@@ -66,6 +66,8 @@ export interface CallSessionDeps {
   storageDir?: string;
   /** Проект «Звонки» — сюда идёт мозговой центр для не-git треда (служебная папка плагина). */
   callsProjectId?: string;
+  /** Аккаунты GitHub владельца: репозиторий с origin другого аккаунта — мозговой центр только читает. */
+  ownGitAccounts?: string[];
   log?: { info(s: string): void; warn(s: string): void; error(s: string): void };
 }
 
@@ -245,9 +247,9 @@ export class CallSession extends EventEmitter {
             /* окружение недоступно — мозговой центр не получит worktree и не запустится */
           }
         }
+        const envPath = typeof envObj.path === "string" ? envObj.path : "";
         // BB запоминает «не git» на момент создания окружения: после `git init` в папке проекта
         // флаг остаётся false. Проверяем саму папку (тот же хост) — тогда мозговой центр получит worktree.
-        const envPath = typeof envObj.path === "string" ? envObj.path : "";
         if (!envObj.isGitRepo && envPath) {
           const { existsSync } = await import("node:fs");
           const { join: pjoin } = await import("node:path");
@@ -262,6 +264,19 @@ export class CallSession extends EventEmitter {
                 /* ветку не узнали — worktree от ветки по умолчанию */
               }
             }
+          }
+        }
+        // Владелец 04.11: в чужие репозитории (origin не его аккаунта) не пушить и не менять без его слова —
+        // мозговой центр там только читает (brain_task → changes_unavailable).
+        if (envPath && envObj.isGitRepo) {
+          try {
+            const { execFileSync } = await import("node:child_process");
+            const url = execFileSync("git", ["-C", envPath, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 3000 }).trim();
+            const owner = /github\.com[:/]([^/]+)\//i.exec(url)?.[1]?.toLowerCase();
+            const own = (this.deps.ownGitAccounts ?? []).map((x) => x.toLowerCase());
+            if (owner && own.length > 0 && !own.includes(owner)) envObj = { ...envObj, foreignRemote: true };
+          } catch {
+            /* нет origin — репозиторий свой локальный */
           }
         }
         let projectTitle: string | undefined = undefined;
@@ -327,6 +342,7 @@ export class CallSession extends EventEmitter {
         targetBranchName: envObj.branchName ? String(envObj.branchName) : undefined,
         isGitRepo: Boolean(envObj.isGitRepo),
         fallbackProjectId: this.deps.callsProjectId,
+        allowModify: !envObj.foreignRemote,
         allMessages: this.threadMessages,
         storageDir: this.deps.storageDir ?? join(tmpdir(), "bb-live-call-brain"),
         log: this.deps.log,

@@ -21,6 +21,8 @@ export interface BrainCenterOptions {
   targetHostId?: string;
   /** Проект «Звонки»: сюда идёт мозговой центр, если тред не в git (BB не даёт пустую папку вне личного проекта). */
   fallbackProjectId?: string;
+  /** false — изменения запрещены (чужой репозиторий, владелец 04.11). */
+  allowModify?: boolean;
   targetBranchName?: string;
   isGitRepo?: boolean;
   allMessages: ThreadMessage[];
@@ -106,7 +108,7 @@ ${historyFile}
         this.opts.store.event(this.opts.callId, "brain_failed", { error: String(e).slice(0, 300) });
         return null;
       }
-      this.canModify = Boolean(this.opts.isGitRepo);
+      this.canModify = Boolean(this.opts.isGitRepo) && this.opts.allowModify !== false;
 
       this.threadId = String(spawned.id);
       this.opts.store.event(this.opts.callId, "brain_started", { threadId: this.threadId });

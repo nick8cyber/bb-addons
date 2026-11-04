@@ -109,6 +109,7 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Вход маршрутизатора",
       description: "text — реплика из транскрипта VOICE (вариант А), audio — то же аудио в обе сессии (вариант Б). Замер — Ф0(д).",
     },
+    ownGitAccounts: { type: "string", label: "Мои аккаунты GitHub", description: "Через запятую. Репозиторий с origin другого аккаунта — мозговой центр только читает, без изменений (по умолчанию nick8cyber)." },
     callsProjectId: { type: "string", label: "Проект «Звонки»", description: "Оставь пустым: плагин создаст проект сам при первом звонке." },
     callsWorkspacePath: { type: "string", label: "Папка проекта «Звонки»", description: "Пустая папка на основном хосте, код в ней не живёт." },
     projectCalls: {
@@ -324,6 +325,7 @@ export default async function plugin(bb: BbPluginApi) {
       routerInput: str(cfg.routerInput, "text") === "audio" ? "audio" : "text",
       maxCallMinutes: Math.min(120, Math.max(5, num(cfg.maxCallMinutes, 60))),
       callsProjectId: str(cfg.callsProjectId, "") || undefined,
+      ownGitAccounts: str(cfg.ownGitAccounts, "nick8cyber").split(/[\s,]+/).filter(Boolean),
       store,
       sdk: bb.sdk,
       targetThreadId,

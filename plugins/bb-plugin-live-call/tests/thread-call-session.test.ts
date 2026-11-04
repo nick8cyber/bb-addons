@@ -380,3 +380,36 @@ describe("git после создания окружения (git init, 03.11)",
     await s.end("owner");
   });
 });
+
+describe("чужой репозиторий — мозговой центр только читает (владелец 04.11)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  const repoWithOrigin = async (url: string) => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { execFileSync } = await import("node:child_process");
+    const dir = mkdtempSync(join(tmpdir(), "lc-remote-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "remote", "add", "origin", url]);
+    return dir;
+  };
+
+  it.each([
+    ["https://github.com/someone-else/repo", false],
+    ["https://github.com/me-owner/repo", true],
+  ])("origin %s → canModify=%s", async (url, expected) => {
+    const dir = await repoWithOrigin(url);
+    const spawned: Array<Record<string, unknown>> = [];
+    const { s } = makeThreadCall("thr_target_remote", { id: "env_test", isGitRepo: true, path: dir }, spawned);
+    (s as unknown as { deps: { ownGitAccounts?: string[] } }).deps.ownGitAccounts = ["me-owner"];
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(s.brain?.canModify).toBe(expected);
+    await s.end("owner");
+  });
+});
