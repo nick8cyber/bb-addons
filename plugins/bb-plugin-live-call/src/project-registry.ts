@@ -31,6 +31,10 @@ export const connectorConfigSchema = z
     tools: z.record(z.string(), toolClassSchema).optional(),
     defaultClass: defaultClassSchema,
     maxResultChars: z.number().int().min(500).max(20000).optional(),
+    twoStep: z
+      .array(z.string())
+      .transform((arr) => Array.from(new Set(arr)).sort())
+      .optional(),
   })
   .superRefine((data, ctx) => {
     if (data.transport === "stdio") {
@@ -76,6 +80,24 @@ export const connectorConfigSchema = z
         }
       }
     }
+    if (data.twoStep) {
+      for (let i = 0; i < data.twoStep.length; i++) {
+        const toolName = data.twoStep[i];
+        if (!data.tools || !Object.hasOwn(data.tools, toolName)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `двухшаговая ручка «${toolName}» из twoStep отсутствует в tools коннектора «${data.id}»`,
+            path: ["twoStep", i],
+          });
+        } else if (data.tools[toolName] === "R") {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `двухшаговая ручка «${toolName}» коннектора «${data.id}» не может иметь класс R`,
+            path: ["twoStep", i],
+          });
+        }
+      }
+    }
   });
 
 export type ConnectorConfig = z.infer<typeof connectorConfigSchema>;
@@ -117,17 +139,38 @@ export interface ProjectListItem {
 export function canonicalizeJson(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(canonicalizeJson);
   if (v && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
     const res: Record<string, unknown> = {};
-    for (const k of Object.keys(v as Record<string, unknown>).sort()) {
-      res[k] = canonicalizeJson((v as Record<string, unknown>)[k]);
+    for (const k of Object.keys(obj).sort()) {
+      res[k] = canonicalizeJson(obj[k]);
     }
     return res;
   }
   return v;
 }
 
+function normalizeProjectConfigTwoStep(cfg: unknown): unknown {
+  if (!cfg || typeof cfg !== "object") return cfg;
+  const obj = cfg as Record<string, unknown>;
+  if (Array.isArray(obj.connectors)) {
+    const connectors = obj.connectors.map((c) => {
+      if (c && typeof c === "object") {
+        const connObj = { ...(c as Record<string, unknown>) };
+        if (Array.isArray(connObj.twoStep)) {
+          connObj.twoStep = Array.from(new Set(connObj.twoStep.map(String))).sort();
+        }
+        return connObj;
+      }
+      return c;
+    });
+    return { ...obj, connectors };
+  }
+  return cfg;
+}
+
 export function hashProjectConfig(cfg: unknown): string {
-  return createHash("sha256").update(JSON.stringify(canonicalizeJson(cfg))).digest("hex");
+  const normalized = normalizeProjectConfigTwoStep(cfg);
+  return createHash("sha256").update(JSON.stringify(canonicalizeJson(normalized))).digest("hex");
 }
 
 /** Сравнение старой подтверждённой конфигурации и новой (§15.2, §16.7 п. 7). */
@@ -135,10 +178,11 @@ export function computeProjectDiff(oldConfig: ProjectConfig | null, newConfig: P
   const diffs: string[] = [];
   if (!oldConfig) {
     const connDetails = newConfig.connectors.map((c) => {
+      const twoStepList = c.twoStep && c.twoStep.length > 0 ? `, двухшаговые ручки [${Array.from(new Set(c.twoStep)).sort().join(", ")}]` : "";
       if (c.transport === "stdio") {
-        return `${c.id} (stdio: [${(c.command ?? []).join(" ")}])`;
+        return `${c.id} (stdio: [${(c.command ?? []).join(" ")}]${twoStepList})`;
       }
-      return `${c.id} (http: ${maskSecrets(c.url ?? "-")})`;
+      return `${c.id} (http: ${maskSecrets(c.url ?? "-")}${twoStepList})`;
     });
     diffs.push(`новый проект в реестре: коннекторы [${connDetails.join(", ")}]`);
     return diffs;
@@ -153,7 +197,8 @@ export function computeProjectDiff(oldConfig: ProjectConfig | null, newConfig: P
 
   for (const [id, c] of newMap) {
     if (!oldMap.has(id)) {
-      const details = c.transport === "stdio" ? `stdio: [${(c.command ?? []).join(" ")}]` : `http: ${maskSecrets(c.url ?? "-")}`;
+      const twoStepList = c.twoStep && c.twoStep.length > 0 ? `, двухшаговые ручки [${Array.from(new Set(c.twoStep)).sort().join(", ")}]` : "";
+      const details = c.transport === "stdio" ? `stdio: [${(c.command ?? []).join(" ")}]${twoStepList}` : `http: ${maskSecrets(c.url ?? "-")}${twoStepList}`;
       diffs.push(`добавлен коннектор «${id}» (${details})`);
       continue;
     }
@@ -177,6 +222,11 @@ export function computeProjectDiff(oldConfig: ProjectConfig | null, newConfig: P
     const newMax = c.maxResultChars ?? CONNECTOR_RESULT_MAX_CHARS_DEFAULT;
     if (oldMax !== newMax) {
       diffs.push(`коннектор «${id}»: изменён лимит ответа ${oldMax} → ${newMax}`);
+    }
+    const oldTwoStep = Array.from(new Set(oldC.twoStep ?? [])).sort();
+    const newTwoStep = Array.from(new Set(c.twoStep ?? [])).sort();
+    if (JSON.stringify(oldTwoStep) !== JSON.stringify(newTwoStep)) {
+      diffs.push(`коннектор «${id}»: двухшаговые ручки [${oldTwoStep.join(", ")}] → [${newTwoStep.join(", ")}]`);
     }
     const oldTools = oldC.tools as Record<string, ProjectToolClass> | undefined;
     const newTools = c.tools as Record<string, ProjectToolClass> | undefined;
@@ -316,7 +366,15 @@ export class ProjectRegistryManager {
       const msg = res.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
       return { parsed: null, rawObj: obj as Record<string, unknown>, error: `ошибка валидации projectCalls: ${msg}` };
     }
-    return { parsed: res.data as Record<string, ProjectConfig>, rawObj: obj as Record<string, unknown> };
+    const parsedData = res.data as Record<string, ProjectConfig>;
+    for (const proj of Object.values(parsedData)) {
+      for (const conn of proj.connectors) {
+        if (conn.twoStep) {
+          conn.twoStep = Array.from(new Set(conn.twoStep)).sort();
+        }
+      }
+    }
+    return { parsed: parsedData, rawObj: obj as Record<string, unknown> };
   }
 
   listProjects(rawJson?: string | null): ProjectListItem[] {

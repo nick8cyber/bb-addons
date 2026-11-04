@@ -9,6 +9,8 @@ import { TOOL_RESULT_MAX_CHARS, TOOL_TIMEOUT_MS, type Json, type ToolClass, type
 import { argsHash, type ConfirmationGate } from "./confirmation-gate.js";
 import type { ContextLedger } from "./context-ledger.js";
 import { fetchThreadMessages, formatMessageTime, type ThreadMessage } from "./thread-messages.js";
+import { canonicalizeJson } from "./project-registry.js";
+import { extractConfirmToken } from "./mcp-client.js";
 
 export interface ThreadBrief {
   id: string;
@@ -45,6 +47,19 @@ export interface ToolContext {
   isTargetThreadActive?: () => Promise<boolean>;
   /** Подписка на тред для EventBridge (§16.4). */
   watchThread?: (threadId: string) => void;
+  /** Хранилище превью двухшаговых ручек коннектора (§14.10 п. 4). */
+  savePreview?: (tool: string, token: string, args: Record<string, unknown>, previewText: string) => void;
+  getPreview?: (tool: string, token: string) => TwoStepPreviewEntry | undefined;
+  deletePreview?: (tool: string, token: string) => void;
+}
+
+export interface TwoStepPreviewEntry {
+  tool: string;
+  token: string;
+  argsCanonical: string;
+  args: Record<string, unknown>;
+  previewText: string;
+  createdAt: number;
 }
 
 export interface ToolDef {
@@ -63,7 +78,24 @@ export interface ToolDef {
   confirmSay?: (args: Record<string, unknown>) => string;
   /** Полный текст карточки подтверждения; нет — вопрос плюс полный текст сообщения/ответа/задачи. */
   confirmCard?: (args: Record<string, unknown>) => string;
-  execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
+  execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolExecutionResult>;
+  /** Двухшаговая ручка коннектора (§14.10): превью -> подтверждение. */
+  twoStep?: boolean;
+}
+
+export type ToolExecutionResult = ToolResult & {
+  previewText?: string;
+  confirm_token?: string;
+};
+
+export function stripConfirmKeys(args: Record<string, unknown>): Record<string, unknown> {
+  const res: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (k !== "confirm" && k !== "confirm_token") {
+      res[k] = v;
+    }
+  }
+  return res;
 }
 
 export function truncate(value: unknown): ToolResult {
@@ -1875,12 +1907,185 @@ export async function runToolCall(
   functionId: string | undefined,
   ctx: ToolContext,
 ): Promise<{ result: ToolResult; executed: boolean }> {
+  if (def.twoStep) {
+    const hasConfirm = "confirm" in args;
+    const confirmVal = args.confirm;
+
+    // Подтверждение только при confirm === true (строго true).
+    // Любое другое значение ("true", 1, …) — ok:false, code:"invalid_argument", до callTool не доходит.
+    if (hasConfirm && confirmVal !== false && confirmVal !== true) {
+      return {
+        result: {
+          ok: false,
+          error: {
+            code: "invalid_argument",
+            message: "поле confirm должно быть логическим (boolean)",
+          },
+        },
+        executed: false,
+      };
+    }
+
+    // 1. Превью — когда confirm отсутствует или false (§14.10 п. 3)
+    if (!hasConfirm || confirmVal === false) {
+      const cleanArgs = stripConfirmKeys(args);
+      try {
+        const res = await def.execute(cleanArgs, ctx);
+        if (!res.ok) {
+          return {
+            result: res,
+            executed: false,
+          };
+        }
+        const token = res.confirm_token ?? extractConfirmToken((res as any).raw ?? res.data);
+        if (!token) {
+          return {
+            result: {
+              ok: false,
+              error: {
+                code: "invalid_argument",
+                message: "подтверждение невозможно",
+              },
+            },
+            executed: false,
+          };
+        }
+        const previewText =
+          res.previewText ??
+          (res as any).maskedFullText ??
+          (res as any).rawText ??
+          (res.data && typeof res.data === "object" && "result" in res.data ? String((res.data as any).result) : JSON.stringify(res.data));
+        ctx.savePreview?.(def.name, token, cleanArgs, previewText);
+
+        const dataObj: Record<string, unknown> =
+          typeof res.data === "object" && res.data !== null ? { ...(res.data as Record<string, unknown>) } : { result: String(res.data) };
+        dataObj.confirm_token = token;
+
+        return {
+          result: {
+            ok: true,
+            data: dataObj as Json,
+          },
+          executed: true,
+        };
+      } catch (e) {
+        return {
+          result: {
+            ok: false,
+            error: {
+              code: "connector_error",
+              message: String((e as Error)?.message ?? e),
+            },
+          },
+          executed: false,
+        };
+      }
+    }
+
+    // 2. Подтверждение — только при confirm === true (строго true, §14.10 п. 5)
+    const token = typeof args.confirm_token === "string" ? args.confirm_token : "";
+    if (!token) {
+      return {
+        result: {
+          ok: false,
+          error: {
+            code: "invalid_argument",
+            message: "отсутствует confirm_token",
+          },
+        },
+        executed: false,
+      };
+    }
+
+    const entry = ctx.getPreview?.(def.name, token);
+    const TWO_STEP_TTL_MS = 10 * 60 * 1000;
+    if (!entry) {
+      return {
+        result: {
+          ok: false,
+          error: {
+            code: "invalid_argument",
+            message: "превью не найдено",
+          },
+        },
+        executed: false,
+      };
+    }
+
+    if (Date.now() - entry.createdAt > TWO_STEP_TTL_MS) {
+      ctx.deletePreview?.(def.name, token);
+      return {
+        result: {
+          ok: false,
+          error: {
+            code: "invalid_argument",
+            message: "превью старше 10 минут",
+          },
+        },
+        executed: false,
+      };
+    }
+
+    const callArgsClean = stripConfirmKeys(args);
+    const callArgsCanonical = JSON.stringify(canonicalizeJson(callArgsClean));
+    if (callArgsCanonical !== entry.argsCanonical) {
+      return {
+        result: {
+          ok: false,
+          error: {
+            code: "invalid_argument",
+            message: "аргументы не совпадают с сохранённым превью",
+          },
+        },
+        executed: false,
+      };
+    }
+
+    // Вслух — <ручка>: <аргументы превью>? (формат C-ручек §14.5, без confirm*)
+    const say = def.confirmSay ? def.confirmSay(callArgsClean) : `${def.name}?`;
+    // Карточка — текст превью целиком, точное значение токена в нём заменено на ***
+    const card = entry.previewText.replaceAll(token, "***");
+
+    const fullCallArgs = { ...callArgsClean, confirm: true, confirm_token: token };
+    const cls: "C" | "P" | "L" = def.cls === "P" || def.cls === "L" ? def.cls : "C";
+    const req = ctx.gate.request(def.name, fullCallArgs, cls, say, card);
+    if ("rejected" in req) {
+      return { result: { ok: false, error: { code: req.rejected, message: req.message } }, executed: false };
+    }
+    ctx.rememberArgs?.(req.pending.argsHash, fullCallArgs);
+    if (req.pending.verdict === "approved") {
+      return {
+        result: {
+          ok: false,
+          error: {
+            code: "already_running",
+            message: "владелец подтвердил, сервер уже выполняет действие — не вызывай повторно",
+          },
+        },
+        executed: false,
+      };
+    }
+    return {
+      result: {
+        ok: false,
+        needsConfirmation: {
+          confirmationId: req.pending.confirmationId,
+          say,
+        },
+      },
+      executed: false,
+    };
+  }
+
   if (def.cls === "R") {
     const actionId = ctx.newActionId?.(def.name);
     const label = readActionLabel(def.name, args);
     if (label) ctx.reportAction(def.name, "R", "running", label.running, undefined, actionId);
     try {
-      const result = await def.execute(args, ctx);
+      const rawRes = await def.execute(args, ctx);
+      const result: ToolResult = rawRes.ok
+        ? { ok: true, data: rawRes.data, ...(rawRes.truncated !== undefined ? { truncated: rawRes.truncated } : {}) }
+        : rawRes;
       if (label) {
         const threadId = result.ok ? threadIdOf(result.data) : undefined;
         const title = result.ok ? threadTitleOf(result.data) : undefined;

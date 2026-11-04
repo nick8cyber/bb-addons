@@ -17,18 +17,22 @@ import { ContextLedger } from "./context-ledger.js";
 import { KeyPool, QuotaExhaustedError } from "./key-pool.js";
 import { LiveClient } from "./live-client.js";
 import { EMPTY_CONTEXT, projectVoiceInstruction, routerInstruction, threadRouterInstruction, threadVoiceInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
-import { TOOLS, capabilityList, getProjectTools, nativeDeclarations, runToolCall, toolByName, type ToolDef } from "./tools.js";
+import { TOOLS, capabilityList, getProjectTools, nativeDeclarations, runToolCall, stripConfirmKeys, toolByName, type ToolDef, type TwoStepPreviewEntry } from "./tools.js";
 import type { ToolClass, ToolResult } from "./contract.js";
 import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
 import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
 import { BrainCenter } from "./brain-center.js";
-import { McpClient, isValidConnectorToolName, makeConnectorToolName, mcpSchemaToGeminiParameters, toGeminiSchema } from "./mcp-client.js";
-import { ProjectRegistryManager, readProjectRepoConfig, resolveStrictClass, type ProjectConfig } from "./project-registry.js";
+import { McpClient, extractConfirmToken, isValidConnectorToolName, makeConnectorToolName, mcpSchemaToGeminiParameters, toGeminiSchema } from "./mcp-client.js";
+import { canonicalizeJson, ProjectRegistryManager, readProjectRepoConfig, resolveStrictClass, type ProjectConfig } from "./project-registry.js";
 import { maskSecrets } from "./secret-filter.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+export function makePreviewKey(tool: string, token: string): string {
+  return `${tool}:${token}`;
+}
 
 export type CallState =
   | "connecting" | "listening" | "thinking" | "speaking" | "working" | "reconnecting" | "muted" | "ended";
@@ -86,6 +90,12 @@ export class CallSession extends EventEmitter {
   private connectorClients: McpClient[] = [];
   private projectConnectorTools: ToolDef[] = [];
   private failedConnectorIds: string[] = [];
+  private twoStepPreviews = new Map<string, TwoStepPreviewEntry>();
+  private knownTokens = new Set<string>();
+
+  getTwoStepPreview(tool: string, token: string): TwoStepPreviewEntry | undefined {
+    return this.twoStepPreviews.get(makePreviewKey(tool, token));
+  }
   private pendingRegistry: { projectId: string; title: string; hash: string; diff: string[] } | null = null;
   private threadMessages: ThreadMessage[] = [];
   private threadMeta: {
@@ -159,7 +169,7 @@ export class CallSession extends EventEmitter {
       const match = deps.pendingRegistryChanges.find((p) => p.projectId === this.targetProjectId);
       if (match) {
         this.pendingRegistry = match;
-        this.deps.store.event(this.deps.callId, "registry_changed", {
+        this.recordEvent( "registry_changed", {
           projectId: match.projectId,
           diff: match.diff,
         });
@@ -186,14 +196,47 @@ export class CallSession extends EventEmitter {
       undefined,
       {
         onConfirmationUpdate: (p, phase) => this.onConfirmationUpdate(p, phase),
-        onQuestionHeardAt: (p, at, offsetMs) => this.deps.store.event(this.deps.callId, "question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
+        onQuestionHeardAt: (p, at, offsetMs) => this.recordEvent( "question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
         onVerdict: (p, verdict) => void this.onVerdict(p, verdict),
       },
     );
   }
 
+  private sanitizeTokens(str: string): string {
+    let result = str;
+    for (const tok of this.knownTokens) {
+      if (tok && result.includes(tok)) {
+        result = result.replaceAll(tok, "***");
+      }
+    }
+    return result;
+  }
+
+  private sanitizeTokensInValue<T>(v: T): T {
+    if (typeof v === "string") {
+      return this.sanitizeTokens(v) as T;
+    }
+    if (Array.isArray(v)) {
+      return v.map((item) => this.sanitizeTokensInValue(item)) as T;
+    }
+    if (v && typeof v === "object") {
+      const res: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(v as Record<string, unknown>)) {
+        res[key] = this.sanitizeTokensInValue(val);
+      }
+      return res as T;
+    }
+    return v;
+  }
+
+  private recordEvent(kind: string, payload: Record<string, unknown>) {
+    const sanitized = this.sanitizeTokensInValue(payload) as Record<string, unknown>;
+    this.deps.store.event(this.deps.callId, kind, sanitized);
+  }
+
   private frame(f: ServerFrame) {
-    this.deps.toBrowser(f);
+    const sanitized = this.sanitizeTokensInValue(f) as ServerFrame;
+    this.deps.toBrowser(sanitized);
   }
 
   private setState(s: CallState, detail?: string) {
@@ -244,7 +287,7 @@ export class CallSession extends EventEmitter {
   async start() {
     if (this.targetThreadId) {
       this.deps.store.startCall(this.deps.callId);
-      this.deps.store.event(this.deps.callId, "call_started", { targetThreadId: this.targetThreadId });
+      this.recordEvent( "call_started", { targetThreadId: this.targetThreadId });
       this.nowUtc = new Date().toISOString();
       let envObj: Record<string, unknown> = {};
       let targetProjectId = "";
@@ -341,7 +384,7 @@ export class CallSession extends EventEmitter {
         lastAgentMessageIndex: lastAgentIndex,
       };
 
-      this.deps.store.event(this.deps.callId, "thread_context", {
+      this.recordEvent( "thread_context", {
         messages: formatted.messagesCount,
         skipped: formatted.skippedCount,
         chars: formatted.chars,
@@ -396,7 +439,7 @@ export class CallSession extends EventEmitter {
           const match = this.deps.pendingRegistryChanges.find((p) => p.projectId === targetProjectId);
           if (match) {
             this.pendingRegistry = match;
-            this.deps.store.event(this.deps.callId, "registry_changed", {
+            this.recordEvent( "registry_changed", {
               projectId: match.projectId,
               diff: match.diff,
             });
@@ -406,7 +449,7 @@ export class CallSession extends EventEmitter {
       }
     } else if (this.targetProjectId) {
       this.deps.store.startCall(this.deps.callId);
-      this.deps.store.event(this.deps.callId, "call_started", { projectId: this.targetProjectId });
+      this.recordEvent( "call_started", { projectId: this.targetProjectId });
       this.nowUtc = new Date().toISOString();
       await this.initProjectConnectors(this.targetProjectId);
     } else {
@@ -589,7 +632,7 @@ export class CallSession extends EventEmitter {
 
         this.failedConnectorIds.push(connCfg.id);
         connectorResults.push({ id: connCfg.id, tools: [], ok: false });
-        this.deps.store.event(this.deps.callId, "connector_start_failed", { id: connCfg.id, reason });
+        this.recordEvent( "connector_start_failed", { id: connCfg.id, reason });
         this.deps.log?.warn?.(`коннектор ${connCfg.id} недоступен: ${errStr}`);
         continue;
       }
@@ -602,7 +645,7 @@ export class CallSession extends EventEmitter {
         // Проверка имени (§14.3, review п. 7)
         const candidateName = makeConnectorToolName(connCfg.id, t.name);
         if (!isValidConnectorToolName(candidateName)) {
-          this.deps.store.event(this.deps.callId, "connector_tool_skipped", {
+          this.recordEvent( "connector_tool_skipped", {
             id: connCfg.id,
             tool: t.name,
             reason: "invalid_name",
@@ -610,7 +653,7 @@ export class CallSession extends EventEmitter {
           continue;
         }
         if (this.projectConnectorTools.some((x) => x.name === candidateName)) {
-          this.deps.store.event(this.deps.callId, "connector_tool_skipped", {
+          this.recordEvent( "connector_tool_skipped", {
             id: connCfg.id,
             tool: t.name,
             reason: "name_collision",
@@ -621,7 +664,7 @@ export class CallSession extends EventEmitter {
         // Проверка схемы параметров Gemini (§14.4, review п. 6)
         const geminiParams = toGeminiSchema(t.inputSchema);
         if (!geminiParams) {
-          this.deps.store.event(this.deps.callId, "connector_tool_skipped", {
+          this.recordEvent( "connector_tool_skipped", {
             id: connCfg.id,
             tool: t.name,
             reason: "schema_unsupported",
@@ -636,9 +679,11 @@ export class CallSession extends EventEmitter {
         if (strictCls === "deny") continue;
 
         toolNames.push(t.name);
+        const isTwoStep = Boolean(connCfg.twoStep && connCfg.twoStep.includes(t.name));
         const toolDef: ToolDef = {
           name: candidateName,
           cls: strictCls as ToolClass,
+          twoStep: isTwoStep,
           word: strictCls === "C" ? "да" : strictCls === "P" ? "разрешаю" : strictCls === "L" ? "запускай" : "",
           description: (t.description || `Ручка ${t.name} коннектора ${connCfg.id}`).slice(0, 1000),
           parameters: geminiParams,
@@ -666,7 +711,7 @@ export class CallSession extends EventEmitter {
             const startMs = Date.now();
             const res = await client.callTool(t.name, args, 30_000);
             const ms = Date.now() - startMs;
-            this.deps.store.event(this.deps.callId, "connector_call", {
+            this.recordEvent( "connector_call", {
               connector: connCfg.id,
               tool: t.name,
               cls: strictCls,
@@ -679,7 +724,20 @@ export class CallSession extends EventEmitter {
                 error: res.error ?? { code: "connector_error", message: "ошибка вызова коннектора" },
               };
             }
-            return { ok: true, data: res.data ?? { result: "" } };
+            if (isTwoStep) {
+              const token = extractConfirmToken(res.raw);
+              const previewText = res.maskedFullText ?? (res.data?.result ?? "");
+              return {
+                ok: true,
+                data: res.data ?? { result: "" },
+                confirm_token: token,
+                previewText,
+              };
+            }
+            return {
+              ok: true,
+              data: res.data ?? { result: "" },
+            };
           },
         };
         this.projectConnectorTools.push(toolDef);
@@ -687,7 +745,7 @@ export class CallSession extends EventEmitter {
       connectorResults.push({ id: connCfg.id, tools: toolNames, ok: true });
     }
     if (connectorResults.length > 0) {
-      this.deps.store.event(this.deps.callId, "project_context", { connectors: connectorResults });
+      this.recordEvent( "project_context", { connectors: connectorResults });
     }
   }
 
@@ -825,7 +883,7 @@ export class CallSession extends EventEmitter {
           summary,
           threadId,
         });
-        this.deps.store.event(this.deps.callId, "action", { tool, cls, status, summary, threadId });
+        this.recordEvent( "action", { tool, cls, status, summary, threadId });
         if (tool === "end_call" && status === "done") void this.end("owner");
         if (tool === "switch_mode" && status === "running") void this.switchMode(summary === "extended" ? "extended" : "normal", "tool");
       },
@@ -833,6 +891,25 @@ export class CallSession extends EventEmitter {
       watchThread: this.deps.watchThread,
       rememberArgs: (hash: string, args: Record<string, unknown>) => {
         this.storedArgs.set(hash, args);
+      },
+      savePreview: (tool: string, token: string, args: Record<string, unknown>, previewText: string) => {
+        const cleanArgs = stripConfirmKeys(args);
+        const key = makePreviewKey(tool, token);
+        this.knownTokens.add(token);
+        this.twoStepPreviews.set(key, {
+          tool,
+          token,
+          args: cleanArgs,
+          argsCanonical: JSON.stringify(canonicalizeJson(cleanArgs)),
+          previewText,
+          createdAt: Date.now(),
+        });
+      },
+      getPreview: (tool: string, token: string) => {
+        return this.twoStepPreviews.get(makePreviewKey(tool, token));
+      },
+      deletePreview: (tool: string, token: string) => {
+        this.twoStepPreviews.delete(makePreviewKey(tool, token));
       },
     } as unknown as ToolContext;
   }
@@ -924,10 +1001,11 @@ export class CallSession extends EventEmitter {
         if (!line) return;
         this.frame({ type: "transcript", role: "agent", text: line, final: true });
         this.lastVoiceLine = line.slice(0, 300);
-        this.ledger.add("agent", line);
-        this.deps.store.event(this.deps.callId, "agent_line", { text: line });
+        const safeLine = this.sanitizeTokens(line);
+        this.ledger.add("agent", safeLine);
+        this.recordEvent( "agent_line", { text: safeLine });
         this.lastAgentLineAt = Date.now();
-        await this.deps.sayCallThread(line);
+        await this.deps.sayCallThread(safeLine);
       })();
     });
     client.on("inputTranscript", (text: string) => {
@@ -1030,7 +1108,7 @@ export class CallSession extends EventEmitter {
         this.lastFailedTool = call.name;
         // Для ручек коннектора аргументы в журнал не пишутся (§15.5, §16.7 п. 4, review п. 4)
         const isConnectorTool = this.projectConnectorTools.some((t) => t.name === def.name);
-        this.deps.store.event(this.deps.callId, "tool_error", {
+        this.recordEvent( "tool_error", {
           tool: def.name,
           ...(isConnectorTool ? {} : { args: call.args }),
           code: result.error.code,
@@ -1039,7 +1117,7 @@ export class CallSession extends EventEmitter {
       } else if (result.ok) {
         this.lastFailedTool = null;
       }
-      if (def.cls !== "R") this.deps.store.event(this.deps.callId, "confirm", { tool: def.name });
+      if (!result.ok && "needsConfirmation" in result) this.recordEvent("confirm", { tool: def.name });
     }
     this.setState("listening");
   }
@@ -1105,18 +1183,19 @@ export class CallSession extends EventEmitter {
         continue;
       }
       seen.set(hash, true);
-      if (def.cls === "R") {
-        const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
+      const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
+      if (result.ok) {
         client.sendToolResponse(call.id, result, "SILENT", call.name);
         this.enqueueSystem(def.name, result);
-      } else {
+      } else if ("needsConfirmation" in result) {
         // Запись: toolResponse откладывается до вердикта (спека §2.1 п. 4).
-        const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
         // Хеш записи считается по аргументам после resolve — ключ ответа берём у шлюза,
         // иначе вердикт искал бы ответ по хешу сырых аргументов (ревью PLUG-113).
         const pendingHash = this.gate.pendingConfirmation()?.argsHash ?? hash;
         this.pendingToolResponses.set(pendingHash, { functionId: call.id, def: def.name, args: call.args });
-        void result; // needsConfirmation уже вставлен в VOICE через gate events.
+      } else {
+        client.sendToolResponse(call.id, result, "SILENT", call.name);
+        this.enqueueSystem(def.name, result);
       }
     }
     this.flushSystemSoon();
@@ -1149,7 +1228,7 @@ export class CallSession extends EventEmitter {
       if (awaiting && !this.voiceTalking) this.scheduleQuietFallback();
       return;
     }
-    this.deps.store.event(this.deps.callId, "system_injected", { waited: false, text: text.slice(0, 120) });
+    this.recordEvent( "system_injected", { waited: false, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, true);
   }
 
@@ -1177,7 +1256,7 @@ export class CallSession extends EventEmitter {
       this.quietContext.push(text);
       return;
     }
-    this.deps.store.event(this.deps.callId, "system_context", { waited: false, text: text.slice(0, 120) });
+    this.recordEvent("system_context", { waited: false, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, false);
   }
 
@@ -1185,7 +1264,7 @@ export class CallSession extends EventEmitter {
     if (this.quietContext.length === 0) return;
     const text = this.quietContext.join("\n\n").slice(0, 8000);
     this.quietContext = [];
-    this.deps.store.event(this.deps.callId, "system_context", { waited: true, text: text.slice(0, 120) });
+    this.recordEvent("system_context", { waited: true, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, false);
   }
 
@@ -1198,7 +1277,7 @@ export class CallSession extends EventEmitter {
     if (this.quietQueue.length === 0) return;
     const text = this.quietQueue.join("\n\n").slice(0, 6000);
     this.quietQueue = [];
-    this.deps.store.event(this.deps.callId, "system_injected", { waited: true, text: text.slice(0, 120) });
+    this.recordEvent( "system_injected", { waited: true, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, true);
   }
 
@@ -1207,14 +1286,14 @@ export class CallSession extends EventEmitter {
     const batch = this.systemBatch;
     this.systemBatch = [];
     const text = `[СИСТЕМА] ${batch.join("\n")}`.slice(0, 4000);
-    this.ledger.add("tool", text);
-    this.deps.store.event(this.deps.callId, "system_batch", { text: text.slice(0, 300) });
+    this.ledger.add("tool", this.sanitizeTokens(text));
+    this.recordEvent( "system_batch", { text: text.slice(0, 300) });
     this.injectWhenQuiet(text);
   }
 
   private onConfirmationUpdate(p: PendingConfirmation, phase: "asking" | "listening") {
     // Журнал для приёмки: открытие окна ответа отделяет перебивание от ответа после вопроса.
-    this.deps.store.event(this.deps.callId, "confirm_phase", { tool: p.tool, phase });
+    this.recordEvent( "confirm_phase", { tool: p.tool, phase });
     const word = p.class === "L" ? "запускай" : p.class === "P" ? "разрешаю" : "да";
     this.frame({
       type: "confirmation",
@@ -1231,7 +1310,7 @@ export class CallSession extends EventEmitter {
       if (this.mode === "extended") {
         this.injectWhenQuiet(`[СИСТЕМА] Скажи владельцу: ${p.say}`);
       }
-      this.ledger.add("system", p.say);
+      this.ledger.add("system", this.sanitizeTokens(p.say));
     }
   }
 
@@ -1260,8 +1339,19 @@ export class CallSession extends EventEmitter {
   private async onVerdict(p: PendingConfirmation, verdict: "approved" | "hint" | "cancelled" | "expired" | "not_confirmed") {
     this.lastVerdict = { verdict, at: Date.now() };
     this.frame({ type: "confirmation_result", confirmationId: p.confirmationId, verdict });
-    this.deps.store.event(this.deps.callId, "verdict", { tool: p.tool, verdict });
+    this.recordEvent("verdict", { tool: p.tool, verdict });
+
+    const def = this.resolveTool(p.tool);
+    const stored = this.storedArgsOf(p);
+    const token = typeof stored.confirm_token === "string" ? stored.confirm_token : "";
+    const previewKey = token ? makePreviewKey(p.tool, token) : "";
+    const isTwoStep = Boolean(def?.twoStep);
+
     if (verdict !== "approved") {
+      // после approved/cancelled/expired запись удаляется: превью одноразовое (§14.10 п. 5)
+      if (isTwoStep && previewKey) {
+        this.twoStepPreviews.delete(previewKey);
+      }
       const message =
         verdict === "cancelled"
           ? "владелец отменил действие"
@@ -1274,13 +1364,39 @@ export class CallSession extends EventEmitter {
       return;
     }
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
-    const def = this.resolveTool(p.tool);
     if (!def) return;
     const actionId = this.newActionId(p.tool);
     this.frame({ type: "action", actionId, tool: p.tool, class: p.class, status: "running", summary: p.say });
     let result: ToolResult;
+
+    if (isTwoStep) {
+      const entry = previewKey ? this.twoStepPreviews.get(previewKey) : undefined;
+      const TWO_STEP_TTL_MS = 10 * 60 * 1000;
+      if (!entry || Date.now() - entry.createdAt > TWO_STEP_TTL_MS) {
+        if (previewKey) this.twoStepPreviews.delete(previewKey);
+        this.gate.consume(p.confirmationId);
+        this.frame({
+          type: "action",
+          actionId,
+          tool: p.tool,
+          class: p.class,
+          status: "failed",
+          summary: `Не выполнено: ${p.tool}`,
+        });
+        const errResult: ToolResult = { ok: false, error: { code: "invalid_argument", message: "срок действия превью истёк" } };
+        this.resolvePendingToolResponse(p.argsHash, errResult);
+        this.injectVerdict(p, `[СИСТЕМА] НЕ ВЫПОЛНЕНО: срок действия превью истёк. Скажи владельцу прямо, что не получилось и почему; не говори «отправлено» или «готово».`);
+        return;
+      }
+      // после approved/cancelled/expired запись удаляется: превью одноразовое (§14.10 п. 5)
+      this.twoStepPreviews.delete(previewKey);
+    }
+
     try {
-      result = await def.execute(this.storedArgsOf(p), this.toolContext());
+      const rawRes = await def.execute(this.storedArgsOf(p), this.toolContext());
+      result = rawRes.ok
+        ? { ok: true, data: rawRes.data, ...(rawRes.truncated !== undefined ? { truncated: rawRes.truncated } : {}) }
+        : rawRes;
     } catch (e) {
       result = { ok: false, error: { code: "internal", message: String(e) } };
     }
@@ -1443,7 +1559,7 @@ export class CallSession extends EventEmitter {
     // Слой 2 против эха: реплика, совпадающая с тем, что агент только что говорил,
     // — это его голос из динамиков, а не владелец. Отбрасываем и не провоцируем ответ.
     if (Date.now() - this.lastAgentLineAt < 3000 && isEcho(text, this.lastVoiceLine)) {
-      this.deps.store.event(this.deps.callId, "echo_dropped", { text: text.slice(0, 200) });
+      this.recordEvent( "echo_dropped", { text: text.slice(0, 200) });
       this.voice?.sendClientContent("[СИСТЕМА] Предыдущая реплика была эхом твоего ответа из динамиков, а не словами владельца. Игнорируй её и жди владельца.", false);
       return;
     }
@@ -1456,8 +1572,9 @@ export class CallSession extends EventEmitter {
     if (this.ended || !text.trim()) return;
     this.lastFailedTool = null;
     this.toolCallsThisTurn = 0;
-    this.ledger.add("owner", text);
-    this.deps.store.event(this.deps.callId, "owner_line", { text });
+    const safeText = this.sanitizeTokens(text);
+    this.ledger.add("owner", safeText);
+    this.recordEvent( "owner_line", { text: safeText });
 
     // §15.2 п. 4: Реплики звонка (речь, кадр text, кадр confirm) изменение реестра не подтверждают — только кнопка в настройках.
 
@@ -1475,7 +1592,7 @@ export class CallSession extends EventEmitter {
   async switchMode(mode: "normal" | "extended", source: "browser" | "tool" = "browser") {
     if (mode === "extended" && !this.deps.allowExtended) return; // Extended отключён (ADR-0006, пересмотр 2)
     if (this.targetThreadId || mode === this.mode || this.ended) return;
-    this.deps.store.event(this.deps.callId, "mode_switch", { to: mode, source, msSinceStart: Date.now() - this.startedAt });
+    this.recordEvent( "mode_switch", { to: mode, source, msSinceStart: Date.now() - this.startedAt });
     if (this.gate.pendingConfirmation()) {
       this.frame({ type: "error", code: "pending_confirmation", message: "дождись ответа на подтверждение", retryable: false });
       return;
@@ -1582,7 +1699,7 @@ export class CallSession extends EventEmitter {
     const queued = this.quietQueue;
     this.quietQueue = [];
     const all = [text, ...queued].join("\n\n").slice(0, 6000);
-    this.deps.store.event(this.deps.callId, "system_injected", { waited: false, interrupted: true, text: all.slice(0, 120) });
+    this.recordEvent( "system_injected", { waited: false, interrupted: true, text: all.slice(0, 120) });
     this.voice?.sendClientContent(all, true);
   }
 
@@ -1607,6 +1724,8 @@ export class CallSession extends EventEmitter {
     if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
     if (this.ended) return;
     this.ended = true;
+    this.twoStepPreviews.clear();
+    this.knownTokens.clear();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -1646,7 +1765,7 @@ export class CallSession extends EventEmitter {
         await this.deps.endCallThread(summary);
       } catch (e) {
         // Тихий пропуск недопустим: ошибка пишется в журнал звонка (контракт §13.1)
-        this.deps.store.event(this.deps.callId, "thread_close_failed", {
+        this.recordEvent( "thread_close_failed", {
           threadId: this.threadId,
           error: String((e as { message?: unknown })?.message ?? e),
         });
@@ -1658,7 +1777,7 @@ export class CallSession extends EventEmitter {
       try {
         await brain.archive();
       } catch (e) {
-        this.deps.store.event(this.deps.callId, "brain_archive_failed", {
+        this.recordEvent( "brain_archive_failed", {
           error: String((e as { message?: unknown })?.message ?? e),
         });
       }
