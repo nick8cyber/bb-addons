@@ -22,9 +22,19 @@ export class EventBridge {
     this.watched.add(threadId);
   }
 
+  isWatching(threadId: string): boolean {
+    return this.watched.has(threadId);
+  }
+
   unwatch(threadId: string) {
     this.watched.delete(threadId);
     this.pendingCache.delete(threadId);
+  }
+
+  /** Сброс слежения и очереди при завершении звонка (§16.4). */
+  reset(): void {
+    this.watched.clear();
+    this.queue = [];
   }
 
   setModelBusy(busy: boolean) {
@@ -47,6 +57,7 @@ export class EventBridge {
 
   onInteractionPending(threadId: string, title: string, kind: "question" | "permission", prompt: string) {
     this.pendingCache.set(threadId, { threadId, title, kind, prompt });
+    if (!this.watched.has(threadId)) return;
     this.queue.push({ kind: "interaction.pending", threadId, summary: `${title}: ${prompt.slice(0, 200)}` });
   }
 

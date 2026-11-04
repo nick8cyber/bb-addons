@@ -10,9 +10,11 @@ import { z } from "zod";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import {
   BUSY_CLOSE_CODE,
+  UNAUTHORIZED_CLOSE_CODE,
   FRAME_MIC,
   FRAME_PLAYBACK,
   HELLO_TIMEOUT_MS,
@@ -83,11 +85,16 @@ const rpcContract = defineRpcContract({
       ok: z.boolean(),
     }),
   },
+  callToken: {
+    input: z.object({}).strict(),
+    output: z.object({ token: z.string() }),
+  },
 });
 
 type Sock = { send(data: string | Uint8Array): void; close(code?: number, reason?: string): void };
 
 export default async function plugin(bb: BbPluginApi) {
+  const callToken = randomUUID();
   const settings = bb.settings.define({
     geminiKeys: {
       type: "string",
@@ -334,6 +341,7 @@ export default async function plugin(bb: BbPluginApi) {
       projectSecrets,
       rawProjectRegistry: rawRegistry,
       pendingRegistryChanges: pendingChanges,
+      watchThread: (threadId: string) => eventBridge.watch(threadId),
       onApproveRegistry: (pid, h) => {
         projectRegistry.approve(pid, h, rawRegistry);
         bb.log.info(`реестр проекта ${pid} подтверждён голосом`);
@@ -368,6 +376,7 @@ export default async function plugin(bb: BbPluginApi) {
     sessionRef.current = session;
     session.on("ended", () => {
       active = null;
+      eventBridge.reset();
     });
     active = { session, startedAt: Date.now(), link, detached: false, grace: null };
     await session.start();
@@ -410,6 +419,7 @@ export default async function plugin(bb: BbPluginApi) {
     bb.log.warn(`closeStaleCallThreads: ${String(e)}`);
   }
   bb.onDispose(async () => {
+    eventBridge.reset();
     if (!active) return;
     // Браузеру «ended» не шлём: он переподключится, получит call_gone и сам начнёт
     // новый звонок — владелец остаётся на линии (приёмка 03.11: reload оборвал звонок).
@@ -424,11 +434,6 @@ export default async function plugin(bb: BbPluginApi) {
       const state: { session: CallSession | null; helloTimer: NodeJS.Timeout | null } = { session: null, helloTimer: null };
       return {
         onOpen: (sock: Sock) => {
-          if (active && !active.detached) {
-            sock.send(JSON.stringify({ type: "error", code: "busy", message: "уже идёт звонок", retryable: false } satisfies ServerFrame));
-            sock.close(BUSY_CLOSE_CODE, "busy");
-            return;
-          }
           state.helloTimer = setTimeout(() => {
             if (!state.session) sock.close(BUSY_CLOSE_CODE, "hello timeout");
           }, HELLO_TIMEOUT_MS);
@@ -446,6 +451,16 @@ export default async function plugin(bb: BbPluginApi) {
             const frame = parsed.data;
             if (frame.type === "hello") {
               if (state.helloTimer) clearTimeout(state.helloTimer);
+              if (!frame.token || frame.token !== callToken) {
+                sock.send(JSON.stringify({
+                  type: "error",
+                  code: "unauthorized",
+                  message: "неверный или отсутствующий токен",
+                  retryable: false,
+                } satisfies ServerFrame));
+                sock.close(UNAUTHORIZED_CLOSE_CODE, "unauthorized");
+                return;
+              }
               const decision = decideHello(
                 active ? { callId: active.session.callId, detached: active.detached } : null,
                 frame.resume,
@@ -703,6 +718,7 @@ export default async function plugin(bb: BbPluginApi) {
     void isCallThread(thread.id, thread.projectId).then(async (yes) => { if (yes) await markCallThreadRead(thread.id); });
   });
   bb.events.on("interaction.pending" as never, ((payload: { thread: { id: string; title?: string }; interaction: { payload?: Record<string, unknown>; kind?: string } }) => {
+    if (!active?.session) return;
     const kind = payload.interaction?.payload?.kind === "approval" ? "permission" : "question";
     eventBridge.onInteractionPending(
       payload.thread.id,
@@ -733,6 +749,7 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`браузер (rpc): ${event}${detail ? ` — ${detail}` : ""}`);
       return { ok: true };
     },
+    callToken: async () => ({ token: callToken }),
     probe: async () => {
       const keys = await keysList();
       if (keys.length === 0) return { extendedNativeTools: false, checkedAt: new Date().toISOString(), detail: "нет ключей" };
@@ -771,6 +788,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "calls", summary: "Последние звонки", usage: "bb call calls [--limit N]" },
       { name: "transcript", summary: "Транскрипт звонка", usage: "bb call transcript <callId>" },
       { name: "probe", summary: "Доставляет ли Extended Thinking toolCall", usage: "bb call probe" },
+      { name: "token", summary: "Токен для подключения к звонку", usage: "bb call token" },
       { name: "tool", summary: "Выполнить инструмент чтения без звонка (отладка данных)", usage: "bb call tool <имя> [json-аргументы]" },
     ],
     async run(argv) {
@@ -781,6 +799,9 @@ export default async function plugin(bb: BbPluginApi) {
           exitCode: 0,
           stdout: `ключи: ${keys.length}; звонок: ${active ? `активен (${active.session.mode})` : "нет"}; проект: ${str((await settings_get()).callsProjectId, "не создан")}\n`,
         };
+      }
+      if (cmd === "token") {
+        return { exitCode: 0, stdout: `${callToken}\n` };
       }
       if (cmd === "calls") {
         const rows = store.calls(20);

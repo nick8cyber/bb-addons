@@ -88,6 +88,11 @@ export class KeyPool {
     return this.activeIndex;
   }
 
+  /** Псевдоним ротации ключей при квоте. */
+  rotate(): number {
+    return this.switchOnQuota();
+  }
+
   /** Новый звонок: основной ключ, счётчики квоты сбрасывать не нужно в рамках звонка. */
   reset(): void {
     this.activeIndex = 0;
