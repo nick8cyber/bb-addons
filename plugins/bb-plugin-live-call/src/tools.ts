@@ -1670,7 +1670,14 @@ export const threadAnswerTool: ToolDef = {
     else if (rows.length > 1) {
       return { ok: false, error: { code: "ambiguous", message: `у треда ${rows.length} ожидающих взаимодействий, назови какое` } };
     }
-    if (!target) return { ok: false, error: { code: "not_found", message: "у треда нет ожидающих взаимодействий" } };
+    if (!target) {
+      // Агент спросил обычным сообщением, а не формой вопроса: владелец уже подтвердил текст
+      // ответа — он уходит в тред сообщением (живая проверка 04.11: ответ не доходил,
+      // thread_answer падал с «нет ожидающих взаимодействий»).
+      const answerText = String(args.answer ?? "").trim();
+      if (!args.grant && answerText) return threadSendTool.execute({ text: answerText }, ctx);
+      return { ok: false, error: { code: "not_found", message: "у треда нет ожидающих взаимодействий" } };
+    }
     const interactionId = String(target.id);
     const payload = (target.payload ?? {}) as Record<string, unknown>;
     if (args.grant) {

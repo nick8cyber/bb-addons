@@ -1205,7 +1205,7 @@ export class CallSession extends EventEmitter {
     // в native toolResponse уже отдан как needsConfirmation, повторять его некому.
     const text = result.ok
       ? `выполнено: ${p.tool}. ${JSON.stringify(result.data).slice(0, 600)}`
-      : `не выполнено: ${"error" in result ? result.error.message : "нужно подтверждение"}`;
+      : `НЕ ВЫПОЛНЕНО: ${"error" in result ? result.error.message : "нужно подтверждение"}. Скажи владельцу прямо, что не получилось и почему; не говори «отправлено» или «готово».`;
     // Если владелец подтвердил раньше, чем голос успел задать вопрос (кнопка), голос мог позже
     // зачитать уже решённый вопрос и получить второе «да» (живая проверка 03.11).
     this.injectWhenQuiet(`[СИСТЕМА] ${text} Вопрос подтверждения уже решён владельцем — НЕ задавай его снова и не вызывай ${p.tool} повторно.`);

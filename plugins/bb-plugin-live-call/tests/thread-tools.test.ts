@@ -624,3 +624,31 @@ describe("вопрос подтверждения короткий, полный
     expect(request).toHaveBeenCalledWith("thread_send", { text }, "C", say, `${say}\n«${text}»`);
   });
 });
+
+describe("thread_answer без формы вопроса (живая проверка 04.11)", () => {
+  it("агент спросил обычным сообщением — ответ уходит в тред сообщением [голос]", async () => {
+    const tool = toolByName("thread_answer", "thr_target")!;
+    const send = vi.fn(async () => ({ ok: true, delivery: "sent" }));
+    const reportAction = vi.fn();
+    const ctx = {
+      sdk: { threads: { send, interactions: { list: async () => [] }, events: { list: async () => [] }, queuedMessages: { list: async () => [] } } },
+      targetThreadId: "thr_target",
+      ledger: { add: vi.fn() },
+      reportAction,
+      deliveryTimeoutMs: 50,
+      deliveryIntervalMs: 10,
+    };
+    const res = (await tool.execute({ answer: "синий" }, ctx as never)) as { ok: boolean };
+    expect(res.ok).toBe(true);
+    expect(JSON.stringify(send.mock.calls[0])).toContain("[голос] синий");
+  });
+
+  it("разрешение (grant) без ожидающего запроса — честная ошибка, без сообщения", async () => {
+    const tool = toolByName("thread_answer", "thr_target")!;
+    const send = vi.fn();
+    const ctx = { sdk: { threads: { send, interactions: { list: async () => [] } } }, targetThreadId: "thr_target", ledger: { add: vi.fn() }, reportAction: vi.fn() };
+    const res = (await tool.execute({ grant: true }, ctx as never)) as { ok: boolean };
+    expect(res.ok).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+  });
+});
