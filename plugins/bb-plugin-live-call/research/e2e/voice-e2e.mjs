@@ -1,7 +1,7 @@
 /**
  * Приёмка звонка живым (синтезированным) голосом в настоящем Chromium — без ключа Gemini.
  *
- * FIX=<папка с фикстурами *.pcm 24 кГц> SCENARIO=<general|barge|early|echo|fail> [THREAD_ID=thr_…]
+ * FIX=<папка с фикстурами *.pcm 24 кГц> SCENARIO=<general|barge|early|echo|fail|button-slow> [THREAD_ID=thr_…]
  * [ECHO=0.6] [OUT=./out] node research/e2e/voice-e2e.mjs
  *
  * - Фразы владельца — готовые PCM-фикстуры (синтезирует куратор), подаются в подменённый микрофон
@@ -49,9 +49,27 @@ await page.addInitScript((echoGainValue) => {
   let micCtx = null, micDest = null, echoGain = null;
   const taps = [];
   const origConnect = AudioNode.prototype.connect;
+  // Счётчик реально проигранного звука страницы (независимо от оценки сервера): каждые 20 мс
+  // уровень сигнала; window.__lcPlayed(from, to) — мс звука между отметками Date.now().
+  let meter = null;
+  const played = [];
+  window.__lcPlayed = (from, to) => played.filter((t) => t >= from && t <= to).length * 20;
   const attach = () => {
     if (!micCtx) return;
-    while (taps.length) origConnect.call(micCtx.createMediaStreamSource(taps.shift()), echoGain);
+    if (!meter) {
+      meter = micCtx.createAnalyser(); meter.fftSize = 512;
+      const buf = new Float32Array(meter.fftSize);
+      setInterval(() => {
+        meter.getFloatTimeDomainData(buf);
+        let sum = 0; for (const v of buf) sum += v * v;
+        if (Math.sqrt(sum / buf.length) > 0.01) played.push(Date.now());
+      }, 20);
+    }
+    while (taps.length) {
+      const src = micCtx.createMediaStreamSource(taps.shift());
+      origConnect.call(src, echoGain);
+      origConnect.call(src, meter);
+    }
   };
   AudioNode.prototype.connect = function (target, ...rest) {
     const r = origConnect.call(this, target, ...rest);
@@ -114,6 +132,15 @@ const waitEvent = async (kind, after = 0, timeoutMs = 60000, pred = () => true) 
   }
   return null;
 };
+/** Тексты сообщений «[голос] …» в тесте-треде, отправленные не раньше since (мс). */
+const threadVoiceSince = (since) => {
+  const d = JSON.parse(sh("bb", ["thread", "messages", THREAD_ID, "--limit", "10", "--json"]));
+  const evs = Array.isArray(d) ? d : (d.events ?? []);
+  return evs
+    .filter((e) => Number(e.createdAt ?? 0) >= since)
+    .flatMap((e) => (e.data?.input ?? []).map((x) => String(x?.text ?? "")))
+    .filter((t) => t.startsWith("[голос]"));
+};
 const result = { scenario: SCENARIO, checks: [] };
 const check = (name, ok, detail = "") => { result.checks.push({ name, ok: Boolean(ok), detail }); log(ok ? "PASS" : "FAIL", name, detail); };
 
@@ -157,8 +184,11 @@ if (SCENARIO === "general") {
     const early = await say("da");
     await sleep(2500);
     const v1 = events("verdict").find((e) => e.ts >= early.at);
-    const heardAt = heardBefore?.p.at ?? events("question_heard")[0]?.p.at ?? Infinity;
-    check("«да» до вопроса не засчитано", !v1 || v1.ts >= heardAt, v1 ? `verdict ${v1.p.verdict} в ${v1.ts}, вопрос слышен с ${heardAt}` : "вердикта нет");
+    void heardBefore;
+    const offsetMs = events("question_heard")[0]?.p.offsetMs ?? 0;
+    const playedAtDa = await page.evaluate(([a, b]) => window.__lcPlayed(a, b), [confirm.ts, early.end]);
+    check("«да» подано до вопроса (по звуку браузера)", playedAtDa <= offsetMs, `проиграно ${playedAtDa} мс, до вопроса ${offsetMs} мс`);
+    check("«да» до вопроса не засчитано", !v1, v1 ? `verdict ${v1.p.verdict} в ${v1.ts}` : "вердикта нет");
   }
   const heard = await waitEvent("question_heard", confirm?.ts ?? 0, 20000);
   check("вопрос зазвучал (question_heard)", heard);
@@ -170,7 +200,13 @@ if (SCENARIO === "general") {
     verdict = await waitEvent("verdict", da.at, 15000);
     const listening = events("confirm_phase").find((e) => e.p.phase === "listening" && e.ts >= confirm.ts);
     check("«да» засчитано", verdict?.p.verdict === "approved", verdict?.p.verdict ?? "нет вердикта");
-    if (SCENARIO === "barge") check("засчитано ПОСЛЕ начала вопроса и ДО конца (перебивание)", verdict && verdict.ts >= heard.p.at && (!listening || verdict.ts < listening.ts), `verdict ${verdict?.ts}, heard ${heard.p.at}, окно ${listening?.ts ?? "не открылось"}`);
+    if (SCENARIO === "barge") {
+      // Независимо от оценки шлюза: к моменту вердикта браузер реально проиграл ≥ offsetMs звука
+      // после запроса — то есть вопрос уже звучал (offsetMs — звук до вопроса, по байтам сервера).
+      const playedMs = verdict ? await page.evaluate(([a, b]) => window.__lcPlayed(a, b), [confirm.ts, verdict.ts]) : 0;
+      check("вопрос реально звучал в браузере к моменту «да»", verdict && playedMs > (heard.p.offsetMs ?? 0), `проиграно ${playedMs} мс, до вопроса ${heard.p.offsetMs} мс`);
+      check("засчитано ДО конца вопроса (перебивание, окно ещё не открыто)", verdict && (!listening || verdict.ts < listening.ts), `verdict ${verdict?.ts}, окно ${listening?.ts ?? "не открылось"}`);
+    }
   }
   const action = await waitEvent("action", verdict?.ts ?? 0, 30000, (e) => e.p.status === "done" || e.p.status === "failed");
   if (SCENARIO === "fail") {
@@ -180,11 +216,26 @@ if (SCENARIO === "general") {
   } else {
     check("действие выполнено", action?.p.status === "done", action?.p.summary ?? "");
     check("без «не доставлено»", !events("tool_error").some((e) => /delivery_failed|не доставлено/.test(e.payload)));
-    if (THREAD_ID) {
-      const msgs = sh("bb", ["thread", "messages", THREAD_ID, "--limit", "3"]);
-      check("сообщение [голос] в треде", /\[голос\][^\n]*перебиван/i.test(msgs));
-    }
+    if (THREAD_ID) check("сообщение [голос] в треде (этого звонка)", threadVoiceSince(startedAfter).some((t) => /перебиван/i.test(t)));
   }
+} else if (SCENARIO === "button-slow") {
+  // Кнопка «Подтвердить» раньше вопроса при медленном действии (задача мозговому центру):
+  // голос не должен дочитывать решённый вопрос.
+  const s = await say("brain_fail");
+  const confirm = await waitEvent("confirm", s.at, 30000);
+  check("запрошено подтверждение", confirm);
+  await sleep(1500);
+  const clicked = await page.evaluate(() => {
+    const b = [...document.querySelectorAll("button")].find((e) => /Подтвердить|Выполнить|Да\b/.test(e.textContent || "") && e.closest("[class*=confirm]"));
+    if (b) { b.click(); return true; }
+    return false;
+  });
+  check("кнопка подтверждения на карточке нажата", clicked);
+  const verdict = await waitEvent("verdict", confirm?.ts ?? 0, 10000);
+  check("вердикт кнопкой", verdict?.p.verdict === "approved", verdict?.p.verdict ?? "нет");
+  await sleep(20000);
+  const reread = events("agent_line").filter((e) => e.ts > (verdict?.ts ?? 0) && /\?\s*$/.test(e.p.text) && /мозгов|задач/i.test(e.p.text));
+  check("решённый вопрос не перечитан", reread.length === 0, reread.map((e) => e.p.text).join(" | ").slice(0, 200));
 } else if (SCENARIO === "echo") {
   const s = await say("send_echo");
   const confirm = await waitEvent("confirm", s.at, 30000);
@@ -195,10 +246,7 @@ if (SCENARIO === "general") {
   check("эхо не подтвердило действие", !v, v ? `approved в ${v.ts}` : "");
   const mics = events("mic").filter((e) => e.ts >= (confirm?.ts ?? 0)).map((e) => +((/пик (\d+)/.exec(e.p.message) || [])[1] || 0));
   check("эхо реально было в микрофоне (пик > 500)", mics.some((x) => x > 500), `пики: ${mics.slice(0, 8).join(", ")}`);
-  if (THREAD_ID) {
-    const msgs = sh("bb", ["thread", "messages", THREAD_ID, "--limit", "3"]);
-    check("сообщение в тред не ушло", !/\[голос\][^\n]*эха/i.test(msgs));
-  }
+  if (THREAD_ID) check("сообщение в тред не ушло (за этот звонок)", !threadVoiceSince(startedAfter).some((t) => /эха/i.test(t)));
   const listening = events("confirm_phase").find((e) => e.p.phase === "listening" && e.ts >= (confirm?.ts ?? 0));
   if (listening && !events("verdict").some((e) => e.ts >= confirm.ts)) {
     const o = await say("otmena");

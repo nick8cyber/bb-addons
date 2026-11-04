@@ -184,7 +184,7 @@ export class CallSession extends EventEmitter {
       undefined,
       {
         onConfirmationUpdate: (p, phase) => this.onConfirmationUpdate(p, phase),
-        onQuestionHeardAt: (p, at) => this.deps.store.event(this.deps.callId, "question_heard", { tool: p.tool, at }),
+        onQuestionHeardAt: (p, at, offsetMs) => this.deps.store.event(this.deps.callId, "question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
         onVerdict: (p, verdict) => void this.onVerdict(p, verdict),
       },
     );
