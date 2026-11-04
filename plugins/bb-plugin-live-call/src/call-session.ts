@@ -24,8 +24,9 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
 import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
 import { BrainCenter } from "./brain-center.js";
-import { McpClient, makeConnectorToolName, mcpSchemaToGeminiParameters } from "./mcp-client.js";
+import { McpClient, isValidConnectorToolName, makeConnectorToolName, mcpSchemaToGeminiParameters, toGeminiSchema } from "./mcp-client.js";
 import { ProjectRegistryManager, readProjectRepoConfig, resolveStrictClass, type ProjectConfig } from "./project-registry.js";
+import { maskSecrets } from "./secret-filter.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -61,8 +62,6 @@ export interface CallSessionDeps {
   projectSecrets?: Record<string, string>;
   rawProjectRegistry?: string;
   pendingRegistryChanges?: Array<{ projectId: string; title: string; hash: string; diff: string[] }>;
-  onApproveRegistry?: (projectId: string, hash: string) => void;
-  onRejectRegistry?: (projectId: string) => void;
   storageDir?: string;
   /** Проект «Звонки» — сюда идёт мозговой центр для не-git треда (служебная папка плагина). */
   callsProjectId?: string;
@@ -146,8 +145,15 @@ export class CallSession extends EventEmitter {
     super();
     this.targetThreadId = deps.targetThreadId ?? null;
     this.targetProjectId = deps.targetProjectId ?? null;
-    if (deps.pendingRegistryChanges && deps.pendingRegistryChanges.length > 0) {
-      this.pendingRegistry = deps.pendingRegistryChanges[0];
+    if (this.targetProjectId && deps.pendingRegistryChanges) {
+      const match = deps.pendingRegistryChanges.find((p) => p.projectId === this.targetProjectId);
+      if (match) {
+        this.pendingRegistry = match;
+        this.deps.store.event(this.deps.callId, "registry_changed", {
+          projectId: match.projectId,
+          diff: match.diff,
+        });
+      }
     }
     // Extended отключён (ADR-0006, пересмотр 2): без allowExtended любой звонок — normal.
     this.mode = this.targetThreadId || this.targetProjectId || (deps.mode === "extended" && !deps.allowExtended) ? "normal" : deps.mode;
@@ -376,6 +382,16 @@ export class CallSession extends EventEmitter {
         }
       });
       if (targetProjectId) {
+        if (this.deps.pendingRegistryChanges) {
+          const match = this.deps.pendingRegistryChanges.find((p) => p.projectId === targetProjectId);
+          if (match) {
+            this.pendingRegistry = match;
+            this.deps.store.event(this.deps.callId, "registry_changed", {
+              projectId: match.projectId,
+              diff: match.diff,
+            });
+          }
+        }
         await this.initProjectConnectors(targetProjectId);
       }
     } else if (this.targetProjectId) {
@@ -467,6 +483,20 @@ export class CallSession extends EventEmitter {
     this.projectConnectorTools = [];
     this.failedConnectorIds = [];
 
+    // Проверка текущего состояния проекта в реестре (§15.4 п. 7, §16.7 п. 2)
+    if (this.deps.projectRegistry) {
+      const list = this.deps.projectRegistry.listProjects(this.deps.rawProjectRegistry);
+      const current = list.find((p) => p.projectId === projectId);
+      if (this.targetThreadId) {
+        // Звонок по треду запускает коннекторы только если проект есть в текущем реестре и утверждён
+        if (!current || current.state !== "approved") {
+          return;
+        }
+      } else if (!current || current.state === "invalid" || current.state === "rejected") {
+        return;
+      }
+    }
+
     let projectTitle = projectId;
     let projectRoot = "";
     try {
@@ -482,56 +512,140 @@ export class CallSession extends EventEmitter {
     this.repoPromptMd = repoEnv.promptMd ?? null;
 
     const approved = this.deps.projectRegistry?.getApprovedConfig(projectId);
-    if (!approved) return;
+    if (!approved || this.ended) return;
+
+    // Коннекторы проекта поднимаются параллельно (§14.2, review п. 9)
+    const clients = approved.config.connectors.map((connCfg) => ({
+      cfg: connCfg,
+      client: new McpClient(connCfg, this.deps.projectSecrets, this.deps.log),
+    }));
+
+    for (const item of clients) {
+      this.connectorClients.push(item.client);
+    }
+
+    const results = await Promise.allSettled(
+      clients.map(async ({ client }) => {
+        return await client.start(10_000);
+      }),
+    );
+
+    if (this.ended) {
+      for (const c of this.connectorClients) {
+        try {
+          c.close();
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
 
     const connectorResults: Array<{ id: string; tools: string[]; ok: boolean }> = [];
-    for (const connCfg of approved.config.connectors) {
-      const client = new McpClient(connCfg, this.deps.projectSecrets, this.deps.log);
-      this.connectorClients.push(client);
-      try {
-        const tools = await client.start(10_000);
-        const toolNames: string[] = [];
-        const connTools = connCfg.tools as Record<string, any> | undefined;
-        for (const t of tools) {
-          const regCls = (connTools?.[t.name] ?? connCfg.defaultClass) as any;
-          const strictCls = resolveStrictClass(regCls, repoEnv.tools?.[t.name]);
-          if (strictCls === "deny") continue;
-          toolNames.push(t.name);
-          const toolDef: ToolDef = {
-            name: makeConnectorToolName(connCfg.id, t.name),
-            cls: strictCls as ToolClass,
-            word: strictCls === "C" ? "да" : strictCls === "P" ? "разрешаю" : strictCls === "L" ? "запускай" : "",
-            description: t.description || `Ручка ${t.name} коннектора ${connCfg.id}`,
-            parameters: mcpSchemaToGeminiParameters(t.inputSchema),
-            confirmSay: () => `Выполнить ${t.name} в ${connCfg.id}?`,
-            execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
-              const startMs = Date.now();
-              const res = await client.callTool(t.name, args, 30_000);
-              const ms = Date.now() - startMs;
-              this.deps.store.event(this.deps.callId, "connector_call", {
-                connector: connCfg.id,
-                tool: t.name,
-                cls: strictCls,
-                ms,
-                ok: res.ok,
-              });
-              if (!res.ok) {
-                return {
-                  ok: false,
-                  error: res.error ?? { code: "connector_error", message: "ошибка вызова коннектора" },
-                };
-              }
-              return { ok: true, data: res.data ?? { result: "" } };
-            },
-          };
-          this.projectConnectorTools.push(toolDef);
-        }
-        connectorResults.push({ id: connCfg.id, tools: toolNames, ok: true });
-      } catch (e) {
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const connCfg = approved.config.connectors[i];
+      const client = clients[i].client;
+
+      if (r.status === "rejected") {
+        const errStr = String(r.reason?.message ?? r.reason);
+        const isMissingSecret = /connector_secret_missing/i.test(errStr);
+        const reason = isMissingSecret ? "connector_secret_missing" : errStr.slice(0, 300);
+
         this.failedConnectorIds.push(connCfg.id);
         connectorResults.push({ id: connCfg.id, tools: [], ok: false });
-        this.deps.log?.warn?.(`коннектор ${connCfg.id} недоступен: ${String(e)}`);
+        this.deps.store.event(this.deps.callId, "connector_start_failed", { id: connCfg.id, reason });
+        this.deps.log?.warn?.(`коннектор ${connCfg.id} недоступен: ${errStr}`);
+        continue;
       }
+
+      const tools = r.value;
+      const toolNames: string[] = [];
+      const connTools = connCfg.tools as Record<string, any> | undefined;
+
+      for (const t of tools) {
+        // Проверка имени (§14.3, review п. 7)
+        const candidateName = makeConnectorToolName(connCfg.id, t.name);
+        if (!isValidConnectorToolName(candidateName)) {
+          this.deps.store.event(this.deps.callId, "connector_tool_skipped", {
+            id: connCfg.id,
+            tool: t.name,
+            reason: "invalid_name",
+          });
+          continue;
+        }
+        if (this.projectConnectorTools.some((x) => x.name === candidateName)) {
+          this.deps.store.event(this.deps.callId, "connector_tool_skipped", {
+            id: connCfg.id,
+            tool: t.name,
+            reason: "name_collision",
+          });
+          continue;
+        }
+
+        // Проверка схемы параметров Gemini (§14.4, review п. 6)
+        const geminiParams = toGeminiSchema(t.inputSchema);
+        if (!geminiParams) {
+          this.deps.store.event(this.deps.callId, "connector_tool_skipped", {
+            id: connCfg.id,
+            tool: t.name,
+            reason: "schema_unsupported",
+          });
+          continue;
+        }
+
+        // Класс ручки (Object.hasOwn, review п. 7)
+        const regCls = (connTools && Object.hasOwn(connTools, t.name) ? connTools[t.name] : connCfg.defaultClass) as any;
+        const repoCls = repoEnv.tools && Object.hasOwn(repoEnv.tools, t.name) ? repoEnv.tools[t.name] : undefined;
+        const strictCls = resolveStrictClass(regCls, repoCls);
+        if (strictCls === "deny") continue;
+
+        toolNames.push(t.name);
+        const toolDef: ToolDef = {
+          name: candidateName,
+          cls: strictCls as ToolClass,
+          word: strictCls === "C" ? "да" : strictCls === "P" ? "разрешаю" : strictCls === "L" ? "запускай" : "",
+          description: (t.description || `Ручка ${t.name} коннектора ${connCfg.id}`).slice(0, 1000),
+          parameters: geminiParams,
+          // §14.5, §16.7 п. 3: confirmSay содержит имя и все аргументы с форматированием и усечением
+          confirmSay: (args: Record<string, unknown>) => {
+            const entries = Object.entries(args ?? {});
+            if (entries.length === 0) {
+              return `${t.name} в ${connCfg.id}. Подтверждаете?`;
+            }
+            const formattedArgs = entries
+              .map(([k, v]) => {
+                const valStr = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+                const truncated = valStr.length > 50 ? valStr.slice(0, 49) + "…" : valStr;
+                return `${k}=${truncated}`;
+              })
+              .join(", ");
+            const truncatedArgs = formattedArgs.length > 200 ? formattedArgs.slice(0, 199) + "…" : formattedArgs;
+            return `${t.name}: ${truncatedArgs}. Подтверждаете?`;
+          },
+          execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+            const startMs = Date.now();
+            const res = await client.callTool(t.name, args, 30_000);
+            const ms = Date.now() - startMs;
+            this.deps.store.event(this.deps.callId, "connector_call", {
+              connector: connCfg.id,
+              tool: t.name,
+              cls: strictCls,
+              ms,
+              ok: res.ok,
+            });
+            if (!res.ok) {
+              return {
+                ok: false,
+                error: res.error ?? { code: "connector_error", message: "ошибка вызова коннектора" },
+              };
+            }
+            return { ok: true, data: res.data ?? { result: "" } };
+          },
+        };
+        this.projectConnectorTools.push(toolDef);
+      }
+      connectorResults.push({ id: connCfg.id, tools: toolNames, ok: true });
     }
     if (connectorResults.length > 0) {
       this.deps.store.event(this.deps.callId, "project_context", { connectors: connectorResults });
@@ -689,14 +803,16 @@ export class CallSession extends EventEmitter {
       if (this.greeted) return; // после переподключений приветствие не повторяем
       this.greeted = true;
       if (this.targetProjectId) {
+        const parts: string[] = [];
         if (this.failedConnectorIds.length > 0) {
+          parts.push(this.failedConnectorIds.map((c) => `коннектор ${c} недоступен`).join(", "));
+        }
+        if (this.pendingRegistry) {
+          parts.push("реестр проекта изменился, подтверди изменения в настройках плагина");
+        }
+        if (parts.length > 0) {
           client.sendClientContent(
-            `Система: звонок по проекту ${this.projectTitle ?? this.targetProjectId} начат. ${this.failedConnectorIds.map((c) => `коннектор ${c} недоступен`).join(", ")}. Скажи об этом владельцу и отвечай только на его вопросы.`,
-            true,
-          );
-        } else if (this.pendingRegistry) {
-          client.sendClientContent(
-            `[СИСТЕМА] В начале звонка скажи владельцу одной фразой: «реестр проекта изменился, подтверди изменения в настройках плагина». Больше ничего не добавляй и жди слов владельца.`,
+            `[СИСТЕМА] Звонок по проекту ${this.projectTitle ?? this.targetProjectId} начат. В начале звонка скажи владельцу одной фразой: «${parts.join(". ")}». Больше ничего не добавляй и жди слов владельца.`,
             true,
           );
         } else {
@@ -706,21 +822,18 @@ export class CallSession extends EventEmitter {
           );
         }
       } else if (this.targetThreadId) {
-        // §12.11 п. 3: Голос сразу представляется: «Привет, сейчас обрабатываю информацию по треду».
+        let registryMsg = "";
+        if (this.pendingRegistry) {
+          registryMsg = " Скажи владельцу: «реестр проекта изменился, подтверди изменения в настройках плагина».";
+        }
         if (this.brain) {
-          client.sendClientContent("Система: звонок начат. Скажи: «Привет, сейчас обрабатываю информацию по треду». Больше ничего не добавляй.", true);
+          client.sendClientContent(`Система: звонок начат. Скажи: «Привет, сейчас обрабатываю информацию по треду».${registryMsg} Больше ничего не добавляй.`, true);
         } else {
-          client.sendClientContent("Система: звонок начат. Мозговой центр недоступен. Скажи «Привет» и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.", true);
+          client.sendClientContent(`Система: звонок начат. Мозговой центр недоступен. Скажи «Привет» и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.${registryMsg}`, true);
         }
       } else {
-        if (this.pendingRegistry) {
-          client.sendClientContent(
-            `[СИСТЕМА] В начале звонка скажи владельцу одной фразой: «реестр проекта изменился, подтверди изменения в настройках плагина». Больше ничего не добавляй и жди слов владельца.`,
-            true,
-          );
-        } else {
-          client.sendClientContent("Система: звонок начат. Жди первого слова владельца и отвечай только ему.", false);
-        }
+        // Обычный звонок координатору: фраза о реестре не звучит (§16.7 п. 6, review п. 10)
+        client.sendClientContent("Система: звонок начат. Жди первого слова владельца и отвечай только ему.", false);
       }
     });
     client.on("audio", (turnSeq: number, pcm: Uint8Array) => {
@@ -868,7 +981,14 @@ export class CallSession extends EventEmitter {
       client.sendToolResponse(call.id, result, "WHEN_IDLE", call.name);
       if (!result.ok && "error" in result) {
         this.lastFailedTool = call.name;
-        this.deps.store.event(this.deps.callId, "tool_error", { tool: def.name, args: call.args, code: result.error.code, message: result.error.message.slice(0, 300) });
+        // Для ручек коннектора аргументы в журнал не пишутся (§15.5, §16.7 п. 4, review п. 4)
+        const isConnectorTool = this.projectConnectorTools.some((t) => t.name === def.name);
+        this.deps.store.event(this.deps.callId, "tool_error", {
+          tool: def.name,
+          ...(isConnectorTool ? {} : { args: call.args }),
+          code: result.error.code,
+          message: maskSecrets(result.error.message.slice(0, 300)),
+        });
       } else if (result.ok) {
         this.lastFailedTool = null;
       }

@@ -55,6 +55,12 @@ const MIGRATIONS = [
     approved_at INTEGER NOT NULL,
     config_json TEXT NOT NULL
   );`,
+  // Отклонённые хеши реестра звонков по проектам (§16.7 п. 7).
+  `CREATE TABLE IF NOT EXISTS project_registry_rejected_hashes (
+    project_id TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    rejected_at INTEGER NOT NULL
+  );`,
 ];
 
 const RETENTION_DAYS = 90;
@@ -123,8 +129,37 @@ export class CallStore {
       .run(projectId, hash, approvedAt, configJson);
   }
 
+  listApprovedProjectIds(): string[] {
+    const rows = this.db.prepare("SELECT project_id AS projectId FROM project_registry_hashes").all() as Array<{ projectId: string }>;
+    return rows.map((r) => r.projectId);
+  }
+
   deleteApprovedProject(projectId: string): boolean {
     return this.db.prepare("DELETE FROM project_registry_hashes WHERE project_id = ?").run(projectId).changes > 0;
+  }
+
+  getRejectedProject(projectId: string): { hash: string; rejectedAt: number } | null {
+    const row = this.db
+      .prepare("SELECT hash, rejected_at AS rejectedAt FROM project_registry_rejected_hashes WHERE project_id = ?")
+      .get(projectId) as { hash: string; rejectedAt: number } | undefined;
+    return row ?? null;
+  }
+
+  setRejectedProject(projectId: string, hash: string, rejectedAt = Date.now()): void {
+    this.db
+      .prepare(
+        "INSERT INTO project_registry_rejected_hashes (project_id, hash, rejected_at) VALUES (?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET hash = excluded.hash, rejected_at = excluded.rejected_at",
+      )
+      .run(projectId, hash, rejectedAt);
+  }
+
+  deleteRejectedProject(projectId: string): boolean {
+    return this.db.prepare("DELETE FROM project_registry_rejected_hashes WHERE project_id = ?").run(projectId).changes > 0;
+  }
+
+  listRejectedProjectIds(): string[] {
+    const rows = this.db.prepare("SELECT project_id AS projectId FROM project_registry_rejected_hashes").all() as Array<{ projectId: string }>;
+    return rows.map((r) => r.projectId);
   }
 
   endCall(callId: string, reason: string, endedAt = Date.now()): void {

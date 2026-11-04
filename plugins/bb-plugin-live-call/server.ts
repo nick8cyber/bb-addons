@@ -62,7 +62,7 @@ const rpcContract = defineRpcContract({
         z.object({
           projectId: z.string(),
           title: z.string(),
-          state: z.enum(["approved", "pending", "invalid"]),
+          state: z.enum(["approved", "pending", "invalid", "rejected"]),
           hash: z.string().optional(),
           diff: z.array(z.string()).optional(),
           error: z.string().optional(),
@@ -334,16 +334,6 @@ export default async function plugin(bb: BbPluginApi) {
       projectSecrets,
       rawProjectRegistry: rawRegistry,
       pendingRegistryChanges: pendingChanges,
-      onApproveRegistry: (pid, h) => {
-        projectRegistry.approve(pid, h, rawRegistry);
-        bb.log.info(`реестр проекта ${pid} подтверждён голосом`);
-        store.event("registry", "registry_approved", { projectId: pid, hash: h });
-      },
-      onRejectRegistry: (pid) => {
-        projectRegistry.reject(pid);
-        bb.log.info(`реестр проекта ${pid} отклонён голосом`);
-        store.event("registry", "registry_rejected", { projectId: pid });
-      },
       storageDir: join(bb.server.experimental_dataDir, "plugins", "live-call", "brain-files"),
       log: bb.log,
       toBrowser: toBrowserRef,
@@ -481,7 +471,7 @@ export default async function plugin(bb: BbPluginApi) {
                   message: "в одном hello не бывает и threadId, и projectId",
                   retryable: false,
                 } satisfies ServerFrame));
-                sock.close(BUSY_CLOSE_CODE, "bad hello");
+                sock.close(4000, "bad hello");
                 return;
               }
               if (frame.projectId) {
@@ -496,7 +486,7 @@ export default async function plugin(bb: BbPluginApi) {
                     message: `для проекта ${frame.projectId} звонок не настроен`,
                     retryable: false,
                   } satisfies ServerFrame));
-                  sock.close(BUSY_CLOSE_CODE, "project not configured");
+                  sock.close(4000, "project not configured");
                   return;
                 }
                 if (item.state === "invalid") {
@@ -506,7 +496,7 @@ export default async function plugin(bb: BbPluginApi) {
                     message: item.error ?? "ошибка в настройках реестра проекта",
                     retryable: false,
                   } satisfies ServerFrame));
-                  sock.close(BUSY_CLOSE_CODE, "invalid registry");
+                  sock.close(4000, "invalid registry");
                   return;
                 }
               }
@@ -525,7 +515,7 @@ export default async function plugin(bb: BbPluginApi) {
                     message: `тред ${frame.threadId} не найден`,
                     retryable: false,
                   } satisfies ServerFrame));
-                  sock.close(BUSY_CLOSE_CODE, "thread not found");
+                  sock.close(4000, "thread not found");
                   return;
                 }
               }
@@ -758,7 +748,9 @@ export default async function plugin(bb: BbPluginApi) {
     projectCallsReject: async ({ projectId }) => {
       bb.log.info(`реестр проекта ${projectId} отклонён`);
       store.event("registry", "registry_rejected", { projectId });
-      return projectRegistry.reject(projectId);
+      const cfg = await settings_get();
+      const raw = typeof cfg.projectCalls === "string" ? cfg.projectCalls : "";
+      return projectRegistry.reject(projectId, raw);
     },
   });
 

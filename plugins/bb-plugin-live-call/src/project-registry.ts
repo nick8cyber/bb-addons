@@ -3,10 +3,11 @@
  * Разбор, валидация, хеширование, диффы, вычисление строгого класса.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, lstatSync, openSync, readSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import type { CallStore } from "./call-store.js";
+import { maskSecrets } from "./secret-filter.js";
 
 export const toolClassSchema = z.enum(["R", "C", "P", "L", "deny"]);
 export type ProjectToolClass = z.infer<typeof toolClassSchema>;
@@ -22,7 +23,7 @@ export const CONNECTOR_RESULT_MAX_CHARS_DEFAULT = 2000;
 
 export const connectorConfigSchema = z
   .object({
-    id: z.string().min(1),
+    id: z.string().regex(/^[a-zA-Z0-9_]+$/, "id коннектора должен содержать только латинские буквы, цифры и подчёркивание").max(32),
     transport: connectorTransportSchema,
     command: z.array(z.string()).optional(),
     url: z.string().optional(),
@@ -41,22 +42,56 @@ export const connectorConfigSchema = z
         });
       }
     } else if (data.transport === "http") {
-      if (!data.url || !/^https?:\/\//i.test(data.url)) {
+      if (!data.url) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: "http-коннектор требует url, начинающийся с http:// или https://",
+          message: "http-коннектор требует url",
           path: ["url"],
         });
+      } else {
+        try {
+          const u = new URL(data.url);
+          const isHttps = u.protocol === "https:";
+          const isLocalHttp = u.protocol === "http:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost");
+          if (!isHttps && !isLocalHttp) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "http-коннектор разрешает только https:// или http://127.0.0.1 / http://localhost",
+              path: ["url"],
+            });
+          }
+        } catch {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "некорректный url",
+            path: ["url"],
+          });
+        }
       }
     }
   });
 
 export type ConnectorConfig = z.infer<typeof connectorConfigSchema>;
 
-export const projectConfigSchema = z.object({
-  title: z.string().min(1),
-  connectors: z.array(connectorConfigSchema),
-});
+export const projectConfigSchema = z
+  .object({
+    title: z.string().min(1),
+    connectors: z.array(connectorConfigSchema),
+  })
+  .superRefine((data, ctx) => {
+    const ids = new Set<string>();
+    for (let i = 0; i < data.connectors.length; i++) {
+      const id = data.connectors[i].id;
+      if (ids.has(id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `дубликат id коннектора: «${id}»`,
+          path: ["connectors", i, "id"],
+        });
+      }
+      ids.add(id);
+    }
+  });
 
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 
@@ -66,7 +101,7 @@ export type ProjectRegistry = z.infer<typeof projectRegistrySchema>;
 export interface ProjectListItem {
   projectId: string;
   title: string;
-  state: "approved" | "pending" | "invalid";
+  state: "approved" | "pending" | "invalid" | "rejected";
   hash?: string;
   diff?: string[];
   error?: string;
@@ -88,11 +123,17 @@ export function hashProjectConfig(cfg: unknown): string {
   return createHash("sha256").update(JSON.stringify(canonicalizeJson(cfg))).digest("hex");
 }
 
-/** Сравнение старой подтверждённой конфигурации и новой (§15.2). */
+/** Сравнение старой подтверждённой конфигурации и новой (§15.2, §16.7 п. 7). */
 export function computeProjectDiff(oldConfig: ProjectConfig | null, newConfig: ProjectConfig): string[] {
   const diffs: string[] = [];
   if (!oldConfig) {
-    diffs.push(`новый проект в реестре: коннекторы [${newConfig.connectors.map((c) => c.id).join(", ")}]`);
+    const connDetails = newConfig.connectors.map((c) => {
+      if (c.transport === "stdio") {
+        return `${c.id} (stdio: [${(c.command ?? []).join(" ")}])`;
+      }
+      return `${c.id} (http: ${maskSecrets(c.url ?? "-")})`;
+    });
+    diffs.push(`новый проект в реестре: коннекторы [${connDetails.join(", ")}]`);
     return diffs;
   }
 
@@ -105,7 +146,8 @@ export function computeProjectDiff(oldConfig: ProjectConfig | null, newConfig: P
 
   for (const [id, c] of newMap) {
     if (!oldMap.has(id)) {
-      diffs.push(`добавлен коннектор «${id}» (${c.transport})`);
+      const details = c.transport === "stdio" ? `stdio: [${(c.command ?? []).join(" ")}]` : `http: ${maskSecrets(c.url ?? "-")}`;
+      diffs.push(`добавлен коннектор «${id}» (${details})`);
       continue;
     }
     const oldC = oldMap.get(id)!;
@@ -113,13 +155,13 @@ export function computeProjectDiff(oldConfig: ProjectConfig | null, newConfig: P
       diffs.push(`коннектор «${id}»: изменён транспорт ${oldC.transport} → ${c.transport}`);
     }
     if (JSON.stringify(oldC.command ?? []) !== JSON.stringify(c.command ?? [])) {
-      diffs.push(`коннектор «${id}»: изменена команда запуска`);
+      diffs.push(`коннектор «${id}»: изменена команда запуска [${(oldC.command ?? []).join(" ")}] → [${(c.command ?? []).join(" ")}]`);
     }
     if (oldC.url !== c.url) {
-      diffs.push(`коннектор «${id}»: изменён адрес ${oldC.url ?? "-"} → ${c.url ?? "-"}`);
+      diffs.push(`коннектор «${id}»: изменён адрес ${maskSecrets(oldC.url ?? "-")} → ${maskSecrets(c.url ?? "-")}`);
     }
     if (JSON.stringify([...(oldC.secrets ?? [])].sort()) !== JSON.stringify([...(c.secrets ?? [])].sort())) {
-      diffs.push(`коннектор «${id}»: изменены секреты`);
+      diffs.push(`коннектор «${id}»: изменены секреты [${(oldC.secrets ?? []).join(", ")}] → [${(c.secrets ?? []).join(", ")}]`);
     }
     if (oldC.defaultClass !== c.defaultClass) {
       diffs.push(`коннектор «${id}»: класс по умолчанию изменён ${oldC.defaultClass} → ${c.defaultClass}`);
@@ -181,29 +223,50 @@ export interface RepoProjectEnvironment {
   tools?: Record<string, "R" | "C" | "P" | "L">;
 }
 
+function safeReadFileBounded(filePath: string, projectRoot: string, maxBytes = 32768): string | null {
+  try {
+    const resolvedRoot = resolve(projectRoot);
+    const resolvedPath = resolve(filePath);
+    if (!resolvedPath.startsWith(resolvedRoot)) return null;
+
+    if (!existsSync(resolvedPath)) return null;
+    const stat = lstatSync(resolvedPath);
+    // Проверка: обычный файл, не симлинк (§16.7 п. 7, §15.3, review п. 12)
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+
+    const fd = openSync(resolvedPath, "r");
+    try {
+      const buf = Buffer.alloc(maxBytes);
+      const bytesRead = readSync(fd, buf, 0, maxBytes, 0);
+      return buf.subarray(0, bytesRead).toString("utf-8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Чтение файлов окружения проекта (§15.3).
- * Читает только .bb/live-call/PROMPT.md (до 8000 символов) и tools.json.
- * Ничего другого из репо не читается никогда.
+ * Чтение файлов окружения проекта (§15.3, §16.7 п. 7).
+ * Читает только .bb/live-call/PROMPT.md (до 8000 символов) и tools.json (до 32 КБ).
+ * Не переходит по симлинкам; не читает устройства; не читает больше 32 КБ.
  */
 export function readProjectRepoConfig(projectRoot: string): RepoProjectEnvironment {
   const result: RepoProjectEnvironment = {};
   if (!projectRoot || !existsSync(projectRoot)) return result;
 
   const promptPath = join(projectRoot, ".bb", "live-call", "PROMPT.md");
-  if (existsSync(promptPath)) {
-    try {
-      const text = readFileSync(promptPath, "utf-8");
-      result.promptMd = text.slice(0, 8000);
-    } catch {
-      // Игнорируем ошибки чтения файла
-    }
+  const promptText = safeReadFileBounded(promptPath, projectRoot, 32768);
+  if (promptText !== null) {
+    result.promptMd = promptText.slice(0, 8000);
   }
 
   const toolsPath = join(projectRoot, ".bb", "live-call", "tools.json");
-  if (existsSync(toolsPath)) {
+  const toolsText = safeReadFileBounded(toolsPath, projectRoot, 32768);
+  if (toolsText !== null) {
     try {
-      const parsed = JSON.parse(readFileSync(toolsPath, "utf-8")) as unknown;
+      const parsed = JSON.parse(toolsText) as unknown;
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const clean: Record<string, "R" | "C" | "P" | "L"> = {};
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
@@ -214,7 +277,7 @@ export function readProjectRepoConfig(projectRoot: string): RepoProjectEnvironme
         result.tools = clean;
       }
     } catch {
-      // Игнорируем ошибки чтения
+      // Игнорируем ошибки парсинга JSON
     }
   }
 
@@ -274,10 +337,25 @@ export class ProjectRegistryManager {
       ];
     }
 
+    // При удалении проекта из реестра снимок удаляется (§16.7 п. 2)
+    const approvedIds = this.store.listApprovedProjectIds();
+    for (const id of approvedIds) {
+      if (!parsed[id]) {
+        this.store.deleteApprovedProject(id);
+      }
+    }
+    const rejectedIds = this.store.listRejectedProjectIds();
+    for (const id of rejectedIds) {
+      if (!parsed[id]) {
+        this.store.deleteRejectedProject(id);
+      }
+    }
+
     const items: ProjectListItem[] = [];
     for (const [projectId, config] of Object.entries(parsed)) {
       const currentHash = hashProjectConfig(config);
       const approved = this.store.getApprovedProject(projectId);
+      const rejected = this.store.getRejectedProject(projectId);
 
       if (approved && approved.hash === currentHash) {
         items.push({
@@ -285,6 +363,23 @@ export class ProjectRegistryManager {
           title: config.title,
           state: "approved",
           hash: currentHash,
+        });
+      } else if (rejected && rejected.hash === currentHash) {
+        let oldConfig: ProjectConfig | null = null;
+        if (approved?.configJson) {
+          try {
+            oldConfig = JSON.parse(approved.configJson) as ProjectConfig;
+          } catch {
+            oldConfig = null;
+          }
+        }
+        const diff = computeProjectDiff(oldConfig, config);
+        items.push({
+          projectId,
+          title: config.title,
+          state: "rejected",
+          hash: currentHash,
+          diff,
         });
       } else {
         let oldConfig: ProjectConfig | null = null;
@@ -319,11 +414,16 @@ export class ProjectRegistryManager {
       return { ok: false, error: "stale" };
     }
     this.store.setApprovedProject(projectId, hash, JSON.stringify(config));
+    this.store.deleteRejectedProject(projectId);
     return { ok: true };
   }
 
-  reject(projectId: string): { ok: boolean } {
-    // Журнал registry_rejected фиксирует вызывающая сторона (server.ts)
+  reject(projectId: string, rawJson?: string | null): { ok: boolean } {
+    const { parsed } = this.parseRegistry(rawJson);
+    if (parsed && parsed[projectId]) {
+      const hash = hashProjectConfig(parsed[projectId]);
+      this.store.setRejectedProject(projectId, hash);
+    }
     return { ok: true };
   }
 
