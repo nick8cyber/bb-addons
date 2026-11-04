@@ -135,15 +135,15 @@ const waitEvent = async (kind, after = 0, timeoutMs = 60000, pred = () => true) 
   }
   return null;
 };
-/** Тексты сообщений «[голос] …» в тесте-треде, отправленные не раньше since (мс). */
-const threadVoiceSince = (since) => {
-  const d = JSON.parse(sh("bb", ["thread", "messages", THREAD_ID, "--limit", "10", "--json"]));
-  const evs = Array.isArray(d) ? d : (d.events ?? []);
-  return evs
-    .filter((e) => Number(e.createdAt ?? 0) >= since)
+/** Последний seq треда до звонка: сообщения после него — только этого звонка (JSON — старейшие первыми). */
+const threadEvents = (args) => { const d = JSON.parse(sh("bb", ["thread", "messages", THREAD_ID, "--json", ...args])); return Array.isArray(d) ? d : (d.events ?? []); };
+const lastSeq = () => { let seq = 0; for (const e of threadEvents(["--all"])) seq = Math.max(seq, Number(e.seq ?? 0)); return seq; };
+const startSeq = THREAD_ID ? lastSeq() : 0;
+/** Тексты сообщений «[голос] …» в тест-треде после начала звонка. */
+const threadVoiceSince = () =>
+  threadEvents(["--after-seq", String(startSeq), "--limit", "200"])
     .flatMap((e) => (e.data?.input ?? []).map((x) => String(x?.text ?? "")))
     .filter((t) => t.startsWith("[голос]"));
-};
 const result = { scenario: SCENARIO, checks: [] };
 const check = (name, ok, detail = "") => { result.checks.push({ name, ok: Boolean(ok), detail }); log(ok ? "PASS" : "FAIL", name, detail); };
 
@@ -173,7 +173,8 @@ if (SCENARIO === "general") {
   const owner = await waitEvent("owner_line", s.at, 20000);
   check("реплика владельца распознана", owner, owner?.p.text ?? "");
   const answer = await waitEvent("agent_line", (owner?.ts ?? s.at) + 1, 40000, (e) => !/секунд/i.test(e.p.text));
-  check("голос ответил по существу", answer, answer?.p.text?.slice(0, 120) ?? "");
+  const toolUsed = events("action").find((e) => e.ts >= (owner?.ts ?? s.at) && e.ts <= (answer?.ts ?? Infinity) && e.p.status === "done");
+  check("голос ответил по данным инструмента", answer && toolUsed, `${toolUsed?.p.tool ?? "без инструмента"}: ${answer?.p.text?.slice(0, 120) ?? ""}`);
   check("без «системной ошибки»", !events("agent_line").some((e) => /системн\S* ошибк/i.test(e.p.text)));
 } else if (SCENARIO === "barge" || SCENARIO === "early" || SCENARIO === "fail") {
   const phrase = SCENARIO === "fail" ? "brain_fail" : "send_ok";
@@ -188,7 +189,8 @@ if (SCENARIO === "general") {
     await sleep(2500);
     const v1 = events("verdict").find((e) => e.ts >= early.at);
     void heardBefore;
-    const offsetMs = events("question_heard")[0]?.p.offsetMs ?? 0;
+    const heardEv = await waitEvent("question_heard", confirm.ts, 20000);
+    const offsetMs = heardEv?.p.offsetMs ?? 0;
     const playedAtDa = await page.evaluate(([a, b]) => window.__lcPlayed(a, b), [confirm.ts, early.end]);
     check("«да» подано до вопроса (по звуку браузера)", playedAtDa <= offsetMs, `проиграно ${playedAtDa} мс, до вопроса ${offsetMs} мс`);
     check("«да» до вопроса не засчитано", !v1, v1 ? `verdict ${v1.p.verdict} в ${v1.ts}` : "вердикта нет");
@@ -196,6 +198,7 @@ if (SCENARIO === "general") {
   const heard = await waitEvent("question_heard", confirm?.ts ?? 0, 20000);
   check("вопрос зазвучал (question_heard)", heard);
   let verdict = events("verdict").find((e) => e.ts >= (confirm?.ts ?? 0));
+  if (SCENARIO !== "early") check("до «да» вердикта нет", !verdict, verdict ? `${verdict.p.verdict} в ${verdict.ts}` : "");
   if (!verdict && heard) {
     if (SCENARIO === "barge") await sleep(Math.max(0, heard.p.at + 800 - Date.now()));
     else await waitEvent("confirm_phase", confirm.ts, 30000, (e) => e.p.phase === "listening");
@@ -219,7 +222,7 @@ if (SCENARIO === "general") {
   } else {
     check("действие выполнено", action?.p.status === "done", action?.p.summary ?? "");
     check("без «не доставлено»", !events("tool_error").some((e) => /delivery_failed|не доставлено/.test(e.payload)));
-    if (THREAD_ID) check("сообщение [голос] в треде (этого звонка)", threadVoiceSince(startedAfter).some((t) => /перебиван/i.test(t)));
+    if (THREAD_ID) check("сообщение [голос] в треде (этого звонка)", threadVoiceSince().some((t) => /перебиван/i.test(t)));
   }
 } else if (SCENARIO === "button-early") {
   // Кнопка «Подтвердить» на карточке раньше вопроса: голос не должен дочитывать решённый вопрос.
@@ -234,9 +237,12 @@ if (SCENARIO === "general") {
     if (b) { b.click(); return true; }
     return false;
   });
+  const clickedAt = Date.now();
   check("кнопка подтверждения на карточке нажата", clicked);
   const verdict = await waitEvent("verdict", confirm?.ts ?? 0, 10000);
   check("вердикт кнопкой", verdict?.p.verdict === "approved", verdict?.p.verdict ?? "нет");
+  const heardB = events("question_heard").find((e) => e.ts >= (confirm?.ts ?? 0));
+  check("кнопка нажата раньше, чем вопрос зазвучал", !heardB || clickedAt < heardB.p.at, heardB ? `клик ${clickedAt}, вопрос ${heardB.p.at}` : "вопрос не начался — оборван");
   await sleep(20000);
   const reread = events("agent_line").filter((e) => e.ts > (verdict?.ts ?? 0) && /\?\s*$/.test(e.p.text) && /мозгов|задач/i.test(e.p.text));
   check("решённый вопрос не перечитан", reread.length === 0, reread.map((e) => e.p.text).join(" | ").slice(0, 200));
@@ -244,25 +250,31 @@ if (SCENARIO === "general") {
   const s = await say("send_echo");
   const confirm = await waitEvent("confirm", s.at, 30000);
   check("запрошено подтверждение", confirm);
+  const heard = await waitEvent("question_heard", confirm?.ts ?? 0, 20000);
+  check("вопрос реально звучал (эхо — эхо вопроса)", heard);
   log("молчу 40 с — в микрофоне только эхо динамика");
   await sleep(40000);
   const v = events("verdict").find((e) => e.ts >= (confirm?.ts ?? 0) && e.p.verdict === "approved");
   check("эхо не подтвердило действие", !v, v ? `approved в ${v.ts}` : "");
-  const mics = events("mic").filter((e) => e.ts >= (confirm?.ts ?? 0)).map((e) => +((/пик (\d+)/.exec(e.p.message) || [])[1] || 0));
-  check("эхо реально было в микрофоне (пик > 500)", mics.some((x) => x > 500), `пики: ${mics.slice(0, 8).join(", ")}`);
-  if (THREAD_ID) check("сообщение в тред не ушло (за этот звонок)", !threadVoiceSince(startedAfter).some((t) => /эха/i.test(t)));
-  const listening = events("confirm_phase").find((e) => e.p.phase === "listening" && e.ts >= (confirm?.ts ?? 0));
-  if (listening && !events("verdict").some((e) => e.ts >= confirm.ts)) {
-    const o = await say("otmena");
-    const vc = await waitEvent("verdict", o.at, 10000);
-    check("«Отмена» голосом после вопроса — cancelled", vc?.p.verdict === "cancelled", vc?.p.verdict ?? "нет");
-  }
+  // сводка mic — за 5 с; первые 5 с после конца фразы владельца ещё содержат её хвост
+  const mics = events("mic").filter((e) => e.ts >= s.end + 5000).map((e) => +((/пик (\d+)/.exec(e.p.message) || [])[1] || 0));
+  check("эхо реально было в микрофоне (пик > 500 после фразы)", mics.some((x) => x > 500), `пики: ${mics.slice(0, 8).join(", ")}`);
+  if (THREAD_ID) check("сообщение в тред не ушло (за этот звонок)", !threadVoiceSince().some((t) => /эха/i.test(t)));
+  const listening = await waitEvent("confirm_phase", confirm?.ts ?? 0, 5000, (e) => e.p.phase === "listening");
+  check("окно ответа открылось", listening);
+  const o = await say("otmena");
+  const vc = await waitEvent("verdict", o.at, 10000);
+  check("«Отмена» голосом после вопроса — cancelled", vc?.p.verdict === "cancelled", vc?.p.verdict ?? "нет");
 }
 
 // Завершение одним кликом
 await page.screenshot({ path: join(OUT, `${SCENARIO}-before-end.png`) });
 const clickAt = Date.now();
-check("кнопка «Завершить звонок» найдена", await clickButton("Завершить звонок"));
+const endBtn = page.getByRole("button", { name: "Завершить звонок" }).first();
+const box = await endBtn.boundingBox().catch(() => null);
+const vp = page.viewportSize();
+check("кнопка «Завершить» видна в окне", box && vp && box.x >= 0 && box.y >= 0 && box.x + box.width <= vp.width && box.y + box.height <= vp.height, box ? JSON.stringify(box) : "нет");
+await endBtn.click({ timeout: 3000 }).catch(() => {});
 let endedAt = null;
 for (let i = 0; i < 40 && !endedAt; i++) { endedAt = rows(`select ended_at from calls where id='${callId}'`)[0]?.ended_at ?? null; if (!endedAt) await sleep(100); }
 check("звонок завершён ≤ 3 с после клика", endedAt && endedAt - clickAt <= 3000, endedAt ? `${endedAt - clickAt} мс` : "не завершился");
