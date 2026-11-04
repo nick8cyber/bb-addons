@@ -95,3 +95,11 @@ describe("звонок по треду без мозгового центра (�
     expect(on).toContain("обрабатываю информацию");
   });
 });
+
+describe("звонок по проекту: без правил звонка по треду", () => {
+  it("в инструкции проекта нет «ответ агенту — в тред» (там нет треда и thread_send)", async () => {
+    const { projectVoiceInstruction } = await import("../src/prompt.js");
+    const t = projectVoiceInstruction({ projectTitle: "Тест", nowUtc: "2026-11-04T00:00:00Z", memory: [] } as never);
+    expect(t).not.toMatch(/ОТВЕТ АГЕНТУ/);
+  });
+});
