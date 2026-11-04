@@ -278,6 +278,12 @@ export class ConfirmationGate {
         this.tailUntil = at + UTTERANCE_SILENCE_MS;
         return;
       }
+      // Перебить можно только звучащий вопрос: согласие до него — ответ на филлер
+      // («Секунду, передаю…»), владелец не слышал точного названия (§16.3; приёмка PLUG-114, B).
+      if (!this.questionStarted(p)) {
+        this.tailUntil = at + UTTERANCE_SILENCE_MS;
+        return;
+      }
       this.bargeUtterance = { firstChunkAt: at, lastChunkAt: at, text };
     } else {
       this.bargeUtterance.text += text;
@@ -285,6 +291,15 @@ export class ConfirmationGate {
     }
     if (this.bargeTimer !== null) this.clock.clearTimeout(this.bargeTimer);
     this.bargeTimer = this.clock.setTimeout(() => this.finalizeBargeIn(), UTTERANCE_SILENCE_MS);
+  }
+
+  /** Вопрос начал звучать: в речи модели после запроса есть ≥2 значимых слова из вопроса. */
+  private questionStarted(p: PendingConfirmation): boolean {
+    const sayWords = new Set(normalizeUtterance(p.say).filter((w) => w.length >= 3));
+    const spoken = new Set(this.modelSpeech.filter((c) => c.at >= p.createdAt).flatMap((c) => c.words));
+    let hits = 0;
+    for (const w of sayWords) if (spoken.has(w) && ++hits >= 2) return true;
+    return false;
   }
 
   private finalizeBargeIn() {

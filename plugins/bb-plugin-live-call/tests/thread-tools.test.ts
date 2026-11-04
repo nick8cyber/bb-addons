@@ -652,3 +652,14 @@ describe("thread_answer без формы вопроса (живая прове�
     expect(send).not.toHaveBeenCalled();
   });
 });
+
+describe("thread_answer grant без запроса агента (приёмка PLUG-114)", () => {
+  it("разрешение, когда агент ничего не просит, — отказ без подтверждения владельца", async () => {
+    const tool = toolByName("thread_answer", "thr_target")!;
+    const request = vi.fn();
+    const ctx = { sdk: { threads: { interactions: { list: async () => [] } } }, targetThreadId: "thr_target", gate: { request }, reportAction: vi.fn(), ledger: { add: vi.fn() } };
+    const { result } = await runToolCall(tool, { grant: true }, "c1", ctx as never);
+    expect(request).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).toContain("не просит разрешения");
+  });
+});

@@ -99,6 +99,8 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
       gate.request("thread_send", { text: "Уведомления о сбоях куратору" }, cls, say);
       gate.onModelAudio(1, 48000 * 5, t.now); // вопрос звучит 5 с, окно не открыто
+      t.advance(1000);
+      gate.onModelTranscript(say, t.now); // вопрос начал звучать
       const sayNow = (text: string, afterMs: number) => {
         t.advance(afterMs);
         gate.onOwnerTranscriptChunk(text, t.now);
@@ -112,6 +114,23 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       sayNow("Да.", 2000);
       expect(verdicts).toEqual(["approved"]);
       expect(gate.windowOpen()).toBe(false);
+    });
+
+    it("«да» до того, как вопрос начал звучать (во время филлера), не засчитывается", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.request("thread_answer", { answer: "зелёный" }, "C", "Ответить агенту: «зелёный»?");
+      gate.onModelTranscript("Секунду, передаю ваш выбор агенту.", t.now + 500);
+      t.advance(2500);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual([]);
+      gate.onModelTranscript("Ответить агенту: «зелёный»?", t.now);
+      t.advance(1000);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual(["approved"]);
     });
 
     it("эхо вопроса из динамиков не решает ничего", () => {
@@ -150,6 +169,7 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       gate.onModelTranscript("Да, всё понятно", t.now);
       t.advance(20_000);
       gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      gate.onModelTranscript("Отправить в тред: «x»?", t.now);
       t.advance(2000);
       gate.onOwnerTranscriptChunk("да", t.now);
       t.advance(800);
@@ -166,7 +186,7 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
 
     it("«да» раньше 1,5 с от запроса — хвост просьбы владельца, не ответ", () => {
       const { verdicts, sayNow } = setup();
-      sayNow("да", 500);
+      sayNow("да", 200); // 1,2 с от запроса (setup уже сдвинул часы на 1 с)
       expect(verdicts).toEqual([]);
     });
 

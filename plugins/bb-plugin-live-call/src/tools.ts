@@ -1653,6 +1653,19 @@ export const threadAnswerTool: ToolDef = {
       grant: { type: "boolean", description: "true — разрешить агенту действие (класс P)" },
     },
   },
+  // Разрешение без ожидающего запроса агента — отказ сразу, без вопроса владельцу
+  // (приёмка PLUG-114: голос сам вызвал thread_answer с grant:true после «да» на ответ).
+  resolve: async (args, ctx) => {
+    if (!args.grant) return { ok: true, resolvedArgs: args };
+    const threadId = ctx.targetThreadId;
+    if (!threadId) return { ok: false, error: { code: "not_found", message: "тред звонка не определён" } };
+    const listed = await withTimeout((ctx.sdk.threads.interactions as unknown as InteractionsArea).list({ threadId }));
+    const rows = (Array.isArray(listed) ? listed : (listed?.interactions ?? [])) as Array<Record<string, unknown>>;
+    if (rows.length === 0) {
+      return { ok: false, error: { code: "not_found", message: "агент сейчас не просит разрешения — разрешать нечего" } };
+    }
+    return { ok: true, resolvedArgs: args };
+  },
   confirmSay: (args) =>
     args.grant
       ? "Разрешить агенту действие?"
