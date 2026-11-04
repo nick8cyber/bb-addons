@@ -192,7 +192,7 @@ if (SCENARIO === "open") {
   check("первая реплика — не «обрабатываю информацию»", greeting && !/обрабатываю информацию/i.test(greeting.p.text), greeting?.p.text ?? "");
   check("пересказ последнего ответа агента без вопроса владельца", events("owner_line").length === 0 && hits.length >= 2, `совпало слов: ${hits.slice(0, 8).join(", ")}`);
   // Сводка мозгового центра — справка (turnComplete:false): голос её сам не зачитывает…
-  const ctxEv = await waitEvent("system_context", 0, 75000, (e) => /сводк/i.test(e.p.text));
+  const ctxEv = await waitEvent("system_context", 0, 75000, (e) => /сводка мозгового центра по всему треду/i.test(e.p.text));
   check("сводка пришла справкой (system_context)", ctxEv);
   if (ctxEv) {
     await sleep(Math.max(0, ctxEv.ts + 20000 - Date.now()));
