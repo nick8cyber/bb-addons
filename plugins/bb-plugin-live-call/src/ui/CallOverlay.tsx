@@ -109,12 +109,113 @@ export function CallOverlay() {
     }
   }, [collapsed]);
 
-  if (view.phase === "idle") return null;
-  const mustShow = Boolean(view.confirmation) || view.phase === "ended" || view.phase === "failed";
+  if (view.phase === "idle") {
+    if (view.projectPicker) {
+      return <ProjectPickerModal picker={view.projectPicker} />;
+    }
+    if (view.overlayNotice) {
+      return <OverlayToast message={view.overlayNotice} onClose={() => callEngine.dismissNotice()} />;
+    }
+    return null;
+  }
+  const mustShow = Boolean(view.confirmation) || view.phase === "ended" || view.phase === "failed" || Boolean(view.projectPicker);
   const minimized = collapsed && !mustShow;
-  if (mobile) return <MobileCall view={view} minimized={minimized} onMinimize={setCollapsed} />;
-  if (minimized) return <Pill view={view} onExpand={() => setCollapsed(false)} />;
-  return <Dock view={view} onCollapse={() => setCollapsed(true)} />;
+  const overlayContent = mobile ? (
+    <MobileCall view={view} minimized={minimized} onMinimize={setCollapsed} />
+  ) : minimized ? (
+    <Pill view={view} onExpand={() => setCollapsed(false)} />
+  ) : (
+    <Dock view={view} onCollapse={() => setCollapsed(true)} />
+  );
+
+  return (
+    <>
+      {overlayContent}
+      {view.projectPicker && <ProjectPickerModal picker={view.projectPicker} />}
+      {view.overlayNotice && <OverlayToast message={view.overlayNotice} onClose={() => callEngine.dismissNotice()} />}
+    </>
+  );
+}
+
+function OverlayToast({ message, onClose }: { message: string; onClose: () => void }) {
+  return (
+    <div
+      className="lc-root lc-toast"
+      role="alert"
+      style={{
+        position: "fixed",
+        bottom: "24px",
+        right: "24px",
+        zIndex: 100,
+        background: "var(--popover)",
+        border: "1px solid var(--border)",
+        color: "var(--popover-foreground, var(--foreground))",
+        borderRadius: "var(--lc-radius)",
+        padding: "10px 14px",
+        boxShadow: "var(--shadow-lg, 0 12px 32px rgb(0 0 0 / 0.28))",
+        display: "flex",
+        alignItems: "center",
+        gap: "10px",
+        maxWidth: "380px",
+        animation: "lc-in 0.16s ease-out",
+      }}
+    >
+      <Icon name="alert" size={16} className="lc-bad" />
+      <span style={{ fontSize: "13px", flex: 1 }}>{message}</span>
+      <button
+        type="button"
+        className="lc-icon-btn"
+        aria-label="Закрыть"
+        onClick={onClose}
+        style={{ width: "24px", height: "24px" }}
+      >
+        <Icon name="x" size={14} />
+      </button>
+    </div>
+  );
+}
+
+function ProjectPickerModal({ picker }: { picker: { projects: Array<{ projectId: string; title: string }> } }) {
+  return (
+    <div
+      className="lc-root lc-dock lc-project-picker"
+      role="dialog"
+      aria-label="Выбор проекта для звонка"
+      style={{ zIndex: 90 }}
+    >
+      <header className="lc-dock__head">
+        <Icon name="phone" size={16} />
+        <span className="lc-state">Позвонить по проекту</span>
+        <span className="lc-grow" />
+        <button
+          type="button"
+          className="lc-icon-btn"
+          title="Закрыть"
+          aria-label="Закрыть"
+          onClick={() => callEngine.closeProjectPicker()}
+        >
+          <Icon name="x" />
+        </button>
+      </header>
+      <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
+        <p className="lc-sub" style={{ margin: "0 0 4px" }}>
+          Выберите проект для звонка:
+        </p>
+        {picker.projects.map((p) => (
+          <button
+            key={p.projectId}
+            type="button"
+            className="lc-btn lc-btn--ghost"
+            style={{ justifyContent: "space-between", height: "36px", padding: "0 12px" }}
+            onClick={() => callEngine.selectProject(p.projectId)}
+          >
+            <span style={{ fontWeight: 500 }}>{p.title || p.projectId}</span>
+            <span className="lc-sub">{p.projectId}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function Orb({ state, size = "sm" }: { state: OrbState; size?: "sm" | "lg" }) {
@@ -154,6 +255,7 @@ function ModeSwitch({ view, compact = false }: { view: CallView; compact?: boole
 function StatusLine({ view }: { view: CallView }) {
   const elapsed = useElapsed(view);
   const parts = [elapsed];
+  if (view.targetProjectId) parts.push(`проект: ${view.targetProjectId}`);
   // Номер ключа виден, только когда звонок ушёл на запасной: основной — норма, не новость.
   if (view.keys && view.keys.active > 1) parts.push("запасной ключ");
   if (view.orb === "reconnecting" && view.stateDetail) parts.push(view.stateDetail);
@@ -508,6 +610,8 @@ const ERROR_HINT: Record<string, string> = {
   quota_all_keys: "Оба ключа упёрлись в лимит. Подожди минуту и перезвони.",
   google_unreachable: "Сервер BB не достучался до Google. Повтори через минуту.",
   extended_unavailable: "Для Extended нужны два ключа. Звони в обычном режиме или добавь второй ключ.",
+  project_not_configured: "Звонок для этого проекта не настроен в реестре плагина.",
+  unauthorized: "Ошибка авторизации: не удалось подтвердить токен звонка.",
 };
 
 function Failed({ view }: { view: CallView }) {

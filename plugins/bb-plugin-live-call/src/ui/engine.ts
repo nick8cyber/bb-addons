@@ -9,6 +9,7 @@
  * Браузер не ходит к Google: только WS в BB (ADR-0005).
  */
 import { FRAME_PLAYBACK, packFrame, type ServerFrame } from "../contract.js";
+import { rpc, type CallTokenResult } from "./rpc.js";
 
 const CALL_WS_PATH = "/api/v1/plugins/live-call/http/call";
 const MIC_PREF_KEY = "lc-mic-id";
@@ -57,6 +58,7 @@ export interface CallView {
   callId: string | null;
   threadId: string | null;
   targetThreadId: string | null;
+  targetProjectId: string | null;
   keys: { active: number; of: number } | null;
   feed: FeedItem[];
   confirmation: Confirmation | null;
@@ -67,6 +69,10 @@ export interface CallView {
   endReason: string | null;
   /** Растёт на каждую просьбу развернуть док (кнопка 📞 во время звонка, подтверждение). */
   expandSignal: number;
+  /** Уведомление поверх UI (например, когда звонок для проекта не настроен) */
+  overlayNotice: string | null;
+  /** Выбор проекта для звонка */
+  projectPicker: { projects: Array<{ projectId: string; title: string }> } | null;
 }
 
 const IDLE: CallView = {
@@ -81,6 +87,7 @@ const IDLE: CallView = {
   callId: null,
   threadId: null,
   targetThreadId: null,
+  targetProjectId: null,
   keys: null,
   feed: [],
   confirmation: null,
@@ -90,6 +97,8 @@ const IDLE: CallView = {
   error: null,
   endReason: null,
   expandSignal: 0,
+  overlayNotice: null,
+  projectPicker: null,
 };
 
 const WORKLET_SOURCE = `
@@ -265,23 +274,36 @@ export class CallEngine {
     this.patch({ expandSignal: this.view.expandSignal + 1 });
   }
 
-  start(opts?: CallMode | { mode?: CallMode; threadId?: string }) {
+  start(opts?: CallMode | { mode?: CallMode; threadId?: string; projectId?: string }) {
     if (this.isActive()) {
       this.requestExpand();
       return;
     }
     const mode = typeof opts === "string" ? opts : opts?.mode;
     const threadId = typeof opts === "object" ? opts?.threadId : undefined;
+    const projectId = typeof opts === "object" ? opts?.projectId : undefined;
     this.releaseAudio();
     this.ownerHeard = false;
     this.endRequested = false;
-    this.view = { ...IDLE, phase: "connecting", orb: "connecting", targetThreadId: threadId ?? null, expandSignal: this.view.expandSignal + 1 };
+    this.unauthorizedRetried = false;
+    this.view = {
+      ...IDLE,
+      phase: "connecting",
+      orb: "connecting",
+      targetThreadId: threadId ?? null,
+      targetProjectId: projectId ?? null,
+      expandSignal: this.view.expandSignal + 1,
+    };
     this.patch({});
     // iOS WebKit (Safari и приложение BB): звук живёт, только если AudioContext
     // создан и запущен прямо в нажатии. Раньше он создавался после ответа сервера —
     // на айфоне оставался «спящим», микрофон и динамик молчали.
     this.unlockAudio();
-    this.openSocket({ ...(mode ? { mode } : {}), ...(threadId ? { threadId } : {}) });
+    this.openSocket({
+      ...(mode ? { mode } : {}),
+      ...(threadId ? { threadId } : {}),
+      ...(projectId ? { projectId } : {}),
+    });
   }
 
   private endRequested = false;
@@ -289,9 +311,10 @@ export class CallEngine {
   private restartPending = false;
   private reconnectTries = 0;
   private liveSince = 0;
+  private unauthorizedRetried = false;
 
-  /** Сокет звонка: первый вход ({mode}) или возврат после обрыва ({resume: callId}). */
-  private openSocket(hello: { mode?: CallMode; resume?: string; threadId?: string }) {
+  /** Сокет звонка: первый вход ({mode, projectId, threadId}) или возврат после обрыва ({resume: callId}). */
+  private openSocket(hello: { mode?: CallMode; resume?: string; threadId?: string; projectId?: string }) {
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     const sock = new WebSocket(`${wsProto}//${location.host}${CALL_WS_PATH}`);
     sock.binaryType = "arraybuffer";
@@ -303,10 +326,20 @@ export class CallEngine {
       if (!hello.resume) this.patch({ error: { code: "connect", message: "Сервер звонка не ответил за 12 с" } });
       sock.close();
     }, 12_000);
-    sock.onopen = () => {
+    sock.onopen = async () => {
       opened = true;
       clearTimeout(openTimer);
-      sock.send(JSON.stringify({ type: "hello", protocol: 1, ...hello }));
+      let token: string | undefined;
+      try {
+        const tokenRes = await rpc<CallTokenResult>("callToken");
+        if (tokenRes && typeof tokenRes.token === "string") {
+          token = tokenRes.token;
+        }
+      } catch {
+        // Сервер без поддержки callToken (или старая версия / ошибка)
+      }
+      if (this.sock !== sock) return;
+      sock.send(JSON.stringify({ type: "hello", protocol: 1, ...(token ? { token } : {}), ...hello }));
     };
     sock.onmessage = (ev: MessageEvent) => void this.onMessage(ev);
     sock.onerror = () => {
@@ -318,6 +351,24 @@ export class CallEngine {
       clearTimeout(openTimer);
       if (this.sock !== sock) return;
       this.sock = null;
+
+      // §16.2: 4401 unauthorized — один раз перезапросить токен и повторить; не переподключаться в цикле
+      if (ev.code === 4401) {
+        this.diag("ws_closed_4401_unauthorized", `retried=${this.unauthorizedRetried}`);
+        if (!this.unauthorizedRetried) {
+          this.unauthorizedRetried = true;
+          this.openSocket(hello);
+          return;
+        }
+        this.releaseAudio();
+        this.patch({
+          phase: "failed",
+          orb: "ended",
+          error: { code: "unauthorized", message: "Не авторизован (ошибка токена звонка)" },
+        });
+        return;
+      }
+
       if (this.view.phase === "connecting") {
         this.diag("ws_closed_before_ready", `code=${ev.code} reason=${ev.reason || "-"} opened=${opened}`);
         this.releaseAudio();
@@ -336,7 +387,11 @@ export class CallEngine {
       if (this.restartPending && !this.endRequested) {
         this.restartPending = false;
         this.patch({ orb: "reconnecting", stateDetail: "сервер перезапустился — новый звонок" });
-        this.openSocket({ mode: this.view.mode });
+        this.openSocket({
+          mode: this.view.mode,
+          ...(this.view.targetProjectId ? { projectId: this.view.targetProjectId } : {}),
+          ...(this.view.targetThreadId ? { threadId: this.view.targetThreadId } : {}),
+        });
         return;
       }
       if (!this.endRequested && this.view.callId && this.reconnectTries < 5 && ev.code !== 4009) {
@@ -377,9 +432,43 @@ export class CallEngine {
   dismiss() {
     this.sock?.close();
     this.sock = null;
+    this.dismissNotice();
+    this.closeProjectPicker();
     this.releaseAudio();
     this.view = { ...IDLE, expandSignal: this.view.expandSignal };
     this.patch({});
+  }
+
+  private noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  showNotice(message: string) {
+    if (this.noticeTimer) clearTimeout(this.noticeTimer);
+    this.patch({ overlayNotice: message, expandSignal: this.view.expandSignal + 1 });
+    this.noticeTimer = setTimeout(() => {
+      this.patch({ overlayNotice: null });
+      this.noticeTimer = null;
+    }, 6000);
+  }
+
+  dismissNotice() {
+    if (this.noticeTimer) {
+      clearTimeout(this.noticeTimer);
+      this.noticeTimer = null;
+    }
+    this.patch({ overlayNotice: null });
+  }
+
+  openProjectPicker(projects: Array<{ projectId: string; title: string }>) {
+    this.patch({ projectPicker: { projects }, expandSignal: this.view.expandSignal + 1 });
+  }
+
+  closeProjectPicker() {
+    this.patch({ projectPicker: null });
+  }
+
+  selectProject(projectId: string) {
+    this.closeProjectPicker();
+    this.start({ projectId });
   }
 
   toggleMute() {
@@ -489,6 +578,7 @@ export class CallEngine {
           if (this.view.muted) this.send({ type: "mute", muted: true });
           break;
         }
+        this.unauthorizedRetried = false;
         this.patch({
           phase: "live",
           orb: "listening",
@@ -496,6 +586,7 @@ export class CallEngine {
           callId: frame.callId,
           keys: frame.keys,
           targetThreadId: frame.targetThreadId ?? this.view.targetThreadId ?? null,
+          targetProjectId: frame.targetProjectId ?? this.view.targetProjectId ?? null,
           startedAt: Date.now(),
         });
         await this.startAudio();
