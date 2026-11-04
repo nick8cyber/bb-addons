@@ -34,6 +34,7 @@ export const TPM_WARN_THRESHOLD = 50_000;
 export const TPM_WINDOW_MS = 60_000;
 export const HELLO_TIMEOUT_MS = 5000;
 export const BUSY_CLOSE_CODE = 4009;
+export const UNAUTHORIZED_CLOSE_CODE = 4401;
 
 export function packFrame(type: number, turnSeq: number, pcm: Uint8Array): Uint8Array {
   const out = new Uint8Array(FRAME_HEADER_BYTES + pcm.length);
@@ -62,6 +63,7 @@ export const clientFrame = z.discriminatedUnion("type", [
     resume: z.string().min(1).optional(),
     threadId: z.string().min(1).optional(),
     projectId: z.string().min(1).optional(),
+    token: z.string().min(1).optional(),
   }),
   z.object({ type: z.literal("mute"), muted: z.boolean() }),
   z.object({ type: z.literal("playback_drained"), turnSeq: z.number().int().nonnegative() }),

@@ -68,6 +68,7 @@ export interface CallSessionDeps {
   callsProjectId?: string;
   /** Аккаунты GitHub владельца: репозиторий с origin другого аккаунта — мозговой центр только читает. */
   ownGitAccounts?: string[];
+  watchThread?: (threadId: string) => void;
   log?: { info(s: string): void; warn(s: string): void; error(s: string): void };
 }
 
@@ -676,6 +677,7 @@ export class CallSession extends EventEmitter {
         if (tool === "switch_mode" && status === "running") void this.switchMode(summary === "extended" ? "extended" : "normal", "tool");
       },
       callsProjectId: () => null,
+      watchThread: this.deps.watchThread,
       rememberArgs: (hash: string, args: Record<string, unknown>) => {
         this.storedArgs.set(hash, args);
       },
@@ -801,7 +803,7 @@ export class CallSession extends EventEmitter {
       if (this.ended || this.voice !== client) return;
       const text = reason ?? "";
       // Gemini отдаёт квоту по-разному: 429, RESOURCE_EXHAUSTED, 1011 "Resource has been exhausted".
-      if (String(code) === "429" || /exhausted|quota/i.test(text)) {
+      if (code === 1011 || String(code) === "429" || /exhausted|quota/i.test(text)) {
         this.switchKeyOnQuota("quota");
         return;
       }
@@ -894,7 +896,7 @@ export class CallSession extends EventEmitter {
       // Квота ключа ROUTER (429 или 1011 «exceeded your current quota»): у Extended
       // второго ключа больше нет — честно говорим и предлагаем Быстрый, а не долбим Google
       // переподключениями без паузы (было: 6 попыток за 0,4 с, приёмка 02.11).
-      if (String(code) === "429" || /exhausted|quota/i.test(reason ?? "")) {
+      if (code === 1011 || String(code) === "429" || /exhausted|quota/i.test(reason ?? "")) {
         this.frame({
           type: "warning",
           code: "extended_unavailable",

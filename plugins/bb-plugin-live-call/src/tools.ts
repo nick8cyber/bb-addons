@@ -43,6 +43,8 @@ export interface ToolContext {
   /** Мозговой центр звонка по треду (§12.11). */
   brain?: BrainCenter;
   isTargetThreadActive?: () => Promise<boolean>;
+  /** Подписка на тред для EventBridge (§16.4). */
+  watchThread?: (threadId: string) => void;
 }
 
 export interface ToolDef {
@@ -52,6 +54,11 @@ export interface ToolDef {
   word: string;
   description: string;
   parameters: Record<string, unknown>;
+  /** Предварительное определение объекта до запроса подтверждения (§16.3). */
+  resolve?: (
+    args: Record<string, unknown>,
+    ctx: ToolContext,
+  ) => Promise<{ ok: true; resolvedArgs: Record<string, unknown> } | { ok: false; error: { code: string; message: string } }>;
   /** Готовая фраза-вопрос для подтверждения; {args} подставляются. */
   confirmSay?: (args: Record<string, unknown>) => string;
   execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
@@ -181,7 +188,7 @@ async function resolveProjectId(sdk: BbPluginApi["sdk"], ref: string): Promise<s
 export async function resolveThreadRef(
   sdk: BbPluginApi["sdk"],
   ref: string,
-): Promise<{ ok: true; thread: Record<string, unknown> } | { ok: false; message: string; candidates: ThreadBrief[] }> {
+): Promise<{ ok: true; thread: Record<string, unknown> } | { ok: false; code: "ambiguous" | "not_found"; message: string; candidates: ThreadBrief[] }> {
   const refTrim = ref.trim();
   const refLower = refTrim.toLowerCase();
 
@@ -216,7 +223,7 @@ export async function resolveThreadRef(
     const byTitle = running.filter((t) => String(t.title ?? "").toLowerCase().includes(refLower));
     if (byTitle.length === 1) return { ok: true, thread: byTitle[0] };
     if (byTitle.length > 1) {
-      return { ok: false, message: `несколько тредов подходят под «${ref}»: ${byTitle.slice(0, 3).map((t) => String(t.title ?? "")).join("; ")}`, candidates: byTitle.slice(0, 3).map(briefOf) };
+      return { ok: false, code: "ambiguous", message: `несколько тредов подходят под «${ref}»: ${byTitle.slice(0, 3).map((t) => String(t.title ?? "")).join("; ")}`, candidates: byTitle.slice(0, 3).map(briefOf) };
     }
   } catch {
     // listRunning недоступен — ищем по общему списку.
@@ -230,8 +237,90 @@ export async function resolveThreadRef(
   const matches = threads.filter((t) => String(t.title ?? "").toLowerCase().includes(refLower));
   if (matches.length === 1) return { ok: true, thread: matches[0] };
   const candidates = matches.slice(0, 3).map(briefOf);
-  if (matches.length === 0) return { ok: false, message: `тред «${ref}» не найден`, candidates: [] };
-  return { ok: false, message: `несколько тредов подходят под «${ref}»: ${candidates.map((c) => c.title).join("; ")}`, candidates };
+  if (matches.length === 0) return { ok: false, code: "not_found", message: `тред «${ref}» не найден`, candidates: [] };
+  return { ok: false, code: "ambiguous", message: `несколько тредов подходят под «${ref}»: ${candidates.map((c) => c.title).join("; ")}`, candidates };
+}
+
+/** Сопоставление проекта по имени или id (§16.3). */
+export async function resolveProjectRef(
+  sdk: BbPluginApi["sdk"],
+  ref: string,
+): Promise<{ ok: true; project: Record<string, unknown> } | { ok: false; code: "ambiguous" | "not_found"; message: string; candidates: Array<{ id: string; name: string }> }> {
+  const refTrim = ref.trim();
+  const refLower = refTrim.toLowerCase();
+  const projects = ((await withTimeout(sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? []) as Array<Record<string, unknown>>;
+  if (refLower.startsWith("proj_")) {
+    const byId = projects.find((p) => String(p.id ?? "").toLowerCase() === refLower);
+    if (byId) return { ok: true, project: byId };
+  }
+  const exact = projects.filter((p) => String(p.name ?? "").toLowerCase() === refLower);
+  if (exact.length === 1) return { ok: true, project: exact[0] };
+  const matches = projects.filter((p) => String(p.name ?? "").toLowerCase().includes(refLower) || String(p.id ?? "").toLowerCase() === refLower);
+  if (matches.length === 1) return { ok: true, project: matches[0] };
+  if (matches.length > 1) {
+    const candidates = matches.slice(0, 3).map((p) => ({ id: String(p.id), name: String(p.name ?? p.id) }));
+    return {
+      ok: false,
+      code: "ambiguous",
+      message: `несколько проектов подходят под «${ref}»: ${candidates.map((c) => c.name).join("; ")}`,
+      candidates,
+    };
+  }
+  return { ok: false, code: "not_found", message: `проект «${ref}» не найден`, candidates: [] };
+}
+
+export async function resolveThreadToolArgs(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<{ ok: true; resolvedArgs: Record<string, unknown> } | { ok: false; error: { code: string; message: string; candidates?: unknown } }> {
+  const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+  if (!ref.ok) {
+    return {
+      ok: false,
+      error: {
+        code: ref.code,
+        message: ref.message,
+        ...(ref.candidates ? { candidates: ref.candidates } : {}),
+      },
+    };
+  }
+  const exactTitle = String(ref.thread.title ?? ref.thread.id);
+  const threadId = String(ref.thread.id);
+  return {
+    ok: true,
+    resolvedArgs: {
+      ...args,
+      thread: exactTitle,
+      threadId,
+      _targetThread: ref.thread,
+    },
+  };
+}
+
+export async function resolveTaskToolArgs(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<{ ok: true; resolvedArgs: Record<string, unknown> } | { ok: false; error: { code: string; message: string } }> {
+  const key = String(args.key ?? "").trim();
+  if (!key) return { ok: true, resolvedArgs: args };
+  try {
+    const res = await pluginRpc(ctx, "tasks", "getTaskByKey", { key });
+    if (res.ok && res.data) {
+      const d = res.data as { task?: { key?: string; title?: string }; key?: string; title?: string };
+      const task = d.task ?? d;
+      return {
+        ok: true,
+        resolvedArgs: {
+          ...args,
+          key: String(task.key ?? key),
+          taskTitle: String(task.title ?? task.key ?? key),
+        },
+      };
+    }
+  } catch {
+    // ignore
+  }
+  return { ok: true, resolvedArgs: args };
 }
 
 type InteractionListResult = { interactions?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>;
@@ -568,9 +657,11 @@ export const TOOLS: ToolDef[] = [
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
     async execute(args, ctx) {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      ctx.reportAction("watch_thread", "R", "done", `Наблюдаю за «${String(ref.thread.title ?? ref.thread.id)}»`, String(ref.thread.id));
-      return truncate({ watching: true });
+      if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+      const threadId = String(ref.thread.id);
+      ctx.watchThread?.(threadId);
+      ctx.reportAction("watch_thread", "R", "done", `Наблюдаю за «${String(ref.thread.title ?? threadId)}»`, threadId);
+      return truncate({ watching: true, threadId });
     },
   },
   {
@@ -583,11 +674,17 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, text: { type: "string", description: "точный текст сообщения" } },
       required: ["thread", "text"],
     },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Отправить в «${String(args.thread)}»: «${brief(args.text)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
       const text = String(args.text ?? "");
       const startTime = Date.now();
       let ack: false | "sent" | "queued" = false;
@@ -613,7 +710,7 @@ export const TOOLS: ToolDef[] = [
       }
       ctx.ledger.add("tool", `send_to_thread → ${threadId}: ${text.slice(0, 200)}`);
       // queued — сообщение стоит в очереди за текущим ходом агента: так и говорим.
-      ctx.reportAction("send_to_thread", "C", "done", `${ack === "queued" ? "В очереди" : "Отправил в"} «${String(ref.thread.title ?? threadId)}»`, threadId);
+      ctx.reportAction("send_to_thread", "C", "done", `${ack === "queued" ? "В очереди" : "Отправил в"} «${title}»`, threadId);
       return truncate({ sent: true, queued: ack === "queued", threadId });
     },
   },
@@ -632,19 +729,14 @@ export const TOOLS: ToolDef[] = [
       },
       required: ["thread"],
     },
-    confirmSay: (args) =>
-      args.grant
-        ? `Разрешить агенту в «${String(args.thread)}»?`
-        : `Ответить агенту в «${String(args.thread)}»: «${brief(args.answer)}»?`,
-    async execute(args, ctx) {
+    resolve: async (args, ctx) => {
       const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
+      if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
       const threadId = String(ref.thread.id);
+      const exactTitle = String(ref.thread.title ?? ref.thread.id);
       const interactions = ctx.sdk.threads.interactions;
-      const listed = await withTimeout(
-        (interactions as unknown as InteractionsArea).list({ threadId }),
-      );
-      const rows = (Array.isArray(listed) ? listed : (listed.interactions ?? [])) as Array<Record<string, unknown>>;
+      const listed = await withTimeout((interactions as unknown as InteractionsArea).list({ threadId }));
+      const rows = (Array.isArray(listed) ? listed : (listed?.interactions ?? [])) as Array<Record<string, unknown>>;
       let target: Record<string, unknown> | undefined;
       const wantedId = args.interactionId ? String(args.interactionId) : null;
       if (wantedId) target = rows.find((i) => String(i.id) === wantedId);
@@ -653,22 +745,83 @@ export const TOOLS: ToolDef[] = [
         return { ok: false, error: { code: "ambiguous", message: `у треда ${rows.length} ожидающих взаимодействий, назови какое` } };
       }
       if (!target) return { ok: false, error: { code: "not_found", message: "у треда нет ожидающих взаимодействий" } };
+      return {
+        ok: true,
+        resolvedArgs: {
+          ...args,
+          thread: exactTitle,
+          threadId,
+          interactionId: String(target.id),
+          _targetInteraction: target,
+        },
+      };
+    },
+    confirmSay: (args) =>
+      args.grant
+        ? `Разрешить агенту в «${String(args.thread)}»?`
+        : `Ответить агенту в «${String(args.thread)}»: «${brief(args.answer)}»?`,
+    async execute(args, ctx) {
+      let threadId = args.threadId ? String(args.threadId) : "";
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+      }
+      let target: Record<string, unknown> | undefined = args._targetInteraction as Record<string, unknown> | undefined;
+      if (!target) {
+        const interactions = ctx.sdk.threads.interactions;
+        const listed = await withTimeout((interactions as unknown as InteractionsArea).list({ threadId }));
+        const rows = (Array.isArray(listed) ? listed : (listed?.interactions ?? [])) as Array<Record<string, unknown>>;
+        const wantedId = args.interactionId ? String(args.interactionId) : null;
+        if (wantedId) target = rows.find((i) => String(i.id) === wantedId);
+        else if (rows.length === 1) target = rows[0];
+        else if (rows.length > 1) {
+          return { ok: false, error: { code: "ambiguous", message: `у треда ${rows.length} ожидающих взаимодействий, назови какое` } };
+        }
+      }
+      if (!target) return { ok: false, error: { code: "not_found", message: "у треда нет ожидающих взаимодействий" } };
       const interactionId = String(target.id);
       const payload = (target.payload ?? {}) as Record<string, unknown>;
       if (args.grant) {
+        const granted = payload.grantedPermissions ?? payload.permissions ?? payload.sessionGrant ?? null;
         await withTimeout(
-          (interactions as unknown as { resolve(a: { interactionId: string; threadId: string; resolution: unknown }): Promise<unknown> }).resolve({
+          (ctx.sdk.threads.interactions as unknown as { resolve(a: { interactionId: string; threadId: string; resolution: unknown }): Promise<unknown> }).resolve({
             interactionId,
             threadId,
-            resolution: { kind: "approval", decision: "allow_once", grantedPermissions: payload.grantedPermissions ?? null },
+            resolution: { kind: "approval", decision: "allow_once", grantedPermissions: granted },
           } as never),
         );
       } else {
+        const questions = (payload.questions ?? []) as Array<{
+          id: string;
+          prompt?: string;
+          allowFreeText?: boolean;
+          options?: Array<{ value: string; label: string; description?: string }>;
+        }>;
+        const answerStr = String(args.answer ?? "").trim();
+        let answers: Record<string, unknown>;
+        if (questions.length > 0) {
+          const ansMap: Record<string, { freeText?: string; selected: string[] }> = {};
+          for (const q of questions) {
+            const matched = q.options?.find(
+              (opt) =>
+                opt.value.toLowerCase() === answerStr.toLowerCase() ||
+                opt.label.toLowerCase() === answerStr.toLowerCase(),
+            );
+            ansMap[q.id] = {
+              selected: matched ? [matched.value] : [],
+              freeText: answerStr,
+            };
+          }
+          answers = ansMap;
+        } else {
+          answers = { default: { freeText: answerStr } };
+        }
         await withTimeout(
-          (interactions as unknown as { respond(a: { interactionId: string; threadId: string; value: unknown }): Promise<unknown> }).respond({
+          (ctx.sdk.threads.interactions as unknown as { respond(a: { interactionId: string; threadId: string; value: unknown }): Promise<unknown> }).respond({
             interactionId,
             threadId,
-            value: { kind: "user_answer", answers: { default: { freeText: String(args.answer ?? "") } } },
+            value: { kind: "user_answer", answers },
           } as never),
         );
       }
@@ -683,12 +836,19 @@ export const TOOLS: ToolDef[] = [
     word: "да",
     description: "Остановить тред. Подтверждение: «да» или «останавливай».",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Остановить тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      await withTimeout(ctx.sdk.threads.stop({ threadId: String(ref.thread.id) }) as Promise<unknown>);
-      ctx.reportAction("stop_thread", "C", "done", `Остановил «${String(ref.thread.title ?? ref.thread.id)}»`, String(ref.thread.id));
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
+      await withTimeout(ctx.sdk.threads.stop({ threadId }) as Promise<unknown>);
+      ctx.reportAction("stop_thread", "C", "done", `Остановил «${title}»`, threadId);
       return truncate({ stopped: true });
     },
   },
@@ -706,17 +866,41 @@ export const TOOLS: ToolDef[] = [
       },
       required: ["project", "task"],
     },
+    resolve: async (args, ctx) => {
+      const ref = String(args.project ?? "").trim();
+      if (!ref) return { ok: false, error: { code: "invalid_argument", message: "укажи проект" } };
+      const res = await resolveProjectRef(ctx.sdk, ref);
+      if (!res.ok) {
+        return {
+          ok: false,
+          error: {
+            code: res.code,
+            message: res.message,
+            ...(res.candidates ? { candidates: res.candidates } : {}),
+          },
+        };
+      }
+      const exactTitle = String(res.project.name ?? res.project.id);
+      return {
+        ok: true,
+        resolvedArgs: {
+          ...args,
+          project: exactTitle,
+          projectId: String(res.project.id),
+        },
+      };
+    },
     confirmSay: (args) => `Запустить агента в «${String(args.project)}»: «${brief(args.task)}»?`,
     async execute(args, ctx) {
-      const projects = (await withTimeout(ctx.sdk.projects.list() as Promise<Array<Record<string, unknown>>>)) ?? [];
-      const ref = String(args.project ?? "").trim().toLowerCase();
-      const project = (Array.isArray(projects) ? projects : []).find(
-        (p) => String(p.id ?? "").toLowerCase() === ref || String(p.name ?? "").toLowerCase().includes(ref),
-      );
-      if (!project) return { ok: false, error: { code: "not_found", message: `проект «${String(args.project)}» не найден` } };
+      let projectId = args.projectId ? String(args.projectId) : "";
+      if (!projectId) {
+        const res = await resolveProjectRef(ctx.sdk, String(args.project ?? ""));
+        if (!res.ok) return { ok: false, error: { code: res.code, message: res.message } };
+        projectId = String(res.project.id);
+      }
       const thread = await withTimeout(
         ctx.sdk.threads.spawn({
-          projectId: String(project.id),
+          projectId,
           prompt: String(args.task),
           title: `[голос] ${String(args.task).slice(0, 60)}`,
           environment: { type: "project-default" },
@@ -758,9 +942,33 @@ export const TOOLS: ToolDef[] = [
       properties: { title: { type: "string" }, spec: { type: "string" }, project: { type: "string" } },
       required: ["title", "spec"],
     },
-    confirmSay: (args) => `Создать задачу «${String(args.title)}»?`,
+    resolve: async (args, ctx) => {
+      if (args.project) {
+        const res = await resolveProjectRef(ctx.sdk, String(args.project));
+        if (!res.ok) {
+          return {
+            ok: false,
+            error: {
+              code: res.code,
+              message: res.message,
+              ...(res.candidates ? { candidates: res.candidates } : {}),
+            },
+          };
+        }
+        return {
+          ok: true,
+          resolvedArgs: {
+            ...args,
+            project: String(res.project.name ?? res.project.id),
+            projectId: String(res.project.id),
+          },
+        };
+      }
+      return { ok: true, resolvedArgs: args };
+    },
+    confirmSay: (args) => `Создать задачу «${String(args.title)}»${args.project ? ` в проекте «${String(args.project)}»` : ""}?`,
     async execute(args, ctx) {
-      const res = await pluginRpc(ctx, "tasks", "createTask", { title: args.title, description: args.spec, project: args.project });
+      const res = await pluginRpc(ctx, "tasks", "createTask", { title: args.title, description: args.spec, project: args.projectId ?? args.project });
       ctx.reportAction("tasks_create", "C", res.ok ? "done" : "failed", `Создал задачу «${String(args.title)}»`);
       return res;
     },
@@ -775,7 +983,8 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, preset: { type: "string" } },
       required: ["key", "preset"],
     },
-    confirmSay: (args) => `Раздать задачу ${String(args.key)} исполнителю (${String(args.preset)})?`,
+    resolve: resolveTaskToolArgs,
+    confirmSay: (args) => `Раздать задачу ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)} исполнителю (${String(args.preset)})?`,
     async execute(args, ctx) {
       const res = await pluginRpc(ctx, "tasks", "dispatch", { key: args.key, preset: args.preset });
       ctx.reportAction("tasks_dispatch", "L", res.ok ? "done" : "failed", `Раздал задачу ${String(args.key)}`);
@@ -988,7 +1197,8 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, body: { type: "string" } },
       required: ["key", "body"],
     },
-    confirmSay: (args) => `Комментарий к задаче ${String(args.key)}: «${brief(args.body)}»?`,
+    resolve: resolveTaskToolArgs,
+    confirmSay: (args) => `Комментарий к задаче ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)}: «${brief(args.body)}»?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "createComment", { key: args.key, body: args.body });
     },
@@ -1003,7 +1213,8 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, status: { type: "string", enum: ["backlog", "in_progress", "in_review", "done", "canceled"] } },
       required: ["key", "status"],
     },
-    confirmSay: (args) => `Перевести задачу ${String(args.key)} в «${String(args.status)}»?`,
+    resolve: resolveTaskToolArgs,
+    confirmSay: (args) => `Перевести задачу ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)} в «${String(args.status)}»?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, status: args.status });
     },
@@ -1018,7 +1229,8 @@ export const TOOLS: ToolDef[] = [
       properties: { key: { type: "string" }, due: { type: "string" } },
       required: ["key", "due"],
     },
-    confirmSay: (args) => `Срок задачи ${String(args.key)} — ${String(args.due)}?`,
+    resolve: resolveTaskToolArgs,
+    confirmSay: (args) => `Срок задачи ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)} — ${String(args.due)}?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, dueDate: args.due });
     },
@@ -1029,13 +1241,19 @@ export const TOOLS: ToolDef[] = [
     word: "да",
     description: "Тред в архив (не удаляет).",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Архивировать тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
       await withTimeout(ctx.sdk.threads.archive({ threadId }) as Promise<unknown>);
-      ctx.reportAction("archive_thread", "C", "done", `Архивировал «${String(ref.thread.title ?? threadId)}»`, threadId);
+      ctx.reportAction("archive_thread", "C", "done", `Архивировал «${title}»`, threadId);
       return truncate({ archived: true });
     },
   },
@@ -1045,13 +1263,19 @@ export const TOOLS: ToolDef[] = [
     word: "да",
     description: "Сжать контекст длинного треда (штатный /compact).",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Сжать контекст треда «${String(args.thread)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
       await withTimeout(ctx.sdk.threads.compact({ threadId }) as Promise<unknown>);
-      ctx.reportAction("compact_thread", "C", "done", `Сжал контекст «${String(ref.thread.title ?? threadId)}»`, threadId);
+      ctx.reportAction("compact_thread", "C", "done", `Сжал контекст «${title}»`, threadId);
       return truncate({ compacted: true });
     },
   },
@@ -1065,15 +1289,21 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, text: { type: "string" } },
       required: ["thread", "text"],
     },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `В очередь треда «${String(args.thread)}»: «${brief(args.text)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
       await withTimeout(
         (ctx.sdk.threads as unknown as { queuedMessages: { create(a: { threadId: string; text: string }): Promise<unknown> } }).queuedMessages.create({ threadId, text: `[голос] ${String(args.text)}` }),
       );
-      ctx.reportAction("queue_message", "C", "done", `В очередь «${String(ref.thread.title ?? threadId)}»`, threadId);
+      ctx.reportAction("queue_message", "C", "done", `В очередь «${title}»`, threadId);
       return truncate({ queued: true, threadId });
     },
   },
@@ -1087,15 +1317,21 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, unpin: { type: "boolean" } },
       required: ["thread"],
     },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `${args.unpin ? "Открепить" : "Закрепить"} тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
       const threads = ctx.sdk.threads as unknown as { pin(a: { threadId: string }): Promise<unknown>; unpin(a: { threadId: string }): Promise<unknown> };
       if (args.unpin) await withTimeout(threads.unpin({ threadId }));
       else await withTimeout(threads.pin({ threadId }));
-      ctx.reportAction("pin_thread", "C", "done", `${args.unpin ? "Открепил" : "Закрепил"} «${String(ref.thread.title ?? threadId)}»`, threadId);
+      ctx.reportAction("pin_thread", "C", "done", `${args.unpin ? "Открепил" : "Закрепил"} «${title}»`, threadId);
       return truncate({ pinned: !args.unpin });
     },
   },
@@ -1109,11 +1345,15 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, title: { type: "string" } },
       required: ["thread", "title"],
     },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Переименовать «${String(args.thread)}» в «${String(args.title)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+      }
       await withTimeout(ctx.sdk.threads.update({ threadId, title: String(args.title) } as never));
       ctx.reportAction("thread_rename", "C", "done", `Переименовал в «${String(args.title)}»`, threadId);
       return truncate({ renamed: true });
@@ -1129,13 +1369,19 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, unhide: { type: "boolean" } },
       required: ["thread"],
     },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `${args.unhide ? "Вернуть" : "Скрыть"} тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
       await withTimeout(ctx.sdk.threads.update({ threadId, visibility: args.unhide ? "visible" : "hidden" } as never));
-      ctx.reportAction("thread_hide", "C", "done", `${args.unhide ? "Вернул" : "Скрыл"} «${String(ref.thread.title ?? threadId)}»`, threadId);
+      ctx.reportAction("thread_hide", "C", "done", `${args.unhide ? "Вернул" : "Скрыл"} «${title}»`, threadId);
       return truncate({ hidden: !args.unhide });
     },
   },
@@ -1191,13 +1437,19 @@ export const TOOLS: ToolDef[] = [
     word: "запускай",
     description: "Перезапустить упавший тред. Класс L: только «запускай».",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Перезапустить тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const threadId = String(ref.thread.id);
+      let threadId = args.threadId ? String(args.threadId) : "";
+      let title = String(args.thread ?? "");
+      if (!threadId) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        threadId = String(ref.thread.id);
+        title = String(ref.thread.title ?? threadId);
+      }
       await withTimeout(ctx.sdk.threads.retry({ threadId }) as Promise<unknown>);
-      ctx.reportAction("retry_thread", "L", "done", `Перезапустил «${String(ref.thread.title ?? threadId)}»`, threadId);
+      ctx.reportAction("retry_thread", "L", "done", `Перезапустил «${title}»`, threadId);
       return truncate({ retried: true, threadId });
     },
   },
@@ -1234,11 +1486,15 @@ export const TOOLS: ToolDef[] = [
       properties: { thread: { type: "string" }, model: { type: "string" } },
       required: ["thread", "model"],
     },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Передать тред «${String(args.thread)}» на ${String(args.model)} в новом треде?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const source = ref.thread as Record<string, unknown>;
+      let source = args._targetThread as Record<string, unknown> | undefined;
+      if (!source) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        source = ref.thread as Record<string, unknown>;
+      }
       const out = await withTimeout(ctx.sdk.threads.output({ threadId: String(source.id) }) as Promise<{ output: string | null }>);
       const brief = String(out.output ?? "").slice(-1500);
       const thread = await withTimeout(
@@ -1260,11 +1516,15 @@ export const TOOLS: ToolDef[] = [
     word: "запускай",
     description: "Клонировать тред с контекстом для отдельной доработки.",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
+    resolve: resolveThreadToolArgs,
     confirmSay: (args) => `Клонировать тред «${String(args.thread)}»?`,
     async execute(args, ctx) {
-      const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
-      if (!ref.ok) return { ok: false, error: { code: "ambiguous", message: ref.message } };
-      const source = ref.thread as Record<string, unknown>;
+      let source = args._targetThread as Record<string, unknown> | undefined;
+      if (!source) {
+        const ref = await resolveThreadRef(ctx.sdk, String(args.thread ?? ""));
+        if (!ref.ok) return { ok: false, error: { code: ref.code, message: ref.message } };
+        source = ref.thread as Record<string, unknown>;
+      }
       const res = await withTimeout(ctx.sdk.threads.fork({ sourceThreadId: String(source.id) } as never) as Promise<{ id: string }>);
       const threadId = String(res.id);
       ctx.reportAction("fork_thread", "L", "done", `Клонировал «${String(source.title ?? source.id)}»`, threadId);
@@ -1414,19 +1674,45 @@ export const threadAnswerTool: ToolDef = {
     const interactionId = String(target.id);
     const payload = (target.payload ?? {}) as Record<string, unknown>;
     if (args.grant) {
+      const granted = payload.grantedPermissions ?? payload.permissions ?? payload.sessionGrant ?? null;
       await withTimeout(
         (interactions as unknown as { resolve(a: unknown): Promise<unknown> }).resolve({
           interactionId,
           threadId,
-          resolution: { kind: "approval", decision: "allow_once", grantedPermissions: payload.grantedPermissions ?? null },
+          resolution: { kind: "approval", decision: "allow_once", grantedPermissions: granted },
         }),
       );
     } else {
+      const questions = (payload.questions ?? []) as Array<{
+        id: string;
+        prompt?: string;
+        allowFreeText?: boolean;
+        options?: Array<{ value: string; label: string; description?: string }>;
+      }>;
+      const answerStr = String(args.answer ?? "").trim();
+      let answers: Record<string, unknown>;
+      if (questions.length > 0) {
+        const ansMap: Record<string, { freeText?: string; selected: string[] }> = {};
+        for (const q of questions) {
+          const matched = q.options?.find(
+            (opt) =>
+              opt.value.toLowerCase() === answerStr.toLowerCase() ||
+              opt.label.toLowerCase() === answerStr.toLowerCase(),
+          );
+          ansMap[q.id] = {
+            selected: matched ? [matched.value] : [],
+            freeText: answerStr,
+          };
+        }
+        answers = ansMap;
+      } else {
+        answers = { default: { freeText: answerStr } };
+      }
       await withTimeout(
         (interactions as unknown as { respond(a: unknown): Promise<unknown> }).respond({
           interactionId,
           threadId,
-          value: { kind: "user_answer", answers: { default: { freeText: String(args.answer ?? "") } } },
+          value: { kind: "user_answer", answers },
         }),
       );
     }
@@ -1583,16 +1869,24 @@ export async function runToolCall(
       return { result: { ok: false, error: { code: "internal", message: String(e) } }, executed: false };
     }
   }
-  const say = def.confirmSay ? def.confirmSay(args) : `${def.description} Подтвердите.`;
-  const cls = (def.name === "answer_interaction" || def.name === "thread_answer") && args.grant ? "P" : def.cls;
+  let callArgs = args;
+  if (def.resolve) {
+    const res = await def.resolve(args, ctx);
+    if (!res.ok) {
+      return { result: res, executed: false };
+    }
+    callArgs = res.resolvedArgs;
+  }
+  const say = def.confirmSay ? def.confirmSay(callArgs) : `${def.description} Подтвердите.`;
+  const cls = (def.name === "answer_interaction" || def.name === "thread_answer") && callArgs.grant ? "P" : def.cls;
   // Вслух — короткий вопрос, на карточке — полный текст, который уйдёт.
-  const full = ["text", "answer", "task", "body"].map((k) => args[k]).find((v) => typeof v === "string" && v.trim());
+  const full = ["text", "answer", "task", "body"].map((k) => callArgs[k]).find((v) => typeof v === "string" && v.trim());
   const card = typeof full === "string" && brief(full) !== full.trim() ? `${say}\n«${full.trim()}»` : say;
-  const req = ctx.gate.request(def.name, args, cls, say, card);
+  const req = ctx.gate.request(def.name, callArgs, cls, say, card);
   if ("rejected" in req) {
     return { result: { ok: false, error: { code: req.rejected, message: req.message } }, executed: false };
   }
-  ctx.rememberArgs?.(req.pending.argsHash, args);
+  ctx.rememberArgs?.(req.pending.argsHash, callArgs);
   if (req.pending.verdict === "approved") {
     // Исполняет только CallSession.onVerdict. Повторный вызов от модели отклоняем, чтобы не дублировать действие.
     return {
