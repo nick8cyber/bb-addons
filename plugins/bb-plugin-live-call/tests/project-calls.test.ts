@@ -376,9 +376,6 @@ describe("6. Защита реестра от подтверждения в зв
       pendingRegistryChanges: [
         { projectId: "p1", title: "CRM", hash: "h1", diff: ["добавлен коннектор"] },
       ],
-      onApproveRegistry: () => {
-        approvedCalled = true;
-      },
     });
 
     await session.start();
@@ -389,7 +386,7 @@ describe("6. Защита реестра от подтверждения в зв
     await vi.advanceTimersByTimeAsync(10);
 
     // Реестр НЕ должен быть подтверждён!
-    expect(approvedCalled).toBe(false);
+    expect(store.getApprovedProject("p1")).toBeNull();
   });
 
   it("реплика владельца голосом (речь) с «разрешаю» НЕ подтверждает изменение реестра (§15.2 п. 4)", async () => {
@@ -418,9 +415,6 @@ describe("6. Защита реестра от подтверждения в зв
       pendingRegistryChanges: [
         { projectId: "p1", title: "CRM", hash: "h1", diff: ["добавлен коннектор"] },
       ],
-      onApproveRegistry: () => {
-        approvedCalled = true;
-      },
     });
 
     await session.start();
@@ -431,7 +425,7 @@ describe("6. Защита реестра от подтверждения в зв
     await vi.advanceTimersByTimeAsync(10);
 
     // Реестр НЕ должен быть подтверждён!
-    expect(approvedCalled).toBe(false);
+    expect(store.getApprovedProject("p1")).toBeNull();
   });
 });
 
