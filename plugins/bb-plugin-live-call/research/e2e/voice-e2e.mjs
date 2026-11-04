@@ -165,8 +165,21 @@ for (let i = 0; i < 40 && !callId; i++) {
 check("звонок начался", callId, callId ?? "");
 if (!callId) { await browser.close(); process.exit(1); }
 log("callId", callId);
-const greeting = await waitEvent("agent_line", 0, 25000); // приветствие (в звонке по треду — пересказ, §12.11 п. 3)
-await sleep(1500);
+/** Ждём, пока звук страницы стихнет (1,5 с без звука подряд), не дольше maxMs: agent_line пишется по концу генерации, а звук ещё играет. */
+const waitSilence = async (maxMs = 60000) => {
+  const until = Date.now() + maxMs;
+  while (Date.now() < until) {
+    const now = Date.now();
+    const played = await page.evaluate(([a, b]) => window.__lcPlayed?.(a, b) ?? 0, [now - 1500, now]);
+    if (played === 0) return true;
+    await sleep(250);
+  }
+  return false;
+};
+// Звонок по треду начинается с пересказа (20–30 с, §12.11 п. 3); обычный звонок молчит до владельца.
+const greeting = THREAD_ID ? await waitEvent("agent_line", 0, 60000) : null;
+if (THREAD_ID) check("приветствие доиграло (тишина перед репликой владельца)", await waitSilence(60000));
+else await sleep(3000);
 
 if (SCENARIO === "open") {
   // §12.11 п. 3: без вопроса владельца голос пересказывает ответ агента на последний запрос владельца.
@@ -178,6 +191,19 @@ if (SCENARIO === "open") {
   const hits = words.filter((w) => first.includes(w.slice(0, 6)));
   check("первая реплика — не «обрабатываю информацию»", greeting && !/обрабатываю информацию/i.test(greeting.p.text), greeting?.p.text ?? "");
   check("пересказ последнего ответа агента без вопроса владельца", events("owner_line").length === 0 && hits.length >= 2, `совпало слов: ${hits.slice(0, 8).join(", ")}`);
+  // Сводка мозгового центра — справка (turnComplete:false): голос её сам не зачитывает…
+  const ctxEv = await waitEvent("system_context", 0, 75000, (e) => /сводк/i.test(e.p.text));
+  check("сводка пришла справкой (system_context)", ctxEv);
+  if (ctxEv) {
+    await sleep(Math.max(0, ctxEv.ts + 20000 - Date.now()));
+    const spoke = events("agent_line").filter((e) => e.ts > ctxEv.ts && !events("owner_line").some((o) => o.ts > ctxEv.ts && o.ts < e.ts));
+    check("сводку голос сам не зачитал (20 с тишины)", spoke.length === 0, spoke.map((e) => e.p.text).join(" | ").slice(0, 200));
+  }
+  // …но после неё отвечает на следующую реплику владельца
+  await waitSilence(30000);
+  const q = await say("ask_last");
+  const ans = await waitEvent("agent_line", q.at, 30000);
+  check("после справки голос отвечает на вопрос", ans, ans?.p.text?.slice(0, 120) ?? "");
 }
 
 if (SCENARIO === "general") {
