@@ -7,7 +7,7 @@ export const RPC_ENDPOINT = "/api/v1/plugins/live-call/rpc";
 export interface ProjectCallItem {
   projectId: string;
   title: string;
-  state: "approved" | "pending" | "invalid";
+  state: "approved" | "pending" | "invalid" | "rejected";
   hash?: string;
   diff?: string[];
   error?: string;

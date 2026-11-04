@@ -191,7 +191,7 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
       expect(callEngine.isActive()).toBe(false);
     });
 
-    it("если проект в состоянии pending — показывает «изменения реестра ждут подтверждения»", async () => {
+    it("если проект в состоянии pending — звонок всё равно идёт (§15.8: по прежнему подтверждённому реестру)", async () => {
       setCustomRpcHandler(async (method) => {
         if (method === "projectCallsList") {
           return {
@@ -212,8 +212,8 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
       const panelAction = registeredSlots.experimental_newThreadPanelAction;
       await panelAction.run({ projectId: "crm-proj" });
 
-      expect(callEngine.getSnapshot().overlayNotice).toBe("изменения реестра ждут подтверждения");
-      expect(callEngine.isActive()).toBe(false);
+      expect(callEngine.isActive()).toBe(true);
+      expect(callEngine.getSnapshot().targetProjectId).toBe("crm-proj");
     });
 
     it("если проект в состоянии approved — начинает звонок callEngine.start({ projectId })", async () => {
@@ -257,7 +257,7 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
   });
 
   describe("3. Команда «Live Call: позвонить по проекту» (§15.1 п. 2)", () => {
-    it("отфильтровывает проекты, оставляя только approved для выбора", async () => {
+    it("отфильтровывает проекты: approved и pending в выборе, invalid — нет", async () => {
       setCustomRpcHandler(async (method) => {
         if (method === "projectCallsList") {
           return {
@@ -279,15 +279,16 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
       expect(picker).toBeDefined();
       expect(picker?.projects).toEqual([
         { projectId: "p-approved-1", title: "CRM" },
+        { projectId: "p-pending", title: "Pending" },
         { projectId: "p-approved-2", title: "Infra" },
       ]);
     });
 
-    it("если нет approved проектов — показывает сообщение «звонок для проекта не настроен»", async () => {
+    it("если нет проектов со звонком — показывает сообщение «звонок для проекта не настроен»", async () => {
       setCustomRpcHandler(async (method) => {
         if (method === "projectCallsList") {
           return {
-            projects: [{ projectId: "p-pending", title: "Pending", state: "pending" }],
+            projects: [{ projectId: "p-invalid", title: "Broken", state: "invalid" }],
           } satisfies ProjectCallsListResult;
         }
         return {};
@@ -410,7 +411,7 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
   });
 
   describe("5. События window (§15.1, §15.8)", () => {
-    it("publishProjects публикует bb-live-call:projects только для approved проектов", async () => {
+    it("publishProjects публикует bb-live-call:projects для approved и pending (§15.1: список из реестра)", async () => {
       setCustomRpcHandler(async (method) => {
         if (method === "projectCallsList") {
           return {
@@ -433,7 +434,7 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
 
       expect(receivedEvent).not.toBeNull();
       expect(receivedEvent!.detail).toEqual({
-        projects: [{ projectId: "proj-app" }],
+        projects: [{ projectId: "proj-app" }, { projectId: "proj-pend" }],
       });
 
       window.removeEventListener(LIVE_CALL_PROJECTS_EVENT, listener);

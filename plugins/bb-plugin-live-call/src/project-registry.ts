@@ -40,6 +40,13 @@ export const connectorConfigSchema = z
           message: "stdio-коннектор требует непустой массив command",
           path: ["command"],
         });
+      } else if (!data.command[0].startsWith("/")) {
+        // §14.1: команда — абсолютный путь, без поиска по PATH (ревью PLUG-113)
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "stdio-коннектор: command[0] должен быть абсолютным путём (например /usr/bin/node)",
+          path: ["command", 0],
+        });
       }
     } else if (data.transport === "http") {
       if (!data.url) {

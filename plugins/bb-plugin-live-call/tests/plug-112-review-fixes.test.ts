@@ -239,7 +239,7 @@ describe("§16.7 п. 2: Звонок по треду и текущий реес�
         {
           id: "crm",
           transport: "stdio" as const,
-          command: ["node", "/server.js"],
+          command: ["/usr/bin/node", "/server.js"],
           defaultClass: "C" as const,
         },
       ],
@@ -328,7 +328,9 @@ describe("§16.7 п. 3: confirmSay ручки коннектора содерж�
     expect(say).toContain("amount=5000");
     expect(say).toContain("client=ACME Corp");
     expect(say).toContain("invoice_id=1234");
-    expect(say).toContain("Подтверждаете?");
+    // ревью PLUG-113 (C): без «Подтверждаете?» — эхо распознавалось как «подтверждаю»
+    expect(say).not.toContain("Подтверждаете");
+    expect(say.endsWith("?")).toBe(true);
 
     await session.end("owner");
   });
@@ -788,7 +790,7 @@ describe("§16.7 п. 7: Мелкие замечания ревью (п. 12–17)
         {
           id: "crm",
           transport: "stdio" as const,
-          command: ["node", "/v1/start.js"],
+          command: ["/usr/bin/node", "/v1/start.js"],
           defaultClass: "C" as const,
         },
       ],
@@ -799,7 +801,7 @@ describe("§16.7 п. 7: Мелкие замечания ревью (п. 12–17)
         {
           id: "crm",
           transport: "stdio" as const,
-          command: ["node", "/v2/start.js", "--prod"],
+          command: ["/usr/bin/node", "/v2/start.js", "--prod"],
           defaultClass: "C" as const,
         },
         {
@@ -813,7 +815,7 @@ describe("§16.7 п. 7: Мелкие замечания ревью (п. 12–17)
 
     const diff = computeProjectDiff(oldConfig, newConfig);
     // Новая команда присутствует в diff
-    expect(diff.some((d) => d.includes("изменена команда запуска [node /v1/start.js] → [node /v2/start.js --prod]"))).toBe(true);
+    expect(diff.some((d) => d.includes("изменена команда запуска [/usr/bin/node /v1/start.js] → [/usr/bin/node /v2/start.js --prod]"))).toBe(true);
     // URL замаскирован
     expect(diff.some((d) => d.includes("https://***:***@api.mycrm.local"))).toBe(true);
     expect(diff.every((d) => !d.includes("pass123"))).toBe(true);
@@ -829,7 +831,7 @@ describe("§16.7 п. 7: Мелкие замечания ревью (п. 12–17)
         {
           id: "crm",
           transport: "stdio" as const,
-          command: ["node", "/start.js"],
+          command: ["/usr/bin/node", "/start.js"],
           defaultClass: "C" as const,
         },
       ],
@@ -853,8 +855,8 @@ describe("§16.7 п. 7: Мелкие замечания ревью (п. 12–17)
     const invalidConfig = {
       title: "CRM",
       connectors: [
-        { id: "conn_1", transport: "stdio", command: ["node", "1.js"], defaultClass: "C" },
-        { id: "conn_1", transport: "stdio", command: ["node", "2.js"], defaultClass: "C" },
+        { id: "conn_1", transport: "stdio", command: ["/usr/bin/node", "1.js"], defaultClass: "C" },
+        { id: "conn_1", transport: "stdio", command: ["/usr/bin/node", "2.js"], defaultClass: "C" },
       ],
     };
     const res = projectConfigSchema.safeParse(invalidConfig);

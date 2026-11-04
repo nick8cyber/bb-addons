@@ -19,14 +19,15 @@ export function getLastPublishedProjects(): ReadonlyArray<{ projectId: string }>
 }
 
 /**
- * Публикация списка доступных (approved) проектов в window.
+ * Публикация списка проектов со звонком (approved и pending) в window.
  */
 export async function publishProjects(): Promise<Array<{ projectId: string }>> {
   if (typeof window === "undefined") return [];
   try {
     const list = await rpc<ProjectCallsListResult>("projectCallsList");
     const approved = (list.projects || [])
-      .filter((p) => p.state === "approved")
+      // pending тоже звонит (по прежнему подтверждённому реестру или без ручек, §15.8)
+      .filter((p) => p.state === "approved" || p.state === "pending")
       .map((p) => ({ projectId: p.projectId }));
     lastPublishedProjects = approved;
     window.dispatchEvent(

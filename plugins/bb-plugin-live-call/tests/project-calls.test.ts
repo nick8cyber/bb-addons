@@ -67,7 +67,7 @@ describe("1. Реестр projectCalls и выбор строгого класс
           {
             id: "crm",
             transport: "stdio",
-            command: ["node", "/path/server.js"],
+            command: ["/usr/bin/node", "/path/server.js"],
             tools: { clients_list: "R", payment_mark: "C" },
             defaultClass: "C",
           },
@@ -86,7 +86,7 @@ describe("1. Реестр projectCalls и выбор строгого класс
           {
             id: "crm",
             transport: "stdio",
-            command: ["node", "/path/server.js"],
+            command: ["/usr/bin/node", "/path/server.js"],
             defaultClass: "R",
           },
         ],
@@ -120,7 +120,7 @@ describe("1. Реестр projectCalls и выбор строгого класс
         {
           id: "crm",
           transport: "stdio",
-          command: ["node", "/old/server.js"],
+          command: ["/usr/bin/node", "/old/server.js"],
           tools: { get_data: "R", set_data: "C" },
           defaultClass: "C",
         },
@@ -132,7 +132,7 @@ describe("1. Реестр projectCalls и выбор строгого класс
         {
           id: "crm",
           transport: "stdio",
-          command: ["node", "/new/server.js"],
+          command: ["/usr/bin/node", "/new/server.js"],
           tools: { get_data: "C", set_data: "P" },
           defaultClass: "P",
         },
@@ -261,7 +261,7 @@ describe("5. RPC (§15.8): projectCallsList, projectCallsApprove, projectCallsRe
         {
           id: "crm",
           transport: "stdio" as const,
-          command: ["node", "/server.js"],
+          command: ["/usr/bin/node", "/server.js"],
           defaultClass: "C" as const,
         },
       ],
@@ -305,7 +305,7 @@ describe("5. RPC (§15.8): projectCallsList, projectCallsApprove, projectCallsRe
         {
           id: "crm",
           transport: "stdio" as const,
-          command: ["node", "/v1.js"],
+          command: ["/usr/bin/node", "/v1.js"],
           tools: { query: "R" as const },
           defaultClass: "deny" as const,
         },
@@ -323,7 +323,7 @@ describe("5. RPC (§15.8): projectCallsList, projectCallsApprove, projectCallsRe
         {
           id: "crm",
           transport: "stdio" as const,
-          command: ["node", "/v2.js"],
+          command: ["/usr/bin/node", "/v2.js"],
           tools: { query: "R" as const },
           defaultClass: "deny" as const,
         },
@@ -338,8 +338,8 @@ describe("5. RPC (§15.8): projectCallsList, projectCallsApprove, projectCallsRe
     // Смена команды без подтверждения не применяется: getApprovedConfig возвращает v1.js, а не v2.js (§15.2)
     const approved = mgr.getApprovedConfig("proj_1");
     expect(approved).not.toBeNull();
-    expect(approved!.config.connectors[0].command).toEqual(["node", "/v1.js"]);
-    expect(approved!.config.connectors[0].command).not.toEqual(["node", "/v2.js"]);
+    expect(approved!.config.connectors[0].command).toEqual(["/usr/bin/node", "/v1.js"]);
+    expect(approved!.config.connectors[0].command).not.toEqual(["/usr/bin/node", "/v2.js"]);
   });
 });
 
@@ -435,7 +435,7 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
     const client = new McpClient({
       id: "test",
       transport: "stdio",
-      command: ["node", fixturePath],
+      command: ["/usr/bin/node", fixturePath],
       defaultClass: "C",
     });
 
@@ -463,7 +463,7 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
       connectorConfigSchema.safeParse({
         id: "c1",
         transport: "stdio",
-        command: ["echo"],
+        command: ["/bin/echo"],
         defaultClass: "C",
         maxResultChars: 500,
       }).success,
@@ -473,7 +473,7 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
       connectorConfigSchema.safeParse({
         id: "c1",
         transport: "stdio",
-        command: ["echo"],
+        command: ["/bin/echo"],
         defaultClass: "C",
         maxResultChars: 20000,
       }).success,
@@ -484,7 +484,7 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
       connectorConfigSchema.safeParse({
         id: "c1",
         transport: "stdio",
-        command: ["echo"],
+        command: ["/bin/echo"],
         defaultClass: "C",
         maxResultChars: 499,
       }).success,
@@ -495,7 +495,7 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
       connectorConfigSchema.safeParse({
         id: "c1",
         transport: "stdio",
-        command: ["echo"],
+        command: ["/bin/echo"],
         defaultClass: "C",
         maxResultChars: 20001,
       }).success,
@@ -505,13 +505,13 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
     const oldConfig: ProjectConfig = {
       title: "P",
       connectors: [
-        { id: "c1", transport: "stdio", command: ["echo"], defaultClass: "C", maxResultChars: 2000 },
+        { id: "c1", transport: "stdio", command: ["/bin/echo"], defaultClass: "C", maxResultChars: 2000 },
       ],
     };
     const newConfig: ProjectConfig = {
       title: "P",
       connectors: [
-        { id: "c1", transport: "stdio", command: ["echo"], defaultClass: "C", maxResultChars: 8000 },
+        { id: "c1", transport: "stdio", command: ["/bin/echo"], defaultClass: "C", maxResultChars: 8000 },
       ],
     };
     const diffs = computeProjectDiff(oldConfig, newConfig);
@@ -523,7 +523,7 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
     const client = new McpClient({
       id: "test",
       transport: "stdio",
-      command: ["node", fixturePath],
+      command: ["/usr/bin/node", fixturePath],
       defaultClass: "C",
       maxResultChars: 500,
     });
@@ -535,6 +535,24 @@ describe("7. MCP-коннектор stdio и вызовы ручек (§15.4, §
     expect(res.ok).toBe(true);
     expect(res.data?.result.length).toBeLessThanOrEqual(500);
     expect(res.data?.result.endsWith("…")).toBe(true);
+    client.close();
+  });
+});
+
+describe("ревью PLUG-113: stdio-коннектор — только абсолютный путь (§14.1)", () => {
+  it("command[0] без «/» — реестр некорректен", () => {
+    expect(connectorConfigSchema.safeParse({ id: "c1", transport: "stdio", command: ["node", "/x.js"], defaultClass: "C" }).success).toBe(false);
+    expect(connectorConfigSchema.safeParse({ id: "c1", transport: "stdio", command: ["/usr/bin/node", "/x.js"], defaultClass: "C" }).success).toBe(true);
+  });
+});
+
+describe("ревью PLUG-113: HTTP-коннектор — обрыв сети посреди звонка", () => {
+  it("fetch падает — connector_unavailable, а не connector_error", async () => {
+    const { McpClient } = await import("../src/mcp-client.js");
+    const client = new McpClient({ id: "h1", transport: "http", url: "http://127.0.0.1:1/mcp", defaultClass: "C" } as never, {});
+    const res = await client.callTool("x", {}, 2000);
+    expect(res.ok).toBe(false);
+    expect((res as { error: { code: string } }).error.code).toBe("connector_unavailable");
     client.close();
   });
 });

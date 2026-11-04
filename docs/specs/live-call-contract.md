@@ -507,8 +507,9 @@ version}`) → `notifications/initialized` → `tools/list` (с курсором
 - **R** — сразу `tools/call {name: <tool>, arguments}`; таймаут и размер ответа — §15.4 п. 5.
 - **C/P/L** — как встроенные (§5, `runToolCall`): `gate.request(name, args, cls, say)`;
   исполнение — только в `CallSession.onVerdict` после `approved`; повтор после
-  `approved` — `already_running`. `say` — «<понятное имя ручки>: <аргумент>=<значение>, …
-  (все аргументы). Подтверждаете?».
+  `approved` — `already_running`. `say` (вслух) — «<понятное имя ручки>: <аргумент>=<значение>, …?»
+  без слова «Подтверждаете» (пересмотр 04.11, §7.1 п. 3.1: эхо «подтверждаете» распознаётся как
+  «подтверждаю»); карточка — имя ручки, коннектор и все аргументы полностью.
 - **Ответ MCP:** `isError: true` → `{ok:false, error:{code:"connector_error", message}}`
   (`message` ≤ 500 знаков); иначе `structuredContent`, если есть, или склеенные
   `text`-части (прочие части — заглушка `[<type>]`); затем фильтр секретов и сжатие до
@@ -586,7 +587,7 @@ HTTP — на локальном `http.createServer` с SSE; перевод сх
       {
         "id": "crm",
         "transport": "stdio",
-        "command": ["node", "/абсолютный/путь/server.js"],
+        "command": ["/usr/bin/node", "/абсолютный/путь/server.js"],
         "secrets": ["CRM_TOKEN"],
         "tools": { "clients_list": "R", "payment_mark": "C" },
         "defaultClass": "C",
@@ -678,13 +679,14 @@ HTTP — на локальном `http.createServer` с SSE; перевод сх
 
 | Метод | Вход | Выход |
 |---|---|---|
-| `projectCallsList` | `{}` | `{ projects: Array<{ projectId: string; title: string; state: "approved" \| "pending" \| "invalid"; hash?: string; diff?: string[]; error?: string }> }` |
+| `projectCallsList` | `{}` | `{ projects: Array<{ projectId: string; title: string; state: "approved" \| "pending" \| "invalid" \| "rejected"; hash?: string; diff?: string[]; error?: string }> }` |
 | `projectCallsApprove` | `{ projectId: string; hash: string }` | `{ ok: boolean; error?: string }` — `hash` из `projectCallsList` (поле `hash` у `pending`), иначе `stale` |
 | `projectCallsReject` | `{ projectId: string }` | `{ ok: boolean }` |
 
 - `state`:
   - `approved` — реестр проекта подтверждён, звонок разрешён;
   - `pending` — изменён и ждёт подтверждения, `diff` — строки для показа;
+  - `rejected` — владелец отклонил изменение; экран показывает diff и кнопку «Подтвердить», передумать можно;
   - `invalid` — ошибка разбора, звонок запрещён.
 - Подтверждение — только кнопкой через `projectCallsApprove` (§15.2, решение владельца 03.11).
 - Звонок по проекту начинает интерфейс: `callEngine.start({ projectId })`, кадр `hello { projectId }` (§15.1). Сервер отвечает `project_not_configured`, если проекта нет в реестре. Неподтверждённый реестр звонок **не блокирует**: звонок идёт по прежнему подтверждённому (§15.2), голос одной фразой предупреждает; `registry_pending` не используется.

@@ -129,6 +129,14 @@ ${historyFile}
 
       this.threadId = String(spawned.id);
       this.opts.store.event(this.opts.callId, "brain_started", { threadId: this.threadId });
+      // Звонок завершился, пока тред создавался: archive() уже прошёл без threadId — убираем сами.
+      if (this.closed) {
+        const id = this.threadId;
+        this.threadId = null;
+        await this.opts.sdk.threads.stop({ threadId: id }).catch(() => {});
+        await this.opts.sdk.threads.archive({ threadId: id }).catch(() => {});
+        return null;
+      }
 
       // Ожидание начальной сводки до 60 с
       void this.waitInitialSummary();

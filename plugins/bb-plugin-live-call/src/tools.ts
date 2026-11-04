@@ -61,6 +61,8 @@ export interface ToolDef {
   ) => Promise<{ ok: true; resolvedArgs: Record<string, unknown> } | { ok: false; error: { code: string; message: string } }>;
   /** Готовая фраза-вопрос для подтверждения; {args} подставляются. */
   confirmSay?: (args: Record<string, unknown>) => string;
+  /** Полный текст карточки подтверждения; нет — вопрос плюс полный текст сообщения/ответа/задачи. */
+  confirmCard?: (args: Record<string, unknown>) => string;
   execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 }
 
@@ -1888,7 +1890,9 @@ export async function runToolCall(
   const cls = (def.name === "answer_interaction" || def.name === "thread_answer") && callArgs.grant ? "P" : def.cls;
   // Вслух — короткий вопрос, на карточке — полный текст, который уйдёт.
   const full = ["text", "answer", "task", "body"].map((k) => callArgs[k]).find((v) => typeof v === "string" && v.trim());
-  const card = typeof full === "string" && brief(full) !== full.trim() ? `${say}\n«${full.trim()}»` : say;
+  const card = def.confirmCard
+    ? def.confirmCard(callArgs)
+    : typeof full === "string" && brief(full) !== full.trim() ? `${say}\n«${full.trim()}»` : say;
   const req = ctx.gate.request(def.name, callArgs, cls, say, card);
   if ("rejected" in req) {
     return { result: { ok: false, error: { code: req.rejected, message: req.message } }, executed: false };

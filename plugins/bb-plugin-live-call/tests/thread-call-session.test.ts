@@ -461,3 +461,29 @@ describe("приёмка 04.11: сводка не обрывает ответ, �
     expect(events).toEqual(["ending", "ended"]);
   });
 });
+
+describe("ревью PLUG-113, D: «Завершить» во время старта звонка", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("end() пока звонок стартует — голосовая сессия Gemini не открывается", async () => {
+    const { s, frames } = makeThreadCall("thr_target_slow");
+    let release!: () => void;
+    const slow = new Promise<void>((r) => { release = r; });
+    const sdk = (s as unknown as { deps: { sdk: { threads: { get: (a: unknown) => Promise<unknown> } } } }).deps.sdk;
+    const get = sdk.threads.get;
+    sdk.threads.get = async (a) => { await slow; return get(a); };
+    const started = s.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await s.end("owner");
+    release();
+    await started;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(frames.some((f) => f.type === "ended")).toBe(true);
+    expect(FakeWs.all.every((w) => w.readyState === 3)).toBe(true);
+    expect(frames.some((f) => f.type === "ready")).toBe(false);
+  });
+});

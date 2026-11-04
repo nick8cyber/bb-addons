@@ -403,7 +403,9 @@ export class CallSession extends EventEmitter {
       this.deps.store.startCall(this.deps.callId);
     }
 
+    if (this.bailIfEnded()) return;
     this.promptContext = await this.buildPromptContext();
+    if (this.bailIfEnded()) return;
     this.deps.store.setModeHistory(this.deps.callId, this.modeHistory);
     try {
       await this.openSessions();
@@ -411,6 +413,7 @@ export class CallSession extends EventEmitter {
       this.frame({ type: "error", code: "no_keys", message: String(e), retryable: false });
       return this.end("error");
     }
+    if (this.bailIfEnded()) return;
     this.frame({
       type: "ready",
       callId: this.deps.callId,
@@ -431,6 +434,26 @@ export class CallSession extends EventEmitter {
     if (this.ended) return;
     this.gate.tick();
     setTimeout(() => this.gateTicker(), 1000);
+  }
+
+  /**
+   * Звонок завершили, пока он стартовал (браузер закрыли, «Завершить» до ready): всё, что
+   * успело открыться после end(), закрывается здесь, голос не открывается (ревью PLUG-113, D).
+   */
+  private bailIfEnded(): boolean {
+    if (!this.ended) return false;
+    const v = this.voice;
+    this.voice = null;
+    v?.close();
+    for (const c of this.connectorClients) {
+      try {
+        c.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.connectorClients = [];
+    return true;
   }
 
   private async openSessions(handle?: string) {
@@ -548,7 +571,9 @@ export class CallSession extends EventEmitter {
       const client = clients[i].client;
 
       if (r.status === "rejected") {
-        const errStr = String(r.reason?.message ?? r.reason);
+        // Текст ошибки initialize от коннектора может нести секрет или URL с учёткой (§16.7 п. 4).
+        const exact = (connCfg.secrets ?? []).map((n) => this.deps.projectSecrets?.[n] ?? "").filter((v) => v.length >= 4);
+        const errStr = maskSecrets(String(r.reason?.message ?? r.reason), exact);
         const isMissingSecret = /connector_secret_missing/i.test(errStr);
         const reason = isMissingSecret ? "connector_secret_missing" : errStr.slice(0, 300);
 
@@ -607,12 +632,12 @@ export class CallSession extends EventEmitter {
           word: strictCls === "C" ? "да" : strictCls === "P" ? "разрешаю" : strictCls === "L" ? "запускай" : "",
           description: (t.description || `Ручка ${t.name} коннектора ${connCfg.id}`).slice(0, 1000),
           parameters: geminiParams,
-          // §14.5, §16.7 п. 3: confirmSay содержит имя и все аргументы с форматированием и усечением
+          // §14.5, §16.7 п. 3: вслух — имя ручки и аргументы коротко, без «Подтверждаете?»
+          // (эхо «подтверждаете» распознавалось как «подтверждаю» — ревью PLUG-113, C);
+          // карточка — все аргументы полностью.
           confirmSay: (args: Record<string, unknown>) => {
             const entries = Object.entries(args ?? {});
-            if (entries.length === 0) {
-              return `${t.name} в ${connCfg.id}. Подтверждаете?`;
-            }
+            if (entries.length === 0) return `${t.name} в ${connCfg.id}?`;
             const formattedArgs = entries
               .map(([k, v]) => {
                 const valStr = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
@@ -621,8 +646,12 @@ export class CallSession extends EventEmitter {
               })
               .join(", ");
             const truncatedArgs = formattedArgs.length > 200 ? formattedArgs.slice(0, 199) + "…" : formattedArgs;
-            return `${t.name}: ${truncatedArgs}. Подтверждаете?`;
+            return `${t.name}: ${truncatedArgs}?`;
           },
+          confirmCard: (args: Record<string, unknown>) =>
+            `${t.name} (${connCfg.id})\n${Object.entries(args ?? {})
+              .map(([k, v]) => `${k} = ${typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)}`)
+              .join("\n")}`,
           execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
             const startMs = Date.now();
             const res = await client.callTool(t.name, args, 30_000);
@@ -858,12 +887,13 @@ export class CallSession extends EventEmitter {
     let agentBuf = "";
     client.on("outputTranscript", (text: string) => {
       if (!text) return;
-      this.gate.onModelTranscript(text);
       // Транскрипт приходит и кусками, и кумулятивно в аудио-сообщениях:
       // кумулятивный кусок, начинающийся с накопленного, ЗАМЕНЯЕТ его, а не дублирует.
       if (text.startsWith(agentBuf) && agentBuf.length > 0) agentBuf = text;
       else if (agentBuf.startsWith(text)) return; // кусок уже внутри накопленного
       else agentBuf += text;
+      // Шлюзу — склеенный текст хода: кусок может резать слово («ок»+«ей»), ревью PLUG-113.
+      this.gate.onModelTranscript(agentBuf);
       this.frame({ type: "transcript", role: "agent", text, final: false });
     });
     client.on("turnComplete", () => {
@@ -991,7 +1021,7 @@ export class CallSession extends EventEmitter {
           tool: def.name,
           ...(isConnectorTool ? {} : { args: call.args }),
           code: result.error.code,
-          message: maskSecrets(result.error.message.slice(0, 300)),
+          message: maskSecrets(result.error.message.slice(0, 300), Object.values(this.deps.projectSecrets ?? {}).filter((v) => v.length >= 4)),
         });
       } else if (result.ok) {
         this.lastFailedTool = null;
@@ -1068,8 +1098,11 @@ export class CallSession extends EventEmitter {
         this.enqueueSystem(def.name, result);
       } else {
         // Запись: toolResponse откладывается до вердикта (спека §2.1 п. 4).
-        this.pendingToolResponses.set(hash, { functionId: call.id, def: def.name, args: call.args });
         const { result } = await runToolCall(def, call.args, call.id, this.toolContext());
+        // Хеш записи считается по аргументам после resolve — ключ ответа берём у шлюза,
+        // иначе вердикт искал бы ответ по хешу сырых аргументов (ревью PLUG-113).
+        const pendingHash = this.gate.pendingConfirmation()?.argsHash ?? hash;
+        this.pendingToolResponses.set(pendingHash, { functionId: call.id, def: def.name, args: call.args });
         void result; // needsConfirmation уже вставлен в VOICE через gate events.
       }
     }
@@ -1499,11 +1532,16 @@ export class CallSession extends EventEmitter {
       clearInterval(this.micReporter);
       this.micReporter = null;
     }
-    this.deps.store.endCall(this.deps.callId, reason);
+    // Хост освобождается сразу и в любом случае: новый звонок не получает busy, а закрытие
+    // сокета браузером после ended не запускает ожидание возврата. Ошибка записи в SQLite
+    // не должна держать хост (ревью PLUG-113). Уборка ниже идёт фоном.
+    try {
+      this.deps.store.endCall(this.deps.callId, reason);
+    } catch (e) {
+      this.deps.log?.warn?.(`не записал конец звонка ${this.deps.callId}: ${String(e)}`);
+    }
     this.frame({ type: "ended", callId: this.deps.callId, threadId: this.threadId, reason });
     this.setState("ended");
-    // Хост освобождается сразу: новый звонок не получает busy, а закрытие сокета
-    // браузером после ended не запускает ожидание возврата. Уборка ниже идёт фоном.
     this.emit("ending");
     if (this.threadId && this.threadId !== this.targetThreadId) {
       try {

@@ -146,6 +146,8 @@ export default async function plugin(bb: BbPluginApi) {
   const turnClosedWaiters = new Map<string, () => void>();
 
   /** link.sock меняется при переподключении браузера; detached — браузер отвалился, ждём возврата. */
+  /** Старт звонка идёт, а active ещё не заполнен (окно между hello и active). */
+  let starting = false;
   let active: {
     session: CallSession;
     startedAt: number;
@@ -291,6 +293,7 @@ export default async function plugin(bb: BbPluginApi) {
     mode: "normal" | "extended",
     targetThreadId?: string,
     targetProjectId?: string,
+    onSession?: (s: CallSession) => void,
   ): Promise<CallSession> => {
     const keys = await keysList();
     if (keys.length === 0) {
@@ -373,6 +376,10 @@ export default async function plugin(bb: BbPluginApi) {
     session.on("ending", release);
     session.on("ended", release);
     active = { session, startedAt: Date.now(), link, detached: false, grace: null };
+    // Сессия видна соединению до конца старта: «Завершить» и закрытие браузера во время
+    // долгого старта (коннекторы до 10 с, тред) доходят до неё — иначе звонок-сирота держал
+    // хост до maxCallMinutes (ревью PLUG-113, D).
+    onSession?.(session);
     await session.start();
     // Лимит минут: проверка раз в 30 с (спека §4).
     const interval = setInterval(() => {
@@ -453,6 +460,13 @@ export default async function plugin(bb: BbPluginApi) {
                   retryable: false,
                 } satisfies ServerFrame));
                 sock.close(UNAUTHORIZED_CLOSE_CODE, "unauthorized");
+                return;
+              }
+              // Звонок уже стартует, но ещё не записан в active (ключи, настройки, тред):
+              // второй hello в это окно не должен открыть второй звонок (ревью PLUG-113).
+              if (!active && starting) {
+                sock.send(JSON.stringify({ type: "error", code: "busy", message: "уже идёт звонок", retryable: false } satisfies ServerFrame));
+                sock.close(BUSY_CLOSE_CODE, "busy");
                 return;
               }
               const decision = decideHello(
@@ -543,10 +557,16 @@ export default async function plugin(bb: BbPluginApi) {
               // Extended отключён (владелец 03.11, ADR-0006 пересмотр 2): модель Google ломается
               // («системная ошибка», нет инструментов). Любой звонок — одна сессия gemini-3.8-live.
               const callMode = "normal" as const;
+              starting = true;
               try {
-                state.session = await startCall(sock, callMode, frame.threadId, frame.projectId);
+                state.session = await startCall(sock, callMode, frame.threadId, frame.projectId, (s) => {
+                  state.session = s;
+                  starting = false;
+                });
               } catch {
                 // Ошибка уже ушла фреймом и соединение закрыто.
+              } finally {
+                starting = false;
               }
               return;
             }

@@ -38,8 +38,18 @@ export type RequestResult =
   | { pending: PendingConfirmation }
   | { rejected: "pending_exists" | "recent_verdict"; message: string };
 
-/** Канонический хеш аргументов: отсортированные ключи, без пробелов (контракт §5). */
+/**
+ * Канонический хеш аргументов: отсортированные ключи, без пробелов (контракт §5).
+ * Служебные ключи `_*` верхнего уровня (запись треда, взаимодействия из resolve) в хеш не входят:
+ * у них меняются updatedAt/status, и один и тот же вызов давал разный хеш — ломались
+ * «тот же вызов → та же запись» и «уже выполнено» (ревью PLUG-113, блокер A).
+ */
 export function argsHash(tool: string, args: Record<string, unknown>): string {
+  const stable = Object.fromEntries(Object.entries(args).filter(([k]) => !k.startsWith("_")));
+  return argsHashRaw(tool, stable);
+}
+
+function argsHashRaw(tool: string, args: Record<string, unknown>): string {
   const canonical = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(canonical);
     if (v && typeof v === "object") {
@@ -105,6 +115,8 @@ export class ConfirmationGate {
    */
   private modelSpeech: Array<{ at: number; words: string[] }> = [];
   private bargeTimer: unknown = null;
+  /** До этого момента куски транскрипта — хвост уже отброшенной реплики. */
+  private tailUntil = 0;
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
   private usedIds = new Set<string>();
   private confirmWaiters = new Map<string, Array<{ resolve: (v: Verdict) => void; timer: unknown }>>();
@@ -154,6 +166,7 @@ export class ConfirmationGate {
     // в onOwnerTranscriptChunk: до открытия окна засчитывается только согласие,
     // не раньше BARGE_IN_MIN_MS и не совпадающее со словами самого вопроса.
     this.resetWindow();
+    this.tailUntil = 0;
     this.micOpen = true;
     this.events.onConfirmationUpdate?.(this.pending, "asking");
     return { pending: this.pending };
@@ -221,7 +234,14 @@ export class ConfirmationGate {
    */
   onOwnerTranscriptChunk(text: string, at = this.clock.now()) {
     if (!this.pending) return;
-    if (this.windowOpenAt === null || at < this.windowOpenAt) {
+    // Хвост реплики, начатой раньше: продлевается до 700 мс тишины и отбрасывается целиком
+    // (§7.1 п. 3.1, п. 3.5; ревью PLUG-113, блокер B).
+    if (at < this.tailUntil) {
+      this.tailUntil = at + UTTERANCE_SILENCE_MS;
+      return;
+    }
+    // Реплика-перебивание, начатая до окна, доигрывается в том же пути, а не режется окном.
+    if (this.bargeUtterance || this.windowOpenAt === null || at < this.windowOpenAt) {
       this.onBargeInChunk(text, at);
       return;
     }
@@ -252,8 +272,12 @@ export class ConfirmationGate {
     const p = this.pending;
     if (!p || p.verdict !== null) return;
     if (!this.bargeUtterance) {
-      // Хвост реплики-просьбы владельца, пришедший после вызова, — не ответ.
-      if (at - p.createdAt < BARGE_IN_MIN_MS) return;
+      // Реплика, начатая раньше 1,5 с от запроса, — хвост просьбы владельца, не ответ:
+      // отбрасывается вместе со всеми кусками до паузы.
+      if (at - p.createdAt < BARGE_IN_MIN_MS) {
+        this.tailUntil = at + UTTERANCE_SILENCE_MS;
+        return;
+      }
       this.bargeUtterance = { firstChunkAt: at, lastChunkAt: at, text };
     } else {
       this.bargeUtterance.text += text;
@@ -277,7 +301,10 @@ export class ConfirmationGate {
       ...this.modelSpeech.filter((c) => c.at >= since).flatMap((c) => c.words),
     ]);
     const words = normalizeUtterance(u.text);
-    if (words.length === 0 || words.every((w) => sayWords.has(w))) return;
+    // Однокоренные слова тоже эхо: «подтверждаете» ↔ «подтверждаю», «отправляю» ↔ «отправляй».
+    const stems = new Set([...sayWords].filter((x) => x.length >= 6).map((x) => x.slice(0, 6)));
+    const echoWord = (w: string) => sayWords.has(w) || (w.length >= 6 && stems.has(w.slice(0, 6)));
+    if (words.length === 0 || words.every(echoWord)) return;
     if (classify(u.text, p.class, this.words) !== "approved") return;
     p.verdict = "approved";
     this.micOpen = true;

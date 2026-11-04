@@ -65,14 +65,13 @@ export default definePluginApp((app) => {
           callEngine.showNotice("звонок для проекта не настроен");
           return;
         }
-        if (project.state === "approved") {
+        // pending звонит по прежнему подтверждённому реестру; голос сам скажет подтвердить (§15.8)
+        if (project.state === "approved" || project.state === "pending") {
           if (callEngine.isActive()) {
             callEngine.requestExpand();
           } else {
             callEngine.start({ projectId });
           }
-        } else if (project.state === "pending") {
-          callEngine.showNotice("изменения реестра ждут подтверждения");
         } else {
           callEngine.showNotice("звонок для проекта не настроен");
         }
@@ -97,7 +96,7 @@ export default definePluginApp((app) => {
     run: async () => {
       try {
         const res = await rpc<ProjectCallsListResult>("projectCallsList");
-        const approved = (res.projects || []).filter((p) => p.state === "approved");
+        const approved = (res.projects || []).filter((p) => p.state === "approved" || p.state === "pending");
         if (approved.length === 0) {
           callEngine.showNotice("звонок для проекта не настроен");
           return;

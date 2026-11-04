@@ -1,6 +1,7 @@
 /**
  * Живая проверка звонка по треду (кадр text, без синтеза речи).
  * node research/probes/thread-call-check.mjs <threadId> "<реплика1>|<реплика2>|..."
+ * PROJECT=1 — первый аргумент projectId, звонок по проекту (§15).
  * Печатает реплики, карточки подтверждения (summary), действия; на подтверждение жмёт «Подтвердить».
  * В конце — «Завершить» и время до кадра ended. Запускать фоном; перед — bb call status.
  */
@@ -20,7 +21,7 @@ const next = () => {
 };
 setTimeout(() => { log("TIMEOUT"); process.exit(2); }, 300_000);
 setInterval(() => { if (ready && !endAt && Date.now() - lastAgent > 14_000) next(); }, 1000);
-ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN, threadId: target }));
+ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN, ...(process.env.PROJECT ? { projectId: target } : { threadId: target }) }));
 ws.onmessage = (ev) => {
   if (typeof ev.data !== "string") { lastAgent = Date.now(); return; }
   const f = JSON.parse(ev.data);

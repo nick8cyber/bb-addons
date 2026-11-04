@@ -455,14 +455,27 @@ export class McpClient {
     const id = ++this.reqId;
     const req = { jsonrpc: "2.0", id, method, params };
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(req),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(req),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e) {
+      const name = (e as { name?: string })?.name;
+      if (name === "TimeoutError" || name === "AbortError") throw new Error(`timeout: таймаут ${timeoutMs} мс`);
+      // Сеть оборвалась посреди звонка: коннектор недоступен до конца звонка (§14.5, ревью PLUG-113)
+      this.alive = false;
+      throw new Error(`connector_unavailable: ${String((e as Error)?.message ?? e)}`);
+    }
 
     if (!res.ok) {
+      if (res.status >= 500) {
+        this.alive = false;
+        throw new Error(`connector_unavailable: HTTP ${res.status} ${res.statusText}`);
+      }
       throw new Error(`HTTP ${res.status} ${res.statusText}`);
     }
 

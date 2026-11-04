@@ -199,12 +199,13 @@ export function ProjectCallsView({
                   {p.state === "approved" && <span className="lc-ok">Подтверждён</span>}
                   {p.state === "pending" && <span className="lc-bad" style={{ color: "var(--warning, #eab308)" }}>Ждёт подтверждения</span>}
                   {p.state === "invalid" && <span className="lc-bad">Ошибка</span>}
+                  {p.state === "rejected" && <span className="lc-bad">Отклонён — можно подтвердить</span>}
                 </div>
               </div>
 
               {p.error && <p className="lc-bad" style={{ margin: 0 }}>{p.error}</p>}
 
-              {p.state === "pending" && (
+              {(p.state === "pending" || p.state === "rejected") && (
                 <div style={{ marginTop: "4px" }}>
                   {p.diff && p.diff.length > 0 && (
                     <pre

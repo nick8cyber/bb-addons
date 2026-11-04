@@ -35,6 +35,7 @@ export class EventBridge {
   reset(): void {
     this.watched.clear();
     this.queue = [];
+    this.pendingCache.clear();
   }
 
   setModelBusy(busy: boolean) {
