@@ -121,6 +121,14 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       expect(gate.pendingConfirmation()).not.toBeNull();
     });
 
+    it("модель сказала вопрос своими словами («Да, конечно…») — эхо этих слов не подтверждает", () => {
+      const { gate, verdicts, sayNow } = setup();
+      gate.onModelTranscript("Да, конечно. Отправить в тред?");
+      sayNow("да конечно", 2000);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
     it("отказ и шум во время вопроса не отменяют — отказ после вопроса или кнопкой", () => {
       const { gate, verdicts, sayNow } = setup();
       sayNow("отмена", 2000);

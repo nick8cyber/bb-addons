@@ -743,6 +743,7 @@ export class CallSession extends EventEmitter {
     let agentBuf = "";
     client.on("outputTranscript", (text: string) => {
       if (!text) return;
+      this.gate.onModelTranscript(text);
       // Транскрипт приходит и кусками, и кумулятивно в аудио-сообщениях:
       // кумулятивный кусок, начинающийся с накопленного, ЗАМЕНЯЕТ его, а не дублирует.
       if (text.startsWith(agentBuf) && agentBuf.length > 0) agentBuf = text;

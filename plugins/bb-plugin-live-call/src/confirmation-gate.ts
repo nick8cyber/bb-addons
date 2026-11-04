@@ -95,6 +95,8 @@ export class ConfirmationGate {
   private currentUtterance: Utterance | null = null;
   private utteranceTimer: unknown = null;
   private bargeUtterance: Utterance | null = null;
+  /** Слова, сказанные моделью после запроса подтверждения: эхо из динамиков не может быть ответом. */
+  private modelWords = new Set<string>();
   private bargeTimer: unknown = null;
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
   private usedIds = new Set<string>();
@@ -145,6 +147,7 @@ export class ConfirmationGate {
     // в onOwnerTranscriptChunk: до открытия окна засчитывается только согласие,
     // не раньше BARGE_IN_MIN_MS и не совпадающее со словами самого вопроса.
     this.resetWindow();
+    this.modelWords.clear();
     this.micOpen = true;
     this.events.onConfirmationUpdate?.(this.pending, "asking");
     return { pending: this.pending };
@@ -226,6 +229,12 @@ export class ConfirmationGate {
     this.utteranceTimer = this.clock.setTimeout(() => this.finalizeUtterance(), UTTERANCE_SILENCE_MS);
   }
 
+  /** Выходной транскрипт модели во время pending (кусками или кумулятивно — набор слов всё равно тот же). */
+  onModelTranscript(text: string) {
+    if (!this.pending) return;
+    for (const w of normalizeUtterance(text)) this.modelWords.add(w);
+  }
+
   /**
    * Перебивание вопроса (окно ещё не открыто). Засчитывается только согласие:
    * отказ, шум и длинные фразы здесь ничего не решают — иначе эхо вопроса из
@@ -253,7 +262,8 @@ export class ConfirmationGate {
     const p = this.pending;
     if (!u || !p || p.verdict !== null) return;
     // Эхо: все слова реплики есть в самом вопросе — это голос агента из динамиков.
-    const sayWords = new Set(normalizeUtterance(`${p.say} ${p.card ?? ""}`));
+    // Модель говорит вопрос своими словами («Да, конечно. Отправить…?») — её слова тоже эхо.
+    const sayWords = new Set([...normalizeUtterance(`${p.say} ${p.card ?? ""}`), ...this.modelWords]);
     const words = normalizeUtterance(u.text);
     if (words.length === 0 || words.every((w) => sayWords.has(w))) return;
     if (classify(u.text, p.class, this.words) !== "approved") return;
