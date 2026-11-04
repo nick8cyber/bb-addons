@@ -72,6 +72,8 @@ export interface CallSessionDeps {
 }
 
 const COMPRESSION = { triggerTokens: 20000, targetTokens: 10000 };
+/** Сколько вставки ждут ответа модели на реплику владельца, прежде чем уйти всё равно. */
+const AWAIT_REPLY_MAX_MS = 12_000;
 
 export class CallSession extends EventEmitter {
   state: CallState = "connecting";
@@ -117,6 +119,9 @@ export class CallSession extends EventEmitter {
   /** Голос сейчас генерирует ответ: вставка с turnComplete=true оборвала бы его на полуслове. */
   private voiceTalking = false;
   private quietQueue: string[] = [];
+  /** До этого момента ждём ответа модели на реплику владельца (вставки не шлём). */
+  private awaitingReplyUntil = 0;
+  private quietFallback: NodeJS.Timeout | null = null;
   private systemBatchTimer: NodeJS.Timeout | null = null;
   private routerBusyCount = 0;
   private pendingToolResponses = new Map<string, { functionId?: string; def: string; args: Record<string, unknown> }>();
@@ -898,6 +903,7 @@ export class CallSession extends EventEmitter {
     });
     client.on("turnComplete", () => {
       this.voiceTalking = false;
+      this.awaitingReplyUntil = 0;
       // Аудит PLUG-108: состояние оставалось «speaking» до конца звонка — речь владельца уходила ×0.25.
       // Но снимать приглушение по turnComplete рано: браузер ещё доигрывает звук, эхо пошло бы в Gemini.
       // Поэтому: нет звука в ходе (текст) — сразу; есть — по playback_drained, запасной таймер по длине звука.
@@ -922,6 +928,7 @@ export class CallSession extends EventEmitter {
       if (!this.gate.isMicOpen()) return;
       this.frame({ type: "transcript", role: "owner", text, final: false });
       this.gate.onOwnerTranscriptChunk(text);
+      this.markAwaitingReply();
       const now = Date.now();
       if (!this.ownerUtterance) this.ownerUtterance = { text, firstAt: now, lastAt: now };
       else {
@@ -1127,15 +1134,41 @@ export class CallSession extends EventEmitter {
    */
   injectWhenQuiet(text: string) {
     if (this.ended) return;
-    if (this.voiceTalking) {
+    // Ждём и конца речи, и ответа на только что сказанное владельцем: вставка сразу после его
+    // реплики перебивала ещё не начатый ответ, и голос молчал (регрессия 04.11: сводка пришла
+    // в ту же секунду, что и вопрос «что было последним в треде?»).
+    const awaiting = Date.now() < this.awaitingReplyUntil;
+    if (this.voiceTalking || awaiting) {
       this.quietQueue.push(text);
+      if (awaiting && !this.voiceTalking) this.scheduleQuietFallback();
       return;
     }
     this.deps.store.event(this.deps.callId, "system_injected", { waited: false, text: text.slice(0, 120) });
     this.voice?.sendClientContent(text, true);
   }
 
+  /** Ответа на реплику владельца так и не было — вставка уходит по запасному таймеру. */
+  private scheduleQuietFallback() {
+    if (this.quietFallback) clearTimeout(this.quietFallback);
+    const wait = Math.max(0, this.awaitingReplyUntil - Date.now());
+    this.quietFallback = setTimeout(() => {
+      this.quietFallback = null;
+      if (this.ended || this.voiceTalking) return;
+      this.awaitingReplyUntil = 0;
+      this.flushQuietQueue();
+    }, wait);
+  }
+
+  /** Владелец сказал реплику: до ответа модели (turnComplete) вставки ждут, не дольше 12 с. */
+  private markAwaitingReply() {
+    this.awaitingReplyUntil = Date.now() + AWAIT_REPLY_MAX_MS;
+  }
+
   private flushQuietQueue() {
+    if (this.quietFallback) {
+      clearTimeout(this.quietFallback);
+      this.quietFallback = null;
+    }
     if (this.quietQueue.length === 0) return;
     const text = this.quietQueue.join("\n\n").slice(0, 6000);
     this.quietQueue = [];
@@ -1279,6 +1312,7 @@ export class CallSession extends EventEmitter {
     if (this.ended || !text.trim()) return;
     this.frame({ type: "transcript", role: "owner", text: text.trim(), final: true });
     this.onOwnerUtteranceFinal(text.trim(), "text_frame");
+    this.markAwaitingReply();
     this.voice?.sendClientContent(text.trim(), true);
   }
 

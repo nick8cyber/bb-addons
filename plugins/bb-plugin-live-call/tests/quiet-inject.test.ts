@@ -237,3 +237,41 @@ describe("«Отмена» кнопкой на уровне сессии (ауд
     await s.end("owner");
   });
 });
+
+describe("вставка сразу после реплики владельца (регрессия 04.11)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("сводка в ту же секунду, что вопрос, ждёт ответа модели, а не перебивает его", async () => {
+    const { s } = make();
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    const sent = () => ws.sent.filter((x) => x.includes("сводку по треду"));
+    s.sendUserMessage("Что было последним в треде?");
+    s.injectWhenQuiet("[СИСТЕМА] Мозговой центр подготовил сводку по треду: …");
+    expect(sent()).toHaveLength(0);
+    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: btoa("\x00\x01") } }] } } });
+    ws.server({ serverContent: { turnComplete: true } });
+    expect(sent()).toHaveLength(1);
+    await s.end("owner");
+  });
+
+  it("ответа на реплику нет — вставка уходит по запасному таймеру через 12 с", async () => {
+    const { s } = make();
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    const sent = () => ws.sent.filter((x) => x.includes("сводку по треду"));
+    s.sendUserMessage("Алло?");
+    s.injectWhenQuiet("[СИСТЕМА] Мозговой центр подготовил сводку по треду: …");
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(sent()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(sent()).toHaveLength(1);
+    await s.end("owner");
+  });
+});
