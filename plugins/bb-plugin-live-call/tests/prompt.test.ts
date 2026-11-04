@@ -94,7 +94,12 @@ describe("звонок по треду без мозгового центра (�
     expect(off).not.toContain("обрабатываю информацию");
     expect(off).toContain("Мозгового центра и сводки в этом звонке нет");
     const on = threadVoiceInstruction({ ...(base as object), brainAvailable: true } as never);
-    expect(on).toContain("обрабатываю информацию");
+    expect(on).not.toContain("обрабатываю информацию");
+    // §12.11 п. 3 (04.11): в обоих случаях — сразу пересказ ответа агента на последний запрос владельца
+    for (const t of [on, off]) {
+      expect(t).toContain("ПЕРВАЯ РЕПЛИКА — БЕЗ ВОПРОСА ВЛАДЕЛЬЦА");
+      expect(t).toContain("все сообщения агента после последнего сообщения владельца");
+    }
   });
 });
 

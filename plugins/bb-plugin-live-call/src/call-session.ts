@@ -119,6 +119,8 @@ export class CallSession extends EventEmitter {
   /** Голос сейчас генерирует ответ: вставка с turnComplete=true оборвала бы его на полуслове. */
   private voiceTalking = false;
   private quietQueue: string[] = [];
+  /** Справки (сводка мозгового центра и т. п.) — уходят без хода модели. */
+  private quietContext: string[] = [];
   /** Последний вердикт пришёл кнопкой (а не голосом) — его результат вставляется с обрывом хода. */
   private decidedByButtonId: string | null = null;
   /** До этого момента ждём ответа модели на реплику владельца (вставки не шлём). */
@@ -365,16 +367,16 @@ export class CallSession extends EventEmitter {
 
       this.brain.onSummaryReady = (summaryText, ms) => {
         this.brainSummary = summaryText;
-        // Только между ходами: сводка посреди ответа обрывала голос на полуслове
-        // и он перескакивал на пересказ (приёмка 04.11).
-        this.injectWhenQuiet(
-          `[СИСТЕМА] Мозговой центр подготовил сводку по треду (${ms} мс):\n${summaryText}\n\nСейчас же перескажи эту сводку владельцу своими словами: цель треда, что сделано, на чём остановились, что ждёт владельца, открытые вопросы.`,
+        // Справка, а не ход (§12.11 п. 3, пересмотр 04.11): голос сводку сам не зачитывает,
+        // а использует для ответов. Между ходами — чтобы не оборвать пересказ на полуслове.
+        this.injectContextWhenQuiet(
+          `[СИСТЕМА] Справка: сводка мозгового центра по всему треду (${ms} мс). Сам её не пересказывай — используй, когда владелец спросит о треде шире последних сообщений.\n${summaryText}`,
         );
       };
 
       this.brain.onSummaryTimeout = () => {
-        this.injectWhenQuiet(
-          `[СИСТЕМА] Сводка мозгового центра не успела сформироваться за 60 секунд. Скажи владельцу: «Сводка не успела подготовиться вовремя, ориентируюсь по сообщениям треда» и продолжай разговор по сообщениям треда.`,
+        this.injectContextWhenQuiet(
+          `[СИСТЕМА] Справка: сводка мозгового центра не готова. Если владелец спросит о треде шире последних сообщений — скажи, что полной сводки нет, и отвечай по сообщениям треда.`,
         );
       };
 
@@ -384,8 +386,8 @@ export class CallSession extends EventEmitter {
         // инструменты получают brain=null, голос не ждёт сводку и работает по сообщениям треда.
         this.brain = null;
         if (this.greeted) {
-          this.injectWhenQuiet(
-            "[СИСТЕМА] Мозговой центр в этом звонке недоступен. Скажи владельцу об этом одной фразой и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.",
+          this.injectContextWhenQuiet(
+            "[СИСТЕМА] Справка: мозговой центр в этом звонке недоступен (brain_ask и brain_task не работают). Сам об этом не объявляй; скажи, только если владелец попросит мозговой центр.",
           );
         }
       });
@@ -864,11 +866,12 @@ export class CallSession extends EventEmitter {
         if (this.pendingRegistry) {
           registryMsg = " Скажи владельцу: «реестр проекта изменился, подтверди изменения в настройках плагина».";
         }
-        if (this.brain) {
-          client.sendClientContent(`Система: звонок начат. Скажи: «Привет, сейчас обрабатываю информацию по треду».${registryMsg} Больше ничего не добавляй.`, true);
-        } else {
-          client.sendClientContent(`Система: звонок начат. Мозговой центр недоступен. Скажи «Привет» и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.${registryMsg}`, true);
-        }
+        // §12.11 п. 3 (слово владельца 04.11): без вопроса владельца — сразу пересказ ответа агента
+        // на последний запрос владельца; мозговой центр не ждём.
+        client.sendClientContent(
+          `Система: звонок по треду начат. Владелец пока ничего не спросил — по правилу ПЕРВАЯ РЕПЛИКА сразу скажи «Привет» и перескажи ответ агента на последний запрос владельца.${registryMsg}`,
+          true,
+        );
       } else {
         // Обычный звонок координатору: фраза о реестре не звучит (§16.7 п. 6, review п. 10)
         client.sendClientContent("Система: звонок начат. Жди первого слова владельца и отвечай только ему.", false);
@@ -1167,7 +1170,27 @@ export class CallSession extends EventEmitter {
     this.awaitingReplyUntil = Date.now() + AWAIT_REPLY_MAX_MS;
   }
 
+  /** Справка в голос без хода модели (turnComplete=false) — только между ходами. */
+  injectContextWhenQuiet(text: string) {
+    if (this.ended) return;
+    if (this.voiceTalking || Date.now() < this.awaitingReplyUntil) {
+      this.quietContext.push(text);
+      return;
+    }
+    this.deps.store.event(this.deps.callId, "system_context", { waited: false, text: text.slice(0, 120) });
+    this.voice?.sendClientContent(text, false);
+  }
+
+  private flushQuietContext() {
+    if (this.quietContext.length === 0) return;
+    const text = this.quietContext.join("\n\n").slice(0, 8000);
+    this.quietContext = [];
+    this.deps.store.event(this.deps.callId, "system_context", { waited: true, text: text.slice(0, 120) });
+    this.voice?.sendClientContent(text, false);
+  }
+
   private flushQuietQueue() {
+    this.flushQuietContext();
     if (this.quietFallback) {
       clearTimeout(this.quietFallback);
       this.quietFallback = null;

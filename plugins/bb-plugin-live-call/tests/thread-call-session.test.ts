@@ -302,7 +302,7 @@ describe("звонок по треду без мозгового центра (�
     expect(spawned[0].projectId).toBe("proj_calls_test");
     expect(s.brain?.canModify).toBe(false);
     const instr = JSON.parse(FakeWs.all[0].sent[0]).setup.systemInstruction.parts[0].text as string;
-    expect(instr).toContain("обрабатываю информацию");
+    expect(instr).toContain("ПЕРВАЯ РЕПЛИКА — БЕЗ ВОПРОСА ВЛАДЕЛЬЦА");
     await s.end("owner");
   });
 
@@ -317,7 +317,7 @@ describe("звонок по треду без мозгового центра (�
     ws.fire("message", { data: JSON.stringify({ setupComplete: {} }) });
     await vi.advanceTimersByTimeAsync(10);
     const greet = ws.sent.filter((x) => x.includes('"clientContent"')).join("\n");
-    expect(greet).toContain("Мозговой центр недоступен");
+    expect(greet).toContain("перескажи ответ агента на последний запрос владельца");
     await s.end("owner");
   });
 });
@@ -341,7 +341,7 @@ describe("мозговой центр: признак git берётся из о
     expect(env).not.toContain("project-default");
     expect(s.brain?.canModify).toBe(true);
     const instr = JSON.parse(FakeWs.all[0].sent[0]).setup.systemInstruction.parts[0].text as string;
-    expect(instr).toContain("обрабатываю информацию");
+    expect(instr).toContain("ПЕРВАЯ РЕПЛИКА — БЕЗ ВОПРОСА ВЛАДЕЛЬЦА");
     await s.end("owner");
   });
 });
@@ -430,12 +430,14 @@ describe("приёмка 04.11: сводка не обрывает ответ, �
     await s.start();
     await vi.advanceTimersByTimeAsync(10);
     const ws = FakeWs.all[0];
-    const summaries = () => ws.sent.filter((x) => x.includes("подготовил сводку"));
+    const summaries = () => ws.sent.filter((x) => x.includes("сводка мозгового центра по всему треду"));
     fire(ws, audio); // голос отвечает владельцу по сообщениям треда
     s.brain!.onSummaryReady!("Цель треда — тест", 1000);
     expect(summaries()).toHaveLength(0);
     fire(ws, { serverContent: { turnComplete: true } });
     expect(summaries()).toHaveLength(1);
+    // справка, а не ход: голос сводку сам не зачитывает (§12.11 п. 3, 04.11)
+    expect(summaries()[0]).toContain('"turnComplete":false');
     await s.end("owner");
   });
 
