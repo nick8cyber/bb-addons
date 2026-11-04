@@ -275,3 +275,34 @@ describe("вставка сразу после реплики владельца
     await s.end("owner");
   });
 });
+
+describe("кнопка подтверждения, пока голос говорит (живая проверка 04.11)", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("вердикт кнопкой обрывает ход: голос не дочитывает решённый вопрос", async () => {
+    const frames: Array<{ type: string }> = [];
+    const store = new CallStore(new Database(":memory:"));
+    const s = new CallSession({
+      callId: "call_b", keys: ["k1"], voice: "Algenib", languageCode: "ru-RU", thinkingLevel: "LOW",
+      mode: "normal", routerInput: "text", maxCallMinutes: 60, store, sdk: {} as never,
+      toBrowser: (f) => frames.push(f as never), sendBrowserAudio: () => {},
+      spawnCallThread: async () => null, advanceCallThread: async () => {}, sayCallThread: async () => {}, endCallThread: async () => {},
+      wsFactory: (url) => new FakeWs(url) as unknown as WebSocket,
+    });
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    const gate = (s as unknown as { gate: { request: (...a: unknown[]) => { pending: { confirmationId: string } } } }).gate;
+    const { pending } = gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+    ws.server({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: btoa("\x00\x01") } }] } } });
+    s.decideConfirmation(pending.confirmationId, "cancel");
+    const injected = ws.sent.filter((x) => x.includes("владелец отменил действие"));
+    expect(injected).toHaveLength(1); // сразу, не дожидаясь turnComplete
+    expect(frames.some((f) => f.type === "interrupted")).toBe(true);
+    await s.end("owner");
+  });
+});

@@ -119,6 +119,8 @@ export class CallSession extends EventEmitter {
   /** Голос сейчас генерирует ответ: вставка с turnComplete=true оборвала бы его на полуслове. */
   private voiceTalking = false;
   private quietQueue: string[] = [];
+  /** Последний вердикт пришёл кнопкой (а не голосом) — его результат вставляется с обрывом хода. */
+  private decidedByButtonId: string | null = null;
   /** До этого момента ждём ответа модели на реплику владельца (вставки не шлём). */
   private awaitingReplyUntil = 0;
   private quietFallback: NodeJS.Timeout | null = null;
@@ -1242,7 +1244,7 @@ export class CallSession extends EventEmitter {
             : "владелец не подтвердил";
       this.resolvePendingToolResponse(p.argsHash, { ok: false, error: { code: "cancelled", message } });
       // Аудит PLUG-108: в одной сессии модель тоже должна узнать об отмене (раньше — только в Extended).
-      this.injectWhenQuiet(`[СИСТЕМА] ${message}. Не повторяй этот вызов без новой просьбы владельца.`);
+      this.injectVerdict(p, `[СИСТЕМА] ${message}. Не повторяй этот вызов без новой просьбы владельца.`);
       return;
     }
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
@@ -1274,7 +1276,7 @@ export class CallSession extends EventEmitter {
       : `НЕ ВЫПОЛНЕНО: ${"error" in result ? result.error.message : "нужно подтверждение"}. Скажи владельцу прямо, что не получилось и почему; не говори «отправлено» или «готово».`;
     // Если владелец подтвердил раньше, чем голос успел задать вопрос (кнопка), голос мог позже
     // зачитать уже решённый вопрос и получить второе «да» (живая проверка 03.11).
-    this.injectWhenQuiet(`[СИСТЕМА] ${text} Вопрос подтверждения уже решён владельцем — НЕ задавай его снова и не вызывай ${p.tool} повторно.`);
+    this.injectVerdict(p, `[СИСТЕМА] ${text} Вопрос подтверждения уже решён владельцем — НЕ задавай его снова и не вызывай ${p.tool} повторно.`);
   }
 
   /** Аргументы сохранённого вызова записи — они же в argsHash, подмена исключена. */
@@ -1527,7 +1529,34 @@ export class CallSession extends EventEmitter {
 
   /** Кнопки оверлея: явное действие владельца (спека §7.1 п. 7). */
   decideConfirmation(confirmationId: string, decision: "approve" | "cancel"): void {
+    // Кнопка нажата, пока голос ещё говорит (часто — сам вопрос): ход модели обрываем, иначе
+    // голос дочитывал уже решённый вопрос и «да» владельца уходило модели как новая реплика
+    // (живая проверка 04.11). Результат действия вставится сразу, а не после конца хода.
+    this.decidedByButtonId = confirmationId;
     this.gate.decide(confirmationId, decision);
+  }
+
+  /** Вставка с обрывом текущего хода: голос замолкает, браузер сбрасывает буфер. */
+  private interruptAndInject(text: string) {
+    if (this.ended) return;
+    if (this.voiceTalking) {
+      this.voiceTalking = false;
+      this.frame({ type: "interrupted", turnSeq: 0 });
+      this.setState("listening");
+    }
+    const queued = this.quietQueue;
+    this.quietQueue = [];
+    const all = [text, ...queued].join("\n\n").slice(0, 6000);
+    this.deps.store.event(this.deps.callId, "system_injected", { waited: false, interrupted: true, text: all.slice(0, 120) });
+    this.voice?.sendClientContent(all, true);
+  }
+
+  /** Результат подтверждения — модели: после кнопки обрывом хода, после голоса — между ходами. */
+  private injectVerdict(p: PendingConfirmation, text: string) {
+    const byButton = this.decidedByButtonId === p.confirmationId;
+    if (byButton) this.decidedByButtonId = null;
+    if (byButton) this.interruptAndInject(text);
+    else this.injectWhenQuiet(text);
   }
 
   pendingConfirmation(): PendingConfirmation | null {
