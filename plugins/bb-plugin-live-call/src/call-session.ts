@@ -350,16 +350,16 @@ export class CallSession extends EventEmitter {
 
       this.brain.onSummaryReady = (summaryText, ms) => {
         this.brainSummary = summaryText;
-        this.voice?.sendClientContent(
+        // Только между ходами: сводка посреди ответа обрывала голос на полуслове
+        // и он перескакивал на пересказ (приёмка 04.11).
+        this.injectWhenQuiet(
           `[СИСТЕМА] Мозговой центр подготовил сводку по треду (${ms} мс):\n${summaryText}\n\nСейчас же перескажи эту сводку владельцу своими словами: цель треда, что сделано, на чём остановились, что ждёт владельца, открытые вопросы.`,
-          true,
         );
       };
 
       this.brain.onSummaryTimeout = () => {
-        this.voice?.sendClientContent(
+        this.injectWhenQuiet(
           `[СИСТЕМА] Сводка мозгового центра не успела сформироваться за 60 секунд. Скажи владельцу: «Сводка не успела подготовиться вовремя, ориентируюсь по сообщениям треда» и продолжай разговор по сообщениям треда.`,
-          true,
         );
       };
 
@@ -369,9 +369,8 @@ export class CallSession extends EventEmitter {
         // инструменты получают brain=null, голос не ждёт сводку и работает по сообщениям треда.
         this.brain = null;
         if (this.greeted) {
-          this.voice?.sendClientContent(
+          this.injectWhenQuiet(
             "[СИСТЕМА] Мозговой центр в этом звонке недоступен. Скажи владельцу об этом одной фразой и сразу коротко расскажи, что сейчас происходит в треде, по сообщениям треда.",
-            true,
           );
         }
       });
@@ -1362,6 +1361,22 @@ export class CallSession extends EventEmitter {
     }
     const minutes = Math.round((Date.now() - this.startedAt) / 60000);
     const summary = `Звонок завершён (${reason === "owner" ? "по просьбе владельца" : reason === "limit" ? "лимит времени" : "ошибка"}), ${minutes} мин.`;
+    // Сначала то, что слышит и видит владелец: голос замолкает, браузер получает ended.
+    // Раньше это шло после остановки мозгового центра и закрытия треда звонка (секунды),
+    // голос продолжал говорить, и «Завершить» приходилось нажимать несколько раз (приёмка 04.11).
+    const v = this.voice;
+    this.voice = null;
+    v?.close();
+    const r = this.router;
+    this.router = null;
+    r?.close();
+    if (this.micReporter) {
+      clearInterval(this.micReporter);
+      this.micReporter = null;
+    }
+    this.deps.store.endCall(this.deps.callId, reason);
+    this.frame({ type: "ended", callId: this.deps.callId, threadId: this.threadId, reason });
+    this.setState("ended");
     if (this.threadId && this.threadId !== this.targetThreadId) {
       try {
         await this.deps.endCallThread(summary);
@@ -1384,12 +1399,6 @@ export class CallSession extends EventEmitter {
         });
       }
     }
-    const v = this.voice;
-    this.voice = null;
-    v?.close();
-    const r = this.router;
-    this.router = null;
-    r?.close();
     for (const c of this.connectorClients) {
       try {
         c.close();
@@ -1398,13 +1407,6 @@ export class CallSession extends EventEmitter {
       }
     }
     this.connectorClients = [];
-    if (this.micReporter) {
-      clearInterval(this.micReporter);
-      this.micReporter = null;
-    }
-    this.deps.store.endCall(this.deps.callId, reason);
-    this.frame({ type: "ended", callId: this.deps.callId, threadId: this.threadId, reason });
-    this.setState("ended");
     this.emit("ended");
   }
 

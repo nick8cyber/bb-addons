@@ -356,8 +356,19 @@ export class CallEngine {
 
   end() {
     this.endRequested = true;
-    if (this.sock?.readyState === WebSocket.OPEN) this.send({ type: "end" });
-    else if (this.view.phase === "connecting") {
+    if (this.sock?.readyState === WebSocket.OPEN) {
+      // Нажатие видно сразу: голос замолкает, не дожидаясь кадра ended от сервера.
+      // Если ended не пришёл за 3 с — завершаем у себя (приёмка 04.11: жали несколько раз).
+      this.player?.interrupted();
+      this.send({ type: "end" });
+      const sock = this.sock;
+      setTimeout(() => {
+        if (this.sock !== sock || this.view.phase === "ended" || this.view.phase === "idle") return;
+        sock.close();
+        this.releaseAudio();
+        this.patch({ phase: "ended", orb: "ended", endedAt: Date.now(), endReason: "owner", confirmation: null });
+      }, 3000);
+    } else if (this.view.phase === "connecting") {
       this.sock?.close();
       this.dismiss();
     }

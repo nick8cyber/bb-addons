@@ -327,6 +327,12 @@ export function eventContainsText(e: Record<string, unknown>, needle: string): b
  * Ищет текст среди ВСЕХ типов событий треда (turn requested, steer, provider message и др.)
  * или сообщение в очереди с этим текстом.
  */
+/** Ответ threads.send — подтверждение сервера BB: сообщение принято (sent) или в очереди (queued). */
+export function sendAcknowledged(res: unknown): boolean {
+  const r = res as { ok?: unknown; delivery?: unknown } | null | undefined;
+  return r?.ok === true && (r.delivery === "sent" || r.delivery === "queued");
+}
+
 export async function verifyThreadDelivery(
   sdk: BbPluginApi["sdk"],
   threadId: string,
@@ -343,9 +349,12 @@ export async function verifyThreadDelivery(
     try {
       const eventsArea = (sdk.threads as unknown as { events?: { list(a: Record<string, unknown>): Promise<unknown> } })?.events;
       if (eventsArea && typeof eventsArea.list === "function") {
-        const res = await eventsArea.list({ threadId });
+        // Новые события первыми: без order SDK отдаёт тред с начала, и в длинном треде
+        // (2000+ событий) только что отправленное сообщение не попадало в выборку —
+        // доставленное показывалось «не доставлено» (приёмка 04.11).
+        const res = await eventsArea.list({ threadId, order: "desc", limit: "50" });
         const rows = toArray(res);
-        for (let i = rows.length - 1; i >= 0 && i >= rows.length - 20; i--) {
+        for (let i = 0; i < rows.length; i++) {
           const e = rows[i];
           const createdAt = Number(e.createdAt ?? (e as { ts?: unknown }).ts ?? 0);
           if (!createdAt || createdAt >= startTime - 1000) {
@@ -571,15 +580,16 @@ export const TOOLS: ToolDef[] = [
       const threadId = String(ref.thread.id);
       const text = String(args.text ?? "");
       const startTime = Date.now();
+      let ack = false;
       try {
-        await withTimeout(
+        ack = sendAcknowledged(await withTimeout(
           ctx.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: `[голос] ${text}`, mentions: [] }] } as never),
-        );
+        ));
       } catch {
         ctx.reportAction("send_to_thread", "C", "failed", "не доставлено", threadId);
         return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
       }
-      const delivered = await verifyThreadDelivery(
+      const delivered = ack || await verifyThreadDelivery(
         ctx.sdk,
         threadId,
         text,
@@ -1326,19 +1336,20 @@ export const threadSendTool: ToolDef = {
     }
     const text = String(args.text ?? "");
     const startTime = Date.now();
+    let ack = false;
     try {
-      await withTimeout(
+      ack = sendAcknowledged(await withTimeout(
         ctx.sdk.threads.send({
           threadId,
           mode: "auto",
           input: [{ type: "text", text: `[голос] ${text}`, mentions: [] }],
         } as never),
-      );
+      ));
     } catch {
       ctx.reportAction("thread_send", "C", "failed", "не доставлено", threadId);
       return { ok: false, error: { code: "delivery_failed", message: "не доставлено" } };
     }
-    const delivered = await verifyThreadDelivery(
+    const delivered = ack || await verifyThreadDelivery(
       ctx.sdk,
       threadId,
       text,

@@ -241,6 +241,45 @@ describe("инструменты звонка по треду (контракт 
       expect(res.error.message).toBe("не доставлено");
       expect(reportAction).toHaveBeenCalledWith("thread_send", "C", "failed", "не доставлено", "thr_target");
     });
+
+    it("подтверждение сервера BB (delivery sent/queued) — доставлено без опроса событий (приёмка 04.11)", async () => {
+      const tool = toolByName("thread_send", "thr_target")!;
+      for (const delivery of ["sent", "queued"]) {
+        const list = vi.fn(async () => []);
+        const reportAction = vi.fn();
+        const ctx = {
+          sdk: { threads: { send: async () => ({ ok: true, delivery }), events: { list }, queuedMessages: { list: async () => [] } } },
+          targetThreadId: "thr_target",
+          ledger: { add: vi.fn() },
+          reportAction,
+          deliveryTimeoutMs: 50,
+          deliveryIntervalMs: 10,
+        };
+        const res = (await tool.execute({ text: "Решение владельца" }, ctx as never)) as { ok: boolean };
+        expect(res.ok).toBe(true);
+        expect(list).not.toHaveBeenCalled();
+        expect(reportAction).toHaveBeenCalledWith("thread_send", "C", "done", expect.stringContaining("Решение владельца"), "thr_target");
+      }
+    });
+
+    it("длинный тред: проверка доставки берёт новые события первыми (order desc), а не начало треда", async () => {
+      const startTime = Date.now();
+      // 2355 событий, как в треде приёмки 04.11; отправленное — последнее.
+      const all = Array.from({ length: 2355 }, (_, i) => ({
+        createdAt: startTime - 100_000 + i,
+        type: "client/turn/requested",
+        data: { input: [{ text: i === 2354 ? "[голос] Свежее сообщение" : `старое ${i}` }] },
+      }));
+      all[2354].createdAt = startTime + 10;
+      const list = vi.fn(async (a: { order?: string; limit?: string }) => {
+        const n = Number(a.limit ?? 100);
+        return a.order === "desc" ? all.slice().reverse().slice(0, n) : all.slice(0, n);
+      });
+      const sdk = { threads: { events: { list }, queuedMessages: { list: async () => [] } } };
+      const ok = await verifyThreadDelivery(sdk as never, "thr_target", "Свежее сообщение", startTime, 50, 10);
+      expect(ok).toBe(true);
+      expect(list).toHaveBeenCalledWith(expect.objectContaining({ threadId: "thr_target", order: "desc" }));
+    });
   });
 
   describe("thread_answer (C «да» / P «разрешаю» при grant: true)", () => {

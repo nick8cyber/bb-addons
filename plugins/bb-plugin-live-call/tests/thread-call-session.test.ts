@@ -413,3 +413,45 @@ describe("чужой репозиторий — мозговой центр то
     await s.end("owner");
   });
 });
+
+describe("приёмка 04.11: сводка не обрывает ответ, «Завершить» срабатывает сразу", () => {
+  beforeEach(() => {
+    FakeWs.all = [];
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  const fire = (ws: FakeWs, msg: unknown) => ws.fire("message", { data: JSON.stringify(msg) });
+  const audio = { serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: btoa("\x00\x01\x02\x03") } }] } } };
+
+  it("сводка мозгового центра посреди ответа ждёт конца хода и не обрывает голос", async () => {
+    const spawned: Array<Record<string, unknown>> = [];
+    const { s } = makeThreadCall("thr_target_git", { id: "env_test", isGitRepo: true, branchName: "feat/x" }, spawned);
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    const summaries = () => ws.sent.filter((x) => x.includes("подготовил сводку"));
+    fire(ws, audio); // голос отвечает владельцу по сообщениям треда
+    s.brain!.onSummaryReady!("Цель треда — тест", 1000);
+    expect(summaries()).toHaveLength(0);
+    fire(ws, { serverContent: { turnComplete: true } });
+    expect(summaries()).toHaveLength(1);
+    await s.end("owner");
+  });
+
+  it("end: кадр ended и закрытие голоса — до остановки мозгового центра и треда звонка", async () => {
+    const { s, frames } = makeThreadCall("thr_target_git", { id: "env_test", isGitRepo: true, branchName: "feat/x" });
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+    let release!: () => void;
+    const slow = new Promise<void>((r) => { release = r; });
+    s.brain!.archive = () => slow;
+    const done = s.end("owner");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(frames.some((f) => f.type === "ended")).toBe(true);
+    expect(ws.readyState).toBe(3);
+    release();
+    await done;
+  });
+});
