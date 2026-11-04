@@ -1,14 +1,20 @@
 /**
- * Раздел «Live Call» в настройках. Поля ключей, голоса и лимитов bb рисует сам
- * из bb.settings.define; здесь — статус, звонок одной кнопкой и проба Extended.
- * Прежняя версия передавала в слот DOM-функцию вместо React-компонента и падала.
+ * Раздел «Live Call» в настройках (контракт §15.2, §15.8).
+ * Поля ключей, голоса и лимитов bb рисует сам из bb.settings.define;
+ * здесь — статус, звонок одной кнопкой, реестр проектов звонков с подтверждением diff.
  */
 import { useCallback, useEffect, useState } from "react";
 
 import { callEngine } from "./engine.js";
 import { Icon } from "./icons.js";
-
-const RPC_ENDPOINT = "/api/v1/plugins/live-call/rpc";
+import { publishProjects } from "./project-events.js";
+import {
+  rpc,
+  type ProjectCallItem,
+  type ProjectCallsApproveResult,
+  type ProjectCallsListResult,
+  type ProjectCallsRejectResult,
+} from "./rpc.js";
 
 type StatusResult = {
   configured: boolean;
@@ -17,20 +23,13 @@ type StatusResult = {
 };
 type ProbeResult = { extendedNativeTools: boolean; checkedAt: string; detail?: string };
 
-async function rpc<Output>(method: string, input: object = {}): Promise<Output> {
-  const response = await fetch(`${RPC_ENDPOINT}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  const body = (await response.json()) as { ok: boolean; result?: Output; error?: { message?: string } };
-  if (!body.ok) throw new Error(body.error?.message ?? "запрос не удался");
-  return body.result as Output;
-}
-
 export function SettingsSection() {
   const [status, setStatus] = useState<StatusResult | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<ProjectCallItem[] | null>(null);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
+  const [busyProjectId, setBusyProjectId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [probe, setProbe] = useState<{ running: boolean; result?: ProbeResult; error?: string }>({ running: false });
 
   const refresh = useCallback(async () => {
@@ -40,6 +39,14 @@ export function SettingsSection() {
     } catch (e) {
       setStatusError(e instanceof Error ? e.message : String(e));
     }
+
+    try {
+      const listRes = await rpc<ProjectCallsListResult>("projectCallsList");
+      setProjects(listRes.projects || []);
+      setProjectsError(null);
+    } catch (e) {
+      setProjectsError(e instanceof Error ? e.message : String(e));
+    }
   }, []);
 
   useEffect(() => {
@@ -47,6 +54,38 @@ export function SettingsSection() {
     const t = setInterval(() => void refresh(), 5000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  const approveProject = async (projectId: string, hash: string) => {
+    setBusyProjectId(projectId);
+    setActionError(null);
+    try {
+      const res = await rpc<ProjectCallsApproveResult>("projectCallsApprove", { projectId, hash });
+      if (!res.ok) {
+        setActionError(res.error || "Не удалось подтвердить изменения");
+      } else {
+        await refresh();
+        await publishProjects();
+      }
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyProjectId(null);
+    }
+  };
+
+  const rejectProject = async (projectId: string) => {
+    setBusyProjectId(projectId);
+    setActionError(null);
+    try {
+      await rpc<ProjectCallsRejectResult>("projectCallsReject", { projectId });
+      await refresh();
+      await publishProjects();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyProjectId(null);
+    }
+  };
 
   const runProbe = async () => {
     setProbe({ running: true });
@@ -86,13 +125,23 @@ export function SettingsSection() {
           </span>
         </Row>
       </div>
+
       <div className="lc-settings__actions">
         <button type="button" className="lc-btn lc-btn--primary" disabled={!status?.configured} onClick={() => callEngine.start()}>
           <Icon name="phone" />
           Позвонить
         </button>
-        {/* Проба Extended убрана: Extended отключён (ADR-0006, пересмотр 2); `bb call probe` остался в CLI. */}
       </div>
+
+      <ProjectCallsView
+        projects={projects}
+        projectsError={projectsError}
+        actionError={actionError}
+        busyProjectId={busyProjectId}
+        onApprove={approveProject}
+        onReject={rejectProject}
+      />
+
       {probe.result && (
         <p className={probe.result.extendedNativeTools ? "lc-ok" : "lc-sub"}>
           {probe.result.extendedNativeTools
@@ -101,6 +150,106 @@ export function SettingsSection() {
         </p>
       )}
       {probe.error && <p className="lc-bad">Проверка не удалась: {probe.error}</p>}
+    </div>
+  );
+}
+
+export function ProjectCallsView({
+  projects,
+  projectsError,
+  actionError,
+  busyProjectId,
+  onApprove,
+  onReject,
+}: {
+  projects: ProjectCallItem[] | null;
+  projectsError?: string | null;
+  actionError?: string | null;
+  busyProjectId?: string | null;
+  onApprove: (projectId: string, hash: string) => void | Promise<void>;
+  onReject: (projectId: string) => void | Promise<void>;
+}) {
+  return (
+    <div className="lc-settings__section" style={{ marginTop: "12px" }}>
+      <h4 style={{ margin: "0 0 8px", fontSize: "13px", fontWeight: 600 }}>
+        Звонки по проектам
+      </h4>
+      {actionError && <p className="lc-bad" style={{ margin: "0 0 8px" }}>{actionError}</p>}
+      {projectsError ? (
+        <p className="lc-bad">Не удалось загрузить реестр: {projectsError}</p>
+      ) : !projects ? (
+        <p className="lc-sub">Загрузка реестра проектов…</p>
+      ) : projects.length === 0 ? (
+        <p className="lc-sub">В реестре нет настроенных проектов.</p>
+      ) : (
+        <div className="lc-settings__rows" style={{ display: "flex", flexDirection: "column" }}>
+          {projects.map((p) => (
+            <div
+              key={p.projectId}
+              className="lc-settings__row"
+              data-testid={`project-row-${p.projectId}`}
+              style={{ flexDirection: "column", gap: "6px", alignItems: "stretch" }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+                <div>
+                  <strong>{p.title || p.projectId}</strong>
+                  <span className="lc-sub" style={{ marginLeft: "8px" }}>{p.projectId}</span>
+                </div>
+                <div>
+                  {p.state === "approved" && <span className="lc-ok">Подтверждён</span>}
+                  {p.state === "pending" && <span className="lc-bad" style={{ color: "var(--warning, #eab308)" }}>Ждёт подтверждения</span>}
+                  {p.state === "invalid" && <span className="lc-bad">Ошибка</span>}
+                </div>
+              </div>
+
+              {p.error && <p className="lc-bad" style={{ margin: 0 }}>{p.error}</p>}
+
+              {p.state === "pending" && (
+                <div style={{ marginTop: "4px" }}>
+                  {p.diff && p.diff.length > 0 && (
+                    <pre
+                      data-testid={`diff-${p.projectId}`}
+                      style={{
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "11px",
+                        lineHeight: "1.4",
+                        margin: "4px 0 8px",
+                        padding: "8px",
+                        background: "var(--secondary)",
+                        borderRadius: "4px",
+                        overflowX: "auto",
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
+                      {p.diff.join("\n")}
+                    </pre>
+                  )}
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button
+                      type="button"
+                      className="lc-btn lc-btn--primary"
+                      disabled={busyProjectId === p.projectId || !p.hash}
+                      onClick={() => p.hash && void onApprove(p.projectId, p.hash)}
+                    >
+                      <Icon name="check" size={14} />
+                      Подтвердить
+                    </button>
+                    <button
+                      type="button"
+                      className="lc-btn lc-btn--ghost"
+                      disabled={busyProjectId === p.projectId}
+                      onClick={() => void onReject(p.projectId)}
+                    >
+                      <Icon name="x" size={14} />
+                      Отклонить
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
