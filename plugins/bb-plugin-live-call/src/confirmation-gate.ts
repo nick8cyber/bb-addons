@@ -122,6 +122,10 @@ export class ConfirmationGate {
   /** Байты аудио модели после запроса (сквозь все ходы) и сколько их было до начала вопроса. */
   private audioSinceRequest = 0;
   private questionAudioOffset: number | null = null;
+  /** Ходы модели, чей звук ещё может доигрываться: turnSeq → первый кадр и байты. */
+  private playingTurns = new Map<number, { firstAt: number; bytes: number }>();
+  /** Когда доиграет звук ходов, начатых до запроса (оценка сервера). */
+  private priorPlaybackEnd = 0;
   /** Значимые слова вопроса без слов из аргументов действия (филлер может их повторять). */
   private questionWords = new Set<string>();
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
@@ -176,6 +180,12 @@ export class ConfirmationGate {
     this.tailUntil = 0;
     this.audioSinceRequest = 0;
     this.questionAudioOffset = null;
+    // Филлер, сгенерированный до вызова инструмента, ещё доигрывается: вопрос зазвучит после него.
+    this.priorPlaybackEnd = 0;
+    for (const t of this.playingTurns.values()) {
+      this.priorPlaybackEnd = Math.max(this.priorPlaybackEnd, t.firstAt + (t.bytes / BYTES_PER_SECOND_24K) * 1000);
+    }
+    this.playingTurns.clear();
     {
       const argWords = new Set(
         normalizeUtterance(
@@ -206,6 +216,10 @@ export class ConfirmationGate {
 
   /** Аудио хода модели: байты PCM 24 кГц, помечены turnSeq (спека §7.1 п. 3.2). */
   onModelAudio(turnSeq: number, byteLen: number, at = this.clock.now()) {
+    const tr = this.playingTurns.get(turnSeq) ?? { firstAt: at, bytes: 0 };
+    tr.bytes += byteLen;
+    this.playingTurns.set(turnSeq, tr);
+    for (const [seq, t] of this.playingTurns) if (at - t.firstAt > 120_000) this.playingTurns.delete(seq);
     if (!this.pending || this.windowOpenAt !== null) return;
     this.audioSinceRequest += byteLen;
     if (!this.turnAudio.has(turnSeq)) this.turnAudio.set(turnSeq, 0);
@@ -216,6 +230,7 @@ export class ConfirmationGate {
   }
 
   onPlaybackDrained(turnSeq: number, at = this.clock.now()) {
+    this.playingTurns.delete(turnSeq);
     if (!this.pending || this.windowOpenAt !== null) return;
     if (!this.turnAudio.has(turnSeq)) this.turnAudio.set(turnSeq, 0);
     this.turnDrained.add(turnSeq);
@@ -330,7 +345,8 @@ export class ConfirmationGate {
    */
   private questionStarted(_p: PendingConfirmation, at: number): boolean {
     if (this.questionAudioOffset === null || this.firstAudioAt === null) return false;
-    const startsAt = this.firstAudioAt + (this.questionAudioOffset / BYTES_PER_SECOND_24K) * 1000 + QUESTION_HEARD_SLACK_MS;
+    const playFrom = Math.max(this.firstAudioAt, this.priorPlaybackEnd);
+    const startsAt = playFrom + (this.questionAudioOffset / BYTES_PER_SECOND_24K) * 1000 + QUESTION_HEARD_SLACK_MS;
     return at >= startsAt;
   }
 

@@ -140,6 +140,27 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       expect(verdicts).toEqual(["approved"]);
     });
 
+    it("филлер до вызова ещё доигрывает — «да» в это время не засчитывается", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.onModelAudio(7, 48000 * 2, t.now); // «Да, сейчас отправлю…» — 2 с звука до запроса
+      t.advance(200);
+      gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      t.advance(100);
+      gate.onModelAudio(8, 4800, t.now);
+      gate.onModelTranscript("Отправить в тред: «x»?", t.now);
+      gate.onModelAudio(8, 48000 * 2, t.now);
+      t.advance(1500); // 1,8 с от начала филлера: он ещё звучит
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual([]);
+      t.advance(1000); // 3,6 с: филлер доиграл, вопрос звучит
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual(["approved"]);
+    });
+
     it("эхо вопроса из динамиков не решает ничего", () => {
       const { gate, verdicts, sayNow } = setup();
       sayNow("уведомления о сбоях", 2000);
