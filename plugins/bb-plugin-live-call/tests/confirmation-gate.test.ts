@@ -98,9 +98,10 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       const verdicts: string[] = [];
       const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
       gate.request("thread_send", { text: "Уведомления о сбоях куратору" }, cls, say);
-      gate.onModelAudio(1, 48000 * 5, t.now); // вопрос звучит 5 с, окно не открыто
+      gate.onModelAudio(1, 4800, t.now); // первые 0,1 с звука — уже вопрос
+      gate.onModelTranscript(say, t.now); // текст вопроса пришёл вместе с ними
+      gate.onModelAudio(1, 48000 * 5, t.now); // вопрос звучит ещё 5 с, окно не открыто
       t.advance(1000);
-      gate.onModelTranscript(say, t.now); // вопрос начал звучать
       const sayNow = (text: string, afterMs: number) => {
         t.advance(afterMs);
         gate.onOwnerTranscriptChunk(text, t.now);
@@ -116,18 +117,24 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       expect(gate.windowOpen()).toBe(false);
     });
 
-    it("«да» до того, как вопрос начал звучать (во время филлера), не засчитывается", () => {
+    it("«да» во время филлера не засчитывается, даже если текст вопроса уже пришёл (звук отстаёт)", () => {
       const t = fakeClock();
       const verdicts: string[] = [];
       const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
       gate.request("thread_answer", { answer: "зелёный" }, "C", "Ответить агенту: «зелёный»?");
-      gate.onModelTranscript("Секунду, передаю ваш выбор агенту.", t.now + 500);
-      t.advance(2500);
+      // Gemini генерирует быстрее реального времени: за 0,3 с пришли 3 с филлера и текст вопроса.
+      gate.onModelAudio(1, 48000 * 3, t.now);
+      gate.onModelTranscript("Секунду, передаю ваш выбор агенту зелёный.", t.now); // филлер повторяет аргумент
+      t.advance(300);
+      gate.onModelTranscript("Ответить агенту: «зелёный»?", t.now);
+      gate.onModelAudio(1, 48000 * 2, t.now);
+      // 2 с от запроса: в динамике ещё филлер — «да» не ответ
+      t.advance(1700);
       gate.onOwnerTranscriptChunk("да", t.now);
       t.advance(800);
       expect(verdicts).toEqual([]);
-      gate.onModelTranscript("Ответить агенту: «зелёный»?", t.now);
-      t.advance(1000);
+      // 4 с: вопрос звучит (3 с филлера + 0,5 с запаса прошли) — «да» засчитывается
+      t.advance(1500);
       gate.onOwnerTranscriptChunk("да", t.now);
       t.advance(800);
       expect(verdicts).toEqual(["approved"]);
@@ -169,6 +176,7 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
       gate.onModelTranscript("Да, всё понятно", t.now);
       t.advance(20_000);
       gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      gate.onModelAudio(1, 4800, t.now);
       gate.onModelTranscript("Отправить в тред: «x»?", t.now);
       t.advance(2000);
       gate.onOwnerTranscriptChunk("да", t.now);

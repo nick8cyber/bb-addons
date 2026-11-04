@@ -93,6 +93,8 @@ export const realClock: GateClock = {
 export const DRAINED_LOST_SLACK_MS = 2500;
 /** Речь модели за столько до запроса подтверждения тоже считается возможным эхом (филлер перед вызовом). */
 export const MODEL_ECHO_BEFORE_REQUEST_MS = 15_000;
+/** Запас на сеть и буфер плеера: вопрос считается услышанным не раньше этого после расчётного начала. */
+export const QUESTION_HEARD_SLACK_MS = 500;
 const MODEL_ECHO_MEMORY_MS = 60_000;
 
 export class ConfirmationGate {
@@ -117,6 +119,11 @@ export class ConfirmationGate {
   private bargeTimer: unknown = null;
   /** До этого момента куски транскрипта — хвост уже отброшенной реплики. */
   private tailUntil = 0;
+  /** Байты аудио модели после запроса (сквозь все ходы) и сколько их было до начала вопроса. */
+  private audioSinceRequest = 0;
+  private questionAudioOffset: number | null = null;
+  /** Значимые слова вопроса без слов из аргументов действия (филлер может их повторять). */
+  private questionWords = new Set<string>();
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
   private usedIds = new Set<string>();
   private confirmWaiters = new Map<string, Array<{ resolve: (v: Verdict) => void; timer: unknown }>>();
@@ -167,6 +174,19 @@ export class ConfirmationGate {
     // не раньше BARGE_IN_MIN_MS и не совпадающее со словами самого вопроса.
     this.resetWindow();
     this.tailUntil = 0;
+    this.audioSinceRequest = 0;
+    this.questionAudioOffset = null;
+    {
+      const argWords = new Set(
+        normalizeUtterance(
+          Object.entries(args)
+            .filter(([k, v]) => !k.startsWith("_") && typeof v === "string")
+            .map(([, v]) => v as string)
+            .join(" "),
+        ),
+      );
+      this.questionWords = new Set(normalizeUtterance(say).filter((w) => w.length >= 3 && !argWords.has(w)));
+    }
     this.micOpen = true;
     this.events.onConfirmationUpdate?.(this.pending, "asking");
     return { pending: this.pending };
@@ -187,6 +207,7 @@ export class ConfirmationGate {
   /** Аудио хода модели: байты PCM 24 кГц, помечены turnSeq (спека §7.1 п. 3.2). */
   onModelAudio(turnSeq: number, byteLen: number, at = this.clock.now()) {
     if (!this.pending || this.windowOpenAt !== null) return;
+    this.audioSinceRequest += byteLen;
     if (!this.turnAudio.has(turnSeq)) this.turnAudio.set(turnSeq, 0);
     this.turnAudio.set(turnSeq, (this.turnAudio.get(turnSeq) ?? 0) + byteLen);
     this.turnDrained.delete(turnSeq);
@@ -259,6 +280,16 @@ export class ConfirmationGate {
   onModelTranscript(text: string, at = this.clock.now()) {
     const words = normalizeUtterance(text);
     if (words.length > 0) this.modelSpeech.push({ at, words });
+    // Начало вопроса в аудио: сколько байт модели пришло до первого куска со словами вопроса.
+    // Текст приходит со скоростью генерации, звук играет в реальном времени — момент, когда
+    // владелец СЛЫШИТ вопрос, считается от первого кадра аудио плюс длительность филлера.
+    if (this.pending && this.questionAudioOffset === null && this.questionWords.size > 0) {
+      const need = Math.min(2, this.questionWords.size);
+      const spoken = new Set(words);
+      let hits = 0;
+      for (const w of this.questionWords) if (spoken.has(w)) hits++;
+      if (hits >= need) this.questionAudioOffset = this.audioSinceRequest;
+    }
     // Хранится только то, что ещё может вернуться эхом.
     this.modelSpeech = this.modelSpeech.filter((c) => at - c.at <= MODEL_ECHO_MEMORY_MS);
   }
@@ -280,7 +311,7 @@ export class ConfirmationGate {
       }
       // Перебить можно только звучащий вопрос: согласие до него — ответ на филлер
       // («Секунду, передаю…»), владелец не слышал точного названия (§16.3; приёмка PLUG-114, B).
-      if (!this.questionStarted(p)) {
+      if (!this.questionStarted(p, at)) {
         this.tailUntil = at + UTTERANCE_SILENCE_MS;
         return;
       }
@@ -293,13 +324,14 @@ export class ConfirmationGate {
     this.bargeTimer = this.clock.setTimeout(() => this.finalizeBargeIn(), UTTERANCE_SILENCE_MS);
   }
 
-  /** Вопрос начал звучать: в речи модели после запроса есть ≥2 значимых слова из вопроса. */
-  private questionStarted(p: PendingConfirmation): boolean {
-    const sayWords = new Set(normalizeUtterance(p.say).filter((w) => w.length >= 3));
-    const spoken = new Set(this.modelSpeech.filter((c) => c.at >= p.createdAt).flatMap((c) => c.words));
-    let hits = 0;
-    for (const w of sayWords) if (spoken.has(w) && ++hits >= 2) return true;
-    return false;
+  /**
+   * Вопрос начал звучать У ВЛАДЕЛЬЦА: первый кадр аудио после запроса + длительность аудио
+   * до куска с вопросом + запас. По тексту нельзя — он обгоняет звук (ревью advisor, приёмка PLUG-114).
+   */
+  private questionStarted(_p: PendingConfirmation, at: number): boolean {
+    if (this.questionAudioOffset === null || this.firstAudioAt === null) return false;
+    const startsAt = this.firstAudioAt + (this.questionAudioOffset / BYTES_PER_SECOND_24K) * 1000 + QUESTION_HEARD_SLACK_MS;
+    return at >= startsAt;
   }
 
   private finalizeBargeIn() {

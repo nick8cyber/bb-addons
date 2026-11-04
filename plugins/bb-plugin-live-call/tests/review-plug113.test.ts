@@ -75,8 +75,9 @@ describe("B: реплика, начатая раньше 1,5 с, — хвост 
     const verdicts: string[] = [];
     const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock as never, { onVerdict: (_p, v) => verdicts.push(v) });
     gate.request("send_to_thread", { text: "Готово" }, "C", "Отправить в «CRM»: «Готово»?");
+    gate.onModelAudio(1, 4800, t.now);
+    gate.onModelTranscript("Отправить в «CRM»: «Готово»?", t.now); // вопрос звучит с начала
     gate.onModelAudio(1, 48000 * 5, t.now);
-    gate.onModelTranscript("Отправить в «CRM»: «Готово»?", t.now + 100); // вопрос звучит
     return { t, gate, verdicts };
   };
 
