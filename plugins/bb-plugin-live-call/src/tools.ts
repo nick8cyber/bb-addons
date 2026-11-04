@@ -1690,7 +1690,9 @@ export const threadAnswerTool: ToolDef = {
       // ответа — он уходит в тред сообщением (живая проверка 04.11: ответ не доходил,
       // thread_answer падал с «нет ожидающих взаимодействий»).
       const answerText = String(args.answer ?? "").trim();
-      if (!args.grant && answerText) return threadSendTool.execute({ text: answerText }, ctx);
+      // Только если у треда вообще нет ожидающих взаимодействий и id не назван: неверный или
+      // устаревший interactionId — честная ошибка, а не тихая отправка сообщением (контракт §12.4).
+      if (!args.grant && answerText && !wantedId && rows.length === 0) return threadSendTool.execute({ text: answerText }, ctx);
       return { ok: false, error: { code: "not_found", message: "у треда нет ожидающих взаимодействий" } };
     }
     const interactionId = String(target.id);

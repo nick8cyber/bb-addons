@@ -663,3 +663,15 @@ describe("thread_answer grant без запроса агента (приёмка
     expect(JSON.stringify(result)).toContain("не просит разрешения");
   });
 });
+
+describe("thread_answer: устаревший interactionId (ревью advisor)", () => {
+  it("назван id, которого нет, — ошибка not_found, сообщение не уходит", async () => {
+    const tool = toolByName("thread_answer", "thr_target")!;
+    const send = vi.fn();
+    const ctx = { sdk: { threads: { send, interactions: { list: async () => [] } } }, targetThreadId: "thr_target", ledger: { add: vi.fn() }, reportAction: vi.fn() };
+    const res = (await tool.execute({ answer: "синий", interactionId: "int_old" }, ctx as never)) as { ok: boolean; error?: { code: string } };
+    expect(res.ok).toBe(false);
+    expect(res.error?.code).toBe("not_found");
+    expect(send).not.toHaveBeenCalled();
+  });
+});
