@@ -105,15 +105,22 @@ export function toGeminiSchema(schema?: unknown): Record<string, unknown> | null
       }
       resolvedType = target.type;
     } else if (Array.isArray(target.type)) {
-      // type: [X, "null"]
-      if (target.type.length === 2 && target.type.includes("null")) {
-        const nonNull = target.type.find((t) => t !== "null");
-        if (typeof nonNull === "string" && SUPPORTED_PRIMITIVE_TYPES.has(nonNull)) {
-          resolvedType = nonNull;
-          nullable = true;
-        } else {
-          return null;
-        }
+      const types = target.type.filter((t): t is string => typeof t === "string");
+      if (types.length !== target.type.length) return null;
+      if (types.includes("null")) nullable = true;
+      const nonNull = [...new Set(types.filter((t) => t !== "null"))];
+      if (nonNull.length === 1 && SUPPORTED_PRIMITIVE_TYPES.has(nonNull[0])) {
+        // type: [X, "null"]
+        resolvedType = nonNull[0];
+      } else if (
+        nonNull.length >= 2 &&
+        nonNull.includes("string") &&
+        nonNull.every((t) => t === "string" || t === "number" || t === "integer")
+      ) {
+        // Скалярное объединение со строкой ([string, number|integer]) → string: сервер
+        // принимает строку, а Gemini объединений типов не знает (§14.4, ревью 04.11 —
+        // суммы и id в CRM объявлены так).
+        resolvedType = "string";
       } else {
         return null;
       }

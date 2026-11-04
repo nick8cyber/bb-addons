@@ -496,7 +496,10 @@ version}`) → `notifications/initialized` → `tools/list` (с курсором
 Переносится: `type` (`object`, `string`, `number`, `integer`, `boolean`, `array`),
 `description`, `properties`, `required`, `items`, `enum` (строки), `format` (`date`,
 `date-time` у строк), `minimum`, `maximum`, `minItems`, `maxItems`; `type: [X, "null"]` и
-`anyOf: [X, {type: "null"}]` → `X` + `nullable: true`. Отбрасывается молча: `$schema`,
+`anyOf: [X, {type: "null"}]` → `X` + `nullable: true`. Скалярное объединение со строкой —
+`type: ["string", "number"]`, `["string", "integer"]` (и с `"null"`) → `string` (+ `nullable`):
+сервер принимает строку, Gemini объединений типов не знает (решение куратора 04.11 по ревью
+первого реального коннектора). Отбрасывается молча: `$schema`,
 `$id`, `title`, `default`, `examples`, `additionalProperties`. Есть `$ref`, `oneOf`,
 `allOf`, иной `anyOf`, `patternProperties` или корень не `object` — ручка пропускается
 (`connector_tool_skipped`, `reason: "schema_unsupported"`). Чистая функция

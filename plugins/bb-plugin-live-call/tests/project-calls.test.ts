@@ -556,3 +556,21 @@ describe("ревью PLUG-113: HTTP-коннектор — обрыв сети �
     client.close();
   });
 });
+
+describe("§14.4: скалярное объединение со строкой (ревью 04.11, схемы первого реального коннектора)", () => {
+  it("[string, number] и [string, integer] → string; с null — nullable; прочие объединения — отказ", async () => {
+    const { toGeminiSchema } = await import("../src/mcp-client.js");
+    const s = toGeminiSchema({
+      type: "object",
+      properties: {
+        amount: { type: ["string", "number"] },
+        telegram_id: { type: ["string", "integer", "null"] },
+      },
+    }) as { properties: Record<string, { type: string; nullable?: boolean }> };
+    expect(s.properties.amount.type.toLowerCase()).toBe("string");
+    expect(s.properties.telegram_id.type.toLowerCase()).toBe("string");
+    expect(s.properties.telegram_id.nullable).toBe(true);
+    expect(toGeminiSchema({ type: "object", properties: { x: { type: ["number", "boolean"] } } })).toBeNull();
+    expect(toGeminiSchema({ type: "object", properties: { x: { type: ["number", "integer"] } } })).toBeNull();
+  });
+});
