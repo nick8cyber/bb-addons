@@ -134,6 +134,7 @@ export interface ProjectListItem {
   hash?: string;
   diff?: string[];
   error?: string;
+  connectors?: ConnectorConfig[];
 }
 
 export function canonicalizeJson(v: unknown): unknown {
@@ -269,9 +270,10 @@ export function resolveStrictClass(
   repoClass?: "R" | "C" | "P" | "L",
 ): ProjectToolClass {
   if (registryClass === "deny") return "deny";
+  if (!CLASS_SEVERITY[registryClass]) return registryClass;
   if (!repoClass || !CLASS_SEVERITY[repoClass]) return registryClass;
-  const regSev = CLASS_SEVERITY[registryClass] ?? 2;
-  const repoSev = CLASS_SEVERITY[repoClass] ?? 2;
+  const regSev = CLASS_SEVERITY[registryClass];
+  const repoSev = CLASS_SEVERITY[repoClass];
   return repoSev > regSev ? repoClass : registryClass;
 }
 
@@ -387,46 +389,91 @@ export class ProjectRegistryManager {
   }
 
   listProjects(rawJson?: string | null): ProjectListItem[] {
-    const { parsed, rawObj, error } = this.parseRegistry(rawJson);
-    if (parsed === null) {
-      // Если весь JSON не распарсился
-      if (rawObj && typeof rawObj === "object") {
-        return Object.entries(rawObj).map(([pid, val]) => {
-          const title = val && typeof val === "object" && "title" in val && typeof val.title === "string" ? val.title : pid;
-          return {
-            projectId: pid,
-            title,
-            state: "invalid",
-            error: error ?? "ошибка валидации",
-          };
-        });
+    const { parsed } = this.parseRegistry(rawJson);
+    if (parsed) {
+      // При удалении проекта из реестра снимок удаляется (§16.7 п. 2)
+      const approvedIds = this.store.listApprovedProjectIds();
+      for (const id of approvedIds) {
+        if (!parsed[id]) {
+          this.store.deleteApprovedProject(id);
+        }
       }
+      const rejectedIds = this.store.listRejectedProjectIds();
+      for (const id of rejectedIds) {
+        if (!parsed[id]) {
+          this.store.deleteRejectedProject(id);
+        }
+      }
+    }
+    return this.listProjectsReadOnly(rawJson);
+  }
+
+  /**
+   * Чтение состояния реестра без мутаций хранилища (§14.8, review PLUG-117).
+   * Не удаляет снимки отсутствующих проектов и не меняет состояние SQLite.
+   * Валидирует каждую запись независимо, чтобы ошибки одного проекта не влияли на другие.
+   */
+  listProjectsReadOnly(rawJson?: string | null): ProjectListItem[] {
+    let rawObj: Record<string, unknown> | null = null;
+    try {
+      if (rawJson && rawJson.trim()) {
+        const parsedJson = JSON.parse(rawJson);
+        if (parsedJson && typeof parsedJson === "object" && !Array.isArray(parsedJson)) {
+          rawObj = parsedJson as Record<string, unknown>;
+        } else {
+          return [
+            {
+              projectId: "unknown",
+              title: "Некорректный реестр",
+              state: "invalid",
+              error: "projectCalls должен быть объектом { <projectId>: { title, connectors } }",
+            },
+          ];
+        }
+      } else {
+        return [];
+      }
+    } catch (e) {
       return [
         {
           projectId: "unknown",
           title: "Некорректный реестр",
           state: "invalid",
-          error: error ?? "ошибка JSON",
+          error: `ошибка JSON: ${String((e as Error)?.message ?? e)}`,
         },
       ];
     }
 
-    // При удалении проекта из реестра снимок удаляется (§16.7 п. 2)
-    const approvedIds = this.store.listApprovedProjectIds();
-    for (const id of approvedIds) {
-      if (!parsed[id]) {
-        this.store.deleteApprovedProject(id);
-      }
-    }
-    const rejectedIds = this.store.listRejectedProjectIds();
-    for (const id of rejectedIds) {
-      if (!parsed[id]) {
-        this.store.deleteRejectedProject(id);
-      }
-    }
-
     const items: ProjectListItem[] = [];
-    for (const [projectId, config] of Object.entries(parsed)) {
+    for (const [projectId, val] of Object.entries(rawObj)) {
+      const res = projectConfigSchema.safeParse(val);
+      if (!res.success) {
+        const title =
+          val && typeof val === "object" && "title" in val && typeof (val as any).title === "string"
+            ? (val as any).title
+            : projectId;
+        const msg = res.error.issues.map((i) => `${projectId}.${i.path.join(".")}: ${i.message}`).join("; ");
+        let fallbackConnectors: ConnectorConfig[] | undefined = undefined;
+        if (val && typeof val === "object" && Array.isArray((val as any).connectors)) {
+          fallbackConnectors = (val as any).connectors.map((c: any) => ({
+            id: typeof c?.id === "string" ? c.id : "unknown",
+            transport: c?.transport === "http" ? "http" : "stdio",
+            command: Array.isArray(c?.command) ? c.command : undefined,
+            url: typeof c?.url === "string" ? c.url : undefined,
+            defaultClass: c?.defaultClass ?? "C",
+          }));
+        }
+        items.push({
+          projectId,
+          title,
+          state: "invalid",
+          error: `ошибка валидации: ${msg}`,
+          connectors: fallbackConnectors,
+        });
+        continue;
+      }
+
+      const config = res.data;
       const currentHash = hashProjectConfig(config);
       const approved = this.store.getApprovedProject(projectId);
       const rejected = this.store.getRejectedProject(projectId);
@@ -437,6 +484,7 @@ export class ProjectRegistryManager {
           title: config.title,
           state: "approved",
           hash: currentHash,
+          connectors: config.connectors,
         });
       } else if (rejected && rejected.hash === currentHash) {
         let oldConfig: ProjectConfig | null = null;
@@ -454,6 +502,7 @@ export class ProjectRegistryManager {
           state: "rejected",
           hash: currentHash,
           diff,
+          connectors: config.connectors,
         });
       } else {
         let oldConfig: ProjectConfig | null = null;
@@ -471,6 +520,7 @@ export class ProjectRegistryManager {
           state: "pending",
           hash: currentHash,
           diff,
+          connectors: config.connectors,
         });
       }
     }

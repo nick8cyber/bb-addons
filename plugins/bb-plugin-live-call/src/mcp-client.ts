@@ -5,8 +5,14 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { CONNECTOR_RESULT_MAX_CHARS_DEFAULT, type ConnectorConfig } from "./project-registry.js";
-import { maskSecrets } from "./secret-filter.js";
+import { StringDecoder } from "node:string_decoder";
+import {
+  CONNECTOR_RESULT_MAX_CHARS_DEFAULT,
+  resolveStrictClass,
+  type ConnectorConfig,
+  type RepoProjectEnvironment,
+} from "./project-registry.js";
+import { getSecretOccurrences, isValidSecretValue, maskSecrets } from "./secret-filter.js";
 
 export interface McpTool {
   name: string;
@@ -84,6 +90,15 @@ export function extractConfirmToken(raw: unknown): string | undefined {
   return undefined;
 }
 
+export interface ResolvedToolInspection {
+  tool: string;
+  candidateName: string;
+  status: "active" | "skipped";
+  cls?: "R" | "C" | "P" | "L";
+  skipReason?: "invalid_name" | "name_collision" | "schema_unsupported" | "deny" | "invalid_class";
+  geminiParams?: Record<string, unknown>;
+}
+
 export function makeConnectorToolName(connectorId: string, tool: string): string {
   const raw = `${connectorId}__${tool}`;
   return raw.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 64);
@@ -97,6 +112,113 @@ export function parseConnectorToolName(name: string): { connectorId: string; too
   const idx = name.indexOf("__");
   if (idx === -1) return null;
   return { connectorId: name.slice(0, idx), tool: name.slice(idx + 2) };
+}
+
+/**
+ * Проверка ручки коннектора (§14.3, §14.4, §15.3, review PLUG-117).
+ * Проверяет допустимость имени, коллизии внутри проекта, схему Gemini, строгий класс R/C/P/L/deny.
+ */
+export function inspectConnectorTool(
+  tool: McpTool,
+  connCfg: ConnectorConfig,
+  repoEnv: RepoProjectEnvironment,
+  seenToolNames: Set<string>,
+): ResolvedToolInspection {
+  const rawName = `${connCfg.id}__${tool.name}`;
+  if (!tool.name || !tool.name.trim() || !isValidConnectorToolName(rawName)) {
+    return {
+      tool: tool.name,
+      candidateName: rawName,
+      status: "skipped",
+      skipReason: "invalid_name",
+    };
+  }
+
+  const candidateName = rawName;
+  if (seenToolNames.has(candidateName)) {
+    return {
+      tool: tool.name,
+      candidateName,
+      status: "skipped",
+      skipReason: "name_collision",
+    };
+  }
+
+  // Двухшаговая ручка (§14.10 п. 2): confirm/confirm_token разрешены в схеме, но не обязательны.
+  const isTwoStep = Boolean(connCfg.twoStep && connCfg.twoStep.includes(tool.name));
+  const geminiParams = toGeminiSchema(tool.inputSchema, isTwoStep);
+  if (geminiParams && isTwoStep && Array.isArray((geminiParams as any).required)) {
+    (geminiParams as any).required = (geminiParams as any).required.filter(
+      (k: string) => k !== "confirm" && k !== "confirm_token",
+    );
+  }
+  if (!geminiParams) {
+    return {
+      tool: tool.name,
+      candidateName,
+      status: "skipped",
+      skipReason: "schema_unsupported",
+    };
+  }
+
+  const connTools = connCfg.tools as Record<string, any> | undefined;
+  const regCls = connTools && Object.hasOwn(connTools, tool.name) ? connTools[tool.name] : connCfg.defaultClass;
+  const repoCls = repoEnv.tools && Object.hasOwn(repoEnv.tools, tool.name) ? repoEnv.tools[tool.name] : undefined;
+
+  // Безопасная валидация классов до сравнения: неверный класс реестра или репо не должен
+  // превращаться в допустимый класс через fallback (§14.8, review PLUG-117 P2-2).
+  const isValidRegCls =
+    regCls === "R" || regCls === "C" || regCls === "P" || regCls === "L" || regCls === "deny";
+  if (!isValidRegCls) {
+    return {
+      tool: tool.name,
+      candidateName,
+      status: "skipped",
+      skipReason: "invalid_class",
+      geminiParams,
+    };
+  }
+
+  if (repoCls !== undefined && repoCls !== "R" && repoCls !== "C" && repoCls !== "P" && repoCls !== "L") {
+    return {
+      tool: tool.name,
+      candidateName,
+      status: "skipped",
+      skipReason: "invalid_class",
+      geminiParams,
+    };
+  }
+
+  const strictCls = resolveStrictClass(regCls, repoCls);
+
+  if (strictCls === "deny") {
+    return {
+      tool: tool.name,
+      candidateName,
+      status: "skipped",
+      skipReason: "deny",
+      geminiParams,
+    };
+  }
+
+  if (strictCls !== "R" && strictCls !== "C" && strictCls !== "P" && strictCls !== "L") {
+    return {
+      tool: tool.name,
+      candidateName,
+      status: "skipped",
+      skipReason: "invalid_class",
+      geminiParams,
+    };
+  }
+
+  seenToolNames.add(candidateName);
+  return {
+    tool: tool.name,
+    candidateName,
+    status: "active",
+    cls: strictCls,
+    geminiParams,
+  };
 }
 
 const SUPPORTED_PRIMITIVE_TYPES = new Set(["string", "number", "integer", "boolean", "array", "object"]);
@@ -282,6 +404,128 @@ export function mcpSchemaToGeminiParameters(schema?: Record<string, unknown>, is
   return res ?? { type: "object", properties: {} };
 }
 
+export const liveConnectorClients = new Set<McpClient>();
+
+/**
+ * Потоковый сборщик и фильтр stderr коннектора (§14.6, коммит b73fedb).
+ */
+export function createMcpStderrCollector(
+  secretVals: string[],
+  logLine: (line: string) => void,
+  budget = 2000,
+) {
+  const maxSecretLen = secretVals.length > 0 ? Math.max(0, ...secretVals.map((s) => s.length)) : 0;
+  const dec = new StringDecoder("utf8");
+  let head = "";
+  let lineLen = 0;
+  let lineEndsWithCR = false;
+  let remainingBudget = budget;
+  let decoderEnded = false;
+
+  const emitLine = (h: string, len: number, B: number): { out: string; C: number } => {
+    if (len === 0) return { out: "", C: 0 };
+    if (len <= B) {
+      return { out: maskSecrets(h, secretVals), C: len };
+    }
+    let C = B;
+    for (;;) {
+      const prev = C;
+      for (const [s, e] of getSecretOccurrences(h, secretVals)) {
+        if (s < C && C < e) {
+          C = s;
+        }
+      }
+      if (C > 0 && !/\s/.test(h[C - 1])) {
+        let k = C;
+        while (k > 0 && !/\s/.test(h[k - 1])) {
+          k--;
+        }
+        C = k;
+      }
+      if (C === prev) break;
+    }
+    const maskedPart = maskSecrets(h.slice(0, C), secretVals);
+    return { out: maskedPart + `…[обрезано ${len - C}]`, C };
+  };
+
+  const flush = () => {
+    if (lineLen === 0) return;
+    if (remainingBudget > 0) {
+      const r = emitLine(head, lineLen, remainingBudget);
+      if (r.out) {
+        logLine(r.out);
+      }
+      remainingBudget -= Math.max(r.C, Math.min(lineLen, remainingBudget));
+    }
+    head = "";
+    lineLen = 0;
+    lineEndsWithCR = false;
+  };
+
+  const feed = (t: string) => {
+    for (const ch of t.split(/(\n)/)) {
+      if (ch === "\n") {
+        if (lineEndsWithCR) {
+          lineLen--;
+          if (head.endsWith("\r")) {
+            head = head.slice(0, -1);
+          }
+          lineEndsWithCR = false;
+        }
+        flush();
+        continue;
+      }
+      if (ch.length > 0) {
+        lineEndsWithCR = ch.endsWith("\r");
+      }
+      if (remainingBudget <= 0) {
+        lineLen += ch.length;
+        continue;
+      }
+      const cap = remainingBudget + maxSecretLen;
+      if (head.length < cap) {
+        head += ch.slice(0, cap - head.length);
+      }
+      lineLen += ch.length;
+    }
+  };
+
+  const onData = (d: Buffer | string) => {
+    if (Buffer.isBuffer(d)) {
+      feed(dec.write(d));
+    } else {
+      feed(d);
+    }
+  };
+
+  const onEnd = () => {
+    if (decoderEnded) return;
+    decoderEnded = true;
+    feed(dec.end());
+    if (lineEndsWithCR) {
+      lineLen--;
+      if (head.endsWith("\r")) {
+        head = head.slice(0, -1);
+      }
+      lineEndsWithCR = false;
+    }
+    flush();
+  };
+
+  return {
+    onData,
+    onEnd,
+    getRemainingBudget: () => remainingBudget,
+    getHeadLen: () => head.length,
+  };
+}
+
+export interface McpClientOwner {
+  type: "call" | "diagnostics";
+  callId?: string;
+  onStopFailed?: (id: string, pid: number) => void;
+}
+
 export class McpClient {
   private child: ChildProcess | null = null;
   private reqId = 0;
@@ -290,22 +534,53 @@ export class McpClient {
   private alive = true;
   private sessionId: string | null = null;
   private stderrChars = 0;
+  private abortController = new AbortController();
+  private closePromise: Promise<void> | null = null;
+  private closePending = false;
+  private closeAttempted = false;
+  private closeFailed = false;
+  private lateDeletes = new Set<Promise<void>>();
+  private started = false;
+  private childExited = false;
+  private lastPid: number | null = null;
+  private inFlightHttpRequests = 0;
 
   constructor(
     public readonly config: ConnectorConfig,
     private secrets: Record<string, string> = {},
     private log?: { info(s: string): void; warn(s: string): void; error(s: string): void },
-  ) {}
+    private owner?: McpClientOwner,
+  ) {
+    liveConnectorClients.add(this);
+  }
+
+  getPid(): number | null {
+    return this.child?.pid ?? this.lastPid;
+  }
+
+  isCloseAttempted(): boolean {
+    return this.closeAttempted;
+  }
+
+  isCloseFailed(): boolean {
+    return this.closeFailed;
+  }
 
   /**
    * Запуск и опрос ручек коннектора: initialize → tools/list с таймаутом 10 с (§15.4 п. 1).
    */
   async start(timeoutMs = 10_000): Promise<McpTool[]> {
-    // Проверка наличия всех требуемых секретов (§14.1, §14.9)
+    this.started = true;
+    // Проверка наличия и валидности всех требуемых секретов (§14.1, 266a726, §14.9)
     if (this.config.secrets && this.config.secrets.length > 0) {
       for (const s of this.config.secrets) {
-        if (!this.secrets || typeof this.secrets[s] !== "string" || !this.secrets[s]) {
+        if (!this.secrets || typeof this.secrets[s] !== "string" || !(s in this.secrets)) {
           throw new Error(`connector_secret_missing: отсутствует секрет «${s}» для коннектора ${this.config.id}`);
+        }
+        const val = this.secrets[s];
+        if (!isValidSecretValue(val)) {
+          this.log?.warn?.(`connector_secret_invalid: недопустимый секрет «${s}» для коннектора ${this.config.id}`);
+          throw new Error(`connector_secret_invalid: недопустимый секрет «${s}» для коннектора ${this.config.id}`);
         }
       }
     }
@@ -325,7 +600,7 @@ export class McpClient {
     try {
       return await Promise.race([this.initAndListTools(), timer]);
     } catch (e) {
-      this.close();
+      await this.close();
       throw e;
     }
   }
@@ -358,6 +633,7 @@ export class McpClient {
       detached: true,
     });
     this.child = child;
+    this.lastPid = child.pid ?? null;
     this.alive = true;
 
     // Защита от EPIPE uncaughtException при внезапном закрытии процесса (§13 п. 3, review п. 8)
@@ -365,27 +641,44 @@ export class McpClient {
 
     child.on("error", (err) => {
       this.alive = false;
+      if (!child.pid) {
+        this.childExited = true;
+      }
       this.log?.warn?.(`MCP [${this.config.id}] child error: ${String(err)}`);
       this.rejectAll(new Error(`connector_unavailable: ${String(err)}`));
     });
 
+    child.on("exit", () => {
+      this.alive = false;
+      this.childExited = true;
+    });
+
     child.on("close", (code) => {
       this.alive = false;
+      this.childExited = true;
       if (!this.closed) {
         this.log?.warn?.(`MCP [${this.config.id}] exited code=${code}`);
         this.rejectAll(new Error(`connector_unavailable: коннектор ${this.config.id} завершил работу с кодом ${code}`));
       }
     });
 
-    // stderr — через фильтр секретов, не более 2000 знаков на звонок (§14.1, §14.6)
-    const secretVals = Object.values(this.secrets);
+    // stderr коннектора — потоково (§14.6, коммит b73fedb, 266a726)
+    const secretVals = Object.values(this.secrets).filter(isValidSecretValue);
+    const collector = createMcpStderrCollector(
+      secretVals,
+      (line) => this.log?.warn?.(`MCP [${this.config.id}] stderr: ${line}`),
+      2000,
+    );
+
     child.stderr?.on("data", (d: Buffer) => {
-      if (this.stderrChars >= 2000) return;
-      const raw = d.toString("utf-8");
-      const allowed = raw.slice(0, 2000 - this.stderrChars);
-      this.stderrChars += allowed.length;
-      const masked = maskSecrets(allowed.trim(), secretVals);
-      this.log?.warn?.(`MCP [${this.config.id}] stderr: ${masked}`);
+      collector.onData(d);
+    });
+
+    child.stderr?.on("end", () => {
+      collector.onEnd();
+    });
+    child.on("close", () => {
+      collector.onEnd();
     });
 
     if (child.stdout) {
@@ -492,12 +785,21 @@ export class McpClient {
           headers["Authorization"] = `Bearer ${this.secrets[firstSecret]}`;
         }
       }
+      const signal = AbortSignal.any([
+        this.abortController.signal,
+        AbortSignal.timeout(5000),
+      ]);
+      this.inFlightHttpRequests++;
       void fetch(this.config.url!, {
         method: "POST",
         headers,
         body: JSON.stringify(req),
-        signal: AbortSignal.timeout(5000),
-      }).catch(() => {});
+        signal,
+      })
+        .catch(() => {})
+        .finally(() => {
+          this.inFlightHttpRequests--;
+        });
     }
   }
 
@@ -509,95 +811,111 @@ export class McpClient {
    * Секрет уходит как Authorization: Bearer <значение первого секрета>.
    */
   private async requestHttp(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
+    if (this.closed) throw new Error(`коннектор ${this.config.id} закрыт`);
+
     const url = this.config.url;
     if (!url) throw new Error(`коннектор ${this.config.id}: не указан url`);
 
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-    };
-    if (this.sessionId) {
-      headers["Mcp-Session-Id"] = this.sessionId;
-    }
-    if (this.config.secrets && this.config.secrets.length > 0) {
-      const firstSecret = this.config.secrets[0];
-      if (this.secrets[firstSecret]) {
-        headers["Authorization"] = `Bearer ${this.secrets[firstSecret]}`;
-      }
-    }
-
-    const id = ++this.reqId;
-    const req = { jsonrpc: "2.0", id, method, params };
-
-    let res: Response;
+    this.inFlightHttpRequests++;
     try {
-      res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(req),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (e) {
-      const name = (e as { name?: string })?.name;
-      if (name === "TimeoutError" || name === "AbortError") throw new Error(`timeout: таймаут ${timeoutMs} мс`);
-      // Сеть оборвалась посреди звонка: коннектор недоступен до конца звонка (§14.5, ревью PLUG-113)
-      this.alive = false;
-      throw new Error(`connector_unavailable: ${String((e as Error)?.message ?? e)}`);
-    }
-
-    if (!res.ok) {
-      if (res.status >= 500) {
-        this.alive = false;
-        throw new Error(`connector_unavailable: HTTP ${res.status} ${res.statusText}`);
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      };
+      if (this.sessionId) {
+        headers["Mcp-Session-Id"] = this.sessionId;
       }
-      throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    }
-
-    const sid = res.headers.get("mcp-session-id");
-    if (sid) {
-      this.sessionId = sid;
-    }
-
-    const contentType = res.headers.get("content-type") || "";
-    if (contentType.includes("text/event-stream")) {
-      const text = await res.text();
-      const lines = text.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data:")) {
-          const jsonStr = trimmed.slice(5).trim();
-          if (!jsonStr) continue;
-          try {
-            const data = JSON.parse(jsonStr) as {
-              id?: number | string;
-              result?: unknown;
-              error?: { code?: number; message?: string };
-            };
-            if (data && typeof data === "object" && data.id === id) {
-              if (data.error) {
-                const errCode = data.error.code === -32602 ? "invalid_argument" : "connector_error";
-                const err = new Error(data.error.message || "MCP HTTP error");
-                (err as any).code = errCode;
-                throw err;
-              }
-              return data.result;
-            }
-          } catch (e) {
-            if ((e as any)?.code) throw e;
-          }
+      if (this.config.secrets && this.config.secrets.length > 0) {
+        const firstSecret = this.config.secrets[0];
+        if (this.secrets[firstSecret]) {
+          headers["Authorization"] = `Bearer ${this.secrets[firstSecret]}`;
         }
       }
-      throw new Error(`не найден ответ для запроса ${id} в SSE потоке`);
-    }
 
-    const data = (await res.json()) as { id?: number | string; result?: unknown; error?: { code?: number; message?: string } };
-    if (data.error) {
-      const errCode = data.error.code === -32602 ? "invalid_argument" : "connector_error";
-      const err = new Error(data.error.message ?? "MCP HTTP error");
-      (err as any).code = errCode;
-      throw err;
+      const id = ++this.reqId;
+      const req = { jsonrpc: "2.0", id, method, params };
+
+      const signal = AbortSignal.any([
+        this.abortController.signal,
+        AbortSignal.timeout(timeoutMs),
+      ]);
+
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(req),
+          signal,
+        });
+      } catch (e) {
+        const name = (e as { name?: string })?.name;
+        if (name === "TimeoutError" || name === "AbortError") throw new Error(`timeout: таймаут ${timeoutMs} мс`);
+        // Сеть оборвалась посреди звонка: коннектор недоступен до конца звонка (§14.5, ревью PLUG-113)
+        this.alive = false;
+        throw new Error(`connector_unavailable: ${String((e as Error)?.message ?? e)}`);
+      }
+
+      if (!res.ok) {
+        if (res.status >= 500) {
+          this.alive = false;
+          throw new Error(`connector_unavailable: HTTP ${res.status} ${res.statusText}`);
+        }
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+
+      const sid = res.headers.get("mcp-session-id");
+      if (sid) {
+        if (this.closed) {
+          void this.sendDelete(sid);
+        } else {
+          this.sessionId = sid;
+        }
+      }
+
+      const contentType = res.headers.get("content-type") || "";
+      if (contentType.includes("text/event-stream")) {
+        const text = await res.text();
+        const lines = text.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("data:")) {
+            const jsonStr = trimmed.slice(5).trim();
+            if (!jsonStr) continue;
+            try {
+              const data = JSON.parse(jsonStr) as {
+                id?: number | string;
+                result?: unknown;
+                error?: { code?: number; message?: string };
+              };
+              if (data && typeof data === "object" && data.id === id) {
+                if (data.error) {
+                  const errCode = data.error.code === -32602 ? "invalid_argument" : "connector_error";
+                  const err = new Error(data.error.message || "MCP HTTP error");
+                  (err as any).code = errCode;
+                  throw err;
+                }
+                return data.result;
+              }
+            } catch (e) {
+              if ((e as any)?.code) throw e;
+            }
+          }
+        }
+        throw new Error(`не найден ответ для запроса ${id} в SSE потоке`);
+      }
+
+      const data = (await res.json()) as { id?: number | string; result?: unknown; error?: { code?: number; message?: string } };
+      if (data.error) {
+        const errCode = data.error.code === -32602 ? "invalid_argument" : "connector_error";
+        const err = new Error(data.error.message ?? "MCP HTTP error");
+        (err as any).code = errCode;
+        throw err;
+      }
+      return data.result;
+    } finally {
+      this.inFlightHttpRequests--;
     }
-    return data.result;
   }
 
   private async initAndListTools(): Promise<McpTool[]> {
@@ -644,7 +962,7 @@ export class McpClient {
       };
     }
 
-    const secretValues = Object.values(this.secrets);
+    const secretValues = Object.values(this.secrets).filter(isValidSecretValue);
     try {
       const res = (await this.request("tools/call", { name: tool, arguments: args }, timeoutMs)) as {
         content?: Array<{ type: string; text?: string }>;
@@ -731,77 +1049,277 @@ export class McpClient {
     }
   }
 
-  /**
-   * Корректная остановка коннектора (§14.5).
-   * stdio: закрыть stdin, SIGTERM через 2 с, SIGKILL через 5 с;
-   * http: DELETE с Mcp-Session-Id.
-   */
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.alive = false;
-    this.rejectAll(new Error(`коннектор ${this.config.id} закрыт`));
-
-    if (this.config.transport === "http" && this.sessionId && this.config.url) {
-      const headers: Record<string, string> = {
-        "Mcp-Session-Id": this.sessionId,
-      };
-      if (this.config.secrets && this.config.secrets.length > 0) {
-        const firstSecret = this.config.secrets[0];
-        if (this.secrets[firstSecret]) {
-          headers["Authorization"] = `Bearer ${this.secrets[firstSecret]}`;
-        }
+  private sendDelete(sessionId: string): Promise<void> {
+    if (!this.config.url) return Promise.resolve();
+    const headers: Record<string, string> = {
+      "Mcp-Session-Id": sessionId,
+    };
+    if (this.config.secrets && this.config.secrets.length > 0) {
+      const firstSecret = this.config.secrets[0];
+      if (this.secrets[firstSecret]) {
+        headers["Authorization"] = `Bearer ${this.secrets[firstSecret]}`;
       }
-      void fetch(this.config.url, {
-        method: "DELETE",
-        headers,
-        signal: AbortSignal.timeout(3000),
-      }).catch(() => {});
+    }
+    let resolveLate!: () => void;
+    const p = new Promise<void>((r) => {
+      resolveLate = r;
+    });
+    this.lateDeletes.add(p);
+    (async () => {
+      try {
+        await fetch(this.config.url!, {
+          method: "DELETE",
+          headers,
+          signal: AbortSignal.timeout(3000),
+        });
+      } catch {
+        // ignore (§14.5: ошибка — игнор)
+      } finally {
+        this.lateDeletes.delete(p);
+        if (this.isStopped()) {
+          liveConnectorClients.delete(this);
+        }
+        resolveLate();
+      }
+    })();
+    return p;
+  }
+
+  isStopped(): boolean {
+    if (this.closePending) return false;
+    if (this.inFlightHttpRequests > 0 || this.lateDeletes.size > 0 || this.sessionId !== null) return false;
+    if (this.config.transport === "http") {
+      if (!this.closed) return false;
+      return true;
+    }
+    // stdio:
+    // процесс не запускался (нет pid), или получен exit/close, или до exit kill(pid, 0) -> ESRCH (EPERM — жив)
+    if (this.child) {
+      if (!this.child.pid) return true;
+      if (this.childExited || this.child.exitCode !== null || this.child.signalCode !== null) return true;
+      try {
+        process.kill(this.child.pid, 0);
+        return false;
+      } catch (e: any) {
+        if (e?.code === "ESRCH") return true;
+        return false;
+      }
+    }
+    if (!this.closed && !this.started) return false;
+    return true;
+  }
+
+  hasActiveClose(): boolean {
+    return this.closePromise !== null;
+  }
+
+  private async terminateProcess(child: ChildProcess, options?: { immediateKill?: boolean; timeoutMs?: number }): Promise<void> {
+    if (this.childExited || child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+    if (!child.pid) {
+      return;
     }
 
-    if (this.child) {
-      const child = this.child;
-      this.child = null;
+    return new Promise<void>((resolve, reject) => {
+      let resolved = false;
+      let termTimer: NodeJS.Timeout | undefined;
+      let killTimer: NodeJS.Timeout | undefined;
+      let hardTimer: NodeJS.Timeout | undefined;
+
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        this.childExited = true;
+        if (termTimer) clearTimeout(termTimer);
+        if (killTimer) clearTimeout(killTimer);
+        if (hardTimer) clearTimeout(hardTimer);
+        resolve();
+      };
+
+      const fail = (err: Error) => {
+        if (resolved) return;
+        resolved = true;
+        if (termTimer) clearTimeout(termTimer);
+        if (killTimer) clearTimeout(killTimer);
+        if (hardTimer) clearTimeout(hardTimer);
+        reject(err);
+      };
+
+      const onExit = () => {
+        this.childExited = true;
+        done();
+      };
+      child.once("close", onExit);
+      child.once("exit", onExit);
+
       try {
         child.stdin?.end();
       } catch {
         // ignore
       }
 
-      const termTimer = setTimeout(() => {
+      const termDelay = Number(process.env.BB_LIVE_CALL_MCP_TERM_DELAY_MS) || 2000;
+      const killDelay = termDelay + (Number(process.env.BB_LIVE_CALL_MCP_KILL_DELAY_MS) || 3000);
+
+      const sendSignal = (signal: "SIGTERM" | "SIGKILL") => {
+        if (this.childExited || !child.pid || child.exitCode !== null || child.signalCode !== null) return;
+        let delivered = false;
         try {
-          if (child.pid) {
+          process.kill(-child.pid, signal);
+          delivered = true;
+        } catch {
+          // ESRCH from group kill does NOT confirm child exit!
+        }
+        if (!delivered) {
+          try {
+            if (child.kill(signal)) {
+              delivered = true;
+            }
+          } catch {}
+        }
+        if (!delivered) {
+          try {
+            process.kill(child.pid, signal);
+            delivered = true;
+          } catch {
+            // Check if actually dead by testing positive pid with signal 0:
             try {
-              process.kill(-child.pid, "SIGTERM");
-            } catch {
-              child.kill("SIGTERM");
+              process.kill(child.pid, 0);
+            } catch (e: any) {
+              if (e?.code === "ESRCH") {
+                done();
+                return;
+              }
             }
           }
-        } catch {
-          // ignore
         }
-      }, 2000);
-      termTimer.unref?.();
+      };
 
-      const killTimer = setTimeout(() => {
-        try {
-          if (child.pid) {
-            try {
-              process.kill(-child.pid, "SIGKILL");
-            } catch {
-              child.kill("SIGKILL");
+      if (options?.immediateKill) {
+        sendSignal("SIGKILL");
+      } else {
+        termTimer = setTimeout(() => {
+          sendSignal("SIGTERM");
+        }, termDelay);
+        termTimer.unref?.();
+
+        killTimer = setTimeout(() => {
+          sendSignal("SIGKILL");
+        }, killDelay);
+        killTimer.unref?.();
+      }
+
+      const emergencyTimeout = options?.timeoutMs ?? (options?.immediateKill ? 1000 : killDelay + 1000);
+
+      hardTimer = setTimeout(() => {
+        if (this.childExited || child.exitCode !== null || child.signalCode !== null) {
+          done();
+          return;
+        }
+        if (child.pid) {
+          try {
+            process.kill(child.pid, 0);
+            this.log?.warn?.(`MCP [${this.config.id}] connector_stop_failed: PID ${child.pid}`);
+            this.owner?.onStopFailed?.(this.config.id, child.pid);
+            fail(new Error(`connector_stop_failed: PID ${child.pid}`));
+            return;
+          } catch (e: any) {
+            if (e?.code === "ESRCH") {
+              done();
+              return;
             }
+            // EPERM or any other error means process is alive:
+            this.log?.warn?.(`MCP [${this.config.id}] connector_stop_failed: PID ${child.pid}`);
+            this.owner?.onStopFailed?.(this.config.id, child.pid);
+            fail(new Error(`connector_stop_failed: PID ${child.pid}`));
+            return;
           }
-        } catch {
-          // ignore
         }
-      }, 5000);
-      killTimer.unref?.();
+        done();
+      }, emergencyTimeout);
+      hardTimer.unref?.();
 
-      child.on("close", () => {
-        clearTimeout(termTimer);
-        clearTimeout(killTimer);
-      });
+      // Быстрая проверка: жив ли процесс (до exit)
+      if (!this.childExited && child.pid) {
+        try {
+          process.kill(child.pid, 0);
+        } catch (e: any) {
+          if (e?.code === "ESRCH") {
+            done();
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * Корректная остановка коннектора (§14.5).
+   * stdio: закрыть stdin, SIGTERM через 2 с, SIGKILL через 5 с; дожидается выхода процесса (§14.8, P1-1).
+   * http: DELETE с Mcp-Session-Id; отмена активных запросов через abortController.
+   * Повторные вызовы возвращают тот же Promise до полного завершения очистки (Round-2 P1-1, Round-5 A.3).
+   */
+  async close(options?: { immediateKill?: boolean; timeoutMs?: number }): Promise<void> {
+    if (this.closePromise) {
+      return this.closePromise;
     }
+    this.closeAttempted = true;
+    if (this.isStopped()) {
+      liveConnectorClients.delete(this);
+      return;
+    }
+    this.closed = true;
+    this.alive = false;
+    this.abortController.abort();
+    this.rejectAll(new Error(`коннектор ${this.config.id} закрыт`));
+
+    this.closePending = true;
+    this.closePromise = (async () => {
+      try {
+        if (this.config.transport === "http" && this.config.url) {
+          while (this.sessionId) {
+            const sid = this.sessionId;
+            this.sessionId = null;
+            await this.sendDelete(sid);
+          }
+          for (let i = 0; i < 10; i++) {
+            if (this.sessionId || this.lateDeletes.size > 0) break;
+            await Promise.resolve();
+          }
+          while (this.sessionId || this.lateDeletes.size > 0) {
+            if (this.sessionId) {
+              const sid = this.sessionId;
+              this.sessionId = null;
+              await this.sendDelete(sid);
+            } else if (this.lateDeletes.size > 0) {
+              await Promise.race(Array.from(this.lateDeletes));
+            }
+          }
+        }
+
+        if (this.child && this.child.pid) {
+          const child = this.child;
+          try {
+            await this.terminateProcess(child, options);
+            this.child = null;
+          } catch (e) {
+            this.closeFailed = true;
+            this.closePromise = null;
+            throw e;
+          }
+        }
+      } catch (e) {
+        this.closeFailed = true;
+        this.closePromise = null;
+        throw e;
+      } finally {
+        this.closePending = false;
+        if (this.isStopped()) {
+          liveConnectorClients.delete(this);
+        }
+      }
+    })();
+
+    return this.closePromise;
   }
 }

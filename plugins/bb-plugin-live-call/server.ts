@@ -31,7 +31,10 @@ import { argsHash } from "./src/confirmation-gate.js";
 import { decideHello } from "./src/reattach.js";
 import { toolByName } from "./src/tools.js";
 import { createCallThreadManager, closeStaleCallThreads } from "./src/thread-lifecycle.js";
-import { ProjectRegistryManager } from "./src/project-registry.js";
+import { ProjectRegistryManager, readProjectRepoConfig, type ProjectConfig } from "./src/project-registry.js";
+import { McpClient, inspectConnectorTool, liveConnectorClients } from "./src/mcp-client.js";
+export { liveConnectorClients };
+import { isValidSecretValue, maskSecrets } from "./src/secret-filter.js";
 
 const rpcContract = defineRpcContract({
   status: {
@@ -152,6 +155,21 @@ export default async function plugin(bb: BbPluginApi) {
   /** link.sock меняется при переподключении браузера; detached — браузер отвалился, ждём возврата. */
   /** Старт звонка идёт, а active ещё не заполнен (окно между hello и active). */
   let starting = false;
+  /** Диагностика коннекторов идёт (bb call connectors) — эксклюзивный доступ (§14.8, review PLUG-117). */
+  let diagnosticsRunning = false;
+
+  function hasUnstoppedConnectors(): boolean {
+    for (const client of liveConnectorClients) {
+      if (client.isStopped()) {
+        liveConnectorClients.delete(client);
+      } else {
+        if (client.isCloseAttempted() && client.isCloseFailed() && !client.hasActiveClose()) {
+          client.close({ immediateKill: true, timeoutMs: 1000 }).catch(() => {});
+        }
+      }
+    }
+    return liveConnectorClients.size > 0;
+  }
   let active: {
     session: CallSession;
     startedAt: number;
@@ -377,7 +395,6 @@ export default async function plugin(bb: BbPluginApi) {
       active = null;
       eventBridge.reset();
     };
-    session.on("ending", release);
     session.on("ended", release);
     active = { session, startedAt: Date.now(), link, detached: false, grace: null };
     // Сессия видна соединению до конца старта: «Завершить» и закрытие браузера во время
@@ -425,6 +442,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   bb.onDispose(async () => {
     eventBridge.reset();
+    await Promise.all(Array.from(liveConnectorClients).map((c) => c.close().catch(() => {})));
     if (!active) return;
     // Браузеру «ended» не шлём: он переподключится, получит call_gone и сам начнёт
     // новый звонок — владелец остаётся на линии (приёмка 03.11: reload оборвал звонок).
@@ -466,9 +484,9 @@ export default async function plugin(bb: BbPluginApi) {
                 sock.close(UNAUTHORIZED_CLOSE_CODE, "unauthorized");
                 return;
               }
-              // Звонок уже стартует, но ещё не записан в active (ключи, настройки, тред):
+              // Звонок уже стартует или идёт диагностика коннекторов (§14.8, review PLUG-117):
               // второй hello в это окно не должен открыть второй звонок (ревью PLUG-113).
-              if (!active && starting) {
+              if (!active && (starting || diagnosticsRunning || hasUnstoppedConnectors())) {
                 sock.send(JSON.stringify({ type: "error", code: "busy", message: "уже идёт звонок", retryable: false } satisfies ServerFrame));
                 sock.close(BUSY_CLOSE_CODE, "busy");
                 return;
@@ -561,6 +579,11 @@ export default async function plugin(bb: BbPluginApi) {
               // Extended отключён (владелец 03.11, ADR-0006 пересмотр 2): модель Google ломается
               // («системная ошибка», нет инструментов). Любой звонок — одна сессия gemini-3.8-live.
               const callMode = "normal" as const;
+              if (active || starting || diagnosticsRunning || hasUnstoppedConnectors()) {
+                sock.send(JSON.stringify({ type: "error", code: "busy", message: "уже идёт звонок", retryable: false } satisfies ServerFrame));
+                sock.close(BUSY_CLOSE_CODE, "busy");
+                return;
+              }
               starting = true;
               try {
                 state.session = await startCall(sock, callMode, frame.threadId, frame.projectId, (s) => {
@@ -587,7 +610,7 @@ export default async function plugin(bb: BbPluginApi) {
             }
             else if (frame.type === "text") s.sendUserMessage(frame.text);
             else if (frame.type === "confirm") s.decideConfirmation(frame.confirmationId, frame.decision);
-            else if (frame.type === "end") await s.end("owner");
+            else if (frame.type === "end") void s.end("owner");
             return;
           }
           // Бинарный кадр: тип 0x01 — микрофон (контракт §2.1).
@@ -810,6 +833,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "probe", summary: "Доставляет ли Extended Thinking toolCall", usage: "bb call probe" },
       { name: "token", summary: "Токен для подключения к звонку", usage: "bb call token" },
       { name: "tool", summary: "Выполнить инструмент чтения без звонка (отладка данных)", usage: "bb call tool <имя> [json-аргументы]" },
+      { name: "connectors", summary: "Диагностика коннекторов проекта (§14.8)", usage: "bb call connectors [--project <projId>]" },
     ],
     async run(argv) {
       const cmd = argv[0] ?? "status";
@@ -866,9 +890,232 @@ export default async function plugin(bb: BbPluginApi) {
         const result = await def.execute(args, ctx);
         return { exitCode: result.ok ? 0 : 1, stdout: JSON.stringify(result, null, 1).slice(0, 8000) + "\n" };
       }
-      return { exitCode: 2, stdout: "usage: bb call status|calls|transcript <callId>|probe\n" };
+      if (cmd === "connectors") {
+        const projectSecrets = await getProjectSecrets();
+        const allSecretValues = Object.values(projectSecrets).filter(isValidSecretValue);
+        const maskOutput = (text: string) => maskSecrets(text, allSecretValues);
+
+        let targetProjectId: string | undefined = undefined;
+        for (let i = 1; i < argv.length; i++) {
+          const arg = argv[i];
+          if (arg === "--project") {
+            if (i + 1 < argv.length) {
+              targetProjectId = argv[i + 1];
+              i++;
+            } else {
+              return { exitCode: 2, stdout: maskOutput("usage: bb call connectors [--project <projId>]\n") };
+            }
+          } else if (arg.startsWith("--project=")) {
+            targetProjectId = arg.slice("--project=".length);
+          } else {
+            return {
+              exitCode: 2,
+              stdout: maskOutput(`неизвестный аргумент: ${arg}\nusage: bb call connectors [--project <projId>]\n`),
+            };
+          }
+        }
+        if (targetProjectId !== undefined && !targetProjectId.trim()) {
+          return { exitCode: 2, stdout: maskOutput("usage: bb call connectors [--project <projId>]\n") };
+        }
+
+        // Взаимное исключение со звонком (§14.8, review PLUG-117)
+        if (starting || active || diagnosticsRunning || hasUnstoppedConnectors()) {
+          return { exitCode: 1, stdout: maskOutput("идёт звонок, повторите позже\n") };
+        }
+
+        diagnosticsRunning = true;
+        const activeClients: McpClient[] = [];
+        let res: { exitCode: number; stdout: string } | undefined;
+        try {
+          res = await diagnoseConnectors(targetProjectId?.trim(), activeClients, projectSecrets, allSecretValues);
+        } finally {
+          const closeResults = await Promise.allSettled(
+            activeClients.map((c) => c.close()),
+          );
+          let unstoppedInfo = "";
+          for (let idx = 0; idx < activeClients.length; idx++) {
+            const r = closeResults[idx];
+            const c = activeClients[idx];
+            if (r.status === "rejected") {
+              const pid = c.getPid?.();
+              unstoppedInfo += `${c.config.id}: не остановлен${pid ? ` (pid ${pid})` : ""}\n`;
+            }
+          }
+          diagnosticsRunning = false;
+          if (unstoppedInfo) {
+            return {
+              exitCode: 1,
+              stdout: maskOutput((res ? res.stdout : "") + unstoppedInfo),
+            };
+          }
+        }
+        if (!res) {
+          return { exitCode: 1, stdout: maskOutput("ошибка выполнения диагностики\n") };
+        }
+        return { exitCode: res.exitCode, stdout: maskOutput(res.stdout) };
+      }
+      return { exitCode: 2, stdout: "usage: bb call status|calls|transcript <callId>|probe|connectors [--project <id>]\n" };
     },
   });
+
+  const diagnoseConnectors = async (
+    targetProjectId: string | undefined,
+    activeClients: McpClient[],
+    projectSecrets: Record<string, string>,
+    allSecretValues: string[],
+  ): Promise<{ exitCode: number; stdout: string }> => {
+    const cfg = await settings_get();
+    const rawProjectCalls = typeof cfg.projectCalls === "string" ? cfg.projectCalls : "";
+
+    const projectList = projectRegistry.listProjectsReadOnly(rawProjectCalls);
+
+    if (targetProjectId) {
+      const matched = projectList.find((p) => p.projectId === targetProjectId);
+      if (!matched) {
+        return {
+          exitCode: 2,
+          stdout: maskSecrets(`проект «${targetProjectId}» не найден в реестре\n`, allSecretValues),
+        };
+      }
+    }
+
+    const projectsToDiagnose = targetProjectId
+      ? projectList.filter((p) => p.projectId === targetProjectId)
+      : projectList;
+
+    if (projectsToDiagnose.length === 0) {
+      return { exitCode: 0, stdout: "нет проектов в реестре projectCalls\n" };
+    }
+
+    const lines: string[] = [];
+    let hasError = false;
+
+    for (const item of projectsToDiagnose) {
+      lines.push(`проект: ${item.projectId} (${item.title})`);
+      lines.push(`состояние реестра: ${item.state}`);
+
+      const approvedSnap = store.getApprovedProject(item.projectId);
+      let approvedConfig: ProjectConfig | null = null;
+      if (approvedSnap?.configJson) {
+        try {
+          approvedConfig = JSON.parse(approvedSnap.configJson) as ProjectConfig;
+        } catch {
+          approvedConfig = null;
+        }
+      }
+
+      if (!approvedConfig) {
+        hasError = true;
+        lines.push("  нет подтверждённого снимка (коннекторы не запускались)");
+        if (item.error) {
+          lines.push(`  ошибка: ${item.error}`);
+        }
+        const currentConnectors = item.connectors ?? [];
+        for (const conn of currentConnectors) {
+          const transportStr =
+            conn.transport === "stdio"
+              ? `stdio: [${(conn.command ?? []).join(" ")}]`
+              : `http: ${conn.url ?? "-"}`;
+          lines.push(`коннектор: ${conn.id}`);
+          lines.push(`  состояние реестра: ${item.state}`);
+          lines.push(`  транспорт: ${transportStr}`);
+          lines.push(`  статус: нет подтверждённого снимка (не запускался)`);
+          lines.push(`  ручки: (не запускался)`);
+        }
+        continue;
+      }
+
+      if (item.state !== "approved") {
+        lines.push(`  снимок: используется прежний подтверждённый снимок (текущая запись отличается: ${item.state})`);
+      }
+
+      // Чтение окружения только для целевого проекта (§14.8, review PLUG-117)
+      let projectRoot = "";
+      try {
+        const p = (await bb.sdk.projects.get({ projectId: item.projectId })) as Record<string, unknown>;
+        const sources = (p?.sources ?? []) as Array<{ path?: string; isDefault?: boolean }>;
+        projectRoot = sources.find((s) => s.isDefault)?.path ?? sources[0]?.path ?? "";
+      } catch {
+        // fallback
+      }
+      const repoEnv = readProjectRepoConfig(projectRoot);
+
+      const connectors = approvedConfig.connectors;
+      if (connectors.length === 0) {
+        lines.push("  нет коннекторов в подтверждённом снимке");
+        continue;
+      }
+
+      const clientEntries = connectors.map((connCfg) => {
+        const client = new McpClient(connCfg, projectSecrets, {
+          info: (s) => bb.log.info(maskSecrets(s, allSecretValues)),
+          warn: (s) => bb.log.warn(maskSecrets(s, allSecretValues)),
+          error: (s) => bb.log.error(maskSecrets(s, allSecretValues)),
+        });
+        activeClients.push(client);
+        return { connCfg, client };
+      });
+
+      const results = await Promise.allSettled(
+        clientEntries.map(async ({ client }) => {
+          try {
+            return await client.start(10_000);
+          } finally {
+            if (!diagnosticsRunning) {
+              client.close().catch(() => {});
+            }
+          }
+        }),
+      );
+
+      const projectSeenNames = new Set<string>();
+
+      for (let i = 0; i < connectors.length; i++) {
+        const connCfg = connectors[i];
+        const res = results[i];
+        const transportStr =
+          connCfg.transport === "stdio"
+            ? `stdio: [${(connCfg.command ?? []).join(" ")}]`
+            : `http: ${connCfg.url ?? "-"}`;
+
+        lines.push(`коннектор: ${connCfg.id}`);
+        lines.push(`  состояние реестра: ${item.state}`);
+        lines.push(`  транспорт: ${transportStr}`);
+
+        if (res.status === "rejected") {
+          hasError = true;
+          const rawErr = String(res.reason?.message ?? res.reason);
+          lines.push(`  статус: ошибка (${rawErr})`);
+          lines.push(`  ручки: (коннектор не поднялся)`);
+        } else {
+          const tools = res.value;
+          lines.push(`  статус: ok`);
+          if (tools.length === 0) {
+            lines.push(`  ручки: (нет ручек)`);
+          } else {
+            lines.push(`  ручки:`);
+            for (const t of tools) {
+              const inspected = inspectConnectorTool(t, connCfg, repoEnv, projectSeenNames);
+              if (inspected.status === "active") {
+                lines.push(`    - ${t.name}: ${inspected.cls}`);
+              } else {
+                let reasonStr: string = inspected.skipReason ?? "unknown";
+                if (inspected.skipReason === "name_collision") {
+                  reasonStr = "конфликт имени (name_collision)";
+                } else if (inspected.skipReason === "invalid_class") {
+                  reasonStr = "неверный класс (invalid_class)";
+                }
+                lines.push(`    - ${t.name}: ${reasonStr}`);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const stdout = lines.map((l) => maskSecrets(l, allSecretValues)).join("\n") + "\n";
+    return { exitCode: hasError ? 1 : 0, stdout };
+  };
 }
 
 /**

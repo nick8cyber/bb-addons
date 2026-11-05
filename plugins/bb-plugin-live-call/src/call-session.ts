@@ -24,9 +24,9 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
 import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
 import { BrainCenter } from "./brain-center.js";
-import { McpClient, extractConfirmToken, isValidConnectorToolName, makeConnectorToolName, mcpSchemaToGeminiParameters, toGeminiSchema } from "./mcp-client.js";
+import { McpClient, extractConfirmToken, inspectConnectorTool, isValidConnectorToolName, makeConnectorToolName, mcpSchemaToGeminiParameters, toGeminiSchema } from "./mcp-client.js";
 import { canonicalizeJson, ProjectRegistryManager, readProjectRepoConfig, resolveStrictClass, type ProjectConfig } from "./project-registry.js";
-import { maskSecrets } from "./secret-filter.js";
+import { isValidSecretValue, maskSecrets } from "./secret-filter.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -161,6 +161,7 @@ export class CallSession extends EventEmitter {
   private lastFailedTool: string | null = null;
   /** Счётчик вызовов инструментов в текущем ходе владельца (§12.12 п. 4). */
   private toolCallsInCurrentTurn = 0;
+  private reportedStopFailed = new Set<string>();
 
   constructor(private deps: CallSessionDeps) {
     super();
@@ -533,11 +534,7 @@ export class CallSession extends EventEmitter {
     this.voice = null;
     v?.close();
     for (const c of this.connectorClients) {
-      try {
-        c.close();
-      } catch {
-        // ignore
-      }
+      c.close().catch(() => {});
     }
     this.connectorClients = [];
     return true;
@@ -583,11 +580,7 @@ export class CallSession extends EventEmitter {
 
   private async initProjectConnectors(projectId: string): Promise<void> {
     for (const c of this.connectorClients) {
-      try {
-        c.close();
-      } catch {
-        // ignore
-      }
+      c.close().catch(() => {});
     }
     this.connectorClients = [];
     this.projectConnectorTools = [];
@@ -627,7 +620,16 @@ export class CallSession extends EventEmitter {
     // Коннекторы проекта поднимаются параллельно (§14.2, review п. 9)
     const clients = approved.config.connectors.map((connCfg) => ({
       cfg: connCfg,
-      client: new McpClient(connCfg, this.deps.projectSecrets, this.deps.log),
+      client: new McpClient(connCfg, this.deps.projectSecrets, this.deps.log, {
+        type: "call",
+        callId: this.deps.callId,
+        onStopFailed: (id, pid) => {
+          if (!this.reportedStopFailed.has(id)) {
+            this.reportedStopFailed.add(id);
+            this.deps.store.event(this.deps.callId, "connector_stop_failed", { id, pid });
+          }
+        },
+      }),
     }));
 
     for (const item of clients) {
@@ -636,18 +638,22 @@ export class CallSession extends EventEmitter {
 
     const results = await Promise.allSettled(
       clients.map(async ({ client }) => {
-        return await client.start(10_000);
+        try {
+          return await client.start(10_000);
+        } finally {
+          if (this.ended) {
+            client.close().catch(() => {});
+          }
+        }
       }),
     );
 
     if (this.ended) {
-      for (const c of this.connectorClients) {
-        try {
-          c.close();
-        } catch {
-          // ignore
-        }
-      }
+      await Promise.all(
+        this.connectorClients.map((c) =>
+          c.close().catch(() => {}),
+        ),
+      );
       return;
     }
 
@@ -659,7 +665,7 @@ export class CallSession extends EventEmitter {
 
       if (r.status === "rejected") {
         // Текст ошибки initialize от коннектора может нести секрет или URL с учёткой (§16.7 п. 4).
-        const exact = (connCfg.secrets ?? []).map((n) => this.deps.projectSecrets?.[n] ?? "").filter((v) => v.length >= 4);
+        const exact = (connCfg.secrets ?? []).map((n) => this.deps.projectSecrets?.[n] ?? "").filter(isValidSecretValue);
         const errStr = maskSecrets(String(r.reason?.message ?? r.reason), exact);
         const isMissingSecret = /connector_secret_missing/i.test(errStr);
         const reason = isMissingSecret ? "connector_secret_missing" : errStr.slice(0, 300);
@@ -675,48 +681,27 @@ export class CallSession extends EventEmitter {
       const toolNames: string[] = [];
       const connTools = connCfg.tools as Record<string, any> | undefined;
 
+      const seenNames = new Set(this.projectConnectorTools.map((x) => x.name));
       for (const t of tools) {
-        // Проверка имени (§14.3, review п. 7)
-        const candidateName = makeConnectorToolName(connCfg.id, t.name);
-        if (!isValidConnectorToolName(candidateName)) {
-          this.recordEvent( "connector_tool_skipped", {
-            id: connCfg.id,
-            tool: t.name,
-            reason: "invalid_name",
-          });
-          continue;
-        }
-        if (this.projectConnectorTools.some((x) => x.name === candidateName)) {
-          this.recordEvent( "connector_tool_skipped", {
-            id: connCfg.id,
-            tool: t.name,
-            reason: "name_collision",
-          });
+        // Проверка имени, коллизий, схемы и строгого класса (§14.3, §14.4, §15.3, review PLUG-117);
+        // двухшаговая схема (§14.10) — внутри inspectConnectorTool, тот же разбор у `bb call connectors`.
+        const inspected = inspectConnectorTool(t, connCfg, repoEnv, seenNames);
+        if (inspected.status === "skipped") {
+          if (inspected.skipReason && inspected.skipReason !== "deny" && inspected.skipReason !== "invalid_class") {
+            this.recordEvent("connector_tool_skipped", {
+              id: connCfg.id,
+              tool: t.name,
+              reason: inspected.skipReason,
+            });
+          }
           continue;
         }
 
-        // Проверка схемы параметров Gemini (§14.4, review п. 6)
+        const candidateName = inspected.candidateName;
+        const strictCls = inspected.cls!;
+        const geminiParams = inspected.geminiParams!;
         const isTwoStep = Boolean(connCfg.twoStep && connCfg.twoStep.includes(t.name));
-        const geminiParams = toGeminiSchema(t.inputSchema, isTwoStep);
-        if (!geminiParams) {
-          this.recordEvent( "connector_tool_skipped", {
-            id: connCfg.id,
-            tool: t.name,
-            reason: "schema_unsupported",
-          });
-          continue;
-        }
-        if (isTwoStep && Array.isArray((geminiParams as any)?.required)) {
-          (geminiParams as any).required = (geminiParams as any).required.filter(
-            (k: string) => k !== "confirm" && k !== "confirm_token",
-          );
-        }
-
-        // Класс ручки (Object.hasOwn, review п. 7)
-        const regCls = (connTools && Object.hasOwn(connTools, t.name) ? connTools[t.name] : connCfg.defaultClass) as any;
-        const repoCls = repoEnv.tools && Object.hasOwn(repoEnv.tools, t.name) ? repoEnv.tools[t.name] : undefined;
-        const strictCls = resolveStrictClass(regCls, repoCls);
-        if (strictCls === "deny") continue;
+        seenNames.add(candidateName);
 
         toolNames.push(t.name);
         const toolDef: ToolDef = {
@@ -1216,7 +1201,7 @@ export class CallSession extends EventEmitter {
           tool: def.name,
           ...(isConnectorTool ? {} : { args: call.args }),
           code: result.error.code,
-          message: maskSecrets(result.error.message.slice(0, 300), Object.values(this.deps.projectSecrets ?? {}).filter((v) => v.length >= 4)),
+          message: maskSecrets(result.error.message.slice(0, 300), Object.values(this.deps.projectSecrets ?? {}).filter(isValidSecretValue)),
         });
       } else if (result.ok) {
         this.lastFailedTool = null;
@@ -1961,6 +1946,24 @@ export class CallSession extends EventEmitter {
     this.frame({ type: "ended", callId: this.deps.callId, threadId: this.threadId, reason });
     this.setState("ended");
     this.emit("ending");
+    await Promise.all(
+      this.connectorClients.map(async (c) => {
+        try {
+          await c.close();
+        } catch {
+          if (!this.reportedStopFailed.has(c.config.id)) {
+            this.reportedStopFailed.add(c.config.id);
+            const pid = c.getPid?.() ?? undefined;
+            this.deps.store.event(this.deps.callId, "connector_stop_failed", {
+              id: c.config.id,
+              pid,
+            });
+          }
+        }
+      }),
+    );
+    this.connectorClients = [];
+
     if (this.threadId && this.threadId !== this.targetThreadId) {
       try {
         await this.deps.endCallThread(summary);
@@ -1983,14 +1986,6 @@ export class CallSession extends EventEmitter {
         });
       }
     }
-    for (const c of this.connectorClients) {
-      try {
-        c.close();
-      } catch {
-        // ignore
-      }
-    }
-    this.connectorClients = [];
     this.emit("ended");
   }
 
