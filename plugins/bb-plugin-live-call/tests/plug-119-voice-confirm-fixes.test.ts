@@ -298,7 +298,7 @@ describe("Баг 1. Раннее «да» во время филлера (§7.1 
     gate.onModelAudio(1, 4800, t.now);
     gate.onModelTranscript("Отправить в тред: «Секретное сообщение»?", t.now);
     expect(heard).toBe(1);
-    t.advance(1800);
+    t.advance(3500);
     gate.onOwnerTranscriptChunk("да", t.now);
     t.advance(700);
     expect(verdicts).toEqual(["approved"]);
@@ -372,7 +372,7 @@ describe("Баг 1. Раннее «да» во время филлера (§7.1 
     expect(heardCount).toBe(1);
 
     // 4. Действительное согласие владельца после того, как вопрос зазвучал
-    t.advance(1000);
+    t.advance(3000);
     gate.onOwnerTranscriptChunk("да", t.now);
     t.advance(800);
 
@@ -815,7 +815,7 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
         turnComplete: true,
       },
     });
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(3000);
 
     // 4. Действительное согласие владельца
     ws.server({ serverContent: { inputTranscription: { text: "да" } } });
@@ -824,6 +824,16 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     // Проверяем: ровно одно исполнение с исходными аргументами
     expect(executedArgs.length).toBe(1);
     expect(executedArgs[0]).toEqual(initialArgs);
+
+    const verdictEvent = store.transcript("call_plug119").find((e) => e.kind === "verdict");
+    expect(verdictEvent).toBeDefined();
+    const payload = JSON.parse(verdictEvent!.payload);
+    expect(payload).toMatchObject({
+      tool: "action_test",
+      verdict: "approved",
+      via: "barge",
+    });
+    expect(typeof payload.utteranceAt).toBe("number");
 
     await s.end("owner");
     vi.useRealTimers();
@@ -898,7 +908,7 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
         turnComplete: true,
       },
     });
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(3000);
     expect(store.transcript("call_plug119").some((e) => e.kind === "question_heard")).toBe(true);
 
     // Владелец соглашается
@@ -907,6 +917,16 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
 
     expect(executedArgs.length).toBe(1);
     expect(executedArgs[0]).toEqual(initialArgs);
+
+    const verdictEvent = store.transcript("call_plug119").find((e) => e.kind === "verdict");
+    expect(verdictEvent).toBeDefined();
+    const payload = JSON.parse(verdictEvent!.payload);
+    expect(payload).toMatchObject({
+      tool: "action_test_router",
+      verdict: "approved",
+      via: "barge",
+    });
+    expect(typeof payload.utteranceAt).toBe("number");
 
     await s.end("owner");
     vi.useRealTimers();
@@ -1051,6 +1071,49 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     gate.onOwnerTranscriptChunk("да", clock.now);
     clock.advance(700);
     expect(verdicts).toEqual(["approved"]);
+  });
+
+  it("сессионный сценарий: шум «at»/«A»/«Прошу» → системная вставка нераспознанного ответа, модель прерывается", async () => {
+    vi.useFakeTimers();
+    FakeWs.all = [];
+    const store = new CallStore(new Database(":memory:"));
+    const { s } = makeSession(store);
+    await s.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = FakeWs.all[0];
+
+    const gate = (s as unknown as { gate: ConfirmationGate }).gate;
+    gate.request("thread_send", { text: "тест" }, "C", "Отправить в тред: «тест»?");
+
+    // Модель озвучивает вопрос, и воспроизведение завершается
+    ws.server({
+      serverContent: {
+        modelTurn: {
+          parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(4800).toString("base64") } }],
+        },
+        outputTranscription: { text: "Отправить в тред: «тест»?" },
+        turnComplete: true,
+      },
+    });
+    // Дожидаемся открытия окна
+    await vi.advanceTimersByTimeAsync(300);
+    const lastSeq = (s as unknown as { lastAudioTurnSeq: number }).lastAudioTurnSeq;
+    s.onPlaybackDrained(lastSeq);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(gate.windowOpen()).toBe(true);
+
+    // В микрофон попадает одиночный шум "at"
+    ws.server({ serverContent: { inputTranscription: { text: "at" } } });
+    await vi.advanceTimersByTimeAsync(800);
+
+    // Проверяем: отправлена системная вставка
+    const injected = ws.sent.filter((x) =>
+      x.includes("Ответ владельца не распознан: ничего не выполнено и не отменено. Повтори вопрос подтверждения одной фразой и жди «да» или «нет»"),
+    );
+    expect(injected.length).toBe(1);
+
+    await s.end("owner");
+    vi.useRealTimers();
   });
 
   it("P1: CallSession не исполняет действие на филлер с цитируемыми аргументными словами (репро Round 3)", async () => {
@@ -2228,6 +2291,185 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
       });
       expect(rHalfSurr.actionTexts).toEqual(["x".repeat(30)]);
       expect(isFalseClaim(claim + ".", rHalfSurr.say, rHalfSurr.actionTexts)).toBe(true);
+    });
+  });
+
+  describe("PLUG-119 round-2 voice acceptance followups (P1, P2-1..P2-4)", () => {
+    function fakeClock() {
+      let now = 1_000_000;
+      let next = 0;
+      const timers = new Map<number, { f: () => void; at: number }>();
+      return {
+        now: () => now,
+        setTimeout: (f: () => void, ms: number) => {
+          timers.set(++next, { f, at: now + ms });
+          return next;
+        },
+        clearTimeout: (id: unknown) => {
+          timers.delete(id as number);
+        },
+        advance(ms: number) {
+          const end = now + ms;
+          for (;;) {
+            const due = [...timers].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+            if (!due) break;
+            timers.delete(due[0]);
+            now = Math.max(now, due[1].at);
+            due[1].f();
+          }
+          now = end;
+        },
+      };
+    }
+
+    const W = { ...DEFAULT_WORDS, toolExtras: { stop_thread: ["останавливай"] } };
+
+    function mkGate(tool: string, cls: "C" | "P" | "L", say: string, args: Record<string, unknown>) {
+      const clock = fakeClock();
+      const log: string[] = [];
+      const g = new ConfirmationGate(W, clock, {
+        onVerdict: (_p, v, via) => log.push(`verdict:${v}:${via}`),
+        onEarlyApproval: () => log.push("early"),
+        onUnrecognized: () => log.push("unrecognized"),
+        onHint: () => log.push("hint"),
+        onQuestionHeardAt: () => log.push("heard"),
+      });
+      g.request(tool, args, cls, say);
+      return { g, clock, log };
+    }
+
+    function openWindow(x: ReturnType<typeof mkGate>, audioMs = 3000) {
+      x.g.onModelAudio(1, 48 * audioMs, x.clock.now());
+      x.clock.advance(audioMs);
+      x.g.onPlaybackDrained(1, x.clock.now());
+      x.clock.advance(1500);
+      expect(x.g.windowOpen()).toBe(true);
+    }
+
+    const deliverUtterance = (x: ReturnType<typeof mkGate>, t: string, gap = 900) => {
+      x.g.onOwnerTranscriptChunk(t, x.clock.now());
+      x.clock.advance(gap);
+    };
+
+    it("P1: old model «да» (5 min before) does not swallow barge-in «да» of owner", () => {
+      const clock = fakeClock();
+      const log: string[] = [];
+      const g = new ConfirmationGate(W, clock, {
+        onVerdict: (_p, v, via) => log.push(`verdict:${v}:${via}`),
+        onEarlyApproval: () => log.push("early"),
+        onQuestionHeardAt: () => log.push("heard"),
+      });
+      // Ход A, 5 минут назад
+      g.onModelTranscript("Да, конечно, сейчас посмотрю.", clock.now());
+      clock.advance(300_000);
+      // Ход B, прямо перед запросом
+      g.onModelTranscript("Секунду.", clock.now());
+      clock.advance(500);
+      g.request("thread_send", { text: "Проверка перебивания прошла." }, "C", "Отправить в тред: «Проверка перебивания прошла.»?");
+      clock.advance(1600);
+      g.onModelAudio(1, 48 * 1300, clock.now());
+      g.onModelTranscript("Отправить в тред: «Проверка перебивания", clock.now());
+      g.onModelAudio(1, 48 * 3000, clock.now());
+      clock.advance(1300 + 500 + 300 + 2000);
+      g.onOwnerTranscriptChunk("да", clock.now());
+      clock.advance(800);
+      expect(log).toEqual(["heard", "verdict:approved:barge"]);
+    });
+
+    it("P1: pre-request text of the same turn does not count for heard", () => {
+      const clock = fakeClock();
+      const log: string[] = [];
+      const g = new ConfirmationGate(W, clock, {
+        onQuestionHeardAt: (_p: any, _at: number, off: number) => log.push(`heard off=${off}`),
+      });
+      const pre = "Отправить в тред: «Проверка перебивания прошла»? Секунду.";
+      g.onModelTranscript(pre, clock.now());
+      g.request("thread_send", { text: "Проверка перебивания прошла." }, "C", "Отправить в тред: «Проверка перебивания прошла.»?");
+      g.onModelAudio(1, 4800, clock.now());
+      g.onModelTranscript(pre + " Сейчас", clock.now());
+      expect(log).toEqual([]);
+    });
+
+    it("P2-1: noise re-ask without model audio opens window via 3s fallback timer (mic is open)", () => {
+      const x = mkGate("thread_send", "C", "Отправить в тред: «Проверка эха»?", { text: "Проверка эха" });
+      openWindow(x);
+      deliverUtterance(x, "at");
+      expect(x.log).toContain("unrecognized");
+      expect(x.g.isMicOpen()).toBe(false);
+
+      // Прокручиваем 3.3 с: резерв 3 с + 300 мс WINDOW_PADDING_MS
+      x.clock.advance(3300);
+      expect(x.g.windowOpen()).toBe(true);
+      expect(x.g.isMicOpen()).toBe(true);
+
+      // Владелец может ответить в окне
+      deliverUtterance(x, "да");
+      expect(x.log).toContain("verdict:approved:window");
+    });
+
+    it("P2-2: rule (а) applies to repeats after noise — model audio closes gate and invalidates window", () => {
+      const x = mkGate("thread_send", "C", "Отправить в тред: «Проверка эха»?", { text: "Проверка эха" });
+      openWindow(x);
+      deliverUtterance(x, "at");
+      expect(x.g.isReaskActive()).toBe(true);
+
+      // Аудио повтора вопроса
+      x.g.onModelAudio(2, 48 * 2000, x.clock.now());
+      x.clock.advance(2000);
+      x.g.onPlaybackDrained(2, x.clock.now());
+      x.clock.advance(1500);
+      expect(x.g.windowOpen()).toBe(true);
+      expect(x.g.isMicOpen()).toBe(true);
+
+      // Модель снова начинает говорить в окне повтора -> правило (а) закрывает шлюз и инвалидирует окно
+      x.g.onModelAudio(3, 48 * 1500, x.clock.now());
+      expect(x.g.windowOpen()).toBe(false);
+      expect(x.g.isMicOpen()).toBe(false);
+    });
+
+    it("P2-3: hyphen responses in owner replies separate words: «Да-да», «Нет-нет», «Не-не», «Ок-ок»", () => {
+      for (const [reply, expectedVerdict] of [
+        ["Да-да.", "verdict:approved:window"],
+        ["Ок-ок", "verdict:approved:window"],
+        ["Нет-нет.", "verdict:cancelled:window"],
+        ["Не-не", "verdict:cancelled:window"],
+      ] as const) {
+        const x = mkGate("thread_send", "C", "Отправить в тред: «Проверка эха»?", { text: "Проверка эха" });
+        openWindow(x);
+        deliverUtterance(x, reply);
+        expect(x.log).toContain(expectedVerdict);
+      }
+    });
+
+    it("P2-4: unquoted question («Остановить все активные треды?») with agreement before window triggers early approval injection", () => {
+      const x = mkGate("stop_all", "C", "Остановить все активные треды?", {});
+      x.clock.advance(1600);
+      x.g.onModelAudio(1, 48 * 2500, x.clock.now());
+      x.g.onModelTranscript("Остановить все активные треды?", x.clock.now());
+      x.clock.advance(1200);
+      deliverUtterance(x, "да", 800);
+      expect(x.log).toEqual(["early"]);
+      expect(x.g.windowOpen()).toBe(false);
+    });
+
+    it("echo artifacts sequence: 1st -> unrecognized, 2nd -> cancel", () => {
+      const x = mkGate("thread_send", "C", "Отправить в тред: «Проверка эха»?", { text: "Проверка эха" });
+      openWindow(x);
+      deliverUtterance(x, "отправ"); // echo prefix -> dropped silently
+      deliverUtterance(x, "at"); // 1st noise -> unrecognized
+      expect(x.log).toEqual(["unrecognized"]);
+      expect(x.g.isMicOpen()).toBe(false);
+
+      // Модель повторяет аудио вопроса
+      x.g.onModelAudio(2, 48 * 2000, x.clock.now());
+      x.clock.advance(2000);
+      x.g.onPlaybackDrained(2, x.clock.now());
+      x.clock.advance(1500);
+      expect(x.g.windowOpen()).toBe(true);
+
+      // 2-й шум -> отмена
+      deliverUtterance(x, "Прошу");
+      expect(x.log).toEqual(["unrecognized", "verdict:cancelled:window"]);
     });
   });
 });

@@ -324,7 +324,7 @@ describe("инструменты звонка по треду (контракт 
     it("разрешение действия: grant=true классифицируется как P («разрешаю»)", async () => {
       const tool = toolByName("thread_answer", "thr_target")!;
       // Вопрос вслух короткий, без «Скажи … или «отмена»» (решение владельца 04.11); слово — на карточке.
-      expect(tool.confirmSay?.({ grant: true })).toBe("Разрешить агенту действие?");
+      expect(tool.confirmSay?.({ grant: true })).toBe("Одобрить запрос агента?");
 
       let resolvedPayload: unknown = null;
       const fakeSdk = {

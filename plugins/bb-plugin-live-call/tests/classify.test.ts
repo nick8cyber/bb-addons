@@ -9,6 +9,12 @@ describe("normalizeUtterance", () => {
     expect(normalizeUtterance("Да, запускай!")).toEqual(["да", "запускай"]);
     expect(normalizeUtterance("Ну, пожалуйста")).toEqual(["ну", "пожалуйста"]);
   });
+  it("дефис между буквами/цифрами разделяет слова в реплике владельца (п. 5), апостроф остаётся", () => {
+    expect(normalizeUtterance("агенту-куратору")).toEqual(["агенту", "куратору"]);
+    expect(normalizeUtterance("don't run")).toEqual(["don't", "run"]);
+    expect(normalizeUtterance("Да-да.")).toEqual(["да", "да"]);
+    expect(normalizeUtterance("Нет-нет.")).toEqual(["нет", "нет"]);
+  });
 });
 
 describe("класс L (запуск): только явный глагол команды", () => {
@@ -36,14 +42,20 @@ describe("класс L (запуск): только явный глагол ко
 });
 
 describe("класс P (разрешение агенту): только «разрешаю»", () => {
-  it("«разрешаю» — approved", () => {
+  it("«разрешаю», «разреши», «одобряю» — approved", () => {
     expect(classify("разрешаю", "P", words)).toBe("approved");
+    expect(classify("разреши", "P", words)).toBe("approved");
+    expect(classify("одобряю", "P", words)).toBe("approved");
   });
   it("«да, разрешаю» — approved", () => {
     expect(classify("да, разрешаю", "P", words)).toBe("approved");
   });
   it("просто «да» — hint", () => {
     expect(classify("да", "P", words)).toBe("hint");
+  });
+  it("только вежливые слова для P — cancelled", () => {
+    expect(classify("пожалуйста", "P", words)).toBe("cancelled");
+    expect(classify("спасибо", "P", words)).toBe("cancelled");
   });
 });
 
@@ -62,6 +74,10 @@ describe("класс C (подтверждение)", () => {
   it("«да, но сначала…» — отмена: «но» слово отказа", () => {
     expect(classify("да, но сначала проверь", "C", words)).toBe("cancelled");
   });
+  it("дефисные ответы согласия: «Да-да», «Ок-ок» — approved (P2-3)", () => {
+    expect(classify("Да-да.", "C", words)).toBe("approved");
+    expect(classify("Ок-ок", "C", words)).toBe("approved");
+  });
 });
 
 describe("отказ сильнее согласия", () => {
@@ -77,6 +93,20 @@ describe("отказ сильнее согласия", () => {
   });
   it("«да, нет» — отмена: отказ перевешивает", () => {
     expect(classify("да нет", "C", words)).toBe("cancelled");
+  });
+  it("дефисные ответы отказа: «Нет-нет», «Не-не» — cancelled (P2-3)", () => {
+    expect(classify("Нет-нет.", "C", words)).toBe("cancelled");
+    expect(classify("Не-не", "C", words)).toBe("cancelled");
+  });
+  it("расширенный список слов отказа (§7.1 п. 5.1)", () => {
+    for (const w of ["отставить", "отставь", "отказ", "отказываюсь", "нельзя", "неа", "нее", "хватит", "передумал", "передумала"]) {
+      expect(classify(w, "C", words)).toBe("cancelled");
+    }
+  });
+  it("латиница отказа: nyet, niet, njet, no, nope, otmena, otmeni, cancel, stoi", () => {
+    for (const w of ["nyet", "niet", "njet", "no", "nope", "otmena", "otmeni", "cancel", "stoi"]) {
+      expect(classify(w, "C", words)).toBe("cancelled");
+    }
   });
 });
 
@@ -101,5 +131,9 @@ describe("латиница распознавания", () => {
   it("«net» — отмена, «zapuskay» — запуск", () => {
     expect(classify("net", "C", DEFAULT_WORDS)).toBe("cancelled");
     expect(classify("zapuskay", "L", DEFAULT_WORDS)).toBe("approved");
+  });
+  it("ответ из нескольких слов латиницей без согласия — cancelled", () => {
+    expect(classify("wait a minute please", "C", DEFAULT_WORDS)).toBe("cancelled");
+    expect(classify("i do not know", "C", DEFAULT_WORDS)).toBe("cancelled");
   });
 });

@@ -808,7 +808,7 @@ export const TOOLS: ToolDef[] = [
     },
     confirmSay: (args, col) =>
       args.grant
-        ? `Разрешить агенту в ${quoteArg(args.thread, col)}?`
+        ? `Одобрить запрос агента в ${quoteArg(args.thread, col)}?`
         : `Ответить агенту в ${quoteArg(args.thread, col)}: ${quoteBrief(args.answer, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
@@ -1716,7 +1716,7 @@ export const threadAnswerTool: ToolDef = {
   },
   confirmSay: (args, col) =>
     args.grant
-      ? "Разрешить агенту действие?"
+      ? "Одобрить запрос агента?"
       : `Ответить агенту: ${quoteBrief(args.answer, col)}?`,
   async execute(args, ctx) {
     const threadId = ctx.targetThreadId;

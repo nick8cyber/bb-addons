@@ -12,7 +12,7 @@ import {
   type ServerFrame,
 } from "./contract.js";
 import { ConfirmationGate, argsHash, type PendingConfirmation } from "./confirmation-gate.js";
-import { classify } from "./classify.js";
+import { DEFAULT_WORDS, classify } from "./classify.js";
 import { ContextLedger } from "./context-ledger.js";
 import { KeyPool, QuotaExhaustedError } from "./key-pool.js";
 import { LiveClient } from "./live-client.js";
@@ -123,6 +123,7 @@ export class CallSession extends EventEmitter {
   private ended = false;
   private startedAt = Date.now();
   private modeHistory: string[];
+  private onInterruptReset?: () => void;
   private lastVoiceLine = "";
   /** Накопленные результаты инструментов одной реплики: уходит в VOICE одним пакетом. */
   private systemBatch: string[] = [];
@@ -187,19 +188,19 @@ export class CallSession extends EventEmitter {
     });
     this.gate = new ConfirmationGate(
       {
-        refuse: ["нет", "не", "отмена", "отмени", "отбой", "стоп", "подожди", "погоди", "потом", "но"],
-        confirm: ["да", "давай", "подтверждаю", "отправляй", "ок", "окей", "верно"],
-        permit: ["разрешаю", "разреши", "одобряю"],
-        launch: ["запускай", "запусти", "запускаем", "раздавай", "раздай"],
+        ...DEFAULT_WORDS,
         toolExtras: { stop_thread: ["останавливай"] },
       },
       undefined,
       {
         onConfirmationUpdate: (p, phase, isHint) => this.onConfirmationUpdate(p, phase, isHint),
-        onQuestionHeardAt: (p, at, offsetMs) => this.recordEvent( "question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
-        onVerdict: (p, verdict) => void this.onVerdict(p, verdict),
+        onQuestionHeardAt: (p, at, offsetMs) => this.recordEvent("question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
+        onVerdict: (p, verdict, via, utteranceAt) => void this.onVerdict(p, verdict, via, utteranceAt),
         onEarlyApproval: (_p) => {
           this.interruptAndInject("[СИСТЕМА] Владелец сказал «да» до вопроса — это НЕ подтверждение, ничего не выполнено. Задай вопрос подтверждения коротко и дождись ответа");
+        },
+        onUnrecognized: (_p) => {
+          this.interruptAndInject("[СИСТЕМА] Ответ владельца не распознан: ничего не выполнено и не отменено. Повтори вопрос подтверждения одной фразой и жди «да» или «нет»");
         },
         onHint: (p) => {
           const text = p.class === "L"
@@ -1012,6 +1013,10 @@ export class CallSession extends EventEmitter {
     });
     let agentBuf = "";
     let streamPending = "";
+    this.onInterruptReset = () => {
+      agentBuf = "";
+      streamPending = "";
+    };
     const utf8Decoder = new TextDecoder("utf-8", { fatal: false });
 
     const flushStream = (final: boolean) => {
@@ -1076,6 +1081,7 @@ export class CallSession extends EventEmitter {
     client.on("turnComplete", () => {
       this.voiceTalking = false;
       this.awaitingReplyUntil = 0;
+      this.gate.onModelTurnComplete();
       // Аудит PLUG-108: состояние оставалось «speaking» до конца звонка — речь владельца уходила ×0.25.
       // Но снимать приглушение по turnComplete рано: браузер ещё доигрывает звук, эхо пошло бы в Gemini.
       // Поэтому: нет звука в ходе (текст) — сразу; есть — по playback_drained, запасной таймер по длине звука.
@@ -1440,11 +1446,16 @@ export class CallSession extends EventEmitter {
     return true;
   }
 
-  private async onVerdict(p: PendingConfirmation, verdict: "approved" | "hint" | "cancelled" | "expired" | "not_confirmed") {
+  private async onVerdict(
+    p: PendingConfirmation,
+    verdict: "approved" | "hint" | "cancelled" | "expired" | "not_confirmed",
+    via: "barge" | "window" | "button" | "system" = "system",
+    utteranceAt: number = Date.now(),
+  ) {
     if (this.ended) return;
     this.lastVerdict = { verdict, at: Date.now() };
     this.frame({ type: "confirmation_result", confirmationId: p.confirmationId, verdict });
-    this.recordEvent("verdict", { tool: p.tool, verdict });
+    this.recordEvent("verdict", { tool: p.tool, verdict, via, utteranceAt });
 
     const def = this.resolveTool(p.tool);
     const stored = this.storedArgsOf(p);
@@ -1855,6 +1866,7 @@ export class CallSession extends EventEmitter {
   /** Вставка с обрывом текущего хода: голос замолкает, браузер сбрасывает буфер. */
   private interruptAndInject(text: string) {
     if (this.ended) return;
+    this.onInterruptReset?.();
     const safeText = this.sanitizeTokens(text);
     const hasPlayingAudio =
       this.voiceTalking ||

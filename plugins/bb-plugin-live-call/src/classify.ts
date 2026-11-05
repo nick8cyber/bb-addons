@@ -18,7 +18,32 @@ export interface ConfirmWords {
 }
 
 export const DEFAULT_WORDS: ConfirmWords = {
-  refuse: ["нет", "не", "отмена", "отмени", "отбой", "стоп", "подожди", "погоди", "потом", "но"],
+  refuse: [
+    "нет",
+    "не",
+    "отмена",
+    "отмени",
+    "отменяй",
+    "отменить",
+    "отменяю",
+    "отбой",
+    "стоп",
+    "стой",
+    "подожди",
+    "погоди",
+    "потом",
+    "но",
+    "отставить",
+    "отставь",
+    "отказ",
+    "отказываюсь",
+    "нельзя",
+    "неа",
+    "нее",
+    "хватит",
+    "передумал",
+    "передумала",
+  ],
   confirm: ["да", "давай", "подтверждаю", "отправляй", "ок", "окей", "верно"],
   permit: ["разрешаю", "разреши", "одобряю"],
   launch: ["запускай", "запусти", "запускаем", "раздавай", "раздай"],
@@ -38,11 +63,19 @@ export type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confi
 const LATIN_ANSWERS: Record<string, string> = {
   da: "да",
   net: "нет",
+  nyet: "нет",
+  niet: "нет",
+  njet: "нет",
+  no: "нет",
+  nope: "нет",
   ok: "ок",
   okay: "окей",
   okey: "окей",
   stop: "стоп",
   otmena: "отмена",
+  otmeni: "отмени",
+  cancel: "отмена",
+  stoi: "стой",
   davai: "давай",
   davay: "давай",
   zapuskay: "запускай",
@@ -56,8 +89,10 @@ export function normalizeUtterance(text: string): string[] {
   return text
     .toLowerCase()
     .replaceAll("ё", "е")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/’/g, "'")
+    .replace(/[^\p{L}\p{N}\s']/gu, " ")
     .split(/\s+/)
+    .map((w) => w.replace(/^'+|'+$/g, ""))
     .filter(Boolean)
     .map((w) => LATIN_ANSWERS[w] ?? w);
 }
@@ -66,6 +101,7 @@ export function classify(
   rawText: string,
   cls: ConfirmClass,
   words: ConfirmWords,
+  echoWords?: Set<string>,
 ): Verdict {
   const words_norm = normalizeUtterance(rawText);
   if (words_norm.length === 0) return "cancelled";
@@ -86,13 +122,14 @@ export function classify(
     for (const w of cls === "L" ? words.launch : words.permit) allowed.add(w);
     for (const w of words.toolExtra ?? []) allowed.add(w);
   }
-  const residual = words_norm.filter((w) => !allowed.has(w));
+  const residual = words_norm.filter((w) => !allowed.has(w) && (!echoWords || !isEchoWord(w, echoWords)));
   if (residual.length > 0) return "cancelled";
 
   const has = (list: string[]) => words_norm.some((w) => list.includes(w));
 
   if (cls === "L") {
     if (has(words.launch)) return "approved";
+    // Одно «да» запуск не подтверждает — модель подсказывает слово.
     if (has(words.confirm)) return "hint";
     return "cancelled";
   }

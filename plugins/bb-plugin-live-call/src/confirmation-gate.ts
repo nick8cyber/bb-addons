@@ -13,6 +13,7 @@ import {
   BYTES_PER_SECOND_24K,
   CONFIRM_TTL_MS,
   BARGE_IN_MIN_MS,
+  INPUT_TRANSCRIPT_LAG_MS,
   TRANSCRIPT_WAIT_MS,
   UTTERANCE_SILENCE_MS,
   WINDOW_PADDING_MS,
@@ -23,6 +24,7 @@ export const HINT_SPEECH_MIN_MS = 150;
 const SPEECH_BLOCK_SAMPLES = 320;
 const SPEECH_BLOCK_BYTES = 640;
 import {
+  claimWordsOf,
   classify,
   isEchoWord,
   isFalseClaim,
@@ -85,17 +87,20 @@ function argsHashRaw(tool: string, args: Record<string, unknown>): string {
   return createHash("sha256").update(`${tool}:${JSON.stringify(canonical(args))}`).digest("hex");
 }
 
+export type VerdictVia = "barge" | "window" | "button" | "system";
+
 interface Utterance {
   firstChunkAt: number;
   lastChunkAt: number;
   text: string;
+  vadStartAt?: number;
 }
 
 export interface GateEvents {
   /** Pending создан, изменён (подсказка) или открыт window: обновить оверлей и say. */
   onConfirmationUpdate?: (pending: PendingConfirmation, phase: "asking" | "listening", isHint?: boolean) => void;
   /** Вердикт определён. Исполнение — на вызывающей стороне. */
-  onVerdict?: (p: PendingConfirmation, verdict: Verdict) => void;
+  onVerdict?: (p: PendingConfirmation, verdict: Verdict, via?: VerdictVia, utteranceAt?: number) => void;
   /**
    * Расчётный момент, когда вопрос зазвучит у владельца (для журнала и приёмки).
    * offsetMs — длительность звука модели после запроса до начала вопроса (по байтам),
@@ -108,6 +113,11 @@ export interface GateEvents {
    */
   onEarlyApproval?: (p: PendingConfirmation) => void;
   /**
+   * Ответ владельца не распознан — одиночный шум (§7.1 п. 5.2).
+   * Сервер прерывает модель и просит повторить вопрос подтверждения.
+   */
+  onUnrecognized?: (p: PendingConfirmation) => void;
+  /**
    * Подсказка класса L/P (PLUG-120 п. 7): «Да» не подходит, модель говорит кодовое слово.
    */
   onHint?: (p: PendingConfirmation) => void;
@@ -115,6 +125,66 @@ export interface GateEvents {
    * Окно инвалидировано (PLUG-120 round-3, C1): позднее аудио подсказки закрывает окно и сбрасывает реплику.
    */
   onWindowInvalidated?: () => void;
+}
+
+/**
+ * Проверка появления начала вопроса в транскрипте модели (§7.1 п. 3.1).
+ * Слова шаблона идут по порядку, между соседними <= 1 вставленное слово,
+ * и сразу после последнего слова шаблона идут слова объекта.
+ */
+export function matchesQuestionStart(words: string[], tw: string[], ow: string[]): boolean {
+  if (ow.length === 0) return false;
+  const matchObj = (startIdx: number): boolean => {
+    if (startIdx + ow.length > words.length) return false;
+    for (let k = 0; k < ow.length; k++) {
+      if (words[startIdx + k] !== ow[k]) return false;
+    }
+    return true;
+  };
+
+  if (tw.length === 0) {
+    for (let i = 0; i < words.length; i++) {
+      if (matchObj(i)) return true;
+    }
+    return false;
+  }
+
+  function matchTemplate(wordIdx: number, tmplIdx: number): boolean {
+    if (tmplIdx === tw.length) {
+      return matchObj(wordIdx);
+    }
+    if (wordIdx >= words.length) return false;
+
+    // 0 вставленных слов
+    if (words[wordIdx] === tw[tmplIdx]) {
+      if (matchTemplate(wordIdx + 1, tmplIdx + 1)) return true;
+    }
+    // 1 вставленное слово (только между словами шаблона: tmplIdx > 0)
+    if (tmplIdx > 0 && wordIdx + 1 < words.length && words[wordIdx + 1] === tw[tmplIdx]) {
+      if (matchTemplate(wordIdx + 2, tmplIdx + 1)) return true;
+    }
+    return false;
+  }
+
+  for (let i = 0; i < words.length; i++) {
+    if (words[i] === tw[0]) {
+      if (matchTemplate(i + 1, 1)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Запасное правило: проверка появления последних двух слов say подряд (§7.1 п. 3.1).
+ */
+export function matchesTail(words: string[], tailWords: string[]): boolean {
+  if (tailWords.length !== 2 || words.length < 2) return false;
+  for (let i = 0; i <= words.length - 2; i++) {
+    if (words[i] === tailWords[0] && words[i + 1] === tailWords[1]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface GateClock {
@@ -166,10 +236,15 @@ export class ConfirmationGate {
   private playingTurns = new Map<number, { firstAt: number; bytes: number }>();
   /** Когда доиграет звук ходов, начатых до запроса (оценка сервера). */
   private priorPlaybackEnd = 0;
-  /** Значимые слова вопроса без слов из аргументов действия (филлер может их повторять). */
+  /** Слова шаблона до первой « и первые два слова объекта внутри «...» (§7.1 п. 3.1) */
+  private templateWords: string[] = [];
   private objectWords: string[] = [];
   private sayTailWords: string[] = [];
   private tailIsIdentifying = false;
+  private hasQuotes = false;
+  private unrecognizedCount = 0;
+  private lastModelTurnTranscript = "";
+  private questionTranscript = "";
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
   private usedIds = new Set<string>();
   private confirmWaiters = new Map<string, Array<{ resolve: (v: Verdict) => void; timer: unknown }>>();
@@ -180,6 +255,8 @@ export class ConfirmationGate {
   private windowGeneration = 0;
   private hintTimer: unknown = null;
   private hintActive = false;
+  private reaskTimer: unknown = null;
+  private reaskActive = false;
   private speechEvidenceMs = 0;
   private speechResidual: Uint8Array = new Uint8Array(0);
 
@@ -260,6 +337,14 @@ export class ConfirmationGate {
     // не раньше BARGE_IN_MIN_MS и не совпадающее со словами самого вопроса.
     this.falseClaimInjected = false;
     this.earlyInjectedForQuestion = false;
+    this.unrecognizedCount = 0;
+    this.questionTranscript = "";
+    this.hintActive = false;
+    this.reaskActive = false;
+    if (this.reaskTimer !== null) {
+      this.clock.clearTimeout(this.reaskTimer);
+      this.reaskTimer = null;
+    }
     this.resetWindow();
     this.tailUntil = 0;
     this.audioSinceRequest = 0;
@@ -271,35 +356,33 @@ export class ConfirmationGate {
     }
     this.playingTurns.clear();
     {
-      const quotes = Array.from(say.matchAll(/[«"']([^»"']{1,})[»"']/g)).map((m) => m[1].trim());
-      // Шаблонная часть say-фразы (вне кавычек)
-      const templateText = say.replace(/[«"'][^»"']*[»"']/g, " ");
-      const templateWords = new Set(normalizeUtterance(templateText));
-      const stopWords = new Set([
-        "в", "на", "с", "со", "по", "к", "ко", "о", "об", "обо", "от", "ото",
-        "из", "изо", "для", "и", "а", "но", "что", "как", "я", "он", "она",
-        "мы", "вы", "они", "это", "этот", "эта", "эти", "то", "же", "у", "за",
-      ]);
+      // Начало вопроса (§7.1 п. 3.1): только кавычка «.
+      // Слова шаблона — слова say до первой «.
+      // Слова объекта — первые два слова внутри этой пары «...» (одно, если там одно слово).
+      const firstQuoteIdx = say.indexOf("«");
+      const match = say.match(/«([^»]+)»/);
+      if (firstQuoteIdx >= 0 && match) {
+        this.hasQuotes = true;
+        const beforeQuote = say.slice(0, firstQuoteIdx);
+        this.templateWords = claimWordsOf(beforeQuote);
+        const quoteWords = claimWordsOf(match[1]);
+        this.objectWords = quoteWords.slice(0, 2);
 
-      // Аргументные слова для защиты от ложного heard по отдельным словам (§7.1 п. 3.1)
-      const argWords = new Set(
-        Object.values(args).flatMap((v) => (typeof v === "string" ? normalizeUtterance(v) : [])),
-      );
-
-      // Слова объекта: только из цитат say, за вычетом шаблонных слов вопроса, предлогов
-      // и слов из аргументов действия (§7.1 п. 3.1). Слова из аргументов не должны становиться
-      // objectWords, чтобы филлер со словами аргументов («секунду», «пожалуйста», «в», «тред»)
-      // не вызывал преждевременный question_heard до того, как прозвучит хвост вопроса.
-      const rawQuoteWords = quotes.flatMap((q) => normalizeUtterance(q));
-      this.objectWords = Array.from(
-        new Set(rawQuoteWords.filter((w) => !templateWords.has(w) && !stopWords.has(w) && !argWords.has(w))),
-      );
-
-      const fullSayWords = normalizeUtterance(say);
-      this.sayTailWords = fullSayWords.slice(-2);
-      this.tailIsIdentifying =
-        this.sayTailWords.length === 2 &&
-        this.sayTailWords.some((w) => !templateWords.has(w) && !stopWords.has(w));
+        const allQuoteWords = new Set(
+          Array.from(say.matchAll(/«([^»]+)»/g)).flatMap((m) => claimWordsOf(m[1])),
+        );
+        const fullSayWords = claimWordsOf(say);
+        this.sayTailWords = fullSayWords.slice(-2);
+        this.tailIsIdentifying =
+          this.sayTailWords.length === 2 &&
+          this.sayTailWords.some((w) => allQuoteWords.has(w));
+      } else {
+        this.hasQuotes = false;
+        this.templateWords = [];
+        this.objectWords = [];
+        this.sayTailWords = [];
+        this.tailIsIdentifying = false;
+      }
     }
     this.micOpen = true;
     this.events.onConfirmationUpdate?.(this.pending, "asking");
@@ -324,6 +407,10 @@ export class ConfirmationGate {
 
   isHintActive(): boolean {
     return this.hintActive;
+  }
+
+  isReaskActive(): boolean {
+    return this.reaskActive;
   }
 
   private resetSpeechEvidence() {
@@ -384,11 +471,11 @@ export class ConfirmationGate {
     for (const [seq, t] of this.playingTurns) if (at - t.firstAt > 120_000) this.playingTurns.delete(seq);
     if (!this.pending) return;
 
-    if (this.hintActive) {
-      // (а) C1: каждый ненулевой PCM-кадр активного поколения подсказки
+    if (this.hintActive || this.reaskActive) {
+      // (а) C1: каждый ненулевой PCM-кадр активного поколения подсказки или повтора
       // (в т.ч. после резервного открытия по таймеру 3 с) закрывает шлюз,
       // инвалидирует окно, снимает таймер окна и незавершённую реплику/таймер
-      // классификации этого окна, сбрасывает свидетельство (§7.1 п. 5.3).
+      // классификации этого окна, сбрасывает свидетельство (§7.1 п. 5.2, п. 5.3).
       this.micOpen = false;
       this.windowOpenAt = null;
       ++this.windowGeneration;
@@ -399,6 +486,10 @@ export class ConfirmationGate {
       if (this.hintTimer !== null) {
         this.clock.clearTimeout(this.hintTimer);
         this.hintTimer = null;
+      }
+      if (this.reaskTimer !== null) {
+        this.clock.clearTimeout(this.reaskTimer);
+        this.reaskTimer = null;
       }
       if (this.utteranceTimer !== null) {
         this.clock.clearTimeout(this.utteranceTimer);
@@ -412,7 +503,7 @@ export class ConfirmationGate {
       this.bargeUtterance = null;
       this.resetSpeechEvidence();
       this.events.onWindowInvalidated?.();
-      this.events.onConfirmationUpdate?.(this.pending, "asking", true);
+      this.events.onConfirmationUpdate?.(this.pending, "asking", this.hintActive);
     } else if (this.windowOpenAt !== null) {
       return;
     }
@@ -507,35 +598,26 @@ export class ConfirmationGate {
     this.utteranceTimer = this.clock.setTimeout(() => this.finalizeUtterance(), UTTERANCE_SILENCE_MS);
   }
 
-  /** Выходной транскрипт модели (кусками или кумулятивно — набор слов всё равно тот же). */
+  /** Выходной транскрипт модели (кусками или кумулятивно). */
   onModelTranscript(text: string, at = this.clock.now()) {
-    const words = normalizeUtterance(text);
+    const delta = this.lastModelTurnTranscript && text.startsWith(this.lastModelTurnTranscript)
+      ? text.slice(this.lastModelTurnTranscript.length)
+      : text;
+    this.lastModelTurnTranscript = text;
+
+    const words = claimWordsOf(text);
     if (words.length > 0) this.modelSpeech.push({ at, words });
-    // Начало вопроса в аудио: сколько байт модели пришло до первого куска со словами вопроса.
-    // Текст приходит со скоростью генерации, звук играет в реальном времени — момент, когда
-    // владелец СЛЫШИТ вопрос, считается от первого кадра аудио плюс длительность филлера.
-    if (this.pending && this.questionAudioOffset === null && (this.objectWords.length > 0 || this.tailIsIdentifying)) {
-      const spoken = new Set(words);
-      let heard = false;
 
-      // 1. По названию объекта действия (спека §7.1 п. 3.1)
-      if (this.objectWords.length >= 2) {
-        let hits = 0;
-        for (const w of this.objectWords) if (spoken.has(w)) hits++;
-        if (hits >= Math.min(2, this.objectWords.length)) heard = true;
-      } else if (this.objectWords.length === 1) {
-        if (spoken.has(this.objectWords[0])) {
-          // Для 1-словного объекта требуем также наличие слова вопроса (не аргумента),
-          // чтобы филлер с одним случайным словом аргумента не считался вопросом.
-          const sayWords = normalizeUtterance(this.pending.say);
-          const nonObjSayWords = sayWords.filter((w) => w !== this.objectWords[0]);
-          if (nonObjSayWords.some((w) => spoken.has(w))) heard = true;
-        }
+    if (this.pending && this.questionAudioOffset === null && this.hasQuotes && (this.objectWords.length > 0 || this.tailIsIdentifying)) {
+      if (delta) {
+        this.questionTranscript = (this.questionTranscript ? this.questionTranscript + " " : "") + delta;
       }
+      const questionWords = claimWordsOf(this.questionTranscript);
+      let heard = matchesQuestionStart(questionWords, this.templateWords, this.objectWords);
 
-      // 2. По хвосту вопроса (последние два слова say-фразы, спека §7.1 п. 3.1)
-      if (!heard && this.tailIsIdentifying) {
-        if (this.sayTailWords.every((w) => spoken.has(w))) heard = true;
+      // Запасное правило по хвосту вопроса
+      if (!heard && this.tailIsIdentifying && matchesTail(questionWords, this.sayTailWords)) {
+        heard = true;
       }
 
       if (heard) {
@@ -548,6 +630,10 @@ export class ConfirmationGate {
     }
     // Хранится только то, что ещё может вернуться эхом.
     this.modelSpeech = this.modelSpeech.filter((c) => at - c.at <= MODEL_ECHO_MEMORY_MS);
+  }
+
+  onModelTurnComplete() {
+    this.lastModelTurnTranscript = "";
   }
 
   /**
@@ -596,9 +682,10 @@ export class ConfirmationGate {
     const p = this.pending;
     if (!u || !p || p.verdict !== null) return;
     if (p.expiresAt <= this.clock.now()) {
-      this.burn(p, "expired");
+      this.burn(p, "expired", "system");
       return;
     }
+
     // Эхо: все слова реплики есть в самом вопросе — это голос агента из динамиков.
     // Модель говорит вопрос своими словами («Да, конечно. Отправить…?») — её слова тоже эхо.
     const since = p.createdAt - MODEL_ECHO_BEFORE_REQUEST_MS;
@@ -611,14 +698,19 @@ export class ConfirmationGate {
     const wordsForTool = this.wordsFor(p.tool);
     if (classify(u.text, p.class, wordsForTool) !== "approved") return;
 
-    if (this.questionStarted(p, u.firstChunkAt)) {
+    const utteranceMoment = u.vadStartAt ?? (u.firstChunkAt - INPUT_TRANSCRIPT_LAG_MS);
+
+    // Если в say есть « и вопрос зазвучал — засчитываем перебивание (§7.1 п. 3.1).
+    // Без « question_heard не наступает, согласие разрешено только в окне.
+    if (this.hasQuotes && this.questionStarted(p, utteranceMoment)) {
       p.verdict = "approved";
       this.micOpen = true;
-      this.events.onVerdict?.(p, "approved");
+      this.events.onVerdict?.(p, "approved", "barge", utteranceMoment);
       return;
     }
 
-    // Согласие до того, как вопрос зазвучал — раннее «да» (спека §7.1 п. 3.1)
+    // Согласие до того, как вопрос зазвучал, либо вопрос без « — раннее «да» (спека §7.1 п. 3.1).
+    // Отброшенное согласие сервер не замалчивает, а вставляет системное сообщение.
     this.tailUntil = this.clock.now() + UTTERANCE_SILENCE_MS;
     if (!this.earlyInjectedForQuestion) {
       this.earlyInjectedForQuestion = true;
@@ -630,12 +722,12 @@ export class ConfirmationGate {
   }
 
   /** Явный конец реплики от транспорта (VAD), не ждём 700 мс. */
-  onOwnerUtteranceEnd(text: string, firstChunkAt: number, at = this.clock.now()) {
+  onOwnerUtteranceEnd(text: string, firstChunkAt: number, at = this.clock.now(), vadStartAt?: number) {
     if (this.ended) return;
     const p = this.pending;
     if (!p) return;
     if (p.expiresAt <= at) {
-      this.burn(p, "expired");
+      this.burn(p, "expired", "system");
       return;
     }
     if (this.windowOpenAt === null || firstChunkAt < this.windowOpenAt) return;
@@ -643,7 +735,7 @@ export class ConfirmationGate {
       this.clock.clearTimeout(this.utteranceTimer);
       this.utteranceTimer = null;
     }
-    this.currentUtterance = { firstChunkAt, lastChunkAt: at, text };
+    this.currentUtterance = { firstChunkAt, lastChunkAt: at, text, vadStartAt };
     this.finalizeUtterance();
   }
 
@@ -654,23 +746,99 @@ export class ConfirmationGate {
     const p = this.pending;
     if (!u || !p || p.verdict !== null) return;
     if (p.expiresAt <= this.clock.now()) {
-      this.burn(p, "expired");
+      this.burn(p, "expired", "system");
       return;
     }
 
+    const utteranceMoment = u.vadStartAt ?? (u.firstChunkAt - INPUT_TRANSCRIPT_LAG_MS);
+    const words = normalizeUtterance(u.text);
+    if (words.length === 0) return;
+
     // Эхо-фильтр в окне ответа (§7.1 п. 5):
     // В окне эхо-набор — только вопрос и карточка.
-    const words = normalizeUtterance(u.text);
-    if (words.length > 0) {
-      const sayWords = new Set(normalizeUtterance(`${p.say} ${p.card ?? ""}`));
-      if (words.every((w) => isEchoWord(w, sayWords))) {
-        return; // Реплика, все слова которой — эхо, не решает ничего: ни approved, ни cancelled
-      }
+    const sayWords = new Set(normalizeUtterance(`${p.say} ${p.card ?? ""}`));
+    if (words.every((w) => isEchoWord(w, sayWords))) {
+      return; // Реплика, все слова которой — эхо, не решает ничего: ни approved, ни cancelled
     }
 
     const wordsForTool = this.wordsFor(p.tool);
-    const verdict = classify(u.text, p.class, wordsForTool);
+
+    // 1. Отказ или стоп-слово (§7.1 п. 5.1)
+    if (words.some((w) => wordsForTool.refuse.includes(w))) {
+      p.verdict = "cancelled";
+      this.events.onVerdict?.(p, "cancelled", "window", utteranceMoment);
+      this.burn(p, "cancelled", "window", utteranceMoment);
+      return;
+    }
+
+    // Проверяем наличие согласия любого класса (§7.1 п. 5.2)
+    const allAgreements = new Set([
+      ...this.words.confirm,
+      ...this.words.permit,
+      ...this.words.launch,
+      ...(this.words.toolExtra ?? []),
+      ...Object.values(this.words.toolExtras ?? {}).flat(),
+    ]);
+    const hasAnyAgreement = words.some((w) => allAgreements.has(w));
+
+    if (!hasAnyAgreement) {
+      // 2. Шум (§7.1 п. 5.2): нет ни согласия, ни отказа
+      const nonEcho = words.filter((w) => !isEchoWord(w, sayWords));
+      if (nonEcho.length === 0) {
+        return; // пустая реплика — молча, без вставки и без счёта
+      }
+      if (nonEcho.length === 1) {
+        if (this.unrecognizedCount === 0) {
+          this.unrecognizedCount++;
+          this.resetQuestionTiming();
+          this.reaskActive = true;
+          this.micOpen = false;
+          this.events.onUnrecognized?.(p);
+          this.events.onConfirmationUpdate?.(p, "asking");
+          if (this.reaskTimer !== null) {
+            this.clock.clearTimeout(this.reaskTimer);
+            this.reaskTimer = null;
+          }
+          const gen = ++this.windowGeneration;
+          this.reaskTimer = this.clock.setTimeout(() => {
+            this.reaskTimer = null;
+            if (this.ended || !this.pending || this.windowOpenAt !== null) return;
+            if (this.windowGeneration !== gen) return;
+            if (this.turnAudio.size > 0) return;
+            const openAt = this.clock.now() + WINDOW_PADDING_MS;
+            this.windowTimer = this.clock.setTimeout(() => {
+              this.windowTimer = null;
+              if (this.ended || !this.pending || this.windowOpenAt !== null) return;
+              if (this.windowGeneration !== gen) return;
+              this.windowOpenAt = openAt;
+              this.micOpen = true;
+              this.events.onConfirmationUpdate?.(this.pending, "listening");
+            }, WINDOW_PADDING_MS);
+          }, 3000);
+          return;
+        }
+        // Второе нераспознанное одиночное слово → отмена
+        this.reaskActive = false;
+        p.verdict = "cancelled";
+        this.events.onVerdict?.(p, "cancelled", "window", utteranceMoment);
+        this.burn(p, "cancelled", "window", utteranceMoment);
+        return;
+      }
+      // nonEcho.length > 1: отмена по п. 3 / п. 7
+      this.reaskActive = false;
+      p.verdict = "cancelled";
+      this.events.onVerdict?.(p, "cancelled", "window", utteranceMoment);
+      this.burn(p, "cancelled", "window", utteranceMoment);
+      return;
+    }
+
+    const verdict = classify(u.text, p.class, wordsForTool, sayWords);
     if (verdict === "hint") {
+      this.reaskActive = false;
+      if (this.reaskTimer !== null) {
+        this.clock.clearTimeout(this.reaskTimer);
+        this.reaskTimer = null;
+      }
       // Подсказка не снимает pending; пока она звучит, шлюз снова закрыт,
       // окно переоткрывается по правилу п. 3 (спека §7.1 п. 5.3).
       this.resetQuestionTiming();
@@ -710,12 +878,14 @@ export class ConfirmationGate {
         return;
       }
       this.hintActive = false;
+      this.reaskActive = false;
     } else {
       this.hintActive = false;
+      this.reaskActive = false;
     }
     p.verdict = verdict;
-    this.events.onVerdict?.(p, verdict);
-    if (verdict !== "approved") this.burn(p, verdict);
+    this.events.onVerdict?.(p, verdict, "window", utteranceMoment);
+    if (verdict !== "approved") this.burn(p, verdict, "window", utteranceMoment);
   }
 
   /**
@@ -756,17 +926,22 @@ export class ConfirmationGate {
     const p = this.pending;
     if (!p || p.confirmationId !== confirmationId) return this.usedIds.has(confirmationId) ? "expired" : "not_confirmed";
     if (p.verdict !== null) return p.verdict;
-    if (p.expiresAt <= this.clock.now()) return this.burn(p, "expired");
+    if (p.expiresAt <= this.clock.now()) return this.burn(p, "expired", "button", this.clock.now());
     const verdict: Verdict = decision === "approve" ? "approved" : "cancelled";
     this.hintActive = false;
+    this.reaskActive = false;
+    if (this.reaskTimer !== null) {
+      this.clock.clearTimeout(this.reaskTimer);
+      this.reaskTimer = null;
+    }
     this.resetSpeechEvidence();
     p.verdict = verdict;
     // Аудит PLUG-108: решение кнопкой сразу открывает микрофон — владелец не говорит в пустоту
     // до конца исполнения или истечения срока.
     this.micOpen = true;
-    this.events.onVerdict?.(p, verdict);
+    this.events.onVerdict?.(p, verdict, "button", this.clock.now());
     // Отмена: исполнения нет — запись сгорает сразу, следующая запись не получает pending_exists.
-    if (verdict === "cancelled") return this.burn(p, "cancelled");
+    if (verdict === "cancelled") return this.burn(p, "cancelled", "button", this.clock.now());
     // Подтверждение: исполняет сервер немедленно; consume() после исполнения.
     return verdict;
   }
@@ -778,7 +953,7 @@ export class ConfirmationGate {
     if (!p) return;
     const now = this.clock.now();
     if (p.expiresAt <= now) {
-      this.burn(p, "expired");
+      this.burn(p, "expired", "system", now);
       return;
     }
     // Резерв: playback_drained не пришёл (фон на телефоне, потерянный кадр) — окно
@@ -800,26 +975,40 @@ export class ConfirmationGate {
   consume(confirmationId: string): void {
     const p = this.pending;
     if (!p || p.confirmationId !== confirmationId) return;
-    this.burn(p, "approved");
+    this.burn(p, "approved", "system", this.clock.now());
   }
 
   /** Вердикт зафиксирован, исполнение не требуется (отказ, отмена, истёк срок). */
-  private burn(p: PendingConfirmation, verdict: Verdict): Verdict {
+  private burn(
+    p: PendingConfirmation,
+    verdict: Verdict,
+    via: VerdictVia = "system",
+    utteranceAt: number = this.clock.now(),
+  ): Verdict {
     const fireEvent = p.verdict === null;
     p.verdict = verdict;
     this.hintActive = false;
+    this.reaskActive = false;
+    if (this.reaskTimer !== null) {
+      this.clock.clearTimeout(this.reaskTimer);
+      this.reaskTimer = null;
+    }
     this.resetSpeechEvidence();
     if (this.pending === p) this.pending = null;
     this.usedIds.add(p.confirmationId);
     this.recentVerdicts.set(p.argsHash, { verdict, at: this.clock.now() });
     this.falseClaimInjected = false;
+    this.unrecognizedCount = 0;
+    this.hasQuotes = false;
+    this.templateWords = [];
     this.objectWords = [];
     this.sayTailWords = [];
     this.tailIsIdentifying = false;
+    this.questionTranscript = "";
     this.resetWindow();
     this.micOpen = true;
     if (fireEvent) {
-      this.events.onVerdict?.(p, verdict);
+      this.events.onVerdict?.(p, verdict, via, utteranceAt);
     }
     for (const w of this.confirmWaiters.get(p.confirmationId) ?? []) {
       if (w.timer !== null) this.clock.clearTimeout(w.timer);
@@ -856,6 +1045,10 @@ export class ConfirmationGate {
       this.clock.clearTimeout(this.hintTimer);
       this.hintTimer = null;
     }
+    if (this.reaskTimer !== null) {
+      this.clock.clearTimeout(this.reaskTimer);
+      this.reaskTimer = null;
+    }
   }
 
   resetQuestionTiming() {
@@ -875,6 +1068,7 @@ export class ConfirmationGate {
     this.questionAudioOffset = null;
     this.playingTurns.clear();
     this.priorPlaybackEnd = 0;
+    this.questionTranscript = "";
     this.resetSpeechEvidence();
     if (this.windowTimer !== null) {
       this.clock.clearTimeout(this.windowTimer);
@@ -884,12 +1078,21 @@ export class ConfirmationGate {
       this.clock.clearTimeout(this.hintTimer);
       this.hintTimer = null;
     }
+    if (this.reaskTimer !== null) {
+      this.clock.clearTimeout(this.reaskTimer);
+      this.reaskTimer = null;
+    }
   }
 
   end(): void {
     if (this.ended) return;
     this.ended = true;
     this.hintActive = false;
+    this.reaskActive = false;
+    if (this.reaskTimer !== null) {
+      this.clock.clearTimeout(this.reaskTimer);
+      this.reaskTimer = null;
+    }
     this.resetWindow();
     for (const waiters of this.confirmWaiters.values()) {
       for (const w of waiters) {
