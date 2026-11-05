@@ -249,7 +249,13 @@ if (SCENARIO === "general") {
       // после запроса — то есть вопрос уже звучал (offsetMs — звук до вопроса, по байтам сервера).
       const playedMs = verdict ? await page.evaluate(([a, b]) => window.__lcPlayed(a, b), [confirm.ts, verdict.ts]) : 0;
       check("вопрос реально звучал в браузере к моменту «да»", verdict && playedMs > (heard.p.offsetMs ?? 0), `проиграно ${playedMs} мс, до вопроса ${heard.p.offsetMs} мс`);
-      check("засчитано ДО конца вопроса (перебивание, окно ещё не открыто)", verdict && (!listening || verdict.ts < listening.ts), `verdict ${verdict?.ts}, окно ${listening?.ts ?? "не открылось"}`);
+      // §7.1 п. 8: путь принятия пишется в verdict.via. Время вердикта с окном не сравниваем —
+      // вердикт выносится после 700 мс тишины, а кусок транскрипта приходит через ~2 с после речи.
+      if (verdict && verdict.p.via !== undefined) {
+        check("засчитано как перебивание (verdict.via = barge)", verdict.p.via === "barge", `via ${verdict.p.via}, момент реплики ${verdict.p.utteranceAt ?? verdict.p.momentAt ?? "?"}, окно ${listening?.ts ?? "не открылось"}`);
+      } else {
+        check("засчитано ДО конца вопроса (перебивание, окно ещё не открыто)", verdict && (!listening || verdict.ts < listening.ts), `verdict ${verdict?.ts}, окно ${listening?.ts ?? "не открылось"}`);
+      }
     }
   }
   const action = await waitEvent("action", verdict?.ts ?? 0, 30000, (e) => e.p.status === "done" || e.p.status === "failed");
