@@ -13,6 +13,8 @@ export interface ConfirmWords {
   launch: string[];
   /** Слово-исключение для конкретного инструмента, напр. «останавливай» для stop_thread. */
   toolExtra?: string[];
+  /** Слова-исключения с привязкой к конкретному инструменту (§7.1 п. 5.5, PLUG-120 п. 6). */
+  toolExtras?: Record<string, string[]>;
 }
 
 export const DEFAULT_WORDS: ConfirmWords = {
@@ -91,12 +93,13 @@ export function classify(
 
   if (cls === "L") {
     if (has(words.launch)) return "approved";
-    // Одно «да» запуск не подтверждает — модель подсказывает слово.
-    return "hint";
+    if (has(words.confirm)) return "hint";
+    return "cancelled";
   }
   if (cls === "P") {
     if (has(words.permit)) return "approved";
-    return "hint";
+    if (has(words.confirm)) return "hint";
+    return "cancelled";
   }
   // C: короткое согласие.
   if (has(words.confirm) || has(words.toolExtra ?? [])) return "approved";

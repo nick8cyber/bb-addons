@@ -86,17 +86,20 @@ export class LiveClient extends EventEmitter {
     ws.addEventListener("error", () => this.emit("error", "websocket error"));
   }
 
-  private send(msg: unknown) {
+  private send(msg: unknown): boolean {
     try {
       const openConst = (WebSocket as unknown as { OPEN?: number }).OPEN;
       const open = typeof openConst === "number" ? openConst : 1;
       if (this.ws && this.ws.readyState === open) {
         this.ws.send(JSON.stringify(msg));
+        return true;
       } else {
         this.emit("sendDropped", this.ws ? this.ws.readyState : "no-socket", JSON.stringify(msg).slice(0, 80));
+        return false;
       }
     } catch (e) {
       this.emit("error", `send failed: ${String(e)}`);
+      return false;
     }
   }
 
@@ -207,9 +210,9 @@ export class LiveClient extends EventEmitter {
     this.send(this.setupMessage());
   }
 
-  sendAudio(pcm: Uint8Array): void {
+  sendAudio(pcm: Uint8Array): boolean {
     const b64 = Buffer.from(pcm).toString("base64");
-    this.send({ realtimeInput: { audio: { data: b64, mimeType: "audio/pcm;rate=16000" } } });
+    return this.send({ realtimeInput: { audio: { data: b64, mimeType: "audio/pcm;rate=16000" } } });
   }
 
   /** Текст владельца в ROUTER (вариант А, контракт §3). Транскрипт ROUTER никому не виден. */

@@ -18,6 +18,10 @@ import {
   WINDOW_PADDING_MS,
   WINDOW_SERVER_SLACK_MS,
 } from "./contract.js";
+export const HINT_SPEECH_PEAK = 300;
+export const HINT_SPEECH_MIN_MS = 150;
+const SPEECH_BLOCK_SAMPLES = 320;
+const SPEECH_BLOCK_BYTES = 640;
 import {
   classify,
   isEchoWord,
@@ -42,6 +46,8 @@ export interface PendingConfirmation {
   expiresAt: number;
   /** Вердикт владельца; до него null. */
   verdict: Verdict | null;
+  /** Снимки resolve встроенных инструментов, отделённые от пользовательских аргументов (PLUG-120 R1). */
+  resolved?: Record<string, unknown>;
 }
 
 export type RequestResult =
@@ -50,12 +56,17 @@ export type RequestResult =
 
 /**
  * Канонический хеш аргументов: отсортированные ключи, без пробелов (контракт §5).
- * Служебные ключи `_*` верхнего уровня (запись треда, взаимодействия из resolve) в хеш не входят:
- * у них меняются updatedAt/status, и один и тот же вызов давал разный хеш — ломались
- * «тот же вызов → та же запись» и «уже выполнено» (ревью PLUG-113, блокер A).
+ * Хеш считается по всем аргументам, которые уйдут исполнителю.
+ * У ручек коннектора (имя с «__») хешируется ВЕСЬ payload без исключений (PLUG-120 R1).
+ * Исключение _targetThread/_targetInteraction применяется ТОЛЬКО для встроенных инструментов с resolve.
  */
+const RESOLVE_SNAPSHOT_KEYS = new Set(["_targetThread", "_targetInteraction"]);
+
 export function argsHash(tool: string, args: Record<string, unknown>): string {
-  const stable = Object.fromEntries(Object.entries(args).filter(([k]) => !k.startsWith("_")));
+  const isConnector = tool.includes("__");
+  const stable = isConnector
+    ? args
+    : Object.fromEntries(Object.entries(args).filter(([k]) => !RESOLVE_SNAPSHOT_KEYS.has(k)));
   return argsHashRaw(tool, stable);
 }
 
@@ -82,7 +93,7 @@ interface Utterance {
 
 export interface GateEvents {
   /** Pending создан, изменён (подсказка) или открыт window: обновить оверлей и say. */
-  onConfirmationUpdate?: (pending: PendingConfirmation, phase: "asking" | "listening") => void;
+  onConfirmationUpdate?: (pending: PendingConfirmation, phase: "asking" | "listening", isHint?: boolean) => void;
   /** Вердикт определён. Исполнение — на вызывающей стороне. */
   onVerdict?: (p: PendingConfirmation, verdict: Verdict) => void;
   /**
@@ -96,6 +107,14 @@ export interface GateEvents {
    * Сервер прерывает модель и вставляет [СИСТЕМА] (спека §7.1 п. 3.1).
    */
   onEarlyApproval?: (p: PendingConfirmation) => void;
+  /**
+   * Подсказка класса L/P (PLUG-120 п. 7): «Да» не подходит, модель говорит кодовое слово.
+   */
+  onHint?: (p: PendingConfirmation) => void;
+  /**
+   * Окно инвалидировано (PLUG-120 round-3, C1): позднее аудио подсказки закрывает окно и сбрасывает реплику.
+   */
+  onWindowInvalidated?: () => void;
 }
 
 export interface GateClock {
@@ -157,6 +176,12 @@ export class ConfirmationGate {
   private falseClaimInjected = false;
   private earlyInjectedForQuestion = false;
   private maxInterruptedTurnSeq = 0;
+  private ended = false;
+  private windowGeneration = 0;
+  private hintTimer: unknown = null;
+  private hintActive = false;
+  private speechEvidenceMs = 0;
+  private speechResidual: Uint8Array = new Uint8Array(0);
 
   constructor(
     private words: ConfirmWords,
@@ -166,6 +191,14 @@ export class ConfirmationGate {
 
   setWords(words: ConfirmWords) {
     this.words = words;
+  }
+
+  private wordsFor(tool: string): ConfirmWords {
+    const extra = this.words.toolExtras?.[tool] ?? (tool === "stop_thread" ? this.words.toolExtra : undefined) ?? [];
+    return {
+      ...this.words,
+      toolExtra: extra,
+    };
   }
 
   /**
@@ -181,6 +214,9 @@ export class ConfirmationGate {
     card?: string,
     actionTexts?: string[],
   ): RequestResult {
+    if (this.ended) {
+      return { rejected: "pending_exists", message: "звонок завершён" };
+    }
     const hash = argsHash(tool, args);
     const recent = this.recentVerdicts.get(hash);
     if (recent && this.clock.now() - recent.at < ARGS_HASH_DEDUP_MS) {
@@ -201,6 +237,10 @@ export class ConfirmationGate {
       return texts;
     })();
 
+    const resolved = !tool.includes("__")
+      ? Object.fromEntries(Object.entries(args).filter(([k]) => RESOLVE_SNAPSHOT_KEYS.has(k)))
+      : undefined;
+
     this.pending = {
       confirmationId: `cf_${hash.slice(0, 12)}_${now.toString(36)}`,
       tool,
@@ -212,6 +252,7 @@ export class ConfirmationGate {
       createdAt: now,
       expiresAt: now + CONFIRM_TTL_MS,
       verdict: null,
+      resolved: resolved && Object.keys(resolved).length > 0 ? resolved : undefined,
     };
     // Микрофон во время вопроса открыт: владелец может перебить вопрос словом
     // подтверждения (решение владельца 04.11, спека §7.1 п. 3.1). Защита от эха —
@@ -277,14 +318,105 @@ export class ConfirmationGate {
     return this.windowOpenAt !== null && this.clock.now() >= this.windowOpenAt;
   }
 
+  getSpeechEvidenceMs(): number {
+    return this.speechEvidenceMs;
+  }
+
+  isHintActive(): boolean {
+    return this.hintActive;
+  }
+
+  private resetSpeechEvidence() {
+    this.speechEvidenceMs = 0;
+    this.speechResidual = new Uint8Array(0);
+  }
+
+  /**
+   * Свидетельство новой речи в окне после подсказки (§7.1 п. 5.3 (б)).
+   * Учитывается только валидный PCM текущего окна, фактически переданный в сессию.
+   */
+  recordOwnerSpeech(pcm: Uint8Array) {
+    if (!this.hintActive || !this.windowOpen()) {
+      return;
+    }
+    if (pcm.length % 2 !== 0) {
+      return;
+    }
+    const totalBytes = this.speechResidual.length + pcm.length;
+    const combined = new Uint8Array(totalBytes);
+    combined.set(this.speechResidual, 0);
+    combined.set(pcm, this.speechResidual.length);
+
+    let offset = 0;
+    while (offset + SPEECH_BLOCK_BYTES <= totalBytes) {
+      let peak = 0;
+      const view = new DataView(combined.buffer, combined.byteOffset + offset, SPEECH_BLOCK_BYTES);
+      for (let i = 0; i < SPEECH_BLOCK_SAMPLES; i++) {
+        const sample = view.getInt16(i * 2, true);
+        const abs = Math.abs(sample);
+        if (abs > peak) peak = abs;
+      }
+      if (peak > HINT_SPEECH_PEAK) {
+        this.speechEvidenceMs += 20;
+      }
+      offset += SPEECH_BLOCK_BYTES;
+    }
+    this.speechResidual = combined.slice(offset);
+  }
+
   /** Аудио хода модели: байты PCM 24 кГц, помечены turnSeq (спека §7.1 п. 3.2). */
   onModelAudio(turnSeq: number, byteLen: number, at = this.clock.now()) {
+    if (this.ended) return;
     if (turnSeq <= this.maxInterruptedTurnSeq) return;
+    if (byteLen <= 0) return;
+    if (this.hintTimer !== null) {
+      this.clock.clearTimeout(this.hintTimer);
+      this.hintTimer = null;
+    }
+    if (this.windowTimer !== null) {
+      this.clock.clearTimeout(this.windowTimer);
+      this.windowTimer = null;
+    }
+    this.windowGeneration++;
     const tr = this.playingTurns.get(turnSeq) ?? { firstAt: at, bytes: 0 };
     tr.bytes += byteLen;
     this.playingTurns.set(turnSeq, tr);
     for (const [seq, t] of this.playingTurns) if (at - t.firstAt > 120_000) this.playingTurns.delete(seq);
-    if (!this.pending || this.windowOpenAt !== null) return;
+    if (!this.pending) return;
+
+    if (this.hintActive) {
+      // (а) C1: каждый ненулевой PCM-кадр активного поколения подсказки
+      // (в т.ч. после резервного открытия по таймеру 3 с) закрывает шлюз,
+      // инвалидирует окно, снимает таймер окна и незавершённую реплику/таймер
+      // классификации этого окна, сбрасывает свидетельство (§7.1 п. 5.3).
+      this.micOpen = false;
+      this.windowOpenAt = null;
+      ++this.windowGeneration;
+      if (this.windowTimer !== null) {
+        this.clock.clearTimeout(this.windowTimer);
+        this.windowTimer = null;
+      }
+      if (this.hintTimer !== null) {
+        this.clock.clearTimeout(this.hintTimer);
+        this.hintTimer = null;
+      }
+      if (this.utteranceTimer !== null) {
+        this.clock.clearTimeout(this.utteranceTimer);
+        this.utteranceTimer = null;
+      }
+      this.currentUtterance = null;
+      if (this.bargeTimer !== null) {
+        this.clock.clearTimeout(this.bargeTimer);
+        this.bargeTimer = null;
+      }
+      this.bargeUtterance = null;
+      this.resetSpeechEvidence();
+      this.events.onWindowInvalidated?.();
+      this.events.onConfirmationUpdate?.(this.pending, "asking", true);
+    } else if (this.windowOpenAt !== null) {
+      return;
+    }
+
     this.audioSinceRequest += byteLen;
     if (!this.turnAudio.has(turnSeq)) this.turnAudio.set(turnSeq, 0);
     this.turnAudio.set(turnSeq, (this.turnAudio.get(turnSeq) ?? 0) + byteLen);
@@ -294,6 +426,7 @@ export class ConfirmationGate {
   }
 
   onPlaybackDrained(turnSeq: number, at = this.clock.now()) {
+    if (this.ended) return;
     this.playingTurns.delete(turnSeq);
     if (!this.pending || this.windowOpenAt !== null) return;
     if (turnSeq <= this.maxInterruptedTurnSeq) return;
@@ -311,18 +444,30 @@ export class ConfirmationGate {
   }
 
   private maybeOpenWindow(at: number) {
-    if (!this.pending || this.windowOpenAt !== null) return;
+    if (this.ended || !this.pending || this.windowOpenAt !== null) return;
     if (this.turnAudio.size === 0) return;
     const allDrained = [...this.turnAudio.keys()].every((t) => this.turnDrained.has(t));
     const quiet = this.lastAudioAt !== null && at - this.lastAudioAt >= WINDOW_PADDING_MS;
     if (!allDrained || !quiet) return;
+    if (this.windowTimer !== null) {
+      this.clock.clearTimeout(this.windowTimer);
+      this.windowTimer = null;
+    }
+    const gen = ++this.windowGeneration;
     const estimate = this.estimateWindowAt();
     const openAt = Math.max(at, estimate ?? 0) + WINDOW_PADDING_MS;
     const open = () => {
-      if (!this.pending || this.windowOpenAt !== null) return;
+      this.windowTimer = null;
+      if (this.ended || !this.pending || this.windowOpenAt !== null) return;
+      if (this.windowGeneration !== gen) return;
+      const now = this.clock.now();
+      const isAllDrained = [...this.turnAudio.keys()].every((t) => this.turnDrained.has(t));
+      const isQuiet = this.lastAudioAt !== null && now - this.lastAudioAt >= WINDOW_PADDING_MS;
+      if (!isAllDrained || !isQuiet) return;
       this.windowOpenAt = openAt;
       this.micOpen = true;
-      this.events.onConfirmationUpdate?.(this.pending, "listening");
+      this.resetSpeechEvidence();
+      this.events.onConfirmationUpdate?.(this.pending, "listening", this.hintActive);
     };
     if (openAt <= at) open();
     else this.windowTimer = this.clock.setTimeout(open, openAt - at);
@@ -334,6 +479,7 @@ export class ConfirmationGate {
    * Реплика завершается по 700 мс тишины — тогда classify.
    */
   onOwnerTranscriptChunk(text: string, at = this.clock.now()) {
+    if (this.ended) return;
     const p = this.pending;
     if (!p) return;
     if (p.expiresAt <= at) {
@@ -462,7 +608,8 @@ export class ConfirmationGate {
     ]);
     const words = normalizeUtterance(u.text);
     if (words.length === 0 || words.every((w) => isEchoWord(w, sayWords))) return;
-    if (classify(u.text, p.class, this.words) !== "approved") return;
+    const wordsForTool = this.wordsFor(p.tool);
+    if (classify(u.text, p.class, wordsForTool) !== "approved") return;
 
     if (this.questionStarted(p, u.firstChunkAt)) {
       p.verdict = "approved";
@@ -484,6 +631,7 @@ export class ConfirmationGate {
 
   /** Явный конец реплики от транспорта (VAD), не ждём 700 мс. */
   onOwnerUtteranceEnd(text: string, firstChunkAt: number, at = this.clock.now()) {
+    if (this.ended) return;
     const p = this.pending;
     if (!p) return;
     if (p.expiresAt <= at) {
@@ -520,14 +668,50 @@ export class ConfirmationGate {
       }
     }
 
-    const verdict = classify(u.text, p.class, this.words);
+    const wordsForTool = this.wordsFor(p.tool);
+    const verdict = classify(u.text, p.class, wordsForTool);
     if (verdict === "hint") {
       // Подсказка не снимает pending; пока она звучит, шлюз снова закрыт,
       // окно переоткрывается по правилу п. 3 (спека §7.1 п. 5.3).
-      this.resetWindow();
+      this.resetQuestionTiming();
+      this.hintActive = true;
+      this.resetSpeechEvidence();
       this.micOpen = false;
-      this.events.onConfirmationUpdate?.(p, "asking");
+      this.events.onConfirmationUpdate?.(p, "asking", true);
+      this.events.onHint?.(p);
+      if (this.hintTimer !== null) {
+        this.clock.clearTimeout(this.hintTimer);
+        this.hintTimer = null;
+      }
+      const gen = ++this.windowGeneration;
+      this.hintTimer = this.clock.setTimeout(() => {
+        this.hintTimer = null;
+        if (this.ended || !this.pending || this.windowOpenAt !== null) return;
+        if (this.windowGeneration !== gen) return;
+        if (this.turnAudio.size > 0) return;
+        const openAt = this.clock.now() + WINDOW_PADDING_MS;
+        this.windowTimer = this.clock.setTimeout(() => {
+          this.windowTimer = null;
+          if (this.ended || !this.pending || this.windowOpenAt !== null) return;
+          if (this.windowGeneration !== gen) return;
+          this.windowOpenAt = openAt;
+          this.micOpen = true;
+          this.resetSpeechEvidence();
+          this.events.onConfirmationUpdate?.(this.pending, "listening", true);
+        }, WINDOW_PADDING_MS);
+      }, 3000);
       return;
+    }
+    if (verdict === "approved") {
+      if (this.hintActive && this.speechEvidenceMs < HINT_SPEECH_MIN_MS) {
+        // Эвристика свидетельства новой речи (§7.1 п. 5.3 (б)):
+        // недостаточно валидной речи в текущем окне после подсказки.
+        // Реплика заканчивается без вердикта, pending ждёт дальше.
+        return;
+      }
+      this.hintActive = false;
+    } else {
+      this.hintActive = false;
     }
     p.verdict = verdict;
     this.events.onVerdict?.(p, verdict);
@@ -539,6 +723,7 @@ export class ConfirmationGate {
    * не классифицирована, ждём окончания до 3 с, потом not_confirmed.
    */
   confirmAction(confirmationId: string): Promise<Verdict> {
+    if (this.ended) return Promise.resolve("cancelled");
     const at = this.clock.now();
     const p = this.pending;
     if (!p || p.confirmationId !== confirmationId) {
@@ -567,11 +752,14 @@ export class ConfirmationGate {
 
   /** Кнопки оверлея: явное действие владельца, равно approved/cancel (спека §7.1 п. 7). */
   decide(confirmationId: string, decision: "approve" | "cancel"): Verdict {
+    if (this.ended) return "cancelled";
     const p = this.pending;
     if (!p || p.confirmationId !== confirmationId) return this.usedIds.has(confirmationId) ? "expired" : "not_confirmed";
     if (p.verdict !== null) return p.verdict;
     if (p.expiresAt <= this.clock.now()) return this.burn(p, "expired");
     const verdict: Verdict = decision === "approve" ? "approved" : "cancelled";
+    this.hintActive = false;
+    this.resetSpeechEvidence();
     p.verdict = verdict;
     // Аудит PLUG-108: решение кнопкой сразу открывает микрофон — владелец не говорит в пустоту
     // до конца исполнения или истечения срока.
@@ -585,6 +773,7 @@ export class ConfirmationGate {
 
   /** TTL. Драйвер вызывает из своего таймера. */
   tick(): void {
+    if (this.ended) return;
     const p = this.pending;
     if (!p) return;
     const now = this.clock.now();
@@ -602,7 +791,8 @@ export class ConfirmationGate {
     if (quiet && now >= estimate + DRAINED_LOST_SLACK_MS) {
       this.windowOpenAt = now + WINDOW_PADDING_MS;
       this.micOpen = true;
-      this.events.onConfirmationUpdate?.(p, "listening");
+      this.resetSpeechEvidence();
+      this.events.onConfirmationUpdate?.(p, "listening", this.hintActive);
     }
   }
 
@@ -617,6 +807,8 @@ export class ConfirmationGate {
   private burn(p: PendingConfirmation, verdict: Verdict): Verdict {
     const fireEvent = p.verdict === null;
     p.verdict = verdict;
+    this.hintActive = false;
+    this.resetSpeechEvidence();
     if (this.pending === p) this.pending = null;
     this.usedIds.add(p.confirmationId);
     this.recentVerdicts.set(p.argsHash, { verdict, at: this.clock.now() });
@@ -640,11 +832,13 @@ export class ConfirmationGate {
 
   private resetWindow() {
     this.windowOpenAt = null;
+    this.windowGeneration++;
     this.turnAudio.clear();
     this.turnDrained.clear();
     this.firstAudioAt = null;
     this.lastAudioAt = null;
     this.currentUtterance = null;
+    this.resetSpeechEvidence();
     if (this.utteranceTimer !== null) {
       this.clock.clearTimeout(this.utteranceTimer);
       this.utteranceTimer = null;
@@ -658,10 +852,15 @@ export class ConfirmationGate {
       this.clock.clearTimeout(this.windowTimer);
       this.windowTimer = null;
     }
+    if (this.hintTimer !== null) {
+      this.clock.clearTimeout(this.hintTimer);
+      this.hintTimer = null;
+    }
   }
 
   resetQuestionTiming() {
     this.windowOpenAt = null;
+    this.windowGeneration++;
     for (const seq of this.turnAudio.keys()) {
       this.maxInterruptedTurnSeq = Math.max(this.maxInterruptedTurnSeq, seq);
     }
@@ -676,9 +875,32 @@ export class ConfirmationGate {
     this.questionAudioOffset = null;
     this.playingTurns.clear();
     this.priorPlaybackEnd = 0;
+    this.resetSpeechEvidence();
     if (this.windowTimer !== null) {
       this.clock.clearTimeout(this.windowTimer);
       this.windowTimer = null;
+    }
+    if (this.hintTimer !== null) {
+      this.clock.clearTimeout(this.hintTimer);
+      this.hintTimer = null;
+    }
+  }
+
+  end(): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.hintActive = false;
+    this.resetWindow();
+    for (const waiters of this.confirmWaiters.values()) {
+      for (const w of waiters) {
+        if (w.timer !== null) this.clock.clearTimeout(w.timer);
+        w.resolve("cancelled");
+      }
+    }
+    this.confirmWaiters.clear();
+    if (this.pending) {
+      this.pending.verdict = "cancelled";
+      this.pending = null;
     }
   }
 

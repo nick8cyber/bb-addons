@@ -191,15 +191,29 @@ export class CallSession extends EventEmitter {
         confirm: ["да", "давай", "подтверждаю", "отправляй", "ок", "окей", "верно"],
         permit: ["разрешаю", "разреши", "одобряю"],
         launch: ["запускай", "запусти", "запускаем", "раздавай", "раздай"],
-        toolExtra: ["останавливай"],
+        toolExtras: { stop_thread: ["останавливай"] },
       },
       undefined,
       {
-        onConfirmationUpdate: (p, phase) => this.onConfirmationUpdate(p, phase),
+        onConfirmationUpdate: (p, phase, isHint) => this.onConfirmationUpdate(p, phase, isHint),
         onQuestionHeardAt: (p, at, offsetMs) => this.recordEvent( "question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
         onVerdict: (p, verdict) => void this.onVerdict(p, verdict),
         onEarlyApproval: (_p) => {
           this.interruptAndInject("[СИСТЕМА] Владелец сказал «да» до вопроса — это НЕ подтверждение, ничего не выполнено. Задай вопрос подтверждения коротко и дождись ответа");
+        },
+        onHint: (p) => {
+          const text = p.class === "L"
+            ? "[СИСТЕМА] «Да» для этого действия не подходит, ничего не выполнено. Скажи владельцу одной фразой: «Для запуска скажи «запускай»» и жди ответа"
+            : "[СИСТЕМА] «Да» для этого действия не подходит, ничего не выполнено. Скажи владельцу одной фразой: «Чтобы разрешить, скажи «разрешаю»» и жди ответа";
+          this.interruptAndInject(text);
+          this.ledger.add("system", text);
+        },
+        onWindowInvalidated: () => {
+          if (this.ownerUtteranceTimer) {
+            clearTimeout(this.ownerUtteranceTimer);
+            this.ownerUtteranceTimer = null;
+          }
+          this.ownerUtterance = null;
         },
       },
     );
@@ -263,6 +277,21 @@ export class CallSession extends EventEmitter {
     });
     if (this.threadId) this.frame({ type: "thread", threadId: this.threadId });
     this.setState(this.muted ? "muted" : "listening");
+    const p = this.gate.pendingConfirmation();
+    if (p && p.verdict === null) {
+      const word = p.class === "L" ? "запускай" : p.class === "P" ? "разрешаю" : "да";
+      const phase = this.gate.windowOpen() ? "listening" : "asking";
+      this.frame({
+        type: "confirmation",
+        confirmationId: p.confirmationId,
+        class: p.class,
+        tool: p.tool,
+        summary: p.card ?? p.say,
+        word,
+        expiresAt: new Date(p.expiresAt).toISOString(),
+        phase,
+      });
+    }
   }
 
   private promptContext: PromptContext = EMPTY_CONTEXT;
@@ -895,7 +924,9 @@ export class CallSession extends EventEmitter {
       callsProjectId: () => null,
       watchThread: this.deps.watchThread,
       rememberArgs: (hash: string, args: Record<string, unknown>) => {
-        this.storedArgs.set(hash, args);
+        if (!this.storedArgs.has(hash)) {
+          this.storedArgs.set(hash, structuredClone(args));
+        }
       },
       savePreview: (tool: string, token: string, args: Record<string, unknown>, previewText: string) => {
         const cleanArgs = stripConfirmKeys(args);
@@ -1355,6 +1386,7 @@ export class CallSession extends EventEmitter {
   }
 
   private flushSystemSoon() {
+    if (this.ended) return;
     if (this.systemBatch.length === 0) return;
     const batch = this.systemBatch;
     this.systemBatch = [];
@@ -1364,7 +1396,7 @@ export class CallSession extends EventEmitter {
     this.injectWhenQuiet(text);
   }
 
-  private onConfirmationUpdate(p: PendingConfirmation, phase: "asking" | "listening") {
+  private onConfirmationUpdate(p: PendingConfirmation, phase: "asking" | "listening", isHint = false) {
     // Журнал для приёмки: открытие окна ответа отделяет перебивание от ответа после вопроса.
     this.recordEvent( "confirm_phase", { tool: p.tool, phase });
     const word = p.class === "L" ? "запускай" : p.class === "P" ? "разрешаю" : "да";
@@ -1378,8 +1410,7 @@ export class CallSession extends EventEmitter {
       expiresAt: new Date(p.expiresAt).toISOString(),
       phase,
     });
-    if (phase === "asking") {
-      // В режиме router вопрос зачитывает VOICE по [СИСТЕМА] с готовой фразой.
+    if (phase === "asking" && !isHint) {
       if (this.mode === "extended") {
         this.injectWhenQuiet(`[СИСТЕМА] Скажи владельцу: ${p.say}`);
       }
@@ -1410,6 +1441,7 @@ export class CallSession extends EventEmitter {
   }
 
   private async onVerdict(p: PendingConfirmation, verdict: "approved" | "hint" | "cancelled" | "expired" | "not_confirmed") {
+    if (this.ended) return;
     this.lastVerdict = { verdict, at: Date.now() };
     this.frame({ type: "confirmation_result", confirmationId: p.confirmationId, verdict });
     this.recordEvent("verdict", { tool: p.tool, verdict });
@@ -1445,8 +1477,46 @@ export class CallSession extends EventEmitter {
       return;
     }
     // Исполняет сервер немедленно (кнопка и voice в обоих режимах, спека §7.1 п. 7).
-    if (!def) return;
+    if (!def) {
+      this.gate.consume(p.confirmationId);
+      this.storedArgs.delete(p.argsHash);
+      const actionId = this.newActionId(p.tool);
+      this.frame({
+        type: "action",
+        actionId,
+        tool: p.tool,
+        class: p.class,
+        status: "failed",
+        summary: `Не выполнено: ${p.tool}`,
+      });
+      const errResult: ToolResult = {
+        ok: false,
+        error: { code: "not_found", message: `инструмент не найден: ${p.tool}` },
+      };
+      this.resolvePendingToolResponse(p.argsHash, errResult);
+      this.injectVerdict(p, `[СИСТЕМА] НЕ ВЫПОЛНЕНО: инструмент не найден: ${p.tool}. Скажи владельцу прямо, что не получилось; не говори «отправлено» или «готово».`);
+      return;
+    }
     const actionId = this.newActionId(p.tool);
+    if (argsHash(p.tool, stored) !== p.argsHash) {
+      this.gate.consume(p.confirmationId);
+      this.storedArgs.delete(p.argsHash);
+      this.frame({
+        type: "action",
+        actionId,
+        tool: p.tool,
+        class: p.class,
+        status: "failed",
+        summary: `Не выполнено: ${p.tool}`,
+      });
+      const errResult: ToolResult = {
+        ok: false,
+        error: { code: "invalid_argument", message: "аргументы действия были изменены" },
+      };
+      this.resolvePendingToolResponse(p.argsHash, errResult);
+      this.injectVerdict(p, `[СИСТЕМА] НЕ ВЫПОЛНЕНО: аргументы действия были изменены. Скажи владельцу прямо, что не получилось; не говори «отправлено» или «готово».`);
+      return;
+    }
     this.frame({ type: "action", actionId, tool: p.tool, class: p.class, status: "running", summary: p.say });
     let result: ToolResult;
 
@@ -1488,6 +1558,7 @@ export class CallSession extends EventEmitter {
     } finally {
       this.storedArgs.delete(p.argsHash);
     }
+    if (this.ended) return;
     this.gate.consume(p.confirmationId);
     this.frame({
       type: "action",
@@ -1550,6 +1621,7 @@ export class CallSession extends EventEmitter {
 
   /** Аудио владельца из браузера. */
   onBrowserAudio(pcm: Uint8Array) {
+    if (pcm.length % 2 !== 0 || pcm.length > MIC_FRAME_BYTES * 8) return;
     this.trackMic(pcm);
     if (this.ended || this.muted) return;
     if (!this.gate.isMicOpen()) {
@@ -1559,7 +1631,7 @@ export class CallSession extends EventEmitter {
     // Полный дуплекс с приглушением: пока агент говорит, микрофон ×0.25 —
     // эхо из динамиков падает ниже порога VAD Gemini, а громкая речь владельца
     // пробивается (перебивание голосом работает). Слой 1 из 2 против эха.
-    if (pcm.length > MIC_FRAME_BYTES * 8) return; // защита от некадренного потока
+    if (!this.voice) return;
     let outgoing = pcm;
     if (this.state === "speaking") {
       const ducked = new Int16Array(pcm.length >> 1);
@@ -1570,7 +1642,10 @@ export class CallSession extends EventEmitter {
       }
       outgoing = new Uint8Array(ducked.buffer);
     }
-    this.voice?.sendAudio(outgoing);
+    const sent = typeof this.voice.sendAudio === "function" ? this.voice.sendAudio(outgoing) : false;
+    if (sent === true) {
+      this.gate.recordOwnerSpeech(pcm);
+    }
     if (this.mode === "extended" && this.deps.routerInput === "audio" && this.routerMayHearOwner()) this.router?.sendAudio(pcm);
     if (this.state === "listening") this.setState("listening");
   }
@@ -1760,6 +1835,7 @@ export class CallSession extends EventEmitter {
 
   /** Кнопки оверлея: явное действие владельца (спека §7.1 п. 7). */
   decideConfirmation(confirmationId: string, decision: "approve" | "cancel"): void {
+    if (this.ended) return;
     // Кнопка нажата, пока голос ещё говорит (часто — сам вопрос): ход модели обрываем, иначе
     // голос дочитывал уже решённый вопрос и «да» владельца уходило модели как новая реплика
     // (живая проверка 04.11). Результат действия вставится сразу, а не после конца хода.
@@ -1823,7 +1899,22 @@ export class CallSession extends EventEmitter {
     if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
     if (this.ended) return;
     this.ended = true;
+    try {
+      const pending = this.gate.pendingConfirmation();
+      if (pending && pending.verdict === null) {
+        this.recordEvent("verdict", { tool: pending.tool, verdict: "cancelled", reason: "call_ended" });
+      }
+    } catch {
+      // Ошибка журнала не должна прерывать очистку сессии и завершение звонка (PLUG-120 R4)
+    }
+    this.gate.end();
+    this.storedArgs.clear();
     this.twoStepPreviews.clear();
+    if (this.systemBatchTimer) {
+      clearTimeout(this.systemBatchTimer);
+      this.systemBatchTimer = null;
+    }
+    this.systemBatch = [];
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

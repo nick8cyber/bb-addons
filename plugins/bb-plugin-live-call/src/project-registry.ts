@@ -3,8 +3,8 @@
  * Разбор, валидация, хеширование, диффы, вычисление строгого класса.
  */
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, lstatSync, openSync, readSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { CallStore } from "./call-store.js";
 import { maskSecrets } from "./secret-filter.js";
@@ -282,17 +282,26 @@ export interface RepoProjectEnvironment {
 
 function safeReadFileBounded(filePath: string, projectRoot: string, maxBytes = 32768): string | null {
   try {
-    const resolvedRoot = resolve(projectRoot);
-    const resolvedPath = resolve(filePath);
-    if (!resolvedPath.startsWith(resolvedRoot)) return null;
+    if (!existsSync(projectRoot) || !existsSync(filePath)) return null;
+    const realRoot = realpathSync(projectRoot);
 
-    if (!existsSync(resolvedPath)) return null;
-    const stat = lstatSync(resolvedPath);
-    // Проверка: обычный файл, не симлинк (§16.7 п. 7, §15.3, review п. 12)
-    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    // Каталоги .bb и .bb/live-call и сам файл симлинками быть не могут (§15.3, PLUG-120 п. 9)
+    const dotBb = join(projectRoot, ".bb");
+    if (!existsSync(dotBb) || lstatSync(dotBb).isSymbolicLink()) return null;
 
-    const fd = openSync(resolvedPath, "r");
+    const liveCallDir = join(dotBb, "live-call");
+    if (!existsSync(liveCallDir) || lstatSync(liveCallDir).isSymbolicLink()) return null;
+
+    if (lstatSync(filePath).isSymbolicLink()) return null;
+
+    const realFile = realpathSync(filePath);
+    if (!realFile.startsWith(realRoot + sep) && realFile !== realRoot) return null;
+
+    // Открытие с O_NOFOLLOW | O_NONBLOCK | O_RDONLY (§15.3)
+    const fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) return null;
       const buf = Buffer.alloc(maxBytes);
       const bytesRead = readSync(fd, buf, 0, maxBytes, 0);
       return buf.subarray(0, bytesRead).toString("utf-8");

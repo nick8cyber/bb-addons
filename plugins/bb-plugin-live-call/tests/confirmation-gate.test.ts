@@ -292,6 +292,10 @@ describe("шлюз микрофона и окно ответа (§7.1 п. 3)", (
     t.advance(300);
     gate.onPlaybackDrained(2, t.now);
     t.advance(1900);
+    const pcm = new Uint8Array(8 * 640);
+    const view = new DataView(pcm.buffer);
+    for (let b = 0; b < 8; b++) view.setInt16(b * 640, 1000, true);
+    gate.recordOwnerSpeech(pcm);
     gate.onOwnerUtteranceEnd("запускай", t.now, t.now);
     expect(gate.pendingConfirmation()?.verdict).toBe("approved");
   });

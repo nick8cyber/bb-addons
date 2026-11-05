@@ -140,6 +140,10 @@ export default async function plugin(bb: BbPluginApi) {
     typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
 
   const store = new CallStore(bb.storage.database());
+  const brainDir = join(bb.server.experimental_dataDir, "plugins", "live-call", "brain-files");
+  store.rotate(Date.now(), brainDir);
+  const rotateTimer = setInterval(() => store.rotate(Date.now(), brainDir), 24 * 3600 * 1000);
+  bb.onDispose(() => clearInterval(rotateTimer));
   const projectRegistry = new ProjectRegistryManager(store);
   const bridges = new Set<Sock>();
   const bridgeOwner = new Map<string, Sock>();

@@ -667,6 +667,10 @@ describe("Баг 2. Эхо в окне ответа (§7.1 п. 5)", () => {
     expect(gate.windowOpen()).toBe(true);
 
     // Владелец говорит «запускай» — подсказка не входит в эхо-набор окна, засчитывается approved
+    const pcm = new Uint8Array(8 * 640);
+    const view = new DataView(pcm.buffer);
+    for (let b = 0; b < 8; b++) view.setInt16(b * 640, 1000, true);
+    gate.recordOwnerSpeech(pcm);
     gate.onOwnerUtteranceEnd("запускай", t.now, t.now);
     expect(verdicts).toEqual(["approved"]);
     expect(gate.pendingConfirmation()?.verdict).toBe("approved");

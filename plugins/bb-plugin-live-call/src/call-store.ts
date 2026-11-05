@@ -3,6 +3,8 @@
  * bb.storage.database() — собственная база плагина; миграции append-only.
  */
 import type Database from "better-sqlite3";
+import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 
 export interface CallRow {
   id: string;
@@ -200,13 +202,33 @@ export class CallStore {
       .all(callId) as unknown as CallEventRow[];
   }
 
-  /** Ротация: звонки старше 90 дней удаляются (контракт §9). */
-  rotate(now = Date.now()): number {
+  /** Ротация: звонки старше 90 дней и старые brain-файлы удаляются (контракт §9, PLUG-120 п. 10). */
+  rotate(now = Date.now(), brainFilesDir?: string): number {
     const cutoff = now - RETENTION_DAYS * 24 * 3600 * 1000;
     const old = this.db.prepare("SELECT id FROM calls WHERE started_at < ?").all(cutoff) as Array<{ id: string }>;
     for (const c of old) {
       this.db.prepare("DELETE FROM call_events WHERE call_id = ?").run(c.id);
       this.db.prepare("DELETE FROM calls WHERE id = ?").run(c.id);
+    }
+    if (brainFilesDir && existsSync(brainFilesDir)) {
+      try {
+        const files = readdirSync(brainFilesDir);
+        for (const file of files) {
+          if (file.startsWith("brain-history-") && file.endsWith(".txt")) {
+            const full = join(brainFilesDir, file);
+            try {
+              const st = statSync(full);
+              if (st.mtimeMs < cutoff) {
+                unlinkSync(full);
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
     }
     return old.length;
   }

@@ -2314,9 +2314,11 @@ export async function runToolCall(
       return { result: { ok: false, error: { code: "internal", message: String(e) } }, executed: false };
     }
   }
-  let callArgs = args;
+  let callArgs = def.name.includes("__")
+    ? args
+    : Object.fromEntries(Object.entries(args).filter(([k]) => !k.startsWith("_")));
   if (def.resolve) {
-    const res = await def.resolve(args, ctx);
+    const res = await def.resolve(callArgs, ctx);
     if (!res.ok) {
       return { result: res, executed: false };
     }
