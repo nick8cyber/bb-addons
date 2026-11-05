@@ -18,6 +18,32 @@ export function isValidSecretValue(v: unknown): v is string {
   return typeof v === "string" && v.trim().length >= 3 && !/[\u0000-\u001F\u007F]/.test(v);
 }
 
+const EXPANDED_FLAG = Symbol.for("bb.live-call.expanded-secrets");
+
+export function isSecretFilterSet(v: unknown): v is string[] {
+  return Array.isArray(v) && (v as any)[EXPANDED_FLAG] === true;
+}
+
+/**
+ * Строит расширенный набор точных секретов E′ = E ∪ { JSON-форма e : e ∈ E } (§14.6).
+ * JSON-форма — JSON.stringify(e) без внешних кавычек (отличается от e для значений с ", \ или одиночными суррогатами).
+ * В набор E попадают только допустимые значения (isValidSecretValue).
+ */
+export function buildSecretFilterSet(exactSecrets: string[] = []): string[] {
+  const set = new Set<string>();
+  for (const s of exactSecrets) {
+    if (!isValidSecretValue(s)) continue;
+    set.add(s);
+    const jsonForm = JSON.stringify(s).slice(1, -1);
+    if (isValidSecretValue(jsonForm)) {
+      set.add(jsonForm);
+    }
+  }
+  const arr = Array.from(set);
+  Object.defineProperty(arr, EXPANDED_FLAG, { value: true, enumerable: false });
+  return arr;
+}
+
 export function getSecretOccurrences(text: string, secrets: string[]): Array<[number, number]> {
   const iv: Array<[number, number]> = [];
   for (const s of secrets) {
@@ -29,11 +55,17 @@ export function getSecretOccurrences(text: string, secrets: string[]): Array<[nu
   return iv.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
 }
 
-export function maskSecrets(text: string, exactSecrets: string[] = []): string {
+/**
+ * Маскирует только точные совпадения секретов из E′ (шаг 1 §14.6).
+ * Принимает как сырой E, так и готовый E′ (без повторного расширения).
+ */
+export function maskExactSecrets(text: string, exactSecrets: string[] = []): string {
   if (!text || typeof text !== "string") return "";
 
-  // 1. Точные значения первыми: объединение всех вхождений (включая перекрывающиеся) в интервалы (§14.6)
-  const iv = getSecretOccurrences(text, exactSecrets);
+  const expandedSecrets = isSecretFilterSet(exactSecrets)
+    ? exactSecrets
+    : buildSecretFilterSet(exactSecrets);
+  const iv = getSecretOccurrences(text, expandedSecrets);
   let out = "";
   let pos = 0;
   let i = 0;
@@ -47,6 +79,14 @@ export function maskSecrets(text: string, exactSecrets: string[] = []): string {
     pos = e;
   }
   out += text.slice(pos);
+  return out;
+}
+
+export function maskSecrets(text: string, exactSecrets: string[] = []): string {
+  if (!text || typeof text !== "string") return "";
+
+  // 1. Точные значения первыми: объединение всех вхождений (включая перекрывающиеся) в интервалы по E′ (§14.6)
+  let out = maskExactSecrets(text, exactSecrets);
 
   // 2. Шаблоны после точных значений (§14.6)
   // Учётки в URL (scheme://user:pass@host)

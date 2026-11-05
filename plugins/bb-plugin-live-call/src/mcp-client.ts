@@ -12,7 +12,7 @@ import {
   type ConnectorConfig,
   type RepoProjectEnvironment,
 } from "./project-registry.js";
-import { getSecretOccurrences, isValidSecretValue, maskSecrets } from "./secret-filter.js";
+import { buildSecretFilterSet, getSecretOccurrences, isValidSecretValue, maskExactSecrets, maskSecrets } from "./secret-filter.js";
 
 export interface McpTool {
   name: string;
@@ -414,7 +414,8 @@ export function createMcpStderrCollector(
   logLine: (line: string) => void,
   budget = 2000,
 ) {
-  const maxSecretLen = secretVals.length > 0 ? Math.max(0, ...secretVals.map((s) => s.length)) : 0;
+  const expandedSecrets = buildSecretFilterSet(secretVals);
+  const maxSecretLen = expandedSecrets.length > 0 ? Math.max(0, ...expandedSecrets.map((s) => s.length)) : 0;
   const dec = new StringDecoder("utf8");
   let head = "";
   let lineLen = 0;
@@ -425,12 +426,12 @@ export function createMcpStderrCollector(
   const emitLine = (h: string, len: number, B: number): { out: string; C: number } => {
     if (len === 0) return { out: "", C: 0 };
     if (len <= B) {
-      return { out: maskSecrets(h, secretVals), C: len };
+      return { out: maskSecrets(h, expandedSecrets), C: len };
     }
     let C = B;
     for (;;) {
       const prev = C;
-      for (const [s, e] of getSecretOccurrences(h, secretVals)) {
+      for (const [s, e] of getSecretOccurrences(h, expandedSecrets)) {
         if (s < C && C < e) {
           C = s;
         }
@@ -444,7 +445,7 @@ export function createMcpStderrCollector(
       }
       if (C === prev) break;
     }
-    const maskedPart = maskSecrets(h.slice(0, C), secretVals);
+    const maskedPart = maskSecrets(h.slice(0, C), expandedSecrets);
     return { out: maskedPart + `…[обрезано ${len - C}]`, C };
   };
 
@@ -524,6 +525,29 @@ export interface McpClientOwner {
   type: "call" | "diagnostics";
   callId?: string;
   onStopFailed?: (id: string, pid: number) => void;
+}
+
+function maskStructuredContent(val: unknown, expandedSecrets: string[]): unknown {
+  if (typeof val === "string") {
+    return expandedSecrets.some((e) => val.includes(e))
+      ? maskExactSecrets(val, expandedSecrets)
+      : val;
+  }
+  if (val === null || typeof val !== "object") {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => maskStructuredContent(item, expandedSecrets));
+  }
+  const copy: Record<string, unknown> = Object.create(null);
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+    const maskedKey = expandedSecrets.some((e) => k.includes(e))
+      ? maskExactSecrets(k, expandedSecrets)
+      : k;
+    // Коллизия двух ключей-секретов в один "***" допустима по спеке (безопасная сторона)
+    copy[maskedKey] = maskStructuredContent(v, expandedSecrets);
+  }
+  return copy;
 }
 
 export class McpClient {
@@ -963,6 +987,7 @@ export class McpClient {
     }
 
     const secretValues = Object.values(this.secrets).filter(isValidSecretValue);
+    const expandedSecrets = buildSecretFilterSet(secretValues);
     try {
       const res = (await this.request("tools/call", { name: tool, arguments: args }, timeoutMs)) as {
         content?: Array<{ type: string; text?: string }>;
@@ -973,7 +998,8 @@ export class McpClient {
       const isError = Boolean(res?.isError);
       let text = "";
       if (res?.structuredContent !== undefined) {
-        text = typeof res.structuredContent === "string" ? res.structuredContent : JSON.stringify(res.structuredContent);
+        const maskedContent = maskStructuredContent(res.structuredContent, expandedSecrets);
+        text = typeof maskedContent === "string" ? maskedContent : JSON.stringify(maskedContent);
       } else if (Array.isArray(res?.content)) {
         text = res.content
           .map((c) => {
@@ -986,7 +1012,7 @@ export class McpClient {
       if (!text && isError) text = "ошибка выполнения инструмента";
 
       // Маскировка секретов до обрезки (§14.6, §14.10)
-      const maskedFull = maskSecrets(text, secretValues);
+      const maskedFull = maskSecrets(text, expandedSecrets);
 
       // Сжатие до maxResultChars (по умолчанию 2000 символов, §15.2, §15.4 п. 5)
       const maxChars = this.config.maxResultChars ?? CONNECTOR_RESULT_MAX_CHARS_DEFAULT;
@@ -1017,7 +1043,7 @@ export class McpClient {
       const rawMsg = String((e as Error)?.message ?? e);
       const code = (e as any)?.code;
       const isTimeout = /таймаут/i.test(rawMsg) || /timeout/i.test(rawMsg);
-      const maskedMsg = maskSecrets(rawMsg, secretValues).slice(0, 500);
+      const maskedMsg = maskSecrets(rawMsg, expandedSecrets).slice(0, 500);
 
       if (code === "invalid_argument" || /invalid_argument/i.test(rawMsg) || /-32602/.test(rawMsg)) {
         return {
