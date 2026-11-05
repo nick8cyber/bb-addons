@@ -1,7 +1,7 @@
 # `live-call` 📞 — живой голосовой звонок с координатором BB
 
 > [!NOTE]
-> Контракт — [docs/specs/live-call-contract.md](../../docs/specs/live-call-contract.md). Архитектура — [docs/specs/live-call.md](../../docs/specs/live-call.md). Что сделано и что дальше — [STATUS.md](STATUS.md).
+> Контракт — [docs/specs/live-call-contract.md](../../docs/specs/live-call-contract.md). Архитектура — [docs/specs/live-call.md](../../docs/specs/live-call.md). Что сделано и что дальше — [STATUS.md](STATUS.md). Как работать агенту над плагином — [AGENTS.md](AGENTS.md).
 
 Кнопка «Позвонить» открывает живой голосовой диалог с агентом-координатором поверх BB. Агент слышит, его можно перебить голосом. Он сам читает треды, пишет в них, запускает агентов (только по слову «запускай») и докладывает, когда агенты закончили.
 
