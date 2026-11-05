@@ -95,6 +95,46 @@ describe("1. Реестр projectCalls и выбор строгого класс
     const invalidRes = mgr.parseRegistry(invalidDefaultClass);
     expect(invalidRes.parsed).toBeNull();
     expect(invalidRes.error).toContain("defaultClass");
+
+    // Запрет R в twoStep (§14.10 п. 1)
+    const invalidTwoStepR = JSON.stringify({
+      proj_1: {
+        title: "CRM",
+        connectors: [
+          {
+            id: "crm",
+            transport: "stdio",
+            command: ["/usr/bin/node", "/path/server.js"],
+            tools: { query: "R" },
+            defaultClass: "C",
+            twoStep: ["query"],
+          },
+        ],
+      },
+    });
+    const resR = mgr.parseRegistry(invalidTwoStepR);
+    expect(resR.parsed).toBeNull();
+    expect(resR.error).toContain("не может иметь класс R");
+
+    // Запрет отсутствующей ручки в twoStep (§14.10 п. 1)
+    const invalidTwoStepMissing = JSON.stringify({
+      proj_1: {
+        title: "CRM",
+        connectors: [
+          {
+            id: "crm",
+            transport: "stdio",
+            command: ["/usr/bin/node", "/path/server.js"],
+            tools: { query: "C" },
+            defaultClass: "deny",
+            twoStep: ["missing"],
+          },
+        ],
+      },
+    });
+    const resMissing = mgr.parseRegistry(invalidTwoStepMissing);
+    expect(resMissing.parsed).toBeNull();
+    expect(resMissing.error).toContain("отсутствует в tools");
   });
 
   it("выбор строгого класса: R < C < P < L и режим только чтения (deny)", () => {
@@ -123,6 +163,7 @@ describe("1. Реестр projectCalls и выбор строгого класс
           command: ["/usr/bin/node", "/old/server.js"],
           tools: { get_data: "R", set_data: "C" },
           defaultClass: "C",
+          twoStep: ["set_data"],
         },
       ],
     };
@@ -135,6 +176,7 @@ describe("1. Реестр projectCalls и выбор строгого класс
           command: ["/usr/bin/node", "/new/server.js"],
           tools: { get_data: "C", set_data: "P" },
           defaultClass: "P",
+          twoStep: ["get_data", "set_data"],
         },
         {
           id: "analytics",
@@ -151,6 +193,7 @@ describe("1. Реестр projectCalls и выбор строгого класс
     expect(diff.some((d) => d.includes("добавлен коннектор «analytics»"))).toBe(true);
     expect(diff.some((d) => d.includes("класс ручки «get_data» изменён R → C"))).toBe(true);
     expect(diff.some((d) => d.includes("класс по умолчанию изменён C → P"))).toBe(true);
+    expect(diff).toContain("коннектор «crm»: двухшаговые ручки [set_data] → [get_data, set_data]");
   });
 });
 

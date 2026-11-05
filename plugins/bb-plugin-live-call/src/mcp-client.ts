@@ -17,10 +17,71 @@ export interface McpTool {
 export interface McpCallResult {
   ok: boolean;
   data?: { result: string };
+  raw?: unknown;
+  maskedFullText?: string;
   error?: {
     code: "connector_error" | "timeout" | "invalid_argument" | "connector_unavailable";
     message: string;
   };
+}
+
+/**
+ * Извлечение confirm_token из сырого ответа (§14.10 п. 3).
+ * Ищется в direct property, structuredContent (объект или JSON-строка),
+ * или в текстовых частях content (JSON или блок).
+ */
+export function extractConfirmToken(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+
+  const checkObj = (o: unknown): string | undefined => {
+    if (o && typeof o === "object") {
+      const rec = o as Record<string, unknown>;
+      if (typeof rec.confirm_token === "string" && rec.confirm_token) return rec.confirm_token;
+    }
+    return undefined;
+  };
+
+  const direct = checkObj(obj);
+  if (direct) return direct;
+
+  if (obj.structuredContent !== undefined) {
+    const fromSc = checkObj(obj.structuredContent);
+    if (fromSc) return fromSc;
+    if (typeof obj.structuredContent === "string") {
+      try {
+        const parsed = JSON.parse(obj.structuredContent);
+        const fromParsed = checkObj(parsed);
+        if (fromParsed) return fromParsed;
+      } catch {}
+    }
+  }
+
+  if (Array.isArray(obj.content)) {
+    for (const item of obj.content) {
+      const fromItem = checkObj(item);
+      if (fromItem) return fromItem;
+      if (item && typeof item === "object" && typeof item.text === "string") {
+        try {
+          const parsed = JSON.parse(item.text);
+          const fromText = checkObj(parsed);
+          if (fromText) return fromText;
+        } catch {}
+        const jsonMatch = item.text.match(/\{[\s\S]*"confirm_token"\s*:\s*"([^"]+)"[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            const fromJsonMatch = checkObj(parsed);
+            if (fromJsonMatch) return fromJsonMatch;
+          } catch {
+            if (jsonMatch[1]) return jsonMatch[1];
+          }
+        }
+      }
+    }
+  }
+
+  return undefined;
 }
 
 export function makeConnectorToolName(connectorId: string, tool: string): string {
@@ -49,7 +110,7 @@ const SUPPORTED_PRIMITIVE_TYPES = new Set(["string", "number", "integer", "boole
  * Неподдержанные схемы ($ref, oneOf, allOf, иной anyOf, patternProperties, корень не object,
  * числовой enum, свойство без type) → null (§14.4, review п. 6).
  */
-export function toGeminiSchema(schema?: unknown): Record<string, unknown> | null {
+export function toGeminiSchema(schema?: unknown, isTwoStep = false): Record<string, unknown> | null {
   if (schema === undefined || schema === null) {
     return { type: "object", properties: {} };
   }
@@ -204,14 +265,20 @@ export function toGeminiSchema(schema?: unknown): Record<string, unknown> | null
   if (!root.properties) {
     root.properties = {};
   }
+  // Для двухшаговых ручек снимаем confirm и confirm_token из required ТОЛЬКО на корневом уровне (§14.10)
+  if (isTwoStep && Array.isArray(root.required)) {
+    root.required = (root.required as string[]).filter(
+      (k) => k !== "confirm" && k !== "confirm_token",
+    );
+  }
   return root;
 }
 
 /**
  * Обратная совместимость для вызова mcpSchemaToGeminiParameters.
  */
-export function mcpSchemaToGeminiParameters(schema?: Record<string, unknown>): Record<string, unknown> {
-  const res = toGeminiSchema(schema);
+export function mcpSchemaToGeminiParameters(schema?: Record<string, unknown>, isTwoStep = false): Record<string, unknown> {
+  const res = toGeminiSchema(schema, isTwoStep);
   return res ?? { type: "object", properties: {} };
 }
 
@@ -600,13 +667,14 @@ export class McpClient {
       }
       if (!text && isError) text = "ошибка выполнения инструмента";
 
-      // Фильтр секретов (§14.6)
-      text = maskSecrets(text, secretValues);
+      // Маскировка секретов до обрезки (§14.6, §14.10)
+      const maskedFull = maskSecrets(text, secretValues);
 
       // Сжатие до maxResultChars (по умолчанию 2000 символов, §15.2, §15.4 п. 5)
       const maxChars = this.config.maxResultChars ?? CONNECTOR_RESULT_MAX_CHARS_DEFAULT;
-      if (text.length > maxChars) {
-        text = text.slice(0, maxChars - 1) + "…";
+      let trimmed = maskedFull;
+      if (trimmed.length > maxChars) {
+        trimmed = trimmed.slice(0, maxChars - 1) + "…";
       }
 
       if (isError) {
@@ -614,14 +682,18 @@ export class McpClient {
           ok: false,
           error: {
             code: "connector_error",
-            message: text.slice(0, 500),
+            message: trimmed.slice(0, 500),
           },
+          raw: res,
+          maskedFullText: maskedFull,
         };
       }
 
       return {
         ok: true,
-        data: { result: text },
+        data: { result: trimmed },
+        raw: res,
+        maskedFullText: maskedFull,
       };
     } catch (e) {
       const rawMsg = String((e as Error)?.message ?? e);

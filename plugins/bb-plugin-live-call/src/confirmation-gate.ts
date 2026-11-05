@@ -498,6 +498,7 @@ export class ConfirmationGate {
 
   /** Вердикт зафиксирован, исполнение не требуется (отказ, отмена, истёк срок). */
   private burn(p: PendingConfirmation, verdict: Verdict): Verdict {
+    const isFirstVerdict = p.verdict === null;
     if (this.pending === p) this.pending = null;
     this.usedIds.add(p.confirmationId);
     this.recentVerdicts.set(p.argsHash, { verdict, at: this.clock.now() });
@@ -508,6 +509,12 @@ export class ConfirmationGate {
       w.resolve(verdict);
     }
     this.confirmWaiters.delete(p.confirmationId);
+
+    if (verdict === "expired" && isFirstVerdict) {
+      p.verdict = "expired";
+      this.events.onVerdict?.(p, "expired");
+    }
+
     return verdict;
   }
 
