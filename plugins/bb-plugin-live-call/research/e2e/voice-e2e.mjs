@@ -220,8 +220,12 @@ if (SCENARIO === "general") {
   const confirm = await waitEvent("confirm", s.at, 30000);
   check("запрошено подтверждение", confirm, confirm?.p.tool ?? "");
   if (SCENARIO === "early" && confirm) {
-    // «да» во время филлера: 1,7 с после запроса — раньше, чем вопрос зазвучит
-    await sleep(Math.max(0, confirm.ts + 1700 - Date.now()));
+    // «да» во время филлера: как только браузер начал играть ответ модели после запроса (≥200 мс звука),
+    // а не через фиксированные 1,7 с — короткий филлер (~1,1 с) иначе успевает смениться вопросом.
+    for (let t0 = Date.now(); Date.now() - t0 < 4000; await sleep(50)) {
+      const played = await page.evaluate(([a, b]) => window.__lcPlayed(a, b), [confirm.ts, Date.now()]);
+      if (played >= 200) break;
+    }
     const heardBefore = events("question_heard")[0];
     const early = await say("da");
     await sleep(2500);
