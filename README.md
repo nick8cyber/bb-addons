@@ -122,6 +122,29 @@ bb speak status
 
 Details in [plugins/bb-plugin-speak/README.md](plugins/bb-plugin-speak/README.md).
 
+### `live-call` 📞 — live voice calls (beta)
+
+A live voice call with the bb coordinator over the Gemini Live API: talk, interrupt,
+and let it read threads, message agents, and start them — the last only after you
+say «запускай». The call is relayed by the bb server, so Google sees the bb host,
+never your device. One `gemini-3.8-live` session with tools (Extended is off, ADR-0006
+rev. 2). Three kinds of call: to the coordinator, about a thread, and about a project
+with its MCP connectors from an owner-approved registry. Every write is confirmed by a
+server-side gate (voice «да» / buttons); confirmation rules and accepted residual risks
+are in ADR-0012.
+
+```bash
+bb call status
+bb call connectors --project <id>   # start a project's MCP connectors without a call and list their tools
+```
+
+Two Gemini API keys go into the plugin's secret setting at install; nothing else is needed.
+
+[Spec](docs/specs/live-call.md),
+[contract](docs/specs/live-call-contract.md),
+ADRs [0005](docs/adr/0005-live-call-server-relay.md)–[0012](docs/adr/0012-live-call-voice-confirmation-rules.md),
+[plugin README](plugins/bb-plugin-live-call/README.md).
+
 ### `sidebar-collapse`
 
 The sidebar keeps the first five chats of every project and folds the rest

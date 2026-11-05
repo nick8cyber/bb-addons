@@ -1,0 +1,613 @@
+/** Тесты ConfirmationGate: шлюз микрофона, окно, одноразовость, дедупликация. */
+import { describe, expect, it } from "vitest";
+import { ConfirmationGate, argsHash, type GateClock } from "../src/confirmation-gate.js";
+import { DEFAULT_WORDS } from "../src/classify.js";
+
+/** Часы без реального времени: setTimeout только по продвижению. */
+function fakeClock() {
+  let now = 1_000_000;
+  const timers: Array<{ at: number; fn: () => void }> = [];
+  const clock: GateClock = {
+    now: () => now,
+    setTimeout(fn, ms) {
+      timers.push({ at: now + ms, fn });
+      return timers.length;
+    },
+    clearTimeout(handle) {
+      const i = Number(handle) - 1;
+      if (timers[i]) timers.splice(i, 1);
+    },
+  };
+  return {
+    clock,
+    advance(ms: number) {
+      now += ms;
+      const due = timers.filter((t) => t.at <= now);
+      for (const t of due) t.fn();
+      for (let i = timers.length - 1; i >= 0; i--) {
+        if (due.includes(timers[i])) timers.splice(i, 1);
+      }
+    },
+    get now() {
+      return now;
+    },
+  };
+}
+
+function openWindow(gate: ConfirmationGate, t: ReturnType<typeof fakeClock>) {
+  // Модель задала вопрос: 48 000 байт = 1 с аудио. Оценка сервера:
+  // first + 1000 мс аудио + 1000 мс запас + 300 мс отступ ≈ 2,3 с от первого кадра.
+  gate.onModelAudio(1, 48000, t.now);
+  t.advance(300);
+  gate.onPlaybackDrained(1, t.now);
+  t.advance(2100);
+  return gate;
+}
+
+describe("request: pending, повторы и дедупликация", () => {
+  it("создаёт pending; повтор с тем же argsHash возвращает ту же запись", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    const r1 = gate.request("start_thread", { project: "A", task: "x" }, "L", "скажи запускай");
+    const r2 = gate.request("start_thread", { task: "x", project: "A" }, "L", "скажи запускай");
+    expect("pending" in r1).toBe(true);
+    expect("pending" in r2).toBe(true);
+    if ("pending" in r1 && "pending" in r2) {
+      expect(r2.pending.confirmationId).toBe(r1.pending.confirmationId);
+    }
+  });
+
+  it("другой вызов записи, пока ждёт подтверждение, отклоняется", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    const r = gate.request("stop_thread", { thread: "t1" }, "C", "s");
+    expect(r).toEqual({ rejected: "pending_exists", message: "сначала ответь на текущее подтверждение" });
+  });
+
+  it("после approved тот же argsHash в течение 5 мин — «уже выполнено», без нового pending", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    const r1 = gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    if (!("pending" in r1)) throw new Error("no pending");
+    gate.decide(r1.pending.confirmationId, "approve");
+    gate.consume(r1.pending.confirmationId);
+    const r2 = gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    expect(r2).toEqual({ rejected: "recent_verdict", message: "уже выполнено, больше не вызывай" });
+    t.advance(6 * 60_000);
+    const r3 = gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    expect("pending" in r3).toBe(true);
+  });
+});
+
+describe("шлюз микрофона и окно ответа (§7.1 п. 3)", () => {
+  it("микрофон открыт и во время вопроса — его можно перебить (решение владельца 04.11)", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    expect(gate.isMicOpen()).toBe(true);
+    expect(gate.windowOpen()).toBe(false);
+    openWindow(gate, t);
+    expect(gate.isMicOpen()).toBe(true);
+    expect(gate.windowOpen()).toBe(true);
+  });
+
+  describe("перебивание вопроса", () => {
+    const setup = (cls: "C" | "L" = "C", say = "Отправить в тред: «Уведомления о сбоях куратору»?") => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.request("thread_send", { text: "Уведомления о сбоях куратору" }, cls, say);
+      gate.onModelAudio(1, 4800, t.now); // первые 0,1 с звука — уже вопрос
+      gate.onModelTranscript(say, t.now); // текст вопроса пришёл вместе с ними
+      gate.onModelAudio(1, 48000 * 5, t.now); // вопрос звучит ещё 5 с, окно не открыто
+      t.advance(1000);
+      const sayNow = (text: string, afterMs: number) => {
+        t.advance(afterMs);
+        gate.onOwnerTranscriptChunk(text, t.now);
+        t.advance(800);
+      };
+      return { t, gate, verdicts, sayNow };
+    };
+
+    it("«да» посреди вопроса засчитывается сразу", () => {
+      const { gate, verdicts, sayNow } = setup();
+      sayNow("Да.", 2000);
+      expect(verdicts).toEqual(["approved"]);
+      expect(gate.windowOpen()).toBe(false);
+    });
+
+    it("«да» во время филлера не засчитывается, даже если текст вопроса уже пришёл (звук отстаёт)", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.request("thread_answer", { answer: "зелёный" }, "C", "Ответить агенту: «зелёный»?");
+      // Gemini генерирует быстрее реального времени: за 0,3 с пришли 3 с филлера и текст вопроса.
+      gate.onModelAudio(1, 48000 * 3, t.now);
+      gate.onModelTranscript("Секунду, передаю ваш выбор агенту зелёный.", t.now); // филлер повторяет аргумент
+      t.advance(300);
+      gate.onModelTranscript("Ответить агенту: «зелёный»?", t.now);
+      gate.onModelAudio(1, 48000 * 2, t.now);
+      // 2 с от запроса: в динамике ещё филлер — «да» не ответ
+      t.advance(1700);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual([]);
+      // 4 с: вопрос звучит (3 с филлера + 0,5 с запаса прошли) — «да» владельца (кусок через 2 с) засчитывается
+      t.advance(3200);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual(["approved"]);
+    });
+
+    it("филлер до вызова ещё доигрывает — «да» в это время не засчитывается", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.onModelAudio(7, 48000 * 2, t.now); // «Да, сейчас отправлю…» — 2 с звука до запроса
+      t.advance(200);
+      gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      t.advance(100);
+      gate.onModelAudio(8, 4800, t.now);
+      gate.onModelTranscript("Отправить в тред: «x»?", t.now);
+      gate.onModelAudio(8, 48000 * 2, t.now);
+      t.advance(1500); // 1,8 с от начала филлера: он ещё звучит
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual([]);
+      t.advance(3000); // 3,6 с: филлер доиграл, вопрос звучит; кусок владельца через 2 с
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual(["approved"]);
+    });
+
+    it("эхо вопроса из динамиков не решает ничего", () => {
+      const { gate, verdicts, sayNow } = setup();
+      sayNow("уведомления о сбоях", 2000);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
+    it("модель сказала вопрос своими словами («Да, конечно…») — эхо этих слов не подтверждает", () => {
+      const { gate, verdicts, sayNow } = setup();
+      gate.onModelTranscript("Да, конечно. Отправить в тред?");
+      sayNow("да конечно", 2000);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
+    it("филлер модели до вызова («Да, сейчас отправлю») — его эхо после запроса не подтверждает", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.onModelTranscript("Да, сейчас отправлю", t.now);
+      t.advance(500);
+      gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      t.advance(2000);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
+    it("старая речь модели (раньше 15 с до запроса) не мешает настоящему «да»", () => {
+      const t = fakeClock();
+      const verdicts: string[] = [];
+      const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, { onVerdict: (_p, v) => verdicts.push(v) });
+      gate.onModelTranscript("Да, всё понятно", t.now);
+      t.advance(20_000);
+      gate.request("thread_send", { text: "x" }, "C", "Отправить в тред: «x»?");
+      gate.onModelAudio(1, 4800, t.now);
+      gate.onModelTranscript("Отправить в тред: «x»?", t.now);
+      t.advance(3500);
+      gate.onOwnerTranscriptChunk("да", t.now);
+      t.advance(800);
+      expect(verdicts).toEqual(["approved"]);
+    });
+
+    it("отказ и шум во время вопроса не отменяют — отказ после вопроса или кнопкой", () => {
+      const { gate, verdicts, sayNow } = setup();
+      sayNow("отмена", 2000);
+      sayNow("ну что там такое вообще происходит", 1000);
+      expect(verdicts).toEqual([]);
+      expect(gate.pendingConfirmation()).not.toBeNull();
+    });
+
+    it("«да» раньше 1,5 с от запроса — хвост просьбы владельца, не ответ", () => {
+      const { verdicts, sayNow } = setup();
+      sayNow("да", 200); // 1,2 с от запроса (setup уже сдвинул часы на 1 с)
+      expect(verdicts).toEqual([]);
+    });
+
+    it("запуск (L): перебить можно только «запускай», одно «да» не запускает", () => {
+      const { verdicts, sayNow } = setup("L", "Запустить агента в «A»: «x»?");
+      sayNow("да", 2000);
+      expect(verdicts).toEqual([]);
+      sayNow("запускай", 1000);
+      expect(verdicts).toEqual(["approved"]);
+    });
+  });
+
+  it("окно не открывается по turnComplete без playback_drained", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    gate.onModelAudio(1, 48000, t.now);
+    t.advance(3000);
+    gate.tick();
+    expect(gate.windowOpen()).toBe(false);
+  });
+
+  it("playback_drained потерян — окно открывается по резервной оценке, «запускай» засчитывается", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    gate.onModelAudio(1, 48000, t.now);
+    // 1 с аудио + 1 с запас оценки + 2,5 с резерв
+    t.advance(4600);
+    gate.tick();
+    t.advance(400);
+    expect(gate.windowOpen()).toBe(true);
+    expect(gate.isMicOpen()).toBe(true);
+    gate.onOwnerTranscriptChunk("запускай", t.now);
+    t.advance(800);
+    expect(gate.pendingConfirmation()?.verdict).toBe("approved");
+  });
+
+  it("реплика, начатая до открытия окна, не идёт в зачёт даже с хвостом после", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    gate.onModelAudio(1, 48000, t.now);
+    gate.onOwnerTranscriptChunk("за", t.now + 100); // ещё до окна
+    t.advance(300);
+    gate.onPlaybackDrained(1, t.now);
+    t.advance(400);
+    gate.onOwnerTranscriptChunk("пускай", t.now); // хвост опоздавшей речи
+    t.advance(800); // конец реплики по тишине
+    expect(gate.pendingConfirmation()?.verdict).toBeNull();
+  });
+
+  it("«запускай» после открытия окна — approved", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    openWindow(gate, t);
+    gate.onOwnerTranscriptChunk("зап", t.now);
+    gate.onOwnerTranscriptChunk("ускай", t.now);
+    t.advance(800);
+    expect(gate.pendingConfirmation()?.verdict).toBe("approved");
+  });
+
+  it("«да» на запуск — hint: pending жив, микрофон снова закрыт до подсказки", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    openWindow(gate, t);
+    gate.onOwnerUtteranceEnd("да", t.now, t.now);
+    expect(gate.pendingConfirmation()).not.toBeNull();
+    expect(gate.isMicOpen()).toBe(false);
+    // Подсказка прозвучала: окно переоткрывается по правилу п. 3.
+    gate.onModelAudio(2, 24000, t.now);
+    t.advance(300);
+    gate.onPlaybackDrained(2, t.now);
+    t.advance(1900);
+    const pcm = new Uint8Array(8 * 640);
+    const view = new DataView(pcm.buffer);
+    for (let b = 0; b < 8; b++) view.setInt16(b * 640, 1000, true);
+    gate.recordOwnerSpeech(pcm);
+    gate.onOwnerUtteranceEnd("запускай", t.now, t.now);
+    expect(gate.pendingConfirmation()?.verdict).toBe("approved");
+  });
+
+  it("«нет» после вопроса — отмена, запись сгорает", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    openWindow(gate, t);
+    gate.onOwnerUtteranceEnd("нет", t.now, t.now);
+    expect(gate.pendingConfirmation()).toBeNull();
+  });
+
+  it("TTL 60 с — expired", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    t.advance(61_000);
+    gate.tick();
+    expect(gate.pendingConfirmation()).toBeNull();
+  });
+});
+
+describe("кнопки и одноразовость", () => {
+  it("кнопка «Подтвердить» = approved, consume() сжигает id", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    const r = gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    if (!("pending" in r)) throw new Error("no pending");
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("approved");
+    gate.consume(r.pending.confirmationId);
+    expect(gate.pendingConfirmation()).toBeNull();
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("expired");
+  });
+
+  it("confirm_action с чужим id — not_confirmed, с использованным — expired", async () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    expect(await gate.confirmAction("cf_nope")).toBe("not_confirmed");
+    const r = gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    if (!("pending" in r)) throw new Error("no pending");
+    gate.decide(r.pending.confirmationId, "approve");
+    gate.consume(r.pending.confirmationId);
+    expect(await gate.confirmAction(r.pending.confirmationId)).toBe("expired");
+  });
+
+  it("повторный decide() при уже вынесенном вердикте не вызывает onVerdict повторно (§12.10.5)", () => {
+    const t = fakeClock();
+    let verdictCount = 0;
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: () => {
+        verdictCount++;
+      },
+    });
+    const r = gate.request("start_thread", { project: "A", task: "x" }, "L", "s");
+    if (!("pending" in r)) throw new Error("no pending");
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("approved");
+    expect(verdictCount).toBe(1);
+
+    // Второй вызов decide до сжигания: вердикт уже вынесен, onVerdict не вызывается повторно
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("approved");
+    expect(verdictCount).toBe(1);
+  });
+});
+
+describe("argsHash", () => {
+  it("не зависит от порядка ключей", () => {
+    expect(argsHash("t", { a: 1, b: { c: 2, d: 3 } })).toBe(argsHash("t", { b: { d: 3, c: 2 }, a: 1 }));
+  });
+  it("разные аргументы — разный хеш", () => {
+    expect(argsHash("t", { a: 1 })).not.toBe(argsHash("t", { a: 2 }));
+  });
+});
+
+describe("кнопки подтверждения (аудит PLUG-108)", () => {
+  it("«Отмена» сразу снимает ожидание: микрофон открыт, следующая запись не получает pending_exists", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    const r = gate.request("send_to_thread", { thread: "A", text: "x" }, "C", "отправить?");
+    expect("pending" in r).toBe(true);
+    if (!("pending" in r)) return;
+    expect(gate.decide(r.pending.confirmationId, "cancel")).toBe("cancelled");
+    expect(gate.pendingConfirmation()).toBeNull();
+    expect(gate.isMicOpen()).toBe(true);
+    const r2 = gate.request("send_to_thread", { thread: "B", text: "y" }, "C", "отправить?");
+    expect("pending" in r2).toBe(true);
+  });
+
+  it("«Подтвердить» кнопкой сразу открывает микрофон, не дожидаясь конца исполнения", () => {
+    const t = fakeClock();
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock);
+    const r = gate.request("send_to_thread", { thread: "A", text: "x" }, "C", "отправить?");
+    if (!("pending" in r)) throw new Error("нет pending");
+    expect(gate.decide(r.pending.confirmationId, "approve")).toBe("approved");
+    expect(gate.isMicOpen()).toBe(true);
+  });
+});
+
+describe("доработка по голосовой приёмке (PLUG-119)", () => {
+  it("barge: «да» сразу после 2 слов объекта → via='barge'", () => {
+    const t = fakeClock();
+    const verdicts: Array<{ verdict: string; via?: string; utteranceAt?: number }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via, utteranceAt) => verdicts.push({ verdict: v, via, utteranceAt }),
+    });
+    // Шаблон: "Отправить в тред:", объект: "«Секретное сообщение»"
+    gate.request("thread_send", { text: "Секретное сообщение" }, "C", "Отправить в тред: «Секретное сообщение»?");
+    // 100 мс аудио
+    gate.onModelAudio(1, 4800, t.now);
+    // Модель произнесла вопрос: 2 слова объекта "секретное сообщение"
+    gate.onModelTranscript("Отправить в тред: «Секретное сообщение»?", t.now);
+    // Аудио вопроса ещё звучит 5 с
+    gate.onModelAudio(1, 48000 * 5, t.now);
+    // Владелец перебивает: "да" сразу после звука объекта (t.now + 3500)
+    t.advance(3500);
+    gate.onOwnerTranscriptChunk("да", t.now);
+    t.advance(800);
+    expect(verdicts.length).toBe(1);
+    expect(verdicts[0].verdict).toBe("approved");
+    expect(verdicts[0].via).toBe("barge");
+    expect(verdicts[0].utteranceAt).toBe(t.now - 800 - 2000);
+  });
+
+  it("echo: шум «at»/«A»/«Прошу» в окне → onUnrecognized, затем «отмена» → cancelled", () => {
+    const t = fakeClock();
+    const unrecognized: string[] = [];
+    const verdicts: Array<{ verdict: string; via?: string }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via) => verdicts.push({ verdict: v, via }),
+      onUnrecognized: (p) => unrecognized.push(p.confirmationId),
+    });
+    gate.request("thread_send", { text: "отчёт" }, "C", "Отправить в тред: «отчёт»?");
+    openWindow(gate, t);
+    expect(gate.windowOpen()).toBe(true);
+
+    // 1. В микрофон попал одиночный шум (например, "at" или "A" или "Прошу")
+    gate.onOwnerTranscriptChunk("at", t.now);
+    t.advance(800);
+    expect(unrecognized.length).toBe(1);
+    expect(verdicts).toEqual([]);
+    expect(gate.pendingConfirmation()?.verdict).toBeNull();
+    // Окно закрыто в ожидании повтора
+    expect(gate.isMicOpen()).toBe(false);
+
+    // 2. Модель повторила вопрос
+    gate.onModelAudio(2, 48000, t.now);
+    gate.onModelTranscript("Отправить в тред: «отчёт»?", t.now);
+    t.advance(300);
+    gate.onPlaybackDrained(2, t.now);
+    t.advance(2100);
+    expect(gate.windowOpen()).toBe(true);
+    expect(gate.isMicOpen()).toBe(true);
+
+    // 3. Владелец говорит «отмена»
+    gate.onOwnerTranscriptChunk("отмена", t.now);
+    t.advance(800);
+    expect(verdicts).toEqual([{ verdict: "cancelled", via: "window" }]);
+    expect(gate.pendingConfirmation()).toBeNull();
+  });
+
+  it("второе одиночное нераспознанное слово в окне → cancelled", () => {
+    const t = fakeClock();
+    let unrecognizedCount = 0;
+    const verdicts: Array<{ verdict: string; via?: string }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via) => verdicts.push({ verdict: v, via }),
+      onUnrecognized: () => unrecognizedCount++,
+    });
+    gate.request("thread_send", { text: "отчёт" }, "C", "Отправить в тред: «отчёт»?");
+    openWindow(gate, t);
+
+    // 1-й шум
+    gate.onOwnerTranscriptChunk("A", t.now);
+    t.advance(800);
+    expect(unrecognizedCount).toBe(1);
+    expect(verdicts).toEqual([]);
+
+    // Повтор вопроса переоткрывает окно
+    gate.onModelAudio(2, 48000, t.now);
+    gate.onModelTranscript("Отправить в тред: «отчёт»?", t.now);
+    t.advance(300);
+    gate.onPlaybackDrained(2, t.now);
+    t.advance(2100);
+    expect(gate.windowOpen()).toBe(true);
+
+    // 2-й шум
+    gate.onOwnerTranscriptChunk("Прошу", t.now);
+    t.advance(800);
+    expect(verdicts).toEqual([{ verdict: "cancelled", via: "window" }]);
+  });
+
+  it("быстрое «нет» через 0,3 с после звука вопроса, кусок через 2 с → cancelled (via='window')", () => {
+    const t = fakeClock();
+    const verdicts: Array<{ verdict: string; via?: string; utteranceAt?: number }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via, utteranceAt) => verdicts.push({ verdict: v, via, utteranceAt }),
+    });
+    gate.request("thread_send", { text: "сообщение" }, "C", "Отправить в тред: «сообщение»?");
+    // Звук вопроса доиграл
+    gate.onModelAudio(1, 48000, t.now);
+    gate.onModelTranscript("Отправить в тред: «сообщение»?", t.now);
+    t.advance(300);
+    gate.onPlaybackDrained(1, t.now);
+    t.advance(2100);
+    expect(gate.windowOpen()).toBe(true);
+
+    // Владелец сказал «нет» через 0.3 с (300 мс) после открытия окна,
+    // но транскрипт STT доставляется через 2000 мс (INPUT_TRANSCRIPT_LAG_MS)
+    t.advance(2000);
+    gate.onOwnerTranscriptChunk("нет", t.now);
+    t.advance(800);
+
+    expect(verdicts.length).toBe(1);
+    expect(verdicts[0].verdict).toBe("cancelled");
+    expect(verdicts[0].via).toBe("window");
+  });
+
+  it("«разрешаю» после «Одобрить запрос агента в «...»?» → approved (класс P)", () => {
+    const t = fakeClock();
+    const verdicts: Array<{ verdict: string; via?: string }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via) => verdicts.push({ verdict: v, via }),
+    });
+    gate.request("answer_interaction", { thread: "t123" }, "P", "Одобрить запрос агента в «t123»?");
+    openWindow(gate, t);
+    gate.onOwnerTranscriptChunk("разрешаю", t.now);
+    t.advance(800);
+    expect(verdicts).toEqual([{ verdict: "approved", via: "window" }]);
+  });
+
+  it("эхо «запусти» в окне после «Запустить агента...» → вердикта нет (остаётся в listening, реплика проглочена)", () => {
+    const t = fakeClock();
+    const verdicts: string[] = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v) => verdicts.push(v),
+    });
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "Запустить агента в «A»: «x»?");
+    openWindow(gate, t);
+    expect(gate.windowOpen()).toBe(true);
+
+    // В микрофон попадает эхо вопроса («запусти» от «Запустить»)
+    gate.onOwnerTranscriptChunk("запусти", t.now);
+    t.advance(800);
+
+    expect(verdicts).toEqual([]);
+    expect(gate.pendingConfirmation()).not.toBeNull();
+    expect(gate.pendingConfirmation()?.verdict).toBeNull();
+  });
+
+  it("одиночный отказ «отставить» → cancelled (не шум!)", () => {
+    const t = fakeClock();
+    let unrecognizedCount = 0;
+    const verdicts: Array<{ verdict: string; via?: string }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via) => verdicts.push({ verdict: v, via }),
+      onUnrecognized: () => unrecognizedCount++,
+    });
+    gate.request("start_thread", { project: "A", task: "x" }, "L", "Запустить агента в «A»: «x»?");
+    openWindow(gate, t);
+
+    gate.onOwnerTranscriptChunk("отставить", t.now);
+    t.advance(800);
+
+    expect(unrecognizedCount).toBe(0);
+    expect(verdicts).toEqual([{ verdict: "cancelled", via: "window" }]);
+    expect(gate.pendingConfirmation()).toBeNull();
+  });
+
+  it("ответ из нескольких слов латиницей без согласия → cancelled", () => {
+    const t = fakeClock();
+    const verdicts: Array<{ verdict: string; via?: string }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via) => verdicts.push({ verdict: v, via }),
+    });
+    gate.request("thread_send", { text: "msg" }, "C", "Отправить в тред: «msg»?");
+    openWindow(gate, t);
+
+    gate.onOwnerTranscriptChunk("what are you doing here", t.now);
+    t.advance(800);
+
+    expect(verdicts).toEqual([{ verdict: "cancelled", via: "window" }]);
+  });
+
+  it("say без « (Одобрить запрос агента? / thread_stop) → question_heard не наступает, согласие только в окне", () => {
+    const t = fakeClock();
+    let heardCount = 0;
+    const verdicts: Array<{ verdict: string; via?: string }> = [];
+    const gate = new ConfirmationGate(DEFAULT_WORDS, t.clock, {
+      onVerdict: (_p, v, via) => verdicts.push({ verdict: v, via }),
+      onQuestionHeardAt: () => heardCount++,
+    });
+    // Без кавычек: "Одобрить запрос агента?"
+    gate.request("thread_answer", { answer: "yes" }, "P", "Одобрить запрос агента?");
+    gate.onModelAudio(1, 4800, t.now);
+    gate.onModelTranscript("Одобрить запрос агента?", t.now);
+    // question_heard не наступает
+    expect(heardCount).toBe(0);
+
+    // Во время воспроизведения (до окна) согласие не принимается
+    t.advance(3500);
+    gate.onOwnerTranscriptChunk("разрешаю", t.now);
+    t.advance(800);
+    expect(verdicts).toEqual([]);
+
+    // Окно открывается после playback_drained
+    gate.onPlaybackDrained(1, t.now);
+    t.advance(2100);
+    expect(gate.windowOpen()).toBe(true);
+
+    // В окне согласие принимается
+    gate.onOwnerTranscriptChunk("разрешаю", t.now);
+    t.advance(800);
+    expect(verdicts).toEqual([{ verdict: "approved", via: "window" }]);
+  });
+});

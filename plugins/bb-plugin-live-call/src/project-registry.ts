@@ -1,0 +1,567 @@
+/**
+ * Реестр звонков по проектам (§15.2, §15.3, §15.8).
+ * Разбор, валидация, хеширование, диффы, вычисление строгого класса.
+ */
+import { createHash } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { z } from "zod";
+import type { CallStore } from "./call-store.js";
+import { maskSecrets } from "./secret-filter.js";
+
+export const toolClassSchema = z.enum(["R", "C", "P", "L", "deny"]);
+export type ProjectToolClass = z.infer<typeof toolClassSchema>;
+
+/** Для defaultClass R запрещён (§15.2): только C, P или deny. */
+export const defaultClassSchema = z.enum(["C", "P", "deny"]);
+export type ProjectDefaultClass = z.infer<typeof defaultClassSchema>;
+
+export const connectorTransportSchema = z.enum(["stdio", "http"]);
+export type ConnectorTransport = z.infer<typeof connectorTransportSchema>;
+
+export const CONNECTOR_RESULT_MAX_CHARS_DEFAULT = 2000;
+
+export const connectorConfigSchema = z
+  .object({
+    id: z.string().regex(/^[a-zA-Z0-9_]+$/, "id коннектора должен содержать только латинские буквы, цифры и подчёркивание").max(32),
+    transport: connectorTransportSchema,
+    command: z.array(z.string()).optional(),
+    url: z.string().optional(),
+    secrets: z.array(z.string()).optional(),
+    tools: z.record(z.string(), toolClassSchema).optional(),
+    defaultClass: defaultClassSchema,
+    maxResultChars: z.number().int().min(500).max(20000).optional(),
+    twoStep: z
+      .array(z.string())
+      .transform((arr) => Array.from(new Set(arr)).sort())
+      .optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.transport === "stdio") {
+      if (!data.command || data.command.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "stdio-коннектор требует непустой массив command",
+          path: ["command"],
+        });
+      } else if (!data.command[0].startsWith("/")) {
+        // §14.1: команда — абсолютный путь, без поиска по PATH (ревью PLUG-113)
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "stdio-коннектор: command[0] должен быть абсолютным путём (например /usr/bin/node)",
+          path: ["command", 0],
+        });
+      }
+    } else if (data.transport === "http") {
+      if (!data.url) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "http-коннектор требует url",
+          path: ["url"],
+        });
+      } else {
+        try {
+          const u = new URL(data.url);
+          const isHttps = u.protocol === "https:";
+          const isLocalHttp = u.protocol === "http:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost");
+          if (!isHttps && !isLocalHttp) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "http-коннектор разрешает только https:// или http://127.0.0.1 / http://localhost",
+              path: ["url"],
+            });
+          }
+        } catch {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "некорректный url",
+            path: ["url"],
+          });
+        }
+      }
+    }
+    if (data.twoStep) {
+      for (let i = 0; i < data.twoStep.length; i++) {
+        const toolName = data.twoStep[i];
+        if (!data.tools || !Object.hasOwn(data.tools, toolName)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `двухшаговая ручка «${toolName}» из twoStep отсутствует в tools коннектора «${data.id}»`,
+            path: ["twoStep", i],
+          });
+        } else if (data.tools[toolName] === "R") {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `двухшаговая ручка «${toolName}» коннектора «${data.id}» не может иметь класс R`,
+            path: ["twoStep", i],
+          });
+        }
+      }
+    }
+  });
+
+export type ConnectorConfig = z.infer<typeof connectorConfigSchema>;
+
+export const projectConfigSchema = z
+  .object({
+    title: z.string().min(1),
+    connectors: z.array(connectorConfigSchema),
+  })
+  .superRefine((data, ctx) => {
+    const ids = new Set<string>();
+    for (let i = 0; i < data.connectors.length; i++) {
+      const id = data.connectors[i].id;
+      if (ids.has(id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `дубликат id коннектора: «${id}»`,
+          path: ["connectors", i, "id"],
+        });
+      }
+      ids.add(id);
+    }
+  });
+
+export type ProjectConfig = z.infer<typeof projectConfigSchema>;
+
+export const projectRegistrySchema = z.record(z.string(), projectConfigSchema);
+export type ProjectRegistry = z.infer<typeof projectRegistrySchema>;
+
+export interface ProjectListItem {
+  projectId: string;
+  title: string;
+  state: "approved" | "pending" | "invalid" | "rejected";
+  hash?: string;
+  diff?: string[];
+  error?: string;
+  connectors?: ConnectorConfig[];
+}
+
+export function canonicalizeJson(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonicalizeJson);
+  if (v && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
+    const res: Record<string, unknown> = {};
+    for (const k of Object.keys(obj).sort()) {
+      res[k] = canonicalizeJson(obj[k]);
+    }
+    return res;
+  }
+  return v;
+}
+
+function normalizeProjectConfigTwoStep(cfg: unknown): unknown {
+  if (!cfg || typeof cfg !== "object") return cfg;
+  const obj = cfg as Record<string, unknown>;
+  if (Array.isArray(obj.connectors)) {
+    const connectors = obj.connectors.map((c) => {
+      if (c && typeof c === "object") {
+        const connObj = { ...(c as Record<string, unknown>) };
+        if (Array.isArray(connObj.twoStep)) {
+          connObj.twoStep = Array.from(new Set(connObj.twoStep.map(String))).sort();
+        }
+        return connObj;
+      }
+      return c;
+    });
+    return { ...obj, connectors };
+  }
+  return cfg;
+}
+
+export function hashProjectConfig(cfg: unknown): string {
+  const normalized = normalizeProjectConfigTwoStep(cfg);
+  return createHash("sha256").update(JSON.stringify(canonicalizeJson(normalized))).digest("hex");
+}
+
+/** Сравнение старой подтверждённой конфигурации и новой (§15.2, §16.7 п. 7). */
+export function computeProjectDiff(oldConfig: ProjectConfig | null, newConfig: ProjectConfig): string[] {
+  const diffs: string[] = [];
+  if (!oldConfig) {
+    const connDetails = newConfig.connectors.map((c) => {
+      const twoStepList = c.twoStep && c.twoStep.length > 0 ? `, двухшаговые ручки [${Array.from(new Set(c.twoStep)).sort().join(", ")}]` : "";
+      if (c.transport === "stdio") {
+        return `${c.id} (stdio: [${(c.command ?? []).join(" ")}]${twoStepList})`;
+      }
+      return `${c.id} (http: ${maskSecrets(c.url ?? "-")}${twoStepList})`;
+    });
+    diffs.push(`новый проект в реестре: коннекторы [${connDetails.join(", ")}]`);
+    return diffs;
+  }
+
+  if (oldConfig.title !== newConfig.title) {
+    diffs.push(`изменено название: «${oldConfig.title}» → «${newConfig.title}»`);
+  }
+
+  const oldMap = new Map(oldConfig.connectors.map((c) => [c.id, c]));
+  const newMap = new Map(newConfig.connectors.map((c) => [c.id, c]));
+
+  for (const [id, c] of newMap) {
+    if (!oldMap.has(id)) {
+      const twoStepList = c.twoStep && c.twoStep.length > 0 ? `, двухшаговые ручки [${Array.from(new Set(c.twoStep)).sort().join(", ")}]` : "";
+      const details = c.transport === "stdio" ? `stdio: [${(c.command ?? []).join(" ")}]${twoStepList}` : `http: ${maskSecrets(c.url ?? "-")}${twoStepList}`;
+      diffs.push(`добавлен коннектор «${id}» (${details})`);
+      continue;
+    }
+    const oldC = oldMap.get(id)!;
+    if (oldC.transport !== c.transport) {
+      diffs.push(`коннектор «${id}»: изменён транспорт ${oldC.transport} → ${c.transport}`);
+    }
+    if (JSON.stringify(oldC.command ?? []) !== JSON.stringify(c.command ?? [])) {
+      diffs.push(`коннектор «${id}»: изменена команда запуска [${(oldC.command ?? []).join(" ")}] → [${(c.command ?? []).join(" ")}]`);
+    }
+    if (oldC.url !== c.url) {
+      diffs.push(`коннектор «${id}»: изменён адрес ${maskSecrets(oldC.url ?? "-")} → ${maskSecrets(c.url ?? "-")}`);
+    }
+    if (JSON.stringify([...(oldC.secrets ?? [])].sort()) !== JSON.stringify([...(c.secrets ?? [])].sort())) {
+      diffs.push(`коннектор «${id}»: изменены секреты [${(oldC.secrets ?? []).join(", ")}] → [${(c.secrets ?? []).join(", ")}]`);
+    }
+    if (oldC.defaultClass !== c.defaultClass) {
+      diffs.push(`коннектор «${id}»: класс по умолчанию изменён ${oldC.defaultClass} → ${c.defaultClass}`);
+    }
+    const oldMax = oldC.maxResultChars ?? CONNECTOR_RESULT_MAX_CHARS_DEFAULT;
+    const newMax = c.maxResultChars ?? CONNECTOR_RESULT_MAX_CHARS_DEFAULT;
+    if (oldMax !== newMax) {
+      diffs.push(`коннектор «${id}»: изменён лимит ответа ${oldMax} → ${newMax}`);
+    }
+    const oldTwoStep = Array.from(new Set(oldC.twoStep ?? [])).sort();
+    const newTwoStep = Array.from(new Set(c.twoStep ?? [])).sort();
+    if (JSON.stringify(oldTwoStep) !== JSON.stringify(newTwoStep)) {
+      diffs.push(`коннектор «${id}»: двухшаговые ручки [${oldTwoStep.join(", ")}] → [${newTwoStep.join(", ")}]`);
+    }
+    const oldTools = oldC.tools as Record<string, ProjectToolClass> | undefined;
+    const newTools = c.tools as Record<string, ProjectToolClass> | undefined;
+    const allTools = new Set([...Object.keys(oldTools ?? {}), ...Object.keys(newTools ?? {})]);
+    for (const tool of allTools) {
+      const oldCls = oldTools?.[tool];
+      const newCls = newTools?.[tool];
+      if (oldCls === undefined && newCls !== undefined) {
+        diffs.push(`коннектор «${id}»: добавлена ручка «${tool}» (${newCls})`);
+      } else if (oldCls !== undefined && newCls === undefined) {
+        diffs.push(`коннектор «${id}»: удалена ручка «${tool}»`);
+      } else if (oldCls !== newCls) {
+        diffs.push(`коннектор «${id}»: класс ручки «${tool}» изменён ${oldCls} → ${newCls}`);
+      }
+    }
+  }
+
+  for (const id of oldMap.keys()) {
+    if (!newMap.has(id)) {
+      diffs.push(`удалён коннектор «${id}»`);
+    }
+  }
+
+  return diffs;
+}
+
+const CLASS_SEVERITY: Record<string, number> = {
+  R: 1,
+  C: 2,
+  P: 3,
+  L: 4,
+};
+
+/**
+ * Итоговый класс — строже из реестра и репо (§15.3: R < C < P < L).
+ * Режим deny всегда побеждает (запрещено).
+ */
+export function resolveStrictClass(
+  registryClass: ProjectToolClass,
+  repoClass?: "R" | "C" | "P" | "L",
+): ProjectToolClass {
+  if (registryClass === "deny") return "deny";
+  if (!CLASS_SEVERITY[registryClass]) return registryClass;
+  if (!repoClass || !CLASS_SEVERITY[repoClass]) return registryClass;
+  const regSev = CLASS_SEVERITY[registryClass];
+  const repoSev = CLASS_SEVERITY[repoClass];
+  return repoSev > regSev ? repoClass : registryClass;
+}
+
+export interface RepoProjectEnvironment {
+  promptMd?: string;
+  tools?: Record<string, "R" | "C" | "P" | "L">;
+}
+
+function safeReadFileBounded(filePath: string, projectRoot: string, maxBytes = 32768): string | null {
+  try {
+    if (!existsSync(projectRoot) || !existsSync(filePath)) return null;
+    const realRoot = realpathSync(projectRoot);
+
+    // Каталоги .bb и .bb/live-call и сам файл симлинками быть не могут (§15.3, PLUG-120 п. 9)
+    const dotBb = join(projectRoot, ".bb");
+    if (!existsSync(dotBb) || lstatSync(dotBb).isSymbolicLink()) return null;
+
+    const liveCallDir = join(dotBb, "live-call");
+    if (!existsSync(liveCallDir) || lstatSync(liveCallDir).isSymbolicLink()) return null;
+
+    if (lstatSync(filePath).isSymbolicLink()) return null;
+
+    const realFile = realpathSync(filePath);
+    if (!realFile.startsWith(realRoot + sep) && realFile !== realRoot) return null;
+
+    // Открытие с O_NOFOLLOW | O_NONBLOCK | O_RDONLY (§15.3)
+    const fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) return null;
+      const buf = Buffer.alloc(maxBytes);
+      const bytesRead = readSync(fd, buf, 0, maxBytes, 0);
+      return buf.subarray(0, bytesRead).toString("utf-8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Чтение файлов окружения проекта (§15.3, §16.7 п. 7).
+ * Читает только .bb/live-call/PROMPT.md (до 8000 символов) и tools.json (до 32 КБ).
+ * Не переходит по симлинкам; не читает устройства; не читает больше 32 КБ.
+ */
+export function readProjectRepoConfig(projectRoot: string): RepoProjectEnvironment {
+  const result: RepoProjectEnvironment = {};
+  if (!projectRoot || !existsSync(projectRoot)) return result;
+
+  const promptPath = join(projectRoot, ".bb", "live-call", "PROMPT.md");
+  const promptText = safeReadFileBounded(promptPath, projectRoot, 32768);
+  if (promptText !== null) {
+    result.promptMd = promptText.slice(0, 8000);
+  }
+
+  const toolsPath = join(projectRoot, ".bb", "live-call", "tools.json");
+  const toolsText = safeReadFileBounded(toolsPath, projectRoot, 32768);
+  if (toolsText !== null) {
+    try {
+      const parsed = JSON.parse(toolsText) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const clean: Record<string, "R" | "C" | "P" | "L"> = {};
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (v === "R" || v === "C" || v === "P" || v === "L") {
+            clean[k] = v;
+          }
+        }
+        result.tools = clean;
+      }
+    } catch {
+      // Игнорируем ошибки парсинга JSON
+    }
+  }
+
+  return result;
+}
+
+export class ProjectRegistryManager {
+  constructor(private store: CallStore) {}
+
+  parseRegistry(rawJson?: string | null): {
+    parsed: Record<string, ProjectConfig> | null;
+    rawObj?: Record<string, unknown>;
+    error?: string;
+  } {
+    if (!rawJson || !rawJson.trim()) {
+      return { parsed: {} };
+    }
+    let obj: unknown;
+    try {
+      obj = JSON.parse(rawJson);
+    } catch (e) {
+      return { parsed: null, error: `некорректный JSON в настройке projectCalls: ${String((e as Error)?.message ?? e)}` };
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+      return { parsed: null, error: "projectCalls должен быть объектом { <projectId>: { title, connectors } }" };
+    }
+    const res = projectRegistrySchema.safeParse(obj);
+    if (!res.success) {
+      const msg = res.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+      return { parsed: null, rawObj: obj as Record<string, unknown>, error: `ошибка валидации projectCalls: ${msg}` };
+    }
+    const parsedData = res.data as Record<string, ProjectConfig>;
+    for (const proj of Object.values(parsedData)) {
+      for (const conn of proj.connectors) {
+        if (conn.twoStep) {
+          conn.twoStep = Array.from(new Set(conn.twoStep)).sort();
+        }
+      }
+    }
+    return { parsed: parsedData, rawObj: obj as Record<string, unknown> };
+  }
+
+  listProjects(rawJson?: string | null): ProjectListItem[] {
+    const { parsed } = this.parseRegistry(rawJson);
+    if (parsed) {
+      // При удалении проекта из реестра снимок удаляется (§16.7 п. 2)
+      const approvedIds = this.store.listApprovedProjectIds();
+      for (const id of approvedIds) {
+        if (!parsed[id]) {
+          this.store.deleteApprovedProject(id);
+        }
+      }
+      const rejectedIds = this.store.listRejectedProjectIds();
+      for (const id of rejectedIds) {
+        if (!parsed[id]) {
+          this.store.deleteRejectedProject(id);
+        }
+      }
+    }
+    return this.listProjectsReadOnly(rawJson);
+  }
+
+  /**
+   * Чтение состояния реестра без мутаций хранилища (§14.8, review PLUG-117).
+   * Не удаляет снимки отсутствующих проектов и не меняет состояние SQLite.
+   * Валидирует каждую запись независимо, чтобы ошибки одного проекта не влияли на другие.
+   */
+  listProjectsReadOnly(rawJson?: string | null): ProjectListItem[] {
+    let rawObj: Record<string, unknown> | null = null;
+    try {
+      if (rawJson && rawJson.trim()) {
+        const parsedJson = JSON.parse(rawJson);
+        if (parsedJson && typeof parsedJson === "object" && !Array.isArray(parsedJson)) {
+          rawObj = parsedJson as Record<string, unknown>;
+        } else {
+          return [
+            {
+              projectId: "unknown",
+              title: "Некорректный реестр",
+              state: "invalid",
+              error: "projectCalls должен быть объектом { <projectId>: { title, connectors } }",
+            },
+          ];
+        }
+      } else {
+        return [];
+      }
+    } catch (e) {
+      return [
+        {
+          projectId: "unknown",
+          title: "Некорректный реестр",
+          state: "invalid",
+          error: `ошибка JSON: ${String((e as Error)?.message ?? e)}`,
+        },
+      ];
+    }
+
+    const items: ProjectListItem[] = [];
+    for (const [projectId, val] of Object.entries(rawObj)) {
+      const res = projectConfigSchema.safeParse(val);
+      if (!res.success) {
+        const title =
+          val && typeof val === "object" && "title" in val && typeof (val as any).title === "string"
+            ? (val as any).title
+            : projectId;
+        const msg = res.error.issues.map((i) => `${projectId}.${i.path.join(".")}: ${i.message}`).join("; ");
+        let fallbackConnectors: ConnectorConfig[] | undefined = undefined;
+        if (val && typeof val === "object" && Array.isArray((val as any).connectors)) {
+          fallbackConnectors = (val as any).connectors.map((c: any) => ({
+            id: typeof c?.id === "string" ? c.id : "unknown",
+            transport: c?.transport === "http" ? "http" : "stdio",
+            command: Array.isArray(c?.command) ? c.command : undefined,
+            url: typeof c?.url === "string" ? c.url : undefined,
+            defaultClass: c?.defaultClass ?? "C",
+          }));
+        }
+        items.push({
+          projectId,
+          title,
+          state: "invalid",
+          error: `ошибка валидации: ${msg}`,
+          connectors: fallbackConnectors,
+        });
+        continue;
+      }
+
+      const config = res.data;
+      const currentHash = hashProjectConfig(config);
+      const approved = this.store.getApprovedProject(projectId);
+      const rejected = this.store.getRejectedProject(projectId);
+
+      if (approved && approved.hash === currentHash) {
+        items.push({
+          projectId,
+          title: config.title,
+          state: "approved",
+          hash: currentHash,
+          connectors: config.connectors,
+        });
+      } else if (rejected && rejected.hash === currentHash) {
+        let oldConfig: ProjectConfig | null = null;
+        if (approved?.configJson) {
+          try {
+            oldConfig = JSON.parse(approved.configJson) as ProjectConfig;
+          } catch {
+            oldConfig = null;
+          }
+        }
+        const diff = computeProjectDiff(oldConfig, config);
+        items.push({
+          projectId,
+          title: config.title,
+          state: "rejected",
+          hash: currentHash,
+          diff,
+          connectors: config.connectors,
+        });
+      } else {
+        let oldConfig: ProjectConfig | null = null;
+        if (approved?.configJson) {
+          try {
+            oldConfig = JSON.parse(approved.configJson) as ProjectConfig;
+          } catch {
+            oldConfig = null;
+          }
+        }
+        const diff = computeProjectDiff(oldConfig, config);
+        items.push({
+          projectId,
+          title: config.title,
+          state: "pending",
+          hash: currentHash,
+          diff,
+          connectors: config.connectors,
+        });
+      }
+    }
+
+    return items;
+  }
+
+  approve(projectId: string, hash: string, rawJson?: string | null): { ok: boolean; error?: string } {
+    const { parsed, error } = this.parseRegistry(rawJson);
+    if (!parsed) return { ok: false, error: error ?? "некорректный реестр" };
+    const config = parsed[projectId];
+    if (!config) return { ok: false, error: `проект ${projectId} не найден в реестре` };
+    const currentHash = hashProjectConfig(config);
+    if (currentHash !== hash) {
+      return { ok: false, error: "stale" };
+    }
+    this.store.setApprovedProject(projectId, hash, JSON.stringify(config));
+    this.store.deleteRejectedProject(projectId);
+    return { ok: true };
+  }
+
+  reject(projectId: string, rawJson?: string | null): { ok: boolean } {
+    const { parsed } = this.parseRegistry(rawJson);
+    if (parsed && parsed[projectId]) {
+      const hash = hashProjectConfig(parsed[projectId]);
+      this.store.setRejectedProject(projectId, hash);
+    }
+    return { ok: true };
+  }
+
+  getApprovedConfig(projectId: string): {
+    config: ProjectConfig;
+    hash: string;
+  } | null {
+    const approved = this.store.getApprovedProject(projectId);
+    if (!approved) return null;
+    try {
+      const config = JSON.parse(approved.configJson) as ProjectConfig;
+      return { config, hash: approved.hash };
+    } catch {
+      return null;
+    }
+  }
+}

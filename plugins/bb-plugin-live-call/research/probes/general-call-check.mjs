@@ -1,0 +1,48 @@
+/**
+ * Живая проверка обычного звонка после отключения Extended (ADR-0006, пересмотр 2).
+ * node research/probes/general-call-check.mjs ["вопрос"] — кадр text, без синтеза речи.
+ * Печатает режим, реплики голоса, инструменты; ищет «системная ошибка». Запускать фоном, перед — bb call status.
+ */
+import { execSync as __exec } from "node:child_process";
+const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
+const WS_URL = "ws://127.0.0.1:38886/api/v1/plugins/live-call/http/call";
+const question = process.argv[2] || "Привет. Расскажи подробно по каждому проекту в BB, что там происходит.";
+const t0 = Date.now();
+const log = (...a) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...a);
+const ws = new WebSocket(WS_URL);
+let asked = false;
+let lastAgent = Date.now();
+let sysErr = false;
+let prefaceAt = 0;
+let prefaceText = "";
+let firstAudioAfterPreface = 0;
+const finish = () => {
+  log(`RESULT systemError=${sysErr}`);
+  try { ws.send(JSON.stringify({ type: "end" })); } catch {}
+  setTimeout(() => process.exit(sysErr ? 1 : 0), 2000);
+};
+setTimeout(finish, 150_000);
+setInterval(() => { if (asked && Date.now() - lastAgent > 15_000) finish(); }, 1000);
+ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1, token: TOKEN }));
+ws.onmessage = (ev) => {
+  if (typeof ev.data !== "string") {
+    lastAgent = Date.now();
+    // реальная пауза: первый звук голоса после законченного вступления
+    if (prefaceAt && !firstAudioAfterPreface && Date.now() - prefaceAt > 300) { firstAudioAfterPreface = Date.now(); log(`первый звук после реплики «${prefaceText.slice(0, 60)}» через ${((firstAudioAfterPreface - prefaceAt) / 1000).toFixed(1)} с`); }
+    return;
+  }
+  const f = JSON.parse(ev.data);
+  if (f.type === "transcript" && f.role === "agent") lastAgent = Date.now();
+  if (f.type === "ready") {
+    log("ready mode=" + f.mode, f.callId);
+    setTimeout(() => { asked = true; lastAgent = Date.now(); ws.send(JSON.stringify({ type: "text", text: question })); }, 3000);
+  }
+  if (f.type === "transcript" && f.final && f.role === "agent") {
+    lastAgent = Date.now();
+    if (/системн\S* ошибк/i.test(f.text)) sysErr = true;
+    log("[agent]", String(f.text).slice(0, 220));
+    if (!prefaceAt) { prefaceAt = Date.now(); prefaceText = String(f.text); }
+  }
+  if (f.type === "action") log("[action]", f.tool, f.status);
+  if (f.type === "error") log("[error]", f.code, f.message);
+};

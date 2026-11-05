@@ -1,0 +1,28 @@
+{
+  "name": "bb-plugin-live-call-spike",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "description": "Throwaway spike: can a Live Call be a BB thread with a native transcript?",
+  "engines": {
+    "bb": ">=0.40",
+    "bbPluginSdk": ">=0.4.21"
+  },
+  "bb": {
+    "name": "Live Call spike",
+    "description": "Spike for live-call thread transcript",
+    "server": "./server.ts",
+    "host": "./host.ts",
+    "branding": {
+      "icon": "./icons/call.svg"
+    }
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "0.4.87",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

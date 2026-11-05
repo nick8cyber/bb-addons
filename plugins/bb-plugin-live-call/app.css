@@ -1,0 +1,849 @@
+/* MARKER-TEST */
+.lc-marker-test { color: red; }
+/*
+ * Live Call — стили звонка. Только токены темы BB: цвета, шрифт, радиус и тени
+ * следуют выбранной теме и светлой/тёмной схеме. Свои значения — только
+ * размеры и цвет «думаю» (в палитре BB нет фиолетового).
+ */
+
+.lc-root {
+  --lc-think: color-mix(in srgb, #a78bfa 75%, var(--foreground) 25%);
+  --lc-hover: var(--state-hover, var(--accent));
+  --lc-radius: calc(var(--radius, 0.5rem) + 4px);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--popover-foreground, var(--foreground));
+  -webkit-font-smoothing: antialiased;
+}
+.lc-root *,
+.lc-root *::before,
+.lc-root *::after {
+  box-sizing: border-box;
+}
+.lc-root button {
+  font: inherit;
+  color: inherit;
+}
+
+/* ── поверхность дока и пилюли ─────────────────────────────── */
+.lc-dock,
+.lc-pill,
+.lc-mbar {
+  position: fixed;
+  z-index: 40;
+  background: var(--popover);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg, 0 12px 32px rgb(0 0 0 / 0.28));
+}
+.lc-dock {
+  right: 16px;
+  bottom: 16px;
+  width: 380px;
+  max-width: calc(100vw - 32px);
+  max-height: min(560px, calc(100vh - 32px));
+  border-radius: var(--lc-radius);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: lc-in 0.16s ease-out;
+}
+@keyframes lc-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.lc-dock__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 10px 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.lc-dock__title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.lc-state {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lc-state--lg {
+  font-size: 18px;
+}
+.lc-sub {
+  white-space: nowrap;
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.lc-grow {
+  flex: 1;
+  min-width: 0;
+}
+.lc-muted {
+  color: var(--muted-foreground);
+}
+.lc-ok {
+  color: var(--success);
+}
+.lc-bad {
+  color: var(--destructive-text, var(--destructive));
+}
+
+/* ── шар состояния ───────────────────────────────────────── */
+.lc-orb {
+  --c: var(--primary);
+  flex: none;
+  display: inline-block;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--c) 45%, white), var(--c) 62%, color-mix(in srgb, var(--c) 70%, black));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 18%, transparent);
+  transition: background 0.3s ease, box-shadow 0.3s ease;
+}
+.lc-orb--sm {
+  width: 22px;
+  height: 22px;
+}
+.lc-orb--lg {
+  width: 116px;
+  height: 116px;
+  box-shadow:
+    0 0 0 12px color-mix(in srgb, var(--c) 14%, transparent),
+    0 0 0 26px color-mix(in srgb, var(--c) 6%, transparent);
+}
+.lc-orb--listening {
+  transform: scale(calc(1 + var(--lc-level, 0) * 0.18));
+  transition: transform 0.08s linear, background 0.3s ease;
+}
+.lc-orb--thinking {
+  --c: var(--lc-think);
+  animation: lc-breathe 2.6s ease-in-out infinite;
+}
+.lc-orb--speaking {
+  --c: var(--success);
+  animation: lc-pulse 0.8s ease-in-out infinite;
+}
+.lc-orb--working {
+  --c: var(--warning);
+  animation: lc-breathe 1.4s ease-in-out infinite;
+}
+.lc-orb--reconnecting {
+  --c: var(--warning);
+  animation: lc-blink 1s steps(2) infinite;
+}
+.lc-orb--connecting {
+  --c: var(--muted-foreground);
+  animation: lc-blink 1.2s steps(2) infinite;
+}
+.lc-orb--muted,
+.lc-orb--ended {
+  --c: var(--muted-foreground);
+  box-shadow: none;
+}
+@keyframes lc-pulse {
+  50% {
+    transform: scale(1.08);
+  }
+}
+@keyframes lc-breathe {
+  50% {
+    transform: scale(1.1);
+    filter: brightness(1.12);
+  }
+}
+@keyframes lc-blink {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* ── кнопки ──────────────────────────────────────────────── */
+.lc-icon-btn {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: calc(var(--radius, 0.5rem) - 1px);
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground) !important;
+  cursor: pointer;
+}
+.lc-icon-btn:hover {
+  background: var(--lc-hover);
+  color: var(--foreground) !important;
+}
+.lc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: var(--radius, 0.5rem);
+  border: 1px solid var(--border);
+  background: transparent;
+  font-size: 12.5px !important;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.lc-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.lc-btn--icon {
+  width: 30px;
+  padding: 0;
+}
+.lc-btn--ghost:hover:not(:disabled) {
+  background: var(--lc-hover);
+}
+.lc-btn--primary {
+  background: var(--primary);
+  border-color: transparent;
+  color: var(--primary-foreground) !important;
+}
+.lc-btn--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--primary) 88%, var(--foreground));
+}
+.lc-btn--danger {
+  background: var(--destructive);
+  border-color: transparent;
+  color: var(--destructive-foreground) !important;
+}
+.lc-btn--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--destructive) 88%, var(--foreground));
+}
+.lc-btn.is-muted {
+  border-color: color-mix(in srgb, var(--destructive) 55%, var(--border));
+  color: var(--destructive-text, var(--destructive)) !important;
+  background: color-mix(in srgb, var(--destructive) 10%, transparent);
+}
+.lc-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--primary) !important;
+  font-size: 12px !important;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lc-link:hover {
+  text-decoration: underline;
+}
+
+/* ── переключатель режима ────────────────────────────────── */
+.lc-seg {
+  flex: none;
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border-radius: var(--radius, 0.5rem);
+  background: var(--surface-recessed, var(--secondary));
+  border: 1px solid var(--border);
+}
+.lc-seg__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: calc(var(--radius, 0.5rem) - 2px);
+  background: transparent;
+  color: var(--muted-foreground) !important;
+  font-size: 11.5px !important;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.lc-seg__item:hover:not(:disabled):not(.is-active) {
+  color: var(--foreground) !important;
+}
+.lc-seg__item.is-active {
+  background: var(--popover);
+  color: var(--foreground) !important;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.18);
+}
+.lc-seg__item:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.lc-seg--compact .lc-seg__item {
+  padding: 0 6px;
+}
+.lc-seg.is-switching {
+  opacity: 0.7;
+}
+
+/* ── лента ───────────────────────────────────────────────── */
+.lc-feed {
+  flex: 1;
+  min-height: 140px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overscroll-behavior: contain;
+}
+.lc-feed--compact {
+  min-height: 0;
+}
+.lc-empty {
+  margin: auto 0;
+  text-align: center;
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+}
+.lc-line {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 88%;
+}
+.lc-line__who {
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--subtle-foreground, var(--muted-foreground));
+}
+.lc-line__text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.lc-line--owner {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+.lc-line--owner .lc-line__text {
+  background: var(--secondary);
+  color: var(--secondary-foreground, var(--foreground));
+  padding: 6px 10px;
+  border-radius: 12px 12px 3px 12px;
+}
+.lc-line.is-partial .lc-line__text {
+  opacity: 0.7;
+}
+.lc-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius, 0.5rem);
+  border: 1px solid var(--border);
+  background: var(--card);
+  font-size: 12.5px;
+}
+.lc-card__icon {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  color: var(--muted-foreground);
+}
+.lc-card__text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.lc-card__end {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.lc-card--running {
+  border-style: dashed;
+}
+.lc-card--done .lc-card__icon {
+  color: var(--success);
+}
+.lc-card--failed {
+  border-color: color-mix(in srgb, var(--destructive) 50%, var(--border));
+}
+.lc-card--failed .lc-card__icon {
+  color: var(--destructive-text, var(--destructive));
+}
+.lc-card--cancelled {
+  opacity: 0.7;
+}
+.lc-card--event {
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+.lc-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.lc-notice--warn {
+  color: var(--warning-text, var(--warning));
+}
+.lc-notice--error {
+  color: var(--destructive-text, var(--destructive));
+}
+.lc-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--subtle-foreground, var(--muted-foreground));
+  font-size: 11px;
+}
+.lc-divider::before,
+.lc-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+.lc-spin {
+  animation: lc-spin 0.9s linear infinite;
+}
+@keyframes lc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.lc-micwarn {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 12px 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius, 0.5rem);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--warning-text, var(--warning));
+  font-size: 12px;
+}
+.lc-micwarn svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+/* ── подвал ──────────────────────────────────────────────── */
+.lc-dock__foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--border);
+}
+.lc-level {
+  flex: none;
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+}
+.lc-level i {
+  display: block;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  transition: background 0.08s linear;
+}
+.lc-level i:nth-child(1) {
+  height: 5px;
+}
+.lc-level i:nth-child(2) {
+  height: 8px;
+}
+.lc-level i:nth-child(3) {
+  height: 11px;
+}
+.lc-level i:nth-child(4) {
+  height: 14px;
+}
+.lc-level i:nth-child(5) {
+  height: 16px;
+}
+.lc-level i.is-on {
+  background: var(--primary);
+}
+.lc-mic-select {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: calc(var(--radius, 0.5rem) - 1px);
+  border: 1px solid var(--input, var(--border));
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 12px;
+}
+
+/* ── подтверждение ───────────────────────────────────────── */
+.lc-confirm {
+  --c: var(--primary);
+  margin: 10px 10px 0;
+  padding: 12px;
+  border-radius: var(--lc-radius);
+  border: 1.5px solid var(--c);
+  background: color-mix(in srgb, var(--c) 7%, var(--popover));
+}
+.lc-confirm--P {
+  --c: var(--warning);
+}
+.lc-confirm--C {
+  --c: color-mix(in srgb, var(--primary) 70%, var(--border));
+}
+.lc-confirm--sheet {
+  margin: 0;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+.lc-confirm__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.lc-confirm__icon {
+  display: inline-grid;
+  place-items: center;
+  color: var(--c);
+}
+.lc-confirm__summary {
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+.lc-confirm__say {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.lc-confirm__actions {
+  display: flex;
+  gap: 8px;
+}
+.lc-confirm__note {
+  margin: 8px 0 0;
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+}
+.lc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--secondary);
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+}
+.lc-chip--live {
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+}
+.lc-word {
+  padding: 1px 9px;
+  border-radius: calc(var(--radius, 0.5rem) - 1px);
+  background: color-mix(in srgb, var(--c, var(--primary)) 16%, transparent);
+  font-weight: 700;
+  font-size: 15px;
+}
+.lc-ttl__track {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 3;
+}
+.lc-ttl__value {
+  fill: none;
+  stroke: var(--c, var(--primary));
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.5s linear;
+}
+.lc-ttl text {
+  fill: var(--foreground);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--font-sans);
+}
+
+/* ── итог и ошибка ───────────────────────────────────────── */
+.lc-summary,
+.lc-failed {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  overflow-y: auto;
+}
+.lc-summary__meta {
+  margin: 0;
+  color: var(--muted-foreground);
+}
+.lc-summary__list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lc-summary__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.lc-label {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--subtle-foreground, var(--muted-foreground));
+}
+.lc-failed__msg {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.lc-failed__msg svg {
+  flex: none;
+  margin-top: 2px;
+}
+.lc-failed p,
+.lc-summary p {
+  margin: 0;
+}
+
+/* ── пилюля (свёрнутый док) ──────────────────────────────── */
+.lc-pill {
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px 5px 5px;
+  border-radius: 999px;
+  animation: lc-in 0.16s ease-out;
+}
+.lc-pill__main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 10px 0 4px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+}
+.lc-pill__main:hover {
+  background: var(--lc-hover);
+}
+.lc-pill .lc-btn {
+  border-radius: 999px;
+}
+
+/* ── телефон ─────────────────────────────────────────────── */
+.lc-mobile {
+  position: fixed;
+  inset: 0;
+  z-index: 70; /* над шапкой BB: иначе её кнопки просвечивают поверх звонка */
+  display: flex;
+  flex-direction: column;
+  background: var(--background);
+  color: var(--foreground);
+  padding: max(12px, env(safe-area-inset-top)) 16px max(18px, env(safe-area-inset-bottom));
+}
+.lc-mobile__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 36px;
+}
+.lc-mobile__center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  text-align: center;
+  min-height: 0;
+}
+.lc-mobile__line {
+  margin: 0;
+  max-width: 34ch;
+  font-size: 15px;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.lc-mobile__card {
+  width: 100%;
+  max-width: 420px;
+  text-align: left;
+}
+.lc-mobile__controls {
+  display: flex;
+  justify-content: space-around;
+  align-items: center;
+  padding-top: 12px;
+}
+.lc-mobile__done {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 24px;
+}
+.lc-mobile__done .lc-state {
+  margin: 0 0 4px;
+  padding: 0 12px;
+}
+.lc-round {
+  display: inline-grid;
+  place-items: center;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--foreground) !important;
+  cursor: pointer;
+}
+.lc-round.is-muted {
+  background: color-mix(in srgb, var(--destructive) 14%, var(--card));
+  border-color: color-mix(in srgb, var(--destructive) 55%, var(--border));
+  color: var(--destructive-text, var(--destructive)) !important;
+}
+.lc-round--end {
+  width: 68px;
+  height: 68px;
+  border: 0;
+  background: var(--destructive);
+  color: var(--destructive-foreground) !important;
+}
+.lc-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 71;
+  max-height: 72vh;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 16px max(16px, env(safe-area-inset-bottom));
+  background: var(--popover);
+  border-top: 1px solid var(--border);
+  border-radius: 20px 20px 0 0;
+  box-shadow: var(--shadow-lg, 0 -12px 32px rgb(0 0 0 / 0.3));
+  animation: lc-up 0.18s ease-out;
+}
+@keyframes lc-up {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
+}
+.lc-sheet__grab {
+  width: 38px;
+  height: 4px;
+  margin: 0 auto 10px;
+  border-radius: 3px;
+  background: var(--border);
+}
+.lc-sheet__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.lc-sheet--confirm .lc-btn {
+  height: 44px;
+  font-size: 14px !important;
+}
+.lc-mbar {
+  z-index: 70;
+  top: max(8px, env(safe-area-inset-top));
+  left: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 12px 0 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--foreground);
+}
+
+/* ── настройки ───────────────────────────────────────────── */
+.lc-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--foreground);
+}
+.lc-settings__rows {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 0.5rem);
+}
+.lc-settings__row {
+  display: flex;
+  gap: 12px;
+  padding: 9px 12px;
+  align-items: baseline;
+}
+.lc-settings__row + .lc-settings__row {
+  border-top: 1px solid var(--border);
+}
+.lc-settings__label {
+  flex: none;
+  width: 150px;
+  color: var(--muted-foreground);
+}
+.lc-settings__value {
+  flex: 1;
+  min-width: 0;
+}
+.lc-settings__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.lc-settings p {
+  margin: 0;
+}
+.lc-root kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lc-orb,
+  .lc-spin,
+  .lc-dock,
+  .lc-pill,
+  .lc-sheet {
+    animation: none !important;
+  }
+}
