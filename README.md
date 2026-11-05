@@ -145,6 +145,17 @@ Two Gemini API keys go into the plugin's secret setting at install; nothing else
 ADRs [0005](docs/adr/0005-live-call-server-relay.md)–[0012](docs/adr/0012-live-call-voice-confirmation-rules.md),
 [plugin README](plugins/bb-plugin-live-call/README.md).
 
+### `privacy-blur`
+
+One click blurs sensitive data across the bb interface for screenshots and
+screen sharing: emails, bb ids, paths, URLs, domains, IPs, tokens, project
+and host names, and your own words. Toggle with the eye button in the
+sidebar footer or `Alt+Shift+P`. Text is masked with the CSS Custom
+Highlight API, so bb's DOM is never rewritten.
+
+Details in
+[plugins/bb-plugin-privacy-blur/README.md](plugins/bb-plugin-privacy-blur/README.md).
+
 ### `sidebar-collapse`
 
 The sidebar keeps the first five chats of every project and folds the rest
