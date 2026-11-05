@@ -56,3 +56,21 @@ test("normalizeTerms drops short and duplicate terms", () => {
 test("snake_case identifiers without digits stay visible", () => {
   assert.deepEqual(hidden("auto_approve task_status env_vars_list"), []);
 });
+
+test("person names heuristic", () => {
+  const find = (text: string) => createDetector([], { names: true }).find(text).map((s) => text.slice(s.start, s.end));
+  assert.deepEqual(find("звонил Иван Петров вчера"), ["Иван Петров"]);
+  assert.deepEqual(find("John Smith and Anna-Maria Lopez"), ["John Smith", "Anna-Maria Lopez"]);
+  assert.deepEqual(find("Новый тред создан"), []);
+  assert.deepEqual(createDetector([]).find("Иван Петров"), []);
+});
+
+test("thread titles as phrases", () => {
+  assert.deepEqual(hidden("[Стратегия] Автоматизация воронки — открыт", ["[Стратегия] Автоматизация воронки"]), [
+    "[Стратегия] Автоматизация воронки",
+  ]);
+});
+
+test("terms keep their own trailing punctuation", () => {
+  assert.deepEqual(hidden("Проба OpenCode жив?", ["Проба OpenCode жив?"]), ["Проба OpenCode жив?"]);
+});

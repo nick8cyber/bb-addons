@@ -4,7 +4,12 @@
 // id, пути, URL, домены, IP, токены, имена проектов/хостов и свои слова
 // размываются прямо в интерфейсе. Состояние хранится в localStorage вкладки.
 import { useEffect, useSyncExternalStore } from "react";
-import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
+import {
+  definePluginApp,
+  experimental_useServers,
+  experimental_useSidebarThreads,
+  useRpc,
+} from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { IGNORE_ATTR, PrivacyBlurEngine } from "./lib/engine";
 
@@ -28,10 +33,44 @@ export function isToggleShortcut(event: KeyboardEvent): boolean {
   return event.altKey && event.shiftKey && !event.ctrlKey && !event.metaKey && event.code === "KeyP";
 }
 
+/** Части адреса страницы, по которым узнаётся инстанс: sursun.getbb.app → sursun. */
+export function hostLabels(hostname: string): string[] {
+  if (!hostname || hostname === "localhost" || /^[\d.:[\]]+$/.test(hostname)) return [];
+  const labels = hostname.split(".");
+  return [hostname, ...(labels.length > 2 ? [labels[0]!] : [])];
+}
+
+/** Слова, известные только фронтенду: заголовки тредов, серверы, адрес страницы. */
+function useClientTerms(enabled: boolean): void {
+  const sidebar = experimental_useSidebarThreads();
+  const servers = experimental_useServers();
+  useEffect(() => {
+    if (!enabled || !engine) return;
+    const terms: string[] = [...hostLabels(window.location.hostname)];
+    for (const server of servers?.servers ?? []) {
+      terms.push(server.name);
+      try {
+        terms.push(...hostLabels(new URL(server.origin).hostname));
+      } catch {
+        // Кривой origin — пропускаем.
+      }
+    }
+    for (const project of sidebar.projects) if (!project.isPersonal) terms.push(project.name);
+    for (const host of sidebar.experimental_hosts ?? []) terms.push(host.name);
+    const titles: string[] = [];
+    for (const thread of sidebar.threads) {
+      titles.push(thread.displayTitle);
+      if (thread.title) titles.push(thread.title);
+    }
+    engine.setClientTerms(terms, titles);
+  }, [enabled, sidebar.threads, sidebar.projects, sidebar.experimental_hosts, servers]);
+}
+
 /** Плашка-индикатор режима: тянет настройки с сервера и даёт выключить одним кликом. */
 function PrivacyOverlay() {
   const rpc = useRpc<typeof rpcContract>();
   const enabled = useSyncExternalStore(subscribe, getEnabled, getEnabled);
+  useClientTerms(enabled);
 
   useEffect(() => {
     if (!enabled) return;

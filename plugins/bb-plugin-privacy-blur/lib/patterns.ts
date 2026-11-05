@@ -62,7 +62,7 @@ export function normalizeTerms(terms: readonly string[]): string[] {
   const out: string[] = [];
   for (const raw of terms) {
     const term = raw.trim();
-    if (term.length < 3 || term.length > 200) continue;
+    if (term.length < 3 || term.length > 300) continue;
     const key = term.toLocaleLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -96,8 +96,18 @@ export interface Detector {
   find(text: string): MatchSpan[];
 }
 
-export function createDetector(terms: readonly string[]): Detector {
+/** Имя и фамилия: два слова подряд с заглавной (Иван Петров, John Smith). */
+const PERSON_NAME_PATTERN =
+  /(?<![\p{L}\p{N}_])\p{Lu}\p{Ll}+(?:-\p{Lu}\p{Ll}+)?\s+\p{Lu}\p{Ll}+(?:-\p{Lu}\p{Ll}+)?(?![\p{L}\p{N}_])/gu;
+
+export interface DetectorOptions {
+  /** Искать имена людей эвристикой «два слова с заглавной». */
+  names?: boolean;
+}
+
+export function createDetector(terms: readonly string[], options: DetectorOptions = {}): Detector {
   const patterns = [...BUILTIN_PATTERNS];
+  if (options.names) patterns.push(PERSON_NAME_PATTERN);
   const termsPattern = buildTermsPattern(terms);
   if (termsPattern) patterns.push(termsPattern);
   return {
@@ -105,12 +115,14 @@ export function createDetector(terms: readonly string[]): Detector {
       if (text.length < 3) return [];
       const spans: MatchSpan[] = [];
       for (const pattern of patterns) {
+        // Хвостовую пунктуацию срезаем только у шаблонов: у слов из списка она своя.
+        const trimTail = pattern !== termsPattern;
         pattern.lastIndex = 0;
         for (const match of text.matchAll(pattern)) {
           const start = match.index ?? 0;
           let end = start + match[0].length;
           // Хвостовая пунктуация предложения — не часть пути/URL/домена.
-          while (end > start && /[.,;:!?]/.test(text[end - 1]!)) end--;
+          while (trimTail && end > start && /[.,;:!?]/.test(text[end - 1]!)) end--;
           if (end > start) spans.push({ start, end });
         }
       }

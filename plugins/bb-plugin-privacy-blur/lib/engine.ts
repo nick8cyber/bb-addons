@@ -17,6 +17,7 @@ export interface EngineOptions {
   blurTerminal: boolean;
   blurAvatars: boolean;
   blurThreadTitles: boolean;
+  detectNames: boolean;
   extraSelectors: string;
 }
 
@@ -26,6 +27,7 @@ export const DEFAULT_OPTIONS: EngineOptions = {
   blurTerminal: true,
   blurAvatars: true,
   blurThreadTitles: false,
+  detectNames: false,
   extraSelectors: "",
 };
 
@@ -71,8 +73,8 @@ export function buildCss(options: EngineOptions): string {
   }
   if (options.blurThreadTitles) {
     blurred.push(
-      `${on} [data-thread-id] [data-slot="thread-title"]`,
-      `${on} [data-thread-row-title]`,
+      `${on} [data-sidebar-thread-id] > span`,
+      `${on} .bb-thread-title`,
     );
   }
   for (const raw of options.extraSelectors.split(/[\n,]/)) {
@@ -81,16 +83,16 @@ export function buildCss(options: EngineOptions): string {
   }
   return [
     // Текстовые совпадения: прозрачный текст + размытая «тень» + серая подложка.
-    // Если браузер не рисует text-shadow у ::highlight, остаётся сплошная плашка.
+    // Плашка непрозрачная: форма букв не угадывается даже без поддержки text-shadow.
     `::highlight(${HIGHLIGHT_NAME}) {`,
     `  color: transparent;`,
     `  -webkit-text-fill-color: transparent;`,
-    `  background-color: rgba(128, 128, 128, 0.28);`,
-    `  text-shadow: 0 0 7px rgba(128, 128, 128, 0.95), 0 0 3px rgba(128, 128, 128, 0.8);`,
+    `  background-color: rgb(140, 140, 140);`,
+    `  text-shadow: 0 0 5px rgb(140, 140, 140), 0 0 10px rgb(140, 140, 140);`,
     `  text-decoration: none;`,
     `}`,
     `${blurred.join(",\n")} {`,
-    `  filter: blur(5px) !important;`,
+    `  filter: blur(7px) !important;`,
     `  transition: filter 120ms ease;`,
     `}`,
   ].join("\n");
@@ -114,11 +116,15 @@ export function parseCachedOptions(raw: string): Partial<EngineOptions> {
   if (Array.isArray(record.terms)) {
     out.terms = record.terms.filter((term): term is string => typeof term === "string").slice(0, 2000);
   }
-  for (const key of ["blurInputs", "blurTerminal", "blurAvatars", "blurThreadTitles"] as const) {
+  for (const key of ["blurInputs", "blurTerminal", "blurAvatars", "blurThreadTitles", "detectNames"] as const) {
     if (typeof record[key] === "boolean") out[key] = record[key];
   }
   if (typeof record.extraSelectors === "string") out.extraSelectors = record.extraSelectors;
   return out;
+}
+
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((item, index) => item === b[index]);
 }
 
 type Listener = (enabled: boolean) => void;
@@ -126,7 +132,10 @@ type Listener = (enabled: boolean) => void;
 export class PrivacyBlurEngine {
   private enabled = false;
   private options: EngineOptions = { ...DEFAULT_OPTIONS };
-  private detector: Detector = createDetector([]);
+  private detector: Detector = createDetector([], { names: DEFAULT_OPTIONS.detectNames });
+  /** Слова, собранные во фронтенде: заголовки тредов, имена серверов, хост страницы. */
+  private clientTerms: string[] = [];
+  private threadTitles: string[] = [];
   private readonly ranges = new Map<Text, Range[]>();
   private readonly hitElements = new Set<Element>();
   private highlight: HighlightLike | null = null;
@@ -140,6 +149,8 @@ export class PrivacyBlurEngine {
   isEnabled(): boolean {
     return this.enabled;
   }
+
+
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -193,7 +204,24 @@ export class PrivacyBlurEngine {
 
   private applyOptions(options: Partial<EngineOptions>): void {
     this.options = { ...this.options, ...options };
-    this.detector = createDetector(this.options.terms);
+    this.rebuild();
+  }
+
+  /** Слова из хуков фронтенда; не кэшируются — приходят сразу при монтировании. */
+  setClientTerms(terms: readonly string[], threadTitles: readonly string[] = []): void {
+    if (sameList(terms, this.clientTerms) && sameList(threadTitles, this.threadTitles)) return;
+    this.clientTerms = [...terms];
+    this.threadTitles = [...threadTitles];
+    this.rebuild();
+  }
+
+  private rebuild(): void {
+    const terms = [...this.options.terms, ...this.clientTerms];
+    // Заголовки тредов — словами, чтобы скрыть их везде: шапка, списки, упоминания.
+    if (this.options.blurThreadTitles) terms.push(...this.threadTitles);
+    this.detector = createDetector(terms, {
+      names: this.options.detectNames,
+    });
     if (this.style) this.style.textContent = buildCss(this.options);
     if (this.enabled) this.rescanAll();
   }

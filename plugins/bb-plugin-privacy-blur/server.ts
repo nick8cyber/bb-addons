@@ -17,6 +17,7 @@ const optionsSchema = z.object({
   blurTerminal: z.boolean(),
   blurAvatars: z.boolean(),
   blurThreadTitles: z.boolean(),
+  detectNames: z.boolean(),
   extraSelectors: z.string(),
 });
 export type PrivacyOptions = z.infer<typeof optionsSchema>;
@@ -88,7 +89,12 @@ export default async function plugin(bb: BbPluginApi) {
     },
     blurThreadTitles: {
       type: "boolean",
-      label: "Размывать заголовки тредов в сайдбаре",
+      label: "Размывать заголовки тредов (сайдбар, шапка, списки)",
+      default: false,
+    },
+    detectNames: {
+      type: "boolean",
+      label: "Искать имена людей (два слова подряд с заглавной: «Иван Петров»)",
       default: false,
     },
     extraSelectors: {
@@ -139,6 +145,7 @@ export default async function plugin(bb: BbPluginApi) {
         blurTerminal: current.blurTerminal,
         blurAvatars: current.blurAvatars,
         blurThreadTitles: current.blurThreadTitles,
+        detectNames: current.detectNames,
         extraSelectors: current.extraSelectors,
       };
     },
