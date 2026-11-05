@@ -238,7 +238,7 @@ if (SCENARIO === "general") {
   let verdict = events("verdict").find((e) => e.ts >= (confirm?.ts ?? 0));
   if (SCENARIO !== "early") check("до «да» вердикта нет", !verdict, verdict ? `${verdict.p.verdict} в ${verdict.ts}` : "");
   if (!verdict && heard) {
-    if (SCENARIO === "barge") await sleep(Math.max(0, heard.p.at + 800 - Date.now()));
+    if (SCENARIO === "barge") await sleep(Math.max(0, heard.p.at + 150 - Date.now())); // сразу после слов объекта: кусок транскрипта приходит через ~2 с
     else await waitEvent("confirm_phase", confirm.ts, 30000, (e) => e.p.phase === "listening");
     const da = await say("da");
     verdict = await waitEvent("verdict", da.at, 15000);
