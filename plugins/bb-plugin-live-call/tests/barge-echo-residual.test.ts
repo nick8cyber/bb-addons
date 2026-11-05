@@ -35,7 +35,7 @@ function fakeClock() {
   };
 }
 
-function bargeIn(answer: string) {
+function bargeIn(answer: string, cls: "C" | "L" = "C") {
   const t = fakeClock();
   const verdicts: string[] = [];
   let early = 0;
@@ -46,15 +46,17 @@ function bargeIn(answer: string) {
     },
   });
   const text = "Какие модели сейчас используются?";
-  const say = `Отправить в тред: «${text}»?`;
-  const r = gate.request("thread_send", { text }, "C", say, say, [text]);
+  const tool = cls === "L" ? "start_thread" : "thread_send";
+  const verb = cls === "L" ? "Запустить агента" : "Отправить в тред";
+  const say = `${verb}: «${text}»?`;
+  const r = gate.request(tool, { text }, cls, say, say, [text]);
   if (!("pending" in r)) throw new Error("нет pending");
   // Филлер модели перед вопросом — его слова попадают в широкий эхо-набор перебивания.
   gate.onModelTranscript("Секунду, отправляю запрос в тред по поводу используемых моделей.", t.now);
   gate.onModelTurnComplete();
   // Вопрос начинает звучать: начало вопроса в транскрипте в начале звука.
   gate.onModelAudio(1, 4800, t.now);
-  gate.onModelTranscript("Отправить в тред: «Какие модели", t.now);
+  gate.onModelTranscript(`${verb}: «Какие модели`, t.now);
   gate.onModelAudio(1, 48000 * 3, t.now);
   t.advance(2600);
   gate.onOwnerTranscriptChunk(answer, t.now);
@@ -73,10 +75,25 @@ describe("перебивание: остаток после эха вопрос�
     it(`«${answer}» (уточнение из слов филлера модели) → вердикта нет`, () => {
       const r = bargeIn(answer);
       expect(r.verdicts).toEqual([]);
+      expect(r.early).toBe(0); // отклонено классификацией, а не ушло в «раннее да»
     });
   }
 
   it("одно «Отправь.» (возможное эхо глагола вопроса) → вердикта нет", () => {
-    expect(bargeIn("Отправь.").verdicts).toEqual([]);
+    const r = bargeIn("Отправь.");
+    expect(r.verdicts).toEqual([]);
+    expect(r.early).toBe(0);
   });
+
+  it("класс L: «запускай агента» во время вопроса → approved/barge", () => {
+    expect(bargeIn("запускай агента", "L").verdicts).toEqual(["approved/barge"]);
+  });
+
+  for (const answer of ["да, запустить", "запусти"]) {
+    it(`класс L: «${answer}» (эхо глагола вопроса) → вердикта нет`, () => {
+      const r = bargeIn(answer, "L");
+      expect(r.verdicts).toEqual([]);
+      expect(r.early).toBe(0);
+    });
+  }
 });
