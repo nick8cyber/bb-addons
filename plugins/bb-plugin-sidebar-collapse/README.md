@@ -135,3 +135,13 @@ npx vitest run app.test.tsx
 ## Компактный чат
 
 Git-сводка и фоновая активность открываются кнопками верхнего бара; отдельные закрытые плашки над вводом скрыты. Выбор merge-base остаётся в штатной Git-панели. Очередь при первом появлении свёрнута в одну строку, ручное раскрытие сохраняется. Редактор и ошибки очереди остаются доступны; новая ошибка раскрывает очередь один раз. На телефоне кнопки имеют область нажатия 44px. Реализация сохраняет штатные действия BB и очищает свои DOM-атрибуты/обработчики при reload. Контракт: [завершение компактного интерфейса](../../docs/specs/compact-chat-complete.md).
+
+## Optional: live-call phone icon
+
+If the live-call plugin is installed, a phone icon appears left of «+» on projects that have a configured project call. The two plugins talk only through `window` events, with no hard dependency on each other:
+
+- `bb-live-call:projects` `{ projects: [{ projectId }] }` — published by live-call; this plugin shows the icon for those projects;
+- `bb-live-call:projects-request` — sent by this plugin on mount, so live-call can re-publish the list;
+- `bb-live-call:start-project` `{ projectId }` — sent on click; live-call starts the project call.
+
+Without live-call there are no events and no icon.
