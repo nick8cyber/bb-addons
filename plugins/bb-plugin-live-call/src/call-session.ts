@@ -17,7 +17,7 @@ import { ContextLedger } from "./context-ledger.js";
 import { KeyPool, QuotaExhaustedError } from "./key-pool.js";
 import { LiveClient } from "./live-client.js";
 import { EMPTY_CONTEXT, projectVoiceInstruction, routerInstruction, threadRouterInstruction, threadVoiceInstruction, voiceInstructionExtended, voiceInstructionNormal, type PromptContext } from "./prompt.js";
-import { TOOLS, capabilityList, getProjectTools, nativeDeclarations, runToolCall, stripConfirmKeys, toolByName, type ToolDef, type TwoStepPreviewEntry } from "./tools.js";
+import { TOOLS, capabilityList, formatConnectorSay, getProjectTools, nativeDeclarations, runToolCall, stripConfirmKeys, toolByName, type ToolDef, type TwoStepPreviewEntry } from "./tools.js";
 import type { ToolClass, ToolResult } from "./contract.js";
 import type { CallStore } from "./call-store.js";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
@@ -198,6 +198,9 @@ export class CallSession extends EventEmitter {
         onConfirmationUpdate: (p, phase) => this.onConfirmationUpdate(p, phase),
         onQuestionHeardAt: (p, at, offsetMs) => this.recordEvent( "question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
         onVerdict: (p, verdict) => void this.onVerdict(p, verdict),
+        onEarlyApproval: (_p) => {
+          this.interruptAndInject("[СИСТЕМА] Владелец сказал «да» до вопроса — это НЕ подтверждение, ничего не выполнено. Задай вопрос подтверждения коротко и дождись ответа");
+        },
       },
     );
   }
@@ -690,25 +693,14 @@ export class CallSession extends EventEmitter {
           name: candidateName,
           cls: strictCls as ToolClass,
           twoStep: isTwoStep,
+          isConnector: true,
           word: strictCls === "C" ? "да" : strictCls === "P" ? "разрешаю" : strictCls === "L" ? "запускай" : "",
           description: (t.description || `Ручка ${t.name} коннектора ${connCfg.id}`).slice(0, 1000),
           parameters: geminiParams,
           // §14.5, §16.7 п. 3: вслух — имя ручки и аргументы коротко, без «Подтверждаете?»
           // (эхо «подтверждаете» распознавалось как «подтверждаю» — ревью PLUG-113, C);
           // карточка — все аргументы полностью.
-          confirmSay: (args: Record<string, unknown>) => {
-            const entries = Object.entries(args ?? {});
-            if (entries.length === 0) return `${t.name} в ${connCfg.id}?`;
-            const formattedArgs = entries
-              .map(([k, v]) => {
-                const valStr = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
-                const truncated = valStr.length > 50 ? valStr.slice(0, 49) + "…" : valStr;
-                return `${k}=${truncated}`;
-              })
-              .join(", ");
-            const truncatedArgs = formattedArgs.length > 200 ? formattedArgs.slice(0, 199) + "…" : formattedArgs;
-            return `${t.name}: ${truncatedArgs}?`;
-          },
+          confirmSay: (args: Record<string, unknown>) => formatConnectorSay(t.name, connCfg.id, args).say,
           confirmCard: (args: Record<string, unknown>) =>
             `${t.name} (${connCfg.id})\n${Object.entries(args ?? {})
               .map(([k, v]) => `${k} = ${typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)}`)
@@ -1074,6 +1066,12 @@ export class CallSession extends EventEmitter {
         this.recordEvent( "agent_line", { text: safeLine });
         this.lastAgentLineAt = Date.now();
         await this.deps.sayCallThread(safeLine);
+
+        const p = this.gate.pendingConfirmation();
+        if (p && p.verdict === null && this.gate.checkFalseClaim(line)) {
+          this.recordEvent("false_claim", { tool: p.tool, text: safeLine.slice(0, 120) });
+          this.interruptAndInject("[СИСТЕМА] Действие ещё не подтверждено и не выполнено. Задай вопрос подтверждения и дождись вердикта");
+        }
       })();
     });
     client.on("inputTranscript", (text: string) => {
@@ -1782,9 +1780,19 @@ export class CallSession extends EventEmitter {
   private interruptAndInject(text: string) {
     if (this.ended) return;
     const safeText = this.sanitizeTokens(text);
-    if (this.voiceTalking) {
+    const hasPlayingAudio =
+      this.voiceTalking ||
+      this.state === "speaking" ||
+      this.listenFallback !== null ||
+      (this.lastAudioTurnSeq !== null && (this.lastDrainedSeq === null || this.lastDrainedSeq < this.lastAudioTurnSeq));
+    if (hasPlayingAudio) {
       this.voiceTalking = false;
-      this.frame({ type: "interrupted", turnSeq: 0 });
+      this.turnAudioBytes = 0;
+      if (this.listenFallback) {
+        clearTimeout(this.listenFallback);
+        this.listenFallback = null;
+      }
+      this.frame({ type: "interrupted", turnSeq: this.lastAudioTurnSeq ?? 0 });
       this.setState("listening");
     }
     const queued = this.quietQueue;

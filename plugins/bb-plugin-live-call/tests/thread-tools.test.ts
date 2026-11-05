@@ -353,7 +353,7 @@ describe("инструменты звонка по треду (контракт 
 
       // runToolCall с grant: true передает класс P в gate.request
       await runToolCall(tool, { grant: true }, "call_1", ctx as never);
-      expect(gate.request).toHaveBeenCalledWith("thread_answer", { grant: true }, "P", expect.any(String), expect.any(String));
+      expect(gate.request).toHaveBeenCalledWith("thread_answer", { grant: true }, "P", expect.any(String), expect.any(String), []);
 
       // При исполнении вызывает resolve
       const res = (await tool.execute({ grant: true }, ctx as never)) as { ok: true };
@@ -621,7 +621,7 @@ describe("вопрос подтверждения короткий, полный
     expect(say).not.toContain("Скажи");
     const request = vi.fn(() => ({ pending: { confirmationId: "cf_1", argsHash: "h", verdict: null } }));
     await runToolCall(tool, { text }, "call_1", { gate: { request }, reportAction: vi.fn() } as never);
-    expect(request).toHaveBeenCalledWith("thread_send", { text }, "C", say, `${say}\n«${text}»`);
+    expect(request).toHaveBeenCalledWith("thread_send", { text }, "C", say, `${say}\n«${text}»`, [text]);
   });
 });
 

@@ -75,9 +75,11 @@ export interface ToolDef {
     ctx: ToolContext,
   ) => Promise<{ ok: true; resolvedArgs: Record<string, unknown> } | { ok: false; error: { code: string; message: string } }>;
   /** Готовая фраза-вопрос для подтверждения; {args} подставляются. */
-  confirmSay?: (args: Record<string, unknown>) => string;
+  confirmSay?: (args: Record<string, unknown>, collector?: { add(v: string): void }) => string;
   /** Полный текст карточки подтверждения; нет — вопрос плюс полный текст сообщения/ответа/задачи. */
   confirmCard?: (args: Record<string, unknown>) => string;
+  /** Ручка коннектора (MCP-сервера) */
+  isConnector?: boolean;
   execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolExecutionResult>;
   /** Двухшаговая ручка коннектора (§14.10): превью -> подтверждение. */
   twoStep?: boolean;
@@ -466,6 +468,20 @@ export function brief(v: unknown, words = 8): string {
   return all.length <= words ? all.join(" ") : `${all.slice(0, words).join(" ")}…`;
 }
 
+export function quoteArg(val: unknown, collector?: { add(v: string): void }): string {
+  if (typeof val === "string" && val.trim()) {
+    collector?.add(val.trim());
+  }
+  return `«${String(val ?? "")}»`;
+}
+
+export function quoteBrief(val: unknown, collector?: { add(v: string): void }): string {
+  if (typeof val === "string" && val.trim()) {
+    collector?.add(val.trim());
+  }
+  return `«${brief(val)}»`;
+}
+
 export async function verifyThreadDelivery(
   sdk: BbPluginApi["sdk"],
   threadId: string,
@@ -709,7 +725,7 @@ export const TOOLS: ToolDef[] = [
       required: ["thread", "text"],
     },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Отправить в «${String(args.thread)}»: «${brief(args.text)}»?`,
+    confirmSay: (args, col) => `Отправить в ${quoteArg(args.thread, col)}: ${quoteBrief(args.text, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -790,10 +806,10 @@ export const TOOLS: ToolDef[] = [
         },
       };
     },
-    confirmSay: (args) =>
+    confirmSay: (args, col) =>
       args.grant
-        ? `Разрешить агенту в «${String(args.thread)}»?`
-        : `Ответить агенту в «${String(args.thread)}»: «${brief(args.answer)}»?`,
+        ? `Разрешить агенту в ${quoteArg(args.thread, col)}?`
+        : `Ответить агенту в ${quoteArg(args.thread, col)}: ${quoteBrief(args.answer, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       if (!threadId) {
@@ -871,7 +887,7 @@ export const TOOLS: ToolDef[] = [
     description: "Остановить тред. Подтверждение: «да» или «останавливай».",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Остановить тред «${String(args.thread)}»?`,
+    confirmSay: (args, col) => `Остановить тред ${quoteArg(args.thread, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -924,7 +940,7 @@ export const TOOLS: ToolDef[] = [
         },
       };
     },
-    confirmSay: (args) => `Запустить агента в «${String(args.project)}»: «${brief(args.task)}»?`,
+    confirmSay: (args, col) => `Запустить агента в ${quoteArg(args.project, col)}: ${quoteBrief(args.task, col)}?`,
     async execute(args, ctx) {
       let projectId = args.projectId ? String(args.projectId) : "";
       if (!projectId) {
@@ -1000,7 +1016,7 @@ export const TOOLS: ToolDef[] = [
       }
       return { ok: true, resolvedArgs: args };
     },
-    confirmSay: (args) => `Создать задачу «${String(args.title)}»${args.project ? ` в проекте «${String(args.project)}»` : ""}?`,
+    confirmSay: (args, col) => `Создать задачу ${quoteArg(args.title, col)}${args.project ? ` в проекте ${quoteArg(args.project, col)}` : ""}?`,
     async execute(args, ctx) {
       const res = await pluginRpc(ctx, "tasks", "createTask", { title: args.title, description: args.spec, project: args.projectId ?? args.project });
       ctx.reportAction("tasks_create", "C", res.ok ? "done" : "failed", `Создал задачу «${String(args.title)}»`);
@@ -1018,7 +1034,7 @@ export const TOOLS: ToolDef[] = [
       required: ["key", "preset"],
     },
     resolve: resolveTaskToolArgs,
-    confirmSay: (args) => `Раздать задачу ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)} исполнителю (${String(args.preset)})?`,
+    confirmSay: (args, col) => `Раздать задачу ${args.taskTitle ? `${quoteArg(args.taskTitle, col)} (${String(args.key)})` : String(args.key)} исполнителю (${String(args.preset)})?`,
     async execute(args, ctx) {
       const res = await pluginRpc(ctx, "tasks", "dispatch", { key: args.key, preset: args.preset });
       ctx.reportAction("tasks_dispatch", "L", res.ok ? "done" : "failed", `Раздал задачу ${String(args.key)}`);
@@ -1232,7 +1248,7 @@ export const TOOLS: ToolDef[] = [
       required: ["key", "body"],
     },
     resolve: resolveTaskToolArgs,
-    confirmSay: (args) => `Комментарий к задаче ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)}: «${brief(args.body)}»?`,
+    confirmSay: (args, col) => `Комментарий к задаче ${args.taskTitle ? `${quoteArg(args.taskTitle, col)} (${String(args.key)})` : String(args.key)}: ${quoteBrief(args.body, col)}?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "createComment", { key: args.key, body: args.body });
     },
@@ -1248,7 +1264,7 @@ export const TOOLS: ToolDef[] = [
       required: ["key", "status"],
     },
     resolve: resolveTaskToolArgs,
-    confirmSay: (args) => `Перевести задачу ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)} в «${String(args.status)}»?`,
+    confirmSay: (args, col) => `Перевести задачу ${args.taskTitle ? `${quoteArg(args.taskTitle, col)} (${String(args.key)})` : String(args.key)} в ${quoteArg(args.status, col)}?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, status: args.status });
     },
@@ -1264,7 +1280,7 @@ export const TOOLS: ToolDef[] = [
       required: ["key", "due"],
     },
     resolve: resolveTaskToolArgs,
-    confirmSay: (args) => `Срок задачи ${args.taskTitle ? `«${String(args.taskTitle)}» (${String(args.key)})` : String(args.key)} — ${String(args.due)}?`,
+    confirmSay: (args, col) => `Срок задачи ${args.taskTitle ? `${quoteArg(args.taskTitle, col)} (${String(args.key)})` : String(args.key)} — ${String(args.due)}?`,
     async execute(args, ctx) {
       return pluginRpc(ctx, "tasks", "updateTask", { key: args.key, dueDate: args.due });
     },
@@ -1276,7 +1292,7 @@ export const TOOLS: ToolDef[] = [
     description: "Тред в архив (не удаляет).",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Архивировать тред «${String(args.thread)}»?`,
+    confirmSay: (args, col) => `Архивировать тред ${quoteArg(args.thread, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -1298,7 +1314,7 @@ export const TOOLS: ToolDef[] = [
     description: "Сжать контекст длинного треда (штатный /compact).",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Сжать контекст треда «${String(args.thread)}»?`,
+    confirmSay: (args, col) => `Сжать контекст треда ${quoteArg(args.thread, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -1324,7 +1340,7 @@ export const TOOLS: ToolDef[] = [
       required: ["thread", "text"],
     },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `В очередь треда «${String(args.thread)}»: «${brief(args.text)}»?`,
+    confirmSay: (args, col) => `В очередь треда ${quoteArg(args.thread, col)}: ${quoteBrief(args.text, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -1352,7 +1368,7 @@ export const TOOLS: ToolDef[] = [
       required: ["thread"],
     },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `${args.unpin ? "Открепить" : "Закрепить"} тред «${String(args.thread)}»?`,
+    confirmSay: (args, col) => `${args.unpin ? "Открепить" : "Закрепить"} тред ${quoteArg(args.thread, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -1380,7 +1396,7 @@ export const TOOLS: ToolDef[] = [
       required: ["thread", "title"],
     },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Переименовать «${String(args.thread)}» в «${String(args.title)}»?`,
+    confirmSay: (args, col) => `Переименовать ${quoteArg(args.thread, col)} в ${quoteArg(args.title, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       if (!threadId) {
@@ -1404,7 +1420,7 @@ export const TOOLS: ToolDef[] = [
       required: ["thread"],
     },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `${args.unhide ? "Вернуть" : "Скрыть"} тред «${String(args.thread)}»?`,
+    confirmSay: (args, col) => `${args.unhide ? "Вернуть" : "Скрыть"} тред ${quoteArg(args.thread, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -1441,7 +1457,7 @@ export const TOOLS: ToolDef[] = [
       properties: { text: { type: "string", description: "что запомнить, одной фразой" } },
       required: ["text"],
     },
-    confirmSay: (args) => `Запомнить: «${brief(args.text)}»?`,
+    confirmSay: (args, col) => `Запомнить: ${quoteBrief(args.text, col)}?`,
     async execute(args, ctx) {
       if (!ctx.voiceMemory) return { ok: false, error: { code: "no_memory", message: "память звонков недоступна" } };
       const r = ctx.voiceMemory.add(String(args.text ?? ""));
@@ -1458,7 +1474,7 @@ export const TOOLS: ToolDef[] = [
       properties: { text: { type: "string" } },
       required: ["text"],
     },
-    confirmSay: (args) => `Отметить в итоге звонка: «${brief(args.text)}»?`,
+    confirmSay: (args, col) => `Отметить в итоге звонка: ${quoteBrief(args.text, col)}?`,
     async execute(args, ctx) {
       ctx.ledger.add("system", `Пометка: ${String(args.text)}`);
       ctx.reportAction("call_note", "C", "done", `Пометка: ${String(args.text).slice(0, 80)}`);
@@ -1472,7 +1488,7 @@ export const TOOLS: ToolDef[] = [
     description: "Перезапустить упавший тред. Класс L: только «запускай».",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Перезапустить тред «${String(args.thread)}»?`,
+    confirmSay: (args, col) => `Перезапустить тред ${quoteArg(args.thread, col)}?`,
     async execute(args, ctx) {
       let threadId = args.threadId ? String(args.threadId) : "";
       let title = String(args.thread ?? "");
@@ -1521,7 +1537,7 @@ export const TOOLS: ToolDef[] = [
       required: ["thread", "model"],
     },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Передать тред «${String(args.thread)}» на ${String(args.model)} в новом треде?`,
+    confirmSay: (args, col) => `Передать тред ${quoteArg(args.thread, col)} на ${String(args.model)} в новом треде?`,
     async execute(args, ctx) {
       let source = args._targetThread as Record<string, unknown> | undefined;
       if (!source) {
@@ -1551,7 +1567,7 @@ export const TOOLS: ToolDef[] = [
     description: "Клонировать тред с контекстом для отдельной доработки.",
     parameters: { type: "object", properties: { thread: { type: "string" } }, required: ["thread"] },
     resolve: resolveThreadToolArgs,
-    confirmSay: (args) => `Клонировать тред «${String(args.thread)}»?`,
+    confirmSay: (args, col) => `Клонировать тред ${quoteArg(args.thread, col)}?`,
     async execute(args, ctx) {
       let source = args._targetThread as Record<string, unknown> | undefined;
       if (!source) {
@@ -1633,7 +1649,7 @@ export const threadSendTool: ToolDef = {
     },
     required: ["text"],
   },
-  confirmSay: (args) => `Отправить в тред: «${brief(args.text)}»?`,
+  confirmSay: (args, col) => `Отправить в тред: ${quoteBrief(args.text, col)}?`,
   async execute(args, ctx) {
     const threadId = ctx.targetThreadId;
     if (!threadId) {
@@ -1698,10 +1714,10 @@ export const threadAnswerTool: ToolDef = {
     }
     return { ok: true, resolvedArgs: args };
   },
-  confirmSay: (args) =>
+  confirmSay: (args, col) =>
     args.grant
       ? "Разрешить агенту действие?"
-      : `Ответить агенту: «${brief(args.answer)}»?`,
+      : `Ответить агенту: ${quoteBrief(args.answer, col)}?`,
   async execute(args, ctx) {
     const threadId = ctx.targetThreadId;
     if (!threadId) {
@@ -1814,7 +1830,7 @@ export const brainTaskTool: ToolDef = {
   cls: "C",
   word: "да",
   description: "Поставить задачу с изменениями (файлы, код, коммит, команды) мозговому центру в отдельном worktree. Требует подтверждения владельца «да».",
-  confirmSay: (args) => `Задача мозговому центру: «${brief(args.task)}»?`,
+  confirmSay: (args, col) => `Задача мозговому центру: ${quoteBrief(args.task, col)}?`,
   parameters: {
     type: "object",
     properties: {
@@ -1895,6 +1911,204 @@ export function nativeDeclarations(targetThreadId?: string, extraTools?: ToolDef
       },
     ],
   }));
+}
+
+export interface StringLeafSpan {
+  rawValue: string;
+  start: number;
+  end: number;
+}
+
+const LETTER_OR_DIGIT_REGEX = /^[\p{L}\p{N}]$/u;
+
+/**
+ * Проверяет, представлена ли в say хотя бы одна буква или цифра исходного значения (§7.1 п. 9.1 шаг 2 в).
+ * Буквы escape-последовательностей (\n, \t, \uXXXX) и половина суррогатной пары символами значения не считаются;
+ * обрыв посреди escape-последовательности означает, что символ не виден целиком.
+ */
+export function representedByValueChar(raw: string, escaped: boolean, visibleLen: number): boolean {
+  let off = 0;
+  for (const cp of raw) {
+    const len = escaped ? JSON.stringify(cp).length - 2 : cp.length;
+    if (off + len > visibleLen) return false;
+    if (LETTER_OR_DIGIT_REGEX.test(cp)) return true;
+    off += len;
+  }
+  return false;
+}
+
+/**
+ * Сериализует JSON-объект/массив аргументов (приходящих из JSON functionCall)
+ * и сохраняет диапазоны [start, end) каждого строкового листа (внутри кавычек JSON, в экранированном виде).
+ */
+export function serializeWithSpans(val: unknown): { valStr: string; spans: StringLeafSpan[] } {
+  let str = "";
+  const spans: StringLeafSpan[] = [];
+
+  function serialize(v: unknown): void {
+    if (typeof v === "string") {
+      const jsonStr = JSON.stringify(v);
+      const start = str.length + 1; // пропускаем открывающую кавычку "
+      const end = str.length + jsonStr.length - 1; // до закрывающей кавычки "
+      spans.push({ rawValue: v, start, end });
+      str += jsonStr;
+    } else if (typeof v === "number" || typeof v === "boolean" || v === null) {
+      str += JSON.stringify(v);
+    } else if (Array.isArray(v)) {
+      str += "[";
+      for (let i = 0; i < v.length; i++) {
+        if (i > 0) str += ",";
+        serialize(v[i]);
+      }
+      str += "]";
+    } else if (typeof v === "object") {
+      str += "{";
+      const entries = Object.entries(v as Record<string, unknown>);
+      for (let i = 0; i < entries.length; i++) {
+        if (i > 0) str += ",";
+        const [k, item] = entries[i];
+        str += JSON.stringify(k) + ":";
+        serialize(item);
+      }
+      str += "}";
+    } else {
+      str += JSON.stringify(v);
+    }
+  }
+
+  serialize(val);
+  return { valStr: str, spans };
+}
+
+/**
+ * Форматирование say и извлечение источников для ручки коннектора (§7.1 п. 9.1 шаг 2 в).
+ * Ключ=значение, ограничение 50 на каждое значение, 200 на весь список.
+ */
+export function formatConnectorSay(
+  toolName: string,
+  connId: string,
+  args: Record<string, unknown>,
+): { say: string; actionTexts: string[] } {
+  const entries = Object.entries(args ?? {});
+  if (entries.length === 0) {
+    const say = connId ? `${toolName} в ${connId}?` : `${toolName}?`;
+    return { say, actionTexts: [] };
+  }
+
+  const formattedParts: string[] = [];
+  const entriesInfo: Array<{
+    valStr: string;
+    spans: StringLeafSpan[];
+    escaped: boolean;
+    valStartInFormattedArgs: number;
+    visibleValLimit: number;
+  }> = [];
+  let currentLen = 0; // длина списка formattedParts, объединённого через ", "
+
+  for (let i = 0; i < entries.length; i++) {
+    const [k, v] = entries[i];
+    let valStr = "";
+    let spans: StringLeafSpan[] = [];
+    let escaped = false;
+
+    if (typeof v === "string") {
+      valStr = String(v);
+      spans = [{ rawValue: v, start: 0, end: valStr.length }];
+      escaped = false;
+    } else if (typeof v === "object" && v !== null) {
+      const res = serializeWithSpans(v);
+      valStr = res.valStr;
+      spans = res.spans;
+      escaped = true;
+    } else {
+      valStr = String(v);
+    }
+
+    const truncated = valStr.length > 50 ? valStr.slice(0, 49) + "…" : valStr;
+    const part = `${k}=${truncated}`;
+    const sepLen = i > 0 ? 2 : 0; // длина ", "
+
+    const entryStart = currentLen + sepLen;
+    const valStartInFormattedArgs = entryStart + k.length + 1; // +1 для '='
+    const visibleValLimit = valStr.length > 50 ? 49 : valStr.length;
+
+    entriesInfo.push({
+      valStr,
+      spans,
+      escaped,
+      valStartInFormattedArgs,
+      visibleValLimit,
+    });
+
+    formattedParts.push(part);
+    currentLen += sepLen + part.length;
+  }
+
+  const formattedArgs = formattedParts.join(", ");
+  const truncatedArgs = formattedArgs.length > 200 ? formattedArgs.slice(0, 199) + "…" : formattedArgs;
+  const visibleFormattedLimit = formattedArgs.length > 200 ? 199 : formattedArgs.length;
+  const say = `${toolName}: ${truncatedArgs}?`;
+
+  const actionTexts: string[] = [];
+
+  for (const info of entriesInfo) {
+    const maxValIndexInFormatted = visibleFormattedLimit - info.valStartInFormattedArgs;
+    if (maxValIndexInFormatted <= 0) continue;
+
+    for (const span of info.spans) {
+      const visEnd = Math.min(span.end, info.visibleValLimit, maxValIndexInFormatted);
+      if (visEnd > span.start) {
+        const visibleLen = visEnd - span.start;
+        // Лист представлен, если в видимой части say целиком видна запись хотя бы одного исходного символа значения, который является буквой или цифрой
+        if (representedByValueChar(span.rawValue, info.escaped, visibleLen)) {
+          const raw = span.rawValue.trim();
+          if (raw && !actionTexts.includes(raw)) {
+            actionTexts.push(raw);
+          }
+        }
+      }
+    }
+  }
+
+  return { say, actionTexts };
+}
+
+/**
+ * Извлечение источников текста действия для false_claim (§7.1 п. 9.1 шаг 2).
+ */
+export function extractActionTexts(
+  def: ToolDef,
+  callArgs: Record<string, unknown>,
+  say: string,
+): string[] {
+  // (в) у ручки коннектора
+  if (def.isConnector) {
+    return formatConnectorSay(def.name, "", callArgs).actionTexts;
+  }
+
+  const sources: string[] = [];
+
+  // (а) полный текст действия — значение аргумента text/answer/task/body
+  const full = ["text", "answer", "task", "body"]
+    .map((k) => callArgs[k])
+    .find((v) => typeof v === "string" && (v as string).trim()) as string | undefined;
+  if (full && full.trim()) {
+    sources.push(full.trim());
+  }
+
+  // (б) Источники перечисляет тот же formatter, который вставляет аргументы в цитируемые блоки say
+  if (def.confirmSay) {
+    const collector = {
+      add(v: string) {
+        if (!sources.includes(v)) {
+          sources.push(v);
+        }
+      },
+    };
+    def.confirmSay(callArgs, collector);
+  }
+
+  return sources;
 }
 
 /**
@@ -2048,7 +2262,9 @@ export async function runToolCall(
 
     const fullCallArgs = { ...callArgsClean, confirm: true, confirm_token: token };
     const cls: "C" | "P" | "L" = def.cls === "P" || def.cls === "L" ? def.cls : "C";
-    const req = ctx.gate.request(def.name, fullCallArgs, cls, say, card);
+    // Источники текста действия (§7.1 п. 9.1, (в)) — по тем же очищенным аргументам, что озвучены в say.
+    const actionTexts = extractActionTexts(def, callArgsClean, say);
+    const req = ctx.gate.request(def.name, fullCallArgs, cls, say, card, actionTexts);
     if ("rejected" in req) {
       return { result: { ok: false, error: { code: req.rejected, message: req.message } }, executed: false };
     }
@@ -2109,11 +2325,12 @@ export async function runToolCall(
   const say = def.confirmSay ? def.confirmSay(callArgs) : `${def.description} Подтвердите.`;
   const cls = (def.name === "answer_interaction" || def.name === "thread_answer") && callArgs.grant ? "P" : def.cls;
   // Вслух — короткий вопрос, на карточке — полный текст, который уйдёт.
-  const full = ["text", "answer", "task", "body"].map((k) => callArgs[k]).find((v) => typeof v === "string" && v.trim());
+  const full = ["text", "answer", "task", "body"].map((k) => callArgs[k]).find((v) => typeof v === "string" && (v as string).trim()) as string | undefined;
   const card = def.confirmCard
     ? def.confirmCard(callArgs)
     : typeof full === "string" && brief(full) !== full.trim() ? `${say}\n«${full.trim()}»` : say;
-  const req = ctx.gate.request(def.name, callArgs, cls, say, card);
+  const actionTexts = extractActionTexts(def, callArgs, say);
+  const req = ctx.gate.request(def.name, callArgs, cls, say, card, actionTexts);
   if ("rejected" in req) {
     return { result: { ok: false, error: { code: req.rejected, message: req.message } }, executed: false };
   }

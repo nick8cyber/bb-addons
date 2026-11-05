@@ -18,7 +18,15 @@ import {
   WINDOW_PADDING_MS,
   WINDOW_SERVER_SLACK_MS,
 } from "./contract.js";
-import { classify, normalizeUtterance, type ConfirmClass, type ConfirmWords, type Verdict } from "./classify.js";
+import {
+  classify,
+  isEchoWord,
+  isFalseClaim,
+  normalizeUtterance,
+  type ConfirmClass,
+  type ConfirmWords,
+  type Verdict,
+} from "./classify.js";
 
 export interface PendingConfirmation {
   confirmationId: string;
@@ -28,6 +36,8 @@ export interface PendingConfirmation {
   say: string;
   /** Полный текст для карточки; вслух — короткий say. */
   card?: string;
+  /** Источники текста действия для false_claim (§7.1 п. 9.1 шаг 2) */
+  actionTexts?: string[];
   createdAt: number;
   expiresAt: number;
   /** Вердикт владельца; до него null. */
@@ -81,6 +91,11 @@ export interface GateEvents {
    * чтобы приёмка сверила его с тем, что реально проиграл браузер, а не с этой оценкой.
    */
   onQuestionHeardAt?: (p: PendingConfirmation, at: number, offsetMs: number) => void;
+  /**
+   * Владелец сказал «да» до вопроса — отброшенное раннее согласие.
+   * Сервер прерывает модель и вставляет [СИСТЕМА] (спека §7.1 п. 3.1).
+   */
+  onEarlyApproval?: (p: PendingConfirmation) => void;
 }
 
 export interface GateClock {
@@ -133,10 +148,15 @@ export class ConfirmationGate {
   /** Когда доиграет звук ходов, начатых до запроса (оценка сервера). */
   private priorPlaybackEnd = 0;
   /** Значимые слова вопроса без слов из аргументов действия (филлер может их повторять). */
-  private questionWords = new Set<string>();
+  private objectWords: string[] = [];
+  private sayTailWords: string[] = [];
+  private tailIsIdentifying = false;
   private recentVerdicts = new Map<string, { verdict: Verdict; at: number }>();
   private usedIds = new Set<string>();
   private confirmWaiters = new Map<string, Array<{ resolve: (v: Verdict) => void; timer: unknown }>>();
+  private falseClaimInjected = false;
+  private earlyInjectedForQuestion = false;
+  private maxInterruptedTurnSeq = 0;
 
   constructor(
     private words: ConfirmWords,
@@ -153,7 +173,14 @@ export class ConfirmationGate {
    * возвращает ту же запись; другой вызов записи отклоняется до вердикта;
    * тот же argsHash в течение 5 мин после вердикта — «уже выполнено» / «отменено».
    */
-  request(tool: string, args: Record<string, unknown>, cls: ConfirmClass, say: string, card?: string): RequestResult {
+  request(
+    tool: string,
+    args: Record<string, unknown>,
+    cls: ConfirmClass,
+    say: string,
+    card?: string,
+    actionTexts?: string[],
+  ): RequestResult {
     const hash = argsHash(tool, args);
     const recent = this.recentVerdicts.get(hash);
     if (recent && this.clock.now() - recent.at < ARGS_HASH_DEDUP_MS) {
@@ -167,6 +194,13 @@ export class ConfirmationGate {
       return { rejected: "pending_exists", message: "сначала ответь на текущее подтверждение" };
     }
     const now = this.clock.now();
+    const resolvedActionTexts: string[] = actionTexts !== undefined ? actionTexts : (() => {
+      const texts: string[] = [];
+      const full = ["text", "answer", "task", "body"].map((k) => args[k]).find((v) => typeof v === "string" && (v as string).trim()) as string | undefined;
+      if (full && full.trim()) texts.push(full.trim());
+      return texts;
+    })();
+
     this.pending = {
       confirmationId: `cf_${hash.slice(0, 12)}_${now.toString(36)}`,
       tool,
@@ -174,6 +208,7 @@ export class ConfirmationGate {
       class: cls,
       say,
       card,
+      actionTexts: resolvedActionTexts,
       createdAt: now,
       expiresAt: now + CONFIRM_TTL_MS,
       verdict: null,
@@ -182,6 +217,8 @@ export class ConfirmationGate {
     // подтверждения (решение владельца 04.11, спека §7.1 п. 3.1). Защита от эха —
     // в onOwnerTranscriptChunk: до открытия окна засчитывается только согласие,
     // не раньше BARGE_IN_MIN_MS и не совпадающее со словами самого вопроса.
+    this.falseClaimInjected = false;
+    this.earlyInjectedForQuestion = false;
     this.resetWindow();
     this.tailUntil = 0;
     this.audioSinceRequest = 0;
@@ -193,15 +230,35 @@ export class ConfirmationGate {
     }
     this.playingTurns.clear();
     {
+      const quotes = Array.from(say.matchAll(/[«"']([^»"']{1,})[»"']/g)).map((m) => m[1].trim());
+      // Шаблонная часть say-фразы (вне кавычек)
+      const templateText = say.replace(/[«"'][^»"']*[»"']/g, " ");
+      const templateWords = new Set(normalizeUtterance(templateText));
+      const stopWords = new Set([
+        "в", "на", "с", "со", "по", "к", "ко", "о", "об", "обо", "от", "ото",
+        "из", "изо", "для", "и", "а", "но", "что", "как", "я", "он", "она",
+        "мы", "вы", "они", "это", "этот", "эта", "эти", "то", "же", "у", "за",
+      ]);
+
+      // Аргументные слова для защиты от ложного heard по отдельным словам (§7.1 п. 3.1)
       const argWords = new Set(
-        normalizeUtterance(
-          Object.entries(args)
-            .filter(([k, v]) => !k.startsWith("_") && typeof v === "string")
-            .map(([, v]) => v as string)
-            .join(" "),
-        ),
+        Object.values(args).flatMap((v) => (typeof v === "string" ? normalizeUtterance(v) : [])),
       );
-      this.questionWords = new Set(normalizeUtterance(say).filter((w) => w.length >= 3 && !argWords.has(w)));
+
+      // Слова объекта: только из цитат say, за вычетом шаблонных слов вопроса, предлогов
+      // и слов из аргументов действия (§7.1 п. 3.1). Слова из аргументов не должны становиться
+      // objectWords, чтобы филлер со словами аргументов («секунду», «пожалуйста», «в», «тред»)
+      // не вызывал преждевременный question_heard до того, как прозвучит хвост вопроса.
+      const rawQuoteWords = quotes.flatMap((q) => normalizeUtterance(q));
+      this.objectWords = Array.from(
+        new Set(rawQuoteWords.filter((w) => !templateWords.has(w) && !stopWords.has(w) && !argWords.has(w))),
+      );
+
+      const fullSayWords = normalizeUtterance(say);
+      this.sayTailWords = fullSayWords.slice(-2);
+      this.tailIsIdentifying =
+        this.sayTailWords.length === 2 &&
+        this.sayTailWords.some((w) => !templateWords.has(w) && !stopWords.has(w));
     }
     this.micOpen = true;
     this.events.onConfirmationUpdate?.(this.pending, "asking");
@@ -222,6 +279,7 @@ export class ConfirmationGate {
 
   /** Аудио хода модели: байты PCM 24 кГц, помечены turnSeq (спека §7.1 п. 3.2). */
   onModelAudio(turnSeq: number, byteLen: number, at = this.clock.now()) {
+    if (turnSeq <= this.maxInterruptedTurnSeq) return;
     const tr = this.playingTurns.get(turnSeq) ?? { firstAt: at, bytes: 0 };
     tr.bytes += byteLen;
     this.playingTurns.set(turnSeq, tr);
@@ -238,6 +296,7 @@ export class ConfirmationGate {
   onPlaybackDrained(turnSeq: number, at = this.clock.now()) {
     this.playingTurns.delete(turnSeq);
     if (!this.pending || this.windowOpenAt !== null) return;
+    if (turnSeq <= this.maxInterruptedTurnSeq) return;
     if (!this.turnAudio.has(turnSeq)) this.turnAudio.set(turnSeq, 0);
     this.turnDrained.add(turnSeq);
     this.maybeOpenWindow(at);
@@ -275,7 +334,12 @@ export class ConfirmationGate {
    * Реплика завершается по 700 мс тишины — тогда classify.
    */
   onOwnerTranscriptChunk(text: string, at = this.clock.now()) {
-    if (!this.pending) return;
+    const p = this.pending;
+    if (!p) return;
+    if (p.expiresAt <= at) {
+      this.burn(p, "expired");
+      return;
+    }
     // Хвост реплики, начатой раньше: продлевается до 700 мс тишины и отбрасывается целиком
     // (§7.1 п. 3.1, п. 3.5; ревью PLUG-113, блокер B).
     if (at < this.tailUntil) {
@@ -304,12 +368,32 @@ export class ConfirmationGate {
     // Начало вопроса в аудио: сколько байт модели пришло до первого куска со словами вопроса.
     // Текст приходит со скоростью генерации, звук играет в реальном времени — момент, когда
     // владелец СЛЫШИТ вопрос, считается от первого кадра аудио плюс длительность филлера.
-    if (this.pending && this.questionAudioOffset === null && this.questionWords.size > 0) {
-      const need = Math.min(2, this.questionWords.size);
+    if (this.pending && this.questionAudioOffset === null && (this.objectWords.length > 0 || this.tailIsIdentifying)) {
       const spoken = new Set(words);
-      let hits = 0;
-      for (const w of this.questionWords) if (spoken.has(w)) hits++;
-      if (hits >= need) {
+      let heard = false;
+
+      // 1. По названию объекта действия (спека §7.1 п. 3.1)
+      if (this.objectWords.length >= 2) {
+        let hits = 0;
+        for (const w of this.objectWords) if (spoken.has(w)) hits++;
+        if (hits >= Math.min(2, this.objectWords.length)) heard = true;
+      } else if (this.objectWords.length === 1) {
+        if (spoken.has(this.objectWords[0])) {
+          // Для 1-словного объекта требуем также наличие слова вопроса (не аргумента),
+          // чтобы филлер с одним случайным словом аргумента не считался вопросом.
+          const sayWords = normalizeUtterance(this.pending.say);
+          const nonObjSayWords = sayWords.filter((w) => w !== this.objectWords[0]);
+          if (nonObjSayWords.some((w) => spoken.has(w))) heard = true;
+        }
+      }
+
+      // 2. По хвосту вопроса (последние два слова say-фразы, спека §7.1 п. 3.1)
+      if (!heard && this.tailIsIdentifying) {
+        if (this.sayTailWords.every((w) => spoken.has(w))) heard = true;
+      }
+
+      if (heard) {
+        this.earlyInjectedForQuestion = false;
         this.questionAudioOffset = this.audioSinceRequest;
         const playFrom = Math.max(this.firstAudioAt ?? at, this.priorPlaybackEnd);
         const offsetMs = (this.questionAudioOffset / BYTES_PER_SECOND_24K) * 1000;
@@ -328,16 +412,14 @@ export class ConfirmationGate {
   private onBargeInChunk(text: string, at: number) {
     const p = this.pending;
     if (!p || p.verdict !== null) return;
+    if (p.expiresAt <= at) {
+      this.burn(p, "expired");
+      return;
+    }
     if (!this.bargeUtterance) {
       // Реплика, начатая раньше 1,5 с от запроса, — хвост просьбы владельца, не ответ:
       // отбрасывается вместе со всеми кусками до паузы.
       if (at - p.createdAt < BARGE_IN_MIN_MS) {
-        this.tailUntil = at + UTTERANCE_SILENCE_MS;
-        return;
-      }
-      // Перебить можно только звучащий вопрос: согласие до него — ответ на филлер
-      // («Секунду, передаю…»), владелец не слышал точного названия (§16.3; приёмка PLUG-114, B).
-      if (!this.questionStarted(p, at)) {
         this.tailUntil = at + UTTERANCE_SILENCE_MS;
         return;
       }
@@ -367,6 +449,10 @@ export class ConfirmationGate {
     this.bargeUtterance = null;
     const p = this.pending;
     if (!u || !p || p.verdict !== null) return;
+    if (p.expiresAt <= this.clock.now()) {
+      this.burn(p, "expired");
+      return;
+    }
     // Эхо: все слова реплики есть в самом вопросе — это голос агента из динамиков.
     // Модель говорит вопрос своими словами («Да, конечно. Отправить…?») — её слова тоже эхо.
     const since = p.createdAt - MODEL_ECHO_BEFORE_REQUEST_MS;
@@ -375,19 +461,35 @@ export class ConfirmationGate {
       ...this.modelSpeech.filter((c) => c.at >= since).flatMap((c) => c.words),
     ]);
     const words = normalizeUtterance(u.text);
-    // Однокоренные слова тоже эхо: «подтверждаете» ↔ «подтверждаю», «отправляю» ↔ «отправляй».
-    const stems = new Set([...sayWords].filter((x) => x.length >= 6).map((x) => x.slice(0, 6)));
-    const echoWord = (w: string) => sayWords.has(w) || (w.length >= 6 && stems.has(w.slice(0, 6)));
-    if (words.length === 0 || words.every(echoWord)) return;
+    if (words.length === 0 || words.every((w) => isEchoWord(w, sayWords))) return;
     if (classify(u.text, p.class, this.words) !== "approved") return;
-    p.verdict = "approved";
-    this.micOpen = true;
-    this.events.onVerdict?.(p, "approved");
+
+    if (this.questionStarted(p, u.firstChunkAt)) {
+      p.verdict = "approved";
+      this.micOpen = true;
+      this.events.onVerdict?.(p, "approved");
+      return;
+    }
+
+    // Согласие до того, как вопрос зазвучал — раннее «да» (спека §7.1 п. 3.1)
+    this.tailUntil = this.clock.now() + UTTERANCE_SILENCE_MS;
+    if (!this.earlyInjectedForQuestion) {
+      this.earlyInjectedForQuestion = true;
+      if (this.events.onEarlyApproval) {
+        this.resetQuestionTiming();
+        this.events.onEarlyApproval(p);
+      }
+    }
   }
 
   /** Явный конец реплики от транспорта (VAD), не ждём 700 мс. */
   onOwnerUtteranceEnd(text: string, firstChunkAt: number, at = this.clock.now()) {
-    if (!this.pending) return;
+    const p = this.pending;
+    if (!p) return;
+    if (p.expiresAt <= at) {
+      this.burn(p, "expired");
+      return;
+    }
     if (this.windowOpenAt === null || firstChunkAt < this.windowOpenAt) return;
     if (this.utteranceTimer !== null) {
       this.clock.clearTimeout(this.utteranceTimer);
@@ -403,6 +505,21 @@ export class ConfirmationGate {
     this.currentUtterance = null;
     const p = this.pending;
     if (!u || !p || p.verdict !== null) return;
+    if (p.expiresAt <= this.clock.now()) {
+      this.burn(p, "expired");
+      return;
+    }
+
+    // Эхо-фильтр в окне ответа (§7.1 п. 5):
+    // В окне эхо-набор — только вопрос и карточка.
+    const words = normalizeUtterance(u.text);
+    if (words.length > 0) {
+      const sayWords = new Set(normalizeUtterance(`${p.say} ${p.card ?? ""}`));
+      if (words.every((w) => isEchoWord(w, sayWords))) {
+        return; // Реплика, все слова которой — эхо, не решает ничего: ни approved, ни cancelled
+      }
+    }
+
     const verdict = classify(u.text, p.class, this.words);
     if (verdict === "hint") {
       // Подсказка не снимает pending; пока она звучит, шлюз снова закрыт,
@@ -427,9 +544,9 @@ export class ConfirmationGate {
     if (!p || p.confirmationId !== confirmationId) {
       return Promise.resolve(this.usedIds.has(confirmationId) ? "expired" : "not_confirmed");
     }
+    if (p.expiresAt <= at) return Promise.resolve(this.burn(p, "expired"));
     if (p.verdict === "approved") return Promise.resolve("approved");
     if (p.verdict === "cancelled" || p.verdict === "expired") return Promise.resolve(p.verdict);
-    if (p.expiresAt <= at) return Promise.resolve(this.burn(p, "expired"));
     return new Promise<Verdict>((resolve) => {
       const waiter = (v: Verdict) => resolve(v);
       const timer = this.clock.setTimeout(() => {
@@ -498,23 +615,26 @@ export class ConfirmationGate {
 
   /** Вердикт зафиксирован, исполнение не требуется (отказ, отмена, истёк срок). */
   private burn(p: PendingConfirmation, verdict: Verdict): Verdict {
-    const isFirstVerdict = p.verdict === null;
+    const fireEvent = p.verdict === null;
+    p.verdict = verdict;
     if (this.pending === p) this.pending = null;
     this.usedIds.add(p.confirmationId);
     this.recentVerdicts.set(p.argsHash, { verdict, at: this.clock.now() });
+    this.falseClaimInjected = false;
+    this.objectWords = [];
+    this.sayTailWords = [];
+    this.tailIsIdentifying = false;
     this.resetWindow();
     this.micOpen = true;
+    if (fireEvent) {
+      this.events.onVerdict?.(p, verdict);
+    }
     for (const w of this.confirmWaiters.get(p.confirmationId) ?? []) {
       if (w.timer !== null) this.clock.clearTimeout(w.timer);
       w.resolve(verdict);
     }
     this.confirmWaiters.delete(p.confirmationId);
-
-    if (verdict === "expired" && isFirstVerdict) {
-      p.verdict = "expired";
-      this.events.onVerdict?.(p, "expired");
-    }
-
+    // Первый вердикт (в т.ч. expired, нужный §14.10 для удаления превью) уже отдан через onVerdict выше.
     return verdict;
   }
 
@@ -538,6 +658,38 @@ export class ConfirmationGate {
       this.clock.clearTimeout(this.windowTimer);
       this.windowTimer = null;
     }
+  }
+
+  resetQuestionTiming() {
+    this.windowOpenAt = null;
+    for (const seq of this.turnAudio.keys()) {
+      this.maxInterruptedTurnSeq = Math.max(this.maxInterruptedTurnSeq, seq);
+    }
+    for (const seq of this.playingTurns.keys()) {
+      this.maxInterruptedTurnSeq = Math.max(this.maxInterruptedTurnSeq, seq);
+    }
+    this.turnAudio.clear();
+    this.turnDrained.clear();
+    this.firstAudioAt = null;
+    this.lastAudioAt = null;
+    this.audioSinceRequest = 0;
+    this.questionAudioOffset = null;
+    this.playingTurns.clear();
+    this.priorPlaybackEnd = 0;
+    if (this.windowTimer !== null) {
+      this.clock.clearTimeout(this.windowTimer);
+      this.windowTimer = null;
+    }
+  }
+
+  checkFalseClaim(turnText: string): boolean {
+    const p = this.pending;
+    if (!p || p.verdict !== null || this.falseClaimInjected) return false;
+    if (isFalseClaim(turnText, p.say, p.actionTexts ?? [])) {
+      this.falseClaimInjected = true;
+      return true;
+    }
+    return false;
   }
 
   /** Ответ по недавнему вердикту этого argsHash — что отдать модели (спека §2.1). */

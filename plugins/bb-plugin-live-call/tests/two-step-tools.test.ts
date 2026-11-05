@@ -339,6 +339,19 @@ describe("2. Логика превью и подтверждения двухш�
     }
   });
 
+  it("интеграция 115+119: подтверждение двухшаговой ручки коннектора передаёт источники текста действия (§7.1 п. 9.1 (в)) без confirm*", async () => {
+    const ctx = makeMockContext();
+    const token = "tok_src_555";
+    ctx.savePreview!("crm__issue_refund", token, { reason: "Письмо клиенту отправлено" }, `Возврат. Токен: ${token}`);
+    const gateRequestSpy = vi.spyOn(gate, "request");
+    const tool: ToolDef = { ...makeMockTool(), isConnector: true, confirmSay: (args) => `issue_refund: reason=${args.reason}?` };
+    await runToolCall(tool, { reason: "Письмо клиенту отправлено", confirm: true, confirm_token: token }, "f9", ctx);
+    expect(gateRequestSpy).toHaveBeenCalledTimes(1);
+    const actionTexts = gateRequestSpy.mock.calls[0][5] as string[];
+    expect(actionTexts).toEqual(["Письмо клиенту отправлено"]);
+    expect(actionTexts.join(" ")).not.toContain(token);
+  });
+
   it("confirm: \"true\" и confirm: 1 не доходят до callTool", async () => {
     const executeMock = vi.fn();
     const tool = makeMockTool({ executeMock });
