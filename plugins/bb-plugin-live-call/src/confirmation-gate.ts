@@ -696,7 +696,11 @@ export class ConfirmationGate {
     const words = normalizeUtterance(u.text);
     if (words.length === 0 || words.every((w) => isEchoWord(w, sayWords))) return;
     const wordsForTool = this.wordsFor(p.tool);
-    if (classify(u.text, p.class, wordsForTool) !== "approved") return;
+    // Остаток для классификации — после удаления эха только вопроса и карточки, как в окне (§7.1 п. 5.3):
+    // «Да, отправь.» во время «Отправить в тред: …?» — согласие. Широкий набор с речью модели выше
+    // решает лишь, не эхо ли вся реплика, иначе «да» с уточнением из слов филлера засчитывалось бы.
+    const questionWords = new Set(normalizeUtterance(`${p.say} ${p.card ?? ""}`));
+    if (classify(u.text, p.class, wordsForTool, questionWords) !== "approved") return;
 
     const utteranceMoment = u.vadStartAt ?? (u.firstChunkAt - INPUT_TRANSCRIPT_LAG_MS);
 
