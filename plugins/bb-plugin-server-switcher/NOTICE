@@ -1,0 +1,12 @@
+Server Switcher — maintained bb-addons fork
+
+Derived from brsbl/bb-plugins, Server Switcher 0.1.2.
+Upstream: https://github.com/brsbl/bb-plugins
+Source snapshot: 00febc4b2585d2de6d837b05bd0b25dcefccef5c
+Original path: plugins/server-switcher
+
+Original project provenance and attribution are retained.
+The maintained fork adds on-demand opening, native monochrome icons,
+an immediately visible server list, and removal of the nested disclosure.
+Maintained by nick8cyber and bb-addons contributors.
+License of the maintained fork: MIT (see LICENSE).

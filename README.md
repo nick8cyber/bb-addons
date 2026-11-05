@@ -148,8 +148,9 @@ ADRs [0005](docs/adr/0005-live-call-server-relay.md)–[0012](docs/adr/0012-live
 ### `sidebar-collapse`
 
 The sidebar keeps the first five chats of every project and folds the rest
-behind **Show more (N)**, the way Claude's sidebar does; the expanded group
-switches the button to **Show less**. Pinned chats, the chat you are in, and
+behind **Ещё N**. Expanding reaches the next decade, then adds ten roots
+at a time; **Меньше** removes one batch. Both buttons share a row with the
+visible/total root count. Pinned chats, the chat you are in, and
 anything waiting on you are never folded away, so the limit only ever hides
 chats you are done with.
 
@@ -197,3 +198,13 @@ bb theme set arctic-ledger
 plugins/           one directory per plugin, each with its own README
 themes/            one directory per theme
 ```
+
+### `server-switcher` — Compact server selector
+
+A monochrome footer icon opens the current server and all switch targets in one click. Closed by default; no avatar rings or nested dropdown. Offline servers are disabled. MIT-licensed maintained fork.
+
+```bash
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin server-switcher --yes
+```
+
+Details and upstream attribution: [Server Switcher](plugins/bb-plugin-server-switcher/README.md).

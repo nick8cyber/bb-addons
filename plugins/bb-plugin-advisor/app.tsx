@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   definePluginApp,
   useBbNavigate,
@@ -279,18 +279,63 @@ function useThreadAdvisor<
   method: Method,
 ) {
   const rpc = useRpc<Contract>();
-  const [data, setData] = useState<PluginRpcResult<Contract[Method]> | null>(
-    null,
-  );
-  const [error, setError] = useState<string | null>(null);
+  const [state, setState] = useState<{
+    threadId: string | null;
+    data: PluginRpcResult<Contract[Method]> | null;
+    error: string | null;
+  }>({
+    threadId,
+    data: null,
+    error: null,
+  });
+
+  const currentThreadIdRef = useRef(threadId);
+  currentThreadIdRef.current = threadId;
+
+  const reqSeqRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
-    if (threadId === null) return;
+    if (currentThreadIdRef.current !== threadId) return;
+    if (threadId === null) {
+      if (mountedRef.current) {
+        setState({ threadId: null, data: null, error: null });
+      }
+      return;
+    }
+    const reqId = ++reqSeqRef.current;
+    setState((prev) =>
+      prev.threadId === threadId
+        ? { ...prev, error: null }
+        : { threadId, data: null, error: null },
+    );
     try {
-      setError(null);
-      setData(await rpc.call(method, { threadId }));
+      const result = await rpc.call(method, { threadId });
+      if (!mountedRef.current) return;
+      if (
+        currentThreadIdRef.current !== threadId ||
+        reqSeqRef.current !== reqId
+      ) {
+        return;
+      }
+      setState({ threadId, data: result, error: null });
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      if (!mountedRef.current) return;
+      if (
+        currentThreadIdRef.current !== threadId ||
+        reqSeqRef.current !== reqId
+      ) {
+        return;
+      }
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setState({ threadId, data: null, error: message });
     }
   }, [rpc, method, threadId]);
 
@@ -327,7 +372,10 @@ function useThreadAdvisor<
     void load();
   }, [connection, wasConnected, load]);
 
-  return { data, error, reload: load };
+  const scopedData = state.threadId === threadId ? state.data : null;
+  const scopedError = state.threadId === threadId ? state.error : null;
+
+  return { data: scopedData, error: scopedError, reload: load };
 }
 
 function AdvisorHeaderBadge({
@@ -447,125 +495,340 @@ function AdvisorComposerBanner() {
     threadId,
     "pendingAdvice",
   );
-  const [dismissing, setDismissing] = useState(false);
-  const [continuing, setContinuing] = useState(false);
-  const [dismissError, setDismissError] = useState<string | null>(null);
+
+  const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>(
+    {},
+  );
+  const [mutationStateByCard, setMutationStateByCard] = useState<
+    Record<
+      string,
+      {
+        busyAction: "dismiss" | "continue" | "not-an-issue" | null;
+        error: string | null;
+      }
+    >
+  >({});
+
+  const busyMutationsRef = useRef<Set<string>>(new Set());
 
   if (!threadId) return null;
 
-  // A failed fetch must not look like "no advice": the advice is still injected
-  // into the next turn either way, which is the blind spot this banner exists
-  // to close.
-  const problem = dismissError ?? error;
-  if (problem) {
-    return (
-      <div className="rounded-lg border border-border bg-card px-4 py-3 text-xs">
-        <p className="text-destructive-text">
-          Advisor status unavailable — any pending review will still be sent to
-          the agent. ({problem})
-        </p>
-        <div className="mt-2 flex justify-end">
+  const advice = (data as PendingAdviceData | null)?.advice ?? null;
+
+  // A failed fetch when there is no advice must not silently disappear.
+  // The advice is still injected into the next turn either way.
+  if (!advice) {
+    if (error) {
+      return (
+        <div className="w-full max-w-full rounded-lg border border-border bg-card px-4 py-3 text-xs box-border">
+          <p className="text-destructive-text break-words">
+            Advisor status unavailable — any pending review will still be sent to
+            the agent. ({error})
+          </p>
+          <div className="mt-2 flex justify-end">
+            <button
+              type="button"
+              onClick={() => void reload()}
+              className="min-h-[44px] rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground hover:bg-state-hover"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return null;
+  }
+
+  const cardKey = `${threadId}:${advice.id}`;
+  const isExpanded = Boolean(expandedCards[cardKey]);
+  const toggleExpanded = () => {
+    setExpandedCards((prev) => ({
+      ...prev,
+      [cardKey]: !prev[cardKey],
+    }));
+  };
+
+  const currentMutation = mutationStateByCard[cardKey];
+  const busyAction = currentMutation?.busyAction ?? null;
+  const mutationBusy =
+    busyAction !== null || busyMutationsRef.current.has(cardKey);
+  const mutationError = currentMutation?.error ?? null;
+  const activeError = mutationError ?? error;
+
+  const clearMutationError = () => {
+    setMutationStateByCard((prev) => {
+      const existing = prev[cardKey];
+      if (!existing || !existing.error) return prev;
+      return {
+        ...prev,
+        [cardKey]: { ...existing, error: null },
+      };
+    });
+  };
+
+  const repeated = advice.repeatCount > 1;
+  const detailsId = `advisor-banner-details-${advice.id}`;
+  const summaryId = `advisor-banner-summary-${advice.id}`;
+
+  const handleDismiss = async () => {
+    if (busyMutationsRef.current.has(cardKey) || mutationBusy) return;
+    busyMutationsRef.current.add(cardKey);
+    setMutationStateByCard((prev) => ({
+      ...prev,
+      [cardKey]: {
+        busyAction: "dismiss",
+        error: null,
+      },
+    }));
+    try {
+      await rpc.call("dismissAdvice", { threadId, adviceId: advice.id });
+      await reload();
+    } catch (caught) {
+      const msg = caught instanceof Error ? caught.message : String(caught);
+      setMutationStateByCard((prev) => ({
+        ...prev,
+        [cardKey]: {
+          busyAction: null,
+          error: msg,
+        },
+      }));
+    } finally {
+      busyMutationsRef.current.delete(cardKey);
+      setMutationStateByCard((prev) => {
+        const existing = prev[cardKey];
+        if (existing?.error) {
+          return {
+            ...prev,
+            [cardKey]: { ...existing, busyAction: null },
+          };
+        }
+        return {
+          ...prev,
+          [cardKey]: { busyAction: null, error: null },
+        };
+      });
+    }
+  };
+
+  const handleNotAnIssue = async () => {
+    if (busyMutationsRef.current.has(cardKey) || mutationBusy) return;
+    busyMutationsRef.current.add(cardKey);
+    setMutationStateByCard((prev) => ({
+      ...prev,
+      [cardKey]: {
+        busyAction: "not-an-issue",
+        error: null,
+      },
+    }));
+    try {
+      const result = await rpc.call("resolveFinding", {
+        threadId,
+        chainId: advice.chainId,
+        resolved: true,
+        reason: "",
+        decision: "not-an-issue",
+      });
+      if (!result || result.resolved !== true) {
+        throw new Error("This finding is no longer open.");
+      }
+      await reload();
+    } catch (caught) {
+      const msg = caught instanceof Error ? caught.message : String(caught);
+      setMutationStateByCard((prev) => ({
+        ...prev,
+        [cardKey]: {
+          busyAction: null,
+          error: msg,
+        },
+      }));
+    } finally {
+      busyMutationsRef.current.delete(cardKey);
+      setMutationStateByCard((prev) => {
+        const existing = prev[cardKey];
+        if (existing?.error) {
+          return {
+            ...prev,
+            [cardKey]: { ...existing, busyAction: null },
+          };
+        }
+        return {
+          ...prev,
+          [cardKey]: { busyAction: null, error: null },
+        };
+      });
+    }
+  };
+
+  const handleFixInNewTurn = async () => {
+    if (busyMutationsRef.current.has(cardKey) || mutationBusy) return;
+    busyMutationsRef.current.add(cardKey);
+    setMutationStateByCard((prev) => ({
+      ...prev,
+      [cardKey]: {
+        busyAction: "continue",
+        error: null,
+      },
+    }));
+    try {
+      const result = await rpc.call("continueFinding", {
+        threadId,
+        reviewId: advice.id,
+      });
+      if (!result.started && result.reason !== "already-started") {
+        throw new Error("This finding is no longer open.");
+      }
+      await reload();
+    } catch (caught) {
+      const msg = caught instanceof Error ? caught.message : String(caught);
+      setMutationStateByCard((prev) => ({
+        ...prev,
+        [cardKey]: {
+          busyAction: null,
+          error: msg,
+        },
+      }));
+    } finally {
+      busyMutationsRef.current.delete(cardKey);
+      setMutationStateByCard((prev) => {
+        const existing = prev[cardKey];
+        if (existing?.error) {
+          return {
+            ...prev,
+            [cardKey]: { ...existing, busyAction: null },
+          };
+        }
+        return {
+          ...prev,
+          [cardKey]: { busyAction: null, error: null },
+        };
+      });
+    }
+  };
+
+  return (
+    <div
+      className={`w-full max-w-full rounded-lg border border-border bg-card text-xs text-muted-foreground box-border ${isExpanded ? "px-3 py-2.5 sm:px-4 sm:py-3" : "px-2 py-0"}`}
+    >
+      <button
+        type="button"
+        aria-expanded={isExpanded}
+        aria-controls={detailsId}
+        aria-describedby={isExpanded ? `${summaryId}-full` : summaryId}
+        aria-label={isExpanded ? "Show less" : "Show more"}
+        title={isExpanded ? "Show less" : "Show more"}
+        onClick={toggleExpanded}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            toggleExpanded();
+          }
+        }}
+        className="flex min-h-[44px] w-full items-center gap-2 rounded-md text-left text-muted-foreground hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:min-h-[32px]"
+      >
+        <span className="shrink-0">
+          <SeverityChip severity={advice.severity}>
+            {repeated
+              ? `${SEVERITY_LABEL[advice.severity]} · ${advice.repeatCount}×`
+              : SEVERITY_LABEL[advice.severity]}
+          </SeverityChip>
+        </span>
+        <span id={summaryId} className="min-w-0 flex-1 truncate text-xs text-foreground" title={advice.summary}>
+          {isExpanded ? "Review" : advice.summary}
+        </span>
+        <span className="sr-only">
+          {isExpanded ? "Show less" : "Show more"}
+        </span>
+        <svg
+          className={`h-4 w-4 shrink-0 transition-transform duration-150 ${isExpanded ? "rotate-180" : ""}`}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
+
+      {activeError ? (
+        <div className={`${isExpanded ? "" : "mb-2"} mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-surface-destructive-border bg-surface-destructive px-3 py-2 text-xs text-destructive-text`}>
+          <span className="min-w-0 flex-1 break-words">
+            {activeError}
+          </span>
           <button
             type="button"
             onClick={() => {
-              setDismissError(null);
+              clearMutationError();
               void reload();
             }}
-            className="h-7 rounded-md border border-border bg-card px-2.5 text-xs text-foreground hover:bg-state-hover"
+            className="min-h-[44px] rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground hover:bg-state-hover"
           >
             Retry
           </button>
         </div>
-      </div>
-    );
-  }
+      ) : null}
 
-  const advice = (data as PendingAdviceData | null)?.advice ?? null;
-  if (!advice) return null;
-
-  const repeated = advice.repeatCount > 1;
-
-  return (
-    <div className="rounded-lg border border-border bg-card px-4 py-3 text-xs text-muted-foreground">
-      <div className="flex flex-wrap items-center gap-2">
-        <SeverityChip severity={advice.severity}>
-          {repeated
-            ? `${SEVERITY_LABEL[advice.severity]} · ${advice.repeatCount}×`
-            : SEVERITY_LABEL[advice.severity]}
-        </SeverityChip>
-        <h3 className="min-w-0 flex-1 text-sm font-semibold text-foreground">
-          Advisor reviewed your last turn
-        </h3>
-      </div>
-      <p className="mt-2">
-        <span className="font-medium text-foreground">{advice.summary}</span>
+      <div
+        id={detailsId}
+        hidden={!isExpanded}
+        className={!isExpanded ? "hidden" : "mt-2 max-h-[30dvh] overflow-y-auto"}
+        style={isExpanded ? { maxHeight: "30dvh" } : undefined}
+      >
+        {isExpanded && (
+          <p id={`${summaryId}-full`} className="text-xs break-words font-medium text-foreground">
+            {advice.summary}
+          </p>
+        )}
         {repeated ? (
-          <span className="text-destructive-text">
-            {" "}
+          <p className="mt-1 text-xs text-destructive-text break-words">
             The agent was told this before and did not resolve it.
-          </span>
+          </p>
         ) : null}
-      </p>
-      <p className="mt-1 text-2xs text-subtle-foreground">
-        Start a corrective turn now, or it will be shared with the agent on
-        your next message.
-      </p>
-      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
-        <button
-          type="button"
-          disabled={dismissing}
-          onClick={() => {
-            setDismissing(true);
-            setDismissError(null);
-            // Dismiss the exact advice on screen. The server refuses if newer
-            // advice has since arrived, so a stale click cannot discard a
-            // finding that was never shown.
-            void rpc
-              .call("dismissAdvice", { threadId, adviceId: advice.id })
-              .then(reload)
-              .catch((caught: unknown) => {
-                setDismissError(
-                  caught instanceof Error ? caught.message : String(caught),
-                );
-              })
-              .finally(() => setDismissing(false));
-          }}
-          className="h-7 rounded-md border border-transparent px-2.5 text-xs text-muted-foreground hover:bg-state-hover disabled:opacity-50"
-        >
-          Dismiss
-        </button>
-        <button
-          type="button"
-          onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION_ID })}
-          className="h-7 rounded-md border border-border bg-card px-2.5 text-xs text-foreground hover:bg-state-hover"
-        >
-          View review
-        </button>
-        <button
-          type="button"
-          disabled={continuing}
-          onClick={() => {
-            setContinuing(true);
-            setDismissError(null);
-            void rpc
-              .call("continueFinding", { threadId, reviewId: advice.id })
-              .then((result) => {
-                if (!result.started && result.reason !== "already-started") {
-                  throw new Error("This finding is no longer open.");
-                }
-                return reload();
-              })
-              .catch((caught: unknown) => {
-                setDismissError(
-                  caught instanceof Error ? caught.message : String(caught),
-                );
-              })
-              .finally(() => setContinuing(false));
-          }}
-          className="h-7 rounded-md border border-surface-destructive-border bg-surface-destructive px-2.5 text-xs font-medium text-destructive-text hover:opacity-90 disabled:opacity-50"
-        >
-          {continuing ? "Starting…" : "Fix in new turn"}
-        </button>
+        {advice.details && advice.details.trim().length > 0 ? (
+          <div className="mt-2 text-xs text-muted-foreground break-words overflow-hidden">
+            <Markdown content={advice.details} />
+          </div>
+        ) : null}
+        <p className="mt-1 text-2xs text-subtle-foreground break-words">
+          Start a corrective turn now, or it will be shared with the agent on
+          your next message.
+        </p>
+        <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+          <button
+            type="button"
+            disabled={mutationBusy}
+            onClick={() => void handleDismiss()}
+            className="min-h-[44px] rounded-md border border-transparent px-3 py-2 text-xs text-muted-foreground hover:bg-state-hover disabled:opacity-50"
+          >
+            Dismiss
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION_ID })}
+            className="min-h-[44px] rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground hover:bg-state-hover"
+          >
+            View review
+          </button>
+          <button
+            type="button"
+            disabled={mutationBusy}
+            onClick={() => void handleNotAnIssue()}
+            className="min-h-[44px] rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground hover:bg-state-hover disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Not an issue
+          </button>
+          <button
+            type="button"
+            disabled={mutationBusy}
+            onClick={() => void handleFixInNewTurn()}
+            className="min-h-[44px] rounded-md border border-surface-destructive-border bg-surface-destructive px-3 py-2 text-xs font-medium text-destructive-text hover:opacity-90 disabled:opacity-50"
+          >
+            {busyAction === "continue" ? "Starting…" : "Fix in new turn"}
+          </button>
+        </div>
       </div>
     </div>
   );
