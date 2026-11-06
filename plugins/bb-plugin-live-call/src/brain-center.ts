@@ -1,6 +1,6 @@
 /**
  * Мозговой центр звонка по треду (контракт §12.11).
- * Скрытый тред agy (gemini-3.8-flash-medium) в отдельном worktree.
+ * Скрытый тред acp-devin (swe-2-flash-medium) в отдельном worktree.
  * Готовит глубокую сводку переписки и отвечает на вопросы / выполняет задания.
  */
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -112,8 +112,11 @@ ${historyFile}
         spawned = (await this.opts.sdk.threads.spawn({
           // не-git: служебный проект «Звонки» (его папка не связана с проектом треда)
           projectId: this.opts.isGitRepo ? this.opts.targetProjectId : this.opts.fallbackProjectId,
-          providerId: "agy",
-          model: "gemini-3.8-flash-medium",
+          providerId: "acp-devin",
+          model: "swe-2-flash-medium",
+          reasoningLevel: "medium",
+          // full: тред скрытый — approve-промпты отвечать некому, без этого brain_task встал бы на первом гранте
+          permissionMode: "full",
           visibility: "hidden",
           title: `🧠 Мозговой центр: ${this.opts.targetThreadTitle}`,
           environment,

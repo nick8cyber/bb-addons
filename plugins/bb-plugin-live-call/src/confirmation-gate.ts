@@ -689,14 +689,18 @@ export class ConfirmationGate {
     // Эхо: все слова реплики есть в самом вопросе — это голос агента из динамиков.
     // Модель говорит вопрос своими словами («Да, конечно. Отправить…?») — её слова тоже эхо.
     const since = p.createdAt - MODEL_ECHO_BEFORE_REQUEST_MS;
+    const questionWords = new Set(normalizeUtterance(`${p.say} ${p.card ?? ""}`));
     const sayWords = new Set([
-      ...normalizeUtterance(`${p.say} ${p.card ?? ""}`),
+      ...questionWords,
       ...this.modelSpeech.filter((c) => c.at >= since).flatMap((c) => c.words),
     ]);
     const words = normalizeUtterance(u.text);
     if (words.length === 0 || words.every((w) => isEchoWord(w, sayWords))) return;
     const wordsForTool = this.wordsFor(p.tool);
-    if (classify(u.text, p.class, wordsForTool) !== "approved") return;
+    // Остаток для классификации — после удаления эха только вопроса и карточки, как в окне (§7.1 п. 5.3):
+    // «Да, отправь.» во время «Отправить в тред: …?» — согласие. Широкий набор с речью модели выше
+    // решает лишь, не эхо ли вся реплика, иначе «да» с уточнением из слов филлера засчитывалось бы.
+    if (classify(u.text, p.class, wordsForTool, questionWords) !== "approved") return;
 
     const utteranceMoment = u.vadStartAt ?? (u.firstChunkAt - INPUT_TRANSCRIPT_LAG_MS);
 

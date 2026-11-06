@@ -18,7 +18,7 @@ function mockStore() {
 describe("BrainCenter (§12.11)", () => {
   const testDir = join(tmpdir(), `test-brain-${Date.now()}`);
 
-  it("сохраняет все сообщения в файл и запускает скрытый тред agy в отдельном worktree", async () => {
+  it("сохраняет все сообщения в файл и запускает скрытый тред acp-devin в отдельном worktree", async () => {
     const store = mockStore();
     let spawnArgs: Record<string, unknown> | null = null;
     const sdk = {
@@ -61,8 +61,10 @@ describe("BrainCenter (§12.11)", () => {
     expect(threadId).toBe("thr_brain_1");
     expect(spawnArgs).not.toBeNull();
     const args = spawnArgs as unknown as Record<string, unknown>;
-    expect(args.providerId).toBe("agy");
-    expect(args.model).toBe("gemini-3.8-flash-medium");
+    expect(args.providerId).toBe("acp-devin");
+    expect(args.model).toBe("swe-2-flash-medium");
+    expect(args.reasoningLevel).toBe("medium");
+    expect(args.permissionMode).toBe("full");
     expect(args.visibility).toBe("hidden");
     expect(args.environment).toEqual({
       type: "host",

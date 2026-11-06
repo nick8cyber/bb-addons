@@ -1,15 +1,17 @@
 /**
- * Живой звонок 1 по треду (§12.11 приёмка):
- * Длинный тред (thr_testlong02):
- * 1) Приветствие («Привет, сейчас обрабатываю информацию по треду»);
- * 2) Сводка мозгового центра и её время в мс;
+ * Живой звонок 1 по треду (§12.11 приёмка, сценарий обновлён 06.11 под пересмотр 04.11):
+ * 1) Приветствие — голос сразу пересказывает ответ агента на последний запрос владельца;
+ * 2) сводка мозгового центра идёт МОЛЧАЛОЙ справкой (не озвучивается) — её ms читается из call_events;
  * 3) Ответ на «На чём остановились?»;
- * 4) Один вызов brain_ask.
+ * 4) Один вызов brain_ask: ждём action done, затем первую реплику модели после него
+ *    (промежуточные «секунду, думаю» пропускаются).
  *
  * Использование: node research/probes/test-12-11-call1.mjs <targetThreadId>
  */
 
-import { execSync as __exec } from "node:child_process";
+import { execSync as __exec, execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { homedir } from "node:os";
 const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
 const targetThreadId = process.argv[2];
 if (!targetThreadId) {
@@ -18,6 +20,8 @@ if (!targetThreadId) {
 }
 
 const WS_URL = "ws://127.0.0.1:38886/api/v1/plugins/live-call/http/call";
+const DB = join(homedir(), ".bb/plugins/live-call/data.db");
+const dbq = (q) => execFileSync("sqlite3", [DB, q], { encoding: "utf8" }).trim();
 
 console.log(`=== LIVE CALL 1 (§12.11) ===`);
 console.log(`Target thread: ${targetThreadId}`);
@@ -30,14 +34,15 @@ async function runCall() {
     const turns = [];
     const actions = [];
     let state = "init";
-    let summaryMs = null;
+    let summaryLogged = false;
+    let brainDone = false;
 
     const timeout = setTimeout(() => {
       console.log("\n[TIMEOUT] 180s reached, closing call...");
       try { ws.send(JSON.stringify({ type: "end" })); } catch {}
       setTimeout(() => {
         try { ws.close(); } catch {}
-        resolve({ callId, callThreadId, turns, actions, summaryMs });
+        resolve({ callId, callThreadId, turns, actions });
       }, 2000);
     }, 180_000);
 
@@ -74,6 +79,24 @@ async function runCall() {
       if (frame.type === "action") {
         console.log(`[ACTION] ${frame.tool} (${frame.status}): ${frame.summary}`);
         actions.push(frame);
+        if (frame.tool === "brain_ask" && (frame.status === "done" || frame.status === "failed")) {
+          brainDone = true;
+          try {
+            const ms = dbq(`select json_extract(payload,'$.ms') from call_events where call_id='${callId}' and kind='brain_answer' order by seq desc limit 1`);
+            if (ms) console.log(`[BRAIN] brain_ask занял ${ms} мс`);
+          } catch {}
+        }
+      }
+
+      // Сводка молчалая — логируем её ms из журнала событий, когда появится
+      if (callId && !summaryLogged) {
+        try {
+          const row = dbq(`select json_extract(payload,'$.ms') from call_events where call_id='${callId}' and kind='brain_summary' limit 1`);
+          if (row) {
+            summaryLogged = true;
+            console.log(`[BRAIN] сводка мозгового центра готова за ${row} мс (молчалая справка, не озвучивается)`);
+          }
+        } catch {}
       }
 
       if (frame.type === "transcript") {
@@ -83,21 +106,17 @@ async function runCall() {
 
           // Обработка стадий диалога
           if (state === "init") {
-            // Первое сообщение агента — приветствие
-            console.log("--> Приветствие получено. Ждём сводку мозгового центра...");
-            state = "waiting_summary";
-          } else if (state === "waiting_summary") {
-            // Второе сообщение агента — пересказ сводки мозгового центра
-            console.log("--> Сводка озвучена! Задаём вопрос «На чём остановились?» через 1.5 с...");
+            // Первое сообщение агента — приветствие/пересказ ответа агента треда
+            console.log("--> Приветствие получено. Задаём вопрос «На чём остановились?» через 3 с...");
             state = "asking_paused";
             setTimeout(() => {
               console.log('[USER SEND] "На чём остановились?"');
               ws.send(JSON.stringify({ type: "text", text: "На чём остановились?" }));
               state = "waiting_paused_answer";
-            }, 1500);
+            }, 3000);
           } else if (state === "waiting_paused_answer") {
-            // Третье сообщение агента — ответ на «На чём остановились?»
-            console.log("--> Ответ на «На чём остановились?» получен! Запрашиваем brain_ask через 1.5 с...");
+            // Ответ на «На чём остановились?»
+            console.log("--> Ответ получен! Запрашиваем brain_ask через 1.5 с...");
             state = "asking_brain";
             setTimeout(() => {
               const q = "Спроси у мозгового центра через brain_ask: какие сейчас главные открытые вопросы?";
@@ -105,8 +124,8 @@ async function runCall() {
               ws.send(JSON.stringify({ type: "text", text: q }));
               state = "waiting_brain_answer";
             }, 1500);
-          } else if (state === "waiting_brain_answer") {
-            // Четвёртое сообщение агента — результат вызова brain_ask
+          } else if (state === "waiting_brain_answer" && brainDone) {
+            // Первая реплика модели ПОСЛЕ завершения brain_ask — озвученный результат
             console.log("--> Ответ по brain_ask получен! Завершаем звонок через 3 с...");
             state = "finishing";
             setTimeout(() => {
@@ -124,14 +143,14 @@ async function runCall() {
         console.log(`[ENDED] reason=${frame.reason}`);
         clearTimeout(timeout);
         ws.close();
-        resolve({ callId, callThreadId, turns, actions, summaryMs });
+        resolve({ callId, callThreadId, turns, actions });
       }
 
       if (frame.type === "error") {
         console.error(`[ERROR] ${frame.code}: ${frame.message}`);
         clearTimeout(timeout);
         ws.close();
-        resolve({ callId, callThreadId, turns, actions, summaryMs, error: frame });
+        resolve({ callId, callThreadId, turns, actions, error: frame });
       }
     };
 
@@ -141,7 +160,7 @@ async function runCall() {
 
     ws.onclose = () => {
       clearTimeout(timeout);
-      resolve({ callId, callThreadId, turns, actions, summaryMs });
+      resolve({ callId, callThreadId, turns, actions });
     };
   });
 }
