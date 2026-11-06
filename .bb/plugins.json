@@ -42,6 +42,10 @@
     {
       "name": "privacy-blur",
       "source": "./plugins/bb-plugin-privacy-blur"
+    },
+    {
+      "name": "tasks-pro",
+      "source": "./plugins/bb-plugin-tasks-pro"
     }
   ]
 }
