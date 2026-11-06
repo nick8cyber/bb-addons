@@ -8,4 +8,5 @@ export type QueryResult = PluginRpcResult<Contract["queryTasks"]>;
 export type DetailResult = PluginRpcResult<Contract["getTaskDetail"]>;
 export type ViewsResult = PluginRpcResult<Contract["listViews"]>;
 export type EnrichedTask = QueryResult["tasks"][number];
+export type DetailTask = NonNullable<DetailResult["task"]>;
 export type SavedViewData = ViewsResult["views"][number];

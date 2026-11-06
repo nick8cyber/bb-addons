@@ -7,7 +7,7 @@ import {
   useBbNavigate,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { Contract, DetailResult, EnrichedTask } from "./app-types";
+import type { Contract, DetailResult, DetailTask } from "./app-types";
 import { STATUS_LABEL } from "./query";
 import {
   PriorityChip,
@@ -129,7 +129,7 @@ function DrawerBody({
   onOpenTask(taskId: string): void;
   onOpenThread(threadId: string): void;
 }) {
-  const task = detail.task as EnrichedTask;
+  const task = detail.task as DetailTask;
   return (
     <div className="space-y-4">
       <h2 className="text-sm font-semibold leading-snug">{task.title}</h2>

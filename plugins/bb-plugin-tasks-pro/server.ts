@@ -121,6 +121,8 @@ const enrichedTaskSchema = taskSchema.extend({
   threadCount: z.number().nullable(),
 });
 
+const listTaskSchema = enrichedTaskSchema.omit({ description: true });
+
 const savedViewSchema = z
   .object({
     id: z.string(),
@@ -157,7 +159,7 @@ export const rpcContract = defineRpcContract({
     output: z
       .object({
         available: z.boolean(),
-        tasks: z.array(enrichedTaskSchema),
+        tasks: z.array(listTaskSchema),
         total: z.number(),
       })
       .strict(),
@@ -326,7 +328,11 @@ export default async function plugin(bb: BbPluginApi) {
           q,
         );
         const sorted = applySort(filtered, q.sort);
-        return { available: true, tasks: sorted, total: enriched.length };
+        return {
+          available: true,
+          tasks: sorted.map(({ description: _description, ...task }) => task),
+          total: enriched.length,
+        };
       } catch (error) {
         bb.log.warn(`tasks query failed: ${String(error)}`);
         return { available: false, tasks: [], total: 0 };

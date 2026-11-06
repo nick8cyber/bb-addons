@@ -51,7 +51,9 @@ export interface Query {
   group?: GroupKey;
 }
 
-export interface EnrichedTask extends Task {
+export type EnrichedTask = Omit<Task, "description"> & {
+  /** Only present inside the server query pipeline; stripped from list RPC. */
+  description?: string;
   project: Project | null;
   folder: Folder | null;
   labels: Label[];
@@ -64,7 +66,7 @@ export interface EnrichedTask extends Task {
   activeThreads: TaskThread[];
   /** All attached threads (any liveStatus) — null without the SQLite read. */
   threadCount: number | null;
-}
+};
 
 export const STATUS_ORDER: readonly TaskStatus[] = [
   "backlog",
@@ -344,7 +346,7 @@ export function applySearch(
       task.title,
       task.key,
       String(task.number),
-      task.description,
+      task.description ?? "",
       task.project?.name ?? "",
       task.project?.prefix ?? "",
       ...task.labels.map((l) => l.name),
