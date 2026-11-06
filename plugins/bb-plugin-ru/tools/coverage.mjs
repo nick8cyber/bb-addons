@@ -78,9 +78,27 @@ let totalRu = 0;
 for (const route of routes) {
   try {
     await page.goto(`${BASE}${route}`, {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
       timeout: 25000,
     });
+    // Ждём, пока перевод вообще запустится: «Новый тред» есть на каждом
+    // экране, и пока его не видно по-русски, плагин ещё не применил словарь.
+    await page
+      .waitForFunction(
+        () => {
+          const walker = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+          );
+          let node;
+          while ((node = walker.nextNode())) {
+            if (node.data.trim() === "Новый тред") return true;
+          }
+          return false;
+        },
+        { timeout: 30000, polling: 500 },
+      )
+      .catch(() => {});
     // Ждём, пока перевод устоится: React дорисовывает, плагин догоняет.
     await page
       .waitForFunction(
