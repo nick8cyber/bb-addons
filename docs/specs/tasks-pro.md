@@ -22,9 +22,9 @@ tags: [bb, plugins, tasks, explorer]
 
 Плагин `tasks-pro`, пакет `bb-plugin-tasks-pro`, живёт в
 `plugins/bb-plugin-tasks-pro` репозитория bb-addons. Регистрирует свою
-навигационную панель (`app.slots.navPanel`, id `explorer`, заголовок
-«Tasks Pro», иконка `ListFilter` или аналог) — отдельный экран рядом с родным
-«Tasks». Родной плагин не трогаем: его доска, CLI `bb tasks` и dispatch
+навигационную панель (`app.slots.navPanel`, обязательные `id:"explorer"`,
+`title:"Tasks Pro"`, `path:"explorer"`, `icon` `ListFilter` или аналог) —
+отдельный экран рядом с родным «Tasks». Родной плагин не трогаем: его доска, CLI `bb tasks` и dispatch
 продолжают работать, данные общие.
 
 Экран:
@@ -41,9 +41,12 @@ tags: [bb, plugins, tasks, explorer]
   (просмотр).
 - **Клик по задаче** — read-only drawer справа: все поля задачи, лейблы,
   комментарии, прикреплённые треды (клик → `navigate.toThread`), сабтаски,
-  PR-ссылки. Кнопка «Open in Tasks» ведёт в родную панель tasks (активация
-  `navPanel` через навигационные actions — точный механизм исполнитель
-  сверяет с SDK).
+  PR-ссылки. Кнопка «Open in Tasks» ведёт в родную панель tasks.
+  `experimental_useAppPanel().openTab` открывает только табы своего плагина —
+  рабочий механизм: активация `navPanel` через навигационные actions
+  (`experimental_useSidebarNavigation().actions.activate("tasks/<panelId>")`)
+  либо обычная ссылка на роут панели; точный panelId и механизм исполнитель
+  сверяет с SDK/хостом.
 - **Сохранённые виды**: именованные наборы {filters, sort, group, search,
   view}, хранятся в storage плагина, применяются из селектора. Пресеты по
   умолчанию: «Просроченные», «В работе», «Сделано за неделю», «Все без
@@ -59,7 +62,10 @@ refresh; если SDK даёт realtime/invalidation по тегам RPC tasks �
 
 Вызов из нашего backend: `bb.sdk.plugins.callRpc({ pluginId: "tasks", method,
 input, outputSchema })`. Каждый вызов оборачиваем: tasks выключен/удалён →
-панель показывает понятный empty-state, а не падает.
+панель показывает понятный empty-state, а не падает. `callRpc` отваливается
+по 75 с — запросы батчим (один `listAllTasks` + один `listTaskCardMeta` + один
+`labelsByProject` на каталог) и кешируем каталог с TTL, а не дёргаем на каждый
+клик фильтра.
 
 Схемы вытащены из `bb-app@0.48.1`
 `server/dist/builtin-plugins/tasks/dist/server.js` — контракт под этой
@@ -92,7 +98,7 @@ Label   = { id, projectId, name, color }
 Comment = { id, taskId, kind: "user"|"agent"|"system", authorName,
             presetName|null, threadId|null, body, notifiedCount, createdAt }
 TaskThread = { id, taskId, threadId, presetName, title,
-               liveStatus: "starting"|"pending"|"idle"|"active"|"stopping"|"error",
+               liveStatus: "starting"|"working"|"idle"|"completed"|"failed",
                attachedAt, updatedAt }
 ```
 
@@ -154,6 +160,7 @@ interface Query {
   due?: DateRange; created?: DateRange;
   updated?: DateRange;     completed?: DateRange | "notCompleted";
   threads?: "active" | "any" | "none";
+  // "active" = liveStatus in ("starting","working"); "any" = хотя бы один тред
   attachments?: boolean;
   depth?: "top" | "subtasks" | "all";
   search?: string;
@@ -180,8 +187,9 @@ interface Query {
 - `npm run typecheck` (tsc --noEmit), `npm test` (vitest: фильтры, сортировка
   null-last, группировка, поиск по токенам, enrich-парсер system-комментариев).
 - `bb plugin build .` — собирается без warnings по API.
-- `bb plugin install <worktrees>/bb-addons-tasks-pro/plugins/bb-plugin-tasks-pro`
-  — path-install; в сайдбаре появляется «Tasks Pro», экран открывается,
+- `bb plugin install <абсолютный путь plugins/bb-plugin-tasks-pro в worktree
+  исполнителя>` — path-install; в сайдбаре появляется «Tasks Pro», экран
+  открывается,
   фильтры/сортировка/поиск/группировка работают на реальных данных, drawer
   открывает тред, «Open in Tasks» ведёт в родную панель.
 - Деградация: с выключенным плагином tasks — empty-state; с отсутствующей
