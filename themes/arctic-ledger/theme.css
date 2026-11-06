@@ -395,3 +395,38 @@ diffs-container {
   --usage-sidebar-focus: #2e77b3;
   color: #14213d;
 }
+
+/* BB 0.46 adds a navigation rail using bg-surface-recessed inside the
+ * sidebar. Keep that local surface in the indigo palette, not the pale
+ * code/composer surface from the main canvas. */
+:is([data-testid="app-nav-rail"], [data-testid="sidebar-footer-row"] > :first-child) {
+  --surface-recessed: var(--sidebar);
+  --arctic-rail-selected-ink: #10203a;
+}
+
+.dark :is([data-testid="app-nav-rail"], [data-testid="sidebar-footer-row"] > :first-child) {
+  --arctic-rail-selected-ink: #e3effc;
+}
+
+/* Rail destinations use aria-current/aria-pressed/data-state, not the
+ * old menu-button data-active contract. A light cornflower selection
+ * needs dark icons; dark appearance keeps its light icons. */
+:is([data-testid="app-nav-rail"], [data-testid="sidebar-footer-row"] > :first-child) button:is(
+  [aria-current="page"],
+  [aria-pressed="true"],
+  [data-state="open"]
+) {
+  --foreground: var(--arctic-rail-selected-ink);
+  --sidebar-foreground: var(--arctic-rail-selected-ink);
+  color: var(--arctic-rail-selected-ink);
+  background-color: var(--state-active);
+}
+
+:is([data-testid="app-nav-rail"], [data-testid="sidebar-footer-row"] > :first-child) button:hover:not(
+  [aria-current="page"],
+  [aria-pressed="true"],
+  [data-state="open"]
+) {
+  color: var(--sidebar-foreground);
+  background-color: var(--state-hover);
+}
