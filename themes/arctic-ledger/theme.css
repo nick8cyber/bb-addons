@@ -440,8 +440,7 @@ diffs-container {
  * already dark and keep their own tokens. */
 :root:not(.dark) :is(
   [data-testid="nav-rail-customize"],
-  [data-testid="sidebar-navigation-customize"],
-  [data-testid="sidebar-footer-customize"]
+  [data-testid="sidebar-navigation-customize"]
 ) {
   --sidebar-foreground: #14213d;
   --sidebar-accent: #d7e7f6;
