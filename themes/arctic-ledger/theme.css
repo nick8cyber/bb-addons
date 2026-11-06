@@ -449,17 +449,18 @@ diffs-container {
   --muted-foreground: #496784;
 }
 
-/* Hide badge/dot indicators inside sidebar navigation destinations and on
- * the aggregate "Ещё"/More row — owner asked for a calm rail without dots. */
-[data-sidebar-navigation-item] :is(
+/* Hide badge/dot indicators inside sidebar navigation — destinations list,
+ * icon rail, and the aggregate "Ещё"/More row wherever it nests. Anchored
+ * on bb's semantic attributes/testids, not utility classes. */
+:is(
+  [data-testid="sidebar-navigation-list"],
+  [data-testid="sidebar-navigation-destinations"],
+  [data-testid="sidebar-navigation-rail"],
+  [data-sidebar-navigation-item]
+) :is(
   [data-testid$="attention-badge"],
   [class*="attention-badge"],
   [class*="badge"],
-  span[class*="rounded-full"]
-),
-[data-testid="sidebar-navigation-list"] button[class*="pr-7"] > :is(
-  [data-testid$="attention-badge"],
-  [class*="attention-badge"],
   span[class*="rounded-full"]
 ) {
   display: none !important;
