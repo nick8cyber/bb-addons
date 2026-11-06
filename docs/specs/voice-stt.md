@@ -83,7 +83,7 @@ devDependencies: `@get-bb/plugin-sdk` (та же линия, что у live-call
 |---|---|---|---|---|
 | `geminiKeys` | string | да | — | 1–2 ключа Gemini AI Studio построчно (как у live-call). |
 | `groqApiKey` | string | да | — | ключ Groq; пусто = стадия Groq пропускается. |
-| `language` | string | нет | `""` | код языка (`ru`…); пусто = автодетект. Идёт в Gemini `languageCodes` и Groq `language`. |
+| `language` | string | нет | `""` | BCP-47 (`ru`, `ru-RU`); пусто = автодетект. Валидация `^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$`, невалидно → null. Gemini получает как есть (`languageCodes`), для Groq срезается регион (`ru-RU`→`ru`, ISO-639-1). |
 | `geminiLiveModel` | string | нет | `gemini-3.5-transcribe-live` | live-модель; `models/` добавляется в setup. |
 | `groqModel` | string | нет | `whisper-large-v3-turbo` | батч-модель Groq. |
 
@@ -94,8 +94,8 @@ devDependencies: `@get-bb/plugin-sdk` (та же линия, что у live-call
 
 bb 0.48.1 валидирует **функциональную** форму (`validatePluginAiServiceDeclaration`
 в server bundle: `complete`/`transcribe`/`status` — функции, хотя бы одна из
-complete/transcribe обязательна). Декларативная форма `{id, displayName, kinds}`
-из новых SDK-типов на 0.48.1 НЕ работает — не использовать.
+complete/transcribe обязательна). Декларативная форма `{id, displayName,
+kinds}` из SDK-типов 0.4.x валидатором 0.48.1 НЕ принимается — не использовать.
 
 ```ts
 bb.experimental_aiServices.register({
@@ -140,7 +140,7 @@ transcribe: async (audio, { signal, hint }) => {
     hint,
     config: cfg,            // ключи, модели, язык — см. схему §5
     timeoutMs: 65_000,
-  }, { hostId, signal, timeoutMs: 65_000 });
+  }, { hostId, signal, timeoutMs: 66_000 }); // +1 c grace, как у codex
   if (!res.ok) throw new Error(res.message);
   return res.text;
 }
@@ -166,23 +166,24 @@ host `voice-stt.status` с бюджетом ~1.2 c (весь status ≤2 c), и�
 ```ts
 const contract = {
   "voice-stt.transcribe": { input: z.object({
-      audioBase64: z.string(), mimeType: z.string(), filename: z.string(),
+      audioBase64: z.string().min(1), mimeType: z.string(), filename: z.string(),
       hint: z.string().nullable(),
       config: z.object({
         geminiKeys: z.array(z.string()),
         geminiLiveModel: z.string(),
         groqApiKey: z.string().nullable(),
         groqModel: z.string(),
-        language: z.string().nullable(),
+        language: z.string().nullable(),   // сервер нормализует "" → null
       }).strict(),
       timeoutMs: z.number().int().positive(),
     }).strict(),
     output: z.union([
-      z.object({ ok: z.literal(true), text: z.string(), engine: z.string() }).strict(),
+      z.object({ ok: z.literal(true), text: z.string(),
+        engine: z.enum(["gemini-live","codex","groq"]) }).strict(),
       z.object({ ok: z.literal(false), code: z.string(), message: z.string() }).strict(),
     ]) },
   "voice-stt.status": { input: z.object({}).strict(), output: z.object({
-      codexAuth: z.enum(["ok","missing","invalid","unusable"]),
+      codexAuth: z.enum(["ok","missing","invalid","unusable","expired"]),
       ffmpeg: z.boolean(),
     }).strict() },
 };
@@ -198,9 +199,10 @@ const contract = {
    таймаут 5 c. Нет ffmpeg или ошибка декода — Gemini-стадия пропускается
    (пометить в лог), codex/groq работают по исходному webm.
 3. **Стадия Gemini Live** (§6): по каждому ключу из `geminiKeys` один заход;
-   на quota-ошибку (429/RESOURCE_EXHAUSTED в error-фрейме или HTTP-отказе
-   апгрейда) — следующий ключ; на прочую ошибку — стадия провалена, переход к
-   codex. Пустой финал (тишина) = мягкий провал стадии → codex (по ADR-0002).
+   ЛЮБОЙ сбой до первого распознанного текста (auth/quota-отказ апгрейда,
+   error-фрейм, таймаут setup, разрыв сокета) — следующий ключ; все ключи
+   исчерпаны — стадия провалена, переход к codex. Пустой финал (тишина) =
+   мягкий провал стадии → codex (по ADR-0002).
 4. **Стадия Codex** (§7): любой сбой → Groq.
 5. **Стадия Groq** (§8): нет ключа — пропуск; любой сбой → финальная ошибка.
 6. Итог: первый непустой текст побеждает; `engine` = `"gemini-live" | "codex" |
@@ -213,21 +215,26 @@ auth_required, request_failed, invalid_response}` (классификация к
 provider-codex: `AiServiceFailure{code, detailCode, message}` →
 `{ok:false, code, message}`; AbortError → `timeout`).
 
-Бюджеты стадий (в рамках общих 65 c): Gemini ≤30 c на ключ-сессию
-(connect+setup ≤5 c, иначе стадия провалена), Codex ≤20 c, Groq ≤20 c.
+Бюджеты стадий (в рамках общих 65 c, сумма худшего случая ≤58 c):
+ffmpeg ≤4 c, Gemini ≤12 c на ключ-сессию (connect+setup ≤5 c),
+Codex ≤15 c, Groq ≤15 c. **Guard по остатку**: перед каждой стадией если
+`remainingMs < 5000` — стадия пропускается с пометкой `timeout` в причинах
+(дедлайн считается от `timeoutMs`/signal один раз на входе).
 
 ## 6. Gemini Live — точный протокол (порт OmniFlow)
 
 ### 6.1. Сокет
 
 - URL: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=<apiKey>`
-- Аутентификация: ключ в query-параметре `key` (как `live-client.ts` live-call).
-  Заголовок `x-goog-api-key` предпочтительнее по OmniFlow, но нативный
-  `WebSocket` Node/undici не даёт кастомных заголовков — только `?key=`.
-- В логах URL маскируется: `url.replace(/key=[^&]+/, "key=…")` — значение
-  ключа нигде не печатается.
+- Аутентификация: ключ в query-параметре `key` — документированный способ
+  Google и путь live-call (undici WebSocket на Node 22 технически умеет
+  заголовки через init-dict, но держимся канонического варианта).
+- Ключ маскируется ВЕЗДЕ: в логах `url.replace(/key=[^&]+/, "key=…")` и из
+  текстов ошибок значение ключа вычищается перед пробросом наверх.
 - WebSocket — глобальный `WebSocket` Node (как `live-client.ts` live-call);
   кадры могут приходить бинарными — принимать string | Blob | ArrayBuffer.
+- Лимит сессии Gemini Live ~10 мин — для файлового STT неактуально, но
+  фиксируем: входные записи голосового ввода bb на порядки короче.
 
 ### 6.2. Кадры
 
@@ -289,14 +296,16 @@ split по `\n , ;` → trim → выкинуть пустые → dedup по lo
 После `audioStreamEnd`: resolve когда `sinceEnd ≥ 0.8c И sinceLastInterim ≥
 1.0c`, либо `sinceEnd ≥ 6.0c` (cap); poll 80 мс. `turnComplete` после
 streamEnded → тоже resolve с накопленным. Тишина без интеримов: сработает по
-minWait/settle от момента streamEnd (lastInterimAt армить от setupComplete).
+minWait/settle от момента streamEnd (lastInterimAt армить от setupComplete и
+обновлять также на voiceActivity-кадрах — активность = доказательство
+живого распознавания).
 
 ### 6.7. Обработка файла целиком
 
 Наш вход — уже готовый файл, не живой поток: после setupComplete шлём все
 чанки подряд (необязательно «в реальном темпе»), затем `audioStreamEnd`.
-Ждём финал с адаптивным финишем. Бюджет на одну ключ-сессию ≤30 c
-(connect+setup ≤5 c, иначе пробуем следующий ключ или выходим из стадии).
+Ждём финал с адаптивным финишем. Бюджет на одну ключ-сессию ≤12 c
+(connect+setup ≤5 c, иначе следующий ключ; см. бюджеты §5).
 
 ## 7. Codex — точный протокол (порт provider-codex 0.48.1, host.js)
 
@@ -314,7 +323,12 @@ env honoured, иначе `~/.codex`.
   `isFedrampAccount` = claim `chatgpt_account_is_fedramp` в любом токене.
 - Файл нет/не читается → `auth_required`/`codex_auth_missing`; не-JSON или
   unusable → `auth_required`/`codex_auth_invalid`.
-- Рефреша токена нет: истёкший → 401 → `auth_required`.
+- Рефреша токена нет: истёкший (claim `exp` < now) → классификация `expired`;
+  на запросе всё равно идём (токен могли обновить вне файла), 401 →
+  `auth_required`.
+- Маппинг в `voice-stt.status.codexAuth`: `ok`→`ok` (если `expired` →
+  `expired`), `missing`/`unreadable`→`missing`, `malformed`→`invalid`,
+  `unusable`→`unusable`.
 
 ### 7.2. Запрос (из бандла)
 
@@ -329,8 +343,9 @@ env honoured, иначе `~/.codex`.
   не null).
 - Ответ JSON: текст из поля `text`; нет поля или не-JSON → `invalid_response`/
   `codex_response_invalid`. Лимит ответа 1 МБ.
-- HTML-ответ chatgpt.com (Cloudflare challenge) → `service_unavailable` с
-  пояснением про challenge.
+- Cloudflare challenge: `403` + заголовок `cf-mitigated:"challenge"` ИЛИ
+  content-type `text/html` → `service_unavailable` с пояснением. Cookie-jar
+  retry из provider-codex НЕ портим (документированное упрощение).
 - Маппинг HTTP: 401→`auth_required`, 429→`rate_limited`, ≥500→
   `service_unavailable`, прочее→`request_failed`; AbortError → `timeout`.
 
@@ -359,7 +374,11 @@ env honoured, иначе `~/.codex`.
 - FormData codex/groq: `model`, `prompt` только при hint, `response_format` по
   модели.
 - Цепочка: замоканные стадии — порядок Gemini→Codex→Groq, пропуск Groq без
-  ключа, ротация ключей Gemini при quota, итоговая ошибка собирает причины.
+  ключа, ротация ключей Gemini при quota И при auth-отказе апгрейда,
+  guard `remainingMs<5000` пропускает стадию, итоговая ошибка собирает причины.
+- Маскировка `?key=` в логах и в текстах ошибок (значение ключа не всплывает).
+- `language`: нормализация `""`→null, `ru-RU`→`ru` для Groq, невалидный код →
+  null.
 - Формат ошибок: коды из множества §5.
 
 Живые сетевые вызовы в тестах запрещены — WS/HTTP мокаются.
