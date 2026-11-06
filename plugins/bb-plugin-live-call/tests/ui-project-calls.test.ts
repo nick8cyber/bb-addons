@@ -109,6 +109,9 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
         experimental_threadAction: vi.fn((reg) => {
           registeredSlots.experimental_threadAction = reg;
         }),
+        experimental_threadHeaderAction: vi.fn((reg) => {
+          registeredSlots.experimental_threadHeaderAction = reg;
+        }),
         experimental_newThreadPanelAction: vi.fn((reg) => {
           registeredSlots.experimental_newThreadPanelAction = reg;
         }),
@@ -149,15 +152,19 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
     });
 
     it("регистрирует кнопку шапки треда «Звонок по треду» с иконкой телефона", () => {
-      const threadAction = registeredSlots.experimental_threadAction;
-      expect(threadAction).toBeDefined();
-      expect(threadAction.id).toBe("call");
-      expect(threadAction.title).toBe("Звонок по треду");
-      expect(threadAction.icon).toBe("live-call/phone");
-      expect(threadAction.placement).toBe("header");
-      const item = threadAction.item({ thread: { id: "thr_test01" } });
-      expect(item?.label).toBe("Звонок по треду");
-      expect(item?.icon).toBe("live-call/phone");
+      const headerAction = registeredSlots.experimental_threadHeaderAction;
+      expect(headerAction).toBeDefined();
+      expect(headerAction.id).toBe("call");
+      expect(headerAction.title).toBe("Звонок по треду");
+      const el = headerAction.component({ threadId: "thr_test01", projectId: "proj_test", isCompactViewport: false });
+      expect(el.type).toBe("button");
+      expect(el.props["aria-label"]).toBe("Звонок по треду");
+      const children = [el.props.children].flat();
+      expect(children.some((c: any) => typeof c === "object" && c?.props?.name === "phone")).toBe(true);
+      expect(children.some((c: any) => typeof c === "object" && c?.props?.children === "Звонок по треду")).toBe(true);
+      // Компактная ширина — только иконка, без текста
+      const compact = headerAction.component({ threadId: "thr_test01", projectId: "proj_test", isCompactViewport: true });
+      expect([compact.props.children].flat().some((c: any) => typeof c === "object" && c?.props?.children === "Звонок по треду")).toBe(false);
     });
 
     it("регистрирует команду «Live Call: позвонить по проекту»", () => {

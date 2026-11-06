@@ -10,14 +10,39 @@
  */
 import "./app.css";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
+import type { ComponentType } from "react";
 
 import { CallOverlay } from "./src/ui/CallOverlay.js";
+import { Icon } from "./src/ui/icons.js";
 import { SettingsSection } from "./src/ui/SettingsSection.js";
 import { callEngine } from "./src/ui/engine.js";
 import { initProjectEvents } from "./src/ui/project-events.js";
 import { rpc, type ProjectCallsListResult } from "./src/ui/rpc.js";
 
 const PHONE_ICON = "live-call/phone";
+
+/** Пропсы слота experimental_threadHeaderAction (в типах SDK 0.6 слот legacy и не объявлен, рантайм хоста его принимает). */
+interface ThreadHeaderActionProps {
+  threadId: string;
+  projectId: string;
+  isCompactViewport: boolean;
+}
+
+/** Кнопка звонка по треду в шапке: нативный threadAction/placement "header" рисует только label без иконки (контракт §12). */
+function ThreadCallButton({ threadId, isCompactViewport }: ThreadHeaderActionProps) {
+  return (
+    <button
+      type="button"
+      title="Звонок по треду"
+      aria-label="Звонок по треду"
+      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border px-2 text-xs text-foreground hover:bg-state-hover"
+      onClick={() => (callEngine.isActive() ? callEngine.requestExpand() : callEngine.start({ threadId }))}
+    >
+      <Icon name="phone" size={14} />
+      {isCompactViewport ? null : <span>Звонок по треду</span>}
+    </button>
+  );
+}
 
 /** Нет звонка — позвонить; звонок идёт — развернуть док. */
 const callOrFocus = () => (callEngine.isActive() ? callEngine.requestExpand() : callEngine.start());
@@ -33,17 +58,16 @@ export default definePluginApp((app) => {
     onActivate: callOrFocus,
   });
 
-  app.slots.experimental_threadAction({
+  (app.slots as unknown as {
+    experimental_threadHeaderAction(registration: {
+      id: string;
+      title: string;
+      component: ComponentType<ThreadHeaderActionProps>;
+    }): void;
+  }).experimental_threadHeaderAction({
     id: "call",
     title: "Звонок по треду",
-    icon: PHONE_ICON,
-    group: "live-call",
-    placement: "header",
-    item: ({ thread }) => ({
-      label: "Звонок по треду",
-      icon: PHONE_ICON,
-      run: () => (callEngine.isActive() ? callEngine.requestExpand() : callEngine.start({ threadId: thread.id })),
-    }),
+    component: ThreadCallButton,
   });
 
   // Действие панели создания треда «Позвонить по проекту» (§15.1 п. 1)
