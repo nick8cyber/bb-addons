@@ -1,13 +1,18 @@
 /**
- * Живой звонок 2 по треду (§12.11 приёмка):
+ * Живой звонок 2 по треду (§12.11 приёмка, сценарий обновлён 06.11 под пересмотр 04.11):
  * Тестовый тред с собственным worktree:
- * brain_task «создай файл test-brain.txt с текстом ok» -> confirm approve ->
- * файл появился в worktree мозгового центра, а не в папке целевого треда; после проверки файл удалить.
+ * приветствие → brain_task «создай файл test-brain.txt с текстом ok» → confirm approve →
+ * ждём action done, затем первую реплику модели после него → конец звонка.
+ * Файл должен появиться в worktree мозгового центра, а не в папке целевого треда;
+ * после проверки файл удалить (см. brain-isolation-check.mjs).
+ * Сводка мозгового центра — молчалая справка, её ms логируется из call_events.
  *
  * Использование: node research/probes/test-12-11-call2.mjs <testThreadId>
  */
 
-import { execSync as __exec } from "node:child_process";
+import { execSync as __exec, execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { homedir } from "node:os";
 const TOKEN = process.env.LC_TOKEN ?? __exec("bb call token", { encoding: "utf8" }).trim(); // §16.2
 const testThreadId = process.argv[2];
 if (!testThreadId) {
@@ -16,6 +21,8 @@ if (!testThreadId) {
 }
 
 const WS_URL = "ws://127.0.0.1:38886/api/v1/plugins/live-call/http/call";
+const DB = join(homedir(), ".bb/plugins/live-call/data.db");
+const dbq = (q) => execFileSync("sqlite3", [DB, q], { encoding: "utf8" }).trim();
 
 console.log(`=== LIVE CALL 2 (§12.11) ===`);
 console.log(`Test thread: ${testThreadId}`);
@@ -29,6 +36,8 @@ async function runCall() {
     const actions = [];
     let state = "init";
     let confirmed = false;
+    let brainDone = false;
+    let summaryLogged = false;
 
     const timeout = setTimeout(() => {
       console.log("\n[TIMEOUT] 180s reached, closing call...");
@@ -72,6 +81,23 @@ async function runCall() {
       if (frame.type === "action") {
         console.log(`[ACTION] ${frame.tool} (${frame.status}): ${frame.summary}`);
         actions.push(frame);
+        if (frame.tool === "brain_task" && (frame.status === "done" || frame.status === "failed")) {
+          brainDone = true;
+          try {
+            const ms = dbq(`select json_extract(payload,'$.ms') from call_events where call_id='${callId}' and kind='brain_answer' order by seq desc limit 1`);
+            if (ms) console.log(`[BRAIN] brain_task занял ${ms} мс`);
+          } catch {}
+        }
+      }
+
+      if (callId && !summaryLogged) {
+        try {
+          const row = dbq(`select json_extract(payload,'$.ms') from call_events where call_id='${callId}' and kind='brain_summary' limit 1`);
+          if (row) {
+            summaryLogged = true;
+            console.log(`[BRAIN] сводка мозгового центра готова за ${row} мс (молчалая справка, не озвучивается)`);
+          }
+        } catch {}
       }
 
       if (frame.type === "confirmation") {
@@ -101,18 +127,16 @@ async function runCall() {
           turns.push({ role: "agent", text: frame.text, at: Date.now() });
 
           if (state === "init") {
-            console.log("--> Приветствие получено. Ждём сводку мозгового центра...");
-            state = "waiting_summary";
-          } else if (state === "waiting_summary") {
-            console.log("--> Сводка озвучена! Отправляем задачу brain_task через 1.5 с...");
+            console.log("--> Приветствие получено. Отправляем задачу brain_task через 3 с...");
             state = "sending_task";
             setTimeout(() => {
               const taskText = "поставь задачу мозговому центру: создай файл test-brain.txt с текстом ok";
               console.log(`[USER SEND] "${taskText}"`);
               ws.send(JSON.stringify({ type: "text", text: taskText }));
               state = "waiting_task_done";
-            }, 1500);
-          } else if (state === "waiting_task_done" && confirmed) {
+            }, 3000);
+          } else if (state === "waiting_task_done" && confirmed && brainDone) {
+            // Первая реплика модели ПОСЛЕ завершения brain_task — озвученный результат
             console.log("--> Задача выполнена мозговым центром и подтверждена агентом! Завершаем звонок через 3 с...");
             state = "finishing";
             setTimeout(() => {
