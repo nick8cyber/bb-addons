@@ -126,9 +126,61 @@ describe("BrainCenter (§12.11)", () => {
       expect((res.data as any)?.answer).toBe("Ответ мозгового центра: всё в порядке.");
     }
     expect(sdk.threads.send).toHaveBeenCalled();
+    // Инструкция к вопросу ограничивает разбор для живого звонка
+    const sentArgs = sdk.threads.send.mock.calls[0] as unknown as [{ input: Array<{ text: string }> }];
+    const sentText = sentArgs[0].input[0].text;
+    expect(sentText).toContain("ВОПРОС, ТОЛЬКО ЧТЕНИЕ");
+    expect(sentText).toContain("60 секунд");
     const ev = store.events.find((e) => e.type === "brain_answer");
     expect(ev).toBeDefined();
     expect((ev?.payload as Record<string, unknown>).tool).toBe("brain_ask");
+  });
+
+  it("brain_ask: по таймауту отдаёт промежуточный ответ с partial, а не «не смог»", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = mockStore();
+      const sdk = {
+        threads: {
+          send: vi.fn(async () => ({})),
+          wait: vi.fn(async () => {
+            throw new Error("wait unsupported");
+          }),
+          get: vi
+            .fn()
+            .mockResolvedValueOnce({ status: "idle" }) // ожидание перед отправкой — тред свободен
+            .mockResolvedValue({ status: "busy" }), // ответ — тред работает дольше таймаута
+          output: vi.fn(async () => ({ output: "Промежуточный итог: коннектор видит только подписки." })),
+        },
+      };
+
+      const brain = new BrainCenter({
+        sdk: sdk as never,
+        store: store as never,
+        callId: "call_test_partial",
+        targetThreadId: "thr_target_p",
+        targetThreadTitle: "Тред",
+        targetProjectId: "proj_1",
+        allMessages: [],
+        storageDir: testDir,
+      });
+      brain.threadId = "thr_brain_partial";
+
+      const p = brain.ask("глубокий вопрос");
+      await vi.advanceTimersByTimeAsync(130_000);
+      const res = await p;
+
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect((res.data as any)?.partial).toBe(true);
+        expect((res.data as any)?.answer).toContain("Промежуточный итог");
+      }
+      const ev = store.events.find((e) => e.type === "brain_answer");
+      expect(ev).toBeDefined();
+      expect((ev?.payload as Record<string, unknown>).partial).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("brain_task: класс C с подтверждением «да»; при активном треде возвращает target_active", async () => {

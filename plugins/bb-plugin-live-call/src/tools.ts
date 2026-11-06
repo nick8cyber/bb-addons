@@ -1798,7 +1798,7 @@ export const brainAskTool: ToolDef = {
   name: "brain_ask",
   cls: "R",
   word: "",
-  description: "Задать вопрос или задачу на анализ мозговому центру звонка (Antigravity). Мозговой центр изучает весь контекст треда и кодовую базу в изолированном worktree.",
+  description: "Задать быстрый вопрос мозговому центру звонка (Devin SWE-2 Flash): он видит весь тред и код в изолированном worktree. Для задач с изменениями или глубокого разбора — brain_task.",
   parameters: {
     type: "object",
     properties: {

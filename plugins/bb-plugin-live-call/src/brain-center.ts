@@ -194,7 +194,7 @@ ${historyFile}
       // Дожидаемся готовности треда (завершения начальной сводки или предыдущего хода)
       await this.waitForIdle(threadId, 60_000);
 
-      const textToSend = `ВОПРОС, ТОЛЬКО ЧТЕНИЕ: ничего не меняй, не создавай и не удаляй файлы, не выполняй команды с записью.\n\n${question}`;
+      const textToSend = `ВОПРОС, ТОЛЬКО ЧТЕНИЕ: ничего не меняй, не создавай и не удаляй файлы, не выполняй команды с записью. Владелец ждёт ответ в живом звонке — держись в пределах ~60 секунд работы, не читай лишнего и не делай глубокий разбор. Если вопрос требует глубокого анализа или изменений — дай краткий предварительный ответ и предложи вынести это в задание.\n\n${question}`;
       await this.opts.sdk.threads.send({
         threadId,
         mode: "start",
@@ -203,22 +203,17 @@ ${historyFile}
 
       await this.waitForIdle(threadId, 120_000);
       const ms = Date.now() - startTs;
-      const out = (await this.opts.sdk.threads.output({ threadId }).catch(() => null)) as unknown as { output?: string | null } | null;
-      let text = String(out?.output ?? "").trim();
-      if (!text) {
-        const msgs = await fetchThreadMessages(this.opts.sdk, threadId).catch(() => []);
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role === "agent" && msgs[i].text.trim()) {
-            text = msgs[i].text.trim();
-            break;
-          }
-        }
-      }
+      const text = await this.latestAnswerText(threadId);
       this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_ask", ms });
       return truncate({ answer: text, ms });
     } catch (e) {
       const ms = Date.now() - startTs;
       this.opts.log?.warn?.(`BrainCenter ask error: ${String(e)}`);
+      const partial = await this.latestAnswerText(threadId);
+      if (partial) {
+        this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_ask", ms, partial: true });
+        return truncate({ answer: partial, partial: true, ms });
+      }
       return { ok: false, error: { code: "timeout", message: `мозговой центр не ответил вовремя (${ms} мс)` } };
     }
   }
@@ -255,17 +250,7 @@ ${historyFile}
 
       await this.waitForIdle(threadId, 120_000);
       const ms = Date.now() - startTs;
-      const out = (await this.opts.sdk.threads.output({ threadId }).catch(() => null)) as unknown as { output?: string | null } | null;
-      let text = String(out?.output ?? "").trim();
-      if (!text) {
-        const msgs = await fetchThreadMessages(this.opts.sdk, threadId).catch(() => []);
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role === "agent" && msgs[i].text.trim()) {
-            text = msgs[i].text.trim();
-            break;
-          }
-        }
-      }
+      const text = await this.latestAnswerText(threadId);
       const changes = extractBrainChanges(text);
       this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_task", ms });
       return truncate({
@@ -277,8 +262,35 @@ ${historyFile}
     } catch (e) {
       const ms = Date.now() - startTs;
       this.opts.log?.warn?.(`BrainCenter task error: ${String(e)}`);
+      const partial = await this.latestAnswerText(threadId);
+      if (partial) {
+        const changes = extractBrainChanges(partial);
+        this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_task", ms, partial: true });
+        return truncate({
+          result: partial,
+          partial: true,
+          ...(changes.commit ? { commit: changes.commit } : {}),
+          ...(changes.files && changes.files.length > 0 ? { files: changes.files } : {}),
+          ms,
+        });
+      }
       return { ok: false, error: { code: "timeout", message: `мозговой центр не выполнил задачу (${ms} мс): ${String((e as Error)?.message ?? e)}` } };
     }
+  }
+
+  private async latestAnswerText(threadId: string): Promise<string> {
+    const out = (await this.opts.sdk.threads.output({ threadId }).catch(() => null)) as unknown as { output?: string | null } | null;
+    let text = String(out?.output ?? "").trim();
+    if (!text) {
+      const msgs = await fetchThreadMessages(this.opts.sdk, threadId).catch(() => []);
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === "agent" && msgs[i].text.trim()) {
+          text = msgs[i].text.trim();
+          break;
+        }
+      }
+    }
+    return text;
   }
 
   async getWorktreePath(): Promise<string | null> {
