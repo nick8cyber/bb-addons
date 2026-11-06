@@ -38,6 +38,10 @@
     {
       "name": "server-switcher",
       "source": "./plugins/bb-plugin-server-switcher"
+    },
+    {
+      "name": "privacy-blur",
+      "source": "./plugins/bb-plugin-privacy-blur"
     }
   ]
 }
