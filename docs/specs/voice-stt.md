@@ -92,9 +92,10 @@ devDependencies: `@get-bb/plugin-sdk` (та же линия, что у live-call
 
 ### 4.2. Регистрация сервиса
 
-Версия bb 0.48.1 валидирует **функциональную** форму (проверено по
-`validatePluginAiServiceDeclaration` в server bundle: `complete`/`transcribe`/
-`status` — функции, хотя бы одна из complete/transcribe обязательна):
+bb 0.48.1 валидирует **функциональную** форму (`validatePluginAiServiceDeclaration`
+в server bundle: `complete`/`transcribe`/`status` — функции, хотя бы одна из
+complete/transcribe обязательна). Декларативная форма `{id, displayName, kinds}`
+из новых SDK-типов на 0.48.1 НЕ работает — не использовать.
 
 ```ts
 bb.experimental_aiServices.register({
@@ -105,30 +106,41 @@ bb.experimental_aiServices.register({
 });
 ```
 
-- `transcribe` возвращает строку транскрипта; `hint` — vocabulary-текст или null.
-- bb обрывает `signal` через **10 c** для voice — это общий бюджет цепочки.
+- Вызов ядра (voice-transcription.ts): `service.transcribe(file, {signal, hint})`
+  где `file` — File/Blob (`size`≤25 МБ, `type`, `name`, `arrayBuffer()`),
+  `hint` — pre-trimmed string | null.
+- Возврат — строка; ядро делает `.trim()` и пустую считает «empty reply»
+  (мягкий фейл; в режиме automatic пробует следующий сервис).
+- Бюджет `signal`: **70 c** (`AI_TASK_TIMEOUT_MS.voice = 70_000`); внутренний
+  бюджет цепочки — 65 c (прецедент codex: `timeoutMs=65e3`).
 - Ошибка стадии ≠ ошибка сервиса: цепочка пробрасывает ошибку только когда
   отработали все доступные стадии.
+- `status()` ≤ **2 c** (`STATUS_TIMEOUT_MS=2000`), строго
+  `{ready:true}` | `{ready:false, message}` — без лишних полей.
+- Выбор пользователя: `{mode:"service", pluginId, serviceId}` —
+  `bb settings ai-services set voice gemini-live --plugin voice-stt`.
 
 ### 4.3. Мост к host-энтри
 
-По образцу `provider-codex` (`server.js`): host-клиент
-`bb.hosts.experimental_client({ contract })`, primary host —
+В точности как `provider-codex` (`server.js` бандла 0.48.1): host-клиент
+`bb.hosts.experimental_client({ contract })` в фабрике, primary host —
 `(await bb.sdk.system.config()).primaryHostId`; `null` → ошибка
 «No primary machine is connected».
 
 ```ts
 transcribe: async (audio, { signal, hint }) => {
+  if (audio.size > 20 * 1024 * 1024)
+    throw new Error("Recordings over 20 MB are too large to transcribe");
   const cfg = await readSettings();
   const hostId = await primaryHostId();
-  const res = await host.call("voice.transcribe", {
+  const res = await host.call("voice-stt.transcribe", {
     audioBase64: Buffer.from(await audio.arrayBuffer()).toString("base64"),
     mimeType: audio.type || "application/octet-stream",
     filename: audio.name || "voice-input",
     hint,
     config: cfg,            // ключи, модели, язык — см. схему §5
-    timeoutMs: 9500,
-  }, { hostId, signal, timeoutMs: 10_000 });
+    timeoutMs: 65_000,
+  }, { hostId, signal, timeoutMs: 65_000 });
   if (!res.ok) throw new Error(res.message);
   return res.text;
 }
@@ -136,7 +148,7 @@ transcribe: async (audio, { signal, hint }) => {
 
 `status()`: `{ready:false,message}` если нет ни geminiKeys, ни groqApiKey, ни
 доступного codex-auth. Codex-auth виден только на хосте → `status` дёргает
-host `voice.status` (проверка auth.json без отправки), итог — объединение:
+host `voice-stt.status` с бюджетом ~1.2 c (весь status ≤2 c), итог:
 `ready = gemini || codex || groq`; message перечисляет что есть/чего нет.
 При недоступном хосте — ready только по локальным ключам, message о хосте.
 
@@ -153,7 +165,7 @@ host `voice.status` (проверка auth.json без отправки), ито
 
 ```ts
 const contract = {
-  "voice.transcribe": { input: z.object({
+  "voice-stt.transcribe": { input: z.object({
       audioBase64: z.string(), mimeType: z.string(), filename: z.string(),
       hint: z.string().nullable(),
       config: z.object({
@@ -162,22 +174,21 @@ const contract = {
         groqApiKey: z.string().nullable(),
         groqModel: z.string(),
         language: z.string().nullable(),
-        timeouts: z.object({ stageMs: z.number() }).optional(),
       }).strict(),
       timeoutMs: z.number().int().positive(),
     }).strict(),
     output: z.union([
       z.object({ ok: z.literal(true), text: z.string(), engine: z.string() }).strict(),
-      z.object({ ok: z.literal(false), code: z.string(), message: z.string(), engine: z.string().nullable() }).strict(),
+      z.object({ ok: z.literal(false), code: z.string(), message: z.string() }).strict(),
     ]) },
-  "voice.status": { input: z.object({}).strict(), output: z.object({
-      codexAuth: z.enum(["ok","missing","invalid","expired"]),
+  "voice-stt.status": { input: z.object({}).strict(), output: z.object({
+      codexAuth: z.enum(["ok","missing","invalid","unusable"]),
       ffmpeg: z.boolean(),
     }).strict() },
 };
 ```
 
-Порядок `voice.transcribe` (общий дедлайн — `timeoutMs` и `context.signal`):
+Порядок `voice-stt.transcribe` (общий дедлайн — `timeoutMs` и `context.signal`):
 
 1. **Подготовка**: `audioBase64` → Buffer → временный файл
    (`context.experimental_paths.tempDir`, имя по `filename`/`mimeType` —
@@ -193,22 +204,30 @@ const contract = {
 4. **Стадия Codex** (§7): любой сбой → Groq.
 5. **Стадия Groq** (§8): нет ключа — пропуск; любой сбой → финальная ошибка.
 6. Итог: первый непустой текст побеждает; `engine` = `"gemini-live" | "codex" |
-   "groq"`. Все стадии упали → `{ok:false, code, message, engine:null}` —
-   message собирает причины по стадиям (`gemini-live: …; codex: …; groq: …`),
-   code — код последней стадии.
+   "groq"` (в лог/CLI; ядру уходит только text). Все стадии упали →
+   `{ok:false, code, message}` — message собирает причины по стадиям
+   (`gemini-live: …; codex: …; groq: …`), code — код последней стадии.
 
 `code` ошибок — из множества `{timeout, rate_limited, service_unavailable,
 auth_required, request_failed, invalid_response}` (классификация как у
-provider-codex).
+provider-codex: `AiServiceFailure{code, detailCode, message}` →
+`{ok:false, code, message}`; AbortError → `timeout`).
+
+Бюджеты стадий (в рамках общих 65 c): Gemini ≤30 c на ключ-сессию
+(connect+setup ≤5 c, иначе стадия провалена), Codex ≤20 c, Groq ≤20 c.
 
 ## 6. Gemini Live — точный протокол (порт OmniFlow)
 
 ### 6.1. Сокет
 
-- URL: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`
-- Аутентификация: заголовок `x-goog-api-key: <key>` при апгрейде (ключ НЕ в URL
-  и не в логах).
-- WebSocket — глобальный `WebSocket` Node (как `live-client.ts` live-call).
+- URL: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=<apiKey>`
+- Аутентификация: ключ в query-параметре `key` (как `live-client.ts` live-call).
+  Заголовок `x-goog-api-key` предпочтительнее по OmniFlow, но нативный
+  `WebSocket` Node/undici не даёт кастомных заголовков — только `?key=`.
+- В логах URL маскируется: `url.replace(/key=[^&]+/, "key=…")` — значение
+  ключа нигде не печатается.
+- WebSocket — глобальный `WebSocket` Node (как `live-client.ts` live-call);
+  кадры могут приходить бинарными — принимать string | Blob | ArrayBuffer.
 
 ### 6.2. Кадры
 
@@ -276,23 +295,28 @@ minWait/settle от момента streamEnd (lastInterimAt армить от se
 
 Наш вход — уже готовый файл, не живой поток: после setupComplete шлём все
 чанки подряд (необязательно «в реальном темпе»), затем `audioStreamEnd`.
-Ждём финал с адаптивным финишем. Общий бюджет стадии ~6 c
-(connect+setup ≤2.5 c, иначе стадия провалена).
+Ждём финал с адаптивным финишем. Бюджет на одну ключ-сессию ≤30 c
+(connect+setup ≤5 c, иначе пробуем следующий ключ или выходим из стадии).
 
-## 7. Codex — точный протокол (порт provider-codex 0.48.1)
+## 7. Codex — точный протокол (порт provider-codex 0.48.1, host.js)
 
 ### 7.1. Авторизация `~/.codex/auth.json`
 
-- `auth_mode === "apikey" | "apiKey"` или (`auth_mode` отсутствует и есть
-  `OPENAI_API_KEY`) → `{type:"apiKey", apiKey: OPENAI_API_KEY}`.
-- Иначе `tokens.access_token` + account_id (`tokens.account_id` ИЛИ claim
-  `chatgpt_account_id` в JWT access/id_token) → `{type:"chatgpt",
-  accessToken, accountId, isFedrampAccount}` (claim
-  `chatgpt_account_is_fedramp` в любом из токенов).
-- Нет файла/битый/нет полей → `auth_required` (в `voice.status` — missing/invalid).
-- Рефреша токена в provider-codex нет: истёкший → 401 → `auth_required`.
+Путь: `join(resolveCodexHome(homedir(), env), "auth.json")` — `CODEX_HOME`
+env honoured, иначе `~/.codex`.
 
-### 7.2. Запрос
+`classifyAuthJson`:
+- `auth_mode === "apikey" | "apiKey"` ИЛИ (`auth_mode` отсутствует И есть
+  `OPENAI_API_KEY`) → `{type:"apiKey", apiKey}` (пустой ключ → unusable/api_key).
+- Иначе `tokens.access_token` обязателен (нет → unusable/access_token);
+  accountId = `tokens.account_id` ?? JWT(access).`chatgpt_account_id` ??
+  JWT(id_token).`chatgpt_account_id` (нет → unusable/account_id);
+  `isFedrampAccount` = claim `chatgpt_account_is_fedramp` в любом токене.
+- Файл нет/не читается → `auth_required`/`codex_auth_missing`; не-JSON или
+  unusable → `auth_required`/`codex_auth_invalid`.
+- Рефреша токена нет: истёкший → 401 → `auth_required`.
+
+### 7.2. Запрос (из бандла)
 
 - ChatGPT: `POST https://chatgpt.com/backend-api/transcribe`,
   заголовки `Authorization: Bearer <accessToken>`,
@@ -300,12 +324,15 @@ minWait/settle от момента streamEnd (lastInterimAt армить от se
   `User-Agent: bb-host-daemon`, `X-OpenAI-Fedramp: true` (если fedramp).
 - API key: `POST https://api.openai.com/v1/audio/transcriptions`,
   `Authorization: Bearer <key>`, `User-Agent: bb-host-daemon`.
-- Тело FormData: `file` = Blob(исходное аудио, mimeType из входа, filename),
-  `model` = `gpt-transcribe`, `prompt` = hint (если не null).
-- Ответ JSON: текст из `response.text` (`{text}`); нет поля → `invalid_response`.
-- HTML-ответ chatgpt.com (Cloudflare challenge) → `service_unavailable`.
-- Маппинг: 401→`auth_required`, 429→`rate_limited`, ≥500→`service_unavailable`,
-  прочее→`request_failed`. Лимит ответа 1 МБ.
+- FormData: `file` = Blob(исходное аудио, mimeType из входа, filename),
+  `model` = `gpt-transcribe` (фиксированная), `prompt` = hint (только если
+  не null).
+- Ответ JSON: текст из поля `text`; нет поля или не-JSON → `invalid_response`/
+  `codex_response_invalid`. Лимит ответа 1 МБ.
+- HTML-ответ chatgpt.com (Cloudflare challenge) → `service_unavailable` с
+  пояснением про challenge.
+- Маппинг HTTP: 401→`auth_required`, 429→`rate_limited`, ≥500→
+  `service_unavailable`, прочее→`request_failed`; AbortError → `timeout`.
 
 ## 8. Groq
 
@@ -341,8 +368,10 @@ minWait/settle от момента streamEnd (lastInterimAt армить от se
 
 - В лог — только факт стадии и код/текст ошибки, без значений ключей и без
   транскрипта (кроме debug-уровня длины).
-- Ключ Gemini — в `x-goog-api-key` заголовке, никогда в URL/логах.
+- Ключ Gemini — в `?key=` URL (см. §6.1), в логах маскируется `key=…`.
 - `~/.codex/auth.json` читается только на хосте, значения наружу не уходят.
+- Ключи, приходящие в `config` host RPC, не логируются и не попадают в
+  сообщения ошибок.
 
 ## 11. Проверка (что значит «работает»)
 
@@ -363,6 +392,9 @@ minWait/settle от момента streamEnd (lastInterimAt армить от se
 - Пост-обработка (LLM cleanup) — вне задачи; `mode: "SMART"` у Gemini уже даёт
   чистый текст, у codex/groq — как есть.
 - Не коммитим в `main`; работа — `feat/voice-stt`, отчёт — ветка + SHA.
+  Вливание в `main` — только по слову владельца (правила репо/AGENTS).
 - Публичный репозиторий: в код/тесты/коммиты не попадают реальные id тредов,
   пути `/home/...`, ключи, домены стенда (см. AGENTS.md live-call — те же
-  правила).
+  правила). Тесты — синтетика (`thr_test…`, `example.com`, dummy-ключи).
+- Операции над самим live-call плагином (reload/install/disable) — не нужны
+  и запрещены без `bb call status | grep -q "звонок: нет"`.
