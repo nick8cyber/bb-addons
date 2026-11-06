@@ -148,6 +148,18 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
       expect(typeof panelAction.run).toBe("function");
     });
 
+    it("регистрирует кнопку шапки треда «Звонок по треду» с иконкой телефона", () => {
+      const threadAction = registeredSlots.experimental_threadAction;
+      expect(threadAction).toBeDefined();
+      expect(threadAction.id).toBe("call");
+      expect(threadAction.title).toBe("Звонок по треду");
+      expect(threadAction.icon).toBe("live-call/phone");
+      expect(threadAction.placement).toBe("header");
+      const item = threadAction.item({ thread: { id: "thr_test01" } });
+      expect(item?.label).toBe("Звонок по треду");
+      expect(item?.icon).toBe("live-call/phone");
+    });
+
     it("регистрирует команду «Live Call: позвонить по проекту»", () => {
       const cmd = registeredCommands.find((c) => c.id === "call-project");
       expect(cmd).toBeDefined();

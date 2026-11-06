@@ -2,7 +2,7 @@
  * Фронтенд live-call (контракт §15.1, §15.8).
  * Входы в звонок:
  * - иконка в футере сайдбара «Позвонить координатору» и Mod+Shift+L (без изменений)
- * - кнопка в шапке треда «Позвонить по треду»
+ * - кнопка в шапке треда «Звонок по треду» (иконка телефона)
  * - действие в панели нового треда «Позвонить по проекту» (experimental_newThreadPanelAction)
  * - команда палитры «Live Call: позвонить по проекту» с выбором проекта
  * - события window: bb-live-call:projects и bb-live-call:start-project
@@ -35,12 +35,12 @@ export default definePluginApp((app) => {
 
   app.slots.experimental_threadAction({
     id: "call",
-    title: "Позвонить по треду",
+    title: "Звонок по треду",
     icon: PHONE_ICON,
     group: "live-call",
     placement: "header",
     item: ({ thread }) => ({
-      label: "Позвонить по треду",
+      label: "Звонок по треду",
       icon: PHONE_ICON,
       run: () => (callEngine.isActive() ? callEngine.requestExpand() : callEngine.start({ threadId: thread.id })),
     }),

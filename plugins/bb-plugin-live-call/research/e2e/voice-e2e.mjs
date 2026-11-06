@@ -152,7 +152,7 @@ const startedAfter = Date.now();
 if (THREAD_ID) {
   await page.goto(`${APP}/threads/${THREAD_ID}`, { waitUntil: "domcontentloaded" });
   await sleep(3000);
-  check("кнопка «Позвонить по треду» найдена", await clickButton("Позвонить по треду"));
+  check("кнопка «Звонок по треду» найдена", await clickButton("Звонок по треду"));
 } else {
   await page.goto(`${APP}/`, { waitUntil: "domcontentloaded" });
   await sleep(3000);
