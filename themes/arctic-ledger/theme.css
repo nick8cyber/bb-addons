@@ -395,3 +395,73 @@ diffs-container {
   --usage-sidebar-focus: #2e77b3;
   color: #14213d;
 }
+
+/* BB 0.46+ adds a navigation rail using bg-surface-recessed inside the
+ * sidebar; in 0.48 the rail lives in sidebar-navigation-rail (wrapping
+ * app-nav-rail) plus a matching grid cell that holds the footer controls.
+ * Keep those local surfaces in the indigo palette, not the pale
+ * code/composer surface from the main canvas. */
+:is([data-testid="app-nav-rail"], [data-testid="sidebar-navigation-rail"], [data-sidebar="sidebar"] .col-start-1.row-start-2, [data-testid="sidebar-footer-row"] > :first-child) {
+  --surface-recessed: var(--sidebar);
+  --arctic-rail-selected-ink: #10203a;
+}
+
+.dark :is([data-testid="app-nav-rail"], [data-testid="sidebar-navigation-rail"], [data-testid="sidebar-footer-row"] > :first-child) {
+  --arctic-rail-selected-ink: #e3effc;
+}
+
+/* Rail destinations use aria-current/aria-pressed/data-state, not the
+ * old menu-button data-active contract. A light cornflower selection
+ * needs dark icons; dark appearance keeps its light icons. */
+:is([data-testid="app-nav-rail"], [data-testid="sidebar-navigation-rail"], [data-testid="sidebar-footer-row"] > :first-child) button:is(
+  [aria-current="page"],
+  [aria-pressed="true"],
+  [data-state="open"]
+) {
+  --foreground: var(--arctic-rail-selected-ink);
+  --sidebar-foreground: var(--arctic-rail-selected-ink);
+  color: var(--arctic-rail-selected-ink);
+  background-color: var(--state-active);
+}
+
+:is([data-testid="app-nav-rail"], [data-testid="sidebar-navigation-rail"], [data-testid="sidebar-footer-row"] > :first-child) button:hover:not(
+  [aria-current="page"],
+  [aria-pressed="true"],
+  [data-state="open"]
+) {
+  color: var(--sidebar-foreground);
+  background-color: var(--state-hover);
+}
+
+/* The navigation and footer customize popovers are portaled to the document
+ * root, where sidebar tokens keep their global light-on-indigo values. Rows
+ * therefore paint light ink on the white popover and hover checks become
+ * unreadable. Repoint the ramp at the light-canvas ink; dark popovers are
+ * already dark and keep their own tokens. */
+:root:not(.dark) :is(
+  [data-testid="nav-rail-customize"],
+  [data-testid="sidebar-navigation-customize"]
+) {
+  --sidebar-foreground: #14213d;
+  --sidebar-accent: #d7e7f6;
+  --sidebar-accent-foreground: #14213d;
+  --subtle-foreground: #4c647e;
+  --muted-foreground: #496784;
+}
+
+/* Hide badge/dot indicators inside sidebar navigation — destinations list,
+ * icon rail, and the aggregate "Ещё"/More row wherever it nests. Anchored
+ * on bb's semantic attributes/testids, not utility classes. */
+:is(
+  [data-testid="sidebar-navigation-list"],
+  [data-testid="sidebar-navigation-destinations"],
+  [data-testid="sidebar-navigation-rail"],
+  [data-sidebar-navigation-item]
+) :is(
+  [data-testid$="attention-badge"],
+  [class*="attention-badge"],
+  [class*="badge"],
+  span[class*="rounded-full"]
+) {
+  display: none !important;
+}

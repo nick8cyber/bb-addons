@@ -38,5 +38,121 @@
  {
   "en": "and opened PR #418.",
   "why": "Хвост предложения из демо-сцены, начало которого — отдельный узел."
+ },
+ {
+  "en": ", file previews at a git revision, Add to chat on",
+  "why": "Фрагмент перечисления, разрезанный кодом."
+ },
+ {
+  "en": ". Dispatch hooks use",
+  "why": "Хвост предложения, начало которого — inline-код; перевод по частям даёт мешанину."
+ },
+ {
+  "en": ". Its types are now",
+  "why": "То же: продолжение предложения после inline-кода."
+ },
+ {
+  "en": "; tool presentation types are now",
+  "why": "Продолжение предложения после inline-кода."
+ },
+ {
+  "en": "Decided (",
+  "why": "Обрывок журнала ревью «Decided (…)» — скобка открывается в этом узле."
+ },
+ {
+  "en": "PR #",
+  "why": "Обрывок «PR #…» — номер отдельным узлом."
+ },
+ {
+  "en": "Review log (",
+  "why": "Обрывок «Review log (…)»."
+ },
+ {
+  "en": "Sent to",
+  "why": "Обрывок фразы «Sent to <имя>» — получатель отдельным узлом; перевод даёт «Кому: Agent» или «Отправлено Agent»."
+ },
+ {
+  "en": "a running thread sends only what changed, about 1–2 KB instead of 11–42 KB per update, and opening a thread no longer resends the whole timeline, which was often 400–500 KB. Early adopters also get compressed live updates, about 4x smaller.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "a thread that finished while you were away opens at its answer instead of its first tool call.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "files in .",
+  "why": "Обрывок сводки инструмента «… files in .»."
+ },
+ {
+  "en": "first flagged",
+  "why": "Обрывок фразы advisor."
+ },
+ {
+  "en": "for ^[+-]",
+  "why": "Фрагмент строки поиска «Searched for …»; перевод даёт «Выполнен поиск для ^[+-]» — лишнее слово."
+ },
+ {
+  "en": "for contributions to this release.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "for launching host processes the way bb does,",
+  "why": "Фрагмент перечисления новых API, разрезанный кодом."
+ },
+ {
+  "en": "for sidebar row metadata, thread actions with",
+  "why": "Середина перечисления, разрезанная именами API."
+ },
+ {
+  "en": "for test",
+  "why": "Фрагмент строки поиска «Searched for …»."
+ },
+ {
+  "en": "in Settings → Experiments to get them, or turn each one on by itself.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "in place of the old singular queue and requester fields.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "in the Git plugin's settings, or run",
+  "why": "Строка длиннее MAX_STRING_LENGTH=240 — переводчик такие не трогает; фрагменты предложений changelog не переводим по правилу dictionary.test.ts."
+ },
+ {
+  "en": "is set as a project variable, ACP agents keep file-write approvals on the tool call's row and accept messages sent while a permission change restarts them, skills are listed once even when several folders provide them, symlinked skill folders work, and large skills no longer stop threads from starting.",
+  "why": "Строка длиннее MAX_STRING_LENGTH=240 — переводчик такие не трогает; фрагменты предложений changelog не переводим по правилу dictionary.test.ts."
+ },
+ {
+  "en": "plugins ·",
+  "why": "Обрывок подписи «… plugins · …» с разделителем."
+ },
+ {
+  "en": "remains a deprecated runtime alias for",
+  "why": "Середина предложения changelog, разрезанного inline-кодом (имя старого поля идёт дальше кодом)."
+ },
+ {
+  "en": "sidebar spinners stop when a thread stops, pull request status updates in every open view (including draft PRs and reloaded thread pages), collapsed sidebar groups stay collapsed when background threads become unread, and switching threads keeps cached plugin data.",
+  "why": "Строка длиннее MAX_STRING_LENGTH=240 — переводчик такие не трогает; фрагменты предложений changelog не переводим по правилу dictionary.test.ts."
+ },
+ {
+  "en": "starts from",
+  "why": "Фрагмент «git checkout -b <name> starts from <base>», разрезанный кодом."
+ },
+ {
+  "en": "the Diff tab, the Info tab's git rows, the changed-files and pull request segments above the composer, and the Commit button now come from the bundled Git and GitHub PR Status plugins, so plugins can replace them.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "to build CLI commands with shared parsing, validation, help, and errors.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "to see available devices.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
+ },
+ {
+  "en": "to summarize local command failures.",
+  "why": "Продолжение предложения changelog после заголовка или inline-кода со строчной буквы; перевод по частям даёт полуанглийскую строку — правило dictionary.test.ts."
  }
 ]

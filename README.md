@@ -11,6 +11,7 @@ bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin 
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin pi-gateways
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin speak
 bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin sidebar-collapse
+bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin tasks-pro
 ```
 
 Or from a local clone — handy while developing, since bb reloads a `path:`
@@ -190,6 +191,21 @@ bounded history requests, caching and cleanup on disable.
 
 Details in
 [plugins/bb-plugin-thread-timestamps/README.md](plugins/bb-plugin-thread-timestamps/README.md).
+
+### `tasks-pro`
+
+A read-only power view over bb's builtin task tracker, in its own sidebar
+panel: a sortable table and a status kanban fed by the same data. Twelve
+composable filters (projects, folders, statuses, priorities, labels, due /
+created / updated / completed ranges, threads, attachments, depth),
+multi-column sorting, grouping, token search across title/key/description/
+project/labels, and saved views. Completion dates and status-change
+timestamps are enriched from a read-only SQLite read; comments and
+attachments come from the tasks plugin's own RPC.
+
+It never mutates tasks — no mutation RPC calls, SQLite opened read-only,
+no kanban drag. Details in
+[plugins/bb-plugin-tasks-pro/README.md](plugins/bb-plugin-tasks-pro/README.md).
 
 ## Themes
 

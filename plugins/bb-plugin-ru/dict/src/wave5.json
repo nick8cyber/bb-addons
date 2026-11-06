@@ -1,0 +1,1838 @@
+[
+ {
+  "en": "(Git) and",
+  "ru": "(Git) и"
+ },
+ {
+  "en": "(GitHub PR Status), and your saved choice carries over to both.",
+  "ru": "(GitHub PR Status), и твой сохранённый выбор переносится на обе."
+ },
+ {
+  "en": ") replaces",
+  "ru": ") заменяет"
+ },
+ {
+  "en": ", and",
+  "ru": ", и"
+ },
+ {
+  "en": ", and Ratul Sarna.",
+  "ru": ", и Ratul Sarna."
+ },
+ {
+  "en": ", and bb's own processes use your shell's proxy settings and the system's certificates.",
+  "ru": ", а собственные процессы bb используют настройки прокси твоего шелла и системные сертификаты."
+ },
+ {
+  "en": ", and header thread actions replace",
+  "ru": ", а действия треда в заголовке заменяют"
+ },
+ {
+  "en": ", and removes worktrees in the background.",
+  "ru": ", и удаляет рабочие деревья в фоне."
+ },
+ {
+  "en": ", as it did before 0.47.0. Turn on the new",
+  "ru": ", как было до 0.47.0. Включи новую"
+ },
+ {
+  "en": ". SDK RPC calls also accept an abort signal.",
+  "ru": ". RPC-вызовы SDK также принимают сигнал прерывания."
+ },
+ {
+  "en": ". The old \"Show Git changes and Commit button\" setting is now",
+  "ru": ". Старая настройка «Show Git changes and Commit button» теперь"
+ },
+ {
+  "en": ". The old members keep working, and the plugin build warns with the replacement.",
+  "ru": ". Старые члены продолжают работать, а сборка плагина предупреждает о замене."
+ },
+ {
+  "en": ".pdf files",
+  "ru": "файлы .pdf"
+ },
+ {
+  "en": "1 other machine has nothing to update",
+  "ru": "На 1 другой машине нечего обновлять"
+ },
+ {
+  "en": "1 project",
+  "ru": "1 проект"
+ },
+ {
+  "en": "13 projects",
+  "ru": "13 проектов"
+ },
+ {
+  "en": "1–10 of 13",
+  "ru": "1–10 из 13"
+ },
+ {
+  "en": "20 min past the hour",
+  "ru": "на 20-й минуте часа"
+ },
+ {
+  "en": "20 min past the hour, every 2 hours",
+  "ru": "на 20-й минуте, каждые 2 часа"
+ },
+ {
+  "en": "30 minutes",
+  "ru": "30 минут"
+ },
+ {
+  "en": "40 min past the hour",
+  "ru": "на 40-й минуте часа"
+ },
+ {
+  "en": "A quality and performance release: bb loads faster, sends far less over the wire, uses less CPU and memory on your machines, and fixes a long list of rough edges.",
+  "ru": "Релиз качества и производительности: bb загружается быстрее, передаёт гораздо меньше по сети, использует меньше CPU и памяти на твоих машинах и исправляет длинный список шероховатостей."
+ },
+ {
+  "en": "Accept Edits",
+  "ru": "Принятие правок"
+ },
+ {
+  "en": "Actions",
+  "ru": "Действия"
+ },
+ {
+  "en": "Add Metadata to the built-in thread list's Organize → Rows menu. When it is checked, plugins can show details such as a thread's pull request on a second line under its title.",
+  "ru": "Добавляет «Метаданные» в меню «Упорядочить» → «Строки» встроенного списка тредов. Когда пункт отмечен, плагины могут показывать детали вроде пул-реквеста треда на второй строке под его заголовком."
+ },
+ {
+  "en": "Add reaction",
+  "ru": "Добавить реакцию"
+ },
+ {
+  "en": "Add secrets",
+  "ru": "Добавить секреты"
+ },
+ {
+  "en": "Add sub-task",
+  "ru": "Добавить подзадачу"
+ },
+ {
+  "en": "Added",
+  "ru": "Добавлено"
+ },
+ {
+  "en": "Advisor status unavailable — any pending review will still be sent to the agent. (",
+  "ru": "Статус Advisor недоступен — ожидающее ревью всё равно будет отправлено агенту. ("
+ },
+ {
+  "en": "Agent options",
+  "ru": "Опции агента"
+ },
+ {
+  "en": "Agents:",
+  "ru": "Агенты:"
+ },
+ {
+  "en": "All activity",
+  "ru": "Вся активность"
+ },
+ {
+  "en": "All tasks",
+  "ru": "Все задачи"
+ },
+ {
+  "en": "All your machines connect to one central bb server, where your threads and settings are stored. Choose a machine that can stay awake and online to run the server.",
+  "ru": "Все твои машины подключаются к одному центральному серверу bb, где хранятся твои треды и настройки. Выбери машину, которая может не спать и быть в сети, чтобы запустить сервер."
+ },
+ {
+  "en": "Allow faster service tiers",
+  "ru": "Разрешать более быстрые сервисные уровни"
+ },
+ {
+  "en": "Always show chats waiting for you",
+  "ru": "Всегда показывать чаты, ждущие тебя"
+ },
+ {
+  "en": "Answered",
+  "ru": "Отвечено"
+ },
+ {
+  "en": "App links",
+  "ru": "Ссылки приложений"
+ },
+ {
+  "en": "App links:",
+  "ru": "Ссылки приложений:"
+ },
+ {
+  "en": "Approvals in Full Access",
+  "ru": "Одобрения в Full Access"
+ },
+ {
+  "en": "Approve for me",
+  "ru": "Одобряй за меня"
+ },
+ {
+  "en": "Ask before archiving a thread with unarchived child threads.",
+  "ru": "Спрашивать перед архивированием треда с незаархивированными дочерними тредами."
+ },
+ {
+  "en": "Attachments",
+  "ru": "Вложения"
+ },
+ {
+  "en": "Automatic (Markdown PRO)",
+  "ru": "Автоматически (Markdown PRO)"
+ },
+ {
+  "en": "Automatic (PDF viewer)",
+  "ru": "Автоматически (просмотрщик PDF)"
+ },
+ {
+  "en": "Automatically copy selected terminal text and show a notification. Does not affect text elsewhere in the app. Linux middle-click paste uses the primary selection independently.",
+  "ru": "Автоматически копировать выделенный текст терминала и показывать уведомление. Не влияет на текст в других частях приложения. Вставка средней кнопкой в Linux использует первичное выделение независимо."
+ },
+ {
+  "en": "Back (Esc)",
+  "ru": "Назад (Esc)"
+ },
+ {
+  "en": "Background command running",
+  "ru": "Фоновая команда выполняется"
+ },
+ {
+  "en": "Become an early adopter",
+  "ru": "Стать ранним последователем"
+ },
+ {
+  "en": "Bug fixes",
+  "ru": "Исправления ошибок"
+ },
+ {
+  "en": "Cancel question",
+  "ru": "Отменить вопрос"
+ },
+ {
+  "en": "Changed files",
+  "ru": "Изменённые файлы"
+ },
+ {
+  "en": "Chats shown per project",
+  "ru": "Чатов на проект"
+ },
+ {
+  "en": "Check microphone access",
+  "ru": "Проверить доступ к микрофону"
+ },
+ {
+  "en": "Choose dispatch preset",
+  "ru": "Выбрать пресет dispatch"
+ },
+ {
+  "en": "Choose how your devices reach this bb server.",
+  "ru": "Выбери, как твои устройства подключаются к этому серверу bb."
+ },
+ {
+  "en": "Choose when this message should send.",
+  "ru": "Выбери, когда отправить это сообщение."
+ },
+ {
+  "en": "Choose which agents you use in BB. Drag to reorder them in provider pickers.",
+  "ru": "Выбери, каких агентов использовать в BB. Перетаскивай, чтобы менять порядок в переключателях провайдеров."
+ },
+ {
+  "en": "Claude Code and Codex updates available",
+  "ru": "Доступны обновления Claude Code и Codex"
+ },
+ {
+  "en": "Claude Code update available",
+  "ru": "Доступно обновление Claude Code"
+ },
+ {
+  "en": "Claude Code's Full Access approves everything again",
+  "ru": "Full Access в Claude Code снова одобряет всё"
+ },
+ {
+  "en": "Clean up plugin cache",
+  "ru": "Очистить кэш плагинов"
+ },
+ {
+  "en": "Close Advisor",
+  "ru": "Закрыть Advisor"
+ },
+ {
+  "en": "Codex and Claude Code updates available",
+  "ru": "Доступны обновления Codex и Claude Code"
+ },
+ {
+  "en": "Codex receives the skills you pick as skills, ACP agents receive extra writable folders, omp and opencode models show which service runs them, and Codex's Ultrafast tier has its own icon.",
+  "ru": "Codex получает выбранные тобой навыки как навыки, ACP-агенты получают дополнительные записываемые папки, модели omp и opencode показывают, какой сервис их запускает, а уровень Ultrafast у Codex получил собственную иконку."
+ },
+ {
+  "en": "Collapse changed files",
+  "ru": "Свернуть изменённые файлы"
+ },
+ {
+  "en": "Collapse finished turns",
+  "ru": "Сворачивать завершённые ходы"
+ },
+ {
+  "en": "Collapse provider usage",
+  "ru": "Свернуть расход провайдера"
+ },
+ {
+  "en": "Collapsed thread list",
+  "ru": "Свёрнутый список тредов"
+ },
+ {
+  "en": "Command line",
+  "ru": "Командная строка"
+ },
+ {
+  "en": "Commands without the wait:",
+  "ru": "Команды без ожидания:"
+ },
+ {
+  "en": "Compact before resuming expired sessions",
+  "ru": "Сжимать перед возобновлением протухших сессий"
+ },
+ {
+  "en": "Compact context",
+  "ru": "Сжать контекст"
+ },
+ {
+  "en": "Composer",
+  "ru": "Поле ввода"
+ },
+ {
+  "en": "Compress large messages on the live connection, such as timeline updates, which cuts their size about 4x for remote access. Applies when the app reconnects.",
+  "ru": "Сжимать большие сообщения в живом соединении, например обновления ленты, что уменьшает их размер примерно в 4 раза для удалённого доступа. Применяется при переподключении приложения."
+ },
+ {
+  "en": "Compressed live updates",
+  "ru": "Сжатые живые обновления"
+ },
+ {
+  "en": "Compressed live updates:",
+  "ru": "Сжатые живые обновления:"
+ },
+ {
+  "en": "Configure usage credits or request them from your admin when you hit a limit",
+  "ru": "Настрой кредиты расхода или запроси их у администратора при достижении лимита"
+ },
+ {
+  "en": "Connections recover:",
+  "ru": "Соединения восстанавливаются:"
+ },
+ {
+  "en": "Control the BB introduction and bundled agent skills.",
+  "ru": "Управляет введением в BB и встроенными навыками агентов."
+ },
+ {
+  "en": "Control the number of concurrent threads that are running in bb",
+  "ru": "Управляет числом одновременно работающих тредов в bb"
+ },
+ {
+  "en": "Copy link",
+  "ru": "Копировать ссылку"
+ },
+ {
+  "en": "Copy on select",
+  "ru": "Копировать при выделении"
+ },
+ {
+  "en": "Copy thread link",
+  "ru": "Копировать ссылку на тред"
+ },
+ {
+  "en": "Corrective follow-up started just now",
+  "ru": "Корректирующее уточнение запущено только что"
+ },
+ {
+  "en": "Couldn't refresh usage. Showing the last available update.",
+  "ru": "Не удалось обновить расход. Показано последнее доступное обновление."
+ },
+ {
+  "en": "Created",
+  "ru": "Создано"
+ },
+ {
+  "en": "Creating",
+  "ru": "Создаёт"
+ },
+ {
+  "en": "Custom date and time",
+  "ru": "Пользовательские дата и время"
+ },
+ {
+  "en": "Custom instructions settings",
+  "ru": "Настройки Custom instructions"
+ },
+ {
+  "en": "Default thread followup behavior",
+  "ru": "Поведение уточнений треда по умолчанию"
+ },
+ {
+  "en": "Delete cached plugin versions that no installed plugin uses, such as versions left by earlier bb releases.",
+  "ru": "Удалить кэшированные версии плагинов, которые не использует ни один установленный плагин, например оставшиеся от прежних релизов bb."
+ },
+ {
+  "en": "Diff tab",
+  "ru": "Вкладка Diff"
+ },
+ {
+  "en": "Direct",
+  "ru": "Напрямую"
+ },
+ {
+  "en": "Disabled",
+  "ru": "Отключено"
+ },
+ {
+  "en": "Dismiss notification",
+  "ru": "Скрыть уведомление"
+ },
+ {
+  "en": "Docs shows changes from other windows, agents and",
+  "ru": "Docs показывает изменения из других окон, агентов и"
+ },
+ {
+  "en": "Don't show a system notification for a thread that is open in a visible, focused bb window or tab. Other threads, and the same thread in a window you're not using, still notify.",
+  "ru": "Не показывать системное уведомление для треда, открытого в видимом сфокусированном окне или вкладке bb. Другие треды — и тот же тред в окне, которым ты не пользуешься, — по-прежнему уведомляют."
+ },
+ {
+  "en": "Drag to reorder.",
+  "ru": "Перетащи для изменения порядка."
+ },
+ {
+  "en": "Earlier messages stay in the thread for you to read. The agent doesn't see them.",
+  "ru": "Ранние сообщения остаются в треде для тебя. Агент их не видит."
+ },
+ {
+  "en": "Early adopter",
+  "ru": "Ранний последователь"
+ },
+ {
+  "en": "Edit dispatch target",
+  "ru": "Изменить цель dispatch"
+ },
+ {
+  "en": "Edit labels",
+  "ru": "Изменить метки"
+ },
+ {
+  "en": "Editing",
+  "ru": "Редактирует"
+ },
+ {
+  "en": "Enable debug logging for this session and help diagnose issues",
+  "ru": "Включить отладочное логирование этой сессии и помочь диагностировать проблемы"
+ },
+ {
+  "en": "Environment variables",
+  "ru": "Переменные окружения"
+ },
+ {
+  "en": "Environment variables settings",
+  "ru": "Настройки переменных окружения"
+ },
+ {
+  "en": "Even with main",
+  "ru": "На уровне main"
+ },
+ {
+  "en": "Even with master",
+  "ru": "На уровне master"
+ },
+ {
+  "en": "Every 10 min",
+  "ru": "Каждые 10 мин"
+ },
+ {
+  "en": "Every 15 min",
+  "ru": "Каждые 15 мин"
+ },
+ {
+  "en": "Every 5 min",
+  "ru": "Каждые 5 мин"
+ },
+ {
+  "en": "Expand the right panel over the conversation, or restore the conversation.",
+  "ru": "Развернуть правую панель поверх переписки или вернуть переписку."
+ },
+ {
+  "en": "Experimental",
+  "ru": "Экспериментальный"
+ },
+ {
+  "en": "Failed to fetch",
+  "ru": "Не удалось загрузить"
+ },
+ {
+  "en": "Faster loading, lighter live updates, and a long list of fixes",
+  "ru": "Быстрая загрузка, лёгкие живые обновления и длинный список исправлений"
+ },
+ {
+  "en": "Faster responses on supported Opus models at a higher cost per token.",
+  "ru": "Более быстрые ответы на поддерживаемых моделях Opus за более высокую цену за токен."
+ },
+ {
+  "en": "Fetched page",
+  "ru": "Страница загружена"
+ },
+ {
+  "en": "Fetching page",
+  "ru": "Загрузка страницы"
+ },
+ {
+  "en": "File actions",
+  "ru": "Действия с файлом"
+ },
+ {
+  "en": "File preferences",
+  "ru": "Настройки файлов"
+ },
+ {
+  "en": "Filter files",
+  "ru": "Фильтр файлов"
+ },
+ {
+  "en": "Filter the diff panel",
+  "ru": "Фильтр панели диффов"
+ },
+ {
+  "en": "Find in terminal",
+  "ru": "Найти в терминале"
+ },
+ {
+  "en": "Find in window",
+  "ru": "Найти в окне"
+ },
+ {
+  "en": "Fix copying a file-path link, which now gives a plain path, and inline code, which now stays inline code.",
+  "ru": "Исправлено копирование ссылки на путь файла — теперь даёт обычный путь — и inline-кода, который теперь остаётся inline-кодом."
+ },
+ {
+  "en": "Fix failed plugin actions showing two error toasts.",
+  "ru": "Исправлено отображение двух тостов об ошибке при неудачных действиях плагина."
+ },
+ {
+  "en": "Fix find in page snapping back while a scrolled-up thread is streaming, and the timeline's scroll height being wrong after its hidden pane is shown again.",
+  "ru": "Исправлен возврат «найти на странице», пока проскролленный вверх тред стримит, и неверная высота прокрутки ленты после повторного показа её скрытой области."
+ },
+ {
+  "en": "Fix the composer resetting when the window resizes across the compact breakpoint.",
+  "ru": "Исправлен сброс поля ввода при изменении размера окна через компактную точку останова."
+ },
+ {
+  "en": "Fix the desktop \"Show right panel\" button sometimes not responding.",
+  "ru": "Исправлено периодическое зависание кнопки «Показать правую панель» на десктопе."
+ },
+ {
+  "en": "Fix the voice waveform staying still with reduced motion on.",
+  "ru": "Исправлена неподвижная голосовая волна при включённом уменьшении движения."
+ },
+ {
+  "en": "Fixes and performance",
+  "ru": "Исправления и производительность"
+ },
+ {
+  "en": "Focus chat pane down",
+  "ru": "Фокус на область чата ниже"
+ },
+ {
+  "en": "Focus chat pane left",
+  "ru": "Фокус на область чата слева"
+ },
+ {
+  "en": "Focus chat pane right",
+  "ru": "Фокус на область чата справа"
+ },
+ {
+  "en": "Focus chat pane up",
+  "ru": "Фокус на область чата выше"
+ },
+ {
+  "en": "Focus the chat pane above the current pane.",
+  "ru": "Перевести фокус на область чата выше текущей."
+ },
+ {
+  "en": "Focus the chat pane below the current pane.",
+  "ru": "Перевести фокус на область чата ниже текущей."
+ },
+ {
+  "en": "Focus the chat pane to the left of the current pane.",
+  "ru": "Перевести фокус на область чата слева от текущей."
+ },
+ {
+  "en": "Focus the chat pane to the right of the current pane.",
+  "ru": "Перевести фокус на область чата справа от текущей."
+ },
+ {
+  "en": "Focus the next search, action, or recent item on the selected New tab page.",
+  "ru": "Перевести фокус на следующий поиск, действие или недавний элемент на выбранной странице «Новой вкладки»."
+ },
+ {
+  "en": "Focus the previous search, action, or recent item on the selected New tab page.",
+  "ru": "Перевести фокус на предыдущий поиск, действие или недавний элемент на выбранной странице «Новой вкладки»."
+ },
+ {
+  "en": "For plugin authors upgrading:",
+  "ru": "Для авторов плагинов при обновлении:"
+ },
+ {
+  "en": "Generate a one-line session recap now",
+  "ru": "Сгенерировать однострочную сводку сессии сейчас"
+ },
+ {
+  "en": "Generate a report analyzing your Claude Code sessions",
+  "ru": "Сгенерировать отчёт с анализом твоих сессий Claude Code"
+ },
+ {
+  "en": "Get new experiments turned on by default sooner and help us try out features before they reach everyone. Turn this off anytime; experiments you switch yourself keep your choice.",
+  "ru": "Раньше получать новые эксперименты, включённые по умолчанию, и помогать нам пробовать функции до того, как они дойдут до всех. Отключи когда угодно; эксперименты, которые ты переключал сам, сохранят твой выбор."
+ },
+ {
+  "en": "Git and pull requests as plugins:",
+  "ru": "Git и пул-реквесты как плагины:"
+ },
+ {
+  "en": "Git status, changed files and the Diff tab for each environment",
+  "ru": "Статус Git, изменённые файлы и вкладка Diff для каждого окружения"
+ },
+ {
+  "en": "Git:",
+  "ru": "Git:"
+ },
+ {
+  "en": "Go back in this window's history.",
+  "ru": "Назад по истории этого окна."
+ },
+ {
+  "en": "Go forward in this window's history.",
+  "ru": "Вперёд по истории этого окна."
+ },
+ {
+  "en": "Grant Claude agent access to your Design projects",
+  "ru": "Предоставить агенту Claude доступ к твоим проектам Design"
+ },
+ {
+  "en": "Hide details",
+  "ru": "Скрыть детали"
+ },
+ {
+  "en": "Hide right panel (⌘ J)",
+  "ru": "Скрыть правую панель (⌘ J)"
+ },
+ {
+  "en": "Hide servers",
+  "ru": "Скрыть серверы"
+ },
+ {
+  "en": "Highlights",
+  "ru": "Основное"
+ },
+ {
+  "en": "How machines connect",
+  "ru": "Как подключаются машины"
+ },
+ {
+  "en": "Installed plugins settings",
+  "ru": "Настройки установленных плагинов"
+ },
+ {
+  "en": "Interface",
+  "ru": "Интерфейс"
+ },
+ {
+  "en": "Less CPU on busy Macs:",
+  "ru": "Меньше CPU на загруженных Mac:"
+ },
+ {
+  "en": "Less memory and bandwidth:",
+  "ru": "Меньше памяти и трафика:"
+ },
+ {
+  "en": "Links",
+  "ru": "Ссылки"
+ },
+ {
+  "en": "List plugins with updates on the Updates page, update them one by one or all at once, and count them in the sidebar updates badge.",
+  "ru": "Показывать плагины с обновлениями на странице «Обновления», обновлять их по одному или все сразу и считать их в бейдже обновлений боковой панели."
+ },
+ {
+  "en": "Listed files in .",
+  "ru": "Выведены файлы в ."
+ },
+ {
+  "en": "Listing",
+  "ru": "Выводит список"
+ },
+ {
+  "en": "Listing files in .",
+  "ru": "Вывод файлов в ."
+ },
+ {
+  "en": "Load failed",
+  "ru": "Ошибка загрузки"
+ },
+ {
+  "en": "Loaded skill",
+  "ru": "Загруженный навык"
+ },
+ {
+  "en": "Loaded when needed. Excluded from current usage.",
+  "ru": "Загружается при необходимости. Не учитывается в текущем расходе."
+ },
+ {
+  "en": "Loading automations",
+  "ru": "Загрузка автоматизаций"
+ },
+ {
+  "en": "Loading diff",
+  "ru": "Загрузка диффа"
+ },
+ {
+  "en": "Loading latest messages…",
+  "ru": "Загрузка последних сообщений…"
+ },
+ {
+  "en": "Loading page",
+  "ru": "Загрузка страницы"
+ },
+ {
+  "en": "Loading preview…",
+  "ru": "Загрузка превью…"
+ },
+ {
+  "en": "Loading queued message details…",
+  "ru": "Загрузка деталей сообщения в очереди…"
+ },
+ {
+  "en": "Loading queued messages",
+  "ru": "Загрузка сообщений в очереди"
+ },
+ {
+  "en": "Machine access",
+  "ru": "Доступ к машинам"
+ },
+ {
+  "en": "Machine updates",
+  "ru": "Обновления машин"
+ },
+ {
+  "en": "Manage",
+  "ru": "Управление"
+ },
+ {
+  "en": "Manage bb and provider CLI updates across all machines.",
+  "ru": "Управление обновлениями bb и CLI провайдеров на всех машинах."
+ },
+ {
+  "en": "Mark as unread",
+  "ru": "Отметить непрочитанным"
+ },
+ {
+  "en": "Mark read and Pin can be bound to keyboard shortcuts.",
+  "ru": "Действия «Отметить прочитанным» и «Закрепить» можно назначить на горячие клавиши."
+ },
+ {
+  "en": "Mark the focused thread read or unread.",
+  "ru": "Отметить выбранный тред прочитанным или непрочитанным."
+ },
+ {
+  "en": "Mark thread read or unread",
+  "ru": "Отметить тред прочитанным или непрочитанным"
+ },
+ {
+  "en": "Maximize pane",
+  "ru": "Развернуть область"
+ },
+ {
+  "en": "Menu",
+  "ru": "Меню"
+ },
+ {
+  "en": "Message from Agent",
+  "ru": "Сообщение от агента"
+ },
+ {
+  "en": "Message queue edge cases:",
+  "ru": "Краевые случаи очереди сообщений:"
+ },
+ {
+  "en": "Mobile apps",
+  "ru": "Мобильные приложения"
+ },
+ {
+  "en": "Modified",
+  "ru": "Изменено"
+ },
+ {
+  "en": "More footer actions",
+  "ru": "Ещё действия в подвале"
+ },
+ {
+  "en": "More sidebar navigation",
+  "ru": "Ещё навигации боковой панели"
+ },
+ {
+  "en": "Move the bb server to another machine from Settings → Machines, and export or import server data with bb server.",
+  "ru": "Перенести сервер bb на другую машину из «Настройки» → «Машины» и экспортировать или импортировать данные сервера через bb server."
+ },
+ {
+  "en": "Much smaller live updates:",
+  "ru": "Значительно меньшие живые обновления:"
+ },
+ {
+  "en": "NEW divider before final assistant message",
+  "ru": "Разделитель NEW перед финальным ответом ассистента"
+ },
+ {
+  "en": "NEW divider before final assistant message:",
+  "ru": "Разделитель NEW перед финальным ответом ассистента:"
+ },
+ {
+  "en": "Navigation",
+  "ru": "Навигация"
+ },
+ {
+  "en": "New branch prefix",
+  "ru": "Префикс новой ветки"
+ },
+ {
+  "en": "New experiments",
+  "ru": "Новые эксперименты"
+ },
+ {
+  "en": "New preset",
+  "ru": "Новый пресет"
+ },
+ {
+  "en": "New surfaces:",
+  "ru": "Новые поверхности:"
+ },
+ {
+  "en": "New task",
+  "ru": "Новая задача"
+ },
+ {
+  "en": "New thread (⇧ ⌘ O)",
+  "ru": "Новый тред (⇧ ⌘ O)"
+ },
+ {
+  "en": "New thread in environment",
+  "ru": "Новый тред в окружении"
+ },
+ {
+  "en": "New thread in this environment",
+  "ru": "Новый тред в этом окружении"
+ },
+ {
+  "en": "New thread options",
+  "ru": "Опции нового треда"
+ },
+ {
+  "en": "Next New tab item",
+  "ru": "Следующий элемент «Новой вкладки»"
+ },
+ {
+  "en": "Next panel tab",
+  "ru": "Следующая вкладка панели"
+ },
+ {
+  "en": "Next question",
+  "ru": "Следующий вопрос"
+ },
+ {
+  "en": "Next tab",
+  "ru": "Следующая вкладка"
+ },
+ {
+  "en": "Next task",
+  "ru": "Следующая задача"
+ },
+ {
+  "en": "No apps are always allowed.",
+  "ru": "Ни одному приложению не разрешено всегда."
+ },
+ {
+  "en": "No more stale state:",
+  "ru": "Больше никакого устаревшего состояния:"
+ },
+ {
+  "en": "No prefix",
+  "ru": "Без префикса"
+ },
+ {
+  "en": "No prior agent reply to notify",
+  "ru": "Нет ответа агента для уведомления"
+ },
+ {
+  "en": "No priority",
+  "ru": "Без приоритета"
+ },
+ {
+  "en": "No review ran",
+  "ru": "Ревью не запускалось"
+ },
+ {
+  "en": "No sandbox and no approvals — the agent can run anything on your machine.",
+  "ru": "Без песочницы и подтверждений — агент может запустить на твоей машине что угодно."
+ },
+ {
+  "en": "No usage sources available.",
+  "ru": "Нет доступных источников расхода."
+ },
+ {
+  "en": "Nothing to update on 1 machine. 1 offline.",
+  "ru": "Нечего обновлять на 1 машине. 1 не в сети."
+ },
+ {
+  "en": "On desktop, right-click a link to",
+  "ru": "На десктопе кликни правой кнопкой по ссылке, чтобы"
+ },
+ {
+  "en": "On mobile, fix long-pressing a sidebar thread opening more than its menu, double taps starting a rename, closing a header menu moving the timeline, and sidebar and Thread Info icon alignment and safe-area padding.",
+  "ru": "На мобильных исправлено: долгое нажатие на тред в боковой панели открывало больше, чем его меню; двойные касания начинали переименование; закрытие меню заголовка двигало ленту; выравнивание иконок боковой панели и Thread Info и отступы безопасной области."
+ },
+ {
+  "en": "Online",
+  "ru": "В сети"
+ },
+ {
+  "en": "Open data directory",
+  "ru": "Открыть каталог данных"
+ },
+ {
+  "en": "Open diff",
+  "ru": "Открыть дифф"
+ },
+ {
+  "en": "Open file in tab",
+  "ru": "Открыть файл во вкладке"
+ },
+ {
+  "en": "Open in Browser",
+  "ru": "Открыть в браузере"
+ },
+ {
+  "en": "Open local desktop, server, and host daemon logs.",
+  "ru": "Открыть локальные логи десктопа, сервера и демона хоста."
+ },
+ {
+  "en": "Open local logs",
+  "ru": "Открыть локальные логи"
+ },
+ {
+  "en": "Open new tab (⌘ T)",
+  "ru": "Новая вкладка (⌘ T)"
+ },
+ {
+  "en": "Open the notification center to read and clear past notifications.",
+  "ru": "Открыть центр уведомлений, чтобы прочитать и очистить прошлые уведомления."
+ },
+ {
+  "en": "Open with Markdown PRO",
+  "ru": "Открыть в Markdown PRO"
+ },
+ {
+  "en": "Other improvements",
+  "ru": "Другие улучшения"
+ },
+ {
+  "en": "Other…",
+  "ru": "Другое…"
+ },
+ {
+  "en": "Performance",
+  "ru": "Производительность"
+ },
+ {
+  "en": "Permission mode: Accept Edits - Applies edits inside the workspace automatically. Anything beyond the workspace asks you first.",
+  "ru": "Режим доступа: принятие правок — правки внутри рабочей области применяются автоматически. Всё за её пределами сначала спрашивает тебя."
+ },
+ {
+  "en": "Permission mode: Approve for me - Same workspace sandbox, with requests reviewed automatically. High-risk actions can still come back to you.",
+  "ru": "Режим доступа: одобряй за меня — та же песочница рабочей области, запросы проверяются автоматически. Действия с высоким риском всё равно могут вернуться к тебе."
+ },
+ {
+  "en": "Pi completes each assistant message on time, Claude Code threads fork when",
+  "ru": "Pi завершает каждое сообщение ассистента вовремя, треды Claude Code форкаются, когда"
+ },
+ {
+  "en": "Pick up skills added or changed on disk during this session",
+  "ru": "Подхватывать навыки, добавленные или изменённые на диске во время этой сессии"
+ },
+ {
+  "en": "Pin or unpin the focused thread.",
+  "ru": "Закрепить или открепить выбранный тред."
+ },
+ {
+  "en": "Pin or unpin thread",
+  "ru": "Закрепить или открепить тред"
+ },
+ {
+  "en": "Plugin commands",
+  "ru": "Команды плагинов"
+ },
+ {
+  "en": "Plugin installed",
+  "ru": "Плагин установлен"
+ },
+ {
+  "en": "Plugin updates",
+  "ru": "Обновления плагинов"
+ },
+ {
+  "en": "Plugin updates",
+  "ru": "Обновления плагинов"
+ },
+ {
+  "en": "Plugin: bb--git",
+  "ru": "Плагин: bb--git"
+ },
+ {
+  "en": "Plugin: live-call",
+  "ru": "Плагин: live-call"
+ },
+ {
+  "en": "Press the question card's Cancel button.",
+  "ru": "Нажать кнопку «Отмена» на карточке вопроса."
+ },
+ {
+  "en": "Press the question card's Next or Submit button.",
+  "ru": "Нажать кнопку «Далее» или «Отправить» на карточке вопроса."
+ },
+ {
+  "en": "Previous New tab item",
+  "ru": "Предыдущий элемент «Новой вкладки»"
+ },
+ {
+  "en": "Previous panel tab",
+  "ru": "Предыдущая вкладка панели"
+ },
+ {
+  "en": "Previous question",
+  "ru": "Предыдущий вопрос"
+ },
+ {
+  "en": "Previous tab",
+  "ru": "Предыдущая вкладка"
+ },
+ {
+  "en": "Previous task",
+  "ru": "Предыдущая задача"
+ },
+ {
+  "en": "Privacy & diagnostics",
+  "ru": "Приватность и диагностика"
+ },
+ {
+  "en": "Project checkout",
+  "ru": "Чекаут проекта"
+ },
+ {
+  "en": "Provider error (error)",
+  "ru": "Ошибка провайдера (ошибка)"
+ },
+ {
+  "en": "Provider rate limit reached (error)",
+  "ru": "Лимит провайдера исчерпан (ошибка)"
+ },
+ {
+  "en": "Provider retry settings",
+  "ru": "Настройки Provider retry"
+ },
+ {
+  "en": "Provider session was replaced; provider-side context was lost.",
+  "ru": "Сессия провайдера была заменена; контекст на стороне провайдера потерян."
+ },
+ {
+  "en": "Provider usage",
+  "ru": "Расход провайдера"
+ },
+ {
+  "en": "Provider usage (Pro) settings",
+  "ru": "Настройки Provider usage (Pro)"
+ },
+ {
+  "en": "Provider, model and reasoning (⇧ ⌘ M)",
+  "ru": "Провайдер, модель и рассуждение (⇧ ⌘ M)"
+ },
+ {
+  "en": "Pushed timeline updates",
+  "ru": "Проталкиваемые обновления ленты"
+ },
+ {
+  "en": "Queue",
+  "ru": "Очередь"
+ },
+ {
+  "en": "Queue a message to run after the stop",
+  "ru": "Поставить сообщение в очередь на запуск после остановки"
+ },
+ {
+  "en": "Queue follow-up (Enter), Ctrl+Enter to steer",
+  "ru": "В очередь уточнения (Enter), Ctrl+Enter — управлять запуском"
+ },
+ {
+  "en": "Queue follow-up (Enter), ⌘ Enter to steer",
+  "ru": "В очередь уточнения (Enter), ⌘ Enter — управлять запуском"
+ },
+ {
+  "en": "Queue for after the stop",
+  "ru": "В очередь после остановки"
+ },
+ {
+  "en": "Queue for after the stop (Enter)",
+  "ru": "В очередь после остановки (Enter)"
+ },
+ {
+  "en": "Read aloud",
+  "ru": "Читать вслух"
+ },
+ {
+  "en": "Reading",
+  "ru": "Читает"
+ },
+ {
+  "en": "Reading file",
+  "ru": "Читает файл"
+ },
+ {
+  "en": "Ready",
+  "ru": "Готов"
+ },
+ {
+  "en": "Refresh tasks",
+  "ru": "Обновить задачи"
+ },
+ {
+  "en": "Release idle agent sessions",
+  "ru": "Освобождать простаивающие сессии агентов"
+ },
+ {
+  "en": "Reliability",
+  "ru": "Надёжность"
+ },
+ {
+  "en": "Reload provider usage",
+  "ru": "Обновить расход провайдера"
+ },
+ {
+  "en": "Reload the current bb desktop window.",
+  "ru": "Перезагрузить текущее окно bb desktop."
+ },
+ {
+  "en": "Reload window",
+  "ru": "Перезагрузить окно"
+ },
+ {
+  "en": "Remove bb CLI",
+  "ru": "Удалить bb CLI"
+ },
+ {
+  "en": "Reopen closed panel tab",
+  "ru": "Открыть закрытую вкладку панели заново"
+ },
+ {
+  "en": "Reopen the most recently closed secondary panel tab.",
+  "ru": "Заново открыть последнюю закрытую дополнительную вкладку панели."
+ },
+ {
+  "en": "Researched",
+  "ru": "Исследование завершено"
+ },
+ {
+  "en": "Researching",
+  "ru": "Исследует"
+ },
+ {
+  "en": "Restart the plugins that were enabled before safe mode.",
+  "ru": "Перезапустить плагины, которые были включены до безопасного режима."
+ },
+ {
+  "en": "Return from Settings, Plugins, Skills, or a plugin page with its own sidebar to the app.",
+  "ru": "Вернуться из «Настроек», «Плагинов», «Навыков» или страницы плагина со своей боковой панелью в приложение."
+ },
+ {
+  "en": "Reveal the bb data directory in the system file manager.",
+  "ru": "Показать каталог данных bb в системном файловом менеджере."
+ },
+ {
+  "en": "Reviewing…",
+  "ru": "Проверяет…"
+ },
+ {
+  "en": "Routes Claude and Codex API traffic across provider account pools.",
+  "ru": "Маршрутизирует API-трафик Claude и Codex через пулы аккаунтов провайдеров."
+ },
+ {
+  "en": "Running bash",
+  "ru": "Запуск bash"
+ },
+ {
+  "en": "Running tool",
+  "ru": "Запуск инструмента"
+ },
+ {
+  "en": "Running tool Read shell",
+  "ru": "Запуск инструмента Read shell"
+ },
+ {
+  "en": "Safer files and updates:",
+  "ru": "Безопаснее файлы и обновления:"
+ },
+ {
+  "en": "Save a composer draft as a manually sent queued message.",
+  "ru": "Сохранить черновик поля ввода как сообщение очереди, отправленное вручную."
+ },
+ {
+  "en": "Saved drafts, browser annotations, and live browser previews",
+  "ru": "Сохранённые черновики, аннотации браузера и живые превью в браузере"
+ },
+ {
+  "en": "Schedule send",
+  "ru": "Запланировать отправку"
+ },
+ {
+  "en": "Scope",
+  "ru": "Область"
+ },
+ {
+  "en": "Scroll to top",
+  "ru": "Наверх"
+ },
+ {
+  "en": "Search filenames",
+  "ru": "Поиск по именам файлов"
+ },
+ {
+  "en": "Search projects",
+  "ru": "Поиск проектов"
+ },
+ {
+  "en": "Search settings",
+  "ru": "Поиск по настройкам"
+ },
+ {
+  "en": "Search the focused terminal scrollback.",
+  "ru": "Поиск по скроллбэку выбранного терминала."
+ },
+ {
+  "en": "Search the text shown in the current bb desktop window.",
+  "ru": "Поиск текста, показанного в текущем окне bb desktop."
+ },
+ {
+  "en": "Search threads in the quick palette.",
+  "ru": "Искать треды в быстрой палитре."
+ },
+ {
+  "en": "Searched for ^[+-]",
+  "ru": "Выполнен поиск ^[+-]"
+ },
+ {
+  "en": "Searched for test",
+  "ru": "Выполнен поиск test"
+ },
+ {
+  "en": "Searched the web",
+  "ru": "Выполнен поиск в интернете"
+ },
+ {
+  "en": "Searching",
+  "ru": "Ищет"
+ },
+ {
+  "en": "Select elements in a Browser tab, comment on them, and add them to the prompt.",
+  "ru": "Выбирай элементы во вкладке браузера, комментируй их и добавляй в промпт."
+ },
+ {
+  "en": "Select multiple sidebar threads",
+  "ru": "Выбор нескольких тредов боковой панели"
+ },
+ {
+  "en": "Select multiple sidebar threads:",
+  "ru": "Выбор нескольких тредов боковой панели:"
+ },
+ {
+  "en": "Select the next visible right-panel tab, wrapping across panel splits.",
+  "ru": "Выбрать следующую видимую вкладку правой панели с переходом через разделения панели."
+ },
+ {
+  "en": "Select the previous visible right-panel tab, wrapping across panel splits.",
+  "ru": "Выбрать предыдущую видимую вкладку правой панели с переходом через разделения панели."
+ },
+ {
+  "en": "Send an open thread's timeline changes over the live connection instead of reloading the latest window after each update.",
+  "ru": "Отправлять изменения ленты открытого треда по живому соединению вместо перезагрузки последнего окна после каждого обновления."
+ },
+ {
+  "en": "Send anonymous usage data, such as app starts, setup progress and feature use, to help improve bb. Turning this off takes effect immediately for this server.",
+  "ru": "Отправлять анонимные данные об использовании — запуски приложения, прогресс настройки и использование функций — чтобы помочь улучшить bb. Отключение действует сразу для этого сервера."
+ },
+ {
+  "en": "Send later",
+  "ru": "Отправить позже"
+ },
+ {
+  "en": "Send later…",
+  "ru": "Отправить позже…"
+ },
+ {
+  "en": "Send options",
+  "ru": "Опции отправки"
+ },
+ {
+  "en": "Send voice input",
+  "ru": "Отправить голосовой ввод"
+ },
+ {
+  "en": "Sends",
+  "ru": "Отправки"
+ },
+ {
+  "en": "Sent to Agent",
+  "ru": "Отправлено агенту"
+ },
+ {
+  "en": "Sent to the agent just now",
+  "ru": "Отправлено агенту только что"
+ },
+ {
+  "en": "Server",
+  "ru": "Сервер"
+ },
+ {
+  "en": "Server move",
+  "ru": "Перенос сервера"
+ },
+ {
+  "en": "Servers",
+  "ru": "Серверы"
+ },
+ {
+  "en": "Session Mode: Code",
+  "ru": "Режим сессии: Code"
+ },
+ {
+  "en": "Session Mode: build",
+  "ru": "Режим сессии: build"
+ },
+ {
+  "en": "Set a goal — keep working until the condition is met",
+  "ru": "Поставить цель — работать, пока условие не выполнено"
+ },
+ {
+  "en": "Settings (Ctrl + ,)",
+  "ru": "Настройки (Ctrl + ,)"
+ },
+ {
+  "en": "Settings (⌘ ,)",
+  "ru": "Настройки (⌘ ,)"
+ },
+ {
+  "en": "Share anonymous usage data",
+  "ru": "Делиться анонимными данными об использовании"
+ },
+ {
+  "en": "Shared diff and syntax-highlighting code loads only for plugins that use it.",
+  "ru": "Общий код диффов и подсветки синтаксиса загружается только для плагинов, которые его используют."
+ },
+ {
+  "en": "Show Commit button",
+  "ru": "Показывать кнопку коммита"
+ },
+ {
+  "en": "Show Git changes above the composer",
+  "ru": "Показывать изменения Git над полем ввода"
+ },
+ {
+  "en": "Show a thread's changes, pull request, and parent and child threads in a card at the upper-right of each thread pane instead of above the composer. A header button opens or pins it; wide panes keep it beside the transcript.",
+  "ru": "Показывать изменения треда, пул-реквест и родительский с дочерними тредами в карточке в правом верхнем углу каждой области треда вместо места над полем ввода. Кнопка в заголовке открывает или закрепляет её; широкие области держат её рядом с перепиской."
+ },
+ {
+  "en": "Show all",
+  "ru": "Показать все"
+ },
+ {
+  "en": "Show all notifications",
+  "ru": "Показать все уведомления"
+ },
+ {
+  "en": "Show current context usage",
+  "ru": "Показывать текущее использование контекста"
+ },
+ {
+  "en": "Show diagnostic events",
+  "ru": "Показывать диагностические события"
+ },
+ {
+  "en": "Show diff panel (⌘ D)",
+  "ru": "Показать панель диффа (⌘ D)"
+ },
+ {
+  "en": "Show machines",
+  "ru": "Показать машины"
+ },
+ {
+  "en": "Show messages from before a context clear",
+  "ru": "Показывать сообщения, бывшие до очистки контекста"
+ },
+ {
+  "en": "Show provider environment resolution and unhandled provider events for troubleshooting.",
+  "ru": "Показывать разрешение окружения провайдера и необработанные события провайдера для диагностики."
+ },
+ {
+  "en": "Show pull request above the composer",
+  "ru": "Показывать пул-реквест над полем ввода"
+ },
+ {
+  "en": "Show right panel (⌘ J)",
+  "ru": "Показать правую панель (⌘ J)"
+ },
+ {
+  "en": "Show session cost, plan usage, and what's contributing to your limits",
+  "ru": "Показывать стоимость сессии, расход по плану и что расходует твои лимиты"
+ },
+ {
+  "en": "Show setup guide",
+  "ru": "Показать руководство по настройке"
+ },
+ {
+  "en": "Show short summaries for commands that read, list, or search files. Turn off to show command text and let you expand each command to view its output.",
+  "ru": "Показывать краткие сводки команд, которые читают, выводят список или ищут файлы. Отключи, чтобы видеть текст команды и разворачивать каждую для просмотра вывода."
+ },
+ {
+  "en": "Show the chat count next to a project",
+  "ru": "Показывать число чатов у проекта"
+ },
+ {
+  "en": "Show the git branch in a row",
+  "ru": "Показывать ветку git в строке"
+ },
+ {
+  "en": "Show the next question without submitting.",
+  "ru": "Показать следующий вопрос без отправки."
+ },
+ {
+  "en": "Show the previous question on a card with several questions.",
+  "ru": "Показать предыдущий вопрос на карточке с несколькими вопросами."
+ },
+ {
+  "en": "Show which loaded skills are unused and costing context",
+  "ru": "Показывать, какие загруженные навыки не используются и тратят контекст"
+ },
+ {
+  "en": "Side chat and plugin thread chats match the main thread view: interactions, editing and forking messages, context usage, and the cards above the composer.",
+  "ru": "Сайд-чат и чаты тредов плагинов повторяют вид основного треда: взаимодействия, правка и форк сообщений, использование контекста и карточки над полем ввода."
+ },
+ {
+  "en": "Sidebar footer",
+  "ru": "Подвал боковой панели"
+ },
+ {
+  "en": "Sidebar navigation",
+  "ru": "Навигация боковой панели"
+ },
+ {
+  "en": "Signs this bb in to your getbb.app account and holds its server credential for remote access and hosted services.",
+  "ru": "Входит этот bb в твой аккаунт getbb.app и хранит серверные креды для удалённого доступа и хостед-сервисов."
+ },
+ {
+  "en": "Skip notifications for the thread you're viewing",
+  "ru": "Пропускать уведомления для открытого треда"
+ },
+ {
+  "en": "Snappier UI:",
+  "ru": "Более отзывчивый интерфейс:"
+ },
+ {
+  "en": "Sort",
+  "ru": "Сортировка"
+ },
+ {
+  "en": "Start fresh context in this thread",
+  "ru": "Начать свежий контекст в этом треде"
+ },
+ {
+  "en": "Starting...",
+  "ru": "Запуск..."
+ },
+ {
+  "en": "Stop agents that have been idle this long to free memory. Threads keep their history and pick up on your next message. Checked every 5 minutes.",
+  "ru": "Останавливать агентов, простаивающих дольше этого срока, для освобождения памяти. Треды сохраняют историю и продолжаются с твоего следующего сообщения. Проверка каждые 5 минут."
+ },
+ {
+  "en": "Stop and add to draft",
+  "ru": "Остановить и перенести в черновик"
+ },
+ {
+  "en": "Stop every plugin you installed, keeping each plugin's enabled setting. Plugins included with bb keep running.",
+  "ru": "Остановить все установленные плагины, сохранив настройку включённости каждого. Плагины, входящие в bb, продолжают работать."
+ },
+ {
+  "en": "Stopped task",
+  "ru": "Задача остановлена"
+ },
+ {
+  "en": "Storage & retention (Experimental) finds and removes worktrees created outside bb, also with",
+  "ru": "Storage & retention (Experimental) находит и удаляет рабочие деревья, созданные вне bb, а также с"
+ },
+ {
+  "en": "Submit answers or go to the next question",
+  "ru": "Отправить ответы или перейти к следующему вопросу"
+ },
+ {
+  "en": "Submitting...",
+  "ru": "Отправка..."
+ },
+ {
+  "en": "Summarize shell commands",
+  "ru": "Сворачивать команды shell"
+ },
+ {
+  "en": "Switch server",
+  "ru": "Сменить сервер"
+ },
+ {
+  "en": "Tasks panel options",
+  "ru": "Опции панели задач"
+ },
+ {
+  "en": "Team",
+  "ru": "Команда"
+ },
+ {
+  "en": "Terminals",
+  "ru": "Терминалы"
+ },
+ {
+  "en": "Thank you to",
+  "ru": "Спасибо"
+ },
+ {
+  "en": "Thank you to the contributors and co-authors outside the core team:",
+  "ru": "Спасибо контрибьюторам и соавторам вне основной команды:"
+ },
+ {
+  "en": "Thank you to the contributors outside the core team:",
+  "ru": "Спасибо контрибьюторам вне основной команды:"
+ },
+ {
+  "en": "Thank you to the fourteen contributors and co-authors outside the core team:",
+  "ru": "Спасибо четырнадцати контрибьюторам и соавторам вне основной команды:"
+ },
+ {
+  "en": "Thanks",
+  "ru": "Благодарности"
+ },
+ {
+  "en": "The Commit button is hidden by default.",
+  "ru": "Кнопка коммита скрыта по умолчанию."
+ },
+ {
+  "en": "The composer is ready sooner:",
+  "ru": "Поле ввода готово раньше:"
+ },
+ {
+  "en": "The prompt box in threads, the New thread screen, and message editors.",
+  "ru": "Поле ввода в тредах, экран «Новый тред» и редакторы сообщений."
+ },
+ {
+  "en": "The timeline stays at the bottom:",
+  "ru": "Лента остаётся внизу:"
+ },
+ {
+  "en": "These are on for early adopters. Turn on",
+  "ru": "Включены для ранних последователей. Включи"
+ },
+ {
+  "en": "Thinking",
+  "ru": "Думает"
+ },
+ {
+  "en": "Thinking…",
+  "ru": "Думает…"
+ },
+ {
+  "en": "This device",
+  "ru": "Это устройство"
+ },
+ {
+  "en": "This phone",
+  "ru": "Этот телефон"
+ },
+ {
+  "en": "Thought",
+  "ru": "Размышление"
+ },
+ {
+  "en": "Thread archive confirmation",
+  "ru": "Подтверждение архивирования треда"
+ },
+ {
+  "en": "Thread context card",
+  "ru": "Карточка контекста треда"
+ },
+ {
+  "en": "Thread history",
+  "ru": "История треда"
+ },
+ {
+  "en": "Thread interrupted because the host daemon disconnected",
+  "ru": "Тред прерван: демон хоста отключился"
+ },
+ {
+  "en": "Thread interrupted because the host daemon disconnected (error)",
+  "ru": "Тред прерван: демон хоста отключился (ошибка)"
+ },
+ {
+  "en": "Thread link copied",
+  "ru": "Ссылка на тред скопирована"
+ },
+ {
+  "en": "Thread needs user input",
+  "ru": "Тред ждёт ввода"
+ },
+ {
+  "en": "Thread row metadata",
+  "ru": "Метаданные строки треда"
+ },
+ {
+  "en": "Thread titles, commit messages, and voice input from bb cloud, included with your bb account.",
+  "ru": "Названия тредов, сообщения коммитов и голосовой ввод от bb cloud, включённые в твой аккаунт bb."
+ },
+ {
+  "en": "Threads & editing",
+  "ru": "Треды и редактирование"
+ },
+ {
+  "en": "To pick up a draggable item, press the space bar. While dragging, use the arrow keys to move the item. Press space again to drop the item in its new position, or press escape to cancel.",
+  "ru": "Чтобы поднять перетаскиваемый элемент, нажми пробел. Во время перетаскивания перемещай элемент стрелками. Нажми пробел ещё раз, чтобы положить элемент на новое место, или escape для отмены."
+ },
+ {
+  "en": "Toggle panel full screen",
+  "ru": "Панель на весь экран"
+ },
+ {
+  "en": "Toggle queued messages",
+  "ru": "Переключить сообщения в очереди"
+ },
+ {
+  "en": "Top list (built-in)",
+  "ru": "Верхний список (встроенный)"
+ },
+ {
+  "en": "Transcribing and sending",
+  "ru": "Транскрибация и отправка"
+ },
+ {
+  "en": "Turn off plugin safe mode",
+  "ru": "Выключить безопасный режим плагинов"
+ },
+ {
+  "en": "Turn on",
+  "ru": "Включи"
+ },
+ {
+  "en": "Turn on plugin safe mode",
+  "ru": "Включить безопасный режим плагинов"
+ },
+ {
+  "en": "Turn this off to use the default service tier for all new turns, including those from queued messages and automations.",
+  "ru": "Отключи, чтобы использовать сервисный уровень по умолчанию для всех новых ходов, включая ходы из очереди сообщений и автоматизаций."
+ },
+ {
+  "en": "Uncommitted",
+  "ru": "Незакоммиченные"
+ },
+ {
+  "en": "Uncommitted files",
+  "ru": "Незакоммиченные файлы"
+ },
+ {
+  "en": "Unread thread failed",
+  "ru": "Непрочитанный тред завершён ошибкой"
+ },
+ {
+  "en": "Updating results",
+  "ru": "Обновление результатов"
+ },
+ {
+  "en": "Uploading",
+  "ru": "Загрузка"
+ },
+ {
+  "en": "Usability",
+  "ru": "Удобство"
+ },
+ {
+  "en": "Usage provider",
+  "ru": "Расход провайдера"
+ },
+ {
+  "en": "Usage unavailable.",
+  "ru": "Расход недоступен."
+ },
+ {
+  "en": "Use the collapsed sidebar list",
+  "ru": "Использовать свёрнутый список боковой панели"
+ },
+ {
+  "en": "View details",
+  "ru": "Подробнее"
+ },
+ {
+  "en": "View provider usage in plugin settings and an optional sidebar footer card.",
+  "ru": "Просмотр расхода провайдера в настройках плагина и опциональная карточка в подвале боковой панели."
+ },
+ {
+  "en": "Walk through connecting an agent, adding projects, plugins, and devices again.",
+  "ru": "Пройти подключение агента, добавление проектов, плагинов и устройств заново."
+ },
+ {
+  "en": "What Enter does in the prompt box while the thread runs.",
+  "ru": "Что делает Enter в поле ввода, пока тред выполняется."
+ },
+ {
+  "en": "What draws New thread, Plugins, Skills, and plugin pages in the sidebar.",
+  "ru": "Что отображает «Новый тред», «Плагины», «Навыки» и страницы плагинов в боковой панели."
+ },
+ {
+  "en": "When",
+  "ru": "Когда"
+ },
+ {
+  "en": "When a turn finishes, fold its work into one Worked for row and keep the final answer visible. Turn a provider off to keep every step of its finished turns visible.",
+  "ru": "Когда ход завершается, сворачивать его работу в одну строку «Worked for» и оставлять финальный ответ видимым. Отключи провайдера, чтобы видеть каждый шаг его завершённых ходов."
+ },
+ {
+  "en": "When a turn finishes, fold its work into one Worked for row and keep the final answer visible. Turn off collapsing to keep every step of a finished turn visible.",
+  "ru": "Когда ход завершается, сворачивать его работу в одну строку «Worked for» и оставлять финальный ответ видимым. Отключи сворачивание, чтобы видеть каждый шаг завершённого хода."
+ },
+ {
+  "en": "When an idle thread holds at least 100k tokens and its prompt cache has expired, the composer offers to compact before your next send. Works with supported providers (e.g. Claude Code, Pi).",
+  "ru": "Когда простаивающий тред держит не меньше 100k токенов и его кэш промпта протух, поле ввода предлагает сжатие перед твоей следующей отправкой. Работает с поддерживаемыми провайдерами (например, Claude Code, Pi)."
+ },
+ {
+  "en": "When to send",
+  "ru": "Когда отправлять"
+ },
+ {
+  "en": "When you open a thread whose turn finished while you were away, place the NEW divider before the turn's final assistant message, or the error that ended it, instead of before its first tool call. The turn's work stays above the divider.",
+  "ru": "Когда ты открываешь тред, чей ход завершился, пока тебя не было, помещать разделитель NEW перед финальным ответом ассистента в ходе — или ошибкой, завершившей его, — а не перед первым вызовом инструмента. Работа хода остаётся над разделителем."
+ },
+ {
+  "en": "Which plugin draws your threads in the sidebar.",
+  "ru": "Какой плагин отображает твои треды в боковой панели."
+ },
+ {
+  "en": "Zoom and pan images in the lightbox, and the right sidebar remembers its width for each thread and plugin page.",
+  "ru": "Масштабирование и панорамирование изображений в лайтбоксе, а правая боковая панель запоминает свою ширину для каждого треда и страницы плагина."
+ },
+ {
+  "en": "as they happen, and editing a note's heading no longer renames its file.",
+  "ru": "по мере появления, а правка заголовка заметки больше не переименовывает её файл."
+ },
+ {
+  "en": "bb finds your tools:",
+  "ru": "bb находит твои инструменты:"
+ },
+ {
+  "en": "bb update available",
+  "ru": "Доступно обновление bb"
+ },
+ {
+  "en": "bb watches only the threads you're viewing instead of every thread's files, so macOS file watching stays quiet on machines running many agents.",
+  "ru": "bb следит только за просматриваемыми тредами вместо файлов каждого треда, так что файловое наблюдение macOS остаётся тихим на машинах со множеством агентов."
+ },
+ {
+  "en": "bb's composer: the prompt box with rich text, @-mentions, slash commands, voice and attachments.",
+  "ru": "Поле ввода bb: поле промпта с rich-текстом, @-упоминаниями, слэш-командами, голосом и вложениями."
+ },
+ {
+  "en": "child thread",
+  "ru": "дочерний тред"
+ },
+ {
+  "en": "collapsing a tool call, resizing, restoring a thread, or an idle scroll no longer leaves you just above the latest message with the jump-to-bottom button showing.",
+  "ru": "сворачивание вызова инструмента, изменение размера, восстановление треда или пустой скролл больше не оставляют тебя чуть выше последнего сообщения с показанной кнопкой перехода вниз."
+ },
+ {
+  "en": "diffs work when the default branch exists only on the remote, and",
+  "ru": "диффы работают, когда ветка по умолчанию существует только на remote, и"
+ },
+ {
+  "en": "editing a skill resends only the files that changed instead of the whole folder, a 34 MiB attachment peaks at under 2 MiB of memory instead of 65 MiB, and updates and plugin downloads stream to disk.",
+  "ru": "правка навыка пересылает только изменённые файлы вместо всей папки, вложение в 34 МиБ достигает пика менее 2 МиБ памяти вместо 65 МиБ, а обновления и загрузки плагинов стримятся на диск."
+ },
+ {
+  "en": "file saves on machines are atomic, so a crash or full disk can't leave a half-written file, and updates and plugin downloads are checksum-verified.",
+  "ru": "сохранение файлов на машинах атомарно, так что сбой или переполненный диск не оставят наполовину записанный файл, а обновления и загрузки плагинов проверяются по контрольным суммам."
+ },
+ {
+  "en": "inside threads, and retryable host RPCs.",
+  "ru": "внутри тредов и повторяемые RPC хоста."
+ },
+ {
+  "en": "is set as a project variable, ACP agents keep file-write approvals on the tool call's row and accept messages",
+  "ru": "установлена как переменная проекта, ACP-агенты держат подтверждения записи файлов в строке вызова инструмента и принимают сообщения"
+ },
+ {
+  "en": "links such as",
+  "ru": "ссылки вроде"
+ },
+ {
+  "en": "live updates are about 4x smaller.",
+  "ru": "живые обновления примерно в 4 раза меньше."
+ },
+ {
+  "en": "machine tunnels give up on a stalled handshake, such as after the computer sleeps mid-connect, and reconnect. bb connect next shows a bb page instead of frp's error page.",
+  "ru": "туннели машин прекращают зависшее рукопожатие — например, после сна компьютера в середине подключения — и переподключаются. bb connect next показывает страницу bb вместо страницы ошибки frp."
+ },
+ {
+  "en": "messages queued after you press Stop are sent instead of held, a queued message can no longer jump ahead of one that's still sending, and messages and child-thread notices that arrive while a thread compacts wait instead of failing.",
+  "ru": "сообщения в очереди, поставленные после нажатия «Остановить», отправляются, а не удерживаются; сообщение в очереди больше не может обогнать то, что ещё отправляется; сообщения и уведомления дочерних тредов, приходящие во время сжатия треда, ждут вместо падения."
+ },
+ {
+  "en": "none active",
+  "ru": "нет активных"
+ },
+ {
+  "en": "one panel controller (",
+  "ru": "один контроллер панели ("
+ },
+ {
+  "en": "open in their apps, after asking first.",
+  "ru": "открываются в их приложениях, сначала спросив."
+ },
+ {
+  "en": "opening or closing a plugin page no longer restyles the whole app, and the Open menu answers instantly instead of rescanning your apps each time.",
+  "ru": "открытие или закрытие страницы плагина больше не пересчитывает стили всего приложения, а меню «Открыть» отвечает мгновенно вместо повторного сканирования твоих приложений каждый раз."
+ },
+ {
+  "en": "rules, hooks that answer \"ask\", and Claude Code's own safety checks.",
+  "ru": "правилах, хуках, отвечающих «ask», и собственных проверках безопасности Claude Code."
+ },
+ {
+  "en": "setting to keep being asked about",
+  "ru": "настройку, чтобы по-прежнему спрашивать о"
+ },
+ {
+  "en": "slash command and skill lists come from a cache instead of waiting on the machine for each new thread.",
+  "ru": "списки слэш-команд и навыков приходят из кэша вместо ожидания машины для каждого нового треда."
+ },
+ {
+  "en": "threads fetch the composer's data and runtime alongside the page instead of after it, and code only some plugins use no longer delays the composer and sidebar. After a reload, the open panel tab's plugin loads first.",
+  "ru": "треды получают данные и рантайм поля ввода вместе со страницей, а не после неё, и код, нужный лишь части плагинов, больше не задерживает поле ввода и боковую панель. После перезагрузки плагин открытой вкладки панели грузится первым."
+ },
+ {
+  "en": "tools installed with mise, asdf, Volta or Homebrew are found when bb runs as a service or from the Dock, plugins can run",
+  "ru": "инструменты, установленные через mise, asdf, Volta или Homebrew, находятся, когда bb работает как сервис или из Dock, плагины могут запускать"
+ },
+ {
+  "en": "when your local branch is behind, falling back to the last fetched copy when the fetch fails.",
+  "ru": "когда твоя локальная ветка отстаёт, с откатом к последней полученной копии при неудачном fetch."
+ },
+ {
+  "en": "— nothing was checked, so this is not an approval.",
+  "ru": "— ничего не проверено, это не одобрение."
+ }
+]
