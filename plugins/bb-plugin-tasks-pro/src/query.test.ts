@@ -150,6 +150,19 @@ describe("matchesDateRange", () => {
     ).toBe(false);
     expect(matchesDateRange("2026-11-05", { kind: "last7d" }, NOW)).toBe(true);
   });
+
+  it("range bounds are open when empty", () => {
+    const openFrom = { kind: "range" as const, from: "", to: "2026-11-01" };
+    const openTo = { kind: "range" as const, from: "2026-11-01", to: "" };
+    const bothOpen = { kind: "range" as const, from: "", to: "" };
+    expect(matchesDateRange("2026-10-01", openFrom, NOW)).toBe(true);
+    expect(matchesDateRange("2026-11-05", openFrom, NOW)).toBe(false);
+    expect(matchesDateRange("2026-12-31", openTo, NOW)).toBe(true);
+    expect(matchesDateRange("2026-10-01", openTo, NOW)).toBe(false);
+    // both empty = "has a date", still excludes null values
+    expect(matchesDateRange("1999-01-01", bothOpen, NOW)).toBe(true);
+    expect(matchesDateRange(null, bothOpen, NOW)).toBe(false);
+  });
 });
 
 describe("applyFilters", () => {
@@ -223,6 +236,48 @@ describe("applyFilters", () => {
     );
     expect(
       applyFilters(withCard, { attachments: true }, NOW).map((t) => t.id),
+    ).toEqual(["t1"]);
+  });
+
+  it("subtasks get threads/attachments from the sqlite channel", () => {
+    // listTaskCardMeta is top-level only: a subtask's threads/attachments must
+    // come from sqliteByTaskId, which covers every task.
+    const sub = task({ id: "sub_1", parentTaskId: "t1" });
+    const src = sources([sub]);
+    src.sqliteByTaskId.set("sub_1", {
+      completedAt: null,
+      lastStatusChangeAt: null,
+      commentCount: 0,
+      threadCount: 2,
+      activeThreads: [thread("working")],
+      attachmentCount: 1,
+    });
+    const [enriched] = buildEnriched([sub], src);
+    expect(enriched.activeThreads).toHaveLength(1);
+    expect(enriched.threadCount).toBe(2);
+    expect(enriched.attachmentCount).toBe(1);
+    expect(
+      applyFilters([enriched], { threads: "active" }, NOW).map((t) => t.id),
+    ).toEqual(["sub_1"]);
+    expect(
+      applyFilters([enriched], { attachments: true }, NOW).map((t) => t.id),
+    ).toEqual(["sub_1"]);
+  });
+
+  it("cardMeta remains the fallback when sqlite is unavailable", () => {
+    const top = task({ id: "t1" });
+    const src = sources([top]);
+    src.sqliteAvailable = false;
+    src.cardByTaskId.set("t1", {
+      attachmentCount: 2,
+      activeThreads: [thread("working")],
+    });
+    const [enriched] = buildEnriched([top], src);
+    expect(enriched.attachmentCount).toBe(2);
+    expect(enriched.activeThreads).toHaveLength(1);
+    expect(enriched.threadCount).toBeNull();
+    expect(
+      applyFilters([enriched], { threads: "active" }, NOW).map((t) => t.id),
     ).toEqual(["t1"]);
   });
 });

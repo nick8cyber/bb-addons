@@ -33,6 +33,17 @@ function seed(path: string, schema = true) {
         attached_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE attachments (
+        id TEXT PRIMARY KEY,
+        task_id TEXT,
+        comment_id TEXT,
+        file_name TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        blob_path TEXT NOT NULL DEFAULT '',
+        is_image INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT ''
+      );
     `);
   }
   return db;
@@ -68,6 +79,19 @@ describe("readEnrichment", () => {
       `INSERT INTO task_threads (id, task_id, thread_id, preset_name, title, live_status, attached_at, updated_at)
        VALUES ('tt2', 't1', 'thr_b', 'p', 'y', 'completed', '', '')`,
     ).run();
+    // A subtask (any task_id works — no top-level restriction like cardMeta).
+    db.prepare(
+      `INSERT INTO task_threads (id, task_id, thread_id, preset_name, title, live_status, attached_at, updated_at)
+       VALUES ('tt3', 'sub_1', 'thr_s', 'p', 'sub', 'starting', '', '')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO attachments (id, task_id, comment_id, file_name, mime, size_bytes)
+       VALUES ('a1', 'sub_1', NULL, 'f.png', 'image/png', 10)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO attachments (id, task_id, comment_id, file_name, mime, size_bytes)
+       VALUES ('a2', NULL, 'c2', 'g.png', 'image/png', 10)`,
+    ).run();
     db.close();
 
     const result = readEnrichment(dbPath);
@@ -78,9 +102,19 @@ describe("readEnrichment", () => {
     expect(t1.lastStatusChangeAt).toBe("2026-10-06T10:00:00Z");
     expect(t1.commentCount).toBe(4);
     expect(t1.threadCount).toBe(2);
+    // active = starting|working only
+    expect(t1.activeThreads.map((t) => t.threadId)).toEqual(["thr_a"]);
     const t2 = result!.get("t2")!;
     expect(t2.completedAt).toBe("2026-10-03T10:00:00Z");
     expect(t2.threadCount).toBe(0);
+    // Subtasks are covered the same as top-level tasks (unlike cardMeta).
+    const sub = result!.get("sub_1")!;
+    expect(sub.threadCount).toBe(1);
+    expect(sub.activeThreads).toHaveLength(1);
+    expect(sub.activeThreads[0].liveStatus).toBe("starting");
+    // Task-level attachments counted; comment-level excluded (cardMeta parity).
+    expect(sub.attachmentCount).toBe(1);
+    expect(result!.get("t1")!.attachmentCount).toBe(0);
   });
 
   it("returns null for a missing database", () => {

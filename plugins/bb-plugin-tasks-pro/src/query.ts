@@ -159,7 +159,10 @@ export function matchesDateRange(
         ? day >= today && day <= addDays(today, 29)
         : day >= addDays(today, -29) && day <= today;
     case "range":
-      return day >= range.from && day <= range.to;
+      // Empty bounds are open: {from:"", to:"2026-01-01"} means "up to".
+      if (range.from !== "" && day < range.from) return false;
+      if (range.to !== "" && day > range.to) return false;
+      return true;
   }
 }
 
@@ -200,7 +203,11 @@ export interface EnrichSources {
     string,
     { attachmentCount: number; activeThreads: TaskThread[] }
   >;
-  /** task_id → sqlite-derived columns; empty when the DB is unavailable. */
+  /**
+   * task_id → sqlite-derived columns; empty when the DB is unavailable.
+   * Covers every task including subtasks (cardMeta is top-level only), so it
+   * wins for threads/attachments whenever present.
+   */
   sqliteByTaskId: Map<
     string,
     {
@@ -208,6 +215,8 @@ export interface EnrichSources {
       lastStatusChangeAt: string | null;
       commentCount: number;
       threadCount: number;
+      activeThreads: TaskThread[];
+      attachmentCount: number;
     }
   >;
   sqliteAvailable: boolean;
@@ -243,8 +252,10 @@ export function buildEnriched(
       completedAt: sql?.completedAt ?? null,
       lastStatusChangeAt: sql?.lastStatusChangeAt ?? null,
       commentCount: sources.sqliteAvailable ? (sql?.commentCount ?? 0) : null,
-      attachmentCount: card?.attachmentCount ?? 0,
-      activeThreads: card?.activeThreads ?? [],
+      // SQLite covers every task (subtasks included); cardMeta is top-level
+      // only, so it stays the fallback for when the DB read failed.
+      attachmentCount: sql?.attachmentCount ?? card?.attachmentCount ?? 0,
+      activeThreads: sql?.activeThreads ?? card?.activeThreads ?? [],
       threadCount: sources.sqliteAvailable ? (sql?.threadCount ?? 0) : null,
     };
   });

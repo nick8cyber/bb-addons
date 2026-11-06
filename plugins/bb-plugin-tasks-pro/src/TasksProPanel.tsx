@@ -60,6 +60,8 @@ export function TasksProPanel(_props: PluginNavPanelProps) {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  /** Last queryTasks availability: false renders the unavailable empty-state. */
+  const [tasksAvailable, setTasksAvailable] = useState(true);
 
   // ---- ui state ----
   const [viewMode, setViewMode] = useState<"table" | "board">("table");
@@ -121,10 +123,12 @@ export function TasksProPanel(_props: PluginNavPanelProps) {
         });
         setTasks(result.tasks);
         setTotal(result.total);
+        setTasksAvailable(result.available);
         setLoadError(null);
       } catch (e) {
         setTasks([]);
         setTotal(0);
+        setTasksAvailable(false);
         setLoadError(e instanceof Error ? e.message : String(e));
       } finally {
         setLoading(false);
@@ -392,6 +396,7 @@ export function TasksProPanel(_props: PluginNavPanelProps) {
                       { value: "last7d", label: "Last 7 days" },
                       { value: "last30d", label: "Last 30 days" },
                       { value: "none", label: "No completion date" },
+                      { value: "range", label: "Custom range…" },
                     ]}
                     value={completedSelectValue(filters.completed)}
                     onChange={(v) =>
@@ -399,6 +404,40 @@ export function TasksProPanel(_props: PluginNavPanelProps) {
                     }
                   />
                 </div>
+                {typeof filters.completed === "object" &&
+                filters.completed?.kind === "range" ? (
+                  <div className="flex items-center gap-1 pl-24">
+                    <input
+                      type="date"
+                      value={filters.completed.from}
+                      onChange={(e) =>
+                        patchFilters({
+                          completed: {
+                            kind: "range",
+                            from: e.target.value,
+                            to: (filters.completed as { to: string }).to,
+                          },
+                        })
+                      }
+                      className="h-7 w-full rounded border border-border bg-background px-1 text-xs"
+                    />
+                    <span className="text-xs text-muted-foreground">→</span>
+                    <input
+                      type="date"
+                      value={filters.completed.to}
+                      onChange={(e) =>
+                        patchFilters({
+                          completed: {
+                            kind: "range",
+                            from: (filters.completed as { from: string }).from,
+                            to: e.target.value,
+                          },
+                        })
+                      }
+                      className="h-7 w-full rounded border border-border bg-background px-1 text-xs"
+                    />
+                  </div>
+                ) : null}
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs text-muted-foreground">Threads</span>
                   <SimpleSelect
@@ -558,6 +597,23 @@ export function TasksProPanel(_props: PluginNavPanelProps) {
           <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground">
             Loading tasks…
           </div>
+        ) : !tasksAvailable ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+            <div className="text-sm font-medium text-foreground">
+              Tasks plugin unavailable
+            </div>
+            <div className="max-w-md text-center text-xs">
+              The builtin <code>tasks</code> plugin is disabled or failed to
+              answer. Enable it in Plugins and refresh.
+            </div>
+            <button
+              type="button"
+              onClick={refresh}
+              className="mt-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+            >
+              Retry
+            </button>
+          </div>
         ) : tasks.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-1 text-muted-foreground">
             <div className="text-sm">No tasks match</div>
@@ -624,7 +680,8 @@ type CompletedSelectValue =
   | "today"
   | "last7d"
   | "last30d"
-  | "none";
+  | "none"
+  | "range";
 
 function completedSelectValue(
   v: Query["completed"],
@@ -636,6 +693,7 @@ function completedSelectValue(
     case "last7d":
     case "last30d":
     case "none":
+    case "range":
       return v.kind;
     default:
       return "any";
@@ -647,5 +705,6 @@ function completedFromSelect(
 ): Query["completed"] {
   if (v === "any") return undefined;
   if (v === "notCompleted") return "notCompleted";
+  if (v === "range") return { kind: "range", from: "", to: "" };
   return { kind: v };
 }
