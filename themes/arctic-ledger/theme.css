@@ -465,3 +465,27 @@ diffs-container {
 ) {
   display: none !important;
 }
+
+/* Plugin chrome buttons keep desktop styling on mobile: the changed-files
+ * pill renders 44px in a 48px row while native controls are 28px, and the
+ * advisor "did not run" dashed frame reads as a render glitch at icon size.
+ * Normalize every chrome-row control to the native 28px hit target. */
+[data-testid="app-page-header-content-row"] :is(
+  button,
+  a[href],
+  [role="button"]
+) {
+  height: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  padding-block: 0;
+  box-sizing: border-box;
+}
+
+[data-testid="app-page-header-content-row"] [data-bb-plugin="advisor"] :is(
+  button,
+  [role="button"]
+) {
+  border-style: solid;
+  border-color: var(--border);
+}
