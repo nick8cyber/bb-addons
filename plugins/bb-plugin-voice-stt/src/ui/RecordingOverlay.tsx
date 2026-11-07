@@ -388,7 +388,8 @@ function onCardTap(view: RecorderView): void {
 
 function cardHint(view: RecorderView): string | null {
   if (view.phase === "recording" || view.phase === "reconnecting") {
-    if (!view.micLive) return null;
+    // До первого звука показываем только проблемы (перезапуск/запасной режим).
+    if (!view.micLive) return view.notice !== null && view.notice !== "подключение…" ? view.notice : null;
     // Звук уже пишется и буферизуется — «подключение…» к серверу не мешает говорить.
     const notice = view.notice === "подключение…" ? null : view.notice;
     return notice ?? (view.holdArmed ? "Держите — или отпустите для toggle" : "Нажмите на плашку — вставить");

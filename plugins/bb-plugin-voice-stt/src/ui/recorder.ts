@@ -307,6 +307,11 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       // Предзахват: только в лог (уйдёт после hello), без плашки.
       if (ev.kind === "started") sendDiag(`mic started (pre-roll): ${ev.info}`);
       else sendDiag(`mic ${ev.kind} (pre-roll): ${"info" in ev ? ev.info : ev.reason}`);
+      if (ev.kind === "fallback") recMode = true; // pressStart не откроет сокет
+      return;
+    }
+    if (ev.kind === "fallback") {
+      enterRecorderMode(ev.info);
       return;
     }
     if (ev.kind === "started") sendDiag(`mic started: ${ev.info}`);
@@ -317,7 +322,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     } else if (ev.kind === "restarted") {
       sendDiag(`mic restarted: ${ev.info}`);
       patch({ notice: null });
-    } else {
+    } else if (ev.kind === "failed") {
       sendDiag(`mic failed: ${ev.reason}`);
       patch({ notice: "микрофон не отвечает — проверьте устройство ввода в системе" });
     }
@@ -329,6 +334,32 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
    * уходит в начало записи, если переносом — всё гасится. Включение
    * микрофона на iOS ~0.5–1 с — так оно идёт параллельно с жестом.
    */
+  /**
+   * Запасной режим (Web Audio молчит): запись идёт MediaRecorder-ом, живая
+   * сессия Gemini не нужна — закрываем сокет; по концу записи файл уходит
+   * в файловую цепочку (liveFallback), текст — без интеримов.
+   */
+  let recMode = false;
+  const enterRecorderMode = (info: string): void => {
+    recMode = true;
+    sendDiag(`mic fallback: ${info}`);
+    const a = attempt;
+    if (a && !a.dead) {
+      if (a.helloSent) sendJson(a, { type: "cancel", reason: "web audio silent → MediaRecorder fallback" });
+      a.dead = true;
+      try {
+        a.sock?.close();
+      } catch {
+        // уже закрыт
+      }
+    }
+    patch({
+      phase: view.phase === "reconnecting" ? "recording" : view.phase,
+      micLive: true,
+      notice: "живого текста не будет — распознаю после записи",
+    });
+  };
+
   /** Тёплый микрофон после записи (мс); 0 — выключать сразу. */
   let warmMs = DEFAULT_WARM_MS;
   let standby: Promise<void> | null = null;
@@ -406,6 +437,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     capture.park(warmMs); // тёплый микрофон — следующая запись стартует мгновенно
     standby = null;
     standbyOn = false;
+    recMode = false;
     preroll = [];
     prerollBytes = 0;
   };
@@ -476,6 +508,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   /** Файловая цепочка (§4.3а): WAV → RPC liveFallback → codex→groq(+gemini). */
   const fileFallback = async (): Promise<void> => {
     if (view.phase !== "finishing") return; // двойной запуск не нужен
+    if (recMode) return; // запасной режим отдаёт свой файл, PCM нет
     patch({ notice: "фоллбэк на файловую цепочку…" });
     try {
       const wav = pcmToWav(concatPcm(pcm));
@@ -743,6 +776,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       preroll = [];
       prerollBytes = 0;
       standbyError = null;
+      recMode = false;
       standbyOn = true;
       standby = capture.start(onMicChunk, onCaptureEvent).catch((e: unknown) => {
         standbyError = e;
@@ -788,6 +822,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         diagQueue = [];
         pressAt = now();
         firstAudioAt = 0;
+        recMode = false;
       }
       readySeen = false;
       patch({
@@ -814,7 +849,12 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
           recorder.stop();
         }
       }, maxRecordMs);
-      openSocket();
+      if (recMode) {
+        // Запасной режим уже включился на предзахвате — живая сессия не нужна.
+        patch({ micLive: true, notice: "живого текста не будет — распознаю после записи" });
+      } else {
+        openSocket();
+      }
       if (sb !== null) {
         void sb.then(() => {
           if (standbyError !== null && (view.phase === "recording" || view.phase === "reconnecting")) {
@@ -881,6 +921,31 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     /** Отпускание/Enter: конец записи → final → вставка (§3.3). */
     stop(): void {
       if (view.phase !== "recording" && view.phase !== "reconnecting") return;
+      if (recMode && capture.finishRecording) {
+        patch({ phase: "finishing", notice: "распознаю запись…", holdArmed: false });
+        const finish = capture.finishRecording;
+        void (async () => {
+          try {
+            const rec = await finish.call(capture);
+            capture.park(warmMs);
+            if (view.phase !== "finishing") return; // отменили, пока собирали файл
+            if (rec === null) {
+              deliver("", "silence", true);
+              return;
+            }
+            const res = (await callRpc("liveFallback", {
+              audioBase64: u8ToBase64(rec.bytes),
+              filename: rec.filename,
+              mimeType: rec.mimeType,
+            })) as LiveFallbackResult;
+            if (res.ok) deliver(res.text, res.engine, true);
+            else fail(`распознавание не удалось: ${res.message}`);
+          } catch (e) {
+            fail(`распознавание не удалось: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        })();
+        return;
+      }
       patch({ phase: "finishing", notice: "обработка…", holdArmed: false });
       capture.park(warmMs); // отпустили — в запись больше не пишем, микрофон тёплый
       const a = attempt;

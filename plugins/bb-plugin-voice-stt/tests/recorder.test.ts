@@ -1,3 +1,4 @@
+import type { CaptureEvent, RecordedAudio } from "../src/ui/capture.js";
 import { describe, expect, it } from "vitest";
 import {
   createVoiceRecorder,
@@ -54,9 +55,16 @@ class FakeCapture implements MicCaptureLike {
   }
   /** Тёплый микрофон: сколько чанков «до нажатия» отдать синхронно внутри start. */
   syncEmit = 0;
-  async start(onChunk: (pcm: Uint8Array, level: number) => void): Promise<void> {
+  private ev: ((e: CaptureEvent) => void) | null = null;
+  recorderMode = false;
+  recording: RecordedAudio | null = null;
+  async start(
+    onChunk: (pcm: Uint8Array, level: number) => void,
+    onEvent?: (e: CaptureEvent) => void,
+  ): Promise<void> {
     this.started += 1;
     this.cb = onChunk;
+    this.ev = onEvent ?? null;
     for (let i = 0; i < this.syncEmit; i++) onChunk(new Uint8Array(1600).fill(2), 0);
     if (this.gate !== null) await this.gate;
   }
@@ -69,6 +77,17 @@ class FakeCapture implements MicCaptureLike {
     // Тёплый микрофон: в запись больше не пишем (как у MicCapture).
     this.parked += 1;
     this.cb = null;
+  }
+  /** Web Audio замолчал → запасной режим MediaRecorder. */
+  fireFallback(): void {
+    this.recorderMode = true;
+    this.ev?.({ kind: "fallback", info: "recorder audio/mp4; test" });
+  }
+  isRecorderMode(): boolean {
+    return this.recorderMode;
+  }
+  async finishRecording(): Promise<RecordedAudio | null> {
+    return this.recording;
   }
   emit(bytes = 3200): void {
     this.cb?.(new Uint8Array(bytes).fill(1), 0.5);
@@ -367,6 +386,24 @@ describe("voiceRecorder (§3.3, §9)", () => {
     const sock = await openWithHello(r);
     expect(sock.binary()).toHaveLength(3);
     r.recorder.cancel();
+  });
+
+  it("запасной режим: Web Audio молчит → сессия отменена, файл MediaRecorder → liveFallback → вставка", async () => {
+    const r = makeRecorder();
+    const composer = new FakeComposer();
+    r.recorder.pressStart(composer, 1);
+    const sock = await openWithHello(r);
+    r.capture.fireFallback();
+    expect(sock.json().at(-1)).toMatchObject({ type: "cancel" });
+    expect(r.recorder.getSnapshot().micLive).toBe(true);
+    expect(r.recorder.getSnapshot().notice).toContain("распознаю после записи");
+    r.capture.recording = { bytes: new Uint8Array([1, 2, 3]), mimeType: "audio/mp4", filename: "live-dictation.m4a" };
+    r.recorder.stop();
+    await new Promise((res) => setTimeout(res, 0));
+    await new Promise((res) => setTimeout(res, 0));
+    const call = r.rpcCalls.find((c) => c.method === "liveFallback");
+    expect(call?.input).toMatchObject({ mimeType: "audio/mp4", filename: "live-dictation.m4a" });
+    expect(composer.inserted.at(-1)?.text).toBe("фоллбэк");
   });
 
   it("cancel sends cancel and never inserts", async () => {
