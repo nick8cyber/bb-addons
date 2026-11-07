@@ -28,13 +28,18 @@ const SMART_MODE = "SMART";
 const AUDIO_CHUNK_BYTES = 3_200;
 const SAMPLE_RATE = 16_000;
 
-// Адаптивный финиш (ADR-0002, константы OmniFlow, спека §6.6):
-// transcribe-live дорафинирует хвост до ~3.2 с после конца аудио, а на чистой
-// тишине VAD сервера не срабатывает — ждём по тишине интеримов, минимуму после
-// стопа и жёсткому cap, а не по turnComplete, который может не прийти.
+/** PCM16 s16le mono 16 кГц = 32 байта на миллисекунду. */
+const BYTES_PER_PCM_MS = 32;
+
+// Адаптивный финиш — файловый режим (спека §6.6, поправка PLUG-126):
+// файл уходит пачкой, транскрипт догоняет потоком — settle побольше живого
+// режима, cap масштабируется длиной аудио и трактуется как ПРОВАЛ (урезанный
+// текст никогда не возвращается), turnComplete сессию не завершает.
 const FINISH_MIN_WAIT_MS = 800;
-const FINISH_SETTLE_MS = 1_000;
-const FINISH_TIMEOUT_MS = 6_000;
+const FINISH_SETTLE_MS = 3_000;
+const FINISH_TIMEOUT_BASE_MS = 8_000;
+const FINISH_TIMEOUT_PER_AUDIO_MS = 0.4;
+const FINISH_TIMEOUT_MAX_MS = 45_000;
 const FINISH_POLL_MS = 80;
 
 const CUSTOM_VOCABULARY_LIMIT = 1_000;
@@ -316,7 +321,15 @@ export function transcribeGeminiLive(options: GeminiLiveSessionOptions): Promise
       );
     };
 
-    /** Адаптивный финиш (§6.6): resolve по тишине интеримов или cap. */
+    // Cap финиша масштабируется длиной аудио (§6.6): файл ушёл пачкой, хвост
+    // транскрипта догоняет примерно пропорционально его длительности.
+    const audioMs = pcm.length / BYTES_PER_PCM_MS;
+    const finishTimeoutMs = Math.min(
+      FINISH_TIMEOUT_BASE_MS + audioMs * FINISH_TIMEOUT_PER_AUDIO_MS,
+      FINISH_TIMEOUT_MAX_MS,
+    );
+
+    /** Адаптивный финиш (§6.6): settle → resolve; cap → ПРОВАЛ стадии. */
     const scheduleFinishCheck = (): void => {
       finishTimer = setTimeout(() => {
         finishTimer = null;
@@ -324,7 +337,18 @@ export function transcribeGeminiLive(options: GeminiLiveSessionOptions): Promise
         const now = Date.now();
         const sinceEnd = now - streamEndedAt;
         const sinceLast = now - lastActivityAt;
-        if (sinceEnd >= FINISH_TIMEOUT_MS || (sinceEnd >= FINISH_MIN_WAIT_MS && sinceLast >= FINISH_SETTLE_MS)) {
+        if (sinceEnd >= finishTimeoutMs) {
+          // Кап при живом потоке кадров — текст, скорее всего, урезан.
+          failWith(
+            new AiServiceFailure(
+              "timeout",
+              "gemini_live_finish_timeout",
+              `Gemini live transcript still arriving after ${finishTimeoutMs}ms`,
+            ),
+          );
+          return;
+        }
+        if (sinceEnd >= FINISH_MIN_WAIT_MS && sinceLast >= FINISH_SETTLE_MS) {
           done();
           return;
         }
@@ -399,10 +423,11 @@ export function transcribeGeminiLive(options: GeminiLiveSessionOptions): Promise
         if (frame.interimTranscript !== null) accumulator.feedInterim(frame.interimTranscript);
         if (frame.transcript !== null) accumulator.feedFinal(frame.transcript);
       }
-      if (frame.isComplete && streamEnded) {
-        // turnComplete закрывает серверный ХОД, не сессию — финиш только после
-        // нашего audioStreamEnd (§6.3).
-        done();
+      if (frame.isComplete) {
+        // turnComplete закрывает серверный ХОД, не сессию; в файловом режиме
+        // может прийти посреди буфера — коммитим сегмент, но не завершаем
+        // (финиш только по settle, §6.6).
+        accumulator.endSegment();
       }
     };
 

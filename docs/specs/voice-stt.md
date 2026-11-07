@@ -215,11 +215,13 @@ auth_required, request_failed, invalid_response}` (классификация к
 provider-codex: `AiServiceFailure{code, detailCode, message}` →
 `{ok:false, code, message}`; AbortError → `timeout`).
 
-Бюджеты стадий (в рамках общих 65 c, сумма худшего случая ≤58 c):
-ffmpeg ≤4 c, Gemini ≤12 c на ключ-сессию (connect+setup ≤5 c),
-Codex ≤15 c, Groq ≤15 c. **Guard по остатку**: перед каждой стадией если
-`remainingMs < 5000` — стадия пропускается с пометкой `timeout` в причинах
-(дедлайн считается от `timeoutMs`/signal один раз на входе).
+Бюджеты стадий (в рамках общих 65 c):
+ffmpeg ≤4 c, Gemini `min(15 + 0.4·audioSec, 55)` c на ключ-сессию
+(connect+setup ≤5 c), Codex ≤15 c, Groq ≤15 c. **Guard по остатку**: перед
+каждой стадией если `remainingMs < 5000` — стадия пропускается с пометкой
+`timeout` в причинах (дедлайн считается от `timeoutMs`/signal один раз на
+входе). Бюджет Gemini масштабируется длиной аудио, потому что файл уходит
+пачкой, а транскрипт догоняет потоком (§6.6).
 
 ## 6. Gemini Live — точный протокол (порт OmniFlow)
 
@@ -291,14 +293,25 @@ split по `\n , ;` → trim → выкинуть пустые → dedup по lo
   непустой trim в `committedSegments`.
 - `finalText()` — committed + открытый хвост, join `" "`, trim.
 
-### 6.6. Адаптивный финиш (ADR-0002, константы OmniFlow)
+### 6.6. Адаптивный финиш — файловый режим (ADR-0002 + поправка PLUG-126)
 
-После `audioStreamEnd`: resolve когда `sinceEnd ≥ 0.8c И sinceLastInterim ≥
-1.0c`, либо `sinceEnd ≥ 6.0c` (cap); poll 80 мс. `turnComplete` после
-streamEnded → тоже resolve с накопленным. Тишина без интеримов: сработает по
-minWait/settle от момента streamEnd (lastInterimAt армить от setupComplete и
-обновлять также на voiceActivity-кадрах — активность = доказательство
-живого распознавания).
+Файл уходит пачкой (~секунды), а транскрипт догоняет потоком десятки секунд —
+константы OmniFlow рассчитаны на живой поток и на длинных записях резали
+текст (баг: cap 6 c возвращал урезанный текст как успех). Пейсинг отправки
+НЕ используется: blast покрывает файл целиком, а растянутая отправка
+теряет хвост (сервер отбрасывает бэклог после audioStreamEnd — проверено
+живьём: пейсинг 1.5× → хвост ~8 c записи потерян, blast → полное покрытие).
+
+- `settle`: resolve когда `sinceEnd ≥ 0.8c И sinceLastActivity ≥ 3.0c`;
+  poll 80 мс. `lastActivityAt` армируется от setupComplete и обновляется на
+  ЛЮБЫХ кадрах активности/транскрипта.
+- `cap`: `sinceEnd ≥ min(8 + 0.4·audioSec, 45)` c → **ПРОВАЛ стадии**
+  (`timeout`), не resolve с частичным текстом. Урезанный текст никогда не
+  возвращается: либо settle (поток реально затих), либо фоллбэк.
+- `turnComplete`/`generationComplete` НЕ завершают сессию — в файловом режиме
+  могут приходить посреди буфера. Только endSegment для аккумулятора.
+- Тишина без кадров: settle от setupComplete/streamEnd → "" → мягкий провал →
+  codex (как раньше).
 
 ### 6.7. Обработка файла целиком
 

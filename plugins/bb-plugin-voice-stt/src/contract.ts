@@ -55,7 +55,8 @@ export const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 /** Стадия пропускается, если до общего дедлайна осталось меньше (спека §5). */
 export const STAGE_MIN_REMAINING_MS = 5_000;
 export const FFMPEG_TIMEOUT_MS = 4_000;
-export const GEMINI_KEY_SESSION_MS = 12_000;
+// Бюджет Gemini-ключ-сессии считается в chain от длины PCM:
+// min(15_000 + audioMs·0.4, 55_000) — спека §5, файловый режим §6.6.
 export const GEMINI_SETUP_TIMEOUT_MS = 5_000;
 export const CODEX_TIMEOUT_MS = 15_000;
 export const GROQ_TIMEOUT_MS = 15_000;

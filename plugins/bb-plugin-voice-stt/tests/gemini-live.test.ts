@@ -168,8 +168,8 @@ describe("transcribeGeminiLive session", () => {
       expect(f).toHaveProperty("realtimeInput.audio.mimeType", "audio/pcm;rate=16000");
     }
     expect(realtime[3]).toEqual(JSON.parse(AUDIO_STREAM_END_MESSAGE));
-    // Финиш по cap после streamEnd (тихо — кадров нет).
-    await vi.advanceTimersByTimeAsync(6_100);
+    // Тишина без кадров: финиш по settle (~3 с) — пустой текст валиден (§6.6).
+    await vi.advanceTimersByTimeAsync(3_100);
     await expect(promise).resolves.toBe("");
   });
 
@@ -183,7 +183,9 @@ describe("transcribeGeminiLive session", () => {
     ws.simulateMessage({ voiceActivity: { type: "ACTIVITY_START" } });
     ws.simulateMessage({ serverContent: { inputTranscription: { text: "мир" } } });
     ws.simulateMessage({ voiceActivity: { type: "ACTIVITY_END" } });
+    // turnComplete коммитит сегмент, но сессию не завершает (§6.6) — финиш по settle.
     ws.simulateMessage({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(3_100);
     await expect(promise).resolves.toBe("привет мир");
   });
 
@@ -195,15 +197,33 @@ describe("transcribeGeminiLive session", () => {
     ws.simulateMessage({ setupComplete: {} });
     ws.simulateMessage({ serverContent: { inputTranscription: { text: "текст" } } });
     ws.simulateMessage({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(3_100);
     await expect(promise).resolves.toBe("текст");
+  });
+
+  it("does not finish on turnComplete mid-buffer — waits for settle", async () => {
+    const promise = transcribeGeminiLive(baseOptions());
+    const ws = openAndSetup();
+    ws.simulateMessage({ serverContent: { inputTranscription: { text: "первая" } } });
+    ws.simulateMessage({ serverContent: { turnComplete: true } });
+    // turnComplete пришёл посреди буфера — дальше ещё едет текст.
+    ws.simulateMessage({ serverContent: { inputTranscription: { text: "вторая" } } });
+    let resolved = false;
+    void promise.then(() => {
+      resolved = true;
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(resolved).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_200);
+    await expect(promise).resolves.toBe("первая вторая");
   });
 
   it("resolves by settle when interims went quiet after streamEnd", async () => {
     const promise = transcribeGeminiLive(baseOptions());
     const ws = openAndSetup();
     ws.simulateMessage({ serverContent: { interimInputTranscription: { text: "текст" } } });
-    // sinceLastActivity < 1.0 с — ждём settle; последний кадр был ~сразу после streamEnd.
-    await vi.advanceTimersByTimeAsync(1_100);
+    // sinceLastActivity < 3.0 с — ждём settle; последний кадр был ~сразу после streamEnd.
+    await vi.advanceTimersByTimeAsync(3_100);
     await expect(promise).resolves.toBe("текст");
   });
 
@@ -218,10 +238,25 @@ describe("transcribeGeminiLive session", () => {
     void promise.then(() => {
       resolved = true;
     });
-    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(2_100);
     expect(resolved).toBe(false);
     await vi.advanceTimersByTimeAsync(300);
     await expect(promise).resolves.toBe("ab");
+  });
+
+  it("fails the stage on finish cap while frames still arrive — never returns partial text", async () => {
+    const promise = transcribeGeminiLive(baseOptions());
+    const expectation = expect(promise).rejects.toMatchObject({
+      name: "AiServiceFailure",
+      code: "timeout",
+    });
+    const ws = openAndSetup();
+    // Для тестового PCM (~300 мс аудио) cap ≈ 8.1 с; кадры приходят каждую секунду.
+    for (let i = 0; i < 10; i += 1) {
+      ws.simulateMessage({ serverContent: { interimInputTranscription: { text: `w${i}` } } });
+      await vi.advanceTimersByTimeAsync(900);
+    }
+    await expectation;
   });
 
   it("fails the stage on an error frame", async () => {
@@ -275,6 +310,7 @@ describe("transcribeGeminiLive session", () => {
     const setup = ws.sentFrames()[0] as { setup: { inputAudioTranscription: Record<string, unknown> } };
     expect(setup.setup.inputAudioTranscription.languageCodes).toEqual(["ru-RU"]);
     ws.simulateMessage({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(3_100);
     await expect(promise).resolves.toBe("");
   });
 
@@ -284,6 +320,7 @@ describe("transcribeGeminiLive session", () => {
     const setup = ws.sentFrames()[0] as { setup: { inputAudioTranscription: Record<string, unknown> } };
     expect(setup.setup.inputAudioTranscription.custom_vocabulary).toEqual(["astra", "github"]);
     ws.simulateMessage({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(3_100);
     await expect(promise).resolves.toBe("");
   });
 
@@ -294,6 +331,7 @@ describe("transcribeGeminiLive session", () => {
     ws.simulateBinaryMessage({ setupComplete: {} });
     ws.simulateBinaryMessage({ serverContent: { inputTranscription: { text: "bin" } } });
     ws.simulateBinaryMessage({ serverContent: { turnComplete: true } });
+    await vi.advanceTimersByTimeAsync(3_100);
     await expect(promise).resolves.toBe("bin");
   });
 });

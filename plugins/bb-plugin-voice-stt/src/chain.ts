@@ -14,7 +14,6 @@ import { transcribeCodex, type TranscribeCodexOptions } from "./codex.js";
 import {
   CODEX_TIMEOUT_MS,
   FFMPEG_TIMEOUT_MS,
-  GEMINI_KEY_SESSION_MS,
   GROQ_TIMEOUT_MS,
   MAX_AUDIO_BYTES,
   STAGE_MIN_REMAINING_MS,
@@ -142,6 +141,11 @@ export async function runTranscribeChain(
             break;
           }
           try {
+            // Бюджет ключ-сессии масштабируется длиной аудио (спека §5):
+            // min(15 + 0.4·audioSec, 55) с — файл ушёл пачкой, транскрипт
+            // догоняет потоком примерно пропорционально длительности.
+            const audioMs = pcm.length / 32;
+            const sessionMs = Math.min(15_000 + audioMs * 0.4, 55_000);
             const text = (
               await gemini({
                 apiKey: key,
@@ -149,7 +153,7 @@ export async function runTranscribeChain(
                 pcm,
                 language: cfg.language,
                 hint: input.hint,
-                timeoutMs: budget(GEMINI_KEY_SESSION_MS),
+                timeoutMs: budget(sessionMs),
                 signal: context.signal,
                 log,
               })
