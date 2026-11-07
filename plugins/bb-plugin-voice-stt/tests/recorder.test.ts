@@ -145,6 +145,19 @@ describe("voiceRecorder (§3.3, §9)", () => {
     r.recorder.cancel();
   });
 
+  it("hold:true (FAB push-to-talk) — release of that pointer ends at once", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 3, { hold: true });
+    const sock = await openWithHello(r);
+    expect(r.recorder.getSnapshot().holdArmed).toBe(false);
+    r.recorder.pressEnd({ pointerId: 9 }); // чужой указатель — не конец
+    expect(r.recorder.getSnapshot().phase).toBe("recording");
+    r.recorder.pressEnd({ pointerId: 3 });
+    expect(r.recorder.getSnapshot().phase).toBe("finishing");
+    expect(sock.json().at(-1)).toEqual({ type: "end" });
+    r.recorder.cancel();
+  });
+
   it("BLOCKER: stray releases in toggle mode do NOT end the session", async () => {
     const r = makeRecorder();
     r.recorder.pressStart(new FakeComposer(), 1);

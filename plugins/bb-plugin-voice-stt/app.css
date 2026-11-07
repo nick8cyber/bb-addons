@@ -193,6 +193,21 @@
 .vsl-fab--busy {
   opacity: 0.8;
 }
+/* Касание: мгновенный отклик цветом, пока решается тап/удержание/перенос. */
+.vsl-fab--pressed {
+  background: var(--destructive, #ef4444);
+  color: #fff;
+  border-color: transparent;
+}
+/* Перенос: кнопка едет за пальцем без анимаций. */
+.vsl-fab--drag,
+.vsl-fab--drag:active {
+  transition: none;
+  animation: none;
+  transform: scale(1.1);
+  cursor: grabbing;
+  opacity: 0.9;
+}
 
 /*
  * Узкий экран (мобильный клиент): плашка во всю ширину, крупный текст —
@@ -213,37 +228,4 @@
   .vsl-hint {
     font-size: 13px;
   }
-}
-
-/*
- * Одна кнопка вместо нативной (§3.1): нативный микрофон композера скрыт,
- * пока живой ввод включён. Селектор по data-icon="Mic" — не зависит от
- * локализации (bb-plugin-ru переводит aria-label).
- */
-html[data-vsl-live] [data-promptbox-standard-actions] > span:has(> button > svg[data-icon="Mic"]),
-html[data-vsl-live] [data-promptbox-standard-actions] > button:has(> svg[data-icon="Mic"]) {
-  display: none !important;
-}
-
-/* Кнопка в composer.actions — на месте нативной (контейнер хоста h-9). */
-.vsl-mic {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 36px;
-  height: 36px;
-  padding: 0;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--muted-foreground);
-  cursor: pointer;
-}
-.vsl-mic:hover {
-  background: var(--state-hover, var(--accent));
-  color: var(--foreground);
-}
-.vsl-mic--active {
-  color: var(--destructive, #ef4444);
-  animation: vsl-pulse 1.2s ease-in-out infinite;
 }

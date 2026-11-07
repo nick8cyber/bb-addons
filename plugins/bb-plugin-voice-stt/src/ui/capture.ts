@@ -61,6 +61,11 @@ export class MicCapture implements MicCaptureLike {
 
   /** iOS: AudioContext живёт, только если создан и запущен прямо в нажатии. */
   unlock(): void {
+    // Идемпотентно: FAB будит контекст на касании, pressStart — повторно.
+    if (this.ctx !== null && this.ctx.state !== "closed") {
+      void this.ctx.resume().catch(() => {});
+      return;
+    }
     try {
       const AC =
         window.AudioContext ??

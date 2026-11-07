@@ -4,11 +4,19 @@
  * «Отпустите/Enter — вставить», «Esc — отмена», пометка фоллбэка и
  * «копировать» для финала, который не удалось вставить (§3.3).
  */
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from "react";
 import { useComposers, useSettings } from "@get-bb/plugin-sdk/app";
 
 import { MicGlyph } from "./MicGlyph.js";
-import { micPresence } from "./micPresence.js";
+import {
+  FAB_MARGIN,
+  FAB_SIZE,
+  loadFabRatio,
+  pxToRatio,
+  ratioToPx,
+  saveFabRatio,
+  type FabRatio,
+} from "./fabPosition.js";
 import { voiceRecorder, type ComposerTarget, type RecorderView } from "./recorder.js";
 
 type ComposerList = readonly (ComposerTarget & { scope?: { kind?: string } })[];
@@ -35,42 +43,165 @@ function ComposersBridge() {
   return null;
 }
 
+/** Сдвиг пальца/курсора, после которого жест — перенос кнопки, а не тап. */
+const DRAG_PX = 10;
+/** Удержание без сдвига дольше этого — push-to-talk. */
+const HOLD_START_MS = 300;
+
+interface FabGesture {
+  pointerId: number;
+  x0: number;
+  y0: number;
+  /** Смещение точки хвата от левого-верхнего угла кнопки. */
+  dx: number;
+  dy: number;
+  /**
+   * pending — нажали в покое, ещё не ясно: тап / удержание / перенос;
+   * hold — удержание распознано, идёт push-to-talk;
+   * stop — нажали во время записи (стоп на отпускании);
+   * drag — переносим кнопку.
+   */
+  mode: "pending" | "hold" | "stop" | "drag";
+  timer: ReturnType<typeof setTimeout> | null;
+  last: { left: number; top: number } | null;
+}
+
+function useViewport(): { vw: number; vh: number } {
+  const [vp, setVp] = useState(() => ({ vw: window.innerWidth, vh: window.innerHeight }));
+  useEffect(() => {
+    const on = () => setVp({ vw: window.innerWidth, vh: window.innerHeight });
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, []);
+  return vp;
+}
+
 /**
- * Плавающая кнопка живого ввода (§3.1 п. 4): только когда композер
- * свёрнут (кнопки в нём нет) — на экране всегда одна кнопка. Сидит на середине правого края — в стороне от композера,
- * кнопки отправки и нижних панелей. Те же жесты, что у composer-
- * кнопки; во время записи — кнопка стоп.
+ * Плавающая кнопка живого ввода (§3.1 п. 1) — основной вход, видна
+ * всегда. Касание — кнопка сразу подсвечивается, но микрофон и сокет
+ * НЕ стартуют: тап (отпустили без сдвига) — старт toggle-записи;
+ * удержание 300 мс — push-to-talk; сдвиг > 10 px — перенос кнопки,
+ * кнопка едет за пальцем прямой записью стиля (без перерисовок React).
+ * Во время записи: тап — стоп, сдвиг — перенос без остановки.
  */
 function FloatingMic() {
   const composers = useComposers();
   const view = useSyncExternalStore(voiceRecorder.subscribe, voiceRecorder.getSnapshot);
-  const composerMics = useSyncExternalStore(micPresence.subscribe, micPresence.getSnapshot);
+  const { vw, vh } = useViewport();
+  const [ratio, setRatio] = useState<FabRatio | null>(() => loadFabRatio());
+  const [pressed, setPressed] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const gesture = useRef<FabGesture | null>(null);
   const active = view.phase === "recording" || view.phase === "reconnecting";
-  // Одна кнопка на экране: композер развёрнут (там наша кнопка) — FAB не
-  // рисуем никогда, в т.ч. во время записи (стоп — та кнопка или тап по
-  // плашке). Композеров нет вовсе — FAB только как стоп идущей записи.
-  if (composerMics > 0) return null;
-  if (!active && (composers as ComposerList).length === 0) return null;
+
+  const placed = ratio !== null ? ratioToPx(ratio, vw, vh) : null;
+  const style = placed !== null ? { left: placed.left, top: placed.top, right: "auto" } : undefined;
+  const target = (): ComposerTarget | null => resolveComposerTarget(composers as ComposerList);
+
+  const clearTimer = (g: FabGesture): void => {
+    if (g.timer !== null) {
+      clearTimeout(g.timer);
+      g.timer = null;
+    }
+  };
+
+  const finishGesture = (e: ReactPointerEvent<HTMLButtonElement>, cancelled: boolean): void => {
+    const g = gesture.current;
+    if (g === null || g.pointerId !== e.pointerId) return;
+    gesture.current = null;
+    clearTimer(g);
+    setPressed(false);
+    if (g.mode === "drag") {
+      setDragging(false);
+      if (g.last !== null) {
+        const r = pxToRatio(g.last.left, g.last.top, window.innerWidth, window.innerHeight);
+        setRatio(r);
+        saveFabRatio(r);
+      }
+      return;
+    }
+    if (g.mode === "pending") {
+      if (cancelled) voiceRecorder.unprime();
+      else voiceRecorder.toggle(target()); // тап — старт, конец — следующим тапом
+      return;
+    }
+    if (g.mode === "stop") {
+      if (!cancelled) voiceRecorder.stop();
+      return;
+    }
+    voiceRecorder.pressEnd(e.nativeEvent); // hold: отпустили — конец записи
+  };
+
   return (
     <button
       type="button"
-      className={`vsl-fab${active ? " vsl-fab--active" : ""}${view.phase === "finishing" ? " vsl-fab--busy" : ""}`}
+      className={`vsl-fab${active ? " vsl-fab--active" : ""}${pressed && !active ? " vsl-fab--pressed" : ""}${view.phase === "finishing" ? " vsl-fab--busy" : ""}${dragging ? " vsl-fab--drag" : ""}`}
+      style={style}
       title={
         active
-          ? "Завершить диктовку"
-          : "Живой ввод: удерживайте кнопку или нажмите для диктовки"
+          ? "Завершить диктовку (перетащите, чтобы сдвинуть)"
+          : "Живой ввод: нажмите или удерживайте; перетащите, чтобы сдвинуть"
       }
       aria-label="Живой ввод"
       aria-pressed={active}
       onPointerDown={(e) => {
         e.preventDefault();
-        voiceRecorder.pressStart(
-          resolveComposerTarget(composers as ComposerList),
-          e.nativeEvent.pointerId,
-        );
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          // без захвата перенос работает по событиям, приходящим на кнопку
+        }
+        const rect = e.currentTarget.getBoundingClientRect();
+        const g: FabGesture = {
+          pointerId: e.pointerId,
+          x0: e.clientX,
+          y0: e.clientY,
+          dx: e.clientX - rect.left,
+          dy: e.clientY - rect.top,
+          mode: active ? "stop" : "pending",
+          timer: null,
+          last: null,
+        };
+        gesture.current = g;
+        if (!active) {
+          setPressed(true);
+          voiceRecorder.prime();
+          const pointerId = e.nativeEvent.pointerId;
+          g.timer = setTimeout(() => {
+            g.timer = null;
+            if (gesture.current !== g || g.mode !== "pending") return;
+            g.mode = "hold";
+            voiceRecorder.pressStart(target(), pointerId, { hold: true });
+          }, HOLD_START_MS);
+        }
       }}
-      onPointerUp={(e) => voiceRecorder.pressEnd(e.nativeEvent)}
-      onPointerCancel={(e) => voiceRecorder.pressEnd(e.nativeEvent)}
+      onPointerMove={(e) => {
+        const g = gesture.current;
+        if (g === null || g.pointerId !== e.pointerId) return;
+        if (g.mode === "hold") return; // говорит с пальцем на кнопке — не двигаем
+        if (g.mode !== "drag") {
+          if (Math.hypot(e.clientX - g.x0, e.clientY - g.y0) < DRAG_PX) return;
+          if (g.mode === "pending") {
+            clearTimer(g);
+            voiceRecorder.unprime();
+            setPressed(false);
+          }
+          g.mode = "drag";
+          setDragging(true);
+        }
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const left = Math.min(Math.max(e.clientX - g.dx, FAB_MARGIN), w - FAB_SIZE - FAB_MARGIN);
+        const top = Math.min(Math.max(e.clientY - g.dy, FAB_MARGIN), h - FAB_SIZE - FAB_MARGIN);
+        g.last = { left, top };
+        // Прямо в DOM — кадр за кадром, без перерисовки React.
+        const el = e.currentTarget;
+        el.style.left = `${left}px`;
+        el.style.top = `${top}px`;
+        el.style.right = "auto";
+      }}
+      onPointerUp={(e) => finishGesture(e, false)}
+      onPointerCancel={(e) => finishGesture(e, true)}
       onContextMenu={(e) => e.preventDefault()}
     >
       <MicGlyph size={22} />
@@ -84,11 +215,6 @@ function SettingsBridge() {
   const enabled = values?.liveInput !== false;
   useEffect(() => {
     voiceRecorder.setLiveEnabled(enabled);
-    // Маркер для CSS: нативный микрофон скрыт, только пока живой ввод включён.
-    const root = document.documentElement;
-    if (enabled) root.setAttribute("data-vsl-live", "");
-    else root.removeAttribute("data-vsl-live");
-    return () => root.removeAttribute("data-vsl-live");
   }, [enabled]);
   return null;
 }

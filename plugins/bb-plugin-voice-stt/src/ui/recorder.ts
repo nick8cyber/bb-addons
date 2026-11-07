@@ -610,7 +610,23 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
      * жесте. `pointerId` — только у реального указателя; команда/футер
      * стартуют без него (pressHeld=false → чужие отпускания игнорятся).
      */
-    pressStart(composer?: ComposerTarget | null, pointerId?: number): void {
+    /**
+     * Касание FAB в покое: только будим AudioContext в жесте (требование
+     * iOS) — без микрофона и сокета, чтобы перенос кнопки не тормозил.
+     */
+    prime(): void {
+      if (view.phase === "idle") capture.unlock();
+    },
+    /** Касание оказалось переносом — разбуженный контекст гасим. */
+    unprime(): void {
+      if (view.phase === "idle") capture.stop();
+    },
+
+    pressStart(
+      composer?: ComposerTarget | null,
+      pointerId?: number,
+      opts?: { hold?: boolean },
+    ): void {
       if (!liveEnabled) return;
       if (view.phase === "recording" || view.phase === "reconnecting") {
         // Повторное нажатие в toggle-режиме → end (§3.3).
@@ -637,7 +653,12 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       });
       capture.unlock(); // синхронно в нажатии — требование iOS (§3.3)
       attachWindowHooks();
-      arm(() => patch({ holdArmed: false }), holdMs);
+      if (opts?.hold === true) {
+        // Удержание уже распознано (FAB): отпускание = конец записи.
+        patch({ holdArmed: false, notice: view.notice });
+      } else {
+        arm(() => patch({ holdArmed: false }), holdMs);
+      }
       arm(() => {
         if (view.phase === "recording" || view.phase === "reconnecting") {
           patch({ notice: "лимит 5 минут — завершаю" });
