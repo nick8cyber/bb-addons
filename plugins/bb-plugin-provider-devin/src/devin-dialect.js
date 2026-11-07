@@ -61,3 +61,13 @@ function persistDevinBbInstructions(bbThreadId, instructions) {
   void fs.mkdir(DEVIN_BB_INSTRUCTIONS_DIR, { recursive: true, mode: 448 }).then(() => fs.writeFile(file, instructions, { mode: 384 })).catch(() => {
   });
 }
+
+// Системные уведомления bb ("[bb system] ... completed", "... is now a child") не
+// прерывают идущий ход Devin: ACP не умеет вклинивать сообщение в ход, и мост
+// отменял ход (session/cancel) — Devin обрывал текущую команду. Такие уведомления
+// ждут в очереди и приходят сразу после хода. Сообщения владельца и других тредов
+// по-прежнему прерывают ход (чтобы можно было остановить агента).
+function isBbSystemNotice(input) {
+  const first = Array.isArray(input) ? input.find((item) => item && item.type === "text") : void 0;
+  return typeof first?.text === "string" && first.text.startsWith("[bb system]");
+}

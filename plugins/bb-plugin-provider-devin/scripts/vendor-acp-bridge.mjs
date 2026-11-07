@@ -41,6 +41,15 @@ replaceOnce(
   "  session = {\n    bbThreadId,\n    construction: params,\n",
   "  persistDevinBbInstructions(bbThreadId, params.instructions);\n  session = {\n    bbThreadId,\n    construction: params,\n",
 );
+// Системные уведомления bb не прерывают ход (см. isBbSystemNotice в devin-dialect.js).
+replaceOnce(
+  "        requestId: null\n      });\n      requestSteerCancel(session);\n      sendResult(request.id, { threadId: params.threadId });",
+  "        requestId: null,\n        soft: isBbSystemNotice(params.input)\n      });\n      if (!isBbSystemNotice(params.input)) {\n        requestSteerCancel(session);\n      }\n      sendResult(request.id, { threadId: params.threadId });",
+);
+replaceOnce(
+  "        if (session.queuedInputs.length > 0) {\n          requestSteerCancel(session);",
+  "        if (session.queuedInputs.some((queued) => queued.soft !== true)) {\n          requestSteerCancel(session);",
+);
 // devin-dialect.js пользуется модулями, которые мост уже импортирует под этими именами.
 for (const imp of ['import fs from "node:fs/promises";', 'import os from "node:os";', 'import path2 from "node:path";']) {
   if (!code.includes(imp)) {

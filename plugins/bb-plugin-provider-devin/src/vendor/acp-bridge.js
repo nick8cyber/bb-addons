@@ -5412,6 +5412,16 @@ function persistDevinBbInstructions(bbThreadId, instructions) {
   });
 }
 
+// Системные уведомления bb ("[bb system] ... completed", "... is now a child") не
+// прерывают идущий ход Devin: ACP не умеет вклинивать сообщение в ход, и мост
+// отменял ход (session/cancel) — Devin обрывал текущую команду. Такие уведомления
+// ждут в очереди и приходят сразу после хода. Сообщения владельца и других тредов
+// по-прежнему прерывают ход (чтобы можно было остановить агента).
+function isBbSystemNotice(input) {
+  const first = Array.isArray(input) ? input.find((item) => item && item.type === "text") : void 0;
+  return typeof first?.text === "string" && first.text.startsWith("[bb system]");
+}
+
 var DIALECTS_BY_ID = /* @__PURE__ */ new Map([
   [DEVIN_ACP_DIALECT.id, DEVIN_ACP_DIALECT],
   [CURSOR_ACP_DIALECT.id, CURSOR_ACP_DIALECT],
@@ -9111,7 +9121,7 @@ function runTurn(session, firstInput) {
           resultSchema: acpPromptResultSchema
         });
         acceptTurnInput(session, pending);
-        if (session.queuedInputs.length > 0) {
+        if (session.queuedInputs.some((queued) => queued.soft !== true)) {
           requestSteerCancel(session);
         }
         const result = await promptResult;
@@ -9562,9 +9572,12 @@ async function handleRequest2(request) {
       session.queuedInputs.push({
         clientRequestId: params.clientRequestId,
         input: params.input,
-        requestId: null
+        requestId: null,
+        soft: isBbSystemNotice(params.input)
       });
-      requestSteerCancel(session);
+      if (!isBbSystemNotice(params.input)) {
+        requestSteerCancel(session);
+      }
       sendResult(request.id, { threadId: params.threadId });
       return;
     }

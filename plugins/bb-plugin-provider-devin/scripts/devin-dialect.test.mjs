@@ -16,13 +16,13 @@ const delegationPresentation = (args) => ({
   title: args.label,
   ...(args.detail === undefined ? {} : { detail: args.detail }),
 });
-const { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions } = new Function(
+const { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice } = new Function(
   "z",
   "delegationPresentation",
   "fs",
   "os",
   "path2",
-  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions };`,
+  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice };`,
 )(z, delegationPresentation, fsPromises, fakeOs, path);
 
 // Реальное событие из bb (<thread> seq 2346), до выключения субагентов.
@@ -86,4 +86,14 @@ test("bb instructions persisted per thread, 0600, junk ids ignored", async () =>
   assert.equal(statSync(file).mode & 0o777, 0o600);
   const { readdirSync } = await import("node:fs");
   assert.deepEqual(readdirSync(dir), ["thr_abc123.md"]);
+});
+
+test("bb system notices are soft, owner and agent messages are not", () => {
+  const t = (text) => [{ type: "text", text }];
+  assert.equal(isBbSystemNotice(t("[bb system]\n\n@thread:thr_a completed:\n\nok")), true);
+  assert.equal(isBbSystemNotice(t("[bb system]\n\n@thread:thr_a is now a child of this thread.")), true);
+  assert.equal(isBbSystemNotice(t("[bb message from thread:thr_x]\n\nстоп")), false);
+  assert.equal(isBbSystemNotice(t("стоп, не деплой")), false);
+  assert.equal(isBbSystemNotice([{ type: "image", url: "x" }]), false);
+  assert.equal(isBbSystemNotice(undefined), false);
 });
