@@ -30,6 +30,8 @@ const CLOSE_INTERNAL = 4_000;
 export interface LiveSock {
   send(data: string | Uint8Array): void;
   close(code?: number, reason?: string): void;
+  /** DOM-конвенция: 2 CLOSING / 3 CLOSED → соединение мертво (гонка §4.3а). */
+  readonly readyState?: number;
 }
 
 export interface LiveVoiceSocketHandlers {
@@ -97,6 +99,8 @@ interface ConnState {
   ready: boolean;
   finishing: boolean;
   torn: boolean;
+  /** Снос состояния соединения — доступен и соседнему hello (takeover). */
+  teardown(): void;
 }
 
 /** RMS int16-выборок накопленного PCM. */
@@ -131,6 +135,7 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
       ready: false,
       finishing: false,
       torn: false,
+      teardown: () => {},
     };
 
     const send = (frame: ServerFrame): void => {
@@ -157,6 +162,7 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
       state.pcm = [];
       if (active === state) active = null;
     };
+    state.teardown = teardown;
 
     /** Открыть сессию на ключе keyIndex; до ready сбой → следующий ключ. */
     const openSession = (): void => {
@@ -269,9 +275,16 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
         return;
       }
       if (active !== null) {
-        sendError("busy", "another live dictation is in progress");
-        state.sock.close(BUSY_CLOSE_CODE, "busy");
-        return;
+        const rs = active.sock.readyState;
+        if (rs === undefined || rs < 2) {
+          sendError("busy", "another live dictation is in progress");
+          state.sock.close(BUSY_CLOSE_CODE, "busy");
+          return;
+        }
+        // Старый сокет уже dead (CLOSING/CLOSED), а клиентский реплей пришёл
+        // раньше onClose — разрешаем takeover, иначе 4009-гонка (§4.3а).
+        log("live-voice: taking over a dead connection");
+        active.teardown();
       }
       state.authed = true;
       active = state;
@@ -290,6 +303,9 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
         return;
       }
       openSession();
+      // Окно до openSession: PCM, прилетевший за время readConfig, не теряем —
+      // доливаем в сессию в порядке прихода (она добуферит до setupComplete).
+      for (const chunk of state.pcm) state.session?.push(chunk);
     };
 
     return {

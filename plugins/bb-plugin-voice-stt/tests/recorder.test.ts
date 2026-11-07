@@ -30,9 +30,9 @@ class FakeSock implements RecorderSock {
   simulateMessage(frame: object): void {
     this.onmessage?.({ data: JSON.stringify(frame) });
   }
-  simulateClose(): void {
+  simulateClose(code = 1006): void {
     this.readyState = 3;
-    this.onclose?.({ code: 1006, reason: "" });
+    this.onclose?.({ code, reason: "" });
   }
   json(): Array<Record<string, unknown>> {
     return this.sent.filter((d): d is string => typeof d === "string").map((s) => JSON.parse(s));
@@ -46,6 +46,8 @@ class FakeCapture implements MicCaptureLike {
   unlocked = 0;
   started = 0;
   stopped = 0;
+  /** Имитация pending getUserMedia — start ждёт, пока тест отопрёт гейт. */
+  gate: Promise<void> | null = null;
   private cb: ((pcm: Uint8Array, level: number) => void) | null = null;
   unlock(): void {
     this.unlocked += 1;
@@ -53,6 +55,7 @@ class FakeCapture implements MicCaptureLike {
   async start(onChunk: (pcm: Uint8Array, level: number) => void): Promise<void> {
     this.started += 1;
     this.cb = onChunk;
+    if (this.gate !== null) await this.gate;
   }
   stop(): void {
     this.stopped += 1;
@@ -304,6 +307,93 @@ describe("voiceRecorder (§3.3, §9)", () => {
     await flush();
     expect(c1.inserted).toHaveLength(0);
     expect(c2.inserted).toEqual([{ text: "два", at: "end" }]);
+  });
+
+  it("BLOCKER: cancel during pending getUserMedia — later chunks never flow", async () => {
+    const capture = new FakeCapture();
+    let openGate: (() => void) | undefined;
+    capture.gate = new Promise<void>((res) => {
+      openGate = res;
+    });
+    const r = makeRecorder({ capture });
+    r.recorder.pressStart(new FakeComposer(), 1);
+    const sock = await openWithHello(r);
+    // getUserMedia ещё pending — отменяем; потом старт «оживает».
+    r.recorder.cancel();
+    openGate?.();
+    await flush();
+    capture.emit();
+    expect(sock.binary()).toHaveLength(0);
+    expect(r.recorder.getSnapshot().phase).toBe("idle");
+  });
+
+  it("BLOCKER: stale done-dismiss timer does not kill the next session", async () => {
+    const r = makeRecorder({ doneDismissMs: 30 });
+    const composer = new FakeComposer();
+    r.recorder.pressStart(composer, 1);
+    const first = await openWithHello(r);
+    r.recorder.stop();
+    first.simulateMessage({ type: "final", text: "раз", engine: "gemini-live" });
+    await flush();
+    expect(r.recorder.getSnapshot().phase).toBe("done");
+    r.recorder.dismiss(); // таймер обязан умереть здесь, не в сессии ниже
+    r.recorder.pressStart(composer, 1);
+    const second = r.socks[1];
+    second.open();
+    await flush(50); // > doneDismissMs — протухший таймер сработал бы
+    expect(r.recorder.getSnapshot().phase).toBe("recording");
+    r.recorder.cancel();
+  });
+
+  it("BLOCKER: server error during finishing → client WAV fallback", async () => {
+    const r = makeRecorder();
+    const composer = new FakeComposer();
+    r.recorder.pressStart(composer, 1);
+    const sock = await openWithHello(r);
+    r.capture.emit();
+    r.recorder.stop();
+    sock.simulateMessage({ type: "error", code: "service_unavailable", message: "gemini died" });
+    await flush();
+    expect(r.rpcCalls.some((c) => c.method === "liveFallback")).toBe(true);
+    expect(composer.inserted).toEqual([{ text: "фоллбэк", at: "end" }]);
+  });
+
+  it("BLOCKER: replay retries on 4009, second attempt lands the session", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 1);
+    const first = await openWithHello(r);
+    first.simulateClose();
+    r.recorder.stop();
+    const second = r.socks[1];
+    second.open();
+    await flush();
+    second.simulateClose(4009); // сервер ещё не снёс старое соединение
+    await flush(300); // ретрай ~250 мс
+    const third = r.socks[2];
+    third.open();
+    await flush();
+    expect(third.json()[0]).toEqual({ type: "hello", token: "tok-1" });
+    expect(third.json().at(-1)).toEqual({ type: "end" });
+    r.recorder.cancel();
+  });
+
+  it("REMARK: cancel during in-flight liveFallback does not insert", async () => {
+    const r = makeRecorder();
+    const composer = new FakeComposer();
+    let resolveFallback: ((v: unknown) => void) | undefined;
+    r.responses.liveFallback = new Promise((res) => {
+      resolveFallback = res;
+    });
+    r.recorder.pressStart(composer, 1);
+    const first = await openWithHello(r);
+    first.simulateClose();
+    r.recorder.stop();
+    await flush(120); // reconnectTimeout прошёл — liveFallback в полёте
+    r.recorder.cancel();
+    resolveFallback?.({ ok: true, text: "поздний текст", engine: "codex" });
+    await flush();
+    expect(composer.inserted).toHaveLength(0);
+    expect(r.recorder.getSnapshot().phase).toBe("idle");
   });
 
   it("token stays inside the hello frame only", async () => {

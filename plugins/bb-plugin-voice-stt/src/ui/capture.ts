@@ -51,6 +51,13 @@ export class MicCapture implements MicCaptureLike {
   private ctx: AudioContext | null = null;
   private captureNode: AudioNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
+  /**
+   * Поколение захвата (пост-ревью, блокер «сирота-микрофон»): cancel/stop
+   * во время pending getUserMedia — окно промпта секунды — не должен
+   * дать ожившему await поднять поток без индикатора записи. Каждый
+   * await в start проверяет поколение; устаревшее → треки глушатся сразу.
+   */
+  private generation = 0;
 
   /** iOS: AudioContext живёт, только если создан и запущен прямо в нажатии. */
   unlock(): void {
@@ -74,20 +81,33 @@ export class MicCapture implements MicCaptureLike {
   }
 
   async start(onChunk: (pcm: Uint8Array, level: number) => void): Promise<void> {
+    const gen = this.generation;
+    const stale = (): boolean => gen !== this.generation;
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
+    if (stale()) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
     this.stream = stream;
     let ctx = this.ctx;
     if (!ctx || ctx.state === "closed") {
       const AC =
         window.AudioContext ??
         (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!AC) throw new Error("AudioContext недоступен");
+      if (!AC) {
+        stream.getTracks().forEach((t) => t.stop());
+        throw new Error("AudioContext недоступен");
+      }
       ctx = new AC();
       this.ctx = ctx;
     }
     await ctx.resume().catch(() => {});
+    if (stale()) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
 
     const emit = (f32: Float32Array): void => {
       const i16 = new Int16Array(f32.length);
@@ -107,10 +127,18 @@ export class MicCapture implements MicCaptureLike {
       await ctx.audioWorklet.addModule(
         URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })),
       );
+      if (stale()) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       const worklet = new AudioWorkletNode(ctx, "voice-stt-capture");
       worklet.port.onmessage = (e: MessageEvent<Float32Array>) => emit(e.data);
       node = worklet;
     } catch {
+      if (stale()) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       // Запасной путь (старый WebKit): ScriptProcessor + то же прореживание.
       const proc = ctx.createScriptProcessor(4096, 1, 1);
       const ratio = ctx.sampleRate / 16000;
@@ -137,6 +165,7 @@ export class MicCapture implements MicCaptureLike {
   }
 
   stop(): void {
+    this.generation += 1;
     try {
       this.captureNode?.disconnect();
       this.source?.disconnect();

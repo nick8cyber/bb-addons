@@ -15,6 +15,7 @@ class FakeSock implements LiveSock {
   sent: string[] = [];
   closed = false;
   closeCode: number | undefined;
+  readyState = 1; // OPEN
   send(data: string | Uint8Array): void {
     this.sent.push(typeof data === "string" ? data : Buffer.from(data).toString("utf8"));
   }
@@ -309,6 +310,32 @@ describe("live-ws (§4, §9)", () => {
     await hello(deps, handler, sock, tokens.issue());
     expect(sock.frames().at(-1)).toMatchObject({ type: "error", code: "no_keys" });
     expect(sock.closed).toBe(true);
+  });
+
+  it("BLOCKER: dead active socket allows takeover, old session is cancelled", async () => {
+    const { tokens, sessions, deps } = makeDeps();
+    const route = makeRoute(deps);
+    const first = route();
+    await hello(deps, first.handler, first.sock, tokens.issue());
+    first.sock.readyState = 3; // CLOSED — onClose сервером ещё не обработан (гонка)
+    const second = route();
+    await hello(deps, second.handler, second.sock, tokens.issue());
+    expect(second.sock.closeCode).toBeUndefined();
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0].cancelled).toBe(true);
+    await second.handler.onClose?.(second.sock, { code: 1000, reason: "" });
+  });
+
+  it("REMARK: PCM before openSession is pushed into the session in order", async () => {
+    const { tokens, sessions, deps } = makeDeps();
+    const { handler, sock } = connect(deps);
+    const token = tokens.issue();
+    const helloPromise = hello(deps, handler, sock, token);
+    // readConfig ещё летит — кадры приходят до создания сессии.
+    await handler.onMessage?.(sock, new Uint8Array(speechPcm()));
+    await helloPromise;
+    expect(sessions[0].pushed).toHaveLength(1);
+    await handler.onClose?.(sock, { code: 1000, reason: "" });
   });
 
   it("token never appears in outgoing frames", async () => {

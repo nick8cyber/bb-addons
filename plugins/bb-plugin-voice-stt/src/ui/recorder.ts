@@ -102,6 +102,7 @@ export interface RecorderDeps {
   readyTimeoutMs?: number;
   reconnectTimeoutMs?: number;
   finalTimeoutMs?: number;
+  doneDismissMs?: number;
   listenKeys?: boolean;
   listenPagehide?: boolean;
 }
@@ -157,6 +158,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   const readyTimeoutMs = deps.readyTimeoutMs ?? READY_TIMEOUT_MS;
   const reconnectTimeoutMs = deps.reconnectTimeoutMs ?? RECONNECT_TIMEOUT_MS;
   const finalTimeoutMs = deps.finalTimeoutMs ?? FINAL_TIMEOUT_MS;
+  const doneDismissMs = deps.doneDismissMs ?? DONE_DISMISS_MS;
   const listenKeys = deps.listenKeys ?? typeof window !== "undefined";
   const listenPagehide = deps.listenPagehide ?? typeof window !== "undefined";
 
@@ -193,6 +195,26 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     arm(() => {
       if (view.phase === "finishing") void fileFallback();
     }, finalTimeoutMs);
+  };
+  /**
+   * Таймер авто-скрытия done-оверлея живёт ОТДЕЛЬНО от timers (пост-ревью,
+   * блокер): deliver армит его после teardown — обычный clearTimers его не
+   * снимает, а срабатывание посреди следующей записи ставило view в idle
+   * с мёртвыми Esc/Enter. Чистится на dismiss/pressStart/teardown.
+   */
+  let dismissTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearDismiss = (): void => {
+    if (dismissTimer !== null) {
+      clearTimeout(dismissTimer);
+      dismissTimer = null;
+    }
+  };
+  const armDismiss = (): void => {
+    clearDismiss();
+    dismissTimer = setTimeout(() => {
+      dismissTimer = null;
+      if (view.phase === "done") patch({ ...IDLE_VIEW, ignorePulse: view.ignorePulse });
+    }, doneDismissMs);
   };
   const clearTimers = (): void => {
     for (const t of timers) clearTimeout(t);
@@ -257,6 +279,10 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   };
 
   const onMicChunk = (bytes: Uint8Array, level: number): void => {
+    // Поздний чанк после cancel/stop — не запись: generation-гард в
+    // capture не пускает поток, это вторая линия (блокер «сирота»).
+    if (attempt === null) return;
+    if (view.phase !== "recording" && view.phase !== "reconnecting") return;
     pcm.push(bytes);
     const a = attempt;
     if (a?.helloSent && a.sock?.readyState === SOCK_OPEN) {
@@ -277,6 +303,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     const a = attempt;
     attempt = null;
     clearTimers();
+    clearDismiss();
     detachWindowHooks();
     if (a) {
       a.dead = true;
@@ -290,6 +317,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   };
 
   const fail = (message: string): void => {
+    // Отменённая сессия не воскрешает оверлей поздней ошибкой.
+    if (view.phase === "idle") return;
     teardown();
     patch({ phase: "error", error: message, notice: null, holdArmed: false });
   };
@@ -300,6 +329,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
    * остаётся в оверлее с «копировать» — тихих потерь нет (§3.3).
    */
   const deliver = (text: string, engine: string, degraded: boolean): void => {
+    // Финал приходит только из finishing; cancel во время ожидания (в т.ч.
+    // в полёте WAV-фоллбэка) — результат больше не вставляем.
+    if (view.phase !== "finishing") return;
     teardown();
     if (engine === "silence" || text.trim() === "") {
       patch({
@@ -312,7 +344,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         finalText: null,
         holdArmed: false,
       });
-      arm(() => patch({ ...IDLE_VIEW, ignorePulse: view.ignorePulse }), DONE_DISMISS_MS);
+      armDismiss();
       return;
     }
     let inserted = false;
@@ -340,7 +372,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       holdArmed: false,
     });
     if (inserted) {
-      arm(() => patch({ ...IDLE_VIEW, ignorePulse: view.ignorePulse }), DONE_DISMISS_MS);
+      armDismiss();
     }
   };
 
@@ -383,6 +415,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     const a: Attempt = { sock: null, helloSent: false, dead: false };
     attempt = a;
     const snapshot = pcm;
+    let busyRetries = 0;
     arm(() => {
       if (attempt === a && !a.helloSent) {
         a.dead = true;
@@ -394,36 +427,48 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         void fileFallback();
       }
     }, reconnectTimeoutMs);
-    let sock: RecorderSock;
-    try {
-      sock = wsFactory(wsUrl());
-    } catch {
-      void fileFallback();
-      return;
-    }
-    a.sock = sock;
-    sock.onopen = () => {
-      void (async () => {
-        try {
-          const res = (await callRpc("liveToken", {})) as LiveTokenResult;
-          if (a.dead) return;
-          sock.send(JSON.stringify({ type: "hello", token: res.token }));
-          a.helloSent = true;
-          for (const chunk of snapshot) sock.send(chunk);
-          sock.send(JSON.stringify({ type: "end" }));
-          armFinishWatchdog();
-        } catch {
-          if (!a.dead) void fileFallback();
+    const openReplay = (): void => {
+      let sock: RecorderSock;
+      try {
+        sock = wsFactory(wsUrl());
+      } catch {
+        void fileFallback();
+        return;
+      }
+      a.sock = sock;
+      sock.onopen = () => {
+        void (async () => {
+          try {
+            const res = (await callRpc("liveToken", {})) as LiveTokenResult;
+            if (a.dead) return;
+            sock.send(JSON.stringify({ type: "hello", token: res.token }));
+            a.helloSent = true;
+            for (const chunk of snapshot) sock.send(chunk);
+            sock.send(JSON.stringify({ type: "end" }));
+            armFinishWatchdog();
+          } catch {
+            if (!a.dead) void fileFallback();
+          }
+        })();
+      };
+      sock.onmessage = (ev) => onServerMessage(a, ev.data);
+      sock.onclose = (ev) => {
+        if (a.dead) return;
+        // Сервер ещё не успел снести старое соединение — пара ретраев (§4.3а-гонка).
+        if (ev.code === 4009 && busyRetries < 2) {
+          busyRetries += 1;
+          setTimeout(() => {
+            if (!a.dead) openReplay();
+          }, 250);
+          return;
         }
-      })();
+        void fileFallback();
+      };
+      sock.onerror = () => {
+        if (!a.dead) void fileFallback();
+      };
     };
-    sock.onmessage = (ev) => onServerMessage(a, ev.data);
-    sock.onclose = () => {
-      if (!a.dead) void fileFallback();
-    };
-    sock.onerror = () => {
-      if (!a.dead) void fileFallback();
-    };
+    openReplay();
   };
 
   const onServerMessage = (a: Attempt, data: unknown): void => {
@@ -448,6 +493,17 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       return;
     }
     if (frame.type === "error") {
+      if (view.phase === "finishing") {
+        // Сервер не смог финиш — §4.3а: у клиента весь PCM → WAV-фоллбэк.
+        a.dead = true;
+        try {
+          a.sock?.close();
+        } catch {
+          // уже закрыт
+        }
+        void fileFallback();
+        return;
+      }
       if (view.phase === "recording" || view.phase === "reconnecting") {
         // Серверная сессия умерла посреди записи — у нас есть весь PCM,
         // на отпускании уйдём реплеем/файлом (§4.3а).
@@ -567,6 +623,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       }
       pressHeld = pointerId !== undefined;
       activePointerId = pointerId ?? null;
+      clearDismiss(); // протухший авто-скрыватель не должен жить в новой сессии
       target = composer ?? null;
       pcm = [];
       readySeen = false;
@@ -672,6 +729,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         recorder.cancel();
         return;
       }
+      clearDismiss();
       patch({ ...IDLE_VIEW, ignorePulse: view.ignorePulse });
     },
   };
