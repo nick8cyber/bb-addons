@@ -10,14 +10,14 @@ test("emails", () => {
 });
 
 test("bb ids", () => {
-  assert.deepEqual(hidden("тред <thread> и <memory>"), ["<thread>", "<memory>"]);
-  assert.deepEqual(hidden("<project> <env> <host>"), [
-    "<project>", "<env>", "<host>",
+  assert.deepEqual(hidden("тред thr_k3m9x2p7qa и mem_q8w2e5r7t_y"), ["thr_k3m9x2p7qa", "mem_q8w2e5r7t_y"]);
+  assert.deepEqual(hidden("proj_a1b2c3d4e5 env_f6g7h8j9k0 host_m1n2b3v4c5"), [
+    "proj_a1b2c3d4e5", "env_f6g7h8j9k0", "host_m1n2b3v4c5",
   ]);
 });
 
 test("paths", () => {
-  assert.deepEqual(hidden("файл ~/work/bb/app.tsx."), ["~/work/bb/app.tsx"]);
+  assert.deepEqual(hidden("файл /home/user/work/app.tsx."), ["/home/user/work/app.tsx"]);
   assert.deepEqual(hidden("см. ~/.bb/AGENTS.md"), ["~/.bb/AGENTS.md"]);
   assert.deepEqual(hidden("C:\\Users\\user\\file.txt"), ["C:\\Users\\user\\file.txt"]);
 });

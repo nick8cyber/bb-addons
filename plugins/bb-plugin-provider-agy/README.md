@@ -687,7 +687,7 @@ accepted: {                        "CodeContent":…, "Overwrite":true, "TargetF
 
 `--mode accept-edits` does not help; seven of the conversations on this host
 have hit it, always on `.tsx` files. The model does not learn from the refusal:
-<thread> produced the identical refusal on three consecutive user turns.
+One production thread produced the identical refusal on three consecutive user turns.
 
 Twice measured, the refused call was a **duplicate**: the model wrote the file
 correctly and then emitted the artifact-shaped call that killed the turn, so the

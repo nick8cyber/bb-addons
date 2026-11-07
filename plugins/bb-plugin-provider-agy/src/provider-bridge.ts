@@ -2402,7 +2402,7 @@ function closeOpenItems(session: Session, turn: Turn): void {
  *   <project path> is not a valid artifact path; artifacts must be in
  *   ~/.gemini/antigravity-cli/brain/<conversation>/
  *
- * Confirmed on thread <thread> / conversation 693cd8c3: the refused call
+ * Confirmed on a production thread: the refused call
  * carried `ArtifactMetadata` plus a perfectly good absolute `TargetFile` under
  * the project root, and the same model writes the same file happily when the
  * field is absent. It is not about `--add-dir`, the cwd, a worktree, or the
@@ -2614,7 +2614,7 @@ function handleResult(
     // turn answered "the file already contains the intended content", the file
     // on disk was correct, and the result still came back ERROR with this
     // refusal. Failing that kills a live thread over work that is done - and
-    // it is what killed <thread> three turns running.
+    // it is what killed a production thread three turns running.
     (isArtifactPathRefusal(event.error) &&
       turn.producedText &&
       turn.artifactRetries > 0) ||
