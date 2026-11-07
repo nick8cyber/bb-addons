@@ -53,6 +53,13 @@ const DRAG_PX = 10;
 const HOLD_DRAG_PX = 24;
 /** Удержание без сдвига дольше этого — push-to-talk. */
 const HOLD_START_MS = 300;
+/**
+ * Предзахват на касании — не сразу, а через 120 мс без сдвига: перенос
+ * начинается раньше, и на переносе микрофон не трогается вовсе (старт
+ * getUserMedia на касании подвешивал отрисовку на iOS, 0.1.8; плюс
+ * оранжевый индикатор на каждом переносе — ревью 0.1.16).
+ */
+const PRIME_DELAY_MS = 120;
 
 interface FabGesture {
   pointerId: number;
@@ -71,6 +78,7 @@ interface FabGesture {
    */
   mode: "pending" | "start" | "hold" | "stop" | "drag";
   timer: ReturnType<typeof setTimeout> | null;
+  primeTimer: ReturnType<typeof setTimeout> | null;
   last: { left: number; top: number } | null;
 }
 
@@ -198,6 +206,10 @@ function FloatingMic() {
       clearTimeout(g.timer);
       g.timer = null;
     }
+    if (g.primeTimer !== null) {
+      clearTimeout(g.primeTimer);
+      g.primeTimer = null;
+    }
   };
 
   const finishGesture = (e: ReactPointerEvent<HTMLButtonElement>, cancelled: boolean): void => {
@@ -257,6 +269,7 @@ function FloatingMic() {
           dy: e.clientY - rect.top,
           mode: active ? "stop" : "pending",
           timer: null,
+          primeTimer: null,
           last: null,
         };
         gesture.current = g;
@@ -267,7 +280,11 @@ function FloatingMic() {
           voiceRecorder.pressStart(target(), e.nativeEvent.pointerId);
         } else if (!active) {
           setPressed(true);
-          voiceRecorder.prime();
+          voiceRecorder.wake(); // AudioContext в жесте (iOS) — дёшево, без микрофона
+          g.primeTimer = setTimeout(() => {
+            g.primeTimer = null;
+            if (gesture.current === g && g.mode === "pending") voiceRecorder.prime();
+          }, PRIME_DELAY_MS);
           const pointerId = e.nativeEvent.pointerId;
           g.timer = setTimeout(() => {
             g.timer = null;

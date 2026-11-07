@@ -694,9 +694,14 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
      * Касание FAB в покое: только будим AudioContext в жесте (требование
      * iOS) — без микрофона и сокета, чтобы перенос кнопки не тормозил.
      */
+    /** Касание FAB: только AudioContext в жесте (iOS), микрофон не трогаем. */
+    wake(): void {
+      if (view.phase === "idle") capture.unlock();
+    },
+    /** Касание держится без сдвига — поднимаем микрофон заранее (pre-roll). */
     prime(): void {
       if (view.phase !== "idle") return;
-      capture.unlock(); // в жесте — требование iOS
+      capture.unlock(); // идемпотентно
       if (standby !== null) return;
       pressAt = now();
       firstAudioAt = 0;
