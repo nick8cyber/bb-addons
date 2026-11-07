@@ -101,12 +101,61 @@ function saveLastGood(id: string): void {
   }
 }
 
+/** Ручной выбор микрофона в настройках — свой на каждом устройстве. */
+export const MIC_CHOICE_KEY = "voice-stt:mic-choice";
+
+export interface MicChoice {
+  deviceId: string;
+  label: string;
+}
+
+export function loadMicChoice(): MicChoice | null {
+  try {
+    const raw = localStorage.getItem(MIC_CHOICE_KEY);
+    if (raw === null) return null;
+    const v = JSON.parse(raw) as Partial<MicChoice>;
+    return typeof v.deviceId === "string" && typeof v.label === "string" ? { deviceId: v.deviceId, label: v.label } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** null — «Авто». */
+export function saveMicChoice(choice: MicChoice | null): void {
+  try {
+    if (choice === null) localStorage.removeItem(MIC_CHOICE_KEY);
+    else localStorage.setItem(MIC_CHOICE_KEY, JSON.stringify(choice));
+  } catch {
+    // нет хранилища — выбор не запомнится
+  }
+}
+
+/** Входы для списка в настройках (метки есть только после разрешения). */
+export async function listInputs(): Promise<MediaDeviceInfo[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const all = await navigator.mediaDevices.enumerateDevices();
+  return all.filter((d) => d.kind === "audioinput" && d.deviceId !== "" && d.deviceId !== "communications");
+}
+
 interface InputChoice {
   deviceId: string | null;
   why: string;
 }
 
 export async function pickInput(exclude: ReadonlySet<string>): Promise<InputChoice> {
+  // Ручной выбор в настройках — на любом устройстве, пока это устройство есть.
+  const manual = loadMicChoice();
+  if (manual !== null && !exclude.has(manual.deviceId) && navigator.mediaDevices !== undefined) {
+    try {
+      const inputs = await listInputs();
+      const hit =
+        inputs.find((d) => d.deviceId === manual.deviceId) ??
+        inputs.find((d) => d.label !== "" && d.label === manual.label);
+      if (hit) return { deviceId: hit.deviceId, why: "manual" };
+    } catch {
+      // перечислить не вышло — авто
+    }
+  }
   if (!isDesktop() || !navigator.mediaDevices?.enumerateDevices) {
     return { deviceId: null, why: "system default" };
   }

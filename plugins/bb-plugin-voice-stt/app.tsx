@@ -15,6 +15,7 @@
 import "./app.css";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 
+import { MicSettings } from "./src/ui/MicSettings.js";
 import { RecordingOverlay } from "./src/ui/RecordingOverlay.js";
 import { voiceRecorder } from "./src/ui/recorder.js";
 
@@ -22,6 +23,15 @@ const MIC_ICON = "voice-stt/mic";
 
 export default definePluginApp((app) => {
   app.slots.experimental_appOverlay({ id: "voice-stt-live", component: RecordingOverlay });
+
+  // Выбор микрофона на этом устройстве (§7.1): страница плагина (на телефоне — та же).
+  app.slots.settingsSection({
+    id: "microphone",
+    title: "Микрофон",
+    description: "Какой микрофон использует живой ввод на этом устройстве",
+    component: MicSettings,
+  });
+
 
   // Composer-команда: run({composer}) получает bound композер (§3.1 п. 2).
   app.composer.experimental_registerCommand({

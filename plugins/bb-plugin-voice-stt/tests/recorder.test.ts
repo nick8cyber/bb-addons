@@ -303,6 +303,37 @@ describe("voiceRecorder (§3.3, §9)", () => {
     expect(r.recorder.getSnapshot().micLive).toBe(false);
   });
 
+  it("pre-roll: prime на касании поднимает микрофон, звук до старта уходит в запись", async () => {
+    const r = makeRecorder();
+    r.recorder.prime();
+    expect(r.capture.started).toBe(1);
+    expect(r.socks).toHaveLength(0); // сокет — только после решения «тап/удержание»
+    r.capture.emit(3200);
+    r.capture.emit(3200);
+    expect(r.recorder.getSnapshot().phase).toBe("idle");
+    r.recorder.pressStart(new FakeComposer(), 1, { hold: true });
+    expect(r.capture.started).toBe(1); // повторно микрофон не поднимаем
+    expect(r.recorder.getSnapshot().micLive).toBe(true);
+    const sock = await openWithHello(r);
+    expect(sock.binary()).toHaveLength(2); // pre-roll ушёл сразу после hello
+    r.capture.emit();
+    expect(sock.binary()).toHaveLength(3);
+    r.recorder.cancel();
+  });
+
+  it("pre-roll: перенос (unprime) гасит микрофон, звук никуда не уходит", async () => {
+    const r = makeRecorder();
+    r.recorder.prime();
+    r.capture.emit();
+    r.recorder.unprime();
+    expect(r.capture.stopped).toBe(1);
+    r.recorder.pressStart(new FakeComposer(), 1);
+    expect(r.capture.started).toBe(2); // новая запись — новый захват, без старого pre-roll
+    const sock = await openWithHello(r);
+    expect(sock.binary()).toHaveLength(0);
+    r.recorder.cancel();
+  });
+
   it("cancel sends cancel and never inserts", async () => {
     const r = makeRecorder();
     const composer = new FakeComposer();

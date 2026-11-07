@@ -292,7 +292,14 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     for (const msg of q) sendJson(a, { type: "diag", msg });
   };
   const onCaptureEvent = (ev: CaptureEvent): void => {
-    if (view.phase !== "recording" && view.phase !== "reconnecting") return;
+    const live = view.phase === "recording" || view.phase === "reconnecting";
+    if (!live && standby === null) return;
+    if (!live) {
+      // Предзахват: только в лог (уйдёт после hello), без плашки.
+      if (ev.kind === "started") sendDiag(`mic started (pre-roll): ${ev.info}`);
+      else sendDiag(`mic ${ev.kind} (pre-roll): ${"info" in ev ? ev.info : ev.reason}`);
+      return;
+    }
     if (ev.kind === "started") sendDiag(`mic started: ${ev.info}`);
     else if (ev.kind === "state") sendDiag(`mic ${ev.info}`);
     else if (ev.kind === "stall") {
@@ -307,6 +314,21 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     }
   };
 
+  /**
+   * Предзахват (касание FAB на телефоне): микрофон поднимается на касании,
+   * звук копится в preroll; если касание стало тапом/удержанием — preroll
+   * уходит в начало записи, если переносом — всё гасится. Включение
+   * микрофона на iOS ~0.5–1 с — так оно идёт параллельно с жестом.
+   */
+  let standby: Promise<void> | null = null;
+  let standbyError: unknown = null;
+  let preroll: Uint8Array[] = [];
+  let prerollBytes = 0;
+  const PREROLL_MAX_BYTES = 64_000; // ~2 с PCM16 16 кГц
+  /** Диагностика задержки «нажатие → первый звук». */
+  let pressAt = 0;
+  let firstAudioAt = 0;
+
   const sendJson = (a: Attempt, frame: object): void => {
     try {
       if (a.sock?.readyState === SOCK_OPEN) a.sock.send(JSON.stringify(frame));
@@ -318,8 +340,19 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   const onMicChunk = (bytes: Uint8Array, level: number): void => {
     // Поздний чанк после cancel/stop — не запись: generation-гард в
     // capture не пускает поток, это вторая линия (блокер «сирота»).
+    if (firstAudioAt === 0) firstAudioAt = now();
+    if (view.phase === "idle" && standby !== null) {
+      preroll.push(bytes);
+      prerollBytes += bytes.byteLength;
+      while (prerollBytes > PREROLL_MAX_BYTES && preroll.length > 1) {
+        prerollBytes -= preroll[0].byteLength;
+        preroll.shift();
+      }
+      return;
+    }
     if (attempt === null) return;
     if (view.phase !== "recording" && view.phase !== "reconnecting") return;
+    if (!view.micLive) sendDiag(`mic first audio ${firstAudioAt - pressAt}ms after press`);
     pcm.push(bytes);
     const a = attempt;
     if (a?.helloSent && a.sock?.readyState === SOCK_OPEN) {
@@ -354,6 +387,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       }
     }
     capture.stop();
+    standby = null;
+    preroll = [];
+    prerollBytes = 0;
   };
 
   const fail = (message: string): void => {
@@ -659,11 +695,26 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
      * iOS) — без микрофона и сокета, чтобы перенос кнопки не тормозил.
      */
     prime(): void {
-      if (view.phase === "idle") capture.unlock();
+      if (view.phase !== "idle") return;
+      capture.unlock(); // в жесте — требование iOS
+      if (standby !== null) return;
+      pressAt = now();
+      firstAudioAt = 0;
+      diagQueue = [];
+      preroll = [];
+      prerollBytes = 0;
+      standbyError = null;
+      standby = capture.start(onMicChunk, onCaptureEvent).catch((e: unknown) => {
+        standbyError = e;
+      });
     },
-    /** Касание оказалось переносом — разбуженный контекст гасим. */
+    /** Касание оказалось переносом — предзахват и контекст гасим. */
     unprime(): void {
-      if (view.phase === "idle") capture.stop();
+      if (view.phase !== "idle") return;
+      capture.stop();
+      standby = null;
+      preroll = [];
+      prerollBytes = 0;
     },
 
     pressStart(
@@ -685,8 +736,17 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       activePointerId = pointerId ?? null;
       clearDismiss(); // протухший авто-скрыватель не должен жить в новой сессии
       target = composer ?? null;
-      pcm = [];
-      diagQueue = [];
+      // Предзахват уже идёт — его звук становится началом записи.
+      const sb = standby;
+      standby = null;
+      pcm = sb !== null ? preroll : [];
+      preroll = [];
+      prerollBytes = 0;
+      if (sb === null) {
+        diagQueue = [];
+        pressAt = now();
+        firstAudioAt = 0;
+      }
       readySeen = false;
       patch({
         ...IDLE_VIEW,
@@ -695,7 +755,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         holdArmed: true,
         notice: "подключение…",
         ignorePulse: view.ignorePulse,
+        micLive: pcm.length > 0,
       });
+      if (pcm.length > 0) sendDiag(`mic first audio ${firstAudioAt - pressAt}ms after press (pre-roll ${pcm.length} chunks)`);
       capture.unlock(); // синхронно в нажатии — требование iOS (§3.3)
       attachWindowHooks();
       if (opts?.hold === true) {
@@ -711,6 +773,15 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         }
       }, maxRecordMs);
       openSocket();
+      if (sb !== null) {
+        void sb.then(() => {
+          if (standbyError !== null && (view.phase === "recording" || view.phase === "reconnecting")) {
+            const e = standbyError;
+            fail(`микрофон недоступен: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        });
+        return;
+      }
       void (async () => {
         try {
           await capture.start(onMicChunk, onCaptureEvent);
