@@ -2,8 +2,10 @@
  * Фронтенд voice-stt — живой голосовой ввод (спека voice-stt-live §3).
  *
  * Точки входа (все ведут в один recording singleton):
+ * - плавающая кнопка (FAB) в appOverlay — видна без открытого композера,
+ *   основной вход (§3.1 п. 4);
  * - composer.actions: кнопка микрофона (все scope'ы; в compact-режиме хост
- *   actions не рисует — покрыто командой и футером);
+ *   actions не рисует — покрыто FAB, командой и футером);
  * - composer-команда «Voice STT Live: диктовка» + Mod+Shift/V — получает
  *   bound composer в run({composer}), привязка бесплатная;
  * - experimental_sidebarFooter «Диктовка» — цель резолвится через
@@ -16,24 +18,11 @@ import "./app.css";
 import { definePluginApp, useComposer, useSettings } from "@get-bb/plugin-sdk/app";
 import { useSyncExternalStore } from "react";
 
+import { MicGlyph } from "./src/ui/MicGlyph.js";
 import { RecordingOverlay } from "./src/ui/RecordingOverlay.js";
 import { voiceRecorder } from "./src/ui/recorder.js";
 
 const MIC_ICON = "voice-stt/mic";
-
-function MicGlyph() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <rect x="9" y="2" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="2" />
-      <path
-        d="M5 10a7 7 0 0 0 14 0M12 19v3"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
 
 /**
  * Кнопка в composer.actions (§3.1 п. 1, §3.3): pointerdown → старт
