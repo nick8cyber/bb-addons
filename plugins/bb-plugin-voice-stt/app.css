@@ -152,6 +152,24 @@
 .vsl-btn:hover {
   background: var(--state-hover, var(--accent));
 }
+.vsl-btn--primary {
+  background: var(--primary, var(--accent));
+  color: var(--primary-foreground, var(--foreground));
+  border-color: transparent;
+}
+.vsl-btn--primary:hover {
+  background: var(--primary, var(--accent));
+  opacity: 0.9;
+}
+/* Кнопки записи — крупные мишени под палец (мобильный клиент без клавиатуры). */
+.vsl-actions--record {
+  gap: 10px;
+}
+.vsl-actions--record .vsl-btn {
+  flex: 1;
+  min-height: 36px;
+  font-weight: 600;
+}
 
 /*
  * Плавающая кнопка живого ввода (§3.1 п. 4): оверлей смонтирован

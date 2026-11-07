@@ -157,7 +157,23 @@ export function RecordingOverlay() {
                   {view.interim !== "" ? view.interim : "Говорите…"}
                 </div>
                 <div className="vsl-hint">
-                  {view.notice ?? (view.holdArmed ? "Держите — или отпустите для toggle" : "Enter — вставить · Esc — отмена")}
+                  {view.notice ?? (view.holdArmed ? "Держите — или отпустите для toggle" : "«Вставить» — завершить и вставить в черновик")}
+                </div>
+                <div className="vsl-actions vsl-actions--record">
+                  <button
+                    type="button"
+                    className="vsl-btn vsl-btn--primary"
+                    onClick={() => voiceRecorder.stop()}
+                  >
+                    Вставить
+                  </button>
+                  <button
+                    type="button"
+                    className="vsl-btn"
+                    onClick={() => voiceRecorder.cancel()}
+                  >
+                    Отмена
+                  </button>
                 </div>
               </>
             )}
