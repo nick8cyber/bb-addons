@@ -44,7 +44,43 @@ export type CaptureEvent =
   | { kind: "state"; info: string }
   | { kind: "stall"; reason: string }
   | { kind: "restarted"; info: string }
-  | { kind: "failed"; reason: string };
+  | { kind: "failed"; reason: string }
+  /** Web Audio молчит — запись идёт через MediaRecorder, текст после конца записи. */
+  | { kind: "fallback"; info: string };
+
+/**
+ * Web Audio на этой странице признан мёртвым (до перезагрузки страницы).
+ * iOS WebKit после прерывания аудиосессии (звонок, Siri, чужой звук,
+ * блокировка) оставляет AudioContext «running», но граф не рендерит ни
+ * кадра — лечится только перезапуском приложения (лог 07.11: mic stall
+ * ×3 → 0 КБ). Нативный микрофон bb пишет MediaRecorder-ом и живёт —
+ * следующие записи сразу идут так же, без 3–4 с попыток.
+ */
+let webAudioBroken = false;
+
+/** Готовая запись запасного режима. */
+export interface RecordedAudio {
+  bytes: Uint8Array;
+  mimeType: string;
+  filename: string;
+}
+
+function pickRecorderMime(): string {
+  const MR = (window as unknown as { MediaRecorder?: typeof MediaRecorder }).MediaRecorder;
+  if (!MR) return "";
+  for (const m of ["audio/mp4", "audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"]) {
+    try {
+      if (MR.isTypeSupported(m)) return m;
+    } catch {
+      // старый WebKit без isTypeSupported
+    }
+  }
+  return "";
+}
+
+function recorderSupported(): boolean {
+  return typeof (window as unknown as { MediaRecorder?: unknown }).MediaRecorder === "function";
+}
 
 /** Один blob-URL модуля на страницу — не пересоздаём на каждую запись. */
 let workletUrl: string | null = null;
@@ -68,6 +104,10 @@ export interface MicCaptureLike {
    * работающий микрофон мгновенно. ms ≤ 0 — то же, что stop().
    */
   park(ms: number): void;
+  /** Запись идёт запасным режимом (MediaRecorder) — живого PCM нет. */
+  isRecorderMode?(): boolean;
+  /** Остановить запасную запись и отдать файл (null — пусто/нет режима). */
+  finishRecording?(): Promise<RecordedAudio | null>;
   /** Поднять getUserMedia + цепочку захвата; чанки идут в onChunk. */
   start(
     onChunk: (pcm: Uint8Array, level: number) => void,
@@ -78,6 +118,8 @@ export interface MicCaptureLike {
 
 /** Нет ни одного кадра дольше — захват встал (контекст/устройство). */
 const STALL_NO_FRAMES_MS = 1500;
+/** Touch: повторная проверка после перезапуска со свежим контекстом. */
+const STALL_NO_FRAMES_AFTER_RESTART_MS = 1000;
 /** Только абсолютные нули дольше — микрофон «подключён», но звука нет. */
 const STALL_ZEROS_MS = 2500;
 const MAX_RESTARTS = 3;
@@ -244,6 +286,10 @@ export class MicCapture implements MicCaptureLike {
   private ring: Uint8Array[] = [];
   private ringBytes = 0;
   private info = "";
+  private mode: "webaudio" | "recorder" = "webaudio";
+  private mr: MediaRecorder | null = null;
+  private mrChunks: Blob[] = [];
+  private mrMime = "";
 
   /** iOS: AudioContext живёт, только если создан и запущен прямо в нажатии. */
   unlock(): void {
@@ -276,6 +322,13 @@ export class MicCapture implements MicCaptureLike {
     this.clearParkTimer();
     if (this.parked) {
       this.parked = false;
+      if (this.mode === "recorder" && this.streamAlive()) {
+        // Тёплый поток в запасном режиме: новый MediaRecorder без getUserMedia.
+        this.onChunk = onChunk;
+        this.onEvent = onEvent ?? (() => {});
+        this.startRecorder("warm stream");
+        return;
+      }
       if (this.alive()) {
         // Тёплый микрофон: подхватываем без getUserMedia, плюс ~0.5 с звука до нажатия.
         this.onChunk = onChunk;
@@ -364,6 +417,13 @@ export class MicCapture implements MicCaptureLike {
     const track = stream.getAudioTracks()[0];
     this.currentDeviceId = track?.getSettings().deviceId ?? choice.deviceId;
     this.soundSeen = false;
+    if (webAudioBroken && recorderSupported()) {
+      // Web Audio уже признан мёртвым на этой странице — сразу запасной режим.
+      const label = track?.label ? track.label.slice(0, 60) : "?";
+      this.startRecorder(`web audio broken earlier; device="${label}" (${choice.why})`);
+      return `recorder mode; device="${label}" (${choice.why})`;
+    }
+    this.mode = "webaudio";
     const trackRate = track?.getSettings().sampleRate;
 
     let ctx = this.ctx;
@@ -497,13 +557,84 @@ export class MicCapture implements MicCaptureLike {
     return `device="${label}" (${choice.why}) track=${trackRate ?? "?"}Hz ctx=${ctx.sampleRate}Hz state=${ctx.state} path=${path}`;
   }
 
+  /** Новый поток + MediaRecorder без Web Audio (запасной режим). */
+  private async openRecorderOnly(gen: number): Promise<string | null> {
+    const choice = await pickInput(this.badDevices);
+    const base = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: choice.deviceId !== null ? { ...base, deviceId: { exact: choice.deviceId } } : base,
+    });
+    if (gen !== this.generation) {
+      stream.getTracks().forEach((t) => t.stop());
+      return null;
+    }
+    this.stream = stream;
+    const track = stream.getAudioTracks()[0];
+    this.currentDeviceId = track?.getSettings().deviceId ?? choice.deviceId;
+    const label = track?.label ? track.label.slice(0, 60) : "?";
+    this.startRecorder(`web audio silent; device="${label}" (${choice.why})`);
+    return "recorder";
+  }
+
+  private startRecorder(info: string): void {
+    const stream = this.stream;
+    if (stream === null) throw new Error("нет потока для MediaRecorder");
+    this.mode = "recorder";
+    this.mrMime = pickRecorderMime();
+    this.mrChunks = [];
+    const mr = this.mrMime !== "" ? new MediaRecorder(stream, { mimeType: this.mrMime }) : new MediaRecorder(stream);
+    this.mrMime = mr.mimeType || this.mrMime || "audio/mp4";
+    mr.ondataavailable = (e: BlobEvent) => {
+      if (e.data && e.data.size > 0) this.mrChunks.push(e.data);
+    };
+    mr.start(1000);
+    this.mr = mr;
+    this.info = `recorder ${this.mrMime}; ${info}`;
+    this.onEvent({ kind: "fallback", info: this.info });
+  }
+
+  isRecorderMode(): boolean {
+    return this.mode === "recorder" && this.mr !== null;
+  }
+
+  async finishRecording(): Promise<RecordedAudio | null> {
+    const mr = this.mr;
+    if (mr === null) return null;
+    this.mr = null;
+    if (mr.state !== "inactive") {
+      await new Promise<void>((resolve) => {
+        mr.onstop = () => resolve();
+        try {
+          mr.stop();
+        } catch {
+          resolve();
+        }
+      });
+    }
+    const chunks = this.mrChunks;
+    this.mrChunks = [];
+    if (chunks.length === 0) return null;
+    const blob = new Blob(chunks, { type: this.mrMime });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    if (bytes.byteLength === 0) return null;
+    const ext = this.mrMime.includes("webm") ? "webm" : this.mrMime.includes("ogg") ? "ogg" : "m4a";
+    return { bytes, mimeType: this.mrMime.split(";")[0], filename: `live-dictation.${ext}` };
+  }
+
+  private streamAlive(): boolean {
+    const track = this.stream?.getAudioTracks()[0];
+    return this.stream !== null && this.stream.active && track !== undefined && track.readyState === "live";
+  }
+
   /** Сторож: нет кадров / одни нули → перезапуск цепочки (до MAX_RESTARTS). */
   private armWatch(gen: number): void {
     this.clearWatch();
     this.watch = setInterval(() => {
       if (gen !== this.generation || this.restarting) return;
       const t = performance.now();
-      if (t - this.lastFrameAt > STALL_NO_FRAMES_MS) {
+      // После перезапуска на телефоне ждём меньше — быстрее в запасной режим.
+      const limit = this.restarts > 0 && !isDesktop() ? STALL_NO_FRAMES_AFTER_RESTART_MS : STALL_NO_FRAMES_MS;
+      if (t - this.lastFrameAt > limit) {
         void this.stall(gen, `no audio frames ${Math.round(t - this.lastFrameAt)}ms (ctx ${this.ctx?.state ?? "none"})`);
       } else if (!this.soundSeen && t - this.lastSoundAt > STALL_ZEROS_MS) {
         // Одни нули с самого старта — устройство не даёт звука. После
@@ -521,9 +652,28 @@ export class MicCapture implements MicCaptureLike {
   }
 
   private async stall(gen: number, reason: string): Promise<void> {
-    if (gen !== this.generation || this.restarting) return;
-    if (this.restarts >= MAX_RESTARTS) {
+    if (gen !== this.generation || this.restarting || this.mode === "recorder") return;
+    // Touch (iOS): один перезапуск со свежим AudioContext, дальше — запасной
+    // режим (типовая причина — мёртвый Web Audio, смена устройства не поможет).
+    // Десктоп: до MAX_RESTARTS смен устройства, потом запасной режим.
+    const limit = isDesktop() ? MAX_RESTARTS : 1;
+    if (this.restarts >= limit) {
       this.clearWatch();
+      if (recorderSupported()) {
+        this.restarting = true;
+        try {
+          if (!isDesktop()) webAudioBroken = true;
+          this.closePipeline(true);
+          this.onEvent({ kind: "stall", reason: `${reason} → MediaRecorder` });
+          const info = await this.openRecorderOnly(gen);
+          if (info === null) return;
+        } catch (e) {
+          this.onEvent({ kind: "failed", reason: `recorder fallback failed: ${e instanceof Error ? e.message : String(e)}` });
+        } finally {
+          this.restarting = false;
+        }
+        return;
+      }
       this.onEvent({ kind: "failed", reason });
       return;
     }
@@ -540,9 +690,11 @@ export class MicCapture implements MicCaptureLike {
     }
     this.onEvent({ kind: "stall", reason });
     try {
-      // Десктоп — полный перезапуск (новое устройство, новый контекст);
-      // touch/iOS — контекст из жеста сохраняем, пересоздаём только поток.
-      this.closePipeline(isDesktop());
+      // Полный перезапуск: новый поток и новый AudioContext. На iOS контекст
+      // из жеста после прерывания аудиосессии остаётся «running», но молчит —
+      // переиспользовать его бесполезно (лог 07.11); пока идёт захват
+      // микрофона, WebKit разрешает запуск нового контекста.
+      this.closePipeline(true);
       const info = await this.open(gen);
       if (info !== null) this.onEvent({ kind: "restarted", info: `#${this.restarts} ${info}` });
     } catch (e) {
@@ -552,8 +704,23 @@ export class MicCapture implements MicCaptureLike {
     }
   }
 
+  private discardRecorder(): void {
+    const mr = this.mr;
+    this.mr = null;
+    this.mrChunks = [];
+    if (mr !== null && mr.state !== "inactive") {
+      try {
+        mr.ondataavailable = null;
+        mr.stop();
+      } catch {
+        // уже остановлен
+      }
+    }
+  }
+
   /** Разобрать цепочку и поток; closeCtx — закрыть и контекст. */
   private closePipeline(closeCtx: boolean): void {
+    this.discardRecorder();
     try {
       this.captureNode?.disconnect();
       this.source?.disconnect();
@@ -587,6 +754,21 @@ export class MicCapture implements MicCaptureLike {
   park(ms: number): void {
     this.clearWatch();
     this.clearParkTimer();
+    if (this.mode === "recorder") {
+      // Запасной режим: незавершённую запись выбрасываем, поток держим тёплым.
+      this.discardRecorder();
+      if (ms <= 0 || !this.streamAlive()) {
+        this.stop();
+        return;
+      }
+      this.parked = true;
+      this.onChunk = null;
+      this.parkTimer = setTimeout(() => {
+        this.parkTimer = null;
+        if (this.parked) this.stop();
+      }, ms);
+      return;
+    }
     if (ms <= 0 || !this.alive()) {
       this.stop();
       return;
@@ -632,5 +814,6 @@ export class MicCapture implements MicCaptureLike {
     this.restarting = false;
     this.closePipeline(true);
     this.onChunk = null;
+    this.mode = "webaudio";
   }
 }

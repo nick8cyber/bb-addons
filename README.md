@@ -157,6 +157,12 @@ Voice input for bb in two modes:
   while you talk, and the text lands in the composer draft 1–2 s after you stop.
   Tapping the recording card also stops it. `Ctrl/Cmd+Shift+V` toggles dictation and
   Esc cancels. Nothing is ever sent automatically.
+- **Microphone**: Auto picks a sensible input. On a Mac it skips the Continuity
+  iPhone mic and virtual devices. You can also pick a device per device under the
+  plugin's settings, with a level check. The mic stays warm for 30 s after a
+  dictation (`micWarmSeconds`), so the next one starts instantly and includes
+  ~0.5 s before the tap. If iOS Web Audio goes silent after an audio interruption,
+  recording switches to `MediaRecorder` and the file is transcribed when you stop.
 
 ```bash
 bb voice-stt status
@@ -168,7 +174,8 @@ and a Groq key is optional.
 
 [Spec (file pipeline)](docs/specs/voice-stt.md),
 [spec (live dictation)](docs/specs/voice-stt-live.md),
-[ADR 0014](docs/adr/0014-voice-stt-live-floating-button.md).
+ADRs [0014](docs/adr/0014-voice-stt-live-floating-button.md),
+[0016](docs/adr/0016-voice-stt-mic-capture.md).
 
 ### `privacy-blur`
 

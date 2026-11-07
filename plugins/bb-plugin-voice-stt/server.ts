@@ -59,6 +59,8 @@ const rpcContract = defineRpcContract({
         // cap как у серверного PCM (10 МБ → ~13.4 МБ base64 + запас).
         audioBase64: z.string().min(1).max(14 * 1024 * 1024),
         filename: z.string().min(1).max(255),
+        // Запасной режим (MediaRecorder): audio/mp4, audio/webm…; без — WAV.
+        mimeType: z.string().min(1).max(100).optional(),
       })
       .strict(),
     output: transcribeOutputSchema,
@@ -377,11 +379,11 @@ export default async function plugin(bb: BbPluginApi) {
      * Файловая цепочка для клиентского фоллбэка (§4.3а): сокет умер до
      * отпускания — реплея не было, Gemini не трогали, skipStages не нужен.
      */
-    liveFallback: async ({ audioBase64, filename }) =>
+    liveFallback: async ({ audioBase64, filename, mimeType }) =>
       await callTranscribe(
         {
           bytes: Buffer.from(audioBase64, "base64"),
-          mimeType: "audio/wav",
+          mimeType: mimeType ?? "audio/wav",
           filename,
         },
         null,
