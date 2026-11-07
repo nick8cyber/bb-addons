@@ -64,10 +64,12 @@ interface FabGesture {
   /**
    * pending — нажали в покое, ещё не ясно: тап / удержание / перенос;
    * hold — удержание распознано, идёт push-to-talk;
+   * start — мышь/трекпад: запись стартовала сразу на нажатии (тап/удержание
+   *   решает рекордер по 400 мс, перенос отменяет запись);
    * stop — нажали во время записи (стоп на отпускании);
    * drag — переносим кнопку.
    */
-  mode: "pending" | "hold" | "stop" | "drag";
+  mode: "pending" | "start" | "hold" | "stop" | "drag";
   timer: ReturnType<typeof setTimeout> | null;
   last: { left: number; top: number } | null;
 }
@@ -223,7 +225,8 @@ function FloatingMic() {
       if (!cancelled) voiceRecorder.stop();
       return;
     }
-    voiceRecorder.pressEnd(e.nativeEvent); // hold: отпустили — конец записи
+    // hold/start: отпустили — рекордер решает (hold → конец, короткий клик → toggle).
+    voiceRecorder.pressEnd(e.nativeEvent);
   };
 
   return (
@@ -257,7 +260,12 @@ function FloatingMic() {
           last: null,
         };
         gesture.current = g;
-        if (!active) {
+        if (!active && e.pointerType !== "touch") {
+          // Мышь/трекпад: микрофон стартует сразу — задержка ради плавного
+          // переноса нужна только iOS (там старт аудио вешал отрисовку).
+          g.mode = "start";
+          voiceRecorder.pressStart(target(), e.nativeEvent.pointerId);
+        } else if (!active) {
           setPressed(true);
           voiceRecorder.prime();
           const pointerId = e.nativeEvent.pointerId;
@@ -275,8 +283,8 @@ function FloatingMic() {
         if (g.mode !== "drag") {
           const moved = Math.hypot(e.clientX - g.x0, e.clientY - g.y0);
           if (moved < (g.mode === "hold" ? HOLD_DRAG_PX : DRAG_PX)) return;
-          if (g.mode === "hold") {
-            voiceRecorder.cancel(); // перенос, а не диктовка — без вставки
+          if (g.mode === "hold" || g.mode === "start") {
+            voiceRecorder.cancel("drag"); // перенос, а не диктовка — без вставки
           }
           if (g.mode === "pending") {
             clearTimer(g);
@@ -358,7 +366,10 @@ function onCardTap(view: RecorderView): void {
 
 function cardHint(view: RecorderView): string | null {
   if (view.phase === "recording" || view.phase === "reconnecting") {
-    return view.notice ?? (view.holdArmed ? "Держите — или отпустите для toggle" : "Нажмите на плашку — вставить");
+    if (!view.micLive) return null;
+    // Звук уже пишется и буферизуется — «подключение…» к серверу не мешает говорить.
+    const notice = view.notice === "подключение…" ? null : view.notice;
+    return notice ?? (view.holdArmed ? "Держите — или отпустите для toggle" : "Нажмите на плашку — вставить");
   }
   if (view.phase === "finishing") return view.notice;
   if (view.phase === "done" && view.finalText !== null) return "Нажмите — скопировать";
@@ -382,7 +393,15 @@ export function RecordingOverlay() {
 
   const recording = view.phase === "recording" || view.phase === "reconnecting";
   const hint = cardHint(view);
-  const body = recording ? (view.interim !== "" ? view.interim : "Говорите…") : view.phase === "done" ? view.finalText : null;
+  const body = recording
+    ? view.interim !== ""
+      ? view.interim
+      : view.micLive
+        ? "Говорите…"
+        : "Включаю микрофон…"
+    : view.phase === "done"
+      ? view.finalText
+      : null;
 
   return (
     <>
@@ -406,7 +425,7 @@ export function RecordingOverlay() {
             <span className="vsl-row vsl-row--head">
               {recording ? (
                 <>
-                  <span className="vsl-dot" aria-hidden="true" />
+                  <span className={`vsl-dot${view.micLive ? "" : " vsl-dot--wait"}`} aria-hidden="true" />
                   <span className="vsl-time">{elapsedLabel(view, now)}</span>
                   <span className="vsl-level" aria-hidden="true">
                     <span className="vsl-level-fill" style={{ width: `${Math.round(view.level * 100)}%` }} />

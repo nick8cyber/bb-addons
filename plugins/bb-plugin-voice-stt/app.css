@@ -84,6 +84,11 @@
   animation: vsl-pulse 1.2s ease-in-out infinite;
   flex: none;
 }
+/* Микрофон ещё включается — серая точка без пульса: говорить рано. */
+.vsl-dot--wait {
+  background: var(--muted-foreground);
+  animation: none;
+}
 @keyframes vsl-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.45; transform: scale(0.82); }

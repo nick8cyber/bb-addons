@@ -279,6 +279,21 @@ describe("live-ws (§4, §9)", () => {
     expect(sock.frames().every((f) => f.type !== "final")).toBe(true);
   });
 
+  it("diagnostics: client cancel reason and early socket close are logged", async () => {
+    const logs: string[] = [];
+    const { tokens, deps } = makeDeps({ log: (m) => logs.push(m) });
+    const route = makeRoute(deps);
+    const a = route();
+    await hello(deps, a.handler, a.sock, tokens.issue());
+    await a.handler.onMessage?.(a.sock, new Uint8Array(speechPcm()));
+    await a.handler.onMessage?.(a.sock, JSON.stringify({ type: "cancel", reason: "client error: микрофон недоступен" }));
+    expect(logs.some((l) => /cancelled by client \(client error: микрофон недоступен\) after \d+\.\ds, audio \d+ KB, ready=/.test(l))).toBe(true);
+    const b = route();
+    await hello(deps, b.handler, b.sock, tokens.issue());
+    await b.handler.onClose?.(b.sock, { code: 1006, reason: "" });
+    expect(logs.some((l) => l.startsWith("live-voice: client socket closed before end"))).toBe(true);
+  });
+
   it("PCM cap forces finish", async () => {
     const { tokens, sessions, deps } = makeDeps({ pcmCapBytes: 4000 });
     const { handler, sock } = connect(deps);

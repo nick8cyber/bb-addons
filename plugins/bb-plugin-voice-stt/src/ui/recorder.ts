@@ -43,6 +43,8 @@ export interface RecorderView {
   inserted: boolean;
   error: string | null;
   level: number;
+  /** Пришёл первый звук с микрофона — можно говорить (до этого «включаю микрофон»). */
+  micLive: boolean;
   /** Первые 400 мс после pointerdown — ещё не решено, hold или тап. */
   holdArmed: boolean;
   /** Счётчик проигнорированных нажатий во время busy — визуальный фидбэк. */
@@ -60,6 +62,7 @@ const IDLE_VIEW: RecorderView = {
   inserted: false,
   error: null,
   level: 0,
+  micLive: false,
   holdArmed: false,
   ignorePulse: 0,
 };
@@ -226,7 +229,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     if (ev.key === "Escape") {
       ev.preventDefault();
       ev.stopPropagation();
-      recorder.cancel();
+      recorder.cancel("esc");
       return;
     }
     if (ev.key === "Enter") {
@@ -267,7 +270,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     }
   };
   const onPageHide = (): void => {
-    recorder.cancel();
+    recorder.cancel("pagehide");
   };
 
   const sendJson = (a: Attempt, frame: object): void => {
@@ -293,7 +296,10 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       }
     }
     const t = now();
-    if (t - lastLevelAt > 90) {
+    if (!view.micLive) {
+      lastLevelAt = t;
+      patch({ level, micLive: true });
+    } else if (t - lastLevelAt > 90) {
       lastLevelAt = t;
       patch({ level });
     }
@@ -319,6 +325,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   const fail = (message: string): void => {
     // Отменённая сессия не воскрешает оверлей поздней ошибкой.
     if (view.phase === "idle") return;
+    // Причина — в лог сервера (диагностика «то работает, то нет»).
+    const a = attempt;
+    if (a && !a.dead && a.helloSent) sendJson(a, { type: "cancel", reason: `client error: ${message}` });
     teardown();
     patch({ phase: "error", error: message, notice: null, holdArmed: false });
   };
@@ -591,7 +600,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     /** Питание настройки liveInput — выключает все входы разом (§7). */
     setLiveEnabled(enabled: boolean): void {
       liveEnabled = enabled;
-      if (!enabled && view.phase !== "idle") recorder.cancel();
+      if (!enabled && view.phase !== "idle") recorder.cancel("live input disabled");
     },
     isLiveEnabled(): boolean {
       return liveEnabled;
@@ -737,9 +746,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     },
 
     /** Esc/уход со страницы: без вставки и без отправки на движки (§3.3). */
-    cancel(): void {
+    cancel(reason = "user"): void {
       const a = attempt;
-      if (a && !a.dead && a.helloSent) sendJson(a, { type: "cancel" });
+      if (a && !a.dead && a.helloSent) sendJson(a, { type: "cancel", reason });
       teardown();
       patch({ ...IDLE_VIEW, ignorePulse: view.ignorePulse });
     },
@@ -747,7 +756,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     /** Закрыть оверлей результата/ошибки. */
     dismiss(): void {
       if (view.phase === "recording" || view.phase === "reconnecting" || view.phase === "finishing") {
-        recorder.cancel();
+        recorder.cancel("dismiss");
         return;
       }
       clearDismiss();

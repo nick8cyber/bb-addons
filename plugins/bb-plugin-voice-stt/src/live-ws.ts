@@ -97,6 +97,8 @@ interface ConnState {
   config: LiveVoiceConfig | null;
   keyIndex: number;
   ready: boolean;
+  /** Время hello — для диагностики длительности в логе. */
+  startedAt: number;
   finishing: boolean;
   torn: boolean;
   /** Снос состояния соединения — доступен и соседнему hello (takeover). */
@@ -133,6 +135,7 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
       config: null,
       keyIndex: 0,
       ready: false,
+      startedAt: 0,
       finishing: false,
       torn: false,
       teardown: () => {},
@@ -149,6 +152,10 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
     const sendError = (code: string, message: string): void => {
       send({ type: "error", code, message });
     };
+
+    /** Диагностика: каждое закрытие живой сессии видно в логе сервера. */
+    const describe = (): string =>
+      `after ${((Date.now() - state.startedAt) / 1000).toFixed(1)}s, audio ${Math.round(state.pcmBytes / 1024)} KB, ready=${state.ready}`;
 
     const teardown = (): void => {
       if (state.torn) return;
@@ -287,6 +294,7 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
         active.teardown();
       }
       state.authed = true;
+      state.startedAt = Date.now();
       active = state;
       try {
         state.config = await deps.readConfig();
@@ -338,6 +346,9 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
             return finish();
           }
           if (type === "cancel") {
+            const raw = (msg as Record<string, unknown>)["reason"];
+            const reason = typeof raw === "string" && raw !== "" ? raw.slice(0, 200) : "user";
+            log(`live-voice: cancelled by client (${reason}) ${describe()}`);
             teardown();
             try {
               sock.close(CLOSE_NORMAL, "cancelled");
@@ -360,6 +371,9 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
       onClose: () => {
         // Обрыв сокета: серверная сессия умирает, резюма нет (§4.3а) —
         // клиент сам решит: реплей в новую сессию или файловая цепочка.
+        if (state.authed && !state.torn && !state.finishing) {
+          log(`live-voice: client socket closed before end ${describe()}`);
+        }
         teardown();
       },
 

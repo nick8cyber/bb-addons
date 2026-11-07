@@ -292,13 +292,24 @@ describe("voiceRecorder (§3.3, §9)", () => {
     expect(composer.inserted).toEqual([{ text: "фоллбэк", at: "end" }]);
   });
 
+  it("micLive turns on with the first mic chunk (card: «включаю микрофон» → «говорите»)", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 1);
+    await openWithHello(r);
+    expect(r.recorder.getSnapshot().micLive).toBe(false);
+    r.capture.emit();
+    expect(r.recorder.getSnapshot().micLive).toBe(true);
+    r.recorder.cancel();
+    expect(r.recorder.getSnapshot().micLive).toBe(false);
+  });
+
   it("cancel sends cancel and never inserts", async () => {
     const r = makeRecorder();
     const composer = new FakeComposer();
     r.recorder.pressStart(composer);
     const sock = await openWithHello(r);
     r.recorder.cancel();
-    expect(sock.json().at(-1)).toEqual({ type: "cancel" });
+    expect(sock.json().at(-1)).toEqual({ type: "cancel", reason: "user" });
     expect(r.recorder.getSnapshot().phase).toBe("idle");
     expect(composer.inserted).toHaveLength(0);
   });
