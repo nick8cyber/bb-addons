@@ -37,6 +37,7 @@ plugins/bb-plugin-live-call/
     ├── key-pool.ts         # 2 ключа, переход по квоте
     ├── call-store.ts       # SQLite плагина: calls, call_events, ротация 90 дней
     ├── brain-center.ts     # мозговой центр звонка по треду (ADR-0009)
+    ├── project-brain.ts    # мозговой центр проекта и мост чтения коннекторов (ADR-0016)
     ├── prompt.ts           # системные инструкции
     └── ui/                 # движок звонка в браузере, оверлей, настройки
 ```
