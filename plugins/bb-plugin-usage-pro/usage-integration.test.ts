@@ -65,7 +65,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
   function setupHarness(cfg: TestRigConfig) {
     const hostsList: Host[] = cfg.hosts ?? [
       { id: "host-primary", name: "Primary Server", status: "connected" },
-      { id: "host-remote", name: "Remote Remote", status: "connected" },
+      { id: "host-remote", name: "Remote Host", status: "connected" },
     ];
     const primaryHostId = cfg.primaryHostId ?? "host-primary";
     const sourcesList = cfg.sources ?? [
@@ -422,7 +422,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     const h = setupHarness({
       hosts: [
         { id: "host-primary", name: "Primary", status: "connected" },
-        { id: "host-remote", name: "Remote", status: "connected" },
+        { id: "host-remote2", name: "Remote2", status: "connected" },
       ],
       primaryHostId: "host-primary",
       sources: [{ pluginId: "source-native", displayName: "Native Codex" }],
@@ -437,11 +437,11 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
               accountKey: "openai:chatgpt:primary-acc",
             },
             {
-              id: "res-remote",
-              label: "Remote Codex",
+              id: "res-remote2",
+              label: "Remote2 Codex",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-remote", hostName: "Remote" },
-              accountKey: "openai:chatgpt:remote-acc",
+              scope: { kind: "host", hostId: "host-remote2", hostName: "Remote2" },
+              accountKey: "openai:chatgpt:remote2-acc",
             },
           ],
         },
@@ -452,8 +452,8 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
           observedAt: currentTime,
           usage: { status: "ok", windows: [] },
         },
-        "source-native:res-remote": {
-          accountKey: "openai:chatgpt:remote-acc",
+        "source-native:res-remote2": {
+          accountKey: "openai:chatgpt:remote2-acc",
           observedAt: currentTime,
           usage: { status: "ok", windows: [] },
         },
@@ -481,12 +481,12 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     });
 
     const primary = snapshot.machines.find((x: any) => x.id === "host-primary");
-    const remote = snapshot.machines.find((x: any) => x.id === "host-remote");
+    const remote2 = snapshot.machines.find((x: any) => x.id === "host-remote2");
 
     expect(primary.providers.some((p: any) => p.id === "codex:pi-team")).toBe(true);
-    expect(remote.providers.some((p: any) => p.id === "codex:pi-team")).toBe(false);
-    expect(remote.providers).toHaveLength(1);
-    expect(remote.providers[0].id).toBe("source-native:res-remote");
+    expect(remote2.providers.some((p: any) => p.id === "codex:pi-team")).toBe(false);
+    expect(remote2.providers).toHaveLength(1);
+    expect(remote2.providers[0].id).toBe("source-native:res-remote2");
   });
 
   // Row 4: Fresh healthy vs stale/error duplicate -> Healthy wins, no summing

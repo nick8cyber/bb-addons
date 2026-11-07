@@ -146,6 +146,30 @@ Two Gemini API keys go into the plugin's secret setting at install; nothing else
 ADRs [0005](docs/adr/0005-live-call-server-relay.md)–[0012](docs/adr/0012-live-call-voice-confirmation-rules.md),
 [plugin README](plugins/bb-plugin-live-call/README.md).
 
+### `voice-stt` 🎙️ — voice input
+
+Voice input for bb in two modes:
+
+- **Native mic** in the composer. bb hands the recording to the plugin's
+  `ai.voice.transcribe` service: Gemini Live, then Codex, then Groq as fallbacks.
+- **Live dictation**: a floating mic button you can drag anywhere. Tap to start and
+  tap again to stop, hold to talk, or drag to move it. Speech streams to Gemini Live
+  while you talk, and the text lands in the composer draft 1–2 s after you stop.
+  Tapping the recording card also stops it. `Ctrl/Cmd+Shift+V` toggles dictation and
+  Esc cancels. Nothing is ever sent automatically.
+
+```bash
+bb voice-stt status
+bb voice-stt transcribe <file>
+```
+
+Gemini keys go into the plugin's secret setting. Codex uses the host's Codex login,
+and a Groq key is optional.
+
+[Spec (file pipeline)](docs/specs/voice-stt.md),
+[spec (live dictation)](docs/specs/voice-stt-live.md),
+[ADR 0014](docs/adr/0014-voice-stt-live-floating-button.md).
+
 ### `privacy-blur`
 
 One click blurs sensitive data across the bb interface for screenshots and
