@@ -45,6 +45,12 @@ function ComposersBridge() {
 
 /** Сдвиг пальца/курсора, после которого жест — перенос кнопки, а не тап. */
 const DRAG_PX = 10;
+/**
+ * Сдвиг во время push-to-talk, после которого это перенос, а не дрожь
+ * пальца при разговоре: запись отменяется, кнопка едет (палец постоял
+ * 300 мс и только потом поехал — частый старт переноса на iPhone).
+ */
+const HOLD_DRAG_PX = 24;
 /** Удержание без сдвига дольше этого — push-to-talk. */
 const HOLD_START_MS = 300;
 
@@ -82,7 +88,8 @@ function useViewport(): { vw: number; vh: number } {
  * НЕ стартуют: тап (отпустили без сдвига) — старт toggle-записи;
  * удержание 300 мс — push-to-talk; сдвиг > 10 px — перенос кнопки,
  * кнопка едет за пальцем прямой записью стиля (без перерисовок React).
- * Во время записи: тап — стоп, сдвиг — перенос без остановки.
+ * Во время записи: тап — стоп, сдвиг — перенос без остановки. Сдвиг
+ * > 24 px в push-to-talk — отмена записи и перенос.
  */
 function FloatingMic() {
   const composers = useComposers();
@@ -178,9 +185,12 @@ function FloatingMic() {
       onPointerMove={(e) => {
         const g = gesture.current;
         if (g === null || g.pointerId !== e.pointerId) return;
-        if (g.mode === "hold") return; // говорит с пальцем на кнопке — не двигаем
         if (g.mode !== "drag") {
-          if (Math.hypot(e.clientX - g.x0, e.clientY - g.y0) < DRAG_PX) return;
+          const moved = Math.hypot(e.clientX - g.x0, e.clientY - g.y0);
+          if (moved < (g.mode === "hold" ? HOLD_DRAG_PX : DRAG_PX)) return;
+          if (g.mode === "hold") {
+            voiceRecorder.cancel(); // перенос, а не диктовка — без вставки
+          }
           if (g.mode === "pending") {
             clearTimer(g);
             voiceRecorder.unprime();
