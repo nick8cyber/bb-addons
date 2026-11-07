@@ -118,6 +118,8 @@ export interface MicCaptureLike {
 
 /** Нет ни одного кадра дольше — захват встал (контекст/устройство). */
 const STALL_NO_FRAMES_MS = 1500;
+/** Touch: повторная проверка после перезапуска со свежим контекстом. */
+const STALL_NO_FRAMES_AFTER_RESTART_MS = 1000;
 /** Только абсолютные нули дольше — микрофон «подключён», но звука нет. */
 const STALL_ZEROS_MS = 2500;
 const MAX_RESTARTS = 3;
@@ -630,7 +632,9 @@ export class MicCapture implements MicCaptureLike {
     this.watch = setInterval(() => {
       if (gen !== this.generation || this.restarting) return;
       const t = performance.now();
-      if (t - this.lastFrameAt > STALL_NO_FRAMES_MS) {
+      // После перезапуска на телефоне ждём меньше — быстрее в запасной режим.
+      const limit = this.restarts > 0 && !isDesktop() ? STALL_NO_FRAMES_AFTER_RESTART_MS : STALL_NO_FRAMES_MS;
+      if (t - this.lastFrameAt > limit) {
         void this.stall(gen, `no audio frames ${Math.round(t - this.lastFrameAt)}ms (ctx ${this.ctx?.state ?? "none"})`);
       } else if (!this.soundSeen && t - this.lastSoundAt > STALL_ZEROS_MS) {
         // Одни нули с самого старта — устройство не даёт звука. После

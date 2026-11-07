@@ -300,6 +300,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     diagQueue = [];
     for (const msg of q) sendJson(a, { type: "diag", msg });
   };
+  const MIC_RESTARTED_NOTICE = "микрофон перезапущен — жду звук…";
+  const MIC_NOTICES = new Set(["микрофон пропал — перезапускаю…", MIC_RESTARTED_NOTICE]);
   const onCaptureEvent = (ev: CaptureEvent): void => {
     const live = view.phase === "recording" || view.phase === "reconnecting";
     if (!live && !standbyOn) return;
@@ -321,7 +323,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       patch({ notice: "микрофон пропал — перезапускаю…" });
     } else if (ev.kind === "restarted") {
       sendDiag(`mic restarted: ${ev.info}`);
-      patch({ notice: null });
+      // Не сбрасываем в тишину: пока звука нет, плашка говорит, что происходит.
+      patch({ notice: view.micLive ? null : MIC_RESTARTED_NOTICE });
     } else if (ev.kind === "failed") {
       sendDiag(`mic failed: ${ev.reason}`);
       patch({ notice: "микрофон не отвечает — проверьте устройство ввода в системе" });
@@ -413,7 +416,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     const t = now();
     if (!view.micLive) {
       lastLevelAt = t;
-      patch({ level, micLive: true });
+      // Звук пошёл — сообщения сторожа больше не актуальны.
+      patch({ level, micLive: true, ...(view.notice !== null && MIC_NOTICES.has(view.notice) ? { notice: null } : {}) });
     } else if (t - lastLevelAt > 90) {
       lastLevelAt = t;
       patch({ level });
