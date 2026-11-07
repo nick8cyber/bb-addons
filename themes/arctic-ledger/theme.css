@@ -361,7 +361,10 @@ diffs-container {
 /* Handoff opens in the thread-detail side panel. It is not navigation: give
  * it the same calm light canvas and dark text as the main work area. The
  * light canvas is a light-appearance choice; dark keeps its own tokens. */
-:root:not(.dark) #thread-detail-secondary-panel {
+:root:not(.dark) :is(
+  #thread-detail-secondary-panel,
+  [data-testid="secondary-panel-shelf"]
+) {
   --sidebar: #f4f8fc;
   --sidebar-foreground: #14213d;
   --sidebar-accent: #d7e7f6;
