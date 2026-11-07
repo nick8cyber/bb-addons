@@ -152,12 +152,12 @@
 .vsl-btn:hover {
   background: var(--state-hover, var(--accent));
 }
-.vsl-btn--primary {
+.vsl-overlay .vsl-btn--primary {
   background: var(--primary, var(--accent));
   color: var(--primary-foreground, var(--foreground));
   border-color: transparent;
 }
-.vsl-btn--primary:hover {
+.vsl-overlay .vsl-btn--primary:hover {
   background: var(--primary, var(--accent));
   opacity: 0.9;
 }
@@ -175,19 +175,21 @@
  * Плавающая кнопка живого ввода (§3.1 п. 4): оверлей смонтирован
  * постоянно — кнопка видна без открытого композера, включая мобильный
  * клиент. Середина правого края — в стороне от композера, кнопки
- * отправки и нижних панелей.
+ * отправки и нижних панелей. Центрирование БЕЗ transform: анимации
+ * масштаба не сдвигают кнопку. z-index выше карточки — стоп никогда
+ * не перекрыт.
  */
 .vsl-fab {
   position: fixed;
   right: 12px;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 60;
+  top: calc(50% - 26px);
+  z-index: 61;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 48px;
-  height: 48px;
+  width: 52px;
+  height: 52px;
+  padding: 0;
   border: 1px solid var(--border);
   border-radius: 50%;
   background: var(--primary, var(--accent));
@@ -200,21 +202,53 @@
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
 }
-.vsl-fab:hover {
-  transform: translateY(-50%) scale(1.06);
+@media (hover: hover) {
+  .vsl-fab:hover {
+    transform: scale(1.06);
+  }
 }
 .vsl-fab:active {
-  transform: translateY(-50%) scale(0.94);
+  transform: scale(0.94);
 }
 .vsl-fab--active {
   background: var(--destructive, #ef4444);
   color: #fff;
   border-color: transparent;
-  animation: vsl-pulse 1.2s ease-in-out infinite;
+  animation: vsl-ring 1.2s ease-out infinite;
+}
+@keyframes vsl-ring {
+  0% { box-shadow: 0 0 0 0 rgb(239 68 68 / 0.55); }
+  100% { box-shadow: 0 0 0 14px rgb(239 68 68 / 0); }
 }
 .vsl-fab--busy {
   opacity: 0.8;
+}
+
+/*
+ * Узкий экран (мобильный клиент): карточка не заходит в правую колонку
+ * FAB — при открытой клавиатуре окно низкое, и карточка во всю ширину
+ * ложилась поверх кнопки стоп (§3.2). Мишени ≥ 44 px.
+ */
+@media (max-width: 640px) {
+  .vsl-overlay {
+    left: 12px;
+    right: 76px;
+    width: auto;
+    max-width: none;
+    transform: none;
+  }
+  .vsl-close {
+    min-width: 44px;
+    min-height: 44px;
+    margin: -10px -8px -10px auto;
+    font-size: 20px;
+  }
+  .vsl-actions--record .vsl-btn {
+    min-height: 44px;
+  }
 }
 
 /* Кнопка в composer.actions — размеры под соседние кнопки композера. */
