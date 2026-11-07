@@ -101,21 +101,68 @@ function readVisibleArea(): VisibleArea {
   };
 }
 
+/**
+ * Общее хранилище видимой области на уровне модуля: слушатели живут
+ * дольше компонентов. Оверлей перемонтируется, когда открывается поле
+ * ввода, и компонентный слушатель пропускал resize от клавиатуры —
+ * кнопка оставалась под ней до следующей перерисовки.
+ */
+let areaSnap: VisibleArea | null = null;
+const areaListeners = new Set<() => void>();
+let areaHooked = false;
+let settleUntil = 0;
+
+function sameArea(a: VisibleArea, b: VisibleArea): boolean {
+  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h && a.keyboard === b.keyboard;
+}
+
+function refreshArea(): void {
+  const next = readVisibleArea();
+  if (areaSnap !== null && sameArea(areaSnap, next)) return;
+  areaSnap = next;
+  for (const fn of areaListeners) fn();
+}
+
+/** Клавиатура выезжает анимацией ~0.3–0.5 с — перечитываем область кадр за кадром. */
+function settleArea(): void {
+  const start = settleUntil === 0 || performance.now() > settleUntil;
+  settleUntil = performance.now() + 700;
+  if (!start) return;
+  const tick = (): void => {
+    refreshArea();
+    if (performance.now() < settleUntil) requestAnimationFrame(tick);
+    else settleUntil = 0;
+  };
+  requestAnimationFrame(tick);
+}
+
+function hookArea(): void {
+  if (areaHooked) return;
+  areaHooked = true;
+  const vv = window.visualViewport;
+  window.addEventListener("resize", refreshArea);
+  vv?.addEventListener("resize", refreshArea);
+  vv?.addEventListener("scroll", refreshArea);
+  // Фокус поля ввода = клавиатура появится/уйдёт.
+  window.addEventListener("focusin", settleArea, true);
+  window.addEventListener("focusout", settleArea, true);
+  window.addEventListener("orientationchange", settleArea);
+}
+
+function subscribeArea(fn: () => void): () => void {
+  hookArea();
+  areaListeners.add(fn);
+  refreshArea(); // догоняем изменения, случившиеся до подписки
+  return () => areaListeners.delete(fn);
+}
+
+function getAreaSnapshot(): VisibleArea {
+  if (areaSnap === null) areaSnap = readVisibleArea();
+  return areaSnap;
+}
+
 function useVisibleArea(): VisibleArea {
-  const [area, setArea] = useState<VisibleArea>(readVisibleArea);
-  useEffect(() => {
-    const on = () => setArea(readVisibleArea());
-    const vv = window.visualViewport;
-    window.addEventListener("resize", on);
-    vv?.addEventListener("resize", on);
-    vv?.addEventListener("scroll", on);
-    return () => {
-      window.removeEventListener("resize", on);
-      vv?.removeEventListener("resize", on);
-      vv?.removeEventListener("scroll", on);
-    };
-  }, []);
-  return area;
+  return useSyncExternalStore(subscribeArea, getAreaSnapshot);
 }
 
 /** Позиция по умолчанию — середина правого края видимой области. */
