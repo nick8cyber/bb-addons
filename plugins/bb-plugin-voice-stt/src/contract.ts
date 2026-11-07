@@ -88,10 +88,16 @@ const transcribeInput = z
     hint: z.string().nullable(),
     config: transcribeConfigSchema,
     timeoutMs: z.number().int().positive(),
+    /**
+     * Стадии, которые цепочка пропускает (спека voice-stt-live §4.5): живой
+     * режим на фоллбэке зовёт codex→groq напрямую, не прогоняя WAV через
+     * ту же сдохшую Gemini. Не указано — полный порядок (путь ai-сервиса).
+     */
+    skipStages: z.array(z.enum(ENGINE_IDS)).optional(),
   })
   .strict();
 
-const transcribeOutput = z.union([
+export const transcribeOutputSchema = z.union([
   z
     .object({
       ok: z.literal(true),
@@ -119,12 +125,22 @@ const statusOutput = z
   .strict();
 
 export const contract = {
-  "voice-stt.transcribe": { input: transcribeInput, output: transcribeOutput },
+  "voice-stt.transcribe": { input: transcribeInput, output: transcribeOutputSchema },
   "voice-stt.status": { input: z.object({}).strict(), output: statusOutput },
 } as const;
 
+/**
+ * Второй контракт host-энтри (спека voice-stt-live §4.5): тот же метод
+ * `voice-stt.transcribe` с опциональным `skipStages` — им server entry зовёт
+ * фоллбэк живого режима. `contract` для ai-сервиса остаётся с полным порядком
+ * стадий по умолчанию (skipStages просто не передаётся).
+ */
+export const voiceSttHostContract = {
+  "voice-stt.transcribe": { input: transcribeInput, output: transcribeOutputSchema },
+} as const;
+
 export type TranscribeInput = z.infer<typeof transcribeInput>;
-export type TranscribeOutput = z.infer<typeof transcribeOutput>;
+export type TranscribeOutput = z.infer<typeof transcribeOutputSchema>;
 
 // --- Маскировка секретов (спека §6.1, §10) ---
 

@@ -21,6 +21,7 @@ import {
   languageBaseCode,
   maskSecretValue,
   toFailureResult,
+  type EngineId,
   type FailureCode,
   type TranscribeInput,
   type TranscribeOutput,
@@ -110,11 +111,21 @@ export async function runTranscribeChain(
     return true;
   };
 
+  // Явный пропуск стадий (спека voice-stt-live §4.5): фоллбэк живого режима
+  // просит codex→groq без повторного прогона Gemini и без ffmpeg-декода.
+  const skipStages = new Set<EngineId>(input.skipStages ?? []);
+  const skippedByCaller = (stage: EngineId): boolean => {
+    if (!skipStages.has(stage)) return false;
+    reasons.push(`${stage}: skipped (skipStages)`);
+    log(`${stage}: skipped via skipStages`);
+    return true;
+  };
+
   try {
     const cfg = input.config;
 
     // --- Стадия Gemini Live (§5 п. 3, §6) ---
-    if (cfg.geminiKeys.length > 0 && !skippedByBudget("gemini-live")) {
+    if (cfg.geminiKeys.length > 0 && !skippedByCaller("gemini-live") && !skippedByBudget("gemini-live")) {
       let pcm: Buffer | null = null;
       try {
         pcm = await decodePcm(
@@ -185,7 +196,7 @@ export async function runTranscribeChain(
     }
 
     // --- Стадия Codex (§5 п. 4, §7) ---
-    if (!skippedByBudget("codex")) {
+    if (!skippedByCaller("codex") && !skippedByBudget("codex")) {
       try {
         const text = (
           await codex({
@@ -215,7 +226,7 @@ export async function runTranscribeChain(
     if (cfg.groqApiKey === null) {
       reasons.push("groq: skipped (no API key)");
       log("groq: skipped, no API key configured");
-    } else if (!skippedByBudget("groq")) {
+    } else if (!skippedByCaller("groq") && !skippedByBudget("groq")) {
       try {
         const text = (
           await groq({
