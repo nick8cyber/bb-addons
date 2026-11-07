@@ -29,7 +29,7 @@ const BUILTIN_PATTERNS: RegExp[] = [
   /(?<![\p{L}\p{N}_:/.\\-])(?:~|\/(?:home|Users|root|mnt|media|opt|srv|var|etc|tmp|private|Volumes|data|workspace|workspaces|usr|run|snap))(?:\/[^\s/<>"'`|:;,()[\]{}]+)+\/?/gu,
   /(?<![\p{L}\p{N}_:/.\\-])(?:\/[\p{L}\p{N}._@+-]+){2,}\/?/gu,
   /\b[A-Za-z]:\\(?:[^\s\\<>"'`|:*?]+\\?)+/gu,
-  // id bb: <thread>, <memory> — у этих префиксов цифра не нужна.
+  // id bb: thr_k3m9x2p7qa, mem_q8w2e5r7t_y — у этих префиксов цифра не нужна.
   new RegExp(`\\b(?:${BB_ID_PREFIXES.join("|")})_[a-z0-9]{6,}(?:_[a-z0-9]+)*\\b`, "gu"),
   // Прочие id с префиксом: только если есть цифра (иначе это snake_case-слово).
   new RegExp(`\\b(?:${ID_PREFIXES.join("|")})_(?=[A-Za-z0-9_-]*\\d)[A-Za-z0-9][A-Za-z0-9_-]{4,}\\b`, "gu"),

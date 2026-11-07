@@ -216,7 +216,7 @@ describe("selectAccountResources", () => {
   describe("host and provider scoping", () => {
     it("does NOT deduplicate across different machineId (hosts)", () => {
       const host1 = createResource("r-host1", { machineId: "host-remote2" });
-      const host2 = createResource("r-host2", { machineId: "host-primary" });
+      const host2 = createResource("r-host2", { machineId: "host-primary2" });
 
       const result = selectAccountResources([host1, host2], (r) => r.identity);
       expect(result).toHaveLength(2);

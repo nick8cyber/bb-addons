@@ -421,20 +421,20 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
   it("Scenario 3: Pi is attached strictly to primaryHostId and not copied to remote hosts", async () => {
     const h = setupHarness({
       hosts: [
-        { id: "host-primary", name: "Primary", status: "connected" },
+        { id: "host-primary2", name: "Primary", status: "connected" },
         { id: "host-remote2", name: "Remote2", status: "connected" },
       ],
-      primaryHostId: "host-primary",
+      primaryHostId: "host-primary2",
       sources: [{ pluginId: "source-native", displayName: "Native Codex" }],
       inventories: {
         "source-native": {
           resources: [
             {
-              id: "res-primary",
+              id: "res-primary2",
               label: "Primary Codex",
               providerId: "codex",
-              scope: { kind: "host", hostId: "host-primary", hostName: "Primary" },
-              accountKey: "openai:chatgpt:primary-acc",
+              scope: { kind: "host", hostId: "host-primary2", hostName: "Primary" },
+              accountKey: "openai:chatgpt:primary2-acc",
             },
             {
               id: "res-remote2",
@@ -447,8 +447,8 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
         },
       },
       measurements: {
-        "source-native:res-primary": {
-          accountKey: "openai:chatgpt:primary-acc",
+        "source-native:res-primary2": {
+          accountKey: "openai:chatgpt:primary2-acc",
           observedAt: currentTime,
           usage: { status: "ok", windows: [] },
         },
@@ -480,7 +480,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       maxAgeMs: 60_000,
     });
 
-    const primary = snapshot.machines.find((x: any) => x.id === "host-primary");
+    const primary = snapshot.machines.find((x: any) => x.id === "host-primary2");
     const remote2 = snapshot.machines.find((x: any) => x.id === "host-remote2");
 
     expect(primary.providers.some((p: any) => p.id === "codex:pi-team")).toBe(true);

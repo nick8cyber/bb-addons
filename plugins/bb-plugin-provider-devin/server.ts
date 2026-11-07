@@ -12,9 +12,13 @@
  *
  * Поля повторяют acpProviderDeclaration() встроенного provider-acp (bb 0.48.1).
  */
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
-const DEVIN_BIN = "~/.local/bin/devin";
+/** Devin CLI ставится в ~/.local/bin (официальный установщик). */
+const DEVIN_BIN = join(homedir(), ".local", "bin", "devin");
 
 export default function plugin(bb: BbPluginApi) {
   bb.providers.register({
