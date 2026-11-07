@@ -33,7 +33,7 @@ FRESH_SECONDS = 15 * 60
 # config.json команды exec не останавливает (06.11 Devin так переписал config.json).
 GUARD_RE = re.compile(
     r"\.config/devin(?:/|\b)|\.claude/(?:CLAUDE\.md|hooks\b|settings(?:\.local)?\.json)"
-    r"|bb-plugin-provider-devin/devin-hooks\b")
+    r"|bb-plugin-provider-devin/devin-hooks\b|\.local/share/bb-devin/hooks\b")
 WRITE_RE = re.compile(
     r">|\btee\b|\bsed\s+(?:-\w*\s+)*-i|\bmv\b|\bcp\b|\brm\b|\bchmod\b|\bchown\b|\btruncate\b|\bln\b"
     r"|\binstall\b|\bdd\b|open\([^)]*['\"][wax+]|write_text|write_bytes|json\.dump|\bperl\s+-\w*i")

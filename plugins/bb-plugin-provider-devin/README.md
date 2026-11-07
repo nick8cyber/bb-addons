@@ -13,7 +13,7 @@
 ## Установка у пользователя
 
 1. `bb plugin install <путь к этому каталогу> --yes`; запись `devin` из `bb plugin config provider-acp customAgents` убрать (один id не может быть у двух провайдеров).
-2. `python3 -I devin-hooks/install.py` — пишет хуки в `~/.config/devin/config.json`, ставит `read_config_from.claude=true` и `subagents_enabled=false`. Резервная копия рядом.
+2. `python3 -I devin-hooks/install.py` — копирует хуки в `~/.local/share/bb-devin/hooks/` (не в чекаут: его переключают на другие ветки), прописывает их в `~/.config/devin/config.json` (чужие хуки пользователя сохраняются), ставит `read_config_from.claude=true` и `subagents_enabled=false`. Резервная копия рядом. После правки хуков в репозитории — запустить снова.
 3. Новые сессии Devin подхватывают хуки сразу; работающие — после перезапуска процесса (`bb thread stop <id>`, когда тред в простое).
 
 Журнал хуков: `~/.local/state/devin-bb-hooks.log`.
