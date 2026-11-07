@@ -168,6 +168,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   const listenPagehide = deps.listenPagehide ?? typeof window !== "undefined";
 
   let view: RecorderView = { ...IDLE_VIEW };
+  /** Плашка результата/ошибки — новое нажатие её закрывает и стартует запись. */
+  const isSettled = (): boolean => view.phase === "done" || view.phase === "error";
   if (listenPagehide && typeof document !== "undefined") {
     // Ушли со вкладки/из приложения — тёплый микрофон гасим (приватность, iOS всё равно отнимет).
     document.addEventListener("visibilitychange", () => {
@@ -392,7 +394,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     // Поздний чанк после cancel/stop — не запись: generation-гард в
     // capture не пускает поток, это вторая линия (блокер «сирота»).
     if (firstAudioAt === 0) firstAudioAt = now();
-    if (view.phase === "idle" && standbyOn) {
+    if ((view.phase === "idle" || isSettled()) && standbyOn) {
       preroll.push(bytes);
       prerollBytes += bytes.byteLength;
       while (prerollBytes > PREROLL_MAX_BYTES && preroll.length > 1) {
@@ -771,7 +773,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     },
     /** Касание держится без сдвига — поднимаем микрофон заранее (pre-roll). */
     prime(touchAt?: number): void {
-      if (view.phase !== "idle") return;
+      if (view.phase !== "idle" && !isSettled()) return;
       capture.unlock(); // идемпотентно
       if (standby !== null) return;
       pressAt = touchAt ?? now(); // задержку считаем от самого касания
@@ -806,6 +808,11 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         // Повторное нажатие в toggle-режиме → end (§3.3).
         recorder.stop();
         return;
+      }
+      if (isSettled()) {
+        // Плашка результата ещё висит — закрываем и начинаем новую запись.
+        clearDismiss();
+        patch({ ...IDLE_VIEW, ignorePulse: view.ignorePulse });
       }
       if (view.phase !== "idle") {
         patch({ ignorePulse: view.ignorePulse + 1 });
@@ -916,7 +923,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         recorder.stop();
         return;
       }
-      if (view.phase !== "idle") return;
+      if (view.phase !== "idle" && !isSettled()) return;
       recorder.pressStart(composer ?? targetResolver?.() ?? null);
       // Команда — не hold: сразу снимаем «дедлайн удержания».
       patch({ holdArmed: false });

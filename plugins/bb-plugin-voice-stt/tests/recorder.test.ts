@@ -406,6 +406,18 @@ describe("voiceRecorder (§3.3, §9)", () => {
     expect(composer.inserted.at(-1)?.text).toBe("фоллбэк");
   });
 
+  it("нажатие, пока висит плашка результата, закрывает её и сразу начинает новую запись", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 1);
+    const sock = await openWithHello(r);
+    r.recorder.stop();
+    sock.simulateMessage({ type: "final", text: "", engine: "silence" });
+    expect(r.recorder.getSnapshot().phase).toBe("done");
+    r.recorder.pressStart(new FakeComposer(), 2);
+    expect(r.recorder.getSnapshot().phase).toBe("recording");
+    r.recorder.cancel();
+  });
+
   it("cancel sends cancel and never inserts", async () => {
     const r = makeRecorder();
     const composer = new FakeComposer();
