@@ -10,7 +10,7 @@
  * файловая цепочка через RPC liveFallback.
  */
 import { pcmToWav } from "../wav.js";
-import { MicCapture, type MicCaptureLike } from "./capture.js";
+import { MicCapture, type CaptureEvent, type MicCaptureLike } from "./capture.js";
 import { rpc, type LiveFallbackResult, type LiveTokenResult } from "./rpc.js";
 
 const WS_PATH = "/api/v1/plugins/voice-stt/http/live-voice";
@@ -271,6 +271,40 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   };
   const onPageHide = (): void => {
     recorder.cancel("pagehide");
+  };
+
+  /**
+   * Диагностика захвата → лог сервера. До hello копим в очередь и
+   * отправляем сразу после него (§8.1).
+   */
+  let diagQueue: string[] = [];
+  const sendDiag = (msg: string): void => {
+    const a = attempt;
+    if (a && !a.dead && a.helloSent && a.sock?.readyState === SOCK_OPEN) {
+      sendJson(a, { type: "diag", msg });
+    } else if (diagQueue.length < 20) {
+      diagQueue.push(msg);
+    }
+  };
+  const flushDiag = (a: Attempt): void => {
+    const q = diagQueue;
+    diagQueue = [];
+    for (const msg of q) sendJson(a, { type: "diag", msg });
+  };
+  const onCaptureEvent = (ev: CaptureEvent): void => {
+    if (view.phase !== "recording" && view.phase !== "reconnecting") return;
+    if (ev.kind === "started") sendDiag(`mic started: ${ev.info}`);
+    else if (ev.kind === "state") sendDiag(`mic ${ev.info}`);
+    else if (ev.kind === "stall") {
+      sendDiag(`mic stall: ${ev.reason}`);
+      patch({ notice: "микрофон пропал — перезапускаю…" });
+    } else if (ev.kind === "restarted") {
+      sendDiag(`mic restarted: ${ev.info}`);
+      patch({ notice: null });
+    } else {
+      sendDiag(`mic failed: ${ev.reason}`);
+      patch({ notice: "микрофон не отвечает — проверьте устройство ввода в системе" });
+    }
   };
 
   const sendJson = (a: Attempt, frame: object): void => {
@@ -555,6 +589,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
           sock.send(JSON.stringify({ type: "hello", token: res.token }));
           a.helloSent = true;
           for (const chunk of pcm) sock.send(chunk);
+          flushDiag(a);
         } catch (e) {
           if (!a.dead && attempt === a) {
             fail(`сервер живого ввода недоступен: ${e instanceof Error ? e.message : String(e)}`);
@@ -651,6 +686,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       clearDismiss(); // протухший авто-скрыватель не должен жить в новой сессии
       target = composer ?? null;
       pcm = [];
+      diagQueue = [];
       readySeen = false;
       patch({
         ...IDLE_VIEW,
@@ -677,7 +713,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       openSocket();
       void (async () => {
         try {
-          await capture.start(onMicChunk);
+          await capture.start(onMicChunk, onCaptureEvent);
         } catch (e) {
           if (view.phase === "recording" || view.phase === "reconnecting") {
             fail(`микрофон недоступен: ${e instanceof Error ? e.message : String(e)}`);

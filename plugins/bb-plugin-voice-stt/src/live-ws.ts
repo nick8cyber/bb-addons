@@ -343,7 +343,13 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
           }
           if (!state.authed) return;
           if (type === "end") {
+            log(`live-voice: end ${describe()}`);
             return finish();
+          }
+          if (type === "diag") {
+            const raw = (msg as Record<string, unknown>)["msg"];
+            if (typeof raw === "string" && raw !== "") log(`live-voice: client ${raw.slice(0, 300)}`);
+            return;
           }
           if (type === "cancel") {
             const raw = (msg as Record<string, unknown>)["reason"];
