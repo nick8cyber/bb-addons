@@ -58,7 +58,7 @@ function LiveMicAction() {
       aria-pressed={active}
       onPointerDown={(e) => {
         e.preventDefault();
-        voiceRecorder.pressStart(composer);
+        voiceRecorder.pressStart(composer, e.nativeEvent.pointerId);
       }}
       onPointerUp={(e) => voiceRecorder.pressEnd(e.nativeEvent)}
       onPointerCancel={(e) => voiceRecorder.pressEnd(e.nativeEvent)}

@@ -19,6 +19,8 @@ const MAX_RECORD_MS = 5 * 60_000;
 const READY_TIMEOUT_MS = 5_000;
 const RECONNECT_TIMEOUT_MS = 5_000;
 const DONE_DISMISS_MS = 1_600;
+/** Вачдог финала (§4.4/§5): settle ≤6 c + фоллбэк codex→groq ≤30 c + запас. */
+const FINAL_TIMEOUT_MS = 40_000;
 
 export type RecorderPhase =
   | "idle"
@@ -99,6 +101,7 @@ export interface RecorderDeps {
   maxRecordMs?: number;
   readyTimeoutMs?: number;
   reconnectTimeoutMs?: number;
+  finalTimeoutMs?: number;
   listenKeys?: boolean;
   listenPagehide?: boolean;
 }
@@ -153,6 +156,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   const maxRecordMs = deps.maxRecordMs ?? MAX_RECORD_MS;
   const readyTimeoutMs = deps.readyTimeoutMs ?? READY_TIMEOUT_MS;
   const reconnectTimeoutMs = deps.reconnectTimeoutMs ?? RECONNECT_TIMEOUT_MS;
+  const finalTimeoutMs = deps.finalTimeoutMs ?? FINAL_TIMEOUT_MS;
   const listenKeys = deps.listenKeys ?? typeof window !== "undefined";
   const listenPagehide = deps.listenPagehide ?? typeof window !== "undefined";
 
@@ -173,9 +177,22 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   let keysAttached = false;
   let readySeen = false;
   let lastReleaseStamp = -1;
+  /**
+   * Физически удерживаемый пресс и его pointerId (§3.3): window pointerup
+   * кончает запись только пока исходный пресс ещё нажат. Без этого ЛЮБОЕ
+   * отпускание в toggle-режиме (клик/скролл/выделение, в т.ч. по оверлею)
+   * обрывало бы диктовку — пост-ревью, блокер.
+   */
+  let pressHeld = false;
+  let activePointerId: number | null = null;
 
   const arm = (fn: () => void, ms: number): void => {
     timers.push(setTimeout(fn, ms));
+  };
+  const armFinishWatchdog = (): void => {
+    arm(() => {
+      if (view.phase === "finishing") void fileFallback();
+    }, finalTimeoutMs);
   };
   const clearTimers = (): void => {
     for (const t of timers) clearTimeout(t);
@@ -329,7 +346,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
 
   /** Файловая цепочка (§4.3а): WAV → RPC liveFallback → codex→groq(+gemini). */
   const fileFallback = async (): Promise<void> => {
-    patch({ phase: "finishing", notice: "фоллбэк на файловую цепочку…" });
+    if (view.phase !== "finishing") return; // двойной запуск не нужен
+    patch({ notice: "фоллбэк на файловую цепочку…" });
     try {
       const wav = pcmToWav(concatPcm(pcm));
       const res = await callRpc("liveFallback", {
@@ -393,6 +411,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
           a.helloSent = true;
           for (const chunk of snapshot) sock.send(chunk);
           sock.send(JSON.stringify({ type: "end" }));
+          armFinishWatchdog();
         } catch {
           if (!a.dead) void fileFallback();
         }
@@ -530,8 +549,12 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       targetResolver = resolver;
     },
 
-    /** pointerdown на кнопке: старт немедленно (прогрев §3.3), iOS-unlock в жесте. */
-    pressStart(composer?: ComposerTarget | null): void {
+    /**
+     * pointerdown на кнопке: старт немедленно (прогрев §3.3), iOS-unlock в
+     * жесте. `pointerId` — только у реального указателя; команда/футер
+     * стартуют без него (pressHeld=false → чужие отпускания игнорятся).
+     */
+    pressStart(composer?: ComposerTarget | null, pointerId?: number): void {
       if (!liveEnabled) return;
       if (view.phase === "recording" || view.phase === "reconnecting") {
         // Повторное нажатие в toggle-режиме → end (§3.3).
@@ -542,6 +565,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         patch({ ignorePulse: view.ignorePulse + 1 });
         return;
       }
+      pressHeld = pointerId !== undefined;
+      activePointerId = pointerId ?? null;
       target = composer ?? null;
       pcm = [];
       readySeen = false;
@@ -575,11 +600,23 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     },
 
     /**
-     * pointerup: <400 мс — toggle (запись продолжается), иначе → end.
-     * Одно отпускание приходит и в React-кнопку, и в window — дедупликация
-     * по timeStamp события.
+     * Отпускание ИСХОДНОГО пресса: <400 мс — toggle (запись продолжается),
+     * иначе → end. Игнорится, когда пресс не удерживается (toggle-режим:
+     * конец — только повторное нажатие кнопки или Enter, §3.3) или когда
+     * pointerId чужой. Одно отпускание приходит и в React-кнопку, и в
+     * window — дедупликация по timeStamp + сброс pressHeld.
      */
-    pressEnd(ev?: { timeStamp?: number }): void {
+    pressEnd(ev?: { timeStamp?: number; pointerId?: number }): void {
+      if (!pressHeld) return;
+      if (
+        activePointerId !== null &&
+        ev?.pointerId !== undefined &&
+        ev.pointerId !== activePointerId
+      ) {
+        return;
+      }
+      pressHeld = false;
+      activePointerId = null;
       if (ev?.timeStamp !== undefined) {
         if (ev.timeStamp === lastReleaseStamp) return;
         lastReleaseStamp = ev.timeStamp;
@@ -613,6 +650,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       const a = attempt;
       if (a && !a.dead && a.helloSent && a.sock?.readyState === SOCK_OPEN) {
         sendJson(a, { type: "end" });
+        // Вачдог финала: тишина от сервера сверх бюджета → WAV-фоллбэк.
+        armFinishWatchdog();
       } else {
         // Сокет мёртв/не поднялся — реплей всей записи в новую сессию (§4.3а).
         void replayAndFinish();

@@ -132,11 +132,47 @@ describe("voiceRecorder (§3.3, §9)", () => {
 
   it("tap <400ms toggles: stays recording on release, second press ends", async () => {
     const r = makeRecorder();
-    r.recorder.pressStart(new FakeComposer());
+    r.recorder.pressStart(new FakeComposer(), 1);
     const sock = await openWithHello(r);
-    r.recorder.pressEnd(); // тап — запись продолжается
+    r.recorder.pressEnd({ pointerId: 1 }); // тап — запись продолжается
     expect(r.recorder.getSnapshot().phase).toBe("recording");
-    r.recorder.pressStart(); // повторное нажатие → end
+    r.recorder.pressStart(new FakeComposer(), 1); // повторное нажатие → end
+    expect(r.recorder.getSnapshot().phase).toBe("finishing");
+    expect(sock.json().at(-1)).toEqual({ type: "end" });
+    r.recorder.cancel();
+  });
+
+  it("BLOCKER: stray releases in toggle mode do NOT end the session", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 1);
+    await openWithHello(r);
+    r.recorder.pressEnd({ pointerId: 1 }); // тап → toggle
+    expect(r.recorder.getSnapshot().phase).toBe("recording");
+    // Любые отпускания (клик, скролл, выделение, по оверлею) — не конец §3.3.
+    r.recorder.pressEnd({ pointerId: 1 });
+    r.recorder.pressEnd({ pointerId: 7 });
+    r.recorder.pressEnd();
+    expect(r.recorder.getSnapshot().phase).toBe("recording");
+    r.recorder.cancel();
+  });
+
+  it("BLOCKER: command/footer start has no press — releases never end it", async () => {
+    const r = makeRecorder();
+    r.recorder.toggle(new FakeComposer());
+    await openWithHello(r);
+    expect(r.recorder.getSnapshot().phase).toBe("recording");
+    r.recorder.pressEnd({ pointerId: 1 });
+    r.recorder.pressEnd();
+    expect(r.recorder.getSnapshot().phase).toBe("recording");
+    r.recorder.cancel();
+  });
+
+  it("BLOCKER: hold release off-button via window still ends (same pointerId)", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 3);
+    const sock = await openWithHello(r);
+    await flush(50); // > holdMs — hold-режим
+    r.recorder.pressEnd({ pointerId: 3 }); // отпускание того же пальца вне кнопки
     expect(r.recorder.getSnapshot().phase).toBe("finishing");
     expect(sock.json().at(-1)).toEqual({ type: "end" });
     r.recorder.cancel();
@@ -144,10 +180,10 @@ describe("voiceRecorder (§3.3, §9)", () => {
 
   it("hold >400ms: release ends the session", async () => {
     const r = makeRecorder();
-    r.recorder.pressStart(new FakeComposer());
+    r.recorder.pressStart(new FakeComposer(), 1);
     const sock = await openWithHello(r);
     await flush(50); // прошло больше holdMs
-    r.recorder.pressEnd();
+    r.recorder.pressEnd({ pointerId: 1 });
     expect(sock.json().at(-1)).toEqual({ type: "end" });
     r.recorder.cancel();
   });

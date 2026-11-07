@@ -55,7 +55,11 @@ const rpcContract = defineRpcContract({
   },
   liveFallback: {
     input: z
-      .object({ audioBase64: z.string().min(1), filename: z.string() })
+      .object({
+        // cap как у серверного PCM (10 МБ → ~13.4 МБ base64 + запас).
+        audioBase64: z.string().min(1).max(14 * 1024 * 1024),
+        filename: z.string().min(1).max(255),
+      })
       .strict(),
     output: transcribeOutputSchema,
   },

@@ -222,6 +222,8 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
         send({ type: "final", text: "", engine: "silence" });
       } else {
         const text = await endSession();
+        // Сокет умер за время ожидания — фоллбэк на труп не звать.
+        if (state.torn) return;
         if (text !== null && text !== "") {
           send({ type: "final", text, engine: "gemini-live" });
         } else {
@@ -229,13 +231,16 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
           log(`live-voice: ${text === "" ? "empty transcript" : "session failure"} — WAV fallback`);
           try {
             const res = await deps.fallback(pcmToWav(pcm));
+            if (state.torn) return;
             if (res.ok) {
               send({ type: "final", text: res.text, engine: res.engine, degraded: true });
             } else {
               sendError(res.code, res.message);
             }
           } catch (e) {
-            sendError("request_failed", e instanceof Error ? e.message : String(e));
+            if (!state.torn) {
+              sendError("request_failed", e instanceof Error ? e.message : String(e));
+            }
           }
         }
       }
@@ -277,6 +282,8 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
         state.sock.close(CLOSE_INTERNAL, "config failed");
         return;
       }
+      // Сокет мог умереть за время await — сессию на трупе не поднимать.
+      if (state.torn) return;
       if (state.config.geminiKeys.length === 0) {
         sendError("no_keys", "no Gemini keys configured");
         state.sock.close(CLOSE_INTERNAL, "no keys");
