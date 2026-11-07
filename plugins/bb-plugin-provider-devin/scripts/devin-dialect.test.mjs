@@ -3,6 +3,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
+import { promises as fsPromises, mkdtempSync, readFileSync as readSync, statSync } from "node:fs";
+import path from "node:path";
+import { tmpdir } from "node:os";
+
+const fakeHome = mkdtempSync(path.join(tmpdir(), "devin-dialect-"));
+const fakeOs = { homedir: () => fakeHome };
 
 const code = readFileSync(new URL("../src/devin-dialect.js", import.meta.url), "utf8");
 const delegationPresentation = (args) => ({
@@ -10,11 +16,14 @@ const delegationPresentation = (args) => ({
   title: args.label,
   ...(args.detail === undefined ? {} : { detail: args.detail }),
 });
-const { devinClassifyToolCall, DEVIN_ACP_DIALECT } = new Function(
+const { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions } = new Function(
   "z",
   "delegationPresentation",
-  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT };`,
-)(z, delegationPresentation);
+  "fs",
+  "os",
+  "path2",
+  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions };`,
+)(z, delegationPresentation, fsPromises, fakeOs, path);
 
 // Реальное событие из bb (<thread> seq 2346), до выключения субагентов.
 const backgroundSubagent = {
@@ -64,4 +73,17 @@ test("read shell / exec / other tools stay generic", () => {
 test("dialect id", () => {
   assert.equal(DEVIN_ACP_DIALECT.id, "devin");
   assert.equal(typeof DEVIN_ACP_DIALECT.classifyToolCall, "function");
+});
+
+test("bb instructions persisted per thread, 0600, junk ids ignored", async () => {
+  persistDevinBbInstructions("thr_abc123", "RULES-TEXT");
+  persistDevinBbInstructions("../evil", "X");
+  persistDevinBbInstructions("thr_def456", undefined);
+  await new Promise((r) => setTimeout(r, 100));
+  const dir = path.join(fakeHome, ".local", "state", "bb-devin", "instructions");
+  const file = path.join(dir, "thr_abc123.md");
+  assert.equal(readSync(file, "utf8"), "RULES-TEXT");
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  const { readdirSync } = await import("node:fs");
+  assert.deepEqual(readdirSync(dir), ["thr_abc123.md"]);
 });

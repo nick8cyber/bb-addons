@@ -36,6 +36,17 @@ replaceOnce(
   "var DIALECT_IDS_BY_COMMAND = {\n",
   "var DIALECT_IDS_BY_COMMAND = {\n  devin: DEVIN_ACP_DIALECT.id,\n",
 );
+// Правила bb треда сохраняются в файл при создании ACP-сессии (новой и восстановленной).
+replaceOnce(
+  "  session = {\n    bbThreadId,\n    construction: params,\n",
+  "  persistDevinBbInstructions(bbThreadId, params.instructions);\n  session = {\n    bbThreadId,\n    construction: params,\n",
+);
+// devin-dialect.js пользуется модулями, которые мост уже импортирует под этими именами.
+for (const imp of ['import fs from "node:fs/promises";', 'import os from "node:os";', 'import path2 from "node:path";']) {
+  if (!code.includes(imp)) {
+    throw new Error(`SDK bridge no longer has: ${imp}`);
+  }
+}
 // Тот же контракт, что у delegationPresentation, должен существовать в SDK.
 if (!code.includes("function delegationPresentation(args)")) {
   throw new Error("delegationPresentation() not found in SDK bridge");

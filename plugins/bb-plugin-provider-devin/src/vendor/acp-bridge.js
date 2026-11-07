@@ -5397,6 +5397,21 @@ var DEVIN_ACP_DIALECT = {
   classifyToolCall: devinClassifyToolCall
 };
 
+// Правила bb для треда — в файл, чтобы хук Devin вернул их после сжатия контекста.
+// Мост отдаёт их агенту один раз текстом в первом сообщении сессии (у Claude и
+// Codex они в системной части каждого запроса), а сжатие Devin их выбрасывает.
+// Файл: ~/.local/state/bb-devin/instructions/<bbThreadId>.md (читает
+// ~/.config/devin/hooks/bb_instructions.py по BB_THREAD_ID).
+var DEVIN_BB_INSTRUCTIONS_DIR = path2.join(os.homedir(), ".local", "state", "bb-devin", "instructions");
+function persistDevinBbInstructions(bbThreadId, instructions) {
+  if (typeof instructions !== "string" || instructions.length === 0 || !/^thr_[a-z0-9]+$/u.test(bbThreadId)) {
+    return;
+  }
+  const file = path2.join(DEVIN_BB_INSTRUCTIONS_DIR, `${bbThreadId}.md`);
+  void fs.mkdir(DEVIN_BB_INSTRUCTIONS_DIR, { recursive: true, mode: 448 }).then(() => fs.writeFile(file, instructions, { mode: 384 })).catch(() => {
+  });
+}
+
 var DIALECTS_BY_ID = /* @__PURE__ */ new Map([
   [DEVIN_ACP_DIALECT.id, DEVIN_ACP_DIALECT],
   [CURSOR_ACP_DIALECT.id, CURSOR_ACP_DIALECT],
@@ -8782,6 +8797,7 @@ async function startAgentSession(request) {
       );
     }
   });
+  persistDevinBbInstructions(bbThreadId, params.instructions);
   session = {
     bbThreadId,
     construction: params,
