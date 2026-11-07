@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-voice-stt",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "private": true,
   "description": "Voice input for bb: Gemini Live STT with Codex and Groq fallbacks",

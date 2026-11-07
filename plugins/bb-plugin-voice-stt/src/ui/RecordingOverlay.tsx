@@ -7,7 +7,19 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useComposers, useSettings } from "@get-bb/plugin-sdk/app";
 
+import { MicGlyph } from "./MicGlyph.js";
 import { voiceRecorder, type ComposerTarget, type RecorderView } from "./recorder.js";
+
+type ComposerList = readonly (ComposerTarget & { scope?: { kind?: string } })[];
+
+/**
+ * Предпочитаем композер треда — «primary» на экране треда; иначе первый
+ * on-screen (new-thread, queued-message). Нет композеров — «no-target»:
+ * финал остаётся в оверлее с «копировать» (§3.1 п. 3–4).
+ */
+function resolveComposerTarget(list: ComposerList): ComposerTarget | null {
+  return list.find((c) => c.scope?.kind === "thread") ?? list[0] ?? null;
+}
 
 /**
  * Мост useComposers → синглтон: хуки недоступны из обычных функций,
@@ -16,16 +28,48 @@ import { voiceRecorder, type ComposerTarget, type RecorderView } from "./recorde
 function ComposersBridge() {
   const composers = useComposers();
   useEffect(() => {
-    const list = composers as readonly (ComposerTarget & { scope?: { kind?: string } })[];
-    voiceRecorder.setTargetResolver(
-      // Предпочитаем композер треда — «primary» на экране треда; иначе
-      // первый on-screen (new-thread, queued-message). Нет композеров —
-      // запись в «no-target» режиме, финал остаётся в оверлее (§3.1 п.3).
-      () => list.find((c) => c.scope?.kind === "thread") ?? list[0] ?? null,
-    );
+    voiceRecorder.setTargetResolver(() => resolveComposerTarget(composers as ComposerList));
     return () => voiceRecorder.setTargetResolver(null);
   }, [composers]);
   return null;
+}
+
+/**
+ * Плавающая кнопка живого ввода (§3.1 п. 4): оверлей смонтирован
+ * постоянно → видна и без открытого композера, включая мобильный
+ * клиент. Сидит на середине правого края — в стороне от композера,
+ * кнопки отправки и нижних панелей. Те же жесты, что у composer-
+ * кнопки; во время записи — кнопка стоп.
+ */
+function FloatingMic() {
+  const composers = useComposers();
+  const view = useSyncExternalStore(voiceRecorder.subscribe, voiceRecorder.getSnapshot);
+  const active = view.phase === "recording" || view.phase === "reconnecting";
+  return (
+    <button
+      type="button"
+      className={`vsl-fab${active ? " vsl-fab--active" : ""}${view.phase === "finishing" ? " vsl-fab--busy" : ""}`}
+      title={
+        active
+          ? "Завершить диктовку"
+          : "Живой ввод: удерживайте кнопку или нажмите для диктовки"
+      }
+      aria-label="Живой ввод"
+      aria-pressed={active}
+      onPointerDown={(e) => {
+        e.preventDefault();
+        voiceRecorder.pressStart(
+          resolveComposerTarget(composers as ComposerList),
+          e.nativeEvent.pointerId,
+        );
+      }}
+      onPointerUp={(e) => voiceRecorder.pressEnd(e.nativeEvent)}
+      onPointerCancel={(e) => voiceRecorder.pressEnd(e.nativeEvent)}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <MicGlyph size={22} />
+    </button>
+  );
 }
 
 /** Питание настройки liveInput в синглтон — выключает все входы (§7). */
@@ -51,6 +95,7 @@ const ENGINE_LABEL: Record<string, string> = {
 
 export function RecordingOverlay() {
   const view = useSyncExternalStore(voiceRecorder.subscribe, voiceRecorder.getSnapshot);
+  const { values } = useSettings();
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState(false);
 
@@ -67,6 +112,7 @@ export function RecordingOverlay() {
     <>
       <ComposersBridge />
       <SettingsBridge />
+      {values?.liveInput !== false && <FloatingMic />}
       {view.phase === "idle" ? null : (
         <div className="vsl-overlay" role="status" aria-live="polite">
           <div className={`vsl-card${view.ignorePulse % 2 === 1 ? " vsl-card--shake" : ""}`}>

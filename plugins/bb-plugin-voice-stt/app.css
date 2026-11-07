@@ -153,6 +153,52 @@
   background: var(--state-hover, var(--accent));
 }
 
+/*
+ * Плавающая кнопка живого ввода (§3.1 п. 4): оверлей смонтирован
+ * постоянно — кнопка видна без открытого композера, включая мобильный
+ * клиент. Середина правого края — в стороне от композера, кнопки
+ * отправки и нижних панелей.
+ */
+.vsl-fab {
+  position: fixed;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 60;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--primary, var(--accent));
+  color: var(--primary-foreground, var(--foreground));
+  box-shadow: var(--shadow-lg, 0 8px 24px rgb(0 0 0 / 0.3));
+  cursor: pointer;
+  transition:
+    transform 0.12s ease-out,
+    background 0.12s ease-out;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.vsl-fab:hover {
+  transform: translateY(-50%) scale(1.06);
+}
+.vsl-fab:active {
+  transform: translateY(-50%) scale(0.94);
+}
+.vsl-fab--active {
+  background: var(--destructive, #ef4444);
+  color: #fff;
+  border-color: transparent;
+  animation: vsl-pulse 1.2s ease-in-out infinite;
+}
+.vsl-fab--busy {
+  opacity: 0.8;
+}
+
 /* Кнопка в composer.actions — размеры под соседние кнопки композера. */
 .vsl-mic {
   display: inline-flex;
