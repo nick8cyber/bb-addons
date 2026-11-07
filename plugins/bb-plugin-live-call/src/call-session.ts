@@ -24,6 +24,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { ToolContext } from "./tools.js";
 import { fetchThreadMessages, formatMessageTime, formatThreadMessagesBlock, type ThreadMessage } from "./thread-messages.js";
 import { BrainCenter } from "./brain-center.js";
+import { ProjectBrain, resolveProjectBrainEnv, type BrainReadResult } from "./project-brain.js";
 import { McpClient, extractConfirmToken, inspectConnectorTool, isValidConnectorToolName, makeConnectorToolName, mcpSchemaToGeminiParameters, toGeminiSchema } from "./mcp-client.js";
 import { canonicalizeJson, ProjectRegistryManager, readProjectRepoConfig, resolveStrictClass, type ProjectConfig } from "./project-registry.js";
 import { isValidSecretValue, maskSecrets } from "./secret-filter.js";
@@ -154,6 +155,8 @@ export class CallSession extends EventEmitter {
   private ownerUtteranceTimer: NodeJS.Timeout | null = null;
   /** Мозговой центр звонка по треду (§12.11). */
   brain: BrainCenter | null = null;
+  /** Мозговой центр звонка по проекту (§15.9, ADR-0013). */
+  projectBrain: ProjectBrain | null = null;
   /** Мозговой центр ожидается (git-окружение треда) — для инструкции голоса. */
   private brainExpected = false;
   brainSummary: string | null = null;
@@ -487,6 +490,38 @@ export class CallSession extends EventEmitter {
       this.recordEvent( "call_started", { projectId: this.targetProjectId });
       this.nowUtc = new Date().toISOString();
       await this.initProjectConnectors(this.targetProjectId);
+      // §15.9: один мозговой центр на проектный звонок, запуск асинхронный —
+      // первое приветствие и простые чтения его не ждут. Звонок, завершившийся
+      // во время инициализации коннекторов, новый тред мозга не оставляет (ревью п. 5).
+      if (!this.ended) {
+      this.projectBrain = new ProjectBrain({
+        sdk: this.deps.sdk,
+        store: this.deps.store,
+        callId: this.deps.callId,
+        projectId: this.targetProjectId,
+        projectTitle: this.projectTitle ?? this.targetProjectId,
+        promptMd: this.repoPromptMd ?? undefined,
+        nowUtc: this.nowUtc,
+        readTools: this.projectConnectorTools
+          .filter((t) => t.isConnector && t.cls === "R" && !t.twoStep)
+          .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, mcpSchema: t.mcpInputSchema })),
+        executeRead: (tool, args, timeoutMs) => this.executeBrainRead(tool, args, timeoutMs),
+        recentContext: () => this.sanitizeTokens(this.ledger.handoverSummary()),
+        env: () => this.resolveProjectBrainEnv(),
+        callsProjectId: this.deps.callsProjectId,
+        storageDir: this.deps.storageDir ?? join(tmpdir(), "bb-live-call-brain"),
+        secretValues: Object.values(this.deps.projectSecrets ?? {}).filter(isValidSecretValue),
+        log: this.deps.log,
+      });
+      void this.projectBrain.start().then((id) => {
+        if (id || this.ended) return;
+        if (this.greeted) {
+          this.injectContextWhenQuiet(
+            "[СИСТЕМА] Справка: мозговой центр в этом звонке недоступен (brain_ask не работает). На аналитические вопросы отвечай, что глубокая проверка недоступна; простые чтения и подтверждаемые записи делай как обычно. Сам об этом не объявляй; скажи, только если владелец попросит мозговой центр или потребуется глубокая проверка.",
+          );
+        }
+      });
+      }
     } else {
       this.deps.store.startCall(this.deps.callId);
     }
@@ -712,6 +747,7 @@ export class CallSession extends EventEmitter {
           word: strictCls === "C" ? "да" : strictCls === "P" ? "разрешаю" : strictCls === "L" ? "запускай" : "",
           description: (t.description || `Ручка ${t.name} коннектора ${connCfg.id}`).slice(0, 1000),
           parameters: geminiParams,
+          mcpInputSchema: (t.inputSchema ?? undefined) as Record<string, unknown> | undefined,
           // §14.5, §16.7 п. 3: вслух — имя ручки и аргументы коротко, без «Подтверждаете?»
           // (эхо «подтверждаете» распознавалось как «подтверждаю» — ревью PLUG-113, C);
           // карточка — все аргументы полностью.
@@ -720,9 +756,10 @@ export class CallSession extends EventEmitter {
             `${t.name} (${connCfg.id})\n${Object.entries(args ?? {})
               .map(([k, v]) => `${k} = ${typeof v === "object" && v !== null ? JSON.stringify(v) : String(v)}`)
               .join("\n")}`,
-          execute: async (args: Record<string, unknown>, ctx: ToolContext) => {
+          execute: async (args: Record<string, unknown>, ctx: ToolContext, opts?: { timeoutMs?: number }) => {
             const startMs = Date.now();
-            const res = await client.callTool(t.name, args, 30_000);
+            // Не больше 30 с и не больше оставшегося бюджета вопроса мозга (§15.9 §3).
+            const res = await client.callTool(t.name, args, Math.min(30_000, Math.max(1, opts?.timeoutMs ?? 30_000)));
             const ms = Date.now() - startMs;
             this.recordEvent( "connector_call", {
               connector: connCfg.id,
@@ -745,11 +782,13 @@ export class CallSession extends EventEmitter {
                 data: res.data ?? { result: "" },
                 confirm_token: token,
                 previewText,
+                ...(res.truncated ? { truncated: true } : {}),
               };
             }
             return {
               ok: true,
               data: res.data ?? { result: "" },
+              ...(res.truncated ? { truncated: true } : {}),
             };
           },
         };
@@ -760,6 +799,68 @@ export class CallSession extends EventEmitter {
     if (connectorResults.length > 0) {
       this.recordEvent( "project_context", { connectors: connectorResults });
     }
+  }
+
+  /**
+   * Источник окружения мозга проектного звонка (§15.9 §2): default source проекта
+   * из SDK, метаданные окружения на hostId источника; локальные проверки — только
+   * при совпадении hostId с хостом сервера.
+   */
+  private async resolveProjectBrainEnv() {
+    let localHostId = "";
+    try {
+      const sys = (await (this.deps.sdk as unknown as { system: { config(): Promise<{ primaryHostId?: string }> } }).system.config()) as {
+        primaryHostId?: string;
+      };
+      localHostId = sys?.primaryHostId ?? "";
+    } catch {
+      localHostId = "";
+    }
+    if (!this.targetProjectId) return { kind: "unavailable" as const, reason: "нет целевого проекта" };
+    return resolveProjectBrainEnv({
+      sdk: this.deps.sdk,
+      projectId: this.targetProjectId,
+      localHostId,
+      fallbackProjectId: this.deps.callsProjectId,
+    });
+  }
+
+  /**
+   * Чтение коннектора для моста мозга (§15.9 §3): только объявленная ручка этого
+   * проекта, isConnector, итоговый класс R, не twoStep. Тот же MCP-клиент, фильтр
+   * секретов, предел ответа и журнал connector_call — через execute ручки; мозгу
+   * уходит только ограниченный маскированный результат и признак truncated.
+   */
+  private async executeBrainRead(tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<BrainReadResult> {
+    const startMs = Date.now();
+    const def = this.projectConnectorTools.find((t) => t.name === tool && t.isConnector && t.cls === "R" && !t.twoStep);
+    if (!def) {
+      return { ok: false, error: { code: "tool_not_allowed", message: "инструмент недоступен мозгу" }, ms: Date.now() - startMs };
+    }
+    let timer: NodeJS.Timeout | null = null;
+    const res = await Promise.race([
+      def.execute(args, this.toolContext(), { timeoutMs }),
+      new Promise<never>((_, rej) => {
+        timer = setTimeout(() => rej(new Error("timeout")), Math.max(1, timeoutMs));
+      }),
+    ])
+      .catch((e) => ({
+        ok: false as const,
+        error: { code: /timeout/i.test(String(e)) ? "timeout" : "connector_error", message: "таймаут чтения коннектора" },
+      }))
+      .finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    const ms = Date.now() - startMs;
+    if (!res.ok) {
+      const code = "error" in res ? res.error.code : "connector_error";
+      const message = maskSecrets(("error" in res ? res.error.message : "ошибка чтения").slice(0, 300), Object.values(this.deps.projectSecrets ?? {}).filter(isValidSecretValue));
+      return { ok: false, error: { code, message }, ms };
+    }
+    const data = res.data;
+    const result =
+      data && typeof data === "object" && "result" in data ? String((data as { result: unknown }).result) : JSON.stringify(data ?? null);
+    return { ok: true, result, truncated: res.truncated === true, ms };
   }
 
   private resolveTool(name: string): ToolDef | undefined {
@@ -778,7 +879,7 @@ export class CallSession extends EventEmitter {
           nowUtc: this.nowUtc,
           memory: this.promptContext.memory,
           failedConnectors: this.failedConnectorIds.length > 0 ? this.failedConnectorIds : undefined,
-          availableTools: this.projectConnectorTools.map((t) => t.name),
+          availableTools: [...this.projectConnectorTools.map((t) => t.name), "brain_ask"],
         })
       : this.targetThreadId
         ? threadVoiceInstruction({
@@ -878,6 +979,7 @@ export class CallSession extends EventEmitter {
       targetProjectId: this.targetProjectId ?? undefined,
       threadMessages: this.threadMessages,
       brain: this.brain ?? undefined,
+      projectBrain: this.projectBrain ?? undefined,
       isTargetThreadActive: async () => {
         if (!this.targetThreadId) return false;
         const res = (await this.deps.sdk.threads.get({ threadId: this.targetThreadId }).catch(() => null)) as unknown as {
@@ -1195,11 +1297,14 @@ export class CallSession extends EventEmitter {
       client.sendToolResponse(call.id, result, "WHEN_IDLE", call.name);
       if (!result.ok && "error" in result) {
         this.lastFailedTool = call.name;
-        // Для ручек коннектора аргументы в журнал не пишутся (§15.5, §16.7 п. 4, review п. 4)
+        // Для ручек коннектора аргументы в журнал не пишутся (§15.5, §16.7 п. 4, review п. 4);
+        // для brain_ask в проектном звонке — ни args, ни исходный вопрос (§15.9 §5);
+        // в звонке по треду args пишутся как раньше (маскированные).
         const isConnectorTool = this.projectConnectorTools.some((t) => t.name === def.name);
+        const noArgs = isConnectorTool || (def.name === "brain_ask" && Boolean(this.targetProjectId));
         this.recordEvent( "tool_error", {
           tool: def.name,
-          ...(isConnectorTool ? {} : { args: call.args }),
+          ...(noArgs ? {} : { args: call.args }),
           code: result.error.code,
           message: maskSecrets(result.error.message.slice(0, 300), Object.values(this.deps.projectSecrets ?? {}).filter(isValidSecretValue)),
         });
@@ -1980,6 +2085,17 @@ export class CallSession extends EventEmitter {
     if (brain) {
       try {
         await brain.archive();
+      } catch (e) {
+        this.recordEvent( "brain_archive_failed", {
+          error: String((e as { message?: unknown })?.message ?? e),
+        });
+      }
+    }
+    const projectBrain = this.projectBrain;
+    this.projectBrain = null;
+    if (projectBrain) {
+      try {
+        await projectBrain.archive();
       } catch (e) {
         this.recordEvent( "brain_archive_failed", {
           error: String((e as { message?: unknown })?.message ?? e),
