@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { listInputs, loadMicChoice, pickInput, saveMicChoice, type MicChoice } from "./capture.js";
+import { voiceRecorder } from "./recorder.js";
 
 const TEST_MS = 4000;
 
@@ -51,6 +52,7 @@ export function MicSettings() {
   };
 
   const select = (deviceId: string): void => {
+    voiceRecorder.releaseMic(); // тёплый микрофон на старом устройстве — гасим
     if (deviceId === "auto") {
       saveMicChoice(null);
       setChoice(null);

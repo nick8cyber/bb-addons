@@ -17,7 +17,7 @@ import {
   saveFabRatio,
   type FabRatio,
 } from "./fabPosition.js";
-import { voiceRecorder, type ComposerTarget, type RecorderView } from "./recorder.js";
+import { DEFAULT_WARM_MS, voiceRecorder, type ComposerTarget, type RecorderView } from "./recorder.js";
 
 type ComposerList = readonly (ComposerTarget & { scope?: { kind?: string } })[];
 
@@ -281,9 +281,10 @@ function FloatingMic() {
         } else if (!active) {
           setPressed(true);
           voiceRecorder.wake(); // AudioContext в жесте (iOS) — дёшево, без микрофона
+          const touchAt = Date.now();
           g.primeTimer = setTimeout(() => {
             g.primeTimer = null;
-            if (gesture.current === g && g.mode === "pending") voiceRecorder.prime();
+            if (gesture.current === g && g.mode === "pending") voiceRecorder.prime(touchAt);
           }, PRIME_DELAY_MS);
           const pointerId = e.nativeEvent.pointerId;
           g.timer = setTimeout(() => {
@@ -344,6 +345,10 @@ function SettingsBridge() {
   useEffect(() => {
     voiceRecorder.setLiveEnabled(enabled);
   }, [enabled]);
+  const warm = values?.micWarmSeconds;
+  useEffect(() => {
+    voiceRecorder.setWarmMs(typeof warm === "number" ? warm * 1000 : DEFAULT_WARM_MS);
+  }, [warm]);
   return null;
 }
 

@@ -19,6 +19,8 @@ const MAX_RECORD_MS = 5 * 60_000;
 const READY_TIMEOUT_MS = 5_000;
 const RECONNECT_TIMEOUT_MS = 5_000;
 const DONE_DISMISS_MS = 1_600;
+/** По умолчанию микрофон остаётся тёплым 30 с после записи. */
+export const DEFAULT_WARM_MS = 30_000;
 /** Вачдог финала (§4.4/§5): settle ≤6 c + фоллбэк codex→groq ≤30 c + запас. */
 const FINAL_TIMEOUT_MS = 40_000;
 
@@ -166,6 +168,12 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   const listenPagehide = deps.listenPagehide ?? typeof window !== "undefined";
 
   let view: RecorderView = { ...IDLE_VIEW };
+  if (listenPagehide && typeof document !== "undefined") {
+    // Ушли со вкладки/из приложения — тёплый микрофон гасим (приватность, iOS всё равно отнимет).
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden" && view.phase === "idle") capture.stop();
+    });
+  }
   const listeners = new Set<Listener>();
   const patch = (next: Partial<RecorderView>): void => {
     view = { ...view, ...next };
@@ -271,6 +279,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   };
   const onPageHide = (): void => {
     recorder.cancel("pagehide");
+    capture.stop();
   };
 
   /**
@@ -293,7 +302,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   };
   const onCaptureEvent = (ev: CaptureEvent): void => {
     const live = view.phase === "recording" || view.phase === "reconnecting";
-    if (!live && standby === null) return;
+    if (!live && !standbyOn) return;
     if (!live) {
       // Предзахват: только в лог (уйдёт после hello), без плашки.
       if (ev.kind === "started") sendDiag(`mic started (pre-roll): ${ev.info}`);
@@ -320,7 +329,15 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
    * уходит в начало записи, если переносом — всё гасится. Включение
    * микрофона на iOS ~0.5–1 с — так оно идёт параллельно с жестом.
    */
+  /** Тёплый микрофон после записи (мс); 0 — выключать сразу. */
+  let warmMs = DEFAULT_WARM_MS;
   let standby: Promise<void> | null = null;
+  /**
+   * Предзахват включён — ставится ДО capture.start: тёплый микрофон отдаёт
+   * кольцо «до нажатия» синхронно внутри start, раньше чем start вернёт
+   * промис; без флага эти чанки терялись.
+   */
+  let standbyOn = false;
   let standbyError: unknown = null;
   let preroll: Uint8Array[] = [];
   let prerollBytes = 0;
@@ -341,7 +358,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     // Поздний чанк после cancel/stop — не запись: generation-гард в
     // capture не пускает поток, это вторая линия (блокер «сирота»).
     if (firstAudioAt === 0) firstAudioAt = now();
-    if (view.phase === "idle" && standby !== null) {
+    if (view.phase === "idle" && standbyOn) {
       preroll.push(bytes);
       prerollBytes += bytes.byteLength;
       while (prerollBytes > PREROLL_MAX_BYTES && preroll.length > 1) {
@@ -386,8 +403,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         // уже закрыт
       }
     }
-    capture.stop();
+    capture.park(warmMs); // тёплый микрофон — следующая запись стартует мгновенно
     standby = null;
+    standbyOn = false;
     preroll = [];
     prerollBytes = 0;
   };
@@ -671,7 +689,23 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     /** Питание настройки liveInput — выключает все входы разом (§7). */
     setLiveEnabled(enabled: boolean): void {
       liveEnabled = enabled;
-      if (!enabled && view.phase !== "idle") recorder.cancel("live input disabled");
+      if (!enabled) {
+        if (view.phase !== "idle") recorder.cancel("live input disabled");
+        capture.stop();
+      }
+    },
+    /** Сколько держать микрофон тёплым после записи (настройка micWarmSeconds). */
+    setWarmMs(ms: number): void {
+      warmMs = Number.isFinite(ms) ? Math.max(0, Math.min(ms, 600_000)) : DEFAULT_WARM_MS;
+      if (warmMs === 0 && view.phase === "idle") capture.stop();
+    },
+    /** Выключить тёплый микрофон (смена устройства в настройках). */
+    releaseMic(): void {
+      if (view.phase === "idle") {
+        standby = null;
+        standbyOn = false;
+        capture.stop();
+      }
     },
     isLiveEnabled(): boolean {
       return liveEnabled;
@@ -699,16 +733,17 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       if (view.phase === "idle") capture.unlock();
     },
     /** Касание держится без сдвига — поднимаем микрофон заранее (pre-roll). */
-    prime(): void {
+    prime(touchAt?: number): void {
       if (view.phase !== "idle") return;
       capture.unlock(); // идемпотентно
       if (standby !== null) return;
-      pressAt = now();
+      pressAt = touchAt ?? now(); // задержку считаем от самого касания
       firstAudioAt = 0;
       diagQueue = [];
       preroll = [];
       prerollBytes = 0;
       standbyError = null;
+      standbyOn = true;
       standby = capture.start(onMicChunk, onCaptureEvent).catch((e: unknown) => {
         standbyError = e;
       });
@@ -716,8 +751,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     /** Касание оказалось переносом — предзахват и контекст гасим. */
     unprime(): void {
       if (view.phase !== "idle") return;
-      capture.stop();
+      capture.park(warmMs); // перенос — тёплый микрофон не гасим
       standby = null;
+      standbyOn = false;
       preroll = [];
       prerollBytes = 0;
     },
@@ -744,6 +780,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       // Предзахват уже идёт — его звук становится началом записи.
       const sb = standby;
       standby = null;
+      standbyOn = false;
       pcm = sb !== null ? preroll : [];
       preroll = [];
       prerollBytes = 0;
@@ -845,7 +882,7 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     stop(): void {
       if (view.phase !== "recording" && view.phase !== "reconnecting") return;
       patch({ phase: "finishing", notice: "обработка…", holdArmed: false });
-      capture.stop(); // отпустили — микрофон больше не пишем
+      capture.park(warmMs); // отпустили — в запись больше не пишем, микрофон тёплый
       const a = attempt;
       if (a && !a.dead && a.helloSent && a.sock?.readyState === SOCK_OPEN) {
         sendJson(a, { type: "end" });

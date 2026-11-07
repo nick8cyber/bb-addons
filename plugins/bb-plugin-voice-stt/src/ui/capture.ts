@@ -13,7 +13,7 @@ class VoiceSttCapture extends AudioWorkletProcessor {
   constructor() {
     super();
     this.ratio = sampleRate / 16000;
-    this.buffer = new Float32Array(1600);
+    this.buffer = new Float32Array(800); // 50 мс при 16 кГц — первый звук раньше
     this.filled = 0;
     this.pos = 0;
   }
@@ -46,9 +46,28 @@ export type CaptureEvent =
   | { kind: "restarted"; info: string }
   | { kind: "failed"; reason: string };
 
+/** Один blob-URL модуля на страницу — не пересоздаём на каждую запись. */
+let workletUrl: string | null = null;
+function getWorkletUrl(): string {
+  if (workletUrl === null) {
+    workletUrl = URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" }));
+  }
+  return workletUrl;
+}
+
+/** Сколько звука до нажатия держит тёплый микрофон (≈0.5 с PCM16 16 кГц). */
+const RING_MAX_BYTES = 16_000;
+
 export interface MicCaptureLike {
   /** Синхронно создать и разбудить AudioContext — вызывать из pointer-обработчика. */
   unlock(): void;
+  /**
+   * Конец записи без выключения микрофона: цепочка живёт ms миллисекунд
+   * («тёплый» микрофон), звук идёт только в кольцевой буфер ~0.5 с в
+   * памяти и никуда не отправляется. Следующий start подхватывает
+   * работающий микрофон мгновенно. ms ≤ 0 — то же, что stop().
+   */
+  park(ms: number): void;
   /** Поднять getUserMedia + цепочку захвата; чанки идут в onChunk. */
   start(
     onChunk: (pcm: Uint8Array, level: number) => void,
@@ -220,6 +239,11 @@ export class MicCapture implements MicCaptureLike {
   private badDevices = new Set<string>();
   private currentDeviceId: string | null = null;
   private soundSeen = false;
+  private parked = false;
+  private parkTimer: ReturnType<typeof setTimeout> | null = null;
+  private ring: Uint8Array[] = [];
+  private ringBytes = 0;
+  private info = "";
 
   /** iOS: AudioContext живёт, только если создан и запущен прямо в нажатии. */
   unlock(): void {
@@ -249,6 +273,29 @@ export class MicCapture implements MicCaptureLike {
     onChunk: (pcm: Uint8Array, level: number) => void,
     onEvent?: (ev: CaptureEvent) => void,
   ): Promise<void> {
+    this.clearParkTimer();
+    if (this.parked) {
+      this.parked = false;
+      if (this.alive()) {
+        // Тёплый микрофон: подхватываем без getUserMedia, плюс ~0.5 с звука до нажатия.
+        this.onChunk = onChunk;
+        this.onEvent = onEvent ?? (() => {});
+        this.restarts = 0;
+        this.badDevices = new Set();
+        const pre = this.ring;
+        this.ring = [];
+        this.ringBytes = 0;
+        void this.ctx?.resume().catch(() => {});
+        const t = performance.now();
+        this.lastFrameAt = t;
+        this.lastSoundAt = t;
+        for (const chunk of pre) onChunk(chunk, 0);
+        this.onEvent({ kind: "started", info: `warm, ${pre.length} chunks before press; ${this.info}` });
+        this.armWatch(this.generation);
+        return;
+      }
+      this.stop(); // остыл/умер (фон, чужой захват) — холодный старт
+    }
     this.onChunk = onChunk;
     this.onEvent = onEvent ?? (() => {});
     this.restarts = 0;
@@ -256,6 +303,7 @@ export class MicCapture implements MicCaptureLike {
     const gen = this.generation;
     const info = await this.open(gen);
     if (info === null) return;
+    this.info = info;
     this.onEvent({ kind: "started", info });
     this.armWatch(gen);
   }
@@ -270,6 +318,15 @@ export class MicCapture implements MicCaptureLike {
   private async open(gen: number): Promise<string | null> {
     const stale = (): boolean => gen !== this.generation;
     const base = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
+    // Модуль обработки грузим параллельно с включением микрофона (контекст из жеста уже есть).
+    const preCtx = this.ctx !== null && this.ctx.state !== "closed" ? this.ctx : null;
+    const preModule =
+      preCtx?.audioWorklet !== undefined
+        ? preCtx.audioWorklet.addModule(getWorkletUrl()).then(
+            () => true,
+            () => false,
+          )
+        : null;
     let choice = await pickInput(this.badDevices);
     let stream: MediaStream;
     try {
@@ -366,6 +423,17 @@ export class MicCapture implements MicCaptureLike {
       }
       const t = performance.now();
       this.lastFrameAt = t;
+      if (this.parked) {
+        // Тёплый микрофон между записями: только кольцо в памяти, никуда не уходит.
+        const chunk = new Uint8Array(i16.buffer);
+        this.ring.push(chunk);
+        this.ringBytes += chunk.byteLength;
+        while (this.ringBytes > RING_MAX_BYTES && this.ring.length > 1) {
+          this.ringBytes -= this.ring[0].byteLength;
+          this.ring.shift();
+        }
+        return;
+      }
       if (peak > 0) {
         this.lastSoundAt = t;
         // Звук пошёл — запоминаем устройство как рабочее (на десктопе).
@@ -381,9 +449,11 @@ export class MicCapture implements MicCaptureLike {
     let path = "worklet";
     try {
       if (!ctx.audioWorklet) throw new Error("AudioWorklet недоступен");
-      await ctx.audioWorklet.addModule(
-        URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" })),
-      );
+      if (preModule !== null && preCtx === ctx) {
+        if (!(await preModule)) throw new Error("worklet load failed");
+      } else {
+        await ctx.audioWorklet.addModule(getWorkletUrl());
+      }
       if (stale()) {
         stream.getTracks().forEach((t) => t.stop());
         return null;
@@ -514,8 +584,50 @@ export class MicCapture implements MicCaptureLike {
     this.stream = null;
   }
 
+  park(ms: number): void {
+    this.clearWatch();
+    this.clearParkTimer();
+    if (ms <= 0 || !this.alive()) {
+      this.stop();
+      return;
+    }
+    this.parked = true;
+    this.onChunk = null;
+    this.ring = [];
+    this.ringBytes = 0;
+    this.parkTimer = setTimeout(() => {
+      this.parkTimer = null;
+      if (this.parked) this.stop();
+    }, ms);
+  }
+
+  /** Цепочка жива: поток активен, дорожка live, контекст не закрыт. */
+  private alive(): boolean {
+    const track = this.stream?.getAudioTracks()[0];
+    return (
+      this.stream !== null &&
+      this.stream.active &&
+      track !== undefined &&
+      track.readyState === "live" &&
+      this.ctx !== null &&
+      this.ctx.state !== "closed" &&
+      this.captureNode !== null
+    );
+  }
+
+  private clearParkTimer(): void {
+    if (this.parkTimer !== null) {
+      clearTimeout(this.parkTimer);
+      this.parkTimer = null;
+    }
+  }
+
   stop(): void {
     this.generation += 1;
+    this.clearParkTimer();
+    this.parked = false;
+    this.ring = [];
+    this.ringBytes = 0;
     this.clearWatch();
     this.restarting = false;
     this.closePipeline(true);

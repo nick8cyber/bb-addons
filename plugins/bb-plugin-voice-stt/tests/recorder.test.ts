@@ -52,13 +52,22 @@ class FakeCapture implements MicCaptureLike {
   unlock(): void {
     this.unlocked += 1;
   }
+  /** Тёплый микрофон: сколько чанков «до нажатия» отдать синхронно внутри start. */
+  syncEmit = 0;
   async start(onChunk: (pcm: Uint8Array, level: number) => void): Promise<void> {
     this.started += 1;
     this.cb = onChunk;
+    for (let i = 0; i < this.syncEmit; i++) onChunk(new Uint8Array(1600).fill(2), 0);
     if (this.gate !== null) await this.gate;
   }
   stop(): void {
     this.stopped += 1;
+    this.cb = null;
+  }
+  parked = 0;
+  park(): void {
+    // Тёплый микрофон: в запись больше не пишем (как у MicCapture).
+    this.parked += 1;
     this.cb = null;
   }
   emit(bytes = 3200): void {
@@ -321,16 +330,42 @@ describe("voiceRecorder (§3.3, §9)", () => {
     r.recorder.cancel();
   });
 
-  it("pre-roll: перенос (unprime) гасит микрофон, звук никуда не уходит", async () => {
+  it("pre-roll: перенос (unprime) отцепляет микрофон (тёплый), звук никуда не уходит", async () => {
     const r = makeRecorder();
     r.recorder.prime();
     r.capture.emit();
     r.recorder.unprime();
-    expect(r.capture.stopped).toBe(1);
+    expect(r.capture.parked).toBe(1);
     r.recorder.pressStart(new FakeComposer(), 1);
     expect(r.capture.started).toBe(2); // новая запись — новый захват, без старого pre-roll
     const sock = await openWithHello(r);
     expect(sock.binary()).toHaveLength(0);
+    r.recorder.cancel();
+  });
+
+  it("тёплый микрофон: конец записи паркует захват; warm=0 и releaseMic — выключают", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 1);
+    await openWithHello(r);
+    r.recorder.stop();
+    expect(r.capture.parked).toBeGreaterThanOrEqual(1);
+    expect(r.capture.stopped).toBe(0);
+    r.recorder.cancel();
+    const before = r.capture.stopped;
+    r.recorder.setWarmMs(0);
+    expect(r.capture.stopped).toBe(before + 1);
+    r.recorder.releaseMic();
+    expect(r.capture.stopped).toBe(before + 2);
+  });
+
+  it("тёплый микрофон: кольцо «до нажатия», отданное синхронно в start, попадает в запись", async () => {
+    const r = makeRecorder();
+    r.capture.syncEmit = 3;
+    r.recorder.prime();
+    r.recorder.pressStart(new FakeComposer(), 1, { hold: true });
+    expect(r.recorder.getSnapshot().micLive).toBe(true);
+    const sock = await openWithHello(r);
+    expect(sock.binary()).toHaveLength(3);
     r.recorder.cancel();
   });
 

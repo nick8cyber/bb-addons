@@ -103,6 +103,13 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Кнопка/команда/оверлей живого режима (спека voice-stt-live §7). Файловый сервис не трогает.",
       default: true,
     },
+    micWarmSeconds: {
+      type: "number",
+      label: "Тёплый микрофон, сек",
+      description:
+        "Сколько секунд микрофон остаётся включённым после диктовки — следующая запись стартует мгновенно и захватывает ~0.5 с до нажатия. Звук между записями никуда не отправляется. 0 — выключать сразу.",
+      default: 30,
+    },
     vocabularyTerms: {
       type: "string",
       label: "Словарь живого ввода",
