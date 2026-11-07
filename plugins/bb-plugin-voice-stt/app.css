@@ -240,7 +240,7 @@
     max-width: none;
     transform: none;
   }
-  .vsl-close {
+  .vsl-overlay .vsl-close {
     min-width: 44px;
     min-height: 44px;
     margin: -10px -8px -10px auto;
