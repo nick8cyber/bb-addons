@@ -35,6 +35,23 @@
   padding: 10px 12px;
   animation: vsl-in 0.16s ease-out;
 }
+.vsl-card--tap {
+  display: block;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.vsl-card--tap:active {
+  background: var(--state-hover, var(--accent));
+}
+.vsl-card--tap > .vsl-interim,
+.vsl-card--tap > .vsl-hint {
+  display: block;
+}
 @keyframes vsl-in {
   from {
     opacity: 0;
@@ -109,22 +126,6 @@
   padding: 0 8px;
 }
 
-.vsl-close {
-  margin-left: auto;
-  border: none;
-  background: transparent;
-  font-size: 16px;
-  line-height: 1;
-  padding: 2px 6px;
-  border-radius: 6px;
-  cursor: pointer;
-  color: var(--muted-foreground);
-}
-.vsl-close:hover {
-  background: var(--state-hover, var(--accent));
-  color: var(--foreground);
-}
-
 .vsl-interim {
   margin-top: 8px;
   max-height: 96px;
@@ -137,40 +138,6 @@
   font-size: 11px;
   color: var(--muted-foreground);
 }
-.vsl-actions {
-  margin-top: 8px;
-  display: flex;
-  gap: 8px;
-}
-.vsl-btn {
-  border: 1px solid var(--border);
-  background: var(--background);
-  border-radius: 6px;
-  padding: 3px 10px;
-  cursor: pointer;
-}
-.vsl-btn:hover {
-  background: var(--state-hover, var(--accent));
-}
-.vsl-overlay .vsl-btn--primary {
-  background: var(--primary, var(--accent));
-  color: var(--primary-foreground, var(--foreground));
-  border-color: transparent;
-}
-.vsl-overlay .vsl-btn--primary:hover {
-  background: var(--primary, var(--accent));
-  opacity: 0.9;
-}
-/* Кнопки записи — крупные мишени под палец (мобильный клиент без клавиатуры). */
-.vsl-actions--record {
-  gap: 10px;
-}
-.vsl-actions--record .vsl-btn {
-  flex: 1;
-  min-height: 36px;
-  font-weight: 600;
-}
-
 /*
  * Плавающая кнопка живого ввода (§3.1 п. 4): оверлей смонтирован
  * постоянно — кнопка видна без открытого композера, включая мобильный
@@ -228,36 +195,44 @@
 }
 
 /*
- * Узкий экран (мобильный клиент): карточка не заходит в правую колонку
- * FAB — при открытой клавиатуре окно низкое, и карточка во всю ширину
- * ложилась поверх кнопки стоп (§3.2). Мишени ≥ 44 px.
+ * Узкий экран (мобильный клиент): плашка во всю ширину, крупный текст —
+ * вся плашка мишень тапа (§3.2). FAB выше по z-index — стоп доступен и
+ * когда плашка под ним.
  */
 @media (max-width: 640px) {
   .vsl-overlay {
-    left: 12px;
-    right: 76px;
-    width: auto;
-    max-width: none;
-    transform: none;
+    font-size: 16px;
   }
-  .vsl-overlay .vsl-close {
-    min-width: 44px;
-    min-height: 44px;
-    margin: -10px -8px -10px auto;
-    font-size: 20px;
+  .vsl-card--tap {
+    padding: 14px 16px;
+    min-height: 64px;
   }
-  .vsl-actions--record .vsl-btn {
-    min-height: 44px;
+  .vsl-interim {
+    max-height: 160px;
+  }
+  .vsl-hint {
+    font-size: 13px;
   }
 }
 
-/* Кнопка в composer.actions — размеры под соседние кнопки композера. */
+/*
+ * Одна кнопка вместо нативной (§3.1): нативный микрофон композера скрыт,
+ * пока живой ввод включён. Селектор по data-icon="Mic" — не зависит от
+ * локализации (bb-plugin-ru переводит aria-label).
+ */
+html[data-vsl-live] [data-promptbox-standard-actions] > span:has(> button > svg[data-icon="Mic"]),
+html[data-vsl-live] [data-promptbox-standard-actions] > button:has(> svg[data-icon="Mic"]) {
+  display: none !important;
+}
+
+/* Кнопка в composer.actions — на месте нативной (контейнер хоста h-9). */
 .vsl-mic {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 36px;
+  height: 36px;
+  padding: 0;
   border: none;
   border-radius: 6px;
   background: transparent;

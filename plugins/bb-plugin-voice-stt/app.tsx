@@ -2,8 +2,8 @@
  * Фронтенд voice-stt — живой голосовой ввод (спека voice-stt-live §3).
  *
  * Точки входа (все ведут в один recording singleton):
- * - плавающая кнопка (FAB) в appOverlay — видна без открытого композера,
- *   основной вход, работает и на мобильном клиенте (§3.1 п. 4);
+ * - плавающая кнопка (FAB) в appOverlay — только когда композер свёрнут
+ *   (мобильный клиент), §3.1 п. 4;
  * - composer.actions: кнопка микрофона (все scope'ы; в compact-режиме хост
  *   actions не рисует — покрыто FAB, командой и футером);
  * - composer-команда «Voice STT Live: диктовка» + Mod+Shift/V — получает
@@ -11,15 +11,17 @@
  * - experimental_sidebarFooter «Диктовка» — цель резолвится через
  *   useComposers() в оверлее.
  *
- * Нативную кнопку не скрываем (§3.1): две кнопки сосуществуют, наша — с
- * другой иконкой и подсказкой «Живой ввод».
+ * Одна кнопка на экране (§3.1): нативный микрофон скрыт CSS по
+ * data-icon="Mic" (не зависит от локализации), пока liveInput включён;
+ * FAB показывается только когда композер свёрнут (нашей кнопки нет).
  */
 import "./app.css";
 import { definePluginApp, useComposer, useSettings } from "@get-bb/plugin-sdk/app";
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 
 import { MicGlyph } from "./src/ui/MicGlyph.js";
 import { RecordingOverlay } from "./src/ui/RecordingOverlay.js";
+import { micPresence } from "./src/ui/micPresence.js";
 import { voiceRecorder } from "./src/ui/recorder.js";
 
 const MIC_ICON = "voice-stt/mic";
@@ -32,7 +34,10 @@ function LiveMicAction() {
   const composer = useComposer();
   const { values } = useSettings();
   const view = useSyncExternalStore(voiceRecorder.subscribe, voiceRecorder.getSnapshot);
-  if (values?.liveInput === false) return null;
+  const enabled = values?.liveInput !== false;
+  // Пока кнопка в композере видна — FAB скрыт: одна кнопка на экране.
+  useEffect(() => (enabled ? micPresence.mount() : undefined), [enabled]);
+  if (!enabled) return null;
   const active = view.phase === "recording" || view.phase === "reconnecting";
   return (
     <button
@@ -53,7 +58,7 @@ function LiveMicAction() {
       onPointerCancel={(e) => voiceRecorder.pressEnd(e.nativeEvent)}
       onContextMenu={(e) => e.preventDefault()}
     >
-      <MicGlyph />
+      <MicGlyph size={18} />
     </button>
   );
 }
