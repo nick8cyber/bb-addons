@@ -45,7 +45,7 @@ const FINISH_POLL_MS = 80;
 const CUSTOM_VOCABULARY_LIMIT = 1_000;
 
 /** Сообщение «Check the transcription API key» — отказ до setupComplete (§6.3). */
-const PRE_SETUP_FAILURE_MESSAGE =
+export const PRE_SETUP_FAILURE_MESSAGE =
   "Could not connect to Gemini live transcription. Check the transcription API key.";
 
 /** Минимальный сокет для сессии — DOM WebSocket Node 22 удовлетворяет ему. */
@@ -208,7 +208,7 @@ const AUTH_ERROR_RE =
 const QUOTA_ERROR_RE = /resource.?exhausted|quota|rate.?limit|\b429\b/i;
 const UNAVAILABLE_RE = /unavailable|overloaded|\b5\d\d\b|INTERNAL\b/i;
 
-function classifyGeminiError(message: string): FailureCode {
+export function classifyGeminiError(message: string): FailureCode {
   if (QUOTA_ERROR_RE.test(message)) return "rate_limited";
   if (AUTH_ERROR_RE.test(message)) return "auth_required";
   if (UNAVAILABLE_RE.test(message)) return "service_unavailable";

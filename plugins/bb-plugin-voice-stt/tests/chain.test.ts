@@ -108,6 +108,41 @@ describe("runTranscribeChain (§5)", () => {
     expect(geminiCalls).toEqual([]);
   });
 
+  it("skipStages [gemini-live] goes straight to codex without ffmpeg or gemini (§4.5)", async () => {
+    const calls: string[] = [];
+    const result = await runTranscribeChain(
+      baseInput({ skipStages: ["gemini-live"] }),
+      ctx,
+      okDeps({
+        decodePcm: async () => {
+          calls.push("decode");
+          return Buffer.alloc(6400, 1);
+        },
+        gemini: async () => {
+          calls.push("gemini");
+          return "no";
+        },
+        codex: async () => "codex text",
+      }),
+    );
+    expect(result).toEqual({ ok: true, text: "codex text", engine: "codex" });
+    expect(calls).toEqual([]);
+  });
+
+  it("skipStages [gemini-live, codex] lands on groq", async () => {
+    const result = await runTranscribeChain(
+      baseInput({ skipStages: ["gemini-live", "codex"] }),
+      ctx,
+      okDeps({
+        codex: async () => {
+          throw new Error("must not run");
+        },
+        groq: async () => "groq text",
+      }),
+    );
+    expect(result).toEqual({ ok: true, text: "groq text", engine: "groq" });
+  });
+
   it("falls through gemini → codex → groq and reports groq engine", async () => {
     const order: string[] = [];
     const result = await runTranscribeChain(baseInput(), ctx, okDeps({

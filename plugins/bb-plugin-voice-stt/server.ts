@@ -6,7 +6,8 @@
  */
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
 import {
   CHAIN_TIMEOUT_MS,
   HOST_CALL_TIMEOUT_MS,
@@ -14,10 +15,16 @@ import {
   STATUS_HOST_TIMEOUT_MS,
   contract,
   normalizeLanguage,
+  transcribeOutputSchema,
+  voiceSttHostContract,
   type CodexAuthState,
   type TranscribeConfig,
   type TranscribeOutput,
 } from "./src/contract.js";
+import { LiveGeminiSession } from "./src/live-session.js";
+import { LiveTokenStore } from "./src/live-token.js";
+import { createLiveVoiceHandler, type LiveVoiceConfig } from "./src/live-ws.js";
+import { vocabularyTerms } from "./src/gemini-live.js";
 
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-transcribe-live";
 const DEFAULT_GROQ_MODEL = "whisper-large-v3-turbo";
@@ -39,6 +46,20 @@ interface EngineStatus {
   ffmpeg: boolean | null;
   hostNote: string | null;
 }
+
+/** RPC для фронтенда живого режима (спека §4.1, §4.3а). */
+const rpcContract = defineRpcContract({
+  liveToken: {
+    input: z.object({}).strict(),
+    output: z.object({ token: z.string() }).strict(),
+  },
+  liveFallback: {
+    input: z
+      .object({ audioBase64: z.string().min(1), filename: z.string() })
+      .strict(),
+    output: transcribeOutputSchema,
+  },
+});
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -72,9 +93,22 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Батч-модель транскрибации Groq.",
       default: DEFAULT_GROQ_MODEL,
     },
+    liveInput: {
+      type: "boolean",
+      label: "Живой ввод (диктовка)",
+      description: "Кнопка/команда/оверлей живого режима (спека voice-stt-live §7). Файловый сервис не трогает.",
+      default: true,
+    },
+    vocabularyTerms: {
+      type: "string",
+      label: "Словарь живого ввода",
+      description: "Термины для custom_vocabulary Gemini на живом пути — по одному на строку или через запятую (hint'а тут нет).",
+    },
   });
 
   const host = bb.hosts.experimental_client({ contract });
+  // Внутренний host-RPC живого режима — тот же метод, но с skipStages (§4.5).
+  const liveHost = bb.hosts.experimental_client({ contract: voiceSttHostContract });
 
   const str = (value: unknown, fallback = ""): string => {
     const s = typeof value === "string" ? value.trim() : "";
@@ -96,6 +130,23 @@ export default async function plugin(bb: BbPluginApi) {
       language: normalizeLanguage(s.language),
     };
   };
+
+  /** Настройки → конфиг живой сессии (спека §7: те же ключи, словарь из настройки). */
+  const readLiveConfig = async (): Promise<LiveVoiceConfig> => {
+    const s = await settings.get();
+    return {
+      geminiKeys: str(s.geminiKeys)
+        .split(/\r?\n/)
+        .map((k) => k.trim())
+        .filter(Boolean)
+        .slice(0, 2),
+      geminiLiveModel: str(s.geminiLiveModel, DEFAULT_GEMINI_MODEL),
+      language: normalizeLanguage(s.language),
+      vocabulary: vocabularyTerms(str(s.vocabularyTerms)),
+    };
+  };
+
+  const liveInputEnabled = async (): Promise<boolean> => (await settings.get()).liveInput !== false;
 
   const primaryHostId = async (): Promise<string | null> =>
     (await bb.sdk.system.config()).primaryHostId;
@@ -266,5 +317,63 @@ export default async function plugin(bb: BbPluginApi) {
         stderr: `unknown command ${command}; use "status" or "transcribe <file>"\n`,
       };
     },
+  });
+
+  // --- Живой режим (спека voice-stt-live §4): WS-стриминг + RPC токена/фоллбэка ---
+
+  const liveTokens = new LiveTokenStore();
+  const liveLog = (message: string) => bb.log.info(message);
+
+  /** Фоллбэк живого режима (§4.5): WAV → host-RPC codex→groq без ffmpeg. */
+  const liveFallback = async (wav: Uint8Array): Promise<TranscribeOutput> => {
+    const config = await readConfig();
+    const hostId = await requirePrimaryHostId();
+    return await liveHost.call(
+      "voice-stt.transcribe",
+      {
+        audioBase64: Buffer.from(wav).toString("base64"),
+        mimeType: "audio/wav",
+        filename: "live-dictation.wav",
+        hint: null,
+        config,
+        timeoutMs: CHAIN_TIMEOUT_MS,
+        skipStages: ["gemini-live"],
+      },
+      { hostId, timeoutMs: HOST_CALL_TIMEOUT_MS },
+    );
+  };
+
+  bb.http.experimental_websocket(
+    "/live-voice",
+    createLiveVoiceHandler({
+      tokens: liveTokens,
+      readConfig: readLiveConfig,
+      createSession: (options) => new LiveGeminiSession({ ...options, log: liveLog }),
+      fallback: liveFallback,
+      log: liveLog,
+    }),
+    { auth: "local" },
+  );
+
+  bb.rpc.register(rpcContract, {
+    liveToken: async () => {
+      if (!(await liveInputEnabled())) {
+        throw new Error("живой ввод выключен в настройках плагина");
+      }
+      return { token: liveTokens.issue() };
+    },
+    /**
+     * Файловая цепочка для клиентского фоллбэка (§4.3а): сокет умер до
+     * отпускания — реплея не было, Gemini не трогали, skipStages не нужен.
+     */
+    liveFallback: async ({ audioBase64, filename }) =>
+      await callTranscribe(
+        {
+          bytes: Buffer.from(audioBase64, "base64"),
+          mimeType: "audio/wav",
+          filename,
+        },
+        null,
+      ),
   });
 }

@@ -1,0 +1,176 @@
+/*
+ * Voice STT — живой ввод. Только токены темы BB (как у live-call): цвета,
+ * шрифт, радиусы и тени следуют выбранной теме; свои значения — размеры
+ * и красный индикатор записи.
+ */
+
+.vsl-overlay {
+  position: fixed;
+  left: 50%;
+  bottom: 96px;
+  transform: translateX(-50%);
+  z-index: 60;
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--popover-foreground, var(--foreground));
+}
+.vsl-overlay *,
+.vsl-overlay *::before,
+.vsl-overlay *::after {
+  box-sizing: border-box;
+}
+.vsl-overlay button {
+  font: inherit;
+  color: inherit;
+}
+
+.vsl-card {
+  background: var(--popover);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius, 0.5rem) + 4px);
+  box-shadow: var(--shadow-lg, 0 12px 32px rgb(0 0 0 / 0.28));
+  padding: 10px 12px;
+  animation: vsl-in 0.16s ease-out;
+}
+@keyframes vsl-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.vsl-card--shake {
+  animation: vsl-shake 0.18s ease-out;
+}
+@keyframes vsl-shake {
+  0%, 100% { transform: translateX(0); }
+  33% { transform: translateX(-3px); }
+  66% { transform: translateX(3px); }
+}
+
+.vsl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vsl-row--head {
+  min-height: 18px;
+}
+
+.vsl-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--destructive, #ef4444);
+  animation: vsl-pulse 1.2s ease-in-out infinite;
+  flex: none;
+}
+@keyframes vsl-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+.vsl-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground);
+  flex: none;
+}
+
+.vsl-level {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--muted, var(--border));
+  overflow: hidden;
+}
+.vsl-level-fill {
+  display: block;
+  height: 100%;
+  background: var(--destructive, #ef4444);
+  transition: width 0.09s linear;
+}
+
+.vsl-status {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vsl-status--error {
+  color: var(--destructive, #ef4444);
+}
+.vsl-engine {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 8px;
+}
+
+.vsl-close {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--muted-foreground);
+}
+.vsl-close:hover {
+  background: var(--state-hover, var(--accent));
+  color: var(--foreground);
+}
+
+.vsl-interim {
+  margin-top: 8px;
+  max-height: 96px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.vsl-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.vsl-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+.vsl-btn {
+  border: 1px solid var(--border);
+  background: var(--background);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.vsl-btn:hover {
+  background: var(--state-hover, var(--accent));
+}
+
+/* Кнопка в composer.actions — размеры под соседние кнопки композера. */
+.vsl-mic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+.vsl-mic:hover {
+  background: var(--state-hover, var(--accent));
+  color: var(--foreground);
+}
+.vsl-mic--active {
+  color: var(--destructive, #ef4444);
+  animation: vsl-pulse 1.2s ease-in-out infinite;
+}
