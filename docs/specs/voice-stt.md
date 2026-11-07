@@ -196,8 +196,9 @@ const contract = {
    webm). Лимит входа 20 МБ (как у codex).
 2. **ffmpeg → PCM** (`audio.ts`, нужен только для Gemini): `ffmpeg -v error -i
    in -f s16le -acodec pcm_s16le -ar 16000 -ac 1 out` через `spawn`/execFile,
-   таймаут 5 c. Нет ffmpeg или ошибка декода — Gemini-стадия пропускается
-   (пометить в лог), codex/groq работают по исходному webm.
+   таймаут 4 c (как в таблице бюджетов). Нет ffmpeg или ошибка декода —
+   Gemini-стадия пропускается (пометить в лог), codex/groq работают по
+   исходному webm.
 3. **Стадия Gemini Live** (§6): по каждому ключу из `geminiKeys` один заход;
    ЛЮБОЙ сбой до первого распознанного текста (auth/quota-отказ апгрейда,
    error-фрейм, таймаут setup, разрыв сокета) — следующий ключ; все ключи
@@ -317,8 +318,9 @@ split по `\n , ;` → trim → выкинуть пустые → dedup по lo
 
 Наш вход — уже готовый файл, не живой поток: после setupComplete шлём все
 чанки подряд (необязательно «в реальном темпе»), затем `audioStreamEnd`.
-Ждём финал с адаптивным финишем. Бюджет на одну ключ-сессию ≤12 c
-(connect+setup ≤5 c, иначе следующий ключ; см. бюджеты §5).
+Ждём финал с адаптивным финишем. Бюджет на одну ключ-сессию
+`min(15 + 0.4·audioSec, 55)` c (connect+setup ≤5 c внутри него, иначе
+следующий ключ; см. бюджеты §5).
 
 ## 7. Codex — точный протокол (порт provider-codex 0.48.1, host.js)
 
@@ -369,7 +371,8 @@ env honoured, иначе `~/.codex`.
 - FormData: `file` (исходный webm — Groq принимает webm), `model` = `groqModel`
   (def `whisper-large-v3-turbo`), `response_format` = `verbose_json` для
   `whisper-1`/`whisper-large-v3`/`whisper-large-v3-turbo`, иначе `json`,
-  `language` (если задан), `prompt` = hint (если не null).
+  `language` (если задан — только базовый ISO-639-1 субтег: `ru-RU` → `ru`,
+  срез региона как в таблице настроек), `prompt` = hint (если не null).
 - Ответ: `.text` из JSON; пусто → `invalid_response`/мягкий провал.
 - Маппинг статусов — как у codex (401/429/5xx/прочее).
 
@@ -421,6 +424,8 @@ env honoured, иначе `~/.codex`.
 
 - Не трогаем `provider-codex`, `live-call`, настройки других плагинов.
 - Не меняем UI: микрофон рисует ядро, когда сервис voice выбран/ready.
+  (Перекрывается отдельной спекой `voice-stt-live.md` — живой ввод через
+  плагин-UI; для файлового пайплайна правило остаётся в силе.)
 - Пост-обработка (LLM cleanup) — вне задачи; `mode: "SMART"` у Gemini уже даёт
   чистый текст, у codex/groq — как есть.
 - Не коммитим в `main`; работа — `feat/voice-stt`, отчёт — ветка + SHA.
