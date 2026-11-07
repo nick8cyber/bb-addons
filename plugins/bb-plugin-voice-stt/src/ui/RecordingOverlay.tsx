@@ -72,15 +72,54 @@ interface FabGesture {
   last: { left: number; top: number } | null;
 }
 
-function useViewport(): { vw: number; vh: number } {
-  const [vp, setVp] = useState(() => ({ vw: window.innerWidth, vh: window.innerHeight }));
-  useEffect(() => {
-    const on = () => setVp({ vw: window.innerWidth, vh: window.innerHeight });
-    window.addEventListener("resize", on);
-    return () => window.removeEventListener("resize", on);
-  }, []);
-  return vp;
+/**
+ * Видимая часть окна (§3.1 п. 1, §3.2). На iOS клавиатура не уменьшает
+ * окно — она перекрывает его низ, и сжимается только visualViewport.
+ * Элементы с position:fixed, посчитанные от окна, уходят под клавиатуру,
+ * поэтому FAB и плашка считают позицию от visualViewport.
+ * x/y — смещение видимой области в координатах окна (как у fixed);
+ * keyboard — сколько окна снизу закрыто (клавиатура, панели).
+ */
+interface VisibleArea {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  keyboard: number;
 }
+
+function readVisibleArea(): VisibleArea {
+  const vv = window.visualViewport;
+  const layoutH = document.documentElement.clientHeight || window.innerHeight;
+  if (!vv) return { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight, keyboard: 0 };
+  return {
+    x: vv.offsetLeft,
+    y: vv.offsetTop,
+    w: vv.width,
+    h: vv.height,
+    keyboard: Math.max(0, Math.round(layoutH - (vv.offsetTop + vv.height))),
+  };
+}
+
+function useVisibleArea(): VisibleArea {
+  const [area, setArea] = useState<VisibleArea>(readVisibleArea);
+  useEffect(() => {
+    const on = () => setArea(readVisibleArea());
+    const vv = window.visualViewport;
+    window.addEventListener("resize", on);
+    vv?.addEventListener("resize", on);
+    vv?.addEventListener("scroll", on);
+    return () => {
+      window.removeEventListener("resize", on);
+      vv?.removeEventListener("resize", on);
+      vv?.removeEventListener("scroll", on);
+    };
+  }, []);
+  return area;
+}
+
+/** Позиция по умолчанию — середина правого края видимой области. */
+const DEFAULT_RATIO: FabRatio = { xr: 1, yr: 0.5 };
 
 /**
  * Плавающая кнопка живого ввода (§3.1 п. 1) — основной вход, видна
@@ -94,15 +133,15 @@ function useViewport(): { vw: number; vh: number } {
 function FloatingMic() {
   const composers = useComposers();
   const view = useSyncExternalStore(voiceRecorder.subscribe, voiceRecorder.getSnapshot);
-  const { vw, vh } = useViewport();
+  const area = useVisibleArea();
   const [ratio, setRatio] = useState<FabRatio | null>(() => loadFabRatio());
   const [pressed, setPressed] = useState(false);
   const [dragging, setDragging] = useState(false);
   const gesture = useRef<FabGesture | null>(null);
   const active = view.phase === "recording" || view.phase === "reconnecting";
 
-  const placed = ratio !== null ? ratioToPx(ratio, vw, vh) : null;
-  const style = placed !== null ? { left: placed.left, top: placed.top, right: "auto" } : undefined;
+  const local = ratioToPx(ratio ?? DEFAULT_RATIO, area.w, area.h);
+  const style = { left: area.x + local.left, top: area.y + local.top, right: "auto" };
   const target = (): ComposerTarget | null => resolveComposerTarget(composers as ComposerList);
 
   const clearTimer = (g: FabGesture): void => {
@@ -121,7 +160,8 @@ function FloatingMic() {
     if (g.mode === "drag") {
       setDragging(false);
       if (g.last !== null) {
-        const r = pxToRatio(g.last.left, g.last.top, window.innerWidth, window.innerHeight);
+        const a = readVisibleArea();
+        const r = pxToRatio(g.last.left - a.x, g.last.top - a.y, a.w, a.h);
         setRatio(r);
         saveFabRatio(r);
       }
@@ -199,10 +239,16 @@ function FloatingMic() {
           g.mode = "drag";
           setDragging(true);
         }
-        const w = window.innerWidth;
-        const h = window.innerHeight;
-        const left = Math.min(Math.max(e.clientX - g.dx, FAB_MARGIN), w - FAB_SIZE - FAB_MARGIN);
-        const top = Math.min(Math.max(e.clientY - g.dy, FAB_MARGIN), h - FAB_SIZE - FAB_MARGIN);
+        // Кнопка ездит только в видимой области — не уходит под клавиатуру.
+        const a = readVisibleArea();
+        const left = Math.min(
+          Math.max(e.clientX - g.dx, a.x + FAB_MARGIN),
+          a.x + a.w - FAB_SIZE - FAB_MARGIN,
+        );
+        const top = Math.min(
+          Math.max(e.clientY - g.dy, a.y + FAB_MARGIN),
+          a.y + a.h - FAB_SIZE - FAB_MARGIN,
+        );
         g.last = { left, top };
         // Прямо в DOM — кадр за кадром, без перерисовки React.
         const el = e.currentTarget;
@@ -275,6 +321,7 @@ function cardHint(view: RecorderView): string | null {
 
 export function RecordingOverlay() {
   const view = useSyncExternalStore(voiceRecorder.subscribe, voiceRecorder.getSnapshot);
+  const area = useVisibleArea();
   const { values } = useSettings();
   const [now, setNow] = useState(() => Date.now());
 
@@ -296,7 +343,13 @@ export function RecordingOverlay() {
       <SettingsBridge />
       {values?.liveInput !== false && <FloatingMic />}
       {view.phase === "idle" ? null : (
-        <div className="vsl-overlay" role="status" aria-live="polite">
+        <div
+          className="vsl-overlay"
+          role="status"
+          aria-live="polite"
+          // Над клавиатурой: базовый отступ 96px + закрытая снизу часть окна.
+          style={area.keyboard > 0 ? { bottom: 96 + area.keyboard } : undefined}
+        >
           <button
             type="button"
             className={`vsl-card vsl-card--tap${view.ignorePulse % 2 === 1 ? " vsl-card--shake" : ""}`}
