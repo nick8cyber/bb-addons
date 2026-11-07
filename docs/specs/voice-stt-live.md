@@ -36,7 +36,7 @@
 
 1. `composer.actions` — кнопка микрофона плагина в композере (scope: все
    `thread`, `queued-message`, `new-thread`). Известное ограничение: в свёрнутом
-   (compact) композере плагинные actions хост не рисует — покрыто п. 2–4.
+   (compact) композере плагинные actions хост не рисует — покрыто п. 2–3.
 2. `app.composer.experimental_registerCommand` — команда «Voice STT Live:
    диктовка» с шорткатом (Mod+Shift+V). Composer-команда получает bound
    `composer` в `run({composer})` — привязка бесплатная; обычный
@@ -46,10 +46,6 @@
    композер резолвится через `useComposers()` (primary/focused pane); если
    композера нет — запись идёт в «no-target» режиме и финал остаётся в
    оверлее с кнопкой «копировать».
-4. Плавающая кнопка (FAB) в `experimental_appOverlay` — основной видимый
-   вход: оверлей смонтирован постоянно (host mounts once per app window),
-   кнопка видна без открытого композера. Тот же жест (hold/toggle), цель —
-   через резолвер `useComposers()`; во время записи FAB — кнопка стоп.
 
 Нативную кнопку микрофона **не скрываем**: официального способа нет, CSS по
 `aria-label` ломается локализацией (bb-plugin-ru). Две кнопки сосуществуют;
