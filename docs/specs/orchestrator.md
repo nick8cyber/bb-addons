@@ -2,7 +2,7 @@
 title: Orchestrator — раздача работы исполнителям как код
 status: draft
 updated: 2026-11-08
-revision: 12 (ревью волны 1, PLUG-143)
+revision: 12.1 (предупреждения о пресетах — в журнале; отмена записи без треда)
 ---
 
 # Orchestrator
@@ -55,7 +55,7 @@ revision: 12 (ревью волны 1, PLUG-143)
 }
 ```
 
-Проверка существования пресетов (`bb tasks preset list`) не выполняется синхронно при загрузке плагина — только при `policy validate`, при первой раздаче и в фоне после старта; предупреждения видны в `bb orchestrator policy show` и в статусе плагина.
+Проверка существования пресетов (`bb tasks preset list`) не выполняется синхронно при загрузке плагина — только при `policy validate`, при первой раздаче и в фоне после старта; предупреждения видны в `bb orchestrator policy show` и в журнале плагина (SDK не даёт плагину статус-предупреждений).
 
 Правила валидации (каждое — отдельная ошибка с путём в JSON):
 1. `version` = 1.
@@ -165,7 +165,7 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 bb orchestrator delegate <KEY> --level <уровень> [--route <r>] [--instructions <t>] [--json]
 bb orchestrator status [--coordinator <thr>] [--all] [--json]   # делегирования и счётчики
 bb orchestrator show <delegationId|threadId> [--json]
-bb orchestrator cancel <delegationId|threadId>                   # стоп исполнителя, статус cancelled; из треда — только координатор этого делегирования
+bb orchestrator cancel <delegationId|threadId>                   # стоп исполнителя, статус cancelled; из треда — только координатор этого делегирования; запись `dispatching` без thread_id — сначала поиск треда через `bb tasks threads <KEY>` (создан после записи) и его остановка
 bb orchestrator policy [show|validate] [--json]                  # действующая политика и ошибки
 bb orchestrator instructions                                     # правило §3
 bb orchestrator reconcile                                        # принудительная сверка §7
