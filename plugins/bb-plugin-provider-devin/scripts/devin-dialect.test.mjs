@@ -16,13 +16,13 @@ const delegationPresentation = (args) => ({
   title: args.label,
   ...(args.detail === undefined ? {} : { detail: args.detail }),
 });
-const { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice } = new Function(
+const { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice, applyDevinAcpSessionMode } = new Function(
   "z",
   "delegationPresentation",
   "fs",
   "os",
   "path2",
-  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice };`,
+  `${code}\nreturn { devinClassifyToolCall, DEVIN_ACP_DIALECT, persistDevinBbInstructions, isBbSystemNotice, applyDevinAcpSessionMode };`,
 )(z, delegationPresentation, fsPromises, fakeOs, path);
 
 // Реальное событие из bb (<thread> seq 2346), до выключения субагентов.
@@ -88,12 +88,104 @@ test("bb instructions persisted per thread, 0600, junk ids ignored", async () =>
   assert.deepEqual(readdirSync(dir), ["thr_abc123.md"]);
 });
 
-test("bb system notices are soft, owner and agent messages are not", () => {
+test("bb system and orchestrator notices are soft, owner and agent messages are not", () => {
   const t = (text) => [{ type: "text", text }];
   assert.equal(isBbSystemNotice(t("[bb system]\n\n@thread:thr_a completed:\n\nok")), true);
   assert.equal(isBbSystemNotice(t("[bb system]\n\n@thread:thr_a is now a child of this thread.")), true);
+  assert.equal(isBbSystemNotice(t("[orchestrator]\n\nстатус волны: 2/3")), true);
   assert.equal(isBbSystemNotice(t("[bb message from thread:thr_x]\n\nстоп")), false);
   assert.equal(isBbSystemNotice(t("стоп, не деплой")), false);
+  assert.equal(isBbSystemNotice(t("не [orchestrator] в начале")), false);
   assert.equal(isBbSystemNotice([{ type: "image", url: "x" }]), false);
   assert.equal(isBbSystemNotice(undefined), false);
+});
+
+const acpModeOption = {
+  id: "mode",
+  type: "select",
+  options: ["accept-edits", "smart", "ask", "plan", "bypass"].map((value) => ({ value })),
+};
+function fakeAcpConnection(requests, fail) {
+  return {
+    request({ method, params }) {
+      requests.push({ method, params });
+      return fail ? Promise.reject(new Error("set_config_option rejected")) : Promise.resolve(null);
+    },
+  };
+}
+function captureStderr(fn) {
+  const warnings = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    warnings.push(String(chunk));
+    return true;
+  };
+  return fn().finally(() => {
+    process.stderr.write = original;
+  }).then((result) => ({ result, warnings }));
+}
+
+test("permissionMode maps to ACP session mode", async () => {
+  for (const [permissionMode, mode] of [["full", "bypass"], ["accept-edits", "accept-edits"], ["auto", "smart"]]) {
+    const requests = [];
+    const { warnings } = await captureStderr(() => applyDevinAcpSessionMode({
+      connection: fakeAcpConnection(requests, false),
+      sessionId: "s1",
+      permissionMode,
+      configOptions: [acpModeOption],
+      agentLabel: "devin",
+    }));
+    assert.deepEqual(requests, [{
+      method: "session/set_config_option",
+      params: { sessionId: "s1", configId: "mode", value: mode },
+    }]);
+    assert.deepEqual(warnings, []);
+  }
+});
+
+test("mode option found by category too", async () => {
+  const requests = [];
+  await applyDevinAcpSessionMode({
+    connection: fakeAcpConnection(requests, false),
+    sessionId: "s1",
+    permissionMode: "full",
+    configOptions: [{ id: "m1", category: "mode", type: "select", options: acpModeOption.options }],
+    agentLabel: "devin",
+  });
+  assert.equal(requests[0].params.configId, "m1");
+  assert.equal(requests[0].params.value, "bypass");
+});
+
+test("no mode option or missing value -> one warning, no request", async () => {
+  for (const configOptions of [
+    [],
+    [{ id: "mode", type: "select", options: [{ value: "smart" }] }],
+    [{ id: "model", category: "model", type: "select", options: [{ value: "bypass" }] }],
+  ]) {
+    const requests = [];
+    const { warnings } = await captureStderr(() => applyDevinAcpSessionMode({
+      connection: fakeAcpConnection(requests, false),
+      sessionId: "s1",
+      permissionMode: "full",
+      configOptions,
+      agentLabel: "devin",
+    }));
+    assert.deepEqual(requests, []);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /does not offer session mode "bypass"/);
+  }
+});
+
+test("set_config_option error is fail-open: warning, no throw", async () => {
+  const requests = [];
+  const { warnings } = await captureStderr(() => applyDevinAcpSessionMode({
+    connection: fakeAcpConnection(requests, true),
+    sessionId: "s1",
+    permissionMode: "full",
+    configOptions: [acpModeOption],
+    agentLabel: "devin",
+  }));
+  assert.equal(requests.length, 1);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /failed to set ACP session mode "bypass"/);
 });

@@ -50,6 +50,17 @@ replaceOnce(
   "        if (session.queuedInputs.length > 0) {\n          requestSteerCancel(session);",
   "        if (session.queuedInputs.some((queued) => queued.soft !== true)) {\n          requestSteerCancel(session);",
 );
+// Режим прав сессии по permissionMode треда — после успешного session/load и
+// после session/new (docs/specs/provider-devin.md §1, applyDevinAcpSessionMode
+// в devin-dialect.js).
+replaceOnce(
+  "        loadedConfigOptions = configState?.configOptions;\n        loadedModels = configState?.models;\n        sessionId = request.resumeProviderThreadId;",
+  "        loadedConfigOptions = configState?.configOptions;\n        loadedModels = configState?.models;\n        sessionId = request.resumeProviderThreadId;\n        await applyDevinAcpSessionMode({\n          connection,\n          sessionId,\n          permissionMode: params.permissionMode,\n          configOptions: loadedConfigOptions,\n          agentLabel\n        });",
+);
+replaceOnce(
+  "      sessionId = newSession.sessionId;\n      await selectAcpNativeModel({\n        connection,\n        sessionId,\n        configOptions: newSession.configOptions,",
+  "      sessionId = newSession.sessionId;\n      await applyDevinAcpSessionMode({\n        connection,\n        sessionId,\n        permissionMode: params.permissionMode,\n        configOptions: newSession.configOptions,\n        agentLabel\n      });\n      await selectAcpNativeModel({\n        connection,\n        sessionId,\n        configOptions: newSession.configOptions,",
+);
 // devin-dialect.js пользуется модулями, которые мост уже импортирует под этими именами.
 for (const imp of ['import fs from "node:fs/promises";', 'import os from "node:os";', 'import path2 from "node:path";']) {
   if (!code.includes(imp)) {

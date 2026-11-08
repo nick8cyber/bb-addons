@@ -62,12 +62,60 @@ function persistDevinBbInstructions(bbThreadId, instructions) {
   });
 }
 
-// Системные уведомления bb ("[bb system] ... completed", "... is now a child") не
-// прерывают идущий ход Devin: ACP не умеет вклинивать сообщение в ход, и мост
-// отменял ход (session/cancel) — Devin обрывал текущую команду. Такие уведомления
-// ждут в очереди и приходят сразу после хода. Сообщения владельца и других тредов
+// Системные уведомления bb ("[bb system] ... completed", "... is now a child") и
+// служебные сообщения сторожа оркестратора ("[orchestrator] ...") не прерывают
+// идущий ход Devin: ACP не умеет вклинивать сообщение в ход, и мост отменял ход
+// (session/cancel) — Devin обрывал текущую команду. Такие уведомления ждут в
+// очереди и приходят сразу после хода. Сообщения владельца и других тредов
 // по-прежнему прерывают ход (чтобы можно было остановить агента).
 function isBbSystemNotice(input) {
   const first = Array.isArray(input) ? input.find((item) => item && item.type === "text") : void 0;
-  return typeof first?.text === "string" && first.text.startsWith("[bb system]");
+  const text = typeof first?.text === "string" ? first.text : "";
+  return text.startsWith("[bb system]") || text.startsWith("[orchestrator]");
+}
+
+// docs/specs/provider-devin.md §1: режим прав сессии Devin по permissionMode
+// треда bb. Мост передаёт Devin флаг --permission-mode при запуске, но сессия
+// ACP его не учитывает — режим прав в ACP это опция сессии "mode". Мост
+// выставляет её после session/new и после успешного session/load. Нет опции или
+// нужного значения в ней — одно предупреждение в журнал, режим агента не
+// меняется; ошибка session/set_config_option — предупреждение, fail-open.
+var DEVIN_ACP_MODE_BY_PERMISSION_MODE = {
+  "accept-edits": "accept-edits",
+  auto: "smart",
+  full: "bypass"
+};
+function findDevinAcpModeConfigOption(configOptions) {
+  const options = configOptions ?? [];
+  return options.find((option) => option.category === "mode") ?? options.find((option) => option.id === "mode");
+}
+async function applyDevinAcpSessionMode(args) {
+  const target = DEVIN_ACP_MODE_BY_PERMISSION_MODE[args.permissionMode];
+  if (target === void 0) {
+    return;
+  }
+  const modeOption = findDevinAcpModeConfigOption(args.configOptions);
+  if (modeOption === void 0 || !(modeOption.options ?? []).some((option) => option.value === target)) {
+    process.stderr.write(
+      `acp bridge: ACP agent "${args.agentLabel}" does not offer session mode "${target}" for permissionMode "${args.permissionMode}"; leaving the agent's default mode
+`
+    );
+    return;
+  }
+  try {
+    await args.connection.request({
+      method: "session/set_config_option",
+      params: {
+        sessionId: args.sessionId,
+        configId: modeOption.id,
+        value: target
+      },
+      resultSchema: z.unknown()
+    });
+  } catch (error) {
+    process.stderr.write(
+      `acp bridge: failed to set ACP session mode "${target}" on "${args.agentLabel}": ${error instanceof Error ? error.message : String(error)}
+`
+    );
+  }
 }
