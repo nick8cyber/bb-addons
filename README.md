@@ -163,8 +163,8 @@ Voice input for bb in two modes:
   dictation (`micWarmSeconds`), so the next one starts instantly and includes
   ~0.5 s before the tap. If iOS Web Audio goes silent, capture switches to
   `MediaRecorder`. The audio is decoded on the fly and streamed to the same Gemini
-  Live session, which should keep live text coming (not yet confirmed on a real
-  iPhone). If on-the-fly decoding fails, the whole file is transcribed when you stop.
+  Live session, so live text keeps coming (verified in Chromium emulation; not yet
+  on a real iPhone). If on-the-fly decoding fails, the whole file is transcribed when you stop.
 
 ```bash
 bb voice-stt status
