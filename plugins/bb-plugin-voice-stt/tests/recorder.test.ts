@@ -418,6 +418,20 @@ describe("voiceRecorder (§3.3, §9)", () => {
     r.recorder.cancel();
   });
 
+  it("диагностика: итог вставки в запасном режиме уходит RPC clientLog (сокета нет)", async () => {
+    const r = makeRecorder();
+    const composer = new FakeComposer();
+    r.recorder.pressStart(composer, 1);
+    await openWithHello(r);
+    r.capture.fireFallback();
+    r.capture.recording = { bytes: new Uint8Array(2048), mimeType: "audio/mp4", filename: "live-dictation.m4a" };
+    r.recorder.stop();
+    for (let i = 0; i < 4; i++) await new Promise((res) => setTimeout(res, 0));
+    const logs = r.rpcCalls.filter((c) => c.method === "clientLog").map((c) => (c.input as { msg: string }).msg);
+    expect(logs.some((m) => m.startsWith("recorder file 2 KB audio/mp4"))).toBe(true);
+    expect(logs.some((m) => /deliver: \d+ chars via .*\[recorder\] → inserted/.test(m))).toBe(true);
+  });
+
   it("cancel sends cancel and never inserts", async () => {
     const r = makeRecorder();
     const composer = new FakeComposer();
