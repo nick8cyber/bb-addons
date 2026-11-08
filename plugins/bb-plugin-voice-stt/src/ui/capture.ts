@@ -46,7 +46,9 @@ export type CaptureEvent =
   | { kind: "restarted"; info: string }
   | { kind: "failed"; reason: string }
   /** Web Audio молчит — запись идёт через MediaRecorder, текст после конца записи. */
-  | { kind: "fallback"; info: string };
+  | { kind: "fallback"; info: string }
+  /** Web Audio молчит — MediaRecorder + раскодирование на лету: живой поток сохраняется. */
+  | { kind: "stream"; info: string };
 
 /**
  * Web Audio на этой странице признан мёртвым (до перезагрузки страницы).
@@ -57,6 +59,12 @@ export type CaptureEvent =
  * следующие записи сразу идут так же, без 3–4 с попыток.
  */
 let webAudioBroken = false;
+
+/** Потоковый запасной режим: кусок MediaRecorder, хвост и размер отдачи (16 кГц). */
+const STREAM_SLICE_MS = 400;
+const STREAM_HOLDBACK_SAMPLES = 1024; // ~64 мс
+const STREAM_EMIT_SAMPLES = 800; // 50 мс, как кадр worklet
+const STREAM_MAX_DECODE_FAILS = 3;
 
 /** Готовая запись запасного режима. */
 export interface RecordedAudio {
@@ -108,6 +116,10 @@ export interface MicCaptureLike {
   isRecorderMode?(): boolean;
   /** Остановить запасную запись и отдать файл (null — пусто/нет режима). */
   finishRecording?(): Promise<RecordedAudio | null>;
+  /** Запасной захват отдаёт PCM потоком (раскодирование на лету). */
+  isStreaming?(): boolean;
+  /** Дослать хвост потокового запасного захвата перед end. */
+  flushStream?(): Promise<void>;
   /** Поднять getUserMedia + цепочку захвата; чанки идут в onChunk. */
   start(
     onChunk: (pcm: Uint8Array, level: number) => void,
@@ -290,6 +302,18 @@ export class MicCapture implements MicCaptureLike {
   private mr: MediaRecorder | null = null;
   private mrChunks: Blob[] = [];
   private mrMime = "";
+  /**
+   * Потоковый запасной режим: MediaRecorder режет запись кусками, весь
+   * накопленный файл раскодируется decodeAudioData (OfflineAudioContext
+   * 16 кГц — без звукового вывода, которого и нет у «мёртвого» Web Audio)
+   * и новые сэмплы уходят тем же onChunk, что у worklet.
+   */
+  private streaming = false;
+  private decodeCtx: OfflineAudioContext | null = null;
+  private decodeBusy: Promise<void> | null = null;
+  private decodeDirty = false;
+  private sentSamples = 0;
+  private decodeFails = 0;
 
   /** iOS: AudioContext живёт, только если создан и запущен прямо в нажатии. */
   unlock(): void {
@@ -584,13 +608,122 @@ export class MicCapture implements MicCaptureLike {
     this.mrChunks = [];
     const mr = this.mrMime !== "" ? new MediaRecorder(stream, { mimeType: this.mrMime }) : new MediaRecorder(stream);
     this.mrMime = mr.mimeType || this.mrMime || "audio/mp4";
+    this.sentSamples = 0;
+    this.decodeFails = 0;
+    this.decodeDirty = false;
+    this.decodeBusy = null;
+    this.streaming = typeof OfflineAudioContext === "function";
+    if (this.streaming) {
+      try {
+        this.decodeCtx = new OfflineAudioContext(1, 1, 16000);
+      } catch {
+        this.streaming = false;
+      }
+    }
     mr.ondataavailable = (e: BlobEvent) => {
-      if (e.data && e.data.size > 0) this.mrChunks.push(e.data);
+      if (e.data && e.data.size > 0) {
+        this.mrChunks.push(e.data);
+        if (this.streaming) this.scheduleDecode(false);
+      }
     };
-    mr.start(1000);
+    mr.start(this.streaming ? STREAM_SLICE_MS : 1000);
     this.mr = mr;
     this.info = `recorder ${this.mrMime}; ${info}`;
-    this.onEvent({ kind: "fallback", info: this.info });
+    this.lastFrameAt = performance.now();
+    if (this.streaming) this.onEvent({ kind: "stream", info: this.info });
+    else this.onEvent({ kind: "fallback", info: this.info });
+  }
+
+  isStreaming(): boolean {
+    return this.mode === "recorder" && this.streaming && this.mr !== null;
+  }
+
+  private scheduleDecode(final: boolean): Promise<void> {
+    if (this.decodeBusy !== null) {
+      this.decodeDirty = true;
+      return this.decodeBusy;
+    }
+    const run = this.decodeOnce(final).finally(() => {
+      this.decodeBusy = null;
+      if (this.decodeDirty && this.streaming) {
+        this.decodeDirty = false;
+        void this.scheduleDecode(false);
+      }
+    });
+    this.decodeBusy = run;
+    return run;
+  }
+
+  /** Раскодировать весь накопленный файл и отдать новые сэмплы (кроме хвоста). */
+  private async decodeOnce(final: boolean): Promise<void> {
+    const ctx = this.decodeCtx;
+    if (ctx === null || this.mrChunks.length === 0) return;
+    const gen = this.generation;
+    try {
+      const buf = await new Blob(this.mrChunks, { type: this.mrMime }).arrayBuffer();
+      const audio = await ctx.decodeAudioData(buf);
+      if (gen !== this.generation || !this.streaming) return;
+      const ch = audio.getChannelData(0);
+      // Хвост держим до следующего куска: последний кадр AAC/Opus меняется,
+      // когда приходит следующий (перекрытие MDCT) — иначе щелчки на стыках.
+      const upto = final ? ch.length : Math.max(this.sentSamples, ch.length - STREAM_HOLDBACK_SAMPLES);
+      if (upto > this.sentSamples) {
+        const fresh = ch.subarray(this.sentSamples, upto);
+        this.sentSamples = upto;
+        for (let i = 0; i < fresh.length; i += STREAM_EMIT_SAMPLES) {
+          this.emitPcm(fresh.subarray(i, Math.min(fresh.length, i + STREAM_EMIT_SAMPLES)));
+        }
+      }
+      this.decodeFails = 0;
+    } catch (e) {
+      this.decodeFails += 1;
+      if (this.decodeFails >= STREAM_MAX_DECODE_FAILS && this.sentSamples === 0 && this.streaming) {
+        // Раскодировать кусками не выходит — файл целиком после записи.
+        this.streaming = false;
+        this.onEvent({
+          kind: "fallback",
+          info: `${this.info}; stream decode failed: ${e instanceof Error ? e.message : String(e)}`,
+        });
+      }
+    }
+  }
+
+  /** PCM16 из float, тот же контракт onChunk, что у worklet. */
+  private emitPcm(f32: Float32Array): void {
+    const i16 = new Int16Array(f32.length);
+    let peak = 0;
+    for (let i = 0; i < f32.length; i++) {
+      const x = Math.max(-1, Math.min(1, f32[i]));
+      const v = Math.abs(x);
+      if (v > peak) peak = v;
+      i16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
+    }
+    this.lastFrameAt = performance.now();
+    this.onChunk?.(new Uint8Array(i16.buffer), Math.min(1, peak * 2.2));
+  }
+
+  async flushStream(): Promise<void> {
+    const mr = this.mr;
+    if (mr === null || !this.streaming) return;
+    // Забрать незакрытый кусок и раскодировать всё до конца, хвост включительно.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 700);
+      const prev = mr.ondataavailable;
+      mr.ondataavailable = (e: BlobEvent) => {
+        if (e.data && e.data.size > 0) this.mrChunks.push(e.data);
+        mr.ondataavailable = prev;
+        clearTimeout(timer);
+        resolve();
+      };
+      try {
+        mr.requestData();
+      } catch {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    if (this.decodeBusy !== null) await this.decodeBusy.catch(() => {});
+    await this.decodeOnce(true);
   }
 
   isRecorderMode(): boolean {
@@ -708,6 +841,9 @@ export class MicCapture implements MicCaptureLike {
     const mr = this.mr;
     this.mr = null;
     this.mrChunks = [];
+    this.streaming = false;
+    this.decodeCtx = null;
+    this.decodeDirty = false;
     if (mr !== null && mr.state !== "inactive") {
       try {
         mr.ondataavailable = null;

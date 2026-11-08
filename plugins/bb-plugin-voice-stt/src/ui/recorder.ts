@@ -315,7 +315,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     for (const msg of q) sendJson(a, { type: "diag", msg });
   };
   const MIC_RESTARTED_NOTICE = "микрофон перезапущен — жду звук…";
-  const MIC_NOTICES = new Set(["микрофон пропал — перезапускаю…", MIC_RESTARTED_NOTICE]);
+  const MIC_STREAM_NOTICE = "запасной захват звука — говорите";
+  const MIC_NOTICES = new Set(["микрофон пропал — перезапускаю…", MIC_RESTARTED_NOTICE, MIC_STREAM_NOTICE]);
   const onCaptureEvent = (ev: CaptureEvent): void => {
     const live = view.phase === "recording" || view.phase === "reconnecting";
     if (!live && !standbyOn) return;
@@ -328,6 +329,13 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     }
     if (ev.kind === "fallback") {
       enterRecorderMode(ev.info);
+      return;
+    }
+    if (ev.kind === "stream") {
+      // Web Audio молчит, но звук идёт потоком через MediaRecorder — живая
+      // сессия продолжается, текст по ходу речи сохраняется.
+      sendDiag(`mic recorder stream: ${ev.info}`);
+      if (!view.micLive) patch({ notice: MIC_STREAM_NOTICE });
       return;
     }
     if (ev.kind === "started") sendDiag(`mic started: ${ev.info}`);
@@ -357,6 +365,10 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
    * в файловую цепочку (liveFallback), текст — без интеримов.
    */
   let recMode = false;
+  /** Идёт досылка хвоста потокового запасного захвата перед end. */
+  let flushing = false;
+  /** Хвост уже дослан — второй раз не досылаем (иначе петля stop→flush→stop). */
+  let flushed = false;
   const enterRecorderMode = (info: string): void => {
     recMode = true;
     sendDiag(`mic fallback: ${info}`);
@@ -456,6 +468,8 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     standby = null;
     standbyOn = false;
     recMode = false;
+    flushing = false;
+    flushed = false;
     preroll = [];
     prerollBytes = 0;
   };
@@ -952,6 +966,20 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
     /** Отпускание/Enter: конец записи → final → вставка (§3.3). */
     stop(): void {
       if (view.phase !== "recording" && view.phase !== "reconnecting") return;
+      if (!recMode && !flushing && !flushed && capture.isStreaming?.() && capture.flushStream) {
+        // Потоковый запасной захват: дослать хвост звука в сессию, потом end.
+        flushing = true;
+        void capture
+          .flushStream()
+          .catch(() => {})
+          .finally(() => {
+            flushing = false;
+            flushed = true;
+            recorder.stop();
+          });
+        return;
+      }
+      if (flushing) return;
       if (recMode && capture.finishRecording) {
         patch({ phase: "finishing", notice: "распознаю запись…", holdArmed: false });
         const finish = capture.finishRecording;

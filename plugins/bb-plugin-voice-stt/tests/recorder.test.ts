@@ -78,6 +78,20 @@ class FakeCapture implements MicCaptureLike {
     this.parked += 1;
     this.cb = null;
   }
+  streaming = false;
+  flushes = 0;
+  isStreaming(): boolean {
+    return this.streaming;
+  }
+  async flushStream(): Promise<void> {
+    this.flushes += 1;
+    this.emit(1600); // хвост
+  }
+  /** Web Audio молчит, но звук идёт потоком (MediaRecorder + раскодирование). */
+  fireStream(): void {
+    this.streaming = true;
+    this.ev?.({ kind: "stream", info: "recorder audio/mp4; stream test" });
+  }
   /** Web Audio замолчал → запасной режим MediaRecorder. */
   fireFallback(): void {
     this.recorderMode = true;
@@ -430,6 +444,22 @@ describe("voiceRecorder (§3.3, §9)", () => {
     const logs = r.rpcCalls.filter((c) => c.method === "clientLog").map((c) => (c.input as { msg: string }).msg);
     expect(logs.some((m) => m.startsWith("recorder file 2 KB audio/mp4"))).toBe(true);
     expect(logs.some((m) => /deliver: \d+ chars via .*\[recorder\] → inserted/.test(m))).toBe(true);
+  });
+
+  it("потоковый запасной захват: сессия живёт, хвост досылается до end, без петли", async () => {
+    const r = makeRecorder();
+    r.recorder.pressStart(new FakeComposer(), 1);
+    const sock = await openWithHello(r);
+    r.capture.fireStream();
+    expect(sock.json().some((f) => f.type === "cancel")).toBe(false); // живая сессия не отменена
+    r.capture.emit();
+    r.recorder.stop();
+    for (let i = 0; i < 4; i++) await new Promise((res) => setTimeout(res, 0));
+    expect(r.capture.flushes).toBe(1);
+    expect(sock.binary().length).toBeGreaterThanOrEqual(2); // кусок + хвост ушли в сессию
+    expect(sock.json().at(-1)).toEqual({ type: "end" });
+    expect(r.recorder.getSnapshot().phase).toBe("finishing");
+    r.recorder.cancel();
   });
 
   it("cancel sends cancel and never inserts", async () => {
