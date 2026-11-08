@@ -46,6 +46,9 @@ export const MIGRATIONS: readonly string[] = [
   // §5.3 `interrupted` outcome: how many times the watchdog already asked
   // the executor to resume after a non-manual interruption.
   `ALTER TABLE delegations ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0`,
+  // §7 retry limit: consecutive failed retries of one reconcile action
+  // (unconfirmed stop, reissue dispatch with an unknown outcome).
+  `ALTER TABLE delegations ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -80,6 +83,7 @@ export interface DelegationRow {
   last_approval_notified_at: number | null;
   timeout_notified_at: number | null;
   resume_count: number;
+  retry_count: number;
   created_at: number;
   updated_at: number;
 }
@@ -364,6 +368,46 @@ export class DelegationStore {
          WHERE id = ?`,
       )
       .run(Date.now(), id);
+  }
+
+  /** §7 retry limit: another failed retry of the same action. */
+  bumpRetry(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET retry_count = retry_count + 1, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(Date.now(), id);
+  }
+
+  /** §7 retry limit: the action finally succeeded — reset the counter. */
+  resetRetry(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET retry_count = 0, updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), id);
+  }
+
+  /** One setup_errors entry by step name, or undefined. */
+  findSetupError(
+    row: DelegationRow,
+    step: string,
+  ): { step: string; detail: string; time: number } | undefined {
+    try {
+      const parsed = JSON.parse(row.setup_errors) as {
+        step?: string;
+        detail?: string;
+        time?: number;
+      }[];
+      if (!Array.isArray(parsed)) return undefined;
+      const hit = parsed.filter((e) => e?.step === step).at(-1);
+      return hit && typeof hit.detail === "string"
+        ? { step, detail: hit.detail, time: hit.time ?? 0 }
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Rows in any of the given statuses, oldest first. */

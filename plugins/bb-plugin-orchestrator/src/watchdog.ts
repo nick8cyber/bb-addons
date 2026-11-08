@@ -176,7 +176,9 @@ export async function findTaskThreadId(
       id: t.threadId,
       at: t.attachedAt ? Date.parse(t.attachedAt) : Number.NaN,
     }))
-    .filter((t) => Number.isNaN(t.at) || t.at >= createdAfter)
+    // An unparseable `attachedAt` cannot prove the thread is newer than
+    // the record — drop it; the remaining sort is then stable.
+    .filter((t) => Number.isFinite(t.at) && t.at >= createdAfter)
     .sort((a, b) => a.at - b.at);
   return candidates[0]?.id ?? null;
 }
@@ -254,6 +256,8 @@ export function createWatchdog(deps: WatchdogDeps) {
         ],
       });
     } catch (e) {
+      const msg = `resume send failed: ${message(e)}`;
+      store.addSetupError(row.id, "resume-send", msg);
       log.warn?.(`orchestrator: resume to ${row.thread_id}: ${message(e)}`);
     }
   };
@@ -321,7 +325,9 @@ export function createWatchdog(deps: WatchdogDeps) {
     const outcomeText =
       outcome === "stalled"
         ? "исполнитель завис"
-        : `квота исполнителя исчерпана (${detail.slice(0, 120)})`;
+        : detail
+          ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
+          : "квота исполнителя исчерпана";
     let nextName: string | undefined;
     let nextRoute: PolicyRoute | undefined;
     if (info.level?.autoFallback && info.policy) {
@@ -343,25 +349,49 @@ export function createWatchdog(deps: WatchdogDeps) {
       }
     }
     if (nextName && nextRoute) {
-      // One transaction: old → `reissued`, new → `dispatching` + reissue_of.
-      const fresh = store.reissue(row.id, {
-        route: nextName,
-        preset: nextRoute.preset,
-        provider: nextRoute.provider,
-      });
+      // §5.4 rev 15: the task may already carry an active delegation (the
+      // coordinator re-delegated manually while the stop retried) — the
+      // unique index then refuses the insert; the row keeps its outcome
+      // status and the coordinator hears about it exactly once.
+      let fresh: DelegationRow | undefined;
+      try {
+        fresh = store.reissue(row.id, {
+          route: nextName,
+          preset: nextRoute.preset,
+          provider: nextRoute.provider,
+        });
+      } catch (e) {
+        const current = store.get(row.id) ?? row;
+        if (!hasSetupError(current, "reissue-conflict")) {
+          store.addSetupError(row.id, "reissue-conflict", message(e));
+          await report(
+            row,
+            `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} — ` +
+              `перевыпуск за координатором: у задачи уже есть активное ` +
+              `делегирование`,
+          );
+        }
+        return;
+      }
       if (fresh) {
         try {
-          const res = await deps.dispatch(fresh);
+          const res = await deps.dispatch(fresh, {
+            onDispatchFailure: "fail",
+          });
           await report(
             row,
             `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} → ` +
               `перевыпущено на ${nextName}, новый тред ${res.threadId ?? "—"}`,
           );
         } catch (e) {
+          const code = (e as { code?: string }).code;
           await report(
             row,
-            `${outcomeText}: задача ${row.task_key}, перевыпуск на ${nextName} ` +
-              `не удался: ${message(e)}`,
+            code === "dispatch-failed"
+              ? `${outcomeText}: задача ${row.task_key}, перевыпуск потерян — ` +
+                  `раздача на ${nextName} отклонена (${message(e)})`
+              : `${outcomeText}: задача ${row.task_key}, перевыпуск на ` +
+                  `${nextName} не удался: ${message(e)}`,
           );
         }
         return;
@@ -392,7 +422,9 @@ export function createWatchdog(deps: WatchdogDeps) {
     const outcomeText =
       outcome === "stalled"
         ? "исполнитель завис"
-        : `квота исполнителя исчерпана (${detail.slice(0, 120)})`;
+        : detail
+          ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
+          : "квота исполнителя исчерпана";
     if (await confirmStop(row)) {
       await outcomeAndMaybeReissue(row, outcome, detail);
       return;
@@ -419,6 +451,7 @@ export function createWatchdog(deps: WatchdogDeps) {
   const handleInterrupted = async (
     row: DelegationRow,
     reason: string,
+    at: number,
   ): Promise<boolean> => {
     const fresh = store.get(row.id);
     if (!fresh || fresh.status !== "running") return true;
@@ -426,10 +459,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       await toStalled(fresh, `повторное прерывание хода (${reason})`);
       return true;
     }
-    // Clear the turn markers first: a following idle must not read as
-    // `done` while the resume message is still in flight.
-    store.clearTurn(fresh.id);
+    // §5.3 rev 15: the interrupt time opens the window for the NEW turn —
+    // if none starts within `firstResponseSeconds`, the row is treated as
+    // a repeat interruption. `resume-await` marks the wait; a following
+    // idle must not read as `done` while the resume is still in flight.
     store.bumpResume(fresh.id);
+    store.setTurnStarted(fresh.id, at);
+    store.addSetupError(fresh.id, "resume-await", reason);
     await sendToExecutor(fresh, `ход прерван (${reason}), продолжай задачу`);
     await notifyCoordinator(
       fresh,
@@ -489,7 +525,10 @@ export function createWatchdog(deps: WatchdogDeps) {
 
   // ── Event stream (§5.1) ──────────────────────────────────────────────
 
-  const errorTextOf = (data: Record<string, unknown>): string | null => {
+  const errorTextOf = (
+    data: Record<string, unknown> | undefined | null,
+  ): string | null => {
+    if (!data) return null;
     const parts = [
       data.message,
       data.detail,
@@ -512,6 +551,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     const data = (ev.data ?? {}) as Record<string, unknown>;
     if (ev.type === "turn/started") {
       store.setTurnStarted(id, ev.createdAt);
+      store.clearSetupError(id, "resume-await"); // the resumed turn began
       interrupted.delete(id);
       return false;
     }
@@ -524,7 +564,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         interrupted.add(id);
         return false;
       }
-      return handleInterrupted(row, reason);
+      return handleInterrupted(row, reason, ev.createdAt);
     }
     if (ev.type === "provider/error" || ev.type === "system/error") {
       const text = errorTextOf(data);
@@ -543,6 +583,22 @@ export function createWatchdog(deps: WatchdogDeps) {
         const info = await routeInfo(row);
         if (matchesQuota(text, info.patterns)) {
           await toQuota(row, `${ev.type}: ${text.slice(0, 200)}`);
+          return true;
+        }
+      }
+      return false;
+    }
+    if (ev.type === "turn/completed") {
+      // §5.2: the turn's own error text is a quota fallback signal too —
+      // a lost turn.failed lifecycle event must not hide a rate limit.
+      const errText = errorTextOf(
+        data.error as Record<string, unknown> | undefined,
+      );
+      if (errText) {
+        lastErrorText.set(id, errText);
+        const info = await routeInfo(row);
+        if (matchesQuota(errText, info.patterns)) {
+          await toQuota(row, `turn/completed: ${errText.slice(0, 200)}`);
           return true;
         }
       }
@@ -641,6 +697,14 @@ export function createWatchdog(deps: WatchdogDeps) {
       // An unreadable queue is not an empty one — stay running.
       log.warn?.(`orchestrator: queuedMessages ${thread.id}: ${message(e)}`);
       return;
+    }
+    // §5.3 rev 15: a resumed turn that never began is a repeat
+    // interruption — `stalled` → §5.4, never `done`.
+    if (hasSetupError(row, "resume-await")) {
+      if (queue.length === 0) {
+        await toStalled(row, "продолжение не подняло новый ход");
+      }
+      return; // queue holds the resume message — give it time to deliver
     }
     if (queue.length === 0) {
       store.setStatus(row.id, "done");
@@ -825,6 +889,19 @@ export function createWatchdog(deps: WatchdogDeps) {
         }
         // Re-read the thread: a finished turn may already have idled it.
         const thread = await getThread(row.thread_id);
+        // §5.3 rev 15: a pending resume shares the window — an idle
+        // executor with an empty queue never began the new turn → stalled.
+        if (hasSetupError(fresh, "resume-await")) {
+          if (!thread || thread.status !== "active") {
+            const queue = await deps.threads.queuedMessages
+              .list({ threadId: row.thread_id! })
+              .catch(() => null);
+            if (queue && queue.length === 0) {
+              await toStalled(fresh, "продолжение не подняло новый ход");
+            }
+          }
+          continue;
+        }
         if (thread && thread.status === "active") {
           await toStalled(
             fresh,
@@ -848,6 +925,34 @@ export function createWatchdog(deps: WatchdogDeps) {
 
   // ── Reconcile (§7) ───────────────────────────────────────────────────
 
+  /**
+   * §7 retry limit: 10 consecutive failed retries of the same action →
+   * `retry-exhausted` in setup_errors and one coordinator message with
+   * the last error and the manual-resolution commands.
+   */
+  const RETRY_LIMIT = 10;
+  const retryExhausted = async (row: DelegationRow, action: string) => {
+    const current = store.get(row.id) ?? row;
+    if (hasSetupError(current, "retry-exhausted")) return;
+    const last =
+      store.findSetupError(current, "watchdog-stop")?.detail ?? "—";
+    store.addSetupError(row.id, "retry-exhausted", last);
+    await report(
+      row,
+      `исчерпан предел повторов (${RETRY_LIMIT}): ${action} по ` +
+        `делегированию #${row.id} — последняя ошибка: ${last}. Ручное ` +
+        `решение: \`bb orchestrator show ${row.id}\` и ` +
+        `\`bb orchestrator cancel ${row.id}\`, затем раздать заново`,
+    );
+  };
+
+  /** §7 retry limit shared by the reconcile paths. */
+  const trackRetry = async (row: DelegationRow, action: string) => {
+    store.bumpRetry(row.id);
+    const fresh = store.get(row.id) ?? row;
+    if (fresh.retry_count >= RETRY_LIMIT) await retryExhausted(fresh, action);
+  };
+
   /** The §5.4 completion report for a `reissue_of` row the reconcile
    * finished: without it a restart between the transaction and the
    * dispatch would leave the coordinator uninformed. */
@@ -865,16 +970,25 @@ export function createWatchdog(deps: WatchdogDeps) {
     s: ReconcileSummary,
   ) => {
     if (now() - row.created_at < DISPATCH_GRACE_MS) return;
+    // §7 retry limit: an exhausted reissue stays `dispatching` for the
+    // coordinator to resolve by hand — retries stop entirely.
+    if (hasSetupError(row, "retry-exhausted")) return;
     if (!row.thread_id) {
       // «Результат раздачи неизвестен»: find the thread the tasks plugin
       // attached after the record was created.
-      const threadId = await findTaskThreadId(
-        deps.bbCli,
-        row.task_key,
-        row.created_at,
-      ).catch((e) => {
+      let threadId: string | null;
+      try {
+        threadId = await findTaskThreadId(
+          deps.bbCli,
+          row.task_key,
+          row.created_at,
+        );
+      } catch (e) {
+        if (row.reissue_of != null) {
+          await trackRetry(row, "доведение перевыпуска");
+        }
         throw new OrchestratorError("bb-cli-failed", message(e));
-      });
+      }
       if (!threadId) {
         if (row.reissue_of != null) {
           // §5.4 rev 13: a reissue record is driven to dispatch, never
@@ -884,6 +998,7 @@ export function createWatchdog(deps: WatchdogDeps) {
             const res = await deps.dispatch(store.get(row.id) ?? row, {
               onDispatchFailure: "fail",
             });
+            store.resetRetry(row.id); // resolved — the streak is over
             if (res.status === "running") {
               s.relinked++;
               await reportReissueDone(store.get(row.id) ?? row);
@@ -901,9 +1016,11 @@ export function createWatchdog(deps: WatchdogDeps) {
                 `перевыпуск потерян: задача ${row.task_key}, маршрут ` +
                   `${row.route} — раздача отклонена (${message(e)})`,
               );
+            } else {
+              // `dispatch-unknown` leaves the row `dispatching`; the
+              // §7 limit bounds how long the next passes may retry.
+              await trackRetry(row, "доведение перевыпуска");
             }
-            // `dispatch-unknown` leaves the row `dispatching`; the next
-            // pass either relinks the thread or retries.
           }
           return;
         }
@@ -992,13 +1109,24 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     // §5.4 rev 13: stalled/quota rows whose stop never confirmed get the
     // stop retried; once confirmed, the reissue decision runs as usual.
+    // §7: bounded by retry_count — exhausted rows stop retrying.
     for (const row of store.listByStatuses(["stalled", "quota"])) {
       if (!hasSetupError(row, "watchdog-stop")) continue;
+      if (hasSetupError(row, "retry-exhausted")) continue;
       summary.scanned++;
       try {
         if (await confirmStop(row)) {
           store.clearSetupError(row.id, "watchdog-stop");
-          await outcomeAndMaybeReissue(row, row.status as "stalled" | "quota", "");
+          store.clearSetupError(row.id, "watchdog-stop-reported");
+          store.resetRetry(row.id);
+          const cur = store.get(row.id) ?? row;
+          await outcomeAndMaybeReissue(
+            cur,
+            cur.status as "stalled" | "quota",
+            store.findSetupError(cur, "watchdog-stop")?.detail ?? "",
+          );
+        } else {
+          await trackRetry(row, "остановка исполнителя");
         }
       } catch (e) {
         summary.errors.push(`delegation #${row.id}: ${message(e)}`);

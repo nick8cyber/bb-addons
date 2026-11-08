@@ -387,16 +387,22 @@ async function ensureBypassMode(
   }
 }
 
+/**
+ * Returns `true` when the step is settled for this delegation — the
+ * preset is not `full`, or the session already reported its options
+ * (mode set, already `bypass`, or `bypass` not offered). An empty options
+ * list means the session is still building → `false`, retry next pass.
+ */
 async function ensureBypassModeOrThrow(
   row: DelegationRow,
   threadId: string,
   deps: DispatchStepsDeps,
-): Promise<void> {
+): Promise<boolean> {
   const show = await runJson<{ preset?: { permissionMode?: string } }>(
     deps.bbCli,
     ["tasks", "preset", "show", row.preset, "--json"],
   );
-  if (show.preset?.permissionMode !== "full") return;
+  if (show.preset?.permissionMode !== "full") return true;
   const opts = await runJson<{
     options?:
       | {
@@ -407,7 +413,9 @@ async function ensureBypassModeOrThrow(
         }[]
       | null;
   }>(deps.bbCli, ["thread", "options", threadId, "--json"]);
-  const mode = (opts.options ?? []).find(
+  const options = opts.options ?? [];
+  if (!options.length) return false; // §4.5: retry while options unseen
+  const mode = options.find(
     (o) => o.id === "mode" || o.name === "mode",
   );
   const offers = (mode?.values ?? []).some((v) =>
@@ -422,6 +430,7 @@ async function ensureBypassModeOrThrow(
       "mode=bypass",
     ]);
   }
+  return true;
 }
 
 /**
@@ -490,12 +499,24 @@ export async function retrySetupSteps(
       ]),
     );
   }
-  // Best-effort by design, bounded by the retry window: the session may
-  // report options only now, but not forever.
-  if (Date.now() - row.created_at < BYPASS_RETRY_WINDOW_MS) {
-    await attempt("bypass-mode", () =>
-      ensureBypassModeOrThrow(row, threadId, deps),
-    );
+  // §4.5 "пока сессия не сообщит опции": retry while the options list is
+  // empty — and stop for good once it reported (marked `bypass-settled`)
+  // or the delegation outgrew the retry window.
+  if (
+    Date.now() - row.created_at < BYPASS_RETRY_WINDOW_MS &&
+    !store.findSetupError(row, "bypass-settled")
+  ) {
+    try {
+      if (await ensureBypassModeOrThrow(row, threadId, deps)) {
+        store.addSetupError(row.id, "bypass-settled", "options reported");
+        store.clearSetupError(row.id, "bypass-mode");
+      }
+    } catch (e) {
+      const msg = message(e);
+      store.clearSetupError(row.id, "bypass-mode");
+      store.addSetupError(row.id, "bypass-mode", msg);
+      errors.push({ step: "bypass-mode", message: msg });
+    }
   }
   if (recorded.has("comment")) {
     await attempt("comment", () =>
