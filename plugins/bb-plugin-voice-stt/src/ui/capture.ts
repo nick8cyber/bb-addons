@@ -677,8 +677,9 @@ export class MicCapture implements MicCaptureLike {
       this.decodeFails = 0;
     } catch (e) {
       this.decodeFails += 1;
-      if (this.decodeFails >= STREAM_MAX_DECODE_FAILS && this.sentSamples === 0 && this.streaming) {
-        // Раскодировать кусками не выходит — файл целиком после записи.
+      if (this.decodeFails >= STREAM_MAX_DECODE_FAILS && this.streaming) {
+        // Раскодировать кусками не выходит (в т.ч. после уже отправленных
+        // кусков) — файл целиком после записи: в нём вся запись, без потерь.
         this.streaming = false;
         this.onEvent({
           kind: "fallback",
