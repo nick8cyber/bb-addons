@@ -181,8 +181,12 @@ export async function findTaskThreadId(
   if (candidates[0]) return candidates[0].id;
   // A task thread exists but its `attachedAt` does not parse — taking it
   // is wrong less often than dispatching a duplicate executor (§5.4).
+  // Dated entries that failed the `createdAfter` filter are proven OLDER
+  // than the record and must never be picked.
   const undatable = (res.taskThreads ?? []).find(
-    (t) => typeof t.threadId === "string",
+    (t) =>
+      typeof t.threadId === "string" &&
+      !Number.isFinite(Date.parse(t.attachedAt ?? "")),
   );
   return undatable?.threadId ?? null;
 }

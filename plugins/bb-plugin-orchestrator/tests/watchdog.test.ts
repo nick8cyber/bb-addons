@@ -1251,3 +1251,47 @@ test("bypass-settled stops the options check (Н6 следствие)", async ()
   assert.equal(optionsCalls(), before);
 });
 
+
+test("findTaskThreadId: dated-but-old entries never win the fallback (Н7)", async () => {
+  const mk = (taskThreads: unknown[]): BbCli => ({
+    run: async (args) =>
+      args.join(" ").startsWith("tasks threads")
+        ? ok(JSON.stringify({ taskThreads }))
+        : ok(),
+  });
+  const older = new Date(T0 - 60_000).toISOString();
+  // a dated-old entry first, then an undated one → the undated wins
+  assert.equal(
+    await findTaskThreadId(
+      mk([
+        { threadId: "thr_old", attachedAt: older },
+        { threadId: "thr_undated", attachedAt: "garbage" },
+      ]),
+      "PLUG-1",
+      T0,
+    ),
+    "thr_undated",
+  );
+  // only a dated-old entry → null, never the predecessor's thread
+  assert.equal(
+    await findTaskThreadId(
+      mk([{ threadId: "thr_old", attachedAt: older }]),
+      "PLUG-1",
+      T0,
+    ),
+    null,
+  );
+  // a fresh dated entry beats the undated one entirely
+  assert.equal(
+    await findTaskThreadId(
+      mk([
+        { threadId: "thr_old", attachedAt: older },
+        { threadId: "thr_fresh", attachedAt: new Date(T0 + 1000).toISOString() },
+        { threadId: "thr_undated", attachedAt: "garbage" },
+      ]),
+      "PLUG-1",
+      T0,
+    ),
+    "thr_fresh",
+  );
+});
