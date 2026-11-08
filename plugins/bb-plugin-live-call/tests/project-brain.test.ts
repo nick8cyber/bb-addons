@@ -827,6 +827,54 @@ describe("8. Ревью координатора (findings 1–5, P3)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("(1) null и другие не-объектные arguments отклоняются даже без required", async () => {
+    const dir = join(testDir, "null-arguments");
+    const invalid = [null, "oops", [], true, 7];
+    const thread = makeBrainThread([
+      ...invalid.map((value) => (ctx: { requestId: string }) =>
+        JSON.stringify({ requestId: ctx.requestId, kind: "read", tool: "crm__get_info", arguments: value })),
+      answer("ограничение получено"),
+    ]);
+    const { sdk, sendCalls } = makeSdk(thread);
+    const db = new Database(":memory:");
+    const store = new CallStore(db);
+    const executeRead = vi.fn(async () => ({ ok: true, result: "данные" } as BrainReadResult));
+    const brain = makeBrain({ sdk, store, storageDir: dir, executeRead });
+    try {
+      await brain.start();
+      expect((await brain.ask("инфо")).ok).toBe(true);
+      expect(executeRead).not.toHaveBeenCalled();
+      expect(sendCalls.filter((c) => c.text.includes("invalid_arguments"))).toHaveLength(invalid.length);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("(1) пропущенные arguments и пустой объект сохраняют вызов без параметров", async () => {
+    const dir = join(testDir, "empty-arguments");
+    const thread = makeBrainThread([
+      (ctx) => JSON.stringify({ requestId: ctx.requestId, kind: "read", tool: "crm__get_info" }),
+      read("crm__get_info", {}),
+      answer("готово"),
+    ]);
+    const { sdk } = makeSdk(thread);
+    const db = new Database(":memory:");
+    const store = new CallStore(db);
+    const executeRead = vi.fn(async (_tool: string, _args: Record<string, unknown>, _ms: number) =>
+      ({ ok: true, result: "данные" } as BrainReadResult));
+    const brain = makeBrain({ sdk, store, storageDir: dir, executeRead });
+    try {
+      await brain.start();
+      expect((await brain.ask("инфо")).ok).toBe(true);
+      expect(executeRead).toHaveBeenCalledTimes(2);
+      expect(executeRead.mock.calls.map((call) => call[1])).toEqual([{}, {}]);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("(2) зависший send: timeout в бюджете, busy освобождается, вызовов после дедлайна нет", async () => {
     vi.useFakeTimers();
     try {
