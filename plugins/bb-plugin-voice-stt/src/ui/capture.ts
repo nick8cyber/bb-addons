@@ -66,6 +66,8 @@ const STREAM_SLICE_MS = 400;
 const STREAM_HOLDBACK_SAMPLES = 1024; // ~64 мс
 const STREAM_EMIT_SAMPLES = 800; // 50 мс, как кадр worklet
 const STREAM_MAX_DECODE_FAILS = 3;
+/** Сколько ждать хвост записи после requestData() при остановке. */
+const FLUSH_WAIT_MS = 700;
 
 /** Готовая запись запасного режима. */
 export interface RecordedAudio {
@@ -709,19 +711,24 @@ export class MicCapture implements MicCaptureLike {
     if (mr === null || !this.streaming) return;
     // Забрать незакрытый кусок и раскодировать всё до конца, хвост включительно.
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 700);
       const prev = mr.ondataavailable;
-      mr.ondataavailable = (e: BlobEvent) => {
-        if (e.data && e.data.size > 0) this.mrChunks.push(e.data);
-        mr.ondataavailable = prev;
+      const done = (): void => {
         clearTimeout(timer);
+        mr.ondataavailable = prev;
         resolve();
+      };
+      const timer = setTimeout(done, FLUSH_WAIT_MS);
+      mr.ondataavailable = (e: BlobEvent) => {
+        // Chromium отвечает на requestData() сначала пустым событием, а
+        // сам хвост (0,2–0,3 с) приходит следующим. Пустое — ждём дальше.
+        if (!e.data || e.data.size === 0) return;
+        this.mrChunks.push(e.data);
+        done();
       };
       try {
         mr.requestData();
       } catch {
-        clearTimeout(timer);
-        resolve();
+        done();
       }
     });
     if (this.decodeBusy !== null) await this.decodeBusy.catch(() => {});
