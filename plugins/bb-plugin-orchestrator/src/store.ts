@@ -49,6 +49,19 @@ export const MIGRATIONS: readonly string[] = [
   // §7 retry limit: consecutive failed retries of one reconcile action
   // (unconfirmed stop, reissue dispatch with an unknown outcome).
   `ALTER TABLE delegations ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`,
+  // §7/§13.2: the new-chat window's current role pick per project, and the
+  // decided role per thread (source of truth for §3 and §13).
+  `CREATE TABLE IF NOT EXISTS pending_roles (
+    project_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS thread_roles (
+    thread_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    decided_at INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('hook','delegate'))
+  )`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -92,6 +105,21 @@ export interface RouteHoldRow {
   quota_group: string;
   until: number;
   reason: string;
+}
+
+export interface PendingRoleRow {
+  project_id: string;
+  role: string;
+  updated_at: number;
+}
+
+export type ThreadRoleSource = "hook" | "delegate";
+
+export interface ThreadRoleRow {
+  thread_id: string;
+  role: string;
+  decided_at: number;
+  source: ThreadRoleSource;
 }
 
 interface SetupError {
@@ -524,5 +552,57 @@ export class DelegationStore {
     return this.db
       .prepare(`SELECT * FROM route_holds ORDER BY until DESC`)
       .all() as RouteHoldRow[];
+  }
+
+  // ── Roles (§13.2) ─────────────────────────────────────────────────
+
+  /** The new-chat window's remembered pick for one project. */
+  pendingRole(projectId: string): string | undefined {
+    return (
+      this.db
+        .prepare(`SELECT role FROM pending_roles WHERE project_id = ?`)
+        .get(projectId) as { role: string } | undefined
+    )?.role;
+  }
+
+  /** Current selection wins: the row stores only the latest pick. */
+  setPendingRole(projectId: string, role: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO pending_roles (project_id, role, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(project_id) DO UPDATE SET
+           role = excluded.role, updated_at = excluded.updated_at`,
+      )
+      .run(projectId, role, Date.now());
+  }
+
+  /** The decided role of a thread, when the hook or delegate recorded it. */
+  threadRole(threadId: string): ThreadRoleRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM thread_roles WHERE thread_id = ?`)
+      .get(threadId) as ThreadRoleRow | undefined;
+  }
+
+  /**
+   * §13.2: record the decision once — or correct it. The delegate path
+   * upserts because the hook may already have written `executor` from the
+   * title alone before the delegation row existed (§4 step 4).
+   */
+  setThreadRole(
+    threadId: string,
+    role: string,
+    source: ThreadRoleSource,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO thread_roles (thread_id, role, decided_at, source)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET
+           role = excluded.role,
+           decided_at = excluded.decided_at,
+           source = excluded.source`,
+      )
+      .run(threadId, role, Date.now(), source);
   }
 }

@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
-import { runDelegate, createDelegateQueue, type DelegateDeps } from "../src/delegate.js";
+import {
+  runDelegate,
+  createDelegateQueue,
+  retrySetupSteps,
+  type DelegateDeps,
+} from "../src/delegate.js";
 import { parsePolicy } from "../src/policy.js";
 import { OrchestratorError } from "../src/errors.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
@@ -45,6 +50,7 @@ interface Call {
 function makeDeps(overrides: {
   cli?: (args: string[]) => BbCliResult | Promise<BbCliResult>;
   threadsUpdate?: () => Promise<unknown>;
+  updatePluginMetadata?: () => Promise<unknown>;
   policyText?: string;
   held?: [string, number][];
 } = {}) {
@@ -80,6 +86,7 @@ function makeDeps(overrides: {
   };
   const updates: unknown[] = [];
   const stops: string[] = [];
+  const metadata: { threadId: string; set: { role: string } }[] = [];
   const deps: DelegateDeps = {
     store,
     bbCli: cli,
@@ -93,15 +100,22 @@ function makeDeps(overrides: {
         stops.push(threadId);
         return {};
       },
+      updatePluginMetadata: async (args) => {
+        metadata.push(args);
+        if (overrides.updatePluginMetadata)
+          return overrides.updatePluginMetadata();
+        return {};
+      },
     },
     loadPolicy: async () =>
       parsePolicy(overrides.policyText ?? POLICY_TEXT, PRESETS),
     probes: {
       delegationByThreadId: (id) => store.byThreadId(id),
       hasFreshDispatching: (s, scope) => store.hasFreshDispatching(s, scope),
+      roleByThreadId: (id) => store.threadRole(id)?.role,
     },
   };
-  return { deps, store, calls, updates, stops, db };
+  return { deps, store, calls, updates, stops, metadata, db };
 }
 
 test("happy path: record → dispatch → attach → bypass → running → comment", async () => {
@@ -542,4 +556,98 @@ test("configure during the dispatch window: unlinked executor gets nothing", asy
     probes: deps.probes,
   });
   assert.deepEqual(config.tools, []);
+});
+
+test("step 4: the executor's role is recorded and mirrored to metadata", async () => {
+  const { deps, store, metadata } = makeDeps();
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  const row = store.threadRole("thr_exec")!;
+  assert.equal(row.role, "executor");
+  assert.equal(row.source, "delegate");
+  assert.deepEqual(metadata, [
+    { threadId: "thr_exec", set: { role: "executor" } },
+  ]);
+  void res;
+});
+
+test("step 4: review level delegates an auditor, correcting a hook guess", async () => {
+  const { deps, store, metadata } = makeDeps({
+    policyText: JSON.stringify({
+      version: 1,
+      levels: { review: { chain: ["simple"] } },
+      routes: { simple: { preset: "simple", provider: "p" } },
+    }),
+  });
+  // The hook may already have written `executor` from the bare title.
+  store.setThreadRole("thr_exec", "executor", "hook");
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "review", caller: COORDINATOR },
+    deps,
+  );
+  const row = store.threadRole("thr_exec")!;
+  assert.equal(row.role, "auditor");
+  assert.equal(row.source, "delegate");
+  assert.deepEqual(metadata, [
+    { threadId: "thr_exec", set: { role: "auditor" } },
+  ]);
+});
+
+test("a thread with role executor gets not-a-coordinator through delegate", async () => {
+  const { deps, store, calls } = makeDeps();
+  store.setThreadRole("thr_exec2", "executor", "hook");
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        // executor-looking facts are absent on purpose — the role alone refuses
+        caller: { ...COORDINATOR, threadId: "thr_exec2" },
+      },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "not-a-coordinator",
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("a thread with role orchestrator delegates despite executor markers", async () => {
+  const { deps, store } = makeDeps();
+  store.setThreadRole("thr_exec2", "orchestrator", "hook");
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "simple",
+      caller: { ...COORDINATOR, threadId: "thr_exec2", parentThreadId: "thr_p" },
+    },
+    deps,
+  );
+  assert.equal(res.ok, true);
+});
+
+test("a failed role-metadata write lands in setup_errors and retries", async () => {
+  let fail = true;
+  const { deps, store, metadata } = makeDeps({
+    updatePluginMetadata: async () => {
+      if (fail) throw new Error("metadata endpoint down");
+      return {};
+    },
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.ok(res.setupErrors.some((e) => e.step === "role-metadata"));
+  assert.equal(store.get(res.delegationId)!.status, "running");
+  // reconcile retries it; a success clears the recorded error
+  fail = false;
+  const retried = await retrySetupSteps(store.get(res.delegationId)!, deps);
+  assert.deepEqual(retried, []);
+  assert.equal(
+    store.findSetupError(store.get(res.delegationId)!, "role-metadata"),
+    undefined,
+  );
+  assert.equal(metadata.length, 2);
 });

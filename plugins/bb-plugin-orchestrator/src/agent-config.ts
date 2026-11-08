@@ -4,8 +4,8 @@
  * Later stages extend this module: PLUG-141 adds role instructions and
  * `thread_roles` lookups.
  *
- * MVP coordinator test is the §3 fallback criterion: the thread has no
- * parent and shows no executor marker:
+ * §13: a `thread_roles` row decides by `delegates`; the §3 fallback
+ * criterion covers threads with no row — no parent and no executor marker:
  *   1. `origin.pluginId === "tasks"` (a thread created by `bb tasks dispatch`);
  *   2. the thread id is recorded in `delegations.thread_id`;
  *   3. the title looks like a dispatch title `<KEY> · …`;
@@ -17,6 +17,10 @@ import type {
   PluginAgentConfiguration,
   PluginAgentConfigurationContext,
 } from "@get-bb/plugin-sdk";
+import {
+  ROLES,
+  type RoleId,
+} from "./roles.js";
 
 export const COORDINATOR_TOOLS = [
   "orchestrator_delegate",
@@ -59,6 +63,12 @@ export interface ExecutorProbes {
     freshSince: number,
     scope: { projectId: string; excludingThreadId: string },
   ): boolean;
+  /**
+   * §13.2: the role `thread_roles` recorded for this thread, or undefined.
+   * A row decides the §3 question on its own (`delegates`); no row falls
+   * through to the fallback criterion.
+   */
+  roleByThreadId?(threadId: string): string | undefined;
 }
 
 /**
@@ -75,11 +85,19 @@ export function isCoordinatorByStaticFacts(facts: ThreadFacts): boolean {
   return true;
 }
 
+/** The §3 question for a decided role; an unknown id delegates nothing. */
+const roleDelegates = (roleId: string): boolean =>
+  ROLES[roleId as RoleId]?.delegates === true;
+
 export function isCoordinator(
   facts: ThreadFacts,
   probes: ExecutorProbes,
   now: number = Date.now(),
 ): boolean {
+  // §3/§13: a recorded role answers by `delegates`; only threads without a
+  // `thread_roles` row fall back to the executor markers.
+  const roleId = probes.roleByThreadId?.(facts.threadId);
+  if (roleId !== undefined) return roleDelegates(roleId);
   if (!isCoordinatorByStaticFacts(facts)) return false;
   if (probes.delegationByThreadId(facts.threadId)) return false;
   if (
@@ -112,14 +130,28 @@ export function buildAgentConfiguration(
     originPluginId: context.origin.pluginId,
     projectId: context.project.id,
   };
-  const coordinator = isCoordinator(
-    facts,
-    deps.probes,
-    deps.now ? deps.now() : Date.now(),
-  );
+  // §13.2 п.3: `configure` only reads `thread_roles` — it never writes a
+  // decision. No row → the §3 fallback criterion.
+  const roleId = deps.probes.roleByThreadId?.(facts.threadId);
+  const role = roleId !== undefined ? ROLES[roleId as RoleId] : undefined;
+  const coordinator =
+    roleId !== undefined
+      ? role?.delegates === true
+      : isCoordinator(facts, deps.probes, deps.now ? deps.now() : Date.now());
+
   if (!coordinator) {
-    return { tools: [], skills: [] };
+    // §3: other roles get their own instruction (when texts are on) and
+    // their own tools/skills — both empty for the MVP executor/auditor,
+    // and for a role id this plugin does not know.
+    if (!role) return { tools: [], skills: [] };
+    const config: PluginAgentConfiguration = {
+      tools: [...role.tools],
+      skills: [...role.skills],
+    };
+    if (deps.injectInstructions) config.instructions = role.instructions;
+    return config;
   }
+
   const config: PluginAgentConfiguration = {
     tools: [...COORDINATOR_TOOLS],
     skills: deps.injectInstructions
@@ -127,7 +159,14 @@ export function buildAgentConfiguration(
       : [SKILL_SETUP],
   };
   if (deps.injectInstructions) {
-    config.instructions = deps.instructionsText;
+    // §3 budget: role instruction (≤ 2500) + routing rule (≤ 1500) +
+    // separator stays under the SDK's 4096. A fallback-decided
+    // coordinator has no role row, so it gets the rule alone.
+    config.instructions = role
+      ? `${role.instructions}
+
+${deps.instructionsText}`
+      : deps.instructionsText;
   }
   return config;
 }

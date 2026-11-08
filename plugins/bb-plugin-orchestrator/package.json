@@ -16,7 +16,8 @@
     "server": "./server.ts",
     "skills": [
       "skills"
-    ]
+    ],
+    "app": "./app.tsx"
   },
   "keywords": [
     "bb-plugin"
@@ -28,7 +29,8 @@
   },
   "dependencies": {
     "@get-bb/plugin-sdk": "0.4.87",
-    "zod": "^4.3.6"
+    "zod": "^4.3.6",
+    "react": "^19.2.8"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
@@ -36,6 +38,7 @@
     "better-sqlite3": "^12.11.1",
     "typescript": "^5.7.0",
     "cron-parser": "^5.10.0",
-    "hono": "^4.13.7"
+    "hono": "^4.13.7",
+    "@types/react": "^19.0.0"
   }
 }

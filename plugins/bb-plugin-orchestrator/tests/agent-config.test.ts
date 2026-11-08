@@ -192,3 +192,32 @@ test("the fallback issues the same skills: coordinator always gets setup", () =>
   );
   assert.deepEqual(fbExec.skills, []);
 });
+
+test("a broken role read falls back to the static-facts result", () => {
+  // §3 resilience: a store error inside configure must not silence the
+  // plugin — the production handler catches and issues from static facts.
+  const broken: ExecutorProbes = {
+    delegationByThreadId: () => undefined,
+    hasFreshDispatching: () => false,
+    roleByThreadId: () => {
+      throw new Error("db gone");
+    },
+  };
+  assert.throws(() =>
+    buildAgentConfiguration(ctx({}), { ...deps, probes: broken }),
+  );
+  const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
+  assert.equal(fb.tools.length, 3);
+  assert.equal(fb.instructions, "RULE");
+});
+
+test("configure without a thread_roles row uses the fallback criterion", () => {
+  // No role row anywhere: the answer comes from executor markers only.
+  const config = buildAgentConfiguration(ctx({}), {
+    ...deps,
+    probes: { ...noProbes, roleByThreadId: () => undefined },
+  });
+  assert.equal(config.tools.length, 3);
+  // A fallback-decided coordinator has no role row → the rule alone.
+  assert.equal(config.instructions, "RULE");
+});

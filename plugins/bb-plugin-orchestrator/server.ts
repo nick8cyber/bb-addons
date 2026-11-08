@@ -7,10 +7,11 @@
  * the §7 reconcile pass behind `bb orchestrator reconcile`.
  */
 import { z } from "zod";
-import type {
-  BbPluginApi,
-  PluginCliContext,
-  StandardSchemaV1,
+import {
+  defineRpcContract,
+  type BbPluginApi,
+  type PluginCliContext,
+  type StandardSchemaV1,
 } from "@get-bb/plugin-sdk";
 import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
 import { parsePolicy, type PolicyLoad } from "./src/policy.js";
@@ -46,6 +47,51 @@ import {
   findTaskThreadId,
   type WatchdogThreads,
 } from "./src/watchdog.js";
+import {
+  handleMessageDispatch,
+  isRoleId,
+  ROLE_IDS,
+  type RoleDecisionProbes,
+} from "./src/roles.js";
+
+/** §13.2 п.1: the new-chat window's role picker writes the project's
+ * current selection through `setPendingRole`; `pendingRole` reads it back
+ * so a reopened window shows the remembered pick. */
+export const rpcContract = defineRpcContract({
+  setPendingRole: {
+    input: z.object({
+      projectId: z.string().nullable(),
+      role: z.enum(ROLE_IDS),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  pendingRole: {
+    input: z.object({ projectId: z.string().nullable() }),
+    output: z.object({ role: z.enum(ROLE_IDS).nullable() }),
+  },
+});
+
+/** The `pending_roles` RPC handlers; `projectId = null` (projectless
+ * compose) stores nothing and reads back the default. */
+export function pendingRoleRpc(store: DelegationStore) {
+  return {
+    setPendingRole({
+      projectId,
+      role,
+    }: {
+      projectId: string | null;
+      role: (typeof ROLE_IDS)[number];
+    }) {
+      if (projectId !== null) store.setPendingRole(projectId, role);
+      return { ok: true as const };
+    },
+    pendingRole({ projectId }: { projectId: string | null }) {
+      const role =
+        projectId === null ? undefined : store.pendingRole(projectId);
+      return { role: role !== undefined && isRoleId(role) ? role : null };
+    },
+  };
+}
 
 export interface OrchestratorDeps {
   bbCli?: BbCli;
@@ -124,6 +170,16 @@ export async function createPlugin(
     delegationByThreadId: (threadId) => store.byThreadId(threadId),
     hasFreshDispatching: (freshSince, scope) =>
       store.hasFreshDispatching(freshSince, scope),
+    roleByThreadId: (threadId) => store.threadRole(threadId)?.role,
+  };
+
+  // §13.2 п.1-2: the role decision's read side — synchronous SQLite only,
+  // the `message.dispatch` hook may not call out anywhere.
+  const roleProbes: RoleDecisionProbes = {
+    threadRole: (threadId) => store.threadRole(threadId),
+    pendingRole: (projectId) => store.pendingRole(projectId),
+    activeDelegationByTaskKey: (taskKey) =>
+      store.activeByTaskKey(taskKey),
   };
 
   /**
@@ -237,11 +293,28 @@ export async function createPlugin(
   // back to static facts and warns.
   bb.agents.configure((context) => {
     try {
-      return buildAgentConfiguration(context, {
+      const config = buildAgentConfiguration(context, {
         injectInstructions: currentSettings.injectInstructions ?? true,
         instructionsText: instructionsText(),
         probes,
       });
+      // §13.2 п.4: reflect the decided role into display metadata. The
+      // hook itself may not touch the network, so the write rides on the
+      // first session build after the decision — display-only either way.
+      const decided = store.threadRole(context.thread.id)?.role;
+      if (decided && context.pluginMetadata.role !== decided) {
+        void bb.sdk.threads
+          .updatePluginMetadata({
+            threadId: context.thread.id,
+            set: { role: decided },
+          })
+          .catch((e) =>
+            bb.log.warn(
+              `orchestrator: role metadata: ${describeError(e)}`,
+            ),
+          );
+      }
+      return config;
     } catch (e) {
       bb.log.warn(
         `orchestrator: configure fell back to static facts: ${describeError(e)}`,
@@ -253,6 +326,17 @@ export async function createPlugin(
       );
     }
   });
+
+  // §13.2 п.2 — the role decision hook; the handler lives in roles.ts so
+  // its decision and fail-closed path stay unit-testable.
+  bb.experimental_hooks.on("message.dispatch", (context) =>
+    handleMessageDispatch(
+      context,
+      roleProbes,
+      (threadId, role) => store.setThreadRole(threadId, role, "hook"),
+      (m) => bb.log.warn(`orchestrator: role hook skipped: ${m}`),
+    ),
+  );
 
   /** §4 caller facts: the invoking thread's identity for the coordinator gate. */
   const callerFacts = async (threadId: string): Promise<ThreadFacts> => {
@@ -419,6 +503,11 @@ export async function createPlugin(
       });
     },
   });
+
+  // ── RPC (§13.2 п.1): the composer's «Роль» picker. ─────────────────
+  // `projectId = null` is a projectless compose — the default role
+  // applies and nothing is stored.
+  bb.rpc.register(rpcContract, pendingRoleRpc(store));
 
   // ── Agent tools (§6): coordinators only, via configure. ──────────────
 

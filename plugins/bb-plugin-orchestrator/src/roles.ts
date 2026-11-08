@@ -1,0 +1,212 @@
+/**
+ * Agent roles (spec §13): the three MVP roles — `orchestrator` (default),
+ * `executor`, `auditor` — as plugin constants: instruction text (≤ 2500
+ * characters each, the §3 budget), the `delegates` flag that decides the
+ * §3 coordinator question, and the role's plugin tools and skills.
+ *
+ * The role binding lives in `thread_roles` (source of truth); the new-chat
+ * window's current pick lives in `pending_roles`. The `message.dispatch`
+ * hook decides the role once, on a thread's first message; `configure`
+ * only reads it. Everything here is synchronous and allocation-free to
+ * call — the hook runs under the server-wide dispatch lock.
+ */
+
+import type {
+  MessageDispatchHookContext,
+  MessageDispatchHookDecision,
+} from "@get-bb/plugin-sdk";
+
+/** §3 budget: one role instruction ≤ 2500 chars (role + rule ≤ 4096). */
+export const ROLE_INSTRUCTIONS_MAX = 2500;
+
+export type RoleId = "orchestrator" | "executor" | "auditor";
+
+export const ROLE_IDS: readonly RoleId[] = [
+  "orchestrator",
+  "executor",
+  "auditor",
+];
+
+export const DEFAULT_ROLE: RoleId = "orchestrator";
+
+export interface RoleDefinition {
+  id: RoleId;
+  /** §13.1: may this role hand work out — the §3 coordinator question. */
+  delegates: boolean;
+  instructions: string;
+  tools: readonly string[];
+  skills: readonly string[];
+}
+
+const ORCHESTRATOR_INSTRUCTIONS = `Ты — оркестратор. Твоя роль — раздавать работу исполнителям, а не выполнять её самому.
+
+- Составную задачу не делай сам: декомпозируй её в задачи bb tasks со спеками и раздавай исполнителям через orchestrator_delegate (bb orchestrator delegate <KEY> --level <уровень>).
+- Уровень выбирай по сложности; сомневаешься — бери выше, сложное не понижай.
+- После раздачи заканчивай ход: отчёт исполнителя придёт сообщением, ждать в форграунде нельзя.
+- Результат исполнителя проверяй сам, прежде чем сводить и отчитываться.
+- Ревью спек до раздачи и результата после — на уровне review (роль auditor).
+- Push, вливание и PR — только твоя зона: исполнители работают без них.
+- Не раздавай вручную (bb tasks dispatch, bb thread spawn) — только delegate.`;
+
+const EXECUTOR_INSTRUCTIONS = `Ты — исполнитель. Твоя роль — выполнить поставленную задачу самостоятельно.
+
+- Работай только в своей рабочей копии и своей ветке; чужие ветки и основной чекаут не трогай.
+- Субагентов не запускай и работу не перераздавай — задачу делаешь ты.
+- Делай строго по спеке задачи; расхождение со спекой — вопрос координатору, а не самодеятельность.
+- Без push и без PR: локальный коммит под автором из конфига репозитория; автор не задан — не коммить, напиши в отчёте.
+- Отчёт — комментарием в задачу: ветка, SHA, вывод проверок; статус in_review; done не ставь.
+- Не запускай команды с rm, git checkout/reset/clean и всё, что теряет чужую работу.`;
+
+const AUDITOR_INSTRUCTIONS = `Ты — аудитор. Твоя роль — только читать и проверять, ничего не меняя.
+
+- Не правь файлы, не коммить, не запускай раздачу и субагентов.
+- Проверяй по контракту: спека и ADR — источник истины, код сверяй с ними.
+- Формат находок: место (файл:строки) → проблема → исправление. Без находок — явный вердикт «замечаний нет».
+- Разделяй факты и оценки; сомнительное помечай, а не выдавай за факт.
+- Отчёт — вердиктом текстом: ОК или список находок; изменений в репозитории быть не должно.`;
+
+export const ROLES: Record<RoleId, RoleDefinition> = {
+  orchestrator: {
+    id: "orchestrator",
+    delegates: true,
+    instructions: ORCHESTRATOR_INSTRUCTIONS,
+    tools: [
+      "orchestrator_delegate",
+      "orchestrator_status",
+      "orchestrator_cancel",
+    ],
+    skills: ["orchestrator-coordinator", "orchestrator-setup"],
+  },
+  executor: {
+    id: "executor",
+    delegates: false,
+    instructions: EXECUTOR_INSTRUCTIONS,
+    tools: [],
+    skills: [],
+  },
+  auditor: {
+    id: "auditor",
+    delegates: false,
+    instructions: AUDITOR_INSTRUCTIONS,
+    tools: [],
+    skills: [],
+  },
+};
+
+export const isRoleId = (value: unknown): value is RoleId =>
+  typeof value === "string" && (ROLE_IDS as readonly string[]).includes(value);
+
+/**
+ * §4 step 4 + §13.2: a delegated thread's role from the dispatch level —
+ * `review` maps to `auditor`, every other level to `executor`.
+ */
+export const roleForLevel = (level: string): RoleId =>
+  level === "review" ? "auditor" : "executor";
+
+/** Dispatch titles carry the task key from birth: `<KEY> · <title>`. */
+const TASK_KEY_TITLE_RE = /^([A-Z][A-Z0-9]+-\d+) · /;
+
+export const taskKeyFromTitle = (title: string | null): string | null =>
+  title ? TASK_KEY_TITLE_RE.exec(title)?.[1] ?? null : null;
+
+/** The §13.2 п.2 hook inputs, already flattened from the hook context. */
+export interface RoleDecisionFacts {
+  threadId: string;
+  /** `thread.status` — only a `"pending"` thread is still undecided. */
+  status: string | null;
+  originPluginId: string | null;
+  title: string | null;
+  sourceThreadId: string | null;
+  parentThreadId: string | null;
+  /** `attempt` — `"start-turn"` only; join-turn is never a first message. */
+  attempt: string;
+  /** `origin` — `"app"` names a thread born in the new-chat window. */
+  origin: string | null;
+  projectId: string;
+}
+
+/**
+ * Synchronous SQLite reads only — the hook forbids CLI, network and await.
+ * `threadRole` doubles as the "already decided" check and the side-chat
+ * source lookup.
+ */
+export interface RoleDecisionProbes {
+  threadRole(threadId: string): { role: string } | undefined;
+  pendingRole(projectId: string): string | undefined;
+  activeDelegationByTaskKey(taskKey: string): { level: string } | undefined;
+}
+
+/**
+ * §13.2 п.2 — the role rule, evaluated strictly in the spec's branch order.
+ * Returns `null` when this dispatch is not the thread's first message (or
+ * the role is already recorded) and nothing may be written.
+ */
+export function decideRole(
+  facts: RoleDecisionFacts,
+  probes: RoleDecisionProbes,
+): RoleId | null {
+  if (facts.attempt !== "start-turn") return null;
+  if (facts.status !== "pending") return null;
+  if (probes.threadRole(facts.threadId)) return null;
+
+  // 1. A thread created by `bb tasks dispatch` is an executor; its level
+  //    decides auditor vs executor.
+  if (facts.originPluginId === "tasks") {
+    const key = taskKeyFromTitle(facts.title);
+    const row = key ? probes.activeDelegationByTaskKey(key) : undefined;
+    return row ? roleForLevel(row.level) : "executor";
+  }
+  // 2. A side chat / session handoff inherits the source thread's role;
+  //    no recorded source role — keep walking the rule.
+  if (facts.sourceThreadId) {
+    const source = probes.threadRole(facts.sourceThreadId);
+    if (source && isRoleId(source.role)) return source.role;
+  }
+  // 3. Any other child thread executes.
+  if (facts.parentThreadId) return "executor";
+  // 4. A chat from the new-thread window takes the project's current pick.
+  if (facts.origin === "app") {
+    const pending = probes.pendingRole(facts.projectId);
+    return pending !== undefined && isRoleId(pending)
+      ? pending
+      : DEFAULT_ROLE;
+  }
+  // 5. cli / plugin / sdk / automations.
+  return DEFAULT_ROLE;
+}
+
+/**
+ * The `message.dispatch` hook itself (§13.2 п.2). Fail-closed by the SDK —
+ * a throw or a >10 s answer fails the attempt, and the pass runs under one
+ * server lock — so the handler answers "proceed" on every path and touches
+ * only synchronous SQLite: no CLI, no network, no `await`. `record` writes
+ * the decided row (`source = hook`); display metadata is not written here —
+ * it rides on the next `configure` (§13.2 п.4).
+ */
+export function handleMessageDispatch(
+  context: MessageDispatchHookContext,
+  probes: RoleDecisionProbes,
+  record: (threadId: string, role: RoleId) => void,
+  warn?: (message: string) => void,
+): MessageDispatchHookDecision {
+  try {
+    const role = decideRole(
+      {
+        threadId: context.thread.id,
+        status: context.thread.status,
+        originPluginId: context.thread.originPluginId,
+        title: context.thread.title ?? context.thread.titleFallback,
+        sourceThreadId: context.thread.sourceThreadId,
+        parentThreadId: context.thread.parentThreadId,
+        attempt: context.attempt,
+        origin: context.origin,
+        projectId: context.project.id,
+      },
+      probes,
+    );
+    if (role) record(context.thread.id, role);
+  } catch (e) {
+    warn?.(e instanceof Error ? e.message : String(e));
+  }
+  return { action: "proceed" };
+}

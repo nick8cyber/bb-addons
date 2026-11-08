@@ -17,6 +17,7 @@ import { mergeDispatchInstructions } from "./instructions.js";
 import { pickRoute, type PolicyLoad } from "./policy.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
+import { roleForLevel } from "./roles.js";
 import { runChecked, runJson, type BbCli } from "./bb-cli.js";
 
 export interface SetupError {
@@ -61,6 +62,11 @@ export interface DelegateDeps {
       visibility?: "hidden" | "visible";
     }): Promise<unknown>;
     stop(args: { threadId: string }): Promise<unknown>;
+    /** §13.2 п.4 display metadata; absent in tests that do not fake it. */
+    updatePluginMetadata?(args: {
+      threadId: string;
+      set: { role: string };
+    }): Promise<unknown>;
   };
   loadPolicy(): Promise<PolicyLoad>;
   probes: ExecutorProbes;
@@ -347,6 +353,28 @@ export async function finishDispatchSteps(
     noteError("parent-notifications", e);
   }
 
+  // §4 step 4 / §13.2: record the executor's role — `review` level maps to
+  // `auditor`, everything else to `executor`. The upsert corrects a role
+  // the hook may already have guessed from the title alone; a corrected
+  // role applies from the next session build. Display metadata mirrors it
+  // (§13.2 п.4) — `thread_roles` stays the source of truth.
+  const role = roleForLevel(row.level);
+  try {
+    store.setThreadRole(threadId, role, "delegate");
+  } catch (e) {
+    noteError("thread-role", e);
+  }
+  if (deps.threads.updatePluginMetadata) {
+    try {
+      await deps.threads.updatePluginMetadata({
+        threadId,
+        set: { role },
+      });
+    } catch (e) {
+      noteError("role-metadata", e);
+    }
+  }
+
   await ensureBypassMode(row, noteError, deps);
 
   // Step 6 — `running` only from `dispatching`: a cancel that landed while
@@ -529,6 +557,19 @@ export async function retrySetupSteps(
       store.addSetupError(row.id, "bypass-mode", msg);
       errors.push({ step: "bypass-mode", message: msg });
     }
+  }
+  if (recorded.has("thread-role")) {
+    await attempt("thread-role", async () => {
+      store.setThreadRole(threadId, roleForLevel(row.level), "delegate");
+    });
+  }
+  if (recorded.has("role-metadata") && deps.threads.updatePluginMetadata) {
+    await attempt("role-metadata", () =>
+      deps.threads.updatePluginMetadata!({
+        threadId,
+        set: { role: roleForLevel(row.level) },
+      }),
+    );
   }
   if (recorded.has("comment")) {
     await attempt("comment", () =>
