@@ -2,7 +2,7 @@
 title: Orchestrator — раздача работы исполнителям как код
 status: draft
 updated: 2026-11-08
-revision: 11.1 (мелочи перепроверки PLUG-142)
+revision: 12 (ревью волны 1, PLUG-143)
 ---
 
 # Orchestrator
@@ -55,6 +55,8 @@ revision: 11.1 (мелочи перепроверки PLUG-142)
 }
 ```
 
+Проверка существования пресетов (`bb tasks preset list`) не выполняется синхронно при загрузке плагина — только при `policy validate`, при первой раздаче и в фоне после старта; предупреждения видны в `bb orchestrator policy show` и в статусе плагина.
+
 Правила валидации (каждое — отдельная ошибка с путём в JSON):
 1. `version` = 1.
 2. Каждый маршрут из `chain` есть в `routes`; каждый `routes.*.preset` существует в `bb tasks preset list` на момент загрузки политики. Отсутствующий пресет — предупреждение в статусе, маршрут помечается недоступным; уровень, у которого не осталось маршрутов, отклоняет раздачу.
@@ -88,7 +90,7 @@ revision: 11.1 (мелочи перепроверки PLUG-142)
 - **Тред-координатор** — тред, чья роль разрешает раздавать (`delegates = true`; из коробки — `orchestrator`, §13). Роль берётся из таблицы `thread_roles` (§13.2). Если строки ещё нет — запасной критерий: нет родителя (`parentThreadId === null`) и нет признаков исполнителя:
   1. тред создан раздачей задач: `origin.pluginId === "tasks"` в контексте `configure` / `originPluginId === "tasks"` в хуке и DTO (основной признак, есть с рождения треда; заполненность в контексте `configure` проверяется живым тредом в PLUG-129);
   2. тред записан исполнителем в `delegations.thread_id`;
-  3. запасные: заголовок в формате раздачи `bb tasks` — `<KEY> · …`; в проекте есть запись `dispatching` без `thread_id` моложе 2 минут.
+  3. запасные: заголовок в формате раздачи `bb tasks` — `<KEY> · …`; в том же bb-проекте (`delegations.project_id` = проект треда) есть запись `dispatching` без `thread_id` моложе 2 минут, созданная не этим тредом.
   Даже при утечке правила исполнителю раздать работу он не сможет: `delegate` проверяет вызывающего в момент вызова (§4).
 - **Что выдаёт `bb.agents.configure`** (обработчик у плагина один — SDK допускает ровно один; выбор выдачи — отдельный модуль, который расширяют задачи этапов): тредам-координаторам — инструменты `orchestrator_*` всегда; если `injectInstructions = true` (по умолчанию) — ещё правило маршрутизации, навык `orchestrator-coordinator` и инструкция роли. Остальным ролям — их инструкция роли (если `injectInstructions = true`) и их инструменты/навыки. `injectInstructions = false` гасит **все** тексты плагина (правило, навыки координатора, инструкции ролей); остаются инструменты и навык `orchestrator-setup`.
 - **Бюджет текста.** SDK отдаёт агенту одно поле `instructions` на плагин, обрезанное до 4096 символов. Плагин собирает его так: инструкция роли ≤ 2500 + правило маршрутизации ≤ 1500 + разделители; валидация длины при загрузке настроек и тест на самую длинную роль.
@@ -104,15 +106,15 @@ revision: 11.1 (мелочи перепроверки PLUG-142)
 bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <маршрут>] [--instructions <текст>] [--json]
 ```
 
-Вход: ключ существующей задачи `bb tasks`, уровень из политики, необязательный маршрут (по умолчанию первый доступный в цепочке), необязательные доп. инструкции. Координатор — тред вызывающего агента: у инструмента — `PluginAgentToolContext.threadId`, у CLI — `PluginCliContext.threadId` (BB передаёт его из `BB_THREAD_ID`). Нет треда — вызов отклоняется. Тред не координатор по критерию §3 (роль без `delegates`, а без роли — родитель или признаки исполнителя) — вызов отклоняется с кодом `not-a-coordinator`: так исполнитель или аудитор не раздаст работу ни инструментом, ни через CLI из своей оболочки, даже если пользователь сам открыл его корневым чатом.
+Вход: ключ существующей задачи `bb tasks` (ULID задачи приводится к ключу до проверок, чтобы защита от повтора работала по ключу), уровень из политики, необязательный маршрут (по умолчанию первый доступный в цепочке), необязательные доп. инструкции. Координатор — тред вызывающего агента: у инструмента — `PluginAgentToolContext.threadId`, у CLI — `PluginCliContext.threadId` (BB передаёт его из `BB_THREAD_ID`). Нет треда — вызов отклоняется. Тред не координатор по критерию §3 (роль без `delegates`, а без роли — родитель или признаки исполнителя) — вызов отклоняется с кодом `not-a-coordinator`: так исполнитель или аудитор не раздаст работу ни инструментом, ни через CLI из своей оболочки, даже если пользователь сам открыл его корневым чатом.
 
 Порядок, атомарный для вызывающего (все шаги или явная ошибка с тем, что успело выполниться). Вызовы `delegate` внутри плагина сериализуются (одна очередь на процесс); защиту на уровне базы даёт частичный уникальный индекс (§7).
 1. Проверить политику, уровень, маршрут, лимиты (`maxActive`, `perLevel`) по делегированиям в статусах `dispatching`/`running`. Превышение — отказ с текущим счётчиком (очередь — этап §10).
 2. Вставить запись делегирования со статусом `dispatching`. Если у задачи уже есть запись в `dispatching`/`running` — уникальный индекс отклоняет вставку → отказ «у задачи уже есть активный исполнитель» (защита от двойного запуска).
-3. Выполнить `bb tasks dispatch <KEY> --preset <preset> [--instructions …] --json` (ответ `{task, preset, threadId}`) и сразу записать `threadId` в `thread_id` записи (до следующих шагов). У плагина `tasks` нет API привязки треда к задаче, поэтому раздача идёт через его CLI (ADR-0015 §1). Ошибка dispatch — запись удаляется, вызов возвращает ошибку.
+3. Выполнить `bb tasks dispatch <KEY> --preset <preset> [--instructions …] --json` (ответ `{task, preset, threadId}`) и сразу записать `threadId` в `thread_id` записи (до следующих шагов). У плагина `tasks` нет API привязки треда к задаче, поэтому раздача идёт через его CLI (ADR-0015 §1). Явный отказ dispatch (CLI вернул ошибку с кодом) — запись удаляется, вызов возвращает ошибку. Таймаут или непонятный ответ (тред мог уже создаться) — запись остаётся `dispatching` без `thread_id`, вызов возвращает ошибку «результат раздачи неизвестен»; её разбирает сверка §7 (поиск треда через `bb tasks threads`).
 4. Сразу привязать тред: `threads.update({threadId, parentThreadId: координатор, visibility: "hidden"})` и `bb thread update <threadId> --parent-notifications auto` через CLI — поля `parentNotifications` нет в типах `UpdateThreadRequest` SDK 0.4.87, сервер его принимает. Без него исполнитель не разбудит координатора, поэтому шаг обязателен. Там же — запись роли исполнителя в `thread_roles` (upsert, `source = delegate`): уровень `review` → `auditor`, остальные → `executor`. Если первая сессия исполнителя построилась раньше, исправленная роль вступит в силу со следующего построения.
 5. Если пресет просит `permissionMode = full` (`bb tasks preset show <preset> --json` → `permissionMode`), а провайдер сообщает опцию сессии `mode` со значением `bypass` и текущее значение другое (`bb thread options <id> --json` → опция `mode`, её `values` и `value`) — выставить `mode = bypass` (`bb thread options <id> --set mode=bypass`). Сразу после dispatch опции могут быть ещё пусты (сессия не построена) — шаг best-effort, повторяется при сверке (§7), пока сессия не сообщит опции или делегирование не закончится. Для `acp-devin` основное исправление — в провайдере ([provider-devin §1](provider-devin.md)); здесь — страховка.
-6. Перевести запись в `running`; комментарий в задачу через `bb tasks comment`: «Раздано: уровень, маршрут, тред».
+6. Перевести запись в `running` **только из `dispatching`** (условие в том же UPDATE); если запись уже `cancelled` (отменили во время раздачи) — остановить созданный тред и вернуть «отменено»; комментарий в задачу через `bb tasks comment`: «Раздано: уровень, маршрут, тред».
 7. Вернуть `{ delegationId, taskKey, threadId, level, route, status: "running" }`.
 
 Ошибки шагов 4–6 не отменяют делегирование: запись в `running` с `setup_errors`, ответ содержит ошибку; сверка (§7) повторяет незавершённые шаги.
@@ -163,7 +165,7 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 bb orchestrator delegate <KEY> --level <уровень> [--route <r>] [--instructions <t>] [--json]
 bb orchestrator status [--coordinator <thr>] [--all] [--json]   # делегирования и счётчики
 bb orchestrator show <delegationId|threadId> [--json]
-bb orchestrator cancel <delegationId|threadId>                   # стоп исполнителя, статус cancelled
+bb orchestrator cancel <delegationId|threadId>                   # стоп исполнителя, статус cancelled; из треда — только координатор этого делегирования
 bb orchestrator policy [show|validate] [--json]                  # действующая политика и ошибки
 bb orchestrator instructions                                     # правило §3
 bb orchestrator reconcile                                        # принудительная сверка §7
@@ -175,7 +177,7 @@ bb orchestrator reconcile                                        # принуд�
 
 SQLite плагина, миграции только добавлением.
 
-`delegations`: `id`, `task_key`, `task_id`, `coordinator_thread_id`, `thread_id`, `level`, `route`, `preset`, `provider`, `status` (`dispatching|running|done|failed|stalled|quota|reissued|cancelled`), `reissue_of`, `turn_started_at`, `first_response_at`, `last_seq`, `setup_errors`, `last_approval_notified_at`, `timeout_notified_at`, `created_at`, `updated_at`. Частичный уникальный индекс `delegations(task_key) WHERE status IN ('dispatching','running')`.
+`delegations`: `id`, `task_key`, `task_id`, `project_id` (bb-проект координатора), `coordinator_thread_id`, `thread_id`, `level`, `route`, `preset`, `provider`, `status` (`dispatching|running|done|failed|stalled|quota|reissued|cancelled`), `reissue_of`, `turn_started_at`, `first_response_at`, `last_seq`, `setup_errors`, `last_approval_notified_at`, `timeout_notified_at`, `created_at`, `updated_at`. Частичный уникальный индекс `delegations(task_key) WHERE status IN ('dispatching','running')`.
 
 `route_holds`: `quota_group` (группа квоты или имя маршрута без группы), `until`, `reason`.
 
