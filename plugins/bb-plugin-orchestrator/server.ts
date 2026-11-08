@@ -7,7 +7,11 @@
  * the §7 reconcile pass behind `bb orchestrator reconcile`.
  */
 import { z } from "zod";
-import type { BbPluginApi, PluginCliContext } from "@get-bb/plugin-sdk";
+import type {
+  BbPluginApi,
+  PluginCliContext,
+  StandardSchemaV1,
+} from "@get-bb/plugin-sdk";
 import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
 import { parsePolicy, type PolicyLoad } from "./src/policy.js";
 import { DelegationStore, MIGRATIONS, type DelegationRow } from "./src/store.js";
@@ -24,7 +28,10 @@ import {
   type ThreadFacts,
 } from "./src/agent-config.js";
 import {
+  DEFAULT_GIT_INSTRUCTIONS,
   generateRoutingRule,
+  GIT_INSTRUCTIONS_MAX,
+  gitInstructionsError,
   SETUP_HINT_TEXT,
 } from "./src/instructions.js";
 import {
@@ -54,6 +61,22 @@ interface PresetListEntry {
 const describeError = (e: unknown) =>
   e instanceof Error ? e.message : String(e);
 
+/** §2.2: refuse over-limit `gitInstructions` at write time. */
+const gitInstructionsSchema: StandardSchemaV1<string, string> = {
+  "~standard": {
+    version: 1,
+    vendor: "orchestrator",
+    validate: (v) =>
+      typeof v === "string" && v.length <= GIT_INSTRUCTIONS_MAX
+        ? { value: v }
+        : {
+            issues: [
+              { message: `at most ${GIT_INSTRUCTIONS_MAX} characters` },
+            ],
+          },
+  },
+};
+
 export async function createPlugin(
   bb: BbPluginApi,
   deps: OrchestratorDeps = {},
@@ -76,6 +99,15 @@ export async function createPlugin(
       description:
         "Give coordinator threads the generated routing rule (§3). When off, all plugin texts are silenced; tools stay.",
       default: true,
+    },
+    gitInstructions: {
+      type: "string",
+      label: "Git instructions",
+      description:
+        "«Работа с git» section (§2.2) prepended to every dispatch's --instructions. Empty disables the section.",
+      experimental_multiline: true,
+      experimental_schema: gitInstructionsSchema,
+      default: DEFAULT_GIT_INSTRUCTIONS,
     },
   });
 
@@ -166,18 +198,24 @@ export async function createPlugin(
 
   const refreshStatus = () => {
     const first = policyLoad.errors[0];
+    const gitError = gitInstructionsError(currentSettings.gitInstructions);
+    let problem: string | null = null;
     if (first) {
       const rest =
         policyLoad.errors.length > 1
           ? ` (+${policyLoad.errors.length - 1} ещё)`
           : "";
-      // needs-configuration clears only on plugin reload (SDK V1), so the
-      // message tells the user how to re-check after fixing the policy.
-      bb.status.needsConfiguration(
-        `orchestrator: ${first.path}: ${first.message}${rest} — ` +
-          "исправьте `policy` и выполните `bb plugin reload orchestrator`",
-      );
+      problem =
+        `${first.path}: ${first.message}${rest} — ` +
+        "исправьте `policy` и выполните `bb plugin reload orchestrator`";
+    } else if (gitError) {
+      problem =
+        `${gitError} — исправьте ` +
+        "`gitInstructions` и выполните `bb plugin reload orchestrator`";
     }
+    // needs-configuration clears only on plugin reload (SDK V1), so the
+    // message tells the user how to re-check after fixing the setting.
+    if (problem) bb.status.needsConfiguration(`orchestrator: ${problem}`);
   };
   refreshStatus();
   maybeCheckPresets();
@@ -258,6 +296,7 @@ export async function createPlugin(
         threads: bb.sdk.threads,
         loadPolicy: () => loadPolicy(true),
         probes,
+        gitInstructions: () => currentSettings.gitInstructions,
       });
     });
 
@@ -270,7 +309,12 @@ export async function createPlugin(
   // so a reissued executor gets every later change to those steps for
   // free. `enqueue` serializes watchdog actions against delegate/cancel
   // calls in this process.
-  const stepsDeps = { store, bbCli, threads: bb.sdk.threads };
+  const stepsDeps = {
+    store,
+    bbCli,
+    threads: bb.sdk.threads,
+    gitInstructions: () => currentSettings.gitInstructions,
+  };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),
     events: {

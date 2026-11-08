@@ -1,8 +1,8 @@
 /**
  * The single `bb.agents.configure` selection module (spec §3). It decides
  * whether the resolved thread is a coordinator and what the plugin gives it.
- * Later stages extend this module: PLUG-138 adds the coordinator/setup
- * skills, PLUG-141 adds role instructions and `thread_roles` lookups.
+ * Later stages extend this module: PLUG-141 adds role instructions and
+ * `thread_roles` lookups.
  *
  * MVP coordinator test is the §3 fallback criterion: the thread has no
  * parent and shows no executor marker:
@@ -23,6 +23,14 @@ export const COORDINATOR_TOOLS = [
   "orchestrator_status",
   "orchestrator_cancel",
 ] as const;
+
+/**
+ * §2.1/§3: coordinator skills. `orchestrator-setup` is always given —
+ * setup must happen before the first delegation even when texts are off;
+ * `orchestrator-coordinator` only when `injectInstructions = true`.
+ */
+export const SKILL_SETUP = "orchestrator-setup";
+export const SKILL_COORDINATOR = "orchestrator-coordinator";
 
 /** Dispatch titles are `<KEY> · <task title>` (e.g. `PLUG-129 · …`). */
 export const DISPATCH_TITLE_RE = /^[A-Z][A-Z0-9]+-\d+ · /;
@@ -114,8 +122,9 @@ export function buildAgentConfiguration(
   }
   const config: PluginAgentConfiguration = {
     tools: [...COORDINATOR_TOOLS],
-    // PLUG-138 adds `orchestrator-coordinator`/`orchestrator-setup` here.
-    skills: [],
+    skills: deps.injectInstructions
+      ? [SKILL_COORDINATOR, SKILL_SETUP]
+      : [SKILL_SETUP],
   };
   if (deps.injectInstructions) {
     config.instructions = deps.instructionsText;
@@ -141,7 +150,9 @@ export function fallbackAgentConfiguration(
   if (!coordinator) return { tools: [], skills: [] };
   const config: PluginAgentConfiguration = {
     tools: [...COORDINATOR_TOOLS],
-    skills: [],
+    skills: injectInstructions
+      ? [SKILL_COORDINATOR, SKILL_SETUP]
+      : [SKILL_SETUP],
   };
   if (injectInstructions) config.instructions = instructionsText;
   return config;

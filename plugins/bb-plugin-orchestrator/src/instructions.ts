@@ -93,3 +93,48 @@ export function generateRoutingRule(policy: Policy): string {
 export const SETUP_HINT_TEXT =
   "Плагин orchestrator: политика не настроена или невалидна — delegate отклонит вызовы. " +
   "Настройка — навык `orchestrator-setup`, затем `bb orchestrator policy validate`.";
+
+/**
+ * §2.2 — the `gitInstructions` setting: repository git rules for executors,
+ * prepended to `--instructions` at every dispatch (delegate and reissue).
+ */
+export const GIT_INSTRUCTIONS_MAX = 1500;
+
+export const DEFAULT_GIT_INSTRUCTIONS = `Работа с git:
+- Первым шагом: git fetch origin и перенос базовой ветки (git merge --ff-only origin/<база>); не вышло — вопрос координатору.
+- Работай только в своей рабочей копии и своей ветке; не переключай чужие ветки и не трогай основной чекаут.
+- Коммить под автором из конфига репозитория: без --author и git -c user.*; автор не задан — не коммить, напиши в отчёте.
+- Без push и PR: локальный коммит, в отчёте ветка и SHA.
+- Не запускай git reset --hard, git clean, git checkout -- и другие команды, теряющие чужую работу.`;
+
+/**
+ * Validation error for `gitInstructions`, or null when the value is usable.
+ * The setting schema refuses over-limit writes; this catches values that
+ * reached storage before the schema or through another path.
+ */
+export function gitInstructionsError(text: string | undefined): string | null {
+  if (text === undefined) return null;
+  return text.length > GIT_INSTRUCTIONS_MAX
+    ? `gitInstructions длиннее ${GIT_INSTRUCTIONS_MAX} символов (${text.length})`
+    : null;
+}
+
+/**
+ * §2.2: the git-rules text becomes the first section of `--instructions`,
+ * before this call's extra instructions; an empty or over-limit value adds
+ * no section (an over-limit value is also flagged needs-configuration so it
+ * is never silently dropped). No text at all — no `--instructions` flag.
+ */
+export function mergeDispatchInstructions(
+  gitInstructions: string | undefined,
+  extra: string | undefined,
+): string | undefined {
+  const git =
+    gitInstructionsError(gitInstructions) === null
+      ? (gitInstructions ?? "").trim()
+      : "";
+  const x = (extra ?? "").trim();
+  const parts = [...(git ? [git] : []), ...(x ? [x] : [])];
+  return parts.length ? parts.join("\n\n") : undefined;
+}
+

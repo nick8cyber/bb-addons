@@ -13,6 +13,7 @@
  * and the reconcile stage (later) retries them.
  */
 import { OrchestratorError } from "./errors.js";
+import { mergeDispatchInstructions } from "./instructions.js";
 import { pickRoute, type PolicyLoad } from "./policy.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
@@ -64,6 +65,9 @@ export interface DelegateDeps {
   loadPolicy(): Promise<PolicyLoad>;
   probes: ExecutorProbes;
   dispatchTimeoutMs?: number;
+  /** §2.2 git rules, read fresh at dispatch so edits and reissues see the
+   * current setting. */
+  gitInstructions?: () => string | undefined;
 }
 
 /**
@@ -77,6 +81,7 @@ export interface DispatchStepsDeps {
   bbCli: BbCli;
   threads: DelegateDeps["threads"];
   dispatchTimeoutMs?: number;
+  gitInstructions?: DelegateDeps["gitInstructions"];
 }
 
 export interface DispatchStepsResult {
@@ -239,13 +244,20 @@ export async function dispatchToRoute(
 ): Promise<DispatchStepsResult> {
   const { store, bbCli } = deps;
 
+  // §2.2: the «Работа с git» section leads --instructions, before this
+  // call's extra instructions — in this shared step it covers the §5.4
+  // reissue path too.
+  const instructions = mergeDispatchInstructions(
+    deps.gitInstructions?.(),
+    opts.instructions,
+  );
   const dispatchArgs = [
     "tasks",
     "dispatch",
     row.task_key,
     "--preset",
     row.preset,
-    ...(opts.instructions ? ["--instructions", opts.instructions] : []),
+    ...(instructions ? ["--instructions", instructions] : []),
     "--json",
   ];
   const dispatchRes = await bbCli.run(dispatchArgs, {

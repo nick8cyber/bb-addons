@@ -13,7 +13,10 @@
     "branding": {
       "icon": "Network"
     },
-    "server": "./server.ts"
+    "server": "./server.ts",
+    "skills": [
+      "skills"
+    ]
   },
   "keywords": [
     "bb-plugin"

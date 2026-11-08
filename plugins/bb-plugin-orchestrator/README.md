@@ -1,8 +1,8 @@
 # bb-plugin-orchestrator
 
 Policy-driven delegation of `bb tasks` to executor threads (spec:
-`docs/specs/orchestrator.md`, ADR-0015). MVP scope — the roles and the
-coordinator skills arrive in later stages.
+`docs/specs/orchestrator.md`, ADR-0015). MVP scope — thread roles arrive
+in a later stage.
 
 ## What it does
 
@@ -34,8 +34,16 @@ coordinator skills arrive in later stages.
   a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `policy show|validate`,
   `instructions`, `reconcile`.
+- **Coordinator skills**: `orchestrator-coordinator` (full coordinator
+  playbook, §3) and `orchestrator-setup` (§2.1 setup walkthrough) ship in
+  `skills/` and are selected for coordinator threads — setup always,
+  coordinator only when `injectInstructions` is on.
+- **`gitInstructions`** setting (§2.2, multiline, ≤ 1500 chars): a
+  «Работа с git» section prepended to every dispatch's `--instructions`,
+  reissues included. Empty disables the section; over-limit is refused by
+  the setting schema and flags `needs-configuration` if already stored.
 - **`injectInstructions`** setting (default on): off silences every
-  plugin-generated text; tools stay.
+  plugin-generated text; tools and `orchestrator-setup` stay.
 
 ## Notes
 
