@@ -545,7 +545,7 @@ ${catalog}
           let rejection: { error: string; message: string } | null = null;
           if (!spec) {
             rejection = { error: "tool_not_allowed", message: "инструмент недоступен мозгу: только чтение класса R этого проекта" };
-          } else if (parsed.arguments !== undefined && parsed.arguments !== null && !isPlainObject(parsed.arguments)) {
+          } else if (parsed.arguments !== undefined && !isPlainObject(parsed.arguments)) {
             rejection = { error: "invalid_arguments", message: "arguments должен быть JSON-объектом" };
           } else {
             if (isPlainObject(parsed.arguments)) targs = parsed.arguments;
