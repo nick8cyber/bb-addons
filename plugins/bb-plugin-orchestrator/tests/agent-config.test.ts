@@ -9,6 +9,8 @@ import {
   buildAgentConfiguration,
   fallbackAgentConfiguration,
   isCoordinator,
+  SKILL_COORDINATOR,
+  SKILL_SETUP,
   type ExecutorProbes,
 } from "../src/agent-config.js";
 
@@ -173,4 +175,20 @@ test("the fallback uses static facts only when probes throw", () => {
     "RULE",
   );
   assert.deepEqual(fbExec.tools, []);
+});
+
+test("the fallback issues the same skills: coordinator always gets setup", () => {
+  // §3: setup — always (needed before the first delegation even with texts
+  // off); coordinator — only when injectInstructions is on.
+  const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
+  assert.deepEqual(fb.skills, [SKILL_COORDINATOR, SKILL_SETUP]);
+  const fbSilent = fallbackAgentConfiguration(ctx({}), false, "RULE");
+  assert.deepEqual(fbSilent.skills, [SKILL_SETUP]);
+  assert.equal(fbSilent.instructions, undefined);
+  const fbExec = fallbackAgentConfiguration(
+    ctx({ thread: { parentThreadId: "thr_p" } }),
+    true,
+    "RULE",
+  );
+  assert.deepEqual(fbExec.skills, []);
 });

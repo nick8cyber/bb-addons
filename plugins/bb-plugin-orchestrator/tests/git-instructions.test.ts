@@ -76,9 +76,9 @@ function makeDeps(overrides: {
   return { deps, store, calls };
 }
 
-/** The `--instructions` value of the `tasks dispatch` call, if sent. */
+/** The `--instructions` value of the last `tasks dispatch` call, if sent. */
 function dispatchedInstructions(calls: string[][]): string | undefined {
-  const args = calls.find((c) => c[0] === "tasks" && c[1] === "dispatch");
+  const args = [...calls].reverse().find((c) => c[0] === "tasks" && c[1] === "dispatch");
   const i = args?.indexOf("--instructions") ?? -1;
   return i >= 0 ? args![i + 1] : undefined;
 }
@@ -213,4 +213,98 @@ test("over-limit gitInstructions: schema refuses the write, a stored one flags n
     }),
     /1500/,
   );
+});
+
+// ── Wiring through the server factory: setting → stepsDeps → dispatch ──
+
+function fakeCli(respond?: (args: string[]) => BbCliResult | undefined) {
+  const calls: string[][] = [];
+  return {
+    calls,
+    cli: {
+      run: async (args: string[]) => {
+        calls.push(args);
+        const custom = respond?.(args);
+        if (custom) return custom;
+        const key = args.join(" ");
+        if (key.startsWith("tasks preset list"))
+          return ok(JSON.stringify({ presets: [{ name: "simple", id: "p1" }] }));
+        if (key.startsWith("tasks dispatch"))
+          return ok(JSON.stringify({ task: { id: "task-1" }, threadId: "thr_exec" }));
+        if (key.startsWith("tasks preset show"))
+          return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+        return ok();
+      },
+    } satisfies BbCli,
+  };
+}
+
+const COORDINATOR_THREAD = {
+  id: "thr_coord",
+  parentThreadId: null,
+  title: "coordinator",
+  titleFallback: null,
+  originPluginId: null,
+  projectId: "proj_main",
+};
+
+async function hostWith(
+  settings: Record<string, string | boolean>,
+  cli: BbCli,
+) {
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    settings: { policy: POLICY_TEXT, ...settings },
+    agentSkillIds: ["orchestrator-setup", "orchestrator-coordinator"],
+    sdk: {
+      threads: {
+        get: async () => COORDINATOR_THREAD,
+        update: async () => ({}),
+      },
+    } as never,
+  });
+  await createPlugin(host.bb, { bbCli: cli });
+  return host;
+}
+
+const delegate = (host: Awaited<ReturnType<typeof hostWith>>, key = "PLUG-1") =>
+  host.harness.runCli(
+    ["delegate", key, "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+
+test("server wiring: the default gitInstructions section reaches the dispatch", async () => {
+  const { cli, calls } = fakeCli();
+  const host = await hostWith({}, cli);
+  const res = await delegate(host);
+  assert.equal(res.exitCode, 0);
+  const instructions = dispatchedInstructions(calls);
+  assert.ok(instructions?.startsWith("Работа с git:"));
+  assert.equal(instructions, DEFAULT_GIT_INSTRUCTIONS);
+});
+
+test("server wiring: a custom setting value reaches the dispatch", async () => {
+  const { cli, calls } = fakeCli();
+  const host = await hostWith({ gitInstructions: "CUSTOM-GIT" }, cli);
+  const res = await delegate(host);
+  assert.equal(res.exitCode, 0);
+  assert.equal(dispatchedInstructions(calls), "CUSTOM-GIT");
+});
+
+test("server wiring: an emptied setting drops the section", async () => {
+  const { cli, calls } = fakeCli();
+  const host = await hostWith({ gitInstructions: "" }, cli);
+  const res = await delegate(host);
+  assert.equal(res.exitCode, 0);
+  assert.equal(dispatchedInstructions(calls), undefined);
+});
+
+test("server wiring: a settings change is picked up by the next dispatch", async () => {
+  const { cli, calls } = fakeCli();
+  const host = await hostWith({ gitInstructions: "GIT-V1" }, cli);
+  assert.equal((await delegate(host)).exitCode, 0);
+  assert.equal(dispatchedInstructions(calls), "GIT-V1");
+  await host.harness.setSettings({ gitInstructions: "GIT-V2" });
+  assert.equal((await delegate(host, "PLUG-2")).exitCode, 0);
+  assert.equal(dispatchedInstructions(calls), "GIT-V2");
 });
