@@ -53,6 +53,11 @@ const rpcContract = defineRpcContract({
     input: z.object({}).strict(),
     output: z.object({ token: z.string() }).strict(),
   },
+  /** Диагностика клиента, когда живого сокета нет (запасной режим, итог вставки). */
+  clientLog: {
+    input: z.object({ msg: z.string().min(1).max(500) }).strict(),
+    output: z.object({}).strict(),
+  },
   liveFallback: {
     input: z
       .object({
@@ -379,14 +384,27 @@ export default async function plugin(bb: BbPluginApi) {
      * Файловая цепочка для клиентского фоллбэка (§4.3а): сокет умер до
      * отпускания — реплея не было, Gemini не трогали, skipStages не нужен.
      */
-    liveFallback: async ({ audioBase64, filename, mimeType }) =>
-      await callTranscribe(
+    clientLog: async ({ msg }) => {
+      bb.log.info(`live-voice: client ${msg}`);
+      return {};
+    },
+    liveFallback: async ({ audioBase64, filename, mimeType }) => {
+      const bytes = Buffer.from(audioBase64, "base64");
+      const res = await callTranscribe(
         {
-          bytes: Buffer.from(audioBase64, "base64"),
+          bytes,
           mimeType: mimeType ?? "audio/wav",
           filename,
         },
         null,
-      ),
+      );
+      // Итог файлового распознавания живого режима — иначе в логе сервера его не видно.
+      bb.log.info(
+        `live-voice: file fallback ${mimeType ?? "audio/wav"} ${Math.round(bytes.byteLength / 1024)} KB → ${
+          res.ok ? `${res.text.length} chars via ${res.engine}` : `failed: ${res.message}`
+        }`,
+      );
+      return res;
+    },
   });
 }

@@ -297,6 +297,18 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
       diagQueue.push(msg);
     }
   };
+  /**
+   * Диагностика и тогда, когда живого сокета нет (запасной режим, итог
+   * вставки после teardown): через RPC clientLog, без ожидания ответа.
+   */
+  const reportDiag = (msg: string): void => {
+    const a = attempt;
+    if (a && !a.dead && a.helloSent && a.sock?.readyState === SOCK_OPEN) {
+      sendJson(a, { type: "diag", msg });
+      return;
+    }
+    void callRpc("clientLog", { msg: msg.slice(0, 500) }).catch(() => {});
+  };
   const flushDiag = (a: Attempt): void => {
     const q = diagQueue;
     diagQueue = [];
@@ -466,9 +478,14 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
   const deliver = (text: string, engine: string, degraded: boolean): void => {
     // Финал приходит только из finishing; cancel во время ожидания (в т.ч.
     // в полёте WAV-фоллбэка) — результат больше не вставляем.
-    if (view.phase !== "finishing") return;
+    if (view.phase !== "finishing") {
+      reportDiag(`deliver skipped: phase ${view.phase} (${text.length} chars via ${engine})`);
+      return;
+    }
+    const via = `${engine}${degraded ? " (fallback)" : ""}${recMode ? " [recorder]" : ""}`;
     teardown();
     if (engine === "silence" || text.trim() === "") {
+      reportDiag(`deliver: empty via ${via}`);
       patch({
         phase: "done",
         interim: "",
@@ -496,6 +513,9 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
         inserted = false;
       }
     }
+    reportDiag(
+      `deliver: ${text.length} chars via ${via} → ${inserted ? "inserted" : target === null ? "NO composer target" : "insert threw"}`,
+    );
     patch({
       phase: "done",
       interim: "",
@@ -939,7 +959,11 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
           try {
             const rec = await finish.call(capture);
             capture.park(warmMs);
-            if (view.phase !== "finishing") return; // отменили, пока собирали файл
+            if (view.phase !== "finishing") {
+              reportDiag(`recorder file dropped: phase ${view.phase}`);
+              return; // отменили, пока собирали файл
+            }
+            reportDiag(`recorder file ${rec === null ? "EMPTY" : `${Math.round(rec.bytes.byteLength / 1024)} KB ${rec.mimeType}`}`);
             if (rec === null) {
               deliver("", "silence", true);
               return;
@@ -950,9 +974,14 @@ export function createVoiceRecorder(deps: RecorderDeps = {}) {
               mimeType: rec.mimeType,
             })) as LiveFallbackResult;
             if (res.ok) deliver(res.text, res.engine, true);
-            else fail(`распознавание не удалось: ${res.message}`);
+            else {
+              reportDiag(`recorder file failed: ${res.message}`);
+              fail(`распознавание не удалось: ${res.message}`);
+            }
           } catch (e) {
-            fail(`распознавание не удалось: ${e instanceof Error ? e.message : String(e)}`);
+            const m = e instanceof Error ? e.message : String(e);
+            reportDiag(`recorder file request failed: ${m}`);
+            fail(`распознавание не удалось: ${m}`);
           }
         })();
         return;
