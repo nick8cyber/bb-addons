@@ -1,0 +1,38 @@
+{
+  "name": "bb-plugin-orchestrator",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Task delegation orchestrator for bb: policy-driven routing, delegate dispatch, CLI and agent tools.",
+  "engines": {
+    "bb": ">=0.48",
+    "bbPluginSdk": ">=0.4.87"
+  },
+  "bb": {
+    "name": "Orchestrator",
+    "description": "Policy-driven delegation of bb tasks to executor threads with routing limits.",
+    "branding": {
+      "icon": "Network"
+    },
+    "server": "./server.ts"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --import ./tests/register-hooks.ts --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "0.4.87",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "better-sqlite3": "^12.11.1",
+    "typescript": "^5.7.0",
+    "cron-parser": "^5.10.0",
+    "hono": "^4.13.7"
+  }
+}

@@ -1,0 +1,645 @@
+/**
+ * bb-plugin-orchestrator — policy-driven delegation of bb tasks (spec
+ * docs/specs/orchestrator.md, ADR-0015). MVP scope: policy setting +
+ * validation, SQLite delegations/route_holds, `delegate` (CLI + agent
+ * tool), coordinator-only `bb.agents.configure`, status/show/cancel/
+ * policy/instructions CLI. The watchdog/reconcile stage is a later task.
+ */
+import { z } from "zod";
+import type { BbPluginApi, PluginCliContext } from "@get-bb/plugin-sdk";
+import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
+import { parsePolicy, type PolicyLoad } from "./src/policy.js";
+import { DelegationStore, MIGRATIONS, type DelegationRow } from "./src/store.js";
+import {
+  createBbCli,
+  runChecked,
+  runJson,
+  type BbCli,
+} from "./src/bb-cli.js";
+import {
+  buildAgentConfiguration,
+  fallbackAgentConfiguration,
+  type ExecutorProbes,
+  type ThreadFacts,
+} from "./src/agent-config.js";
+import {
+  generateRoutingRule,
+  SETUP_HINT_TEXT,
+} from "./src/instructions.js";
+import { createDelegateQueue, runDelegate } from "./src/delegate.js";
+
+export interface OrchestratorDeps {
+  bbCli?: BbCli;
+}
+
+interface PresetListEntry {
+  id?: string;
+  name?: string;
+}
+
+const describeError = (e: unknown) =>
+  e instanceof Error ? e.message : String(e);
+
+export async function createPlugin(
+  bb: BbPluginApi,
+  deps: OrchestratorDeps = {},
+) {
+  const bbCli = deps.bbCli ?? createBbCli();
+
+  const settings = bb.settings.define({
+    policy: {
+      type: "string",
+      label: "Policy",
+      description:
+        "Routing policy JSON (spec §2): version, limits, levels with route chains, routes naming bb tasks presets. Empty or invalid — plugin reports needs-configuration and delegate refuses calls.",
+      experimental_multiline: true,
+      default: "",
+    },
+    injectInstructions: {
+      type: "boolean",
+      label: "Inject coordinator instructions",
+      description:
+        "Give coordinator threads the generated routing rule (§3). When off, all plugin texts are silenced; tools stay.",
+      default: true,
+    },
+  });
+
+  let currentSettings = await settings.get();
+
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [...MIGRATIONS]);
+  const store = new DelegationStore(db);
+  const enqueue = createDelegateQueue();
+
+  // The probes behind the §3 executor heuristics; one implementation for
+  // `configure`, `delegate`, and the CLI caller check.
+  const probes: ExecutorProbes = {
+    delegationByThreadId: (threadId) => store.byThreadId(threadId),
+    hasFreshDispatching: (freshSince, scope) =>
+      store.hasFreshDispatching(freshSince, scope),
+  };
+
+  /**
+   * Load + validate the configured policy. The structural parse never
+   * touches the CLI; rule 2's preset-existence check (`bb tasks preset
+   * list`) runs only when `checkPresets` — at `policy validate`, at each
+   * delegate, and in the background after load. An unreadable preset list
+   * degrades to a warning so a CLI hiccup cannot make a good policy look
+   * invalid (§2).
+   */
+  const loadPolicy = async (checkPresets = false): Promise<PolicyLoad> => {
+    const text = currentSettings.policy ?? "";
+    if (!checkPresets) return parsePolicy(text);
+    let knownPresets: Set<string> | undefined;
+    let presetWarning: string | undefined;
+    try {
+      const res = await runJson<{ presets?: PresetListEntry[] }>(bbCli, [
+        "tasks",
+        "preset",
+        "list",
+        "--json",
+      ]);
+      knownPresets = new Set(
+        (res.presets ?? []).flatMap((p) =>
+          [p.name, p.id].filter((x): x is string => typeof x === "string"),
+        ),
+      );
+    } catch (e) {
+      presetWarning = `preset check skipped: ${describeError(e)}`;
+    }
+    const load = parsePolicy(text, knownPresets);
+    if (presetWarning) {
+      load.warnings.push({ path: "policy", message: presetWarning });
+    }
+    return load;
+  };
+
+  // Structural validation only — nothing may block plugin load on the CLI.
+  let policyLoad = parsePolicy(currentSettings.policy ?? "");
+  // Preset existence resolves in the background; results refresh the
+  // warnings visible in `policy show` and the plugin status/log.
+  const checkPresetsInBackground = () => {
+    void loadPolicy(true).then((load) => {
+      policyLoad = load;
+      for (const w of load.warnings) {
+        bb.log.warn(`orchestrator: ${w.path}: ${w.message}`);
+      }
+      refreshStatus();
+    });
+  };
+
+  const refreshStatus = () => {
+    const first = policyLoad.errors[0];
+    if (first) {
+      const rest =
+        policyLoad.errors.length > 1
+          ? ` (+${policyLoad.errors.length - 1} ещё)`
+          : "";
+      // needs-configuration clears only on plugin reload (SDK V1), so the
+      // message tells the user how to re-check after fixing the policy.
+      bb.status.needsConfiguration(
+        `orchestrator: ${first.path}: ${first.message}${rest} — ` +
+          "исправьте `policy` и выполните `bb plugin reload orchestrator`",
+      );
+    }
+  };
+  refreshStatus();
+  checkPresetsInBackground();
+
+  settings.onChange((next) => {
+    currentSettings = next;
+    policyLoad = parsePolicy(currentSettings.policy ?? "");
+    refreshStatus();
+    checkPresetsInBackground();
+  });
+
+  const instructionsText = () =>
+    policyLoad.policy
+      ? generateRoutingRule(policyLoad.policy)
+      : SETUP_HINT_TEXT;
+
+  // §3: one configure handler, the choice delegated to agent-config.ts. A
+  // throw inside must not silence the plugin (SDK fail-closed), so it falls
+  // back to static facts and warns.
+  bb.agents.configure((context) => {
+    try {
+      return buildAgentConfiguration(context, {
+        injectInstructions: currentSettings.injectInstructions ?? true,
+        instructionsText: instructionsText(),
+        probes,
+      });
+    } catch (e) {
+      bb.log.warn(
+        `orchestrator: configure fell back to static facts: ${describeError(e)}`,
+      );
+      return fallbackAgentConfiguration(
+        context,
+        currentSettings.injectInstructions ?? true,
+        instructionsText(),
+      );
+    }
+  });
+
+  /** §4 caller facts: the invoking thread's identity for the coordinator gate. */
+  const callerFacts = async (threadId: string): Promise<ThreadFacts> => {
+    const thread = await bb.sdk.threads.get({ threadId });
+    return {
+      threadId,
+      parentThreadId: thread.parentThreadId,
+      title: thread.title ?? thread.titleFallback,
+      originPluginId: thread.originPluginId,
+      projectId: thread.projectId,
+    };
+  };
+
+  const delegate = (input: {
+    taskKey: string;
+    level: string;
+    route?: string;
+    instructions?: string;
+    threadId?: string;
+  }) =>
+    enqueue(async () => {
+      if (!input.threadId) {
+        throw new OrchestratorError(
+          "no-caller-thread",
+          "delegate works only from a bb thread (BB_THREAD_ID is absent)",
+          "run it inside a thread, or via the orchestrator_delegate tool",
+        );
+      }
+      let caller: ThreadFacts;
+      try {
+        caller = await callerFacts(input.threadId);
+      } catch (e) {
+        throw new OrchestratorError(
+          "not-a-coordinator",
+          `calling thread ${input.threadId} is not readable: ${describeError(e)}`,
+        );
+      }
+      return runDelegate({ ...input, caller }, {
+        store,
+        bbCli,
+        threads: bb.sdk.threads,
+        loadPolicy: () => loadPolicy(true),
+        probes,
+      });
+    });
+
+  const findDelegation = (ref: string): DelegationRow | undefined =>
+    /^\d+$/.test(ref) ? store.get(Number(ref)) : store.byThreadId(ref);
+
+  // ── Agent tools (§6): coordinators only, via configure. ──────────────
+
+  bb.agents.registerTool({
+    name: "orchestrator_delegate",
+    description:
+      "Delegate a bb task to an executor thread under the routing policy: dispatch, attach as hidden child, parent notifications, and setup in one call.",
+    instructions:
+      "Use orchestrator_delegate instead of running `bb tasks dispatch` + `bb thread update` by hand. The executor's report arrives as a message — finish your turn after delegating.",
+    parameters: z.object({
+      taskKey: z.string().min(1).describe("Task key, e.g. PLUG-129"),
+      level: z
+        .string()
+        .min(1)
+        .describe("Level name from the routing policy"),
+      route: z
+        .string()
+        .optional()
+        .describe("Route name within the level chain; defaults to the first available"),
+      instructions: z
+        .string()
+        .optional()
+        .describe("Extra instructions for this dispatch only"),
+    }),
+    async execute(params, ctx) {
+      try {
+        const res = await delegate({ ...params, threadId: ctx.threadId });
+        return JSON.stringify({
+          ...res,
+          note: "Ответ исполнителя придёт сообщением — закончи ход.",
+        });
+      } catch (e) {
+        return JSON.stringify(errorJson(e));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "orchestrator_status",
+    description:
+      "List this coordinator's delegations and counters (active vs policy limits).",
+    parameters: z.object({
+      all: z
+        .boolean()
+        .optional()
+        .describe("Include delegations of all coordinators"),
+    }),
+    async execute(params, ctx) {
+      try {
+        const res = statusReport(
+          params.all ? {} : { coordinatorThreadId: ctx.threadId },
+        );
+        return JSON.stringify({ ok: true, ...res });
+      } catch (e) {
+        return JSON.stringify(errorJson(e));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "orchestrator_cancel",
+    description:
+      "Cancel a delegation: stop the executor thread and mark the record cancelled. Accepts a delegation id or thread id.",
+    parameters: z.object({
+      target: z
+        .string()
+        .min(1)
+        .describe("Delegation id (number) or executor thread id (thr_…)"),
+    }),
+    async execute(params, _ctx) {
+      try {
+        return JSON.stringify(
+          await cancelDelegation(params.target, _ctx.threadId),
+        );
+      } catch (e) {
+        return JSON.stringify(errorJson(e));
+      }
+    },
+  });
+
+  const statusReport = (filter: { coordinatorThreadId?: string }) => {
+    const delegations = store.list(filter);
+    const counts = store.countsByStatus();
+    return {
+      active: store.activeCount(),
+      counts,
+      limits: policyLoad.policy?.limits ?? null,
+      delegations,
+    };
+  };
+
+  const cancelDelegation = async (ref: string, callerThreadId?: string) => {
+    const row = findDelegation(ref);
+    if (!row) {
+      throw new OrchestratorError(
+        "not-found",
+        `no delegation ${ref}`,
+        "see `bb orchestrator status`",
+      );
+    }
+    // §6: from a thread, only the coordinator that owns this delegation.
+    if (callerThreadId && callerThreadId !== row.coordinator_thread_id) {
+      throw new OrchestratorError(
+        "not-a-coordinator",
+        `thread ${callerThreadId} is not the coordinator of delegation ${row.id}`,
+        "only the delegating coordinator may cancel it",
+      );
+    }
+    if (row.status !== "dispatching" && row.status !== "running") {
+      throw new OrchestratorError(
+        "not-active",
+        `delegation ${row.id} is already ${row.status}`,
+      );
+    }
+    // Status first, stop second — otherwise our own stop can read as external.
+    store.setStatus(row.id, "cancelled");
+    let warning: string | undefined;
+    if (row.thread_id) {
+      try {
+        await bb.sdk.threads.stop({ threadId: row.thread_id });
+      } catch (e) {
+        warning = `thread stop failed: ${describeError(e)}`;
+        store.addSetupError(row.id, "cancel-stop", warning);
+      }
+    }
+    return {
+      ok: true as const,
+      delegationId: row.id,
+      status: "cancelled" as const,
+      ...(warning ? { warning } : {}),
+    };
+  };
+
+  // ── CLI (§6) ─────────────────────────────────────────────────────────
+
+  const jsonOk = (value: unknown) => ({
+    exitCode: 0,
+    stdout: JSON.stringify(value, null, 2) + "\n",
+  });
+  const jsonFail = (error: unknown) => ({
+    exitCode: 1,
+    stdout: JSON.stringify(errorJson(error), null, 2) + "\n",
+  });
+  const textFail = (error: unknown) => {
+    const body = toErrorBody(error);
+    return {
+      exitCode: 1,
+      stderr: `${body.code}: ${body.message}${body.hint ? `\nhint: ${body.hint}` : ""}\n`,
+    };
+  };
+  const fail = (json: boolean, error: unknown) =>
+    json ? jsonFail(error) : textFail(error);
+
+  const renderDelegation = (d: DelegationRow) =>
+    `#${d.id} ${d.task_key} level=${d.level} route=${d.route} status=${d.status}` +
+    `${d.thread_id ? ` thread=${d.thread_id}` : ""} ` +
+    `coordinator=${d.coordinator_thread_id}` +
+    (d.setup_errors !== "[]" ? ` setup_errors=${d.setup_errors}` : "");
+
+  bb.cli.register({
+    name: "orchestrator",
+    summary:
+      "Delegate bb tasks to executor threads under the routing policy (spec: docs/specs/orchestrator.md)",
+    commands: [
+      {
+        name: "delegate",
+        summary: "Dispatch a task to an executor under the policy",
+        usage:
+          "bb orchestrator delegate <KEY> --level <level> [--route <route>] [--instructions <text>] [--json]",
+      },
+      {
+        name: "status",
+        summary: "Delegations and counters",
+        usage: "bb orchestrator status [--coordinator <thr>] [--all] [--json]",
+      },
+      {
+        name: "show",
+        summary: "One delegation by id or thread id",
+        usage: "bb orchestrator show <delegationId|threadId> [--json]",
+      },
+      {
+        name: "cancel",
+        summary: "Stop the executor and mark the delegation cancelled",
+        usage: "bb orchestrator cancel <delegationId|threadId> [--json]",
+      },
+      {
+        name: "policy",
+        summary: "Show or validate the configured policy",
+        usage: "bb orchestrator policy [show|validate] [--json]",
+      },
+      {
+        name: "instructions",
+        summary: "Print the generated routing rule (§3)",
+        usage: "bb orchestrator instructions",
+      },
+      {
+        name: "reconcile",
+        summary: "Force a reconciliation pass (watchdog stage)",
+        usage: "bb orchestrator reconcile [--json]",
+      },
+    ],
+    async run(argv, ctx: PluginCliContext) {
+      const json = argv.includes("--json");
+      const flag = (name: string) => {
+        const i = argv.indexOf(name);
+        return i >= 0 ? argv[i + 1] : undefined;
+      };
+      const positional = argv.filter(
+        (a, i) => !a.startsWith("--") && argv[i - 1] !== "--level" &&
+          argv[i - 1] !== "--route" && argv[i - 1] !== "--instructions" &&
+          argv[i - 1] !== "--coordinator",
+      );
+      const cmd = positional[0];
+
+      try {
+        if (cmd === "delegate") {
+          const taskKey = positional[1];
+          const level = flag("--level");
+          if (!taskKey || !level) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>] [--instructions <t>]",
+            );
+          }
+          const res = await delegate({
+            taskKey,
+            level,
+            route: flag("--route"),
+            instructions: flag("--instructions"),
+            threadId: ctx.threadId,
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout:
+                  `delegated ${res.taskKey}: level=${res.level} route=${res.route} thread=${res.threadId} (delegation #${res.delegationId})` +
+                  (res.setupErrors.length
+                    ? `\nsetup errors: ${res.setupErrors.map((s) => `${s.step}: ${s.message}`).join("; ")}`
+                    : "") +
+                  "\n",
+              };
+        }
+
+        if (cmd === "status") {
+          const all = argv.includes("--all");
+          const coordinator = flag("--coordinator");
+          const filter =
+            coordinator !== undefined
+              ? { coordinatorThreadId: coordinator }
+              : all
+                ? {}
+                : ctx.threadId
+                  ? { coordinatorThreadId: ctx.threadId }
+                  : {};
+          const res = statusReport(filter);
+          if (json) return jsonOk({ ok: true, ...res });
+          let out = `active: ${res.active}` +
+            (res.limits?.maxActive !== undefined
+              ? `/${res.limits.maxActive}`
+              : "") +
+            `  counts: ${JSON.stringify(res.counts)}\n`;
+          for (const d of res.delegations) out += renderDelegation(d) + "\n";
+          if (!res.delegations.length) out += "no delegations\n";
+          return { exitCode: 0, stdout: out };
+        }
+
+        if (cmd === "show") {
+          const ref = positional[1];
+          const row = ref && findDelegation(ref);
+          if (!row) {
+            throw new OrchestratorError(
+              "not-found",
+              `no delegation ${ref ?? ""}`,
+              "see `bb orchestrator status`",
+            );
+          }
+          return json
+            ? jsonOk({ ok: true, delegation: row })
+            : { exitCode: 0, stdout: renderDelegation(row) + "\n" };
+        }
+
+        if (cmd === "cancel") {
+          const ref = positional[1];
+          if (!ref) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "usage: bb orchestrator cancel <delegationId|threadId>",
+            );
+          }
+          const res = await cancelDelegation(ref, ctx.threadId);
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `cancelled delegation #${res.delegationId}` +
+                  (res.warning ? ` (${res.warning})` : "") + "\n",
+              };
+        }
+
+        if (cmd === "policy") {
+          const sub = positional[1] ?? "show";
+          if (sub === "show") {
+            const text = currentSettings.policy ?? "";
+            if (json) {
+              return jsonOk({
+                ok: true,
+                policy: policyLoad.policy,
+                errors: policyLoad.errors,
+                warnings: policyLoad.warnings,
+                raw: text,
+              });
+            }
+            let out = text.trim() ? text + "\n" : "(policy is empty)\n";
+            for (const e of policyLoad.errors)
+              out += `error ${e.path}: ${e.message}\n`;
+            for (const w of policyLoad.warnings)
+              out += `warning ${w.path}: ${w.message}\n`;
+            return { exitCode: 0, stdout: out };
+          }
+          if (sub === "validate") {
+            policyLoad = await loadPolicy(true);
+            if (policyLoad.errors.length) {
+              const e = policyLoad.errors[0]!;
+              if (json) {
+                return {
+                  exitCode: 1,
+                  stdout:
+                    JSON.stringify(
+                      {
+                        ok: false,
+                        error: {
+                          code: "policy-invalid",
+                          message: `${e.path}: ${e.message}`,
+                          hint: "fix `bb plugin config orchestrator set policy …`",
+                        },
+                        errors: policyLoad.errors,
+                        warnings: policyLoad.warnings,
+                      },
+                      null,
+                      2,
+                    ) + "\n",
+                };
+              }
+              return {
+                exitCode: 1,
+                stderr:
+                  `policy-invalid: ${e.path}: ${e.message}\n` +
+                  policyLoad.errors
+                    .slice(1)
+                    .map((x) => `  ${x.path}: ${x.message}\n`)
+                    .join(""),
+              };
+            }
+            return json
+              ? jsonOk({
+                  ok: true,
+                  warnings: policyLoad.warnings,
+                  unavailableRoutes: policyLoad.unavailableRoutes,
+                })
+              : {
+                  exitCode: 0,
+                  stdout:
+                    "policy is valid\n" +
+                    policyLoad.warnings
+                      .map((w) => `warning ${w.path}: ${w.message}\n`)
+                      .join(""),
+                };
+          }
+          throw new OrchestratorError(
+            "invalid-arguments",
+            `unknown policy subcommand "${sub}" (show|validate)`,
+          );
+        }
+
+        if (cmd === "instructions") {
+          if (!policyLoad.policy) {
+            throw new OrchestratorError(
+              "policy-invalid",
+              "cannot generate the routing rule without a valid policy",
+              "see `bb orchestrator policy validate`",
+            );
+          }
+          const text = generateRoutingRule(policyLoad.policy);
+          return json
+            ? jsonOk({ ok: true, instructions: text })
+            : { exitCode: 0, stdout: text + "\n" };
+        }
+
+        if (cmd === "reconcile") {
+          const note =
+            "reconcile — этап сторожа (watchdog): пока не реализовано в MVP";
+          return json
+            ? jsonOk({ ok: true, note })
+            : { exitCode: 0, stdout: note + "\n" };
+        }
+
+        throw new OrchestratorError(
+          "invalid-arguments",
+          `unknown subcommand "${cmd ?? ""}"`,
+          "commands: delegate, status, show, cancel, policy, instructions, reconcile",
+        );
+      } catch (e) {
+        return fail(json, e);
+      }
+    },
+  });
+
+  bb.onDispose(() => {
+    bb.log.info("bb-plugin-orchestrator disposed");
+  });
+}
+
+export default async function plugin(bb: BbPluginApi) {
+  await createPlugin(bb);
+}
