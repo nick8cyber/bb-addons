@@ -4,7 +4,7 @@
  * Точки входа (все ведут в один recording singleton):
  * - плавающая кнопка (FAB) в appOverlay — основной вход, видна всегда,
  *   перетаскивается, позиция запоминается на устройстве (§3.1 п. 4);
- * - composer-команда «Voice STT Live: диктовка» + Mod+Shift/V — получает
+ * - composer-команда «Gemini STT Live Voice: диктовка» + Mod+Shift/V — получает
  *   bound composer в run({composer});
  * - experimental_sidebarFooter «Диктовка» — цель резолвится через
  *   useComposers() в оверлее.
@@ -36,7 +36,7 @@ export default definePluginApp((app) => {
   // Composer-команда: run({composer}) получает bound композер (§3.1 п. 2).
   app.composer.experimental_registerCommand({
     id: "live-dictation",
-    title: "Voice STT Live: диктовка",
+    title: "Gemini STT Live Voice: диктовка",
     defaultShortcut: { key: "v", mod: true, shift: true },
     run: ({ composer }) => {
       voiceRecorder.toggle(composer);

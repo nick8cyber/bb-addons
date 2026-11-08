@@ -62,7 +62,7 @@ plugins/bb-plugin-voice-stt/
   "private": true,
   "engines": { "bb": ">=0.48.1", "bbPluginSdk": ">=0.6.49" },
   "bb": {
-    "name": "Voice STT",
+    "name": "Gemini STT Live Voice",
     "description": "Голосовой ввод: Gemini Live STT, фоллбэки Codex и Groq",
     "branding": { "icon": "./icons/mic.svg" },
     "server": "./server.ts",

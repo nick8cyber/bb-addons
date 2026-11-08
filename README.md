@@ -146,7 +146,7 @@ Two Gemini API keys go into the plugin's secret setting at install; nothing else
 ADRs [0005](docs/adr/0005-live-call-server-relay.md)–[0012](docs/adr/0012-live-call-voice-confirmation-rules.md),
 [plugin README](plugins/bb-plugin-live-call/README.md).
 
-### `voice-stt` 🎙️ — voice input
+### `voice-stt` 🎙️ — Gemini STT Live Voice (voice input)
 
 Voice input for bb in two modes:
 
