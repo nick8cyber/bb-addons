@@ -185,11 +185,15 @@ test("instructions prints the generated rule", async () => {
   assert.match(res.stdout, /orchestrator-coordinator/);
 });
 
-test("reconcile is a watchdog-stage stub", async () => {
+test("reconcile runs a pass and reports counters", async () => {
   const host = await hostWith();
   const res = await host.harness.runCli(["reconcile"]);
   assert.equal(res.exitCode, 0);
-  assert.match(res.stdout, /сторожа|watchdog/i);
+  assert.match(res.stdout, /scanned=0/);
+  const json = await host.harness.runCli(["reconcile", "--json"]);
+  const body = JSON.parse(json.stdout) as { ok: boolean; scanned: number };
+  assert.equal(body.ok, true);
+  assert.equal(body.scanned, 0);
 });
 
 test("agent tool delegate returns structured errors", async () => {

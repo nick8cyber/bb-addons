@@ -1,8 +1,8 @@
 # bb-plugin-orchestrator
 
 Policy-driven delegation of `bb tasks` to executor threads (spec:
-`docs/specs/orchestrator.md`, ADR-0015). MVP scope — the watchdog, roles,
-and reconcile arrive in later stages.
+`docs/specs/orchestrator.md`, ADR-0015). MVP scope — the roles and the
+coordinator skills arrive in later stages.
 
 ## What it does
 
@@ -19,8 +19,21 @@ and reconcile arrive in later stages.
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only coordinator threads (no parent + no executor markers, §3);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).
+- **Watchdog** (background service, §5): first-response window
+  (`firstResponseSeconds`) → `stalled` + stop; quota detection
+  (`errorInfo.category`, then text patterns) → `quota`, 15-minute
+  `route_holds` on the quota group; `done`/`cancelled`/`failed`/`approval`/
+  `timeout` outcomes; auto-reissue down the level chain when
+  `autoFallback` allows (one transaction, `reissue_of`, reuses the §4
+  dispatch steps); coordinator messages via `threads.send`
+  `queue-if-active` prefixed `[orchestrator]`, task comments throughout.
+- **Reconcile** (§7): on service start and every 60 s — re-reads threads
+  and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
+  `dispatching` rows via `bb tasks threads` or drops them, survives
+  restarts without duplicate reissues. `bb orchestrator reconcile` runs
+  a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `policy show|validate`,
-  `instructions`, `reconcile` (watchdog-stage stub).
+  `instructions`, `reconcile`.
 - **`injectInstructions`** setting (default on): off silences every
   plugin-generated text; tools stay.
 

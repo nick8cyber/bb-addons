@@ -3,7 +3,8 @@
  * docs/specs/orchestrator.md, ADR-0015). MVP scope: policy setting +
  * validation, SQLite delegations/route_holds, `delegate` (CLI + agent
  * tool), coordinator-only `bb.agents.configure`, status/show/cancel/
- * policy/instructions CLI. The watchdog/reconcile stage is a later task.
+ * policy/instructions CLI, and the §5 watchdog (background service) with
+ * the §7 reconcile pass behind `bb orchestrator reconcile`.
  */
 import { z } from "zod";
 import type { BbPluginApi, PluginCliContext } from "@get-bb/plugin-sdk";
@@ -26,7 +27,18 @@ import {
   generateRoutingRule,
   SETUP_HINT_TEXT,
 } from "./src/instructions.js";
-import { createDelegateQueue, runDelegate } from "./src/delegate.js";
+import {
+  createDelegateQueue,
+  dispatchToRoute,
+  finishDispatchSteps,
+  retrySetupSteps,
+  runDelegate,
+} from "./src/delegate.js";
+import {
+  createWatchdog,
+  findTaskThreadId,
+  type WatchdogThreads,
+} from "./src/watchdog.js";
 
 export interface OrchestratorDeps {
   bbCli?: BbCli;
@@ -228,6 +240,96 @@ export async function createPlugin(
   const findDelegation = (ref: string): DelegationRow | undefined =>
     /^\d+$/.test(ref) ? store.get(Number(ref)) : store.byThreadId(ref);
 
+  // ── Watchdog (§5) + reconcile (§7) ──────────────────────────────────
+  //
+  // The dispatch steps are the same functions `delegate` runs (§4.3–4.7),
+  // so a reissued executor gets every later change to those steps for
+  // free. `enqueue` serializes watchdog actions against delegate/cancel
+  // calls in this process.
+  const stepsDeps = { store, bbCli, threads: bb.sdk.threads };
+  const watchdogThreads: WatchdogThreads = {
+    get: (a) => bb.sdk.threads.get(a),
+    events: {
+      list: (a) =>
+        bb.sdk.threads.events.list(a as never) as never,
+    },
+    queuedMessages: { list: (a) => bb.sdk.threads.queuedMessages.list(a) },
+    send: (a) => bb.sdk.threads.send(a as never),
+    stop: (a) => bb.sdk.threads.stop(a),
+  };
+  const watchdog = createWatchdog({
+    store,
+    bbCli,
+    threads: watchdogThreads,
+    loadPolicy: () => loadPolicy(true),
+    dispatch: (row) => dispatchToRoute(row, {}, stepsDeps),
+    finalize: (row) => finishDispatchSteps(row, stepsDeps),
+    retrySetup: (row) => retrySetupSteps(row, stepsDeps),
+    enqueue,
+    log: bb.log,
+  });
+
+  let watchdogSubscribed = false;
+  bb.background.service("orchestrator-watchdog", {
+    start(signal) {
+      const run = (p: Promise<unknown>) =>
+        void p.catch((e) =>
+          bb.log.warn(`orchestrator watchdog: ${describeError(e)}`),
+        );
+      // `bb.events.on` has no unsubscribe; guard so a service crash
+      // restart does not stack duplicate handlers.
+      if (!watchdogSubscribed) {
+        watchdogSubscribed = true;
+        bb.events.on("experimental_thread.events", (p) =>
+          run(watchdog.onThreadEvents(p)),
+        );
+        bb.events.on("thread.active", ({ thread }) =>
+          run(watchdog.onThreadActive(thread)),
+        );
+        bb.events.on("thread.idle", ({ thread }) =>
+          run(watchdog.onThreadIdle(thread)),
+        );
+        bb.events.on("thread.failed", ({ thread, error }) =>
+          run(watchdog.onThreadFailed(thread, error)),
+        );
+        bb.events.on("turn.failed", (e) => run(watchdog.onTurnFailed(e)));
+        bb.events.on("interaction.pending", ({ thread, interaction }) =>
+          run(watchdog.onInteractionPending(thread, interaction)),
+        );
+        bb.events.on("thread.archived", ({ thread }) =>
+          run(watchdog.onThreadGone(thread, "archived")),
+        );
+        bb.events.on("thread.deleted", ({ thread }) =>
+          run(watchdog.onThreadGone(thread, "deleted")),
+        );
+      }
+      // §7: a reconcile pass at start, then every 60 s; the §5.1/§5.3
+      // timers run on a shorter beat.
+      run(watchdog.reconcile());
+      const reconcileTimer = setInterval(
+        () => run(watchdog.reconcile()),
+        60_000,
+      );
+      const timersTimer = setInterval(
+        () => run(watchdog.checkTimers()),
+        5_000,
+      );
+      return new Promise<void>((resolve) => {
+        if (signal.aborted) {
+          clearInterval(reconcileTimer);
+          clearInterval(timersTimer);
+          resolve();
+          return;
+        }
+        signal.addEventListener("abort", () => {
+          clearInterval(reconcileTimer);
+          clearInterval(timersTimer);
+          resolve();
+        });
+      });
+    },
+  });
+
   // ── Agent tools (§6): coordinators only, via configure. ──────────────
 
   bb.agents.registerTool({
@@ -318,47 +420,60 @@ export async function createPlugin(
     };
   };
 
-  const cancelDelegation = async (ref: string, callerThreadId?: string) => {
-    const row = findDelegation(ref);
-    if (!row) {
-      throw new OrchestratorError(
-        "not-found",
-        `no delegation ${ref}`,
-        "see `bb orchestrator status`",
-      );
-    }
-    // §6: from a thread, only the coordinator that owns this delegation.
-    if (callerThreadId && callerThreadId !== row.coordinator_thread_id) {
-      throw new OrchestratorError(
-        "not-a-coordinator",
-        `thread ${callerThreadId} is not the coordinator of delegation ${row.id}`,
-        "only the delegating coordinator may cancel it",
-      );
-    }
-    if (row.status !== "dispatching" && row.status !== "running") {
-      throw new OrchestratorError(
-        "not-active",
-        `delegation ${row.id} is already ${row.status}`,
-      );
-    }
-    // Status first, stop second — otherwise our own stop can read as external.
-    store.setStatus(row.id, "cancelled");
-    let warning: string | undefined;
-    if (row.thread_id) {
-      try {
-        await bb.sdk.threads.stop({ threadId: row.thread_id });
-      } catch (e) {
-        warning = `thread stop failed: ${describeError(e)}`;
-        store.addSetupError(row.id, "cancel-stop", warning);
+  const cancelDelegation = async (ref: string, callerThreadId?: string) =>
+    enqueue(async () => {
+      const row = findDelegation(ref);
+      if (!row) {
+        throw new OrchestratorError(
+          "not-found",
+          `no delegation ${ref}`,
+          "see `bb orchestrator status`",
+        );
       }
-    }
-    return {
-      ok: true as const,
-      delegationId: row.id,
-      status: "cancelled" as const,
-      ...(warning ? { warning } : {}),
-    };
-  };
+      // §6: from a thread, only the coordinator that owns this delegation.
+      if (callerThreadId && callerThreadId !== row.coordinator_thread_id) {
+        throw new OrchestratorError(
+          "not-a-coordinator",
+          `thread ${callerThreadId} is not the coordinator of delegation ${row.id}`,
+          "only the delegating coordinator may cancel it",
+        );
+      }
+      if (row.status !== "dispatching" && row.status !== "running") {
+        throw new OrchestratorError(
+          "not-active",
+          `delegation ${row.id} is already ${row.status}`,
+        );
+      }
+      // §6: a `dispatching` record without `thread_id` — the thread the
+      // tasks plugin attached after the record may still exist; find it
+      // first so the stop below can reach it.
+      let stopTarget = row.thread_id;
+      if (!stopTarget && row.status === "dispatching") {
+        stopTarget = await findTaskThreadId(
+          bbCli,
+          row.task_key,
+          row.created_at,
+        ).catch(() => null);
+        if (stopTarget) store.setThreadInfo(row.id, stopTarget);
+      }
+      // Status first, stop second — otherwise our own stop can read as external.
+      store.setStatus(row.id, "cancelled");
+      let warning: string | undefined;
+      if (stopTarget) {
+        try {
+          await bb.sdk.threads.stop({ threadId: stopTarget });
+        } catch (e) {
+          warning = `thread stop failed: ${describeError(e)}`;
+          store.addSetupError(row.id, "cancel-stop", warning);
+        }
+      }
+      return {
+        ok: true as const,
+        delegationId: row.id,
+        status: "cancelled" as const,
+        ...(warning ? { warning } : {}),
+      };
+    });
 
   // ── CLI (§6) ─────────────────────────────────────────────────────────
 
@@ -617,11 +732,17 @@ export async function createPlugin(
         }
 
         if (cmd === "reconcile") {
-          const note =
-            "reconcile — этап сторожа (watchdog): пока не реализовано в MVP";
+          const res = await watchdog.reconcile();
           return json
-            ? jsonOk({ ok: true, note })
-            : { exitCode: 0, stdout: note + "\n" };
+            ? jsonOk({ ok: true, ...res })
+            : {
+                exitCode: res.errors.length ? 1 : 0,
+                stdout:
+                  `reconcile: scanned=${res.scanned} cancelled=${res.cancelled} ` +
+                  `relinked=${res.relinked} removed=${res.removed} ` +
+                  `finalized=${res.finalized} retried=${res.retriedSteps}\n` +
+                  res.errors.map((e) => `error: ${e}\n`).join(""),
+              };
         }
 
         throw new OrchestratorError(

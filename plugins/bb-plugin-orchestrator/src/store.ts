@@ -279,6 +279,143 @@ export class DelegationStore {
     this.db.prepare(`DELETE FROM delegations WHERE id = ?`).run(id);
   }
 
+  /** All active (`dispatching`/`running`) rows, oldest first. */
+  listActive(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status IN ('dispatching','running') ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /**
+   * §5.1: a new executor turn opened the first-response window — record its
+   * start and clear the per-turn response marker.
+   */
+  setTurnStarted(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET turn_started_at = ?, first_response_at = NULL,
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /** First response event of the current turn; keeps the earliest value. */
+  setFirstResponse(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations
+         SET first_response_at = COALESCE(first_response_at, ?), updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /** Event-stream cursor (§5.1): only ever moves forward. */
+  advanceLastSeq(id: number, seq: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET last_seq = MAX(COALESCE(last_seq, -1), ?),
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(seq, Date.now(), id);
+  }
+
+  setApprovalNotified(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET last_approval_notified_at = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  setTimeoutNotified(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET timeout_notified_at = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /**
+   * Routes this task has already run on (§5.4): a route may be picked by an
+   * automatic reissue at most once per task, so every recorded row counts,
+   * whatever its status.
+   */
+  routesUsedByTask(taskKey: string): Set<string> {
+    const rows = this.db
+      .prepare(`SELECT DISTINCT route FROM delegations WHERE task_key = ?`)
+      .all(normalizeTaskKey(taskKey)) as { route: string }[];
+    return new Set(rows.map((r) => r.route));
+  }
+
+  /**
+   * §5.4 reissue in one transaction: the old row moves to `reissued` and a
+   * new `dispatching` row with `reissue_of` is inserted atomically, so a
+   * service restart mid-reissue cannot leave a duplicate. Returns the new
+   * row, or undefined when the old row already left `stalled`/`quota`.
+   */
+  reissue(
+    id: number,
+    next: { route: string; preset: string; provider: string },
+  ): DelegationRow | undefined {
+    return this.db.transaction(() => {
+      const row = this.get(id);
+      if (!row || (row.status !== "stalled" && row.status !== "quota")) {
+        return undefined;
+      }
+      const now = Date.now();
+      this.db
+        .prepare(
+          `UPDATE delegations SET status = 'reissued', updated_at = ? WHERE id = ?`,
+        )
+        .run(now, id);
+      const info = this.db
+        .prepare(
+          `INSERT INTO delegations (
+            task_key, task_id, project_id, coordinator_thread_id, level,
+            route, preset, provider, status, reissue_of, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?)`,
+        )
+        .run(
+          row.task_key,
+          row.task_id,
+          row.project_id,
+          row.coordinator_thread_id,
+          row.level,
+          next.route,
+          next.preset,
+          next.provider,
+          id,
+          now,
+          now,
+        );
+      return this.get(Number(info.lastInsertRowid));
+    })();
+  }
+
+  /** Drop every `setup_errors` entry of one step — after a successful retry. */
+  clearSetupError(id: number, step: string): void {
+    const row = this.get(id);
+    if (!row) return;
+    let errors: SetupError[] = [];
+    try {
+      const parsed = JSON.parse(row.setup_errors) as unknown;
+      if (Array.isArray(parsed)) errors = parsed as SetupError[];
+    } catch {
+      return;
+    }
+    const kept = errors.filter((e) => e?.step !== step);
+    if (kept.length === errors.length) return;
+    this.db
+      .prepare(`UPDATE delegations SET setup_errors = ?, updated_at = ? WHERE id = ?`)
+      .run(JSON.stringify(kept), Date.now(), id);
+  }
+
   /** Quota groups currently on hold (`route_holds.until` in the future). */
   heldGroups(now: number): Set<string> {
     const rows = this.db

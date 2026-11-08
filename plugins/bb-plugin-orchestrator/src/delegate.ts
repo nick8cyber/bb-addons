@@ -14,7 +14,7 @@
  */
 import { OrchestratorError } from "./errors.js";
 import { pickRoute, type PolicyLoad } from "./policy.js";
-import type { DelegationStore } from "./store.js";
+import type { DelegationRow, DelegationStore } from "./store.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
 import { runChecked, runJson, type BbCli } from "./bb-cli.js";
 
@@ -64,6 +64,26 @@ export interface DelegateDeps {
   loadPolicy(): Promise<PolicyLoad>;
   probes: ExecutorProbes;
   dispatchTimeoutMs?: number;
+}
+
+/**
+ * Narrower deps for the post-insert steps: dispatch (§4.3), attach,
+ * notifications, bypass, finalize, comment (§4.4–4.7). The watchdog's
+ * reissue (§5.4) and reconcile (§7) call these without the §4.1–4.2 checks,
+ * so later changes to the steps cover reissued threads too.
+ */
+export interface DispatchStepsDeps {
+  store: DelegationStore;
+  bbCli: BbCli;
+  threads: DelegateDeps["threads"];
+  dispatchTimeoutMs?: number;
+}
+
+export interface DispatchStepsResult {
+  threadId: string | null;
+  /** `cancelled` when the delegation was cancelled while dispatch ran. */
+  status: "running" | "cancelled";
+  setupErrors: SetupError[];
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -177,18 +197,46 @@ export async function runDelegate(
     throw e;
   }
 
-  // Step 3 — dispatch through the tasks CLI. Only an explicit failure
-  // (non-zero exit, not a timeout) removes the record: `bb tasks dispatch`
-  // spawns the thread before it answers, so on a timeout or an unreadable
-  // answer the executor may already exist and must stay tracked — the §7
-  // reconcile finds it through `bb tasks threads`.
+  // Steps 3–7 — shared with the watchdog's reissue (§5.4): the same
+  // function dispatches, attaches, finalizes and reports.
+  const res = await dispatchToRoute(row, { instructions: params.instructions }, deps);
+
+  return {
+    ok: true,
+    delegationId: row.id,
+    taskKey: row.task_key,
+    threadId: res.threadId,
+    level: params.level,
+    route: routeName,
+    status: res.status,
+    setupErrors: res.setupErrors,
+  };
+}
+
+/**
+ * §4 step 3 + steps 4–7 on an existing `dispatching` row: `bb tasks
+ * dispatch`, record `thread_id`, attach, notifications, bypass, `running`,
+ * «Раздано» comment. Also the reissue path (§5.4): the watchdog inserts the
+ * `dispatching` row itself and calls this — no copied dispatch logic.
+ *
+ * An explicit dispatch failure deletes the row; a timeout or unreadable
+ * answer leaves it `dispatching` without `thread_id` for the §7 reconcile
+ * and throws `dispatch-unknown`.
+ */
+export async function dispatchToRoute(
+  row: DelegationRow,
+  opts: { instructions?: string },
+  deps: DispatchStepsDeps,
+): Promise<DispatchStepsResult> {
+  const { store, bbCli } = deps;
+
   const dispatchArgs = [
     "tasks",
     "dispatch",
-    taskKey,
+    row.task_key,
     "--preset",
-    route.preset,
-    ...(params.instructions ? ["--instructions", params.instructions] : []),
+    row.preset,
+    ...(opts.instructions ? ["--instructions", opts.instructions] : []),
     "--json",
   ];
   const dispatchRes = await bbCli.run(dispatchArgs, {
@@ -219,7 +267,31 @@ export async function runDelegate(
   const threadId = dispatch.threadId;
   if (!threadId) throw unknownDispatch();
   store.setThreadInfo(row.id, threadId, dispatch.task?.id);
+  const linked = store.get(row.id) ?? row;
 
+  const done = await finishDispatchSteps(linked, deps);
+  return { threadId, status: done.status, setupErrors: done.setupErrors };
+}
+
+/**
+ * §4 steps 4–6 on a `dispatching` row that already has `thread_id`: attach
+ * (parent + hidden), `parentNotifications=auto`, best-effort `mode=bypass`,
+ * `dispatching`→`running` (a cancel that landed meanwhile wins and the
+ * created thread is stopped), «Раздано» comment. Errors land in
+ * `setup_errors`; the §7 reconcile retries them.
+ */
+export async function finishDispatchSteps(
+  row: DelegationRow,
+  deps: DispatchStepsDeps,
+): Promise<{ status: "running" | "cancelled"; setupErrors: SetupError[] }> {
+  const { store, bbCli } = deps;
+  const threadId = row.thread_id;
+  if (!threadId) {
+    throw new OrchestratorError(
+      "internal-error",
+      `delegation ${row.id} has no thread_id for the setup steps`,
+    );
+  }
   const setupErrors: SetupError[] = [];
   const noteError = (step: string, e: unknown) => {
     const err = { step, message: message(e) };
@@ -232,7 +304,7 @@ export async function runDelegate(
   try {
     await deps.threads.update({
       threadId,
-      parentThreadId: params.caller.threadId,
+      parentThreadId: row.coordinator_thread_id,
       visibility: "hidden",
     });
   } catch (e) {
@@ -250,44 +322,7 @@ export async function runDelegate(
     noteError("parent-notifications", e);
   }
 
-  // Step 5 — best-effort `mode=bypass` when the preset asks for full
-  // permission. Session options may still be empty right after dispatch;
-  // the reconcile pass repeats this until the session reports them.
-  try {
-    const show = await runJson<{ preset?: { permissionMode?: string } }>(
-      bbCli,
-      ["tasks", "preset", "show", route.preset, "--json"],
-    );
-    if (show.preset?.permissionMode === "full") {
-      const opts = await runJson<{
-        options?:
-          | {
-              id?: string;
-              name?: string;
-              value?: unknown;
-              values?: unknown[];
-            }[]
-          | null;
-      }>(bbCli, ["thread", "options", threadId, "--json"]);
-      const mode = (opts.options ?? []).find(
-        (o) => o.id === "mode" || o.name === "mode",
-      );
-      const offers = (mode?.values ?? []).some((v) =>
-        typeof v === "string" ? v === "bypass" : (v as { id?: string }).id === "bypass",
-      );
-      if (offers && mode?.value !== "bypass") {
-        await runChecked(bbCli, [
-          "thread",
-          "options",
-          threadId,
-          "--set",
-          "mode=bypass",
-        ]);
-      }
-    }
-  } catch (e) {
-    noteError("bypass-mode", e);
-  }
+  await ensureBypassMode(row, noteError, deps);
 
   // Step 6 — `running` only from `dispatching`: a cancel that landed while
   // dispatch ran wins, and the executor it created is stopped here.
@@ -299,16 +334,7 @@ export async function runDelegate(
       } catch (e) {
         noteError("cancel-stop", e);
       }
-      return {
-        ok: true,
-        delegationId: row.id,
-        taskKey: row.task_key,
-        threadId,
-        level: params.level,
-        route: routeName,
-        status: "cancelled",
-        setupErrors,
-      };
+      return { status: "cancelled", setupErrors };
     }
     noteError(
       "finalize",
@@ -322,25 +348,147 @@ export async function runDelegate(
     await runChecked(bbCli, [
       "tasks",
       "comment",
-      taskKey,
+      row.task_key,
       "--body",
-      `Раздано: уровень ${params.level}, маршрут ${routeName}, тред ${threadId}`,
+      `Раздано: уровень ${row.level}, маршрут ${row.route}, тред ${threadId}`,
     ]);
   } catch (e) {
     noteError("comment", e);
   }
 
-  // Step 7.
-  return {
-    ok: true,
-    delegationId: row.id,
-    taskKey: row.task_key,
-    threadId,
-    level: params.level,
-    route: routeName,
-    status: "running",
-    setupErrors,
+  return { status: "running", setupErrors };
+}
+
+/** §4 step 5 — best-effort `mode=bypass` for `permissionMode=full` presets. */
+async function ensureBypassMode(
+  row: DelegationRow,
+  noteError: (step: string, e: unknown) => void,
+  deps: DispatchStepsDeps,
+): Promise<void> {
+  const threadId = row.thread_id;
+  if (!threadId) return;
+  try {
+    await ensureBypassModeOrThrow(row, threadId, deps);
+  } catch (e) {
+    noteError("bypass-mode", e);
+  }
+}
+
+async function ensureBypassModeOrThrow(
+  row: DelegationRow,
+  threadId: string,
+  deps: DispatchStepsDeps,
+): Promise<void> {
+  const show = await runJson<{ preset?: { permissionMode?: string } }>(
+    deps.bbCli,
+    ["tasks", "preset", "show", row.preset, "--json"],
+  );
+  if (show.preset?.permissionMode !== "full") return;
+  const opts = await runJson<{
+    options?:
+      | {
+          id?: string;
+          name?: string;
+          value?: unknown;
+          values?: unknown[];
+        }[]
+      | null;
+  }>(deps.bbCli, ["thread", "options", threadId, "--json"]);
+  const mode = (opts.options ?? []).find(
+    (o) => o.id === "mode" || o.name === "mode",
+  );
+  const offers = (mode?.values ?? []).some((v) =>
+    typeof v === "string" ? v === "bypass" : (v as { id?: string }).id === "bypass",
+  );
+  if (offers && mode?.value !== "bypass") {
+    await runChecked(deps.bbCli, [
+      "thread",
+      "options",
+      threadId,
+      "--set",
+      "mode=bypass",
+    ]);
+  }
+}
+
+const SETUP_STEPS = ["attach", "parent-notifications", "bypass-mode", "comment", "cancel-stop"] as const;
+
+/**
+ * §7 reconcile helper for `running` rows: retry the §4.4–4.6 steps that
+ * `setup_errors` recorded as failed — plus step 5 unconditionally (session
+ * options can be empty right after dispatch; the preset check is the only
+ * cost). A successful attempt clears its recorded error.
+ */
+export async function retrySetupSteps(
+  row: DelegationRow,
+  deps: DispatchStepsDeps,
+): Promise<SetupError[]> {
+  const { store } = deps;
+  const threadId = row.thread_id;
+  if (!threadId) return [];
+
+  let recorded: Set<string>;
+  try {
+    const parsed = JSON.parse(row.setup_errors) as { step?: string }[];
+    recorded = new Set(
+      (Array.isArray(parsed) ? parsed : [])
+        .map((e) => e?.step)
+        .filter((s): s is string => typeof s === "string"),
+    );
+  } catch {
+    recorded = new Set();
+  }
+
+  const errors: SetupError[] = [];
+  const attempt = async (step: string, fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+      store.clearSetupError(row.id, step);
+    } catch (e) {
+      store.clearSetupError(row.id, step);
+      const msg = message(e);
+      store.addSetupError(row.id, step, msg);
+      errors.push({ step, message: msg });
+    }
   };
+
+  if (recorded.has("attach")) {
+    await attempt("attach", () =>
+      deps.threads.update({
+        threadId,
+        parentThreadId: row.coordinator_thread_id,
+        visibility: "hidden",
+      }),
+    );
+  }
+  if (recorded.has("parent-notifications")) {
+    await attempt("parent-notifications", () =>
+      runChecked(deps.bbCli, [
+        "thread",
+        "update",
+        threadId,
+        "--parent-notifications",
+        "auto",
+      ]),
+    );
+  }
+  // Best-effort by design: the session may report options only now.
+  await attempt("bypass-mode", () => ensureBypassModeOrThrow(row, threadId, deps));
+  if (recorded.has("comment")) {
+    await attempt("comment", () =>
+      runChecked(deps.bbCli, [
+        "tasks",
+        "comment",
+        row.task_key,
+        "--body",
+        `Раздано: уровень ${row.level}, маршрут ${row.route}, тред ${threadId}`,
+      ]),
+    );
+  }
+  if (recorded.has("cancel-stop")) {
+    await attempt("cancel-stop", () => deps.threads.stop({ threadId }));
+  }
+  return errors;
 }
 
 /** Serialize delegate calls inside this process (§4): the unique index is
