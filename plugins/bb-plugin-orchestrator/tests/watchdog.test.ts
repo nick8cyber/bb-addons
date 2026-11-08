@@ -1067,6 +1067,8 @@ test("10 failed stops → retry-exhausted + one escalation message", async () =>
   );
   assert.equal(exhausted.length, 1);
   assert.match(JSON.stringify(exhausted[0]!.input), /orchestrator cancel/);
+  // §7: the message carries the last real error, not a dash
+  assert.match(JSON.stringify(exhausted[0]!.input), /stop failed \(test\)/);
 
   // retries stopped for good
   const callsBefore = h.stops.length;
@@ -1094,7 +1096,7 @@ test("turn/completed with a quota-pattern error → quota (not silent)", async (
   assert.ok(h.store.heldGroups(h.getNow()).has("strict"));
 });
 
-test("findTaskThreadId drops NaN attachedAt and picks the earliest after", async () => {
+test("findTaskThreadId: dated candidates win; undatable ones still count", async () => {
   const cli: BbCli = {
     run: async (args) => {
       if (args.join(" ").startsWith("tasks threads"))
@@ -1111,5 +1113,141 @@ test("findTaskThreadId drops NaN attachedAt and picks the earliest after", async
     },
   };
   const id = await findTaskThreadId(cli, "PLUG-1", T0);
-  assert.equal(id, "thr_first"); // NaN dropped, earliest after created_at wins
+  assert.equal(id, "thr_first"); // earliest provable candidate wins
+
+  // §5.4 rev 15: a thread whose attachedAt does not parse is still a
+  // task thread — taking it beats a duplicate dispatch
+  const cli2: BbCli = {
+    run: async (args) =>
+      args.join(" ").startsWith("tasks threads")
+        ? ok(
+            JSON.stringify({
+              taskThreads: [{ threadId: "thr_only", attachedAt: "??" }],
+            }),
+          )
+        : ok(),
+  };
+  assert.equal(await findTaskThreadId(cli2, "PLUG-1", T0), "thr_only");
 });
+
+test("reconcile: undatable attachedAt relinks instead of a second dispatch", async () => {
+  const h = makeHarness({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks threads"))
+        return ok(
+          JSON.stringify({
+            taskThreads: [{ threadId: "thr_undated", attachedAt: "garbage" }],
+          }),
+        );
+      return undefined;
+    },
+  });
+  const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.db.prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`).run(
+    T0 - 6 * 60_000,
+    row2.id,
+  );
+  await h.wd.reconcile();
+  const fresh = h.store.get(row2.id)!;
+  assert.equal(fresh.thread_id, "thr_undated"); // relinked, not re-dispatched
+  assert.equal(fresh.status, "running");
+  assert.ok(
+    !h.calls.some((c) => c.join(" ").startsWith("tasks dispatch")),
+    "no second dispatch allowed",
+  );
+});
+
+test("relink + finalize resets retry_count (Н4 оговорка)", async () => {
+  let failLookup = true;
+  const h = makeHarness({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks threads"))
+        return failLookup
+          ? { exitCode: 1, stdout: "", stderr: "api down" }
+          : ok(
+              JSON.stringify({
+                taskThreads: [
+                  { threadId: "thr_e2", attachedAt: new Date(T0).toISOString() },
+                ],
+              }),
+            );
+      return undefined;
+    },
+  });
+  const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.db.prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`).run(
+    T0 - 6 * 60_000,
+    row2.id,
+  );
+  await h.wd.reconcile(); // lookup fails → retry_count = 1
+  assert.equal(h.store.get(row2.id)!.retry_count, 1);
+  failLookup = false;
+  await h.wd.reconcile(); // relink + finalize → resolved
+  const fresh = h.store.get(row2.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.retry_count, 0);
+});
+
+test("setup_errors never duplicates the same step+message", async () => {
+  const h = makeHarness();
+  const row = h.insertActive();
+  h.store.addSetupError(row.id, "watchdog-stop", "same failure");
+  h.store.addSetupError(row.id, "watchdog-stop", "same failure");
+  h.store.addSetupError(row.id, "watchdog-stop", "different failure");
+  const parsed = JSON.parse(h.store.get(row.id)!.setup_errors) as {
+    step: string;
+    message: string;
+  }[];
+  assert.deepEqual(parsed, [
+    { step: "watchdog-stop", message: "same failure" },
+    { step: "watchdog-stop", message: "different failure" },
+  ]);
+});
+
+test("bypass-settled stops the options check (Н6 следствие)", async () => {
+  const h = makeHarness({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(JSON.stringify({ preset: { permissionMode: "full" } }));
+      if (key.startsWith("thread options thr_e1 --json"))
+        return ok(
+          JSON.stringify({
+            options: [
+              { id: "mode", value: "bypass", values: [{ id: "bypass" }] },
+            ],
+          }),
+        );
+      return undefined;
+    },
+  });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.queues.set("thr_e1", [{ id: "q1" }]); // keeps it running past idle eval
+  await h.wd.reconcile(); // settles: options reported → marker recorded
+  assert.match(h.store.get(row.id)!.setup_errors, /bypass-settled/);
+  const optionsCalls = () =>
+    h.calls.filter(
+      (c) =>
+        c.join(" ").startsWith("thread options") ||
+        c.join(" ").startsWith("tasks preset show"),
+    ).length;
+  const before = optionsCalls();
+  await h.wd.reconcile(); // settled → no more CLI for the bypass check
+  assert.equal(optionsCalls(), before);
+});
+

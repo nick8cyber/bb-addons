@@ -176,11 +176,15 @@ export async function findTaskThreadId(
       id: t.threadId,
       at: t.attachedAt ? Date.parse(t.attachedAt) : Number.NaN,
     }))
-    // An unparseable `attachedAt` cannot prove the thread is newer than
-    // the record — drop it; the remaining sort is then stable.
     .filter((t) => Number.isFinite(t.at) && t.at >= createdAfter)
     .sort((a, b) => a.at - b.at);
-  return candidates[0]?.id ?? null;
+  if (candidates[0]) return candidates[0].id;
+  // A task thread exists but its `attachedAt` does not parse — taking it
+  // is wrong less often than dispatching a duplicate executor (§5.4).
+  const undatable = (res.taskThreads ?? []).find(
+    (t) => typeof t.threadId === "string",
+  );
+  return undatable?.threadId ?? null;
 }
 
 export function createWatchdog(deps: WatchdogDeps) {
@@ -935,7 +939,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     const current = store.get(row.id) ?? row;
     if (hasSetupError(current, "retry-exhausted")) return;
     const last =
-      store.findSetupError(current, "watchdog-stop")?.detail ?? "—";
+      store.findSetupError(current, "watchdog-stop")?.message ?? "—";
     store.addSetupError(row.id, "retry-exhausted", last);
     await report(
       row,
@@ -1040,6 +1044,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (!fresh || fresh.status !== "dispatching") return;
     // §7: a `dispatching` older than five minutes gets steps 4–6 finished.
     const res = await deps.finalize(fresh);
+    store.resetRetry(row.id); // resolved — the retry streak is over
     if (res.status === "running") {
       s.finalized++;
       if (fresh.reissue_of != null) await reportReissueDone(store.get(row.id)!);
@@ -1123,7 +1128,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           await outcomeAndMaybeReissue(
             cur,
             cur.status as "stalled" | "quota",
-            store.findSetupError(cur, "watchdog-stop")?.detail ?? "",
+            store.findSetupError(cur, "watchdog-stop")?.message ?? "",
           );
         } else {
           await trackRetry(row, "остановка исполнителя");

@@ -277,6 +277,11 @@ export class DelegationStore {
     } catch {
       // A corrupt value is overwritten rather than grown.
     }
+    // One (step, message) pair is stored once — retries must not pile
+    // up identical entries.
+    errors = errors.filter(
+      (e) => !(e?.step === step && e?.message === message),
+    );
     errors.push({ step, message });
     this.db
       .prepare(`UPDATE delegations SET setup_errors = ?, updated_at = ? WHERE id = ?`)
@@ -393,17 +398,16 @@ export class DelegationStore {
   findSetupError(
     row: DelegationRow,
     step: string,
-  ): { step: string; detail: string; time: number } | undefined {
+  ): { step: string; message: string } | undefined {
     try {
       const parsed = JSON.parse(row.setup_errors) as {
         step?: string;
-        detail?: string;
-        time?: number;
+        message?: string;
       }[];
       if (!Array.isArray(parsed)) return undefined;
       const hit = parsed.filter((e) => e?.step === step).at(-1);
-      return hit && typeof hit.detail === "string"
-        ? { step, detail: hit.detail, time: hit.time ?? 0 }
+      return hit && typeof hit.message === "string"
+        ? { step, message: hit.message }
         : undefined;
     } catch {
       return undefined;
