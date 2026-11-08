@@ -42,6 +42,8 @@ import {
 
 export interface OrchestratorDeps {
   bbCli?: BbCli;
+  /** Clock for the §2 preset-check throttle; tests inject a fake. */
+  now?: () => number;
 }
 
 interface PresetListEntry {
@@ -57,6 +59,7 @@ export async function createPlugin(
   deps: OrchestratorDeps = {},
 ) {
   const bbCli = deps.bbCli ?? createBbCli();
+  const now = deps.now ?? Date.now;
 
   const settings = bb.settings.define({
     policy: {
@@ -95,9 +98,9 @@ export async function createPlugin(
    * Load + validate the configured policy. The structural parse never
    * touches the CLI; rule 2's preset-existence check (`bb tasks preset
    * list`) runs only when `checkPresets` — at `policy validate`, at each
-   * delegate, and in the background after load. An unreadable preset list
-   * degrades to a warning so a CLI hiccup cannot make a good policy look
-   * invalid (§2).
+   * delegate, and in the background on the §2 schedule. An unreadable
+   * preset list degrades to a warning so a CLI hiccup cannot make a good
+   * policy look invalid (§2).
    */
   const loadPolicy = async (checkPresets = false): Promise<PolicyLoad> => {
     const text = currentSettings.policy ?? "";
@@ -105,12 +108,11 @@ export async function createPlugin(
     let knownPresets: Set<string> | undefined;
     let presetWarning: string | undefined;
     try {
-      const res = await runJson<{ presets?: PresetListEntry[] }>(bbCli, [
-        "tasks",
-        "preset",
-        "list",
-        "--json",
-      ]);
+      const res = await runJson<{ presets?: PresetListEntry[] }>(
+        bbCli,
+        ["tasks", "preset", "list", "--json"],
+        { timeoutMs: 15_000 },
+      );
       knownPresets = new Set(
         (res.presets ?? []).flatMap((p) =>
           [p.name, p.id].filter((x): x is string => typeof x === "string"),
@@ -128,16 +130,38 @@ export async function createPlugin(
 
   // Structural validation only — nothing may block plugin load on the CLI.
   let policyLoad = parsePolicy(currentSettings.policy ?? "");
-  // Preset existence resolves in the background; results refresh the
-  // warnings visible in `policy show` and the plugin status/log.
-  const checkPresetsInBackground = () => {
-    void loadPolicy(true).then((load) => {
-      policyLoad = load;
-      for (const w of load.warnings) {
-        bb.log.warn(`orchestrator: ${w.path}: ${w.message}`);
-      }
-      refreshStatus();
-    });
+  /**
+   * §2 (rev 13): the background preset check runs at most once per ten
+   * minutes, only when the policy text changed since the last check or
+   * delegations are active — and outside the `delegate` queue, so a slow
+   * `bb tasks preset list` cannot stall dispatches.
+   */
+  const PRESET_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+  let lastPresetCheckAt = 0;
+  let lastPresetCheckPolicy: string | undefined;
+  let presetCheckInFlight = false;
+  const maybeCheckPresets = () => {
+    const text = currentSettings.policy ?? "";
+    const due =
+      !presetCheckInFlight &&
+      now() - lastPresetCheckAt >= PRESET_CHECK_INTERVAL_MS &&
+      (lastPresetCheckPolicy !== text || store.activeCount() > 0);
+    if (!due) return;
+    presetCheckInFlight = true;
+    lastPresetCheckAt = now();
+    lastPresetCheckPolicy = text;
+    void loadPolicy(true)
+      .then((load) => {
+        policyLoad = load;
+        for (const w of load.warnings) {
+          bb.log.warn(`orchestrator: ${w.path}: ${w.message}`);
+        }
+        refreshStatus();
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        presetCheckInFlight = false;
+      });
   };
 
   const refreshStatus = () => {
@@ -156,13 +180,13 @@ export async function createPlugin(
     }
   };
   refreshStatus();
-  checkPresetsInBackground();
+  maybeCheckPresets();
 
   settings.onChange((next) => {
     currentSettings = next;
     policyLoad = parsePolicy(currentSettings.policy ?? "");
     refreshStatus();
-    checkPresetsInBackground();
+    maybeCheckPresets();
   });
 
   const instructionsText = () =>
@@ -261,8 +285,10 @@ export async function createPlugin(
     store,
     bbCli,
     threads: watchdogThreads,
-    loadPolicy: () => loadPolicy(true),
-    dispatch: (row) => dispatchToRoute(row, {}, stepsDeps),
+    // The §2 schedule keeps `policyLoad` fresh; the watchdog must not run
+    // `bb tasks preset list` on every timer/event.
+    loadPolicy: async () => policyLoad,
+    dispatch: (row, opts) => dispatchToRoute(row, opts ?? {}, stepsDeps),
     finalize: (row) => finishDispatchSteps(row, stepsDeps),
     retrySetup: (row) => retrySetupSteps(row, stepsDeps),
     enqueue,
@@ -270,62 +296,82 @@ export async function createPlugin(
   });
 
   let watchdogSubscribed = false;
+  let serviceRunning = false;
   bb.background.service("orchestrator-watchdog", {
     start(signal) {
+      // `bb.events.on` has no unsubscribe: handlers check the flag, so a
+      // stopped service is inert even though registrations stay.
       const run = (p: Promise<unknown>) =>
         void p.catch((e) =>
           bb.log.warn(`orchestrator watchdog: ${describeError(e)}`),
         );
+      const live = <T>(fn: () => Promise<T>): Promise<T | undefined> =>
+        serviceRunning ? fn() : Promise.resolve(undefined);
       // `bb.events.on` has no unsubscribe; guard so a service crash
       // restart does not stack duplicate handlers.
       if (!watchdogSubscribed) {
         watchdogSubscribed = true;
         bb.events.on("experimental_thread.events", (p) =>
-          run(watchdog.onThreadEvents(p)),
+          run(live(() => watchdog.onThreadEvents(p))),
         );
         bb.events.on("thread.active", ({ thread }) =>
-          run(watchdog.onThreadActive(thread)),
+          run(live(() => watchdog.onThreadActive(thread))),
         );
         bb.events.on("thread.idle", ({ thread }) =>
-          run(watchdog.onThreadIdle(thread)),
+          run(live(() => watchdog.onThreadIdle(thread))),
         );
         bb.events.on("thread.failed", ({ thread, error }) =>
-          run(watchdog.onThreadFailed(thread, error)),
+          run(live(() => watchdog.onThreadFailed(thread, error))),
         );
-        bb.events.on("turn.failed", (e) => run(watchdog.onTurnFailed(e)));
+        bb.events.on("turn.failed", (e) => run(live(() => watchdog.onTurnFailed(e))));
         bb.events.on("interaction.pending", ({ thread, interaction }) =>
-          run(watchdog.onInteractionPending(thread, interaction)),
+          run(live(() => watchdog.onInteractionPending(thread, interaction))),
         );
         bb.events.on("thread.archived", ({ thread }) =>
-          run(watchdog.onThreadGone(thread, "archived")),
+          run(live(() => watchdog.onThreadGone(thread, "archived"))),
         );
         bb.events.on("thread.deleted", ({ thread }) =>
-          run(watchdog.onThreadGone(thread, "deleted")),
+          run(live(() => watchdog.onThreadGone(thread, "deleted"))),
         );
       }
       // §7: a reconcile pass at start, then every 60 s; the §5.1/§5.3
-      // timers run on a shorter beat.
-      run(watchdog.reconcile());
-      const reconcileTimer = setInterval(
-        () => run(watchdog.reconcile()),
-        60_000,
-      );
+      // timers run on a shorter beat. Busy guards keep a slow pass from
+      // piling up queued copies of itself.
+      serviceRunning = true;
+      let busy = false;
+      const beat = (fn: () => Promise<unknown>) => {
+        if (busy) return;
+        busy = true;
+        void live(fn)
+          ?.catch((e) =>
+            bb.log.warn(`orchestrator watchdog: ${describeError(e)}`),
+          )
+          .finally(() => {
+            busy = false;
+          });
+      };
+      beat(() => watchdog.reconcile());
+      maybeCheckPresets();
+      const reconcileTimer = setInterval(() => {
+        beat(() => watchdog.reconcile());
+        maybeCheckPresets();
+      }, 60_000);
       const timersTimer = setInterval(
-        () => run(watchdog.checkTimers()),
+        () => beat(() => watchdog.checkTimers()),
         5_000,
       );
       return new Promise<void>((resolve) => {
-        if (signal.aborted) {
+        const stop = () => {
+          serviceRunning = false;
           clearInterval(reconcileTimer);
           clearInterval(timersTimer);
           resolve();
+        };
+        if (signal.aborted) {
+          stop();
           return;
         }
-        signal.addEventListener("abort", () => {
-          clearInterval(reconcileTimer);
-          clearInterval(timersTimer);
-          resolve();
-        });
+        signal.addEventListener("abort", stop);
       });
     },
   });
@@ -448,17 +494,21 @@ export async function createPlugin(
       // tasks plugin attached after the record may still exist; find it
       // first so the stop below can reach it.
       let stopTarget = row.thread_id;
+      let warning: string | undefined;
       if (!stopTarget && row.status === "dispatching") {
-        stopTarget = await findTaskThreadId(
-          bbCli,
-          row.task_key,
-          row.created_at,
-        ).catch(() => null);
+        try {
+          stopTarget = await findTaskThreadId(
+            bbCli,
+            row.task_key,
+            row.created_at,
+          );
+        } catch (e) {
+          warning = `task thread lookup failed: ${describeError(e)}`;
+        }
         if (stopTarget) store.setThreadInfo(row.id, stopTarget);
       }
       // Status first, stop second — otherwise our own stop can read as external.
       store.setStatus(row.id, "cancelled");
-      let warning: string | undefined;
       if (stopTarget) {
         try {
           await bb.sdk.threads.stop({ threadId: stopTarget });

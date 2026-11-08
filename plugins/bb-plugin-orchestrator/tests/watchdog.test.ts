@@ -49,6 +49,8 @@ function makeHarness(
     policyText?: string;
     cli?: (args: string[]) => BbCliResult | undefined;
     dispatchThreadId?: string;
+    /** Throw on the first N `threads.stop` calls (confirmStop tests). */
+    stopFails?: number;
   } = {},
 ) {
   const db = new Database(":memory:");
@@ -124,12 +126,20 @@ function makeHarness(
       return {};
     },
     stop: async ({ threadId }: { threadId: string }) => {
+      const row = store.byThreadId(threadId);
+      statusAtStop.push(row?.status ?? "none");
       stops.push(threadId);
+      if (stopFailsLeft > 0) {
+        stopFailsLeft--;
+        throw new Error("stop failed (test)");
+      }
       const dto = threadDtos.get(threadId);
       if (dto) dto.status = "idle";
       return {};
     },
   };
+  let stopFailsLeft = opts.stopFails ?? 0;
+  const statusAtStop: (string | undefined)[] = [];
 
   let nowVal = T0;
   const enqueue = createDelegateQueue();
@@ -150,7 +160,7 @@ function makeHarness(
     bbCli: cli,
     threads,
     loadPolicy: async () => parsePolicy(opts.policyText ?? POLICY, PRESETS),
-    dispatch: (row) => dispatchToRoute(row, {}, stepsDeps),
+    dispatch: (row, opts) => dispatchToRoute(row, opts ?? {}, stepsDeps),
     finalize: (row) => finishDispatchSteps(row, stepsDeps),
     retrySetup: (row) => retrySetupSteps(row, stepsDeps),
     enqueue,
@@ -200,6 +210,7 @@ function makeHarness(
     threadDtos,
     queues,
     warns,
+    statusAtStop,
     insertActive,
     setNow: (v: number) => {
       nowVal = v;
@@ -574,4 +585,296 @@ test("findTaskThreadId picks the thread attached after the record", async () => 
   };
   const id = await findTaskThreadId(cli, "PLUG-1", T0);
   assert.equal(id, "thr_new");
+});
+
+// ── Доработка по ревью PLUG-144 / спека rev 13 ──────────────────────────
+
+test("stalled decision drains the stream first: a pending response cancels it", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  // turn/started processed (window open); the response lands in the
+  // journal afterwards but is not yet processed (debounce/queue lag)
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "item/agentMessage/delta", T0 + 5000, { text: "hi" }),
+  ]);
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.first_response_at, T0 + 5000);
+  assert.deepEqual(h.stops, []);
+});
+
+test("unconfirmed stop: no reissue, one message, reconcile retries the stop", async () => {
+  const h = makeHarness({ stopFails: 1 });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  const stalled = h.store.get(row.id)!;
+  assert.equal(stalled.status, "stalled"); // status kept, NOT reissued
+  assert.equal(h.store.listActive().length, 0);
+  assert.equal(h.store.listByStatuses(["reissued"]).length, 0);
+  assert.equal(h.stops.length, 1); // attempted once, failed
+  assert.match(stalled.setup_errors, /watchdog-stop/);
+  assert.equal(h.sends.length, 1);
+  assert.match(
+    JSON.stringify(h.sends[0]!.input),
+    /не удалось остановить исполнителя/,
+  );
+
+  // reconcile retries: now stop succeeds → the §5.4 decision runs
+  const summary = await h.wd.reconcile();
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple-alt");
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.reissue_of, row.id);
+  assert.ok(summary.errors.length === 0);
+});
+
+test("interrupted (non-manual reason): resume once, stalled on repeat", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "system/thread/interrupted", T0, { reason: "host-daemon-restarted" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.resume_count, 1);
+  assert.equal(fresh.turn_started_at, null); // cleared so idle can't read as done
+  // message to the executor + coordinator notification
+  const executorMsg = h.sends.find((s) => s.threadId === "thr_e1");
+  const coordMsg = h.sends.find((s) => s.threadId === "thr_coord");
+  assert.ok(executorMsg, "executor resume expected");
+  assert.match(JSON.stringify(executorMsg!.input), /продолжай задачу/);
+  assert.ok(coordMsg, "coordinator notification expected");
+
+  // a second interruption → stalled path
+  h.eventLog.set("thr_e1", [
+    ev(3, "system/thread/interrupted", T0 + 10_000, { reason: "provider-turn-idle" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+});
+
+test("reconcile drives a reissue_of dispatching row to dispatch + report", async () => {
+  const h = makeHarness();
+  // restart between the reissue transaction and the dispatch
+  const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.db.prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`).run(
+    T0 - 6 * 60_000,
+    row2.id,
+  );
+
+  const summary = await h.wd.reconcile();
+  const fresh = h.store.get(row2.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.thread_id, "thr_new");
+  assert.equal(h.store.get(old.id)!.status, "reissued");
+  assert.equal(h.store.listActive().length, 1);
+  assert.ok(
+    h.calls.some((c) => c.join(" ").startsWith("tasks dispatch PLUG-1")),
+  );
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /перевыпуск завершён/,
+  );
+  assert.equal(summary.errors.length, 0);
+});
+
+test("reconcile: refused reissue dispatch → new row failed + lost-reissue report", async () => {
+  const h = makeHarness({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks dispatch"))
+        return { exitCode: 1, stdout: "", stderr: "preset gone" };
+      if (key.startsWith("tasks threads"))
+        return ok(JSON.stringify({ taskThreads: [] }));
+      return ok();
+    },
+  });
+  const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.db.prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`).run(
+    T0 - 6 * 60_000,
+    row2.id,
+  );
+
+  await h.wd.reconcile();
+  const fresh = h.store.get(row2.id)!;
+  assert.equal(fresh.status, "failed"); // kept, not removed
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /перевыпуск потерян/,
+  );
+});
+
+test("turn.failed category upgrades a premature failed to quota + hold", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  // race: thread.failed lands first with a non-pattern error text
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+  assert.equal(h.store.get(row.id)!.status, "failed");
+  // then turn.failed arrives carrying the typed signal
+  await h.wd.onTurnFailed({
+    threadId: "thr_e1",
+    errorInfo: { category: "rate-limit" },
+  });
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.ok(h.store.heldGroups(h.getNow()).has("zen"));
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple-alt");
+});
+
+test("provider/error with willRetry=true is not a quota", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "provider/error", T0, {
+      message: "rate limit 429, retrying",
+      willRetry: true,
+    }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  assert.equal(h.store.get(row.id)!.status, "running");
+  assert.equal(h.store.heldGroups(h.getNow()).size, 0);
+});
+
+test("provider/error with errorInfo.category is a quota", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "provider/error", T0, {
+      message: "nope",
+      errorInfo: { category: "billing" },
+    }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  assert.equal(h.store.get(row.id)!.status, "quota");
+  assert.ok(h.store.heldGroups(h.getNow()).has("strict"));
+});
+
+test("status is written before the stop call (§5.3 order)", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  assert.deepEqual(h.statusAtStop, ["stalled"]); // not "running"
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+});
+
+test("manual-stop interrupt recovered from the journal after restart", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  // interrupt already consumed in an earlier life: last_seq moved past it,
+  // the in-memory flag (lost on restart) is empty
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(5, "system/thread/interrupted", T0 - 500, { reason: "manual-stop" }),
+  ]);
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setTurnStarted(row.id, T0 - 1000);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "cancelled");
+});
+
+test("idle with archivedAt → cancelled (evaluateIdle tombstones)", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle", { archivedAt: T0 }));
+  await h.wd.onThreadIdle(dto("thr_e1", "idle", { archivedAt: T0 }));
+  assert.equal(h.store.get(row.id)!.status, "cancelled");
+});
+
+test("store.reissue refuses non-stalled sources and double reissues", async () => {
+  const h = makeHarness();
+  const running = h.insertActive({ taskKey: "PLUG-7" });
+  assert.equal(
+    h.store.reissue(running.id, {
+      route: "simple-alt",
+      preset: "p",
+      provider: "p",
+    }),
+    undefined,
+  );
+  h.store.setStatus(running.id, "stalled");
+  const next = h.store.reissue(running.id, {
+    route: "simple-alt",
+    preset: "p",
+    provider: "p",
+  })!;
+  assert.equal(next.reissue_of, running.id);
+  // already reissued — a second call must not produce another row
+  assert.equal(
+    h.store.reissue(running.id, { route: "x", preset: "x", provider: "x" }),
+    undefined,
+  );
+  assert.equal(
+    h.store.list().filter((r) => r.task_key === "PLUG-7").length,
+    2,
+  );
+});
+
+test("reissue route choice starts after the current route", async () => {
+  const h = makeHarness();
+  // delegated explicitly to simple-alt (second in chain); a stall must not
+  // walk back to the earlier `simple`
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple-alt", preset: "simple-alt", provider: "agy" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+  assert.equal(h.store.listActive().length, 0); // no route after simple-alt
+  assert.match(JSON.stringify(h.sends[0]!.input), /перевыпуск за координатором/);
 });

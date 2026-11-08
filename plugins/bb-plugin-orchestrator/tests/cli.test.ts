@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createFakePluginHost,
   makePluginAgentConfigurationContext,
+  makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import { createPlugin } from "../server.js";
@@ -40,13 +41,14 @@ async function hostWith(
   settings: Record<string, string | boolean> = {},
   cli: BbCli = fakeCli().cli,
   sdk: NonNullable<Parameters<typeof createFakePluginHost>[0]>["sdk"] = {},
+  now?: () => number,
 ) {
   const host = createFakePluginHost({
     pluginId: "orchestrator",
     settings: { policy: POLICY_TEXT, ...settings },
     sdk,
   });
-  await createPlugin(host.bb, { bbCli: cli });
+  await createPlugin(host.bb, { bbCli: cli, ...(now ? { now } : {}) });
   return host;
 }
 
@@ -196,6 +198,17 @@ test("reconcile runs a pass and reports counters", async () => {
   assert.equal(body.scanned, 0);
 });
 
+const COORDINATOR_SDK = {
+  get: async () => ({
+    id: "thr_coord",
+    parentThreadId: null,
+    title: "coordinator",
+    titleFallback: null,
+    originPluginId: null,
+    projectId: "proj_main",
+  }),
+};
+
 test("agent tool delegate returns structured errors", async () => {
   const host = await hostWith({}, fakeCli().cli, {
     threads: {
@@ -276,4 +289,179 @@ test("CLI cancel from a foreign thread is refused; owner coordinator cancels", a
     "cancelled",
   );
   assert.deepEqual(stops, ["thr_exec"]);
+});
+
+// ── rev 13: cancel без thread_id, dispose-интертность, throttle пресетов ──
+
+const DISPATCH_TIMEOUT = {
+  exitCode: 1,
+  stdout: "",
+  stderr: "timed out",
+  timedOut: true,
+} as const;
+
+test("cancel of a dispatching row without thread_id finds and stops the thread (§6)", async () => {
+  const stops: string[] = [];
+  const { cli } = fakeCli((args) => {
+    const key = args.join(" ");
+    if (key.startsWith("tasks dispatch")) return { ...DISPATCH_TIMEOUT };
+    if (key.startsWith("tasks preset show"))
+      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+    if (key.startsWith("tasks threads"))
+      return ok(
+        JSON.stringify({
+          taskThreads: [
+            { threadId: "thr_late", attachedAt: new Date().toISOString() },
+          ],
+        }),
+      );
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: {
+      ...COORDINATOR_SDK,
+      update: async () => ({}),
+      stop: async ({ threadId }: { threadId: string }) => {
+        stops.push(threadId);
+        return {};
+      },
+    },
+  });
+  const delegated = await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(
+    (JSON.parse(delegated.stdout) as { error: { code: string } }).error.code,
+    "dispatch-unknown",
+  );
+
+  const res = await host.harness.runCli(["cancel", "1", "--json"], {
+    threadId: "thr_coord",
+  });
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    status: string;
+    warning?: string;
+  };
+  assert.equal(body.ok, true);
+  assert.equal(body.status, "cancelled");
+  assert.equal(body.warning, undefined);
+  assert.deepEqual(stops, ["thr_late"]);
+});
+
+test("cancel surfaces the thread-lookup failure as a warning", async () => {
+  const stops: string[] = [];
+  const { cli } = fakeCli((args) => {
+    const key = args.join(" ");
+    if (key.startsWith("tasks dispatch")) return { ...DISPATCH_TIMEOUT };
+    if (key.startsWith("tasks threads"))
+      return { exitCode: 1, stdout: "", stderr: "tasks api down" };
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: {
+      ...COORDINATOR_SDK,
+      update: async () => ({}),
+      stop: async ({ threadId }: { threadId: string }) => {
+        stops.push(threadId);
+        return {};
+      },
+    },
+  });
+  await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+  const res = await host.harness.runCli(["cancel", "1", "--json"], {
+    threadId: "thr_coord",
+  });
+  const body = JSON.parse(res.stdout) as { status: string; warning?: string };
+  assert.equal(body.status, "cancelled");
+  assert.match(body.warning ?? "", /task thread lookup failed/);
+  assert.deepEqual(stops, []);
+});
+
+test("a stopped watchdog service ignores thread events (dispose)", async () => {
+  const eventLists: number[] = [];
+  const { cli } = fakeCli((args) => {
+    const key = args.join(" ");
+    if (key.startsWith("tasks dispatch"))
+      return ok(JSON.stringify({ threadId: "thr_exec" }));
+    if (key.startsWith("tasks preset show"))
+      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: {
+      ...COORDINATOR_SDK,
+      update: async () => ({}),
+      stop: async () => ({}),
+      get: async ({ threadId }: { threadId: string }) =>
+        threadId === "thr_exec"
+          ? { id: "thr_exec", status: "active", archivedAt: null, deletedAt: null }
+          : COORDINATOR_SDK.get(),
+      events: {
+        list: async () => {
+          eventLists.push(1);
+          return [];
+        },
+      },
+      queuedMessages: { list: async () => [] },
+      send: async () => ({}),
+    },
+  });
+  await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+  const { controller, done } = host.harness.runService("orchestrator-watchdog");
+  const tick = () => new Promise((r) => setImmediate(r));
+  await host.harness.emitThreadEvent("experimental_thread.events", {
+    thread: makeThreadResponse({ id: "thr_exec" }),
+    sequence: 7,
+  });
+  await tick(); // the handler resolves before its enqueued work drains
+  await tick();
+  const liveCalls = eventLists.length;
+  assert.ok(liveCalls > 0, "running service should read the stream");
+
+  controller.abort();
+  await done;
+  await host.harness.emitThreadEvent("experimental_thread.events", {
+    thread: makeThreadResponse({ id: "thr_exec" }),
+    sequence: 9,
+  });
+  await tick();
+  await tick();
+  assert.equal(eventLists.length, liveCalls, "stopped service must be inert");
+});
+
+test("preset check: throttled to 10 min and gated on change/activity", async () => {
+  let fakeNow = 1_000_000;
+  const presetListCalls = () =>
+    calls.filter((c) => c.join(" ").startsWith("tasks preset list")).length;
+  const { cli, calls } = fakeCli();
+  const host = await hostWith({}, cli, {}, () => fakeNow);
+  // initial background check — one call
+  await new Promise((r) => setImmediate(r));
+  assert.equal(presetListCalls(), 1);
+
+  const POLICY2 = JSON.stringify({
+    version: 1,
+    levels: { simple: { chain: ["simple"] } },
+    routes: { simple: { preset: "simple", provider: "agy" } },
+  });
+  // changed policy but inside the 10-minute window → still 1
+  fakeNow += 5 * 60_000;
+  await host.harness.setSettings({ policy: POLICY2 });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(presetListCalls(), 1);
+  // past the window with a changed policy → second call
+  fakeNow += 6 * 60_000;
+  await host.harness.setSettings({
+    policy: POLICY2.replace("agy", "acp-devin"),
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(presetListCalls(), 2);
 });

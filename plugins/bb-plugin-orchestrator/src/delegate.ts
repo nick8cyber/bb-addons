@@ -225,7 +225,16 @@ export async function runDelegate(
  */
 export async function dispatchToRoute(
   row: DelegationRow,
-  opts: { instructions?: string },
+  opts: {
+    instructions?: string;
+    /**
+     * What an explicit dispatch refusal does to the record. Default
+     * `remove` (§4 step 3); `fail` marks it `failed` instead — the §7
+     * reconcile uses it for `reissue_of` rows, which must never silently
+     * vanish (§5.4 rev 13).
+     */
+    onDispatchFailure?: "remove" | "fail";
+  },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
   const { store, bbCli } = deps;
@@ -249,7 +258,11 @@ export async function dispatchToRoute(
       "the delegation stays `dispatching`; the reconcile pass will link the thread or remove the record",
     );
   if (dispatchRes.exitCode !== 0 && !dispatchRes.timedOut) {
-    store.remove(row.id);
+    if (opts.onDispatchFailure === "fail") {
+      store.setStatus(row.id, "failed");
+    } else {
+      store.remove(row.id);
+    }
     throw new OrchestratorError(
       "dispatch-failed",
       `bb tasks dispatch failed (exit ${dispatchRes.exitCode}): ${
@@ -411,13 +424,18 @@ async function ensureBypassModeOrThrow(
   }
 }
 
-const SETUP_STEPS = ["attach", "parent-notifications", "bypass-mode", "comment", "cancel-stop"] as const;
+/**
+ * §4.5 retries step 5 only while the session can still be building its
+ * options — bounded by the delegation's age so reconcile does not spend
+ * two CLI calls per row per minute forever.
+ */
+const BYPASS_RETRY_WINDOW_MS = 30 * 60 * 1000;
 
 /**
  * §7 reconcile helper for `running` rows: retry the §4.4–4.6 steps that
- * `setup_errors` recorded as failed — plus step 5 unconditionally (session
- * options can be empty right after dispatch; the preset check is the only
- * cost). A successful attempt clears its recorded error.
+ * `setup_errors` recorded as failed — plus step 5 while inside the retry
+ * window (session options can be empty right after dispatch; the preset
+ * check is the only cost). A successful attempt clears its recorded error.
  */
 export async function retrySetupSteps(
   row: DelegationRow,
@@ -472,8 +490,13 @@ export async function retrySetupSteps(
       ]),
     );
   }
-  // Best-effort by design: the session may report options only now.
-  await attempt("bypass-mode", () => ensureBypassModeOrThrow(row, threadId, deps));
+  // Best-effort by design, bounded by the retry window: the session may
+  // report options only now, but not forever.
+  if (Date.now() - row.created_at < BYPASS_RETRY_WINDOW_MS) {
+    await attempt("bypass-mode", () =>
+      ensureBypassModeOrThrow(row, threadId, deps),
+    );
+  }
   if (recorded.has("comment")) {
     await attempt("comment", () =>
       runChecked(deps.bbCli, [

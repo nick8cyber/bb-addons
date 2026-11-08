@@ -43,6 +43,9 @@ export const MIGRATIONS: readonly string[] = [
   // §3: the fresh-dispatching executor marker is scoped to the thread's
   // bb project, so delegations record the coordinator's project.
   `ALTER TABLE delegations ADD COLUMN project_id TEXT`,
+  // §5.3 `interrupted` outcome: how many times the watchdog already asked
+  // the executor to resume after a non-manual interruption.
+  `ALTER TABLE delegations ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -76,6 +79,7 @@ export interface DelegationRow {
   setup_errors: string;
   last_approval_notified_at: number | null;
   timeout_notified_at: number | null;
+  resume_count: number;
   created_at: number;
   updated_at: number;
 }
@@ -341,14 +345,49 @@ export class DelegationStore {
       .run(at, Date.now(), id);
   }
 
+  /** §5.3: a non-manual interruption ends the current turn — clear both
+   * markers so `done` cannot latch and a later idle is not misread. */
+  clearTurn(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET turn_started_at = NULL, first_response_at = NULL,
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), id);
+  }
+
+  /** §5.3 `interrupted`: one resume has been issued. */
+  bumpResume(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET resume_count = resume_count + 1, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(Date.now(), id);
+  }
+
+  /** Rows in any of the given statuses, oldest first. */
+  listByStatuses(statuses: readonly string[]): DelegationRow[] {
+    if (!statuses.length) return [];
+    const marks = statuses.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE status IN (${marks}) ORDER BY id`,
+      )
+      .all(...statuses) as DelegationRow[];
+  }
+
   /**
-   * Routes this task has already run on (§5.4): a route may be picked by an
-   * automatic reissue at most once per task, so every recorded row counts,
-   * whatever its status.
+   * Routes an automatic reissue already sent this task to (§5.4): a route
+   * may be picked at most once per task — but only auto-reissues count,
+   * routes of manual delegations stay eligible.
    */
   routesUsedByTask(taskKey: string): Set<string> {
     const rows = this.db
-      .prepare(`SELECT DISTINCT route FROM delegations WHERE task_key = ?`)
+      .prepare(
+        `SELECT DISTINCT route FROM delegations
+         WHERE task_key = ? AND reissue_of IS NOT NULL`,
+      )
       .all(normalizeTaskKey(taskKey)) as { route: string }[];
     return new Set(rows.map((r) => r.route));
   }
