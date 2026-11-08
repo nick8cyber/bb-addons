@@ -2,7 +2,7 @@
 title: Orchestrator — раздача работы исполнителям как код
 status: draft
 updated: 2026-11-08
-revision: 12.1 (предупреждения о пресетах — в журнале; отмена записи без треда)
+revision: 13 (ревью PLUG-144: прерывания, порядок решений сторожа)
 ---
 
 # Orchestrator
@@ -55,7 +55,7 @@ revision: 12.1 (предупреждения о пресетах — в журн
 }
 ```
 
-Проверка существования пресетов (`bb tasks preset list`) не выполняется синхронно при загрузке плагина — только при `policy validate`, при первой раздаче и в фоне после старта; предупреждения видны в `bb orchestrator policy show` и в журнале плагина (SDK не даёт плагину статус-предупреждений).
+Проверка существования пресетов (`bb tasks preset list`) не выполняется синхронно при загрузке плагина — только при `policy validate`, при раздаче и в фоне не чаще раза в 10 минут (и только при изменении политики или наличии активных делегирований), с таймаутом вызова CLI 15 с, вне очереди `delegate`; предупреждения видны в `bb orchestrator policy show` и в журнале плагина (SDK не даёт плагину статус-предупреждений).
 
 Правила валидации (каждое — отдельная ошибка с путём в JSON):
 1. `version` = 1.
@@ -127,7 +127,7 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 
 ### 5.1 Первый ответ (правило N секунд)
 
-Окно открывается при старте хода исполнителя (`turn/started` или переход треда в `active`). Ответом считаются события: `item/started` (кроме `userMessage`), `item/completed`, дельты текста и размышлений, `item/toolCall/progress`, `item/commandExecution/outputDelta`. Если за `firstResponseSeconds` ответа нет — исполнитель **завис**: `threads.stop`, исход `stalled`.
+Окно открывается при старте хода исполнителя (`turn/started` или переход треда в `active`). Ответом считаются события: `item/started` (кроме `userMessage`), `item/completed`, дельты текста и размышлений, `item/toolCall/progress`, `item/commandExecution/outputDelta`. Если за `firstResponseSeconds` ответа нет — исполнитель **завис**: `threads.stop`, исход `stalled`. Перед решением «завис» сторож обязательно дочитывает события треда после `last_seq` (`threads.events.list`): ответ, пришедший, но ещё не обработанный, отменяет решение.
 
 Источник событий — подписка `experimental_thread.events` (не чаще раза в секунду) + чтение `threads.events.list` после последнего виденного номера. Таймер — на сервере, не зависит от опроса агентом.
 
@@ -135,7 +135,7 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 
 ### 5.2 Исчерпание квоты
 
-Первый сигнал — типизированный: `turn.failed` с `errorInfo.category` = `rate-limit` или `billing`. Запасной — текст события `provider/error`, `system/error` или ошибки хода совпадает с шаблоном квоты провайдера (`429`, `rate limit`, `quota`, `usage limit`, `Free usage limit reached`, `insufficient credits`; список — константа плагина, расширяемая в политике `routes.*.quotaPatterns`). Исход `quota`: запись → `quota`, затем `threads.stop`; все маршруты той же группы квоты (`quotaGroup`, а без неё — сам маршрут) помечаются недоступными на 15 минут.
+Первый сигнал — типизированный: `turn.failed` с `errorInfo.category` = `rate-limit` или `billing`; ответ провайдера «повторю сам» (`willRetry = true`) квотой не считается, пока провайдер не сдался. Решение по `thread.failed` принимается только после чтения событий хода: если среди них есть `turn.failed` с категорией квоты — исход `quota`, а не `failed`. Запасной — текст события `provider/error`, `system/error` или ошибки хода совпадает с шаблоном квоты провайдера (`429`, `rate limit`, `quota`, `usage limit`, `Free usage limit reached`, `insufficient credits`; список — константа плагина, расширяемая в политике `routes.*.quotaPatterns`). Исход `quota`: запись → `quota`, затем `threads.stop`; все маршруты той же группы квоты (`quotaGroup`, а без неё — сам маршрут) помечаются недоступными на 15 минут.
 
 ### 5.3 Прочие исходы
 
@@ -144,7 +144,8 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 | Исход | Условие | Действие сторожа |
 |---|---|---|
 | `done` | `thread.idle` после начала хода, после `last_seq` нет события потока `system/thread/interrupted`, тред не архивирован и не удалён (события `bb.events.on` `thread.archived`/`thread.deleted`, поля DTO `archivedAt`/`deletedAt`), и очередь сообщений исполнителя пуста (`threads.queuedMessages.list`) | статус `done`; ничего не перевыпускать (отчёт координатору доставляет сам BB как дочернему треду). Очередь не пуста — делегирование остаётся `running`: начнётся новый ход |
-| `cancelled` | `thread.idle` вместе с событием потока `system/thread/interrupted`, либо тред архивирован или удалён (`bb.events.on` `thread.archived`/`thread.deleted`, поля DTO), и запись не была переведена сторожем в `stalled`/`quota` | статус `cancelled`, без перевыпуска, комментарий в задачу |
+| `cancelled` | `thread.idle` вместе с событием потока `system/thread/interrupted` с причиной `manual-stop` (остановил пользователь или агент), либо тред архивирован или удалён (`bb.events.on` `thread.archived`/`thread.deleted`, поля DTO), и запись не была переведена сторожем в `stalled`/`quota` | статус `cancelled`, без перевыпуска, комментарий в задачу |
+| `interrupted` | `system/thread/interrupted` с любой причиной, кроме `manual-stop` (перезапуск демона `host-daemon-restarted`, простой провайдера `provider-turn-idle` и т.п.) | не отмена. Первый раз: исполнителю одно сообщение `[orchestrator] ход прерван (<причина>), продолжай задачу`, статус остаётся `running` (`resume_count += 1`), координатору — уведомление. Повторно — как `stalled` (§5.4) |
 | `failed` | `thread.failed` / `turn.failed` без признаков квоты | статус `failed`, сообщение координатору с текстом ошибки |
 | `approval` | `interaction.pending` у исполнителя | статус не меняется; сообщение координатору: какой запрос и команда для решения (`bb thread interactions approve\|grant\|answer\|respond`). Не чаще раза в 10 минут — по `last_approval_notified_at` |
 | `stalled` | §5.1 | статус, стоп, затем §5.4 |
@@ -154,7 +155,8 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 ### 5.4 Перевыпуск
 
 Для `stalled` и `quota`:
-- `autoFallback: true` и в цепочке есть следующий доступный маршрут → в одной транзакции старое делегирование переводится в `reissued`, а новое вставляется в `dispatching` с `reissue_of`; затем §4 шаги 3–7. Так перезапуск сервиса посреди перевыпуска не даёт дубля. Не больше одного автоперевыпуска на маршрут для задачи.
+- Остановка старого исполнителя должна подтвердиться (`threads.stop` без ошибки и тред не `active`); не подтвердилась — перевыпуска нет: статус остаётся, координатору сообщение «не удалось остановить исполнителя», сверка повторит.
+- `autoFallback: true` и в цепочке есть следующий доступный маршрут **после текущего** (лимит — только автоперевыпуски этой задачи, ручные делегирования маршрут не исключают) → в одной транзакции старое делегирование переводится в `reissued`, а новое вставляется в `dispatching` с `reissue_of`; затем §4 шаги 3–7. Так перезапуск сервиса посреди перевыпуска не даёт дубля. Сверка доводит новую запись `dispatching` с `reissue_of` до раздачи (не удаляет её); если раздача невозможна — новая запись `failed`, координатору сообщение о потере перевыпуска. Не больше одного автоперевыпуска на маршрут для задачи.
 - иначе → статус `stalled`/`quota`, перевыпуска нет.
 
 В обоих случаях: сообщение координатору (`threads.send` с `mode: "queue-if-active"`, текст начинается с `[orchestrator]`) и комментарий в задачу: исход, маршрут, новый тред или «перевыпуск за координатором». Сообщение не должно обрывать ход координатора: у Claude оно читается на границе шага, у `acp-devin` — ждёт конца хода ([provider-devin §2](provider-devin.md)).
@@ -177,7 +179,7 @@ bb orchestrator reconcile                                        # принуд�
 
 SQLite плагина, миграции только добавлением.
 
-`delegations`: `id`, `task_key`, `task_id`, `project_id` (bb-проект координатора), `coordinator_thread_id`, `thread_id`, `level`, `route`, `preset`, `provider`, `status` (`dispatching|running|done|failed|stalled|quota|reissued|cancelled`), `reissue_of`, `turn_started_at`, `first_response_at`, `last_seq`, `setup_errors`, `last_approval_notified_at`, `timeout_notified_at`, `created_at`, `updated_at`. Частичный уникальный индекс `delegations(task_key) WHERE status IN ('dispatching','running')`.
+`delegations`: `id`, `task_key`, `task_id`, `project_id` (bb-проект координатора), `coordinator_thread_id`, `thread_id`, `level`, `route`, `preset`, `provider`, `status` (`dispatching|running|done|failed|stalled|quota|reissued|cancelled`), `reissue_of`, `turn_started_at`, `first_response_at`, `last_seq`, `setup_errors`, `last_approval_notified_at`, `timeout_notified_at`, `resume_count`, `created_at`, `updated_at`. Частичный уникальный индекс `delegations(task_key) WHERE status IN ('dispatching','running')`.
 
 `route_holds`: `quota_group` (группа квоты или имя маршрута без группы), `until`, `reason`.
 
