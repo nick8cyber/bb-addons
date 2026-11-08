@@ -161,8 +161,10 @@ Voice input for bb in two modes:
   iPhone mic and virtual devices. You can also pick a device per device under the
   plugin's settings, with a level check. The mic stays warm for 30 s after a
   dictation (`micWarmSeconds`), so the next one starts instantly and includes
-  ~0.5 s before the tap. If iOS Web Audio goes silent after an audio interruption,
-  recording switches to `MediaRecorder` and the file is transcribed when you stop.
+  ~0.5 s before the tap. If iOS Web Audio goes silent, capture switches to
+  `MediaRecorder`. The audio is decoded on the fly and keeps streaming to Gemini Live,
+  so live text keeps coming. If on-the-fly decoding fails, the file is transcribed
+  when you stop.
 
 ```bash
 bb voice-stt status
