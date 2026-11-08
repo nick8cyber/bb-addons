@@ -37,19 +37,34 @@ function RoleSelect() {
 
   // §13.2 п.1: report the selection on mount and on every change. A
   // reopened window restores the project's remembered pick first, then
-  // reports it — the stored row always mirrors what the list shows.
+  // reports it — the stored row always mirrors what the list shows. A
+  // transient read failure must not clobber the stored pick: retry the
+  // read once after a second, and only then fall back to the default so
+  // the shown value is the one that will actually apply.
   useEffect(() => {
     let alive = true;
-    void rpc
-      .call("pendingRole", { projectId })
-      .then((res) => {
-        const next = res?.role ?? DEFAULT_ROLE;
-        if (alive) setRole(next);
-        report(next);
-      })
-      .catch(() => report(DEFAULT_ROLE));
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const apply = (next: RoleId) => {
+      if (alive) setRole(next);
+      report(next);
+    };
+    const load = () =>
+      rpc
+        .call("pendingRole", { projectId })
+        .then((res) => apply(res?.role ?? DEFAULT_ROLE))
+        .catch(() => {
+          retryTimer = setTimeout(() => {
+            if (!alive) return;
+            void rpc
+              .call("pendingRole", { projectId })
+              .then((res) => apply(res?.role ?? DEFAULT_ROLE))
+              .catch(() => apply(DEFAULT_ROLE));
+          }, 1000);
+        });
+    void load();
     return () => {
       alive = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
     };
   }, [projectId]);
 

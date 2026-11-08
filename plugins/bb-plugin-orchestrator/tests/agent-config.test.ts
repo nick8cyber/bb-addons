@@ -13,6 +13,9 @@ import {
   SKILL_SETUP,
   type ExecutorProbes,
 } from "../src/agent-config.js";
+import { ROLES } from "../src/roles.js";
+
+const ORCH_TEXT = ROLES.orchestrator.instructions;
 
 const noProbes: ExecutorProbes = {
   delegationByThreadId: () => undefined,
@@ -34,7 +37,11 @@ test("a root app thread is a coordinator: gets tools and the rule", () => {
     config.tools,
     ["orchestrator_delegate", "orchestrator_status", "orchestrator_cancel"],
   );
-  assert.equal(config.instructions, "RULE");
+  // §3 rev 16: a fallback-decided coordinator gets the orchestrator
+  // role's text too — instruction + rule.
+  assert.equal(config.instructions, `${ORCH_TEXT}
+
+RULE`);
 });
 
 test("injectInstructions=false silences texts but keeps the tools", () => {
@@ -208,16 +215,28 @@ test("a broken role read falls back to the static-facts result", () => {
   );
   const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
   assert.equal(fb.tools.length, 3);
-  assert.equal(fb.instructions, "RULE");
+  assert.equal(fb.instructions, `${ORCH_TEXT}
+
+RULE`);
 });
 
-test("configure without a thread_roles row uses the fallback criterion", () => {
-  // No role row anywhere: the answer comes from executor markers only.
+test("configure without a thread_roles row: fallback gives orchestrator texts", () => {
+  // §3 rev 16: a coordinator decided by the fallback criterion (no
+  // `thread_roles` row) receives the same as the orchestrator role —
+  // its instruction plus the rule — and nothing is recorded.
   const config = buildAgentConfiguration(ctx({}), {
     ...deps,
     probes: { ...noProbes, roleByThreadId: () => undefined },
   });
   assert.equal(config.tools.length, 3);
-  // A fallback-decided coordinator has no role row → the rule alone.
-  assert.equal(config.instructions, "RULE");
+  assert.equal(config.instructions, `${ORCH_TEXT}
+
+RULE`);
+  assert.ok(config.instructions!.length <= 4096);
+  const silent = buildAgentConfiguration(ctx({}), {
+    injectInstructions: false,
+    instructionsText: "RULE",
+    probes: { ...noProbes, roleByThreadId: () => undefined },
+  });
+  assert.equal(silent.instructions, undefined);
 });

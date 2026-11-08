@@ -159,14 +159,14 @@ export function buildAgentConfiguration(
       : [SKILL_SETUP],
   };
   if (deps.injectInstructions) {
-    // §3 budget: role instruction (≤ 2500) + routing rule (≤ 1500) +
-    // separator stays under the SDK's 4096. A fallback-decided
-    // coordinator has no role row, so it gets the rule alone.
-    config.instructions = role
-      ? `${role.instructions}
+    // §3 rev 16: a fallback-decided coordinator (no `thread_roles` row)
+    // gets the same text as the `orchestrator` role — its instruction
+    // plus the routing rule; the row itself is still not written.
+    // Budget: instruction ≤ 2500 + rule ≤ 1500 + separator ≤ 4096.
+    const roleText = (role ?? ROLES.orchestrator).instructions;
+    config.instructions = `${roleText}
 
-${deps.instructionsText}`
-      : deps.instructionsText;
+${deps.instructionsText}`;
   }
   return config;
 }
@@ -193,6 +193,12 @@ export function fallbackAgentConfiguration(
       ? [SKILL_COORDINATOR, SKILL_SETUP]
       : [SKILL_SETUP],
   };
-  if (injectInstructions) config.instructions = instructionsText;
+  // §3 rev 16: the fallback criterion yields the orchestrator role's
+  // issuance — instruction + rule — without recording anything.
+  if (injectInstructions) {
+    config.instructions = `${ROLES.orchestrator.instructions}
+
+${instructionsText}`;
+  }
   return config;
 }
