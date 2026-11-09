@@ -11,6 +11,7 @@
 3. Запись в `~/.config/devin/config.json` (через exec и write/edit) по-прежнему блокируется.
 4. Защита других конфигов (~/.claude/CLAUDE.md, settings.json, хуки) работает, чтение разрешено.
 5. `install.py`: повторная установка поверх старой убирает старую регистрацию PostToolUse.
+6. DEVIN_BB_LOG перенаправляет журнал во временный файл; реальный ~/.local/state/devin-bb-hooks.log не изменяется.
 """
 import importlib.util
 import json
@@ -25,6 +26,13 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(HERE, "bb_subagents.py")
 INSTALL = os.path.join(HERE, "install.py")
+
+REAL_LOG = os.path.expanduser("~/.local/state/devin-bb-hooks.log")
+real_log_before = open(REAL_LOG, "rb").read() if os.path.exists(REAL_LOG) else None
+real_log_mtime_before = os.path.getmtime(REAL_LOG) if os.path.exists(REAL_LOG) else None
+
+TEMP_DIR = tempfile.TemporaryDirectory()
+TEST_LOG = os.path.join(TEMP_DIR.name, "devin-hooks-test.log")
 
 fails = 0
 
@@ -46,6 +54,7 @@ def run_hook(event, tool_name, tool_input, env_extra=None):
         "tool_input": tool_input,
     })
     env = os.environ.copy()
+    env["DEVIN_BB_LOG"] = TEST_LOG
     if env_extra:
         env.update(env_extra)
     p = subprocess.run([sys.executable, "-I", HOOK], input=payload, capture_output=True, text=True, env=env)
@@ -218,6 +227,19 @@ report(post_has_instructions, "install.py keeps bb_instructions in PostToolUse")
 # Проверяем идемпотентность повторного запуска поверх new_hooks
 repeated_hooks = install_mod.merged_hooks(new_hooks)
 report(repeated_hooks == new_hooks, "install.py repeated run is idempotent")
+
+
+print("\n=== 6. Проверка: реальный лог не изменился, лог теста записан во временный файл ===")
+real_log_after = open(REAL_LOG, "rb").read() if os.path.exists(REAL_LOG) else None
+real_log_mtime_after = os.path.getmtime(REAL_LOG) if os.path.exists(REAL_LOG) else None
+
+report(real_log_after == real_log_before and real_log_mtime_after == real_log_mtime_before,
+       "real devin-bb-hooks.log was not modified")
+report(os.path.exists(TEST_LOG) and os.path.getsize(TEST_LOG) > 0,
+       "test log received blocked events",
+       f"size={os.path.getsize(TEST_LOG) if os.path.exists(TEST_LOG) else 0}")
+
+TEMP_DIR.cleanup()
 
 print(f"\nИтог: fails={fails}")
 sys.exit(1 if fails else 0)
