@@ -1452,3 +1452,147 @@ test("idle with an unreadable journal stays running — no done/cancelled", asyn
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   assert.equal(h.store.get(row.id)!.status, "done");
 });
+
+// ── PLUG-150 / спека rev 19: исход `unavailable` ───────────────────────
+
+test("unavailable: thread.start failed before the first turn → reissue + route hold, no stop", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "Command thread.start failed / Invalid params: model not found: acme-9",
+  );
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.deepEqual(h.stops, []); // executor never ran — no threads.stop
+  const held = h.store.heldGroups(h.getNow());
+  assert.ok(held.has("simple"), "the route NAME is held, not the quota group");
+  assert.ok(!held.has("zen"));
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple-alt");
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.reissue_of, row.id);
+  assert.match(h.store.get(row.id)!.setup_errors, /маршрут недоступен/);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /маршрут недоступен.*перевыпущено на simple-alt/,
+  );
+});
+
+test("unavailable: 'model not found' in the journal error text → same path", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "provider/error", T0, { message: "model not found: gpt-x" }),
+  ]);
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), null);
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.deepEqual(h.stops, []);
+  assert.ok(h.store.heldGroups(h.getNow()).has("simple"));
+  assert.equal(h.store.listActive()[0]!.route, "simple-alt");
+});
+
+test("unavailable without autoFallback → stalled, coordinator reissues by hand", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "Command thread.start failed / Invalid params: model not found: x",
+  );
+
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "stalled");
+  assert.deepEqual(h.stops, []);
+  assert.ok(h.store.heldGroups(h.getNow()).has("strict"));
+  assert.equal(h.store.listActive().length, 0);
+  assert.ok(
+    !h.calls.some((c) => c.join(" ").startsWith("tasks dispatch")),
+    "no dispatch expected",
+  );
+  assert.match(
+    JSON.stringify(h.sends[0]!.input),
+    /маршрут недоступен.*перевыпуск за координатором/,
+  );
+});
+
+test("ordinary error after the first turn → failed as before (no hold, no reissue)", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+
+  assert.equal(h.store.get(row.id)!.status, "failed");
+  assert.equal(h.store.heldGroups(h.getNow()).size, 0);
+  assert.equal(h.store.listActive().length, 0);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /завершился с ошибкой.*provider blew up/,
+  );
+});
+
+test("start-failure text after a begun turn is not unavailable → failed", async () => {
+  // the thread.start-failed marker only counts while no turn ever started
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "Command thread.start failed / connection reset",
+  );
+  assert.equal(h.store.get(row.id)!.status, "failed");
+  assert.equal(h.store.heldGroups(h.getNow()).size, 0);
+});
+
+test("unavailablePatterns from the policy extend the built-in list", async () => {
+  const policy = JSON.stringify({
+    version: 1,
+    levels: {
+      simple: { chain: ["simple", "simple-alt"], autoFallback: true },
+    },
+    routes: {
+      simple: {
+        preset: "simple",
+        provider: "acp-opencode",
+        unavailablePatterns: ["model retired upstream"],
+      },
+      "simple-alt": { preset: "simple-alt", provider: "agy" },
+    },
+  });
+  const h = makeHarness({ policyText: policy });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "model retired upstream");
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.equal(h.store.listActive()[0]!.route, "simple-alt");
+});
+
+test("quota is checked before unavailable: both signals → quota path", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "rate limit while loading model not found",
+  );
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.deepEqual(h.stops, ["thr_e1"]); // quota does stop — unavailable does not
+  const held = h.store.heldGroups(h.getNow());
+  assert.ok(held.has("zen")); // the quota GROUP, not the route name
+  assert.ok(!held.has("simple"));
+});

@@ -120,3 +120,37 @@ test("rule 5: quotaPatterns is an array of ≤20 non-empty strings", () => {
   load = parsePolicy(JSON.stringify(bad), presets);
   assert.ok(load.errors.some((e) => e.path === "routes.simple.quotaPatterns"));
 });
+
+test("rule 6: unavailablePatterns is an array of ≤20 non-empty strings", () => {
+  const ok = JSON.parse(VALID);
+  ok.routes.simple.unavailablePatterns = ["model retired"];
+  let load = parsePolicy(JSON.stringify(ok), presets);
+  assert.equal(load.errors.length, 0);
+  assert.deepEqual(load.policy?.routes.simple?.unavailablePatterns, [
+    "model retired",
+  ]);
+
+  const bad = JSON.parse(VALID);
+  bad.routes.simple.unavailablePatterns = "nope";
+  load = parsePolicy(JSON.stringify(bad), presets);
+  assert.ok(
+    load.errors.some((e) => e.path === "routes.simple.unavailablePatterns"),
+  );
+
+  bad.routes.simple.unavailablePatterns = ["ok", ""];
+  load = parsePolicy(JSON.stringify(bad), presets);
+  assert.ok(
+    load.errors.some(
+      (e) => e.path === "routes.simple.unavailablePatterns[1]",
+    ),
+  );
+
+  bad.routes.simple.unavailablePatterns = Array.from(
+    { length: 21 },
+    (_, i) => `p${i}`,
+  );
+  load = parsePolicy(JSON.stringify(bad), presets);
+  assert.ok(
+    load.errors.some((e) => e.path === "routes.simple.unavailablePatterns"),
+  );
+});

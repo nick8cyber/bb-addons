@@ -14,6 +14,7 @@ export interface PolicyRoute {
   provider: string;
   quotaGroup?: string;
   quotaPatterns?: string[];
+  unavailablePatterns?: string[];
 }
 
 export interface PolicyLevel {
@@ -126,24 +127,26 @@ export function parsePolicy(
       if (value.quotaGroup !== undefined && !isNonEmptyString(value.quotaGroup)) {
         err(`${path}.quotaGroup`, "must be a non-empty string");
       }
-      // Rule 5.
-      let quotaPatterns: string[] | undefined;
-      if (value.quotaPatterns !== undefined) {
-        const qp = value.quotaPatterns;
-        if (!Array.isArray(qp)) {
-          err(`${path}.quotaPatterns`, "must be an array of non-empty strings");
-        } else {
-          if (qp.length > 20) {
-            err(`${path}.quotaPatterns`, "at most 20 patterns");
-          }
-          const bad = qp.findIndex((p) => !isNonEmptyString(p));
-          if (bad >= 0) {
-            err(`${path}.quotaPatterns[${bad}]`, "must be a non-empty string");
-          } else {
-            quotaPatterns = qp.map((p) => (p as string).trim());
-          }
+      // Rules 5 + 6: quota and removed-model pattern lists share the shape.
+      const patternsOf = (
+        key: "quotaPatterns" | "unavailablePatterns",
+      ): string[] | undefined => {
+        const raw = value[key];
+        if (raw === undefined) return undefined;
+        if (!Array.isArray(raw)) {
+          err(`${path}.${key}`, "must be an array of non-empty strings");
+          return undefined;
         }
-      }
+        if (raw.length > 20) err(`${path}.${key}`, "at most 20 patterns");
+        const bad = raw.findIndex((p) => !isNonEmptyString(p));
+        if (bad >= 0) {
+          err(`${path}.${key}[${bad}]`, "must be a non-empty string");
+          return undefined;
+        }
+        return raw.map((p) => (p as string).trim());
+      };
+      const quotaPatterns = patternsOf("quotaPatterns");
+      const unavailablePatterns = patternsOf("unavailablePatterns");
       if (isNonEmptyString(value.preset) && isNonEmptyString(value.provider)) {
         routes[name] = {
           preset: value.preset,
@@ -152,6 +155,7 @@ export function parsePolicy(
             ? { quotaGroup: value.quotaGroup }
             : {}),
           ...(quotaPatterns ? { quotaPatterns } : {}),
+          ...(unavailablePatterns ? { unavailablePatterns } : {}),
         };
       }
     }
@@ -324,7 +328,13 @@ export function pickRoute(
   const usable = (name: string) => {
     const route = policy.routes[name];
     if (!route) return false;
-    return !unavailable.has(name) && !held.has(quotaGroupOf(route, name));
+    // Holds sit on quota groups (§5.2) and on route names (§5.3
+    // `unavailable`) — a route is unusable when either is on hold.
+    return (
+      !unavailable.has(name) &&
+      !held.has(name) &&
+      !held.has(quotaGroupOf(route, name))
+    );
   };
   if (opts.requested !== undefined) {
     const name = opts.requested;

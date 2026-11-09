@@ -33,6 +33,16 @@ export const BUILTIN_QUOTA_PATTERNS = [
   "insufficient credits",
 ] as const;
 
+/** §5.3 removed-model text patterns; `routes.*.unavailablePatterns` extends. */
+export const BUILTIN_UNAVAILABLE_PATTERNS = [
+  "model not found",
+  "model_not_found",
+  "unknown model",
+] as const;
+
+/** §5.3: a start failure before the first turn reads as `unavailable`. */
+const THREAD_START_FAILED = "thread.start failed";
+
 /** §5.2 typed signal: `errorInfo.category` values that mean quota. */
 const QUOTA_CATEGORIES = new Set(["rate-limit", "billing"]);
 const QUOTA_HOLD_MS = 15 * 60 * 1000;
@@ -212,6 +222,23 @@ export function createWatchdog(deps: WatchdogDeps) {
     return patterns.some((p) => hay.includes(p.toLowerCase()));
   };
 
+  /**
+   * §5.3 `unavailable`: a `thread.start failed` error while no turn ever
+   * began (`turn_started_at` still empty), or the error text matching a
+   * removed-model pattern. Checked after quota, before `failed`.
+   */
+  const isUnavailable = (
+    row: DelegationRow,
+    text: string,
+    patterns: readonly string[],
+  ): boolean => {
+    const hay = text.toLowerCase();
+    if (row.turn_started_at == null && hay.includes(THREAD_START_FAILED)) {
+      return true;
+    }
+    return patterns.some((p) => hay.includes(p.toLowerCase()));
+  };
+
   /** Route facts from the live policy, falling back to the stored row. */
   const routeInfo = async (row: DelegationRow) => {
     const load = await deps.loadPolicy();
@@ -223,6 +250,10 @@ export function createWatchdog(deps: WatchdogDeps) {
       route,
       quotaGroup: route ? quotaGroupOf(route, row.route) : row.route,
       patterns: [...BUILTIN_QUOTA_PATTERNS, ...(route?.quotaPatterns ?? [])],
+      unavailablePatterns: [
+        ...BUILTIN_UNAVAILABLE_PATTERNS,
+        ...(route?.unavailablePatterns ?? []),
+      ],
     };
   };
 
@@ -328,16 +359,20 @@ export function createWatchdog(deps: WatchdogDeps) {
   /** §5.4: report the outcome, and auto-reissue when the level allows. */
   const outcomeAndMaybeReissue = async (
     row: DelegationRow,
-    outcome: "stalled" | "quota",
+    outcome: "stalled" | "quota" | "unavailable",
     detail: string,
   ) => {
     const info = await routeInfo(row);
     const outcomeText =
       outcome === "stalled"
         ? "исполнитель завис"
-        : detail
-          ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
-          : "квота исполнителя исчерпана";
+        : outcome === "unavailable"
+          ? detail
+            ? `маршрут недоступен (${detail.slice(0, 120)})`
+            : "маршрут недоступен"
+          : detail
+            ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
+            : "квота исполнителя исчерпана";
     let nextName: string | undefined;
     let nextRoute: PolicyRoute | undefined;
     if (info.level?.autoFallback && info.policy) {
@@ -352,7 +387,9 @@ export function createWatchdog(deps: WatchdogDeps) {
       for (const name of candidates) {
         const r = info.policy.routes[name];
         if (!r || used.has(name) || unavailable.has(name)) continue;
-        if (held.has(quotaGroupOf(r, name))) continue;
+        // §5.2 holds sit on quota groups, §5.3 `unavailable` on route
+        // names — a candidate is out when either is held.
+        if (held.has(name) || held.has(quotaGroupOf(r, name))) continue;
         nextName = name;
         nextRoute = r;
         break;
@@ -508,6 +545,23 @@ export function createWatchdog(deps: WatchdogDeps) {
     const info = await routeInfo(fresh);
     store.hold(info.quotaGroup, now() + QUOTA_HOLD_MS, detail.slice(0, 200));
     await afterOutcomeStatus(fresh, "quota", detail);
+  };
+
+  /**
+   * §5.3 `unavailable` → `stalled` with the "route unavailable" reason.
+   * The stop counts as confirmed — the executor never started — so §5.4
+   * runs without `threads.stop`; the ROUTE (not the quota group) goes on
+   * hold for 15 minutes.
+   */
+  const toUnavailable = async (row: DelegationRow, detail: string) => {
+    const fresh = store.get(row.id);
+    if (!fresh || !isActive(fresh.status)) return;
+    store.setStatus(fresh.id, "stalled"); // §5.3: unavailable lands as stalled
+    clearMarks(fresh.id);
+    const reason = `маршрут недоступен: ${detail.slice(0, 180)}`;
+    store.hold(fresh.route, now() + QUOTA_HOLD_MS, reason);
+    store.addSetupError(fresh.id, "outcome-detail", reason);
+    await outcomeAndMaybeReissue(fresh, "unavailable", detail);
   };
 
   const toFailed = async (row: DelegationRow, errorText: string) => {
@@ -801,6 +855,8 @@ export function createWatchdog(deps: WatchdogDeps) {
     const info = await routeInfo(fresh);
     if (matchesQuota(text, info.patterns)) {
       await toQuota(fresh, `thread.failed: ${text.slice(0, 200)}`);
+    } else if (isUnavailable(fresh, text, info.unavailablePatterns)) {
+      await toUnavailable(fresh, `thread.failed: ${text.slice(0, 200)}`);
     } else {
       await toFailed(fresh, text);
     }
@@ -828,6 +884,8 @@ export function createWatchdog(deps: WatchdogDeps) {
     const info = await routeInfo(fresh);
     if (matchesQuota(text, info.patterns)) {
       await toQuota(fresh, `turn.failed: ${text.slice(0, 200)}`);
+    } else if (isUnavailable(fresh, text, info.unavailablePatterns)) {
+      await toUnavailable(fresh, `turn.failed: ${text.slice(0, 200)}`);
     } else {
       await toFailed(fresh, text);
     }
@@ -1127,6 +1185,8 @@ export function createWatchdog(deps: WatchdogDeps) {
         const info = await routeInfo(fresh);
         if (matchesQuota(text, info.patterns)) {
           await toQuota(fresh, `thread.error: ${text.slice(0, 200)}`);
+        } else if (isUnavailable(fresh, text, info.unavailablePatterns)) {
+          await toUnavailable(fresh, `thread.error: ${text.slice(0, 200)}`);
         } else {
           await toFailed(fresh, text);
         }

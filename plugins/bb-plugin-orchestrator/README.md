@@ -21,7 +21,10 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
 - **Watchdog** (background service, §5): first-response window
   (`firstResponseSeconds`) → `stalled` + stop; quota detection
   (`errorInfo.category`, then text patterns) → `quota`, 15-minute
-  `route_holds` on the quota group; `done`/`cancelled`/`failed`/`approval`/
+  `route_holds` on the quota group; a removed model (`thread.start
+  failed` before the first turn, `model not found` patterns) →
+  `unavailable`: `stalled`, 15-minute hold on the route itself, no stop —
+  the executor never ran; `done`/`cancelled`/`failed`/`approval`/
   `timeout` outcomes; auto-reissue down the level chain when
   `autoFallback` allows (one transaction, `reissue_of`, reuses the §4
   dispatch steps); coordinator messages via `threads.send`
