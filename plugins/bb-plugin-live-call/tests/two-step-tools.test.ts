@@ -811,8 +811,8 @@ describe("3. E2E с тестовым коннектором stdio и CallSession
 
     expect(toolResponse).toBeDefined();
     expect(toolResponse.ok).toBe(true);
-    // Только ok и data
-    expect(Object.keys(toolResponse).sort()).toEqual(["data", "ok"]);
+    // Только ok, data и признак обрезки (§15.9: truncated протаскивается к мосту)
+    expect(Object.keys(toolResponse).sort()).toEqual(["data", "ok", "truncated"]);
     expect(toolResponse.raw).toBeUndefined();
     expect(toolResponse.rawText).toBeUndefined();
     expect(toolResponse.data.result.length).toBeLessThanOrEqual(500);

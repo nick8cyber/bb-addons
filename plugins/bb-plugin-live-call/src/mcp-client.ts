@@ -25,6 +25,8 @@ export interface McpCallResult {
   data?: { result: string };
   raw?: unknown;
   maskedFullText?: string;
+  /** Полный маскированный текст был длиннее maxResultChars и обрезан (§15.9: мост мозгового центра). */
+  truncated?: boolean;
   error?: {
     code: "connector_error" | "timeout" | "invalid_argument" | "connector_unavailable";
     message: string;
@@ -1016,8 +1018,9 @@ export class McpClient {
 
       // Сжатие до maxResultChars (по умолчанию 2000 символов, §15.2, §15.4 п. 5)
       const maxChars = this.config.maxResultChars ?? CONNECTOR_RESULT_MAX_CHARS_DEFAULT;
+      const truncated = maskedFull.length > maxChars;
       let trimmed = maskedFull;
-      if (trimmed.length > maxChars) {
+      if (truncated) {
         trimmed = trimmed.slice(0, maxChars - 1) + "…";
       }
 
@@ -1030,6 +1033,7 @@ export class McpClient {
           },
           raw: res,
           maskedFullText: maskedFull,
+          truncated,
         };
       }
 
@@ -1038,6 +1042,7 @@ export class McpClient {
         data: { result: trimmed },
         raw: res,
         maskedFullText: maskedFull,
+        truncated,
       };
     } catch (e) {
       const rawMsg = String((e as Error)?.message ?? e);

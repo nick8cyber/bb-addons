@@ -44,6 +44,8 @@ export interface ToolContext {
   deliveryIntervalMs?: number;
   /** Мозговой центр звонка по треду (§12.11). */
   brain?: BrainCenter;
+  /** Мозговой центр звонка по проекту (§15.9): только вопросы, записи у голоса. */
+  projectBrain?: { ask(question: string): Promise<ToolResult> };
   isTargetThreadActive?: () => Promise<boolean>;
   /** Подписка на тред для EventBridge (§16.4). */
   watchThread?: (threadId: string) => void;
@@ -80,7 +82,10 @@ export interface ToolDef {
   confirmCard?: (args: Record<string, unknown>) => string;
   /** Ручка коннектора (MCP-сервера) */
   isConnector?: boolean;
-  execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolExecutionResult>;
+  /** Исходная JSON-схема аргументов MCP-инструмента (не lossy Gemini): мост мозга валидирует по ней (§15.9). */
+  mcpInputSchema?: Record<string, unknown>;
+  /** opts.timeoutMs — верхняя граница ожидания вызова (мост мозга, спека §15.9: не больше оставшегося бюджета). */
+  execute: (args: Record<string, unknown>, ctx: ToolContext, opts?: { timeoutMs?: number }) => Promise<ToolExecutionResult>;
   /** Двухшаговая ручка коннектора (§14.10): превью -> подтверждение. */
   twoStep?: boolean;
 }
@@ -1858,6 +1863,43 @@ export const brainTaskTool: ToolDef = {
   },
 };
 
+/**
+ * brain_ask звонка по проекту (§15.9): описание отдельное от тредового варианта —
+ * мозг видит контекст проекта и данные коннекторов этого звонка, а не весь тред
+ * и код; brain_task в проектном звонке не объявляется.
+ */
+export const projectBrainAskTool: ToolDef = {
+  name: "brain_ask",
+  cls: "R",
+  word: "",
+  description:
+    "Задать аналитический вопрос мозговому центру звонка по проекту (Devin SWE-2 Flash): он видит контекст проекта и читает данные коннекторов этого звонка. Для расчётов, сравнений, вопросов за период и диагностики интеграций. Простое чтение конкретного объекта — напрямую ручкой.",
+  parameters: {
+    type: "object",
+    properties: {
+      question: { type: "string", description: "Исходный вопрос владельца с периодом и источником, без подмены" },
+    },
+    required: ["question"],
+  },
+  async execute(args, ctx) {
+    const q = String(args.question ?? "").trim();
+    if (!q) return { ok: false, error: { code: "invalid_argument", message: "укажи вопрос для мозгового центра" } };
+    ctx.ledger.add("tool", `brain_ask: ${q}`);
+    ctx.reportAction("brain_ask", "R", "running", `Спрашиваю у мозгового центра: «${q.slice(0, 80)}»`);
+    if (!ctx.projectBrain) {
+      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не доступен");
+      return { ok: false, error: { code: "unavailable", message: "мозговой центр недоступен" } };
+    }
+    const res = await ctx.projectBrain.ask(q);
+    if (res.ok) {
+      ctx.reportAction("brain_ask", "R", "done", `Мозговой центр ответил на «${q.slice(0, 80)}»`);
+    } else {
+      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не смог ответить");
+    }
+    return res;
+  },
+};
+
 export const THREAD_SPECIFIC_TOOLS: ToolDef[] = [
   threadReadMessagesTool,
   threadSendTool,
@@ -1871,10 +1913,10 @@ export function getThreadTools(): ToolDef[] {
   return [...THREAD_SPECIFIC_TOOLS, ...common];
 }
 
-/** Ручки звонка по проекту (§15.4 п. 3). */
+/** Ручки звонка по проекту (§15.4 п. 3, §15.9): коннекторы + brain_ask + общие; brain_task нет. */
 export function getProjectTools(connectorTools: ToolDef[] = []): ToolDef[] {
   const common = TOOLS.filter((t) => ["end_call", "remember", "recall", "list_threads", "read_thread"].includes(t.name));
-  return [...connectorTools, ...common];
+  return [...connectorTools, projectBrainAskTool, ...common];
 }
 
 export function toolByName(name: string, targetThreadId?: string, extraTools?: ToolDef[], isProjectCall?: boolean): ToolDef | undefined {
