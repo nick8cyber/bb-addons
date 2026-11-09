@@ -38,7 +38,10 @@ function sanitize(text: string): string {
 function levelLine(name: string, description?: string): string {
   const cleanName = sanitize(name) || "level";
   const desc = description ? sanitize(description) : "";
-  return `- ${cleanName}${desc ? ` — ${desc}` : ""}`;
+  // orchestrator §2 rev 20: the pipeline's own level — coordinators
+  // never delegate to it, `release` launches it.
+  const tag = cleanName === "release-audit" ? " (только конвейер release, не раздавать)" : "";
+  return `- ${cleanName}${desc ? ` — ${desc}` : ""}${tag}`;
 }
 
 function limitsLine(policy: Policy): string | null {

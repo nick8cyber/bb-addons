@@ -19,9 +19,23 @@ import type {
 /** §3 budget: one role instruction ≤ 2500 chars (role + rule ≤ 4096). */
 export const ROLE_INSTRUCTIONS_MAX = 2500;
 
-export type RoleId = "orchestrator" | "executor" | "auditor";
+export type RoleId =
+  | "orchestrator"
+  | "executor"
+  | "auditor"
+  | "release-auditor";
 
 export const ROLE_IDS: readonly RoleId[] = [
+  "orchestrator",
+  "executor",
+  "auditor",
+  "release-auditor",
+];
+
+/** §13.1 rev 20: `release-auditor` is never offered in the new-chat
+ * window — only a `release` pipeline dispatch assigns it (source
+ * `delegate`). The RPC enum and the composer list use this subset. */
+export const PICKABLE_ROLE_IDS: readonly RoleId[] = [
   "orchestrator",
   "executor",
   "auditor",
@@ -54,6 +68,18 @@ const EXECUTOR_INSTRUCTIONS = `Ты — исполнитель. Твоя рол�
 - Делай строго по спеке задачи; расхождение со спекой — вопрос координатору, а не самодеятельность.
 - Правила работы с git — раздел «Работа с git» в инструкциях задачи.
 - Отчёт — по контракту из описания задачи.`;
+
+const RELEASE_AUDITOR_INSTRUCTIONS = `Ты — проверяющий агент выкладки (release-auditor). Твоя роль — только читать и проверять выпуск перед публикацией, ничего не меняя.
+
+- Не правь файлы, не коммить, не пушь, не запускай раздачу и субагентов. Все проверки — только чтением.
+- Вход аудита — файл, указанный в задаче: дифф выкладки, сообщения и метаданные коммитов, список связанных документов, находки машинного скана.
+- Проверь два блока:
+  1. Документация актуальна: каждое изменение поведения в коде отражено в связанных спеках, ADR и документации; нет противоречий «код ↔ спека»; ревизии и даты обновлены. Если указан явный отказ от правки документов (флаг --no-docs с причиной, трейлер Docs-not-needed) — оцени, обоснована ли причина.
+  2. Утечки всех категорий: секреты (токены, ключи, .env, VPN-конфиги, ссылки vless://), личность автора (личная почта, чужие подписи и трейлеры ботов), привязка к машине (абсолютные пути, имена хостов, внутренние IP), идентификаторы bb (thr_/proj_/env_/*.getbb.app в коде и документах; трейлер BB-Thread: в сообщении коммита разрешён), смысловые (имена людей, описание личной инфраструктуры, приватные переписки).
+- Находки не содержат значений секретов: значение маскируй (например ghp_abc123 → ghp_…***), иначе находка сама становится утечкой.
+- Итог — ОДНО сообщение строгим JSON без пояснений вокруг:
+  {"verdict":"APPROVE"|"REJECT","findings":[{"category":"docs|secrets|identity|machine|bbIds|semantic","file":"<path>","line":<n>,"problem":"<что>","fix":"<как исправить>"}]}
+  APPROVE — только когда находок нет. Любой другой формат будет засчитан как REJECT.`;
 
 const AUDITOR_INSTRUCTIONS = `Ты — аудитор. Твоя роль — только читать и проверять, ничего не меняя.
 
@@ -89,17 +115,30 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
     tools: [],
     skills: [],
   },
+  "release-auditor": {
+    id: "release-auditor",
+    delegates: false,
+    instructions: RELEASE_AUDITOR_INSTRUCTIONS,
+    tools: [],
+    skills: [],
+  },
 };
 
 export const isRoleId = (value: unknown): value is RoleId =>
   typeof value === "string" && (ROLE_IDS as readonly string[]).includes(value);
 
 /**
- * §4 step 4 + §13.2: a delegated thread's role from the dispatch level —
- * `review` maps to `auditor`, every other level to `executor`.
+ * §4 step 4 + §13.2 + §13.1 rev 20: a delegated thread's role from the
+ * dispatch level — `review` maps to `auditor`, `release-audit` (the
+ * release pipeline's checking agent) to `release-auditor`, every other
+ * level to `executor`.
  */
 export const roleForLevel = (level: string): RoleId =>
-  level === "review" ? "auditor" : "executor";
+  level === "review"
+    ? "auditor"
+    : level === "release-audit"
+      ? "release-auditor"
+      : "executor";
 
 /** Dispatch titles carry the task key from birth: `<KEY> · <title>`. */
 const TASK_KEY_TITLE_RE = /^([A-Z][A-Z0-9]+-\d+) · /;

@@ -1,0 +1,127 @@
+#!/usr/bin/env node
+/**
+ * Shared git pre-push hook for the bb orchestrator release pipeline
+ * (spec orchestrator-release §5). Installed once per development user via
+ * global `core.hooksPath` — ordinary `git push` is refused unless the
+ * plugin's `release` command left a one-time token for the pushed commit
+ * in `<hooks dir>/push-token.json`. After its own checks the hook chains
+ * to the repository's local `$GIT_DIR/hooks/pre-push` when it exists.
+ *
+ * Repo skips: `exclusions` (one absolute repo path or dir-prefix per
+ * line, `#` comments) next to this script — for service repositories
+ * with their own autopush. A repo with a *local* `core.hooksPath` never
+ * reaches this script at all (local config wins over the global one).
+ */
+import { existsSync, readFileSync, rmSync, chmodSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HOOK_NAME = "pre-push";
+const dir = dirname(fileURLToPath(import.meta.url));
+const tokenFile = join(dir, "push-token.json");
+const exclusionsFile = join(dir, "exclusions");
+const ZERO = "0000000000000000000000000000000000000000";
+
+const stdin = readFileSync(0, "utf8");
+
+function git(args) {
+  return spawnSync("git", args, { encoding: "utf8" });
+}
+
+/** The repository's own hook (the global core.hooksPath shadows it):
+ * `$GIT_DIR/hooks/<name>` — the env var first, then the common dir for
+ * worktrees. */
+function localHookPath() {
+  const candidates = [];
+  if (process.env.GIT_DIR) {
+    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
+  }
+  const common = git(["rev-parse", "--git-common-dir"]);
+  if (common.status === 0) {
+    candidates.push(join(common.stdout.trim(), "hooks", HOOK_NAME));
+  }
+  const self = fileURLToPath(import.meta.url);
+  for (const c of candidates) {
+    if (c !== self && existsSync(c)) return c;
+  }
+  return null;
+}
+
+function chainLocal() {
+  const local = localHookPath();
+  if (!local) return 0;
+  const res = spawnSync(local, process.argv.slice(2), {
+    input: stdin,
+    encoding: "utf8",
+    stdio: ["pipe", "inherit", "inherit"],
+  });
+  return res.status ?? 1;
+}
+
+function refuse(msg) {
+  process.stderr.write(`[orchestrator] ${msg}\n`);
+  process.exit(1);
+}
+
+// ── Exclusions: service repositories with their own push flow. ────────
+const repoTop = git(["rev-parse", "--show-toplevel"]);
+if (repoTop.status === 0) {
+  const repo = repoTop.stdout.trim();
+  let excluded = false;
+  try {
+    for (const line of readFileSync(exclusionsFile, "utf8").split("\n")) {
+      const e = line.trim();
+      if (!e || e.startsWith("#")) continue;
+      if (e.endsWith("/")) {
+        if (repo.startsWith(e)) { excluded = true; break; }
+      } else if (repo === e) { excluded = true; break; }
+    }
+  } catch { /* no exclusions file — nothing excluded */ }
+  if (excluded) process.exit(chainLocal());
+}
+
+// ── Ref lines from stdin: <local ref> <local sha> <remote ref> <remote sha>.
+const refs = stdin
+  .split("\n")
+  .map((l) => l.trim())
+  .filter(Boolean)
+  .map((l) => l.split(/\s+/));
+const pushedShas = refs
+  .map((r) => r[1])
+  .filter((sha) => sha && sha !== ZERO);
+
+// Branch/tag deletions cannot publish code — let them through.
+if (pushedShas.length === 0) process.exit(chainLocal());
+
+let token;
+try {
+  token = JSON.parse(readFileSync(tokenFile, "utf8"));
+} catch {
+  refuse(
+    "push отклонён: выкладка только через `bb orchestrator release` " +
+      "(нет одноразового маркера)",
+  );
+}
+if (
+  !token ||
+  typeof token.token !== "string" ||
+  typeof token.sha !== "string" ||
+  typeof token.expiresAt !== "number"
+) {
+  refuse("push отклонён: маркер release повреждён");
+}
+if (token.expiresAt < Date.now()) {
+  try { rmSync(tokenFile); } catch { /* stale */ }
+  refuse("push отклонён: маркер release истёк — повторите `bb orchestrator release`");
+}
+const bad = pushedShas.filter((sha) => sha !== token.sha);
+if (bad.length) {
+  refuse(
+    `push отклонён: маркер release выписан на другой коммит ` +
+      `(${bad[0].slice(0, 8)} ≠ ${token.sha.slice(0, 8)})`,
+  );
+}
+// One-time marker — consumed before chaining to the repo's local hook.
+try { rmSync(tokenFile); chmodSync(tokenFile, 0o600); } catch { /* gone */ }
+process.exit(chainLocal());

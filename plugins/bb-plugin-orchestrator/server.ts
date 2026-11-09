@@ -7,6 +7,7 @@
  * the §7 reconcile pass behind `bb orchestrator reconcile`.
  */
 import { z } from "zod";
+import { join as joinPath } from "node:path";
 import {
   defineRpcContract,
   type BbPluginApi,
@@ -50,9 +51,16 @@ import {
 import {
   handleMessageDispatch,
   isRoleId,
-  ROLE_IDS,
+  PICKABLE_ROLE_IDS,
   type RoleDecisionProbes,
+  type RoleId,
 } from "./src/roles.js";
+import {
+  parseReleaseConfig,
+  type ReleaseConfigLoad,
+} from "./src/release-config.js";
+import { createCmd } from "./src/cmd.js";
+import { pumpReleases, runRelease } from "./src/release.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -61,13 +69,15 @@ export const rpcContract = defineRpcContract({
   setPendingRole: {
     input: z.object({
       projectId: z.string().nullable(),
-      role: z.enum(ROLE_IDS),
+      role: z.enum(["orchestrator", "executor", "auditor"]),
     }),
     output: z.object({ ok: z.literal(true) }),
   },
   pendingRole: {
     input: z.object({ projectId: z.string().nullable() }),
-    output: z.object({ role: z.enum(ROLE_IDS).nullable() }),
+    output: z.object({
+      role: z.enum(["orchestrator", "executor", "auditor"]).nullable(),
+    }),
   },
 });
 
@@ -80,7 +90,7 @@ export function pendingRoleRpc(store: DelegationStore) {
       role,
     }: {
       projectId: string | null;
-      role: (typeof ROLE_IDS)[number];
+      role: RoleId;
     }) {
       if (projectId !== null) store.setPendingRole(projectId, role);
       return { ok: true as const };
@@ -88,13 +98,19 @@ export function pendingRoleRpc(store: DelegationStore) {
     pendingRole({ projectId }: { projectId: string | null }) {
       const role =
         projectId === null ? undefined : store.pendingRole(projectId);
-      return { role: role !== undefined && isRoleId(role) ? role : null };
+      return {
+        role:
+          role !== undefined && isRoleId(role) && role !== "release-auditor"
+            ? role
+            : null,
+      };
     },
   };
 }
 
 export interface OrchestratorDeps {
   bbCli?: BbCli;
+  cmd?: ReturnType<typeof createCmd>;
   /** Clock for the §2 preset-check throttle; tests inject a fake. */
   now?: () => number;
 }
@@ -145,6 +161,14 @@ export async function createPlugin(
       description:
         "Give coordinator threads the generated routing rule (§3). When off, all plugin texts are silenced; tools stay.",
       default: true,
+    },
+    release: {
+      type: "string",
+      label: "Release config",
+      description:
+        "Release pipeline JSON (orchestrator-release §6): commitIdentity, defaults and per-project overrides (target, sync, checks, public, docsMap, leaks, excluded). Empty — `release` disabled.",
+      experimental_multiline: true,
+      default: "",
     },
     gitInstructions: {
       type: "string",
@@ -218,6 +242,9 @@ export async function createPlugin(
 
   // Structural validation only — nothing may block plugin load on the CLI.
   let policyLoad = parsePolicy(currentSettings.policy ?? "");
+  let releaseConfig: ReleaseConfigLoad = parseReleaseConfig(
+    currentSettings.release ?? "",
+  );
   /**
    * §2 (rev 13): the background preset check runs at most once per ten
    * minutes, only when the policy text changed since the last check or
@@ -264,6 +291,14 @@ export async function createPlugin(
       problem =
         `${first.path}: ${first.message}${rest} — ` +
         "исправьте `policy` и выполните `bb plugin reload orchestrator`";
+    } else if (releaseConfig.errors.length) {
+      const first = releaseConfig.errors[0]!;
+      problem =
+        `release: ${first.path}: ${first.message}` +
+        (releaseConfig.errors.length > 1
+          ? ` (+${releaseConfig.errors.length - 1} ещё)`
+          : "") +
+        " — исправьте `release` и выполните `bb plugin reload orchestrator`";
     } else if (gitError) {
       problem =
         `${gitError} — исправьте ` +
@@ -279,6 +314,7 @@ export async function createPlugin(
   settings.onChange((next) => {
     currentSettings = next;
     policyLoad = parsePolicy(currentSettings.policy ?? "");
+    releaseConfig = parseReleaseConfig(currentSettings.release ?? "");
     refreshStatus();
     maybeCheckPresets();
   });
@@ -409,6 +445,43 @@ export async function createPlugin(
     send: (a) => bb.sdk.threads.send(a as never),
     stop: (a) => bb.sdk.threads.stop(a),
   };
+  const cmd = deps.cmd ?? createCmd();
+  const pluginDataDir = () => {
+    try {
+      return joinPath(
+        bb.server.experimental_dataDir,
+        "plugins",
+        bb.pluginId,
+      );
+    } catch {
+      return "/tmp/bb-orchestrator";
+    }
+  };
+  const releaseDeps = {
+    store,
+    bbCli,
+    cmd,
+    threads: {
+      get: (a: { threadId: string }) =>
+        bb.sdk.threads.get(a) as never,
+      send: (a: never) => bb.sdk.threads.send(a) as never,
+      events: {
+        list: (a: never) => bb.sdk.threads.events.list(a) as never,
+      },
+    },
+    stepsDeps,
+    loadPolicy: async () => policyLoad,
+    loadReleaseConfig: () => releaseConfig,
+    probes,
+    hooksDir: () => joinPath(pluginDataDir(), "git-hooks"),
+    packetDir: () => joinPath(pluginDataDir(), "release-audit"),
+    log: bb.log,
+  };
+  const pumpRelease = () =>
+    pumpReleases(releaseDeps).catch((e) =>
+      bb.log.warn(`orchestrator release pump: ${describeError(e)}`),
+    );
+
   const watchdog = createWatchdog({
     store,
     bbCli,
@@ -478,14 +551,24 @@ export async function createPlugin(
             busy = false;
           });
       };
-      beat(() => watchdog.reconcile());
+      beat(async () => {
+        await watchdog.reconcile();
+        await pumpRelease();
+      });
       maybeCheckPresets();
       const reconcileTimer = setInterval(() => {
-        beat(() => watchdog.reconcile());
+        beat(async () => {
+          await watchdog.reconcile();
+          await pumpRelease();
+        });
         maybeCheckPresets();
       }, 60_000);
       const timersTimer = setInterval(
-        () => beat(() => watchdog.checkTimers()),
+        () =>
+          beat(async () => {
+            await watchdog.checkTimers();
+            await pumpRelease();
+          }),
         5_000,
       );
       return new Promise<void>((resolve) => {
@@ -725,6 +808,18 @@ export async function createPlugin(
         summary: "Force a reconciliation pass (watchdog stage)",
         usage: "bb orchestrator reconcile [--json]",
       },
+      {
+        name: "release",
+        summary:
+          "Deterministic publish pipeline (spec orchestrator-release §2)",
+        usage:
+          "bb orchestrator release <KEY> [--no-docs <причина>] [--kb <заметка>|--no-kb <причина>] [--json]",
+      },
+      {
+        name: "hooks-dir",
+        summary: "Directory of the shared pre-push hook + push token",
+        usage: "bb orchestrator hooks-dir",
+      },
     ],
     async run(argv, ctx: PluginCliContext) {
       const json = argv.includes("--json");
@@ -912,6 +1007,64 @@ export async function createPlugin(
           return json
             ? jsonOk({ ok: true, instructions: text })
             : { exitCode: 0, stdout: text + "\n" };
+        }
+
+        if (cmd === "release") {
+          const key = positional[1];
+          if (!key) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "usage: bb orchestrator release <KEY> [--no-docs <причина>] [--kb <заметка>|--no-kb <причина>]",
+            );
+          }
+          if (flag("--kb") && flag("--no-kb")) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "--kb и --no-kb несовместимы",
+            );
+          }
+          if (!ctx.threadId) {
+            throw new OrchestratorError(
+              "no-caller-thread",
+              "release works only from a bb thread (BB_THREAD_ID is absent)",
+            );
+          }
+          const caller = await callerFacts(ctx.threadId);
+          const res = await enqueue(() =>
+            runRelease(
+              {
+                taskKey: key,
+                caller,
+                noDocs: flag("--no-docs"),
+                kb: flag("--kb"),
+                noKb: flag("--no-kb"),
+              },
+              releaseDeps,
+            ),
+          );
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout:
+                  `release ${res.taskKey}: аудит запущен ` +
+                  `(release #${res.releaseId}, тред ${res.auditThreadId ?? "—"})` +
+                  (res.warnings.length
+                    ? `
+предупреждения скана:
+${res.warnings
+                        .slice(0, 10)
+                        .map((f) => `- ${f.file ?? ""}:${f.line ?? ""} ${f.problem}`)
+                        .join("\n")}`
+                    : "") +
+                  `
+итог придёт сообщением [orchestrator] — закончи ход.
+`,
+              };
+        }
+
+        if (cmd === "hooks-dir") {
+          return { exitCode: 0, stdout: releaseDeps.hooksDir() + "\n" };
         }
 
         if (cmd === "reconcile") {

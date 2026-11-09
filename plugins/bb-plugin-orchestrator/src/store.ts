@@ -62,6 +62,35 @@ export const MIGRATIONS: readonly string[] = [
     decided_at INTEGER NOT NULL,
     source TEXT NOT NULL CHECK (source IN ('hook','delegate'))
   )`,
+  // orchestrator-release §2: one release pipeline run per task at a time;
+  // published rows double as the step-7 «выложено в обход» reference.
+  `CREATE TABLE IF NOT EXISTS releases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    coordinator_thread_id TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    target_action TEXT NOT NULL CHECK (target_action IN ('push','pr')),
+    target_branch TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+      'auditing','rejected','publishing','published','failed'
+    )),
+    head_sha TEXT,
+    published_sha TEXT,
+    remote_base_sha TEXT,
+    audit_delegation_id INTEGER,
+    no_docs_reason TEXT,
+    kb_note TEXT,
+    no_kb_reason TEXT,
+    pr_url TEXT,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS releases_active_task_idx
+    ON releases(task_key) WHERE status IN ('auditing','publishing')`,
+  `CREATE INDEX IF NOT EXISTS releases_task_idx ON releases(task_key)`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -110,6 +139,36 @@ export interface RouteHoldRow {
 export interface PendingRoleRow {
   project_id: string;
   role: string;
+  updated_at: number;
+}
+
+export type ReleaseStatus =
+  | "auditing"
+  | "rejected"
+  | "publishing"
+  | "published"
+  | "failed";
+
+export interface ReleaseRow {
+  id: number;
+  task_key: string;
+  project_id: string;
+  coordinator_thread_id: string;
+  repo_path: string;
+  branch: string;
+  target_action: "push" | "pr";
+  target_branch: string;
+  status: ReleaseStatus;
+  head_sha: string | null;
+  published_sha: string | null;
+  remote_base_sha: string | null;
+  audit_delegation_id: number | null;
+  no_docs_reason: string | null;
+  kb_note: string | null;
+  no_kb_reason: string | null;
+  pr_url: string | null;
+  error: string | null;
+  created_at: number;
   updated_at: number;
 }
 
@@ -609,4 +668,144 @@ export class DelegationStore {
       )
       .run(threadId, role, Date.now(), source);
   }
+
+  // ── Releases (orchestrator-release §2/§7) ─────────────────────────
+
+  insertRelease(input: {
+    taskKey: string;
+    projectId: string;
+    coordinatorThreadId: string;
+    repoPath: string;
+    branch: string;
+    targetAction: "push" | "pr";
+    targetBranch: string;
+    noDocsReason?: string | null;
+    kbNote?: string | null;
+    noKbReason?: string | null;
+  }): ReleaseRow {
+    const now = Date.now();
+    const info = this.db
+      .prepare(
+        `INSERT INTO releases (
+          task_key, project_id, coordinator_thread_id, repo_path, branch,
+          target_action, target_branch, status, no_docs_reason, kb_note,
+          no_kb_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'auditing', ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        normalizeTaskKey(input.taskKey),
+        input.projectId,
+        input.coordinatorThreadId,
+        input.repoPath,
+        input.branch,
+        input.targetAction,
+        input.targetBranch,
+        input.noDocsReason ?? null,
+        input.kbNote ?? null,
+        input.noKbReason ?? null,
+        now,
+        now,
+      );
+    return this.getRelease(Number(info.lastInsertRowid))!;
+  }
+
+  getRelease(id: number): ReleaseRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM releases WHERE id = ?`)
+      .get(id) as ReleaseRow | undefined;
+  }
+
+  latestReleaseByTask(taskKey: string): ReleaseRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE task_key = ? ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as ReleaseRow | undefined;
+  }
+
+  activeReleaseByTask(taskKey: string): ReleaseRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE task_key = ?
+         AND status IN ('auditing','publishing')`,
+      )
+      .get(normalizeTaskKey(taskKey)) as ReleaseRow | undefined;
+  }
+
+  releasesByStatuses(statuses: readonly string[]): ReleaseRow[] {
+    if (!statuses.length) return [];
+    const marks = statuses.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE status IN (${marks}) ORDER BY id`,
+      )
+      .all(...statuses) as ReleaseRow[];
+  }
+
+  updateRelease(
+    id: number,
+    fields: {
+      status?: ReleaseStatus;
+      headSha?: string | null;
+      publishedSha?: string | null;
+      remoteBaseSha?: string | null;
+      auditDelegationId?: number | null;
+      prUrl?: string | null;
+      error?: string | null;
+    },
+  ): void {
+    const sets: string[] = [];
+    const args: unknown[] = [];
+    const map: Record<string, string> = {
+      status: "status",
+      headSha: "head_sha",
+      publishedSha: "published_sha",
+      remoteBaseSha: "remote_base_sha",
+      auditDelegationId: "audit_delegation_id",
+      prUrl: "pr_url",
+      error: "error",
+    };
+    for (const [key, col] of Object.entries(map)) {
+      if (key in fields) {
+        sets.push(`${col} = ?`);
+        args.push((fields as Record<string, unknown>)[key]);
+      }
+    }
+    if (!sets.length) return;
+    sets.push("updated_at = ?");
+    args.push(Date.now(), id);
+    this.db
+      .prepare(`UPDATE releases SET ${sets.join(", ")} WHERE id = ?`)
+      .run(...args);
+  }
+
+  /** Latest release-audit delegation of a task (§3): the chain reissue
+   * inserts newer rows, so "the audit's delegation" is always the newest
+   * `release-audit` row for the task key. */
+  latestDelegationByTaskAndLevel(
+    taskKey: string,
+    level: string,
+  ): DelegationRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE task_key = ? AND level = ?
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey), level) as
+      | DelegationRow
+      | undefined;
+  }
+
+  /** §2 step 7 «выложено в обход»: is this sha a commit release pushed? */
+  shaWasReleased(sha: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM releases
+           WHERE head_sha = ? OR published_sha = ? LIMIT 1`,
+        )
+        .get(sha, sha) !== undefined
+    );
+  }
 }
+
