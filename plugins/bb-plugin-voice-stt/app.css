@@ -1,0 +1,293 @@
+/*
+ * Voice STT — живой ввод. Только токены темы BB (как у live-call): цвета,
+ * шрифт, радиусы и тени следуют выбранной теме; свои значения — размеры
+ * и красный индикатор записи.
+ */
+
+.vsl-overlay {
+  position: fixed;
+  left: 50%;
+  bottom: 96px;
+  transform: translateX(-50%);
+  z-index: 60;
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--popover-foreground, var(--foreground));
+}
+.vsl-overlay *,
+.vsl-overlay *::before,
+.vsl-overlay *::after {
+  box-sizing: border-box;
+}
+.vsl-overlay button {
+  font: inherit;
+  color: inherit;
+}
+
+.vsl-card {
+  background: var(--popover);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius, 0.5rem) + 4px);
+  box-shadow: var(--shadow-lg, 0 12px 32px rgb(0 0 0 / 0.28));
+  padding: 10px 12px;
+  animation: vsl-in 0.16s ease-out;
+}
+.vsl-card--tap {
+  display: block;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.vsl-card--tap:active {
+  background: var(--state-hover, var(--accent));
+}
+.vsl-card--tap > .vsl-interim,
+.vsl-card--tap > .vsl-hint {
+  display: block;
+}
+@keyframes vsl-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.vsl-card--shake {
+  animation: vsl-shake 0.18s ease-out;
+}
+@keyframes vsl-shake {
+  0%, 100% { transform: translateX(0); }
+  33% { transform: translateX(-3px); }
+  66% { transform: translateX(3px); }
+}
+
+.vsl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vsl-row--head {
+  min-height: 18px;
+}
+
+.vsl-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--destructive, #ef4444);
+  animation: vsl-pulse 1.2s ease-in-out infinite;
+  flex: none;
+}
+/* Микрофон ещё включается — серая точка без пульса: говорить рано. */
+.vsl-dot--wait {
+  background: var(--muted-foreground);
+  animation: none;
+}
+@keyframes vsl-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+.vsl-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground);
+  flex: none;
+}
+
+.vsl-level {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--muted, var(--border));
+  overflow: hidden;
+}
+.vsl-level-fill {
+  display: block;
+  height: 100%;
+  background: var(--destructive, #ef4444);
+  transition: width 0.09s linear;
+}
+
+.vsl-status {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vsl-status--error {
+  color: var(--destructive, #ef4444);
+}
+.vsl-engine {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 8px;
+}
+
+.vsl-interim {
+  margin-top: 8px;
+  max-height: 96px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.vsl-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+/*
+ * Плавающая кнопка живого ввода (§3.1 п. 4): оверлей смонтирован
+ * постоянно — кнопка видна без открытого композера, включая мобильный
+ * клиент. Середина правого края — в стороне от композера, кнопки
+ * отправки и нижних панелей. Центрирование БЕЗ transform: анимации
+ * масштаба не сдвигают кнопку. z-index выше карточки — стоп никогда
+ * не перекрыт.
+ */
+.vsl-fab {
+  position: fixed;
+  right: 12px;
+  top: calc(50% - 26px);
+  z-index: 61;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--primary, var(--accent));
+  color: var(--primary-foreground, var(--foreground));
+  box-shadow: var(--shadow-lg, 0 8px 24px rgb(0 0 0 / 0.3));
+  cursor: pointer;
+  transition:
+    transform 0.12s ease-out,
+    background 0.12s ease-out;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+@media (hover: hover) {
+  .vsl-fab:hover {
+    transform: scale(1.06);
+  }
+}
+.vsl-fab:active {
+  transform: scale(0.94);
+}
+.vsl-fab--active {
+  background: var(--destructive, #ef4444);
+  color: #fff;
+  border-color: transparent;
+  animation: vsl-ring 1.2s ease-out infinite;
+}
+@keyframes vsl-ring {
+  0% { box-shadow: 0 0 0 0 rgb(239 68 68 / 0.55); }
+  100% { box-shadow: 0 0 0 14px rgb(239 68 68 / 0); }
+}
+.vsl-fab--busy {
+  opacity: 0.8;
+}
+/* Касание: мгновенный отклик цветом, пока решается тап/удержание/перенос. */
+.vsl-fab--pressed {
+  background: var(--destructive, #ef4444);
+  color: #fff;
+  border-color: transparent;
+}
+/* Перенос: кнопка едет за пальцем без анимаций. */
+.vsl-fab--drag,
+.vsl-fab--drag:active {
+  transition: none;
+  animation: none;
+  transform: scale(1.1);
+  cursor: grabbing;
+  opacity: 0.9;
+}
+
+/*
+ * Узкий экран (мобильный клиент): плашка во всю ширину, крупный текст —
+ * вся плашка мишень тапа (§3.2). FAB выше по z-index — стоп доступен и
+ * когда плашка под ним.
+ */
+@media (max-width: 640px) {
+  .vsl-overlay {
+    font-size: 16px;
+  }
+  .vsl-card--tap {
+    padding: 14px 16px;
+    min-height: 64px;
+  }
+  .vsl-interim {
+    max-height: 160px;
+  }
+  .vsl-hint {
+    font-size: 13px;
+  }
+}
+
+/* Настройка «Микрофон на этом устройстве» (§7.1). */
+.vsl-set {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--foreground);
+}
+.vsl-set-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.vsl-set-label {
+  font-weight: 500;
+}
+.vsl-set-select {
+  min-width: 220px;
+  max-width: 100%;
+  min-height: 36px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+}
+.vsl-set-btn {
+  min-height: 36px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  cursor: pointer;
+}
+.vsl-set-btn:hover {
+  background: var(--state-hover, var(--accent));
+}
+.vsl-set-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+.vsl-set-level {
+  flex: 1;
+  min-width: 120px;
+  max-width: 260px;
+}
+.vsl-set-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}

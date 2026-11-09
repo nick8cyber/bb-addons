@@ -81,6 +81,16 @@ The README also documents a real trap worth reading before writing any provider
 bridge: how a refused `write_to_file` argument silently costs you a whole run —
 [plugins/bb-plugin-provider-agy/README.md](plugins/bb-plugin-provider-agy/README.md).
 
+### `provider-devin` — Devin (SWE-2)
+
+Runs bb threads on Devin's SWE-2 as a native `acp-devin` provider: an ACP
+bridge with a `devin` dialect, plus hooks that return bb thread rules after
+compaction, hide executor threads and pin them to the coordinator. Requires
+the `devin` CLI and its hook set installed.
+
+Details in
+[plugins/bb-plugin-provider-devin/README.md](plugins/bb-plugin-provider-devin/README.md).
+
 ### `pi-gateways`
 
 Offers the free models of **OpenCode Zen** and the **Kilo Code gateway** to the
@@ -146,6 +156,39 @@ Two Gemini API keys go into the plugin's secret setting at install; nothing else
 ADRs [0005](docs/adr/0005-live-call-server-relay.md)–[0012](docs/adr/0012-live-call-voice-confirmation-rules.md),
 [plugin README](plugins/bb-plugin-live-call/README.md).
 
+### `voice-stt` 🎙️ — Gemini STT Live Voice (voice input)
+
+Voice input for bb in two modes:
+
+- **Native mic** in the composer. bb hands the recording to the plugin's
+  `ai.voice.transcribe` service: Gemini Live, then Codex, then Groq as fallbacks.
+- **Live dictation**: a floating mic button you can drag anywhere. Tap to start and
+  tap again to stop, hold to talk, or drag to move it. Speech streams to Gemini Live
+  while you talk, and the text lands in the composer draft 1–2 s after you stop.
+  Tapping the recording card also stops it. `Ctrl/Cmd+Shift+V` toggles dictation and
+  Esc cancels. Nothing is ever sent automatically.
+- **Microphone**: Auto picks a sensible input. On a Mac it skips the Continuity
+  iPhone mic and virtual devices. You can also pick a device per device under the
+  plugin's settings, with a level check. The mic stays warm for 30 s after a
+  dictation (`micWarmSeconds`), so the next one starts instantly and includes
+  ~0.5 s before the tap. If iOS Web Audio goes silent, capture switches to
+  `MediaRecorder`. The audio is decoded on the fly and streamed to the same Gemini
+  Live session, so live text keeps coming (verified in Chromium emulation; not yet
+  on a real iPhone). If on-the-fly decoding fails, the whole file is transcribed when you stop.
+
+```bash
+bb voice-stt status
+bb voice-stt transcribe <file>
+```
+
+Gemini keys go into the plugin's secret setting. Codex uses the host's Codex login,
+and a Groq key is optional.
+
+[Spec (file pipeline)](docs/specs/voice-stt.md),
+[spec (live dictation)](docs/specs/voice-stt-live.md),
+ADRs [0014](docs/adr/0014-voice-stt-live-floating-button.md),
+[0016](docs/adr/0016-voice-stt-mic-capture.md).
+
 ### `privacy-blur`
 
 One click blurs sensitive data across the bb interface for screenshots and
@@ -172,6 +215,12 @@ open in split, pin, read/unread, inline rename, archive, delete, the status
 indicator and bb's keyboard-shortcut DOM contract. What it does not rebuild —
 list virtualization, project sections, pull-request badges — is listed in the
 plugin README, along with the Settings switch that brings bb's own list back.
+
+The plugin also carries bb's screen-space fixes: it caps the whole message
+composer (text + attachments + toolbar) at one third of the working area on
+desktop and mobile, with overflow absorbed by the editor's own scroll —
+[spec](docs/specs/composer-viewport-cap.md),
+[ADR 0019](docs/adr/0019-composer-viewport-cap.md).
 
 ```bash
 bb plugin config sidebar-collapse set visibleThreads 10
@@ -206,6 +255,18 @@ attachments come from the tasks plugin's own RPC.
 It never mutates tasks — no mutation RPC calls, SQLite opened read-only,
 no kanban drag. Details in
 [plugins/bb-plugin-tasks-pro/README.md](plugins/bb-plugin-tasks-pro/README.md).
+
+### `orchestrator`
+
+Policy-driven delegation of `bb tasks` to executor threads: one `delegate`
+call dispatches the task under a routing policy, wires the executor as a
+hidden child with parent notifications, and a watchdog tracks the first
+response, quota holds and auto-reissue down the level's route chain. Thread
+roles (`orchestrator`, `executor`, `auditor`) decide which instructions and
+plugin tools each thread gets.
+
+Details in
+[plugins/bb-plugin-orchestrator/README.md](plugins/bb-plugin-orchestrator/README.md).
 
 ## Themes
 

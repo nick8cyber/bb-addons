@@ -7,6 +7,8 @@ import {
   selectAccountResources
 } from "../usage-policy.js";
 const require = __createRequire(import.meta.url);
+const __bbUserHome = require("node:os").homedir();
+const __bbToolPath = [`${__bbUserHome}/.local/bin`, `${__bbUserHome}/.npm-global/bin`, "/usr/local/bin", "/usr/bin", "/bin"].join(":");
 var __filename = __fileURLToPath(import.meta.url);
 var __dirname = __pathDirname(__filename);
 var __defProp = Object.defineProperty;
@@ -15306,7 +15308,7 @@ function providerUsagePlugin(bb, options = {}) {
   const getUserHome = () => {
     if (typeof options.userHome === "function") return options.userHome();
     if (typeof options.userHome === "string") return options.userHome;
-    return "~";
+    return __bbUserHome;
   };
   const getNow = () => {
     if (typeof options.now === "function") return options.now();
@@ -15316,7 +15318,7 @@ function providerUsagePlugin(bb, options = {}) {
     if (typeof options.agyPath === "function") return options.agyPath();
     if (typeof options.agyPath === "string") return options.agyPath;
     const fs = require("node:fs");
-    if (fs.existsSync("~/.local/bin/agy")) return "~/.local/bin/agy";
+    if (fs.existsSync(`${__bbUserHome}/.local/bin/agy`)) return `${__bbUserHome}/.local/bin/agy`;
     return "agy";
   };
   const customFetch = (url, init) => {
@@ -15441,7 +15443,7 @@ function providerUsagePlugin(bb, options = {}) {
         const refreshedToken = runExecFileSync("pi", ["auth", "print-bearer-token", "--provider", "openai-codex"], {
           encoding: "utf8",
           timeout: 10000,
-          env: { ...(nodeProcess.env || {}), PATH: "~/.local/bin:~/.npm-global/bin:/usr/local/bin:/usr/bin:/bin" }
+          env: { ...(nodeProcess.env || {}), PATH: __bbToolPath }
         });
         token = (typeof refreshedToken === "string" ? refreshedToken : refreshedToken.toString()).trim();
         try {
@@ -15722,7 +15724,7 @@ function providerUsagePlugin(bb, options = {}) {
           const env = {
             ...(nodeProcess.env || {}),
             HOME: accDir,
-            PATH: "~/.local/bin:~/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
+            PATH: __bbToolPath,
             ...(proxyUrl ? { HTTPS_PROXY: proxyUrl, HTTP_PROXY: proxyUrl } : {})
           };
           const proc = runSpawn(agyBin, ["--output-format", "json", "-p", "/usage"], {

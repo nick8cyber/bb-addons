@@ -1,0 +1,35 @@
+{
+  "name": "bb-plugin-provider-devin",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Devin (SWE-2) for bb over ACP, with Devin subagents shown as bb subagents.",
+  "engines": {
+    "bb": ">=0.48",
+    "bbPluginSdk": ">=0.4.87"
+  },
+  "bb": {
+    "name": "Devin provider",
+    "description": "Devin (SWE-2) over ACP; Devin subagents appear inside the thread like Claude's and Cursor's.",
+    "branding": {
+      "icon": "./icons/devin.svg"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "vendor": "node scripts/vendor-acp-bridge.mjs",
+    "test": "node --test scripts/devin-dialect.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "0.4.87",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

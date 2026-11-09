@@ -1,0 +1,42 @@
+{
+  "name": "bb-plugin-voice-stt",
+  "version": "0.1.28",
+  "type": "module",
+  "private": true,
+  "description": "Voice input for bb: Gemini Live STT with Codex and Groq fallbacks",
+  "engines": {
+    "bb": ">=0.48.1",
+    "bbPluginSdk": ">=0.6.49"
+  },
+  "bb": {
+    "name": "Gemini STT Live Voice",
+    "description": "Голосовой ввод: Gemini Live STT, фоллбэки Codex и Groq",
+    "branding": {
+      "icon": "./icons/mic.svg",
+      "experimental_icons": {
+        "mic": "./icons/mic.svg"
+      }
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "host": "./host.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "bb plugin build ."
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.104",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  }
+}

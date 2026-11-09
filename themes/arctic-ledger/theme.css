@@ -361,7 +361,10 @@ diffs-container {
 /* Handoff opens in the thread-detail side panel. It is not navigation: give
  * it the same calm light canvas and dark text as the main work area. The
  * light canvas is a light-appearance choice; dark keeps its own tokens. */
-:root:not(.dark) #thread-detail-secondary-panel {
+:root:not(.dark) :is(
+  #thread-detail-secondary-panel,
+  [data-testid="secondary-panel-shelf"]
+) {
   --sidebar: #f4f8fc;
   --sidebar-foreground: #14213d;
   --sidebar-accent: #d7e7f6;
@@ -464,4 +467,55 @@ diffs-container {
   span[class*="rounded-full"]
 ) {
   display: none !important;
+}
+
+/* Plugin chrome buttons keep desktop styling on mobile: the changed-files
+ * pill renders 44px in a 48px row while native controls are 28px, and the
+ * advisor "did not run" dashed frame reads as a render glitch at icon size.
+ * Normalize every chrome-row control to the native 28px hit target. */
+[data-testid="app-page-header-content-row"] :is(
+  button,
+  a[href],
+  [role="button"]
+) {
+  height: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  padding-block: 0;
+  box-sizing: border-box;
+}
+
+[data-testid="app-page-header-content-row"] [data-bb-plugin="advisor"] :is(
+  button,
+  [role="button"]
+) {
+  border-style: solid;
+  border-color: var(--border);
+}
+
+/* The footer customize strip (sidebar-footer-customize-inline) renders
+ * outside the [data-sidebar=panel] token ladder but paints text-muted-fore-
+ * ground icons on bg-sidebar tiles — the light-canvas dark ink on indigo.
+ * Repoint the text ramp at sidebar ink inside the customize surface. */
+[data-testid="sidebar-footer-customize-inline"],
+[data-testid="sidebar-footer-customize-inline"] * {
+  --muted-foreground: #c8d8ed;
+  --subtle-foreground: #9fb6d1;
+}
+
+.dark [data-testid="sidebar-footer-customize-inline"],
+.dark [data-testid="sidebar-footer-customize-inline"] * {
+  --muted-foreground: #bfd0e2;
+  --subtle-foreground: #6d87a2;
+}
+
+/* The strip's bg-sidebar-accent context flips --sidebar-foreground to the
+ * dark selection ink; the minus badge keeps its indigo fill, so pin its
+ * icon back to light ink. */
+[data-testid="sidebar-footer-customize-inline"] [data-footer-placement-toggle] {
+  color: #e2eafa;
+}
+
+.dark [data-testid="sidebar-footer-customize-inline"] [data-footer-placement-toggle] {
+  color: #bfd0e2;
 }
