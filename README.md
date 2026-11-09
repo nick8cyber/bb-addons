@@ -216,6 +216,12 @@ indicator and bb's keyboard-shortcut DOM contract. What it does not rebuild —
 list virtualization, project sections, pull-request badges — is listed in the
 plugin README, along with the Settings switch that brings bb's own list back.
 
+The plugin also carries bb's screen-space fixes: it caps the whole message
+composer (text + attachments + toolbar) at one third of the working area on
+desktop and mobile, with overflow absorbed by the editor's own scroll —
+[spec](docs/specs/composer-viewport-cap.md),
+[ADR 0019](docs/adr/0019-composer-viewport-cap.md).
+
 ```bash
 bb plugin config sidebar-collapse set visibleThreads 10
 ```
