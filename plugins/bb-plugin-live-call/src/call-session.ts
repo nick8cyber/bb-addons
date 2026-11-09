@@ -133,8 +133,6 @@ export class CallSession extends EventEmitter {
   private quietQueue: string[] = [];
   /** Справки (сводка мозгового центра и т. п.) — уходят без хода модели. */
   private quietContext: string[] = [];
-  /** Последний вердикт пришёл кнопкой (а не голосом) — его результат вставляется с обрывом хода. */
-  private decidedByButtonId: string | null = null;
   /** До этого момента ждём ответа модели на реплику владельца (вставки не шлём). */
   private awaitingReplyUntil = 0;
   private quietFallback: NodeJS.Timeout | null = null;
@@ -198,10 +196,20 @@ export class CallSession extends EventEmitter {
       undefined,
       {
         onConfirmationUpdate: (p, phase, isHint) => this.onConfirmationUpdate(p, phase, isHint),
-        onQuestionHeardAt: (p, at, offsetMs) => this.recordEvent("question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
-        onVerdict: (p, verdict, via, utteranceAt) => void this.onVerdict(p, verdict, via, utteranceAt),
-        onEarlyApproval: (_p) => {
-          this.interruptAndInject("[СИСТЕМА] Владелец сказал «да» до вопроса — это НЕ подтверждение, ничего не выполнено. Задай вопрос подтверждения коротко и дождись ответа");
+        onQuestionHeardAt: (p, at, offsetMs) =>
+          this.recordEvent("question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs) }),
+        // §7.2.3: длительность вопроса — вторая запись question_heard по playback_drained его хода.
+        onQuestionDuration: (p, at, offsetMs, durationMs) =>
+          this.recordEvent("question_heard", { tool: p.tool, at, offsetMs: Math.round(offsetMs), durationMs: Math.round(durationMs) }),
+        onQuestionLong: (p, words) => this.recordEvent("question_long", { tool: p.tool, words }),
+        onBargeDecision: (p, info) => this.recordEvent("barge_decision", { tool: p.tool, ...info }),
+        onVerdict: (p, verdict, via, utteranceAt, timing) => void this.onVerdict(p, verdict, via, utteranceAt, timing),
+        onEarlyApproval: (p) => {
+          // §7.2.2: вопрос задаётся заново коротким say, а не своими словами модели.
+          this.interruptAndInject(`[СИСТЕМА] Владелец сказал «да» до вопроса — это НЕ подтверждение, ничего не выполнено. Задай вопрос подтверждения заново — прочитай дословно: «${p.say}» и дождись ответа`);
+        },
+        onEarlyApprovalLogged: (p, info) => {
+          this.recordEvent("early_approval", { tool: p.tool, speechAt: info.speechAt, requestTurnSeq: info.requestTurnSeq, timing: info.timing });
         },
         onUnrecognized: (_p) => {
           this.interruptAndInject("[СИСТЕМА] Ответ владельца не распознан: ничего не выполнено и не отменено. Повтори вопрос подтверждения одной фразой и жди «да» или «нет»");
@@ -212,6 +220,13 @@ export class CallSession extends EventEmitter {
             : "[СИСТЕМА] «Да» для этого действия не подходит, ничего не выполнено. Скажи владельцу одной фразой: «Чтобы разрешить, скажи «разрешаю»» и жди ответа";
           this.interruptAndInject(text);
           this.ledger.add("system", text);
+        },
+        onReaskQuestion: (p) => {
+          // §7.2.1: вопрос не прозвучал у владельца — один раз просим повторить
+          // его дословно. Голосовой сессии может ещё не быть (переподключение):
+          // текст ждёт setupComplete очередного клиента.
+          this.reaskQuestionText = `[СИСТЕМА] Вопрос подтверждения не дошёл до владельца — ответа нет и ничего не выполнено. Задай его заново, прочитай дословно: «${p.say}» и дождись ответа`;
+          this.flushReaskQuestion();
         },
         onWindowInvalidated: () => {
           if (this.ownerUtteranceTimer) {
@@ -271,6 +286,9 @@ export class CallSession extends EventEmitter {
   /** Браузер вернулся после обрыва WS: повторить ready, тред и состояние (сессии Gemini живы). */
   resendReady() {
     if (this.ended) return;
+    // §7.2.1: ходы без итога при обрыве связи — оборванные с неизвестным итогом;
+    // досланные браузером playback_stopped заполнят итоги дальше.
+    this.gate.markUnfinishedTurnsInterrupted();
     this.frame({
       type: "ready",
       callId: this.deps.callId,
@@ -598,12 +616,27 @@ export class CallSession extends EventEmitter {
     }
   }
 
+  /**
+   * §7.2.1: сквозная нумерация ходов — новый клиент Gemini продолжает
+   * с последнего выданного номера, а не с нуля.
+   */
+  private turnSeqBase = 0;
+
+  private captureTurnSeqBase(client: LiveClient | null) {
+    if (client) this.turnSeqBase = Math.max(this.turnSeqBase, client.nextTurnSeq - 1);
+  }
+
   /** Закрыть голос и помощника; закрытие заменённой сессии не вызывает переподключение. */
   private closeSessions() {
     const voice = this.voice;
     const router = this.router;
     this.voice = null;
     this.router = null;
+    // §7.2.1: нумерация продолжается; ходы закрытой сессии без итога —
+    // оборванные с неизвестным итогом (ход вопроса среди них — сброс точки).
+    this.captureTurnSeqBase(voice);
+    this.captureTurnSeqBase(router);
+    if (voice || router) this.gate.markUnfinishedTurnsInterrupted();
     voice?.close();
     router?.close();
   }
@@ -917,6 +950,7 @@ export class CallSession extends EventEmitter {
       sessionHandle: handle,
       contextWindowCompression: COMPRESSION,
       wsFactory: this.deps.wsFactory,
+      turnSeqBase: this.turnSeqBase,
     });
     this.wireVoice(client);
     client.connect();
@@ -958,6 +992,7 @@ export class CallSession extends EventEmitter {
       tools: nativeDeclarations(this.targetThreadId ?? undefined) as unknown[],
       contextWindowCompression: COMPRESSION,
       wsFactory: this.deps.wsFactory,
+      turnSeqBase: this.turnSeqBase,
     });
     this.wireRouter(client);
     client.connect();
@@ -1038,9 +1073,25 @@ export class CallSession extends EventEmitter {
     } as unknown as ToolContext;
   }
 
+  /** Отложенная вставка «повтори вопрос» — ждёт живую голосовую сессию (§7.2.1). */
+  private reaskQuestionText: string | null = null;
+
+  private flushReaskQuestion() {
+    const text = this.reaskQuestionText;
+    if (!text || !this.voice) return;
+    const p = this.gate.pendingConfirmation();
+    if (!p || p.verdict !== null) {
+      this.reaskQuestionText = null;
+      return;
+    }
+    this.reaskQuestionText = null;
+    this.interruptAndInject(text);
+  }
+
   private wireVoice(client: LiveClient) {
     const ctx = this.toolContext();
     client.on("setupComplete", () => {
+      this.flushReaskQuestion();
       if (this.greeted) return; // после переподключений приветствие не повторяем
       this.greeted = true;
       if (this.targetProjectId) {
@@ -1091,6 +1142,9 @@ export class CallSession extends EventEmitter {
     });
     client.on("interrupted", (turnSeq: number | null) => {
       this.voiceTalking = false;
+      // §7.2.1: шлюз узнаёт об обрыве хода со стороны модели — точный playedMs
+      // придёт кадром playback_stopped от браузера, до него ход считается оборванным.
+      this.gate.onModelInterrupted(turnSeq);
       this.frame({ type: "interrupted", turnSeq: turnSeq ?? 0 });
       this.turnAudioBytes = 0;
       if (this.listenFallback) { clearTimeout(this.listenFallback); this.listenFallback = null; }
@@ -1159,7 +1213,8 @@ export class CallSession extends EventEmitter {
         agentBuf += text;
       }
       // Шлюзу — склеенный текст хода: кусок может резать слово («ок»+«ей»), ревью PLUG-113.
-      this.gate.onModelTranscript(agentBuf);
+      // turnSeq текущего хода нужен §7.2.1: вопрос часто звучит в следующем ходе.
+      this.gate.onModelTranscript(agentBuf, undefined, client.currentTurnSeq);
       if (delta) {
         streamPending += delta;
         flushStream(false);
@@ -1168,7 +1223,9 @@ export class CallSession extends EventEmitter {
     client.on("turnComplete", () => {
       this.voiceTalking = false;
       this.awaitingReplyUntil = 0;
-      this.gate.onModelTurnComplete();
+      // §7.2.1: номер завершившегося хода — якорный кусок «текст после всего звука»
+      // даёт смещение = длительность хода (offsetSource turn_end).
+      this.gate.onModelTurnComplete(client.nextTurnSeq - 1);
       // Аудит PLUG-108: состояние оставалось «speaking» до конца звонка — речь владельца уходила ×0.25.
       // Но снимать приглушение по turnComplete рано: браузер ещё доигрывает звук, эхо пошло бы в Gemini.
       // Поэтому: нет звука в ходе (текст) — сразу; есть — по playback_drained, запасной таймер по длине звука.
@@ -1267,10 +1324,27 @@ export class CallSession extends EventEmitter {
   /** Число вызовов инструментов в текущем ходе владельца (защита от циклов). */
   private toolCallsThisTurn = 0;
 
+  /** Журнал сырого toolCall от Gemini до исполнения (спека §7.2.6). */
+  private logToolCall(name: string, id: string | undefined, args: Record<string, unknown>) {
+    // Для ручек коннектора и brain_ask в проектном звонке аргументы в журнал не пишутся
+    // (§15.5, §15.9 §5, §16.7 п. 4) — только имя и хеш.
+    const noArgs =
+      this.projectConnectorTools.some((t) => t.name === name) ||
+      (name === "brain_ask" && Boolean(this.targetProjectId));
+    const secrets = Object.values(this.deps.projectSecrets ?? {}).filter(isValidSecretValue);
+    this.recordEvent("tool_call", {
+      id: id ?? null,
+      name,
+      argsHash: argsHash(name, args),
+      ...(noArgs ? {} : { argsPreview: maskSecrets(JSON.stringify(args), secrets).slice(0, 200) }),
+    });
+  }
+
   /** native: вызовы инструментов голосовой сессией. */
   private async handleNativeCalls(client: LiveClient, calls: Array<{ id?: string; name: string; args: Record<string, unknown> }>) {
     this.setState("working");
     for (const call of calls) {
+      this.logToolCall(call.name, call.id, call.args);
       if (this.lastFailedTool === call.name) {
         // §12.12 п. 3: Запрет повторного вызова того же инструмента после ok:false без реплики владельца
         client.sendToolResponse(
@@ -1366,6 +1440,7 @@ export class CallSession extends EventEmitter {
     this.setState("working");
     const seen = new Map<string, boolean>();
     for (const call of calls) {
+      this.logToolCall(call.name, call.id, call.args);
       const def = this.resolveTool(call.name);
       if (!def) {
         client.sendToolResponse(call.id, { error: `неизвестный инструмент ${call.name}` }, "SILENT", call.name);
@@ -1508,7 +1583,7 @@ export class CallSession extends EventEmitter {
     });
     if (phase === "asking" && !isHint) {
       if (this.mode === "extended") {
-        this.injectWhenQuiet(`[СИСТЕМА] Скажи владельцу: ${p.say}`);
+        this.injectWhenQuiet(`[СИСТЕМА] Скажи владельцу дословно, это весь вопрос: ${p.say}`);
       }
       this.ledger.add("system", this.sanitizeTokens(p.say));
     }
@@ -1541,11 +1616,12 @@ export class CallSession extends EventEmitter {
     verdict: "approved" | "hint" | "cancelled" | "expired" | "not_confirmed",
     via: "barge" | "window" | "button" | "system" = "system",
     utteranceAt: number = Date.now(),
+    timing?: "client" | "no_marker" | "tail",
   ) {
     if (this.ended) return;
     this.lastVerdict = { verdict, at: Date.now() };
     this.frame({ type: "confirmation_result", confirmationId: p.confirmationId, verdict });
-    this.recordEvent("verdict", { tool: p.tool, verdict, via, utteranceAt });
+    this.recordEvent("verdict", { tool: p.tool, verdict, via, utteranceAt, ...(timing ? { timing } : {}) });
 
     const def = this.resolveTool(p.tool);
     const stored = this.storedArgsOf(p);
@@ -1649,6 +1725,12 @@ export class CallSession extends EventEmitter {
       }
     }
 
+    // §7.2.4: вердикт доходит до модели сразу с прерыванием её звука — иначе, услышав
+    // «да», модель успевает сама переспросить «подтверждаешь?». По кнопке вставку уже
+    // сделал decideConfirmation — не дублируем.
+    if (via !== "button") {
+      this.interruptAndInject("[СИСТЕМА] Владелец подтвердил действие — оно уже выполняется. Вопрос подтверждения НЕ задавай; скажи одной короткой фразой, что выполняешь, и жди результата.");
+    }
     try {
       const rawRes = await def.execute(stored, this.toolContext());
       result = rawRes.ok
@@ -1777,6 +1859,18 @@ export class CallSession extends EventEmitter {
     }
   }
 
+  /** Кадр speech_start из браузера: начало реплики владельца по часам клиента (§7.2.1). */
+  onSpeechStart(turnSeq: number, playedMs: number) {
+    this.recordEvent("speech_start", { turnSeq, playedMs });
+    this.gate.onSpeechStart(turnSeq, playedMs);
+  }
+
+  /** Кадр playback_stopped из браузера: ход оборван, сколько реально проиграно (§7.2.1). */
+  onPlaybackStopped(turnSeq: number, playedMs: number) {
+    this.recordEvent("playback_stopped", { turnSeq, playedMs });
+    this.gate.onPlaybackStopped(turnSeq, playedMs);
+  }
+
   /** Кадр playback_drained из браузера: открывает окно подтверждения. */
   onPlaybackDrained(turnSeq: number) {
     this.gate.onPlaybackDrained(turnSeq);
@@ -1901,6 +1995,9 @@ export class CallSession extends EventEmitter {
       const useHandle = handle === undefined ? this.voice?.sessionHandle ?? undefined : handle;
       const old = this.voice;
       this.voice = null;
+      // §7.2.1: сквозная нумерация и обрыв незакрытых ходов — как при closeSessions.
+      this.captureTurnSeqBase(old);
+      if (old) this.gate.markUnfinishedTurnsInterrupted();
       old?.close();
       try {
         // Переподключается только голос; помощник Extended жив и не дублируется.
@@ -1942,13 +2039,11 @@ export class CallSession extends EventEmitter {
     // (живая проверка 04.11). Результат действия вставится сразу, а не после конца хода.
     const before = this.gate.pendingConfirmation();
     const fresh = before?.confirmationId === confirmationId && before.verdict === null;
-    this.decidedByButtonId = fresh ? confirmationId : null;
     const verdict = this.gate.decide(confirmationId, decision);
     // Подтверждение: обрываем ход СРАЗУ, не дожидаясь исполнения — медленное действие
     // (мозговой центр, коннектор) иначе давало голосу дочитать решённый вопрос.
     // Результат действия придёт позже обычной вставкой между ходами.
-    if (verdict === "approved" && this.decidedByButtonId === confirmationId) {
-      this.decidedByButtonId = null;
+    if (verdict === "approved" && fresh) {
       this.interruptAndInject("[СИСТЕМА] Владелец подтвердил действие кнопкой — оно уже выполняется. Вопрос подтверждения НЕ задавай; скажи одной короткой фразой, что выполняешь, и жди результата.");
     }
   }
@@ -1970,6 +2065,7 @@ export class CallSession extends EventEmitter {
         clearTimeout(this.listenFallback);
         this.listenFallback = null;
       }
+      this.gate.onModelInterrupted(this.lastAudioTurnSeq);
       this.frame({ type: "interrupted", turnSeq: this.lastAudioTurnSeq ?? 0 });
       this.setState("listening");
     }
@@ -1980,12 +2076,13 @@ export class CallSession extends EventEmitter {
     this.voice?.sendClientContent(all, true);
   }
 
-  /** Результат подтверждения — модели: после кнопки обрывом хода, после голоса — между ходами. */
+  /**
+   * Итог подтверждения — модели сразу и с прерыванием текущего звука (спека §7.2.4):
+   * модель не успевает переспросить «подтверждаешь?», пока результат ждёт тишины.
+   */
   private injectVerdict(p: PendingConfirmation, text: string) {
-    const byButton = this.decidedByButtonId === p.confirmationId;
-    if (byButton) this.decidedByButtonId = null;
-    if (byButton) this.interruptAndInject(text);
-    else this.injectWhenQuiet(text);
+    void p;
+    this.interruptAndInject(text);
   }
 
   pendingConfirmation(): PendingConfirmation | null {

@@ -96,6 +96,7 @@ describe("B: реплика, начатая раньше 1,5 с, — хвост 
     t.advance(1200);
     gate.onOwnerTranscriptChunk(" и", t.now);
     t.advance(1500);
+    gate.onSpeechStart(1, 300, t.now); // кадр: звук ответа проигран → засчитывается
     gate.onOwnerTranscriptChunk("да", t.now);
     t.advance(800);
     expect(verdicts).toEqual(["approved"]);

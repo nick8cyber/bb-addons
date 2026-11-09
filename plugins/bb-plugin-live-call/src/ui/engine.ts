@@ -136,16 +136,22 @@ registerProcessor("live-call-capture", LiveCallCapture);
  * Плеер: один курсор воспроизведения — каждый кусок начинается строго после
  * предыдущего, ходы не накладываются. playback_drained уходит, когда ход доигран.
  */
-class TurnPlayer {
+export class TurnPlayer {
   private pending: Array<{ turnSeq: number; buffer: AudioBuffer }> = [];
-  private sources: Array<{ turnSeq: number; source: AudioBufferSourceNode }> = [];
+  private sources: Array<{ turnSeq: number; source: AudioBufferSourceNode; startedAt: number }> = [];
   private lastTurnSeq: number | null = null;
   private drainedSent = new Set<number>();
   private nextStart = 0;
+  /**
+   * Ход → время старта ПЕРВОГО его буфера, полная длительность и сколько реально
+   * прозвучало (заполняется при interrupted) — для кадра speech_start (§7.2.1).
+   */
+  private turnPos = new Map<number, { startedAt: number; totalMs: number; playedMs?: number }>();
 
   constructor(
     private ctx: AudioContext,
     private drained: (turnSeq: number) => void,
+    private stopped?: (turnSeq: number, playedMs: number) => void,
   ) {}
 
   enqueue(turnSeq: number, pcm: Uint8Array) {
@@ -171,11 +177,14 @@ class TurnPlayer {
       source.connect(this.ctx.destination);
       const start = Math.max(this.ctx.currentTime + 0.015, this.nextStart);
       this.nextStart = start + item.buffer.duration;
+      const pos = this.turnPos.get(item.turnSeq) ?? { startedAt: start, totalMs: 0 };
+      pos.totalMs += item.buffer.duration * 1000;
+      this.turnPos.set(item.turnSeq, pos);
       source.onended = () => {
         this.sources = this.sources.filter((p) => p.source !== source);
         if (this.lastTurnSeq !== null) this.maybeDrain(this.lastTurnSeq);
       };
-      this.sources.push({ turnSeq: item.turnSeq, source });
+      this.sources.push({ turnSeq: item.turnSeq, source, startedAt: start });
       source.start(start);
     }
   }
@@ -188,6 +197,7 @@ class TurnPlayer {
   }
 
   interrupted() {
+    const now = this.ctx.currentTime;
     for (const p of this.sources) {
       try {
         p.source.stop();
@@ -195,10 +205,46 @@ class TurnPlayer {
         // источник уже закончился
       }
     }
+    // Прерванный ход не «доигран»: фиксируем реально прозвучавшие мс каждого
+    // оборванного хода и шлём playback_stopped (§7.2.1). Повторный interrupted
+    // уже остановленного хода (стрей кадр, смена режима, реконнект) playedMs
+    // не раздувает и кадр не шлёт.
+    const finished = new Set<number>([...this.sources.map((s) => s.turnSeq), ...this.pending.map((p) => p.turnSeq)]);
+    for (const seq of finished) {
+      const pos = this.turnPos.get(seq);
+      if (!pos || pos.playedMs !== undefined) continue;
+      pos.playedMs = Math.min(Math.max(0, now - pos.startedAt) * 1000, pos.totalMs);
+      this.stopped?.(seq, Math.round(pos.playedMs));
+      // Оборванный ход уже отчитался playback_stopped: отложенный onended
+      // остановленного буфера не должен слать ложный playback_drained.
+      this.drainedSent.add(seq);
+    }
     this.sources = [];
     this.pending = [];
     this.nextStart = this.ctx.currentTime;
-    this.drainedSent.clear();
+  }
+
+  /**
+   * Позиция проигрывания для speech_start (§7.2.1): ход, чей звук играет или
+   * доигран последним, и сколько его миллисекунд реально прозвучало. Отсчёт — от
+   * первого буфера хода (ход — много буферов), а не от текущего.
+   */
+  playbackPosition(): { turnSeq: number; playedMs: number } | null {
+    const now = this.ctx.currentTime;
+    const cur = this.sources[0];
+    if (cur) {
+      const pos = this.turnPos.get(cur.turnSeq);
+      if (pos) {
+        const played = Math.max(0, now - pos.startedAt) * 1000;
+        return { turnSeq: cur.turnSeq, playedMs: Math.min(played, pos.totalMs) };
+      }
+      return { turnSeq: cur.turnSeq, playedMs: 0 };
+    }
+    if (this.lastTurnSeq !== null) {
+      const pos = this.turnPos.get(this.lastTurnSeq);
+      return { turnSeq: this.lastTurnSeq, playedMs: pos ? (pos.playedMs ?? pos.totalMs) : 0 };
+    }
+    return null;
   }
 }
 
@@ -266,6 +312,24 @@ export class CallEngine {
     if (this.sock?.readyState === WebSocket.OPEN) this.sock.send(JSON.stringify(frame));
   }
 
+  /**
+   * §7.2.1: неотправленные playback_stopped — обрыв WS рвёт сокет раньше кадров.
+   * Живут до hello { resume } и досылаются первыми; новый звонок их не получает.
+   */
+  private stoppedOutbox: Array<{ turnSeq: number; playedMs: number }> = [];
+
+  private sendPlaybackStopped(turnSeq: number, playedMs: number) {
+    this.stoppedOutbox.push({ turnSeq, playedMs });
+    this.flushStoppedOutbox();
+  }
+
+  private flushStoppedOutbox() {
+    if (this.stoppedOutbox.length === 0 || this.sock?.readyState !== WebSocket.OPEN) return;
+    const frames = this.stoppedOutbox;
+    this.stoppedOutbox = [];
+    for (const f of frames) this.send({ type: "playback_stopped", turnSeq: f.turnSeq, playedMs: f.playedMs });
+  }
+
   isActive() {
     return this.view.phase === "connecting" || this.view.phase === "live";
   }
@@ -315,6 +379,7 @@ export class CallEngine {
 
   /** Сокет звонка: первый вход ({mode, projectId, threadId}) или возврат после обрыва ({resume: callId}). */
   private openSocket(hello: { mode?: CallMode; resume?: string; threadId?: string; projectId?: string }) {
+    if (!hello.resume) this.stoppedOutbox = [];
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     const sock = new WebSocket(`${wsProto}//${location.host}${CALL_WS_PATH}`);
     sock.binaryType = "arraybuffer";
@@ -340,6 +405,7 @@ export class CallEngine {
       }
       if (this.sock !== sock) return;
       sock.send(JSON.stringify({ type: "hello", protocol: 1, ...(token ? { token } : {}), ...hello }));
+      this.flushStoppedOutbox();
     };
     sock.onmessage = (ev: MessageEvent) => void this.onMessage(ev);
     sock.onerror = () => {
@@ -382,6 +448,9 @@ export class CallEngine {
       if (this.view.phase !== "live") return;
       // Обрыв посреди звонка (мобильная сеть, Connect, свернули приложение): сервер
       // держит звонок 20 с — возвращаемся в тот же звонок, звук и лента не трогаются.
+      // §7.2.1: сначала фиксируем остановку плеера — playback_stopped копятся в
+      // очереди и досылаются после hello { resume }.
+      this.player?.interrupted();
       const lived = Math.round((Date.now() - this.liveSince) / 1000);
       this.diag("ws_closed_live", `code=${ev.code} reason=${ev.reason || "-"} после ${lived} с; попытка ${this.reconnectTries + 1}`);
       if (this.restartPending && !this.endRequested) {
@@ -396,7 +465,6 @@ export class CallEngine {
       }
       if (!this.endRequested && this.view.callId && this.reconnectTries < 5 && ev.code !== 4009) {
         this.reconnectTries += 1;
-        this.player?.interrupted();
         this.patch({ orb: "reconnecting", stateDetail: "связь прервалась" });
         const callId = this.view.callId;
         setTimeout(() => {
@@ -540,6 +608,7 @@ export class CallEngine {
     this.source = null;
     this.player = null;
     this.wakeLock = null;
+    this.stoppedOutbox = [];
     this.level.set(0);
   }
 
@@ -787,6 +856,28 @@ export class CallEngine {
     }).catch(() => {});
   }
 
+  /** Детектор речи для speech_start (§7.2.1): накопление мс над порогом и тишины. */
+  private speechAboveMs = 0;
+  private speechBelowMs = 0;
+  private speechArmed = true;
+
+  private detectSpeechStart(samples: number, peak: number) {
+    const chunkMs = samples / 16; // 16 кГц → сэмплов на мс
+    if (peak > 0.03) {
+      this.speechAboveMs += chunkMs;
+      this.speechBelowMs = 0;
+      if (this.speechArmed && this.speechAboveMs >= 120) {
+        this.speechArmed = false;
+        const pos = this.player?.playbackPosition() ?? null;
+        this.send({ type: "speech_start", turnSeq: pos?.turnSeq ?? 0, playedMs: Math.round(pos?.playedMs ?? 0) });
+      }
+    } else {
+      this.speechAboveMs = 0;
+      this.speechBelowMs += chunkMs;
+      if (this.speechBelowMs >= 400) this.speechArmed = true;
+    }
+  }
+
   /** Обработка куска микрофона (общая для AudioWorklet и запасного ScriptProcessor). */
   private onMicChunk(f32: Float32Array, state: { silent: number }) {
     const sock = this.sock;
@@ -800,6 +891,7 @@ export class CallEngine {
       i16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
     }
     this.level.set(this.view.muted ? 0 : Math.min(1, peak * 2.2));
+    if (!this.view.muted) this.detectSpeechStart(f32.length, peak);
     if (peak > 0.01) {
       state.silent = 0;
       if (this.ownerHeard && this.view.micWarning?.startsWith("Микрофон молчит")) this.patch({ micWarning: null });
@@ -880,7 +972,11 @@ export class CallEngine {
       this.source.connect(capture);
       capture.connect(ctx.destination); // узлу захвата нужен выход, но он молчит
       // Плеер на ТОМ ЖЕ контексте, что и захват: голос агента — опорный сигнал AEC.
-      this.player = new TurnPlayer(ctx, (turnSeq) => this.send({ type: "playback_drained", turnSeq }));
+      this.player = new TurnPlayer(
+        ctx,
+        (turnSeq) => this.send({ type: "playback_drained", turnSeq }),
+        (turnSeq, playedMs) => this.sendPlaybackStopped(turnSeq, playedMs),
+      );
       const devices = await navigator.mediaDevices.enumerateDevices();
       const mics = devices.filter((d) => d.kind === "audioinput").map((d, i) => ({ id: d.deviceId, label: d.label || `Микрофон ${i + 1}` }));
       this.patch({ mics, micId });

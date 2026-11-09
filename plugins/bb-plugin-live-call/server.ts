@@ -601,6 +601,8 @@ export default async function plugin(bb: BbPluginApi) {
             if (!s) return;
             if (frame.type === "mute") s.setMuted(frame.muted);
             else if (frame.type === "playback_drained") s.onPlaybackDrained(frame.turnSeq);
+            else if (frame.type === "playback_stopped") s.onPlaybackStopped(frame.turnSeq, frame.playedMs);
+            else if (frame.type === "speech_start") s.onSpeechStart(frame.turnSeq, frame.playedMs);
             else if (frame.type === "switch_mode") {
               /* Extended отключён — переключение режима не выполняется (ADR-0006, пересмотр 2). */
             }

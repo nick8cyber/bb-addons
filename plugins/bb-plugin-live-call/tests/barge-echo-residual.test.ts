@@ -59,6 +59,7 @@ function bargeIn(answer: string, cls: "C" | "L" = "C") {
   gate.onModelTranscript(`${verb}: «Какие модели`, t.now);
   gate.onModelAudio(1, 48000 * 3, t.now);
   t.advance(2600);
+  gate.onSpeechStart(1, 2500, t.now); // кадр: звук ответа после запроса проигран (§7.2.1)
   gate.onOwnerTranscriptChunk(answer, t.now);
   t.advance(800);
   return { verdicts, early };

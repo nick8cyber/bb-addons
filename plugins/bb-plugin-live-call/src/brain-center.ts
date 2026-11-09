@@ -9,6 +9,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { CallStore } from "./call-store.js";
 import { fetchThreadMessages, formatAllThreadMessagesText, type ThreadMessage } from "./thread-messages.js";
 import { truncate } from "./tools.js";
+import { QuestionFlight } from "./single-flight.js";
 import type { ToolResult } from "./contract.js";
 
 export interface BrainCenterOptions {
@@ -184,7 +185,18 @@ ${historyFile}
     }
   }
 
-  async ask(question: string): Promise<ToolResult> {
+  /** Single-flight (спека §7.2.6): совпадающий вопрос присоединяется, другой ждёт очереди. */
+  private askFlight = new QuestionFlight();
+
+  askWillJoin(question: string): boolean {
+    return this.askFlight.willJoin(question);
+  }
+
+  ask(question: string, callId?: string): Promise<ToolResult> {
+    return this.askFlight.ask(question, callId, (callIds) => this.askNow(question, callIds));
+  }
+
+  private async askNow(question: string, callIds: string[]): Promise<ToolResult> {
     if (!this.threadId) {
       return { ok: false, error: { code: "not_found", message: "мозговой центр не запущен" } };
     }
@@ -204,14 +216,14 @@ ${historyFile}
       await this.waitForIdle(threadId, 120_000);
       const ms = Date.now() - startTs;
       const text = await this.latestAnswerText(threadId);
-      this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_ask", ms });
+      this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_ask", ms, callIds });
       return truncate({ answer: text, ms });
     } catch (e) {
       const ms = Date.now() - startTs;
       this.opts.log?.warn?.(`BrainCenter ask error: ${String(e)}`);
       const partial = await this.latestAnswerText(threadId);
       if (partial) {
-        this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_ask", ms, partial: true });
+        this.opts.store.event(this.opts.callId, "brain_answer", { tool: "brain_ask", ms, partial: true, callIds });
         return truncate({ answer: partial, partial: true, ms });
       }
       return { ok: false, error: { code: "timeout", message: `мозговой центр не ответил вовремя (${ms} мс)` } };
