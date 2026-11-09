@@ -36,6 +36,7 @@ import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridge
 import { mountSidebarControls } from "./lib/sidebar-controls";
 import { bindGitHeader, type GitHeaderSnapshot } from "./lib/git-header";
 import { bindActivityHeader, mountCompactQueue, type ActivitySnapshot } from "./lib/chat-compact";
+import { mountComposerCap } from "./lib/composer-cap";
 import { useSidebarRowActions, registerHeaderControl, type SidebarRowActions } from "./lib/host-compat";
 import {
   groupSidebarThreads,
@@ -908,6 +909,7 @@ function ActivityHeader({ threadId }: { threadId: string }) {
 export default definePluginApp((app) => {
   app.contentScripts.register({ id: "sidebar-controls", mount: ({signal}) => mountSidebarControls(signal) });
   app.contentScripts.register({ id: "compact-queue", mount: ({signal}) => mountCompactQueue(signal) });
+  app.contentScripts.register({ id: "composer-cap", mount: ({signal}) => mountComposerCap(signal) });
   registerHeaderControl(app, { id: "changed-files", title: "Изменённые файлы", component: GitHeader });
   registerHeaderControl(app, { id: "background-activity", title: "Фоновая активность", component: ActivityHeader });
   app.slots.experimental_threadList({
