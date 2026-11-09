@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parsePolicy } from "../src/policy.js";
+import { parsePolicy, pickRoute } from "../src/policy.js";
 
 const VALID = JSON.stringify({
   version: 1,
@@ -153,4 +153,26 @@ test("rule 6: unavailablePatterns is an array of ≤20 non-empty strings", () =>
   assert.ok(
     load.errors.some((e) => e.path === "routes.simple.unavailablePatterns"),
   );
+});
+
+test("pickRoute: a route NAME on hold is skipped, not just its quota group", () => {
+  const load = parsePolicy(VALID, presets);
+  // name-hold on "simple" while its quotaGroup "zen" is free
+  const unavailable = (e: unknown) =>
+    (e as { code?: string }).code === "route-unavailable";
+  const nameHold = new Set(["simple"]);
+  assert.throws(
+    () => pickRoute(load.policy!, "simple", { heldGroups: nameHold }),
+    unavailable,
+  );
+  // sanity: the quota-group hold refuses it too
+  assert.throws(
+    () => pickRoute(load.policy!, "simple", { heldGroups: new Set(["zen"]) }),
+    unavailable,
+  );
+  // and a non-held route still picks
+  const { name } = pickRoute(load.policy!, "complex", {
+    heldGroups: nameHold,
+  });
+  assert.equal(name, "complex");
 });

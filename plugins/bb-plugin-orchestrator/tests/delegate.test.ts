@@ -651,3 +651,41 @@ test("a failed role-metadata write lands in setup_errors and retries", async () 
   );
   assert.equal(metadata.length, 2);
 });
+
+test("dispatch refusal naming a removed model holds the route (§5.3 r19)", async () => {
+  const { deps, store } = makeDeps({
+    cli: (args) =>
+      args.join(" ").startsWith("tasks dispatch")
+        ? { exitCode: 1, stdout: "", stderr: "Invalid params: model not found: m-9" }
+        : ok(),
+  });
+  await assert.rejects(
+    runDelegate({ taskKey: "PLUG-1", level: "simple", caller: COORDINATOR }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "dispatch-failed",
+  );
+  assert.ok(
+    store.heldGroups(Date.now()).has("simple"),
+    "route name on hold for 15 minutes",
+  );
+  assert.equal(store.list().length, 0); // refusal still removes the record
+
+  // the next delegate skips the held route → route-unavailable for a
+  // single-route level
+  await assert.rejects(
+    runDelegate({ taskKey: "PLUG-2", level: "simple", caller: COORDINATOR }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "route-unavailable",
+  );
+});
+
+test("dispatch refusal without a model pattern holds nothing", async () => {
+  const { deps, store } = makeDeps({
+    cli: (args) =>
+      args.join(" ").startsWith("tasks dispatch")
+        ? { exitCode: 1, stdout: "", stderr: "no such preset" }
+        : ok(),
+  });
+  await assert.rejects(
+    runDelegate({ taskKey: "PLUG-1", level: "simple", caller: COORDINATOR }, deps),
+  );
+  assert.equal(store.heldGroups(Date.now()).size, 0);
+});

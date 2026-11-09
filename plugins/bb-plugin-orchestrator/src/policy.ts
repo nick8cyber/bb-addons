@@ -301,6 +301,13 @@ export function quotaGroupOf(route: PolicyRoute, name: string): string {
   return route.quotaGroup ?? name;
 }
 
+/** §5.3 removed-model text patterns; `routes.*.unavailablePatterns` extends. */
+export const BUILTIN_UNAVAILABLE_PATTERNS = [
+  "model not found",
+  "model_not_found",
+  "unknown model",
+] as const;
+
 /**
  * First usable route of a level chain: one whose preset exists and whose
  * quota group is not on hold (§2, §4 step 1). `undefined` when the whole
@@ -348,7 +355,7 @@ export function pickRoute(
     if (!usable(name)) {
       throw new OrchestratorError(
         "route-unavailable",
-        `route "${name}" is unavailable (missing preset or quota hold)`,
+        `route "${name}" is unavailable (missing preset or route/quota hold)`,
       );
     }
     return { name, route: policy.routes[name]! };

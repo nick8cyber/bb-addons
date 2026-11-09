@@ -1596,3 +1596,154 @@ test("quota is checked before unavailable: both signals → quota path", async (
   assert.ok(held.has("zen")); // the quota GROUP, not the route name
   assert.ok(!held.has("simple"));
 });
+
+// ── PLUG-150 ревью: находки 1–4 ────────────────────────────────────────
+
+const POLICY_THREE_ROUTES = JSON.stringify({
+  version: 1,
+  firstResponseSeconds: 30,
+  levels: { lvl: { chain: ["a", "b", "c"], autoFallback: true } },
+  routes: {
+    a: { preset: "simple", provider: "p" },
+    b: { preset: "simple-alt", provider: "p", quotaGroup: "g1" },
+    c: { preset: "strict", provider: "p" },
+  },
+});
+
+test("reissue skips a name-held route sitting after the current one", async () => {
+  const h = makeHarness({ policyText: POLICY_THREE_ROUTES });
+  // name-hold on "b" while its quotaGroup "g1" is free — only the §5.3
+  // route-name check can skip it
+  h.store.hold("b", h.getNow() + 15 * 60 * 1000, "route unavailable");
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "lvl",
+    route: "a",
+    preset: "simple",
+    provider: "p",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "c"); // "b" skipped via the name hold
+});
+
+test("reissue dispatch refused with a removed model → hold + chain continues", async () => {
+  const h = makeHarness({
+    policyText: POLICY_THREE_ROUTES,
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks dispatch") && key.includes("--preset simple-alt"))
+        return { exitCode: 1, stdout: "", stderr: "model not found: b-9" };
+      return undefined;
+    },
+  });
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "lvl",
+    route: "a",
+    preset: "simple",
+    provider: "p",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "Command thread.start failed / Invalid params: model not found: a-1",
+  );
+
+  const held = h.store.heldGroups(h.getNow());
+  assert.ok(held.has("a") && held.has("b"), "both refused routes on hold");
+  assert.ok(!held.has("g1"), "the quota GROUP is not held — names are");
+  const mid = h.store.list().find((r) => r.route === "b")!;
+  assert.equal(mid.status, "reissued"); // unavailable → stalled → reissued onward
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "c");
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.reissue_of, mid.id);
+  assert.deepEqual(h.stops, []);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /перевыпущено на c/,
+  );
+});
+
+test("reconcile: reissue dispatch refused with a removed model → hold + next route", async () => {
+  const h = makeHarness({
+    policyText: POLICY_THREE_ROUTES,
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks dispatch") && key.includes("--preset simple-alt"))
+        return { exitCode: 1, stdout: "", stderr: "model not found: b-9" };
+      return undefined;
+    },
+  });
+  const old = h.insertActive({
+    threadId: "thr_e1",
+    level: "lvl",
+    route: "a",
+    preset: "simple",
+    provider: "p",
+  });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "b",
+    preset: "simple-alt",
+    provider: "p",
+  })!;
+  h.db.prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`).run(
+    T0 - 6 * 60_000,
+    row2.id,
+  );
+
+  await h.wd.reconcile();
+  const mid = h.store.get(row2.id)!;
+  assert.equal(mid.status, "reissued");
+  assert.ok(h.store.heldGroups(h.getNow()).has("b"));
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "c");
+  assert.equal(fresh.status, "running");
+});
+
+test("start-failure after a pre-first-turn interrupt is still unavailable", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  // interrupt before any turn → resume sent, turn_started_at now marks the
+  // resume window, not a real turn
+  h.eventLog.set("thr_e1", [
+    ev(1, "system/thread/interrupted", T0, { reason: "host-daemon-restarted" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  assert.match(h.store.get(row.id)!.setup_errors, /resume-await/);
+  assert.notEqual(h.store.get(row.id)!.turn_started_at, null);
+
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "Command thread.start failed / connection refused",
+  );
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.ok(h.store.heldGroups(h.getNow()).has("simple"));
+  assert.equal(h.store.listActive()[0]!.route, "simple-alt");
+});
+
+test("a later thread.failed upgrades a premature failed to unavailable", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  // race: thread.failed lands first with a non-pattern error text
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+  assert.equal(h.store.get(row.id)!.status, "failed");
+  // then the same failure arrives carrying the removed-model signal
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "Command thread.start failed / Invalid params: model not found: x",
+  );
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.ok(h.store.heldGroups(h.getNow()).has("simple"));
+  assert.equal(h.store.listActive()[0]!.route, "simple-alt");
+});

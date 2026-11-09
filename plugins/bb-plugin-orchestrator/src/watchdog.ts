@@ -15,6 +15,7 @@
  */
 import { OrchestratorError } from "./errors.js";
 import {
+  BUILTIN_UNAVAILABLE_PATTERNS,
   quotaGroupOf,
   type PolicyLoad,
   type PolicyRoute,
@@ -31,13 +32,6 @@ export const BUILTIN_QUOTA_PATTERNS = [
   "usage limit",
   "free usage limit reached",
   "insufficient credits",
-] as const;
-
-/** §5.3 removed-model text patterns; `routes.*.unavailablePatterns` extends. */
-export const BUILTIN_UNAVAILABLE_PATTERNS = [
-  "model not found",
-  "model_not_found",
-  "unknown model",
 ] as const;
 
 /** §5.3: a start failure before the first turn reads as `unavailable`. */
@@ -224,8 +218,11 @@ export function createWatchdog(deps: WatchdogDeps) {
 
   /**
    * §5.3 `unavailable`: a `thread.start failed` error while no turn ever
-   * began (`turn_started_at` still empty), or the error text matching a
-   * removed-model pattern. Checked after quota, before `failed`.
+   * began, or the error text matching a removed-model pattern. Checked
+   * after quota, before `failed`. "No turn began" is either an empty
+   * `turn_started_at` or a pending resume (`resume-await` clears only when
+   * a real turn starts — an interrupt before the first turn leaves the
+   * start failure inside the unavailable gate).
    */
   const isUnavailable = (
     row: DelegationRow,
@@ -233,7 +230,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     patterns: readonly string[],
   ): boolean => {
     const hay = text.toLowerCase();
-    if (row.turn_started_at == null && hay.includes(THREAD_START_FAILED)) {
+    if (
+      (row.turn_started_at == null || hasSetupError(row, "resume-await")) &&
+      hay.includes(THREAD_START_FAILED)
+    ) {
       return true;
     }
     return patterns.some((p) => hay.includes(p.toLowerCase()));
@@ -432,6 +432,12 @@ export function createWatchdog(deps: WatchdogDeps) {
           );
         } catch (e) {
           const code = (e as { code?: string }).code;
+          if (
+            code === "dispatch-failed" &&
+            (await dispatchRefusalIsUnavailable(fresh, message(e)))
+          ) {
+            return;
+          }
           await report(
             row,
             code === "dispatch-failed"
@@ -555,13 +561,43 @@ export function createWatchdog(deps: WatchdogDeps) {
    */
   const toUnavailable = async (row: DelegationRow, detail: string) => {
     const fresh = store.get(row.id);
-    if (!fresh || !isActive(fresh.status)) return;
+    // A start-failure signal may upgrade a premature `failed` — same
+    // precedence the typed quota category has (§5.3 before `failed`).
+    if (!fresh || !(isActive(fresh.status) || fresh.status === "failed")) {
+      return;
+    }
     store.setStatus(fresh.id, "stalled"); // §5.3: unavailable lands as stalled
     clearMarks(fresh.id);
     const reason = `маршрут недоступен: ${detail.slice(0, 180)}`;
     store.hold(fresh.route, now() + QUOTA_HOLD_MS, reason);
     store.addSetupError(fresh.id, "outcome-detail", reason);
     await outcomeAndMaybeReissue(fresh, "unavailable", detail);
+  };
+
+  /**
+   * §5.3 rev 19: a synchronous dispatch refusal naming a removed model is
+   * the `unavailable` outcome too — hold the ROUTE, land the refused row
+   * as `stalled` with the reason, and let §5.4 continue the chain to the
+   * next route. Returns false when the refusal is an ordinary error.
+   */
+  const dispatchRefusalIsUnavailable = async (
+    row: DelegationRow,
+    text: string,
+  ): Promise<boolean> => {
+    const info = await routeInfo(row);
+    if (
+      !info.unavailablePatterns.some((p) =>
+        text.toLowerCase().includes(p.toLowerCase()),
+      )
+    ) {
+      return false;
+    }
+    const reason = `маршрут недоступен: ${text.slice(0, 180)}`;
+    store.setStatus(row.id, "stalled");
+    store.hold(row.route, now() + QUOTA_HOLD_MS, reason);
+    store.addSetupError(row.id, "outcome-detail", reason);
+    await outcomeAndMaybeReissue(store.get(row.id) ?? row, "unavailable", text);
+    return true;
   };
 
   const toFailed = async (row: DelegationRow, errorText: string) => {
@@ -845,10 +881,16 @@ export function createWatchdog(deps: WatchdogDeps) {
     error: string | null,
   ) => {
     const row = store.byThreadId(thread.id);
-    if (!row || !isActive(row.status)) return;
+    // `failed` rows pass: a stronger signal in this event may upgrade the
+    // outcome (§5.2/§5.3 precede `failed` whenever it is re-evaluated).
+    if (!row || !(isActive(row.status) || row.status === "failed")) return;
     const streamRead = await processStream(row);
     const fresh = store.get(row.id);
-    if (!fresh || !isActive(fresh.status)) return;
+    // A later, stronger signal may still upgrade a premature `failed` —
+    // let `failed` rows reach the decision too (§5.2/§5.3 before `failed`).
+    if (!fresh || !(isActive(fresh.status) || fresh.status === "failed")) {
+      return;
+    }
     // §5.2: the failed-vs-quota decision needs the turn's events read.
     if (!streamRead) return;
     const text = error ?? lastErrorText.get(fresh.id) ?? "thread failed";
@@ -872,10 +914,12 @@ export function createWatchdog(deps: WatchdogDeps) {
       await toQuota(row, `turn.failed: ${category}`);
       return;
     }
-    if (!isActive(row.status)) return;
+    if (!(isActive(row.status) || row.status === "failed")) return;
     const streamRead = await processStream(row);
     const fresh = store.get(row.id);
-    if (!fresh || !isActive(fresh.status)) return;
+    if (!fresh || !(isActive(fresh.status) || fresh.status === "failed")) {
+      return;
+    }
     // §5.2: the failed-vs-quota decision needs the turn's events read.
     if (!streamRead) return;
     const text =
@@ -1115,6 +1159,14 @@ export function createWatchdog(deps: WatchdogDeps) {
           } catch (e) {
             const err = e as { code?: string };
             if (err.code === "dispatch-failed") {
+              if (
+                await dispatchRefusalIsUnavailable(
+                  store.get(row.id) ?? row,
+                  message(e),
+                )
+              ) {
+                return;
+              }
               s.errors.push(
                 `delegation #${row.id}: reissue dispatch failed`,
               );

@@ -14,7 +14,11 @@
  */
 import { OrchestratorError } from "./errors.js";
 import { mergeDispatchInstructions } from "./instructions.js";
-import { pickRoute, type PolicyLoad } from "./policy.js";
+import {
+  BUILTIN_UNAVAILABLE_PATTERNS,
+  pickRoute,
+  type PolicyLoad,
+} from "./policy.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
 import { roleForLevel } from "./roles.js";
@@ -210,7 +214,34 @@ export async function runDelegate(
 
   // Steps 3–7 — shared with the watchdog's reissue (§5.4): the same
   // function dispatches, attaches, finalizes and reports.
-  const res = await dispatchToRoute(row, { instructions: params.instructions }, deps);
+  let res: DispatchStepsResult;
+  try {
+    res = await dispatchToRoute(row, { instructions: params.instructions }, deps);
+  } catch (e) {
+    // §5.3 rev 19: a synchronous refusal naming a removed model puts the
+    // ROUTE on hold so the next dispatch skips it (the reissue path holds
+    // and continues the chain from the watchdog).
+    if ((e as { code?: string }).code === "dispatch-failed") {
+      const patterns = [
+        ...BUILTIN_UNAVAILABLE_PATTERNS,
+        ...(route.unavailablePatterns ?? []),
+      ];
+      const text = message(e);
+      if (patterns.some((p) => text.toLowerCase().includes(p.toLowerCase()))) {
+        store.hold(
+          routeName,
+          Date.now() + 15 * 60 * 1000,
+          `маршрут недоступен: ${text.slice(0, 180)}`,
+        );
+        throw new OrchestratorError(
+          "dispatch-failed",
+          `${text} — маршрут ${routeName} отмечен недоступным на 15 минут`,
+          e instanceof OrchestratorError ? e.hint : undefined,
+        );
+      }
+    }
+    throw e;
+  }
 
   return {
     ok: true,

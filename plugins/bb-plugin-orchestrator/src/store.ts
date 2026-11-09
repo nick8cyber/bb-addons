@@ -535,7 +535,7 @@ export class DelegationStore {
       .run(JSON.stringify(kept), Date.now(), id);
   }
 
-  /** Quota groups currently on hold (`route_holds.until` in the future). */
+  /** Quota groups and route names currently on hold (`route_holds.until` in the future). */
   heldGroups(now: number): Set<string> {
     const rows = this.db
       .prepare(`SELECT quota_group FROM route_holds WHERE until > ?`)
