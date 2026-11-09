@@ -188,6 +188,17 @@ test("instructions prints the generated rule", async () => {
   assert.match(res.stdout, /orchestrator-coordinator/);
 });
 
+test("instructions without a valid policy points at orchestrator-setup", async () => {
+  const host = await hostWith({ policy: "" });
+  const res = await host.harness.runCli(["instructions", "--json"]);
+  assert.equal(res.exitCode, 1);
+  const body = JSON.parse(res.stdout) as {
+    error: { code: string; hint?: string };
+  };
+  assert.equal(body.error.code, "policy-invalid");
+  assert.match(body.error.hint ?? "", /orchestrator-setup/);
+});
+
 test("reconcile runs a pass and reports counters", async () => {
   const host = await hostWith();
   const res = await host.harness.runCli(["reconcile"]);

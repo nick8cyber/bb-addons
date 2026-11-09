@@ -427,6 +427,9 @@ export function createWatchdog(deps: WatchdogDeps) {
     outcome: "stalled" | "quota",
     detail: string,
   ) => {
+    // §7: the outcome reason outlives the stop retry — the reissue report
+    // needs it after `watchdog-stop` is already cleared.
+    if (detail) store.addSetupError(row.id, "outcome-detail", detail);
     const outcomeText =
       outcome === "stalled"
         ? "исполнитель завис"
@@ -848,7 +851,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       row,
       `исполнитель ждёт решения: задача ${row.task_key}, маршрут ${row.route}, ` +
         `тред ${row.thread_id} — ${describeInteraction(interaction)}. ` +
-        `Реши: bb thread interactions approve|grant|answer|respond ${id} ${row.thread_id}`,
+        `Реши: bb thread interactions approve|deny|grant|answer|respond ${id} ${row.thread_id}`,
     );
   };
 
@@ -943,7 +946,9 @@ export function createWatchdog(deps: WatchdogDeps) {
     const current = store.get(row.id) ?? row;
     if (hasSetupError(current, "retry-exhausted")) return;
     const last =
-      store.findSetupError(current, "watchdog-stop")?.message ?? "—";
+      store.findSetupError(current, "retry-last-error")?.message ??
+      store.findSetupError(current, "watchdog-stop")?.message ??
+      "—";
     store.addSetupError(row.id, "retry-exhausted", last);
     await report(
       row,
@@ -954,9 +959,19 @@ export function createWatchdog(deps: WatchdogDeps) {
     );
   };
 
-  /** §7 retry limit shared by the reconcile paths. */
-  const trackRetry = async (row: DelegationRow, action: string) => {
+  /**
+   * §7 retry limit shared by the reconcile paths. Every failed retry also
+   * refreshes `retry-last-error` — the exhaustion message quotes the error
+   * of the action being retried, whatever it is (cleared by `resetRetry`).
+   */
+  const trackRetry = async (
+    row: DelegationRow,
+    action: string,
+    lastError: string,
+  ) => {
     store.bumpRetry(row.id);
+    store.clearSetupError(row.id, "retry-last-error");
+    store.addSetupError(row.id, "retry-last-error", lastError);
     const fresh = store.get(row.id) ?? row;
     if (fresh.retry_count >= RETRY_LIMIT) await retryExhausted(fresh, action);
   };
@@ -993,7 +1008,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         );
       } catch (e) {
         if (row.reissue_of != null) {
-          await trackRetry(row, "доведение перевыпуска");
+          await trackRetry(row, "доведение перевыпуска", message(e));
         }
         throw new OrchestratorError("bb-cli-failed", message(e));
       }
@@ -1027,7 +1042,7 @@ export function createWatchdog(deps: WatchdogDeps) {
             } else {
               // `dispatch-unknown` leaves the row `dispatching`; the
               // §7 limit bounds how long the next passes may retry.
-              await trackRetry(row, "доведение перевыпуска");
+              await trackRetry(row, "доведение перевыпуска", message(e));
             }
           }
           return;
@@ -1125,6 +1140,8 @@ export function createWatchdog(deps: WatchdogDeps) {
       summary.scanned++;
       try {
         if (await confirmStop(row)) {
+          const detail =
+            store.findSetupError(row, "outcome-detail")?.message ?? "";
           store.clearSetupError(row.id, "watchdog-stop");
           store.clearSetupError(row.id, "watchdog-stop-reported");
           store.resetRetry(row.id);
@@ -1132,10 +1149,16 @@ export function createWatchdog(deps: WatchdogDeps) {
           await outcomeAndMaybeReissue(
             cur,
             cur.status as "stalled" | "quota",
-            store.findSetupError(cur, "watchdog-stop")?.message ?? "",
+            detail,
           );
         } else {
-          await trackRetry(row, "остановка исполнителя");
+          const fresh = store.get(row.id) ?? row;
+          await trackRetry(
+            fresh,
+            "остановка исполнителя",
+            store.findSetupError(fresh, "watchdog-stop")?.message ??
+              "stop not confirmed",
+          );
         }
       } catch (e) {
         summary.errors.push(`delegation #${row.id}: ${message(e)}`);

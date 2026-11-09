@@ -1195,11 +1195,13 @@ test("relink + finalize resets retry_count (Н4 оговорка)", async () => 
   );
   await h.wd.reconcile(); // lookup fails → retry_count = 1
   assert.equal(h.store.get(row2.id)!.retry_count, 1);
+  assert.match(h.store.get(row2.id)!.setup_errors, /retry-last-error/);
   failLookup = false;
   await h.wd.reconcile(); // relink + finalize → resolved
   const fresh = h.store.get(row2.id)!;
   assert.equal(fresh.status, "running");
   assert.equal(fresh.retry_count, 0);
+  assert.doesNotMatch(fresh.setup_errors, /retry-last-error/);
 });
 
 test("setup_errors never duplicates the same step+message", async () => {
@@ -1293,5 +1295,69 @@ test("findTaskThreadId: dated-but-old entries never win the fallback (Н7)", asy
       T0,
     ),
     "thr_fresh",
+  );
+});
+
+// ── Доработка по ревью PLUG-148 ────────────────────────────────────────
+
+test("retry-exhausted on доведение перевыпуска quotes that action's error", async () => {
+  const h = makeHarness({
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks threads"))
+        return { exitCode: 1, stdout: "", stderr: "tasks api down" };
+      return undefined;
+    },
+  });
+  const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.db.prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`).run(
+    T0 - 6 * 60_000,
+    row2.id,
+  );
+  for (let i = 0; i < 10; i++) await h.wd.reconcile();
+  const exhausted = h.sends.filter((s) =>
+    JSON.stringify(s.input).includes("исчерпан предел повторов"),
+  );
+  assert.equal(exhausted.length, 1);
+  const msg = JSON.stringify(exhausted[0]!.input);
+  assert.match(msg, /доведение перевыпуска/);
+  assert.match(msg, /tasks api down/); // the action's own last error, not "—"
+});
+
+test("unconfirmed stop on quota: the reissue report keeps the quota reason", async () => {
+  const h = makeHarness({ stopFails: 1 });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "provider/error", T0, { message: "insufficient credits" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  const quota = h.store.get(row.id)!;
+  assert.equal(quota.status, "quota");
+  assert.match(quota.setup_errors, /watchdog-stop/);
+  assert.match(quota.setup_errors, /outcome-detail/);
+
+  await h.wd.reconcile(); // the second stop confirms → the §5.4 decision
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const msg = JSON.stringify(h.sends.at(-1)!.input);
+  assert.match(msg, /insufficient credits/);
+  assert.match(msg, /перевыпущено на simple-alt/);
+});
+
+test("approval message names the deny command too (§5.3 rev 17)", async () => {
+  const h = makeHarness();
+  h.insertActive({ threadId: "thr_e1" });
+  await h.wd.onInteractionPending(dto("thr_e1", "active"), {
+    id: "int_9",
+    payload: { kind: "approval", subject: { command: "rm -rf /tmp/x" } },
+  });
+  assert.match(
+    JSON.stringify(h.sends[0]!.input),
+    /interactions approve\|deny\|grant\|answer\|respond int_9 thr_e1/,
   );
 });

@@ -471,3 +471,14 @@ test("a role row beats the fallback markers in both directions", () => {
   assert.equal(orch.tools.length, 3);
   assert.ok(orch.instructions!.includes("RULE"));
 });
+
+test("role instructions carry no site process rules (PLUG-148)", () => {
+  for (const role of Object.values(ROLES)) {
+    assert.doesNotMatch(role.instructions, /push/i, role.id);
+    assert.doesNotMatch(role.instructions, /in_review/i, role.id);
+    assert.doesNotMatch(role.instructions, /--author/, role.id);
+  }
+  // the executor text points at the task's own contract instead
+  assert.match(ROLES.executor.instructions, /Работа с git/);
+  assert.match(ROLES.executor.instructions, /контракту из описания задачи/);
+});

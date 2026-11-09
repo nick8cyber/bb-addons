@@ -413,8 +413,12 @@ export class DelegationStore {
       .run(Date.now(), id);
   }
 
-  /** §7 retry limit: the action finally succeeded — reset the counter. */
+  /**
+   * §7 retry limit: the action finally succeeded — reset the counter and
+   * drop the remembered `retry-last-error` step alongside it.
+   */
   resetRetry(id: number): void {
+    this.clearSetupError(id, "retry-last-error");
     this.db
       .prepare(
         `UPDATE delegations SET retry_count = 0, updated_at = ? WHERE id = ?`,

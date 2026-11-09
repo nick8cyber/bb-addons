@@ -1,8 +1,7 @@
 # bb-plugin-orchestrator
 
 Policy-driven delegation of `bb tasks` to executor threads (spec:
-`docs/specs/orchestrator.md`, ADR-0015). MVP scope — thread roles arrive
-in a later stage.
+`docs/specs/orchestrator.md`, ADR-0015).
 
 ## What it does
 
@@ -17,7 +16,7 @@ in a later stage.
   `mode=bypass` for `permissionMode=full` presets, marks `running`, and
   comments «Раздано» on the task.
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
-  reach only coordinator threads (no parent + no executor markers, §3);
+  reach only threads whose role may delegate (`delegates`, §13);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).
 - **Watchdog** (background service, §5): first-response window
   (`firstResponseSeconds`) → `stalled` + stop; quota detection
@@ -34,24 +33,61 @@ in a later stage.
   a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `policy show|validate`,
   `instructions`, `reconcile`.
-- **Coordinator skills**: `orchestrator-coordinator` (full coordinator
-  playbook, §3) and `orchestrator-setup` (§2.1 setup walkthrough) ship in
-  `skills/` and are selected for coordinator threads — setup always,
-  coordinator only when `injectInstructions` is on.
-- **`gitInstructions`** setting (§2.2, multiline, ≤ 1500 chars): a
-  «Работа с git» section prepended to every dispatch's `--instructions`,
-  reissues included. Empty disables the section; over-limit is refused by
-  the setting schema and flags `needs-configuration` if already stored.
-- **`injectInstructions`** setting (default on): off silences every
-  plugin-generated text; tools and `orchestrator-setup` stay.
+
+## Роли
+
+Three built-in roles (§13.1): `orchestrator` (the default, the only one
+with `delegates: true`), `executor`, `auditor`. A role is its instruction
+text plus the plugin tools and skills the thread may use.
+
+- **Picker**: the new-chat window gets a «Роль» dropdown
+  (`composer.customize`, new-thread area); the current pick is stored per
+  project in `pending_roles`.
+- **Decision**: the `message.dispatch` hook decides the role once, on the
+  thread's first message, and writes it to `thread_roles` — the source of
+  truth (`pluginMetadata.role` is display-only). Threads the hook never
+  saw fall back to the §3 criterion: no parent and no executor markers →
+  coordinator.
+- **Limitations** (§13.2 п.5, §13.3): the plugin grants and withholds only
+  its own tools — provider built-ins (file edits, shell) stay governed by
+  the preset's permission mode. The role's instruction reaches the agent
+  only if the provider delivers BB instructions; on a provider that does
+  not, the role carries no text (agy pending PLUG-139; `acp-devin`
+  restores instructions after compaction via `provider-devin`).
+
+## Настройка
+
+No bundled model sets — setup is a walkthrough the agent runs with the
+user via the `orchestrator-setup` skill (§2.1): inventory the providers,
+map presets onto levels and fallback chains, write the policy, validate.
+
+- `policy` (multiline JSON, §2) — levels, route chains, limits, quota
+  groups. Empty or invalid → `needs-configuration`, `delegate` refuses.
+- `gitInstructions` (§2.2, ≤ 1500 chars) — the «Работа с git» section
+  prepended to every dispatch's `--instructions`; empty disables it.
+- `injectInstructions` (default on) — off silences every plugin-generated
+  text; tools and `orchestrator-setup` stay.
+- `needs-configuration` clears only on plugin reload (SDK V1): after
+  fixing a setting run `bb plugin reload orchestrator`.
+
+## Переход с ручной раздачи
+
+Per §8: while manual dispatch instructions are still in place, keep
+`injectInstructions = false` so the plugin's rule does not duplicate
+them. The switch itself is a separate coordinator step after acceptance:
+own policy via `orchestrator-setup`, `injectInstructions = true`, manual
+dispatch instructions off; an external watchdog may stay as a safety net
+until switched off on purpose. Plugin dispatches never need the external
+watchdog — it would risk a double reissue.
 
 ## Notes
 
-- `needs-configuration` clears only on plugin reload (SDK V1): after fixing
-  `policy`, run `bb plugin reload orchestrator` to re-check.
 - Warnings about missing presets appear in the log, `policy show`, and
   `policy validate`; the check runs at validate/first delegate/in the
   background — never synchronously at plugin load.
+- **Coordinator skills**: `orchestrator-coordinator` (full coordinator
+  playbook, §3) and `orchestrator-setup` (§2.1) ship in `skills/` —
+  setup always, coordinator only when `injectInstructions` is on.
 
 ## Development
 

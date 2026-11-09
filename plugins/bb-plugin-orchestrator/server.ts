@@ -905,7 +905,7 @@ export async function createPlugin(
             throw new OrchestratorError(
               "policy-invalid",
               "cannot generate the routing rule without a valid policy",
-              "see `bb orchestrator policy validate`",
+              "set it up via the `orchestrator-setup` skill (§2.1), then `bb orchestrator policy validate`",
             );
           }
           const text = generateRoutingRule(policyLoad.policy);

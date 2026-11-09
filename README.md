@@ -81,6 +81,16 @@ The README also documents a real trap worth reading before writing any provider
 bridge: how a refused `write_to_file` argument silently costs you a whole run —
 [plugins/bb-plugin-provider-agy/README.md](plugins/bb-plugin-provider-agy/README.md).
 
+### `provider-devin` — Devin (SWE-2)
+
+Runs bb threads on Devin's SWE-2 as a native `acp-devin` provider: an ACP
+bridge with a `devin` dialect, plus hooks that return bb thread rules after
+compaction, hide executor threads and pin them to the coordinator. Requires
+the `devin` CLI and its hook set installed.
+
+Details in
+[plugins/bb-plugin-provider-devin/README.md](plugins/bb-plugin-provider-devin/README.md).
+
 ### `pi-gateways`
 
 Offers the free models of **OpenCode Zen** and the **Kilo Code gateway** to the
@@ -239,6 +249,18 @@ attachments come from the tasks plugin's own RPC.
 It never mutates tasks — no mutation RPC calls, SQLite opened read-only,
 no kanban drag. Details in
 [plugins/bb-plugin-tasks-pro/README.md](plugins/bb-plugin-tasks-pro/README.md).
+
+### `orchestrator`
+
+Policy-driven delegation of `bb tasks` to executor threads: one `delegate`
+call dispatches the task under a routing policy, wires the executor as a
+hidden child with parent notifications, and a watchdog tracks the first
+response, quota holds and auto-reissue down the level's route chain. Thread
+roles (`orchestrator`, `executor`, `auditor`) decide which instructions and
+plugin tools each thread gets.
+
+Details in
+[plugins/bb-plugin-orchestrator/README.md](plugins/bb-plugin-orchestrator/README.md).
 
 ## Themes
 
