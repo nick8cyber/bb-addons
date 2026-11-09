@@ -2,7 +2,7 @@
 title: Orchestrator — раздача работы исполнителям как код
 status: draft
 updated: 2026-11-08
-revision: 16 (роль координатора по запасному критерию)
+revision: 17 (финальная проверка: команда отказа в запросе прав)
 ---
 
 # Orchestrator
@@ -162,7 +162,7 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 | `cancelled` | `thread.idle` вместе с событием потока `system/thread/interrupted` с причиной `manual-stop` (остановил пользователь или агент), либо тред архивирован или удалён (`bb.events.on` `thread.archived`/`thread.deleted`, поля DTO), и запись не была переведена сторожем в `stalled`/`quota` | статус `cancelled`, без перевыпуска, комментарий в задачу |
 | `interrupted` | `system/thread/interrupted` с любой причиной, кроме `manual-stop` (перезапуск демона `host-daemon-restarted`, простой провайдера `provider-turn-idle` и т.п.) | не отмена. Первый раз: исполнителю одно сообщение `[orchestrator] ход прерван (<причина>), продолжай задачу`, статус остаётся `running` (`resume_count += 1`), координатору — уведомление. После «продолжай» новый ход должен начаться за `firstResponseSeconds`: не начался (сообщение не доставлено, тред в `idle` без нового хода и с пустой очередью) — как повторное прерывание. Повторно — как `stalled` (§5.4) |
 | `failed` | `thread.failed` / `turn.failed` без признаков квоты | статус `failed`, сообщение координатору с текстом ошибки |
-| `approval` | `interaction.pending` у исполнителя | статус не меняется; сообщение координатору: какой запрос и команда для решения (`bb thread interactions approve\|grant\|answer\|respond`). Не чаще раза в 10 минут — по `last_approval_notified_at` |
+| `approval` | `interaction.pending` у исполнителя | статус не меняется; сообщение координатору: какой запрос и команда для решения (`bb thread interactions approve\|deny\|grant\|answer\|respond`). Не чаще раза в 10 минут — по `last_approval_notified_at` |
 | `stalled` | §5.1 | статус, стоп, затем §5.4 |
 | `quota` | §5.2 | статус, стоп, затем §5.4 |
 | `timeout` | дольше `maxRunSeconds` | одно сообщение координатору (`timeout_notified_at`); не останавливать |
