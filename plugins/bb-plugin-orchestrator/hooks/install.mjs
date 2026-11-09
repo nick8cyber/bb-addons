@@ -24,7 +24,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -40,6 +40,7 @@ const multi = (n) => {
 };
 const dryRun = args.includes("--dry-run");
 const force = args.includes("--force");
+const selfTest = args.includes("--self-test");
 const hooksDir = resolve(
   flag("--hooks-dir") ??
     join(homedir(), ".bb", "plugins", "orchestrator", "git-hooks"),
@@ -51,7 +52,7 @@ const SKIP = new Set([
   "node_modules", ".cache", ".local", ".npm", ".cargo", ".rustup",
   "snap", ".vscode", ".config/google-chrome",
 ]);
-const MAX_DEPTH = 4;
+const MAX_DEPTH = 8;
 
 function* findRepos(root, depth = 0) {
   if (depth > MAX_DEPTH) return;
@@ -66,7 +67,10 @@ function* findRepos(root, depth = 0) {
     return; // do not descend into a repo's own tree
   }
   for (const e of entries) {
-    if (!e.isDirectory() || e.name.startsWith(".") || SKIP.has(e.name)) continue;
+    if (!e.isDirectory() || SKIP.has(e.name)) continue;
+    // §7 опись: thread worktrees live under ~/.bb/plugins/environment-
+    // git-worktree/... — hidden dirs are skipped EXCEPT .bb itself.
+    if (e.name.startsWith(".") && e.name !== ".bb") continue;
     yield* findRepos(join(root, e.name), depth + 1);
   }
 }
@@ -119,11 +123,69 @@ const report = [
   ...plain.map((r) => `  - ${r}`),
   `исключения (автопуш служебных): ${exclusions.length}`,
   ...exclusions.map((r) => `  - ${r}`),
+  "",
+  "проекты с excluded:true в настройке release: их репозитории хук не трогает —",
+  "добавьте пути через --exclude <path> (или запишите в exclusions вручную).",
 ].join("\n");
 
 if (dryRun) {
   console.log(report);
   process.exit(0);
+}
+
+// §5/§7 self-test: build each repository kind in a temp dir and prove a
+// local pre-push hook still fires through the shared one (with a valid
+// release token on a matching sha).
+if (selfTest) {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { spawnSync } = await import("node:child_process");
+  const hookPath = join(hooksDir, "pre-push");
+  if (!existsSync(hookPath)) {
+    mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
+    copyFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "pre-push"),
+      hookPath,
+    );
+    execFileSync("chmod", ["755", hookPath]);
+  }
+  const SHA = "a".repeat(40);
+  const LINE = `refs/heads/x ${SHA} refs/heads/x ${"0".repeat(40)}\n`;
+  const tmp = mkdtempSync(join(tmpdir(), "hook-selftest-"));
+  const kinds = [
+    { name: "plain .git/hooks", mk: (r) => r },
+    {
+      name: "worktree (.git file)",
+      mk: (r) => {
+        execFileSync("git", ["-C", r, "worktree", "add", join(tmp, "wt")], { stdio: "ignore" });
+        return join(tmp, "wt");
+      },
+    },
+  ];
+  let failed = 0;
+  for (const kind of kinds) {
+    const base = join(tmp, kind.name.replace(/\W+/g, "-"));
+    execFileSync("git", ["init", base], { stdio: "ignore" });
+    const repo = kind.mk(base);
+    // local hook writes a marker next to the repo when it fires
+    const commonRaw = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
+    const common = isAbsolute(commonRaw) ? commonRaw : join(repo, commonRaw);
+    const lh = join(common, "hooks", "pre-push");
+    writeFileSync(lh, '#!/bin/sh\n[ -n "$ORCH_MARK" ] && echo hit > "$ORCH_MARK"\nexit 0\n');
+    execFileSync("chmod", ["+x", lh]);
+    writeFileSync(join(hooksDir, "push-token.json"),
+      JSON.stringify({ token: "t", sha: SHA, expiresAt: Date.now() + 60000 }));
+    const mark = join(tmp, `mark-${kind.name.replace(/\W+/g, "-")}`);
+    const r = spawnSync("node", [hookPath], {
+      cwd: repo, input: LINE,
+      env: { ...process.env, GIT_DIR: execFileSync("git", ["-C", repo, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim(), ORCH_MARK: mark },
+      encoding: "utf8",
+    });
+    const ok = r.status === 0 && existsSync(mark);
+    console.log(`${ok ? "OK " : "FAIL"}  local hook fires: ${kind.name}`);
+    if (!ok) failed++;
+  }
+  process.exit(failed ? 1 : 0);
 }
 
 // ── Install ────────────────────────────────────────────────────────────

@@ -108,7 +108,8 @@ export const DEFAULT_GIT_INSTRUCTIONS = `Работа с git:
 - Работай только в своей рабочей копии и своей ветке; не переключай чужие ветки и не трогай основной чекаут.
 - Коммить под автором из конфига репозитория: без --author и git -c user.*; автор не задан — не коммить, напиши в отчёте.
 - Без push и PR: локальный коммит, в отчёте ветка и SHA.
-- Не запускай git reset --hard, git clean, git checkout -- и другие команды, теряющие чужую работу.`;
+- Не запускай git reset --hard, git clean, git checkout -- и другие команды, теряющие чужую работу.
+- Обход гейтов запрещён: никаких --no-verify, -c core.hooksPath=…, --author и записи core.hooksPath через git config (в любой области).`;
 
 /**
  * Validation error for `gitInstructions`, or null when the value is usable.

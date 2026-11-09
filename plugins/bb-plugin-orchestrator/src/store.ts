@@ -802,7 +802,8 @@ export class DelegationStore {
       this.db
         .prepare(
           `SELECT 1 AS x FROM releases
-           WHERE head_sha = ? OR published_sha = ? LIMIT 1`,
+           WHERE status = 'published'
+             AND (head_sha = ? OR published_sha = ?) LIMIT 1`,
         )
         .get(sha, sha) !== undefined
     );

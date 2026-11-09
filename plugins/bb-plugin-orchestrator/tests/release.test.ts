@@ -511,3 +511,67 @@ test("push token file: sha + expiry written 0600", () => {
   assert.equal(data.sha, "abc123");
   assert.ok(data.expiresAt > Date.now());
 });
+
+// ── review findings 1–9 ────────────────────────────────────────────────
+
+test("f1: allow does NOT suppress categories 1-2", async () => {
+  const cmd: CmdRunner = { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) };
+  const findings = await machineScan(cmd, {
+    repoPath: "/r", baseSha: "a".repeat(40), headSha: "b".repeat(40),
+    commits: [],
+    added: [
+      { file: "docs/PLAN.md", line: 1, text: "vless://srv/x y@gmail.com" },
+      { file: "docs/PLAN.md", line: 2, text: "thr_abc1234567" },
+    ],
+    leaks: { machine: "block", bbIds: "warn", allow: ["docs/"] },
+  });
+  assert.ok(findings.some((f) => f.category === 1));
+  assert.ok(findings.some((f) => f.category === 2 && f.rule === "personal-email"));
+  assert.ok(!findings.some((f) => f.category === 4));
+});
+
+test("f2: maskSecrets applied to fix and file fields", async () => {
+  const { repo } = makeRepo();
+  const { deps, sent, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"REJECT","findings":[{"file":"f ghp_abcdef1234567890","problem":"p sk-abcdefghijklmnop1234","fix":"use ghp_abcdef1234567890"}]}',
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(store.latestDelegationByTaskAndLevel("PLUG-1","release-audit")!.id, "done");
+  await pumpReleases(deps);
+  assert.ok(sent.length && !sent.some((m) => m.includes("ghp_abcdef1234567890") || m.includes("sk-abcdefghijklmnop1234")));
+});
+
+test("f3: gitInstructions + roles forbid bypass flags", async () => {
+  const { DEFAULT_GIT_INSTRUCTIONS } = await import("../src/instructions.js");
+  assert.match(DEFAULT_GIT_INSTRUCTIONS, /--no-verify/);
+  assert.match(DEFAULT_GIT_INSTRUCTIONS, /core\.hooksPath/);
+
+});
+
+test("f8: shaWasReleased counts only published releases", () => {
+  const { store } = makeDeps("/tmp/x");
+  const r = store.insertRelease({
+    taskKey: "PLUG-9", projectId: "p", coordinatorThreadId: "t",
+    repoPath: "/r", branch: "b", targetAction: "push", targetBranch: "main",
+  });
+  store.updateRelease(r.id, { headSha: "abc", status: "rejected" });
+  assert.equal(store.shaWasReleased("abc"), false);
+  store.updateRelease(r.id, { status: "published", publishedSha: "abc" });
+  assert.equal(store.shaWasReleased("abc"), true);
+});
+
+test("f9: task-key template flags PLUG-123, not UTF-8", async () => {
+  const cmd: CmdRunner = { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) };
+  const findings = await machineScan(cmd, {
+    repoPath: "/r", baseSha: "a".repeat(40), headSha: "b".repeat(40),
+    commits: [],
+    added: [
+      { file: "a.md", line: 1, text: "see PLUG-123" },
+      { file: "b.md", line: 1, text: 'charset="UTF-8"' },
+    ],
+    leaks: { machine: "block", bbIds: "warn", allow: [] },
+  });
+  const keys = findings.filter((f) => f.rule === "task-key");
+  assert.equal(keys.length, 1);
+  assert.equal(keys[0]!.file, "a.md");
+});

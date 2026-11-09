@@ -81,3 +81,15 @@ test("hook: exclusions file skips the gate", () => {
   const r = runHook(repo, hooksDir, LINE + "\n");
   assert.equal(r.status, 0);
 });
+
+test("f4/f6: installer inventory sees .bb worktrees, --self-test ok", () => {
+  const root = mkdtempSync(join(tmpdir(), "inv-"));
+  const wtRoot = join(root, ".bb", "plugins", "environment-git-worktree", "host-data", "worktrees", "x");
+  mkdirSync(wtRoot, { recursive: true });
+  execFileSync("git", ["init", wtRoot]);
+  const out = execFileSync("node", ["hooks/install.mjs", "--dry-run", "--repos-root", root], {
+    cwd: new URL("..", import.meta.url).pathname, encoding: "utf8",
+  });
+  assert.match(out, new RegExp(wtRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(out, /excluded:true/); // f5 hint
+});

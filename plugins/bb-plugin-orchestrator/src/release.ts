@@ -867,7 +867,6 @@ export async function runRelease(
       status: "failed",
       error: message(e).slice(0, 400),
     });
-    deps.store.updateRelease(release.id, {});
     throw e;
   }
 }
@@ -946,7 +945,7 @@ async function writeAuditPacket(
   ]
     .filter((l) => l !== null)
     .join("\n");
-  appendFileSync(path, body, "utf8");
+  appendFileSync(path, body, { encoding: "utf8", mode: 0o600 });
   return path;
 }
 
@@ -988,8 +987,10 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
             deps,
             row,
             `выкладка ${row.task_key} остановлена: проверяющий агент ` +
-              `завершился исходом ${delegation.status} — цепочка ` +
-              `${AUDIT_LEVEL} исчерпана, выкладки нет`,
+              `завершился исходом ${delegation.status} — ` +
+              (delegation.status === "cancelled"
+                ? "аудит отменён, выкладки нет"
+                : `цепочка ${AUDIT_LEVEL} исчерпана, выкладки нет`),
           );
           continue;
         }
@@ -1009,9 +1010,9 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
             .slice(0, 15)
             .map(
               (f) =>
-                `- ${f.file ?? "?"}${f.line != null ? `:${f.line}` : ""} ` +
-                `${f.category ?? ""}: ${maskSecrets(f.problem ?? "")}` +
-                (f.fix ? ` → ${f.fix}` : ""),
+                `- ${maskSecrets(f.file ?? "?")}${f.line != null ? `:${f.line}` : ""} ` +
+                `${maskSecrets(f.category ?? "")}: ${maskSecrets(f.problem ?? "")}` +
+                (f.fix ? ` → ${maskSecrets(f.fix)}` : ""),
             )
             .join("\n");
           await report(
@@ -1232,6 +1233,7 @@ async function postCheck(
   pushedSha: string,
   prUrl: string | null,
 ): Promise<void> {
+  row = deps.store.getRelease(row.id) ?? row;
   const repo = row.repo_path;
   try {
     await git(deps, repo, ["fetch", "origin"], { timeoutMs: 180_000 });
@@ -1330,7 +1332,7 @@ async function postCheck(
       const blockers = findings.filter((f) => f.severity === "block");
       if (blockers.length) {
         messages.push(
-          `в удалённом репозитории находки категорий 1–2:\n` +
+          `повторный скан удалённого диапазона нашёл находки:\n` +
             blockers.slice(0, 10).map((f) => `- ${formatFinding(f)}`).join("\n"),
         );
       }

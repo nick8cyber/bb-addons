@@ -141,7 +141,22 @@ const BB_ID_RULES: { rule: string; re: RegExp }[] = [
   { rule: "bb-project-id", re: /\bproj_[a-z0-9]{6,}\b/i },
   { rule: "bb-env-id", re: /\benv_[a-z0-9]{6,}\b/i },
   { rule: "getbb-host", re: /\b[a-z0-9-]+\.getbb\.app\b/i },
+  {
+    rule: "task-key",
+    // §4: private tracker keys like PLUG-156; encodings are not keys.
+    re: /\b[A-Z][A-Z0-9]{1,9}-\d+\b(?!\s*(?:charset|encoding))/,
+  },
 ];
+
+/** Common false positives of the task-key template: encodings and
+ * version-like tokens that are legitimate in code and docs. */
+const TASK_KEY_ALLOW = new Set([
+  "UTF-8", "UTF-16", "UTF-32", "ISO-8859", "SHA-1", "SHA-256", "SHA-384",
+  "SHA-512", "MD-5", "DES-3", "AES-128", "AES-192", "AES-256",
+]);
+
+const isTaskKeyToken = (token: string) =>
+  /^[A-Z][A-Z0-9]{1,9}-\d+$/.test(token) && !TASK_KEY_ALLOW.has(token);
 
 /** §4: the `BB-Thread:` trailer line in a commit message is contract, not
  * a leak — strip it before scanning commit bodies for category 4. */
@@ -167,7 +182,9 @@ function scanAddedLines(
     ? [...MACHINE_RULES, hostRule]
     : MACHINE_RULES;
   for (const { file, line, text } of added) {
-    if (isAllowed(file, leaks.allow)) continue;
+    // §4: `allow` places relax categories 3–4 only — secrets and author
+    // identity (categories 1–2) are checked everywhere, always block.
+    const allowed = isAllowed(file, leaks.allow);
     if (SECRET_FILE_RE.test(file)) {
       findings.push({
         category: 1,
@@ -199,6 +216,7 @@ function scanAddedLines(
       });
     }
     for (const rule of hits(text, machineRules)) {
+      if (allowed) continue;
       findings.push({
         category: 3,
         file,
@@ -209,6 +227,11 @@ function scanAddedLines(
       });
     }
     for (const rule of hits(text, BB_ID_RULES)) {
+      if (allowed) continue;
+      if (rule === "task-key") {
+        const tokens = text.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/g) ?? [];
+        if (!tokens.some(isTaskKeyToken)) continue;
+      }
       findings.push({
         category: 4,
         file,
@@ -286,6 +309,10 @@ function scanCommitMeta(
       });
     }
     for (const rule of hits(body, BB_ID_RULES)) {
+      if (rule === "task-key") {
+        const tokens = body.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/g) ?? [];
+        if (!tokens.some(isTaskKeyToken)) continue;
+      }
       findings.push({
         category: 4,
         file: null,
