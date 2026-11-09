@@ -11,7 +11,7 @@
 
 В ~/.config/devin/config.json (с резервной копией config.json.bak-hooks-<время>):
   - hooks: наши записи заменяются, ЧУЖИЕ хуки пользователя сохраняются
-      bb_subagents.py   PreToolUse(exec/write/edit/...) + PostToolUse(exec)
+      bb_subagents.py   PreToolUse(exec/write/edit/...) — защита конфигов и правил
       bb_instructions.py SessionStart/PostCompaction/PostToolUse/UserPromptSubmit
       no_blocking_wait.py PreToolUse(exec) — только если у пользователя есть
                         ~/.claude/hooks/no-blocking-wait.py (это правило его Claude)
@@ -46,7 +46,6 @@ def our_hooks():
     return {
         "PreToolUse": pre,
         "PostToolUse": [
-            {"matcher": "^exec$", "hooks": [cmd("bb_subagents.py", 120)]},
             {"matcher": "", "hooks": ins},
         ],
         "PostCompaction": [{"matcher": "", "hooks": ins}],

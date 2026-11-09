@@ -8,7 +8,7 @@
 |---|---|
 | `server.ts` | объявление провайдера `acp-devin`; бинарник — `~/.local/bin/devin`, иначе `/usr/local/bin/devin`, иначе `devin` из PATH |
 | `host.ts` + `src/vendor/acp-bridge.js` | ACP-мост из `@get-bb/plugin-sdk` (собирается `npm run vendor`) с диалектом `devin` и сохранением правил bb треда в `~/.local/state/bb-devin/instructions/<thr>.md` |
-| `devin-hooks/` | хуки Devin CLI: правила bb возвращаются после сжатия и при восстановлении сессии; треды-исполнители скрыты и привязаны к координатору; защита конфигов; запрет блокирующего ожидания (если он есть у Claude пользователя) |
+| `devin-hooks/` | хуки Devin CLI: правила bb возвращаются после сжатия и при восстановлении сессии; защита конфигов (~/.config/devin, ~/.claude, хуки); запрет блокирующего ожидания (если он есть у Claude пользователя). Раздача задач и привязка тредов — через плагин `orchestrator` (`bb orchestrator delegate`) |
 
 ## Установка у пользователя
 
@@ -22,6 +22,7 @@
 
 ```
 npm test                                   # диалект и сохранение правил
+python3 -I devin-hooks/bb_subagents.test.py # хук защиты конфигов (без spawn/dispatch)
 python3 -I devin-hooks/no_blocking_wait.test.py
 python3 -I devin-hooks/install.py --check  # что будет записано
 ```
