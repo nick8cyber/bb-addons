@@ -575,3 +575,44 @@ test("f9: task-key template flags PLUG-123, not UTF-8", async () => {
   assert.equal(keys.length, 1);
   assert.equal(keys[0]!.file, "a.md");
 });
+
+// ── N1: non-string verdict finding fields → rejected, not failed ──────
+
+test("N1: parseAuditVerdict coerces numeric/missing finding fields", () => {
+  const v = parseAuditVerdict(
+    '{"verdict":"REJECT","findings":[{"category":2,"file":123,"line":"x","problem":"leak","fix":42},{"problem":"g"}],"extra":true}',
+  );
+  assert.equal(v.verdict, "REJECT");
+  assert.equal(v.unparseable, false);
+  assert.equal(v.findings.length, 2);
+  const f = v.findings[0]!;
+  assert.strictEqual(f.category, "2");
+  assert.strictEqual(f.file, "123");
+  assert.equal(f.line, undefined); // "x" is not finite
+  assert.strictEqual(f.fix, "42");
+  // findings not an array → empty list, still parses
+  const v2 = parseAuditVerdict('{"verdict":"REJECT","findings":"oops"}');
+  assert.equal(v2.verdict, "REJECT");
+  assert.equal(v2.findings.length, 0);
+});
+
+test("N1: pump on non-string verdict fields → rejected, no exception", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict:
+      '{"verdict":"REJECT","findings":[{"category":2,"file":123,"line":"x","problem":"leak ghp_abcdef1234567890","fix":42}]}',
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.rejected, 1);
+  assert.equal(s.failed, 0);
+  assert.equal(store.releasesByStatuses(["rejected"]).length, 1);
+  assert.equal(store.releasesByStatuses(["failed"]).length, 0);
+  assert.ok(sent.some((m) => m.includes("REJECT")));
+  // still masked even through coercion
+  assert.ok(!sent.some((m) => m.includes("ghp_abcdef1234567890")));
+});
