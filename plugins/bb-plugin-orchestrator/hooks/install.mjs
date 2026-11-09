@@ -137,21 +137,25 @@ if (dryRun) {
 // local pre-push hook still fires through the shared one (with a valid
 // release token on a matching sha).
 if (selfTest) {
-  const { mkdtempSync } = await import("node:fs");
+  const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { spawnSync } = await import("node:child_process");
-  const hookPath = join(hooksDir, "pre-push");
-  if (!existsSync(hookPath)) {
-    mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
-    copyFileSync(
-      join(dirname(fileURLToPath(import.meta.url)), "pre-push"),
-      hookPath,
-    );
-    execFileSync("chmod", ["755", hookPath]);
-  }
+  const tmp = mkdtempSync(join(tmpdir(), "hook-selftest-"));
+  // Run against a TEMP copy of the hooks dir — the token file resolves
+  // relative to the hook's own directory, so the live push-token.json
+  // (possibly written by an in-flight release) is never touched.
+  const testHooksDir = join(tmp, "hooks");
+  mkdirSync(testHooksDir, { recursive: true });
+  const hookPath = join(testHooksDir, "pre-push");
+  copyFileSync(
+    existsSync(join(hooksDir, "pre-push"))
+      ? join(hooksDir, "pre-push")
+      : join(dirname(fileURLToPath(import.meta.url)), "pre-push"),
+    hookPath,
+  );
+  execFileSync("chmod", ["755", hookPath]);
   const SHA = "a".repeat(40);
   const LINE = `refs/heads/x ${SHA} refs/heads/x ${"0".repeat(40)}\n`;
-  const tmp = mkdtempSync(join(tmpdir(), "hook-selftest-"));
   const kinds = [
     { name: "plain .git/hooks", mk: (r) => r },
     {
@@ -173,7 +177,7 @@ if (selfTest) {
     const lh = join(common, "hooks", "pre-push");
     writeFileSync(lh, '#!/bin/sh\n[ -n "$ORCH_MARK" ] && echo hit > "$ORCH_MARK"\nexit 0\n');
     execFileSync("chmod", ["+x", lh]);
-    writeFileSync(join(hooksDir, "push-token.json"),
+    writeFileSync(join(testHooksDir, "push-token.json"),
       JSON.stringify({ token: "t", sha: SHA, expiresAt: Date.now() + 60000 }));
     const mark = join(tmp, `mark-${kind.name.replace(/\W+/g, "-")}`);
     const r = spawnSync("node", [hookPath], {
@@ -185,6 +189,7 @@ if (selfTest) {
     console.log(`${ok ? "OK " : "FAIL"}  local hook fires: ${kind.name}`);
     if (!ok) failed++;
   }
+  rmSync(tmp, { recursive: true, force: true });
   process.exit(failed ? 1 : 0);
 }
 

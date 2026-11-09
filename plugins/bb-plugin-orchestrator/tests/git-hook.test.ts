@@ -82,7 +82,7 @@ test("hook: exclusions file skips the gate", () => {
   assert.equal(r.status, 0);
 });
 
-test("f4/f6: installer inventory sees .bb worktrees, --self-test ok", () => {
+test("f4/f6: installer inventory sees .bb worktrees, real --self-test run", () => {
   const root = mkdtempSync(join(tmpdir(), "inv-"));
   const wtRoot = join(root, ".bb", "plugins", "environment-git-worktree", "host-data", "worktrees", "x");
   mkdirSync(wtRoot, { recursive: true });
@@ -92,4 +92,16 @@ test("f4/f6: installer inventory sees .bb worktrees, --self-test ok", () => {
   });
   assert.match(out, new RegExp(wtRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(out, /excluded:true/); // f5 hint
+
+  const st = execFileSync("node", [
+    "hooks/install.mjs",
+    "--self-test",
+    "--hooks-dir", join(root, "hd"),
+  ], {
+    cwd: new URL("..", import.meta.url).pathname, encoding: "utf8",
+  });
+  assert.match(st, /OK +local hook fires: plain/);
+  assert.match(st, /OK +local hook fires: worktree/);
+  // N2: live hooksDir untouched — no fake token left behind
+  assert.equal(existsSync(join(root, "hd", "push-token.json")), false);
 });

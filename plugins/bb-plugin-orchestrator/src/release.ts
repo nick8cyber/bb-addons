@@ -528,13 +528,19 @@ export function parseAuditVerdict(text: string): AuditVerdict {
   }
   const v = (parsed as { verdict?: unknown; findings?: unknown }) ?? {};
   if (v.verdict !== "APPROVE" && v.verdict !== "REJECT") return fail();
-  return {
-    verdict: v.verdict,
-    findings: Array.isArray(v.findings)
-      ? (v.findings as AuditVerdict["findings"])
-      : [],
-    unparseable: false,
-  };
+  // Findings come straight from the agent — coerce optional fields to
+  // their reported types so downstream code (maskSecrets, formatting)
+  // never crashes on e.g. a numeric category.
+  const findings = (
+    Array.isArray(v.findings) ? (v.findings as Record<string, unknown>[]) : []
+  ).map((f) => ({
+    category: f?.category == null ? undefined : String(f.category),
+    file: f?.file == null ? undefined : String(f.file),
+    line: Number.isFinite(Number(f?.line)) ? Number(f.line) : undefined,
+    problem: f?.problem == null ? undefined : String(f.problem),
+    fix: f?.fix == null ? undefined : String(f.fix),
+  }));
+  return { verdict: v.verdict, findings, unparseable: false };
 }
 
 /** The auditor's last message — `item/completed` agentMessage text. */
