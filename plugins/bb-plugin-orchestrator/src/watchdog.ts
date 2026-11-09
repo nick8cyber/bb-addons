@@ -40,8 +40,10 @@ const APPROVAL_NOTIFY_MS = 10 * 60 * 1000;
 const DISPATCH_GRACE_MS = 5 * 60 * 1000;
 const DEFAULT_FIRST_RESPONSE_SECONDS = 90;
 const DEFAULT_MAX_RUN_SECONDS = 7200;
-const EVENT_PAGE_SIZE = 500;
-const EVENT_MAX_PAGES = 20;
+/** §5.1 rev 18: the BB server rejects `events.list` pages over 100. */
+const EVENT_PAGE_SIZE = 100;
+/** Coverage kept from the 500×20 days: 100 pages × 100 events. */
+const EVENT_MAX_PAGES = 100;
 
 /**
  * §5.1 response events: `item/started` (except `userMessage`),
@@ -628,9 +630,13 @@ export function createWatchdog(deps: WatchdogDeps) {
     return false;
   };
 
-  /** Read the thread's events after `last_seq`, applying §5 to each. */
-  const processStream = async (row: DelegationRow) => {
-    if (!row.thread_id) return;
+  /**
+   * Read the thread's events after `last_seq`, applying §5 to each.
+   * Returns false when the journal could not be fully read — §5.1 rev 18:
+   * an unread journal is not silence, so no outcome may be decided on it.
+   */
+  const processStream = async (row: DelegationRow): Promise<boolean> => {
+    if (!row.thread_id) return true;
     let after = row.last_seq ?? 0;
     for (let page = 0; page < EVENT_MAX_PAGES; page++) {
       let events: WatchdogThreadEvent[];
@@ -645,25 +651,31 @@ export function createWatchdog(deps: WatchdogDeps) {
         log.warn?.(
           `orchestrator: events.list ${row.thread_id}: ${message(e)}`,
         );
-        return;
+        return false;
       }
-      if (events.length === 0) return;
+      if (events.length === 0) return true;
       for (const ev of events) {
         after = Math.max(after, ev.seq);
         const terminal = await applyStreamEvent(row.id, ev);
         store.advanceLastSeq(row.id, ev.seq);
-        if (terminal) return;
+        if (terminal) return true;
       }
-      if (events.length < EVENT_PAGE_SIZE) return;
+      if (events.length < EVENT_PAGE_SIZE) return true;
     }
+    // Page cap hit with a full last page — the journal may hold more.
+    return false;
   };
 
   /**
    * The done/cancelled gate (§5.3): an interrupt counts only when it came
    * after the latest turn start — either seen in the stream just now or
    * still sitting in the event log (plugin restart lost the in-memory flag).
+   * Returns null when the journal could not be read — §5.1 rev 18: an
+   * unreadable journal is "unknown", not "no interrupt".
    */
-  const recentInterrupt = async (row: DelegationRow): Promise<boolean> => {
+  const recentInterrupt = async (
+    row: DelegationRow,
+  ): Promise<boolean | null> => {
     if (interrupted.has(row.id)) return true;
     if (!row.thread_id) return false;
     try {
@@ -680,14 +692,16 @@ export function createWatchdog(deps: WatchdogDeps) {
           (row.turn_started_at == null || ev.createdAt >= row.turn_started_at),
       );
     } catch {
-      return false;
+      return null;
     }
   };
 
   const evaluateIdle = async (
     row: DelegationRow,
     thread: WatchdogThreadDto,
+    streamRead: boolean,
   ) => {
+    // Tombstones come from the DTO, not the journal — they decide alone.
     if (thread.deletedAt || thread.archivedAt) {
       await toCancelled(
         row,
@@ -695,7 +709,12 @@ export function createWatchdog(deps: WatchdogDeps) {
       );
       return;
     }
-    if (await recentInterrupt(row)) {
+    // §5.1 rev 18: done/cancelled/stalled all stand on the journal —
+    // an unread one is not silence; the next check re-reads it.
+    if (!streamRead) return;
+    const interruptedNow = await recentInterrupt(row);
+    if (interruptedNow === null) return; // interrupt lookup failed too
+    if (interruptedNow) {
       await toCancelled(row, "ход прерван (system/thread/interrupted)");
       return;
     }
@@ -761,10 +780,10 @@ export function createWatchdog(deps: WatchdogDeps) {
   const onThreadIdle = async (thread: WatchdogThreadDto) => {
     const row = store.byThreadId(thread.id);
     if (!row || !isActive(row.status)) return;
-    await processStream(row);
+    const streamRead = await processStream(row);
     const fresh = store.get(row.id);
     if (!fresh || fresh.status !== "running") return;
-    await evaluateIdle(fresh, thread);
+    await evaluateIdle(fresh, thread, streamRead);
   };
 
   const onThreadFailed = async (
@@ -773,9 +792,11 @@ export function createWatchdog(deps: WatchdogDeps) {
   ) => {
     const row = store.byThreadId(thread.id);
     if (!row || !isActive(row.status)) return;
-    await processStream(row);
+    const streamRead = await processStream(row);
     const fresh = store.get(row.id);
     if (!fresh || !isActive(fresh.status)) return;
+    // §5.2: the failed-vs-quota decision needs the turn's events read.
+    if (!streamRead) return;
     const text = error ?? lastErrorText.get(fresh.id) ?? "thread failed";
     const info = await routeInfo(fresh);
     if (matchesQuota(text, info.patterns)) {
@@ -796,9 +817,11 @@ export function createWatchdog(deps: WatchdogDeps) {
       return;
     }
     if (!isActive(row.status)) return;
-    await processStream(row);
+    const streamRead = await processStream(row);
     const fresh = store.get(row.id);
     if (!fresh || !isActive(fresh.status)) return;
+    // §5.2: the failed-vs-quota decision needs the turn's events read.
+    if (!streamRead) return;
     const text =
       lastErrorText.get(fresh.id) ??
       `turn failed${category ? ` (${category})` : ""}`;
@@ -887,7 +910,10 @@ export function createWatchdog(deps: WatchdogDeps) {
       ) {
         // §5.1 rev 13: drain the event log first — a response already
         // recorded after `last_seq` cancels the stalled decision.
-        await processStream(row);
+        // rev 18: an unreadable journal is not silence — no stalled
+        // decision (the resume window below included); the next
+        // check retries.
+        if (!(await processStream(row))) continue;
         const fresh = store.get(row.id);
         if (
           !fresh ||
@@ -1087,23 +1113,27 @@ export function createWatchdog(deps: WatchdogDeps) {
       s.cancelled++;
       return;
     }
-    await processStream(row);
+    const streamRead = await processStream(row);
     let fresh = store.get(row.id);
     if (!fresh || fresh.status !== "running") return;
-    // §7 "apply §5": derive the outcome from the current thread status.
-    if (thread.status === "idle") {
-      await evaluateIdle(fresh, thread);
-    } else if (thread.status === "error") {
-      const text = lastErrorText.get(fresh.id) ?? "thread failed";
-      const info = await routeInfo(fresh);
-      if (matchesQuota(text, info.patterns)) {
-        await toQuota(fresh, `thread.error: ${text.slice(0, 200)}`);
-      } else {
-        await toFailed(fresh, text);
+    // §7 "apply §5": derive the outcome from the current thread status —
+    // only on a fully read journal (§5.1 rev 18, §5.2); an unreadable
+    // one is not silence and the next pass re-reads it.
+    if (streamRead) {
+      if (thread.status === "idle") {
+        await evaluateIdle(fresh, thread, streamRead);
+      } else if (thread.status === "error") {
+        const text = lastErrorText.get(fresh.id) ?? "thread failed";
+        const info = await routeInfo(fresh);
+        if (matchesQuota(text, info.patterns)) {
+          await toQuota(fresh, `thread.error: ${text.slice(0, 200)}`);
+        } else {
+          await toFailed(fresh, text);
+        }
       }
+      fresh = store.get(row.id);
+      if (!fresh || fresh.status !== "running") return;
     }
-    fresh = store.get(row.id);
-    if (!fresh || fresh.status !== "running") return;
     // §7: repeat unfinished §4.4–4.6 steps (setup_errors + the bypass check).
     const retried = await deps.retrySetup(fresh);
     s.retriedSteps += retried.length;

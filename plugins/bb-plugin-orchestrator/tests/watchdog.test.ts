@@ -85,6 +85,8 @@ function makeHarness(
   const eventLog = new Map<string, WatchdogThreadEvent[]>();
   const threadDtos = new Map<string, WatchdogThreadDto>();
   const queues = new Map<string, unknown[]>();
+  /** §5.1 rev 18: threadIds whose journal reads must fail (server down). */
+  const eventsBlocked = new Set<string>();
   const threads = {
     get: async ({ threadId }: { threadId: string }) => {
       const dto = threadDtos.get(threadId);
@@ -99,6 +101,13 @@ function makeHarness(
         limit?: string;
         types?: readonly string[];
       }) => {
+        // The live BB server refuses pages over 100 (§5.1 rev 18).
+        if (Number(args.limit) > 100) {
+          throw new Error("Thread event limit cannot exceed 100");
+        }
+        if (eventsBlocked.has(args.threadId)) {
+          throw new Error("events.list unavailable (test)");
+        }
         let rows = (eventLog.get(args.threadId) ?? []).slice();
         if (args.types?.length) {
           rows = rows.filter((r) => args.types!.includes(r.type));
@@ -209,6 +218,7 @@ function makeHarness(
     eventLog,
     threadDtos,
     queues,
+    eventsBlocked,
     warns,
     statusAtStop,
     insertActive,
@@ -1360,4 +1370,85 @@ test("approval message names the deny command too (§5.3 rev 17)", async () => {
     JSON.stringify(h.sends[0]!.input),
     /interactions approve\|deny\|grant\|answer\|respond int_9 thr_e1/,
   );
+});
+
+// ── Доработка по приёмке PLUG-149 / спека rev 18 ───────────────────────
+
+test("events.list failure past the window: no stalled, no stop; a late response cancels", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+
+  // journal unreadable → no stalled decision, no threads.stop (rev 18)
+  h.eventsBlocked.add("thr_e1");
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "running");
+  assert.deepEqual(h.stops, []);
+  await h.wd.checkTimers(); // the next pass re-tries, still nothing
+  assert.equal(h.store.get(row.id)!.status, "running");
+  assert.deepEqual(h.stops, []);
+
+  // reading recovered; a response in the journal cancels the decision
+  h.eventsBlocked.delete("thr_e1");
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "item/agentMessage/delta", T0 + 20_000, { text: "hi" }),
+  ]);
+  await h.wd.checkTimers();
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.first_response_at, T0 + 20_000);
+  assert.deepEqual(h.stops, []);
+});
+
+test("resume window with an unreadable journal: decision deferred, not stalled", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.queues.set("thr_e1", []);
+  h.eventLog.set("thr_e1", [
+    ev(1, "system/thread/interrupted", T0, { reason: "provider-turn-idle" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  assert.match(h.store.get(row.id)!.setup_errors, /resume-await/);
+  h.setNow(T0 + 31_000); // past the resume window
+
+  h.eventsBlocked.add("thr_e1");
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "running"); // deferred
+  assert.deepEqual(h.stops, []);
+
+  // journal readable again, still no new turn → stalled as before
+  h.eventsBlocked.delete("thr_e1");
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+});
+
+test("idle with an unreadable journal stays running — no done/cancelled", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.store.setTurnStarted(row.id, T0 - 1000);
+  h.queues.set("thr_e1", []); // empty queue would mean done — if readable
+  h.eventsBlocked.add("thr_e1");
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "running");
+  // reconcile follows the same rule
+  await h.wd.reconcile();
+  assert.equal(h.store.get(row.id)!.status, "running");
+
+  // once the journal reads again, the usual done applies
+  h.eventsBlocked.delete("thr_e1");
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "done");
 });
