@@ -48,3 +48,25 @@ export const contract = defineRpcContract({
 export type CompactThreadInput = z.infer<typeof compactThreadInputSchema>;
 export type CompactThreadOutput = z.infer<typeof compactThreadOutputSchema>;
 export type StatusOutput = z.infer<typeof statusOutputSchema>;
+
+/** Модель-суммаризатор (спека «Модель и доступ»). */
+export const SUMMARIZER_MODEL = "gemini-3.6-flash";
+/** Минимальный интервал опроса офферов (спека «Поток» п. 1). */
+export const OFFER_POLL_MIN_INTERVAL_MS = 60_000;
+
+/** Минимальная форма usage из `threads.context` для оффера и гейта. */
+export interface ThreadUsageLike {
+  usedTokens?: number;
+  compactionOfferAt?: string | null;
+}
+
+/** Оффер компакта: `usage.compactionOfferAt` в прошлом (спека «Поток» п. 1). */
+export function isCompactionOffered(
+  usage: ThreadUsageLike | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  const offerAt = usage?.compactionOfferAt;
+  if (!offerAt) return false;
+  const at = Date.parse(offerAt);
+  return Number.isFinite(at) && at <= now;
+}

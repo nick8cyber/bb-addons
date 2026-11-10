@@ -11,7 +11,7 @@ import {
   type ExperimentalThreadRowMetadataProps,
 } from "@get-bb/plugin-sdk/app";
 
-import { isCompactionOffered, OFFER_POLL_MIN_INTERVAL_MS } from "../external-compact.js";
+import { isCompactionOffered, OFFER_POLL_MIN_INTERVAL_MS } from "../contract.js";
 
 /** threadId → у треда истёк кэш (compactionOfferAt в прошлом). */
 export type CacheBadgeData = Record<string, true>;

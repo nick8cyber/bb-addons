@@ -7,8 +7,7 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 
-import { contract } from "../contract.js";
-import { SUMMARIZER_MODEL } from "../external-compact.js";
+import { contract, SUMMARIZER_MODEL } from "../contract.js";
 import { compactUiStore } from "./compactUiStore.js";
 
 const TOAST_ID = "external-compact";

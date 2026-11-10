@@ -12,16 +12,25 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import {
+  SUMMARIZER_MODEL,
+  OFFER_POLL_MIN_INTERVAL_MS,
+  isCompactionOffered,
+  type ThreadUsageLike,
+} from "./contract.js";
+
+export {
+  SUMMARIZER_MODEL,
+  OFFER_POLL_MIN_INTERVAL_MS,
+  isCompactionOffered,
+  type ThreadUsageLike,
+};
 
 const execFileAsync = promisify(execFile);
 
-/** Модель-суммаризатор (спека «Модель и доступ»). */
-export const SUMMARIZER_MODEL = "gemini-3.6-flash";
 export const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 /** Безопасная граница одного запроса (спека «Поток» п. 3). */
 export const SAFE_SINGLE_PASS_TOKENS = 800_000;
-/** Минимальный интервал опроса офферов (спека «Поток» п. 1). */
-export const OFFER_POLL_MIN_INTERVAL_MS = 60_000;
 /** В настройке — до двух ключей: основной и фолбэк на 429. */
 export const GEMINI_MAX_KEYS = 2;
 export const EXPORT_TIMEOUT_MS = 120_000;
@@ -62,23 +71,6 @@ export function parseGeminiKeys(raw: string | undefined | null): string[] {
     if (key) seen.add(key);
   }
   return [...seen].slice(0, GEMINI_MAX_KEYS);
-}
-
-/** Минимальная форма usage из `threads.context` для оффера и гейта. */
-export interface ThreadUsageLike {
-  usedTokens?: number;
-  compactionOfferAt?: string | null;
-}
-
-/** Оффер компакта: `usage.compactionOfferAt` в прошлом (спека «Поток» п. 1). */
-export function isCompactionOffered(
-  usage: ThreadUsageLike | null | undefined,
-  now: number = Date.now(),
-): boolean {
-  const offerAt = usage?.compactionOfferAt;
-  if (!offerAt) return false;
-  const at = Date.parse(offerAt);
-  return Number.isFinite(at) && at <= now;
 }
 
 /**
