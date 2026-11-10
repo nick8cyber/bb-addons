@@ -48,6 +48,7 @@ import {
   checkIneligibleBreaker,
   ineligibleCooldownMs,
   isAccountIneligible,
+  isAuthDead,
   listAccounts,
   loadLedger,
   markAccountCooldown,
@@ -405,7 +406,7 @@ interface WSession {
   model: string | undefined;
   reasoningLevel: string | undefined;
   rotating: boolean;
-  rotationCause: "quota" | "ineligible" | null;
+  rotationCause: "quota" | "ineligible" | "auth-dead" | null;
   armedError: ArmedError | null;
   waitTimer: NodeJS.Timeout | null;
   waitUntilMs: number;
@@ -1367,7 +1368,7 @@ function freeSibling(
  */
 function coolSessionAccount(
   session: WSession,
-  cause: "quota" | "ineligible",
+  cause: "quota" | "ineligible" | "auth-dead",
   message: string,
 ): "cooled" | "breaker" | "none" {
   if (
@@ -1379,14 +1380,15 @@ function coolSessionAccount(
   }
   const ledger = loadLedger(dataDir);
   const now = Date.now();
-  if (cause === "ineligible") {
+  if (cause === "ineligible" || cause === "auth-dead") {
     if (checkIneligibleBreaker(ledger, now)) {
       log(
-        `thread ${session.threadId}: ineligible breaker open; not parking ${session.accountLabel}`,
+        `thread ${session.threadId}: ${cause} breaker open; not parking ${session.accountLabel}`,
       );
       return "breaker";
     }
     const location =
+      cause === "ineligible" &&
       /not currently available in your location/iu.test(message) &&
       !/verify your account|https:\/\/accounts\.google\.com\//iu.test(message);
     markAccountCooldown(
@@ -1396,9 +1398,12 @@ function coolSessionAccount(
       message,
     );
     ledger.accounts[session.accountLabel].ineligibleAtMs = now;
+    if (cause === "auth-dead") {
+      ledger.accounts[session.accountLabel].parkedReason = "auth-dead";
+    }
     saveLedger(dataDir, ledger);
     log(
-      `thread ${session.threadId}: account ${session.accountLabel} parked (${location ? "location" : "verification required"})`,
+      `thread ${session.threadId}: account ${session.accountLabel} parked (${cause === "auth-dead" ? "auth-dead" : location ? "location" : "verification required"})`,
     );
     return "cooled";
   }
@@ -1423,7 +1428,7 @@ function coolSessionAccount(
  */
 function planRotation(
   session: WSession,
-  cause: "quota" | "ineligible",
+  cause: "quota" | "ineligible" | "auth-dead",
   message: string,
 ): "rotate" | "wait" | "fail" {
   const cooled = coolSessionAccount(session, cause, message);
@@ -1434,8 +1439,8 @@ function planRotation(
   if (account !== null) {
     return "rotate";
   }
-  if (cause === "ineligible") {
-    return "fail"; // eligibility never waits: rotate or fail
+  if (cause === "ineligible" || cause === "auth-dead") {
+    return "fail"; // dead causes never wait: rotate or fail
   }
   const resetAt = quotaResetAtMs(message);
   const waitMs =
@@ -1525,7 +1530,7 @@ function synthThreadStart(session: WSession): Promise<{
  */
 function startRotation(
   session: WSession,
-  cause: "quota" | "ineligible",
+  cause: "quota" | "ineligible" | "auth-dead",
   message: string,
 ): void {
   // The dying session's pending permission dialogs would hang in the UI
@@ -1536,7 +1541,7 @@ function startRotation(
     log(
       `thread ${session.threadId}: rotation found no free sibling; failing out`,
     );
-    failOut(session, message);
+    failOut(session, poolExhaustedText(cause, message));
     return;
   }
   session.rotating = true;
@@ -1578,7 +1583,7 @@ function startRotation(
 
 function scheduleWaitRetry(
   session: WSession,
-  cause: "quota" | "ineligible",
+  cause: "quota" | "ineligible" | "auth-dead",
   message: string,
 ): void {
   const waitMs = session.waitUntilMs;
@@ -1599,10 +1604,19 @@ function scheduleWaitRetry(
   );
 }
 
-/** The quota/eligibility error now decides the open turn's fate. */
+/** The quota/eligibility/auth-dead error now decides the open turn's fate. */
+function poolExhaustedText(
+  cause: "quota" | "ineligible" | "auth-dead",
+  message: string,
+): string {
+  return cause === "auth-dead"
+    ? `${message} — every pool account lost its Google sign-in; re-authenticate one and retry`
+    : message;
+}
+
 function handleClassifiedError(
   session: WSession,
-  cause: "quota" | "ineligible",
+  cause: "quota" | "ineligible" | "auth-dead",
   message: string,
 ): void {
   const plan = planRotation(session, cause, message);
@@ -1614,7 +1628,7 @@ function handleClassifiedError(
       scheduleWaitRetry(session, cause, message);
       return;
     case "fail":
-      failOut(session, message);
+      failOut(session, poolExhaustedText(cause, message));
       return;
   }
 }
@@ -1860,7 +1874,9 @@ function onThreadIdentity(params: Record<string, unknown>): void {
       reason:
         session.rotationCause === "ineligible"
           ? "this account failed Google's Antigravity eligibility check; the turn is being re-run on another account, so the conversation context does not carry over"
-          : "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over",
+          : session.rotationCause === "auth-dead"
+            ? "the session's account lost its Google sign-in (auth_required); the turn is being re-run on another account, so the conversation context does not carry over"
+            : "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over",
       contextLost: true,
     });
     // The failed turn (or the daemon turn that triggered the rotation) is
@@ -1891,7 +1907,11 @@ function onProviderErrorDelta(
     (typeof delta.message === "string" ? delta.message : "") +
       (typeof delta.detail === "string" ? `\n${delta.detail}` : "");
   const category = classifyError(text);
-  if (category !== "rate-limit" && !isAccountIneligible(text)) {
+  if (
+    category !== "rate-limit" &&
+    !isAccountIneligible(text) &&
+    !isAuthDead(text)
+  ) {
     // Consumed once for classification: leaving it armed would let this old
     // error text shadow the classification of later boundaries for 60s.
     if (armed !== null) {
@@ -1915,7 +1935,11 @@ function onProviderErrorDelta(
   session.suppressErrorNotify = true;
   handleClassifiedError(
     session,
-    category === "rate-limit" ? "quota" : "ineligible",
+    category === "rate-limit"
+      ? "quota"
+      : isAuthDead(text)
+        ? "auth-dead"
+        : "ineligible",
     text,
   );
   return "drop";
@@ -2284,9 +2308,13 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
   }
   session.needsHandoff = true;
   session.rotating = true; // hold daemon turns until the sibling is up
+  const ownerLabel = session.accountLabel;
   session.accountLabel = account.label;
   const ledger = loadLedger(dataDir);
   markAccountUse(ledger, account.label);
+  const ownerParkedAuthDead =
+    (ownerLabel !== null ? ledger.accounts[ownerLabel]?.parkedReason : undefined) ===
+    "auth-dead";
   saveLedger(dataDir, ledger);
   buildLaunch(session);
   const startParams = {
@@ -2310,9 +2338,11 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     sendNotification("session/replaced", {
       threadId,
       providerThreadId: session.providerThreadId,
-      reason:
-        `resumed conversation ${providerThreadId} belongs to an account in quota cooldown; ` +
-        `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
+      reason: ownerParkedAuthDead
+        ? `resumed conversation ${providerThreadId} belongs to an account that lost its Google sign-in (auth_required); ` +
+          `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`
+        : `resumed conversation ${providerThreadId} belongs to an account in quota cooldown; ` +
+          `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
       contextLost: true,
     });
     // The thread/start response doubles as the resume answer.
@@ -2345,7 +2375,25 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
       );
       const queued: QueuedDaemonTurn = { kind: "daemon", requestId: id, params };
       session.pendingConsume = queued;
-      startRotation(session, "quota", "account in quota cooldown");
+      const entry =
+        dataDir !== "" && session.accountLabel !== null
+          ? loadLedger(dataDir).accounts[session.accountLabel]
+          : undefined;
+      const cause =
+        entry?.parkedReason === "auth-dead"
+          ? "auth-dead"
+          : entry?.ineligibleAtMs !== undefined
+            ? "ineligible"
+            : "quota";
+      startRotation(
+        session,
+        cause,
+        cause === "auth-dead"
+          ? "account lost its Google sign-in (auth_required)"
+          : cause === "ineligible"
+            ? "account parked after eligibility refusal"
+            : "account in quota cooldown",
+      );
       return;
     }
   }

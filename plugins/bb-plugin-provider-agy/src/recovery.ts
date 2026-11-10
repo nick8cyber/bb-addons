@@ -10,7 +10,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { isAccountIneligible } from "./accounts.js";
+import { isAccountIneligible, isAuthDead } from "./accounts.js";
 
 // ---------------------------------------------------------------------------
 // Error classification (carried verbatim)
@@ -59,6 +59,7 @@ export function classifyError(
   }
   if (
     isAccountIneligible(message) ||
+    isAuthDead(message) ||
     /unauthori|not authorized|sign in|logged in|login|\b401\b|\b403\b|token/u.test(
       text,
     )

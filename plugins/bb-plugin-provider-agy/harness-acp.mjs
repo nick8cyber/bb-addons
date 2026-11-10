@@ -232,6 +232,50 @@ await waitFor(() => boundaries("t3").length >= 1, 30000, "t3 settles");
 check("parallel/t4-unbroken", boundaries("t4")[0].status === "completed", `t3acct=${t3acct}`);
 setControl({ modeByLabel: {} });
 
+// --- scenario: auth-dead — live turn parks + rotates -----------------------
+// a) live turn hits auth_required → account parked, turn replayed on sibling.
+setControl({ modeByLabel: {}, compactMode: "ok" });
+threadReqIds.t6 = 150;
+start(150, "t6");
+await waitFor(() => replies(150).length === 1 && replies(150)[0].result?.providerThreadId, 20000, "t6 start");
+const t6ptid = replies(150)[0].result.providerThreadId;
+const t6acct = ledger().conversations[t6ptid];
+setControl({ modeByLabel: { [t6acct]: "auth-dead" } });
+turn(151, "t6", "still here?");
+await waitFor(() => boundaries("t6").length >= 1 && boundaries("t6").at(-1).status === "completed", 40000, "t6 rotated turn");
+check("authdead/parked", ledger().accounts[t6acct]?.parkedReason === "auth-dead" && (ledger().accounts[t6acct]?.cooldownUntilMs ?? 0) > Date.now() + 3_600_000, `acct=${t6acct} pr=${ledger().accounts[t6acct]?.parkedReason}`);
+check("authdead/turn-replayed", boundaries("t6").at(-1).status === "completed", "");
+check("authdead/replaced-contextLost", replaced("t6").some((m) => m.params.contextLost === true), "");
+check("authdead/no-rateLimits-no-perr", rateLimits("t6").length === 0 && perrors("t6").length === 0, `rl=${rateLimits("t6").length} perr=${perrors("t6").length}`);
+
+// b) resume pinned to the parked account → same rotation.
+const deadPtid = "fake-dead-conv";
+{
+  const l = ledger();
+  l.conversations[deadPtid] = t6acct;
+  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(l));
+}
+const newsBefore = Object.fromEntries(["a1", "a2", "a3", "a4"].map((h) => [h, news(h).length]));
+threadReqIds.t7 = 160;
+resume(160, "t7", deadPtid);
+await waitFor(() => replies(160).length === 1, 20000, "t7 resume");
+await waitFor(() => ["a1", "a2", "a3", "a4"].some((h) => h !== t6acct && news(h).length > newsBefore[h]), 20000, "t7 sibling start");
+check("authdead/resume-sibling", true, "");
+
+// c) every account dead → honest pool-exhausted fail, no rotation spam.
+setControl({ modeByLabel: { a1: "auth-dead", a2: "auth-dead", a3: "auth-dead", a4: "auth-dead" } });
+threadReqIds.t8 = 170;
+start(170, "t8");
+await waitFor(() => replies(170).length === 1, 20000, "t8 start");
+turn(171, "t8", "everyone is dead");
+await waitFor(() => boundaries("t8").length >= 1 && boundaries("t8").at(-1).status === "failed", 60000, "t8 pool fail");
+const t8last = boundaries("t8").at(-1);
+const t8err = t8last?.error?.message ?? perrors("t8").at(-1)?.message ?? "";
+check("authdead/pool-exhausted-honest", t8last?.status === "failed" && /re-authenticate|lost its google sign-in/iu.test(t8err), t8err.slice(0, 120));
+check("authdead/all-parked", ["a1", "a2", "a3", "a4"].filter((h) => ledger().accounts[h]?.parkedReason === "auth-dead").length >= 3, JSON.stringify(Object.fromEntries(Object.entries(ledger().accounts).map(([k, v]) => [k, v.parkedReason ?? null]))));
+check("authdead/no-rateLimits-on-fail", rateLimits("t8").length === 0, "");
+setControl({ modeByLabel: {} });
+
 // --- shim materialization ---------------------------------------------------
 check("shim/materialized", existsSync(join(root, "acp-shim.mjs")) && readFileSync(join(root, "acp-shim.mjs"), "utf8").includes("NDJSON relay"), "");
 check("shim/argv-embedded-path", !transcriptLines().some((l) => JSON.stringify(l).includes("/src/acp-shim.mjs")), "");

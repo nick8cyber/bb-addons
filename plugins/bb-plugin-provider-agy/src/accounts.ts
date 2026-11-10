@@ -37,6 +37,8 @@ export interface AccountLedgerEntry {
   lastError: string | null;
   /** Last eligibility parking, persisted for the cross-session breaker. */
   ineligibleAtMs?: number;
+  /** Why the account is parked, when the cause is finer than eligibility. */
+  parkedReason?: "auth-dead" | string;
 }
 
 export interface AccountsLedger {
@@ -191,6 +193,19 @@ export function accountByLabel(
 /** A network failure during the eligibility check alone is not an auth failure. */
 export function isAccountIneligible(message: string): boolean {
   return /not eligible for Antigravity|verify your account/iu.test(message);
+}
+
+/**
+ * Signatures of a dead Google sign-in: the account's OAuth session was
+ * revoked or expired and every session request fails auth_required (agy
+ * logs "Silent sign-in failed" / "not logged into Antigravity" alongside).
+ * Not quota, not eligibility — the account is parked until re-login.
+ */
+const AUTH_DEAD_PATTERN =
+  /auth_required|authentication required|silent sign-in failed|not logged into antigravity|error getting token source/iu;
+
+export function isAuthDead(message: string): boolean {
+  return AUTH_DEAD_PATTERN.test(message);
 }
 
 /** Extract one eligibility diagnostic, excluding earlier quota/tool chatter. */
