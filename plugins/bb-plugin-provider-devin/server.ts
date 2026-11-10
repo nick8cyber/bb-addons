@@ -27,6 +27,15 @@ const DEVIN_BIN =
   [join(homedir(), ".local", "bin", "devin"), "/usr/local/bin/devin"].find((p) => existsSync(p)) ?? "devin";
 
 export default function plugin(bb: BbPluginApi) {
+  bb.settings.define({
+    subagentsDisabled: {
+      type: "boolean",
+      label: "Disable provider subagents",
+      description:
+        "Prevent Devin from starting native subagents (run_subagent, read_subagent) so agents use bb for delegation. Applies by managing subagents_enabled in the Devin user config — the only lever devin acp reads; the prior value is restored when the setting is turned off.",
+      default: false,
+    },
+  });
   bb.providers.register({
     id: "acp-devin",
     displayName: "Devin",
@@ -76,5 +85,12 @@ export default function plugin(bb: BbPluginApi) {
       reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
     },
     composerActions: [],
+    // Central provider knob, same contract as codex/claude-code/agy: bb's
+    // "Disable provider subagents" setting reaches the host wrapper as
+    // options.providerOptions.providerSubagentsEnabled; the wrapper applies it
+    // to subagents_enabled in the Devin user config.
+    deriveProviderOptions: (ctx) => ({
+      providerSubagentsEnabled: ctx.settings.subagentsDisabled !== true,
+    }),
   });
 }
