@@ -181,6 +181,62 @@ export function accountByLabel(
   return accounts.find((a) => a.label === label) ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// Eligibility parking. agy refuses accounts that fail Google's Antigravity
+// eligibility check (region or verification); such an account is parked for a
+// long cooldown, and a breaker stops mass-parking when the real cause is the
+// egress, not the accounts.
+// ---------------------------------------------------------------------------
+
+/** A network failure during the eligibility check alone is not an auth failure. */
+export function isAccountIneligible(message: string): boolean {
+  return /not eligible for Antigravity|verify your account/iu.test(message);
+}
+
+/** Extract one eligibility diagnostic, excluding earlier quota/tool chatter. */
+export function ineligibleStderrBlock(stderr: string): string | null {
+  const lines = stderr.replace(/\u001b\[[0-9;]*m/gu, "")
+    .split(/\r?\n/u).map((line) => line.trim());
+  let start = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (/Eligibility check failed/iu.test(lines[index]) ||
+        (start === -1 && isAccountIneligible(lines[index]))) {
+      start = index;
+    }
+  }
+  if (start === -1) return null;
+  const tail = lines.slice(start);
+  let end = tail.findIndex((line) => /https:\/\/accounts\.google\.com\//u.test(line));
+  if (end === -1) {
+    // Location has no URL. End at the last eligibility instruction, not at
+    // unrelated shutdown chatter; preserve intermediate diagnostic lines.
+    end = 0;
+    tail.forEach((line, index) => {
+      if (isAccountIneligible(line) || /^Alternatively,/iu.test(line)) end = index;
+    });
+  }
+  const message = tail.slice(0, end + 1).join("\n");
+  return isAccountIneligible(message) ? message : null;
+}
+
+/** Read per failure so operators can disable parking without a bridge restart. */
+export function ineligibleCooldownMs(location: boolean): number {
+  const variable = location ? "AGY_LOCATION_COOLDOWN_MS" : "AGY_INELIGIBLE_COOLDOWN_MS";
+  const raw = Number(process.env[variable]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : (location ? 7_200_000 : 86_400_000);
+}
+
+export function ineligibleBreakerWindowMs(): number {
+  const raw = Number(process.env.AGY_INELIGIBLE_BREAKER_WINDOW_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 600_000;
+}
+
+export function ineligibleBreakerMax(): number {
+  const raw = Number(process.env.AGY_INELIGIBLE_BREAKER_MAX);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3;
+}
+
+
 /**
  * Create one pool entry from a Google OAuth refresh grant (the shape the
  * opencode antigravity plugin and cliproxy auth files both carry). The

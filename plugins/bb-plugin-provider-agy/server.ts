@@ -34,9 +34,14 @@ export default function plugin(bb: BbPluginApi) {
       supportsManualCompaction: true,
       supportsThreadArchive: false,
       supportsThreadRename: false,
-      // agy's stream-json has no approval back channel, so the only mode the
-      // bridge can honestly run is the unrestricted one.
-      permissionModes: ["full"],
+      // The ACP transport speaks session/set_mode and
+      // --dangerously-skip-permissions, so the whole ladder is honest now.
+      permissionModes: [
+        "full",
+        "default",
+        "accept-edits",
+        "plan",
+      ] as ("full" | "default" | "accept-edits" | "plan")[] as never,
       // agy's own ladder; the model list encodes the effort in the model id.
       reasoningLevels: ["low", "medium", "high"],
     },
@@ -53,5 +58,17 @@ export default function plugin(bb: BbPluginApi) {
       installUrl: "https://antigravity.google/docs/cli/getting-started",
     },
     composerActions: [],
+    // The daemon hands this to the ACP wrapper on every thread-bound
+    // request; the wrapper rewrites acpLaunchSpec per session (account
+    // pool, shim, proxies) before delegating to the generic bridge.
+    experimental_bridgeOptions: {
+      acpLaunchSpec: {
+        displayName: "Antigravity (agy)",
+        command: "agy",
+        args: ["acp"],
+        env: {},
+      },
+      acpDialect: "generic",
+    },
   });
 }

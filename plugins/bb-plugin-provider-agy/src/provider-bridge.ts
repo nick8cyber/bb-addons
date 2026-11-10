@@ -68,6 +68,11 @@ import {
 import {
   accountByLabel,
   accountsEnabled,
+  ineligibleBreakerMax,
+  ineligibleBreakerWindowMs,
+  ineligibleCooldownMs,
+  ineligibleStderrBlock,
+  isAccountIneligible,
   listAccounts,
   loadLedger,
   markAccountCooldown,
@@ -480,37 +485,6 @@ const ACTIONABLE_ERROR =
 /** Lines agy prints while it is still running normally, not failures. */
 const BENIGN_STDERR = /^warning[: ]/iu;
 
-/** A network failure during the eligibility check alone is not an auth failure. */
-function isAccountIneligible(message: string): boolean {
-  return /not eligible for Antigravity|verify your account/iu.test(message);
-}
-
-/** Extract one eligibility diagnostic, excluding earlier quota/tool chatter. */
-function ineligibleStderrBlock(stderr: string): string | null {
-  const lines = stderr.replace(/\u001b\[[0-9;]*m/gu, "")
-    .split(/\r?\n/u).map((line) => line.trim());
-  let start = -1;
-  for (let index = 0; index < lines.length; index += 1) {
-    if (/Eligibility check failed/iu.test(lines[index]) ||
-        (start === -1 && isAccountIneligible(lines[index]))) {
-      start = index;
-    }
-  }
-  if (start === -1) return null;
-  const tail = lines.slice(start);
-  let end = tail.findIndex((line) => /https:\/\/accounts\.google\.com\//u.test(line));
-  if (end === -1) {
-    // Location has no URL. End at the last eligibility instruction, not at
-    // unrelated shutdown chatter; preserve intermediate diagnostic lines.
-    end = 0;
-    tail.forEach((line, index) => {
-      if (isAccountIneligible(line) || /^Alternatively,/iu.test(line)) end = index;
-    });
-  }
-  const message = tail.slice(0, end + 1).join("\n");
-  return isAccountIneligible(message) ? message : null;
-}
-
 function classifyError(
   message: string,
   opts: { toolError?: boolean } = {},
@@ -782,23 +756,6 @@ function quotaRetryMaxWaitMs(): number {
  * assumed to be agy's usual ~50-minute individual one, so half of that.
  */
 const DEFAULT_QUOTA_COOLDOWN_MS = 1_800_000;
-
-/** Read per failure so operators can disable parking without a bridge restart. */
-function ineligibleCooldownMs(location: boolean): number {
-  const variable = location ? "AGY_LOCATION_COOLDOWN_MS" : "AGY_INELIGIBLE_COOLDOWN_MS";
-  const raw = Number(process.env[variable]);
-  return Number.isFinite(raw) && raw >= 0 ? raw : (location ? 7_200_000 : 86_400_000);
-}
-
-function ineligibleBreakerWindowMs(): number {
-  const raw = Number(process.env.AGY_INELIGIBLE_BREAKER_WINDOW_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 600_000;
-}
-
-function ineligibleBreakerMax(): number {
-  const raw = Number(process.env.AGY_INELIGIBLE_BREAKER_MAX);
-  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3;
-}
 
 type AccountRetryReason = "quota" | "ineligible";
 
