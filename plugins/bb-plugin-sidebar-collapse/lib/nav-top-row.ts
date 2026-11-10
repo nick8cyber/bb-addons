@@ -40,7 +40,7 @@ function buildIcons(doc: Document, sources: HTMLElement[]): HTMLElement | null {
     const label = src.getAttribute("aria-label") || src.textContent?.trim() || "";
     btn.setAttribute("aria-label", label);
     btn.title = label;
-    const icon = src.querySelector("[data-icon-root]")?.cloneNode(true);
+    const icon = src.querySelector("[data-icon-root] svg, [data-icon-root]")?.cloneNode(true);
     if (icon) btn.append(icon);
     if (!btn.childNodes.length) return null;
     if (src.querySelector(".rounded-full")) {
@@ -48,7 +48,11 @@ function buildIcons(doc: Document, sources: HTMLElement[]): HTMLElement | null {
       dot.className = "bb-nav-top-badge";
       btn.append(dot);
     }
-    btn.addEventListener("click", () => src.click());
+    btn.addEventListener("click", () => {
+      for (const type of ["pointerdown", "pointerup", "click"]) {
+        src.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true }));
+      }
+    });
     host.append(btn);
   }
   return host;

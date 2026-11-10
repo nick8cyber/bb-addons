@@ -128,7 +128,7 @@ form[class*="group/promptbox"] div.overflow-y-auto:has(.ProseMirror) {
 /* Nav icons cloned into the top chrome row by the nav-top-row script: hide the
    original region (kept alive for click forwarding) and style the clones. */
 html[data-bb-nav-icons-active] [data-testid="sidebar-navigation-region"] {
-  position: absolute !important; top: -200vh !important; visibility: hidden !important;
+  position: absolute !important; visibility: hidden !important; pointer-events: none !important;
 }
 .bb-nav-top-icons { display: flex; align-items: center; gap: 2px; margin-right: auto; }
 .bb-nav-top-icons > button {
@@ -138,14 +138,14 @@ html[data-bb-nav-icons-active] [data-testid="sidebar-navigation-region"] {
 }
 .bb-nav-top-icons > button:hover { background: var(--sidebar-accent); }
 .bb-nav-top-icons > button:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
-.bb-nav-top-icons > button > svg { width: 16px; height: 16px; }
+.bb-nav-top-icons > button svg { width: 16px; height: 16px; display: block; }
 .bb-nav-top-badge {
   position: absolute; top: 1px; right: 1px; width: 8px; height: 8px;
   border-radius: 50%; background: var(--muted-foreground); pointer-events: none;
 }
 @media (max-width: 767px), (pointer: coarse) {
   .bb-nav-top-icons > button { width: 36px; height: 36px; }
-  .bb-nav-top-icons > button > svg { width: 20px; height: 20px; }
+  .bb-nav-top-icons > button svg { width: 20px; height: 20px; }
 }
 `;
 export function mountSidebarControls(signal?: AbortSignal, doc: Document = document): () => void {
