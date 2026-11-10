@@ -139,10 +139,6 @@ html[data-bb-nav-icons-active] [data-testid="sidebar-navigation-region"] {
 .bb-nav-top-icons > button:hover { background: var(--sidebar-accent); }
 .bb-nav-top-icons > button:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
 .bb-nav-top-icons > button svg { width: 16px; height: 16px; display: block; }
-.bb-nav-top-badge {
-  position: absolute; top: 1px; right: 1px; width: 8px; height: 8px;
-  border-radius: 50%; background: var(--muted-foreground); pointer-events: none;
-}
 @media (max-width: 767px), (pointer: coarse) {
   .bb-nav-top-icons > button { width: 36px; height: 36px; }
   .bb-nav-top-icons > button svg { width: 20px; height: 20px; }

@@ -43,11 +43,6 @@ function buildIcons(doc: Document, sources: HTMLElement[]): HTMLElement | null {
     const icon = src.querySelector("[data-icon-root] svg, [data-icon-root]")?.cloneNode(true);
     if (icon) btn.append(icon);
     if (!btn.childNodes.length) return null;
-    if (src.querySelector(".rounded-full")) {
-      const dot = doc.createElement("span");
-      dot.className = "bb-nav-top-badge";
-      btn.append(dot);
-    }
     btn.addEventListener("click", () => {
       for (const type of ["pointerdown", "pointerup", "click"]) {
         src.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true }));
