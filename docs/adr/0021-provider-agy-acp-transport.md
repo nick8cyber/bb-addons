@@ -34,7 +34,7 @@ date: 2026-11-10
 
 ## Исход (2026-11-10, реализовано)
 
-Смержено в `main`: #7 `f06334e` (миграция), #8 `4d8faac` (permissionModes), #9 `e5027bc` (acp-shim едет внутри host-бандла — блокер артефактов), #10 `d2403fa` (лестница усилий на голых id из `agy models`), #11 `e6dba11` (gitDiffStat не сыплет git-варнинги), #12 `bdf5c7c` (permissionModes без `auto`). После аудита транспорта (PLUG-167, ревью на Gemini 3.8 High): #15 `de47ede` (1 блокер — dead ctl-канал `session/set_mode`, и 7 фиксов очереди/ротации/взаимодействий/side-channel) и #16 `1ccdc9c` (спека догнала код).
+Смержено в `main`: #7 `f06334e` (миграция), #8 `4d8faac` (permissionModes), #9 `e5027bc` (acp-shim едет внутри host-бандла — блокер артефактов), #10 `d2403fa` (лестница усилий на голых id из `agy models`), #11 `e6dba11` (gitDiffStat не сыплет git-варнинги), #12 `bdf5c7c` (permissionModes без `auto`). После аудита транспорта (PLUG-167, ревью на Gemini 3.8 High): #15 `de47ede` (1 блокер — dead ctl-канал `session/set_mode`, и 7 фиксов очереди/ротации/взаимодействий/side-channel) и #16 `1ccdc9c` (спека догнала код). По инциденту 10.11 (вылогиненный пул-аккаунт убивал треды насовсем): #18 `0fc6b23` — классификация auth-dead, парковка с `parkedReason`, ротация хода и resume, честный фейл при пустом пуле.
 
 Проверено вживую на двух bb-инстансах (ubuntu и ornella, обе на `bdf5c7c`): потурневый ход 5–6 с на `claude-sonnet-4-6`; `session/resume` сохраняет контекст; live-стрим `item/reasoning/textDelta` + `commandExecution` + `tokenUsage/updated`; usage пишется в side-channel (`acp-shim/events.ndjson`, в т.ч. `thoughtTokens`); плагинные agentTools доезжают до модели через MCP-прокси (`zoom_list_meetings` вернул реальные данные из agy-сессии); `model/list` отдаёт лестницу low/medium/high.
 
