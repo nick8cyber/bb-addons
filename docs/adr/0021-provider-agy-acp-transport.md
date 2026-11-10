@@ -1,6 +1,6 @@
 ---
 title: provider-agy — переход на ACP-транспорт agy acp
-status: draft
+status: accepted
 date: 2026-11-10
 ---
 
@@ -31,3 +31,11 @@ date: 2026-11-10
 В тредах видны живые мысли (`item/reasoning/textDelta`), аргументы и вывод тулов, потурновые токены. `session/load` читает разговоры stream-json — история не теряется при переходе. Стоимость — слой обёртки ~перенос recovery-логики; риск формы квота-ошибки закрыт классификатором под обе формы и флагом отката.
 
 Контракт: [спецификация](../specs/provider-agy-acp.md).
+
+## Исход (2026-11-10, реализовано)
+
+Смержено в `main`: #7 `f06334e` (миграция), #8 `4d8faac` (permissionModes), #9 `e5027bc` (acp-shim едет внутри host-бандла — блокер артефактов), #10 `d2403fa` (лестница усилий на голых id из `agy models`), #11 `e6dba11` (gitDiffStat не сыплет git-варнинги), #12 `bdf5c7c` (permissionModes без `auto`).
+
+Проверено вживую на двух bb-инстансах (ubuntu и ornella, обе на `bdf5c7c`): потурневый ход 5–6 с на `claude-sonnet-4-6`; `session/resume` сохраняет контекст; live-стрим `item/reasoning/textDelta` + `commandExecution` + `tokenUsage/updated`; usage пишется в side-channel (`acp-shim/events.ndjson`, в т.ч. `thoughtTokens`); плагинные agentTools доезжают до модели через MCP-прокси (`zoom_list_meetings` вернул реальные данные из agy-сессии); `model/list` отдаёт лестницу low/medium/high.
+
+Ограничения, найденные при внедрении: `auto`/`default`/`plan` недоставляемы на generic-диалекте (демон гейтит `thread.start` по capabilities адаптера) — заявлены только `full`+`accept-edits`; холодный старт сессии ~1.5–3 мин, причём основная часть — очередь ёмкости у Google на gemini-tiers (503-волна дня, на Claude тот же путь — секунды), не транспорт; живой прогон `AGY_TRANSPORT=stream-json` не делался (env демона, путь покрыт харнессом 9/9).

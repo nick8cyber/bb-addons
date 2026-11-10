@@ -24,7 +24,7 @@ tags: [bb, plugins, provider-agy, acp]
 
 Generic-мост отвечает за: JSON-RPC, `session/new`/`load`/`prompt`/`cancel`/`set_mode`, перевод session/update → thread-дельты, permissions, steer. Обёртка отвечает за всё проприетарное ниже.
 
-`server.ts` провайдера обновляется: `permissionModes: ["full","default","accept-edits","plan"]` и `experimental_bridgeOptions` (`acpLaunchSpec`, `acpDialect: "generic"`) — сейчас заявлен только `"full"`, без правки демон не даст сменить режим.
+`server.ts` провайдера обновляется: `permissionModes: ["full","accept-edits"]` и `experimental_bridgeOptions` (`acpLaunchSpec`, `acpDialect: "generic"`) — сейчас заявлен только `"full"`, без правки демон не даст сменить режим. Из первоначального набора `["full","default","accept-edits","plan"]` оставлены два: generic-мост маппит режимы через `permissionCli.insertAfterArgs`, и доставляемы на этом диалекте только `full` и `accept-edits`; заявленный, но недоставляемый режим (проверено на `auto`) отклоняется демоном на `thread.start` («does not support permission mode») — декларируем только то, что реально доезжает.
 
 ## 2. Пул аккаунтов и изоляция
 
