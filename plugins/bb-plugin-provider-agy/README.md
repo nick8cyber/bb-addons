@@ -561,7 +561,10 @@ Both routes are wired, because bb resolves a provider icon in this order:
 a plugin-registered `app.slots.experimental_providerIcon` component, then its
 vendored brand maps, then the server `logoUrl`. So `app.tsx` renders the mark
 inline (crisp, no fetch) and `icons/agy.svg` stays as the fallback for when the
-frontend has not booted, is disabled, or fails. The palette is explicit rather
+frontend has not booted, is disabled, or fails. The registered component must
+declare intrinsic size (`width`/`height` on the `<svg>`): the host wraps the
+icon in a `min-w/h-max` container, and a dimensionless SVG reports 300×150,
+blowing the slot out of its row. The palette is explicit rather
 than `currentColor`: an `<img>` SVG is a separate document where `currentColor`
 is black, and a four-colour mark has no single tint to inherit anyway.
 

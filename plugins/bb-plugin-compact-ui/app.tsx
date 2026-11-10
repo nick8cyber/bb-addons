@@ -390,7 +390,7 @@ function ThreadRow({
             <ProviderIcon
               providerKind="agent"
               provider={provider ?? { id: thread.providerId }}
-              className="size-3.5 shrink-0 text-muted-foreground"
+              className="size-6 shrink-0 text-muted-foreground"
               aria-hidden
             />
           ) : null}
