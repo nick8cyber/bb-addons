@@ -2,7 +2,18 @@
 
 `agy` — the Antigravity CLI — as a native bb provider: a provider declaration
 plus a provider bridge, the same shape `provider-claude-code` and
-`provider-codex` use. No ACP in the path.
+`provider-codex` use.
+
+Since 2026-11-10 the default transport is **`agy acp`** through the SDK's
+`experimental_acpProviderBridge` wrapped by `src/acp-wrapper.ts` (account pool,
+quota rotation, session persistence, usage side-channel via `src/acp-shim.mjs`).
+ACP delivers live reasoning, tool-call args/output and per-turn usage; bb
+plugin tools reach the agent through the generic bridge's MCP proxy
+(`mcp/bb-bridge/*.json` under the account's gemini dir). Declared permission
+modes are `["full", "accept-edits"]` — `auto`/`plan`/`default` are not
+deliverable on the generic ACP dialect (thread.start is gated on adapter
+capabilities). The legacy stream-json bridge stays available behind
+`AGY_TRANSPORT=stream-json` for one release as a no-deploy rollback.
 
 Built and verified against **bb 0.40.0** (`@get-bb/plugin-sdk` 0.4.21), which
 speaks **provider bridge protocol version 2** and thread-delta grammar v3.
