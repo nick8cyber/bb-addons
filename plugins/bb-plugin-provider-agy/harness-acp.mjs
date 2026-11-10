@@ -241,6 +241,9 @@ process.env.AGY_FAKE_MODELS_OUT = "";
 send({ jsonrpc: "2.0", id: 90, method: "model/list", params: {} });
 await waitFor(() => replies(90).length === 1, 20000, "model list");
 check("models/answered", replies(90)[0].result?.models?.length >= 1, JSON.stringify(replies(90)[0].result?.models?.map((m) => m.id)));
+const ladderModel = (replies(90)[0].result?.models ?? []).find((m) => m.id === "fake-model") ?? replies(90)[0].result?.models?.[0];
+const ladderEfforts = (ladderModel?.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort);
+check("models/effort-ladder", ladderEfforts.includes("low") && ladderEfforts.includes("medium") && ladderEfforts.includes("high"), JSON.stringify(ladderEfforts));
 
 process.stdout.write = originalWrite;
 say(`\n${checks.filter(([, ok]) => ok).length}/${checks.length} passed`);
