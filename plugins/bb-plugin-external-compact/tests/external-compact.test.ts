@@ -1,16 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   buildContinuationMessage,
+  buildMergePrompt,
   buildSummaryPrompt,
+  chunkSummaryInput,
+  commonPrefixLength,
   compactThread,
   isCompactionOffered,
   mapGeminiHttpError,
+  MAX_CHUNKS,
   parseGeminiKeys,
+  pickChunkCuts,
   SAFE_SINGLE_PASS_TOKENS,
   sizeGate,
+  sliceChunkDelta,
+  splitTextBySize,
+  summarizeHistoryHierarchical,
   summarizeWithGemini,
   SUMMARIZER_MODEL,
+  transcriptBody,
   type CompactThreadDeps,
+  type HierarchicalSummarizeDeps,
 } from "../src/external-compact.js";
 
 const SILENT_LOG = { info: () => {}, warn: () => {} };
@@ -28,6 +38,7 @@ function makeDeps(overrides: Partial<CompactThreadDeps> = {}): CompactThreadDeps
     }),
     getUsage: async () => ({ usedTokens: 150_000, compactionOfferAt: null }),
     exportHistory: async () => "serialized history",
+    listCutSeqs: async () => [],
     summarize: async () => "summary text",
     spawnContinuation: async () => "thr_new0000001",
     archiveSource: async () => {},
@@ -195,13 +206,53 @@ describe("compactThread (оркестрация)", () => {
     expect(res.error).toContain("thread_not_found");
   });
 
-  it("сверх границы → явный отказ not_implemented", async () => {
+  it("сверх границы → иерархическое сжатие: экспорт по срезам, summary чанков, сводка", async () => {
+    const exportedSeqs: (number | undefined)[] = [];
+    const summaries: string[] = [];
+    // Префиксные экспорты делят общий транскрипт: срез N оканчивается записью N.
+    const full = ["T1", "T2", "T3"].join("\n---\n");
+    const docFor = (upToSeq?: number) =>
+      `# Session handoff\n\n## Transcript\n\n${
+        upToSeq === 10 ? "T1" : upToSeq === 20 ? "T1\n---\nT2" : full
+      }`;
     const deps = makeDeps({
-      getUsage: async () => ({ usedTokens: SAFE_SINGLE_PASS_TOKENS + 1 }),
+      getUsage: async () => ({ usedTokens: 1_700_000 }),
+      listCutSeqs: async () => [10, 20, 30],
+      exportHistory: async (_id, upToSeq) => {
+        exportedSeqs.push(upToSeq);
+        return docFor(upToSeq);
+      },
+      summarize: async (h) => {
+        summaries.push(h);
+        return `S${summaries.length}`;
+      },
+      spawnContinuation: async () => "thr_new_chunked",
     });
     const res = await compactThread(deps, { threadId: "thr_big0000001" });
+    expect(res).toEqual({ ok: true, newThreadId: "thr_new_chunked" });
+    // 1_700_000 / 800_000 → 3 чанка: срезы по seq 10 и 20 + полный экспорт.
+    expect(exportedSeqs).toEqual([10, 20, undefined]);
+    // 3 summary чанков + 1 сводное.
+    expect(summaries).toHaveLength(4);
+    expect(summaries[0]).toContain("T1");
+    expect(summaries[1]).toContain("T2");
+    expect(summaries[1]).not.toContain("T1\n---");
+    expect(summaries[2]).toContain("T3");
+    expect(summaries[3]).toContain("## Часть 1");
+    expect(summaries[3]).toContain("S1");
+    expect(summaries[3]).toContain("S3");
+  });
+
+  it("слишком большая история → явный отказ too_large, без экспорта", async () => {
+    const exportHistory = vi.fn(async () => "doc");
+    const deps = makeDeps({
+      getUsage: async () => ({ usedTokens: MAX_CHUNKS * SAFE_SINGLE_PASS_TOKENS + 1 }),
+      exportHistory,
+    });
+    const res = await compactThread(deps, { threadId: "thr_huge000001" });
     expect(res.ok).toBe(false);
-    expect(res.error).toContain("not_implemented");
+    expect(res.error).toContain("too_large");
+    expect(exportHistory).not.toHaveBeenCalled();
   });
 
   it("autoArchiveSource=on → исходный архивируется; падение архивации не валит результат", async () => {
@@ -224,5 +275,133 @@ describe("compactThread (оркестрация)", () => {
     });
     const res2 = await compactThread(deps2, { threadId: "thr_src000004" });
     expect(res2.ok).toBe(true);
+  });
+});
+
+describe("pickChunkCuts", () => {
+  it("равномерные внутренние срезы: chunkCount-1 точек, без дублей", () => {
+    const seqs = Array.from({ length: 10 }, (_, i) => i + 1);
+    expect(pickChunkCuts(seqs, 3)).toEqual([4, 7]);
+    expect(pickChunkCuts(seqs, 2)).toEqual([5]);
+  });
+  it("chunkCount <= 1 или нет кандидатов → срезов нет", () => {
+    expect(pickChunkCuts([1, 2, 3], 1)).toEqual([]);
+    expect(pickChunkCuts([], 5)).toEqual([]);
+  });
+  it("кандидатов меньше нужного — берём все, вход сортируется и дедупится", () => {
+    expect(pickChunkCuts([30, 10, 30, 20], 5)).toEqual([10, 20, 30]);
+  });
+});
+
+describe("transcriptBody / sliceChunkDelta", () => {
+  const doc = (t: string) => `# Session handoff\n\n- Captured: x\n\n## Transcript\n\n${t}`;
+  it("берёт часть после ## Transcript; без заголовка — весь документ", () => {
+    expect(transcriptBody(doc("BODY"))).toBe("\nBODY");
+    expect(transcriptBody("no marker")).toBe("no marker");
+  });
+  it("дельта чанка — транскрипт большего среза без общего префикса", () => {
+    const t1 = transcriptBody(doc("A1\n---\nA2"));
+    const t2 = transcriptBody(doc("A1\n---\nA2\n---\nA3"));
+    expect(sliceChunkDelta(t1, t2)).toBe("\n---\nA3");
+  });
+  it("недетерминированный рендер → чанк с перекрытием, не пропуск", () => {
+    expect(sliceChunkDelta("XYZ", "ABCDEF")).toBe("ABCDEF");
+    expect(commonPrefixLength("abc", "abd")).toBe(2);
+  });
+});
+
+describe("splitTextBySize", () => {
+  it("режет по границам абзацев, каждая часть <= maxChars", () => {
+    const text = ["aaaa", "bbbb", "cccc", "dddd"].join("\n\n");
+    const parts = splitTextBySize(text, 10);
+    expect(parts.length).toBeGreaterThan(1);
+    for (const p of parts) expect(p.length).toBeLessThanOrEqual(10);
+    expect(parts.join(" ").replace(/\s+/g, " ")).toContain("aaaa");
+    expect(parts.join(" ").replace(/\s+/g, " ")).toContain("dddd");
+  });
+  it("абзац длиннее maxChars → жёсткий рез по длине", () => {
+    const parts = splitTextBySize("x".repeat(25), 10);
+    expect(parts).toEqual(["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
+  });
+  it("короткий текст → одна часть", () => {
+    expect(splitTextBySize("short", 100)).toEqual(["short"]);
+  });
+});
+
+describe("summarizeHistoryHierarchical", () => {
+  const doc = (t: string) => `head\n## Transcript\n\n${t}`;
+  function makeHDeps(overrides: Partial<HierarchicalSummarizeDeps> = {}) {
+    const calls: { exportSeqs: (number | undefined)[]; summaries: string[] } = {
+      exportSeqs: [],
+      summaries: [],
+    };
+    const deps: HierarchicalSummarizeDeps = {
+      listCutSeqs: async () => [10, 20],
+      exportPart: async (_id, upToSeq) => {
+        calls.exportSeqs.push(upToSeq);
+        return doc(upToSeq === 10 ? "C1" : upToSeq === 20 ? "C1\n---\nC2" : "C1\n---\nC2\n---\nC3");
+      },
+      summarize: async (h) => {
+        calls.summaries.push(h);
+        return `S${calls.summaries.length}`;
+      },
+      log: SILENT_LOG,
+      ...overrides,
+    };
+    return { deps, calls };
+  }
+
+  it("чанки по срезам → summary каждого → сводное summary", async () => {
+    const { deps, calls } = makeHDeps();
+    const out = await summarizeHistoryHierarchical(deps, "thr_t", 1_700_000, ["k1"]);
+    expect(calls.exportSeqs).toEqual([10, 20, undefined]);
+    expect(calls.summaries).toHaveLength(4);
+    expect(calls.summaries[0]).toContain("C1");
+    expect(calls.summaries[1]).toContain("C2");
+    expect(calls.summaries[2]).toContain("C3");
+    expect(calls.summaries[3]).toContain(buildMergePrompt().split("\n")[0]);
+    expect(out).toBe("S4");
+  });
+
+  it("без кандидатов на срезы — один полный экспорт, один чанк", async () => {
+    const { deps, calls } = makeHDeps({ listCutSeqs: async () => [] });
+    const out = await summarizeHistoryHierarchical(deps, "thr_t", 900_000, ["k1"]);
+    expect(calls.exportSeqs).toEqual([undefined]);
+    expect(calls.summaries).toHaveLength(2); // чанк + сводка
+    expect(out).toBe("S2");
+  });
+
+  it("объём сверх MAX_CHUNKS → too_large до экспорта", async () => {
+    const exportPart = vi.fn(async () => "x");
+    const { deps } = makeHDeps({ exportPart });
+    await expect(
+      summarizeHistoryHierarchical(
+        deps,
+        "thr_t",
+        MAX_CHUNKS * SAFE_SINGLE_PASS_TOKENS + 1,
+        ["k1"],
+      ),
+    ).rejects.toMatchObject({ code: "too_large" });
+    expect(exportPart).not.toHaveBeenCalled();
+  });
+
+  it("второй уровень сведения, если частичные summary не влезают", async () => {
+    const big = "y".repeat(SAFE_SINGLE_PASS_TOKENS + 1);
+    const { deps, calls } = makeHDeps({
+      exportPart: async () => doc("C"),
+      summarize: async (h) => {
+        calls.summaries.push(h);
+        return big; // каждый summary сам огромный → merged > лимита
+      },
+    });
+    // MAX_REDUCE_DEPTH=3: раунды сведения исчерпаются → too_large.
+    await expect(
+      summarizeHistoryHierarchical(deps, "thr_t", 900_000, ["k1"]),
+    ).rejects.toMatchObject({ code: "too_large" });
+  });
+
+  it("chunkSummaryInput нумерует части", () => {
+    expect(chunkSummaryInput("CH", 1, 3)).toContain("часть 2 из 3");
+    expect(chunkSummaryInput("CH", 1, 3)).toContain("CH");
   });
 });

@@ -31,7 +31,7 @@ export type CompactErrorCode =
   | "no_keys"
   | "thread_not_found"
   | "export_failed"
-  | "not_implemented"
+  | "too_large"
   | "rate_limited"
   | "gemini_rejected"
   | "invalid_response"
@@ -90,6 +90,198 @@ export type SizeGate = "single" | "chunked";
 export function sizeGate(usedTokens: number | null | undefined): SizeGate {
   if (usedTokens == null || usedTokens <= SAFE_SINGLE_PASS_TOKENS) return "single";
   return "chunked";
+}
+
+/**
+ * Иерархическое сжатие (спека «Поток» п. 3): верхние границы — сколько чанков
+ * первого уровня и сколько раундов сведения допустимы. Сверх — явный отказ
+ * too_large, не молчаливый обрыв.
+ */
+export const MAX_CHUNKS = 32;
+export const MAX_REDUCE_DEPTH = 3;
+/** Пессимистичный перевод токен-границы в символы: чанк больше не влезет в окно. */
+export const HARD_SINGLE_PASS_CHARS = 4 * SAFE_SINGLE_PASS_TOKENS;
+
+/**
+ * Тело транскрипта в markdown-экспорте `bb handoff export` — часть после
+ * заголовка `## Transcript`. Шапка (Captured, счётчики, Latest result) у
+ * префиксных экспортов различается, поэтому сравнение идёт только по телу.
+ */
+export function transcriptBody(exportMd: string): string {
+  const m = /^## Transcript\s*$/m.exec(exportMd);
+  return m ? exportMd.slice(m.index + m[0].length) : exportMd;
+}
+
+export function commonPrefixLength(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  return i;
+}
+
+/**
+ * Дельта-чанк: `bb handoff export --up-to-seq N` отдаёт только префикс истории,
+ * поэтому чанк i — это транскрипт экспорта среза i без общего префикса со
+ * срезом i-1. Рендер одних и тех же событий детерминирован, так что транскрипт
+ * меньшего среза — литеральный префикс большего; если рендер нестабилен, общий
+ * префикс просто короче и чанк получает лишнее перекрытие, а не пропуск.
+ */
+export function sliceChunkDelta(covered: string, current: string): string {
+  return current.slice(commonPrefixLength(covered, current));
+}
+
+/**
+ * Внутренние точки разреза для chunkCount чанков: до chunkCount-1 seq-границ,
+ * равномерно по кандидатам; хвост до конца истории покрывает полный экспорт.
+ * Кандидатов меньше, чем нужно точек — берём все (гранулярность сообщений —
+ * минимальная из доступных, дальше дробить нечем).
+ */
+export function pickChunkCuts(
+  candidateSeqs: readonly number[],
+  chunkCount: number,
+): number[] {
+  const seqs = [...new Set(candidateSeqs)].sort((a, b) => a - b);
+  const wanted = chunkCount - 1;
+  if (wanted <= 0 || seqs.length === 0) return [];
+  if (seqs.length <= wanted) return seqs;
+  const cuts: number[] = [];
+  for (let i = 1; i <= wanted; i++) {
+    cuts.push(seqs[Math.ceil((i * seqs.length) / chunkCount) - 1]);
+  }
+  return [...new Set(cuts)];
+}
+
+/**
+ * Разрезание текста на части не длиннее maxChars: по границам абзацев, при
+ * отсутствии подходящей — жёстко по длине (для уровней сведения > 0, где
+ * seq-границ уже нет).
+ */
+export function splitTextBySize(text: string, maxChars: number): string[] {
+  const parts: string[] = [];
+  let rest = text;
+  while (rest.length > maxChars) {
+    let cut = rest.lastIndexOf("\n\n", maxChars);
+    if (cut <= 0) cut = maxChars;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\s+/, "");
+  }
+  if (rest.length > 0) parts.push(rest);
+  return parts;
+}
+
+/** Промпт сведения частичных summary в итоговое (спека «Поток» п. 3). */
+export function buildMergePrompt(): string {
+  return [
+    "Сведи частичные summary одной сессии агента в единое summary для продолжения работы.",
+    "Сохрани цели и прямые инструкции владельца, принятые решения, состояние",
+    "репозитория, открытые задачи и блокеры. Убери дубли между частями.",
+    "Компактный структурированный markdown на языке исходной сессии.",
+  ].join("\n");
+}
+
+/** Обёртка чанка контекстом «часть i из k» для суммаризатора. */
+export function chunkSummaryInput(chunk: string, index: number, total: number): string {
+  return [
+    `Это часть ${index + 1} из ${total} сериализованной истории одной сессии.`,
+    "Сожми её так, чтобы по всем частям можно было собрать общее summary.",
+    "",
+    chunk,
+  ].join("\n");
+}
+
+/** Зависимости иерархического сжатия — серверные привязки в server.ts. */
+export interface HierarchicalSummarizeDeps {
+  /** Seq-границы сообщений треда (кандидаты для --up-to-seq), по возрастанию. */
+  listCutSeqs(threadId: string): Promise<number[]>;
+  /** Экспорт истории: без upToSeq — целиком, с ним — префикс до seq. */
+  exportPart(threadId: string, upToSeq?: number): Promise<string>;
+  summarize(history: string, keys: readonly string[]): Promise<string>;
+  log: { info(msg: string): void; warn(msg: string): void };
+}
+
+async function reduceSummaries(
+  deps: HierarchicalSummarizeDeps,
+  summaries: readonly string[],
+  keys: readonly string[],
+  depth: number,
+): Promise<string> {
+  if (depth >= MAX_REDUCE_DEPTH) {
+    throw new ExternalCompactError(
+      "too_large",
+      `частичные summary не сходятся за ${MAX_REDUCE_DEPTH} раундов сведения`,
+    );
+  }
+  const merged = summaries.map((s, i) => `## Часть ${i + 1}\n\n${s}`).join("\n\n");
+  if (merged.length <= SAFE_SINGLE_PASS_TOKENS) {
+    return deps.summarize(`${buildMergePrompt()}\n\n---\n\n${merged}`, keys);
+  }
+  if (merged.length > HARD_SINGLE_PASS_CHARS && depth + 1 >= MAX_REDUCE_DEPTH) {
+    throw new ExternalCompactError(
+      "too_large",
+      `сводный текст ${merged.length} символов превышает окно модели`,
+    );
+  }
+  const next: string[] = [];
+  for (const part of splitTextBySize(merged, SAFE_SINGLE_PASS_TOKENS)) {
+    next.push(await deps.summarize(`${buildMergePrompt()}\n\n---\n\n${part}`, keys));
+  }
+  return reduceSummaries(deps, next, keys, depth + 1);
+}
+
+/**
+ * Иерархическое сжатие истории треда (спека «Поток» п. 3): нарезка по
+ * `--up-to-seq`, экспорт каждого среза, summary чанков через gemini-3.6-flash,
+ * затем сводный summary (с повторными раундами, если сводка сама не влезает).
+ * Совсем не влезает — явный отказ too_large.
+ */
+export async function summarizeHistoryHierarchical(
+  deps: HierarchicalSummarizeDeps,
+  threadId: string,
+  estimatedTokens: number,
+  keys: readonly string[],
+): Promise<string> {
+  const chunkCount = Math.ceil(estimatedTokens / SAFE_SINGLE_PASS_TOKENS);
+  if (chunkCount > MAX_CHUNKS) {
+    throw new ExternalCompactError(
+      "too_large",
+      `оценка ${estimatedTokens} токенов требует ${chunkCount} чанков (> ${MAX_CHUNKS}): история слишком велика`,
+    );
+  }
+  const cuts = pickChunkCuts(await deps.listCutSeqs(threadId), chunkCount);
+  const docs: string[] = [];
+  for (const seq of cuts) docs.push(await deps.exportPart(threadId, seq));
+  docs.push(await deps.exportPart(threadId));
+  const chunks: string[] = [];
+  let covered = "";
+  for (const doc of docs) {
+    const transcript = transcriptBody(doc);
+    const delta = sliceChunkDelta(covered, transcript).trim();
+    if (delta.length > 0) chunks.push(delta);
+    covered = transcript;
+  }
+  if (chunks.length === 0) {
+    throw new ExternalCompactError(
+      "invalid_response",
+      "экспорт истории по срезам дал пустой результат",
+    );
+  }
+  const oversized = chunks.find((c) => c.length > HARD_SINGLE_PASS_CHARS);
+  if (oversized !== undefined) {
+    throw new ExternalCompactError(
+      "too_large",
+      `чанк ${oversized.length} символов крупнее окна модели: дальше по seq не дробится`,
+    );
+  }
+  deps.log.info(
+    `external-compact: ${threadId}: ${chunks.length} чанков (${cuts.length} срезов + хвост)`,
+  );
+  const partSummaries: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    partSummaries.push(
+      await deps.summarize(chunkSummaryInput(chunks[i], i, chunks.length), keys),
+    );
+  }
+  return reduceSummaries(deps, partSummaries, keys, 0);
 }
 
 /** Промпт суммаризатору (спека «Поток» п. 4). */
@@ -267,7 +459,10 @@ export interface CompactThreadDeps {
   getAutoArchive(): Promise<boolean>;
   getThread(threadId: string): Promise<ContinuationTarget | null>;
   getUsage(threadId: string): Promise<ThreadUsageLike | null>;
-  exportHistory(threadId: string): Promise<string>;
+  /** Экспорт истории: без upToSeq — целиком, с ним — префикс до seq. */
+  exportHistory(threadId: string, upToSeq?: number): Promise<string>;
+  /** Seq-границы сообщений треда для чанкования (спека «Поток» п. 3). */
+  listCutSeqs(threadId: string): Promise<number[]>;
   summarize(history: string, keys: readonly string[]): Promise<string>;
   spawnContinuation(target: ContinuationTarget, prompt: string): Promise<string>;
   archiveSource(threadId: string): Promise<void>;
@@ -283,8 +478,8 @@ export interface CompactThreadResult {
 /**
  * Оркестрация (спека «Поток» п. 2–5): ключи → тред → гейт → экспорт → summary →
  * новый тред → опциональная архивация исходного. Архивация не валит результат:
- * продолжение уже создано. Чанкование >800k — явный отказ до реализации
- * (спека «явный отказ с причиной»).
+ * продолжение уже создано. Сверх безопасной границы — иерархическое сжатие
+ * по seq-срезам; совсем не влезает — явный отказ с причиной.
  */
 export async function compactThread(
   deps: CompactThreadDeps,
@@ -303,14 +498,20 @@ export async function compactThread(
       throw new ExternalCompactError("thread_not_found", `тред ${input.threadId} не найден`);
     }
     const usage = await deps.getUsage(input.threadId);
-    if (sizeGate(usage?.usedTokens) === "chunked") {
-      throw new ExternalCompactError(
-        "not_implemented",
-        `usedTokens=${usage?.usedTokens} > ${SAFE_SINGLE_PASS_TOKENS}: чанкование по seq ещё не реализовано`,
-      );
-    }
-    const history = await deps.exportHistory(input.threadId);
-    const summary = await deps.summarize(history, keys);
+    const summary =
+      sizeGate(usage?.usedTokens) === "chunked"
+        ? await summarizeHistoryHierarchical(
+            {
+              listCutSeqs: deps.listCutSeqs,
+              exportPart: deps.exportHistory,
+              summarize: deps.summarize,
+              log: deps.log,
+            },
+            input.threadId,
+            usage?.usedTokens ?? SAFE_SINGLE_PASS_TOKENS + 1,
+            keys,
+          )
+        : await deps.summarize(await deps.exportHistory(input.threadId), keys);
     const prompt = buildContinuationMessage(summary, input.threadId);
     const newThreadId = await deps.spawnContinuation(
       { ...thread, title: `${COMPACT_TITLE_PREFIX}${thread.title ?? input.threadId}` },

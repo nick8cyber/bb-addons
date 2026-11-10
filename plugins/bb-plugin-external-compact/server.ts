@@ -79,7 +79,32 @@ export default async function plugin(bb: BbPluginApi) {
       const ctx = await bb.sdk.threads.context({ threadId }).catch(() => null);
       return ctx?.usage ?? null;
     },
-    exportHistory: (threadId) => exportThreadHistory(threadId),
+    exportHistory: (threadId, upToSeq) =>
+      exportThreadHistory(threadId, upToSeq == null ? {} : { upToSeq }),
+    listCutSeqs: async (threadId) => {
+      // Кандидаты на --up-to-seq: концы сообщений агента (item/completed с
+      // item.type === "agentMessage"). Постранично по events.list.
+      const seqs: number[] = [];
+      let afterSeq: string | undefined;
+      const PAGE = "500";
+      for (;;) {
+        const rows = await bb.sdk.threads.events.list({
+          threadId,
+          order: "asc",
+          limit: PAGE,
+          types: ["item/completed"],
+          ...(afterSeq ? { afterSeq } : {}),
+        });
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          const itemType = (row.data as { item?: { type?: string } } | undefined)?.item?.type;
+          if (itemType === "agentMessage") seqs.push(row.seq);
+        }
+        if (rows.length < Number(PAGE)) break;
+        afterSeq = String(rows[rows.length - 1].seq);
+      }
+      return seqs;
+    },
     summarize: (history, keys) => summarizeWithGemini(history, keys),
     spawnContinuation: async (target, prompt) => {
       if (!target.projectId) {
