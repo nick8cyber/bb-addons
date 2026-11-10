@@ -67,6 +67,7 @@ export default function plugin(bb: BbPluginApi) {
         command: "agy",
         args: ["acp"],
         env: {},
+        permissionCli: { full: ["--dangerously-skip-permissions"] },
       },
       acpDialect: "generic",
     },
