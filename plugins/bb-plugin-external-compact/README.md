@@ -20,15 +20,30 @@ bb external-compact status        # key configured? readiness?
 ## How it works
 
 1. `bb handoff export <thread-id>` writes the serialized history.
-2. Size gate: up to ~800k used tokens → a single request; larger histories are
-   refused explicitly until chunked summarization lands.
-3. One REST `generateContent` call on `gemini-3.6-flash`; on 429/403/5xx the
-   next key is tried.
+2. Size gate on `usedTokens`: up to ~800k → a single request. Larger histories
+   go through hierarchical chunking: `bb handoff export --up-to-seq <N>` prefix
+   slices at agent-message boundaries → per-chunk summaries → merged summary
+   (extra reduce rounds if the merge itself overflows). What still doesn't fit
+   is refused explicitly (`too_large`), never silently truncated.
+3. REST `generateContent` call on `gemini-3.6-flash`; on 429/403/5xx the next
+   key is tried, on 400/404 the request is not retried.
 4. A new thread spawns in the same project and environment; its first message is
    the summary plus a link to the source thread.
 
 Keys only ever travel in the `x-goog-api-key` request header — never in logs,
 errors, or RPC output.
+
+## UI
+
+- **Thread action** «Compact via Gemini (free)» in the thread menu (lifecycle
+  group) and the same command in the composer palette. Both open a confirmation
+  dialog warning that the history will be sent to Google AI Studio — no action
+  without the owner's explicit «Продолжить».
+- **Cache badge** «⏳ compact?» on the thread row when the thread's prompt cache
+  has expired (`usage.compactionOfferAt` in the past). Polls `threads.context`
+  at most once per 60s and only for idle/error threads.
+- Progress and result surface as toasts; the success toast has an «Открыть»
+  button navigating to the continuation thread.
 
 ## Checks
 

@@ -6,6 +6,7 @@ import {
   chunkSummaryInput,
   commonPrefixLength,
   compactThread,
+  ExternalCompactError,
   isCompactionOffered,
   mapGeminiHttpError,
   MAX_CHUNKS,
@@ -164,6 +165,82 @@ describe("summarizeWithGemini", () => {
     });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it("503 → фолбэк на следующий ключ", async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response("unavailable", { status: 503 }))
+      .mockResolvedValueOnce(okResponse("ok-after-503"));
+    await expect(
+      summarizeWithGemini("hist", ["k1", "k2"], { fetchImpl }),
+    ).resolves.toBe("ok-after-503");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("403 (квота/доступ) → фолбэк на следующий ключ", async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response("forbidden", { status: 403 }))
+      .mockResolvedValueOnce(okResponse("ok-after-403"));
+    await expect(
+      summarizeWithGemini("hist", ["k1", "k2"], { fetchImpl }),
+    ).resolves.toBe("ok-after-403");
+    const second = fetchImpl.mock.calls[1]?.[1] as RequestInit;
+    expect((second.headers as Record<string, string>)["x-goog-api-key"]).toBe("k2");
+  });
+
+  it("404 (модель снята) → gemini_rejected, второй ключ не трогаем", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response("nf", { status: 404 }));
+    await expect(
+      summarizeWithGemini("hist", ["k1", "k2"], { fetchImpl }),
+    ).rejects.toMatchObject({ code: "gemini_rejected" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("сетевой сбой → следующий ключ; все упали → rate_limited", async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new Error("socket hangup"))
+      .mockResolvedValueOnce(okResponse("ok-after-net-fail"));
+    await expect(
+      summarizeWithGemini("hist", ["k1", "k2"], { fetchImpl }),
+    ).resolves.toBe("ok-after-net-fail");
+    const allFail = vi.fn<typeof fetch>(async () => {
+      throw new Error("timeout");
+    });
+    await expect(
+      summarizeWithGemini("hist", ["k1", "k2"], { fetchImpl: allFail }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+  });
+
+  it("ответ без текста/не-JSON → invalid_response", async () => {
+    const empty = vi.fn<typeof fetch>(
+      async () => new Response(JSON.stringify({ candidates: [] }), { status: 200 }),
+    );
+    await expect(summarizeWithGemini("hist", ["k1"], { fetchImpl: empty })).rejects.toMatchObject(
+      { code: "invalid_response" },
+    );
+    const notJson = vi.fn<typeof fetch>(async () => new Response("<html>", { status: 200 }));
+    await expect(summarizeWithGemini("hist", ["k1"], { fetchImpl: notJson })).rejects.toMatchObject(
+      { code: "invalid_response" },
+    );
+  });
+
+  it("ключи не попадают в ошибки: ни в URL, ни в message", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(
+      async () => new Response("quota exceeded for project", { status: 429 }),
+    );
+    const err = await summarizeWithGemini("hist", ["key-AAA-secret", "key-BBB-secret"], {
+      fetchImpl,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ExternalCompactError);
+    const message = (err as Error).message;
+    expect(message).not.toContain("key-AAA-secret");
+    expect(message).not.toContain("key-BBB-secret");
+    for (const call of fetchImpl.mock.calls) {
+      expect(String(call[0])).not.toContain("secret");
+    }
+  });
 });
 
 describe("compactThread (оркестрация)", () => {
@@ -275,6 +352,23 @@ describe("compactThread (оркестрация)", () => {
     });
     const res2 = await compactThread(deps2, { threadId: "thr_src000004" });
     expect(res2.ok).toBe(true);
+  });
+
+  it("сбой summarize: ключи не попадают ни в error, ни в лог", async () => {
+    const warnings: string[] = [];
+    const deps = makeDeps({
+      getKeys: async () => ["key-SECRET-1", "key-SECRET-2"],
+      summarize: async () => {
+        throw new ExternalCompactError("rate_limited", "Gemini HTTP 429: quota exceeded");
+      },
+      log: { info: () => {}, warn: (m) => warnings.push(m) },
+    });
+    const res = await compactThread(deps, { threadId: "thr_mask000001" });
+    expect(res.ok).toBe(false);
+    for (const surface of [res.error ?? "", ...warnings]) {
+      expect(surface).not.toContain("key-SECRET-1");
+      expect(surface).not.toContain("key-SECRET-2");
+    }
   });
 });
 
@@ -403,5 +497,28 @@ describe("summarizeHistoryHierarchical", () => {
   it("chunkSummaryInput нумерует части", () => {
     expect(chunkSummaryInput("CH", 1, 3)).toContain("часть 2 из 3");
     expect(chunkSummaryInput("CH", 1, 3)).toContain("CH");
+  });
+});
+
+describe("compactUiStore", () => {
+  it("request выставляет pending и будит подписчиков; cancel снимает", async () => {
+    const { compactUiStore } = await import("../src/ui/compactUiStore.js");
+    const seen: (object | null)[] = [];
+    const unsub = compactUiStore.subscribe(() => seen.push(compactUiStore.getSnapshot()));
+    compactUiStore.request({ threadId: "thr_ui0000001" });
+    expect(compactUiStore.getSnapshot()).toEqual({ threadId: "thr_ui0000001" });
+    compactUiStore.cancel();
+    expect(compactUiStore.getSnapshot()).toBeNull();
+    unsub();
+    expect(seen).toEqual([{ threadId: "thr_ui0000001" }, null]);
+  });
+
+  it("cancel на пустом сторе не эмитит", async () => {
+    const { compactUiStore } = await import("../src/ui/compactUiStore.js");
+    let calls = 0;
+    const unsub = compactUiStore.subscribe(() => calls++);
+    compactUiStore.cancel();
+    expect(calls).toBe(0);
+    unsub();
   });
 });

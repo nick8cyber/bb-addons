@@ -1,6 +1,6 @@
 ---
 title: External Compact — сжатие остывшего контекста на бесплатной Gemini
-status: spec
+status: implemented
 updated: 2026-11-10
 tags: [bb, compaction, cache, external-compact, plugin]
 ---
@@ -37,7 +37,8 @@ tags: [bb, compaction, cache, external-compact, plugin]
 - Живьём: тред >100k с истёкшим кэшем → действие → новый тред со summary, у исходного ничего не потеряно; повтор на ~500k-треде (один запрос) и на >1M (чанки).
 - Откат: отключение плагина; настройки и треды не затрагиваются.
 
-## Открытые вопросы до раздачи
+## Открытые вопросы — статус после реализации
 
-- Точное имя REST-метода и лимиты `gemini-3.6-flash` в AI Studio — сверить при реализации (SDK generateContent, streaming не нужен).
-- Автодетект бесплатных моделей в cliproxy (`:8317`) как второй маршрут — опционально, не MVP.
+- ~~Точное имя REST-метода и лимиты `gemini-3.6-flash` в AI Studio~~ — **решено**: REST `POST /v1beta/models/gemini-3.6-flash:generateContent`, ключ в заголовке `x-goog-api-key` (не в URL), streaming не используется. Реализация: `summarizeWithGemini` в `plugins/bb-plugin-external-compact/src/external-compact.ts`.
+- ~~Чанкование историй >800k~~ — **реализовано**: иерархическое сжатие по срезам `--up-to-seq` (summary чанков → сводный, до `MAX_REDUCE_DEPTH` раундов), отказ `too_large` сверх `MAX_CHUNKS`.
+- Автодетект бесплатных моделей в cliproxy (`:8317`) как второй маршрут — опционально, не MVP; остаётся открытым для будущих итераций.
