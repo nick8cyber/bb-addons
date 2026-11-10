@@ -14,7 +14,8 @@
     "branding": {
       "icon": "Shrink"
     },
-    "server": "./server.ts"
+    "server": "./server.ts",
+    "app": "./app.tsx"
   },
   "keywords": [
     "bb-plugin"
@@ -30,6 +31,11 @@
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.6.104",
     "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "sonner": "^1.7.4",
     "typescript": "^5.7.0",
     "vitest": "^3.2.7"
   }
