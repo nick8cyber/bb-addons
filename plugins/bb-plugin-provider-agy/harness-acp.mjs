@@ -232,6 +232,10 @@ await waitFor(() => boundaries("t3").length >= 1, 30000, "t3 settles");
 check("parallel/t4-unbroken", boundaries("t4")[0].status === "completed", `t3acct=${t3acct}`);
 setControl({ modeByLabel: {} });
 
+// --- shim materialization ---------------------------------------------------
+check("shim/materialized", existsSync(join(root, "acp-shim.mjs")) && readFileSync(join(root, "acp-shim.mjs"), "utf8").includes("NDJSON relay"), "");
+check("shim/argv-embedded-path", !transcriptLines().some((l) => JSON.stringify(l).includes("/src/acp-shim.mjs")), "");
+
 // --- model/list ------------------------------------------------------------
 process.env.AGY_FAKE_MODELS_OUT = "";
 send({ jsonrpc: "2.0", id: 90, method: "model/list", params: {} });
