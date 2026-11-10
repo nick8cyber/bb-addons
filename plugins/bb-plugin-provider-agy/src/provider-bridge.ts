@@ -775,6 +775,7 @@ function gitDiffStat(cwd: string): string | null {
       encoding: "utf8",
       timeout: 5_000,
       maxBuffer: 64 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
     });
     return out.trim().slice(0, 1500);
   } catch {
