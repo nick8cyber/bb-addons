@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   definePluginApp,
+  experimental_ProviderIcon,
+  experimental_useProviders,
   experimental_useSidebarThreads,
   experimental_useSidebarThreadSplit,
   useBbNavigate,
@@ -14,6 +16,8 @@ import type {
   PluginSidebarThread,
   PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
+import type { PluginProvidersState } from "@get-bb/plugin-sdk/app";
+type ProviderInfo = PluginProvidersState["providers"][number];
 import { toast } from "sonner";
 import {
   ContextMenu,
@@ -31,6 +35,7 @@ import { Icon } from "./components/ui/icon";
 import type { IconName } from "./components/ui/icon";
 import { Input } from "./components/ui/input";
 import { cn } from "./lib/utils";
+const ProviderIcon = experimental_ProviderIcon;
 import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib/pagination";
 import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridgeValue } from "./lib/navigation-rail";
 import { mountSidebarControls } from "./lib/sidebar-controls";
@@ -305,9 +310,11 @@ function ThreadRow({
   actions,
   renamingThreadId,
   setRenamingThreadId,
+  provider,
 }: {
   row: GroupingRow<PluginSidebarThread>;
   projects: readonly PluginSidebarProject[];
+  provider?: ProviderInfo;
   activeThreadId: string | null;
   isCompactViewport: boolean;
   showBranchName: boolean;
@@ -378,6 +385,15 @@ function ThreadRow({
             indicator={thread.indicator}
             label={thread.indicatorLabel}
           />
+
+          {!isRenaming ? (
+            <ProviderIcon
+              providerKind="agent"
+              provider={provider ?? { id: thread.providerId }}
+              className="size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden
+            />
+          ) : null}
 
           {isRenaming ? (
             <InlineRenameInput
@@ -571,6 +587,11 @@ function CollapsedThreadList({
   Original,
 }: PluginThreadListProps & { Original?: ComponentType }) {
   const { status, threads, projects } = experimental_useSidebarThreads();
+  const providersState = experimental_useProviders();
+  const providerById = useMemo(
+    () => new Map(providersState.providers.map(provider => [provider.id, provider])),
+    [providersState.providers],
+  );
   const liveCallProjects = useLiveCallProjects();
   const actions = useSidebarRowActions();
   const navigate = useBbNavigate();
@@ -822,6 +843,7 @@ function CollapsedThreadList({
                   key={row.thread.id}
                   row={row}
                   projects={projects}
+                  provider={providerById.get(row.thread.providerId)}
                   activeThreadId={activeThreadId}
                   isCompactViewport={isCompactViewport}
                   showBranchName={showBranchName}
