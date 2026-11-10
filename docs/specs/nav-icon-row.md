@@ -24,3 +24,9 @@ tags: [bb, sidebar, navigation, layout]
 - Тесты sidebar-collapse 134/134 + typecheck + build.
 - Chromium desktop 1440×1050: регион 57px, иконки MessageSquarePlus/Search/ListTodo/MoreHorizontal в одном ряду, badge на месте. Mobile 390×844: ряд 40px-кнопок, та же строка.
 - Откат: удаление CSS-блока navigation из `SIDEBAR_CONTROLS_CSS`; иконка tasks-pro — возврат `ListFilter`.
+
+## Подъём в верхний chrome-ряд (8e64f10)
+
+Иконки дополнительно клонируются в `[data-testid="app-sidebar-top-reserve-row"]` — слева, стрелки «Назад/Вперёд» остаются справа (`lib/nav-top-row.ts`). Прямой репарентинг React-узлов невозможен: BB блокирует вынос из дерева. Клон пробрасывает клик на настоящую кнопку (`src.click()`), подпись источников (aria-label+icon+badge) предотвращает лишние пересборки; ресинхронизация — `setInterval` 1.5с, MutationObserver не используется. Родной регион скрывается через `data-bb-nav-icons-active` только когда клон смонтирован. Fail-open: без top-row или источников ничего не вставляется и меню остаётся штатным.
+
+**Постмортем:** первая версия на MutationObserver пересобирала клоны от собственных вставок — бесконечный цикл заморозил хост (инцидент). Урок: не наблюдать DOM, который сам мутируешь; для редких ресинхронизаций достаточно интервала с подписью.
