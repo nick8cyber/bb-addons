@@ -63,14 +63,40 @@ function collectDiag(doc: Document, row: Element | null, sources: HTMLElement[],
     const rects = clone
       ? Array.from(clone.querySelectorAll("button")).map((b) => {
           const r = b.getBoundingClientRect();
-          return { label: b.getAttribute("aria-label") || "", x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width) };
+          return {
+            label: b.getAttribute("aria-label") || "",
+            x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width),
+            svgs: b.querySelectorAll("svg").length,
+            html: b.innerHTML.slice(0, 300),
+          };
         })
       : [];
     let overlaps = 0;
     for (let i = 1; i < rects.length; i++) {
       if (rects[i].x < rects[i - 1].x + rects[i - 1].w - 1) overlaps++;
     }
+    const stackAt = (x: number, y: number) =>
+      Array.from(doc.elementsFromPoint(x, y)).slice(0, 6).map((e) => ({
+        tag: e.tagName, cls: ((e as HTMLElement).className?.toString?.() || "").slice(0, 60),
+        label: (e as HTMLElement).getAttribute?.("aria-label") || "",
+        ours: !!(e as HTMLElement).closest?.(`[${HOST_ATTR}]`),
+      }));
+    const paintStack = rects.length && rects[0]
+      ? stackAt(rects[0].x + rects[0].w / 2, rects[0].y + 14)
+      : [];
     const region = doc.querySelector('[data-testid="sidebar-navigation-region"]');
+    const rowChildren = row
+      ? Array.from(row.children).map((c) => {
+          const r = c.getBoundingClientRect();
+          const el = c as HTMLElement;
+          return {
+            tag: c.tagName, ours: c.hasAttribute(HOST_ATTR),
+            label: el.getAttribute?.("aria-label") || (c.querySelector?.("button")?.getAttribute("aria-label")) || "",
+            testid: c.getAttribute?.("data-testid") || "",
+            x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width),
+          };
+        })
+      : [];
     const win = (doc.defaultView || window) as unknown as Record<string, unknown>;
     win.__bbNavTopDiag = {
       ts: Date.now(),
@@ -79,6 +105,8 @@ function collectDiag(doc: Document, row: Element | null, sources: HTMLElement[],
       cloneCount: rects.length,
       rects,
       overlaps,
+      rowChildren,
+      paintStack,
       regionHidden: region ? getComputedStyle(region).visibility === "hidden" : null,
     };
   } catch { /* diagnostics must never break the script */ }
@@ -101,6 +129,20 @@ export function mountNavTopRow(signal?: AbortSignal, doc: Document = document): 
       existing?.remove();
       row.insertBefore(rebuilt, row.firstChild);
       doc.documentElement.setAttribute("data-bb-nav-icons-active", "");
+    }
+    // A fixed native "Toggle sidebar" button overlays the row's left edge —
+    // shift the icons clear of it (recomputed each tick; absent => 0).
+    const host = row.querySelector(`[${HOST_ATTR}]`) as HTMLElement | null;
+    if (host) {
+      const hostRect = host.getBoundingClientRect();
+      let shift = 0;
+      for (const t of Array.from(doc.querySelectorAll('button[aria-label^="Toggle sidebar" i]'))) {
+        const tr = t.getBoundingClientRect();
+        if (tr.width && tr.top < hostRect.bottom && tr.bottom > hostRect.top && tr.right > hostRect.left && tr.left < hostRect.right) {
+          shift = Math.max(shift, tr.right - hostRect.left + 4);
+        }
+      }
+      host.style.marginLeft = shift > 0 ? `${Math.round(shift)}px` : "";
     }
     collectDiag(doc, row, sources, row.querySelector(`[${HOST_ATTR}]`));
   };
