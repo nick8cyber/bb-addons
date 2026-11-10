@@ -115,6 +115,12 @@ describe("Live Call UI — звонок по проекту (§15.1, §15.8, §1
         experimental_newThreadPanelAction: vi.fn((reg) => {
           registeredSlots.experimental_newThreadPanelAction = reg;
         }),
+        experimental_providerIcon: vi.fn((reg) => {
+          registeredSlots.experimental_providerIcon = reg;
+        }),
+        experimental_providerIcon: vi.fn((reg) => {
+          registeredSlots.experimental_providerIcon = reg;
+        }),
         settingsSection: vi.fn((reg) => {
           registeredSlots.settingsSection = reg;
         }),

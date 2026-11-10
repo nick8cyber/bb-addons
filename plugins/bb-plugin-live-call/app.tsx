@@ -21,6 +21,11 @@ import { rpc, type ProjectCallsListResult } from "./src/ui/rpc.js";
 
 const PHONE_ICON = "live-call/phone";
 
+/** Иконка провайдера «live-call» в списках тредов: та же lucide-трубка, размер из className хоста. */
+const LiveCallProviderGlyph = ({ className }: { className?: string }) => (
+  <Icon name="phone" className={className} />
+);
+
 /** Пропсы слота experimental_threadHeaderAction (в типах SDK 0.6 слот legacy и не объявлен, рантайм хоста его принимает). */
 interface ThreadHeaderActionProps {
   threadId: string;
@@ -49,6 +54,13 @@ const callOrFocus = () => (callEngine.isActive() ? callEngine.requestExpand() : 
 
 export default definePluginApp((app) => {
   app.slots.experimental_appOverlay({ id: "live-call", component: CallOverlay });
+
+  // Иконка типа «Звонок» в сайдбаре/пикерах вместо фолбэка Code (providerId спавна — "live-call").
+  app.slots.experimental_providerIcon({
+    providerKind: "agent",
+    providerId: "live-call",
+    icon: LiveCallProviderGlyph,
+  });
 
   app.experimental_sidebarFooter.register({
     kind: "action",

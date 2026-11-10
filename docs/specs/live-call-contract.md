@@ -206,10 +206,10 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 ## 6. Тред звонка (провайдер `live-call`)
 
 1. `callsProjectId` пуст → папка `callsWorkspacePath` создаётся на основном хосте (`sdk.system.config().primaryHostId`), затем `bb.sdk.projects.create({ name: "Звонки", source: { type: "local_path", hostId, path } })`, id сохраняется в настройку. Окружение создавать не нужно: `projects.create` с `local_path` сама даёт проекту окружение `project-checkout` (unmanaged workspace по пути проекта), и `threads.spawn({ projectId })` без явного `environmentId` подхватывает его. Проверено спайком 02.11 (проект создан, тред заспавнен, окружение `project-checkout` присвоено автоматически).
-2. Первая законченная реплика владельца → `threads.spawn({ projectId, providerId: "live-call", model: "live", title: "📞 Звонок ДД.ММ ЧЧ:ММ", prompt, environment: { type: "project-default" } })`. `environment` обязателен в SDK (`createThreadRequestSchema`): `project-default` подхватывает окружение `project-checkout`, которое `projects.create` делает само (см. п. 1).
+2. Первая законченная реплика владельца → `threads.spawn({ projectId, providerId: "live-call", model: "live", title: "Звонок ДД.ММ ЧЧ:ММ", prompt, environment: { type: "project-default" } })`. `environment` обязателен в SDK (`createThreadRequestSchema`): `project-default` подхватывает окружение `project-checkout`, которое `projects.create` делает само (см. п. 1).
 3. Следующая реплика: сервер шлёт мосту `end` для открытого хода, ждёт `turn_closed`, затем `threads.send({ threadId, mode: "start", input: [{ type: "text", text, mentions: [] }] })`.
 4. Реплики агента, действия и события — `say` в открытый ход. Действия выглядят так: `✉️ Отправил в «…»`, `📖 Прочитал «…»`, `🚀 Запустил «…»` — со ссылкой `@thread`.
-5. Конец звонка → `say` с итогом (решения, действия, хвосты), потом `end`. Заголовок дополняется темами: «📞 Звонок 02.11 12:40 — проект A, проект B».
+5. Конец звонка → `say` с итогом (решения, действия, хвосты), потом `end`. Заголовок дополняется темами: «Звонок 02.11 12:40 — проект A, проект B». Маркер звонка — не эмодзи в заголовке, а иконка провайдера `live-call` (регистрация `slots.experimental_providerIcon`, `providerKind: "agent"`, трубка `live-call/phone`): нативный список и плагины вроде compact-ui рисуют её на месте типа провайдера.
 
 ## 7. Сервер ↔ мост (внутренний протокол)
 

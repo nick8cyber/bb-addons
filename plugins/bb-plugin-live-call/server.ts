@@ -259,7 +259,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const projectId = await ensureCallsProject();
       const now = new Date();
-      const title = `📞 Звонок ${now.toLocaleDateString("ru-RU")} ${now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
+      const title = `Звонок ${now.toLocaleDateString("ru-RU")} ${now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`;
       const thread = (await bb.sdk.threads.spawn({
         projectId,
         providerId: "live-call",
