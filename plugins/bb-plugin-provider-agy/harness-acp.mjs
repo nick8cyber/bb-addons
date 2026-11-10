@@ -201,11 +201,17 @@ threadReqIds.t5 = 40;
 send({ jsonrpc: "2.0", id: 40, method: "thread/start", params: { threadId: "t5", cwd: workspace, options: editOptions, instructionMode: "append" } });
 await waitFor(() => replies(40).length === 1, 20000, "t5 start");
 send({ jsonrpc: "2.0", id: 41, method: "turn/start", params: { threadId: "t5", providerThreadId: ptidOf("t5"), input: [{ type: "text", text: "[[askperm]] do the thing", mentions: [] }], clientRequestId: creq(), options: editOptions } });
-await waitFor(() => messages.some((m) => m.method === "interaction/request" && m.params?.threadId === "t5"), 20000, "interaction request");
+const sawInteraction = () => messages.some((m) => m.method === "interaction/request" && m.params?.threadId === "t5");
+await waitFor(sawInteraction, 20000, "interaction request");
 stop(42, "t5", "release");
 await sleep(500);
-const permResponded = transcriptLines().some((l) => l.id !== undefined && typeof l.id === "string" && l.id.startsWith("perm-") && (l.result !== undefined || l.error !== undefined));
-check("interaction/resolved-on-release", permResponded, "(deny response reached the fake)");
+const lifecycle = messages.find((m) =>
+  m.method === "provider/raw" &&
+  m.params?.raw?.method === "system/interaction/lifecycle" &&
+  m.params?.raw?.params?.threadId === "t5" &&
+  m.params?.raw?.params?.interaction?.status === "cancelled");
+check("interaction/resolved-on-release", lifecycle !== undefined,
+  JSON.stringify(messages.slice(-15).map((m) => (m.method ?? `id:${m.id}`))));
 
 // --- scenario 9: two parallel threads on one account -----------------------
 {

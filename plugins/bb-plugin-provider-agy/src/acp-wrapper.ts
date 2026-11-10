@@ -42,8 +42,7 @@ import {
   accountByLabel,
   accountsEnabled,
   conversationAccount,
-  ineligibleBreakerMax,
-  ineligibleBreakerWindowMs,
+  checkIneligibleBreaker,
   ineligibleCooldownMs,
   isAccountIneligible,
   listAccounts,
@@ -169,6 +168,7 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 }
 
 function sendNotification(method: string, params: Record<string, unknown>): void {
+  log(`emit ${method} threadId=${String(params.threadId ?? "")}`);
   writeOutbound({ jsonrpc: "2.0", method, params });
 }
 
@@ -1327,16 +1327,9 @@ function coolSessionAccount(
   const ledger = loadLedger(dataDir);
   const now = Date.now();
   if (cause === "ineligible") {
-    const windowMs = ineligibleBreakerWindowMs();
-    const parkedCount = Object.values(ledger.accounts).filter(
-      (entry) =>
-        typeof entry.ineligibleAtMs === "number" &&
-        entry.ineligibleAtMs > now - windowMs &&
-        entry.ineligibleAtMs <= now,
-    ).length;
-    if (parkedCount >= ineligibleBreakerMax()) {
+    if (checkIneligibleBreaker(ledger, now)) {
       log(
-        `thread ${session.threadId}: ineligible breaker open (${parkedCount} parked in ${windowMs / 60_000}m); not parking ${session.accountLabel}`,
+        `thread ${session.threadId}: ineligible breaker open; not parking ${session.accountLabel}`,
       );
       return "breaker";
     }
@@ -1735,18 +1728,45 @@ function compactRestore(session: WSession): void {
 // Outbound interception
 // ---------------------------------------------------------------------------
 
-/** interaction/request ids in flight, by request id → threadId. */
-const pendingInteractions = new Map<JsonRpcId, string>();
+/** interaction/request ids in flight: request id → thread + payload. */
+const pendingInteractions = new Map<
+  JsonRpcId,
+  { threadId: string; payload: Record<string, unknown> }
+>();
 
 function resolveInteractions(threadId: string): void {
-  for (const [id, owner] of [...pendingInteractions.entries()]) {
-    if (owner !== threadId) {
+  for (const [id, record] of [...pendingInteractions.entries()]) {
+    if (record.threadId !== threadId) {
       continue;
     }
     pendingInteractions.delete(id);
-    // A synthesized deny settles the bridge's sendRuntimeRequest promise,
-    // which lets the ACP permission responder answer the agent's request.
-    feedLine({ jsonrpc: "2.0", id, result: { decision: "deny" } });
+    // The generic bridge kills the agent process and runs its own
+    // cancelPendingPermissions — answering the agent is pointless. What IS
+    // needed is the client's dialog: emit the lifecycle event that closes it.
+    const payload = { ...record.payload };
+    delete payload.availableDecisions;
+    sendNotification("provider/raw", {
+      threadId,
+      raw: {
+        jsonrpc: "2.0",
+        method: "system/interaction/lifecycle",
+        params: {
+          threadId,
+          interaction: {
+            id: String(id),
+            status: "cancelled",
+            statusReason: "Session released",
+            origin: {
+              kind: "provider",
+              providerId: "agy",
+              providerRequestId: String(id),
+            },
+            payload,
+            resolution: null,
+          },
+        },
+      },
+    });
     log(`thread ${threadId}: resolved hanging interaction ${String(id)}`);
   }
 }
@@ -2021,7 +2041,10 @@ function interceptOutbound(line: string): void {
   if (msg.method === "interaction/request" && msg.id !== undefined) {
     const params = optionsRecord(msg.params);
     if (typeof params.threadId === "string") {
-      pendingInteractions.set(msg.id as JsonRpcId, params.threadId);
+      pendingInteractions.set(msg.id as JsonRpcId, {
+        threadId: params.threadId,
+        payload: optionsRecord(params.payload),
+      });
     }
     rawWrite(`${line}\n`);
     return;

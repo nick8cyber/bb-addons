@@ -68,8 +68,7 @@ import {
 import {
   accountByLabel,
   accountsEnabled,
-  ineligibleBreakerMax,
-  ineligibleBreakerWindowMs,
+  checkIneligibleBreaker,
   ineligibleCooldownMs,
   ineligibleStderrBlock,
   isAccountIneligible,
@@ -1245,13 +1244,8 @@ function scheduleAccountRetry(
     const ledger = loadLedger(cliproxyRelayDataDir);
     const now = Date.now();
     if (reason === "ineligible") {
-      const windowMs = ineligibleBreakerWindowMs();
-      const parkedCount = Object.values(ledger.accounts).filter((entry) =>
-        typeof entry.ineligibleAtMs === "number" &&
-        entry.ineligibleAtMs > now - windowMs && entry.ineligibleAtMs <= now,
-      ).length;
-      if (parkedCount >= ineligibleBreakerMax()) {
-        log(`ineligible breaker open: ${parkedCount} accounts parked in the last ${windowMs / 60_000}m — suspect egress/network, not parking ${session.accountLabel}`);
+      if (checkIneligibleBreaker(ledger, now)) {
+        log(`ineligible breaker open — suspect egress/network, not parking ${session.accountLabel}`);
         return false;
       }
     }

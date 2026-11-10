@@ -274,3 +274,16 @@ export function writeAccountHome(
   });
   return home;
 }
+
+/** True when too many accounts were parked inside the breaker window — the
+ * egress looks guilty, not the accounts, so no more parking. */
+export function checkIneligibleBreaker(ledger: AccountsLedger, nowMs = Date.now()): boolean {
+  const windowMs = ineligibleBreakerWindowMs();
+  const parkedCount = Object.values(ledger.accounts).filter(
+    (entry) =>
+      typeof entry.ineligibleAtMs === "number" &&
+      entry.ineligibleAtMs > nowMs - windowMs &&
+      entry.ineligibleAtMs <= nowMs,
+  ).length;
+  return parkedCount >= ineligibleBreakerMax();
+}
