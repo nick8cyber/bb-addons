@@ -57,7 +57,7 @@ Generic-мост отвечает за: JSON-RPC, `session/new`/`load`/`prompt`/
 
 ## 5. Usage за ход
 
-`agy acp` возвращает `result.usage` (`inputTokens`, `outputTokens`, `thoughtTokens`, `totalTokens`) в ответе `session/prompt`; generic-мост его игнорирует (схема читает только `stopReason`), и на границу `handleLine` он не попадает. Добыча — **stdio-shim** (§1): снифит ответ `session/prompt`, пишет usage в side-channel, обёртка эмитит usage-дельту в тред. SQLite-прокси не нужен. Лимиты аккаунтов по-прежнему собирает `bb-plugin-usage-pro` — не трогаем.
+`agy acp` возвращает `result.usage` (`inputTokens`, `outputTokens`, `cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens`, `totalTokens`) в ответе `session/prompt`; generic-мост его игнорирует (схема читает только `stopReason`), и на границу `handleLine` он не попадает. Добыча — **stdio-shim** (§1): снифит ответ `session/prompt`, пишет usage в side-channel, обёртка эмитит usage-дельту в тред. SQLite-прокси не нужен. Лимиты аккаунтов по-прежнему собирает `bb-plugin-usage-pro` — не трогаем. С 11.11 рядом с usage-строкой эмитится и `contextWindow`-дельта (`used = inputTokens + cachedReadTokens`, `size` = family-map, `estimated:true`, snapshot) — без неё метр окна контекста показывал «not available yet» (agy не шлёт `usage_update`, поэтому generic-мост сам её не синтезирует).
 
 Проверка: в треде после хода виден расход токенов; фикстура отдаёт usage → дельта проходит.
 
