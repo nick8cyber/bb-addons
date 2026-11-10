@@ -12,6 +12,15 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 export default function plugin(bb: BbPluginApi) {
+  bb.settings.define({
+    subagentsDisabled: {
+      type: "boolean",
+      label: "Disable provider subagents",
+      description:
+        "Prevent agy from starting native subagents (invoke_subagent, swarm, boost) so agents use bb for delegation.",
+      default: true,
+    },
+  });
   bb.providers.register({
     id: "agy",
     displayName: "Antigravity (agy)",
@@ -54,6 +63,13 @@ export default function plugin(bb: BbPluginApi) {
       installUrl: "https://antigravity.google/docs/cli/getting-started",
     },
     composerActions: [],
+    // Central provider knob, same contract as codex/claude-code: bb's
+    // "Disable provider subagents" setting reaches the bridge as
+    // options.providerOptions.providerSubagentsEnabled; the wrapper resolves
+    // it against the AGY_DISABLE_SUBAGENTS env override.
+    deriveProviderOptions: (ctx) => ({
+      providerSubagentsEnabled: ctx.settings.subagentsDisabled !== true,
+    }),
     // The daemon hands this to the ACP wrapper on every thread-bound
     // request; the wrapper rewrites acpLaunchSpec per session (account
     // pool, shim, proxies) before delegating to the generic bridge.

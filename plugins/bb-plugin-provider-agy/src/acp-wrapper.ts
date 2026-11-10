@@ -747,25 +747,39 @@ function shimEnvFor(session: WSession): Record<string, string> {
  * params. Additive merge: other keys are preserved; both casings are
  * written because the reader is unknown (protojson accepts both).
  */
-const SUBAGENT_SETTINGS_KEYS: Record<string, unknown> = {
-  antigravityConfig: {
-    subagentsConfig: { enabled: false },
-    boostCommandDisabled: true,
-  },
-  antigravity_config: {
-    subagents_config: { enabled: false },
-    boost_command_disabled: true,
-  },
-};
-
-function subagentsDisabled(): boolean {
-  return process.env.AGY_DISABLE_SUBAGENTS !== "0";
+function subagentSettings(enabled: boolean): Record<string, unknown> {
+  return {
+    antigravityConfig: {
+      subagentsConfig: { enabled },
+      boostCommandDisabled: !enabled,
+    },
+    antigravity_config: {
+      subagents_config: { enabled },
+      boost_command_disabled: !enabled,
+    },
+  };
 }
 
-function stampSubagentDisable(geminiDir: string): void {
-  if (!subagentsDisabled()) {
-    return;
+/**
+ * Whether agy may spawn native subagents for this session. Resolution order:
+ * `AGY_DISABLE_SUBAGENTS` env override ("0" allows, anything else forbids) >
+ * `providerOptions.providerSubagentsEnabled` derived by the server from the
+ * `subagentsDisabled` plugin setting > default OFF (bb owns every subagent).
+ */
+function subagentsEnabledFor(session: WSession): boolean {
+  const override = process.env.AGY_DISABLE_SUBAGENTS;
+  if (override !== undefined && override !== "") {
+    return override === "0";
   }
+  const derived = optionsRecord(session.baseOptions.providerOptions)
+    .providerSubagentsEnabled;
+  if (typeof derived === "boolean") {
+    return derived;
+  }
+  return false;
+}
+
+function stampSubagentConfig(geminiDir: string, enabled: boolean): void {
   const file = join(geminiDir, "settings.json");
   try {
     let doc: Record<string, unknown> = {};
@@ -781,7 +795,7 @@ function stampSubagentDisable(geminiDir: string): void {
         return;
       }
     }
-    for (const [section, fields] of Object.entries(SUBAGENT_SETTINGS_KEYS)) {
+    for (const [section, fields] of Object.entries(subagentSettings(enabled))) {
       const existing =
         doc[section] !== null &&
         typeof doc[section] === "object" &&
@@ -837,6 +851,8 @@ function buildLaunch(session: WSession): void {
     appendFileSync(session.controlFile, "");
   } catch {}
   const env = shimEnvFor(session);
+  const subagentsOn = subagentsEnabledFor(session);
+  env.AGY_DISABLE_SUBAGENTS = subagentsOn ? "0" : "1";
   const args: string[] = [materializeShim(), "acp"];
   let relayHome: string | null = null;
   if (dataDir !== "") {
@@ -871,7 +887,7 @@ function buildLaunch(session: WSession): void {
     geminiDir = join(relayHome, ".gemini");
   }
   if (geminiDir !== null) {
-    stampSubagentDisable(geminiDir);
+    stampSubagentConfig(geminiDir, subagentsOn);
     args.push("--gemini-dir", geminiDir);
   }
   session.launchEnv = env;
