@@ -1,0 +1,26 @@
+---
+title: Навигация сайдбара — иконочная строка вместо вертикального меню
+status: implemented
+updated: 2026-11-10
+tags: [bb, sidebar, navigation, layout]
+---
+
+# Контракт
+
+Владелец поручил уменьшить вертикальное меню навигации сайдбара («Новый тред», «Поиск по тредам», «Задачи Pro», «Ещё»): четыре текстовых пункта занимали ~143px и требовали редизайна в одну строку иконок. Блок принадлежит встроенному плагину `navigation` (нативная обёртка `sidebar-navigation-region`, placement `list`) — исходник недоступен, рестайл делается host-стилями в существующем sidebar-collapse (плагин space-оптимизаций). Новый плагин не создавать.
+
+## Требования
+
+1. **Одна горизонтальная строка иконок** внутри `[data-testid="sidebar-navigation-list"]`: destinations (`[data-sidebar-navigation-item]`) и кнопка «Ещё» выстраиваются flex-row, регион сжимается с ~143px до ~57px desktop (~69px mobile).
+2. **Только иконки**: текстовые лейблы скрываются (`button > :not([data-icon-root])`), кнопки квадратные `var(--bb-sidebar-row-height)`. aria-label и title сохраняют подсказки и доступность.
+3. **Chevron «Опции» каждого пункта скрываются** (`.bb-sidebar-hover-actions`): действия остаются доступны внутри самих панелей/меню.
+4. **Badge-точка у «Ещё» сохраняется** (`.rounded-full`): индикатор открытых задач не гасится.
+5. **Режим rail не затрагивается**: правила скоплены под `[data-testid="sidebar-navigation-list"]`, который существует только в list-раскладке; вертикальная rail-колонка не меняется.
+6. **Иконка Tasks Pro**: `ListFilter` → `ListTodo` (app.tsx navPanel + package.json branding) — метафоры «список задач» вместо «фильтр».
+7. Fail-open: если BB переименует разметку — правила молча перестают действовать, интерфейс штатный.
+
+## Проверка и выпуск
+
+- Тесты sidebar-collapse 134/134 + typecheck + build.
+- Chromium desktop 1440×1050: регион 57px, иконки MessageSquarePlus/Search/ListTodo/MoreHorizontal в одном ряду, badge на месте. Mobile 390×844: ряд 40px-кнопок, та же строка.
+- Откат: удаление CSS-блока navigation из `SIDEBAR_CONTROLS_CSS`; иконка tasks-pro — возврат `ListFilter`.

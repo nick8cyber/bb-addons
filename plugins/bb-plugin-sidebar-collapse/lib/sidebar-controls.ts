@@ -101,6 +101,30 @@ form[class*="group/promptbox"] div.overflow-y-auto:has(.ProseMirror) {
   max-height: min(312px, calc(33vh - 56px));
   max-height: min(312px, calc(33svh - 56px));
 }
+/* Navigation (list placement): collapse the four destinations into one icon row.
+   Labels and per-item option chevrons are hidden; aria-labels keep tooltips. */
+[data-testid="sidebar-navigation-list"] {
+  display: flex !important; flex-direction: row !important;
+  align-items: center !important; gap: 2px;
+}
+[data-testid="sidebar-navigation-destinations"] {
+  display: flex !important; flex-direction: row !important;
+  align-items: center !important; gap: 2px;
+  max-height: none !important; overflow: visible !important; flex: 0 0 auto;
+}
+[data-sidebar-navigation-item] { flex: 0 0 auto; }
+[data-testid="sidebar-navigation-list"] button {
+  width: var(--bb-sidebar-row-height) !important;
+  min-width: var(--bb-sidebar-row-height) !important;
+  padding-left: 0 !important; padding-right: 0 !important;
+  justify-content: center !important;
+}
+[data-testid="sidebar-navigation-list"] button > :not([data-icon-root]):not(.rounded-full) {
+  display: none !important;
+}
+[data-testid="sidebar-navigation-region"] .bb-sidebar-hover-actions {
+  display: none !important;
+}
 `;
 export function mountSidebarControls(signal?: AbortSignal, doc: Document = document): () => void {
   if (signal?.aborted) return () => {};

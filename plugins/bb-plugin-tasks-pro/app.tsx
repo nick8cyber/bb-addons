@@ -13,7 +13,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "explorer",
     title: "Tasks Pro",
-    icon: "ListFilter",
+    icon: "ListTodo",
     path: "explorer",
     component: TasksProPanel,
   });
