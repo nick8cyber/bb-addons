@@ -34,9 +34,10 @@ export default function plugin(bb: BbPluginApi) {
       supportsManualCompaction: true,
       supportsThreadArchive: false,
       supportsThreadRename: false,
-      // The ACP transport speaks session/set_mode and
-      // --dangerously-skip-permissions, so the whole ladder is honest now.
-      permissionModes: ["full", "auto", "accept-edits"],
+      // The ACP dialect delivers full/accept-edits only: "auto" has no
+      // permissionCli mapping in the generic bridge, and the daemon rejects
+      // it at thread.start even when declared — so it is not offered here.
+      permissionModes: ["full", "accept-edits"],
       // agy's own ladder; the model list encodes the effort in the model id.
       reasoningLevels: ["low", "medium", "high"],
     },
