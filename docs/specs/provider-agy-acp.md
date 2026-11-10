@@ -43,7 +43,7 @@ Generic-мост отвечает за: JSON-RPC, `session/new`/`load`/`prompt`/
 2. Обёртка ждёт остановки/релиза текущей сессии, затем синтезирует `thread/start` на том же треде с `--gemini-dir` сиблинга → generic-мост релизит старую сессию и строит новую → обёртка эмитит `sessionReplaced` (contextLost).
 3. Обёртка синтезирует `turn/start` с `input` = handoff-промпт (`[quota-rotation-handoff]` + recentAssistantText ≤4k + `git diff --stat`); идентификаторы хода маппятся на ожидаемый демоном turn, чтобы boundary/дельты закрыли исходный ход честно.
 - Очередь ходов — **в самой обёртке** (generic очередь не держит): ходы, пришедшие во время ротации, выполняются по порядку на новой сессии.
-- Если остыл весь пул: обёртка пропускает `provider.error` наружу с инжектированным `errorInfo{category:"rate-limit", httpStatusCode:429}` и эмитит `provider.rateLimits` (blocked, resetsAt = ближайший конец кулдауна) → штатный `provider-retry` ждёт resetsAt и перезапускает ход. Когда от `provider-retry` приходит повторный `turn/start`, обёртка проверяет кулдаун текущего аккаунта сессии: если мёртв/сменился — сначала автомат пп.2–3 (новая сессия + handoff), затем пропуск хода. Снятие blocked — `provider.rateLimits` ready.
+- Если остыл весь пул: обёртка пропускает `provider.error` наружу с инжектированным `errorInfo{category:"rate-limit", httpStatusCode:429}` и эмитит `provider.rateLimits` (blocked, resetsAt = ближайший конец кулдауна) → штатный `provider-retry` ждёт resetsAt и перезапускает ход. Когда от `provider-retry` приходит повторный `turn/start`, обёртка проверяет кулдаун текущего аккаунта сессии: если мёртв/сменился — сначала автомат пп.2–3 (новая сессия + handoff), затем пропуск хода. Снятие blocked — `provider.rateLimits` ready. Пока сессия в состоянии blocked, `drainQueue` **удерживает daemon-ходы** в очереди (internal-ходы автомата всегда дренируются); после `ready`/settle очередь снимается `drainQueue` из `onSettled`.
 - `AGY_AUTO_RETRY_MAX`, `AGY_AUTO_RETRY_MAX_WAIT_MS`, `AGY_INELIGIBLE_*` — те же env и смыслы; бюджет ретраев — на сессию, сбрасывается на честно завершённом ходе. Stop отменяет ожидание ретрая и висящий повтор.
 
 Проверка: харнесс `harness-rotation.mjs` на ACP — квота на А → переезд на Б с handoff за ~1с, демон видит один непрерывный ход; весь пул в кулдауне → rateLimits blocked + ретрай после resetsAt на ожившем сиблинге; ход, пришедший во время ротации, выполняется после неё.
@@ -63,7 +63,7 @@ Generic-мост отвечает за: JSON-RPC, `session/new`/`load`/`prompt`/
 ## 6. Восстановление: compaction fallback и ArtifactMetadata
 
 - **Compact fallback** (`AGY_COMPACT_FALLBACK`): конечный автомат ADR-0003 переносится в обёртку — при отказе сжатия: `compactSummaryPrompt` в том же разговоре → новая сессия с `compactSeedPrompt`/`compactMemoPrompt` первым ходом. `/compact` у agy acp идёт обычным текстом промпта (проверено живым тестом); собственного `session/compact` у сервера нет.
-- **ArtifactMetadata**: основной механизм — превентивный `WRITE_GUARDRAIL` в инструкциях сессии (перехват `tool_call_update` через `handleLine` невозможен). Дополнительно shim видит текст отказа `tool_call_update` («is not a valid artifact path») в side-channel → обёртка может однократно подать `writeRetryNudge` следующим вводом (`MAX_ARTIFACT_RETRIES=1`).
+- **ArtifactMetadata**: основной механизм — превентивный `WRITE_GUARDRAIL` в инструкциях сессии (перехват `tool_call_update` через `handleLine` невозможен). Дополнительно shim видит текст отказа `tool_call_update` («is not a valid artifact path») в side-channel → обёртка может однократно подать `writeRetryNudge` следующим вводом (`MAX_ARTIFACT_RETRIES=1` **на ход**: счётчик и флаг nudge сбрасываются на каждой границе хода — долгоживущая сессия не теряет nudge после первого использования).
 
 Проверка: харнесс `harness-errors.mjs`/`harness-artifact.mjs` на ACP — компакт-фоллбэк проходит два шага, артефактный отказ встречает один повтор с nudge.
 
@@ -79,13 +79,15 @@ Generic-мост отвечает за: JSON-RPC, `session/new`/`load`/`prompt`/
 
 - `model/list`: быстрый путь — ответ из кэша (TTL 6 ч) или `agy models` (~100 мс); холодный прогон ACP-сервера только на промахе кэша (таймаут, при неудаче — последний кэш). Усилия — не отдельные модели: `gemini-3.8-flash` + `supportedReasoningEfforts` (low/medium/high) → `session/set_config_option` (`thought_level`), маппинг id вида `<model>-<effort>` по образцу `model-utils.ts` rawizhere; голый id без суффикса — стандартная лестница `thought_level` (low/medium/high), не «только medium».
 - Permission mode треда → `session/set_mode` на живой сессии (`default`/`accept-edits`/`plan`; проверено: работает на лету). `--dangerously-skip-permissions` добавляется в args для `full` (`permissionCli`-маппинг). Декларация режимов в `server.ts` — см. §1.
+- Канал смены режима на живой сессии — side-channel файл `acp-shim/ctl-<thread>-<nonce>.ndjson`: обёртка **создаёт его пустым при запуске сессии** (shim ставит `fs.watch` до первой записи; без файла watch молча не регистрируется). Shim дополнительно создаёт файл перед `watch` и дренирует его на каждой входящей строке — три независимых гарантии доставки `{"cmd":"set_mode","mode":...}` → `session/set_mode` в agy.
 - Стиринг — `turn/steer` generic-моста (session/prompt на живой сессии); очередь стирингов старого моста не нужна — `session/cancel` отменяет mid-tool штатно (проверено).
 
 Проверка: `bb provider models agy` отвечает <1с на горячем кэше; смена режима в треде не пересоздаёт сессию; стиринг доезжает в идущий ход.
 
 ## 9. Прочее из аудита
 
-- Висящие `interactionRequest`: обёртка ведёт мапу активных `interactionId` из перехваченных нотификаций демона и при релизе сессии (ротация, stop) эмитит клиенту событие резолва/отмены каждого — иначе диалог аппрува висит в UI навсегда (`cancelPendingPermissions` generic-моста закрывает только внутренний запрос агента).
+- Висящие `interactionRequest`: обёртка ведёт мапу активных `interactionId` из перехваченных нотификаций демона и при релизе сессии (ротация, stop, failOut) эмитит клиенту событие резолва/отмены каждого — иначе диалог аппрува висит в UI навсегда (`cancelPendingPermissions` generic-моста закрывает только внутренний запрос агента).
+- Аудит PLUG-167 (10.11.2026, Gemini review): дополнительно закрыты — ctl-канал set_mode (см. §8), `input.accepted` для стиринга в ротации, per-turn бюджет artifact-nudge (§5), удержание очереди при rateLimits-blocked (§3), shim SIGTERM ребёнку по таймауту после закрытия stdin, `events.ndjson` читается с EOF при старте (без реплея мёртвых сессий), armed-ошибка side-channel помечается handled при первой классификации.
 - Общий `conversation_summaries.db` мостом для чтения не используется — `SQLITE_BUSY` не возникает.
 - Параллельные треды на одном аккаунте допустимы; кулдаун от 429 любого из них ставится на аккаунт целиком (как сейчас); покрывается тестом §11.
 
