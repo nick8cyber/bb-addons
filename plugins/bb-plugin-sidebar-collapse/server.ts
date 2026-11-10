@@ -89,6 +89,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Дописывать в строку чата имя ветки его окружения. Родной список bb ветку не показывает.",
       default: false,
     },
+    navDiag: {
+      type: "boolean",
+      label: "Nav top-row diagnostics (debug)",
+      description:
+        "Включает канал самопроверки навигационных иконок: опрос команд и запись диагностики в /tmp. Выключено по умолчанию — только для отладки.",
+      default: false,
+    },
     hideNavigationRail: {
       type: "boolean",
       label: "Скрыть полосу навигации",

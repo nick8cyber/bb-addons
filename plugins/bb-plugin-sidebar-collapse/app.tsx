@@ -872,7 +872,10 @@ export function registerNavigationRail(app: PluginAppBuilder): void {
  *  and report where the menu actually rendered). */
 function NavDiagBridge() {
   const rpc = useRpc<typeof rpcContract>();
+  const { values } = useSettings();
+  const enabled = values?.navDiag === true;
   useEffect(() => {
+    if (!enabled) return;
     let last = "";
     const win = window as unknown as Record<string, unknown>;
     const timer = setInterval(() => {
@@ -888,7 +891,7 @@ function NavDiagBridge() {
       }).catch(() => {});
     }, 2000);
     return () => clearInterval(timer);
-  }, [rpc]);
+  }, [rpc, enabled]);
   return null;
 }
 
