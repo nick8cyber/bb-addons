@@ -16,7 +16,9 @@
       no_blocking_wait.py PreToolUse(exec) — только если у пользователя есть
                         ~/.claude/hooks/no-blocking-wait.py (это правило его Claude)
   - read_config_from.claude = true  (Devin читает ~/.claude/CLAUDE.md, как Claude)
-  - subagents_enabled = false       (субагенты — только треды bb)
+  - subagents_enabled = false       только при первом запуске (ключа нет);
+      дальше ключом управляет центральная настройка bb subagentsDisabled
+      (host-gate плагина provider-devin)
 ~/.config/devin/hooks — ссылка на постоянный каталог (старые сессии держат этот путь).
 """
 import datetime
@@ -112,7 +114,8 @@ def main():
         config = json.load(f)
     new = dict(config)
     new["hooks"] = merged_hooks(config.get("hooks"))
-    new["subagents_enabled"] = False
+    new.setdefault("subagents_enabled", False)  # первый запуск — выкл;
+    # дальше ключом управляет настройка subagentsDisabled (см. host.ts)
     rcf = dict(new.get("read_config_from") or {})
     rcf["claude"] = True
     rcf.setdefault("agents_standard", True)
