@@ -85,6 +85,23 @@ function collectDiag(doc: Document, row: Element | null, sources: HTMLElement[],
       ? stackAt(rects[0].x + rects[0].w / 2, rects[0].y + 14)
       : [];
     const region = doc.querySelector('[data-testid="sidebar-navigation-region"]');
+    const dots = Array.from(doc.querySelectorAll('[class*="rounded"], [class*="badge"], [class*="avatar"], [class*="dot"], [class*="indicator"], [class*="unread"], [class*="notification"], [class*="count"], [data-nav-rail-badge], [data-icon]'))
+      .filter((e) => {
+        const r = e.getBoundingClientRect();
+        return r.width >= 6 && r.width <= 48 && r.top < 80 && getComputedStyle(e).visibility !== "hidden" && getComputedStyle(e).display !== "none";
+      })
+      .slice(0, 10)
+      .map((e) => {
+        const r = e.getBoundingClientRect();
+        const el = e as HTMLElement;
+        return {
+          tag: e.tagName, cls: (el.className?.toString?.() || "").slice(0, 80),
+          text: (el.textContent || "").trim().slice(0, 20),
+          x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+          insideRegion: region?.contains(e) ?? false,
+          inTopRow: !!e.closest?.('[data-testid="app-sidebar-top-reserve-row"]'),
+        };
+      });
     const rowChildren = row
       ? Array.from(row.children).map((c) => {
           const r = c.getBoundingClientRect();
@@ -97,6 +114,42 @@ function collectDiag(doc: Document, row: Element | null, sources: HTMLElement[],
           };
         })
       : [];
+    const pseudoScan = (root: Element | null): Record<string, unknown>[] => {
+      if (!root) return [];
+      const out: Record<string, unknown>[] = [];
+      const els = [root, ...Array.from(root.querySelectorAll("*"))];
+      for (const el of els.slice(0, 60)) {
+        for (const p of ["::before", "::after"] as const) {
+          try {
+            const s = getComputedStyle(el, p);
+            if (s.display !== "none" && s.position !== "static" && parseFloat(s.width) >= 6 && s.content !== "none" && s.content !== "normal") {
+              const r = el.getBoundingClientRect();
+              out.push({
+                p, cls: ((el as HTMLElement).className?.toString?.() || "").slice(0, 60),
+                w: s.width, h: s.height, bg: s.backgroundColor.slice(0, 40), pos: s.position,
+                shadow: s.boxShadow.slice(0, 60), border: `${s.borderTopWidth} ${s.borderTopStyle}`,
+                elX: Math.round(r.x), elY: Math.round(r.y),
+                content: s.content.slice(0, 20),
+              });
+            }
+          } catch { /* skip */ }
+        }
+      }
+      return out.slice(0, 15);
+    };
+    const pseudo = (el: Element | null | undefined) => {
+      if (!el) return null;
+      const out: Record<string, string> = {};
+      for (const p of ["::before", "::after"] as const) {
+        const s = getComputedStyle(el, p);
+        if (s.display !== "none" && s.content !== "none" && s.content !== "normal" && parseFloat(s.width) > 0) {
+          out[p] = `content=${s.content.slice(0, 30)} w=${s.width} h=${s.height} bg=${s.backgroundColor} pos=${s.position} r=${s.borderRadius}`;
+        }
+      }
+      return Object.keys(out).length ? out : null;
+    };
+    const moreClone = clone?.querySelector("button:last-of-type");
+    const moreSource = sources.find((s) => s.querySelector(".rounded-full"));
     const win = (doc.defaultView || window) as unknown as Record<string, unknown>;
     win.__bbNavTopDiag = {
       ts: Date.now(),
@@ -107,6 +160,39 @@ function collectDiag(doc: Document, row: Element | null, sources: HTMLElement[],
       overlaps,
       rowChildren,
       paintStack,
+      dots,
+      pseudoClone: pseudo(moreClone),
+      pseudoRow: pseudoScan(row),
+      pseudoAncestors: [row?.parentElement, row?.parentElement?.parentElement, row?.parentElement?.parentElement?.parentElement]
+        .flatMap((p) => pseudoScan(p || null)).slice(0, 15),
+      rectScan: Array.from(doc.querySelectorAll("body *")).filter((e) => {
+        const r = e.getBoundingClientRect();
+        return r.top >= -10 && r.top < 80 && r.width >= 8 && r.width <= 40 && Math.abs(r.width - r.height) <= 10
+          && getComputedStyle(e).visibility !== "hidden";
+      }).slice(0, 25).map((e) => {
+        const r = e.getBoundingClientRect(); const el = e as HTMLElement; const s = getComputedStyle(el);
+        return { tag: e.tagName, cls: (el.className?.toString?.() || "").slice(0, 70),
+          x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width),
+          pe: s.pointerEvents,
+          shadow: s.boxShadow !== "none" ? s.boxShadow.slice(0, 50) : undefined,
+          bgImg: s.backgroundImage !== "none" ? s.backgroundImage.slice(0, 60) : undefined,
+          plugin: el.closest?.("[data-bb-plugin]")?.getAttribute("data-bb-plugin") || "" };
+      }),
+      rowBg: row ? getComputedStyle(row).backgroundImage.slice(0, 80) : null,
+      rowShadow: row ? getComputedStyle(row).boxShadow.slice(0, 80) : null,
+      zoneScan: Array.from(doc.querySelectorAll("body *")).filter((e) => {
+        const r = e.getBoundingClientRect();
+        return r.left < 285 && r.right > 140 && r.top < 60 && r.bottom > -5 && r.width > 0 && r.width <= 300
+          && getComputedStyle(e).visibility !== "hidden";
+      }).sort((a, b) => { const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect(); return (ra.width * ra.height) - (rb.width * rb.height); })
+        .slice(0, 30).map((e) => {
+          const r = e.getBoundingClientRect(); const el = e as HTMLElement;
+          return { tag: e.tagName, cls: (el.className?.toString?.() || "").slice(0, 60),
+            x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+            plugin: el.closest?.("[data-bb-plugin]")?.getAttribute("data-bb-plugin") || "" };
+        }),
+      pseudoSource: pseudo(moreSource),
+      sourceBadgeHtml: moreSource?.querySelector(".rounded-full")?.outerHTML?.slice(0, 300) || null,
       regionHidden: region ? getComputedStyle(region).visibility === "hidden" : null,
     };
   } catch { /* diagnostics must never break the script */ }

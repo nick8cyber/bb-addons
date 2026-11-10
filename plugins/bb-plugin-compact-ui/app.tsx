@@ -888,6 +888,18 @@ function NavDiagBridge() {
       }
       void rpc.call("nav_top_row_poll", {}).then(({ command }) => {
         if (command === "test_more") runMoreSelfTest(win);
+        const probe = command?.match(/^probe\s+(\d+)\s+(\d+)$/);
+        if (probe) {
+          win.__bbNavTopTest = {
+            cmd: command, ts: Date.now(),
+            stack: Array.from(document.elementsFromPoint(Number(probe[1]), Number(probe[2]))).slice(0, 8).map((e) => {
+              const el = e as HTMLElement; const r = el.getBoundingClientRect();
+              return { tag: e.tagName, cls: (el.className?.toString?.() || "").slice(0, 80),
+                label: el.getAttribute?.("aria-label") || "", testid: el.getAttribute?.("data-testid") || "",
+                w: Math.round(r.width), h: Math.round(r.height), plugin: el.closest?.("[data-bb-plugin]")?.getAttribute("data-bb-plugin") || "" };
+            }),
+          };
+        }
       }).catch(() => {});
     }, 2000);
     return () => clearInterval(timer);
