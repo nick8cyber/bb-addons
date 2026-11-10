@@ -1,5 +1,5 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { z } from "zod";
 
 /** Project drag-and-drop is not part of the frontend sidebar API, so the list
@@ -24,9 +24,16 @@ export const rpcContract = defineRpcContract({
     input: z.object({ report: z.string().max(20000) }).strict(),
     output: z.object({ ok: z.literal(true) }),
   },
+  /** One-shot commands for the UI self-test: written into CMD_PATH by the
+   *  agent, consumed (and deleted) by the next poll from the app bridge. */
+  nav_top_row_poll: {
+    input: z.object({}).strict(),
+    output: z.object({ command: z.string().nullable() }),
+  },
 });
 
 const DIAG_PATH = "/tmp/sidebar-collapse-nav-top-row.json";
+const CMD_PATH = "/tmp/sidebar-collapse-nav-cmd.txt";
 
 export async function selectThreadList(bb: BbPluginApi, collapsed: boolean, isDisposed = () => false) {
   if (isDisposed()) return false;
@@ -129,6 +136,11 @@ export default async function plugin(bb: BbPluginApi) {
     nav_top_row_diag: async ({ report }) => {
       await writeFile(DIAG_PATH, report, "utf8").catch((e) => bb.log.warn("nav diag write failed: " + String(e)));
       return { ok: true } as const;
+    },
+    nav_top_row_poll: async () => {
+      const command = (await readFile(CMD_PATH, "utf8").catch(() => "")).trim() || null;
+      if (command) await unlink(CMD_PATH).catch(() => {});
+      return { command };
     },
   });
 

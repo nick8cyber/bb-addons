@@ -867,22 +867,53 @@ export function registerNavigationRail(app: PluginAppBuilder): void {
 
 /** Forwards the nav-top-row content script's live DOM diagnostics
  *  (window.__bbNavTopDiag) to the plugin backend so it lands in a file —
- *  verification without a headless browser. */
+ *  verification without a headless browser. Also executes one-shot
+ *  self-test commands (e.g. "test_more": click the cloned "More" button
+ *  and report where the menu actually rendered). */
 function NavDiagBridge() {
   const rpc = useRpc<typeof rpcContract>();
   useEffect(() => {
     let last = "";
+    const win = window as unknown as Record<string, unknown>;
     const timer = setInterval(() => {
-      const diag = (window as unknown as Record<string, unknown>).__bbNavTopDiag;
-      if (!diag) return;
-      const report = JSON.stringify(diag);
-      if (report === last) return;
-      last = report;
-      void rpc.call("nav_top_row_diag", { report }).catch(() => {});
+      const diag = win.__bbNavTopDiag;
+      const test = win.__bbNavTopTest;
+      const report = JSON.stringify({ diag, test });
+      if (report !== last) {
+        last = report;
+        void rpc.call("nav_top_row_diag", { report }).catch(() => {});
+      }
+      void rpc.call("nav_top_row_poll", {}).then(({ command }) => {
+        if (command === "test_more") runMoreSelfTest(win);
+      }).catch(() => {});
     }, 2000);
     return () => clearInterval(timer);
   }, [rpc]);
   return null;
+}
+
+function runMoreSelfTest(win: Record<string, unknown>): void {
+  const host = document.querySelector(".bb-nav-top-icons");
+  const buttons = host ? Array.from(host.querySelectorAll("button")) : [];
+  const clone = buttons.find((b) => /more|ещё|ещe/i.test(b.getAttribute("aria-label") || "")) || buttons[buttons.length - 1];
+  const result: Record<string, unknown> = { cmd: "test_more", ts: Date.now(), cloneFound: !!clone };
+  if (!clone) { win.__bbNavTopTest = result; return; }
+  const region = document.querySelector('[data-testid="sidebar-navigation-region"]');
+  clone.click();
+  setTimeout(() => {
+    const menus = Array.from(document.querySelectorAll(
+      '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content], [data-state="open"]',
+    ));
+    result.menusFound = menus.length;
+    result.menus = menus.slice(0, 5).map((m) => ({
+      tag: m.tagName, role: m.getAttribute("role"),
+      insideRegion: region?.contains(m) ?? false,
+      visibility: getComputedStyle(m).visibility,
+      rect: (() => { const r = m.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width) }; })(),
+    }));
+    win.__bbNavTopTest = result;
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  }, 400);
 }
 
 function GitHeader({ threadId }: { threadId: string }) {
