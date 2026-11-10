@@ -32,6 +32,7 @@ import {
   appendFileSync,
   chmodSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -743,6 +744,11 @@ function buildLaunch(session: WSession): void {
     `ctl-${session.threadId}-${session.nonce}.ndjson`,
   );
   ensureShimDir();
+  // The shim fs.watch()es this file: it must exist before the shim starts or
+  // the watch silently never registers (ENOENT swallowed by catch).
+  try {
+    appendFileSync(session.controlFile, "");
+  } catch {}
   const env = shimEnvFor(session);
   const args: string[] = [materializeShim(), "acp"];
   let relayHome: string | null = null;
@@ -1249,7 +1255,10 @@ function drainQueue(session: WSession): void {
     const head = session.queue[0];
     // Daemon turns wait out rotations and the compaction automaton; internal
     // turns ARE the automaton and always drain.
-    if (head.kind === "daemon" && (session.rotating || session.compact !== null)) {
+    if (
+      head.kind === "daemon" &&
+      (session.rotating || session.compact !== null || session.rateLimitsBlocked)
+    ) {
       return;
     }
     session.queue.shift();
@@ -1297,12 +1306,12 @@ function drainQueue(session: WSession): void {
     session.settledInternal = head.onSettled;
     if (head.consumeRequestId !== undefined) {
       sendResult(head.consumeRequestId, { threadId: session.threadId });
-      if (head.consumeClientRequestId !== undefined) {
-        emitDeltas(session.threadId, {
-          kind: "input.accepted",
-          clientRequestId: head.consumeClientRequestId,
-        });
-      }
+    }
+    if (head.consumeClientRequestId !== undefined) {
+      emitDeltas(session.threadId, {
+        kind: "input.accepted",
+        clientRequestId: head.consumeClientRequestId,
+      });
     }
     log(
       `injecting internal turn ${head.tag} on ${session.threadId} (queue left ${session.queue.length})`,
@@ -1461,6 +1470,7 @@ function nearestCooldownEnd(session: WSession): number | null {
  * a turn the daemon still holds open — the failed boundary that closes it.
  */
 function failOut(session: WSession, message: string): void {
+  resolveInteractions(session.threadId);
   if (session.pendingConsume !== null) {
     sendError(session.pendingConsume.requestId, -32000, message);
     session.pendingConsume = null;
@@ -1518,6 +1528,9 @@ function startRotation(
   cause: "quota" | "ineligible",
   message: string,
 ): void {
+  // The dying session's pending permission dialogs would hang in the UI
+  // forever — resolve them before the session is released or replaced.
+  resolveInteractions(session.threadId);
   const { account } = freeSibling(session, session.accountLabel);
   if (account === null) {
     log(
@@ -1879,6 +1892,11 @@ function onProviderErrorDelta(
       (typeof delta.detail === "string" ? `\n${delta.detail}` : "");
   const category = classifyError(text);
   if (category !== "rate-limit" && !isAccountIneligible(text)) {
+    // Consumed once for classification: leaving it armed would let this old
+    // error text shadow the classification of later boundaries for 60s.
+    if (armed !== null) {
+      armed.handled = true;
+    }
     return "pass";
   }
   if (armed !== null) {
@@ -1907,6 +1925,8 @@ function onTurnBoundary(session: WSession, delta: Record<string, unknown>): void
   const status = typeof delta.status === "string" ? delta.status : "failed";
   session.bridgeTurnBusy = false;
   session.daemonTurnOpen = false;
+  session.artifactRetries = 0;
+  session.artifactNudgeQueued = false;
   const settled = session.settledInternal;
   session.settledInternal = null;
   if (status === "completed") {
@@ -2468,6 +2488,16 @@ export const experimental_providerBridge = {
     dataDir = context.dataDir;
     logFile = join(context.dataDir, "acp-wrapper.log");
     ensureShimDir();
+    // Events older than this wrapper instance belong to dead sessions and
+    // would re-emit stale usage/errors into live threads — skip to EOF once,
+    // before any session of this instance can produce events.
+    try {
+      const file = eventsFilePath();
+      if (existsSync(file)) {
+        eventsFd = openSync(file, "r");
+        eventsOffset = fstatSync(eventsFd).size;
+      }
+    } catch {}
     ensureStarted();
     loadModelDiskCache();
     log(`acp wrapper started (dataDir=${context.dataDir})`);

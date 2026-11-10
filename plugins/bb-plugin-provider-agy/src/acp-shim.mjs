@@ -139,6 +139,9 @@ function drainControlFile() {
 }
 if (CONTROL_FILE !== null) {
   try {
+    // fs.watch throws ENOENT synchronously on a missing file and the catch
+    // would swallow it — the file must exist before the watch registers.
+    if (!existsSync(CONTROL_FILE)) appendFileSync(CONTROL_FILE, "");
     watch(CONTROL_FILE, () => {
       try { drainControlFile(); } catch {}
     });
@@ -149,6 +152,7 @@ if (CONTROL_FILE !== null) {
 
 const rlIn = createInterface({ input: process.stdin, crlfDelay: Infinity });
 rlIn.on("line", (line) => {
+  drainControlFile();
   if (!acceptingClientInput) return;
   if (line.trim().length > 0) {
     try {
@@ -166,6 +170,10 @@ rlIn.on("line", (line) => {
 rlIn.on("close", () => {
   acceptingClientInput = false;
   if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
+  const t = setTimeout(() => {
+    if (!child.killed) child.kill("SIGTERM");
+  }, 2500);
+  t.unref?.();
 });
 
 // --- child → stdout --------------------------------------------------------
