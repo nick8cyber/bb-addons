@@ -21,6 +21,8 @@
  *   - `session/update` notifications whose `tool_call_update` carries a
  *     refusal text (the ArtifactMetadata "is not a valid artifact path"
  *     refusal) — appended as `{"t":"tool-refusal",...}`;
+  *   - `session/new` / `session/load` requests: `disableBuiltInTools` is
+ *     injected (bb owns all subagents — agy must not spawn its own ones);
  *   - `session/new` / `session/load` responses: the session id is remembered;
  *     when $AGY_SHIM_SET_MODE names a session mode, the shim then issues its
  *     own `session/set_mode` (ids from a private high range, responses
@@ -43,6 +45,22 @@ const NONCE = process.env.AGY_SHIM_NONCE ?? null;
 const INITIAL_MODE = process.env.AGY_SHIM_SET_MODE ?? "";
 const SHIM_ID_BASE = 1_000_000_000;
 const SET_MODE_SETTLE_MS = 400;
+// Built-in tools that let agy spawn its own agents invisibly to bb: every
+// subagent must be a bb thread, so these names are injected into
+// session/new|load params.disableBuiltInTools. Extra names are harmless —
+// the agent filters the list against its own tool registry.
+// AGY_DISABLE_SUBAGENTS=0 opts out (env relayed to the child as-is).
+const SUBAGENT_TOOLS_DISABLED = [
+  "invoke_subagent",
+  "manage_subagents",
+  "define_subagent",
+  "browser_subagent",
+  "run_subagent",
+  "native_swarm",
+  "manage_swarm",
+  "boost",
+];
+const DISABLE_SUBAGENTS = process.env.AGY_DISABLE_SUBAGENTS !== "0";
 
 if (REAL_BIN.length === 0) {
   process.stderr.write("acp-shim: AGY_SHIM_REAL_BIN is not set\n");
@@ -162,6 +180,15 @@ rlIn.on("line", (line) => {
           method: msg.method,
           sessionId: msg.params?.sessionId ?? null,
         });
+        if (
+          DISABLE_SUBAGENTS &&
+          (msg.method === "session/new" || msg.method === "session/load") &&
+          msg.params !== null &&
+          typeof msg.params === "object"
+        ) {
+          msg.params.disableBuiltInTools = SUBAGENT_TOOLS_DISABLED;
+          line = JSON.stringify(msg);
+        }
       }
     } catch {}
   }

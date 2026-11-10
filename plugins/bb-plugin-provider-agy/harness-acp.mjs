@@ -262,6 +262,13 @@ await waitFor(() => replies(160).length === 1, 20000, "t7 resume");
 await waitFor(() => ["a1", "a2", "a3", "a4"].some((h) => h !== t6acct && news(h).length > newsBefore[h]), 20000, "t7 sibling start");
 check("authdead/resume-sibling", true, "");
 
+// d2) resume on a LIVE owner → generic bridge issues a real session/load
+// (makes subagents/session-load-injected a non-vacuous check).
+threadReqIds.t1r = 165;
+resume(165, "t1r", ptidOf("t1"));
+await waitFor(() => replies(165).length === 1, 20000, "t1r live resume");
+await waitFor(() => transcriptLines().some((l) => l.method === "session/load"), 20000, "session/load reaches fake");
+
 // c) every account dead → honest pool-exhausted fail, no rotation spam.
 setControl({ modeByLabel: { a1: "auth-dead", a2: "auth-dead", a3: "auth-dead", a4: "auth-dead" } });
 threadReqIds.t8 = 170;
@@ -279,6 +286,14 @@ setControl({ modeByLabel: {} });
 // --- shim materialization ---------------------------------------------------
 check("shim/materialized", existsSync(join(root, "acp-shim.mjs")) && readFileSync(join(root, "acp-shim.mjs"), "utf8").includes("NDJSON relay"), "");
 check("shim/argv-embedded-path", !transcriptLines().some((l) => JSON.stringify(l).includes("/src/acp-shim.mjs")), "");
+
+// --- native subagents disabled ----------------------------------------------
+const sessionReqs = (m) => transcriptLines().filter((l) => l.method === m);
+const hasDisabled = (l) => Array.isArray(l.params?.disableBuiltInTools) && l.params.disableBuiltInTools.includes("invoke_subagent");
+check("subagents/session-new-injected", sessionReqs("session/new").length > 0 && sessionReqs("session/new").every(hasDisabled), `news=${sessionReqs("session/new").length}`);
+check("subagents/session-load-injected", sessionReqs("session/load").length > 0 && sessionReqs("session/load").every(hasDisabled), `loads=${sessionReqs("session/load").length}`);
+const a1Settings = (() => { try { return JSON.parse(readFileSync(join(root, "accounts", "a1", ".gemini", "settings.json"), "utf8")); } catch { return {}; } })();
+check("subagents/settings-stamped", a1Settings.antigravityConfig?.subagentsConfig?.enabled === false && a1Settings.antigravity_config?.subagents_config?.enabled === false, JSON.stringify(a1Settings).slice(0, 200));
 
 // --- model/list ------------------------------------------------------------
 process.env.AGY_FAKE_MODELS_OUT = "";
