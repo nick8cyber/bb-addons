@@ -979,7 +979,7 @@ export default definePluginApp((app) => {
     component: CollapsedThreadList,
   });
   app.slots.sidebarFooterAction({
-    id: "sidebar-collapse-settings",
+    id: "compact-ui-settings",
     title: "Настройки Compact UI",
     icon: "ChevronsUp",
     run: ({ openSettings }) => openSettings(),

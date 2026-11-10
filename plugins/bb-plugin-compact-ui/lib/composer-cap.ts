@@ -3,7 +3,7 @@
  * under 1/3 of the working area. The editor scroll region absorbs the overflow,
  * so the toolbar and attachment row are never clipped.
  */
-export const COMPOSER_CAP_STYLE_ID = "bb-plugin-sidebar-collapse-composer-cap";
+export const COMPOSER_CAP_STYLE_ID = "bb-plugin-compact-ui-composer-cap";
 
 const PROMPTBOX = 'form[class*="group/promptbox"]';
 const EDITOR_SCROLL = "div.overflow-y-auto:has(.ProseMirror)";

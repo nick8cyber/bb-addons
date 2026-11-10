@@ -1,5 +1,5 @@
 {
-  "name": "bb-plugin-sidebar-collapse",
+  "name": "bb-plugin-compact-ui",
   "version": "0.1.0",
   "type": "module",
   "engines": {

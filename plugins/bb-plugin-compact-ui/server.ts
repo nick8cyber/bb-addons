@@ -32,14 +32,14 @@ export const rpcContract = defineRpcContract({
   },
 });
 
-const DIAG_PATH = "/tmp/sidebar-collapse-nav-top-row.json";
-const CMD_PATH = "/tmp/sidebar-collapse-nav-cmd.txt";
+const DIAG_PATH = "/tmp/compact-ui-nav-top-row.json";
+const CMD_PATH = "/tmp/compact-ui-nav-cmd.txt";
 
 export async function selectThreadList(bb: BbPluginApi, collapsed: boolean, isDisposed = () => false) {
   if (isDisposed()) return false;
   const key = "sidebar.threadListProvider";
   const current = (await bb.sdk.system.uiPreferences.list()).preferences[key];
-  const ours = "sidebar-collapse/collapsed", native = "thread-list/thread-list";
+  const ours = "compact-ui/collapsed", native = "thread-list/thread-list";
   const target = collapsed ? ours : native;
   // A deliberate selection of another plugin belongs to the user.
   if (current.value === target || !["", "auto", "__automatic__", ours, native].includes(current.value) || isDisposed()) return false;
@@ -52,7 +52,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const settings = bb.settings.define({
     // Off switch reachable without a browser:
-    // `bb plugin config sidebar-collapse set useCollapsedList false` hands the
+    // `bb plugin config compact-ui set useCollapsedList false` hands the
     // sidebar back to bb's own list while leaving the plugin installed.
     useCollapsedList: {
       type: "boolean",

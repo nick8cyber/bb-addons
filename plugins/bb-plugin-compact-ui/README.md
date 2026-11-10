@@ -1,4 +1,4 @@
-# Compact UI (bb-plugin-sidebar-collapse)
+# Compact UI (bb-plugin-compact-ui)
 
 Плагин для bb, заменяющий прокручиваемый список тредов в левом сайдбаре своим списком со свёрткой чатов сверх лимита (поведение сайдбара Claude).
 
@@ -83,7 +83,7 @@ BB 0.47 вернул штатный выбор **Appearance → Navigation → R
   (порядок самих проектов мышкой работает, см. ниже).
 
 Вернуть родной список bb можно без удаления плагина — двумя способами:
-`bb plugin config sidebar-collapse set useCollapsedList false` или
+`bb plugin config compact-ui set useCollapsedList false` или
 **Settings → Appearance → Sidebar**, где выбирается, чей список рисовать.
 
 ## Настройки
@@ -94,7 +94,7 @@ BB 0.47 вернул штатный выбор **Appearance → Navigation → R
 
 По умолчанию опция выключена, поэтому существующий порядок не меняется. Лимит, «Показать ещё», сворачивание проектов и видимость активного чата продолжают работать. Настройка сохраняется на сервере и применяется к открытым спискам без перезагрузки страницы.
 
-Включить через CLI: `bb plugin config sidebar-collapse set unreadFirst true`. Вернуть прежний порядок: `bb plugin config sidebar-collapse set unreadFirst false`.
+Включить через CLI: `bb plugin config compact-ui set unreadFirst true`. Вернуть прежний порядок: `bb plugin config compact-ui set unreadFirst false`.
 
 ### Остальные параметры
 
@@ -113,10 +113,10 @@ BB 0.47 вернул штатный выбор **Appearance → Navigation → R
 Настройка через CLI:
 
 ```bash
-bb plugin config sidebar-collapse
-bb plugin config sidebar-collapse set visibleThreads 10
-bb plugin config sidebar-collapse set useCollapsedList false   # вернуть список bb
-bb plugin reload sidebar-collapse
+bb plugin config compact-ui
+bb plugin config compact-ui set visibleThreads 10
+bb plugin config compact-ui set useCollapsedList false   # вернуть список bb
+bb plugin reload compact-ui
 ```
 
 ## Структура файлов

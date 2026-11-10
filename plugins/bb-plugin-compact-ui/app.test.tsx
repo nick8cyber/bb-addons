@@ -156,7 +156,7 @@ describe("persistent row controls", () => {
   });
 });
 
-describe("bb-plugin-sidebar-collapse frontend tests", () => {
+describe("bb-plugin-compact-ui frontend tests", () => {
   it("does not crash without Original on current BB and offers native fallback", async () => {
     const app = await appPromise;
     const registration = app.threadLists[0]!;

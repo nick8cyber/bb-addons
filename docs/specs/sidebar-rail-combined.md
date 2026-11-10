@@ -27,7 +27,7 @@ Boolean hideNavigationRail (default false) скрывает только узк�
 
 ### Уточнение по живой проверке Original
 
-В BB 0.46.1 и SDK 0.6.49 Original больше не передаётся в thread-list slot (хотя зафиксированный SDK 0.4.87 обещает его в типах). Не рендерить отсутствующий компонент. Для useCollapsedList false/true серверный settings.onChange последовательно переключает публичную UI preference sidebar.threadListProvider между thread-list/thread-list и sidebar-collapse/collapsed, с optimistic revision и без изменения иных настроек. Если выбран сторонний провайдер списка, его выбор не перезаписывать. Обработчик защищён от dispose и не переключает список при загрузке плагина.
+В BB 0.46.1 и SDK 0.6.49 Original больше не передаётся в thread-list slot (хотя зафиксированный SDK 0.4.87 обещает его в типах). Не рендерить отсутствующий компонент. Для useCollapsedList false/true серверный settings.onChange последовательно переключает публичную UI preference sidebar.threadListProvider между thread-list/thread-list и compact-ui/collapsed, с optimistic revision и без изменения иных настроек. Если выбран сторонний провайдер списка, его выбор не перезаписывать. Обработчик защищён от dispose и не переключает список при загрузке плагина.
 
 На ошибке данных без Original показывать контролируемый fallback с кнопкой перехода на штатный список через schema-validated RPC. Проверить отсутствие Original, смену false→true, сохранение hideNavigationRail, сохранение стороннего выбора, CAS error, dispose и отсутствие startup writes. Старый Original допустим только при фактическом наличии для совместимости с прежним хостом. Применение fallback не должно падать и не должно скрывать настройки.
 
@@ -35,7 +35,7 @@ Boolean hideNavigationRail (default false) скрывает только узк�
 - [ ] npm ci, npm test, npm run typecheck, bb plugin build, git diff --check относительно документной базы.
 - [ ] Реальный Chromium: 0.46.1 desktop/mobile light/dark; false→true→false; Settings/Home, collapse, native-list fallback, reload, отсутствие ошибок и перекрытий; пагинация остаётся работающей.
 - [ ] Для 0.47 отдельно указывать уровень доказательств: реальные официальные frontend-артефакты/разметка и браузерный fixture не выдаются за end-to-end обновлённого сервера. Рабочий сервер не обновлять ради теста.
-- [ ] Проверить сессии только bb-addons перед выкладкой. Установить тот же sidebar-collapse из постоянного worktree, проверить настройки и UI; advisor_review ровно один раз; исправить замечания; commit/push ветки без main merge.
+- [ ] Проверить сессии только bb-addons перед выкладкой. Установить тот же compact-ui из постоянного worktree, проверить настройки и UI; advisor_review ровно один раз; исправить замечания; commit/push ветки без main merge.
 
-Откат: path:<worktrees>/bb-addons-sidebar-pagination/plugins/bb-plugin-sidebar-collapse @bc3333a, с сохранением существующих настроек.
+Откат: path:<worktrees>/bb-addons-sidebar-pagination/plugins/bb-plugin-compact-ui @bc3333a, с сохранением существующих настроек.
 
