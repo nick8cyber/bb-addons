@@ -8,7 +8,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 
 # provider-agy — восстановление после сбоев и сжатие
 
-Контракт поведения моста `provider-agy` (Antigravity CLI как провайдер bb) при сбоях Google, аккаунтов и самого agy, и при сжатии контекста. Подробности реализации — в [README плагина](../../plugins/bb-plugin-provider-agy/README.md); решения — в [ADR 0002](../adr/0002-provider-agy-failure-recovery.md) и [ADR 0003](../adr/0003-provider-agy-compaction-fallback.md).
+Контракт поведения моста `provider-agy` (Antigravity CLI как провайдер bb) при сбоях Google, аккаунтов и самого agy, и при сжатии контекста. Подробности реализации — в [README плагина](../../plugins/bb-plugin-provider-agy/README.md); решения — в [ADR 0002](../adr/0002-provider-agy-failure-recovery.md), [ADR 0003](../adr/0003-provider-agy-compaction-fallback.md) и [ADR 0021](../adr/0021-provider-agy-acp-transport.md) (транспорт ACP с 10.11.2026).
 
 ## 1. Запрос владельца
 
