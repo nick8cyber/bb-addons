@@ -67,8 +67,11 @@ export default function plugin(bb: BbPluginApi) {
     // "Disable provider subagents" setting reaches the bridge as
     // options.providerOptions.providerSubagentsEnabled; the wrapper resolves
     // it against the AGY_DISABLE_SUBAGENTS env override.
+    // `=== false` on purpose: the SDK allows `undefined` settings values, and
+    // our default is the inverted one (disabled) — native subagents turn on
+    // only after an explicit opt-out, never on a missing/unloaded value.
     deriveProviderOptions: (ctx) => ({
-      providerSubagentsEnabled: ctx.settings.subagentsDisabled !== true,
+      providerSubagentsEnabled: ctx.settings.subagentsDisabled === false,
     }),
     // The daemon hands this to the ACP wrapper on every thread-bound
     // request; the wrapper rewrites acpLaunchSpec per session (account
