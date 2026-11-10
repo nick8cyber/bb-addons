@@ -10,6 +10,18 @@
 | `host.ts` + `src/vendor/acp-bridge.js` | ACP-мост из `@get-bb/plugin-sdk` (собирается `npm run vendor`) с диалектом `devin` и сохранением правил bb треда в `~/.local/state/bb-devin/instructions/<thr>.md` |
 | `devin-hooks/` | хуки Devin CLI: правила bb возвращаются после сжатия и при восстановлении сессии; защита конфигов (~/.config/devin, ~/.claude, хуки); запрет блокирующего ожидания (если он есть у Claude пользователя). Раздача задач и привязка тредов — через плагин `orchestrator` (`bb orchestrator delegate`) |
 
+## Центральная настройка субагентов
+
+`bb plugin config acp-devin set subagentsDisabled true` — тот же контракт, что у
+codex/claude-code/agy: server.ts через `deriveProviderOptions` кладёт её в
+`options.providerOptions.providerSubagentsEnabled` на каждый thread/start|resume,
+а host-обёртка применяет её к `subagents_enabled` в юзерском конфиге Devin —
+единственному рычагу, который `devin acp` читает. Запрет запоминает прошлое
+значение в dataDir (`subagents-gate.json`) и при выключении настройки его
+восстанавливает; `subagents_enabled:false`, поставленный самим пользователем
+(в т.ч. `devin-hooks/install.py`), не трогается ни в одну сторону.
+Действие глобально — затрагивает и интерактивный `devin` на хосте.
+
 ## Установка у пользователя
 
 1. `bb plugin install <путь к этому каталогу> --yes`; запись `devin` из `bb plugin config provider-acp customAgents` убрать (один id не может быть у двух провайдеров).

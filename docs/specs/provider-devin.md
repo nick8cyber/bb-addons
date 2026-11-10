@@ -35,3 +35,10 @@ revision: 2 (замечания ревью PLUG-131)
 Требование: так же мягко обрабатывать сообщения, начинающиеся с `[orchestrator]` (служебные сообщения сторожа оркестратора). Сообщения владельца и других тредов по-прежнему прерывают ход.
 
 Проверка: тест `isBbSystemNotice` (или переименованной функции) на оба префикса и на обычный текст; живой прогон — сообщение `[orchestrator] …` посреди длинной команды Devin не отменяет её и доставляется после хода.
+
+## 3. Центральная настройка субагентов (11.11.2026)
+
+- Тот же контракт, что у codex/claude-code/agy: `bb.settings.define({subagentsDisabled})` (default **false** — субагенты Devin видны в треде как `delegation`-карточки, проблемы невидимости нет) + `deriveProviderOptions` → `options.providerOptions.providerSubagentsEnabled`.
+- У Devin нет per-session провода для запрета: `devin acp` читает только юзерский конфиг (`subagents_enabled`, документирован как user-only, применяется живьём). Host-обёртка (`host.ts` + `src/subagent-gate.mjs`) на thread/start|resume|fork стемпит `subagents_enabled:false` при запрете и откатывает ровно свой стемп при включении (prior хранится в `dataDir/subagents-gate.json`); чужой `false` в конфиге (devin-hooks/install.py) не трогается. JSONC-комментарии конфига сохраняются (правки value-in-place).
+- Покрытие: `node --test scripts/subagent-gate.test.mjs` (parse/insert/flip/restore, JSONC).
+

@@ -10,6 +10,8 @@
 2. `bb tasks dispatch …` не вызывает никаких `bb thread update` (ни в PreToolUse, ни в PostToolUse).
 3. Запись в `~/.config/devin/config.json` (через exec и write/edit) по-прежнему блокируется.
 4. Защита других конфигов (~/.claude/CLAUDE.md, settings.json, хуки) работает, чтение разрешено.
+4b. Упоминание пути в СОДЕРЖИМОМ файла не блокирует (ложные срабатывания убраны);
+    путь назначения по-прежнему блокируется.
 5. `install.py`: повторная установка поверх старой убирает старую регистрацию PostToolUse.
 6. DEVIN_BB_LOG перенаправляет журнал во временный файл; реальный ~/.local/state/devin-bb-hooks.log не изменяется.
 """
@@ -167,6 +169,36 @@ for cmd in allowed_reads:
     ok = (rc == 0 and "decision" not in stdout)
     report(ok, f"allowed read/exec: {cmd[:40]}", f"rc={rc}")
 
+print("\n=== 4b. Регрессия: упоминание пути в содержимом не блокирует; назначение блокирует ===")
+# Ложное срабатывание 11.11: исходник плагина ссылается на конфиг — write/edit
+# раньше блокировались по содержимому. Теперь проверяется только путь назначения.
+content_mention_cases = [
+    ("write", {"file_path": "/home/ubuntu/work/bb/bb-addons/plugins/bb-plugin-provider-devin/src/x.mjs",
+               "content": "// обновляет ~/.config/devin/config.json\nconst a = 1"}),
+    ("edit", {"file_path": "/home/ubuntu/work/bb/bb-addons/plugins/bb-plugin-provider-devin/src/x.mjs",
+              "old_string": "a", "new_string": "смотри ~/.config/devin/config.json"}),
+    ("edit", {"file_path": "/home/ubuntu/work/bb/bb-addons/plugins/bb-plugin-provider-devin/src/subagent-gate.mjs",
+              "old_string": "a", "new_string": "b"}),
+    ("apply_patch", {"patch": "--- plugins/bb-plugin-provider-devin/src/x.mjs\n"
+                             "+++ plugins/bb-plugin-provider-devin/src/x.mjs\n"
+                             "@@ -1 +1 @@\n-// ~/.config/devin/config.json\n+// new"}),
+]
+for tool_name, tool_input in content_mention_cases:
+    rc, stdout, _ = run_hook("PreToolUse", tool_name, tool_input)
+    ok = (rc == 0 and "decision" not in stdout)
+    desc = tool_input.get("file_path") or "patch-body-mention"
+    report(ok, f"allowed content-mention ({tool_name}): {desc[-55:]}", f"rc={rc}")
+
+dest_blocked = [
+    ("edit", {"file_path": "~/.config/devin/config.json", "old_string": "a", "new_string": "b"}),
+    ("write", {"file_path": "/home/ubuntu/.claude/settings.json", "content": "{}"}),
+    ("edit", {"file_path": "/home/ubuntu/work/bb/bb-addons/plugins/bb-plugin-provider-devin/devin-hooks/x.py",
+              "old_string": "a", "new_string": "b"}),
+]
+for tool_name, tool_input in dest_blocked:
+    rc, stdout, _ = run_hook("PreToolUse", tool_name, tool_input)
+    ok = (rc == 2 and '"decision": "block"' in stdout)
+    report(ok, f"blocked dest ({tool_input['file_path'][:60]})", f"rc={rc}")
 
 print("\n=== 5. Проверка install.py: очистка старой PostToolUse регистрации ===")
 spec = importlib.util.spec_from_file_location("devin_install", INSTALL)
