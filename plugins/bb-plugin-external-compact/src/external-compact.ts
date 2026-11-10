@@ -356,35 +356,43 @@ export async function summarizeWithGemini(
   const prompt = buildSummaryPrompt();
   let lastError: ExternalCompactError | null = null;
   for (const key of keys) {
-    let res: Response;
-    try {
-      res = await doFetch(`${apiBase}/models/${SUMMARIZER_MODEL}:generateContent`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-goog-api-key": key },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: `${prompt}\n\n---\n\n${history}` }] }],
-          generationConfig: { temperature: 0.2 },
-        }),
-        signal: opts.signal ?? AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS),
-      });
-    } catch (e) {
-      // Сетевой сбой/таймаут — следующий ключ может ответить.
-      lastError = new ExternalCompactError("rate_limited", `Gemini request failed: ${errMessage(e)}`);
-      continue;
-    }
-    if (res.ok) {
-      let data: GeminiGenerateResponse;
+    let res: Response | null = null;
+    const maxAttempts = 2;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
-        data = (await res.json()) as GeminiGenerateResponse;
-      } catch {
-        throw new ExternalCompactError("invalid_response", "Gemini вернул не-JSON ответ");
+        res = await doFetch(`${apiBase}/models/${SUMMARIZER_MODEL}:generateContent`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-goog-api-key": key },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: `${prompt}\n\n---\n\n${history}` }] }],
+            generationConfig: { temperature: 0.2 },
+          }),
+          signal: opts.signal ?? AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS),
+        });
+      } catch (e) {
+        lastError = new ExternalCompactError("rate_limited", `Gemini request failed: ${errMessage(e)}`);
+        break;
       }
-      const text = extractSummaryText(data);
-      if (text === null) {
-        throw new ExternalCompactError("invalid_response", "Gemini вернул ответ без текста");
+      if (res.ok) {
+        let data: GeminiGenerateResponse;
+        try {
+          data = (await res.json()) as GeminiGenerateResponse;
+        } catch {
+          throw new ExternalCompactError("invalid_response", "Gemini вернул не-JSON ответ");
+        }
+        const text = extractSummaryText(data);
+        if (text === null) {
+          throw new ExternalCompactError("invalid_response", "Gemini вернул ответ без текста");
+        }
+        return text;
       }
-      return text;
+      if (res.status === 503 && attempt + 1 < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      break;
     }
+    if (!res) continue;
     const info = mapGeminiHttpError(res.status);
     const body = await res.text().catch(() => "");
     lastError = new ExternalCompactError(
