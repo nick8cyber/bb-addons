@@ -24,6 +24,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 | «not eligible», нужна проверка | Отложить на 24 ч (`AGY_INELIGIBLE_COOLDOWN_MS`), ссылка проверки в `bridge.log`, ход на свободный аккаунт |
 | «not eligible», страна | Отложить на 2 ч (`AGY_LOCATION_COOLDOWN_MS`), ход на свободный аккаунт |
 | ≥3 разных аккаунта отложены за 10 мин | Предохранитель: больше не откладывать, падать с исходным текстом (подозрение на сеть) |
+| Слёт Google-входа: `auth_required`, «Authentication required», «Silent sign-in failed», «not logged into Antigravity», «error getting token source» (ACP-транспорт) | Припарковать как ineligible + метка `parkedReason:"auth-dead"` в accounts-state.json; ход переигрывается на свободном аккаунте с `contextLost`; свободных нет — честный фейл «every pool account lost its Google sign-in; re-authenticate one and retry». Не квота, не toolError |
 | Google `API error (attempt N): … (code 500/502/503/504)` | `errorInfo {internal, 5xx}` → встроенный bb provider-retry повторяет ход (~1 мин, удвоение, до 4) |
 | Ошибка шага инструмента, auth/billing вместе с 5xx | Метки автоповтора нет |
 | Тишина ≥15 мин во время хода, тул не открыт | Убить agy; если в полёте один принятый ход без очереди — `errorInfo {stream-disconnected}` → bb повторяет |
