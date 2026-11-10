@@ -1,4 +1,4 @@
-# bb-plugin-sidebar-collapse
+# Compact UI (bb-plugin-sidebar-collapse)
 
 Плагин для bb, заменяющий прокручиваемый список тредов в левом сайдбаре своим списком со свёрткой чатов сверх лимита (поведение сайдбара Claude).
 

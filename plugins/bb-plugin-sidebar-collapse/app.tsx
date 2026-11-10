@@ -980,7 +980,7 @@ export default definePluginApp((app) => {
   });
   app.slots.sidebarFooterAction({
     id: "sidebar-collapse-settings",
-    title: "Настройки Sidebar Collapse",
+    title: "Настройки Compact UI",
     icon: "ChevronsUp",
     run: ({ openSettings }) => openSettings(),
   });

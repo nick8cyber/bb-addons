@@ -13,7 +13,7 @@ function setup(initial="sidebar-collapse/collapsed"){
   return {...h,list,set};
 }
 describe("native list selection without removed Original prop",()=>{
-  it("switches Automatic to native and back to Sidebar Collapse",async()=>{
+  it("switches Automatic to native and back to Compact UI",async()=>{
     const h=setup("__automatic__");await plugin(h.bb);
     await h.harness.behavior.setSettings({useCollapsedList:false});
     await vi.waitFor(()=>expect(h.set).toHaveBeenCalledWith({key:"sidebar.threadListProvider",value:"thread-list/thread-list",expectedRevision:1}));
