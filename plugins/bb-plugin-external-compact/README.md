@@ -35,9 +35,9 @@ errors, or RPC output.
 
 ## UI
 
-- **Thread action** «Compact via Gemini (free)» in the thread menu (lifecycle
+- **Thread action** «Compact via external provider» in the thread menu (lifecycle
   group) and the same command in the composer palette. Both open a confirmation
-  dialog warning that the history will be sent to Google AI Studio — no action
+  dialog warning that the history will be sent to the external summarizer — no action
   without the owner's explicit «Продолжить».
 - **Cache badge** «⏳ compact?» on the thread row when the thread's prompt cache
   has expired (`usage.compactionOfferAt` in the past). Polls `threads.context`

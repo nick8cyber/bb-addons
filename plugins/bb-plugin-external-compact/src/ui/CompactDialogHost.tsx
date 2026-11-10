@@ -32,9 +32,9 @@ export function CompactDialogHost() {
     const req = compactUiStore.getSnapshot();
     compactUiStore.cancel();
     if (req === null) return;
-    toast.loading("Сжатие через Gemini запущено…", {
+    toast.loading("Сжатие через внешний провайдер запущено…", {
       id: TOAST_ID,
-      description: `История уходит в Google AI Studio (${SUMMARIZER_MODEL})`,
+      description: `История уходит во внешний суммаризатор (${SUMMARIZER_MODEL})`,
     });
     try {
       const result = await rpc.call("compactThread", { threadId: req.threadId });
@@ -72,10 +72,10 @@ export function CompactDialogHost() {
         onClick={(e) => e.stopPropagation()}
       >
         <h2 id="ec-dialog-title" className="ec-dialog-title">
-          Compact via Gemini (free)
+          Compact via external provider
         </h2>
         <p id="ec-dialog-desc" className="ec-dialog-desc">
-          История сессии будет отправлена в Google AI Studio через {SUMMARIZER_MODEL}. Не
+          История сессии будет отправлена во внешний суммаризатор ({SUMMARIZER_MODEL}). Не
           используйте для тредов с закрытыми секретами. Продолжить?
         </p>
         <div className="ec-dialog-actions">

@@ -71,7 +71,7 @@ export function CacheBadge({
   return (
     <span
       className="ec-badge"
-      title="Кэш промпта истёк — bb предлагает compact. Действие «Compact via Gemini (free)» сожмёт историю бесплатной Gemini в новый тред."
+      title="Кэш промпта истёк — bb предлагает compact. Действие «Compact via external provider» сожмёт историю через внешний провайдер в новый тред."
     >
       <span aria-hidden="true">⏳</span> compact?
     </span>

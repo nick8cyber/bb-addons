@@ -26,8 +26,14 @@ export default async function plugin(bb: BbPluginApi) {
     geminiApiKey: {
       type: "string",
       secret: true,
-      label: "Ключи Gemini (AI Studio)",
+      label: "Ключи API провайдера (Gemini / AI Studio)",
       description: "1–2 ключа, по одному на строку (второй — фолбэк на 429)",
+    },
+    model: {
+      type: "string",
+      default: SUMMARIZER_MODEL,
+      label: "Модель внешнего суммаризатора",
+      description: "Модель для внешнего сжатия (по умолчанию gemini-3.6-flash)",
     },
     autoArchiveSource: {
       type: "boolean",
@@ -41,16 +47,19 @@ export default async function plugin(bb: BbPluginApi) {
     parseGeminiKeys((await settings.get()).geminiApiKey);
   const getAutoArchive = async (): Promise<boolean> =>
     (await settings.get()).autoArchiveSource ?? false;
+  const getModel = async (): Promise<string> =>
+    (await settings.get()).model || SUMMARIZER_MODEL;
 
   const collectStatus = async (): Promise<StatusOutput> => {
     const keys = await getKeys();
+    const model = await getModel();
     return {
       ready: keys.length > 0,
       geminiKeys: keys.length,
-      model: SUMMARIZER_MODEL,
+      model,
       autoArchiveSource: await getAutoArchive(),
       ...(keys.length === 0
-        ? { note: "geminiApiKey не настроен — задайте 1–2 ключа AI Studio в настройках плагина" }
+        ? { note: "geminiApiKey не настроен — задайте 1–2 ключа в настройках плагина" }
         : {}),
     };
   };
@@ -105,7 +114,10 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return seqs;
     },
-    summarize: (history, keys) => summarizeWithGemini(history, keys),
+    summarize: async (history, keys) => {
+      const model = await getModel();
+      return summarizeWithGemini(history, keys, { model });
+    },
     spawnContinuation: async (target, prompt) => {
       if (!target.projectId) {
         throw new ExternalCompactError(

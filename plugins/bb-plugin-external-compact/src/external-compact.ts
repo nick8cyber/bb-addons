@@ -335,6 +335,8 @@ export interface SummarizeOptions {
   /** Подмена fetch в тестах. */
   fetchImpl?: typeof fetch;
   apiBase?: string;
+  /** Имя модели (по умолчанию gemini-3.6-flash). */
+  model?: string;
 }
 
 /**
@@ -353,6 +355,7 @@ export async function summarizeWithGemini(
   }
   const doFetch = opts.fetchImpl ?? fetch;
   const apiBase = opts.apiBase ?? GEMINI_API_BASE;
+  const model = opts.model ?? SUMMARIZER_MODEL;
   const prompt = buildSummaryPrompt();
   let lastError: ExternalCompactError | null = null;
   for (const key of keys) {
@@ -360,7 +363,7 @@ export async function summarizeWithGemini(
     const maxAttempts = 2;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
-        res = await doFetch(`${apiBase}/models/${SUMMARIZER_MODEL}:generateContent`, {
+        res = await doFetch(`${apiBase}/models/${model}:generateContent`, {
           method: "POST",
           headers: { "content-type": "application/json", "x-goog-api-key": key },
           body: JSON.stringify({

@@ -1,8 +1,8 @@
 /**
  * Фронтенд external-compact (спека docs/specs/external-compact.md, «Поток»
  * п. 6):
- * - действие «Compact via Gemini (free)» в меню треда → модальное
- *   предупреждение об отправке истории в AI Studio → rpc compactThread;
+ * - действие «Compact via external provider» в меню треда → модальное
+ *   предупреждение об отправке истории во внешний суммаризатор → rpc compactThread;
  * - та же команда в палитре композера;
  * - бейдж протухшего кэша на строке треда (experimental_threadRowMetadata).
  * Не автомат — решение владельца, как у штатного тоггла.
@@ -27,12 +27,12 @@ export default definePluginApp((app) => {
   });
 
   app.slots.experimental_threadAction({
-    id: "compact-via-gemini",
-    title: "Compact via Gemini (free)",
+    id: "compact-via-external-provider",
+    title: "Compact via external provider",
     icon: "Shrink",
     group: experimental_THREAD_ACTION_GROUPS.lifecycle,
     item: ({ thread }) => ({
-      label: "Compact via Gemini (free)",
+      label: "Compact via external provider",
       icon: "Shrink",
       run: () => {
         compactUiStore.request({ threadId: thread.id });
@@ -41,8 +41,8 @@ export default definePluginApp((app) => {
   });
 
   app.composer.experimental_registerCommand({
-    id: "compact-via-gemini",
-    title: "Compact via Gemini (free)",
+    id: "compact-via-external-provider",
+    title: "Compact via external provider",
     run: ({ composer }) => {
       if (composer.scope.kind !== "thread") {
         toast.error("Сжатие доступно в композере открытого треда");

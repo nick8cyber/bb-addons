@@ -197,6 +197,18 @@ describe("summarizeWithGemini", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it("поддерживает кастомную модель через options.model", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (info) => {
+      expect(String(info)).toContain("/models/custom-model-pro:generateContent");
+      return okResponse("custom-model-summary");
+    });
+    const result = await summarizeWithGemini("hist", ["k1"], {
+      fetchImpl,
+      model: "custom-model-pro",
+    });
+    expect(result).toBe("custom-model-summary");
+  });
+
   it("сетевой сбой → следующий ключ; все упали → rate_limited", async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
