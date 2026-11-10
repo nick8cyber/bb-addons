@@ -102,6 +102,10 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, error: { code: 403, message: ineligibleMsg } });
     return;
   }
+  if (mode === "auth-dead") {
+    out({ jsonrpc: "2.0", id, error: { code: 401, message: "Authentication required" } });
+    return;
+  }
   if (/^\s*\/compact\s*$/u.test(text) && compactMode === "fail") {
     out({ jsonrpc: "2.0", id, error: { code: 500, message: "API error (attempt 1): INTERNAL (code 500): cannot compact" } });
     return;
