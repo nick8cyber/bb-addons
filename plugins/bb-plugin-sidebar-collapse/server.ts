@@ -1,4 +1,5 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { writeFile } from "node:fs/promises";
 import { z } from "zod";
 
 /** Project drag-and-drop is not part of the frontend sidebar API, so the list
@@ -16,7 +17,16 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ ok: z.literal(true) }),
   },
+  /** Self-check channel: the nav-top-row content script reports live DOM
+   *  geometry through an app overlay bridge; the backend persists it where
+   *  the agent can read it without a browser. */
+  nav_top_row_diag: {
+    input: z.object({ report: z.string().max(20000) }).strict(),
+    output: z.object({ ok: z.literal(true) }),
+  },
 });
+
+const DIAG_PATH = "/tmp/sidebar-collapse-nav-top-row.json";
 
 export async function selectThreadList(bb: BbPluginApi, collapsed: boolean, isDisposed = () => false) {
   if (isDisposed()) return false;
@@ -114,6 +124,10 @@ export default async function plugin(bb: BbPluginApi) {
         previousProjectId,
         nextProjectId,
       });
+      return { ok: true } as const;
+    },
+    nav_top_row_diag: async ({ report }) => {
+      await writeFile(DIAG_PATH, report, "utf8").catch((e) => bb.log.warn("nav diag write failed: " + String(e)));
       return { ok: true } as const;
     },
   });

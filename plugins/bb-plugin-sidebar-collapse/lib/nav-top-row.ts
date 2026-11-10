@@ -58,6 +58,32 @@ function buildIcons(doc: Document, sources: HTMLElement[]): HTMLElement | null {
   return host;
 }
 
+function collectDiag(doc: Document, row: Element | null, sources: HTMLElement[], clone: Element | null): void {
+  try {
+    const rects = clone
+      ? Array.from(clone.querySelectorAll("button")).map((b) => {
+          const r = b.getBoundingClientRect();
+          return { label: b.getAttribute("aria-label") || "", x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width) };
+        })
+      : [];
+    let overlaps = 0;
+    for (let i = 1; i < rects.length; i++) {
+      if (rects[i].x < rects[i - 1].x + rects[i - 1].w - 1) overlaps++;
+    }
+    const region = doc.querySelector('[data-testid="sidebar-navigation-region"]');
+    const win = (doc.defaultView || window) as unknown as Record<string, unknown>;
+    win.__bbNavTopDiag = {
+      ts: Date.now(),
+      rowFound: !!row,
+      sourceCount: sources.length,
+      cloneCount: rects.length,
+      rects,
+      overlaps,
+      regionHidden: region ? getComputedStyle(region).visibility === "hidden" : null,
+    };
+  } catch { /* diagnostics must never break the script */ }
+}
+
 export function mountNavTopRow(signal?: AbortSignal, doc: Document = document): () => void {
   if (signal?.aborted) return () => {};
   let lastSig = "";
@@ -76,6 +102,7 @@ export function mountNavTopRow(signal?: AbortSignal, doc: Document = document): 
       row.insertBefore(rebuilt, row.firstChild);
       doc.documentElement.setAttribute("data-bb-nav-icons-active", "");
     }
+    collectDiag(doc, row, sources, row.querySelector(`[${HOST_ATTR}]`));
   };
   sync();
   const timer = setInterval(sync, RESYNC_MS);

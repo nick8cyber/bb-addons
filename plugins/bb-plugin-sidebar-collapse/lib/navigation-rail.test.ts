@@ -627,7 +627,7 @@ describe("navigation rail plugin registration", () => {
     expect(mounted.inspection.mountedIds).toContain("navigation-rail");
 
     const overlay = renderSlot(
-      app.appOverlays[0]!,
+      app.appOverlays.find((o) => o.id === "navigation-rail")!,
       {},
       {
         settings: {
@@ -654,7 +654,7 @@ describe("navigation rail plugin registration", () => {
       pluginId: "sidebar-collapse",
     });
 
-    const overlay = renderSlot(app.appOverlays[0]!, {});
+    const overlay = renderSlot(app.appOverlays.find((o) => o.id === "navigation-rail")!, {});
 
     expect(root().hasAttribute(NAVIGATION_RAIL_ROOT_ATTRIBUTE)).toBe(false);
     expect(styleElement()).toBeNull();

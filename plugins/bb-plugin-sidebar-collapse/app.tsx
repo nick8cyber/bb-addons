@@ -865,6 +865,26 @@ export function registerNavigationRail(app: PluginAppBuilder): void {
   });
 }
 
+/** Forwards the nav-top-row content script's live DOM diagnostics
+ *  (window.__bbNavTopDiag) to the plugin backend so it lands in a file —
+ *  verification without a headless browser. */
+function NavDiagBridge() {
+  const rpc = useRpc<typeof rpcContract>();
+  useEffect(() => {
+    let last = "";
+    const timer = setInterval(() => {
+      const diag = (window as unknown as Record<string, unknown>).__bbNavTopDiag;
+      if (!diag) return;
+      const report = JSON.stringify(diag);
+      if (report === last) return;
+      last = report;
+      void rpc.call("nav_top_row_diag", { report }).catch(() => {});
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [rpc]);
+  return null;
+}
+
 function GitHeader({ threadId }: { threadId: string }) {
   const anchor = useRef<HTMLSpanElement>(null);
   const controller = useRef<ReturnType<typeof bindGitHeader> | null>(null);
@@ -912,6 +932,9 @@ export default definePluginApp((app) => {
   app.contentScripts.register({ id: "compact-queue", mount: ({signal}) => mountCompactQueue(signal) });
   app.contentScripts.register({ id: "composer-cap", mount: ({signal}) => mountComposerCap(signal) });
   app.contentScripts.register({ id: "nav-top-row", mount: ({signal}) => mountNavTopRow(signal) });
+  if (typeof app.slots.experimental_appOverlay === "function") {
+    app.slots.experimental_appOverlay({ id: "nav-diag", component: NavDiagBridge });
+  }
   registerHeaderControl(app, { id: "changed-files", title: "Изменённые файлы", component: GitHeader });
   registerHeaderControl(app, { id: "background-activity", title: "Фоновая активность", component: ActivityHeader });
   app.slots.experimental_threadList({
