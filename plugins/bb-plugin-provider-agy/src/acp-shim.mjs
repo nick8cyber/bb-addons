@@ -5,6 +5,12 @@
  *
  *   node acp-shim.mjs <agy args...>   (e.g. "acp", "--gemini-dir", <dir>)
  *
+ * IMPORTANT: this file rides inside the host bundle as base64
+ * (src/acp-shim-source.ts) and is materialized to <dataDir>/acp-shim.mjs at
+ * bridge start. After ANY edit, regenerate:
+ *
+ *   node scripts/gen-acp-shim-source.mjs
+ *
  * It relays stdin → child stdin and child stdout → stdout untouched, and in
  * parallel sniffs the JSON-RPC traffic for things the generic bridge cannot
  * see (they never reach the daemon boundary):

@@ -25,10 +25,12 @@
  * patch installed before the first write sees every byte the bridge emits).
  */
 import { experimental_acpProviderBridge as acpBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
+import { ACP_SHIM_SOURCE_B64 } from "./acp-shim-source.js";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   openSync,
@@ -511,7 +513,37 @@ function promptText(input: readonly PromptItem[] | undefined): string {
 // Launch spec
 // ---------------------------------------------------------------------------
 
-const SHIM_SCRIPT = (() => {
+/**
+ * Where the shim lives at runtime. The host artifact is a single bundled
+ * file — no sidecar ships — so the shim source travels as base64 inside it
+ * and is materialized into the provider dataDir (rewritten whenever the
+ * embedded bytes differ). Dev checkouts fall back to src/acp-shim.mjs.
+ */
+let materializedShimPath: string | null = null;
+
+function materializeShim(): string {
+  if (dataDir !== "") {
+    const target = join(dataDir, "acp-shim.mjs");
+    try {
+      const bytes = Buffer.from(ACP_SHIM_SOURCE_B64, "base64");
+      const existing = existsSync(target)
+        ? readFileSync(target)
+        : null;
+      if (existing === null || !existing.equals(bytes)) {
+        writeFileSync(target, bytes);
+      }
+      try {
+        chmodSync(target, 0o755);
+      } catch {
+        // Mode is cosmetic: the child runs through process.execPath anyway.
+      }
+      materializedShimPath = target;
+      return target;
+    } catch (error) {
+      log(`shim materialization failed: ${String(error)}`);
+    }
+  }
+  // Dev fallback: run straight from the source tree.
   const here = dirname(fileURLToPath(import.meta.url));
   for (const candidate of [
     join(here, "acp-shim.mjs"),
@@ -523,7 +555,7 @@ const SHIM_SCRIPT = (() => {
     }
   }
   return join(here, "acp-shim.mjs");
-})();
+}
 
 /**
  * Declared bb permission mode → boundary policy quadruple + agy
@@ -712,7 +744,7 @@ function buildLaunch(session: WSession): void {
   );
   ensureShimDir();
   const env = shimEnvFor(session);
-  const args: string[] = [SHIM_SCRIPT, "acp"];
+  const args: string[] = [materializeShim(), "acp"];
   let relayHome: string | null = null;
   if (dataDir !== "") {
     const relay = resolveCliproxyRelay(dataDir);
@@ -1006,7 +1038,7 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
     const { env, args } = maintenanceEnvAndArgs();
     let child;
     try {
-      child = spawn(process.execPath, [SHIM_SCRIPT, "acp", ...args], {
+      child = spawn(process.execPath, [materializeShim(), "acp", ...args], {
         env: {
           ...process.env,
           ...env,
