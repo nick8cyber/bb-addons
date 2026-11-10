@@ -792,7 +792,7 @@ function buildLaunch(session: WSession): void {
     },
     nativeReasoning: {
       configId: "thought_level",
-      supportedLevels: ["low", "medium", "high"],
+      supportedLevels: THOUGHT_LEVELS,
       defaultLevel: "medium",
       levelValues: {
         none: "low",
@@ -943,6 +943,9 @@ const EFFORT_ORDER = [
   "max",
 ];
 
+/** Levels `thought_level` accepts — shared with nativeReasoning in the launch spec. */
+const THOUGHT_LEVELS = ["low", "medium", "high"];
+
 function buildModelListResult(): {
   models: Record<string, unknown>[];
   selectedOnlyModels: string[];
@@ -950,7 +953,7 @@ function buildModelListResult(): {
   const raw = modelCatalog?.raw ?? [];
   const families = new Map<
     string,
-    { displayName: string; variants: Map<string, string> }
+    { displayName: string; variants: Map<string, string>; explicit: boolean }
   >();
   for (const entry of raw) {
     const split = splitModelEffort(entry.id);
@@ -964,10 +967,14 @@ function buildModelListResult(): {
             ? entry.displayName
             : entry.displayName.replace(/\s*\([^)]*\)\s*$/u, "") || family,
         variants: new Map(),
+        explicit: false,
       };
       families.set(family, fam);
     }
     fam.variants.set(effort, entry.id);
+    if (split !== null) {
+      fam.explicit = true;
+    }
   }
   const flash = [...families.keys()].filter((id) => id.includes("flash"));
   const defaultFamily =
@@ -975,9 +982,14 @@ function buildModelListResult(): {
     families.keys().next().value ??
     "";
   const models = [...families.entries()].map(([id, fam]) => {
-    const efforts = [...fam.variants.keys()].sort(
-      (a, b) => EFFORT_ORDER.indexOf(a) - EFFORT_ORDER.indexOf(b),
-    );
+    // `agy models` now reports bare family ids — without a `<model>-<effort>`
+    // suffix there is no per-id ladder to parse, so the family offers the
+    // standard thought_level ladder instead of collapsing to medium only.
+    const efforts = fam.explicit
+      ? [...fam.variants.keys()].sort(
+          (a, b) => EFFORT_ORDER.indexOf(a) - EFFORT_ORDER.indexOf(b),
+        )
+      : THOUGHT_LEVELS;
     return {
       id,
       model: id,
@@ -987,7 +999,7 @@ function buildModelListResult(): {
         reasoningEffort: effort,
         description: `${effort.charAt(0).toUpperCase()}${effort.slice(1)} reasoning effort`,
       })),
-      defaultReasoningEffort: fam.variants.has("medium")
+      defaultReasoningEffort: efforts.includes("medium")
         ? "medium"
         : (efforts[0] ?? "medium"),
       isDefault: id === defaultFamily,

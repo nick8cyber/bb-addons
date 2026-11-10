@@ -77,7 +77,7 @@ Generic-мост отвечает за: JSON-RPC, `session/new`/`load`/`prompt`/
 
 ## 8. Модели, режимы, permissions
 
-- `model/list`: быстрый путь — ответ из кэша (TTL 6 ч) или `agy models` (~100 мс); холодный прогон ACP-сервера только на промахе кэша (таймаут, при неудаче — последний кэш). Усилия — не отдельные модели: `gemini-3.8-flash` + `supportedReasoningEfforts` (low/medium/high) → `session/set_config_option` (`thought_level`), маппинг id вида `<model>-<effort>` по образцу `model-utils.ts` rawizhere.
+- `model/list`: быстрый путь — ответ из кэша (TTL 6 ч) или `agy models` (~100 мс); холодный прогон ACP-сервера только на промахе кэша (таймаут, при неудаче — последний кэш). Усилия — не отдельные модели: `gemini-3.8-flash` + `supportedReasoningEfforts` (low/medium/high) → `session/set_config_option` (`thought_level`), маппинг id вида `<model>-<effort>` по образцу `model-utils.ts` rawizhere; голый id без суффикса — стандартная лестница `thought_level` (low/medium/high), не «только medium».
 - Permission mode треда → `session/set_mode` на живой сессии (`default`/`accept-edits`/`plan`; проверено: работает на лету). `--dangerously-skip-permissions` добавляется в args для `full` (`permissionCli`-маппинг). Декларация режимов в `server.ts` — см. §1.
 - Стиринг — `turn/steer` generic-моста (session/prompt на живой сессии); очередь стирингов старого моста не нужна — `session/cancel` отменяет mid-tool штатно (проверено).
 
