@@ -478,6 +478,8 @@ export interface AcpUsage {
   outputTokens: number;
   thoughtTokens: number;
   totalTokens: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
 }
 
 export interface TokenBreakdown {
@@ -500,7 +502,7 @@ export function acpUsageToBreakdown(usage: AcpUsage): TokenBreakdown {
   return {
     totalTokens: usage.totalTokens,
     inputTokens: usage.inputTokens,
-    cachedInputTokens: 0,
+    cachedInputTokens: usage.cachedReadTokens ?? 0,
     outputTokens: usage.outputTokens,
     reasoningOutputTokens: usage.thoughtTokens,
   };
