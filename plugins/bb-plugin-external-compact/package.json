@@ -1,0 +1,36 @@
+{
+  "name": "bb-plugin-external-compact",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "External thread compaction: summarize a cooled-off bb thread with free Gemini (AI Studio) and continue in a fresh thread",
+  "engines": {
+    "bb": ">=0.49",
+    "bbPluginSdk": ">=0.6.104"
+  },
+  "bb": {
+    "name": "External Compact",
+    "description": "Сжатие остывшего контекста треда через бесплатную Gemini (AI Studio): summary → новый тред, дорогая модель не читает старый контекст.",
+    "branding": {
+      "icon": "Shrink"
+    },
+    "server": "./server.ts"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "bb plugin build ."
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.104",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  }
+}
