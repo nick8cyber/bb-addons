@@ -442,14 +442,21 @@ rotations. Quota fields and `rateLimits` are untouched.
 #### Native agy subagents are disabled
 
 Every subagent must be a bb thread, so agy's own invisible agents are turned
-off at two layers: the ACP shim injects `disableBuiltInTools`
-(`invoke_subagent`, `manage_subagents`, `define_subagent`,
-`browser_subagent`, `native_swarm`, `manage_swarm`, `boost`) into every
-`session/new` and `session/load`, and the wrapper additively merges
-`antigravityConfig.subagentsConfig.enabled=false` (plus the snake_case twin)
-and `boostCommandDisabled=true` into the account home's
-`.gemini/settings.json` on each launch. `AGY_DISABLE_SUBAGENTS=0` opts out
-completely.
+off — by the central provider setting, same as codex/claude-code:
+`bb plugin config provider-agy set subagentsDisabled false` re-enables them
+(default **on**, i.e. native subagents are disabled; the server derives it
+into `options.providerOptions.providerSubagentsEnabled` on every
+thread/start and resume). Resolution order: `AGY_DISABLE_SUBAGENTS` env
+override (`0` allows, anything else forbids) > the derived provider option >
+default disabled. Two enforcement layers: the wrapper passes the decision to
+the shim as `AGY_DISABLE_SUBAGENTS` and the shim injects
+`disableBuiltInTools` (`invoke_subagent`, `manage_subagents`,
+`define_subagent`, `browser_subagent`, `native_swarm`, `manage_swarm`,
+`boost`) into every `session/new` and `session/load`; the wrapper also
+additively merges `antigravityConfig.subagentsConfig.enabled=<resolved>`
+(plus the snake_case twin) and `boostCommandDisabled` into the account
+home's `.gemini/settings.json` on each launch — so a re-enable actually
+takes effect.
 
 Accounts come in through `scripts/import-accounts.mjs` (from the opencode
 antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single

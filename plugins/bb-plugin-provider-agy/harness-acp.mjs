@@ -22,7 +22,7 @@ chmodSync(shim, 0o755);
 process.env.AGY_PATH = shim;
 process.env.AGY_CLIPROXY = "0";
 process.env.AGY_FAKE_TRANSCRIPT = join(root, "transcript.ndjson");
-process.env.AGY_FAKE_RECORD_ENV = "HTTPS_PROXY";
+process.env.AGY_FAKE_RECORD_ENV = "HTTPS_PROXY,AGY_DISABLE_SUBAGENTS";
 process.env.AGY_FAKE_QUOTA_MSG = "Quota exhausted; retry later. Resets in 0h0m3s.";
 process.env.AGY_FAKE_CONTROL = join(root, "control.json");
 writeFileSync(process.env.AGY_FAKE_CONTROL, "{}\n");
@@ -269,6 +269,17 @@ resume(165, "t1r", ptidOf("t1"));
 await waitFor(() => replies(165).length === 1, 20000, "t1r live resume");
 await waitFor(() => transcriptLines().some((l) => l.method === "session/load"), 20000, "session/load reaches fake");
 
+// e) central bb setting re-enable: providerOptions.providerSubagentsEnabled=true
+// must flip the shim env and the stamped settings.json for that session only.
+threadReqIds.t9 = 180;
+send({ jsonrpc: "2.0", id: 180, method: "thread/start", params: { threadId: "t9", cwd: workspace, options: { ...options, providerOptions: { providerSubagentsEnabled: true } }, instructionMode: "append" } });
+await waitFor(() => replies(180).length === 1, 20000, "t9 start");
+const t9acct = ledger().conversations[ptidOf("t9")];
+// Read the stamp now — the all-dead phase re-stamps every account as disabled.
+const t9Settings = (() => { try { return JSON.parse(readFileSync(join(root, "accounts", t9acct, ".gemini", "settings.json"), "utf8")); } catch { return {}; } })();
+const t9news = transcriptLines().filter((l) => l.method === "session/new" && l.home === t9acct);
+const t9envOn = t9news.some((l) => l.__env?.AGY_DISABLE_SUBAGENTS === "0");
+
 // c) every account dead → honest pool-exhausted fail, no rotation spam.
 setControl({ modeByLabel: { a1: "auth-dead", a2: "auth-dead", a3: "auth-dead", a4: "auth-dead" } });
 threadReqIds.t8 = 170;
@@ -290,10 +301,16 @@ check("shim/argv-embedded-path", !transcriptLines().some((l) => JSON.stringify(l
 // --- native subagents disabled ----------------------------------------------
 const sessionReqs = (m) => transcriptLines().filter((l) => l.method === m);
 const hasDisabled = (l) => Array.isArray(l.params?.disableBuiltInTools) && l.params.disableBuiltInTools.includes("invoke_subagent");
-check("subagents/session-new-injected", sessionReqs("session/new").length > 0 && sessionReqs("session/new").every(hasDisabled), `news=${sessionReqs("session/new").length}`);
+// Injection happens iff the session resolved subagents OFF (env !== "0"):
+// coupling the env record to the injected field is the real invariant.
+const envOnLine = (l) => l.__env?.AGY_DISABLE_SUBAGENTS === "0";
+check("subagents/session-new-injected", sessionReqs("session/new").length > 0 && sessionReqs("session/new").every((l) => hasDisabled(l) === !envOnLine(l)), `news=${sessionReqs("session/new").length}`);
 check("subagents/session-load-injected", sessionReqs("session/load").length > 0 && sessionReqs("session/load").every(hasDisabled), `loads=${sessionReqs("session/load").length}`);
 const a1Settings = (() => { try { return JSON.parse(readFileSync(join(root, "accounts", "a1", ".gemini", "settings.json"), "utf8")); } catch { return {}; } })();
 check("subagents/settings-stamped", a1Settings.antigravityConfig?.subagentsConfig?.enabled === false && a1Settings.antigravity_config?.subagents_config?.enabled === false, JSON.stringify(a1Settings).slice(0, 200));
+check("subagents/disabled-env-default", sessionReqs("session/new").length > 0 && sessionReqs("session/new").every((l) => (l.__env?.AGY_DISABLE_SUBAGENTS ?? "1") === "1" || l.home === t9acct), "");
+check("subagents/reenabled-env", t9envOn, `t9acct=${t9acct} t9news=${t9news.length}`);
+check("subagents/reenabled-settings", t9Settings.antigravityConfig?.subagentsConfig?.enabled === true && t9Settings.antigravityConfig?.boostCommandDisabled === false, JSON.stringify(t9Settings.antigravityConfig));
 
 // --- model/list ------------------------------------------------------------
 process.env.AGY_FAKE_MODELS_OUT = "";
