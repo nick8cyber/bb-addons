@@ -439,6 +439,18 @@ rotations. Quota fields and `rateLimits` are untouched.
 > [!TIP] Restore a verified account
 > For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then set that account's `cooldownUntilMs` to `0` in `bridge-data/accounts-state.json`, or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
 
+#### Native agy subagents are disabled
+
+Every subagent must be a bb thread, so agy's own invisible agents are turned
+off at two layers: the ACP shim injects `disableBuiltInTools`
+(`invoke_subagent`, `manage_subagents`, `define_subagent`,
+`browser_subagent`, `native_swarm`, `manage_swarm`, `boost`) into every
+`session/new` and `session/load`, and the wrapper additively merges
+`antigravityConfig.subagentsConfig.enabled=false` (plus the snake_case twin)
+and `boostCommandDisabled=true` into the account home's
+`.gemini/settings.json` on each launch. `AGY_DISABLE_SUBAGENTS=0` opts out
+completely.
+
 Accounts come in through `scripts/import-accounts.mjs` (from the opencode
 antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single
 token file) or by logging in directly into a home:

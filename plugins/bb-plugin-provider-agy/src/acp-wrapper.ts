@@ -738,6 +738,92 @@ function shimEnvFor(session: WSession): Record<string, string> {
  * relay contributes its api env + own gemini dir. Direct mode gets neither —
  * agy then defaults to the real HOME's ~/.gemini.
  */
+/**
+ * bb owns every subagent — agy must not run its own invoke_subagent/swarm/
+ * boost invisibly inside a thread. The hard lever is the shim's
+ * disableBuiltInTools injection on session/new|load; this stamps the same
+ * intent into the account home's settings.json (antigravityConfig is the
+ * UserConfig section) as a second layer for paths that carry no session
+ * params. Additive merge: other keys are preserved; both casings are
+ * written because the reader is unknown (protojson accepts both).
+ */
+const SUBAGENT_SETTINGS_KEYS: Record<string, unknown> = {
+  antigravityConfig: {
+    subagentsConfig: { enabled: false },
+    boostCommandDisabled: true,
+  },
+  antigravity_config: {
+    subagents_config: { enabled: false },
+    boost_command_disabled: true,
+  },
+};
+
+function subagentsDisabled(): boolean {
+  return process.env.AGY_DISABLE_SUBAGENTS !== "0";
+}
+
+function stampSubagentDisable(geminiDir: string): void {
+  if (!subagentsDisabled()) {
+    return;
+  }
+  const file = join(geminiDir, "settings.json");
+  try {
+    let doc: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        doc = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Missing or unparsable: a malformed file would fail agy on load, so
+      // leave a broken one alone rather than making the session unbootable.
+      if (existsSync(file)) {
+        return;
+      }
+    }
+    for (const [section, fields] of Object.entries(SUBAGENT_SETTINGS_KEYS)) {
+      const existing =
+        doc[section] !== null &&
+        typeof doc[section] === "object" &&
+        !Array.isArray(doc[section])
+          ? (doc[section] as Record<string, unknown>)
+          : {};
+      doc[section] = deepMergeSettings(
+        existing,
+        fields as Record<string, unknown>,
+      );
+    }
+    writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
+  } catch {}
+}
+
+function deepMergeSettings(
+  existing: Record<string, unknown>,
+  ours: Record<string, unknown>,
+): Record<string, unknown> {
+  const out = { ...ours };
+  for (const [k, v] of Object.entries(existing)) {
+    if (
+      k in ours &&
+      v !== null &&
+      typeof v === "object" &&
+      !Array.isArray(v) &&
+      typeof ours[k] === "object" &&
+      ours[k] !== null &&
+      !Array.isArray(ours[k])
+    ) {
+      out[k] = deepMergeSettings(
+        v as Record<string, unknown>,
+        ours[k] as Record<string, unknown>,
+      );
+    } else if (!(k in ours)) {
+      out[k] = v;
+    }
+    // Our key wins when present — that is the point of the stamp.
+  }
+  return out;
+}
+
 function buildLaunch(session: WSession): void {
   session.nonce = randomUUID().replaceAll("-", "").slice(0, 12);
   session.controlFile = join(
@@ -785,6 +871,7 @@ function buildLaunch(session: WSession): void {
     geminiDir = join(relayHome, ".gemini");
   }
   if (geminiDir !== null) {
+    stampSubagentDisable(geminiDir);
     args.push("--gemini-dir", geminiDir);
   }
   session.launchEnv = env;

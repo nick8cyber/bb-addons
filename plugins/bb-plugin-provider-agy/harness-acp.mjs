@@ -280,6 +280,14 @@ setControl({ modeByLabel: {} });
 check("shim/materialized", existsSync(join(root, "acp-shim.mjs")) && readFileSync(join(root, "acp-shim.mjs"), "utf8").includes("NDJSON relay"), "");
 check("shim/argv-embedded-path", !transcriptLines().some((l) => JSON.stringify(l).includes("/src/acp-shim.mjs")), "");
 
+// --- native subagents disabled ----------------------------------------------
+const sessionReqs = (m) => transcriptLines().filter((l) => l.method === m);
+const hasDisabled = (l) => Array.isArray(l.params?.disableBuiltInTools) && l.params.disableBuiltInTools.includes("invoke_subagent");
+check("subagents/session-new-injected", sessionReqs("session/new").length > 0 && sessionReqs("session/new").every(hasDisabled), `news=${sessionReqs("session/new").length}`);
+check("subagents/session-load-injected", sessionReqs("session/load").every(hasDisabled), `loads=${sessionReqs("session/load").length}`);
+const a1Settings = (() => { try { return JSON.parse(readFileSync(join(root, "accounts", "a1", ".gemini", "settings.json"), "utf8")); } catch { return {}; } })();
+check("subagents/settings-stamped", a1Settings.antigravityConfig?.subagentsConfig?.enabled === false && a1Settings.antigravity_config?.subagents_config?.enabled === false, JSON.stringify(a1Settings).slice(0, 200));
+
 // --- model/list ------------------------------------------------------------
 process.env.AGY_FAKE_MODELS_OUT = "";
 send({ jsonrpc: "2.0", id: 90, method: "model/list", params: {} });
