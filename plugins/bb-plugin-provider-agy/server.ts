@@ -36,12 +36,7 @@ export default function plugin(bb: BbPluginApi) {
       supportsThreadRename: false,
       // The ACP transport speaks session/set_mode and
       // --dangerously-skip-permissions, so the whole ladder is honest now.
-      permissionModes: [
-        "full",
-        "default",
-        "accept-edits",
-        "plan",
-      ] as ("full" | "default" | "accept-edits" | "plan")[] as never,
+      permissionModes: ["full", "auto", "accept-edits"],
       // agy's own ladder; the model list encodes the effort in the model id.
       reasoningLevels: ["low", "medium", "high"],
     },
