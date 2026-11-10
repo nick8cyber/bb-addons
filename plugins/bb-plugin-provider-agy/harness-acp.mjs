@@ -84,6 +84,7 @@ const opens = (tid) => deltas(tid).filter((d) => d.kind === "turn.open");
 const perrors = (tid) => deltas(tid).filter((d) => d.kind === "provider.error");
 const rateLimits = (tid) => deltas(tid).filter((d) => d.kind === "provider.rateLimits");
 const usages = (tid) => deltas(tid).filter((d) => d.kind === "usage");
+const cws = (tid) => deltas(tid).filter((d) => d.kind === "contextWindow");
 const replaced = (tid) => messages.filter((m) => m.method === "session/replaced" && m.params.threadId === tid);
 const replies = (id) => messages.filter((m) => m.id === id && (m.result !== undefined || m.error !== undefined));
 const errors = (tid) => messages.filter((m) => m.method === "error" && m.params?.threadId === tid);
@@ -127,6 +128,7 @@ check("pool/first-spawn-account", news("a1").length === 1 && prompts("a1").lengt
 check("pool/args-gemini-dir", transcriptLines().some((l) => l.method === "session/new"), "");
 check("pool/sticky-ledger", ledger().conversations[t1Ptid] === "a1", JSON.stringify(ledger().conversations));
 check("pool/usage-delta", usages("t1").length === 1 && usages("t1")[0].last.totalTokens > 0, JSON.stringify(usages("t1").map((u) => u.last.totalTokens)));
+check("pool/context-window-delta", cws("t1").length === 1 && cws("t1")[0].used === 140 && cws("t1")[0].estimated === true, JSON.stringify(cws("t1")));
 
 // --- scenario 2: quota rotation with handoff ------------------------------
 turn(3, "t1", "[[quota]] continue the work");

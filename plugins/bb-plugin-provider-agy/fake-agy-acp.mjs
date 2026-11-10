@@ -148,7 +148,7 @@ async function runPrompt(id, text) {
   }
   function usage() {
     usageTotal += 100;
-    return { inputTokens: usageTotal, outputTokens: 10, thoughtTokens: 5, totalTokens: usageTotal + 15 };
+    return { inputTokens: usageTotal, outputTokens: 10, thoughtTokens: 5, cachedReadTokens: 40, totalTokens: usageTotal + 55 };
   }
 }
 

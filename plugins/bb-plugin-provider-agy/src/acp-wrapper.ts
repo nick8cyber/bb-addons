@@ -339,11 +339,41 @@ function emitUsage(session: WSession, usage: AcpUsage): void {
       session.usageTotal.reasoningOutputTokens + last.reasoningOutputTokens,
   };
   session.usageTotal = total;
+  const window = contextWindowSize(session.model);
   emitDeltas(session.threadId, {
     kind: "usage",
     total,
     last,
-    modelContextWindow: contextWindowSize(session.model),
+    modelContextWindow: window,
+  });
+  // The thread's context meter needs a contextWindow delta, not just the
+  // usage row — without it bb shows "Context usage is not available yet".
+  // agy reports only per-turn usage; `used` is the turn's whole fed input
+  // (fresh + cache-read, same formula the stream-json bridge used for the
+  // last step's occupancy) — coarse for multi-call turns, honest-estimated.
+  const usedTokens =
+    (usage.inputTokens ?? 0) + (usage.cachedReadTokens ?? 0);
+  emitDeltas(session.threadId, {
+    kind: "contextWindow",
+    attach: "currentOrLast",
+    estimated: true,
+    used: usedTokens,
+    size: window,
+    ...(window === null || session.providerThreadId === null
+      ? {}
+      : {
+          snapshot: {
+            autoCompactAtTokens: null,
+            capturedAt: new Date().toISOString(),
+            categories: [],
+            contextWindowTokens: window,
+            estimated: true,
+            model: session.model ?? "unknown",
+            providerSessionId: session.providerThreadId,
+            providerTurnId: null,
+            usedTokens,
+          },
+        }),
   });
 }
 
