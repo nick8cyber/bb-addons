@@ -339,13 +339,46 @@ test("merged only locally (not on origin) stays", async () => {
   assert.equal(item.first_seen_at, null);
 });
 
-test("an extra unmerged local branch keeps the copy", async () => {
+test("a foreign unmerged bb/ branch does not block the copy", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
   mergeEnv(repo, env);
-  // a side branch nobody merged — checked out nowhere, not on origin
+  // a side branch nobody merged — checked out nowhere, not on origin;
+  // local branches are repo-shared, so it is not the copy's business
   unmergedBranch(repo, "bb/loose");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(existsSync(env.path), false);
+  // the unmerged branch itself survives — only merged bb/ are swept
+  git(repo, ["rev-parse", "--verify", "bb/loose"]);
+});
+
+test("the copy's own unmerged branch keeps the copy", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // the executor switched the copy to another merged branch, while
+  // env.branchName (bb/a) was moved onto a commit origin never saw —
+  // the copy must stay so that work is not lost
+  git(env.path, ["checkout", "-b", "bb/other"]);
+  const tree = git(repo, ["rev-parse", "HEAD^{tree}"]);
+  const sha = git(repo, [
+    "commit-tree",
+    tree,
+    "-p",
+    "HEAD",
+    "-m",
+    "wip: moved bb/a",
+  ]);
+  git(repo, ["branch", "-f", env.branchName, sha]);
   const w = makeWorld({
     envs: [env],
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
@@ -543,7 +576,8 @@ test("protected and non-bb/ branches are never deleted", async () => {
   git(repo, ["branch", "-f", "bb/done-old", "main"]);
   // a merged non-bb/ branch → stays
   git(repo, ["branch", "people/keep"]);
-  // an unmerged bb/ branch → stays
+  // an unmerged bb/ branch → stays (foreign to the copy, so the copy
+  // is still cleaned up)
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
   mergeEnv(repo, env);
@@ -555,8 +589,7 @@ test("protected and non-bb/ branches are never deleted", async () => {
   await w.jan.run();
   w.clock.t += 16 * 60_000;
   const res = await w.jan.run();
-  // bb/wip unmerged → env kept; merged bb/done-old still swept
-  assert.equal(res.removedCopies, 0);
+  assert.equal(res.removedCopies, 1);
   git(repo, ["rev-parse", "--verify", "people/keep"]);
   git(repo, ["rev-parse", "--verify", "bb/wip"]);
   assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/done-old"]));

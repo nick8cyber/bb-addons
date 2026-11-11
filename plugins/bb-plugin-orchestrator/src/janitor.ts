@@ -4,12 +4,13 @@
  * what is provably merged on `origin` and clean; unmerged or dirty copies
  * are only reported.
  *
- * «Влитая копия»: the copy's HEAD and every local branch visible from the
- * copy are ancestors of `origin/<protected>` or the env's
- * `mergeBaseBranch`, checked right after this run's successful
- * `git fetch` (a failed fetch skips the whole repository). bb worktree
- * environments share one repository, so the local-branch check is
- * repo-wide — a copy stays while ANY local branch is unmerged.
+ * «Влитая копия»: the copy's HEAD and the copy's own branch (the env's
+ * `branchName`, when it exists and differs from the checked-out one)
+ * are ancestors of `origin/<protected>` or the env's `mergeBaseBranch`,
+ * checked right after this run's successful `git fetch` (a failed
+ * fetch skips the whole repository). Other local branches are shared
+ * repo-wide and do not belong to the copy — an unmerged foreign branch
+ * never blocks a copy's removal.
  */
 import { existsSync, readdirSync, readlinkSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
@@ -461,25 +462,20 @@ export function createJanitor(deps: JanitorDeps) {
         worktrees.map((w) => w.branch).filter((b): b is string => !!b),
       );
 
-      // Every local branch of the repository is checked per copy (§15):
-      // a copy stays while any of them is not on origin. Branch tips are
-      // repo-wide, so they are fetched once; `ancestorCache` carries
-      // positive results between copies of the same repository.
-      const localBranches: { name: string; sha: string }[] = (
+      // Local branch names feed the «ветки без копий» sweep below; the
+      // per-copy merge check (§15) only needs each copy's own branch.
+      // `ancestorCache` carries positive results between copies.
+      const localBranches: { name: string }[] = (
         (await gitOut(deps.cmd, root, [
           "for-each-ref",
           "refs/heads",
-          "--format=%(refname:short) %(objectname)",
+          "--format=%(refname:short)",
         ])) ?? ""
       )
         .split("\n")
         .map((l) => l.trim())
         .filter(Boolean)
-        .map((l) => {
-          const i = l.lastIndexOf(" ");
-          return { name: l.slice(0, i), sha: l.slice(i + 1) };
-        });
-      const branchShas = [...new Set(localBranches.map((b) => b.sha))];
+        .map((l) => ({ name: l }));
       const ancestorCache = new Map<string, boolean>();
 
       let pruned = false;
@@ -492,7 +488,6 @@ export function createJanitor(deps: JanitorDeps) {
             env,
             root,
             protectedTargets,
-            branchShas,
             ancestorCache,
             checkedOut,
             delegatedThreads,
@@ -582,7 +577,6 @@ export function createJanitor(deps: JanitorDeps) {
     env: EnvDto,
     repoRoot: string,
     protectedTargets: string[],
-    branchShas: string[],
     ancestorCache: Map<string, boolean>,
     checkedOut: Set<string>,
     delegatedThreads: Set<string>,
@@ -648,7 +642,7 @@ export function createJanitor(deps: JanitorDeps) {
       return fail("kept", "missing-path");
     }
 
-    // ── merge check (§15): HEAD and every local branch on origin ──
+    // ── merge check (§15): HEAD and the copy's own branch on origin ──
     const head = (
       await gitOut(deps.cmd, path, ["rev-parse", "--verify", "HEAD"])
     )?.trim();
@@ -679,10 +673,28 @@ export function createJanitor(deps: JanitorDeps) {
         existsSync(join(gitDir, "rebase-merge")) ||
         existsSync(join(gitDir, "rebase-apply")));
 
+    // §15: HEAD plus the env's own branch (`branchName`) when it exists
+    // and is not the checked-out one — an executor who switched the
+    // copy to another branch still loses nothing unmerged. Other local
+    // branches of the shared repository are not the copy's and are not
+    // checked here.
+    const shas = [head];
+    const envBranch = env.branchName?.trim();
+    if (envBranch && envBranch !== ownBranch) {
+      const sha = (
+        await gitOut(deps.cmd, repoRoot, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          `refs/heads/${envBranch}`,
+        ])
+      )?.trim();
+      if (sha) shas.push(sha);
+    }
     const targets = await targetRefs(env, repoRoot, protectedTargets);
     let merged = targets.length > 0;
     if (merged) {
-      for (const sha of new Set([head, ...branchShas])) {
+      for (const sha of new Set(shas)) {
         let ok = ancestorCache.get(sha) === true;
         if (!ok) {
           for (const t of targets) {
