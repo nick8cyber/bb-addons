@@ -81,7 +81,7 @@ export interface ExecutorProbes {
   /**
    * §17.1 r26 (PLUG-211 Б2): plugin ids whose threads continue a human
    * chat — they are not "plugin-born" for the role rule. Absent probe =
-   * the default `["handoff"]`.
+   * the default `["handoff", "external-compact"]`.
    */
   userThreadPlugins?(): readonly string[];
 }
@@ -118,11 +118,17 @@ const roleDelegates = (roleId: string): boolean =>
   ROLES[roleId as RoleId]?.delegates === true;
 
 /**
- * §17.1 r26 (PLUG-211 Б1): the recorded role, with the lazy rewrite — a
- * stale `orchestrator` row on a plugin-born thread outside
- * `userThreadPlugins` predates the r26 rule; the verdict the hook would
- * write today is `none`, so the row is corrected on sight (the one-time
- * `migratePluginThreadRoles` pass covers what configure never reaches).
+ * §17.1 r26 (PLUG-211 Б1 + PLUG-215 Б1): the recorded role, with the
+ * lazy rewrite in BOTH directions — a stale `orchestrator` row on a
+ * plugin-born thread outside `userThreadPlugins` predates the r26 rule
+ * (the hook would write `none` today), and a `none` row on a parentless
+ * thread whose plugin IS in `userThreadPlugins` predates the plugin's
+ * addition to the list (the hook would write `orchestrator` today).
+ * Both are corrected on sight; the one-time `migratePluginThreadRoles`
+ * pass covers what configure never reaches. A parented `none` row
+ * stands: the parent rule beats the plugin list (§17.1), so the hook
+ * would write `executor`, and `none` already keeps the thread from the
+ * coordinator issuance.
  */
 export function effectiveRoleId(
   facts: ThreadFacts,
@@ -131,14 +137,25 @@ export function effectiveRoleId(
   const roleId = probes.roleByThreadId?.(facts.threadId);
   const userPlugins =
     probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
+  const pluginBorn =
+    facts.originPluginId !== null && facts.originPluginId !== undefined;
   if (
     roleId === "orchestrator" &&
-    facts.originPluginId !== null &&
-    facts.originPluginId !== undefined &&
-    !userPlugins.includes(facts.originPluginId)
+    pluginBorn &&
+    !userPlugins.includes(facts.originPluginId!)
   ) {
     probes.writeRole?.(facts.threadId, NO_ROLE);
     return NO_ROLE;
+  }
+  if (
+    roleId === NO_ROLE &&
+    pluginBorn &&
+    (facts.parentThreadId === null ||
+      facts.parentThreadId === undefined) &&
+    userPlugins.includes(facts.originPluginId!)
+  ) {
+    probes.writeRole?.(facts.threadId, "orchestrator");
+    return "orchestrator";
   }
   return roleId;
 }
@@ -321,11 +338,7 @@ export async function migratePluginThreadRoles(
       );
       continue;
     }
-    if (
-      pluginId &&
-      pluginId !== "mixed" &&
-      !userPlugins.includes(pluginId)
-    ) {
+    if (pluginId && !userPlugins.includes(pluginId)) {
       store.setThreadRole(row.thread_id, NO_ROLE, "hook");
       moved++;
     }

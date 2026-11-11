@@ -354,3 +354,72 @@ test("§17.1 r26 (Б2): a configured-empty userThreadPlugins denies a handoff th
   );
   assert.deepEqual(config.tools, []);
 });
+
+test("§17.1 r26 (PLUG-215 Б1): the lazy fix is two-sided — a none row on a listed plugin thread is restored to orchestrator", () => {
+  const writes: [string, string][] = [];
+  const context = ctx({ origin: { pluginId: "external-compact" } });
+  const config = buildAgentConfiguration(context, {
+    ...deps,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "none",
+      writeRole: (id, role) => writes.push([id, role]),
+    },
+  });
+  // the plugin continues the human chat — the row is stale, the hook
+  // would write orchestrator today
+  assert.equal(config.tools.length, 4);
+  assert.deepEqual(writes, [[context.thread.id, "orchestrator"]]);
+});
+
+test("§17.1 r26 (PLUG-215 Б1): a parented none row stays none — the parent beats the plugin list", () => {
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(
+    ctx({
+      thread: { parentThreadId: "thr_p" },
+      origin: { pluginId: "handoff" },
+    }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        roleByThreadId: () => "none",
+        writeRole: (id, role) => writes.push([id, role]),
+      },
+    },
+  );
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(writes, []);
+});
+
+test("§17.1 r26 (PLUG-215 Б1): a none row on an unlisted plugin stays none", () => {
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "advisor" } }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        roleByThreadId: () => "none",
+        writeRole: (id, role) => writes.push([id, role]),
+      },
+    },
+  );
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(writes, []);
+});
+
+test("§17.1 r26 (PLUG-215 Б1): a none row on a non-plugin thread stands", () => {
+  // `none` on an app/cli thread is not a plugin-list question — no fix.
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(ctx({}), {
+    ...deps,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "none",
+      writeRole: (id, role) => writes.push([id, role]),
+    },
+  });
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(writes, []);
+});

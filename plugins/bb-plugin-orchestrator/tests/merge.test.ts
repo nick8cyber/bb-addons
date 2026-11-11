@@ -1217,3 +1217,76 @@ test("§17.2 r26 (PLUG-211 Б3): a release-audit row is never the merge target",
   assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
   assert.equal(res.delegationId, row.id);
 });
+
+test("§17.2 r26 (PLUG-215 С1): a failed/stalled/quota newest round refuses with a merge <id> hint", async () => {
+  for (const status of ["failed", "stalled", "quota"] as const) {
+    const { coord, exec, resultSha } = makeRepos();
+    const { deps, store, row } = makeDeps({ coord, exec });
+    // round 1 — done with a result
+    recordResult(store, row, resultSha);
+    // round 2 — the review-returned follow-up died without a result
+    const row2 = store.insert({
+      taskKey: "PLUG-1",
+      projectId: "proj_main",
+      coordinatorThreadId: "thr_coord",
+      level: "complex",
+      route: "r",
+      preset: "r",
+      provider: "p",
+      round: 2,
+    });
+    store.setThreadInfo(row2.id, "thr_exec");
+    store.setStatus(row2.id, status);
+    await assert.rejects(runMerge(PARAMS, deps), (e: unknown) => {
+      const err = e as OrchestratorError;
+      assert.equal(err.code, "not-done", status);
+      assert.match(err.message, /завершился/, status);
+      assert.match(
+        err.hint ?? "",
+        new RegExp(`merge ${row.id}`),
+        `${status}: the refusal names the previous round`,
+      );
+      return true;
+    });
+    // round 1 is untouched — no merge happened silently
+    assert.equal(store.get(row.id)!.merge_status, null, status);
+    assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work");
+  }
+});
+
+test("§17.2 r26 (PLUG-215 С1): a cancelled newest round still merges the previous one", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  // round 2 — the coordinator retracted it: the fallback to the newest
+  // FINISHED round is allowed for cancelled only.
+  const row2 = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "r",
+    preset: "r",
+    provider: "p",
+    round: 2,
+  });
+  store.setThreadInfo(row2.id, "thr_exec");
+  store.setStatus(row2.id, "cancelled");
+  const res = await runMerge(PARAMS, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  assert.equal(res.delegationId, row.id, "round 1 merges");
+});
+
+test("§17.2 r26 (PLUG-215 С1): a failed newest round without a finished predecessor refuses plainly", async () => {
+  const { coord, exec } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  store.setStatus(row.id, "failed");
+  await assert.rejects(runMerge(PARAMS, deps), (e: unknown) => {
+    const err = e as OrchestratorError;
+    assert.equal(err.code, "not-done");
+    assert.match(err.message, /завершился failed/);
+    // no done round to point at — the generic hint stands
+    assert.match(err.hint ?? "", /orchestrator status/);
+    return true;
+  });
+});

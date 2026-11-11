@@ -62,6 +62,7 @@ import {
   type WatchdogThreads,
 } from "./src/watchdog.js";
 import {
+  DEFAULT_USER_THREAD_PLUGINS,
   handleMessageDispatch,
   isRoleId,
   PICKABLE_ROLE_IDS,
@@ -209,8 +210,8 @@ export async function createPlugin(
       type: "string",
       label: "User thread plugins",
       description:
-        "§17.1: plugin ids whose threads continue a human chat (session handoff) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default `handoff`.",
-      default: "handoff",
+        "§17.1: plugin ids whose threads continue a human chat (session handoff, chat compaction into a new thread) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default `handoff, external-compact`.",
+      default: "handoff external-compact",
     },
     janitor: {
       type: "string",
@@ -227,7 +228,10 @@ export async function createPlugin(
   /** §17.1 r26 (PLUG-211 Б2): plugin ids continuing a human chat —
    * comma/space-separated in the `userThreadPlugins` setting. */
   const userPlugins = (): readonly string[] =>
-    (currentSettings.userThreadPlugins ?? "handoff")
+    (
+      currentSettings.userThreadPlugins ??
+      DEFAULT_USER_THREAD_PLUGINS.join(" ")
+    )
       .split(/[\s,]+/)
       .filter(Boolean);
 
@@ -1150,11 +1154,37 @@ export async function createPlugin(
   const fail = (json: boolean, error: unknown) =>
     json ? jsonFail(error) : textFail(error);
 
+  // §17.2 r26 (PLUG-215 мелко 2): a `notify-muted` setup_errors entry is
+  // the quiet-stop mark awaiting the `auto` restore — a pending state,
+  // not a setup failure; render it under its own label instead of
+  // inside `setup_errors`.
+  const renderSetupErrors = (raw: string): string => {
+    try {
+      const entries = JSON.parse(raw) as {
+        step?: string;
+        message?: string;
+      }[];
+      if (!Array.isArray(entries)) return ` setup_errors=${raw}`;
+      const errors = entries.filter((e) => e?.step !== "notify-muted");
+      const muted = entries.filter((e) => e?.step === "notify-muted");
+      let out = errors.length
+        ? ` setup_errors=${JSON.stringify(errors)}`
+        : "";
+      if (muted.length) {
+        out +=
+          ` notify-muted=${muted.at(-1)?.message ?? "?"}` +
+          ` (уведомления заглушены, ждут восстановления auto)`;
+      }
+      return out;
+    } catch {
+      return ` setup_errors=${raw}`;
+    }
+  };
   const renderDelegation = (d: DelegationRow) =>
     `#${d.id} ${d.task_key} level=${d.level} route=${d.route} status=${d.status}` +
     `${d.thread_id ? ` thread=${d.thread_id}` : ""} ` +
     `coordinator=${d.coordinator_thread_id}` +
-    (d.setup_errors !== "[]" ? ` setup_errors=${d.setup_errors}` : "");
+    (d.setup_errors !== "[]" ? renderSetupErrors(d.setup_errors) : "");
 
   bb.cli.register({
     name: "orchestrator",

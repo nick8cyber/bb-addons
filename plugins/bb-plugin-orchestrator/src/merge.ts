@@ -243,19 +243,28 @@ export async function runMerge(
       }
       if (fresh.status === "done") {
         row = fresh;
-      } else if (
-        fresh.status === "dispatching" ||
-        fresh.status === "running"
-      ) {
+      } else if (fresh.status !== "cancelled") {
+        // §17.2 (PLUG-215 С1): the newest round failed/stalled/quota or
+        // is still dispatching/running — its predecessor's result is NOT
+        // merged silently (review may have rejected that round, and a
+        // `stalled` round can still revive to `done`, §16.2). The
+        // refusal names `merge <id>` for the previous round; only a
+        // `cancelled` newest round — one the coordinator retracted — falls
+        // back on its own.
+        const inflight =
+          fresh.status === "dispatching" || fresh.status === "running";
         throw new OrchestratorError(
           "not-done",
-          `делегирование ${fresh.id} ещё ${fresh.status}, итога нет`,
-          "merge works on finished rounds — see `bb orchestrator status`",
+          inflight
+            ? `делегирование ${fresh.id} ещё ${fresh.status}, итога нет`
+            : `заход ${fresh.id} завершился ${fresh.status}, итога нет`,
+          row && row.id !== fresh.id
+            ? `прошлый итог — \`bb orchestrator merge ${row.id}\``
+            : "merge works on finished rounds — see `bb orchestrator status`",
         );
       }
-      // Terminal non-done (failed/cancelled/stalled/quota): the newest
-      // FINISHED round stays the merge target — `row` from
-      // latestDoneResultByTask above.
+      // `cancelled` newest round: the newest FINISHED round stays the
+      // merge target — `row` from latestDoneResultByTask above.
     }
   }
   if (!row) {

@@ -6,6 +6,7 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
+import { DelegationStore } from "../src/store.js";
 import { createPlugin } from "../server.js";
 
 const POLICY_TEXT = JSON.stringify({
@@ -571,4 +572,37 @@ test("janitor run with invalid config reports janitor-invalid", async () => {
   const res = await host.harness.runCli(["janitor", "run"], {});
   assert.equal(res.exitCode, 1);
   assert.match(res.stderr ?? "", /janitor-invalid/);
+});
+
+test("§17.2 r26 (PLUG-215 мелко 2): `show` labels the notify-muted mark, not a setup error", async () => {
+  const { cli } = fakeCli((args) => {
+    if (args.join(" ").startsWith("tasks dispatch"))
+      return ok(JSON.stringify({ threadId: "thr_exec" }));
+    if (args.join(" ").startsWith("tasks preset show"))
+      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: { ...COORDINATOR_SDK, update: async () => ({}) },
+  });
+  const created = await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+  const delegationId = (
+    JSON.parse(created.stdout) as { delegationId: number }
+  ).delegationId;
+  // the quiet-stop mark plus a real setup error — only the real one
+  // stays inside setup_errors=
+  const store = new DelegationStore(host.bb.storage.database());
+  store.addSetupError(delegationId, "notify-muted", "thr_exec");
+  store.addSetupError(delegationId, "attach-verify", "gone");
+
+  const res = await host.harness.runCli(["show", String(delegationId)]);
+  assert.equal(res.exitCode, 0);
+  assert.doesNotMatch(res.stdout, /"step":"notify-muted"/);
+  assert.match(res.stdout, /notify-muted=thr_exec/);
+  assert.match(res.stdout, /заглушены/);
+  assert.match(res.stdout, /setup_errors=\[/);
+  assert.match(res.stdout, /"step":"attach-verify"/);
 });

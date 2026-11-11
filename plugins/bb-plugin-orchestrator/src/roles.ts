@@ -193,9 +193,10 @@ export interface RoleDecisionProbes {
   policy?(): Policy | null;
   /**
    * §17.1 r26 (PLUG-211 Б2): plugin ids whose threads continue a human
-   * chat (session handoff) — their thread inherits the source role, or
-   * takes the orchestrator default without a decidable source. Absent
-   * probe = the default `["handoff"]`.
+   * chat (session handoff, chat compaction into a new thread) — their
+   * thread inherits the source role, or takes the orchestrator default
+   * without a decidable source. Absent probe = the default
+   * `["handoff", "external-compact"]`.
    */
   userThreadPlugins?(): readonly string[];
 }
@@ -206,8 +207,12 @@ export interface RoleDecisionProbes {
 export const NO_ROLE = "none";
 
 /** §17.1: plugins continuing a human chat when the `userThreadPlugins`
- * setting is unset. */
-export const DEFAULT_USER_THREAD_PLUGINS = ["handoff"] as const;
+ * setting is unset — session handoff and `bb external-compact` (chat
+ * compaction into a new thread) (PLUG-215 Б1). */
+export const DEFAULT_USER_THREAD_PLUGINS = [
+  "handoff",
+  "external-compact",
+] as const;
 
 /**
  * §13.2 п.2 — the role rule, evaluated strictly in the spec's branch order.
@@ -242,6 +247,11 @@ export function decideRole(
     const source = probes.threadRole(facts.sourceThreadId);
     if (source && isRoleId(source.role)) return source.role;
   }
+  // 3. Any other child thread executes. §17.1 r26 (PLUG-215 С2): the
+  //    parent rule beats userThreadPlugins — a user-continuation
+  //    plugin's thread WITH a parent is a handed-off worker, not a
+  //    human chat.
+  if (facts.parentThreadId) return "executor";
   // §17.1 r26 (PLUG-211 Б2): a user-continuation plugin's thread IS a
   //    human chat — the source's role already applied when decidable;
   //    without it the thread gets the orchestrator default, like a chat
@@ -249,8 +259,6 @@ export function decideRole(
   if (facts.originPluginId && userPlugins.includes(facts.originPluginId)) {
     return policyOk ? DEFAULT_ROLE : null;
   }
-  // 3. Any other child thread executes.
-  if (facts.parentThreadId) return "executor";
   // 4. A chat from the new-thread window takes the project's current pick.
   //    §16.7: while the policy is invalid the DEFAULT is no role — an
   //    explicit pick still applies, the setup skill alone is issued.

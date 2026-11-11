@@ -5023,3 +5023,78 @@ test("§17.2 r26 (PLUG-211 С3): no branch start point → commits stays null, n
   );
   assert.doesNotMatch(fresh.setup_errors, /коммитов нет/);
 });
+
+test("§17.2 r26 (PLUG-215 мелко 1): the compaction pair across passes fires ONE reminder", async () => {
+  const h = makeHarness();
+  h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_coord", [ev(8, "turn/started", T0)]);
+  await h.wd.reconcile(); // seeds the cursor at the journal tip
+  // claude-code emits ONE compaction as a pair ~1 seq apart: the
+  // item/completed half lands first, the pass runs between the halves.
+  h.eventLog
+    .get("thr_coord")!
+    .push(
+      ev(9, "item/completed", T0 + 100, {
+        item: { type: "contextCompaction" },
+      }),
+    );
+  await h.wd.reconcile();
+  const reminds = () =>
+    h.sends.filter(
+      (x) =>
+        x.threadId === "thr_coord" && /сжат/.test(JSON.stringify(x.input)),
+    ).length;
+  assert.equal(reminds(), 1);
+  // the thread/compacted half arrives in the next pass — same compaction
+  h.eventLog.get("thr_coord")!.push(ev(10, "thread/compacted", T0 + 300));
+  await h.wd.reconcile();
+  assert.equal(reminds(), 1, "the pair's second half is not a new compaction");
+  // a genuinely NEW compaction well past the pair still reminds
+  h.eventLog
+    .get("thr_coord")!
+    .push(
+      ev(30, "item/completed", T0 + 90_000, {
+        item: { type: "contextCompaction" },
+      }),
+    );
+  await h.wd.reconcile();
+  assert.equal(reminds(), 2);
+});
+
+test("§17.2 r26 (PLUG-215 мелко 3): a compaction-reminder failure does not skip the notify-muted restore", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.store.addSetupError(row.id, "notify-muted", "thr_e1");
+  h.threadDtos.set(
+    "thr_e1",
+    dto("thr_e1", "idle", {
+      parentThreadId: "thr_coord",
+      parentNotifications: "off",
+    }),
+  );
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // the compaction pass dies on its cursor read — the `auto` restore
+  // must still run in the same reconcile.
+  const origMetaGet = h.store.metaGet.bind(h.store);
+  h.store.metaGet = (key: string) => {
+    if (key.startsWith("compact-")) throw new Error("meta gone (test)");
+    return origMetaGet(key);
+  };
+  const s = await h.wd.reconcile();
+  assert.ok(
+    s.errors.some((e) => /compact reminders: meta gone/.test(e)),
+    "the reminder failure is reported",
+  );
+  assert.equal(
+    h.threadDtos.get("thr_e1")!.parentNotifications,
+    "auto",
+    "the restore still ran",
+  );
+  assert.equal(
+    h.store.findSetupError(h.store.get(row.id)!, "notify-muted"),
+    undefined,
+    "the mark cleared",
+  );
+});

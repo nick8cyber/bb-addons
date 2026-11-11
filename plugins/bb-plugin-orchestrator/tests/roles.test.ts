@@ -640,9 +640,9 @@ test("§17.1 r26 (Б2): a handoff thread without a decidable source → orchestr
     ),
     "orchestrator",
   );
-  // a source without a recorded role falls through to the same default,
-  // NOT to the parent/executor branch (a handoff is a human chat, never
-  // an executor).
+  // §17.1 (PLUG-215 С2): a source without a recorded role falls through
+  // to the PARENT branch — the parent rule beats userThreadPlugins: a
+  // handed-off worker is an executor, not a human chat.
   assert.equal(
     decideRole(
       facts({
@@ -653,7 +653,7 @@ test("§17.1 r26 (Б2): a handoff thread without a decidable source → orchestr
       }),
       noProbes,
     ),
-    "orchestrator",
+    "executor",
   );
   // a plugin NOT in the configured list keeps `none` — the list decides
   assert.equal(
@@ -683,6 +683,53 @@ test("§17.1 r26 (Б2): a handoff thread without a decidable source → orchestr
     }),
     null,
   );
+});
+
+test("§17.1 r26 (PLUG-215 Б1): external-compact is a user-thread plugin by default", () => {
+  // `bb external-compact` continues the human chat in a new thread —
+  // without a decidable source it gets the orchestrator default.
+  assert.equal(
+    decideRole(
+      facts({ origin: "plugin", originPluginId: "external-compact" }),
+      noProbes,
+    ),
+    "orchestrator",
+  );
+  // …and inherits the source role when decidable.
+  assert.equal(
+    decideRole(
+      facts({
+        origin: "plugin",
+        originPluginId: "external-compact",
+        sourceThreadId: "thr_src",
+      }),
+      {
+        ...noProbes,
+        threadRole: (id) =>
+          id === "thr_src" ? { role: "auditor" } : undefined,
+      },
+    ),
+    "auditor",
+  );
+});
+
+test("§17.1 r26 (PLUG-215 С2): the parent rule beats userThreadPlugins", () => {
+  // a handed-off WORKER (the plugin's thread kept its parent) is an
+  // executor — the human-chat default is for parentless threads only.
+  for (const pluginId of ["handoff", "external-compact"]) {
+    assert.equal(
+      decideRole(
+        facts({
+          origin: "plugin",
+          originPluginId: pluginId,
+          parentThreadId: "thr_p",
+        }),
+        noProbes,
+      ),
+      "executor",
+      pluginId,
+    );
+  }
 });
 
 test("§17.1 r26 (Б2): the hook records orchestrator for a handoff thread", () => {
@@ -723,11 +770,13 @@ test("§17.1 r26 (Б1): the one-time migration rewrites plugin orchestrator rows
   const moved = await migratePluginThreadRoles(store, {
     threadOriginPluginId: async (id) => origins.get(id),
   });
-  assert.equal(moved, 4);
-  for (const id of ["thr_adv", "thr_call", "thr_persp", "thr_ext"]) {
+  assert.equal(moved, 3);
+  for (const id of ["thr_adv", "thr_call", "thr_persp"]) {
     assert.equal(store.threadRole(id)!.role, "none", id);
   }
-  for (const id of ["thr_app", "thr_cli", "thr_ho"]) {
+  // PLUG-215 Б1: external-compact joined the default userThreadPlugins —
+  // its orchestrator row is not stale and survives the migration.
+  for (const id of ["thr_app", "thr_cli", "thr_ho", "thr_ext"]) {
     assert.equal(store.threadRole(id)!.role, "orchestrator", id);
   }
   // a `delegate`-sourced row is the delegate path's own correction —

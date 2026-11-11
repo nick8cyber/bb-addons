@@ -62,6 +62,12 @@ const RESULT_OUTPUT_CAP = 3000;
 const RESULT_BB_GRACE_MS = 120_000;
 /** §16.5: the coordinator journal's compaction event (SDK `thread/compacted`). */
 const COMPACTION_EVENT_TYPE = "thread/compacted";
+/** §17.2 r26 (PLUG-215 мелко 1): claude-code reports ONE compaction as a
+ * pair — `item/completed` (contextCompaction) and `thread/compacted` land
+ * ~1 seq apart (~0.2 s live). A different-kind compaction event within
+ * this many seq of the last reminded one is the pair's second half, not
+ * a new compaction. */
+const COMPACTION_PAIR_SEQ = 8;
 
 /** §17.2 r26 (PLUG-211 Б4): `setup_errors` step marking an intentional
  * parent-notifications mute — written BEFORE `off`, cleared only after
@@ -2656,6 +2662,26 @@ export function createWatchdog(deps: WatchdogDeps) {
         if (tail) store.metaSet(key, String(scannedTip));
         continue;
       }
+      // §17.2 r26 (PLUG-215 мелко 1): the reminder fires once per
+      // COMPACTION, not per event — a pass landing between the pair's
+      // halves (contextCompaction then thread/compacted, or back) must
+      // not send a second reminder. The durable `compact-reminded` mark
+      // records seq + kind of the last reminded event; a different-kind
+      // event within COMPACTION_PAIR_SEQ of it is the same compaction.
+      const remindedKey = `compact-reminded:${coordId}`;
+      const [remindedSeqRaw, remindedKind] = (
+        store.metaGet(remindedKey) ?? ""
+      ).split(":");
+      const latestKind =
+        latest.type === COMPACTION_EVENT_TYPE ? "compacted" : "item";
+      if (
+        remindedKind !== undefined &&
+        remindedKind !== latestKind &&
+        latest.seq - Number(remindedSeqRaw) <= COMPACTION_PAIR_SEQ
+      ) {
+        store.metaSet(key, String(tail ? scannedTip : latest.seq));
+        continue;
+      }
       let coord: WatchdogThreadDto | null;
       try {
         coord = await getThread(coordId);
@@ -2691,6 +2717,7 @@ export function createWatchdog(deps: WatchdogDeps) {
             },
           ],
         });
+        store.metaSet(remindedKey, `${latest.seq}:${latestKind}`);
         store.metaSet(key, String(tail ? scannedTip : latest.seq));
       } catch (e) {
         s.errors.push(`compact remind ${coordId}: ${message(e)}`);
@@ -2928,9 +2955,15 @@ export function createWatchdog(deps: WatchdogDeps) {
     // §16.5: the post-compaction §3 reminder — one per compaction event.
     try {
       await compactionReminders(summary);
-      await restoreMutedNotify(summary);
     } catch (e) {
       summary.errors.push(`compact reminders: ${message(e)}`);
+    }
+    // §17.2 r26 (PLUG-215 мелко 3): the `auto` restore gets its own
+    // try — a reminder exception must not skip it for the whole pass.
+    try {
+      await restoreMutedNotify(summary);
+    } catch (e) {
+      summary.errors.push(`notify-muted restore: ${message(e)}`);
     }
     return summary;
   };
