@@ -78,7 +78,11 @@ import {
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
 import { isEnvironmentGone, runMerge } from "./src/merge.js";
-import { pumpReleases, runRelease } from "./src/release.js";
+import {
+  pumpReleases,
+  runRelease,
+  settingsProjectId,
+} from "./src/release.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -711,10 +715,18 @@ export async function createPlugin(
         janitorConfig().config?.protectedBranches ?? undefined,
       mergeAutofix: () => currentSettings.mergeAutofix === true,
       // §16.6 `threadIds`: off → merge commits drop the task key.
-      releaseThreadIds: (projectId) =>
+      // §6 (r7): the settings project is the repository's bb project —
+      // the delegation's project id is only the fallback.
+      releaseThreadIds: async (repoPath, projectId) =>
         releaseConfig.config
-          ? resolveProject(releaseConfig.config, projectId ?? "")
-              .threadIds
+          ? resolveProject(
+              releaseConfig.config,
+              await settingsProjectId(
+                { cmd, bbCli },
+                repoPath,
+                projectId ?? "",
+              ),
+            ).threadIds
           : true,
       log: bb.log,
     });
@@ -1569,7 +1581,9 @@ export async function createPlugin(
                 exitCode: 0,
                 stdout:
                   `release ${res.taskKey}: аудит запущен ` +
-                  `(release #${res.releaseId}, тред ${res.auditThreadId ?? "—"})` +
+                  `(release #${res.releaseId}, тред ${res.auditThreadId ?? "—"}; ` +
+                  `проект настройки ${res.settingsProjectId}, ` +
+                  `проект делегирования ${res.delegationProjectId})` +
                   (res.warnings.length
                     ? `
 предупреждения скана:
