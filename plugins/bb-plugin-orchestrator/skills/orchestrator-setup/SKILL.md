@@ -24,5 +24,9 @@ description: Set up the orchestrator plugin together with the user — their pro
 6. **Запиши политику** и проверь её:
    `bb plugin config orchestrator set policy '<json>'`, затем `bb orchestrator policy validate`.
    Формат: `version: 1`, `levels.<имя> = { description, chain: [<маршрут>...], autoFallback }`, `routes.<имя> = { preset, provider, quotaGroup?, quotaPatterns? }`, необязательные `limits`, `firstResponseSeconds` (30–600), `maxRunSeconds` (≥ 300). Пустая или невалидная политика — плагин в `needs-configuration`, `delegate` отклоняет вызовы. После правки настроек перезагрузи плагин, чтобы статус обновился.
+7. **Предложи включить уборщик** (спека §15): он убирает влитые рабочие копии, ветки `bb/` и треды исполнителей и сообщает о брошенных. По умолчанию выключен.
+   `bb plugin config orchestrator set janitor '{"enabled": true, "mode": "report"}'` — первым прогоном только отчёт, ничего не удаляет. Посмотри `bb orchestrator janitor report`; если отчёт разумный, переведи в удаление:
+   `bb plugin config orchestrator set janitor '{"enabled": true, "mode": "apply"}'`.
+   Тонкая настройка (JSON, необязательные ключи): `afterMerge` (срок после вливания до уборки, `15m`+, по умолчанию `10h`), `abandonedAfter` (простой для отчёта «брошено», `1d`+, по умолчанию `10d`), `intervalMinutes` (≥ 15, по умолчанию 60), `excludeProjects` (id проектов bb, которыми занимается другой уборщик), `protectedBranches` (по умолчанию `["main","master","dev"]`), `deleteBranches` (по умолчанию `true`). Удаляется только то, что полностью на `origin` и чисто; невлитое и грязное — только в отчёте и в суточном сообщении координатору. Внеочередной прогон — `bb orchestrator janitor run`, сухой — `bb orchestrator janitor run --dry-run`.
 
-Проверь итог: `bb orchestrator policy show` (политика и предупреждения) и `bb orchestrator instructions` (правило, которое увидит координатор).
+Проверь итог: `bb orchestrator policy show` (политика и предупреждения), `bb orchestrator instructions` (правило, которое увидит координатор) и — если уборщик включён — `bb orchestrator janitor report`.
