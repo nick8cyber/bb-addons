@@ -101,6 +101,7 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
       "orchestrator_delegate",
       "orchestrator_status",
       "orchestrator_cancel",
+      "orchestrator_merge",
     ],
     skills: ["orchestrator-coordinator", "orchestrator-setup"],
   },

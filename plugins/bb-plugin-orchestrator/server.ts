@@ -60,6 +60,7 @@ import {
   type ReleaseConfigLoad,
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
+import { runMerge } from "./src/merge.js";
 import { pumpReleases, runRelease } from "./src/release.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
@@ -178,6 +179,13 @@ export async function createPlugin(
       experimental_multiline: true,
       experimental_schema: gitInstructionsSchema,
       default: DEFAULT_GIT_INSTRUCTIONS,
+    },
+    mergeAutofix: {
+      type: "boolean",
+      label: "Auto-delegate merge conflicts",
+      description:
+        "§14/§16.6: on a merge conflict, delegate a fix round to the same task and level. Off — only report the conflict to the coordinator.",
+      default: false,
     },
   });
 
@@ -484,6 +492,76 @@ export async function createPlugin(
       bb.log.warn(`orchestrator release pump: ${describeError(e)}`),
     );
 
+  /**
+   * A thread's worktree: `threads.get` gives the environment id, `bb
+   * environment show` its facts (§4.1, §14). Shared by the watchdog's
+   * round-result reader and `merge`'s coordinator copy.
+   */
+  const environmentOf = async (threadId: string) => {
+    const t = (await bb.sdk.threads.get({ threadId })) as {
+      environmentId?: string | null;
+    };
+    if (!t.environmentId) return null;
+    const env = await runJson<{
+      id?: string;
+      path?: string;
+      branchName?: string;
+      mergeBaseBranch?: string | null;
+      baseBranch?: string | { name?: string } | null;
+    }>(bbCli, ["environment", "show", t.environmentId, "--json"]);
+    const mergeBase =
+      env.mergeBaseBranch ??
+      (typeof env.baseBranch === "string"
+        ? env.baseBranch
+        : (env.baseBranch?.name ?? null));
+    return {
+      id: env.id ?? t.environmentId,
+      path: env.path,
+      branchName: env.branchName,
+      mergeBaseBranch: mergeBase,
+    };
+  };
+
+  // §14 merge — deliberately NOT on the `delegate` queue (§16.8): the
+  // autofix path calls `delegate`, which is queued itself; queuing the
+  // outer merge would deadlock. The per-copy lock lives in merge.ts.
+  const mergeDelegation = (input: {
+    ref: string;
+    into?: string;
+    noAutofix?: boolean;
+    dryRun?: boolean;
+    callerThreadId: string;
+  }) =>
+    runMerge(input, {
+      store,
+      bbCli,
+      git: async (repo, args) => {
+        const res = await cmd.run("git", ["-C", repo, ...args]);
+        return {
+          exitCode: res.exitCode,
+          stdout: res.stdout,
+          stderr: res.stderr,
+        };
+      },
+      environment: environmentOf,
+      environmentById: async (envId) => {
+        const env = await runJson<{ path?: string }>(bbCli, [
+          "environment",
+          "show",
+          envId,
+          "--json",
+        ]);
+        return { path: env.path };
+      },
+      threads: {
+        send: (a) => bb.sdk.threads.send(a as never) as Promise<unknown>,
+      },
+      delegate: (d) =>
+        delegate({ ...d, threadId: input.callerThreadId }),
+      mergeAutofix: () => currentSettings.mergeAutofix === true,
+      log: bb.log,
+    });
+
   const watchdog = createWatchdog({
     store,
     bbCli,
@@ -497,30 +575,7 @@ export async function createPlugin(
     round: {
       // §4.1: the executor's environment from its thread, then the env's
       // own facts via `bb environment show`.
-      environment: async (threadId: string) => {
-        const t = (await bb.sdk.threads.get({ threadId })) as {
-          environmentId?: string | null;
-        };
-        if (!t.environmentId) return null;
-        const env = await runJson<{
-          id?: string;
-          path?: string;
-          branchName?: string;
-          mergeBaseBranch?: string | null;
-          baseBranch?: string | { name?: string } | null;
-        }>(bbCli, ["environment", "show", t.environmentId, "--json"]);
-        const mergeBase =
-          env.mergeBaseBranch ??
-          (typeof env.baseBranch === "string"
-            ? env.baseBranch
-            : (env.baseBranch?.name ?? null));
-        return {
-          id: env.id ?? t.environmentId,
-          path: env.path,
-          branchName: env.branchName,
-          mergeBaseBranch: mergeBase,
-        };
-      },
+      environment: environmentOf,
       git: async (repo, args) => {
         const res = await cmd.run("git", ["-C", repo, ...args]);
         if (res.exitCode !== 0) {
@@ -718,6 +773,41 @@ export async function createPlugin(
     },
   });
 
+  bb.agents.registerTool({
+    name: "orchestrator_merge",
+    description:
+      "Merge a finished delegation round's result into your worktree (spec §14): checks, `git merge --no-ff`, a conflict-fix round when mergeAutofix is on.",
+    instructions:
+      "Call after checking the executor's result. Only the delegation's own coordinator may merge. Protected branches (main/master/dev) are refused — use `bb orchestrator release` for those. --dry-run checks for conflicts without touching the copy.",
+    parameters: z.object({
+      ref: z
+        .string()
+        .min(1)
+        .describe("Task key (latest done delegation) or delegation id"),
+      into: z
+        .string()
+        .optional()
+        .describe("Target branch; defaults to the worktree's current branch"),
+      noAutofix: z
+        .boolean()
+        .optional()
+        .describe("Never delegate a conflict-fix round, even with mergeAutofix on"),
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe("Checks + merge-tree only; the worktree stays untouched"),
+    }),
+    async execute(params, ctx) {
+      try {
+        return JSON.stringify(
+          await mergeDelegation({ ...params, callerThreadId: ctx.threadId }),
+        );
+      } catch (e) {
+        return JSON.stringify(errorJson(e));
+      }
+    },
+  });
+
   const statusReport = (filter: { coordinatorThreadId?: string }) => {
     const delegations = store.list(filter);
     const counts = store.countsByStatus();
@@ -841,6 +931,13 @@ export async function createPlugin(
         usage: "bb orchestrator cancel <delegationId|threadId> [--json]",
       },
       {
+        name: "merge",
+        summary:
+          "Merge a finished round's result into the coordinator's worktree (§14)",
+        usage:
+          "bb orchestrator merge <KEY|delegationId> [--into <branch>] [--no-autofix] [--dry-run] [--json]",
+      },
+      {
         name: "policy",
         summary: "Show or validate the configured policy",
         usage: "bb orchestrator policy [show|validate] [--json]",
@@ -877,7 +974,8 @@ export async function createPlugin(
       const positional = argv.filter(
         (a, i) => !a.startsWith("--") && argv[i - 1] !== "--level" &&
           argv[i - 1] !== "--route" && argv[i - 1] !== "--instructions" &&
-          argv[i - 1] !== "--coordinator" && argv[i - 1] !== "--from",
+          argv[i - 1] !== "--coordinator" && argv[i - 1] !== "--from" &&
+          argv[i - 1] !== "--into",
       );
       const cmd = positional[0];
 
@@ -967,6 +1065,55 @@ export async function createPlugin(
                 stdout: `cancelled delegation #${res.delegationId}` +
                   (res.warning ? ` (${res.warning})` : "") + "\n",
               };
+        }
+
+        if (cmd === "merge") {
+          const ref = positional[1];
+          if (!ref) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "usage: bb orchestrator merge <KEY|delegationId> [--into <ветка>] [--no-autofix] [--dry-run]",
+            );
+          }
+          if (!ctx.threadId) {
+            throw new OrchestratorError(
+              "no-caller-thread",
+              "merge works only from a bb thread (BB_THREAD_ID is absent)",
+              "run it inside a thread, or via the orchestrator_merge tool",
+            );
+          }
+          const res = await mergeDelegation({
+            ref,
+            into: flag("--into"),
+            noAutofix: argv.includes("--no-autofix"),
+            dryRun: argv.includes("--dry-run"),
+            callerThreadId: ctx.threadId,
+          });
+          if (json) return jsonOk(res);
+          if ("dryRun" in res) {
+            return {
+              exitCode: res.wouldConflict ? 1 : 0,
+              stdout:
+                `merge ${res.taskKey} r${res.round} → ${res.into}: ` +
+                (res.wouldConflict
+                  ? `конфликт (${res.conflictFiles.slice(0, 10).join(", ")})`
+                  : "чисто") +
+                " (dry-run)\n",
+            };
+          }
+          return {
+            exitCode: 0,
+            stdout:
+              `merge ${res.taskKey} r${res.round} → ${res.into}: ` +
+              (res.mergeStatus === "merged"
+                ? `влито ${res.mergedSha?.slice(0, 7) ?? ""}`
+                : res.mergeStatus === "fix-delegated"
+                  ? `конфликт, раздан заход разбора #${res.fixDelegationId}` +
+                    ` (тред ${res.fixThreadId ?? "—"})`
+                  : "конфликт, копия чистая — разбор за координатором") +
+              (res.warning ? `\nwarning: ${res.warning}` : "") +
+              "\n",
+          };
         }
 
         if (cmd === "policy") {
@@ -1133,7 +1280,7 @@ ${res.warnings
         throw new OrchestratorError(
           "invalid-arguments",
           `unknown subcommand "${cmd ?? ""}"`,
-          "commands: delegate, status, show, cancel, policy, instructions, reconcile",
+          "commands: delegate, status, show, cancel, merge, policy, instructions, reconcile",
         );
       } catch (e) {
         return fail(json, e);

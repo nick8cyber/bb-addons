@@ -35,7 +35,12 @@ test("a root app thread is a coordinator: gets tools and the rule", () => {
   const config = buildAgentConfiguration(ctx({}), deps);
   assert.deepEqual(
     config.tools,
-    ["orchestrator_delegate", "orchestrator_status", "orchestrator_cancel"],
+    [
+      "orchestrator_delegate",
+      "orchestrator_status",
+      "orchestrator_cancel",
+      "orchestrator_merge",
+    ],
   );
   // §3 rev 16: a fallback-decided coordinator gets the orchestrator
   // role's text too — instruction + rule.
@@ -49,7 +54,7 @@ test("injectInstructions=false silences texts but keeps the tools", () => {
     ...deps,
     injectInstructions: false,
   });
-  assert.equal(config.tools.length, 3);
+  assert.equal(config.tools.length, 4);
   assert.equal(config.instructions, undefined);
 });
 
@@ -158,7 +163,7 @@ test("each executor marker alone is enough — one test per marker", () => {
     [],
   );
   // none of the markers → coordinator
-  assert.equal(buildAgentConfiguration(clean, deps).tools.length, 3);
+  assert.equal(buildAgentConfiguration(clean, deps).tools.length, 4);
 });
 
 test("the fallback uses static facts only when probes throw", () => {
@@ -175,7 +180,7 @@ test("the fallback uses static facts only when probes throw", () => {
     buildAgentConfiguration(ctx({}), { ...deps, probes: broken }),
   );
   const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
-  assert.equal(fb.tools.length, 3);
+  assert.equal(fb.tools.length, 4);
   const fbExec = fallbackAgentConfiguration(
     ctx({ thread: { parentThreadId: "thr_p" } }),
     true,
@@ -214,7 +219,7 @@ test("a broken role read falls back to the static-facts result", () => {
     buildAgentConfiguration(ctx({}), { ...deps, probes: broken }),
   );
   const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
-  assert.equal(fb.tools.length, 3);
+  assert.equal(fb.tools.length, 4);
   assert.equal(fb.instructions, `${ORCH_TEXT}
 
 RULE`);
@@ -228,7 +233,7 @@ test("configure without a thread_roles row: fallback gives orchestrator texts", 
     ...deps,
     probes: { ...noProbes, roleByThreadId: () => undefined },
   });
-  assert.equal(config.tools.length, 3);
+  assert.equal(config.tools.length, 4);
   assert.equal(config.instructions, `${ORCH_TEXT}
 
 RULE`);

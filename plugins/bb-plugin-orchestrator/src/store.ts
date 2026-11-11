@@ -696,6 +696,43 @@ export class DelegationStore {
       );
   }
 
+  /**
+   * §14: the newest `done` delegation of the task with a recorded round
+   * result — the row `merge <KEY>` targets.
+   */
+  latestDoneResultByTask(taskKey: string): DelegationRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE task_key = ? AND status = 'done' AND result_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as DelegationRow | undefined;
+  }
+
+  /** §14: the merge landed — record target branch, merge commit, time. */
+  setMerged(id: number, merged: { into: string; sha: string }): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET merge_status = 'merged', merged_into = ?,
+         merged_sha = ?, merged_at = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(merged.into, merged.sha, Date.now(), Date.now(), id);
+  }
+
+  /** §14: a merge outcome that produced no merge commit. */
+  setMergeStatus(
+    id: number,
+    status: "conflict" | "fix-delegated" | "failed",
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET merge_status = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(status, Date.now(), id);
+  }
+
+
   /** Drop every `setup_errors` entry of one step — after a successful retry. */
   clearSetupError(id: number, step: string): void {
     const row = this.get(id);

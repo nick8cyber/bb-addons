@@ -26,6 +26,7 @@ export const COORDINATOR_TOOLS = [
   "orchestrator_delegate",
   "orchestrator_status",
   "orchestrator_cancel",
+  "orchestrator_merge",
 ] as const;
 
 /**
