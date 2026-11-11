@@ -1598,17 +1598,15 @@ export function createWatchdog(deps: WatchdogDeps) {
    * `child-completed`/`child-interrupted` with
    * `systemMessageSubject.threadId` = the executor's thread, or a
    * `child-outcome-batch` listing it in `outcomes`. A batch without a
-   * thread list counts only when it arrived after the executor's last
-   * response — an unattributed batch can only stand in for a turn that
-   * already ended. Returns null when the journal could not be read to
-   * its tail: unproven is not "absent".
+   * thread list never counts — an unattributed batch cannot stand in
+   * for a notice about THIS executor (PLUG-200 #4). Returns null when
+   * the journal could not be read to its tail: unproven is not "absent".
    */
   const coordinatorSawOutcome = async (
     row: DelegationRow,
   ): Promise<boolean | null> => {
     if (!row.thread_id) return false;
     const since = row.turn_started_at ?? 0;
-    const turnEnd = Math.max(row.last_response_at ?? 0, since);
     let after = 0;
     try {
       for (let page = 0; page < EVENT_MAX_PAGES; page++) {
@@ -1641,17 +1639,14 @@ export function createWatchdog(deps: WatchdogDeps) {
           }
           if (kind === "child-outcome-batch") {
             const outcomes = subj?.outcomes;
-            if (Array.isArray(outcomes) && outcomes.length > 0) {
-              if (
-                outcomes.some(
-                  (o) =>
-                    (o as { threadId?: unknown } | null)?.threadId ===
-                    row.thread_id,
-                )
-              ) {
-                return true;
-              }
-            } else if (turnEnd > 0 && e.createdAt > turnEnd) {
+            if (
+              Array.isArray(outcomes) &&
+              outcomes.some(
+                (o) =>
+                  (o as { threadId?: unknown } | null)?.threadId ===
+                  row.thread_id,
+              )
+            ) {
               return true;
             }
           }
@@ -1678,7 +1673,9 @@ export function createWatchdog(deps: WatchdogDeps) {
    * executor's thread; found — `result_notice = bb`, no message.
    * Absent — the plugin's own ONE line (branch, sha7, copy cleanliness,
    * executor output ≤ 3000 or «без отчёта»), `result_notice = plugin`.
-   * An empty or doubtful (§4.1) result always gets the plugin line.
+   * A doubtful (§4.1) result still gets the one-line header when BB
+   * already carried the report — the doubt rides it, the body does not
+   * repeat (PLUG-200 #1); an empty result always gets the plugin line.
    * `result_notified_at` is the durable delivery record; a gone
    * coordinator records the delivery with a NULL `result_notice` so the
    * row never rescans.
@@ -1748,25 +1745,33 @@ export function createWatchdog(deps: WatchdogDeps) {
     // §16.5 one channel: the round's doubts ride the result message.
     const doubt = store.findSetupError(fresh, "round-problems")?.message;
     // §16.5: BB's own notice about this thread in the coordinator's
-    // journal satisfies the delivery (`result_notice = bb`) — except an
-    // empty or doubtful result, which the plugin always reports itself.
-    // An unreadable journal is not "absent": the claim is released so
-    // the §7 pass re-checks — a duplicate line is worse than a late one.
-    if (report.length > 0 && !doubt) {
+    // journal satisfies the delivery (`result_notice = bb`). A doubtful
+    // result is journal-checked too: when BB already carried the report
+    // the plugin adds only the one-line header — the coordinator must
+    // not read the same 3000 chars twice (PLUG-200 #1). An unreadable
+    // journal is not "absent": the claim is released so the §7 pass
+    // re-checks — until the retry limit is spent, after which a late
+    // duplicate beats a lost result (PLUG-200 #2).
+    let bbCarried = false;
+    if (report.length > 0) {
       const seen = await coordinatorSawOutcome(fresh);
       if (seen === null) {
-        store.releaseResultClaim(fresh.id);
         await trackRetry(
           fresh,
           "проверка журнала координатора",
           "events.list failed",
         );
-        return;
-      }
-      if (seen) {
+        const retried = store.get(fresh.id) ?? fresh;
+        if (!hasSetupError(retried, "retry-exhausted")) {
+          store.releaseResultClaim(fresh.id);
+          return;
+        }
+      } else if (seen && !doubt) {
         store.setResultNotified(fresh.id, "bb");
         store.resetRetry(fresh.id);
         return;
+      } else {
+        bbCarried = seen;
       }
     }
     const branch = fresh.result_branch ?? "—";
@@ -1793,7 +1798,7 @@ export function createWatchdog(deps: WatchdogDeps) {
               `${fresh.thread_id ?? "—"}): ${fresh.status}, ветка ${branch}, ` +
               `коммит ${sha7}, копия ${copy}` +
               (doubt ? `, итог сомнителен: ${doubt}` : "") +
-              `\n${body}`,
+              (bbCarried ? "" : `\n${body}`),
             mentions: [],
           },
         ],

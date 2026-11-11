@@ -3265,7 +3265,7 @@ test("§16.5: a batch naming the thread counts; other threads only does not", as
   assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 1);
 });
 
-test("§16.5: an unattributed batch counts only after the executor's turn end", async () => {
+test("§16.5: an unattributed batch never counts — the plugin delivers (PLUG-200 #4)", async () => {
   const h = makeHarness();
   const row = h.insertActive({ threadId: "thr_e1" });
   const row2 = h.insertActive({ taskKey: "PLUG-2", threadId: "thr_e2" });
@@ -3274,14 +3274,12 @@ test("§16.5: an unattributed batch counts only after the executor's turn end", 
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог 1");
   h.outputs.set("thr_e2", "итог 2");
-  // thr_e1's last response is T0+9000 — the unattributed batch at
-  // T0+10_000 postdates its turn end and stands in for BB's notice.
+  // A `child-outcome-batch` with no `outcomes` list — it may be anyone's
+  // outcome; a foreign batch must not "extinguish" this delivery.
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0 - 1000),
     ev(2, "item/agentMessage/delta", T0 + 9000, { delta: "x" }),
   ]);
-  // thr_e2 answers further — T0+20_000 — so the same batch predates ITS
-  // turn end and cannot stand in.
   h.eventLog.set("thr_e2", [
     ev(1, "turn/started", T0 - 1000),
     ev(2, "item/agentMessage/delta", T0 + 20_000, { delta: "x" }),
@@ -3291,12 +3289,18 @@ test("§16.5: an unattributed batch counts only after the executor's turn end", 
       kind: "thread-batch",
       count: 1,
     }),
+    sysNotice(12, T0 + 11_000, "child-outcome-batch", {
+      kind: "thread-batch",
+      count: 1,
+      outcomes: [],
+    }),
   ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await h.wd.onThreadIdle(dto("thr_e2", "idle"));
   await settleResults(h);
-  assert.equal(h.store.get(row.id)!.result_notice, "bb");
+  assert.equal(h.store.get(row.id)!.result_notice, "plugin");
   assert.equal(h.store.get(row2.id)!.result_notice, "plugin");
+  assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 2);
 });
 
 test("§16.5: an empty executor report always gets the plugin line — even with BB's notice", async () => {
@@ -3317,7 +3321,7 @@ test("§16.5: an empty executor report always gets the plugin line — even with
   );
 });
 
-test("§16.5: a doubtful round always gets the plugin line — even with BB's notice", async () => {
+test("§16.5: a doubtful round BB already reported gets the header ONLY (PLUG-200 #1)", async () => {
   const repo = makeExecutorRepo({ commits: 1, dirty: true });
   const h = makeHarness({ round: roundDeps(repo) });
   const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
@@ -3331,7 +3335,32 @@ test("§16.5: a doubtful round always gets the plugin line — even with BB's no
   const fresh = h.store.get(row.id)!;
   assert.equal(fresh.result_notice, "plugin");
   const msg = h.sends.find((x) => x.threadId === "thr_coord")!;
-  assert.match(JSON.stringify(msg.input), /итог сомнителен/);
+  const text = JSON.stringify(msg.input);
+  assert.match(text, /итог сомнителен/);
+  assert.match(text, /ветка exec-branch/);
+  // BB's notice already carried the report — the plugin line must not
+  // repeat it (the coordinator reads the 3000 chars once).
+  assert.ok(!text.includes("итог захода"));
+  assert.ok(!text.includes("\\n"), "header-only — no body newline");
+});
+
+test("§16.5: a doubtful round WITHOUT BB's notice gets header + report", async () => {
+  const repo = makeExecutorRepo({ commits: 1, dirty: true });
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "итог захода");
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  // thr_coord journal: no notice about this executor.
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await settleResults(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_notice, "plugin");
+  const msg = h.sends.find((x) => x.threadId === "thr_coord")!;
+  const text = JSON.stringify(msg.input);
+  assert.match(text, /итог сомнителен/);
+  assert.ok(text.includes("итог захода"));
 });
 
 test("§16.5: an unreadable coordinator journal is not 'absent' — retried, then bb", async () => {
@@ -3355,6 +3384,105 @@ test("§16.5: an unreadable coordinator journal is not 'absent' — retried, the
   fresh = h.store.get(row.id)!;
   assert.equal(fresh.result_notice, "bb");
   assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 0);
+});
+
+test("§16.5: journal unreadable past the retry limit → plugin line anyway (PLUG-200 #2)", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "итог захода");
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventsBlocked.add("thr_coord");
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await h.wd.reconcile(); // opens the grace window
+  h.setNow(T0 + 121_000);
+  // 10 failed journal reads exhaust the §7 retry limit — the delivery
+  // must not die with the journal: a late duplicate beats a loss.
+  for (let i = 0; i < 10; i++) {
+    await h.wd.reconcile();
+  }
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_notice, "plugin");
+  const msgs = h.sends.filter((x) => x.threadId === "thr_coord");
+  const result = msgs.find((m) =>
+    /итог захода/.test(JSON.stringify(m.input)),
+  )!;
+  assert.ok(result, "the result line went out despite the dead journal");
+  assert.match(JSON.stringify(result.input), /ветка/);
+  assert.ok(
+    msgs.some((m) => /исчерпан предел повторов/.test(JSON.stringify(m.input))),
+    "the retry-exhausted escalation is sent too",
+  );
+});
+
+test("§16.5: a restart inside the 120 s window sends nothing — the marker survives", async () => {
+  const h1 = makeHarness();
+  const row = h1.insertActive({ threadId: "thr_e1" });
+  h1.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h1.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h1.outputs.set("thr_e1", "итог захода");
+  h1.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h1.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await h1.wd.reconcile(); // first sight — the window opens at T0
+  assert.equal(h1.store.get(row.id)!.result_notified_at, null);
+
+  // «Restart»: a new watchdog over the SAME database — the persisted
+  // `result-window` marker must keep the 120 s grace.
+  const h2 = makeHarness({ db: h1.db });
+  h2.setNow(T0 + 60_000); // still inside the window
+  h2.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h2.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h2.outputs.set("thr_e1", "итог захода");
+  await h2.wd.reconcile();
+  assert.equal(h2.sends.length, 0);
+  assert.equal(h2.store.get(row.id)!.result_notified_at, null);
+
+  h2.setNow(T0 + 121_000); // window elapsed
+  await h2.wd.reconcile();
+  assert.equal(h2.store.get(row.id)!.result_notice, "plugin");
+  assert.equal(h2.sends.filter((x) => x.threadId === "thr_coord").length, 1);
+});
+
+test("§16.5: a revived thread's stale BB notice does not cover the new turn", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "итог захода 1");
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_coord", [childNotice(11, T0, "thr_e1")]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await settleResults(h);
+  assert.equal(h.store.get(row.id)!.result_notice, "bb");
+
+  // The thread comes back — a second turn starts (its own delivery).
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/started", T0 + 60_000),
+  ]);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  assert.equal(h.store.get(row.id)!.status, "running");
+
+  // Turn 2 finishes. BB's earlier notice (T0) predates turn 2's start
+  // (T0+60_000) — the plugin delivers the new outcome itself.
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/started", T0 + 60_000),
+    ev(3, "turn/completed", T0 + 90_000, { status: "completed" }),
+  ]);
+  h.outputs.set("thr_e1", "итог захода 2");
+  h.queues.set("thr_e1", []);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await settleResults(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_notice, "plugin");
+  const msgs = h.sends.filter((x) => x.threadId === "thr_coord");
+  assert.equal(msgs.length, 1);
+  assert.match(JSON.stringify(msgs[0]!.input), /итог захода 2/);
 });
 
 test("§16.5: the grace window gates delivery — reconcile before 120 s sends nothing", async () => {
