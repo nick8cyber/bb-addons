@@ -2333,12 +2333,17 @@ test("PLUG-216 п.2: a turn ended on provider/error without turn/completed is no
   );
   assert.equal(res.status, "auditing");
 
-  // a queued request on a stopped thread still counts as active
+  // a FRESH queued request on a stopped thread still counts as active
   const queuedCase = makeDeps(repo, {
     execStatus: "idle",
     execEvents: () => [
-      { seq: 7, type: "client/turn/requested", createdAt: 3, data: {} },
-      { seq: 6, type: "turn/started", createdAt: 2, data: {} },
+      {
+        seq: 7,
+        type: "client/turn/requested",
+        createdAt: Date.now(),
+        data: {},
+      },
+      { seq: 6, type: "turn/started", createdAt: Date.now() - 60_000, data: {} },
     ],
   });
   await assert.rejects(
@@ -2371,4 +2376,199 @@ test("PLUG-216 п.2: a turn ended on provider/error without turn/completed is no
     runRelease({ taskKey: "PLUG-1", caller: COORD }, legacyCase.deps),
     (e: unknown) => (e as OrchestratorError).code === "release-refused",
   );
+});
+
+test("PLUG-217 Б1: a commit slipped in after the last tip check is not the audited head", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  let fetches = 0;
+  let tipReads = 0;
+  let xSha = "";
+  let verifiedSha = "";
+  const realRun = deps.cmd.run;
+  deps.cmd = {
+    run: async (file, args, o) => {
+      const res = await realRun(file, args, o);
+      if (file === "git" && args.includes("fetch")) fetches++;
+      // the 4th `rev-parse HEAD` after the sync's own fetch reads the
+      // pre-trailer tip — the LAST verification the pipeline makes. A
+      // commit landing right after it used to be picked up by a fresh
+      // rev-parse and go to the auditor unreviewed.
+      if (
+        !xSha &&
+        fetches === 2 &&
+        file === "git" &&
+        args.at(-2) === "rev-parse" &&
+        args.at(-1) === "HEAD" &&
+        ++tipReads === 4
+      ) {
+        verifiedSha = res.stdout.trim();
+        writeFileSync(join(repo, "x-after-gate.txt"), "x\n");
+        gitR(repo, ["add", "."]);
+        gitR(repo, ["commit", "-m", "feat: after-gate"]);
+        xSha = gitR(repo, ["rev-parse", "HEAD"]);
+      }
+      return res;
+    },
+  };
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.ok(xSha, "the injection never ran");
+  assert.equal(res.status, "auditing");
+  const row = store.releasesByStatuses(["auditing"])[0]!;
+  // the audit is bound to the verified tip — X is neither recorded nor
+  // pushed by the publish step (it pushes head_sha explicitly)
+  assert.equal(row.head_sha, verifiedSha);
+  assert.notEqual(row.head_sha, xSha);
+});
+
+test("PLUG-217 Б1: a commit slipped in before the docs trailer is refused", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  const realRun = deps.cmd.run;
+  let xSha = "";
+  deps.cmd = {
+    run: async (file, args, o) => {
+      const res = await realRun(file, args, o);
+      // `log -1 --format=%B` is the first call of applyDocsTrailer —
+      // right after the pre-trailer tip read. A commit landing here
+      // puts real diff between the checked tip and the trailer commit.
+      if (
+        !xSha &&
+        file === "git" &&
+        args.includes("log") &&
+        args.includes("--format=%B")
+      ) {
+        writeFileSync(join(repo, "x-mid-trailer.txt"), "x\n");
+        gitR(repo, ["add", "."]);
+        gitR(repo, ["commit", "-m", "feat: mid-trailer"]);
+        xSha = gitR(repo, ["rev-parse", "HEAD"]);
+      }
+      return res;
+    },
+  };
+  await assert.rejects(
+    runRelease(
+      { taskKey: "PLUG-1", caller: COORD, noDocs: "no docs needed" },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unreviewed-commits" &&
+      /во время записи трейлера/.test((e as OrchestratorError).message),
+  );
+});
+
+test("PLUG-217: a stale queued request on a stopped executor does not block release", async () => {
+  const { repo } = makeRepo();
+  // confirmed-idle thread; the newest journal event is a queued request
+  // OLDER than the fresh window — a request that never reached
+  // turn/started, not a live turn
+  const stale = makeDeps(repo, {
+    execStatus: "idle",
+    execEvents: () => [
+      {
+        seq: 9,
+        type: "client/turn/requested",
+        createdAt: Date.now() - 10 * 60 * 1000,
+        data: {},
+      },
+    ],
+  });
+  const res = await runRelease(
+    { taskKey: "PLUG-1", caller: COORD },
+    stale.deps,
+  );
+  assert.equal(res.status, "auditing");
+
+  // a request that pre-dates the last completed turn is not a live turn
+  // either even when it is still fresh
+  const beforeDone = makeDeps(repo, {
+    execStatus: "idle",
+    execEvents: () => [
+      {
+        seq: 9,
+        type: "client/turn/requested",
+        createdAt: Date.now() - 30_000,
+        data: {},
+      },
+      {
+        seq: 8,
+        type: "turn/completed",
+        createdAt: Date.now() - 10_000,
+        data: {},
+      },
+    ],
+  });
+  const res2 = await runRelease(
+    { taskKey: "PLUG-1", caller: COORD },
+    beforeDone.deps,
+  );
+  assert.equal(res2.status, "auditing");
+
+  // a FRESH request newer than the last completion is a real queued turn
+  const fresh = makeDeps(repo, {
+    execStatus: "idle",
+    execEvents: () => [
+      {
+        seq: 9,
+        type: "client/turn/requested",
+        createdAt: Date.now(),
+        data: {},
+      },
+      {
+        seq: 8,
+        type: "turn/completed",
+        createdAt: Date.now() - 60_000,
+        data: {},
+      },
+    ],
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, fresh.deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /идёт ход/.test((e as OrchestratorError).message),
+  );
+});
+
+test("PLUG-217: rebase — a foreign empty commit is not excused by the pre-range's empty slots", async () => {
+  const { repo, seed } = makeRepo();
+  // an empty-diff commit inside the range the rebase will rewrite — it
+  // has no patch-id, and the rebase drops it, freeing a «slot» that the
+  // old count matching would excuse ANY foreign empty commit with
+  gitR(repo, ["commit", "--allow-empty", "-m", "chore: empty slot"]);
+  const { deps, store } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_main: { sync: "rebase" } },
+    }),
+  });
+  // advance main so the rebase actually rewrites the range
+  writeFileSync(join(seed, "adv.txt"), "adv\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: advance"]);
+  gitR(seed, ["push", "origin", "main"]);
+  const realRun = deps.cmd.run;
+  let xSha = "";
+  deps.cmd = {
+    run: async (file, args, o) => {
+      const res = await realRun(file, args, o);
+      if (!xSha && file === "git" && args.includes("rebase")) {
+        // a foreign EMPTY commit — no patch-id, different message: only
+        // identity matching can call it foreign
+        gitR(repo, ["commit", "--allow-empty", "-m", "feat: foreign empty"]);
+        xSha = gitR(repo, ["rev-parse", "HEAD"]);
+      }
+      return res;
+    },
+  };
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unreviewed-commits" &&
+      (e as OrchestratorError).message.includes(xSha.slice(0, 7)),
+  );
+  const failed = store.releasesByStatuses(["failed"])[0]!;
+  const rec = JSON.parse(failed.pipeline_shas ?? "[]") as string[];
+  assert.ok(!rec.includes(xSha));
 });

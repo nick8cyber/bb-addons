@@ -58,6 +58,11 @@ import type { WatchdogThreadEvent } from "./watchdog.js";
 
 const AUDIT_LEVEL = "release-audit";
 const TOKEN_TTL_MS = 5 * 60 * 1000;
+// §17.3 (ревью PLUG-217): a queued client/turn/requested on a
+// confirmed-stopped executor thread counts as a live turn only
+// while it is this fresh — a request that never reached
+// turn/started would otherwise refuse every release forever.
+const STALE_TURN_REQUEST_MS = 2 * 60 * 1000;
 const CHECK_TIMEOUT_MS = 10 * 60 * 1000;
 /** §17.3: how long a release row may sit in `auditing` without its
  * audit delegation before the pump calls it dead (sync + checks +
@@ -204,6 +209,25 @@ async function patchId(
   );
   if (id.exitCode !== 0) return null;
   return id.stdout.trim().split(/\s+/)[0] || null;
+}
+
+/**
+ * §17.3 (ревью PLUG-217): identity of a patch-id-less commit —
+ * author + message. A rebase keeps or drops empty-diff commits, so a
+ * post-rebase commit without a patch-id must match one of the
+ * pre-rebase ones by identity, not just by head count.
+ */
+async function emptyCommitKey(
+  deps: ReleaseDeps,
+  repo: string,
+  sha: string,
+): Promise<string> {
+  return git(deps, repo, [
+    "log",
+    "-1",
+    "--format=%an%x00%ae%x00%B",
+    sha,
+  ]);
 }
 
 // ── Step 1: приёмка ────────────────────────────────────────────────────
@@ -475,11 +499,14 @@ async function syncBranch(
         .split("\n")
         .filter(Boolean);
       const preIds = new Set<string>();
-      let preNoId = 0;
+      const preNoId = new Map<string, number>();
       for (const sha of preShas) {
         const id = await patchId(deps, repo, sha);
         if (id) preIds.add(id);
-        else preNoId++;
+        else {
+          const key = await emptyCommitKey(deps, repo, sha);
+          preNoId.set(key, (preNoId.get(key) ?? 0) + 1);
+        }
       }
       const res = await deps.cmd.run(
         "git",
@@ -504,10 +531,17 @@ async function syncBranch(
       for (const sha of postShas) {
         const id = await patchId(deps, repo, sha);
         if (id && preIds.has(id)) continue;
-        // an empty-diff commit carries no patch-id — allow as many as
-        // the pre-rebase range had (a rebase drops or keeps them, but
-        // never creates new content this way).
-        if (!id && preNoId-- > 0) continue;
+        // an empty-diff commit carries no patch-id — allow it only if
+        // the pre-rebase range had the same author+message commit (a
+        // rebase drops or keeps them, but never creates new ones).
+        if (!id) {
+          const key = await emptyCommitKey(deps, repo, sha);
+          const left = preNoId.get(key) ?? 0;
+          if (left > 0) {
+            preNoId.set(key, left - 1);
+            continue;
+          }
+        }
         foreign.push(sha);
       }
       if (foreign.length) {
@@ -1314,7 +1348,20 @@ async function executorTurnActive(
     const newest = events[0];
     // a confirmed-stopped thread: only a queued request can still start
     // a turn — a stale `turn/started` means the turn died unreported.
-    if (stopped) return newest?.type === "client/turn/requested";
+    // §17.3 (ревью PLUG-217): and only a FRESH one, newer than the last
+    // completed turn — a request that never reached `turn/started`
+    // (provider dead, client gone) would otherwise refuse every release
+    // until the executor wakes, which the gate exists to avoid.
+    if (stopped) {
+      if (newest?.type !== "client/turn/requested") return false;
+      const completedAt =
+        events.find((e) => e.type === "turn/completed")?.createdAt ?? 0;
+      return (
+        newest.createdAt > completedAt &&
+        (deps.now?.() ?? Date.now()) - newest.createdAt <=
+          STALE_TURN_REQUEST_MS
+      );
+    }
     return (
       newest?.type === "turn/started" ||
       newest?.type === "client/turn/requested"
@@ -1730,13 +1777,14 @@ async function runReleaseSteps(
         "повторите release, когда исполнитель остановлен",
       );
     }
+    let trailerTip: string | null = null;
     if (input.noDocs) {
       await applyDocsTrailer(deps, repo, input.noDocs);
       // Only the pipeline's own trailer commit lands in pipeline_shas:
       // an amend and an empty trailer commit both carry the SAME tree
       // as preTrailerSha — a tip with a real diff, or more than one new
       // commit, is foreign work.
-      const trailerTip = await git(deps, repo, ["rev-parse", "HEAD"]);
+      trailerTip = await git(deps, repo, ["rev-parse", "HEAD"]);
       if (trailerTip !== preTrailerSha) {
         const sameTree =
           (await git(deps, repo, ["diff", preTrailerSha, trailerTip])) ===
@@ -1760,7 +1808,13 @@ async function runReleaseSteps(
         deps.store.addReleasePipelineShas(release.id, [trailerTip]);
       }
     }
-    const headSha = await git(deps, repo, ["rev-parse", "HEAD"]);
+    // §17.3 (ревью PLUG-217 Б1): the audited/published tip is the one
+    // already verified — a fresh rev-parse here would let a commit
+    // slipped into the gap go to the auditor unreviewed.
+    const headSha =
+      trailerTip !== null && trailerTip !== preTrailerSha
+        ? trailerTip
+        : preTrailerSha;
     deps.store.updateRelease(release.id, { headSha, remoteBaseSha });
 
     // Step 4 — машинный скан категорий 1–4.
