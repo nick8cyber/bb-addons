@@ -210,8 +210,23 @@ function foreignTrailers(
 
 // ── Category 3: machine binding ────────────────────────────────────────
 
-const MACHINE_RULES: { rule: string; re: RegExp }[] = [
-  { rule: "home-path", re: /\/(?:home|Users)\/[A-Za-z0-9._-]+\// },
+interface MachineRule {
+  rule: string;
+  re: RegExp;
+  /** §4 (r8): an occurrence matching this pattern is a test fixture,
+   * not a leak — checked per occurrence, so a fixture prefix next to a
+   * real path in one line is still a finding. Written as a regex so the
+   * literal prefix never appears in the scanner's own source (the
+   * installed scanner would flag it). */
+  exempt?: RegExp;
+}
+
+const MACHINE_RULES: MachineRule[] = [
+  {
+    rule: "home-path",
+    re: /\/(?:home|Users)\/[A-Za-z0-9._-]+\//,
+    exempt: /\/(?:home|Users)\/example\//,
+  },
   { rule: "opt-path", re: /\/opt\/[A-Za-z0-9._-]/ },
   {
     rule: "private-ip",
@@ -279,8 +294,18 @@ export function hasBbIds(text: string): boolean {
   return false;
 }
 
-const hits = (text: string, rules: { rule: string; re: RegExp }[]) =>
-  rules.filter(({ re }) => re.test(text)).map(({ rule }) => rule);
+const hits = (text: string, rules: MachineRule[]) =>
+  rules
+    .filter(({ re, exempt }) => {
+      if (!exempt) return re.test(text);
+      // §4 (r8): the rule fires only when at least one occurrence is
+      // not an exempt fixture prefix.
+      for (const m of text.matchAll(new RegExp(re.source, "g"))) {
+        if (!exempt.test(m[0])) return true;
+      }
+      return false;
+    })
+    .map(({ rule }) => rule);
 
 const hostRe = (hostname: string) =>
   new RegExp(`\\b${hostname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
@@ -293,7 +318,7 @@ function scanAddedLines(
   allowedEmails: readonly string[] = [],
 ): ScanFinding[] {
   const findings: ScanFinding[] = [];
-  const hostRule =
+  const hostRule: MachineRule | undefined =
     hostname && hostname.length > 2
       ? { rule: "hostname", re: hostRe(hostname) }
       : undefined;

@@ -180,6 +180,10 @@ export const MIGRATIONS: readonly string[] = [
   // `run --json`). Восстановление ветки: `git branch <ветка> <sha>`,
   // пока gc не убрал объекты (ADR-0024 «Восстановимость»).
   `ALTER TABLE janitor_items ADD COLUMN tip_sha TEXT`,
+  // orchestrator-release §6 (r8, PLUG-231): проект настройки выкладки,
+  // определённый один раз на шаге 1 — шаги 6–7 и повторные заходы той же
+  // выкладки берут его из записи и заново не ищут.
+  `ALTER TABLE releases ADD COLUMN settings_project_id TEXT`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -277,6 +281,8 @@ export interface ReleaseRow {
   publish_branch: string | null;
   /** §17.3: JSON-массив SHA, созданных конвейером на этой выкладке. */
   pipeline_shas: string | null;
+  /** §6 (r8): проект настройки, записанный на шаге 1. */
+  settings_project_id: string | null;
   error: string | null;
   created_at: number;
   updated_at: number;
@@ -1251,6 +1257,8 @@ export class DelegationStore {
     noDocsReason?: string | null;
     kbNote?: string | null;
     noKbReason?: string | null;
+    /** §6 (r8): resolved on step 1; absent only on pre-r8 rows. */
+    settingsProjectId?: string | null;
   }): ReleaseRow {
     const now = Date.now();
     const info = this.db
@@ -1258,8 +1266,8 @@ export class DelegationStore {
         `INSERT INTO releases (
           task_key, project_id, coordinator_thread_id, repo_path, branch,
           target_action, target_branch, status, no_docs_reason, kb_note,
-          no_kb_reason, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'auditing', ?, ?, ?, ?, ?)`,
+          no_kb_reason, settings_project_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'auditing', ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         normalizeTaskKey(input.taskKey),
@@ -1272,6 +1280,7 @@ export class DelegationStore {
         input.noDocsReason ?? null,
         input.kbNote ?? null,
         input.noKbReason ?? null,
+        input.settingsProjectId ?? null,
         now,
         now,
       );

@@ -5,6 +5,7 @@ import {
   ROUTING_RULE_MAX,
 } from "../src/instructions.js";
 import type { Policy } from "../src/policy.js";
+import { LEAK_HOME_PATH } from "./fixtures/leak-samples.js";
 
 const POLICY: Policy = {
   version: 1,
@@ -43,7 +44,7 @@ test("the rule contains no thread ids or filesystem paths", () => {
     ...POLICY,
     levels: {
       simple: {
-        description: "see thr_aaaaaaaaaa and /home/user/secret/file",
+        description: `see thr_aaaaaaaaaa and ${LEAK_HOME_PATH}/file`,
         chain: ["simple"],
       },
     },

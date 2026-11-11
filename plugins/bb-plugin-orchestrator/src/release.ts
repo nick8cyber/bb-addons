@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
@@ -41,6 +41,7 @@ import {
 } from "./scan.js";
 import {
   resolveProject,
+  type ReleaseConfig,
   type ReleaseConfigLoad,
   type ResolvedProject,
 } from "./release-config.js";
@@ -166,6 +167,9 @@ export interface ReleaseDeps {
   /** §17.3 (С1): the delegate queue — release itself runs outside it;
    * only the audit dispatch is serialized against other dispatches. */
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
+  /** §6 (r8): this machine's bb hostId — a project source counts only
+   * when its path's hostId is this host. */
+  localHostId?: () => string | Promise<string>;
   hostname?: string;
   now?: () => number;
   log?: {
@@ -274,71 +278,189 @@ async function emptyCommitKey(
   ]);
 }
 
-// ── Step 0 (r7): проект настройки по репозиторию ──────────────────────
+// ── Step 0 (r8): проект настройки по репозиторию, падает закрыто ──────
 
 interface BbProjectListItem {
   id?: string;
-  sources?: { type?: string; path?: string | null; isDefault?: boolean }[];
+  gitRemoteUrl?: string | null;
+  sources?: {
+    type?: string;
+    path?: string | null;
+    isDefault?: boolean;
+    hostId?: string | null;
+  }[];
+}
+
+/** §6 (r8) п.1: the main checkout dir is the `worktree` line of the
+ * FIRST record of `git worktree list --porcelain`; a record with the
+ * `bare` marker is not a match (null). */
+function mainWorktreeDir(porcelain: string): string | null {
+  const first = porcelain.split(/\r?\n\r?\n/)[0] ?? "";
+  if (first.split("\n").some((l) => l.trim() === "bare")) return null;
+  const wt = first.split("\n").find((l) => l.startsWith("worktree "));
+  return wt ? wt.slice("worktree ".length).trim() || null : null;
+}
+
+/** §6 (r8) п.3: a remote url reduced to `host/path` — the scheme and
+ * `git@host:` forms both lose their transport, userinfo and port are
+ * dropped, the host is lowercased, `.git` and trailing slashes go away.
+ * A local path (no host) normalizes to null. */
+export function normalizeGitRemoteUrl(raw: string): string | null {
+  const s = raw.trim();
+  if (!s) return null;
+  let host = "";
+  let path = "";
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) {
+    try {
+      const u = new URL(s);
+      host = u.hostname;
+      path = u.pathname;
+    } catch {
+      return null;
+    }
+  } else {
+    const m = /^(?:[^@\s]+@)?([^:\s]+):(.+)$/.exec(s);
+    if (!m) return null;
+    host = m[1]!;
+    path = m[2]!;
+  }
+  host = host.toLowerCase();
+  path = path.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/i, "");
+  return host && path ? `${host}/${path}` : null;
 }
 
 /**
- * §6 (r7): which project's settings a release runs under — the bb
- * project of the REPOSITORY, not the delegation's. The main checkout
- * dir of the executor's copy (`git rev-parse --git-common-dir` → its
- * parent, matched by realpath against project sources) decides; no
- * match — or any git/CLI failure — falls back to the delegation's
- * project. Delegations to a nested repo are often dispatched from a
- * parent project whose root sits above it, and the parent's settings
- * must not govern the repo's release (ADR-0018, дополнение r7).
+ * §6 (r8): which project's settings a release runs under — the bb
+ * project of the REPOSITORY, resolved once on step 1 and recorded in
+ * the release row. The main checkout dir of the executor's copy (first
+ * `git worktree list` record, compared by realpath) decides; with no
+ * path match the copy's `origin` is compared against project
+ * `gitRemoteUrl`s — such a candidate counts only with an explicit
+ * `projects` entry and a path that exists on this machine. One
+ * candidate wins; several resolve to the delegation's project when it
+ * is among them, else `release-settings-ambiguous`; none —
+ * `release-settings-unknown`. Any git/`bb project list`/realpath
+ * failure refuses the same way — the gate fails CLOSED, never silently
+ * substituting the delegation project (ADR-0018, дополнение r8). The
+ * remote url never reaches messages (it may carry a token).
  */
 export async function settingsProjectId(
-  deps: Pick<ReleaseDeps, "cmd" | "bbCli">,
+  deps: Pick<ReleaseDeps, "cmd" | "bbCli" | "localHostId">,
   repo: string,
-  fallback: string,
+  delegationProjectId: string,
+  config: ReleaseConfig | null,
 ): Promise<string> {
+  const unknown = (why: string) =>
+    new OrchestratorError(
+      "release-settings-unknown",
+      `проект настройки не определён (${why}); ` +
+        `проект делегирования ${delegationProjectId}`,
+      "привяжите bb-проект к репозиторию копии (§6) и повторите",
+    );
+
+  const wt = await deps.cmd.run(
+    "git",
+    ["-C", repo, "worktree", "list", "--porcelain"],
+    { timeoutMs: 30_000 },
+  );
+  if (wt.exitCode !== 0) {
+    throw unknown(`git worktree list завершился с кодом ${wt.exitCode}`);
+  }
+  // §6 п.1: a bare first record is no match — the main dir is unset.
+  const mainDir = mainWorktreeDir(wt.stdout);
+
+  const listRes = await deps.bbCli.run(["project", "list", "--json"], {
+    timeoutMs: 15_000,
+  });
+  if (listRes.exitCode !== 0) {
+    throw unknown(`bb project list завершился с кодом ${listRes.exitCode}`);
+  }
+  let projects: BbProjectListItem[];
   try {
-    const res = await deps.cmd.run(
+    const parsed: unknown = JSON.parse(listRes.stdout);
+    if (!Array.isArray(parsed)) throw new Error("not an array");
+    projects = parsed as BbProjectListItem[];
+  } catch {
+    throw unknown("bb project list вернул JSON неожиданной формы");
+  }
+
+  const localHost = deps.localHostId
+    ? String((await deps.localHostId()) ?? "")
+    : "";
+  // §6 п.2: the project's MAIN path on THIS host — the default
+  // local_path source whose hostId is this host (an unset hostId is a
+  // pre-hostfield record). Secondary sources never count.
+  const mainPathOf = (p: BbProjectListItem): string | null => {
+    for (const s of p.sources ?? []) {
+      if (s.type !== "local_path" || !s.path || s.isDefault !== true) continue;
+      if (s.hostId && s.hostId !== localHost) continue;
+      return s.path;
+    }
+    return null;
+  };
+
+  const candidates = new Set<string>();
+  if (mainDir) {
+    let root: string;
+    try {
+      root = await realpath(mainDir);
+    } catch {
+      throw unknown("realpath основного каталога копии не удался");
+    }
+    for (const p of projects) {
+      if (!p.id) continue;
+      const mainPath = mainPathOf(p);
+      if (!mainPath) continue;
+      try {
+        if ((await realpath(mainPath)) === root) candidates.add(p.id);
+      } catch {
+        // §6 п.2: a path missing on this machine is no candidate
+        // and no error.
+      }
+    }
+  }
+
+  // §6 п.3: only with NO path candidates — the copy's `origin` against
+  // normalized project gitRemoteUrls.
+  if (!candidates.size) {
+    const remote = await deps.cmd.run(
       "git",
-      [
-        "-C",
-        repo,
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-      ],
+      ["-C", repo, "remote", "get-url", "origin"],
       { timeoutMs: 30_000 },
     );
-    if (res.exitCode !== 0) return fallback;
-    const root = await realpath(dirname(res.stdout.trim()));
-    const projects = await runJson<BbProjectListItem[]>(
-      deps.bbCli,
-      ["project", "list", "--json"],
-      { timeoutMs: 15_000 },
-    );
-    const matches = async (p: BbProjectListItem, wantDefault: boolean) => {
-      for (const s of p.sources ?? []) {
-        if (s.type !== "local_path" || !s.path) continue;
-        if (wantDefault && !s.isDefault) continue;
-        try {
-          if ((await realpath(s.path)) === root) return true;
-        } catch {
-          // a missing source path cannot match
-        }
+    if (remote.exitCode !== 0) {
+      throw unknown(`git remote get-url завершился с кодом ${remote.exitCode}`);
+    }
+    const want = normalizeGitRemoteUrl(remote.stdout);
+    if (want) {
+      for (const p of projects) {
+        // an explicit `projects` entry is required (§6 п.3)
+        if (!p.id || !config?.projects?.[p.id]) continue;
+        const their = p.gitRemoteUrl
+          ? normalizeGitRemoteUrl(p.gitRemoteUrl)
+          : null;
+        if (!their || their !== want) continue;
+        const mainPath = mainPathOf(p);
+        if (!mainPath || !existsSync(mainPath)) continue;
+        candidates.add(p.id);
       }
-      return false;
-    };
-    // The project path is its default source; a non-default source
-    // match counts only when no project's default matched.
-    for (const p of projects) {
-      if (p.id && (await matches(p, true))) return p.id;
     }
-    for (const p of projects) {
-      if (p.id && (await matches(p, false))) return p.id;
-    }
-  } catch {
-    // git or `bb project list` failed — the delegation project decides.
   }
-  return fallback;
+
+  // §6 п.4: one candidate → it; several → the delegation's project if
+  // among them, else ambiguous; none → unknown.
+  if (candidates.size === 1) return [...candidates][0]!;
+  if (candidates.size > 1) {
+    if (candidates.has(delegationProjectId)) return delegationProjectId;
+    throw new OrchestratorError(
+      "release-settings-ambiguous",
+      `репозиторий копии совпадает с несколькими bb-проектами ` +
+        `(${[...candidates].sort().join(", ")}), проект делегирования ` +
+        `${delegationProjectId} не среди них`,
+      "оставьте один bb-проект на этот репозиторий (§6) и повторите",
+    );
+  }
+  throw unknown("ни один bb-проект не совпал с репозиторием копии");
 }
 
 // ── Step 1: приёмка ────────────────────────────────────────────────────
@@ -1261,6 +1383,7 @@ export async function runRelease(
     deps,
     repo,
     delegationProjectId,
+    cfg.config,
   );
   const project = resolveProject(cfg.config!, settingsProject);
   if (project.excluded) {
@@ -1823,6 +1946,7 @@ async function runReleaseSteps(
       noDocsReason: input.noDocs ?? null,
       kbNote: input.kb ?? null,
       noKbReason: input.noKb ?? null,
+      settingsProjectId: ctx.settingsProjectId,
     });
   } catch (e) {
     if (/UNIQUE constraint/.test(message(e))) {
@@ -2363,7 +2487,16 @@ async function projectThreadIds(
 ): Promise<boolean> {
   const cfg = deps.loadReleaseConfig();
   if (!cfg.config) return true;
-  const id = await settingsProjectId(deps, row.repo_path, row.project_id);
+  // §6 (r8) п.6: the recorded settings project wins; pre-r8 rows
+  // resolve anew (a resolver error refuses the publish).
+  const id =
+    row.settings_project_id ??
+    (await settingsProjectId(
+      deps,
+      row.repo_path,
+      row.project_id,
+      cfg.config,
+    ));
   return resolveProject(cfg.config, id).threadIds;
 }
 
@@ -2667,7 +2800,16 @@ async function postCheck(
   const scanBase = row.remote_base_sha && row.remote_base_sha !== ZERO_SHA
     ? row.remote_base_sha
     : null;
-  if (scanBase && scanBase !== pushedSha) {
+  // §2 шаг 7 (r8): a skipped rescan is a line to the coordinator, not
+  // silence — the first release onto a new branch has no remote base.
+  if (!scanBase) {
+    messages.push(
+      "скан пропущен, нет базы удалённого диапазона " +
+        "(первая выкладка в новую ветку)",
+    );
+  } else if (scanBase === pushedSha) {
+    messages.push("скан пропущен, удалённый диапазон пуст");
+  } else {
     try {
       const commits = await commitRange(
         deps,
@@ -2710,7 +2852,15 @@ async function postCheck(
       > = cfg
         ? resolveProject(
             cfg,
-            await settingsProjectId(deps, row.repo_path, row.project_id),
+            // §6 (r8) п.6: the recorded settings project wins; pre-r8
+            // rows resolve anew (an error here is reported below).
+            row.settings_project_id ??
+              (await settingsProjectId(
+                deps,
+                row.repo_path,
+                row.project_id,
+                cfg,
+              )),
           )
         : {
             leaks: { machine: "block", bbIds: "block", allow: [] },

@@ -611,10 +611,24 @@ export async function createPlugin(
       mergeBaseBranch?: string | null;
       baseBranch?: string | { name?: string } | null;
     }>(bbCli, ["environment", "show", envId, "--json"]);
+  /** This machine's bb hostId (release §6 r8; janitor host scoping). */
+  const localHostId = async () => {
+    try {
+      const sys = await (
+        bb.sdk as unknown as {
+          system?: { config?: () => Promise<{ primaryHostId?: string }> };
+        }
+      ).system?.config?.();
+      return sys?.primaryHostId ?? "";
+    } catch {
+      return "";
+    }
+  };
   const releaseDeps = {
     store,
     bbCli,
     cmd,
+    localHostId,
     threads: {
       get: releaseThreadsGet(
         (a: { threadId: string }) => bb.sdk.threads.get(a),
@@ -726,19 +740,25 @@ export async function createPlugin(
         janitorConfig().config?.protectedBranches ?? undefined,
       mergeAutofix: () => currentSettings.mergeAutofix === true,
       // §16.6 `threadIds`: off → merge commits drop the task key.
-      // §6 (r7): the settings project is the repository's bb project —
-      // the delegation's project id is only the fallback.
-      releaseThreadIds: async (repoPath, projectId) =>
-        releaseConfig.config
-          ? resolveProject(
+      // §6 (r8) п.7: the settings project is the repository's bb
+      // project; a resolver error or ambiguity counts `threadIds:
+      // false` — stricter, never the delegation's project.
+      releaseThreadIds: async (repoPath, projectId) => {
+        if (!releaseConfig.config) return true;
+        try {
+          return resolveProject(
+            releaseConfig.config,
+            await settingsProjectId(
+              { cmd, bbCli, localHostId },
+              repoPath,
+              projectId ?? "",
               releaseConfig.config,
-              await settingsProjectId(
-                { cmd, bbCli },
-                repoPath,
-                projectId ?? "",
-              ),
-            ).threadIds
-          : true,
+            ),
+          ).threadIds;
+        } catch {
+          return false;
+        }
+      },
       log: bb.log,
     });
 
@@ -884,18 +904,7 @@ export async function createPlugin(
       list: (a) => bb.sdk.threads.list(a) as Promise<unknown>,
     },
     loadConfig: janitorConfig,
-    localHostId: async () => {
-      try {
-        const sys = await (
-          bb.sdk as unknown as {
-            system?: { config?: () => Promise<{ primaryHostId?: string }> };
-          }
-        ).system?.config?.();
-        return sys?.primaryHostId ?? "";
-      } catch {
-        return "";
-      }
-    },
+    localHostId,
     log: bb.log,
   });
   let janitorBusy = false;

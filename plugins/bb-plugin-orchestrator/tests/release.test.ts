@@ -32,6 +32,13 @@ import {
   type ReleaseDeps,
   type ReleaseThreads,
 } from "../src/release.js";
+import {
+  LEAK_HOME_PATH,
+  LEAK_USERS_PATH,
+  MIXED_PATH_LINE,
+  SAFE_HOME_PATH,
+  SAFE_USERS_PATH,
+} from "./fixtures/leak-samples.js";
 import { parsePolicy } from "../src/policy.js";
 import { OrchestratorError } from "../src/errors.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
@@ -172,7 +179,7 @@ const SCAN_BASE = {
     },
   ],
   added: [
-    { file: "f.ts", line: 1, text: 'const d = "/home/u/secrets/"' },
+    { file: "f.ts", line: 1, text: `const d = "${LEAK_HOME_PATH}"` },
     { file: "f.ts", line: 2, text: "see thr_abc1234567" },
     { file: "allow/x.md", line: 1, text: "thr_abc1234567" },
     { file: ".env", line: 1, text: "X=1" },
@@ -344,8 +351,17 @@ function makeDeps(repo: string, overrides: Partial<{
   /** §6 (r7): the executor copy's branch (worktree copies cannot share
    * the main checkout's branch). */
   execBranch: string;
-  /** §6 (r7): what `bb project list --json` returns. */
-  projects: unknown[];
+  /** §6 (r7/r8): what `bb project list --json` returns — absent, the
+   * harness advertises the project that owns this repo (the r8
+   * resolver needs SOME match — there is no delegation fallback). */
+  projects?: unknown[];
+  /** §6 (r8): `bb project list` exits non-zero — the resolver fails. */
+  projectListFail?: boolean;
+  /** §6 (r8): the local bb hostId — project sources on another hostId
+   * never count as candidates. */
+  localHostId?: string;
+  /** §6 (r8): the delegation rows' `project_id` (default proj_main). */
+  delegationProjectId?: string;
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -358,7 +374,8 @@ function makeDeps(repo: string, overrides: Partial<{
     RESULT_SHA = gitR(repo, ["rev-parse", "HEAD"]);
   } catch { /* fake path — the fake sha stands */ }
   const exec = store.insert({
-    taskKey: "PLUG-1", projectId: "proj_main",
+    taskKey: "PLUG-1",
+    projectId: overrides.delegationProjectId ?? "proj_main",
     coordinatorThreadId: "thr_coord", level: "complex",
     route: "c", preset: "c", provider: "p",
   });
@@ -412,7 +429,18 @@ function makeDeps(repo: string, overrides: Partial<{
       if (key.startsWith("thread options"))
         return ok(JSON.stringify({ options: [] }));
       if (key.startsWith("project list"))
-        return ok(JSON.stringify(overrides.projects ?? []));
+        return overrides.projectListFail
+          ? { exitCode: 1, stdout: "", stderr: "project list boom" }
+          : ok(JSON.stringify(
+              overrides.projects ?? [{
+                id: "proj_main",
+                sources: [{
+                  type: "local_path",
+                  path: overrides.coordPath ?? repo,
+                  isDefault: true,
+                }],
+              }],
+            ));
       return ok();
     },
   };
@@ -495,6 +523,7 @@ function makeDeps(repo: string, overrides: Partial<{
     },
     hooksDir: () => tmp,
     packetDir: () => mkdtempSync(join(tmpdir(), "pkt-")),
+    localHostId: async () => overrides.localHostId ?? "host_test",
     enqueue: <T>(f: () => Promise<T>) => f(),
     log: {},
   } satisfies ReleaseDeps;
@@ -615,7 +644,7 @@ test("release r7: настройка — по проекту репозитор�
     execPath: wt,
     execBranch: "exec-copy",
     projects: [
-      { id: "proj_parent", sources: [{ type: "local_path", path: tmpdir(), isDefault: true }] },
+      { id: "proj_par", sources: [{ type: "local_path", path: tmpdir(), isDefault: true }] },
       { id: "proj_repo", sources: [{ type: "local_path", path: repo, isDefault: true }] },
     ],
     releaseText: JSON.stringify({
@@ -656,9 +685,9 @@ test("release r7: excluded у проекта репозитория → отка
   );
 });
 
-test("release r7: нет bb-проекта на пути репозитория → проект делегирования", async () => {
+test("release r8: ни один проект не совпал → отказ, не проект делегирования", async () => {
   const { repo } = makeRepo();
-  const { deps, store } = makeDeps(repo, {
+  const { deps } = makeDeps(repo, {
     projects: [],
     releaseText: JSON.stringify({
       commitIdentity: "Agent <agent@x.io>",
@@ -666,20 +695,24 @@ test("release r7: нет bb-проекта на пути репозитория 
       projects: { proj_main: { target: { action: "push", branch: "dev" } } },
     }),
   });
-  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
-  assert.equal(res.settingsProjectId, "proj_main");
-  // The delegation project's own settings were used — target dev.
-  assert.equal(store.getRelease(res.releaseId)!.target_branch, "dev");
+  // §6 (r8): no path candidate and no origin match — the gate fails
+  // closed, never substituting the delegation project.
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-unknown",
+  );
 });
 
-test("settingsProjectId: ошибка git → проект делегирования, без падения", async () => {
+test("settingsProjectId r8: ошибка git → отказ, не проект делегирования", async () => {
   const cmd: CmdRunner = {
     run: async () => ({ exitCode: 1, stdout: "", stderr: "fatal" }),
   };
   const bbCli: BbCli = { run: async () => ok("[]") };
-  assert.equal(
-    await settingsProjectId({ cmd, bbCli }, "/no/such/dir", "proj_main"),
-    "proj_main",
+  await assert.rejects(
+    settingsProjectId({ cmd, bbCli }, "/no/such/dir", "proj_main", null),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-unknown",
   );
 });
 
@@ -708,12 +741,12 @@ test("settingsProjectId: worktree → проект основного катал
   };
   // resolving from the worktree copy finds the main checkout's project
   assert.equal(
-    await settingsProjectId({ cmd, bbCli }, wt, "proj_main"),
+    await settingsProjectId({ cmd, bbCli }, wt, "proj_main", null),
     "proj_repo",
   );
   // and from the checkout itself
   assert.equal(
-    await settingsProjectId({ cmd, bbCli }, repo, "proj_main"),
+    await settingsProjectId({ cmd, bbCli }, repo, "proj_main", null),
     "proj_repo",
   );
 });
@@ -1018,7 +1051,7 @@ test("release: sync merge message carries no branch names or ids (§16.6)", asyn
 
 test("release: leak added and removed inside the range is still caught (§16.6)", async () => {
   const { repo } = makeRepo();
-  writeFileSync(join(repo, "leak.txt"), "path /home/someone/secret\n");
+  writeFileSync(join(repo, "leak.txt"), `path ${LEAK_HOME_PATH}\n`);
   gitR(repo, ["add", "."]);
   gitR(repo, ["commit", "-m", "wip: leak"]);
   execFileSync("rm", [join(repo, "leak.txt")]);
@@ -1352,7 +1385,7 @@ test("parseAddedLines: +++ inside a hunk is content, not a file header", () => {
     "@@ -0,0 +1,3 @@",
     "+++ /dev/null",
     "+++ b/docs/PLAN.md",
-    "+/home/after/z",
+    `+${LEAK_HOME_PATH}`,
     "diff --git a/h.txt b/h.txt",
     "+++ b/h.txt",
     "@@ -0,0 +1 @@",
@@ -1361,7 +1394,7 @@ test("parseAddedLines: +++ inside a hunk is content, not a file header", () => {
   assert.deepEqual(parseAddedLines(diff), [
     { file: "g.txt", line: 1, text: "++ /dev/null" },
     { file: "g.txt", line: 2, text: "++ b/docs/PLAN.md" },
-    { file: "g.txt", line: 3, text: "/home/after/z" },
+    { file: "g.txt", line: 3, text: LEAK_HOME_PATH },
     { file: "h.txt", line: 1, text: "x" },
   ]);
 });
@@ -2921,13 +2954,14 @@ test("PLUG-230: пост-проверка — leaks.allow проекта ува�
       projects: { proj_main: {} },
     }),
   });
-  // the same machine path under an allow-listed prefix and outside it —
-  // only the latter may surface in the rescan findings.
+  // the same positive sample under an allow-listed prefix and outside
+  // it; a fixture-prefix path in a third file — only the unlisted
+  // positive sample may surface in the rescan findings (§4 r8).
   mkdirSync(join(repo, "docs"), { recursive: true });
   mkdirSync(join(repo, "src"), { recursive: true });
-  const machinePath = ["", "home", "builder", "x"].join("/");
-  writeFileSync(join(repo, "docs/plan.md"), `build in ${machinePath}\n`);
-  writeFileSync(join(repo, "src/leak.txt"), `build in ${machinePath}\n`);
+  writeFileSync(join(repo, "docs/plan.md"), `build in ${LEAK_HOME_PATH}\n`);
+  writeFileSync(join(repo, "src/leak.txt"), `build in ${LEAK_HOME_PATH}\n`);
+  writeFileSync(join(repo, "src/ok.txt"), `build in ${SAFE_HOME_PATH}\n`);
   gitR(repo, ["add", "."]);
   gitR(repo, ["commit", "-m", "chore: paths"]);
   const headSha = gitR(repo, ["rev-parse", "HEAD"]);
@@ -2947,4 +2981,415 @@ test("PLUG-230: пост-проверка — leaks.allow проекта ува�
   assert.ok(msg, `expected rescan findings, got: ${JSON.stringify(sent)}`);
   assert.ok(msg.includes("src/leak.txt"));
   assert.ok(!msg.includes("docs/plan.md"));
+});
+
+// ── §6 r8: проект настройки падает закрыто (PLUG-231) ────────────────
+
+/** A cmd/bbCli/localHostId set for settingsProjectId unit tests —
+ * real git passes through, `worktree list`/`remote get-url` and
+ * `project list` are stubbed per test. */
+function resolverDeps(opts: {
+  projects?: unknown[];
+  hostId?: string;
+  projectList?: () => BbCliResult;
+  worktreeList?: string;
+  worktreeExit?: number;
+  remoteUrl?: string;
+}) {
+  const cmd: CmdRunner = {
+    run: async (file, args, o) => {
+      if (file === "git" && args.includes("worktree")) {
+        if (opts.worktreeList !== undefined || opts.worktreeExit !== undefined) {
+          return {
+            exitCode: opts.worktreeExit ?? 0,
+            stdout: opts.worktreeList ?? "",
+            stderr: "",
+          };
+        }
+      }
+      if (
+        file === "git" &&
+        args.includes("remote") &&
+        opts.remoteUrl !== undefined
+      ) {
+        return { exitCode: 0, stdout: `${opts.remoteUrl}\n`, stderr: "" };
+      }
+      try {
+        const out = execFileSync(file, args, {
+          cwd: o?.cwd, encoding: "utf8", input: o?.stdin,
+        });
+        return { exitCode: 0, stdout: out, stderr: "" };
+      } catch (e: unknown) {
+        const x = e as { status?: number; stdout?: string; stderr?: string };
+        return { exitCode: x.status ?? 1, stdout: x.stdout ?? "", stderr: x.stderr ?? "" };
+      }
+    },
+  };
+  const bbCli: BbCli = {
+    run: async () =>
+      opts.projectList
+        ? opts.projectList()
+        : ok(JSON.stringify(opts.projects ?? [])),
+  };
+  return { cmd, bbCli, localHostId: () => opts.hostId ?? "host_test" };
+}
+
+test("settingsProjectId r8: сбой bb project list и мусорный JSON → отказ", async () => {
+  const { repo } = makeRepo();
+  for (const projectList of [
+    () => ({ exitCode: 1, stdout: "", stderr: "boom" }),
+    () => ok("not json at all"),
+    () => ok("{}"),
+  ]) {
+    await assert.rejects(
+      settingsProjectId(resolverDeps({ projectList }), repo, "proj_main", null),
+      (e: unknown) =>
+        (e as OrchestratorError).code === "release-settings-unknown",
+    );
+  }
+});
+
+test("settingsProjectId r8: realpath основного каталога → отказ", async () => {
+  await assert.rejects(
+    settingsProjectId(
+      resolverDeps({
+        worktreeList: "worktree /gone/no-such-dir\nHEAD 0\ndetached\n",
+      }),
+      "/anywhere",
+      "proj_main",
+      null,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-unknown",
+  );
+});
+
+test("settingsProjectId r8: несуществующий и чужой-hostId пути — не кандидаты, не ошибка", async () => {
+  const { repo } = makeRepo();
+  const res = await settingsProjectId(
+    resolverDeps({
+      projects: [
+        { id: "proj_gone", sources: [{ type: "local_path", path: "/gone/nope", isDefault: true }] },
+        { id: "proj_far", sources: [{ type: "local_path", path: repo, isDefault: true, hostId: "host_other" }] },
+        { id: "proj_main", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+      ],
+    }),
+    repo,
+    "proj_del",
+    null,
+  );
+  // only proj_main is a real candidate — no error, no ambiguity
+  assert.equal(res, "proj_main");
+});
+
+test("settingsProjectId r8: второстепенный путь не делает кандидатом", async () => {
+  const { repo } = makeRepo();
+  const res = await settingsProjectId(
+    resolverDeps({
+      projects: [
+        { id: "proj_sec", sources: [
+          { type: "local_path", path: repo, isDefault: false },
+          { type: "local_path", path: "/other/nope", isDefault: true },
+        ] },
+        { id: "proj_main", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+      ],
+    }),
+    repo,
+    "proj_del",
+    null,
+  );
+  // a secondary-source match must not join the candidate set — else
+  // proj_sec + proj_main would be ambiguous, not proj_main.
+  assert.equal(res, "proj_main");
+});
+
+test("settingsProjectId r8: несколько кандидатов → проект делегирования если среди них, иначе отказ", async () => {
+  const { repo } = makeRepo();
+  const projects = [
+    { id: "proj_a", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+    { id: "proj_b", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+  ];
+  assert.equal(
+    await settingsProjectId(resolverDeps({ projects }), repo, "proj_a", null),
+    "proj_a",
+  );
+  await assert.rejects(
+    settingsProjectId(resolverDeps({ projects }), repo, "proj_del", null),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-ambiguous",
+  );
+});
+
+test("settingsProjectId r8: bare-копия — совпадение по origin с явной записью", async () => {
+  const base = mkdtempSync(join(tmpdir(), "rel-bare-"));
+  const bare = join(base, "bare.git");
+  execFileSync("git", ["init", "--bare", bare]);
+  const projDir = mkdtempSync(join(tmpdir(), "projdir-"));
+  const cfg = parseReleaseConfig(
+    JSON.stringify({
+      defaults: { target: { action: "push", branch: "main" } },
+      projects: { proj_o: {} },
+    }),
+  ).config!;
+  const res = await settingsProjectId(
+    resolverDeps({
+      remoteUrl: "git@GH.Example:Team/Repo.git",
+      projects: [
+        {
+          id: "proj_o",
+          gitRemoteUrl: "https://u:t@gh.example:8443/Team/Repo.git",
+          sources: [{ type: "local_path", path: projDir, isDefault: true }],
+        },
+      ],
+    }),
+    bare,
+    "proj_del",
+    cfg,
+  );
+  assert.equal(res, "proj_o");
+});
+
+test("settingsProjectId r8: совпадение по origin без явной записи и без пути → unknown", async () => {
+  const base = mkdtempSync(join(tmpdir(), "rel-bare-"));
+  const bare = join(base, "bare.git");
+  execFileSync("git", ["init", "--bare", bare]);
+  const cfg = parseReleaseConfig(
+    JSON.stringify({
+      defaults: { target: { action: "push", branch: "main" } },
+      projects: {},
+    }),
+  ).config!;
+  // no `projects.proj_o` entry → the origin candidate is dropped
+  await assert.rejects(
+    settingsProjectId(
+      resolverDeps({
+        remoteUrl: "git@gh.example:Team/Repo.git",
+        projects: [
+          {
+            id: "proj_o",
+            gitRemoteUrl: "https://gh.example/Team/Repo",
+            sources: [{ type: "local_path", path: base, isDefault: true }],
+          },
+        ],
+      }),
+      bare,
+      "proj_del",
+      cfg,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-unknown",
+  );
+  // an explicit entry but a path missing on this machine → dropped too
+  const cfg2 = parseReleaseConfig(
+    JSON.stringify({
+      defaults: { target: { action: "push", branch: "main" } },
+      projects: { proj_o: {} },
+    }),
+  ).config!;
+  await assert.rejects(
+    settingsProjectId(
+      resolverDeps({
+        remoteUrl: "git@gh.example:Team/Repo.git",
+        projects: [
+          {
+            id: "proj_o",
+            gitRemoteUrl: "https://gh.example/Team/Repo",
+            sources: [{ type: "local_path", path: "/gone/nope", isDefault: true }],
+          },
+        ],
+      }),
+      bare,
+      "proj_del",
+      cfg2,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-unknown",
+  );
+});
+
+test("settingsProjectId r8: url origin не попадает в отказ", async () => {
+  const secret = "sekret-token-xyz";
+  await assert.rejects(
+    settingsProjectId(
+      resolverDeps({
+        worktreeList: "worktree /gone/x\nbare\n",
+        remoteUrl: `https://u:${secret}@h.example/o/r`,
+        projects: [],
+      }),
+      "/anywhere",
+      "proj_del",
+      null,
+    ),
+    (e: unknown) => {
+      const x = e as OrchestratorError;
+      assert.equal(x.code, "release-settings-unknown");
+      assert.ok(!x.message.includes(secret));
+      assert.ok(!(x.hint ?? "").includes(secret));
+      return true;
+    },
+  );
+});
+
+test("release r8: неоднозначные проекты → отказ release-settings-ambiguous", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo, {
+    projects: [
+      { id: "proj_a", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+      { id: "proj_b", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+    ],
+  });
+  // the delegation project (proj_main) is not among the candidates
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-ambiguous",
+  );
+});
+
+test("release r8: сбой git в копии → отказ release-settings-unknown", async () => {
+  const { deps } = makeDeps("/gone/nope", {
+    execPath: "/gone/nope",
+    execBranch: "feat-x",
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-settings-unknown",
+  );
+});
+
+test("release r8: settings_project_id пишется на шаге 1 и живёт в записи", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.settingsProjectId, "proj_main");
+  assert.equal(
+    store.getRelease(res.releaseId)!.settings_project_id,
+    "proj_main",
+  );
+});
+
+test("release r8: publish берёт проект из записи — сбой project list не страшен", async () => {
+  const { repo } = makeRepo();
+  const ghCalls: string[][] = [];
+  const { deps, store, sent } = makeDeps(repo, {
+    ghCalls,
+    projectListFail: true,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "pr", branch: "main" }, checks: [] },
+      projects: { proj_th: { threadIds: false }, proj_main: {} },
+    }),
+  });
+  // a pre-resolved row (as step 1 left it): publish must read
+  // settings_project_id and never call `project list` — a CLI failure
+  // at step 6 must not change threadIds.
+  writeFileSync(join(repo, "f2.txt"), "y\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const headSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const r = store.insertRelease({
+    taskKey: "PLUG-1", projectId: "proj_main",
+    coordinatorThreadId: "thr_coord", repoPath: repo, branch: "feat-x",
+    targetAction: "pr", targetBranch: "main",
+    settingsProjectId: "proj_th",
+  });
+  store.updateRelease(r.id, {
+    status: "publishing",
+    headSha,
+    remoteBaseSha: gitR(repo, ["rev-parse", "origin/main"]),
+  });
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  const create = ghCalls.find((a) => a[0] === "pr" && a[1] === "create")!;
+  // proj_th has threadIds off — the «Источник» line proves the
+  // RECORDED project drove the publish, not proj_main's default.
+  assert.equal(create[create.indexOf("--body") + 1], "");
+  assert.ok(!sent.some((m) => m.includes("находк")), JSON.stringify(sent));
+});
+
+test("release r8: пост-проверка — пропуск скана это строка, а не молчание", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "newbr" }, checks: [] },
+      projects: { proj_main: {} },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  // first release onto a new branch: no remote base → the skipped
+  // rescan is a coordinator line, not silence (§2 шаг 7, r8).
+  assert.ok(
+    sent.some(
+      (m) => m.includes("пост-проверка") && m.includes("скан пропущен"),
+    ),
+    `expected the skip line, got: ${JSON.stringify(sent)}`,
+  );
+});
+
+test("release r8: пост-проверка pr — commitIdentity repo + leaks.allow без находок", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "repo",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        checks: [],
+        leaks: { allow: ["docs/"] },
+      },
+      projects: { proj_main: {} },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  assert.ok(
+    !sent.some((m) => m.includes("находк")),
+    `unexpected findings, got: ${JSON.stringify(sent)}`,
+  );
+});
+
+test("machine scan r8: префиксы-фикстуры — не находки, и по каждому вхождению", async () => {
+  const scan = (added: { file: string; line: number; text: string }[], body = "") =>
+    machineScan(GL_EMPTY, {
+      ...SCAN_BASE,
+      commits: [{ ...SCAN_BASE.commits[0]!, body }],
+      added,
+    });
+  // negative samples — silence in added lines and in commit text
+  let f = await scan(
+    [
+      { file: "f.ts", line: 1, text: `x = ${SAFE_HOME_PATH}` },
+      { file: "g.ts", line: 1, text: `y = ${SAFE_USERS_PATH}` },
+    ],
+    `note ${SAFE_HOME_PATH}`,
+  );
+  assert.ok(!f.some((x) => x.category === 3), JSON.stringify(f));
+  // positive samples — a finding in added lines and in commit text
+  f = await scan(
+    [{ file: "f.ts", line: 1, text: `x = ${LEAK_HOME_PATH}` }],
+    `see ${LEAK_USERS_PATH}`,
+  );
+  assert.ok(f.some((x) => x.category === 3 && x.file === "f.ts"));
+  assert.ok(f.some((x) => x.category === 3 && x.file === null));
+  // a fixture prefix next to a real path in one line — still a finding
+  f = await scan(
+    [{ file: "f.ts", line: 1, text: MIXED_PATH_LINE }],
+    MIXED_PATH_LINE,
+  );
+  assert.ok(f.some((x) => x.category === 3 && x.file === "f.ts"));
+  assert.ok(f.some((x) => x.category === 3 && x.file === null));
 });
