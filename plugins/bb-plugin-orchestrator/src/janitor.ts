@@ -3507,7 +3507,7 @@ export function createJanitor(deps: JanitorDeps) {
     // rescue rather than silence.
     // §16.4 r29 п.2: «живой» only when the DTO proves it — a missing
     // `archivedAt` cannot prove «не в архиве» (нет поля → спасать,
-    // ревью thr_ivx9d3y269). `deletedAt` absent is the norm — deleted
+    // ревью PLUG-240). `deletedAt` absent is the norm — deleted
     // threads are excluded from the list server-side; only a set one
     // disqualifies.
     const liveThread = (t: ThreadDto) =>
@@ -3634,7 +3634,7 @@ export function createJanitor(deps: JanitorDeps) {
     // candidate from listRescueRefs) is not a failure: compare with
     // the occupying ref, identical → done, different → try N+1.
     // §16.4 r29 п.3: the new ref is <id>-<maxN+1>, never a filled
-    // hole (ревью thr_ivx9d3y269) — a freed number reused later would
+    // hole (ревью PLUG-240) — a freed number reused later would
     // sit below the newest snapshot the п.3 comparison runs against.
     const maxN = existing.reduce(
       (m, r) => Math.max(m, rescueN(refBase, r)),
