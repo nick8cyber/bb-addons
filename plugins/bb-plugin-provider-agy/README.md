@@ -564,7 +564,8 @@ inline (crisp, no fetch) and `icons/agy.svg` stays as the fallback for when the
 frontend has not booted, is disabled, or fails. The registered component must
 declare intrinsic size (`width`/`height` on the `<svg>`): the host wraps the
 icon in a `min-w/h-max` container, and a dimensionless SVG reports 300×150,
-blowing the slot out of its row. The palette is explicit rather
+blowing the slot out of its row. Intrinsic 14px keeps the mark compact in
+14px slots while `size-full` still stretches it wherever the slot is bigger. The palette is explicit rather
 than `currentColor`: an `<img>` SVG is a separate document where `currentColor`
 is black, and a four-colour mark has no single tint to inherit anyway.
 
