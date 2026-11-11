@@ -24,6 +24,11 @@ const MIN_EDITOR_PX = 104;
 /** Expanded queue shows at most this many rows; the rest scroll. */
 const MAX_QUEUE_ROWS = 3;
 
+function padY(el: Element): number {
+  const cs = getComputedStyle(el);
+  return (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+}
+
 function capPx(win: Window): number {
   return Math.max(120, Math.floor((win.innerHeight - OUTER_CHROME_PX) / 3));
 }
@@ -46,19 +51,16 @@ function enforce(form: Element, win: Window): void {
       if (frame) frame.style.maxHeight = "";
     } else {
       /* Exact height of the first min(N,3) rows including inter-row gaps —
-         measured, not multiplied, so spacing variants don't clip a row. The
-         flex-1 frame gets the same bound so the card actually shrinks; clamping
-         only the inner scroll leaves dead space under it. */
+         measured, not multiplied. The scroll element carries its own vertical
+         padding (host: pt-1 pb-3); omitting it clips the last visible row. */
       const k = Math.min(rows.length, MAX_QUEUE_ROWS);
       const queueMax = Math.ceil(
         rows[k - 1].getBoundingClientRect().bottom -
-          rows[0].getBoundingClientRect().top,
+          rows[0].getBoundingClientRect().top +
+          padY(queue),
       );
       queue.style.maxHeight = `${queueMax}px`;
-      if (frame) {
-        const chrome = Math.max(0, frame.getBoundingClientRect().height - queue.getBoundingClientRect().height);
-        frame.style.maxHeight = `${queueMax + chrome}px`;
-      }
+      if (frame) frame.style.maxHeight = `${queueMax + Math.ceil(padY(frame))}px`;
     }
   }
   const formH = form.getBoundingClientRect().height;
