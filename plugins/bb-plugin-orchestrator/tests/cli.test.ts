@@ -531,3 +531,44 @@ test("preset check: throttled to 10 min and gated on change/activity", async () 
   await new Promise((r) => setImmediate(r));
   assert.equal(presetListCalls(), 2);
 });
+
+test("janitor run is refused while disabled, report works", async () => {
+  const { cli } = fakeCli((args) =>
+    args.join(" ").startsWith("environment list")
+      ? ok(JSON.stringify([]))
+      : undefined,
+  );
+  const host = await hostWith({}, cli);
+  // disabled (default {"enabled": false}) → refusal with hint
+  let res = await host.harness.runCli(["janitor", "run", "--json"], {});
+  assert.equal(res.exitCode, 1);
+  let body = JSON.parse(res.stdout) as { ok: boolean; error: { code: string } };
+  assert.equal(body.ok, false);
+  assert.equal(body.error.code, "janitor-disabled");
+  // --dry-run passes without enabled config
+  res = await host.harness.runCli(["janitor", "run", "--dry-run", "--json"], {});
+  assert.equal(res.exitCode, 0);
+  const dry = JSON.parse(res.stdout) as { ok: boolean; applied: boolean };
+  assert.equal(dry.ok, true);
+  assert.equal(dry.applied, false);
+  // report: JSON summary shape
+  res = await host.harness.runCli(["janitor", "report", "--json"], {});
+  assert.equal(res.exitCode, 0);
+  const rep = JSON.parse(res.stdout) as {
+    ok: boolean;
+    items: unknown[];
+    abandoned: unknown[];
+    lastRun: { removed: number } | null;
+  };
+  assert.equal(rep.ok, true);
+  assert.ok(Array.isArray(rep.items));
+  assert.ok(rep.lastRun !== null);
+});
+
+test("janitor run with invalid config reports janitor-invalid", async () => {
+  const { cli } = fakeCli();
+  const host = await hostWith({ janitor: "{oops" }, cli);
+  const res = await host.harness.runCli(["janitor", "run"], {});
+  assert.equal(res.exitCode, 1);
+  assert.match(res.stderr ?? "", /janitor-invalid/);
+});
