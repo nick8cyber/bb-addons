@@ -22,7 +22,10 @@ import { createPlugin } from "../server.js";
 
 const POLICY_TEXT = JSON.stringify({
   version: 1,
-  levels: { simple: { chain: ["simple"] } },
+  levels: {
+    simple: { chain: ["simple"] },
+    review: { chain: ["simple"] },
+  },
   routes: { simple: { preset: "simple", provider: "acp-opencode" } },
 });
 const PRESETS = new Set(["simple"]);
@@ -307,4 +310,175 @@ test("server wiring: a settings change is picked up by the next dispatch", async
   await host.harness.setSettings({ gitInstructions: "GIT-V2" });
   assert.equal((await delegate(host, "PLUG-2")).exitCode, 0);
   assert.equal(dispatchedInstructions(calls), "GIT-V2");
+});
+
+// ── rev 23: rounds — «Заход N» in --instructions, --from/--fresh ────────
+
+test("round 2 dispatch gets the «Заход 2» section with the round-1 SHA", async () => {
+  const { deps, store, calls } = makeDeps();
+  const prev = insertRow(store);
+  store.setStatus(prev.id, "done");
+  store.setRoundResult(prev.id, {
+    branch: "exec-r1",
+    sha: "abc123def",
+    commits: 3,
+    dirty: false,
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  const text = dispatchedInstructions(calls)!;
+  assert.match(text, /Заход 2: продолжение работы с коммита abc123def/);
+  assert.match(text, /ветка exec-r1 прошлого захода/);
+  assert.match(text, /git merge --ff-only abc123def/);
+  assert.match(text, /git merge --no-edit abc123def/);
+  const row = store.listActive()[0]!;
+  assert.equal(row.round, 2);
+  assert.equal(row.continue_from, "abc123def");
+});
+
+test("--fresh disables continuation: no Заход section, continue_from null", async () => {
+  const { deps, store, calls } = makeDeps();
+  const prev = insertRow(store);
+  store.setStatus(prev.id, "done");
+  store.setRoundResult(prev.id, {
+    branch: "exec-r1",
+    sha: "abc123def",
+    commits: 3,
+    dirty: false,
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", fresh: true, caller: COORDINATOR },
+    deps,
+  );
+  const text = dispatchedInstructions(calls);
+  assert.ok(!text || !/Заход/.test(text), `unexpected section: ${text}`);
+  const row = store.listActive()[0]!;
+  assert.equal(row.round, 2);
+  assert.equal(row.continue_from, null);
+});
+
+test("--from overrides continuation with the given ref", async () => {
+  const { deps, store, calls } = makeDeps();
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", from: "deadbeef", caller: COORDINATOR },
+    deps,
+  );
+  const text = dispatchedInstructions(calls)!;
+  assert.match(text, /Заход 1: продолжение работы с коммита deadbeef/);
+  const row = store.listActive()[0]!;
+  assert.equal(row.continue_from, "deadbeef");
+});
+
+test("a reissue inherits round and continue_from — the same «Заход N»", async () => {
+  const { deps, store, calls } = makeDeps();
+  const row = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    round: 1,
+    continueFrom: "abc123def",
+  });
+  store.setStatus(row.id, "stalled");
+  const fresh = store.reissue(row.id, {
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+  })!;
+  // §4.1 r23: a reissue retries the same round, not round + 1
+  assert.equal(fresh.round, 1);
+  assert.equal(fresh.continue_from, "abc123def");
+  await dispatchToRoute(fresh, {}, deps);
+  assert.match(
+    dispatchedInstructions(calls)!,
+    /Заход 1: продолжение работы с коммита abc123def/,
+  );
+});
+
+test("reissue accepts a failed row (§5.4 r23)", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+  const row = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+  });
+  store.setStatus(row.id, "failed");
+  const fresh = store.reissue(row.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "p2",
+  });
+  assert.ok(fresh);
+  assert.equal(store.get(row.id)!.status, "reissued");
+  assert.equal(fresh.route, "simple-alt");
+});
+
+test("--from + --fresh → incompatible-flags, nothing inserted", async () => {
+  const { deps, store, calls } = makeDeps();
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        from: "abc123def",
+        fresh: true,
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) =>
+      e instanceof Error && (e as { code?: string }).code === "incompatible-flags",
+  );
+  assert.equal(store.activeCount(), 0);
+  assert.ok(
+    !calls.some((c) => c.join(" ").startsWith("tasks dispatch")),
+    "no dispatch expected",
+  );
+});
+
+test("review level gets «Проверяемый итог», not the «Заход N» section", async () => {
+  const { deps, store, calls } = makeDeps();
+  const prev = insertRow(store);
+  store.setStatus(prev.id, "done");
+  store.setRoundResult(prev.id, {
+    branch: "exec-r1",
+    sha: "abc123def",
+    commits: 3,
+    dirty: false,
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "review", caller: COORDINATOR },
+    deps,
+  );
+  const text = dispatchedInstructions(calls)!;
+  // §4.1 r23: a read-only role gets the commit to check, no git commands
+  assert.match(
+    text,
+    /Проверяемый итог: коммит abc123def \(ветка exec-r1, заход 1\)/,
+  );
+  assert.ok(!/Заход|git merge/.test(text), `unexpected section: ${text}`);
+  const row = store.listActive()[0]!;
+  assert.equal(row.level, "review");
+  assert.equal(row.continue_from, "abc123def");
+});
+
+test("review level with an unrecorded --from ref names just the commit", async () => {
+  const { deps, calls } = makeDeps();
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "review", from: "deadbeef", caller: COORDINATOR },
+    deps,
+  );
+  const text = dispatchedInstructions(calls)!;
+  assert.match(text, /^Проверяемый итог: коммит deadbeef$/m);
+  assert.ok(!/Заход|git merge/.test(text), `unexpected section: ${text}`);
 });

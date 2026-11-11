@@ -15,6 +15,8 @@ export interface PolicyRoute {
   quotaGroup?: string;
   quotaPatterns?: string[];
   unavailablePatterns?: string[];
+  /** §2 rule 4: per-route first-response window, overrides the global one. */
+  firstResponseSeconds?: number;
 }
 
 export interface PolicyLevel {
@@ -147,6 +149,16 @@ export function parsePolicy(
       };
       const quotaPatterns = patternsOf("quotaPatterns");
       const unavailablePatterns = patternsOf("unavailablePatterns");
+      // Rule 4, per route: a cold-start-heavy provider gets its own window.
+      let routeFirst: number | undefined;
+      if (value.firstResponseSeconds !== undefined) {
+        const v = value.firstResponseSeconds;
+        if (typeof v !== "number" || v < 30 || v > 600) {
+          err(`${path}.firstResponseSeconds`, "must be a number in 30–600");
+        } else {
+          routeFirst = v;
+        }
+      }
       if (isNonEmptyString(value.preset) && isNonEmptyString(value.provider)) {
         routes[name] = {
           preset: value.preset,
@@ -156,6 +168,9 @@ export function parsePolicy(
             : {}),
           ...(quotaPatterns ? { quotaPatterns } : {}),
           ...(unavailablePatterns ? { unavailablePatterns } : {}),
+          ...(routeFirst !== undefined
+            ? { firstResponseSeconds: routeFirst }
+            : {}),
         };
       }
     }

@@ -91,6 +91,22 @@ export const MIGRATIONS: readonly string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS releases_active_task_idx
     ON releases(task_key) WHERE status IN ('auditing','publishing')`,
   `CREATE INDEX IF NOT EXISTS releases_task_idx ON releases(task_key)`,
+  // §7 rev 23 (ADR-0024): rounds — every dispatch gets `round` and an
+  // optional `continue_from`; `result_*` — the round's outcome read from
+  // the executor's worktree at `done` (§4.1); `merge_*` — the §14 merge
+  // step's record, filled by the merge task. One migration statement per
+  // column (SQLite has no multi-column ALTER); exec'd as one migration.
+  `ALTER TABLE delegations ADD COLUMN round INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE delegations ADD COLUMN continue_from TEXT;
+   ALTER TABLE delegations ADD COLUMN result_branch TEXT;
+   ALTER TABLE delegations ADD COLUMN result_sha TEXT;
+   ALTER TABLE delegations ADD COLUMN result_commits INTEGER;
+   ALTER TABLE delegations ADD COLUMN result_dirty INTEGER;
+   ALTER TABLE delegations ADD COLUMN result_env_id TEXT;
+   ALTER TABLE delegations ADD COLUMN merge_status TEXT;
+   ALTER TABLE delegations ADD COLUMN merged_into TEXT;
+   ALTER TABLE delegations ADD COLUMN merged_sha TEXT;
+   ALTER TABLE delegations ADD COLUMN merged_at INTEGER`,
   // §15 janitor, one migration: the per-env ledger (`first_seen_at` is the
   // first run the copy was seen merged — «влита» state), the run log, and
   // a small key-value table (daily coordinator-notify watermark).
@@ -155,6 +171,17 @@ export interface DelegationRow {
   timeout_notified_at: number | null;
   resume_count: number;
   retry_count: number;
+  round: number;
+  continue_from: string | null;
+  result_branch: string | null;
+  result_sha: string | null;
+  result_commits: number | null;
+  result_dirty: number | null;
+  result_env_id: string | null;
+  merge_status: string | null;
+  merged_into: string | null;
+  merged_sha: string | null;
+  merged_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -235,14 +262,16 @@ export class DelegationStore {
     route: string;
     preset: string;
     provider: string;
+    round?: number;
+    continueFrom?: string | null;
   }): DelegationRow {
     const now = Date.now();
     const info = this.db
       .prepare(
         `INSERT INTO delegations (
           task_key, task_id, project_id, coordinator_thread_id, level, route,
-          preset, provider, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)`,
+          preset, provider, status, round, continue_from, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?)`,
       )
       .run(
         normalizeTaskKey(input.taskKey),
@@ -253,6 +282,8 @@ export class DelegationStore {
         input.route,
         input.preset,
         input.provider,
+        input.round ?? 1,
+        input.continueFrom ?? null,
         now,
         now,
       );
@@ -564,7 +595,10 @@ export class DelegationStore {
    * §5.4 reissue in one transaction: the old row moves to `reissued` and a
    * new `dispatching` row with `reissue_of` is inserted atomically, so a
    * service restart mid-reissue cannot leave a duplicate. Returns the new
-   * row, or undefined when the old row already left `stalled`/`quota`.
+   * row, or undefined when the old row already left `stalled`/`quota`/
+   * `failed`. The reissue retries the SAME round (§4.1 r23): it inherits
+   * `round` and `continue_from`, so a later manual delegate is the next
+   * round, not the reissue.
    */
   reissue(
     id: number,
@@ -572,7 +606,12 @@ export class DelegationStore {
   ): DelegationRow | undefined {
     return this.db.transaction(() => {
       const row = this.get(id);
-      if (!row || (row.status !== "stalled" && row.status !== "quota")) {
+      if (
+        !row ||
+        (row.status !== "stalled" &&
+          row.status !== "quota" &&
+          row.status !== "failed")
+      ) {
         return undefined;
       }
       const now = Date.now();
@@ -585,8 +624,9 @@ export class DelegationStore {
         .prepare(
           `INSERT INTO delegations (
             task_key, task_id, project_id, coordinator_thread_id, level,
-            route, preset, provider, status, reissue_of, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?)`,
+            route, preset, provider, status, reissue_of, round, continue_from,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?)`,
         )
         .run(
           row.task_key,
@@ -598,11 +638,91 @@ export class DelegationStore {
           next.preset,
           next.provider,
           id,
+          row.round,
+          row.continue_from,
           now,
           now,
         );
       return this.get(Number(info.lastInsertRowid));
     })();
+  }
+
+  /**
+   * §4.1: the next round number for a task — one above the highest round
+   * the task already has.
+   */
+  nextRound(taskKey: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(round), 0) + 1 AS n FROM delegations
+         WHERE task_key = ?`,
+      )
+      .get(normalizeTaskKey(taskKey)) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * §4.1: the newest delegation of the task with a recorded round result —
+   * the SHA the next round continues from.
+   */
+  latestResultByTask(taskKey: string): DelegationRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE task_key = ? AND result_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as DelegationRow | undefined;
+  }
+
+  /**
+   * §4.1: the recorded result a `continue_from` sha points at — its branch
+   * and the round that produced it — for the «Заход N» / «Проверяемый
+   * итог» instruction texts. Null when the ref names no recorded result
+   * (e.g. an arbitrary `--from` commit).
+   */
+  resultRefForSha(
+    taskKey: string,
+    sha: string,
+  ): { branch: string | null; round: number } | null {
+    const row = this.db
+      .prepare(
+        `SELECT result_branch, round FROM delegations
+         WHERE task_key = ? AND result_sha = ?
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey), sha) as
+      | { result_branch: string | null; round: number }
+      | undefined;
+    return row ? { branch: row.result_branch, round: row.round } : null;
+  }
+
+  /** §4.1: record the executor worktree's state at `done`. */
+  setRoundResult(
+    id: number,
+    result: {
+      envId?: string | null;
+      branch: string | null;
+      sha: string;
+      commits: number | null;
+      dirty: boolean;
+    },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_env_id = ?, result_branch = ?,
+         result_sha = ?, result_commits = ?, result_dirty = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        result.envId ?? null,
+        result.branch,
+        result.sha,
+        result.commits,
+        result.dirty ? 1 : 0,
+        Date.now(),
+        id,
+      );
   }
 
   /** Drop every `setup_errors` entry of one step — after a successful retry. */

@@ -421,6 +421,8 @@ export async function createPlugin(
     level: string;
     route?: string;
     instructions?: string;
+    from?: string;
+    fresh?: boolean;
     threadId?: string;
   }) =>
     enqueue(async () => {
@@ -522,6 +524,43 @@ export async function createPlugin(
     dispatch: (row, opts) => dispatchToRoute(row, opts ?? {}, stepsDeps),
     finalize: (row) => finishDispatchSteps(row, stepsDeps),
     retrySetup: (row) => retrySetupSteps(row, stepsDeps),
+    round: {
+      // §4.1: the executor's environment from its thread, then the env's
+      // own facts via `bb environment show`.
+      environment: async (threadId: string) => {
+        const t = (await bb.sdk.threads.get({ threadId })) as {
+          environmentId?: string | null;
+        };
+        if (!t.environmentId) return null;
+        const env = await runJson<{
+          id?: string;
+          path?: string;
+          branchName?: string;
+          mergeBaseBranch?: string | null;
+          baseBranch?: string | { name?: string } | null;
+        }>(bbCli, ["environment", "show", t.environmentId, "--json"]);
+        const mergeBase =
+          env.mergeBaseBranch ??
+          (typeof env.baseBranch === "string"
+            ? env.baseBranch
+            : (env.baseBranch?.name ?? null));
+        return {
+          id: env.id ?? t.environmentId,
+          path: env.path,
+          branchName: env.branchName,
+          mergeBaseBranch: mergeBase,
+        };
+      },
+      git: async (repo, args) => {
+        const res = await cmd.run("git", ["-C", repo, ...args]);
+        if (res.exitCode !== 0) {
+          throw new Error(
+            `git ${args.join(" ")}: ${(res.stderr || res.stdout).trim()}`,
+          );
+        }
+        return res.stdout;
+      },
+    },
     enqueue,
     log: bb.log,
   });
@@ -702,6 +741,14 @@ export async function createPlugin(
         .string()
         .optional()
         .describe("Extra instructions for this dispatch only"),
+      from: z
+        .string()
+        .optional()
+        .describe("Continue this round from an explicit sha or branch (§6 --from)"),
+      fresh: z
+        .boolean()
+        .optional()
+        .describe("Start the round without continuing the previous result (§6 --fresh)"),
     }),
     async execute(params, ctx) {
       try {
@@ -864,7 +911,7 @@ export async function createPlugin(
         name: "delegate",
         summary: "Dispatch a task to an executor under the policy",
         usage:
-          "bb orchestrator delegate <KEY> --level <level> [--route <route>] [--instructions <text>] [--json]",
+          "bb orchestrator delegate <KEY> --level <level> [--route <route>] [--instructions <text>] [--from <sha|branch>] [--fresh] [--json]",
       },
       {
         name: "status",
@@ -923,7 +970,7 @@ export async function createPlugin(
       const positional = argv.filter(
         (a, i) => !a.startsWith("--") && argv[i - 1] !== "--level" &&
           argv[i - 1] !== "--route" && argv[i - 1] !== "--instructions" &&
-          argv[i - 1] !== "--coordinator",
+          argv[i - 1] !== "--coordinator" && argv[i - 1] !== "--from",
       );
       const cmd = positional[0];
 
@@ -934,7 +981,7 @@ export async function createPlugin(
           if (!taskKey || !level) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>] [--instructions <t>]",
+              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>] [--instructions <t>] [--from <sha|branch>] [--fresh]",
             );
           }
           const res = await delegate({
@@ -942,6 +989,8 @@ export async function createPlugin(
             level,
             route: flag("--route"),
             instructions: flag("--instructions"),
+            from: flag("--from"),
+            fresh: argv.includes("--fresh"),
             threadId: ctx.threadId,
           });
           return json
