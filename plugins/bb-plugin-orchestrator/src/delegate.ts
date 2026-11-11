@@ -5,7 +5,7 @@
  *   2. INSERT the delegation as `dispatching` (the partial unique index is
  *      the double-dispatch guard);
  *   3. `bb tasks dispatch --json` → record `thread_id` at once;
- *   4. attach: `threads.update` (parent, hidden) + CLI `--parent-notifications stuck` (§16.5);
+ *   4. attach: `threads.update` (parent, hidden) + CLI `--parent-notifications auto` (§16.5);
  *   5. best-effort `mode=bypass` for `permissionMode=full` presets;
  *   6. status `running` + task comment «Раздано: …»;
  *   7. return the delegation.
@@ -530,7 +530,7 @@ export async function finishDispatchSteps(
       "update",
       threadId,
       "--parent-notifications",
-      "stuck",
+      "auto",
     ]);
   } catch (e) {
     noteError("parent-notifications", e);
@@ -719,7 +719,7 @@ export async function retrySetupSteps(
         "update",
         threadId,
         "--parent-notifications",
-        "stuck",
+        "auto",
       ]),
     );
   }
