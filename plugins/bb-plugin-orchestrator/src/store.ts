@@ -170,6 +170,11 @@ export const MIGRATIONS: readonly string[] = [
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`,
+  // §17.3 (ревью PLUG-210): `pipeline_shas` — JSON-массив SHA коммитов,
+  // которые создал сам конвейер выкладки на публикуемой ветке (синк-
+  // слияние, трейлер --no-docs). Гейт ревью не считает их чужими, в том
+  // числе на повторном запуске после отказа.
+  `ALTER TABLE releases ADD COLUMN pipeline_shas TEXT`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -265,6 +270,8 @@ export interface ReleaseRow {
   no_kb_reason: string | null;
   pr_url: string | null;
   publish_branch: string | null;
+  /** §17.3: JSON-массив SHA, созданных конвейером на этой выкладке. */
+  pipeline_shas: string | null;
   error: string | null;
   created_at: number;
   updated_at: number;
@@ -1254,24 +1261,6 @@ export class DelegationStore {
     );
   }
 
-  /** §16.6 (PLUG-191): the neutral `release/<sha7>` branch name this
-   * task's FIRST published release wrote — repeat releases reuse it so
-   * the task keeps one remote branch and one PR. PLUG-194: only
-   * `release/…` names count — rows written while `threadIds` was on may
-   * still hold the executor's branch, which must never be reused. */
-  releasePublishBranch(taskKey: string): string | null {
-    const row = this.db
-      .prepare(
-        `SELECT publish_branch FROM releases
-         WHERE task_key = ? AND publish_branch LIKE 'release/%'
-         ORDER BY id ASC LIMIT 1`,
-      )
-      .get(normalizeTaskKey(taskKey)) as
-      | { publish_branch: string }
-      | undefined;
-    return row?.publish_branch ?? null;
-  }
-
   /** §2 step 7 «выложено в обход»: is this sha a commit release pushed? */
   shaWasReleased(sha: string): boolean {
     return (
@@ -1283,6 +1272,167 @@ export class DelegationStore {
         )
         .get(sha, sha) !== undefined
     );
+  }
+
+  /** §17.3 (С4): the newest publish branch name recorded for the task —
+   * any form (`release/<sha7>` or the executor's own while `threadIds`
+   * was on); the caller decides which forms are reusable. */
+  lastPublishBranch(taskKey: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT publish_branch FROM releases
+         WHERE task_key = ? AND publish_branch IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as
+      | { publish_branch: string }
+      | undefined;
+    return row?.publish_branch ?? null;
+  }
+
+  /** §17.3 (Б4): all delegations the §14 merge recorded into this branch
+   * — every task's, not only the released one. */
+  mergedDelegationsInto(branch: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE merge_status = 'merged' AND merged_into = ?`,
+      )
+      .all(branch) as DelegationRow[];
+  }
+
+  /**
+   * §17.3 (С4): the commit the task's next round continues from — the
+   * newest `published_sha` when it CONTAINS the latest round result
+   * (the published tip carries the sync merge and the docs trailer, so
+   * a repeat release fast-forwards the same remote branch), else the
+   * latest recorded `result_sha`. Ancestry, not timestamps, decides —
+   * `updated_at` moves on late writes (ревью PLUG-210 мелко).
+   * `isAncestor(repoPath, a, b)` reports `git merge-base
+   * --is-ancestor a b`; without it the old timestamp heuristic is the
+   * degraded fallback.
+   */
+  async continuePoint(
+    taskKey: string,
+    isAncestor?: (
+      repoPath: string,
+      ancestor: string,
+      descendant: string,
+    ) => Promise<boolean>,
+  ): Promise<string | null> {
+    const key = normalizeTaskKey(taskKey);
+    const result = this.latestResultByTask(key);
+    const release = this.db
+      .prepare(
+        `SELECT published_sha, repo_path, updated_at FROM releases
+         WHERE task_key = ? AND status = 'published'
+           AND published_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(key) as
+      | { published_sha: string; repo_path: string; updated_at: number }
+      | undefined;
+    if (release && result?.result_sha && isAncestor) {
+      const publishedCovers = await isAncestor(
+        release.repo_path,
+        result.result_sha,
+        release.published_sha,
+      ).catch(() => false);
+      return publishedCovers ? release.published_sha : result.result_sha;
+    }
+    if (release && (!result?.result_sha || !isAncestor)) {
+      if (!result?.result_sha) return release.published_sha;
+      if (release.updated_at >= result.updated_at) {
+        return release.published_sha;
+      }
+    }
+    return result?.result_sha ?? null;
+  }
+
+  /** §17.3: SHAs the pipeline itself created on this run's branch —
+   * unioned into the row so a retry's review gate ignores them. */
+  addReleasePipelineShas(id: number, shas: readonly string[]): void {
+    if (!shas.length) return;
+    const row = this.getRelease(id);
+    if (!row) return;
+    let cur: string[] = [];
+    try {
+      const parsed = JSON.parse(row.pipeline_shas ?? "[]") as unknown;
+      if (Array.isArray(parsed)) {
+        cur = parsed.filter((x): x is string => typeof x === "string");
+      }
+    } catch { /* corrupt value — replaced below */ }
+    this.db
+      .prepare(
+        `UPDATE releases SET pipeline_shas = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(JSON.stringify([...new Set([...cur, ...shas])]), Date.now(), id);
+  }
+
+  /** §17.3: every sha the pipeline ever created in this repo — the
+   * review gate's exclusion set (any run, any status). */
+  pipelineShasForRepo(repoPath: string): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT pipeline_shas FROM releases
+         WHERE repo_path = ? AND pipeline_shas IS NOT NULL`,
+      )
+      .all(repoPath) as { pipeline_shas: string }[];
+    const out = new Set<string>();
+    for (const r of rows) {
+      try {
+        const parsed = JSON.parse(r.pipeline_shas) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const x of parsed) {
+            if (typeof x === "string") out.add(x);
+          }
+        }
+      } catch { /* ignore corrupt row */ }
+    }
+    return out;
+  }
+
+  /** §17.3: tips this repo's releases already pushed — «опубликовано»
+   * for the gate's range regardless of the remote branch they hit. */
+  publishedShasForRepo(repoPath: string): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT published_sha FROM releases
+           WHERE repo_path = ? AND status = 'published'
+             AND published_sha IS NOT NULL`,
+        )
+        .all(repoPath) as { published_sha: string }[]
+    ).map((r) => r.published_sha);
+  }
+
+  /** §17.3 (С4): the task's newest pushed tip — the fast-forward
+   * baseline a repeat release continues from (the CURRENT row's
+   * published_sha is still empty at publish time). */
+  lastPublishedSha(taskKey: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT published_sha FROM releases
+         WHERE task_key = ? AND status = 'published'
+           AND published_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as
+      | { published_sha: string }
+      | undefined;
+    return row?.published_sha ?? null;
+  }
+
+  /** §17.3: delegations of ANY task bound to a sha via `continue_from`
+   * — the tip-review lookup (a review covering a merged branch tip may
+   * live under a different task). Newest first. */
+  delegationsByContinueFrom(sha: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE continue_from = ?
+         ORDER BY id DESC`,
+      )
+      .all(sha) as DelegationRow[];
   }
 }
 

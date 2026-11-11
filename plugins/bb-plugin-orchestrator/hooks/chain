@@ -1,0 +1,30 @@
+#!/bin/sh
+# Generic shared-hook wrapper (spec orchestrator §17.3, Б2). The shared
+# `core.hooksPath` shadows EVERY standard hook name, so install.mjs
+# copies this file under each of them — else a repo's local `pre-commit`
+# or `commit-msg` would silently stop firing.
+#
+# Behaviour: exec the repository's own `$GIT_DIR/hooks/<my name>` with
+# the same arguments — but ONLY when it is executable, exactly like git
+# itself (a non-executable local hook is skipped, not an error; ревью
+# PLUG-210). stdin/stdout/stderr and the exit code pass through. No
+# local hook — exit 0. The orchestrator's own gate lives only in
+# `pre-push`; this wrapper never decides. POSIX sh, not node — this
+# fires on every `git status` (post-index-change), ~45ms of node
+# startup per call was too much (ревью PLUG-210 мелко 10).
+name=${0##*/}
+self=$0
+
+try=""
+if [ -n "$GIT_DIR" ]; then
+  try="$GIT_DIR/hooks/$name"
+fi
+if [ ! -x "$try" ] || [ "$try" -ef "$self" ]; then
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || exit 0
+  try="$common/hooks/$name"
+fi
+
+[ -x "$try" ] || exit 0
+[ "$try" -ef "$self" ] && exit 0
+exec "$try" "$@"

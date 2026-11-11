@@ -323,11 +323,23 @@ function makeDeps(repo: string, overrides: Partial<{
   reviewLevel: string;
   coordPath: string;
   ghCalls: string[][];
+  /** Open PRs `gh pr list` reports — a thunk so tests can flip the
+   * answer between release rounds. */
+  ghPrList: () => unknown[];
+  /** §17.3 (мелко 5): the reviewer thread's final output — the verdict
+   * fallback when the task carries no verdict comment. */
+  reviewThreadOutput: string | null;
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
-  // executor done + review done-OK
+  // executor done + review done-OK — §17.3 (Б4): the review is bound to
+  // the round's result sha via `continue_from`. The gate runs
+  // `git cat-file -e` on it — a real repo needs a real commit.
+  let RESULT_SHA = "f".repeat(40);
+  try {
+    RESULT_SHA = gitR(repo, ["rev-parse", "HEAD"]);
+  } catch { /* fake path — the fake sha stands */ }
   const exec = store.insert({
     taskKey: "PLUG-1", projectId: "proj_main",
     coordinatorThreadId: "thr_coord", level: "complex",
@@ -335,14 +347,22 @@ function makeDeps(repo: string, overrides: Partial<{
   });
   store.setThreadInfo(exec.id, "thr_exec");
   store.setStatus(exec.id, "done");
+  store.setRoundResult(exec.id, {
+    branch: "feat-x", sha: RESULT_SHA, commits: 1, dirty: false,
+  });
   const rev = store.insert({
     taskKey: "PLUG-1", projectId: "proj_main",
     coordinatorThreadId: "thr_coord",
     level: overrides.reviewLevel ?? "review",
     route: "r", preset: "r", provider: "p",
+    continueFrom: RESULT_SHA,
   });
   store.setThreadInfo(rev.id, "thr_rev");
   store.setStatus(rev.id, "done");
+  /** Re-bind a review's sha — merged tests point it at `merged_sha`. */
+  const bindReview = (sha: string, id = rev.id) =>
+    db.prepare("UPDATE delegations SET continue_from = ? WHERE id = ?")
+      .run(sha, id);
   const calls: string[][] = [];
   const comments: string[] = [];
   const sent: string[] = [];
@@ -397,6 +417,10 @@ function makeDeps(repo: string, overrides: Partial<{
             }]
           : [],
     },
+    output: async ({ threadId }: { threadId: string }) =>
+      threadId === "thr_rev"
+        ? { output: overrides.reviewThreadOutput ?? null }
+        : { output: null },
   };
   const tmp = mkdtempSync(join(tmpdir(), "hooks-"));
   const deps = {
@@ -406,11 +430,17 @@ function makeDeps(repo: string, overrides: Partial<{
       if (file === "gh") {
         overrides.ghCalls?.push(args);
         if (args[0] === "pr" && args[1] === "list")
-          return { exitCode: 0, stdout: "[]", stderr: "" };
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify(overrides.ghPrList?.() ?? []),
+            stderr: "",
+          };
+        // §17.3 (Б1): `gh pr create` prints the URL as plain text, not
+        // JSON — the mock returns the real output format.
         if (args[0] === "pr" && args[1] === "create")
           return {
             exitCode: 0,
-            stdout: JSON.stringify({ url: "https://example.test/pr/7" }),
+            stdout: "https://example.test/pr/7\n",
             stderr: "",
           };
         return { exitCode: 0, stdout: "{}", stderr: "" };
@@ -444,9 +474,10 @@ function makeDeps(repo: string, overrides: Partial<{
     },
     hooksDir: () => tmp,
     packetDir: () => mkdtempSync(join(tmpdir(), "pkt-")),
+    enqueue: <T>(f: () => Promise<T>) => f(),
     log: {},
   } satisfies ReleaseDeps;
-  return { deps, store, calls, comments, sent, tmp, exec };
+  return { deps, store, calls, comments, sent, tmp, exec, rev, bindReview };
 }
 
 test("release: refuses without release config / level / coordinator", async () => {
@@ -752,13 +783,15 @@ test("release: merged round publishes merged_into from coordinator copy", async 
   gitR(coord, ["commit", "-m", "feat: merged result"]);
   // Executor env deliberately absent — a merged result must come from
   // the coordinator's copy, not the executor's.
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
   });
+  const mergedSha = gitR(coord, ["rev-parse", "HEAD"]);
   store.setMerged(exec.id, {
     into: "work",
-    sha: gitR(coord, ["rev-parse", "HEAD"]),
+    sha: mergedSha,
   });
+  bindReview(mergedSha);
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   const row = store.getRelease(res.releaseId)!;
   assert.equal(row.branch, "work");
@@ -892,10 +925,11 @@ function makeMergedCoordinatorCopy(): { coord: string; workTip: string } {
 test("release (merged): copy restored to original branch+HEAD, lock gone", async () => {
   const { coord, workTip } = makeMergedCoordinatorCopy();
   const originalHead = gitR(coord, ["rev-parse", "HEAD"]);
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   assert.equal(res.status, "auditing");
   // §16.6: the copy is back on work-2 at its original commit, clean.
@@ -912,10 +946,11 @@ test("release (merged): copy restored to original branch+HEAD, lock gone", async
 test("release (merged): dirty copy refuses BEFORE the switch", async () => {
   const { coord, workTip } = makeMergedCoordinatorCopy();
   writeFileSync(join(coord, "dirty.txt"), "x"); // uncommitted
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   await assert.rejects(
     runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
     (e: unknown) => (e as OrchestratorError).code === "dirty-coordinator",
@@ -926,10 +961,11 @@ test("release (merged): dirty copy refuses BEFORE the switch", async () => {
 
 test("release (merged): same lock as merge — held lock refuses", async () => {
   const { coord, workTip } = makeMergedCoordinatorCopy();
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
   // A live lock (this process stands in for a running merge/release).
   writeFileSync(
@@ -953,10 +989,11 @@ test("release (merged): same lock as merge — held lock refuses", async () => {
 
 test("release (merged): restore failure → copy-not-restored", async () => {
   const { coord, workTip } = makeMergedCoordinatorCopy();
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   const realRun = deps.cmd.run;
   deps.cmd = {
     run: async (file, args, o) => {
@@ -999,15 +1036,42 @@ test("release: stale installed hook refuses with reinstall hint", async () => {
   );
 });
 
+/** Install the full wrapper set into `dir` — pre-push is the gate,
+ * every other name is a byte-copy of `chain` (what install.mjs does). */
+function installAllWrappers(dir: string) {
+  const src = new URL("../hooks", import.meta.url).pathname;
+  const names = readFileSync(join(src, "hook-names"), "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  for (const n of names) {
+    cpSync(join(src, n === "pre-push" ? "pre-push" : "chain"), join(dir, n));
+  }
+  return names;
+}
+
 test("release: up-to-date installed hook passes the freshness check", async () => {
   const { repo } = makeRepo();
   const { deps, tmp } = makeDeps(repo);
+  installAllWrappers(tmp);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("§17.3 (ревью PLUG-210): a missing wrapper is stale — a partial install refuses", async () => {
+  const { repo } = makeRepo();
+  const { deps, tmp } = makeDeps(repo);
+  // a pre-r26 install: real pre-push, none of the other wrappers
   cpSync(
     new URL("../hooks/pre-push", import.meta.url).pathname,
     join(tmp, "pre-push"),
   );
-  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
-  assert.equal(res.status, "auditing");
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "hook-stale" &&
+      /install\.mjs/.test((e as OrchestratorError).hint ?? ""),
+  );
 });
 
 test("machine scan: threadIds governs task-key too (§16.6)", async () => {
@@ -1127,7 +1191,7 @@ test("pump: threadIds=false — PR title is the HEAD subject, never a task key",
 test("pump: threadIds=false — repeat release reuses the first release/<sha7>", async () => {
   const { repo, remote } = makeRepo();
   const ghCalls: string[][] = [];
-  const { deps, store } = makeDeps(repo, {
+  const { deps, store, exec, bindReview } = makeDeps(repo, {
     ghCalls,
     auditVerdict: '{"verdict":"APPROVE","findings":[]}',
     releaseText: JSON.stringify({
@@ -1156,11 +1220,16 @@ test("pump: threadIds=false — repeat release reuses the first release/<sha7>",
     branch,
   );
   // A repeat release has a DIFFERENT head — the branch must stay the
-  // recorded one anyway (§16.6: one branch and one PR per task).
+  // recorded one anyway (§16.6: one branch and one PR per task). The
+  // §17.3 gate binds it as the round's reviewed result.
   writeFileSync(join(repo, "more.txt"), "more\n");
   gitR(repo, ["add", "."]);
   gitR(repo, ["commit", "-m", "feat: more"]);
   const newHead = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x", sha: newHead, commits: 2, dirty: false,
+  });
+  bindReview(newHead);
   assert.notEqual(newHead.slice(0, 7), branch.slice("release/".length));
   await round();
   const remoteTip = execFileSync(
@@ -1177,7 +1246,7 @@ test("pump: threadIds=false — repeat release reuses the first release/<sha7>",
 test("release (merged): a failing project check restores the copy (PLUG-191)", async () => {
   const { coord, workTip } = makeMergedCoordinatorCopy();
   const originalHead = gitR(coord, ["rev-parse", "HEAD"]); // work-2 tip
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
     releaseText: JSON.stringify({
       commitIdentity: "Agent <agent@x.io>",
@@ -1188,6 +1257,7 @@ test("release (merged): a failing project check restores the copy (PLUG-191)", a
     }),
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   await assert.rejects(
     runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
     (e: unknown) => /проверка проекта упала/.test((e as Error).message),
@@ -1242,10 +1312,11 @@ test("release: two parallel runs in the executor worktree — second refused", a
 
 test("release (merged): two releases of different tasks into one coordinator copy", async () => {
   const { coord, workTip } = makeMergedCoordinatorCopy();
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   // A second task whose round was also merged into the same copy.
   const exec2 = store.insert({
     taskKey: "PLUG-2",
@@ -1270,6 +1341,7 @@ test("release (merged): two releases of different tasks into one coordinator cop
   });
   store.setThreadInfo(rev2.id, "thr_rev");
   store.setStatus(rev2.id, "done");
+  bindReview(workTip, rev2.id);
   const gate = fetchGate(deps);
   const slow = runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   await gate.entered;
@@ -1288,10 +1360,11 @@ test("release (merged): lock records EMPTY head on the publish branch (PLUG-191)
   // The copy already sits on merged_into — the sync merge legitimately
   // moves its tip, so the lock must not pin a HEAD it can never match.
   gitR(coord, ["checkout", "work"]);
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
   const lock = join(gitDir, "orchestrator-merge.lock");
   const gate = fetchGate(deps);
@@ -1320,7 +1393,7 @@ test("pump: threadIds true→false — the executor branch is never published (P
   const { repo } = makeRepo();
   const ghCalls: string[][] = [];
   let threadIds = true;
-  const { deps, store } = makeDeps(repo, {
+  const { deps, store, exec, bindReview } = makeDeps(repo, {
     ghCalls,
     auditVerdict: '{"verdict":"APPROVE","findings":[]}',
   });
@@ -1341,20 +1414,27 @@ test("pump: threadIds true→false — the executor branch is never published (P
     assert.equal(s.published, 1);
   };
   await round();
-  // §16.6: only `release/…` names are recorded — under threadIds=true
-  // the published executor branch is not a reusable publish name.
+  // §17.3 (С4): the publish branch IS recorded so the repeat release
+  // reuses it — but an executor-branch name is only reusable while
+  // threadIds stays on; `releasePublishBranch` keeps yielding only
+  // `release/…` names.
   const first = store.releasesByStatuses(["published"])[0]!;
-  assert.equal(first.publish_branch, null);
-  assert.equal(store.releasePublishBranch("PLUG-1"), null);
-  // Emulate a row written by the pre-fix version — the executor branch
-  // name sitting in publish_branch must never be reused either.
-  store.updateRelease(first.id, { publishBranch: "feat-x" });
+  assert.equal(first.publish_branch, "feat-x");
+  // the reuse filter takes only `release/…` names — `feat-x` recorded
+  // while threadIds was on must never be reused (PLUG-194).
+  assert.equal(store.lastPublishBranch("PLUG-1"), "feat-x");
   // The project flips to no-ids: the next release publishes a neutral
   // release/<sha7>, not `feat-x`.
   threadIds = false;
   writeFileSync(join(repo, "more.txt"), "more\n");
   gitR(repo, ["add", "."]);
   gitR(repo, ["commit", "-m", "feat: more"]);
+  // §17.3 gate: the new round's tip is the reviewed result.
+  const tip = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x", sha: tip, commits: 2, dirty: false,
+  });
+  bindReview(tip);
   await round();
   const creates = ghCalls.filter((a) => a[0] === "pr" && a[1] === "create");
   assert.equal(creates.length, 2);
@@ -1432,7 +1512,7 @@ test("release (merged): sync=rebase never applies — merge keeps the resolution
   gitR(seed, ["add", "."]);
   gitR(seed, ["commit", "-m", "chore: more"]);
   gitR(seed, ["push", "origin", "main"]);
-  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
     coordPath: coord,
     releaseText: JSON.stringify({
       commitIdentity: "Agent <agent@x.io>",
@@ -1443,6 +1523,7 @@ test("release (merged): sync=rebase never applies — merge keeps the resolution
     }),
   });
   store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
   const subcommands: string[] = [];
   const realRun = deps.cmd.run;
   deps.cmd = {
@@ -1473,4 +1554,456 @@ test("release (merged): sync=rebase never applies — merge keeps the resolution
   );
   // The coordinator copy returned to its own branch, lock released.
   assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work-2");
+});
+
+// ── §17.3 r26: очередь, SHA-гейт ревью, PR текстом, rev-list ──────────
+
+test("§17.3 С1: only the audit dispatch goes through the delegate queue", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  let enqueued = 0;
+  deps.enqueue = async <T,>(f: () => Promise<T>) => {
+    enqueued++;
+    return f();
+  };
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  // the outer release never enqueues — exactly the one audit dispatch does
+  assert.equal(enqueued, 1);
+});
+
+test("§17.3 Б4: a review bound to a stale sha does not satisfy the gate", async () => {
+  const { repo } = makeRepo();
+  const { deps, bindReview } = makeDeps(repo);
+  // a review of an older round — not of the result being published
+  bindReview("0".repeat(40));
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      /нет ревью.*публикуемый итог/.test((e as OrchestratorError).message),
+  );
+});
+
+test("§17.3 Б4: merged — a commit outside the merged shas is unreviewed-commits", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  // a coordinator commit on `work` that no merged delegation explains
+  gitR(coord, ["checkout", "work"]);
+  writeFileSync(join(coord, "sneaky.txt"), "x\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "coord: unreviewed"]);
+  gitR(coord, ["checkout", "work-2"]);
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "unreviewed-commits",
+  );
+});
+
+test("§17.3 Б4: merged — every merged delegation needs an OK review on its merged_sha", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  // a second task's result merged into the same branch
+  gitR(coord, ["checkout", "work"]);
+  writeFileSync(join(coord, "task2.txt"), "x\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "feat: task2 result"]);
+  const sha2 = gitR(coord, ["rev-parse", "HEAD"]);
+  gitR(coord, ["checkout", "work-2"]);
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+  const exec2 = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c",
+    preset: "c",
+    provider: "p",
+  });
+  store.setThreadInfo(exec2.id, "thr_exec2");
+  store.setStatus(exec2.id, "done");
+  store.setMerged(exec2.id, { into: "work", sha: sha2 });
+  const rev2 = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+  });
+  store.setThreadInfo(rev2.id, "thr_rev2");
+  store.setStatus(rev2.id, "done");
+  // PLUG-2's review is bound to an older sha — not its merged result
+  bindReview("0".repeat(40), rev2.id);
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => /нет ревью на влитый итог/.test((e as OrchestratorError).message),
+  );
+});
+
+test("§17.3 Б1: gh pr create URL is read from plain-text stdout", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "pr", branch: "main" } },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  // the mock returns gh's real output format — a bare URL, no JSON
+  assert.equal(
+    store.releasesByStatuses(["published"])[0]!.pr_url,
+    "https://example.test/pr/7",
+  );
+});
+
+test("§17.3 С4: repeat release reuses the recorded branch and the existing PR", async () => {
+  const { repo } = makeRepo();
+  const ghCalls: string[][] = [];
+  let prs: unknown[] = [];
+  const { deps, store, exec, bindReview } = makeDeps(repo, {
+    ghCalls,
+    ghPrList: () => prs,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        threadIds: false,
+      },
+    }),
+  });
+  const round = async () => {
+    await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+    store.setStatus(
+      store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+      "done",
+    );
+    const s = await pumpReleases(deps);
+    assert.equal(s.published, 1);
+  };
+  await round();
+  const branch =
+    store.releasesByStatuses(["published"])[0]!.publish_branch!;
+  assert.match(branch, /^release\/[0-9a-f]{7}$/);
+  // GitHub now reports the PR round 1 created.
+  prs = [
+    {
+      url: "https://example.test/pr/7",
+      body: "",
+      headRefName: branch,
+      baseRefName: "main",
+    },
+  ];
+  // a new round fast-forwards from the published tip — and the gate
+  // reviews the new tip as the round's result
+  writeFileSync(join(repo, "more.txt"), "more\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const tip2 = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x", sha: tip2, commits: 2, dirty: false,
+  });
+  bindReview(tip2);
+  await round();
+  const creates = ghCalls.filter((a) => a[0] === "pr" && a[1] === "create");
+  assert.equal(creates.length, 1); // one PR per task, ever
+  const rows = store.releasesByStatuses(["published"]);
+  assert.equal(rows[1]!.publish_branch, branch);
+  assert.equal(rows[1]!.pr_url, "https://example.test/pr/7");
+});
+
+test("§17.3 С5: post-check reports commits landed outside the pushed range", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
+  let pushedSeen = false;
+  let injected = false;
+  const realRun = deps.cmd.run;
+  deps.cmd = {
+    run: async (file, args, o) => {
+      const res = await realRun(file, args, o);
+      if (file === "git" && args.includes("push")) pushedSeen = true;
+      // a foreign commit lands on origin/main between push and post-check
+      if (
+        pushedSeen &&
+        !injected &&
+        file === "git" &&
+        args.includes("fetch")
+      ) {
+        injected = true;
+        // the release push already moved main — fast-forward the seed
+        // first so the foreign commit lands ON TOP of it
+        gitR(seed, ["pull", "--ff-only", "origin", "main"]);
+        writeFileSync(join(seed, "foreign.txt"), "x\n");
+        gitR(seed, ["add", "."]);
+        gitR(seed, ["commit", "-m", "chore: foreign"]);
+        gitR(seed, ["push", "origin", "main"]);
+        await realRun("git", ["-C", repo, "fetch", "origin"], o);
+      }
+      return res;
+    },
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  assert.ok(
+    sent.some((m) => /коммиты вне release/.test(m)),
+    `expected «выложено в обход» notice, got: ${JSON.stringify(sent)}`,
+  );
+});
+
+test("§17.3 С6: allowedTrailers/allowedEmails parse and exempt matching findings", async () => {
+  const cfg = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        allowedTrailers: ["co-authored-by"],
+        allowedEmails: ["dev@gmail.com", "@corp.io"],
+      },
+    }),
+  );
+  assert.equal(cfg.errors.length, 0);
+  const p = resolveProject(cfg.config!, "x");
+  assert.deepEqual(p.allowedTrailers, ["co-authored-by"]);
+  assert.deepEqual(p.allowedEmails, ["dev@gmail.com", "@corp.io"]);
+  const bad = parseReleaseConfig(
+    JSON.stringify({ projects: { p: { allowedEmails: "x@y.z" } } }),
+  );
+  assert.ok(bad.errors.some((e) => e.path === "projects.p.allowedEmails"));
+
+  const meta = {
+    sha: "b".repeat(40),
+    authorName: "Agent",
+    authorEmail: "agent@x.io",
+    committerName: "Agent",
+    committerEmail: "agent@x.io",
+    body: "feat: x\n\nCo-Authored-By: helper <h@x.io>",
+  };
+  const base = {
+    repoPath: "/r",
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    commits: [meta],
+    added: [{ file: "f.ts", line: 1, text: "contact dev@gmail.com" }],
+    leaks: LEAKS,
+    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+  };
+  const strict = await machineScan(GL_EMPTY, base);
+  assert.ok(strict.some((f) => f.rule === "foreign-bot-trailer"));
+  assert.ok(strict.some((f) => f.rule === "personal-email"));
+  const allowed = await machineScan(GL_EMPTY, {
+    ...base,
+    allowedTrailers: ["Co-Authored-By"],
+    allowedEmails: ["dev@gmail.com"],
+  });
+  assert.ok(!allowed.some((f) => f.rule === "foreign-bot-trailer"));
+  assert.ok(!allowed.some((f) => f.rule === "personal-email"));
+  // a different personal address still blocks
+  const other = await machineScan(GL_EMPTY, {
+    ...base,
+    added: [{ file: "f.ts", line: 1, text: "other@gmail.com" }],
+    allowedEmails: ["dev@gmail.com"],
+  });
+  assert.ok(other.some((f) => f.rule === "personal-email"));
+  // a domain entry exempts any address on it
+  const dom = await machineScan(GL_EMPTY, {
+    ...base,
+    added: [{ file: "f.ts", line: 1, text: "anyone@gmail.com" }],
+    allowedEmails: ["gmail.com"],
+  });
+  assert.ok(!dom.some((f) => f.rule === "personal-email"));
+});
+
+test("§17.3 мелко5: review verdict falls back to the reviewer thread's output", async () => {
+  const { repo } = makeRepo();
+  const okCase = makeDeps(repo, {
+    comments: [], // no verdict comment on the task
+    reviewThreadOutput: 'итог ревью\n{"verdict":"OK","blockers":0}',
+  });
+  const res = await runRelease(
+    { taskKey: "PLUG-1", caller: COORD },
+    okCase.deps,
+  );
+  assert.equal(res.status, "auditing");
+
+  const badCase = makeDeps(repo, {
+    comments: [],
+    reviewThreadOutput: 'итог: {"verdict":"CHANGES","blockers":3}',
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, badCase.deps),
+    (e: unknown) => /не «OK»/.test((e as OrchestratorError).message),
+  );
+});
+
+// ── ревью PLUG-210: ретрай после отказа, гейт вершины, очередь ─────
+
+test("PLUG-210 Б1: retry after a post-sync REJECT — pipeline commits are not foreign", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict:
+      '{"verdict":"REJECT","findings":[{"file":"f.ts","line":1,"problem":"p","fix":"x"}]}',
+  });
+  // advance main so the sync step creates a merge commit — the
+  // pipeline's own work on top of the reviewed result
+  writeFileSync(join(seed, "adv.txt"), "adv\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: advance"]);
+  gitR(seed, ["push", "origin", "main"]);
+
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const afterSync = gitR(repo, ["rev-parse", "HEAD"]);
+  // the sync created a real merge commit on top of the reviewed result
+  assert.equal(
+    gitR(repo, ["rev-list", "--parents", "-n", "1", "HEAD"]).split(" ").length,
+    3,
+  );
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s1 = await pumpReleases(deps);
+  assert.equal(s1.rejected, 1);
+  // the sync merge landed in releases.pipeline_shas
+  const row = store.releasesByStatuses(["rejected"])[0]!;
+  const recorded = JSON.parse(row.pipeline_shas ?? "[]") as string[];
+  assert.ok(recorded.includes(afterSync));
+
+  // second run: review still bound to result_sha; the recorded pipeline
+  // commit on top is not foreign work — the run reaches auditing again.
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-210 Б2: executor tip above result_sha → unreviewed-commits with the sha", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  writeFileSync(join(repo, "extra.txt"), "x\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: unreviewed"]);
+  const extra = gitR(repo, ["rev-parse", "HEAD"]);
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unreviewed-commits" &&
+      (e as OrchestratorError).message.includes(extra.slice(0, 7)),
+  );
+});
+
+test("PLUG-210 Б4: merged — an OK review on the branch tip covers coordinator commits", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  // a coordinator docs commit on `work` — covered by a whole-tip review
+  gitR(coord, ["checkout", "work"]);
+  writeFileSync(join(coord, "docs-note.md"), "docs\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "docs: coordinator edits"]);
+  const tip = gitR(coord, ["rev-parse", "HEAD"]);
+  gitR(coord, ["checkout", "work-2"]);
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+  const tipRev = store.insert({
+    taskKey: "PLUG-9",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+  });
+  // the verdict comment the mock serves carries threadId "thr_rev"
+  store.setThreadInfo(tipRev.id, "thr_rev");
+  store.setStatus(tipRev.id, "done");
+  bindReview(tip, tipRev.id);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-210: merged — a merged_sha absent from the copy is a clear refusal", async () => {
+  const { coord } = makeMergedCoordinatorCopy();
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: "d".repeat(40) });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /отсутствует в копии/.test((e as OrchestratorError).message),
+  );
+});
+
+test("PLUG-210 мелко9: the audit row is inserted inside the delegate queue", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  let before: unknown;
+  let after: unknown;
+  deps.enqueue = async <T,>(f: () => Promise<T>) => {
+    // the watchdog must never observe a `dispatching` audit row before
+    // its dispatch actually ran — the insert rides inside the queue.
+    before = store.latestDelegationByTaskAndLevel(
+      "PLUG-1",
+      "release-audit",
+    );
+    const r = await f();
+    after = store.latestDelegationByTaskAndLevel(
+      "PLUG-1",
+      "release-audit",
+    );
+    return r;
+  };
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(before, undefined);
+  assert.ok(after);
+});
+
+test("PLUG-210 мелко: continuePoint picks by ancestry, not timestamps", async () => {
+  const { store } = makeDeps("/tmp/x");
+  const r = store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "p",
+    coordinatorThreadId: "t",
+    repoPath: "/r",
+    branch: "b",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  store.updateRelease(r.id, {
+    status: "published",
+    publishedSha: "e".repeat(40),
+  });
+  // result_sha is NOT an ancestor of the published tip → the new round
+  // continues from the result, not from an unrelated published sha.
+  assert.equal(
+    await store.continuePoint("PLUG-1", async () => false),
+    "f".repeat(40),
+  );
+  // the published tip CONTAINS the result → continue from it
+  // (it carries the sync merge + docs trailer).
+  assert.equal(
+    await store.continuePoint("PLUG-1", async () => true),
+    "e".repeat(40),
+  );
 });

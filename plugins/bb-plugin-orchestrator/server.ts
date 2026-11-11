@@ -8,6 +8,7 @@
  */
 import { z } from "zod";
 import { join as joinPath } from "node:path";
+import { homedir } from "node:os";
 import {
   defineRpcContract,
   type BbPluginApi,
@@ -484,6 +485,7 @@ export async function createPlugin(
         loadPolicy: () => loadPolicy(true),
         probes,
         gitInstructions: () => currentSettings.gitInstructions,
+        cmd,
       });
     });
 
@@ -524,7 +526,11 @@ export async function createPlugin(
         bb.pluginId,
       );
     } catch {
-      return "/tmp/bb-orchestrator";
+      // §17.3 (мелко 9): the token dir must be ONE path the plugin and
+      // hooks/install.mjs both know — the installer's default
+      // `~/.bb/plugins/orchestrator`, never a per-boot /tmp a reinstalled
+      // hook would not find tokens in.
+      return joinPath(homedir(), ".bb", "plugins", "orchestrator");
     }
   };
   const releaseDeps = {
@@ -535,6 +541,8 @@ export async function createPlugin(
       get: (a: { threadId: string }) =>
         bb.sdk.threads.get(a) as never,
       send: (a: never) => bb.sdk.threads.send(a) as never,
+      output: (a: { threadId: string }) =>
+        bb.sdk.threads.output(a) as never,
       events: {
         list: (a: never) => bb.sdk.threads.events.list(a) as never,
       },
@@ -545,6 +553,9 @@ export async function createPlugin(
     probes,
     hooksDir: () => joinPath(pluginDataDir(), "git-hooks"),
     packetDir: () => joinPath(pluginDataDir(), "release-audit"),
+    // §17.3 (С1): only the release-auditor dispatch goes through the
+    // delegate queue — the outer release flow runs outside it.
+    enqueue,
     log: bb.log,
   };
   const pumpRelease = () =>
@@ -1166,7 +1177,8 @@ export async function createPlugin(
           argv[i - 1] !== "--route" && argv[i - 1] !== "--preset" &&
           argv[i - 1] !== "--instructions" &&
           argv[i - 1] !== "--coordinator" && argv[i - 1] !== "--from" &&
-          argv[i - 1] !== "--into",
+          argv[i - 1] !== "--into" && argv[i - 1] !== "--no-docs" &&
+          argv[i - 1] !== "--kb" && argv[i - 1] !== "--no-kb",
       );
       const cmd = positional[0];
 
@@ -1419,17 +1431,19 @@ export async function createPlugin(
             );
           }
           const caller = await callerFacts(ctx.threadId);
-          const res = await enqueue(() =>
-            runRelease(
-              {
-                taskKey: key,
-                caller,
-                noDocs: flag("--no-docs"),
-                kb: flag("--kb"),
-                noKb: flag("--no-kb"),
-              },
-              releaseDeps,
-            ),
+          // §17.3 (С1): release runs OUTSIDE the delegate queue — only
+          // the release-auditor dispatch inside it is enqueued. A queued
+          // release that internally dispatches would deadlock waiting
+          // for its own queue slot.
+          const res = await runRelease(
+            {
+              taskKey: key,
+              caller,
+              noDocs: flag("--no-docs"),
+              kb: flag("--kb"),
+              noKb: flag("--no-kb"),
+            },
+            releaseDeps,
           );
           return json
             ? jsonOk(res)
