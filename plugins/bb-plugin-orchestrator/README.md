@@ -115,6 +115,20 @@ watchdog — it would risk a double reissue.
   playbook, §3) and `orchestrator-setup` (§2.1) ship in `skills/` —
   setup always, coordinator only when `injectInstructions` is on.
 
+## Ограничения
+
+- **Исполнители на другой машине не поддержаны.** Итог захода
+  (`result_sha`, `result_commits`, `result_dirty`), `merge` и спасение
+  грязной копии читают worktree локальным `git -C` — среда исполнителя
+  должна жить на том же хосте, что и сервер bb с плагином.
+- **Без `/proc` уборщик ничего не удаляет.** Проверка «в копии нет
+  живого процесса» (§15 п.5) читает `/proc/<pid>/cwd`; на системе без
+  `/proc` (например macOS) каждая копия остаётся `process-unknown` —
+  прогоны работают, но ничего не снимается.
+- **Git ≥ 2.39.** Ниже — `patch-id --verbatim` не существует: уборщик
+  отказывает прогон, а `merge --dry-run` — с подсказкой обновить git
+  (`merge-tree --write-tree` — с 2.38).
+
 ## Development
 
 ```
