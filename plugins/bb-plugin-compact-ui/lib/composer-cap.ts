@@ -105,37 +105,36 @@ export function enforce(form: Element, win: Window, retry = true): void {
       /* Exact height of the first min(N,3) rows including inter-row gaps —
          measured, not multiplied. The scroll element carries its own vertical
          padding (host: pt-1 pb-3); omitting it clips the last visible row. */
+      /* Rows (the inline editor in particular) stretch to whatever
+         viewport they are granted — height:100%/flex children resolve
+         against the scroll's used height, which our own inline max-height
+         just set. Measuring in that state feeds the grant back into
+         itself and the surplus renders as dead space inside the row.
+         So clear OUR max-height grants on the scroll and frame first,
+         force one synchronous reflow, measure the now-natural content,
+         and restore — all inside the same task, so nothing paints the
+         unclamped state. scrollHeight then equals intrinsic content
+         (padding included) for short queues; for long ones we measure
+         the first-three-rows span off equally natural rects. */
+      const savedQueueMax = queue.style.maxHeight;
+      const savedFrameMax = frame ? frame.style.maxHeight : null;
+      queue.style.maxHeight = 'none';
+      if (frame) frame.style.maxHeight = 'none';
       const k = Math.min(rows.length, MAX_QUEUE_ROWS);
-      /* Row height must be its NATURAL content, not the rect: the inline
-         editor row stretches to whatever viewport it is granted, so
-         measuring its rect feeds the grant back into itself — the surplus
-         renders as dead space inside the row (below the editor controls).
-         Intrinsic = last-child bottom − first-child top + the row's own
-         vertical padding; fall back to the rect for empty rows. */
-      const rowH = (li: Element) => {
-        const kids = li.children;
-        if (!kids.length) return li.getBoundingClientRect().height;
-        const r = li.getBoundingClientRect();
-        const span = kids[kids.length - 1].getBoundingClientRect().bottom -
-          kids[0].getBoundingClientRect().top + padY(li);
-        return Math.min(r.height || span, Math.max(1, span));
-      };
-      /* For up-to-three rows the scroll's own content height is the exact
-         bound (padding included); beyond three, measure the first-k span. */
-      let content = padY(queue) + padY(rows[0].parentElement ?? queue);
-      for (let i = 0; i < k; i++) content += rowH(rows[i]);
-      /* Inter-row gaps ride on the ul's spacing — keep them by measuring
-         real tops where available; stretched rows report top offsets that
-         still reflect the flex layout. */
-      for (let i = 1; i < k; i++) {
-        const gap = rows[i].getBoundingClientRect().top - rows[i - 1].getBoundingClientRect().top - rowH(rows[i - 1]);
-        if (gap > 0) content += gap;
-      }
-      const measured = Math.ceil(content);
-      /* scrollHeight is NOT a safe upper bound here: a stretched inline-
-         editor row inflates it the same way as its rect — the grant then
-         feeds itself. The measured intrinsic span already includes the
-         scroll's and the list's vertical padding. */
+      const rowSpan = rows[k - 1].getBoundingClientRect().bottom -
+        rows[0].getBoundingClientRect().top +
+        padY(queue) +
+        padY(rows[0].parentElement ?? queue);
+      /* Short queue: scrollHeight is the exact intrinsic content height;
+         keep the row span as a floor for environments where scrollHeight
+         is not laid out (tests) or under-reports during transitions. */
+      const measured = Math.ceil(
+        rows.length <= MAX_QUEUE_ROWS
+          ? Math.max(queue.scrollHeight, rowSpan)
+          : rowSpan,
+      );
+      queue.style.maxHeight = savedQueueMax;
+      if (frame) frame.style.maxHeight = savedFrameMax as string;
       const queueMax = measured;
       const roomBefore = queue.getBoundingClientRect().height;
       const qMax = `${queueMax}px`;
