@@ -16,6 +16,7 @@
 import { OrchestratorError } from "./errors.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
+  quotaGroupForProvider,
   quotaGroupOf,
   type PolicyLoad,
   type PolicyRoute,
@@ -260,12 +261,20 @@ export function createWatchdog(deps: WatchdogDeps) {
   const routeInfo = async (row: DelegationRow) => {
     const load = await deps.loadPolicy();
     const route = load.policy?.routes[row.route];
+    // §2.3 r24: a `preset:` one-off is not in the policy routes — its
+    // quota group is the same-provider policy route's group, else the
+    // provider name, so a quota burn holds the provider's routes too.
+    const quotaGroup = route
+      ? quotaGroupOf(route, row.route)
+      : row.route.startsWith("preset:")
+        ? quotaGroupForProvider(load.policy, row.provider)
+        : row.route;
     return {
       load,
       policy: load.policy,
       level: load.policy?.levels[row.level],
       route,
-      quotaGroup: route ? quotaGroupOf(route, row.route) : row.route,
+      quotaGroup,
       patterns: [...BUILTIN_QUOTA_PATTERNS, ...(route?.quotaPatterns ?? [])],
       unavailablePatterns: [
         ...BUILTIN_UNAVAILABLE_PATTERNS,
@@ -397,8 +406,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     let nextName: string | undefined;
     let nextRoute: PolicyRoute | undefined;
     if (info.level?.autoFallback && info.policy) {
-      // §5.4 rev 13: the next available route AFTER the current one in the
-      // chain; only routes an auto-reissue already used are excluded
+      // §5.4 rev 13 + §16.8: for a route in the chain the candidates are
+      // the routes AFTER the current one; for an explicit --route/--preset
+      // outside the chain (`idx === -1`) reissue starts from the chain's
+      // beginning. Only routes an auto-reissue already used are excluded
       // (`reissue_of IS NOT NULL`), manual delegations do not count.
       const used = store.routesUsedByTask(row.task_key);
       const held = store.heldGroups(now());

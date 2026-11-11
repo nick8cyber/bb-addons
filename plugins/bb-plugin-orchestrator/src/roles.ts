@@ -15,6 +15,7 @@ import type {
   MessageDispatchHookContext,
   MessageDispatchHookDecision,
 } from "@get-bb/plugin-sdk";
+import { levelRole, type Policy } from "./policy.js";
 
 /** §3 budget: one role instruction ≤ 2500 chars (role + rule ≤ 4096). */
 export const ROLE_INSTRUCTIONS_MAX = 2500;
@@ -60,6 +61,7 @@ const ORCHESTRATOR_INSTRUCTIONS = `Ты — оркестратор. Твоя р�
 - Результат исполнителя проверяй сам, прежде чем сводить и отчитываться.
 - Ревью спек до раздачи и результата после — на уровне review (роль auditor).
 - Сведение и выкладка результата — только твоя зона: исполнители сдают работу тебе.
+- Хендофф: веди файл HANDOFF.md в хранилище своего треда ($BB_THREAD_STORAGE/HANDOFF.md) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше; со ссылками на треды исполнителей и их задачи. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.
 - Доработку раздавай новым delegate той же задачи: плагин сам продолжит работу с коммита прошлого захода (--from <sha|ветка> — своя точка, --fresh — заново).
 - Ветку и рабочую копию исполнителя не открывай в других копиях: итог захода снимает плагин.
 - Свои поллеры поверх сторожа не ставь: исходы (зависание, квота, падение, перевыпуск) приходят сообщениями [orchestrator].
@@ -70,7 +72,8 @@ const EXECUTOR_INSTRUCTIONS = `Ты — исполнитель. Твоя рол�
 - Задачу делаешь ты: субагентов не запускай и работу не перераздавай.
 - Делай строго по спеке задачи; расхождение со спекой — вопрос координатору, а не самодеятельность.
 - Правила работы с git — раздел «Работа с git» в инструкциях задачи.
-- Отчёт — по контракту из описания задачи.`;
+- Отчёт — по контракту из описания задачи.
+- Хендофф: веди файл HANDOFF.md в хранилище своего треда ($BB_THREAD_STORAGE/HANDOFF.md) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.`;
 
 const RELEASE_AUDITOR_INSTRUCTIONS = `Ты — проверяющий агент выкладки (release-auditor). Твоя роль — только читать и проверять выпуск перед публикацией, ничего не меняя.
 
@@ -90,7 +93,7 @@ const AUDITOR_INSTRUCTIONS = `Ты — аудитор. Твоя роль — т�
 - Проверяй по контракту: спека и ADR — источник истины, код сверяй с ними.
 - Формат находок: место (файл:строки) → проблема → исправление. Без находок — явный вердикт «замечаний нет».
 - Разделяй факты и оценки; сомнительное помечай, а не выдавай за факт.
-- Отчёт — вердиктом текстом: ОК или список находок; изменений в репозитории быть не должно.`;
+- Отчёт — список находок или «замечаний нет»; изменений в репозитории быть не должно. Заканчивай отчёт строкой JSON {"verdict":"OK"|"CHANGES","blockers":<число блокирующих находок>} — её читает конвейер выкладки.`;
 
 export const ROLES: Record<RoleId, RoleDefinition> = {
   orchestrator: {
@@ -131,16 +134,20 @@ export const isRoleId = (value: unknown): value is RoleId =>
   typeof value === "string" && (ROLE_IDS as readonly string[]).includes(value);
 
 /**
- * §4 step 4 + §13.2 + §13.1 rev 20: a delegated thread's role from the
- * dispatch level — `review` maps to `auditor`, `release-audit` (the
- * release pipeline's checking agent) to `release-auditor`, every other
- * level to `executor`.
+ * §4 step 4 + §13.2 + §2.3: a delegated thread's role from the dispatch
+ * level — `release-audit` (the release pipeline's checking agent) maps to
+ * `release-auditor`, a level with role `auditor` (or the historical bare
+ * `review`) to `auditor`, every other level to `executor`. Without the
+ * policy (tests, missing level) the name rule applies.
  */
-export const roleForLevel = (level: string): RoleId =>
-  level === "review"
-    ? "auditor"
-    : level === "release-audit"
-      ? "release-auditor"
+export const roleForLevel = (
+  level: string,
+  policy?: Policy | null,
+): RoleId =>
+  level === "release-audit"
+    ? "release-auditor"
+    : levelRole(policy, level) === "auditor"
+      ? "auditor"
       : "executor";
 
 /** Dispatch titles carry the task key from birth: `<KEY> · <title>`. */
@@ -174,6 +181,13 @@ export interface RoleDecisionProbes {
   threadRole(threadId: string): { role: string } | undefined;
   pendingRole(projectId: string): string | undefined;
   activeDelegationByTaskKey(taskKey: string): { level: string } | undefined;
+  /**
+   * The live parsed policy (in-memory, sync — the hook may not call out).
+   * Drives the §2.3 level→role map; `null` while the policy is invalid
+   * (§16.7: a root chat then gets no role — only the setup skill).
+   * Absent probe = behave as before (valid, name-based role mapping).
+   */
+  policy?(): Policy | null;
 }
 
 /**
@@ -194,7 +208,7 @@ export function decideRole(
   if (facts.originPluginId === "tasks") {
     const key = taskKeyFromTitle(facts.title);
     const row = key ? probes.activeDelegationByTaskKey(key) : undefined;
-    return row ? roleForLevel(row.level) : "executor";
+    return row ? roleForLevel(row.level, probes.policy?.()) : "executor";
   }
   // 2. A side chat / session handoff inherits the source thread's role;
   //    no recorded source role — keep walking the rule.
@@ -205,14 +219,17 @@ export function decideRole(
   // 3. Any other child thread executes.
   if (facts.parentThreadId) return "executor";
   // 4. A chat from the new-thread window takes the project's current pick.
+  //    §16.7: while the policy is invalid the DEFAULT is no role — an
+  //    explicit pick still applies, the setup skill alone is issued.
+  const policyOk =
+    probes.policy === undefined || probes.policy() !== null;
   if (facts.origin === "app") {
     const pending = probes.pendingRole(facts.projectId);
-    return pending !== undefined && isRoleId(pending)
-      ? pending
-      : DEFAULT_ROLE;
+    if (pending !== undefined && isRoleId(pending)) return pending;
+    return policyOk ? DEFAULT_ROLE : null;
   }
   // 5. cli / plugin / sdk / automations.
-  return DEFAULT_ROLE;
+  return policyOk ? DEFAULT_ROLE : null;
 }
 
 /**

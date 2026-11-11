@@ -10,10 +10,12 @@ import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
   decideRole,
   handleMessageDispatch,
+  roleForLevel,
   ROLE_INSTRUCTIONS_MAX,
   ROLES,
   type RoleDecisionProbes,
 } from "../src/roles.js";
+import { parsePolicy } from "../src/policy.js";
 import { buildAgentConfiguration } from "../src/agent-config.js";
 import { pendingRoleRpc } from "../server.js";
 
@@ -481,4 +483,80 @@ test("role instructions carry no site process rules (PLUG-148)", () => {
   // the executor text points at the task's own contract instead
   assert.match(ROLES.executor.instructions, /Работа с git/);
   assert.match(ROLES.executor.instructions, /контракту из описания задачи/);
+});
+
+
+// ── §2.3 r24 / §16.7 r25: policy-aware roles, verdict + handoff text ──
+
+test("§2.3 roleForLevel: policy-aware — auditor levels map to auditor", () => {
+  const policy = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: {
+        "review-mid": { role: "auditor", chain: ["r"] },
+        exec: { chain: ["r"] },
+      },
+      routes: { r: { preset: "p", provider: "x" } },
+    }),
+  ).policy;
+  assert.equal(roleForLevel("review-mid", policy), "auditor");
+  assert.equal(roleForLevel("exec", policy), "executor");
+  assert.equal(roleForLevel("release-audit", policy), "release-auditor");
+  // Without the policy the historical name rule applies.
+  assert.equal(roleForLevel("review"), "auditor");
+  assert.equal(roleForLevel("review-mid"), "executor");
+});
+
+test("§16.7: invalid policy → root chat default is no role; pick still applies", () => {
+  const badPolicy: RoleDecisionProbes = { ...noProbes, policy: () => null };
+  assert.equal(decideRole(facts({ origin: "app" }), badPolicy), null);
+  assert.equal(decideRole(facts({ origin: "cli" }), badPolicy), null);
+  // An explicit pending pick still wins.
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...badPolicy,
+      pendingRole: (p) => (p === "proj_a" ? "executor" : undefined),
+    }),
+    "executor",
+  );
+  // Valid policy → defaults back to orchestrator.
+  const good = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: { simple: { chain: ["s"] } },
+      routes: { s: { preset: "p", provider: "x" } },
+    }),
+  ).policy;
+  assert.equal(
+    decideRole(facts({ origin: "app" }), { ...noProbes, policy: () => good }),
+    "orchestrator",
+  );
+  // tasks origin keeps its mapping under an invalid policy.
+  assert.equal(
+    decideRole(
+      facts({ originPluginId: "tasks", title: "PLUG-9 · do x" }),
+      badPolicy,
+    ),
+    "executor",
+  );
+});
+
+test("§16.7 auditor instructions demand the JSON verdict; §13.1 handoff on doers", () => {
+  const auditor = ROLES.auditor.instructions;
+  assert.match(auditor, /\{"verdict":"OK"\|"CHANGES","blockers"/);
+  assert.ok(!auditor.includes("HANDOFF"), "auditor keeps no handoff file");
+  assert.ok(
+    !ROLES["release-auditor"].instructions.includes("HANDOFF"),
+    "release-auditor keeps no handoff file",
+  );
+  for (const id of ["orchestrator", "executor"] as const) {
+    const text = ROLES[id].instructions;
+    assert.match(text, /HANDOFF\.md/, `${id} handoff rule`);
+    assert.match(text, /\$BB_THREAD_STORAGE/, `${id} storage path`);
+    assert.match(
+      text,
+      /~\/\.cache\/bb-handoff/,
+      `${id} fallback path when no storage`,
+    );
+  }
 });

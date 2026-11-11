@@ -21,7 +21,10 @@ import {
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
   pickRoute,
+  quotaGroupForProvider,
+  type Policy,
   type PolicyLoad,
+  type PolicyRoute,
 } from "./policy.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
@@ -37,6 +40,9 @@ export interface DelegateParams {
   taskKey: string;
   level: string;
   route?: string;
+  /** §2.3: a one-off existing preset, dispatched outside the policy
+   * routes. Mutually exclusive with `route`. */
+  preset?: string;
   instructions?: string;
   /** §6 `--from`: continue this round from an explicit sha/branch. */
   from?: string;
@@ -52,6 +58,9 @@ export interface DelegateResult {
   threadId: string | null;
   level: string;
   route: string;
+  /** §2.3 reviewByLevel note, e.g. «review → review-medium по сложности
+   * исполнения medium». */
+  note?: string;
   /** `cancelled` when the delegation was cancelled while dispatch ran. */
   status: "running" | "cancelled";
   setupErrors: SetupError[];
@@ -100,6 +109,8 @@ export interface DispatchStepsDeps {
   threads: DelegateDeps["threads"];
   dispatchTimeoutMs?: number;
   gitInstructions?: DelegateDeps["gitInstructions"];
+  /** §2.3 r24: parsed policy for the level→role map; absent = name rule. */
+  policy?: () => Policy | null;
 }
 
 export interface DispatchStepsResult {
@@ -164,12 +175,85 @@ export async function runDelegate(
     );
   }
 
+  // §2.3: --route and --preset pick different kinds of destinations —
+  // together the call is ambiguous.
+  if (params.route && params.preset) {
+    throw new OrchestratorError(
+      "incompatible-flags",
+      "--route and --preset cannot be combined",
+      "--route names a policy route; --preset dispatches a one-off existing preset",
+    );
+  }
+
+  // §2.3 reviewByLevel: bare `--level review` resolves to the auditor
+  // level mapped from the latest executor delegation's complexity —
+  // explicit levels, --route and --preset keep the caller's choice.
+  let level = params.level;
+  let levelNote: string | undefined;
+  if (
+    level === "review" &&
+    policy.reviewByLevel &&
+    !params.route &&
+    !params.preset
+  ) {
+    const latestExec = store
+      .delegationsByTask(taskKey)
+      .find((r) => policy.reviewByLevel![r.level] !== undefined);
+    if (latestExec) {
+      const mapped = policy.reviewByLevel[latestExec.level]!;
+      levelNote =
+        `review → ${mapped} по сложности исполнения ${latestExec.level}`;
+      level = mapped;
+    }
+  }
+
   const held = store.heldGroups(Date.now());
-  const { name: routeName, route } = pickRoute(policy, params.level, {
-    requested: params.route,
-    unavailableRoutes: new Set(load.unavailableRoutes),
-    heldGroups: held,
-  });
+  let routeName: string;
+  let route: PolicyRoute;
+  if (params.preset) {
+    // §2.3: a one-off preset dispatches outside the policy routes —
+    // provider comes from the preset itself, and its quota group is the
+    // first policy route's group on the same provider (else the provider
+    // name), so a burned preset closes its same-provider routes too.
+    const show = await runJson<{ preset?: { providerId?: string } }>(
+      bbCli,
+      ["tasks", "preset", "show", params.preset, "--json"],
+    ).catch((e) => {
+      throw new OrchestratorError(
+        "unknown-preset",
+        `preset "${params.preset}": ${message(e)}`,
+      );
+    });
+    const provider = show.preset?.providerId;
+    if (!provider) {
+      throw new OrchestratorError(
+        "unknown-preset",
+        `preset "${params.preset}" has no providerId in bb tasks preset show`,
+      );
+    }
+    routeName = `preset:${params.preset}`;
+    route = {
+      preset: params.preset,
+      provider,
+      quotaGroup: quotaGroupForProvider(policy, provider),
+    };
+    const group = route.quotaGroup!;
+    if (held.has(group) || held.has(routeName)) {
+      throw new OrchestratorError(
+        "route-held",
+        `provider quota group "${group}" is on hold`,
+        "wait for the hold to expire or pick a preset on another provider",
+      );
+    }
+  } else {
+    const picked = pickRoute(policy, level, {
+      requested: params.route,
+      unavailableRoutes: new Set(load.unavailableRoutes),
+      heldGroups: held,
+    });
+    routeName = picked.name;
+    route = picked.route;
+  }
 
   // Limits (§4 step 1) — over the limit is a refusal, not a queue (§10).
   const maxActive = policy.limits?.maxActive;
@@ -183,9 +267,9 @@ export async function runDelegate(
       );
     }
   }
-  const perLevel = policy.limits?.perLevel?.[params.level];
+  const perLevel = policy.limits?.perLevel?.[level];
   if (perLevel !== undefined) {
-    const count = store.activeCountByLevel(params.level);
+    const count = store.activeCountByLevel(level);
     if (count >= perLevel) {
       throw new OrchestratorError(
         "limit-exceeded",
@@ -219,7 +303,7 @@ export async function runDelegate(
       taskKey,
       projectId: params.caller.projectId,
       coordinatorThreadId: params.caller.threadId,
-      level: params.level,
+      level,
       route: routeName,
       preset: route.preset,
       provider: route.provider,
@@ -244,7 +328,11 @@ export async function runDelegate(
   // function dispatches, attaches, finalizes and reports.
   let res: DispatchStepsResult;
   try {
-    res = await dispatchToRoute(row, { instructions: params.instructions }, deps);
+    res = await dispatchToRoute(
+      row,
+      { instructions: params.instructions, levelNote },
+      { ...deps, policy: () => policy },
+    );
   } catch (e) {
     // §5.3 rev 19: a synchronous refusal naming a removed model puts the
     // ROUTE on hold so the next dispatch skips it (the reissue path holds
@@ -276,8 +364,9 @@ export async function runDelegate(
     delegationId: row.id,
     taskKey: row.task_key,
     threadId: res.threadId,
-    level: params.level,
+    level,
     route: routeName,
+    note: levelNote,
     status: res.status,
     setupErrors: res.setupErrors,
   };
@@ -297,6 +386,8 @@ export async function dispatchToRoute(
   row: DelegationRow,
   opts: {
     instructions?: string;
+    /** §2.3 reviewByLevel: replaces «уровень X» in the «Раздано» comment. */
+    levelNote?: string;
     /**
      * What an explicit dispatch refusal does to the record. Default
      * `remove` (§4 step 3); `fail` marks it `failed` instead — the §7
@@ -321,7 +412,7 @@ export async function dispatchToRoute(
     deps.gitInstructions?.(),
     opts.instructions,
     row.continue_from
-      ? roleForLevel(row.level) === "auditor"
+      ? roleForLevel(row.level, deps.policy?.()) === "auditor"
         ? reviewRoundLine(row.continue_from, resultRef?.branch, resultRef?.round)
         : roundSection(row.round, row.continue_from, resultRef?.branch)
       : undefined,
@@ -369,7 +460,9 @@ export async function dispatchToRoute(
   store.setThreadInfo(row.id, threadId, dispatch.task?.id);
   const linked = store.get(row.id) ?? row;
 
-  const done = await finishDispatchSteps(linked, deps);
+  const done = await finishDispatchSteps(linked, deps, {
+    levelNote: opts.levelNote,
+  });
   return { threadId, status: done.status, setupErrors: done.setupErrors };
 }
 
@@ -383,6 +476,7 @@ export async function dispatchToRoute(
 export async function finishDispatchSteps(
   row: DelegationRow,
   deps: DispatchStepsDeps,
+  opts: { levelNote?: string } = {},
 ): Promise<{ status: "running" | "cancelled"; setupErrors: SetupError[] }> {
   const { store, bbCli } = deps;
   const threadId = row.thread_id;
@@ -422,12 +516,13 @@ export async function finishDispatchSteps(
     noteError("parent-notifications", e);
   }
 
-  // §4 step 4 / §13.2: record the executor's role — `review` level maps to
-  // `auditor`, everything else to `executor`. The upsert corrects a role
-  // the hook may already have guessed from the title alone; a corrected
-  // role applies from the next session build. Display metadata mirrors it
+  // §4 step 4 / §13.2 + §2.3: record the executor's role — auditor levels
+  // (policy `role` or the historical `review`) map to `auditor`,
+  // everything else to `executor`. The upsert corrects a role the hook
+  // may already have guessed from the title alone; a corrected role
+  // applies from the next session build. Display metadata mirrors it
   // (§13.2 п.4) — `thread_roles` stays the source of truth.
-  const role = roleForLevel(row.level);
+  const role = roleForLevel(row.level, deps.policy?.());
   try {
     store.setThreadRole(threadId, role, "delegate");
   } catch (e) {
@@ -472,7 +567,7 @@ export async function finishDispatchSteps(
       "comment",
       row.task_key,
       "--body",
-      `Раздано: уровень ${row.level}, маршрут ${row.route}, тред ${threadId}`,
+      `Раздано: ${opts.levelNote ?? `уровень ${row.level}`}, маршрут ${row.route}, тред ${threadId}`,
     ]);
   } catch (e) {
     noteError("comment", e);
@@ -629,14 +724,18 @@ export async function retrySetupSteps(
   }
   if (recorded.has("thread-role")) {
     await attempt("thread-role", async () => {
-      store.setThreadRole(threadId, roleForLevel(row.level), "delegate");
+      store.setThreadRole(
+        threadId,
+        roleForLevel(row.level, deps.policy?.()),
+        "delegate",
+      );
     });
   }
   if (recorded.has("role-metadata") && deps.threads.updatePluginMetadata) {
     await attempt("role-metadata", () =>
       deps.threads.updatePluginMetadata!({
         threadId,
-        set: { role: roleForLevel(row.level) },
+        set: { role: roleForLevel(row.level, deps.policy?.()) },
       }),
     );
   }

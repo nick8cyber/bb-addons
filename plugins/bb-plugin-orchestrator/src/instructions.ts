@@ -4,13 +4,14 @@
  * pointer to the `orchestrator-coordinator` skill. Printed by
  * `bb orchestrator instructions` and injected into coordinator threads.
  */
-import type { Policy } from "./policy.js";
+import { levelRole, type Policy } from "./policy.js";
 
 export const ROUTING_RULE_MAX = 1500;
 
 const HEADER =
   "Раздача работы исполнителям — только через `bb orchestrator delegate <KEY> --level <уровень>` " +
-  "(инструмент orchestrator_delegate). Полный порядок — навык `orchestrator-coordinator`. " +
+  "(инструмент orchestrator_delegate). `--route` — любой маршрут политики, `--preset` — разовый пресет вне неё. " +
+  "Полный порядок — навык `orchestrator-coordinator`. " +
   "Отчёт исполнителя придёт сообщением — не жди его в форграунде.";
 
 const FOOTER =
@@ -35,13 +36,36 @@ function sanitize(text: string): string {
     .trim();
 }
 
-function levelLine(name: string, description?: string): string {
+function levelLine(
+  name: string,
+  description: string | undefined,
+  policy: Policy,
+): string {
   const cleanName = sanitize(name) || "level";
   const desc = description ? sanitize(description) : "";
   // orchestrator §2 rev 20: the pipeline's own level — coordinators
-  // never delegate to it, `release` launches it.
-  const tag = cleanName === "release-audit" ? " (только конвейер release, не раздавать)" : "";
+  // never delegate to it, `release` launches it. §2.3: auditor levels
+  // check instead of doing.
+  const tag =
+    cleanName === "release-audit"
+      ? " (только конвейер release, не раздавать)"
+      : levelRole(policy, name) === "auditor"
+        ? " (проверка — только чтение)"
+        : "";
   return `- ${cleanName}${desc ? ` — ${desc}` : ""}${tag}`;
+}
+
+/** §2.3: one line naming the reviewByLevel map, when configured. */
+function reviewByLevelLine(policy: Policy): string | null {
+  const map = policy.reviewByLevel;
+  if (!map || Object.keys(map).length === 0) return null;
+  const pairs = Object.entries(map).map(
+    ([exec, review]) => `${exec} → ${review}`,
+  );
+  return (
+    `Ревью по сложности исполнения: ${pairs.join("; ")} ` +
+    "— `delegate --level review` выберет уровень сам."
+  );
 }
 
 function limitsLine(policy: Policy): string | null {
@@ -59,6 +83,7 @@ function limitsLine(policy: Policy): string | null {
 
 export function generateRoutingRule(policy: Policy): string {
   const limits = limitsLine(policy);
+  const reviewLine = reviewByLevelLine(policy);
   const build = (line: (name: string, desc?: string) => string) =>
     [
       HEADER,
@@ -68,11 +93,12 @@ export function generateRoutingRule(policy: Policy): string {
         line(name, l.description),
       ),
       ...(limits ? ["", limits] : []),
+      ...(reviewLine ? ["", reviewLine] : []),
       "",
       FOOTER,
     ].join("\n");
 
-  let text = build(levelLine);
+  let text = build((name, desc) => levelLine(name, desc, policy));
   if (text.length <= ROUTING_RULE_MAX) return text;
   // Long descriptions: keep the shape, shrink each description.
   const budgetPerLevel = Math.max(
@@ -86,6 +112,7 @@ export function generateRoutingRule(policy: Policy): string {
       desc && desc.length > budgetPerLevel
         ? `${desc.slice(0, budgetPerLevel - 1)}…`
         : desc,
+      policy,
     ),
   );
   if (text.length <= ROUTING_RULE_MAX) return text;

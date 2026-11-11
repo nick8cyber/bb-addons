@@ -117,6 +117,12 @@ export interface AgentConfigDeps {
   instructionsText: string;
   probes: ExecutorProbes;
   now?: () => number;
+  /**
+   * §16.7 r25: while the policy is invalid a role-less root thread gets
+   * ONLY the setup skill — no coordinator tools or routing text (the
+   * orchestrator does not work anyway). `undefined` = treated as valid.
+   */
+  policyOk?: boolean;
 }
 
 export function buildAgentConfiguration(
@@ -150,6 +156,11 @@ export function buildAgentConfiguration(
     };
     if (deps.injectInstructions) config.instructions = role.instructions;
     return config;
+  }
+
+  // §16.7 r25: policy invalid + no decided role → setup skill only.
+  if (deps.policyOk === false && roleId === undefined) {
+    return { tools: [], skills: [SKILL_SETUP] };
   }
 
   const config: PluginAgentConfiguration = {
