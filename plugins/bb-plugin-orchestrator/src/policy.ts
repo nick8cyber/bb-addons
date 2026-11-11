@@ -17,6 +17,10 @@ export interface PolicyRoute {
   unavailablePatterns?: string[];
   /** §2 rule 4: per-route first-response window, overrides the global one. */
   firstResponseSeconds?: number;
+  /** §16.5: no turn for this long → one coordinator message (default 600). */
+  startSeconds?: number;
+  /** §16.5: response silence this long → one coordinator message (default 1800). */
+  idleSeconds?: number;
 }
 
 /** §2.3: what a level's delegation does — executes or only checks. */
@@ -169,6 +173,26 @@ export function parsePolicy(
           routeFirst = v;
         }
       }
+      // §16.5, per route: the stall notices — `startSeconds` (no turn
+      // began) and `idleSeconds` (response silence) — one message each.
+      let routeStart: number | undefined;
+      if (value.startSeconds !== undefined) {
+        const v = value.startSeconds;
+        if (typeof v !== "number" || v < 30) {
+          err(`${path}.startSeconds`, "must be a number ≥ 30");
+        } else {
+          routeStart = v;
+        }
+      }
+      let routeIdle: number | undefined;
+      if (value.idleSeconds !== undefined) {
+        const v = value.idleSeconds;
+        if (typeof v !== "number" || v < 60) {
+          err(`${path}.idleSeconds`, "must be a number ≥ 60");
+        } else {
+          routeIdle = v;
+        }
+      }
       if (isNonEmptyString(value.preset) && isNonEmptyString(value.provider)) {
         routes[name] = {
           preset: value.preset,
@@ -181,6 +205,8 @@ export function parsePolicy(
           ...(routeFirst !== undefined
             ? { firstResponseSeconds: routeFirst }
             : {}),
+          ...(routeStart !== undefined ? { startSeconds: routeStart } : {}),
+          ...(routeIdle !== undefined ? { idleSeconds: routeIdle } : {}),
         };
       }
     }

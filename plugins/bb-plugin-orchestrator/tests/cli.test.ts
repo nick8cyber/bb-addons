@@ -31,6 +31,8 @@ function fakeCli(respond?: (args: string[]) => BbCliResult | undefined): {
         if (custom) return custom;
         if (args.join(" ").startsWith("tasks preset list"))
           return ok(JSON.stringify({ presets: [{ name: "simple", id: "p1" }] }));
+        if (args.join(" ").startsWith("provider-retry status"))
+          return ok(JSON.stringify({ retries: [] }));
         return ok();
       },
     },
@@ -166,7 +168,7 @@ test("CLI delegate end-to-end through the fake host", async () => {
   assert.equal(body.threadId, "thr_exec");
   assert.equal(body.route, "simple");
   assert.ok(
-    calls.some((c) => c.join(" ") === "thread update thr_exec --parent-notifications auto"),
+    calls.some((c) => c.join(" ") === "thread update thr_exec --parent-notifications stuck"),
   );
   assert.deepEqual(updates, [
     { threadId: "thr_exec", parentThreadId: "thr_coord", visibility: "hidden" },
@@ -365,6 +367,53 @@ test("cancel of a dispatching row without thread_id finds and stops the thread (
   assert.equal(body.status, "cancelled");
   assert.equal(body.warning, undefined);
   assert.deepEqual(stops, ["thr_late"]);
+});
+
+test("PLUG-184 C5: cancel drops the BB auto-retry BEFORE the stop", async () => {
+  const ops: string[] = [];
+  let retryCleared = false;
+  const { cli } = fakeCli((args) => {
+    const key = args.join(" ");
+    if (key.startsWith("provider-retry")) ops.push(`cli:${key.split(" ")[1]}`);
+    if (key.startsWith("tasks dispatch"))
+      return ok(JSON.stringify({ threadId: "thr_exec" }));
+    if (key.startsWith("tasks preset show"))
+      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+    if (key.startsWith("provider-retry status"))
+      return ok(JSON.stringify({ retries: retryCleared ? [] : [{}] }));
+    if (key.startsWith("provider-retry cancel")) {
+      retryCleared = true;
+      return ok();
+    }
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: {
+      ...COORDINATOR_SDK,
+      update: async () => ({}),
+      stop: async ({ threadId }: { threadId: string }) => {
+        ops.push(`sdk:stop ${threadId}`);
+        return {};
+      },
+    },
+  });
+  await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+  const res = await host.harness.runCli(["cancel", "1", "--json"], {
+    threadId: "thr_coord",
+  });
+  const body = JSON.parse(res.stdout) as { ok: boolean; warning?: string };
+  assert.equal(body.ok, true);
+  assert.equal(body.warning, undefined);
+  const cancelIdx = ops.findIndex((o) => o === "cli:cancel");
+  const stopIdx = ops.findIndex((o) => o === "sdk:stop thr_exec");
+  assert.ok(cancelIdx >= 0 && stopIdx >= 0, `both ran: ${JSON.stringify(ops)}`);
+  assert.ok(
+    cancelIdx < stopIdx,
+    `auto-retry cancel precedes stop: ${JSON.stringify(ops)}`,
+  );
 });
 
 test("cancel surfaces the thread-lookup failure as a warning", async () => {
