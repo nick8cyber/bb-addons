@@ -1642,7 +1642,8 @@ export class JanitorStore {
       sizeKb?: number | null;
       firstSeenAt?: number | null;
       removedAt?: number | null;
-      /** §17.4 (PLUG-218): stamped only by the «removed» write; a later
+      /** §17.4 (PLUG-218/220): stamped by the pre-delete «removing»
+       * write and confirmed by «removed»; a later
        * «ветки больше нет» write never erases it (`fields ?? prev`). */
       tipSha?: string | null;
     },

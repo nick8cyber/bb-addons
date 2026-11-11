@@ -1645,6 +1645,19 @@ ${res.warnings
                       (res.orphanBranches
                         ? `, orphan branches ${res.orphanBranches}`
                         : "") +
+                      // §17.4 (ревью PLUG-220): what was removed, with
+                      // the tip SHA to restore it — `git branch <name>
+                      // <sha>` while gc keeps the objects.
+                      (res.removedItems.length
+                        ? `\nremoved:\n${res.removedItems
+                            .map(
+                              (i) =>
+                                `  ${i.branch ?? i.envId} ${i.tipSha ?? "-"}` +
+                                (i.headSha ? ` head ${i.headSha}` : "") +
+                                (i.repo ? ` (${i.repo})` : ""),
+                            )
+                            .join("\n")}`
+                        : "") +
                       // §17.4 (С9): «готова к удалению» is a list, not
                       // only a count — this is what `apply` removes.
                       (res.readyItems.length

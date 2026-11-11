@@ -4961,3 +4961,197 @@ test("a thread created between the passes is excused and listed — not threads-
   assert.equal(res.kept["threads-unknown"] ?? 0, 0);
   assert.equal(res.removedCopies, 1);
 });
+
+// ── PLUG-220 (ревью PLUG-219): SHA пишется ДО удаления ───────────────
+
+// §17.4 (ревью PLUG-219, блокер 1): the branch tip and the journal
+// line are written BEFORE `update-ref -d` — a refused delete already
+// finds `tip_sha` in the ledger, so a crash between the write and the
+// delete cannot lose the SHA (the branch's own reflog dies with it).
+test("a refused update-ref already finds tip_sha — stamped before the delete (§17.4 PLUG-220)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const refusing: CmdRunner = {
+    run: async (file, args, o) =>
+      file === "git" && args[2] === "update-ref" && args[3] === "-d"
+        ? fail("update-ref refused")
+        : realCmd.run(file, args, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: refusing,
+  });
+  const common = git(env.path, ["rev-parse", "--git-common-dir"]);
+  const key = `branch:${common}:${env.branchName}`;
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  await w.jan.run();
+  git(repo, ["worktree", "remove", "--force", env.path]);
+  const tip = git(repo, ["rev-parse", env.branchName]);
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-delete-failed"], 1);
+  const row = w.janitor.item(key)!;
+  assert.equal(row.state, "kept");
+  assert.equal(row.reason, "branch-delete-failed");
+  // the SHA was stamped BEFORE the refused delete — it survives
+  assert.equal(row.tip_sha, tip);
+  assert.ok(
+    w.infos.some(
+      (m) =>
+        m.includes(`removing branch ${common}:${env.branchName}`) &&
+        m.includes(`at ${tip}`),
+    ),
+    `infos: ${w.infos.join(" | ")}`,
+  );
+});
+
+// §17.4 (ревью PLUG-219, блокер 2): a copy's tip and HEAD go to the
+// journal and the ledger BEFORE `thread archive` — the settle write
+// only flips the row to «removed». A run dying between the archive
+// and the settle (`du` here) leaves the stamped row behind.
+test("a crash between archive and the settle write keeps tip_sha — stamped pre-archive (§17.4 PLUG-220)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // `du` dies in the settle step — the archive already went through
+  const duDies: CmdRunner = {
+    run: async (file, args, o) =>
+      file === "du"
+        ? Promise.reject(new Error("du boom"))
+        : realCmd.run(file, args, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: duDies,
+  });
+  const head = git(env.path, ["rev-parse", "HEAD"]);
+  const tip = git(repo, ["rev-parse", env.branchName]);
+  const common = git(env.path, ["rev-parse", "--git-common-dir"]);
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  // the run died in settle — the archive had already stamped the row
+  assert.ok(
+    res.errors.some((e) => e.includes("du boom")),
+    `errors: ${res.errors.join(" | ")}`,
+  );
+  assert.deepEqual(w.archivedCalls, [`thr_${env.id}`]);
+  const row = w.janitor.item(env.id)!;
+  assert.equal(row.state, "kept");
+  assert.equal(row.reason, "removing");
+  assert.equal(row.tip_sha, tip);
+  // журнал: `removing copy …` ушла ДО архива, с tip и HEAD копии
+  assert.ok(
+    w.infos.some(
+      (m) =>
+        m.includes(`removing copy ${common}:${env.branchName}`) &&
+        m.includes(`at ${tip}`) &&
+        m.includes(`head ${head}`),
+    ),
+    `infos: ${w.infos.join(" | ")}`,
+  );
+});
+
+// §17.4 (ревью PLUG-220): a new thread seen only in the FIRST pass is
+// excused from the sets comparison yet joins the union — and a copy it
+// holds is NOT removed.
+test("a new thread only in the first pass still holds its copy — the union counts (§17.4 PLUG-220)", async () => {
+  const { repo, base } = makeRepo();
+  const envA = addEnv(repo, base, "a");
+  const envB = addEnv(repo, base, "b");
+  commitIn(envA.path, "wa.txt", "feat: a");
+  commitIn(envB.path, "wb.txt", "feat: b");
+  mergeEnv(repo, envA);
+  mergeEnv(repo, envB);
+  const t = Date.now();
+  const extras: ThreadSpec[] = [];
+  const w = makeWorld({
+    envs: [envA, envB],
+    threads: {
+      [envA.id]: [idle({ t }, envA.id)],
+      [envB.id]: [idle({ t }, envB.id)],
+    },
+    extraThreads: extras,
+    clock: { t },
+    onThreadListCall: (call) => {
+      // run 2: call 3 = the first run-start pass — a running thread
+      // born mid-listing (createdAt > pass start) sits in this pass
+      // only; call 4 = the second pass no longer sees it
+      if (call === 3) {
+        extras.push({
+          id: "thr_new",
+          status: "running",
+          archivedAt: null,
+          updatedAt: w.clock.t,
+          createdAt: w.clock.t + 1,
+          parentThreadId: "thr_coord",
+          environmentId: envB.id,
+        });
+      } else if (call === 4) {
+        extras.length = 0;
+      }
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  // the excused thread made the pair equal — no retry, no unproven list
+  assert.ok(
+    !w.warns.some((m) => /thread list unproven/.test(m)),
+    `warns: ${w.warns.join(" | ")}`,
+  );
+  assert.equal(res.kept["threads-unknown"] ?? 0, 0);
+  // envA's copy went; envB's stayed — the pass-1-only running thread
+  // joined the union and blocked the cascade
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(envA.id)!.state, "removed");
+  assert.equal(w.janitor.item(envB.id)!.reason, "threads-active");
+});
+
+// §17.4 (ревью PLUG-220): an OLD thread (no createdAt) that appears in
+// only one pass is NOT excused — the sets differ, the retry pair
+// differs too, and the run ends threads-unknown.
+test("an old thread without createdAt seen in one pass makes the list unproven — threads-unknown (§17.4 PLUG-220)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = [];
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    onThreadListCall: (call) => {
+      // the flap sits in odd calls (first pass of each attempt) and is
+      // gone in even ones — without createdAt nothing excuses it, so
+      // both attempts see different sets
+      if (call % 2 === 1) {
+        extras.push({
+          id: "thr_flap",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: t - 60_000,
+        });
+      } else {
+        extras.length = 0;
+      }
+    },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(res.kept["threads-unknown"], 1);
+  // 2 attempts × 2 passes — the flap was not excused and burned the retry
+  assert.equal(w.sdkListCalls, 4);
+  assert.ok(
+    w.warns.some((m) => /thread list unproven/.test(m)),
+    `warns: ${w.warns.join(" | ")}`,
+  );
+});

@@ -1704,6 +1704,14 @@ export function createJanitor(deps: JanitorDeps) {
     const processedThreads = new Set<string>();
     const envBlocked = new Map<string, string>();
     const ancestorCache = new Map<string, boolean>();
+    // §17.4 (ревью PLUG-219, PLUG-220): the SHAs journaled and stamped
+    // into the ledger BEFORE a copy's threads are archived — the settle
+    // write below reuses them, so what the journal said matches what
+    // the row keeps even if the branch moved in between.
+    const preArchiveShas = new Map<
+      string,
+      { tipSha: string | null; headSha: string | null }
+    >();
 
     const markReported = (env: EnvDto, reason: string) => {
       const prevReported = ledger
@@ -2357,6 +2365,55 @@ export function createJanitor(deps: JanitorDeps) {
         }
       }
 
+      // §17.4 (ревью PLUG-219, PLUG-220): every member env's branch tip
+      // and HEAD go to the journal and the ledger BEFORE the first
+      // `thread archive` — BB frees the copy on archive, so a crash or
+      // an exception between the archive and the settle write below
+      // would lose both SHAs (on the next run the env is already gone
+      // and the row never appears). The row sits at «removing»; the
+      // settle write flips it to «removed», a rolled-back archive to
+      // «archive-failed» (`tip_sha` survives either way).
+      for (const e of freshEnvs.values()) {
+        const f = await envFacts(e);
+        const eRepo = repoByEnv.get(e.id);
+        const eBranch = e.branchName?.trim();
+        const eTip = eBranch
+          ? (
+              await gitOut(deps.cmd, eRepo?.root ?? e.path!, [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                `refs/heads/${eBranch}`,
+              ])
+            )?.trim() || null
+          : null;
+        const copyTip = eTip ?? f.headSha ?? null;
+        log.info?.(
+          `orchestrator janitor: removing copy ` +
+            `${eRepo?.commonDir ?? e.path}:${eBranch ?? "-"} ` +
+            `at ${copyTip ?? "-"} head ${f.headSha ?? "-"}`,
+        );
+        preArchiveShas.set(e.id, {
+          tipSha: copyTip,
+          headSha: f.headSha ?? null,
+        });
+        if (ledger) {
+          deps.janitor.upsertItem(
+            e.id,
+            {
+              projectId: e.projectId ?? null,
+              path: e.path ?? null,
+              branch: e.branchName ?? null,
+              threadId: pickThreadId(e),
+              state: "kept",
+              reason: "removing",
+              tipSha: copyTip,
+            },
+            at,
+          );
+        }
+      }
+
       const done: string[] = [];
       for (const t of [...freshMembers].reverse()) {
         const res = await deps.bbCli.run(["thread", "archive", t.id]);
@@ -2488,34 +2545,41 @@ export function createJanitor(deps: JanitorDeps) {
         summary.ready += 1;
         summary.freedKb += sizeKb;
         reportedMem.delete(env.id);
-        // §17.4 (ревью PLUG-218): recoverability — with the removal the
-        // copy's HEAD and its branch tip go into the same ledger write
-        // (`tip_sha`) and the plugin journal, so the branch restores
-        // with `git branch <name> <sha>` while gc keeps the objects.
+        // §17.4 (ревью PLUG-218/220): recoverability — the copy's HEAD
+        // and its branch tip were journaled and stamped BEFORE the
+        // archive (a copy whose threads were already archived before
+        // this run never saw that write — its tip is resolved here);
+        // the settle write only flips the row to «removed» so the
+        // branch restores with `git branch <name> <sha>` while gc
+        // keeps the objects.
+        const pre = preArchiveShas.get(env.id);
         const repo = repoByEnv.get(env.id);
         const envBranch = env.branchName?.trim();
-        const branchTip = envBranch
-          ? (
-              await gitOut(deps.cmd, repo?.root ?? env.path!, [
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                `refs/heads/${envBranch}`,
-              ])
-            )?.trim() || null
-          : null;
-        const copyTip = branchTip ?? facts.headSha ?? null;
+        const branchTip = pre
+          ? pre.tipSha
+          : envBranch
+            ? (
+                await gitOut(deps.cmd, repo?.root ?? env.path!, [
+                  "rev-parse",
+                  "--verify",
+                  "--quiet",
+                  `refs/heads/${envBranch}`,
+                ])
+              )?.trim() || null
+            : null;
+        const copyTip = pre?.tipSha ?? branchTip ?? facts.headSha ?? null;
+        const headSha = pre?.headSha ?? facts.headSha ?? null;
         log.info?.(
           `orchestrator janitor: removed copy ` +
             `${repo?.commonDir ?? env.path}:${envBranch ?? "-"} ` +
-            `at ${copyTip ?? "-"} head ${facts.headSha ?? "-"}`,
+            `at ${copyTip ?? "-"} head ${headSha ?? "-"}`,
         );
         summary.removedItems.push({
           envId: env.id,
           branch: env.branchName ?? null,
           repo: repo?.commonDir ?? null,
           tipSha: copyTip,
-          headSha: facts.headSha ?? null,
+          headSha,
         });
         deps.janitor.upsertItem(
           env.id,
@@ -2734,6 +2798,31 @@ export function createJanitor(deps: JanitorDeps) {
         if (!cfg.deleteBranches) keep(summary, "branch-kept-config");
         let deleted = false;
         if (willDelete) {
+          // §17.4 (ревью PLUG-219, PLUG-220): the tip is journaled and
+          // stamped into the ledger BEFORE `update-ref -d` — a crash
+          // between the delete and the «removed» write below would take
+          // the SHA with it (deleting a branch erases its own reflog,
+          // the SHA's last reference). The row sits at «removing»;
+          // success flips it to «removed», a refused delete to
+          // «branch-delete-failed» (`tip_sha` survives either way).
+          log.info?.(
+            `orchestrator janitor: removing branch ` +
+              `${commonDir}:${branch} at ${tip}`,
+          );
+          if (ledger) {
+            deps.janitor.upsertItem(
+              envId,
+              {
+                projectId: branchOwner?.project_id ?? null,
+                threadId: branchOwner?.thread_id ?? null,
+                branch,
+                state: "kept",
+                reason: "removing",
+                tipSha: tip ?? null,
+              },
+              at,
+            );
+          }
           // §15/§16.3 (PLUG-199): delete atomically against the tip the
           // checks above verified — `branch -D` removes whatever the
           // ref points at NOW, so a mid-run `branch -f` would slip an
@@ -3264,11 +3353,19 @@ export function createJanitor(deps: JanitorDeps) {
     const since = lastRun?.started_at ?? Number.NEGATIVE_INFINITY;
     const lastRunRow = (i: { last_checked_at: number | null }) =>
       i.last_checked_at != null && i.last_checked_at >= since;
+    // §17.4 (ревью PLUG-220): `tip_sha` is a removal record — the
+    // report shows it only on `removed` rows; a live row may still
+    // carry an old deletion's SHA (`fields ?? prev` never erases) and
+    // must not advertise it.
+    const shownSha = (i: { state: string; tip_sha: string | null }) =>
+      i.state === "removed" ? i.tip_sha : null;
     return {
       config: cfgLoad.config,
       configErrors: cfgLoad.errors,
       lastRun,
-      items,
+      items: items.map((i) =>
+        i.state === "removed" ? i : { ...i, tip_sha: null },
+      ),
       abandoned: items
         .filter((i) => i.state === "reported" && lastRunRow(i))
         .map((i) => ({
@@ -3278,7 +3375,7 @@ export function createJanitor(deps: JanitorDeps) {
           branch: i.branch,
           threadId: i.thread_id,
           reason: i.reason ?? "",
-          tipSha: i.tip_sha,
+          tipSha: shownSha(i),
         })),
       // §17.4 (С9): «готова к удалению» rows — what `apply` would
       // remove. Written by report-mode and apply passes alike, so the
@@ -3297,7 +3394,7 @@ export function createJanitor(deps: JanitorDeps) {
           branch: i.branch,
           threadId: i.thread_id,
           reason: i.reason ?? "",
-          tipSha: i.tip_sha,
+          tipSha: shownSha(i),
         })),
     };
   };
