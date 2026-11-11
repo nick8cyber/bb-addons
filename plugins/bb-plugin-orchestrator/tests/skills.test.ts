@@ -80,7 +80,10 @@ test("an executor-shaped thread gets no skills", () => {
 test("resolveAgentConfiguration passes the declared skills through", async () => {
   const host = createFakePluginHost({
     pluginId: "orchestrator",
-    settings: { policy: "" },
+    settings: {
+      policy:
+        '{"version":1,"levels":{"simple":{"chain":["s"]}},"routes":{"s":{"preset":"s","provider":"p"}}}',
+    },
     agentSkillIds: [...SKILL_IDS],
   });
   const cli: BbCli = { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) };

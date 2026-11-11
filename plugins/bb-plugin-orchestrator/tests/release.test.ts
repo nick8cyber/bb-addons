@@ -221,10 +221,30 @@ test("parseAuditVerdict: strict json, fenced, garbage → REJECT", () => {
   assert.equal(bad.unparseable, true);
 });
 
-test("reviewVerdictOk: OK markers vs findings", () => {
-  assert.equal(reviewVerdictOk("ОК. Замечаний нет."), true);
-  assert.equal(reviewVerdictOk("ЕСТЬ ЗАМЕЧАНИЯ (неблокирующие). Ревью…"), false);
-  assert.equal(reviewVerdictOk("Вердикт: ОК\nдетали…"), true);
+test("reviewVerdictOk: §16.7 strict JSON verdict line", () => {
+  // The report ends with {"verdict":"OK"|"CHANGES","blockers":<n>} —
+  // prose «ОК» alone no longer counts.
+  assert.equal(reviewVerdictOk("ОК. Замечаний нет."), false);
+  assert.equal(
+    reviewVerdictOk('Замечаний нет\n{"verdict":"OK","blockers":0}'),
+    true,
+  );
+  assert.equal(
+    reviewVerdictOk('Итог\n{"verdict":"CHANGES","blockers":2}'),
+    false,
+  );
+  // OK with open blockers is not accepted.
+  assert.equal(
+    reviewVerdictOk('{"verdict":"OK","blockers":1}'),
+    false,
+  );
+  // Last JSON verdict line wins.
+  assert.equal(
+    reviewVerdictOk(
+      '{"verdict":"CHANGES","blockers":1}\n…\n{"verdict":"OK","blockers":0}',
+    ),
+    true,
+  );
 });
 
 test("docsForChanges: map prefixes → docs, no map → null", () => {
@@ -281,6 +301,7 @@ function makeDeps(repo: string, overrides: Partial<{
   dispatchFail: boolean;
   auditVerdict: string;
   auditStatus: string;
+  reviewLevel: string;
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -295,7 +316,8 @@ function makeDeps(repo: string, overrides: Partial<{
   store.setStatus(exec.id, "done");
   const rev = store.insert({
     taskKey: "PLUG-1", projectId: "proj_main",
-    coordinatorThreadId: "thr_coord", level: "review",
+    coordinatorThreadId: "thr_coord",
+    level: overrides.reviewLevel ?? "review",
     route: "r", preset: "r", provider: "p",
   });
   store.setThreadInfo(rev.id, "thr_rev");
@@ -311,7 +333,12 @@ function makeDeps(repo: string, overrides: Partial<{
         return ok(JSON.stringify({
           task: { key: "PLUG-1", title: "do x", status: "in_review" },
           comments: overrides.comments ?? [
-            { kind: "agent", threadId: "thr_rev", body: "ОК, замечаний нет", createdAt: "2026-01-01" },
+            {
+              kind: "agent",
+              threadId: "thr_rev",
+              body: 'ОК, замечаний нет\n{"verdict":"OK","blockers":0}',
+              createdAt: "2026-01-01",
+            },
           ],
         }));
       if (key.startsWith("tasks comment")) {
@@ -453,11 +480,18 @@ test("release: dirty worktree refuses (step 2)", async () => {
 test("release: not-OK review refuses at step 1", async () => {
   const { repo } = makeRepo();
   const { deps } = makeDeps(repo, {
-    comments: [{ kind: "agent", threadId: "thr_rev", body: "ЕСТЬ ЗАМЕЧАНИЯ: …", createdAt: "x" }],
+    comments: [
+      {
+        kind: "agent",
+        threadId: "thr_rev",
+        body: 'ЕСТЬ ЗАМЕЧАНИЯ: …\n{"verdict":"CHANGES","blockers":2}',
+        createdAt: "x",
+      },
+    ],
   });
   await assert.rejects(
     runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
-    (e: unknown) => /не «ОК»/.test((e as OrchestratorError).message),
+    (e: unknown) => /не «OK»/.test((e as OrchestratorError).message),
   );
 });
 
@@ -615,4 +649,46 @@ test("N1: pump on non-string verdict fields → rejected, no exception", async (
   assert.ok(sent.some((m) => m.includes("REJECT")));
   // still masked even through coercion
   assert.ok(!sent.some((m) => m.includes("ghp_abcdef1234567890")));
+});
+
+
+// ── §2.3 r24: reviews on any auditor-role level count at step 1 ──────
+
+test("release step 1: a review on an arbitrary auditor level counts", async () => {
+  const { repo } = makeRepo();
+  const policy = JSON.stringify({
+    version: 1,
+    levels: {
+      "release-audit": { chain: ["ra"], autoFallback: true },
+      "review-mid": { role: "auditor", chain: ["ra"] },
+      complex: { chain: ["ra"] },
+    },
+    routes: { ra: { preset: "ra", provider: "p" } },
+  });
+  const { deps } = makeDeps(repo, {
+    policyText: policy,
+    reviewLevel: "review-mid",
+  });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("release step 1: auditor-level rows never count as executor work", async () => {
+  const { repo } = makeRepo();
+  // "complex" is declared auditor here — its done row must not satisfy
+  // the executor requirement.
+  const policy = JSON.stringify({
+    version: 1,
+    levels: {
+      "release-audit": { chain: ["ra"], autoFallback: true },
+      complex: { role: "auditor", chain: ["ra"] },
+    },
+    routes: { ra: { preset: "ra", provider: "p" } },
+  });
+  const { deps } = makeDeps(repo, { policyText: policy });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      /нет делегирования/.test((e as OrchestratorError).message),
+  );
 });

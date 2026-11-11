@@ -26,7 +26,7 @@ import {
   type ReleaseConfigLoad,
   type ResolvedProject,
 } from "./release-config.js";
-import { pickRoute, type PolicyLoad } from "./policy.js";
+import { levelRole, pickRoute, type PolicyLoad } from "./policy.js";
 import type { DelegationRow, DelegationStore, ReleaseRow } from "./store.js";
 import { runChecked, runJson, type BbCli } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
@@ -176,18 +176,28 @@ async function resolveTask(
   return { key: key.toUpperCase(), show };
 }
 
-/** Step-1 review verdict: the last agent comment from the review
- * delegation's own thread reads as a verdict — ОК markers accepted,
- * findings markers rejected. */
+/** Step-1 review verdict (§16.7 r25): the auditor ends its report with a
+ * strict JSON line `{"verdict":"OK"|"CHANGES","blockers":<n>}`. Release
+ * reads that line — prose «ОК» markers no longer count, and a report
+ * without the line is not accepted. Scans the report for JSON lines and
+ * judges by the last one. */
 export function reviewVerdictOk(body: string): boolean {
-  const head = body.split("\n").filter((l) => l.trim()).slice(0, 3).join("\n");
-  const ok =
-    /(?:^|[^\p{L}\p{N}])(?:ОК|ок|LGTM)(?:[^\p{L}\p{N}]|$)|замечаний нет|нет замечаний|без замечаний|no findings/iu.test(
-      head,
-    );
-  const bad =
-    /есть замечания|находк|не\s*ок|\bfail|ошибк|нельзя/i.test(head);
-  return ok && !bad;
+  let verdict: unknown;
+  let blockers: unknown;
+  for (const raw of body.split("\n")) {
+    const line = raw.trim();
+    if (!line.startsWith("{") || !line.endsWith("}")) continue;
+    let parsed: { verdict?: unknown; blockers?: unknown };
+    try {
+      parsed = JSON.parse(line) as { verdict?: unknown; blockers?: unknown };
+    } catch {
+      continue;
+    }
+    if (parsed.verdict !== "OK" && parsed.verdict !== "CHANGES") continue;
+    verdict = parsed.verdict;
+    blockers = parsed.blockers;
+  }
+  return verdict === "OK" && (blockers === undefined || blockers === 0);
 }
 
 function reviewVerdict(
@@ -215,23 +225,26 @@ async function acceptTask(
   const { key, show } = await resolveTask(deps, input.taskKey);
   const missing: string[] = [];
 
-  const rows = deps.store
-    .list({})
-    .filter(
-      (d) =>
-        d.task_key === key &&
-        d.level !== "review" &&
-        d.level !== AUDIT_LEVEL &&
-        d.status === "done",
-    );
-  const executor = rows.at(-1);
+  // §2.3 r24: levels carry a `role` — executors do the work, auditor
+  // levels (any name) review it; release-audit stays its own thing.
+  const policy = (await deps.loadPolicy()).policy;
+  const roleOf = (level: string) =>
+    level === AUDIT_LEVEL ? "release-audit" : levelRole(policy, level);
+
+  const executor = deps.store
+    .delegationsByTask(key)
+    .find((d) => roleOf(d.level) === "executor" && d.status === "done");
   if (!executor) missing.push("нет делегирования в статусе done");
 
-  const review = deps.store.latestDelegationByTaskAndLevel(key, "review");
+  const review = deps.store
+    .delegationsByTask(key)
+    .find((d) => roleOf(d.level) === "auditor");
   if (!review) {
-    missing.push("нет ревью уровня review");
+    missing.push("нет ревью аудиторского уровня");
   } else if (review.status !== "done") {
-    missing.push(`последнее ревью уровня review в статусе ${review.status}`);
+    missing.push(
+      `последнее ревью уровня ${review.level} в статусе ${review.status}`,
+    );
   } else {
     if (executor && review.created_at < executor.created_at) {
       missing.push("последнее ревью старше последнего исполнения");
@@ -240,7 +253,7 @@ async function acceptTask(
     if (v === "missing") {
       missing.push("вердикт ревью не найден в комментариях задачи");
     } else if (v === "not-ok") {
-      missing.push("последнее ревью уровня review — не «ОК»");
+      missing.push("последнее ревью — вердикт не «OK» (§16.7 JSON)");
     }
   }
 

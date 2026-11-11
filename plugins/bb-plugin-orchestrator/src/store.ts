@@ -107,6 +107,9 @@ export const MIGRATIONS: readonly string[] = [
    ALTER TABLE delegations ADD COLUMN merged_into TEXT;
    ALTER TABLE delegations ADD COLUMN merged_sha TEXT;
    ALTER TABLE delegations ADD COLUMN merged_at INTEGER`,
+  // §2.3 r24 (PLUG-182): the dispatch used an explicit `--route`/`--preset`
+  // — its §5.4 reissue restarts the level chain from the beginning.
+  `ALTER TABLE delegations ADD COLUMN explicit_route INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -153,6 +156,9 @@ export interface DelegationRow {
   merged_into: string | null;
   merged_sha: string | null;
   merged_at: number | null;
+  /** §2.3: the dispatch named an explicit `--route`/`--preset` (reissue
+   * restarts the chain from its beginning). */
+  explicit_route: number;
   created_at: number;
   updated_at: number;
 }
@@ -235,14 +241,17 @@ export class DelegationStore {
     provider: string;
     round?: number;
     continueFrom?: string | null;
+    /** §2.3: set when the dispatch named an explicit `--route`/`--preset`. */
+    explicitRoute?: boolean;
   }): DelegationRow {
     const now = Date.now();
     const info = this.db
       .prepare(
         `INSERT INTO delegations (
           task_key, task_id, project_id, coordinator_thread_id, level, route,
-          preset, provider, status, round, continue_from, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?)`,
+          preset, provider, status, round, continue_from, explicit_route,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?)`,
       )
       .run(
         normalizeTaskKey(input.taskKey),
@@ -255,6 +264,7 @@ export class DelegationStore {
         input.provider,
         input.round ?? 1,
         input.continueFrom ?? null,
+        input.explicitRoute ? 1 : 0,
         now,
         now,
       );
@@ -934,6 +944,19 @@ export class DelegationStore {
     this.db
       .prepare(`UPDATE releases SET ${sets.join(", ")} WHERE id = ?`)
       .run(...args);
+  }
+
+  /**
+   * §2.3 r24: all delegations of the task, newest first — the caller
+   * filters by level role (the policy decides which levels audit) or
+   * status. Used by reviewByLevel mapping and release acceptance.
+   */
+  delegationsByTask(taskKey: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE task_key = ? ORDER BY id DESC`,
+      )
+      .all(normalizeTaskKey(taskKey)) as DelegationRow[];
   }
 
   /** Latest release-audit delegation of a task (§3): the chain reissue

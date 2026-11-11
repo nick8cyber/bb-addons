@@ -100,3 +100,27 @@ export async function runJson<T>(
     );
   }
 }
+
+/**
+ * §2.3: preset name/id → `modelId` from `bb tasks preset list --json` —
+ * the model-matching source for a one-off preset's quota groups. An
+ * unreadable list degrades to an empty map (name-only matching).
+ */
+export async function presetModelMap(
+  cli: BbCli,
+): Promise<Map<string, string | null>> {
+  const map = new Map<string, string | null>();
+  try {
+    const res = await runJson<{
+      presets?: { id?: string; name?: string; modelId?: string | null }[];
+    }>(cli, ["tasks", "preset", "list", "--json"], { timeoutMs: 15_000 });
+    for (const p of res.presets ?? []) {
+      for (const key of [p.name, p.id]) {
+        if (typeof key === "string") map.set(key, p.modelId ?? null);
+      }
+    }
+  } catch {
+    // degrade: no model data → name-only quota matching
+  }
+  return map;
+}

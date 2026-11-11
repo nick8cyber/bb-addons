@@ -194,6 +194,7 @@ function makeHarness(
     threadId?: string | null;
     status?: "dispatching" | "running";
     createdAt?: number;
+    explicitRoute?: boolean;
   } = {}): DelegationRow => {
     const row = store.insert({
       taskKey: input.taskKey ?? "PLUG-1",
@@ -203,6 +204,7 @@ function makeHarness(
       route: input.route ?? "simple",
       preset: input.preset ?? "simple",
       provider: input.provider ?? "acp-opencode",
+      explicitRoute: input.explicitRoute,
     });
     if (input.threadId) store.setThreadInfo(row.id, input.threadId);
     store.setStatus(row.id, input.status ?? "running");
@@ -2294,4 +2296,204 @@ test("§5.3 r23: a failed turn/completed still decides when errors trail it → 
   assert.equal(fresh.resume_count, 1);
   const toExec = h.sends.find((s) => s.threadId === "thr_e1")!;
   assert.match(JSON.stringify(toExec.input), /оборвался ошибкой/);
+});
+
+
+// ── §2.3 r24: outside-chain routes reissue from the chain's start ─────
+
+test("§5.4/§16.8: --route outside the chain reissues from the chain start", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    route: "custom-x", // explicit --route outside the level chain
+    preset: "custom-x",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(
+    fresh.route,
+    "simple",
+    "outside-chain route → reissue starts at the chain's beginning",
+  );
+});
+
+test("§5.4: in-chain route still reissues only the routes after it", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple-alt" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  // simple-alt is the LAST chain route → nothing after it → stays stalled.
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+  assert.equal(h.store.listActive().length, 0);
+});
+
+test("§2.3 preset: one-off route reissues from the chain start", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    route: "preset:one-off",
+    preset: "one-off",
+    provider: "acp-opencode",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple");
+});
+
+test("§5.4/§2.3: explicit --route inside the chain restarts from the chain start", async () => {
+  // PLUG-182: an explicit --route delegation (even naming a chain route)
+  // reissues from the chain's beginning, skipping routes the task ran —
+  // `simple-alt` was used by this task, so the reissue lands on `simple`.
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+    explicitRoute: true,
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(
+    fresh.route,
+    "simple",
+    "explicit --route restarts the chain, not after-current",
+  );
+});
+
+test("§5.4/§2.3: reissue rows keep the after-current rule (no restart)", async () => {
+  // A chain route reached by an earlier auto-reissue is not explicit —
+  // its own stall continues after it, even though the task used `simple`.
+  const h = makeHarness();
+  const row1 = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(row1.id, "stalled");
+  const row2 = h.store.reissue(row1.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.store.setThreadInfo(row2.id, "thr_e2");
+  h.store.setStatus(row2.id, "running");
+  h.threadDtos.set("thr_e2", dto("thr_e2", "active"));
+  h.eventLog.set("thr_e2", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e2"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row2.id)!.status, "stalled"); // nothing after
+  assert.equal(h.store.listActive().length, 0);
+});
+
+// ── §2.3 (PLUG-182): one-off preset quota — provider+model holds ──────
+
+const POLICY_OC = JSON.stringify({
+  version: 1,
+  firstResponseSeconds: 30,
+  levels: { lvl: { chain: ["oc-a", "oc-b", "oc-c"], autoFallback: true } },
+  routes: {
+    "oc-a": { preset: "simple", provider: "acp-opencode" },
+    "oc-b": { preset: "simple-alt", provider: "acp-opencode" },
+    "oc-c": { preset: "strict", provider: "agy" },
+  },
+});
+
+const OC_MODELS = ok(
+  JSON.stringify({
+    presets: [
+      { name: "poof", providerId: "acp-opencode", modelId: "m1" },
+      { name: "simple", providerId: "acp-opencode", modelId: "m1" },
+      { name: "simple-alt", providerId: "acp-opencode", modelId: "m2" },
+      { name: "strict", providerId: "agy", modelId: "m9" },
+    ],
+  }),
+);
+
+test("§2.3: one-off preset quota holds same-provider+model groups only", async () => {
+  // PLUG-182: the burned preset (acp-opencode, m1) pauses route oc-a
+  // (same provider+model) and its own name — oc-b (m2) and oc-c (agy)
+  // stay open, and the reissue picks oc-b.
+  const h = makeHarness({
+    policyText: POLICY_OC,
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks preset list")) return OC_MODELS;
+      return undefined;
+    },
+  });
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "lvl",
+    route: "preset:poof",
+    preset: "poof",
+    provider: "acp-opencode",
+    explicitRoute: true,
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "429 rate limit" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+
+  const held = h.store.heldGroups(h.getNow());
+  assert.ok(held.has("preset:poof"), "the one-off's own name is held");
+  assert.ok(held.has("oc-a"), "same provider+model route held");
+  assert.ok(!held.has("oc-b"), "same provider, other model stays open");
+  assert.ok(!held.has("oc-c"), "other provider stays open");
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "oc-b", "held oc-a skipped → next open route");
+});
+
+test("§2.3: unknown preset model holds only the one-off's own name", async () => {
+  // The preset vanished from `preset list` → no model → no mass hold;
+  // the reissue then walks the chain from its start.
+  const h = makeHarness({
+    policyText: POLICY_OC,
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks preset list"))
+        return ok(JSON.stringify({ presets: [] }));
+      return undefined;
+    },
+  });
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "lvl",
+    route: "preset:poof",
+    preset: "poof",
+    provider: "acp-opencode",
+    explicitRoute: true,
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "429 rate limit" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+
+  const held = h.store.heldGroups(h.getNow());
+  assert.deepEqual([...held].sort(), ["preset:poof"]);
+  assert.equal(h.store.listActive()[0]!.route, "oc-a");
 });

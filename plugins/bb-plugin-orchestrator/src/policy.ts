@@ -19,8 +19,14 @@ export interface PolicyRoute {
   firstResponseSeconds?: number;
 }
 
+/** §2.3: what a level's delegation does — executes or only checks. */
+export type LevelRole = "auditor" | "executor";
+
 export interface PolicyLevel {
   description?: string;
+  /** §2.3: `auditor` marks a review level; default `executor`, except a
+   * level named `review` which stays `auditor` as before. */
+  role?: LevelRole;
   chain: string[];
   autoFallback?: boolean;
 }
@@ -35,6 +41,8 @@ export interface Policy {
   limits?: PolicyLimits;
   firstResponseSeconds?: number;
   maxRunSeconds?: number;
+  /** §2.3: executor level → the auditor level that reviews its work. */
+  reviewByLevel?: Record<string, string>;
   levels: Record<string, PolicyLevel>;
   routes: Record<string, PolicyRoute>;
 }
@@ -74,6 +82,8 @@ const isPositiveInt = (x: unknown): x is number =>
 export function parsePolicy(
   text: string | undefined,
   knownPresets?: ReadonlySet<string>,
+  /** §16.8: preset name/id → facts; used for the executor-worktree warning. */
+  presetDetails?: ReadonlyMap<string, { environmentKind?: string | null }>,
 ): PolicyLoad {
   const errors: PolicyIssue[] = [];
   const warnings: PolicyIssue[] = [];
@@ -193,6 +203,14 @@ export function parsePolicy(
       if (value.autoFallback !== undefined && typeof value.autoFallback !== "boolean") {
         err(`${path}.autoFallback`, "must be a boolean");
       }
+      // §2.3: the level's role — `auditor` (review) or `executor`.
+      if (
+        value.role !== undefined &&
+        value.role !== "auditor" &&
+        value.role !== "executor"
+      ) {
+        err(`${path}.role`, `must be "auditor" or "executor"`);
+      }
       let chain: string[] = [];
       if (!Array.isArray(value.chain) || value.chain.length === 0) {
         err(`${path}.chain`, "required non-empty array of route names");
@@ -216,11 +234,71 @@ export function parsePolicy(
         ...(typeof value.description === "string"
           ? { description: value.description }
           : {}),
+        ...(value.role === "auditor" || value.role === "executor"
+          ? { role: value.role }
+          : {}),
         chain,
         ...(typeof value.autoFallback === "boolean"
           ? { autoFallback: value.autoFallback }
           : {}),
       };
+    }
+  }
+
+  // §2.3: reviewByLevel — executor level → auditor level that reviews it.
+  // Every map value must name a declared level with the auditor role.
+  let reviewByLevel: Record<string, string> | undefined;
+  if (raw.reviewByLevel !== undefined) {
+    if (!isRecord(raw.reviewByLevel)) {
+      err("reviewByLevel", "must be an object of level → review level");
+    } else {
+      reviewByLevel = {};
+      for (const [execLevel, reviewLevel] of Object.entries(
+        raw.reviewByLevel,
+      )) {
+        // §2.3: the map key is the EXECUTED level — it must name a
+        // declared level with the executor role.
+        const source = levels[execLevel];
+        const sourceRole = source
+          ? (source.role ?? (execLevel === "review" ? "auditor" : "executor"))
+          : undefined;
+        if (!source) {
+          err(
+            `reviewByLevel.${execLevel}`,
+            `level "${execLevel}" is not declared in levels`,
+          );
+          continue;
+        }
+        if (sourceRole !== "executor") {
+          err(
+            `reviewByLevel.${execLevel}`,
+            `level "${execLevel}" does not have role "executor"`,
+          );
+          continue;
+        }
+        if (!isNonEmptyString(reviewLevel)) {
+          err(`reviewByLevel.${execLevel}`, "must be a level name");
+          continue;
+        }
+        const target = levels[reviewLevel];
+        if (!target) {
+          err(
+            `reviewByLevel.${execLevel}`,
+            `level "${reviewLevel}" is not declared in levels`,
+          );
+          continue;
+        }
+        const targetRole =
+          target.role ?? (reviewLevel === "review" ? "auditor" : "executor");
+        if (targetRole !== "auditor") {
+          err(
+            `reviewByLevel.${execLevel}`,
+            `level "${reviewLevel}" does not have role "auditor"`,
+          );
+          continue;
+        }
+        reviewByLevel[execLevel] = reviewLevel;
+      }
     }
   }
 
@@ -295,11 +373,34 @@ export function parsePolicy(
     }
   }
 
+  // §16.8: an executor-level preset must give the executor its own
+  // worktree — a preset that does not create one is a warning.
+  if (presetDetails) {
+    for (const [levelName, level] of Object.entries(levels)) {
+      const role = level.role ?? (levelName === "review" ? "auditor" : "executor");
+      if (role !== "executor") continue;
+      for (const routeName of level.chain) {
+        const route = routes[routeName];
+        if (!route) continue;
+        const detail = presetDetails.get(route.preset);
+        if (detail && detail.environmentKind !== "new-worktree") {
+          warn(
+            `routes.${routeName}.preset`,
+            `preset "${route.preset}" does not create a worktree ` +
+              `(environmentKind=${detail.environmentKind ?? "—"}); ` +
+              `уровню "${levelName}" исполнителю нужна своя копия`,
+          );
+        }
+      }
+    }
+  }
+
   if (errors.length > 0) return done();
   return {
     policy: {
       version: 1,
       ...(limits ? { limits } : {}),
+      ...(reviewByLevel ? { reviewByLevel } : {}),
       ...(firstResponseSeconds !== undefined ? { firstResponseSeconds } : {}),
       ...(maxRunSeconds !== undefined ? { maxRunSeconds } : {}),
       levels,
@@ -314,6 +415,44 @@ export function parsePolicy(
 /** Quota group a route belongs to: its `quotaGroup`, or itself. */
 export function quotaGroupOf(route: PolicyRoute, name: string): string {
   return route.quotaGroup ?? name;
+}
+
+/**
+ * §2.3: the effective role of a level — its `role` field, or the default:
+ * a level named `review` audits (as before r24), every other executes.
+ * `release-audit` keeps its own role (§13.1) — callers needing the thread
+ * role use `roleForLevel` in roles.ts.
+ */
+export function levelRole(
+  policy: Policy | null | undefined,
+  levelName: string,
+): LevelRole {
+  const role = policy?.levels[levelName]?.role;
+  if (role) return role;
+  return levelName === "review" ? "auditor" : "executor";
+}
+
+/**
+ * §2.3 (уточнение PLUG-182): the hold names a burned `preset:<name>`
+ * one-off shares — the quota group of every policy route on the same
+ * provider AND the same model (preset `modelId` from `bb tasks preset
+ * show`/`list`), plus the one-off route's own name so the preset itself
+ * is paused for re-dispatch. A route whose preset model is unknown does
+ * not join — a one-off never pauses same-provider routes on other models.
+ */
+export function quotaGroupsForOneOff(
+  policy: Policy | null | undefined,
+  oneOff: { route: string; provider: string; modelId?: string | null },
+  presetModels: ReadonlyMap<string, string | null | undefined>,
+): string[] {
+  const groups = new Set<string>([oneOff.route]);
+  if (!policy || !oneOff.modelId) return [...groups];
+  for (const [name, route] of Object.entries(policy.routes)) {
+    if (route.provider !== oneOff.provider) continue;
+    if (presetModels.get(route.preset) !== oneOff.modelId) continue;
+    groups.add(quotaGroupOf(route, name));
+  }
+  return [...groups];
 }
 
 /** §5.3 removed-model text patterns; `routes.*.unavailablePatterns` extends. */
@@ -360,11 +499,13 @@ export function pickRoute(
   };
   if (opts.requested !== undefined) {
     const name = opts.requested;
-    if (!level.chain.includes(name)) {
+    // §2.3: `--route` names any route of the policy, not only the level's
+    // chain — the chain is only the fallback order.
+    if (!policy.routes[name]) {
       throw new OrchestratorError(
         "unknown-route",
-        `route "${name}" is not in the chain of level "${levelName}"`,
-        `chain: ${level.chain.join(" → ")}`,
+        `route "${name}" is not declared in routes`,
+        `routes: ${Object.keys(policy.routes).join(", ")}`,
       );
     }
     if (!usable(name)) {
