@@ -34,7 +34,14 @@
  * version) keeps the copy (`unpushed-commits`), or reports it once
  * abandoned. The rule is re-run immediately before archiving, and for
  * a copy-less `bb/` branch — over the branch's own reflog before
- * `branch -D` (`branch-unpushed`), since deleting the branch erases it.
+ * `update-ref -d` against the verified tip (`branch-unpushed`), since
+ * deleting the branch erases it. `merge-tree` signs run with every
+ * configured merge driver disabled (`-c merge.<name>.driver=false`,
+ * PLUG-199): a driver like `ours` from `.gitattributes` would
+ * otherwise reproduce the target tree for ANY commit and fake «content
+ * already on origin». A copy carrying submodules (`.gitmodules` or
+ * `$GIT_DIR/modules`) is never removed — their objects live inside
+ * the copy's git dir and no origin check covers them.
  *
  * §16.4: on `thread.archived` of an executor whose copy is still dirty,
  * the state is saved into `refs/orchestrator/rescue/<thr>` (stash object
@@ -100,6 +107,7 @@ const TRANSIENT_KEEPS = new Set([
   "archive-failed",
   "cascade-env-external",
   "interactions-pending",
+  "submodules-unknown",
 ]);
 
 export interface JanitorLog {
@@ -521,6 +529,36 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
+   * §16.3 (PLUG-199): merge drivers configured for the repo must not
+   * run inside a merge-tree sign — `db.yml merge=ours` plus
+   * `merge.ours.driver true` makes merge-tree reproduce the target
+   * tree for ANY commit, faking «content already on origin». Every
+   * `merge.<name>.driver` key is overridden per call with `-c
+   * <key>=false`: the driver errors out, merge-tree reports a conflict
+   * and proves nothing. Cached per repo for the run; an unreadable
+   * config yields no overrides (an unconfigured driver errors the same
+   * way — the sign stays unproven, never faked).
+   */
+  const mergeDriverCache = new Map<string, string[]>();
+  const mergeDriverArgs = async (repoRoot: string): Promise<string[]> => {
+    const hit = mergeDriverCache.get(repoRoot);
+    if (hit) return hit;
+    const out = await gitOut(deps.cmd, repoRoot, [
+      "config",
+      "--get-regexp",
+      "^merge\..*\.driver$",
+    ]);
+    const keys = new Set<string>();
+    for (const line of (out ?? "").split("\n")) {
+      const key = line.split(/\s/, 1)[0]?.trim();
+      if (key && /^merge\..*\.driver$/.test(key)) keys.add(key);
+    }
+    const args = [...keys].flatMap((k) => ["-c", `${k}=false`]);
+    mergeDriverCache.set(repoRoot, args);
+    return args;
+  };
+
+  /**
    * §16.3 «влита», the content sign: `git merge-tree --write-tree
    * <target> <sha>` reproducing `<target>^{tree}` proves merging <sha>
    * into the target adds nothing — every change of <sha> is already
@@ -534,6 +572,7 @@ export function createJanitor(deps: JanitorDeps) {
   ): Promise<boolean> => {
     const mergedTree = (
       await gitOut(deps.cmd, repoRoot, [
+        ...(await mergeDriverArgs(repoRoot)),
         "merge-tree",
         "--write-tree",
         target,
@@ -584,10 +623,13 @@ export function createJanitor(deps: JanitorDeps) {
     sha: string,
     targets: string[],
   ): Promise<boolean> => {
+    // §16.3 (PLUG-199): only <sha> itself is checked for being a merge
+    // — a bare walk would find ANY merge on its history and disable
+    // the patch-id sign in every repo that has one.
     const merge = (
       await gitOut(deps.cmd, repoRoot, [
         "rev-list",
-        "-1",
+        "--no-walk",
         "--min-parents=2",
         sha,
       ])
@@ -702,6 +744,7 @@ export function createJanitor(deps: JanitorDeps) {
       if (!tt) return false;
       const mergedTree = (
         await gitOut(deps.cmd, repoRoot, [
+          ...(await mergeDriverArgs(repoRoot)),
           "merge-tree",
           "--write-tree",
           t,
@@ -765,10 +808,39 @@ export function createJanitor(deps: JanitorDeps) {
     return reflogPositionsSafe(path, refs, repoRoot, targets);
   };
 
+  /**
+   * §16.3 (PLUG-199): submodule objects live in the copy's own git dir
+   * (`$GIT_DIR/modules/<name>` — inside `<common>/worktrees/<id>/` for a
+   * linked worktree) and die with it, outside every origin check — a
+   * copy carrying submodules is never removed. Presence is proven by
+   * `.gitmodules` at the copy root or a `modules/` dir under the
+   * worktree's git dir; a failed `--git-dir` probe proves nothing —
+   * `null` keeps the copy.
+   */
+  const copyHasSubmodules = async (
+    path: string,
+    gitDir?: string | null,
+  ): Promise<boolean | null> => {
+    if (existsSync(join(path, ".gitmodules"))) return true;
+    let dir = gitDir;
+    if (dir === undefined) {
+      const raw = await gitOut(deps.cmd, path, [
+        "rev-parse",
+        "--git-dir",
+      ]);
+      if (raw === null) return null;
+      dir = raw.trim();
+      if (dir && !isAbsolute(dir)) dir = join(path, dir);
+    }
+    if (!dir) return null;
+    return existsSync(join(dir, "modules"));
+  };
+
   const run = async (
     opts: JanitorRunOptions = {},
   ): Promise<JanitorRunSummary> => {
     const at = now();
+    mergeDriverCache.clear();
     const summary: JanitorRunSummary = {
       applied: false,
       removedCopies: 0,
@@ -1158,7 +1230,6 @@ export function createJanitor(deps: JanitorDeps) {
         ? deps.janitor.item(env.id)?.state === "reported"
         : reportedMem.has(env.id);
       reportedMem.add(env.id);
-      if (!persist) firstSeenMem.delete(env.id);
       reportedNow.push({
         env,
         reason,
@@ -1176,7 +1247,9 @@ export function createJanitor(deps: JanitorDeps) {
             threadId: pickThreadId(env),
             state: "reported",
             reason,
-            firstSeenAt: null,
+            // PLUG-199: firstSeenAt is NOT cleared — a «reported»
+            // spell must not restart the merged streak (no
+            // merged-wait ↔ reported flip).
           },
           at,
         );
@@ -1362,6 +1435,17 @@ export function createJanitor(deps: JanitorDeps) {
         return after(abandoned ? "abandoned-dirty" : "dirty", abandoned);
       if (unfinished) return after("unfinished-op");
       if (gitDirFailed) return after("unfinished-unknown");
+      // §16.3 (PLUG-199): a copy with submodules is never removed —
+      // their objects live inside the copy's git dir and no origin
+      // check covers them; idle past abandonedAfter — «брошено».
+      const submodules = await copyHasSubmodules(path, gitDir);
+      if (submodules === null) return after("submodules-unknown");
+      if (submodules) {
+        return after(
+          abandoned ? "abandoned-submodules" : "has-submodules",
+          abandoned,
+        );
+      }
       // §16.3 (ревизия 25, главное условие): «ничего не теряется» —
       // every commit the copy's HEAD or its own branch ever pointed at
       // must already sit on a remote target: as an ancestor, as a
@@ -1660,6 +1744,13 @@ export function createJanitor(deps: JanitorDeps) {
           note(lost === "lost" ? "unpushed-commits" : "unpushed-unknown", e.id);
           return;
         }
+        // §16.3 (PLUG-199): a submodule initialised after the snapshot
+        // still blocks the archive — the check is re-run, not cached.
+        const sub = await copyHasSubmodules(e.path!);
+        if (sub !== false) {
+          note(sub === null ? "submodules-unknown" : "has-submodules", e.id);
+          return;
+        }
         // §15 «Действие» (PLUG-197): a process may have cd'ed into the
         // copy after the run-start probe — re-check before archiving.
         const proc = await hasProcessIn(e.path!);
@@ -1800,7 +1891,7 @@ export function createJanitor(deps: JanitorDeps) {
     // «Ветки без копий»: local `bb/` branches merged on origin (ancestor
     // or content-equal) and not checked out anywhere are deleted (apply
     // mode only) — on a *later* run than the copy's own archiving, once
-    // BB has freed the worktree. `branch -D` erases the branch's own
+    // BB has freed the worktree. Deleting a branch erases its own
     // reflog, where a `reset`-orphaned commit may have its only
     // reference — so the «nothing lost» rule is re-checked over that
     // reflog first (§15, PLUG-195); a failure keeps the branch
@@ -1824,7 +1915,7 @@ export function createJanitor(deps: JanitorDeps) {
       worktreeListFailed,
     } of repoInfos) {
       // A failed `worktree list` cannot prove a branch is open nowhere —
-      // `branch -D` would refuse anyway, but the sweep skips entirely.
+      // the sweep skips entirely rather than delete on a guess.
       if (!fetched || worktreeListFailed) continue;
       // PLUG-197 PX6: every branch row of THIS repo is a definite
       // outcome — the sweep either evaluates the branch or proves it
@@ -1861,7 +1952,7 @@ export function createJanitor(deps: JanitorDeps) {
         if (openBranches.has(branch)) continue;
         if (!(await shaMergedIn(root, branch, protectedTargets))) continue;
         // §15 «Ветки без копий»: every position of the branch's own
-        // reflog must be safe before `branch -D` erases it — checked
+        // reflog must be safe before the delete erases it — checked
         // per commit (PLUG-197: «A + revert A» nets to origin, but A
         // never reached it).
         const tip = (
@@ -1924,7 +2015,6 @@ export function createJanitor(deps: JanitorDeps) {
                 branch,
                 state: abandoned ? "reported" : "kept",
                 reason: "branch-unpushed",
-                firstSeenAt: null,
               },
               at,
             );
@@ -1934,7 +2024,18 @@ export function createJanitor(deps: JanitorDeps) {
         reportedMem.delete(envId);
         summary.orphanBranches += 1;
         if (apply && cfg.deleteBranches) {
-          if (await gitOk(deps.cmd, root, ["branch", "-D", branch])) {
+          // §15/§16.3 (PLUG-199): delete atomically against the tip the
+          // checks above verified — `branch -D` removes whatever the
+          // ref points at NOW, so a mid-run `branch -f` would slip an
+          // unverified position under the delete.
+          if (
+            await gitOk(deps.cmd, root, [
+              "update-ref",
+              "-d",
+              `refs/heads/${branch}`,
+              tip!,
+            ])
+          ) {
             summary.removedBranches += 1;
           } else {
             keep(summary, "branch-delete-failed");

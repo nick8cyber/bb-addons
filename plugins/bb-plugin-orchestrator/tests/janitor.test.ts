@@ -3007,8 +3007,8 @@ test("Q1: after reflog expiry «A + revert A» still keeps the copy — ancestor
   // `gc.reflogExpire` (90d) erases every position — A is reachable
   // only as an ancestor of the tip; it must still block removal
   git(env.path, ["reflog", "expire", "--expire=now", "--all"]);
-  // the «reported» row drops firstSeenAt — the afterMerge streak is
-  // re-measured before the next verdict
+  // the «reported» row keeps firstSeenAt (PLUG-199) — no merged-wait ↔
+  // reported streak flip; the verdict itself is unchanged
   w.clock.t += 16 * 60_000;
   res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
@@ -3110,4 +3110,209 @@ test("Q4: an empty commit has no content — the copy stays (PLUG-198)", async (
   // an empty commit merges clean («влита»), but it is no content of
   // its own — «ничего не теряется» keeps the copy
   assert.equal(res.kept["unpushed-commits"], 1);
+});
+
+// ── PLUG-199 ─────────────────────────────────────────────────────────
+
+test("M1: a merge driver from repo config cannot fake the content sign — the copy stays (PLUG-199)", async () => {
+  const { repo, base } = makeRepo();
+  // `db.yml merge=ours` + a silent `true` driver: merge-tree reproduces
+  // the target tree for ANY commit touching db.yml — the content sign
+  // must run with every configured driver disabled
+  writeFileSync(join(repo, ".gitattributes"), "db.yml merge=ours\n");
+  writeFileSync(join(repo, "db.yml"), "db: base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: attrs + db"]);
+  git(repo, ["push", "origin", "main"]);
+  git(repo, ["config", "merge.ours.driver", "true"]);
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "db.yml"), "db: local\n");
+  git(env.path, ["add", "db.yml"]);
+  git(env.path, ["commit", "-m", "feat: A edits db.yml"]);
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repo, "db.yml"), "db: origin\n");
+  git(repo, ["add", "db.yml"]);
+  git(repo, ["commit", "-m", "feat: origin edits db.yml"]);
+  git(repo, ["push", "origin", "main"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.archivedCalls.length, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
+  // A is on no remote branch — a removal would have lost it
+  assert.ok(!git(repo, ["branch", "-r", "--contains", a]).includes(a));
+});
+
+test("M1b: the same driver cannot fake a copy-less bb/ branch's safety — it stays (PLUG-199)", async () => {
+  const { repo, base } = makeRepo();
+  writeFileSync(join(repo, ".gitattributes"), "db.yml merge=ours\n");
+  writeFileSync(join(repo, "db.yml"), "db: base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: attrs + db"]);
+  git(repo, ["config", "merge.ours.driver", "true"]);
+  git(repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(repo, "db.yml"), "db: local\n");
+  git(repo, ["add", "db.yml"]);
+  git(repo, ["commit", "-m", "feat: A"]);
+  git(repo, ["checkout", "main"]);
+  writeFileSync(join(repo, "db.yml"), "db: origin\n");
+  git(repo, ["add", "db.yml"]);
+  git(repo, ["commit", "-m", "feat: origin db"]);
+  git(repo, ["push", "origin", "main"]);
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  git(repo, ["rev-parse", "--verify", "bb/o"]);
+});
+
+test("S1: a copy with a submodule is never removed — its objects live in the copy (PLUG-199)", async () => {
+  const { repo, base } = makeRepo();
+  const subSrc = join(base, "subsrc");
+  execFileSync("git", ["init", "-q", "-b", "main", subSrc]);
+  git(subSrc, ["config", "user.name", "Agent"]);
+  git(subSrc, ["config", "user.email", "agent@x.io"]);
+  writeFileSync(join(subSrc, "s.txt"), "s\n");
+  git(subSrc, ["add", "."]);
+  git(subSrc, ["commit", "-qm", "feat: sub"]);
+  const env = addEnv(repo, base, "a");
+  git(env.path, [
+    "-c",
+    "protocol.file.allow=always",
+    "submodule",
+    "add",
+    subSrc,
+    "sub",
+  ]);
+  git(env.path, ["commit", "-qm", "feat: add submodule"]);
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.archivedCalls.length, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-submodules");
+});
+
+test("P4: a patch-equivalent commit clears «ничего не теряется» even with merges in history (PLUG-199)", async () => {
+  const { repo, base } = makeRepo();
+  // a --no-ff merge in origin's history — a bare rev-list walk used to
+  // find it and disable the patch-id sign entirely
+  git(repo, ["checkout", "-b", "side"]);
+  commitIn(repo, "side.txt", "feat: side");
+  git(repo, ["checkout", "main"]);
+  commitIn(repo, "m.txt", "feat: main work");
+  git(repo, ["merge", "--no-ff", "-m", "merge: side", "side"]);
+  git(repo, ["push", "origin", "main"]);
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "c.txt", "feat: C");
+  const c = git(env.path, ["rev-parse", "HEAD"]);
+  // C reaches origin only by patch — cherry-picked, then its lines
+  // edited so merge-tree conflicts (no content equality, no ancestry)
+  git(repo, ["cherry-pick", "-x", c]);
+  writeFileSync(join(repo, "c.txt"), "feat: C\nedited\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "fix: adjust C"]);
+  git(repo, ["push", "origin", "main"]);
+  // the copy's tip returns to its merge base — C lives on only in the
+  // reflogs; the env is «влита», C must be proven by patch-id
+  git(env.path, ["reset", "--hard", "HEAD~1"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.deepEqual(w.archivedCalls, ["thr_a"]);
+});
+
+test("a branch moved between the check and the delete is not deleted — update-ref refuses (PLUG-199)", async () => {
+  const { repo, base } = makeRepo();
+  // bb/o at origin's tip — fully merged, safe to delete …
+  const tip = git(repo, ["rev-parse", "HEAD"]);
+  git(repo, ["branch", "bb/o", tip]);
+  const env = addEnv(repo, base, "a");
+  // … until a concurrent operator moves it between the janitor's
+  // check and its `update-ref -d` — the delete must refuse
+  const moved = git(repo, [
+    "commit-tree",
+    `${tip}^{tree}`,
+    "-p",
+    tip,
+    "-m",
+    "wip: moved",
+  ]);
+  const movingCmd: CmdRunner = {
+    run: async (file, args, o) => {
+      if (
+        file === "git" &&
+        args[0] === "-C" &&
+        args[2] === "update-ref" &&
+        args[3] === "-d" &&
+        args[4] === "refs/heads/bb/o"
+      ) {
+        git(repo, ["branch", "-f", "bb/o", moved]);
+      }
+      return realCmd.run(file, args, o);
+    },
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: movingCmd,
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-delete-failed"], 1);
+  assert.equal(git(repo, ["rev-parse", "bb/o"]), moved);
 });
