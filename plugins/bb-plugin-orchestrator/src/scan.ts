@@ -146,22 +146,64 @@ function personalEmailHits(
   });
 }
 
-const FOREIGN_BOT_MARKER_RE =
-  /^\s*(Co-Authored-By|Co-authored-by|Signed-off-by|Generated with|Generated-by)\s*:?[ \t]/gim;
+/** §17.3 (С6): the foreign-bot trailer names category 2 scans for. */
+export const FOREIGN_BOT_TRAILER_NAMES = [
+  "Co-Authored-By",
+  "Signed-off-by",
+  "Generated with",
+  "Generated-by",
+] as const;
 
-/** §17.3 (С6): foreign-bot trailer names found in the commit body and
- * NOT in the project's `allowedTrailers`. */
+const FOREIGN_BOT_MARKER_RE = new RegExp(
+  `^\\s*(${FOREIGN_BOT_TRAILER_NAMES.join("|")})\\s*:?[ \\t]([^\\n]*)`,
+  "gim",
+);
+
+/** §17.3 (С6): one `allowedTrailers` element — a trailer name (every
+ * value allowed) or «name: value prefix»; the name must be a trailer
+ * the scan actually produces. Matching ignores case. */
+export interface AllowedTrailer {
+  name: string;
+  /** Value head; `null` — every value allowed. */
+  prefix: string | null;
+}
+
+export function parseAllowedTrailer(entry: string): AllowedTrailer | null {
+  const t = entry.trim();
+  const i = t.indexOf(":");
+  const name = (i < 0 ? t : t.slice(0, i)).trim();
+  const prefix = i < 0 ? null : t.slice(i + 1).trim();
+  if (
+    !FOREIGN_BOT_TRAILER_NAMES.some(
+      (n) => n.toLowerCase() === name.toLowerCase(),
+    ) ||
+    prefix === ""
+  ) {
+    return null;
+  }
+  return { name: name.toLowerCase(), prefix: prefix?.toLowerCase() ?? null };
+}
+
+/** §17.3 (С6): foreign-bot trailers found in the commit body that no
+ * `allowedTrailers` element covers — a bare name covers every value,
+ * «name: prefix» only values starting with it (case-insensitive). */
 function foreignTrailers(
   body: string,
   allowedTrailers: readonly string[],
 ): string[] {
-  const allowed = new Set(
-    allowedTrailers.map((a) => a.trim().toLowerCase()),
-  );
+  const allowed = allowedTrailers
+    .map(parseAllowedTrailer)
+    .filter((a): a is AllowedTrailer => a !== null);
   const found: string[] = [];
   for (const m of body.matchAll(FOREIGN_BOT_MARKER_RE)) {
-    const name = m[1]!;
-    if (!allowed.has(name.toLowerCase())) found.push(name);
+    const name = m[1]!.toLowerCase();
+    const value = (m[2] ?? "").trim().toLowerCase();
+    const covered = allowed.some(
+      (a) =>
+        a.name === name &&
+        (a.prefix === null || value.startsWith(a.prefix)),
+    );
+    if (!covered) found.push(m[1]!);
   }
   return found;
 }

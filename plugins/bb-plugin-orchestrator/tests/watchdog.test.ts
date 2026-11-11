@@ -3197,6 +3197,60 @@ test("§16.5: cancelled delivers a result message too", async () => {
   assert.match(JSON.stringify(msg!.input), /: cancelled, ветка/);
 });
 
+// PLUG-224: `orchestrator cancel` marks the row — the §16.5 delivery
+// sends the cancelled header but never tails «без отчёта» on it.
+test("§16.5 (PLUG-224): a coordinator-initiated cancel never sends «без отчёта»", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.store.setStatus(row.id, "cancelled");
+  h.store.addSetupError(row.id, "coordinator-cancel", "thr_coord");
+  await settleResults(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_notice, "plugin");
+  const msg = h.sends.find((x) => x.threadId === "thr_coord");
+  const text = JSON.stringify(msg!.input);
+  assert.match(text, /: cancelled, ветка/);
+  assert.ok(!/без отчёта/.test(text), text);
+});
+
+// PLUG-224: BB's own child-interrupted notice satisfies even an
+// empty-report coordinator-cancelled row — no plugin line at all.
+test("§16.5 (PLUG-224): child-interrupted satisfies a coordinator-cancelled row", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.store.setStatus(row.id, "cancelled");
+  h.store.addSetupError(row.id, "coordinator-cancel", "thr_coord");
+  h.eventLog.set("thr_coord", [
+    childNotice(11, T0 + 500, "thr_e1", "child-interrupted"),
+  ]);
+  await settleResults(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_notice, "bb");
+  assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 0);
+});
+
+// PLUG-224: a watchdog-driven cancel (the thread vanished) still tails
+// «без отчёта» — only the coordinator's own cancel is exempt.
+test("§16.5 (PLUG-224): an external cancel still sends «без отчёта»", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // the executor thread is gone — the watchdog cancels it
+  await h.wd.onThreadGone(dto("thr_e1", "idle", { deletedAt: T0 }), "deleted");
+  await settleResults(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "cancelled");
+  assert.equal(fresh.result_notice, "plugin");
+  const msg = h.sends.find((x) => x.threadId === "thr_coord");
+  const text = JSON.stringify(msg!.input);
+  assert.match(text, /: cancelled, ветка/);
+  assert.match(text, /без отчёта/);
+});
+
 test("§16.5: BB child-completed in the coordinator journal → bb, no plugin message", async () => {
   const h = makeHarness();
   const row = h.insertActive({ threadId: "thr_e1" });

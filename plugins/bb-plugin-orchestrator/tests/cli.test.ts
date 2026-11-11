@@ -310,6 +310,20 @@ test("CLI cancel from a foreign thread is refused; owner coordinator cancels", a
     "cancelled",
   );
   assert.deepEqual(stops, ["thr_exec"]);
+
+  // PLUG-224: the coordinator's own cancel is marked — the §16.5
+  // delivery then skips the «исполнитель закончил без отчёта» tail
+  const shown = await host.harness.runCli(
+    ["show", String(delegationId), "--json"],
+    { threadId: "thr_coord" },
+  );
+  const delegation = (
+    JSON.parse(shown.stdout) as {
+      delegation: { status: string; setup_errors: string };
+    }
+  ).delegation;
+  assert.equal(delegation.status, "cancelled");
+  assert.match(delegation.setup_errors, /coordinator-cancel/);
 });
 
 // ── rev 13: cancel без thread_id, dispose-интертность, throttle пресетов ──

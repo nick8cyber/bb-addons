@@ -2462,6 +2462,19 @@ export function createJanitor(deps: JanitorDeps) {
       if (!TRANSIENT_KEEPS.has(reason.replace(/^cascade:/, ""))) {
         ctx.definite.add(env.id);
       }
+      // §17.4 (ревью PLUG-221): a «removing copy» journal line needs
+      // its pair when the run keeps the copy — otherwise the journal
+      // claims «removing» for a copy that is still there (a failed
+      // archive, a thread outside the cascade holding the copy).
+      const pre = preArchiveShas.get(env.id);
+      if (pre) {
+        log.info?.(
+          `orchestrator janitor: kept copy ` +
+            `${repoByEnv.get(env.id)?.commonDir ?? env.path}:` +
+            `${env.branchName?.trim() ?? "-"} ` +
+            `at ${pre.tipSha ?? "-"} (removal cancelled: ${reason})`,
+        );
+      }
     };
     for (const env of envs) {
       const facts = await envFacts(env);
@@ -2598,6 +2611,30 @@ export function createJanitor(deps: JanitorDeps) {
           at,
         );
         ctx.definite.add(env.id);
+      }
+    }
+
+    // §17.4 (ревью PLUG-221): a copy row still sitting at «removing»
+    // whose env BB no longer lists closes as «removed» — a crash
+    // between the archive and the settle write left it dangling and the
+    // per-env pass above never reaches a gone env (the same closing the
+    // branch sweep below gives deleted branches). `tip_sha` stays
+    // (`fields ?? prev`), so `report --json` now shows the removal SHA.
+    for (const i of deps.janitor.items()) {
+      if (
+        i.state === "kept" &&
+        i.reason === "removing" &&
+        !i.env_id.startsWith("branch:") &&
+        !ctx.allEnvIds.has(i.env_id)
+      ) {
+        ctx.definite.add(i.env_id);
+        if (ledger) {
+          deps.janitor.upsertItem(
+            i.env_id,
+            { state: "removed", reason: "removed", removedAt: at },
+            at,
+          );
+        }
       }
     }
 

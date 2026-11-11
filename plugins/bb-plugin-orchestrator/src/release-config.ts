@@ -16,6 +16,7 @@
  * overrides the top-level one.
  */
 import type { PolicyIssue } from "./policy.js";
+import { parseAllowedTrailer } from "./scan.js";
 
 export type ReleaseAction = "push" | "pr";
 export type SyncMode = "merge" | "rebase";
@@ -251,6 +252,20 @@ function parseLayer(
       err(`${path}.${key}`, "must be an array of non-empty strings");
     } else {
       layer[key] = v.map((a) => (a as string).trim());
+    }
+  }
+  // §17.3 (С6, PLUG-224): an `allowedTrailers` element is a known
+  // trailer name, optionally with a ": <value prefix>" — anything else
+  // (a typo'd name, an empty prefix) is a config error, not dead config.
+  if (layer.allowedTrailers) {
+    const bad = layer.allowedTrailers.findIndex(
+      (a) => parseAllowedTrailer(a) === null,
+    );
+    if (bad >= 0) {
+      err(
+        `${path}.allowedTrailers[${bad}]`,
+        'must be a known trailer name ("Co-Authored-By", "Signed-off-by", "Generated with", "Generated-by"), optionally ": <value prefix>"',
+      );
     }
   }
   return layer;

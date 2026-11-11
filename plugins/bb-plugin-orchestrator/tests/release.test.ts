@@ -1845,6 +1845,78 @@ test("§17.3 С6: allowedTrailers/allowedEmails parse and exempt matching findin
   assert.ok(!dom.some((f) => f.rule === "personal-email"));
 });
 
+test("§17.3 С6 (PLUG-224): allowedTrailers «name: value prefix», case-insensitive", async () => {
+  const meta = (body: string) => ({
+    sha: "b".repeat(40),
+    authorName: "Agent",
+    authorEmail: "agent@x.io",
+    committerName: "Agent",
+    committerEmail: "agent@x.io",
+    body,
+  });
+  const base = {
+    repoPath: "/r",
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    added: [],
+    leaks: LEAKS,
+    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+  };
+  const claude =
+    "feat: x\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>";
+  const devin = "feat: x\n\nCo-Authored-By: Devin <devin@x.io>";
+  const scan = (body: string, allowedTrailers: string[]) =>
+    machineScan(GL_EMPTY, {
+      ...base,
+      commits: [meta(body)],
+      allowedTrailers,
+    });
+  // «name: prefix»: Claude's trailer passes, Devin's does not
+  assert.ok(
+    !(await scan(claude, ["Co-Authored-By: Claude"])).some(
+      (f) => f.rule === "foreign-bot-trailer",
+    ),
+  );
+  assert.ok(
+    (await scan(devin, ["Co-Authored-By: Claude"])).some(
+      (f) => f.rule === "foreign-bot-trailer",
+    ),
+  );
+  // a bare name allows every value
+  for (const body of [claude, devin]) {
+    assert.ok(
+      !(await scan(body, ["Co-Authored-By"])).some(
+        (f) => f.rule === "foreign-bot-trailer",
+      ),
+    );
+  }
+  // name, prefix and trailer text all compare case-insensitively
+  assert.ok(
+    !(await scan("feat: x\n\nco-authored-by: CLAUDE Opus <c@x.io>", [
+      "CO-AUTHORED-BY: claude",
+    ])).some((f) => f.rule === "foreign-bot-trailer"),
+  );
+
+  // validation: an unknown name or an empty prefix is a config error
+  for (const entry of ["Co-Authered-By", "Co-Authored-By:", "Unknown: x"]) {
+    const bad = parseReleaseConfig(
+      JSON.stringify({ defaults: { allowedTrailers: [entry] } }),
+    );
+    assert.ok(
+      bad.errors.some((e) => e.path === "defaults.allowedTrailers[0]"),
+      `expected a config error for ${entry}, got ${JSON.stringify(bad.errors)}`,
+    );
+  }
+  const good = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        allowedTrailers: ["Co-Authored-By: Claude", "Signed-off-by"],
+      },
+    }),
+  );
+  assert.equal(good.errors.length, 0);
+});
+
 test("§17.3 мелко5: review verdict falls back to the reviewer thread's output", async () => {
   const { repo } = makeRepo();
   const okCase = makeDeps(repo, {

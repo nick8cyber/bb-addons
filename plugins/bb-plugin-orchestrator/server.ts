@@ -1123,6 +1123,13 @@ export async function createPlugin(
       }
       // Status first, stop second — otherwise our own stop can read as external.
       store.setStatus(row.id, "cancelled");
+      // PLUG-224: the coordinator cancelled it — the §16.5 delivery
+      // must not tail «исполнитель закончил без отчёта».
+      store.addSetupError(
+        row.id,
+        "coordinator-cancel",
+        callerThreadId ?? "cli",
+      );
       if (stopTarget) {
         // §16.1/PLUG-184: the thread's queued BB auto-retry is cancelled
         // BEFORE our stop — otherwise it lifts the cancelled executor

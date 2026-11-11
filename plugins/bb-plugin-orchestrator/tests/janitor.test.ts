@@ -5058,6 +5058,84 @@ test("a crash between archive and the settle write keeps tip_sha — stamped pre
   );
 });
 
+// ── PLUG-221 (ревью PLUG-219, неблокирующие 1 и 3) ────────────────────
+
+// §17.4 (ревью PLUG-221 #1): a copy row left at «removing» by a crash
+// between the archive and the settle closes as «removed» once the env
+// is gone from BB's list — like the gone-branch closing pass. tip_sha
+// stays and `report --json` shows it on the `removed` row.
+test("a «removing» copy row whose env is gone closes as removed (§17.4 PLUG-221)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const duDies: CmdRunner = {
+    run: async (file, args, o) =>
+      file === "du"
+        ? Promise.reject(new Error("du boom"))
+        : realCmd.run(file, args, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: duDies,
+  });
+  const tip = git(repo, ["rev-parse", env.branchName]);
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  await w.jan.run(); // crashes in settle — the row sits at «removing»
+  assert.equal(w.janitor.item(env.id)!.reason, "removing");
+
+  // BB freed the copy — the env is no longer listed; the next run
+  // closes the dangling row as removed and `report --json` shows the SHA
+  w.envSpecs.length = 0;
+  await w.jan.run();
+  const row = w.janitor.item(env.id)!;
+  assert.equal(row.state, "removed");
+  assert.equal(row.reason, "removed");
+  assert.equal(row.tip_sha, tip);
+  const rep = await w.jan.report();
+  assert.equal(
+    rep.items.find((i) => i.env_id === env.id)!.tip_sha,
+    tip,
+  );
+});
+
+// §17.4 (ревью PLUG-221 #3): a «removing copy» journal line gets a
+// paired `kept copy … (removal cancelled: <reason>)` when the run ends
+// up keeping the copy — here a failed archive rolled the members back.
+test("a kept copy after «removing copy» gets a paired kept line (§17.4 PLUG-221)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    archiveFailFor: new Set([`thr_${env.id}`]),
+  });
+  const common = git(env.path, ["rev-parse", "--git-common-dir"]);
+  const tip = git(repo, ["rev-parse", env.branchName]);
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(res.kept["archive-failed"], 1);
+  assert.equal(w.janitor.item(env.id)!.reason, "archive-failed");
+  // журнал: «removing copy …» followed by the paired «kept copy …»
+  const removing = w.infos.findIndex((m) =>
+    m.includes(`removing copy ${common}:${env.branchName}`),
+  );
+  const kept = w.infos.findIndex(
+    (m) =>
+      m.includes(`kept copy ${common}:${env.branchName}`) &&
+      m.includes(`at ${tip}`) &&
+      m.includes("removal cancelled: archive-failed"),
+  );
+  assert.ok(removing >= 0, `infos: ${w.infos.join(" | ")}`);
+  assert.ok(kept > removing, `infos: ${w.infos.join(" | ")}`);
+});
+
 // §17.4 (ревью PLUG-220): a new thread seen only in the FIRST pass is
 // excused from the sets comparison yet joins the union — and a copy it
 // holds is NOT removed.

@@ -636,10 +636,15 @@ export class DelegationStore {
         .run(Date.now(), id);
       // §16.5: the next `done` re-opens BB's grace window — a stale
       // `result-window` marker would skip it and send over BB's notice.
+      // A stale `coordinator-cancel` (PLUG-224) would keep «без отчёта»
+      // wrongly suppressed on the new round.
       try {
         const errors = (
           JSON.parse(row.setup_errors) as { step?: string }[]
-        ).filter((e) => e?.step !== "result-window");
+        ).filter(
+          (e) =>
+            e?.step !== "result-window" && e?.step !== "coordinator-cancel",
+        );
         this.db
           .prepare(
             `UPDATE delegations SET setup_errors = ? WHERE id = ?`,

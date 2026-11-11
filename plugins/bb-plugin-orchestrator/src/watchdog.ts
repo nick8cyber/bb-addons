@@ -1855,8 +1855,15 @@ export function createWatchdog(deps: WatchdogDeps) {
     // journal is not "absent": the claim is released so the §7 pass
     // re-checks — until the retry limit is spent, after which a late
     // duplicate beats a lost result (PLUG-200 #2).
+    // PLUG-224: the coordinator's own `orchestrator cancel` never gets
+    // a «без отчёта» tail — and BB's `child-interrupted` notice may
+    // satisfy the delivery even with an empty report, so the journal
+    // check runs for it too.
+    const selfCancelled =
+      fresh.status === "cancelled" &&
+      hasSetupError(fresh, "coordinator-cancel");
     let bbCarried = false;
-    if (report.length > 0) {
+    if (report.length > 0 || selfCancelled) {
       const seen = await coordinatorSawOutcome(fresh);
       if (seen === null) {
         await trackRetry(
@@ -1888,7 +1895,9 @@ export function createWatchdog(deps: WatchdogDeps) {
     const body =
       report.length > 0
         ? report.slice(0, RESULT_OUTPUT_CAP)
-        : "исполнитель закончил без отчёта";
+        : selfCancelled
+          ? ""
+          : "исполнитель закончил без отчёта";
     try {
       await deps.threads.send({
         threadId: coord.id,
@@ -1901,7 +1910,7 @@ export function createWatchdog(deps: WatchdogDeps) {
               `${fresh.thread_id ?? "—"}): ${fresh.status}, ветка ${branch}, ` +
               `коммит ${sha7}, копия ${copy}` +
               (doubt ? `, итог сомнителен: ${doubt}` : "") +
-              (bbCarried ? "" : `\n${body}`),
+              (bbCarried || body === "" ? "" : `\n${body}`),
             mentions: [],
           },
         ],
