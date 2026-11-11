@@ -419,9 +419,11 @@ test("refusal: not-done / no-result / not-found", async () => {
     runMerge({ ...PARAMS, ref: String(row.id) }, deps),
     (e: unknown) => (e as OrchestratorError).code === "not-done",
   );
+  // §17.2 (e2e 1): a task key whose latest round is still `running` is
+  // `not-done`, not `not-found` — the caller learns the round exists.
   await assert.rejects(
     runMerge(PARAMS, deps),
-    (e: unknown) => (e as OrchestratorError).code === "not-found",
+    (e: unknown) => (e as OrchestratorError).code === "not-done",
   );
   // done but no result recorded
   store.setStatus(row.id, "done");
@@ -1054,3 +1056,74 @@ test("a stale lock with a branch but no head restores branch-only (PLUG-191)", a
   assert.equal(store.get(row.id)!.merge_status, "merged");
 });
 
+
+// ── §17 r26 ──────────────────────────────────────────────────────────
+
+test("§17.2 (e2e 1): merge on a just-finished round syncs the row first", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  // BB's child-completed notice landed before the watchdog wrote `done`
+  // — merge forces the delegation's own sync instead of not-found.
+  store.setStatus(row.id, "running");
+  let synced = 0;
+  deps.syncRow = async (r) => {
+    synced++;
+    store.setStatus(r.id, "done");
+    recordResult(store, r, resultSha);
+  };
+  const res = await runMerge(PARAMS, deps);
+  assert.equal(synced, 1);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+});
+
+test("§17.2 (e2e 1): a running round that stays running is not-done", async () => {
+  const { coord, exec } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  store.setStatus(row.id, "running");
+  let synced = 0;
+  deps.syncRow = async () => {
+    synced++;
+  };
+  await assert.rejects(
+    runMerge(PARAMS, deps),
+    (e: unknown) => (e as OrchestratorError).code === "not-done",
+  );
+  assert.equal(synced, 1);
+});
+
+test("§17.3 (мелко 2): protected branches come from deps, not the default", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  // janitor.protectedBranches = ["release-only"]: the default `main` is
+  // no longer listed — the custom entry is what is refused.
+  deps.protectedBranches = ["release-only"];
+  gitR(coord, ["branch", "release-only"]);
+  await assert.rejects(
+    runMerge({ ...PARAMS, into: "release-only" }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "protected-branch",
+  );
+});
+
+test("§17.2 (С3): a changed result_sha clears the recorded merge state", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  store.setMerged(row.id, { into: "work", sha: "aaa111" });
+  let fresh = store.get(row.id)!;
+  assert.equal(fresh.merge_status, "merged");
+  // the executor revived and committed again — the old merge verdict is
+  // void, merge must not answer already-merged for the new sha
+  recordResult(store, row, "bbb222".padEnd(40, "0"));
+  fresh = store.get(row.id)!;
+  assert.equal(fresh.result_sha, "bbb222".padEnd(40, "0"));
+  assert.equal(fresh.merge_status, null);
+  assert.equal(fresh.merged_into, null);
+  assert.equal(fresh.merged_sha, null);
+  assert.equal(fresh.merged_at, null);
+  // and the SAME sha re-recorded keeps the merge state untouched
+  store.setMerged(row.id, { into: "work", sha: "ccc333" });
+  recordResult(store, row, "bbb222".padEnd(40, "0"));
+  fresh = store.get(row.id)!;
+  assert.equal(fresh.merge_status, "merged");
+});

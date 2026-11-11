@@ -401,7 +401,12 @@ export async function createPlugin(
       // hook itself may not touch the network, so the write rides on the
       // first session build after the decision — display-only either way.
       const decided = store.threadRole(context.thread.id)?.role;
-      if (decided && context.pluginMetadata.role !== decided) {
+      // §17.1: the `none` verdict is not a role — nothing to display.
+      if (
+        decided &&
+        isRoleId(decided) &&
+        context.pluginMetadata.role !== decided
+      ) {
         void bb.sdk.threads
           .updatePluginMetadata({
             threadId: context.thread.id,
@@ -627,6 +632,13 @@ export async function createPlugin(
       },
       delegate: (d) =>
         delegate({ ...d, threadId: input.callerThreadId }),
+      // §17.2 (e2e 1): BB's notice can outrun the watchdog's `done` —
+      // merge forces the row's sync before judging its status.
+      syncRow: (row) => watchdog.syncDelegation(row),
+      // §17.3 (мелко 2): the protected list is the janitor's
+      // `protectedBranches` setting, not the hardcoded default.
+      protectedBranches:
+        janitorConfig().config?.protectedBranches ?? undefined,
       mergeAutofix: () => currentSettings.mergeAutofix === true,
       // §16.6 `threadIds`: off → merge commits drop the task key.
       releaseThreadIds: (projectId) =>

@@ -741,6 +741,33 @@ export class DelegationStore {
     return rows.map((r) => r.t);
   }
 
+  /** §17.2 (мелко 6): coordinator threads that still own an ACTIVE
+   * delegation — the post-compaction reminder polls only these, not the
+   * whole history of coordinators every minute. */
+  activeCoordinatorThreadIds(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT coordinator_thread_id AS t FROM delegations
+         WHERE status IN ('dispatching','running')`,
+      )
+      .all() as { t: string }[];
+    return rows.map((r) => r.t);
+  }
+
+  /** §17.2 (мелко 6): status counts of ONE coordinator's delegations —
+   * the reminder names only its own rows, not global totals. */
+  countsByStatusForCoordinator(
+    coordinatorThreadId: string,
+  ): Record<string, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT status, COUNT(*) AS n FROM delegations
+         WHERE coordinator_thread_id = ? GROUP BY status`,
+      )
+      .all(coordinatorThreadId) as { status: string; n: number }[];
+    return Object.fromEntries(rows.map((r) => [r.status, r.n]));
+  }
+
   /** `plugin_meta` — durable service cursors (post-compaction reminder). */
   metaGet(key: string): string | undefined {
     return (
@@ -816,15 +843,27 @@ export class DelegationStore {
   /**
    * Routes an automatic reissue already sent this task to (§5.4): a route
    * may be picked at most once per task — but only auto-reissues count,
-   * routes of manual delegations stay eligible.
+   * routes of manual delegations stay eligible. §17.2 (мелко 4): the
+   * budget is per ROUND — a later round's chain may re-walk routes an
+   * earlier round already burned, so callers pass the current `round`.
    */
-  routesUsedByTask(taskKey: string): Set<string> {
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT route FROM delegations
-         WHERE task_key = ? AND reissue_of IS NOT NULL`,
-      )
-      .all(normalizeTaskKey(taskKey)) as { route: string }[];
+  routesUsedByTask(taskKey: string, round?: number): Set<string> {
+    const key = normalizeTaskKey(taskKey);
+    const rows = (
+      round === undefined
+        ? this.db
+            .prepare(
+              `SELECT DISTINCT route FROM delegations
+               WHERE task_key = ? AND reissue_of IS NOT NULL`,
+            )
+            .all(key)
+        : this.db
+            .prepare(
+              `SELECT DISTINCT route FROM delegations
+               WHERE task_key = ? AND reissue_of IS NOT NULL AND round = ?`,
+            )
+            .all(key, round)
+    ) as { route: string }[];
     return new Set(rows.map((r) => r.route));
   }
 
@@ -938,7 +977,11 @@ export class DelegationStore {
     return row ? { branch: row.result_branch, round: row.round } : null;
   }
 
-  /** §4.1: record the executor worktree's state at `done`. */
+  /** §4.1: record the executor worktree's state at `done`. §17.2 (С3):
+   * a CHANGED `result_sha` — a revived thread that committed more —
+   * voids the recorded merge: the new commits were never merged, so
+   * `merge` must no longer answer `already-merged` and `release` must
+   * not publish the stale `merged_into` range. */
   setRoundResult(
     id: number,
     result: {
@@ -949,10 +992,17 @@ export class DelegationStore {
       dirty: boolean;
     },
   ): void {
+    const prev = this.get(id);
+    const shaChanged = prev != null && prev.result_sha !== result.sha;
     this.db
       .prepare(
         `UPDATE delegations SET result_env_id = ?, result_branch = ?,
-         result_sha = ?, result_commits = ?, result_dirty = ?, updated_at = ?
+         result_sha = ?, result_commits = ?, result_dirty = ?,
+         merge_status = CASE WHEN ? THEN NULL ELSE merge_status END,
+         merged_into = CASE WHEN ? THEN NULL ELSE merged_into END,
+         merged_sha = CASE WHEN ? THEN NULL ELSE merged_sha END,
+         merged_at = CASE WHEN ? THEN NULL ELSE merged_at END,
+         updated_at = ?
          WHERE id = ?`,
       )
       .run(
@@ -961,6 +1011,10 @@ export class DelegationStore {
         result.sha,
         result.commits,
         result.dirty ? 1 : 0,
+        shaChanged ? 1 : 0,
+        shaChanged ? 1 : 0,
+        shaChanged ? 1 : 0,
+        shaChanged ? 1 : 0,
         Date.now(),
         id,
       );

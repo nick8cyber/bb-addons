@@ -496,6 +496,32 @@ export function createWatchdog(deps: WatchdogDeps) {
     await commentOnTask(row, text);
   };
 
+  /**
+   * §17.2 (e2e 4): `bb thread update --parent-notifications <off|auto>` —
+   * the quiet stop mutes BB's own «child interrupted» notice around the
+   * stop so the coordinator does not get a second outcome message.
+   */
+  const setParentNotify = async (
+    threadId: string,
+    mode: "off" | "auto",
+  ): Promise<boolean> => {
+    try {
+      await runChecked(deps.bbCli, [
+        "thread",
+        "update",
+        threadId,
+        "--parent-notifications",
+        mode,
+      ]);
+      return true;
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: parent-notifications ${mode} ${threadId}: ${message(e)}`,
+      );
+      return false;
+    }
+  };
+
   const hasSetupError = (row: DelegationRow, step: string) => {
     try {
       const parsed = JSON.parse(row.setup_errors) as { step?: string }[];
@@ -686,11 +712,18 @@ export function createWatchdog(deps: WatchdogDeps) {
       const candidates = restart
         ? info.level.chain
         : info.level.chain.slice(idx + 1);
+      // §17.2 (мелко 4): «один маршрут — один перевыпуск» считается в
+      // пределах ЗАХОДА — со второго захода сработавшие маршруты снова
+      // доступны резерву; то же для маршрутов, уже пройденных задачей
+      // при явном --route/--preset.
       const used = restart
         ? new Set(
-            store.delegationsByTask(row.task_key).map((r) => r.route),
+            store
+              .delegationsByTask(row.task_key)
+              .filter((r) => r.round === row.round)
+              .map((r) => r.route),
           )
-        : store.routesUsedByTask(row.task_key);
+        : store.routesUsedByTask(row.task_key, row.round);
       for (const name of candidates) {
         const r = info.policy.routes[name];
         if (!r || used.has(name) || unavailable.has(name)) continue;
@@ -1167,8 +1200,8 @@ export function createWatchdog(deps: WatchdogDeps) {
    */
   const lastTurnError = async (
     row: DelegationRow,
-  ): Promise<{ text: string } | "clean" | null> => {
-    if (!row.thread_id) return "clean";
+  ): Promise<{ text: string } | { clean: true; completed: boolean } | null> => {
+    if (!row.thread_id) return { clean: true, completed: false };
     let events: WatchdogThreadEvent[];
     try {
       events = await deps.threads.events.list({
@@ -1202,8 +1235,10 @@ export function createWatchdog(deps: WatchdogDeps) {
           text: errText ?? `turn/completed: status ${String(data.status)}`,
         };
       }
-      return "clean";
+      return { clean: true, completed: true };
     }
+    // §17.2 (С2): without the last turn's `turn/completed` the turn is
+    // still in flight — clean-looking but NOT finished.
     for (const ev of tail) {
       const data = (ev.data ?? {}) as Record<string, unknown>;
       if (ev.type === "turn.failed" || ev.type === "turn/failed") {
@@ -1212,17 +1247,23 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (ev.type === "provider/error" || ev.type === "system/error") {
         // §5.3: `willRetry` means the provider is still retrying — the
         // turn did not end with an error and idle carries no verdict.
-        if (data.willRetry === true) return "clean";
+        if (data.willRetry === true) {
+          return { clean: true, completed: false };
+        }
         return { text: errorTextOf(data) ?? ev.type };
       }
       if (ev.type === "item/started" || ev.type === "item/completed") {
         const item = data.item as { type?: unknown } | undefined;
-        if (item?.type !== "userMessage") return "clean";
+        if (item?.type !== "userMessage") {
+          return { clean: true, completed: false };
+        }
         continue;
       }
-      if (RESPONSE_EVENT_TYPES.has(ev.type)) return "clean";
+      if (RESPONSE_EVENT_TYPES.has(ev.type)) {
+        return { clean: true, completed: false };
+      }
     }
-    return "clean";
+    return { clean: true, completed: false };
   };
 
   /**
@@ -1302,15 +1343,38 @@ export function createWatchdog(deps: WatchdogDeps) {
         .then((s) => s.trim())
         .catch(() => null);
       const dirty = (await git(["status", "--porcelain"])).trim().length > 0;
+      // §17.2 (мелко 1): the round's own commits are counted from the
+      // round's start — `continue_from` (заходы 2+) or the branch's
+      // reflog «branch: Created from <sha>» entry (заход 1, §16.3) —
+      // never from `mergeBaseBranch`, whose drift made «коммитов нет»
+      // unsound in later rounds.
       let commits: number | null = null;
-      if (env.mergeBaseBranch) {
-        const out = await git([
-          "rev-list",
-          "--count",
-          `${env.mergeBaseBranch}..HEAD`,
-        ]);
+      let start = row.continue_from?.trim() || null;
+      if (!start) {
+        const ref = (branch ?? env.branchName)?.trim();
+        if (ref) {
+          const reflog = await git([
+            "log",
+            "-g",
+            "--format=%H%x00%gs",
+            `refs/heads/${ref}`,
+          ]).catch(() => "");
+          for (const line of reflog.split("\n")) {
+            const sep = line.indexOf("\0");
+            if (sep < 0) continue;
+            if (/^branch: Created from\b/.test(line.slice(sep + 1))) {
+              start = line.slice(0, sep);
+              break;
+            }
+          }
+        }
+      }
+      if (start) {
+        const out = await git(["rev-list", "--count", `${start}..HEAD`]);
         const n = Number(out.trim());
-        commits = Number.isFinite(n) ? n : null;
+        commits = Number.isFinite(n) ? n : 0;
+      } else {
+        commits = 0;
       }
       store.setRoundResult(row.id, {
         envId: env.id ?? null,
@@ -1374,6 +1438,10 @@ export function createWatchdog(deps: WatchdogDeps) {
         `orchestrator: suppress #${row.id} auto-retry cancel: ${cancelErr}`,
       );
     }
+    // §17.2 (e2e 4): the suppressed turn is a past round — mute BB's
+    // «child interrupted» notice for the stop; the plugin's own
+    // `revived-suppressed` line is the sanctioned channel.
+    await setParentNotify(row.thread_id!, "off");
     let confirmed = false;
     try {
       await deps.threads.stop({ threadId: row.thread_id! });
@@ -1396,6 +1464,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (confirmed) {
       // This wake is handled — a NEW turn/started re-fires suppression.
       store.advanceLastSeq(row.id, turnSeq);
+      await setParentNotify(row.thread_id!, "auto");
     } else {
       log.warn?.(
         `orchestrator: suppress stop of ${row.thread_id} unconfirmed — next pass retries`,
@@ -1439,6 +1508,10 @@ export function createWatchdog(deps: WatchdogDeps) {
       );
       return;
     }
+    // §17.2 (e2e 4): mute BB's «child interrupted» notice for the stop —
+    // a stopped turn's outcome would otherwise reach the coordinator as
+    // a second child-completed. `auto` returns once the stop confirms.
+    await setParentNotify(row.thread_id!, "off");
     try {
       await deps.threads.stop({ threadId: row.thread_id! });
       const t = await getThread(row.thread_id!).catch(() => null);
@@ -1459,6 +1532,8 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     if (confirmed) {
       store.advanceLastSeq(row.id, turnSeq);
+      // §17.2: the mute was for the stop — restore delivery afterwards.
+      await setParentNotify(row.thread_id!, "auto");
       log.info?.(
         `orchestrator: delegation #${row.id} tracker wake ` +
           `stopped silently (turn seq ${turnSeq})`,
@@ -1864,8 +1939,23 @@ export function createWatchdog(deps: WatchdogDeps) {
       // nudge (→ `failed` on repeat) and `done`.
       const verdict = await lastTurnError(row);
       if (verdict === null) return; // unreadable journal is not a clean one
-      if (verdict !== "clean") {
+      if ("text" in verdict) {
         await handleErrored(row, verdict.text, now());
+        return;
+      }
+      // §17.2 (С2): `done` stands on the last turn's `turn/completed`
+      // actually read — without it the turn is still in flight.
+      if (!verdict.completed) return;
+      // §17.2 (С2): and the thread is re-read right before the write —
+      // BB may already have started the next turn while this handler
+      // waited in the plugin queue; an active thread is not `done`.
+      const latest = await getThread(thread.id);
+      if (
+        !latest ||
+        latest.status !== "idle" ||
+        latest.deletedAt ||
+        latest.archivedAt
+      ) {
         return;
       }
       // PLUG-184: the status move is conditional — a row that left
@@ -2063,10 +2153,28 @@ export function createWatchdog(deps: WatchdogDeps) {
     const { policy } = await deps.loadPolicy();
     // §2 rule 4 (r23): a route's own `firstResponseSeconds` overrides the
     // global window — slow cold starts (agy takes 2–3 min) must not stall.
-    const firstMsOf = (row: DelegationRow) =>
-      (policy?.routes[row.route]?.firstResponseSeconds ??
-        policy?.firstResponseSeconds ??
-        DEFAULT_FIRST_RESPONSE_SECONDS) * 1000;
+    // §17.2 (e2e 8): a `--preset` one-off route has no entry in
+    // `policy.routes` — it borrows the window of ANY policy route on the
+    // same provider, then `firstResponseSecondsByProvider`, then global.
+    const firstMsOf = (row: DelegationRow) => {
+      const own = policy?.routes[row.route]?.firstResponseSeconds;
+      if (own !== undefined) return own * 1000;
+      if (policy && row.route.startsWith("preset:")) {
+        const routeWindow = Object.values(policy.routes).find(
+          (r) =>
+            r.provider === row.provider &&
+            r.firstResponseSeconds !== undefined,
+        )?.firstResponseSeconds;
+        if (routeWindow !== undefined) return routeWindow * 1000;
+        const byProvider =
+          policy.firstResponseSecondsByProvider?.[row.provider];
+        if (byProvider !== undefined) return byProvider * 1000;
+      }
+      return (
+        (policy?.firstResponseSeconds ?? DEFAULT_FIRST_RESPONSE_SECONDS) *
+        1000
+      );
+    };
     // §16.5: `routes.*.startSeconds` (no turn began) and
     // `routes.*.idleSeconds` (response silence) — one message each,
     // never a stop.
@@ -2460,21 +2568,35 @@ export function createWatchdog(deps: WatchdogDeps) {
    * restart neither repeats nor loses the reminder.
    */
   const compactionReminders = async (s: ReconcileSummary) => {
-    for (const coordId of store.coordinatorThreadIds()) {
+    // §17.2 (мелко 6): only coordinators with ACTIVE delegations are
+    // polled — a dormant coordinator needs no §3 reminder, and scanning
+    // the whole history of coordinators every minute was pure waste.
+    for (const coordId of store.activeCoordinatorThreadIds()) {
       const key = `compact-seq:${coordId}`;
       let events: WatchdogThreadEvent[];
       try {
         events = await deps.threads.events.list({
           threadId: coordId,
           order: "desc",
-          limit: "5",
-          types: [COMPACTION_EVENT_TYPE],
+          limit: "50",
+          // §17.2 (e2e 7): Codex never emits `thread/compacted` — its
+          // compaction is an `item/completed` with
+          // `item.type = "contextCompaction"`.
+          types: [COMPACTION_EVENT_TYPE, "item/completed"],
         });
       } catch (e) {
         s.errors.push(`compact scan ${coordId}: ${message(e)}`);
         continue;
       }
-      const latest = events[0];
+      const latest = events.find(
+        (e) =>
+          e.type === COMPACTION_EVENT_TYPE ||
+          (e.type === "item/completed" &&
+            (
+              (e.data as { item?: { type?: unknown } } | null | undefined)
+                ?.item?.type === "contextCompaction"
+            )),
+      );
       const stored = store.metaGet(key);
       if (stored === undefined) {
         // PLUG-184/B1: first sight of this coordinator (e.g. a fresh r25
@@ -2496,7 +2618,9 @@ export function createWatchdog(deps: WatchdogDeps) {
         store.metaSet(key, String(latest.seq)); // nobody to remind
         continue;
       }
-      const counts = store.countsByStatus();
+      // §17.2 (мелко 6): the reminder counts only THIS coordinator's
+      // delegations — global totals belong to nobody's memory.
+      const counts = store.countsByStatusForCoordinator(coordId);
       const parts = Object.entries(counts)
         .map(([st, n]) => `${st}: ${n}`)
         .join(", ");
@@ -2729,7 +2853,26 @@ export function createWatchdog(deps: WatchdogDeps) {
     return summary;
   };
 
+  /**
+   * §17.2 (e2e 1): `merge` called on BB's outcome notice can land before
+   * the watchdog wrote `done` — run this row's stream read and idle
+   * evaluation now so the caller re-checks a fresh row, not a stale one.
+   */
+  const syncDelegationRow = async (row: DelegationRow) => {
+    const fresh = store.get(row.id) ?? row;
+    if (fresh.status !== "running" || !fresh.thread_id) return;
+    const thread = await getThread(fresh.thread_id);
+    if (!thread) return;
+    const streamRead = await processStream(fresh);
+    const cur = store.get(fresh.id);
+    if (!cur || cur.status !== "running") return;
+    await evaluateIdle(cur, thread, streamRead);
+  };
+
   return {
+    /** §17.2 (e2e 1): force the row's bookkeeping up to date (merge). */
+    syncDelegation: (row: DelegationRow) =>
+      deps.enqueue(() => syncDelegationRow(row)),
     onThreadEvents: (payload: { thread: WatchdogThreadDto; sequence?: number }) =>
       deps.enqueue(() => onThreadEvents(payload)),
     onThreadActive: (thread: WatchdogThreadDto) =>
