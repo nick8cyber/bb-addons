@@ -772,6 +772,9 @@ export async function createPlugin(
     cmd,
     threads: {
       send: (a) => bb.sdk.threads.send(a as never) as never,
+      // §17.4 (С7): paged SDK list — the one-shot CLI dump overflowed
+      // its buffer at ~5700 threads.
+      list: (a) => bb.sdk.threads.list(a as never) as never,
     },
     loadConfig: janitorConfig,
     localHostId: async () => {
@@ -1518,6 +1521,16 @@ ${res.warnings
                       (res.orphanBranches
                         ? `, orphan branches ${res.orphanBranches}`
                         : "") +
+                      // §17.4 (С9): «готова к удалению» is a list, not
+                      // only a count — this is what `apply` removes.
+                      (res.readyItems.length
+                        ? `\nready to remove:\n${res.readyItems
+                            .map(
+                              (i) =>
+                                `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"}`,
+                            )
+                            .join("\n")}`
+                        : "") +
                       (keptText ? `
 kept: ${keptText}` : "") +
                       (res.reported.length
@@ -1559,6 +1572,14 @@ abandoned: ${res.reported
                   (rep.lastRun.error ? ` error=${rep.lastRun.error}` : "") +
                   "\n"
                 : "no runs yet\n");
+            // §17.4 (С9): «готова к удалению» — the report answers
+            // what `apply` would remove, not only what is abandoned.
+            if (rep.ready.length) {
+              out += "ready to remove:\n";
+              for (const i of rep.ready) {
+                out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"}\n`;
+              }
+            }
             if (rep.abandoned.length) {
               out += "abandoned:\n";
               for (const i of rep.abandoned) {

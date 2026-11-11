@@ -388,6 +388,25 @@ export async function runMerge(
     // is a conflict; any other non-zero exit is a git failure, not a
     // conflict prediction.
     if (params.dryRun) {
+      // §17.4 (мелко 11): the plugin's git floor is 2.39
+      // (`merge-tree --write-tree` is 2.38, `patch-id --verbatim`
+      // 2.39) — below it the dry-run refuses with a hint instead of a
+      // bare `git: 'merge-tree' is not a git command`.
+      const ver = await git(["--version"]);
+      const vm = /git version (\d+)\.(\d+)/.exec(ver.stdout);
+      if (
+        ver.exitCode !== 0 ||
+        !vm ||
+        Number(vm[1]) < 2 ||
+        (Number(vm[1]) === 2 && Number(vm[2]) < 39)
+      ) {
+        throw new OrchestratorError(
+          "unsupported-git",
+          `merge --dry-run требует git ≥ 2.39 (merge-tree --write-tree)` +
+            (vm ? `, найден ${vm[1]}.${vm[2]}` : " — `git --version` не прочитан"),
+          "обновите git на машине копии",
+        );
+      }
       const probe = await git([
         "merge-tree",
         "--write-tree",

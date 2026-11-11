@@ -80,3 +80,25 @@ test("non-git commands inherit GIT_* unchanged", async () => {
     assert.equal(res.stdout.trim(), "/tmp/somewhere");
   });
 });
+
+
+// §17.4 (мелко 13): every janitor/rescue parse of git output assumes
+// the default path rendering — user config must not leak in.
+test("git invocations force stable path rendering (-c core.quotePath/mnemonicPrefix)", async () => {
+  const dir = makeRepo();
+  execFileSync("git", ["-C", dir, "config", "core.quotePath", "true"]);
+  execFileSync("git", ["-C", dir, "config", "diff.mnemonicPrefix", "true"]);
+  writeFileSync(join(dir, "файл.txt"), "x\n");
+  execFileSync("git", ["-C", dir, "add", "."]);
+  execFileSync("git", ["-C", dir, "commit", "-m", "add cyrillic"]);
+  const ls = await createCmd().run("git", ["-C", dir, "ls-files"]);
+  assert.equal(ls.exitCode, 0);
+  // without the -c overrides this would be octal-escaped "\321\204…"
+  assert.ok(ls.stdout.includes("файл.txt"), ls.stdout);
+  writeFileSync(join(dir, "f.txt"), "changed\n");
+  const diff = await createCmd().run("git", ["-C", dir, "diff"]);
+  assert.equal(diff.exitCode, 0);
+  // mnemonicPrefix would render i//w// instead of a//b/
+  assert.ok(diff.stdout.includes("--- a/f.txt"), diff.stdout);
+  assert.ok(diff.stdout.includes("+++ b/f.txt"), diff.stdout);
+});
