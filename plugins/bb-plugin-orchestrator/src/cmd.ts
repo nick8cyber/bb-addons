@@ -53,7 +53,19 @@ export function createCmd(): CmdRunner {
       new Promise<BbCliResult>((resolve) => {
         const child = execFile(
           file,
-          args,
+          // §17.4 (мелко 11): every `git` call gets neutral path
+          // rendering — a user's `core.quotePath`/`diff.mnemonicPrefix`
+          // config must not mangle paths the plugin parses (`ls-files`,
+          // `status`, `worktree list`, merge-tree conflicts).
+          basename(file) === "git"
+            ? [
+                "-c",
+                "core.quotePath=false",
+                "-c",
+                "diff.mnemonicPrefix=false",
+                ...args,
+              ]
+            : args,
           {
             cwd: opts?.cwd,
             env:
