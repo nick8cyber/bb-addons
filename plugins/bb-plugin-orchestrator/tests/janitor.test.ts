@@ -22,7 +22,7 @@ import {
   type JanitorDeps,
 } from "../src/janitor.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
-import type { CmdRunner } from "../src/cmd.js";
+import { createCmd, type CmdRunner } from "../src/cmd.js";
 
 const ok = (stdout = ""): BbCliResult => ({ exitCode: 0, stdout, stderr: "" });
 const fail = (stderr = "boom"): BbCliResult => ({
@@ -45,27 +45,9 @@ function gitIn(repo: string, args: string[], input: string): string {
   }).trim();
 }
 
-/** Real runner: executes git/du against the temp repos. */
-const realCmd: CmdRunner = {
-  run: async (file, args, o) => {
-    try {
-      const out = execFileSync(file, args, {
-        cwd: o?.cwd,
-        env: o?.env ? { ...process.env, ...o.env } : undefined,
-        encoding: "utf8",
-        input: o?.stdin,
-      });
-      return { exitCode: 0, stdout: out, stderr: "" };
-    } catch (e: unknown) {
-      const x = e as { status?: number; stdout?: string; stderr?: string };
-      return {
-        exitCode: x.status ?? 1,
-        stdout: x.stdout ?? "",
-        stderr: x.stderr ?? "",
-      };
-    }
-  },
-};
+/** Real runner: executes git/du against the temp repos — the
+ * production one, so the GIT_* scrub (PLUG-204) applies here too. */
+const realCmd: CmdRunner = createCmd();
 
 interface EnvSpec {
   id: string;
@@ -103,8 +85,8 @@ const CFG = (over: Record<string, unknown> = {}) =>
   });
 
 /** A repo: bare origin + one checkout on `main`, envs are its worktrees. */
-function makeRepo() {
-  const base = mkdtempSync(join(tmpdir(), "jan-"));
+function makeRepo(prefix = "jan-") {
+  const base = mkdtempSync(join(tmpdir(), prefix));
   const origin = join(base, "origin.git");
   const repo = join(base, "repo");
   execFileSync("git", ["init", "--bare", origin]);
@@ -839,6 +821,56 @@ test("a failed thread archive rolls the cascade back", async () => {
   assert.equal(w.janitor.item(env.id)!.reason, "archive-failed");
 });
 
+test("a rolled-back cascade member leaves archivedNow — its env is not «removed» (PLUG-204)", async () => {
+  const { repo, base } = makeRepo();
+  const envA = addEnv(repo, base, "a");
+  const envB = addEnv(repo, base, "b");
+  commitIn(envA.path, "wa.txt", "feat: a");
+  commitIn(envB.path, "wb.txt", "feat: b");
+  mergeEnv(repo, envA);
+  mergeEnv(repo, envB);
+  const clock = { t: Date.now() };
+  const root: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  // envB's cascade member is invisible to the run-start snapshot and
+  // joins only through the pre-archive re-read (call #3). Its env never
+  // enters memberEnvs, so «archive-failed» does not blame it — a stale
+  // archivedNow id would write «removed» for a live thread.
+  const late: ThreadSpec = {
+    id: "thr_late",
+    status: "idle",
+    queuedWork: "none",
+    hasPendingInteraction: false,
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    environmentId: envB.id,
+    parentThreadId: "thr_a",
+  };
+  const w = makeWorld({
+    envs: [envA, envB],
+    threads: { [envA.id]: [root] },
+    archiveFailFor: new Set(["thr_a"]),
+    clock,
+    onThreadListCall: (n) => {
+      if (n >= 3) w.threadSpecs[envB.id] = [late];
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, ["thr_late"]);
+  assert.deepEqual(w.unarchivedCalls, ["thr_late"]);
+  assert.equal(w.janitor.item(envA.id)!.reason, "archive-failed");
+  // live again after the rollback — kept as «ready», not «removed»
+  assert.equal(w.janitor.item(envB.id)!.reason, "merged-ready");
+});
+
 test("removal is archive-only — `bb environment cleanup` is never called (§16.3)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
@@ -1361,9 +1393,10 @@ test("archived executor with a dirty copy gets a rescue ref + coordinator line",
   // stash apply inside it
   assert.equal(w.sent.length, 1);
   assert.equal(w.sent[0]!.threadId, "thr_coord");
-  const m = /worktree add (\S+) \S+\^1 && git -C (\S+) stash apply \S+/.exec(
-    w.sent[0]!.text,
-  );
+  const m =
+    /worktree add '([^']+)' \S+\^1 && git -C '([^']+)' stash apply \S+/.exec(
+      w.sent[0]!.text,
+    );
   assert.ok(m, `restore command missing: ${w.sent[0]!.text}`);
   const [, rescueDir] = m;
   assert.match(rescueDir, /rescue-thr_w$/);
@@ -1373,6 +1406,35 @@ test("archived executor with a dirty copy gets a rescue ref + coordinator line",
   assert.equal(readFileSync(join(rescueDir!, "f.txt"), "utf8"), "dirty\n");
   assert.equal(readFileSync(join(rescueDir!, "new.txt"), "utf8"), "untracked\n");
   git(repo, ["worktree", "remove", "--force", rescueDir!]);
+});
+
+test("rescue restore command is shell-quoted — a space in the path still runs (PLUG-204)", async () => {
+  const { repo, base } = makeRepo("jan sp-");
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.onThreadArchived({
+    id: "thr_w",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  const line = /Восстановление в новую копию: (git .+)$/.exec(
+    w.sent[0]!.text,
+  )?.[1];
+  assert.ok(line, `restore command missing: ${w.sent[0]!.text}`);
+  // every path is single-quoted…
+  assert.match(
+    line,
+    /^git -C '[^']+' worktree add '[^']+' \S+\^1 && git -C '[^']+' stash apply \S+$/,
+  );
+  // …and the advertised command really restores the work under sh
+  execFileSync("sh", ["-c", line]);
+  const rescueDir = /worktree add '([^']+)'/.exec(line)![1]!;
+  assert.equal(readFileSync(join(rescueDir, "f.txt"), "utf8"), "dirty\n");
+  git(repo, ["worktree", "remove", "--force", rescueDir]);
 });
 
 test("rescue with only untracked files still restores them via stash apply", async () => {
@@ -1459,6 +1521,25 @@ test("ff-only sync counts by the strict «Created from» formula — merged copy
   git(repo, ["push", "origin", "main"]);
   git(env.path, ["fetch", "origin"]);
   git(env.path, ["merge", "--ff-only", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
+});
+
+test("a commit message starting with «Created from» is not a creation point (PLUG-204)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  // %gs of this entry is «commit: Created from …» — an unanchored
+  // /Created from/ match would take the commit's own position as the
+  // branch base and count zero own commits → «no-commits-fresh».
+  commitIn(env.path, "w.txt", "Created from scratch");
+  mergeEnv(repo, env);
   const w = makeWorld({
     envs: [env],
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },

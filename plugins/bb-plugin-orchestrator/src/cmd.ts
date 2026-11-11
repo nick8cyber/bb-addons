@@ -5,6 +5,7 @@
  * so tests inject a fake runner (or point a real one at a temp repo).
  */
 import { execFile } from "node:child_process";
+import { basename } from "node:path";
 import type { BbCliResult } from "./bb-cli.js";
 
 export interface CmdRunOptions {
@@ -27,6 +28,25 @@ export interface CmdRunner {
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_BUFFER = 16 * 1024 * 1024;
 
+/**
+ * `process.env` minus every `GIT_*` variable. A stray inherited
+ * `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`/
+ * `GIT_NAMESPACE`/`GIT_OBJECT_DIRECTORY` (a hook exporting them, a
+ * script run under `git -c`, a `git rebase` exec) retargets every
+ * `git -C <copy>` probe at the wrong repository — status, reflog and
+ * mergedness checks would pass against foreign state and a copy with
+ * unpublished work could be dropped (PLUG-204). Inheritance-only:
+ * an explicit `opts.env` (the rescue snapshot's temporary
+ * `GIT_INDEX_FILE`) is merged afterwards and still wins.
+ */
+const envWithoutGit = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) {
+    if (k.startsWith("GIT_")) delete env[k];
+  }
+  return env;
+};
+
 export function createCmd(): CmdRunner {
   return {
     run: (file, args, opts) =>
@@ -36,7 +56,12 @@ export function createCmd(): CmdRunner {
           args,
           {
             cwd: opts?.cwd,
-            env: opts?.env ? { ...process.env, ...opts.env } : undefined,
+            env:
+              basename(file) === "git"
+                ? { ...envWithoutGit(), ...opts?.env }
+                : opts?.env
+                  ? { ...process.env, ...opts.env }
+                  : undefined,
             timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
             maxBuffer: MAX_BUFFER,
           },

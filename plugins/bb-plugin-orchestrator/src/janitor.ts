@@ -488,9 +488,11 @@ export function createJanitor(deps: JanitorDeps) {
     for (const line of reflog.split("\n")) {
       const sep = line.indexOf("\0");
       if (sep < 0) continue;
-      // newest → oldest: the first «Created from» is the latest
-      // (re)creation point of the branch.
-      if (/Created from/.test(line.slice(sep + 1))) {
+      // newest → oldest: the first «branch: Created from» is the
+      // latest (re)creation point of the branch. Anchored to the %gs
+      // prefix — a commit message starting with «Created from» («commit:
+      // Created from …») must not pose as a creation entry (PLUG-204).
+      if (/^branch: Created from\b/.test(line.slice(sep + 1))) {
         base = line.slice(0, sep);
         break;
       }
@@ -769,25 +771,30 @@ export function createJanitor(deps: JanitorDeps) {
    * §16.3 (ревизия 25) «ничего не теряется»: every commit the given
    * reflogs (`git log -g --format=%H <ref>`, whole history) ever
    * pointed at — plus the tips themselves — and every ancestor of
-   * those positions not on origin must be safe: an ancestor of a
-   * remote target, patch-equivalent to a commit on it, or carrying
-   * content already on a target. Ancestors are checked too (PLUG-198):
-   * a reflog may lose a position (`reflog expire`, `pull --ff-only`
-   * records only the landing tip, a ref with no reflog) while the
-   * commit stays reachable — «A + revert A» then leaves A, whose
-   * content never reached origin, visible only as an ancestor. The
-   * content sign is checked for EACH pending commit itself (PLUG-197):
-   * `merge-tree --write-tree <target> <sha>`
-   * reproducing `<target>^{tree}` proves THIS commit's content is on
-   * origin. A whole-tip check cannot clear the middle commits — «A +
-   * revert A» nets to origin while A's content never reached it, and a
-   * squash that rewrote an earlier commit's lines leaves that commit
-   * without a counterpart; both stay («брошено» when abandoned, never
-   * a silent removal). «ok» — the reflogs hold nothing unpublished;
-   * «lost» — at least one commit (a `reset`-orphan, a detached-HEAD
-   * commit, an unpublished pre-amend version) would die with the ref;
-   * «unknown» — a reflog or the reachability scan could not be read,
-   * so nothing is proven and the ref stays.
+   * those positions must be safe: reachable from a remote target
+   * (`rev-list <positions> --not <targets>` proves ancestry) or
+   * patch-equivalent to a commit on one (`git patch-id --verbatim`;
+   * the `git cherry` «+» line is only a fast-path hint to skip the
+   * diff scan, «-» or a failed cherry decides nothing). Ancestors are
+   * checked too (PLUG-198): a reflog may lose a position
+   * (`reflog expire`, `pull --ff-only` records only the landing tip,
+   * a ref with no reflog) while the commit stays reachable — «A +
+   * revert A» then leaves A, whose content never reached origin,
+   * visible only as an ancestor. The equivalence sign is checked for
+   * EACH pending commit itself: a whole-tip check cannot clear the
+   * middle commits — «A + revert A» nets to origin while A's content
+   * never reached it, and a squash that rewrote an earlier commit's
+   * lines leaves that commit without a counterpart; both stay
+   * («брошено» when abandoned, never a silent removal). The
+   * `merge-tree` content sign is deliberately NOT used (PLUG-201):
+   * merge drivers (`ours`, built-in `union`, names with `=`) fake it.
+   * An empty commit has no diff to match — it counts as «lost»
+   * (message-only work must not vanish silently). «ok» — the reflogs
+   * hold nothing unpublished; «lost» — at least one commit (a
+   * `reset`-orphan, a detached-HEAD commit, an unpublished pre-amend
+   * version) would die with the ref; «unknown» — a reflog or the
+   * reachability scan could not be read, so nothing is proven and the
+   * ref stays.
    */
   const reflogPositionsSafe = async (
     cwd: string,
@@ -2127,6 +2134,13 @@ export function createJanitor(deps: JanitorDeps) {
                 `orchestrator janitor: unarchive ${u} failed: ` +
                   (back.stderr.trim() || `exit ${back.exitCode}`),
               );
+            } else {
+              // The thread is live again — a stale id in `archivedNow`
+              // would let the settle below write «removed» for an env
+              // (blamed only via the run-start member set) whose threads
+              // are alive (PLUG-204).
+              archivedNow.delete(u);
+              summary.archivedThreads -= 1;
             }
           }
           note("archive-failed", root.environmentId ?? null);
@@ -2885,6 +2899,9 @@ export function createJanitor(deps: JanitorDeps) {
       dirname(repoRoot),
       `${basename(repoRoot)}-rescue-${thread.id}`,
     );
+    // POSIX single-quoting — the hint is a copy-paste shell command and
+    // a repo path may contain spaces (PLUG-204).
+    const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
     await tellCoordinator(
       `[orchestrator] исполнитель ${thread.id} заархивирован ` +
         `с несохранённой работой` +
@@ -2892,8 +2909,8 @@ export function createJanitor(deps: JanitorDeps) {
           ? " (снимок неполный — часть файлов не сохранилась)"
           : "") +
         ` — снимок: ${ref}. ` +
-        `Восстановление в новую копию: git -C ${repoRoot} worktree add ` +
-        `${rescueDir} ${ref}^1 && git -C ${rescueDir} stash apply ${ref}`,
+        `Восстановление в новую копию: git -C ${q(repoRoot)} worktree add ` +
+        `${q(rescueDir)} ${ref}^1 && git -C ${q(rescueDir)} stash apply ${ref}`,
     );
   };
 
