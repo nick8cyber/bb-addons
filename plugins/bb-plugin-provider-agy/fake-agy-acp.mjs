@@ -87,7 +87,11 @@ async function runPrompt(id, text) {
   const mode = ctl.modeByLabel?.[homeLabel] ?? ctl.errorMode ?? modeEnv;
   const compactMode = ctl.compactMode ?? compactModeEnv;
   const summaryMode = ctl.summaryMode ?? summaryModeEnv;
-  const upd = (update) => out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+  const replayable = ["agent_message_chunk","agent_thought_chunk","user_message_chunk","tool_call","tool_call_update","plan"];
+  const upd = (update, record = true) => {
+    if (record && replayable.includes(update.sessionUpdate)) replayed.push(update);
+    out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+  };
   if (text.includes("[[die]]")) {
     upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "bye" } });
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
@@ -124,8 +128,9 @@ async function runPrompt(id, text) {
   }
   await finish();
   async function finish() {
-    upd({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `thinking about: ${text.slice(0, 40)}` } });
-    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `answer to ${text.slice(0, 60)}` } });
+    upd({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+    upd({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `thinking about: ${text.slice(-40)}` } });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `answer to ${text.slice(-60)}` } });
     if (text.includes("[[artifact]]")) {
       upd({ sessionUpdate: "tool_call", toolCallId: "tc-art", title: "write_to_file", kind: "edit", status: "in_progress" });
       upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-art", status: "failed",
@@ -152,6 +157,7 @@ async function runPrompt(id, text) {
   }
 }
 
+const replayed = [];
 const pendingPerm = new Map();
 let cancelled = false;
 createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
@@ -171,14 +177,19 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line)
       sessionId = `fake-acp-${++sessionCounter}-${homeLabel}`;
       out({ jsonrpc: "2.0", id: msg.id, result: { sessionId, configOptions, modes } });
       return;
-    case "session/load":
+    case "session/load": {
       if (typeof p.sessionId !== "string" || !p.sessionId.startsWith("fake-")) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: `no such session ${p.sessionId}` } });
         return;
       }
       sessionId = p.sessionId;
       out({ jsonrpc: "2.0", id: msg.id, result: { configOptions, modes } });
+      // Real agy answers session/load mid-replay: the stored history keeps
+      // streaming as session/update notifications after the response.
+      const replay = replayed.splice(0);
+      setImmediate(() => { for (const u of replay) out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: u } }); });
       return;
+    }
     case "session/set_mode":
       out({ jsonrpc: "2.0", id: msg.id, result: {} });
       return;
