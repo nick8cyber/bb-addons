@@ -72,6 +72,10 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export interface ReleaseThreadDto {
   id: string;
+  /** §17.3 (ревью PLUG-216 п.2): the turn gate's primary signal —
+   * `idle`/`error` mean no turn is in flight (the watchdog's §16.5
+   * stop-confirm reads the same two). */
+  status?: string | null;
   environmentPath?: string | null;
   environmentBranchName?: string | null;
   projectId?: string;
@@ -176,6 +180,30 @@ async function git(
     );
   }
   return res.stdout.trim();
+}
+
+/** §17.3 (ревью PLUG-216 Б1): the stable patch-id of one commit — a
+ * rebase rewrite changes the sha but keeps the diff, a foreign commit's
+ * id never matches the pre-rebase set. Empty diffs (merge commits,
+ * empty commits) yield no id. */
+async function patchId(
+  deps: ReleaseDeps,
+  repo: string,
+  sha: string,
+): Promise<string | null> {
+  const diff = await deps.cmd.run(
+    "git",
+    ["-C", repo, "show", "--format=", sha],
+    { timeoutMs: 30_000 },
+  );
+  if (diff.exitCode !== 0) return null;
+  const id = await deps.cmd.run(
+    "git",
+    ["-C", repo, "patch-id", "--stable"],
+    { timeoutMs: 30_000, stdin: diff.stdout },
+  );
+  if (id.exitCode !== 0) return null;
+  return id.stdout.trim().split(/\s+/)[0] || null;
 }
 
 // ── Step 1: приёмка ────────────────────────────────────────────────────
@@ -369,7 +397,17 @@ async function syncBranch(
   repo: string,
   branch: string,
   project: ResolvedProject,
-): Promise<{ baseSha: string; remoteBaseSha: string | null }> {
+  ctx: { taskKey: string; expectedSha: string },
+): Promise<{
+  baseSha: string;
+  remoteBaseSha: string | null;
+  postSyncSha: string;
+  /** §17.3 (ревью PLUG-216 Б1): only the commits the pipeline itself
+   * created during the sync — the merge commit, or the rewritten
+   * commits a rebase produced (matched by patch-id). Never the whole
+   * `expectedSha..HEAD` range: a foreign commit in it stays foreign. */
+  pipelineShas: string[];
+}> {
   const dirty = await git(deps, repo, ["status", "--porcelain"]);
   if (dirty) {
     throw new OrchestratorError(
@@ -379,10 +417,36 @@ async function syncBranch(
     );
   }
   await git(deps, repo, ["fetch", "origin"], { timeoutMs: 180_000 });
+  // §17.3 (ревью PLUG-216 Б1): the step-1 gate vetted `expectedSha` —
+  // between it and this fetch (the tasks show, the release row, up to
+  // 180 s of network) a revived executor can land a commit no review
+  // covers. Re-verify the tip BEFORE the pipeline mutates it.
+  const fetchedHead = await git(deps, repo, ["rev-parse", "HEAD"]);
+  if (fetchedHead !== ctx.expectedSha) {
+    const extra = (
+      await git(deps, repo, [
+        "rev-list",
+        `${ctx.expectedSha}..${fetchedHead}`,
+      ])
+    )
+      .split("\n")
+      .filter(Boolean);
+    throw new OrchestratorError(
+      "unreviewed-commits",
+      `release ${ctx.taskKey}: во время sync на ветку ${branch} легли ` +
+        `коммиты сверх проверенной вершины ${ctx.expectedSha.slice(0, 7)}` +
+        (extra.length
+          ? `: ${extra.map((x) => x.slice(0, 7)).join(", ")}`
+          : ` (вершина ${fetchedHead.slice(0, 7)})`),
+      "ревью покрывает вершину на момент гейта — повторите release, когда исполнитель остановлен",
+    );
+  }
   const target = `origin/${project.target.branch}`;
   const remoteBaseSha = (await gitRefExists(deps, repo, target))
     ? await git(deps, repo, ["rev-parse", target])
     : null;
+  const pipelineShas: string[] = [];
+  let verifiedTip = ctx.expectedSha;
   if (remoteBaseSha) {
     if (project.sync === "rebase") {
       // §2: rebase only for never-pushed branches.
@@ -399,6 +463,24 @@ async function syncBranch(
           'переведите проект на sync="merge" или заведите новую ветку',
         );
       }
+      // §17.3 (ревью PLUG-216 Б1): before the rebase, the patch-ids of
+      // the range it will rewrite — after it, every commit over the
+      // remote base must be one of those rewrites, or it is foreign.
+      const preShas = (
+        await git(deps, repo, [
+          "rev-list",
+          `${remoteBaseSha}..${ctx.expectedSha}`,
+        ])
+      )
+        .split("\n")
+        .filter(Boolean);
+      const preIds = new Set<string>();
+      let preNoId = 0;
+      for (const sha of preShas) {
+        const id = await patchId(deps, repo, sha);
+        if (id) preIds.add(id);
+        else preNoId++;
+      }
       const res = await deps.cmd.run(
         "git",
         ["-C", repo, "rebase", target],
@@ -411,6 +493,36 @@ async function syncBranch(
           `rebase на ${target}: конфликт — сведи вручную`,
         );
       }
+      const preShaSet = new Set(preShas);
+      const head = await git(deps, repo, ["rev-parse", "HEAD"]);
+      const postShas = (
+        await git(deps, repo, ["rev-list", `${remoteBaseSha}..${head}`])
+      )
+        .split("\n")
+        .filter(Boolean);
+      const foreign: string[] = [];
+      for (const sha of postShas) {
+        const id = await patchId(deps, repo, sha);
+        if (id && preIds.has(id)) continue;
+        // an empty-diff commit carries no patch-id — allow as many as
+        // the pre-rebase range had (a rebase drops or keeps them, but
+        // never creates new content this way).
+        if (!id && preNoId-- > 0) continue;
+        foreign.push(sha);
+      }
+      if (foreign.length) {
+        throw new OrchestratorError(
+          "unreviewed-commits",
+          `release ${ctx.taskKey}: после rebase на ветке ${branch} ` +
+            `коммиты вне проверенного диапазона: ` +
+            foreign.map((x) => x.slice(0, 7)).join(", "),
+          "повторите release, когда исполнитель остановлен",
+        );
+      }
+      // only genuinely rewritten commits are pipeline-made — an
+      // unchanged sha (no-op rebase) is the executor's own work.
+      pipelineShas.push(...postShas.filter((x) => !preShaSet.has(x)));
+      verifiedTip = head;
     } else {
       // §16.6: an explicit `-m` — the default merge message embeds the
       // source and target branch names, which the leak scan must not see.
@@ -433,12 +545,64 @@ async function syncBranch(
           `merge ${target}: конфликт — сведи вручную`,
         );
       }
+      // §17.3 (ревью PLUG-216 Б1): the only tips the sync may leave are
+      // the pipeline's own merge commit (first parent the vetted tip,
+      // second the remote base), a fast-forward onto the remote base,
+      // or the unchanged `expectedSha`. Anything else is foreign work
+      // landed mid-sync.
+      const head = await git(deps, repo, ["rev-parse", "HEAD"]);
+      if (head !== ctx.expectedSha) {
+        const parents = (
+          await git(deps, repo, ["rev-list", "--parents", "-n", "1", head])
+        )
+          .trim()
+          .split(/\s+/);
+        const isPipelineMerge =
+          parents.length === 3 &&
+          parents[1] === ctx.expectedSha &&
+          parents[2] === remoteBaseSha;
+        const isFastForward =
+          head === remoteBaseSha &&
+          (await isAncestor(deps, repo, ctx.expectedSha, remoteBaseSha));
+        if (isPipelineMerge) {
+          pipelineShas.push(head);
+        }
+        if (!isPipelineMerge && !isFastForward) {
+          const extra = (
+            await git(deps, repo, [
+              "rev-list",
+              `${ctx.expectedSha}..${head}`,
+              "--not",
+              remoteBaseSha,
+            ])
+          )
+            .split("\n")
+            .filter(Boolean);
+          throw new OrchestratorError(
+            "unreviewed-commits",
+            `release ${ctx.taskKey}: во время sync на ветку ${branch} ` +
+              `легли коммиты сверх проверенной вершины ` +
+              `${ctx.expectedSha.slice(0, 7)}: ` +
+              (extra.length
+                ? extra.map((x) => x.slice(0, 7)).join(", ")
+                : head.slice(0, 7)),
+            "повторите release, когда исполнитель остановлен",
+          );
+        }
+        verifiedTip = head;
+      } else {
+        verifiedTip = ctx.expectedSha;
+      }
     }
   }
+  // §17.3 (ревью PLUG-216 Б1): the post-sync tip is the one sync itself
+  // verified — not a fresh `rev-parse` whose tiny gap would let a commit
+  // slipped in between pass the checks-window comparison below.
+  const postSyncSha = verifiedTip;
   const baseSha = remoteBaseSha
     ? await git(deps, repo, ["merge-base", target, "HEAD"])
     : EMPTY_TREE_SHA;
-  return { baseSha, remoteBaseSha };
+  return { baseSha, remoteBaseSha, postSyncSha, pipelineShas };
 }
 
 // ── Step 3: проверки проекта ───────────────────────────────────────────
@@ -1108,14 +1272,32 @@ async function firstParent(
  * §17.3 (ревью PLUG-214): on the executor-branch path an in-flight turn
  * of the executor's thread refuses the release at step 1 — a commit it
  * lands while the pipeline runs would publish unreviewed. A queued
- * request counts as active too. An unreadable journal cannot prove a
- * turn — the run continues (the post-sync HEAD check still guards the
- * window).
+ * request counts as active too.
+ *
+ * §17.3 (ревью PLUG-216 п.2): the thread status is the PRIMARY signal —
+ * a turn that died on `provider/error` without `turn/completed` leaves
+ * `turn/started` newest in the journal and would refuse every retry
+ * forever. The watchdog's stop-confirm (§16.5) reads `idle`/`error` as
+ * "no turn". The journal is the second signal: on a stopped thread it
+ * still sees a queued `client/turn/requested` the status does not show,
+ * and with no readable status it keeps the old newest-event heuristic.
  */
 async function executorTurnActive(
   deps: ReleaseDeps,
   threadId: string,
 ): Promise<boolean> {
+  let stopped = false;
+  try {
+    const t = await deps.threads.get({ threadId });
+    if (t.status && t.status !== "idle" && t.status !== "error") {
+      return true;
+    }
+    stopped = t.status === "idle" || t.status === "error";
+  } catch (e) {
+    deps.log?.warn?.(
+      `orchestrator: executor turn status ${threadId}: ${message(e)}`,
+    );
+  }
   try {
     const events = await deps.threads.events.list({
       threadId,
@@ -1130,6 +1312,9 @@ async function executorTurnActive(
       ],
     });
     const newest = events[0];
+    // a confirmed-stopped thread: only a queued request can still start
+    // a turn — a stale `turn/started` means the turn died unreported.
+    if (stopped) return newest?.type === "client/turn/requested";
     return (
       newest?.type === "turn/started" ||
       newest?.type === "client/turn/requested"
@@ -1213,7 +1398,27 @@ async function reviewGate(
           `отсутствует в копии ${repo}`,
       );
     }
-    const extra = (await git(deps, repo, ["rev-list", `${need}..${tipSha}`]))
+    // «Опубликовано» — the same notRefs the merged path builds below:
+    // the remote target plus every published tip recorded for this
+    // copy. A sync merge now records ONLY its own merge commit in
+    // pipeline_shas (ревью PLUG-216 Б1), so the origin range it pulled
+    // in is excused by remote reachability instead — and a fast-forward
+    // sync leaves the gate satisfied outright.
+    const notRefs: string[] = [];
+    const target = `origin/${project.target.branch}`;
+    if (await gitRefExists(deps, repo, target)) notRefs.push(target);
+    for (const sha of deps.store.publishedShasForRepo(repo)) {
+      if (await shaExists(deps, repo, sha)) notRefs.push(sha);
+    }
+    const extra = (
+      await git(deps, repo, [
+        "rev-list",
+        tipSha,
+        "--not",
+        need,
+        ...notRefs,
+      ])
+    )
       .split("\n")
       .filter(Boolean)
       .filter((s) => !pipeline.has(s));
@@ -1373,21 +1578,6 @@ async function reviewGate(
   }
 }
 
-/** §17.3: the commits the pipeline created since `fromSha` land in the
- * release row — the next run's gate must not call them foreign
- * (ревью PLUG-210 Б1: a retry after a post-sync refusal must pass). */
-async function recordPipelineShas(
-  deps: ReleaseDeps,
-  repo: string,
-  releaseId: number,
-  fromSha: string,
-): Promise<void> {
-  const shas = (await git(deps, repo, ["rev-list", `${fromSha}..HEAD`]))
-    .split("\n")
-    .filter(Boolean);
-  deps.store.addReleasePipelineShas(releaseId, shas);
-}
-
 // ── Steps 2–5: sync → checks → scan → audit dispatch ──────────────────
 
 async function runReleaseSteps(
@@ -1480,20 +1670,21 @@ async function runReleaseSteps(
     // §16.6 (PLUG-194): a §14-merged result is synced by MERGE only —
     // `git rebase` flattens merge commits, silently dropping the
     // conflict-resolution edits that exist only in them.
-    const { baseSha, remoteBaseSha } = await syncBranch(
-      deps,
-      repo,
-      branch,
-      executor.merge_status === "merged"
-        ? { ...project, sync: "merge" }
-        : project,
-    );
-    await recordPipelineShas(deps, repo, release.id, preSyncSha);
+    const { baseSha, remoteBaseSha, postSyncSha, pipelineShas } =
+      await syncBranch(
+        deps,
+        repo,
+        branch,
+        executor.merge_status === "merged"
+          ? { ...project, sync: "merge" }
+          : project,
+        { taskKey, expectedSha: preSyncSha },
+      );
+    deps.store.addReleasePipelineShas(release.id, pipelineShas);
     // §17.3 (ревью PLUG-214): the tip the gate vetted — the checks
     // window (up to CHECK_TIMEOUT_MS) is long enough for a revived
     // executor to land a commit on the branch; only this sha may stand
     // when the checks finish.
-    const postSyncSha = await git(deps, repo, ["rev-parse", "HEAD"]);
 
     // Step 3 — проверки проекта.
     await runProjectChecks(deps, repo, project.checks);
@@ -1518,10 +1709,56 @@ async function runReleaseSteps(
     }
 
     // §3 --no-docs → Docs-not-needed trailer (before sha capture).
+    // §17.3 (ревью PLUG-216 Б1): the window between the checks check
+    // and the trailer is guarded the same way — the tip must still be
+    // the post-sync one.
     const preTrailerSha = await git(deps, repo, ["rev-parse", "HEAD"]);
+    if (preTrailerSha !== postSyncSha) {
+      const extra = (
+        await git(deps, repo, [
+          "rev-list",
+          `${postSyncSha}..${preTrailerSha}`,
+        ])
+      )
+        .split("\n")
+        .filter(Boolean);
+      throw new OrchestratorError(
+        "unreviewed-commits",
+        `release ${taskKey}: после проверок на ветку ${branch} легли ` +
+          `коммиты сверх проверенной вершины: ` +
+          extra.map((x) => x.slice(0, 7)).join(", "),
+        "повторите release, когда исполнитель остановлен",
+      );
+    }
     if (input.noDocs) {
       await applyDocsTrailer(deps, repo, input.noDocs);
-      await recordPipelineShas(deps, repo, release.id, preTrailerSha);
+      // Only the pipeline's own trailer commit lands in pipeline_shas:
+      // an amend and an empty trailer commit both carry the SAME tree
+      // as preTrailerSha — a tip with a real diff, or more than one new
+      // commit, is foreign work.
+      const trailerTip = await git(deps, repo, ["rev-parse", "HEAD"]);
+      if (trailerTip !== preTrailerSha) {
+        const sameTree =
+          (await git(deps, repo, ["diff", preTrailerSha, trailerTip])) ===
+          "";
+        const count = Number(
+          await git(deps, repo, [
+            "rev-list",
+            "--count",
+            `${preTrailerSha}..${trailerTip}`,
+          ]),
+        );
+        if (!sameTree || count !== 1) {
+          throw new OrchestratorError(
+            "unreviewed-commits",
+            `release ${taskKey}: во время записи трейлера на ветку ` +
+              `${branch} легли чужие коммиты (вершина ` +
+              `${trailerTip.slice(0, 7)})`,
+            "повторите release, когда исполнитель остановлен",
+          );
+        }
+        deps.store.addReleasePipelineShas(release.id, [trailerTip]);
+      }
     }
     const headSha = await git(deps, repo, ["rev-parse", "HEAD"]);
     deps.store.updateRelease(release.id, { headSha, remoteBaseSha });

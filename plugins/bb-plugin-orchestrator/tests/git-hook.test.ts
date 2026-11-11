@@ -411,3 +411,28 @@ test("§17.3 (PLUG-214): a foreign global core.hooksPath refuses BEFORE copying"
   // the refusal left no wrappers behind
   assert.equal(existsSync(join(gd, "pre-push")), false);
 });
+
+test("§17.3 (PLUG-216): --self-test/--dry-run need no hooks-dir and no bb", () => {
+  const root = mkdtempSync(join(tmpdir(), "install-needless-"));
+  const env = {
+    ...process.env,
+    // a `bb` that cannot answer `orchestrator hooks-dir`, and a clean
+    // global gitconfig — the same shape the refusal test uses
+    BB_CLI: join(root, "no-such-bb"),
+    GIT_CONFIG_GLOBAL: join(root, "gitconfig"),
+  };
+  const dry = spawnSync(
+    "node",
+    ["hooks/install.mjs", "--dry-run", "--repos-root", join(root, "empty")],
+    { cwd: PLUGIN_DIR, encoding: "utf8", env },
+  );
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /hooks dir/);
+  const st = spawnSync(
+    "node",
+    ["hooks/install.mjs", "--self-test"],
+    { cwd: PLUGIN_DIR, encoding: "utf8", env },
+  );
+  assert.equal(st.status, 0, st.stdout + st.stderr);
+  assert.match(st.stdout, /OK  self-test passed/);
+});

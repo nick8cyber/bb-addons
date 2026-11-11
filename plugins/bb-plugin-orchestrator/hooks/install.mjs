@@ -75,7 +75,10 @@ function pluginHooksDir() {
   }
 }
 const hooksDirArg = flag("--hooks-dir") ?? pluginHooksDir();
-if (!hooksDirArg) {
+// §17.3 (ревью PLUG-216 мелко): the hooks dir is required only to
+// INSTALL — `--self-test` falls back to this package's own wrappers and
+// `--dry-run` only prints the inventory.
+if (!hooksDirArg && !selfTest && !dryRun) {
   console.error(
     "каталог хуков не определён: `bb orchestrator hooks-dir` недоступен " +
       "(bb или плагин не отвечает).\n" +
@@ -84,7 +87,7 @@ if (!hooksDirArg) {
   );
   process.exit(1);
 }
-const hooksDir = resolve(hooksDirArg);
+const hooksDir = hooksDirArg ? resolve(hooksDirArg) : null;
 const reposRoot = resolve(flag("--repos-root") ?? homedir());
 const extraExcludes = multi("--exclude").map((p) => resolve(p));
 
@@ -152,7 +155,7 @@ for (const repo of repos) {
 const exclusions = [...new Set(extraExcludes)];
 
 const report = [
-  `hooks dir:      ${hooksDir}`,
+  `hooks dir:      ${hooksDir ?? "(не определён — для установки передайте --hooks-dir)"}`,
   `repos root:     ${reposRoot} (${repos.length} репозиториев)`,
   "",
   `свой core.hooksPath (общий хук их НЕ трогает): ${ownHooksPath.length}`,
@@ -192,7 +195,7 @@ if (selfTest) {
     const srcName = name === "pre-push" ? "pre-push" : "chain";
     const dst = join(testHooksDir, name);
     copyFileSync(
-      existsSync(join(hooksDir, name))
+      hooksDir && existsSync(join(hooksDir, name))
         ? join(hooksDir, name)
         : join(srcDir, srcName),
       dst,

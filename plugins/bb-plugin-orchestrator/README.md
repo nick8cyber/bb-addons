@@ -59,7 +59,10 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   name EXCEPT `push-to-checkout` — its mere presence disables git's
   built-in worktree update on `receive.denyCurrentBranch=updateInstead`;
   the installer removes a wrapper an older install left under that
-  name. `pre-push` is the orchestrator gate; the rest are copies of
+  name. The same shadowing works the other way too: while a global
+  `core.hooksPath` is set git reads hooks ONLY from it, so a
+  repository's own `.git/hooks/push-to-checkout` never fires anyway —
+  keeping the name in the wrapper set would buy nothing. `pre-push` is the orchestrator gate; the rest are copies of
   `chain`, which execs the repo's own `.git/hooks/<name>` — only when
   it is executable, like git itself. The shared `pre-push` is a
   **forgetfulness guard, not a hard gate**: it stops an accidental

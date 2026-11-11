@@ -332,6 +332,9 @@ function makeDeps(repo: string, overrides: Partial<{
   /** §17.3 (ревью PLUG-214): the executor thread's events — the step-1
    * check refuses while a turn is in flight. */
   execEvents: () => unknown[];
+  /** §17.3 (ревью PLUG-216 п.2): the executor thread's status — the
+   * primary turn signal; absent → the journal heuristic decides. */
+  execStatus: string | null;
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -403,7 +406,7 @@ function makeDeps(repo: string, overrides: Partial<{
   const threads = {
     get: async ({ threadId }: { threadId: string }) =>
       threadId === "thr_exec"
-        ? { id: threadId, environmentPath: repo, environmentBranchName: "feat-x", parentThreadId: null }
+        ? { id: threadId, status: overrides.execStatus ?? undefined, environmentPath: repo, environmentBranchName: "feat-x", parentThreadId: null }
         : threadId === "thr_coord" && overrides.coordPath
           ? { id: threadId, environmentPath: overrides.coordPath, environmentBranchName: null, parentThreadId: null }
           : { id: threadId, parentThreadId: null, title: null, originPluginId: null, projectId: "proj_main" },
@@ -430,7 +433,7 @@ function makeDeps(repo: string, overrides: Partial<{
   const tmp = mkdtempSync(join(tmpdir(), "hooks-"));
   const deps = {
     store, bbCli, threads: threads as never,
-    cmd: { run: async (file: string, args: string[], o?: { cwd?: string }) => {
+    cmd: { run: async (file: string, args: string[], o?: { cwd?: string; stdin?: string }) => {
       if (file === "gitleaks") return { exitCode: 0, stdout: "", stderr: "" };
       if (file === "gh") {
         overrides.ghCalls?.push(args);
@@ -452,7 +455,7 @@ function makeDeps(repo: string, overrides: Partial<{
       }
       try {
         const out = execFileSync(file, args, {
-          cwd: o?.cwd, encoding: "utf8",
+          cwd: o?.cwd, encoding: "utf8", input: o?.stdin,
         });
         return { exitCode: 0, stdout: out, stderr: "" };
       } catch (e: unknown) {
@@ -2187,5 +2190,185 @@ test("PLUG-214 Б3: a leftover push-to-checkout wrapper is a stale install", asy
     (e: unknown) =>
       (e as OrchestratorError).code === "hook-stale" &&
       /install\.mjs/.test((e as OrchestratorError).hint ?? ""),
+  );
+});
+
+// ── ревью PLUG-216: fetch-окно sync, статус треда ───────────────────
+
+test("PLUG-216 Б1: a commit landed during the sync fetch → unreviewed-commits, not in pipeline_shas", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  let fetches = 0;
+  let xSha = "";
+  const realRun = deps.cmd.run;
+  deps.cmd = {
+    run: async (file, args, o) => {
+      const res = await realRun(file, args, o);
+      // «оживление после ревью» раньше: the step-1 fetch already ran —
+      // during the sync's own fetch window the executor lands a commit
+      // no review covers.
+      if (file === "git" && args.includes("fetch") && ++fetches === 2) {
+        writeFileSync(join(repo, "x-mid-fetch.txt"), "x\n");
+        gitR(repo, ["add", "."]);
+        gitR(repo, ["commit", "-m", "feat: mid-fetch"]);
+        xSha = gitR(repo, ["rev-parse", "HEAD"]);
+      }
+      return res;
+    },
+  };
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unreviewed-commits" &&
+      /во время sync/.test((e as OrchestratorError).message) &&
+      (e as OrchestratorError).message.includes(xSha.slice(0, 7)),
+  );
+  // the foreign commit must not land in pipeline_shas — on a retry the
+  // gate still calls it foreign.
+  const row = store.releasesByStatuses(["failed"])[0]!;
+  const recorded = JSON.parse(row.pipeline_shas ?? "[]") as string[];
+  assert.ok(!recorded.includes(xSha));
+});
+
+test("PLUG-216 Б1: pipeline_shas records only the pipeline's own sync merge", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"REJECT","findings":[]}',
+  });
+  // advance main — the sync merge pulls in the origin range too; only
+  // the merge commit itself is pipeline-made.
+  writeFileSync(join(seed, "adv.txt"), "adv\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: advance"]);
+  gitR(seed, ["push", "origin", "main"]);
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const mergeTip = gitR(repo, ["rev-parse", "HEAD"]);
+  const originTip = gitR(repo, ["rev-parse", "origin/main"]);
+  const row = store.releasesByStatuses(["auditing"])[0]!;
+  const recorded = JSON.parse(row.pipeline_shas ?? "[]") as string[];
+  assert.deepEqual(recorded, [mergeTip]);
+  assert.ok(!recorded.includes(originTip));
+  // and a retry still passes the gate — the origin range is excused by
+  // remote reachability, not by the pipeline set.
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s1 = await pumpReleases(deps);
+  assert.equal(s1.rejected, 1);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-216 Б1: rebase sync records the rewritten commits (patch-id), refuses foreign ones", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_main: { sync: "rebase" } },
+    }),
+  });
+  // advance main — the rebase rewrites the branch commits on top of it
+  writeFileSync(join(seed, "adv.txt"), "adv\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: advance"]);
+  gitR(seed, ["push", "origin", "main"]);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  // the rewritten tip is recorded as pipeline-made — a retry's gate
+  // must not call it foreign
+  const tip = gitR(repo, ["rev-parse", "HEAD"]);
+  const row = store.releasesByStatuses(["auditing"])[0]!;
+  const recorded = JSON.parse(row.pipeline_shas ?? "[]") as string[];
+  assert.ok(recorded.includes(tip), `tip ${tip} in ${recorded}`);
+
+  // a foreign commit on the rebased tip has no matching patch-id —
+  // sync refuses before it can land in pipeline_shas
+  const { deps: deps2, store: store2 } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_main: { sync: "rebase" } },
+    }),
+  });
+  const realRun = deps2.cmd.run;
+  let xSha = "";
+  deps2.cmd = {
+    run: async (file, args, o) => {
+      const res = await realRun(file, args, o);
+      if (!xSha && file === "git" && args.includes("rebase")) {
+        writeFileSync(join(repo, "x-mid-rebase.txt"), "x\n");
+        gitR(repo, ["add", "."]);
+        gitR(repo, ["commit", "-m", "feat: mid-rebase"]);
+        xSha = gitR(repo, ["rev-parse", "HEAD"]);
+      }
+      return res;
+    },
+  };
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unreviewed-commits" &&
+      (e as OrchestratorError).message.includes(xSha.slice(0, 7)),
+  );
+  const failed = store2.releasesByStatuses(["failed"])[0]!;
+  const rec2 = JSON.parse(failed.pipeline_shas ?? "[]") as string[];
+  assert.ok(!rec2.includes(xSha));
+});
+
+test("PLUG-216 п.2: a turn ended on provider/error without turn/completed is not active", async () => {
+  const { repo } = makeRepo();
+  // the journal's newest event stays `turn/started` forever — the
+  // status says the thread stopped, so the release must proceed.
+  const idleCase = makeDeps(repo, {
+    execStatus: "idle",
+    execEvents: () => [
+      { seq: 6, type: "turn/started", createdAt: 2, data: {} },
+    ],
+  });
+  const res = await runRelease(
+    { taskKey: "PLUG-1", caller: COORD },
+    idleCase.deps,
+  );
+  assert.equal(res.status, "auditing");
+
+  // a queued request on a stopped thread still counts as active
+  const queuedCase = makeDeps(repo, {
+    execStatus: "idle",
+    execEvents: () => [
+      { seq: 7, type: "client/turn/requested", createdAt: 3, data: {} },
+      { seq: 6, type: "turn/started", createdAt: 2, data: {} },
+    ],
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, queuedCase.deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /идёт ход/.test((e as OrchestratorError).message),
+  );
+
+  // a live status refuses even when the journal tail looks finished
+  const runningCase = makeDeps(repo, {
+    execStatus: "running",
+    execEvents: () => [
+      { seq: 8, type: "turn/completed", createdAt: 4, data: {} },
+      { seq: 6, type: "turn/started", createdAt: 2, data: {} },
+    ],
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, runningCase.deps),
+    (e: unknown) => (e as OrchestratorError).code === "release-refused",
+  );
+
+  // status unreadable → the journal heuristic decides, as before
+  const legacyCase = makeDeps(repo, {
+    execEvents: () => [
+      { seq: 6, type: "turn/started", createdAt: 2, data: {} },
+    ],
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, legacyCase.deps),
+    (e: unknown) => (e as OrchestratorError).code === "release-refused",
   );
 });
