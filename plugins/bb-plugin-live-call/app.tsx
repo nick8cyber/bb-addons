@@ -23,7 +23,7 @@ const PHONE_ICON = "live-call/phone";
 
 /** Иконка провайдера «live-call» в списках тредов: та же lucide-трубка, размер из className хоста. */
 const LiveCallProviderGlyph = ({ className }: { className?: string }) => (
-  <Icon name="phone" className={className} />
+  <Icon name="phone" size={14} className={className} />
 );
 
 /** Пропсы слота experimental_threadHeaderAction (в типах SDK 0.6 слот legacy и не объявлен, рантайм хоста его принимает). */
