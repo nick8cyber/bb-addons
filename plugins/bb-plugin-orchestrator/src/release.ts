@@ -344,9 +344,18 @@ async function syncBranch(
         );
       }
     } else {
+      // §16.6: an explicit `-m` — the default merge message embeds the
+      // source and target branch names, which the leak scan must not see.
       const res = await deps.cmd.run(
         "git",
-        ["-C", repo, "merge", "--no-edit", target],
+        [
+          "-C",
+          repo,
+          "merge",
+          "-m",
+          `merge ${remoteBaseSha.slice(0, 7)}`,
+          target,
+        ],
         { timeoutMs: 300_000 },
       );
       if (res.exitCode !== 0) {
@@ -584,22 +593,28 @@ async function lastAgentMessage(
 
 /**
  * The shared pre-push hook lets a push through only with a one-time token
- * the plugin writes for this exact commit: `<hooksDir>/push-token.json`,
- * mode 0600, in a 0700 dir — a file, not an agent env var (§5).
+ * the plugin writes for this exact branch+commit: a `push-token-<id>.json`
+ * file, mode 0600, in a 0700 dir — a file, not an agent env var (§5).
+ * §16.6: the token binds the target BRANCH and the SHA, and every release
+ * run writes its own file — two parallel releases never clobber each
+ * other's marker. The hook scans the dir for the matching token.
  */
 export function writePushToken(
   hooksDir: string,
   sha: string,
+  branch: string,
   now = Date.now(),
 ): string {
   mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
   chmodSync(hooksDir, 0o700);
-  const file = join(hooksDir, "push-token.json");
+  const token = randomBytes(24).toString("hex");
+  const file = join(hooksDir, `push-token-${token.slice(0, 16)}.json`);
   writeFileSync(
     file,
     JSON.stringify({
-      token: randomBytes(24).toString("hex"),
+      token,
       sha,
+      branch,
       expiresAt: now + TOKEN_TTL_MS,
     }),
     { mode: 0o600 },
@@ -607,9 +622,9 @@ export function writePushToken(
   return file;
 }
 
-export function clearPushToken(hooksDir: string): void {
+export function clearPushToken(file: string): void {
   try {
-    rmSync(join(hooksDir, "push-token.json"), { force: true });
+    rmSync(file, { force: true });
   } catch {
     // best-effort cleanup; the TTL bounds a stale token anyway
   }
@@ -729,20 +744,58 @@ export async function runRelease(
       `по задаче ${taskKey} уже идёт выкладка`,
     );
   }
-  if (!executor.thread_id) {
-    throw new OrchestratorError(
-      "release-refused",
-      "у делегирования нет треда исполнителя — рабочая копия не найдена",
-    );
+  // §16.6: publish the branch that holds the task's result — a merged
+  // round lives on `merged_into` in the coordinator's copy; anything else
+  // still sits on the executor's own branch.
+  let repo: string | null;
+  let branch: string | null;
+  if (executor.merge_status === "merged") {
+    if (!executor.merged_into) {
+      throw new OrchestratorError(
+        "release-refused",
+        "делегирование помечено merged, но ветка merged_into не записана",
+      );
+    }
+    const coordThread = await deps.threads.get({
+      threadId: input.caller.threadId,
+    });
+    repo = coordThread.environmentPath ?? null;
+    branch = executor.merged_into;
+    if (!repo) {
+      throw new OrchestratorError(
+        "release-refused",
+        "итог влит в копию координатора, но у вызывающего треда нет рабочей копии",
+      );
+    }
+  } else {
+    if (!executor.thread_id) {
+      throw new OrchestratorError(
+        "release-refused",
+        "у делегирования нет треда исполнителя — рабочая копия не найдена",
+      );
+    }
+    const execThread = await deps.threads.get({
+      threadId: executor.thread_id,
+    });
+    repo = execThread.environmentPath ?? null;
+    branch = execThread.environmentBranchName ?? null;
+    if (!repo || !branch) {
+      throw new OrchestratorError(
+        "release-refused",
+        "у исполнителя нет рабочей копии (environmentPath/environmentBranchName пусты)",
+      );
+    }
   }
-  const execThread = await deps.threads.get({ threadId: executor.thread_id });
-  const repo = execThread.environmentPath ?? null;
-  const branch = execThread.environmentBranchName ?? null;
-  if (!repo || !branch) {
-    throw new OrchestratorError(
-      "release-refused",
-      "у исполнителя нет рабочей копии (environmentPath/environmentBranchName пусты)",
-    );
+  // The copy must sit on the publishable branch — a merged result may
+  // share the coordinator's worktree with other work.
+  const onBranch = await git(
+    deps,
+    repo,
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    { allowFail: true },
+  );
+  if (onBranch !== branch) {
+    await git(deps, repo, ["switch", branch]);
   }
 
   // Step 2 — sync по режиму проекта.
@@ -767,6 +820,18 @@ export async function runRelease(
   const added = parseAddedLines(
     await git(deps, repo, ["diff", "--unified=0", baseSha, headSha]),
   );
+  // §16.6: scan the patch of EVERY commit in the range — a leak added
+  // and removed inside it escapes the range diff. `--cc` gives merge
+  // commits their conflict-resolution patch.
+  const patches = parseAddedLines(
+    await git(deps, repo, [
+      "log",
+      "-p",
+      "--cc",
+      "--unified=0",
+      `${baseSha}..${headSha}`,
+    ]),
+  );
   const allowed = await allowedAuthor(deps, repo, project.commitIdentity);
   const findings = await machineScan(deps.cmd, {
     repoPath: repo,
@@ -774,9 +839,11 @@ export async function runRelease(
     headSha,
     commits,
     added,
+    patches,
     leaks: project.leaks,
     allowedAuthor: allowed,
     hostname: deps.hostname ?? osHostname(),
+    threadIds: project.threadIds,
   });
   const blockers = findings.filter((f) => f.severity === "block");
   const warnings = findings.filter((f) => f.severity === "warn");
@@ -924,7 +991,7 @@ async function writeAuditPacket(
     `# Аудит выкладки ${r.task_key}`,
     "",
     `- Задача: ${r.task_key} — ${input.taskTitle}`,
-    `- Репозиторий (рабочая копия исполнителя): ${r.repo_path}`,
+    `- Репозиторий (рабочая копия с итогом задачи): ${r.repo_path}`,
     `- Ветка: ${r.branch} → ${r.target_action} в ${r.target_branch}`,
     `- Диапазон: ${input.baseSha}..${input.headSha}`,
     input.noDocs ? `- --no-docs: ${input.noDocs}` : null,
@@ -1093,26 +1160,35 @@ async function ghJson<T>(
 }
 
 /**
- * §5: write the one-time token for `sha`, run `git push` (the shared
- * pre-push hook validates sha+expiry and consumes the file), then clean
- * up whatever the hook did not consume (push refused by the remote, or
- * no hook installed).
+ * §5: write the one-time token for `branch`+`sha`, run `git push` (the
+ * shared pre-push hook validates branch+sha+expiry and consumes the
+ * file), then clean up whatever the hook did not consume (push refused
+ * by the remote, or no hook installed).
  */
 async function pushWithToken(
   deps: ReleaseDeps,
   repo: string,
   sha: string,
+  branch: string,
   refspec: string,
 ): Promise<void> {
-  const hooksDir = deps.hooksDir();
-  writePushToken(hooksDir, sha, deps.now?.());
+  const file = writePushToken(deps.hooksDir(), sha, branch, deps.now?.());
   try {
     await git(deps, repo, ["push", "origin", refspec], {
       timeoutMs: 300_000,
     });
   } finally {
-    clearPushToken(hooksDir);
+    clearPushToken(file);
   }
+}
+
+/** The project's `threadIds` at publish time (§16.6; default `true` —
+ * a broken config at pump time must not silently drop the contract
+ * line CI/CD relies on). */
+function projectThreadIds(deps: ReleaseDeps, projectId: string): boolean {
+  const cfg = deps.loadReleaseConfig();
+  if (!cfg.config) return true;
+  return resolveProject(cfg.config, projectId).threadIds;
 }
 
 async function publishRelease(
@@ -1139,6 +1215,7 @@ async function publishRelease(
       deps,
       repo,
       headSha,
+      row.target_branch,
       `${headSha}:refs/heads/${row.target_branch}`,
     );
     deps.store.updateRelease(row.id, { publishedSha: headSha });
@@ -1162,7 +1239,9 @@ async function publishRelease(
     return;
   }
 
-  // action=pr
+  // action=pr — §16.6 `threadIds`: the «Источник: bb тред thr_…» line is
+  // written only while the project allows thread ids.
+  const threadIds = projectThreadIds(deps, row.project_id);
   const prs = await ghJson<GhPr[]>(deps, repo, [
     "pr",
     "list",
@@ -1180,7 +1259,13 @@ async function publishRelease(
   );
   if (existing) {
     const src = SOURCE_RE.exec(existing.body ?? "")?.[1];
-    if (src !== row.coordinator_thread_id) {
+    const foreign =
+      src !== undefined
+        ? src !== row.coordinator_thread_id
+        : threadIds
+          ? true // our PRs always carry «Источник» — none means foreign
+          : !existing.url || !deps.store.prWasReleased(existing.url);
+    if (foreign) {
       throw new OrchestratorError(
         "release-refused",
         `PR ${existing.url} у ветки ${row.branch} создан не этим release ` +
@@ -1192,6 +1277,7 @@ async function publishRelease(
     deps,
     repo,
     headSha,
+    row.branch,
     `${headSha}:refs/heads/${row.branch}`,
   );
   deps.store.updateRelease(row.id, { publishedSha: headSha });
@@ -1214,7 +1300,9 @@ async function publishRelease(
       "--title",
       title,
       "--body",
-      `Источник: bb тред ${row.coordinator_thread_id}\n\nЗадача: ${row.task_key}`,
+      (threadIds
+        ? `Источник: bb тред ${row.coordinator_thread_id}\n\n`
+        : "") + `Задача: ${row.task_key}`,
     ]);
     prUrl = created.url ?? null;
   }
@@ -1340,6 +1428,15 @@ async function postCheck(
           pushedSha,
         ]),
       );
+      const patches = parseAddedLines(
+        await git(deps, repo, [
+          "log",
+          "-p",
+          "--cc",
+          "--unified=0",
+          `${scanBase}..${pushedSha}`,
+        ]),
+      );
       const leaks = { machine: "block" as const, bbIds: "block" as const, allow: [] };
       const findings = await machineScan(deps.cmd, {
         repoPath: repo,
@@ -1347,8 +1444,10 @@ async function postCheck(
         headSha: pushedSha,
         commits,
         added,
+        patches,
         leaks,
         hostname: deps.hostname ?? osHostname(),
+        threadIds: projectThreadIds(deps, row.project_id),
       });
       const blockers = findings.filter((f) => f.severity === "block");
       if (blockers.length) {

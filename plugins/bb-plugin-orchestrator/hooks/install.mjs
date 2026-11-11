@@ -141,9 +141,9 @@ if (selfTest) {
   const { tmpdir } = await import("node:os");
   const { spawnSync } = await import("node:child_process");
   const tmp = mkdtempSync(join(tmpdir(), "hook-selftest-"));
-  // Run against a TEMP copy of the hooks dir — the token file resolves
-  // relative to the hook's own directory, so the live push-token.json
-  // (possibly written by an in-flight release) is never touched.
+  // Run against a TEMP copy of the hooks dir — the token files resolve
+  // relative to the hook's own directory, so the live push-token-*.json
+  // (possibly written by an in-flight release) are never touched.
   const testHooksDir = join(tmp, "hooks");
   mkdirSync(testHooksDir, { recursive: true });
   const hookPath = join(testHooksDir, "pre-push");
@@ -177,8 +177,8 @@ if (selfTest) {
     const lh = join(common, "hooks", "pre-push");
     writeFileSync(lh, '#!/bin/sh\n[ -n "$ORCH_MARK" ] && echo hit > "$ORCH_MARK"\nexit 0\n');
     execFileSync("chmod", ["+x", lh]);
-    writeFileSync(join(testHooksDir, "push-token.json"),
-      JSON.stringify({ token: "t", sha: SHA, expiresAt: Date.now() + 60000 }));
+    writeFileSync(join(testHooksDir, "push-token-selftest.json"),
+      JSON.stringify({ token: "t", sha: SHA, branch: "x", expiresAt: Date.now() + 60000 }));
     const mark = join(tmp, `mark-${kind.name.replace(/\W+/g, "-")}`);
     const r = spawnSync("node", [hookPath], {
       cwd: repo, input: LINE,

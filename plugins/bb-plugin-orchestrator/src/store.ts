@@ -980,6 +980,19 @@ export class DelegationStore {
       | undefined;
   }
 
+  /** §16.6: is this PR URL one the release pipeline itself created?
+   * With `threadIds` off our PRs carry no «Источник» marker, so a repeat
+   * release may write only into a PR it recorded here. */
+  prWasReleased(url: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM releases WHERE pr_url = ? LIMIT 1`,
+        )
+        .get(url) !== undefined
+    );
+  }
+
   /** §2 step 7 «выложено в обход»: is this sha a commit release pushed? */
   shaWasReleased(sha: string): boolean {
     return (

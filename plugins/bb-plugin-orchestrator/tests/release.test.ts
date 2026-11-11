@@ -153,44 +153,58 @@ test("parseAddedLines tracks file+line of + lines", () => {
 
 const LEAKS = { machine: "block" as const, bbIds: "warn" as const, allow: [] };
 
-test("machine scan: categories 2-4 templates, BB-Thread exempt", async () => {
-  const cmd: CmdRunner = {
-    run: async (file) =>
-      file === "gitleaks" ? { exitCode: 7, stdout: "[]", stderr: "" } : ok(),
-  };
-  const findings = await machineScan(cmd, {
-    repoPath: "/r",
-    baseSha: "a".repeat(40),
-    headSha: "b".repeat(40),
-    commits: [
-      {
-        sha: "b".repeat(40),
-        authorName: "Wrong",
-        authorEmail: "w@x.io",
-        committerName: "Agent",
-        committerEmail: "agent@x.io",
-        body: "feat: x\n\nBB-Thread: thr_abc1234567\nCo-Authored-By: bot <b@x>",
-      },
-    ],
-    added: [
-      { file: "f.ts", line: 1, text: 'const d = "/home/u/secrets/"' },
-      { file: "f.ts", line: 2, text: "see thr_abc1234567" },
-      { file: "allow/x.md", line: 1, text: "thr_abc1234567" },
-      { file: ".env", line: 1, text: "X=1" },
-    ],
-    leaks: { ...LEAKS, allow: ["allow/"] },
-    allowedAuthor: { name: "Agent", email: "agent@x.io" },
-  });
+const SCAN_BASE = {
+  repoPath: "/r",
+  baseSha: "a".repeat(40),
+  headSha: "b".repeat(40),
+  commits: [
+    {
+      sha: "b".repeat(40),
+      authorName: "Wrong",
+      authorEmail: "w@x.io",
+      committerName: "Agent",
+      committerEmail: "agent@x.io",
+      body: "feat: x\n\nBB-Thread: thr_abc1234567\nCo-Authored-By: bot <b@x>",
+    },
+  ],
+  added: [
+    { file: "f.ts", line: 1, text: 'const d = "/home/u/secrets/"' },
+    { file: "f.ts", line: 2, text: "see thr_abc1234567" },
+    { file: "allow/x.md", line: 1, text: "thr_abc1234567" },
+    { file: ".env", line: 1, text: "X=1" },
+  ],
+  leaks: { ...LEAKS, allow: ["allow/"] },
+  allowedAuthor: { name: "Agent", email: "agent@x.io" },
+};
+
+const GL_EMPTY: CmdRunner = {
+  run: async (file) =>
+    file === "gitleaks" ? { exitCode: 7, stdout: "[]", stderr: "" } : ok(),
+};
+
+test("machine scan: categories 1-3 always; threadIds on → thr_ exempt (§16.6)", async () => {
+  const findings = await machineScan(GL_EMPTY, SCAN_BASE);
   const cat = (n: number) => findings.filter((f) => f.category === n);
   assert.ok(cat(1).some((f) => f.rule === "secret-file" && f.file === ".env"));
   assert.ok(cat(2).some((f) => f.rule === "commit-identity"));
   assert.ok(cat(2).some((f) => f.rule === "foreign-bot-trailer"));
   assert.ok(cat(3).some((f) => f.rule === "home-path"));
-  // thr_ in the diff is cat 4 (warn), in the BB-Thread trailer exempt,
-  // in allow-listed files skipped.
+  // §16.6 default: thr_ ids are anonymized — no bb-thread-id finding
+  // anywhere (diff, allow-listed file or BB-Thread trailer).
+  assert.ok(!findings.some((f) => f.rule === "bb-thread-id"));
+});
+
+test("machine scan: threadIds off → thr_ a finding incl. BB-Thread trailer", async () => {
+  const findings = await machineScan(GL_EMPTY, {
+    ...SCAN_BASE,
+    threadIds: false,
+  });
+  const cat = (n: number) => findings.filter((f) => f.category === n);
+  // thr_ in the diff is cat 4 (warn) and, with the exemption off, even
+  // the BB-Thread trailer line counts — file:null findings exist.
   assert.ok(cat(4).some((f) => f.file === "f.ts"));
+  assert.ok(cat(4).some((f) => f.file === null));
   assert.ok(!cat(4).some((f) => f.file === "allow/x.md"));
-  assert.ok(!cat(4).some((f) => f.file === null));
 });
 
 test("gitleaks missing → gitleaks-missing with hint", async () => {
@@ -268,7 +282,7 @@ function gitR(repo: string, args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-function makeRepo(): { repo: string; remote: string } {
+function makeRepo(): { repo: string; remote: string; seed: string } {
   const base = mkdtempSync(join(tmpdir(), "rel-"));
   const remote = join(base, "remote.git");
   const repo = join(base, "wt");
@@ -295,7 +309,7 @@ function makeRepo(): { repo: string; remote: string } {
   gitR(repo, ["fetch", "origin"]);
   // Give the feature branch a real merge-base with main.
   gitR(repo, ["rebase", "origin/main"]);
-  return { repo, remote };
+  return { repo, remote, seed };
 }
 
 function makeDeps(repo: string, overrides: Partial<{
@@ -306,6 +320,8 @@ function makeDeps(repo: string, overrides: Partial<{
   auditVerdict: string;
   auditStatus: string;
   reviewLevel: string;
+  coordPath: string;
+  ghCalls: string[][];
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -364,7 +380,9 @@ function makeDeps(repo: string, overrides: Partial<{
     get: async ({ threadId }: { threadId: string }) =>
       threadId === "thr_exec"
         ? { id: threadId, environmentPath: repo, environmentBranchName: "feat-x", parentThreadId: null }
-        : { id: threadId, parentThreadId: null, title: null, originPluginId: null, projectId: "proj_main" },
+        : threadId === "thr_coord" && overrides.coordPath
+          ? { id: threadId, environmentPath: overrides.coordPath, environmentBranchName: null, parentThreadId: null }
+          : { id: threadId, parentThreadId: null, title: null, originPluginId: null, projectId: "proj_main" },
     send: async (a: { threadId: string; input: unknown[] }) => {
       sent.push((a.input[0] as { text: string }).text);
       return {};
@@ -384,6 +402,18 @@ function makeDeps(repo: string, overrides: Partial<{
     store, bbCli, threads: threads as never,
     cmd: { run: async (file: string, args: string[], o?: { cwd?: string }) => {
       if (file === "gitleaks") return { exitCode: 0, stdout: "", stderr: "" };
+      if (file === "gh") {
+        overrides.ghCalls?.push(args);
+        if (args[0] === "pr" && args[1] === "list")
+          return { exitCode: 0, stdout: "[]", stderr: "" };
+        if (args[0] === "pr" && args[1] === "create")
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({ url: "https://example.test/pr/7" }),
+            stderr: "",
+          };
+        return { exitCode: 0, stdout: "{}", stderr: "" };
+      }
       try {
         const out = execFileSync(file, args, {
           cwd: o?.cwd, encoding: "utf8",
@@ -415,7 +445,7 @@ function makeDeps(repo: string, overrides: Partial<{
     packetDir: () => mkdtempSync(join(tmpdir(), "pkt-")),
     log: {},
   } satisfies ReleaseDeps;
-  return { deps, store, calls, comments, sent, tmp };
+  return { deps, store, calls, comments, sent, tmp, exec };
 }
 
 test("release: refuses without release config / level / coordinator", async () => {
@@ -542,12 +572,18 @@ test("pump: audit chain exhausted → failed + message", async () => {
   assert.ok(sent.some((m) => /исчерпана/.test(m)));
 });
 
-test("push token file: sha + expiry written 0600", () => {
+test("push token file: branch+sha+expiry, one file per run (§16.6)", () => {
   const dir = mkdtempSync(join(tmpdir(), "tok-"));
-  const file = writePushToken(dir, "abc123");
+  const file = writePushToken(dir, "abc123", "main");
   const data = JSON.parse(readFileSync(file, "utf8"));
   assert.equal(data.sha, "abc123");
+  assert.equal(data.branch, "main");
   assert.ok(data.expiresAt > Date.now());
+  assert.match(file, /push-token-[0-9a-f]+\.json$/);
+  // two runs — two files, nothing clobbered
+  const file2 = writePushToken(dir, "def456", "dev");
+  assert.notEqual(file, file2);
+  assert.ok(readFileSync(file, "utf8").includes("abc123"));
 });
 
 // ── review findings 1–9 ────────────────────────────────────────────────
@@ -695,4 +731,123 @@ test("release step 1: auditor-level rows never count as executor work", async ()
     (e: unknown) =>
       /нет делегирования/.test((e as OrchestratorError).message),
   );
+});
+
+// ── §16.6 r25: publishable branch, -m, per-commit scan, threadIds ──────
+
+test("release: merged round publishes merged_into from coordinator copy", async () => {
+  const { remote } = makeRepo();
+  const base = mkdtempSync(join(tmpdir(), "rel-coord-"));
+  const coord = join(base, "coord");
+  execFileSync("git", ["clone", "--branch", "main", remote, coord]);
+  gitR(coord, ["config", "user.name", "Agent"]);
+  gitR(coord, ["config", "user.email", "agent@x.io"]);
+  gitR(coord, ["checkout", "-b", "work"]);
+  writeFileSync(join(coord, "merged.txt"), "merged\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "feat: merged result"]);
+  // Executor env deliberately absent — a merged result must come from
+  // the coordinator's copy, not the executor's.
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, {
+    into: "work",
+    sha: gitR(coord, ["rev-parse", "HEAD"]),
+  });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const row = store.getRelease(res.releaseId)!;
+  assert.equal(row.branch, "work");
+  assert.equal(row.repo_path, coord);
+  assert.equal(res.status, "auditing");
+});
+
+test("release: sync merge message carries no branch names or ids (§16.6)", async () => {
+  const { repo, seed } = makeRepo();
+  // Advance main so the sync step must create a merge commit.
+  writeFileSync(join(seed, "new.txt"), "new\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: more"]);
+  gitR(seed, ["push", "origin", "main"]);
+  const { deps } = makeDeps(repo);
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const msg = gitR(repo, ["log", "-1", "--format=%B"]);
+  assert.match(msg, /^merge [0-9a-f]{7}\s*$/);
+  assert.ok(!/feat-x|origin\/main|thr_/.test(msg));
+});
+
+test("release: leak added and removed inside the range is still caught (§16.6)", async () => {
+  const { repo } = makeRepo();
+  writeFileSync(join(repo, "leak.txt"), "path /home/someone/secret\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "wip: leak"]);
+  execFileSync("rm", [join(repo, "leak.txt")]);
+  gitR(repo, ["add", "-A"]);
+  gitR(repo, ["commit", "-m", "wip: cleanup"]);
+  const { deps } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        leaks: { machine: "block" },
+      },
+    }),
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /привязка|home-path/.test((e as OrchestratorError).message),
+  );
+});
+
+test("release config: threadIds parses, defaults true, validates (§16.6)", () => {
+  const c = parseReleaseConfig(
+    JSON.stringify({
+      defaults: { threadIds: false },
+      projects: { p1: { threadIds: true }, p2: {} },
+    }),
+  );
+  assert.equal(c.errors.length, 0);
+  assert.equal(resolveProject(c.config!, "p1").threadIds, true);
+  assert.equal(resolveProject(c.config!, "p2").threadIds, false);
+  assert.equal(resolveProject(c.config!, "unknown").threadIds, false);
+  const bad = parseReleaseConfig(
+    JSON.stringify({ projects: { p: { threadIds: "yes" } } }),
+  );
+  assert.ok(bad.errors.some((e) => e.path === "projects.p.threadIds"));
+});
+
+test("pump: «Источник» line follows threadIds; repeat release on own PR (§16.6)", async () => {
+  const publish = async (threadIds: boolean) => {
+    const { repo } = makeRepo();
+    const ghCalls: string[][] = [];
+    const { deps, store } = makeDeps(repo, {
+      ghCalls,
+      auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+      releaseText: JSON.stringify({
+        commitIdentity: "Agent <agent@x.io>",
+        defaults: {
+          target: { action: "pr", branch: "main" },
+          threadIds,
+        },
+      }),
+    });
+    await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+    const audit = store.latestDelegationByTaskAndLevel(
+      "PLUG-1",
+      "release-audit",
+    )!;
+    store.setStatus(audit.id, "done");
+    const s = await pumpReleases(deps);
+    assert.equal(s.published, 1);
+    const create = ghCalls.find(
+      (a) => a[0] === "pr" && a[1] === "create",
+    )!;
+    return create[create.indexOf("--body") + 1]!;
+  };
+  assert.match(await publish(true), /Источник: bb тред thr_coord/);
+  const off = await publish(false);
+  assert.doesNotMatch(off, /Источник/);
+  assert.match(off, /Задача: PLUG-1/);
 });

@@ -36,6 +36,19 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   back to a clean copy; with the `mergeAutofix` setting on, a fix round is
   delegated to the same task and level. Protected branches refuse —
   `release` owns them.
+- **`release`** (CLI `bb orchestrator release <KEY>`, spec
+  orchestrator-release): the only path code takes to a remote — приёмка →
+  branch sync → project checks → machine leak scan (every commit's
+  patch, §16.6) → audit agent → publish (`push` or `pr`) → post-check.
+  A merged round publishes its `merged_into` branch from the
+  coordinator's copy; anything else the executor's branch. The shared
+  `pre-push` hook is a **forgetfulness guard, not a hard gate**: it
+  stops an accidental `git push`, but an agent running as the same user
+  could write the token itself — for a hard gate use branch protection
+  on the hosting (required checks); `orchestrator-setup` offers it.
+  `threadIds` (default on) keeps the «Источник: bb тред thr_…» line in
+  PR bodies and exempts `thr_…` from the bb-ids leak rule; off — no
+  «Источник» line and every `thr_…` is a `leaks.bbIds` finding.
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
   `dispatching` rows via `bb tasks threads` or drops them, survives
