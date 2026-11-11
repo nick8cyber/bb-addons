@@ -46,6 +46,9 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   stops an accidental `git push`, but an agent running as the same user
   could write the token itself — for a hard gate use branch protection
   on the hosting (required checks); `orchestrator-setup` offers it.
+  After a plugin update re-run `hooks/install.mjs` — `release` compares
+  the installed hook with the plugin's and refuses with a reinstall
+  hint when they differ.
   `threadIds` (default on) keeps the «Источник: bb тред thr_…» line in
   PR bodies and exempts `thr_…` from the bb-ids leak rule; off — no
   «Источник» line and every `thr_…` is a `leaks.bbIds` finding.

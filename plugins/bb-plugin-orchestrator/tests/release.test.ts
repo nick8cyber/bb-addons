@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -644,6 +644,9 @@ test("f9: task-key template flags PLUG-123, not UTF-8", async () => {
       { file: "b.md", line: 1, text: 'charset="UTF-8"' },
     ],
     leaks: { machine: "block", bbIds: "warn", allow: [] },
+    // §16.6: the template itself is tested — `threadIds` off, else
+    // task-key is exempt like `thr_…` (PLUG-189).
+    threadIds: false,
   });
   const keys = findings.filter((f) => f.rule === "task-key");
   assert.equal(keys.length, 1);
@@ -844,10 +847,222 @@ test("pump: «Источник» line follows threadIds; repeat release on own P
     const create = ghCalls.find(
       (a) => a[0] === "pr" && a[1] === "create",
     )!;
-    return create[create.indexOf("--body") + 1]!;
+    return {
+      body: create[create.indexOf("--body") + 1]!,
+      head: create[create.indexOf("--head") + 1]!,
+      args: create,
+    };
   };
-  assert.match(await publish(true), /Источник: bb тред thr_coord/);
+  const on = await publish(true);
+  assert.match(on.body, /Источник: bb тред thr_coord/);
+  assert.match(on.body, /Задача: PLUG-1/);
+  assert.equal(on.head, "feat-x"); // local executor branch published as-is
   const off = await publish(false);
-  assert.doesNotMatch(off, /Источник/);
-  assert.match(off, /Задача: PLUG-1/);
+  // §16.6: with threadIds off nothing bb-identifiable reaches the remote
+  // — no «Источник», no «Задача: <KEY>», a neutral release/<sha7> head.
+  assert.doesNotMatch(off.body, /Источник|Задача/);
+  assert.match(off.head, /^release\/[0-9a-f]{7}$/);
+});
+
+// ── §16.6 (PLUG-189): coordinator-copy lock/restore, neutral publish ──
+
+/** A coordinator copy: clone on `main`, task result committed on `work`
+ * (the merged_into branch). */
+function makeMergedCoordinatorCopy(): { coord: string; workTip: string } {
+  const { remote } = makeRepo();
+  const base = mkdtempSync(join(tmpdir(), "rel-coord-"));
+  const coord = join(base, "coord");
+  execFileSync("git", ["clone", "--branch", "main", remote, coord]);
+  gitR(coord, ["config", "user.name", "Agent"]);
+  gitR(coord, ["config", "user.email", "agent@x.io"]);
+  gitR(coord, ["checkout", "-b", "work"]);
+  writeFileSync(join(coord, "merged.txt"), "merged\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "feat: merged result"]);
+  const workTip = gitR(coord, ["rev-parse", "HEAD"]);
+  // The coordinator's own position — another branch with its own commit.
+  gitR(coord, ["checkout", "-b", "work-2"]);
+  writeFileSync(join(coord, "own.txt"), "own\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "coord own work"]);
+  return { coord, workTip };
+}
+
+test("release (merged): copy restored to original branch+HEAD, lock gone", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const originalHead = gitR(coord, ["rev-parse", "HEAD"]);
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  // §16.6: the copy is back on work-2 at its original commit, clean.
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work-2");
+  assert.equal(gitR(coord, ["rev-parse", "HEAD"]), originalHead);
+  assert.equal(gitR(coord, ["status", "--porcelain"]), "");
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  assert.equal(
+    existsSync(join(gitDir, "orchestrator-merge.lock")),
+    false,
+  );
+});
+
+test("release (merged): dirty copy refuses BEFORE the switch", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  writeFileSync(join(coord, "dirty.txt"), "x"); // uncommitted
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "dirty-coordinator",
+  );
+  // The dirty copy was never moved onto `work`.
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work-2");
+});
+
+test("release (merged): same lock as merge — held lock refuses", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  // A live lock (this process stands in for a running merge/release).
+  writeFileSync(
+    join(gitDir, "orchestrator-merge.lock"),
+    `${process.pid}\n${new Date().toISOString()}\n`,
+  );
+  try {
+    await assert.rejects(
+      runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+      (e: unknown) =>
+        (e as OrchestratorError).code === "merge-in-progress",
+    );
+    assert.equal(
+      gitR(coord, ["symbolic-ref", "--short", "HEAD"]),
+      "work-2",
+    );
+  } finally {
+    execFileSync("rm", ["-f", join(gitDir, "orchestrator-merge.lock")]);
+  }
+});
+
+test("release (merged): restore failure → copy-not-restored", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  const realRun = deps.cmd.run;
+  deps.cmd = {
+    run: async (file, args, o) => {
+      const res = await realRun(file, args, o);
+      // Once the pipeline moves the copy onto `work`, `work-2` is
+      // deleted behind its back — the restore switch must fail.
+      if (file === "git" && args[2] === "switch" && args[3] === "work") {
+        gitR(coord, ["branch", "-D", "work-2"]);
+      }
+      return res;
+    },
+  };
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "copy-not-restored",
+  );
+});
+
+test("release: audit instructions bind the sha, not the copy's branch", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, calls } = makeDeps(repo);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const headSha = store.getRelease(res.releaseId)!.head_sha!;
+  const dispatch = calls.find(
+    (c) => c[0] === "tasks" && c[1] === "dispatch",
+  )!;
+  const instructions = dispatch[dispatch.indexOf("--instructions") + 1]!;
+  assert.ok(instructions.includes(headSha));
+});
+
+test("release: stale installed hook refuses with reinstall hint", async () => {
+  const { repo } = makeRepo();
+  const { deps, tmp } = makeDeps(repo);
+  writeFileSync(join(tmp, "pre-push"), "#!/bin/sh\n# outdated hook\n");
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "hook-stale" &&
+      /install\.mjs/.test((e as OrchestratorError).hint ?? ""),
+  );
+});
+
+test("release: up-to-date installed hook passes the freshness check", async () => {
+  const { repo } = makeRepo();
+  const { deps, tmp } = makeDeps(repo);
+  cpSync(
+    new URL("../hooks/pre-push", import.meta.url).pathname,
+    join(tmp, "pre-push"),
+  );
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("machine scan: threadIds governs task-key too (§16.6)", async () => {
+  const input = {
+    ...SCAN_BASE,
+    commits: [
+      {
+        sha: "b".repeat(40),
+        authorName: "Agent",
+        authorEmail: "agent@x.io",
+        committerName: "Agent",
+        committerEmail: "agent@x.io",
+        body: "merge PLUG-1 r2 (abc1234)",
+      },
+    ],
+    added: [
+      { file: "m.ts", line: 1, text: "note: merge PLUG-1 r2 (abc1234)" },
+    ],
+  };
+  // The pipeline's own merge commit (§14) is not a finding while
+  // threadIds is on.
+  const on = await machineScan(GL_EMPTY, input);
+  assert.ok(!on.some((f) => f.rule === "task-key"));
+  const off = await machineScan(GL_EMPTY, { ...input, threadIds: false });
+  assert.ok(off.some((f) => f.rule === "task-key"));
+});
+
+test("parseAddedLines: combined @@@ hunks — only all-+ columns scan", () => {
+  const diff = [
+    "diff --combined f.ts",
+    "index 1111111,2222222..3333333",
+    "--- a/f.ts",
+    "+++ b/f.ts",
+    "@@@ -1,3 -1,3 +1,4 @@@",
+    "++added-by-merge",
+    " -not-in-result",
+    "+ already-in-parent1",
+    "  context-line",
+  ].join("\n");
+  assert.deepEqual(parseAddedLines(diff), [
+    { file: "f.ts", line: 1, text: "added-by-merge" },
+  ]);
+});
+
+test("f7: prWasReleased is scoped to the coordinator", () => {
+  const { store } = makeDeps("/tmp/x");
+  const r = store.insertRelease({
+    taskKey: "PLUG-9",
+    projectId: "p",
+    coordinatorThreadId: "thr_a",
+    repoPath: "/r",
+    branch: "b",
+    targetAction: "pr",
+    targetBranch: "main",
+  });
+  store.updateRelease(r.id, { prUrl: "https://x.test/pr/1" });
+  assert.equal(store.prWasReleased("https://x.test/pr/1", "thr_a"), true);
+  assert.equal(store.prWasReleased("https://x.test/pr/1", "thr_b"), false);
 });

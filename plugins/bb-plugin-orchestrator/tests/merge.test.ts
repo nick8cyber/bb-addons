@@ -198,6 +198,20 @@ test("clean merge: merge commit, record, task comment", async () => {
   ]);
 });
 
+test("§16.6 threadIds=false: merge message drops the task key", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  deps.releaseThreadIds = () => false;
+  recordResult(store, row, resultSha);
+
+  const res = await runMerge(PARAMS, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  assert.match(
+    gitR(coord, ["log", "-1", "--format=%s"]),
+    new RegExp(`^merge r1 \\(${resultSha.slice(0, 7)}\\)$`),
+  );
+});
+
 test("merge --into <branch>: checks out the target and merges there", async () => {
   const { coord, exec, resultSha } = makeRepos();
   gitR(coord, ["branch", "target"]);

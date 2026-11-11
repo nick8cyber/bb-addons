@@ -58,14 +58,22 @@ export const DEFAULT_PROTECTED_BRANCHES = ["main", "master", "dev"] as const;
 /** §14: merge hooks may run test suites — well above cmd's 60 s default. */
 const MERGE_TIMEOUT_MS = 10 * 60_000;
 
-/** §14 check 4: lock file inside the copy's git dir (per-worktree). */
-const MERGE_LOCK_NAME = "orchestrator-merge.lock";
+/** §14 check 4: lock file inside the copy's git dir (per-worktree).
+ * §16.6: `release` takes the same lock when it works inside the
+ * coordinator's copy (merged_into publication). */
+export const MERGE_LOCK_NAME = "orchestrator-merge.lock";
 
 export interface MergeGitResult {
   exitCode: number;
   stdout: string;
   stderr: string;
 }
+
+/** `git` inside a worktree — shared by `merge` and `release`. */
+export type MergeGit = (
+  args: string[],
+  opts?: { timeoutMs?: number },
+) => Promise<MergeGitResult>;
 
 export interface MergeParams {
   /** Task key (latest `done` delegation with a result) or delegation id. */
@@ -107,6 +115,10 @@ export interface MergeDeps {
   protectedBranches?: readonly string[];
   /** §16.6 `mergeAutofix` setting — off by default (report only). */
   mergeAutofix?: () => boolean;
+  /** §16.6 `threadIds` of the project's release config: `false` → the
+   * merge message drops the task key (`merge r<N> (<sha7>)`). Default
+   * on when unset. */
+  releaseThreadIds?: (projectId: string | null) => boolean;
   log?: { warn?(message: string): void };
 }
 
@@ -138,10 +150,7 @@ export interface MergeOutcome {
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const sha7 = (sha: string) => sha.slice(0, 7);
 
-type Git = (
-  args: string[],
-  opts?: { timeoutMs?: number },
-) => Promise<MergeGitResult>;
+type Git = MergeGit;
 
 /**
  * §14 check 1 + repeat calls, as a reusable unit: they run before the
@@ -424,13 +433,19 @@ export async function runMerge(
         await gitText(["switch", into]);
       }
       targetTip = (await gitText(["rev-parse", "HEAD"])).trim();
+      // §16.6 `threadIds`: off → the merge message drops the task key
+      // (`merge r<N> (<sha7>)`) so a public-facing release scan never
+      // trips over the pipeline's own commit.
+      const mergeMessage = (deps.releaseThreadIds?.(row.project_id) ?? true)
+        ? `merge ${row.task_key} r${row.round} (${sha7(resultSha)})`
+        : `merge r${row.round} (${sha7(resultSha)})`;
       const mergeRes = await git(
         [
           "merge",
           "--no-ff",
           "--no-edit",
           "-m",
-          `merge ${row.task_key} r${row.round} (${sha7(resultSha)})`,
+          mergeMessage,
           resultSha,
         ],
         { timeoutMs: MERGE_TIMEOUT_MS },
@@ -566,13 +581,16 @@ export async function runMerge(
 
 /**
  * §14: the coordinator copy must come back to `branch` at `head` with a
- * clean `git status` after any failed merge. Returns a description of
- * what is still wrong, or null when the copy is restored.
+ * clean `git status` after any failed merge. `head = null` skips the
+ * tip check — §16.6 release: when the copy already sat on the published
+ * branch, its tip legitimately advanced (the sync merge is real work),
+ * so only the branch and a clean status are verified. Returns a
+ * description of what is still wrong, or null when the copy is restored.
  */
-async function restoreCopy(
+export async function restoreCopy(
   git: Git,
   branch: string,
-  head: string,
+  head: string | null,
 ): Promise<string | null> {
   const merging = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
   if (merging.exitCode === 0) {
@@ -609,9 +627,11 @@ async function restoreCopy(
     const lines = status.stdout.trim().split("\n").slice(0, 5).join("; ");
     return `копия грязная: ${lines}`;
   }
-  const tip = await git(["rev-parse", "HEAD"]);
-  if (tip.exitCode !== 0 || tip.stdout.trim() !== head) {
-    return `HEAD ${tip.stdout.trim() || "?"} ≠ ${sha7(head)}`;
+  if (head !== null) {
+    const tip = await git(["rev-parse", "HEAD"]);
+    if (tip.exitCode !== 0 || tip.stdout.trim() !== head) {
+      return `HEAD ${tip.stdout.trim() || "?"} ≠ ${sha7(head)}`;
+    }
   }
   return null;
 }
@@ -636,7 +656,7 @@ function pidAlive(pid: number): boolean {
 }
 
 /** §14 check 2: git-dir markers of an unfinished operation (`copy-busy`). */
-const COPY_BUSY_MARKERS = [
+export const COPY_BUSY_MARKERS = [
   "MERGE_HEAD",
   "CHERRY_PICK_HEAD",
   "REVERT_HEAD",
@@ -662,7 +682,11 @@ function parseLock(content: string): LockInfo | null {
  * §14: once the copy's original state is known it goes into our lock —
  * a stale-lock breaker restores the copy to it before removing the lock.
  */
-function recordLockState(lockPath: string, branch: string, head: string): void {
+export function recordLockState(
+  lockPath: string,
+  branch: string,
+  head: string,
+): void {
   try {
     writeFileSync(
       lockPath,
@@ -683,7 +707,7 @@ function recordLockState(lockPath: string, branch: string, head: string): void {
  * stolen content is verified: a file that is not the vetted stale lock
  * belongs to a new owner and is put back.
  */
-async function acquireCopyLock(
+export async function acquireCopyLock(
   git: Git,
   repo: string,
   lockPath: string,

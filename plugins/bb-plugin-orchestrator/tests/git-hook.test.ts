@@ -103,6 +103,50 @@ test("hook: expired token → refuse", () => {
   assert.match(r.stderr, /истёк/);
 });
 
+// §16.6 (PLUG-189): a branchless token is legacy-only — valid solely in
+// `push-token.json`; a `push-token-<id>.json` without `branch` is not a
+// token.
+test("hook: legacy branchless push-token.json → pass, consumed", () => {
+  const { repo, hooksDir } = makeEnv(true);
+  const legacy = join(hooksDir, "push-token.json");
+  writeFileSync(
+    legacy,
+    JSON.stringify({
+      token: "t",
+      sha: SHA,
+      expiresAt: Date.now() + 60_000,
+    }),
+  );
+  const r = runHook(repo, hooksDir, LINE + "\n");
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(legacy), false);
+});
+
+test("hook: branchless push-token-<id>.json is not a token → refuse", () => {
+  const { repo, hooksDir } = makeEnv();
+  writeFileSync(
+    join(hooksDir, "push-token-abc.json"),
+    JSON.stringify({
+      token: "t",
+      sha: SHA,
+      expiresAt: Date.now() + 60_000,
+    }),
+  );
+  const r = runHook(repo, hooksDir, LINE + "\n");
+  assert.equal(r.status, 1);
+});
+
+// §16.6 (PLUG-189): the branch is compared to the FULL pushed ref — a
+// token for branch `v1` must not pass a `refs/tags/v1` push.
+test("hook: a branch token never satisfies a tag push", () => {
+  const { repo, hooksDir } = makeEnv();
+  writePushToken(hooksDir, SHA, "v1");
+  const line = `refs/tags/v1 ${SHA} refs/tags/v1 ${"0".repeat(40)}\n`;
+  const r = runHook(repo, hooksDir, line);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /другую ветку/);
+});
+
 test("hook: exclusions file skips the gate", () => {
   const { repo, hooksDir } = makeEnv();
   const top = execFileSync("git", ["-C", repo, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();

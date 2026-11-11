@@ -95,21 +95,19 @@ const pushed = refs
 // Branch/tag deletions cannot publish code — let them through.
 if (pushed.length === 0) process.exit(chainLocal());
 
-const shortRef = (ref) => {
-  const m = /^refs\/(?:heads|tags)\/(.+)$/.exec(ref);
-  return m ? m[1] : ref;
-};
-
 // §16.6: one token file per release run — `push-token-<id>.json` (the
 // legacy name `push-token.json` still parses). A token binds the remote
-// branch AND the sha; a legacy token without `branch` checks sha only.
+// branch AND the sha; a legacy token — only in `push-token.json` — has
+// no `branch` field and checks sha only (PLUG-189: a branchless token in
+// a new-format file is not a valid token). The branch is compared to
+// the FULL pushed ref (`refs/heads/<branch>`) — a tag can never satisfy
+// a branch token.
 const tokenFiles = readdirSync(dir).filter((f) =>
   /^push-token(?:-.+)?\.json$/.test(f),
 );
 
 const consumed = [];
 for (const p of pushed) {
-  const remote = shortRef(p.remote);
   let match = null;
   let sawSha = false;
   let sawBranch = false;
@@ -132,9 +130,13 @@ for (const p of pushed) {
     }
     if (t.sha !== p.sha) continue;
     sawSha = true;
-    if (typeof t.branch === "string" && t.branch !== remote) {
-      sawBranch = true;
-      continue;
+    if (typeof t.branch === "string") {
+      if (`refs/heads/${t.branch}` !== p.remote) {
+        sawBranch = true;
+        continue;
+      }
+    } else if (f !== "push-token.json") {
+      continue; // branchless is legacy-only
     }
     if (t.expiresAt < Date.now()) {
       sawExpired = true;
@@ -152,7 +154,7 @@ for (const p of pushed) {
     } else if (sawSha && sawBranch) {
       refuse(
         `push отклонён: маркер release выписан на другую ветку ` +
-          `(${remote} ≠ ветка маркера)`,
+          `(${p.remote} ≠ ветка маркера)`,
       );
     } else if (tokenFiles.length) {
       refuse(

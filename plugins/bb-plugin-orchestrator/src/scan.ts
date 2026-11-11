@@ -168,12 +168,17 @@ const isTaskKeyToken = (token: string) =>
  * included. */
 const BB_THREAD_TRAILER_RE = /^\s*BB-Thread\s*:[^\n]*$/gim;
 
-/** §16.6 `threadIds`: `true` (default) — `thr_…` ids are anonymized and
- * the pipeline needs them, so the `bb-thread-id` rule is off; other bb
- * ids stay. `false` — every `thr_…` is a finding. */
+/** §16.6 `threadIds` governs ALL bb identifiers (thread ids AND task
+ * keys): `true` (default) — `thr_…` ids are anonymized and the pipeline
+ * needs them, and tracker keys in the pipeline's own messages
+ * (`merge <KEY> r<N>`) are legitimate — both `bb-thread-id` and
+ * `task-key` rules are off; other bb ids stay. `false` — every `thr_…`
+ * and every task key is a `leaks.bbIds` finding. */
 const bbIdRules = (threadIds: boolean) =>
   threadIds
-    ? BB_ID_RULES.filter((r) => r.rule !== "bb-thread-id")
+    ? BB_ID_RULES.filter(
+        (r) => r.rule !== "bb-thread-id" && r.rule !== "task-key",
+      )
     : BB_ID_RULES;
 
 const hits = (text: string, rules: { rule: string; re: RegExp }[]) =>
@@ -358,31 +363,51 @@ function scanCommitMeta(
 // ── Diff parsing ───────────────────────────────────────────────────────
 
 /** Added lines of `git diff --unified=0`, with post-image line numbers.
- * Deleted files (`+++ /dev/null`) and binary hunks are skipped. */
+ * Deleted files (`+++ /dev/null`) and binary hunks are skipped.
+ *
+ * Combined diffs (`@@@` hunks — merge-commit patches under `git log -p
+ * --cc`) carry one prefix column PER PARENT: a line is a real addition
+ * only when every column is `+`; `+ ` means "content of one parent,
+ * already public" — not a finding; a `-` in any column means the line is
+ * not in the merge result at all, so it does not advance the post-image
+ * line number (PLUG-189 finding 6). */
 export function parseAddedLines(diffText: string): AddedLine[] {
   const out: AddedLine[] = [];
   let file: string | null = null;
   let line = 0;
+  let columns = 0; // prefix columns per content line (1 regular, 2+ combined)
   for (const raw of diffText.split("\n")) {
     if (raw.startsWith("+++ ")) {
       const p = raw.slice(4).trim();
       file = p === "/dev/null" ? null : p.replace(/^b\//, "");
       continue;
     }
-    // `@@` regular hunks and `@@@` combined-diff hunks (merge patches
-    // under `git log -p --cc`): the post-image start is the + group.
-    const hunk = /^@+ (?:-\d+(?:,\d+)? )+\+(\d+)(?:,\d+)? @+/.exec(raw);
+    // `@@` regular hunks and `@@@`/`@@@@` combined-diff hunks: the
+    // post-image start is the + group; prefix columns = @ count − 1.
+    const hunk = /^(@+) (?:-\d+(?:,\d+)? )+\+(\d+)(?:,\d+)? @+/.exec(raw);
     if (hunk) {
-      line = Number(hunk[1]);
+      columns = hunk[1]!.length - 1;
+      line = Number(hunk[2]);
       continue;
     }
     if (!file) continue;
-    if (raw.startsWith("+")) {
-      out.push({ file, line, text: raw.slice(1) });
-      line += 1;
-    } else if (raw.startsWith(" ")) {
-      line += 1;
+    if (columns <= 1) {
+      if (raw.startsWith("+")) {
+        out.push({ file, line, text: raw.slice(1) });
+        line += 1;
+      } else if (raw.startsWith(" ")) {
+        line += 1;
+      }
+      continue;
     }
+    // Combined hunk: examine the per-parent prefix columns.
+    if (raw.length < columns) continue;
+    const prefix = raw.slice(0, columns);
+    if (prefix.includes("-")) continue; // absent from the merge result
+    if ([...prefix].every((c) => c === "+")) {
+      out.push({ file, line, text: raw.slice(columns) });
+    }
+    line += 1; // present in the result, added or already-public
   }
   return out;
 }
