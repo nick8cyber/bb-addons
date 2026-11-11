@@ -114,6 +114,35 @@ export const MIGRATIONS: readonly string[] = [
   // `release/<sha7>` recorded at the first release and reused by repeats
   // — one branch and one PR per task.
   `ALTER TABLE releases ADD COLUMN publish_branch TEXT`,
+  // §15 janitor, one migration: the per-env ledger (`first_seen_at` is the
+  // first run the copy was seen merged — «влита» state), the run log, and
+  // a small key-value table (daily coordinator-notify watermark).
+  `CREATE TABLE IF NOT EXISTS janitor_items (
+    env_id TEXT PRIMARY KEY,
+    project_id TEXT,
+    thread_id TEXT,
+    path TEXT,
+    branch TEXT,
+    state TEXT NOT NULL CHECK (state IN ('removed','kept','reported')),
+    reason TEXT,
+    size_kb INTEGER,
+    first_seen_at INTEGER,
+    last_checked_at INTEGER,
+    removed_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS janitor_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    removed INTEGER NOT NULL DEFAULT 0,
+    kept INTEGER NOT NULL DEFAULT 0,
+    freed_kb INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+  );
+  CREATE TABLE IF NOT EXISTS janitor_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  )`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -1035,3 +1064,185 @@ export class DelegationStore {
   }
 }
 
+
+// ── Janitor (§15) ────────────────────────────────────────────────────
+
+export type JanitorItemState = "removed" | "kept" | "reported";
+
+export interface JanitorItemRow {
+  env_id: string;
+  project_id: string | null;
+  thread_id: string | null;
+  path: string | null;
+  branch: string | null;
+  state: JanitorItemState;
+  reason: string | null;
+  size_kb: number | null;
+  /** First run the copy was seen merged (resets when the sighting breaks). */
+  first_seen_at: number | null;
+  last_checked_at: number | null;
+  removed_at: number | null;
+}
+
+export interface JanitorRunRow {
+  id: number;
+  started_at: number;
+  finished_at: number | null;
+  removed: number;
+  kept: number;
+  freed_kb: number;
+  error: string | null;
+}
+
+export class JanitorStore {
+  private readonly db: Database;
+
+  constructor(db: Database) {
+    this.db = db;
+  }
+
+  item(envId: string): JanitorItemRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM janitor_items WHERE env_id = ?`)
+      .get(envId) as JanitorItemRow | undefined;
+  }
+
+  items(): JanitorItemRow[] {
+    return this.db
+      .prepare(`SELECT * FROM janitor_items ORDER BY last_checked_at DESC`)
+      .all() as JanitorItemRow[];
+  }
+
+  /**
+   * Upsert the per-env ledger row. `first_seen_at` is managed by the
+   * caller (merged-sighting clock, §15); every write stamps
+   * `last_checked_at`.
+   */
+  upsertItem(
+    envId: string,
+    fields: {
+      projectId?: string | null;
+      threadId?: string | null;
+      path?: string | null;
+      branch?: string | null;
+      state: JanitorItemState;
+      reason?: string | null;
+      sizeKb?: number | null;
+      firstSeenAt?: number | null;
+      removedAt?: number | null;
+    },
+    at: number,
+  ): void {
+    const prev = this.item(envId);
+    const next = {
+      project_id: fields.projectId ?? prev?.project_id ?? null,
+      thread_id: fields.threadId ?? prev?.thread_id ?? null,
+      path: fields.path ?? prev?.path ?? null,
+      branch: fields.branch ?? prev?.branch ?? null,
+      state: fields.state,
+      reason:
+        fields.reason !== undefined ? fields.reason : (prev?.reason ?? null),
+      size_kb:
+        fields.sizeKb !== undefined ? fields.sizeKb : (prev?.size_kb ?? null),
+      first_seen_at:
+        fields.firstSeenAt !== undefined
+          ? fields.firstSeenAt
+          : (prev?.first_seen_at ?? null),
+      removed_at:
+        fields.removedAt !== undefined
+          ? fields.removedAt
+          : (prev?.removed_at ?? null),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO janitor_items (
+          env_id, project_id, thread_id, path, branch, state, reason,
+          size_kb, first_seen_at, last_checked_at, removed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(env_id) DO UPDATE SET
+          project_id = excluded.project_id,
+          thread_id = excluded.thread_id,
+          path = excluded.path,
+          branch = excluded.branch,
+          state = excluded.state,
+          reason = excluded.reason,
+          size_kb = excluded.size_kb,
+          first_seen_at = excluded.first_seen_at,
+          last_checked_at = excluded.last_checked_at,
+          removed_at = excluded.removed_at`,
+      )
+      .run(
+        envId,
+        next.project_id,
+        next.thread_id,
+        next.path,
+        next.branch,
+        next.state,
+        next.reason,
+        next.size_kb,
+        next.first_seen_at,
+        at,
+        next.removed_at,
+      );
+  }
+
+  /** Forget an env row entirely (env disappeared and nothing to report). */
+  removeItem(envId: string): void {
+    this.db.prepare(`DELETE FROM janitor_items WHERE env_id = ?`).run(envId);
+  }
+
+  startRun(at: number): number {
+    const info = this.db
+      .prepare(`INSERT INTO janitor_runs (started_at) VALUES (?)`)
+      .run(at);
+    return Number(info.lastInsertRowid);
+  }
+
+  finishRun(
+    id: number,
+    result: {
+      removed: number;
+      kept: number;
+      freedKb: number;
+      error?: string | null;
+    },
+    at: number,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE janitor_runs SET finished_at = ?, removed = ?, kept = ?,
+         freed_kb = ?, error = ? WHERE id = ?`,
+      )
+      .run(
+        at,
+        result.removed,
+        result.kept,
+        result.freedKb,
+        result.error ?? null,
+        id,
+      );
+  }
+
+  latestRun(): JanitorRunRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM janitor_runs ORDER BY id DESC LIMIT 1`)
+      .get() as JanitorRunRow | undefined;
+  }
+
+  meta(key: string): string | undefined {
+    return (
+      this.db.prepare(`SELECT value FROM janitor_meta WHERE key = ?`).get(key) as
+        | { value: string }
+        | undefined
+    )?.value;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO janitor_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
+  }
+}
