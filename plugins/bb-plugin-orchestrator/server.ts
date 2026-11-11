@@ -57,6 +57,7 @@ import {
 } from "./src/roles.js";
 import {
   parseReleaseConfig,
+  resolveProject,
   type ReleaseConfigLoad,
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
@@ -170,7 +171,7 @@ export async function createPlugin(
       type: "string",
       label: "Release config",
       description:
-        "Release pipeline JSON (orchestrator-release §6): commitIdentity, defaults and per-project overrides (target, sync, checks, public, docsMap, leaks, excluded). Empty — `release` disabled.",
+        "Release pipeline JSON (orchestrator-release §6): commitIdentity, defaults and per-project overrides (target, sync, checks, public, docsMap, leaks, excluded, threadIds). Empty — `release` disabled.",
       experimental_multiline: true,
       default: "",
     },
@@ -593,6 +594,12 @@ export async function createPlugin(
       delegate: (d) =>
         delegate({ ...d, threadId: input.callerThreadId }),
       mergeAutofix: () => currentSettings.mergeAutofix === true,
+      // §16.6 `threadIds`: off → merge commits drop the task key.
+      releaseThreadIds: (projectId) =>
+        releaseConfig.config
+          ? resolveProject(releaseConfig.config, projectId ?? "")
+              .threadIds
+          : true,
       log: bb.log,
     });
 

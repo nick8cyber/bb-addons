@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writePushToken } from "../src/release.js";
@@ -47,31 +47,104 @@ test("hook: no token → refuse with release hint", () => {
 
 test("hook: valid token+sha → pass, token consumed, local hook runs", () => {
   const { repo, hooksDir } = makeEnv(true);
-  writePushToken(hooksDir, SHA);
+  const file = writePushToken(hooksDir, SHA, "x");
   const r = runHook(repo, hooksDir, LINE + "\n");
   assert.equal(r.status, 0);
-  assert.equal(existsSync(join(hooksDir, "push-token.json")), false);
+  assert.equal(existsSync(file), false);
   assert.equal(existsSync(join(repo, "local-ran")), true);
 });
 
 test("hook: token for another sha → refuse, token kept", () => {
   const { repo, hooksDir } = makeEnv();
-  writePushToken(hooksDir, OTHER);
+  const file = writePushToken(hooksDir, OTHER, "x");
   const r = runHook(repo, hooksDir, LINE + "\n");
   assert.equal(r.status, 1);
   assert.match(r.stderr, /другой коммит/);
-  assert.equal(existsSync(join(hooksDir, "push-token.json")), true);
+  assert.equal(existsSync(file), true);
+});
+
+// §16.6: the token binds the BRANCH too — a valid sha pushed to a
+// different branch is refused.
+test("hook: token for another branch, same sha → refuse, token kept", () => {
+  const { repo, hooksDir } = makeEnv();
+  const file = writePushToken(hooksDir, SHA, "y");
+  const r = runHook(repo, hooksDir, LINE + "\n");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /другую ветку/);
+  assert.equal(existsSync(file), true);
+});
+
+// §16.6: a file per release run — two parallel releases coexist; the
+// hook consumes only the token of the pushed branch.
+test("hook: two tokens on different branches — right one consumed", () => {
+  const { repo, hooksDir } = makeEnv();
+  const fileX = writePushToken(hooksDir, SHA, "x");
+  const fileY = writePushToken(hooksDir, SHA, "y");
+  const line = `refs/heads/y ${SHA} refs/heads/y ${"0".repeat(40)}\n`;
+  const r = runHook(repo, hooksDir, line);
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(fileY), false); // consumed
+  assert.equal(existsSync(fileX), true);  // the other release's marker stays
 });
 
 test("hook: expired token → refuse", () => {
   const { repo, hooksDir } = makeEnv();
   writeFileSync(
-    join(hooksDir, "push-token.json"),
-    JSON.stringify({ token: "t", sha: SHA, expiresAt: Date.now() - 1 }),
+    join(hooksDir, "push-token-stale.json"),
+    JSON.stringify({
+      token: "t",
+      sha: SHA,
+      branch: "x",
+      expiresAt: Date.now() - 1,
+    }),
   );
   const r = runHook(repo, hooksDir, LINE + "\n");
   assert.equal(r.status, 1);
   assert.match(r.stderr, /истёк/);
+});
+
+// §16.6 (PLUG-189): a branchless token is legacy-only — valid solely in
+// `push-token.json`; a `push-token-<id>.json` without `branch` is not a
+// token.
+test("hook: legacy branchless push-token.json → pass, consumed", () => {
+  const { repo, hooksDir } = makeEnv(true);
+  const legacy = join(hooksDir, "push-token.json");
+  writeFileSync(
+    legacy,
+    JSON.stringify({
+      token: "t",
+      sha: SHA,
+      expiresAt: Date.now() + 60_000,
+    }),
+  );
+  const r = runHook(repo, hooksDir, LINE + "\n");
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(legacy), false);
+});
+
+test("hook: branchless push-token-<id>.json is not a token → refuse", () => {
+  const { repo, hooksDir } = makeEnv();
+  writeFileSync(
+    join(hooksDir, "push-token-abc.json"),
+    JSON.stringify({
+      token: "t",
+      sha: SHA,
+      expiresAt: Date.now() + 60_000,
+    }),
+  );
+  const r = runHook(repo, hooksDir, LINE + "\n");
+  assert.equal(r.status, 1);
+});
+
+// §16.6 (PLUG-189): the branch is compared to the FULL pushed ref — a
+// token for branch `v1` must not pass a `refs/tags/v1` push.
+test("hook: a branch token never satisfies a tag push", () => {
+  const { repo, hooksDir } = makeEnv();
+  writePushToken(hooksDir, SHA, "v1");
+  const line = `refs/tags/v1 ${SHA} refs/tags/v1 ${"0".repeat(40)}\n`;
+  const r = runHook(repo, hooksDir, line);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /другую ветку/);
 });
 
 test("hook: exclusions file skips the gate", () => {
@@ -103,5 +176,12 @@ test("f4/f6: installer inventory sees .bb worktrees, real --self-test run", () =
   assert.match(st, /OK +local hook fires: plain/);
   assert.match(st, /OK +local hook fires: worktree/);
   // N2: live hooksDir untouched — no fake token left behind
-  assert.equal(existsSync(join(root, "hd", "push-token.json")), false);
+  assert.equal(
+    existsSync(join(root, "hd"))
+      ? readdirSync(join(root, "hd")).filter((f) =>
+          /^push-token(?:-.+)?\.json$/.test(f),
+        ).length
+      : 0,
+    0,
+  );
 });

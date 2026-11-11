@@ -42,6 +42,10 @@ export interface ReleaseProjectLayer {
   leaks?: ReleaseLeaks;
   excluded?: boolean;
   commitIdentity?: string;
+  /** §16.6: `true` (default) — the «Источник: bb тред thr_…» line goes
+   * into PR bodies and `thr_…` ids are not a leak; `false` — no
+   * «Источник» line and `thr_…` is a `leaks.bbIds` finding. */
+  threadIds?: boolean;
 }
 
 export interface ReleaseConfig {
@@ -75,6 +79,8 @@ export interface ResolvedProject {
    * undefined when nothing allows a signature — every author then fails
    * category 2. */
   commitIdentity?: string;
+  /** §16.6 `threadIds` — default `true`. */
+  threadIds: boolean;
 }
 
 const isRecord = (x: unknown): x is Record<string, unknown> =>
@@ -220,6 +226,13 @@ function parseLayer(
       layer.commitIdentity = value.commitIdentity;
     }
   }
+  if (value.threadIds !== undefined) {
+    if (typeof value.threadIds !== "boolean") {
+      err(`${path}.threadIds`, "must be a boolean");
+    } else {
+      layer.threadIds = value.threadIds;
+    }
+  }
   return layer;
 }
 
@@ -316,5 +329,6 @@ export function resolveProject(
       allow: layer.leaks?.allow ?? [],
     },
     commitIdentity: layer.commitIdentity ?? config.commitIdentity,
+    threadIds: layer.threadIds ?? true,
   };
 }

@@ -7,11 +7,27 @@
  * strict JSON verdict and runs steps 6–7 after APPROVE.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  chmodSync,
+} from "node:fs";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostname as osHostname } from "node:os";
+import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
+import {
+  acquireCopyLock,
+  restoreCopy,
+  recordLockState,
+  COPY_BUSY_MARKERS,
+  MERGE_LOCK_NAME,
+  type MergeGit,
+} from "./merge.js";
 import {
   machineScan,
   parseAddedLines,
@@ -26,7 +42,12 @@ import {
   type ReleaseConfigLoad,
   type ResolvedProject,
 } from "./release-config.js";
-import { levelRole, pickRoute, type PolicyLoad } from "./policy.js";
+import {
+  levelRole,
+  pickRoute,
+  type Policy,
+  type PolicyLoad,
+} from "./policy.js";
 import type { DelegationRow, DelegationStore, ReleaseRow } from "./store.js";
 import { runChecked, runJson, type BbCli } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
@@ -344,9 +365,18 @@ async function syncBranch(
         );
       }
     } else {
+      // §16.6: an explicit `-m` — the default merge message embeds the
+      // source and target branch names, which the leak scan must not see.
       const res = await deps.cmd.run(
         "git",
-        ["-C", repo, "merge", "--no-edit", target],
+        [
+          "-C",
+          repo,
+          "merge",
+          "-m",
+          `merge ${remoteBaseSha.slice(0, 7)}`,
+          target,
+        ],
         { timeoutMs: 300_000 },
       );
       if (res.exitCode !== 0) {
@@ -584,22 +614,28 @@ async function lastAgentMessage(
 
 /**
  * The shared pre-push hook lets a push through only with a one-time token
- * the plugin writes for this exact commit: `<hooksDir>/push-token.json`,
- * mode 0600, in a 0700 dir — a file, not an agent env var (§5).
+ * the plugin writes for this exact branch+commit: a `push-token-<id>.json`
+ * file, mode 0600, in a 0700 dir — a file, not an agent env var (§5).
+ * §16.6: the token binds the target BRANCH and the SHA, and every release
+ * run writes its own file — two parallel releases never clobber each
+ * other's marker. The hook scans the dir for the matching token.
  */
 export function writePushToken(
   hooksDir: string,
   sha: string,
+  branch: string,
   now = Date.now(),
 ): string {
   mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
   chmodSync(hooksDir, 0o700);
-  const file = join(hooksDir, "push-token.json");
+  const token = randomBytes(24).toString("hex");
+  const file = join(hooksDir, `push-token-${token.slice(0, 16)}.json`);
   writeFileSync(
     file,
     JSON.stringify({
-      token: randomBytes(24).toString("hex"),
+      token,
       sha,
+      branch,
       expiresAt: now + TOKEN_TTL_MS,
     }),
     { mode: 0o600 },
@@ -607,11 +643,50 @@ export function writePushToken(
   return file;
 }
 
-export function clearPushToken(hooksDir: string): void {
+export function clearPushToken(file: string): void {
   try {
-    rmSync(join(hooksDir, "push-token.json"), { force: true });
+    rmSync(file, { force: true });
   } catch {
     // best-effort cleanup; the TTL bounds a stale token anyway
+  }
+}
+
+/** The plugin's own hook source — `hooks/pre-push` next to `src/`. */
+const PLUGIN_HOOK = fileURLToPath(
+  new URL("../hooks/pre-push", import.meta.url),
+);
+
+/**
+ * §16.6 (PLUG-189): a plugin update changes the hook but the installed
+ * copy in `hooksDir` does not follow — a stale hook may reject every
+ * push («no marker» for the new token file names). Release compares the
+ * installed hook byte-for-byte with the plugin's and refuses early with
+ * a reinstall hint. A missing hook is not an error: the gate is a
+ * forgetfulness guard, an absent guard simply does not fire.
+ */
+function assertInstalledHookFresh(deps: ReleaseDeps): void {
+  let installed: Buffer;
+  let current: Buffer;
+  try {
+    installed = readFileSync(join(deps.hooksDir(), "pre-push"));
+  } catch {
+    return;
+  }
+  try {
+    current = readFileSync(PLUGIN_HOOK);
+  } catch {
+    return; // plugin source unreadable — nothing to compare against
+  }
+  if (!installed.equals(current)) {
+    throw new OrchestratorError(
+      "hook-stale",
+      "установленный общий pre-push хук устарел — версия плагина новее",
+      `переустановите хук: node ${join(
+        fileURLToPath(new URL("..", import.meta.url)),
+        "hooks",
+        "install.mjs",
+      )}`,
+    );
   }
 }
 
@@ -715,6 +790,11 @@ export async function runRelease(
     );
   }
 
+  // §16.6 (PLUG-189): a stale installed hook would refuse the §5 push
+  // («no marker» for the new token file names) — refuse early with a
+  // reinstall hint instead.
+  assertInstalledHookFresh(deps);
+
   // Step 1 — приёмка.
   const { taskKey, title, executor, project } = await acceptTask(input, deps);
   if (project.excluded) {
@@ -729,21 +809,179 @@ export async function runRelease(
       `по задаче ${taskKey} уже идёт выкладка`,
     );
   }
-  if (!executor.thread_id) {
-    throw new OrchestratorError(
-      "release-refused",
-      "у делегирования нет треда исполнителя — рабочая копия не найдена",
+  // §16.6: publish the branch that holds the task's result — a merged
+  // round lives on `merged_into` in the coordinator's copy; anything else
+  // still sits on the executor's own branch.
+  let repo: string | null;
+  let branch: string | null;
+  if (executor.merge_status === "merged") {
+    if (!executor.merged_into) {
+      throw new OrchestratorError(
+        "release-refused",
+        "делегирование помечено merged, но ветка merged_into не записана",
+      );
+    }
+    const coordThread = await deps.threads.get({
+      threadId: input.caller.threadId,
+    });
+    repo = coordThread.environmentPath ?? null;
+    branch = executor.merged_into;
+    if (!repo) {
+      throw new OrchestratorError(
+        "release-refused",
+        "итог влит в копию координатора, но у вызывающего треда нет рабочей копии",
+      );
+    }
+  } else {
+    if (!executor.thread_id) {
+      throw new OrchestratorError(
+        "release-refused",
+        "у делегирования нет треда исполнителя — рабочая копия не найдена",
+      );
+    }
+    const execThread = await deps.threads.get({
+      threadId: executor.thread_id,
+    });
+    repo = execThread.environmentPath ?? null;
+    branch = execThread.environmentBranchName ?? null;
+    if (!repo || !branch) {
+      throw new OrchestratorError(
+        "release-refused",
+        "у исполнителя нет рабочей копии (environmentPath/environmentBranchName пусты)",
+      );
+    }
+  }
+  // §16.6 (PLUG-189): a merged result publishes from the COORDINATOR's
+  // copy — under the same per-copy lock `merge` takes (§14 check 4: one
+  // merge/release per copy at a time), with the busy/clean checks BEFORE
+  // `git switch` and the copy restored to its original branch in
+  // `finally`. The executor's own worktree needs no lock.
+  const coordinatorCopy = executor.merge_status === "merged";
+  if (!coordinatorCopy) {
+    const onBranch = await git(
+      deps,
+      repo,
+      ["symbolic-ref", "--quiet", "--short", "HEAD"],
+      { allowFail: true },
+    );
+    if (onBranch !== branch) {
+      await git(deps, repo, ["switch", branch]);
+    }
+    return runReleaseSteps(
+      {
+        taskKey,
+        title,
+        executor,
+        project,
+        repo,
+        branch,
+        policyLoad: policyLoad as PolicyLoad & { policy: Policy },
+      },
+      input,
+      deps,
     );
   }
-  const execThread = await deps.threads.get({ threadId: executor.thread_id });
-  const repo = execThread.environmentPath ?? null;
-  const branch = execThread.environmentBranchName ?? null;
-  if (!repo || !branch) {
-    throw new OrchestratorError(
-      "release-refused",
-      "у исполнителя нет рабочей копии (environmentPath/environmentBranchName пусты)",
+  const mgit: MergeGit = (args, opts) =>
+    deps.cmd.run("git", ["-C", repo, ...args], {
+      timeoutMs: opts?.timeoutMs ?? 120_000,
+    });
+  const gitDir = await git(deps, repo, ["rev-parse", "--absolute-git-dir"]);
+  const lockPath = join(gitDir, MERGE_LOCK_NAME);
+  const releaseLock = await acquireCopyLock(mgit, repo, lockPath);
+  let copyToRestore: { branch: string; head: string | null } | null = null;
+  try {
+    const busy = COPY_BUSY_MARKERS.filter((n) =>
+      existsSync(join(gitDir, n)),
     );
+    if (busy.length) {
+      throw new OrchestratorError(
+        "copy-busy",
+        `в копии координатора незавершённая операция (${busy.join(", ")})`,
+        "завершите или отмените её (git merge|cherry-pick|revert|rebase --abort) и повторите",
+      );
+    }
+    // §16.6: a dirty coordinator copy refuses BEFORE the switch —
+    // uncommitted work must not travel onto merged_into.
+    const porcelain = await git(deps, repo, ["status", "--porcelain"]);
+    if (porcelain.trim()) {
+      throw new OrchestratorError(
+        "dirty-coordinator",
+        "копия координатора грязная (незакоммиченные правки)",
+        "закоммить или уберите изменения и повторите",
+      );
+    }
+    const headRef = await git(deps, repo, ["symbolic-ref", "HEAD"], {
+      allowFail: true,
+    });
+    const currentBranch = headRef.startsWith("refs/heads/")
+      ? headRef.slice("refs/heads/".length)
+      : "";
+    if (!currentBranch) {
+      throw new OrchestratorError(
+        "detached-head",
+        "копия координатора на отсоединённом HEAD — ветки нет",
+        "перейдите на ветку (git switch <branch>) и повторите",
+      );
+    }
+    const originalHead = await git(deps, repo, ["rev-parse", "HEAD"]);
+    recordLockState(lockPath, currentBranch, originalHead);
+    // When the copy already sits on the published branch its tip
+    // legitimately advances (the sync merge is real work) — then the
+    // restore checks branch+clean only (`restoreCopy` head=null).
+    copyToRestore = {
+      branch: currentBranch,
+      head: currentBranch === branch ? null : originalHead,
+    };
+    if (currentBranch !== branch) {
+      await git(deps, repo, ["switch", branch]);
+    }
+    return await runReleaseSteps(
+      {
+        taskKey,
+        title,
+        executor,
+        project,
+        repo,
+        branch,
+        policyLoad: policyLoad as PolicyLoad & { policy: Policy },
+      },
+      input,
+      deps,
+    );
+  } finally {
+    // §16.6: after the run (success or refusal) the coordinator copy
+    // returns to its original branch with a clean status.
+    const restoreError = copyToRestore
+      ? await restoreCopy(mgit, copyToRestore.branch, copyToRestore.head)
+      : null;
+    releaseLock();
+    if (restoreError) {
+      throw new OrchestratorError(
+        "copy-not-restored",
+        `копия координатора не вернулась в исходное состояние: ${restoreError}`,
+        `копия ${repo} — разберите вручную, там могло остаться незавершённое слияние`,
+      );
+    }
   }
+}
+
+// ── Steps 2–5: sync → checks → scan → audit dispatch ──────────────────
+
+async function runReleaseSteps(
+  ctx: {
+    taskKey: string;
+    title: string;
+    executor: DelegationRow;
+    project: ResolvedProject;
+    repo: string;
+    branch: string;
+    /** Already null-checked in `runRelease` — `policy` is present. */
+    policyLoad: PolicyLoad & { policy: Policy };
+  },
+  input: ReleaseInput,
+  deps: ReleaseDeps,
+): Promise<ReleaseResult> {
+  const { taskKey, title, executor, project, repo, branch, policyLoad } = ctx;
 
   // Step 2 — sync по режиму проекта.
   const { baseSha, remoteBaseSha } = await syncBranch(
@@ -763,9 +1001,32 @@ export async function runRelease(
   const headSha = await git(deps, repo, ["rev-parse", "HEAD"]);
 
   // Step 4 — машинный скан категорий 1–4.
+  // §16.6 (PLUG-189): --no-color/--no-ext-diff — a `color.ui=always`
+  // config or an external diff driver would silently break the parser.
   const commits = await commitRange(deps, repo, baseSha, headSha);
   const added = parseAddedLines(
-    await git(deps, repo, ["diff", "--unified=0", baseSha, headSha]),
+    await git(deps, repo, [
+      "diff",
+      "--no-color",
+      "--no-ext-diff",
+      "--unified=0",
+      baseSha,
+      headSha,
+    ]),
+  );
+  // §16.6: scan the patch of EVERY commit in the range — a leak added
+  // and removed inside it escapes the range diff. `--cc` gives merge
+  // commits their conflict-resolution patch.
+  const patches = parseAddedLines(
+    await git(deps, repo, [
+      "log",
+      "-p",
+      "--cc",
+      "--no-color",
+      "--no-ext-diff",
+      "--unified=0",
+      `${baseSha}..${headSha}`,
+    ]),
   );
   const allowed = await allowedAuthor(deps, repo, project.commitIdentity);
   const findings = await machineScan(deps.cmd, {
@@ -774,9 +1035,11 @@ export async function runRelease(
     headSha,
     commits,
     added,
+    patches,
     leaks: project.leaks,
     allowedAuthor: allowed,
     hostname: deps.hostname ?? osHostname(),
+    threadIds: project.threadIds,
   });
   const blockers = findings.filter((f) => f.severity === "block");
   const warnings = findings.filter((f) => f.severity === "warn");
@@ -861,7 +1124,11 @@ export async function runRelease(
     const auditInstructions =
       `Выкладка задачи ${taskKey}: аудит релиза (шаг 5 конвейера). ` +
       `Вход аудита — файл ${packetPath}, прочитай его целиком. ` +
-      `Репозиторий для проверки: ${repo} (ветка ${branch}). ` +
+      // §16.6: the auditor checks the exact commit — after the run the
+      // coordinator's copy is restored to its original branch, so a
+      // branch name could point at the wrong tree.
+      `Репозиторий для проверки: ${repo} (коммит ${headSha} — проверяй его, ` +
+      `ветка копии после выкладки может отличаться). ` +
       `Итог — ОДНО сообщение строгим JSON {"verdict":"APPROVE"|"REJECT","findings":[…]} без пояснений; ` +
       `находки — без значений секретов (маскируй).`;
     const res = await dispatchToRoute(
@@ -924,7 +1191,7 @@ async function writeAuditPacket(
     `# Аудит выкладки ${r.task_key}`,
     "",
     `- Задача: ${r.task_key} — ${input.taskTitle}`,
-    `- Репозиторий (рабочая копия исполнителя): ${r.repo_path}`,
+    `- Репозиторий (рабочая копия с итогом задачи): ${r.repo_path}`,
     `- Ветка: ${r.branch} → ${r.target_action} в ${r.target_branch}`,
     `- Диапазон: ${input.baseSha}..${input.headSha}`,
     input.noDocs ? `- --no-docs: ${input.noDocs}` : null,
@@ -1093,26 +1360,35 @@ async function ghJson<T>(
 }
 
 /**
- * §5: write the one-time token for `sha`, run `git push` (the shared
- * pre-push hook validates sha+expiry and consumes the file), then clean
- * up whatever the hook did not consume (push refused by the remote, or
- * no hook installed).
+ * §5: write the one-time token for `branch`+`sha`, run `git push` (the
+ * shared pre-push hook validates branch+sha+expiry and consumes the
+ * file), then clean up whatever the hook did not consume (push refused
+ * by the remote, or no hook installed).
  */
 async function pushWithToken(
   deps: ReleaseDeps,
   repo: string,
   sha: string,
+  branch: string,
   refspec: string,
 ): Promise<void> {
-  const hooksDir = deps.hooksDir();
-  writePushToken(hooksDir, sha, deps.now?.());
+  const file = writePushToken(deps.hooksDir(), sha, branch, deps.now?.());
   try {
     await git(deps, repo, ["push", "origin", refspec], {
       timeoutMs: 300_000,
     });
   } finally {
-    clearPushToken(hooksDir);
+    clearPushToken(file);
   }
+}
+
+/** The project's `threadIds` at publish time (§16.6; default `true` —
+ * a broken config at pump time must not silently drop the contract
+ * line CI/CD relies on). */
+function projectThreadIds(deps: ReleaseDeps, projectId: string): boolean {
+  const cfg = deps.loadReleaseConfig();
+  if (!cfg.config) return true;
+  return resolveProject(cfg.config, projectId).threadIds;
 }
 
 async function publishRelease(
@@ -1139,6 +1415,7 @@ async function publishRelease(
       deps,
       repo,
       headSha,
+      row.target_branch,
       `${headSha}:refs/heads/${row.target_branch}`,
     );
     deps.store.updateRelease(row.id, { publishedSha: headSha });
@@ -1149,7 +1426,7 @@ async function publishRelease(
       "--status",
       "done",
     ]).catch((e) => deps.log?.warn?.(`release task status: ${message(e)}`));
-    await postCheck(deps, row, headSha, null);
+    await postCheck(deps, row, headSha, row.target_branch, null);
     deps.store.updateRelease(row.id, { status: "published" });
     s.published++;
     await commentOnTask(
@@ -1162,12 +1439,20 @@ async function publishRelease(
     return;
   }
 
-  // action=pr
+  // action=pr — §16.6 `threadIds`: the «Источник: bb тред thr_…» line is
+  // written only while the project allows thread ids. With it off the
+  // local executor branch name (`bb/<key>-…-thr_…`) must not reach the
+  // remote either — the published branch is a neutral `release/<sha7>`,
+  // and the PR body carries neither «Источник» nor «Задача: <KEY>».
+  const threadIds = projectThreadIds(deps, row.project_id);
+  const remoteBranch = threadIds
+    ? row.branch
+    : `release/${headSha.slice(0, 7)}`;
   const prs = await ghJson<GhPr[]>(deps, repo, [
     "pr",
     "list",
     "--head",
-    row.branch,
+    remoteBranch,
     "--state",
     "open",
     "--json",
@@ -1176,14 +1461,25 @@ async function publishRelease(
     "20",
   ]);
   const existing = prs.find(
-    (p) => p.headRefName === row.branch && p.baseRefName === row.target_branch,
+    (p) =>
+      p.headRefName === remoteBranch && p.baseRefName === row.target_branch,
   );
   if (existing) {
     const src = SOURCE_RE.exec(existing.body ?? "")?.[1];
-    if (src !== row.coordinator_thread_id) {
+    const foreign =
+      src !== undefined
+        ? src !== row.coordinator_thread_id
+        : threadIds
+          ? true // our PRs always carry «Источник» — none means foreign
+          : !existing.url ||
+            !deps.store.prWasReleased(
+              existing.url,
+              row.coordinator_thread_id,
+            );
+    if (foreign) {
       throw new OrchestratorError(
         "release-refused",
-        `PR ${existing.url} у ветки ${row.branch} создан не этим release ` +
+        `PR ${existing.url} у ветки ${remoteBranch} создан не этим release ` +
           `(Источник: ${src ?? "нет"}) — release в чужую ветку PR не пишет`,
       );
     }
@@ -1192,7 +1488,8 @@ async function publishRelease(
     deps,
     repo,
     headSha,
-    `${headSha}:refs/heads/${row.branch}`,
+    remoteBranch,
+    `${headSha}:refs/heads/${remoteBranch}`,
   );
   deps.store.updateRelease(row.id, { publishedSha: headSha });
   let prUrl = existing?.url ?? null;
@@ -1210,11 +1507,14 @@ async function publishRelease(
       "--base",
       row.target_branch,
       "--head",
-      row.branch,
+      remoteBranch,
       "--title",
       title,
       "--body",
-      `Источник: bb тред ${row.coordinator_thread_id}\n\nЗадача: ${row.task_key}`,
+      threadIds
+        ? `Источник: bb тред ${row.coordinator_thread_id}\n\n` +
+          `Задача: ${row.task_key}`
+        : "",
     ]);
     prUrl = created.url ?? null;
   }
@@ -1226,13 +1526,13 @@ async function publishRelease(
     "--status",
     "in_review",
   ]).catch((e) => deps.log?.warn?.(`release task status: ${message(e)}`));
-  await postCheck(deps, row, headSha, prUrl);
+  await postCheck(deps, row, headSha, remoteBranch, prUrl);
   deps.store.updateRelease(row.id, { status: "published" });
   s.published++;
   await commentOnTask(
     deps,
     row.task_key,
-    `выложено: ${headSha.slice(0, 10)}, ветка ${row.branch}` +
+    `выложено: ${headSha.slice(0, 10)}, ветка ${remoteBranch}` +
       (prUrl ? ` / PR ${prUrl}` : "") +
       (row.kb_note ? `\nKB-заметка: ${row.kb_note}` : "") +
       (row.no_kb_reason ? `\nKB не требуется: ${row.no_kb_reason}` : ""),
@@ -1252,6 +1552,9 @@ async function postCheck(
   deps: ReleaseDeps,
   row: ReleaseRow,
   pushedSha: string,
+  /** The remote branch the push actually wrote (§16.6: `release/<sha7>`
+   * when the project's `threadIds` is off). */
+  pushedBranch: string,
   prUrl: string | null,
 ): Promise<void> {
   row = deps.store.getRelease(row.id) ?? row;
@@ -1305,7 +1608,7 @@ async function postCheck(
       );
     }
   } else {
-    const remote = `origin/${row.branch}`;
+    const remote = `origin/${pushedBranch}`;
     const remoteSha = await git(deps, repo, ["rev-parse", remote]).catch(
       () => "",
     );
@@ -1316,7 +1619,9 @@ async function postCheck(
       );
     }
     if (!prUrl) {
-      messages.push(`PR ветки ${row.branch} → ${row.target_branch} не найден`);
+      messages.push(
+        `PR ветки ${pushedBranch} → ${row.target_branch} не найден`,
+      );
     }
   }
 
@@ -1335,9 +1640,22 @@ async function postCheck(
       const added = parseAddedLines(
         await git(deps, repo, [
           "diff",
+          "--no-color",
+          "--no-ext-diff",
           "--unified=0",
           scanBase,
           pushedSha,
+        ]),
+      );
+      const patches = parseAddedLines(
+        await git(deps, repo, [
+          "log",
+          "-p",
+          "--cc",
+          "--no-color",
+          "--no-ext-diff",
+          "--unified=0",
+          `${scanBase}..${pushedSha}`,
         ]),
       );
       const leaks = { machine: "block" as const, bbIds: "block" as const, allow: [] };
@@ -1347,8 +1665,10 @@ async function postCheck(
         headSha: pushedSha,
         commits,
         added,
+        patches,
         leaks,
         hostname: deps.hostname ?? osHostname(),
+        threadIds: projectThreadIds(deps, row.project_id),
       });
       const blockers = findings.filter((f) => f.severity === "block");
       if (blockers.length) {

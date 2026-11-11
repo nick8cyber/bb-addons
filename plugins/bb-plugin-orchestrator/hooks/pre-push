@@ -3,23 +3,24 @@
  * Shared git pre-push hook for the bb orchestrator release pipeline
  * (spec orchestrator-release §5). Installed once per development user via
  * global `core.hooksPath` — ordinary `git push` is refused unless the
- * plugin's `release` command left a one-time token for the pushed commit
- * in `<hooks dir>/push-token.json`. After its own checks the hook chains
- * to the repository's local `$GIT_DIR/hooks/pre-push` when it exists.
+ * plugin's `release` command left a one-time token for the pushed
+ * branch+commit in `<hooks dir>/push-token-<id>.json` (one file per
+ * release run — §16.6, parallel releases don't clobber each other). After
+ * its own checks the hook chains to the repository's local
+ * `$GIT_DIR/hooks/pre-push` when it exists.
  *
  * Repo skips: `exclusions` (one absolute repo path or dir-prefix per
  * line, `#` comments) next to this script — for service repositories
  * with their own autopush. A repo with a *local* `core.hooksPath` never
  * reaches this script at all (local config wins over the global one).
  */
-import { existsSync, readFileSync, rmSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HOOK_NAME = "pre-push";
 const dir = dirname(fileURLToPath(import.meta.url));
-const tokenFile = join(dir, "push-token.json");
 const exclusionsFile = join(dir, "exclusions");
 const ZERO = "0000000000000000000000000000000000000000";
 
@@ -87,41 +88,90 @@ const refs = stdin
   .map((l) => l.trim())
   .filter(Boolean)
   .map((l) => l.split(/\s+/));
-const pushedShas = refs
-  .map((r) => r[1])
-  .filter((sha) => sha && sha !== ZERO);
+const pushed = refs
+  .map((r) => ({ sha: r[1], remote: r[2] ?? "" }))
+  .filter((r) => r.sha && r.sha !== ZERO);
 
 // Branch/tag deletions cannot publish code — let them through.
-if (pushedShas.length === 0) process.exit(chainLocal());
+if (pushed.length === 0) process.exit(chainLocal());
 
-let token;
-try {
-  token = JSON.parse(readFileSync(tokenFile, "utf8"));
-} catch {
-  refuse(
-    "push отклонён: выкладка только через `bb orchestrator release` " +
-      "(нет одноразового маркера)",
-  );
+// §16.6: one token file per release run — `push-token-<id>.json` (the
+// legacy name `push-token.json` still parses). A token binds the remote
+// branch AND the sha; a legacy token — only in `push-token.json` — has
+// no `branch` field and checks sha only (PLUG-189: a branchless token in
+// a new-format file is not a valid token). The branch is compared to
+// the FULL pushed ref (`refs/heads/<branch>`) — a tag can never satisfy
+// a branch token.
+const tokenFiles = readdirSync(dir).filter((f) =>
+  /^push-token(?:-.+)?\.json$/.test(f),
+);
+
+const consumed = [];
+for (const p of pushed) {
+  let match = null;
+  let sawSha = false;
+  let sawBranch = false;
+  let sawExpired = false;
+  for (const f of tokenFiles) {
+    if (consumed.includes(f)) continue; // a marker is one-time — one ref each
+    let t;
+    try {
+      t = JSON.parse(readFileSync(join(dir, f), "utf8"));
+    } catch {
+      continue;
+    }
+    if (
+      !t ||
+      typeof t.token !== "string" ||
+      typeof t.sha !== "string" ||
+      typeof t.expiresAt !== "number"
+    ) {
+      continue;
+    }
+    if (t.sha !== p.sha) continue;
+    sawSha = true;
+    if (typeof t.branch === "string") {
+      if (`refs/heads/${t.branch}` !== p.remote) {
+        sawBranch = true;
+        continue;
+      }
+    } else if (f !== "push-token.json") {
+      continue; // branchless is legacy-only
+    }
+    if (t.expiresAt < Date.now()) {
+      sawExpired = true;
+      try { rmSync(join(dir, f)); } catch { /* stale */ }
+      continue;
+    }
+    match = f;
+    break;
+  }
+  if (!match) {
+    if (sawExpired) {
+      refuse(
+        "push отклонён: маркер release истёк — повторите `bb orchestrator release`",
+      );
+    } else if (sawSha && sawBranch) {
+      refuse(
+        `push отклонён: маркер release выписан на другую ветку ` +
+          `(${p.remote} ≠ ветка маркера)`,
+      );
+    } else if (tokenFiles.length) {
+      refuse(
+        `push отклонён: маркер release выписан на другой коммит ` +
+          `(${p.sha.slice(0, 8)})`,
+      );
+    } else {
+      refuse(
+        "push отклонён: выкладка только через `bb orchestrator release` " +
+          "(нет одноразового маркера)",
+      );
+    }
+  }
+  consumed.push(match);
 }
-if (
-  !token ||
-  typeof token.token !== "string" ||
-  typeof token.sha !== "string" ||
-  typeof token.expiresAt !== "number"
-) {
-  refuse("push отклонён: маркер release повреждён");
+// One-time markers — consumed before chaining to the repo's local hook.
+for (const f of consumed) {
+  try { rmSync(join(dir, f)); } catch { /* gone */ }
 }
-if (token.expiresAt < Date.now()) {
-  try { rmSync(tokenFile); } catch { /* stale */ }
-  refuse("push отклонён: маркер release истёк — повторите `bb orchestrator release`");
-}
-const bad = pushedShas.filter((sha) => sha !== token.sha);
-if (bad.length) {
-  refuse(
-    `push отклонён: маркер release выписан на другой коммит ` +
-      `(${bad[0].slice(0, 8)} ≠ ${token.sha.slice(0, 8)})`,
-  );
-}
-// One-time marker — consumed before chaining to the repo's local hook.
-try { rmSync(tokenFile); chmodSync(tokenFile, 0o600); } catch { /* gone */ }
 process.exit(chainLocal());
