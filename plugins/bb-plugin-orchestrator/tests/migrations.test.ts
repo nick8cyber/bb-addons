@@ -39,6 +39,36 @@ test("migrations create the §7 schema", () => {
     .prepare(`PRAGMA table_info(route_holds)`)
     .all() as { name: string }[]).map((c) => c.name);
   assert.deepEqual(holdColumns.sort(), ["quota_group", "reason", "until"]);
+
+  const itemColumns = (db
+    .prepare(`PRAGMA table_info(janitor_items)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.deepEqual(itemColumns.sort(), [
+    "branch",
+    "env_id",
+    "first_seen_at",
+    "last_checked_at",
+    "path",
+    "project_id",
+    "reason",
+    "removed_at",
+    "size_kb",
+    "state",
+    "thread_id",
+  ]);
+
+  const runColumns = (db
+    .prepare(`PRAGMA table_info(janitor_runs)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.deepEqual(runColumns.sort(), [
+    "error",
+    "finished_at",
+    "freed_kb",
+    "id",
+    "kept",
+    "removed",
+    "started_at",
+  ]);
 });
 
 test("the partial unique index allows one active row per task", () => {

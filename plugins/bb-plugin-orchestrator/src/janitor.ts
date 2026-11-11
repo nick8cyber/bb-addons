@@ -1,0 +1,924 @@
+/**
+ * §15 janitor — background cleanup of merged executor copies, their
+ * branches and threads (ADR-0024, owner decision 11.11). Deletes only
+ * what is provably merged on `origin` and clean; unmerged or dirty copies
+ * are only reported.
+ *
+ * «Влитая копия»: the copy's HEAD and every local branch visible from the
+ * copy are ancestors of `origin/<protected>` or the env's
+ * `mergeBaseBranch`, checked right after this run's successful
+ * `git fetch` (a failed fetch skips the whole repository). bb worktree
+ * environments share one repository, so the local-branch check is
+ * repo-wide — a copy stays while ANY local branch is unmerged.
+ */
+import { existsSync, readdirSync, readlinkSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { runJson, type BbCli } from "./bb-cli.js";
+import type { CmdRunner } from "./cmd.js";
+import type { JanitorConfig, JanitorConfigLoad } from "./janitor-config.js";
+import type {
+  DelegationStore,
+  JanitorItemState,
+  JanitorRunRow,
+  JanitorStore,
+} from "./store.js";
+
+const DAY_MS = 24 * 60 * 60_000;
+const GIT_TIMEOUT_MS = 30_000;
+const CLEANUP_TIMEOUT_MS = 120_000;
+/** §15 cond 4: threads in these statuses keep their copy. */
+const BLOCKING_THREAD_STATUSES = new Set(["active", "pending"]);
+const BRANCH_PREFIX = "bb/";
+
+export interface JanitorLog {
+  info?(message: string): void;
+  warn?(message: string): void;
+  error?(message: string): void;
+}
+
+export interface JanitorThreads {
+  send(args: {
+    threadId: string;
+    mode: "queue-if-active";
+    input: unknown[];
+  }): Promise<unknown>;
+}
+
+export interface JanitorDeps {
+  store: DelegationStore;
+  janitor: JanitorStore;
+  bbCli: BbCli;
+  cmd: CmdRunner;
+  threads: JanitorThreads;
+  loadConfig(): JanitorConfigLoad | Promise<JanitorConfigLoad>;
+  now?: () => number;
+  log?: JanitorLog;
+  /** §15 cond 5 seam — default scans `/proc/<pid>/cwd` of the current user. */
+  hasProcessIn?: (path: string) => Promise<boolean>;
+}
+
+interface EnvDto {
+  id: string;
+  projectId?: string | null;
+  path?: string | null;
+  branchName?: string | null;
+  mergeBaseBranch?: string | null;
+  status?: string | null;
+  environmentProviderId?: string | null;
+  managed?: boolean;
+  updatedAt?: number | null;
+}
+
+interface EnvThreadDto {
+  id: string;
+  status?: string | null;
+  archivedAt?: number | null;
+  updatedAt?: number | null;
+}
+
+export interface JanitorRunOptions {
+  /** `--dry-run`: a report-mode pass even under `mode: "apply"`. */
+  dryRun?: boolean;
+}
+
+export interface JanitorReportedItem {
+  envId: string;
+  projectId: string | null;
+  path: string | null;
+  branch: string | null;
+  threadId: string | null;
+  reason: string;
+}
+
+export interface JanitorRunSummary {
+  /** True when the run deleted (apply mode and not --dry-run). */
+  applied: boolean;
+  skipped?: "disabled" | "invalid-config";
+  removedCopies: number;
+  removedBranches: number;
+  archivedThreads: number;
+  freedKb: number;
+  /** Copies eligible for removal (in report mode — would remove). */
+  ready: number;
+  /** `bb/` branches without a copy, merged (deleted when applied). */
+  orphanBranches: number;
+  kept: Record<string, number>;
+  reported: JanitorReportedItem[];
+  errors: string[];
+  runId?: number;
+}
+
+export interface JanitorReport {
+  config: JanitorConfig | null;
+  configErrors: { path: string; message: string }[];
+  lastRun: JanitorRunRow | undefined;
+  items: ReturnType<JanitorStore["items"]>;
+  abandoned: JanitorReportedItem[];
+}
+
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+async function gitOut(
+  cmd: CmdRunner,
+  cwd: string,
+  args: string[],
+): Promise<string | null> {
+  const res = await cmd.run("git", ["-C", cwd, ...args], {
+    timeoutMs: GIT_TIMEOUT_MS,
+  });
+  return res.exitCode === 0 ? res.stdout : null;
+}
+
+async function gitOk(
+  cmd: CmdRunner,
+  cwd: string,
+  args: string[],
+): Promise<boolean> {
+  const res = await cmd.run("git", ["-C", cwd, ...args], {
+    timeoutMs: GIT_TIMEOUT_MS,
+  });
+  return res.exitCode === 0;
+}
+
+/**
+ * §15 cond 5: a live process whose cwd sits inside the copy blocks
+ * removal. Only same-uid processes count (other users are unreadable and
+ * out of scope anyway).
+ */
+export function defaultHasProcessIn(root: string): boolean {
+  const prefix = root.endsWith("/") ? root : `${root}/`;
+  const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+  let pids: string[];
+  try {
+    pids = readdirSync("/proc").filter((e) => /^\d+$/.test(e));
+  } catch {
+    return false;
+  }
+  for (const pid of pids) {
+    try {
+      if (uid >= 0) {
+        const st = statSync(`/proc/${pid}/cwd`);
+        if (st.uid !== uid) continue;
+      }
+      const target = readlinkSync(`/proc/${pid}/cwd`);
+      if (target === root || target.startsWith(prefix)) return true;
+    } catch {
+      // the process exited or the cwd is unreadable — not ours
+    }
+  }
+  return false;
+}
+
+/** `git worktree list --porcelain` → branches checked out per worktree. */
+function parseWorktreeList(
+  text: string,
+): { worktrees: { path: string; branch: string | null }[] } {
+  const worktrees: { path: string; branch: string | null }[] = [];
+  let cur: { path: string; branch: string | null } | null = null;
+  for (const line of text.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      cur = { path: line.slice("worktree ".length), branch: null };
+      worktrees.push(cur);
+    } else if (cur && line.startsWith("branch ")) {
+      cur.branch = line.slice("branch ".length).replace(/^refs\/heads\//, "");
+    }
+  }
+  return { worktrees };
+}
+
+export function createJanitor(deps: JanitorDeps) {
+  const now = deps.now ?? Date.now;
+  const log = deps.log ?? {};
+  const hasProcessIn =
+    deps.hasProcessIn ?? (async (p: string) => defaultHasProcessIn(p));
+
+  const listEnvironments = async (): Promise<EnvDto[]> =>
+    runJson<EnvDto[]>(deps.bbCli, ["environment", "list", "--json"], {
+      timeoutMs: 60_000,
+    });
+
+  const envThreads = async (envId: string): Promise<EnvThreadDto[] | null> => {
+    try {
+      return await runJson<EnvThreadDto[]>(
+        deps.bbCli,
+        [
+          "thread",
+          "list",
+          "--environment",
+          envId,
+          "--include-archived",
+          "--include-hidden",
+          "--json",
+        ],
+      );
+    } catch {
+      return null;
+    }
+  };
+
+  /** Non-empty interactions list = a request is waiting (§15 cond 4). */
+  const hasPendingInteraction = async (threadId: string): Promise<boolean> => {
+    try {
+      const list = await runJson<unknown[]>(
+        deps.bbCli,
+        ["thread", "interactions", "list", threadId, "--json"],
+      );
+      return Array.isArray(list) && list.length > 0;
+    } catch {
+      // Cannot prove there is no pending request — assume there is one.
+      return true;
+    }
+  };
+
+  const keep = (
+    summary: JanitorRunSummary,
+    reason: string,
+    n = 1,
+  ) => {
+    summary.kept[reason] = (summary.kept[reason] ?? 0) + n;
+  };
+
+  /**
+   * Refs the copy's commits must be ancestors of: `origin/<protected>`
+   * for every protected branch present on the remote, plus the env's
+   * `mergeBaseBranch`. Local-only merging (§14) never counts.
+   */
+  const targetRefs = async (
+    env: EnvDto,
+    repoDir: string,
+    protectedTargets: string[],
+  ): Promise<string[]> => {
+    const targets = [...protectedTargets];
+    const mbb = env.mergeBaseBranch?.trim();
+    if (mbb) {
+      if (
+        await gitOk(deps.cmd, repoDir, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          mbb,
+        ])
+      ) {
+        targets.push(mbb);
+      } else if (
+        !mbb.startsWith("origin/") &&
+        (await gitOk(deps.cmd, repoDir, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          `origin/${mbb}`,
+        ]))
+      ) {
+        targets.push(`origin/${mbb}`);
+      }
+    }
+    return [...new Set(targets)];
+  };
+
+  const run = async (
+    opts: JanitorRunOptions = {},
+  ): Promise<JanitorRunSummary> => {
+    const at = now();
+    const summary: JanitorRunSummary = {
+      applied: false,
+      removedCopies: 0,
+      removedBranches: 0,
+      archivedThreads: 0,
+      freedKb: 0,
+      ready: 0,
+      orphanBranches: 0,
+      kept: {},
+      reported: [],
+      errors: [],
+    };
+
+    const cfgLoad = await deps.loadConfig();
+    if (cfgLoad.errors.length) {
+      for (const e of cfgLoad.errors) {
+        log.warn?.(`orchestrator janitor: ${e.path}: ${e.message}`);
+      }
+      summary.skipped = "invalid-config";
+      summary.errors = cfgLoad.errors.map((e) => `${e.path}: ${e.message}`);
+      return summary;
+    }
+    const cfg = cfgLoad.config;
+    // A --dry-run pass reads everything and writes nothing, so it is
+    // allowed even while the janitor is disabled — that is how the user
+    // previews what enabling it would do (§6 janitor run --dry-run).
+    if (!cfg?.enabled && !opts.dryRun) {
+      summary.skipped = "disabled";
+      return summary;
+    }
+    const effective: JanitorConfig = cfg ?? {
+      enabled: false,
+      mode: "report",
+      afterMergeMs: 10 * 3_600_000,
+      abandonedAfterMs: 10 * 86_400_000,
+      intervalMinutes: 60,
+      excludeProjects: [],
+      protectedBranches: ["main", "master", "dev"],
+      deleteBranches: false,
+    };
+    const apply = effective.enabled && effective.mode === "apply" && !opts.dryRun;
+    summary.applied = apply;
+
+    const runId = deps.janitor.startRun(at);
+    summary.runId = runId;
+
+    const finish = (error?: string) => {
+      deps.janitor.finishRun(
+        runId,
+        {
+          removed: summary.removedCopies + summary.removedBranches,
+          kept: Object.values(summary.kept).reduce((a, b) => a + b, 0),
+          freedKb: summary.freedKb,
+          error: error ?? null,
+        },
+        now(),
+      );
+      const keptText = Object.entries(summary.kept)
+        .map(([r, n]) => `${r}=${n}`)
+        .join(" ");
+      log.info?.(
+        `[orchestrator] janitor: removed ${summary.removedCopies} copies, ` +
+          `${summary.removedBranches} branches, ${summary.archivedThreads} threads, ` +
+          `freed ${Math.round(summary.freedKb / 1024)} MB` +
+          (keptText ? `; kept: ${keptText}` : "") +
+          (error ? `; error: ${error}` : ""),
+      );
+    };
+
+    try {
+      await runBody(effective, apply, summary);
+      // A --dry-run preview never writes to the coordinator either.
+      if (!opts.dryRun) await notifyCoordinators(summary);
+      finish();
+    } catch (e) {
+      const text = message(e);
+      summary.errors.push(text);
+      finish(text);
+    }
+    return summary;
+  };
+
+  const runBody = async (
+    cfg: JanitorConfig,
+    apply: boolean,
+    summary: JanitorRunSummary,
+  ): Promise<void> => {
+    const at = now();
+    const exclude = new Set(cfg.excludeProjects);
+    const envs = (await listEnvironments()).filter(
+      (e) =>
+        e.managed === true &&
+        e.environmentProviderId === "git-worktree" &&
+        e.status === "ready" &&
+        typeof e.path === "string" &&
+        e.path.length > 0 &&
+        !exclude.has(e.projectId ?? ""),
+    );
+
+    const delegatedThreads = new Set(
+      deps.store
+        .listActive()
+        .map((r) => r.thread_id)
+        .filter((t): t is string => typeof t === "string"),
+    );
+
+    // Group copies by repository: one `git fetch --prune origin` per repo
+    // per run; a failed fetch skips the repo entirely (§15).
+    const repos = new Map<string, { root: string; envs: EnvDto[] }>();
+    for (const env of envs) {
+      const common = await gitOut(deps.cmd, env.path!, [
+        "rev-parse",
+        "--git-common-dir",
+      ]);
+      if (common === null) {
+        keep(summary, "not-a-repo");
+        continue;
+      }
+      const commonDir = isAbsolute(common.trim())
+        ? common.trim()
+        : join(env.path!, common.trim());
+      const root =
+        basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
+      const slot = repos.get(commonDir) ?? { root, envs: [] };
+      slot.envs.push(env);
+      repos.set(commonDir, slot);
+    }
+
+    const reportedNow: { env: EnvDto; reason: string }[] = [];
+
+    for (const { root, envs: repoEnvs } of repos.values()) {
+      const fetched = await gitOk(deps.cmd, root, [
+        "fetch",
+        "--prune",
+        "origin",
+      ]);
+      if (!fetched) {
+        keep(summary, "fetch-failed", repoEnvs.length);
+        // The run never saw these copies merged, so their «влита» streak
+        // cannot count this pass — the clock pauses via a null marker
+        // and restarts on the next verified-merged run.
+        for (const env of repoEnvs) {
+          const prev = deps.janitor.item(env.id);
+          if (prev?.first_seen_at != null) {
+            deps.janitor.upsertItem(
+              env.id,
+              {
+                projectId: env.projectId ?? null,
+                path: env.path ?? null,
+                branch: env.branchName ?? null,
+                state: prev.state,
+                firstSeenAt: null,
+              },
+              now(),
+            );
+          }
+        }
+        continue;
+      }
+
+      const protectedTargets: string[] = [];
+      for (const b of cfg.protectedBranches) {
+        if (
+          await gitOk(deps.cmd, root, [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            `origin/${b}`,
+          ])
+        ) {
+          protectedTargets.push(`origin/${b}`);
+        }
+      }
+
+      const worktreeText =
+        (await gitOut(deps.cmd, root, ["worktree", "list", "--porcelain"])) ??
+        "";
+      const { worktrees } = parseWorktreeList(worktreeText);
+      const checkedOut = new Set(
+        worktrees.map((w) => w.branch).filter((b): b is string => !!b),
+      );
+
+      // Every local branch of the repository is checked per copy (§15):
+      // a copy stays while any of them is not on origin. Branch tips are
+      // repo-wide, so they are fetched once; `ancestorCache` carries
+      // positive results between copies of the same repository.
+      const localBranches: { name: string; sha: string }[] = (
+        (await gitOut(deps.cmd, root, [
+          "for-each-ref",
+          "refs/heads",
+          "--format=%(refname:short) %(objectname)",
+        ])) ?? ""
+      )
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .map((l) => {
+          const i = l.lastIndexOf(" ");
+          return { name: l.slice(0, i), sha: l.slice(i + 1) };
+        });
+      const branchShas = [...new Set(localBranches.map((b) => b.sha))];
+      const ancestorCache = new Map<string, boolean>();
+
+      let pruned = false;
+      for (const env of repoEnvs) {
+        if (
+          await evalEnv(
+            cfg,
+            apply,
+            summary,
+            env,
+            root,
+            protectedTargets,
+            branchShas,
+            ancestorCache,
+            checkedOut,
+            delegatedThreads,
+            reportedNow,
+          )
+        ) {
+          pruned = true;
+        }
+      }
+
+      // «Ветки без копий»: local `bb/` branches merged on origin and not
+      // checked out anywhere are deleted (apply mode only); people's other
+      // branches are never touched. The occupancy list is refreshed when
+      // this run already removed copies — their branches left the
+      // worktree list with them.
+      let openBranches = checkedOut;
+      if (apply && summary.removedCopies > 0) {
+        await gitOk(deps.cmd, root, ["worktree", "prune"]);
+        const fresh = parseWorktreeList(
+          (await gitOut(deps.cmd, root, [
+            "worktree",
+            "list",
+            "--porcelain",
+          ])) ?? "",
+        );
+        openBranches = new Set(
+          fresh.worktrees
+            .map((w) => w.branch)
+            .filter((b): b is string => !!b),
+        );
+      }
+      for (const { name: branch } of localBranches) {
+        if (!branch.startsWith(BRANCH_PREFIX)) continue;
+        if (cfg.protectedBranches.includes(branch)) continue;
+        if (openBranches.has(branch)) continue;
+        let merged = protectedTargets.length > 0;
+        if (merged) {
+          merged = false;
+          for (const t of protectedTargets) {
+            if (
+              await gitOk(deps.cmd, root, [
+                "merge-base",
+                "--is-ancestor",
+                branch,
+                t,
+              ])
+            ) {
+              merged = true;
+              break;
+            }
+          }
+        }
+        if (!merged) continue;
+        summary.orphanBranches += 1;
+        if (apply && cfg.deleteBranches) {
+          if (await gitOk(deps.cmd, root, ["branch", "-D", branch])) {
+            summary.removedBranches += 1;
+          } else {
+            keep(summary, "branch-delete-failed");
+          }
+        }
+      }
+      if (apply && (pruned || summary.removedBranches > 0)) {
+        await gitOk(deps.cmd, root, ["worktree", "prune"]);
+      }
+    }
+
+    // «Отчёт, без удаления» (§15): abandoned copies collected this run —
+    // also used by the daily coordinator message below.
+    for (const { env, reason } of reportedNow) {
+      const item = deps.janitor.item(env.id);
+      summary.reported.push({
+        envId: env.id,
+        projectId: env.projectId ?? null,
+        path: env.path ?? null,
+        branch: env.branchName ?? item?.branch ?? null,
+        threadId: item?.thread_id ?? null,
+        reason,
+      });
+    }
+  };
+
+  const evalEnv = async (
+    cfg: JanitorConfig,
+    apply: boolean,
+    summary: JanitorRunSummary,
+    env: EnvDto,
+    repoRoot: string,
+    protectedTargets: string[],
+    branchShas: string[],
+    ancestorCache: Map<string, boolean>,
+    checkedOut: Set<string>,
+    delegatedThreads: Set<string>,
+    reportedNow: { env: EnvDto; reason: string }[],
+  ): Promise<boolean> => {
+    const at = now();
+    const path = env.path!;
+    const prev = deps.janitor.item(env.id);
+    const upsert = (
+      state: JanitorItemState,
+      reason: string,
+      extra: {
+        firstSeenAt?: number | null;
+        removedAt?: number | null;
+        sizeKb?: number | null;
+      } = {},
+    ) =>
+      deps.janitor.upsertItem(
+        env.id,
+        {
+          projectId: env.projectId ?? null,
+          path,
+          branch: env.branchName ?? null,
+          threadId,
+          state,
+          reason,
+          ...(extra.firstSeenAt !== undefined
+            ? { firstSeenAt: extra.firstSeenAt }
+            : {}),
+          ...(extra.removedAt !== undefined
+            ? { removedAt: extra.removedAt }
+            : {}),
+          ...(extra.sizeKb !== undefined ? { sizeKb: extra.sizeKb } : {}),
+        },
+        at,
+      );
+
+    const threads = await envThreads(env.id);
+    const liveThreads = (threads ?? []).filter((t) => !t.archivedAt);
+    const threadId =
+      liveThreads.find((t) => delegatedThreads.has(t.id))?.id ??
+      liveThreads[0]?.id ??
+      threads?.[0]?.id ??
+      prev?.thread_id ??
+      null;
+    // «Тред простаивает» — idleness is the threads', not the env record's:
+    // env.updatedAt moves on lifecycle events, not user work. An env
+    // without threads falls back to its own updatedAt.
+    const lastActivity = (threads ?? []).length
+      ? Math.max(...(threads ?? []).map((t) => t.updatedAt ?? 0))
+      : (env.updatedAt ?? 0);
+    const abandoned = at - lastActivity > cfg.abandonedAfterMs;
+    const allArchived = (threads ?? []).length > 0 && liveThreads.length === 0;
+
+    const fail = (state: JanitorItemState, reason: string): false => {
+      upsert(state, reason, { firstSeenAt: null });
+      keep(summary, reason);
+      if (state === "reported") reportedNow.push({ env, reason });
+      return false;
+    };
+
+    if (!existsSync(path)) {
+      return fail("kept", "missing-path");
+    }
+
+    // ── merge check (§15): HEAD and every local branch on origin ──
+    const head = (
+      await gitOut(deps.cmd, path, ["rev-parse", "--verify", "HEAD"])
+    )?.trim();
+    if (!head) return fail("kept", "no-head");
+    const ownBranch = (
+      await gitOut(deps.cmd, path, ["branch", "--show-current"])
+    )?.trim();
+
+    // §15 cond 3 facts are computed up front: they decide the abandoned
+    // reason for unmerged copies too («грязное с тем же простоем»).
+    const dirty =
+      ((await gitOut(deps.cmd, path, ["status", "--porcelain"])) ?? "").trim()
+        .length > 0;
+    const gitDirRaw = await gitOut(deps.cmd, path, [
+      "rev-parse",
+      "--git-dir",
+    ]);
+    const gitDir = gitDirRaw
+      ? isAbsolute(gitDirRaw.trim())
+        ? gitDirRaw.trim()
+        : join(path, gitDirRaw.trim())
+      : null;
+    const unfinished =
+      !!gitDir &&
+      (["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REVERT_HEAD"].some(
+        (f) => existsSync(join(gitDir, f)),
+      ) ||
+        existsSync(join(gitDir, "rebase-merge")) ||
+        existsSync(join(gitDir, "rebase-apply")));
+
+    const targets = await targetRefs(env, repoRoot, protectedTargets);
+    let merged = targets.length > 0;
+    if (merged) {
+      for (const sha of new Set([head, ...branchShas])) {
+        let ok = ancestorCache.get(sha) === true;
+        if (!ok) {
+          for (const t of targets) {
+            if (
+              await gitOk(deps.cmd, repoRoot, [
+                "merge-base",
+                "--is-ancestor",
+                sha,
+                t,
+              ])
+            ) {
+              ok = true;
+              break;
+            }
+          }
+          // Only positive results are shared: a miss here may still be an
+          // ancestor of another env's mergeBaseBranch.
+          if (ok) ancestorCache.set(sha, true);
+        }
+        if (!ok) {
+          merged = false;
+          break;
+        }
+      }
+    }
+
+    if (!merged) {
+      const reason = allArchived
+        ? "abandoned-archived"
+        : !abandoned
+          ? "not-merged"
+          : dirty || unfinished
+            ? "abandoned-dirty"
+            : "abandoned-unmerged";
+      return fail(
+        reason.startsWith("abandoned") ? "reported" : "kept",
+        reason,
+      );
+    }
+
+    // The copy stays merged from the first run that saw it so; an
+    // unmerged sighting between runs resets the clock via `fail` above.
+    const firstSeenAt = prev?.first_seen_at ?? at;
+
+    // §15 cond 2: a copy with no own work at the base tip only looks
+    // merged — it must not go while its thread is merely resting.
+    let freshAtTip = false;
+    for (const t of targets) {
+      const tip = (
+        await gitOut(deps.cmd, repoRoot, ["rev-parse", "--verify", t])
+      )?.trim();
+      if (tip && tip === head) {
+        freshAtTip = true;
+        break;
+      }
+    }
+    const ownWork = !freshAtTip;
+
+    const threadsUnknown = threads === null;
+    const threadsBlocking = liveThreads.some((t) =>
+      BLOCKING_THREAD_STATUSES.has(t.status ?? ""),
+    );
+    let interactionsPending = false;
+    for (const t of liveThreads) {
+      if (await hasPendingInteraction(t.id)) {
+        interactionsPending = true;
+        break;
+      }
+    }
+    const delegated = liveThreads.some((t) => delegatedThreads.has(t.id));
+    const processInside = await hasProcessIn(path);
+
+    let reason: string | null = null;
+    if (at - firstSeenAt < cfg.afterMergeMs) reason = "merged-wait";
+    else if (!ownWork && !abandoned) reason = "no-commits-fresh";
+    else if (dirty) reason = abandoned ? "abandoned-dirty" : "dirty";
+    else if (unfinished) reason = "unfinished-op";
+    else if (threadsUnknown) reason = "threads-unknown";
+    else if (threadsBlocking) reason = "threads-active";
+    else if (interactionsPending) reason = "interactions-pending";
+    else if (delegated) reason = "delegation-active";
+    else if (processInside) reason = "process-inside";
+
+    if (reason !== null) {
+      const reported = reason.startsWith("abandoned");
+      upsert(reported ? "reported" : "kept", reason, { firstSeenAt });
+      keep(summary, reason);
+      if (reported) reportedNow.push({ env, reason });
+      return false;
+    }
+
+    // Fully eligible: merged for afterMerge, own work or idle thread,
+    // clean, no live thread/process.
+    summary.ready += 1;
+    if (!apply) {
+      upsert("kept", "merged-ready", { firstSeenAt });
+      keep(summary, "merged-ready");
+      return false;
+    }
+
+    const sizeText = await deps.cmd.run("du", ["-sk", path], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    const sizeKb =
+      sizeText.exitCode === 0
+        ? Number(sizeText.stdout.split(/\s+/)[0]) || 0
+        : 0;
+
+    // §15 action: archive the env's threads, then `bb environment
+    // cleanup`; a refused cleanup unarchives the threads back.
+    const archivedNow: string[] = [];
+    for (const t of liveThreads) {
+      const res = await deps.bbCli.run(["thread", "archive", t.id]);
+      if (res.exitCode === 0) archivedNow.push(t.id);
+    }
+    const cleanup = await deps.bbCli.run(
+      ["environment", "cleanup", env.id],
+      { timeoutMs: CLEANUP_TIMEOUT_MS },
+    );
+    if (cleanup.exitCode !== 0) {
+      for (const t of archivedNow) {
+        await deps.bbCli.run(["thread", "unarchive", t]);
+      }
+      const stderr = (cleanup.stderr || cleanup.stdout).trim().slice(0, 120);
+      upsert("kept", `cleanup-refused${stderr ? `: ${stderr}` : ""}`, {
+        firstSeenAt,
+      });
+      keep(summary, "cleanup-refused");
+      return false;
+    }
+
+    summary.removedCopies += 1;
+    summary.archivedThreads += archivedNow.length;
+    summary.freedKb += sizeKb;
+    upsert("removed", "removed", {
+      firstSeenAt,
+      removedAt: at,
+      sizeKb,
+    });
+
+    // The copy's own branch — captured before the cleanup removed the
+    // worktree. The checked-out branch wins over the env record: an
+    // executor that switched branches still loses nothing unmerged.
+    const branch = ownBranch || env.branchName?.trim();
+    if (cfg.deleteBranches && branch) {
+      await gitOk(deps.cmd, repoRoot, ["worktree", "prune"]);
+      const fresh = parseWorktreeList(
+        (await gitOut(deps.cmd, repoRoot, [
+          "worktree",
+          "list",
+          "--porcelain",
+        ])) ?? "",
+      );
+      const stillOpen = new Set(
+        fresh.worktrees.map((w) => w.branch).filter((b): b is string => !!b),
+      );
+      if (
+        !cfg.protectedBranches.includes(branch) &&
+        !stillOpen.has(branch) &&
+        (await gitOk(deps.cmd, repoRoot, ["branch", "-D", branch]))
+      ) {
+        summary.removedBranches += 1;
+      }
+    }
+    return true;
+  };
+
+  /** §15: at most one «брошено» message per coordinator per day, listing
+   * the envs of his delegations. Other threads are never written to. */
+  const notifyCoordinators = async (
+    summary: JanitorRunSummary,
+  ): Promise<void> => {
+    if (!summary.reported.length) return;
+    const byCoordinator = new Map<string, JanitorReportedItem[]>();
+    for (const item of summary.reported) {
+      const tid = item.threadId;
+      const coordinator = tid
+        ? deps.store.byThreadId(tid)?.coordinator_thread_id
+        : undefined;
+      if (!coordinator) continue;
+      const list = byCoordinator.get(coordinator) ?? [];
+      list.push(item);
+      byCoordinator.set(coordinator, list);
+    }
+    for (const [coordinator, items] of byCoordinator) {
+      const key = `dailyNotify:${coordinator}`;
+      const last = Number(deps.janitor.meta(key) ?? 0);
+      if (now() - last < DAY_MS) continue;
+      const list = items
+        .slice(0, 8)
+        .map((i) => i.branch ?? i.path ?? i.envId)
+        .join(", ");
+      const more =
+        items.length > 8 ? ` и ещё ${items.length - 8}` : "";
+      try {
+        await deps.threads.send({
+          threadId: coordinator,
+          mode: "queue-if-active",
+          input: [
+            {
+              type: "text",
+              text:
+                `[orchestrator] уборщик: брошено ${items.length} ` +
+                `копий${more ? ` (всего)` : ""}: ${list}${more} — ` +
+                `разбор: bb orchestrator janitor report`,
+              mentions: [],
+            },
+          ],
+        });
+        deps.janitor.setMeta(key, String(now()));
+      } catch (e) {
+        log.warn?.(`orchestrator janitor: notify ${coordinator}: ${message(e)}`);
+      }
+    }
+  };
+
+  const report = async (): Promise<JanitorReport> => {
+    const cfgLoad = await deps.loadConfig();
+    const items = deps.janitor.items();
+    return {
+      config: cfgLoad.config,
+      configErrors: cfgLoad.errors,
+      lastRun: deps.janitor.latestRun(),
+      items,
+      abandoned: items
+        .filter((i) => i.state === "reported")
+        .map((i) => ({
+          envId: i.env_id,
+          projectId: i.project_id,
+          path: i.path,
+          branch: i.branch,
+          threadId: i.thread_id,
+          reason: i.reason ?? "",
+        })),
+    };
+  };
+
+  return { run, report };
+}
