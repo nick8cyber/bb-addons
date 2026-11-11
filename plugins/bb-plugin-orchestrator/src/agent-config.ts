@@ -81,7 +81,12 @@ export function isCoordinatorByStaticFacts(facts: ThreadFacts): boolean {
   if (facts.parentThreadId !== null && facts.parentThreadId !== undefined) {
     return false;
   }
-  if (facts.originPluginId === "tasks") return false;
+  // §17.1 (аудит Б3): a plugin-born thread — `tasks` dispatch included —
+  // is never a default coordinator; it carries no dispatch tools or
+  // coordinator instructions.
+  if (facts.originPluginId !== null && facts.originPluginId !== undefined) {
+    return false;
+  }
   if (facts.title && DISPATCH_TITLE_RE.test(facts.title)) return false;
   return true;
 }

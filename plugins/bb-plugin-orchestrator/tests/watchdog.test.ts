@@ -558,7 +558,10 @@ test("idle with a non-empty queue stays running; empty → done", async () => {
   const h = makeHarness();
   const row = h.insertActive({ threadId: "thr_e1" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.queues.set("thr_e1", [{ id: "q1" }]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   assert.equal(h.store.get(row.id)!.status, "running");
@@ -1628,6 +1631,10 @@ test("idle with an unreadable journal stays running — no done/cancelled", asyn
 
   // once the journal reads again, the usual done applies
   h.eventsBlocked.delete("thr_e1");
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   assert.equal(h.store.get(row.id)!.status, "done");
 });
@@ -2058,8 +2065,9 @@ test("§5.3 r23: a mid-turn tool error followed by response events is done, not 
     ev(2, "provider/error", T0 + 500, { message: "tool exploded" }),
     ev(3, "item/agentMessage/delta", T0 + 600, { delta: "working on it" }),
     ev(4, "item/completed", T0 + 700, { item: { type: "agentMessage" } }),
+    ev(5, "turn/completed", T0 + 800, { status: "completed" }),
   ]);
-  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 4 });
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 5 });
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   assert.equal(h.store.get(row.id)!.status, "done");
   assert.equal(
@@ -2302,8 +2310,9 @@ test("§5.3 r23: a trailing willRetry provider error is not errored → done", a
       message: "backend hiccup",
       willRetry: true,
     }),
+    ev(3, "turn/completed", T0 + 600, { status: "completed" }),
   ]);
-  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   assert.equal(h.store.get(row.id)!.status, "done");
 });
@@ -2943,7 +2952,10 @@ test("§16.2: turn/started on done → running, result delivery re-arms", async 
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог захода 1");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
   let fresh = h.store.get(row.id)!;
@@ -2954,10 +2966,11 @@ test("§16.2: turn/started on done → running, result delivery re-arms", async 
   // A `bb thread tell` lifts the thread: a new turn starts.
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0 - 1000),
-    ev(2, "turn/started", T0 + 5000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+    ev(3, "turn/started", T0 + 5000),
   ]);
   h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
-  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
   fresh = h.store.get(row.id)!;
   assert.equal(fresh.status, "running");
   assert.equal(fresh.revived_count, 1);
@@ -2968,8 +2981,9 @@ test("§16.2: turn/started on done → running, result delivery re-arms", async 
   // «итог захода пересчитывается при каждом done»).
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0 - 1000),
-    ev(2, "turn/started", T0 + 5000),
-    ev(3, "turn/completed", T0 + 9000, { status: "completed" }),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+    ev(3, "turn/started", T0 + 5000),
+    ev(4, "turn/completed", T0 + 9000, { status: "completed" }),
   ]);
   h.queues.set("thr_e1", []);
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
@@ -3054,6 +3068,8 @@ const ROUND_FAKE: WatchdogDeps["round"] = {
     if (k.startsWith("symbolic-ref")) return "bb/plug-1\n";
     if (k.startsWith("status")) return "\n";
     if (k.startsWith("rev-list")) return "3\n";
+    if (k.startsWith("log -g"))
+      return "base0000\u0000branch: Created from main\n";
     return "";
   },
 };
@@ -3064,7 +3080,10 @@ test("§16.5: done delivers ONE plugin message with branch/sha7/копия/outpu
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "готово: npm test + typecheck");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
   const fresh = h.store.get(row.id)!;
@@ -3089,8 +3108,14 @@ test("§16.5: empty output → «без отчёта»; output is capped at 3000
   h.threadDtos.set("thr_e2", dto("thr_e2", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e2", "y".repeat(4000));
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
-  h.eventLog.set("thr_e2", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
+  h.eventLog.set("thr_e2", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await h.wd.onThreadIdle(dto("thr_e2", "idle"));
   await settleResults(h);
@@ -3109,7 +3134,10 @@ test("§16.5: send failure → reconcile resends until delivered", async () => {
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   let fresh = h.store.get(row.id)!;
   assert.equal(fresh.status, "done");
@@ -3133,7 +3161,10 @@ test("§16.5: a gone coordinator records the delivery and never rescans", async 
   const row = h.insertActive({ threadId: "thr_e1" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   // thr_coord is NOT in threadDtos — it is gone
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
   const fresh = h.store.get(row.id)!;
@@ -3172,7 +3203,10 @@ test("§16.5: BB child-completed in the coordinator journal → bb, no plugin me
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог захода");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.eventLog.set("thr_coord", [
     childNotice(11, T0, "thr_e1"), // after the executor's turn started
   ]);
@@ -3201,9 +3235,10 @@ test("§16.5: a notice older than the last turn's start does not count", async (
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0 - 1000),
     ev(2, "turn/started", T0 + 50_000),
+    ev(3, "turn/completed", T0 + 60_000, { status: "completed" }),
   ]);
   h.eventLog.set("thr_coord", [childNotice(11, T0 + 10_000, "thr_e1")]);
-  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
   const fresh = h.store.get(row.id)!;
@@ -3245,8 +3280,14 @@ test("§16.5: a batch naming the thread counts; other threads only does not", as
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог 1");
   h.outputs.set("thr_e2", "итог 2");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
-  h.eventLog.set("thr_e2", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
+  h.eventLog.set("thr_e2", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.eventLog.set("thr_coord", [
     sysNotice(11, T0, "child-outcome-batch", {
       kind: "thread-batch",
@@ -3279,10 +3320,12 @@ test("§16.5: an unattributed batch never counts — the plugin delivers (PLUG-2
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0 - 1000),
     ev(2, "item/agentMessage/delta", T0 + 9000, { delta: "x" }),
+    ev(3, "turn/completed", T0 + 21_000, { status: "completed" }),
   ]);
   h.eventLog.set("thr_e2", [
     ev(1, "turn/started", T0 - 1000),
     ev(2, "item/agentMessage/delta", T0 + 20_000, { delta: "x" }),
+    ev(3, "turn/completed", T0 + 21_000, { status: "completed" }),
   ]);
   h.eventLog.set("thr_coord", [
     sysNotice(11, T0 + 10_000, "child-outcome-batch", {
@@ -3309,7 +3352,10 @@ test("§16.5: an empty executor report always gets the plugin line — even with
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   // no output recorded → «без отчёта»
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.eventLog.set("thr_coord", [childNotice(11, T0, "thr_e1")]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
@@ -3328,7 +3374,10 @@ test("§16.5: a doubtful round BB already reported gets the header ONLY (PLUG-20
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог захода");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.eventLog.set("thr_coord", [childNotice(11, T0, "thr_e1")]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
@@ -3351,7 +3400,10 @@ test("§16.5: a doubtful round WITHOUT BB's notice gets header + report", async 
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог захода");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   // thr_coord journal: no notice about this executor.
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
@@ -3369,7 +3421,10 @@ test("§16.5: an unreadable coordinator journal is not 'absent' — retried, the
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог захода");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.eventLog.set("thr_coord", [childNotice(11, T0, "thr_e1")]);
   h.eventsBlocked.add("thr_coord");
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
@@ -3392,7 +3447,10 @@ test("§16.5: journal unreadable past the retry limit → plugin line anyway (PL
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог захода");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.eventsBlocked.add("thr_coord");
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await h.wd.reconcile(); // opens the grace window
@@ -3422,7 +3480,10 @@ test("§16.5: a restart inside the 120 s window sends nothing — the marker sur
   h1.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h1.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h1.outputs.set("thr_e1", "итог захода");
-  h1.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h1.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h1.wd.onThreadIdle(dto("thr_e1", "idle"));
   await h1.wd.reconcile(); // first sight — the window opens at T0
   assert.equal(h1.store.get(row.id)!.result_notified_at, null);
@@ -3450,7 +3511,10 @@ test("§16.5: a revived thread's stale BB notice does not cover the new turn", a
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог захода 1");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   h.eventLog.set("thr_coord", [childNotice(11, T0, "thr_e1")]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await settleResults(h);
@@ -3459,18 +3523,20 @@ test("§16.5: a revived thread's stale BB notice does not cover the new turn", a
   // The thread comes back — a second turn starts (its own delivery).
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0 - 1000),
-    ev(2, "turn/started", T0 + 60_000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+    ev(3, "turn/started", T0 + 60_000),
   ]);
   h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
-  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
   assert.equal(h.store.get(row.id)!.status, "running");
 
   // Turn 2 finishes. BB's earlier notice (T0) predates turn 2's start
   // (T0+60_000) — the plugin delivers the new outcome itself.
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0 - 1000),
-    ev(2, "turn/started", T0 + 60_000),
-    ev(3, "turn/completed", T0 + 90_000, { status: "completed" }),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+    ev(3, "turn/started", T0 + 60_000),
+    ev(4, "turn/completed", T0 + 90_000, { status: "completed" }),
   ]);
   h.outputs.set("thr_e1", "итог захода 2");
   h.queues.set("thr_e1", []);
@@ -3491,7 +3557,10 @@ test("§16.5: the grace window gates delivery — reconcile before 120 s sends n
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.outputs.set("thr_e1", "итог");
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   assert.equal(h.store.get(row.id)!.status, "done");
   h.setNow(T0 + 119_000); // one second short of the window
@@ -3715,7 +3784,8 @@ test("PLUG-184 B1: an old base's migration marks legacy results; first reconcile
     0,
     "first reconcile re-sends no legacy result or compaction reminder",
   );
-  // a NEW compaction still fires the reminder
+  // §17.2 (мелко 6): a coordinator whose delegations all finished is
+  // NOT polled — even a NEW compaction fires no reminder here.
   h.eventLog.set("thr_coord", [
     ev(7, "thread/compacted", T0 - 1000),
     ev(8, "thread/compacted", T0),
@@ -3723,8 +3793,25 @@ test("PLUG-184 B1: an old base's migration marks legacy results; first reconcile
   await h.wd.reconcile();
   assert.equal(
     h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    0,
+  );
+  // ...while a coordinator WITH an active delegation is polled: the
+  // first pass only initializes the cursor (PLUG-184 B1), a compaction
+  // NEWER than that is reminded (§16.5).
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    0,
+  );
+  h.eventLog.get("thr_coord")!.push(ev(9, "thread/compacted", T0 + 1000));
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
     1,
   );
+  assert.ok(row.id > 0);
 });
 
 test("PLUG-184 B2: a tracker comment waking an OLD round → silent stop, no line", async () => {
@@ -3865,7 +3952,10 @@ test("PLUG-184 C3: event done + reconcile → exactly one result send", async ()
   const row = h.insertActive({ threadId: "thr_e1" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
-  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   await h.wd.reconcile(); // inside BB's grace window — nothing sent yet
   assert.equal(h.sends.length, 0);
@@ -4580,4 +4670,190 @@ test("PLUG-190 #6: failed without autoFallback + retry-cancel failure → ONE me
     !h.store.findSetupError(h.store.get(row.id)!, "watchdog-stop"),
     "watchdog-stop cleared after the confirmed cancel",
   );
+});
+
+// ── §17.2 r26 ────────────────────────────────────────────────────────
+
+test("§17.2 (С2): idle without the turn's turn/completed stays running", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.queues.set("thr_e1", []);
+  // The turn started but its completion was never read — the turn is
+  // still in flight and idle alone is not `done`.
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "running");
+  await h.wd.reconcile();
+  assert.equal(h.store.get(row.id)!.status, "running");
+  // ...until the completion actually lands.
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "done");
+});
+
+test("§17.2 (e2e 7): item/completed contextCompaction fires the §3 reminder", async () => {
+  const h = makeHarness();
+  h.insertActive({ threadId: "thr_e1" });
+  // a second coordinator's row — its counts must not enter thr_coord's memo
+  const other = h.store.insert({
+    taskKey: "PLUG-9",
+    coordinatorThreadId: "thr_c2",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+  });
+  h.store.setStatus(other.id, "running");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // Codex never sends thread/compacted — the compaction is an
+  // item/completed whose item type is contextCompaction.
+  h.eventLog.set("thr_coord", [
+    ev(9, "item/completed", T0, { item: { type: "contextCompaction" } }),
+  ]);
+  await h.wd.reconcile(); // first sight initializes the cursor
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    0,
+  );
+  h.eventLog.set("thr_coord", [
+    ev(9, "item/completed", T0, { item: { type: "contextCompaction" } }),
+    ev(10, "item/completed", T0 + 60_000, {
+      item: { type: "contextCompaction" },
+    }),
+  ]);
+  await h.wd.reconcile();
+  const memos = h.sends.filter(
+    (x) => x.threadId === "thr_coord" && /сжат/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(memos.length, 1);
+  // §17.2 (мелко 6): the memo counts ONLY this coordinator's rows.
+  assert.match(JSON.stringify(memos[0]!.input), /running: 1/);
+  // an ordinary item/completed is not a compaction — no second reminder
+  h.eventLog.set("thr_coord", [
+    ev(9, "item/completed", T0, { item: { type: "contextCompaction" } }),
+    ev(10, "item/completed", T0 + 60_000, {
+      item: { type: "contextCompaction" },
+    }),
+    ev(11, "item/completed", T0 + 120_000, {
+      item: { type: "agentMessage" },
+    }),
+  ]);
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    1,
+  );
+});
+
+test("§17.2 (e2e 8): --preset first-response window resolves per provider", async () => {
+  const policy = JSON.stringify({
+    version: 1,
+    firstResponseSeconds: 30,
+    maxRunSeconds: 6000,
+    firstResponseSecondsByProvider: { agy: 45 },
+    levels: {
+      simple: { chain: ["simple"], autoFallback: false },
+      strict: { chain: ["strict"], autoFallback: false },
+    },
+    routes: {
+      simple: { preset: "simple", provider: "acp-opencode" },
+      strict: {
+        preset: "strict",
+        provider: "acp-devin",
+        firstResponseSeconds: 90,
+      },
+    },
+  });
+  const h = makeHarness({ policyText: policy });
+  // Row 1: preset one-off on acp-devin — the same-provider ROUTE window
+  // (strict 90 s) wins over byProvider and the global 30 s.
+  const row1 = h.insertActive({
+    threadId: "thr_e1",
+    route: "preset:oneoff",
+    preset: "oneoff",
+    provider: "acp-devin",
+  });
+  // Row 2: preset one-off on agy — no same-provider route window, so
+  // firstResponseSecondsByProvider (45 s) applies.
+  const row2 = h.insertActive({
+    taskKey: "PLUG-2",
+    threadId: "thr_e2",
+    route: "preset:two",
+    preset: "two",
+    provider: "agy",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_e2", dto("thr_e2", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  h.eventLog.set("thr_e2", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  await h.wd.onThreadEvents({ thread: dto("thr_e2"), sequence: 1 });
+  h.setNow(T0 + 31_000); // past the global 30 s — neither stalled
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row1.id)!.status, "running");
+  assert.equal(h.store.get(row2.id)!.status, "running");
+  h.setNow(T0 + 46_000); // past agy's 45 s provider window
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row2.id)!.status, "stalled");
+  assert.equal(h.store.get(row1.id)!.status, "running");
+  h.setNow(T0 + 91_000); // past strict's 90 s same-provider route window
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row1.id)!.status, "stalled");
+});
+
+test("§17.2 (e2e 4): the silent tracker stop mutes parentNotifications off→auto", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: one" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  const cmds = h.calls.map((c) => c.join(" "));
+  const off = cmds.indexOf(
+    "thread update thr_e1 --parent-notifications off",
+  );
+  const auto = cmds.indexOf(
+    "thread update thr_e1 --parent-notifications auto",
+  );
+  assert.ok(off >= 0, "the stop is muted first");
+  assert.ok(auto > off, "auto is restored after the confirmed stop");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  assert.equal(
+    h.sends.filter((x) => x.threadId === "thr_coord").length,
+    0,
+    "the intentionally stopped wake never reaches the coordinator",
+  );
+});
+
+test("§17.2 (мелко 1): result_commits counts from continue_from, not the base", async () => {
+  const repo = makeExecutorRepo({ commits: 2 });
+  const continueFrom = git(repo, ["rev-parse", "HEAD~1"]);
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.db
+    .prepare("UPDATE delegations SET continue_from = ? WHERE id = ?")
+    .run(continueFrom, row.id);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_commits, 1, "only this round's commits count");
 });

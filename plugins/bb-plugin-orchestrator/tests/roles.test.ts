@@ -203,14 +203,34 @@ test("decideRole: parent → executor; app → pending pick; else orchestrator",
     }),
     "orchestrator",
   );
-  // cli / plugin / sdk / internal → orchestrator
-  for (const origin of ["cli", "plugin", "sdk", null]) {
+  // §17.1 (аудит Б3): cli → orchestrator; plugin/sdk/automation-born →
+  // no role at all (the `none` row blocks the configure-time fallback).
+  assert.equal(decideRole(facts({ origin: "cli" }), noProbes), "orchestrator");
+  for (const origin of ["plugin", "sdk", null]) {
     assert.equal(
       decideRole(facts({ origin }), noProbes),
-      "orchestrator",
+      "none",
       `origin ${origin}`,
     );
   }
+});
+
+test("§17.1: a plugin-origin dispatch records the none row, no coordinator", () => {
+  const { store, hook } = makeStore();
+  const decision = hook(
+    dispatch({
+      thread: {
+        id: "thr_plugin",
+        status: "pending",
+        originPluginId: "advisor",
+      },
+      origin: "plugin",
+      attempt: "start-turn",
+      project: { id: "proj_a" },
+    }),
+  );
+  assert.deepEqual(decision, { action: "proceed" });
+  assert.equal(store.threadRole("thr_plugin")!.role, "none");
 });
 
 test("hook: first app message records the project's pick", () => {
@@ -414,6 +434,13 @@ test("§3 budget: longest role + a 1500-char rule stays under 4096", () => {
       ROLES.orchestrator.instructions.slice(0, 30),
     ),
   );
+});
+
+test("§17.1: orchestrator and executor instructions forbid host changes", () => {
+  for (const id of ["orchestrator", "executor"] as const) {
+    const text = ROLES[id].instructions;
+    assert.match(text, /ни sudo, ни установки пакетов/, `${id} bans sudo/pkg`);
+  }
 });
 
 test("injectInstructions=false: no texts for any role, tools stay", () => {

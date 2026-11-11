@@ -1039,3 +1039,159 @@ test("§2.3 reviewByLevel: --route/--preset keep the caller's level (no mapping)
   assert.equal(res.level, "review");
   assert.equal(res.note, undefined);
 });
+
+// ── §17 r26 ──────────────────────────────────────────────────────────
+
+test("§17.3 (мелко 3): --level release-audit is refused — the pipeline alone assigns it", async () => {
+  const { deps, calls } = makeDeps();
+  await assert.rejects(
+    runDelegate(
+      { taskKey: "PLUG-1", level: "release-audit", caller: COORDINATOR },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "level-forbidden",
+  );
+  assert.equal(
+    calls.filter((c) => c.args.join(" ").startsWith("tasks dispatch")).length,
+    0,
+  );
+});
+
+test("§17.3 (мелко 3): --preset still checks the level against the policy", async () => {
+  const { deps } = makeDeps();
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "nonexistent",
+        preset: "oneoff",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "unknown-level",
+  );
+});
+
+test("§17.2 (e2e 2): round numbers count executor-role delegations only", async () => {
+  const { deps, store } = makeDeps();
+  // Round 1: an executor finished; a review (auditor-role) delegation ran
+  // after it — the NEXT executor round is 2, not 3.
+  const execRow = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    round: 1,
+  });
+  store.setStatus(execRow.id, "done");
+  const reviewRow = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "review",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    round: 1,
+  });
+  store.setStatus(reviewRow.id, "done");
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.ok, true);
+  assert.equal(store.get(res.delegationId)!.round, 2);
+});
+
+test("§17.2 (e2e 6): a dispatch refusal comments the reason on the task", async () => {
+  const { deps, calls } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks dispatch")) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "Invalid params: reasoning level \"extreme\" unknown",
+        };
+      }
+      if (key.startsWith("tasks preset show")) {
+        return ok(
+          JSON.stringify({
+            preset: { permissionMode: "full", providerId: "acp-devin" },
+          }),
+        );
+      }
+      return ok();
+    },
+  });
+  await assert.rejects(
+    runDelegate(
+      { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "dispatch-failed",
+  );
+  const comment = calls.find(
+    (c) =>
+      c.args.join(" ").startsWith("tasks comment PLUG-1") &&
+      c.args.join(" ").includes("отклонена"),
+  );
+  assert.ok(comment, "the refusal reason is recorded as a task comment");
+  assert.ok(comment!.args.join(" ").includes("reasoning level"));
+});
+
+test("§17.2 (мелко 4): the reissue route budget is per round, not per task", async () => {
+  const { store } = makeDeps();
+  const r1 = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    round: 1,
+  });
+  store.setStatus(r1.id, "stalled");
+  const r1b = store.reissue(r1.id, {
+    route: "simple-alt",
+    preset: "preset-alt",
+    provider: "agy",
+  })!;
+  store.setStatus(r1b.id, "done");
+  const r2 = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    round: 2,
+  });
+  store.setStatus(r2.id, "stalled");
+  const r2b = store.reissue(r2.id, {
+    route: "complex",
+    preset: "preset-c",
+    provider: "agy",
+  })!;
+  assert.deepEqual(
+    [...store.routesUsedByTask("PLUG-1", 1)].sort(),
+    ["simple-alt"],
+    "round 1 sees only its own auto-reissues",
+  );
+  assert.deepEqual(
+    [...store.routesUsedByTask("PLUG-1", 2)].sort(),
+    ["complex"],
+  );
+  assert.deepEqual(
+    [...store.routesUsedByTask("PLUG-1")].sort(),
+    ["complex", "simple-alt"],
+    "the unscoped call still answers every reissue",
+  );
+  assert.ok(r2b.id > r1b.id);
+});

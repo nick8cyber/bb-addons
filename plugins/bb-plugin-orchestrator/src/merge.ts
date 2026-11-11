@@ -112,6 +112,13 @@ export interface MergeDeps {
     from?: string;
     instructions?: string;
   }): Promise<{ delegationId: number; threadId: string | null }>;
+  /**
+   * §17.2 (e2e 1): force the delegation's bookkeeping up to date before
+   * judging `done` — BB's outcome notice reaches the coordinator seconds
+   * before the watchdog writes the status, and a `merge` issued on that
+   * notice must re-check a fresh row instead of answering `not-found`.
+   */
+  syncRow?(row: DelegationRow): Promise<void>;
   protectedBranches?: readonly string[];
   /** §16.6 `mergeAutofix` setting — off by default (report only). */
   mergeAutofix?: () => boolean;
@@ -206,12 +213,38 @@ export async function runMerge(
   let row = /^\d+$/.test(ref)
     ? store.get(Number(ref))
     : store.latestDoneResultByTask(ref);
+  // §17.2 (e2e 1): BB's child-completed notice lands seconds before the
+  // watchdog writes `done` — sync the task's newest delegation and
+  // re-resolve instead of answering `not-found` on a finished round.
+  if (!row && !/^\d+$/.test(ref) && deps.syncRow) {
+    const latest = store.delegationsByTask(ref)[0];
+    if (latest) {
+      await deps.syncRow(latest).catch(() => {});
+      row = store.latestDoneResultByTask(ref);
+    }
+  }
   if (!row) {
+    const latest = /^\d+$/.test(ref)
+      ? undefined
+      : store.delegationsByTask(ref)[0];
+    if (latest) {
+      throw new OrchestratorError(
+        "not-done",
+        `делегирование ${latest.id} ещё ${latest.status}, итога нет`,
+        "merge works on finished rounds — see `bb orchestrator status`",
+      );
+    }
     throw new OrchestratorError(
       "not-found",
       `no mergeable delegation for "${params.ref}"`,
       "`bb orchestrator status` lists delegations; a task key resolves to its latest done delegation with a result",
     );
+  }
+  // §17.2 (e2e 1): a numeric ref to a still-`running` row gets the same
+  // sync-and-recheck before the `not-done` verdict.
+  if (row.status === "running" && deps.syncRow) {
+    await deps.syncRow(row).catch(() => {});
+    row = store.get(row.id) ?? row;
   }
   if (params.callerThreadId !== row.coordinator_thread_id) {
     throw new OrchestratorError(
