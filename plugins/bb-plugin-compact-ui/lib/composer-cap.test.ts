@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { enforce } from "./composer-cap";
 
 /** jsdom has no layout — stub geometry per element via props. */
@@ -51,6 +51,13 @@ function buildDom(opts: { rows: number; rowH?: number; queueH?: number }) {
 }
 
 const win = { innerHeight: 932 } as Window; // cap = floor((932-96)/3) = 278
+
+/* jsdom keeps appended cards in document.body across tests — a stale card's
+   mocked queue heights leak into parent-scope candidate picks otherwise. */
+afterEach(() => {
+  document.body.replaceChildren();
+  document.documentElement.removeAttribute("data-cap-debug");
+});
 
 describe("enforce: expanded queue shows exactly min(N,3) items", () => {
   it("2 items → height of both + paddings", () => {

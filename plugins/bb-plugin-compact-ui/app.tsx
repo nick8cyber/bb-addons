@@ -955,6 +955,12 @@ function NavDiagBridge() {
             });
           win.__bbNavTopTest = { cmd: command, ts: Date.now(), hits };
         }
+        if (command === "reload_page") {
+          win.__bbNavTopTest = { cmd: command, ts: Date.now() };
+          try { sessionStorage.setItem("__bbNavReload", "1"); } catch {}
+          setTimeout(() => location.reload(), 400);
+          return;
+        }
         if (command === "dump_queue") {
           const box = (el: Element | null | undefined) => {
             if (!el) return null;
@@ -965,8 +971,16 @@ function NavDiagBridge() {
           };
           const q = document.querySelector("[data-queued-messages-scroll]");
           win.__bbNavTopTest = {
-            cmd: command, ts: Date.now(), innerH: window.innerHeight,
+            cmd: command, ts: Date.now(), innerH: window.innerHeight, appBuild: "v6",
             card: box(document.querySelector("[data-app-composer]")),
+            cardCount: document.querySelectorAll("[data-app-composer]").length,
+            timeOrigin: Math.round(performance.timeOrigin),
+            reloaded: (() => { try { return sessionStorage.getItem("__bbNavReload"); } catch { return null; } })(),
+            capMounted: document.documentElement.dataset.capMounted ?? null,
+            capDebug: document.documentElement.dataset.capDebug ? JSON.parse(document.documentElement.dataset.capDebug) : null,
+            editorInCard: !!document.querySelector("[data-app-composer] div.overflow-y-auto:has(.ProseMirror)"),
+            pmInCard: !!document.querySelector("[data-app-composer] .ProseMirror"),
+            queues: Array.from(document.querySelectorAll("[data-queued-messages-scroll]")).map((el) => ({ ...box(el), inCard: !!el.closest("[data-app-composer]") })),
             frame: box(q?.closest("[data-queued-messages-scroll-frame]")),
             scroll: q ? { ...box(q), scrollH: q.scrollHeight } : null,
             editor: box(document.querySelector("div.overflow-y-auto:has(.ProseMirror)")),

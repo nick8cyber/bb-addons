@@ -42,16 +42,44 @@ const pendingRetry = new WeakSet<Element>();
 const grownAncestors = new Set<HTMLElement>();
 
 export function enforce(form: Element, win: Window, retry = true): void {
-  const scroll = form.querySelector(EDITOR_SCROLL) as HTMLElement | null;
-  if (!scroll) return;
+  const dbgEl = form.ownerDocument.documentElement;
+  const dbg = JSON.parse(dbgEl.dataset.capDebug || "{}");
+  dbg.runs = (dbg.runs ?? 0) + 1;
+  dbg.ts = Date.now();
+  /* BB 0.49 no longer wraps the editor in div.overflow-y-auto — fall back to
+     the ProseMirror's own scrollable ancestor, then the element itself. */
+  const pm = form.querySelector(".ProseMirror") as HTMLElement | null;
+  /* BB 0.49 dropped the div.overflow-y-auto editor wrapper — find the real
+     scrollable ancestor of the ProseMirror by computed overflow instead. */
+  let pmScroll: HTMLElement | null = null;
+  for (let el = pm?.parentElement; el && el !== form; el = el.parentElement) {
+    const ov = getComputedStyle(el).overflowY;
+    if (ov === "auto" || ov === "scroll") { pmScroll = el as HTMLElement; break; }
+  }
+  const scroll = (form.querySelector(EDITOR_SCROLL) ?? pmScroll ?? pm) as HTMLElement | null;
+  dbg.editor = scroll ? scroll.tagName + "." + (scroll.className?.toString?.().split(" ")[0] ?? "") : null;
+  dbgEl.dataset.capDebug = JSON.stringify(dbg);
   const cap = capPx(win);
-  /* The queue panel may sit outside the form element itself; look just past it. */
-  const queue = (form.querySelector(QUEUE_SCROLL) ??
-    form.parentElement?.querySelector(QUEUE_SCROLL) ??
-    null) as HTMLElement | null;
+  /* The queue panel may sit outside the form element itself; look just past it.
+     bb keeps detached/hidden composer copies mounted — a collapsed stale queue
+     sorts first in document order and measures zero; prefer a visible one. */
+  const pick = (list: Element[]) => {
+    const live = list.filter((q) => q.isConnected) as HTMLElement[];
+    return live.find((q) => q.getBoundingClientRect().height > 0) ?? live[0];
+  };
+  const queue =
+    pick(Array.from(form.querySelectorAll(QUEUE_SCROLL))) ??
+    pick(Array.from(form.parentElement?.querySelectorAll(QUEUE_SCROLL) ?? [])) ??
+    null;
   if (queue) {
+    dbg.queueSeen = (dbg.queueSeen ?? 0) + 1;
+    dbgEl.dataset.capDebug = JSON.stringify(dbg);
     queueObserver?.(queue);
     const rows = Array.from(queue.querySelectorAll(QUEUE_ITEM));
+    const dbg2 = JSON.parse(dbgEl.dataset.capDebug || "{}");
+    dbg2.queueH = Math.round(queue.getBoundingClientRect().height);
+    dbg2.rows = rows.length;
+    dbgEl.dataset.capDebug = JSON.stringify(dbg2);
     /* Row text (markdown/async content) grows after mount; watching each row
        and re-measuring once on a timer keeps the clamp from freezing small. */
     rows.forEach((r) => queueObserver?.(r));
@@ -68,12 +96,17 @@ export function enforce(form: Element, win: Window, retry = true): void {
          measured, not multiplied. The scroll element carries its own vertical
          padding (host: pt-1 pb-3); omitting it clips the last visible row. */
       const k = Math.min(rows.length, MAX_QUEUE_ROWS);
-      const queueMax = Math.ceil(
+      /* For up-to-three rows the scroll's own content height is the exact
+         bound (padding included); beyond three, measure the first-k span. */
+      const measured = Math.ceil(
         rows[k - 1].getBoundingClientRect().bottom -
           rows[0].getBoundingClientRect().top +
           padY(queue) +
           padY(rows[0].parentElement ?? queue),
       );
+      const queueMax = rows.length <= MAX_QUEUE_ROWS
+        ? Math.max(measured, Math.ceil(queue.scrollHeight))
+        : measured;
       const roomBefore = queue.getBoundingClientRect().height;
       queue.style.maxHeight = `${queueMax}px`;
       if (frame) frame.style.maxHeight = `${queueMax + Math.ceil(padY(frame))}px`;
@@ -100,6 +133,7 @@ export function enforce(form: Element, win: Window, retry = true): void {
       }
     }
   }
+  if (!scroll) return;
   const formH = form.getBoundingClientRect().height;
   const cur = scroll.getBoundingClientRect().height;
   /* Height the form would have if the editor were at its natural (BB-capped) size.
@@ -117,6 +151,7 @@ export function mountComposerCap(
   win: Window = window,
 ): () => void {
   if (signal?.aborted) return () => {};
+  doc.documentElement.dataset.capMounted = "v5";
   const forms = new Set<Element>();
   const track = (form: Element) => {
     if (!forms.has(form)) {
