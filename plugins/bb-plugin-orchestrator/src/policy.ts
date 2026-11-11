@@ -256,6 +256,26 @@ export function parsePolicy(
       for (const [execLevel, reviewLevel] of Object.entries(
         raw.reviewByLevel,
       )) {
+        // §2.3: the map key is the EXECUTED level — it must name a
+        // declared level with the executor role.
+        const source = levels[execLevel];
+        const sourceRole = source
+          ? (source.role ?? (execLevel === "review" ? "auditor" : "executor"))
+          : undefined;
+        if (!source) {
+          err(
+            `reviewByLevel.${execLevel}`,
+            `level "${execLevel}" is not declared in levels`,
+          );
+          continue;
+        }
+        if (sourceRole !== "executor") {
+          err(
+            `reviewByLevel.${execLevel}`,
+            `level "${execLevel}" does not have role "executor"`,
+          );
+          continue;
+        }
         if (!isNonEmptyString(reviewLevel)) {
           err(`reviewByLevel.${execLevel}`, "must be a level name");
           continue;
@@ -413,21 +433,26 @@ export function levelRole(
 }
 
 /**
- * §2.3 quota group of a delegation whose route is not declared in the
- * policy (a `preset:<name>` one-off): the quota group of the first policy
- * route on the same provider, else the provider name itself — a burned
- * one-off preset closes the same-provider routes too.
+ * §2.3 (уточнение PLUG-182): the hold names a burned `preset:<name>`
+ * one-off shares — the quota group of every policy route on the same
+ * provider AND the same model (preset `modelId` from `bb tasks preset
+ * show`/`list`), plus the one-off route's own name so the preset itself
+ * is paused for re-dispatch. A route whose preset model is unknown does
+ * not join — a one-off never pauses same-provider routes on other models.
  */
-export function quotaGroupForProvider(
+export function quotaGroupsForOneOff(
   policy: Policy | null | undefined,
-  provider: string,
-): string {
-  if (policy) {
-    for (const [name, route] of Object.entries(policy.routes)) {
-      if (route.provider === provider) return quotaGroupOf(route, name);
-    }
+  oneOff: { route: string; provider: string; modelId?: string | null },
+  presetModels: ReadonlyMap<string, string | null | undefined>,
+): string[] {
+  const groups = new Set<string>([oneOff.route]);
+  if (!policy || !oneOff.modelId) return [...groups];
+  for (const [name, route] of Object.entries(policy.routes)) {
+    if (route.provider !== oneOff.provider) continue;
+    if (presetModels.get(route.preset) !== oneOff.modelId) continue;
+    groups.add(quotaGroupOf(route, name));
   }
-  return provider;
+  return [...groups];
 }
 
 /** §5.3 removed-model text patterns; `routes.*.unavailablePatterns` extends. */

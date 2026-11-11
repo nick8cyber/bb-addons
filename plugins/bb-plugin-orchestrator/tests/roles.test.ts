@@ -511,13 +511,22 @@ test("§16.7: invalid policy → root chat default is no role; pick still applie
   const badPolicy: RoleDecisionProbes = { ...noProbes, policy: () => null };
   assert.equal(decideRole(facts({ origin: "app" }), badPolicy), null);
   assert.equal(decideRole(facts({ origin: "cli" }), badPolicy), null);
-  // An explicit pending pick still wins.
+  // An explicit non-orchestrator pending pick still wins.
   assert.equal(
     decideRole(facts({ origin: "app" }), {
       ...badPolicy,
       pendingRole: (p) => (p === "proj_a" ? "executor" : undefined),
     }),
     "executor",
+  );
+  // PLUG-182: the new-chat window writes `orchestrator` itself on open —
+  // under an invalid policy that pick is the default, not a choice.
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...badPolicy,
+      pendingRole: (p) => (p === "proj_a" ? "orchestrator" : undefined),
+    }),
+    null,
   );
   // Valid policy → defaults back to orchestrator.
   const good = parsePolicy(
@@ -529,6 +538,15 @@ test("§16.7: invalid policy → root chat default is no role; pick still applie
   ).policy;
   assert.equal(
     decideRole(facts({ origin: "app" }), { ...noProbes, policy: () => good }),
+    "orchestrator",
+  );
+  // Valid policy → the window's orchestrator pick applies as before.
+  assert.equal(
+    decideRole(facts({ origin: "app" }), {
+      ...noProbes,
+      policy: () => good,
+      pendingRole: (p) => (p === "proj_a" ? "orchestrator" : undefined),
+    }),
     "orchestrator",
   );
   // tasks origin keeps its mapping under an invalid policy.

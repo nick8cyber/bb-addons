@@ -250,8 +250,8 @@ test("§16.7: invalid policy → role-less root thread gets only the setup skill
   assert.deepEqual(config.tools, []);
   assert.deepEqual(config.skills, ["orchestrator-setup"]);
   assert.equal(config.instructions, undefined);
-  // A recorded role still resolves normally — the gate only covers the
-  // role-less fallback path.
+  // §16.7 (PLUG-182): a recorded `orchestrator` role gets the same
+  // setup-only issuance — the window's pick is not a real choice.
   const withRole = buildAgentConfiguration(ctx({}), {
     ...deps,
     policyOk: false,
@@ -260,11 +260,29 @@ test("§16.7: invalid policy → role-less root thread gets only the setup skill
       roleByThreadId: () => "orchestrator",
     },
   });
-  assert.deepEqual(withRole.skills, [
-    "orchestrator-coordinator",
-    "orchestrator-setup",
-  ]);
+  assert.deepEqual(withRole.tools, []);
+  assert.deepEqual(withRole.skills, ["orchestrator-setup"]);
+  assert.equal(withRole.instructions, undefined);
   // Valid policy → full coordinator issuance as before.
   const ok = buildAgentConfiguration(ctx({}), { ...deps, policyOk: true });
   assert.equal(ok.tools.length, 3);
+});
+
+test("§16.7: the error fallback honors policyOk — coordinator gets setup only", () => {
+  // agent-config.ts fallback path: a root thread with an invalid policy
+  // must not get coordinator tools or instructions even from the
+  // static-facts path.
+  const fb = fallbackAgentConfiguration(ctx({}), true, "RULE", false);
+  assert.deepEqual(fb.tools, []);
+  assert.deepEqual(fb.skills, ["orchestrator-setup"]);
+  assert.equal(fb.instructions, undefined);
+  // A non-coordinator still gets nothing at all.
+  const fbExec = fallbackAgentConfiguration(
+    ctx({ thread: { parentThreadId: "thr_p" } }),
+    true,
+    "RULE",
+    false,
+  );
+  assert.deepEqual(fbExec.tools, []);
+  assert.deepEqual(fbExec.skills, []);
 });

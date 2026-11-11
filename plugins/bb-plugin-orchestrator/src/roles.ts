@@ -225,7 +225,17 @@ export function decideRole(
     probes.policy === undefined || probes.policy() !== null;
   if (facts.origin === "app") {
     const pending = probes.pendingRole(facts.projectId);
-    if (pending !== undefined && isRoleId(pending)) return pending;
+    // §16.7 (PLUG-182): the new-chat window writes `orchestrator` itself
+    // on open — while the policy is invalid that pick is the default, not
+    // a choice, so the thread stays role-less (setup skill only). Other
+    // picks are real choices and still apply.
+    if (
+      pending !== undefined &&
+      isRoleId(pending) &&
+      (policyOk || pending !== DEFAULT_ROLE)
+    ) {
+      return pending;
+    }
     return policyOk ? DEFAULT_ROLE : null;
   }
   // 5. cli / plugin / sdk / automations.

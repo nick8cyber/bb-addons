@@ -4,7 +4,7 @@ import {
   levelRole,
   parsePolicy,
   pickRoute,
-  quotaGroupForProvider,
+  quotaGroupsForOneOff,
 } from "../src/policy.js";
 
 const VALID = JSON.stringify({
@@ -277,8 +277,88 @@ test("§16.8: executor-level preset without a worktree warns; auditor exempt", (
   assert.equal(hits[0]!.path, "routes.nowt.preset");
 });
 
-test("quotaGroupForProvider: first same-provider route's group, else provider", () => {
-  const load = parsePolicy(VALID, presets);
-  assert.equal(quotaGroupForProvider(load.policy, "acp-opencode"), "zen");
-  assert.equal(quotaGroupForProvider(load.policy, "unknown"), "unknown");
+test("§2.3 reviewByLevel: keys must name declared executor levels", () => {
+  const bad = JSON.parse(ROLE_POLICY);
+  // Unknown key level → error.
+  bad.reviewByLevel = { ghost: "review-mid" };
+  let l2 = parsePolicy(JSON.stringify(bad), ROLE_PRESETS);
+  assert.ok(
+    l2.errors.some(
+      (e) => e.path === "reviewByLevel.ghost" && /not declared/.test(e.message),
+    ),
+  );
+  // Auditor-level key → error.
+  bad.reviewByLevel = { "review-mid": "review-complex" };
+  l2 = parsePolicy(JSON.stringify(bad), ROLE_PRESETS);
+  assert.ok(
+    l2.errors.some(
+      (e) =>
+        e.path === "reviewByLevel.review-mid" && /executor/.test(e.message),
+    ),
+  );
+  // The level named `review` (implicit auditor) as a key → error too.
+  const legacy = JSON.parse(VALID);
+  legacy.levels.review = { chain: ["simple"] };
+  legacy.reviewByLevel = { review: "review" };
+  l2 = parsePolicy(JSON.stringify(legacy), presets);
+  assert.ok(
+    l2.errors.some(
+      (e) => e.path === "reviewByLevel.review" && /executor/.test(e.message),
+    ),
+  );
+});
+
+test("§2.3 quotaGroupsForOneOff: same provider AND model, plus the one-off name", () => {
+  const policy = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: { x: { chain: ["a", "b", "c"] } },
+      routes: {
+        a: { preset: "pa", provider: "acp-opencode", quotaGroup: "g-a" },
+        b: { preset: "pb", provider: "acp-opencode" },
+        c: { preset: "pc", provider: "agy" },
+      },
+    }),
+  ).policy;
+  const models = new Map([
+    ["pa", "m1"],
+    ["pb", "m2"],
+    ["pc", "m1"],
+  ]);
+  // provider acp-opencode + model m1 → only route a's group + own name.
+  assert.deepEqual(
+    quotaGroupsForOneOff(
+      policy,
+      { route: "preset:x", provider: "acp-opencode", modelId: "m1" },
+      models,
+    ).sort(),
+    ["g-a", "preset:x"],
+  );
+  // Same provider, model m2 → route b (no quotaGroup → its name).
+  assert.deepEqual(
+    quotaGroupsForOneOff(
+      policy,
+      { route: "preset:x", provider: "acp-opencode", modelId: "m2" },
+      models,
+    ).sort(),
+    ["b", "preset:x"],
+  );
+  // Unknown model → name only, no mass hold.
+  assert.deepEqual(
+    quotaGroupsForOneOff(
+      policy,
+      { route: "preset:x", provider: "acp-opencode" },
+      models,
+    ),
+    ["preset:x"],
+  );
+  // No policy → name only.
+  assert.deepEqual(
+    quotaGroupsForOneOff(
+      null,
+      { route: "preset:x", provider: "p", modelId: "m1" },
+      models,
+    ),
+    ["preset:x"],
+  );
 });

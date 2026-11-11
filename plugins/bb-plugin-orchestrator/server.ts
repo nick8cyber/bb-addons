@@ -381,6 +381,7 @@ export async function createPlugin(
         context,
         currentSettings.injectInstructions ?? true,
         instructionsText(),
+        policyLoad.policy !== null,
       );
     }
   });
@@ -695,7 +696,10 @@ export async function createPlugin(
         const res = await delegate({ ...params, threadId: ctx.threadId });
         return JSON.stringify({
           ...res,
-          note: "Ответ исполнителя придёт сообщением — закончи ход.",
+          // §2.3 (PLUG-182): `res.note` carries the reviewByLevel mapping
+          // («review → review-medium по сложности…») — the reminder must
+          // not overwrite it.
+          reminder: "Ответ исполнителя придёт сообщением — закончи ход.",
         });
       } catch (e) {
         return JSON.stringify(errorJson(e));

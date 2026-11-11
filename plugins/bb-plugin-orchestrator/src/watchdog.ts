@@ -16,13 +16,18 @@
 import { OrchestratorError } from "./errors.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
-  quotaGroupForProvider,
   quotaGroupOf,
+  quotaGroupsForOneOff,
   type PolicyLoad,
   type PolicyRoute,
 } from "./policy.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
-import { runChecked, runJson, type BbCli } from "./bb-cli.js";
+import {
+  presetModelMap,
+  runChecked,
+  runJson,
+  type BbCli,
+} from "./bb-cli.js";
 import type { DispatchStepsResult, SetupError } from "./delegate.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
@@ -261,20 +266,32 @@ export function createWatchdog(deps: WatchdogDeps) {
   const routeInfo = async (row: DelegationRow) => {
     const load = await deps.loadPolicy();
     const route = load.policy?.routes[row.route];
-    // §2.3 r24: a `preset:` one-off is not in the policy routes — its
-    // quota group is the same-provider policy route's group, else the
-    // provider name, so a quota burn holds the provider's routes too.
-    const quotaGroup = route
-      ? quotaGroupOf(route, row.route)
-      : row.route.startsWith("preset:")
-        ? quotaGroupForProvider(load.policy, row.provider)
-        : row.route;
+    // §2.3 r24 (PLUG-182): a `preset:` one-off is not in the policy
+    // routes — a quota burn holds the quota group of every same-provider
+    // AND same-model policy route plus the one-off's own name.
+    let quotaGroups: string[];
+    if (route) {
+      quotaGroups = [quotaGroupOf(route, row.route)];
+    } else if (row.route.startsWith("preset:")) {
+      const models = await presetModelMap(deps.bbCli);
+      quotaGroups = quotaGroupsForOneOff(
+        load.policy,
+        {
+          route: row.route,
+          provider: row.provider,
+          modelId: models.get(row.preset),
+        },
+        models,
+      );
+    } else {
+      quotaGroups = [row.route];
+    }
     return {
       load,
       policy: load.policy,
       level: load.policy?.levels[row.level],
       route,
-      quotaGroup,
+      quotaGroups,
       patterns: [...BUILTIN_QUOTA_PATTERNS, ...(route?.quotaPatterns ?? [])],
       unavailablePatterns: [
         ...BUILTIN_UNAVAILABLE_PATTERNS,
@@ -406,16 +423,23 @@ export function createWatchdog(deps: WatchdogDeps) {
     let nextName: string | undefined;
     let nextRoute: PolicyRoute | undefined;
     if (info.level?.autoFallback && info.policy) {
-      // §5.4 rev 13 + §16.8: for a route in the chain the candidates are
-      // the routes AFTER the current one; for an explicit --route/--preset
-      // outside the chain (`idx === -1`) reissue starts from the chain's
-      // beginning. Only routes an auto-reissue already used are excluded
-      // (`reissue_of IS NOT NULL`), manual delegations do not count.
-      const used = store.routesUsedByTask(row.task_key);
+      // §5.4 rev 13 + §16.8/§2.3 (PLUG-182): for a natural chain route the
+      // candidates are the routes AFTER the current one (only routes an
+      // auto-reissue already used are excluded — `reissue_of IS NOT
+      // NULL`). An explicit --route/--preset delegation restarts from the
+      // chain's beginning and skips every route this task already ran on.
       const held = store.heldGroups(now());
       const unavailable = new Set(info.load.unavailableRoutes);
       const idx = info.level.chain.indexOf(row.route);
-      const candidates = idx === -1 ? info.level.chain : info.level.chain.slice(idx + 1);
+      const restart = idx === -1 || row.explicit_route !== 0;
+      const candidates = restart
+        ? info.level.chain
+        : info.level.chain.slice(idx + 1);
+      const used = restart
+        ? new Set(
+            store.delegationsByTask(row.task_key).map((r) => r.route),
+          )
+        : store.routesUsedByTask(row.task_key);
       for (const name of candidates) {
         const r = info.policy.routes[name];
         if (!r || used.has(name) || unavailable.has(name)) continue;
@@ -591,7 +615,9 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.setStatus(fresh.id, "quota"); // status first, stop second (§5.3)
     clearMarks(fresh.id);
     const info = await routeInfo(fresh);
-    store.hold(info.quotaGroup, now() + QUOTA_HOLD_MS, detail.slice(0, 200));
+    for (const group of info.quotaGroups) {
+      store.hold(group, now() + QUOTA_HOLD_MS, detail.slice(0, 200));
+    }
     await afterOutcomeStatus(fresh, "quota", detail);
   };
 

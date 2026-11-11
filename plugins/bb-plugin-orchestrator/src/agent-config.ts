@@ -158,8 +158,10 @@ export function buildAgentConfiguration(
     return config;
   }
 
-  // §16.7 r25: policy invalid + no decided role → setup skill only.
-  if (deps.policyOk === false && roleId === undefined) {
+  // §16.7 r25 (PLUG-182): policy invalid + a coordinator (a role-less
+  // root thread OR a recorded `orchestrator` role — the new-chat window
+  // writes that pick itself) → setup skill only, no tools or texts.
+  if (deps.policyOk === false) {
     return { tools: [], skills: [SKILL_SETUP] };
   }
 
@@ -189,6 +191,8 @@ export function fallbackAgentConfiguration(
   context: PluginAgentConfigurationContext,
   injectInstructions: boolean,
   instructionsText: string,
+  /** §16.7: `false` → a coordinator gets the setup skill only. */
+  policyOk: boolean = true,
 ): PluginAgentConfiguration {
   const coordinator = isCoordinatorByStaticFacts({
     threadId: context.thread.id,
@@ -198,6 +202,7 @@ export function fallbackAgentConfiguration(
     projectId: context.project.id,
   });
   if (!coordinator) return { tools: [], skills: [] };
+  if (!policyOk) return { tools: [], skills: [SKILL_SETUP] };
   const config: PluginAgentConfiguration = {
     tools: [...COORDINATOR_TOOLS],
     skills: injectInstructions

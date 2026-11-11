@@ -20,8 +20,9 @@ import {
 } from "./instructions.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
+  levelRole,
   pickRoute,
-  quotaGroupForProvider,
+  quotaGroupsForOneOff,
   type Policy,
   type PolicyLoad,
   type PolicyRoute,
@@ -29,7 +30,12 @@ import {
 import type { DelegationRow, DelegationStore } from "./store.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
 import { roleForLevel } from "./roles.js";
-import { runChecked, runJson, type BbCli } from "./bb-cli.js";
+import {
+  presetModelMap,
+  runChecked,
+  runJson,
+  type BbCli,
+} from "./bb-cli.js";
 
 export interface SetupError {
   step: string;
@@ -196,13 +202,17 @@ export async function runDelegate(
     !params.route &&
     !params.preset
   ) {
+    // §2.3 (PLUG-182): the LATEST executor-role delegation decides —
+    // mapped or not; a level missing from the map falls back to `review`.
     const latestExec = store
       .delegationsByTask(taskKey)
-      .find((r) => policy.reviewByLevel![r.level] !== undefined);
+      .find((r) => levelRole(policy, r.level) === "executor");
     if (latestExec) {
-      const mapped = policy.reviewByLevel[latestExec.level]!;
-      levelNote =
-        `review → ${mapped} по сложности исполнения ${latestExec.level}`;
+      const mapped = policy.reviewByLevel[latestExec.level] ?? "review";
+      if (mapped !== "review") {
+        levelNote =
+          `review → ${mapped} по сложности исполнения ${latestExec.level}`;
+      }
       level = mapped;
     }
   }
@@ -212,10 +222,12 @@ export async function runDelegate(
   let route: PolicyRoute;
   if (params.preset) {
     // §2.3: a one-off preset dispatches outside the policy routes —
-    // provider comes from the preset itself, and its quota group is the
-    // first policy route's group on the same provider (else the provider
-    // name), so a burned preset closes its same-provider routes too.
-    const show = await runJson<{ preset?: { providerId?: string } }>(
+    // provider and model come from the preset itself, and its quota is
+    // shared with every policy route on the same provider AND model
+    // (PLUG-182), so a burned preset closes only those.
+    const show = await runJson<{
+      preset?: { providerId?: string; modelId?: string | null };
+    }>(
       bbCli,
       ["tasks", "preset", "show", params.preset, "--json"],
     ).catch((e) => {
@@ -232,19 +244,25 @@ export async function runDelegate(
       );
     }
     routeName = `preset:${params.preset}`;
-    route = {
-      preset: params.preset,
-      provider,
-      quotaGroup: quotaGroupForProvider(policy, provider),
-    };
-    const group = route.quotaGroup!;
-    if (held.has(group) || held.has(routeName)) {
+    const presetModels = await presetModelMap(bbCli);
+    const groups = quotaGroupsForOneOff(
+      policy,
+      {
+        route: routeName,
+        provider,
+        modelId: show.preset?.modelId ?? presetModels.get(params.preset),
+      },
+      presetModels,
+    );
+    const blocked = groups.find((g) => held.has(g));
+    if (blocked) {
       throw new OrchestratorError(
         "route-held",
-        `provider quota group "${group}" is on hold`,
+        `provider quota group "${blocked}" is on hold`,
         "wait for the hold to expire or pick a preset on another provider",
       );
     }
+    route = { preset: params.preset, provider };
   } else {
     const picked = pickRoute(policy, level, {
       requested: params.route,
@@ -309,6 +327,7 @@ export async function runDelegate(
       provider: route.provider,
       round,
       continueFrom,
+      explicitRoute: params.route !== undefined || params.preset !== undefined,
     });
   } catch (e) {
     if (

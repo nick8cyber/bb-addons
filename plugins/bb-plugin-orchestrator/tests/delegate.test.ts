@@ -713,6 +713,7 @@ test("§2.3 --route outside the level chain dispatches that route", async () => 
   assert.equal(row.route, "simple");
   assert.equal(row.preset, "simple");
   assert.equal(row.level, "complex");
+  assert.equal(row.explicit_route, 1, "explicit --route marks the row");
 });
 
 test("§2.3 --route and --preset are mutually exclusive", async () => {
@@ -795,11 +796,32 @@ test("§2.3 --preset: unknown preset refused before any dispatch", async () => {
   );
 });
 
-test("§2.3 --preset: derived provider quota group honors holds", async () => {
-  // "complex" route has provider acp-devin and no quotaGroup → group
-  // name "complex"; a held group refuses the one-off preset on it.
+test("§2.3 --preset: held group of a same-provider+model route refuses it", async () => {
+  // "complex" (acp-devin, model m1) shares the one-off's provider AND
+  // model → its group joins the one-off's holds; "complex" held → refuse.
   const { deps } = makeDeps({
     held: [["complex", Date.now() + 60_000]],
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: { providerId: "acp-devin", modelId: "m1" },
+          }),
+        );
+      if (key.startsWith("tasks preset list"))
+        return ok(
+          JSON.stringify({
+            presets: [
+              { name: "one-off", providerId: "acp-devin", modelId: "m1" },
+              { name: "complex", providerId: "acp-devin", modelId: "m1" },
+              { name: "complex-alt", providerId: "agy", modelId: "m2" },
+              { name: "simple", providerId: "acp-opencode", modelId: "m3" },
+            ],
+          }),
+        );
+      return ok();
+    },
   });
   await assert.rejects(
     runDelegate(
@@ -813,6 +835,48 @@ test("§2.3 --preset: derived provider quota group honors holds", async () => {
     ),
     (e: unknown) => (e as OrchestratorError).code === "route-held",
   );
+});
+
+test("§2.3 --preset: a same-provider route on ANOTHER model stays open", async () => {
+  // Same scenario but the one-off runs model m9 — "complex" (m1) is a
+  // different quota pool, so its hold does not block the dispatch.
+  const { deps, store } = makeDeps({
+    held: [["complex", Date.now() + 60_000]],
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: { providerId: "acp-devin", modelId: "m9" },
+          }),
+        );
+      if (key.startsWith("tasks preset list"))
+        return ok(
+          JSON.stringify({
+            presets: [
+              { name: "one-off", providerId: "acp-devin", modelId: "m9" },
+              { name: "complex", providerId: "acp-devin", modelId: "m1" },
+            ],
+          }),
+        );
+      if (key.startsWith("tasks dispatch"))
+        return ok(JSON.stringify({ task: { id: "t1" }, threadId: "thr_p" }));
+      if (key.startsWith("thread options"))
+        return ok(JSON.stringify({ options: [] }));
+      return ok();
+    },
+  });
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "complex",
+      preset: "one-off",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.route, "preset:one-off");
+  assert.equal(store.listActive()[0]!.route, "preset:one-off");
 });
 
 const REVIEW_POLICY = (() => {
@@ -854,6 +918,65 @@ test("§2.3 reviewByLevel: bare --level review maps to the executor's auditor le
   );
   // The auditor level binds the auditor role.
   assert.equal(store.threadRole("thr_exec")?.role, "auditor");
+});
+
+test("§2.3 reviewByLevel: executor level missing from the map → stays review", async () => {
+  // PLUG-182: the LATEST executor delegation decides — `complex` is not
+  // in the map, so the review stays on `review`, not the older match.
+  const { deps, store } = makeDeps({ policyText: REVIEW_POLICY });
+  for (const lvl of ["simple", "complex"]) {
+    const row = store.insert({
+      taskKey: "PLUG-1",
+      projectId: "proj_main",
+      coordinatorThreadId: "thr_coord",
+      level: lvl,
+      route: "simple",
+      preset: "simple",
+      provider: "acp-opencode",
+    });
+    store.setStatus(row.id, "done");
+  }
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "review", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.level, "review");
+  assert.equal(res.note, undefined);
+});
+
+test("§2.3 reviewByLevel: a newer auditor delegation does not hide the executor", async () => {
+  // The map looks at the latest EXECUTOR delegation — an auditor
+  // delegation in between does not change the mapped level.
+  const { deps, store } = makeDeps({ policyText: REVIEW_POLICY });
+  const exec = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "acp-opencode",
+  });
+  store.setStatus(exec.id, "done");
+  const audit = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review-mid",
+    route: "simple",
+    preset: "simple",
+    provider: "acp-opencode",
+  });
+  store.setStatus(audit.id, "done");
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "review", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.level, "review-mid");
+  assert.match(
+    res.note ?? "",
+    /review → review-mid по сложности исполнения simple/,
+  );
 });
 
 test("§2.3 reviewByLevel: --route/--preset keep the caller's level (no mapping)", async () => {
