@@ -6,7 +6,9 @@ plus a provider bridge, the same shape `provider-claude-code` and
 
 Since 2026-11-10 the default transport is **`agy acp`** through the SDK's
 `experimental_acpProviderBridge` wrapped by `src/acp-wrapper.ts` (account pool,
-quota rotation, session persistence, usage side-channel via `src/acp-shim.mjs`).
+quota rotation, session persistence, usage side-channel via `src/acp-shim.mjs`,
+which also drops the `session/load` history replay before the live prompt's
+user-message echo).
 ACP delivers live reasoning, tool-call args/output and per-turn usage; bb
 plugin tools reach the agent through the generic bridge's MCP proxy
 (`mcp/bb-bridge/*.json` under the account's gemini dir). Declared permission
