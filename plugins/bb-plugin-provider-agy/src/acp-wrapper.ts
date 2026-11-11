@@ -223,6 +223,7 @@ interface ShimEvent {
   t: string;
   sessionId?: string | null;
   usage?: AcpUsage | null;
+  toolCalls?: number;
   error?: { code: number | null; message: string } | null;
   text?: string;
 }
@@ -293,7 +294,7 @@ function handleShimEvent(event: ShimEvent): void {
         session.armedError = { message, atMs: Date.now(), handled: false };
       }
       if (event.usage) {
-        emitUsage(session, event.usage);
+        emitUsage(session, event.usage, event.toolCalls ?? 0);
       }
       return;
     }
@@ -327,7 +328,7 @@ function handleShimEvent(event: ShimEvent): void {
   }
 }
 
-function emitUsage(session: WSession, usage: AcpUsage): void {
+function emitUsage(session: WSession, usage: AcpUsage, toolCalls = 0): void {
   const last = acpUsageToBreakdown(usage);
   const total: TokenBreakdown = {
     totalTokens: session.usageTotal.totalTokens + last.totalTokens,
@@ -348,11 +349,17 @@ function emitUsage(session: WSession, usage: AcpUsage): void {
   });
   // The thread's context meter needs a contextWindow delta, not just the
   // usage row — without it bb shows "Context usage is not available yet".
-  // agy reports only per-turn usage; `used` is the turn's whole fed input
-  // (fresh + cache-read, same formula the stream-json bridge used for the
-  // last step's occupancy) — coarse for multi-call turns, honest-estimated.
-  const usedTokens =
-    (usage.inputTokens ?? 0) + (usage.cachedReadTokens ?? 0);
+  // agy's result.usage aggregates EVERY model call of the turn: each call
+  // re-reads ~the whole cached prefix, so input+cachedRead of a multi-step
+  // turn is N× the real window (a 15-call turn read "3m / 1m"). Estimate the
+  // live edge as per-call average input + the turn's generated tokens:
+  // used ≈ (input + cachedRead)/steps + output + thought.
+  const steps = 1 + Math.max(0, toolCalls);
+  const usedTokens = Math.round(
+    ((usage.inputTokens ?? 0) + (usage.cachedReadTokens ?? 0)) / steps +
+      (usage.outputTokens ?? 0) +
+      (usage.thoughtTokens ?? 0),
+  );
   emitDeltas(session.threadId, {
     kind: "contextWindow",
     attach: "currentOrLast",

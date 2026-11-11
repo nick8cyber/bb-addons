@@ -113,6 +113,14 @@ let userEchoSeen = false; // positional boundary mode: a user chunk has arrived 
 let shortTailMode = false; // prompt tail too short for content matching (<16 chars)
 let replayFallbackTimer = null; // bounds the damage if no user echo ever arrives
 let replayDeadline = 0; // hard ceiling: a live turn's chunks are drops too, so
+// Live tool_call counts per in-flight prompt — agy's result.usage aggregates
+// every model call of the turn, so the wrapper needs the step count to
+// estimate the real context size (each call re-reads ~the whole cached
+// prefix). Keyed by request id, NOT a single counter: a queued follow-up
+// prompt (artifact nudge) can reach the wire before the previous result, and
+// a naive reset would zero the previous turn's count mid-flight.
+const promptToolCalls = new Map();
+let activePromptId = null;
 // activity alone must not keep the gate shut forever.
 // A missed boundary must not eat a live turn: if the echo never comes, stop
 // suppressing once the stream goes quiet, and never past REPLAY_DEADLINE_MS.
@@ -274,6 +282,8 @@ rlIn.on("line", (line) => {
           promptTailNorm = promptTextTail(msg.params);
           boundaryArmed = true;
           echoBuf = "";
+          promptToolCalls.set(msg.id, 0);
+          activePromptId = msg.id;
           userEchoSeen = false;
           // A tiny prompt ("ok", "yes") can never satisfy the content match —
           // any same word in old history would also match. Fall back to the
@@ -323,9 +333,15 @@ rlOut.on("line", (line) => {
             emitEvent({
               t: "prompt-result",
               sessionId: req.sessionId ?? sessionId,
+              toolCalls: promptToolCalls.get(msg.id) ?? 0,
               usage: msg.result?.usage ?? null,
               error: msg.error ? { code: msg.error.code ?? null, message: msg.error.message ?? String(msg.error) } : null,
             });
+            promptToolCalls.delete(msg.id);
+            if (activePromptId === msg.id) {
+              const keys = [...promptToolCalls.keys()];
+              activePromptId = keys.length === 0 ? null : keys[keys.length - 1];
+            }
           } else if (
             req.method === "session/new" ||
             req.method === "session/load" ||
@@ -380,6 +396,9 @@ rlOut.on("line", (line) => {
               if (boundaryArmed) armReplayFallback(); // still replaying: keep the gate shut
               return; // replayed history: swallowed, never reaches the bridge
             }
+          }
+          if (kind === "tool_call" && activePromptId !== null && promptToolCalls.has(activePromptId)) {
+            promptToolCalls.set(activePromptId, promptToolCalls.get(activePromptId) + 1);
           }
           if (update?.sessionUpdate === "tool_call_update") {
             const texts = [];

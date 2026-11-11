@@ -128,7 +128,7 @@ check("pool/first-spawn-account", news("a1").length === 1 && prompts("a1").lengt
 check("pool/args-gemini-dir", transcriptLines().some((l) => l.method === "session/new"), "");
 check("pool/sticky-ledger", ledger().conversations[t1Ptid] === "a1", JSON.stringify(ledger().conversations));
 check("pool/usage-delta", usages("t1").length === 1 && usages("t1")[0].last.totalTokens > 0, JSON.stringify(usages("t1").map((u) => u.last.totalTokens)));
-check("pool/context-window-delta", cws("t1").length === 1 && cws("t1")[0].used === 140 && cws("t1")[0].estimated === true, JSON.stringify(cws("t1")));
+check("pool/context-window-delta", cws("t1").length === 1 && cws("t1")[0].used === 155 && cws("t1")[0].estimated === true, JSON.stringify(cws("t1")));
 
 // --- scenario 2: quota rotation with handoff ------------------------------
 turn(3, "t1", "[[quota]] continue the work");
@@ -195,6 +195,19 @@ setControl({ compactMode: "ok" });
 turn(30, "t2", "[[artifact]] write the file");
 await waitFor(() => prompts("a4").filter((p) => ptxt(p).includes("ArtifactMetadata")).length >= 1, 30000, "nudge turn");
 check("artifact/nudge-turn", true, "");
+// The artifact turn ran a tool call → the meter must be step-normalized, not
+// the raw aggregate (regression: a busy turn read "3m / 1m"). t2's usage
+// deltas are [handoff, summary, seed, artifact, nudge] — the artifact turn
+// is .at(-2). The nudge turn's own delta traffic drains the two last shim
+// events, so wait for all five before indexing.
+await waitFor(() => cws("t2").length >= 5, 20000, "artifact+nudge cw deltas");
+{
+  const l = usages("t2").at(-2)?.last;
+  const cw = cws("t2").at(-2);
+  const want = l ? Math.round((l.inputTokens + l.cachedInputTokens) / 2 + l.outputTokens + l.reasoningOutputTokens) : -1;
+  check("pool/context-window-steps", cw?.used === want && cw?.used < (l?.inputTokens ?? 0) + (l?.cachedInputTokens ?? 0),
+    `used=${cw?.used} want=${want} us=${JSON.stringify(usages("t2").map((u) => u.last?.inputTokens))} cws=${JSON.stringify(cws("t2").map((c) => c.used))}`);
+}
 
 // --- scenario 8: hanging interaction resolved on release -------------------
 // Under "full" the bridge auto-allows; a runtime request needs accept-edits.
