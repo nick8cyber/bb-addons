@@ -59,6 +59,10 @@ import type { WatchdogThreadEvent } from "./watchdog.js";
 const AUDIT_LEVEL = "release-audit";
 const TOKEN_TTL_MS = 5 * 60 * 1000;
 const CHECK_TIMEOUT_MS = 10 * 60 * 1000;
+/** §17.3: how long a release row may sit in `auditing` without its
+ * audit delegation before the pump calls it dead (sync + checks +
+ * dispatch window, with margin). */
+const PREPARE_TIMEOUT_MS = 20 * 60 * 1000;
 const PACKET_DIFF_CAP = 200_000;
 const ZERO_SHA = "0000000000000000000000000000000000000000";
 
@@ -282,43 +286,44 @@ async function acceptTask(
   if (!executor) missing.push("нет делегирования в статусе done");
 
   // §17.3 (Б4): the review gate is bound to the published sha — a
-  // merged result needs an OK review on its `merged_sha`, a plain
-  // executor result on its `result_sha` («Проверяемый итог: коммит
-  // <sha>» rides in the review's `continue_from`). A review of an older
-  // round never counts for what is being published now.
+  // plain executor result needs an OK review on its `result_sha`
+  // («Проверяемый итог: коммит <sha>» rides in the review's
+  // `continue_from`). A merged result's gate needs the branch tip, so
+  // it lives in `reviewGate` at the start of the pipeline (tip review OR
+  // per-delegation `merged_sha` reviews, §17.3 по ревью PLUG-210).
   const requiredSha = executor
     ? executor.merge_status === "merged"
       ? executor.merged_sha
       : executor.result_sha
     : null;
-  const review = requiredSha
-    ? deps.store
-        .delegationsByTask(key)
-        .find(
-          (d) =>
-            roleOf(d.level) === "auditor" && d.continue_from === requiredSha,
-        )
-    : undefined;
   if (executor && !requiredSha) {
     missing.push(
       "итог делегирования без зафиксированного sha — ревью не привязать",
     );
-  } else if (requiredSha && !review) {
-    missing.push(
-      `нет ревью аудиторского уровня на публикуемый итог ` +
-        `${requiredSha.slice(0, 7)}`,
-    );
-  } else if (review && review.status !== "done") {
-    missing.push(
-      `ревью на ${requiredSha!.slice(0, 7)} (уровень ${review.level}) ` +
-        `в статусе ${review.status}`,
-    );
-  } else if (review) {
-    const v = await reviewVerdict(deps, show, review);
-    if (v === "missing") {
-      missing.push("вердикт ревью не найден ни в комментариях, ни в итоге треда");
-    } else if (v === "not-ok") {
-      missing.push("последнее ревью — вердикт не «OK» (§16.7 JSON)");
+  } else if (executor && executor.merge_status !== "merged") {
+    const review = deps.store
+      .delegationsByTask(key)
+      .find(
+        (d) =>
+          roleOf(d.level) === "auditor" && d.continue_from === requiredSha,
+      );
+    if (!review) {
+      missing.push(
+        `нет ревью аудиторского уровня на публикуемый итог ` +
+          `${requiredSha!.slice(0, 7)}`,
+      );
+    } else if (review.status !== "done") {
+      missing.push(
+        `ревью на ${requiredSha!.slice(0, 7)} (уровень ${review.level}) ` +
+          `в статусе ${review.status}`,
+      );
+    } else {
+      const v = await reviewVerdict(deps, show, review);
+      if (v === "missing") {
+        missing.push("вердикт ревью не найден ни в комментариях, ни в итоге треда");
+      } else if (v === "not-ok") {
+        missing.push("последнее ревью — вердикт не «OK» (§16.7 JSON)");
+      }
     }
   }
 
@@ -727,13 +732,17 @@ function assertInstalledHookFresh(deps: ReleaseDeps): void {
   const dir = deps.hooksDir();
   const names = standardHookNames();
   const stale: string[] = [];
+  const missing: string[] = [];
+  let present = 0;
   for (const name of names) {
     let installed: Buffer;
     try {
       installed = readFileSync(join(dir, name));
     } catch {
-      continue; // absent name — not installed, nothing to compare
+      missing.push(name);
+      continue;
     }
+    present++;
     let current: Buffer;
     try {
       current = readFileSync(
@@ -744,15 +753,24 @@ function assertInstalledHookFresh(deps: ReleaseDeps): void {
     }
     if (!installed.equals(current)) stale.push(name);
   }
-  if (stale.length) {
+  // §17.3 (ревью PLUG-210): a partial install (e.g. a pre-r26 one with
+  // `pre-push` only) leaves every OTHER local hook dead — that is a
+  // stale install, not «guard absent».
+  const problems = [
+    ...stale,
+    ...(present > 0 && missing.length
+      ? [`нет обёрток: ${missing.join(", ")}`]
+      : []),
+  ];
+  if (problems.length) {
     throw new OrchestratorError(
       "hook-stale",
-      `установленные общие хуки устарели (${stale.join(", ")}) — ` +
-        "версия плагина новее",
+      `установленные общие хуки устарели или неполные ` +
+        `(${problems.join(", ")})`,
       `переустановите хуки: node ${join(
         PLUGIN_HOOKS_DIR,
         "install.mjs",
-      )}`,
+      )} --hooks-dir ${deps.hooksDir()}`,
     );
   }
 }
@@ -1025,6 +1043,264 @@ export async function runRelease(
   }
 }
 
+// ── Step 1 (продолжение): гейт ревью по публикуемым SHA (§17.3) ──────
+
+async function shaExists(
+  deps: ReleaseDeps,
+  repo: string,
+  sha: string,
+): Promise<boolean> {
+  const res = await deps.cmd.run("git", ["-C", repo, "cat-file", "-e", sha], {
+    timeoutMs: 30_000,
+  });
+  return res.exitCode === 0;
+}
+
+async function isAncestor(
+  deps: ReleaseDeps,
+  repo: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
+  const res = await deps.cmd.run(
+    "git",
+    ["-C", repo, "merge-base", "--is-ancestor", ancestor, descendant],
+    { timeoutMs: 30_000 },
+  );
+  return res.exitCode === 0;
+}
+
+/** Verdict of the review bound to `sha` under `taskKey` (§16.7). */
+async function okReviewOn(
+  deps: ReleaseDeps,
+  policy: Policy,
+  taskKey: string,
+  sha: string,
+): Promise<DelegationRow | undefined> {
+  const review = deps.store
+    .delegationsByTask(taskKey)
+    .find(
+      (d) =>
+        levelRole(policy, d.level) === "auditor" &&
+        d.status === "done" &&
+        d.continue_from === sha,
+    );
+  if (!review) return undefined;
+  const show = await runJson<TaskShow>(deps.bbCli, [
+    "tasks",
+    "show",
+    taskKey,
+    "--json",
+  ]).catch(() => ({ comments: [] }) as TaskShow);
+  return (await reviewVerdict(deps, show, review)) === "ok"
+    ? review
+    : undefined;
+}
+
+/**
+ * §17.3 (Б4, по ревью PLUG-210): the review gate is part of step 1 —
+ * it runs BEFORE the pipeline mutates the branch (sync merge, checks,
+ * docs trailer), so a refusal costs seconds, not a full check run.
+ *
+ * Executor branch: the tip must equal the reviewed `result_sha` modulo
+ * the pipeline's own commits (a retry after a mid-run refusal has the
+ * sync merge / docs trailer of the failed run on top — recorded in
+ * `releases.pipeline_shas`, not foreign work).
+ *
+ * `merged_into` branch: an OK review on the TIP covers everything under
+ * it (coordinator commits included — documents are the coordinator's
+ * per release §1). Without one, every merged delegation whose
+ * `merged_sha` sits on the tip but not on a published ref needs an OK
+ * review on that `merged_sha`, and no commit may remain unexplained.
+ */
+async function reviewGate(
+  deps: ReleaseDeps,
+  ctx: {
+    taskKey: string;
+    executor: DelegationRow;
+    project: ResolvedProject;
+    repo: string;
+    branch: string;
+    tipSha: string;
+    policy: Policy;
+  },
+): Promise<void> {
+  const { taskKey, executor, project, repo, branch, tipSha, policy } = ctx;
+  const pipeline = deps.store.pipelineShasForRepo(repo);
+
+  if (executor.merge_status !== "merged") {
+    const need = executor.result_sha!;
+    if (!(await shaExists(deps, repo, need))) {
+      throw new OrchestratorError(
+        "release-refused",
+        `release ${taskKey}: итог делегирования ${need.slice(0, 7)} ` +
+          `отсутствует в копии ${repo}`,
+      );
+    }
+    const extra = (await git(deps, repo, ["rev-list", `${need}..${tipSha}`]))
+      .split("\n")
+      .filter(Boolean)
+      .filter((s) => !pipeline.has(s));
+    if (extra.length) {
+      throw new OrchestratorError(
+        "unreviewed-commits",
+        `release ${taskKey}: ветка ${branch} содержит коммиты сверх ` +
+          `проверенного итога ${need.slice(0, 7)}: ` +
+          extra.map((s) => s.slice(0, 7)).join(", "),
+        "верните ветку к result_sha или раздайте ревью на новый итог",
+      );
+    }
+    return;
+  }
+
+  // merged_into: an OK review on the tip covers everything below it.
+  const tipReview = deps.store
+    .delegationsByContinueFrom(tipSha)
+    .find(
+      (d) =>
+        levelRole(policy, d.level) === "auditor" && d.status === "done",
+    );
+  if (tipReview) {
+    const tShow = await runJson<TaskShow>(deps.bbCli, [
+      "tasks",
+      "show",
+      tipReview.task_key,
+      "--json",
+    ]).catch(() => ({ comments: [] }) as TaskShow);
+    if ((await reviewVerdict(deps, tShow, tipReview)) === "ok") return;
+  }
+
+  // «Опубликовано» — reachable from the remote target or from a tip a
+  // past release already pushed (`--not` refs; missing objects skipped).
+  const notRefs: string[] = [];
+  const target = `origin/${project.target.branch}`;
+  if (await gitRefExists(deps, repo, target)) notRefs.push(target);
+  for (const sha of deps.store.publishedShasForRepo(repo)) {
+    if (await shaExists(deps, repo, sha)) notRefs.push(sha);
+  }
+
+  // Recorded merges that still need a review: the merge commit is on
+  // the published tip AND unreachable from the published refs. A
+  // recorded `merged_sha` absent from the copy is a clear refusal, not
+  // a bare `rev-list` error.
+  const unpublished: DelegationRow[] = [];
+  for (const row of deps.store.mergedDelegationsInto(branch)) {
+    if (!row.merged_sha) continue;
+    if (!(await shaExists(deps, repo, row.merged_sha))) {
+      throw new OrchestratorError(
+        "release-refused",
+        `release ${taskKey}: коммит слияния ` +
+          `${row.merged_sha.slice(0, 7)} (${row.task_key}) отсутствует ` +
+          `в копии ${repo}`,
+        "восстановите коммит слияния или поправьте запись merge",
+      );
+    }
+    if (!(await isAncestor(deps, repo, row.merged_sha, tipSha))) continue;
+    if (notRefs.length) {
+      const covered = await deps.cmd.run(
+        "git",
+        [
+          "-C",
+          repo,
+          "rev-list",
+          "--count",
+          row.merged_sha,
+          "--not",
+          ...notRefs,
+        ],
+        { timeoutMs: 60_000 },
+      );
+      if (covered.exitCode === 0 && Number(covered.stdout.trim()) === 0) {
+        continue; // already on a published ref
+      }
+    }
+    unpublished.push(row);
+  }
+
+  // Every commit in the publish range must be explained: reachable from
+  // neither the published refs nor an unpublished merge — and not one
+  // of the pipeline's own recorded commits.
+  const foreign = (
+    await git(deps, repo, [
+      "rev-list",
+      tipSha,
+      "--not",
+      ...notRefs,
+      ...unpublished.map((r) => r.merged_sha!),
+    ])
+  )
+    .split("\n")
+    .filter(Boolean)
+    .filter((s) => !pipeline.has(s));
+  if (foreign.length) {
+    throw new OrchestratorError(
+      "unreviewed-commits",
+      `release ${taskKey}: в диапазоне ${branch} коммиты без влитого ` +
+        `делегирования: ${foreign.map((s) => s.slice(0, 7)).join(", ")}`,
+      `ревью всей вершины покрывает их: bb orchestrator delegate ` +
+        `${taskKey} --level <уровень аудита> --from ${tipSha}`,
+    );
+  }
+
+  for (const row of unpublished) {
+    const label = `${row.task_key} → ${row.merged_sha!.slice(0, 7)}`;
+    const hint =
+      `раздайте ревью на влитый итог: bb orchestrator delegate ` +
+      `${row.task_key} --level <уровень аудита> --from ${row.merged_sha}`;
+    const rReview = deps.store
+      .delegationsByTask(row.task_key)
+      .find(
+        (d) =>
+          levelRole(policy, d.level) === "auditor" &&
+          d.continue_from === row.merged_sha,
+      );
+    if (!rReview) {
+      throw new OrchestratorError(
+        "unreviewed-commits",
+        `release ${taskKey}: нет ревью на влитый итог ${label}`,
+        hint,
+      );
+    }
+    if (rReview.status !== "done") {
+      throw new OrchestratorError(
+        "unreviewed-commits",
+        `release ${taskKey}: ревью на ${label} в статусе ${rReview.status}`,
+        hint,
+      );
+    }
+    const rShow = await runJson<TaskShow>(deps.bbCli, [
+      "tasks",
+      "show",
+      row.task_key,
+      "--json",
+    ]).catch(() => ({ comments: [] }) as TaskShow);
+    const v = await reviewVerdict(deps, rShow, rReview);
+    if (v !== "ok") {
+      throw new OrchestratorError(
+        "unreviewed-commits",
+        `release ${taskKey}: вердикт ревью на ${label} ` +
+          (v === "missing" ? "не найден" : "не «OK»"),
+        hint,
+      );
+    }
+  }
+}
+
+/** §17.3: the commits the pipeline created since `fromSha` land in the
+ * release row — the next run's gate must not call them foreign
+ * (ревью PLUG-210 Б1: a retry after a post-sync refusal must pass). */
+async function recordPipelineShas(
+  deps: ReleaseDeps,
+  repo: string,
+  releaseId: number,
+  fromSha: string,
+): Promise<void> {
+  const shas = (await git(deps, repo, ["rev-list", `${fromSha}..HEAD`]))
+    .split("\n")
+    .filter(Boolean);
+  deps.store.addReleasePipelineShas(releaseId, shas);
+}
+
 // ── Steps 2–5: sync → checks → scan → audit dispatch ──────────────────
 
 async function runReleaseSteps(
@@ -1043,168 +1319,25 @@ async function runReleaseSteps(
 ): Promise<ReleaseResult> {
   const { taskKey, title, executor, project, repo, branch, policyLoad } = ctx;
 
-  // Step 2 — sync по режиму проекта.
-  // §16.6 (PLUG-194): a §14-merged result is synced by MERGE only —
-  // `git rebase` flattens merge commits, silently dropping the
-  // conflict-resolution edits that exist only in them.
-  // §17.3 (Б4): the tip BEFORE sync — the unreviewed-commits gate
-  // excludes the pipeline's own sync merge and docs-trailer amend.
+  // Step 1 (продолжение приёмки) — гейт ревью по публикуемым SHA до
+  // действий конвейера (§17.3, ревью PLUG-210 Б1/Б4): свежие refs origin
+  // нужны для сверки «опубликовано», а отказ обходится секундами, а не
+  // полным прогоном sync + проверок.
+  await git(deps, repo, ["fetch", "origin"], { timeoutMs: 180_000 });
   const preSyncSha = await git(deps, repo, ["rev-parse", "HEAD"]);
-  const { baseSha, remoteBaseSha } = await syncBranch(
-    deps,
+  await reviewGate(deps, {
+    taskKey,
+    executor,
+    project,
     repo,
     branch,
-    executor.merge_status === "merged"
-      ? { ...project, sync: "merge" }
-      : project,
-  );
-
-  // Step 3 — проверки проекта.
-  await runProjectChecks(deps, repo, project.checks);
-
-  // §3 --no-docs → Docs-not-needed trailer (before sha capture).
-  if (input.noDocs) {
-    await applyDocsTrailer(deps, repo, input.noDocs);
-  }
-  const headSha = await git(deps, repo, ["rev-parse", "HEAD"]);
-
-  // Step 4 — машинный скан категорий 1–4.
-  // §16.6 (PLUG-189): --no-color/--no-ext-diff — a `color.ui=always`
-  // config or an external diff driver would silently break the parser.
-  const commits = await commitRange(deps, repo, baseSha, headSha);
-  // §17.3 (Б4): a merged result's range holds the merge commits of every
-  // task merged into this branch — each needs an OK review bound to its
-  // own `merged_sha`, and every commit without a matching merge record
-  // is an «unreviewed-commits» refusal (coordinator work must not ride
-  // the release unnoticed).
-  if (executor.merge_status === "merged") {
-    const mergedRows = deps.store.mergedDelegationsInto(branch);
-    const mergedBySha = new Map(
-      mergedRows.filter((r) => r.merged_sha).map((r) => [r.merged_sha!, r]),
-    );
-    // The pipeline's own commits on top of the pre-sync tip (the sync
-    // merge, a docs-trailer amend) are not reviewable work.
-    const pipeline = new Set(
-      (
-        await git(deps, repo, ["rev-list", `${preSyncSha}..${headSha}`])
-      )
-        .split("\n")
-        .filter(Boolean),
-    );
-    // Commits the range must explain: everything on the branch that is
-    // not on the remote base AND not reachable from a recorded
-    // merged_sha (the merge's second-parent history is part of that
-    // delegation's reviewed result), minus the pipeline's own commits.
-    const mergedShaList = [...mergedBySha.keys()];
-    const unreviewed = mergedShaList.length
-      ? (
-          await git(deps, repo, [
-            "rev-list",
-            headSha,
-            "--not",
-            baseSha,
-            ...mergedShaList,
-          ])
-        )
-          .split("\n")
-          .filter(Boolean)
-          .filter((sha) => !pipeline.has(sha))
-      : commits.map((c) => c.sha).filter((sha) => !pipeline.has(sha));
-    if (unreviewed.length) {
-      throw new OrchestratorError(
-        "unreviewed-commits",
-        `release ${taskKey}: в диапазоне ${branch} коммиты без влитого ` +
-          `делегирования: ${unreviewed.map((s) => s.slice(0, 7)).join(", ")}`,
-      );
-    }
-    const policy = policyLoad.policy;
-    for (const [mergedSha, row] of mergedBySha) {
-      const rReview = deps.store
-        .delegationsByTask(row.task_key)
-        .find(
-          (d) =>
-            levelRole(policy, d.level) === "auditor" &&
-            d.continue_from === mergedSha,
-        );
-      const label = `${row.task_key} → ${mergedSha.slice(0, 7)}`;
-      if (!rReview) {
-        throw new OrchestratorError(
-          "release-refused",
-          `release ${taskKey}: нет ревью на влитый итог ${label}`,
-        );
-      }
-      if (rReview.status !== "done") {
-        throw new OrchestratorError(
-          "release-refused",
-          `release ${taskKey}: ревью на ${label} в статусе ${rReview.status}`,
-        );
-      }
-      const rShow = await runJson<TaskShow>(deps.bbCli, [
-        "tasks",
-        "show",
-        row.task_key,
-        "--json",
-      ]).catch(() => ({ comments: [] }) as TaskShow);
-      const v = await reviewVerdict(deps, rShow, rReview);
-      if (v !== "ok") {
-        throw new OrchestratorError(
-          "release-refused",
-          `release ${taskKey}: вердикт ревью на ${label} ` +
-            (v === "missing" ? "не найден" : "не «OK»"),
-        );
-      }
-    }
-  }
-  const added = parseAddedLines(
-    await git(deps, repo, [
-      "diff",
-      "--no-color",
-      "--no-ext-diff",
-      "--unified=0",
-      baseSha,
-      headSha,
-    ]),
-  );
-  // §16.6: scan the patch of EVERY commit in the range — a leak added
-  // and removed inside it escapes the range diff. `--cc` gives merge
-  // commits their conflict-resolution patch.
-  const patches = parseAddedLines(
-    await git(deps, repo, [
-      "log",
-      "-p",
-      "--cc",
-      "--no-color",
-      "--no-ext-diff",
-      "--unified=0",
-      `${baseSha}..${headSha}`,
-    ]),
-  );
-  const allowed = await allowedAuthor(deps, repo, project.commitIdentity);
-  const findings = await machineScan(deps.cmd, {
-    repoPath: repo,
-    baseSha,
-    headSha,
-    commits,
-    added,
-    patches,
-    leaks: project.leaks,
-    allowedAuthor: allowed,
-    hostname: deps.hostname ?? osHostname(),
-    threadIds: project.threadIds,
-    allowedTrailers: project.allowedTrailers,
-    allowedEmails: project.allowedEmails,
+    tipSha: preSyncSha,
+    policy: policyLoad.policy,
   });
-  const blockers = findings.filter((f) => f.severity === "block");
-  const warnings = findings.filter((f) => f.severity === "warn");
-  if (blockers.length) {
-    throw new OrchestratorError(
-      "release-refused",
-      `release ${taskKey}: машинный скан нашёл ${blockers.length} блокирующих находок:\n` +
-        blockers.slice(0, 20).map((f) => `- ${formatFinding(f)}`).join("\n"),
-    );
-  }
 
-  // Release row + audit packet + dispatch.
+  // The release row exists BEFORE the pipeline mutates the branch — its
+  // `pipeline_shas` record survives a mid-run refusal, so the next run's
+  // gate does not call the pipeline's own commits foreign.
   let release: ReleaseRow;
   try {
     release = deps.store.insertRelease({
@@ -1228,51 +1361,117 @@ async function runReleaseSteps(
     }
     throw e;
   }
-  deps.store.updateRelease(release.id, {
-    headSha,
-    remoteBaseSha,
-  });
-
-  const packetPath = await writeAuditPacket(deps, {
-    release,
-    taskTitle: title,
-    commits,
-    changed: await git(deps, repo, [
-      "diff",
-      "--name-only",
-      baseSha,
-      headSha,
-    ]).then((t) => t.split("\n").filter(Boolean)),
-    diff: await git(deps, repo, ["diff", baseSha, headSha]),
-    docs: docsForChanges(
-      (
-        await git(deps, repo, ["diff", "--name-only", baseSha, headSha])
-      )
-        .split("\n")
-        .filter(Boolean),
-      project.docsMap,
-    ),
-    findings,
-    noDocs: input.noDocs,
-    kb: input.kb,
-    noKb: input.noKb,
-    baseSha,
-    headSha,
-  });
 
   try {
+    // Step 2 — sync по режиму проекта.
+    // §16.6 (PLUG-194): a §14-merged result is synced by MERGE only —
+    // `git rebase` flattens merge commits, silently dropping the
+    // conflict-resolution edits that exist only in them.
+    const { baseSha, remoteBaseSha } = await syncBranch(
+      deps,
+      repo,
+      branch,
+      executor.merge_status === "merged"
+        ? { ...project, sync: "merge" }
+        : project,
+    );
+    await recordPipelineShas(deps, repo, release.id, preSyncSha);
+
+    // Step 3 — проверки проекта.
+    await runProjectChecks(deps, repo, project.checks);
+
+    // §3 --no-docs → Docs-not-needed trailer (before sha capture).
+    const preTrailerSha = await git(deps, repo, ["rev-parse", "HEAD"]);
+    if (input.noDocs) {
+      await applyDocsTrailer(deps, repo, input.noDocs);
+      await recordPipelineShas(deps, repo, release.id, preTrailerSha);
+    }
+    const headSha = await git(deps, repo, ["rev-parse", "HEAD"]);
+    deps.store.updateRelease(release.id, { headSha, remoteBaseSha });
+
+    // Step 4 — машинный скан категорий 1–4.
+    // §16.6 (PLUG-189): --no-color/--no-ext-diff — a `color.ui=always`
+    // config or an external diff driver would silently break the parser.
+    const commits = await commitRange(deps, repo, baseSha, headSha);
+    const added = parseAddedLines(
+      await git(deps, repo, [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--unified=0",
+        baseSha,
+        headSha,
+      ]),
+    );
+    // §16.6: scan the patch of EVERY commit in the range — a leak added
+    // and removed inside it escapes the range diff. `--cc` gives merge
+    // commits their conflict-resolution patch.
+    const patches = parseAddedLines(
+      await git(deps, repo, [
+        "log",
+        "-p",
+        "--cc",
+        "--no-color",
+        "--no-ext-diff",
+        "--unified=0",
+        `${baseSha}..${headSha}`,
+      ]),
+    );
+    const allowed = await allowedAuthor(deps, repo, project.commitIdentity);
+    const findings = await machineScan(deps.cmd, {
+      repoPath: repo,
+      baseSha,
+      headSha,
+      commits,
+      added,
+      patches,
+      leaks: project.leaks,
+      allowedAuthor: allowed,
+      hostname: deps.hostname ?? osHostname(),
+      threadIds: project.threadIds,
+      allowedTrailers: project.allowedTrailers,
+      allowedEmails: project.allowedEmails,
+    });
+    const blockers = findings.filter((f) => f.severity === "block");
+    const warnings = findings.filter((f) => f.severity === "warn");
+    if (blockers.length) {
+      throw new OrchestratorError(
+        "release-refused",
+        `release ${taskKey}: машинный скан нашёл ${blockers.length} блокирующих находок:\n` +
+          blockers.slice(0, 20).map((f) => `- ${formatFinding(f)}`).join("\n"),
+      );
+    }
+
+    const packetPath = await writeAuditPacket(deps, {
+      release,
+      taskTitle: title,
+      commits,
+      changed: await git(deps, repo, [
+        "diff",
+        "--name-only",
+        baseSha,
+        headSha,
+      ]).then((t) => t.split("\n").filter(Boolean)),
+      diff: await git(deps, repo, ["diff", baseSha, headSha]),
+      docs: docsForChanges(
+        (
+          await git(deps, repo, ["diff", "--name-only", baseSha, headSha])
+        )
+          .split("\n")
+          .filter(Boolean),
+        project.docsMap,
+      ),
+      findings,
+      noDocs: input.noDocs,
+      kb: input.kb,
+      noKb: input.noKb,
+      baseSha,
+      headSha,
+    });
+
     const route = pickRoute(policyLoad.policy, AUDIT_LEVEL, {
       unavailableRoutes: new Set(policyLoad.unavailableRoutes),
       heldGroups: deps.store.heldGroups(deps.now?.() ?? Date.now()),
-    });
-    const auditRow = deps.store.insert({
-      taskKey,
-      projectId: executor.project_id ?? input.caller.projectId,
-      coordinatorThreadId: input.caller.threadId,
-      level: AUDIT_LEVEL,
-      route: route.name,
-      preset: route.route.preset,
-      provider: route.route.provider,
     });
     const auditInstructions =
       `Выкладка задачи ${taskKey}: аудит релиза (шаг 5 конвейера). ` +
@@ -1287,14 +1486,27 @@ async function runReleaseSteps(
     // §17.3 (С1): only the audit dispatch is serialized on the delegate
     // queue — release itself runs outside it (the `bb orchestrator
     // release` CLI does not enqueue), so a release invoked while a
-    // dispatch is in flight never deadlocks on its own queue.
-    const res = await deps.enqueue(() =>
-      dispatchToRoute(
+    // dispatch is in flight never deadlocks on its own queue. The audit
+    // row INSERT rides inside too (ревью PLUG-210 мелко 9): else a long
+    // queue leaves a `dispatching` row the watchdog's 5-minute sweep
+    // could claim before it was ever dispatched.
+    const { auditRow, res } = await deps.enqueue(async () => {
+      const auditRow = deps.store.insert({
+        taskKey,
+        projectId: executor.project_id ?? input.caller.projectId,
+        coordinatorThreadId: input.caller.threadId,
+        level: AUDIT_LEVEL,
+        route: route.name,
+        preset: route.route.preset,
+        provider: route.route.provider,
+      });
+      const res = await dispatchToRoute(
         auditRow,
         { instructions: auditInstructions },
         deps.stepsDeps,
-      ),
-    );
+      );
+      return { auditRow, res };
+    });
     deps.store.updateRelease(release.id, {
       auditDelegationId: auditRow.id,
     });
@@ -1308,8 +1520,9 @@ async function runReleaseSteps(
       warnings,
     };
   } catch (e) {
-    // An explicit dispatch refusal: the audit never started — the release
-    // is failed, the task goes back to the coordinator with the reason.
+    // Any post-insert failure — sync conflict, a check, the scan, a
+    // dispatch refusal — ends the release; the row still carries the
+    // recorded `pipeline_shas` for the next run's gate.
     deps.store.updateRelease(release.id, {
       status: "failed",
       error: message(e).slice(0, 400),
@@ -1417,6 +1630,29 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
     s.scanning++;
     try {
       if (row.status === "auditing") {
+        // §17.3 (ревью PLUG-210): the release row is inserted BEFORE the
+        // audit dispatch — a fresh row without `audit_delegation_id` is
+        // mid-pipeline, not a verdict (an older audit delegation's
+        // verdict must never be read for it). A row still without the
+        // audit after the pipeline's own timeout means the run died —
+        // mark it failed so a retry is not blocked forever.
+        if (!row.audit_delegation_id) {
+          const age = (deps.now?.() ?? Date.now()) - row.created_at;
+          if (age > PREPARE_TIMEOUT_MS) {
+            deps.store.updateRelease(row.id, {
+              status: "failed",
+              error: "выкладка остановилась до раздачи аудита",
+            });
+            s.failed++;
+            await report(
+              deps,
+              row,
+              `выкладка ${row.task_key} остановлена до раздачи аудита ` +
+                `— повторите release`,
+            );
+          }
+          continue;
+        }
         const delegation = deps.store.latestDelegationByTaskAndLevel(
           row.task_key,
           AUDIT_LEVEL,
@@ -1641,12 +1877,16 @@ async function publishRelease(
     : ([recorded].find(isPublishName) ?? `release/${headSha.slice(0, 7)}`);
   // §17.3 (С4): the reused branch fast-forwards from `published_sha` —
   // the new round continued from it (delegate continue point), so a
-  // non-ancestor published tip means somebody rewrote the branch.
-  if (row.published_sha && row.published_sha !== headSha) {
+  // non-ancestor published tip means somebody rewrote the branch. The
+  // baseline is the task's PREVIOUS published release — this row's
+  // `published_sha` is still empty on a fresh run (ревью PLUG-210 мелко).
+  const prevPublished =
+    row.published_sha ?? deps.store.lastPublishedSha(row.task_key);
+  if (prevPublished && prevPublished !== headSha) {
     const ff = await git(deps, repo, [
       "merge-base",
       "--is-ancestor",
-      row.published_sha,
+      prevPublished,
       headSha,
     ])
       .then(() => true)
@@ -1654,7 +1894,7 @@ async function publishRelease(
     if (!ff) {
       throw new OrchestratorError(
         "release-refused",
-        `ветка публикации не fast-forward от ${row.published_sha.slice(0, 8)} ` +
+        `ветка публикации не fast-forward от ${prevPublished.slice(0, 8)} ` +
           `— новый заход должен продолжать от published_sha`,
       );
     }

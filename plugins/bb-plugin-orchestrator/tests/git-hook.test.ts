@@ -173,8 +173,9 @@ test("f4/f6: installer inventory sees .bb worktrees, real --self-test run", () =
   ], {
     cwd: new URL("..", import.meta.url).pathname, encoding: "utf8",
   });
-  assert.match(st, /OK +local hook fires: plain/);
-  assert.match(st, /OK +local hook fires: worktree/);
+  assert.match(st, /all \d+ wrappers chain: plain/);
+  assert.match(st, /all \d+ wrappers chain: worktree/);
+  assert.match(st, /OK  self-test passed/);
   // N2: live hooksDir untouched — no fake token left behind
   assert.equal(
     existsSync(join(root, "hd"))
@@ -244,7 +245,7 @@ test("Б2: a non-pre-push wrapper chains the repository-local hook", () => {
     '#!/bin/sh\necho hit > "$GIT_DIR/../precommit-ran"\nexit 0\n',
   );
   execFileSync("chmod", ["+x", join(repo, ".git", "hooks", "pre-commit")]);
-  const r = spawnSync("node", [join(hooksDir, "pre-commit")], {
+  const r = spawnSync(join(hooksDir, "pre-commit"), [], {
     cwd: repo,
     env: { ...process.env, GIT_DIR: join(repo, ".git") },
     encoding: "utf8",
@@ -255,10 +256,90 @@ test("Б2: a non-pre-push wrapper chains the repository-local hook", () => {
   const { repo: bare, hooksDir: hd2 } = makeEnv();
   cpSync(CHAIN_SRC, join(hd2, "commit-msg"));
   execFileSync("chmod", ["+x", join(hd2, "commit-msg")]);
-  const r2 = spawnSync("node", [join(hd2, "commit-msg"), "msg-file"], {
+  const r2 = spawnSync(join(hd2, "commit-msg"), ["msg-file"], {
     cwd: bare,
     env: { ...process.env, GIT_DIR: join(bare, ".git") },
     encoding: "utf8",
   });
   assert.equal(r2.status, 0);
+});
+
+// ── ревью PLUG-210: исполняемость, полнота имён, каталог токенов ────
+
+test("§17.3 (PLUG-210): chain skips a NON-executable local hook — git semantics", () => {
+  const { repo, hooksDir } = makeEnv();
+  cpSync(CHAIN_SRC, join(hooksDir, "pre-commit"));
+  execFileSync("chmod", ["+x", join(hooksDir, "pre-commit")]);
+  // a local hook WITHOUT the exec bit — git itself would skip it; the
+  // wrapper must not turn that into an error (or run it anyway)
+  writeFileSync(
+    join(repo, ".git", "hooks", "pre-commit"),
+    '#!/bin/sh\necho hit > "$GIT_DIR/../precommit-ran"\nexit 0\n',
+  ); // no chmod — stays 0644
+  const r = spawnSync(join(hooksDir, "pre-commit"), [], {
+    cwd: repo,
+    env: { ...process.env, GIT_DIR: join(repo, ".git") },
+    encoding: "utf8",
+  });
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(join(repo, "precommit-ran")), false);
+});
+
+test("§17.3 (PLUG-210): pre-push chains only to an EXECUTABLE local hook", () => {
+  const { repo, hooksDir } = makeEnv();
+  writeFileSync(
+    join(repo, ".git", "hooks", "pre-push"),
+    '#!/bin/sh\necho hit > "$GIT_DIR/../local-ran"\nexit 0\n',
+  ); // no chmod
+  const file = writePushToken(hooksDir, SHA, "x");
+  const r = runHook(repo, hooksDir, LINE + "\n");
+  // the gate passes (valid token) and the non-executable local hook is
+  // skipped instead of crashing the push with EACCES
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(file), false);
+  assert.equal(existsSync(join(repo, "local-ran")), false);
+});
+
+test("§17.3: hook-names covers every githooks(5) name incl. server side", () => {
+  const names = new Set(
+    readFileSync(NAMES_SRC, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#")),
+  );
+  // the full githooks(5) inventory — client AND receive-pack hooks
+  for (const n of [
+    "applypatch-msg", "pre-applypatch", "post-applypatch",
+    "pre-commit", "pre-merge-commit", "prepare-commit-msg", "commit-msg",
+    "post-commit", "pre-rebase", "post-checkout", "post-merge",
+    "pre-push", "pre-receive", "update", "proc-receive", "post-receive",
+    "post-update", "reference-transaction", "push-to-checkout",
+    "pre-auto-gc", "post-rewrite", "sendemail-validate",
+    "fsmonitor-watchman", "p4-pre-submit", "post-index-change",
+  ]) {
+    assert.ok(names.has(n), `hook-names missing ${n}`);
+  }
+});
+
+test("§17.3 (PLUG-210): installer takes the token dir from `bb orchestrator hooks-dir`", () => {
+  const root = mkdtempSync(join(tmpdir(), "install-dir-"));
+  const pluginDir = join(root, "plugin-hooks");
+  // a stub `bb` answering `orchestrator hooks-dir` with the plugin's dir
+  const bbStub = join(root, "bb-stub");
+  writeFileSync(bbStub, `#!/bin/sh\necho "${pluginDir}"\n`);
+  execFileSync("chmod", ["+x", bbStub]);
+  const gcfg = join(root, "gitconfig");
+  execFileSync(
+    "node",
+    ["hooks/install.mjs", "--repos-root", join(root, "empty")],
+    {
+      cwd: PLUGIN_DIR,
+      encoding: "utf8",
+      env: { ...process.env, BB_CLI: bbStub, GIT_CONFIG_GLOBAL: gcfg },
+    },
+  );
+  // the install landed where the plugin reports — not the hard-coded
+  // ~/.bb path the installer used to compute on its own
+  assert.ok(existsSync(join(pluginDir, "pre-push")));
+  assert.ok(existsSync(join(pluginDir, "update")));
 });

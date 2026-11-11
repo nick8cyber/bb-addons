@@ -334,8 +334,12 @@ function makeDeps(repo: string, overrides: Partial<{
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
   // executor done + review done-OK — §17.3 (Б4): the review is bound to
-  // the round's result sha via `continue_from`.
-  const RESULT_SHA = "f".repeat(40);
+  // the round's result sha via `continue_from`. The gate runs
+  // `git cat-file -e` on it — a real repo needs a real commit.
+  let RESULT_SHA = "f".repeat(40);
+  try {
+    RESULT_SHA = gitR(repo, ["rev-parse", "HEAD"]);
+  } catch { /* fake path — the fake sha stands */ }
   const exec = store.insert({
     taskKey: "PLUG-1", projectId: "proj_main",
     coordinatorThreadId: "thr_coord", level: "complex",
@@ -1032,15 +1036,42 @@ test("release: stale installed hook refuses with reinstall hint", async () => {
   );
 });
 
+/** Install the full wrapper set into `dir` — pre-push is the gate,
+ * every other name is a byte-copy of `chain` (what install.mjs does). */
+function installAllWrappers(dir: string) {
+  const src = new URL("../hooks", import.meta.url).pathname;
+  const names = readFileSync(join(src, "hook-names"), "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  for (const n of names) {
+    cpSync(join(src, n === "pre-push" ? "pre-push" : "chain"), join(dir, n));
+  }
+  return names;
+}
+
 test("release: up-to-date installed hook passes the freshness check", async () => {
   const { repo } = makeRepo();
   const { deps, tmp } = makeDeps(repo);
+  installAllWrappers(tmp);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("§17.3 (ревью PLUG-210): a missing wrapper is stale — a partial install refuses", async () => {
+  const { repo } = makeRepo();
+  const { deps, tmp } = makeDeps(repo);
+  // a pre-r26 install: real pre-push, none of the other wrappers
   cpSync(
     new URL("../hooks/pre-push", import.meta.url).pathname,
     join(tmp, "pre-push"),
   );
-  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
-  assert.equal(res.status, "auditing");
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "hook-stale" &&
+      /install\.mjs/.test((e as OrchestratorError).hint ?? ""),
+  );
 });
 
 test("machine scan: threadIds governs task-key too (§16.6)", async () => {
@@ -1160,7 +1191,7 @@ test("pump: threadIds=false — PR title is the HEAD subject, never a task key",
 test("pump: threadIds=false — repeat release reuses the first release/<sha7>", async () => {
   const { repo, remote } = makeRepo();
   const ghCalls: string[][] = [];
-  const { deps, store } = makeDeps(repo, {
+  const { deps, store, exec, bindReview } = makeDeps(repo, {
     ghCalls,
     auditVerdict: '{"verdict":"APPROVE","findings":[]}',
     releaseText: JSON.stringify({
@@ -1189,11 +1220,16 @@ test("pump: threadIds=false — repeat release reuses the first release/<sha7>",
     branch,
   );
   // A repeat release has a DIFFERENT head — the branch must stay the
-  // recorded one anyway (§16.6: one branch and one PR per task).
+  // recorded one anyway (§16.6: one branch and one PR per task). The
+  // §17.3 gate binds it as the round's reviewed result.
   writeFileSync(join(repo, "more.txt"), "more\n");
   gitR(repo, ["add", "."]);
   gitR(repo, ["commit", "-m", "feat: more"]);
   const newHead = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x", sha: newHead, commits: 2, dirty: false,
+  });
+  bindReview(newHead);
   assert.notEqual(newHead.slice(0, 7), branch.slice("release/".length));
   await round();
   const remoteTip = execFileSync(
@@ -1357,7 +1393,7 @@ test("pump: threadIds true→false — the executor branch is never published (P
   const { repo } = makeRepo();
   const ghCalls: string[][] = [];
   let threadIds = true;
-  const { deps, store } = makeDeps(repo, {
+  const { deps, store, exec, bindReview } = makeDeps(repo, {
     ghCalls,
     auditVerdict: '{"verdict":"APPROVE","findings":[]}',
   });
@@ -1384,13 +1420,21 @@ test("pump: threadIds true→false — the executor branch is never published (P
   // `release/…` names.
   const first = store.releasesByStatuses(["published"])[0]!;
   assert.equal(first.publish_branch, "feat-x");
-  assert.equal(store.releasePublishBranch("PLUG-1"), null);
+  // the reuse filter takes only `release/…` names — `feat-x` recorded
+  // while threadIds was on must never be reused (PLUG-194).
+  assert.equal(store.lastPublishBranch("PLUG-1"), "feat-x");
   // The project flips to no-ids: the next release publishes a neutral
   // release/<sha7>, not `feat-x`.
   threadIds = false;
   writeFileSync(join(repo, "more.txt"), "more\n");
   gitR(repo, ["add", "."]);
   gitR(repo, ["commit", "-m", "feat: more"]);
+  // §17.3 gate: the new round's tip is the reviewed result.
+  const tip = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x", sha: tip, commits: 2, dirty: false,
+  });
+  bindReview(tip);
   await round();
   const creates = ghCalls.filter((a) => a[0] === "pr" && a[1] === "create");
   assert.equal(creates.length, 2);
@@ -1631,7 +1675,7 @@ test("§17.3 С4: repeat release reuses the recorded branch and the existing PR"
   const { repo } = makeRepo();
   const ghCalls: string[][] = [];
   let prs: unknown[] = [];
-  const { deps, store } = makeDeps(repo, {
+  const { deps, store, exec, bindReview } = makeDeps(repo, {
     ghCalls,
     ghPrList: () => prs,
     auditVerdict: '{"verdict":"APPROVE","findings":[]}',
@@ -1665,10 +1709,16 @@ test("§17.3 С4: repeat release reuses the recorded branch and the existing PR"
       baseRefName: "main",
     },
   ];
-  // a new round fast-forwards from the published tip
+  // a new round fast-forwards from the published tip — and the gate
+  // reviews the new tip as the round's result
   writeFileSync(join(repo, "more.txt"), "more\n");
   gitR(repo, ["add", "."]);
   gitR(repo, ["commit", "-m", "feat: more"]);
+  const tip2 = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x", sha: tip2, commits: 2, dirty: false,
+  });
+  bindReview(tip2);
   await round();
   const creates = ghCalls.filter((a) => a[0] === "pr" && a[1] === "create");
   assert.equal(creates.length, 1); // one PR per task, ever
@@ -1802,5 +1852,158 @@ test("§17.3 мелко5: review verdict falls back to the reviewer thread's out
   await assert.rejects(
     runRelease({ taskKey: "PLUG-1", caller: COORD }, badCase.deps),
     (e: unknown) => /не «OK»/.test((e as OrchestratorError).message),
+  );
+});
+
+// ── ревью PLUG-210: ретрай после отказа, гейт вершины, очередь ─────
+
+test("PLUG-210 Б1: retry after a post-sync REJECT — pipeline commits are not foreign", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict:
+      '{"verdict":"REJECT","findings":[{"file":"f.ts","line":1,"problem":"p","fix":"x"}]}',
+  });
+  // advance main so the sync step creates a merge commit — the
+  // pipeline's own work on top of the reviewed result
+  writeFileSync(join(seed, "adv.txt"), "adv\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: advance"]);
+  gitR(seed, ["push", "origin", "main"]);
+
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const afterSync = gitR(repo, ["rev-parse", "HEAD"]);
+  // the sync created a real merge commit on top of the reviewed result
+  assert.equal(
+    gitR(repo, ["rev-list", "--parents", "-n", "1", "HEAD"]).split(" ").length,
+    3,
+  );
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s1 = await pumpReleases(deps);
+  assert.equal(s1.rejected, 1);
+  // the sync merge landed in releases.pipeline_shas
+  const row = store.releasesByStatuses(["rejected"])[0]!;
+  const recorded = JSON.parse(row.pipeline_shas ?? "[]") as string[];
+  assert.ok(recorded.includes(afterSync));
+
+  // second run: review still bound to result_sha; the recorded pipeline
+  // commit on top is not foreign work — the run reaches auditing again.
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-210 Б2: executor tip above result_sha → unreviewed-commits with the sha", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  writeFileSync(join(repo, "extra.txt"), "x\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: unreviewed"]);
+  const extra = gitR(repo, ["rev-parse", "HEAD"]);
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unreviewed-commits" &&
+      (e as OrchestratorError).message.includes(extra.slice(0, 7)),
+  );
+});
+
+test("PLUG-210 Б4: merged — an OK review on the branch tip covers coordinator commits", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  // a coordinator docs commit on `work` — covered by a whole-tip review
+  gitR(coord, ["checkout", "work"]);
+  writeFileSync(join(coord, "docs-note.md"), "docs\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "docs: coordinator edits"]);
+  const tip = gitR(coord, ["rev-parse", "HEAD"]);
+  gitR(coord, ["checkout", "work-2"]);
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+  const tipRev = store.insert({
+    taskKey: "PLUG-9",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+  });
+  // the verdict comment the mock serves carries threadId "thr_rev"
+  store.setThreadInfo(tipRev.id, "thr_rev");
+  store.setStatus(tipRev.id, "done");
+  bindReview(tip, tipRev.id);
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-210: merged — a merged_sha absent from the copy is a clear refusal", async () => {
+  const { coord } = makeMergedCoordinatorCopy();
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: "d".repeat(40) });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /отсутствует в копии/.test((e as OrchestratorError).message),
+  );
+});
+
+test("PLUG-210 мелко9: the audit row is inserted inside the delegate queue", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  let before: unknown;
+  let after: unknown;
+  deps.enqueue = async <T,>(f: () => Promise<T>) => {
+    // the watchdog must never observe a `dispatching` audit row before
+    // its dispatch actually ran — the insert rides inside the queue.
+    before = store.latestDelegationByTaskAndLevel(
+      "PLUG-1",
+      "release-audit",
+    );
+    const r = await f();
+    after = store.latestDelegationByTaskAndLevel(
+      "PLUG-1",
+      "release-audit",
+    );
+    return r;
+  };
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(before, undefined);
+  assert.ok(after);
+});
+
+test("PLUG-210 мелко: continuePoint picks by ancestry, not timestamps", async () => {
+  const { store } = makeDeps("/tmp/x");
+  const r = store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "p",
+    coordinatorThreadId: "t",
+    repoPath: "/r",
+    branch: "b",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  store.updateRelease(r.id, {
+    status: "published",
+    publishedSha: "e".repeat(40),
+  });
+  // result_sha is NOT an ancestor of the published tip → the new round
+  // continues from the result, not from an unrelated published sha.
+  assert.equal(
+    await store.continuePoint("PLUG-1", async () => false),
+    "f".repeat(40),
+  );
+  // the published tip CONTAINS the result → continue from it
+  // (it carries the sync merge + docs trailer).
+  assert.equal(
+    await store.continuePoint("PLUG-1", async () => true),
+    "e".repeat(40),
   );
 });

@@ -1,7 +1,8 @@
-# Standard git hook names (client side, githooks(5)) — install.mjs
-# copies a wrapper under each name, release.ts freshness-checks every
-# installed file. `pre-push` gets the orchestrator gate, every other
-# name gets the `chain` pass-through.
+# Standard git hook names (githooks(5)) — client AND server side
+# (a global core.hooksPath also shadows receive-pack hooks in local
+# bare repositories). install.mjs copies a wrapper under each name,
+# release.ts freshness-checks every installed file. `pre-push` gets
+# the orchestrator gate, every other name gets the `chain` pass-through.
 applypatch-msg
 pre-applypatch
 post-applypatch
@@ -24,3 +25,9 @@ p4-prepare-changelist
 p4-post-changelist
 p4-pre-submit
 post-index-change
+reference-transaction
+pre-receive
+update
+proc-receive
+post-receive
+post-update

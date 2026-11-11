@@ -1,50 +1,30 @@
-#!/usr/bin/env node
-/**
- * Generic shared-hook wrapper (spec orchestrator §17.3, Б2). The shared
- * `core.hooksPath` shadows EVERY standard hook name, so install.mjs
- * copies this file under each of them — else a repo's local `pre-commit`
- * or `commit-msg` would silently stop firing.
- *
- * Behaviour: resolve the repository's own `$GIT_DIR/hooks/<my name>`
- * (GIT_DIR first, then `--git-common-dir` for worktrees) and exec it
- * with the same arguments; stdin/stdout/stderr are inherited, the exit
- * code passes through. No local hook — exit 0. The orchestrator's own
- * gate lives only in `pre-push`; this wrapper never decides.
- */
-import { existsSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+#!/bin/sh
+# Generic shared-hook wrapper (spec orchestrator §17.3, Б2). The shared
+# `core.hooksPath` shadows EVERY standard hook name, so install.mjs
+# copies this file under each of them — else a repo's local `pre-commit`
+# or `commit-msg` would silently stop firing.
+#
+# Behaviour: exec the repository's own `$GIT_DIR/hooks/<my name>` with
+# the same arguments — but ONLY when it is executable, exactly like git
+# itself (a non-executable local hook is skipped, not an error; ревью
+# PLUG-210). stdin/stdout/stderr and the exit code pass through. No
+# local hook — exit 0. The orchestrator's own gate lives only in
+# `pre-push`; this wrapper never decides. POSIX sh, not node — this
+# fires on every `git status` (post-index-change), ~45ms of node
+# startup per call was too much (ревью PLUG-210 мелко 10).
+name=${0##*/}
+self=$0
 
-const self = fileURLToPath(import.meta.url);
-const HOOK_NAME = basename(process.argv[1] ?? self);
+try=""
+if [ -n "$GIT_DIR" ]; then
+  try="$GIT_DIR/hooks/$name"
+fi
+if [ ! -x "$try" ] || [ "$try" -ef "$self" ]; then
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || exit 0
+  try="$common/hooks/$name"
+fi
 
-function git(args) {
-  return spawnSync("git", args, { encoding: "utf8" });
-}
-
-function localHookPath() {
-  const candidates = [];
-  if (process.env.GIT_DIR) {
-    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
-  }
-  const common = git(["rev-parse", "--git-common-dir"]);
-  if (common.status === 0) {
-    candidates.push(join(common.stdout.trim(), "hooks", HOOK_NAME));
-  }
-  for (const c of candidates) {
-    if (c !== self && existsSync(c)) return c;
-  }
-  return null;
-}
-
-const local = localHookPath();
-if (!local) process.exit(0);
-// stdio "inherit" pipes git's stdin through unchanged — hook kinds that
-// read ref lines (post-rewrite, …) see exactly what git sent.
-const res = spawnSync(local, process.argv.slice(2), { stdio: "inherit" });
-if (res.error) {
-  process.stderr.write(`[orchestrator] local ${HOOK_NAME}: ${res.error.message}\n`);
-  process.exit(1);
-}
-process.exit(res.status ?? (res.signal ? 1 : 0));
+[ -x "$try" ] || exit 0
+[ "$try" -ef "$self" ] && exit 0
+exec "$try" "$@"

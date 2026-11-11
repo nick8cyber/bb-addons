@@ -485,6 +485,7 @@ export async function createPlugin(
         loadPolicy: () => loadPolicy(true),
         probes,
         gitInstructions: () => currentSettings.gitInstructions,
+        cmd,
       });
     });
 

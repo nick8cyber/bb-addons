@@ -55,10 +55,23 @@ const multi = (n) => {
 const dryRun = args.includes("--dry-run");
 const force = args.includes("--force");
 const selfTest = args.includes("--self-test");
-const hooksDir = resolve(
-  flag("--hooks-dir") ??
-    join(homedir(), ".bb", "plugins", "orchestrator", "git-hooks"),
-);
+/** §17.3 (ревью PLUG-210): ONE token dir shared by the plugin and the
+ * hook — the installer asks the plugin itself (`bb orchestrator
+ * hooks-dir`) instead of recalculating the path. Falls back to the
+ * documented default when bb or the plugin is unavailable (a fresh
+ * checkout, tests). */
+function defaultHooksDir() {
+  try {
+    const out = execFileSync(
+      process.env.BB_CLI ?? "bb",
+      ["orchestrator", "hooks-dir"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    if (out) return out;
+  } catch { /* bb or the plugin unavailable — use the default */ }
+  return join(homedir(), ".bb", "plugins", "orchestrator", "git-hooks");
+}
+const hooksDir = resolve(flag("--hooks-dir") ?? defaultHooksDir());
 const reposRoot = resolve(flag("--repos-root") ?? homedir());
 const extraExcludes = multi("--exclude").map((p) => resolve(p));
 
@@ -147,9 +160,10 @@ if (dryRun) {
   process.exit(0);
 }
 
-// §5/§7 self-test: build each repository kind in a temp dir and prove a
-// local pre-push hook still fires through the shared one (with a valid
-// release token on a matching sha).
+// §5/§7 self-test: build each repository kind in a temp dir and prove
+// every installed wrapper still chains to the repository's local hook —
+// `pre-push` with a valid release token, every other name through the
+// `chain` pass-through.
 if (selfTest) {
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -160,14 +174,18 @@ if (selfTest) {
   // (possibly written by an in-flight release) are never touched.
   const testHooksDir = join(tmp, "hooks");
   mkdirSync(testHooksDir, { recursive: true });
-  const hookPath = join(testHooksDir, "pre-push");
-  copyFileSync(
-    existsSync(join(hooksDir, "pre-push"))
-      ? join(hooksDir, "pre-push")
-      : join(dirname(fileURLToPath(import.meta.url)), "pre-push"),
-    hookPath,
-  );
-  execFileSync("chmod", ["755", hookPath]);
+  const srcDir = dirname(fileURLToPath(import.meta.url));
+  for (const name of HOOK_NAMES) {
+    const srcName = name === "pre-push" ? "pre-push" : "chain";
+    const dst = join(testHooksDir, name);
+    copyFileSync(
+      existsSync(join(hooksDir, name))
+        ? join(hooksDir, name)
+        : join(srcDir, srcName),
+      dst,
+    );
+    execFileSync("chmod", ["755", dst]);
+  }
   const SHA = "a".repeat(40);
   const LINE = `refs/heads/x ${SHA} refs/heads/x ${"0".repeat(40)}\n`;
   const kinds = [
@@ -185,24 +203,33 @@ if (selfTest) {
     const base = join(tmp, kind.name.replace(/\W+/g, "-"));
     execFileSync("git", ["init", base], { stdio: "ignore" });
     const repo = kind.mk(base);
-    // local hook writes a marker next to the repo when it fires
     const commonRaw = execFileSync("git", ["-C", repo, "rev-parse", "--git-common-dir"], { encoding: "utf8" }).trim();
     const common = isAbsolute(commonRaw) ? commonRaw : join(repo, commonRaw);
-    const lh = join(common, "hooks", "pre-push");
-    writeFileSync(lh, '#!/bin/sh\n[ -n "$ORCH_MARK" ] && echo hit > "$ORCH_MARK"\nexit 0\n');
-    execFileSync("chmod", ["+x", lh]);
-    writeFileSync(join(testHooksDir, "push-token-selftest.json"),
-      JSON.stringify({ token: "t", sha: SHA, branch: "x", expiresAt: Date.now() + 60000 }));
-    const mark = join(tmp, `mark-${kind.name.replace(/\W+/g, "-")}`);
-    const r = spawnSync("node", [hookPath], {
-      cwd: repo, input: LINE,
-      env: { ...process.env, GIT_DIR: execFileSync("git", ["-C", repo, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim(), ORCH_MARK: mark },
-      encoding: "utf8",
-    });
-    const ok = r.status === 0 && existsSync(mark);
-    console.log(`${ok ? "OK " : "FAIL"}  local hook fires: ${kind.name}`);
-    if (!ok) failed++;
+    const gitDir = execFileSync("git", ["-C", repo, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
+    for (const name of HOOK_NAMES) {
+      // local hook writes a marker next to the repo when it fires
+      const lh = join(common, "hooks", name);
+      writeFileSync(lh, '#!/bin/sh\n[ -n "$ORCH_MARK" ] && echo hit > "$ORCH_MARK"\nexit 0\n');
+      execFileSync("chmod", ["+x", lh]);
+      const mark = join(tmp, `mark-${kind.name.replace(/\W+/g, "-")}-${name}`);
+      const env = { ...process.env, GIT_DIR: gitDir, ORCH_MARK: mark };
+      if (name === "pre-push") {
+        writeFileSync(join(testHooksDir, "push-token-selftest.json"),
+          JSON.stringify({ token: "t", sha: SHA, branch: "x", expiresAt: Date.now() + 60000 }));
+      }
+      const wrapper = join(testHooksDir, name);
+      const r = name === "pre-push"
+        ? spawnSync("node", [wrapper], { cwd: repo, input: LINE, env, encoding: "utf8" })
+        : spawnSync(wrapper, [], { cwd: repo, env, encoding: "utf8" });
+      const ok = r.status === 0 && existsSync(mark);
+      if (!ok) {
+        failed++;
+        console.log(`FAIL  ${name} chains to local hook: ${kind.name}`);
+      }
+    }
+    console.log(`done  all ${HOOK_NAMES.length} wrappers chain: ${kind.name}`);
   }
+  if (!failed) console.log("OK  self-test passed");
   rmSync(tmp, { recursive: true, force: true });
   process.exit(failed ? 1 : 0);
 }

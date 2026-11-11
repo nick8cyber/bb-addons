@@ -35,6 +35,7 @@ import {
   runJson,
   type BbCli,
 } from "./bb-cli.js";
+import type { CmdRunner } from "./cmd.js";
 
 export interface SetupError {
   step: string;
@@ -97,6 +98,9 @@ export interface DelegateDeps {
   loadPolicy(): Promise<PolicyLoad>;
   probes: ExecutorProbes;
   dispatchTimeoutMs?: number;
+  /** §17.3: git access for the continue-point ancestry check — without
+   * it `continuePoint` falls back to the timestamp heuristic. */
+  cmd?: CmdRunner;
   /** §2.2 git rules, read fresh at dispatch so edits and reissues see the
    * current setting. */
   gitInstructions?: () => string | undefined;
@@ -315,7 +319,21 @@ export async function runDelegate(
   const round = store.nextRound(taskKey);
   const continueFrom = params.fresh
     ? null
-    : (params.from ?? store.continuePoint(taskKey) ?? null);
+    : (params.from ??
+      (await store.continuePoint(
+        taskKey,
+        // no git access (tests, odd embedders) → the timestamp heuristic
+        deps.cmd
+          ? async (repoPath, a, b) => {
+              const r = await deps.cmd!.run(
+                "git",
+                ["-C", repoPath, "merge-base", "--is-ancestor", a, b],
+                { timeoutMs: 30_000 },
+              );
+              return r.exitCode === 0;
+            }
+          : undefined,
+      )) ?? null);
 
   // Step 2 — the unique index makes this atomic across processes.
   let row;
