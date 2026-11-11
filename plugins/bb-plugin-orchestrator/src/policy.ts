@@ -446,13 +446,22 @@ export function quotaGroupsForOneOff(
   presetModels: ReadonlyMap<string, string | null | undefined>,
 ): string[] {
   const groups = new Set<string>([oneOff.route]);
-  if (!policy || !oneOff.modelId) return [...groups];
+  const want = baseModelId(oneOff.modelId);
+  if (!policy || !want) return [...groups];
   for (const [name, route] of Object.entries(policy.routes)) {
     if (route.provider !== oneOff.provider) continue;
-    if (presetModels.get(route.preset) !== oneOff.modelId) continue;
+    if (baseModelId(presetModels.get(route.preset)) !== want) continue;
     groups.add(quotaGroupOf(route, name));
   }
   return [...groups];
+}
+
+/** §2.3: model ids compare without the bracketed variant suffix —
+ * `claude-opus-5-5[1m]` and `claude-opus-5-5` share one quota. */
+function baseModelId(
+  modelId: string | null | undefined,
+): string | null | undefined {
+  return modelId?.replace(/\[[^\]]*\]\s*$/, "");
 }
 
 /** §5.3 removed-model text patterns; `routes.*.unavailablePatterns` extends. */

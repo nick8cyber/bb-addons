@@ -979,6 +979,42 @@ test("§2.3 reviewByLevel: a newer auditor delegation does not hide the executor
   );
 });
 
+test("§2.3 reviewByLevel: a release-audit delegation is not the executor", async () => {
+  // PLUG-186: release.ts stores its audit delegation under the
+  // `release-audit` level — roleForLevel maps it to release-auditor, not
+  // executor, so the map still sees the earlier executor delegation.
+  const { deps, store } = makeDeps({ policyText: REVIEW_POLICY });
+  const exec = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "acp-opencode",
+  });
+  store.setStatus(exec.id, "done");
+  const audit = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "release-audit",
+    route: "simple",
+    preset: "simple",
+    provider: "acp-opencode",
+  });
+  store.setStatus(audit.id, "done");
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "review", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.level, "review-mid");
+  assert.match(
+    res.note ?? "",
+    /review → review-mid по сложности исполнения simple/,
+  );
+});
+
 test("§2.3 reviewByLevel: --route/--preset keep the caller's level (no mapping)", async () => {
   const { deps, store } = makeDeps({ policyText: REVIEW_POLICY });
   const exec = store.insert({

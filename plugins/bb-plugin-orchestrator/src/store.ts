@@ -606,8 +606,8 @@ export class DelegationStore {
           `INSERT INTO delegations (
             task_key, task_id, project_id, coordinator_thread_id, level,
             route, preset, provider, status, reissue_of, round, continue_from,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?)`,
+            explicit_route, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.task_key,
@@ -621,6 +621,10 @@ export class DelegationStore {
           id,
           row.round,
           row.continue_from,
+          // §5.4 (PLUG-186): an explicit --route/--preset lineage keeps
+          // restarting the chain and skipping every used route — the
+          // flag must reach each reissue, not just the first one.
+          row.explicit_route,
           now,
           now,
         );

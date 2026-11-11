@@ -270,7 +270,7 @@ test("§16.7: invalid policy → role-less root thread gets only the setup skill
   assert.equal(withRole.instructions, undefined);
   // Valid policy → full coordinator issuance as before.
   const ok = buildAgentConfiguration(ctx({}), { ...deps, policyOk: true });
-  assert.equal(ok.tools.length, 3);
+  assert.equal(ok.tools.length, 4);
 });
 
 test("§16.7: the error fallback honors policyOk — coordinator gets setup only", () => {

@@ -268,24 +268,30 @@ export function createWatchdog(deps: WatchdogDeps) {
     const route = load.policy?.routes[row.route];
     // §2.3 r24 (PLUG-182): a `preset:` one-off is not in the policy
     // routes — a quota burn holds the quota group of every same-provider
-    // AND same-model policy route plus the one-off's own name.
-    let quotaGroups: string[];
-    if (route) {
-      quotaGroups = [quotaGroupOf(route, row.route)];
-    } else if (row.route.startsWith("preset:")) {
-      const models = await presetModelMap(deps.bbCli);
-      quotaGroups = quotaGroupsForOneOff(
-        load.policy,
-        {
-          route: row.route,
-          provider: row.provider,
-          modelId: models.get(row.preset),
-        },
-        models,
-      );
-    } else {
-      quotaGroups = [row.route];
-    }
+    // AND same-model policy route plus the one-off's own name. The
+    // `preset list` call is lazy (PLUG-186): only the quota path needs
+    // the groups — pattern checks must not pay up to 15s per event.
+    let cachedGroups: string[] | undefined;
+    const quotaGroups = async (): Promise<string[]> => {
+      if (cachedGroups) return cachedGroups;
+      if (route) {
+        cachedGroups = [quotaGroupOf(route, row.route)];
+      } else if (row.route.startsWith("preset:")) {
+        const models = await presetModelMap(deps.bbCli);
+        cachedGroups = quotaGroupsForOneOff(
+          load.policy,
+          {
+            route: row.route,
+            provider: row.provider,
+            modelId: models.get(row.preset),
+          },
+          models,
+        );
+      } else {
+        cachedGroups = [row.route];
+      }
+      return cachedGroups;
+    };
     return {
       load,
       policy: load.policy,
@@ -615,7 +621,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.setStatus(fresh.id, "quota"); // status first, stop second (§5.3)
     clearMarks(fresh.id);
     const info = await routeInfo(fresh);
-    for (const group of info.quotaGroups) {
+    for (const group of await info.quotaGroups()) {
       store.hold(group, now() + QUOTA_HOLD_MS, detail.slice(0, 200));
     }
     await afterOutcomeStatus(fresh, "quota", detail);

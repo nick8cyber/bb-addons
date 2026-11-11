@@ -197,7 +197,9 @@ export function reviewVerdictOk(body: string): boolean {
     verdict = parsed.verdict;
     blockers = parsed.blockers;
   }
-  return verdict === "OK" && (blockers === undefined || blockers === 0);
+  // §16.7 (PLUG-186): the verdict line carries `blockers` — a missing
+  // field is not an OK.
+  return verdict === "OK" && blockers === 0;
 }
 
 function reviewVerdict(

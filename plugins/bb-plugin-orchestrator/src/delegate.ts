@@ -20,7 +20,6 @@ import {
 } from "./instructions.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
-  levelRole,
   pickRoute,
   quotaGroupsForOneOff,
   type Policy,
@@ -206,7 +205,7 @@ export async function runDelegate(
     // mapped or not; a level missing from the map falls back to `review`.
     const latestExec = store
       .delegationsByTask(taskKey)
-      .find((r) => levelRole(policy, r.level) === "executor");
+      .find((r) => roleForLevel(r.level, policy) === "executor");
     if (latestExec) {
       const mapped = policy.reviewByLevel[latestExec.level] ?? "review";
       if (mapped !== "review") {

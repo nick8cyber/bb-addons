@@ -238,6 +238,10 @@ test("reviewVerdictOk: §16.7 strict JSON verdict line", () => {
     reviewVerdictOk('{"verdict":"OK","blockers":1}'),
     false,
   );
+  // PLUG-186: `blockers` is required — an OK without it (or with a
+  // non-number) is not accepted.
+  assert.equal(reviewVerdictOk('{"verdict":"OK"}'), false);
+  assert.equal(reviewVerdictOk('{"verdict":"OK","blockers":"0"}'), false);
   // Last JSON verdict line wins.
   assert.equal(
     reviewVerdictOk(

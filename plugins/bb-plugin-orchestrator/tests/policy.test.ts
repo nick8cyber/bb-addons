@@ -362,3 +362,45 @@ test("§2.3 quotaGroupsForOneOff: same provider AND model, plus the one-off name
     ["preset:x"],
   );
 });
+
+test("§2.3 quotaGroupsForOneOff: bracketed model variant shares the quota", () => {
+  // PLUG-186 (spec 6797550): `claude-opus-5-5[1m]` and
+  // `claude-opus-5-5` are one quota — the bracketed variant suffix is
+  // stripped before comparing, on BOTH sides.
+  const policy = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: { x: { chain: ["a", "b"] } },
+      routes: {
+        a: { preset: "pa", provider: "claude-code" },
+        b: { preset: "pb", provider: "claude-code" },
+      },
+    }),
+  ).policy;
+  const models = new Map([
+    ["pa", "claude-opus-5-5[1m]"],
+    ["pb", "gemini-3-8"],
+  ]);
+  // One-off without the suffix still joins the variant's group.
+  assert.deepEqual(
+    quotaGroupsForOneOff(
+      policy,
+      { route: "preset:x", provider: "claude-code", modelId: "claude-opus-5-5" },
+      models,
+    ).sort(),
+    ["a", "preset:x"],
+  );
+  // And the other way around — the one-off carries the suffix.
+  assert.deepEqual(
+    quotaGroupsForOneOff(
+      policy,
+      {
+        route: "preset:x",
+        provider: "claude-code",
+        modelId: "claude-opus-5-5[1m]",
+      },
+      models,
+    ).sort(),
+    ["a", "preset:x"],
+  );
+});

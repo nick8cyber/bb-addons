@@ -2406,6 +2406,93 @@ test("§5.4/§2.3: reissue rows keep the after-current rule (no restart)", async
   assert.equal(h.store.listActive().length, 0);
 });
 
+test("§5.4/§2.3: explicit-route lineage never returns to a used route", async () => {
+  // PLUG-186: explicit_route rides every reissue — chain
+  // [oc-a,oc-b,oc-c], --route oc-c → stall → oc-a → stall → oc-b →
+  // stall → nothing left: oc-c is not re-picked.
+  const h = makeHarness({ policyText: POLICY_OC });
+  const stall = async (threadId: string, at: number) => {
+    h.threadDtos.set(threadId, dto(threadId, "active"));
+    h.eventLog.set(threadId, [ev(1, "turn/started", at)]);
+    await h.wd.onThreadEvents({ thread: dto(threadId), sequence: 1 });
+    h.setNow(at + 31_000);
+    await h.wd.checkTimers();
+  };
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "lvl",
+    route: "oc-c",
+    preset: "strict",
+    provider: "agy",
+    explicitRoute: true,
+  });
+  await stall("thr_e1", T0);
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const second = h.store.listActive()[0]!;
+  assert.equal(second.route, "oc-a", "restart skips used oc-c");
+  assert.equal(second.explicit_route, 1, "the flag rides the reissue");
+
+  await stall(second.thread_id!, T0 + 40_000);
+  assert.equal(h.store.get(second.id)!.status, "reissued");
+  const third = h.store.listActive()[0]!;
+  assert.equal(third.route, "oc-b", "oc-c and oc-a both stay used");
+  assert.equal(third.explicit_route, 1);
+
+  await stall(third.thread_id!, T0 + 80_000);
+  assert.equal(
+    h.store.get(third.id)!.status,
+    "stalled",
+    "no route left — oc-c is not re-picked",
+  );
+  assert.equal(h.store.listActive().length, 0);
+});
+
+test("§2.3 (PLUG-186): preset quota groups are lazy off the quota path", async () => {
+  // A `preset:*` row pays for `tasks preset list` only when a quota
+  // actually lands — a non-quota error event must not fetch it.
+  const h = makeHarness({
+    policyText: POLICY_OC,
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks preset list")) return OC_MODELS;
+      return undefined;
+    },
+  });
+  const presetListCalls = () =>
+    h.calls.filter((c) => c.join(" ").startsWith("tasks preset list")).length;
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "lvl",
+    route: "preset:poof",
+    preset: "poof",
+    provider: "acp-opencode",
+    explicitRoute: true,
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "socket hang up" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+
+  assert.equal(presetListCalls(), 0, "non-quota event fetched no preset list");
+  assert.equal(h.store.get(row.id)!.status, "running");
+
+  // A quota event still resolves the groups on demand.
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "socket hang up" }),
+    ev(3, "provider/error", T0 + 1000, { message: "429 rate limit" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
+  assert.equal(
+    h.store.get(row.id)!.status,
+    "reissued",
+    "quota + autoFallback reissues the row",
+  );
+  assert.ok(presetListCalls() > 0, "quota path fetched the preset list");
+});
+
 // ── §2.3 (PLUG-182): one-off preset quota — provider+model holds ──────
 
 const POLICY_OC = JSON.stringify({
