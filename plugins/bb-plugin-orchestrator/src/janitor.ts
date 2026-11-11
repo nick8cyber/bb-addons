@@ -152,6 +152,20 @@ export interface JanitorThreads {
     limit?: number;
     offset?: number;
   }): Promise<unknown>;
+  /**
+   * §17.4 (PLUG-212): `threads.count` with the list's own coverage —
+   * every non-deleted thread, archived and hidden included. It
+   * brackets the paged traversal: offset paging can silently lose a
+   * row when the sorted set shifts under it (a deletion or a
+   * pin/unpin on an already-read page), so the janitor compares the
+   * count before/after and the unique ids collected — a mismatch
+   * means the list is unproven (`threads-unknown`), not «тредов
+   * нет». Absent on older wiring → the CLI list is the fallback.
+   */
+  count?(args: {
+    includeArchived?: boolean;
+    includeHidden?: boolean;
+  }): Promise<unknown>;
 }
 
 export interface JanitorDeps {
@@ -402,22 +416,71 @@ export function createJanitor(deps: JanitorDeps) {
    */
   const THREADS_PAGE = 200;
   const listThreads = async (): Promise<ThreadDto[] | null> => {
-    if (deps.threads.list) {
-      try {
-        const out: ThreadDto[] = [];
+    // §17.4 (PLUG-212): the verified paged path needs BOTH SDK seams.
+    // Offset paging races the server's ordering (`projectId ASC`,
+    // pinned first, `createdAt DESC`, `id DESC`): deleting or
+    // (un)pinning a thread on an already-read page shifts later rows
+    // up and one is never read — a full-looking list with a hole in
+    // it. `threads.count` (same coverage: every non-deleted thread)
+    // brackets the traversal and the ids are deduplicated, so a
+    // shift or a hole is detected; one retry, then «список не
+    // доказан» (threads-unknown). Without either seam the atomic
+    // one-shot CLI list is the fallback.
+    if (deps.threads.list && deps.threads.count) {
+      const countThreads = async (): Promise<number | null> => {
+        try {
+          const res = await deps.threads.count!({
+            includeArchived: true,
+            includeHidden: true,
+          });
+          const total =
+            typeof res === "number"
+              ? res
+              : (res as { total?: unknown } | null)?.total;
+          return typeof total === "number" &&
+            Number.isFinite(total) &&
+            total >= 0
+            ? total
+            : null;
+        } catch {
+          return null;
+        }
+      };
+      const sweep = async (): Promise<ThreadDto[] | null> => {
+        const before = await countThreads();
+        if (before === null) return null;
+        const byId = new Map<string, ThreadDto>();
         for (let offset = 0; ; offset += THREADS_PAGE) {
-          const page = await deps.threads.list({
+          const page = await deps.threads.list!({
             includeHidden: true,
             limit: THREADS_PAGE,
             offset,
           });
           if (!Array.isArray(page)) return null;
-          out.push(...(page as ThreadDto[]));
-          if (page.length < THREADS_PAGE) return out;
+          for (const t of page as ThreadDto[]) {
+            if (t && typeof t.id === "string" && !byId.has(t.id)) {
+              byId.set(t.id, t);
+            }
+          }
+          if (page.length < THREADS_PAGE) break;
         }
-      } catch {
-        return null;
+        const after = await countThreads();
+        // The set moved under the traversal, or the unique ids do not
+        // cover every counted thread — the collected list has a hole.
+        if (after === null || after !== before || byId.size !== after) {
+          return null;
+        }
+        return [...byId.values()];
+      };
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const out = await sweep();
+          if (out !== null) return out;
+        } catch {
+          // a page call threw — the retry may still succeed
+        }
       }
+      return null;
     }
     try {
       return await runJson<ThreadDto[]>(
@@ -1243,22 +1306,6 @@ export function createJanitor(deps: JanitorDeps) {
     const apply = effective.enabled && effective.mode === "apply" && !opts.dryRun;
     summary.applied = apply;
 
-    // §17.4 (мелко 11): below the git floor the «ничего не теряется»
-    // probe (`patch-id --verbatim`) does not exist — refuse the whole
-    // pass with a hint rather than collect misleading verdicts.
-    const gv = await gitVersion();
-    if (!(await gitSupported())) {
-      const text =
-        `git ≥ ${MIN_GIT[0]}.${MIN_GIT[1]} required ` +
-        "(patch-id --verbatim, merge-tree --write-tree)" +
-        (gv ? `, found ${gv.major}.${gv.minor}` : " — `git --version` failed") +
-        " — обновите git на этой машине";
-      summary.skipped = "unsupported-git";
-      summary.errors.push(text);
-      log.warn?.(`orchestrator janitor: ${text}`);
-      return summary;
-    }
-
     // §15: «--dry-run ничего не пишет и ничего не отправляет» — no run
     // row, no janitor_meta marks, no coordinator messages; the pass is
     // a pure preview. In-memory streak mirrors still advance so
@@ -1291,6 +1338,26 @@ export function createJanitor(deps: JanitorDeps) {
           (error ? `; error: ${error}` : ""),
       );
     };
+
+    // §17.4 (мелко 11, PLUG-212): below the git floor the «ничего не
+    // теряется» probe (`patch-id --verbatim`) does not exist — refuse
+    // the whole pass with a hint rather than collect misleading
+    // verdicts. The refusal is still a RECORDED run: the row carries
+    // the error so `janitor report` shows it, and `janitor run` exits
+    // non-zero (a silent skip looked like a healthy pass).
+    const gv = await gitVersion();
+    if (!(await gitSupported())) {
+      const text =
+        `git ≥ ${MIN_GIT[0]}.${MIN_GIT[1]} required ` +
+        "(patch-id --verbatim, merge-tree --write-tree)" +
+        (gv ? `, found ${gv.major}.${gv.minor}` : " — `git --version` failed") +
+        " — обновите git на этой машине";
+      summary.skipped = "unsupported-git";
+      summary.errors.push(text);
+      log.warn?.(`orchestrator janitor: ${text}`);
+      finish(text);
+      return summary;
+    }
 
     try {
       const ctx = await runBody(effective, apply, summary, dry);
@@ -2360,7 +2427,7 @@ export function createJanitor(deps: JanitorDeps) {
         continue;
       }
       const remaining = liveThreadsOf(env.id);
-      if (!apply || remaining.length > 0) {
+      if (!apply) {
         // Report mode (nothing is archived) — «готова к удалению».
         // §17.4 (С9): the item itself, not only the count — `janitor
         // run` prints the list and `janitor report` reads the rows.
@@ -2373,8 +2440,17 @@ export function createJanitor(deps: JanitorDeps) {
           threadId: pickThreadId(env),
           reason: "merged-ready",
         });
-        writeKept(env, blocked ?? "merged-ready", facts.firstSeenAt);
-        settle(env, blocked ?? "merged-ready");
+        writeKept(env, "merged-ready", facts.firstSeenAt);
+        settle(env, "merged-ready");
+        continue;
+      }
+      if (remaining.length > 0) {
+        // §17.4 (С9, PLUG-212): apply leaves the copy — live threads
+        // (a brand-new env thread outside the archived cascade,
+        // PLUG-192) still hold it. Not «готова к удалению»: kept with
+        // its own reason, like the unhandled-threads case above.
+        writeKept(env, "threads-remaining", facts.firstSeenAt);
+        settle(env, "threads-remaining");
         continue;
       }
       {
@@ -2451,7 +2527,9 @@ export function createJanitor(deps: JanitorDeps) {
       // Ledger rows of branches no longer in THIS repo are closed — a
       // manually deleted branch must not linger in the abandoned list.
       // Rows are keyed `branch:<commonDir>:<name>`, so one repo never
-      // closes another's namesake (PLUG-197 PX5).
+      // closes another's namesake (PLUG-197 PX5). §17.4 (PLUG-212):
+      // closed under `ledger` like every other row — in report mode
+      // too, or the gone branch hangs as «готова» forever.
       const prefix = `branch:${commonDir}:`;
       const present = new Set(localBranches);
       for (const i of deps.janitor.items()) {
@@ -2460,7 +2538,7 @@ export function createJanitor(deps: JanitorDeps) {
           !present.has(i.env_id.slice(prefix.length))
         ) {
           ctx.definite.add(i.env_id);
-          if (persist) {
+          if (ledger) {
             deps.janitor.upsertItem(
               i.env_id,
               { state: "removed", reason: "removed" },
@@ -2581,16 +2659,20 @@ export function createJanitor(deps: JanitorDeps) {
           continue;
         }
         summary.orphanBranches += 1;
-        // §17.4 (С9): a merged copy-less `bb/` branch is «готова к
-        // удалению» too — unless this very run deletes it
-        // (`apply` + `deleteBranches`), then it is a removed count.
+        // §17.4 (С9, PLUG-212): a merged copy-less `bb/` branch is
+        // «готова к удалению» only when `apply` would truly delete it —
+        // `deleteBranches: true`. With the flag off the sweep never
+        // removes it: `branch-kept-config`, never `merged-ready`.
         const branchOwner =
           deps.janitor.item(envId) ??
           deps.janitor
             .items()
             .find((i) => i.branch === branch && i.env_id !== envId);
-        if (!(apply && cfg.deleteBranches))
-            summary.readyItems.push({
+        const willDelete = apply && cfg.deleteBranches;
+        if (cfg.deleteBranches && !willDelete) {
+          // A report-mode pass under a deleteBranches config — the
+          // apply run would delete this branch.
+          summary.readyItems.push({
             envId,
             projectId: branchOwner?.project_id ?? null,
             path: null,
@@ -2598,7 +2680,9 @@ export function createJanitor(deps: JanitorDeps) {
             threadId: branchOwner?.thread_id ?? null,
             reason: "merged-ready",
           });
-        if (apply && cfg.deleteBranches) {
+        }
+        if (!cfg.deleteBranches) keep(summary, "branch-kept-config");
+        if (willDelete) {
           // §15/§16.3 (PLUG-199): delete atomically against the tip the
           // checks above verified — `branch -D` removes whatever the
           // ref points at NOW, so a mid-run `branch -f` would slip an
@@ -2619,16 +2703,22 @@ export function createJanitor(deps: JanitorDeps) {
         // The branch is gone or provably safe — a stale «брошено» row
         // for it closes either way. §17.4 (С9): the row is written in
         // report mode too — `janitor report` lists it as «готова к
-        // удалению» (`merged-ready`).
+        // удалению» (`merged-ready`) only when `deleteBranches` is on;
+        // otherwise `branch-kept-config` (PLUG-212).
         if (ledger) {
           deps.janitor.upsertItem(
             envId,
             {
-              state:
-                apply && cfg.deleteBranches ? "removed" : "kept",
-              reason:
-                apply && cfg.deleteBranches ? "removed" : "merged-ready",
-              removedAt: apply && cfg.deleteBranches ? at : null,
+              projectId: branchOwner?.project_id ?? null,
+              threadId: branchOwner?.thread_id ?? null,
+              branch,
+              state: willDelete ? "removed" : "kept",
+              reason: willDelete
+                ? "removed"
+                : cfg.deleteBranches
+                  ? "merged-ready"
+                  : "branch-kept-config",
+              removedAt: willDelete ? at : null,
             },
             at,
           );
@@ -3095,13 +3185,21 @@ export function createJanitor(deps: JanitorDeps) {
   const report = async (): Promise<JanitorReport> => {
     const cfgLoad = await deps.loadConfig();
     const items = deps.janitor.items();
+    const lastRun = deps.janitor.latestRun();
+    // §17.4 (С9, PLUG-212): the report lists rows of the LAST run —
+    // a row not refreshed by it (the env was deleted outside the
+    // janitor, moved under an excluded project, or its verdict
+    // changed) no longer claims «готова» or «брошено».
+    const since = lastRun?.started_at ?? Number.NEGATIVE_INFINITY;
+    const lastRunRow = (i: { last_checked_at: number | null }) =>
+      i.last_checked_at != null && i.last_checked_at >= since;
     return {
       config: cfgLoad.config,
       configErrors: cfgLoad.errors,
-      lastRun: deps.janitor.latestRun(),
+      lastRun,
       items,
       abandoned: items
-        .filter((i) => i.state === "reported")
+        .filter((i) => i.state === "reported" && lastRunRow(i))
         .map((i) => ({
           envId: i.env_id,
           projectId: i.project_id,
@@ -3114,7 +3212,12 @@ export function createJanitor(deps: JanitorDeps) {
       // remove. Written by report-mode and apply passes alike, so the
       // report answers «что удалится» in either mode.
       ready: items
-        .filter((i) => i.state !== "removed" && i.reason === "merged-ready")
+        .filter(
+          (i) =>
+            i.state !== "removed" &&
+            i.reason === "merged-ready" &&
+            lastRunRow(i),
+        )
         .map((i) => ({
           envId: i.env_id,
           projectId: i.project_id,

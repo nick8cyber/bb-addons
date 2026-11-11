@@ -191,6 +191,9 @@ function makeWorld(opts: {
   onThreadListCall?: (call: number) => void;
   /** Set false to drop the paged SDK seam → CLI `thread list` fallback. */
   sdkList?: boolean;
+  /** Set false to keep the paged list but drop the count seam — the
+   * verified paged path needs both, so the CLI fallback covers it. */
+  sdkCount?: boolean;
 }) {
   const clock = opts.clock ?? { t: Date.now() };
   const db = new Database(":memory:");
@@ -213,6 +216,11 @@ function makeWorld(opts: {
     archived?: boolean;
     limit?: number;
     offset?: number;
+  }[] = [];
+  let sdkCountCalls = 0;
+  const sdkCountArgs: {
+    includeArchived?: boolean;
+    includeHidden?: boolean;
   }[] = [];
   const allThreads = () => {
     const all = Object.entries(threads).flatMap(([envId, list]) =>
@@ -310,6 +318,18 @@ function makeWorld(opts: {
                 a.limit === undefined ? undefined : offset + a.limit,
               );
             },
+            ...(opts.sdkCount === false
+              ? {}
+              : {
+                  count: async (a: {
+                    includeArchived?: boolean;
+                    includeHidden?: boolean;
+                  }) => {
+                    sdkCountCalls += 1;
+                    sdkCountArgs.push(a);
+                    return { total: allThreads().length };
+                  },
+                }),
           }),
     },
     loadConfig: () => parseJanitorConfig(opts.config ?? CFG()),
@@ -332,8 +352,12 @@ function makeWorld(opts: {
     sent,
     warns,
     sdkListArgs,
+    sdkCountArgs,
     get sdkListCalls() {
       return sdkListCalls;
+    },
+    get sdkCountCalls() {
+      return sdkCountCalls;
     },
     get cliThreadListCalls() {
       return cliThreadListCalls;
@@ -910,8 +934,10 @@ test("a rolled-back cascade member leaves archivedNow — its env is not «remov
   assert.deepEqual(w.archivedCalls, ["thr_late"]);
   assert.deepEqual(w.unarchivedCalls, ["thr_late"]);
   assert.equal(w.janitor.item(envA.id)!.reason, "archive-failed");
-  // live again after the rollback — kept as «ready», not «removed»
-  assert.equal(w.janitor.item(envB.id)!.reason, "merged-ready");
+  // live again after the rollback — kept, not «removed» (PLUG-204);
+  // and not «готова» either — the live thread holds the copy
+  // (§17.4 С9, PLUG-212)
+  assert.equal(w.janitor.item(envB.id)!.reason, "threads-remaining");
 });
 
 test("removal is archive-only — `bb environment cleanup` is never called (§16.3)", async () => {
@@ -4465,4 +4491,248 @@ test("git below 2.39 refuses the whole run with a hint (§17.4 мелко 11)", 
   assert.ok(res.errors.some((e) => /2\.39/.test(e) && /git/.test(e)));
   assert.ok(w.warns.some((m) => /2\.39/.test(m)));
   assert.ok(existsSync(env.path));
+  // §17.4 (PLUG-212): the refusal is a RECORDED run — `janitor
+  // report` shows the failed pass instead of the last healthy one
+  const row = w.janitor.latestRun();
+  assert.ok(row, "the refused run is recorded");
+  assert.match(row!.error ?? "", /2\.39/);
+});
+
+// ── PLUG-212 (§17.4 ревью) ───────────────────────────────────────────
+
+// Ревью №1 [блокер]: offset paging can silently lose a thread — a
+// deletion or (un)pin on an already-read page shifts later rows up.
+// The count bracket + id dedup detects it: an unstable set retries
+// once, then the list is unproven — threads-unknown, never a hole.
+test("a thread deleted between pages → threads-unknown, not a silent hole (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  // 251 threads → two page fetches per sweep
+  const extras: ThreadSpec[] = Array.from({ length: 250 }, (_, i) => ({
+    id: `thr_x${i}`,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t,
+  }));
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    // a thread vanishes on EVERY page fetch — the set shifts under
+    // every traversal, so the list can never be proven
+    onThreadListCall: () => {
+      extras.pop();
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.kept["threads-unknown"], 1);
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  // the verification ran — count bracketed the traversal
+  assert.ok(w.sdkCountCalls > 0);
+  assert.ok(
+    w.sdkCountArgs.every(
+      (a) => a.includeArchived === true && a.includeHidden === true,
+    ),
+  );
+});
+
+// Same review, positive side: a thread that moved to a LATER page
+// (unpin) is read twice — dedup by id keeps the list complete and the
+// count check still passes.
+test("a thread shifting to a later page is deduplicated — the verified list still counts (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = Array.from({ length: 250 }, (_, i) => ({
+    id: `thr_x${i}`,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t,
+  }));
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    // mid-traversal the first row moves to the tail — it appears on
+    // two pages; dedup keeps the unique set equal to the count
+    onThreadListCall: (call) => {
+      if (call === 2) extras.push(extras.shift()!);
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.kept["threads-unknown"] ?? 0, 0);
+  assert.equal(res.removedCopies, 1);
+});
+
+// The verified path needs BOTH seams — `threads.list` without
+// `threads.count` cannot be trusted; the atomic CLI dump covers it.
+test("threads.list without threads.count falls back to the atomic CLI list (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    sdkCount: false,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(w.sdkCountCalls, 0);
+  assert.equal(w.cliThreadListCalls > 0, true);
+  assert.equal(res.removedCopies, 1);
+});
+
+// Ревью №2: `janitor report` lists rows of the LAST run — a row not
+// refreshed by it (env deleted outside the janitor) no longer claims
+// «готова к удалению».
+test("janitor report lists only rows of the last run — a gone env's «готова» row drops (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ mode: "report" }),
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  await w.jan.run();
+  assert.equal(w.janitor.item(env.id)!.reason, "merged-ready");
+  let rep = await w.jan.report();
+  assert.deepEqual(
+    rep.ready.map((r) => r.envId),
+    [env.id],
+  );
+  // BB deleted the env outside the janitor — its row goes stale
+  w.envSpecs.splice(0, 1);
+  rmSync(env.path, { recursive: true, force: true });
+  w.clock.t += 60_000;
+  await w.jan.run();
+  rep = await w.jan.report();
+  assert.ok(!rep.ready.some((r) => r.envId === env.id));
+  // …while the env's merged branch — now copy-less — is a fresh
+  // last-run row and still listed
+  assert.ok(rep.ready.some((r) => r.branch === env.branchName));
+});
+
+// Ревью №2b: a manually deleted branch's ledger row closes under
+// `ledger` — in report mode too, or it hangs as «готова» forever.
+test("a manually deleted branch's ledger row closes in report mode too (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["branch", "bb/gone", "main"]); // merged copy-less branch
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ mode: "report" }),
+  });
+  await w.jan.run();
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/gone`;
+  assert.equal(w.janitor.item(key)!.reason, "merged-ready");
+  git(repo, ["branch", "-D", "bb/gone"]);
+  w.clock.t += 60_000;
+  await w.jan.run();
+  // report mode wrote the closure — the row no longer says «готова»
+  assert.equal(w.janitor.item(key)!.state, "removed");
+  const rep = await w.jan.report();
+  assert.ok(!rep.ready.some((r) => r.envId === key));
+});
+
+// Ревью №3: «готова к удалению» is only what `apply` truly removes.
+// With deleteBranches:false the sweep never deletes the branch —
+// branch-kept-config, never merged-ready.
+test("deleteBranches:false — a merged copy-less branch is branch-kept-config, not «готова» (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["branch", "bb/keep", "main"]); // merged copy-less branch
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ deleteBranches: false }),
+  });
+  const res = await w.jan.run();
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/keep`;
+  assert.equal(res.orphanBranches, 1);
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-kept-config"], 1);
+  assert.ok(res.readyItems.every((i) => i.envId !== key));
+  assert.equal(w.janitor.item(key)!.state, "kept");
+  assert.equal(w.janitor.item(key)!.reason, "branch-kept-config");
+  const rep = await w.jan.report();
+  assert.ok(!rep.ready.some((r) => r.envId === key));
+  git(repo, ["rev-parse", "--verify", "bb/keep"]); // still there
+});
+
+// Same review, env side: an env apply cannot remove (a live thread
+// joined its cascade on the pre-archive re-read) is kept
+// `threads-remaining` — never «готова к удалению». The joining env's
+// thread enters memberEnvs only via the stale run-start set, so the
+// cascade failure blames the root's env alone — the second env is
+// processed-but-live, which the old code mislabeled merged-ready.
+test("apply leaves a copy held by live threads — not «готова» (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const envA = addEnv(repo, base, "a");
+  const envB = addEnv(repo, base, "b");
+  commitIn(envA.path, "wa.txt", "feat: a");
+  commitIn(envB.path, "wb.txt", "feat: b");
+  mergeEnv(repo, envA);
+  mergeEnv(repo, envB);
+  const t = Date.now();
+  const rootT: ThreadSpec = {
+    id: "thr_p",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  // envB's thread spawns mid-run and lands in thr_p's cascade on the
+  // pre-archive re-read — a processed-but-live thread of envB
+  const spawn: ThreadSpec = {
+    id: "thr_new",
+    status: "idle",
+    queuedWork: "none",
+    archivedAt: null,
+    updatedAt: t,
+    parentThreadId: "thr_p",
+    environmentId: envB.id,
+  };
+  let injected = false;
+  const w = makeWorld({
+    envs: [envA, envB],
+    threads: { [envA.id]: [rootT], [envB.id]: [] },
+    archiveFailFor: new Set(["thr_p"]),
+    clock: { t },
+    // run1: call1. run2: call2 = run-start sweep, call3 = the
+    // pre-archive re-read inside evalCascade — the spawn lands there
+    onThreadListCall: (call) => {
+      if (call === 3 && !injected) {
+        injected = true;
+        w.threadSpecs[envB.id]!.push(spawn);
+      }
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  // thr_new was archived, then rolled back — it stays live and
+  // processed, so envB is held by live threads, not «готова»
+  assert.equal(w.janitor.item(envB.id)!.reason, "threads-remaining");
+  assert.ok(!res.readyItems.some((i) => i.envId === envB.id));
+  assert.ok(existsSync(envB.path));
 });

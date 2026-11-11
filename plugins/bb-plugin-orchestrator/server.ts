@@ -775,6 +775,16 @@ export async function createPlugin(
       // §17.4 (С7): paged SDK list — the one-shot CLI dump overflowed
       // its buffer at ~5700 threads.
       list: (a) => bb.sdk.threads.list(a as never) as never,
+      // §17.4 (PLUG-212): count() brackets the paged traversal — a
+      // shifted page can silently lose a thread. Only wired when the
+      // SDK exposes it; otherwise the janitor falls back to the
+      // atomic one-shot CLI list.
+      ...(bb.sdk.threads.count
+        ? {
+            count: (a: never) =>
+              bb.sdk.threads.count(a as never) as never,
+          }
+        : {}),
     },
     loadConfig: janitorConfig,
     localHostId: async () => {
@@ -1504,6 +1514,17 @@ ${res.warnings
             lastJanitorRunAt = now();
             try {
               const res = await janitor.run({ dryRun });
+              // §17.4 (мелко 11): a refused pass is a recorded
+              // failure, not a quiet skip — `janitor run` exits
+              // non-zero so cron/a caller sees it; the run row in
+              // the ledger carries the reason for `janitor report`.
+              if (res.skipped === "unsupported-git") {
+                throw new OrchestratorError(
+                  "unsupported-git",
+                  res.errors[0] ??
+                    `git ≥ 2.39 required — обновите git на этой машине`,
+                );
+              }
               const keptText = Object.entries(res.kept)
                 .map(([r, n]) => `${r}=${n}`)
                 .join(" ");
