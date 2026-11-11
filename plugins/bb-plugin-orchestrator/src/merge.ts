@@ -2,26 +2,33 @@
  * `merge` — §14 (+ §16.2/§16.6): merge a finished round's result into the
  * coordinator's worktree. Only the delegation's own coordinator may call it;
  * the target copy is that thread's environment. Refusals carry codes:
- * `dirty-result`, `protected-branch`, `stale-result`, `not-done`,
- * `no-result`, `no-environment`, `dirty-coordinator`, `detached-head`,
- * `unknown-branch`, `result-missing`, `merge-in-progress`.
+ * `dirty-result`, `protected-branch`, `stale-result`, `stale-check-failed`,
+ * `not-done`, `no-result`, `no-environment`, `dirty-coordinator`,
+ * `detached-head`, `unknown-branch`, `result-missing`, `merge-in-progress`,
+ * `already-merged`, `fix-delegated`, `merge-hook-failed`, `copy-not-restored`.
  *
- * Order: row checks → coordinator environment → copy lock → clean copy +
- * on-branch → target branch (`--into` or current, not protected) →
- * §16.2 stale check (result_sha vs the executor copy's HEAD) →
- * `git cat-file -e` → `git merge --no-ff --no-edit -m "merge <KEY> r<N>
- * (<sha7>)" <result_sha>` under the repo's configured identity (never
- * `--author`/`-c user.*`/`--no-verify`). A conflict aborts back to a clean
- * copy (`merge_status = conflict`), tells the coordinator one line, and —
- * when the `mergeAutofix` setting is on and `--no-autofix` was not given —
+ * Order: row checks (done, result, `merged`/`fix-delegated` repeats) →
+ * coordinator environment → copy lock (a lock file in the copy's git dir,
+ * §14 check 4) → clean copy + on-branch → target branch (`--into`, local
+ * branch only, never protected) → §16.2 stale check (result_sha vs the
+ * executor copy's HEAD) → `git cat-file -e` → `git merge --no-ff --no-edit
+ * -m "merge <KEY> r<N> (<sha7>)" <result_sha>` under the repo's configured
+ * identity (never `--author`/`-c user.*`/`--no-verify`), with a ~10 min
+ * ceiling for hooks. A conflict aborts back to a clean copy
+ * (`merge_status = conflict`), tells the coordinator one line, and — when
+ * the `mergeAutofix` setting is on and `--no-autofix` was not given —
  * delegates a fix round (same task and level, `--from result_sha`) and
- * records `fix-delegated`. `--dry-run` runs the checks and
+ * records `fix-delegated`. A merge that stops without conflicted files
+ * (hook refusal, timeout) is `merge-hook-failed` — no fix round. Whatever
+ * failed, the copy must return to its original branch and HEAD with a
+ * clean status, else `copy-not-restored`. `--dry-run` runs the checks and
  * `git merge-tree --write-tree` only; the copy is not touched.
  *
- * git operations run off the `delegate` queue (§16.8): the per-copy lock
- * is the §14 check-4 guard, the autofix delegation itself goes through
- * `delegate`, which is queued internally.
+ * git operations run off the `delegate` queue (§16.8): the autofix
+ * delegation itself goes through `delegate`, which is queued internally.
  */
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { OrchestratorError } from "./errors.js";
 import { runChecked, type BbCli } from "./bb-cli.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
@@ -32,6 +39,12 @@ import type { DelegationRow, DelegationStore } from "./store.js";
  * `janitor.protectedBranches` setting once the janitor config lands.
  */
 export const DEFAULT_PROTECTED_BRANCHES = ["main", "master", "dev"] as const;
+
+/** §14: merge hooks may run test suites — well above cmd's 60 s default. */
+const MERGE_TIMEOUT_MS = 10 * 60_000;
+
+/** §14 check 4: lock file inside the copy's git dir (per-worktree). */
+const MERGE_LOCK_NAME = "orchestrator-merge.lock";
 
 export interface MergeGitResult {
   exitCode: number;
@@ -53,7 +66,11 @@ export interface MergeDeps {
   store: DelegationStore;
   bbCli: BbCli;
   /** `git` inside a worktree; returns exit/stdout/stderr, never throws. */
-  git(repo: string, args: string[]): Promise<MergeGitResult>;
+  git(
+    repo: string,
+    args: string[],
+    opts?: { timeoutMs?: number },
+  ): Promise<MergeGitResult>;
   /** A thread's environment (SDK or `bb environment show`). */
   environment(threadId: string): Promise<{ path?: string | null } | null>;
   /** An environment by id — the §16.2 stale check on `result_env_id`. */
@@ -106,8 +123,10 @@ export interface MergeOutcome {
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const sha7 = (sha: string) => sha.slice(0, 7);
 
-/** §14 check 4: one merge per coordinator copy at a time, per process. */
-const copyLocks = new Set<string>();
+type Git = (
+  args: string[],
+  opts?: { timeoutMs?: number },
+) => Promise<MergeGitResult>;
 
 export async function runMerge(
   params: MergeParams,
@@ -158,6 +177,22 @@ export async function runMerge(
     );
   }
 
+  // §14 repeat calls: merged and fix-delegated rows are terminal for
+  // `merge` — the fix round's own row is what gets merged next.
+  if (row.merge_status === "merged") {
+    throw new OrchestratorError(
+      "already-merged",
+      `делегирование ${row.id} уже влито в ${row.merged_into ?? "?"} (${row.merged_sha ? sha7(row.merged_sha) : "?"})`,
+    );
+  }
+  if (row.merge_status === "fix-delegated") {
+    throw new OrchestratorError(
+      "fix-delegated",
+      `по делегированию ${row.id} уже раздан заход разбора конфликта`,
+      "дождитесь его done и влейте его итог: `bb orchestrator merge <id захода разбора>`",
+    );
+  }
+
   const env = await deps
     .environment(params.callerThreadId)
     .catch((e: unknown) => {
@@ -174,7 +209,7 @@ export async function runMerge(
     );
   }
   const repo = env.path;
-  const git = (args: string[]) => deps.git(repo, args);
+  const git: Git = (args, opts) => deps.git(repo, args, opts);
   const gitText = async (args: string[]): Promise<string> => {
     const r = await git(args);
     if (r.exitCode !== 0) {
@@ -188,13 +223,7 @@ export async function runMerge(
     return r.stdout;
   };
 
-  if (copyLocks.has(repo)) {
-    throw new OrchestratorError(
-      "merge-in-progress",
-      `a merge is already running in ${repo}`,
-    );
-  }
-  copyLocks.add(repo);
+  const releaseLock = await acquireCopyLock(gitText, repo);
   try {
     // §14 check 2: the coordinator copy is clean and sits on a branch.
     const porcelain = await gitText(["status", "--porcelain"]);
@@ -218,9 +247,30 @@ export async function runMerge(
       );
     }
 
-    // §14 check 3: the merge target is `--into` or the current branch, and
-    // never a protected branch — those are `release` territory.
-    const into = (params.into ?? "").trim() || currentBranch;
+    // §14 check 3: the merge target is `--into` or the current branch.
+    // `--into` must name a LOCAL branch — `check-ref-format --branch`
+    // validates the name, `show-ref --verify refs/heads/<name>` proves it
+    // is a local branch (ref forms, tags and SHAs are refused). The
+    // protected list sees the normalized name.
+    let into = currentBranch;
+    if (params.into?.trim()) {
+      const fmt = await git([
+        "check-ref-format",
+        "--branch",
+        params.into.trim(),
+      ]);
+      let normalized = fmt.exitCode === 0 ? fmt.stdout.trim() : "";
+      if (normalized.startsWith("refs/heads/")) {
+        normalized = normalized.slice("refs/heads/".length);
+      }
+      if (!normalized) {
+        throw new OrchestratorError(
+          "unknown-branch",
+          `ветка-приёмник ${params.into.trim()} — не имя локальной ветки`,
+        );
+      }
+      into = normalized;
+    }
     const protectedBranches =
       deps.protectedBranches ?? DEFAULT_PROTECTED_BRANCHES;
     if (protectedBranches.includes(into)) {
@@ -230,17 +280,16 @@ export async function runMerge(
         "в защищённые ветки код уходит только через `bb orchestrator release`",
       );
     }
-    if (into !== currentBranch) {
-      const verify = await git([
-        "rev-parse",
+    if (params.into?.trim()) {
+      const local = await git([
+        "show-ref",
         "--verify",
-        "--quiet",
-        `${into}^{commit}`,
+        `refs/heads/${into}`,
       ]);
-      if (verify.exitCode !== 0) {
+      if (local.exitCode !== 0) {
         throw new OrchestratorError(
           "unknown-branch",
-          `ветка-приёмник ${into} не существует`,
+          `ветка-приёмник ${into} — не локальная ветка копии`,
         );
       }
     }
@@ -269,10 +318,14 @@ export async function runMerge(
         into,
         resultSha,
       ]);
-      const lines = probe.stdout
-        .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0);
+      // merge-tree output: the tree oid, then conflicted file names up
+      // to the first blank line; informational messages follow it and
+      // are not file names.
+      const conflictFiles: string[] = [];
+      for (const line of probe.stdout.split("\n").slice(1)) {
+        if (!line.trim()) break;
+        conflictFiles.push(line.trim());
+      }
       return {
         ok: true,
         dryRun: true,
@@ -281,74 +334,87 @@ export async function runMerge(
         round: row.round,
         into,
         wouldConflict: probe.exitCode !== 0,
-        conflictFiles: probe.exitCode !== 0 ? lines.slice(1) : [],
+        conflictFiles: probe.exitCode !== 0 ? conflictFiles : [],
       };
     }
 
     // Move the clean copy onto the target branch — only now, so refused
     // calls leave the copy untouched.
-    if (into !== currentBranch) {
-      await gitText(["checkout", into]);
-    }
-    const targetTip = (await gitText(["rev-parse", "HEAD"])).trim();
-    const mergeRes = await git([
-      "merge",
-      "--no-ff",
-      "--no-edit",
-      "-m",
-      `merge ${row.task_key} r${row.round} (${sha7(resultSha)})`,
-      resultSha,
-    ]);
+    const originalHead = (await gitText(["rev-parse", "HEAD"])).trim();
+    let conflictFiles: string[] | null = null;
+    let failure: OrchestratorError | null = null;
+    let targetTip = "";
+    try {
+      if (into !== currentBranch) {
+        await gitText(["checkout", into]);
+      }
+      targetTip = (await gitText(["rev-parse", "HEAD"])).trim();
+      const mergeRes = await git(
+        [
+          "merge",
+          "--no-ff",
+          "--no-edit",
+          "-m",
+          `merge ${row.task_key} r${row.round} (${sha7(resultSha)})`,
+          resultSha,
+        ],
+        { timeoutMs: MERGE_TIMEOUT_MS },
+      );
 
-    if (mergeRes.exitCode === 0) {
-      const mergedSha = (await gitText(["rev-parse", "HEAD"])).trim();
-      store.setMerged(row.id, { into, sha: mergedSha });
-      await comment(row, `Влито в ${into} (${sha7(mergedSha)})`, deps);
-      return {
-        ok: true,
-        delegationId: row.id,
-        taskKey: row.task_key,
-        round: row.round,
-        into,
-        mergeStatus: "merged",
-        mergedSha,
-      };
+      if (mergeRes.exitCode === 0) {
+        const mergedSha = (await gitText(["rev-parse", "HEAD"])).trim();
+        store.setMerged(row.id, { into, sha: mergedSha });
+        await comment(row, `Влито в ${into} (${sha7(mergedSha)})`, deps);
+        return {
+          ok: true,
+          delegationId: row.id,
+          taskKey: row.task_key,
+          round: row.round,
+          into,
+          mergeStatus: "merged",
+          mergedSha,
+        };
+      }
+
+      // Failure: conflicted files mean a real conflict; a merge that
+      // stopped without any (hook refusal, timeout) is `merge-hook-failed`
+      // and gets no fix round (§14).
+      const unmerged = await unmergedFiles(git);
+      if (unmerged.length > 0) {
+        conflictFiles = unmerged;
+      } else {
+        failure = new OrchestratorError(
+          "merge-hook-failed",
+          `git merge не завершился без конфликтных файлов` +
+            ` (отказ хука или таймаут, exit ${mergeRes.exitCode}): ` +
+            `${(mergeRes.stderr || mergeRes.stdout).trim() || "no output"}`,
+        );
+      }
+    } catch (e) {
+      failure =
+        e instanceof OrchestratorError
+          ? e
+          : new OrchestratorError("git-failed", message(e));
     }
 
-    // Failure: a merge in progress means conflicts; anything else is a
-    // git error — record `failed` and surface it.
-    const mergeHead = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
-    if (mergeHead.exitCode !== 0) {
+    // §14: whatever failed, the copy returns to the original branch and
+    // HEAD with a clean status — abort a dangling merge, switch back.
+    const restoreError = await restoreCopy(
+      git,
+      currentBranch,
+      originalHead,
+    );
+    if (restoreError) {
       store.setMergeStatus(row.id, "failed");
       throw new OrchestratorError(
-        "git-failed",
-        `git merge failed (exit ${mergeRes.exitCode}): ${
-          (mergeRes.stderr || mergeRes.stdout).trim() || "no output"
-        }`,
+        "copy-not-restored",
+        `копия координатора не вернулась в исходное состояние: ${restoreError}`,
+        `копия ${repo} — разберите вручную, там могло остаться незавершённое слияние`,
       );
     }
-    const conflictFiles = (
-      await gitText(["diff", "--name-only", "--diff-filter=U"]).catch(
-        () => "",
-      )
-    )
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
-    await git(["merge", "--abort"]);
-    const stillMerging = await git([
-      "rev-parse",
-      "-q",
-      "--verify",
-      "MERGE_HEAD",
-    ]);
-    if (stillMerging.exitCode === 0) {
+    if (failure) {
       store.setMergeStatus(row.id, "failed");
-      throw new OrchestratorError(
-        "git-failed",
-        "git merge --abort did not return the copy to a clean state",
-        `копия ${repo} посреди слияния — разберите вручную`,
-      );
+      throw failure;
     }
 
     store.setMergeStatus(row.id, "conflict");
@@ -358,7 +424,7 @@ export async function runMerge(
       taskKey: row.task_key,
       round: row.round,
       into,
-      conflictFiles,
+      conflictFiles: conflictFiles ?? [],
     };
 
     // §16.6: autofix needs the `mergeAutofix` setting AND no --no-autofix.
@@ -367,7 +433,7 @@ export async function runMerge(
       await notifyCoordinator(
         row,
         `${row.task_key}: вливание захода ${row.round} в ${into} — конфликт` +
-          `${conflictFiles.length ? ` (${conflictFiles.slice(0, 10).join(", ")})` : ""}. ` +
+          `${base.conflictFiles.length ? ` (${base.conflictFiles.slice(0, 10).join(", ")})` : ""}. ` +
           `Разбор — вручную или новым заходом delegate (--from ${sha7(resultSha)})`,
         deps,
       );
@@ -419,40 +485,173 @@ export async function runMerge(
       };
     }
   } finally {
-    copyLocks.delete(repo);
+    releaseLock();
   }
+}
+
+/**
+ * §14: the coordinator copy must come back to `branch` at `head` with a
+ * clean `git status` after any failed merge. Returns a description of
+ * what is still wrong, or null when the copy is restored.
+ */
+async function restoreCopy(
+  git: Git,
+  branch: string,
+  head: string,
+): Promise<string | null> {
+  const merging = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+  if (merging.exitCode === 0) {
+    const abort = await git(["merge", "--abort"]);
+    if (abort.exitCode !== 0) {
+      return (
+        `git merge --abort: ` +
+        `${(abort.stderr || abort.stdout).trim() || "no output"}`
+      );
+    }
+  }
+  const onBranch = await git(["symbolic-ref", "--short", "HEAD"]);
+  if (onBranch.exitCode !== 0 || onBranch.stdout.trim() !== branch) {
+    const checkout = await git(["checkout", branch]);
+    if (checkout.exitCode !== 0) {
+      return (
+        `git checkout ${branch}: ` +
+        `${(checkout.stderr || checkout.stdout).trim() || "no output"}`
+      );
+    }
+  }
+  const status = await git(["status", "--porcelain"]);
+  if (status.exitCode !== 0) {
+    return (
+      `git status: ` +
+      `${(status.stderr || status.stdout).trim() || "no output"}`
+    );
+  }
+  if (status.stdout.trim()) {
+    const lines = status.stdout.trim().split("\n").slice(0, 5).join("; ");
+    return `копия грязная: ${lines}`;
+  }
+  const tip = await git(["rev-parse", "HEAD"]);
+  if (tip.exitCode !== 0 || tip.stdout.trim() !== head) {
+    return `HEAD ${tip.stdout.trim() || "?"} ≠ ${sha7(head)}`;
+  }
+  return null;
+}
+
+/** Conflicted (unmerged) paths of an in-progress merge; empty on error. */
+async function unmergedFiles(git: Git): Promise<string[]> {
+  const r = await git(["diff", "--name-only", "--diff-filter=U"]);
+  if (r.exitCode !== 0) return [];
+  return r.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * §14 check 4: one merge per coordinator copy — a lock file in the
+ * copy's own git dir (`--absolute-git-dir` is per-worktree), so the
+ * guard holds across processes, not just in plugin memory. A lock whose
+ * owner pid is dead is stale and broken once.
+ */
+async function acquireCopyLock(
+  gitText: (args: string[]) => Promise<string>,
+  repo: string,
+): Promise<() => void> {
+  const gitDir = (await gitText(["rev-parse", "--absolute-git-dir"])).trim();
+  const lockPath = join(gitDir, MERGE_LOCK_NAME);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeFileSync(
+        lockPath,
+        `${process.pid}\n${new Date().toISOString()}\n`,
+        { flag: "wx" },
+      );
+      return () => {
+        try {
+          rmSync(lockPath, { force: true });
+        } catch {
+          /* releasing the lock is best-effort */
+        }
+      };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw new OrchestratorError(
+          "git-failed",
+          `cannot create merge lock ${lockPath}: ${message(e)}`,
+        );
+      }
+      let pid = NaN;
+      try {
+        pid = Number(readFileSync(lockPath, "utf8").split("\n")[0] ?? "");
+      } catch {
+        /* an unreadable lock cannot be proven stale */
+      }
+      if (Number.isInteger(pid) && pid > 0 && !pidAlive(pid)) {
+        rmSync(lockPath, { force: true });
+        continue;
+      }
+      throw new OrchestratorError(
+        "merge-in-progress",
+        `a merge is already running in ${repo}`,
+      );
+    }
+  }
+  throw new OrchestratorError(
+    "merge-in-progress",
+    `a merge is already running in ${repo}`,
+  );
 }
 
 /**
  * §16.2: compare the recorded `result_sha` to the executor copy's HEAD.
  * The env comes from `result_env_id`, else the executor thread's
- * environment. An unreadable or gone copy cannot be written to either —
- * the check is skipped, not failed.
+ * environment. A copy confirmed gone (no env record, no path) skips the
+ * check; a copy that cannot be read refuses `stale-check-failed`.
  */
 async function checkStaleResult(
   row: DelegationRow,
   resultSha: string,
   deps: MergeDeps,
 ): Promise<void> {
+  const lookup = row.result_env_id
+    ? () => deps.environmentById?.(row.result_env_id as string)
+    : row.thread_id
+      ? () => deps.environment(row.thread_id as string)
+      : null;
+  if (!lookup) return;
+  let env: { path?: string | null } | null;
   try {
-    const env = row.result_env_id
-      ? await deps.environmentById?.(row.result_env_id)
-      : row.thread_id
-        ? await deps.environment(row.thread_id)
-        : null;
-    if (!env?.path) return;
-    const head = await deps.git(env.path, ["rev-parse", "HEAD"]);
-    if (head.exitCode !== 0) return;
-    if (head.stdout.trim() !== resultSha) {
-      throw new OrchestratorError(
-        "stale-result",
-        `итог захода устарел: HEAD копии исполнителя ${head.stdout.trim().slice(0, 7)} ≠ записанного ${sha7(resultSha)}`,
-        "исполнитель продолжил работу после done — дождитесь done нового захода или проверьте копию",
-      );
-    }
+    env = (await lookup()) ?? null;
   } catch (e) {
-    if (e instanceof OrchestratorError) throw e;
-    deps.log?.warn?.(`orchestrator: stale-result check skipped: ${message(e)}`);
+    throw new OrchestratorError(
+      "stale-check-failed",
+      `не удалось прочитать копию исполнителя: ${message(e)}`,
+    );
+  }
+  if (!env?.path) return;
+  const head = await deps.git(env.path, ["rev-parse", "HEAD"]);
+  if (head.exitCode !== 0) {
+    throw new OrchestratorError(
+      "stale-check-failed",
+      `не удалось прочитать HEAD копии исполнителя ${env.path}: ` +
+        `${(head.stderr || head.stdout).trim() || "no output"}`,
+    );
+  }
+  if (head.stdout.trim() !== resultSha) {
+    throw new OrchestratorError(
+      "stale-result",
+      `итог захода устарел: HEAD копии исполнителя ${head.stdout.trim().slice(0, 7)} ≠ записанного ${sha7(resultSha)}`,
+      "исполнитель продолжил работу после done — дождитесь done нового захода или проверьте копию",
+    );
   }
 }
 

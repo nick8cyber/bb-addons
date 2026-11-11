@@ -535,8 +535,10 @@ export async function createPlugin(
     runMerge(input, {
       store,
       bbCli,
-      git: async (repo, args) => {
-        const res = await cmd.run("git", ["-C", repo, ...args]);
+      git: async (repo, args, opts) => {
+        const res = await cmd.run("git", ["-C", repo, ...args], {
+          timeoutMs: opts?.timeoutMs,
+        });
         return {
           exitCode: res.exitCode,
           stdout: res.stdout,
