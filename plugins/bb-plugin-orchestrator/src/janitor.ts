@@ -6,13 +6,20 @@
  *
  * «Влитая копия»: the copy's HEAD and the copy's own branch (the env's
  * `branchName`, when it exists and differs from the checked-out one)
- * are ancestors of `origin/<protected>` or the env's `mergeBaseBranch`,
+ * are ancestors of remote-tracking refs only — `origin/<protected>` or
+ * the env's `mergeBaseBranch` resolved under `refs/remotes/origin/` —
  * checked right after this run's successful `git fetch` (a failed
- * fetch skips the whole repository). Other local branches are shared
- * repo-wide and do not belong to the copy — an unmerged foreign branch
- * never blocks a copy's removal.
+ * fetch skips the whole repository). Local-only merges never count.
+ * Other local branches are shared repo-wide and do not belong to the
+ * copy — an unmerged foreign branch never blocks a copy's removal.
  */
-import { existsSync, readdirSync, readlinkSync, statSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { runJson, type BbCli } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
@@ -67,6 +74,7 @@ interface EnvDto {
   status?: string | null;
   environmentProviderId?: string | null;
   managed?: boolean;
+  createdAt?: number | null;
   updatedAt?: number | null;
 }
 
@@ -143,11 +151,21 @@ async function gitOk(
 
 /**
  * §15 cond 5: a live process whose cwd sits inside the copy blocks
- * removal. Only same-uid processes count (other users are unreadable and
- * out of scope anyway).
+ * removal. Only same-uid processes count — the owner is read from
+ * `/proc/<pid>` itself (the `cwd` link's stat reports the *directory's*
+ * owner, not the process's). `env.path` may contain symlinks while
+ * `/proc/<pid>/cwd` is always canonical, so paths are compared after
+ * `realpath`.
  */
 export function defaultHasProcessIn(root: string): boolean {
-  const prefix = root.endsWith("/") ? root : `${root}/`;
+  let realRoot = root;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    // path vanished between checks — no process can sit inside it
+    return false;
+  }
+  const roots = [realRoot, root];
   const uid = typeof process.getuid === "function" ? process.getuid() : -1;
   let pids: string[];
   try {
@@ -158,11 +176,14 @@ export function defaultHasProcessIn(root: string): boolean {
   for (const pid of pids) {
     try {
       if (uid >= 0) {
-        const st = statSync(`/proc/${pid}/cwd`);
+        const st = statSync(`/proc/${pid}`);
         if (st.uid !== uid) continue;
       }
       const target = readlinkSync(`/proc/${pid}/cwd`);
-      if (target === root || target.startsWith(prefix)) return true;
+      for (const r of roots) {
+        const prefix = r.endsWith("/") ? r : `${r}/`;
+        if (target === r || target.startsWith(prefix)) return true;
+      }
     } catch {
       // the process exited or the cwd is unreadable — not ours
     }
@@ -192,6 +213,11 @@ export function createJanitor(deps: JanitorDeps) {
   const log = deps.log ?? {};
   const hasProcessIn =
     deps.hasProcessIn ?? (async (p: string) => defaultHasProcessIn(p));
+  // §15: «--dry-run и mode: report в базу ничего не пишут, кроме отчёта
+  // прогона». The merged-sighting streak and the daily-notify watermark
+  // still work inside such runs — kept in memory only, per process.
+  const firstSeenMem = new Map<string, number>();
+  const notifyMem = new Map<string, number>();
 
   const listEnvironments = async (): Promise<EnvDto[]> =>
     runJson<EnvDto[]>(deps.bbCli, ["environment", "list", "--json"], {
@@ -217,14 +243,26 @@ export function createJanitor(deps: JanitorDeps) {
     }
   };
 
-  /** Non-empty interactions list = a request is waiting (§15 cond 4). */
+  /**
+   * §15 cond 4: a request waiting on the thread blocks removal.
+   * `bb thread interactions list` returns only awaiting requests; the
+   * status check is a guard in case resolved history ever leaks in —
+   * then only `pending`/`resolving` count. Items without a `status`
+   * field are awaiting by contract.
+   */
   const hasPendingInteraction = async (threadId: string): Promise<boolean> => {
     try {
       const list = await runJson<unknown[]>(
         deps.bbCli,
         ["thread", "interactions", "list", threadId, "--json"],
       );
-      return Array.isArray(list) && list.length > 0;
+      if (!Array.isArray(list)) return false;
+      return list.some((i) => {
+        const status = (i as { status?: unknown } | null)?.status;
+        return (
+          status === undefined || status === "pending" || status === "resolving"
+        );
+      });
     } catch {
       // Cannot prove there is no pending request — assume there is one.
       return true;
@@ -242,7 +280,10 @@ export function createJanitor(deps: JanitorDeps) {
   /**
    * Refs the copy's commits must be ancestors of: `origin/<protected>`
    * for every protected branch present on the remote, plus the env's
-   * `mergeBaseBranch`. Local-only merging (§14) never counts.
+   * `mergeBaseBranch` taken strictly as a remote-tracking ref. A merge
+   * into a local branch (§14, `bb orchestrator merge`) is not «влита»
+   * until it reaches origin; bare SHAs and local-only names resolve to
+   * nothing under `refs/remotes/origin/` and are ignored.
    */
   const targetRefs = async (
     env: EnvDto,
@@ -252,28 +293,77 @@ export function createJanitor(deps: JanitorDeps) {
     const targets = [...protectedTargets];
     const mbb = env.mergeBaseBranch?.trim();
     if (mbb) {
+      const ref = mbb.startsWith("origin/")
+        ? `refs/remotes/${mbb}`
+        : `refs/remotes/origin/${mbb}`;
       if (
         await gitOk(deps.cmd, repoDir, [
           "rev-parse",
           "--verify",
           "--quiet",
-          mbb,
+          ref,
         ])
       ) {
-        targets.push(mbb);
-      } else if (
-        !mbb.startsWith("origin/") &&
-        (await gitOk(deps.cmd, repoDir, [
-          "rev-parse",
-          "--verify",
-          "--quiet",
-          `origin/${mbb}`,
-        ]))
-      ) {
-        targets.push(`origin/${mbb}`);
+        targets.push(ref);
       }
     }
     return [...new Set(targets)];
+  };
+
+  /**
+   * §15 cond 2: the copy's own commits — commits of its branch after
+   * the branch's creation point. The branch reflog's oldest entry
+   * («branch: Created from …») names the sha the branch started at;
+   * `rev-list <sha>..<branch>` counts everything it gained since. With
+   * no reflog (expired, or `ref` unborn), the env's `createdAt` is
+   * compared against commit times (`--max-age`). No data at all → no
+   * own commits, per spec.
+   */
+  const countOwnCommits = async (
+    env: EnvDto,
+    path: string,
+    ownBranch: string | undefined,
+  ): Promise<number> => {
+    const ref = ownBranch?.trim() || env.branchName?.trim() || "HEAD";
+    const reflog = await gitOut(deps.cmd, path, [
+      "reflog",
+      "show",
+      ref,
+      "--format=%H %gs",
+    ]);
+    if (reflog) {
+      const oldest = reflog
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .pop();
+      if (oldest && /Created from /.test(oldest)) {
+        const creationSha = oldest.slice(0, oldest.indexOf(" "));
+        if (/^[0-9a-f]{40}$/i.test(creationSha)) {
+          const count = (
+            await gitOut(deps.cmd, path, [
+              "rev-list",
+              "--count",
+              `${creationSha}..${ref}`,
+            ])
+          )?.trim();
+          if (count) return Number(count) || 0;
+        }
+      }
+    }
+    const createdAt = env.createdAt;
+    if (typeof createdAt === "number" && createdAt > 0) {
+      const count = (
+        await gitOut(deps.cmd, path, [
+          "rev-list",
+          "--count",
+          ref,
+          `--max-age=${Math.floor(createdAt / 1000)}`,
+        ])
+      )?.trim();
+      if (count) return Number(count) || 0;
+    }
+    return 0;
   };
 
   const run = async (
@@ -352,7 +442,7 @@ export function createJanitor(deps: JanitorDeps) {
     try {
       await runBody(effective, apply, summary);
       // A --dry-run preview never writes to the coordinator either.
-      if (!opts.dryRun) await notifyCoordinators(summary);
+      if (!opts.dryRun) await notifyCoordinators(summary, apply);
       finish();
     } catch (e) {
       const text = message(e);
@@ -408,7 +498,8 @@ export function createJanitor(deps: JanitorDeps) {
       repos.set(commonDir, slot);
     }
 
-    const reportedNow: { env: EnvDto; reason: string }[] = [];
+    const reportedNow: { env: EnvDto; reason: string; threadId: string | null }[] =
+      [];
 
     for (const { root, envs: repoEnvs } of repos.values()) {
       const fetched = await gitOk(deps.cmd, root, [
@@ -419,22 +510,26 @@ export function createJanitor(deps: JanitorDeps) {
       if (!fetched) {
         keep(summary, "fetch-failed", repoEnvs.length);
         // The run never saw these copies merged, so their «влита» streak
-        // cannot count this pass — the clock pauses via a null marker
-        // and restarts on the next verified-merged run.
+        // cannot count this pass — the clock pauses and restarts on the
+        // next verified-merged run.
         for (const env of repoEnvs) {
-          const prev = deps.janitor.item(env.id);
-          if (prev?.first_seen_at != null) {
-            deps.janitor.upsertItem(
-              env.id,
-              {
-                projectId: env.projectId ?? null,
-                path: env.path ?? null,
-                branch: env.branchName ?? null,
-                state: prev.state,
-                firstSeenAt: null,
-              },
-              now(),
-            );
+          if (apply) {
+            const prev = deps.janitor.item(env.id);
+            if (prev?.first_seen_at != null) {
+              deps.janitor.upsertItem(
+                env.id,
+                {
+                  projectId: env.projectId ?? null,
+                  path: env.path ?? null,
+                  branch: env.branchName ?? null,
+                  state: prev.state,
+                  firstSeenAt: null,
+                },
+                now(),
+              );
+            }
+          } else {
+            firstSeenMem.delete(env.id);
           }
         }
         continue;
@@ -442,15 +537,16 @@ export function createJanitor(deps: JanitorDeps) {
 
       const protectedTargets: string[] = [];
       for (const b of cfg.protectedBranches) {
+        const ref = `refs/remotes/origin/${b}`;
         if (
           await gitOk(deps.cmd, root, [
             "rev-parse",
             "--verify",
             "--quiet",
-            `origin/${b}`,
+            ref,
           ])
         ) {
-          protectedTargets.push(`origin/${b}`);
+          protectedTargets.push(ref);
         }
       }
 
@@ -557,14 +653,14 @@ export function createJanitor(deps: JanitorDeps) {
 
     // «Отчёт, без удаления» (§15): abandoned copies collected this run —
     // also used by the daily coordinator message below.
-    for (const { env, reason } of reportedNow) {
+    for (const { env, reason, threadId } of reportedNow) {
       const item = deps.janitor.item(env.id);
       summary.reported.push({
         envId: env.id,
         projectId: env.projectId ?? null,
         path: env.path ?? null,
         branch: env.branchName ?? item?.branch ?? null,
-        threadId: item?.thread_id ?? null,
+        threadId: item?.thread_id ?? threadId,
         reason,
       });
     }
@@ -580,10 +676,14 @@ export function createJanitor(deps: JanitorDeps) {
     ancestorCache: Map<string, boolean>,
     checkedOut: Set<string>,
     delegatedThreads: Set<string>,
-    reportedNow: { env: EnvDto; reason: string }[],
+    reportedNow: { env: EnvDto; reason: string; threadId: string | null }[],
   ): Promise<boolean> => {
     const at = now();
     const path = env.path!;
+    // §15: report-mode and --dry-run passes write nothing to the db —
+    // only janitor_runs (the run's own report). The merged-sighting
+    // streak then lives in `firstSeenMem` for this process.
+    const persist = apply;
     const prev = deps.janitor.item(env.id);
     const upsert = (
       state: JanitorItemState,
@@ -632,9 +732,10 @@ export function createJanitor(deps: JanitorDeps) {
     const allArchived = (threads ?? []).length > 0 && liveThreads.length === 0;
 
     const fail = (state: JanitorItemState, reason: string): false => {
-      upsert(state, reason, { firstSeenAt: null });
+      if (persist) upsert(state, reason, { firstSeenAt: null });
+      else firstSeenMem.delete(env.id);
       keep(summary, reason);
-      if (state === "reported") reportedNow.push({ env, reason });
+      if (state === "reported") reportedNow.push({ env, reason, threadId });
       return false;
     };
 
@@ -652,10 +753,18 @@ export function createJanitor(deps: JanitorDeps) {
     )?.trim();
 
     // §15 cond 3 facts are computed up front: they decide the abandoned
-    // reason for unmerged copies too («грязное с тем же простоем»).
-    const dirty =
-      ((await gitOut(deps.cmd, path, ["status", "--porcelain"])) ?? "").trim()
-        .length > 0;
+    // reason for unmerged copies too («грязное с тем же простоем»). The
+    // flags override repo config like status.showUntrackedFiles=no —
+    // hiding an untracked file must never pass as «clean». A failed or
+    // timed-out status means cleanliness is unproven, not proven.
+    const statusText = await gitOut(deps.cmd, path, [
+      "status",
+      "--porcelain",
+      "--untracked-files=all",
+      "--ignore-submodules=none",
+    ]);
+    const statusFailed = statusText === null;
+    const dirty = statusText !== null && statusText.trim().length > 0;
     const gitDirRaw = await gitOut(deps.cmd, path, [
       "rev-parse",
       "--git-dir",
@@ -737,21 +846,15 @@ export function createJanitor(deps: JanitorDeps) {
 
     // The copy stays merged from the first run that saw it so; an
     // unmerged sighting between runs resets the clock via `fail` above.
-    const firstSeenAt = prev?.first_seen_at ?? at;
+    const firstSeenAt =
+      prev?.first_seen_at ?? firstSeenMem.get(env.id) ?? at;
+    if (!persist) firstSeenMem.set(env.id, firstSeenAt);
 
-    // §15 cond 2: a copy with no own work at the base tip only looks
-    // merged — it must not go while its thread is merely resting.
-    let freshAtTip = false;
-    for (const t of targets) {
-      const tip = (
-        await gitOut(deps.cmd, repoRoot, ["rev-parse", "--verify", t])
-      )?.trim();
-      if (tip && tip === head) {
-        freshAtTip = true;
-        break;
-      }
-    }
-    const ownWork = !freshAtTip;
+    // §15 cond 2: own commits are the copy's branch commits after its
+    // creation point — not «HEAD differs from the base tip». A copy at
+    // (or behind) the tip with no commits only looks merged; it goes
+    // once its thread idles past abandonedAfter, not on a fresh thread.
+    const ownWork = (await countOwnCommits(env, path, ownBranch)) > 0;
 
     const threadsUnknown = threads === null;
     const threadsBlocking = liveThreads.some((t) =>
@@ -770,6 +873,7 @@ export function createJanitor(deps: JanitorDeps) {
     let reason: string | null = null;
     if (at - firstSeenAt < cfg.afterMergeMs) reason = "merged-wait";
     else if (!ownWork && !abandoned) reason = "no-commits-fresh";
+    else if (statusFailed) reason = "status-failed";
     else if (dirty) reason = abandoned ? "abandoned-dirty" : "dirty";
     else if (unfinished) reason = "unfinished-op";
     else if (threadsUnknown) reason = "threads-unknown";
@@ -780,9 +884,9 @@ export function createJanitor(deps: JanitorDeps) {
 
     if (reason !== null) {
       const reported = reason.startsWith("abandoned");
-      upsert(reported ? "reported" : "kept", reason, { firstSeenAt });
+      if (persist) upsert(reported ? "reported" : "kept", reason, { firstSeenAt });
       keep(summary, reason);
-      if (reported) reportedNow.push({ env, reason });
+      if (reported) reportedNow.push({ env, reason, threadId });
       return false;
     }
 
@@ -790,7 +894,6 @@ export function createJanitor(deps: JanitorDeps) {
     // clean, no live thread/process.
     summary.ready += 1;
     if (!apply) {
-      upsert("kept", "merged-ready", { firstSeenAt });
       keep(summary, "merged-ready");
       return false;
     }
@@ -804,11 +907,27 @@ export function createJanitor(deps: JanitorDeps) {
         : 0;
 
     // §15 action: archive the env's threads, then `bb environment
-    // cleanup`; a refused cleanup unarchives the threads back.
+    // cleanup`. A failed archive rolls back the threads already
+    // archived and leaves the copy alone; a refused cleanup unarchives
+    // the threads back.
     const archivedNow: string[] = [];
+    let archiveFailed = false;
     for (const t of liveThreads) {
       const res = await deps.bbCli.run(["thread", "archive", t.id]);
-      if (res.exitCode === 0) archivedNow.push(t.id);
+      if (res.exitCode === 0) {
+        archivedNow.push(t.id);
+      } else {
+        archiveFailed = true;
+        break;
+      }
+    }
+    if (archiveFailed) {
+      for (const t of archivedNow) {
+        await deps.bbCli.run(["thread", "unarchive", t]);
+      }
+      upsert("kept", "archive-failed", { firstSeenAt });
+      keep(summary, "archive-failed");
+      return false;
     }
     const cleanup = await deps.bbCli.run(
       ["environment", "cleanup", env.id],
@@ -866,6 +985,7 @@ export function createJanitor(deps: JanitorDeps) {
    * the envs of his delegations. Other threads are never written to. */
   const notifyCoordinators = async (
     summary: JanitorRunSummary,
+    persist: boolean,
   ): Promise<void> => {
     if (!summary.reported.length) return;
     const byCoordinator = new Map<string, JanitorReportedItem[]>();
@@ -881,7 +1001,10 @@ export function createJanitor(deps: JanitorDeps) {
     }
     for (const [coordinator, items] of byCoordinator) {
       const key = `dailyNotify:${coordinator}`;
-      const last = Number(deps.janitor.meta(key) ?? 0);
+      const last = Math.max(
+        Number(deps.janitor.meta(key) ?? 0),
+        notifyMem.get(coordinator) ?? 0,
+      );
       if (now() - last < DAY_MS) continue;
       const list = items
         .slice(0, 8)
@@ -904,7 +1027,8 @@ export function createJanitor(deps: JanitorDeps) {
             },
           ],
         });
-        deps.janitor.setMeta(key, String(now()));
+        notifyMem.set(coordinator, now());
+        if (persist) deps.janitor.setMeta(key, String(now()));
       } catch (e) {
         log.warn?.(`orchestrator janitor: notify ${coordinator}: ${message(e)}`);
       }

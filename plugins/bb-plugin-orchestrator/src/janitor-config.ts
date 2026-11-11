@@ -20,6 +20,10 @@
  *   "protectedBranches": ["main", "master", "dev"],
  *   "deleteBranches": true
  * }
+ *
+ * §15: a missing or invalid `mode` falls back to `report` — never delete
+ * on an unclear setting; an unknown key is a validation error and keeps
+ * the janitor off.
  */
 import type { PolicyIssue } from "./policy.js";
 
@@ -89,26 +93,36 @@ export function parseJanitorConfig(
     return { config: null, errors };
   }
 
+  const KNOWN_KEYS = new Set([
+    "enabled",
+    "mode",
+    "afterMerge",
+    "abandonedAfter",
+    "intervalMinutes",
+    "excludeProjects",
+    "protectedBranches",
+    "deleteBranches",
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!KNOWN_KEYS.has(key)) {
+      err(
+        key,
+        key === "enable"
+          ? "unknown key `enable` — did you mean `enabled`?"
+          : "unknown janitor setting key",
+      );
+    }
+  }
+
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
     err("enabled", "must be a boolean");
   }
   const enabled = raw.enabled === true;
   if (!enabled) {
-    // A misspelled `enabled` must not silently keep the janitor off.
-    if (errors.length === 0 && raw.enable !== undefined) {
-      err("enabled", "unknown key `enable` — did you mean `enabled`?");
-    }
     return { config: null, errors };
   }
 
-  let mode: JanitorMode = "apply";
-  if (raw.mode !== undefined) {
-    if (raw.mode === "apply" || raw.mode === "report") {
-      mode = raw.mode;
-    } else {
-      err("mode", 'must be "apply" or "report"');
-    }
-  }
+  const mode: JanitorMode = raw.mode === "apply" ? "apply" : "report";
 
   let afterMergeMs = 10 * 3_600_000;
   if (raw.afterMerge !== undefined) {

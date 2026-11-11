@@ -5,15 +5,20 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import Database from "better-sqlite3";
 import { DelegationStore, JanitorStore, MIGRATIONS } from "../src/store.js";
 import { parseJanitorConfig } from "../src/janitor-config.js";
-import { createJanitor, type JanitorDeps } from "../src/janitor.js";
+import {
+  createJanitor,
+  defaultHasProcessIn,
+  type JanitorDeps,
+} from "../src/janitor.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import type { CmdRunner } from "../src/cmd.js";
 
@@ -56,6 +61,7 @@ interface EnvSpec {
   branchName: string;
   projectId: string;
   mergeBaseBranch: string;
+  createdAt?: number;
 }
 
 interface ThreadSpec {
@@ -146,6 +152,7 @@ function envJson(e: EnvSpec, updatedAt: number) {
     path: e.path,
     branchName: e.branchName,
     mergeBaseBranch: e.mergeBaseBranch,
+    createdAt: e.createdAt ?? updatedAt,
     managed: true,
     environmentProviderId: "git-worktree",
     status: "ready",
@@ -158,9 +165,11 @@ function makeWorld(opts: {
   threads?: Record<string, ThreadSpec[]>;
   interactions?: Record<string, unknown[]>;
   cleanupFailFor?: Set<string>;
+  archiveFailFor?: Set<string>;
   clock?: { t: number };
   config?: string;
   hasProcessIn?: (path: string) => Promise<boolean>;
+  cmd?: CmdRunner;
 }) {
   const clock = opts.clock ?? { t: Date.now() };
   const db = new Database(":memory:");
@@ -192,6 +201,7 @@ function makeWorld(opts: {
       }
       if (key.startsWith("thread archive")) {
         const tid = args[2]!;
+        if (opts.archiveFailFor?.has(tid)) return fail("cannot archive");
         archivedCalls.push(tid);
         return ok();
       }
@@ -216,7 +226,7 @@ function makeWorld(opts: {
     store,
     janitor,
     bbCli,
-    cmd: realCmd,
+    cmd: opts.cmd ?? realCmd,
     threads: {
       send: async (a) => {
         sent.push({
@@ -263,14 +273,31 @@ test("janitor config: empty/disabled default, validation errors", () => {
   assert.equal(c.abandonedAfterMs, 24 * 60 * 60_000);
   assert.deepEqual(c.protectedBranches, ["main"]);
   const bad = parseJanitorConfig(
-    JSON.stringify({ enabled: true, mode: "x", afterMerge: "1m", intervalMinutes: 5 }),
+    JSON.stringify({ enabled: true, afterMerge: "1m", intervalMinutes: 5 }),
   );
   assert.ok(bad.config === null);
-  assert.ok(bad.errors.some((e) => e.path === "mode"));
   assert.ok(bad.errors.some((e) => e.path === "afterMerge"));
   assert.ok(bad.errors.some((e) => e.path === "intervalMinutes"));
   assert.equal(parseJanitorConfig("{oops").config, null);
   assert.ok(parseJanitorConfig("{oops").errors.length > 0);
+  // §15: mode missing or invalid → report, never an error
+  assert.equal(
+    parseJanitorConfig(JSON.stringify({ enabled: true })).config!.mode,
+    "report",
+  );
+  assert.equal(
+    parseJanitorConfig(JSON.stringify({ enabled: true, mode: "x" })).config!
+      .mode,
+    "report",
+  );
+  // unknown keys are a validation error — the janitor stays off
+  const unknown = parseJanitorConfig(
+    JSON.stringify({ enabled: true, mode: "apply", bogus: 1 }),
+  );
+  assert.equal(unknown.config, null);
+  assert.ok(unknown.errors.some((e) => e.path === "bogus"));
+  const typo = parseJanitorConfig(JSON.stringify({ enable: true }));
+  assert.ok(typo.errors.some((e) => e.path === "enable"));
 });
 
 // ── runs against temp repos ──────────────────────────────────────────
@@ -325,7 +352,9 @@ test("merged only locally (not on origin) stays", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
-  // merged into local main but never pushed
+  // merged into local main but never pushed; mergeBaseBranch names the
+  // bare local branch — §15 counts only origin/* refs
+  env.mergeBaseBranch = "main";
   git(repo, ["merge", "--no-ff", "--no-edit", env.branchName]);
   const w = makeWorld({
     envs: [env],
@@ -337,6 +366,25 @@ test("merged only locally (not on origin) stays", async () => {
   const item = w.janitor.item(env.id)!;
   assert.equal(item.reason, "not-merged");
   assert.equal(item.first_seen_at, null);
+});
+
+test("a bare SHA mergeBaseBranch is ignored — no origin branch, no merge", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // the work IS on origin/main, but the only plausible target is the
+  // env's mergeBaseBranch — a raw sha, which resolves to nothing under
+  // refs/remotes/origin/ (protectedBranches point at a missing branch)
+  env.mergeBaseBranch = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ protectedBranches: ["nominal"] }),
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
 });
 
 test("a foreign unmerged bb/ branch does not block the copy", async () => {
@@ -424,6 +472,51 @@ test("dirty / untracked / unfinished-merge copies stay", async () => {
   assert.equal(w.janitor.item(env.id)!.reason, "unfinished-op");
 });
 
+test("status.showUntrackedFiles=no cannot hide an untracked file", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // repo-level config hides untracked files from a bare `git status
+  // --porcelain` — the janitor's flags must override it
+  git(repo, ["config", "status.showUntrackedFiles", "no"]);
+  writeFileSync(join(env.path, "notes.txt"), "x\n");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(w.janitor.item(env.id)!.reason, "dirty");
+});
+
+test("a failed git status keeps the copy (cleanliness unproven)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const statusFails: CmdRunner = {
+    run: async (file, args, o) =>
+      file === "git" && args[2] === "status"
+        ? fail("status boom")
+        : realCmd.run(file, args, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: statusFails,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(w.janitor.item(env.id)!.reason, "status-failed");
+});
+
 test("copy without own commits younger than abandonedAfter stays", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a"); // branch at origin/main tip, no commits
@@ -437,6 +530,83 @@ test("copy without own commits younger than abandonedAfter stays", async () => {
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
   assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+});
+
+test("origin moved ahead but the copy has no commits — fresh thread keeps it", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a"); // bb/a at the old origin/main tip
+  // origin/main moved forward — the copy is still merged (an ancestor)
+  // yet has zero own commits
+  commitIn(repo, "g.txt", "feat: ahead");
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+});
+
+test("same setup with an abandoned thread is removed", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(repo, "g.txt", "feat: ahead");
+  git(repo, ["push", "origin", "main"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(existsSync(env.path), false);
+});
+
+test("no reflog → createdAt decides: commits older than env creation do not count", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  git(repo, ["reflog", "expire", "--expire=now", env.branchName]);
+  const now = Date.now();
+  // env "created" an hour in the future: the merged commit's time is
+  // before it → zero own commits → a fresh thread keeps the copy
+  const w = makeWorld({
+    envs: [{ ...env, createdAt: now + 3_600_000 }],
+    threads: { [env.id]: [idle({ t: now }, env.id)] },
+    clock: { t: now },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  let res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+  // env "created" an hour ago: the commit came after → own work → gone
+  const w2 = makeWorld({
+    envs: [{ ...env, createdAt: now - 3_600_000 }],
+    threads: { [env.id]: [idle({ t: now }, env.id)] },
+    clock: { t: now },
+  });
+  await w2.jan.run();
+  w2.clock.t += 16 * 60_000;
+  res = await w2.jan.run();
+  assert.equal(res.removedCopies, 1);
 });
 
 test("active thread or pending interaction keeps the copy", async () => {
@@ -474,6 +644,23 @@ test("active thread or pending interaction keeps the copy", async () => {
   res = await w2.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.equal(w2.janitor.item(env.id)!.reason, "interactions-pending");
+  // a resolved interaction is history, not a pending request — if the
+  // list ever returns it, it must not block the copy
+  const w3 = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [t1] },
+    interactions: {
+      thr_a: [
+        { id: "int_1", status: "resolved" },
+        { id: "int_2", status: "interrupted" },
+      ],
+    },
+    clock,
+  });
+  await w3.jan.run();
+  w3.clock.t += 16 * 60_000;
+  res = await w3.jan.run();
+  assert.equal(res.removedCopies, 1);
 });
 
 test("a delegation in dispatching/running keeps the env", async () => {
@@ -499,6 +686,30 @@ test("a delegation in dispatching/running keeps the env", async () => {
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.equal(w.janitor.item(env.id)!.reason, "delegation-active");
+});
+
+test("defaultHasProcessIn matches a live process through a symlinked path", async (t) => {
+  if (!existsSync("/proc")) return t.skip("/proc not available");
+  const dir = mkdtempSync(join(tmpdir(), "jan-proc-"));
+  const real = join(dir, "real");
+  mkdirSync(real);
+  const link = join(dir, "link");
+  symlinkSync(real, link);
+  // the kernel resolves the cwd symlink — /proc/<pid>/cwd shows `real`;
+  // env.path handed to the janitor may be the `link` spelling
+  const child = spawn("sleep", ["30"], { cwd: link, stdio: "ignore" });
+  try {
+    let found = false;
+    for (let i = 0; i < 40 && !found; i++) {
+      found = defaultHasProcessIn(link) && defaultHasProcessIn(real);
+      if (!found) await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(found, "process with cwd inside the copy not detected");
+    mkdirSync(join(dir, "empty"));
+    assert.equal(defaultHasProcessIn(join(dir, "empty")), false);
+  } finally {
+    child.kill("SIGKILL");
+  }
 });
 
 test("a failed fetch skips the whole repository", async () => {
@@ -528,6 +739,37 @@ test("a failed fetch skips the whole repository", async () => {
   assert.equal(w.janitor.item(env.id)!.first_seen_at, w.clock.t);
 });
 
+test("a failed thread archive rolls back and skips cleanup", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const t1: ThreadSpec = {
+    id: "thr_a1",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+  };
+  const t2: ThreadSpec = { ...t1, id: "thr_a2" };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [t1, t2] },
+    archiveFailFor: new Set(["thr_a2"]),
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  // thr_a1 archived, thr_a2 refused → thr_a1 restored, cleanup never ran
+  assert.deepEqual(w.archivedCalls, ["thr_a1"]);
+  assert.deepEqual(w.unarchivedCalls, ["thr_a1"]);
+  assert.deepEqual(w.cleanedUp, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(w.janitor.item(env.id)!.reason, "archive-failed");
+});
+
 test("refused environment cleanup unarchives the threads", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
@@ -548,7 +790,7 @@ test("refused environment cleanup unarchives the threads", async () => {
   assert.match(w.janitor.item(env.id)!.reason ?? "", /cleanup-refused/);
 });
 
-test("report mode deletes nothing", async () => {
+test("report mode deletes nothing and writes only the run row", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
@@ -563,10 +805,35 @@ test("report mode deletes nothing", async () => {
   const res = await w.jan.run();
   assert.equal(res.applied, false);
   assert.equal(res.removedCopies, 0);
+  // the merged-sighting streak matures in memory: the second report
+  // pass sees the copy eligible — yet nothing reached the db
   assert.equal(res.ready, 1);
   assert.ok(existsSync(env.path));
   git(repo, ["rev-parse", "--verify", env.branchName]);
-  assert.equal(w.janitor.item(env.id)!.reason, "merged-ready");
+  assert.equal(w.janitor.item(env.id), undefined);
+  assert.ok(w.janitor.latestRun());
+});
+
+test("a --dry-run pass under apply mode writes only the run row", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  let res = await w.jan.run({ dryRun: true });
+  assert.equal(res.ready, 0);
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run({ dryRun: true });
+  assert.equal(res.ready, 1);
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  // the dry-run preview must not pre-arm the afterMerge clock: no
+  // first_seen_at, no item row at all
+  assert.equal(w.janitor.item(env.id), undefined);
+  assert.ok(w.janitor.latestRun());
 });
 
 test("protected and non-bb/ branches are never deleted", async () => {
@@ -642,6 +909,49 @@ test("unmerged copy idle over abandonedAfter is reported, coordinator notified o
   const rep = await w.jan.report();
   assert.equal(rep.abandoned.length, 1);
   assert.equal(rep.abandoned[0]!.envId, env.id);
+});
+
+test("report mode still notifies once a day — watermark in memory, not db", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work"); // never pushed/merged
+  const clock = { t: Date.now() };
+  const staleThread: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [staleThread] },
+    clock,
+    config: CFG({ mode: "report" }),
+  });
+  const d = w.store.insert({
+    taskKey: "PLUG-8",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w.store.setThreadInfo(d.id, "thr_a");
+  w.store.setStatus(d.id, "done");
+  let res = await w.jan.run();
+  assert.equal(res.reported.length, 1);
+  assert.equal(w.sent.length, 1);
+  // report mode writes nothing to the db: no item row, no notify meta
+  assert.equal(w.janitor.item(env.id), undefined);
+  assert.equal(w.janitor.meta("dailyNotify:thr_coord"), undefined);
+  // same-day dedup still works — via the in-memory watermark
+  w.clock.t += 60_000;
+  res = await w.jan.run();
+  assert.equal(res.reported.length, 1);
+  assert.equal(w.sent.length, 1);
+  w.clock.t += 24 * 60 * 60_000;
+  await w.jan.run();
+  assert.equal(w.sent.length, 2);
 });
 
 test("disabled janitor is a no-op; env in excludeProjects is ignored", async () => {
