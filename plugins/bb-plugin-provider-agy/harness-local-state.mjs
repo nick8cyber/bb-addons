@@ -421,6 +421,94 @@ check(
   );
 }
 
+// A17: reverse same-label race — the stale writer did NOT touch the
+// string fields (markAccountUse bumps only lastUsedMs), so its save must
+// yield parkedReason/lastError to the neighbour's fresher overlay record
+// instead of erasing them with the load-time snapshot.
+{
+  const rr = mkdtempSync(join(tmpdir(), "agy-localstate-revrace-"));
+  writeJson(join(rr, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  const w1 = loadLedger(rr);
+  const w2 = loadLedger(rr); // stale snapshot from the same load point
+  markAccountIneligible(w1, "a1", { parkedReason: "auth-dead" });
+  markAccountCooldown(w1, "a1", Date.now() + 5_000, "w1 429");
+  saveLedger(rr, w1);
+  markAccountUse(w2, "a1"); // numeric only — strings are load-stale
+  saveLedger(rr, w2);
+  const a1 = readJson(join(rr, "accounts-overlay.json"))?.accounts?.a1;
+  check(
+    "localstate/stale-writer-keeps-neighbour-strings",
+    a1?.parkedReason === "auth-dead" &&
+      a1?.lastError === "w1 429" &&
+      (a1?.lastUsedMs ?? 0) > 0 &&
+      (a1?.ineligibleAtMs ?? 0) > 0,
+    JSON.stringify(a1),
+  );
+}
+
+// A18: a pin-only save (empty dirtyLabels) must not carry a ghost into
+// the shared file — the label exists only as an overlay shadow, absent
+// from both the shared accounts and the accounts/ directory.
+{
+  const gs = mkdtempSync(join(tmpdir(), "agy-localstate-ghostpin-"));
+  writeJson(join(gs, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(gs, "accounts-overlay.json"), {
+    accounts: {
+      ghost: {
+        cooldownUntilMs: 0, lastUsedMs: 1, lastError: null,
+        writtenMs: Date.now(),
+      },
+    },
+  });
+  const l = loadLedger(gs); // ghost shadow applies into l.accounts
+  rememberConversation(l, "pin-g", "a1");
+  saveLedger(gs, l);
+  const sh = readJson(join(gs, "accounts-state.json"))?.accounts ?? {};
+  const ov = readJson(join(gs, "accounts-overlay.json"))?.accounts ?? {};
+  check(
+    "localstate/pin-only-save-drops-ghost",
+    l.accounts.ghost !== undefined &&
+      sh.ghost === undefined &&
+      sh.a1 !== undefined &&
+      ov.ghost !== undefined, // pin-only save leaves the overlay file be
+    JSON.stringify({ sh: Object.keys(sh), ov: Object.keys(ov) }),
+  );
+}
+
+// A19: two loadLedger calls racing the eager migration both write the
+// union — whoever persists second still lands the same pin set, no loss.
+{
+  const mig = mkdtempSync(join(tmpdir(), "agy-localstate-mig-"));
+  writeJson(join(mig, "accounts-state.json"), {
+    accounts: {},
+    conversations: { "mig-1": "a1", "mig-2": "a2" },
+  });
+  const la = loadLedger(mig); // migrates and writes the union
+  unlinkSync(join(mig, "conversations-state.json")); // interleave: the
+  // second loader still saw no local file and writes its union too
+  const lb = loadLedger(mig);
+  const onDisk =
+    readJson(join(mig, "conversations-state.json"))?.conversations ?? {};
+  check(
+    "localstate/eager-migration-two-loaders-union",
+    la.conversations["mig-1"] === "a1" &&
+      la.conversations["mig-2"] === "a2" &&
+      lb.conversations["mig-1"] === "a1" &&
+      lb.conversations["mig-2"] === "a2" &&
+      onDisk["mig-1"] === "a1" &&
+      onDisk["mig-2"] === "a2",
+    JSON.stringify(onDisk),
+  );
+}
+
 // ===========================================================================
 // Part B — end-to-end on the built bridge, once per transport.
 // ===========================================================================

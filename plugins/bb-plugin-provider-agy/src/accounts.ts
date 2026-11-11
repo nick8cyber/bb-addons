@@ -73,6 +73,16 @@ export interface AccountsLedger {
    * leave the overlay file (and its writtenMs stamps) untouched.
    */
   dirtyPins?: Set<string>;
+  /**
+   * Freshness baseline per label for saveLedger's string-field merge —
+   * never persisted. Seeded from the overlay record's writtenMs at load
+   * and re-stamped to the written writtenMs on save, so a later save is
+   * not shadowed by this instance's own write. Helpers that mutate
+   * parkedReason/lastError bump it to the mutation time, which is what
+   * lets an on-disk neighbour record win the string fields only when it
+   * post-dates our snapshot.
+   */
+  overlayStamps?: Map<string, number>;
 }
 
 /** Overlay record: one account mark plus when this instance wrote it. */
@@ -184,31 +194,37 @@ export function loadLedger(dataDir: string): AccountsLedger {
       join(dataDir, ACCOUNTS_OVERLAY_FILE),
     )?.accounts ?? {};
   const accounts: Record<string, AccountLedgerEntry> = {};
+  const overlayStamps = new Map<string, number>();
   for (const label of new Set([
     ...Object.keys(sharedAccounts),
     ...Object.keys(overlay),
   ])) {
     const s = sharedAccounts[label];
     const o = overlay[label];
+    if (o !== undefined) {
+      overlayStamps.set(label, o.writtenMs ?? 0);
+    }
     if (o !== undefined && (o.writtenMs ?? 0) >= (s?.lastUsedMs ?? 0)) {
       const ineligibleAtMs = Math.max(
         s?.ineligibleAtMs ?? 0,
         o.ineligibleAtMs ?? 0,
       );
+      // parkedReason falls back to the shared side: an applied shadow
+      // that never carried the field should not hide the diagnostic the
+      // shared file still has.
+      const parkedReason = o.parkedReason ?? s?.parkedReason;
       accounts[label] = {
         cooldownUntilMs: Math.max(s?.cooldownUntilMs ?? 0, o.cooldownUntilMs ?? 0),
         lastUsedMs: Math.max(s?.lastUsedMs ?? 0, o.lastUsedMs ?? 0),
         lastError: o.lastError ?? null,
         ...(ineligibleAtMs > 0 ? { ineligibleAtMs } : {}),
-        ...(o.parkedReason !== undefined
-          ? { parkedReason: o.parkedReason }
-          : {}),
+        ...(parkedReason !== undefined ? { parkedReason } : {}),
       };
     } else if (s !== undefined) {
       accounts[label] = s;
     }
   }
-  return { accounts, conversations, dirtyLabels: new Set() };
+  return { accounts, conversations, dirtyLabels: new Set(), overlayStamps };
 }
 
 /**
@@ -218,7 +234,6 @@ export function loadLedger(dataDir: string): AccountsLedger {
  * field leaves it on first save.
  */
 export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
-  const ghostLabels = new Set<string>();
   // Merge-on-save for pins, by dirty keys only: parallel wrappers of this
   // instance race load-modify-save, so re-read the file and overwrite just
   // the keys this ledger pinned — a stale snapshot must not resurrect a
@@ -248,17 +263,33 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
     });
   }
 
+  // Ghost detection runs unconditionally, before ANY shared write: a
+  // ghost is a label absent from both the on-disk shared accounts and
+  // the accounts/ directory — a stale overlay shadow that must never
+  // reach the shared file (it syncs onward from there). A pin-only save
+  // would otherwise leak it, since a ghost still sits in ledger.accounts
+  // once its overlay record applied on load. The check reads the shared
+  // file on disk, not the merged view.
+  const sharedPath = join(dataDir, SHARED_STATE_FILE);
+  const diskSharedAccounts =
+    readJsonFile<Partial<AccountsLedger>>(sharedPath)?.accounts ?? {};
+  const isGhostLabel = (label: string): boolean =>
+    !(label in diskSharedAccounts) &&
+    !existsSync(join(accountsDir(dataDir), label));
+
   // Overlay is written only for labels this instance dirtied; a save done
   // purely for a conversation pin leaves the file (and its writtenMs)
   // untouched. The disk merge is per FIELD of the same label, not whole
   // record by writtenMs: a fresh stamp with stale contents would erase a
   // neighbour wrapper's cooldown. Numbers take the max of both sides —
   // marks only grow locally — parkedReason/lastError come from the fresher
-  // record (absent writtenMs counts as 0, so a hand-edited overlay does
-  // not wedge updates); lastError always serializes, a fresh-side null is
-  // a value, not an absence. Ghosts — overlay records for labels gone
-  // from both the shared file and accounts/ — are dropped so they cannot
-  // leak into the shared file and sync onward.
+  // side: the disk record when its writtenMs beats the stamp loadLedger
+  // recorded (a neighbour wrote after our snapshot), our record otherwise.
+  // Helpers re-stamp when they mutate strings, so our own fresh mark is
+  // not shadowed by an older neighbour write; absent writtenMs counts as
+  // 0, so a hand-edited overlay does not wedge updates. lastError always
+  // serializes, a fresh-side null is a value, not an absence. Ghosts are
+  // dropped from the overlay so they cannot linger and sync onward.
   if (ledger.dirtyLabels !== undefined && ledger.dirtyLabels.size > 0) {
     const overlayPath = join(dataDir, ACCOUNTS_OVERLAY_FILE);
     const onDisk =
@@ -272,8 +303,9 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
       }
       const disk = merged[label];
       const diskWrittenMs = disk?.writtenMs ?? 0;
+      const stamp = ledger.overlayStamps?.get(label) ?? 0;
       const freshSide: AccountLedgerEntry =
-        diskWrittenMs > now && disk !== undefined ? disk : entry;
+        disk !== undefined && diskWrittenMs > stamp ? disk : entry;
       const ineligibleAtMs = Math.max(
         entry.ineligibleAtMs ?? 0,
         disk?.ineligibleAtMs ?? 0,
@@ -291,40 +323,29 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
           : {}),
         writtenMs: Math.max(now, diskWrittenMs),
       };
+      (ledger.overlayStamps ??= new Map()).set(
+        label,
+        merged[label].writtenMs,
+      );
     }
-    // A ghost label still sits in ledger.accounts (its overlay record
-    // applied on load), so "gone from the shared file" is checked against
-    // the file on disk, not the merged view — and it is filtered out of
-    // the shared write below too, or this very save would leak it.
-    const diskSharedAccounts =
-      readJsonFile<Partial<AccountsLedger>>(
-        join(dataDir, SHARED_STATE_FILE),
-      )?.accounts ?? {};
     for (const label of Object.keys(merged)) {
-      if (
-        !(label in diskSharedAccounts) &&
-        !existsSync(join(accountsDir(dataDir), label))
-      ) {
+      if (isGhostLabel(label)) {
         delete merged[label];
-        ghostLabels.add(label);
       }
     }
     writeJsonAtomic(overlayPath, { accounts: merged });
   }
 
-  writeJsonAtomic(join(dataDir, SHARED_STATE_FILE), {
-    accounts:
-      ghostLabels.size > 0
-        ? Object.fromEntries(
-            Object.entries(ledger.accounts).filter(
-              ([label]) => !ghostLabels.has(label),
-            ),
-          )
-        : ledger.accounts,
+  writeJsonAtomic(sharedPath, {
+    accounts: Object.fromEntries(
+      Object.entries(ledger.accounts).filter(
+        ([label]) => !isGhostLabel(label),
+      ),
+    ),
   });
 }
 
-export function ledgerEntry(
+function ledgerEntry(
   ledger: AccountsLedger,
   label: string,
 ): AccountLedgerEntry {
@@ -337,6 +358,18 @@ export function ledgerEntry(
 
 function markDirty(ledger: AccountsLedger, label: string): void {
   (ledger.dirtyLabels ??= new Set()).add(label);
+}
+
+/**
+ * Re-stamp a label after a helper writes its string fields: saveLedger
+ * hands parkedReason/lastError to whichever side is fresher by
+ * overlayStamps, so a neighbour's older overlay record must not shadow
+ * the mark this instance just made. Helpers that touch only numbers
+ * (markAccountUse) leave the stamp alone — a stale numeric-only save
+ * then yields the strings to a fresher on-disk record.
+ */
+function stampStrings(ledger: AccountsLedger, label: string): void {
+  (ledger.overlayStamps ??= new Map()).set(label, Date.now());
 }
 
 export function markAccountUse(
@@ -356,6 +389,7 @@ export function markAccountCooldown(
   const entry = ledgerEntry(ledger, label);
   entry.cooldownUntilMs = Math.max(entry.cooldownUntilMs, untilMs);
   entry.lastError = message;
+  stampStrings(ledger, label);
   markDirty(ledger, label);
 }
 
@@ -375,6 +409,7 @@ export function markAccountIneligible(
   entry.ineligibleAtMs = Date.now();
   if (options.parkedReason !== undefined) {
     entry.parkedReason = options.parkedReason;
+    stampStrings(ledger, label);
   }
   markDirty(ledger, label);
 }
