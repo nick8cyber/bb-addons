@@ -86,6 +86,74 @@ const child = spawn(REAL_BIN, process.argv.slice(2), {
 
 let sessionId = null;
 let shimId = SHIM_ID_BASE;
+
+// --- session/load replay suppression --------------------------------------
+// agy answers session/load in the middle of its conversation replay: the
+// whole history (user/agent/thought chunks, tool calls) keeps streaming after
+// the response, through the idle window and into the next prompt — past the
+// generic bridge's session.loading gate, so replayed items render as the new
+// turn's output (old answers glued ahead of live text, stale thinking after).
+// The replay ends exactly when the conversation stream reaches the live edge:
+// the user-message echo of the current session/prompt. Until that echo, every
+// replayable update is dropped here, before the bridge can translate it.
+const REPLAYABLE_KINDS = new Set([
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "user_message_chunk",
+  "tool_call",
+  "tool_call_update",
+  "plan",
+]);
+let suppressReplay = false;
+let promptTailNorm = null; // normalized tail of the pending prompt's user text
+let boundaryArmed = false;
+let droppedReplay = 0;
+let echoBuf = ""; // normalized user-echo text accumulated while awaiting the boundary
+let userEchoSeen = false; // positional boundary mode: a user chunk has arrived since the prompt
+let shortTailMode = false; // prompt tail too short for content matching (<16 chars)
+let replayFallbackTimer = null; // bounds the damage if no user echo ever arrives
+let replayDeadline = 0; // hard ceiling: a live turn's chunks are drops too, so
+// activity alone must not keep the gate shut forever.
+// A missed boundary must not eat a live turn: if the echo never comes, stop
+// suppressing once the stream goes quiet, and never past REPLAY_DEADLINE_MS.
+const REPLAY_BOUNDARY_TIMEOUT_MS = 20_000;
+const REPLAY_DEADLINE_MS = 90_000;
+
+function clearReplayTimer() {
+  if (replayFallbackTimer !== null) {
+    clearTimeout(replayFallbackTimer);
+    replayFallbackTimer = null;
+  }
+}
+
+// The fallback is a QUIET-stream detector, not a fixed deadline: every dropped
+// replay update re-arms it, so a long replay stays suppressed to its end, but
+// 20s of silence without the boundary echo means "no echo is coming" and the
+// live turn must be let through.
+function armReplayFallback() {
+  clearReplayTimer();
+  replayFallbackTimer = setTimeout(() => {
+    replayFallbackTimer = null;
+    if (suppressReplay) {
+      suppressReplay = false;
+      emitEvent({ t: "replay-abort", dropped: droppedReplay, reason: "boundary-quiet" });
+    }
+  }, REPLAY_BOUNDARY_TIMEOUT_MS);
+  replayFallbackTimer.unref?.();
+}
+
+function normalizeText(t) {
+  return String(t).replace(/\s+/g, " ").trim();
+}
+function promptTextTail(params) {
+  const items = Array.isArray(params?.prompt) ? params.prompt : [];
+  const joined = items
+    .filter((i) => i && i.type === "text" && typeof i.text === "string")
+    .map((i) => i.text)
+    .join("\n");
+  const n = normalizeText(joined);
+  return n.length === 0 ? null : n.slice(-160);
+}
 let modeApplied = INITIAL_MODE.length === 0;
 const ownRequestIds = new Set();
 /** client request id → {method, sessionId} for sniffing prompt responses. */
@@ -189,6 +257,34 @@ rlIn.on("line", (line) => {
           msg.params.disableBuiltInTools = SUBAGENT_TOOLS_DISABLED;
           line = JSON.stringify(msg);
         }
+        if (msg.method === "session/load" || msg.method === "session/fork") {
+          suppressReplay = true;
+          promptTailNorm = null;
+          boundaryArmed = false;
+          droppedReplay = 0;
+          echoBuf = "";
+          userEchoSeen = false;
+        } else if (msg.method === "session/prompt") {
+          // A second prompt before the boundary echo means it was missed —
+          // better to leak leftover replay than to drop a live turn.
+          if (suppressReplay && boundaryArmed) {
+            suppressReplay = false;
+            emitEvent({ t: "replay-abort", dropped: droppedReplay, reason: "reprompt" });
+          }
+          promptTailNorm = promptTextTail(msg.params);
+          boundaryArmed = true;
+          echoBuf = "";
+          userEchoSeen = false;
+          // A tiny prompt ("ok", "yes") can never satisfy the content match —
+          // any same word in old history would also match. Fall back to the
+          // positional boundary instead of eating the live turn to deadline.
+          shortTailMode = promptTailNorm === null || promptTailNorm.length < 16;
+          replayDeadline = Date.now() + REPLAY_DEADLINE_MS;
+          if (suppressReplay) armReplayFallback();
+        } else if (msg.method === "session/new") {
+          suppressReplay = false;
+          clearReplayTimer();
+        }
       }
     } catch {}
   }
@@ -235,10 +331,56 @@ rlOut.on("line", (line) => {
             req.method === "session/load" ||
             req.method === "session/resume"
           ) {
+            if (req.method === "session/load" && msg.error && suppressReplay) {
+              // A failed load starts no replay; holding the gate would eat the
+              // next live turn if the bridge retries with session/new late.
+              suppressReplay = false;
+              clearReplayTimer();
+              emitEvent({ t: "replay-abort", dropped: droppedReplay, reason: "load-error" });
+            }
             maybeApplyInitialMode(msg.result?.sessionId);
           }
         } else if (msg.method === "session/update") {
           const update = msg.params?.update;
+          const kind = update?.sessionUpdate;
+          if (suppressReplay && REPLAYABLE_KINDS.has(kind)) {
+            const ct = update?.content;
+            const text = typeof ct?.text === "string" ? normalizeText(ct.text) : "";
+            let isBoundary = false;
+            if (kind === "user_message_chunk" && boundaryArmed) {
+              if (shortTailMode) {
+                userEchoSeen = true;
+              } else if (promptTailNorm !== null && text.length > 0) {
+                // The echo may arrive chunked; accumulate it and compare tails.
+                // The shorter side must carry 16+ real chars so a stray "yes"
+                // or "ok" in old history cannot pose as the boundary.
+                echoBuf = echoBuf.length === 0 ? text : `${echoBuf} ${text}`;
+                const shorter = echoBuf.length <= promptTailNorm.length ? echoBuf : promptTailNorm;
+                isBoundary =
+                  shorter.length >= 16 &&
+                  (echoBuf.endsWith(promptTailNorm) || promptTailNorm.endsWith(echoBuf));
+              }
+            } else if (boundaryArmed && shortTailMode && userEchoSeen) {
+              // Conversation order guarantees everything after the user-echo
+              // run is live: replayed items all precede the new echo.
+              isBoundary = true;
+            }
+            if (isBoundary) {
+              suppressReplay = false;
+              clearReplayTimer();
+              emitEvent({ t: "replay-end", dropped: droppedReplay });
+            } else if (boundaryArmed && Date.now() > replayDeadline) {
+              // Suppression has outlived any plausible replay: what is flowing
+              // now is the live turn — stop dropping it.
+              suppressReplay = false;
+              clearReplayTimer();
+              emitEvent({ t: "replay-abort", dropped: droppedReplay, reason: "boundary-deadline" });
+            } else {
+              droppedReplay += 1;
+              if (boundaryArmed) armReplayFallback(); // still replaying: keep the gate shut
+              return; // replayed history: swallowed, never reaches the bridge
+            }
+          }
           if (update?.sessionUpdate === "tool_call_update") {
             const texts = [];
             if (typeof update.title === "string") texts.push(update.title);

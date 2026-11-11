@@ -271,6 +271,13 @@ resume(165, "t1r", ptidOf("t1"));
 await waitFor(() => replies(165).length === 1, 20000, "t1r live resume");
 await waitFor(() => transcriptLines().some((l) => l.method === "session/load"), 20000, "session/load reaches fake");
 
+// d3) resume replay suppression: the fake streams stored history AFTER the
+// session/load response — none of it may reach the new turn's deltas.
+turn(166, "t1r", "post-resume prompt");
+await waitFor(() => boundaries("t1r").length >= 1 && boundaries("t1r").at(-1).status === "completed", 30000, "t1r post-resume turn");
+const t1rText = deltas("t1r").map((d) => (typeof d.text === "string" ? d.text : "")).join("");
+check("replay/suppressed", !t1rText.includes("hello") && t1rText.includes("post-resume prompt"), t1rText.slice(0, 120));
+
 // e) central bb setting re-enable: providerOptions.providerSubagentsEnabled=true
 // must flip the shim env and the stamped settings.json for that session only.
 threadReqIds.t9 = 180;
