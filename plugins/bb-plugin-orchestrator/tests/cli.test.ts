@@ -632,3 +632,60 @@ test("janitor run on unsupported git exits non-zero (§17.4 мелко 11)", asy
   assert.equal(res.exitCode, 1);
   assert.match(res.stderr ?? "", /unsupported-git|2\.39/);
 });
+
+test("release CLI: --no-docs/--kb/--no-kb values are not positional (§17.3 м7)", async () => {
+  const { cli, calls } = fakeCli((args) =>
+    args.join(" ").startsWith("tasks show")
+      ? ok(JSON.stringify({ task: { key: "PLUG-1", title: "t" }, comments: [] }))
+      : undefined,
+  );
+  const host = await hostWith(
+    {
+      // release must get far enough to resolve the task key — a valid
+      // config and the release-audit level, so only приёмка refuses.
+      policy: JSON.stringify({
+        version: 1,
+        levels: {
+          "release-audit": { chain: ["ra"] },
+          complex: { chain: ["ra"] },
+        },
+        routes: { ra: { preset: "ra", provider: "p" } },
+      }),
+      release: JSON.stringify({
+        defaults: { target: { action: "push", branch: "main" } },
+      }),
+    },
+    cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }),
+      },
+    },
+  );
+  const res = await host.harness.runCli(
+    [
+      "release",
+      "PLUG-1",
+      "--no-docs",
+      "причина без доков",
+      "--kb",
+      "заметка",
+      "--json",
+    ],
+    { threadId: "thr_coord" },
+  );
+  // the flag values must not land in positionals — PLUG-1 is the key
+  assert.ok(
+    calls.some((c) => c.join(" ") === "tasks show PLUG-1 --json"),
+    `expected lookup of PLUG-1, got: ${JSON.stringify(calls)}`,
+  );
+  assert.ok(!calls.some((c) => c.join(" ").includes("причина без доков")));
+  void res;
+});

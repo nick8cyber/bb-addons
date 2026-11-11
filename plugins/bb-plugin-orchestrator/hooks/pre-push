@@ -14,7 +14,14 @@
  * with their own autopush. A repo with a *local* `core.hooksPath` never
  * reaches this script at all (local config wins over the global one).
  */
-import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,7 +39,9 @@ function git(args) {
 
 /** The repository's own hook (the global core.hooksPath shadows it):
  * `$GIT_DIR/hooks/<name>` — the env var first, then the common dir for
- * worktrees. */
+ * worktrees. Executable files only (§17.3, ревью PLUG-210): git itself
+ * silently skips a non-executable hook — chaining must not turn that
+ * into an EACCES refusal. */
 function localHookPath() {
   const candidates = [];
   if (process.env.GIT_DIR) {
@@ -44,7 +53,13 @@ function localHookPath() {
   }
   const self = fileURLToPath(import.meta.url);
   for (const c of candidates) {
-    if (c !== self && existsSync(c)) return c;
+    if (c === self || !existsSync(c)) continue;
+    try {
+      accessSync(c, constants.X_OK);
+    } catch {
+      continue; // not executable — git would skip it, so do we
+    }
+    return c;
   }
   return null;
 }

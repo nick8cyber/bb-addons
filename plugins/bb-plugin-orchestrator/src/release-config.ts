@@ -46,6 +46,13 @@ export interface ReleaseProjectLayer {
    * into PR bodies and `thr_…` ids are not a leak; `false` — no
    * «Источник» line and `thr_…` is a `leaks.bbIds` finding. */
   threadIds?: boolean;
+  /** §17.3 (С6): category-2 trailer names the project allows in commit
+   * messages (`Co-Authored-By`, `Signed-off-by`, …). Unset — every
+   * foreign-bot trailer blocks. */
+  allowedTrailers?: string[];
+  /** §17.3 (С6): addresses (`a@b.c`) and domains (`@b.c` or `b.c`)
+   * that do not count as a personal-email leak. */
+  allowedEmails?: string[];
 }
 
 export interface ReleaseConfig {
@@ -81,6 +88,10 @@ export interface ResolvedProject {
   commitIdentity?: string;
   /** §16.6 `threadIds` — default `true`. */
   threadIds: boolean;
+  /** §17.3 (С6): foreign-bot trailers this project accepts (default []). */
+  allowedTrailers: string[];
+  /** §17.3 (С6): emails/domains that are not a leak (default []). */
+  allowedEmails: string[];
 }
 
 const isRecord = (x: unknown): x is Record<string, unknown> =>
@@ -233,6 +244,15 @@ function parseLayer(
       layer.threadIds = value.threadIds;
     }
   }
+  for (const key of ["allowedTrailers", "allowedEmails"] as const) {
+    const v = value[key];
+    if (v === undefined) continue;
+    if (!Array.isArray(v) || v.some((a) => !isNonEmptyString(a))) {
+      err(`${path}.${key}`, "must be an array of non-empty strings");
+    } else {
+      layer[key] = v.map((a) => (a as string).trim());
+    }
+  }
   return layer;
 }
 
@@ -330,5 +350,7 @@ export function resolveProject(
     },
     commitIdentity: layer.commitIdentity ?? config.commitIdentity,
     threadIds: layer.threadIds ?? true,
+    allowedTrailers: layer.allowedTrailers ?? [],
+    allowedEmails: layer.allowedEmails ?? [],
   };
 }
