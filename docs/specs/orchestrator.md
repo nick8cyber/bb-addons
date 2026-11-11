@@ -221,6 +221,23 @@ bb orchestrator delegate <TASK-KEY> --level <уровень> [--route <марш�
 
 В обоих случаях: сообщение координатору (`threads.send` с `mode: "queue-if-active"`, текст начинается с `[orchestrator]`) и комментарий в задачу: исход, маршрут, новый тред или «перевыпуск за координатором». Сообщение не должно обрывать ход координатора: у Claude оно читается на границе шага, у `acp-devin` — ждёт конца хода ([provider-devin §2](provider-devin.md)).
 
+### 5.5 Гарантия доставки итога координатору (ревизия 24)
+
+Координатор должен узнать о каждом исходе своего исполнителя, даже на слабой модели и даже если уведомление BB не дошло. Исходы со своим сообщением сторожа (`stalled`, `quota`, `unavailable`, `failed`, `errored`, `interrupted`, `approval`, `timeout`, перевыпуск) уже доставляет плагин. Для `done` и `cancelled` основной путь — уведомление BB дочернего треда (`parentNotifications = auto`, §4 шаг 4): в журнале координатора `client/turn/requested` с `systemMessageKind = "child-completed"` и `systemMessageSubject.threadId` = тред исполнителя.
+
+Правило: через 120 с после перехода делегирования в `done`/`cancelled` (и при каждой сверке §7, пока не подтверждено) сторож ищет в журнале координатора такое уведомление, пришедшее после `turn_started_at` последнего хода исполнителя. Нашлось — `result_notified_at`, `result_notice = bb`. Не нашлось — плагин сам отправляет координатору (`threads.send`, `queue-if-active`):
+
+```text
+[orchestrator] <KEY> (<уровень>, тред <thr>) закончил: <done|cancelled>.
+<итог исполнителя — `threads` output, до 3000 символов; пусто — «исполнитель закончил без отчёта: проверь тред или раздай заход заново»>
+```
+
+и пишет `result_notice = plugin`. Ошибка отправки — повтор при сверке (предел §7). Координатор в архиве или удалён — только журнал плагина. Пустой итог исполнителя (`done` без текста ответа) — всегда сообщение плагина, даже если уведомление BB было.
+
+Проверка привязки (§4 шаг 4) повторяется сверкой до подтверждения: у треда исполнителя `parentThreadId` = координатор и `parentNotifications = auto`; иначе — повторить шаг и одна строка координатору при неудаче.
+
+Правило §3 и навык координатора: итоги исполнителей приходят сами — сообщением `[bb system] … completed` или `[orchestrator] …`; не ждать в форграунде и не опрашивать в цикле; раздавать только через `delegate` (ручные `bb tasks dispatch` и `bb thread spawn` под сторож и гарантию доставки не попадают); сомневаешься — `bb orchestrator status`.
+
 ## 6. CLI
 
 ```
@@ -241,7 +258,7 @@ bb orchestrator janitor [run|report] [--dry-run] [--json]       # уборщик
 
 SQLite плагина, миграции только добавлением.
 
-`delegations`: `id`, `task_key`, `task_id`, `project_id` (bb-проект координатора), `coordinator_thread_id`, `thread_id`, `level`, `route`, `preset`, `provider`, `status` (`dispatching|running|done|failed|stalled|quota|reissued|cancelled`), `reissue_of`, `turn_started_at`, `first_response_at`, `last_seq`, `setup_errors`, `last_approval_notified_at`, `timeout_notified_at`, `resume_count`, `retry_count`, `created_at`, `updated_at`; ревизия 23 — `round` (1 у первой раздачи), `continue_from`, `result_branch`, `result_sha`, `result_commits`, `result_dirty`, `result_env_id`, `merge_status` (`merged|conflict|fix-delegated|failed`), `merged_into`, `merged_sha`, `merged_at`. Частичный уникальный индекс `delegations(task_key) WHERE status IN ('dispatching','running')`.
+`delegations`: `id`, `task_key`, `task_id`, `project_id` (bb-проект координатора), `coordinator_thread_id`, `thread_id`, `level`, `route`, `preset`, `provider`, `status` (`dispatching|running|done|failed|stalled|quota|reissued|cancelled`), `reissue_of`, `turn_started_at`, `first_response_at`, `last_seq`, `setup_errors`, `last_approval_notified_at`, `timeout_notified_at`, `resume_count`, `retry_count`, `created_at`, `updated_at`; ревизия 23 — `round` (1 у первой раздачи), `continue_from`, `result_branch`, `result_sha`, `result_commits`, `result_dirty`, `result_env_id`, `merge_status` (`merged|conflict|fix-delegated|failed`), `merged_into`, `merged_sha`, `merged_at`; ревизия 24 — `result_notified_at`, `result_notice` (`bb|plugin`). Частичный уникальный индекс `delegations(task_key) WHERE status IN ('dispatching','running')`.
 
 `janitor_items` (§15): `env_id` (ключ), `project_id`, `thread_id`, `path`, `branch`, `state` (`removed|kept|reported`), `reason`, `size_kb`, `first_seen_at`, `last_checked_at`, `removed_at`. `janitor_runs`: `id`, `started_at`, `finished_at`, `removed`, `kept`, `freed_kb`, `error`.
 
@@ -428,3 +445,4 @@ bb orchestrator merge <KEY|delegationId> [--into <ветка>] [--no-autofix] [-
 4. `merge`: чистое вливание → коммит слияния, комментарий; конфликт → копия чистая, раздан заход разбора, повторный `merge` проходит.
 5. Уборщик в `report`, затем в `apply` на тестовом проекте: влитая чистая копия старше `afterMerge` удалена вместе с веткой и тред в архиве; грязная, невлитая и копия без коммитов моложе `abandonedAfter` — на месте; брошенное — в отчёте.
 6. Ревизия 24: `delegate --level review` по задаче, исполненной на `medium`, уходит на `review-medium`, ревьюер получает роль `auditor`; `--route` вне цепочки и `--preset` разового пресета раздаются, сторож следит, при квоте перевыпуск идёт по цепочке уровня; `release` принимает «ОК» ревьюера любого уровня с ролью `auditor`.
+7. Ревизия 24, гарантия доставки (§5.5), на каждом провайдере исполнителя (Claude Code, Codex, Devin, agy по ACP, OpenCode) и координатора: раздача → итог приходит координатору сообщением; уведомление BB подавлено (тестовый тред без `parentNotifications`) → итог доставляет плагин; пустой итог → сообщение плагина. Прогоняет исполнитель-тестировщик (Devin), координатор проверяет журнал.
