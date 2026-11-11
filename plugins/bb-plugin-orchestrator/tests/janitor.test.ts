@@ -64,11 +64,14 @@ interface EnvSpec {
   projectId: string;
   mergeBaseBranch: string;
   createdAt?: number;
+  hostId?: string;
 }
 
 interface ThreadSpec {
   id: string;
   status: string;
+  queuedWork?: string | null;
+  hasPendingInteraction?: boolean;
   archivedAt: number | null;
   updatedAt: number;
   environmentId?: string | null;
@@ -155,6 +158,7 @@ function mergeEnv(repo: string, env: EnvSpec) {
 function envJson(e: EnvSpec, updatedAt: number) {
   return {
     id: e.id,
+    hostId: e.hostId ?? null,
     projectId: e.projectId,
     path: e.path,
     branchName: e.branchName,
@@ -174,9 +178,11 @@ function makeWorld(opts: {
   interactions?: Record<string, unknown[]>;
   cleanupFailFor?: Set<string>;
   archiveFailFor?: Set<string>;
+  unarchiveFailFor?: Set<string>;
   clock?: { t: number };
   config?: string;
-  hasProcessIn?: (path: string) => Promise<boolean>;
+  hasProcessIn?: (path: string) => Promise<boolean | null>;
+  localHostId?: string;
   cmd?: CmdRunner;
 }) {
   const clock = opts.clock ?? { t: Date.now() };
@@ -190,6 +196,7 @@ function makeWorld(opts: {
   const unarchivedCalls: string[] = [];
   const cleanedUp: string[] = [];
   const sent: { threadId: string; text: string }[] = [];
+  const warns: string[] = [];
 
   const bbCli: BbCli = {
     run: async (args) => {
@@ -206,7 +213,11 @@ function makeWorld(opts: {
         }
         // global list (§16.3) — env-attached + cross-env extras
         const all = Object.entries(threads).flatMap(([envId, list]) =>
-          list.map((t) => ({ environmentId: envId, ...t })),
+          list.map((t) => ({
+            environmentId: envId,
+            queuedWork: "none",
+            ...t,
+          })),
         );
         return ok(
           JSON.stringify([...all, ...(opts.extraThreads ?? [])]),
@@ -231,6 +242,7 @@ function makeWorld(opts: {
       }
       if (key.startsWith("thread unarchive")) {
         const tid = args[2]!;
+        if (opts.unarchiveFailFor?.has(tid)) return fail("cannot unarchive");
         unarchivedCalls.push(tid);
         return ok();
       }
@@ -262,8 +274,9 @@ function makeWorld(opts: {
     },
     loadConfig: () => parseJanitorConfig(opts.config ?? CFG()),
     now: () => clock.t,
-    log: {},
+    log: { warn: (m) => warns.push(m) },
     hasProcessIn: opts.hasProcessIn ?? (async () => false),
+    localHostId: () => opts.localHostId ?? "",
   };
   return {
     deps,
@@ -277,6 +290,7 @@ function makeWorld(opts: {
     unarchivedCalls,
     cleanedUp,
     sent,
+    warns,
     jan: createJanitor(deps),
   };
 }
@@ -294,7 +308,14 @@ const idle = (clock: { t: number }, envId: string): ThreadSpec => ({
 
 test("janitor config: empty/disabled default, validation errors", () => {
   assert.equal(parseJanitorConfig("").config, null);
-  assert.equal(parseJanitorConfig('{"enabled": false}').config, null);
+  // PLUG-185: a valid disabled document still yields a config — a
+  // --dry-run preview must honor its excludeProjects/scope
+  const off = parseJanitorConfig(
+    '{"enabled": false, "excludeProjects": ["proj_x"], "scope": "all"}',
+  ).config!;
+  assert.equal(off.enabled, false);
+  assert.deepEqual(off.excludeProjects, ["proj_x"]);
+  assert.equal(off.scope, "all");
   const c = parseJanitorConfig(CFG()).config!;
   assert.equal(c.enabled, true);
   assert.equal(c.mode, "apply");
@@ -729,7 +750,9 @@ test("defaultHasProcessIn matches a live process through a symlinked path", asyn
   try {
     let found = false;
     for (let i = 0; i < 40 && !found; i++) {
-      found = defaultHasProcessIn(link) && defaultHasProcessIn(real);
+      found =
+        defaultHasProcessIn(link) === true &&
+        defaultHasProcessIn(real) === true;
       if (!found) await new Promise((r) => setTimeout(r, 50));
     }
     assert.ok(found, "process with cwd inside the copy not detected");
@@ -967,7 +990,7 @@ test("unmerged copy idle over abandonedAfter is reported, coordinator notified o
   assert.equal(rep.abandoned.length, 2);
 });
 
-test("report mode still notifies once a day — watermark in memory, not db", async () => {
+test("report mode still notifies once a day — watermark in janitor_meta (PLUG-185)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work"); // never pushed/merged
@@ -998,10 +1021,16 @@ test("report mode still notifies once a day — watermark in memory, not db", as
   let res = await w.jan.run();
   assert.equal(res.reported.length, 1);
   assert.equal(w.sent.length, 1);
-  // report mode writes nothing to the db: no item row, no notify meta
+  // report mode still writes no item row — but the notify watermark and
+  // the announced set ARE service state: they go to janitor_meta so a
+  // plugin restart cannot resend the same message early
   assert.equal(w.janitor.item(env.id), undefined);
-  assert.equal(w.janitor.meta("dailyNotify:thr_coord"), undefined);
-  // same-day dedup and §16.3 new-only dedup both hold — in memory
+  assert.equal(w.janitor.meta("dailyNotify:thr_coord"), String(w.clock.t));
+  assert.match(
+    w.janitor.meta("announcedAbandoned") ?? "",
+    new RegExp(env.id),
+  );
+  // same-day dedup and §16.3 new-only dedup both hold
   w.clock.t += 60_000;
   res = await w.jan.run();
   assert.equal(res.reported.length, 1);
@@ -1306,10 +1335,23 @@ test("archived executor with a dirty copy gets a rescue ref + coordinator line",
   git(repo, ["stash", "apply", ref]);
   assert.equal(readFileSync(join(repo, "f.txt"), "utf8"), "dirty\n");
   assert.equal(readFileSync(join(repo, "new.txt"), "utf8"), "untracked\n");
-  // coordinator got the restore command
+  // coordinator got the restore command — into a NEW worktree, never
+  // the main checkout (PLUG-185): worktree add <dir> <ref>^1, then
+  // stash apply inside it
   assert.equal(w.sent.length, 1);
   assert.equal(w.sent[0]!.threadId, "thr_coord");
-  assert.match(w.sent[0]!.text, new RegExp(`stash apply ${ref}`));
+  const m = /worktree add (\S+) \S+\^1 && git -C (\S+) stash apply \S+/.exec(
+    w.sent[0]!.text,
+  );
+  assert.ok(m, `restore command missing: ${w.sent[0]!.text}`);
+  const [, rescueDir] = m;
+  assert.match(rescueDir, /rescue-thr_w$/);
+  // the advertised command actually restores both kinds of work
+  git(repo, ["worktree", "add", rescueDir!, `${ref}^1`]);
+  git(rescueDir!, ["stash", "apply", ref]);
+  assert.equal(readFileSync(join(rescueDir!, "f.txt"), "utf8"), "dirty\n");
+  assert.equal(readFileSync(join(rescueDir!, "new.txt"), "utf8"), "untracked\n");
+  git(repo, ["worktree", "remove", "--force", rescueDir!]);
 });
 
 test("rescue with only untracked files still restores them via stash apply", async () => {
@@ -1380,4 +1422,470 @@ test("rescue no-ops: clean copy, root chat, already-freed copy, no coordinator",
   // the orphan's work is still rescued; only the notification is skipped
   git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_orphan"]);
   assert.equal(w.sent.length, 0);
+});
+
+// ── PLUG-185 review fixes ────────────────────────────────────────────
+
+test("ff-only sync with origin/main counts no own commits — fresh thread keeps the copy (PLUG-185 B1)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a"); // bb/a at the old origin tip
+  // origin/main moves ahead; the copy fast-forwards — the standard
+  // «fetch + ff-only base» first step, reflog gets
+  // «merge origin/main: Fast-forward», not a commit
+  commitIn(repo, "g.txt", "feat: ahead");
+  git(repo, ["push", "origin", "main"]);
+  git(env.path, ["fetch", "origin"]);
+  git(env.path, ["merge", "--ff-only", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  let res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+  // a reset + checkout on top still create no commits
+  git(env.path, ["reset", "--hard", "HEAD"]);
+  res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+});
+
+test("a real commit in the copy counts as own work (PLUG-185 B1)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(repo, "g.txt", "feat: ahead");
+  git(repo, ["push", "origin", "main"]);
+  git(env.path, ["fetch", "origin"]);
+  git(env.path, ["merge", "--ff-only", "origin/main"]);
+  commitIn(env.path, "w.txt", "feat: work"); // reflog «commit: …»
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+});
+
+test("starting/stopping/queued threads keep the copy (PLUG-185 B3)", async () => {
+  for (const [status, queuedWork, reason] of [
+    ["starting", "none", "threads-active"],
+    ["stopping", "none", "threads-active"],
+    ["pending", "none", "threads-active"],
+    ["idle", "waiting", "queued-work"],
+    ["error", "failed", "queued-work"],
+  ] as const) {
+    const { repo, base } = makeRepo();
+    const env = addEnv(repo, base, "a");
+    commitIn(env.path, "w.txt", "feat: work");
+    mergeEnv(repo, env);
+    const clock = { t: Date.now() };
+    const w = makeWorld({
+      envs: [env],
+      threads: {
+        [env.id]: [
+          {
+            id: "thr_a",
+            status,
+            queuedWork,
+            archivedAt: null,
+            updatedAt: clock.t - 60_000,
+            parentThreadId: "thr_coord",
+          },
+        ],
+      },
+      clock,
+    });
+    await w.jan.run();
+    w.clock.t += 16 * 60_000;
+    const res = await w.jan.run();
+    assert.equal(res.removedCopies, 0, `${status}/${queuedWork}`);
+    assert.equal(
+      w.janitor.item(env.id)!.reason,
+      reason,
+      `${status}/${queuedWork}`,
+    );
+    assert.deepEqual(w.archivedCalls, []);
+  }
+});
+
+test("a blocking non-cascade thread of the same env blocks the cascade (PLUG-185 M4)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const worker: ThreadSpec = {
+    id: "thr_w",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  // a root chat in the same env — outside the workers-scope cascade,
+  // but §15 cond 4 still counts it: active status blocks
+  const chat: ThreadSpec = {
+    id: "thr_chat",
+    status: "active",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: null,
+    originPluginId: null,
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [worker, chat] },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  let res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "threads-active");
+  // a queued message on the out-of-cascade thread also blocks
+  chat.status = "idle";
+  chat.queuedWork = "waiting";
+  const w2 = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [worker, chat] },
+    clock,
+  });
+  await w2.jan.run();
+  w2.clock.t += 16 * 60_000;
+  res = await w2.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w2.janitor.item(env.id)!.reason, "queued-work");
+  // and a pending request reported by the thread-list field (no CLI
+  // fallback needed)
+  chat.queuedWork = "none";
+  chat.hasPendingInteraction = true;
+  const w3 = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [worker, chat] },
+    clock,
+  });
+  await w3.jan.run();
+  w3.clock.t += 16 * 60_000;
+  res = await w3.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w3.janitor.item(env.id)!.reason, "interactions-pending");
+});
+
+test("no /proc → process-unknown keeps the copy (PLUG-185 M5)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    hasProcessIn: async () => null,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "process-unknown");
+});
+
+test("cherry-equivalent branch with merge-only content is NOT «влита» (PLUG-185 L8)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  // a side branch merged into bb/a with an extra resolution edit —
+  // `git cherry` skips merge commits, so without the merge-tree guard
+  // this content would be lost silently
+  git(env.path, ["checkout", "-b", "bb/side"]);
+  commitIn(env.path, "s.txt", "feat: side");
+  git(env.path, ["checkout", env.branchName]);
+  git(env.path, ["merge", "--no-ff", "--no-commit", "bb/side"]);
+  writeFileSync(join(env.path, "m.txt"), "merge-only\n");
+  git(env.path, ["add", "m.txt"]);
+  git(env.path, ["commit", "-m", "merge: side + resolution edit"]);
+  // origin/main gets patch-identical non-merge commits — every cherry
+  // line is «-», yet merging bb/a still adds m.txt
+  writeFileSync(join(repo, "w.txt"), "feat: work\n");
+  writeFileSync(join(repo, "s.txt"), "feat: side\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: work + side (squashed)"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
+  git(repo, ["rev-parse", "--verify", env.branchName]);
+});
+
+test("a failed git-dir probe keeps the copy — unfinished unknown (PLUG-185 L9)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const cmd: CmdRunner = {
+    run: async (f, a, o) =>
+      a.join(" ").includes("rev-parse --git-dir")
+        ? fail("git-dir probe")
+        : realCmd.run(f, a, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "unfinished-unknown");
+});
+
+test("a failed worktree list skips the branch sweep (PLUG-185 L9)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["branch", "bb/gone"]); // merged orphan — would be swept
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const cmd: CmdRunner = {
+    run: async (f, a, o) =>
+      a.join(" ").includes("worktree list")
+        ? fail("worktree list")
+        : realCmd.run(f, a, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1); // the copy still goes
+  assert.equal(res.orphanBranches, 0);
+  assert.equal(res.removedBranches, 0);
+  git(repo, ["rev-parse", "--verify", "bb/gone"]);
+});
+
+test("a failed unarchive on rollback is logged, not swallowed (PLUG-185 L9)", async () => {
+  const { repo, base } = makeRepo();
+  const envA = addEnv(repo, base, "a");
+  const envB = addEnv(repo, base, "b");
+  commitIn(envA.path, "wa.txt", "feat: a");
+  commitIn(envB.path, "wb.txt", "feat: b");
+  mergeEnv(repo, envA);
+  mergeEnv(repo, envB);
+  const clock = { t: Date.now() };
+  const rootT: ThreadSpec = {
+    id: "thr_p",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  const childT: ThreadSpec = {
+    ...rootT,
+    id: "thr_c",
+    parentThreadId: "thr_p",
+  };
+  const w = makeWorld({
+    envs: [envA, envB],
+    threads: { [envA.id]: [rootT], [envB.id]: [childT] },
+    archiveFailFor: new Set(["thr_p"]),
+    unarchiveFailFor: new Set(["thr_c"]),
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(
+    w.warns.some((m) => m.includes("unarchive thr_c")),
+    `warns: ${w.warns.join(" | ")}`,
+  );
+});
+
+test("commits reachable only from the copy's HEAD reflog keep it (PLUG-185 L10)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // a commit on detached HEAD — unreachable from every ref, dies with
+  // the copy
+  git(env.path, ["checkout", "--detach", "HEAD"]);
+  commitIn(env.path, "d.txt", "wip: detached");
+  git(env.path, ["checkout", env.branchName]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "detached-commits");
+});
+
+test("envs of other hosts are skipped entirely (PLUG-185 L11)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const remote: EnvSpec = {
+    id: "env_remote",
+    path: "/nonexistent/remote-copy",
+    branchName: "bb/remote",
+    projectId: "proj_1",
+    mergeBaseBranch: "origin/main",
+    hostId: "host_other",
+  };
+  // without a local host id the remote env is processed and only earns
+  // a bogus not-a-repo row
+  const w0 = makeWorld({
+    envs: [env, remote],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const r0 = await w0.jan.run();
+  assert.equal(r0.kept["not-a-repo"], 1);
+  // with the local host known the remote env never enters the list
+  const w = makeWorld({
+    envs: [env, remote],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    localHostId: "host_local",
+  });
+  const res = await w.jan.run();
+  assert.equal(res.kept["not-a-repo"] ?? 0, 0);
+  assert.equal(w.janitor.item("env_remote"), undefined);
+});
+
+test("the branch sweep honors excludeProjects (PLUG-185 L11)", async () => {
+  const { repo, base } = makeRepo();
+  // two merged orphan bb/ branches — one belongs to an excluded env
+  git(repo, ["branch", "bb/exc", "main"]);
+  git(repo, ["branch", "bb/free", "main"]);
+  const env = addEnv(repo, base, "a");
+  const excluded: EnvSpec = {
+    id: "env_x",
+    path: "/nonexistent/x",
+    branchName: "bb/exc",
+    projectId: "proj_x",
+    mergeBaseBranch: "origin/main",
+  };
+  const w = makeWorld({
+    envs: [env, excluded],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ excludeProjects: ["proj_x"] }),
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 1);
+  git(repo, ["rev-parse", "--verify", "bb/exc"]); // survived
+  assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/free"]));
+});
+
+test("--dry-run honors the disabled janitor's excludeProjects and scope (PLUG-185 L12)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work"); // unmerged
+  const clock = { t: Date.now() };
+  const stale: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+    parentThreadId: "thr_coord",
+  };
+  // excluded → the dry-run does not even look at the env
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [stale] },
+    clock,
+    config: '{"enabled": false, "excludeProjects": ["proj_1"]}',
+  });
+  const res = await w.jan.run({ dryRun: true });
+  assert.deepEqual(res.kept, {});
+  assert.equal(res.reported.length, 0);
+  // not excluded → the same disabled-config dry-run reports it
+  const w2 = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [stale] },
+    clock,
+    config: '{"enabled": false, "abandonedAfter": "1d"}',
+  });
+  const res2 = await w2.jan.run({ dryRun: true });
+  assert.equal(res2.reported.length, 1);
+});
+
+test("rescue fires with the janitor disabled or misconfigured (PLUG-185 B2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  for (const [tag, config] of [
+    ["off", '{"enabled": false}'],
+    ["bad", '{"enabled": true, "bogus": 1}'],
+  ] as const) {
+    const w = makeWorld({ envs: [env], threads: {}, config });
+    await w.jan.onThreadArchived({
+      id: `thr_${tag}`,
+      environmentId: env.id,
+      parentThreadId: "thr_coord",
+    });
+    git(repo, [
+      "rev-parse",
+      "--verify",
+      `refs/orchestrator/rescue/thr_${tag}`,
+    ]);
+    assert.equal(w.sent.length, 1, tag);
+  }
+});
+
+test("an incomplete or failed rescue tells the coordinator (PLUG-185 M7)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n"); // tracked edit
+  writeFileSync(join(env.path, "n.txt"), "new\n"); // untracked
+  // the untracked add fails → best-effort ref on `stash create`, flagged
+  const partialCmd: CmdRunner = {
+    run: async (f, a, o) =>
+      a.includes("--pathspec-file-nul") ? fail("add") : realCmd.run(f, a, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: {},
+    cmd: partialCmd,
+  });
+  await w.jan.onThreadArchived({
+    id: "thr_p",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_p"]);
+  assert.equal(w.sent.length, 1);
+  assert.match(w.sent[0]!.text, /неполн/);
+  // nothing at all could be snapshotted → a failure line, no ref
+  const env2 = addEnv(repo, base, "b");
+  writeFileSync(join(env2.path, "f.txt"), "dirty\n");
+  const failCmd: CmdRunner = {
+    run: async (f, a, o) =>
+      a.includes("stash") || a.includes("--pathspec-file-nul")
+        ? fail("boom")
+        : realCmd.run(f, a, o),
+  };
+  const w2 = makeWorld({ envs: [env2], threads: {}, cmd: failCmd });
+  await w2.jan.onThreadArchived({
+    id: "thr_f",
+    environmentId: env2.id,
+    parentThreadId: "thr_coord",
+  });
+  assert.throws(() =>
+    git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_f"]),
+  );
+  assert.equal(w2.sent.length, 1);
+  assert.match(w2.sent[0]!.text, /НЕ удался/);
 });

@@ -735,6 +735,18 @@ export async function createPlugin(
       send: (a) => bb.sdk.threads.send(a as never) as never,
     },
     loadConfig: janitorConfig,
+    localHostId: async () => {
+      try {
+        const sys = await (
+          bb.sdk as unknown as {
+            system?: { config?: () => Promise<{ primaryHostId?: string }> };
+          }
+        ).system?.config?.();
+        return sys?.primaryHostId ?? "";
+      } catch {
+        return "";
+      }
+    },
     log: bb.log,
   });
   let janitorBusy = false;

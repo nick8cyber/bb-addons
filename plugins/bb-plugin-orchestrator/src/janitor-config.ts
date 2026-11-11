@@ -45,7 +45,12 @@ export interface JanitorConfig {
 }
 
 export interface JanitorConfigLoad {
-  /** Normalized config, or null when disabled/empty/invalid. */
+  /**
+   * Normalized config, or null when the document is empty or invalid.
+   * A valid `{"enabled": false, …}` still yields a config — a `--dry-run`
+   * preview must honor the user's `excludeProjects`/`scope` even while
+   * the janitor is off (PLUG-185).
+   */
   config: JanitorConfig | null;
   errors: PolicyIssue[];
 }
@@ -123,9 +128,6 @@ export function parseJanitorConfig(
     err("enabled", "must be a boolean");
   }
   const enabled = raw.enabled === true;
-  if (!enabled) {
-    return { config: null, errors };
-  }
 
   const mode: JanitorMode = raw.mode === "apply" ? "apply" : "report";
 

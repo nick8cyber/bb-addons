@@ -8,18 +8,27 @@
  * is never called — BB frees the copy once every thread of the env is
  * archived). Before archiving, the full cascade — children and hidden
  * forks recursively — is built and conditions 1–5 are checked for every
- * env of the cascade. `scope` picks the candidates: `workers` (default)
- * covers dispatch threads (`originPluginId=tasks`) and threads with a
- * parent; `all` also covers root chats. A `bb/` branch is deleted only on
- * a later run, once its copy no longer exists. Squash/rebase merges get
- * a second mergedness signal: `git cherry origin/<base> <branch>` with no
- * `+` lines.
+ * env of the cascade; condition 4 covers *every* live thread of those
+ * envs (`idle`/`error` only, `queuedWork = none`, no active delegation,
+ * no pending request), not only cascade members. `scope` picks the
+ * candidates: `workers` (default) covers dispatch threads
+ * (`originPluginId=tasks`) and threads with a parent; `all` also covers
+ * root chats. A `bb/` branch is deleted only on a later run, once its
+ * copy no longer exists. Squash/rebase merges get a second mergedness
+ * signal: `git cherry origin/<base> <branch>` with no `+` lines — and,
+ * because cherry ignores merge commits, `git merge-tree --write-tree`
+ * must produce the target's own tree. Own commits are counted only from
+ * reflog entries that create commits (`commit*`, `cherry-pick`,
+ * `revert`, `rebase (finish)`) — fast-forwards, resets and checkouts
+ * never count.
  *
  * §16.4: on `thread.archived` of an executor whose copy is still dirty,
  * the state is saved into `refs/orchestrator/rescue/<thr>` (stash object
- * including untracked files via a temporary index) and the coordinator
- * gets a restore command. The janitor never deletes refs under
- * `refs/orchestrator/`.
+ * including untracked files via a temporary index and
+ * `--pathspec-from-file`) — unconditionally, even with the janitor
+ * disabled — and the coordinator gets a restore command into a *new*
+ * worktree, plus a line when the snapshot is incomplete. The janitor
+ * never deletes refs under `refs/orchestrator/`.
  *
  * «Влитая копия»: the copy's HEAD and the copy's own branch (the env's
  * `branchName`, when it exists and differs from the checked-out one)
@@ -37,6 +46,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
@@ -52,8 +62,12 @@ import type {
 
 const DAY_MS = 24 * 60 * 60_000;
 const GIT_TIMEOUT_MS = 30_000;
-/** §15 cond 4: threads in these statuses keep their copy. */
-const BLOCKING_THREAD_STATUSES = new Set(["active", "pending"]);
+/**
+ * §15 cond 4 (ревизия 25): only `idle`/`error` threads are quiescent.
+ * `active`, `pending`, `starting`, `stopping` and every unknown status
+ * keep the copy.
+ */
+const QUIESCENT_THREAD_STATUSES = new Set(["idle", "error"]);
 const BRANCH_PREFIX = "bb/";
 
 export interface JanitorLog {
@@ -79,13 +93,25 @@ export interface JanitorDeps {
   loadConfig(): JanitorConfigLoad | Promise<JanitorConfigLoad>;
   now?: () => number;
   log?: JanitorLog;
-  /** §15 cond 5 seam — default scans `/proc/<pid>/cwd` of the current user. */
-  hasProcessIn?: (path: string) => Promise<boolean>;
+  /**
+   * §15 cond 5 seam — default scans `/proc/<pid>/cwd` of the current
+   * user. `null` means the check cannot prove anything (no `/proc`,
+   * e.g. macOS) — the copy is then kept with `process-unknown`.
+   */
+  hasProcessIn?: (path: string) => Promise<boolean | null>;
+  /**
+   * §15 «что смотрит»: id of the host this bb runs on. Envs advertising a
+   * different `hostId` are skipped entirely — their copies are
+   * unreachable to `git -C` anyway. An empty answer cannot prove
+   * remoteness, so nothing is filtered then.
+   */
+  localHostId?: () => string | Promise<string>;
 }
 
 interface EnvDto {
   id: string;
   projectId?: string | null;
+  hostId?: string | null;
   path?: string | null;
   branchName?: string | null;
   mergeBaseBranch?: string | null;
@@ -99,6 +125,10 @@ interface EnvDto {
 interface ThreadDto {
   id: string;
   status?: string | null;
+  /** §15 cond 4: anything but `none` keeps the copy. */
+  queuedWork?: string | null;
+  /** `bb thread list` precomputes this; absent on older BB → CLI fallback. */
+  hasPendingInteraction?: boolean | null;
   archivedAt?: number | null;
   updatedAt?: number | null;
   environmentId?: string | null;
@@ -181,9 +211,10 @@ async function gitOk(
  * `/proc/<pid>` itself (the `cwd` link's stat reports the *directory's*
  * owner, not the process's). `env.path` may contain symlinks while
  * `/proc/<pid>/cwd` is always canonical, so paths are compared after
- * `realpath`.
+ * `realpath`. A platform without `/proc` (macOS) cannot prove the
+ * negative — `null` keeps the copy (`process-unknown`).
  */
-export function defaultHasProcessIn(root: string): boolean {
+export function defaultHasProcessIn(root: string): boolean | null {
   let realRoot = root;
   try {
     realRoot = realpathSync(root);
@@ -197,7 +228,7 @@ export function defaultHasProcessIn(root: string): boolean {
   try {
     pids = readdirSync("/proc").filter((e) => /^\d+$/.test(e));
   } catch {
-    return false;
+    return null;
   }
   for (const pid of pids) {
     try {
@@ -359,12 +390,15 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
-   * §16.3 cond 2: the copy's own commits — commits of its branch after
-   * the branch's creation point. The branch reflog's oldest entry
-   * («branch: Created from …») names the sha the branch started at;
-   * `rev-list <sha>..<branch>` counts everything it gained since. With
-   * no reflog data at all → no own commits, per spec.
+   * §16.3 cond 2: the copy's own commits — reflog entries of its branch
+   * that *create* commits (`commit`, `commit (amend|merge|initial|…)`,
+   * `cherry-pick`, `revert`, `rebase (finish)`). Fast-forwards
+   * (`merge …: Fast-forward`, `pull`), `reset` and `checkout` only move
+   * the ref — an `ff-only` sync with `origin/<base>` is not own work.
+   * No reflog data at all → no own commits, per spec.
    */
+  const OWN_COMMIT_ACTION =
+    /^(?:commit(?:\s*\([^)]*\))?:|cherry-pick:|revert:|rebase \(finish\))/;
   const countOwnCommits = async (
     env: EnvDto,
     path: string,
@@ -375,29 +409,12 @@ export function createJanitor(deps: JanitorDeps) {
       "reflog",
       "show",
       ref,
-      "--format=%H %gs",
+      "--format=%gs",
     ]);
-    if (reflog) {
-      const oldest = reflog
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .pop();
-      if (oldest && /Created from /.test(oldest)) {
-        const creationSha = oldest.slice(0, oldest.indexOf(" "));
-        if (/^[0-9a-f]{40}$/i.test(creationSha)) {
-          const count = (
-            await gitOut(deps.cmd, path, [
-              "rev-list",
-              "--count",
-              `${creationSha}..${ref}`,
-            ])
-          )?.trim();
-          if (count) return Number(count) || 0;
-        }
-      }
-    }
-    return 0;
+    if (!reflog) return 0;
+    return reflog
+      .split("\n")
+      .filter((l) => OWN_COMMIT_ACTION.test(l.trim())).length;
   };
 
   /**
@@ -405,7 +422,11 @@ export function createJanitor(deps: JanitorDeps) {
    * is an ancestor — or when every commit it adds is patch-equivalent on
    * the target (`git cherry` prints only «-» lines, no «+»). Squash and
    * rebase merges leave the sha unreachable but equivalent; a failed
-   * cherry proves nothing, so it never counts.
+   * cherry proves nothing, so it never counts. `git cherry` skips merge
+   * commits entirely — content that exists only inside one (a conflict
+   * resolution edit) is invisible to it, so the cherry path also
+   * requires `git merge-tree --write-tree <target> <sha>` to produce the
+   * target's own tree (a clean merge adding nothing).
    */
   const shaMergedIn = async (
     repoRoot: string,
@@ -420,9 +441,25 @@ export function createJanitor(deps: JanitorDeps) {
       }
       const cherry = await gitOut(deps.cmd, repoRoot, ["cherry", t, sha]);
       if (
-        cherry !== null &&
-        !cherry.split("\n").some((l) => l.startsWith("+"))
+        cherry === null ||
+        cherry.split("\n").some((l) => l.startsWith("+"))
       ) {
+        continue;
+      }
+      const mergedTree = (
+        await gitOut(deps.cmd, repoRoot, [
+          "merge-tree",
+          "--write-tree",
+          t,
+          sha,
+        ])
+      )
+        ?.split("\n")[0]
+        ?.trim();
+      const targetTree = (
+        await gitOut(deps.cmd, repoRoot, ["rev-parse", `${t}^{tree}`])
+      )?.trim();
+      if (mergedTree && targetTree && mergedTree === targetTree) {
         return true;
       }
     }
@@ -504,9 +541,9 @@ export function createJanitor(deps: JanitorDeps) {
     };
 
     try {
-      await runBody(effective, apply, summary);
+      await runBody(effective, apply, summary, !opts.dryRun);
       // A --dry-run preview never writes to the coordinator either.
-      if (!opts.dryRun) await notifyCoordinators(summary, apply);
+      if (!opts.dryRun) await notifyCoordinators(summary);
       finish();
     } catch (e) {
       const text = message(e);
@@ -520,18 +557,39 @@ export function createJanitor(deps: JanitorDeps) {
     cfg: JanitorConfig,
     apply: boolean,
     summary: JanitorRunSummary,
+    metaPersist: boolean,
   ): Promise<void> => {
     const at = now();
     const persist = apply;
     const exclude = new Set(cfg.excludeProjects);
-    const envs = (await listEnvironments()).filter(
+    const localHost = deps.localHostId
+      ? String((await deps.localHostId()) ?? "")
+      : "";
+    const allEnvs = await listEnvironments();
+    // `bb/` branches belonging to envs the janitor must not touch —
+    // excluded projects, and envs of other machines — stay out of the
+    // branch sweep even when the repo itself is in scope.
+    const excludedBranches = new Set(
+      allEnvs
+        .filter(
+          (e) =>
+            exclude.has(e.projectId ?? "") ||
+            (!!localHost && !!e.hostId && e.hostId !== localHost),
+        )
+        .map((e) => e.branchName?.trim())
+        .filter((b): b is string => !!b),
+    );
+    const envs = allEnvs.filter(
       (e) =>
         e.managed === true &&
         e.environmentProviderId === "git-worktree" &&
         e.status === "ready" &&
         typeof e.path === "string" &&
         e.path.length > 0 &&
-        !exclude.has(e.projectId ?? ""),
+        !exclude.has(e.projectId ?? "") &&
+        // Envs of other machines are unreachable to `git -C` — without
+        // the filter they only collect bogus `not-a-repo` rows.
+        (!localHost || !e.hostId || e.hostId === localHost),
     );
     const envById = new Map(envs.map((e) => [e.id, e]));
 
@@ -589,6 +647,8 @@ export function createJanitor(deps: JanitorDeps) {
       protectedTargets: string[];
       localBranches: string[];
       openBranches: Set<string>;
+      /** `git worktree list` failed — the sweep cannot prove openness. */
+      worktreeListFailed: boolean;
     }
     const repos = new Map<string, { root: string; envs: EnvDto[] }>();
     const repoByEnv = new Map<string, RepoInfo | null>();
@@ -659,6 +719,7 @@ export function createJanitor(deps: JanitorDeps) {
         protectedTargets: [],
         localBranches: [],
         openBranches: new Set(),
+        worktreeListFailed: false,
       };
       if (!info.fetched) {
         // The run never saw these copies merged, so their «влита» streak
@@ -679,14 +740,14 @@ export function createJanitor(deps: JanitorDeps) {
             info.protectedTargets.push(ref);
           }
         }
+        const worktreeList = await gitOut(deps.cmd, root, [
+          "worktree",
+          "list",
+          "--porcelain",
+        ]);
+        info.worktreeListFailed = worktreeList === null;
         info.openBranches = new Set(
-          parseWorktreeList(
-            (await gitOut(deps.cmd, root, [
-              "worktree",
-              "list",
-              "--porcelain",
-            ])) ?? "",
-          )
+          parseWorktreeList(worktreeList ?? "")
             .worktrees.map((w) => w.branch)
             .filter((b): b is string => !!b),
         );
@@ -705,7 +766,9 @@ export function createJanitor(deps: JanitorDeps) {
       repoInfos.push(info);
       seenRoots.push({ common: commonDir, root });
     }
-    if (persist) {
+    // Service state, not an item row: written in report mode too (but
+    // never by --dry-run), per the PLUG-185 review of §15/§16.
+    if (metaPersist) {
       deps.janitor.setMeta(
         "repoRoots",
         JSON.stringify(seenRoots.slice(-500)),
@@ -832,6 +895,9 @@ export function createJanitor(deps: JanitorDeps) {
         "rev-parse",
         "--git-dir",
       ]);
+      // A failed git-dir probe means unfinished-op state is unproven —
+      // the copy is kept (`unfinished-unknown`), never silently passed.
+      const gitDirFailed = gitDirRaw === null;
       const gitDir = gitDirRaw
         ? isAbsolute(gitDirRaw.trim())
           ? gitDirRaw.trim()
@@ -926,7 +992,36 @@ export function createJanitor(deps: JanitorDeps) {
       if (dirty)
         return after(abandoned ? "abandoned-dirty" : "dirty", abandoned);
       if (unfinished) return after("unfinished-op");
-      if (await hasProcessIn(path)) return after("process-inside");
+      if (gitDirFailed) return after("unfinished-unknown");
+      // §16.3: commits reachable only from this copy's HEAD reflog die
+      // with the copy — keep it (`detached-commits`). A failed probe
+      // cannot prove the negative (`detached-unknown`).
+      const headReflog = await gitOut(deps.cmd, path, [
+        "reflog",
+        "show",
+        "HEAD",
+        "--format=%H",
+      ]);
+      if (headReflog === null) return after("detached-unknown");
+      const headShas = [
+        ...new Set(headReflog.split("\n").filter(Boolean)),
+      ].slice(0, 500);
+      if (headShas.length) {
+        const detached = (
+          await gitOut(deps.cmd, path, [
+            "rev-list",
+            "--count",
+            ...headShas,
+            "--not",
+            "--all",
+          ])
+        )?.trim();
+        if (detached === undefined) return after("detached-unknown");
+        if (Number(detached) > 0) return after("detached-commits");
+      }
+      const proc = await hasProcessIn(path);
+      if (proc === null) return after("process-unknown");
+      if (proc) return after("process-inside");
       return { ready: true, reason: "ready", reported: false, firstSeenAt };
     };
 
@@ -1018,20 +1113,36 @@ export function createJanitor(deps: JanitorDeps) {
         note("cascade-env-external", null);
         return;
       }
-      for (const t of members) {
-        if (BLOCKING_THREAD_STATUSES.has(t.status ?? "")) {
-          note("threads-active", t.environmentId ?? null);
-          return;
-        }
-        if (delegatedThreads.has(t.id)) {
-          note("delegation-active", t.environmentId ?? null);
-          return;
+      // §15 cond 4 (ревизия 25): every live thread of every cascade env —
+      // not only cascade members — must be idle/errored with an empty
+      // queue and no active delegation. A blocking thread outside the
+      // cascade still blocks the archive.
+      for (const e of memberEnvs.values()) {
+        for (const t of liveThreadsOf(e.id)) {
+          if (!QUIESCENT_THREAD_STATUSES.has(t.status ?? "")) {
+            note("threads-active", e.id);
+            return;
+          }
+          if (t.queuedWork !== "none") {
+            note("queued-work", e.id);
+            return;
+          }
+          if (delegatedThreads.has(t.id)) {
+            note("delegation-active", e.id);
+            return;
+          }
         }
       }
-      for (const t of members) {
-        if (await hasPendingInteraction(t.id)) {
-          note("interactions-pending", t.environmentId ?? null);
-          return;
+      for (const e of memberEnvs.values()) {
+        for (const t of liveThreadsOf(e.id)) {
+          const pending =
+            typeof t.hasPendingInteraction === "boolean"
+              ? t.hasPendingInteraction
+              : await hasPendingInteraction(t.id);
+          if (pending) {
+            note("interactions-pending", e.id);
+            return;
+          }
         }
       }
       for (const e of memberEnvs.values()) {
@@ -1049,7 +1160,13 @@ export function createJanitor(deps: JanitorDeps) {
           // §15: a failed archive rolls the members already archived
           // back and leaves every copy of the cascade alone.
           for (const u of done) {
-            await deps.bbCli.run(["thread", "unarchive", u]);
+            const back = await deps.bbCli.run(["thread", "unarchive", u]);
+            if (back.exitCode !== 0) {
+              log.warn?.(
+                `orchestrator janitor: unarchive ${u} failed: ` +
+                  (back.stderr.trim() || `exit ${back.exitCode}`),
+              );
+            }
           }
           note("archive-failed", root.environmentId ?? null);
           return;
@@ -1153,11 +1270,21 @@ export function createJanitor(deps: JanitorDeps) {
     // deleted (apply mode only) — on a *later* run than the copy's own
     // archiving, once BB has freed the worktree. People's other branches
     // and rescue refs under `refs/orchestrator/` are never touched (§16).
-    for (const { fetched, root, protectedTargets, localBranches, openBranches } of repoInfos) {
-      if (!fetched) continue;
+    for (const {
+      fetched,
+      root,
+      protectedTargets,
+      localBranches,
+      openBranches,
+      worktreeListFailed,
+    } of repoInfos) {
+      // A failed `worktree list` cannot prove a branch is open nowhere —
+      // `branch -D` would refuse anyway, but the sweep skips entirely.
+      if (!fetched || worktreeListFailed) continue;
       for (const branch of localBranches) {
         if (!branch.startsWith(BRANCH_PREFIX)) continue;
         if (cfg.protectedBranches.includes(branch)) continue;
+        if (excludedBranches.has(branch)) continue;
         if (openBranches.has(branch)) continue;
         if (!(await shaMergedIn(root, branch, protectedTargets))) continue;
         summary.orphanBranches += 1;
@@ -1194,21 +1321,24 @@ export function createJanitor(deps: JanitorDeps) {
    * tracked separately from the reported ledger — an env suppressed by
    * the daily watermark stays unannounced and joins the next day's
    * message rather than being dropped. Other threads are never
-   * written to. */
+   * written to. The watermark and the announced set live in
+   * `janitor_meta` (service state — written in report mode too, so a
+   * plugin restart cannot resend a message early); item rows stay
+   * apply-only. */
   const notifyCoordinators = async (
     summary: JanitorRunSummary,
-    persist: boolean,
   ): Promise<void> => {
     if (!summary.reported.length) return;
     let announced = announcedMem;
-    if (persist) {
-      try {
-        announced = new Set(
-          JSON.parse(deps.janitor.meta("announcedAbandoned") ?? "[]"),
-        );
-      } catch {
-        announced = new Set();
-      }
+    try {
+      announced = new Set([
+        ...announcedMem,
+        ...(JSON.parse(
+          deps.janitor.meta("announcedAbandoned") ?? "[]",
+        ) as string[]),
+      ]);
+    } catch {
+      announced = new Set(announcedMem);
     }
     const fresh = summary.reported.filter((i) => !announced.has(i.envId));
     if (!fresh.length) return;
@@ -1252,14 +1382,15 @@ export function createJanitor(deps: JanitorDeps) {
           ],
         });
         notifyMem.set(coordinator, now());
-        for (const item of items) announced.add(item.envId);
-        if (persist) {
-          deps.janitor.setMeta(key, String(now()));
-          deps.janitor.setMeta(
-            "announcedAbandoned",
-            JSON.stringify([...announced].slice(-2000)),
-          );
+        for (const item of items) {
+          announced.add(item.envId);
+          announcedMem.add(item.envId);
         }
+        deps.janitor.setMeta(key, String(now()));
+        deps.janitor.setMeta(
+          "announcedAbandoned",
+          JSON.stringify([...announced].slice(-2000)),
+        );
       } catch (e) {
         log.warn?.(`orchestrator janitor: notify ${coordinator}: ${message(e)}`);
       }
@@ -1269,19 +1400,21 @@ export function createJanitor(deps: JanitorDeps) {
   /**
    * §16.4: build the rescue commit for a dirty copy whose thread was
    * just archived. Tracked/staged state comes from `git stash create`;
-   * untracked files go through a temporary index (empty index + `add`
-   * of the untracked paths) into a third-parent commit — the resulting
-   * ref is a standard stash object restorable by `git stash apply`.
-   * Returns null when there is nothing to save.
+   * untracked files go through a temporary index into a third-parent
+   * commit — the resulting ref is a standard stash object restorable by
+   * `git stash apply`. The untracked list can run to tens of thousands
+   * of paths: it is fed via `--pathspec-from-file` (a NUL-separated temp
+   * file), never argv. `partial` marks a best-effort snapshot — some
+   * content could not be saved and the coordinator is told so.
    */
   const rescueCommit = async (
     path: string,
     threadId: string,
-  ): Promise<string | null> => {
+  ): Promise<{ sha: string | null; partial: boolean }> => {
     const head = (
       await gitOut(deps.cmd, path, ["rev-parse", "--verify", "HEAD"])
     )?.trim();
-    if (!head) return null;
+    if (!head) return { sha: null, partial: false };
     const w = (
       await gitOut(deps.cmd, path, ["stash", "create"])
     )?.trim() || null;
@@ -1293,25 +1426,33 @@ export function createJanitor(deps: JanitorDeps) {
         "--exclude-standard",
       ])) ?? "";
     const uFiles = untracked.split("\0").filter(Boolean);
-    if (!uFiles.length) return w;
-    const tmpIndex = join(
-      tmpdir(),
-      `jan-rescue-${process.pid}-${threadId}-${now()}`,
-    );
+    if (!uFiles.length) return { sha: w, partial: false };
+    const tag = `${process.pid}-${threadId}-${now()}`;
+    const tmpIndex = join(tmpdir(), `jan-rescue-${tag}`);
+    const tmpPaths = join(tmpdir(), `jan-rescue-paths-${tag}`);
     const env = { GIT_INDEX_FILE: tmpIndex };
+    const partialW = { sha: w, partial: true };
     try {
-      await gitOut(deps.cmd, path, ["read-tree", "--empty"], env);
-      const added = await gitOut(
-        deps.cmd,
-        path,
-        ["add", "--", ...uFiles],
-        env,
-      );
-      if (added === null) return w;
+      writeFileSync(tmpPaths, uFiles.join("\0"));
+      const ready = await gitOut(deps.cmd, path, ["read-tree", "--empty"], env);
+      const added =
+        ready === null
+          ? null
+          : await gitOut(
+              deps.cmd,
+              path,
+              [
+                "add",
+                `--pathspec-from-file=${tmpPaths}`,
+                "--pathspec-file-nul",
+              ],
+              env,
+            );
+      if (added === null) return partialW;
       const uTree = (
         await gitOut(deps.cmd, path, ["write-tree"], env)
       )?.trim();
-      if (!uTree) return w;
+      if (!uTree) return partialW;
       const uSha = (
         await gitOut(deps.cmd, path, [
           "commit-tree",
@@ -1320,7 +1461,7 @@ export function createJanitor(deps: JanitorDeps) {
           `orchestrator rescue (untracked) ${threadId}`,
         ])
       )?.trim();
-      if (!uSha) return w;
+      if (!uSha) return partialW;
       if (!w) {
         // Only untracked work: build a stash-shaped commit so the same
         // `git stash apply` restore command works — index commit first,
@@ -1328,7 +1469,7 @@ export function createJanitor(deps: JanitorDeps) {
         const iTree = (
           await gitOut(deps.cmd, path, ["write-tree"])
         )?.trim();
-        if (!iTree) return uSha;
+        if (!iTree) return { sha: uSha, partial: true };
         const iSha = (
           await gitOut(deps.cmd, path, [
             "commit-tree",
@@ -1339,22 +1480,24 @@ export function createJanitor(deps: JanitorDeps) {
             `orchestrator rescue (index) ${threadId}`,
           ])
         )?.trim();
-        return (
-          (
-            await gitOut(deps.cmd, path, [
-              "commit-tree",
-              iTree,
-              "-p",
-              head,
-              "-p",
-              iSha ?? head,
-              "-p",
-              uSha,
-              "-m",
-              `orchestrator rescue ${threadId}`,
-            ])
-          )?.trim() ?? uSha
-        );
+        return {
+          sha:
+            (
+              await gitOut(deps.cmd, path, [
+                "commit-tree",
+                iTree,
+                "-p",
+                head,
+                "-p",
+                iSha ?? head,
+                "-p",
+                uSha,
+                "-m",
+                `orchestrator rescue ${threadId}`,
+              ])
+            )?.trim() ?? uSha,
+          partial: false,
+        };
       }
       const wTree = (
         await gitOut(deps.cmd, path, ["rev-parse", `${w}^{tree}`])
@@ -1367,28 +1510,32 @@ export function createJanitor(deps: JanitorDeps) {
           `${w}^2`,
         ])
       )?.trim();
-      if (!wTree || !wIndex) return w;
-      return (
-        (
-          await gitOut(deps.cmd, path, [
-            "commit-tree",
-            wTree,
-            "-p",
-            head,
-            "-p",
-            wIndex,
-            "-p",
-            uSha,
-            "-m",
-            `orchestrator rescue ${threadId}`,
-          ])
-        )?.trim() ?? w
-      );
+      if (!wTree || !wIndex) return partialW;
+      return {
+        sha:
+          (
+            await gitOut(deps.cmd, path, [
+              "commit-tree",
+              wTree,
+              "-p",
+              head,
+              "-p",
+              wIndex,
+              "-p",
+              uSha,
+              "-m",
+              `orchestrator rescue ${threadId}`,
+            ])
+          )?.trim() ?? w,
+        partial: false,
+      };
     } finally {
-      try {
-        rmSync(tmpIndex, { force: true });
-      } catch {
-        // temp index removal failed — harmless
+      for (const f of [tmpIndex, tmpPaths]) {
+        try {
+          rmSync(f, { force: true });
+        } catch {
+          // temp file removal failed — harmless
+        }
       }
     }
   };
@@ -1396,9 +1543,13 @@ export function createJanitor(deps: JanitorDeps) {
   /**
    * §16.4: `thread.archived` for an executor thread — while BB still
    * holds the copy (the ~5-minute window), a dirty state is committed
-   * to `refs/orchestrator/rescue/<thread>` and the coordinator gets the
-   * restore command. Clean copies and non-executor threads are no-ops;
-   * the janitor never deletes refs under `refs/orchestrator/`.
+   * to `refs/orchestrator/rescue/<thread>` and the coordinator gets a
+   * restore command into a *new* worktree (never the main checkout,
+   * where somebody else's work may be in flight). Rescue is
+   * unconditional: it does not depend on `janitor.enabled` or a valid
+   * config — a user who keeps the janitor off still gets the safety
+   * net. Clean copies and non-executor threads are no-ops; the janitor
+   * never deletes refs under `refs/orchestrator/`.
    */
   const onThreadArchived = async (thread: {
     id: string;
@@ -1407,8 +1558,6 @@ export function createJanitor(deps: JanitorDeps) {
     sourceThreadId?: string | null;
     originPluginId?: string | null;
   }): Promise<void> => {
-    const cfgLoad = await deps.loadConfig();
-    if (cfgLoad.errors.length || !cfgLoad.config?.enabled) return;
     // Scope check when the event carries the fields; absent fields mean
     // «unknown» — rescuing a dirty copy is harmless, so proceed.
     const fieldsKnown =
@@ -1432,15 +1581,39 @@ export function createJanitor(deps: JanitorDeps) {
       "--ignore-submodules=none",
     ]);
     if (statusText === null || !statusText.trim()) return;
-    const sha = await rescueCommit(path, thread.id);
-    if (!sha) return;
-    const ref = `refs/orchestrator/rescue/${thread.id}`;
-    if (!(await gitOk(deps.cmd, path, ["update-ref", ref, sha]))) return;
     const coordinator =
       deps.store.byThreadId(thread.id)?.coordinator_thread_id ??
       thread.parentThreadId ??
       null;
-    if (!coordinator) return;
+    const tellCoordinator = async (text: string) => {
+      if (!coordinator) return;
+      try {
+        await deps.threads.send({
+          threadId: coordinator,
+          mode: "queue-if-active",
+          input: [{ type: "text", text, mentions: [] }],
+        });
+      } catch (e) {
+        log.warn?.(
+          `orchestrator janitor: rescue notify ${coordinator}: ${message(e)}`,
+        );
+      }
+    };
+    const { sha, partial } = await rescueCommit(path, thread.id);
+    const ref = `refs/orchestrator/rescue/${thread.id}`;
+    if (
+      !sha ||
+      !(await gitOk(deps.cmd, path, ["update-ref", ref, sha]))
+    ) {
+      // The archive still happens — without the line the work is gone
+      // silently (PLUG-185): a failed or partial rescue is reported.
+      await tellCoordinator(
+        `[orchestrator] исполнитель ${thread.id} заархивирован ` +
+          `с несохранённой работой, снимок НЕ удался — копия ${path} ` +
+          `уходит под уборку BB, проверь вручную`,
+      );
+      return;
+    }
     const common = (
       await gitOut(deps.cmd, path, ["rev-parse", "--git-common-dir"])
     )?.trim();
@@ -1451,26 +1624,20 @@ export function createJanitor(deps: JanitorDeps) {
       : path;
     const repoRoot =
       basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
-    try {
-      await deps.threads.send({
-        threadId: coordinator,
-        mode: "queue-if-active",
-        input: [
-          {
-            type: "text",
-            text:
-              `[orchestrator] исполнитель ${thread.id} заархивирован ` +
-              `с несохранённой работой — снимок: ${ref}. ` +
-              `Восстановление: git -C ${repoRoot} stash apply ${ref}`,
-            mentions: [],
-          },
-        ],
-      });
-    } catch (e) {
-      log.warn?.(
-        `orchestrator janitor: rescue notify ${coordinator}: ${message(e)}`,
-      );
-    }
+    const rescueDir = join(
+      dirname(repoRoot),
+      `${basename(repoRoot)}-rescue-${thread.id}`,
+    );
+    await tellCoordinator(
+      `[orchestrator] исполнитель ${thread.id} заархивирован ` +
+        `с несохранённой работой` +
+        (partial
+          ? " (снимок неполный — часть файлов не сохранилась)"
+          : "") +
+        ` — снимок: ${ref}. ` +
+        `Восстановление в новую копию: git -C ${repoRoot} worktree add ` +
+        `${rescueDir} ${ref}^1 && git -C ${rescueDir} stash apply ${ref}`,
+    );
   };
 
   const report = async (): Promise<JanitorReport> => {
