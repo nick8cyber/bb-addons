@@ -16,6 +16,7 @@ import {
   isAllowed,
   maskSecrets,
   parseAddedLines,
+  hasBbIds,
   machineScan,
   runGitleaks,
 } from "../src/scan.js";
@@ -1303,4 +1304,173 @@ test("release (merged): lock records EMPTY head on the publish branch (PLUG-191)
   assert.equal((await pending).status, "auditing");
   assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work");
   assert.equal(existsSync(lock), false);
+});
+
+// ── §16.6 (PLUG-194): release/… names only, neutral title, merged sync ──
+
+test("hasBbIds: thr_ and task-key hit, plain subject does not (PLUG-194)", () => {
+  assert.equal(hasBbIds("fix: rework (PLUG-187)"), true);
+  assert.equal(hasBbIds("wip: notes for thr_abc1234567"), true);
+  assert.equal(hasBbIds("see proj_abc1234567"), true);
+  assert.equal(hasBbIds('charset="UTF-8"'), false);
+  assert.equal(hasBbIds("feat: add a thing"), false);
+});
+
+test("pump: threadIds true→false — the executor branch is never published (PLUG-194)", async () => {
+  const { repo } = makeRepo();
+  const ghCalls: string[][] = [];
+  let threadIds = true;
+  const { deps, store } = makeDeps(repo, {
+    ghCalls,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
+  deps.loadReleaseConfig = () =>
+    parseReleaseConfig(
+      JSON.stringify({
+        commitIdentity: "Agent <agent@x.io>",
+        defaults: { target: { action: "pr", branch: "main" }, threadIds },
+      }),
+    );
+  const round = async () => {
+    await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+    store.setStatus(
+      store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+      "done",
+    );
+    const s = await pumpReleases(deps);
+    assert.equal(s.published, 1);
+  };
+  await round();
+  // §16.6: only `release/…` names are recorded — under threadIds=true
+  // the published executor branch is not a reusable publish name.
+  const first = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(first.publish_branch, null);
+  assert.equal(store.releasePublishBranch("PLUG-1"), null);
+  // Emulate a row written by the pre-fix version — the executor branch
+  // name sitting in publish_branch must never be reused either.
+  store.updateRelease(first.id, { publishBranch: "feat-x" });
+  // The project flips to no-ids: the next release publishes a neutral
+  // release/<sha7>, not `feat-x`.
+  threadIds = false;
+  writeFileSync(join(repo, "more.txt"), "more\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  await round();
+  const creates = ghCalls.filter((a) => a[0] === "pr" && a[1] === "create");
+  assert.equal(creates.length, 2);
+  assert.equal(creates[0]![creates[0]!.indexOf("--head") + 1], "feat-x");
+  const second = creates[1]![creates[1]!.indexOf("--head") + 1]!;
+  assert.match(second, /^release\/[0-9a-f]{7}$/);
+  assert.equal(
+    store.releasesByStatuses(["published"])[1]!.publish_branch,
+    second,
+  );
+});
+
+test("pump: threadIds=false — HEAD subject with a task key → release <sha7> (PLUG-194)", async () => {
+  const { repo } = makeRepo();
+  const ghCalls: string[][] = [];
+  // §16.6: the subject carries a tracker key — under bbIds=warn it is
+  // only a warning, yet the PR title must stay neutral.
+  gitR(repo, ["commit", "--amend", "-m", "fix: rework (PLUG-1)"]);
+  const { deps, store } = makeDeps(repo, {
+    ghCalls,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        threadIds: false,
+      },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  const create = ghCalls.find((a) => a[0] === "pr" && a[1] === "create")!;
+  assert.match(
+    create[create.indexOf("--title") + 1]!,
+    /^release [0-9a-f]{7}$/,
+  );
+});
+
+test("release (merged): sync=rebase never applies — merge keeps the resolution (PLUG-194)", async () => {
+  const { remote, seed } = makeRepo();
+  const base = mkdtempSync(join(tmpdir(), "rel-coord-"));
+  const coord = join(base, "coord");
+  execFileSync("git", ["clone", "--branch", "main", remote, coord]);
+  gitR(coord, ["config", "user.name", "Agent"]);
+  gitR(coord, ["config", "user.email", "agent@x.io"]);
+  gitR(coord, ["checkout", "-b", "work"]);
+  // A §14 merge commit whose conflict resolution exists only in it —
+  // `git rebase` would flatten it away.
+  writeFileSync(join(coord, "res.txt"), "base\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "feat: result"]);
+  gitR(coord, ["checkout", "-b", "side"]);
+  writeFileSync(join(coord, "res.txt"), "side\n");
+  gitR(coord, ["commit", "-am", "side edit"]);
+  gitR(coord, ["checkout", "work"]);
+  writeFileSync(join(coord, "res.txt"), "work\n");
+  gitR(coord, ["commit", "-am", "work edit"]);
+  try {
+    execFileSync("git", ["-C", coord, "merge", "-m", "merge r1", "side"]);
+  } catch {
+    // expected conflict — resolve it with content unique to the merge
+  }
+  writeFileSync(join(coord, "res.txt"), "RESOLVED-ONLY-IN-MERGE\n");
+  gitR(coord, ["add", "res.txt"]);
+  gitR(coord, ["commit", "-m", "merge r1"]);
+  const workTip = gitR(coord, ["rev-parse", "HEAD"]);
+  gitR(coord, ["checkout", "-b", "work-2"]);
+  // Advance origin/main so the sync step actually runs.
+  writeFileSync(join(seed, "new.txt"), "new\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: more"]);
+  gitR(seed, ["push", "origin", "main"]);
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        sync: "rebase",
+      },
+    }),
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  const subcommands: string[] = [];
+  const realRun = deps.cmd.run;
+  deps.cmd = {
+    run: async (file, args, o) => {
+      if (file === "git" && args[0] === "-C") subcommands.push(args[2]!);
+      return realRun(file, args, o);
+    },
+  };
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  // §16.6: a §14-merged result is synced by merge only.
+  assert.ok(subcommands.includes("merge"));
+  assert.ok(!subcommands.includes("rebase"));
+  // The §14 merge commit is still in `work` and its resolution survived.
+  execFileSync("git", [
+    "-C",
+    coord,
+    "merge-base",
+    "--is-ancestor",
+    workTip,
+    "work",
+  ]);
+  assert.match(
+    execFileSync("git", ["-C", coord, "show", "work:res.txt"], {
+      encoding: "utf8",
+    }),
+    /RESOLVED-ONLY-IN-MERGE/,
+  );
+  // The coordinator copy returned to its own branch, lock released.
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work-2");
 });

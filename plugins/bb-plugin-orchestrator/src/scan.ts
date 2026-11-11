@@ -181,6 +181,22 @@ const bbIdRules = (threadIds: boolean) =>
       )
     : BB_ID_RULES;
 
+/** §16.6 (PLUG-194): does the text carry a bb identifier — a `thr_…`/
+ * `proj_…`/`env_…` id, a `*.getbb.app` host, or a tracker task key?
+ * Used for the neutral PR title: a HEAD subject with any of these is
+ * replaced by `release <sha7>` while `threadIds` is off. */
+export function hasBbIds(text: string): boolean {
+  for (const { rule, re } of BB_ID_RULES) {
+    if (!re.test(text)) continue;
+    if (rule === "task-key") {
+      const tokens = text.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/g) ?? [];
+      if (!tokens.some(isTaskKeyToken)) continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 const hits = (text: string, rules: { rule: string; re: RegExp }[]) =>
   rules.filter(({ re }) => re.test(text)).map(({ rule }) => rule);
 

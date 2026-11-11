@@ -31,6 +31,7 @@ import {
 import {
   machineScan,
   parseAddedLines,
+  hasBbIds,
   EMPTY_TREE_SHA,
   formatFinding,
   maskSecrets,
@@ -977,11 +978,16 @@ async function runReleaseSteps(
   const { taskKey, title, executor, project, repo, branch, policyLoad } = ctx;
 
   // Step 2 — sync по режиму проекта.
+  // §16.6 (PLUG-194): a §14-merged result is synced by MERGE only —
+  // `git rebase` flattens merge commits, silently dropping the
+  // conflict-resolution edits that exist only in them.
   const { baseSha, remoteBaseSha } = await syncBranch(
     deps,
     repo,
     branch,
-    project,
+    executor.merge_status === "merged"
+      ? { ...project, sync: "merge" }
+      : project,
   );
 
   // Step 3 — проверки проекта.
@@ -1440,11 +1446,15 @@ async function publishRelease(
   // (one branch and one PR per task, §16.6), and the PR body carries
   // neither «Источник» nor «Задача: <KEY>».
   const threadIds = projectThreadIds(deps, row.project_id);
+  // §16.6 (PLUG-194): a publish-branch name is written and reused only
+  // in the `release/…` form — an executor branch name recorded while
+  // threadIds was on must not be published after it flips off.
+  const isPublishName = (b: string | null | undefined): b is string =>
+    typeof b === "string" && b.startsWith("release/");
   const remoteBranch = threadIds
     ? row.branch
-    : (row.publish_branch ??
-      deps.store.releasePublishBranch(row.task_key) ??
-      `release/${headSha.slice(0, 7)}`);
+    : ([row.publish_branch, deps.store.releasePublishBranch(row.task_key)]
+        .find(isPublishName) ?? `release/${headSha.slice(0, 7)}`);
   const prs = await ghJson<GhPr[]>(deps, repo, [
     "pr",
     "list",
@@ -1490,12 +1500,21 @@ async function publishRelease(
   );
   deps.store.updateRelease(row.id, {
     publishedSha: headSha,
-    publishBranch: remoteBranch,
+    // §16.6: only `release/…` names are recorded — the executor's own
+    // branch (published under threadIds=true) is not a reusable name.
+    ...(isPublishName(remoteBranch) ? { publishBranch: remoteBranch } : {}),
   });
   let prUrl = existing?.url ?? null;
   if (!existing) {
     // §16.6: with thread ids off the PR title never carries the task's
-    // title or key — the HEAD commit subject, else `release <sha7>`.
+    // title or key — the HEAD commit subject when it is free of bb
+    // identifiers (`thr_…`, tracker keys), else `release <sha7>`
+    // (PLUG-194).
+    const subject = threadIds
+      ? null
+      : await git(deps, repo, ["log", "-1", "--format=%s", headSha], {
+          allowFail: true,
+        });
     const title = threadIds
       ? ((
           await runJson<TaskShow>(deps.bbCli, [
@@ -1505,10 +1524,9 @@ async function publishRelease(
             "--json",
           ]).catch(() => null)
         )?.task?.title ?? row.task_key)
-      : ((await git(deps, repo, ["log", "-1", "--format=%s", headSha], {
-          allowFail: true,
-        })) ||
-        `release ${headSha.slice(0, 7)}`);
+      : subject && !hasBbIds(subject)
+        ? subject
+        : `release ${headSha.slice(0, 7)}`;
     const created = await ghJson<{ url?: string }>(deps, repo, [
       "pr",
       "create",

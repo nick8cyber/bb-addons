@@ -1005,12 +1005,14 @@ export class DelegationStore {
 
   /** §16.6 (PLUG-191): the neutral `release/<sha7>` branch name this
    * task's FIRST published release wrote — repeat releases reuse it so
-   * the task keeps one remote branch and one PR. */
+   * the task keeps one remote branch and one PR. PLUG-194: only
+   * `release/…` names count — rows written while `threadIds` was on may
+   * still hold the executor's branch, which must never be reused. */
   releasePublishBranch(taskKey: string): string | null {
     const row = this.db
       .prepare(
         `SELECT publish_branch FROM releases
-         WHERE task_key = ? AND publish_branch IS NOT NULL
+         WHERE task_key = ? AND publish_branch LIKE 'release/%'
          ORDER BY id ASC LIMIT 1`,
       )
       .get(normalizeTaskKey(taskKey)) as
