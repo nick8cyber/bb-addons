@@ -488,8 +488,9 @@ export async function dispatchToRoute(
   // §2.2: the «Работа с git» section leads --instructions; a continuation
   // round then adds «Заход N» (§4.1) — or, for auditor levels, the
   // «Проверяемый итог» line instead (§4.1 r23: a read-only role gets no
-  // merge commands) — a `no_code` row adds the §4.1 r28 «задача без кода»
-  // line — then this call's extra instructions. In this shared step they
+  // merge commands) — a `no_code` row drops the git memo entirely (§4.1
+  // r28.1: its commit requirements would contradict the «задача без кода»
+  // line) — then this call's extra instructions. In this shared step they
   // cover the §5.4 reissue path too.
   const resultRef = row.continue_from
     ? store.resultRefForSha(row.task_key, row.continue_from)

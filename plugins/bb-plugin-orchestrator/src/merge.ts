@@ -6,7 +6,7 @@
  * `not-done`, `no-result`, `no-environment`, `dirty-coordinator`,
  * `detached-head`, `unknown-branch`, `result-missing`, `merge-in-progress`,
  * `already-merged`, `fix-delegated`, `merge-hook-failed`, `copy-not-restored`,
- * `copy-busy`.
+ * `copy-busy`, `nothing-to-merge`.
  *
  * Order: row checks (done, result, `merged`/`fix-delegated` repeats) →
  * coordinator environment → copy lock (a lock file in the copy's git dir,
@@ -183,6 +183,14 @@ function assertMergeableRow(row: DelegationRow): string {
       "not-done",
       `delegation ${row.id} is ${row.status}, not done`,
       "merge works on finished rounds — see `bb orchestrator status`",
+    );
+  }
+  // §4.1 r28.1: a «задача без кода» round that produced no commits has
+  // nothing to merge — the refusal comes before the result checks.
+  if (row.no_code === 1 && (row.result_commits ?? 0) === 0) {
+    throw new OrchestratorError(
+      "nothing-to-merge",
+      "задача без кода: вливать нечего",
     );
   }
   if (!row.result_sha) {

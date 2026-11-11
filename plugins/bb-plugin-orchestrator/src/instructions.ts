@@ -211,6 +211,12 @@ export const NO_CODE_LINE =
  * call's extra instructions; an empty or over-limit value adds no section
  * (an over-limit value is also flagged needs-configuration so it is never
  * silently dropped). No text at all — no `--instructions` flag.
+ *
+ * §4.1 r28.1: for a `no_code` row the §2.2 memo is NOT sent — its
+ * requirements to commit and to report a branch and a SHA would
+ * contradict NO_CODE_LINE, which alone states the contract («не менять,
+ * не коммитить; итог — отчёт»). The «Заход N» section still goes out:
+ * landing on `continue_from` is positioning, not a commit requirement.
  */
 export function mergeDispatchInstructions(
   gitInstructions: string | undefined,
@@ -225,7 +231,7 @@ export function mergeDispatchInstructions(
   const x = (extra ?? "").trim();
   const r = (round ?? "").trim();
   const parts = [
-    ...(git ? [git] : []),
+    ...(git && !noCode ? [git] : []),
     ...(r ? [r] : []),
     ...(noCode ? [NO_CODE_LINE] : []),
     ...(x ? [x] : []),

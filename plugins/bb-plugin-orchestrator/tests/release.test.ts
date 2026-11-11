@@ -362,6 +362,10 @@ function makeDeps(repo: string, overrides: Partial<{
   localHostId?: string;
   /** §6 (r8): the delegation rows' `project_id` (default proj_main). */
   delegationProjectId?: string;
+  /** §4.1 r28.1: mark the executor delegation «задача без кода». */
+  execNoCode?: boolean;
+  /** §4.1 r28.1: the executor round's own commit count (default 1). */
+  execCommits?: number | null;
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -378,11 +382,14 @@ function makeDeps(repo: string, overrides: Partial<{
     projectId: overrides.delegationProjectId ?? "proj_main",
     coordinatorThreadId: "thr_coord", level: "complex",
     route: "c", preset: "c", provider: "p",
+    noCode: overrides.execNoCode,
   });
   store.setThreadInfo(exec.id, "thr_exec");
   store.setStatus(exec.id, "done");
   store.setRoundResult(exec.id, {
-    branch: "feat-x", sha: RESULT_SHA, commits: 1, dirty: false,
+    branch: "feat-x", sha: RESULT_SHA,
+    commits: overrides.execCommits === undefined ? 1 : overrides.execCommits,
+    dirty: false,
   });
   const rev = store.insert({
     taskKey: "PLUG-1", projectId: "proj_main",
@@ -3392,4 +3399,39 @@ test("machine scan r8: префиксы-фикстуры — не находки
   );
   assert.ok(f.some((x) => x.category === 3 && x.file === "f.ts"));
   assert.ok(f.some((x) => x.category === 3 && x.file === null));
+});
+
+// ── §4.1 r28.1: «задача без кода» — вливать нечего ─────────────────────
+
+test("§4.1 r28.1: no-code round with 0 commits — release отказывает «вливать нечего»", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo, { execNoCode: true, execCommits: 0 });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => {
+      const err = e as OrchestratorError;
+      assert.equal(err.code, "release-refused");
+      assert.match(err.message, /задача без кода: вливать нечего/);
+      return true;
+    },
+  );
+});
+
+test("§4.1 r28.1: no-code round без записанных коммитов — тот же отказ", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo, { execNoCode: true, execCommits: null });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /задача без кода: вливать нечего/.test((e as OrchestratorError).message),
+  );
+});
+
+test("§4.1 r28.1: no-code round WITH commits — release идёт как обычно", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo, { execNoCode: true });
+  // commits appeared anyway — the pipeline runs its normal gates
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
 });

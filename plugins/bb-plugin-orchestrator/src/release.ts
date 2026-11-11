@@ -568,6 +568,18 @@ async function acceptTask(
     .delegationsByTask(key)
     .find((d) => roleOf(d.level) === "executor" && d.status === "done");
   if (!executor) missing.push("нет делегирования в статусе done");
+  // §4.1 r28.1: a «задача без кода» round that produced no commits has
+  // nothing to publish — a hard refusal before the sha/review gate.
+  if (
+    executor &&
+    executor.no_code === 1 &&
+    (executor.result_commits ?? 0) === 0
+  ) {
+    throw new OrchestratorError(
+      "release-refused",
+      `release ${key}: задача без кода: вливать нечего`,
+    );
+  }
 
   // §17.3 (Б4): the review gate is bound to the published sha — a
   // plain executor result needs an OK review on its `result_sha`

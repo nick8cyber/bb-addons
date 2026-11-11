@@ -16,9 +16,13 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `mode=bypass` for `permissionMode=full` presets, marks `running`, and
   comments «Раздано» on the task. `--no-code` (tool `noCode`) marks a
   delegation that expects no commits (§4.1 r28): the executor is told to
-  report only, the watchdog drops «коммитов нет» and flags commits that
-  appear anyway; the mark rides reissues and shows as `no-code` in
-  `status`/`show`.
+  report only — the §2.2 git memo's commit/branch/SHA requirements are
+  left out (r28.1); the watchdog drops «коммитов нет» and flags commits
+  that appear anyway; the mark rides watchdog reissues only (a new
+  `delegate` without the flag is an ordinary dispatch), shows as
+  `no-code` in `status`/`show`, and makes `merge`/`release` refuse
+  «задача без кода: вливать нечего» when the last round produced no
+  commits (r28.1).
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only threads whose role may delegate (`delegates`, §13);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).

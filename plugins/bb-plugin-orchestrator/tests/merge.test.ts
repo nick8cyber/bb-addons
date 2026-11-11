@@ -95,6 +95,7 @@ function makeDeps(opts: {
   exec?: string | null;
   mergeAutofix?: boolean;
   delegateFail?: Error;
+  noCode?: boolean;
 }) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -107,6 +108,7 @@ function makeDeps(opts: {
     route: "r",
     preset: "r",
     provider: "p",
+    noCode: opts.noCode,
   });
   store.setThreadInfo(row.id, "thr_exec");
   store.setStatus(row.id, "done");
@@ -1313,4 +1315,53 @@ test("§17.2 r26 (PLUG-215 С1): a failed newest round without a finished predec
     assert.match(err.hint ?? "", /orchestrator status/);
     return true;
   });
+});
+
+// ── §4.1 r28.1: «задача без кода» — вливать нечего ─────────────────────
+
+test("§4.1 r28.1: a no-code round with 0 commits refuses «вливать нечего»", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec, noCode: true });
+  // the watchdog still records the round result — HEAD sits on the base
+  // commit with no commits of its own
+  store.setRoundResult(row.id, {
+    envId: "env_exec",
+    branch: "bb/plug-1",
+    sha: resultSha,
+    commits: 0,
+    dirty: false,
+  });
+  await assert.rejects(runMerge(PARAMS, deps), (e: unknown) => {
+    const err = e as OrchestratorError;
+    assert.equal(err.code, "nothing-to-merge");
+    assert.match(err.message, /задача без кода: вливать нечего/);
+    return true;
+  });
+  assert.equal(gitR(coord, ["status", "--porcelain"]), "");
+});
+
+test("§4.1 r28.1: a no-code round without a recorded result refuses the same", async () => {
+  const { coord, exec } = makeRepos();
+  const { deps, row } = makeDeps({ coord, exec, noCode: true });
+  // result_commits NULL counts as «no commits» — «вливать нечего» beats
+  // the plain «no-result» answer.
+  await assert.rejects(
+    runMerge({ ref: String(row.id), callerThreadId: "thr_coord" }, deps),
+    (e: unknown) => {
+      const err = e as OrchestratorError;
+      assert.equal(err.code, "nothing-to-merge");
+      assert.match(err.message, /задача без кода: вливать нечего/);
+      return true;
+    },
+  );
+});
+
+test("§4.1 r28.1: a no-code round WITH commits merges as usual", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec, noCode: true });
+  // commits appeared anyway — the task stopped being «без кода» de facto
+  recordResult(store, row, resultSha);
+  const res = await runMerge(PARAMS, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  assert.equal(res.delegationId, row.id);
 });

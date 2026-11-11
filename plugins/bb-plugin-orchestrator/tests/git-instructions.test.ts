@@ -487,10 +487,12 @@ test("review level with an unrecorded --from ref names just the commit", async (
 // ── §4.1 r28 (PLUG-237): the «задача без кода» instruction line ───────
 
 test("mergeDispatchInstructions: the no-code line lands before extras", () => {
+  // §4.1 r28.1: the git memo is NOT sent for a no-code row — its commit
+  // requirements would contradict the «не коммитить» line.
   const merged = mergeDispatchInstructions("GIT-RULES", "EXTRA", undefined, true)!;
   assert.equal(
     merged,
-    "GIT-RULES\n\nзадача без кода: файлы репозитория не менять, не коммитить; итог — отчёт\n\nEXTRA",
+    "задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт\n\nEXTRA",
   );
   assert.equal(
     mergeDispatchInstructions(undefined, undefined, undefined, true),
@@ -500,6 +502,36 @@ test("mergeDispatchInstructions: the no-code line lands before extras", () => {
     mergeDispatchInstructions(undefined, undefined, undefined, false),
     undefined,
   );
+});
+
+test("§4.1 r28.1: no-code instructions carry no requirement to commit", () => {
+  // The §2.2 memo's commit/branch/SHA-in-the-report requirements must not
+  // reach a no-code executor — with the default memo nothing but
+  // NO_CODE_LINE remains, whatever text the memo itself holds.
+  const merged = mergeDispatchInstructions(
+    DEFAULT_GIT_INSTRUCTIONS,
+    undefined,
+    undefined,
+    true,
+  )!;
+  assert.equal(merged, NO_CODE_LINE);
+  const requirements = merged.replace(NO_CODE_LINE, "");
+  assert.doesNotMatch(requirements, /коммит|commit|sha/i);
+  assert.doesNotMatch(merged, /локальный коммит|ветка и SHA/);
+});
+
+test("§4.1 r28.1: a «Заход N» section still reaches a no-code round", () => {
+  // The continuation merge commands are positioning, not a commit
+  // requirement — they stay; only the §2.2 memo is dropped.
+  const merged = mergeDispatchInstructions(
+    DEFAULT_GIT_INSTRUCTIONS,
+    undefined,
+    "Заход 2: продолжение работы с коммита abc123def",
+    true,
+  )!;
+  assert.match(merged, /Заход 2: продолжение работы с коммита abc123def/);
+  assert.match(merged, /задача без кода/);
+  assert.doesNotMatch(merged, /локальный коммит|ветка и SHA/);
 });
 
 test("§4.1 r28: dispatchToRoute adds the no-code line for a marked row", async () => {
@@ -515,9 +547,10 @@ test("§4.1 r28: dispatchToRoute adds the no-code line for a marked row", async 
     noCode: true,
   });
   await dispatchToRoute(row, {}, deps);
+  // r28.1: the §2.2 memo is dropped — the no-code line goes out alone.
   assert.equal(
     dispatchedInstructions(calls),
-    "GIT-RULES\n\nзадача без кода: файлы репозитория не менять, не коммитить; итог — отчёт",
+    "задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт",
   );
 });
 
