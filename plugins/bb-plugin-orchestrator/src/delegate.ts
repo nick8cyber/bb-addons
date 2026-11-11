@@ -5,7 +5,7 @@
  *   2. INSERT the delegation as `dispatching` (the partial unique index is
  *      the double-dispatch guard);
  *   3. `bb tasks dispatch --json` → record `thread_id` at once;
- *   4. attach: `threads.update` (parent, hidden) + CLI `--parent-notifications auto`;
+ *   4. attach: `threads.update` (parent, hidden) + CLI `--parent-notifications stuck` (§16.5);
  *   5. best-effort `mode=bypass` for `permissionMode=full` presets;
  *   6. status `running` + task comment «Раздано: …»;
  *   7. return the delegation.
@@ -164,6 +164,18 @@ export async function runDelegate(
     );
   }
 
+  // §6: `--from` picks the continuation point, `--fresh` drops it — never
+  // both; the silent precedence hid caller mistakes (PLUG-176). The check
+  // precedes the limits so a mis-flagged call fails on its own error even
+  // when the task is already at the cap.
+  if (params.from && params.fresh) {
+    throw new OrchestratorError(
+      "incompatible-flags",
+      "--from and --fresh cannot be combined",
+      "--from names the commit to continue from; --fresh starts the round from the base",
+    );
+  }
+
   const held = store.heldGroups(Date.now());
   const { name: routeName, route } = pickRoute(policy, params.level, {
     requested: params.route,
@@ -192,16 +204,6 @@ export async function runDelegate(
         `active "${params.level}" delegations ${count}/${perLevel}`,
       );
     }
-  }
-
-  // §6: `--from` picks the continuation point, `--fresh` drops it — never
-  // both; the silent precedence hid caller mistakes (PLUG-176).
-  if (params.from && params.fresh) {
-    throw new OrchestratorError(
-      "incompatible-flags",
-      "--from and --fresh cannot be combined",
-      "--from names the commit to continue from; --fresh starts the round from the base",
-    );
   }
 
   // §4.1 rounds: every delegate is a new round. The round continues from
@@ -321,7 +323,11 @@ export async function dispatchToRoute(
     deps.gitInstructions?.(),
     opts.instructions,
     row.continue_from
-      ? roleForLevel(row.level) === "auditor"
+      ? // TODO(§16.8/§2.3): decide by the LEVEL's `role` field — a level
+        // declared `role: "auditor"` counts even when not named `review`.
+        // roleForLevel covers the name convention until PLUG-175 ships
+        // the level-role helper.
+        roleForLevel(row.level) === "auditor"
         ? reviewRoundLine(row.continue_from, resultRef?.branch, resultRef?.round)
         : roundSection(row.round, row.continue_from, resultRef?.branch)
       : undefined,
@@ -416,7 +422,7 @@ export async function finishDispatchSteps(
       "update",
       threadId,
       "--parent-notifications",
-      "auto",
+      "stuck",
     ]);
   } catch (e) {
     noteError("parent-notifications", e);
@@ -604,7 +610,7 @@ export async function retrySetupSteps(
         "update",
         threadId,
         "--parent-notifications",
-        "auto",
+        "stuck",
       ]),
     );
   }

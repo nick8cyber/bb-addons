@@ -56,6 +56,11 @@ function makeHarness(
     dispatchThreadId?: string;
     /** Throw on the first N `threads.stop` calls (confirmStop tests). */
     stopFails?: number;
+    /** Throw on the first N `threads.send` calls (§16.5 resend tests). */
+    sendFails?: number;
+    /** §16.1: provider-retry status/cancel fail counts. */
+    retryStatusFails?: number;
+    retryCancelFails?: number;
     /** §4.1 round-result seam; absent → the done path skips collection. */
     round?: WatchdogDeps["round"];
   } = {},
@@ -89,11 +94,33 @@ function makeHarness(
   const sends: { threadId: string; mode: string; input: unknown[] }[] = [];
   const stops: string[] = [];
   const updates: unknown[] = [];
+  /** §16.5: watchdog `threads.update` calls (binding re-verify). */
+  const wdUpdates: {
+    threadId: string;
+    parentThreadId?: string | null;
+    visibility?: string;
+  }[] = [];
+  /** §16.5: `threads.output` answers — the executor's report text. */
+  const outputs = new Map<string, string | null>();
+  /** §16.1: pending provider-retry rows per thread. */
+  const retryPendingRows = new Map<string, unknown[]>();
+  /** §16.1: scripted `pending` answers — each call shifts one entry. */
+  const retryStatusScript: unknown[][] = [];
+  const retryCancels: string[] = [];
+  const retryKnobs = {
+    statusFails: opts.retryStatusFails ?? 0,
+    cancelFails: opts.retryCancelFails ?? 0,
+  };
+  /** Call-order record: `stop:<id>`, `retry-status:<id>`, `retry-cancel:<id>`. */
+  const ops: string[] = [];
   const eventLog = new Map<string, WatchdogThreadEvent[]>();
   const threadDtos = new Map<string, WatchdogThreadDto>();
   const queues = new Map<string, unknown[]>();
   /** §5.1 rev 18: threadIds whose journal reads must fail (server down). */
   const eventsBlocked = new Set<string>();
+  /** §16.5: the status a successful `threads.stop` leaves behind. */
+  const stopResult = { status: "idle" as string | null };
+  let sendFailsLeft = opts.sendFails ?? 0;
   const threads = {
     get: async ({ threadId }: { threadId: string }) => {
       const dto = threadDtos.get(threadId);
@@ -138,6 +165,10 @@ function makeHarness(
       mode: "queue-if-active";
       input: unknown[];
     }) => {
+      if (sendFailsLeft > 0) {
+        sendFailsLeft--;
+        throw new Error("send failed (test)");
+      }
       sends.push(args);
       return {};
     },
@@ -145,12 +176,31 @@ function makeHarness(
       const row = store.byThreadId(threadId);
       statusAtStop.push(row?.status ?? "none");
       stops.push(threadId);
+      ops.push(`stop:${threadId}`);
       if (stopFailsLeft > 0) {
         stopFailsLeft--;
         throw new Error("stop failed (test)");
       }
       const dto = threadDtos.get(threadId);
-      if (dto) dto.status = "idle";
+      if (dto) dto.status = stopResult.status;
+      return {};
+    },
+    output: async ({ threadId }: { threadId: string }) => {
+      if (!threadDtos.has(threadId) && !outputs.has(threadId)) {
+        throw new Error(`thread not found: ${threadId}`);
+      }
+      return { output: outputs.get(threadId) ?? null };
+    },
+    update: async (a: {
+      threadId: string;
+      parentThreadId?: string | null;
+      visibility?: string;
+    }) => {
+      wdUpdates.push(a);
+      const dto = threadDtos.get(a.threadId);
+      if (dto && a.parentThreadId !== undefined) {
+        dto.parentThreadId = a.parentThreadId;
+      }
       return {};
     },
   };
@@ -179,6 +229,28 @@ function makeHarness(
     dispatch: (row, opts) => dispatchToRoute(row, opts ?? {}, stepsDeps),
     finalize: (row) => finishDispatchSteps(row, stepsDeps),
     retrySetup: (row) => retrySetupSteps(row, stepsDeps),
+    providerRetry: {
+      pending: async (threadId) => {
+        ops.push(`retry-status:${threadId}`);
+        if (retryKnobs.statusFails > 0) {
+          retryKnobs.statusFails--;
+          throw new Error("provider-retry status failed (test)");
+        }
+        if (retryStatusScript.length > 0) {
+          return retryStatusScript.shift()!;
+        }
+        return retryPendingRows.get(threadId) ?? [];
+      },
+      cancel: async (threadId) => {
+        if (retryKnobs.cancelFails > 0) {
+          retryKnobs.cancelFails--;
+          throw new Error("provider-retry cancel failed (test)");
+        }
+        ops.push(`retry-cancel:${threadId}`);
+        retryCancels.push(threadId);
+        retryPendingRows.delete(threadId);
+      },
+    },
     ...(opts.round ? { round: opts.round } : {}),
     enqueue,
     now: () => nowVal,
@@ -229,6 +301,14 @@ function makeHarness(
     eventsBlocked,
     warns,
     statusAtStop,
+    outputs,
+    wdUpdates,
+    retryPendingRows,
+    retryStatusScript,
+    retryCancels,
+    retryKnobs,
+    ops,
+    stopResult,
     insertActive,
     setNow: (v: number) => {
       nowVal = v;
@@ -344,7 +424,7 @@ test("quota by errorInfo.category → route_holds on the quota group + reissue",
   assert.equal(fresh.status, "running");
 });
 
-test("quota by text pattern → hold by route name when no quotaGroup", async () => {
+test("§16.1: mid-turn quota TEXT does not transition; turn-ending text does", async () => {
   const h = makeHarness();
   const row = h.insertActive({
     threadId: "thr_e1",
@@ -355,10 +435,24 @@ test("quota by text pattern → hold by route name when no quotaGroup", async ()
   });
   h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
   h.eventLog.set("thr_e1", [
-    ev(1, "provider/error", T0, { message: "Free usage limit reached" }),
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "provider/error", T0, { message: "Free usage limit reached" }),
   ]);
-  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  // §16.1: text patterns mid-turn are noise — only errorInfo.category may
+  // transition an ACTIVE turn; the row stays running.
+  assert.equal(h.store.get(row.id)!.status, "running");
+  assert.equal(h.store.heldGroups(h.getNow()).size, 0);
 
+  // The turn ending with the same error text is still quota.
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "provider/error", T0, { message: "Free usage limit reached" }),
+    ev(3, "turn/completed", T0 + 1000, {
+      error: { message: "Free usage limit reached" },
+    }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
   assert.equal(h.store.get(row.id)!.status, "quota"); // autoFallback off → stays
   assert.ok(h.store.heldGroups(h.getNow()).has("strict"));
   assert.equal(h.store.listActive().length, 0);
@@ -519,7 +613,7 @@ test("reconcile: dispatching with thread_id older than 5 min → steps 4–6 fin
   ]);
   assert.ok(
     h.calls.some(
-      (c) => c.join(" ") === "thread update thr_e1 --parent-notifications auto",
+      (c) => c.join(" ") === "thread update thr_e1 --parent-notifications stuck",
     ),
   );
   assert.ok(
@@ -1354,7 +1448,11 @@ test("unconfirmed stop on quota: the reissue report keeps the quota reason", asy
   const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
   h.eventLog.set("thr_e1", [
-    ev(1, "provider/error", T0, { message: "insufficient credits" }),
+    // §16.1: text quota is a verdict only when the turn ENDED with an
+    // error — a turn/completed error carries it.
+    ev(1, "turn/completed", T0, {
+      error: { message: "insufficient credits" },
+    }),
   ]);
   await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
   const quota = h.store.get(row.id)!;
@@ -2294,4 +2392,530 @@ test("§5.3 r23: a failed turn/completed still decides when errors trail it → 
   assert.equal(fresh.resume_count, 1);
   const toExec = h.sends.find((s) => s.threadId === "thr_e1")!;
   assert.match(JSON.stringify(toExec.input), /оборвался ошибкой/);
+});
+
+
+const STRICT = {
+  level: "strict",
+  route: "strict",
+  preset: "strict",
+  provider: "acp-devin",
+};
+
+// ── §16.1 provider-retry ───────────────────────────────────────────────
+
+test("§16.1: pending provider-retry + thread.failed → running + mark", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.retryPendingRows.set("thr_e1", [{ id: 1, reason: "overloaded" }]);
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.match(fresh.setup_errors, /provider-retry-pending/);
+  assert.equal(h.sends.length, 0);
+  assert.deepEqual(h.stops, []);
+  assert.equal(h.store.listByStatuses(["failed"]).length, 0);
+});
+
+test("§16.1: pending retry outranks the typed quota category on turn.failed", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.retryPendingRows.set("thr_e1", [{}]);
+  await h.wd.onTurnFailed({
+    threadId: "thr_e1",
+    errorInfo: { category: "rate-limit" },
+  });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.match(fresh.setup_errors, /provider-retry-pending/);
+  assert.equal(h.store.heldGroups(h.getNow()).size, 0);
+});
+
+test("§16.1: a premature failed row with a pending retry revives", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", ...STRICT });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.store.setStatus(row.id, "failed");
+  h.retryPendingRows.set("thr_e1", [{}]);
+  await h.wd.onTurnFailed({ threadId: "thr_e1", errorInfo: null });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.revived_count, 1);
+  assert.match(fresh.setup_errors, /provider-retry-pending/);
+});
+
+test("§16.1: reconcile thread.status=error defers while a retry is queued", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.retryPendingRows.set("thr_e1", [{}]);
+  await h.wd.reconcile();
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.match(fresh.setup_errors, /provider-retry-pending/);
+  assert.equal(h.sends.length, 0);
+});
+
+test("§16.1: the errored path also holds while a retry is queued", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.queues.set("thr_e1", []);
+  h.retryPendingRows.set("thr_e1", [{}]);
+  // turn tail ends on a non-retrying error → idle verdict is `errored`
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "provider/error", T0, { message: "connection reset" }),
+  ]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.match(fresh.setup_errors, /provider-retry-pending/);
+  assert.doesNotMatch(fresh.setup_errors, /errored-resume-sent/);
+});
+
+test("§16.1: provider-retry status unreadable → the outcome defers", async () => {
+  const h = makeHarness({ retryStatusFails: 1 });
+  const row = h.insertActive({ threadId: "thr_e1", ...STRICT });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running"); // undecided, not failed
+  assert.equal(h.sends.length, 0);
+  assert.deepEqual(h.stops, []);
+});
+
+test("§16.1: cancel runs BEFORE threads.stop inside confirmStop", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.retryPendingRows.set("thr_e1", [{ id: 7 }]); // retry queued mid-turn
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.deepEqual(h.retryCancels, ["thr_e1"]);
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  // order: retry-status → … → retry-cancel → stop
+  const iCancel = h.ops.indexOf("retry-cancel:thr_e1");
+  const iStop = h.ops.indexOf("stop:thr_e1");
+  assert.ok(iCancel >= 0 && iStop > iCancel, h.ops.join(","));
+});
+
+test("§16.1: cancel failure → stop unconfirmed, one message, reconcile retries", async () => {
+  const h = makeHarness({ retryCancelFails: 1 });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.retryPendingRows.set("thr_e1", [{}]);
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  const stalled = h.store.get(row.id)!;
+  assert.equal(stalled.status, "stalled"); // outcome kept, stop NOT confirmed
+  assert.deepEqual(h.stops, []); // threads.stop never ran
+  assert.match(stalled.setup_errors, /watchdog-stop/);
+  assert.equal(h.sends.length, 1);
+  assert.match(JSON.stringify(h.sends[0]!.input), /не удалось остановить/);
+
+  // retry cancelled on the next pass → stop confirmed → §5.4 reissue
+  await h.wd.reconcile();
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.equal(h.stops.length, 1);
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple-alt");
+});
+
+test("§16.1: unavailable path cancels a retry appearing after the decision", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  // Entry check sees an empty queue; the reissue gate sees the new row.
+  h.retryStatusScript.push([], [{}]);
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "thread.start failed: model not found",
+  );
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.deepEqual(h.retryCancels, ["thr_e1"]);
+});
+
+test("§16.1: reissue gate cancel failure → watchdog-stop + once-message, no reissue", async () => {
+  const h = makeHarness({ retryCancelFails: 1 });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  // 1st read — the entry gate (empty); 2nd — confirmStop's cancel
+  // (empty → threads.stop); 3rd — the reissue gate sees the new row.
+  h.retryStatusScript.push([], [], [{}]);
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "failed"); // outcome kept
+  assert.match(fresh.setup_errors, /watchdog-stop/);
+  assert.match(fresh.setup_errors, /provider-retry cancel/);
+  assert.equal(h.store.listActive().length, 0);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /не удалось отменить автоповтор/,
+  );
+});
+
+// ── §16.2 revival ──────────────────────────────────────────────────────
+
+test("§16.2: turn/started on done → running, result delivery re-arms", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "итог захода 1");
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  let fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_notice, "plugin"); // result delivered
+  const delivered = h.sends.length;
+
+  // A `bb thread tell` lifts the thread: a new turn starts.
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/started", T0 + 5000),
+  ]);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.revived_count, 1);
+  assert.equal(fresh.result_notified_at, null); // delivery re-armed
+  assert.equal(fresh.turn_started_at, T0 + 5000);
+
+  // The revived turn finishes → the round's result is sent AGAIN (§16.2
+  // «итог захода пересчитывается при каждом done»).
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/started", T0 + 5000),
+    ev(3, "turn/completed", T0 + 9000, { status: "completed" }),
+  ]);
+  h.queues.set("thr_e1", []);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_notice, "plugin");
+  assert.equal(h.sends.length, delivered + 1);
+});
+
+test("§16.2: failed without autoFallback revives when BB lifts the thread", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", ...STRICT });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+  assert.equal(h.store.get(row.id)!.status, "failed");
+  // BB retries on its own — a turn/started without watchdog supervision.
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 + 5000)]);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.revived_count, 1);
+});
+
+test("§16.2: turn/started on cancelled revives too", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "system/thread/interrupted", T0, { reason: "manual-stop" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "cancelled");
+
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "system/thread/interrupted", T0, { reason: "manual-stop" }),
+    ev(3, "turn/started", T0 + 5000),
+  ]);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.revived_count, 1);
+});
+
+test("§16.2: a duplicate turn is stopped when the task has an active row", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "failed");
+  h.store.advanceLastSeq(row.id, 5);
+  const other = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e2" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_e2", dto("thr_e2", "active"));
+  h.eventLog.set("thr_e1", [ev(6, "turn/started", T0 + 9999)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 6 });
+  assert.equal(h.store.get(row.id)!.status, "failed"); // outcome stands
+  assert.equal(h.store.get(other.id)!.status, "running");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /уже есть активное делегирование/,
+  );
+});
+
+// ── §16.5 result delivery ──────────────────────────────────────────────
+
+const ROUND_FAKE: WatchdogDeps["round"] = {
+  environment: async () => ({
+    id: "env_1",
+    path: "/tmp/wt",
+    branchName: "bb/plug-1",
+    mergeBaseBranch: "main",
+  }),
+  git: async (_repo, args) => {
+    const k = args.join(" ");
+    if (k.startsWith("rev-parse")) return "abc1234deadbeef\n";
+    if (k.startsWith("symbolic-ref")) return "bb/plug-1\n";
+    if (k.startsWith("status")) return "\n";
+    if (k.startsWith("rev-list")) return "3\n";
+    return "";
+  },
+};
+
+test("§16.5: done delivers ONE plugin message with branch/sha7/копия/output", async () => {
+  const h = makeHarness({ round: ROUND_FAKE });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "готово: npm test + typecheck");
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_notice, "plugin");
+  assert.ok(fresh.result_notified_at != null);
+  const msg = h.sends.find((x) => x.threadId === "thr_coord");
+  assert.ok(msg, "result message expected");
+  const text = JSON.stringify(msg!.input);
+  assert.match(text, /PLUG-1 \(simple, тред thr_e1\): done/);
+  assert.match(text, /ветка bb\/plug-1/);
+  assert.match(text, /коммит abc1234/);
+  assert.match(text, /копия чистая/);
+  assert.match(text, /npm test \+ typecheck/);
+});
+
+test("§16.5: empty output → «без отчёта»; output is capped at 3000", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  const row2 = h.insertActive({ taskKey: "PLUG-2", threadId: "thr_e2" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_e2", dto("thr_e2", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e2", "y".repeat(4000));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  h.eventLog.set("thr_e2", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await h.wd.onThreadIdle(dto("thr_e2", "idle"));
+  const m1 = JSON.stringify(h.sends.find((x) => x.threadId === "thr_coord")!.input);
+  assert.match(m1, /без отчёта/);
+  const m2 = JSON.stringify(h.sends.filter((x) => x.threadId === "thr_coord").at(-1)!.input);
+  assert.ok(m2.includes("y".repeat(3000)));
+  assert.ok(!m2.includes("y".repeat(3001)));
+  assert.equal(h.store.get(row.id)!.result_notice, "plugin");
+  assert.equal(h.store.get(row2.id)!.result_notice, "plugin");
+});
+
+test("§16.5: send failure → reconcile resends until delivered", async () => {
+  const h = makeHarness({ sendFails: 1 });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "итог");
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  let fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_notified_at, null); // not delivered yet
+  assert.equal(fresh.retry_count, 1);
+
+  await h.wd.reconcile(); // resend succeeds now
+  fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_notice, "plugin");
+  const msgs = h.sends.filter((x) => x.threadId === "thr_coord");
+  assert.equal(msgs.length, 1);
+});
+
+test("§16.5: a gone coordinator records the delivery and never rescans", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  // thr_coord is NOT in threadDtos — it is gone
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.ok(fresh.result_notified_at != null);
+  assert.equal(fresh.result_notice, null); // recorded without a notice
+  assert.equal(h.sends.length, 0);
+  const s = await h.wd.reconcile();
+  assert.equal(s.errors.length, 0);
+  assert.equal(h.sends.length, 0); // no rescan attempts
+});
+
+test("§16.5: cancelled delivers a result message too", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "частичный прогресс");
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "system/thread/interrupted", T0, { reason: "manual-stop" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "cancelled");
+  assert.equal(fresh.result_notice, "plugin");
+  const msg = h.sends.find((x) => x.threadId === "thr_coord");
+  assert.match(JSON.stringify(msg!.input), /: cancelled, ветка/);
+});
+
+test("§16.5: only idle|error confirm a stop — 'stopping' retries via watchdog-stop", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", ...STRICT });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.stopResult.status = "stopping"; // BB accepted the stop but is not down yet
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  const stalled = h.store.get(row.id)!;
+  assert.equal(stalled.status, "stalled");
+  assert.match(stalled.setup_errors, /watchdog-stop/);
+  h.stopResult.status = "idle"; // the stop lands on the next pass
+  await h.wd.reconcile();
+  const cur = h.store.get(row.id)!;
+  assert.doesNotMatch(cur.setup_errors, /"watchdog-stop"/);
+});
+
+// ── §16.5 startSeconds / idleSeconds / памятка / привязка ─────────────
+
+const TIMER_POLICY = JSON.stringify({
+  version: 1,
+  firstResponseSeconds: 30,
+  maxRunSeconds: 300,
+  levels: {
+    simple: { chain: ["simple"], autoFallback: false },
+  },
+  routes: {
+    simple: {
+      preset: "simple",
+      provider: "acp-opencode",
+      startSeconds: 60,
+      idleSeconds: 60,
+    },
+  },
+});
+
+test("§16.5 startSeconds: no turn for the window → one message, no stop", async () => {
+  const h = makeHarness({ policyText: TIMER_POLICY });
+  const row = h.insertActive({ threadId: "thr_e1", createdAt: T0 - 200_000 });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  await h.wd.checkTimers();
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.deepEqual(h.stops, []);
+  const msgs = h.sends.filter((x) => x.threadId === "thr_coord");
+  assert.equal(msgs.length, 1);
+  assert.match(JSON.stringify(msgs[0]!.input), /не начал ход/);
+  await h.wd.checkTimers(); // one-shot
+  assert.equal(h.sends.length, 1);
+});
+
+test("§16.5 idleSeconds: response silence → one message, no stop", async () => {
+  const h = makeHarness({ policyText: TIMER_POLICY });
+  const row = h.insertActive({ threadId: "thr_e1", createdAt: T0 - 200_000 });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 150_000),
+    ev(2, "item/agentMessage/delta", T0 - 140_000, {}),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.checkTimers(); // silence 140s > idleSeconds 60s
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.deepEqual(h.stops, []);
+  const msgs = h.sends.filter((x) => x.threadId === "thr_coord");
+  assert.equal(msgs.length, 1);
+  assert.match(JSON.stringify(msgs[0]!.input), /нет событий ответа/);
+  await h.wd.checkTimers();
+  assert.equal(h.sends.length, 1); // one-shot
+});
+
+test("§16.5: post-compaction §3 reminder — one per thread/compacted", async () => {
+  const h = makeHarness();
+  h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_coord", [ev(9, "thread/compacted", T0)]);
+  await h.wd.reconcile();
+  const msgs = h.sends.filter(
+    (x) => x.threadId === "thr_coord" && /сжат/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(msgs.length, 1);
+  assert.match(JSON.stringify(msgs[0]!.input), /orchestrator_delegate/);
+  await h.wd.reconcile(); // the cursor stops the repeat
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    1,
+  );
+  // a NEW compaction event re-fires the reminder
+  h.eventLog.set("thr_coord", [
+    ev(9, "thread/compacted", T0),
+    ev(10, "thread/compacted", T0 + 60_000),
+  ]);
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    2,
+  );
+});
+
+test("§16.5: drifted binding re-applied until attach-verified", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set(
+    "thr_e1",
+    dto("thr_e1", "active", {
+      parentThreadId: "thr_other",
+      parentNotifications: "off",
+    }),
+  );
+  await h.wd.reconcile();
+  assert.ok(
+    h.wdUpdates.some(
+      (u) => u.threadId === "thr_e1" && u.parentThreadId === "thr_coord",
+    ),
+    "threads.update re-applies the parent",
+  );
+  assert.ok(
+    h.calls.some(
+      (c) => c.join(" ") === "thread update thr_e1 --parent-notifications stuck",
+    ),
+  );
+  assert.doesNotMatch(h.store.get(row.id)!.setup_errors, /attach-verified/);
+  // once the DTO confirms, the row is marked verified and untouched
+  h.threadDtos.set(
+    "thr_e1",
+    dto("thr_e1", "active", {
+      parentThreadId: "thr_coord",
+      parentNotifications: "stuck",
+    }),
+  );
+  const updatesBefore = h.wdUpdates.length;
+  await h.wd.reconcile();
+  assert.match(h.store.get(row.id)!.setup_errors, /attach-verified/);
+  assert.equal(h.wdUpdates.length, updatesBefore); // no further re-apply
 });

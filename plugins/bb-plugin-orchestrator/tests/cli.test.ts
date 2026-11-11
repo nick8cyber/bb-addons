@@ -161,7 +161,7 @@ test("CLI delegate end-to-end through the fake host", async () => {
   assert.equal(body.threadId, "thr_exec");
   assert.equal(body.route, "simple");
   assert.ok(
-    calls.some((c) => c.join(" ") === "thread update thr_exec --parent-notifications auto"),
+    calls.some((c) => c.join(" ") === "thread update thr_exec --parent-notifications stuck"),
   );
   assert.deepEqual(updates, [
     { threadId: "thr_exec", parentThreadId: "thr_coord", visibility: "hidden" },
