@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -57,6 +58,8 @@ interface EnvSpec {
   mergeBaseBranch: string;
   createdAt?: number;
   hostId?: string;
+  /** env lifecycle phase — absent/`active` is live; `destroying` etc. is BB tearing it down. */
+  lifecycle?: { phase?: string | null } | null;
 }
 
 interface ThreadSpec {
@@ -165,6 +168,7 @@ function envJson(e: EnvSpec, updatedAt: number) {
     environmentProviderId: "git-worktree",
     status: "ready",
     updatedAt,
+    ...(e.lifecycle !== undefined ? { lifecycle: e.lifecycle } : {}),
   };
 }
 
@@ -183,8 +187,12 @@ function makeWorld(opts: {
   cmd?: CmdRunner;
   /** Invoked on every `thread list` call (1-based) — lets a test change
    * thread or repo state between the run-start snapshot and the
-   * pre-archive re-read (§15 «Действие», PLUG-188). */
-  onThreadListCall?: (call: number) => void;
+   * pre-archive re-read (§15 «Действие», PLUG-188). The paged SDK
+   * variant also passes its page args, so a mutation can be armed
+   * mid-pass (PLUG-213). */
+  onThreadListCall?: (call: number, page?: { offset?: number }) => void;
+  /** Set false to drop the paged SDK seam → CLI `thread list` fallback. */
+  sdkList?: boolean;
 }) {
   const clock = opts.clock ?? { t: Date.now() };
   const db = new Database(":memory:");
@@ -200,6 +208,24 @@ function makeWorld(opts: {
   const warns: string[] = [];
 
   let threadListCalls = 0;
+  let cliThreadListCalls = 0;
+  let sdkListCalls = 0;
+  const sdkListArgs: {
+    includeHidden?: boolean;
+    archived?: boolean;
+    limit?: number;
+    offset?: number;
+  }[] = [];
+  const allThreads = () => {
+    const all = Object.entries(threads).flatMap(([envId, list]) =>
+      list.map((t) => ({
+        environmentId: envId,
+        queuedWork: "none",
+        ...t,
+      })),
+    );
+    return [...all, ...(opts.extraThreads ?? [])];
+  };
   const bbCli: BbCli = {
     run: async (args) => {
       const key = args.join(" ");
@@ -210,22 +236,14 @@ function makeWorld(opts: {
       }
       if (key.startsWith("thread list")) {
         threadListCalls += 1;
+        cliThreadListCalls += 1;
         opts.onThreadListCall?.(threadListCalls);
         if (args.includes("--environment")) {
           const envId = args[args.indexOf("--environment") + 1]!;
           return ok(JSON.stringify(threads[envId] ?? []));
         }
         // global list (§16.3) — env-attached + cross-env extras
-        const all = Object.entries(threads).flatMap(([envId, list]) =>
-          list.map((t) => ({
-            environmentId: envId,
-            queuedWork: "none",
-            ...t,
-          })),
-        );
-        return ok(
-          JSON.stringify([...all, ...(opts.extraThreads ?? [])]),
-        );
+        return ok(JSON.stringify(allThreads()));
       }
       if (key.startsWith("environment show")) {
         const envId = args[args.indexOf("show") + 1]!;
@@ -275,6 +293,26 @@ function makeWorld(opts: {
         });
         return {};
       },
+      ...(opts.sdkList === false
+        ? {}
+        : {
+            list: async (a: {
+              includeHidden?: boolean;
+              archived?: boolean;
+              limit?: number;
+              offset?: number;
+            }) => {
+              sdkListCalls += 1;
+              threadListCalls += 1;
+              opts.onThreadListCall?.(threadListCalls, a);
+              sdkListArgs.push(a);
+              const offset = a.offset ?? 0;
+              return allThreads().slice(
+                offset,
+                a.limit === undefined ? undefined : offset + a.limit,
+              );
+            },
+          }),
     },
     loadConfig: () => parseJanitorConfig(opts.config ?? CFG()),
     now: () => clock.t,
@@ -295,6 +333,13 @@ function makeWorld(opts: {
     cleanedUp,
     sent,
     warns,
+    sdkListArgs,
+    get sdkListCalls() {
+      return sdkListCalls;
+    },
+    get cliThreadListCalls() {
+      return cliThreadListCalls;
+    },
     jan: createJanitor(deps),
   };
 }
@@ -856,8 +901,11 @@ test("a rolled-back cascade member leaves archivedNow — its env is not «remov
     threads: { [envA.id]: [root] },
     archiveFailFor: new Set(["thr_a"]),
     clock,
+    // calls 5-6 are run 2's pre-archive re-read (each sweep is two
+    // paged passes since PLUG-213 — run 1: 1-2, run 2: 3-4 start,
+    // 5-6 re-read)
     onThreadListCall: (n) => {
-      if (n >= 3) w.threadSpecs[envB.id] = [late];
+      if (n >= 5) w.threadSpecs[envB.id] = [late];
     },
   });
   await w.jan.run();
@@ -867,8 +915,10 @@ test("a rolled-back cascade member leaves archivedNow — its env is not «remov
   assert.deepEqual(w.archivedCalls, ["thr_late"]);
   assert.deepEqual(w.unarchivedCalls, ["thr_late"]);
   assert.equal(w.janitor.item(envA.id)!.reason, "archive-failed");
-  // live again after the rollback — kept as «ready», not «removed»
-  assert.equal(w.janitor.item(envB.id)!.reason, "merged-ready");
+  // live again after the rollback — kept, not «removed» (PLUG-204);
+  // and not «готова» either — the live thread holds the copy
+  // (§17.4 С9, PLUG-212)
+  assert.equal(w.janitor.item(envB.id)!.reason, "threads-remaining");
 });
 
 test("removal is archive-only — `bb environment cleanup` is never called (§16.3)", async () => {
@@ -893,7 +943,7 @@ test("removal is archive-only — `bb environment cleanup` is never called (§16
   assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
 
-test("report mode deletes nothing and writes no item rows", async () => {
+test("report mode deletes nothing but writes «готова к удалению» rows (§17.4 С9)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
@@ -908,12 +958,25 @@ test("report mode deletes nothing and writes no item rows", async () => {
   const res = await w.jan.run();
   assert.equal(res.applied, false);
   assert.equal(res.removedCopies, 0);
-  // the merged-sighting streak matures in memory: the second report
-  // pass sees the copy eligible — yet nothing reached the db
   assert.equal(res.ready, 1);
   assert.ok(existsSync(env.path));
   git(repo, ["rev-parse", "--verify", env.branchName]);
-  assert.equal(w.janitor.item(env.id), undefined);
+  // §17.4 (С9): the ready copy IS a ledger row in report mode so
+  // `janitor report` can list it — first_seen_at stays unset (report
+  // never arms the merged clock, §15)
+  const item = w.janitor.item(env.id)!;
+  assert.equal(item.state, "kept");
+  assert.equal(item.reason, "merged-ready");
+  assert.equal(item.first_seen_at, null);
+  // …and the run summary carries the row for `janitor run` output
+  assert.equal(res.readyItems.length, 1);
+  assert.equal(res.readyItems[0]!.envId, env.id);
+  assert.equal(res.readyItems[0]!.reason, "merged-ready");
+  const rep = await w.jan.report();
+  assert.deepEqual(
+    rep.ready.map((r) => r.envId),
+    [env.id],
+  );
   assert.ok(w.janitor.latestRun());
 });
 
@@ -1072,10 +1135,11 @@ test("report mode still notifies once a day — watermark in janitor_meta (PLUG-
   let res = await w.jan.run();
   assert.equal(res.reported.length, 1);
   assert.equal(w.sent.length, 1);
-  // report mode still writes no item row — but the notify watermark and
-  // the announced set ARE service state: they go to janitor_meta so a
+  // §17.4 (С9): report mode now writes the ledger row (the reported
+  // env is visible in `janitor report`) — but the notify watermark and
+  // the announced set are still janitor_meta service state, so a
   // plugin restart cannot resend the same message early
-  assert.equal(w.janitor.item(env.id), undefined);
+  assert.equal(w.janitor.item(env.id)!.state, "reported");
   assert.equal(w.janitor.meta("dailyNotify:thr_coord"), String(w.clock.t));
   assert.match(
     w.janitor.meta("announcedAbandoned") ?? "",
@@ -2250,7 +2314,7 @@ test("a thread that comes alive between the snapshot and the archive re-check ke
     threads: { [env.id]: [t1] },
     clock,
     onThreadListCall: (n) => {
-      if (n >= 2) t1.status = "active";
+      if (n >= 5) t1.status = "active";
     },
   });
   await w.jan.run();
@@ -2271,7 +2335,8 @@ test("a copy dirtied between the snapshot and the archive re-check is kept (PLUG
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
     onThreadListCall: (n) => {
       // dirtied after the run-start git status, before the archive
-      if (n >= 2) writeFileSync(join(env.path, "late.txt"), "x\n");
+      // (calls 5-6 are the pre-archive re-read, PLUG-213 numbering)
+      if (n >= 5) writeFileSync(join(env.path, "late.txt"), "x\n");
     },
   });
   await w.jan.run();
@@ -2310,7 +2375,7 @@ test("a cascade member spawned between the snapshot and the re-read is checked a
     threads: { [env.id]: [root] },
     clock,
     onThreadListCall: (n) => {
-      if (n >= 2) w.threadSpecs[env.id] = [root, kid];
+      if (n >= 5) w.threadSpecs[env.id] = [root, kid];
     },
   });
   await w.jan.run();
@@ -2558,10 +2623,11 @@ test("a copy whose HEAD moved between the snapshot and the archive is kept — h
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
     onThreadListCall: (n) => {
       // a commit lands after the run-start HEAD snapshot, on the
-      // pre-archive re-read (list calls are cumulative across runs:
-      // run 1 → #1, run 2 → #2 initial + #3 fresh) — the archive must
-      // be cancelled
-      if (n >= 3 && !existsSync(join(env.path, "late.txt"))) {
+      // pre-archive re-read (list calls are cumulative across runs;
+      // each sweep is two paged passes since PLUG-213: run 1 → #1-2,
+      // run 2 → #3-4 start, #5-6 re-read) — the archive must be
+      // cancelled
+      if (n >= 5 && !existsSync(join(env.path, "late.txt"))) {
         commitIn(env.path, "late.txt", "feat: late");
       }
     },
@@ -2603,9 +2669,10 @@ test("an env thread created mid-run outside the cascade keeps the copy — fresh
     threads: { [env.id]: [root] },
     clock,
     onThreadListCall: (n) => {
-      // call #3 is run 2's pre-archive re-read — `late` is invisible
-      // to the run-start snapshot and appears only in the fresh graph
-      if (n >= 3) w.threadSpecs[env.id] = [root, late];
+      // calls 5-6 are run 2's pre-archive re-read (two paged passes
+      // per sweep, PLUG-213) — `late` is invisible to the run-start
+      // snapshot and appears only in the fresh graph
+      if (n >= 5) w.threadSpecs[env.id] = [root, late];
     },
   });
   await w.jan.run();
@@ -2744,11 +2811,12 @@ test("PROBE3: a commit + reset between the snapshot and the archive keeps the co
     envs: [env],
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
     onThreadListCall: (n) => {
-      // call #2 is the pre-archive re-read: a process commits and
-      // resets right before the archive — HEAD is unchanged and the
-      // tree stays clean, but the reflog now holds an unpublished
-      // commit that would die with the copy
-      if (n === 2) {
+      // call #5 is run 2's pre-archive re-read (two paged passes per
+      // sweep, PLUG-213): a process commits and resets right before
+      // the archive — HEAD is unchanged and the tree stays clean, but
+      // the reflog now holds an unpublished commit that would die
+      // with the copy
+      if (n === 5) {
         commitIn(env.path, "late.txt", "wip: late unpushed");
         git(env.path, ["reset", "--hard", "HEAD~1"]);
       }
@@ -3422,6 +3490,14 @@ test("a branch moved between the check and the delete is not deleted — update-
   assert.equal(res.removedBranches, 0);
   assert.equal(res.kept["branch-delete-failed"], 1);
   assert.equal(git(repo, ["rev-parse", "bb/o"]), moved);
+  // PLUG-213 (ревью №2): the refused `update-ref -d` left the branch
+  // alive — the journal row must not claim `removed` until a later
+  // run actually deletes it
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/o`;
+  const row = w.janitor.item(key);
+  assert.equal(row?.state, "kept");
+  assert.equal(row?.reason, "branch-delete-failed");
+  assert.equal(row?.removed_at, null);
 });
 
 // ── PLUG-201 ─────────────────────────────────────────────────────────
@@ -4140,4 +4216,599 @@ test("a bb/ branch checked out between the snapshot and the delete stays (PLUG-2
   assert.equal(res.removedBranches, 0);
   assert.equal(res.kept["branch-open"], 1);
   git(repo, ["rev-parse", "--verify", "bb/a"]);
+});
+
+// ── PLUG-209 (§17.4, ревизия 26) ─────────────────────────────────────
+
+// С7: the SDK `threads.list` pages — one `bb thread list --json` dump
+// stopped fitting the CLI buffer at ~5700 threads (аудит С7). 451
+// threads → three 200-row pages; a live child on the LAST page must
+// still block the parent's archive.
+test("threads are read via paged SDK list — a child on a late page still counts (§17.4 С7)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = Array.from({ length: 449 }, (_, i) => ({
+    id: `thr_x${i}`,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t,
+  }));
+  // a live child of the env's thread — sits on the last page; a
+  // truncated list would archive the parent and delete the copy
+  extras.push({
+    id: "thr_child",
+    status: "running",
+    archivedAt: null,
+    updatedAt: t,
+    parentThreadId: "thr_env_a",
+  });
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.ok(w.sdkListCalls >= 3, `sdkListCalls=${w.sdkListCalls}`);
+  assert.deepEqual(
+    [...new Set(w.sdkListArgs.map((a) => a.offset))].slice(0, 3),
+    [0, 200, 400],
+  );
+  assert.ok(
+    w.sdkListArgs.every(
+      (a) => a.includeHidden === true && a.limit === 200,
+    ),
+  );
+  // the whole graph came from the SDK — no CLI dump at all
+  assert.equal(w.cliThreadListCalls, 0);
+  // the running child on page 3 blocked the archive → the copy stays
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+});
+
+test("threads.list failure → every env is threads-unknown, nothing removed (§17.4 С7)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  w.deps.threads.list = async () => {
+    throw new Error("sdk down");
+  };
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.kept["threads-unknown"], 1);
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  // a non-array page is equally unprovable
+  w.deps.threads.list = async () => ({ total: 5 });
+  const res2 = await w.jan.run();
+  assert.equal(res2.kept["threads-unknown"], 1);
+});
+
+test("without the SDK seam the CLI `thread list` fallback still works (§17.4 С7)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    sdkList: false,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(w.sdkListCalls, 0);
+  assert.ok(w.cliThreadListCalls > 0);
+  assert.equal(res.removedCopies, 1);
+});
+
+// С8: the FS walk is async (`fs/promises.readdir` + setImmediate per
+// directory) so the server process is never blocked; the verdicts —
+// nested repo found, failed read → nested-unknown — are unchanged.
+test("async nested-storage walk: unreadable dir is nested-unknown, deep bare repo is nested-repo (§17.4 С8)", async () => {
+  const { repo, base } = makeRepo();
+  // ignored from main so the copies stay `git status`-clean yet the
+  // walk still enters them (ignored dirs may hide nested repos)
+  writeFileSync(join(repo, ".gitignore"), "locked/\ndeep/\n");
+  git(repo, ["add", ".gitignore"]);
+  git(repo, ["commit", "-m", "chore: ignores"]);
+  git(repo, ["push", "origin", "main"]);
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const denied = join(env.path, "locked", "sub");
+  mkdirSync(denied, { recursive: true });
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run(); // merged-wait — the streak arms
+  w.clock.t += 16 * 60_000;
+  chmodSync(denied, 0o000);
+  try {
+    const res = await w.jan.run();
+    assert.equal(res.kept["nested-unknown"], 1);
+    assert.equal(res.removedCopies, 0);
+    assert.ok(existsSync(env.path));
+  } finally {
+    chmodSync(denied, 0o755);
+  }
+  // a bare repo three levels deep inside an ignored dir is still found
+  const deep = join(env.path, "deep", "a", "b", "c");
+  mkdirSync(deep, { recursive: true });
+  execFileSync("git", ["init", "--bare", "-q", join(deep, "r.git")]);
+  const res2 = await w.jan.run();
+  assert.equal(res2.kept["nested-repo"], 1);
+  assert.ok(existsSync(env.path));
+});
+
+// С9: --dry-run previews «готова к удалению» — the summary lists them,
+// nothing reaches the db.
+test("--dry-run lists «готова к удалению» but writes nothing (§17.4 С9)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  let res = await w.jan.run({ dryRun: true });
+  assert.equal(res.ready, 0);
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run({ dryRun: true });
+  assert.equal(res.ready, 1);
+  assert.equal(res.readyItems.length, 1);
+  assert.equal(res.readyItems[0]!.envId, env.id);
+  assert.equal(res.readyItems[0]!.reason, "merged-ready");
+  assert.equal(res.removedCopies, 0);
+  // §15: «--dry-run ничего не пишет» — no item row, no run row, no meta
+  assert.equal(w.janitor.item(env.id), undefined);
+  assert.equal(w.janitor.latestRun(), undefined);
+  assert.equal(w.janitor.meta("repoRoots"), undefined);
+});
+
+// мелко 8: a `ready` env whose recorded directory is gone — BB lost
+// the copy (вживую 307 of 787 envs looked like this). `missing-dir`,
+// not `not-a-repo`; reported when its threads are clear.
+test("missing-dir: ready env with a gone directory is reported when nothing hangs on it (§17.4 мелко 8)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  rmSync(env.path, { recursive: true, force: true });
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.kept["missing-dir"], 1);
+  assert.equal(res.reported.length, 1);
+  assert.equal(res.reported[0]!.envId, env.id);
+  assert.equal(res.reported[0]!.reason, "missing-dir");
+  assert.equal(w.janitor.item(env.id)!.state, "reported");
+});
+
+test("missing-dir under teardown is kept, not reported — BB destroys it itself (§17.4 мелко 8)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a", {
+    lifecycle: { phase: "destroying" },
+  });
+  rmSync(env.path, { recursive: true, force: true });
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.kept["missing-dir"], 1);
+  assert.equal(res.reported.length, 0);
+  assert.equal(w.janitor.item(env.id)!.state, "kept");
+});
+
+test("missing-dir stays out of the report with a live child or active delegation (§17.4 мелко 8)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  rmSync(env.path, { recursive: true, force: true });
+  const t = Date.now();
+  // env's thread has an unarchived child — the stale records are still
+  // referenced, the janitor cannot decide
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: [
+      {
+        id: "thr_child",
+        status: "idle",
+        archivedAt: null,
+        updatedAt: t,
+        parentThreadId: "thr_env_a",
+      },
+    ],
+    clock: { t },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.kept["missing-dir"], 1);
+  assert.equal(res.reported.length, 0);
+  // an active delegation on the env's thread — same answer
+  const w2 = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    clock: { t },
+  });
+  const d = w2.store.insert({
+    taskKey: "PLUG-8",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w2.store.setThreadInfo(d.id, "thr_env_a");
+  w2.store.setStatus(d.id, "running");
+  const res2 = await w2.jan.run();
+  assert.equal(res2.kept["missing-dir"], 1);
+  assert.equal(res2.reported.length, 0);
+});
+
+// мелко 11: below the git floor `patch-id --verbatim` does not exist —
+// the janitor refuses the pass with a hint instead of evaluating on a
+// git whose «ничего не теряется» probe is missing.
+test("git below 2.39 refuses the whole run with a hint (§17.4 мелко 11)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const oldGit: CmdRunner = {
+    run: async (f, a, o) =>
+      f === "git" && a[a.length - 1] === "--version"
+        ? ok("git version 2.30.0\n")
+        : realCmd.run(f, a, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: oldGit,
+  });
+  const res = await w.jan.run();
+  assert.equal(res.skipped, "unsupported-git");
+  assert.equal(res.removedCopies, 0);
+  assert.ok(res.errors.some((e) => /2\.39/.test(e) && /git/.test(e)));
+  assert.ok(w.warns.some((m) => /2\.39/.test(m)));
+  assert.ok(existsSync(env.path));
+  // §17.4 (PLUG-212): the refusal is a RECORDED run — `janitor
+  // report` shows the failed pass instead of the last healthy one
+  const row = w.janitor.latestRun();
+  assert.ok(row, "the refused run is recorded");
+  assert.match(row!.error ?? "", /2\.39/);
+});
+
+// ── PLUG-212/213 (§17.4 ревью) ───────────────────────────────────────
+
+// Ревью №1 [блокер]: offset paging can silently lose a thread — a
+// deletion or (un)pin on an already-read page shifts later rows up.
+// The list is read twice and the deduplicated id sets compared
+// (PLUG-213 — the count bracket was dropped: the SDK wrapper loses
+// includeArchived/includeHidden). An unstable set retries the pair
+// once, then the list is unproven — threads-unknown, never a hole.
+test("a thread deleted between pages → threads-unknown, not a silent hole (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  // 251 threads → two page fetches per sweep
+  const extras: ThreadSpec[] = Array.from({ length: 250 }, (_, i) => ({
+    id: `thr_x${i}`,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t,
+  }));
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    // a thread vanishes on EVERY page fetch — the set shifts under
+    // every traversal, so the list can never be proven
+    onThreadListCall: () => {
+      extras.pop();
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.kept["threads-unknown"], 1);
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  // the pair of passes ran exactly twice per run (one retry) and the
+  // journal explains the refusal — the differing sets are logged
+  assert.equal(w.sdkListCalls, 16);
+  assert.ok(
+    w.warns.some(
+      (m) => /thread list unproven/.test(m) && /pass sets differ/.test(m),
+    ),
+    `warns: ${w.warns.join(" | ")}`,
+  );
+});
+
+// Same review, positive side: a thread that moved to a LATER page
+// (unpin) is read twice — dedup inside the pass keeps both id sets
+// equal, so the verified list still stands.
+test("a thread shifting to a later page is deduplicated — the verified list still counts (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = Array.from({ length: 250 }, (_, i) => ({
+    id: `thr_x${i}`,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t,
+  }));
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    // mid-traversal the first row moves to the tail — it appears on
+    // two pages; dedup keeps both pass sets identical
+    onThreadListCall: (call) => {
+      if (call === 2) extras.push(extras.shift()!);
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.kept["threads-unknown"] ?? 0, 0);
+  assert.equal(res.removedCopies, 1);
+});
+
+// PLUG-213 [блокер]: the SDK `threads.count` wrapper drops
+// includeArchived/includeHidden — live it counted 504 rows where the
+// paged list saw 2400, so a count bracket would fail every sweep.
+// The janitor never consults it: a count mock behaving exactly like
+// the live SDK (visible-live only, flags ignored) must not steer or
+// break the paged list.
+test("a live-SDK count that drops archived/hidden is never consulted — the paged list stands (PLUG-213)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = [
+    { id: "thr_arch", status: "idle", archivedAt: t - 1000, updatedAt: t },
+    {
+      id: "thr_hid",
+      status: "idle",
+      archivedAt: null,
+      updatedAt: t,
+      visibility: "hidden",
+    },
+  ];
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+  });
+  // live-SDK semantics: archived and hidden rows are never counted,
+  // whatever the flags — the number can never match the paged total
+  let countCalls = 0;
+  (
+    w.deps.threads as { count?: () => Promise<unknown> }
+  ).count = async () => {
+    countCalls += 1;
+    return { total: 1 };
+  };
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(countCalls, 0);
+  assert.equal(res.kept["threads-unknown"] ?? 0, 0);
+  assert.equal(res.removedCopies, 1);
+});
+
+// PLUG-213 (ревью №3): the one combination a count bracket could never
+// see — a thread deleted on an ALREADY-read page (rows shift up, the
+// next row is skipped) while another is created on a still-unread
+// page. Two back-to-back passes catch the changed set; instability
+// through the retried pair → threads-unknown, never a silent hole.
+test("deleted on a read page + created on an unread page → threads-unknown (PLUG-213)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = Array.from({ length: 250 }, (_, i) => ({
+    id: `thr_x${i}`,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t,
+  }));
+  let created = 0;
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    // every later-page fetch: a row of the already-read first page is
+    // deleted (the set shifts, the next row is skipped) and a fresh
+    // thread lands on the still-unread tail — pass sets never match
+    onThreadListCall: (_call, page) => {
+      if ((page?.offset ?? 0) === 0) return;
+      extras.shift();
+      created += 1;
+      extras.push({
+        id: `thr_new${created}`,
+        status: "idle",
+        archivedAt: null,
+        updatedAt: t,
+      });
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.kept["threads-unknown"], 1);
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  // the journal explains why — set sizes and the differing ids
+  assert.ok(
+    w.warns.some(
+      (m) => /thread list unproven/.test(m) && /only-in-/.test(m),
+    ),
+    `warns: ${w.warns.join(" | ")}`,
+  );
+});
+
+// Ревью №2: `janitor report` lists rows of the LAST run — a row not
+// refreshed by it (env deleted outside the janitor) no longer claims
+// «готова к удалению».
+test("janitor report lists only rows of the last run — a gone env's «готова» row drops (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ mode: "report" }),
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  await w.jan.run();
+  assert.equal(w.janitor.item(env.id)!.reason, "merged-ready");
+  let rep = await w.jan.report();
+  assert.deepEqual(
+    rep.ready.map((r) => r.envId),
+    [env.id],
+  );
+  // BB deleted the env outside the janitor — its row goes stale
+  w.envSpecs.splice(0, 1);
+  rmSync(env.path, { recursive: true, force: true });
+  w.clock.t += 60_000;
+  await w.jan.run();
+  rep = await w.jan.report();
+  assert.ok(!rep.ready.some((r) => r.envId === env.id));
+  // …while the env's merged branch — now copy-less — is a fresh
+  // last-run row and still listed
+  assert.ok(rep.ready.some((r) => r.branch === env.branchName));
+});
+
+// Ревью №2b: a manually deleted branch's ledger row closes under
+// `ledger` — in report mode too, or it hangs as «готова» forever.
+test("a manually deleted branch's ledger row closes in report mode too (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["branch", "bb/gone", "main"]); // merged copy-less branch
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ mode: "report" }),
+  });
+  await w.jan.run();
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/gone`;
+  assert.equal(w.janitor.item(key)!.reason, "merged-ready");
+  git(repo, ["branch", "-D", "bb/gone"]);
+  w.clock.t += 60_000;
+  await w.jan.run();
+  // report mode wrote the closure — the row no longer says «готова»
+  assert.equal(w.janitor.item(key)!.state, "removed");
+  const rep = await w.jan.report();
+  assert.ok(!rep.ready.some((r) => r.envId === key));
+});
+
+// Ревью №3: «готова к удалению» is only what `apply` truly removes.
+// With deleteBranches:false the sweep never deletes the branch —
+// branch-kept-config, never merged-ready.
+test("deleteBranches:false — a merged copy-less branch is branch-kept-config, not «готова» (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["branch", "bb/keep", "main"]); // merged copy-less branch
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    config: CFG({ deleteBranches: false }),
+  });
+  const res = await w.jan.run();
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/keep`;
+  assert.equal(res.orphanBranches, 1);
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-kept-config"], 1);
+  assert.ok(res.readyItems.every((i) => i.envId !== key));
+  assert.equal(w.janitor.item(key)!.state, "kept");
+  assert.equal(w.janitor.item(key)!.reason, "branch-kept-config");
+  const rep = await w.jan.report();
+  assert.ok(!rep.ready.some((r) => r.envId === key));
+  git(repo, ["rev-parse", "--verify", "bb/keep"]); // still there
+});
+
+// Same review, env side: an env apply cannot remove (a live thread
+// joined its cascade on the pre-archive re-read) is kept
+// `threads-remaining` — never «готова к удалению». The joining env's
+// thread enters memberEnvs only via the stale run-start set, so the
+// cascade failure blames the root's env alone — the second env is
+// processed-but-live, which the old code mislabeled merged-ready.
+test("apply leaves a copy held by live threads — not «готова» (PLUG-212)", async () => {
+  const { repo, base } = makeRepo();
+  const envA = addEnv(repo, base, "a");
+  const envB = addEnv(repo, base, "b");
+  commitIn(envA.path, "wa.txt", "feat: a");
+  commitIn(envB.path, "wb.txt", "feat: b");
+  mergeEnv(repo, envA);
+  mergeEnv(repo, envB);
+  const t = Date.now();
+  const rootT: ThreadSpec = {
+    id: "thr_p",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  // envB's thread spawns mid-run and lands in thr_p's cascade on the
+  // pre-archive re-read — a processed-but-live thread of envB
+  const spawn: ThreadSpec = {
+    id: "thr_new",
+    status: "idle",
+    queuedWork: "none",
+    archivedAt: null,
+    updatedAt: t,
+    parentThreadId: "thr_p",
+    environmentId: envB.id,
+  };
+  let injected = false;
+  const w = makeWorld({
+    envs: [envA, envB],
+    threads: { [envA.id]: [rootT], [envB.id]: [] },
+    archiveFailFor: new Set(["thr_p"]),
+    clock: { t },
+    // run1: calls 1-2. run2: calls 3-4 = run-start sweep, calls 5-6 =
+    // the pre-archive re-read inside evalCascade (two paged passes
+    // per sweep, PLUG-213) — the spawn lands there
+    onThreadListCall: (call) => {
+      if (call === 5 && !injected) {
+        injected = true;
+        w.threadSpecs[envB.id]!.push(spawn);
+      }
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  // thr_new was archived, then rolled back — it stays live and
+  // processed, so envB is held by live threads, not «готова»
+  assert.equal(w.janitor.item(envB.id)!.reason, "threads-remaining");
+  assert.ok(!res.readyItems.some((i) => i.envId === envB.id));
+  assert.ok(existsSync(envB.path));
 });

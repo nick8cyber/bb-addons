@@ -843,6 +843,11 @@ export async function createPlugin(
     cmd,
     threads: {
       send: (a) => bb.sdk.threads.send(a as never) as never,
+      // §17.4 (С7): paged SDK list — the one-shot CLI dump overflowed
+      // its buffer at ~5700 threads. No `count`: the SDK wrapper drops
+      // includeArchived/includeHidden, so the janitor proves the list
+      // by reading it twice and comparing id sets (PLUG-213).
+      list: (a) => bb.sdk.threads.list(a) as Promise<unknown>,
     },
     loadConfig: janitorConfig,
     localHostId: async () => {
@@ -1598,6 +1603,17 @@ ${res.warnings
             lastJanitorRunAt = now();
             try {
               const res = await janitor.run({ dryRun });
+              // §17.4 (мелко 11): a refused pass is a recorded
+              // failure, not a quiet skip — `janitor run` exits
+              // non-zero so cron/a caller sees it; the run row in
+              // the ledger carries the reason for `janitor report`.
+              if (res.skipped === "unsupported-git") {
+                throw new OrchestratorError(
+                  "unsupported-git",
+                  res.errors[0] ??
+                    `git ≥ 2.39 required — обновите git на этой машине`,
+                );
+              }
               const keptText = Object.entries(res.kept)
                 .map(([r, n]) => `${r}=${n}`)
                 .join(" ");
@@ -1614,6 +1630,16 @@ ${res.warnings
                       `ready ${res.ready}` +
                       (res.orphanBranches
                         ? `, orphan branches ${res.orphanBranches}`
+                        : "") +
+                      // §17.4 (С9): «готова к удалению» is a list, not
+                      // only a count — this is what `apply` removes.
+                      (res.readyItems.length
+                        ? `\nready to remove:\n${res.readyItems
+                            .map(
+                              (i) =>
+                                `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"}`,
+                            )
+                            .join("\n")}`
                         : "") +
                       (keptText ? `
 kept: ${keptText}` : "") +
@@ -1656,6 +1682,14 @@ abandoned: ${res.reported
                   (rep.lastRun.error ? ` error=${rep.lastRun.error}` : "") +
                   "\n"
                 : "no runs yet\n");
+            // §17.4 (С9): «готова к удалению» — the report answers
+            // what `apply` would remove, not only what is abandoned.
+            if (rep.ready.length) {
+              out += "ready to remove:\n";
+              for (const i of rep.ready) {
+                out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"}\n`;
+              }
+            }
             if (rep.abandoned.length) {
               out += "abandoned:\n";
               for (const i of rep.abandoned) {

@@ -7,6 +7,7 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import { DelegationStore } from "../src/store.js";
+import type { CmdRunner } from "../src/cmd.js";
 import { createPlugin } from "../server.js";
 
 const POLICY_TEXT = JSON.stringify({
@@ -605,4 +606,29 @@ test("§17.2 r26 (PLUG-215 мелко 2): `show` labels the notify-muted mark, n
   assert.match(res.stdout, /заглушены/);
   assert.match(res.stdout, /setup_errors=\[/);
   assert.match(res.stdout, /"step":"attach-verify"/);
+});
+
+// §17.4 (PLUG-212): a janitor pass refused on git < 2.39 is a recorded
+// failure — `janitor run` exits non-zero instead of printing a healthy
+// empty report.
+test("janitor run on unsupported git exits non-zero (§17.4 мелко 11)", async () => {
+  const { cli } = fakeCli();
+  const oldGit: CmdRunner = {
+    run: async (f, a) =>
+      f === "git" && a.includes("--version")
+        ? ok("git version 2.30.0\n")
+        : ok(),
+  };
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    settings: {
+      policy: POLICY_TEXT,
+      janitor: JSON.stringify({ enabled: true, mode: "report" }),
+    },
+    agentSkillIds: [],
+  });
+  await createPlugin(host.bb, { bbCli: cli, cmd: oldGit });
+  const res = await host.harness.runCli(["janitor", "run"], {});
+  assert.equal(res.exitCode, 1);
+  assert.match(res.stderr ?? "", /unsupported-git|2\.39/);
 });

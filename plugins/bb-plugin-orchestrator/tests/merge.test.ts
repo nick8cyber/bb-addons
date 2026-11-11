@@ -348,6 +348,30 @@ test("--dry-run on a clean merge: no conflict", async () => {
   assert.equal(store.get(row.id)!.merge_status, null);
 });
 
+test("--dry-run refuses on git < 2.39 with a hint (§17.4 мелко 11)", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  const oldGit = {
+    ...deps,
+    git: async (
+      repo: string,
+      args: string[],
+      o?: Parameters<typeof deps.git>[2],
+    ) =>
+      args[0] === "--version"
+        ? { exitCode: 0, stdout: "git version 2.30.0\n", stderr: "" }
+        : deps.git(repo, args, o),
+  };
+  await assert.rejects(
+    runMerge({ ...PARAMS, dryRun: true }, oldGit),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unsupported-git" &&
+      /2\.39/.test((e as OrchestratorError).message),
+  );
+  assert.equal(store.get(row.id)!.merge_status, null);
+});
+
 // ── §14 refusals ──────────────────────────────────────────────────────
 
 test("refusal: dirty-result when the executor left uncommitted work", async () => {
