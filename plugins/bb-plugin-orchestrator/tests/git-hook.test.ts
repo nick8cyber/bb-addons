@@ -185,3 +185,80 @@ test("f4/f6: installer inventory sees .bb worktrees, real --self-test run", () =
     0,
   );
 });
+
+// ── §17.3 r26: обёртки всех имён хуков, единый каталог токенов ────────
+
+const PLUGIN_DIR = new URL("..", import.meta.url).pathname;
+const CHAIN_SRC = new URL("../hooks/chain", import.meta.url).pathname;
+const NAMES_SRC = new URL("../hooks/hook-names", import.meta.url).pathname;
+
+test("Б2/мелко9: installer covers every standard hook name; shared token dir", () => {
+  const root = mkdtempSync(join(tmpdir(), "install-"));
+  const gd = join(root, "hooks");
+  const gcfg = join(root, "gitconfig");
+  execFileSync(
+    "node",
+    ["hooks/install.mjs", "--hooks-dir", gd, "--repos-root", join(root, "empty")],
+    {
+      cwd: PLUGIN_DIR,
+      encoding: "utf8",
+      // redirect the global git config — the real --global write must not
+      // touch the developer's config
+      env: { ...process.env, GIT_CONFIG_GLOBAL: gcfg },
+    },
+  );
+  const names = readFileSync(NAMES_SRC, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  const gateSrc = readFileSync(HOOK_SRC, "utf8");
+  const chainSrc = readFileSync(CHAIN_SRC, "utf8");
+  for (const n of names) {
+    const f = join(gd, n);
+    assert.ok(existsSync(f), `${n} installed`);
+    // pre-push carries the gate; every other name is the chain wrapper
+    assert.equal(readFileSync(f, "utf8"), n === "pre-push" ? gateSrc : chainSrc);
+  }
+  assert.match(readFileSync(gcfg, "utf8"), /hookspath/i);
+  // the token dir is the SAME dir the installer installs into — the
+  // plugin's writePushToken lands where the installed hook scans
+  const repo = join(root, "repo");
+  execFileSync("git", ["init", repo]);
+  const file = writePushToken(gd, SHA, "x");
+  const r = spawnSync("node", [join(gd, "pre-push")], {
+    cwd: repo,
+    input: LINE + "\n",
+    env: { ...process.env, GIT_DIR: join(repo, ".git") },
+    encoding: "utf8",
+  });
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(file), false);
+});
+
+test("Б2: a non-pre-push wrapper chains the repository-local hook", () => {
+  const { repo, hooksDir } = makeEnv();
+  cpSync(CHAIN_SRC, join(hooksDir, "pre-commit"));
+  execFileSync("chmod", ["+x", join(hooksDir, "pre-commit")]);
+  writeFileSync(
+    join(repo, ".git", "hooks", "pre-commit"),
+    '#!/bin/sh\necho hit > "$GIT_DIR/../precommit-ran"\nexit 0\n',
+  );
+  execFileSync("chmod", ["+x", join(repo, ".git", "hooks", "pre-commit")]);
+  const r = spawnSync("node", [join(hooksDir, "pre-commit")], {
+    cwd: repo,
+    env: { ...process.env, GIT_DIR: join(repo, ".git") },
+    encoding: "utf8",
+  });
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(join(repo, "precommit-ran")), true);
+  // no local hook at all → pass-through exit 0
+  const { repo: bare, hooksDir: hd2 } = makeEnv();
+  cpSync(CHAIN_SRC, join(hd2, "commit-msg"));
+  execFileSync("chmod", ["+x", join(hd2, "commit-msg")]);
+  const r2 = spawnSync("node", [join(hd2, "commit-msg"), "msg-file"], {
+    cwd: bare,
+    env: { ...process.env, GIT_DIR: join(bare, ".git") },
+    encoding: "utf8",
+  });
+  assert.equal(r2.status, 0);
+});

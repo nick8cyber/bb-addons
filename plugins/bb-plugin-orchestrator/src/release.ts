@@ -84,6 +84,9 @@ export interface ReleaseThreads {
     mode: "queue-if-active";
     input: unknown[];
   }): Promise<unknown>;
+  /** §17.3 (мелко 5): the thread's last output — the review verdict's
+   * fallback source when the task carries no verdict comment. */
+  output(args: { threadId: string }): Promise<{ output?: string | null } | null>;
   events: {
     list(args: {
       threadId: string;
@@ -109,6 +112,9 @@ export interface ReleaseDeps {
   hooksDir(): string;
   /** Directory for audit packet files the auditor reads. */
   packetDir(): string;
+  /** §17.3 (С1): the delegate queue — release itself runs outside it;
+   * only the audit dispatch is serialized against other dispatches. */
+  enqueue<T>(fn: () => Promise<T>): Promise<T>;
   hostname?: string;
   now?: () => number;
   log?: {
@@ -224,16 +230,31 @@ export function reviewVerdictOk(body: string): boolean {
   return verdict === "OK" && blockers === 0;
 }
 
-function reviewVerdict(
+async function reviewVerdict(
+  deps: ReleaseDeps,
   show: TaskShow,
   delegation: DelegationRow,
-): "ok" | "missing" | "not-ok" {
+): Promise<"ok" | "missing" | "not-ok"> {
   const comments = (show.comments ?? [])
     .filter((c) => c.kind === "agent" && c.threadId === delegation.thread_id)
     .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
   const last = comments.at(-1);
-  if (!last?.body) return "missing";
-  return reviewVerdictOk(last.body) ? "ok" : "not-ok";
+  if (last?.body) return reviewVerdictOk(last.body) ? "ok" : "not-ok";
+  // §17.3 (мелко 5): no verdict comment — the reviewer's own thread
+  // output is the fallback source (a report sent as the final message
+  // without a task comment still counts).
+  if (delegation.thread_id) {
+    try {
+      const res = await deps.threads.output({
+        threadId: delegation.thread_id,
+      });
+      const out = res?.output;
+      if (out) return reviewVerdictOk(out) ? "ok" : "not-ok";
+    } catch {
+      // an unreadable thread output counts as no verdict
+    }
+  }
+  return "missing";
 }
 
 /** §2 step 1 — everything the pipeline refuses on, as one list. */
@@ -260,22 +281,42 @@ async function acceptTask(
     .find((d) => roleOf(d.level) === "executor" && d.status === "done");
   if (!executor) missing.push("нет делегирования в статусе done");
 
-  const review = deps.store
-    .delegationsByTask(key)
-    .find((d) => roleOf(d.level) === "auditor");
-  if (!review) {
-    missing.push("нет ревью аудиторского уровня");
-  } else if (review.status !== "done") {
+  // §17.3 (Б4): the review gate is bound to the published sha — a
+  // merged result needs an OK review on its `merged_sha`, a plain
+  // executor result on its `result_sha` («Проверяемый итог: коммит
+  // <sha>» rides in the review's `continue_from`). A review of an older
+  // round never counts for what is being published now.
+  const requiredSha = executor
+    ? executor.merge_status === "merged"
+      ? executor.merged_sha
+      : executor.result_sha
+    : null;
+  const review = requiredSha
+    ? deps.store
+        .delegationsByTask(key)
+        .find(
+          (d) =>
+            roleOf(d.level) === "auditor" && d.continue_from === requiredSha,
+        )
+    : undefined;
+  if (executor && !requiredSha) {
     missing.push(
-      `последнее ревью уровня ${review.level} в статусе ${review.status}`,
+      "итог делегирования без зафиксированного sha — ревью не привязать",
     );
-  } else {
-    if (executor && review.created_at < executor.created_at) {
-      missing.push("последнее ревью старше последнего исполнения");
-    }
-    const v = reviewVerdict(show, review);
+  } else if (requiredSha && !review) {
+    missing.push(
+      `нет ревью аудиторского уровня на публикуемый итог ` +
+        `${requiredSha.slice(0, 7)}`,
+    );
+  } else if (review && review.status !== "done") {
+    missing.push(
+      `ревью на ${requiredSha!.slice(0, 7)} (уровень ${review.level}) ` +
+        `в статусе ${review.status}`,
+    );
+  } else if (review) {
+    const v = await reviewVerdict(deps, show, review);
     if (v === "missing") {
-      missing.push("вердикт ревью не найден в комментариях задачи");
+      missing.push("вердикт ревью не найден ни в комментариях, ни в итоге треда");
     } else if (v === "not-ok") {
       missing.push("последнее ревью — вердикт не «OK» (§16.7 JSON)");
     }
@@ -652,10 +693,22 @@ export function clearPushToken(file: string): void {
   }
 }
 
-/** The plugin's own hook source — `hooks/pre-push` next to `src/`. */
-const PLUGIN_HOOK = fileURLToPath(
-  new URL("../hooks/pre-push", import.meta.url),
-);
+/** The plugin's own hook source — `hooks/` next to `src/`. */
+const PLUGIN_HOOKS_DIR = fileURLToPath(new URL("../hooks", import.meta.url));
+const PLUGIN_HOOK = join(PLUGIN_HOOKS_DIR, "pre-push");
+
+/** §17.3 (Б2): standard names the installer covers — shared with
+ * `hooks/install.mjs`, which reads the same `hook-names` file. */
+function standardHookNames(): string[] {
+  try {
+    return readFileSync(join(PLUGIN_HOOKS_DIR, "hook-names"), "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"));
+  } catch {
+    return ["pre-push"];
+  }
+}
 
 /**
  * §16.6 (PLUG-189): a plugin update changes the hook but the installed
@@ -666,25 +719,38 @@ const PLUGIN_HOOK = fileURLToPath(
  * forgetfulness guard, an absent guard simply does not fire.
  */
 function assertInstalledHookFresh(deps: ReleaseDeps): void {
-  let installed: Buffer;
-  let current: Buffer;
-  try {
-    installed = readFileSync(join(deps.hooksDir(), "pre-push"));
-  } catch {
-    return;
+  // §17.3 (Б2): the installer writes a wrapper under EVERY standard
+  // name — `pre-push` is the gate, the rest are copies of `chain`. A
+  // stale or missing file of any kind leaves local hooks silently
+  // disabled; missing files count only when at least one wrapper exists
+  // (no hooks installed at all = no guard, not an error).
+  const dir = deps.hooksDir();
+  const names = standardHookNames();
+  const stale: string[] = [];
+  for (const name of names) {
+    let installed: Buffer;
+    try {
+      installed = readFileSync(join(dir, name));
+    } catch {
+      continue; // absent name — not installed, nothing to compare
+    }
+    let current: Buffer;
+    try {
+      current = readFileSync(
+        join(PLUGIN_HOOKS_DIR, name === "pre-push" ? "pre-push" : "chain"),
+      );
+    } catch {
+      continue;
+    }
+    if (!installed.equals(current)) stale.push(name);
   }
-  try {
-    current = readFileSync(PLUGIN_HOOK);
-  } catch {
-    return; // plugin source unreadable — nothing to compare against
-  }
-  if (!installed.equals(current)) {
+  if (stale.length) {
     throw new OrchestratorError(
       "hook-stale",
-      "установленный общий pre-push хук устарел — версия плагина новее",
-      `переустановите хук: node ${join(
-        fileURLToPath(new URL("..", import.meta.url)),
-        "hooks",
+      `установленные общие хуки устарели (${stale.join(", ")}) — ` +
+        "версия плагина новее",
+      `переустановите хуки: node ${join(
+        PLUGIN_HOOKS_DIR,
         "install.mjs",
       )}`,
     );
@@ -981,6 +1047,9 @@ async function runReleaseSteps(
   // §16.6 (PLUG-194): a §14-merged result is synced by MERGE only —
   // `git rebase` flattens merge commits, silently dropping the
   // conflict-resolution edits that exist only in them.
+  // §17.3 (Б4): the tip BEFORE sync — the unreviewed-commits gate
+  // excludes the pipeline's own sync merge and docs-trailer amend.
+  const preSyncSha = await git(deps, repo, ["rev-parse", "HEAD"]);
   const { baseSha, remoteBaseSha } = await syncBranch(
     deps,
     repo,
@@ -1003,6 +1072,89 @@ async function runReleaseSteps(
   // §16.6 (PLUG-189): --no-color/--no-ext-diff — a `color.ui=always`
   // config or an external diff driver would silently break the parser.
   const commits = await commitRange(deps, repo, baseSha, headSha);
+  // §17.3 (Б4): a merged result's range holds the merge commits of every
+  // task merged into this branch — each needs an OK review bound to its
+  // own `merged_sha`, and every commit without a matching merge record
+  // is an «unreviewed-commits» refusal (coordinator work must not ride
+  // the release unnoticed).
+  if (executor.merge_status === "merged") {
+    const mergedRows = deps.store.mergedDelegationsInto(branch);
+    const mergedBySha = new Map(
+      mergedRows.filter((r) => r.merged_sha).map((r) => [r.merged_sha!, r]),
+    );
+    // The pipeline's own commits on top of the pre-sync tip (the sync
+    // merge, a docs-trailer amend) are not reviewable work.
+    const pipeline = new Set(
+      (
+        await git(deps, repo, ["rev-list", `${preSyncSha}..${headSha}`])
+      )
+        .split("\n")
+        .filter(Boolean),
+    );
+    // Commits the range must explain: everything on the branch that is
+    // not on the remote base AND not reachable from a recorded
+    // merged_sha (the merge's second-parent history is part of that
+    // delegation's reviewed result), minus the pipeline's own commits.
+    const mergedShaList = [...mergedBySha.keys()];
+    const unreviewed = mergedShaList.length
+      ? (
+          await git(deps, repo, [
+            "rev-list",
+            headSha,
+            "--not",
+            baseSha,
+            ...mergedShaList,
+          ])
+        )
+          .split("\n")
+          .filter(Boolean)
+          .filter((sha) => !pipeline.has(sha))
+      : commits.map((c) => c.sha).filter((sha) => !pipeline.has(sha));
+    if (unreviewed.length) {
+      throw new OrchestratorError(
+        "unreviewed-commits",
+        `release ${taskKey}: в диапазоне ${branch} коммиты без влитого ` +
+          `делегирования: ${unreviewed.map((s) => s.slice(0, 7)).join(", ")}`,
+      );
+    }
+    const policy = policyLoad.policy;
+    for (const [mergedSha, row] of mergedBySha) {
+      const rReview = deps.store
+        .delegationsByTask(row.task_key)
+        .find(
+          (d) =>
+            levelRole(policy, d.level) === "auditor" &&
+            d.continue_from === mergedSha,
+        );
+      const label = `${row.task_key} → ${mergedSha.slice(0, 7)}`;
+      if (!rReview) {
+        throw new OrchestratorError(
+          "release-refused",
+          `release ${taskKey}: нет ревью на влитый итог ${label}`,
+        );
+      }
+      if (rReview.status !== "done") {
+        throw new OrchestratorError(
+          "release-refused",
+          `release ${taskKey}: ревью на ${label} в статусе ${rReview.status}`,
+        );
+      }
+      const rShow = await runJson<TaskShow>(deps.bbCli, [
+        "tasks",
+        "show",
+        row.task_key,
+        "--json",
+      ]).catch(() => ({ comments: [] }) as TaskShow);
+      const v = await reviewVerdict(deps, rShow, rReview);
+      if (v !== "ok") {
+        throw new OrchestratorError(
+          "release-refused",
+          `release ${taskKey}: вердикт ревью на ${label} ` +
+            (v === "missing" ? "не найден" : "не «OK»"),
+        );
+      }
+    }
+  }
   const added = parseAddedLines(
     await git(deps, repo, [
       "diff",
@@ -1039,6 +1191,8 @@ async function runReleaseSteps(
     allowedAuthor: allowed,
     hostname: deps.hostname ?? osHostname(),
     threadIds: project.threadIds,
+    allowedTrailers: project.allowedTrailers,
+    allowedEmails: project.allowedEmails,
   });
   const blockers = findings.filter((f) => f.severity === "block");
   const warnings = findings.filter((f) => f.severity === "warn");
@@ -1130,10 +1284,16 @@ async function runReleaseSteps(
       `ветка копии после выкладки может отличаться). ` +
       `Итог — ОДНО сообщение строгим JSON {"verdict":"APPROVE"|"REJECT","findings":[…]} без пояснений; ` +
       `находки — без значений секретов (маскируй).`;
-    const res = await dispatchToRoute(
-      auditRow,
-      { instructions: auditInstructions },
-      deps.stepsDeps,
+    // §17.3 (С1): only the audit dispatch is serialized on the delegate
+    // queue — release itself runs outside it (the `bb orchestrator
+    // release` CLI does not enqueue), so a release invoked while a
+    // dispatch is in flight never deadlocks on its own queue.
+    const res = await deps.enqueue(() =>
+      dispatchToRoute(
+        auditRow,
+        { instructions: auditInstructions },
+        deps.stepsDeps,
+      ),
     );
     deps.store.updateRelease(release.id, {
       auditDelegationId: auditRow.id,
@@ -1358,6 +1518,25 @@ async function ghJson<T>(
   return JSON.parse(res.stdout) as T;
 }
 
+/** §17.3 (Б1): `gh pr create` prints the PR URL as plain text on
+ * stdout — it is NOT JSON. Read the first URL-looking token. */
+async function ghText(
+  deps: ReleaseDeps,
+  repo: string,
+  args: string[],
+): Promise<string> {
+  const res = await deps.cmd.run("gh", args, { cwd: repo, timeoutMs: 60_000 });
+  if (res.exitCode !== 0) {
+    throw new OrchestratorError(
+      "gh-failed",
+      `gh ${args.join(" ")} failed (exit ${res.exitCode}): ${res.stderr.trim().slice(0, 300)}`,
+    );
+  }
+  return res.stdout;
+}
+
+const GH_PR_URL_RE = /https?:\/\/\S+/;
+
 /**
  * §5: write the one-time token for `branch`+`sha`, run `git push` (the
  * shared pre-push hook validates branch+sha+expiry and consumes the
@@ -1451,10 +1630,35 @@ async function publishRelease(
   // threadIds was on must not be published after it flips off.
   const isPublishName = (b: string | null | undefined): b is string =>
     typeof b === "string" && b.startsWith("release/");
+  // §17.3 (С4): a repeat release continues the SAME publication branch —
+  // the name recorded at the first release wins over the branch the new
+  // round happens to sit on, so the same PR is updated. A recorded
+  // executor-branch name is reused only while `threadIds` is on (a flip
+  // to off must not publish a `thr_…` name — PLUG-194).
+  const recorded = row.publish_branch ?? deps.store.lastPublishBranch(row.task_key);
   const remoteBranch = threadIds
-    ? row.branch
-    : ([row.publish_branch, deps.store.releasePublishBranch(row.task_key)]
-        .find(isPublishName) ?? `release/${headSha.slice(0, 7)}`);
+    ? (recorded ?? row.branch)
+    : ([recorded].find(isPublishName) ?? `release/${headSha.slice(0, 7)}`);
+  // §17.3 (С4): the reused branch fast-forwards from `published_sha` —
+  // the new round continued from it (delegate continue point), so a
+  // non-ancestor published tip means somebody rewrote the branch.
+  if (row.published_sha && row.published_sha !== headSha) {
+    const ff = await git(deps, repo, [
+      "merge-base",
+      "--is-ancestor",
+      row.published_sha,
+      headSha,
+    ])
+      .then(() => true)
+      .catch(() => false);
+    if (!ff) {
+      throw new OrchestratorError(
+        "release-refused",
+        `ветка публикации не fast-forward от ${row.published_sha.slice(0, 8)} ` +
+          `— новый заход должен продолжать от published_sha`,
+      );
+    }
+  }
   const prs = await ghJson<GhPr[]>(deps, repo, [
     "pr",
     "list",
@@ -1500,9 +1704,10 @@ async function publishRelease(
   );
   deps.store.updateRelease(row.id, {
     publishedSha: headSha,
-    // §16.6: only `release/…` names are recorded — the executor's own
-    // branch (published under threadIds=true) is not a reusable name.
-    ...(isPublishName(remoteBranch) ? { publishBranch: remoteBranch } : {}),
+    // §17.3 (С4): the publication branch name is always recorded — the
+    // repeat release reuses it (an executor-branch name only while
+    // `threadIds` stays on, see the reuse check above).
+    publishBranch: remoteBranch,
   });
   let prUrl = existing?.url ?? null;
   if (!existing) {
@@ -1527,7 +1732,7 @@ async function publishRelease(
       : subject && !hasBbIds(subject)
         ? subject
         : `release ${headSha.slice(0, 7)}`;
-    const created = await ghJson<{ url?: string }>(deps, repo, [
+    const created = await ghText(deps, repo, [
       "pr",
       "create",
       "--base",
@@ -1542,7 +1747,7 @@ async function publishRelease(
           `Задача: ${row.task_key}`
         : "",
     ]);
-    prUrl = created.url ?? null;
+    prUrl = GH_PR_URL_RE.exec(created)?.[0] ?? null;
   }
   deps.store.updateRelease(row.id, { prUrl });
   await runChecked(deps.bbCli, [
@@ -1603,9 +1808,14 @@ async function postCheck(
     // that is neither ours nor another release's is «выложено в обход».
     const base = row.remote_base_sha ?? null;
     if (base && base !== ZERO_SHA) {
+      // §17.3 (С5): what landed on the remote outside the pushed
+      // history — `rev-list <target> --not <pushedSha>`; another
+      // release's own commits don't count as «выложено в обход».
       const extra = await git(deps, repo, [
         "rev-list",
-        `${base}..${target}`,
+        target,
+        "--not",
+        pushedSha,
       ]).catch(() => "");
       const unknown = extra
         .split("\n")
@@ -1685,6 +1895,10 @@ async function postCheck(
         ]),
       );
       const leaks = { machine: "block" as const, bbIds: "block" as const, allow: [] };
+      const cfg = deps.loadReleaseConfig().config;
+      const proj = cfg
+        ? resolveProject(cfg, row.project_id)
+        : { threadIds: true, allowedTrailers: [], allowedEmails: [] };
       const findings = await machineScan(deps.cmd, {
         repoPath: repo,
         baseSha: scanBase,
@@ -1694,7 +1908,9 @@ async function postCheck(
         patches,
         leaks,
         hostname: deps.hostname ?? osHostname(),
-        threadIds: projectThreadIds(deps, row.project_id),
+        threadIds: proj.threadIds,
+        allowedTrailers: proj.allowedTrailers,
+        allowedEmails: proj.allowedEmails,
       });
       const blockers = findings.filter((f) => f.severity === "block");
       if (blockers.length) {

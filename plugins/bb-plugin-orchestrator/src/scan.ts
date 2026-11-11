@@ -123,8 +123,48 @@ const SECRET_FILE_RE =
 const PERSONAL_EMAIL_RE =
   /[\w.+-]+@(?:gmail|googlemail|yandex|ya\.ru|mail\.ru|bk\.ru|inbox\.ru|list\.ru|outlook|hotmail|live|yahoo|icloud|me\.com|proton\.me|protonmail|rambler)\.[a-z.]+/i;
 
-const FOREIGN_BOT_TRAILER_RE =
-  /^\s*(?:Co-Authored-By|Co-authored-by|Signed-off-by|Generated with|Generated-by)\s*:?[ \t]/im;
+/** §17.3 (С6): every personal-address hit in the text, minus the
+ * project's `allowedEmails` — an exact address (`a@b.c`) or a domain
+ * (`@b.c` or bare `b.c`) in the list is not a finding. */
+function personalEmailHits(
+  text: string,
+  allowedEmails: readonly string[],
+): string[] {
+  const matches =
+    text.match(new RegExp(PERSONAL_EMAIL_RE.source, "gi")) ?? [];
+  if (!allowedEmails.length) return matches;
+  const allowed = allowedEmails.map((a) => a.trim().toLowerCase());
+  return matches.filter((m) => {
+    const lower = m.toLowerCase();
+    const domain = lower.slice(lower.indexOf("@"));
+    return !allowed.some(
+      (a) =>
+        (a.startsWith("@") && domain === a) ||
+        (a.includes("@") && lower === a) ||
+        (!a.includes("@") && domain === `@${a}`),
+    );
+  });
+}
+
+const FOREIGN_BOT_MARKER_RE =
+  /^\s*(Co-Authored-By|Co-authored-by|Signed-off-by|Generated with|Generated-by)\s*:?[ \t]/gim;
+
+/** §17.3 (С6): foreign-bot trailer names found in the commit body and
+ * NOT in the project's `allowedTrailers`. */
+function foreignTrailers(
+  body: string,
+  allowedTrailers: readonly string[],
+): string[] {
+  const allowed = new Set(
+    allowedTrailers.map((a) => a.trim().toLowerCase()),
+  );
+  const found: string[] = [];
+  for (const m of body.matchAll(FOREIGN_BOT_MARKER_RE)) {
+    const name = m[1]!;
+    if (!allowed.has(name.toLowerCase())) found.push(name);
+  }
+  return found;
+}
 
 // ── Category 3: machine binding ────────────────────────────────────────
 
@@ -208,6 +248,7 @@ function scanAddedLines(
   leaks: ResolvedProject["leaks"],
   hostname: string | undefined,
   threadIds = true,
+  allowedEmails: readonly string[] = [],
 ): ScanFinding[] {
   const findings: ScanFinding[] = [];
   const hostRule =
@@ -242,7 +283,7 @@ function scanAddedLines(
         severity: "block",
       });
     }
-    if (PERSONAL_EMAIL_RE.test(text)) {
+    if (personalEmailHits(text, allowedEmails).length) {
       findings.push({
         category: 2,
         file,
@@ -288,6 +329,8 @@ function scanCommitMeta(
   leaks: ResolvedProject["leaks"],
   hostname: string | undefined,
   threadIds = true,
+  allowedTrailers: readonly string[] = [],
+  allowedEmails: readonly string[] = [],
 ): ScanFinding[] {
   const findings: ScanFinding[] = [];
   const short = (sha: string) => sha.slice(0, 8);
@@ -315,13 +358,14 @@ function scanCommitMeta(
         severity: "block",
       });
     }
-    if (FOREIGN_BOT_TRAILER_RE.test(c.body)) {
+    const trailers = foreignTrailers(c.body, allowedTrailers);
+    if (trailers.length) {
       findings.push({
         category: 2,
         file: null,
         line: null,
         rule: "foreign-bot-trailer",
-        problem: `коммит ${short(c.sha)}: трейлер чужого бота (Co-Authored-By / Signed-off-by / Generated with)`,
+        problem: `коммит ${short(c.sha)}: трейлер чужого бота (${trailers.join(", ")})`,
         severity: "block",
       });
     }
@@ -362,7 +406,7 @@ function scanCommitMeta(
         severity: leaks.bbIds,
       });
     }
-    if (PERSONAL_EMAIL_RE.test(c.body)) {
+    if (personalEmailHits(c.body, allowedEmails).length) {
       findings.push({
         category: 2,
         file: null,
@@ -551,6 +595,10 @@ export async function machineScan(
     hostname?: string | undefined;
     /** §16.6 `threadIds` — default `true` (`thr_…` is not a leak). */
     threadIds?: boolean;
+    /** §17.3 (С6): foreign-bot trailers the project accepts. */
+    allowedTrailers?: readonly string[];
+    /** §17.3 (С6): emails/domains that are not a leak. */
+    allowedEmails?: readonly string[];
   },
 ): Promise<ScanFinding[]> {
   const findings: ScanFinding[] = [];
@@ -564,6 +612,8 @@ export async function machineScan(
       input.leaks,
       input.hostname,
       input.threadIds ?? true,
+      input.allowedTrailers ?? [],
+      input.allowedEmails ?? [],
     ),
   );
   // Range-diff lines ∪ per-commit patch lines, deduped — the same added
@@ -581,6 +631,7 @@ export async function machineScan(
       input.leaks,
       input.hostname,
       input.threadIds ?? true,
+      input.allowedEmails ?? [],
     ),
   );
   return findings;

@@ -1284,6 +1284,76 @@ export class DelegationStore {
         .get(sha, sha) !== undefined
     );
   }
+
+  /** §17.3 (С5): every sha the pipeline ever published — heads of all
+   * `published` releases, for the post-push `--not` exclusion. */
+  releasedShas(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT head_sha, published_sha FROM releases
+         WHERE status = 'published'`,
+      )
+      .all() as { head_sha: string | null; published_sha: string | null }[];
+    const out = new Set<string>();
+    for (const r of rows) {
+      if (r.head_sha) out.add(r.head_sha);
+      if (r.published_sha) out.add(r.published_sha);
+    }
+    return [...out];
+  }
+
+  /** §17.3 (С4): the newest publish branch name recorded for the task —
+   * any form (`release/<sha7>` or the executor's own while `threadIds`
+   * was on); the caller decides which forms are reusable. */
+  lastPublishBranch(taskKey: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT publish_branch FROM releases
+         WHERE task_key = ? AND publish_branch IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as
+      | { publish_branch: string }
+      | undefined;
+    return row?.publish_branch ?? null;
+  }
+
+  /** §17.3 (Б4): all delegations the §14 merge recorded into this branch
+   * — every task's, not only the released one. */
+  mergedDelegationsInto(branch: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE merge_status = 'merged' AND merged_into = ?`,
+      )
+      .all(branch) as DelegationRow[];
+  }
+
+  /**
+   * §17.3 (С4): the commit the task's next round continues from — the
+   * newest `published_sha` when it postdates the latest round result
+   * (the published tip carries the sync merge and the docs trailer, so
+   * a repeat release fast-forwards the same remote branch), else the
+   * latest recorded `result_sha`.
+   */
+  continuePoint(taskKey: string): string | null {
+    const key = normalizeTaskKey(taskKey);
+    const result = this.latestResultByTask(key);
+    const release = this.db
+      .prepare(
+        `SELECT published_sha, updated_at FROM releases
+         WHERE task_key = ? AND status = 'published'
+           AND published_sha IS NOT NULL
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(key) as
+      | { published_sha: string; updated_at: number }
+      | undefined;
+    if (release && (!result || release.updated_at >= result.updated_at)) {
+      return release.published_sha;
+    }
+    return result?.result_sha ?? null;
+  }
 }
 
 
