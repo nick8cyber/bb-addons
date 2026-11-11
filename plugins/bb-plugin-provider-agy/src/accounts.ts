@@ -24,6 +24,21 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+/**
+ * Instance-local state (spec section 2.1, ADR-0025): accounts-state.json is
+ * the SHARED pool file - an infra keeper one-way syncs it from the owner
+ * instance and would erase anything a satellite wrote. State that belongs
+ * to this instance lives in two sibling files the keeper never touches:
+ *
+ *   conversations-state.json   providerThreadId -> accountLabel pins
+ *   accounts-overlay.json      shadow of marks this instance set, each with
+ *                              its own writtenMs; applies while
+ *                              writtenMs >= shared.lastUsedMs
+ */
+const SHARED_STATE_FILE = "accounts-state.json";
+const CONVERSATIONS_STATE_FILE = "conversations-state.json";
+const ACCOUNTS_OVERLAY_FILE = "accounts-overlay.json";
+
 export interface AccountHome {
   label: string;
   home: string;
@@ -45,6 +60,28 @@ export interface AccountsLedger {
   accounts: Record<string, AccountLedgerEntry>;
   /** Which account owns which agy conversation, so a resume lands home. */
   conversations: Record<string, string>;
+  /**
+   * Labels this instance mutated since load — never persisted. saveLedger
+   * copies only these entries into accounts-overlay.json; without it a
+   * merged load could not tell our own marks from shared ones.
+   */
+  dirtyLabels?: Set<string>;
+  /**
+   * Conversation ids this instance pinned since load — never persisted.
+   * saveLedger re-writes only these keys over the on-disk map, so a stale
+   * snapshot cannot resurrect a neighbour's re-pin; pin-only saves also
+   * leave the overlay file (and its writtenMs stamps) untouched.
+   */
+  dirtyPins?: Set<string>;
+}
+
+/** Overlay record: one account mark plus when this instance wrote it. */
+interface OverlayEntry extends AccountLedgerEntry {
+  writtenMs: number;
+}
+
+interface OverlayFile {
+  accounts: Record<string, OverlayEntry>;
 }
 
 export function accountsEnabled(env: NodeJS.ProcessEnv): boolean {
@@ -79,24 +116,212 @@ export function listAccounts(dataDir: string): AccountHome[] {
   });
 }
 
-export function loadLedger(dataDir: string): AccountsLedger {
+function readJsonFile<T>(path: string): T | null {
   try {
-    const parsed = JSON.parse(
-      readFileSync(join(dataDir, "accounts-state.json"), "utf8"),
-    ) as Partial<AccountsLedger>;
-    return {
-      accounts: parsed.accounts ?? {},
-      conversations: parsed.conversations ?? {},
-    };
+    return JSON.parse(readFileSync(path, "utf8")) as T;
   } catch {
-    return { accounts: {}, conversations: {} };
+    return null;
   }
 }
 
+function writeJsonAtomic(path: string, value: unknown): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 1)}\n`, "utf8");
+  renameSync(tmp, path);
+}
+
+/**
+ * Effective view over shared + instance-local files:
+ * - conversations = union(legacy shared field, conversations-state.json),
+ *   local wins; legacy pins migrate eagerly so a first shared save cannot
+ *   erase them before this instance ever wrote.
+ * - accounts = merge(shared, overlay): cooldownUntilMs/lastUsedMs/
+ *   ineligibleAtMs take the max of both sides (the mass-parking breaker
+ *   must see the freshest stamp), parkedReason/lastError come from the
+ *   fresher side — a null there is a value, not an absence; an overlay
+ *   record applies while writtenMs >= shared.lastUsedMs (fresh shared
+ *   activity lifts the whole shadow, which is how an owner-side unpark
+ *   arrives).
+ */
+export function loadLedger(dataDir: string): AccountsLedger {
+  const shared =
+    readJsonFile<Partial<AccountsLedger>>(
+      join(dataDir, SHARED_STATE_FILE),
+    ) ?? {};
+  const sharedAccounts = shared.accounts ?? {};
+  const legacyConversations = shared.conversations ?? {};
+
+  const localPath = join(dataDir, CONVERSATIONS_STATE_FILE);
+  let local = readJsonFile<{ conversations?: Record<string, string> }>(
+    localPath,
+  );
+  const localConversations = local?.conversations ?? {};
+  if (
+    Object.keys(legacyConversations).some(
+      (key) => !(key in localConversations),
+    )
+  ) {
+    // Eager migration: the next keeper sync would erase shared pins this
+    // instance still needs; persist them locally on first sight. Fires on
+    // a missing, broken or empty local file alike — anything that leaves
+    // a legacy pin uncovered.
+    const migrated = { ...legacyConversations, ...localConversations };
+    try {
+      writeJsonAtomic(localPath, { conversations: migrated });
+      local = { conversations: migrated };
+    } catch {
+      // Read-only dir or a race on the temp name: the union below still
+      // returns the pins; they persist on the next successful save.
+    }
+  }
+  const conversations = {
+    ...legacyConversations,
+    ...(local?.conversations ?? {}),
+  };
+
+  const overlay =
+    readJsonFile<Partial<OverlayFile>>(
+      join(dataDir, ACCOUNTS_OVERLAY_FILE),
+    )?.accounts ?? {};
+  const accounts: Record<string, AccountLedgerEntry> = {};
+  for (const label of new Set([
+    ...Object.keys(sharedAccounts),
+    ...Object.keys(overlay),
+  ])) {
+    const s = sharedAccounts[label];
+    const o = overlay[label];
+    if (o !== undefined && (o.writtenMs ?? 0) >= (s?.lastUsedMs ?? 0)) {
+      const ineligibleAtMs = Math.max(
+        s?.ineligibleAtMs ?? 0,
+        o.ineligibleAtMs ?? 0,
+      );
+      accounts[label] = {
+        cooldownUntilMs: Math.max(s?.cooldownUntilMs ?? 0, o.cooldownUntilMs ?? 0),
+        lastUsedMs: Math.max(s?.lastUsedMs ?? 0, o.lastUsedMs ?? 0),
+        lastError: o.lastError ?? null,
+        ...(ineligibleAtMs > 0 ? { ineligibleAtMs } : {}),
+        ...(o.parkedReason !== undefined
+          ? { parkedReason: o.parkedReason }
+          : {}),
+      };
+    } else if (s !== undefined) {
+      accounts[label] = s;
+    }
+  }
+  return { accounts, conversations, dirtyLabels: new Set() };
+}
+
+/**
+ * Persist order is local files first, shared last: a crash between them
+ * leaves the old shared file beside newer local data, and the read union
+ * loses nothing. The shared file gets only `accounts` — the conversations
+ * field leaves it on first save.
+ */
 export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
-  const tmp = join(dataDir, `accounts-state.json.${process.pid}.tmp`);
-  writeFileSync(tmp, `${JSON.stringify(ledger, null, 1)}\n`, "utf8");
-  renameSync(tmp, join(dataDir, "accounts-state.json"));
+  const ghostLabels = new Set<string>();
+  // Merge-on-save for pins, by dirty keys only: parallel wrappers of this
+  // instance race load-modify-save, so re-read the file and overwrite just
+  // the keys this ledger pinned — a stale snapshot must not resurrect a
+  // neighbour's re-pin. Keys absent on disk (e.g. legacy pins whose eager
+  // migration failed at load) cannot clobber anything, so they join too.
+  const conversationsPath = join(dataDir, CONVERSATIONS_STATE_FILE);
+  const diskConversations =
+    readJsonFile<{ conversations?: Record<string, string> }>(
+      conversationsPath,
+    )?.conversations ?? {};
+  const pinKeys = new Set(ledger.dirtyPins ?? []);
+  for (const key of Object.keys(ledger.conversations)) {
+    if (!(key in diskConversations)) {
+      pinKeys.add(key);
+    }
+  }
+  if (pinKeys.size > 0) {
+    const mergedConversations = { ...diskConversations };
+    for (const key of pinKeys) {
+      const label = ledger.conversations[key];
+      if (label !== undefined) {
+        mergedConversations[key] = label;
+      }
+    }
+    writeJsonAtomic(conversationsPath, {
+      conversations: mergedConversations,
+    });
+  }
+
+  // Overlay is written only for labels this instance dirtied; a save done
+  // purely for a conversation pin leaves the file (and its writtenMs)
+  // untouched. The disk merge is per FIELD of the same label, not whole
+  // record by writtenMs: a fresh stamp with stale contents would erase a
+  // neighbour wrapper's cooldown. Numbers take the max of both sides —
+  // marks only grow locally — parkedReason/lastError come from the fresher
+  // record (absent writtenMs counts as 0, so a hand-edited overlay does
+  // not wedge updates); lastError always serializes, a fresh-side null is
+  // a value, not an absence. Ghosts — overlay records for labels gone
+  // from both the shared file and accounts/ — are dropped so they cannot
+  // leak into the shared file and sync onward.
+  if (ledger.dirtyLabels !== undefined && ledger.dirtyLabels.size > 0) {
+    const overlayPath = join(dataDir, ACCOUNTS_OVERLAY_FILE);
+    const onDisk =
+      readJsonFile<Partial<OverlayFile>>(overlayPath)?.accounts ?? {};
+    const merged: Record<string, OverlayEntry> = { ...onDisk };
+    const now = Date.now();
+    for (const label of ledger.dirtyLabels) {
+      const entry = ledger.accounts[label];
+      if (entry === undefined) {
+        continue;
+      }
+      const disk = merged[label];
+      const diskWrittenMs = disk?.writtenMs ?? 0;
+      const freshSide: AccountLedgerEntry =
+        diskWrittenMs > now && disk !== undefined ? disk : entry;
+      const ineligibleAtMs = Math.max(
+        entry.ineligibleAtMs ?? 0,
+        disk?.ineligibleAtMs ?? 0,
+      );
+      merged[label] = {
+        cooldownUntilMs: Math.max(
+          entry.cooldownUntilMs ?? 0,
+          disk?.cooldownUntilMs ?? 0,
+        ),
+        lastUsedMs: Math.max(entry.lastUsedMs ?? 0, disk?.lastUsedMs ?? 0),
+        lastError: freshSide.lastError ?? null,
+        ...(ineligibleAtMs > 0 ? { ineligibleAtMs } : {}),
+        ...(freshSide.parkedReason !== undefined
+          ? { parkedReason: freshSide.parkedReason }
+          : {}),
+        writtenMs: Math.max(now, diskWrittenMs),
+      };
+    }
+    // A ghost label still sits in ledger.accounts (its overlay record
+    // applied on load), so "gone from the shared file" is checked against
+    // the file on disk, not the merged view — and it is filtered out of
+    // the shared write below too, or this very save would leak it.
+    const diskSharedAccounts =
+      readJsonFile<Partial<AccountsLedger>>(
+        join(dataDir, SHARED_STATE_FILE),
+      )?.accounts ?? {};
+    for (const label of Object.keys(merged)) {
+      if (
+        !(label in diskSharedAccounts) &&
+        !existsSync(join(accountsDir(dataDir), label))
+      ) {
+        delete merged[label];
+        ghostLabels.add(label);
+      }
+    }
+    writeJsonAtomic(overlayPath, { accounts: merged });
+  }
+
+  writeJsonAtomic(join(dataDir, SHARED_STATE_FILE), {
+    accounts:
+      ghostLabels.size > 0
+        ? Object.fromEntries(
+            Object.entries(ledger.accounts).filter(
+              ([label]) => !ghostLabels.has(label),
+            ),
+          )
+        : ledger.accounts,
+  });
 }
 
 export function ledgerEntry(
@@ -110,11 +335,16 @@ export function ledgerEntry(
   });
 }
 
+function markDirty(ledger: AccountsLedger, label: string): void {
+  (ledger.dirtyLabels ??= new Set()).add(label);
+}
+
 export function markAccountUse(
   ledger: AccountsLedger,
   label: string,
 ): void {
   ledgerEntry(ledger, label).lastUsedMs = Date.now();
+  markDirty(ledger, label);
 }
 
 export function markAccountCooldown(
@@ -126,6 +356,27 @@ export function markAccountCooldown(
   const entry = ledgerEntry(ledger, label);
   entry.cooldownUntilMs = Math.max(entry.cooldownUntilMs, untilMs);
   entry.lastError = message;
+  markDirty(ledger, label);
+}
+
+/**
+ * Park an account after an eligibility/auth refusal: stamps ineligibleAtMs
+ * (the cross-session breaker counts it) and, when the cause is finer than
+ * eligibility, parkedReason. Direct field writes are forbidden — without
+ * this helper the mark never reaches accounts-overlay.json and the next
+ * keeper sync erases it.
+ */
+export function markAccountIneligible(
+  ledger: AccountsLedger,
+  label: string,
+  options: { parkedReason?: AccountLedgerEntry["parkedReason"] } = {},
+): void {
+  const entry = ledgerEntry(ledger, label);
+  entry.ineligibleAtMs = Date.now();
+  if (options.parkedReason !== undefined) {
+    entry.parkedReason = options.parkedReason;
+  }
+  markDirty(ledger, label);
 }
 
 export function rememberConversation(
@@ -134,6 +385,7 @@ export function rememberConversation(
   label: string,
 ): void {
   ledger.conversations[providerThreadId] = label;
+  (ledger.dirtyPins ??= new Set()).add(providerThreadId);
 }
 
 export function conversationAccount(
