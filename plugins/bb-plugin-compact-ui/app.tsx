@@ -926,6 +926,80 @@ function NavDiagBridge() {
     if (!enabled) return;
     let last = "";
     const win = window as unknown as Record<string, unknown>;
+        const dumpQueue = (cmdName: string) => {
+        const box = (el: Element | null | undefined) => {
+          if (!el) return null;
+          const h = el as HTMLElement;
+          const r = h.getBoundingClientRect();
+          return { h: Math.round(r.height), y: Math.round(r.top),
+            maxH: h.style?.maxHeight || "", cls: h.className?.toString?.().slice(0, 60) };
+        };
+        const q = document.querySelector("[data-queued-messages-scroll]");
+        const section = q?.closest("section");
+        win.__bbNavTopTest = {
+          cmd: cmdName, ts: Date.now(), innerH: window.innerHeight, appBuild: "v6",
+          sectionBox: box(section),
+          sectionButtons: section ? Array.from(section.querySelectorAll("button")).slice(0, 8).map((b) => ({
+            ...box(b), label: b.getAttribute("aria-label") || (b.textContent || "").trim().slice(0, 30) })) : [],
+          card: box(document.querySelector("[data-app-composer]")),
+          cardCount: document.querySelectorAll("[data-app-composer]").length,
+          timeOrigin: Math.round(performance.timeOrigin),
+          reloaded: (() => { try { return sessionStorage.getItem("__bbNavReload"); } catch { return null; } })(),
+          capMounted: document.documentElement.dataset.capMounted ?? null,
+          capDebug: document.documentElement.dataset.capDebug ? JSON.parse(document.documentElement.dataset.capDebug) : null,
+          editorInCard: !!document.querySelector("[data-app-composer] div.overflow-y-auto:has(.ProseMirror)"),
+          pmInCard: !!document.querySelector("[data-app-composer] .ProseMirror"),
+          queues: Array.from(document.querySelectorAll("[data-queued-messages-scroll]")).map((el) => ({ ...box(el), inCard: !!el.closest("[data-app-composer]") })),
+          frame: box(q?.closest("[data-queued-messages-scroll-frame]")),
+          scroll: q ? { ...box(q), scrollH: q.scrollHeight } : null,
+          editor: box(document.querySelector("div.overflow-y-auto:has(.ProseMirror)")),
+          rows: q ? Array.from(q.querySelectorAll("ul > li")).map((li) => ({
+            h: Math.round(li.getBoundingClientRect().height),
+            kind: Object.keys((li as HTMLElement).dataset)[0] || "",
+          })) : [],
+          gridChildren: (() => {
+            const g = document.querySelector("[data-app-composer] > div");
+            return g ? Array.from(g.children).map((el) => ({ ...box(el), tag: el.tagName,
+              cls: (el as HTMLElement).className?.toString?.().slice(0, 80),
+              data: Object.keys((el as HTMLElement).dataset).slice(0,3).join(","),
+              kids: el.children.length, disp: getComputedStyle(el).display })) : [];
+          })(),
+          cardChildren: (() => {
+            const c = document.querySelector("[data-app-composer]");
+            return c ? Array.from(c.children).map((el) => ({ ...box(el), tag: el.tagName,
+              data: Object.keys((el as HTMLElement).dataset).slice(0,3).join(","),
+              minH: (el as HTMLElement).style?.minHeight || "" })) : [];
+          })(),
+          ancestors: (() => {
+            const out = [];
+            let el = q?.parentElement;
+            for (let i = 0; i < 5 && el; i++, el = el.parentElement) {
+              const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+              out.push({ tag: el.tagName, cls: el.className?.toString?.().slice(0, 70),
+                h: Math.round(r.height), disp: cs.display, ov: cs.overflowY,
+                data: Object.keys((el as HTMLElement).dataset).slice(0, 3).join(",") });
+            }
+            return out;
+          })(),
+        };
+      };
+    try {
+      if (sessionStorage.getItem("__bbArm") === "1") {
+        sessionStorage.removeItem("__bbArm");
+        let tries = 0;
+        const boot = setInterval(() => {
+          const qEl = document.querySelector("[data-queued-messages-scroll]") as HTMLElement | null;
+          const sec = qEl?.closest("section");
+          const btn = sec?.querySelector("button") as HTMLElement | null;
+          if (btn && qEl && qEl.getBoundingClientRect().height < 10) { btn.click(); clearInterval(boot); }
+          else if (btn || ++tries > 30) clearInterval(boot);
+        }, 500);
+        setTimeout(() => {
+          let n = 0;
+          const arm = setInterval(() => { dumpQueue("armed_idle"); if (++n >= 400) clearInterval(arm); }, 3000);
+        }, 3000);
+      }
+    } catch {}
     const timer = setInterval(() => {
       const diag = win.__bbNavTopDiag;
       const test = win.__bbNavTopTest;
@@ -955,57 +1029,43 @@ function NavDiagBridge() {
             });
           win.__bbNavTopTest = { cmd: command, ts: Date.now(), hits };
         }
+        if (command === "arm_after_reload") {
+          win.__bbNavTopTest = { cmd: command, ts: Date.now() };
+          try { sessionStorage.setItem("__bbArm", "1"); } catch {}
+          setTimeout(() => location.reload(), 400);
+          return;
+        }
         if (command === "reload_page") {
           win.__bbNavTopTest = { cmd: command, ts: Date.now() };
           try { sessionStorage.setItem("__bbNavReload", "1"); } catch {}
           setTimeout(() => location.reload(), 400);
           return;
         }
-        if (command === "dump_queue") {
-          const box = (el: Element | null | undefined) => {
-            if (!el) return null;
-            const h = el as HTMLElement;
-            const r = h.getBoundingClientRect();
-            return { h: Math.round(r.height), y: Math.round(r.top),
-              maxH: h.style?.maxHeight || "", cls: h.className?.toString?.().slice(0, 60) };
-          };
-          const q = document.querySelector("[data-queued-messages-scroll]");
-          win.__bbNavTopTest = {
-            cmd: command, ts: Date.now(), innerH: window.innerHeight, appBuild: "v6",
-            card: box(document.querySelector("[data-app-composer]")),
-            cardCount: document.querySelectorAll("[data-app-composer]").length,
-            timeOrigin: Math.round(performance.timeOrigin),
-            reloaded: (() => { try { return sessionStorage.getItem("__bbNavReload"); } catch { return null; } })(),
-            capMounted: document.documentElement.dataset.capMounted ?? null,
-            capDebug: document.documentElement.dataset.capDebug ? JSON.parse(document.documentElement.dataset.capDebug) : null,
-            editorInCard: !!document.querySelector("[data-app-composer] div.overflow-y-auto:has(.ProseMirror)"),
-            pmInCard: !!document.querySelector("[data-app-composer] .ProseMirror"),
-            queues: Array.from(document.querySelectorAll("[data-queued-messages-scroll]")).map((el) => ({ ...box(el), inCard: !!el.closest("[data-app-composer]") })),
-            frame: box(q?.closest("[data-queued-messages-scroll-frame]")),
-            scroll: q ? { ...box(q), scrollH: q.scrollHeight } : null,
-            editor: box(document.querySelector("div.overflow-y-auto:has(.ProseMirror)")),
-            rows: q ? Array.from(q.querySelectorAll("ul > li")).map((li) => ({
-              h: Math.round(li.getBoundingClientRect().height),
-              kind: Object.keys((li as HTMLElement).dataset)[0] || "",
-            })) : [],
-            cardChildren: (() => {
-              const c = document.querySelector("[data-app-composer]");
-              return c ? Array.from(c.children).map((el) => ({ ...box(el), tag: el.tagName,
-                data: Object.keys((el as HTMLElement).dataset).slice(0,3).join(","),
-                minH: (el as HTMLElement).style?.minHeight || "" })) : [];
-            })(),
-            ancestors: (() => {
-              const out = [];
-              let el = q?.parentElement;
-              for (let i = 0; i < 5 && el; i++, el = el.parentElement) {
-                const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
-                out.push({ tag: el.tagName, cls: el.className?.toString?.().slice(0, 70),
-                  h: Math.round(r.height), disp: cs.display, ov: cs.overflowY,
-                  data: Object.keys((el as HTMLElement).dataset).slice(0, 3).join(",") });
-              }
-              return out;
-            })(),
-          };
+
+        if (command === "dump_queue") dumpQueue(command);
+        if (command === "dump_arm") {
+          win.__bbNavTopTest = { cmd: "dump_arm", ts: Date.now() };
+          let n = 0;
+          const arm = setInterval(() => {
+            dumpQueue("armed_idle");
+            if (++n >= 200) clearInterval(arm);
+          }, 3000);
+        }
+        if (command === "queue_expand") {
+          const qEl = document.querySelector("[data-queued-messages-scroll]");
+          const sec = qEl?.closest("section");
+          const cardEl = document.querySelector("[data-app-composer]");
+          const secBtns = sec ? Array.from(sec.querySelectorAll("button")) : [];
+          const target = (secBtns.find((b) => {
+            const r = b.getBoundingClientRect(), sr = sec!.getBoundingClientRect();
+            return r.top - sr.top < 60;
+          }) || secBtns[secBtns.length - 1] || cardEl?.querySelector("button")) as HTMLElement | undefined;
+          win.__bbNavTopTest = { cmd: "queue_expand", ts: Date.now(),
+            clicked: target ? { tag: target.tagName, cls: target.className?.toString?.().slice(0, 70),
+              label: target.getAttribute("aria-label") || (target.textContent || "").trim().slice(0, 30) } : null,
+            btnCount: secBtns.length };
+          target?.click();
+          setTimeout(() => dumpQueue("queue_expand+dump"), 700);
         }
         if (probe) {
           win.__bbNavTopTest = {
