@@ -14,7 +14,9 @@ const EDITOR_SCROLL = "div.overflow-y-auto:has(.ProseMirror)";
 /** Queued-messages panel's own scroll region (host marks it). */
 const QUEUE_SCROLL = "[data-queued-messages-scroll]";
 const QUEUE_FRAME = "[data-queued-messages-scroll-frame]";
-const QUEUE_ROW = "[data-queued-message-row]";
+/** Every visible queue item is an <li> inside ul.group/queue — message rows,
+     inline editors, notices; only the zero-height group dividers are skipped. */
+const QUEUE_ITEM = "ul > li:not([data-queued-message-group-divider])";
 /** App chrome outside the conversation working area: page header + status bar. */
 const OUTER_CHROME_PX = 96;
 /** BB's own composer ceiling when content is short. */
@@ -42,7 +44,7 @@ function enforce(form: Element, win: Window): void {
     form.parentElement?.querySelector(QUEUE_SCROLL) ??
     null) as HTMLElement | null;
   if (queue) {
-    const rows = queue.querySelectorAll(QUEUE_ROW);
+    const rows = queue.querySelectorAll(QUEUE_ITEM);
     const frame = queue.closest(QUEUE_FRAME) as HTMLElement | null;
     /* A collapsed panel stays mounted with a zero-height viewport — clamping it
        would resurrect it; an empty one has nothing to bound. */
@@ -57,7 +59,8 @@ function enforce(form: Element, win: Window): void {
       const queueMax = Math.ceil(
         rows[k - 1].getBoundingClientRect().bottom -
           rows[0].getBoundingClientRect().top +
-          padY(queue),
+          padY(queue) +
+          padY(rows[0].parentElement ?? queue),
       );
       queue.style.maxHeight = `${queueMax}px`;
       if (frame) frame.style.maxHeight = `${queueMax + Math.ceil(padY(frame))}px`;
