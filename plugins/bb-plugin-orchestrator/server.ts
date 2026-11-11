@@ -949,6 +949,17 @@ export async function createPlugin(
             bb.log.warn(`orchestrator janitor: ${describeError(e)}`),
           ),
         );
+        // §16.4 r29: the same rescue on `thread.deleted` — BB retires
+        // the copy identically (~5 min after the first of the two
+        // events), the reason word is the only difference.
+        bb.events.on("thread.deleted", ({ thread }) =>
+          void (janitorLive
+            ? janitor.onThreadDeleted(thread)
+            : Promise.resolve(undefined)
+          ).catch((e) =>
+            bb.log.warn(`orchestrator janitor: ${describeError(e)}`),
+          ),
+        );
       }
       const timer = setInterval(janitorTick, 60_000);
       janitorLive = true;
@@ -1791,6 +1802,30 @@ abandoned: ${res.reported
                 out += `  ${i.env_id} ${i.branch ?? "-"} (${i.reason ?? "-"})\n`;
               }
               if (kept.length > 20) out += `  ... and ${kept.length - 20} more\n`;
+            }
+            // §16.4 r29: the rescue ledger — saved work whose line
+            // never reached a coordinator stays findable here. Rows
+            // with notified=0 always show (ревью PLUG-240) — an
+            // undelivered rescue must not scroll out of sight.
+            if (rep.rescues.length) {
+              out += "rescued work:\n";
+              const shown = new Set([
+                ...rep.rescues.filter((r) => !r.notified),
+                ...rep.rescues.slice(-20),
+              ]);
+              for (const r of rep.rescues) {
+                if (!shown.has(r)) continue;
+                out +=
+                  `  ${r.thread_id} ${r.ref ?? "снимок не удался"} ` +
+                  `${r.reason}` +
+                  (r.repo_root ? ` (${r.repo_root})` : "") +
+                  (r.notified ? "" : " — координатору не дошло") +
+                  (r.error ? ` [${r.error}]` : "") +
+                  "\n";
+              }
+              if (shown.size < rep.rescues.length) {
+                out += `  ... and ${rep.rescues.length - shown.size} more\n`;
+              }
             }
             return { exitCode: 0, stdout: out };
           }
