@@ -6,6 +6,7 @@ import {
   experimental_useSidebarThreads,
   experimental_useSidebarThreadSplit,
   useBbNavigate,
+  useRealtime,
   useRpc,
   useSettings,
 } from "@get-bb/plugin-sdk/app";
@@ -618,6 +619,24 @@ function CollapsedThreadList({
   // Project drag-and-drop: the frontend sidebar API has no reorder action, so
   // the move goes to this plugin's backend, which owns `bb.sdk.projects`.
   const rpc = useRpc<typeof rpcContract>();
+  // Fold state persists server-side (kv + realtime), so it survives reloads
+  // and syncs across devices. `foldDirty` keeps a pending local toggle from
+  // being clobbered by the initial hydration; `origin` skips our own echo.
+  const foldClientId = useRef(`ui-${Math.random().toString(36).slice(2)}`);
+  const foldDirty = useRef(false);
+  useEffect(() => {
+    void rpc
+      .call("collapsed_projects_get", {})
+      .then(({ ids }) => {
+        if (!foldDirty.current) setFoldedProjectIds(new Set(ids));
+      })
+      .catch(() => {});
+  }, [rpc]);
+  useRealtime("collapsed-projects", (payload) => {
+    const next = payload as { ids?: unknown; origin?: unknown } | null;
+    if (!next || next.origin === foldClientId.current || !Array.isArray(next.ids)) return;
+    setFoldedProjectIds(new Set(next.ids.filter((id): id is string => typeof id === "string")));
+  });
   const fallback = () => typeof Original === "function" ? <Original /> : (
     <div role="status" className="space-y-2 px-3 py-2 text-xs text-muted-foreground">
       <p>Штатный список BB выбирается отдельно от списка плагина.</p>
@@ -686,6 +705,13 @@ function CollapsedThreadList({
       } else {
         next.add(projectId);
       }
+      foldDirty.current = true;
+      void rpc
+        .call("collapsed_projects_set", {
+          ids: Array.from(next),
+          origin: foldClientId.current,
+        })
+        .catch(() => {});
       return next;
     });
   };

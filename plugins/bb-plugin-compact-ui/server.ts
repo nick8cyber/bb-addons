@@ -24,6 +24,20 @@ export const rpcContract = defineRpcContract({
     input: z.object({ report: z.string().max(20000) }).strict(),
     output: z.object({ ok: z.literal(true) }),
   },
+  /** Folded project groups persist server-side (bb.storage.kv) so the state
+   *  survives reloads and syncs across devices; writes broadcast on the
+   *  "collapsed-projects" realtime channel. */
+  collapsed_projects_get: {
+    input: z.object({}).strict(),
+    output: z.object({ ids: z.array(z.string()) }),
+  },
+  collapsed_projects_set: {
+    input: z.object({
+      ids: z.array(z.string().min(1)).max(500),
+      origin: z.string().nullable().default(null),
+    }).strict(),
+    output: z.object({ ok: z.literal(true) }),
+  },
   /** One-shot commands for the UI self-test: written into CMD_PATH by the
    *  agent, consumed (and deleted) by the next poll from the app bridge. */
   nav_top_row_poll: {
@@ -138,6 +152,14 @@ export default async function plugin(bb: BbPluginApi) {
         previousProjectId,
         nextProjectId,
       });
+      return { ok: true } as const;
+    },
+    collapsed_projects_get: async () => ({
+      ids: (await bb.storage.kv.get<string[]>("collapsedProjects")) ?? [],
+    }),
+    collapsed_projects_set: async ({ ids, origin }) => {
+      await bb.storage.kv.set("collapsedProjects", ids);
+      bb.realtime.publish("collapsed-projects", { ids, origin });
       return { ok: true } as const;
     },
     nav_top_row_diag: async ({ report }) => {
