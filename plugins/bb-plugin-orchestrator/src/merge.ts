@@ -685,12 +685,12 @@ function parseLock(content: string): LockInfo | null {
 export function recordLockState(
   lockPath: string,
   branch: string,
-  head: string,
+  head: string | null,
 ): void {
   try {
     writeFileSync(
       lockPath,
-      `${process.pid}\n${new Date().toISOString()}\n${branch}\n${head}\n`,
+      `${process.pid}\n${new Date().toISOString()}\n${branch}\n${head ?? ""}\n`,
     );
   } catch {
     /* the lock exists; recording state is best-effort */
@@ -752,14 +752,17 @@ export async function acquireCopyLock(
     // §14: a dead owner's lock breaks only after the copy is restored
     // to the recorded state (a crash may have left it mid-merge or on
     // the target branch). Nothing recorded → the owner died before
-    // touching the copy — nothing to restore.
-    if (info.branch && info.head) {
+    // touching the copy — nothing to restore. A recorded branch with an
+    // empty head means the tip was allowed to move (§16.6 release on the
+    // published branch): restore branch+clean only, or the stale lock
+    // would wedge the copy on a HEAD it can never return to (PLUG-191).
+    if (info.branch) {
       const restoreError = await restoreCopy(git, info.branch, info.head);
       if (restoreError) {
         throw new OrchestratorError(
           "copy-not-restored",
           `старая блокировка ${lockPath}: копия не возвращена к ` +
-            `${info.branch}@${sha7(info.head)}: ${restoreError}`,
+            `${info.branch}${info.head ? `@${sha7(info.head)}` : ""}: ${restoreError}`,
           `копия ${repo} — разберите вручную, там могло остаться незавершённое слияние`,
         );
       }

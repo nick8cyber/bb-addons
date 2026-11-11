@@ -351,7 +351,7 @@ function makeDeps(repo: string, overrides: Partial<{
       const key = args.join(" ");
       if (key.startsWith("tasks show"))
         return ok(JSON.stringify({
-          task: { key: "PLUG-1", title: "do x", status: "in_review" },
+          task: { key: args[2] ?? "PLUG-1", title: "do x", status: "in_review" },
           comments: overrides.comments ?? [
             {
               kind: "agent",
@@ -1065,4 +1065,242 @@ test("f7: prWasReleased is scoped to the coordinator", () => {
   store.updateRelease(r.id, { prUrl: "https://x.test/pr/1" });
   assert.equal(store.prWasReleased("https://x.test/pr/1", "thr_a"), true);
   assert.equal(store.prWasReleased("https://x.test/pr/1", "thr_b"), false);
+});
+
+// ── §16.6 (PLUG-191): hunk counting, neutral title, stable branch ─────
+
+test("parseAddedLines: +++ inside a hunk is content, not a file header", () => {
+  // PLUG-191 finding 2: an added line `++ /dev/null` prints as
+  // `+++ /dev/null`; the old parser read it as a deleted-file header and
+  // dropped the rest of the file. The hunk's own `+N,M` count bounds it.
+  const diff = [
+    "diff --git a/g.txt b/g.txt",
+    "--- a/g.txt",
+    "+++ b/g.txt",
+    "@@ -0,0 +1,3 @@",
+    "+++ /dev/null",
+    "+++ b/docs/PLAN.md",
+    "+/home/after/z",
+    "diff --git a/h.txt b/h.txt",
+    "+++ b/h.txt",
+    "@@ -0,0 +1 @@",
+    "+x",
+  ].join("\n");
+  assert.deepEqual(parseAddedLines(diff), [
+    { file: "g.txt", line: 1, text: "++ /dev/null" },
+    { file: "g.txt", line: 2, text: "++ b/docs/PLAN.md" },
+    { file: "g.txt", line: 3, text: "/home/after/z" },
+    { file: "h.txt", line: 1, text: "x" },
+  ]);
+});
+
+test("pump: threadIds=false — PR title is the HEAD subject, never a task key", async () => {
+  const { repo } = makeRepo();
+  const ghCalls: string[][] = [];
+  const { deps, store } = makeDeps(repo, {
+    ghCalls,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        threadIds: false,
+      },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  const create = ghCalls.find((a) => a[0] === "pr" && a[1] === "create")!;
+  const title = create[create.indexOf("--title") + 1]!;
+  // §16.6: HEAD-commit subject — never the tracker title («do x») or key.
+  assert.equal(title, gitR(repo, ["log", "-1", "--format=%s"]));
+  assert.notEqual(title, "do x");
+  assert.doesNotMatch(title, /[A-Z][A-Z0-9]+-\d+/);
+});
+
+test("pump: threadIds=false — repeat release reuses the first release/<sha7>", async () => {
+  const { repo, remote } = makeRepo();
+  const ghCalls: string[][] = [];
+  const { deps, store } = makeDeps(repo, {
+    ghCalls,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        threadIds: false,
+      },
+    }),
+  });
+  const round = async () => {
+    await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+    store.setStatus(
+      store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+      "done",
+    );
+    const s = await pumpReleases(deps);
+    assert.equal(s.published, 1);
+  };
+  await round();
+  const create = ghCalls.find((a) => a[0] === "pr" && a[1] === "create")!;
+  const branch = create[create.indexOf("--head") + 1]!;
+  assert.match(branch, /^release\/[0-9a-f]{7}$/);
+  assert.equal(
+    store.releasesByStatuses(["published"])[0]!.publish_branch,
+    branch,
+  );
+  // A repeat release has a DIFFERENT head — the branch must stay the
+  // recorded one anyway (§16.6: one branch and one PR per task).
+  writeFileSync(join(repo, "more.txt"), "more\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const newHead = gitR(repo, ["rev-parse", "HEAD"]);
+  assert.notEqual(newHead.slice(0, 7), branch.slice("release/".length));
+  await round();
+  const remoteTip = execFileSync(
+    "git",
+    ["--git-dir", remote, "rev-parse", `refs/heads/${branch}`],
+    { encoding: "utf8" },
+  ).trim();
+  const rows = store.releasesByStatuses(["published"]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1]!.publish_branch, branch);
+  assert.equal(remoteTip, rows[1]!.head_sha);
+});
+
+test("release (merged): a failing project check restores the copy (PLUG-191)", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const originalHead = gitR(coord, ["rev-parse", "HEAD"]); // work-2 tip
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        checks: ["exit 1"],
+      },
+    }),
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => /проверка проекта упала/.test((e as Error).message),
+  );
+  // the copy went back to work-2 at its commit, clean, lock released
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work-2");
+  assert.equal(gitR(coord, ["rev-parse", "HEAD"]), originalHead);
+  assert.equal(gitR(coord, ["status", "--porcelain"]), "");
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  assert.equal(existsSync(join(gitDir, "orchestrator-merge.lock")), false);
+});
+
+/** A deferred gate: `entered` fires when the wrapped git call starts,
+ * `open` releases it. Used to hold a release mid-run inside the lock. */
+function fetchGate(deps: { cmd: CmdRunner }) {
+  let open!: () => void;
+  let mark!: () => void;
+  const entered = new Promise<void>((r) => {
+    mark = r;
+  });
+  const gate = new Promise<void>((r) => {
+    open = r;
+  });
+  let once = true;
+  const realRun = deps.cmd.run;
+  deps.cmd = {
+    run: async (file, args, o) => {
+      if (once && file === "git" && args[2] === "fetch") {
+        once = false;
+        mark();
+        await gate;
+      }
+      return realRun(file, args, o);
+    },
+  };
+  return { entered, open };
+}
+
+test("release: two parallel runs in the executor worktree — second refused", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  const gate = fetchGate(deps);
+  const slow = runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await gate.entered;
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "merge-in-progress",
+  );
+  gate.open();
+  assert.equal((await slow).status, "auditing");
+});
+
+test("release (merged): two releases of different tasks into one coordinator copy", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  // A second task whose round was also merged into the same copy.
+  const exec2 = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c",
+    preset: "c",
+    provider: "p",
+  });
+  store.setThreadInfo(exec2.id, "thr_exec");
+  store.setStatus(exec2.id, "done");
+  store.setMerged(exec2.id, { into: "work", sha: workTip });
+  const rev2 = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "r",
+    preset: "r",
+    provider: "p",
+  });
+  store.setThreadInfo(rev2.id, "thr_rev");
+  store.setStatus(rev2.id, "done");
+  const gate = fetchGate(deps);
+  const slow = runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await gate.entered;
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-2", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "merge-in-progress",
+  );
+  gate.open();
+  assert.equal((await slow).status, "auditing");
+  // the first release's copy came back to its own branch
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work-2");
+});
+
+test("release (merged): lock records EMPTY head on the publish branch (PLUG-191)", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  // The copy already sits on merged_into — the sync merge legitimately
+  // moves its tip, so the lock must not pin a HEAD it can never match.
+  gitR(coord, ["checkout", "work"]);
+  const { deps, store, exec } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  const lock = join(gitDir, "orchestrator-merge.lock");
+  const gate = fetchGate(deps);
+  const pending = runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await gate.entered;
+  const recorded = readFileSync(lock, "utf8").split("\n");
+  assert.equal(recorded[2], "work");
+  assert.equal(recorded[3], ""); // branch+clean only on restore
+  gate.open();
+  assert.equal((await pending).status, "auditing");
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work");
+  assert.equal(existsSync(lock), false);
 });

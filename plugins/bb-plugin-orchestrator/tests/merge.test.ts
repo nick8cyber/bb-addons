@@ -1030,3 +1030,27 @@ test("--into: the copy moves to the target via git switch", async () => {
   assert.ok(calls.some((a) => a[0] === "switch" && a[1] === "target"));
   assert.ok(!calls.some((a) => a[0] === "checkout"));
 });
+
+test("a stale lock with a branch but no head restores branch-only (PLUG-191)", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  const lock = join(gitDir, "orchestrator-merge.lock");
+  // §16.6: a crashed release on the publish branch recorded the original
+  // branch and NO head — the tip legitimately moved after the crash, so
+  // the breaker must check branch+clean, not a HEAD it can never match.
+  gitR(coord, ["checkout", "-b", "side"]);
+  writeFileSync(join(coord, "side.txt"), "s\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "side"]);
+  writeFileSync(lock, "1073741824\nstale\nwork\n\n");
+
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  const res = await runMerge(PARAMS, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  // the breaker returned the copy to `work` before stealing the lock
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work");
+  assert.equal(existsSync(lock), false);
+  assert.equal(store.get(row.id)!.merge_status, "merged");
+});
+

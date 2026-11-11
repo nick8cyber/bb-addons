@@ -110,6 +110,10 @@ export const MIGRATIONS: readonly string[] = [
   // §2.3 r24 (PLUG-182): the dispatch used an explicit `--route`/`--preset`
   // — its §5.4 reissue restarts the level chain from the beginning.
   `ALTER TABLE delegations ADD COLUMN explicit_route INTEGER NOT NULL DEFAULT 0`,
+  // §16.6 (PLUG-191): with `threadIds` off the remote branch is a neutral
+  // `release/<sha7>` recorded at the first release and reused by repeats
+  // — one branch and one PR per task.
+  `ALTER TABLE releases ADD COLUMN publish_branch TEXT`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -200,6 +204,7 @@ export interface ReleaseRow {
   kb_note: string | null;
   no_kb_reason: string | null;
   pr_url: string | null;
+  publish_branch: string | null;
   error: string | null;
   created_at: number;
   updated_at: number;
@@ -922,6 +927,7 @@ export class DelegationStore {
       remoteBaseSha?: string | null;
       auditDelegationId?: number | null;
       prUrl?: string | null;
+      publishBranch?: string | null;
       error?: string | null;
     },
   ): void {
@@ -934,6 +940,7 @@ export class DelegationStore {
       remoteBaseSha: "remote_base_sha",
       auditDelegationId: "audit_delegation_id",
       prUrl: "pr_url",
+      publishBranch: "publish_branch",
       error: "error",
     };
     for (const [key, col] of Object.entries(map)) {
@@ -994,6 +1001,22 @@ export class DelegationStore {
         )
         .get(url, coordinatorThreadId) !== undefined
     );
+  }
+
+  /** §16.6 (PLUG-191): the neutral `release/<sha7>` branch name this
+   * task's FIRST published release wrote — repeat releases reuse it so
+   * the task keeps one remote branch and one PR. */
+  releasePublishBranch(taskKey: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT publish_branch FROM releases
+         WHERE task_key = ? AND publish_branch IS NOT NULL
+         ORDER BY id ASC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey)) as
+      | { publish_branch: string }
+      | undefined;
+    return row?.publish_branch ?? null;
   }
 
   /** §2 step 7 «выложено в обход»: is this sha a commit release pushed? */

@@ -376,38 +376,70 @@ export function parseAddedLines(diffText: string): AddedLine[] {
   let file: string | null = null;
   let line = 0;
   let columns = 0; // prefix columns per content line (1 regular, 2+ combined)
+  // §16.6 (PLUG-191): a `+++`/`---`/`@@`-looking line inside a hunk is
+  // CONTENT, not a header (`++ /dev/null` added to a file prints as
+  // `+++ /dev/null` and used to un-pin `file`, losing every later line
+  // of that file). The hunk's own counts tell where its body ends:
+  // pre-image lines per parent and post-image lines from `+N,M`.
+  let inHunk = false;
+  let preLeft: number[] = [];
+  let postLeft = 0;
   for (const raw of diffText.split("\n")) {
-    if (raw.startsWith("+++ ")) {
-      const p = raw.slice(4).trim();
-      file = p === "/dev/null" ? null : p.replace(/^b\//, "");
-      continue;
-    }
-    // `@@` regular hunks and `@@@`/`@@@@` combined-diff hunks: the
-    // post-image start is the + group; prefix columns = @ count − 1.
-    const hunk = /^(@+) (?:-\d+(?:,\d+)? )+\+(\d+)(?:,\d+)? @+/.exec(raw);
-    if (hunk) {
-      columns = hunk[1]!.length - 1;
-      line = Number(hunk[2]);
-      continue;
-    }
-    if (!file) continue;
-    if (columns <= 1) {
-      if (raw.startsWith("+")) {
-        out.push({ file, line, text: raw.slice(1) });
-        line += 1;
-      } else if (raw.startsWith(" ")) {
-        line += 1;
+    if (!inHunk) {
+      if (raw.startsWith("+++ ")) {
+        const p = raw.slice(4).trim();
+        file = p === "/dev/null" ? null : p.replace(/^b\//, "");
+        continue;
+      }
+      // `@@` regular hunks and `@@@`/`@@@@` combined-diff hunks: the
+      // post-image start is the + group; prefix columns = @ count − 1.
+      const hunk =
+        /^(@+) ((?:-\d+(?:,\d+)? )+)\+(\d+)(?:,(\d+))? @+/.exec(raw);
+      if (hunk) {
+        columns = hunk[1]!.length - 1;
+        preLeft = [...hunk[2]!.matchAll(/-\d+(?:,(\d+))?/g)].map(
+          (m) => (m[1] === undefined ? 1 : Number(m[1])),
+        );
+        postLeft = hunk[4] === undefined ? 1 : Number(hunk[4]);
+        line = Number(hunk[3]);
+        inHunk = postLeft > 0 || preLeft.some((n) => n > 0);
       }
       continue;
     }
-    // Combined hunk: examine the per-parent prefix columns.
-    if (raw.length < columns) continue;
-    const prefix = raw.slice(0, columns);
-    if (prefix.includes("-")) continue; // absent from the merge result
-    if ([...prefix].every((c) => c === "+")) {
-      out.push({ file, line, text: raw.slice(columns) });
+    // In a hunk: `\ No newline at end of file` consumes nothing.
+    if (raw.startsWith("\\")) continue;
+    if (columns <= 1) {
+      if (raw.startsWith("+")) {
+        if (file) out.push({ file, line, text: raw.slice(1) });
+        line += 1;
+        postLeft -= 1;
+      } else if (raw.startsWith("-")) {
+        preLeft[0]! -= 1;
+      } else if (raw.startsWith(" ")) {
+        preLeft[0]! -= 1;
+        postLeft -= 1;
+        line += 1;
+      } else {
+        continue; // empty/malformed — do not touch the counters
+      }
+    } else {
+      // Combined hunk: examine the per-parent prefix columns.
+      if (raw.length < columns) continue;
+      const prefix = raw.slice(0, columns);
+      for (let i = 0; i < columns; i += 1) {
+        if (prefix[i] === "-" || prefix[i] === " ") preLeft[i]! -= 1;
+      }
+      if (prefix.includes("-")) {
+        // absent from the merge result — no post-image line consumed
+      } else {
+        if (file && [...prefix].every((c) => c === "+")) {
+          out.push({ file, line, text: raw.slice(columns) });
+        }
+        line += 1; // present in the result, added or already-public
+        postLeft -= 1;
+      }
     }
-    line += 1; // present in the result, added or already-public
+    if (postLeft <= 0 && preLeft.every((n) => n <= 0)) inHunk = false;
   }
   return out;
 }

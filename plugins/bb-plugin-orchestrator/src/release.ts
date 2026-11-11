@@ -855,32 +855,13 @@ export async function runRelease(
   // copy — under the same per-copy lock `merge` takes (§14 check 4: one
   // merge/release per copy at a time), with the busy/clean checks BEFORE
   // `git switch` and the copy restored to its original branch in
-  // `finally`. The executor's own worktree needs no lock.
+  // `finally`. PLUG-191: the executor's own worktree takes the same
+  // lock — two parallel release runs of one task would otherwise race
+  // `git merge`/`--amend`/`git switch` in the same directory. It records
+  // NO state and is never restored: unlike the coordinator's, this copy
+  // is not required clean up front, so a restore would either mask the
+  // real error over pre-existing dirt or wedge a dirty worktree's lock.
   const coordinatorCopy = executor.merge_status === "merged";
-  if (!coordinatorCopy) {
-    const onBranch = await git(
-      deps,
-      repo,
-      ["symbolic-ref", "--quiet", "--short", "HEAD"],
-      { allowFail: true },
-    );
-    if (onBranch !== branch) {
-      await git(deps, repo, ["switch", branch]);
-    }
-    return runReleaseSteps(
-      {
-        taskKey,
-        title,
-        executor,
-        project,
-        repo,
-        branch,
-        policyLoad: policyLoad as PolicyLoad & { policy: Policy },
-      },
-      input,
-      deps,
-    );
-  }
   const mgit: MergeGit = (args, opts) =>
     deps.cmd.run("git", ["-C", repo, ...args], {
       timeoutMs: opts?.timeoutMs ?? 120_000,
@@ -890,50 +871,62 @@ export async function runRelease(
   const releaseLock = await acquireCopyLock(mgit, repo, lockPath);
   let copyToRestore: { branch: string; head: string | null } | null = null;
   try {
-    const busy = COPY_BUSY_MARKERS.filter((n) =>
-      existsSync(join(gitDir, n)),
-    );
-    if (busy.length) {
-      throw new OrchestratorError(
-        "copy-busy",
-        `в копии координатора незавершённая операция (${busy.join(", ")})`,
-        "завершите или отмените её (git merge|cherry-pick|revert|rebase --abort) и повторите",
+    if (coordinatorCopy) {
+      const busy = COPY_BUSY_MARKERS.filter((n) =>
+        existsSync(join(gitDir, n)),
       );
-    }
-    // §16.6: a dirty coordinator copy refuses BEFORE the switch —
-    // uncommitted work must not travel onto merged_into.
-    const porcelain = await git(deps, repo, ["status", "--porcelain"]);
-    if (porcelain.trim()) {
-      throw new OrchestratorError(
-        "dirty-coordinator",
-        "копия координатора грязная (незакоммиченные правки)",
-        "закоммить или уберите изменения и повторите",
+      if (busy.length) {
+        throw new OrchestratorError(
+          "copy-busy",
+          `в копии координатора незавершённая операция (${busy.join(", ")})`,
+          "завершите или отмените её (git merge|cherry-pick|revert|rebase --abort) и повторите",
+        );
+      }
+      // §16.6: a dirty coordinator copy refuses BEFORE the switch —
+      // uncommitted work must not travel onto merged_into.
+      const porcelain = await git(deps, repo, ["status", "--porcelain"]);
+      if (porcelain.trim()) {
+        throw new OrchestratorError(
+          "dirty-coordinator",
+          "копия координатора грязная (незакоммиченные правки)",
+          "закоммить или уберите изменения и повторите",
+        );
+      }
+      const headRef = await git(deps, repo, ["symbolic-ref", "HEAD"], {
+        allowFail: true,
+      });
+      const currentBranch = headRef.startsWith("refs/heads/")
+        ? headRef.slice("refs/heads/".length)
+        : "";
+      if (!currentBranch) {
+        throw new OrchestratorError(
+          "detached-head",
+          "копия координатора на отсоединённом HEAD — ветки нет",
+          "перейдите на ветку (git switch <branch>) и повторите",
+        );
+      }
+      const originalHead = await git(deps, repo, ["rev-parse", "HEAD"]);
+      // §16.6 (PLUG-191): when the copy already sits on the published
+      // branch its tip legitimately advances (the sync merge is real
+      // work) — record an EMPTY head so this run's restore AND a
+      // stale-lock breaker check branch+clean only. A recorded HEAD the
+      // copy can never return to would wedge the lock forever.
+      const restoreHead = currentBranch === branch ? null : originalHead;
+      recordLockState(lockPath, currentBranch, restoreHead);
+      copyToRestore = { branch: currentBranch, head: restoreHead };
+      if (currentBranch !== branch) {
+        await git(deps, repo, ["switch", branch]);
+      }
+    } else {
+      const onBranch = await git(
+        deps,
+        repo,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        { allowFail: true },
       );
-    }
-    const headRef = await git(deps, repo, ["symbolic-ref", "HEAD"], {
-      allowFail: true,
-    });
-    const currentBranch = headRef.startsWith("refs/heads/")
-      ? headRef.slice("refs/heads/".length)
-      : "";
-    if (!currentBranch) {
-      throw new OrchestratorError(
-        "detached-head",
-        "копия координатора на отсоединённом HEAD — ветки нет",
-        "перейдите на ветку (git switch <branch>) и повторите",
-      );
-    }
-    const originalHead = await git(deps, repo, ["rev-parse", "HEAD"]);
-    recordLockState(lockPath, currentBranch, originalHead);
-    // When the copy already sits on the published branch its tip
-    // legitimately advances (the sync merge is real work) — then the
-    // restore checks branch+clean only (`restoreCopy` head=null).
-    copyToRestore = {
-      branch: currentBranch,
-      head: currentBranch === branch ? null : originalHead,
-    };
-    if (currentBranch !== branch) {
-      await git(deps, repo, ["switch", branch]);
+      if (onBranch !== branch) {
+        await git(deps, repo, ["switch", branch]);
+      }
     }
     return await runReleaseSteps(
       {
@@ -1442,12 +1435,16 @@ async function publishRelease(
   // action=pr — §16.6 `threadIds`: the «Источник: bb тред thr_…» line is
   // written only while the project allows thread ids. With it off the
   // local executor branch name (`bb/<key>-…-thr_…`) must not reach the
-  // remote either — the published branch is a neutral `release/<sha7>`,
-  // and the PR body carries neither «Источник» nor «Задача: <KEY>».
+  // remote either — the published branch is a neutral `release/<sha7>`
+  // recorded at the FIRST release of the task and reused by repeats
+  // (one branch and one PR per task, §16.6), and the PR body carries
+  // neither «Источник» nor «Задача: <KEY>».
   const threadIds = projectThreadIds(deps, row.project_id);
   const remoteBranch = threadIds
     ? row.branch
-    : `release/${headSha.slice(0, 7)}`;
+    : (row.publish_branch ??
+      deps.store.releasePublishBranch(row.task_key) ??
+      `release/${headSha.slice(0, 7)}`);
   const prs = await ghJson<GhPr[]>(deps, repo, [
     "pr",
     "list",
@@ -1491,16 +1488,27 @@ async function publishRelease(
     remoteBranch,
     `${headSha}:refs/heads/${remoteBranch}`,
   );
-  deps.store.updateRelease(row.id, { publishedSha: headSha });
+  deps.store.updateRelease(row.id, {
+    publishedSha: headSha,
+    publishBranch: remoteBranch,
+  });
   let prUrl = existing?.url ?? null;
   if (!existing) {
-    const task = await runJson<TaskShow>(deps.bbCli, [
-      "tasks",
-      "show",
-      row.task_key,
-      "--json",
-    ]).catch(() => null);
-    const title = task?.task?.title ?? row.task_key;
+    // §16.6: with thread ids off the PR title never carries the task's
+    // title or key — the HEAD commit subject, else `release <sha7>`.
+    const title = threadIds
+      ? ((
+          await runJson<TaskShow>(deps.bbCli, [
+            "tasks",
+            "show",
+            row.task_key,
+            "--json",
+          ]).catch(() => null)
+        )?.task?.title ?? row.task_key)
+      : ((await git(deps, repo, ["log", "-1", "--format=%s", headSha], {
+          allowFail: true,
+        })) ||
+        `release ${headSha.slice(0, 7)}`);
     const created = await ghJson<{ url?: string }>(deps, repo, [
       "pr",
       "create",

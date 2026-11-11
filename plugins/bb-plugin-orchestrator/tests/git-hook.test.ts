@@ -103,10 +103,9 @@ test("hook: expired token → refuse", () => {
   assert.match(r.stderr, /истёк/);
 });
 
-// §16.6 (PLUG-189): a branchless token is legacy-only — valid solely in
-// `push-token.json`; a `push-token-<id>.json` without `branch` is not a
-// token.
-test("hook: legacy branchless push-token.json → pass, consumed", () => {
+// §16.6 (PLUG-191): a token must bind the branch — a branchless token
+// is refused in ANY file, including the legacy `push-token.json` name.
+test("hook: legacy branchless push-token.json → refuse (PLUG-191)", () => {
   const { repo, hooksDir } = makeEnv(true);
   const legacy = join(hooksDir, "push-token.json");
   writeFileSync(
@@ -118,8 +117,9 @@ test("hook: legacy branchless push-token.json → pass, consumed", () => {
     }),
   );
   const r = runHook(repo, hooksDir, LINE + "\n");
-  assert.equal(r.status, 0);
-  assert.equal(existsSync(legacy), false);
+  assert.equal(r.status, 1);
+  assert.equal(existsSync(legacy), true); // not a token — not consumed
+  assert.equal(existsSync(join(repo, "local-ran")), false);
 });
 
 test("hook: branchless push-token-<id>.json is not a token → refuse", () => {
