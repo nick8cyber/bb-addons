@@ -16,7 +16,17 @@ import {
 } from "@get-bb/plugin-sdk";
 import { OrchestratorError, errorJson, toErrorBody } from "./src/errors.js";
 import { parsePolicy, type PolicyLoad } from "./src/policy.js";
-import { DelegationStore, MIGRATIONS, type DelegationRow } from "./src/store.js";
+import {
+  DelegationStore,
+  JanitorStore,
+  MIGRATIONS,
+  type DelegationRow,
+} from "./src/store.js";
+import {
+  parseJanitorConfig,
+  type JanitorConfigLoad,
+} from "./src/janitor-config.js";
+import { createJanitor } from "./src/janitor.js";
 import {
   createBbCli,
   runChecked,
@@ -179,6 +189,14 @@ export async function createPlugin(
       experimental_schema: gitInstructionsSchema,
       default: DEFAULT_GIT_INSTRUCTIONS,
     },
+    janitor: {
+      type: "string",
+      label: "Janitor",
+      description:
+        "Janitor JSON (spec §15): enabled, mode apply|report, afterMerge, abandonedAfter, intervalMinutes, excludeProjects, protectedBranches, deleteBranches. Disabled by default; an invalid document warns in the journal and keeps the janitor off.",
+      experimental_multiline: true,
+      default: '{"enabled": false}',
+    },
   });
 
   let currentSettings = await settings.get();
@@ -186,6 +204,7 @@ export async function createPlugin(
   const db = bb.storage.database();
   bb.storage.migrate(db, [...MIGRATIONS]);
   const store = new DelegationStore(db);
+  const janitorStore = new JanitorStore(db);
   const enqueue = createDelegateQueue();
 
   // The probes behind the §3 executor heuristics; one implementation for
@@ -245,6 +264,14 @@ export async function createPlugin(
   let releaseConfig: ReleaseConfigLoad = parseReleaseConfig(
     currentSettings.release ?? "",
   );
+  const janitorConfig = (): JanitorConfigLoad =>
+    parseJanitorConfig(currentSettings.janitor ?? "");
+  {
+    const l = janitorConfig();
+    for (const e of l.errors) {
+      bb.log.warn(`orchestrator janitor: ${e.path}: ${e.message}`);
+    }
+  }
   /**
    * §2 (rev 13): the background preset check runs at most once per ten
    * minutes, only when the policy text changed since the last check or
@@ -315,6 +342,9 @@ export async function createPlugin(
     currentSettings = next;
     policyLoad = parsePolicy(currentSettings.policy ?? "");
     releaseConfig = parseReleaseConfig(currentSettings.release ?? "");
+    for (const e of janitorConfig().errors) {
+      bb.log.warn(`orchestrator janitor: ${e.path}: ${e.message}`);
+    }
     refreshStatus();
     maybeCheckPresets();
   });
@@ -587,6 +617,64 @@ export async function createPlugin(
     },
   });
 
+  // ── Janitor (§15) ──────────────────────────────────────────────────
+  //
+  // A second background service: the watchdog owns delegation lifecycle,
+  // the janitor owns disk. It ticks every minute and runs a pass when the
+  // configured interval elapsed; the first pass goes right away so a
+  // plugin restart never postpones a due cleanup.
+  const janitor = createJanitor({
+    store,
+    janitor: janitorStore,
+    bbCli,
+    cmd,
+    threads: {
+      send: (a) => bb.sdk.threads.send(a as never) as never,
+    },
+    loadConfig: janitorConfig,
+    log: bb.log,
+  });
+  let janitorBusy = false;
+  let lastJanitorRunAt = 0;
+  const janitorTick = () => {
+    const cfg = janitorConfig().config;
+    if (!cfg?.enabled || janitorBusy) return;
+    if (now() - lastJanitorRunAt < cfg.intervalMinutes * 60_000) return;
+    janitorBusy = true;
+    lastJanitorRunAt = now();
+    void janitor
+      .run()
+      .catch((e) =>
+        bb.log.warn(`orchestrator janitor: ${describeError(e)}`),
+      )
+      .finally(() => {
+        janitorBusy = false;
+      });
+  };
+  bb.background.service("orchestrator-janitor", {
+    start(signal) {
+      // A plugin restart must not replay a due-early pass: the last run's
+      // timestamp survives in janitor_runs.
+      lastJanitorRunAt = Math.max(
+        lastJanitorRunAt,
+        janitorStore.latestRun()?.started_at ?? 0,
+      );
+      const timer = setInterval(janitorTick, 60_000);
+      janitorTick();
+      return new Promise<void>((resolve) => {
+        const stop = () => {
+          clearInterval(timer);
+          resolve();
+        };
+        if (signal.aborted) {
+          stop();
+          return;
+        }
+        signal.addEventListener("abort", stop);
+      });
+    },
+  });
+
   // ── RPC (§13.2 п.1): the composer's «Роль» picker. ─────────────────
   // `projectId = null` is a projectless compose — the default role
   // applies and nothing is stored.
@@ -819,6 +907,11 @@ export async function createPlugin(
         name: "hooks-dir",
         summary: "Directory of the shared pre-push hook + push token",
         usage: "bb orchestrator hooks-dir",
+      },
+      {
+        name: "janitor",
+        summary: "Janitor: merged copy/branch/thread cleanup (§15)",
+        usage: "bb orchestrator janitor [run|report] [--dry-run] [--json]",
       },
     ],
     async run(argv, ctx: PluginCliContext) {
@@ -1081,10 +1174,114 @@ ${res.warnings
               };
         }
 
+        if (cmd === "janitor") {
+          const sub = positional[1] ?? "report";
+          const dryRun = argv.includes("--dry-run");
+          if (sub === "run") {
+            const cfgLoad = janitorConfig();
+            if (cfgLoad.errors.length) {
+              const e = cfgLoad.errors[0]!;
+              throw new OrchestratorError(
+                "janitor-invalid",
+                `janitor config: ${e.path}: ${e.message}`,
+                "fix `bb plugin config orchestrator set janitor '<json>'`",
+              );
+            }
+            if (!cfgLoad.config?.enabled && !dryRun) {
+              throw new OrchestratorError(
+                "janitor-disabled",
+                "the janitor is disabled (janitor.enabled is false)",
+                'enable it via `bb plugin config orchestrator set janitor`' +
+                  " (mode: report first), or run `bb orchestrator janitor run --dry-run`",
+              );
+            }
+            if (janitorBusy) {
+              throw new OrchestratorError(
+                "janitor-busy",
+                "a janitor pass is already running",
+              );
+            }
+            janitorBusy = true;
+            lastJanitorRunAt = now();
+            try {
+              const res = await janitor.run({ dryRun });
+              const keptText = Object.entries(res.kept)
+                .map(([r, n]) => `${r}=${n}`)
+                .join(" ");
+              return json
+                ? jsonOk({ ok: true, ...res })
+                : {
+                    exitCode: 0,
+                    stdout:
+                      `janitor ${res.applied ? "apply" : "report"}: ` +
+                      `removed ${res.removedCopies} copies, ` +
+                      `${res.removedBranches} branches, ` +
+                      `${res.archivedThreads} threads, ` +
+                      `freed ${Math.round(res.freedKb / 1024)} MB, ` +
+                      `ready ${res.ready}` +
+                      (res.orphanBranches
+                        ? `, orphan branches ${res.orphanBranches}`
+                        : "") +
+                      (keptText ? `
+kept: ${keptText}` : "") +
+                      (res.reported.length
+                        ? `
+abandoned: ${res.reported
+                            .map((i) => `${i.branch ?? i.envId} (${i.reason})`)
+                            .join(", ")}`
+                        : "") +
+                      (res.errors.length
+                        ? `\nerrors: ${res.errors.join("; ")}`
+                        : "") +
+                      "\n",
+                  };
+            } finally {
+              janitorBusy = false;
+            }
+          }
+          if (sub === "report") {
+            const rep = await janitor.report();
+            if (json) return jsonOk({ ok: true, ...rep });
+            let out =
+              `janitor: ${
+                rep.config?.enabled
+                  ? `enabled (${rep.config.mode})`
+                  : "disabled"
+              }\n` +
+              (rep.lastRun
+                ? `last run #${rep.lastRun.id}: ` +
+                  `started ${new Date(rep.lastRun.started_at).toISOString()} ` +
+                  `removed=${rep.lastRun.removed} kept=${rep.lastRun.kept} ` +
+                  `freed=${Math.round(rep.lastRun.freed_kb / 1024)} MB` +
+                  (rep.lastRun.error ? ` error=${rep.lastRun.error}` : "") +
+                  "\n"
+                : "no runs yet\n");
+            if (rep.abandoned.length) {
+              out += "abandoned:\n";
+              for (const i of rep.abandoned) {
+                out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"} (${i.reason})\n`;
+              }
+            }
+            const kept = rep.items.filter((i) => i.state === "kept");
+            if (kept.length) {
+              out += "kept:\n";
+              for (const i of kept.slice(0, 20)) {
+                out += `  ${i.env_id} ${i.branch ?? "-"} (${i.reason ?? "-"})\n`;
+              }
+              if (kept.length > 20) out += `  ... and ${kept.length - 20} more\n`;
+            }
+            return { exitCode: 0, stdout: out };
+          }
+          throw new OrchestratorError(
+            "invalid-arguments",
+            `unknown janitor subcommand "${sub}" (run|report)`,
+          );
+        }
+
         throw new OrchestratorError(
           "invalid-arguments",
           `unknown subcommand "${cmd ?? ""}"`,
-          "commands: delegate, status, show, cancel, policy, instructions, reconcile",
+          "commands: delegate, status, show, cancel, policy, instructions, reconcile, janitor",
         );
       } catch (e) {
         return fail(json, e);
