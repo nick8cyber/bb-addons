@@ -16,11 +16,27 @@ if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
   exit 1
 fi
 
-mapfile -t PLUGIN_DIRS < <(
-  git diff --name-only "$BASE"...HEAD \
-    | sed -n 's|^plugins/\([^/]*\)/.*$|plugins/\1|p' \
-    | sort -u
-)
+if ! git merge-base "$BASE" HEAD >/dev/null; then
+  echo "check-changed-plugins: no merge base with $BASE" >&2
+  exit 1
+fi
+
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "check-changed-plugins: working tree is dirty — commit or stash first (only committed changes are checked)" >&2
+  exit 1
+fi
+
+CHANGED=$(git diff --name-only "$BASE"...HEAD) || {
+  echo "check-changed-plugins: git diff failed" >&2
+  exit 1
+}
+
+PLUGIN_DIRS=()
+while IFS= read -r dir; do
+  [ -n "$dir" ] && PLUGIN_DIRS+=("$dir")
+done <<EOF
+$(printf '%s\n' "$CHANGED" | sed -n 's|^plugins/\([^/]*\)/.*$|plugins/\1|p' | sort -u)
+EOF
 
 if [ "${#PLUGIN_DIRS[@]}" -eq 0 ]; then
   echo "check-changed-plugins: no plugins affected vs $BASE — nothing to check"
@@ -50,8 +66,8 @@ for dir in "${PLUGIN_DIRS[@]}"; do
   fi
 
   if [ "$ok" -eq 1 ] && [ -f "$dir/tsconfig.json" ]; then
-    echo "    npx tsc --noEmit"
-    (cd "$dir" && nice -n 19 npx tsc --noEmit) || ok=0
+    echo "    npx --no-install tsc --noEmit"
+    (cd "$dir" && nice -n 19 npx --no-install tsc --noEmit) || ok=0
   fi
 
   if [ "$ok" -eq 1 ]; then

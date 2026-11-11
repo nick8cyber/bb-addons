@@ -302,4 +302,5 @@ Details and upstream attribution: [Server Switcher](plugins/bb-plugin-server-swi
 `scripts/check-changed-plugins.sh [base-ref]` — release gate: runs `npm test`
 and `tsc --noEmit` only in the `plugins/` directories changed vs the base ref
 (default `origin/main`); exits non-zero on any failure, exits 0 when no plugin
-is affected.
+is affected. Requires a clean working tree (untracked files are ignored) — only
+committed changes are checked.
