@@ -130,9 +130,18 @@ export function enforce(form: Element, win: Window, retry = true): void {
         let el = child.parentElement;
         while (el && el !== form && el !== form.ownerDocument.documentElement) {
           const h = el as HTMLElement;
-          const slack = h.getBoundingClientRect().height -
-            child.getBoundingClientRect().height;
-          const want = Math.ceil(needed + Math.max(0, slack));
+          /* Slack = padding + REAL heights of the child's siblings. Measuring
+             ancestor.h − child.h instead fed our own min-height back into the
+             want — a grown floor confirmed itself forever, and when a sibling
+             (e.g. the active-turn status row) collapsed in idle, the held
+             space rendered as a dead gap under the queue card. */
+          let slack = padY(h);
+          for (const sib of Array.from(h.children)) {
+            if (sib !== child) {
+              slack += (sib as HTMLElement).getBoundingClientRect().height;
+            }
+          }
+          const want = Math.ceil(needed + slack);
           if (h.getBoundingClientRect().height < want - 1 || grownAncestors.has(h)) {
             wanted.set(h, want);
           }

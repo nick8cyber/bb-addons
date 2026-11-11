@@ -97,21 +97,27 @@ describe("enforce: expanded queue shows exactly min(N,3) items", () => {
     // queue clamp is unconditional: 1 row still bounded
     expect(scroll.style.maxHeight).toBe("80px");
   });
-  it("grows panel ancestors by the missing delta when scroll is squeezed", () => {
+  it("grows panel ancestors only when constrained, slack from real siblings", () => {
     const { card, scroll, frame } = buildDom({ rows: 2 });
-    // Panel grants only 103px though content needs 140+ — squeeze scroll/frame.
     box(scroll, 0, 103);
     box(frame, 0, 103);
-    // Insert a fixed-height panel ancestor between frame and card.
+    // Tight panel (140) with a 30px sibling bar beside the frame.
     const panel = document.createElement("div");
+    const sibling = document.createElement("div");
+    box(sibling, 0, 30);
     card.removeChild(frame);
+    panel.appendChild(sibling);
     panel.appendChild(frame);
     card.insertBefore(panel, card.firstChild);
-    box(panel, 0, 190);
+    box(panel, 0, 140);
     enforce(card, win);
-    // delta = 140 - 103 = 37 → panel min-height = 190 + 37 = 227
-    expect(panel.style.minHeight).toBe("227px");
-    // second pass clears the grown min-heights when queue collapses
+    // needed 140 + sibling slack 30 = 170 > 140 → grown
+    expect(panel.style.minHeight).toBe("170px");
+    // Sibling collapses (idle state) → slack 0 → want 140 ≤ h → released
+    box(sibling, 0, 0);
+    enforce(card, win);
+    expect(panel.style.minHeight).toBe("140px");
+    // queue collapse → everything cleared
     box(scroll, 0, 0);
     enforce(card, win);
     expect(panel.style.minHeight).toBe("");
