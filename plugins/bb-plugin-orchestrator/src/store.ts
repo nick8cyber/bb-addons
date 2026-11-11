@@ -868,6 +868,53 @@ export class DelegationStore {
   }
 
   /**
+   * §17.2 r26 (PLUG-211 С2/мелко 2): the auto-reissue budget's «заход» is
+   * one reissue CHAIN — the root dispatch (`reissue_of` NULL) plus every
+   * row reissued from it. Round numbers are no longer one-per-chain:
+   * review and release-audit dispatches share the executor's round space
+   * but form their own chains, so their route reserve counts separately
+   * and never eats the executor round's budget (or vice versa).
+   * `reissuesOnly` mirrors `routesUsedByTask` — only routes an
+   * auto-reissue already burned; without it every route of the chain
+   * counts (the explicit --route/--preset restart rule).
+   */
+  chainUsedRoutes(
+    row: DelegationRow,
+    opts: { reissuesOnly?: boolean } = {},
+  ): Set<string> {
+    const rows = this.delegationsByTask(row.task_key);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const rootOf = (r: DelegationRow): number => {
+      let cur = r;
+      const seen = new Set<number>();
+      while (cur.reissue_of != null && !seen.has(cur.reissue_of)) {
+        seen.add(cur.reissue_of);
+        const prev = byId.get(cur.reissue_of);
+        if (!prev) break;
+        cur = prev;
+      }
+      return cur.id;
+    };
+    const root = rootOf(row);
+    return new Set(
+      rows
+        .filter((r) => !opts.reissuesOnly || r.reissue_of != null)
+        .filter((r) => rootOf(r) === root)
+        .map((r) => r.route),
+    );
+  }
+
+  /** Rows whose `setup_errors` carry an entry for `step` — the §7 scans
+   * (e.g. `notify-muted` marks needing the `auto` restore, §17.2 r26). */
+  listBySetupError(step: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE setup_errors LIKE ? ORDER BY id`,
+      )
+      .all(`%"step":"${step}"%`) as DelegationRow[];
+  }
+
+  /**
    * §5.4 reissue in one transaction: the old row moves to `reissued` and a
    * new `dispatching` row with `reissue_of` is inserted atomically, so a
    * service restart mid-reissue cannot leave a duplicate. Returns the new
@@ -1119,6 +1166,30 @@ export class DelegationStore {
            role = excluded.role, updated_at = excluded.updated_at`,
       )
       .run(projectId, role, Date.now());
+  }
+
+  /** All recorded thread roles, optionally filtered — the §17.1 r26
+   * migration's scope (hook-written `orchestrator` rows). */
+  listThreadRoles(
+    filter: { role?: string; source?: ThreadRoleSource } = {},
+  ): ThreadRoleRow[] {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (filter.role) {
+      where.push("role = ?");
+      args.push(filter.role);
+    }
+    if (filter.source) {
+      where.push("source = ?");
+      args.push(filter.source);
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM thread_roles` +
+          (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
+          ` ORDER BY thread_id`,
+      )
+      .all(...args) as ThreadRoleRow[];
   }
 
   /** The decided role of a thread, when the hook or delegate recorded it. */

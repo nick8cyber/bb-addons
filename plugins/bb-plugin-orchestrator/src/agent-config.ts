@@ -18,9 +18,12 @@ import type {
   PluginAgentConfigurationContext,
 } from "@get-bb/plugin-sdk";
 import {
+  DEFAULT_USER_THREAD_PLUGINS,
+  NO_ROLE,
   ROLES,
   type RoleId,
 } from "./roles.js";
+import type { DelegationStore } from "./store.js";
 
 export const COORDINATOR_TOOLS = [
   "orchestrator_delegate",
@@ -70,6 +73,17 @@ export interface ExecutorProbes {
    * through to the fallback criterion.
    */
   roleByThreadId?(threadId: string): string | undefined;
+  /**
+   * §17.1 r26 (PLUG-211 Б1): the lazy-rewrite sink — a stale `orchestrator`
+   * row on a plugin-born thread is corrected to `none` on sight.
+   */
+  writeRole?(threadId: string, role: string): void;
+  /**
+   * §17.1 r26 (PLUG-211 Б2): plugin ids whose threads continue a human
+   * chat — they are not "plugin-born" for the role rule. Absent probe =
+   * the default `["handoff"]`.
+   */
+  userThreadPlugins?(): readonly string[];
 }
 
 /**
@@ -77,14 +91,22 @@ export interface ExecutorProbes {
  * thing that failed (the §3 resilience rule: on error, fall back to the
  * cheapest facts we can compute and warn in the log).
  */
-export function isCoordinatorByStaticFacts(facts: ThreadFacts): boolean {
+export function isCoordinatorByStaticFacts(
+  facts: ThreadFacts,
+  userThreadPlugins: readonly string[] = DEFAULT_USER_THREAD_PLUGINS,
+): boolean {
   if (facts.parentThreadId !== null && facts.parentThreadId !== undefined) {
     return false;
   }
   // §17.1 (аудит Б3): a plugin-born thread — `tasks` dispatch included —
   // is never a default coordinator; it carries no dispatch tools or
-  // coordinator instructions.
-  if (facts.originPluginId !== null && facts.originPluginId !== undefined) {
+  // coordinator instructions. §17.1 r26 (PLUG-211 Б2): except a
+  // userThreadPlugins plugin — its thread IS the continued human chat.
+  if (
+    facts.originPluginId !== null &&
+    facts.originPluginId !== undefined &&
+    !userThreadPlugins.includes(facts.originPluginId)
+  ) {
     return false;
   }
   if (facts.title && DISPATCH_TITLE_RE.test(facts.title)) return false;
@@ -95,6 +117,32 @@ export function isCoordinatorByStaticFacts(facts: ThreadFacts): boolean {
 const roleDelegates = (roleId: string): boolean =>
   ROLES[roleId as RoleId]?.delegates === true;
 
+/**
+ * §17.1 r26 (PLUG-211 Б1): the recorded role, with the lazy rewrite — a
+ * stale `orchestrator` row on a plugin-born thread outside
+ * `userThreadPlugins` predates the r26 rule; the verdict the hook would
+ * write today is `none`, so the row is corrected on sight (the one-time
+ * `migratePluginThreadRoles` pass covers what configure never reaches).
+ */
+export function effectiveRoleId(
+  facts: ThreadFacts,
+  probes: ExecutorProbes,
+): string | undefined {
+  const roleId = probes.roleByThreadId?.(facts.threadId);
+  const userPlugins =
+    probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
+  if (
+    roleId === "orchestrator" &&
+    facts.originPluginId !== null &&
+    facts.originPluginId !== undefined &&
+    !userPlugins.includes(facts.originPluginId)
+  ) {
+    probes.writeRole?.(facts.threadId, NO_ROLE);
+    return NO_ROLE;
+  }
+  return roleId;
+}
+
 export function isCoordinator(
   facts: ThreadFacts,
   probes: ExecutorProbes,
@@ -102,9 +150,16 @@ export function isCoordinator(
 ): boolean {
   // §3/§13: a recorded role answers by `delegates`; only threads without a
   // `thread_roles` row fall back to the executor markers.
-  const roleId = probes.roleByThreadId?.(facts.threadId);
+  const roleId = effectiveRoleId(facts, probes);
   if (roleId !== undefined) return roleDelegates(roleId);
-  if (!isCoordinatorByStaticFacts(facts)) return false;
+  if (
+    !isCoordinatorByStaticFacts(
+      facts,
+      probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS,
+    )
+  ) {
+    return false;
+  }
   if (probes.delegationByThreadId(facts.threadId)) return false;
   if (
     probes.hasFreshDispatching(now - FRESH_DISPATCHING_WINDOW_MS, {
@@ -143,8 +198,9 @@ export function buildAgentConfiguration(
     projectId: context.project.id,
   };
   // §13.2 п.3: `configure` only reads `thread_roles` — it never writes a
-  // decision. No row → the §3 fallback criterion.
-  const roleId = deps.probes.roleByThreadId?.(facts.threadId);
+  // decision (the §17.1 r26 lazy rewrite in `effectiveRoleId` is a
+  // correction, not a decision). No row → the §3 fallback criterion.
+  const roleId = effectiveRoleId(facts, deps.probes);
   const role = roleId !== undefined ? ROLES[roleId as RoleId] : undefined;
   const coordinator =
     roleId !== undefined
@@ -199,14 +255,19 @@ export function fallbackAgentConfiguration(
   instructionsText: string,
   /** §16.7: `false` → a coordinator gets the setup skill only. */
   policyOk: boolean = true,
+  /** §17.1 r26 (PLUG-211 Б2): user-continuation plugin ids. */
+  userThreadPlugins: readonly string[] = DEFAULT_USER_THREAD_PLUGINS,
 ): PluginAgentConfiguration {
-  const coordinator = isCoordinatorByStaticFacts({
-    threadId: context.thread.id,
-    parentThreadId: context.thread.parentThreadId,
-    title: context.thread.title,
-    originPluginId: context.origin.pluginId,
-    projectId: context.project.id,
-  });
+  const coordinator = isCoordinatorByStaticFacts(
+    {
+      threadId: context.thread.id,
+      parentThreadId: context.thread.parentThreadId,
+      title: context.thread.title,
+      originPluginId: context.origin.pluginId,
+      projectId: context.project.id,
+    },
+    userThreadPlugins,
+  );
   if (!coordinator) return { tools: [], skills: [] };
   if (!policyOk) return { tools: [], skills: [SKILL_SETUP] };
   const config: PluginAgentConfiguration = {
@@ -223,4 +284,51 @@ export function fallbackAgentConfiguration(
 ${instructionsText}`;
   }
   return config;
+}
+
+/**
+ * §17.1 r26 (PLUG-211 Б1): the one-time rewrite — hook-decided
+ * `orchestrator` rows on plugin-born threads outside `userThreadPlugins`
+ * become the `none` verdict the hook would write today. `configure`'s
+ * lazy fix covers rows this pass cannot reach; the caller marks the pass
+ * in `plugin_meta`. Rows whose origin lookup fails are skipped (next
+ * configure still fixes them lazily when the thread lives).
+ */
+export async function migratePluginThreadRoles(
+  store: DelegationStore,
+  opts: {
+    threadOriginPluginId(
+      threadId: string,
+    ): Promise<string | null | undefined>;
+    userThreadPlugins?: readonly string[];
+    log?: { warn?(message: string): void };
+  },
+): Promise<number> {
+  const userPlugins = opts.userThreadPlugins ?? DEFAULT_USER_THREAD_PLUGINS;
+  let moved = 0;
+  for (const row of store.listThreadRoles({
+    role: "orchestrator",
+    source: "hook",
+  })) {
+    let pluginId: string | null | undefined;
+    try {
+      pluginId = await opts.threadOriginPluginId(row.thread_id);
+    } catch (e) {
+      opts.log?.warn?.(
+        `orchestrator: role migration ${row.thread_id}: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+      continue;
+    }
+    if (
+      pluginId &&
+      pluginId !== "mixed" &&
+      !userPlugins.includes(pluginId)
+    ) {
+      store.setThreadRole(row.thread_id, NO_ROLE, "hook");
+      moved++;
+    }
+  }
+  return moved;
 }

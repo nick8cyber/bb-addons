@@ -4857,3 +4857,169 @@ test("§17.2 (мелко 1): result_commits counts from continue_from, not the b
   assert.equal(fresh.status, "done");
   assert.equal(fresh.result_commits, 1, "only this round's commits count");
 });
+
+test("§17.2 r26 (PLUG-211 Б4): a failed `auto` restore keeps the mark — reconcile restores it", async () => {
+  // `thread update ... auto` fails once — as if the plugin restarted
+  // between the confirmed stop and the delivery restore.
+  let autoFails = 1;
+  const h = makeHarness({
+    cli: (args) => {
+      if (
+        args.join(" ") ===
+          "thread update thr_e1 --parent-notifications auto" &&
+        autoFails-- > 0
+      ) {
+        return { exitCode: 1, stdout: "", stderr: "update failed" };
+      }
+      return undefined;
+    },
+  });
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: one" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  // the stop confirmed but `auto` failed — the thread stays muted and
+  // the row carries the notify-muted mark (written BEFORE `off`)
+  assert.equal(
+    h.threadDtos.get("thr_e1")!.parentNotifications,
+    "off",
+    "delivery stayed muted",
+  );
+  assert.ok(
+    h.store.findSetupError(h.store.get(row.id)!, "notify-muted"),
+    "the mark stands while muted",
+  );
+  // restart/reconcile: the §7 pass restores `auto` and clears the mark
+  await h.wd.reconcile();
+  assert.equal(h.threadDtos.get("thr_e1")!.parentNotifications, "auto");
+  assert.equal(
+    h.store.findSetupError(h.store.get(row.id)!, "notify-muted"),
+    undefined,
+  );
+});
+
+test("§17.2 r26 (PLUG-211 Б4): a gone thread's mark is just cleared", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_gone" });
+  h.store.setStatus(row.id, "done");
+  h.store.addSetupError(row.id, "notify-muted", "thr_gone");
+  // no DTO — the thread is gone; the §7 pass drops the mark without a
+  // thread update call
+  const s = await h.wd.reconcile();
+  assert.equal(
+    h.store.findSetupError(h.store.get(row.id)!, "notify-muted"),
+    undefined,
+  );
+  assert.equal(
+    h.calls.filter((c) => c.join(" ").includes("parent-notifications"))
+      .length,
+    0,
+  );
+});
+
+test("§17.2 r26 (PLUG-211 С1): a compaction behind a flood of item/completed is still found", async () => {
+  const h = makeHarness();
+  h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // first sight seeds the cursor at the journal tip
+  h.eventLog.set("thr_coord", [ev(1, "turn/started", T0)]);
+  await h.wd.reconcile();
+  // then a compaction + 60 ordinary item/completed — the old fixed
+  // `desc limit 50` by-types window would have lost the compaction
+  const log = [ev(2, "thread/compacted", T0 + 1000)];
+  for (let i = 0; i < 60; i++) {
+    log.push(
+      ev(3 + i, "item/completed", T0 + 2000 + i * 100, {
+        item: { type: "agentMessage" },
+      }),
+    );
+  }
+  h.eventLog.set("thr_coord", log);
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter(
+      (x) =>
+        x.threadId === "thr_coord" &&
+        /сжат/.test(JSON.stringify(x.input)),
+    ).length,
+    1,
+    "the cursor scan by types finds the buried compaction",
+  );
+  await h.wd.reconcile(); // no repeat
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    1,
+  );
+});
+
+test("§17.2 r26 (PLUG-211 С4): a refused reissue comments the reason exactly once", async () => {
+  const h = makeHarness({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks dispatch"))
+        return { exitCode: 1, stdout: "", stderr: "preset gone" };
+      if (key.startsWith("tasks threads"))
+        return ok(JSON.stringify({ taskThreads: [] }));
+      return ok();
+    },
+  });
+  const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.db
+    .prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`)
+    .run(T0 - 6 * 60_000, row2.id);
+  await h.wd.reconcile();
+  const comments = h.calls.filter((c) =>
+    c.join(" ").startsWith("tasks comment PLUG-1"),
+  );
+  assert.equal(
+    comments.length,
+    1,
+    "the watchdog's report comments the refusal — dispatchToRoute must not add a second",
+  );
+});
+
+test("§17.2 r26 (PLUG-211 С3): no branch start point → commits stays null, no «коммитов нет»", async () => {
+  const repo = makeExecutorRepo({ commits: 1 });
+  // wipe the branch reflog — no `continue_from` AND no
+  // `branch: Created from` anchor → the start point is unknown
+  execFileSync("git", [
+    "-C",
+    repo,
+    "reflog",
+    "expire",
+    "--expire=now",
+    "refs/heads/exec-branch",
+  ]);
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(
+    fresh.result_commits,
+    null,
+    "no start point — the count is unknown, not 0",
+  );
+  assert.doesNotMatch(fresh.setup_errors, /коммитов нет/);
+});

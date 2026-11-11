@@ -1195,3 +1195,62 @@ test("§17.2 (мелко 4): the reissue route budget is per round, not per task
   );
   assert.ok(r2b.id > r1b.id);
 });
+
+test("§17.2 r26 (PLUG-211 С2/мелко 2): the reissue reserve counts one reissue CHAIN", () => {
+  const { store } = makeDeps();
+  // executor chain at round 1: root `simple`, its auto-reissue burned
+  // `simple-alt`
+  const exec = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    round: 1,
+  });
+  store.setStatus(exec.id, "stalled");
+  const re1 = store.reissue(exec.id, {
+    route: "simple-alt",
+    preset: "preset-alt",
+    provider: "agy",
+  })!;
+  store.setStatus(re1.id, "stalled");
+  // a review chain in the SAME round number — review and audit rows
+  // share the executor's round space (§17.2 e2e 2) but form their own
+  // chain: their burned route must not eat the executor's reserve.
+  const review = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "review",
+    route: "strict",
+    preset: "strict",
+    provider: "p",
+    round: 1,
+  });
+  store.setStatus(review.id, "stalled");
+  const re2 = store.reissue(review.id, {
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+  })!;
+  store.setStatus(re2.id, "stalled");
+
+  assert.deepEqual(
+    [...store.chainUsedRoutes(store.get(re1.id)!, { reissuesOnly: true })].sort(),
+    ["simple-alt"],
+    "the executor chain sees only its own auto-reissues — the review's `simple` reissue does not eat its reserve",
+  );
+  assert.deepEqual(
+    [...store.chainUsedRoutes(store.get(re2.id)!, { reissuesOnly: true })].sort(),
+    ["simple"],
+    "the review chain counts its own reissue",
+  );
+  assert.deepEqual(
+    [...store.chainUsedRoutes(store.get(re1.id)!)].sort(),
+    ["simple", "simple-alt"],
+    "the explicit-restart rule counts the whole chain (root included)",
+  );
+});

@@ -50,8 +50,9 @@ import type { DelegationRow, DelegationStore } from "./store.js";
 
 /**
  * §14 check 3 — protected branches refuse `merge` (code goes out through
- * `release` instead). Default list per spec; TODO(PLUG-174): read the
- * `janitor.protectedBranches` setting once the janitor config lands.
+ * `release` instead). The effective list comes from the janitor
+ * `protectedBranches` setting via `MergeDeps.protectedBranches` (§17.3);
+ * this constant is only the fallback when the setting is unset.
  */
 export const DEFAULT_PROTECTED_BRANCHES = ["main", "master", "dev"] as const;
 
@@ -119,6 +120,13 @@ export interface MergeDeps {
    * notice must re-check a fresh row instead of answering `not-found`.
    */
   syncRow?(row: DelegationRow): Promise<void>;
+  /**
+   * §17.2 r26 (PLUG-211 Б3): which levels count as the executor whose
+   * NEWEST delegation a task ref is judged by — review and release-audit
+   * rows share the task's delegation list but are never merge targets.
+   * Absent dep = every level counts.
+   */
+  isExecutorLevel?(level: string): boolean;
   protectedBranches?: readonly string[];
   /** §16.6 `mergeAutofix` setting — off by default (report only). */
   mergeAutofix?: () => boolean;
@@ -210,21 +218,48 @@ export async function runMerge(
   const { store } = deps;
   const ref = params.ref.trim();
 
-  let row = /^\d+$/.test(ref)
+  const numeric = /^\d+$/.test(ref);
+  let row = numeric
     ? store.get(Number(ref))
     : store.latestDoneResultByTask(ref);
-  // §17.2 (e2e 1): BB's child-completed notice lands seconds before the
-  // watchdog writes `done` — sync the task's newest delegation and
-  // re-resolve instead of answering `not-found` on a finished round.
-  if (!row && !/^\d+$/.test(ref) && deps.syncRow) {
-    const latest = store.delegationsByTask(ref)[0];
+  if (!numeric) {
+    // §17.2 (e2e 1 + PLUG-211 Б3): a task ref is judged by the NEWEST
+    // executor delegation of any round — BB's outcome notice reaches the
+    // coordinator seconds before the watchdog writes `done`, and a merge
+    // issued on that notice must sync/answer by the newest round, not
+    // echo the previous one's record (`already-merged` of round 1 while
+    // round 2 still runs, or round 1's result after round 2 finished).
+    const latest = store
+      .delegationsByTask(ref)
+      .find((r) => deps.isExecutorLevel?.(r.level) ?? true);
     if (latest) {
-      await deps.syncRow(latest).catch(() => {});
-      row = store.latestDoneResultByTask(ref);
+      let fresh = latest;
+      if (
+        (latest.status === "dispatching" || latest.status === "running") &&
+        deps.syncRow
+      ) {
+        await deps.syncRow(latest).catch(() => {});
+        fresh = store.get(latest.id) ?? latest;
+      }
+      if (fresh.status === "done") {
+        row = fresh;
+      } else if (
+        fresh.status === "dispatching" ||
+        fresh.status === "running"
+      ) {
+        throw new OrchestratorError(
+          "not-done",
+          `делегирование ${fresh.id} ещё ${fresh.status}, итога нет`,
+          "merge works on finished rounds — see `bb orchestrator status`",
+        );
+      }
+      // Terminal non-done (failed/cancelled/stalled/quota): the newest
+      // FINISHED round stays the merge target — `row` from
+      // latestDoneResultByTask above.
     }
   }
   if (!row) {
-    const latest = /^\d+$/.test(ref)
+    const latest = numeric
       ? undefined
       : store.delegationsByTask(ref)[0];
     if (latest) {

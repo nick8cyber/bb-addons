@@ -379,7 +379,12 @@ export async function runDelegate(
   try {
     res = await dispatchToRoute(
       row,
-      { instructions: params.instructions, levelNote },
+      {
+        instructions: params.instructions,
+        levelNote,
+        // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
+        commentOnRefusal: true,
+      },
       { ...deps, policy: () => policy },
     );
   } catch (e) {
@@ -444,6 +449,14 @@ export async function dispatchToRoute(
      * vanish (§5.4 rev 13).
      */
     onDispatchFailure?: "remove" | "fail";
+    /**
+     * §17.2 (e2e 6 + PLUG-211 С4): write the dispatch refusal to the
+     * task — only for CALLER-INITIATED dispatches (manual delegate,
+     * release audit). The watchdog's reissue path reports the refusal
+     * through `report`, which already comments the task; both would
+     * double the reason in the task trail.
+     */
+    commentOnRefusal?: boolean;
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
@@ -487,20 +500,23 @@ export async function dispatchToRoute(
   if (dispatchRes.exitCode !== 0 && !dispatchRes.timedOut) {
     const detail =
       dispatchRes.stderr.trim() || dispatchRes.stdout.trim() || "no output";
-    // §17.2 (e2e 6): an undispatchable route (bad reasoning level, removed
-    // model) leaves its reason as a task comment — before, it was visible
-    // only in the coordinator's answer and the task trail had nothing.
-    try {
-      await runChecked(bbCli, [
-        "tasks",
-        "comment",
-        row.task_key,
-        "--body",
-        `раздача на ${row.route} отклонена (exit ${dispatchRes.exitCode}): ` +
-          detail.slice(0, 500),
-      ]);
-    } catch {
-      // A failed comment must not hide the dispatch refusal itself.
+    // §17.2 (e2e 6 + PLUG-211 С4): an undispatchable route (bad reasoning
+    // level, removed model) leaves its reason as a task comment — once.
+    // The watchdog reissue path skips this (its `report` comments the
+    // task itself); only caller-initiated dispatches opt in.
+    if (opts.commentOnRefusal) {
+      try {
+        await runChecked(bbCli, [
+          "tasks",
+          "comment",
+          row.task_key,
+          "--body",
+          `раздача на ${row.route} отклонена (exit ${dispatchRes.exitCode}): ` +
+            detail.slice(0, 500),
+        ]);
+      } catch {
+        // A failed comment must not hide the dispatch refusal itself.
+      }
     }
     if (opts.onDispatchFailure === "fail") {
       store.setStatus(row.id, "failed");

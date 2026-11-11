@@ -66,7 +66,7 @@ const ORCHESTRATOR_INSTRUCTIONS = `Ты — оркестратор. Твоя р�
 - Ветку и рабочую копию исполнителя не открывай в других копиях: итог захода снимает плагин.
 - Свои поллеры поверх сторожа не ставь: исходы (зависание, квота, падение, перевыпуск) приходят сообщениями [orchestrator].
 - Не раздавай вручную (bb tasks dispatch, bb thread spawn) — только delegate.
-- Машину вне рабочих копий не меняй: ни sudo, ни установки пакетов, ни настроек хоста — чего-то не хватает, сообщи пользователю.`;
+- Машину вне рабочих копий не меняй: ни sudo, ни установки пакетов, ни настроек хоста — чего-то не хватает, сообщи пользователю (он и есть координатор этого чата).`;
 
 const EXECUTOR_INSTRUCTIONS = `Ты — исполнитель. Твоя роль — выполнить поставленную задачу самостоятельно.
 
@@ -191,12 +191,23 @@ export interface RoleDecisionProbes {
    * Absent probe = behave as before (valid, name-based role mapping).
    */
   policy?(): Policy | null;
+  /**
+   * §17.1 r26 (PLUG-211 Б2): plugin ids whose threads continue a human
+   * chat (session handoff) — their thread inherits the source role, or
+   * takes the orchestrator default without a decidable source. Absent
+   * probe = the default `["handoff"]`.
+   */
+  userThreadPlugins?(): readonly string[];
 }
 
 /** §17.1: the recorded "no orchestrator role" verdict for plugin-/sdk-
  * born threads — the row keeps the §3 fallback criterion from issuing
  * coordinator tools to them at `configure` (audit Б3). */
 export const NO_ROLE = "none";
+
+/** §17.1: plugins continuing a human chat when the `userThreadPlugins`
+ * setting is unset. */
+export const DEFAULT_USER_THREAD_PLUGINS = ["handoff"] as const;
 
 /**
  * §13.2 п.2 — the role rule, evaluated strictly in the spec's branch order.
@@ -211,6 +222,13 @@ export function decideRole(
   if (facts.status !== "pending") return null;
   if (probes.threadRole(facts.threadId)) return null;
 
+  // §16.7: while the policy is invalid a root chat gets no role.
+  const policyOk =
+    probes.policy === undefined || probes.policy() !== null;
+  // §17.1 r26 (PLUG-211 Б2): plugins that continue a human chat.
+  const userPlugins =
+    probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
+
   // 1. A thread created by `bb tasks dispatch` is an executor; its level
   //    decides auditor vs executor.
   if (facts.originPluginId === "tasks") {
@@ -224,13 +242,18 @@ export function decideRole(
     const source = probes.threadRole(facts.sourceThreadId);
     if (source && isRoleId(source.role)) return source.role;
   }
+  // §17.1 r26 (PLUG-211 Б2): a user-continuation plugin's thread IS a
+  //    human chat — the source's role already applied when decidable;
+  //    without it the thread gets the orchestrator default, like a chat
+  //    opened from the window (`policyOk` gates it the same way).
+  if (facts.originPluginId && userPlugins.includes(facts.originPluginId)) {
+    return policyOk ? DEFAULT_ROLE : null;
+  }
   // 3. Any other child thread executes.
   if (facts.parentThreadId) return "executor";
   // 4. A chat from the new-thread window takes the project's current pick.
   //    §16.7: while the policy is invalid the DEFAULT is no role — an
   //    explicit pick still applies, the setup skill alone is issued.
-  const policyOk =
-    probes.policy === undefined || probes.policy() !== null;
   if (facts.origin === "app") {
     const pending = probes.pendingRole(facts.projectId);
     // §16.7 (PLUG-182): the new-chat window writes `orchestrator` itself
