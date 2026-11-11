@@ -18,14 +18,18 @@
  * copy no longer exists. Squash/rebase merges get a second mergedness
  * signal: `git cherry origin/<base> <branch>` with no `+` lines — and,
  * because cherry ignores merge commits, `git merge-tree --write-tree`
- * must produce the target's own tree. Own commits are counted only from
- * reflog entries that create commits (`commit*`, `cherry-pick`,
- * `revert`, `rebase (finish)` — the latter only when the new tip differs
- * from the `onto` base, a commit-less rebase is a fast-forward) —
- * fast-forwards, resets and checkouts never count. Detached-HEAD
- * commits unreachable from every ref keep the copy, or report it once
- * abandoned; commits made on a branch (the amend/rebase orphans they
- * leave in the HEAD reflog included) do not count.
+ * must produce the target's own tree. Own commits are the *reachable*
+ * commits of the copy's branch: `rev-list <base>..<tip>` where <base>
+ * is the position of the newest reflog entry that moved the ref
+ * without creating commits (checkout/reset/fast-forward/`rebase
+ * (finish) onto <X>`), falling back to the «Created from» entry —
+ * fast-forwards and commit-less rebases count 0. «Ничего не
+ * теряется»: every commit the copy's HEAD or its branch ever pointed
+ * at (the whole `git log -g`) is either an ancestor of a remote target
+ * or patch-equivalent to a commit on it — one that is neither (a
+ * `reset`-orphaned or detached commit, an unpublished pre-amend
+ * version) keeps the copy (`unpushed-commits`), or reports it once
+ * abandoned.
  *
  * §16.4: on `thread.archived` of an executor whose copy is still dirty,
  * the state is saved into `refs/orchestrator/rescue/<thr>` (stash object
@@ -74,6 +78,24 @@ const GIT_TIMEOUT_MS = 30_000;
  */
 const QUIESCENT_THREAD_STATUSES = new Set(["idle", "error"]);
 const BRANCH_PREFIX = "bb/";
+/**
+ * Kept-reasons meaning «could not evaluate», not a real env state —
+ * they never clear the announced-abandoned list (§15, PLUG-192): a
+ * transient failure must not cause the same env to be announced again.
+ */
+const TRANSIENT_KEEPS = new Set([
+  "fetch-failed",
+  "threads-unknown",
+  "not-a-repo",
+  "missing-path",
+  "no-head",
+  "status-failed",
+  "unfinished-unknown",
+  "unpushed-unknown",
+  "archive-failed",
+  "cascade-env-external",
+  "interactions-pending",
+]);
 
 export interface JanitorLog {
   info?(message: string): void;
@@ -411,62 +433,61 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
-   * §16.3 cond 2: the copy's own commits — reflog entries of its branch
-   * that *create* commits (`commit`, `commit (amend|merge|initial|…)`,
-   * `cherry-pick`, `revert`, `rebase (finish)`). Fast-forwards
-   * (`merge …: Fast-forward`, `pull`), `reset` and `checkout` only move
-   * the ref — an `ff-only` sync with `origin/<base>` is not own work.
-   * No reflog data at all → no own commits, per spec.
+   * §16.3 cond 2 (ревизия 25): the copy's own commits — only *reachable*
+   * ones, `rev-list --count <base>..<tip>` of the copy's branch. <base>
+   * is the position of the newest reflog entry that moved the ref
+   * without creating commits: `checkout`, `reset`, `merge …:
+   * Fast-forward`, `rebase (finish)` (its `onto` base), the «Created
+   * from» entry itself. Commit-creating entries (`commit`, `commit
+   * (…)`, `cherry-pick`, `revert`, `merge …: Merge made`) are own work —
+   * the boundary lies below them. A fast-forward sync or a commit-less
+   * rebase therefore counts 0; a commit discarded by `reset` is not
+   * reachable and counts 0 either (the «nothing lost» check below is
+   * what then keeps the copy). No reflog data at all → no own commits.
    */
   const OWN_COMMIT_ACTION =
-    /^(?:commit(?:\s*\([^)]*\))?:|cherry-pick:|revert:|rebase \(finish\))/;
+    /^(?:commit(?:\s*\([^)]*\))?:|cherry-pick:|revert:|merge .*: Merge made)/;
   const REBASE_ONTO = /^rebase \(finish\).*onto (\S+)/;
-  const DETACHED_CREATOR =
-    /^(?:commit(?:\s*\([^)]*\))?:|cherry-pick:|revert:|rebase \((?:pick|merge|squash|fixup|finish)\)|merge .*: Merge made)/;
   const countOwnCommits = async (
     env: EnvDto,
     path: string,
     ownBranch: string | undefined,
   ): Promise<number> => {
-    const ref = ownBranch?.trim() || env.branchName?.trim() || "HEAD";
+    const ref = ownBranch?.trim() || env.branchName?.trim();
+    if (!ref) return 0;
     const reflog = await gitOut(deps.cmd, path, [
-      "reflog",
-      "show",
-      ref,
+      "log",
+      "-g",
       "--format=%H%x00%gs",
+      `refs/heads/${ref}`,
     ]);
     if (!reflog) return 0;
-    let count = 0;
-    const rebases: { onto: string; sha: string }[] = [];
-    for (const line of reflog.split("\n")) {
+    const lines = reflog.split("\n").filter((l) => l.includes("\0"));
+    let base: string | undefined;
+    for (const line of lines) {
+      // newest → oldest: the first pure move bounds the own-work range
       const sep = line.indexOf("\0");
-      if (sep < 0) continue;
       const sha = line.slice(0, sep);
       const subject = line.slice(sep + 1).trim();
-      if (!OWN_COMMIT_ACTION.test(subject)) continue;
-      const onto = REBASE_ONTO.exec(subject)?.[1];
-      if (onto) rebases.push({ onto, sha });
-      else count += 1;
+      if (OWN_COMMIT_ACTION.test(subject)) continue;
+      base = REBASE_ONTO.exec(subject)?.[1] ?? sha;
+      break;
     }
-    // §16.3: «rebase (finish) … onto <X>» counts as own work only when the
-    // new tip differs from <X> — rebasing a commit-less branch
-    // fast-forwards it to <X> itself, a перемотка, not a commit. The
-    // reflog writes the resolved sha, so a prefix compare catches the
-    // common case; `rev-list <X>..<tip>` is the exact count. An
-    // unresolvable <X> proves nothing — contribute zero (stay kept).
-    for (const { onto, sha } of rebases) {
-      if (sha === onto || sha.startsWith(onto)) continue;
-      const n = (
-        await gitOut(deps.cmd, path, [
-          "rev-list",
-          "--count",
-          `${onto}..${sha}`,
-        ])
-      )?.trim();
-      if (n === undefined) continue;
-      count += Number(n) || 0;
+    if (!base) {
+      // A reflog with no move at all (no «Created from») is anomalous —
+      // every entry created commits, so there is own work by count.
+      return lines.filter((l) =>
+        OWN_COMMIT_ACTION.test(l.slice(l.indexOf("\0") + 1).trim()),
+      ).length;
     }
-    return count;
+    const n = (
+      await gitOut(deps.cmd, path, [
+        "rev-list",
+        "--count",
+        `${base}..${ref}`,
+      ])
+    )?.trim();
+    return Number(n) || 0;
   };
 
   /**
@@ -518,6 +539,80 @@ export function createJanitor(deps: JanitorDeps) {
     return false;
   };
 
+  /**
+   * §16.3 (ревизия 25) «ничего не теряется»: read the whole reflog of
+   * the copy's HEAD (per-worktree) and of the copy's own branches —
+   * `branchName` plus the checked-out one when it differs — and require
+   * every commit they ever pointed at to be an ancestor of a remote
+   * target or patch-equivalent to a commit on it (the `git cherry`
+   * `patch-id --stable` comparison inside `shaMergedIn`). «ok» — the
+   * reflogs hold nothing unpublished; «lost» — at least one commit
+   * would die with the copy; «unknown» — a reflog or the reachability
+   * scan could not be read, so nothing is proven and the copy stays.
+   * The repo's other branches are never scanned — that would multiply
+   * every copy's git calls by the branch count.
+   */
+  const nothingLost = async (
+    env: EnvDto,
+    path: string,
+    ownBranch: string | undefined,
+    repoRoot: string,
+    targets: string[],
+  ): Promise<"ok" | "lost" | "unknown"> => {
+    const refs = ["HEAD"];
+    for (const b of [env.branchName?.trim(), ownBranch?.trim()]) {
+      if (!b) continue;
+      const ref = `refs/heads/${b}`;
+      if (refs.includes(ref)) continue;
+      // A branch that does not exist has no positions to protect.
+      if (
+        await gitOk(deps.cmd, path, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          ref,
+        ])
+      ) {
+        refs.push(ref);
+      }
+    }
+    const shas = new Set<string>();
+    for (const ref of refs) {
+      const out = await gitOut(deps.cmd, path, [
+        "log",
+        "-g",
+        "--format=%H",
+        ref,
+      ]);
+      if (out === null) return "unknown";
+      for (const l of out.split("\n")) {
+        const s = l.trim();
+        if (s) shas.add(s);
+      }
+    }
+    // Positions already reachable from a target are proven published —
+    // drop them in one rev-list pass, then patch-check the remainder.
+    const pending = new Set<string>();
+    const list = [...shas];
+    for (let i = 0; i < list.length; i += 200) {
+      const out = await gitOut(deps.cmd, repoRoot, [
+        "rev-list",
+        ...list.slice(i, i + 200),
+        "--not",
+        ...targets,
+      ]);
+      if (out === null) return "unknown";
+      for (const l of out.split("\n")) {
+        const s = l.trim();
+        if (s && shas.has(s)) pending.add(s);
+      }
+    }
+    for (const sha of pending) {
+      if (!(await shaMergedIn(repoRoot, sha, targets))) return "lost";
+    }
+    return "ok";
+  };
+
   const run = async (
     opts: JanitorRunOptions = {},
   ): Promise<JanitorRunSummary> => {
@@ -566,20 +661,27 @@ export function createJanitor(deps: JanitorDeps) {
     const apply = effective.enabled && effective.mode === "apply" && !opts.dryRun;
     summary.applied = apply;
 
-    const runId = deps.janitor.startRun(at);
+    // §15: «--dry-run ничего не пишет и ничего не отправляет» — no run
+    // row, no janitor_meta marks, no coordinator messages; the pass is
+    // a pure preview. In-memory streak mirrors still advance so
+    // repeated dry-runs of one process behave like real runs.
+    const dry = opts.dryRun === true;
+    const runId = dry ? undefined : deps.janitor.startRun(at);
     summary.runId = runId;
 
     const finish = (error?: string) => {
-      deps.janitor.finishRun(
-        runId,
-        {
-          removed: summary.removedCopies + summary.removedBranches,
-          kept: Object.values(summary.kept).reduce((a, b) => a + b, 0),
-          freedKb: summary.freedKb,
-          error: error ?? null,
-        },
-        now(),
-      );
+      if (runId !== undefined) {
+        deps.janitor.finishRun(
+          runId,
+          {
+            removed: summary.removedCopies + summary.removedBranches,
+            kept: Object.values(summary.kept).reduce((a, b) => a + b, 0),
+            freedKb: summary.freedKb,
+            error: error ?? null,
+          },
+          now(),
+        );
+      }
       const keptText = Object.entries(summary.kept)
         .map(([r, n]) => `${r}=${n}`)
         .join(" ");
@@ -593,11 +695,11 @@ export function createJanitor(deps: JanitorDeps) {
     };
 
     try {
-      await runBody(effective, apply, summary);
-      // The daily «брошено» message is report output, not a deletion —
-      // it goes out in report mode and on --dry-run alike (§15), with
-      // the janitor_meta marks persisted so a restart cannot resend it.
-      await notifyCoordinators(summary);
+      const ctx = await runBody(effective, apply, summary, dry);
+      // The daily «брошено» message is report output — it goes out in
+      // report and apply modes (never on --dry-run), with the
+      // janitor_meta marks persisted so a restart cannot resend it.
+      if (!dry) await notifyCoordinators(summary, ctx);
       finish();
     } catch (e) {
       const text = message(e);
@@ -607,11 +709,29 @@ export function createJanitor(deps: JanitorDeps) {
     return summary;
   };
 
+  /** Run output the notify step needs (§15, PLUG-192). */
+  interface RunContext {
+    /**
+     * Envs that got a definite, non-transient outcome this run — only
+     * those may leave the announced-abandoned list. Transient results
+     * (`fetch-failed`, `threads-unknown`, `not-a-repo`, `missing-path`,
+     * a failed `git status`/reflog/probe, a failed archive) leave it
+     * untouched, so a flapping run cannot cause a repeat announcement.
+     */
+    definite: Set<string>;
+    /** Every env id BB reported — an id absent here no longer exists. */
+    allEnvIds: Set<string>;
+  }
   const runBody = async (
     cfg: JanitorConfig,
     apply: boolean,
     summary: JanitorRunSummary,
-  ): Promise<void> => {
+    dry: boolean,
+  ): Promise<RunContext> => {
+    const ctx: RunContext = {
+      definite: new Set(),
+      allEnvIds: new Set(),
+    };
     const at = now();
     const persist = apply;
     const exclude = new Set(cfg.excludeProjects);
@@ -619,6 +739,7 @@ export function createJanitor(deps: JanitorDeps) {
       ? String((await deps.localHostId()) ?? "")
       : "";
     const allEnvs = await listEnvironments();
+    for (const e of allEnvs) ctx.allEnvIds.add(e.id);
     // `bb/` branches belonging to envs the janitor must not touch —
     // excluded projects, and envs of other machines — stay out of the
     // branch sweep even when the repo itself is in scope.
@@ -691,16 +812,23 @@ export function createJanitor(deps: JanitorDeps) {
       return g;
     };
     const graph = await fetchGraph();
+    /**
+     * The freshest thread list seen this run — refreshed by every
+     * pre-archive re-read, so the post-archive «remaining» check below
+     * counts threads that appeared mid-run (PLUG-192: a brand-new env
+     * thread outside the archived cascade still holds the copy).
+     */
+    let latestGraph = graph;
     const liveThreadsOf = (
       envId: string,
-      g: ThreadGraph = graph,
+      g?: ThreadGraph,
     ): ThreadDto[] =>
-      (g.byEnv.get(envId) ?? []).filter(
+      ((g ?? latestGraph).byEnv.get(envId) ?? []).filter(
         (t) => !t.archivedAt && !archivedNow.has(t.id),
       );
 
     const pickThreadId = (env: EnvDto): string | null => {
-      const list = graph.byEnv.get(env.id) ?? [];
+      const list = latestGraph.byEnv.get(env.id) ?? [];
       const live = list.filter((t) => !t.archivedAt);
       return (
         live.find((t) => delegatedThreads.has(t.id))?.id ??
@@ -848,13 +976,16 @@ export function createJanitor(deps: JanitorDeps) {
       repoInfos.push(info);
       seenRoots.push({ common: commonDir, root });
     }
-    // Service state, not an item row: written by report mode and
-    // --dry-run too (§15 — the branch sweep needs the roots of copies
-    // that are already gone, whatever mode deletes them).
-    deps.janitor.setMeta(
-      "repoRoots",
-      JSON.stringify(seenRoots.slice(-500)),
-    );
+    // Service state, not an item row: written by report and apply
+    // modes (§15 — the branch sweep needs the roots of copies that are
+    // already gone, whatever mode deletes them). --dry-run writes
+    // nothing.
+    if (!dry) {
+      deps.janitor.setMeta(
+        "repoRoots",
+        JSON.stringify(seenRoots.slice(-500)),
+      );
+    }
 
     const reportedNow: {
       env: EnvDto;
@@ -929,6 +1060,8 @@ export function createJanitor(deps: JanitorDeps) {
       reason: string;
       reported: boolean;
       firstSeenAt: number | null;
+      /** HEAD at the run-start evaluation — re-verified before archive. */
+      headSha?: string;
     }
     const factsCache = new Map<string, EnvFacts>();
     const envFacts = async (env: EnvDto): Promise<EnvFacts> => {
@@ -1074,67 +1207,34 @@ export function createJanitor(deps: JanitorDeps) {
         return after(abandoned ? "abandoned-dirty" : "dirty", abandoned);
       if (unfinished) return after("unfinished-op");
       if (gitDirFailed) return after("unfinished-unknown");
-      // §16.3 (ревизия 25): only commits *made* on a detached HEAD and
-      // unreachable from every ref die with the copy — it stays
-      // (`detached-commits`), or goes to the «брошено» report once the
-      // thread idles past `abandonedAfter`. A commit always lands in the
-      // checked-out branch's own reflog as well as HEAD's, so
-      // commit-creating shas found in any branch reflog were made while
-      // attached: the orphans `commit --amend` and `rebase` leave behind
-      // do not count. The whole HEAD reflog is read — no entry cap.
-      const headReflog = await gitOut(deps.cmd, path, [
-        "reflog",
-        "show",
-        "HEAD",
-        "--format=%H%x00%gs",
-      ]);
-      if (headReflog === null) return after("detached-unknown");
-      const commitShas = (text: string): Set<string> => {
-        const out = new Set<string>();
-        for (const line of text.split("\n")) {
-          const sep = line.indexOf("\0");
-          if (sep < 0) continue;
-          if (DETACHED_CREATOR.test(line.slice(sep + 1).trim())) {
-            out.add(line.slice(0, sep));
-          }
-        }
-        return out;
-      };
-      const attachedShas = new Set<string>();
-      for (const b of repo.localBranches) {
-        const rl = await gitOut(deps.cmd, path, [
-          "reflog",
-          "show",
-          `refs/heads/${b}`,
-          "--format=%H%x00%gs",
-        ]);
-        if (rl === null) continue;
-        for (const s of commitShas(rl)) attachedShas.add(s);
-      }
-      const detachedShas = [...commitShas(headReflog)].filter(
-        (s) => !attachedShas.has(s),
-      );
-      if (detachedShas.length) {
-        const detached = (
-          await gitOut(deps.cmd, path, [
-            "rev-list",
-            "--count",
-            ...detachedShas,
-            "--not",
-            "--all",
-          ])
-        )?.trim();
-        if (detached === undefined) return after("detached-unknown");
-        if (Number(detached) > 0) {
-          return abandoned
-            ? after("abandoned-detached", true)
-            : after("detached-commits");
-        }
+      // §16.3 (ревизия 25, главное условие): «ничего не теряется» —
+      // every commit the copy's HEAD or its own branch ever pointed at
+      // must already sit on a remote target, as an ancestor or as a
+      // patch-equivalent (amend/rebase/squash of published work). A
+      // commit that is neither — one orphaned by `reset`, made on a
+      // detached HEAD, an unpublished pre-amend version — keeps the
+      // copy; once the thread idles past `abandonedAfter` it goes to
+      // the «брошено» report. The whole reflogs are read (no entry
+      // cap), but only the copy's own: HEAD is per-worktree, plus
+      // `branchName` and the checked-out branch when they exist — the
+      // repo's other branches are never scanned per copy.
+      const lost = await nothingLost(env, path, ownBranch, repo.root, targets);
+      if (lost === "unknown") return after("unpushed-unknown");
+      if (lost === "lost") {
+        return abandoned
+          ? after("abandoned-unpushed", true)
+          : after("unpushed-commits");
       }
       const proc = await hasProcessIn(path);
       if (proc === null) return after("process-unknown");
       if (proc) return after("process-inside");
-      return { ready: true, reason: "ready", reported: false, firstSeenAt };
+      return {
+        ready: true,
+        reason: "ready",
+        reported: false,
+        firstSeenAt,
+        headSha: head,
+      };
     };
 
     // §16.3: candidates are dispatch threads (`originPluginId=tasks`) and
@@ -1302,6 +1402,7 @@ export function createJanitor(deps: JanitorDeps) {
       // child spawned meanwhile rides BB's own cascade archive, so it
       // must face the same checks (or the whole archive is off).
       const fresh = await fetchGraph();
+      latestGraph = fresh;
       const freshRoot = fresh.all === null ? undefined : fresh.byId.get(root.id);
       if (!freshRoot || freshRoot.archivedAt || archivedNow.has(root.id)) {
         note("threads-unknown", null);
@@ -1357,6 +1458,17 @@ export function createJanitor(deps: JanitorDeps) {
           note("dirty", e.id);
           return;
         }
+        // §15 «Действие»: HEAD is re-verified against the run-start
+        // snapshot — a commit landed meanwhile cancels the archive;
+        // the env is re-evaluated on the next run.
+        const f = await envFacts(e);
+        const head = (
+          await gitOut(deps.cmd, e.path!, ["rev-parse", "--verify", "HEAD"])
+        )?.trim();
+        if (!head || head !== f.headSha) {
+          note("head-changed", e.id);
+          return;
+        }
       }
 
       const done: string[] = [];
@@ -1393,7 +1505,14 @@ export function createJanitor(deps: JanitorDeps) {
       }
     }
 
-    // Per-env outcomes.
+    // Per-env outcomes. `definite` records envs whose outcome is a real
+    // evaluation (not a transient failure) — only they may leave the
+    // announced-abandoned list in the notify step.
+    const settle = (env: EnvDto, reason: string) => {
+      if (!TRANSIENT_KEEPS.has(reason.replace(/^cascade:/, ""))) {
+        ctx.definite.add(env.id);
+      }
+    };
     for (const env of envs) {
       const facts = await envFacts(env);
       if (!facts.ready) {
@@ -1409,9 +1528,10 @@ export function createJanitor(deps: JanitorDeps) {
         } else {
           writeKept(env, facts.reason, facts.firstSeenAt);
         }
+        settle(env, facts.reason);
         continue;
       }
-      const envThreadList = graph.byEnv.get(env.id) ?? [];
+      const envThreadList = latestGraph.byEnv.get(env.id) ?? [];
       const blocked = envBlocked.get(env.id);
       // Threads that stayed out of every evaluated cascade — out-of-scope
       // root chats under `scope: workers`, or members of a cascade that
@@ -1421,6 +1541,7 @@ export function createJanitor(deps: JanitorDeps) {
       );
       if (envThreadList.length === 0) {
         writeKept(env, "no-threads", facts.firstSeenAt);
+        settle(env, "no-threads");
         continue;
       }
       if (unhandled.length > 0 || blocked) {
@@ -1429,6 +1550,7 @@ export function createJanitor(deps: JanitorDeps) {
           blocked ?? "threads-remaining",
           facts.firstSeenAt,
         );
+        settle(env, blocked ?? "threads-remaining");
         continue;
       }
       const remaining = liveThreadsOf(env.id);
@@ -1436,6 +1558,7 @@ export function createJanitor(deps: JanitorDeps) {
         // Report mode (nothing is archived) — «готова к удалению».
         summary.ready += 1;
         writeKept(env, blocked ?? "merged-ready", facts.firstSeenAt);
+        settle(env, blocked ?? "merged-ready");
         continue;
       }
       {
@@ -1468,6 +1591,7 @@ export function createJanitor(deps: JanitorDeps) {
           },
           at,
         );
+        ctx.definite.add(env.id);
       }
     }
 
@@ -1521,6 +1645,7 @@ export function createJanitor(deps: JanitorDeps) {
         isNew,
       });
     }
+    return ctx;
   };
   /** §16.3: at most one «брошено» message per coordinator per day, and
    * only while *newly* abandoned envs appear. Announcement state is
@@ -1533,6 +1658,7 @@ export function createJanitor(deps: JanitorDeps) {
    * apply-only. */
   const notifyCoordinators = async (
     summary: JanitorRunSummary,
+    ctx: { definite: Set<string>; allEnvIds: Set<string> },
   ): Promise<void> => {
     let announced: Set<string>;
     try {
@@ -1546,10 +1672,17 @@ export function createJanitor(deps: JanitorDeps) {
       announced = new Set(announcedMem);
     }
     // §15: a copy that stopped being abandoned leaves the announced
-    // list — if it goes abandoned again later it is announced again.
+    // list — but only when this run *proved* it (a definite outcome or
+    // the env gone entirely). Transient failures (a failed fetch, an
+    // unreadable thread list, a missing path) leave the list
+    // untouched — otherwise the next run would re-announce the same
+    // envs and the once-a-day limit would be broken (PLUG-192).
     const current = new Set(summary.reported.map((i) => i.envId));
     for (const id of [...announced]) {
-      if (!current.has(id)) {
+      if (
+        !current.has(id) &&
+        (ctx.definite.has(id) || !ctx.allEnvIds.has(id))
+      ) {
         announced.delete(id);
         announcedMem.delete(id);
       }
