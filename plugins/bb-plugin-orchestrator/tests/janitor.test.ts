@@ -2432,6 +2432,168 @@ test("a failed snapshot on delete → «НЕ удался» line carries the ste
   assert.match(rows[0]!.error ?? "", /stash create/);
 });
 
+test("a hole in ref numbers stays a hole — next ref is <id>-<maxN+1> (r29 п.3)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({ envs: [env], threads: {} });
+  const ev = {
+    id: "thr_g",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  };
+  writeFileSync(join(env.path, "f.txt"), "v1\n");
+  await w.jan.onThreadDeleted(ev);
+  writeFileSync(join(env.path, "f.txt"), "v2\n");
+  await w.jan.onThreadDeleted(ev);
+  writeFileSync(join(env.path, "f.txt"), "v3\n");
+  await w.jan.onThreadDeleted(ev);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_g-3"]);
+  // -2 removed by hand: the freed number must NOT be reused — the п.3
+  // comparison runs against the newest snapshot (-3), so the next
+  // ref is -4
+  git(repo, ["update-ref", "-d", "refs/orchestrator/rescue/thr_g-2"]);
+  writeFileSync(join(env.path, "f.txt"), "v4\n");
+  await w.jan.onThreadDeleted(ev);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_g-4"]);
+  assert.throws(() =>
+    git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_g-2"]),
+  );
+});
+
+test("a neighbour missing archivedAt or a set deletedAt cannot prove live — rescue, not silence (r29 п.2)", async () => {
+  const { repo, base } = makeRepo();
+  const noField = addEnv(repo, base, "a");
+  writeFileSync(join(noField.path, "f.txt"), "dirty\n");
+  const deleted = addEnv(repo, base, "d");
+  writeFileSync(join(deleted.path, "f.txt"), "dirty\n");
+  const t = Date.now();
+  const noArchivedAt = { ...idle({ t }, noField.id), id: "thr_sib1" };
+  delete (noArchivedAt as { archivedAt?: number | null }).archivedAt;
+  const w = makeWorld({
+    envs: [noField, deleted],
+    threads: {
+      // an old-BB row without the field: «не в архиве» unproven → rescue
+      [noField.id]: [noArchivedAt],
+      // a soft-deleted neighbour still in the list → not live → rescue
+      [deleted.id]: [{ ...idle({ t }, deleted.id), id: "thr_sib2", deletedAt: t }],
+    },
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_n1",
+    environmentId: noField.id,
+    parentThreadId: "thr_coord",
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_n2",
+    environmentId: deleted.id,
+    parentThreadId: "thr_coord",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_n1"]);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_n2"]);
+});
+
+test("a soft-deleted coordinator still in the list counts as gone — warn + notified=0 (r29 п.6)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const t = Date.now();
+  const w = makeWorld({
+    envs: [env],
+    threads: {},
+    extraThreads: [
+      {
+        id: "thr_coord",
+        status: "idle",
+        archivedAt: null,
+        deletedAt: t, // same liveness rule as the neighbour check
+        updatedAt: t,
+        environmentId: null,
+        parentThreadId: null,
+      },
+    ],
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_dc",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  const rows = w.janitor.rescues();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.notified, 0);
+  assert.ok(
+    w.warns.some(
+      (m) => m.includes("thr_dc") && m.includes("координатор thr_coord удалён"),
+    ),
+    `expected a deleted-coordinator warn: ${w.warns.join(" | ")}`,
+  );
+});
+
+test("no coordinator anywhere — warn «координатор неизвестен» + notified=0 (r29 п.6)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const w = makeWorld({ envs: [env], threads: {} });
+  await w.jan.onThreadDeleted({
+    id: "thr_nc",
+    environmentId: env.id,
+    parentThreadId: null, // known executor (tasks child), no parent
+    originPluginId: "tasks",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_nc"]);
+  assert.equal(w.sent.length, 0);
+  const rows = w.janitor.rescues();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.notified, 0);
+  assert.ok(
+    w.warns.some(
+      (m) => m.includes("thr_nc") && m.includes("координатор неизвестен"),
+    ),
+    `expected an unknown-coordinator warn: ${w.warns.join(" | ")}`,
+  );
+});
+
+test("the per-thread queue alone serializes rescues — a non-atomic update-ref would double the row (r29 п.4)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  // check-then-create update-ref: without the queue two racing
+  // rescues both pass the empty check and both land → two lines, two
+  // ledger rows. The queue makes the second one see the saved ref and
+  // stay silent.
+  const loose: CmdRunner = {
+    run: async (f, a, o) => {
+      const i = a.indexOf("update-ref");
+      if (i >= 0 && a[i + 3] === "") {
+        await new Promise((r) => setTimeout(r, 20));
+        const probe = await realCmd.run(
+          f,
+          [...a.slice(0, i), "rev-parse", "--verify", "--quiet", a[i + 1]!],
+          o,
+        );
+        if (probe.exitCode !== 0) {
+          return realCmd.run(
+            f,
+            [...a.slice(0, i), "update-ref", a[i + 1]!, a[i + 2]!],
+            o,
+          );
+        }
+        return { exitCode: 1, stdout: "", stderr: "ref exists" };
+      }
+      return realCmd.run(f, a, o);
+    },
+  };
+  const w = makeWorld({ envs: [env], threads: {}, cmd: loose });
+  const ev = {
+    id: "thr_q",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  };
+  await Promise.all([w.jan.onThreadArchived(ev), w.jan.onThreadDeleted(ev)]);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_q"]);
+  assert.equal(w.sent.length, 1);
+  assert.equal(w.janitor.rescues().length, 1);
+});
+
 // ── PLUG-188 review fixes ────────────────────────────────────────────
 
 test("a commit-less rebase counts by the strict «Created from» formula — merged copy is removed (PLUG-195)", async () => {

@@ -3365,6 +3365,15 @@ export function createJanitor(deps: JanitorDeps) {
   const RESCUE_PREFIX = "refs/orchestrator/rescue/";
   const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+  /** §16.4 r29 п.3: the snapshot number of a thread's rescue ref —
+   * `refs/orchestrator/rescue/<id>` counts as 1, `<id>-N` as N; 0 for
+   * anything else under the prefix. */
+  const rescueN = (base: string, ref: string): number => {
+    if (ref === base) return 1;
+    const m = new RegExp(`^${escapeRe(base)}-(\\d+)$`).exec(ref);
+    return m ? Number(m[1]) : 0;
+  };
+
   /** §16.4 r29 п.3: all saved snapshots of a thread, oldest first —
    * `refs/orchestrator/rescue/<id>` counts as N=1, `<id>-N` as N. */
   const listRescueRefs = async (
@@ -3378,13 +3387,11 @@ export function createJanitor(deps: JanitorDeps) {
     ]);
     if (!out) return [];
     const base = `${RESCUE_PREFIX}${threadId}`;
-    const re = new RegExp(`^${escapeRe(base)}-(\\d+)$`);
-    const nOf = (r: string) => (r === base ? 1 : Number(re.exec(r)![1]));
     return out
       .split("\n")
       .map((r) => r.trim())
-      .filter((r) => r === base || re.test(r))
-      .sort((a, b) => nOf(a) - nOf(b));
+      .filter((r) => rescueN(base, r) > 0)
+      .sort((a, b) => rescueN(base, a) - rescueN(base, b));
   };
 
   /** The three trees that define a snapshot's content
@@ -3498,6 +3505,13 @@ export function createJanitor(deps: JanitorDeps) {
     // does not retire a shared copy, so nothing is at risk. The same
     // env-thread list the janitor itself uses; an unproven list means
     // rescue rather than silence.
+    // §16.4 r29 п.2: «живой» only when the DTO proves it — a missing
+    // `archivedAt` cannot prove «не в архиве» (нет поля → спасать,
+    // ревью thr_ivx9d3y269). `deletedAt` absent is the norm — deleted
+    // threads are excluded from the list server-side; only a set one
+    // disqualifies.
+    const liveThread = (t: ThreadDto) =>
+      t.archivedAt === null && !t.deletedAt;
     const threadsNow = await listThreads();
     if (
       threadsNow !== null &&
@@ -3505,8 +3519,7 @@ export function createJanitor(deps: JanitorDeps) {
         (t) =>
           t.environmentId === envId &&
           t.id !== thread.id &&
-          !t.archivedAt &&
-          !t.deletedAt,
+          liveThread(t),
       )
     ) {
       return;
@@ -3522,7 +3535,7 @@ export function createJanitor(deps: JanitorDeps) {
     const coordGone =
       coordinator !== null &&
       threadsNow !== null &&
-      !threadsNow.some((t) => t.id === coordinator);
+      !threadsNow.some((t) => t.id === coordinator && liveThread(t));
     let sendError: string | null = null;
     const sendLine = async (text: string): Promise<boolean> => {
       if (!coordinator) return false;
@@ -3561,13 +3574,15 @@ export function createJanitor(deps: JanitorDeps) {
           `orchestrator janitor: rescue record ${thread.id}: ${message(e)}`,
         );
       }
-      if (!r.notified && coordinator) {
+      if (!r.notified) {
         log.warn?.(
           `orchestrator janitor: rescue ${thread.id}: ` +
-            (coordGone
-              ? `координатор ${coordinator} удалён`
-              : `строка координатору ${coordinator} не дошла` +
-                (sendError ? ` (${sendError})` : "")) +
+            (coordinator === null
+              ? "координатор неизвестен"
+              : coordGone
+                ? `координатор ${coordinator} удалён`
+                : `строка координатору ${coordinator} не дошла` +
+                  (sendError ? ` (${sendError})` : "")) +
             ` — ${r.ref ?? "снимок не удался"} ${path}`,
         );
       }
@@ -3618,10 +3633,15 @@ export function createJanitor(deps: JanitorDeps) {
     // writes only when the ref is absent; a lost race (or a stale
     // candidate from listRescueRefs) is not a failure: compare with
     // the occupying ref, identical → done, different → try N+1.
-    const taken = new Set(existing);
-    let n = 1;
-    let candidate = refBase;
-    while (taken.has(candidate)) candidate = `${refBase}-${++n}`;
+    // §16.4 r29 п.3: the new ref is <id>-<maxN+1>, never a filled
+    // hole (ревью thr_ivx9d3y269) — a freed number reused later would
+    // sit below the newest snapshot the п.3 comparison runs against.
+    const maxN = existing.reduce(
+      (m, r) => Math.max(m, rescueN(refBase, r)),
+      0,
+    );
+    let n = Math.max(1, maxN);
+    let candidate = maxN === 0 ? refBase : `${refBase}-${maxN + 1}`;
     let ref: string | null = null;
     let updateErr: string | null = null;
     for (let attempt = 0; attempt < 64; attempt++) {
