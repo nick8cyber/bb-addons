@@ -114,6 +114,33 @@ export const MIGRATIONS: readonly string[] = [
   // `release/<sha7>` recorded at the first release and reused by repeats
   // — one branch and one PR per task.
   `ALTER TABLE releases ADD COLUMN publish_branch TEXT`,
+  // §7 rev 24/25: `result_notified_at`/`result_notice` — the §16.5 result
+  // delivery's record (`plugin` when the plugin message went out, NULL
+  // notice when the coordinator was already gone); `revived_count` —
+  // §16.2, how often a finished delegation came back to `running`;
+  // `last_response_at` — §16.5 `idleSeconds`, the newest response-event
+  // time of the current turn. `plugin_meta` — key/value service state
+  // (the post-compaction reminder's per-coordinator cursor).
+  `ALTER TABLE delegations ADD COLUMN result_notified_at INTEGER;
+   ALTER TABLE delegations ADD COLUMN result_notice TEXT;
+   ALTER TABLE delegations ADD COLUMN revived_count INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE delegations ADD COLUMN last_response_at INTEGER;
+   CREATE TABLE IF NOT EXISTS plugin_meta (
+     key TEXT PRIMARY KEY,
+     value TEXT NOT NULL
+   )`,
+  // §7 rev 25 rollout: delegations finished BEFORE the §16.5 delivery
+  // columns existed already reached the coordinator through BB's own
+  // parent notifications — they are marked `legacy` so the first
+  // reconcile does not re-send every stale result (PLUG-184 B1). The
+  // marker covers EVERY terminal status: it doubles as the rollout
+  // last_seq-sync scope — only rows already terminal at the migration
+  // may be force-advanced (PLUG-193 #4; a row closed after the rollout
+  // keeps its live cursor for the §16.2 wake rule).
+  `UPDATE delegations SET result_notified_at = CAST(strftime('%s','now') AS INTEGER) * 1000,
+     result_notice = 'legacy'
+   WHERE status IN ('done','cancelled','failed','stalled','quota','reissued')
+     AND result_notified_at IS NULL`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -163,6 +190,10 @@ export interface DelegationRow {
   /** §2.3: the dispatch named an explicit `--route`/`--preset` (reissue
    * restarts the chain from its beginning). */
   explicit_route: number;
+  result_notified_at: number | null;
+  result_notice: string | null;
+  revived_count: number;
+  last_response_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -506,6 +537,182 @@ export class DelegationStore {
          WHERE id = ?`,
       )
       .run(Date.now(), id);
+  }
+
+  /** §16.5: latest response-event time of the current turn (idleSeconds). */
+  setLastResponse(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations
+         SET last_response_at = MAX(COALESCE(last_response_at, -1), ?),
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /**
+   * §16.5: the coordinator was told (or could not be told — a gone
+   * coordinator records `result_notified_at` with a NULL `result_notice`
+   * so the delivery does not rescan forever).
+   */
+  setResultNotified(id: number, notice: "bb" | "plugin" | "legacy" | null): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = ?, result_notice = ?,
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), notice, Date.now(), id);
+  }
+
+  /**
+   * §16.2: a `turn/started` on a finished delegation revives it — back to
+   * `running`, `revived_count += 1`, and the delivery record cleared so
+   * the next `done`/`cancelled` notifies again. The check for another
+   * ACTIVE delegation of the same task runs inside the transaction —
+   * otherwise the partial unique index throws mid-handler (PLUG-184).
+   * Returns false when a sibling already owns the task.
+   */
+  revive(id: number): boolean {
+    return this.db.transaction(() => {
+      const row = this.get(id);
+      if (!row) return false;
+      const other = this.db
+        .prepare(
+          `SELECT 1 AS x FROM delegations
+           WHERE task_key = ? AND id <> ?
+             AND status IN ('dispatching','running') LIMIT 1`,
+        )
+        .get(row.task_key, id) as { x: number } | undefined;
+      if (other) return false;
+      this.db
+        .prepare(
+          `UPDATE delegations SET status = 'running',
+           revived_count = revived_count + 1,
+           result_notified_at = NULL, result_notice = NULL,
+           first_response_at = NULL, last_response_at = NULL, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(Date.now(), id);
+      return true;
+    })();
+  }
+
+  /**
+   * §16.2: only the task's NEWEST delegation may revive — a row with a
+   * bigger id is a past round that must never work again.
+   */
+  hasNewerForTask(taskKey: string, id: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM delegations
+           WHERE task_key = ? AND id > ? LIMIT 1`,
+        )
+        .get(taskKey, id) !== undefined
+    );
+  }
+
+  /**
+   * §16.5 exactly-once (PLUG-184): the in-flight delivery marker —
+   * `UPDATE … WHERE` is atomic, so a second caller (event vs reconcile
+   * pass, or a second plugin process) sees the claim and leaves.
+   * `updated_at` doubles as the claim's time: a crash mid-delivery
+   * leaves the `-1` until it goes stale — the same predicate that
+   * `listPendingResult` rescans lets the claim be TAKEN again after
+   * two minutes, so a killed send cannot lose the result (PLUG-190).
+   */
+  claimResultDelivery(id: number): boolean {
+    const staleBefore = Date.now() - 120_000;
+    const info = this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = -1, updated_at = ?
+         WHERE id = ? AND (
+           result_notified_at IS NULL
+           OR (result_notified_at = -1 AND updated_at < ?)
+         )`,
+      )
+      .run(Date.now(), id, staleBefore);
+    return info.changes > 0;
+  }
+
+  /** A claimed delivery failed before the send — release it for a retry. */
+  releaseResultClaim(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = NULL
+         WHERE id = ? AND result_notified_at = -1`,
+      )
+      .run(id);
+  }
+
+  /** §16.5: `done`/`cancelled` rows whose result was not delivered yet —
+   * plus claims that went stale (a crash mid-delivery). */
+  listPendingResult(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status IN ('done','cancelled') AND (
+           result_notified_at IS NULL
+           OR (result_notified_at = -1 AND updated_at < ?)
+         )
+         ORDER BY id`,
+      )
+      .all(Date.now() - 120_000) as DelegationRow[];
+  }
+
+  /** §16.5 rollout (PLUG-193 #4): rows already terminal when the
+   * delivery migration ran — the last_seq sync scope. A row closed
+   * after the rollout (`result_notice` unset/'plugin'/'bb') is never
+   * force-advanced: its post-cursor turns are real and go through the
+   * §16.2 wake rule. */
+  listLegacyTerminal(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE result_notice = 'legacy' AND thread_id IS NOT NULL
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /** Terminal rows that still name a thread — the §16.2 wake scan
+   * scope (PLUG-193 #3; a stale cursor would let a HISTORICAL turn
+   * revive or suppress them, PLUG-190). */
+  listTerminalWithThread(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status NOT IN ('dispatching','running')
+           AND thread_id IS NOT NULL
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /** Distinct coordinator threads the store knows — the §16.5 reminder's scope. */
+  coordinatorThreadIds(): string[] {
+    const rows = this.db
+      .prepare(`SELECT DISTINCT coordinator_thread_id AS t FROM delegations`)
+      .all() as { t: string }[];
+    return rows.map((r) => r.t);
+  }
+
+  /** `plugin_meta` — durable service cursors (post-compaction reminder). */
+  metaGet(key: string): string | undefined {
+    return (
+      this.db.prepare(`SELECT value FROM plugin_meta WHERE key = ?`).get(key) as
+        | { value: string }
+        | undefined
+    )?.value;
+  }
+
+  metaSet(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO plugin_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
   }
 
   /** §7 retry limit: another failed retry of the same action. */
