@@ -90,6 +90,26 @@ describe("enforce: expanded queue shows exactly min(N,3) items", () => {
     // queue clamp is unconditional: 1 row still bounded
     expect(scroll.style.maxHeight).toBe("80px");
   });
+  it("grows panel ancestors by the missing delta when scroll is squeezed", () => {
+    const { card, scroll, frame } = buildDom({ rows: 2 });
+    // Panel grants only 103px though content needs 140+ — squeeze scroll/frame.
+    box(scroll, 0, 103);
+    box(frame, 0, 103);
+    // Insert a fixed-height panel ancestor between frame and card.
+    const panel = document.createElement("div");
+    card.removeChild(frame);
+    panel.appendChild(frame);
+    card.insertBefore(panel, card.firstChild);
+    box(panel, 0, 190);
+    enforce(card, win);
+    // delta = 140 - 103 = 37 → panel min-height = 190 + 37 = 227
+    expect(panel.style.minHeight).toBe("227px");
+    // second pass clears the grown min-heights when queue collapses
+    box(scroll, 0, 0);
+    enforce(card, win);
+    expect(panel.style.minHeight).toBe("");
+    expect(scroll.style.maxHeight).toBe("");
+  });
   it("dividers (h-0, marked) are not counted as items", () => {
     const { card, scroll, lis } = buildDom({ rows: 3 });
     lis[1].setAttribute("data-queued-message-group-divider", "");

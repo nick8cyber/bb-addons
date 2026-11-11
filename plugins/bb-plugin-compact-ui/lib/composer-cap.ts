@@ -37,6 +37,9 @@ function capPx(win: Window): number {
 
 let queueObserver: ((queue: Element) => void) | undefined;
 const pendingRetry = new WeakSet<Element>();
+/* Ancestors we grew last pass — cleared before each enforce so stale
+   min-heights cannot linger when the queue shrinks or collapses. */
+const grownAncestors = new Set<HTMLElement>();
 
 export function enforce(form: Element, win: Window, retry = true): void {
   const scroll = form.querySelector(EDITOR_SCROLL) as HTMLElement | null;
@@ -55,6 +58,8 @@ export function enforce(form: Element, win: Window, retry = true): void {
     const frame = queue.closest(QUEUE_FRAME) as HTMLElement | null;
     /* A collapsed panel stays mounted with a zero-height viewport — clamping it
        would resurrect it; an empty one has nothing to bound. */
+    for (const el of grownAncestors) el.style.minHeight = "";
+    grownAncestors.clear();
     if (queue.getBoundingClientRect().height === 0 || rows.length === 0) {
       queue.style.maxHeight = "";
       if (frame) frame.style.maxHeight = "";
@@ -69,8 +74,23 @@ export function enforce(form: Element, win: Window, retry = true): void {
           padY(queue) +
           padY(rows[0].parentElement ?? queue),
       );
+      const roomBefore = queue.getBoundingClientRect().height;
       queue.style.maxHeight = `${queueMax}px`;
       if (frame) frame.style.maxHeight = `${queueMax + Math.ceil(padY(frame))}px`;
+      /* The frame is flex-1 inside the queue panel: when the panel's own
+         height is host-budgeted, extra max-height on the scroll just clips.
+         Grow every ancestor up to the composer card by the missing delta so
+         the space is actually granted. */
+      const delta = queueMax - roomBefore;
+      if (delta > 1) {
+        let el = (frame ?? queue).parentElement;
+        while (el && el !== form && el !== form.ownerDocument.documentElement) {
+          const h = el as HTMLElement;
+          h.style.minHeight = `${Math.ceil(h.getBoundingClientRect().height + delta)}px`;
+          grownAncestors.add(h);
+          el = el.parentElement;
+        }
+      }
       if (retry && !pendingRetry.has(form)) {
         pendingRetry.add(form);
         setTimeout(() => {

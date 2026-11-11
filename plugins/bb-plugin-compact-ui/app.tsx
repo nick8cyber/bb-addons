@@ -937,6 +937,24 @@ function NavDiagBridge() {
       void rpc.call("nav_top_row_poll", {}).then(({ command }) => {
         if (command === "test_more") runMoreSelfTest(win);
         const probe = command?.match(/^probe\s+(\d+)\s+(\d+)$/);
+        const textProbe = command?.match(/^dump_text\s+(.+)$/);
+        if (textProbe) {
+          const needle = textProbe[1].trim().toLowerCase();
+          const hits = Array.from(document.querySelectorAll("button, a, [role='button'], div, span"))
+            .filter((el) => el.children.length === 0 || el.tagName === "BUTTON" || el.tagName === "A")
+            .filter((el) => (el.textContent || "").trim().toLowerCase().includes(needle))
+            .slice(0, 6)
+            .map((el) => {
+              const h = el as HTMLElement, r = h.getBoundingClientRect(), p = h.parentElement;
+              return { text: (el.textContent || "").trim().slice(0, 40), tag: el.tagName,
+                cls: h.className?.toString?.().slice(0, 80), x: Math.round(r.x), y: Math.round(r.y),
+                w: Math.round(r.width), h: Math.round(r.height),
+                parentCls: p?.className?.toString?.().slice(0, 80) || "",
+                parentDisp: p ? getComputedStyle(p).display + "/" + getComputedStyle(p).flexWrap : "",
+                cardCls: h.closest("[class*='card'],[class*='Card'],[data-card]")?.className?.toString?.().slice(0, 80) || "" };
+            });
+          win.__bbNavTopTest = { cmd: command, ts: Date.now(), hits };
+        }
         if (command === "dump_queue") {
           const box = (el: Element | null | undefined) => {
             if (!el) return null;
@@ -956,6 +974,17 @@ function NavDiagBridge() {
               h: Math.round(li.getBoundingClientRect().height),
               kind: Object.keys((li as HTMLElement).dataset)[0] || "",
             })) : [],
+            ancestors: (() => {
+              const out = [];
+              let el = q?.parentElement;
+              for (let i = 0; i < 5 && el; i++, el = el.parentElement) {
+                const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+                out.push({ tag: el.tagName, cls: el.className?.toString?.().slice(0, 70),
+                  h: Math.round(r.height), disp: cs.display, ov: cs.overflowY,
+                  data: Object.keys((el as HTMLElement).dataset).slice(0, 3).join(",") });
+              }
+              return out;
+            })(),
           };
         }
         if (probe) {
