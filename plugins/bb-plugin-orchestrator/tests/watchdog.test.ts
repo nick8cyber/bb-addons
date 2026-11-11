@@ -1793,7 +1793,8 @@ test("§5.4 r23: failed reissues to the next route under autoFallback (503 no ca
   const fresh = h.store.listActive()[0]!;
   assert.equal(fresh.route, "simple-alt");
   assert.equal(fresh.reissue_of, row.id);
-  assert.equal(fresh.round, 2);
+  // §4.1 r23: a reissue retries the SAME round, it does not open a new one
+  assert.equal(fresh.round, row.round);
   assert.match(
     JSON.stringify(h.sends.at(-1)!.input),
     /завершился с ошибкой.*перевыпущено на simple-alt/,
@@ -2130,4 +2131,167 @@ test("§5.3 r23: a trailing willRetry provider error is not errored → done", a
   await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
   await h.wd.onThreadIdle(dto("thr_e1", "idle"));
   assert.equal(h.store.get(row.id)!.status, "done");
+});
+
+// ── PLUG-176 review fixes: separate repeat marks, strict errored gate ───
+
+test("§5.3 r23: errored → interrupt counts separately — first interrupt still resumes", async () => {
+  // PLUG-176 #1: an errored resume bumped resume_count, so the FIRST
+  // non-manual interrupt afterwards read as a repeat and stalled (or
+  // reissued) a working executor. Repeats are per-outcome marks now.
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "tool exploded" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "running");
+  assert.equal(h.store.get(row.id)!.resume_count, 1); // stats only
+
+  // the resumed turn starts, then a first non-manual interrupt arrives —
+  // it gets its own resume, not stalled
+  h.eventLog.get("thr_e1")!.push(
+    ev(3, "turn/started", T0 + 1000),
+    ev(4, "system/thread/interrupted", T0 + 2000, {
+      reason: "host-daemon-restarted",
+    }),
+  );
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 4 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.resume_count, 2);
+  const toExec = h.sends.filter((s) => s.threadId === "thr_e1");
+  assert.match(JSON.stringify(toExec.at(-1)!.input), /продолжай задачу/);
+
+  // a SECOND interruption is the interrupt repeat → stalled
+  h.eventLog.get("thr_e1")!.push(
+    ev(5, "system/thread/interrupted", T0 + 3000, {
+      reason: "provider-turn-idle",
+    }),
+  );
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 5 });
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+});
+
+test("§5.3 r23: interrupt → errored counts separately — first errored still resumes", async () => {
+  // the other order (PLUG-176 #1): an interrupted resume must not burn
+  // the errored outcome's one retry either
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "system/thread/interrupted", T0, { reason: "provider-turn-idle" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  assert.equal(h.store.get(row.id)!.status, "running");
+  assert.equal(h.store.get(row.id)!.resume_count, 1);
+
+  // the resumed turn starts, then ends with an error at idle — the FIRST
+  // errored verdict, so a resume, not `failed`
+  h.eventLog.get("thr_e1")!.push(
+    ev(3, "turn/started", T0 + 1000),
+    ev(4, "provider/error", T0 + 1500, { message: "tool exploded" }),
+  );
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 4 });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.resume_count, 2);
+  const toExec = h.sends.filter((s) => s.threadId === "thr_e1");
+  assert.match(JSON.stringify(toExec.at(-1)!.input), /оборвался ошибкой/);
+
+  // a second errored verdict is the errored repeat → failed (strict: no
+  // reissue)
+  h.eventLog.get("thr_e1")!.push(
+    ev(5, "turn/started", T0 + 2500),
+    ev(6, "provider/error", T0 + 3000, { message: "tool exploded again" }),
+  );
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 6 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "failed");
+});
+
+test("§5.3 r23: turn/completed status interrupted is not errored → done", async () => {
+  // PLUG-176 #2: `bb thread tell` interrupts the turn without a
+  // system/thread/interrupted event; the interrupted/cancelled paths own
+  // that outcome, so errored must not fire on it
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 500, { status: "interrupted" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "done");
+  assert.equal(
+    h.sends.filter((s) => s.threadId === "thr_e1").length,
+    0,
+    "no resume nudge on an interrupted completion",
+  );
+});
+
+test("§5.3 r23: an error after a clean turn/completed does not count → done", async () => {
+  // PLUG-176 #3, the live case: "agy exited (code null, signal SIGKILL)"
+  // lands after the turn already completed — the completion alone decides
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 500, { status: "completed" }),
+    ev(3, "provider/error", T0 + 600, {
+      message: "agy exited (code null, signal SIGKILL)",
+    }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "done");
+  assert.equal(
+    h.sends.filter((s) => s.threadId === "thr_e1").length,
+    0,
+    "no resume nudge for noise after a completed turn",
+  );
+});
+
+test("§5.3 r23: a failed turn/completed still decides when errors trail it → errored", async () => {
+  // PLUG-176 #3 both ways: the turn/completed decides alone — a failed
+  // completion is errored even though the trailing noise is not an error
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 500, { status: "failed" }),
+    ev(3, "provider/error", T0 + 600, {
+      message: "agy exited (code null, signal SIGKILL)",
+    }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.resume_count, 1);
+  const toExec = h.sends.find((s) => s.threadId === "thr_e1")!;
+  assert.match(JSON.stringify(toExec.input), /оборвался ошибкой/);
 });

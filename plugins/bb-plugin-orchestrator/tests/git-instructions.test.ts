@@ -22,7 +22,10 @@ import { createPlugin } from "../server.js";
 
 const POLICY_TEXT = JSON.stringify({
   version: 1,
-  levels: { simple: { chain: ["simple"] } },
+  levels: {
+    simple: { chain: ["simple"] },
+    review: { chain: ["simple"] },
+  },
   routes: { simple: { preset: "simple", provider: "acp-opencode" } },
 });
 const PRESETS = new Set(["simple"]);
@@ -368,7 +371,7 @@ test("--from overrides continuation with the given ref", async () => {
   assert.equal(row.continue_from, "deadbeef");
 });
 
-test("a reissue inherits continue_from and its «Заход N» section", async () => {
+test("a reissue inherits round and continue_from — the same «Заход N»", async () => {
   const { deps, store, calls } = makeDeps();
   const row = store.insert({
     taskKey: "PLUG-1",
@@ -387,12 +390,13 @@ test("a reissue inherits continue_from and its «Заход N» section", async 
     preset: "simple",
     provider: "p",
   })!;
-  assert.equal(fresh.round, 2);
+  // §4.1 r23: a reissue retries the same round, not round + 1
+  assert.equal(fresh.round, 1);
   assert.equal(fresh.continue_from, "abc123def");
   await dispatchToRoute(fresh, {}, deps);
   assert.match(
     dispatchedInstructions(calls)!,
-    /Заход 2: продолжение работы с коммита abc123def/,
+    /Заход 1: продолжение работы с коммита abc123def/,
   );
 });
 
@@ -417,4 +421,64 @@ test("reissue accepts a failed row (§5.4 r23)", async () => {
   assert.ok(fresh);
   assert.equal(store.get(row.id)!.status, "reissued");
   assert.equal(fresh.route, "simple-alt");
+});
+
+test("--from + --fresh → incompatible-flags, nothing inserted", async () => {
+  const { deps, store, calls } = makeDeps();
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        from: "abc123def",
+        fresh: true,
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) =>
+      e instanceof Error && (e as { code?: string }).code === "incompatible-flags",
+  );
+  assert.equal(store.activeCount(), 0);
+  assert.ok(
+    !calls.some((c) => c.join(" ").startsWith("tasks dispatch")),
+    "no dispatch expected",
+  );
+});
+
+test("review level gets «Проверяемый итог», not the «Заход N» section", async () => {
+  const { deps, store, calls } = makeDeps();
+  const prev = insertRow(store);
+  store.setStatus(prev.id, "done");
+  store.setRoundResult(prev.id, {
+    branch: "exec-r1",
+    sha: "abc123def",
+    commits: 3,
+    dirty: false,
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "review", caller: COORDINATOR },
+    deps,
+  );
+  const text = dispatchedInstructions(calls)!;
+  // §4.1 r23: a read-only role gets the commit to check, no git commands
+  assert.match(
+    text,
+    /Проверяемый итог: коммит abc123def \(ветка exec-r1, заход 1\)/,
+  );
+  assert.ok(!/Заход|git merge/.test(text), `unexpected section: ${text}`);
+  const row = store.listActive()[0]!;
+  assert.equal(row.level, "review");
+  assert.equal(row.continue_from, "abc123def");
+});
+
+test("review level with an unrecorded --from ref names just the commit", async () => {
+  const { deps, calls } = makeDeps();
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "review", from: "deadbeef", caller: COORDINATOR },
+    deps,
+  );
+  const text = dispatchedInstructions(calls)!;
+  assert.match(text, /^Проверяемый итог: коммит deadbeef$/m);
+  assert.ok(!/Заход|git merge/.test(text), `unexpected section: ${text}`);
 });

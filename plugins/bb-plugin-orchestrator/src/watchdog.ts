@@ -526,8 +526,12 @@ export function createWatchdog(deps: WatchdogDeps) {
   /**
    * §5.3 `interrupted`: a non-manual interruption is not a cancellation.
    * First time — resume the executor (`queue-if-active`), keep `running`,
-   * bump `resume_count`, notify the coordinator. A repeat interruption is
-   * treated like `stalled`. Returns true when the delegation ended.
+   * notify the coordinator. A repeat interruption is treated like
+   * `stalled`. Repeats are counted per outcome kind (r23): the
+   * `interrupted-resume-sent` mark gates the interrupt repeat, the
+   * `errored-resume-sent` mark the errored one — `resume_count` itself is
+   * statistics only, so an errored resume does not burn the interrupt's
+   * one retry (PLUG-176). Returns true when the delegation ended.
    */
   const handleInterrupted = async (
     row: DelegationRow,
@@ -536,7 +540,7 @@ export function createWatchdog(deps: WatchdogDeps) {
   ): Promise<boolean> => {
     const fresh = store.get(row.id);
     if (!fresh || fresh.status !== "running") return true;
-    if (fresh.resume_count >= 1) {
+    if (hasSetupError(fresh, "interrupted-resume-sent")) {
       await toStalled(fresh, `повторное прерывание хода (${reason})`);
       return true;
     }
@@ -544,9 +548,11 @@ export function createWatchdog(deps: WatchdogDeps) {
     // if none starts within `firstResponseSeconds`, the row is treated as
     // a repeat interruption. `resume-await` marks the wait; a following
     // idle must not read as `done` while the resume is still in flight.
+    // `interrupted-resume-sent` is this outcome's own repeat mark (r23).
     store.bumpResume(fresh.id);
     store.setTurnStarted(fresh.id, at);
     store.addSetupError(fresh.id, "resume-await", reason);
+    store.addSetupError(fresh.id, "interrupted-resume-sent", "1");
     await sendToExecutor(fresh, `ход прерван (${reason}), продолжай задачу`);
     await notifyCoordinator(
       fresh,
@@ -820,13 +826,17 @@ export function createWatchdog(deps: WatchdogDeps) {
   };
 
   /**
-   * §5.3 r23 `errored`: the current turn's journal read backwards — the
-   * first verdict event decides. A response event means the agent kept
-   * working past any earlier error (clean — a mid-turn tool error is no
-   * outcome); `turn/completed` with a non-completed status or an error,
-   * `turn.failed` or a trailing provider/system error ends the turn
-   * errored. Returns null when the journal cannot be read — unknown is
-   * not "clean" (§5.1 rev 18).
+   * §5.3 r23 `errored`: collect the current turn's tail (newest → oldest
+   * up to its start). When the tail holds a `turn/completed`, that event
+   * alone decides: only `status = "failed"` or an `error` field is
+   * errored — `interrupted` is a new-message/stop interruption, not an
+   * error, and errors arriving AFTER the completion (the agent process
+   * exiting, stray provider noise) never count (PLUG-176). Without a
+   * `turn/completed`, the newest verdict event decides: a trailing
+   * `turn.failed` or `provider/error`/`system/error` without
+   * `willRetry = true` ends the turn errored, while a response event or a
+   * retrying error means the agent kept working. Returns null when the
+   * journal cannot be read — unknown is not "clean" (§5.1 rev 18).
    */
   const lastTurnError = async (
     row: DelegationRow,
@@ -845,28 +855,30 @@ export function createWatchdog(deps: WatchdogDeps) {
       );
       return null;
     }
+    // The turn's tail, newest first, up to the turn's start boundary.
+    const tail: WatchdogThreadEvent[] = [];
     for (const ev of events) {
       if (row.turn_started_at != null && ev.createdAt < row.turn_started_at) {
         break; // older turns are out of scope
       }
-      const data = (ev.data ?? {}) as Record<string, unknown>;
       if (ev.type === "turn/started") break;
-      if (ev.type === "turn/completed") {
-        const errText =
-          errorTextOf(data.error as Record<string, unknown> | undefined) ??
-          errorTextOf(data);
-        const status = data.status;
-        if (
-          errText ||
-          data.error != null ||
-          (status !== undefined && status !== "completed")
-        ) {
-          return {
-            text: errText ?? `turn/completed: status ${String(status)}`,
-          };
-        }
-        return "clean";
+      tail.push(ev);
+    }
+    const completed = tail.find((e) => e.type === "turn/completed");
+    if (completed) {
+      const data = (completed.data ?? {}) as Record<string, unknown>;
+      const errText =
+        errorTextOf(data.error as Record<string, unknown> | undefined) ??
+        errorTextOf(data);
+      if (data.status === "failed" || data.error != null) {
+        return {
+          text: errText ?? `turn/completed: status ${String(data.status)}`,
+        };
       }
+      return "clean";
+    }
+    for (const ev of tail) {
+      const data = (ev.data ?? {}) as Record<string, unknown>;
       if (ev.type === "turn.failed" || ev.type === "turn/failed") {
         return { text: errorTextOf(data) ?? "turn failed" };
       }

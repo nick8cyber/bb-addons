@@ -13,7 +13,11 @@
  * and the reconcile stage (later) retries them.
  */
 import { OrchestratorError } from "./errors.js";
-import { mergeDispatchInstructions, roundSection } from "./instructions.js";
+import {
+  mergeDispatchInstructions,
+  reviewRoundLine,
+  roundSection,
+} from "./instructions.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
   pickRoute,
@@ -190,6 +194,16 @@ export async function runDelegate(
     }
   }
 
+  // §6: `--from` picks the continuation point, `--fresh` drops it — never
+  // both; the silent precedence hid caller mistakes (PLUG-176).
+  if (params.from && params.fresh) {
+    throw new OrchestratorError(
+      "incompatible-flags",
+      "--from and --fresh cannot be combined",
+      "--from names the commit to continue from; --fresh starts the round from the base",
+    );
+  }
+
   // §4.1 rounds: every delegate is a new round. The round continues from
   // `--from`, else from the previous round's recorded result SHA; `--fresh`
   // disables continuation.
@@ -295,18 +309,21 @@ export async function dispatchToRoute(
 ): Promise<DispatchStepsResult> {
   const { store, bbCli } = deps;
 
-  // §2.2: the «Работа с git» section leads --instructions, then «Заход N»
-  // for continuation rounds (§4.1), then this call's extra instructions —
-  // in this shared step they cover the §5.4 reissue path too.
+  // §2.2: the «Работа с git» section leads --instructions; a continuation
+  // round then adds «Заход N» (§4.1) — or, for auditor levels, the
+  // «Проверяемый итог» line instead (§4.1 r23: a read-only role gets no
+  // merge commands) — then this call's extra instructions. In this shared
+  // step they cover the §5.4 reissue path too.
+  const resultRef = row.continue_from
+    ? store.resultRefForSha(row.task_key, row.continue_from)
+    : null;
   const instructions = mergeDispatchInstructions(
     deps.gitInstructions?.(),
     opts.instructions,
     row.continue_from
-      ? roundSection(
-          row.round,
-          row.continue_from,
-          store.resultBranchForSha(row.task_key, row.continue_from),
-        )
+      ? roleForLevel(row.level) === "auditor"
+        ? reviewRoundLine(row.continue_from, resultRef?.branch, resultRef?.round)
+        : roundSection(row.round, row.continue_from, resultRef?.branch)
       : undefined,
   );
   const dispatchArgs = [

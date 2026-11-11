@@ -145,6 +145,27 @@ export function roundSection(
 }
 
 /**
+ * §4.1 r23: auditor levels (read-only roles) get no «Заход N» merge
+ * commands — this one line names the commit under review, its branch and
+ * the round that produced it. Unknown pieces are dropped (an arbitrary
+ * `--from` ref may match no recorded result).
+ */
+export function reviewRoundLine(
+  continueFrom: string,
+  branch: string | null | undefined,
+  round: number | null | undefined,
+): string {
+  const parts = [
+    ...(branch ? [`ветка ${branch}`] : []),
+    ...(round != null ? [`заход ${round}`] : []),
+  ];
+  return (
+    `Проверяемый итог: коммит ${continueFrom}` +
+    (parts.length ? ` (${parts.join(", ")})` : "")
+  );
+}
+
+/**
  * §2.2: the git-rules text becomes the first section of `--instructions`,
  * then the «Заход N» section when the dispatch continues a previous round,
  * then this call's extra instructions; an empty or over-limit value adds

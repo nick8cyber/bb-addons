@@ -567,8 +567,9 @@ export class DelegationStore {
    * new `dispatching` row with `reissue_of` is inserted atomically, so a
    * service restart mid-reissue cannot leave a duplicate. Returns the new
    * row, or undefined when the old row already left `stalled`/`quota`/
-   * `failed`. The reissue is a new round (§4.1) inheriting the
-   * predecessor's `continue_from`.
+   * `failed`. The reissue retries the SAME round (§4.1 r23): it inherits
+   * `round` and `continue_from`, so a later manual delegate is the next
+   * round, not the reissue.
    */
   reissue(
     id: number,
@@ -608,7 +609,7 @@ export class DelegationStore {
           next.preset,
           next.provider,
           id,
-          row.round + 1,
+          row.round,
           row.continue_from,
           now,
           now,
@@ -645,18 +646,26 @@ export class DelegationStore {
       .get(normalizeTaskKey(taskKey)) as DelegationRow | undefined;
   }
 
-  /** The branch a previous round committed on, for the «Заход N» text. */
-  resultBranchForSha(taskKey: string, sha: string): string | null {
+  /**
+   * §4.1: the recorded result a `continue_from` sha points at — its branch
+   * and the round that produced it — for the «Заход N» / «Проверяемый
+   * итог» instruction texts. Null when the ref names no recorded result
+   * (e.g. an arbitrary `--from` commit).
+   */
+  resultRefForSha(
+    taskKey: string,
+    sha: string,
+  ): { branch: string | null; round: number } | null {
     const row = this.db
       .prepare(
-        `SELECT result_branch FROM delegations
+        `SELECT result_branch, round FROM delegations
          WHERE task_key = ? AND result_sha = ?
          ORDER BY id DESC LIMIT 1`,
       )
       .get(normalizeTaskKey(taskKey), sha) as
-      | { result_branch: string | null }
+      | { result_branch: string | null; round: number }
       | undefined;
-    return row?.result_branch ?? null;
+    return row ? { branch: row.result_branch, round: row.round } : null;
   }
 
   /** §4.1: record the executor worktree's state at `done`. */
