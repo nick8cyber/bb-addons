@@ -37,9 +37,10 @@ function capPx(win: Window): number {
 
 let queueObserver: ((queue: Element) => void) | undefined;
 const pendingRetry = new WeakSet<Element>();
-/* Ancestors we grew last pass — cleared before each enforce so stale
-   min-heights cannot linger when the queue shrinks or collapses. */
-const grownAncestors = new Set<HTMLElement>();
+/* Ancestors we grew, with the value last applied — writes are idempotent:
+   unchanged wants are not rewritten, so our own style mutations never
+   retrigger enforce into a clear→set mutation loop. */
+const grownAncestors = new Map<HTMLElement, number>();
 
 export function enforce(form: Element, win: Window, retry = true): void {
   const dbgEl = form.ownerDocument.documentElement;
@@ -86,11 +87,11 @@ export function enforce(form: Element, win: Window, retry = true): void {
     const frame = queue.closest(QUEUE_FRAME) as HTMLElement | null;
     /* A collapsed panel stays mounted with a zero-height viewport — clamping it
        would resurrect it; an empty one has nothing to bound. */
-    for (const el of grownAncestors) el.style.minHeight = "";
-    grownAncestors.clear();
     if (queue.getBoundingClientRect().height === 0 || rows.length === 0) {
-      queue.style.maxHeight = "";
-      if (frame) frame.style.maxHeight = "";
+      for (const el of grownAncestors.keys()) el.style.minHeight = "";
+      grownAncestors.clear();
+      if (queue.style.maxHeight) queue.style.maxHeight = "";
+      if (frame?.style.maxHeight) frame.style.maxHeight = "";
     } else {
       /* Exact height of the first min(N,3) rows including inter-row gaps —
          measured, not multiplied. The scroll element carries its own vertical
@@ -108,8 +109,10 @@ export function enforce(form: Element, win: Window, retry = true): void {
         ? Math.max(measured, Math.ceil(queue.scrollHeight))
         : measured;
       const roomBefore = queue.getBoundingClientRect().height;
-      queue.style.maxHeight = `${queueMax}px`;
-      if (frame) frame.style.maxHeight = `${queueMax + Math.ceil(padY(frame))}px`;
+      const qMax = `${queueMax}px`;
+      if (queue.style.maxHeight !== qMax) queue.style.maxHeight = qMax;
+      const fMax = `${queueMax + Math.ceil(padY(frame ?? queue))}px`;
+      if (frame && frame.style.maxHeight !== fMax) frame.style.maxHeight = fMax;
       /* The frame is flex-1 inside the queue panel: when the panel's own
          height is host-budgeted, extra max-height on the scroll just clips.
          Grow every ancestor up to the composer card by the missing delta so
@@ -118,6 +121,9 @@ export function enforce(form: Element, win: Window, retry = true): void {
          needs (child's target) + (its slack for other children), so the
          delta is not double-counted up the chain — idempotent too. */
       const delta = queueMax - roomBefore;
+      /* Reconcile instead of clear→set: drop ancestors no longer needed,
+         rewrite only those whose target changed — no self-mutation churn. */
+      const wanted = new Map<HTMLElement, number>();
       if (delta > 1) {
         let needed = queueMax + Math.ceil(padY(frame ?? queue));
         let child: Element = frame ?? queue;
@@ -126,14 +132,25 @@ export function enforce(form: Element, win: Window, retry = true): void {
           const h = el as HTMLElement;
           const slack = h.getBoundingClientRect().height -
             child.getBoundingClientRect().height;
-          const want = needed + Math.max(0, slack);
-          if (h.getBoundingClientRect().height < want - 1) {
-            h.style.minHeight = `${Math.ceil(want)}px`;
-            grownAncestors.add(h);
+          const want = Math.ceil(needed + Math.max(0, slack));
+          if (h.getBoundingClientRect().height < want - 1 || grownAncestors.has(h)) {
+            wanted.set(h, want);
           }
           needed = want;
           child = el;
           el = el.parentElement;
+        }
+      }
+      for (const [el, v] of wanted) {
+        if (grownAncestors.get(el) !== v) {
+          el.style.minHeight = `${v}px`;
+          grownAncestors.set(el, v);
+        }
+      }
+      for (const el of [...grownAncestors.keys()]) {
+        if (!wanted.has(el)) {
+          el.style.minHeight = "";
+          grownAncestors.delete(el);
         }
       }
       if (retry && !pendingRetry.has(form)) {
@@ -152,9 +169,10 @@ export function enforce(form: Element, win: Window, retry = true): void {
      scrollHeight reports content height even while clamped, so this stays stable
      and converges instead of oscillating between capped/uncapped states. */
   const natural = formH - cur + Math.min(scroll.scrollHeight, BB_EDITOR_CEILING_PX);
-  scroll.style.maxHeight = natural > cap
+  const eMax = natural > cap
     ? `${Math.max(MIN_EDITOR_PX, Math.floor(cur - (formH - cap)))}px`
     : "";
+  if (scroll.style.maxHeight !== eMax) scroll.style.maxHeight = eMax;
 }
 
 export function mountComposerCap(
@@ -192,7 +210,10 @@ export function mountComposerCap(
     subtree: true,
     childList: true,
     attributes: true,
-    attributeFilter: ["aria-hidden", "inert"],
+    /* class/style flips carry host state (idle↔active turn) that childList
+       and aria-hidden never report — without them a stale grown ancestor
+       held dead space until the next stream of mutations. */
+    attributeFilter: ["aria-hidden", "inert", "class", "style"],
   });
   win.addEventListener("resize", rescan);
   rescan();

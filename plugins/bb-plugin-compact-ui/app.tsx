@@ -988,6 +988,12 @@ function NavDiagBridge() {
               h: Math.round(li.getBoundingClientRect().height),
               kind: Object.keys((li as HTMLElement).dataset)[0] || "",
             })) : [],
+            cardChildren: (() => {
+              const c = document.querySelector("[data-app-composer]");
+              return c ? Array.from(c.children).map((el) => ({ ...box(el), tag: el.tagName,
+                data: Object.keys((el as HTMLElement).dataset).slice(0,3).join(","),
+                minH: (el as HTMLElement).style?.minHeight || "" })) : [];
+            })(),
             ancestors: (() => {
               const out = [];
               let el = q?.parentElement;
