@@ -35,6 +35,7 @@ import {
   runJson,
   type BbCli,
 } from "./bb-cli.js";
+import type { CmdRunner } from "./cmd.js";
 
 export interface SetupError {
   step: string;
@@ -97,6 +98,9 @@ export interface DelegateDeps {
   loadPolicy(): Promise<PolicyLoad>;
   probes: ExecutorProbes;
   dispatchTimeoutMs?: number;
+  /** §17.3: git access for the continue-point ancestry check — without
+   * it `continuePoint` falls back to the timestamp heuristic. */
+  cmd?: CmdRunner;
   /** §2.2 git rules, read fresh at dispatch so edits and reissues see the
    * current setting. */
   gitInstructions?: () => string | undefined;
@@ -330,8 +334,10 @@ export async function runDelegate(
   // §4.1 rounds: every delegate is a new round — §17.2 (e2e 2): counted
   // by EXECUTOR-role delegations only, so review and release-audit rounds
   // no longer shift the «Заход N» number the coordinator sees. The round
-  // continues from `--from`, else from the previous round's recorded
-  // result SHA; `--fresh` disables continuation.
+  // continues from `--from`, else from the task's continue point — the
+  // previous round's result SHA, or the newer `published_sha` a release
+  // left (§17.3 С4: the repeat release fast-forwards the same remote
+  // branch); `--fresh` disables continuation.
   const round =
     Math.max(
       0,
@@ -342,7 +348,21 @@ export async function runDelegate(
     ) + 1;
   const continueFrom = params.fresh
     ? null
-    : (params.from ?? store.latestResultByTask(taskKey)?.result_sha ?? null);
+    : (params.from ??
+      (await store.continuePoint(
+        taskKey,
+        // no git access (tests, odd embedders) → the timestamp heuristic
+        deps.cmd
+          ? async (repoPath, a, b) => {
+              const r = await deps.cmd!.run(
+                "git",
+                ["-C", repoPath, "merge-base", "--is-ancestor", a, b],
+                { timeoutMs: 30_000 },
+              );
+              return r.exitCode === 0;
+            }
+          : undefined,
+      )) ?? null);
 
   // Step 2 — the unique index makes this atomic across processes.
   let row;
