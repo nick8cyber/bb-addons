@@ -147,6 +147,22 @@ watchdog — it would risk a double reissue.
   playbook, §3) and `orchestrator-setup` (§2.1) ship in `skills/` —
   setup always, coordinator only when `injectInstructions` is on.
 
+## Уборщик: восстановление
+
+Перед каждым удалением уборщик записывает SHA удаляемого в базу
+(`janitor_items.tip_sha`) и строку в журнал плагина
+(`removed branch|copy <репозиторий>:<ветка> at <sha>`; для копии — ещё
+её HEAD); `bb orchestrator janitor run`/`report --json` выводят их.
+Вернуть удалённую ветку:
+
+```
+git -C <репозиторий> branch <ветка> <sha>
+```
+
+Восстановление работает, пока `git gc` не убрал объекты — ориентировочно
+две недели (стандартный `gc.pruneExpire`). После — ни ветку, ни копию
+не вернуть.
+
 ## Ограничения
 
 - **Исполнители на другой машине не поддержаны.** Итог захода

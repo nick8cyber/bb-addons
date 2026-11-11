@@ -2480,20 +2480,21 @@ test("PLUG-217: a stale queued request on a stopped executor does not block rele
   assert.equal(res.status, "auditing");
 
   // a request that pre-dates the last completed turn is not a live turn
-  // either even when it is still fresh
+  // either even when it is still fresh — in a desc-ordered feed such a
+  // request can never head the list: the fresher completion does
   const beforeDone = makeDeps(repo, {
     execStatus: "idle",
     execEvents: () => [
       {
         seq: 9,
-        type: "client/turn/requested",
-        createdAt: Date.now() - 30_000,
+        type: "turn/completed",
+        createdAt: Date.now() - 10_000,
         data: {},
       },
       {
         seq: 8,
-        type: "turn/completed",
-        createdAt: Date.now() - 10_000,
+        type: "client/turn/requested",
+        createdAt: Date.now() - 30_000,
         data: {},
       },
     ],

@@ -202,6 +202,9 @@ interface EnvDto {
 interface ThreadDto {
   id: string;
   status?: string | null;
+  /** §17.4 (PLUG-219): a thread created mid-listing is excused from the
+   * two-pass comparison (it can legitimately appear in one pass only). */
+  createdAt?: number | null;
   /** §15 cond 4: anything but `none` keeps the copy. */
   queuedWork?: string | null;
   /** `bb thread list` precomputes this; absent on older BB → CLI fallback. */
@@ -226,8 +229,23 @@ export interface JanitorReportedItem {
   branch: string | null;
   threadId: string | null;
   reason: string;
+  /** §17.4 (PLUG-218): the ledger's `tip_sha`, when the row carries one. */
+  tipSha?: string | null;
   /** §16.3: true when this env was not already reported as abandoned. */
   isNew?: boolean;
+}
+
+/** §17.4 (ревью PLUG-218): one removal of the run — the SHAs that make
+ * `git branch <name> <sha>` restore possible (recover until gc). */
+export interface JanitorRemovedItem {
+  envId: string;
+  branch: string | null;
+  /** Git common dir of the repo the branch lives(d) in. */
+  repo: string | null;
+  /** Branch tip; for a copy — its own-branch tip, else HEAD. */
+  tipSha: string | null;
+  /** Copy HEAD at archive — copies only. */
+  headSha: string | null;
 }
 
 export interface JanitorRunSummary {
@@ -246,6 +264,9 @@ export interface JanitorRunSummary {
    * as ledger rows in report mode so `janitor report` can show them.
    */
   readyItems: JanitorReportedItem[];
+  /** §17.4 (PLUG-218): what was actually removed this run, with SHAs —
+   * `janitor run --json` prints it. */
+  removedItems: JanitorRemovedItem[];
   /** `bb/` branches without a copy, merged (deleted when applied). */
   orphanBranches: number;
   kept: Record<string, number>;
@@ -439,6 +460,12 @@ export function createJanitor(deps: JanitorDeps) {
       let lastIssue = "no pass completed";
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
+          // §17.4 (ревью PLUG-218): a thread created after the first
+          // pass began can legitimately sit in only one of the two
+          // sets — it is excused from the comparison (a missing
+          // createdAt cannot prove newness, so it still counts), yet
+          // it joins the proven list via the union of both passes.
+          const firstStartedAt = now();
           const first = await pass();
           if (first === null) {
             lastIssue = "a page was not an array";
@@ -449,14 +476,16 @@ export function createJanitor(deps: JanitorDeps) {
             lastIssue = "a page was not an array";
             continue;
           }
+          const bornDuring = (t: ThreadDto | undefined) =>
+            t?.createdAt != null && t.createdAt > firstStartedAt;
           const onlyFirst = [...first.keys()].filter(
-            (id) => !second.has(id),
+            (id) => !second.has(id) && !bornDuring(first.get(id)),
           );
           const onlySecond = [...second.keys()].filter(
-            (id) => !first.has(id),
+            (id) => !first.has(id) && !bornDuring(second.get(id)),
           );
           if (onlyFirst.length === 0 && onlySecond.length === 0) {
-            return [...second.values()];
+            return [...new Map([...first, ...second]).values()];
           }
           lastIssue =
             `pass sets differ (${first.size} vs ${second.size} ids; ` +
@@ -1259,6 +1288,7 @@ export function createJanitor(deps: JanitorDeps) {
       freedKb: 0,
       ready: 0,
       readyItems: [],
+      removedItems: [],
       orphanBranches: 0,
       kept: {},
       reported: [],
@@ -2458,6 +2488,35 @@ export function createJanitor(deps: JanitorDeps) {
         summary.ready += 1;
         summary.freedKb += sizeKb;
         reportedMem.delete(env.id);
+        // §17.4 (ревью PLUG-218): recoverability — with the removal the
+        // copy's HEAD and its branch tip go into the same ledger write
+        // (`tip_sha`) and the plugin journal, so the branch restores
+        // with `git branch <name> <sha>` while gc keeps the objects.
+        const repo = repoByEnv.get(env.id);
+        const envBranch = env.branchName?.trim();
+        const branchTip = envBranch
+          ? (
+              await gitOut(deps.cmd, repo?.root ?? env.path!, [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                `refs/heads/${envBranch}`,
+              ])
+            )?.trim() || null
+          : null;
+        const copyTip = branchTip ?? facts.headSha ?? null;
+        log.info?.(
+          `orchestrator janitor: removed copy ` +
+            `${repo?.commonDir ?? env.path}:${envBranch ?? "-"} ` +
+            `at ${copyTip ?? "-"} head ${facts.headSha ?? "-"}`,
+        );
+        summary.removedItems.push({
+          envId: env.id,
+          branch: env.branchName ?? null,
+          repo: repo?.commonDir ?? null,
+          tipSha: copyTip,
+          headSha: facts.headSha ?? null,
+        });
         deps.janitor.upsertItem(
           env.id,
           {
@@ -2470,6 +2529,7 @@ export function createJanitor(deps: JanitorDeps) {
             firstSeenAt: facts.firstSeenAt,
             removedAt: at,
             sizeKb,
+            tipSha: copyTip,
           },
           at,
         );
@@ -2688,6 +2748,20 @@ export function createJanitor(deps: JanitorDeps) {
           ) {
             summary.removedBranches += 1;
             deleted = true;
+            // §17.4 (ревью PLUG-218): the deleted tip goes to the
+            // plugin journal (and the ledger row below) — restore with
+            // `git branch <name> <sha>` while gc keeps the objects.
+            log.info?.(
+              `orchestrator janitor: removed branch ` +
+                `${commonDir}:${branch} at ${tip}`,
+            );
+            summary.removedItems.push({
+              envId,
+              branch,
+              repo: commonDir,
+              tipSha: tip ?? null,
+              headSha: null,
+            });
           } else {
             keep(summary, "branch-delete-failed");
           }
@@ -2715,6 +2789,7 @@ export function createJanitor(deps: JanitorDeps) {
                     ? "merged-ready"
                     : "branch-kept-config",
               removedAt: deleted ? at : null,
+              tipSha: deleted ? tip : null,
             },
             at,
           );
@@ -3203,6 +3278,7 @@ export function createJanitor(deps: JanitorDeps) {
           branch: i.branch,
           threadId: i.thread_id,
           reason: i.reason ?? "",
+          tipSha: i.tip_sha,
         })),
       // §17.4 (С9): «готова к удалению» rows — what `apply` would
       // remove. Written by report-mode and apply passes alike, so the
@@ -3221,6 +3297,7 @@ export function createJanitor(deps: JanitorDeps) {
           branch: i.branch,
           threadId: i.thread_id,
           reason: i.reason ?? "",
+          tipSha: i.tip_sha,
         })),
     };
   };

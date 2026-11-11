@@ -69,6 +69,9 @@ interface ThreadSpec {
   hasPendingInteraction?: boolean;
   archivedAt: number | null;
   updatedAt: number;
+  /** §17.4 (PLUG-219): a thread created mid-listing is excused from the
+   * two-pass comparison; absent → proves nothing → still counts. */
+  createdAt?: number;
   environmentId?: string | null;
   parentThreadId?: string | null;
   sourceThreadId?: string | null;
@@ -206,6 +209,7 @@ function makeWorld(opts: {
   const cleanedUp: string[] = [];
   const sent: { threadId: string; text: string }[] = [];
   const warns: string[] = [];
+  const infos: string[] = [];
 
   let threadListCalls = 0;
   let cliThreadListCalls = 0;
@@ -316,7 +320,10 @@ function makeWorld(opts: {
     },
     loadConfig: () => parseJanitorConfig(opts.config ?? CFG()),
     now: () => clock.t,
-    log: { warn: (m) => warns.push(m) },
+    log: {
+      info: (m) => infos.push(m),
+      warn: (m) => warns.push(m),
+    },
     hasProcessIn: opts.hasProcessIn ?? (async () => false),
     localHostId: () => opts.localHostId ?? "",
   };
@@ -333,6 +340,7 @@ function makeWorld(opts: {
     cleanedUp,
     sent,
     warns,
+    infos,
     sdkListArgs,
     get sdkListCalls() {
       return sdkListCalls;
@@ -4811,4 +4819,145 @@ test("apply leaves a copy held by live threads — not «готова» (PLUG-21
   assert.equal(w.janitor.item(envB.id)!.reason, "threads-remaining");
   assert.ok(!res.readyItems.some((i) => i.envId === envB.id));
   assert.ok(existsSync(envB.path));
+});
+
+// ── PLUG-219 (§17.4, ревью PLUG-218): восстановимость удалений ───────
+
+// Before a copy is removed its branch tip AND HEAD are recorded — the
+// tip in `janitor_items.tip_sha`, both in the plugin journal
+// (`removed copy <repo>:<branch> at <tip> head <head>`) and in
+// `run --json`'s removedItems.
+test("a removed copy stamps tip_sha, the journal carries HEAD too (§17.4 PLUG-219)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const head = git(env.path, ["rev-parse", "HEAD"]);
+  const tip = git(repo, ["rev-parse", env.branchName]);
+  const common = git(env.path, ["rev-parse", "--git-common-dir"]);
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  const row = w.janitor.item(env.id)!;
+  assert.equal(row.state, "removed");
+  assert.equal(row.tip_sha, tip);
+  // журнал: одна строка на удаление — `removed copy <repo>:<ветка>
+  // at <sha>` плюс HEAD копии
+  assert.ok(
+    w.infos.some(
+      (m) =>
+        m.includes(`removed copy ${common}:${env.branchName}`) &&
+        m.includes(`at ${tip}`) &&
+        m.includes(`head ${head}`),
+    ),
+    `infos: ${w.infos.join(" | ")}`,
+  );
+  // run --json: the removal and both SHAs are in the summary
+  const item = res.removedItems.find((i) => i.envId === env.id);
+  assert.deepEqual(item, {
+    envId: env.id,
+    branch: env.branchName,
+    repo: common,
+    tipSha: tip,
+    headSha: head,
+  });
+});
+
+// A swept copy-less `bb/` branch records its tip the same way — and a
+// later «ветки больше нет» write must not erase it (fields ?? prev).
+test("a swept branch records its tip; the gone-branch write keeps it (§17.4 PLUG-219)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const common = git(env.path, ["rev-parse", "--git-common-dir"]);
+  const key = `branch:${common}:${env.branchName}`;
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  await w.jan.run();
+  git(repo, ["worktree", "remove", "--force", env.path]);
+  const tip = git(repo, ["rev-parse", env.branchName]);
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 1);
+  assert.equal(w.janitor.item(key)!.tip_sha, tip);
+  assert.ok(
+    w.infos.some(
+      (m) =>
+        m.includes(`removed branch ${common}:${env.branchName}`) &&
+        m.includes(`at ${tip}`),
+    ),
+    `infos: ${w.infos.join(" | ")}`,
+  );
+  const item = res.removedItems.find((i) => i.envId === key);
+  assert.deepEqual(item, {
+    envId: key,
+    branch: env.branchName,
+    repo: common,
+    tipSha: tip,
+    headSha: null,
+  });
+  // report --json: the ledger row carries tip_sha
+  const rep = await w.jan.report();
+  assert.equal(
+    rep.items.find((i) => i.env_id === key)!.tip_sha,
+    tip,
+  );
+  // a later run re-writes the closed row («ветки больше нет») without
+  // a tip — the recorded SHA survives
+  await w.jan.run();
+  assert.equal(w.janitor.item(key)!.tip_sha, tip);
+});
+
+// §17.4 (ревью PLUG-218): a thread created after the first pass began
+// is excused from the two-pass comparison — it can only ever sit in
+// one set — yet still joins the proven list (the union). Without the
+// excuse the first pair always differed and burned its single retry.
+test("a thread created between the passes is excused and listed — not threads-unknown (§17.4 PLUG-219)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = [];
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    onThreadListCall: (call) => {
+      // run 1: call 1 = first pass, call 2 = second — a brand-new
+      // thread (created after the first pass began) lands in the
+      // second pass only; it is env-less, so it cannot block removal
+      if (call === 2) {
+        extras.push({
+          id: "thr_new",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: t,
+          createdAt: t + 1,
+        });
+      }
+    },
+  });
+  await w.jan.run();
+  // the first pair proved the list — no retry was needed (2 page
+  // fetches for two one-page passes, not 4)
+  assert.equal(w.sdkListCalls, 2);
+  assert.ok(
+    !w.warns.some((m) => /thread list unproven/.test(m)),
+    `warns: ${w.warns.join(" | ")}`,
+  );
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.kept["threads-unknown"] ?? 0, 0);
+  assert.equal(res.removedCopies, 1);
 });

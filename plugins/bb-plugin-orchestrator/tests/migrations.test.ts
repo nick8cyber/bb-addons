@@ -55,6 +55,7 @@ test("migrations create the §7 schema", () => {
     "size_kb",
     "state",
     "thread_id",
+    "tip_sha",
   ]);
 
   const runColumns = (db

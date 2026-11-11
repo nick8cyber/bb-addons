@@ -1348,16 +1348,14 @@ async function executorTurnActive(
     const newest = events[0];
     // a confirmed-stopped thread: only a queued request can still start
     // a turn — a stale `turn/started` means the turn died unreported.
-    // §17.3 (ревью PLUG-217): and only a FRESH one, newer than the last
-    // completed turn — a request that never reached `turn/started`
-    // (provider dead, client gone) would otherwise refuse every release
-    // until the executor wakes, which the gate exists to avoid.
+    // §17.3 (ревью PLUG-217): and only a FRESH one — the list is desc,
+    // so a request heading it is already newer than any completed
+    // turn; the 2-minute window is what lets a request that never
+    // reached `turn/started` (provider dead, client gone) stop
+    // refusing every release, which the gate exists to avoid.
     if (stopped) {
       if (newest?.type !== "client/turn/requested") return false;
-      const completedAt =
-        events.find((e) => e.type === "turn/completed")?.createdAt ?? 0;
       return (
-        newest.createdAt > completedAt &&
         (deps.now?.() ?? Date.now()) - newest.createdAt <=
           STALE_TURN_REQUEST_MS
       );

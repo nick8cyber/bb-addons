@@ -175,6 +175,11 @@ export const MIGRATIONS: readonly string[] = [
   // слияние, трейлер --no-docs). Гейт ревью не считает их чужими, в том
   // числе на повторном запуске после отказа.
   `ALTER TABLE releases ADD COLUMN pipeline_shas TEXT`,
+  // §17.4 (ревью PLUG-218): `tip_sha` — вершина удаляемого (ветка —
+  // её tip, копия — tip её ветки; HEAD копии уходит в журнал и
+  // `run --json`). Восстановление ветки: `git branch <ветка> <sha>`,
+  // пока gc не убрал объекты (ADR-0024 «Восстановимость»).
+  `ALTER TABLE janitor_items ADD COLUMN tip_sha TEXT`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -1586,6 +1591,9 @@ export interface JanitorItemRow {
   first_seen_at: number | null;
   last_checked_at: number | null;
   removed_at: number | null;
+  /** §17.4 (PLUG-218): tip of the removed branch (copies: own-branch
+   * tip, else HEAD) — restore with `git branch <name> <sha>`. */
+  tip_sha: string | null;
 }
 
 export interface JanitorRunRow {
@@ -1634,6 +1642,9 @@ export class JanitorStore {
       sizeKb?: number | null;
       firstSeenAt?: number | null;
       removedAt?: number | null;
+      /** §17.4 (PLUG-218): stamped only by the «removed» write; a later
+       * «ветки больше нет» write never erases it (`fields ?? prev`). */
+      tipSha?: string | null;
     },
     at: number,
   ): void {
@@ -1656,13 +1667,14 @@ export class JanitorStore {
         fields.removedAt !== undefined
           ? fields.removedAt
           : (prev?.removed_at ?? null),
+      tip_sha: fields.tipSha ?? prev?.tip_sha ?? null,
     };
     this.db
       .prepare(
         `INSERT INTO janitor_items (
           env_id, project_id, thread_id, path, branch, state, reason,
-          size_kb, first_seen_at, last_checked_at, removed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          size_kb, first_seen_at, last_checked_at, removed_at, tip_sha
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(env_id) DO UPDATE SET
           project_id = excluded.project_id,
           thread_id = excluded.thread_id,
@@ -1673,7 +1685,8 @@ export class JanitorStore {
           size_kb = excluded.size_kb,
           first_seen_at = excluded.first_seen_at,
           last_checked_at = excluded.last_checked_at,
-          removed_at = excluded.removed_at`,
+          removed_at = excluded.removed_at,
+          tip_sha = excluded.tip_sha`,
       )
       .run(
         envId,
@@ -1687,6 +1700,7 @@ export class JanitorStore {
         next.first_seen_at,
         at,
         next.removed_at,
+        next.tip_sha,
       );
   }
 
