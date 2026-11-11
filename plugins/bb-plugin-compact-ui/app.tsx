@@ -937,6 +937,27 @@ function NavDiagBridge() {
       void rpc.call("nav_top_row_poll", {}).then(({ command }) => {
         if (command === "test_more") runMoreSelfTest(win);
         const probe = command?.match(/^probe\s+(\d+)\s+(\d+)$/);
+        if (command === "dump_queue") {
+          const box = (el: Element | null | undefined) => {
+            if (!el) return null;
+            const h = el as HTMLElement;
+            const r = h.getBoundingClientRect();
+            return { h: Math.round(r.height), y: Math.round(r.top),
+              maxH: h.style?.maxHeight || "", cls: h.className?.toString?.().slice(0, 60) };
+          };
+          const q = document.querySelector("[data-queued-messages-scroll]");
+          win.__bbNavTopTest = {
+            cmd: command, ts: Date.now(), innerH: window.innerHeight,
+            card: box(document.querySelector("[data-app-composer]")),
+            frame: box(q?.closest("[data-queued-messages-scroll-frame]")),
+            scroll: q ? { ...box(q), scrollH: q.scrollHeight } : null,
+            editor: box(document.querySelector("div.overflow-y-auto:has(.ProseMirror)")),
+            rows: q ? Array.from(q.querySelectorAll("ul > li")).map((li) => ({
+              h: Math.round(li.getBoundingClientRect().height),
+              kind: Object.keys((li as HTMLElement).dataset)[0] || "",
+            })) : [],
+          };
+        }
         if (probe) {
           win.__bbNavTopTest = {
             cmd: command, ts: Date.now(),

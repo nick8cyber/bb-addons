@@ -35,6 +35,8 @@ function capPx(win: Window): number {
   return Math.max(120, Math.floor((win.innerHeight - OUTER_CHROME_PX) / 3));
 }
 
+let queueObserver: ((queue: Element) => void) | undefined;
+
 function enforce(form: Element, win: Window): void {
   const scroll = form.querySelector(EDITOR_SCROLL) as HTMLElement | null;
   if (!scroll) return;
@@ -44,6 +46,7 @@ function enforce(form: Element, win: Window): void {
     form.parentElement?.querySelector(QUEUE_SCROLL) ??
     null) as HTMLElement | null;
   if (queue) {
+    queueObserver?.(queue);
     const rows = queue.querySelectorAll(QUEUE_ITEM);
     const frame = queue.closest(QUEUE_FRAME) as HTMLElement | null;
     /* A collapsed panel stays mounted with a zero-height viewport — clamping it
@@ -94,9 +97,18 @@ export function mountComposerCap(
   const rescan = () => doc.querySelectorAll(PROMPTBOX).forEach(track);
   const ro = typeof ResizeObserver === "function"
     ? new ResizeObserver((entries) => {
-        for (const entry of entries) enforce(entry.target, win);
+        for (const entry of entries) {
+          /* An observed queue scroll resizes on expand/collapse — enforce the
+             card it lives in (or the first tracked card when it sits outside). */
+          const t = entry.target as Element;
+          const card = t.matches(PROMPTBOX)
+            ? t
+            : t.closest(PROMPTBOX) ?? forms.values().next().value;
+          if (card) enforce(card, win);
+        }
       })
     : null;
+  queueObserver = (queue) => ro?.observe(queue);
   const mo = new MutationObserver(rescan);
   mo.observe(doc.documentElement, { subtree: true, childList: true });
   win.addEventListener("resize", rescan);
@@ -105,6 +117,7 @@ export function mountComposerCap(
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    queueObserver = undefined;
     mo.disconnect();
     ro?.disconnect();
     win.removeEventListener("resize", rescan);
