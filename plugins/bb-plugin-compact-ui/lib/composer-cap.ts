@@ -205,15 +205,22 @@ export function mountComposerCap(
       })
     : null;
   queueObserver = (queue) => ro?.observe(queue);
-  const mo = new MutationObserver(rescan);
+  /* Host state flips (idle↔active turn) ride on class changes — childList
+     and aria-hidden never report them, so a stale grown ancestor held dead
+     space. `style` is deliberately NOT watched: the host mutates inline
+     styles constantly (virtualization, transitions), each record meant a
+     forced layout — that milled the page to a freeze. */
+  let moQueued = false;
+  const mo = new MutationObserver(() => {
+    if (moQueued) return;
+    moQueued = true;
+    win.setTimeout(() => { moQueued = false; rescan(); }, 0);
+  });
   mo.observe(doc.documentElement, {
     subtree: true,
     childList: true,
     attributes: true,
-    /* class/style flips carry host state (idle↔active turn) that childList
-       and aria-hidden never report — without them a stale grown ancestor
-       held dead space until the next stream of mutations. */
-    attributeFilter: ["aria-hidden", "inert", "class", "style"],
+    attributeFilter: ["aria-hidden", "inert", "class"],
   });
   win.addEventListener("resize", rescan);
   rescan();
