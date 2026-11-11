@@ -84,6 +84,12 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   commit trailers (e.g. `Co-Authored-By`) and e-mail addresses/domains
   from the machine scan's `foreign-bot-trailer` / `personal-email`
   rules.
+  The settings project (release spec §6 r8) is the bb project of the
+  executor copy's repository, resolved once at step 1 and stored in the
+  release row (`settings_project_id`); any resolver error refuses
+  (`release-settings-unknown` / `release-settings-ambiguous`). Test
+  fixtures for leak paths live in `tests/fixtures/leak-samples.ts`
+  (listed in `leaks.allow`), negative samples use `/home/example/`.
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
   `dispatching` rows via `bb tasks threads` or drops them, survives
