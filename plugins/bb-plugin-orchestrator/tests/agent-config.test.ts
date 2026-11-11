@@ -240,3 +240,31 @@ RULE`);
   });
   assert.equal(silent.instructions, undefined);
 });
+
+
+test("§16.7: invalid policy → role-less root thread gets only the setup skill", () => {
+  const config = buildAgentConfiguration(ctx({}), {
+    ...deps,
+    policyOk: false,
+  });
+  assert.deepEqual(config.tools, []);
+  assert.deepEqual(config.skills, ["orchestrator-setup"]);
+  assert.equal(config.instructions, undefined);
+  // A recorded role still resolves normally — the gate only covers the
+  // role-less fallback path.
+  const withRole = buildAgentConfiguration(ctx({}), {
+    ...deps,
+    policyOk: false,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "orchestrator",
+    },
+  });
+  assert.deepEqual(withRole.skills, [
+    "orchestrator-coordinator",
+    "orchestrator-setup",
+  ]);
+  // Valid policy → full coordinator issuance as before.
+  const ok = buildAgentConfiguration(ctx({}), { ...deps, policyOk: true });
+  assert.equal(ok.tools.length, 3);
+});

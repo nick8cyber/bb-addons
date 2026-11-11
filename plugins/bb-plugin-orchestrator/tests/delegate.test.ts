@@ -67,7 +67,11 @@ function makeDeps(overrides: {
       if (key.startsWith("tasks dispatch"))
         return ok(JSON.stringify({ task: { id: "task-1" }, preset: {}, threadId: "thr_exec" }));
       if (key.startsWith("tasks preset show"))
-        return ok(JSON.stringify({ preset: { permissionMode: "full" } }));
+        return ok(
+          JSON.stringify({
+            preset: { permissionMode: "full", providerId: "acp-devin" },
+          }),
+        );
       if (key.startsWith("thread options") && key.includes("--json"))
         return ok(
           JSON.stringify({
@@ -688,4 +692,191 @@ test("dispatch refusal without a model pattern holds nothing", async () => {
     runDelegate({ taskKey: "PLUG-1", level: "simple", caller: COORDINATOR }, deps),
   );
   assert.equal(store.heldGroups(Date.now()).size, 0);
+});
+
+
+// ── §2.3 r24: --route anywhere, --preset one-off, reviewByLevel ───────
+
+test("§2.3 --route outside the level chain dispatches that route", async () => {
+  const { deps, store } = makeDeps();
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "complex",
+      route: "simple",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.route, "simple");
+  const row = store.listActive()[0]!;
+  assert.equal(row.route, "simple");
+  assert.equal(row.preset, "simple");
+  assert.equal(row.level, "complex");
+});
+
+test("§2.3 --route and --preset are mutually exclusive", async () => {
+  const { deps } = makeDeps();
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        route: "simple",
+        preset: "one-off",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "incompatible-flags",
+  );
+});
+
+test("§2.3 --preset: one-off preset → route preset:<name>, provider recorded", async () => {
+  const { deps, store, calls } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: { providerId: "acp-opencode", permissionMode: "auto" },
+          }),
+        );
+      if (key.startsWith("tasks dispatch"))
+        return ok(JSON.stringify({ task: { id: "t1" }, threadId: "thr_p" }));
+      if (key.startsWith("thread options"))
+        return ok(JSON.stringify({ options: [] }));
+      return ok();
+    },
+  });
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "complex",
+      preset: "one-off",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.route, "preset:one-off");
+  const row = store.listActive()[0]!;
+  assert.equal(row.route, "preset:one-off");
+  assert.equal(row.preset, "one-off");
+  assert.equal(row.provider, "acp-opencode");
+  assert.ok(
+    calls.some((c) => c.args.join(" ").includes("--preset one-off")),
+    "dispatch should use the preset name",
+  );
+});
+
+test("§2.3 --preset: unknown preset refused before any dispatch", async () => {
+  const { deps, calls } = makeDeps({
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks preset show"))
+        return { exitCode: 1, stdout: "", stderr: "preset not found" };
+      return ok();
+    },
+  });
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "complex",
+        preset: "ghost",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "unknown-preset",
+  );
+  assert.ok(
+    !calls.some((c) => c.args.join(" ").startsWith("tasks dispatch")),
+  );
+});
+
+test("§2.3 --preset: derived provider quota group honors holds", async () => {
+  // "complex" route has provider acp-devin and no quotaGroup → group
+  // name "complex"; a held group refuses the one-off preset on it.
+  const { deps } = makeDeps({
+    held: [["complex", Date.now() + 60_000]],
+  });
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "complex",
+        preset: "one-off",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "route-held",
+  );
+});
+
+const REVIEW_POLICY = (() => {
+  const p = JSON.parse(POLICY_TEXT);
+  p.levels["review-mid"] = { role: "auditor", chain: ["simple"] };
+  p.levels.review = { chain: ["simple"] };
+  p.reviewByLevel = { simple: "review-mid" };
+  return JSON.stringify(p);
+})();
+
+test("§2.3 reviewByLevel: bare --level review maps to the executor's auditor level", async () => {
+  const { deps, store, calls } = makeDeps({ policyText: REVIEW_POLICY });
+  const exec = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "acp-opencode",
+  });
+  store.setStatus(exec.id, "done");
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "review", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.level, "review-mid");
+  assert.match(
+    res.note ?? "",
+    /review → review-mid по сложности исполнения simple/,
+  );
+  const row = store.listActive()[0]!;
+  assert.equal(row.level, "review-mid");
+  assert.ok(
+    calls.some((c) =>
+      c.args.join(" ").includes("review → review-mid по сложности исполнения simple"),
+    ),
+    "the task comment should carry the mapping note",
+  );
+  // The auditor level binds the auditor role.
+  assert.equal(store.threadRole("thr_exec")?.role, "auditor");
+});
+
+test("§2.3 reviewByLevel: --route/--preset keep the caller's level (no mapping)", async () => {
+  const { deps, store } = makeDeps({ policyText: REVIEW_POLICY });
+  const exec = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "acp-opencode",
+  });
+  store.setStatus(exec.id, "done");
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "review",
+      route: "simple",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.level, "review");
+  assert.equal(res.note, undefined);
 });

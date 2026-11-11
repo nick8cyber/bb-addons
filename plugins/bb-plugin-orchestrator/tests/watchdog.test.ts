@@ -2295,3 +2295,61 @@ test("§5.3 r23: a failed turn/completed still decides when errors trail it → 
   const toExec = h.sends.find((s) => s.threadId === "thr_e1")!;
   assert.match(JSON.stringify(toExec.input), /оборвался ошибкой/);
 });
+
+
+// ── §2.3 r24: outside-chain routes reissue from the chain's start ─────
+
+test("§5.4/§16.8: --route outside the chain reissues from the chain start", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    route: "custom-x", // explicit --route outside the level chain
+    preset: "custom-x",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(
+    fresh.route,
+    "simple",
+    "outside-chain route → reissue starts at the chain's beginning",
+  );
+});
+
+test("§5.4: in-chain route still reissues only the routes after it", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple-alt" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  // simple-alt is the LAST chain route → nothing after it → stays stalled.
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+  assert.equal(h.store.listActive().length, 0);
+});
+
+test("§2.3 preset: one-off route reissues from chain start + quota group via provider", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    route: "preset:one-off",
+    preset: "one-off",
+    provider: "acp-opencode", // same provider as `simple` → group "zen"
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple");
+});

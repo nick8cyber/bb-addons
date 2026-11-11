@@ -118,6 +118,9 @@ export interface OrchestratorDeps {
 interface PresetListEntry {
   id?: string;
   name?: string;
+  /** §2.3 one-off presets + §16.8 worktree check need provider/env kind. */
+  providerId?: string;
+  environmentKind?: string;
 }
 
 const describeError = (e: unknown) =>
@@ -204,6 +207,8 @@ export async function createPlugin(
     pendingRole: (projectId) => store.pendingRole(projectId),
     activeDelegationByTaskKey: (taskKey) =>
       store.activeByTaskKey(taskKey),
+    // §16.7: level→role map + "invalid policy → root chat gets no role".
+    policy: () => policyLoad.policy,
   };
 
   /**
@@ -218,6 +223,9 @@ export async function createPlugin(
     const text = currentSettings.policy ?? "";
     if (!checkPresets) return parsePolicy(text);
     let knownPresets: Set<string> | undefined;
+    let presetDetails:
+      | Map<string, { environmentKind?: string | null }>
+      | undefined;
     let presetWarning: string | undefined;
     try {
       const res = await runJson<{ presets?: PresetListEntry[] }>(
@@ -230,10 +238,23 @@ export async function createPlugin(
           [p.name, p.id].filter((x): x is string => typeof x === "string"),
         ),
       );
+      presetDetails = new Map(
+        (res.presets ?? []).flatMap((p) =>
+          [p.name, p.id]
+            .filter((x): x is string => typeof x === "string")
+            .map(
+              (key) =>
+                [
+                  key,
+                  { environmentKind: p.environmentKind ?? null },
+                ] as const,
+            ),
+        ),
+      );
     } catch (e) {
       presetWarning = `preset check skipped: ${describeError(e)}`;
     }
-    const load = parsePolicy(text, knownPresets);
+    const load = parsePolicy(text, knownPresets, presetDetails);
     if (presetWarning) {
       load.warnings.push({ path: "policy", message: presetWarning });
     }
@@ -333,6 +354,7 @@ export async function createPlugin(
         injectInstructions: currentSettings.injectInstructions ?? true,
         instructionsText: instructionsText(),
         probes,
+        policyOk: policyLoad.policy !== null,
       });
       // §13.2 п.4: reflect the decided role into display metadata. The
       // hook itself may not touch the network, so the write rides on the
@@ -390,6 +412,7 @@ export async function createPlugin(
     taskKey: string;
     level: string;
     route?: string;
+    preset?: string;
     instructions?: string;
     from?: string;
     fresh?: boolean;
@@ -436,6 +459,7 @@ export async function createPlugin(
     bbCli,
     threads: bb.sdk.threads,
     gitInstructions: () => currentSettings.gitInstructions,
+    policy: () => policyLoad.policy,
   };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),
@@ -648,7 +672,11 @@ export async function createPlugin(
       route: z
         .string()
         .optional()
-        .describe("Route name within the level chain; defaults to the first available"),
+        .describe("Any route name declared in the policy (not only the level's chain); defaults to the first available"),
+      preset: z
+        .string()
+        .optional()
+        .describe("One-off: an existing `bb tasks` preset name, dispatched outside the policy. Mutually exclusive with `route`"),
       instructions: z
         .string()
         .optional()
@@ -823,7 +851,7 @@ export async function createPlugin(
         name: "delegate",
         summary: "Dispatch a task to an executor under the policy",
         usage:
-          "bb orchestrator delegate <KEY> --level <level> [--route <route>] [--instructions <text>] [--from <sha|branch>] [--fresh] [--json]",
+          "bb orchestrator delegate <KEY> --level <level> [--route <route>|--preset <preset>] [--instructions <text>] [--from <sha|branch>] [--fresh] [--json]",
       },
       {
         name: "status",
@@ -876,7 +904,8 @@ export async function createPlugin(
       };
       const positional = argv.filter(
         (a, i) => !a.startsWith("--") && argv[i - 1] !== "--level" &&
-          argv[i - 1] !== "--route" && argv[i - 1] !== "--instructions" &&
+          argv[i - 1] !== "--route" && argv[i - 1] !== "--preset" &&
+          argv[i - 1] !== "--instructions" &&
           argv[i - 1] !== "--coordinator" && argv[i - 1] !== "--from",
       );
       const cmd = positional[0];
@@ -888,13 +917,14 @@ export async function createPlugin(
           if (!taskKey || !level) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>] [--instructions <t>] [--from <sha|branch>] [--fresh]",
+              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>|--preset <p>] [--instructions <t>] [--from <sha|branch>] [--fresh]",
             );
           }
           const res = await delegate({
             taskKey,
             level,
             route: flag("--route"),
+            preset: flag("--preset"),
             instructions: flag("--instructions"),
             from: flag("--from"),
             fresh: argv.includes("--fresh"),
@@ -906,6 +936,7 @@ export async function createPlugin(
                 exitCode: 0,
                 stdout:
                   `delegated ${res.taskKey}: level=${res.level} route=${res.route} thread=${res.threadId} (delegation #${res.delegationId})` +
+                  (res.note ? `\nnote: ${res.note}` : "") +
                   (res.setupErrors.length
                     ? `\nsetup errors: ${res.setupErrors.map((s) => `${s.step}: ${s.message}`).join("; ")}`
                     : "") +

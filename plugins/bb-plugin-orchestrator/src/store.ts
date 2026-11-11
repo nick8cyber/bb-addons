@@ -899,6 +899,19 @@ export class DelegationStore {
       .run(...args);
   }
 
+  /**
+   * §2.3 r24: all delegations of the task, newest first — the caller
+   * filters by level role (the policy decides which levels audit) or
+   * status. Used by reviewByLevel mapping and release acceptance.
+   */
+  delegationsByTask(taskKey: string): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations WHERE task_key = ? ORDER BY id DESC`,
+      )
+      .all(normalizeTaskKey(taskKey)) as DelegationRow[];
+  }
+
   /** Latest release-audit delegation of a task (§3): the chain reissue
    * inserts newer rows, so "the audit's delegation" is always the newest
    * `release-audit` row for the task key. */

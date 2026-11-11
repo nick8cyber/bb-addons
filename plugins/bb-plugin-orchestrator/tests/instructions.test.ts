@@ -86,3 +86,20 @@ test("huge descriptions are truncated to the budget", () => {
   const text = generateRoutingRule(huge);
   assert.ok(text.length <= ROUTING_RULE_MAX, `len=${text.length}`);
 });
+
+test("§2.3: auditor levels are tagged and reviewByLevel is surfaced", () => {
+  const policy: Policy = {
+    ...POLICY,
+    reviewByLevel: { complex: "review-hard", medium: "review-mid" },
+    levels: {
+      ...POLICY.levels,
+      "review-hard": { role: "auditor", chain: ["review"] },
+      "review-mid": { role: "auditor", chain: ["review"] },
+    },
+  };
+  const text = generateRoutingRule(policy);
+  assert.ok(text.length <= ROUTING_RULE_MAX, `len=${text.length}`);
+  assert.match(text, /review-hard \(проверка — только чтение\)/);
+  assert.match(text, /complex → review-hard/);
+  assert.match(text, /delegate --level review/);
+});
