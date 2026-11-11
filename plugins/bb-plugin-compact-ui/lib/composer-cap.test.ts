@@ -97,30 +97,32 @@ describe("enforce: expanded queue shows exactly min(N,3) items", () => {
     // queue clamp is unconditional: 1 row still bounded
     expect(scroll.style.maxHeight).toBe("80px");
   });
-  it("grows panel ancestors only when constrained, slack from real siblings", () => {
+  it("grows only the queue's own section, slack from in-section siblings", () => {
     const { card, scroll, frame } = buildDom({ rows: 2 });
     box(scroll, 0, 103);
     box(frame, 0, 103);
-    // Tight panel (140) with a 30px sibling bar beside the frame.
-    const panel = document.createElement("div");
-    const sibling = document.createElement("div");
-    box(sibling, 0, 30);
+    // Real host shape: section > [header 30 + frame]; the grid/card above
+    // must never get a min-height — it stretch-inflates sibling tracks.
+    const section = document.createElement("section");
+    const header = document.createElement("div");
+    box(header, 0, 30);
     card.removeChild(frame);
-    panel.appendChild(sibling);
-    panel.appendChild(frame);
-    card.insertBefore(panel, card.firstChild);
-    box(panel, 0, 140);
+    section.appendChild(header);
+    section.appendChild(frame);
+    card.insertBefore(section, card.firstChild);
+    box(section, 0, 140);
     enforce(card, win);
-    // needed 140 + sibling slack 30 = 170 > 140 → grown
-    expect(panel.style.minHeight).toBe("170px");
-    // Sibling collapses (idle state) → slack 0 → want 140 ≤ h → released
-    box(sibling, 0, 0);
+    // needed frame 140 + header slack 30 = 170 > 140 → grown on the section
+    expect(section.style.minHeight).toBe("170px");
+    expect(card.style.minHeight).toBe("");
+    // Header collapses (idle state) → slack 0 → want 140 ≤ h → released
+    box(header, 0, 0);
     enforce(card, win);
-    expect(panel.style.minHeight).toBe("140px");
+    expect(section.style.minHeight).toBe("140px");
     // queue collapse → everything cleared
     box(scroll, 0, 0);
     enforce(card, win);
-    expect(panel.style.minHeight).toBe("");
+    expect(section.style.minHeight).toBe("");
     expect(scroll.style.maxHeight).toBe("");
   });
   it("dividers (h-0, marked) are not counted as items", () => {

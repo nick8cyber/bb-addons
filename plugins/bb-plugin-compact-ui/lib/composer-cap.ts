@@ -115,39 +115,35 @@ export function enforce(form: Element, win: Window, retry = true): void {
       if (frame && frame.style.maxHeight !== fMax) frame.style.maxHeight = fMax;
       /* The frame is flex-1 inside the queue panel: when the panel's own
          height is host-budgeted, extra max-height on the scroll just clips.
-         Grow every ancestor up to the composer card by the missing delta so
-         the space is actually granted. */
-      /* Grow ancestors by the space the child actually lacks: each level
-         needs (child's target) + (its slack for other children), so the
-         delta is not double-counted up the chain — idempotent too. */
+         Grow the queue's own <section> by the missing delta so the space is
+         actually granted — the flex column re-splits it onto the frame. */
       const delta = queueMax - roomBefore;
       /* Reconcile instead of clear→set: drop ancestors no longer needed,
          rewrite only those whose target changed — no self-mutation churn. */
       const wanted = new Map<HTMLElement, number>();
       if (delta > 1) {
-        let needed = queueMax + Math.ceil(padY(frame ?? queue));
-        let child: Element = frame ?? queue;
-        let el = child.parentElement;
-        while (el && el !== form && el !== form.ownerDocument.documentElement) {
-          const h = el as HTMLElement;
-          /* Slack = padding + REAL heights of the child's siblings. Measuring
-             ancestor.h − child.h instead fed our own min-height back into the
-             want — a grown floor confirmed itself forever, and when a sibling
-             (e.g. the active-turn status row) collapsed in idle, the held
-             space rendered as a dead gap under the queue card. */
-          let slack = padY(h);
-          for (const sib of Array.from(h.children)) {
-            if (sib !== child) {
+        /* Grow ONLY the queue's own section — never the grid ancestor. The
+           host grid stretches free space across ALL auto tracks
+           (align-content: normal → stretch): a grid min-height let the
+           collapsed banner row absorb the surplus, inflating it with dead
+           space and leaving a gap above/below the queue in idle. A section
+           min-height sizes its own track exactly — no surplus anywhere. */
+        const section = (frame ?? queue).closest("section") as HTMLElement | null;
+        if (section && section !== form) {
+          const neededFrame = queueMax + Math.ceil(padY(frame ?? queue));
+          /* Slack = padding + REAL heights of the frame's siblings inside
+             the section (header row, bottom chevron) — measured, so a
+             vanished sibling can't freeze a stale floor. */
+          let slack = padY(section);
+          for (const sib of Array.from(section.children)) {
+            if (sib !== (frame ?? queue)) {
               slack += (sib as HTMLElement).getBoundingClientRect().height;
             }
           }
-          const want = Math.ceil(needed + slack);
-          if (h.getBoundingClientRect().height < want - 1 || grownAncestors.has(h)) {
-            wanted.set(h, want);
+          const want = Math.ceil(neededFrame + slack);
+          if (section.getBoundingClientRect().height < want - 1 || grownAncestors.has(section)) {
+            wanted.set(section, want);
           }
-          needed = want;
-          child = el;
-          el = el.parentElement;
         }
       }
       for (const [el, v] of wanted) {
