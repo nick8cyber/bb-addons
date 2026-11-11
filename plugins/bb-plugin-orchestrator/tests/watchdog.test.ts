@@ -61,12 +61,16 @@ function makeHarness(
     /** §16.1: provider-retry status/cancel fail counts. */
     retryStatusFails?: number;
     retryCancelFails?: number;
+    /** §16.1: first N cancels answer `no_pending_retry` (row fired early). */
+    retryCancelNoPending?: number;
     /** §4.1 round-result seam; absent → the done path skips collection. */
     round?: WatchdogDeps["round"];
+    /** B1: a pre-migrated "old" database — caller drives the schema. */
+    db?: import("better-sqlite3").Database;
   } = {},
 ) {
-  const db = new Database(":memory:");
-  for (const m of MIGRATIONS) db.exec(m);
+  const db = opts.db ?? new Database(":memory:");
+  if (!opts.db) for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
   const calls: string[][] = [];
   const cli: BbCli = {
@@ -87,6 +91,24 @@ function makeHarness(
         return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
       if (key.startsWith("tasks threads"))
         return ok(JSON.stringify({ taskThreads: [] }));
+      // §16.5 attach-verify: `bb thread show <id> --json` answers the
+      // thread facts from the DTO map (parentNotifications included).
+      if (args[0] === "thread" && args[1] === "show") {
+        const dto = threadDtos.get(args[2]!);
+        if (!dto)
+          return { exitCode: 1, stdout: "", stderr: "thread not found" };
+        return ok(JSON.stringify({ thread: dto }));
+      }
+      // `bb thread update <id> --parent-notifications <v>` applies to the DTO.
+      if (args[0] === "thread" && args[1] === "update") {
+        const dto = threadDtos.get(args[2]!);
+        const i = args.indexOf("--parent-notifications");
+        if (dto && i >= 0) {
+          (dto as { parentNotifications?: string }).parentNotifications =
+            args[i + 1];
+        }
+        return ok();
+      }
       return ok();
     },
   };
@@ -110,6 +132,7 @@ function makeHarness(
   const retryKnobs = {
     statusFails: opts.retryStatusFails ?? 0,
     cancelFails: opts.retryCancelFails ?? 0,
+    cancelNoPending: opts.retryCancelNoPending ?? 0,
   };
   /** Call-order record: `stop:<id>`, `retry-status:<id>`, `retry-cancel:<id>`. */
   const ops: string[] = [];
@@ -246,9 +269,20 @@ function makeHarness(
           retryKnobs.cancelFails--;
           throw new Error("provider-retry cancel failed (test)");
         }
+        if (retryKnobs.cancelNoPending > 0) {
+          retryKnobs.cancelNoPending--;
+          ops.push(`retry-cancel:${threadId}`);
+          throw new Error(
+            "bb provider-retry cancel failed (exit 1): no_pending_retry",
+          );
+        }
         ops.push(`retry-cancel:${threadId}`);
         retryCancels.push(threadId);
-        retryPendingRows.delete(threadId);
+        // §16.1: BB's cancel drops ONE queued row per call.
+        const rows = retryPendingRows.get(threadId) ?? [];
+        rows.shift();
+        if (rows.length) retryPendingRows.set(threadId, rows);
+        else retryPendingRows.delete(threadId);
       },
     },
     ...(opts.round ? { round: opts.round } : {}),
@@ -2113,6 +2147,9 @@ const roundDeps = (repo: string, branchName = "exec-branch") => ({
 async function runToDone(h: ReturnType<typeof makeHarness>) {
   const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  // §16.5 one channel: a live coordinator receives the result message
+  // (the round doubts ride it, PLUG-184 M12).
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.eventLog.set("thr_e1", [
     ev(1, "turn/started", T0),
     ev(2, "turn/completed", T0 + 10, { status: "completed" }),
@@ -2660,7 +2697,7 @@ test("§16.2: a duplicate turn is stopped when the task has an active row", asyn
   assert.deepEqual(h.stops, ["thr_e1"]);
   assert.match(
     JSON.stringify(h.sends.at(-1)!.input),
-    /уже есть активное делегирование/,
+    /более новое делегирование/,
   );
 });
 
@@ -2860,6 +2897,18 @@ test("§16.5: post-compaction §3 reminder — one per thread/compacted", async 
   h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
   h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
   h.eventLog.set("thr_coord", [ev(9, "thread/compacted", T0)]);
+  // PLUG-184 B1: the first sight of a coordinator initializes the cursor
+  // to the newest existing seq — old compactions owe no reminder.
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    0,
+  );
+  // a NEW compaction event fires the reminder
+  h.eventLog.set("thr_coord", [
+    ev(9, "thread/compacted", T0),
+    ev(10, "thread/compacted", T0 + 60_000),
+  ]);
   await h.wd.reconcile();
   const msgs = h.sends.filter(
     (x) => x.threadId === "thr_coord" && /сжат/.test(JSON.stringify(x.input)),
@@ -2871,10 +2920,10 @@ test("§16.5: post-compaction §3 reminder — one per thread/compacted", async 
     h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
     1,
   );
-  // a NEW compaction event re-fires the reminder
   h.eventLog.set("thr_coord", [
     ev(9, "thread/compacted", T0),
     ev(10, "thread/compacted", T0 + 60_000),
+    ev(11, "thread/compacted", T0 + 120_000),
   ]);
   await h.wd.reconcile();
   assert.equal(
@@ -2918,4 +2967,323 @@ test("§16.5: drifted binding re-applied until attach-verified", async () => {
   await h.wd.reconcile();
   assert.match(h.store.get(row.id)!.setup_errors, /attach-verified/);
   assert.equal(h.wdUpdates.length, updatesBefore); // no further re-apply
+});
+
+// ── PLUG-184 review fixes (r25 rollout) ───────────────────────────────
+
+test("PLUG-184 B1: an old base's migration marks legacy results; first reconcile sends nothing", async () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS.slice(0, -1)) db.exec(m); // pre-rollout schema
+  db.prepare(
+    `INSERT INTO delegations (task_key, coordinator_thread_id, thread_id,
+       level, route, preset, provider, status, created_at, updated_at)
+     VALUES ('PLUG-OLD','thr_coord','thr_old','simple','simple','simple',
+       'acp-opencode','done',?,?)`,
+  ).run(T0 - 10_000, T0 - 9_000);
+  db.exec(MIGRATIONS.at(-1)!); // the rollout UPDATE
+  const stored = db
+    .prepare(`SELECT result_notified_at, result_notice FROM delegations`)
+    .get() as { result_notified_at: number | null; result_notice: string };
+  assert.equal(stored.result_notice, "legacy");
+  assert.ok(stored.result_notified_at != null);
+
+  const h = makeHarness({ db });
+  h.threadDtos.set("thr_old", dto("thr_old", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_coord", [ev(7, "thread/compacted", T0 - 1000)]);
+  const s = await h.wd.reconcile();
+  assert.equal(
+    h.sends.length,
+    0,
+    "first reconcile re-sends no legacy result or compaction reminder",
+  );
+  // a NEW compaction still fires the reminder
+  h.eventLog.set("thr_coord", [
+    ev(7, "thread/compacted", T0 - 1000),
+    ev(8, "thread/compacted", T0),
+  ]);
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter((x) => /сжат/.test(JSON.stringify(x.input))).length,
+    1,
+  );
+});
+
+test("PLUG-184 B2: a tracker comment waking an OLD round → cancel+stop, status stands", async () => {
+  const h = makeHarness();
+  const old = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(old.id, "done");
+  h.store.advanceLastSeq(old.id, 5);
+  h.store.setResultNotified(old.id, "plugin");
+  h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e2" }); // newer round
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.retryPendingRows.set("thr_e1", [{}]);
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_coord: ок" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  assert.equal(h.store.get(old.id)!.status, "done");
+  assert.deepEqual(h.retryCancels, ["thr_e1"]); // §16.1 cancel BEFORE stop
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  assert.equal(
+    h.sends.filter((x) => x.threadId === "thr_coord").length,
+    1,
+    "one suppression line",
+  );
+});
+
+test("PLUG-184 B2: a tracker comment on the LATEST round is not a revive", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [
+        { text: "New comment on task PLUG-1 from thr_coord: ping" },
+      ],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done"); // stays finished — notification wake
+  assert.equal(fresh.revived_count, 0);
+  assert.deepEqual(h.stops, []); // the latest round is never stopped
+});
+
+test("PLUG-184 B2: auto-retry lifts a reissued thread → cancel+stop+one line", async () => {
+  const h = makeHarness();
+  const old = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(old.id, "stalled");
+  h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.retryPendingRows.set("thr_e1", [{}]);
+  h.eventLog.set("thr_e1", [ev(3, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 3 });
+  const fresh = h.store.get(old.id)!;
+  assert.equal(fresh.status, "reissued");
+  assert.deepEqual(h.retryCancels, ["thr_e1"]);
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  const lines = h.sends.filter((x) => x.threadId === "thr_coord");
+  assert.equal(lines.length, 1);
+  assert.match(JSON.stringify(lines[0]!.input), /reissued|перевыпуск|исхода/);
+});
+
+test("PLUG-184 M10: suppressed wake — stop repeats on a second turn, outcome still delivered", async () => {
+  const h = makeHarness();
+  const old = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(old.id, "done"); // outcome not delivered yet
+  h.store.advanceLastSeq(old.id, 5);
+  h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e2" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_e2", dto("thr_e2", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [ev(6, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 6 });
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  // the suppressed row's outcome still delivers — exactly once
+  await h.wd.reconcile();
+  const doneRow = h.store.get(old.id)!;
+  assert.equal(doneRow.result_notice, "plugin");
+  const results = h.sends.filter(
+    (x) => x.threadId === "thr_coord" && /: done/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(results.length, 1);
+  // a SECOND wake on the same thread stops again — one line total
+  h.eventLog.set("thr_e1", [
+    ev(6, "turn/started", T0),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  assert.equal(h.stops.length, 2);
+  assert.equal(
+    h.sends.filter(
+      (x) => x.threadId === "thr_coord" && /остановлен|останавливаю/.test(
+        JSON.stringify(x.input),
+      ),
+    ).length,
+    1,
+    "coordinator still heard the suppression exactly once",
+  );
+});
+
+test("PLUG-184 C3: claimResultDelivery is atomic; a stale claim rescans", () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  assert.ok(h.store.claimResultDelivery(row.id));
+  assert.ok(!h.store.claimResultDelivery(row.id), "second claim refused");
+  // a crashed claim (old updated_at) still shows up for the resend pass
+  h.db
+    .prepare(`UPDATE delegations SET updated_at = ? WHERE id = ?`)
+    .run(Date.now() - 200_000, row.id);
+  assert.deepEqual(h.store.listPendingResult().map((r) => r.id), [row.id]);
+  h.store.releaseResultClaim(row.id);
+  assert.equal(h.store.get(row.id)!.result_notified_at, null);
+  assert.ok(h.store.claimResultDelivery(row.id), "released claim retakes");
+});
+
+test("PLUG-184 C3: event done + reconcile → exactly one result send", async () => {
+  const h = makeHarness({ round: ROUND_FAKE });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await h.wd.reconcile(); // the second path must not resend
+  const msgs = h.sends.filter(
+    (x) =>
+      x.threadId === "thr_coord" &&
+      /\[orchestrator\] PLUG-1.*: done/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(h.store.get(row.id)!.result_notice, "plugin");
+});
+
+test("PLUG-184 C4: pending retry on a failed row with an active sibling → no revive, retry cancelled", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "failed");
+  const other = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e2" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.retryPendingRows.set("thr_e1", [{}]);
+  await h.wd.onTurnFailed({ threadId: "thr_e1", errorInfo: null });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "failed"); // revive refused — sibling owns it
+  assert.equal(fresh.revived_count, 0);
+  assert.equal(h.store.get(other.id)!.status, "running");
+  assert.deepEqual(h.retryCancels, ["thr_e1"]);
+});
+
+test("PLUG-184 C6: no_pending_retry is a drained queue; two rows need two cancels", async () => {
+  const h = makeHarness({ retryCancelNoPending: 1 });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  // first cancel answers no_pending_retry (row fired) then the queue
+  // reads empty — the decision is a success, not a stop-blocker.
+  h.retryPendingRows.set("thr_e1", [{}]);
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "reissued");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+
+  const h2 = makeHarness();
+  const row2 = h2.insertActive({ threadId: "thr_e1", route: "simple" });
+  h2.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h2.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h2.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h2.retryPendingRows.set("thr_e1", [{}, {}]); // two queued rows
+  h2.setNow(T0 + 31_000);
+  await h2.wd.checkTimers();
+  assert.equal(h2.store.get(row2.id)!.status, "reissued");
+  assert.deepEqual(h2.retryCancels, ["thr_e1", "thr_e1"]);
+  assert.deepEqual(h2.stops, ["thr_e1"]);
+});
+
+test("PLUG-184 C7: a final failed without autoFallback cancels the auto-retry first", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", ...STRICT });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  // entry check sees an empty queue; the row appears before the stop
+  h.retryStatusScript.push([], [{}], []);
+  await h.wd.onThreadFailed(dto("thr_e1", "error"), "provider blew up");
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "failed");
+  assert.deepEqual(h.retryCancels, ["thr_e1"]);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /завершился с ошибкой/,
+  );
+});
+
+test("PLUG-184 M8: silence counts from the turn's own response; pending retry suppresses; a response re-arms", async () => {
+  const h = makeHarness({ policyText: TIMER_POLICY });
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    createdAt: T0 - 400_000,
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  // old turn with a stale response + a NEW turn (post auto-retry wait)
+  // that answered 40s ago — silence measures from the new turn, not the
+  // stale response (was: instant «нет событий ответа»).
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0 - 300_000),
+    ev(2, "item/agentMessage/delta", T0 - 290_000),
+    ev(3, "turn/started", T0 - 50_000),
+    ev(4, "item/agentMessage/delta", T0 - 40_000),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 4 });
+  const silenced = () =>
+    h.sends.filter((x) => /нет событий ответа/.test(JSON.stringify(x.input)))
+      .length;
+  await h.wd.checkTimers(); // silence 40s < 60s
+  assert.equal(silenced(), 0);
+  // a queued auto-retry is sleeping on BB, not silent
+  h.store.addSetupError(row.id, "provider-retry-pending", "auto-retry queued");
+  h.setNow(T0 + 30_000); // silence 70s — but suppressed
+  await h.wd.checkTimers();
+  assert.equal(silenced(), 0);
+  h.store.clearSetupError(row.id, "provider-retry-pending");
+  await h.wd.checkTimers();
+  assert.equal(silenced(), 1);
+  // a response after the notice re-arms it
+  h.eventLog.get("thr_e1")!.push(
+    ev(5, "item/agentMessage/delta", T0 + 31_000),
+  );
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 5 });
+  h.setNow(T0 + 100_000); // silence 69s after the response → a second notice
+  await h.wd.checkTimers();
+  assert.equal(silenced(), 2);
+});
+
+test("PLUG-184 M9: an unreadable `thread show` lands attach-verify once", async () => {
+  const h = makeHarness({
+    cli: (args) =>
+      args.join(" ").startsWith("thread show")
+        ? { exitCode: 1, stdout: "", stderr: "daemon down" }
+        : undefined,
+  });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.reconcile();
+  const fresh = h.store.get(row.id)!;
+  assert.doesNotMatch(fresh.setup_errors, /attach-verified/);
+  assert.match(fresh.setup_errors, /attach-verify.*thread show/);
+  const lines = h.sends.filter(
+    (x) => x.threadId === "thr_coord" && /привязка/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(lines.length, 1);
+});
+
+test("PLUG-184: a cancelled result never claims «коммитов нет»", async () => {
+  const repo = makeExecutorRepo({ commits: 0 });
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0 - 1000)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.store.setStatus(row.id, "cancelled");
+  // collect the round facts and deliver — the cancelled outcome must not
+  // brand «коммитов нет» (the executor was stopped mid-work).
+  const finished = h.store.get(row.id)!;
+  await (h.wd as any).reconcile();
+  const sends = h.sends.filter(
+    (x) => x.threadId === "thr_coord" && /cancelled/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(sends.length, 1);
+  assert.doesNotMatch(JSON.stringify(sends[0]!.input), /коммитов нет/);
 });

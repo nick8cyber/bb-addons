@@ -44,8 +44,10 @@ import {
   runDelegate,
 } from "./src/delegate.js";
 import {
+  cancelProviderRetries,
   createWatchdog,
   findTaskThreadId,
+  providerRetryCli,
   type WatchdogThreads,
 } from "./src/watchdog.js";
 import {
@@ -585,25 +587,7 @@ export async function createPlugin(
     retrySetup: (row) => retrySetupSteps(row, stepsDeps),
     // §16.1: BB's own auto-retry queue via the CLI — `status` answers the
     // thread's pending retry rows, `cancel` drops them before an own stop.
-    providerRetry: {
-      pending: async (threadId) => {
-        const res = await runJson<{ retries?: unknown[] }>(bbCli, [
-          "provider-retry",
-          "status",
-          threadId,
-          "--json",
-        ]);
-        return res.retries ?? [];
-      },
-      cancel: async (threadId) => {
-        await runChecked(bbCli, [
-          "provider-retry",
-          "cancel",
-          threadId,
-          "--json",
-        ]);
-      },
-    },
+    providerRetry: providerRetryCli(bbCli),
     round: {
       // §4.1: the executor's environment from its thread, then the env's
       // own facts via `bb environment show`.
@@ -895,6 +879,17 @@ export async function createPlugin(
       // Status first, stop second — otherwise our own stop can read as external.
       store.setStatus(row.id, "cancelled");
       if (stopTarget) {
+        // §16.1/PLUG-184: the thread's queued BB auto-retry is cancelled
+        // BEFORE our stop — otherwise it lifts the cancelled executor
+        // back minutes later. A cancel failure does not block the user's
+        // cancel; it surfaces as the warning.
+        const cancelled = await cancelProviderRetries(
+          providerRetryCli(bbCli),
+          stopTarget,
+        );
+        if (cancelled !== true) {
+          warning = `auto-retry cancel failed: ${cancelled}`;
+        }
         try {
           await bb.sdk.threads.stop({ threadId: stopTarget });
         } catch (e) {

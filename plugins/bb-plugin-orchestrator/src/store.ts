@@ -122,6 +122,13 @@ export const MIGRATIONS: readonly string[] = [
      key TEXT PRIMARY KEY,
      value TEXT NOT NULL
    )`,
+  // §7 rev 25 rollout: delegations finished BEFORE the §16.5 delivery
+  // columns existed already reached the coordinator through BB's own
+  // parent notifications — they are marked `legacy` so the first
+  // reconcile does not re-send every stale result (PLUG-184 B1).
+  `UPDATE delegations SET result_notified_at = CAST(strftime('%s','now') AS INTEGER) * 1000,
+     result_notice = 'legacy'
+   WHERE status IN ('done','cancelled') AND result_notified_at IS NULL`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -528,7 +535,7 @@ export class DelegationStore {
    * coordinator records `result_notified_at` with a NULL `result_notice`
    * so the delivery does not rescan forever).
    */
-  setResultNotified(id: number, notice: "bb" | "plugin" | null): void {
+  setResultNotified(id: number, notice: "bb" | "plugin" | "legacy" | null): void {
     this.db
       .prepare(
         `UPDATE delegations SET result_notified_at = ?, result_notice = ?,
@@ -540,29 +547,92 @@ export class DelegationStore {
   /**
    * §16.2: a `turn/started` on a finished delegation revives it — back to
    * `running`, `revived_count += 1`, and the delivery record cleared so
-   * the next `done`/`cancelled` notifies again.
+   * the next `done`/`cancelled` notifies again. The check for another
+   * ACTIVE delegation of the same task runs inside the transaction —
+   * otherwise the partial unique index throws mid-handler (PLUG-184).
+   * Returns false when a sibling already owns the task.
    */
-  revive(id: number): void {
-    this.db
-      .prepare(
-        `UPDATE delegations SET status = 'running',
-         revived_count = revived_count + 1,
-         result_notified_at = NULL, result_notice = NULL,
-         first_response_at = NULL, last_response_at = NULL, updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(Date.now(), id);
+  revive(id: number): boolean {
+    return this.db.transaction(() => {
+      const row = this.get(id);
+      if (!row) return false;
+      const other = this.db
+        .prepare(
+          `SELECT 1 AS x FROM delegations
+           WHERE task_key = ? AND id <> ?
+             AND status IN ('dispatching','running') LIMIT 1`,
+        )
+        .get(row.task_key, id) as { x: number } | undefined;
+      if (other) return false;
+      this.db
+        .prepare(
+          `UPDATE delegations SET status = 'running',
+           revived_count = revived_count + 1,
+           result_notified_at = NULL, result_notice = NULL,
+           first_response_at = NULL, last_response_at = NULL, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(Date.now(), id);
+      return true;
+    })();
   }
 
-  /** §16.5: `done`/`cancelled` rows whose result was not delivered yet. */
+  /**
+   * §16.2: only the task's NEWEST delegation may revive — a row with a
+   * bigger id is a past round that must never work again.
+   */
+  hasNewerForTask(taskKey: string, id: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM delegations
+           WHERE task_key = ? AND id > ? LIMIT 1`,
+        )
+        .get(taskKey, id) !== undefined
+    );
+  }
+
+  /**
+   * §16.5 exactly-once (PLUG-184): the in-flight delivery marker —
+   * `UPDATE … WHERE result_notified_at IS NULL` is atomic, so a second
+   * caller (event vs reconcile pass, or a second plugin process) sees
+   * the claim and leaves. `updated_at` doubles as the claim's time: a
+   * crash leaves the claim until it goes stale (`listPendingResult`
+   * rescans it after two minutes).
+   */
+  claimResultDelivery(id: number): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = -1, updated_at = ?
+         WHERE id = ? AND result_notified_at IS NULL`,
+      )
+      .run(Date.now(), id);
+    return info.changes > 0;
+  }
+
+  /** A claimed delivery failed before the send — release it for a retry. */
+  releaseResultClaim(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = NULL
+         WHERE id = ? AND result_notified_at = -1`,
+      )
+      .run(id);
+  }
+
+  /** §16.5: `done`/`cancelled` rows whose result was not delivered yet —
+   * plus claims that went stale (a crash mid-delivery). */
   listPendingResult(): DelegationRow[] {
     return this.db
       .prepare(
         `SELECT * FROM delegations
-         WHERE status IN ('done','cancelled') AND result_notified_at IS NULL
+         WHERE status IN ('done','cancelled') AND (
+           result_notified_at IS NULL
+           OR (result_notified_at = -1 AND updated_at < ?)
+         )
          ORDER BY id`,
       )
-      .all() as DelegationRow[];
+      .all(Date.now() - 120_000) as DelegationRow[];
   }
 
   /** Distinct coordinator threads the store knows — the §16.5 reminder's scope. */
