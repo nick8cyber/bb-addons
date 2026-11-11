@@ -78,7 +78,7 @@ text plus the plugin tools and skills the thread may use.
   its own tools — provider built-ins (file edits, shell) stay governed by
   the preset's permission mode. The role's instruction reaches the agent
   only if the provider delivers BB instructions; on a provider that does
-  not, the role carries no text (agy pending PLUG-139; `acp-devin`
+  not, the role carries no text (agy on the ACP bridge delivers it; `acp-devin`
   restores instructions after compaction via `provider-devin`).
 
 ## Настройка
