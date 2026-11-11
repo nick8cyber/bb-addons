@@ -184,6 +184,21 @@ export const MIGRATIONS: readonly string[] = [
   // определённый один раз на шаге 1 — шаги 6–7 и повторные заходы той же
   // выкладки берут его из записи и заново не ищут.
   `ALTER TABLE releases ADD COLUMN settings_project_id TEXT`,
+  // §16.4 r29 (PLUG-240): журнал спасений — каждая попытка снимка
+  // грязной копии (и сбой) строкой: тред, ref, корень репозитория,
+  // причина, время и дошла ли строка координатору. `janitor report`
+  // читает её, не обходя репозитории, — спасённое без адресата не
+  // теряется.
+  `CREATE TABLE IF NOT EXISTS janitor_rescues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    ref TEXT,
+    repo_root TEXT,
+    reason TEXT NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at INTEGER NOT NULL
+  )`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -1620,6 +1635,19 @@ export interface JanitorRunRow {
   error: string | null;
 }
 
+/** §16.4 r29 (PLUG-240): one rescue snapshot attempt — success rows
+ * carry the ref, failures carry `error` and no ref. */
+export interface JanitorRescueRow {
+  id: number;
+  thread_id: string;
+  ref: string | null;
+  repo_root: string | null;
+  reason: string;
+  notified: number;
+  error: string | null;
+  created_at: number;
+}
+
 export class JanitorStore {
   private readonly db: Database;
 
@@ -1760,6 +1788,41 @@ export class JanitorStore {
     return this.db
       .prepare(`SELECT * FROM janitor_runs ORDER BY id DESC LIMIT 1`)
       .get() as JanitorRunRow | undefined;
+  }
+
+  /** §16.4 r29: append one rescue attempt to the ledger. */
+  addRescue(
+    r: {
+      threadId: string;
+      ref: string | null;
+      repoRoot: string | null;
+      reason: string;
+      notified: boolean;
+      error?: string | null;
+    },
+    at: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO janitor_rescues (
+          thread_id, ref, repo_root, reason, notified, error, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        r.threadId,
+        r.ref,
+        r.repoRoot,
+        r.reason,
+        r.notified ? 1 : 0,
+        r.error ?? null,
+        at,
+      );
+  }
+
+  rescues(): JanitorRescueRow[] {
+    return this.db
+      .prepare(`SELECT * FROM janitor_rescues ORDER BY id`)
+      .all() as JanitorRescueRow[];
   }
 
   meta(key: string): string | undefined {
