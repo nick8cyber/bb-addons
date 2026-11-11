@@ -72,6 +72,19 @@ function applySubagentGate(enabled: boolean) {
   } catch {}
 }
 
+/**
+ * devin acp exposes no local memory lever in this version: its Memory Drive /
+ * auto-notes are cloud-side features with no user-config key (the config
+ * schema has `disabled_tools`, but no memory tool is registered to disable —
+ * stamping speculative names there would claim an effect we cannot verify).
+ * Nothing is written; a real lever lands here when devin ships one.
+ */
+function applyMemoryGate(enabled: boolean) {
+  if (!enabled) {
+    log("memory gate: OFF requested, but devin acp has no local memory lever (cloud Memory Drive/notes only); nothing applied");
+  }
+}
+
 const GATE_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
 
 export const experimental_providerBridge = {
@@ -86,6 +99,8 @@ export const experimental_providerBridge = {
       if (msg !== null && typeof msg === "object" && GATE_METHODS.has(msg.method)) {
         const enabled = msg.params?.options?.providerOptions?.providerSubagentsEnabled;
         if (typeof enabled === "boolean") applySubagentGate(enabled);
+        const memoryEnabled = msg.params?.options?.providerOptions?.providerMemoryEnabled;
+        if (typeof memoryEnabled === "boolean") applyMemoryGate(memoryEnabled);
       }
     } catch {}
     inner.handleLine(line);

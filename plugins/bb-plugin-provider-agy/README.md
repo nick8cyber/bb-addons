@@ -460,6 +460,21 @@ additively merges `antigravityConfig.subagentsConfig.enabled=<resolved>`
 home's `.gemini/settings.json` on each launch — so a re-enable actually
 takes effect.
 
+#### Native agy memory is disabled
+
+The same class of hidden state: agy's own memory tools persist notes about
+the work inside the account home, invisible to bb. The central setting
+`memoryEnabled` (default **off**;
+`bb plugin config provider-agy set memoryEnabled true` re-enables it) is
+derived as `options.providerOptions.providerMemoryEnabled` — same contract
+as codex/claude-code. Resolution order: `AGY_DISABLE_MEMORY` env override
+(`0` allows) > the derived option > default disabled. Two enforcement
+layers, same as subagents: the shim adds `memory`, `retrieve_memory`,
+`disable_memory` (plus a few speculative names — agy filters unknowns) to
+`disableBuiltInTools` on `session/new`/`session/load`, and the wrapper
+stamps `antigravityConfig.memoryConfig.enabled=<resolved>` (plus the
+snake_case twin) into the account's `.gemini/settings.json` on each launch.
+
 Accounts come in through `scripts/import-accounts.mjs` (from the opencode
 antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single
 token file) or by logging in directly into a home:

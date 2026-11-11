@@ -22,6 +22,16 @@ codex/claude-code/agy: server.ts через `deriveProviderOptions` кладёт
 (в т.ч. `devin-hooks/install.py`), не трогается ни в одну сторону.
 Действие глобально — затрагивает и интерактивный `devin` на хосте.
 
+## Центральная настройка памяти
+
+`memoryEnabled` (default **true**, контракт как у codex/claude-code) доезжает до
+host-обёртки как `providerMemoryEnabled` — но применять нечего: в этом `devin
+acp` локального рычага памяти нет. Memory Drive и auto-notes — облачные фичи,
+в юзерском конфиге ключа для них нет (`disabled_tools` существует, но memory-тула
+в реестре `devin acp` нет — стемпить имена наугад значило бы врать про эффект).
+Гейт логирует «nothing applied» при запросе OFF; когда devin добавит рычаг —
+он подключается в `applyMemoryGate` (host.ts).
+
 ## Установка у пользователя
 
 1. `bb plugin install <путь к этому каталогу> --yes`; запись `devin` из `bb plugin config provider-acp customAgents` убрать (один id не может быть у двух провайдеров).

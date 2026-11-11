@@ -20,6 +20,13 @@ export default function plugin(bb: BbPluginApi) {
         "Prevent agy from starting native subagents (invoke_subagent, swarm, boost) so agents use bb for delegation.",
       default: true,
     },
+    memoryEnabled: {
+      type: "boolean",
+      label: "Antigravity memory",
+      description:
+        "Allow agy to read and write its native memory (memory/retrieve_memory tools) for bb threads.",
+      default: false,
+    },
   });
   bb.providers.register({
     id: "agy",
@@ -72,6 +79,7 @@ export default function plugin(bb: BbPluginApi) {
     // only after an explicit opt-out, never on a missing/unloaded value.
     deriveProviderOptions: (ctx) => ({
       providerSubagentsEnabled: ctx.settings.subagentsDisabled === false,
+      providerMemoryEnabled: ctx.settings.memoryEnabled === true,
     }),
     // The daemon hands this to the ACP wrapper on every thread-bound
     // request; the wrapper rewrites acpLaunchSpec per session (account

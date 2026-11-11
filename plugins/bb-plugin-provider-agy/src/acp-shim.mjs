@@ -61,6 +61,19 @@ const SUBAGENT_TOOLS_DISABLED = [
   "boost",
 ];
 const DISABLE_SUBAGENTS = process.env.AGY_DISABLE_SUBAGENTS !== "0";
+// agy's native memory (memory/retrieve_memory/disable_memory plus a few
+// speculative names — the agent filters unknown ones out of
+// disableBuiltInTools) is invisible to bb, so it rides the same injection.
+// AGY_DISABLE_MEMORY=0 opts back in.
+const MEMORY_TOOLS_DISABLED = [
+  "memory",
+  "retrieve_memory",
+  "disable_memory",
+  "update_memory",
+  "save_memory",
+  "write_memory",
+];
+const DISABLE_MEMORY = process.env.AGY_DISABLE_MEMORY !== "0";
 
 if (REAL_BIN.length === 0) {
   process.stderr.write("acp-shim: AGY_SHIM_REAL_BIN is not set\n");
@@ -257,12 +270,15 @@ rlIn.on("line", (line) => {
           sessionId: msg.params?.sessionId ?? null,
         });
         if (
-          DISABLE_SUBAGENTS &&
+          (DISABLE_SUBAGENTS || DISABLE_MEMORY) &&
           (msg.method === "session/new" || msg.method === "session/load") &&
           msg.params !== null &&
           typeof msg.params === "object"
         ) {
-          msg.params.disableBuiltInTools = SUBAGENT_TOOLS_DISABLED;
+          const disabled = [];
+          if (DISABLE_SUBAGENTS) disabled.push(...SUBAGENT_TOOLS_DISABLED);
+          if (DISABLE_MEMORY) disabled.push(...MEMORY_TOOLS_DISABLED);
+          msg.params.disableBuiltInTools = disabled;
           line = JSON.stringify(msg);
         }
         if (msg.method === "session/load" || msg.method === "session/fork") {

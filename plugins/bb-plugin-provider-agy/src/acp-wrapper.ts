@@ -784,15 +784,20 @@ function shimEnvFor(session: WSession): Record<string, string> {
  * params. Additive merge: other keys are preserved; both casings are
  * written because the reader is unknown (protojson accepts both).
  */
-function subagentSettings(enabled: boolean): Record<string, unknown> {
+function providerSettings(
+  subagentsEnabled: boolean,
+  memoryEnabled: boolean,
+): Record<string, unknown> {
   return {
     antigravityConfig: {
-      subagentsConfig: { enabled },
-      boostCommandDisabled: !enabled,
+      subagentsConfig: { enabled: subagentsEnabled },
+      boostCommandDisabled: !subagentsEnabled,
+      memoryConfig: { enabled: memoryEnabled },
     },
     antigravity_config: {
-      subagents_config: { enabled },
-      boost_command_disabled: !enabled,
+      subagents_config: { enabled: subagentsEnabled },
+      boost_command_disabled: !subagentsEnabled,
+      memory_config: { enabled: memoryEnabled },
     },
   };
 }
@@ -816,7 +821,30 @@ function subagentsEnabledFor(session: WSession): boolean {
   return false;
 }
 
-function stampSubagentConfig(geminiDir: string, enabled: boolean): void {
+/**
+ * Whether agy may use its native memory tools for this session. Same
+ * resolution ladder as subagents: `AGY_DISABLE_MEMORY` env ("0" allows) >
+ * `providerOptions.providerMemoryEnabled` from the `memoryEnabled` plugin
+ * setting > default OFF (bb does not run hidden provider memory).
+ */
+function memoryEnabledFor(session: WSession): boolean {
+  const override = process.env.AGY_DISABLE_MEMORY;
+  if (override !== undefined && override !== "") {
+    return override === "0";
+  }
+  const derived = optionsRecord(session.baseOptions.providerOptions)
+    .providerMemoryEnabled;
+  if (typeof derived === "boolean") {
+    return derived;
+  }
+  return false;
+}
+
+function stampProviderConfig(
+  geminiDir: string,
+  subagentsEnabled: boolean,
+  memoryEnabled: boolean,
+): void {
   const file = join(geminiDir, "settings.json");
   try {
     let doc: Record<string, unknown> = {};
@@ -832,7 +860,9 @@ function stampSubagentConfig(geminiDir: string, enabled: boolean): void {
         return;
       }
     }
-    for (const [section, fields] of Object.entries(subagentSettings(enabled))) {
+    for (const [section, fields] of Object.entries(
+      providerSettings(subagentsEnabled, memoryEnabled),
+    )) {
       const existing =
         doc[section] !== null &&
         typeof doc[section] === "object" &&
@@ -890,6 +920,8 @@ function buildLaunch(session: WSession): void {
   const env = shimEnvFor(session);
   const subagentsOn = subagentsEnabledFor(session);
   env.AGY_DISABLE_SUBAGENTS = subagentsOn ? "0" : "1";
+  const memoryOn = memoryEnabledFor(session);
+  env.AGY_DISABLE_MEMORY = memoryOn ? "0" : "1";
   const args: string[] = [materializeShim(), "acp"];
   let relayHome: string | null = null;
   if (dataDir !== "") {
@@ -924,7 +956,7 @@ function buildLaunch(session: WSession): void {
     geminiDir = join(relayHome, ".gemini");
   }
   if (geminiDir !== null) {
-    stampSubagentConfig(geminiDir, subagentsOn);
+    stampProviderConfig(geminiDir, subagentsOn, memoryOn);
     args.push("--gemini-dir", geminiDir);
   }
   session.launchEnv = env;
