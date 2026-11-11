@@ -353,13 +353,17 @@ function emitUsage(session: WSession, usage: AcpUsage, toolCalls = 0): void {
   // re-reads ~the whole cached prefix, so input+cachedRead of a multi-step
   // turn is N× the real window (a 15-call turn read "3m / 1m"). Estimate the
   // live edge as per-call average input + the turn's generated tokens:
-  // used ≈ (input + cachedRead)/steps + output + thought.
+  // used ≈ (input + cachedRead)/steps + output + thought. Model calls that
+  // carry no tool_call (summarization, steering) are not in `steps`, so an
+  // edge turn can overshoot the window — cap it: >100% of the window is
+  // impossible by definition and renders as a saturated "100" meter.
   const steps = 1 + Math.max(0, toolCalls);
-  const usedTokens = Math.round(
+  const rawUsed = Math.round(
     ((usage.inputTokens ?? 0) + (usage.cachedReadTokens ?? 0)) / steps +
       (usage.outputTokens ?? 0) +
       (usage.thoughtTokens ?? 0),
   );
+  const usedTokens = window === null ? rawUsed : Math.min(rawUsed, window);
   emitDeltas(session.threadId, {
     kind: "contextWindow",
     attach: "currentOrLast",
