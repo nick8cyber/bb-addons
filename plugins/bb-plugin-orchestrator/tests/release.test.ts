@@ -405,6 +405,8 @@ function makeDeps(repo: string, overrides: Partial<{
     db.prepare("UPDATE delegations SET continue_from = ? WHERE id = ?")
       .run(sha, id);
   const calls: string[][] = [];
+  /** §4 r30: recorded `threads.spawn` calls of the audit dispatch. */
+  const spawnCalls: unknown[] = [];
   const comments: string[] = [];
   const sent: string[] = [];
   const bbCli: BbCli = {
@@ -413,7 +415,15 @@ function makeDeps(repo: string, overrides: Partial<{
       const key = args.join(" ");
       if (key.startsWith("tasks show"))
         return ok(JSON.stringify({
-          task: { key: args[2] ?? "PLUG-1", title: "do x", status: "in_review" },
+          task: {
+            id: "task-1",
+            key: args[2] ?? "PLUG-1",
+            title: "do x",
+            status: "in_review",
+          },
+          project: { name: "p", linkedBbProjectId: "proj_bb" },
+          subtasks: [],
+          attachments: [],
           comments: overrides.comments ?? [
             {
               kind: "agent",
@@ -427,12 +437,32 @@ function makeDeps(repo: string, overrides: Partial<{
         comments.push(args[args.length - 1]!);
         return ok();
       }
+      if (key.startsWith("thread show"))
+        return ok(
+          JSON.stringify({
+            thread: {
+              parentThreadId: "thr_coord",
+              parentNotifications: "auto",
+              visibility: "hidden",
+            },
+          }),
+        );
       if (key.startsWith("tasks dispatch"))
         return overrides.dispatchFail
           ? { exitCode: 1, stdout: "", stderr: "boom" }
           : ok(JSON.stringify({ threadId: "thr_audit" }));
       if (key.startsWith("tasks preset show"))
-        return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+        return ok(
+          JSON.stringify({
+            preset: {
+              providerId: "p",
+              modelId: "m1",
+              reasoningLevel: "medium",
+              permissionMode: "auto",
+              environmentKind: "project-default",
+            },
+          }),
+        );
       if (key.startsWith("thread options"))
         return ok(JSON.stringify({ options: [] }));
       if (key.startsWith("project list"))
@@ -514,10 +544,25 @@ function makeDeps(repo: string, overrides: Partial<{
     stepsDeps: {
       store, bbCli,
       threads: {
+        spawn: async (a: unknown) => {
+          spawnCalls.push(a);
+          if (overrides.dispatchFail) {
+            const e = new Error("HTTP 400: boom") as Error & {
+              code: string | null;
+              status: number;
+            };
+            e.code = "invalid_params";
+            e.status = 400;
+            throw e;
+          }
+          return { id: "thr_audit" };
+        },
+        list: async () => [],
         update: async () => ({}),
         stop: async () => ({}),
         updatePluginMetadata: async () => ({}),
       },
+      primaryHostId: async () => "host_test",
     },
     loadPolicy: async () => parsePolicy(overrides.policyText ?? POLICY),
     loadReleaseConfig: () =>
@@ -534,7 +579,7 @@ function makeDeps(repo: string, overrides: Partial<{
     enqueue: <T>(f: () => Promise<T>) => f(),
     log: {},
   } satisfies ReleaseDeps;
-  return { deps, store, calls, comments, sent, tmp, exec, rev, bindReview };
+  return { deps, store, calls, spawnCalls, comments, sent, tmp, exec, rev, bindReview };
 }
 
 test("release: refuses without release config / level / coordinator", async () => {
@@ -560,13 +605,13 @@ test("release: refuses without release config / level / coordinator", async () =
 test("release happy path: приёмка → sync → скан → аудит раздан", async () => {
   const { repo } = makeRepo();
   // branch off main so merge-base exists
-  const { deps, store, calls } = makeDeps(repo);
+  const { deps, store, spawnCalls } = makeDeps(repo);
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   assert.equal(res.status, "auditing");
   const row = store.getRelease(res.releaseId)!;
   assert.equal(row.status, "auditing");
   assert.equal(row.target_action, "push");
-  assert.ok(calls.some((c) => c.join(" ").startsWith("tasks dispatch PLUG-1")));
+  assert.equal(spawnCalls.length, 1, "audit dispatched via own spawn");
   const audit = store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!;
   assert.equal(audit.status, "running");
   assert.equal(store.threadRole("thr_audit")?.role, "release-auditor");
@@ -760,7 +805,7 @@ test("settingsProjectId: worktree → проект основного катал
 
 test("release: scan finding (cat 2 identity) refuses before audit", async () => {
   const { repo } = makeRepo();
-  const { deps, store, calls } = makeDeps(repo, {
+  const { deps, store, calls, spawnCalls } = makeDeps(repo, {
     releaseText: JSON.stringify({
       commitIdentity: "Other <o@x.io>",
       defaults: { target: { action: "push", branch: "main" } },
@@ -773,6 +818,7 @@ test("release: scan finding (cat 2 identity) refuses before audit", async () => 
       /commit-identity|личность/.test((e as OrchestratorError).message),
   );
   assert.ok(!calls.some((c) => c.join(" ").startsWith("tasks dispatch")));
+  assert.equal(spawnCalls.length, 0, "no audit spawn either");
   assert.equal(store.releasesByStatuses(["auditing"]).length, 0);
 });
 
@@ -1261,14 +1307,12 @@ test("release (merged): restore failure → copy-not-restored", async () => {
 
 test("release: audit instructions bind the sha, not the copy's branch", async () => {
   const { repo } = makeRepo();
-  const { deps, store, calls } = makeDeps(repo);
+  const { deps, store, spawnCalls } = makeDeps(repo);
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   const headSha = store.getRelease(res.releaseId)!.head_sha!;
-  const dispatch = calls.find(
-    (c) => c[0] === "tasks" && c[1] === "dispatch",
-  )!;
-  const instructions = dispatch[dispatch.indexOf("--instructions") + 1]!;
-  assert.ok(instructions.includes(headSha));
+  // §4 r30: the sha-binding instructions ride inside the spawn prompt
+  const prompt = (spawnCalls[0] as { prompt?: string }).prompt!;
+  assert.ok(prompt.includes(headSha));
 });
 
 test("release: stale installed hook refuses with reinstall hint", async () => {

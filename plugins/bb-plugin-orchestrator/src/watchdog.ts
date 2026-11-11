@@ -216,6 +216,11 @@ export interface WatchdogThreadDto {
   /** §16.5 binding verify: the executor's parent link and notify mode. */
   parentThreadId?: string | null;
   parentNotifications?: string | null;
+  /** §4 r30 (е 4): label-lookup fields the `list` seam returns. */
+  title?: string | null;
+  titleFallback?: string | null;
+  createdAt?: number | null;
+  visibility?: string | null;
 }
 
 /** One stored event-stream row (subset of `ThreadEventRow`). */
@@ -254,6 +259,17 @@ export interface WatchdogThreads {
     parentThreadId?: string | null;
     visibility?: string;
   }): Promise<unknown>;
+  /** §4 r30 (е 4): children of the coordinator for the own-spawn label
+   * lookup. Optional — absent → the marker-gated `tasks threads` path. */
+  list?(args: {
+    parentThreadId?: string;
+    includeHidden?: boolean;
+    limit?: number;
+  }): Promise<FindThreadCandidate[]>;
+  /** §4 r30 (е 4): the `pluginMetadata.delegationId` read per candidate. */
+  getPluginMetadata?(args: {
+    threadId: string;
+  }): Promise<Record<string, unknown> | null | undefined>;
 }
 
 /** The `turn.failed` lifecycle event fields the watchdog consumes. */
@@ -369,6 +385,92 @@ export async function findTaskThreadId(
       !Number.isFinite(Date.parse(t.attachedAt ?? "")),
   );
   return undatable?.threadId ?? null;
+}
+
+/** The `threads.list` row the label lookup reads (r30 е 4). */
+export interface FindThreadCandidate {
+  id: string;
+  title?: string | null;
+  titleFallback?: string | null;
+  createdAt?: number | null;
+}
+
+/** The SDK seams the label lookup uses (r30 е 4). */
+export interface DelegatedThreadFinder {
+  list?(args: {
+    parentThreadId?: string;
+    includeHidden?: boolean;
+    limit?: number;
+  }): Promise<FindThreadCandidate[]>;
+  getPluginMetadata?(args: {
+    threadId: string;
+  }): Promise<Record<string, unknown> | null | undefined>;
+}
+
+/**
+ * §4 r30 (е 4): find the executor thread of a `dispatching` row with no
+ * `thread_id` — shared by the §7 reconcile and `cancel`. An own-spawn
+ * thread is labelled `pluginMetadata.delegationId` and titled `KEY · …`
+ * under the coordinator: look at the coordinator's children first —
+ * metadata match, then the `createdAt >= row.created_at` + `KEY · `
+ * title fallback. `bb tasks threads` stays only for rows whose dispatch
+ * ran the `bb tasks dispatch` fallback (the `own-spawn` marker), which
+ * the tasks plugin attaches itself.
+ */
+export async function findDelegatedThreadId(
+  row: DelegationRow,
+  deps: {
+    bbCli: BbCli;
+    store: DelegationStore;
+    threads?: DelegatedThreadFinder;
+  },
+): Promise<string | null> {
+  let children: FindThreadCandidate[] | null = null;
+  try {
+    children =
+      (await deps.threads?.list?.({
+        parentThreadId: row.coordinator_thread_id,
+        includeHidden: true,
+        limit: 200,
+      })) ?? null;
+  } catch {
+    children = null; // a broken list must not hide the tasks fallback
+  }
+  if (children) {
+    const candidates = children.filter(
+      (t) =>
+        typeof t.id === "string" &&
+        typeof t.createdAt === "number" &&
+        t.createdAt >= row.created_at,
+    );
+    if (deps.threads?.getPluginMetadata) {
+      for (const t of candidates) {
+        try {
+          const meta = await deps.threads.getPluginMetadata({
+            threadId: t.id,
+          });
+          if (
+            meta &&
+            (meta as { delegationId?: unknown }).delegationId === row.id
+          ) {
+            return t.id;
+          }
+        } catch {
+          // unreadable metadata — the title filter below still applies
+        }
+      }
+    }
+    const titled = candidates
+      .filter((t) =>
+        (t.title ?? t.titleFallback ?? "").startsWith(`${row.task_key} · `),
+      )
+      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+    if (titled[0]) return titled[0].id;
+  }
+  if (deps.store.findSetupError(row, "own-spawn") !== undefined) {
+    return findTaskThreadId(deps.bbCli, row.task_key, row.created_at);
+  }
+  return null;
 }
 
 export function createWatchdog(deps: WatchdogDeps) {
@@ -2401,15 +2503,16 @@ export function createWatchdog(deps: WatchdogDeps) {
     // coordinator to resolve by hand — retries stop entirely.
     if (hasSetupError(row, "retry-exhausted")) return;
     if (!row.thread_id) {
-      // «Результат раздачи неизвестен»: find the thread the tasks plugin
-      // attached after the record was created.
+      // «Результат раздачи неизвестен»: r30 е 4 — an own-spawn thread is
+      // found by its `delegationId` label under the coordinator;
+      // `bb tasks threads` stays for `own-spawn`-marked fallback rows.
       let threadId: string | null;
       try {
-        threadId = await findTaskThreadId(
-          deps.bbCli,
-          row.task_key,
-          row.created_at,
-        );
+        threadId = await findDelegatedThreadId(row, {
+          bbCli: deps.bbCli,
+          store,
+          threads: deps.threads,
+        });
       } catch (e) {
         if (row.reissue_of != null) {
           await trackRetry(row, "доведение перевыпуска", message(e));
@@ -2464,7 +2567,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         await commentOnTask(
           row,
           `раздача не подтверждена: делегирование #${row.id} удалено ` +
-            `(тред не найден через bb tasks threads)`,
+            `(тред раздачи не найден)`,
         );
         return;
       }
@@ -2528,14 +2631,15 @@ export function createWatchdog(deps: WatchdogDeps) {
     // §7: repeat unfinished §4.4–4.6 steps (setup_errors + the bypass check).
     const retried = await deps.retrySetup(fresh);
     s.retriedSteps += retried.length;
-    // §16.5/PLUG-184: the executor→coordinator binding is verified by
-    // `bb thread show --json` — the SDK thread DTO omits
-    // `parentNotifications`, so reading the DTO never confirms and the
-    // update re-applied forever. A drifted binding is re-applied — `auto`
-    // is required so BB itself delivers the executor's outcome notice
-    // (§16.5) — and the next pass re-reads the show output. The marker
-    // records the mode it confirmed: an r24 `confirmed` row re-verifies
-    // once, which also migrates live `stuck` executors to `auto`.
+    // §16.5/PLUG-184 + §4 r30 п.4: the executor→coordinator binding is
+    // verified by `bb thread show --json` — the SDK thread DTO omits
+    // `parentNotifications`, so reading the DTO never confirms. A
+    // READ ERROR retries next pass with NO update (a blind update on an
+    // already-bound thread sends `ownership-assigned`); a confirmed
+    // drift is re-applied — `auto` is required so BB itself delivers
+    // the executor's outcome notice (§16.5). The marker records the
+    // mode it confirmed: an r24 `confirmed` row re-verifies once,
+    // which also migrates live `stuck` executors to `auto`.
     if (
       fresh.thread_id &&
       store.findSetupError(fresh, "attach-verified")?.message !== "auto"
@@ -2544,6 +2648,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         | {
             parentThreadId?: string | null;
             parentNotifications?: string | null;
+            visibility?: string | null;
           }
         | null = null;
       let readErr: string | null = null;
@@ -2552,6 +2657,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           thread?: {
             parentThreadId?: string | null;
             parentNotifications?: string | null;
+            visibility?: string | null;
           };
         }>(deps.bbCli, ["thread", "show", fresh.thread_id, "--json"]);
         facts = res.thread ?? null;
@@ -2561,30 +2667,51 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (
         facts &&
         facts.parentThreadId === fresh.coordinator_thread_id &&
-        facts.parentNotifications === "auto"
+        facts.parentNotifications === "auto" &&
+        facts.visibility === "hidden"
       ) {
         store.addSetupError(fresh.id, "attach-verified", "auto");
-      } else {
-        let err: string | null = readErr;
-        try {
-          await deps.threads.update({
-            threadId: fresh.thread_id,
-            parentThreadId: fresh.coordinator_thread_id,
-            visibility: "hidden",
-          });
-        } catch (e) {
-          err = `${err ? `${err}; ` : ""}threads.update: ${message(e)}`;
+      } else if (!facts) {
+        // r30 п.4: a read failure → retry next pass, NO update.
+        const err = readErr ?? "thread show: no thread payload";
+        store.addSetupError(fresh.id, "attach-verify", err);
+        const cur = store.get(fresh.id) ?? fresh;
+        if (!hasSetupError(cur, "attach-verify-reported")) {
+          store.addSetupError(fresh.id, "attach-verify-reported", "1");
+          await notifyCoordinator(
+            fresh,
+            `${fresh.task_key}: привязка исполнителя ${fresh.thread_id} ` +
+              `не подтверждена (${err}) — сверка повторяет`,
+          );
         }
-        try {
-          await runChecked(deps.bbCli, [
-            "thread",
-            "update",
-            fresh.thread_id,
-            "--parent-notifications",
-            "auto",
-          ]);
-        } catch (e) {
-          err = `${err ? `${err}; ` : ""}parent-notifications: ${message(e)}`;
+      } else {
+        let err: string | null = null;
+        if (
+          facts.parentThreadId !== fresh.coordinator_thread_id ||
+          facts.visibility !== "hidden"
+        ) {
+          try {
+            await deps.threads.update({
+              threadId: fresh.thread_id,
+              parentThreadId: fresh.coordinator_thread_id,
+              visibility: "hidden",
+            });
+          } catch (e) {
+            err = `threads.update: ${message(e)}`;
+          }
+        }
+        if (facts.parentNotifications !== "auto") {
+          try {
+            await runChecked(deps.bbCli, [
+              "thread",
+              "update",
+              fresh.thread_id,
+              "--parent-notifications",
+              "auto",
+            ]);
+          } catch (e) {
+            err = `${err ? `${err}; ` : ""}parent-notifications: ${message(e)}`;
+          }
         }
         const cur = store.get(fresh.id) ?? fresh;
         if (err) {

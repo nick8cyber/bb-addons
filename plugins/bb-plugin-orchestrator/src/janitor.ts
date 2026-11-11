@@ -2056,7 +2056,9 @@ export function createJanitor(deps: JanitorDeps) {
       !!t.environmentId &&
       envById.has(t.environmentId) &&
       (cfg.scope === "all" ||
+        // §4 r30 д: own-spawn executors carry `orchestrator`.
         t.originPluginId === "tasks" ||
+        t.originPluginId === "orchestrator" ||
         !!t.parentThreadId);
 
     const hasCandidateAncestor = (t: ThreadDto): boolean => {
@@ -3322,7 +3324,9 @@ export function createJanitor(deps: JanitorDeps) {
       thread.parentThreadId !== undefined ||
       thread.sourceThreadId !== undefined;
     const worker =
+      // §4 r30 д: own-spawn executors carry `orchestrator`.
       thread.originPluginId === "tasks" ||
+      thread.originPluginId === "orchestrator" ||
       !!thread.parentThreadId ||
       !!thread.sourceThreadId;
     if (fieldsKnown && !worker) return;

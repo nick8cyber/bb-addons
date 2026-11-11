@@ -234,9 +234,13 @@ export function decideRole(
   const userPlugins =
     probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
 
-  // 1. A thread created by `bb tasks dispatch` is an executor; its level
-  //    decides auditor vs executor.
-  if (facts.originPluginId === "tasks") {
+  // 1. A thread created by `bb tasks dispatch` — or spawned by this
+  //    plugin itself (§4 r30 д: `originPluginId = "orchestrator"`) — is an
+  //    executor; its level decides auditor vs executor.
+  if (
+    facts.originPluginId === "tasks" ||
+    facts.originPluginId === "orchestrator"
+  ) {
     const key = taskKeyFromTitle(facts.title);
     const row = key ? probes.activeDelegationByTaskKey(key) : undefined;
     return row ? roleForLevel(row.level, probes.policy?.()) : "executor";

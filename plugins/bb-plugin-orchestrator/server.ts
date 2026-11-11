@@ -54,11 +54,12 @@ import {
   finishDispatchSteps,
   retrySetupSteps,
   runDelegate,
+  type DelegateThreads,
 } from "./src/delegate.js";
 import {
   cancelProviderRetries,
   createWatchdog,
-  findTaskThreadId,
+  findDelegatedThreadId,
   providerRetryCli,
   type WatchdogThreads,
 } from "./src/watchdog.js";
@@ -546,9 +547,10 @@ export async function createPlugin(
       return runDelegate({ ...input, caller }, {
         store,
         bbCli,
-        threads: bb.sdk.threads,
+        threads: bb.sdk.threads as unknown as DelegateThreads,
         loadPolicy: () => loadPolicy(true),
         probes,
+        primaryHostId: localHostId,
         gitInstructions: () => currentSettings.gitInstructions,
         cmd,
       });
@@ -563,10 +565,25 @@ export async function createPlugin(
   // so a reissued executor gets every later change to those steps for
   // free. `enqueue` serializes watchdog actions against delegate/cancel
   // calls in this process.
+  /** This machine's bb hostId (release §6 r8; janitor host scoping; the
+   * r30 spawn environment's `machineId ?? primaryHostId`). */
+  const localHostId = async () => {
+    try {
+      const sys = await (
+        bb.sdk as unknown as {
+          system?: { config?: () => Promise<{ primaryHostId?: string }> };
+        }
+      ).system?.config?.();
+      return sys?.primaryHostId ?? "";
+    } catch {
+      return "";
+    }
+  };
   const stepsDeps = {
     store,
     bbCli,
-    threads: bb.sdk.threads,
+    threads: bb.sdk.threads as unknown as DelegateThreads,
+    primaryHostId: localHostId,
     gitInstructions: () => currentSettings.gitInstructions,
     policy: () => policyLoad.policy,
   };
@@ -581,6 +598,12 @@ export async function createPlugin(
     stop: (a) => bb.sdk.threads.stop(a),
     output: (a) => bb.sdk.threads.output(a),
     update: (a) => bb.sdk.threads.update(a as never),
+    // §4 r30 (е 4): the own-spawn label lookup for `dispatching` rows
+    // without `thread_id` — children of the coordinator + the
+    // `pluginMetadata.delegationId` read per candidate.
+    list: (a) => bb.sdk.threads.list(a) as never,
+    getPluginMetadata: (a: { threadId: string }) =>
+      bb.sdk.threads.getPluginMetadata(a),
   };
   const cmd = deps.cmd ?? createCmd();
   const pluginDataDir = () => {
@@ -612,19 +635,6 @@ export async function createPlugin(
       mergeBaseBranch?: string | null;
       baseBranch?: string | { name?: string } | null;
     }>(bbCli, ["environment", "show", envId, "--json"]);
-  /** This machine's bb hostId (release §6 r8; janitor host scoping). */
-  const localHostId = async () => {
-    try {
-      const sys = await (
-        bb.sdk as unknown as {
-          system?: { config?: () => Promise<{ primaryHostId?: string }> };
-        }
-      ).system?.config?.();
-      return sys?.primaryHostId ?? "";
-    } catch {
-      return "";
-    }
-  };
   const releaseDeps = {
     store,
     bbCli,
@@ -1141,18 +1151,18 @@ export async function createPlugin(
           `delegation ${row.id} is already ${row.status}`,
         );
       }
-      // §6: a `dispatching` record without `thread_id` — the thread the
-      // tasks plugin attached after the record may still exist; find it
-      // first so the stop below can reach it.
+      // §6: a `dispatching` record without `thread_id` — the thread may
+      // still exist (an uncertain spawn result); find it first so the
+      // stop below can reach it — §4 r30 (е 4) the label lookup.
       let stopTarget = row.thread_id;
       let warning: string | undefined;
       if (!stopTarget && row.status === "dispatching") {
         try {
-          stopTarget = await findTaskThreadId(
+          stopTarget = await findDelegatedThreadId(row, {
             bbCli,
-            row.task_key,
-            row.created_at,
-          );
+            store,
+            threads: watchdogThreads,
+          });
         } catch (e) {
           warning = `task thread lookup failed: ${describeError(e)}`;
         }

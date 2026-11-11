@@ -11,8 +11,12 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `delegate` refuses calls.
 - **`delegate`** (agent tool `orchestrator_delegate` + CLI): one call that
   checks limits, records the delegation as `dispatching` (partial unique
-  index against double dispatch), runs `bb tasks dispatch`, attaches the
-  thread as a hidden child with `parentNotifications=auto`, best-effort
+  index against double dispatch), spawns the executor itself
+  (`threads.spawn` with the coordinator parent, `hidden`,
+  `parentNotifications=auto` and the `pluginMetadata.delegationId` label
+  at creation — no `ownership-assigned` wakeup; `bb tasks dispatch`
+  survives only as a fallback for a schema refusal on the own-spawn
+  fields), attaches the task (`bb tasks attach`), best-effort
   `mode=bypass` for `permissionMode=full` presets, marks `running`, and
   comments «Раздано» on the task. `--no-code` (tool `noCode`) marks a
   delegation that expects no commits (§4.1 r28): the executor is told to
@@ -100,9 +104,11 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   (listed in `leaks.allow`), negative samples use `/home/example/`.
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
-  `dispatching` rows via `bb tasks threads` or drops them, survives
-  restarts without duplicate reissues. `bb orchestrator reconcile` runs
-  a pass immediately.
+  `dispatching` rows by the `pluginMetadata.delegationId` label under the
+  coordinator (`threads.list` + title/createdAt fallback; `bb tasks
+  threads` only for rows that ran the `bb tasks dispatch` fallback) or
+  drops them, survives restarts without duplicate reissues.
+  `bb orchestrator reconcile` runs a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `merge`, `policy show|validate`,
   `instructions`, `reconcile`.
 
@@ -136,7 +142,8 @@ map presets onto levels and fallback chains, write the policy, validate.
 - `policy` (multiline JSON, §2) — levels, route chains, limits, quota
   groups. Empty or invalid → `needs-configuration`, `delegate` refuses.
 - `gitInstructions` (§2.2, ≤ 1500 chars) — the «Работа с git» section
-  prepended to every dispatch's `--instructions`; empty disables it.
+  prepended to every dispatch's instructions (the spawn prompt's
+  «Additional instructions»); empty disables it.
 - `injectInstructions` (default on) — off silences every plugin-generated
   text; tools and `orchestrator-setup` stay.
 - `needs-configuration` clears only on plugin reload (SDK V1): after

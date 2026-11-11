@@ -31,9 +31,47 @@ function fakeCli(respond?: (args: string[]) => BbCliResult | undefined): {
         calls.push(args);
         const custom = respond?.(args);
         if (custom) return custom;
-        if (args.join(" ").startsWith("tasks preset list"))
+        const key = args.join(" ");
+        if (key.startsWith("tasks preset list"))
           return ok(JSON.stringify({ presets: [{ name: "simple", id: "p1" }] }));
-        if (args.join(" ").startsWith("provider-retry status"))
+        if (key.startsWith("tasks preset show"))
+          return ok(
+            JSON.stringify({
+              preset: {
+                providerId: "p",
+                modelId: "m1",
+                reasoningLevel: "medium",
+                permissionMode: "auto",
+                environmentKind: "project-default",
+              },
+            }),
+          );
+        if (key.startsWith("tasks show"))
+          return ok(
+            JSON.stringify({
+              task: {
+                id: "task-1",
+                key: args[2] ?? "PLUG-1",
+                title: "do it",
+                status: "in_progress",
+              },
+              project: { name: "p", linkedBbProjectId: "proj_bb" },
+              subtasks: [],
+              attachments: [],
+              comments: [],
+            }),
+          );
+        if (key.startsWith("thread show"))
+          return ok(
+            JSON.stringify({
+              thread: {
+                parentThreadId: "thr_coord",
+                parentNotifications: "auto",
+                visibility: "hidden",
+              },
+            }),
+          );
+        if (key.startsWith("provider-retry status"))
           return ok(JSON.stringify({ retries: [] }));
         return ok();
       },
@@ -132,14 +170,14 @@ test("CLI delegate without a calling thread is refused", async () => {
 });
 
 test("CLI delegate end-to-end through the fake host", async () => {
-  const { cli, calls } = fakeCli((args) => {
-    if (args.join(" ").startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ task: { id: "t1" }, threadId: "thr_exec" }));
-    if (args.join(" ").startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    return undefined;
-  });
+  const { cli, calls } = fakeCli();
   const updates: unknown[] = [];
+  const spawnCalls: {
+    parentThreadId?: string;
+    parentNotifications?: string;
+    visibility?: string;
+    pluginMetadata?: { delegationId?: unknown };
+  }[] = [];
   const host = await hostWith({}, cli, {
     threads: {
       get: async () => ({
@@ -150,6 +188,11 @@ test("CLI delegate end-to-end through the fake host", async () => {
         originPluginId: null,
         projectId: "proj_main",
       }),
+      spawn: async (a: (typeof spawnCalls)[number]) => {
+        spawnCalls.push(a);
+        return { id: "thr_exec" };
+      },
+      list: async () => [],
       update: async (a: unknown) => {
         updates.push(a);
         return {};
@@ -165,16 +208,23 @@ test("CLI delegate end-to-end through the fake host", async () => {
     ok: boolean;
     threadId: string;
     route: string;
+    delegationId: number;
   };
   assert.equal(body.ok, true);
   assert.equal(body.threadId, "thr_exec");
   assert.equal(body.route, "simple");
+  // §4 r30: parent/hidden/auto + the delegationId label are set AT
+  // spawn — no repair update, no `ownership-assigned` wakeup.
+  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls[0]!.parentThreadId, "thr_coord");
+  assert.equal(spawnCalls[0]!.parentNotifications, "auto");
+  assert.equal(spawnCalls[0]!.visibility, "hidden");
+  assert.equal(spawnCalls[0]!.pluginMetadata?.delegationId, body.delegationId);
   assert.ok(
-    calls.some((c) => c.join(" ") === "thread update thr_exec --parent-notifications auto"),
+    !calls.some((c) => c.join(" ").startsWith("thread update")),
+    "no parent-notifications repair call",
   );
-  assert.deepEqual(updates, [
-    { threadId: "thr_exec", parentThreadId: "thr_coord", visibility: "hidden" },
-  ]);
+  assert.deepEqual(updates, []);
 });
 
 test("policy validate rejects an invalid policy with a path", async () => {
@@ -228,6 +278,10 @@ const COORDINATOR_SDK = {
     originPluginId: null,
     projectId: "proj_main",
   }),
+  /** §4 r30: the own-spawn dispatch — the fake returns the executor id. */
+  spawn: async () => ({ id: "thr_exec" }),
+  list: async () => [],
+  getPluginMetadata: async () => null,
 };
 
 test("agent tool delegate returns structured errors", async () => {
@@ -254,13 +308,7 @@ test("agent tool delegate returns structured errors", async () => {
 });
 
 test("CLI cancel from a foreign thread is refused; owner coordinator cancels", async () => {
-  const { cli, calls } = fakeCli((args) => {
-    if (args.join(" ").startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ threadId: "thr_exec" }));
-    if (args.join(" ").startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    return undefined;
-  });
+  const { cli } = fakeCli();
   const stops: string[] = [];
   const host = await hostWith({}, cli, {
     threads: {
@@ -272,6 +320,8 @@ test("CLI cancel from a foreign thread is refused; owner coordinator cancels", a
         originPluginId: null,
         projectId: "proj_main",
       }),
+      spawn: async () => ({ id: "thr_exec" }),
+      list: async () => [],
       update: async () => ({}),
       stop: async ({ threadId }: { threadId: string }) => {
         stops.push(threadId);
@@ -337,24 +387,24 @@ const DISPATCH_TIMEOUT = {
 
 test("cancel of a dispatching row without thread_id finds and stops the thread (§6)", async () => {
   const stops: string[] = [];
-  const { cli } = fakeCli((args) => {
-    const key = args.join(" ");
-    if (key.startsWith("tasks dispatch")) return { ...DISPATCH_TIMEOUT };
-    if (key.startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    if (key.startsWith("tasks threads"))
-      return ok(
-        JSON.stringify({
-          taskThreads: [
-            { threadId: "thr_late", attachedAt: new Date().toISOString() },
-          ],
-        }),
-      );
-    return undefined;
-  });
+  const { cli } = fakeCli();
   const host = await hostWith({}, cli, {
     threads: {
       ...COORDINATOR_SDK,
+      // §4 r30: the spawn outcome is uncertain — no thread id survives,
+      // but the thread exists under the coordinator with the label.
+      spawn: async () => {
+        throw new Error("spawn timed out");
+      },
+      list: async () => [
+        {
+          id: "thr_late",
+          title: "PLUG-1 · do it",
+          createdAt: Date.now(),
+        },
+      ],
+      getPluginMetadata: async ({ threadId }: { threadId: string }) =>
+        threadId === "thr_late" ? { delegationId: 1 } : null,
       update: async () => ({}),
       stop: async ({ threadId }: { threadId: string }) => {
         stops.push(threadId);
@@ -391,10 +441,6 @@ test("PLUG-184 C5: cancel drops the BB auto-retry BEFORE the stop", async () => 
   const { cli } = fakeCli((args) => {
     const key = args.join(" ");
     if (key.startsWith("provider-retry")) ops.push(`cli:${key.split(" ")[1]}`);
-    if (key.startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ threadId: "thr_exec" }));
-    if (key.startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
     if (key.startsWith("provider-retry status"))
       return ok(JSON.stringify({ retries: retryCleared ? [] : [{}] }));
     if (key.startsWith("provider-retry cancel")) {
@@ -444,6 +490,15 @@ test("cancel surfaces the thread-lookup failure as a warning", async () => {
   const host = await hostWith({}, cli, {
     threads: {
       ...COORDINATOR_SDK,
+      // §4 r30 е 3: a schema refusal on the own-spawn fields falls back
+      // to `bb tasks dispatch` (which times out here) — the row gets the
+      // `own-spawn` marker, so cancel searches `bb tasks threads`.
+      spawn: async () => {
+        throw Object.assign(
+          new Error("HTTP 400: unrecognized field parentNotifications"),
+          { code: "invalid_params", status: 400 },
+        );
+      },
       update: async () => ({}),
       stop: async ({ threadId }: { threadId: string }) => {
         stops.push(threadId);
@@ -466,14 +521,7 @@ test("cancel surfaces the thread-lookup failure as a warning", async () => {
 
 test("a stopped watchdog service ignores thread events (dispose)", async () => {
   const eventLists: number[] = [];
-  const { cli } = fakeCli((args) => {
-    const key = args.join(" ");
-    if (key.startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ threadId: "thr_exec" }));
-    if (key.startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    return undefined;
-  });
+  const { cli } = fakeCli();
   const host = await hostWith({}, cli, {
     threads: {
       ...COORDINATOR_SDK,
@@ -590,13 +638,7 @@ test("janitor run with invalid config reports janitor-invalid", async () => {
 });
 
 test("§17.2 r26 (PLUG-215 мелко 2): `show` labels the notify-muted mark, not a setup error", async () => {
-  const { cli } = fakeCli((args) => {
-    if (args.join(" ").startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ threadId: "thr_exec" }));
-    if (args.join(" ").startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    return undefined;
-  });
+  const { cli } = fakeCli();
   const host = await hostWith({}, cli, {
     threads: { ...COORDINATOR_SDK, update: async () => ({}) },
   });
@@ -623,13 +665,7 @@ test("§17.2 r26 (PLUG-215 мелко 2): `show` labels the notify-muted mark, n
 });
 
 test("§17.2 r26 (PLUG-227): `show` labels coordinator-cancel, not in setup_errors", async () => {
-  const { cli } = fakeCli((args) => {
-    if (args.join(" ").startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ threadId: "thr_exec" }));
-    if (args.join(" ").startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    return undefined;
-  });
+  const { cli } = fakeCli();
   const host = await hostWith({}, cli, {
     threads: { ...COORDINATOR_SDK, update: async () => ({}) },
   });
@@ -739,13 +775,8 @@ test("release CLI: --no-docs/--kb/--no-kb values are not positional (§17.3 м7)
 // ── §4.1 r28 (PLUG-237): delegate --no-code ────────────────────────────
 
 test("CLI delegate --no-code marks the row, instructs the executor, shows in status/show", async () => {
-  const { cli, calls } = fakeCli((args) => {
-    if (args.join(" ").startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ task: { id: "t1" }, threadId: "thr_exec" }));
-    if (args.join(" ").startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    return undefined;
-  });
+  const { cli } = fakeCli();
+  const spawnCalls: { prompt?: string }[] = [];
   const host = await hostWith({}, cli, {
     threads: {
       get: async () => ({
@@ -756,6 +787,11 @@ test("CLI delegate --no-code marks the row, instructs the executor, shows in sta
         originPluginId: null,
         projectId: "proj_main",
       }),
+      spawn: async (a: { prompt?: string }) => {
+        spawnCalls.push(a);
+        return { id: "thr_exec" };
+      },
+      list: async () => [],
       update: async () => ({}),
     },
   });
@@ -767,14 +803,10 @@ test("CLI delegate --no-code marks the row, instructs the executor, shows in sta
   const body = JSON.parse(res.stdout) as { ok: boolean; delegationId: number };
   assert.equal(body.ok, true);
 
-  // the dispatch carries the §4.1 r28 line
-  const dispatch = calls.find((c) =>
-    c.join(" ").startsWith("tasks dispatch"),
-  )!;
-  const i = dispatch.indexOf("--instructions");
-  assert.ok(i >= 0, "--instructions sent");
+  // §4.1 r28: the no-code line lands in the spawn prompt (r30)
+  assert.equal(spawnCalls.length, 1, "executor spawned");
   assert.match(
-    dispatch[i + 1]!,
+    spawnCalls[0]!.prompt!,
     /задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт/,
   );
 
@@ -801,13 +833,8 @@ test("CLI delegate --no-code marks the row, instructs the executor, shows in sta
 });
 
 test("agent tool noCode: true marks the delegation", async () => {
-  const { cli, calls } = fakeCli((args) => {
-    if (args.join(" ").startsWith("tasks dispatch"))
-      return ok(JSON.stringify({ task: { id: "t1" }, threadId: "thr_exec" }));
-    if (args.join(" ").startsWith("tasks preset show"))
-      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
-    return undefined;
-  });
+  const { cli } = fakeCli();
+  const spawnCalls: { prompt?: string }[] = [];
   const host = await hostWith({}, cli, {
     threads: {
       get: async () => ({
@@ -818,6 +845,11 @@ test("agent tool noCode: true marks the delegation", async () => {
         originPluginId: null,
         projectId: "proj_main",
       }),
+      spawn: async (a: { prompt?: string }) => {
+        spawnCalls.push(a);
+        return { id: "thr_exec" };
+      },
+      list: async () => [],
       update: async () => ({}),
     },
   });
@@ -833,8 +865,6 @@ test("agent tool noCode: true marks the delegation", async () => {
     { threadId: "thr_coord" },
   );
   assert.match(shown.stdout, /no-code/);
-  const dispatch = calls.find((c) =>
-    c.join(" ").startsWith("tasks dispatch"),
-  )!;
-  assert.match(dispatch.join(" "), /задача без кода/);
+  assert.equal(spawnCalls.length, 1, "executor spawned");
+  assert.match(spawnCalls[0]!.prompt!, /задача без кода/);
 });

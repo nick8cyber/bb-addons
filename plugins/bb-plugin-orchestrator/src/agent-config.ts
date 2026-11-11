@@ -6,7 +6,8 @@
  *
  * §13: a `thread_roles` row decides by `delegates`; the §3 fallback
  * criterion covers threads with no row — no parent and no executor marker:
- *   1. `origin.pluginId === "tasks"` (a thread created by `bb tasks dispatch`);
+ *   1. `origin.pluginId === "tasks"` (a thread created by `bb tasks
+ *      dispatch`) or `"orchestrator"` (§4 r30 д — the own spawn);
  *   2. the thread id is recorded in `delegations.thread_id`;
  *   3. the title looks like a dispatch title `<KEY> · …`;
  *   4. a `dispatching` row without `thread_id` younger than two minutes

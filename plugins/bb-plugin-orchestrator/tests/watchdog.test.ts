@@ -79,6 +79,21 @@ function makeHarness(
       const custom = opts.cli?.(args);
       if (custom) return custom;
       const key = args.join(" ");
+      if (key.startsWith("tasks show"))
+        return ok(
+          JSON.stringify({
+            task: {
+              id: "t-1",
+              key: args[2] ?? "PLUG-1",
+              title: "do it",
+              status: "todo",
+            },
+            project: { name: "p", linkedBbProjectId: "proj_bb" },
+            subtasks: [],
+            attachments: [],
+            comments: [],
+          }),
+        );
       if (key.startsWith("tasks dispatch")) {
         return ok(
           JSON.stringify({
@@ -88,7 +103,17 @@ function makeHarness(
         );
       }
       if (key.startsWith("tasks preset show"))
-        return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+        return ok(
+          JSON.stringify({
+            preset: {
+              providerId: "p",
+              modelId: "m1",
+              reasoningLevel: "medium",
+              permissionMode: "auto",
+              environmentKind: "project-default",
+            },
+          }),
+        );
       if (key.startsWith("tasks threads"))
         return ok(JSON.stringify({ taskThreads: [] }));
       // §16.5 attach-verify: `bb thread show <id> --json` answers the
@@ -224,9 +249,35 @@ function makeHarness(
       if (dto && a.parentThreadId !== undefined) {
         dto.parentThreadId = a.parentThreadId;
       }
+      if (dto && a.visibility !== undefined) {
+        (dto as { visibility?: string }).visibility = a.visibility;
+      }
       return {};
     },
+    // §4 r30 (е 4): children of the coordinator + the pluginMetadata read.
+    list: async (a: {
+      parentThreadId?: string;
+      includeHidden?: boolean;
+      limit?: number;
+    }) =>
+      [...threadDtos.values()]
+        .filter(
+          (d) =>
+            !a.parentThreadId || d.parentThreadId === a.parentThreadId,
+        )
+        .filter(
+          (d) =>
+            a.includeHidden ||
+            (d as { visibility?: string }).visibility !== "hidden",
+        )
+        .slice(0, a.limit ?? 100),
+    getPluginMetadata: async ({ threadId }: { threadId: string }) =>
+      pluginMeta.get(threadId) ?? null,
   };
+  /** §4 r30: `pluginMetadata` per thread for the label lookup. */
+  const pluginMeta = new Map<string, Record<string, unknown>>();
+  /** §4 r30: recorded `threads.spawn` args. */
+  const spawnCalls: Record<string, unknown>[] = [];
   let stopFailsLeft = opts.stopFails ?? 0;
   const statusAtStop: (string | undefined)[] = [];
 
@@ -236,12 +287,38 @@ function makeHarness(
     store,
     bbCli: cli,
     threads: {
+      // §4 r30: a correct own-spawn — bound, hidden, auto, labelled.
+      spawn: async (a: {
+        parentThreadId?: string;
+        title?: string;
+        pluginMetadata?: Record<string, unknown>;
+      }) => {
+        spawnCalls.push(a as Record<string, unknown>);
+        const id = opts.dispatchThreadId ?? "thr_new";
+        const dto = {
+          id,
+          status: "active",
+          archivedAt: null,
+          deletedAt: null,
+          parentThreadId: a.parentThreadId ?? null,
+          parentNotifications: "auto",
+          visibility: "hidden",
+          title: a.title ?? null,
+          createdAt: nowVal,
+        } as WatchdogThreadDto;
+        threadDtos.set(id, dto);
+        if (a.pluginMetadata) pluginMeta.set(id, a.pluginMetadata);
+        return { id };
+      },
+      list: threads.list,
+      getPluginMetadata: threads.getPluginMetadata,
       update: async (a: unknown) => {
         updates.push(a);
         return {};
       },
       stop: threads.stop,
     },
+    primaryHostId: async () => "host_1",
   };
   const warns: string[] = [];
   const wd = createWatchdog({
@@ -341,6 +418,8 @@ function makeHarness(
     statusAtStop,
     outputs,
     wdUpdates,
+    pluginMeta,
+    spawnCalls,
     retryPendingRows,
     retryStatusScript,
     retryCancels,
@@ -620,7 +699,7 @@ test("deleted thread → cancelled; archived too", async () => {
   assert.equal(h.store.get(row2.id)!.status, "cancelled");
 });
 
-test("reconcile: dispatching without thread_id relinks via bb tasks threads", async () => {
+test("reconcile: dispatching without thread_id relinks via bb tasks threads (fallback row)", async () => {
   const h = makeHarness({
     cli: (args) => {
       if (args.join(" ").startsWith("tasks threads"))
@@ -634,12 +713,15 @@ test("reconcile: dispatching without thread_id relinks via bb tasks threads", as
       return undefined;
     },
   });
-  // restart-mid-reissue state: transaction done, dispatch not yet run
+  // restart-mid-reissue state: transaction done, dispatch not yet run —
+  // `own-spawn` marks a row whose dispatch ran the tasks-CLI fallback,
+  // so its thread is found via `bb tasks threads` (r30 е 4).
   const row = h.insertActive({
     threadId: null,
     status: "dispatching",
     createdAt: T0 - 6 * 60_000,
   });
+  h.store.addSetupError(row.id, "own-spawn", "свой запуск недоступен: test");
   const summary = await h.wd.reconcile();
   assert.equal(summary.relinked, 1);
   assert.equal(summary.finalized, 1);
@@ -652,6 +734,68 @@ test("reconcile: dispatching without thread_id relinks via bb tasks threads", as
     !h.calls.some((c) => c.join(" ").startsWith("tasks dispatch")),
     "no re-dispatch",
   );
+});
+
+test("reconcile: dispatching without thread_id relinks via the delegationId label (r30 е 4)", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: null,
+    status: "dispatching",
+    createdAt: T0 - 6 * 60_000,
+  });
+  // the own-spawn thread exists — hidden under the coordinator, labelled
+  // with the delegation id, not yet attached to the task
+  h.threadDtos.set(
+    "thr_own",
+    dto("thr_own", "active", {
+      parentThreadId: "thr_coord",
+      parentNotifications: "auto",
+      visibility: "hidden",
+      title: "PLUG-1 · do it",
+      createdAt: T0 - 5 * 60_000,
+    }),
+  );
+  h.pluginMeta.set("thr_own", { delegationId: row.id });
+  const summary = await h.wd.reconcile();
+  assert.equal(summary.relinked, 1);
+  assert.equal(summary.finalized, 1);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.thread_id, "thr_own");
+  assert.equal(fresh.status, "running");
+  assert.equal(h.store.listActive().length, 1);
+  assert.ok(
+    !h.calls.some((c) => c.join(" ").startsWith("tasks dispatch")),
+    "no re-dispatch",
+  );
+  assert.equal(h.spawnCalls.length, 0, "no re-spawn either");
+});
+
+test("reconcile: label absent → the KEY · title fallback finds the thread", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: null,
+    status: "dispatching",
+    createdAt: T0 - 6 * 60_000,
+  });
+  h.threadDtos.set(
+    "thr_older",
+    dto("thr_older", "active", {
+      parentThreadId: "thr_coord",
+      title: "PLUG-1 · do it",
+      createdAt: T0 - 7 * 60_000, // BEFORE the record → not a candidate
+    }),
+  );
+  h.threadDtos.set(
+    "thr_hit",
+    dto("thr_hit", "active", {
+      parentThreadId: "thr_coord",
+      title: "PLUG-1 · do it",
+      createdAt: T0 - 5 * 60_000,
+    }),
+  );
+  const summary = await h.wd.reconcile();
+  assert.equal(summary.relinked, 1);
+  assert.equal(h.store.get(row.id)!.thread_id, "thr_hit");
 });
 
 test("reconcile: dispatching without thread_id and no task thread → removed + comment", async () => {
@@ -680,6 +824,8 @@ test("reconcile: dispatching with thread_id older than 5 min → steps 4–6 fin
     status: "dispatching",
     createdAt: T0 - 6 * 60_000,
   });
+  // §16.5: the drifted binding is read first, then repaired.
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
   const summary = await h.wd.reconcile();
   assert.equal(summary.finalized, 1);
   const fresh = h.store.get(row.id)!;
@@ -893,8 +1039,9 @@ test("reconcile drives a reissue_of dispatching row to dispatch + report", async
   assert.equal(h.store.get(old.id)!.status, "reissued");
   assert.equal(h.store.listActive().length, 1);
   assert.ok(
-    h.calls.some((c) => c.join(" ").startsWith("tasks dispatch PLUG-1")),
+    h.calls.some((c) => c.join(" ").startsWith("tasks preset show simple-alt")),
   );
+  assert.equal(h.spawnCalls.length, 1);
   assert.match(
     JSON.stringify(h.sends.at(-1)!.input),
     /перевыпуск завершён/,
@@ -906,11 +1053,11 @@ test("reconcile: refused reissue dispatch → new row failed + lost-reissue repo
   const h = makeHarness({
     cli: (args) => {
       const key = args.join(" ");
-      if (key.startsWith("tasks dispatch"))
+      if (key.startsWith("tasks preset show"))
         return { exitCode: 1, stdout: "", stderr: "preset gone" };
       if (key.startsWith("tasks threads"))
         return ok(JSON.stringify({ taskThreads: [] }));
-      return ok();
+      return undefined;
     },
   });
   const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
@@ -1207,13 +1354,11 @@ test("instant reissue dispatch refused → new row failed + lost-reissue report"
   const h = makeHarness({
     cli: (args) => {
       const key = args.join(" ");
-      if (key.startsWith("tasks dispatch"))
-        return { exitCode: 1, stdout: "", stderr: "provider off" };
       if (key.startsWith("tasks preset show"))
-        return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+        return { exitCode: 1, stdout: "", stderr: "provider off" };
       if (key.startsWith("tasks threads"))
         return ok(JSON.stringify({ taskThreads: [] }));
-      return ok();
+      return undefined;
     },
   });
   const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
@@ -1344,6 +1489,7 @@ test("reconcile: undatable attachedAt relinks instead of a second dispatch", asy
     T0 - 6 * 60_000,
     row2.id,
   );
+  h.store.addSetupError(row2.id, "own-spawn", "свой запуск недоступен: test");
   await h.wd.reconcile();
   const fresh = h.store.get(row2.id)!;
   assert.equal(fresh.thread_id, "thr_undated"); // relinked, not re-dispatched
@@ -1383,6 +1529,7 @@ test("relink + finalize resets retry_count (Н4 оговорка)", async () => 
     T0 - 6 * 60_000,
     row2.id,
   );
+  h.store.addSetupError(row2.id, "own-spawn", "свой запуск недоступен: test");
   await h.wd.reconcile(); // lookup fails → retry_count = 1
   assert.equal(h.store.get(row2.id)!.retry_count, 1);
   assert.match(h.store.get(row2.id)!.setup_errors, /retry-last-error/);
@@ -1509,6 +1656,7 @@ test("retry-exhausted on доведение перевыпуска quotes that a
     T0 - 6 * 60_000,
     row2.id,
   );
+  h.store.addSetupError(row2.id, "own-spawn", "свой запуск недоступен: test");
   for (let i = 0; i < 10; i++) await h.wd.reconcile();
   const exhausted = h.sends.filter((s) =>
     JSON.stringify(s.input).includes("исчерпан предел повторов"),
@@ -1840,7 +1988,7 @@ test("reissue dispatch refused with a removed model → hold + chain continues",
     policyText: POLICY_THREE_ROUTES,
     cli: (args) => {
       const key = args.join(" ");
-      if (key.startsWith("tasks dispatch") && key.includes("--preset simple-alt"))
+      if (key.startsWith("tasks preset show simple-alt"))
         return { exitCode: 1, stdout: "", stderr: "model not found: b-9" };
       return undefined;
     },
@@ -1879,7 +2027,7 @@ test("reconcile: reissue dispatch refused with a removed model → hold + next r
     policyText: POLICY_THREE_ROUTES,
     cli: (args) => {
       const key = args.join(" ");
-      if (key.startsWith("tasks dispatch") && key.includes("--preset simple-alt"))
+      if (key.startsWith("tasks preset show simple-alt"))
         return { exitCode: 1, stdout: "", stderr: "model not found: b-9" };
       return undefined;
     },
@@ -3882,6 +4030,7 @@ test("§16.5: drifted binding re-applied until attach-verified=auto", async () =
     dto("thr_e1", "active", {
       parentThreadId: "thr_coord",
       parentNotifications: "auto",
+      visibility: "hidden",
     }),
   );
   const updatesBefore = h.wdUpdates.length;
@@ -5133,11 +5282,11 @@ test("§17.2 r26 (PLUG-211 С4): a refused reissue comments the reason exactly o
   const h = makeHarness({
     cli: (args) => {
       const key = args.join(" ");
-      if (key.startsWith("tasks dispatch"))
+      if (key.startsWith("tasks preset show"))
         return { exitCode: 1, stdout: "", stderr: "preset gone" };
       if (key.startsWith("tasks threads"))
         return ok(JSON.stringify({ taskThreads: [] }));
-      return ok();
+      return undefined;
     },
   });
   const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
