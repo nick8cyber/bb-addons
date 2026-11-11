@@ -107,6 +107,21 @@ export const MIGRATIONS: readonly string[] = [
    ALTER TABLE delegations ADD COLUMN merged_into TEXT;
    ALTER TABLE delegations ADD COLUMN merged_sha TEXT;
    ALTER TABLE delegations ADD COLUMN merged_at INTEGER`,
+  // §7 rev 24/25: `result_notified_at`/`result_notice` — the §16.5 result
+  // delivery's record (`plugin` when the plugin message went out, NULL
+  // notice when the coordinator was already gone); `revived_count` —
+  // §16.2, how often a finished delegation came back to `running`;
+  // `last_response_at` — §16.5 `idleSeconds`, the newest response-event
+  // time of the current turn. `plugin_meta` — key/value service state
+  // (the post-compaction reminder's per-coordinator cursor).
+  `ALTER TABLE delegations ADD COLUMN result_notified_at INTEGER;
+   ALTER TABLE delegations ADD COLUMN result_notice TEXT;
+   ALTER TABLE delegations ADD COLUMN revived_count INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE delegations ADD COLUMN last_response_at INTEGER;
+   CREATE TABLE IF NOT EXISTS plugin_meta (
+     key TEXT PRIMARY KEY,
+     value TEXT NOT NULL
+   )`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -153,6 +168,10 @@ export interface DelegationRow {
   merged_into: string | null;
   merged_sha: string | null;
   merged_at: number | null;
+  result_notified_at: number | null;
+  result_notice: string | null;
+  revived_count: number;
+  last_response_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -491,6 +510,85 @@ export class DelegationStore {
          WHERE id = ?`,
       )
       .run(Date.now(), id);
+  }
+
+  /** §16.5: latest response-event time of the current turn (idleSeconds). */
+  setLastResponse(id: number, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations
+         SET last_response_at = MAX(COALESCE(last_response_at, -1), ?),
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /**
+   * §16.5: the coordinator was told (or could not be told — a gone
+   * coordinator records `result_notified_at` with a NULL `result_notice`
+   * so the delivery does not rescan forever).
+   */
+  setResultNotified(id: number, notice: "bb" | "plugin" | null): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET result_notified_at = ?, result_notice = ?,
+         updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), notice, Date.now(), id);
+  }
+
+  /**
+   * §16.2: a `turn/started` on a finished delegation revives it — back to
+   * `running`, `revived_count += 1`, and the delivery record cleared so
+   * the next `done`/`cancelled` notifies again.
+   */
+  revive(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET status = 'running',
+         revived_count = revived_count + 1,
+         result_notified_at = NULL, result_notice = NULL,
+         first_response_at = NULL, last_response_at = NULL, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(Date.now(), id);
+  }
+
+  /** §16.5: `done`/`cancelled` rows whose result was not delivered yet. */
+  listPendingResult(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status IN ('done','cancelled') AND result_notified_at IS NULL
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /** Distinct coordinator threads the store knows — the §16.5 reminder's scope. */
+  coordinatorThreadIds(): string[] {
+    const rows = this.db
+      .prepare(`SELECT DISTINCT coordinator_thread_id AS t FROM delegations`)
+      .all() as { t: string }[];
+    return rows.map((r) => r.t);
+  }
+
+  /** `plugin_meta` — durable service cursors (post-compaction reminder). */
+  metaGet(key: string): string | undefined {
+    return (
+      this.db.prepare(`SELECT value FROM plugin_meta WHERE key = ?`).get(key) as
+        | { value: string }
+        | undefined
+    )?.value;
+  }
+
+  metaSet(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO plugin_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
   }
 
   /** §7 retry limit: another failed retry of the same action. */

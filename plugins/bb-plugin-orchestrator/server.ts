@@ -454,6 +454,8 @@ export async function createPlugin(
     queuedMessages: { list: (a) => bb.sdk.threads.queuedMessages.list(a) },
     send: (a) => bb.sdk.threads.send(a as never),
     stop: (a) => bb.sdk.threads.stop(a),
+    output: (a) => bb.sdk.threads.output(a),
+    update: (a) => bb.sdk.threads.update(a as never),
   };
   const cmd = deps.cmd ?? createCmd();
   const pluginDataDir = () => {
@@ -581,6 +583,27 @@ export async function createPlugin(
     dispatch: (row, opts) => dispatchToRoute(row, opts ?? {}, stepsDeps),
     finalize: (row) => finishDispatchSteps(row, stepsDeps),
     retrySetup: (row) => retrySetupSteps(row, stepsDeps),
+    // §16.1: BB's own auto-retry queue via the CLI — `status` answers the
+    // thread's pending retry rows, `cancel` drops them before an own stop.
+    providerRetry: {
+      pending: async (threadId) => {
+        const res = await runJson<{ retries?: unknown[] }>(bbCli, [
+          "provider-retry",
+          "status",
+          threadId,
+          "--json",
+        ]);
+        return res.retries ?? [];
+      },
+      cancel: async (threadId) => {
+        await runChecked(bbCli, [
+          "provider-retry",
+          "cancel",
+          threadId,
+          "--json",
+        ]);
+      },
+    },
     round: {
       // §4.1: the executor's environment from its thread, then the env's
       // own facts via `bb environment show`.
