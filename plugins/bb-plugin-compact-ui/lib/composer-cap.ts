@@ -147,10 +147,16 @@ export function enforce(form: Element, win: Window, retry = true): void {
           grownAncestors.set(el, v);
         }
       }
-      for (const el of [...grownAncestors.keys()]) {
-        if (!wanted.has(el)) {
-          el.style.minHeight = "";
-          grownAncestors.delete(el);
+      /* Release only on real overshoot (or the collapse branch above):
+         near the target, delta flutters around zero during the expand
+         transition — stripping min-heights there collapsed the panel, RO
+         re-fired, re-grew it — a visible flap every frame. */
+      if (delta < -8) {
+        for (const el of [...grownAncestors.keys()]) {
+          if (!wanted.has(el)) {
+            el.style.minHeight = "";
+            grownAncestors.delete(el);
+          }
         }
       }
       if (retry && !pendingRetry.has(form)) {
