@@ -184,6 +184,10 @@ function makeWorld(opts: {
   hasProcessIn?: (path: string) => Promise<boolean | null>;
   localHostId?: string;
   cmd?: CmdRunner;
+  /** Invoked on every `thread list` call (1-based) — lets a test change
+   * thread or repo state between the run-start snapshot and the
+   * pre-archive re-read (§15 «Действие», PLUG-188). */
+  onThreadListCall?: (call: number) => void;
 }) {
   const clock = opts.clock ?? { t: Date.now() };
   const db = new Database(":memory:");
@@ -198,6 +202,7 @@ function makeWorld(opts: {
   const sent: { threadId: string; text: string }[] = [];
   const warns: string[] = [];
 
+  let threadListCalls = 0;
   const bbCli: BbCli = {
     run: async (args) => {
       const key = args.join(" ");
@@ -207,6 +212,8 @@ function makeWorld(opts: {
         );
       }
       if (key.startsWith("thread list")) {
+        threadListCalls += 1;
+        opts.onThreadListCall?.(threadListCalls);
         if (args.includes("--environment")) {
           const envId = args[args.indexOf("--environment") + 1]!;
           return ok(JSON.stringify(threads[envId] ?? []));
@@ -845,7 +852,7 @@ test("removal is archive-only — `bb environment cleanup` is never called (§16
   assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
 
-test("report mode deletes nothing and writes only the run row", async () => {
+test("report mode deletes nothing and writes no item rows", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
@@ -869,7 +876,7 @@ test("report mode deletes nothing and writes only the run row", async () => {
   assert.ok(w.janitor.latestRun());
 });
 
-test("a --dry-run pass under apply mode writes only the run row", async () => {
+test("a --dry-run pass under apply mode writes no item rows", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
@@ -886,8 +893,10 @@ test("a --dry-run pass under apply mode writes only the run row", async () => {
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
   // the dry-run preview must not pre-arm the afterMerge clock: no
-  // first_seen_at, no item row at all
+  // first_seen_at, no item row at all — but §15 (r25) has it write the
+  // janitor_meta service marks (repoRoots and the notify bookkeeping)
   assert.equal(w.janitor.item(env.id), undefined);
+  assert.ok(w.janitor.meta("repoRoots"));
   assert.ok(w.janitor.latestRun());
 });
 
@@ -1888,4 +1897,413 @@ test("an incomplete or failed rescue tells the coordinator (PLUG-185 M7)", async
   );
   assert.equal(w2.sent.length, 1);
   assert.match(w2.sent[0]!.text, /НЕ удался/);
+});
+
+// ── PLUG-188 review fixes ────────────────────────────────────────────
+
+test("rebase without commits (ff to origin/main) counts no own work — fresh thread keeps the copy (PLUG-188 B1)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a"); // bb/a at the old origin tip
+  // origin/main moves ahead; `git rebase origin/main` fast-forwards
+  // bb/a — reflog «rebase (finish): refs/heads/bb/a onto <sha>» where
+  // the new tip == <sha>: a перемотка, not own work
+  commitIn(repo, "g.txt", "feat: ahead");
+  git(repo, ["push", "origin", "main"]);
+  git(env.path, ["fetch", "origin"]);
+  git(env.path, ["rebase", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+});
+
+test("a rebase that replays commits counts them as own work (PLUG-188 B1)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  commitIn(repo, "g.txt", "feat: ahead"); // origin moves ahead
+  git(repo, ["push", "origin", "main"]);
+  git(env.path, ["fetch", "origin"]);
+  git(env.path, ["rebase", "origin/main"]); // replays feat: work on top
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+});
+
+test("cascade member without an env still faces cond 4 — an active child blocks the archive (PLUG-188 B2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const root: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  // a child thread with NO environment of its own — BB still archives
+  // it together with the root, so its state must be verified (P3)
+  const kid: ThreadSpec = {
+    id: "thr_kid",
+    status: "active",
+    queuedWork: "waiting",
+    hasPendingInteraction: false,
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    environmentId: null,
+    parentThreadId: "thr_a",
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [root] },
+    extraThreads: [kid],
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(w.janitor.item(env.id)!.reason, "threads-active");
+  // the same env-less child, quiescent — archives with the parent
+  kid.status = "idle";
+  kid.queuedWork = "none";
+  const w2 = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [root] },
+    extraThreads: [kid],
+    clock,
+  });
+  await w2.jan.run();
+  w2.clock.t += 16 * 60_000;
+  const res2 = await w2.jan.run();
+  assert.equal(res2.removedCopies, 1);
+  assert.deepEqual(w2.archivedCalls.sort(), ["thr_a", "thr_kid"].sort());
+});
+
+test("pre-amend orphans are not detached commits — merged copy idled past abandonedAfter is removed (PLUG-188 P2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  // amend rewrites the tip — the pre-amend commit stays in the HEAD
+  // reflog unreachable, but it was made *on* bb/a: not a detached commit
+  writeFileSync(join(env.path, "w.txt"), "feat: work v2\n");
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "--amend", "-m", "feat: work v2"]);
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 30 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
+  assert.equal(res.reported.length, 0);
+});
+
+test("a real detached commit keeps a fresh copy and reports an abandoned one (PLUG-188 M3)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  git(env.path, ["checkout", "--detach", "HEAD"]);
+  commitIn(env.path, "d.txt", "wip: detached");
+  git(env.path, ["checkout", env.branchName]);
+  const clock = { t: Date.now() };
+  // abandoned thread → «брошено» report, not a silent keep
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run(); // first pass only starts the merged-streak
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(res.reported.length, 1);
+  assert.equal(res.reported[0]!.reason, "abandoned-detached");
+  assert.equal(w.janitor.item(env.id)!.state, "reported");
+  // a fresh thread instead → kept, no report
+  const w2 = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w2.jan.run();
+  w2.clock.t += 16 * 60_000;
+  const res2 = await w2.jan.run();
+  assert.equal(res2.reported.length, 0);
+  assert.equal(w2.janitor.item(env.id)!.reason, "detached-commits");
+});
+
+test("the whole HEAD reflog is scanned — a detached commit past the first 500 entries still counts (PLUG-188 L5)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // an orphan commit object nobody references
+  const orphan = git(repo, [
+    "commit-tree",
+    git(repo, ["rev-parse", "HEAD^{tree}"]),
+    "-p",
+    "HEAD",
+    "-m",
+    "wip: ancient detached",
+  ]);
+  const head = git(repo, ["rev-parse", "HEAD"]);
+  // 600 newest reflog lines are non-commit noise; the detached commit
+  // sits in the 601st (oldest) position — a 500-entry slice would miss it
+  const lines = [
+    ...Array.from(
+      { length: 600 },
+      () => `${head}\0reset: moving to HEAD`,
+    ),
+    `${orphan}\0commit: wip: ancient detached`,
+  ];
+  const reflogCmd: CmdRunner = {
+    run: async (f, a, o) =>
+      a[2] === "reflog" && a[3] === "show" && a[4] === "HEAD"
+        ? ok(lines.join("\n") + "\n")
+        : realCmd.run(f, a, o),
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: reflogCmd,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "detached-commits");
+});
+
+test("a thread that comes alive between the snapshot and the archive re-check keeps the copy (PLUG-188 M4)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const t1: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  // the second `thread list` — the pre-archive re-read — sees it active
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [t1] },
+    clock,
+    onThreadListCall: (n) => {
+      if (n >= 2) t1.status = "active";
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(w.janitor.item(env.id)!.reason, "threads-active");
+});
+
+test("a copy dirtied between the snapshot and the archive re-check is kept (PLUG-188 M4)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    onThreadListCall: (n) => {
+      // dirtied after the run-start git status, before the archive
+      if (n >= 2) writeFileSync(join(env.path, "late.txt"), "x\n");
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(w.janitor.item(env.id)!.reason, "dirty");
+});
+
+test("a cascade member spawned between the snapshot and the re-read is checked and archived too (PLUG-188 M4)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const root: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  };
+  const kid: ThreadSpec = {
+    id: "thr_late",
+    status: "idle",
+    queuedWork: "none",
+    hasPendingInteraction: false,
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    environmentId: env.id,
+    parentThreadId: "thr_a",
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [root] },
+    clock,
+    onThreadListCall: (n) => {
+      if (n >= 2) w.threadSpecs[env.id] = [root, kid];
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.deepEqual(w.archivedCalls.sort(), ["thr_a", "thr_late"].sort());
+});
+
+test("--dry-run writes the janitor_meta marks too — daily notify and announced list (PLUG-188 L6)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work"); // never merged
+  const clock = { t: Date.now() };
+  const stale: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+    parentThreadId: "thr_coord",
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [stale] },
+    clock,
+    config: CFG({ mode: "report" }),
+  });
+  const d = w.store.insert({
+    taskKey: "PLUG-9d",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w.store.setThreadInfo(d.id, "thr_a");
+  w.store.setStatus(d.id, "done");
+  const res = await w.jan.run({ dryRun: true });
+  assert.equal(res.reported.length, 1);
+  // the message is report output — it goes out, and its marks persist
+  assert.equal(w.sent.length, 1);
+  assert.equal(w.janitor.meta("dailyNotify:thr_coord"), String(clock.t));
+  assert.match(w.janitor.meta("announcedAbandoned") ?? "", new RegExp(env.id));
+  assert.ok(w.janitor.meta("repoRoots"));
+  // but no copy state and no item row ever
+  assert.equal(w.janitor.item(env.id), undefined);
+  assert.equal(res.removedCopies, 0);
+});
+
+test("a branch checked out in a copy whose directory is already gone is NOT «open» (PLUG-188 L7)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  // BB deleted the copy's directory but left the worktree entry — the
+  // branch shows in `worktree list` as prunable yet must not block
+  // the sweep
+  const stalePath = join(base, "envs", "stale");
+  git(repo, ["worktree", "add", stalePath, "-b", "bb/stale"]);
+  rmSync(stalePath, { recursive: true, force: true });
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.orphanBranches, 1);
+  assert.equal(res.removedBranches, 1);
+  assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/stale"]));
+});
+
+test("an env that leaves «брошено» drops out of announcedAbandoned and is re-announced later (PLUG-188 L8)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work"); // never merged
+  const clock = { t: Date.now() };
+  const thread: ThreadSpec = {
+    id: "thr_a",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+    parentThreadId: "thr_coord",
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [thread] },
+    clock,
+  });
+  const d = w.store.insert({
+    taskKey: "PLUG-9e",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w.store.setThreadInfo(d.id, "thr_a");
+  w.store.setStatus(d.id, "done");
+  await w.jan.run();
+  assert.equal(w.sent.length, 1);
+  assert.match(
+    w.janitor.meta("announcedAbandoned") ?? "",
+    new RegExp(env.id),
+  );
+  // the env stops being abandoned — the announced list forgets it
+  thread.updatedAt = clock.t;
+  await w.jan.run();
+  assert.ok(
+    !(w.janitor.meta("announcedAbandoned") ?? "").includes(env.id),
+  );
+  // abandoned again → announced again (past the daily watermark)
+  thread.updatedAt = clock.t - 2 * 24 * 60 * 60_000;
+  w.clock.t += 25 * 60 * 60_000;
+  await w.jan.run();
+  assert.equal(w.sent.length, 2);
 });

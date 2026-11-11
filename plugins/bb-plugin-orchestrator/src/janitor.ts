@@ -8,9 +8,10 @@
  * is never called — BB frees the copy once every thread of the env is
  * archived). Before archiving, the full cascade — children and hidden
  * forks recursively — is built and conditions 1–5 are checked for every
- * env of the cascade; condition 4 covers *every* live thread of those
- * envs (`idle`/`error` only, `queuedWork = none`, no active delegation,
- * no pending request), not only cascade members. `scope` picks the
+ * env of the cascade; condition 4 covers every non-archived cascade
+ * member — including members with no env of their own — and every live
+ * thread of those envs (`idle`/`error` only, `queuedWork = none`, no
+ * active delegation, no pending request). `scope` picks the
  * candidates: `workers` (default) covers dispatch threads
  * (`originPluginId=tasks`) and threads with a parent; `all` also covers
  * root chats. A `bb/` branch is deleted only on a later run, once its
@@ -19,8 +20,12 @@
  * because cherry ignores merge commits, `git merge-tree --write-tree`
  * must produce the target's own tree. Own commits are counted only from
  * reflog entries that create commits (`commit*`, `cherry-pick`,
- * `revert`, `rebase (finish)`) — fast-forwards, resets and checkouts
- * never count.
+ * `revert`, `rebase (finish)` — the latter only when the new tip differs
+ * from the `onto` base, a commit-less rebase is a fast-forward) —
+ * fast-forwards, resets and checkouts never count. Detached-HEAD
+ * commits unreachable from every ref keep the copy, or report it once
+ * abandoned; commits made on a branch (the amend/rebase orphans they
+ * leave in the HEAD reflog included) do not count.
  *
  * §16.4: on `thread.archived` of an executor whose copy is still dirty,
  * the state is saved into `refs/orchestrator/rescue/<thr>` (stash object
@@ -251,15 +256,29 @@ export function defaultHasProcessIn(root: string): boolean | null {
 /** `git worktree list --porcelain` → branches checked out per worktree. */
 function parseWorktreeList(
   text: string,
-): { worktrees: { path: string; branch: string | null }[] } {
-  const worktrees: { path: string; branch: string | null }[] = [];
-  let cur: { path: string; branch: string | null } | null = null;
+): { worktrees: { path: string; branch: string | null; prunable: boolean }[] } {
+  const worktrees: {
+    path: string;
+    branch: string | null;
+    prunable: boolean;
+  }[] = [];
+  let cur: {
+    path: string;
+    branch: string | null;
+    prunable: boolean;
+  } | null = null;
   for (const line of text.split("\n")) {
     if (line.startsWith("worktree ")) {
-      cur = { path: line.slice("worktree ".length), branch: null };
+      cur = {
+        path: line.slice("worktree ".length),
+        branch: null,
+        prunable: false,
+      };
       worktrees.push(cur);
     } else if (cur && line.startsWith("branch ")) {
       cur.branch = line.slice("branch ".length).replace(/^refs\/heads\//, "");
+    } else if (cur && line.startsWith("prunable")) {
+      cur.prunable = true;
     }
   }
   return { worktrees };
@@ -270,9 +289,11 @@ export function createJanitor(deps: JanitorDeps) {
   const log = deps.log ?? {};
   const hasProcessIn =
     deps.hasProcessIn ?? (async (p: string) => defaultHasProcessIn(p));
-  // §15: «--dry-run и mode: report в базу ничего не пишут, кроме отчёта
-  // прогона». The merged-sighting streak and the daily-notify watermark
-  // still work inside such runs — kept in memory only, per process.
+  // §15 (ревизия 25): «--dry-run и mode: report не ставят first_seen_at
+  // и не меняют состояние копий; служебные отметки отчёта (janitor_meta)
+  // пишутся». The merged-sighting streak and the daily-notify watermark
+  // also work inside such runs — mirrored in memory per process so the
+  // DB is not required for a coherent preview.
   const firstSeenMem = new Map<string, number>();
   const notifyMem = new Map<string, number>();
   // §16.3: «newly abandoned» tracking for report-mode runs — the DB is
@@ -399,6 +420,9 @@ export function createJanitor(deps: JanitorDeps) {
    */
   const OWN_COMMIT_ACTION =
     /^(?:commit(?:\s*\([^)]*\))?:|cherry-pick:|revert:|rebase \(finish\))/;
+  const REBASE_ONTO = /^rebase \(finish\).*onto (\S+)/;
+  const DETACHED_CREATOR =
+    /^(?:commit(?:\s*\([^)]*\))?:|cherry-pick:|revert:|rebase \((?:pick|merge|squash|fixup|finish)\)|merge .*: Merge made)/;
   const countOwnCommits = async (
     env: EnvDto,
     path: string,
@@ -409,12 +433,40 @@ export function createJanitor(deps: JanitorDeps) {
       "reflog",
       "show",
       ref,
-      "--format=%gs",
+      "--format=%H%x00%gs",
     ]);
     if (!reflog) return 0;
-    return reflog
-      .split("\n")
-      .filter((l) => OWN_COMMIT_ACTION.test(l.trim())).length;
+    let count = 0;
+    const rebases: { onto: string; sha: string }[] = [];
+    for (const line of reflog.split("\n")) {
+      const sep = line.indexOf("\0");
+      if (sep < 0) continue;
+      const sha = line.slice(0, sep);
+      const subject = line.slice(sep + 1).trim();
+      if (!OWN_COMMIT_ACTION.test(subject)) continue;
+      const onto = REBASE_ONTO.exec(subject)?.[1];
+      if (onto) rebases.push({ onto, sha });
+      else count += 1;
+    }
+    // §16.3: «rebase (finish) … onto <X>» counts as own work only when the
+    // new tip differs from <X> — rebasing a commit-less branch
+    // fast-forwards it to <X> itself, a перемотка, not a commit. The
+    // reflog writes the resolved sha, so a prefix compare catches the
+    // common case; `rev-list <X>..<tip>` is the exact count. An
+    // unresolvable <X> proves nothing — contribute zero (stay kept).
+    for (const { onto, sha } of rebases) {
+      if (sha === onto || sha.startsWith(onto)) continue;
+      const n = (
+        await gitOut(deps.cmd, path, [
+          "rev-list",
+          "--count",
+          `${onto}..${sha}`,
+        ])
+      )?.trim();
+      if (n === undefined) continue;
+      count += Number(n) || 0;
+    }
+    return count;
   };
 
   /**
@@ -541,9 +593,11 @@ export function createJanitor(deps: JanitorDeps) {
     };
 
     try {
-      await runBody(effective, apply, summary, !opts.dryRun);
-      // A --dry-run preview never writes to the coordinator either.
-      if (!opts.dryRun) await notifyCoordinators(summary);
+      await runBody(effective, apply, summary);
+      // The daily «брошено» message is report output, not a deletion —
+      // it goes out in report mode and on --dry-run alike (§15), with
+      // the janitor_meta marks persisted so a restart cannot resend it.
+      await notifyCoordinators(summary);
       finish();
     } catch (e) {
       const text = message(e);
@@ -557,7 +611,6 @@ export function createJanitor(deps: JanitorDeps) {
     cfg: JanitorConfig,
     apply: boolean,
     summary: JanitorRunSummary,
-    metaPersist: boolean,
   ): Promise<void> => {
     const at = now();
     const persist = apply;
@@ -593,41 +646,61 @@ export function createJanitor(deps: JanitorDeps) {
     );
     const envById = new Map(envs.map((e) => [e.id, e]));
 
-    const delegatedThreads = new Set(
-      deps.store
-        .listActive()
-        .map((r) => r.thread_id)
-        .filter((t): t is string => typeof t === "string"),
-    );
+    const activeDelegations = (): Set<string> =>
+      new Set(
+        deps.store
+          .listActive()
+          .map((r) => r.thread_id)
+          .filter((t): t is string => typeof t === "string"),
+      );
+    const delegatedThreads = activeDelegations();
 
     // §16.3: one global thread list builds the cascade graph — children
-    // via `parentThreadId`, hidden forks via `sourceThreadId`.
-    const allThreads = await listThreads();
-    const threadById = new Map<string, ThreadDto>();
-    const threadsByEnv = new Map<string, ThreadDto[]>();
-    const childrenOf = new Map<string, ThreadDto[]>();
-    for (const t of allThreads ?? []) {
-      threadById.set(t.id, t);
-      if (t.environmentId) {
-        const list = threadsByEnv.get(t.environmentId) ?? [];
-        list.push(t);
-        threadsByEnv.set(t.environmentId, list);
-      }
-      for (const p of [t.parentThreadId, t.sourceThreadId]) {
-        if (p) {
-          const list = childrenOf.get(p) ?? [];
+    // via `parentThreadId`, hidden forks via `sourceThreadId`. The graph
+    // is rebuilt right before archiving (§15 «Действие»): the run-start
+    // snapshot is stale by then.
+    interface ThreadGraph {
+      all: ThreadDto[] | null;
+      byId: Map<string, ThreadDto>;
+      byEnv: Map<string, ThreadDto[]>;
+      childrenOf: Map<string, ThreadDto[]>;
+    }
+    const fetchGraph = async (): Promise<ThreadGraph> => {
+      const all = await listThreads();
+      const g: ThreadGraph = {
+        all,
+        byId: new Map(),
+        byEnv: new Map(),
+        childrenOf: new Map(),
+      };
+      for (const t of all ?? []) {
+        g.byId.set(t.id, t);
+        if (t.environmentId) {
+          const list = g.byEnv.get(t.environmentId) ?? [];
           list.push(t);
-          childrenOf.set(p, list);
+          g.byEnv.set(t.environmentId, list);
+        }
+        for (const p of [t.parentThreadId, t.sourceThreadId]) {
+          if (p) {
+            const list = g.childrenOf.get(p) ?? [];
+            list.push(t);
+            g.childrenOf.set(p, list);
+          }
         }
       }
-    }
-    const liveThreadsOf = (envId: string): ThreadDto[] =>
-      (threadsByEnv.get(envId) ?? []).filter(
+      return g;
+    };
+    const graph = await fetchGraph();
+    const liveThreadsOf = (
+      envId: string,
+      g: ThreadGraph = graph,
+    ): ThreadDto[] =>
+      (g.byEnv.get(envId) ?? []).filter(
         (t) => !t.archivedAt && !archivedNow.has(t.id),
       );
 
     const pickThreadId = (env: EnvDto): string | null => {
-      const list = threadsByEnv.get(env.id) ?? [];
+      const list = graph.byEnv.get(env.id) ?? [];
       const live = list.filter((t) => !t.archivedAt);
       return (
         live.find((t) => delegatedThreads.has(t.id))?.id ??
@@ -740,6 +813,10 @@ export function createJanitor(deps: JanitorDeps) {
             info.protectedTargets.push(ref);
           }
         }
+        // A copy BB deleted externally leaves a stale worktree entry
+        // that still marks its branch «checked out» — prune it (apply
+        // only; report mode reads the `prunable` flag instead).
+        if (apply) await gitOk(deps.cmd, root, ["worktree", "prune"]);
         const worktreeList = await gitOut(deps.cmd, root, [
           "worktree",
           "list",
@@ -748,7 +825,12 @@ export function createJanitor(deps: JanitorDeps) {
         info.worktreeListFailed = worktreeList === null;
         info.openBranches = new Set(
           parseWorktreeList(worktreeList ?? "")
-            .worktrees.map((w) => w.branch)
+            .worktrees
+            // A copy whose directory BB already deleted lingers as a
+            // `prunable` entry (or is simply missing from disk) — its
+            // branch is not «открыта ни в одной копии» (§15).
+            .filter((w) => !w.prunable && existsSync(w.path))
+            .map((w) => w.branch)
             .filter((b): b is string => !!b),
         );
         info.localBranches = (
@@ -766,14 +848,13 @@ export function createJanitor(deps: JanitorDeps) {
       repoInfos.push(info);
       seenRoots.push({ common: commonDir, root });
     }
-    // Service state, not an item row: written in report mode too (but
-    // never by --dry-run), per the PLUG-185 review of §15/§16.
-    if (metaPersist) {
-      deps.janitor.setMeta(
-        "repoRoots",
-        JSON.stringify(seenRoots.slice(-500)),
-      );
-    }
+    // Service state, not an item row: written by report mode and
+    // --dry-run too (§15 — the branch sweep needs the roots of copies
+    // that are already gone, whatever mode deletes them).
+    deps.janitor.setMeta(
+      "repoRoots",
+      JSON.stringify(seenRoots.slice(-500)),
+    );
 
     const reportedNow: {
       env: EnvDto;
@@ -870,7 +951,7 @@ export function createJanitor(deps: JanitorDeps) {
       if (!repo.fetched) return bad("fetch-failed");
       // Thread state feeds «заброшена» and «все в архиве» — without the
       // list neither is provable, so nothing about the env is.
-      if (allThreads === null) return bad("threads-unknown");
+      if (graph.all === null) return bad("threads-unknown");
       const path = env.path!;
       if (!existsSync(path)) return bad("missing-path");
       const head = (
@@ -915,7 +996,7 @@ export function createJanitor(deps: JanitorDeps) {
         await gitOut(deps.cmd, path, ["branch", "--show-current"])
       )?.trim();
 
-      const envThreadList = threadsByEnv.get(env.id) ?? [];
+      const envThreadList = graph.byEnv.get(env.id) ?? [];
       const liveThreads = envThreadList.filter((t) => !t.archivedAt);
       // «Тред простаивает» — idleness is the threads', not the env
       // record's: env.updatedAt moves on lifecycle events, not user work.
@@ -993,31 +1074,62 @@ export function createJanitor(deps: JanitorDeps) {
         return after(abandoned ? "abandoned-dirty" : "dirty", abandoned);
       if (unfinished) return after("unfinished-op");
       if (gitDirFailed) return after("unfinished-unknown");
-      // §16.3: commits reachable only from this copy's HEAD reflog die
-      // with the copy — keep it (`detached-commits`). A failed probe
-      // cannot prove the negative (`detached-unknown`).
+      // §16.3 (ревизия 25): only commits *made* on a detached HEAD and
+      // unreachable from every ref die with the copy — it stays
+      // (`detached-commits`), or goes to the «брошено» report once the
+      // thread idles past `abandonedAfter`. A commit always lands in the
+      // checked-out branch's own reflog as well as HEAD's, so
+      // commit-creating shas found in any branch reflog were made while
+      // attached: the orphans `commit --amend` and `rebase` leave behind
+      // do not count. The whole HEAD reflog is read — no entry cap.
       const headReflog = await gitOut(deps.cmd, path, [
         "reflog",
         "show",
         "HEAD",
-        "--format=%H",
+        "--format=%H%x00%gs",
       ]);
       if (headReflog === null) return after("detached-unknown");
-      const headShas = [
-        ...new Set(headReflog.split("\n").filter(Boolean)),
-      ].slice(0, 500);
-      if (headShas.length) {
+      const commitShas = (text: string): Set<string> => {
+        const out = new Set<string>();
+        for (const line of text.split("\n")) {
+          const sep = line.indexOf("\0");
+          if (sep < 0) continue;
+          if (DETACHED_CREATOR.test(line.slice(sep + 1).trim())) {
+            out.add(line.slice(0, sep));
+          }
+        }
+        return out;
+      };
+      const attachedShas = new Set<string>();
+      for (const b of repo.localBranches) {
+        const rl = await gitOut(deps.cmd, path, [
+          "reflog",
+          "show",
+          `refs/heads/${b}`,
+          "--format=%H%x00%gs",
+        ]);
+        if (rl === null) continue;
+        for (const s of commitShas(rl)) attachedShas.add(s);
+      }
+      const detachedShas = [...commitShas(headReflog)].filter(
+        (s) => !attachedShas.has(s),
+      );
+      if (detachedShas.length) {
         const detached = (
           await gitOut(deps.cmd, path, [
             "rev-list",
             "--count",
-            ...headShas,
+            ...detachedShas,
             "--not",
             "--all",
           ])
         )?.trim();
         if (detached === undefined) return after("detached-unknown");
-        if (Number(detached) > 0) return after("detached-commits");
+        if (Number(detached) > 0) {
+          return abandoned
+            ? after("abandoned-detached", true)
+            : after("detached-commits");
+        }
       }
       const proc = await hasProcessIn(path);
       if (proc === null) return after("process-unknown");
@@ -1046,7 +1158,7 @@ export function createJanitor(deps: JanitorDeps) {
         const pid = cur.parentThreadId ?? cur.sourceThreadId;
         if (!pid || seen.has(pid)) return false;
         seen.add(pid);
-        const p = threadById.get(pid);
+        const p = graph.byId.get(pid);
         if (!p) return false;
         if (!p.archivedAt && isCandidate(p)) return true;
         cur = p;
@@ -1056,14 +1168,17 @@ export function createJanitor(deps: JanitorDeps) {
     const isCascadeRoot = (t: ThreadDto): boolean =>
       isCandidate(t) && !hasCandidateAncestor(t);
 
-    const cascadeOf = (root: ThreadDto): ThreadDto[] => {
+    const cascadeOf = (
+      g: ThreadGraph,
+      root: ThreadDto,
+    ): ThreadDto[] => {
       const out: ThreadDto[] = [];
       const seen = new Set<string>([root.id]);
       const queue = [root];
       while (queue.length) {
         const t = queue.shift()!;
         out.push(t);
-        for (const c of childrenOf.get(t.id) ?? []) {
+        for (const c of g.childrenOf.get(t.id) ?? []) {
           if (!seen.has(c.id)) {
             seen.add(c.id);
             queue.push(c);
@@ -1080,6 +1195,57 @@ export function createJanitor(deps: JanitorDeps) {
       );
 
     /**
+     * §15 cond 4 (ревизия 25): the quiescence set is every non-archived
+     * cascade member — *including members with no env of their own* — and
+     * every live thread of each member env (they share the copy; a
+     * blocking thread outside the cascade still blocks the archive).
+     */
+    const cond4Threads = (
+      members: ThreadDto[],
+      memberEnvs: Map<string, EnvDto>,
+      g: ThreadGraph,
+    ): { thread: ThreadDto; env: string | null }[] => {
+      const out: { thread: ThreadDto; env: string | null }[] = [];
+      const seen = new Set<string>();
+      for (const t of members) {
+        seen.add(t.id);
+        out.push({ thread: t, env: t.environmentId ?? null });
+      }
+      for (const e of memberEnvs.values()) {
+        for (const t of liveThreadsOf(e.id, g)) {
+          if (seen.has(t.id)) continue;
+          seen.add(t.id);
+          out.push({ thread: t, env: e.id });
+        }
+      }
+      return out;
+    };
+    const checkCond4 = async (
+      list: { thread: ThreadDto; env: string | null }[],
+      delegated: Set<string>,
+    ): Promise<{ reason: string; env: string | null } | null> => {
+      for (const { thread: t, env } of list) {
+        if (!QUIESCENT_THREAD_STATUSES.has(t.status ?? "")) {
+          return { reason: "threads-active", env };
+        }
+        if (t.queuedWork !== "none") {
+          return { reason: "queued-work", env };
+        }
+        if (delegated.has(t.id)) {
+          return { reason: "delegation-active", env };
+        }
+      }
+      for (const { thread: t, env } of list) {
+        const pending =
+          typeof t.hasPendingInteraction === "boolean"
+            ? t.hasPendingInteraction
+            : await hasPendingInteraction(t.id);
+        if (pending) return { reason: "interactions-pending", env };
+      }
+      return null;
+    };
+
+    /**
      * §16.3: evaluate one cascade — every unarchived member's env must
      * pass conditions 1–5 and no member may have a blocking status, an
      * active delegation or a pending request. A pass archives all
@@ -1088,7 +1254,7 @@ export function createJanitor(deps: JanitorDeps) {
      * never called — BB frees the copy once every env thread is archived.
      */
     const evalCascade = async (root: ThreadDto): Promise<void> => {
-      const members = cascadeOf(root).filter(
+      const members = cascadeOf(graph, root).filter(
         (t) => !t.archivedAt && !archivedNow.has(t.id),
       );
       for (const t of members) processedThreads.add(t.id);
@@ -1113,37 +1279,13 @@ export function createJanitor(deps: JanitorDeps) {
         note("cascade-env-external", null);
         return;
       }
-      // §15 cond 4 (ревизия 25): every live thread of every cascade env —
-      // not only cascade members — must be idle/errored with an empty
-      // queue and no active delegation. A blocking thread outside the
-      // cascade still blocks the archive.
-      for (const e of memberEnvs.values()) {
-        for (const t of liveThreadsOf(e.id)) {
-          if (!QUIESCENT_THREAD_STATUSES.has(t.status ?? "")) {
-            note("threads-active", e.id);
-            return;
-          }
-          if (t.queuedWork !== "none") {
-            note("queued-work", e.id);
-            return;
-          }
-          if (delegatedThreads.has(t.id)) {
-            note("delegation-active", e.id);
-            return;
-          }
-        }
-      }
-      for (const e of memberEnvs.values()) {
-        for (const t of liveThreadsOf(e.id)) {
-          const pending =
-            typeof t.hasPendingInteraction === "boolean"
-              ? t.hasPendingInteraction
-              : await hasPendingInteraction(t.id);
-          if (pending) {
-            note("interactions-pending", e.id);
-            return;
-          }
-        }
+      const blocked = await checkCond4(
+        cond4Threads(members, memberEnvs, graph),
+        delegatedThreads,
+      );
+      if (blocked) {
+        note(blocked.reason, blocked.env);
+        return;
       }
       for (const e of memberEnvs.values()) {
         const f = await envFacts(e);
@@ -1153,8 +1295,72 @@ export function createJanitor(deps: JanitorDeps) {
         }
       }
       if (!apply) return; // report mode: counted via «ready» below
+
+      // §15 «Действие»: the run-start snapshot is minutes old by now —
+      // re-read the cascade's threads and repeat `git status` on every
+      // member copy before archiving. The cascade itself is rebuilt: a
+      // child spawned meanwhile rides BB's own cascade archive, so it
+      // must face the same checks (or the whole archive is off).
+      const fresh = await fetchGraph();
+      const freshRoot = fresh.all === null ? undefined : fresh.byId.get(root.id);
+      if (!freshRoot || freshRoot.archivedAt || archivedNow.has(root.id)) {
+        note("threads-unknown", null);
+        return;
+      }
+      const freshMembers = cascadeOf(fresh, freshRoot).filter(
+        (t) => !t.archivedAt && !archivedNow.has(t.id),
+      );
+      for (const t of freshMembers) processedThreads.add(t.id);
+      const freshEnvs = new Map<string, EnvDto>();
+      let externalFresh = false;
+      for (const t of freshMembers) {
+        const eid = t.environmentId;
+        if (!eid) continue;
+        const e = envById.get(eid);
+        if (!e) {
+          externalFresh = true;
+          break;
+        }
+        freshEnvs.set(eid, e);
+      }
+      if (externalFresh) {
+        note("cascade-env-external", null);
+        return;
+      }
+      const blockedFresh = await checkCond4(
+        cond4Threads(freshMembers, freshEnvs, fresh),
+        activeDelegations(),
+      );
+      if (blockedFresh) {
+        note(blockedFresh.reason, blockedFresh.env);
+        return;
+      }
+      for (const e of freshEnvs.values()) {
+        const f = await envFacts(e);
+        if (!f.ready) {
+          note(f.reason, e.id);
+          return;
+        }
+      }
+      for (const e of freshEnvs.values()) {
+        const st = await gitOut(deps.cmd, e.path!, [
+          "status",
+          "--porcelain",
+          "--untracked-files=all",
+          "--ignore-submodules=none",
+        ]);
+        if (st === null) {
+          note("status-failed", e.id);
+          return;
+        }
+        if (st.trim()) {
+          note("dirty", e.id);
+          return;
+        }
+      }
+
       const done: string[] = [];
-      for (const t of [...members].reverse()) {
+      for (const t of [...freshMembers].reverse()) {
         const res = await deps.bbCli.run(["thread", "archive", t.id]);
         if (res.exitCode !== 0) {
           // §15: a failed archive rolls the members already archived
@@ -1182,7 +1388,7 @@ export function createJanitor(deps: JanitorDeps) {
     // iteration order does not matter.
     for (const env of envs) {
       if (!(await envFacts(env)).ready) continue;
-      for (const t of threadsByEnv.get(env.id) ?? []) {
+      for (const t of graph.byEnv.get(env.id) ?? []) {
         if (isCascadeRoot(t)) await evalCascade(t);
       }
     }
@@ -1205,7 +1411,7 @@ export function createJanitor(deps: JanitorDeps) {
         }
         continue;
       }
-      const envThreadList = threadsByEnv.get(env.id) ?? [];
+      const envThreadList = graph.byEnv.get(env.id) ?? [];
       const blocked = envBlocked.get(env.id);
       // Threads that stayed out of every evaluated cascade — out-of-scope
       // root chats under `scope: workers`, or members of a cascade that
@@ -1328,8 +1534,7 @@ export function createJanitor(deps: JanitorDeps) {
   const notifyCoordinators = async (
     summary: JanitorRunSummary,
   ): Promise<void> => {
-    if (!summary.reported.length) return;
-    let announced = announcedMem;
+    let announced: Set<string>;
     try {
       announced = new Set([
         ...announcedMem,
@@ -1340,8 +1545,29 @@ export function createJanitor(deps: JanitorDeps) {
     } catch {
       announced = new Set(announcedMem);
     }
+    // §15: a copy that stopped being abandoned leaves the announced
+    // list — if it goes abandoned again later it is announced again.
+    const current = new Set(summary.reported.map((i) => i.envId));
+    for (const id of [...announced]) {
+      if (!current.has(id)) {
+        announced.delete(id);
+        announcedMem.delete(id);
+      }
+    }
+    const persistAnnounced = () =>
+      deps.janitor.setMeta(
+        "announcedAbandoned",
+        JSON.stringify([...announced].slice(-2000)),
+      );
+    if (!summary.reported.length) {
+      persistAnnounced();
+      return;
+    }
     const fresh = summary.reported.filter((i) => !announced.has(i.envId));
-    if (!fresh.length) return;
+    if (!fresh.length) {
+      persistAnnounced();
+      return;
+    }
     const byCoordinator = new Map<string, JanitorReportedItem[]>();
     for (const item of fresh) {
       const tid = item.threadId;
@@ -1387,10 +1613,7 @@ export function createJanitor(deps: JanitorDeps) {
           announcedMem.add(item.envId);
         }
         deps.janitor.setMeta(key, String(now()));
-        deps.janitor.setMeta(
-          "announcedAbandoned",
-          JSON.stringify([...announced].slice(-2000)),
-        );
+        persistAnnounced();
       } catch (e) {
         log.warn?.(`orchestrator janitor: notify ${coordinator}: ${message(e)}`);
       }
