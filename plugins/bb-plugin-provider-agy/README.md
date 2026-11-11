@@ -434,17 +434,19 @@ Google sign-in; re-authenticate one and retry` — instead of spamming
 rotations. Quota fields and `rateLimits` are untouched.
 
 > [!TIP] Restore a logged-out account
-> Re-login the account (`HOME=accounts/<label> agy` login flow), then in
-> `bridge-data/accounts-state.json` set its `cooldownUntilMs` to `0` **and**
-> `lastUsedMs` to the current time — clearing the cooldown alone is not
-> enough: a satellite instance's `accounts-overlay.json` shadow survives
-> until the shared file shows fresher activity (or just run one turn on the
-> owner instance — its own `markAccountUse` lifts the shadow via the next
-> sync). Alternatively remove the label from `accounts-parked/` bookkeeping
-> the same way as any parked account.
+> Re-login the account (`HOME=accounts/<label> agy` login flow). The unpark
+> edit differs by side. **On the owner instance**: in
+> `bridge-data/accounts-state.json` set the account's `cooldownUntilMs` to
+> `0` **and** `lastUsedMs` to the current time — or just run one turn, its
+> `markAccountUse` lifts every satellite's `accounts-overlay.json` shadow
+> via the next sync. **On a satellite**: remove the label's record from
+> `bridge-data/accounts-overlay.json` (or delete the file) — editing the
+> shared file there is useless, the keeper restores the owner's version
+> within ~30 s. Alternatively remove the label from `accounts-parked/`
+> bookkeeping the same way as any parked account.
 
 > [!TIP] Restore a verified account
-> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then in `bridge-data/accounts-state.json` set that account's `cooldownUntilMs` to `0` **and** `lastUsedMs` to the current time (both are needed so a satellite's overlay shadow lifts), or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
+> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then unpark by side — **on the owner instance**: set that account's `cooldownUntilMs` to `0` **and** `lastUsedMs` to the current time in `bridge-data/accounts-state.json` (or run one turn); **on a satellite**: remove the label's record from `bridge-data/accounts-overlay.json`, since the keeper reverts shared edits within ~30 s. Or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
 
 #### Native agy subagents are disabled
 

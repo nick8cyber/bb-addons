@@ -54,9 +54,16 @@ const {
   markAccountUse,
   markAccountCooldown,
   markAccountIneligible,
+  pickAccount,
 } = acct;
 
 const rootA = mkdtempSync(join(tmpdir(), "agy-localstate-"));
+// Real pool labels always have accounts/<label>/ homes — overlay records
+// for labels absent from BOTH the shared file and accounts/ are ghosts
+// and get cleaned on save.
+for (const label of ["a1", "a2", "a3"]) {
+  mkdirSync(join(rootA, "accounts", label), { recursive: true });
+}
 const sharedPath = join(rootA, "accounts-state.json");
 const convPath = join(rootA, "conversations-state.json");
 const overlayPath = join(rootA, "accounts-overlay.json");
@@ -216,6 +223,201 @@ check(
       merged.conversations["conv-w1"] === "a1" &&
       merged.conversations["conv-w2"] === "a2",
     JSON.stringify({ conv, ov: Object.keys(ov) }),
+  );
+}
+
+// A10: same-label overlay race — two parallel ledgers dirty the SAME
+// label; the per-field disk merge keeps each side's fields: w1's cooldown
+// survives w2's stale snapshot, and w2's fresher strings win (its null
+// lastError is a value, not an absence).
+{
+  const race = mkdtempSync(join(tmpdir(), "agy-localstate-race-"));
+  writeJson(join(race, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  const w1 = loadLedger(race);
+  const w2 = loadLedger(race); // stale snapshot from the same load point
+  const cooldownUntil = Date.now() + 5_000;
+  markAccountCooldown(w1, "a1", cooldownUntil, "w1 429");
+  saveLedger(race, w1);
+  markAccountIneligible(w2, "a1", { parkedReason: "auth-dead" });
+  saveLedger(race, w2); // carries neither w1's cooldown nor its error
+  const a1 = readJson(join(race, "accounts-overlay.json"))?.accounts?.a1;
+  check(
+    "localstate/same-label-overlay-race-field-merge",
+    (a1?.cooldownUntilMs ?? 0) >= cooldownUntil &&
+      (a1?.ineligibleAtMs ?? 0) > 0 &&
+      a1?.parkedReason === "auth-dead" &&
+      a1?.lastError === null,
+    JSON.stringify(a1),
+  );
+}
+
+// A11: re-pin race — a stale ledger must not write a neighbour's re-pin
+// back: save pushes only dirtyPins keys over the disk map.
+{
+  const repin = mkdtempSync(join(tmpdir(), "agy-localstate-repin-"));
+  writeJson(join(repin, "accounts-state.json"), { accounts: {} });
+  const w1 = loadLedger(repin);
+  rememberConversation(w1, "conv", "a1");
+  saveLedger(repin, w1); // disk: conv -> a1
+  const w3 = loadLedger(repin);
+  const w4 = loadLedger(repin); // both snapshots see conv -> a1
+  rememberConversation(w3, "conv", "a2");
+  saveLedger(repin, w3); // disk: conv -> a2
+  rememberConversation(w4, "other", "a1");
+  saveLedger(repin, w4); // w4's stale conv -> a1 must not come back
+  const conv =
+    readJson(join(repin, "conversations-state.json"))?.conversations ?? {};
+  check(
+    "localstate/stale-ledger-keeps-neighbour-repin",
+    conv["conv"] === "a2" && conv["other"] === "a1",
+    JSON.stringify(conv),
+  );
+}
+
+// A12: broken JSON in each of the three files — load treats each as empty
+// instead of throwing.
+{
+  const broken = mkdtempSync(join(tmpdir(), "agy-localstate-broken-"));
+  writeFileSync(join(broken, "accounts-state.json"), "{ nope");
+  writeFileSync(join(broken, "conversations-state.json"), "%%%");
+  writeFileSync(join(broken, "accounts-overlay.json"), "not json");
+  let brokenLoad = null;
+  try {
+    brokenLoad = loadLedger(broken);
+  } catch (e) {
+    brokenLoad = e;
+  }
+  check(
+    "localstate/broken-json-files-load-empty",
+    !(brokenLoad instanceof Error) &&
+      Object.keys(brokenLoad?.accounts ?? { x: 1 }).length === 0 &&
+      Object.keys(brokenLoad?.conversations ?? { x: 1 }).length === 0,
+    brokenLoad instanceof Error ? String(brokenLoad) : "ok",
+  );
+}
+
+// A13: the shadow dies by untilMs too — an expired overlay cooldown stops
+// masking the account; expiry is decided against `now` at use.
+{
+  const exp = mkdtempSync(join(tmpdir(), "agy-localstate-exp-"));
+  writeJson(join(exp, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(exp, "accounts-overlay.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: Date.now() - 1_000,
+        lastUsedMs: 0,
+        lastError: "old 429",
+        writtenMs: Date.now(),
+      },
+    },
+  });
+  const l = loadLedger(exp);
+  const pick = pickAccount(l, [{ label: "a1", home: "/x", proxy: null }]);
+  check(
+    "localstate/expired-shadow-cools-off",
+    (l.accounts.a1?.cooldownUntilMs ?? Infinity) <= Date.now() &&
+      pick?.label === "a1",
+    JSON.stringify(l.accounts.a1),
+  );
+}
+
+// A14: ghost cleanup — an overlay record for a label absent from both the
+// shared file and accounts/ is dropped on the next dirty save and does
+// not leak into the shared write; a label with an accounts/ dir survives.
+{
+  const ghost = mkdtempSync(join(tmpdir(), "agy-localstate-ghost-"));
+  mkdirSync(join(ghost, "accounts", "a1"), { recursive: true });
+  mkdirSync(join(ghost, "accounts", "dirkept"), { recursive: true });
+  writeJson(join(ghost, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(ghost, "accounts-overlay.json"), {
+    accounts: {
+      ghost: {
+        cooldownUntilMs: 0, lastUsedMs: 1, lastError: null, writtenMs: 1,
+      },
+      dirkept: {
+        cooldownUntilMs: 0, lastUsedMs: 1, lastError: null, writtenMs: 1,
+      },
+    },
+  });
+  const l = loadLedger(ghost);
+  markAccountCooldown(l, "a1", Date.now() + 5_000, "touch");
+  saveLedger(ghost, l);
+  const ov = readJson(join(ghost, "accounts-overlay.json"))?.accounts ?? {};
+  const sh = readJson(join(ghost, "accounts-state.json"))?.accounts ?? {};
+  check(
+    "localstate/ghost-records-cleaned-on-save",
+    ov.ghost === undefined &&
+      ov.dirkept !== undefined &&
+      ov.a1 !== undefined &&
+      sh.ghost === undefined,
+    JSON.stringify({ ov: Object.keys(ov), sh: Object.keys(sh) }),
+  );
+}
+
+// A15: eager migration fires on a broken local file — legacy shared pins
+// are rewritten locally even though conversations-state.json exists.
+{
+  const em = mkdtempSync(join(tmpdir(), "agy-localstate-eager-"));
+  writeJson(join(em, "accounts-state.json"), {
+    accounts: {},
+    conversations: { "leg-1": "a1" },
+  });
+  writeFileSync(join(em, "conversations-state.json"), "%%%broken");
+  const l = loadLedger(em);
+  check(
+    "localstate/eager-migration-on-broken-local",
+    l.conversations["leg-1"] === "a1" &&
+      readJson(join(em, "conversations-state.json"))?.conversations?.[
+        "leg-1"
+      ] === "a1",
+    JSON.stringify(readJson(join(em, "conversations-state.json"))),
+  );
+}
+
+// A16: writtenMs == shared.lastUsedMs boundary — the shadow still applies
+// (equal stamps are deliberate: only strictly fresher shared lifts it);
+// ineligibleAtMs merges by max, here won by the shared side.
+{
+  const bnd = mkdtempSync(join(tmpdir(), "agy-localstate-bound-"));
+  const T = Date.now();
+  writeJson(join(bnd, "accounts-state.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: 0, lastUsedMs: T, lastError: "shared",
+        ineligibleAtMs: 200,
+      },
+    },
+  });
+  writeJson(join(bnd, "accounts-overlay.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: T + 5_000, lastUsedMs: 0,
+        lastError: null, parkedReason: "auth-dead",
+        ineligibleAtMs: 123, writtenMs: T,
+      },
+    },
+  });
+  const a1 = loadLedger(bnd).accounts.a1;
+  check(
+    "localstate/shadow-boundary-writtenms-eq-lastused",
+    a1?.cooldownUntilMs === T + 5_000 &&
+      a1?.lastUsedMs === T &&
+      a1?.ineligibleAtMs === 200 &&
+      a1?.parkedReason === "auth-dead" &&
+      a1?.lastError === null,
+    JSON.stringify(a1),
   );
 }
 
