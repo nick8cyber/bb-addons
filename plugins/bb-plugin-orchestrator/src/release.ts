@@ -111,6 +111,43 @@ export interface ReleaseThreads {
   };
 }
 
+/** PLUG-229: an SDK thread carries `environmentId`, never
+ * `environmentPath`/`environmentBranchName` — release reads those for
+ * the executor's copy (and the coordinator's on a merged round, §14).
+ * This wraps the SDK `threads.get` and fills them from
+ * `bb environment show` (the same source `environmentOf` uses). A
+ * failed show leaves them null, so release refuses with its honest
+ * "no copy" error exactly like a thread without an environment. */
+export const releaseThreadsGet =
+  (
+    sdkGet: (a: { threadId: string }) => Promise<unknown>,
+    environmentFacts: (envId: string) => Promise<{
+      path?: string | null;
+      branchName?: string | null;
+    }>,
+  ): ReleaseThreads["get"] =>
+  async (a) => {
+    const t = (await sdkGet(a)) as ReleaseThreadDto & {
+      environmentId?: string | null;
+    };
+    if (
+      t.environmentId &&
+      (t.environmentPath == null || t.environmentBranchName == null)
+    ) {
+      let environmentPath: string | null = null;
+      let environmentBranchName: string | null = null;
+      try {
+        const env = await environmentFacts(t.environmentId);
+        environmentPath = env.path ?? null;
+        environmentBranchName = env.branchName ?? null;
+      } catch {
+        // show failed → null fields → the step-1 "no copy" refusal.
+      }
+      return { ...t, environmentPath, environmentBranchName };
+    }
+    return t;
+  };
+
 export interface ReleaseDeps {
   store: DelegationStore;
   bbCli: BbCli;

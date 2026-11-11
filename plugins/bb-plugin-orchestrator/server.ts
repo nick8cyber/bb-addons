@@ -80,6 +80,7 @@ import { createCmd } from "./src/cmd.js";
 import { isEnvironmentGone, runMerge } from "./src/merge.js";
 import {
   pumpReleases,
+  releaseThreadsGet,
   runRelease,
   settingsProjectId,
 } from "./src/release.js";
@@ -596,13 +597,29 @@ export async function createPlugin(
       return joinPath(homedir(), ".bb", "plugins", "orchestrator");
     }
   };
+  /** `bb environment show <id> --json` — the env's own facts (§4.1,
+   * §14). Shared by `environmentOf` below and release's copy lookup
+   * (PLUG-229): an SDK thread has `environmentId` only, so
+   * `releaseThreadsGet` fills `environmentPath`/`environmentBranchName`
+   * from here — for the executor's copy and, on a merged round, the
+   * coordinator's. */
+  const environmentFacts = (envId: string) =>
+    runJson<{
+      id?: string;
+      path?: string;
+      branchName?: string;
+      mergeBaseBranch?: string | null;
+      baseBranch?: string | { name?: string } | null;
+    }>(bbCli, ["environment", "show", envId, "--json"]);
   const releaseDeps = {
     store,
     bbCli,
     cmd,
     threads: {
-      get: (a: { threadId: string }) =>
-        bb.sdk.threads.get(a) as never,
+      get: releaseThreadsGet(
+        (a: { threadId: string }) => bb.sdk.threads.get(a),
+        environmentFacts,
+      ),
       send: (a: never) => bb.sdk.threads.send(a) as never,
       output: (a: { threadId: string }) =>
         bb.sdk.threads.output(a) as never,
@@ -636,13 +653,7 @@ export async function createPlugin(
       environmentId?: string | null;
     };
     if (!t.environmentId) return null;
-    const env = await runJson<{
-      id?: string;
-      path?: string;
-      branchName?: string;
-      mergeBaseBranch?: string | null;
-      baseBranch?: string | { name?: string } | null;
-    }>(bbCli, ["environment", "show", t.environmentId, "--json"]);
+    const env = await environmentFacts(t.environmentId);
     const mergeBase =
       env.mergeBaseBranch ??
       (typeof env.baseBranch === "string"

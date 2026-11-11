@@ -24,11 +24,13 @@ import {
   parseAuditVerdict,
   reviewVerdictOk,
   docsForChanges,
+  releaseThreadsGet,
   runRelease,
   pumpReleases,
   writePushToken,
   settingsProjectId,
   type ReleaseDeps,
+  type ReleaseThreads,
 } from "../src/release.js";
 import { parsePolicy } from "../src/policy.js";
 import { OrchestratorError } from "../src/errors.js";
@@ -532,6 +534,75 @@ test("release happy path: приёмка → sync → скан → аудит р
   const audit = store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!;
   assert.equal(audit.status, "running");
   assert.equal(store.threadRole("thr_audit")?.role, "release-auditor");
+});
+
+// ── PLUG-229: server-side threads.get (environmentId → env show) ─────
+
+test("PLUG-229: SDK thread без envPath — копия из environment show", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  const shown: string[] = [];
+  // The real SDK thread carries `environmentId` only — the mocked
+  // `environmentPath`/`environmentBranchName` hid the bug on live runs.
+  const sdkGet = async ({ threadId }: { threadId: string }) =>
+    threadId === "thr_exec"
+      ? {
+          id: threadId,
+          status: "idle",
+          environmentId: "env_exec",
+          parentThreadId: null,
+          title: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }
+      : {
+          id: threadId,
+          parentThreadId: null,
+          title: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        };
+  (deps.threads as ReleaseThreads).get = releaseThreadsGet(sdkGet, async (envId) => {
+    shown.push(envId);
+    return { path: repo, branchName: "feat-x" };
+  });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  // Step 1's copy read + the §17.3 turn gate both go through the wrap.
+  assert.deepEqual(shown, ["env_exec", "env_exec"]);
+});
+
+test("PLUG-229: без environmentId — прежний отказ «нет рабочей копии»", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  (deps.threads as ReleaseThreads).get = releaseThreadsGet(
+    async ({ threadId }: { threadId: string }) => ({ id: threadId }),
+    async () => ({ path: repo, branchName: "feat-x" }),
+  );
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /нет рабочей копии/.test((e as OrchestratorError).message),
+  );
+});
+
+test("PLUG-229: ошибка environment show → поля null → тот же отказ", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  (deps.threads as ReleaseThreads).get = releaseThreadsGet(
+    async ({ threadId }: { threadId: string }) =>
+      threadId === "thr_exec"
+        ? { id: threadId, environmentId: "env_gone" }
+        : { id: threadId },
+    async () => {
+      throw new Error("environment show: no such environment");
+    },
+  );
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "release-refused",
+  );
 });
 
 test("release r7: настройка — по проекту репозитория копии исполнителя", async () => {
