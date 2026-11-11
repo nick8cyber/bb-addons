@@ -1177,10 +1177,11 @@ export async function createPlugin(
   const fail = (json: boolean, error: unknown) =>
     json ? jsonFail(error) : textFail(error);
 
-  // §17.2 r26 (PLUG-215 мелко 2): a `notify-muted` setup_errors entry is
-  // the quiet-stop mark awaiting the `auto` restore — a pending state,
-  // not a setup failure; render it under its own label instead of
-  // inside `setup_errors`.
+  // §17.2 r26 (PLUG-215 мелко 2, PLUG-227): `notify-muted` and
+  // `coordinator-cancel` setup_errors entries are state marks (the
+  // quiet-stop mark awaiting the `auto` restore; the coordinator cancel
+  // record suppressing «закончил без отчёта»), not setup failures;
+  // render them under their own labels instead of inside `setup_errors`.
   const renderSetupErrors = (raw: string): string => {
     try {
       const entries = JSON.parse(raw) as {
@@ -1188,8 +1189,11 @@ export async function createPlugin(
         message?: string;
       }[];
       if (!Array.isArray(entries)) return ` setup_errors=${raw}`;
-      const errors = entries.filter((e) => e?.step !== "notify-muted");
+      const errors = entries.filter(
+        (e) => e?.step !== "notify-muted" && e?.step !== "coordinator-cancel",
+      );
       const muted = entries.filter((e) => e?.step === "notify-muted");
+      const cancelled = entries.filter((e) => e?.step === "coordinator-cancel");
       let out = errors.length
         ? ` setup_errors=${JSON.stringify(errors)}`
         : "";
@@ -1197,6 +1201,11 @@ export async function createPlugin(
         out +=
           ` notify-muted=${muted.at(-1)?.message ?? "?"}` +
           ` (уведомления заглушены, ждут восстановления auto)`;
+      }
+      if (cancelled.length) {
+        out +=
+          ` coordinator-cancel=${cancelled.at(-1)?.message ?? "?"}` +
+          ` (отменено координатором)`;
       }
       return out;
     } catch {

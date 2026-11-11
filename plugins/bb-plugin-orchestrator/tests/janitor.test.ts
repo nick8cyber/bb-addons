@@ -5081,6 +5081,7 @@ test("a «removing» copy row whose env is gone closes as removed (§17.4 PLUG-2
     cmd: duDies,
   });
   const tip = git(repo, ["rev-parse", env.branchName]);
+  const common = git(env.path, ["rev-parse", "--git-common-dir"]);
   await w.jan.run();
   w.clock.t += 16 * 60_000;
   await w.jan.run(); // crashes in settle — the row sits at «removing»
@@ -5089,16 +5090,79 @@ test("a «removing» copy row whose env is gone closes as removed (§17.4 PLUG-2
   // BB freed the copy — the env is no longer listed; the next run
   // closes the dangling row as removed and `report --json` shows the SHA
   w.envSpecs.length = 0;
-  await w.jan.run();
+  const res = await w.jan.run();
   const row = w.janitor.item(env.id)!;
   assert.equal(row.state, "removed");
   assert.equal(row.reason, "removed");
   assert.equal(row.tip_sha, tip);
+  assert.equal(res.removedCopies, 1);
+  assert.ok(
+    w.infos.some(
+      (m) =>
+        m.includes(`removed copy ${common}:${env.branchName}`) &&
+        m.includes(`at ${tip}`) &&
+        m.includes("(env gone)"),
+    ),
+    `infos: ${w.infos.join(" | ")}`,
+  );
+  const item = res.removedItems.find((i) => i.envId === env.id);
+  assert.deepEqual(item, {
+    envId: env.id,
+    branch: env.branchName,
+    repo: common,
+    tipSha: tip,
+    headSha: null,
+  });
   const rep = await w.jan.report();
   assert.equal(
     rep.items.find((i) => i.env_id === env.id)!.tip_sha,
     tip,
   );
+});
+
+// §17.4 (ревью PLUG-226, PLUG-227): a «removing» copy row whose env is
+// still listed in `environment list` is NOT closed as removed.
+test("a «removing» copy row whose env is still listed is not closed as removed (§17.4 PLUG-227)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const tip = git(repo, ["rev-parse", env.branchName]);
+  // Place the row at «removing»
+  w.janitor.upsertItem(
+    env.id,
+    {
+      state: "kept",
+      reason: "removing",
+      path: env.path,
+      branch: env.branchName,
+      tipSha: tip,
+      firstSeenAt: Date.now() - 20 * 60_000,
+    },
+    Date.now(),
+  );
+
+  // The env is still in envs, but has a live running thread blocking removal
+  w.threadSpecs[env.id] = [
+    {
+      id: `thr_${env.id}`,
+      status: "running",
+      archivedAt: null,
+      updatedAt: Date.now(),
+      createdAt: Date.now(),
+    },
+  ];
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  const row = w.janitor.item(env.id)!;
+  assert.equal(row.state, "kept");
+  assert.equal(row.reason, "threads-remaining");
+  assert.ok(!res.removedItems.some((i) => i.envId === env.id));
+  assert.ok(!w.infos.some((m) => m.includes("(env gone)")));
 });
 
 // §17.4 (ревью PLUG-221 #3): a «removing copy» journal line gets a

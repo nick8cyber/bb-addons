@@ -622,6 +622,38 @@ test("§17.2 r26 (PLUG-215 мелко 2): `show` labels the notify-muted mark, n
   assert.match(res.stdout, /"step":"attach-verify"/);
 });
 
+test("§17.2 r26 (PLUG-227): `show` labels coordinator-cancel, not in setup_errors", async () => {
+  const { cli } = fakeCli((args) => {
+    if (args.join(" ").startsWith("tasks dispatch"))
+      return ok(JSON.stringify({ threadId: "thr_exec" }));
+    if (args.join(" ").startsWith("tasks preset show"))
+      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: { ...COORDINATOR_SDK, update: async () => ({}) },
+  });
+  const created = await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "simple", "--json"],
+    { threadId: "thr_coord" },
+  );
+  const delegationId = (
+    JSON.parse(created.stdout) as { delegationId: number }
+  ).delegationId;
+  const store = new DelegationStore(host.bb.storage.database());
+  store.setStatus(delegationId, "cancelled");
+  store.addSetupError(delegationId, "coordinator-cancel", "thr_coord");
+  store.addSetupError(delegationId, "attach-verify", "gone");
+
+  const res = await host.harness.runCli(["show", String(delegationId)]);
+  assert.equal(res.exitCode, 0);
+  assert.doesNotMatch(res.stdout, /"step":"coordinator-cancel"/);
+  assert.match(res.stdout, /coordinator-cancel=thr_coord/);
+  assert.match(res.stdout, /отменено координатором/);
+  assert.match(res.stdout, /setup_errors=\[/);
+  assert.match(res.stdout, /"step":"attach-verify"/);
+});
+
 // §17.4 (PLUG-212): a janitor pass refused on git < 2.39 is a recorded
 // failure — `janitor run` exits non-zero instead of printing a healthy
 // empty report.
