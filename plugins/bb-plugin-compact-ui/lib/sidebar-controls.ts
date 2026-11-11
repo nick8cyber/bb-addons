@@ -94,6 +94,16 @@ section:has(> header[data-queued-messages-mode="collapsed"]) > [data-queued-mess
   [data-queued-message-actions] { margin-left: auto; }
   [data-queued-message-actions] > button { min-width: 44px; min-height: 44px; }
 }
+/* Expanded queued messages: the host truncates each row's text to a single
+   line ("…"), so the message cannot be read. Let the text wrap to up to 3
+   lines (line-clamp); collapsed rows keep the host single-line look. */
+[data-queued-messages-scroll-frame]:not([aria-hidden="true"])
+  [data-queued-message-row] span.block.truncate {
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
 /* Composer: editor scroll area stays under ~1/3 of the viewport (desktop + mobile),
    so the conversation above keeps most of the screen. 56px reserves promptbox chrome
    (send row, model picker); min() keeps BB's own 312px ceiling on tall desktops. */
