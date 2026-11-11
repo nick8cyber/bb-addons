@@ -3,7 +3,10 @@ import test from "node:test";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
+  readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -714,4 +717,302 @@ test("the lock file: a live owner refuses, a dead one is broken", async () => {
   const res = await runMerge(PARAMS, deps);
   assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
   assert.equal(existsSync(lock), false);
+});
+
+// ── §14: the row is re-read under the copy lock ───────────────────────
+
+test("the row is re-checked under the lock — a concurrent outcome refuses", async () => {
+  const cases: {
+    code: string;
+    mutate: (store: DelegationStore, row: DelegationRow, sha: string) => void;
+  }[] = [
+    {
+      code: "already-merged",
+      mutate: (s, r) =>
+        s.setMerged(r.id, { into: "work", sha: "0".repeat(40) }),
+    },
+    {
+      code: "fix-delegated",
+      mutate: (s, r) => s.setMergeStatus(r.id, "fix-delegated"),
+    },
+    {
+      code: "not-done",
+      mutate: (s, r) => s.setStatus(r.id, "running"),
+    },
+    {
+      code: "stale-result",
+      mutate: (s, r) => recordResult(s, r, "b".repeat(40)),
+    },
+    {
+      code: "dirty-result",
+      mutate: (s, r, sha) => recordResult(s, r, sha, true),
+    },
+  ];
+  for (const { code, mutate } of cases) {
+    const { coord, exec, resultSha } = makeRepos();
+    const { deps, store, row } = makeDeps({ coord, exec });
+    recordResult(store, row, resultSha);
+    // mutate the row in the window between resolve and the copy lock —
+    // the lock is taken right after `rev-parse --absolute-git-dir`
+    let armed = true;
+    const realGit = deps.git;
+    deps.git = async (repo, args, opts) => {
+      if (
+        armed &&
+        args[0] === "rev-parse" &&
+        args.includes("--absolute-git-dir")
+      ) {
+        armed = false;
+        mutate(store, row, resultSha);
+      }
+      return realGit(repo, args, opts);
+    };
+    await assert.rejects(
+      runMerge(PARAMS, deps),
+      (e: unknown) => (e as OrchestratorError).code === code,
+      code,
+    );
+  }
+});
+
+// ── §14: a deleted executor copy skips the §16.2 check ────────────────
+
+test("§16.2: a 404 from environment show skips the check and merges", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+  deps.environmentById = async () => {
+    throw new Error(
+      "bb environment show env_exec --json failed (exit 1): HTTP 404 environment_not_found",
+    );
+  };
+  const res = await runMerge(PARAMS, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+});
+
+// ── §14 check 2: copy-busy ────────────────────────────────────────────
+
+test("refusal: copy-busy — an unfinished merge leaves a clean status", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  // `merge -s ours --no-commit` leaves MERGE_HEAD with a clean porcelain
+  gitR(coord, ["checkout", "-b", "side"]);
+  writeFileSync(join(coord, "side.txt"), "s\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "side"]);
+  gitR(coord, ["switch", "work"]);
+  gitR(coord, ["merge", "-s", "ours", "--no-commit", "--no-edit", "side"]);
+  assert.equal(gitR(coord, ["status", "--porcelain"]), "");
+  assert.equal(
+    gitRes(coord, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).exitCode,
+    0,
+  );
+
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+  await assert.rejects(
+    runMerge(PARAMS, deps),
+    (e: unknown) => (e as OrchestratorError).code === "copy-busy",
+  );
+  // the coordinator's own merge is untouched
+  assert.equal(
+    gitRes(coord, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).exitCode,
+    0,
+  );
+});
+
+test("refusal: copy-busy — rebase and cherry-pick markers", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+
+  mkdirSync(join(gitDir, "rebase-merge"));
+  await assert.rejects(
+    runMerge(PARAMS, deps),
+    (e: unknown) => (e as OrchestratorError).code === "copy-busy",
+  );
+  rmSync(join(gitDir, "rebase-merge"), { recursive: true, force: true });
+
+  writeFileSync(join(gitDir, "CHERRY_PICK_HEAD"), `${resultSha}\n`);
+  await assert.rejects(
+    runMerge(PARAMS, deps),
+    (e: unknown) => (e as OrchestratorError).code === "copy-busy",
+  );
+  rmSync(join(gitDir, "CHERRY_PICK_HEAD"), { force: true });
+});
+
+// ── §14 check 4: the lock records the copy's original state ───────────
+
+test("the lock records the original branch and HEAD", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const head = gitR(coord, ["rev-parse", "HEAD"]);
+  const lock = join(
+    gitR(coord, ["rev-parse", "--absolute-git-dir"]),
+    "orchestrator-merge.lock",
+  );
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let seen: string[] | null = null;
+  const realGit = deps.git;
+  deps.git = async (repo, args, opts) => {
+    if (args[0] === "cat-file" && seen === null) {
+      seen = readFileSync(lock, "utf8").split("\n");
+      await gate;
+    }
+    return realGit(repo, args, opts);
+  };
+
+  const pending = runMerge(PARAMS, deps);
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(seen![0], String(process.pid));
+  assert.equal(seen![2], "work");
+  assert.equal(seen![3], head);
+  release();
+  const res = await pending;
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+});
+
+test("a stale lock breaks only after the copy is restored", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const head = gitR(coord, ["rev-parse", "HEAD"]);
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  const lock = join(gitDir, "orchestrator-merge.lock");
+  // a crashed merge: the copy is on another branch mid-merge, the lock
+  // records the original branch and HEAD
+  gitR(coord, ["checkout", "-b", "side"]);
+  writeFileSync(join(coord, "side.txt"), "s\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "side"]);
+  gitR(coord, ["checkout", "-b", "other", "work"]);
+  gitR(coord, ["merge", "--no-ff", "--no-commit", "--no-edit", "side"]);
+  assert.equal(
+    gitRes(coord, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).exitCode,
+    0,
+  );
+  writeFileSync(lock, `1073741824\nstale\nwork\n${head}\n`);
+
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  const res = await runMerge(PARAMS, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  assert.equal(gitR(coord, ["symbolic-ref", "--short", "HEAD"]), "work");
+  assert.equal(
+    gitRes(coord, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).exitCode,
+    1,
+  );
+  assert.equal(existsSync(lock), false);
+  assert.equal(store.get(row.id)!.merge_status, "merged");
+});
+
+test("a stale lock over an unrestorable copy refuses copy-not-restored", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const head = gitR(coord, ["rev-parse", "HEAD"]);
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  const lock = join(gitDir, "orchestrator-merge.lock");
+  writeFileSync(lock, `1073741824\nstale\nwork\n${head}\n`);
+  writeFileSync(join(coord, "dirty.txt"), "x\n");
+
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+  await assert.rejects(
+    runMerge(PARAMS, deps),
+    (e: unknown) => (e as OrchestratorError).code === "copy-not-restored",
+  );
+  // the lock stays — nobody removed it over foreign dirty work
+  assert.equal(existsSync(lock), true);
+});
+
+test("two calls race for one stale lock — exactly one wins", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
+  const lock = join(gitDir, "orchestrator-merge.lock");
+  writeFileSync(lock, "1073741824\nstale\n");
+
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+  const [a, b] = await Promise.allSettled([
+    runMerge(PARAMS, deps),
+    runMerge(PARAMS, deps),
+  ]);
+  const merged = [a, b].filter(
+    (r) => r.status === "fulfilled",
+  );
+  const refused = [a, b].filter((r) => r.status === "rejected");
+  assert.equal(merged.length, 1);
+  assert.equal(refused.length, 1);
+  assert.equal(
+    (refused[0] as PromiseRejectedResult).reason.code,
+    "merge-in-progress",
+  );
+  assert.equal(existsSync(lock), false);
+});
+
+// ── §14 --dry-run: refs/heads/<into> and merge-tree exit codes ────────
+
+test("--dry-run: merge-tree gets refs/heads/<into>, a tag cannot shadow it", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  // a tag `work` on a commit that conflicts with the result — the bare
+  // name resolves to the tag (tags precede heads), refs/heads/work is
+  // the branch and merges clean
+  gitR(coord, ["checkout", "-b", "tmp"]);
+  writeFileSync(join(coord, "f.txt"), "tag side\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "tag commit"]);
+  gitR(coord, ["tag", "work"]);
+  gitR(coord, ["switch", "work"]);
+
+  const calls: string[][] = [];
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+  const realGit = deps.git;
+  deps.git = async (repo, args, opts) => {
+    calls.push(args);
+    return realGit(repo, args, opts);
+  };
+
+  const res = await runMerge({ ...PARAMS, dryRun: true }, deps);
+  assert.ok("dryRun" in res && res.wouldConflict === false);
+  const mt = calls.find((a) => a[0] === "merge-tree")!;
+  assert.ok(mt.includes("refs/heads/work"));
+  assert.ok(!mt.includes("work"));
+});
+
+test("--dry-run: a merge-tree error is git-failed, not a conflict", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+  deps.git = async (repo, args, opts) =>
+    args[0] === "merge-tree"
+      ? { exitCode: 128, stdout: "", stderr: "fatal: bad object" }
+      : gitRes(repo, args);
+
+  await assert.rejects(
+    runMerge({ ...PARAMS, dryRun: true }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "git-failed",
+  );
+});
+
+test("--into: the copy moves to the target via git switch", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  gitR(coord, ["branch", "target"]);
+  const calls: string[][] = [];
+  const { deps, row } = makeDeps({ coord, exec });
+  recordResult(deps.store, row, resultSha);
+  const realGit = deps.git;
+  deps.git = async (repo, args, opts) => {
+    calls.push(args);
+    return realGit(repo, args, opts);
+  };
+
+  const res = await runMerge({ ...PARAMS, into: "target" }, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  assert.ok(calls.some((a) => a[0] === "switch" && a[1] === "target"));
+  assert.ok(!calls.some((a) => a[0] === "checkout"));
 });

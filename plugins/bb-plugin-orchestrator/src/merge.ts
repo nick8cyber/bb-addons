@@ -5,13 +5,17 @@
  * `dirty-result`, `protected-branch`, `stale-result`, `stale-check-failed`,
  * `not-done`, `no-result`, `no-environment`, `dirty-coordinator`,
  * `detached-head`, `unknown-branch`, `result-missing`, `merge-in-progress`,
- * `already-merged`, `fix-delegated`, `merge-hook-failed`, `copy-not-restored`.
+ * `already-merged`, `fix-delegated`, `merge-hook-failed`, `copy-not-restored`,
+ * `copy-busy`.
  *
  * Order: row checks (done, result, `merged`/`fix-delegated` repeats) →
  * coordinator environment → copy lock (a lock file in the copy's git dir,
- * §14 check 4) → clean copy + on-branch → target branch (`--into`, local
- * branch only, never protected) → §16.2 stale check (result_sha vs the
- * executor copy's HEAD) → `git cat-file -e` → `git merge --no-ff --no-edit
+ * §14 check 4) → the row checks REPEAT under the lock (the row may have
+ * changed while the call waited) → no unfinished merge/cherry-pick/
+ * revert/rebase in the copy (`copy-busy`) → clean copy + on-branch →
+ * target branch (`--into`, local branch only, never protected) → §16.2
+ * stale check (result_sha vs the executor copy's HEAD; a confirmed-deleted
+ * copy — 404 — skips it) → `git cat-file -e` → `git merge --no-ff --no-edit
  * -m "merge <KEY> r<N> (<sha7>)" <result_sha>` under the repo's configured
  * identity (never `--author`/`-c user.*`/`--no-verify`), with a ~10 min
  * ceiling for hooks. A conflict aborts back to a clean copy
@@ -21,13 +25,24 @@
  * records `fix-delegated`. A merge that stops without conflicted files
  * (hook refusal, timeout) is `merge-hook-failed` — no fix round. Whatever
  * failed, the copy must return to its original branch and HEAD with a
- * clean status, else `copy-not-restored`. `--dry-run` runs the checks and
- * `git merge-tree --write-tree` only; the copy is not touched.
+ * clean status, else `copy-not-restored`. The lock file records that
+ * original branch and HEAD: a stale lock (dead owner) breaks only after
+ * the copy is restored to them, and the break is an atomic rename — only
+ * one process ever steals the file. `--dry-run` runs the checks and
+ * `git merge-tree --write-tree refs/heads/<into> <sha>` only (exit 0
+ * clean, 1 conflict, anything else is `git-failed`); the copy is not
+ * touched.
  *
  * git operations run off the `delegate` queue (§16.8): the autofix
  * delegation itself goes through `delegate`, which is queued internally.
  */
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { OrchestratorError } from "./errors.js";
 import { runChecked, type BbCli } from "./bb-cli.js";
@@ -128,6 +143,50 @@ type Git = (
   opts?: { timeoutMs?: number },
 ) => Promise<MergeGitResult>;
 
+/**
+ * §14 check 1 + repeat calls, as a reusable unit: they run before the
+ * copy lock AND again under it — the row may have changed while the
+ * call waited (`merged`/`fix-delegated` are terminal for `merge`; the
+ * fix round's own row is what gets merged next).
+ */
+function assertMergeableRow(row: DelegationRow): string {
+  if (row.status !== "done") {
+    throw new OrchestratorError(
+      "not-done",
+      `delegation ${row.id} is ${row.status}, not done`,
+      "merge works on finished rounds — see `bb orchestrator status`",
+    );
+  }
+  if (!row.result_sha) {
+    throw new OrchestratorError(
+      "no-result",
+      `delegation ${row.id} has no recorded round result`,
+      "the watchdog could not read the executor worktree — check setup_errors in `bb orchestrator show`",
+    );
+  }
+  if (row.result_dirty === 1) {
+    throw new OrchestratorError(
+      "dirty-result",
+      "исполнитель не закоммитил: копия захода грязная",
+      "доработка — новым заходом: `bb orchestrator delegate <KEY> --level <уровень>`",
+    );
+  }
+  if (row.merge_status === "merged") {
+    throw new OrchestratorError(
+      "already-merged",
+      `делегирование ${row.id} уже влито в ${row.merged_into ?? "?"} (${row.merged_sha ? sha7(row.merged_sha) : "?"})`,
+    );
+  }
+  if (row.merge_status === "fix-delegated") {
+    throw new OrchestratorError(
+      "fix-delegated",
+      `по делегированию ${row.id} уже раздан заход разбора конфликта`,
+      "дождитесь его done и влейте его итог: `bb orchestrator merge <id захода разбора>`",
+    );
+  }
+  return row.result_sha;
+}
+
 export async function runMerge(
   params: MergeParams,
   deps: MergeDeps,
@@ -135,7 +194,7 @@ export async function runMerge(
   const { store } = deps;
   const ref = params.ref.trim();
 
-  const row = /^\d+$/.test(ref)
+  let row = /^\d+$/.test(ref)
     ? store.get(Number(ref))
     : store.latestDoneResultByTask(ref);
   if (!row) {
@@ -152,46 +211,7 @@ export async function runMerge(
       "only the delegating coordinator may merge its result",
     );
   }
-
-  // §14 check 1: the round finished with a usable, committed result.
-  if (row.status !== "done") {
-    throw new OrchestratorError(
-      "not-done",
-      `delegation ${row.id} is ${row.status}, not done`,
-      "merge works on finished rounds — see `bb orchestrator status`",
-    );
-  }
-  const resultSha = row.result_sha;
-  if (!resultSha) {
-    throw new OrchestratorError(
-      "no-result",
-      `delegation ${row.id} has no recorded round result`,
-      "the watchdog could not read the executor worktree — check setup_errors in `bb orchestrator show`",
-    );
-  }
-  if (row.result_dirty === 1) {
-    throw new OrchestratorError(
-      "dirty-result",
-      "исполнитель не закоммитил: копия захода грязная",
-      "доработка — новым заходом: `bb orchestrator delegate <KEY> --level <уровень>`",
-    );
-  }
-
-  // §14 repeat calls: merged and fix-delegated rows are terminal for
-  // `merge` — the fix round's own row is what gets merged next.
-  if (row.merge_status === "merged") {
-    throw new OrchestratorError(
-      "already-merged",
-      `делегирование ${row.id} уже влито в ${row.merged_into ?? "?"} (${row.merged_sha ? sha7(row.merged_sha) : "?"})`,
-    );
-  }
-  if (row.merge_status === "fix-delegated") {
-    throw new OrchestratorError(
-      "fix-delegated",
-      `по делегированию ${row.id} уже раздан заход разбора конфликта`,
-      "дождитесь его done и влейте его итог: `bb orchestrator merge <id захода разбора>`",
-    );
-  }
+  const resultSha = assertMergeableRow(row);
 
   const env = await deps
     .environment(params.callerThreadId)
@@ -223,9 +243,44 @@ export async function runMerge(
     return r.stdout;
   };
 
-  const releaseLock = await acquireCopyLock(gitText, repo);
+  const gitDir = (await gitText(["rev-parse", "--absolute-git-dir"])).trim();
+  const lockPath = join(gitDir, MERGE_LOCK_NAME);
+  const releaseLock = await acquireCopyLock(git, repo, lockPath);
   try {
-    // §14 check 2: the coordinator copy is clean and sits on a branch.
+    // §14: the row is re-read under the lock — a concurrent merge may
+    // have finished (merged), delegated a fix round, or the round result
+    // may have been recomputed while this call waited.
+    const fresh = store.get(row.id);
+    if (!fresh) {
+      throw new OrchestratorError(
+        "not-found",
+        `делегирование ${row.id} исчезло из хранилища`,
+      );
+    }
+    const freshSha = assertMergeableRow(fresh);
+    if (freshSha !== resultSha) {
+      throw new OrchestratorError(
+        "stale-result",
+        `итог делегирования ${row.id} изменился: ${sha7(freshSha)} ≠ записанного ${sha7(resultSha)}`,
+        "вливать нужно новый итог — повторите `bb orchestrator merge`",
+      );
+    }
+    row = fresh;
+
+    // §14 check 2: no unfinished merge/cherry-pick/revert/rebase in the
+    // coordinator copy. `merge --no-commit` leaves a clean status, so the
+    // git-dir markers are checked before --porcelain.
+    const busy = COPY_BUSY_MARKERS.filter((n) =>
+      existsSync(join(gitDir, n)),
+    );
+    if (busy.length > 0) {
+      throw new OrchestratorError(
+        "copy-busy",
+        `в копии координатора незавершённая операция (${busy.join(", ")})`,
+        "завершите или отмените её (git merge|cherry-pick|revert|rebase --abort) и повторите",
+      );
+    }
+    // The coordinator copy is clean and sits on a branch.
     const porcelain = await gitText(["status", "--porcelain"]);
     if (porcelain.trim()) {
       throw new OrchestratorError(
@@ -234,11 +289,16 @@ export async function runMerge(
         "закоммить или уберите изменения и повторите",
       );
     }
+    // `--short` shortens ambiguously (a tag `work` turns `work` into
+    // `heads/work`) — the full ref keeps the branch name exact, so the
+    // protected-branch check and `refs/heads/<into>` cannot be shadowed.
     let currentBranch: string;
     try {
-      currentBranch = (
-        await gitText(["symbolic-ref", "--short", "HEAD"])
-      ).trim();
+      const headRef = (await gitText(["symbolic-ref", "HEAD"])).trim();
+      currentBranch = headRef.startsWith("refs/heads/")
+        ? headRef.slice("refs/heads/".length)
+        : headRef;
+      if (!currentBranch) throw new Error("empty HEAD ref");
     } catch {
       throw new OrchestratorError(
         "detached-head",
@@ -246,6 +306,11 @@ export async function runMerge(
         "перейдите на ветку (git switch <branch>) и повторите",
       );
     }
+    // §14: the lock file carries the copy's original state — if this
+    // process dies mid-merge, a stale-lock breaker restores the copy to
+    // this branch and HEAD before removing the lock.
+    const originalHead = (await gitText(["rev-parse", "HEAD"])).trim();
+    recordLockState(lockPath, currentBranch, originalHead);
 
     // §14 check 3: the merge target is `--into` or the current branch.
     // `--into` must name a LOCAL branch — `check-ref-format --branch`
@@ -310,14 +375,24 @@ export async function runMerge(
     }
 
     // §14 `--dry-run`: checks + merge-tree only; the copy is not touched.
+    // `refs/heads/<into>` — a bare name is ambiguous with a tag. Exit 1
+    // is a conflict; any other non-zero exit is a git failure, not a
+    // conflict prediction.
     if (params.dryRun) {
       const probe = await git([
         "merge-tree",
         "--write-tree",
         "--name-only",
-        into,
+        `refs/heads/${into}`,
         resultSha,
       ]);
+      if (probe.exitCode !== 0 && probe.exitCode !== 1) {
+        throw new OrchestratorError(
+          "git-failed",
+          `git merge-tree failed (exit ${probe.exitCode}): ` +
+            `${(probe.stderr || probe.stdout).trim() || "no output"}`,
+        );
+      }
       // merge-tree output: the tree oid, then conflicted file names up
       // to the first blank line; informational messages follow it and
       // are not file names.
@@ -333,20 +408,20 @@ export async function runMerge(
         taskKey: row.task_key,
         round: row.round,
         into,
-        wouldConflict: probe.exitCode !== 0,
-        conflictFiles: probe.exitCode !== 0 ? conflictFiles : [],
+        wouldConflict: probe.exitCode === 1,
+        conflictFiles: probe.exitCode === 1 ? conflictFiles : [],
       };
     }
 
     // Move the clean copy onto the target branch — only now, so refused
-    // calls leave the copy untouched.
-    const originalHead = (await gitText(["rev-parse", "HEAD"])).trim();
+    // calls leave the copy untouched. `git switch` takes a branch name
+    // only — a tag or ref form cannot shadow `into`.
     let conflictFiles: string[] | null = null;
     let failure: OrchestratorError | null = null;
     let targetTip = "";
     try {
       if (into !== currentBranch) {
-        await gitText(["checkout", into]);
+        await gitText(["switch", into]);
       }
       targetTip = (await gitText(["rev-parse", "HEAD"])).trim();
       const mergeRes = await git(
@@ -509,13 +584,17 @@ async function restoreCopy(
       );
     }
   }
-  const onBranch = await git(["symbolic-ref", "--short", "HEAD"]);
-  if (onBranch.exitCode !== 0 || onBranch.stdout.trim() !== branch) {
-    const checkout = await git(["checkout", branch]);
-    if (checkout.exitCode !== 0) {
+  const onBranch = await git(["symbolic-ref", "HEAD"]);
+  const onName =
+    onBranch.exitCode === 0
+      ? onBranch.stdout.trim().replace(/^refs\/heads\//, "")
+      : "";
+  if (onName !== branch) {
+    const sw = await git(["switch", branch]);
+    if (sw.exitCode !== 0) {
       return (
-        `git checkout ${branch}: ` +
-        `${(checkout.stderr || checkout.stdout).trim() || "no output"}`
+        `git switch ${branch}: ` +
+        `${(sw.stderr || sw.stdout).trim() || "no output"}`
       );
     }
   }
@@ -556,19 +635,65 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** §14 check 2: git-dir markers of an unfinished operation (`copy-busy`). */
+const COPY_BUSY_MARKERS = [
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "rebase-merge",
+  "rebase-apply",
+] as const;
+
+interface LockInfo {
+  pid: number;
+  branch: string | null;
+  head: string | null;
+}
+
+/** `pid\ntime\nbranch\nhead` — branch/head are empty until recorded. */
+function parseLock(content: string): LockInfo | null {
+  const [pidText, , branch, head] = content.split("\n");
+  const pid = Number(pidText);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  return { pid, branch: branch || null, head: head || null };
+}
+
+/**
+ * §14: once the copy's original state is known it goes into our lock —
+ * a stale-lock breaker restores the copy to it before removing the lock.
+ */
+function recordLockState(lockPath: string, branch: string, head: string): void {
+  try {
+    writeFileSync(
+      lockPath,
+      `${process.pid}\n${new Date().toISOString()}\n${branch}\n${head}\n`,
+    );
+  } catch {
+    /* the lock exists; recording state is best-effort */
+  }
+}
+
 /**
  * §14 check 4: one merge per coordinator copy — a lock file in the
  * copy's own git dir (`--absolute-git-dir` is per-worktree), so the
  * guard holds across processes, not just in plugin memory. A lock whose
- * owner pid is dead is stale and broken once.
+ * owner pid is dead is stale: the breaker first restores the copy to
+ * the branch/HEAD the owner recorded, then steals the file with an
+ * atomic rename — `renameSync` succeeds for exactly one process. The
+ * stolen content is verified: a file that is not the vetted stale lock
+ * belongs to a new owner and is put back.
  */
 async function acquireCopyLock(
-  gitText: (args: string[]) => Promise<string>,
+  git: Git,
   repo: string,
+  lockPath: string,
 ): Promise<() => void> {
-  const gitDir = (await gitText(["rev-parse", "--absolute-git-dir"])).trim();
-  const lockPath = join(gitDir, MERGE_LOCK_NAME);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const inProgress = () =>
+    new OrchestratorError(
+      "merge-in-progress",
+      `a merge is already running in ${repo} (lock ${lockPath})`,
+    );
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       writeFileSync(
         lockPath,
@@ -589,33 +714,74 @@ async function acquireCopyLock(
           `cannot create merge lock ${lockPath}: ${message(e)}`,
         );
       }
-      let pid = NaN;
-      try {
-        pid = Number(readFileSync(lockPath, "utf8").split("\n")[0] ?? "");
-      } catch {
-        /* an unreadable lock cannot be proven stale */
-      }
-      if (Number.isInteger(pid) && pid > 0 && !pidAlive(pid)) {
-        rmSync(lockPath, { force: true });
-        continue;
-      }
-      throw new OrchestratorError(
-        "merge-in-progress",
-        `a merge is already running in ${repo}`,
-      );
     }
+    let content: string;
+    try {
+      content = readFileSync(lockPath, "utf8");
+    } catch {
+      continue; // vanished between create and read — retry
+    }
+    const info = parseLock(content);
+    if (!info || pidAlive(info.pid)) {
+      throw inProgress();
+    }
+    // §14: a dead owner's lock breaks only after the copy is restored
+    // to the recorded state (a crash may have left it mid-merge or on
+    // the target branch). Nothing recorded → the owner died before
+    // touching the copy — nothing to restore.
+    if (info.branch && info.head) {
+      const restoreError = await restoreCopy(git, info.branch, info.head);
+      if (restoreError) {
+        throw new OrchestratorError(
+          "copy-not-restored",
+          `старая блокировка ${lockPath}: копия не возвращена к ` +
+            `${info.branch}@${sha7(info.head)}: ${restoreError}`,
+          `копия ${repo} — разберите вручную, там могло остаться незавершённое слияние`,
+        );
+      }
+    }
+    const stolen = `${lockPath}.stolen-${process.pid}-${attempt}`;
+    try {
+      renameSync(lockPath, stolen);
+    } catch {
+      continue; // another breaker won or the owner released — retry
+    }
+    let stolenContent: string | null = null;
+    try {
+      stolenContent = readFileSync(stolen, "utf8");
+    } catch {
+      /* unreadable — treated as not ours */
+    }
+    if (stolenContent !== content) {
+      try {
+        renameSync(stolen, lockPath);
+      } catch {
+        /* a third party already claimed the path — leave it */
+      }
+      throw inProgress();
+    }
+    rmSync(stolen, { force: true });
   }
-  throw new OrchestratorError(
-    "merge-in-progress",
-    `a merge is already running in ${repo}`,
+  throw inProgress();
+}
+
+/**
+ * §14: the executor copy is confirmed deleted — `bb environment show`
+ * answers `HTTP 404 environment_not_found`, a removed thread `thread not
+ * found`. A gone copy's result can no longer change, so the §16.2 check
+ * is skipped. Any other lookup error is `stale-check-failed`.
+ */
+export function isEnvironmentGone(e: unknown): boolean {
+  return /environment_not_found|thread not found|HTTP 404/i.test(
+    message(e),
   );
 }
 
 /**
  * §16.2: compare the recorded `result_sha` to the executor copy's HEAD.
  * The env comes from `result_env_id`, else the executor thread's
- * environment. A copy confirmed gone (no env record, no path) skips the
- * check; a copy that cannot be read refuses `stale-check-failed`.
+ * environment. A copy confirmed gone (no env record, no path, 404) skips
+ * the check; a copy that cannot be read refuses `stale-check-failed`.
  */
 async function checkStaleResult(
   row: DelegationRow,
@@ -632,6 +798,7 @@ async function checkStaleResult(
   try {
     env = (await lookup()) ?? null;
   } catch (e) {
+    if (isEnvironmentGone(e)) return;
     throw new OrchestratorError(
       "stale-check-failed",
       `не удалось прочитать копию исполнителя: ${message(e)}`,

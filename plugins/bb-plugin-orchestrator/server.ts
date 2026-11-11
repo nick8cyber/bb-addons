@@ -60,7 +60,7 @@ import {
   type ReleaseConfigLoad,
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
-import { runMerge } from "./src/merge.js";
+import { isEnvironmentGone, runMerge } from "./src/merge.js";
 import { pumpReleases, runRelease } from "./src/release.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
@@ -546,14 +546,21 @@ export async function createPlugin(
         };
       },
       environment: environmentOf,
+      // §14: a deleted executor environment (404) answers null — the
+      // §16.2 check is skipped, a gone copy's result cannot change.
       environmentById: async (envId) => {
-        const env = await runJson<{ path?: string }>(bbCli, [
-          "environment",
-          "show",
-          envId,
-          "--json",
-        ]);
-        return { path: env.path };
+        try {
+          const env = await runJson<{ path?: string }>(bbCli, [
+            "environment",
+            "show",
+            envId,
+            "--json",
+          ]);
+          return { path: env.path };
+        } catch (e) {
+          if (isEnvironmentGone(e)) return null;
+          throw e;
+        }
       },
       threads: {
         send: (a) => bb.sdk.threads.send(a as never) as Promise<unknown>,
