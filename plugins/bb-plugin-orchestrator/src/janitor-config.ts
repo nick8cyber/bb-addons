@@ -18,7 +18,8 @@
  *   "intervalMinutes": 60,
  *   "excludeProjects": ["proj_x"],
  *   "protectedBranches": ["main", "master", "dev"],
- *   "deleteBranches": true
+ *   "deleteBranches": true,
+ *   "scope": "workers"
  * }
  *
  * §15: a missing or invalid `mode` falls back to `report` — never delete
@@ -28,6 +29,8 @@
 import type { PolicyIssue } from "./policy.js";
 
 export type JanitorMode = "apply" | "report";
+/** §16.3: `workers` — dispatch threads and children; `all` — root chats too. */
+export type JanitorScope = "workers" | "all";
 
 export interface JanitorConfig {
   enabled: boolean;
@@ -38,6 +41,7 @@ export interface JanitorConfig {
   excludeProjects: string[];
   protectedBranches: string[];
   deleteBranches: boolean;
+  scope: JanitorScope;
 }
 
 export interface JanitorConfigLoad {
@@ -102,6 +106,7 @@ export function parseJanitorConfig(
     "excludeProjects",
     "protectedBranches",
     "deleteBranches",
+    "scope",
   ]);
   for (const key of Object.keys(raw)) {
     if (!KNOWN_KEYS.has(key)) {
@@ -193,6 +198,15 @@ export function parseJanitorConfig(
     }
   }
 
+  let scope: JanitorScope = "workers";
+  if (raw.scope !== undefined) {
+    if (raw.scope !== "workers" && raw.scope !== "all") {
+      err("scope", 'must be "workers" or "all"');
+    } else {
+      scope = raw.scope;
+    }
+  }
+
   if (errors.length > 0) return { config: null, errors };
   return {
     config: {
@@ -204,6 +218,7 @@ export function parseJanitorConfig(
       excludeProjects,
       protectedBranches,
       deleteBranches,
+      scope,
     },
     errors,
   };

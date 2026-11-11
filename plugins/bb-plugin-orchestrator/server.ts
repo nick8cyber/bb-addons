@@ -193,7 +193,7 @@ export async function createPlugin(
       type: "string",
       label: "Janitor",
       description:
-        "Janitor JSON (spec §15): enabled, mode apply|report, afterMerge, abandonedAfter, intervalMinutes, excludeProjects, protectedBranches, deleteBranches. Disabled by default; an invalid document warns in the journal and keeps the janitor off.",
+        "Janitor JSON (spec §15-16): enabled, mode apply|report, afterMerge, abandonedAfter, intervalMinutes, excludeProjects, protectedBranches, deleteBranches, scope workers|all. Disabled by default; an invalid document warns in the journal and keeps the janitor off.",
       experimental_multiline: true,
       default: '{"enabled": false}',
     },
@@ -690,6 +690,10 @@ export async function createPlugin(
         janitorBusy = false;
       });
   };
+  // §16.4: while the service runs, an archived executor with a dirty
+  // copy gets a rescue ref before BB frees it (the ~5-minute window).
+  let janitorLive = false;
+  let janitorSubscribed = false;
   bb.background.service("orchestrator-janitor", {
     start(signal) {
       // A plugin restart must not replay a due-early pass: the last run's
@@ -698,10 +702,25 @@ export async function createPlugin(
         lastJanitorRunAt,
         janitorStore.latestRun()?.started_at ?? 0,
       );
+      // `bb.events.on` has no unsubscribe; guard so a service restart
+      // does not stack duplicate handlers.
+      if (!janitorSubscribed) {
+        janitorSubscribed = true;
+        bb.events.on("thread.archived", ({ thread }) =>
+          void (janitorLive
+            ? janitor.onThreadArchived(thread)
+            : Promise.resolve(undefined)
+          ).catch((e) =>
+            bb.log.warn(`orchestrator janitor: ${describeError(e)}`),
+          ),
+        );
+      }
       const timer = setInterval(janitorTick, 60_000);
+      janitorLive = true;
       janitorTick();
       return new Promise<void>((resolve) => {
         const stop = () => {
+          janitorLive = false;
           clearInterval(timer);
           resolve();
         };
