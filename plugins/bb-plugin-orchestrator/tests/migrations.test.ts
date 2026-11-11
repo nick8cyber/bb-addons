@@ -154,3 +154,63 @@ test("the r23 migration adds round/result/merge columns to an existing db", () =
   assert.equal(row.round, 1);
   assert.equal(row.continue_from, null);
 });
+
+test("the r24/25 migrations apply on a base that recorded main's 0–14", async () => {
+  // The live plugin DB recorded main's MIGRATIONS[0..14] — #14 is
+  // `explicit_route`. The §16.5 columns and the legacy UPDATE are #15/#16
+  // and must come AFTER, or the SDK's statement-hash check aborts the
+  // plugin at startup (PLUG-190).
+  const { createHash } = await import("node:crypto");
+  const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+  assert.match(MIGRATIONS[14]!, /explicit_route/, "migration 14 is main's explicit_route");
+  assert.match(MIGRATIONS[15]!, /result_notified_at/, "the §16.5 columns come after");
+  assert.match(MIGRATIONS[16]!, /result_notice = 'legacy'/, "the legacy UPDATE is last");
+
+  const db = new Database(":memory:");
+  db.exec(
+    `CREATE TABLE _bb_migrations (
+      id INTEGER PRIMARY KEY, applied_at INTEGER, statement_hash TEXT
+    )`,
+  );
+  // Verbatim SDK runPluginStorageMigrations (0.4.87): recorded hashes
+  // must match, unrecorded statements apply in order.
+  const migrate = (statements: string[]) => {
+    const rows = db
+      .prepare(`SELECT id, statement_hash FROM _bb_migrations ORDER BY id`)
+      .all() as { id: number; statement_hash: string | null }[];
+    const applied = new Map(rows.map((r) => [r.id, r.statement_hash]));
+    statements.map(hash).forEach((sh, i) => {
+      const rec = applied.get(i);
+      if (rec != null && rec !== sh) {
+        throw new Error(`migration ${i} does not match the recorded statement`);
+      }
+    });
+    db.transaction(() => {
+      statements.forEach((s, i) => {
+        if (applied.has(i)) return;
+        db.exec(s);
+        db.prepare(
+          `INSERT INTO _bb_migrations (id, applied_at, statement_hash)
+           VALUES (?,?,?)`,
+        ).run(i, Date.now(), hash(s));
+      });
+    })();
+  };
+  // The base recorded main's list — our 0–14 are byte-identical to it.
+  migrate(MIGRATIONS.slice(0, 15));
+  db.prepare(
+    `INSERT INTO delegations (
+      task_key, coordinator_thread_id, level, route, preset, provider,
+      status, created_at, updated_at
+    ) VALUES ('PLUG-0', 'thr_c', 'simple', 'simple', 'simple', 'p', 'done', 1, 1)`,
+  ).run();
+  migrate([...MIGRATIONS]); // must not throw "does not match"
+  const recorded = db
+    .prepare(`SELECT count(*) n FROM _bb_migrations`)
+    .get() as { n: number };
+  assert.equal(recorded.n, MIGRATIONS.length);
+  const legacy = db
+    .prepare(`SELECT result_notice FROM delegations WHERE task_key = 'PLUG-0'`)
+    .get() as { result_notice: string };
+  assert.equal(legacy.result_notice, "legacy");
+});

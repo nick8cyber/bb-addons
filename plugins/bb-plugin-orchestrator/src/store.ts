@@ -604,19 +604,24 @@ export class DelegationStore {
 
   /**
    * §16.5 exactly-once (PLUG-184): the in-flight delivery marker —
-   * `UPDATE … WHERE result_notified_at IS NULL` is atomic, so a second
-   * caller (event vs reconcile pass, or a second plugin process) sees
-   * the claim and leaves. `updated_at` doubles as the claim's time: a
-   * crash leaves the claim until it goes stale (`listPendingResult`
-   * rescans it after two minutes).
+   * `UPDATE … WHERE` is atomic, so a second caller (event vs reconcile
+   * pass, or a second plugin process) sees the claim and leaves.
+   * `updated_at` doubles as the claim's time: a crash mid-delivery
+   * leaves the `-1` until it goes stale — the same predicate that
+   * `listPendingResult` rescans lets the claim be TAKEN again after
+   * two minutes, so a killed send cannot lose the result (PLUG-190).
    */
   claimResultDelivery(id: number): boolean {
+    const staleBefore = Date.now() - 120_000;
     const info = this.db
       .prepare(
         `UPDATE delegations SET result_notified_at = -1, updated_at = ?
-         WHERE id = ? AND result_notified_at IS NULL`,
+         WHERE id = ? AND (
+           result_notified_at IS NULL
+           OR (result_notified_at = -1 AND updated_at < ?)
+         )`,
       )
-      .run(Date.now(), id);
+      .run(Date.now(), id, staleBefore);
     return info.changes > 0;
   }
 
@@ -643,6 +648,20 @@ export class DelegationStore {
          ORDER BY id`,
       )
       .all(Date.now() - 120_000) as DelegationRow[];
+  }
+
+  /** Terminal rows that still name a thread — the §16.5 rollout's
+   * last_seq sync scope (a stale cursor would let a HISTORICAL turn
+   * revive or suppress them, PLUG-190). */
+  listTerminalWithThread(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status NOT IN ('dispatching','running')
+           AND thread_id IS NOT NULL
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
   }
 
   /** Distinct coordinator threads the store knows — the §16.5 reminder's scope. */

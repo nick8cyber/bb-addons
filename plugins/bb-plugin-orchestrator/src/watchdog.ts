@@ -116,7 +116,7 @@ export async function cancelProviderRetries(
   threadId: string,
 ): Promise<true | string> {
   if (!providerRetry) return true;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     let pending: unknown[];
     try {
       pending = await providerRetry.pending(threadId);
@@ -150,12 +150,33 @@ export function providerRetryCli(
       return res.retries ?? [];
     },
     cancel: async (threadId) => {
-      await runChecked(bbCli, [
+      const res = await bbCli.run([
         "provider-retry",
         "cancel",
         threadId,
         "--json",
       ]);
+      if (res.exitCode === 0) return;
+      // The live CLI answers `no_pending_retry` with exit 1, the code in
+      // the stdout JSON and the human sentence in stderr (PLUG-190) —
+      // the row fired between status and cancel, i.e. a drained queue.
+      try {
+        const j = JSON.parse(res.stdout) as
+          | { error?: { code?: unknown } }
+          | null
+          | undefined;
+        if (j?.error?.code === "no_pending_retry") return;
+      } catch {
+        // not JSON — fall through to the text check
+      }
+      if (/no_pending_retry/i.test(`${res.stdout}\n${res.stderr}`)) return;
+      throw new OrchestratorError(
+        "bb-cli-failed",
+        `bb provider-retry cancel ${threadId} failed (exit ` +
+          `${res.exitCode}): ${
+            res.stderr.trim() || res.stdout.trim() || "no output"
+          }`,
+      );
     },
   };
 }
@@ -1406,53 +1427,72 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     const starts = events.filter((e) => e.type === "turn/started");
     if (starts.length === 0) return false;
-    // §16.2: the message that opened the FIRST new turn decides — a
-    // tracker comment notification ("New comment on task …") is a
-    // notification wake, not a revive.
-    const firstStart = starts[0]!;
-    const request = events
-      .filter(
-        (e) => e.type === "client/turn/requested" && e.seq < firstStart.seq,
-      )
-      .at(-1);
-    const reqText = (
-      (
-        (request?.data as { input?: { text?: string }[] } | null | undefined)
-          ?.input ?? []
-      ) as { text?: string }[]
-    )
-      .map((p) => p?.text ?? "")
-      .join("")
-      .trim();
-    const trackerWake = reqText.startsWith(TRACKER_COMMENT_PREFIX);
-    const superseded = SUPERSEDED.has(row.status);
-    const newer = store.hasNewerForTask(row.task_key, row.id);
+    // §16.2 r25 (PLUG-190): EVERY new turn/started is decided on its own
+    // opening message — judging once by the FIRST turn let a tracker
+    // comment wake ("New comment on task …") mask a later genuine turn
+    // forever: last_seq never moved, the executor worked unsupervised
+    // and its result was never delivered. A tracker wake is consumed by
+    // advancing last_seq past it; the next turn then gets its verdict.
     const turnSeq = Math.max(...starts.map((e) => e.seq));
-    if (superseded || newer) {
-      await suppressWake(
-        row,
-        turnSeq,
-        newer
-          ? "у задачи есть более новое делегирование"
-          : `исход «${row.status}» уже зафиксирован`,
+    const reqTextBefore = (seq: number): string => {
+      const request = events
+        .filter(
+          (e) => e.type === "client/turn/requested" && e.seq < seq,
+        )
+        .at(-1);
+      return (
+        (
+          (request?.data as
+            | { input?: { text?: string }[] }
+            | null
+            | undefined)?.input ?? []
+        ) as { text?: string }[]
+      )
+        .map((p) => p?.text ?? "")
+        .join("")
+        .trim();
+    };
+    for (const start of starts) {
+      const superseded = SUPERSEDED.has(row.status);
+      const newer = store.hasNewerForTask(row.task_key, row.id);
+      if (superseded || newer) {
+        await suppressWake(
+          row,
+          turnSeq,
+          newer
+            ? "у задачи есть более новое делегирование"
+            : `исход «${row.status}» уже зафиксирован`,
+        );
+        // A finished row keeps delivering its outcome; a superseded
+        // status never reaches the delivery list anyway.
+        return superseded;
+      }
+      if (reqTextBefore(start.seq).startsWith(TRACKER_COMMENT_PREFIX)) {
+        // A notification wake, not a revive — consume it so the next
+        // turn/started is judged on its own message.
+        store.advanceLastSeq(row.id, start.seq);
+        continue;
+      }
+      if (!store.revive(row.id)) {
+        // Lost the race — another delegation of the task is active
+        // (the revive() transaction guards the partial unique index).
+        await suppressWake(
+          row,
+          turnSeq,
+          "у задачи есть более новое делегирование",
+        );
+        return false;
+      }
+      clearMarks(row.id);
+      log.info?.(
+        `orchestrator: delegation #${row.id} revived (turn/started)`,
       );
-      // A finished row keeps delivering its outcome; a superseded status
-      // never reaches the delivery list anyway.
-      return superseded;
+      // Drain the stream so the new turn's `turn/started` reopens
+      // supervision (turn_started_at, cleared marks).
+      await processStream(store.get(row.id) ?? row);
+      return true;
     }
-    if (trackerWake) return false; // the latest round stays finished
-    if (!store.revive(row.id)) {
-      // Lost the race — another delegation of the task is active
-      // (the revive() transaction guards the partial unique index).
-      await suppressWake(row, turnSeq, "у задачи есть более новое делегирование");
-      return false;
-    }
-    clearMarks(row.id);
-    log.info?.(`orchestrator: delegation #${row.id} revived (turn/started)`);
-    // Drain the stream so the new turn's `turn/started` reopens
-    // supervision (turn_started_at, cleared marks).
-    await processStream(store.get(row.id) ?? row);
-    return true;
+    return false;
   };
 
   /**
@@ -1467,7 +1507,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     // §16.2 hedge: a revived thread voids the outcome — check first.
     if (await maybeRevive(row)) return;
     const fresh = store.get(row.id) ?? row;
-    if (fresh.result_notified_at != null) return;
+    // PLUG-190: only a RECORDED delivery ends the resend — a `-1` claim
+    // left by a crash mid-delivery is stale work, not a delivered result
+    // (`claimResultDelivery` re-takes it after two minutes).
+    if ((fresh.result_notified_at ?? 0) > 0 || fresh.result_notice != null) {
+      return;
+    }
     if (fresh.status !== "done" && fresh.status !== "cancelled") return;
     // §16.5 exactly-once (PLUG-184): the conditional claim below is the
     // atomic gate — event-driven and reconcile paths cannot both send.
@@ -2253,6 +2298,49 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
   };
 
+  /**
+   * §16.5 rollout (PLUG-190): delegations closed BEFORE the delivery
+   * columns existed carry a stale `last_seq` — on the live base ten
+   * terminal rows had turn/started events above their cursor, so the
+   * first post-upgrade event would revive them on a HISTORICAL turn or
+   * suppress a thread's CURRENT work. One pass lifts every terminal
+   * row's cursor to its thread's journal tip; `plugin_meta` makes it
+   * once-per-install, and a journal that cannot be read retries the
+   * pass on the next reconcile (a gone thread cannot revive — it counts
+   * as synced).
+   */
+  const syncTerminalLastSeq = async (s: ReconcileSummary) => {
+    if (store.metaGet("legacy-lastseq") === "1") return;
+    let complete = true;
+    for (const row of store.listTerminalWithThread()) {
+      let tip: WatchdogThreadEvent[] | undefined;
+      try {
+        tip = await deps.threads.events.list({
+          threadId: row.thread_id!,
+          order: "desc",
+          limit: "1",
+        });
+      } catch {
+        tip = undefined;
+      }
+      if (tip === undefined) {
+        // An unreadable journal retries next pass unless the thread
+        // itself is gone (a gone thread cannot produce a reviving turn).
+        let gone = false;
+        try {
+          const t = await getThread(row.thread_id);
+          gone = !t || !!t.deletedAt || !!t.archivedAt;
+        } catch (e) {
+          s.errors.push(`lastseq sync ${row.thread_id}: ${message(e)}`);
+        }
+        if (!gone) complete = false;
+        continue;
+      }
+      if (tip[0]) store.advanceLastSeq(row.id, tip[0]!.seq);
+    }
+    if (complete) store.metaSet("legacy-lastseq", "1");
+  };
+
   const reconcile = async (): Promise<ReconcileSummary> => {
     const summary: ReconcileSummary = {
       scanned: 0,
@@ -2290,6 +2378,13 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.clearSetupError(row.id, "watchdog-stop-reported");
           store.resetRetry(row.id);
           const cur = store.get(row.id) ?? row;
+          // PLUG-190: `failed` on a level without autoFallback was already
+          // reported by toFailed — the retry only owed the auto-retry
+          // cancel, not a second «завершился с ошибкой» message.
+          if (cur.status === "failed") {
+            const info = await routeInfo(cur);
+            if (!info.level?.autoFallback) continue;
+          }
           await outcomeAndMaybeReissue(
             cur,
             cur.status as "stalled" | "quota" | "failed",
@@ -2307,6 +2402,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       } catch (e) {
         summary.errors.push(`delegation #${row.id}: ${message(e)}`);
       }
+    }
+    // §16.5 rollout: stale cursors on pre-upgrade terminal rows first —
+    // a historical turn must not decide revive/suppress below.
+    try {
+      await syncTerminalLastSeq(summary);
+    } catch (e) {
+      summary.errors.push(`lastseq sync: ${message(e)}`);
     }
     // §16.5: every done/cancelled row delivers its result exactly once —
     // the pass resends until `result_notified_at` records the delivery.
