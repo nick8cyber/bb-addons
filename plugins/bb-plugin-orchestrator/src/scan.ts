@@ -1,10 +1,13 @@
 /**
  * Machine leak scan (spec orchestrator-release §4) — pipeline step 4.
  * `gitleaks` covers category 1 (secrets); plugin templates cover
- * categories 2-4 over the release diff's added lines and the commit
- * metadata of `merge-base(origin/<цель>, HEAD)..HEAD`. Categories 1-2
- * always block; 3-4 follow the project's `leaks` strictness with `allow`
- * places where such mentions are the norm.
+ * categories 2-4 over the added lines of EVERY commit's patch in the
+ * range `merge-base(origin/<цель>, HEAD)..HEAD` (§16.6 — a finding added
+ * and removed inside the range is still caught) plus the release diff's
+ * added lines and the commit metadata. Categories 1-2 always block; 3-4
+ * follow the project's `leaks` strictness with `allow` places where such
+ * mentions are the norm. `thr_…` ids are exempt only while the project's
+ * `threadIds` is on (§16.6).
  *
  * Findings never carry secret values — a finding that quotes the leak
  * would itself leak (§3). Descriptions name the rule and the masked hit.
@@ -159,8 +162,19 @@ const isTaskKeyToken = (token: string) =>
   /^[A-Z][A-Z0-9]{1,9}-\d+$/.test(token) && !TASK_KEY_ALLOW.has(token);
 
 /** §4: the `BB-Thread:` trailer line in a commit message is contract, not
- * a leak — strip it before scanning commit bodies for category 4. */
+ * a leak — strip it before scanning commit bodies for category 4. The
+ * exemption holds only while `threadIds` is on (§16.6): with `threadIds`
+ * off every `thr_…` in commit text is a `leaks.bbIds` finding, trailer
+ * included. */
 const BB_THREAD_TRAILER_RE = /^\s*BB-Thread\s*:[^\n]*$/gim;
+
+/** §16.6 `threadIds`: `true` (default) — `thr_…` ids are anonymized and
+ * the pipeline needs them, so the `bb-thread-id` rule is off; other bb
+ * ids stay. `false` — every `thr_…` is a finding. */
+const bbIdRules = (threadIds: boolean) =>
+  threadIds
+    ? BB_ID_RULES.filter((r) => r.rule !== "bb-thread-id")
+    : BB_ID_RULES;
 
 const hits = (text: string, rules: { rule: string; re: RegExp }[]) =>
   rules.filter(({ re }) => re.test(text)).map(({ rule }) => rule);
@@ -172,6 +186,7 @@ function scanAddedLines(
   added: readonly AddedLine[],
   leaks: ResolvedProject["leaks"],
   hostname: string | undefined,
+  threadIds = true,
 ): ScanFinding[] {
   const findings: ScanFinding[] = [];
   const hostRule =
@@ -181,6 +196,7 @@ function scanAddedLines(
   const machineRules = hostRule
     ? [...MACHINE_RULES, hostRule]
     : MACHINE_RULES;
+  const bbRules = bbIdRules(threadIds);
   for (const { file, line, text } of added) {
     // §4: `allow` places relax categories 3–4 only — secrets and author
     // identity (categories 1–2) are checked everywhere, always block.
@@ -226,7 +242,7 @@ function scanAddedLines(
         severity: leaks.machine,
       });
     }
-    for (const rule of hits(text, BB_ID_RULES)) {
+    for (const rule of hits(text, bbRules)) {
       if (allowed) continue;
       if (rule === "task-key") {
         const tokens = text.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/g) ?? [];
@@ -250,9 +266,11 @@ function scanCommitMeta(
   allowed: { name: string; email: string } | undefined,
   leaks: ResolvedProject["leaks"],
   hostname: string | undefined,
+  threadIds = true,
 ): ScanFinding[] {
   const findings: ScanFinding[] = [];
   const short = (sha: string) => sha.slice(0, 8);
+  const bbRules = bbIdRules(threadIds);
   for (const c of commits) {
     // Category 2 — the signature must equal the configured one.
     const ok =
@@ -286,8 +304,9 @@ function scanCommitMeta(
         severity: "block",
       });
     }
-    // Categories 3–4 over commit text; the BB-Thread trailer is exempt.
-    const body = c.body.replace(BB_THREAD_TRAILER_RE, "");
+    // Categories 3–4 over commit text; the BB-Thread trailer is exempt
+    // while threadIds is on — with it off even the trailer is a finding.
+    const body = threadIds ? c.body.replace(BB_THREAD_TRAILER_RE, "") : c.body;
     for (const rule of hits(body, MACHINE_RULES)) {
       findings.push({
         category: 3,
@@ -308,7 +327,7 @@ function scanCommitMeta(
         severity: leaks.machine,
       });
     }
-    for (const rule of hits(body, BB_ID_RULES)) {
+    for (const rule of hits(body, bbRules)) {
       if (rule === "task-key") {
         const tokens = body.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/g) ?? [];
         if (!tokens.some(isTaskKeyToken)) continue;
@@ -350,7 +369,9 @@ export function parseAddedLines(diffText: string): AddedLine[] {
       file = p === "/dev/null" ? null : p.replace(/^b\//, "");
       continue;
     }
-    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+    // `@@` regular hunks and `@@@` combined-diff hunks (merge patches
+    // under `git log -p --cc`): the post-image start is the + group.
+    const hunk = /^@+ (?:-\d+(?:,\d+)? )+\+(\d+)(?:,\d+)? @+/.exec(raw);
     if (hunk) {
       line = Number(hunk[1]);
       continue;
@@ -439,7 +460,9 @@ export async function runGitleaks(
   }));
 }
 
-/** The whole step-4 scan: gitleaks + plugin templates. */
+/** The whole step-4 scan: gitleaks + plugin templates. `patches` — §16.6
+ * per-commit added lines (`git log -p --cc` over the range): a leak added
+ * and removed inside the range is still caught. */
 export async function machineScan(
   cmd: CmdRunner,
   input: {
@@ -448,9 +471,13 @@ export async function machineScan(
     headSha: string;
     commits: readonly CommitMeta[];
     added: readonly AddedLine[];
+    /** Added lines across every commit's patch in the range (§16.6). */
+    patches?: readonly AddedLine[];
     leaks: ResolvedProject["leaks"];
     allowedAuthor?: { name: string; email: string } | undefined;
     hostname?: string | undefined;
+    /** §16.6 `threadIds` — default `true` (`thr_…` is not a leak). */
+    threadIds?: boolean;
   },
 ): Promise<ScanFinding[]> {
   const findings: ScanFinding[] = [];
@@ -463,10 +490,25 @@ export async function machineScan(
       input.allowedAuthor,
       input.leaks,
       input.hostname,
+      input.threadIds ?? true,
     ),
   );
+  // Range-diff lines ∪ per-commit patch lines, deduped — the same added
+  // line must not surface the same finding twice.
+  const seen = new Set<string>();
+  const added = [...input.added, ...(input.patches ?? [])].filter((l) => {
+    const key = `${l.file} ${l.line} ${l.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   findings.push(
-    ...scanAddedLines(input.added, input.leaks, input.hostname),
+    ...scanAddedLines(
+      added,
+      input.leaks,
+      input.hostname,
+      input.threadIds ?? true,
+    ),
   );
   return findings;
 }

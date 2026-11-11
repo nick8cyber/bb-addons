@@ -170,7 +170,7 @@ export async function createPlugin(
       type: "string",
       label: "Release config",
       description:
-        "Release pipeline JSON (orchestrator-release §6): commitIdentity, defaults and per-project overrides (target, sync, checks, public, docsMap, leaks, excluded). Empty — `release` disabled.",
+        "Release pipeline JSON (orchestrator-release §6): commitIdentity, defaults and per-project overrides (target, sync, checks, public, docsMap, leaks, excluded, threadIds). Empty — `release` disabled.",
       experimental_multiline: true,
       default: "",
     },
