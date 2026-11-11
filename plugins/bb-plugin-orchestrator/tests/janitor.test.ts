@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -136,7 +137,10 @@ function commitIn(path: string, file: string, msg: string) {
 
 /** A branch whose tip is a commit origin has never seen (unmerged). */
 function unmergedBranch(repo: string, name: string) {
-  const tree = git(repo, ["rev-parse", "HEAD^{tree}"]);
+  const file = `wip-${name.replace(/\//g, "-")}.txt`;
+  writeFileSync(join(repo, file), "unpushed\n");
+  git(repo, ["add", file]);
+  const tree = git(repo, ["write-tree"]);
   const sha = git(repo, [
     "commit-tree",
     tree,
@@ -146,6 +150,8 @@ function unmergedBranch(repo: string, name: string) {
     `wip: ${name}`,
   ]);
   git(repo, ["branch", name, sha]);
+  git(repo, ["reset", "-q", "HEAD"]);
+  rmSync(join(repo, file));
 }
 
 /** env work lands on origin/main: push the branch, merge it, push main. */
@@ -479,17 +485,11 @@ test("the copy's own unmerged branch keeps the copy", async () => {
   mergeEnv(repo, env);
   // the executor switched the copy to another merged branch, while
   // env.branchName (bb/a) was moved onto a commit origin never saw —
-  // the copy must stay so that work is not lost
+  // real content, so «влита» fails on every sign and the copy must
+  // stay so that work is not lost
   git(env.path, ["checkout", "-b", "bb/other"]);
-  const tree = git(repo, ["rev-parse", "HEAD^{tree}"]);
-  const sha = git(repo, [
-    "commit-tree",
-    tree,
-    "-p",
-    "HEAD",
-    "-m",
-    "wip: moved bb/a",
-  ]);
+  unmergedBranch(repo, "scratch/wip");
+  const sha = git(repo, ["rev-parse", "scratch/wip"]);
   git(repo, ["branch", "-f", env.branchName, sha]);
   const w = makeWorld({
     envs: [env],
@@ -1244,12 +1244,12 @@ test("cascade: a child's pending interaction blocks the parent", async () => {
   );
 });
 
-test("squash-equivalent branch is «влита» via git cherry (§16.3)", async () => {
+test("squash-equivalent branch is «влита» via the content sign (§16.3)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
   // squash-merge on main: same diff, a different sha — bb/a is not an
-  // ancestor of origin/main, but `git cherry` shows only «-» lines
+  // ancestor of origin/main, but merging it adds nothing (same tree)
   writeFileSync(join(repo, "w.txt"), "feat: work\n");
   git(repo, ["add", "."]);
   git(repo, ["commit", "-m", "feat: work (squashed)"]);
@@ -1265,7 +1265,7 @@ test("squash-equivalent branch is «влита» via git cherry (§16.3)", async
   assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
 
-test("orphan bb/ branch merged only via cherry is swept", async () => {
+test("orphan bb/ branch merged only by content is swept", async () => {
   const { repo, base } = makeRepo();
   // a squash-merged bb/ branch, checked out nowhere
   git(repo, ["checkout", "-b", "bb/squashed"]);
@@ -1436,12 +1436,14 @@ test("rescue no-ops: clean copy, root chat, already-freed copy, no coordinator",
 
 // ── PLUG-185 review fixes ────────────────────────────────────────────
 
-test("ff-only sync with origin/main counts no own commits — fresh thread keeps the copy (PLUG-185 B1)", async () => {
+test("ff-only sync counts by the strict «Created from» formula — merged copy is removed (PLUG-195)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a"); // bb/a at the old origin tip
   // origin/main moves ahead; the copy fast-forwards — the standard
-  // «fetch + ff-only base» first step, reflog gets
-  // «merge origin/main: Fast-forward», not a commit
+  // «fetch + ff-only base» first step. §16.3 (PLUG-195): own commits
+  // are `rev-list --count <«Created from»>..<tip>` with no reflog-type
+  // parsing — the commits arrived by the ff count too, so the copy no
+  // longer waits for `abandonedAfter` (it is fully merged anyway).
   commitIn(repo, "g.txt", "feat: ahead");
   git(repo, ["push", "origin", "main"]);
   git(env.path, ["fetch", "origin"]);
@@ -1452,14 +1454,9 @@ test("ff-only sync with origin/main counts no own commits — fresh thread keeps
   });
   await w.jan.run();
   w.clock.t += 16 * 60_000;
-  let res = await w.jan.run();
-  assert.equal(res.removedCopies, 0);
-  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
-  // a reset + checkout on top still create no commits
-  git(env.path, ["reset", "--hard", "HEAD"]);
-  res = await w.jan.run();
-  assert.equal(res.removedCopies, 0);
-  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
 
 test("a real commit in the copy counts as own work (PLUG-185 B1)", async () => {
@@ -1902,12 +1899,12 @@ test("an incomplete or failed rescue tells the coordinator (PLUG-185 M7)", async
 
 // ── PLUG-188 review fixes ────────────────────────────────────────────
 
-test("rebase without commits (ff to origin/main) counts no own work — fresh thread keeps the copy (PLUG-188 B1)", async () => {
+test("a commit-less rebase counts by the strict «Created from» formula — merged copy is removed (PLUG-195)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a"); // bb/a at the old origin tip
   // origin/main moves ahead; `git rebase origin/main` fast-forwards
-  // bb/a — reflog «rebase (finish): refs/heads/bb/a onto <sha>» where
-  // the new tip == <sha>: a перемотка, not own work
+  // bb/a — under the strict formula the foreign commits it lands on
+  // count as own (no «rebase (finish) … onto» parsing, PLUG-195).
   commitIn(repo, "g.txt", "feat: ahead");
   git(repo, ["push", "origin", "main"]);
   git(env.path, ["fetch", "origin"]);
@@ -1919,8 +1916,8 @@ test("rebase without commits (ff to origin/main) counts no own work — fresh th
   await w.jan.run();
   w.clock.t += 16 * 60_000;
   const res = await w.jan.run();
-  assert.equal(res.removedCopies, 0);
-  assert.equal(w.janitor.item(env.id)!.reason, "no-commits-fresh");
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
 
 test("a rebase that replays commits counts them as own work (PLUG-188 B1)", async () => {
@@ -2540,4 +2537,141 @@ test("an unreadable HEAD reflog keeps the copy — unpushed-unknown (PLUG-192)",
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.equal(w.janitor.item(env.id)!.reason, "unpushed-unknown");
+});
+
+test("PROBE1: a reset-orphan in a copy-less bb/ branch's own reflog keeps it (PLUG-195)", async () => {
+  const { repo, base } = makeRepo();
+  // bb/o: commit U, then reset --hard — the tip is merged, but U lives
+  // only in the branch reflog that `branch -D` would erase
+  git(repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(repo, "u.txt"), "unpushed\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: unpushed"]);
+  const u = git(repo, ["rev-parse", "HEAD"]);
+  git(repo, ["reset", "--hard", "HEAD~1"]);
+  git(repo, ["checkout", "main"]);
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.orphanBranches, 0);
+  assert.equal(res.kept["branch-unpushed"], 1);
+  assert.equal(
+    git(repo, ["rev-parse", "bb/o"]),
+    git(repo, ["rev-parse", "main"]),
+  );
+  // U is still reachable from the branch reflog
+  assert.ok(
+    git(repo, ["log", "-g", "--format=%H", "refs/heads/bb/o"]).includes(u),
+  );
+});
+
+test("a branch-unpushed orphan idle over abandonedAfter is reported (PLUG-195)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(repo, "u.txt"), "unpushed\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: unpushed"]);
+  git(repo, ["reset", "--hard", "HEAD~1"]);
+  git(repo, ["checkout", "main"]);
+  // age the branch reflog past abandonedAfter (1d in CFG)
+  const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+  utimesSync(join(repo, ".git", "logs", "refs", "heads", "bb", "o"), stale, stale);
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.kept["branch-unpushed"], 1);
+  const item = res.reported.find((r) => r.branch === "bb/o");
+  assert.ok(item);
+  assert.equal(item.envId, "branch:bb/o");
+  assert.equal(item.reason, "branch-unpushed");
+  assert.equal(w.janitor.item("branch:bb/o")!.state, "reported");
+  // when the orphan commit is published the branch becomes sweepable
+  // again and the «брошено» row closes
+  const u = git(repo, ["rev-parse", "bb/o@{1}"]);
+  git(repo, ["merge", "--ff-only", u]);
+  git(repo, ["push", "origin", "main"]);
+  const res2 = await w.jan.run();
+  assert.equal(res2.removedBranches, 1);
+  assert.equal(w.janitor.item("branch:bb/o")!.state, "removed");
+  assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/o"]));
+});
+
+test("PROBE2: a squash of two or more commits is «влита» by the content sign (PLUG-195)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w1.txt", "feat: part 1");
+  commitIn(env.path, "w2.txt", "feat: part 2");
+  // a single squash commit on main holds both changes — no commit of
+  // bb/a is patch-equivalent (`git cherry` would say «+»), yet merging
+  // bb/a into main adds nothing
+  writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
+  writeFileSync(join(repo, "w2.txt"), "feat: part 2\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: squashed both parts"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
+});
+
+test("PROBE3: a commit + reset between the snapshot and the archive keeps the copy (PLUG-195)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    onThreadListCall: (n) => {
+      // call #2 is the pre-archive re-read: a process commits and
+      // resets right before the archive — HEAD is unchanged and the
+      // tree stays clean, but the reflog now holds an unpublished
+      // commit that would die with the copy
+      if (n === 2) {
+        commitIn(env.path, "late.txt", "wip: late unpushed");
+        git(env.path, ["reset", "--hard", "HEAD~1"]);
+      }
+    },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(w.janitor.item(env.id)!.reason, "unpushed-commits");
+});
+
+test("a pull-merge entry does not hide own commits — strict «Created from» count (PLUG-195)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  // origin/main moves ahead; `git pull` writes «pull origin main:
+  // Merge made by the 'ort' strategy.» — a reflog record the old
+  // type-parser mistook for a commit-less move (own commits = 0)
+  commitIn(repo, "g.txt", "feat: ahead");
+  git(repo, ["push", "origin", "main"]);
+  git(env.path, ["pull", "--no-rebase", "--no-edit", "origin", "main"]);
+  mergeEnv(repo, env);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
