@@ -434,12 +434,17 @@ Google sign-in; re-authenticate one and retry` — instead of spamming
 rotations. Quota fields and `rateLimits` are untouched.
 
 > [!TIP] Restore a logged-out account
-> Re-login the account (`HOME=accounts/<label> agy` login flow), then set its
-> `cooldownUntilMs` to `0` in `bridge-data/accounts-state.json` — or remove the
-> label from `accounts-parked/` bookkeeping the same way as any parked account.
+> Re-login the account (`HOME=accounts/<label> agy` login flow), then in
+> `bridge-data/accounts-state.json` set its `cooldownUntilMs` to `0` **and**
+> `lastUsedMs` to the current time — clearing the cooldown alone is not
+> enough: a satellite instance's `accounts-overlay.json` shadow survives
+> until the shared file shows fresher activity (or just run one turn on the
+> owner instance — its own `markAccountUse` lifts the shadow via the next
+> sync). Alternatively remove the label from `accounts-parked/` bookkeeping
+> the same way as any parked account.
 
 > [!TIP] Restore a verified account
-> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then set that account's `cooldownUntilMs` to `0` in `bridge-data/accounts-state.json`, or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
+> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then in `bridge-data/accounts-state.json` set that account's `cooldownUntilMs` to `0` **and** `lastUsedMs` to the current time (both are needed so a satellite's overlay shadow lifts), or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
 
 #### Native agy subagents are disabled
 
