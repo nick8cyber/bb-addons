@@ -22,8 +22,8 @@
  * `rev-list --count <«Created from»>..<tip>` (PLUG-195: strictly from
  * the creation entry — no reflog-type parsing). «Ничего не
  * теряется»: every commit the copy's HEAD or its branch ever pointed
- * at (the whole `git log -g`, plus the tips of the copy-scoped
- * `refs/worktree/*` and `refs/bisect/*`, PLUG-202) — and every
+ * at (the whole `git log -g`, plus the copy-scoped `refs/worktree/*`
+ * and `refs/bisect/*` with their reflogs, PLUG-202/203) — and every
  * ancestor of those positions not on origin — is an ancestor of a
  * remote target or patch-equivalent (`patch-id --verbatim`, the
  * commit itself, `rev-list --no-walk`; an empty commit only as an
@@ -48,9 +48,14 @@
  * reproduces the target tree while its commits failed is reported
  * «похоже, влито squash — проверьте и удалите вручную»
  * (`squash-suspect`), never removed. A copy carrying submodules
- * (`.gitmodules` or `$GIT_DIR/modules`) is never removed — their
- * objects live inside the copy's git dir and no origin check covers
- * them.
+ * (`.gitmodules`, `$GIT_DIR/modules` or a gitlink `160000` index
+ * entry, PLUG-203) is never removed — their objects live inside the
+ * copy's git dir and no origin check covers them. The same holds for
+ * nested git storage found by a full filesystem walk of the copy
+ * (any `.git` below the root or a bare `HEAD`+`objects/`+`refs/`
+ * layout, ignored directories included; `nested-repo`). `git
+ * worktree prune` is never invoked — it erases the HEAD reflog of a
+ * manually deleted copy, the last pointer to its commits (PLUG-203).
  *
  * §16.4: on `thread.archived` of an executor whose copy is still dirty,
  * the state is saved into `refs/orchestrator/rescue/<thr>` (stash object
@@ -889,27 +894,27 @@ export function createJanitor(deps: JanitorDeps) {
         refs.push(ref);
       }
     }
-    // §16.3 (PLUG-202): copy-scoped refs — `refs/worktree/*` and
+    // §16.3 (PLUG-202/203): copy-scoped refs — `refs/worktree/*` and
     // `refs/bisect/*` live in the worktree's own git dir and die with
-    // it. Their tips join the positions to prove; an unreadable
-    // listing proves nothing → «unknown».
+    // it. Their reflogs are read like HEAD's — under
+    // `core.logAllRefUpdates=always` a moved-away position is
+    // protected too; a ref without a reflog contributes its tip only
+    // (`log -g` is empty). An unreadable listing proves nothing →
+    // «unknown».
     const extra = await gitOut(deps.cmd, path, [
       "for-each-ref",
-      "--format=%(objectname)",
+      "--format=%(refname)",
       "refs/worktree/",
       "refs/bisect/",
     ]);
     if (extra === null) return "unknown";
-    return reflogPositionsSafe(
-      path,
-      refs,
-      repoRoot,
-      targets,
-      extra
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean),
-    );
+    for (const r of extra
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)) {
+      if (!refs.includes(r)) refs.push(r);
+    }
+    return reflogPositionsSafe(path, refs, repoRoot, targets);
   };
 
   /**
@@ -976,46 +981,53 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
-   * §15 п.3 (PLUG-202): a foreign `.git` (file or directory) anywhere
-   * under the copy means an embedded repository whose commits no
-   * origin check covers. Only ignored directories can hide it — an
-   * untracked nested repo shows up in `git status` («dirty») and a
-   * tracked one as a gitlink — so the scan is bounded to the `!!`
-   * entries of `status --ignored`. `node_modules` is pruned (package
-   * manager content is recoverable), symlinks are never followed;
-   * a probe failure proves nothing → null (`nested-unknown`).
+   * §15 п.3 (PLUG-203, грубое правило): nested git storage anywhere
+   * under the copy means commits no origin check can see. The whole
+   * copy is walked on the filesystem — `git status` never sees an
+   * ignored bare clone — including ignored and untracked directories;
+   * symlinks are never followed. A `.git` entry (file or directory)
+   * below the root, or a directory with bare-storage structure
+   * (`HEAD` + `objects/` + `refs/`), keeps the copy (`nested-repo`).
+   * The copy's own `.git` at the root — a file for a linked worktree,
+   * a directory for a main checkout — is skipped whole. A failed
+   * read, a walk past depth 20 or the time budget proves nothing →
+   * null (`nested-unknown`), the copy stays.
    */
-  const nestedGitUnder = (dir: string, depth = 0): boolean | null => {
-    if (depth > 20) return false;
-    let entries;
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return null;
-    }
-    for (const e of entries) {
-      if (e.name === ".git") return true;
-      if (e.name === "node_modules" || !e.isDirectory()) continue;
-      const found = nestedGitUnder(join(dir, e.name), depth + 1);
-      if (found !== false) return found;
-    }
-    return false;
-  };
-  const nestedRepoIn = async (path: string): Promise<boolean | null> => {
-    const out = await gitOut(deps.cmd, path, [
-      "status",
-      "--porcelain",
-      "--ignored=traditional",
-      "--untracked-files=all",
-      "--ignore-submodules=none",
-    ]);
-    if (out === null) return null;
-    for (const line of out.split("\n")) {
-      if (!line.startsWith("!! ") || !line.endsWith("/")) continue;
-      const found = nestedGitUnder(join(path, line.slice(3)));
-      if (found !== false) return found;
-    }
-    return false;
+  const NESTED_SCAN_MS = 20_000;
+  const NESTED_MAX_DEPTH = 20;
+  const nestedStorageIn = (path: string): boolean | null => {
+    const deadline = Date.now() + NESTED_SCAN_MS;
+    const walk = (dir: string, depth: number): boolean | null => {
+      if (depth > NESTED_MAX_DEPTH || Date.now() > deadline) return null;
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return null;
+      }
+      let bareHead = false;
+      let bareObjects = false;
+      let bareRefs = false;
+      for (const e of entries) {
+        if (e.name === "HEAD" && !e.isDirectory()) bareHead = true;
+        else if (e.name === "objects" && e.isDirectory()) bareObjects = true;
+        else if (e.name === "refs" && e.isDirectory()) bareRefs = true;
+      }
+      if (bareHead && bareObjects && bareRefs) return true;
+      for (const e of entries) {
+        if (e.name === ".git") {
+          // The copy's own `.git` at the root is its own storage, not
+          // a nested repository — it is not entered either.
+          if (depth === 0) continue;
+          return true;
+        }
+        if (!e.isDirectory()) continue;
+        const found = walk(join(dir, e.name), depth + 1);
+        if (found !== false) return found;
+      }
+      return false;
+    };
+    return walk(path, 0);
   };
 
   /**
@@ -1032,6 +1044,15 @@ export function createJanitor(deps: JanitorDeps) {
     gitDir?: string | null,
   ): Promise<boolean | null> => {
     if (existsSync(join(path, ".gitmodules"))) return true;
+    // §15 п.3 (PLUG-203 G1): a nested repo committed as a gitlink
+    // without `.gitmodules` (`git clone` + `git add`) leaves a
+    // mode-160000 index entry — the nested objects die with the copy
+    // exactly like a registered submodule's.
+    const staged = await gitOut(deps.cmd, path, ["ls-files", "-s"]);
+    if (staged === null) return null;
+    if (staged.split("\n").some((l) => l.startsWith("160000 "))) {
+      return true;
+    }
     let dir = gitDir;
     if (dir === undefined) {
       const raw = await gitOut(deps.cmd, path, [
@@ -1412,10 +1433,12 @@ export function createJanitor(deps: JanitorDeps) {
             info.protectedTargets.push(ref);
           }
         }
-        // A copy BB deleted externally leaves a stale worktree entry
-        // that still marks its branch «checked out» — prune it (apply
-        // only; report mode reads the `prunable` flag instead).
-        if (apply) await gitOk(deps.cmd, root, ["worktree", "prune"]);
+        // §15 «Действие» (PLUG-203): `git worktree prune` is never
+        // called — it erases the `.git/worktrees/<id>/HEAD` reflog of a
+        // manually deleted copy, the last pointer to its commits. The
+        // `prunable` flag is honored instead: such entries are neither
+        // live copies nor «открыта» branches (git's own expiry reaps
+        // the metadata later).
         const worktreeList = await gitOut(deps.cmd, root, [
           "worktree",
           "list",
@@ -1684,10 +1707,11 @@ export function createJanitor(deps: JanitorDeps) {
         return after(abandoned ? "abandoned-dirty" : "dirty", abandoned);
       if (unfinished === null) return after("unfinished-unknown");
       if (unfinished) return after("unfinished-op");
-      // §15 п.3 (PLUG-202): ignored files are recoverable — nested git
-      // storage is not. A live `worktree list` entry inside the copy or
-      // a foreign `.git` under an ignored directory keeps it; a failed
-      // probe proves nothing.
+      // §15 п.3 (PLUG-202/203): ignored files are recoverable — nested
+      // git storage is not. A live `worktree list` entry inside the
+      // copy, a gitlink (160000) or submodule metadata, or any `.git`/
+      // bare structure the filesystem walk finds keeps the copy; a
+      // failed probe proves nothing.
       if (repo.worktreeListFailed) return after("nested-unknown");
       if (repo.worktreePaths.some((w) => pathInside(path, w))) {
         return after(
@@ -1695,9 +1719,21 @@ export function createJanitor(deps: JanitorDeps) {
           abandoned,
         );
       }
-      const nestedRepo = await nestedRepoIn(path);
-      if (nestedRepo === null) return after("nested-unknown");
-      if (nestedRepo) {
+      // §16.3 (PLUG-199/203): a copy with submodules — `.gitmodules`,
+      // `$GIT_DIR/modules` or a gitlink index entry — is never
+      // removed: their objects die with the copy's git dir and no
+      // origin check covers them.
+      const submodules = await copyHasSubmodules(path, gitDir);
+      if (submodules === null) return after("submodules-unknown");
+      if (submodules) {
+        return after(
+          abandoned ? "abandoned-submodules" : "has-submodules",
+          abandoned,
+        );
+      }
+      const nested = nestedStorageIn(path);
+      if (nested === null) return after("nested-unknown");
+      if (nested) {
         return after(
           abandoned ? "abandoned-nested-repo" : "nested-repo",
           abandoned,
@@ -1711,17 +1747,6 @@ export function createJanitor(deps: JanitorDeps) {
       if (hidden.length) {
         return after(
           abandoned ? "abandoned-hidden-changes" : "hidden-changes",
-          abandoned,
-        );
-      }
-      // §16.3 (PLUG-199): a copy with submodules is never removed —
-      // their objects live inside the copy's git dir and no origin
-      // check covers them; idle past abandonedAfter — «брошено».
-      const submodules = await copyHasSubmodules(path, gitDir);
-      if (submodules === null) return after("submodules-unknown");
-      if (submodules) {
-        return after(
-          abandoned ? "abandoned-submodules" : "has-submodules",
           abandoned,
         );
       }
@@ -2066,7 +2091,7 @@ export function createJanitor(deps: JanitorDeps) {
           note("nested-worktree", e.id);
           return;
         }
-        const nRepo = await nestedRepoIn(e.path!);
+        const nRepo = nestedStorageIn(e.path!);
         if (nRepo !== false) {
           note(nRepo === null ? "nested-unknown" : "nested-repo", e.id);
           return;
@@ -2356,6 +2381,32 @@ export function createJanitor(deps: JanitorDeps) {
           continue;
         }
         reportedMem.delete(envId);
+        // §16.3 (PLUG-203): openness was proven by the run-start
+        // `worktree list`, minutes stale by now — re-read it
+        // immediately before the delete; a branch checked out in a new
+        // copy meanwhile (e.g. `bb thread restore-environment`) must
+        // not be deleted from under it. A failed re-list proves
+        // nothing → the branch stays.
+        let openedNow = false;
+        let relistFailed = false;
+        if (apply && cfg.deleteBranches) {
+          const freshWtl = await gitOut(deps.cmd, root, [
+            "worktree",
+            "list",
+            "--porcelain",
+          ]);
+          if (freshWtl === null) {
+            relistFailed = true;
+          } else {
+            openedNow = parseWorktreeList(freshWtl)
+              .worktrees.filter((w) => !w.prunable && existsSync(w.path))
+              .some((w) => w.branch === branch);
+          }
+        }
+        if (openedNow || relistFailed) {
+          keep(summary, openedNow ? "branch-open" : "branch-delete-failed");
+          continue;
+        }
         summary.orphanBranches += 1;
         if (apply && cfg.deleteBranches) {
           // §15/§16.3 (PLUG-199): delete atomically against the tip the
@@ -2390,9 +2441,6 @@ export function createJanitor(deps: JanitorDeps) {
             at,
           );
         }
-      }
-      if (apply && (summary.removedCopies > 0 || summary.removedBranches > 0)) {
-        await gitOk(deps.cmd, root, ["worktree", "prune"]);
       }
     }
 

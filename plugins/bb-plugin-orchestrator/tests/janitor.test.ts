@@ -37,6 +37,14 @@ function git(repo: string, args: string[]): string {
   }).trim();
 }
 
+/** Same, with stdin (plumbing like `mktree`). */
+function gitIn(repo: string, args: string[], input: string): string {
+  return execFileSync("git", ["-C", repo, ...args], {
+    encoding: "utf8",
+    input,
+  }).trim();
+}
+
 /** Real runner: executes git/du against the temp repos. */
 const realCmd: CmdRunner = {
   run: async (file, args, o) => {
@@ -3829,4 +3837,226 @@ test("git < 2.40: no --attr-source → no squash flag, one journal line (PLUG-20
   assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
   assert.equal(res.errors.length, 0);
   assert.ok(w.warns.some((m) => /attr-source/.test(m)));
+});
+
+// ── PLUG-203 ─────────────────────────────────────────────────────────
+
+test("G1: a gitlink without .gitmodules keeps the copy — the nested repo dies with it (PLUG-203)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  // `git init` inside the copy + `git add` records a mode-160000
+  // gitlink with no .gitmodules — a pattern agents hit often; the
+  // nested repository's own objects die with the copy
+  const sub = join(env.path, "sub");
+  execFileSync("git", ["init", "-q", "-b", "main", sub]);
+  git(sub, ["config", "user.name", "Agent"]);
+  git(sub, ["config", "user.email", "agent@x.io"]);
+  commitIn(sub, "inner.txt", "wip: inside sub");
+  git(env.path, ["add", "sub"]);
+  git(env.path, ["commit", "-m", "feat: add sub gitlink"]);
+  mergeEnv(repo, env);
+  assert.equal(git(env.path, ["status", "--porcelain"]), "");
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-submodules");
+});
+
+test("G3: a bare repository inside an ignored directory keeps the copy (PLUG-203)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  writeFileSync(join(env.path, ".gitignore"), "tmp/\n");
+  git(env.path, ["add", ".gitignore"]);
+  git(env.path, ["commit", "-m", "chore: ignore tmp"]);
+  mergeEnv(repo, env);
+  // a bare clone under an ignored dir: no `.git` NAME at all, only
+  // the HEAD+objects+refs layout — `git status` stays clean while its
+  // unpushed commit would die with the copy
+  const bare = join(env.path, "tmp", "b.git");
+  execFileSync("git", ["clone", "-q", "--bare", repo, bare]);
+  git(bare, ["config", "user.name", "Agent"]);
+  git(bare, ["config", "user.email", "agent@x.io"]);
+  const blob = gitIn(bare, ["hash-object", "-w", "--stdin"], "orphan\n");
+  const tree = gitIn(
+    bare,
+    ["mktree"],
+    `100644 blob ${blob}\torphan.txt\n`,
+  );
+  const sha = git(bare, ["commit-tree", tree, "-m", "wip: bare"]);
+  git(bare, ["update-ref", "refs/heads/wip", sha]);
+  assert.equal(git(env.path, ["status", "--porcelain"]), "");
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-nested-repo");
+});
+
+test("P1: `git worktree prune` is never invoked — the orphan HEAD-reflog survives (PLUG-203)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // a manually deleted worktree leaves a `prunable` admin entry whose
+  // worktrees/<id>/HEAD reflog is the last pointer to its commits —
+  // pruning it (the old apply step) condemned them to gc
+  const orphan = join(base, "orphan");
+  git(repo, ["worktree", "add", "--detach", orphan]);
+  commitIn(orphan, "draft.txt", "wip: orphan");
+  const orphanGit = join(repo, ".git", "worktrees", "orphan");
+  assert.ok(existsSync(orphanGit));
+  rmSync(orphan, { recursive: true, force: true });
+  const calls: string[] = [];
+  const spy: CmdRunner = {
+    run: async (f, a, o) => {
+      if (f === "git") calls.push(a.join(" "));
+      return realCmd.run(f, a, o);
+    },
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: spy,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.ok(
+    !calls.some((c) => /\bworktree\s+prune\b/.test(c)),
+    `unexpected prune in: ${calls.join(" | ")}`,
+  );
+  assert.ok(existsSync(orphanGit)); // admin entry + HEAD reflog intact
+});
+
+test("WR2: a moved-away position of refs/worktree/* is protected by its reflog (PLUG-203)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["config", "core.logAllRefUpdates", "always"]);
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // K's only pointer ever was the worktree-ref's reflog: the ref moved
+  // on to the merged tip — without the reflog read K would die unseen
+  writeFileSync(join(env.path, "k.txt"), "keep\n");
+  git(env.path, ["add", "k.txt"]);
+  const k = git(env.path, [
+    "commit-tree",
+    git(env.path, ["write-tree"]),
+    "-p",
+    "HEAD",
+    "-m",
+    "wip: K",
+  ]);
+  git(env.path, ["reset", "-q", "HEAD", "--", "k.txt"]);
+  rmSync(join(env.path, "k.txt"));
+  git(env.path, ["update-ref", "refs/worktree/keep", k]);
+  git(env.path, [
+    "update-ref",
+    "refs/worktree/keep",
+    git(env.path, ["rev-parse", "HEAD"]),
+  ]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle(clock, env.id)] },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(res.kept["unpushed-commits"], 1);
+});
+
+test("a bb/ branch checked out between the snapshot and the delete stays (PLUG-203)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  // run 1 marks the copy merged, run 2 archives it — the repo root is
+  // then known via `repoRoots` even with the copy gone; run 3 sweeps
+  const reopened = join(base, "reopened");
+  let listsInRun = 0;
+  let armed = false;
+  const spy: CmdRunner = {
+    run: async (f, a, o) => {
+      const isList =
+        f === "git" &&
+        a.includes("worktree") &&
+        a.includes("list") &&
+        a.includes("--porcelain");
+      if (isList) {
+        listsInRun += 1;
+        // «bb thread restore-environment» landing mid-run: the branch
+        // is open again between the snapshot and update-ref -d
+        if (armed && listsInRun === 2 && !existsSync(reopened)) {
+          execFileSync("git", [
+            "-C",
+            repo,
+            "worktree",
+            "add",
+            reopened,
+            "bb/a",
+          ]);
+        }
+      }
+      return realCmd.run(f, a, o);
+    },
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    cmd: spy,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res2 = await w.jan.run();
+  assert.equal(res2.removedCopies, 1);
+  git(repo, ["worktree", "remove", "--force", env.path]);
+  listsInRun = 0;
+  armed = true;
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-open"], 1);
+  git(repo, ["rev-parse", "--verify", "bb/a"]);
 });
