@@ -14,7 +14,11 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   index against double dispatch), runs `bb tasks dispatch`, attaches the
   thread as a hidden child with `parentNotifications=auto`, best-effort
   `mode=bypass` for `permissionMode=full` presets, marks `running`, and
-  comments «Раздано» on the task.
+  comments «Раздано» on the task. `--no-code` (tool `noCode`) marks a
+  delegation that expects no commits (§4.1 r28): the executor is told to
+  report only, the watchdog drops «коммитов нет» and flags commits that
+  appear anyway; the mark rides reissues and shows as `no-code` in
+  `status`/`show`.
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only threads whose role may delegate (`delegates`, §13);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).

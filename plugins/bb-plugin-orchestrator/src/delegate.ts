@@ -54,6 +54,8 @@ export interface DelegateParams {
   from?: string;
   /** §6 `--fresh`: no continuation — the round starts from the base. */
   fresh?: boolean;
+  /** §4.1 r28: mark the delegation «задача без кода» (no commits expected). */
+  noCode?: boolean;
   caller: ThreadFacts;
 }
 
@@ -378,6 +380,7 @@ export async function runDelegate(
       round,
       continueFrom,
       explicitRoute: params.route !== undefined || params.preset !== undefined,
+      noCode: params.noCode,
     });
   } catch (e) {
     if (
@@ -485,8 +488,9 @@ export async function dispatchToRoute(
   // §2.2: the «Работа с git» section leads --instructions; a continuation
   // round then adds «Заход N» (§4.1) — or, for auditor levels, the
   // «Проверяемый итог» line instead (§4.1 r23: a read-only role gets no
-  // merge commands) — then this call's extra instructions. In this shared
-  // step they cover the §5.4 reissue path too.
+  // merge commands) — a `no_code` row adds the §4.1 r28 «задача без кода»
+  // line — then this call's extra instructions. In this shared step they
+  // cover the §5.4 reissue path too.
   const resultRef = row.continue_from
     ? store.resultRefForSha(row.task_key, row.continue_from)
     : null;
@@ -498,6 +502,7 @@ export async function dispatchToRoute(
         ? reviewRoundLine(row.continue_from, resultRef?.branch, resultRef?.round)
         : roundSection(row.round, row.continue_from, resultRef?.branch)
       : undefined,
+    row.no_code === 1,
   );
   const dispatchArgs = [
     "tasks",

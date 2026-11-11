@@ -29,6 +29,7 @@ test("migrations create the §7 schema", () => {
     "setup_errors",
     "last_approval_notified_at",
     "timeout_notified_at",
+    "no_code",
     "created_at",
     "updated_at",
   ]) {
@@ -188,6 +189,29 @@ test("the r23 migration adds round/result/merge columns to an existing db", () =
     .get() as { round: number; continue_from: string | null };
   assert.equal(row.round, 1);
   assert.equal(row.continue_from, null);
+});
+
+test("the r28 migration adds no_code to an existing db, defaulting 0", () => {
+  const db = new Database(":memory:");
+  const r28 = MIGRATIONS.findIndex((m) => m.includes("ADD COLUMN no_code"));
+  assert.ok(r28 > 0, "r28 migration found");
+  assert.equal(r28, MIGRATIONS.length - 1, "r28 is the last migration");
+  for (const m of MIGRATIONS.slice(0, r28)) db.exec(m);
+  db.prepare(
+    `INSERT INTO delegations (
+      task_key, coordinator_thread_id, level, route, preset, provider,
+      status, created_at, updated_at
+    ) VALUES ('PLUG-0', 'thr_c', 'simple', 'simple', 'simple', 'p', 'done', 1, 1)`,
+  ).run();
+  db.exec(MIGRATIONS[r28]!);
+  const columns = (db
+    .prepare(`PRAGMA table_info(delegations)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.ok(columns.includes("no_code"), "missing column no_code");
+  const row = db
+    .prepare(`SELECT no_code FROM delegations WHERE task_key = 'PLUG-0'`)
+    .get() as { no_code: number };
+  assert.equal(row.no_code, 0, "existing rows are ordinary dispatches");
 });
 
 test("the r24/25 migrations apply on a base that recorded main's 0–15", async () => {

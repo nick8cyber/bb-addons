@@ -5,6 +5,7 @@ import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
   runDelegate,
   createDelegateQueue,
+  dispatchToRoute,
   retrySetupSteps,
   type DelegateDeps,
 } from "../src/delegate.js";
@@ -1253,4 +1254,97 @@ test("§17.2 r26 (PLUG-211 С2/мелко 2): the reissue reserve counts one rei
     ["simple", "simple-alt"],
     "the explicit-restart rule counts the whole chain (root included)",
   );
+});
+
+// ── §4.1 r28 (PLUG-237): «задача без кода» --no-code ──────────────────
+
+test("§4.1 r28: --no-code marks the row and adds the no-code instruction line", async () => {
+  const { deps, store, calls } = makeDeps();
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", noCode: true, caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.ok, true);
+  const row = store.get(res.delegationId)!;
+  assert.equal(row.no_code, 1);
+  const dispatch = calls.find((c) =>
+    c.args.join(" ").startsWith("tasks dispatch"),
+  )!;
+  const i = dispatch.args.indexOf("--instructions");
+  assert.ok(i >= 0, "--instructions sent");
+  assert.match(
+    dispatch.args[i + 1]!,
+    /задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт/,
+  );
+});
+
+test("§4.1 r28: a delegate without the flag is an ordinary dispatch", async () => {
+  const { deps, store, calls } = makeDeps();
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(store.get(res.delegationId)!.no_code, 0);
+  const dispatch = calls.find((c) =>
+    c.args.join(" ").startsWith("tasks dispatch"),
+  )!;
+  const i = dispatch.args.indexOf("--instructions");
+  const instructions = i >= 0 ? dispatch.args[i + 1]! : "";
+  assert.doesNotMatch(instructions, /задача без кода/);
+});
+
+test("§4.1 r28: a new delegate without the flag resets the mark", async () => {
+  const { deps, store } = makeDeps();
+  const first = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", noCode: true, caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(store.get(first.delegationId)!.no_code, 1);
+  store.setStatus(first.delegationId, "done");
+  const second = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(
+    store.get(second.delegationId)!.no_code,
+    0,
+    "заход 2 без флага — снова обычная раздача",
+  );
+});
+
+test("§4.1 r28: a reissue inherits no_code, a second hop keeps it", async () => {
+  const { deps, store, calls } = makeDeps();
+  const row = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    noCode: true,
+  });
+  store.setStatus(row.id, "stalled");
+  const re1 = store.reissue(row.id, {
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+  })!;
+  assert.equal(re1.no_code, 1, "reissue inherits the mark");
+  // the reissued dispatch also carries the instruction line
+  await dispatchToRoute(re1, {}, deps);
+  const dispatch = calls.find((c) =>
+    c.args.join(" ").startsWith("tasks dispatch"),
+  )!;
+  const i = dispatch.args.indexOf("--instructions");
+  assert.ok(i >= 0);
+  assert.match(dispatch.args[i + 1]!, /задача без кода/);
+  // a second hop in the chain keeps it too
+  store.setStatus(re1.id, "stalled");
+  const re2 = store.reissue(re1.id, {
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+  })!;
+  assert.equal(re2.no_code, 1);
 });

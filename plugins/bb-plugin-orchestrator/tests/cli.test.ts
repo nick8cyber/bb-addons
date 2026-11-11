@@ -735,3 +735,106 @@ test("release CLI: --no-docs/--kb/--no-kb values are not positional (§17.3 м7)
   assert.ok(!calls.some((c) => c.join(" ").includes("причина без доков")));
   void res;
 });
+
+// ── §4.1 r28 (PLUG-237): delegate --no-code ────────────────────────────
+
+test("CLI delegate --no-code marks the row, instructs the executor, shows in status/show", async () => {
+  const { cli, calls } = fakeCli((args) => {
+    if (args.join(" ").startsWith("tasks dispatch"))
+      return ok(JSON.stringify({ task: { id: "t1" }, threadId: "thr_exec" }));
+    if (args.join(" ").startsWith("tasks preset show"))
+      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: {
+      get: async () => ({
+        id: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        titleFallback: null,
+        originPluginId: null,
+        projectId: "proj_main",
+      }),
+      update: async () => ({}),
+    },
+  });
+  const res = await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "simple", "--no-code", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 0, res.stdout + (res.stderr ?? ""));
+  const body = JSON.parse(res.stdout) as { ok: boolean; delegationId: number };
+  assert.equal(body.ok, true);
+
+  // the dispatch carries the §4.1 r28 line
+  const dispatch = calls.find((c) =>
+    c.join(" ").startsWith("tasks dispatch"),
+  )!;
+  const i = dispatch.indexOf("--instructions");
+  assert.ok(i >= 0, "--instructions sent");
+  assert.match(
+    dispatch[i + 1]!,
+    /задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт/,
+  );
+
+  // show renders the no-code mark
+  const shown = await host.harness.runCli(
+    ["show", String(body.delegationId)],
+    { threadId: "thr_coord" },
+  );
+  assert.match(shown.stdout, /no-code/);
+  // status renders it too
+  const status = await host.harness.runCli(["status"], {
+    threadId: "thr_coord",
+  });
+  assert.match(status.stdout, /status=running no-code/);
+  // --json exposes the column
+  const shownJson = await host.harness.runCli(
+    ["show", String(body.delegationId), "--json"],
+    { threadId: "thr_coord" },
+  );
+  const row = (JSON.parse(shownJson.stdout) as {
+    delegation: { no_code: number };
+  }).delegation;
+  assert.equal(row.no_code, 1);
+});
+
+test("agent tool noCode: true marks the delegation", async () => {
+  const { cli, calls } = fakeCli((args) => {
+    if (args.join(" ").startsWith("tasks dispatch"))
+      return ok(JSON.stringify({ task: { id: "t1" }, threadId: "thr_exec" }));
+    if (args.join(" ").startsWith("tasks preset show"))
+      return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
+    return undefined;
+  });
+  const host = await hostWith({}, cli, {
+    threads: {
+      get: async () => ({
+        id: "thr_coord",
+        parentThreadId: null,
+        title: "coordinator",
+        titleFallback: null,
+        originPluginId: null,
+        projectId: "proj_main",
+      }),
+      update: async () => ({}),
+    },
+  });
+  const out = (await host.harness.callAgentTool(
+    "orchestrator_delegate",
+    { taskKey: "PLUG-1", level: "simple", noCode: true },
+    { threadId: "thr_coord" },
+  )) as string;
+  const body = JSON.parse(out) as { ok: boolean; delegationId: number };
+  assert.equal(body.ok, true);
+  const shown = await host.harness.runCli(
+    ["show", String(body.delegationId)],
+    { threadId: "thr_coord" },
+  );
+  assert.match(shown.stdout, /no-code/);
+  const dispatch = calls.find((c) =>
+    c.join(" ").startsWith("tasks dispatch"),
+  )!;
+  assert.match(dispatch.join(" "), /задача без кода/);
+});

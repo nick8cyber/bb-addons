@@ -301,6 +301,7 @@ function makeHarness(
     status?: "dispatching" | "running";
     createdAt?: number;
     explicitRoute?: boolean;
+    noCode?: boolean;
   } = {}): DelegationRow => {
     const row = store.insert({
       taskKey: input.taskKey ?? "PLUG-1",
@@ -311,6 +312,7 @@ function makeHarness(
       preset: input.preset ?? "simple",
       provider: input.provider ?? "acp-opencode",
       explicitRoute: input.explicitRoute,
+      noCode: input.noCode,
     });
     if (input.threadId) store.setThreadInfo(row.id, input.threadId);
     store.setStatus(row.id, input.status ?? "running");
@@ -2262,6 +2264,77 @@ test("§4.1: a foreign branch reports to the coordinator", async () => {
     /сомнителен/.test(JSON.stringify(s.input)),
   )!;
   assert.match(JSON.stringify(note.input), /master вместо exec-branch/);
+});
+
+// ── §4.1 r28 (PLUG-237): «задача без кода» исходы ─────────────────────
+
+test("§4.1 r28: a no_code delegation with zero commits reports nothing", async () => {
+  const repo = makeExecutorRepo({ commits: 0 });
+  const h = makeHarness({ round: roundDeps(repo) });
+  h.insertActive({ threadId: "thr_e1", route: "simple", noCode: true });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await settleResults(h);
+  const fresh = h.store.list()[0]!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_commits, 0);
+  assert.doesNotMatch(fresh.setup_errors, /коммитов нет|round-problems/);
+  assert.equal(
+    h.sends.filter((s) => /коммитов нет/.test(JSON.stringify(s.input))).length,
+    0,
+    "no «коммитов нет» for a no_code result",
+  );
+});
+
+test("§4.1 r28: a no_code delegation WITH commits reports them to the coordinator", async () => {
+  const repo = makeExecutorRepo({ commits: 2 });
+  const h = makeHarness({ round: roundDeps(repo) });
+  h.insertActive({ threadId: "thr_e1", route: "simple", noCode: true });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await settleResults(h);
+  const note = h.sends.find((s) =>
+    /сомнителен/.test(JSON.stringify(s.input)),
+  )!;
+  assert.match(
+    JSON.stringify(note.input),
+    /задача без кода, но есть коммиты: 2/,
+  );
+});
+
+test("§4.1 r28: a dirty copy and a foreign branch still report under no_code", async () => {
+  const repo = makeExecutorRepo({ commits: 0, dirty: true });
+  git(repo, ["checkout", "master"]); // executor left its branch
+  const h = makeHarness({ round: roundDeps(repo) });
+  h.insertActive({ threadId: "thr_e1", route: "simple", noCode: true });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  await settleResults(h);
+  const note = h.sends.find((s) =>
+    /сомнителен/.test(JSON.stringify(s.input)),
+  )!;
+  const text = JSON.stringify(note.input);
+  assert.match(text, /грязная/);
+  assert.match(text, /master вместо exec-branch/);
+  assert.doesNotMatch(text, /коммитов нет/);
 });
 
 test("§4.1: review-level delegations skip the result collection", async () => {

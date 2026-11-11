@@ -14,6 +14,7 @@ import {
   GIT_INSTRUCTIONS_MAX,
   gitInstructionsError,
   mergeDispatchInstructions,
+  NO_CODE_LINE,
 } from "../src/instructions.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import type { ThreadFacts } from "../src/agent-config.js";
@@ -481,4 +482,66 @@ test("review level with an unrecorded --from ref names just the commit", async (
   const text = dispatchedInstructions(calls)!;
   assert.match(text, /^Проверяемый итог: коммит deadbeef$/m);
   assert.ok(!/Заход|git merge/.test(text), `unexpected section: ${text}`);
+});
+
+// ── §4.1 r28 (PLUG-237): the «задача без кода» instruction line ───────
+
+test("mergeDispatchInstructions: the no-code line lands before extras", () => {
+  const merged = mergeDispatchInstructions("GIT-RULES", "EXTRA", undefined, true)!;
+  assert.equal(
+    merged,
+    "GIT-RULES\n\nзадача без кода: файлы репозитория не менять, не коммитить; итог — отчёт\n\nEXTRA",
+  );
+  assert.equal(
+    mergeDispatchInstructions(undefined, undefined, undefined, true),
+    NO_CODE_LINE,
+  );
+  assert.equal(
+    mergeDispatchInstructions(undefined, undefined, undefined, false),
+    undefined,
+  );
+});
+
+test("§4.1 r28: dispatchToRoute adds the no-code line for a marked row", async () => {
+  const { deps, store, calls } = makeDeps({ gitInstructions: "GIT-RULES" });
+  const row = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    noCode: true,
+  });
+  await dispatchToRoute(row, {}, deps);
+  assert.equal(
+    dispatchedInstructions(calls),
+    "GIT-RULES\n\nзадача без кода: файлы репозитория не менять, не коммитить; итог — отчёт",
+  );
+});
+
+test("§4.1 r28: a reissue of a no_code row dispatches the line too", async () => {
+  // §5.4: the reissue inherits the mark through store.reissue — the line
+  // reaches the replacement executor without the coordinator re-flagging.
+  const { deps, store, calls } = makeDeps();
+  const row = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+    noCode: true,
+  });
+  store.setStatus(row.id, "stalled");
+  const fresh = store.reissue(row.id, {
+    route: "simple",
+    preset: "simple",
+    provider: "p",
+  })!;
+  assert.equal(fresh.no_code, 1);
+  await dispatchToRoute(fresh, {}, deps);
+  assert.match(dispatchedInstructions(calls)!, /задача без кода/);
 });

@@ -1405,7 +1405,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       // §16.5 one channel (PLUG-184): the doubts ride the single result
       // message, not a second send. «Коммитов нет» is noise for a
       // cancelled round — the executor may have been stopped mid-work.
-      if (commits === 0 && row.status !== "cancelled") {
+      // §4.1 r28: a `no_code` delegation expects NO commits — «коммитов
+      // нет» never applies; commits that appeared anyway are the doubt.
+      if (row.no_code) {
+        if (commits !== null && commits > 0) {
+          problems.push(`задача без кода, но есть коммиты: ${commits}`);
+        }
+      } else if (commits === 0 && row.status !== "cancelled") {
         problems.push("коммитов нет");
       }
       if (dirty) problems.push("копия грязная (незакоммиченные правки)");
