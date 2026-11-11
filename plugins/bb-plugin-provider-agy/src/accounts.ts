@@ -273,9 +273,21 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
   const sharedPath = join(dataDir, SHARED_STATE_FILE);
   const diskSharedAccounts =
     readJsonFile<Partial<AccountsLedger>>(sharedPath)?.accounts ?? {};
+  // Object.hasOwn, not `in`: the map is a JSON.parse result, so labels
+  // like "constructor" or "toString" would otherwise pass as present via
+  // the prototype chain and never be seen as ghosts. A label carrying
+  // path separators or ".." can never be an account home — it is a ghost
+  // outright, and probing the filesystem for it would read outside
+  // dataDir. When the shared file itself is broken the map reads as zero
+  // accounts: labels that exist only there (a removed account still on
+  // cooldown) are then all judged ghosts and purged — the torn-write
+  // class of failure, bounded in ADR-0025 "Границы".
   const isGhostLabel = (label: string): boolean =>
-    !(label in diskSharedAccounts) &&
-    !existsSync(join(accountsDir(dataDir), label));
+    !Object.hasOwn(diskSharedAccounts, label) &&
+    (label.includes("/") ||
+      label.includes("\\") ||
+      label.includes("..") ||
+      !existsSync(join(accountsDir(dataDir), label)));
 
   // Overlay is written only for labels this instance dirtied; a save done
   // purely for a conversation pin leaves the file (and its writtenMs)
@@ -288,14 +300,29 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
   // Helpers re-stamp when they mutate strings, so our own fresh mark is
   // not shadowed by an older neighbour write; absent writtenMs counts as
   // 0, so a hand-edited overlay does not wedge updates. lastError always
-  // serializes, a fresh-side null is a value, not an absence. Ghosts are
-  // dropped from the overlay so they cannot linger and sync onward.
+  // serializes, a fresh-side null is a value, not an absence. The disk
+  // record joins the merge only while its shadow still applies — a lifted
+  // shadow (writtenMs behind the shared lastUsedMs re-read above) would
+  // otherwise resurrect its cooldown, ineligible stamp and strings under
+  // a fresh writtenMs. Dead shadows are purged before the merge so they
+  // cannot linger and sync onward.
   if (ledger.dirtyLabels !== undefined && ledger.dirtyLabels.size > 0) {
     const overlayPath = join(dataDir, ACCOUNTS_OVERLAY_FILE);
     const onDisk =
       readJsonFile<Partial<OverlayFile>>(overlayPath)?.accounts ?? {};
     const merged: Record<string, OverlayEntry> = { ...onDisk };
     const now = Date.now();
+    // A lifted shadow (writtenMs behind the shared lastUsedMs re-read
+    // above) is purged before the merge: left in, it would resurrect its
+    // cooldown, ineligible stamp and strings under a fresh writtenMs.
+    for (const label of Object.keys(merged)) {
+      if (
+        (merged[label].writtenMs ?? 0) <
+        (diskSharedAccounts[label]?.lastUsedMs ?? 0)
+      ) {
+        delete merged[label];
+      }
+    }
     for (const label of ledger.dirtyLabels) {
       const entry = ledger.accounts[label];
       if (entry === undefined) {
@@ -303,25 +330,38 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
       }
       const disk = merged[label];
       const diskWrittenMs = disk?.writtenMs ?? 0;
+      // Same applicability rule loadLedger uses: the shadow lives while
+      // writtenMs >= shared.lastUsedMs. A dead disk record contributes
+      // nothing — not to max(), not to freshSide.
+      const diskEntry =
+        disk !== undefined &&
+        diskWrittenMs >= (diskSharedAccounts[label]?.lastUsedMs ?? 0)
+          ? disk
+          : undefined;
       const stamp = ledger.overlayStamps?.get(label) ?? 0;
       const freshSide: AccountLedgerEntry =
-        disk !== undefined && diskWrittenMs > stamp ? disk : entry;
+        diskEntry !== undefined && diskWrittenMs > stamp
+          ? diskEntry
+          : entry;
       const ineligibleAtMs = Math.max(
         entry.ineligibleAtMs ?? 0,
-        disk?.ineligibleAtMs ?? 0,
+        diskEntry?.ineligibleAtMs ?? 0,
       );
       merged[label] = {
         cooldownUntilMs: Math.max(
           entry.cooldownUntilMs ?? 0,
-          disk?.cooldownUntilMs ?? 0,
+          diskEntry?.cooldownUntilMs ?? 0,
         ),
-        lastUsedMs: Math.max(entry.lastUsedMs ?? 0, disk?.lastUsedMs ?? 0),
+        lastUsedMs: Math.max(
+          entry.lastUsedMs ?? 0,
+          diskEntry?.lastUsedMs ?? 0,
+        ),
         lastError: freshSide.lastError ?? null,
         ...(ineligibleAtMs > 0 ? { ineligibleAtMs } : {}),
         ...(freshSide.parkedReason !== undefined
           ? { parkedReason: freshSide.parkedReason }
           : {}),
-        writtenMs: Math.max(now, diskWrittenMs),
+        writtenMs: Math.max(now, diskEntry?.writtenMs ?? 0),
       };
       (ledger.overlayStamps ??= new Map()).set(
         label,

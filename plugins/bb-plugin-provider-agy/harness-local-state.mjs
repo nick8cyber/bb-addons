@@ -509,6 +509,172 @@ check(
   );
 }
 
+// A20: the blocker case — a save after the shadow was lifted must not
+// resurrect the label: the dead disk record (writtenMs behind the shared
+// lastUsedMs) contributes nothing to max(), freshSide or writtenMs.
+{
+  const res = mkdtempSync(join(tmpdir(), "agy-localstate-resurr-"));
+  mkdirSync(join(res, "accounts", "a1"), { recursive: true });
+  const T = Date.now();
+  writeJson(join(res, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: T, lastError: null },
+    },
+  });
+  writeJson(join(res, "accounts-overlay.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: T + 3_600_000, lastUsedMs: 0,
+        lastError: "dead 429", parkedReason: "auth-dead",
+        ineligibleAtMs: 555, writtenMs: T - 1_000, // shadow lifted
+      },
+    },
+  });
+  const l = loadLedger(res); // dead shadow does not apply
+  markAccountUse(l, "a1"); // dirties the label -> overlay rewrite
+  saveLedger(res, l);
+  const ov = readJson(join(res, "accounts-overlay.json"))?.accounts?.a1;
+  const after = loadLedger(res).accounts.a1;
+  check(
+    "localstate/save-after-shadow-lift-no-resurrect",
+    (ov?.cooldownUntilMs ?? Infinity) <= T &&
+      (ov?.ineligibleAtMs ?? undefined) === undefined &&
+      ov?.parkedReason === undefined &&
+      ov?.lastError === null &&
+      (after?.cooldownUntilMs ?? Infinity) <= T &&
+      (after?.ineligibleAtMs ?? undefined) === undefined &&
+      after?.parkedReason === undefined,
+    JSON.stringify({ ov, after }),
+  );
+}
+
+// A21: shadowed-vs-stamp for strings — a neighbour overlay record with
+// writtenMs > our stamp but still < shared.lastUsedMs is dead: it must
+// not win parkedReason/lastError through freshSide. markAccountUse does
+// not re-stamp, so stamp stays behind the neighbour's writtenMs.
+{
+  const sv = mkdtempSync(join(tmpdir(), "agy-localstate-shadowstamp-"));
+  mkdirSync(join(sv, "accounts", "a1"), { recursive: true });
+  const T = Date.now();
+  writeJson(join(sv, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: T, lastError: "shared" },
+    },
+  });
+  writeJson(join(sv, "accounts-overlay.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: 0, lastUsedMs: 0,
+        lastError: "old-shadow", writtenMs: T - 500, // dead at load
+      },
+    },
+  });
+  const l = loadLedger(sv); // stamp = T-500; a1 resolves to the shared row
+  // A neighbour writes a fresher record — still dead against shared.
+  writeJson(join(sv, "accounts-overlay.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: T + 9_000, lastUsedMs: 0,
+        lastError: "neighbour", parkedReason: "auth-dead",
+        writtenMs: T - 300, // > our stamp, still < shared.lastUsedMs
+      },
+    },
+  });
+  markAccountUse(l, "a1"); // numeric only — stamp stays T-500
+  saveLedger(sv, l);
+  const a1 = readJson(join(sv, "accounts-overlay.json"))?.accounts?.a1;
+  check(
+    "localstate/dead-shadow-yields-no-strings",
+    a1?.lastError === "shared" &&
+      a1?.parkedReason === undefined &&
+      (a1?.cooldownUntilMs ?? Infinity) <= T &&
+      (a1?.ineligibleAtMs ?? undefined) === undefined,
+    JSON.stringify(a1),
+  );
+}
+
+// A22: markAccountIneligible without parkedReason mutates only numbers —
+// it must NOT bump stampStrings, so a neighbour's fresher overlay record
+// still wins the string fields on save.
+{
+  const st = mkdtempSync(join(tmpdir(), "agy-localstate-stamp-"));
+  mkdirSync(join(st, "accounts", "a1"), { recursive: true });
+  writeJson(join(st, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(st, "accounts-overlay.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: 0, lastUsedMs: 0,
+        lastError: "v0", writtenMs: 100,
+      },
+    },
+  });
+  const l = loadLedger(st); // stamp = 100
+  writeJson(join(st, "accounts-overlay.json"), {
+    accounts: {
+      a1: {
+        cooldownUntilMs: 0, lastUsedMs: 0,
+        lastError: "neighbour", parkedReason: "auth-dead",
+        writtenMs: Date.now(), // live, and fresher than our stamp
+      },
+    },
+  });
+  markAccountIneligible(l, "a1"); // numbers only — stamp must stay 100
+  saveLedger(st, l);
+  const a1 = readJson(join(st, "accounts-overlay.json"))?.accounts?.a1;
+  check(
+    "localstate/ineligible-no-reason-keeps-stamp",
+    a1?.lastError === "neighbour" &&
+      a1?.parkedReason === "auth-dead" &&
+      (a1?.ineligibleAtMs ?? 0) > 0,
+    JSON.stringify(a1),
+  );
+}
+
+// A23: prototype-named and traversal labels are ghosts — "constructor"
+// passes an `in` check via the prototype chain, and "../evil" resolves
+// outside accounts/ so existsSync alone would bless it; both must be
+// dropped from the overlay and kept out of the shared write.
+{
+  const gh = mkdtempSync(join(tmpdir(), "agy-localstate-ghostname-"));
+  mkdirSync(join(gh, "accounts", "a1"), { recursive: true });
+  mkdirSync(join(gh, "evil"), { recursive: true }); // ../evil target exists
+  writeJson(join(gh, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(gh, "accounts-overlay.json"), {
+    accounts: {
+      constructor: {
+        cooldownUntilMs: 5, lastUsedMs: 0,
+        lastError: "proto", writtenMs: Date.now(),
+      },
+      "../evil": {
+        cooldownUntilMs: 5, lastUsedMs: 0,
+        lastError: "trav", writtenMs: Date.now(),
+      },
+    },
+  });
+  const l = loadLedger(gh);
+  markAccountCooldown(l, "a1", Date.now() + 5_000, "touch");
+  saveLedger(gh, l);
+  const ov = readJson(join(gh, "accounts-overlay.json"))?.accounts ?? {};
+  const sh = readJson(join(gh, "accounts-state.json"))?.accounts ?? {};
+  check(
+    "localstate/proto-and-traversal-labels-are-ghosts",
+    !Object.hasOwn(ov, "constructor") &&
+      !Object.hasOwn(ov, "../evil") &&
+      !Object.hasOwn(sh, "constructor") &&
+      !Object.hasOwn(sh, "../evil") &&
+      ov.a1 !== undefined,
+    JSON.stringify({ ov: Object.keys(ov), sh: Object.keys(sh) }),
+  );
+}
+
 // ===========================================================================
 // Part B — end-to-end on the built bridge, once per transport.
 // ===========================================================================
