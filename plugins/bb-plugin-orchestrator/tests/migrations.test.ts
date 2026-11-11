@@ -155,16 +155,18 @@ test("the r23 migration adds round/result/merge columns to an existing db", () =
   assert.equal(row.continue_from, null);
 });
 
-test("the r24/25 migrations apply on a base that recorded main's 0–14", async () => {
-  // The live plugin DB recorded main's MIGRATIONS[0..14] — #14 is
-  // `explicit_route`. The §16.5 columns and the legacy UPDATE are #15/#16
-  // and must come AFTER, or the SDK's statement-hash check aborts the
-  // plugin at startup (PLUG-190).
+test("the r24/25 migrations apply on a base that recorded main's 0–15", async () => {
+  // The live plugin DB recorded main's MIGRATIONS[0..15] — #14 is
+  // `explicit_route`, #15 is `publish_branch` (§16.6, PLUG-191). The
+  // §16.5 columns and the legacy UPDATE are #16/#17 and must come AFTER,
+  // or the SDK's statement-hash check aborts the plugin at startup
+  // (PLUG-190, re-checked PLUG-196).
   const { createHash } = await import("node:crypto");
   const hash = (s: string) => createHash("sha256").update(s).digest("hex");
   assert.match(MIGRATIONS[14]!, /explicit_route/, "migration 14 is main's explicit_route");
-  assert.match(MIGRATIONS[15]!, /result_notified_at/, "the §16.5 columns come after");
-  assert.match(MIGRATIONS[16]!, /result_notice = 'legacy'/, "the legacy UPDATE is last");
+  assert.match(MIGRATIONS[15]!, /publish_branch/, "migration 15 is main's publish_branch");
+  assert.match(MIGRATIONS[16]!, /result_notified_at/, "the §16.5 columns come after");
+  assert.match(MIGRATIONS[17]!, /result_notice = 'legacy'/, "the legacy UPDATE is last");
 
   const db = new Database(":memory:");
   db.exec(
@@ -196,8 +198,8 @@ test("the r24/25 migrations apply on a base that recorded main's 0–14", async 
       });
     })();
   };
-  // The base recorded main's list — our 0–14 are byte-identical to it.
-  migrate(MIGRATIONS.slice(0, 15));
+  // The base recorded main's list — our 0–15 are byte-identical to it.
+  migrate(MIGRATIONS.slice(0, 16));
   db.prepare(
     `INSERT INTO delegations (
       task_key, coordinator_thread_id, level, route, preset, provider,

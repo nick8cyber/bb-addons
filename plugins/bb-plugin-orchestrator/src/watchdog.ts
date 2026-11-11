@@ -1424,6 +1424,17 @@ export function createWatchdog(deps: WatchdogDeps) {
    */
   const silentStopWake = async (row: DelegationRow, turnSeq: number) => {
     let confirmed = false;
+    // §16.2 (spec 560588a): the thread's own auto-retry rows go BEFORE
+    // the silent stop — an uncancelled retry would lift the rogue turn
+    // back; a failed cancel is an unconfirmed stop retried next pass.
+    const cancelled = await ensureRetryCancelled(row);
+    if (cancelled !== true) {
+      log.warn?.(
+        `orchestrator: tracker-wake stop of ${row.thread_id} ` +
+          `unconfirmed — auto-retry cancel: ${cancelled}`,
+      );
+      return;
+    }
     try {
       await deps.threads.stop({ threadId: row.thread_id! });
       const t = await getThread(row.thread_id!).catch(() => null);
@@ -1466,7 +1477,10 @@ export function createWatchdog(deps: WatchdogDeps) {
    * unsupervised. All-requests-tracker → silent stop, status stands,
    * cursor consumed. Any other request — or none at all (an
    * unattributed turn such as an auto-retry resume) — → the general
-   * rule: superseded/newer → suppress, otherwise revive.
+   * rule: superseded/newer → suppress, otherwise revive. A full window
+   * is read on — the "all requests are tracker" verdict needs EVERY
+   * request after `last_seq`, so the scan keeps paging (pages ≤100,
+   * §5.1 rev 18) until the journal tail is reached (PLUG-196).
    */
   type WakeVerdict =
     | "none"
@@ -1477,15 +1491,33 @@ export function createWatchdog(deps: WatchdogDeps) {
   const scanTerminalWake = async (
     row: DelegationRow,
   ): Promise<WakeVerdict> => {
-    let events: WatchdogThreadEvent[];
+    const events: WatchdogThreadEvent[] = [];
     try {
-      events = await deps.threads.events.list({
-        threadId: row.thread_id!,
-        afterSeq: String(row.last_seq ?? 0),
-        order: "asc",
-        limit: "50",
-        types: ["turn/started", "client/turn/requested"],
-      });
+      let after = row.last_seq ?? 0;
+      let tailReached = false;
+      for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+        const chunk = await deps.threads.events.list({
+          threadId: row.thread_id!,
+          afterSeq: String(after),
+          order: "asc",
+          limit: "50",
+          types: ["turn/started", "client/turn/requested"],
+        });
+        events.push(...chunk);
+        if (chunk.length < 50) {
+          tailReached = true;
+          break;
+        }
+        after = Math.max(...chunk.map((e) => e.seq));
+      }
+      if (!tailReached) {
+        // Page cap hit with a full last page — the tail is unread, the
+        // all-tracker verdict would be unproven. Defer to a later pass.
+        log.warn?.(
+          `orchestrator: revive check ${row.thread_id}: page cap reached`,
+        );
+        return "unreadable";
+      }
     } catch (e) {
       log.warn?.(
         `orchestrator: revive check ${row.thread_id}: ${message(e)}`,

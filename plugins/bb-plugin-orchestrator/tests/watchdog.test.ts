@@ -3325,10 +3325,11 @@ test("PLUG-184 B2: a tracker comment waking an OLD round → silent stop, no lin
   await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
   const fresh = h.store.get(old.id)!;
   assert.equal(fresh.status, "done");
-  // §16.2 r25: a tracker-only wake is a notification, not a rogue turn —
-  // stopped quietly; the queued retry fires later and is judged then.
+  // §16.2 r25 (spec 560588a): a tracker-only wake is a notification,
+  // not a rogue turn — its own auto-retry is cancelled BEFORE the
+  // silent stop, else the queued retry would lift it back.
+  assert.deepEqual(h.retryCancels, ["thr_e1"]);
   assert.deepEqual(h.stops, ["thr_e1"]);
-  assert.deepEqual(h.retryCancels, []);
   assert.equal(fresh.last_seq, 7);
   assert.equal(
     h.sends.filter((x) => x.threadId === "thr_coord").length,
@@ -3872,6 +3873,120 @@ test("PLUG-193 #1: an all-tracker batch → one silent stop, cursor consumed", a
     0,
     "a tracker wake never reaches the coordinator",
   );
+});
+
+test("PLUG-196 #2: silent stop cancels the auto-retry BEFORE threads.stop", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.retryPendingRows.set("thr_e1", [{}]);
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: ping" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  // Spec 560588a §16.2: an uncancelled queued retry would lift the
+  // rogue turn back — the cancel goes first, the stop after.
+  const cancelAt = h.ops.indexOf("retry-cancel:thr_e1");
+  const stopAt = h.ops.indexOf("stop:thr_e1");
+  assert.ok(cancelAt >= 0, "the queued auto-retry is cancelled");
+  assert.ok(stopAt > cancelAt, "threads.stop runs after the cancel");
+  assert.equal(h.store.get(row.id)!.last_seq, 7);
+  assert.equal(h.sends.length, 0);
+});
+
+test("PLUG-196 #2: a failed auto-retry cancel keeps the wake unconfirmed", async () => {
+  const h = makeHarness({ retryCancelFails: 1 });
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.retryPendingRows.set("thr_e1", [{}]);
+  const wake = () => [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: ping" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ];
+  h.eventLog.set("thr_e1", wake());
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  // Cancel failed → the stop is unconfirmed: no stop call, the cursor
+  // stays so the next pass retries the whole silent-stop path.
+  assert.deepEqual(h.stops, []);
+  assert.equal(h.store.get(row.id)!.last_seq, 5);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  assert.deepEqual(h.stops, ["thr_e1"], "the retry pass stops it");
+  assert.equal(h.store.get(row.id)!.last_seq, 7);
+});
+
+test("PLUG-196 #3: the all-tracker verdict reads past a full window", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // 26 tracker wakes fill the first 50-event window; the coordinator's
+  // tell sits just past it — judging by the window alone would silent-
+  // stop a genuinely woken executor.
+  const log: WatchdogThreadEvent[] = [];
+  for (let i = 0; i < 26; i++) {
+    log.push(
+      ev(2 * i + 1, "client/turn/requested", T0 + i * 200, {
+        input: [
+          { text: `New comment on task PLUG-1 from thr_x: n${i}` },
+        ],
+      }),
+      ev(2 * i + 2, "turn/started", T0 + i * 200 + 100),
+    );
+  }
+  log.push(
+    ev(53, "client/turn/requested", T0 + 6000, {
+      input: [{ text: "[bb message from thread:thr_coord] доделай" }],
+    }),
+    ev(54, "turn/started", T0 + 6100),
+  );
+  h.eventLog.set("thr_e1", log);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 54 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running", "a request past the window revives");
+  assert.equal(fresh.revived_count, 1);
+  assert.deepEqual(h.stops, [], "no silent stop on a genuine wake");
+});
+
+test("PLUG-196 #3: a full all-tracker flood still stops silently", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  // 27 tracker wakes = 54 events — the verdict needs the second page.
+  const log: WatchdogThreadEvent[] = [];
+  for (let i = 0; i < 27; i++) {
+    log.push(
+      ev(2 * i + 1, "client/turn/requested", T0 + i * 200, {
+        input: [
+          { text: `New comment on task PLUG-1 from thr_x: n${i}` },
+        ],
+      }),
+      ev(2 * i + 2, "turn/started", T0 + i * 200 + 100),
+    );
+  }
+  h.eventLog.set("thr_e1", log);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 54 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.revived_count, 0);
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  assert.equal(fresh.last_seq, 54, "the whole flood is consumed");
+  assert.equal(h.sends.length, 0);
 });
 
 test("PLUG-193 #2: stalled + tracker wake → silent stop, no false suppression line", async () => {
