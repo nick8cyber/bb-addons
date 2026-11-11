@@ -36,8 +36,9 @@ function capPx(win: Window): number {
 }
 
 let queueObserver: ((queue: Element) => void) | undefined;
+const pendingRetry = new WeakSet<Element>();
 
-function enforce(form: Element, win: Window): void {
+export function enforce(form: Element, win: Window, retry = true): void {
   const scroll = form.querySelector(EDITOR_SCROLL) as HTMLElement | null;
   if (!scroll) return;
   const cap = capPx(win);
@@ -47,7 +48,10 @@ function enforce(form: Element, win: Window): void {
     null) as HTMLElement | null;
   if (queue) {
     queueObserver?.(queue);
-    const rows = queue.querySelectorAll(QUEUE_ITEM);
+    const rows = Array.from(queue.querySelectorAll(QUEUE_ITEM));
+    /* Row text (markdown/async content) grows after mount; watching each row
+       and re-measuring once on a timer keeps the clamp from freezing small. */
+    rows.forEach((r) => queueObserver?.(r));
     const frame = queue.closest(QUEUE_FRAME) as HTMLElement | null;
     /* A collapsed panel stays mounted with a zero-height viewport — clamping it
        would resurrect it; an empty one has nothing to bound. */
@@ -67,6 +71,13 @@ function enforce(form: Element, win: Window): void {
       );
       queue.style.maxHeight = `${queueMax}px`;
       if (frame) frame.style.maxHeight = `${queueMax + Math.ceil(padY(frame))}px`;
+      if (retry && !pendingRetry.has(form)) {
+        pendingRetry.add(form);
+        setTimeout(() => {
+          pendingRetry.delete(form);
+          if (form.isConnected) enforce(form, win, false);
+        }, 300);
+      }
     }
   }
   const formH = form.getBoundingClientRect().height;
@@ -110,7 +121,12 @@ export function mountComposerCap(
     : null;
   queueObserver = (queue) => ro?.observe(queue);
   const mo = new MutationObserver(rescan);
-  mo.observe(doc.documentElement, { subtree: true, childList: true });
+  mo.observe(doc.documentElement, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    attributeFilter: ["aria-hidden", "inert"],
+  });
   win.addEventListener("resize", rescan);
   rescan();
   let disposed = false;
