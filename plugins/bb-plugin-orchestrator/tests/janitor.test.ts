@@ -2976,3 +2976,138 @@ test("a process entering the copy between the snapshot and the archive keeps it 
   assert.deepEqual(w.archivedCalls, []);
   assert.equal(w.janitor.item(env.id)!.reason, "process-inside");
 });
+
+test("Q1: after reflog expiry «A + revert A» still keeps the copy — ancestors count (PLUG-198)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "a.txt", "feat: A");
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  git(env.path, ["revert", "--no-edit", "HEAD"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  // while the reflog still names A the verdict is already «брошено»
+  let res = await w.jan.run();
+  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  // `gc.reflogExpire` (90d) erases every position — A is reachable
+  // only as an ancestor of the tip; it must still block removal
+  git(env.path, ["reflog", "expire", "--expire=now", "--all"]);
+  // the «reported» row drops firstSeenAt — the afterMerge streak is
+  // re-measured before the next verdict
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.removedBranches, 0);
+  git(repo, ["rev-parse", "--verify", env.branchName]);
+  assert.ok(git(env.path, ["rev-list", "HEAD"]).includes(a));
+});
+
+test("Q2: a copy-less bb/ branch without a reflog — «A + revert A» is not deleted (PLUG-198)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(repo, "o.txt"), "unpushed\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: A"]);
+  git(repo, ["revert", "--no-edit", "HEAD"]);
+  git(repo, ["checkout", "main"]);
+  // no reflog at all — the tip itself must stand in as a position
+  git(repo, ["reflog", "expire", "--expire=now", "refs/heads/bb/o"]);
+  rmSync(join(repo, ".git", "logs", "refs", "heads", "bb", "o"), {
+    force: true,
+  });
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-unpushed"], 1);
+  git(repo, ["rev-parse", "--verify", "bb/o"]);
+});
+
+test("Q3: commits pulled --ff-only from a third clone keep the copy (PLUG-198)", async () => {
+  const { repo, base, origin } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  // a third clone holds X1 + «revert X1»; the copy fast-forwards to it —
+  // the HEAD reflog records only the landing tip, X1 is never a
+  // position, only an ancestor
+  const clone = join(base, "clone3");
+  execFileSync("git", ["clone", "-q", origin, clone]);
+  git(clone, ["config", "user.name", "Agent"]);
+  git(clone, ["config", "user.email", "agent@x.io"]);
+  // bare origin's HEAD is not main — the clone checks nothing out;
+  // base the work on the fetched origin/main so ff is possible
+  git(clone, ["checkout", "-b", "main", "origin/main"]);
+  const cbranch = git(clone, ["symbolic-ref", "--short", "-q", "HEAD"]);
+  commitIn(clone, "x.txt", "feat: X1");
+  const x1 = git(clone, ["rev-parse", "HEAD"]);
+  git(clone, ["revert", "--no-edit", "HEAD"]);
+  git(env.path, ["pull", "--ff-only", clone, cbranch]);
+  rmSync(clone, { recursive: true, force: true });
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  // X1 lives only on bb/a — the branch must stay too
+  assert.equal(res.removedBranches, 0);
+  assert.ok(git(env.path, ["rev-list", env.branchName]).includes(x1));
+});
+
+test("Q4: an empty commit has no content — the copy stays (PLUG-198)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  git(env.path, ["commit", "--allow-empty", "-m", "chore: empty"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: clock.t }, env.id)] },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  // an empty commit merges clean («влита»), but it is no content of
+  // its own — «ничего не теряется» keeps the copy
+  assert.equal(res.kept["unpushed-commits"], 1);
+});

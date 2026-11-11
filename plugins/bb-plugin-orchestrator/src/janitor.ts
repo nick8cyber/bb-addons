@@ -25,9 +25,11 @@
  * теряется»: every commit the copy's HEAD or its branch ever pointed
  * at (the whole `git log -g`) is an ancestor of a remote target,
  * patch-equivalent to a commit on it, or carries content already on a
- * target — the `merge-tree` sign checked for EACH reflog commit itself
- * (PLUG-197: «A + revert A» nets to origin, but A's content never
- * reached it — such a copy stays). One that is neither
+ * target — the `merge-tree` sign checked for EACH commit the reflogs
+ * and tips reach beyond origin (PLUG-197: «A + revert A» nets to
+ * origin, but A's content never reached it; PLUG-198: ancestors count
+ * too — a reflog may have lost the position while the commit stays
+ * reachable — such a copy stays). One that is neither
  * (a `reset`-orphaned or detached commit, an unpublished pre-amend
  * version) keeps the copy (`unpushed-commits`), or reports it once
  * abandoned. The rule is re-run immediately before archiving, and for
@@ -480,6 +482,44 @@ export function createJanitor(deps: JanitorDeps) {
     return Number(n) || 0;
   };
 
+  const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+  /**
+   * §16.3 «ничего не теряется»: an empty commit (`--allow-empty` —
+   * its tree equals a parent's, or the empty tree at the root) has no
+   * content of its own, so the content sign must never clear it: such
+   * a commit is safe only as an origin ancestor or by patch-id —
+   * otherwise work that exists solely as a commit message would
+   * vanish with the ref (PLUG-198). An unproven answer counts as
+   * non-empty — the content check then decides on its own.
+   */
+  const commitContentless = async (
+    repoRoot: string,
+    sha: string,
+  ): Promise<boolean> => {
+    const line = (
+      await gitOut(deps.cmd, repoRoot, [
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        sha,
+      ])
+    )?.trim();
+    const tree = (
+      await gitOut(deps.cmd, repoRoot, ["rev-parse", `${sha}^{tree}`])
+    )?.trim();
+    if (!line || !tree) return false;
+    const parents = line.split(/\s+/).slice(1);
+    for (const p of parents.length ? parents : [EMPTY_TREE]) {
+      const pt = (
+        await gitOut(deps.cmd, repoRoot, ["rev-parse", `${p}^{tree}`])
+      )?.trim();
+      if (pt && pt === tree) return true;
+    }
+    return false;
+  };
+
   /**
    * §16.3 «влита», the content sign: `git merge-tree --write-tree
    * <target> <sha>` reproducing `<target>^{tree}` proves merging <sha>
@@ -568,10 +608,16 @@ export function createJanitor(deps: JanitorDeps) {
   /**
    * §16.3 (ревизия 25) «ничего не теряется»: every commit the given
    * reflogs (`git log -g --format=%H <ref>`, whole history) ever
-   * pointed at must be safe — an ancestor of a remote target,
-   * patch-equivalent to a commit on it, or carrying content already on
-   * a target. The content sign is checked for EACH pending commit
-   * itself (PLUG-197): `merge-tree --write-tree <target> <sha>`
+   * pointed at — plus the tips themselves — and every ancestor of
+   * those positions not on origin must be safe: an ancestor of a
+   * remote target, patch-equivalent to a commit on it, or carrying
+   * content already on a target. Ancestors are checked too (PLUG-198):
+   * a reflog may lose a position (`reflog expire`, `pull --ff-only`
+   * records only the landing tip, a ref with no reflog) while the
+   * commit stays reachable — «A + revert A» then leaves A, whose
+   * content never reached origin, visible only as an ancestor. The
+   * content sign is checked for EACH pending commit itself (PLUG-197):
+   * `merge-tree --write-tree <target> <sha>`
    * reproducing `<target>^{tree}` proves THIS commit's content is on
    * origin. A whole-tip check cannot clear the middle commits — «A +
    * revert A» nets to origin while A's content never reached it, and a
@@ -602,9 +648,27 @@ export function createJanitor(deps: JanitorDeps) {
         const s = l.trim();
         if (s) shas.add(s);
       }
+      // The tip is a position of its own (PLUG-198): its reflog entry
+      // may be gone — expired by `git gc` (`gc.reflogExpire`), never
+      // recorded (`pull --ff-only` logs only the landing position), or
+      // the ref may have no reflog at all — while every ancestor it
+      // reaches must still be proven safe.
+      const tip = (
+        await gitOut(deps.cmd, cwd, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          ref,
+        ])
+      )?.trim();
+      if (!tip) return "unknown";
+      shas.add(tip);
     }
-    // Positions already reachable from a target are proven published —
-    // drop them in one rev-list pass, then check the remainder.
+    // Every commit reachable from the positions but not from a remote
+    // target must prove itself — not just the positions themselves
+    // (PLUG-198): «A + revert A» nets to origin while A, an ancestor
+    // that was never a position (or no longer is, after
+    // `reflog expire`), carried content origin never saw.
     const pending = new Set<string>();
     const list = [...shas];
     for (let i = 0; i < list.length; i += 200) {
@@ -617,7 +681,7 @@ export function createJanitor(deps: JanitorDeps) {
       if (out === null) return "unknown";
       for (const l of out.split("\n")) {
         const s = l.trim();
-        if (s && shas.has(s)) pending.add(s);
+        if (s) pending.add(s);
       }
     }
     if (!pending.size) return "ok";
@@ -650,6 +714,10 @@ export function createJanitor(deps: JanitorDeps) {
     };
     for (const sha of pending) {
       if (await patchEquivalent(repoRoot, sha, targets)) continue;
+      // §16.3: an empty commit (`--allow-empty`) has no content to find
+      // on a target — safe only by ancestry (already excluded) or by
+      // patch-id (PLUG-198).
+      if (await commitContentless(repoRoot, sha)) return "lost";
       let own = false;
       for (const t of targets) {
         if (await ownContentOn(t, sha)) {
