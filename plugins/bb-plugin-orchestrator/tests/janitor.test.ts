@@ -77,6 +77,9 @@ interface ThreadSpec {
   sourceThreadId?: string | null;
   originPluginId?: string | null;
   visibility?: string | null;
+  /** §16.4 r29: soft-deleted threads may still be reported — set
+   * `deletedAt` counts as not-live. */
+  deletedAt?: number | null;
 }
 
 const CFG = (over: Record<string, unknown> = {}) =>
@@ -1443,9 +1446,15 @@ test("archived executor with a dirty copy gets a rescue ref + coordinator line",
   const env = addEnv(repo, base, "a");
   writeFileSync(join(env.path, "f.txt"), "dirty\n"); // modified tracked
   writeFileSync(join(env.path, "new.txt"), "untracked\n"); // untracked
+  // §16.4 r29: a LIVE sibling thread would keep the shared env — the
+  // env is retiring only once every thread of it is archived/deleted.
   const w = makeWorld({
     envs: [env],
-    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    threads: {
+      [env.id]: [
+        { ...idle({ t: Date.now() }, env.id), archivedAt: Date.now() },
+      ],
+    },
   });
   await w.jan.onThreadArchived({
     id: "thr_w",
@@ -1486,7 +1495,11 @@ test("rescue restore command is shell-quoted — a space in the path still runs 
   writeFileSync(join(env.path, "f.txt"), "dirty\n");
   const w = makeWorld({
     envs: [env],
-    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    threads: {
+      [env.id]: [
+        { ...idle({ t: Date.now() }, env.id), archivedAt: Date.now() },
+      ],
+    },
   });
   await w.jan.onThreadArchived({
     id: "thr_w",
@@ -1515,7 +1528,11 @@ test("rescue with only untracked files still restores them via stash apply", asy
   writeFileSync(join(env.path, "notes.txt"), "draft\n");
   const w = makeWorld({
     envs: [env],
-    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    threads: {
+      [env.id]: [
+        { ...idle({ t: Date.now() }, env.id), archivedAt: Date.now() },
+      ],
+    },
   });
   await w.jan.onThreadArchived({
     id: "thr_u",
@@ -2062,6 +2079,357 @@ test("an incomplete or failed rescue tells the coordinator (PLUG-185 M7)", async
   );
   assert.equal(w2.sent.length, 1);
   assert.match(w2.sent[0]!.text, /НЕ удался/);
+});
+
+// ── §16.4 r29: rescue on thread.deleted ──────────────────────────────
+
+test("deleted executor with a dirty copy gets a rescue ref + «удалён» line", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const w = makeWorld({ envs: [env], threads: {} });
+  await w.jan.onThreadDeleted({
+    id: "thr_d",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_d"]);
+  assert.equal(w.sent.length, 1);
+  assert.match(w.sent[0]!.text, /удалён с несохранённой работой/);
+  assert.doesNotMatch(w.sent[0]!.text, /заархивирован/);
+});
+
+test("archive → delete без правок: один ref, одна строка; с правкой: <id>-2 и <repo>-rescue-<id>-2", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const w = makeWorld({ envs: [env], threads: {} });
+  const ev = {
+    id: "thr_x",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  };
+  await w.jan.onThreadArchived(ev);
+  await w.jan.onThreadDeleted(ev);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_x"]);
+  assert.throws(() =>
+    git(repo, [
+      "rev-parse",
+      "--verify",
+      "refs/orchestrator/rescue/thr_x-2",
+    ]),
+  );
+  assert.equal(w.sent.length, 1);
+  assert.match(w.sent[0]!.text, /заархивирован/);
+  // an edit between archive and delete → a second snapshot <id>-2
+  writeFileSync(join(env.path, "f.txt"), "dirtier\n");
+  writeFileSync(join(env.path, "m.txt"), "more\n");
+  await w.jan.onThreadDeleted(ev);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_x-2"]);
+  assert.equal(w.sent.length, 2);
+  assert.match(w.sent[1]!.text, /удалён с несохранённой работой/);
+  assert.match(w.sent[1]!.text, /refs\/orchestrator\/rescue\/thr_x-2/);
+  // the restore directory carries -2 so it cannot collide with a
+  // first snapshot already restored
+  assert.match(w.sent[1]!.text, /-rescue-thr_x-2'/);
+});
+
+test("archive and delete racing → one ref, one line (per-thread queue)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const w = makeWorld({ envs: [env], threads: {} });
+  const ev = {
+    id: "thr_r",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  };
+  await Promise.all([
+    w.jan.onThreadArchived(ev),
+    w.jan.onThreadDeleted(ev),
+    w.jan.onThreadDeleted(ev),
+  ]);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_r"]);
+  assert.throws(() =>
+    git(repo, [
+      "rev-parse",
+      "--verify",
+      "refs/orchestrator/rescue/thr_r-2",
+    ]),
+  );
+  assert.equal(w.sent.length, 1);
+});
+
+test("delete: silence on a shared env and a gone copy; foreign thread and clean copy do nothing", async () => {
+  const { repo, base } = makeRepo();
+  const shared = addEnv(repo, base, "s");
+  writeFileSync(join(shared.path, "f.txt"), "dirty\n");
+  const gone = addEnv(repo, base, "g");
+  git(repo, ["worktree", "remove", "--force", gone.path]);
+  const clean = addEnv(repo, base, "c");
+  const t = Date.now();
+  const w = makeWorld({
+    envs: [shared, gone, clean],
+    threads: {
+      [shared.id]: [
+        {
+          id: "thr_del",
+          status: "idle",
+          archivedAt: null,
+          deletedAt: t,
+          updatedAt: t,
+          parentThreadId: "thr_coord",
+        },
+        // another LIVE thread of the env — BB keeps a shared env,
+        // so nothing is rescued
+        { ...idle({ t }, shared.id), id: "thr_sib" },
+      ],
+    },
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_del",
+    environmentId: shared.id,
+    parentThreadId: "thr_coord",
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_g", // BB already freed the copy — journal only
+    environmentId: gone.id,
+    parentThreadId: "thr_coord",
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_root", // root chat — not an executor
+    environmentId: clean.id,
+    parentThreadId: null,
+    originPluginId: null,
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_c", // clean copy — nothing to save
+    environmentId: clean.id,
+    parentThreadId: "thr_coord",
+  });
+  for (const id of ["thr_del", "thr_g", "thr_root", "thr_c"]) {
+    assert.throws(() =>
+      git(repo, ["rev-parse", "--verify", `refs/orchestrator/rescue/${id}`]),
+    );
+  }
+  assert.equal(w.sent.length, 0);
+});
+
+test("archive of an active-phase env still rescues; an unproven thread list still rescues (r29 п.2)", async () => {
+  const { repo, base } = makeRepo();
+  // phase=active at the event — the turn may still run; rescue anyway
+  const active = addEnv(repo, base, "a", {
+    lifecycle: { phase: "active" },
+  });
+  writeFileSync(join(active.path, "f.txt"), "dirty\n");
+  const t = Date.now();
+  const w = makeWorld({
+    envs: [active],
+    threads: {
+      [active.id]: [
+        {
+          id: "thr_a",
+          status: "active",
+          archivedAt: t,
+          updatedAt: t,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+  });
+  await w.jan.onThreadArchived({
+    id: "thr_a",
+    environmentId: active.id,
+    parentThreadId: "thr_coord",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_a"]);
+  assert.equal(w.sent.length, 1);
+  // «поля нет или ответ непонятен — спасать»: the env-thread list is
+  // unproven, so the rescue runs rather than staying silent
+  const env2 = addEnv(repo, base, "u");
+  writeFileSync(join(env2.path, "f.txt"), "dirty\n");
+  const w2 = makeWorld({
+    envs: [env2],
+    threads: {},
+    onThreadListCall: () => {
+      throw new Error("list broken");
+    },
+  });
+  await w2.jan.onThreadDeleted({
+    id: "thr_u",
+    environmentId: env2.id,
+    parentThreadId: "thr_coord",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_u"]);
+  assert.equal(w2.sent.length, 1);
+});
+
+test("rescue ledger: every attempt recorded + `janitor report` shows it; deleted coordinator → journal + notified=0", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const t = Date.now();
+  const w = makeWorld({
+    envs: [env],
+    threads: {},
+    extraThreads: [
+      {
+        id: "thr_coord",
+        status: "idle",
+        archivedAt: null,
+        updatedAt: t,
+        environmentId: null,
+        parentThreadId: null,
+      },
+    ],
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_r",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  const ref = "refs/orchestrator/rescue/thr_r";
+  git(repo, ["rev-parse", "--verify", ref]);
+  const rows = w.janitor.rescues();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.thread_id, "thr_r");
+  assert.equal(rows[0]!.ref, ref);
+  assert.equal(rows[0]!.reason, "удалён");
+  assert.equal(rows[0]!.notified, 1);
+  assert.ok(rows[0]!.repo_root);
+  assert.equal(rows[0]!.error, null);
+  const rep = await w.jan.report();
+  assert.equal(rep.rescues.length, 1);
+  assert.equal(rep.rescues[0]!.ref, ref);
+  // coordinator deleted by the same cascade → warn + notified=0, the
+  // saved ref stays findable in the ledger
+  const env2 = addEnv(repo, base, "b");
+  writeFileSync(join(env2.path, "f.txt"), "dirty\n");
+  const w2 = makeWorld({ envs: [env2], threads: {} });
+  await w2.jan.onThreadDeleted({
+    id: "thr_orph",
+    environmentId: env2.id,
+    parentThreadId: "thr_coord",
+  });
+  const rows2 = w2.janitor.rescues();
+  assert.equal(rows2.length, 1);
+  assert.equal(rows2[0]!.notified, 0);
+  assert.equal(rows2[0]!.ref, "refs/orchestrator/rescue/thr_orph");
+  assert.ok(
+    w2.warns.some(
+      (m) =>
+        m.includes("thr_orph") &&
+        m.includes("thr_coord") &&
+        m.includes("rescue/thr_orph"),
+    ),
+    `expected a deleted-coordinator warn: ${w2.warns.join(" | ")}`,
+  );
+  const rep2 = await w2.jan.report();
+  assert.equal(rep2.rescues.length, 1);
+  assert.equal(rep2.rescues[0]!.notified, 0);
+});
+
+test("a raced ref create: occupied by different content → <id>-2, by identical → silent (r29 п.4)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  // a competitor lands the base ref between our list and update-ref —
+  // with DIFFERENT content, so the snapshot moves to <id>-2
+  const other = git(repo, [
+    "commit-tree",
+    git(repo, ["write-tree"]),
+    "-m",
+    "other",
+  ]);
+  let armed = true;
+  const raceCmd: CmdRunner = {
+    run: async (f, a, o) => {
+      const i = a.indexOf("update-ref");
+      if (
+        armed &&
+        i >= 0 &&
+        a[i + 1] === "refs/orchestrator/rescue/thr_o"
+      ) {
+        armed = false;
+        await realCmd.run("git", [
+          "-C",
+          repo,
+          "update-ref",
+          "refs/orchestrator/rescue/thr_o",
+          other,
+        ]);
+      }
+      return realCmd.run(f, a, o);
+    },
+  };
+  const w = makeWorld({ envs: [env], threads: {}, cmd: raceCmd });
+  await w.jan.onThreadDeleted({
+    id: "thr_o",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  assert.equal(git(repo, ["rev-parse", "refs/orchestrator/rescue/thr_o"]), other);
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_o-2"]);
+  assert.equal(w.sent.length, 1);
+  assert.match(w.sent[0]!.text, /thr_o-2/);
+  // the same race with IDENTICAL content (the competitor saved our
+  // exact snapshot) — treated as done: no -2, no second line
+  const env2 = addEnv(repo, base, "b");
+  writeFileSync(join(env2.path, "f.txt"), "dirty\n");
+  let armed2 = true;
+  const raceCmd2: CmdRunner = {
+    run: async (f, a, o) => {
+      const i = a.indexOf("update-ref");
+      if (
+        armed2 &&
+        i >= 0 &&
+        a[i + 1] === "refs/orchestrator/rescue/thr_s"
+      ) {
+        armed2 = false;
+        await realCmd.run("git", ["-C", repo, "update-ref", a[i + 1]!, a[i + 2]!]);
+      }
+      return realCmd.run(f, a, o);
+    },
+  };
+  const w2 = makeWorld({ envs: [env2], threads: {}, cmd: raceCmd2 });
+  await w2.jan.onThreadDeleted({
+    id: "thr_s",
+    environmentId: env2.id,
+    parentThreadId: "thr_coord",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_s"]);
+  assert.throws(() =>
+    git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_s-2"]),
+  );
+  assert.equal(w2.sent.length, 0);
+});
+
+test("a failed snapshot on delete → «НЕ удался» line carries the step (r29 п.5)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "f");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const failCmd: CmdRunner = {
+    run: async (f, a, o) =>
+      a.includes("stash") ? fail("boom") : realCmd.run(f, a, o),
+  };
+  const w = makeWorld({ envs: [env], threads: {}, cmd: failCmd });
+  await w.jan.onThreadDeleted({
+    id: "thr_f",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  assert.throws(() =>
+    git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_f"]),
+  );
+  assert.equal(w.sent.length, 1);
+  assert.match(
+    w.sent[0]!.text,
+    /удалён с несохранённой работой, снимок НЕ удался \(stash create: /,
+  );
+  const rows = w.janitor.rescues();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.ref, null);
+  assert.match(rows[0]!.error ?? "", /stash create/);
 });
 
 // ── PLUG-188 review fixes ────────────────────────────────────────────
