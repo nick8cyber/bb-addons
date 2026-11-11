@@ -114,13 +114,25 @@ export function enforce(form: Element, win: Window, retry = true): void {
          height is host-budgeted, extra max-height on the scroll just clips.
          Grow every ancestor up to the composer card by the missing delta so
          the space is actually granted. */
+      /* Grow ancestors by the space the child actually lacks: each level
+         needs (child's target) + (its slack for other children), so the
+         delta is not double-counted up the chain — idempotent too. */
       const delta = queueMax - roomBefore;
       if (delta > 1) {
-        let el = (frame ?? queue).parentElement;
+        let needed = queueMax + Math.ceil(padY(frame ?? queue));
+        let child: Element = frame ?? queue;
+        let el = child.parentElement;
         while (el && el !== form && el !== form.ownerDocument.documentElement) {
           const h = el as HTMLElement;
-          h.style.minHeight = `${Math.ceil(h.getBoundingClientRect().height + delta)}px`;
-          grownAncestors.add(h);
+          const slack = h.getBoundingClientRect().height -
+            child.getBoundingClientRect().height;
+          const want = needed + Math.max(0, slack);
+          if (h.getBoundingClientRect().height < want - 1) {
+            h.style.minHeight = `${Math.ceil(want)}px`;
+            grownAncestors.add(h);
+          }
+          needed = want;
+          child = el;
           el = el.parentElement;
         }
       }
