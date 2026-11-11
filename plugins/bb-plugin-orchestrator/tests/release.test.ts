@@ -329,6 +329,9 @@ function makeDeps(repo: string, overrides: Partial<{
   /** §17.3 (мелко 5): the reviewer thread's final output — the verdict
    * fallback when the task carries no verdict comment. */
   reviewThreadOutput: string | null;
+  /** §17.3 (ревью PLUG-214): the executor thread's events — the step-1
+   * check refuses while a turn is in flight. */
+  execEvents: () => unknown[];
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -409,13 +412,15 @@ function makeDeps(repo: string, overrides: Partial<{
       return {};
     },
     events: {
-      list: async () =>
-        overrides.auditVerdict !== undefined
-          ? [{
-              seq: 9, type: "item/completed", createdAt: 1,
-              data: { item: { type: "agentMessage", text: overrides.auditVerdict } },
-            }]
-          : [],
+      list: async (a: { threadId?: string }) =>
+        a?.threadId === "thr_exec" && overrides.execEvents !== undefined
+          ? overrides.execEvents()
+          : overrides.auditVerdict !== undefined
+            ? [{
+                seq: 9, type: "item/completed", createdAt: 1,
+                data: { item: { type: "agentMessage", text: overrides.auditVerdict } },
+              }]
+            : [],
     },
     output: async ({ threadId }: { threadId: string }) =>
       threadId === "thr_rev"
@@ -902,8 +907,12 @@ test("pump: «Источник» line follows threadIds; repeat release on own P
 
 /** A coordinator copy: clone on `main`, task result committed on `work`
  * (the merged_into branch). */
-function makeMergedCoordinatorCopy(): { coord: string; workTip: string } {
-  const { remote } = makeRepo();
+function makeMergedCoordinatorCopy(): {
+  coord: string;
+  workTip: string;
+  seed: string;
+} {
+  const { remote, seed } = makeRepo();
   const base = mkdtempSync(join(tmpdir(), "rel-coord-"));
   const coord = join(base, "coord");
   execFileSync("git", ["clone", "--branch", "main", remote, coord]);
@@ -919,7 +928,7 @@ function makeMergedCoordinatorCopy(): { coord: string; workTip: string } {
   writeFileSync(join(coord, "own.txt"), "own\n");
   gitR(coord, ["add", "."]);
   gitR(coord, ["commit", "-m", "coord own work"]);
-  return { coord, workTip };
+  return { coord, workTip, seed };
 }
 
 test("release (merged): copy restored to original branch+HEAD, lock gone", async () => {
@@ -2005,5 +2014,178 @@ test("PLUG-210 мелко: continuePoint picks by ancestry, not timestamps", asy
   assert.equal(
     await store.continuePoint("PLUG-1", async () => true),
     "e".repeat(40),
+  );
+});
+
+// ── ревью PLUG-214: вершина после проверок, ревью ниже вершины ────────
+
+test("PLUG-214 Б1: a commit landed during project checks → unreviewed-commits", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        // the «оживление после ревью» scenario: while the check runs,
+        // something commits onto the branch behind the pipeline's back
+        checks: ["git commit --allow-empty -m mid-check"],
+      },
+    }),
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "unreviewed-commits" &&
+      /во время проверок/.test((e as OrchestratorError).message),
+  );
+  // refused mid-run — the release row is closed, the audit never ran
+  assert.equal(store.releasesByStatuses(["failed"]).length, 1);
+});
+
+test("PLUG-214 Б1: an in-flight executor turn refuses at step 1", async () => {
+  const { repo } = makeRepo();
+  let events: unknown[] = [
+    { seq: 5, type: "turn/started", createdAt: 2, data: {} },
+    { seq: 4, type: "turn/completed", createdAt: 1, data: {} },
+  ];
+  const { deps } = makeDeps(repo, { execEvents: () => events });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /идёт ход/.test((e as OrchestratorError).message),
+  );
+  // a queued request counts as an active turn too
+  events = [
+    { seq: 6, type: "client/turn/requested", createdAt: 3, data: {} },
+    { seq: 4, type: "turn/completed", createdAt: 1, data: {} },
+  ];
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "release-refused",
+  );
+  // the newest verdict event is a completion — no turn in flight
+  events = [
+    { seq: 7, type: "turn/completed", createdAt: 4, data: {} },
+    { seq: 5, type: "turn/started", createdAt: 2, data: {} },
+  ];
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-214 Б2: merged — a review below the tip counts when only pipeline commits intervene", async () => {
+  const { coord, workTip, seed } = makeMergedCoordinatorCopy();
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+    auditVerdict:
+      '{"verdict":"REJECT","findings":[{"file":"f","line":1,"problem":"p","fix":"x"}]}',
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  // the OK review of the whole tip — the sha it is bound to is the
+  // branch tip AT REVIEW TIME
+  bindReview(workTip);
+  // advance origin/main so the sync step adds a pipeline merge on top
+  writeFileSync(join(seed, "adv.txt"), "adv\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "chore: advance"]);
+  gitR(seed, ["push", "origin", "main"]);
+
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const syncTip = gitR(coord, ["rev-parse", "work"]);
+  assert.notEqual(syncTip, workTip); // the pipeline's own merge on top
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s1 = await pumpReleases(deps);
+  assert.equal(s1.rejected, 1);
+
+  // run 2: the tip is the failed run's sync merge; the review sits
+  // below it with only pipeline_shas between — the gate must accept.
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-214 мелко: merged delegations are scoped to the released project", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+  // another project's row with the same merged_into — its merge commit
+  // does not even exist in this copy; it must not block the gate
+  const other = store.insert({
+    taskKey: "PLUG-7",
+    projectId: "proj_other",
+    coordinatorThreadId: "thr_coord",
+    level: "complex",
+    route: "c",
+    preset: "c",
+    provider: "p",
+  });
+  store.setStatus(other.id, "done");
+  store.setMerged(other.id, { into: "work", sha: "e".repeat(40) });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-214 мелко: the fast-forward gate fires at step 1 — «нет в копии» is its own refusal", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  const r1 = store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    repoPath: repo,
+    branch: "feat-x",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  // a published sha this copy never saw — not a bare is-ancestor error
+  store.updateRelease(r1.id, {
+    status: "published",
+    publishedSha: "d".repeat(40),
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /отсутствует в копии/.test((e as OrchestratorError).message),
+  );
+  // an existing commit that is not an ancestor — «не fast-forward»
+  gitR(repo, ["checkout", "-b", "side"]);
+  writeFileSync(join(repo, "side.txt"), "s\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "side work"]);
+  const sideSha = gitR(repo, ["rev-parse", "HEAD"]);
+  gitR(repo, ["checkout", "feat-x"]);
+  store.updateRelease(r1.id, { publishedSha: sideSha });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /не fast-forward/.test((e as OrchestratorError).message),
+  );
+  // an ancestor published tip passes the gate
+  store.updateRelease(r1.id, {
+    publishedSha: gitR(repo, ["rev-parse", "HEAD~"]),
+  });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("PLUG-214 Б3: a leftover push-to-checkout wrapper is a stale install", async () => {
+  const { repo } = makeRepo();
+  const { deps, tmp } = makeDeps(repo);
+  installAllWrappers(tmp);
+  // a pre-r26-fix install left the retired wrapper — it still breaks
+  // updateInstead pushes, so its presence alone is «stale»
+  writeFileSync(join(tmp, "push-to-checkout"), "#!/bin/sh\n# retired\n");
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "hook-stale" &&
+      /install\.mjs/.test((e as OrchestratorError).hint ?? ""),
   );
 });

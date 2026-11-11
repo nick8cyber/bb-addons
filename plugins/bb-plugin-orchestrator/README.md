@@ -55,19 +55,25 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `bb orchestrator delegate <KEY> --level <аудит> --from <sha>` —
   `--from <merged_sha>` binds the review to a merged result.
   **Shared hooks (§17.3 Б2):** `hooks/install.mjs` sets a global
-  `core.hooksPath` and installs a wrapper under EVERY `githooks(5)`
-  name (`pre-push` is the orchestrator gate; the rest are copies of
+  `core.hooksPath` and installs a wrapper under every `githooks(5)`
+  name EXCEPT `push-to-checkout` — its mere presence disables git's
+  built-in worktree update on `receive.denyCurrentBranch=updateInstead`;
+  the installer removes a wrapper an older install left under that
+  name. `pre-push` is the orchestrator gate; the rest are copies of
   `chain`, which execs the repo's own `.git/hooks/<name>` — only when
-  it is executable, like git itself). The shared `pre-push` is a
+  it is executable, like git itself. The shared `pre-push` is a
   **forgetfulness guard, not a hard gate**: it stops an accidental
   `git push` via a one-time `push-token-*.json` binding branch+sha,
   but an agent running as the same user could write the token itself —
   for a hard gate use branch protection on the hosting (required
   checks); `orchestrator-setup` offers it. The installer takes the
   token dir from `bb orchestrator hooks-dir` (the plugin's data dir)
-  — override with `--hooks-dir`. After a plugin update re-run
-  `hooks/install.mjs` — `release` refuses `hook-stale` when any
-  expected wrapper is missing or differs from the plugin's.
+  — override with `--hooks-dir`; with neither a flag nor a working
+  `bb` it refuses with a hint rather than guessing a path. A foreign
+  global `core.hooksPath` refuses BEFORE any file is copied. After a
+  plugin update re-run `hooks/install.mjs` — `release` refuses
+  `hook-stale` when any expected wrapper is missing, differs from the
+  plugin's, or a retired `push-to-checkout` wrapper is left over.
   `threadIds` (default on) keeps the «Источник: bb тред thr_…» line in
   PR bodies and exempts `thr_…` from the bb-ids leak rule; off — no
   «Источник» line and every `thr_…` is a `leaks.bbIds` finding.

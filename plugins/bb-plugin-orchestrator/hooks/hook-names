@@ -3,6 +3,10 @@
 # bare repositories). install.mjs copies a wrapper under each name,
 # release.ts freshness-checks every installed file. `pre-push` gets
 # the orchestrator gate, every other name gets the `chain` pass-through.
+# EXCLUDED: `push-to-checkout` — the hook's mere presence disables
+# git's built-in worktree update on receive.denyCurrentBranch=
+# updateInstead (ревью PLUG-214); the installer removes a wrapper an
+# older install left under that name.
 applypatch-msg
 pre-applypatch
 post-applypatch
@@ -15,7 +19,6 @@ pre-rebase
 post-checkout
 post-merge
 pre-push
-push-to-checkout
 pre-auto-gc
 post-rewrite
 sendemail-validate

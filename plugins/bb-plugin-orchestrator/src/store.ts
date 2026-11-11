@@ -1291,14 +1291,21 @@ export class DelegationStore {
   }
 
   /** §17.3 (Б4): all delegations the §14 merge recorded into this branch
-   * — every task's, not only the released one. */
-  mergedDelegationsInto(branch: string): DelegationRow[] {
+   * — every task's of THIS project, not only the released one (ревью
+   * PLUG-214: a row from another project with the same `merged_into`,
+   * or a stale row whose merge commit is gone, must not block the
+   * gate with «отсутствует в копии»). */
+  mergedDelegationsInto(
+    branch: string,
+    projectId: string | null,
+  ): DelegationRow[] {
     return this.db
       .prepare(
         `SELECT * FROM delegations
-         WHERE merge_status = 'merged' AND merged_into = ?`,
+         WHERE merge_status = 'merged' AND merged_into = ?
+           AND project_id IS ?`,
       )
-      .all(branch) as DelegationRow[];
+      .all(branch, projectId) as DelegationRow[];
   }
 
   /**

@@ -175,6 +175,9 @@ test("f4/f6: installer inventory sees .bb worktrees, real --self-test run", () =
   });
   assert.match(st, /all \d+ wrappers chain: plain/);
   assert.match(st, /all \d+ wrappers chain: worktree/);
+  // §17.3 (ревью PLUG-214): the server-side names exist for bare
+  // repositories — the self-test exercises that shape too
+  assert.match(st, /all \d+ wrappers chain: bare/);
   assert.match(st, /OK  self-test passed/);
   // N2: live hooksDir untouched — no fake token left behind
   assert.equal(
@@ -307,18 +310,24 @@ test("§17.3: hook-names covers every githooks(5) name incl. server side", () =>
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("#")),
   );
-  // the full githooks(5) inventory — client AND receive-pack hooks
+  // the full githooks(5) inventory — client AND receive-pack hooks,
+  // EXCEPT push-to-checkout (ревью PLUG-214: the hook's mere presence
+  // disables git's built-in worktree update on updateInstead pushes)
   for (const n of [
     "applypatch-msg", "pre-applypatch", "post-applypatch",
     "pre-commit", "pre-merge-commit", "prepare-commit-msg", "commit-msg",
     "post-commit", "pre-rebase", "post-checkout", "post-merge",
     "pre-push", "pre-receive", "update", "proc-receive", "post-receive",
-    "post-update", "reference-transaction", "push-to-checkout",
+    "post-update", "reference-transaction",
     "pre-auto-gc", "post-rewrite", "sendemail-validate",
     "fsmonitor-watchman", "p4-pre-submit", "post-index-change",
   ]) {
     assert.ok(names.has(n), `hook-names missing ${n}`);
   }
+  assert.ok(
+    !names.has("push-to-checkout"),
+    "push-to-checkout must never be wrapped",
+  );
 });
 
 test("§17.3 (PLUG-210): installer takes the token dir from `bb orchestrator hooks-dir`", () => {
@@ -342,4 +351,63 @@ test("§17.3 (PLUG-210): installer takes the token dir from `bb orchestrator hoo
   // ~/.bb path the installer used to compute on its own
   assert.ok(existsSync(join(pluginDir, "pre-push")));
   assert.ok(existsSync(join(pluginDir, "update")));
+});
+
+// ── ревью PLUG-214: без push-to-checkout, отказы установщика ──────────
+
+test("§17.3 (PLUG-214): install removes a stale push-to-checkout wrapper", () => {
+  const root = mkdtempSync(join(tmpdir(), "install-retire-"));
+  const gd = join(root, "hooks");
+  mkdirSync(gd, { recursive: true });
+  // a pre-fix install left the retired wrapper — the update must remove
+  // it, else every updateInstead push on the machine stays broken
+  writeFileSync(join(gd, "push-to-checkout"), "#!/bin/sh\n# stale\n");
+  const gcfg = join(root, "gitconfig");
+  execFileSync(
+    "node",
+    ["hooks/install.mjs", "--hooks-dir", gd, "--repos-root", join(root, "empty")],
+    {
+      cwd: PLUGIN_DIR,
+      encoding: "utf8",
+      env: { ...process.env, GIT_CONFIG_GLOBAL: gcfg },
+    },
+  );
+  assert.equal(existsSync(join(gd, "push-to-checkout")), false);
+  assert.ok(existsSync(join(gd, "pre-push")));
+});
+
+test("§17.3 (PLUG-214): no --hooks-dir and no bb answer → refuse with a hint", () => {
+  const root = mkdtempSync(join(tmpdir(), "install-nodir-"));
+  const r = spawnSync(
+    "node",
+    ["hooks/install.mjs", "--repos-root", join(root, "empty")],
+    {
+      cwd: PLUGIN_DIR,
+      encoding: "utf8",
+      // a `bb` that cannot answer `orchestrator hooks-dir`
+      env: { ...process.env, BB_CLI: join(root, "no-such-bb") },
+    },
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stderr + r.stdout, /hooks-dir/);
+});
+
+test("§17.3 (PLUG-214): a foreign global core.hooksPath refuses BEFORE copying", () => {
+  const root = mkdtempSync(join(tmpdir(), "install-hp-"));
+  const gd = join(root, "hooks");
+  const gcfg = join(root, "gitconfig");
+  writeFileSync(gcfg, "[core]\n\thooksPath = /other/hooks\n");
+  const r = spawnSync(
+    "node",
+    ["hooks/install.mjs", "--hooks-dir", gd, "--repos-root", join(root, "empty")],
+    {
+      cwd: PLUGIN_DIR,
+      encoding: "utf8",
+      env: { ...process.env, GIT_CONFIG_GLOBAL: gcfg },
+    },
+  );
+  assert.equal(r.status, 1);
+  assert.match(r.stdout + r.stderr, /core\.hooksPath/);
+  // the refusal left no wrappers behind
+  assert.equal(existsSync(join(gd, "pre-push")), false);
 });

@@ -753,6 +753,12 @@ function assertInstalledHookFresh(deps: ReleaseDeps): void {
     }
     if (!installed.equals(current)) stale.push(name);
   }
+  // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — a leftover
+  // wrapper still disables git's built-in worktree update on
+  // updateInstead pushes. Its presence alone is a stale install.
+  if (existsSync(join(dir, "push-to-checkout"))) {
+    stale.push("push-to-checkout");
+  }
   // §17.3 (ревью PLUG-210): a partial install (e.g. a pre-r26 one with
   // `pre-push` only) leaves every OTHER local hook dead — that is a
   // stale install, not «guard absent».
@@ -935,6 +941,17 @@ export async function runRelease(
         "у исполнителя нет рабочей копии (environmentPath/environmentBranchName пусты)",
       );
     }
+    // §17.3 (ревью PLUG-214): a running executor turn can commit onto
+    // the branch while the pipeline's checks hold it — refuse at step 1
+    // instead of publishing work no review covered.
+    if (await executorTurnActive(deps, executor.thread_id)) {
+      throw new OrchestratorError(
+        "release-refused",
+        `release ${taskKey}: у треда исполнителя идёт ход — ` +
+          `его новые коммиты не покрыты ревью итога`,
+        "дождитесь завершения хода исполнителя и повторите",
+      );
+    }
   }
   // §16.6 (PLUG-189): a merged result publishes from the COORDINATOR's
   // copy — under the same per-copy lock `merge` takes (§14 check 4: one
@@ -1070,6 +1087,61 @@ async function isAncestor(
   return res.exitCode === 0;
 }
 
+/** §17.3 (ревью PLUG-214): first parent of `sha` — the review gate
+ * descends through the pipeline's own commits; null for a root. */
+async function firstParent(
+  deps: ReleaseDeps,
+  repo: string,
+  sha: string,
+): Promise<string | null> {
+  const line = await git(deps, repo, [
+    "rev-list",
+    "--parents",
+    "-n",
+    "1",
+    sha,
+  ]);
+  return line.split(/\s+/)[1] ?? null;
+}
+
+/**
+ * §17.3 (ревью PLUG-214): on the executor-branch path an in-flight turn
+ * of the executor's thread refuses the release at step 1 — a commit it
+ * lands while the pipeline runs would publish unreviewed. A queued
+ * request counts as active too. An unreadable journal cannot prove a
+ * turn — the run continues (the post-sync HEAD check still guards the
+ * window).
+ */
+async function executorTurnActive(
+  deps: ReleaseDeps,
+  threadId: string,
+): Promise<boolean> {
+  try {
+    const events = await deps.threads.events.list({
+      threadId,
+      order: "desc",
+      limit: "20",
+      types: [
+        "turn/started",
+        "turn/completed",
+        "turn.failed",
+        "turn/failed",
+        "client/turn/requested",
+      ],
+    });
+    const newest = events[0];
+    return (
+      newest?.type === "turn/started" ||
+      newest?.type === "client/turn/requested"
+    );
+  } catch (e) {
+    deps.log?.warn?.(
+      `orchestrator: executor turn check ${threadId}: ${message(e)}`,
+    );
+    return false;
+  }
+}
+
 /** Verdict of the review bound to `sha` under `taskKey` (§16.7). */
 async function okReviewOn(
   deps: ReleaseDeps,
@@ -1123,10 +1195,14 @@ async function reviewGate(
     branch: string;
     tipSha: string;
     policy: Policy;
+    /** The released project — merged-delegation rows are scoped to it
+     * (ревью PLUG-214 мелко). */
+    projectId: string | null;
   },
 ): Promise<void> {
   const { taskKey, executor, project, repo, branch, tipSha, policy } = ctx;
   const pipeline = deps.store.pipelineShasForRepo(repo);
+  const projectId = executor.project_id ?? ctx.projectId;
 
   if (executor.merge_status !== "merged") {
     const need = executor.result_sha!;
@@ -1153,21 +1229,32 @@ async function reviewGate(
     return;
   }
 
-  // merged_into: an OK review on the tip covers everything below it.
-  const tipReview = deps.store
-    .delegationsByContinueFrom(tipSha)
-    .find(
-      (d) =>
-        levelRole(policy, d.level) === "auditor" && d.status === "done",
-    );
-  if (tipReview) {
-    const tShow = await runJson<TaskShow>(deps.bbCli, [
-      "tasks",
-      "show",
-      tipReview.task_key,
-      "--json",
-    ]).catch(() => ({ comments: [] }) as TaskShow);
-    if ((await reviewVerdict(deps, tShow, tipReview)) === "ok") return;
+  // merged_into: an OK review on the tip covers everything below it —
+  // and an OK review UNDER the tip counts when only the pipeline's own
+  // commits separate it from the tip (ревью PLUG-214: a retry after a
+  // mid-run refusal carries the failed run's sync merge on top, so the
+  // reviewed tip is one first-parent step down).
+  let candidate: string | null = tipSha;
+  const seen = new Set<string>();
+  while (candidate && !seen.has(candidate)) {
+    seen.add(candidate);
+    const tipReview = deps.store
+      .delegationsByContinueFrom(candidate)
+      .find(
+        (d) =>
+          levelRole(policy, d.level) === "auditor" && d.status === "done",
+      );
+    if (tipReview) {
+      const tShow = await runJson<TaskShow>(deps.bbCli, [
+        "tasks",
+        "show",
+        tipReview.task_key,
+        "--json",
+      ]).catch(() => ({ comments: [] }) as TaskShow);
+      if ((await reviewVerdict(deps, tShow, tipReview)) === "ok") return;
+    }
+    if (!pipeline.has(candidate)) break;
+    candidate = await firstParent(deps, repo, candidate);
   }
 
   // «Опубликовано» — reachable from the remote target or from a tip a
@@ -1184,7 +1271,7 @@ async function reviewGate(
   // recorded `merged_sha` absent from the copy is a clear refusal, not
   // a bare `rev-list` error.
   const unpublished: DelegationRow[] = [];
-  for (const row of deps.store.mergedDelegationsInto(branch)) {
+  for (const row of deps.store.mergedDelegationsInto(branch, projectId)) {
     if (!row.merged_sha) continue;
     if (!(await shaExists(deps, repo, row.merged_sha))) {
       throw new OrchestratorError(
@@ -1325,6 +1412,31 @@ async function runReleaseSteps(
   // полным прогоном sync + проверок.
   await git(deps, repo, ["fetch", "origin"], { timeoutMs: 180_000 });
   const preSyncSha = await git(deps, repo, ["rev-parse", "HEAD"]);
+
+  // §17.3 (ревью PLUG-214): the fast-forward gate against the task's
+  // previous published tip belongs to step 1 — refusing here costs
+  // seconds, not a full check run and an audit. A published sha absent
+  // from this copy gets its own clear refusal, not a bare is-ancestor
+  // failure.
+  const prevPublished = deps.store.lastPublishedSha(taskKey);
+  if (prevPublished && prevPublished !== preSyncSha) {
+    if (!(await shaExists(deps, repo, prevPublished))) {
+      throw new OrchestratorError(
+        "release-refused",
+        `release ${taskKey}: прошлая опубликованная вершина ` +
+          `${prevPublished.slice(0, 8)} отсутствует в копии ${repo}`,
+        "новый заход продолжает от published_sha — повторите из копии, где этот коммит есть",
+      );
+    }
+    if (!(await isAncestor(deps, repo, prevPublished, preSyncSha))) {
+      throw new OrchestratorError(
+        "release-refused",
+        `ветка публикации не fast-forward от ${prevPublished.slice(0, 8)} ` +
+          `— новый заход должен продолжать от published_sha`,
+      );
+    }
+  }
+
   await reviewGate(deps, {
     taskKey,
     executor,
@@ -1333,6 +1445,7 @@ async function runReleaseSteps(
     branch,
     tipSha: preSyncSha,
     policy: policyLoad.policy,
+    projectId: executor.project_id ?? input.caller.projectId,
   });
 
   // The release row exists BEFORE the pipeline mutates the branch — its
@@ -1376,9 +1489,33 @@ async function runReleaseSteps(
         : project,
     );
     await recordPipelineShas(deps, repo, release.id, preSyncSha);
+    // §17.3 (ревью PLUG-214): the tip the gate vetted — the checks
+    // window (up to CHECK_TIMEOUT_MS) is long enough for a revived
+    // executor to land a commit on the branch; only this sha may stand
+    // when the checks finish.
+    const postSyncSha = await git(deps, repo, ["rev-parse", "HEAD"]);
 
     // Step 3 — проверки проекта.
     await runProjectChecks(deps, repo, project.checks);
+
+    const afterChecksSha = await git(deps, repo, ["rev-parse", "HEAD"]);
+    if (afterChecksSha !== postSyncSha) {
+      const extra = (
+        await git(deps, repo, [
+          "rev-list",
+          `${postSyncSha}..${afterChecksSha}`,
+        ])
+      )
+        .split("\n")
+        .filter(Boolean);
+      throw new OrchestratorError(
+        "unreviewed-commits",
+        `release ${taskKey}: во время проверок на ветку ${branch} легли ` +
+          `коммиты сверх проверенной вершины: ` +
+          extra.map((s) => s.slice(0, 7)).join(", "),
+        "ревью покрывает вершину после sync — повторите release, когда исполнитель остановлен",
+      );
+    }
 
     // §3 --no-docs → Docs-not-needed trailer (before sha capture).
     const preTrailerSha = await git(deps, repo, ["rev-parse", "HEAD"]);
