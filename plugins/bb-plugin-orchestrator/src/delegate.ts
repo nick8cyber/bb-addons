@@ -13,7 +13,7 @@
  * and the reconcile stage (later) retries them.
  */
 import { OrchestratorError } from "./errors.js";
-import { mergeDispatchInstructions } from "./instructions.js";
+import { mergeDispatchInstructions, roundSection } from "./instructions.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
   pickRoute,
@@ -34,6 +34,10 @@ export interface DelegateParams {
   level: string;
   route?: string;
   instructions?: string;
+  /** §6 `--from`: continue this round from an explicit sha/branch. */
+  from?: string;
+  /** §6 `--fresh`: no continuation — the round starts from the base. */
+  fresh?: boolean;
   caller: ThreadFacts;
 }
 
@@ -186,6 +190,14 @@ export async function runDelegate(
     }
   }
 
+  // §4.1 rounds: every delegate is a new round. The round continues from
+  // `--from`, else from the previous round's recorded result SHA; `--fresh`
+  // disables continuation.
+  const round = store.nextRound(taskKey);
+  const continueFrom = params.fresh
+    ? null
+    : (params.from ?? store.latestResultByTask(taskKey)?.result_sha ?? null);
+
   // Step 2 — the unique index makes this atomic across processes.
   let row;
   try {
@@ -197,6 +209,8 @@ export async function runDelegate(
       route: routeName,
       preset: route.preset,
       provider: route.provider,
+      round,
+      continueFrom,
     });
   } catch (e) {
     if (
@@ -281,12 +295,19 @@ export async function dispatchToRoute(
 ): Promise<DispatchStepsResult> {
   const { store, bbCli } = deps;
 
-  // §2.2: the «Работа с git» section leads --instructions, before this
-  // call's extra instructions — in this shared step it covers the §5.4
-  // reissue path too.
+  // §2.2: the «Работа с git» section leads --instructions, then «Заход N»
+  // for continuation rounds (§4.1), then this call's extra instructions —
+  // in this shared step they cover the §5.4 reissue path too.
   const instructions = mergeDispatchInstructions(
     deps.gitInstructions?.(),
     opts.instructions,
+    row.continue_from
+      ? roundSection(
+          row.round,
+          row.continue_from,
+          store.resultBranchForSha(row.task_key, row.continue_from),
+        )
+      : undefined,
   );
   const dispatchArgs = [
     "tasks",

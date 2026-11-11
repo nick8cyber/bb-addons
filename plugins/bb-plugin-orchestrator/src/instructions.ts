@@ -124,21 +124,49 @@ export function gitInstructionsError(text: string | undefined): string | null {
 }
 
 /**
+ * §4.1: the «Заход N» section of `--instructions` — tells a continuation
+ * round which commit to start from and to leave the previous round's
+ * branch and worktree alone.
+ */
+export function roundSection(
+  round: number,
+  continueFrom: string,
+  branch: string | null | undefined,
+): string {
+  const prev = branch ?? continueFrom;
+  return (
+    `Заход ${round}: продолжение работы с коммита ${continueFrom}` +
+    ` (ветка ${prev} прошлого захода).\n` +
+    `- Первым шагом: git merge --ff-only ${continueFrom}; не fast-forward —` +
+    ` git merge --no-edit ${continueFrom}; конфликт — вопрос координатору.\n` +
+    `- Ветку прошлого захода не открывай и в её рабочую копию не заходи:` +
+    ` работай только в своей ветке.`
+  );
+}
+
+/**
  * §2.2: the git-rules text becomes the first section of `--instructions`,
- * before this call's extra instructions; an empty or over-limit value adds
+ * then the «Заход N» section when the dispatch continues a previous round,
+ * then this call's extra instructions; an empty or over-limit value adds
  * no section (an over-limit value is also flagged needs-configuration so it
  * is never silently dropped). No text at all — no `--instructions` flag.
  */
 export function mergeDispatchInstructions(
   gitInstructions: string | undefined,
   extra: string | undefined,
+  round?: string | undefined,
 ): string | undefined {
   const git =
     gitInstructionsError(gitInstructions) === null
       ? (gitInstructions ?? "").trim()
       : "";
   const x = (extra ?? "").trim();
-  const parts = [...(git ? [git] : []), ...(x ? [x] : [])];
+  const r = (round ?? "").trim();
+  const parts = [
+    ...(git ? [git] : []),
+    ...(r ? [r] : []),
+    ...(x ? [x] : []),
+  ];
   return parts.length ? parts.join("\n\n") : undefined;
 }
 
