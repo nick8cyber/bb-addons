@@ -2696,14 +2696,28 @@ async function postCheck(
           `${scanBase}..${pushedSha}`,
         ]),
       );
-      const leaks = { machine: "block" as const, bbIds: "block" as const, allow: [] };
       const cfg = deps.loadReleaseConfig().config;
-      const proj = cfg
+      // §2 шаг 7: the same project rules as step 4 — the repo's project
+      // settings (leaks, commitIdentity, threadIds, allowlists). Without
+      // a release config the previous strict defaults apply.
+      const proj: Pick<
+        ResolvedProject,
+        | "leaks"
+        | "commitIdentity"
+        | "threadIds"
+        | "allowedTrailers"
+        | "allowedEmails"
+      > = cfg
         ? resolveProject(
             cfg,
             await settingsProjectId(deps, row.repo_path, row.project_id),
           )
-        : { threadIds: true, allowedTrailers: [], allowedEmails: [] };
+        : {
+            leaks: { machine: "block", bbIds: "block", allow: [] },
+            threadIds: true,
+            allowedTrailers: [],
+            allowedEmails: [],
+          };
       const findings = await machineScan(deps.cmd, {
         repoPath: repo,
         baseSha: scanBase,
@@ -2711,7 +2725,8 @@ async function postCheck(
         commits,
         added,
         patches,
-        leaks,
+        leaks: proj.leaks,
+        allowedAuthor: await allowedAuthor(deps, repo, proj.commitIdentity),
         hostname: deps.hostname ?? osHostname(),
         threadIds: proj.threadIds,
         allowedTrailers: proj.allowedTrailers,

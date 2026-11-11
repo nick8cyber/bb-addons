@@ -2840,3 +2840,111 @@ test("PLUG-217: rebase — a foreign empty commit is not excused by the pre-rang
   const rec = JSON.parse(failed.pipeline_shas ?? "[]") as string[];
   assert.ok(!rec.includes(xSha));
 });
+
+// ── PLUG-230: пост-проверка по правилам проекта (§2 шаг 7) ────────────
+
+test("PLUG-230: пост-проверка — коммиты подписи commitIdentity «repo» без находок", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "repo",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_main: {} },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  store.setStatus(
+    store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!.id,
+    "done",
+  );
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  // every published commit is signed by the copy's own git config —
+  // «repo» resolves to it and the rescan stays silent (the releaseId 1
+  // false positive flagged them all «commitIdentity не задан»).
+  assert.ok(
+    !sent.some((m) => m.includes("пост-проверка")),
+    `unexpected post-check message: ${JSON.stringify(sent)}`,
+  );
+});
+
+test("PLUG-230: пост-проверка — чужой автор в выложенном диапазоне это находка", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "repo",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_main: {} },
+    }),
+  });
+  // a commit signed by someone else inside the pushed range — the
+  // release row is seeded mid-publish (past step 4) to reach step 7.
+  writeFileSync(join(repo, "foreign.txt"), "x\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, [
+    "-c", "user.name=Foreign", "-c", "user.email=foreign@x.io",
+    "commit", "-m", "feat: foreign",
+  ]);
+  const headSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const r = store.insertRelease({
+    taskKey: "PLUG-1", projectId: "proj_main",
+    coordinatorThreadId: "thr_coord", repoPath: repo, branch: "feat-x",
+    targetAction: "push", targetBranch: "main",
+  });
+  store.updateRelease(r.id, {
+    status: "publishing",
+    headSha,
+    remoteBaseSha: gitR(repo, ["rev-parse", "origin/main"]),
+  });
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  assert.ok(
+    sent.some(
+      (m) => m.includes("пост-проверка") && m.includes("личность автора"),
+    ),
+    `expected a commit-identity finding, got: ${JSON.stringify(sent)}`,
+  );
+});
+
+test("PLUG-230: пост-проверка — leaks.allow проекта уважается", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "repo",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        checks: [],
+        public: true,
+        leaks: { allow: ["docs/"] },
+      },
+      projects: { proj_main: {} },
+    }),
+  });
+  // the same machine path under an allow-listed prefix and outside it —
+  // only the latter may surface in the rescan findings.
+  mkdirSync(join(repo, "docs"), { recursive: true });
+  mkdirSync(join(repo, "src"), { recursive: true });
+  const machinePath = ["", "home", "builder", "x"].join("/");
+  writeFileSync(join(repo, "docs/plan.md"), `build in ${machinePath}\n`);
+  writeFileSync(join(repo, "src/leak.txt"), `build in ${machinePath}\n`);
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "chore: paths"]);
+  const headSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const r = store.insertRelease({
+    taskKey: "PLUG-1", projectId: "proj_main",
+    coordinatorThreadId: "thr_coord", repoPath: repo, branch: "feat-x",
+    targetAction: "push", targetBranch: "main",
+  });
+  store.updateRelease(r.id, {
+    status: "publishing",
+    headSha,
+    remoteBaseSha: gitR(repo, ["rev-parse", "origin/main"]),
+  });
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  const msg = sent.find((m) => m.includes("повторный скан"));
+  assert.ok(msg, `expected rescan findings, got: ${JSON.stringify(sent)}`);
+  assert.ok(msg.includes("src/leak.txt"));
+  assert.ok(!msg.includes("docs/plan.md"));
+});
