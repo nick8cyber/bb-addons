@@ -308,12 +308,14 @@ export async function runDelegate(
   }
 
   // §4.1 rounds: every delegate is a new round. The round continues from
-  // `--from`, else from the previous round's recorded result SHA; `--fresh`
+  // `--from`, else from the task's continue point — the latest round's
+  // result SHA, or the newer `published_sha` a release left (§17.3 С4:
+  // the repeat release fast-forwards the same remote branch); `--fresh`
   // disables continuation.
   const round = store.nextRound(taskKey);
   const continueFrom = params.fresh
     ? null
-    : (params.from ?? store.latestResultByTask(taskKey)?.result_sha ?? null);
+    : (params.from ?? store.continuePoint(taskKey) ?? null);
 
   // Step 2 — the unique index makes this atomic across processes.
   let row;

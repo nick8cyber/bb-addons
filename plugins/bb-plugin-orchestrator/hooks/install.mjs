@@ -7,11 +7,16 @@
  *     [--hooks-dir <dir>] [--repos-root <dir>] [--exclude <path>]...
  *
  * 1. Inventory (опись) of the user's repositories: which hooks live in
- *    `.git/hooks`, which have their own `core.hooksPath` («свой процесс» —
- *    the shared hook never reaches them), which are excluded (service
- *    repos with autopush — put them in `--exclude`, else their autopush
- *    breaks).
- * 2. Copies `pre-push` into the hooks dir and writes `exclusions`.
+ *    `.git/hooks` (the shared hook CHAINS to them — a global
+ *    `core.hooksPath` shadows every hook name, so a local `pre-commit`
+ *    would silently die without the wrapper, §17.3 Б2), which have their
+ *    own `core.hooksPath` («свой процесс» — the shared hook never
+ *    reaches them), which are excluded (service repos with autopush —
+ *    put them in `--exclude`, else their autopush breaks).
+ * 2. Installs a wrapper under EVERY standard hook name (`hook-names`):
+ *    `pre-push` is the orchestrator token gate that chains to the local
+ *    hook afterwards; every other name is a copy of `chain` — a plain
+ *    pass-through to `$GIT_DIR/hooks/<name>`. Then writes `exclusions`.
  * 3. Sets `git config --global core.hooksPath <hooks dir>` unless one is
  *    already configured (then it only reports — `--force` overrides).
  */
@@ -21,12 +26,21 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+
+const HOOKS_SRC = dirname(fileURLToPath(import.meta.url));
+/** Standard hook names this installer covers — single source shared
+ * with the plugin's release-time freshness check. */
+const HOOK_NAMES = readFileSync(join(HOOKS_SRC, "hook-names"), "utf8")
+  .split("\n")
+  .map((l) => l.trim())
+  .filter((l) => l && !l.startsWith("#"));
 
 const args = process.argv.slice(2);
 const flag = (n) => {
@@ -117,7 +131,7 @@ const report = [
   "",
   `свой core.hooksPath (общий хук их НЕ трогает): ${ownHooksPath.length}`,
   ...ownHooksPath.map((r) => `  - ${r}`),
-  `с локальными .git/hooks (будут вызваны общим хуком): ${withLocalHooks.length}`,
+  `с локальными .git/hooks (общий хук вызовет их через обёртки всех имён): ${withLocalHooks.length}`,
   ...withLocalHooks.map((r) => `  - ${r}`),
   `без локальных хуков: ${plain.length}`,
   ...plain.map((r) => `  - ${r}`),
@@ -194,12 +208,17 @@ if (selfTest) {
 }
 
 // ── Install ────────────────────────────────────────────────────────────
+// §17.3 (Б2): a global core.hooksPath shadows EVERY hook name — install
+// a wrapper under each: `pre-push` is the orchestrator gate (it chains
+// to the local hook itself), the rest are copies of the `chain`
+// pass-through so repository-local hooks keep firing.
 mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
-copyFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), "pre-push"),
-  join(hooksDir, "pre-push"),
-);
-execFileSync("chmod", ["755", join(hooksDir, "pre-push")]);
+for (const name of HOOK_NAMES) {
+  const src = join(HOOKS_SRC, name === "pre-push" ? "pre-push" : "chain");
+  const dst = join(hooksDir, name);
+  copyFileSync(src, dst);
+  execFileSync("chmod", ["755", dst]);
+}
 writeFileSync(
   join(hooksDir, "exclusions"),
   exclusions.map((e) => `${e}\n`).join(""),
