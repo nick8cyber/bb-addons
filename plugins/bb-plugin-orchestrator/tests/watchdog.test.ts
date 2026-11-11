@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS, type DelegationRow } from "../src/store.js";
@@ -14,6 +18,7 @@ import {
 import {
   createWatchdog,
   findTaskThreadId,
+  type WatchdogDeps,
   type WatchdogThreadDto,
   type WatchdogThreadEvent,
 } from "../src/watchdog.js";
@@ -51,6 +56,8 @@ function makeHarness(
     dispatchThreadId?: string;
     /** Throw on the first N `threads.stop` calls (confirmStop tests). */
     stopFails?: number;
+    /** §4.1 round-result seam; absent → the done path skips collection. */
+    round?: WatchdogDeps["round"];
   } = {},
 ) {
   const db = new Database(":memory:");
@@ -172,6 +179,7 @@ function makeHarness(
     dispatch: (row, opts) => dispatchToRoute(row, opts ?? {}, stepsDeps),
     finalize: (row) => finishDispatchSteps(row, stepsDeps),
     retrySetup: (row) => retrySetupSteps(row, stepsDeps),
+    ...(opts.round ? { round: opts.round } : {}),
     enqueue,
     now: () => nowVal,
     log: { warn: (m) => warns.push(m), info: () => {}, error: () => {} },
@@ -757,7 +765,9 @@ test("reconcile: refused reissue dispatch → new row failed + lost-reissue repo
 });
 
 test("turn.failed category upgrades a premature failed to quota + hold", async () => {
-  const h = makeHarness();
+  // the first stop fails → the premature `failed` is still standing when
+  // the typed category arrives (autoFallback reissues `failed` on its own)
+  const h = makeHarness({ stopFails: 1 });
   const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
   // race: thread.failed lands first with a non-pattern error text
@@ -1526,8 +1536,15 @@ test("unavailable without autoFallback → stalled, coordinator reissues by hand
 });
 
 test("ordinary error after the first turn → failed as before (no hold, no reissue)", async () => {
+  // strict level: autoFallback off, so `failed` stays terminal (§5.4 r23)
   const h = makeHarness();
-  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
   h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
   h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
   await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
@@ -1543,9 +1560,16 @@ test("ordinary error after the first turn → failed as before (no hold, no reis
 });
 
 test("start-failure text after a begun turn is not unavailable → failed", async () => {
-  // the thread.start-failed marker only counts while no turn ever started
+  // the thread.start-failed marker only counts while no turn ever started;
+  // strict level keeps `failed` terminal (autoFallback off)
   const h = makeHarness();
-  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "strict",
+    route: "strict",
+    preset: "strict",
+    provider: "acp-devin",
+  });
   h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
   h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
   await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
@@ -1732,7 +1756,9 @@ test("start-failure after a pre-first-turn interrupt is still unavailable", asyn
 });
 
 test("a later thread.failed upgrades a premature failed to unavailable", async () => {
-  const h = makeHarness();
+  // the first stop fails, so the premature `failed` is still standing when
+  // the stronger signal arrives (§5.4 r23: autoFallback reissues `failed`)
+  const h = makeHarness({ stopFails: 1 });
   const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
   // race: thread.failed lands first with a non-pattern error text
@@ -1746,4 +1772,362 @@ test("a later thread.failed upgrades a premature failed to unavailable", async (
   assert.equal(h.store.get(row.id)!.status, "reissued");
   assert.ok(h.store.heldGroups(h.getNow()).has("simple"));
   assert.equal(h.store.listActive()[0]!.route, "simple-alt");
+});
+
+// ── rev 23: failed → reissue, errored, per-route window, round result ───
+
+test("§5.4 r23: failed reissues to the next route under autoFallback (503 no capacity)", async () => {
+  // the live case behind ADR-0024: a reviewer died with "503 UNAVAILABLE:
+  // No capacity available" and the row stayed `failed` forever
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "error"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  await h.wd.onThreadFailed(
+    dto("thr_e1", "error"),
+    "503 UNAVAILABLE: No capacity available",
+  );
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple-alt");
+  assert.equal(fresh.reissue_of, row.id);
+  assert.equal(fresh.round, 2);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /завершился с ошибкой.*перевыпущено на simple-alt/,
+  );
+});
+
+test("§2 rule 4: routes.*.firstResponseSeconds overrides the global window", async () => {
+  const h = makeHarness({
+    policyText: JSON.stringify({
+      version: 1,
+      firstResponseSeconds: 30,
+      levels: { simple: { chain: ["simple"], autoFallback: true } },
+      routes: {
+        simple: {
+          preset: "simple",
+          provider: "p",
+          firstResponseSeconds: 300,
+        },
+      },
+    }),
+  });
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000); // past the global 30s, inside the route's 300s
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "running");
+  h.setNow(T0 + 301_000);
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "stalled");
+});
+
+test("§5.3 r23: a turn that ended with an error at idle → continue + coordinator line", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "tool exploded" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.resume_count, 1);
+  const toExec = h.sends.find((s) => s.threadId === "thr_e1")!;
+  assert.match(
+    JSON.stringify(toExec.input),
+    /оборвался ошибкой.*tool exploded.*Продолжай/,
+  );
+  const toCoord = h.sends.find((s) => s.threadId === "thr_coord")!;
+  assert.match(JSON.stringify(toCoord.input), /оборвался ошибкой/);
+});
+
+test("§5.3 r23: a repeat errored → failed → autoFallback reissue", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "tool exploded" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "running");
+  // the resumed turn also ends with an error
+  h.eventLog.get("thr_e1")!.push(
+    ev(3, "turn/started", T0 + 1000),
+    ev(4, "provider/error", T0 + 1500, { message: "tool exploded again" }),
+  );
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 4 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const fresh = h.store.listActive()[0]!;
+  assert.equal(fresh.route, "simple-alt");
+  assert.equal(fresh.reissue_of, row.id);
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /завершился с ошибкой.*перевыпущено на simple-alt/,
+  );
+});
+
+test("§5.3 r23: a mid-turn tool error followed by response events is done, not errored", async () => {
+  // the sample case: provider/error mid-turn, then twenty more minutes of
+  // work — NOT an outcome
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "tool exploded" }),
+    ev(3, "item/agentMessage/delta", T0 + 600, { delta: "working on it" }),
+    ev(4, "item/completed", T0 + 700, { item: { type: "agentMessage" } }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 4 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "done");
+  assert.equal(
+    h.sends.filter((s) => s.threadId === "thr_e1").length,
+    0,
+    "no resume nudge for a clean turn",
+  );
+});
+
+test("§5.3 r23: turn/completed with a non-completed status → errored resume", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 500, { status: "failed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.resume_count, 1);
+  const toExec = h.sends.find((s) => s.threadId === "thr_e1")!;
+  assert.match(JSON.stringify(toExec.input), /оборвался ошибкой/);
+});
+
+test("§5.3 r23: a clean turn/completed → done", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 500, { status: "completed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "done");
+});
+
+test("§5.3 r23: a quota text in the errored path → quota, not a resume", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn.failed", T0 + 500, { message: "429 rate limit exceeded" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.ok(h.store.heldGroups(h.getNow()).has("zen"));
+});
+
+test("§5.3 r23: a removed-model text at the turn's end → stalled + route hold + reissue", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 500, {
+      status: "failed",
+      error: { message: "model not found: m-1" },
+    }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.ok(h.store.heldGroups(h.getNow()).has("simple")); // route name held
+});
+
+test("§5.3 r23: an errored resume that lifts no turn within the window → failed", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, { message: "tool exploded" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "running");
+  // the resume never lifted a turn; the thread went quiet past the window
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  assert.equal(h.store.listActive()[0]!.route, "simple-alt");
+});
+
+// ── §4.1 round result at done (real git repo in a temp dir) ─────────────
+
+const git = (repo: string, args: string[]) =>
+  execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+function makeExecutorRepo(opts: { commits?: number; dirty?: boolean } = {}) {
+  const repo = mkdtempSync(join(tmpdir(), "round-"));
+  execFileSync("git", ["init", repo]);
+  git(repo, ["config", "user.email", "a@b.c"]);
+  git(repo, ["config", "user.name", "T"]);
+  writeFileSync(join(repo, "a.txt"), "1");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "base"]);
+  git(repo, ["checkout", "-b", "exec-branch"]);
+  for (let i = 0; i < (opts.commits ?? 1); i++) {
+    writeFileSync(join(repo, `w${i}.txt`), String(i));
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", `work ${i}`]);
+  }
+  if (opts.dirty) writeFileSync(join(repo, "dirty.txt"), "x");
+  return repo;
+}
+
+const roundDeps = (repo: string, branchName = "exec-branch") => ({
+  environment: async () => ({
+    id: "env_1",
+    path: repo,
+    branchName,
+    mergeBaseBranch: "master",
+  }),
+  git: async (r: string, args: string[]) => git(r, args),
+});
+
+async function runToDone(h: ReturnType<typeof makeHarness>) {
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  return row;
+}
+
+test("§4.1: done collects the round result — branch, sha, commits, clean", async () => {
+  const repo = makeExecutorRepo({ commits: 2 });
+  const sha = git(repo, ["rev-parse", "HEAD"]);
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = await runToDone(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_env_id, "env_1");
+  assert.equal(fresh.result_branch, "exec-branch");
+  assert.equal(fresh.result_sha, sha);
+  assert.equal(fresh.result_commits, 2);
+  assert.equal(fresh.result_dirty, 0);
+  assert.equal(
+    h.sends.filter((s) => /сомнителен/.test(JSON.stringify(s.input))).length,
+    0,
+    "a clean result sends no warning",
+  );
+});
+
+test("§4.1: a dirty copy reports to the coordinator", async () => {
+  const repo = makeExecutorRepo({ commits: 1, dirty: true });
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = await runToDone(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_dirty, 1);
+  const note = h.sends.find((s) =>
+    /сомнителен/.test(JSON.stringify(s.input)),
+  )!;
+  assert.match(JSON.stringify(note.input), /грязная/);
+});
+
+test("§4.1: zero commits reports to the coordinator", async () => {
+  const repo = makeExecutorRepo({ commits: 0 });
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = await runToDone(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_commits, 0);
+  const note = h.sends.find((s) =>
+    /сомнителен/.test(JSON.stringify(s.input)),
+  )!;
+  assert.match(JSON.stringify(note.input), /коммитов нет/);
+});
+
+test("§4.1: a foreign branch reports to the coordinator", async () => {
+  const repo = makeExecutorRepo({ commits: 1 });
+  git(repo, ["checkout", "master"]); // executor left its branch
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = await runToDone(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_branch, "master");
+  const note = h.sends.find((s) =>
+    /сомнителен/.test(JSON.stringify(s.input)),
+  )!;
+  assert.match(JSON.stringify(note.input), /master вместо exec-branch/);
+});
+
+test("§4.1: review-level delegations skip the result collection", async () => {
+  const repo = makeExecutorRepo({ commits: 1 });
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    level: "review",
+    route: "simple",
+  });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.result_sha, null);
+});
+
+test("§4.1: a missing environment lands in setup_errors, not the outcome", async () => {
+  const h = makeHarness({
+    round: {
+      environment: async () => null,
+      git: async () => "",
+    },
+  });
+  const row = await runToDone(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.ok(
+    h.store.findSetupError(fresh, "round-result"),
+    "round-result setup error recorded",
+  );
+});
+
+test("§5.3 r23: a trailing willRetry provider error is not errored → done", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(1, "turn/started", T0),
+    ev(2, "provider/error", T0 + 500, {
+      message: "backend hiccup",
+      willRetry: true,
+    }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_e1", "idle"));
+  assert.equal(h.store.get(row.id)!.status, "done");
 });

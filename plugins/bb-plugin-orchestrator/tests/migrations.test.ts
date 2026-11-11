@@ -118,3 +118,39 @@ test("hasFreshDispatching scopes by project, owner, thread_id, and age", () => {
   insert({ createdAt: fresh });
   assert.equal(probe("proj_f"), false);
 });
+
+test("the r23 migration adds round/result/merge columns to an existing db", () => {
+  const db = new Database(":memory:");
+  // a database that predates r23: every migration but the last
+  for (const m of MIGRATIONS.slice(0, -1)) db.exec(m);
+  db.prepare(
+    `INSERT INTO delegations (
+      task_key, coordinator_thread_id, level, route, preset, provider,
+      status, created_at, updated_at
+    ) VALUES ('PLUG-0', 'thr_c', 'simple', 'simple', 'simple', 'p', 'done', 1, 1)`,
+  ).run();
+  db.exec(MIGRATIONS[MIGRATIONS.length - 1]!);
+  const columns = (db
+    .prepare(`PRAGMA table_info(delegations)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  for (const col of [
+    "round",
+    "continue_from",
+    "result_branch",
+    "result_sha",
+    "result_commits",
+    "result_dirty",
+    "result_env_id",
+    "merge_status",
+    "merged_into",
+    "merged_sha",
+    "merged_at",
+  ]) {
+    assert.ok(columns.includes(col), `missing column ${col}`);
+  }
+  const row = db
+    .prepare(`SELECT round, continue_from FROM delegations WHERE task_key = 'PLUG-0'`)
+    .get() as { round: number; continue_from: string | null };
+  assert.equal(row.round, 1);
+  assert.equal(row.continue_from, null);
+});

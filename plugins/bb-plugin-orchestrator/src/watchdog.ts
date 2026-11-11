@@ -119,6 +119,14 @@ export interface TurnFailedInfo {
   errorInfo?: { category?: string | null } | null;
 }
 
+/** §4.1 round result: the executor environment facts the watchdog needs. */
+export interface RoundEnvironment {
+  id?: string | null;
+  path?: string | null;
+  branchName?: string | null;
+  mergeBaseBranch?: string | null;
+}
+
 export interface ReconcileSummary {
   scanned: number;
   cancelled: number;
@@ -151,6 +159,15 @@ export interface WatchdogDeps {
   ): Promise<{ status: "running" | "cancelled"; setupErrors: SetupError[] }>;
   /** §7: retry failed §4.4–4.6 steps on a `running` row. */
   retrySetup(row: DelegationRow): Promise<SetupError[]>;
+  /**
+   * §4.1 round result at `done`: resolve the executor's environment and
+   * run git inside it. Optional — tests without a git seam skip the
+   * collection entirely.
+   */
+  round?: {
+    environment(threadId: string): Promise<RoundEnvironment | null>;
+    git(repo: string, args: string[]): Promise<string>;
+  };
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
   now?: () => number;
   log?: {
@@ -359,7 +376,7 @@ export function createWatchdog(deps: WatchdogDeps) {
   /** §5.4: report the outcome, and auto-reissue when the level allows. */
   const outcomeAndMaybeReissue = async (
     row: DelegationRow,
-    outcome: "stalled" | "quota" | "unavailable",
+    outcome: "stalled" | "quota" | "unavailable" | "failed",
     detail: string,
   ) => {
     const info = await routeInfo(row);
@@ -370,9 +387,13 @@ export function createWatchdog(deps: WatchdogDeps) {
           ? detail
             ? `маршрут недоступен (${detail.slice(0, 120)})`
             : "маршрут недоступен"
-          : detail
-            ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
-            : "квота исполнителя исчерпана";
+          : outcome === "failed"
+            ? detail
+              ? `исполнитель завершился с ошибкой (${detail.slice(0, 120)})`
+              : "исполнитель завершился с ошибкой"
+            : detail
+              ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
+              : "квота исполнителя исчерпана";
     let nextName: string | undefined;
     let nextRoute: PolicyRoute | undefined;
     if (info.level?.autoFallback && info.policy) {
@@ -469,7 +490,7 @@ export function createWatchdog(deps: WatchdogDeps) {
    */
   const afterOutcomeStatus = async (
     row: DelegationRow,
-    outcome: "stalled" | "quota",
+    outcome: "stalled" | "quota" | "failed",
     detail: string,
   ) => {
     // §7: the outcome reason outlives the stop retry — the reissue report
@@ -478,9 +499,13 @@ export function createWatchdog(deps: WatchdogDeps) {
     const outcomeText =
       outcome === "stalled"
         ? "исполнитель завис"
-        : detail
-          ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
-          : "квота исполнителя исчерпана";
+        : outcome === "failed"
+          ? detail
+            ? `исполнитель завершился с ошибкой (${detail.slice(0, 120)})`
+            : "исполнитель завершился с ошибкой"
+          : detail
+            ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
+            : "квота исполнителя исчерпана";
     if (await confirmStop(row)) {
       await outcomeAndMaybeReissue(row, outcome, detail);
       return;
@@ -603,8 +628,16 @@ export function createWatchdog(deps: WatchdogDeps) {
   const toFailed = async (row: DelegationRow, errorText: string) => {
     const fresh = store.get(row.id);
     if (!fresh || !isActive(fresh.status)) return;
-    store.setStatus(fresh.id, "failed");
+    store.setStatus(fresh.id, "failed"); // status first, stop second (§5.3)
     clearMarks(fresh.id);
+    const info = await routeInfo(fresh);
+    // §5.4 r23: `failed` reissues through the same confirmed-stop gate —
+    // without it a dead executor stayed `failed` forever (503 UNAVAILABLE
+    // on a review route was the live case that motivated ADR-0024).
+    if (info.level?.autoFallback) {
+      await afterOutcomeStatus(fresh, "failed", errorText);
+      return;
+    }
     await report(
       fresh,
       `исполнитель завершился с ошибкой: задача ${fresh.task_key}, ` +
@@ -786,6 +819,186 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
   };
 
+  /**
+   * §5.3 r23 `errored`: the current turn's journal read backwards — the
+   * first verdict event decides. A response event means the agent kept
+   * working past any earlier error (clean — a mid-turn tool error is no
+   * outcome); `turn/completed` with a non-completed status or an error,
+   * `turn.failed` or a trailing provider/system error ends the turn
+   * errored. Returns null when the journal cannot be read — unknown is
+   * not "clean" (§5.1 rev 18).
+   */
+  const lastTurnError = async (
+    row: DelegationRow,
+  ): Promise<{ text: string } | "clean" | null> => {
+    if (!row.thread_id) return "clean";
+    let events: WatchdogThreadEvent[];
+    try {
+      events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "100",
+      });
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: events.tail ${row.thread_id}: ${message(e)}`,
+      );
+      return null;
+    }
+    for (const ev of events) {
+      if (row.turn_started_at != null && ev.createdAt < row.turn_started_at) {
+        break; // older turns are out of scope
+      }
+      const data = (ev.data ?? {}) as Record<string, unknown>;
+      if (ev.type === "turn/started") break;
+      if (ev.type === "turn/completed") {
+        const errText =
+          errorTextOf(data.error as Record<string, unknown> | undefined) ??
+          errorTextOf(data);
+        const status = data.status;
+        if (
+          errText ||
+          data.error != null ||
+          (status !== undefined && status !== "completed")
+        ) {
+          return {
+            text: errText ?? `turn/completed: status ${String(status)}`,
+          };
+        }
+        return "clean";
+      }
+      if (ev.type === "turn.failed" || ev.type === "turn/failed") {
+        return { text: errorTextOf(data) ?? "turn failed" };
+      }
+      if (ev.type === "provider/error" || ev.type === "system/error") {
+        // §5.3: `willRetry` means the provider is still retrying — the
+        // turn did not end with an error and idle carries no verdict.
+        if (data.willRetry === true) return "clean";
+        return { text: errorTextOf(data) ?? ev.type };
+      }
+      if (ev.type === "item/started" || ev.type === "item/completed") {
+        const item = data.item as { type?: unknown } | undefined;
+        if (item?.type !== "userMessage") return "clean";
+        continue;
+      }
+      if (RESPONSE_EVENT_TYPES.has(ev.type)) return "clean";
+    }
+    return "clean";
+  };
+
+  /**
+   * §5.3 `errored`: first time — «продолжай» to the executor and one line
+   * to the coordinator, `running` stays (resume_count + 1); a repeat
+   * `errored` is `failed` and follows §5.4. Quota and unavailable texts
+   * still outrank the safety outcome.
+   */
+  const handleErrored = async (
+    row: DelegationRow,
+    text: string,
+    at: number,
+  ) => {
+    const fresh = store.get(row.id);
+    if (!fresh || fresh.status !== "running") return;
+    const info = await routeInfo(fresh);
+    if (matchesQuota(text, info.patterns)) {
+      await toQuota(fresh, `errored: ${text.slice(0, 200)}`);
+      return;
+    }
+    if (isUnavailable(fresh, text, info.unavailablePatterns)) {
+      await toUnavailable(fresh, `errored: ${text.slice(0, 200)}`);
+      return;
+    }
+    if (hasSetupError(fresh, "errored-resume-sent")) {
+      await toFailed(fresh, `повторный обрыв хода ошибкой: ${text.slice(0, 200)}`);
+      return;
+    }
+    // The resume opens a new first-response window — `resume-await`
+    // carries the kind so the timer and the idle pass can tell an errored
+    // resume (→ `failed` on repeat) from an interrupted one (→ `stalled`).
+    store.bumpResume(fresh.id);
+    store.setTurnStarted(fresh.id, at);
+    store.addSetupError(fresh.id, "resume-await", `errored: ${text.slice(0, 200)}`);
+    store.addSetupError(fresh.id, "errored-resume-sent", "1");
+    await sendToExecutor(
+      fresh,
+      `ход оборвался ошибкой: ${text.slice(0, 300)}. Продолжай задачу`,
+    );
+    await notifyCoordinator(
+      fresh,
+      `ход исполнителя оборвался ошибкой: задача ${fresh.task_key}, ` +
+        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"} — ` +
+        `послал продолжение (resume #${fresh.resume_count + 1}). ` +
+        `Ошибка: ${text.slice(0, 300)}`,
+    );
+  };
+
+  /**
+   * §4.1 round result at `done`: the executor's worktree answers — its
+   * branch, HEAD, commit count over the merge base and cleanliness — into
+   * `result_*`. A foreign branch, zero commits or a dirty copy gets one
+   * coordinator line. Review-level and auditor delegations commit
+   * nothing, so the check does not run for them; env/git failures land
+   * in `round-result`, never in the outcome.
+   */
+  const collectRoundResult = async (row: DelegationRow) => {
+    if (!deps.round || !row.thread_id) return;
+    if (row.level === "review") return;
+    const role = store.threadRole(row.thread_id)?.role;
+    if (role === "auditor" || role === "release-auditor") return;
+    try {
+      const env = await deps.round.environment(row.thread_id);
+      if (!env?.path) {
+        store.addSetupError(
+          row.id,
+          "round-result",
+          "среда исполнителя не найдена",
+        );
+        return;
+      }
+      const git = (args: string[]) => deps.round!.git(env.path!, args);
+      const sha = (await git(["rev-parse", "HEAD"])).trim();
+      const branch = await git(["symbolic-ref", "--short", "HEAD"])
+        .then((s) => s.trim())
+        .catch(() => null);
+      const dirty = (await git(["status", "--porcelain"])).trim().length > 0;
+      let commits: number | null = null;
+      if (env.mergeBaseBranch) {
+        const out = await git([
+          "rev-list",
+          "--count",
+          `${env.mergeBaseBranch}..HEAD`,
+        ]);
+        const n = Number(out.trim());
+        commits = Number.isFinite(n) ? n : null;
+      }
+      store.setRoundResult(row.id, {
+        envId: env.id ?? null,
+        branch,
+        sha,
+        commits,
+        dirty,
+      });
+      const problems: string[] = [];
+      if (env.branchName && branch !== env.branchName) {
+        problems.push(
+          `ветка ${branch ?? "—"} вместо ${env.branchName} (ушёл в чужую ветку)`,
+        );
+      }
+      if (commits === 0) problems.push("коммитов нет");
+      if (dirty) problems.push("копия грязная (незакоммиченные правки)");
+      if (problems.length) {
+        await notifyCoordinator(
+          row,
+          `${row.task_key}: итог захода ${row.round} сомнителен — ` +
+            `${problems.join("; ")}. Копия: ${env.path}, ` +
+            `HEAD ${sha.slice(0, 12)}`,
+        );
+      }
+    } catch (e) {
+      store.addSetupError(row.id, "round-result", message(e));
+    }
+  };
+
   const evaluateIdle = async (
     row: DelegationRow,
     thread: WatchdogThreadDto,
@@ -818,17 +1031,33 @@ export function createWatchdog(deps: WatchdogDeps) {
       log.warn?.(`orchestrator: queuedMessages ${thread.id}: ${message(e)}`);
       return;
     }
-    // §5.3 rev 15: a resumed turn that never began is a repeat
-    // interruption — `stalled` → §5.4, never `done`.
-    if (hasSetupError(row, "resume-await")) {
+    // §5.3 rev 15/23: a resume that never lifted a new turn repeats the
+    // failure — an errored resume lands `failed`, an interrupted one
+    // `stalled`; both follow §5.4 and neither is `done`.
+    const resumeAwait = store.findSetupError(row, "resume-await");
+    if (resumeAwait) {
       if (queue.length === 0) {
-        await toStalled(row, "продолжение не подняло новый ход");
+        if (resumeAwait.message.startsWith("errored:")) {
+          await toFailed(row, "продолжение не подняло новый ход");
+        } else {
+          await toStalled(row, "продолжение не подняло новый ход");
+        }
       }
       return; // queue holds the resume message — give it time to deliver
     }
     if (queue.length === 0) {
+      // §5.3 r23 `errored`: the turn may have ended with an error while
+      // the thread went idle — the journal tail decides between a resume
+      // nudge (→ `failed` on repeat) and `done`.
+      const verdict = await lastTurnError(row);
+      if (verdict === null) return; // unreadable journal is not a clean one
+      if (verdict !== "clean") {
+        await handleErrored(row, verdict.text, now());
+        return;
+      }
       store.setStatus(row.id, "done");
       clearMarks(row.id);
+      await collectRoundResult(store.get(row.id) ?? row);
     }
   };
 
@@ -998,13 +1227,18 @@ export function createWatchdog(deps: WatchdogDeps) {
   /** §5.1 first-response window + §5.3 `maxRunSeconds` — the timer pass. */
   const checkTimers = async () => {
     const { policy } = await deps.loadPolicy();
-    const firstMs =
-      (policy?.firstResponseSeconds ?? DEFAULT_FIRST_RESPONSE_SECONDS) * 1000;
+    // §2 rule 4 (r23): a route's own `firstResponseSeconds` overrides the
+    // global window — slow cold starts (agy takes 2–3 min) must not stall.
+    const firstMsOf = (row: DelegationRow) =>
+      (policy?.routes[row.route]?.firstResponseSeconds ??
+        policy?.firstResponseSeconds ??
+        DEFAULT_FIRST_RESPONSE_SECONDS) * 1000;
     const maxRunMs =
       (policy?.maxRunSeconds ?? DEFAULT_MAX_RUN_SECONDS) * 1000;
     const t = now();
     for (const row of store.listActive()) {
       if (row.status !== "running") continue;
+      const firstMs = firstMsOf(row);
       if (
         row.turn_started_at != null &&
         row.first_response_at == null &&
@@ -1028,15 +1262,21 @@ export function createWatchdog(deps: WatchdogDeps) {
         }
         // Re-read the thread: a finished turn may already have idled it.
         const thread = await getThread(row.thread_id);
-        // §5.3 rev 15: a pending resume shares the window — an idle
-        // executor with an empty queue never began the new turn → stalled.
-        if (hasSetupError(fresh, "resume-await")) {
+        // §5.3 rev 15/23: a pending resume shares the window — an idle
+        // executor with an empty queue never began the new turn. An
+        // errored resume lands `failed`, an interrupted one `stalled`.
+        const resumeAwait = store.findSetupError(fresh, "resume-await");
+        if (resumeAwait) {
           if (!thread || thread.status !== "active") {
             const queue = await deps.threads.queuedMessages
               .list({ threadId: row.thread_id! })
               .catch(() => null);
             if (queue && queue.length === 0) {
-              await toStalled(fresh, "продолжение не подняло новый ход");
+              if (resumeAwait.message.startsWith("errored:")) {
+                await toFailed(fresh, "продолжение не подняло новый ход");
+              } else {
+                await toStalled(fresh, "продолжение не подняло новый ход");
+              }
             }
           }
           continue;
@@ -1273,10 +1513,10 @@ export function createWatchdog(deps: WatchdogDeps) {
         summary.errors.push(`delegation #${row.id}: ${message(e)}`);
       }
     }
-    // §5.4 rev 13: stalled/quota rows whose stop never confirmed get the
-    // stop retried; once confirmed, the reissue decision runs as usual.
-    // §7: bounded by retry_count — exhausted rows stop retrying.
-    for (const row of store.listByStatuses(["stalled", "quota"])) {
+    // §5.4 rev 13/23: stalled/quota/failed rows whose stop never confirmed
+    // get the stop retried; once confirmed, the reissue decision runs as
+    // usual. §7: bounded by retry_count — exhausted rows stop retrying.
+    for (const row of store.listByStatuses(["stalled", "quota", "failed"])) {
       if (!hasSetupError(row, "watchdog-stop")) continue;
       if (hasSetupError(row, "retry-exhausted")) continue;
       summary.scanned++;
@@ -1290,7 +1530,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           const cur = store.get(row.id) ?? row;
           await outcomeAndMaybeReissue(
             cur,
-            cur.status as "stalled" | "quota",
+            cur.status as "stalled" | "quota" | "failed",
             detail,
           );
         } else {
