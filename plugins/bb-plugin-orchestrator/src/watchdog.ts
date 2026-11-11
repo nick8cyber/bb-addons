@@ -95,6 +95,16 @@ const SUPERSEDED = new Set(["reissued", "stalled", "quota"]);
 /** §16.2: the tasks plugin's comment fan-out prefix — a turn opened by
  * it is a notification wake, not a revive. */
 const TRACKER_COMMENT_PREFIX = "New comment on task ";
+
+/** §16.2: text of a `client/turn/requested` journal entry. */
+const requestText = (e: WatchdogThreadEvent): string =>
+  (
+    ((e.data as { input?: { text?: string }[] } | null | undefined)?.input ??
+      []) as { text?: string }[]
+  )
+    .map((p) => p?.text ?? "")
+    .join("")
+    .trim();
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /**
@@ -1403,17 +1413,74 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
   };
 
-  const maybeRevive = async (row: DelegationRow): Promise<boolean> => {
-    if (
-      !row.thread_id ||
-      !(REVIVABLE.has(row.status) || SUPERSEDED.has(row.status))
-    ) {
-      return false;
+  /**
+   * §16.2 r25 (PLUG-193): a wake opened ONLY by tracker comment
+   * notifications is not a revive and never reaches the coordinator —
+   * the rogue turn of a TERMINAL delegation is just stopped (the plugin
+   * journal records it), the status stands and the cursor moves past
+   * the consumed turn. The stop is confirmed by a read-back like
+   * suppressWake's; an unconfirmed stop keeps the cursor so the next
+   * pass retries.
+   */
+  const silentStopWake = async (row: DelegationRow, turnSeq: number) => {
+    let confirmed = false;
+    try {
+      await deps.threads.stop({ threadId: row.thread_id! });
+      const t = await getThread(row.thread_id!).catch(() => null);
+      confirmed =
+        !t ||
+        !!t.deletedAt ||
+        !!t.archivedAt ||
+        t.status === "idle" ||
+        t.status === "error";
+    } catch (e) {
+      if (/not.?found|does not exist|deleted|archiv/i.test(message(e))) {
+        confirmed = true;
+      } else {
+        log.warn?.(
+          `orchestrator: tracker-wake stop ${row.thread_id}: ${message(e)}`,
+        );
+      }
     }
+    if (confirmed) {
+      store.advanceLastSeq(row.id, turnSeq);
+      log.info?.(
+        `orchestrator: delegation #${row.id} tracker wake ` +
+          `stopped silently (turn seq ${turnSeq})`,
+      );
+    } else {
+      log.warn?.(
+        `orchestrator: tracker-wake stop of ${row.thread_id} ` +
+          `unconfirmed — next pass retries`,
+      );
+    }
+  };
+
+  /**
+   * §16.2 r25 (PLUG-193): the wake verdict reads EVERY
+   * `client/turn/requested` above `last_seq` — BB writes the request
+   * when a message is QUEUED, not when its turn starts, so judging each
+   * `turn/started` by the request right before it misreads queued
+   * batches: a coordinator's tell arriving mid-turn between two tracker
+   * comments was consumed as a tracker wake and the executor worked
+   * unsupervised. All-requests-tracker → silent stop, status stands,
+   * cursor consumed. Any other request — or none at all (an
+   * unattributed turn such as an auto-retry resume) — → the general
+   * rule: superseded/newer → suppress, otherwise revive.
+   */
+  type WakeVerdict =
+    | "none"
+    | "silent"
+    | "revived"
+    | "suppressed"
+    | "unreadable";
+  const scanTerminalWake = async (
+    row: DelegationRow,
+  ): Promise<WakeVerdict> => {
     let events: WatchdogThreadEvent[];
     try {
       events = await deps.threads.events.list({
-        threadId: row.thread_id,
+        threadId: row.thread_id!,
         afterSeq: String(row.last_seq ?? 0),
         order: "asc",
         limit: "50",
@@ -1423,76 +1490,68 @@ export function createWatchdog(deps: WatchdogDeps) {
       log.warn?.(
         `orchestrator: revive check ${row.thread_id}: ${message(e)}`,
       );
-      return false; // unreadable — keep the outcome; a later pass re-checks
+      return "unreadable"; // a later pass re-checks
     }
     const starts = events.filter((e) => e.type === "turn/started");
-    if (starts.length === 0) return false;
-    // §16.2 r25 (PLUG-190): EVERY new turn/started is decided on its own
-    // opening message — judging once by the FIRST turn let a tracker
-    // comment wake ("New comment on task …") mask a later genuine turn
-    // forever: last_seq never moved, the executor worked unsupervised
-    // and its result was never delivered. A tracker wake is consumed by
-    // advancing last_seq past it; the next turn then gets its verdict.
+    if (starts.length === 0) return "none";
     const turnSeq = Math.max(...starts.map((e) => e.seq));
-    const reqTextBefore = (seq: number): string => {
-      const request = events
-        .filter(
-          (e) => e.type === "client/turn/requested" && e.seq < seq,
-        )
-        .at(-1);
-      return (
-        (
-          (request?.data as
-            | { input?: { text?: string }[] }
-            | null
-            | undefined)?.input ?? []
-        ) as { text?: string }[]
+    const requests = events.filter(
+      (e) => e.type === "client/turn/requested",
+    );
+    if (
+      requests.length > 0 &&
+      requests.every((r) =>
+        requestText(r).startsWith(TRACKER_COMMENT_PREFIX),
       )
-        .map((p) => p?.text ?? "")
-        .join("")
-        .trim();
-    };
-    for (const start of starts) {
-      const superseded = SUPERSEDED.has(row.status);
-      const newer = store.hasNewerForTask(row.task_key, row.id);
-      if (superseded || newer) {
-        await suppressWake(
-          row,
-          turnSeq,
-          newer
-            ? "у задачи есть более новое делегирование"
-            : `исход «${row.status}» уже зафиксирован`,
-        );
-        // A finished row keeps delivering its outcome; a superseded
-        // status never reaches the delivery list anyway.
-        return superseded;
-      }
-      if (reqTextBefore(start.seq).startsWith(TRACKER_COMMENT_PREFIX)) {
-        // A notification wake, not a revive — consume it so the next
-        // turn/started is judged on its own message.
-        store.advanceLastSeq(row.id, start.seq);
-        continue;
-      }
-      if (!store.revive(row.id)) {
-        // Lost the race — another delegation of the task is active
-        // (the revive() transaction guards the partial unique index).
-        await suppressWake(
-          row,
-          turnSeq,
-          "у задачи есть более новое делегирование",
-        );
-        return false;
-      }
-      clearMarks(row.id);
-      log.info?.(
-        `orchestrator: delegation #${row.id} revived (turn/started)`,
-      );
-      // Drain the stream so the new turn's `turn/started` reopens
-      // supervision (turn_started_at, cleared marks).
-      await processStream(store.get(row.id) ?? row);
-      return true;
+    ) {
+      await silentStopWake(row, turnSeq);
+      return "silent";
     }
-    return false;
+    const superseded = SUPERSEDED.has(row.status);
+    const newer = store.hasNewerForTask(row.task_key, row.id);
+    if (superseded || newer) {
+      await suppressWake(
+        row,
+        turnSeq,
+        newer
+          ? "у задачи есть более новое делегирование"
+          : `исход «${row.status}» уже зафиксирован`,
+      );
+      return "suppressed";
+    }
+    if (!store.revive(row.id)) {
+      // Lost the race — another delegation of the task is active
+      // (the revive() transaction guards the partial unique index).
+      await suppressWake(
+        row,
+        turnSeq,
+        "у задачи есть более новое делегирование",
+      );
+      return "suppressed";
+    }
+    clearMarks(row.id);
+    log.info?.(`orchestrator: delegation #${row.id} revived (turn/started)`);
+    // Drain the stream so the new turn's `turn/started` reopens
+    // supervision (turn_started_at, cleared marks).
+    await processStream(store.get(row.id) ?? row);
+    return "revived";
+  };
+
+  const maybeRevive = async (row: DelegationRow): Promise<boolean> => {
+    if (
+      !row.thread_id ||
+      !(REVIVABLE.has(row.status) || SUPERSEDED.has(row.status))
+    ) {
+      return false;
+    }
+    const verdict = await scanTerminalWake(row);
+    // A finished row keeps delivering its outcome; "suppressed" blocks
+    // only for superseded statuses (they never reach the delivery list
+    // anyway), "revived" always blocks — the outcome is void.
+    return (
+      verdict === "revived" ||
+      (verdict === "suppressed" && SUPERSEDED.has(row.status))
+    );
   };
 
   /**
@@ -2298,21 +2357,28 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
   };
 
+  /** §16.5 rollout (PLUG-193 #4): give up the last_seq sync after this
+   * many incomplete passes (a permanently unreadable journal). */
+  const LASTSEQ_SYNC_PASSES = 10;
+
   /**
    * §16.5 rollout (PLUG-190): delegations closed BEFORE the delivery
    * columns existed carry a stale `last_seq` — on the live base ten
    * terminal rows had turn/started events above their cursor, so the
    * first post-upgrade event would revive them on a HISTORICAL turn or
-   * suppress a thread's CURRENT work. One pass lifts every terminal
-   * row's cursor to its thread's journal tip; `plugin_meta` makes it
+   * suppress a thread's CURRENT work. One pass lifts every such row's
+   * cursor to its thread's journal tip; `plugin_meta` makes it
    * once-per-install, and a journal that cannot be read retries the
    * pass on the next reconcile (a gone thread cannot revive — it counts
-   * as synced).
+   * as synced). PLUG-193 #4: the scope is rows terminal AT THE
+   * MIGRATION (`result_notice='legacy'`, `listLegacyTerminal`) — a row
+   * closed after the rollout keeps its live cursor so a genuine
+   * post-cursor turn still reaches the §16.2 wake rule.
    */
   const syncTerminalLastSeq = async (s: ReconcileSummary) => {
     if (store.metaGet("legacy-lastseq") === "1") return;
     let complete = true;
-    for (const row of store.listTerminalWithThread()) {
+    for (const row of store.listLegacyTerminal()) {
       let tip: WatchdogThreadEvent[] | undefined;
       try {
         tip = await deps.threads.events.list({
@@ -2338,7 +2404,67 @@ export function createWatchdog(deps: WatchdogDeps) {
       }
       if (tip[0]) store.advanceLastSeq(row.id, tip[0]!.seq);
     }
-    if (complete) store.metaSet("legacy-lastseq", "1");
+    if (complete) {
+      store.metaSet("legacy-lastseq", "1");
+      return;
+    }
+    // PLUG-193 #4: an unrecoverable read must not rescan the whole
+    // terminal list forever — bound the retries, then record the flag
+    // with a journal error (the unscanned rows keep a stale cursor and
+    // are still covered by the §16.2 wake scan below).
+    const attempts =
+      Number(store.metaGet("legacy-lastseq-attempts") ?? "0") + 1;
+    store.metaSet("legacy-lastseq-attempts", String(attempts));
+    if (attempts >= LASTSEQ_SYNC_PASSES) {
+      store.metaSet("legacy-lastseq", "1");
+      log.error?.(
+        `orchestrator: lastseq sync incomplete after ${attempts} ` +
+          `passes — giving up`,
+      );
+    }
+  };
+
+  /**
+   * §16.2 r25 (PLUG-193 #3): a plugin restart mid-turn loses the
+   * `experimental_thread.events` kick — the reconcile pass applies the
+   * revive rule to every terminal row whose journal still holds
+   * post-cursor turns. Bounded: each terminal row is scanned ONCE per
+   * process start — an unreadable journal keeps the row pending for
+   * the next pass, a gone thread counts as scanned (it cannot produce
+   * a reviving turn). Wakes while the plugin runs arrive through
+   * onThreadEvents.
+   */
+  let terminalWakesPrimed = false;
+  const terminalWakesPending = new Set<number>();
+  const scanTerminalWakes = async (s: ReconcileSummary) => {
+    if (!terminalWakesPrimed) {
+      terminalWakesPrimed = true;
+      for (const row of store.listTerminalWithThread()) {
+        terminalWakesPending.add(row.id);
+      }
+    }
+    for (const id of [...terminalWakesPending]) {
+      const row = store.get(id);
+      if (!row || isActive(row.status) || !row.thread_id) {
+        terminalWakesPending.delete(id);
+        continue;
+      }
+      s.scanned++;
+      const verdict = await scanTerminalWake(row);
+      if (verdict !== "unreadable") {
+        terminalWakesPending.delete(id);
+        continue;
+      }
+      // Unreadable journal — retry next pass unless the thread is gone.
+      let gone = false;
+      try {
+        const t = await getThread(row.thread_id);
+        gone = !t || !!t.deletedAt || !!t.archivedAt;
+      } catch (e) {
+        s.errors.push(`wake scan ${row.thread_id}: ${message(e)}`);
+      }
+      if (gone) terminalWakesPending.delete(id);
+    }
   };
 
   const reconcile = async (): Promise<ReconcileSummary> => {
@@ -2409,6 +2535,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       await syncTerminalLastSeq(summary);
     } catch (e) {
       summary.errors.push(`lastseq sync: ${message(e)}`);
+    }
+    // §16.2 r25: terminal rows with post-cursor turns (a wake missed at
+    // a plugin restart) get the revive rule once per process start.
+    try {
+      await scanTerminalWakes(summary);
+    } catch (e) {
+      summary.errors.push(`terminal wakes: ${message(e)}`);
     }
     // §16.5: every done/cancelled row delivers its result exactly once —
     // the pass resends until `result_notified_at` records the delivery.

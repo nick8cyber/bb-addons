@@ -202,15 +202,23 @@ test("the r24/25 migrations apply on a base that recorded main's 0–14", async 
     `INSERT INTO delegations (
       task_key, coordinator_thread_id, level, route, preset, provider,
       status, created_at, updated_at
-    ) VALUES ('PLUG-0', 'thr_c', 'simple', 'simple', 'simple', 'p', 'done', 1, 1)`,
+    ) VALUES ('PLUG-0', 'thr_c', 'simple', 'simple', 'simple', 'p', 'done', 1, 1),
+             ('PLUG-1', 'thr_c', 'simple', 'simple', 'simple', 'p', 'failed', 1, 1),
+             ('PLUG-2', 'thr_c', 'simple', 'simple', 'simple', 'p', 'running', 1, 1)`,
   ).run();
   migrate([...MIGRATIONS]); // must not throw "does not match"
   const recorded = db
     .prepare(`SELECT count(*) n FROM _bb_migrations`)
     .get() as { n: number };
   assert.equal(recorded.n, MIGRATIONS.length);
-  const legacy = db
-    .prepare(`SELECT result_notice FROM delegations WHERE task_key = 'PLUG-0'`)
-    .get() as { result_notice: string };
-  assert.equal(legacy.result_notice, "legacy");
+  // PLUG-193 #4: EVERY row terminal at the migration is marked — the
+  // `legacy` notice doubles as the last_seq-sync scope.
+  const notices = db
+    .prepare(`SELECT task_key, result_notice FROM delegations ORDER BY task_key`)
+    .all() as { task_key: string; result_notice: string | null }[];
+  assert.deepEqual(notices, [
+    { task_key: "PLUG-0", result_notice: "legacy" },
+    { task_key: "PLUG-1", result_notice: "legacy" },
+    { task_key: "PLUG-2", result_notice: null },
+  ]);
 });

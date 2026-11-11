@@ -128,10 +128,15 @@ export const MIGRATIONS: readonly string[] = [
   // §7 rev 25 rollout: delegations finished BEFORE the §16.5 delivery
   // columns existed already reached the coordinator through BB's own
   // parent notifications — they are marked `legacy` so the first
-  // reconcile does not re-send every stale result (PLUG-184 B1).
+  // reconcile does not re-send every stale result (PLUG-184 B1). The
+  // marker covers EVERY terminal status: it doubles as the rollout
+  // last_seq-sync scope — only rows already terminal at the migration
+  // may be force-advanced (PLUG-193 #4; a row closed after the rollout
+  // keeps its live cursor for the §16.2 wake rule).
   `UPDATE delegations SET result_notified_at = CAST(strftime('%s','now') AS INTEGER) * 1000,
      result_notice = 'legacy'
-   WHERE status IN ('done','cancelled') AND result_notified_at IS NULL`,
+   WHERE status IN ('done','cancelled','failed','stalled','quota','reissued')
+     AND result_notified_at IS NULL`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -650,8 +655,23 @@ export class DelegationStore {
       .all(Date.now() - 120_000) as DelegationRow[];
   }
 
-  /** Terminal rows that still name a thread — the §16.5 rollout's
-   * last_seq sync scope (a stale cursor would let a HISTORICAL turn
+  /** §16.5 rollout (PLUG-193 #4): rows already terminal when the
+   * delivery migration ran — the last_seq sync scope. A row closed
+   * after the rollout (`result_notice` unset/'plugin'/'bb') is never
+   * force-advanced: its post-cursor turns are real and go through the
+   * §16.2 wake rule. */
+  listLegacyTerminal(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE result_notice = 'legacy' AND thread_id IS NOT NULL
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /** Terminal rows that still name a thread — the §16.2 wake scan
+   * scope (PLUG-193 #3; a stale cursor would let a HISTORICAL turn
    * revive or suppress them, PLUG-190). */
   listTerminalWithThread(): DelegationRow[] {
     return this.db

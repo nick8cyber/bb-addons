@@ -3307,7 +3307,7 @@ test("PLUG-184 B1: an old base's migration marks legacy results; first reconcile
   );
 });
 
-test("PLUG-184 B2: a tracker comment waking an OLD round → cancel+stop, status stands", async () => {
+test("PLUG-184 B2: a tracker comment waking an OLD round → silent stop, no line", async () => {
   const h = makeHarness();
   const old = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
   h.store.setStatus(old.id, "done");
@@ -3323,17 +3323,21 @@ test("PLUG-184 B2: a tracker comment waking an OLD round → cancel+stop, status
     ev(7, "turn/started", T0 + 100),
   ]);
   await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
-  assert.equal(h.store.get(old.id)!.status, "done");
-  assert.deepEqual(h.retryCancels, ["thr_e1"]); // §16.1 cancel BEFORE stop
+  const fresh = h.store.get(old.id)!;
+  assert.equal(fresh.status, "done");
+  // §16.2 r25: a tracker-only wake is a notification, not a rogue turn —
+  // stopped quietly; the queued retry fires later and is judged then.
   assert.deepEqual(h.stops, ["thr_e1"]);
+  assert.deepEqual(h.retryCancels, []);
+  assert.equal(fresh.last_seq, 7);
   assert.equal(
     h.sends.filter((x) => x.threadId === "thr_coord").length,
-    1,
-    "one suppression line",
+    0,
+    "no coordinator line on a notification wake",
   );
 });
 
-test("PLUG-184 B2: a tracker comment on the LATEST round is not a revive", async () => {
+test("PLUG-184 B2: a tracker comment on the LATEST round → silent stop, not a revive", async () => {
   const h = makeHarness();
   const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
   h.store.setStatus(row.id, "done");
@@ -3351,7 +3355,11 @@ test("PLUG-184 B2: a tracker comment on the LATEST round is not a revive", async
   const fresh = h.store.get(row.id)!;
   assert.equal(fresh.status, "done"); // stays finished — notification wake
   assert.equal(fresh.revived_count, 0);
-  assert.deepEqual(h.stops, []); // the latest round is never stopped
+  // §16.2 r25: the tracker-driven turn is stopped silently — without it
+  // the woken executor would work unmonitored.
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  assert.equal(fresh.last_seq, 7);
+  assert.equal(h.sends.length, 0);
 });
 
 test("PLUG-184 B2: auto-retry lifts a reissued thread → cancel+stop+one line", async () => {
@@ -3772,6 +3780,9 @@ test("PLUG-190 #5: a superseded row's stale cursor cannot stop a thread's curren
   const row = h.insertActive({ taskKey: "PLUG-6", threadId: "thr_old" });
   h.store.setStatus(row.id, "stalled");
   h.store.advanceLastSeq(row.id, 5);
+  // PLUG-193 #4: the rollout marks EVERY terminal row `legacy` — a
+  // pre-upgrade stalled row is inside the sync scope.
+  h.store.setResultNotified(row.id, "legacy");
   h.threadDtos.set("thr_old", dto("thr_old", "active"));
   // thr_old's journal already holds a post-stall turn (pre-upgrade noise).
   h.eventLog.set("thr_old", [
@@ -3788,13 +3799,210 @@ test("PLUG-190 #5: the sync is once-per-install and tolerates gone threads", asy
   const gone = h.insertActive({ taskKey: "PLUG-7", threadId: "thr_dead" });
   h.store.setStatus(gone.id, "failed");
   h.store.advanceLastSeq(gone.id, 3);
-  // thr_dead is not in threadDtos — events.list throws, getThread throws.
+  // PLUG-193 #4: the rollout marks EVERY terminal row `legacy`.
+  h.store.setResultNotified(gone.id, "legacy");
+  // thr_dead is not in threadDtos and its journal is unreachable —
+  // a gone thread cannot produce a reviving turn, so it counts synced.
+  h.eventsBlocked.add("thr_dead");
   await h.wd.reconcile();
   assert.equal(h.store.metaGet("legacy-lastseq"), "1", "gone threads count synced");
   // Second pass does not rescan (the flag short-circuits).
   const callsBefore = h.ops.length;
   await h.wd.reconcile();
   assert.equal(h.ops.length, callsBefore);
+});
+
+test("PLUG-193 #1: a coordinator tell queued between tracker wakes → revive", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // The review scenario: a tracker comment opens a turn; while it runs,
+  // the coordinator tells the thread AND another comment lands — all
+  // queued BEFORE the next turn/started (BB writes requests on enqueue).
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: fyi" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+    ev(8, "client/turn/requested", T0 + 2000, {
+      input: [{ text: "[bb message from thread:thr_coord] доделай" }],
+    }),
+    ev(9, "client/turn/requested", T0 + 2100, {
+      input: [{ text: "New comment on task PLUG-1 from thr_y: more" }],
+    }),
+    ev(10, "turn/started", T0 + 2200),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 10 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running", "a genuine request must revive");
+  assert.equal(fresh.revived_count, 1);
+  assert.equal(fresh.result_notified_at, null, "delivery re-armed");
+});
+
+test("PLUG-193 #1: an all-tracker batch → one silent stop, cursor consumed", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: one" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+    ev(8, "client/turn/requested", T0 + 200, {
+      input: [{ text: "New comment on task PLUG-1 from thr_y: two" }],
+    }),
+    ev(9, "turn/started", T0 + 300),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 9 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.revived_count, 0);
+  assert.equal(fresh.last_seq, 9, "the batch's turns are consumed");
+  assert.deepEqual(h.stops, ["thr_e1"], "one silent stop for the wake");
+  assert.equal(
+    h.sends.filter((x) => x.threadId === "thr_coord").length,
+    0,
+    "a tracker wake never reaches the coordinator",
+  );
+});
+
+test("PLUG-193 #2: stalled + tracker wake → silent stop, no false suppression line", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "stalled");
+  h.store.advanceLastSeq(row.id, 5);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: ping" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "stalled");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+  assert.equal(fresh.last_seq, 7);
+  assert.equal(
+    h.sends.filter((x) => x.threadId === "thr_coord").length,
+    0,
+    "a tracker wake must not claim «поднял новый ход»",
+  );
+  // A REAL wake on the same row still suppresses — the silent path
+  // leaves no one-shot mark that would swallow it.
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.get("thr_e1")!.push(
+    ev(8, "client/turn/requested", T0 + 5000, {
+      input: [{ text: "[bb message from thread:thr_coord] стоп" }],
+    }),
+    ev(9, "turn/started", T0 + 5100),
+  );
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 9 });
+  assert.equal(h.stops.length, 2);
+  assert.equal(
+    h.sends.filter(
+      (x) =>
+        x.threadId === "thr_coord" &&
+        /поднял новый ход/.test(JSON.stringify(x.input)),
+    ).length,
+    1,
+    "the genuine wake gets its single suppression line",
+  );
+});
+
+test("PLUG-193 #3: reconcile revives a terminal row woken during a restart", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin"); // already delivered
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // The coordinator replied while the plugin was down — the event kick
+  // never arrived; the turn already ran and finished.
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "[bb message from thread:thr_coord] ответ" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+    ev(8, "turn/completed", T0 + 2000, { status: "completed" }),
+  ]);
+  await h.wd.reconcile();
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.revived_count, 1);
+});
+
+test("PLUG-193 #4: the last_seq sync covers only rows terminal at the migration", async () => {
+  const h = makeHarness();
+  const legacy = h.insertActive({ taskKey: "PLUG-8", threadId: "thr_old" });
+  h.store.setStatus(legacy.id, "done");
+  h.store.advanceLastSeq(legacy.id, 5);
+  h.store.setResultNotified(legacy.id, "legacy");
+  const fresh = h.insertActive({ taskKey: "PLUG-9", threadId: "thr_new" });
+  h.store.setStatus(fresh.id, "done");
+  h.store.advanceLastSeq(fresh.id, 5);
+  h.store.setResultNotified(fresh.id, "plugin"); // closed AFTER rollout
+  h.threadDtos.set("thr_old", dto("thr_old", "idle"));
+  h.threadDtos.set("thr_new", dto("thr_new", "active"));
+  // Both threads hold a post-cursor tracker wake; only the legacy row
+  // is force-advanced — the post-rollout row gets the §16.2 wake rule.
+  const wake = () => [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: ping" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ];
+  h.eventLog.set("thr_old", wake());
+  h.eventLog.set("thr_new", wake());
+  await h.wd.reconcile();
+  assert.equal(
+    h.store.get(legacy.id)!.last_seq,
+    7,
+    "legacy cursor lifted to the journal tip",
+  );
+  assert.deepEqual(
+    h.stops,
+    ["thr_new"],
+    "the post-rollout row's wake is handled, not skipped by the sync",
+  );
+  assert.equal(h.store.get(fresh.id)!.status, "done");
+  // Once per process: a wake landing while the plugin runs is
+  // onThreadEvents' job — the next pass does not rescan clean rows.
+  h.eventLog.get("thr_new")!.push(
+    ev(8, "client/turn/requested", T0 + 5000, {
+      input: [{ text: "New comment on task PLUG-9 from thr_y: again" }],
+    }),
+    ev(9, "turn/started", T0 + 5100),
+  );
+  await h.wd.reconcile();
+  assert.equal(h.stops.length, 1, "no rescan after the startup pass");
+});
+
+test("PLUG-193 #4: an unreadable journal bounds the last_seq sync retries", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-10", threadId: "thr_blk" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "legacy");
+  h.eventsBlocked.add("thr_blk");
+  h.threadDtos.set("thr_blk", dto("thr_blk", "idle")); // exists — retries
+  h.store.metaSet("legacy-lastseq-attempts", "9");
+  await h.wd.reconcile();
+  assert.equal(
+    h.store.metaGet("legacy-lastseq"),
+    "1",
+    "gives up after the pass bound with a journal error",
+  );
 });
 
 test("PLUG-190 #6: failed without autoFallback + retry-cancel failure → ONE message", async () => {
