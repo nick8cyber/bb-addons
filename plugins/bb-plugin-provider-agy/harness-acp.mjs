@@ -29,6 +29,8 @@ writeFileSync(process.env.AGY_FAKE_CONTROL, "{}\n");
 const setControl = (obj) => { const c = JSON.parse(readFileSync(process.env.AGY_FAKE_CONTROL, "utf8")); Object.assign(c, obj); writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify(c)); };
 process.env.AGY_AUTO_RETRY_MAX = "2";
 process.env.AGY_AUTO_RETRY_MAX_WAIT_MS = "30000";
+delete process.env.AGY_DISABLE_SUBAGENTS;
+delete process.env.AGY_DISABLE_MEMORY;
 
 // Pool accounts a1..a4 (a2 has a proxy).
 for (const label of ["a1", "a2", "a3", "a4"]) {

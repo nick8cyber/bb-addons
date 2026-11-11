@@ -675,6 +675,104 @@ check(
   );
 }
 
+// A24: label containing dots (e.g. "x..y") is valid and not a ghost when
+// its accounts/ directory exists; only literal ".." is a ghost.
+{
+  const xy = mkdtempSync(join(tmpdir(), "agy-localstate-dots-"));
+  mkdirSync(join(xy, "accounts", "a1"), { recursive: true });
+  mkdirSync(join(xy, "accounts", "x..y"), { recursive: true });
+  writeJson(join(xy, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(xy, "accounts-overlay.json"), {
+    accounts: {
+      "x..y": {
+        cooldownUntilMs: 5_000, lastUsedMs: 0,
+        lastError: "xy", writtenMs: Date.now(),
+      },
+      "..": {
+        cooldownUntilMs: 5_000, lastUsedMs: 0,
+        lastError: "dotdot", writtenMs: Date.now(),
+      },
+    },
+  });
+  const l = loadLedger(xy);
+  markAccountCooldown(l, "a1", Date.now() + 5_000, "touch");
+  saveLedger(xy, l);
+  const ov = readJson(join(xy, "accounts-overlay.json"))?.accounts ?? {};
+  const sh = readJson(join(xy, "accounts-state.json"))?.accounts ?? {};
+  check(
+    "localstate/dotted-label-persists-not-ghost",
+    Object.hasOwn(ov, "x..y") &&
+      Object.hasOwn(sh, "x..y") &&
+      !Object.hasOwn(ov, "..") &&
+      !Object.hasOwn(sh, ".."),
+    JSON.stringify({ ov: Object.keys(ov), sh: Object.keys(sh) }),
+  );
+}
+
+// A25: conversation pin with prototype name (e.g. "constructor", "toString")
+// is detected as absent from disk and written to conversations-state.json.
+{
+  const cp = mkdtempSync(join(tmpdir(), "agy-localstate-protoconv-"));
+  writeJson(join(cp, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(cp, "conversations-state.json"), {
+    conversations: {},
+  });
+  const l = loadLedger(cp);
+  l.conversations.constructor = "a1";
+  l.conversations.toString = "a1";
+  saveLedger(cp, l);
+  const conv =
+    readJson(join(cp, "conversations-state.json"))?.conversations ?? {};
+  check(
+    "localstate/proto-named-conversation-persists",
+    Object.hasOwn(conv, "constructor") &&
+      conv.constructor === "a1" &&
+      Object.hasOwn(conv, "toString") &&
+      conv.toString === "a1",
+    JSON.stringify(conv),
+  );
+}
+
+// A26: empty label "" is a ghost even though existsSync(join(accountsDir, ""))
+// resolves to accountsDir and returns true.
+{
+  const eg = mkdtempSync(join(tmpdir(), "agy-localstate-emptyghost-"));
+  mkdirSync(join(eg, "accounts", "a1"), { recursive: true });
+  writeJson(join(eg, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(eg, "accounts-overlay.json"), {
+    accounts: {
+      "": {
+        cooldownUntilMs: 5_000, lastUsedMs: 0,
+        lastError: "empty", writtenMs: Date.now(),
+      },
+    },
+  });
+  const l = loadLedger(eg);
+  markAccountCooldown(l, "a1", Date.now() + 5_000, "touch");
+  saveLedger(eg, l);
+  const ov = readJson(join(eg, "accounts-overlay.json"))?.accounts ?? {};
+  const sh = readJson(join(eg, "accounts-state.json"))?.accounts ?? {};
+  check(
+    "localstate/empty-label-is-ghost",
+    !Object.hasOwn(ov, "") &&
+      !Object.hasOwn(sh, "") &&
+      ov.a1 !== undefined,
+    JSON.stringify({ ov: Object.keys(ov), sh: Object.keys(sh) }),
+  );
+}
+
 // ===========================================================================
 // Part B — end-to-end on the built bridge, once per transport.
 // ===========================================================================

@@ -168,7 +168,7 @@ export function loadLedger(dataDir: string): AccountsLedger {
   const localConversations = local?.conversations ?? {};
   if (
     Object.keys(legacyConversations).some(
-      (key) => !(key in localConversations),
+      (key) => !Object.hasOwn(localConversations, key),
     )
   ) {
     // Eager migration: the next keeper sync would erase shared pins this
@@ -246,7 +246,7 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
     )?.conversations ?? {};
   const pinKeys = new Set(ledger.dirtyPins ?? []);
   for (const key of Object.keys(ledger.conversations)) {
-    if (!(key in diskConversations)) {
+    if (!Object.hasOwn(diskConversations, key)) {
       pinKeys.add(key);
     }
   }
@@ -275,18 +275,20 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
     readJsonFile<Partial<AccountsLedger>>(sharedPath)?.accounts ?? {};
   // Object.hasOwn, not `in`: the map is a JSON.parse result, so labels
   // like "constructor" or "toString" would otherwise pass as present via
-  // the prototype chain and never be seen as ghosts. A label carrying
+  // the prototype chain and never be seen as ghosts. An empty label,
   // path separators or ".." can never be an account home — it is a ghost
-  // outright, and probing the filesystem for it would read outside
-  // dataDir. When the shared file itself is broken the map reads as zero
-  // accounts: labels that exist only there (a removed account still on
+  // outright, and probing the filesystem for it would read dataDir or
+  // outside it. When the shared file itself is broken the map reads as
+  // zero accounts: labels that exist only there (a removed account still on
   // cooldown) are then all judged ghosts and purged — the torn-write
   // class of failure, bounded in ADR-0025 "Границы".
   const isGhostLabel = (label: string): boolean =>
     !Object.hasOwn(diskSharedAccounts, label) &&
-    (label.includes("/") ||
+    (!label ||
+      label === "." ||
+      label === ".." ||
+      label.includes("/") ||
       label.includes("\\") ||
-      label.includes("..") ||
       !existsSync(join(accountsDir(dataDir), label)));
 
   // Overlay is written only for labels this instance dirtied; a save done
