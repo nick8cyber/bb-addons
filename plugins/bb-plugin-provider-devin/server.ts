@@ -35,6 +35,13 @@ export default function plugin(bb: BbPluginApi) {
         "Prevent Devin from starting native subagents (run_subagent, read_subagent) so agents use bb for delegation. Applies by managing subagents_enabled in the Devin user config — the only lever devin acp reads; the prior value is restored when the setting is turned off.",
       default: false,
     },
+    memoryEnabled: {
+      type: "boolean",
+      label: "Devin native memory",
+      description:
+        "Reserved toggle — this devin acp exposes no local memory lever (Memory Drive/notes are cloud-side, not gated by user config), so the setting only plumbs the decision through for a future lever.",
+      default: true,
+    },
   });
   bb.providers.register({
     id: "acp-devin",
@@ -91,6 +98,7 @@ export default function plugin(bb: BbPluginApi) {
     // to subagents_enabled in the Devin user config.
     deriveProviderOptions: (ctx) => ({
       providerSubagentsEnabled: ctx.settings.subagentsDisabled !== true,
+      providerMemoryEnabled: ctx.settings.memoryEnabled !== false,
     }),
   });
 }

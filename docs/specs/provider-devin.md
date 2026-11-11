@@ -42,3 +42,9 @@ revision: 2 (замечания ревью PLUG-131)
 - У Devin нет per-session провода для запрета: `devin acp` читает только юзерский конфиг (`subagents_enabled`, документирован как user-only, применяется живьём). Host-обёртка (`host.ts` + `src/subagent-gate.mjs`) на thread/start|resume|fork стемпит `subagents_enabled:false` при запрете и откатывает ровно свой стемп при включении (prior хранится в `dataDir/subagents-gate.json`); чужой `false` в конфиге (devin-hooks/install.py) не трогается. JSONC-комментарии конфига сохраняются (правки value-in-place).
 - Покрытие: `node --test scripts/subagent-gate.test.mjs` (parse/insert/flip/restore, JSONC).
 
+## 4. Центральная настройка памяти (11.11.2026)
+
+- `memoryEnabled` (default **true**) → `providerMemoryEnabled` на thread/start|resume|fork, тот же контракт codex/claude-code/agy.
+- Локального рычага у `devin acp` нет: Memory Drive/auto-notes — облачная подсистема (события `memory_update`, `note_used`, knowledge_generation), в схеме юзер-конфига ключ отсутствует; `disabled_tools` принимает имена тулов, но memory-тула в реестре нет — инъектить имена наугад не стали (недоказуемый эффект + риск строгой валидации чужого конфига).
+- `applyMemoryGate` в host.ts честный no-op: лог «OFF requested … nothing applied» в `dataDir/subagents-gate.log`. Точка подключения уже есть — появится `memory_enabled`/memory-tool в devin, сюда одна строка.
+
