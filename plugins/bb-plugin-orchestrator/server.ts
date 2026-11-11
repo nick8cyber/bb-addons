@@ -36,6 +36,7 @@ import {
 import {
   buildAgentConfiguration,
   fallbackAgentConfiguration,
+  migratePluginThreadRoles,
   type ExecutorProbes,
   type ThreadFacts,
 } from "./src/agent-config.js";
@@ -64,6 +65,7 @@ import {
   handleMessageDispatch,
   isRoleId,
   PICKABLE_ROLE_IDS,
+  roleForLevel,
   type RoleDecisionProbes,
   type RoleId,
 } from "./src/roles.js";
@@ -203,6 +205,13 @@ export async function createPlugin(
         "§14/§16.6: on a merge conflict, delegate a fix round to the same task and level. Off — only report the conflict to the coordinator.",
       default: false,
     },
+    userThreadPlugins: {
+      type: "string",
+      label: "User thread plugins",
+      description:
+        "§17.1: plugin ids whose threads continue a human chat (session handoff) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default `handoff`.",
+      default: "handoff",
+    },
     janitor: {
       type: "string",
       label: "Janitor",
@@ -214,6 +223,13 @@ export async function createPlugin(
   });
 
   let currentSettings = await settings.get();
+
+  /** §17.1 r26 (PLUG-211 Б2): plugin ids continuing a human chat —
+   * comma/space-separated in the `userThreadPlugins` setting. */
+  const userPlugins = (): readonly string[] =>
+    (currentSettings.userThreadPlugins ?? "handoff")
+      .split(/[\s,]+/)
+      .filter(Boolean);
 
   const db = bb.storage.database();
   bb.storage.migrate(db, [...MIGRATIONS]);
@@ -228,6 +244,12 @@ export async function createPlugin(
     hasFreshDispatching: (freshSince, scope) =>
       store.hasFreshDispatching(freshSince, scope),
     roleByThreadId: (threadId) => store.threadRole(threadId)?.role,
+    // §17.1 r26 (PLUG-211 Б1): the configure-time lazy rewrite of a
+    // stale `orchestrator` row on a plugin-born thread.
+    writeRole: (threadId, role) =>
+      store.setThreadRole(threadId, role, "hook"),
+    // §17.1 r26 (PLUG-211 Б2): plugins continuing a human chat.
+    userThreadPlugins: () => userPlugins(),
   };
 
   // §13.2 п.1-2: the role decision's read side — synchronous SQLite only,
@@ -239,7 +261,34 @@ export async function createPlugin(
       store.activeByTaskKey(taskKey),
     // §16.7: level→role map + "invalid policy → root chat gets no role".
     policy: () => policyLoad.policy,
+    // §17.1 r26 (PLUG-211 Б2): plugins continuing a human chat.
+    userThreadPlugins: () => userPlugins(),
   };
+
+  // §17.1 r26 (PLUG-211 Б1): one-time rewrite — hook-decided
+  // `orchestrator` rows on plugin-born threads outside
+  // `userThreadPlugins` become `none`; `configure`'s lazy fix covers
+  // what this pass cannot reach.
+  const ROLE_MIGRATION_KEY = "role-migration-r26";
+  if (store.metaGet(ROLE_MIGRATION_KEY) === undefined) {
+    void migratePluginThreadRoles(store, {
+      threadOriginPluginId: async (threadId) =>
+        (await bb.sdk.threads.get({ threadId })).originPluginId,
+      userThreadPlugins: userPlugins(),
+      log: bb.log,
+    })
+      .then((moved) => {
+        if (moved > 0) {
+          bb.log.info(
+            `orchestrator: role migration r26 rewrote ${moved} thread_roles`,
+          );
+        }
+        store.metaSet(ROLE_MIGRATION_KEY, "1");
+      })
+      .catch((e) =>
+        bb.log.warn(`orchestrator: role migration r26: ${describeError(e)}`),
+      );
+  }
 
   /**
    * Load + validate the configured policy. The structural parse never
@@ -401,7 +450,12 @@ export async function createPlugin(
       // hook itself may not touch the network, so the write rides on the
       // first session build after the decision — display-only either way.
       const decided = store.threadRole(context.thread.id)?.role;
-      if (decided && context.pluginMetadata.role !== decided) {
+      // §17.1: the `none` verdict is not a role — nothing to display.
+      if (
+        decided &&
+        isRoleId(decided) &&
+        context.pluginMetadata.role !== decided
+      ) {
         void bb.sdk.threads
           .updatePluginMetadata({
             threadId: context.thread.id,
@@ -423,6 +477,7 @@ export async function createPlugin(
         currentSettings.injectInstructions ?? true,
         instructionsText(),
         policyLoad.policy !== null,
+        userPlugins(),
       );
     }
   });
@@ -627,6 +682,18 @@ export async function createPlugin(
       },
       delegate: (d) =>
         delegate({ ...d, threadId: input.callerThreadId }),
+      // §17.2 (e2e 1): BB's notice can outrun the watchdog's `done` —
+      // merge forces the row's sync before judging its status.
+      syncRow: (row) => watchdog.syncDelegation(row),
+      // §17.2 r26 (PLUG-211 Б3): a task ref resolves by the newest
+      // EXECUTOR delegation — review/release-audit rows share the
+      // task's delegation list but are never merge targets.
+      isExecutorLevel: (level) =>
+        roleForLevel(level, policyLoad.policy) === "executor",
+      // §17.3 (мелко 2): the protected list is the janitor's
+      // `protectedBranches` setting, not the hardcoded default.
+      protectedBranches:
+        janitorConfig().config?.protectedBranches ?? undefined,
       mergeAutofix: () => currentSettings.mergeAutofix === true,
       // §16.6 `threadIds`: off → merge commits drop the task key.
       releaseThreadIds: (projectId) =>

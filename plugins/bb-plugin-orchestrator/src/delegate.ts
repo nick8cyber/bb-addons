@@ -216,6 +216,16 @@ export async function runDelegate(
     }
   }
 
+  // §17.3 (мелко 3): the release pipeline alone assigns `release-audit`
+  // — a coordinator must not mint a release auditor by hand.
+  if (level === "release-audit") {
+    throw new OrchestratorError(
+      "level-forbidden",
+      `--level release-audit назначает только конвейер выкладки`,
+      "раздавай уровни исполнения и ревью из политики",
+    );
+  }
+
   // §6: `--from` picks the continuation point, `--fresh` drops it — never
   // both; the silent precedence hid caller mistakes (PLUG-176). The check
   // precedes the limits so a mis-flagged call fails on its own error even
@@ -232,6 +242,16 @@ export async function runDelegate(
   let routeName: string;
   let route: PolicyRoute;
   if (params.preset) {
+    // §17.3 (мелко 3): even outside the policy routes the LEVEL still
+    // comes from the policy — an undeclared level is a refusal, as
+    // `pickRoute` already enforces for --route and chain picks.
+    if (!policy.levels[level]) {
+      throw new OrchestratorError(
+        "unknown-level",
+        `level "${level}" is not in the policy`,
+        `levels: ${Object.keys(policy.levels).join(", ")}`,
+      );
+    }
     // §2.3: a one-off preset dispatches outside the policy routes —
     // provider and model come from the preset itself, and its quota is
     // shared with every policy route on the same provider AND model
@@ -307,10 +327,19 @@ export async function runDelegate(
     }
   }
 
-  // §4.1 rounds: every delegate is a new round. The round continues from
-  // `--from`, else from the previous round's recorded result SHA; `--fresh`
-  // disables continuation.
-  const round = store.nextRound(taskKey);
+  // §4.1 rounds: every delegate is a new round — §17.2 (e2e 2): counted
+  // by EXECUTOR-role delegations only, so review and release-audit rounds
+  // no longer shift the «Заход N» number the coordinator sees. The round
+  // continues from `--from`, else from the previous round's recorded
+  // result SHA; `--fresh` disables continuation.
+  const round =
+    Math.max(
+      0,
+      ...store
+        .delegationsByTask(taskKey)
+        .filter((r) => roleForLevel(r.level, policy) === "executor")
+        .map((r) => r.round),
+    ) + 1;
   const continueFrom = params.fresh
     ? null
     : (params.from ?? store.latestResultByTask(taskKey)?.result_sha ?? null);
@@ -350,7 +379,12 @@ export async function runDelegate(
   try {
     res = await dispatchToRoute(
       row,
-      { instructions: params.instructions, levelNote },
+      {
+        instructions: params.instructions,
+        levelNote,
+        // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
+        commentOnRefusal: true,
+      },
       { ...deps, policy: () => policy },
     );
   } catch (e) {
@@ -415,6 +449,14 @@ export async function dispatchToRoute(
      * vanish (§5.4 rev 13).
      */
     onDispatchFailure?: "remove" | "fail";
+    /**
+     * §17.2 (e2e 6 + PLUG-211 С4): write the dispatch refusal to the
+     * task — only for CALLER-INITIATED dispatches (manual delegate,
+     * release audit). The watchdog's reissue path reports the refusal
+     * through `report`, which already comments the task; both would
+     * double the reason in the task trail.
+     */
+    commentOnRefusal?: boolean;
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
@@ -456,6 +498,26 @@ export async function dispatchToRoute(
       "the delegation stays `dispatching`; the reconcile pass will link the thread or remove the record",
     );
   if (dispatchRes.exitCode !== 0 && !dispatchRes.timedOut) {
+    const detail =
+      dispatchRes.stderr.trim() || dispatchRes.stdout.trim() || "no output";
+    // §17.2 (e2e 6 + PLUG-211 С4): an undispatchable route (bad reasoning
+    // level, removed model) leaves its reason as a task comment — once.
+    // The watchdog reissue path skips this (its `report` comments the
+    // task itself); only caller-initiated dispatches opt in.
+    if (opts.commentOnRefusal) {
+      try {
+        await runChecked(bbCli, [
+          "tasks",
+          "comment",
+          row.task_key,
+          "--body",
+          `раздача на ${row.route} отклонена (exit ${dispatchRes.exitCode}): ` +
+            detail.slice(0, 500),
+        ]);
+      } catch {
+        // A failed comment must not hide the dispatch refusal itself.
+      }
+    }
     if (opts.onDispatchFailure === "fail") {
       store.setStatus(row.id, "failed");
     } else {
@@ -463,9 +525,7 @@ export async function dispatchToRoute(
     }
     throw new OrchestratorError(
       "dispatch-failed",
-      `bb tasks dispatch failed (exit ${dispatchRes.exitCode}): ${
-        dispatchRes.stderr.trim() || dispatchRes.stdout.trim() || "no output"
-      }`,
+      `bb tasks dispatch failed (exit ${dispatchRes.exitCode}): ${detail}`,
     );
   }
   if (dispatchRes.timedOut) throw unknownDispatch();

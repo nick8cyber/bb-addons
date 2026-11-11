@@ -65,7 +65,8 @@ const ORCHESTRATOR_INSTRUCTIONS = `Ты — оркестратор. Твоя р�
 - Доработку раздавай новым delegate той же задачи: плагин сам продолжит работу с коммита прошлого захода (--from <sha|ветка> — своя точка, --fresh — заново).
 - Ветку и рабочую копию исполнителя не открывай в других копиях: итог захода снимает плагин.
 - Свои поллеры поверх сторожа не ставь: исходы (зависание, квота, падение, перевыпуск) приходят сообщениями [orchestrator].
-- Не раздавай вручную (bb tasks dispatch, bb thread spawn) — только delegate.`;
+- Не раздавай вручную (bb tasks dispatch, bb thread spawn) — только delegate.
+- Машину вне рабочих копий не меняй: ни sudo, ни установки пакетов, ни настроек хоста — чего-то не хватает, сообщи пользователю (он и есть координатор этого чата).`;
 
 const EXECUTOR_INSTRUCTIONS = `Ты — исполнитель. Твоя роль — выполнить поставленную задачу самостоятельно.
 
@@ -73,7 +74,8 @@ const EXECUTOR_INSTRUCTIONS = `Ты — исполнитель. Твоя рол�
 - Делай строго по спеке задачи; расхождение со спекой — вопрос координатору, а не самодеятельность.
 - Правила работы с git — раздел «Работа с git» в инструкциях задачи.
 - Отчёт — по контракту из описания задачи.
-- Хендофф: веди файл HANDOFF.md в хранилище своего треда ($BB_THREAD_STORAGE/HANDOFF.md) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.`;
+- Хендофф: веди файл HANDOFF.md в хранилище своего треда ($BB_THREAD_STORAGE/HANDOFF.md) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.
+- Машину вне своей рабочей копии не меняй: ни sudo, ни установки пакетов — чего-то не хватает, сообщи координатору, не делай сам.`;
 
 const RELEASE_AUDITOR_INSTRUCTIONS = `Ты — проверяющий агент выкладки (release-auditor). Твоя роль — только читать и проверять выпуск перед публикацией, ничего не меняя.
 
@@ -189,7 +191,23 @@ export interface RoleDecisionProbes {
    * Absent probe = behave as before (valid, name-based role mapping).
    */
   policy?(): Policy | null;
+  /**
+   * §17.1 r26 (PLUG-211 Б2): plugin ids whose threads continue a human
+   * chat (session handoff) — their thread inherits the source role, or
+   * takes the orchestrator default without a decidable source. Absent
+   * probe = the default `["handoff"]`.
+   */
+  userThreadPlugins?(): readonly string[];
 }
+
+/** §17.1: the recorded "no orchestrator role" verdict for plugin-/sdk-
+ * born threads — the row keeps the §3 fallback criterion from issuing
+ * coordinator tools to them at `configure` (audit Б3). */
+export const NO_ROLE = "none";
+
+/** §17.1: plugins continuing a human chat when the `userThreadPlugins`
+ * setting is unset. */
+export const DEFAULT_USER_THREAD_PLUGINS = ["handoff"] as const;
 
 /**
  * §13.2 п.2 — the role rule, evaluated strictly in the spec's branch order.
@@ -199,10 +217,17 @@ export interface RoleDecisionProbes {
 export function decideRole(
   facts: RoleDecisionFacts,
   probes: RoleDecisionProbes,
-): RoleId | null {
+): RoleId | typeof NO_ROLE | null {
   if (facts.attempt !== "start-turn") return null;
   if (facts.status !== "pending") return null;
   if (probes.threadRole(facts.threadId)) return null;
+
+  // §16.7: while the policy is invalid a root chat gets no role.
+  const policyOk =
+    probes.policy === undefined || probes.policy() !== null;
+  // §17.1 r26 (PLUG-211 Б2): plugins that continue a human chat.
+  const userPlugins =
+    probes.userThreadPlugins?.() ?? DEFAULT_USER_THREAD_PLUGINS;
 
   // 1. A thread created by `bb tasks dispatch` is an executor; its level
   //    decides auditor vs executor.
@@ -217,13 +242,18 @@ export function decideRole(
     const source = probes.threadRole(facts.sourceThreadId);
     if (source && isRoleId(source.role)) return source.role;
   }
+  // §17.1 r26 (PLUG-211 Б2): a user-continuation plugin's thread IS a
+  //    human chat — the source's role already applied when decidable;
+  //    without it the thread gets the orchestrator default, like a chat
+  //    opened from the window (`policyOk` gates it the same way).
+  if (facts.originPluginId && userPlugins.includes(facts.originPluginId)) {
+    return policyOk ? DEFAULT_ROLE : null;
+  }
   // 3. Any other child thread executes.
   if (facts.parentThreadId) return "executor";
   // 4. A chat from the new-thread window takes the project's current pick.
   //    §16.7: while the policy is invalid the DEFAULT is no role — an
   //    explicit pick still applies, the setup skill alone is issued.
-  const policyOk =
-    probes.policy === undefined || probes.policy() !== null;
   if (facts.origin === "app") {
     const pending = probes.pendingRole(facts.projectId);
     // §16.7 (PLUG-182): the new-chat window writes `orchestrator` itself
@@ -239,8 +269,15 @@ export function decideRole(
     }
     return policyOk ? DEFAULT_ROLE : null;
   }
-  // 5. cli / plugin / sdk / automations.
-  return policyOk ? DEFAULT_ROLE : null;
+  // 5. §17.1 (аудит Б3): the default orchestrator role is for threads a
+  //    human or an agent opened — `app` above (the new-chat window) and
+  //    `cli` (`bb thread spawn`) here. Plugin-, sdk- and automation-born
+  //    threads (advisor, live-call, perspectives, …) get NO role: no
+  //    dispatch tools, no coordinator instructions. The recorded `none`
+  //    row is what stops the §3 fallback criterion from handing them the
+  //    coordinator issuance at `configure`.
+  if (facts.origin === "cli") return policyOk ? DEFAULT_ROLE : null;
+  return NO_ROLE;
 }
 
 /**
@@ -254,7 +291,7 @@ export function decideRole(
 export function handleMessageDispatch(
   context: MessageDispatchHookContext,
   probes: RoleDecisionProbes,
-  record: (threadId: string, role: RoleId) => void,
+  record: (threadId: string, role: RoleId | typeof NO_ROLE) => void,
   warn?: (message: string) => void,
 ): MessageDispatchHookDecision {
   try {

@@ -1132,7 +1132,12 @@ async function runReleaseSteps(
       `находки — без значений секретов (маскируй).`;
     const res = await dispatchToRoute(
       auditRow,
-      { instructions: auditInstructions },
+      {
+        instructions: auditInstructions,
+        // §17.2 (PLUG-211 С4): a caller-initiated dispatch owns the
+        // refusal comment.
+        commentOnRefusal: true,
+      },
       deps.stepsDeps,
     );
     deps.store.updateRelease(release.id, {

@@ -291,3 +291,66 @@ test("§16.7: the error fallback honors policyOk — coordinator gets setup only
   assert.deepEqual(fbExec.tools, []);
   assert.deepEqual(fbExec.skills, []);
 });
+
+// ── §17.1 r26 (PLUG-211 Б1/Б2) ────────────────────────────────────────
+
+test("§17.1 r26 (Б1): a stale orchestrator row on a plugin thread is lazily corrected to none", () => {
+  const writes: [string, string][] = [];
+  const context = ctx({ origin: { pluginId: "advisor" } });
+  const config = buildAgentConfiguration(context, {
+    ...deps,
+    probes: {
+      ...noProbes,
+      roleByThreadId: () => "orchestrator",
+      writeRole: (id, role) => writes.push([id, role]),
+    },
+  });
+  assert.deepEqual(config.tools, []);
+  assert.equal(config.instructions, undefined);
+  assert.deepEqual(writes, [[context.thread.id, "none"]]);
+});
+
+test("§17.1 r26 (Б2): a handoff plugin thread keeps its orchestrator row", () => {
+  const writes: [string, string][] = [];
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "handoff" } }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        roleByThreadId: () => "orchestrator",
+        writeRole: (id, role) => writes.push([id, role]),
+      },
+    },
+  );
+  // a userThreadPlugins thread IS a human chat — the row is not stale
+  assert.deepEqual(config.tools, [
+    "orchestrator_delegate",
+    "orchestrator_status",
+    "orchestrator_cancel",
+    "orchestrator_merge",
+  ]);
+  assert.deepEqual(writes, []);
+});
+
+test("§17.1 r26 (Б2): an unrecorded handoff thread is a coordinator by static facts", () => {
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "handoff" } }),
+    deps,
+  );
+  assert.equal(config.tools.length, 4);
+});
+
+test("§17.1 r26 (Б2): a configured-empty userThreadPlugins denies a handoff thread", () => {
+  const config = buildAgentConfiguration(
+    ctx({ origin: { pluginId: "handoff" } }),
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        userThreadPlugins: () => [],
+      },
+    },
+  );
+  assert.deepEqual(config.tools, []);
+});

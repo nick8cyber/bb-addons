@@ -16,7 +16,10 @@ import {
   type RoleDecisionProbes,
 } from "../src/roles.js";
 import { parsePolicy } from "../src/policy.js";
-import { buildAgentConfiguration } from "../src/agent-config.js";
+import {
+  buildAgentConfiguration,
+  migratePluginThreadRoles,
+} from "../src/agent-config.js";
 import { pendingRoleRpc } from "../server.js";
 
 function makeStore() {
@@ -203,14 +206,34 @@ test("decideRole: parent → executor; app → pending pick; else orchestrator",
     }),
     "orchestrator",
   );
-  // cli / plugin / sdk / internal → orchestrator
-  for (const origin of ["cli", "plugin", "sdk", null]) {
+  // §17.1 (аудит Б3): cli → orchestrator; plugin/sdk/automation-born →
+  // no role at all (the `none` row blocks the configure-time fallback).
+  assert.equal(decideRole(facts({ origin: "cli" }), noProbes), "orchestrator");
+  for (const origin of ["plugin", "sdk", null]) {
     assert.equal(
       decideRole(facts({ origin }), noProbes),
-      "orchestrator",
+      "none",
       `origin ${origin}`,
     );
   }
+});
+
+test("§17.1: a plugin-origin dispatch records the none row, no coordinator", () => {
+  const { store, hook } = makeStore();
+  const decision = hook(
+    dispatch({
+      thread: {
+        id: "thr_plugin",
+        status: "pending",
+        originPluginId: "advisor",
+      },
+      origin: "plugin",
+      attempt: "start-turn",
+      project: { id: "proj_a" },
+    }),
+  );
+  assert.deepEqual(decision, { action: "proceed" });
+  assert.equal(store.threadRole("thr_plugin")!.role, "none");
 });
 
 test("hook: first app message records the project's pick", () => {
@@ -416,6 +439,13 @@ test("§3 budget: longest role + a 1500-char rule stays under 4096", () => {
   );
 });
 
+test("§17.1: orchestrator and executor instructions forbid host changes", () => {
+  for (const id of ["orchestrator", "executor"] as const) {
+    const text = ROLES[id].instructions;
+    assert.match(text, /ни sudo, ни установки пакетов/, `${id} bans sudo/pkg`);
+  }
+});
+
 test("injectInstructions=false: no texts for any role, tools stay", () => {
   const ctxFor = (id: string) =>
     makePluginAgentConfigurationContext({ thread: { id } });
@@ -577,4 +607,145 @@ test("§16.7 auditor instructions demand the JSON verdict; §13.1 handoff on doe
       `${id} fallback path when no storage`,
     );
   }
+});
+
+// ── §17.1 r26 (PLUG-211 Б1/Б2): userThreadPlugins + the r26 role fix ──
+
+test("§17.1 r26 (Б2): a userThreadPlugins thread inherits the source role", () => {
+  // default list ["handoff"]: a handoff thread with a decidable source
+  // inherits it — like any side chat.
+  assert.equal(
+    decideRole(
+      facts({
+        origin: "plugin",
+        originPluginId: "handoff",
+        sourceThreadId: "thr_src",
+      }),
+      {
+        ...noProbes,
+        threadRole: (id) =>
+          id === "thr_src" ? { role: "executor" } : undefined,
+      },
+    ),
+    "executor",
+  );
+});
+
+test("§17.1 r26 (Б2): a handoff thread without a decidable source → orchestrator", () => {
+  // no source thread — the continued human chat gets the default role
+  assert.equal(
+    decideRole(
+      facts({ origin: "plugin", originPluginId: "handoff" }),
+      noProbes,
+    ),
+    "orchestrator",
+  );
+  // a source without a recorded role falls through to the same default,
+  // NOT to the parent/executor branch (a handoff is a human chat, never
+  // an executor).
+  assert.equal(
+    decideRole(
+      facts({
+        origin: "plugin",
+        originPluginId: "handoff",
+        sourceThreadId: "thr_src",
+        parentThreadId: "thr_p",
+      }),
+      noProbes,
+    ),
+    "orchestrator",
+  );
+  // a plugin NOT in the configured list keeps `none` — the list decides
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
+      ...noProbes,
+      userThreadPlugins: () => [],
+    }),
+    "none",
+  );
+  // other plugin ids still get none
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "advisor" }), noProbes),
+    "none",
+  );
+  assert.equal(
+    decideRole(
+      facts({ origin: "plugin", originPluginId: "live-call" }),
+      noProbes,
+    ),
+    "none",
+  );
+  // §16.7: an invalid policy leaves even a human-chat plugin role-less
+  assert.equal(
+    decideRole(facts({ origin: "plugin", originPluginId: "handoff" }), {
+      ...noProbes,
+      policy: () => null,
+    }),
+    null,
+  );
+});
+
+test("§17.1 r26 (Б2): the hook records orchestrator for a handoff thread", () => {
+  const { store, hook } = makeStore();
+  const decision = hook(
+    dispatch({
+      thread: { id: "thr_ho", status: "pending", originPluginId: "handoff" },
+      origin: "plugin",
+      attempt: "start-turn",
+      project: { id: "proj_a" },
+    }),
+  );
+  assert.deepEqual(decision, { action: "proceed" });
+  assert.equal(store.threadRole("thr_ho")!.role, "orchestrator");
+});
+
+test("§17.1 r26 (Б1): the one-time migration rewrites plugin orchestrator rows", async () => {
+  const { store } = makeStore();
+  // live pre-r26 rows: plugin-created threads wrongly recorded
+  // `orchestrator` before the §17.1 plugin rule existed.
+  for (const id of ["thr_adv", "thr_call", "thr_persp", "thr_ext"]) {
+    store.setThreadRole(id, "orchestrator", "hook");
+  }
+  store.setThreadRole("thr_app", "orchestrator", "hook"); // human chat
+  store.setThreadRole("thr_cli", "orchestrator", "hook"); // bb thread spawn
+  store.setThreadRole("thr_ho", "orchestrator", "hook"); // handoff — user chat
+  store.setThreadRole("thr_del", "orchestrator", "delegate"); // not hook-written
+  const origins = new Map<string, string | null>([
+    ["thr_adv", "advisor"],
+    ["thr_call", "live-call"],
+    ["thr_persp", "perspectives"],
+    ["thr_ext", "external-compact"],
+    ["thr_app", null],
+    ["thr_cli", null],
+    ["thr_ho", "handoff"],
+    ["thr_del", "advisor"],
+  ]);
+  const moved = await migratePluginThreadRoles(store, {
+    threadOriginPluginId: async (id) => origins.get(id),
+  });
+  assert.equal(moved, 4);
+  for (const id of ["thr_adv", "thr_call", "thr_persp", "thr_ext"]) {
+    assert.equal(store.threadRole(id)!.role, "none", id);
+  }
+  for (const id of ["thr_app", "thr_cli", "thr_ho"]) {
+    assert.equal(store.threadRole(id)!.role, "orchestrator", id);
+  }
+  // a `delegate`-sourced row is the delegate path's own correction —
+  // the migration only owns hook-written rows
+  assert.equal(store.threadRole("thr_del")!.role, "orchestrator");
+  // a thread whose origin read fails is skipped, not rewritten
+  store.setThreadRole("thr_gone", "orchestrator", "hook");
+  const warns: string[] = [];
+  const moved2 = await migratePluginThreadRoles(store, {
+    threadOriginPluginId: async (id) => {
+      if (id === "thr_gone") throw new Error("thread not found");
+      return origins.get(id);
+    },
+    log: { warn: (m) => warns.push(m) },
+  });
+  // the first pass already rewrote the live rows — only the skipped
+  // thread is left in scope
+  assert.equal(moved2, 0);
+  assert.equal(store.threadRole("thr_gone")!.role, "orchestrator");
+  assert.equal(warns.length, 1);
 });

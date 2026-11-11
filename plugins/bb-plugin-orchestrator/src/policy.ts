@@ -44,6 +44,10 @@ export interface Policy {
   version: 1;
   limits?: PolicyLimits;
   firstResponseSeconds?: number;
+  /** §17.2 (e2e 8): first-response window for `--preset` one-off routes
+   * when no policy route on the same provider carries its own
+   * `firstResponseSeconds`, e.g. `{"codex": 300}`. */
+  firstResponseSecondsByProvider?: Record<string, number>;
   maxRunSeconds?: number;
   /** §2.3: executor level → the auditor level that reviews its work. */
   reviewByLevel?: Record<string, string>;
@@ -379,6 +383,31 @@ export function parsePolicy(
       firstResponseSeconds = v;
     }
   }
+  // §17.2 (e2e 8): per-provider first-response windows for one-off
+  // preset dispatches — same 30–600 bounds as the route/global fields.
+  let firstResponseSecondsByProvider: Record<string, number> | undefined;
+  if (raw.firstResponseSecondsByProvider !== undefined) {
+    if (!isRecord(raw.firstResponseSecondsByProvider)) {
+      err(
+        "firstResponseSecondsByProvider",
+        "must be an object of provider id → seconds",
+      );
+    } else {
+      firstResponseSecondsByProvider = {};
+      for (const [providerId, v] of Object.entries(
+        raw.firstResponseSecondsByProvider,
+      )) {
+        if (typeof v !== "number" || v < 30 || v > 600) {
+          err(
+            `firstResponseSecondsByProvider.${providerId}`,
+            "must be a number in 30–600",
+          );
+          continue;
+        }
+        firstResponseSecondsByProvider[providerId] = v;
+      }
+    }
+  }
   let maxRunSeconds: number | undefined;
   if (raw.maxRunSeconds !== undefined) {
     const v = raw.maxRunSeconds;
@@ -428,6 +457,9 @@ export function parsePolicy(
       ...(limits ? { limits } : {}),
       ...(reviewByLevel ? { reviewByLevel } : {}),
       ...(firstResponseSeconds !== undefined ? { firstResponseSeconds } : {}),
+      ...(firstResponseSecondsByProvider !== undefined
+        ? { firstResponseSecondsByProvider }
+        : {}),
       ...(maxRunSeconds !== undefined ? { maxRunSeconds } : {}),
       levels,
       routes,
