@@ -45,6 +45,7 @@ const realCmd: CmdRunner = {
         cwd: o?.cwd,
         env: o?.env ? { ...process.env, ...o.env } : undefined,
         encoding: "utf8",
+        input: o?.stdin,
       });
       return { exitCode: 0, stdout: out, stderr: "" };
     } catch (e: unknown) {
@@ -1657,7 +1658,7 @@ test("a failed git-dir probe keeps the copy — unfinished unknown (PLUG-185 L9)
   assert.equal(w.janitor.item(env.id)!.reason, "unfinished-unknown");
 });
 
-test("a failed worktree list skips the branch sweep (PLUG-185 L9)", async () => {
+test("a failed worktree list keeps the copy and skips the branch sweep (PLUG-185 L9)", async () => {
   const { repo, base } = makeRepo();
   git(repo, ["branch", "bb/gone"]); // merged orphan — would be swept
   const env = addEnv(repo, base, "a");
@@ -1677,7 +1678,10 @@ test("a failed worktree list skips the branch sweep (PLUG-185 L9)", async () => 
   await w.jan.run();
   w.clock.t += 16 * 60_000;
   const res = await w.jan.run();
-  assert.equal(res.removedCopies, 1); // the copy still goes
+  // PLUG-202: without the list a nested worktree inside the copy is
+  // unproven — the copy stays too, not only the orphan branch
+  assert.equal(res.removedCopies, 0);
+  assert.equal(res.kept["nested-unknown"], 1);
   assert.equal(res.orphanBranches, 0);
   assert.equal(res.removedBranches, 0);
   git(repo, ["rev-parse", "--verify", "bb/gone"]);
@@ -3448,4 +3452,381 @@ test("E1: a merge driver whose name holds «=» cannot fake removal (PLUG-201)",
   assert.ok(existsSync(env.path));
   assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
   assert.ok(!git(repo, ["branch", "-r", "--contains", a]).includes(a));
+});
+
+// ── PLUG-202 ─────────────────────────────────────────────────────────
+
+test("NW: a nested worktree inside the copy keeps it — «брошено» when idle (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  writeFileSync(join(env.path, ".gitignore"), ".worktrees/\n");
+  git(env.path, ["add", ".gitignore"]);
+  git(env.path, ["commit", "-m", "chore: ignore nested worktrees"]);
+  mergeEnv(repo, env);
+  // a linked worktree of the same repo inside an ignored dir — `git
+  // status` of the copy stays clean while the nested worktree's
+  // detached commit and dirty file die with the copy
+  const nested = join(env.path, ".worktrees", "x");
+  git(env.path, ["worktree", "add", "--detach", nested]);
+  commitIn(nested, "draft.txt", "wip: nested");
+  writeFileSync(join(nested, "unstaged.txt"), "dirty\n");
+  assert.equal(git(env.path, ["status", "--porcelain"]), "");
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-nested-worktree");
+});
+
+test("NC: a clone inside an ignored directory keeps the copy (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  writeFileSync(join(env.path, ".gitignore"), "tmp/\n");
+  git(env.path, ["add", ".gitignore"]);
+  git(env.path, ["commit", "-m", "chore: ignore tmp"]);
+  mergeEnv(repo, env);
+  // a foreign clone under an ignored dir — its unpushed commit is
+  // invisible to every check of the copy itself
+  const clone = join(env.path, "tmp", "lib");
+  execFileSync("git", ["clone", "-q", repo, clone]);
+  git(clone, ["config", "user.name", "Agent"]);
+  git(clone, ["config", "user.email", "agent@x.io"]);
+  commitIn(clone, "c.txt", "wip: nested clone");
+  assert.equal(git(env.path, ["status", "--porcelain"]), "");
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-nested-repo");
+});
+
+test("SW: skip-worktree / assume-unchanged edits keep the copy (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  writeFileSync(join(repo, "cfg.txt"), "base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: cfg"]);
+  git(repo, ["push", "origin", "main"]);
+  const envA = addEnv(repo, base, "a");
+  const envB = addEnv(repo, base, "b");
+  commitIn(envA.path, "wa.txt", "feat: work a");
+  commitIn(envB.path, "wb.txt", "feat: work b");
+  mergeEnv(repo, envA);
+  mergeEnv(repo, envB);
+  git(envA.path, ["update-index", "--skip-worktree", "cfg.txt"]);
+  writeFileSync(join(envA.path, "cfg.txt"), "local secret\n");
+  git(envB.path, ["update-index", "--assume-unchanged", "cfg.txt"]);
+  writeFileSync(join(envB.path, "cfg.txt"), "local secret\n");
+  // both copies look perfectly clean to `git status`
+  assert.equal(git(envA.path, ["status", "--porcelain"]), "");
+  assert.equal(git(envB.path, ["status", "--porcelain"]), "");
+  const clock = { t: Date.now() };
+  const stale = (id: string): ThreadSpec => ({
+    id,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  });
+  const w = makeWorld({
+    envs: [envA, envB],
+    threads: { [envA.id]: [stale("thr_a")], [envB.id]: [stale("thr_b")] },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(res.kept["hidden-changes"], 2);
+  // idle past abandonedAfter both go to the «брошено» report
+  w.threadSpecs[envA.id]![0]!.updatedAt = w.clock.t - 2 * 24 * 60 * 60_000;
+  w.threadSpecs[envB.id]![0]!.updatedAt = w.clock.t - 2 * 24 * 60 * 60_000;
+  const res2 = await w.jan.run();
+  assert.equal(res2.reported.length, 2);
+  assert.ok(
+    res2.reported.every((r) => r.reason === "abandoned-hidden-changes"),
+  );
+});
+
+test("rescue §16.4 covers hidden-flagged edits — they ride the untracked commit (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  writeFileSync(join(repo, "cfg.txt"), "base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: cfg"]);
+  git(repo, ["push", "origin", "main"]);
+  const env = addEnv(repo, base, "a");
+  git(env.path, ["update-index", "--skip-worktree", "cfg.txt"]);
+  writeFileSync(join(env.path, "cfg.txt"), "local secret\n");
+  // `git status` is clean — the only unsaved work hides behind the flag
+  assert.equal(git(env.path, ["status", "--porcelain"]), "");
+  const w = makeWorld({ envs: [env], threads: {} });
+  const d = w.store.insert({
+    taskKey: "PLUG-9",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w.store.setThreadInfo(d.id, "thr_a");
+  w.store.setStatus(d.id, "done");
+  await w.jan.onThreadArchived({
+    id: "thr_a",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  const ref = "refs/orchestrator/rescue/thr_a";
+  const sha = git(repo, ["rev-parse", "--verify", ref]);
+  // the third parent of the stash-shaped commit holds the flagged file
+  const uSha = git(repo, ["rev-parse", `${sha}^3`]);
+  const blob = git(env.path, ["hash-object", "cfg.txt"]);
+  assert.ok(git(repo, ["ls-tree", uSha, "cfg.txt"]).includes(blob));
+  assert.equal(w.sent.length, 1);
+  assert.equal(w.sent[0]!.threadId, "thr_coord");
+  assert.match(w.sent[0]!.text, /несохранённой работой/);
+});
+
+test("PW: «spaces → tab» is not patch-equivalent to «spaces → two spaces» — the copy stays (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  writeFileSync(join(repo, "Makefile"), "all:\n    echo hi\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: makefile"]);
+  git(repo, ["push", "origin", "main"]);
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "Makefile"), "all:\n\techo hi\n");
+  git(env.path, ["add", "Makefile"]);
+  git(env.path, ["commit", "-m", "fix: real tab in recipe"]);
+  // origin gains «the same» change with 2 spaces: `git cherry` calls A
+  // «-» (stable patch-ids ignore whitespace) — verbatim they differ,
+  // so the tab is unpublished work
+  writeFileSync(join(repo, "Makefile"), "all:\n  echo hi\n");
+  git(repo, ["add", "Makefile"]);
+  git(repo, ["commit", "-m", "fix: two-space indent"]);
+  git(repo, ["push", "origin", "main"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
+});
+
+test("WR: a commit held only by refs/worktree/* or refs/bisect/* keeps the copy (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  const envA = addEnv(repo, base, "a");
+  const envB = addEnv(repo, base, "b");
+  commitIn(envA.path, "wa.txt", "feat: work a");
+  commitIn(envB.path, "wb.txt", "feat: work b");
+  mergeEnv(repo, envA);
+  mergeEnv(repo, envB);
+  // K is built by commit-tree — it never touches HEAD or its reflog;
+  // the only pointer to it is a copy-scoped ref that dies with the copy
+  writeFileSync(join(envA.path, "k.txt"), "keep\n");
+  git(envA.path, ["add", "k.txt"]);
+  const kA = git(envA.path, [
+    "commit-tree",
+    git(envA.path, ["write-tree"]),
+    "-p",
+    "HEAD",
+    "-m",
+    "wip: K",
+  ]);
+  git(envA.path, ["reset", "-q", "HEAD", "--", "k.txt"]);
+  rmSync(join(envA.path, "k.txt"));
+  git(envA.path, ["update-ref", "refs/worktree/keep", kA]);
+  writeFileSync(join(envB.path, "k2.txt"), "keep\n");
+  git(envB.path, ["add", "k2.txt"]);
+  const kB = git(envB.path, [
+    "commit-tree",
+    git(envB.path, ["write-tree"]),
+    "-p",
+    "HEAD",
+    "-m",
+    "wip: K2",
+  ]);
+  git(envB.path, ["reset", "-q", "HEAD", "--", "k2.txt"]);
+  rmSync(join(envB.path, "k2.txt"));
+  git(envB.path, ["update-ref", "refs/bisect/side", kB]);
+  const clock = { t: Date.now() };
+  const stale = (id: string): ThreadSpec => ({
+    id,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: "thr_coord",
+  });
+  const w = makeWorld({
+    envs: [envA, envB],
+    threads: { [envA.id]: [stale("thr_a")], [envB.id]: [stale("thr_b")] },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(res.kept["unpushed-commits"], 2);
+});
+
+test("copy-less unmerged bb/ branches: daily message counts + first 10, full list in report (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+  for (let i = 1; i <= 12; i += 1) {
+    const name = `bb/o${String(i).padStart(2, "0")}`;
+    unmergedBranch(repo, name);
+    utimesSync(
+      join(repo, ".git", "logs", "refs", "heads", "bb", name.slice(3)),
+      stale,
+      stale,
+    );
+  }
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle(clock, env.id)] },
+    clock,
+  });
+  const d = w.store.insert({
+    taskKey: "PLUG-9",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w.store.setThreadInfo(d.id, "thr_a");
+  w.store.setStatus(d.id, "done");
+  // every orphan branch is attributed through the ledger row of the
+  // env that used to own it
+  for (let i = 1; i <= 12; i += 1) {
+    w.janitor.upsertItem(
+      `env_old${i}`,
+      {
+        branch: `bb/o${String(i).padStart(2, "0")}`,
+        threadId: "thr_a",
+        state: "removed",
+        reason: "removed",
+      },
+      clock.t,
+    );
+  }
+  await w.jan.run(); // env_a still inside afterMerge
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1); // env_a archived — not reported
+  const branchItems = res.reported.filter((r) =>
+    r.envId.startsWith("branch:"),
+  );
+  assert.equal(branchItems.length, 12);
+  assert.equal(w.sent.length, 1);
+  const text = w.sent[0]!.text;
+  assert.match(text, /брошенных веток bb\/ без копий: 12/);
+  assert.ok(text.includes("bb/o01"));
+  assert.ok(text.includes("bb/o10"));
+  assert.ok(!text.includes("bb/o11"));
+  assert.ok(!text.includes("bb/o12"));
+  assert.match(text, /и ещё 2/);
+  const rep = await w.jan.report();
+  assert.equal(
+    rep.abandoned.filter((i) => i.envId.startsWith("branch:")).length,
+    12,
+  );
+});
+
+test("git < 2.40: no --attr-source → no squash flag, one journal line (PLUG-202)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w1.txt", "feat: part 1");
+  commitIn(env.path, "w2.txt", "feat: part 2");
+  writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
+  writeFileSync(join(repo, "w2.txt"), "feat: part 2\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: squashed both parts"]);
+  git(repo, ["push", "origin", "main"]);
+  const oldGit: CmdRunner = {
+    run: async (f, a, o) =>
+      f === "git" && a[0] === "--version"
+        ? ok("git version 2.39.3\n")
+        : realCmd.run(f, a, o),
+  };
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+    cmd: oldGit,
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  // no squash flag without --attr-source support — the copy is just
+  // unmerged (and would be «похоже, влито squash» on git ≥ 2.40)
+  assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
+  assert.equal(res.errors.length, 0);
+  assert.ok(w.warns.some((m) => /attr-source/.test(m)));
 });

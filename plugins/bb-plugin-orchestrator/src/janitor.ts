@@ -22,10 +22,14 @@
  * `rev-list --count <«Created from»>..<tip>` (PLUG-195: strictly from
  * the creation entry — no reflog-type parsing). «Ничего не
  * теряется»: every commit the copy's HEAD or its branch ever pointed
- * at (the whole `git log -g`) — and every ancestor of those positions
- * not on origin — is an ancestor of a remote target or
- * patch-equivalent (`patch-id --stable`, the commit itself,
- * `rev-list --no-walk`; an empty commit only as an ancestor).
+ * at (the whole `git log -g`, plus the tips of the copy-scoped
+ * `refs/worktree/*` and `refs/bisect/*`, PLUG-202) — and every
+ * ancestor of those positions not on origin — is an ancestor of a
+ * remote target or patch-equivalent (`patch-id --verbatim`, the
+ * commit itself, `rev-list --no-walk`; an empty commit only as an
+ * ancestor). `--stable` normalizes whitespace — a tab-vs-spaces
+ * patch collides (PLUG-202) — so `git cherry` only pre-filters and
+ * the verdict is the verbatim id.
  * The merge-tree content sign is NOT used for removal (PLUG-201):
  * merge drivers fake it — a configured `ours`, the built-in `union`
  * from `.gitattributes`, a driver name with `=` that `-c` cannot
@@ -113,6 +117,8 @@ const TRANSIENT_KEEPS = new Set([
   "cascade-env-external",
   "interactions-pending",
   "submodules-unknown",
+  "nested-unknown",
+  "hidden-unknown",
 ]);
 
 export interface JanitorLog {
@@ -534,9 +540,34 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
+   * §16.3 squash flag needs `--attr-source` — git ≥ 2.40 (PLUG-202).
+   * Parsed once per janitor instance; an older git only loses the
+   * flag (one journal line), never the run.
+   */
+  let attrSourceCached: boolean | undefined;
+  const attrSource = async (): Promise<boolean> => {
+    if (attrSourceCached !== undefined) return attrSourceCached;
+    const res = await deps.cmd.run("git", ["--version"], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    const m = /git version (\d+)\.(\d+)/.exec(res.stdout);
+    attrSourceCached =
+      res.exitCode === 0 &&
+      !!m &&
+      (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 40));
+    if (!attrSourceCached) {
+      log.warn?.(
+        "orchestrator janitor: git < 2.40 — пометка «влито squash» " +
+          "недоступна (нужен --attr-source)",
+      );
+    }
+    return attrSourceCached;
+  };
+
+  /**
    * §16.3 the report flag, the ONLY surviving use of the content sign
    * (PLUG-201): `git merge-tree --write-tree <target> <sha>`
-   * reproducing `<target>^{tree>` proves merging <sha> adds nothing —
+   * reproducing `<target>^{tree}` proves merging <sha> adds nothing —
    * «похоже, влито squash». The sign is never trusted for removal, so
    * merge drivers cannot fake a deletion; still, it runs with
    * attributes fully disabled (`--attr-source=<empty tree>` +
@@ -550,6 +581,9 @@ export function createJanitor(deps: JanitorDeps) {
     target: string,
     sha: string,
   ): Promise<boolean> => {
+    // PLUG-202: `--attr-source` needs git ≥ 2.40 — without it the flag
+    // is skipped (one journal line above), never an error.
+    if (!(await attrSource())) return false;
     const mergedTree = (
       await gitOut(deps.cmd, repoRoot, [
         `--attr-source=${EMPTY_TREE}`,
@@ -622,13 +656,70 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
-   * §16.3 «ничего не теряется», the patch-id sign: every commit <sha>
-   * adds over the target is `patch-id --stable`-equivalent to a commit
-   * on it (`git cherry` prints only «-» lines — amend/rebase of already
-   * published work). A merge commit has no patch-id and can never match
-   * — its unique resolution content is covered by the anchor-content
-   * sign instead; a failed cherry proves nothing.
+   * §16.3 «ничего не теряется», the patch-id sign (PLUG-202): <sha> is
+   * equivalent to a commit on the target only when their `patch-id
+   * --verbatim` ids match — exact bytes, whitespace included
+   * (`--stable` normalizes it: a «spaces → tab» patch collides with
+   * «spaces → two spaces» and the tab was lost). `git cherry` stays as
+   * a hint only: a «+» means no stable-id match, hence no verbatim
+   * one either, so the expensive diff scan can be skipped. A merge
+   * commit has no patch-id and can never match; a failed probe proves
+   * nothing.
    */
+  const patchIdOf = async (
+    repoRoot: string,
+    spec: string,
+  ): Promise<string | null> => {
+    const diff = await gitOut(deps.cmd, repoRoot, [
+      "log",
+      "-p",
+      "--no-merges",
+      "-n",
+      "1",
+      spec,
+    ]);
+    if (diff === null) return null;
+    const res = await deps.cmd.run(
+      "git",
+      ["-C", repoRoot, "patch-id", "--verbatim"],
+      { timeoutMs: GIT_TIMEOUT_MS, stdin: diff },
+    );
+    if (res.exitCode !== 0) return null;
+    return res.stdout.split("\n")[0]?.split(/\s+/)[0]?.trim() || null;
+  };
+
+  /**
+   * Verbatim patch-ids of the non-merge commits in <range>. Kept
+   * bounded — a match outside the window is missed, which only keeps
+   * the copy (the safe direction). The `commit <sha>` headers of the
+   * default log format split the stream into one patch per commit.
+   */
+  const patchIdsIn = async (
+    repoRoot: string,
+    range: string,
+  ): Promise<Set<string> | null> => {
+    const diff = await gitOut(deps.cmd, repoRoot, [
+      "log",
+      "-p",
+      "--no-merges",
+      "--max-count=500",
+      range,
+    ]);
+    if (diff === null) return null;
+    const res = await deps.cmd.run(
+      "git",
+      ["-C", repoRoot, "patch-id", "--verbatim"],
+      { timeoutMs: GIT_TIMEOUT_MS, stdin: diff },
+    );
+    if (res.exitCode !== 0) return null;
+    const ids = new Set<string>();
+    for (const l of res.stdout.split("\n")) {
+      const id = l.split(/\s+/)[0]?.trim();
+      if (id) ids.add(id);
+    }
+    return ids;
+  };
+
   const patchEquivalent = async (
     repoRoot: string,
     sha: string,
@@ -646,14 +737,25 @@ export function createJanitor(deps: JanitorDeps) {
       ])
     )?.trim();
     if (merge) return false;
+    // The verbatim id is computed lazily — the cherry hint ends the
+    // common «truly unpushed» case without a single diff scan.
+    let id: string | null | undefined;
+    const ownId = async () =>
+      id !== undefined ? id : (id = await patchIdOf(repoRoot, sha));
     for (const t of targets) {
+      // Hint only (PLUG-202): a «+» line proves no stable-id match —
+      // and verbatim ⊆ stable, so no verbatim match either. «-» or a
+      // failed cherry decide nothing; verbatim does.
       const cherry = await gitOut(deps.cmd, repoRoot, ["cherry", t, sha]);
       if (
         cherry !== null &&
-        !cherry.split("\n").some((l) => l.startsWith("+"))
+        cherry.split("\n").some((l) => l.startsWith("+"))
       ) {
-        return true;
+        continue;
       }
+      if (!(await ownId())) continue;
+      const ids = await patchIdsIn(repoRoot, `${sha}..${t}`);
+      if (ids?.has(id!)) return true;
     }
     return false;
   };
@@ -687,8 +789,9 @@ export function createJanitor(deps: JanitorDeps) {
     refs: string[],
     repoRoot: string,
     targets: string[],
+    extraTips: string[] = [],
   ): Promise<"ok" | "lost" | "unknown"> => {
-    const shas = new Set<string>();
+    const shas = new Set<string>(extraTips);
     for (const ref of refs) {
       const out = await gitOut(deps.cmd, cwd, [
         "log",
@@ -786,7 +889,133 @@ export function createJanitor(deps: JanitorDeps) {
         refs.push(ref);
       }
     }
-    return reflogPositionsSafe(path, refs, repoRoot, targets);
+    // §16.3 (PLUG-202): copy-scoped refs — `refs/worktree/*` and
+    // `refs/bisect/*` live in the worktree's own git dir and die with
+    // it. Their tips join the positions to prove; an unreadable
+    // listing proves nothing → «unknown».
+    const extra = await gitOut(deps.cmd, path, [
+      "for-each-ref",
+      "--format=%(objectname)",
+      "refs/worktree/",
+      "refs/bisect/",
+    ]);
+    if (extra === null) return "unknown";
+    return reflogPositionsSafe(
+      path,
+      refs,
+      repoRoot,
+      targets,
+      extra
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean),
+    );
+  };
+
+  /**
+   * §15 п.3 (PLUG-202): tracked files carrying `skip-worktree` or
+   * `assume-unchanged` (`git ls-files -v` — tag `S` or a lowercase
+   * letter) are invisible to `git status`, so a dirty one must be
+   * found by comparing the disk content (`git hash-object`) to the
+   * index blob. A flagged file missing on disk (sparse-checkout out
+   * of the cone) is skipped; a probe failure returns null — nothing
+   * is proven (`hidden-unknown`).
+   */
+  const hiddenChangedFiles = async (
+    path: string,
+  ): Promise<string[] | null> => {
+    const verbose = await gitOut(deps.cmd, path, ["ls-files", "-v", "-z"]);
+    if (verbose === null) return null;
+    const flagged: string[] = [];
+    for (const rec of verbose.split("\0")) {
+      if (!rec) continue;
+      const tag = rec[0]!;
+      if (tag === "S" || (tag >= "a" && tag <= "z")) {
+        flagged.push(rec.slice(2));
+      }
+    }
+    if (!flagged.length) return [];
+    const staged = await gitOut(deps.cmd, path, ["ls-files", "-s", "-z"]);
+    if (staged === null) return null;
+    const indexSha = new Map<string, string>();
+    for (const rec of staged.split("\0")) {
+      const tab = rec.indexOf("\t");
+      if (tab < 0) continue;
+      indexSha.set(rec.slice(tab + 1), rec.slice(0, tab).split(/\s+/)[1]!);
+    }
+    const changed: string[] = [];
+    for (const f of flagged) {
+      if (!existsSync(join(path, f))) continue;
+      const idx = indexSha.get(f);
+      if (!idx) return null; // flagged but not in the index — unproven
+      const h = (
+        await gitOut(deps.cmd, path, ["hash-object", "--", f])
+      )?.trim();
+      if (!h || h !== idx) changed.push(f);
+    }
+    return changed;
+  };
+
+  /** `child` strictly inside `parent`, compared after `realpath`. */
+  const pathInside = (parent: string, child: string): boolean => {
+    let rp = parent;
+    let rc = child;
+    try {
+      rp = realpathSync(parent);
+    } catch {
+      // keep the raw path — the copy was verified to exist already
+    }
+    try {
+      rc = realpathSync(child);
+    } catch {
+      // vanished between the listing and now — not provably outside
+      return true;
+    }
+    const prefix = rp.endsWith("/") ? rp : `${rp}/`;
+    return rc.startsWith(prefix);
+  };
+
+  /**
+   * §15 п.3 (PLUG-202): a foreign `.git` (file or directory) anywhere
+   * under the copy means an embedded repository whose commits no
+   * origin check covers. Only ignored directories can hide it — an
+   * untracked nested repo shows up in `git status` («dirty») and a
+   * tracked one as a gitlink — so the scan is bounded to the `!!`
+   * entries of `status --ignored`. `node_modules` is pruned (package
+   * manager content is recoverable), symlinks are never followed;
+   * a probe failure proves nothing → null (`nested-unknown`).
+   */
+  const nestedGitUnder = (dir: string, depth = 0): boolean | null => {
+    if (depth > 20) return false;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    for (const e of entries) {
+      if (e.name === ".git") return true;
+      if (e.name === "node_modules" || !e.isDirectory()) continue;
+      const found = nestedGitUnder(join(dir, e.name), depth + 1);
+      if (found !== false) return found;
+    }
+    return false;
+  };
+  const nestedRepoIn = async (path: string): Promise<boolean | null> => {
+    const out = await gitOut(deps.cmd, path, [
+      "status",
+      "--porcelain",
+      "--ignored=traditional",
+      "--untracked-files=all",
+      "--ignore-submodules=none",
+    ]);
+    if (out === null) return null;
+    for (const line of out.split("\n")) {
+      if (!line.startsWith("!! ") || !line.endsWith("/")) continue;
+      const found = nestedGitUnder(join(path, line.slice(3)));
+      if (found !== false) return found;
+    }
+    return false;
   };
 
   /**
@@ -1086,6 +1315,8 @@ export function createJanitor(deps: JanitorDeps) {
       protectedTargets: string[];
       localBranches: string[];
       openBranches: Set<string>;
+      /** Live (non-prunable, existing) worktree paths of the repo. */
+      worktreePaths: string[];
       /** `git worktree list` failed — the sweep cannot prove openness. */
       worktreeListFailed: boolean;
     }
@@ -1159,6 +1390,7 @@ export function createJanitor(deps: JanitorDeps) {
         protectedTargets: [],
         localBranches: [],
         openBranches: new Set(),
+        worktreePaths: [],
         worktreeListFailed: false,
       };
       if (!info.fetched) {
@@ -1190,13 +1422,15 @@ export function createJanitor(deps: JanitorDeps) {
           "--porcelain",
         ]);
         info.worktreeListFailed = worktreeList === null;
+        const liveWorktrees = parseWorktreeList(worktreeList ?? "")
+          .worktrees
+          // A copy whose directory BB already deleted lingers as a
+          // `prunable` entry (or is simply missing from disk) — its
+          // branch is not «открыта ни в одной копии» (§15).
+          .filter((w) => !w.prunable && existsSync(w.path));
+        info.worktreePaths = liveWorktrees.map((w) => w.path);
         info.openBranches = new Set(
-          parseWorktreeList(worktreeList ?? "")
-            .worktrees
-            // A copy whose directory BB already deleted lingers as a
-            // `prunable` entry (or is simply missing from disk) — its
-            // branch is not «открыта ни в одной копии» (§15).
-            .filter((w) => !w.prunable && existsSync(w.path))
+          liveWorktrees
             .map((w) => w.branch)
             .filter((b): b is string => !!b),
         );
@@ -1450,6 +1684,36 @@ export function createJanitor(deps: JanitorDeps) {
         return after(abandoned ? "abandoned-dirty" : "dirty", abandoned);
       if (unfinished === null) return after("unfinished-unknown");
       if (unfinished) return after("unfinished-op");
+      // §15 п.3 (PLUG-202): ignored files are recoverable — nested git
+      // storage is not. A live `worktree list` entry inside the copy or
+      // a foreign `.git` under an ignored directory keeps it; a failed
+      // probe proves nothing.
+      if (repo.worktreeListFailed) return after("nested-unknown");
+      if (repo.worktreePaths.some((w) => pathInside(path, w))) {
+        return after(
+          abandoned ? "abandoned-nested-worktree" : "nested-worktree",
+          abandoned,
+        );
+      }
+      const nestedRepo = await nestedRepoIn(path);
+      if (nestedRepo === null) return after("nested-unknown");
+      if (nestedRepo) {
+        return after(
+          abandoned ? "abandoned-nested-repo" : "nested-repo",
+          abandoned,
+        );
+      }
+      // §15 п.3 (PLUG-202): `skip-worktree`/`assume-unchanged` edits
+      // are invisible to `git status` — flagged files whose disk
+      // content differs from the index keep the copy.
+      const hidden = await hiddenChangedFiles(path);
+      if (hidden === null) return after("hidden-unknown");
+      if (hidden.length) {
+        return after(
+          abandoned ? "abandoned-hidden-changes" : "hidden-changes",
+          abandoned,
+        );
+      }
       // §16.3 (PLUG-199): a copy with submodules is never removed —
       // their objects live inside the copy's git dir and no origin
       // check covers them; idle past abandonedAfter — «брошено».
@@ -1780,6 +2044,36 @@ export function createJanitor(deps: JanitorDeps) {
         const sub = await copyHasSubmodules(e.path!);
         if (sub !== false) {
           note(sub === null ? "submodules-unknown" : "has-submodules", e.id);
+          return;
+        }
+        // §15 п.3 (PLUG-202): a nested worktree, an embedded `.git` or
+        // a hidden-flagged edit may have appeared since the run-start
+        // snapshot — the nested checks are re-run on the FRESH worktree
+        // list, not the one cached at fetch time.
+        const freshWtl = await gitOut(deps.cmd, repo.root, [
+          "worktree",
+          "list",
+          "--porcelain",
+        ]);
+        if (freshWtl === null) {
+          note("nested-unknown", e.id);
+          return;
+        }
+        const freshWtPaths = parseWorktreeList(freshWtl)
+          .worktrees.filter((w) => !w.prunable && existsSync(w.path))
+          .map((w) => w.path);
+        if (freshWtPaths.some((w) => pathInside(e.path!, w))) {
+          note("nested-worktree", e.id);
+          return;
+        }
+        const nRepo = await nestedRepoIn(e.path!);
+        if (nRepo !== false) {
+          note(nRepo === null ? "nested-unknown" : "nested-repo", e.id);
+          return;
+        }
+        const hid = await hiddenChangedFiles(e.path!);
+        if (hid === null || hid.length) {
+          note(hid === null ? "hidden-unknown" : "hidden-changes", e.id);
           return;
         }
         // §15 «Действие» (PLUG-197): a process may have cd'ed into the
@@ -2235,17 +2529,39 @@ export function createJanitor(deps: JanitorDeps) {
         notifyMem.get(coordinator) ?? 0,
       );
       if (now() - last < DAY_MS) continue;
-      const list = items
-        .slice(0, 8)
-        .map(
-          (i) =>
-            (i.branch ?? i.path ?? i.envId) +
-            // §16.3: «похоже, влито squash» — the manual-check flag.
-            (i.reason === "squash-suspect" ? " (squash?)" : ""),
-        )
-        .join(", ");
-      const more =
-        items.length > 8 ? ` и ещё ${items.length - 8}` : "";
+      // §15 «Ветки без копий» (PLUG-202): abandoned copy-less `bb/`
+      // branches go into the message as a count with the first 10 —
+      // the full list lives in `janitor report`.
+      const copies = items.filter((i) => !i.envId.startsWith("branch:"));
+      const branches = items.filter((i) => i.envId.startsWith("branch:"));
+      const parts: string[] = [];
+      if (copies.length) {
+        const list = copies
+          .slice(0, 8)
+          .map(
+            (i) =>
+              (i.branch ?? i.path ?? i.envId) +
+              // §16.3: «похоже, влито squash» — the manual-check flag.
+              (i.reason === "squash-suspect" ? " (squash?)" : ""),
+          )
+          .join(", ");
+        parts.push(
+          `новых брошенных ${copies.length} копий: ${list}` +
+            (copies.length > 8 ? ` и ещё ${copies.length - 8}` : ""),
+        );
+      }
+      if (branches.length) {
+        const names = branches
+          .slice(0, 10)
+          .map((b) => b.branch ?? b.envId)
+          .join(", ");
+        parts.push(
+          `брошенных веток bb/ без копий: ${branches.length} — ${names}` +
+            (branches.length > 10
+              ? ` и ещё ${branches.length - 10}`
+              : ""),
+        );
+      }
       try {
         await deps.threads.send({
           threadId: coordinator,
@@ -2254,8 +2570,7 @@ export function createJanitor(deps: JanitorDeps) {
             {
               type: "text",
               text:
-                `[orchestrator] уборщик: новых брошенных ` +
-                `${items.length} копий: ${list}${more} — ` +
+                `[orchestrator] уборщик: ${parts.join("; ")} — ` +
                 `разбор: bb orchestrator janitor report`,
               mentions: [],
             },
@@ -2302,8 +2617,18 @@ export function createJanitor(deps: JanitorDeps) {
         "-o",
         "--exclude-standard",
       ])) ?? "";
-    const uFiles = untracked.split("\0").filter(Boolean);
-    if (!uFiles.length) return { sha: w, partial: false };
+    // §15 п.3 (PLUG-202): `skip-worktree`/`assume-unchanged` edits are
+    // invisible to `stash create` too — flagged-and-changed files ride
+    // the untracked commit so their content survives. A failed probe
+    // marks the snapshot partial rather than silently skipping them.
+    const hidden = await hiddenChangedFiles(path);
+    const uFiles = [
+      ...new Set([
+        ...untracked.split("\0").filter(Boolean),
+        ...(hidden ?? []),
+      ]),
+    ];
+    if (!uFiles.length) return { sha: w, partial: hidden === null };
     const tag = `${process.pid}-${threadId}-${now()}`;
     const tmpIndex = join(tmpdir(), `jan-rescue-${tag}`);
     const tmpPaths = join(tmpdir(), `jan-rescue-paths-${tag}`);
@@ -2457,7 +2782,14 @@ export function createJanitor(deps: JanitorDeps) {
       "--untracked-files=all",
       "--ignore-submodules=none",
     ]);
-    if (statusText === null || !statusText.trim()) return;
+    if (statusText === null) return;
+    // §15 п.3 (PLUG-202): a copy whose only changes hide behind
+    // `skip-worktree`/`assume-unchanged` looks clean to `git status`
+    // but still holds work — rescue it the same way.
+    if (!statusText.trim()) {
+      const hidden = await hiddenChangedFiles(path);
+      if (!hidden?.length) return;
+    }
     const coordinator =
       deps.store.byThreadId(thread.id)?.coordinator_thread_id ??
       thread.parentThreadId ??

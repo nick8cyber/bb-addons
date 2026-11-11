@@ -12,6 +12,8 @@ export interface CmdRunOptions {
   timeoutMs?: number;
   /** Extra environment (merged over `process.env`). */
   env?: NodeJS.ProcessEnv;
+  /** Fed to the child's stdin (closed afterwards). */
+  stdin?: string;
 }
 
 export interface CmdRunner {
@@ -29,7 +31,7 @@ export function createCmd(): CmdRunner {
   return {
     run: (file, args, opts) =>
       new Promise<BbCliResult>((resolve) => {
-        execFile(
+        const child = execFile(
           file,
           args,
           {
@@ -59,6 +61,13 @@ export function createCmd(): CmdRunner {
             });
           },
         );
+        if (opts?.stdin === undefined) {
+          child.stdin?.end();
+        } else {
+          // a dead child may close the pipe early — not a run error
+          child.stdin?.on("error", () => {});
+          child.stdin?.end(opts.stdin);
+        }
       }),
   };
 }
