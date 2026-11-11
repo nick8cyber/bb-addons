@@ -8,7 +8,7 @@
  *
  * Usage: node harness-acp.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -47,11 +47,25 @@ const ptxt0 = (p) => (p?.params?.prompt ?? []).map((b) => b.text ?? "").join("\n
 const news = (home) => transcriptLines().filter((l) => l.method === "session/new" && l.home === home);
 const loads = (home) => transcriptLines().filter((l) => l.method === "session/load" && l.home === home);
 const setModes = (home) => transcriptLines().filter((l) => l.method === "session/set_mode" && l.home === home);
-const ledger = () => JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"));
+const ledger = () => {
+  const shared = JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"));
+  let local = {};
+  try {
+    local = JSON.parse(readFileSync(join(root, "conversations-state.json"), "utf8")).conversations ?? {};
+  } catch { /* no local file yet */ }
+  return { ...shared, conversations: { ...(shared.conversations ?? {}), ...local } };
+};
+// Operator-side write: also drop the instance-local files so the shared file is
+// the whole truth for the scenario (shadow semantics live in harness-local-state).
+const writeShared = (l) => {
+  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(l));
+  try { unlinkSync(join(root, "accounts-overlay.json")); } catch { /* absent */ }
+  try { unlinkSync(join(root, "conversations-state.json")); } catch { /* absent */ }
+};
 const cool = (label, untilIn) => {
   const l = ledger();
   l.accounts[label] = { ...(l.accounts[label] ?? { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null }), cooldownUntilMs: Date.now() + untilIn, lastError: "test" };
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(l));
+  writeShared(l);
 };
 const say = (...a) => process.stderr.write(`${a.join(" ")}\n`);
 
@@ -169,7 +183,7 @@ cool("a1", 60_000); cool("a2", 60_000); cool("a3", 60_000);
 {
   const l = ledger();
   l.conversations[t1bPtid] = "a1";
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(l));
+  writeShared(l);
 }
 resume(10, "t2", t1bPtid);
 await waitFor(() => replies(10).length === 1, 20000, "t2 resume");
@@ -232,7 +246,7 @@ check("interaction/resolved-on-release", lifecycle !== undefined,
 {
   const l = ledger();
   for (const a of ["a1", "a2", "a3", "a4"]) l.accounts[a].cooldownUntilMs = 0;
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(l));
+  writeShared(l);
 }
 start(50, "t3");
 await waitFor(() => replies(50).length === 1, 20000, "t3 start");
@@ -268,7 +282,7 @@ const deadPtid = "fake-dead-conv";
 {
   const l = ledger();
   l.conversations[deadPtid] = t6acct;
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(l));
+  writeShared(l);
 }
 const newsBefore = Object.fromEntries(["a1", "a2", "a3", "a4"].map((h) => [h, news(h).length]));
 threadReqIds.t7 = 160;

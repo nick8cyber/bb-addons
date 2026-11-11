@@ -52,6 +52,7 @@ import {
   listAccounts,
   loadLedger,
   markAccountCooldown,
+  markAccountIneligible,
   markAccountUse,
   pickAccount,
   rememberConversation,
@@ -1573,10 +1574,9 @@ function coolSessionAccount(
       now + ineligibleCooldownMs(location),
       message,
     );
-    ledger.accounts[session.accountLabel].ineligibleAtMs = now;
-    if (cause === "auth-dead") {
-      ledger.accounts[session.accountLabel].parkedReason = "auth-dead";
-    }
+    markAccountIneligible(ledger, session.accountLabel, {
+      ...(cause === "auth-dead" ? { parkedReason: "auth-dead" } : {}),
+    });
     saveLedger(dataDir, ledger);
     log(
       `thread ${session.threadId}: account ${session.accountLabel} parked (${cause === "auth-dead" ? "auth-dead" : location ? "location" : "verification required"})`,

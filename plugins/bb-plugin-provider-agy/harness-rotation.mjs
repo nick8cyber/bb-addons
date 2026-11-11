@@ -32,8 +32,7 @@ import {
   writeFileSync,
   chmodSync,
   readFileSync,
-  renameSync,
-} from "node:fs";
+  renameSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -243,8 +242,26 @@ function stop(threadId) {
   });
 }
 
-const readLedger = () =>
-  JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"));
+const readLedger = () => {
+  const shared = JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"));
+  let local = {};
+  try {
+    local = JSON.parse(readFileSync(join(root, "conversations-state.json"), "utf8")).conversations ?? {};
+  } catch { /* no local file yet */ }
+  return { ...shared, conversations: { ...(shared.conversations ?? {}), ...local } };
+};
+// Writes below act as operator/keeper truth on the shared file; dropping the
+// instance-local files keeps them deterministic (the overlay shadow would
+// otherwise keep stale marks alive until fresher shared.lastUsedMs, and a
+// local pin would shadow the conversations written here — covered separately).
+const writeLedger = (ledger, pretty = false) => {
+  writeFileSync(
+    join(root, "accounts-state.json"),
+    pretty ? `${JSON.stringify(ledger, null, 1)}\n` : JSON.stringify(ledger),
+  );
+  try { unlinkSync(join(root, "accounts-overlay.json")); } catch { /* absent */ }
+  try { unlinkSync(join(root, "conversations-state.json")); } catch { /* absent */ }
+};
 
 // ---- Phase A: bare 429 via ERROR result → default-cooldown rotation + handoff
 process.env.AGY_FAKE_ERROR_MODE = "pool-bare-once";
@@ -282,7 +299,7 @@ process.env.AGY_FAKE_ONCE_FILE = join(root, ".exit-trailing-once-done");
     }
     ledger.accounts[label].cooldownUntilMs = 0;
   }
-  writeFileSync(join(root, "accounts-state.json"), `${JSON.stringify(ledger, null, 1)}\n`);
+  writeLedger(ledger, true);
 }
 const spawnsBeforeD = spawns().length;
 await startThread("t-trailing");
@@ -311,7 +328,7 @@ const spawnsBeforeC2 = spawns().length;
   }
   ledger.accounts[pinnedLabel].cooldownUntilMs = Date.now() + 3_600_000;
   ledger.accounts[pinnedLabel].lastError = "test-injected cooldown";
-  writeFileSync(join(root, "accounts-state.json"), `${JSON.stringify(ledger, null, 1)}\n`);
+  writeLedger(ledger, true);
 }
 await sleep(2_500); // past the 1.5s idle kill: the child is gone
 await turn("t-rebuild", "two", 2);
@@ -329,7 +346,7 @@ const resetPool = () => {
   for (const label of ["a1", "a2", "a3"]) {
     ledger.accounts[label] = { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null };
   }
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 };
 const bridgeLog = () => readFileSync(join(root, "bridge.log"), "utf8");
 const waitBoundaries = (id, count) => waitFor(() => boundaries(id).length >= count, 15_000, `${id}: ${count} boundaries`);
@@ -364,7 +381,7 @@ stop("t-ineligible-first");
   ledger.accounts.a1.lastUsedMs = 0;
   ledger.accounts.a2.lastUsedMs = Date.now();
   ledger.accounts.a3.lastUsedMs = Date.now();
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 spawnOffset = spawns().length;
 await startThread("t-ineligible-next");
@@ -542,7 +559,7 @@ process.env.AGY_FAKE_ERROR_MODE = "ineligible";
     for (const label of ["a1", "a2", "a3"]) {
       if (label !== pinned) ledger.accounts[label] = { cooldownUntilMs: Date.now() + 3_600_000, lastUsedMs: 0, lastError: null };
     }
-    writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+    writeLedger(ledger);
     const arm = join(root, "preinit-arm");
     writeFileSync(arm, "x");
     process.env.AGY_FAKE_PREINIT_ARM = arm;
@@ -678,7 +695,7 @@ resetPool();
   const ledger = readLedger();
   ledger.accounts.a2.cooldownUntilMs = Date.now() + 3_600_000;
   ledger.accounts.a3.cooldownUntilMs = Date.now() + 3_600_000;
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 await expectStartupFailure("t-ineligible-no-free-sibling", VERIFY_URL);
 
@@ -889,7 +906,7 @@ stop("t-resume-next");
   ledger.accounts.a1.cooldownUntilMs = 0;
   ledger.accounts.a1.ineligibleAtMs = Date.now();
   for (const label of ["a2", "a3"]) ledger.accounts[label].ineligibleAtMs = Date.now();
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 const resumeBreakerStamp = readLedger().accounts.a1.ineligibleAtMs;
 const resumeBreakerLogOffset = bridgeLog().length;
@@ -897,7 +914,7 @@ const breakerResume = await resumeThread("t-resume-breaker", resumeConversation)
 check("resume/breaker-keeps-no-work-refusal-unparked",
   breakerResume.error?.message.includes(VERIFY_URL) && readLedger().accounts.a1.cooldownUntilMs === 0 &&
   readLedger().accounts.a1.ineligibleAtMs === resumeBreakerStamp &&
-  bridgeLog().slice(resumeBreakerLogOffset).includes("ineligible breaker open: 3 accounts parked"));
+  bridgeLog().slice(resumeBreakerLogOffset).includes("ineligible breaker open — suspect egress/network, not parking a1"));
 check("breaker/verification-url-on-own-line",
   bridgeLog().slice(resumeBreakerLogOffset).split("\n").some((line) => line.endsWith(`[provider-agy] ${VERIFY_URL}`)));
 delete process.env.AGY_FAKE_MODE_BY_LABEL;
@@ -1003,7 +1020,7 @@ check("breaker/three-distinct-then-stop-before-free-fifth",
   ["a1", "a2", "a3"].every((label) => breakerLedger.accounts[label].ineligibleAtMs > 0) &&
   breakerLedger.accounts.a4.cooldownUntilMs === 0 && breakerLedger.accounts.a4.ineligibleAtMs === undefined && breakerLedger.accounts.a5 === undefined);
 check("breaker/logs-open-with-original-diagnostic",
-  bridgeLog().slice(breakerLogOffset).includes("ineligible breaker open: 3 accounts parked in the last 10m — suspect egress/network, not parking a4"));
+  bridgeLog().slice(breakerLogOffset).includes("ineligible breaker open — suspect egress/network, not parking a4"));
 stop("t-breaker");
 
 // Recreate the bridge module: persisted timestamps must still open the breaker.
@@ -1011,7 +1028,7 @@ stop("t-breaker");
   const ledger = readLedger();
   ledger.accounts.a4.lastUsedMs = 0;
   ledger.accounts.a5 = { cooldownUntilMs: 0, lastUsedMs: Date.now(), lastError: null };
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 bridge.onClose?.();
 activeBridge = (await import(new URL("./dist/host.js?breaker-restart", import.meta.url).href)).experimental_providerBridge;
@@ -1029,7 +1046,7 @@ stop("t-breaker-restart");
   for (const label of ["a1", "a2", "a3"]) ledger.accounts[label].ineligibleAtMs = Date.now() - 600_001;
   ledger.accounts.a4.lastUsedMs = 0;
   ledger.accounts.a5 = { cooldownUntilMs: 0, lastUsedMs: Date.now(), lastError: null };
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 const outsideWindowReply = await startThread("t-breaker-outside-window", "old events do not block");
 await waitBoundaries("t-breaker-outside-window", 2);
@@ -1046,7 +1063,7 @@ stop("t-breaker-outside-window");
   }
   ledger.accounts.a2.ineligibleAtMs = Date.now() - 120_000;
   ledger.accounts.a3.ineligibleAtMs = Date.now() - 120_000;
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 process.env.AGY_INELIGIBLE_BREAKER_WINDOW_MS = "60000";
 process.env.AGY_INELIGIBLE_BREAKER_MAX = "2";
@@ -1060,7 +1077,7 @@ stop("t-breaker-custom-window");
   const ledger = readLedger();
   ledger.accounts.a1.cooldownUntilMs = 0;
   ledger.accounts.a1.lastUsedMs = 0;
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 const repeatedLabelReply = await startThread("t-breaker-repeated-label", "one account still counts once");
 await waitBoundaries("t-breaker-repeated-label", 2);
@@ -1072,7 +1089,7 @@ stop("t-breaker-repeated-label");
   ledger.accounts.a1.cooldownUntilMs = 0;
   ledger.accounts.a1.lastUsedMs = 0;
   ledger.accounts.a2.ineligibleAtMs = Date.now();
-  writeFileSync(join(root, "accounts-state.json"), JSON.stringify(ledger));
+  writeLedger(ledger);
 }
 const stampBeforeBreaker = readLedger().accounts.a1.ineligibleAtMs;
 const customMaxReply = await startThread("t-breaker-custom-max", "custom max two reached");

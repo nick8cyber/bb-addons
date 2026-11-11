@@ -75,6 +75,7 @@ import {
   listAccounts,
   loadLedger,
   markAccountCooldown,
+  markAccountIneligible,
   markAccountUse,
   pickAccount,
   rememberConversation,
@@ -1257,7 +1258,7 @@ function scheduleAccountRetry(
       message,
     );
     if (reason === "ineligible") {
-      ledger.accounts[session.accountLabel].ineligibleAtMs = now;
+      markAccountIneligible(ledger, session.accountLabel);
       parked = true;
     }
     const accounts = listAccounts(cliproxyRelayDataDir);
