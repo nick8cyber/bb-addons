@@ -428,7 +428,7 @@ test("injectInstructions=false: no texts for any role, tools stay", () => {
     probes: probes("orchestrator"),
   });
   assert.equal(orch.instructions, undefined);
-  assert.equal(orch.tools.length, 3);
+  assert.equal(orch.tools.length, 4);
   assert.deepEqual(orch.skills, ["orchestrator-setup"]);
   const exec = buildAgentConfiguration(ctxFor("thr_e"), {
     ...deps,
@@ -468,7 +468,7 @@ test("a role row beats the fallback markers in both directions", () => {
       probes: { ...base, roleByThreadId: () => "orchestrator" },
     },
   );
-  assert.equal(orch.tools.length, 3);
+  assert.equal(orch.tools.length, 4);
   assert.ok(orch.instructions!.includes("RULE"));
 });
 

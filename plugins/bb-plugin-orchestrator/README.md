@@ -29,12 +29,19 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `autoFallback` allows (one transaction, `reissue_of`, reuses the §4
   dispatch steps); coordinator messages via `threads.send`
   `queue-if-active` prefixed `[orchestrator]`, task comments throughout.
+- **`merge`** (agent tool `orchestrator_merge` + CLI, §14): merges a
+  finished round's `result_sha` into the coordinator's worktree after the
+  §14 checks (clean result, clean coordinator copy, non-protected target,
+  fresh executor HEAD per §16.2, one merge per copy). A conflict aborts
+  back to a clean copy; with the `mergeAutofix` setting on, a fix round is
+  delegated to the same task and level. Protected branches refuse —
+  `release` owns them.
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
   `dispatching` rows via `bb tasks threads` or drops them, survives
   restarts without duplicate reissues. `bb orchestrator reconcile` runs
   a pass immediately.
-- **CLI**: `delegate`, `status`, `show`, `cancel`, `policy show|validate`,
+- **CLI**: `delegate`, `status`, `show`, `cancel`, `merge`, `policy show|validate`,
   `instructions`, `reconcile`.
 
 ## Роли

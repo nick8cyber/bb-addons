@@ -69,7 +69,12 @@ test("configure wires the registered tools for a coordinator thread", async () =
   );
   assert.deepEqual(
     resolved.tools.map((t) => t.name).sort(),
-    ["orchestrator_cancel", "orchestrator_delegate", "orchestrator_status"],
+    [
+      "orchestrator_cancel",
+      "orchestrator_delegate",
+      "orchestrator_merge",
+      "orchestrator_status",
+    ],
   );
   assert.match(resolved.instructions ?? "", /delegate/);
 });

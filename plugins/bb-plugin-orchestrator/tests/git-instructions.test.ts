@@ -332,7 +332,7 @@ test("round 2 dispatch gets the «Заход 2» section with the round-1 SHA", 
   assert.match(text, /Заход 2: продолжение работы с коммита abc123def/);
   assert.match(text, /ветка exec-r1 прошлого захода/);
   assert.match(text, /git merge --ff-only abc123def/);
-  assert.match(text, /git merge --no-edit abc123def/);
+  assert.match(text, /git merge -m "merge abc123d" abc123def/);
   const row = store.listActive()[0]!;
   assert.equal(row.round, 2);
   assert.equal(row.continue_from, "abc123def");

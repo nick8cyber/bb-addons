@@ -134,11 +134,16 @@ export function roundSection(
   branch: string | null | undefined,
 ): string {
   const prev = branch ?? continueFrom;
+  // §16.6: merges carry an explicit `-m`; the message never embeds a
+  // branch name or a thread id — a sha7 or a bare "merge".
+  const mergeMsg = /^[0-9a-f]{7,40}$/i.test(continueFrom)
+    ? `merge ${continueFrom.slice(0, 7)}`
+    : "merge";
   return (
     `Заход ${round}: продолжение работы с коммита ${continueFrom}` +
     ` (ветка ${prev} прошлого захода).\n` +
     `- Первым шагом: git merge --ff-only ${continueFrom}; не fast-forward —` +
-    ` git merge --no-edit ${continueFrom}; конфликт — вопрос координатору.\n` +
+    ` git merge -m "${mergeMsg}" ${continueFrom}; конфликт — вопрос координатору.\n` +
     `- Ветку прошлого захода не открывай и в её рабочую копию не заходи:` +
     ` работай только в своей ветке.`
   );
