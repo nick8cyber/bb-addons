@@ -6,7 +6,7 @@ afterEach(()=>{document.body.replaceChildren();document.getElementById(SIDEBAR_C
 describe("owned sidebar control styles",()=>{
  it("deduplicates only our Settings item while native Settings exists, then restores it",()=>{
   const footer=document.createElement("div");footer.dataset.sidebar="footer";
-  const ours=document.createElement("li");ours.dataset.footerItem="plugin:sidebar-collapse/sidebar-collapse-settings";
+  const ours=document.createElement("li");ours.dataset.footerItem="plugin:compact-ui/compact-ui-settings";
   const other=document.createElement("li");other.dataset.footerItem="plugin:other/settings";
   footer.append(ours,other);document.body.append(footer);
   const dispose=mountSidebarControls();

@@ -610,7 +610,7 @@ describe("navigation rail plugin registration", () => {
     );
 
     const footer = app.sidebarFooterActions.find(
-      (action) => action.id === "sidebar-collapse-settings",
+      (action) => action.id === "compact-ui-settings",
     );
     expect(footer).toBeTruthy();
     const openSettings = vi.fn();
@@ -622,12 +622,12 @@ describe("navigation rail plugin registration", () => {
     const app = await appPromise;
     buildShell();
     const mounted = await mountPluginContentScripts(app, {
-      pluginId: "sidebar-collapse",
+      pluginId: "compact-ui",
     });
     expect(mounted.inspection.mountedIds).toContain("navigation-rail");
 
     const overlay = renderSlot(
-      app.appOverlays[0]!,
+      app.appOverlays.find((o) => o.id === "navigation-rail")!,
       {},
       {
         settings: {
@@ -651,10 +651,10 @@ describe("navigation rail plugin registration", () => {
     const app = await appPromise;
     buildShell();
     const mounted = await mountPluginContentScripts(app, {
-      pluginId: "sidebar-collapse",
+      pluginId: "compact-ui",
     });
 
-    const overlay = renderSlot(app.appOverlays[0]!, {});
+    const overlay = renderSlot(app.appOverlays.find((o) => o.id === "navigation-rail")!, {});
 
     expect(root().hasAttribute(NAVIGATION_RAIL_ROOT_ATTRIBUTE)).toBe(false);
     expect(styleElement()).toBeNull();

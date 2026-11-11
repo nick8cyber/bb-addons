@@ -20,7 +20,7 @@ export const NAVIGATION_RAIL_ROOT_ATTRIBUTE =
 export const NAVIGATION_RAIL_PART_ATTRIBUTE =
   "data-bb-sidebar-navigation-rail-part";
 export const NAVIGATION_RAIL_STYLE_ID =
-  "bb-plugin-sidebar-collapse-navigation-rail";
+  "bb-plugin-compact-ui-navigation-rail";
 
 const ROOT_ACTIVE_VALUE = "true";
 

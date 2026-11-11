@@ -1,4 +1,5 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { z } from "zod";
 
 /** Project drag-and-drop is not part of the frontend sidebar API, so the list
@@ -16,13 +17,43 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ ok: z.literal(true) }),
   },
+  /** Self-check channel: the nav-top-row content script reports live DOM
+   *  geometry through an app overlay bridge; the backend persists it where
+   *  the agent can read it without a browser. */
+  nav_top_row_diag: {
+    input: z.object({ report: z.string().max(20000) }).strict(),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  /** Folded project groups persist server-side (bb.storage.kv) so the state
+   *  survives reloads and syncs across devices; writes broadcast on the
+   *  "collapsed-projects" realtime channel. */
+  collapsed_projects_get: {
+    input: z.object({}).strict(),
+    output: z.object({ ids: z.array(z.string()) }),
+  },
+  collapsed_projects_set: {
+    input: z.object({
+      ids: z.array(z.string().min(1)).max(500),
+      origin: z.string().nullable().default(null),
+    }).strict(),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  /** One-shot commands for the UI self-test: written into CMD_PATH by the
+   *  agent, consumed (and deleted) by the next poll from the app bridge. */
+  nav_top_row_poll: {
+    input: z.object({}).strict(),
+    output: z.object({ command: z.string().nullable() }),
+  },
 });
+
+const DIAG_PATH = "/tmp/compact-ui-nav-top-row.json";
+const CMD_PATH = "/tmp/compact-ui-nav-cmd.txt";
 
 export async function selectThreadList(bb: BbPluginApi, collapsed: boolean, isDisposed = () => false) {
   if (isDisposed()) return false;
   const key = "sidebar.threadListProvider";
   const current = (await bb.sdk.system.uiPreferences.list()).preferences[key];
-  const ours = "sidebar-collapse/collapsed", native = "thread-list/thread-list";
+  const ours = "compact-ui/collapsed", native = "thread-list/thread-list";
   const target = collapsed ? ours : native;
   // A deliberate selection of another plugin belongs to the user.
   if (current.value === target || !["", "auto", "__automatic__", ours, native].includes(current.value) || isDisposed()) return false;
@@ -35,7 +66,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const settings = bb.settings.define({
     // Off switch reachable without a browser:
-    // `bb plugin config sidebar-collapse set useCollapsedList false` hands the
+    // `bb plugin config compact-ui set useCollapsedList false` hands the
     // sidebar back to bb's own list while leaving the plugin installed.
     useCollapsedList: {
       type: "boolean",
@@ -72,10 +103,17 @@ export default async function plugin(bb: BbPluginApi) {
         "Дописывать в строку чата имя ветки его окружения. Родной список bb ветку не показывает.",
       default: false,
     },
+    navDiag: {
+      type: "boolean",
+      label: "Nav top-row diagnostics (debug)",
+      description:
+        "Включает канал самопроверки навигационных иконок: опрос команд и запись диагностики в /tmp. Выключено по умолчанию — только для отладки.",
+      default: false,
+    },
     hideNavigationRail: {
       type: "boolean",
       label: "Скрыть полосу навигации",
-      description: "Скрывает узкую полосу Home/Tasks/More в развёрнутом списке чатов. Настройки доступны через Settings или кнопку Sidebar Collapse внизу. Нативный Top list BB не меняет.",
+      description: "Скрывает узкую полосу Home/Tasks/More в развёрнутом списке чатов. Настройки доступны через Settings или кнопку Compact UI внизу. Нативный Top list BB не меняет.",
       default: false,
     },
     showThreadCount: {
@@ -115,6 +153,23 @@ export default async function plugin(bb: BbPluginApi) {
         nextProjectId,
       });
       return { ok: true } as const;
+    },
+    collapsed_projects_get: async () => ({
+      ids: (await bb.storage.kv.get<string[]>("collapsedProjects")) ?? [],
+    }),
+    collapsed_projects_set: async ({ ids, origin }) => {
+      await bb.storage.kv.set("collapsedProjects", ids);
+      bb.realtime.publish("collapsed-projects", { ids, origin });
+      return { ok: true } as const;
+    },
+    nav_top_row_diag: async ({ report }) => {
+      await writeFile(DIAG_PATH, report, "utf8").catch((e) => bb.log.warn("nav diag write failed: " + String(e)));
+      return { ok: true } as const;
+    },
+    nav_top_row_poll: async () => {
+      const command = (await readFile(CMD_PATH, "utf8").catch(() => "")).trim() || null;
+      if (command) await unlink(CMD_PATH).catch(() => {});
+      return { command };
     },
   });
 

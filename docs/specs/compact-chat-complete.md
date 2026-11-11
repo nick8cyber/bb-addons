@@ -6,7 +6,7 @@ updated: 2026-11-02
 
 # Контракт
 
-Дополняет [прежний план](chat-chrome-047.md). Реализация в существующем `sidebar-collapse`, без новых плагинов и изменений BB core.
+Дополняет [прежний план](chat-chrome-047.md). Реализация в существующем `compact-ui`, без новых плагинов и изменений BB core.
 
 1. Git-сводка доступна кнопкой в верхнем баре. Закрытая сводка и её merge-base не занимают отдельную строку над вводом. Открытие показывает штатные файлы/выбор базы; неизвестные соседние сегменты не скрываются. Включить `bb--git.showGitChanges` после работающего переноса, вместо отключения возможности.
 2. Фоновая активность доступна верхней кнопкой Terminal. Её закрытая панель не занимает высоту над вводом; по нажатию показывает штатную карточку с названиями/длительностью команд. Escape и внешний клик закрывают, Escape возвращает фокус. Кнопки запуска/остановки команд не вызываются автоматически.
@@ -16,9 +16,9 @@ updated: 2026-11-02
 
 ## Проверка и выпуск
 
-Focused tests: первая свёртка/ручное раскрытие/редактор/ошибка/cleanup очереди; перенос фоновой активности без запуска команд, split isolation, Escape/outside/resize/cleanup; сохранение merge-base в Git popover. Полные существующие тесты sidebar-collapse, typecheck и source build. Chromium: desktop1440, mobile390/360 и360×520; реальный BB shell с изолированными fixtures для очереди/фоновых команд, перехват любых mutations. Проверить реальные размеры, отсутствие overflow и screenshots. Откат: прежний установленный source `worktrees/bb-addons-chat-chrome/plugins/bb-plugin-sidebar-collapse` и snapshot его settings.
+Focused tests: первая свёртка/ручное раскрытие/редактор/ошибка/cleanup очереди; перенос фоновой активности без запуска команд, split isolation, Escape/outside/resize/cleanup; сохранение merge-base в Git popover. Полные существующие тесты compact-ui, typecheck и source build. Chromium: desktop1440, mobile390/360 и360×520; реальный BB shell с изолированными fixtures для очереди/фоновых команд, перехват любых mutations. Проверить реальные размеры, отсутствие overflow и screenshots. Откат: прежний установленный source `worktrees/bb-addons-chat-chrome/plugins/bb-plugin-compact-ui` и snapshot его settings.
 
-Свести старую опубликованную ветку `fix/chat-chrome-047` и завершение в основную ветку, source установки перевести в canonical `bb-addons/plugins/bb-plugin-sidebar-collapse`, сохранить настройки. Компактность опубликована отдельно. Последующим прямым указанием владельца разрешены MIT-лицензия и публикация Server Switcher в том же bb-addons/main.
+Свести старую опубликованную ветку `fix/chat-chrome-047` и завершение в основную ветку, source установки перевести в canonical `bb-addons/plugins/bb-plugin-compact-ui`, сохранить настройки. Компактность опубликована отдельно. Последующим прямым указанием владельца разрешены MIT-лицензия и публикация Server Switcher в том же bb-addons/main.
 
 Совместимость: SDK зафиксирован на 0.6.104; старые public runtime callbacks BB0.48 для собственного списка/React header controls изолированы в `lib/host-compat.ts`, поскольку SDK исключил их TypeScript-декларации, но поддерживает исполнение. Навигация, rename и native confirmation остаются у host. `Original` опционален; на новом host используется существующий штатный выбор списка. Чистая установка включает `cron-parser`, требуемый testing SDK.
 

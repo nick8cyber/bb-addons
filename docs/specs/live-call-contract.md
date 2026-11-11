@@ -54,6 +54,8 @@ bytes 5..   PCM16 LE, моно: 0x01 — 16 кГц, 20 мс = 640 байт; 0x02
 | `hello` | `protocol: 1`, `mode?: "normal"\|"extended"`, `resume?: callId` — возврат в идущий звонок после обрыва (сервер ждёт 20 с, иначе `error { code: "call_gone" }` + 4009). При возврате (`resume`) сервер повторяет `ready`, `thread`, `state` и, если ждёт подтверждение без вердикта, кадр `confirmation` с тем же `confirmationId`, `expiresAt` и текущей фазой (`listening`, если окно открыто, иначе `asking`). (PLUG-120 п. 11) | Первый кадр. Без него через 5 с соединение закрывается |
 | `mute` | `muted: boolean` | Микрофон выключен: сервер шлёт в Gemini тишину |
 | `playback_drained` | `turnSeq: number` | Плеер доиграл последний кадр хода (§7.1 п. 3 спеки) |
+| `playback_stopped` | `turnSeq: number`, `playedMs: number` | Ход оборван (прерывание/перебивание): сколько звука хода реально проиграно до остановки; повторная остановка кадр не шлёт (спека §7.2.1) |
+| `speech_start` | `turnSeq: number`, `playedMs: number` | Детектор речи браузера увидел начало реплики владельца; `playedMs` — сколько мс звука хода `turnSeq` плеер реально проиграл к этому моменту (0 — хода не было). Порог уровня ≥ 120 мс, повтор — после 400 мс тишины (спека §7.2.1) |
 | `switch_mode` | `mode` | Переключение режима, отклоняется при pending (`error { code: "pending_confirmation" }`) |
 | `confirm` | `confirmationId: string`, `decision: "approve"\|"cancel"` | Кнопки в оверлее, равносильны слову владельца |
 | `end` | — | Завершить звонок |
@@ -261,6 +263,14 @@ type Verdict = "approved" | "hint" | "cancelled" | "expired" | "not_confirmed";
 | `system_injected { waited }` | вставка реально ушла в голос; `waited=true` — ждала конца хода |
 | `mode_switch { to, source, msSinceStart }` / `client_log switch_mode_ui` | смена режима и её источник |
 | `client_log` | браузер: `audio_ready`, `mic_silent`, `mic_error`, `ws_closed_live`, `ws_open_timeout`, `detached`, `reattached` |
+| `tool_call { id, name, argsHash, argsPreview }` | каждый `toolCall` от Gemini до исполнения; `argsPreview` ≤ 200 символов после фильтра секретов (спека §7.2.6) |
+| `brain_answer { tool, ms, partial?, callIds }` | ответ мозгового центра отдан модели; `callIds` — все вызовы, получившие этот ответ (single-flight) |
+| `early_approval { tool, speechAt, requestTurnSeq, timing }` | «да» до звука ответа или без кадра отброшено; `timing: "client"\|"no_marker"\|"tail"` (§7.2.1–7.2.2) |
+| `question_heard { tool, at, offsetMs, durationMs? }` | вопрос подтверждения зазвучал; `durationMs` — до `playback_drained` |
+| `speech_start { turnSeq, playedMs }` | кадр браузера о начале речи владельца (§7.2.1) |
+| `barge_decision { turnSeq, playedMs, requestTurnSeq, requestTurnMs, tailSource?, result }` | решение по реплике в пути перебивания при pending; `result`: `approved`\|`early`\|`echo`\|`not_approval`\|`no_marker`\|`tail` (§7.2.1) |
+| `question_long { tool, words }` | модель сказала вопрос длиннее `say` + 6 слов (§7.2.3) |
+| `verdict { …, timing }` | у вердикта перебиванием — `timing: "client"` (без кадра перебивание не засчитывается) |
 
 CLI: `bb call tool <имя> [json]` — выполнить инструмент чтения вне звонка (классы C/P/L отклоняются).
 
@@ -694,10 +704,10 @@ stderr (§14.6): точный секрет — ASCII, с пробелом, ки�
   1. `experimental_newThreadPanelAction` — «Позвонить по проекту». Действие показывается всегда; если `context.projectId` не в реестре, `run` пишет «для этого проекта звонок не настроен» и звонок не начинает.
   2. Команда «Live Call: позвонить по проекту» — выбор из проектов реестра.
   3. Кнопка сайдбара «Позвонить» и `Mod+Shift+L` **не меняются**: обычный звонок координатору в один клик, без выбора.
-- **Необязательная интеграция с `bb-plugin-sidebar-collapse`** (не требуется для работы). Предположение, которое исполнитель проверяет первым: компоненты плагинов рендерятся в одном дереве React хоста, то есть в одном `window`. Если нет — интеграции нет, входы п. 1–2 остаются:
+- **Необязательная интеграция с `bb-plugin-compact-ui`** (не требуется для работы). Предположение, которое исполнитель проверяет первым: компоненты плагинов рендерятся в одном дереве React хоста, то есть в одном `window`. Если нет — интеграции нет, входы п. 1–2 остаются:
   - плагин звонка публикует в `window` событие `bb-live-call:projects` со списком `{ projectId }` из реестра (при загрузке, при изменении реестра и в ответ на `bb-live-call:projects-request`) и слушает `bb-live-call:start-project { projectId }`;
-  - `sidebar-collapse` при монтировании шлёт `bb-live-call:projects-request` — плагин звонка мог опубликовать список раньше (сделано: ветка `feat/sidebar-collapse-live-call-icon`);
-  - `sidebar-collapse` рисует телефон слева от «+» только для проектов из последнего `bb-live-call:projects`; нет событий — нет иконки;
+  - `compact-ui` при монтировании шлёт `bb-live-call:projects-request` — плагин звонка мог опубликовать список раньше (сделано: ветка `feat/compact-ui-live-call-icon`);
+  - `compact-ui` рисует телефон слева от «+» только для проектов из последнего `bb-live-call:projects`; нет событий — нет иконки;
   - события документируются в README плагина звонка.
 
 ### 15.2 Реестр (настройки плагина, меняет только владелец)
@@ -795,7 +805,7 @@ stderr (§14.6): точный секрет — ASCII, с пробелом, ки�
    - ручка C после `confirm approve`;
    - ручка, запрещённая реестром, модели не видна;
    - звонок по треду в тестовом проекте из реестра: ручка R вызывается, ручки треда работают.
-3. Без `sidebar-collapse` все входы §15.1 п. 1–3 работают.
+3. Без `compact-ui` все входы §15.1 п. 1–3 работают.
 
 ### 15.7 TODO (не в этой задаче)
 

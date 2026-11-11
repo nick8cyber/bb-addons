@@ -12,6 +12,22 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 export default function plugin(bb: BbPluginApi) {
+  bb.settings.define({
+    subagentsDisabled: {
+      type: "boolean",
+      label: "Disable provider subagents",
+      description:
+        "Prevent agy from starting native subagents (invoke_subagent, swarm, boost) so agents use bb for delegation.",
+      default: true,
+    },
+    memoryEnabled: {
+      type: "boolean",
+      label: "Antigravity memory",
+      description:
+        "Allow agy to read and write its native memory (memory/retrieve_memory tools) for bb threads.",
+      default: false,
+    },
+  });
   bb.providers.register({
     id: "agy",
     displayName: "Antigravity (agy)",
@@ -34,9 +50,10 @@ export default function plugin(bb: BbPluginApi) {
       supportsManualCompaction: true,
       supportsThreadArchive: false,
       supportsThreadRename: false,
-      // agy's stream-json has no approval back channel, so the only mode the
-      // bridge can honestly run is the unrestricted one.
-      permissionModes: ["full"],
+      // The ACP dialect delivers full/accept-edits only: "auto" has no
+      // permissionCli mapping in the generic bridge, and the daemon rejects
+      // it at thread.start even when declared — so it is not offered here.
+      permissionModes: ["full", "accept-edits"],
       // agy's own ladder; the model list encodes the effort in the model id.
       reasoningLevels: ["low", "medium", "high"],
     },
@@ -53,5 +70,29 @@ export default function plugin(bb: BbPluginApi) {
       installUrl: "https://antigravity.google/docs/cli/getting-started",
     },
     composerActions: [],
+    // Central provider knob, same contract as codex/claude-code: bb's
+    // "Disable provider subagents" setting reaches the bridge as
+    // options.providerOptions.providerSubagentsEnabled; the wrapper resolves
+    // it against the AGY_DISABLE_SUBAGENTS env override.
+    // `=== false` on purpose: the SDK allows `undefined` settings values, and
+    // our default is the inverted one (disabled) — native subagents turn on
+    // only after an explicit opt-out, never on a missing/unloaded value.
+    deriveProviderOptions: (ctx) => ({
+      providerSubagentsEnabled: ctx.settings.subagentsDisabled === false,
+      providerMemoryEnabled: ctx.settings.memoryEnabled === true,
+    }),
+    // The daemon hands this to the ACP wrapper on every thread-bound
+    // request; the wrapper rewrites acpLaunchSpec per session (account
+    // pool, shim, proxies) before delegating to the generic bridge.
+    experimental_bridgeOptions: {
+      acpLaunchSpec: {
+        displayName: "Antigravity (agy)",
+        command: "agy",
+        args: ["acp"],
+        env: {},
+        permissionCli: { full: ["--dangerously-skip-permissions"] },
+      },
+      acpDialect: "generic",
+    },
   });
 }

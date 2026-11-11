@@ -796,7 +796,7 @@ function AdvisorComposerBanner() {
           Start a corrective turn now, or it will be shared with the agent on
           your next message.
         </p>
-        <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-end">
           <button
             type="button"
             disabled={mutationBusy}

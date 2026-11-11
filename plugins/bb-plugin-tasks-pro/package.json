@@ -11,7 +11,7 @@
     "name": "Tasks Pro",
     "description": "Advanced read-only task browser: sortable table, kanban, filters, grouping, search and saved views.",
     "branding": {
-      "icon": "ListFilter"
+      "icon": "ListTodo"
     },
     "server": "./server.ts",
     "app": "./app.tsx"

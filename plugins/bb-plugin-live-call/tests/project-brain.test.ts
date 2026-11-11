@@ -443,7 +443,7 @@ describe("3. Мост чтения коннекторов (§3, §7)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("параллельный brain_ask → busy без смешивания запросов", async () => {
+  it("параллельный brain_ask → очередь без смешивания запросов (§7.2.6)", async () => {
     const dir = join(testDir, "b7");
     const thread = makeBrainThread([]);
     const { sdk } = makeSdk(thread);
@@ -453,12 +453,14 @@ describe("3. Мост чтения коннекторов (§3, §7)", () => {
     const brain = makeBrain({ sdk: sdk as never, store, storageDir: dir });
     await brain.start();
     const first = brain.ask("первый");
-    const second = await brain.ask("второй");
-    expect(second.ok).toBe(false);
-    if (!second.ok && "error" in second) expect(second.error.code).toBe("busy");
+    const second = brain.ask("второй");
+    // §7.2.6: другой вопрос ждёт в очереди — не busy и не второй ход мозгового центра.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sdk.threads.send).toHaveBeenCalledTimes(1);
     releaseSend();
     await brain.archive();
-    await first.catch(() => {});
+    const [, r2] = await Promise.all([first.catch((e) => e), second.catch((e) => e)]);
+    expect(!(r2.ok === false && "error" in r2 && r2.error.code === "busy")).toBe(true);
     rmSync(dir, { recursive: true, force: true });
   });
 });

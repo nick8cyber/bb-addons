@@ -45,7 +45,9 @@ export interface ToolContext {
   /** Мозговой центр звонка по треду (§12.11). */
   brain?: BrainCenter;
   /** Мозговой центр звонка по проекту (§15.9): только вопросы, записи у голоса. */
-  projectBrain?: { ask(question: string): Promise<ToolResult> };
+  projectBrain?: { ask(question: string, callId?: string): Promise<ToolResult>; askWillJoin?(question: string): boolean };
+  /** id toolCall от Gemini — в журнал brain_answer (single-flight, §7.2.6). */
+  functionId?: string;
   isTargetThreadActive?: () => Promise<boolean>;
   /** Подписка на тред для EventBridge (§16.4). */
   watchThread?: (threadId: string) => void;
@@ -88,6 +90,8 @@ export interface ToolDef {
   execute: (args: Record<string, unknown>, ctx: ToolContext, opts?: { timeoutMs?: number }) => Promise<ToolExecutionResult>;
   /** Двухшаговая ручка коннектора (§14.10): превью -> подтверждение. */
   twoStep?: boolean;
+  /** Подавить карточку действия для этого вызова (single-flight brain_ask, §7.2.6). */
+  suppressActionCard?: (args: Record<string, unknown>, ctx: ToolContext) => boolean;
 }
 
 export type ToolExecutionResult = ToolResult & {
@@ -1811,22 +1815,16 @@ export const brainAskTool: ToolDef = {
     },
     required: ["question"],
   },
+  // §7.2.6: присоединившийся single-flight вызов карточки не создаёт — одна на вопрос.
+  suppressActionCard: (args, ctx) => Boolean(ctx.brain?.askWillJoin?.(String(args.question ?? "").trim())),
   async execute(args, ctx) {
     const q = String(args.question ?? "").trim();
     if (!q) return { ok: false, error: { code: "invalid_argument", message: "укажи вопрос для мозгового центра" } };
     ctx.ledger.add("tool", `brain_ask: ${q}`);
-    ctx.reportAction("brain_ask", "R", "running", `Спрашиваю у мозгового центра: «${q.slice(0, 80)}»`);
     if (!ctx.brain) {
-      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не доступен");
       return { ok: false, error: { code: "not_found", message: "мозговой центр не доступен" } };
     }
-    const res = await ctx.brain.ask(q);
-    if (res.ok) {
-      ctx.reportAction("brain_ask", "R", "done", `Мозговой центр ответил на «${q.slice(0, 80)}»`);
-    } else {
-      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не смог ответить");
-    }
-    return res;
+    return ctx.brain.ask(q, ctx.functionId);
   },
 };
 
@@ -1881,22 +1879,16 @@ export const projectBrainAskTool: ToolDef = {
     },
     required: ["question"],
   },
+  // §7.2.6: присоединившийся single-flight вызов карточки не создаёт — одна на вопрос.
+  suppressActionCard: (args, ctx) => Boolean(ctx.projectBrain?.askWillJoin?.(String(args.question ?? "").trim())),
   async execute(args, ctx) {
     const q = String(args.question ?? "").trim();
     if (!q) return { ok: false, error: { code: "invalid_argument", message: "укажи вопрос для мозгового центра" } };
     ctx.ledger.add("tool", `brain_ask: ${q}`);
-    ctx.reportAction("brain_ask", "R", "running", `Спрашиваю у мозгового центра: «${q.slice(0, 80)}»`);
     if (!ctx.projectBrain) {
-      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не доступен");
       return { ok: false, error: { code: "unavailable", message: "мозговой центр недоступен" } };
     }
-    const res = await ctx.projectBrain.ask(q);
-    if (res.ok) {
-      ctx.reportAction("brain_ask", "R", "done", `Мозговой центр ответил на «${q.slice(0, 80)}»`);
-    } else {
-      ctx.reportAction("brain_ask", "R", "failed", "Мозговой центр не смог ответить");
-    }
-    return res;
+    return ctx.projectBrain.ask(q, ctx.functionId);
   },
 };
 
@@ -2163,6 +2155,7 @@ export async function runToolCall(
   functionId: string | undefined,
   ctx: ToolContext,
 ): Promise<{ result: ToolResult; executed: boolean }> {
+  ctx.functionId = functionId;
   if (def.twoStep) {
     const hasConfirm = "confirm" in args;
     const confirmVal = args.confirm;
@@ -2329,6 +2322,7 @@ export async function runToolCall(
         needsConfirmation: {
           confirmationId: req.pending.confirmationId,
           say,
+          instruction: "Прочитай поле say дословно — это весь вопрос. Полный текст на карточке, вслух не читай.",
         },
       },
       executed: false,
@@ -2336,8 +2330,9 @@ export async function runToolCall(
   }
 
   if (def.cls === "R") {
+    const hideCard = def.suppressActionCard?.(args, ctx) === true;
     const actionId = ctx.newActionId?.(def.name);
-    const label = readActionLabel(def.name, args);
+    const label = hideCard ? null : readActionLabel(def.name, args);
     if (label) ctx.reportAction(def.name, "R", "running", label.running, undefined, actionId);
     try {
       const rawRes = await def.execute(args, ctx);
@@ -2392,7 +2387,17 @@ export async function runToolCall(
       executed: false,
     };
   }
-  return { result: { ok: false, needsConfirmation: { confirmationId: req.pending.confirmationId, say } }, executed: false };
+  return {
+    result: {
+      ok: false,
+      needsConfirmation: {
+        confirmationId: req.pending.confirmationId,
+        say,
+        instruction: "Прочитай поле say дословно — это весь вопрос. Полный текст на карточке, вслух не читай.",
+      },
+    },
+    executed: false,
+  };
 }
 
 

@@ -1,0 +1,95 @@
+/*
+ * External Compact — модальное подтверждение и бейдж кэша. Только токены
+ * темы BB (как у voice-stt/live-call): цвета, шрифт, радиусы следуют теме.
+ */
+
+.ec-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 0.5);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--popover-foreground, var(--foreground));
+}
+.ec-overlay *,
+.ec-overlay *::before,
+.ec-overlay *::after {
+  box-sizing: border-box;
+}
+.ec-overlay button {
+  font: inherit;
+}
+
+.ec-dialog {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  padding: 18px 20px;
+  background: var(--popover);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius, 0.5rem) + 4px);
+  box-shadow: var(--shadow-lg, 0 16px 48px rgb(0 0 0 / 0.45));
+  animation: ec-in 0.14s ease-out;
+}
+@keyframes ec-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+}
+.ec-dialog-title {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.ec-dialog-desc {
+  margin: 0 0 16px;
+  color: var(--muted-foreground);
+}
+.ec-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.ec-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 0.5rem);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.ec-btn:hover {
+  background: var(--state-hover, var(--accent));
+}
+.ec-btn--primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+}
+.ec-btn--primary:hover {
+  background: var(--primary);
+  filter: brightness(1.08);
+}
+.ec-btn:focus-visible {
+  outline: 2px solid var(--ring, var(--primary));
+  outline-offset: 1px;
+}
+
+.ec-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}

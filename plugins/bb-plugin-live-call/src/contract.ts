@@ -27,6 +27,8 @@ export const BARGE_IN_MIN_MS = 1500;
 export const TRANSCRIPT_WAIT_MS = 3000;
 /** Задержка доставки inputTranscription для расчёта момента реплики владельца (спека §7.1 п. 3.1). */
 export const INPUT_TRANSCRIPT_LAG_MS = 2000;
+/** «Модель молчит» для однократного повтора вопроса подтверждения (спека §7.2.1). */
+export const REASK_SILENCE_MS = 4000;
 export const MAX_UTTERANCE_WORDS = 6;
 /** Окно дедупликации записи по argsHash после вердикта (спека §7.1 п. 1). */
 export const ARGS_HASH_DEDUP_MS = 5 * 60_000;
@@ -69,6 +71,10 @@ export const clientFrame = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("mute"), muted: z.boolean() }),
   z.object({ type: z.literal("playback_drained"), turnSeq: z.number().int().nonnegative() }),
+  // §7.2.1: ход оборван — сколько звука хода реально проиграно до остановки. Повтор не шлётся.
+  z.object({ type: z.literal("playback_stopped"), turnSeq: z.number().int().nonnegative(), playedMs: z.number().nonnegative() }),
+  // §7.2.1: детектор речи браузера — начало реплики владельца и сколько звука хода реально проиграно.
+  z.object({ type: z.literal("speech_start"), turnSeq: z.number().int().nonnegative(), playedMs: z.number().nonnegative() }),
   z.object({ type: z.literal("switch_mode"), mode: z.enum(["normal", "extended"]) }),
   z.object({
     type: z.literal("confirm"),
@@ -163,7 +169,7 @@ export type ServerFrame = z.infer<typeof serverFrame>;
 export type ToolResult =
   | { ok: true; data: Json; truncated?: boolean }
   | { ok: false; error: { code: string; message: string } }
-  | { ok: false; needsConfirmation: { confirmationId: string; say: string } };
+  | { ok: false; needsConfirmation: { confirmationId: string; say: string; instruction?: string } };
 
 export type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 

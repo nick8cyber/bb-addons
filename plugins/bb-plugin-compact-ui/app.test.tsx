@@ -156,7 +156,7 @@ describe("persistent row controls", () => {
   });
 });
 
-describe("bb-plugin-sidebar-collapse frontend tests", () => {
+describe("bb-plugin-compact-ui frontend tests", () => {
   it("does not crash without Original on current BB and offers native fallback", async () => {
     const app = await appPromise;
     const registration = app.threadLists[0]!;
@@ -607,7 +607,10 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
         Original: () => <div>bb list</div>,
       },
       {
-        rpc: { reorder_project: () => ({ ok: true as const }) },
+        rpc: {
+          reorder_project: () => ({ ok: true as const }),
+          collapsed_projects_get: () => ({ ids: [] as string[] }),
+        },
         settings: { visibleThreads: 5 },
         sidebarThreads: { status: "ready", threads, projects },
       },
@@ -632,6 +635,7 @@ describe("bb-plugin-sidebar-collapse frontend tests", () => {
     fireEvent.drop(header("Project One"), { dataTransfer });
 
     expect(slot.inspection.rpcCalls).toEqual([
+      { method: "collapsed_projects_get", input: {} },
       {
         method: "reorder_project",
         input: {

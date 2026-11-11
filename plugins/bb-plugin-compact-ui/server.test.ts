@@ -2,23 +2,23 @@ import {describe,it,expect,vi} from "vitest";
 import {createFakePluginHost} from "@get-bb/plugin-sdk/testing";
 import plugin,{selectThreadList} from "./server";
 
-function setup(initial="sidebar-collapse/collapsed"){
+function setup(initial="compact-ui/collapsed"){
   let value=initial,revision=1;
   const list=vi.fn(async()=>({preferences:{"sidebar.threadListProvider":{value,revision}}}));
   const set=vi.fn(async(args:{value:string;expectedRevision:number})=>{
     if(args.expectedRevision!==revision)throw Error("revision-conflict");
     value=args.value;revision++;return {key:"sidebar.threadListProvider",value,revision};
   });
-  const h=createFakePluginHost({pluginId:"sidebar-collapse",sdk:{system:{uiPreferences:{list,set}}}});
+  const h=createFakePluginHost({pluginId:"compact-ui",sdk:{system:{uiPreferences:{list,set}}}});
   return {...h,list,set};
 }
 describe("native list selection without removed Original prop",()=>{
-  it("switches Automatic to native and back to Sidebar Collapse",async()=>{
+  it("switches Automatic to native and back to Compact UI",async()=>{
     const h=setup("__automatic__");await plugin(h.bb);
     await h.harness.behavior.setSettings({useCollapsedList:false});
     await vi.waitFor(()=>expect(h.set).toHaveBeenCalledWith({key:"sidebar.threadListProvider",value:"thread-list/thread-list",expectedRevision:1}));
     await h.harness.behavior.setSettings({useCollapsedList:true});
-    await vi.waitFor(()=>expect(h.set).toHaveBeenCalledWith({key:"sidebar.threadListProvider",value:"sidebar-collapse/collapsed",expectedRevision:2}));
+    await vi.waitFor(()=>expect(h.set).toHaveBeenCalledWith({key:"sidebar.threadListProvider",value:"compact-ui/collapsed",expectedRevision:2}));
     await h.harness.lifecycle.dispose();
   });
   it("does not write preferences at startup; false then true selects each list",async()=>{
@@ -26,7 +26,7 @@ describe("native list selection without removed Original prop",()=>{
     await h.harness.behavior.setSettings({useCollapsedList:false});
     await vi.waitFor(()=>expect(h.set).toHaveBeenCalledWith({key:"sidebar.threadListProvider",value:"thread-list/thread-list",expectedRevision:1}));
     await h.harness.behavior.setSettings({useCollapsedList:true});
-    await vi.waitFor(()=>expect(h.set).toHaveBeenCalledWith({key:"sidebar.threadListProvider",value:"sidebar-collapse/collapsed",expectedRevision:2}));
+    await vi.waitFor(()=>expect(h.set).toHaveBeenCalledWith({key:"sidebar.threadListProvider",value:"compact-ui/collapsed",expectedRevision:2}));
     await h.harness.lifecycle.dispose();
   });
   it("keeps another plugin selection intact",async()=>{

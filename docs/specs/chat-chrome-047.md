@@ -16,13 +16,13 @@ updated: 2026-11-03
 
 ## Реализация и приёмка
 
-Один существующий плагин `plugins/bb-plugin-sidebar-collapse`, без BB core/нового плагина. `app.tsx`: архив только в меню, header slot. Отдельный модуль `lib/git-header.ts` с управлением native DOM и cleanup; `lib/sidebar-controls.ts`: узкие mobile CSS-селекторы. README отражает новое поведение. Старый контракт sidebar-controls-047 по постоянному архиву заменён этим запросом владельца.
+Один существующий плагин `plugins/bb-plugin-compact-ui`, без BB core/нового плагина. `app.tsx`: архив только в меню, header slot. Отдельный модуль `lib/git-header.ts` с управлением native DOM и cleanup; `lib/sidebar-controls.ts`: узкие mobile CSS-селекторы. README отражает новое поведение. Старый контракт sidebar-controls-047 по постоянному архиву заменён этим запросом владельца.
 
 - Unit: row copy/menu и archive только через menu fake host; header mount/label update/open/close/disabled/несколько pane/замена source/cleanup/отсутствие родного DOM; очередь CSS scoped, fallback «⋯» и disabled.
 - `npm ci`, `npx vitest run --maxWorkers 1 --testTimeout 30000`, `npm run typecheck`, `bb plugin build .`, `git diff --check` от документного коммита.
 - Chromium: desktop/mobile light/dark; верхняя сводка, исходная панель не занимает место, штатное открытие/закрытие списка, файловые действия без навигационной регрессии, resize/смена route; mobile queue actions видны и помещаются. Проверять очередь read-only, изменения/отправку перехватить в изолированной браузерной сессии либо fake DOM. Настоящие сообщения не отправлять/удалять и треды не архивировать.
 - Сохранить пользовательские настройки. Проверить running/compatible, browser errors; advisor один раз после реализации и проверок, исправить замечания. Запушить ветку в bb-addons и проверить SHA.
 
-Откат: `path:<worktrees>/bb-addons-sidebar-controls/plugins/bb-plugin-sidebar-collapse` @da0d06c.
+Откат: `path:<worktrees>/bb-addons-sidebar-controls/plugins/bb-plugin-compact-ui` @da0d06c.
 
 Завершение и адаптация под BB0.48: [контракт](compact-chat-complete.md), [проверка](../reports/compact-chat-2026-11-03.md).

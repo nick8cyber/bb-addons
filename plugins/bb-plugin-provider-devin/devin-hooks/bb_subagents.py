@@ -13,6 +13,13 @@ PreToolUse(exec|write|edit|...): блокирует попытки модифи�
                                  ~/.claude (CLAUDE.md, settings.json, hooks)
                                  и хуков плагина provider-devin.
 
+
+Сужение 11.11 (advisor nit): домашние пути матчатся только с домашним якорем
+(~, $HOME, /home/<user>, /Users/<user>) — иначе любой файл, который УПОМИНАЕТ
+".config/devin" в строке или комментарии (например src/subagent-gate.mjs плагина,
+который этим конфигом управляет), ловил ложную блокировку. Для write/edit/
+apply_patch/notebook_edit проверяется только путь НАЗНАЧЕНИЯ, не содержимое.
+
 Журнал: ~/.local/state/devin-bb-hooks.log. Любая ошибка -> exit 0 (не мешаем
 агенту работать).
 """
@@ -25,8 +32,10 @@ import sys
 LOG = os.environ.get("DEVIN_BB_LOG") or os.path.expanduser("~/.local/state/devin-bb-hooks.log")
 # Защита своих файлов: конфиг Devin, хуки, глобальные правила. Deny Write(...) в
 # config.json команды exec не останавливает (06.11 Devin так переписал config.json).
+HOME = r"(?:~|\$HOME|\$\{HOME\}|/home/[^\s/'\"]+|/Users/[^\s/'\"]+|/root|%USERPROFILE%)"
 GUARD_RE = re.compile(
-    r"\.config/devin(?:/|\b)|\.claude/(?:CLAUDE\.md|hooks\b|settings(?:\.local)?\.json)"
+    HOME + r"/\.config/devin(?:/|\b)"
+    r"|" + HOME + r"/\.claude/(?:CLAUDE\.md|hooks\b|settings(?:\.local)?\.json)"
     r"|bb-plugin-provider-devin/devin-hooks\b|\.local/share/bb-devin/hooks\b")
 WRITE_RE = re.compile(
     r">|\btee\b|\bsed\s+(?:-\w*\s+)*-i|\bmv\b|\bcp\b|\brm\b|\bchmod\b|\bchown\b|\btruncate\b|\bln\b"
@@ -45,6 +54,16 @@ def log(msg):
     except OSError:
         pass
 
+
+
+def patch_targets(tool_input):
+    """Путь назначения файлового инструмента — содержимое не проверяем."""
+    direct = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    if direct:
+        return direct
+    patch = tool_input.get("patch") or ""
+    return "\n".join(l for l in patch.splitlines()
+                     if l.startswith(("--- ", "+++ ", "*** ")))
 
 def main():
     try:
@@ -65,7 +84,7 @@ def main():
         guarded = bool(GUARD_RE.search(probe) and WRITE_RE.search(probe))
     else:
         guarded = tool in ("write", "edit", "apply_patch", "notebook_edit") and \
-            bool(GUARD_RE.search(json.dumps(tool_input, ensure_ascii=False)))
+            bool(GUARD_RE.search(patch_targets(tool_input)))
 
     if guarded:
         log(f"guard blocked {tool}: {(cmd or json.dumps(tool_input))[:200]!r}")

@@ -251,4 +251,14 @@ export class LiveClient extends EventEmitter {
   get nextTurnSeq(): number {
     return this.turnSeq + 1;
   }
+
+  /**
+   * Ход, чей транскрипт сейчас идёт (§7.2.1): открытый аудио-ход. Между
+   * turnComplete и первым звуком следующего хода — null: кусок транскрипта
+   * нельзя приписывать следующему номеру, звука у него ещё нет, и шлюз
+   * разрешает такой якорь по следующему ходу со звуком.
+   */
+  get currentTurnSeq(): number | null {
+    return this.openTurnSeq;
+  }
 }

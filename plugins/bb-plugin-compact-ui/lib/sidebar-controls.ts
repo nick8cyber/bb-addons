@@ -1,12 +1,12 @@
 /** Small owned shell styles. Exact BB markers fail open on unknown layouts. */
-export const SIDEBAR_CONTROLS_STYLE_ID = "bb-plugin-sidebar-collapse-controls";
+export const SIDEBAR_CONTROLS_STYLE_ID = "bb-plugin-compact-ui-controls";
 export const SIDEBAR_CONTROLS_CSS = `
 [data-bb-sidebar-row-action] { opacity: 1 !important; }
 @media (pointer: coarse) {
   [data-bb-sidebar-row-action] { width: 28px; height: 28px; }
 }
 [data-sidebar="footer"]:has([data-footer-item="builtin:settings"] > #sidebar-footer-settings)
-[data-footer-item="plugin:sidebar-collapse/sidebar-collapse-settings"] { display: none !important; }
+[data-footer-item="plugin:compact-ui/compact-ui-settings"] { display: none !important; }
 [data-testid="sidebar-navigation-region"][data-sidebar-navigation-placement="list"]
 [data-nav-rail-badge="count"][data-nav-badge-tone="neutral"] > span {
   background-color: var(--sidebar-foreground) !important;
@@ -94,12 +94,64 @@ section:has(> header[data-queued-messages-mode="collapsed"]) > [data-queued-mess
   [data-queued-message-actions] { margin-left: auto; }
   [data-queued-message-actions] > button { min-width: 44px; min-height: 44px; }
 }
+/* Expanded queued messages: the host truncates each row's text to a single
+   line ("…"), so the message cannot be read. Let the text wrap to up to 3
+   lines (line-clamp); collapsed rows keep the host single-line look. */
+[data-queued-messages-scroll-frame]:not([aria-hidden="true"])
+  [data-queued-message-row] span.block.truncate {
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
 /* Composer: editor scroll area stays under ~1/3 of the viewport (desktop + mobile),
    so the conversation above keeps most of the screen. 56px reserves promptbox chrome
    (send row, model picker); min() keeps BB's own 312px ceiling on tall desktops. */
-form[class*="group/promptbox"] div.overflow-y-auto:has(.ProseMirror) {
+[data-app-composer] div.overflow-y-auto:has(.ProseMirror) {
   max-height: min(312px, calc(33vh - 56px));
   max-height: min(312px, calc(33svh - 56px));
+}
+/* Navigation (list placement): collapse the four destinations into one icon row.
+   Labels and per-item option chevrons are hidden; aria-labels keep tooltips. */
+[data-testid="sidebar-navigation-list"] {
+  display: flex !important; flex-direction: row !important;
+  align-items: center !important; gap: 2px;
+}
+[data-testid="sidebar-navigation-destinations"] {
+  display: flex !important; flex-direction: row !important;
+  align-items: center !important; gap: 2px;
+  max-height: none !important; overflow: visible !important; flex: 0 0 auto;
+}
+[data-sidebar-navigation-item] { flex: 0 0 auto; }
+[data-testid="sidebar-navigation-list"] button {
+  width: var(--bb-sidebar-row-height) !important;
+  min-width: var(--bb-sidebar-row-height) !important;
+  padding-left: 0 !important; padding-right: 0 !important;
+  justify-content: center !important;
+}
+[data-testid="sidebar-navigation-list"] button > :not([data-icon-root]):not(.rounded-full) {
+  display: none !important;
+}
+[data-testid="sidebar-navigation-region"] .bb-sidebar-hover-actions {
+  display: none !important;
+}
+/* Nav icons cloned into the top chrome row by the nav-top-row script: hide the
+   original region (kept alive for click forwarding) and style the clones. */
+html[data-bb-nav-icons-active] [data-testid="sidebar-navigation-region"] {
+  position: absolute !important; visibility: hidden !important; pointer-events: none !important;
+}
+.bb-nav-top-icons { display: flex; align-items: center; gap: 2px; margin-right: auto; }
+.bb-nav-top-icons > button {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: 6px; border: 0; padding: 0;
+  background: transparent; color: var(--sidebar-foreground); cursor: pointer;
+}
+.bb-nav-top-icons > button:hover { background: var(--sidebar-accent); }
+.bb-nav-top-icons > button:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
+.bb-nav-top-icons > button svg { width: 16px; height: 16px; display: block; }
+@media (max-width: 767px), (pointer: coarse) {
+  .bb-nav-top-icons > button { width: 36px; height: 36px; }
+  .bb-nav-top-icons > button svg { width: 20px; height: 20px; }
 }
 `;
 export function mountSidebarControls(signal?: AbortSignal, doc: Document = document): () => void {

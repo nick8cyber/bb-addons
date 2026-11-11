@@ -1,9 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   definePluginApp,
+  experimental_ProviderIcon,
+  experimental_useProviders,
   experimental_useSidebarThreads,
   experimental_useSidebarThreadSplit,
   useBbNavigate,
+  useRealtime,
   useRpc,
   useSettings,
 } from "@get-bb/plugin-sdk/app";
@@ -14,6 +17,8 @@ import type {
   PluginSidebarThread,
   PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
+import type { PluginProvidersState } from "@get-bb/plugin-sdk/app";
+type ProviderInfo = PluginProvidersState["providers"][number];
 import { toast } from "sonner";
 import {
   ContextMenu,
@@ -31,12 +36,14 @@ import { Icon } from "./components/ui/icon";
 import type { IconName } from "./components/ui/icon";
 import { Input } from "./components/ui/input";
 import { cn } from "./lib/utils";
+const ProviderIcon = experimental_ProviderIcon;
 import { createPageState, pageSteps, reconcilePages, setPageBudget } from "./lib/pagination";
 import { clearNavigationRailBridge, mountNavigationRail, setNavigationRailBridgeValue } from "./lib/navigation-rail";
 import { mountSidebarControls } from "./lib/sidebar-controls";
 import { bindGitHeader, type GitHeaderSnapshot } from "./lib/git-header";
 import { bindActivityHeader, mountCompactQueue, type ActivitySnapshot } from "./lib/chat-compact";
 import { mountComposerCap } from "./lib/composer-cap";
+import { mountNavTopRow } from "./lib/nav-top-row";
 import { useSidebarRowActions, registerHeaderControl, type SidebarRowActions } from "./lib/host-compat";
 import {
   groupSidebarThreads,
@@ -304,9 +311,11 @@ function ThreadRow({
   actions,
   renamingThreadId,
   setRenamingThreadId,
+  provider,
 }: {
   row: GroupingRow<PluginSidebarThread>;
   projects: readonly PluginSidebarProject[];
+  provider?: ProviderInfo;
   activeThreadId: string | null;
   isCompactViewport: boolean;
   showBranchName: boolean;
@@ -377,6 +386,15 @@ function ThreadRow({
             indicator={thread.indicator}
             label={thread.indicatorLabel}
           />
+
+          {!isRenaming ? (
+            <ProviderIcon
+              providerKind="agent"
+              provider={provider ?? { id: thread.providerId }}
+              className="size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden
+            />
+          ) : null}
 
           {isRenaming ? (
             <InlineRenameInput
@@ -570,6 +588,11 @@ function CollapsedThreadList({
   Original,
 }: PluginThreadListProps & { Original?: ComponentType }) {
   const { status, threads, projects } = experimental_useSidebarThreads();
+  const providersState = experimental_useProviders();
+  const providerById = useMemo(
+    () => new Map(providersState.providers.map(provider => [provider.id, provider])),
+    [providersState.providers],
+  );
   const liveCallProjects = useLiveCallProjects();
   const actions = useSidebarRowActions();
   const navigate = useBbNavigate();
@@ -596,6 +619,24 @@ function CollapsedThreadList({
   // Project drag-and-drop: the frontend sidebar API has no reorder action, so
   // the move goes to this plugin's backend, which owns `bb.sdk.projects`.
   const rpc = useRpc<typeof rpcContract>();
+  // Fold state persists server-side (kv + realtime), so it survives reloads
+  // and syncs across devices. `foldDirty` keeps a pending local toggle from
+  // being clobbered by the initial hydration; `origin` skips our own echo.
+  const foldClientId = useRef(`ui-${Math.random().toString(36).slice(2)}`);
+  const foldDirty = useRef(false);
+  useEffect(() => {
+    void rpc
+      .call("collapsed_projects_get", {})
+      .then(({ ids }) => {
+        if (!foldDirty.current) setFoldedProjectIds(new Set(ids));
+      })
+      .catch(() => {});
+  }, [rpc]);
+  useRealtime("collapsed-projects", (payload) => {
+    const next = payload as { ids?: unknown; origin?: unknown } | null;
+    if (!next || next.origin === foldClientId.current || !Array.isArray(next.ids)) return;
+    setFoldedProjectIds(new Set(next.ids.filter((id): id is string => typeof id === "string")));
+  });
   const fallback = () => typeof Original === "function" ? <Original /> : (
     <div role="status" className="space-y-2 px-3 py-2 text-xs text-muted-foreground">
       <p>Штатный список BB выбирается отдельно от списка плагина.</p>
@@ -664,6 +705,13 @@ function CollapsedThreadList({
       } else {
         next.add(projectId);
       }
+      foldDirty.current = true;
+      void rpc
+        .call("collapsed_projects_set", {
+          ids: Array.from(next),
+          origin: foldClientId.current,
+        })
+        .catch(() => {});
       return next;
     });
   };
@@ -821,6 +869,7 @@ function CollapsedThreadList({
                   key={row.thread.id}
                   row={row}
                   projects={projects}
+                  provider={providerById.get(row.thread.providerId)}
                   activeThreadId={activeThreadId}
                   isCompactViewport={isCompactViewport}
                   showBranchName={showBranchName}
@@ -862,6 +911,142 @@ export function registerNavigationRail(app: PluginAppBuilder): void {
   app.slots.experimental_appOverlay({
     id: "navigation-rail", component: NavigationRailBridge,
   });
+}
+
+/** Forwards the nav-top-row content script's live DOM diagnostics
+ *  (window.__bbNavTopDiag) to the plugin backend so it lands in a file —
+ *  verification without a headless browser. Also executes one-shot
+ *  self-test commands (e.g. "test_more": click the cloned "More" button
+ *  and report where the menu actually rendered). */
+function NavDiagBridge() {
+  const rpc = useRpc<typeof rpcContract>();
+  const { values } = useSettings();
+  const enabled = values?.navDiag === true;
+  useEffect(() => {
+    if (!enabled) return;
+    let last = "";
+    const win = window as unknown as Record<string, unknown>;
+    const timer = setInterval(() => {
+      const diag = win.__bbNavTopDiag;
+      const test = win.__bbNavTopTest;
+      const report = JSON.stringify({ diag, test });
+      if (report !== last) {
+        last = report;
+        void rpc.call("nav_top_row_diag", { report }).catch(() => {});
+      }
+      void rpc.call("nav_top_row_poll", {}).then(({ command }) => {
+        if (command === "test_more") runMoreSelfTest(win);
+        const probe = command?.match(/^probe\s+(\d+)\s+(\d+)$/);
+        const textProbe = command?.match(/^dump_text\s+(.+)$/);
+        if (textProbe) {
+          const needle = textProbe[1].trim().toLowerCase();
+          const hits = Array.from(document.querySelectorAll("button, a, [role='button'], div, span"))
+            .filter((el) => el.children.length === 0 || el.tagName === "BUTTON" || el.tagName === "A")
+            .filter((el) => (el.textContent || "").trim().toLowerCase().includes(needle))
+            .slice(0, 6)
+            .map((el) => {
+              const h = el as HTMLElement, r = h.getBoundingClientRect(), p = h.parentElement;
+              return { text: (el.textContent || "").trim().slice(0, 40), tag: el.tagName,
+                cls: h.className?.toString?.().slice(0, 80), x: Math.round(r.x), y: Math.round(r.y),
+                w: Math.round(r.width), h: Math.round(r.height),
+                parentCls: p?.className?.toString?.().slice(0, 80) || "",
+                parentDisp: p ? getComputedStyle(p).display + "/" + getComputedStyle(p).flexWrap : "",
+                cardCls: h.closest("[class*='card'],[class*='Card'],[data-card]")?.className?.toString?.().slice(0, 80) || "" };
+            });
+          win.__bbNavTopTest = { cmd: command, ts: Date.now(), hits };
+        }
+        if (command === "reload_page") {
+          win.__bbNavTopTest = { cmd: command, ts: Date.now() };
+          try { sessionStorage.setItem("__bbNavReload", "1"); } catch {}
+          setTimeout(() => location.reload(), 400);
+          return;
+        }
+        if (command === "dump_queue") {
+          const box = (el: Element | null | undefined) => {
+            if (!el) return null;
+            const h = el as HTMLElement;
+            const r = h.getBoundingClientRect();
+            return { h: Math.round(r.height), y: Math.round(r.top),
+              maxH: h.style?.maxHeight || "", cls: h.className?.toString?.().slice(0, 60) };
+          };
+          const q = document.querySelector("[data-queued-messages-scroll]");
+          win.__bbNavTopTest = {
+            cmd: command, ts: Date.now(), innerH: window.innerHeight, appBuild: "v6",
+            card: box(document.querySelector("[data-app-composer]")),
+            cardCount: document.querySelectorAll("[data-app-composer]").length,
+            timeOrigin: Math.round(performance.timeOrigin),
+            reloaded: (() => { try { return sessionStorage.getItem("__bbNavReload"); } catch { return null; } })(),
+            capMounted: document.documentElement.dataset.capMounted ?? null,
+            capDebug: document.documentElement.dataset.capDebug ? JSON.parse(document.documentElement.dataset.capDebug) : null,
+            editorInCard: !!document.querySelector("[data-app-composer] div.overflow-y-auto:has(.ProseMirror)"),
+            pmInCard: !!document.querySelector("[data-app-composer] .ProseMirror"),
+            queues: Array.from(document.querySelectorAll("[data-queued-messages-scroll]")).map((el) => ({ ...box(el), inCard: !!el.closest("[data-app-composer]") })),
+            frame: box(q?.closest("[data-queued-messages-scroll-frame]")),
+            scroll: q ? { ...box(q), scrollH: q.scrollHeight } : null,
+            editor: box(document.querySelector("div.overflow-y-auto:has(.ProseMirror)")),
+            rows: q ? Array.from(q.querySelectorAll("ul > li")).map((li) => ({
+              h: Math.round(li.getBoundingClientRect().height),
+              kind: Object.keys((li as HTMLElement).dataset)[0] || "",
+            })) : [],
+            cardChildren: (() => {
+              const c = document.querySelector("[data-app-composer]");
+              return c ? Array.from(c.children).map((el) => ({ ...box(el), tag: el.tagName,
+                data: Object.keys((el as HTMLElement).dataset).slice(0,3).join(","),
+                minH: (el as HTMLElement).style?.minHeight || "" })) : [];
+            })(),
+            ancestors: (() => {
+              const out = [];
+              let el = q?.parentElement;
+              for (let i = 0; i < 5 && el; i++, el = el.parentElement) {
+                const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+                out.push({ tag: el.tagName, cls: el.className?.toString?.().slice(0, 70),
+                  h: Math.round(r.height), disp: cs.display, ov: cs.overflowY,
+                  data: Object.keys((el as HTMLElement).dataset).slice(0, 3).join(",") });
+              }
+              return out;
+            })(),
+          };
+        }
+        if (probe) {
+          win.__bbNavTopTest = {
+            cmd: command, ts: Date.now(),
+            stack: Array.from(document.elementsFromPoint(Number(probe[1]), Number(probe[2]))).slice(0, 8).map((e) => {
+              const el = e as HTMLElement; const r = el.getBoundingClientRect();
+              return { tag: e.tagName, cls: (el.className?.toString?.() || "").slice(0, 80),
+                label: el.getAttribute?.("aria-label") || "", testid: el.getAttribute?.("data-testid") || "",
+                w: Math.round(r.width), h: Math.round(r.height), plugin: el.closest?.("[data-bb-plugin]")?.getAttribute("data-bb-plugin") || "" };
+            }),
+          };
+        }
+      }).catch(() => {});
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [rpc, enabled]);
+  return null;
+}
+
+function runMoreSelfTest(win: Record<string, unknown>): void {
+  const host = document.querySelector(".bb-nav-top-icons");
+  const buttons = host ? Array.from(host.querySelectorAll("button")) : [];
+  const clone = buttons.find((b) => /more|ещё|ещe/i.test(b.getAttribute("aria-label") || "")) || buttons[buttons.length - 1];
+  const result: Record<string, unknown> = { cmd: "test_more", ts: Date.now(), cloneFound: !!clone };
+  if (!clone) { win.__bbNavTopTest = result; return; }
+  const region = document.querySelector('[data-testid="sidebar-navigation-region"]');
+  clone.click();
+  setTimeout(() => {
+    const menus = Array.from(document.querySelectorAll(
+      '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content], [data-state="open"]',
+    ));
+    result.menusFound = menus.length;
+    result.menus = menus.slice(0, 5).map((m) => ({
+      tag: m.tagName, role: m.getAttribute("role"),
+      insideRegion: region?.contains(m) ?? false,
+      visibility: getComputedStyle(m).visibility,
+      rect: (() => { const r = m.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width) }; })(),
+    }));
+    win.__bbNavTopTest = result;
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  }, 400);
 }
 
 function GitHeader({ threadId }: { threadId: string }) {
@@ -910,6 +1095,10 @@ export default definePluginApp((app) => {
   app.contentScripts.register({ id: "sidebar-controls", mount: ({signal}) => mountSidebarControls(signal) });
   app.contentScripts.register({ id: "compact-queue", mount: ({signal}) => mountCompactQueue(signal) });
   app.contentScripts.register({ id: "composer-cap", mount: ({signal}) => mountComposerCap(signal) });
+  app.contentScripts.register({ id: "nav-top-row", mount: ({signal}) => mountNavTopRow(signal) });
+  if (typeof app.slots.experimental_appOverlay === "function") {
+    app.slots.experimental_appOverlay({ id: "nav-diag", component: NavDiagBridge });
+  }
   registerHeaderControl(app, { id: "changed-files", title: "Изменённые файлы", component: GitHeader });
   registerHeaderControl(app, { id: "background-activity", title: "Фоновая активность", component: ActivityHeader });
   app.slots.experimental_threadList({
@@ -920,8 +1109,8 @@ export default definePluginApp((app) => {
     component: CollapsedThreadList,
   });
   app.slots.sidebarFooterAction({
-    id: "sidebar-collapse-settings",
-    title: "Настройки Sidebar Collapse",
+    id: "compact-ui-settings",
+    title: "Настройки Compact UI",
     icon: "ChevronsUp",
     run: ({ openSettings }) => openSettings(),
   });

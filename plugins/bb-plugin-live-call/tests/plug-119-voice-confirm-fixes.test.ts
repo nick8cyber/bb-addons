@@ -130,8 +130,8 @@ describe("Баг 1. Раннее «да» во время филлера (§7.1 
       },
     });
 
-    // Владелец говорит «да» на 1.8 с (филлер ещё играет, вопрос ещё не звучал)
-    await vi.advanceTimersByTimeAsync(1800);
+    // Владелец говорит «да» на 3.8 с (без кадра speech_start — старый клиент: раннее no_marker)
+    await vi.advanceTimersByTimeAsync(3800);
     gate.onOwnerTranscriptChunk("да", Date.now());
 
     // Ждём 700 мс окончания реплики (правило п. 4)
@@ -186,8 +186,8 @@ describe("Баг 1. Раннее «да» во время филлера (§7.1 
     gate.onModelAudio(1, 48000 * 3, t.now);
     gate.onModelTranscript("Секунду, передаю...", t.now);
 
-    // Первое раннее «да»
-    t.advance(1800);
+    // Первое раннее «да» (без кадра — раннее по правилу no_marker, §7.2.1)
+    t.advance(3800);
     gate.onOwnerTranscriptChunk("да", t.now);
     t.advance(800);
     expect(earlyApprovalCount).toBe(1);
@@ -299,6 +299,7 @@ describe("Баг 1. Раннее «да» во время филлера (§7.1 
     gate.onModelTranscript("Отправить в тред: «Секретное сообщение»?", t.now);
     expect(heard).toBe(1);
     t.advance(3500);
+    gate.onSpeechStart(1, 500, t.now); // кадр: звук ответа проигран → перебивание засчитывается
     gate.onOwnerTranscriptChunk("да", t.now);
     t.advance(700);
     expect(verdicts).toEqual(["approved"]);
@@ -348,8 +349,8 @@ describe("Баг 1. Раннее «да» во время филлера (§7.1 
     gate.onModelAudio(1, 48000 * 3, t.now);
     gate.onModelTranscript("Секунду, отправляю сообщение...", t.now);
 
-    // 2. Раннее «да» во время филлера
-    t.advance(1800);
+    // 2. Раннее «да» во время филлера (без кадра — раннее no_marker, §7.2.1)
+    t.advance(3800);
     gate.onOwnerTranscriptChunk("да", t.now);
     t.advance(800);
     expect(earlyApprovalCount).toBe(1);
@@ -371,8 +372,9 @@ describe("Баг 1. Раннее «да» во время филлера (§7.1 
     gate.onModelTranscript("Отправить в тред: «сообщение»?", t.now);
     expect(heardCount).toBe(1);
 
-    // 4. Действительное согласие владельца после того, как вопрос зазвучал
+    // 4. Действительное согласие владельца после того, как вопрос зазвучал (кадр хода 2)
     t.advance(3000);
+    gate.onSpeechStart(2, 500, t.now);
     gate.onOwnerTranscriptChunk("да", t.now);
     t.advance(800);
 
@@ -787,7 +789,8 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     });
     await vi.advanceTimersByTimeAsync(1800);
 
-    // 2. Владелец говорит «да» во время филлера
+    // 2. Владелец говорит «да» во время филлера (без кадра — раннее no_marker)
+    await vi.advanceTimersByTimeAsync(2000); // ≥1,5 с оценки от запроса — не хвост
     ws.server({ serverContent: { inputTranscription: { text: "да" } } });
     await vi.advanceTimersByTimeAsync(800);
 
@@ -817,7 +820,8 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     });
     await vi.advanceTimersByTimeAsync(3000);
 
-    // 4. Действительное согласие владельца
+    // 4. Действительное согласие владельца — кадр speech_start хода 2 (звук ответа проигран)
+    s.onSpeechStart(2, 500);
     ws.server({ serverContent: { inputTranscription: { text: "да" } } });
     await vi.advanceTimersByTimeAsync(800);
 
@@ -881,7 +885,7 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
         outputTranscription: { text: "Минутку..." },
       },
     });
-    await vi.advanceTimersByTimeAsync(1800);
+    await vi.advanceTimersByTimeAsync(3800);
 
     ws.server({ serverContent: { inputTranscription: { text: "да" } } });
     await vi.advanceTimersByTimeAsync(800);
@@ -911,7 +915,8 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     await vi.advanceTimersByTimeAsync(3000);
     expect(store.transcript("call_plug119").some((e) => e.kind === "question_heard")).toBe(true);
 
-    // Владелец соглашается
+    // Владелец соглашается — кадр speech_start хода 2
+    s.onSpeechStart(2, 500);
     ws.server({ serverContent: { inputTranscription: { text: "да" } } });
     await vi.advanceTimersByTimeAsync(800);
 
@@ -960,14 +965,14 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     const confirmationId = req.pending.confirmationId;
     (s as unknown as { storedArgs: Map<string, Record<string, unknown>> }).storedArgs.set(req.pending.argsHash, { id: "1" });
 
-    // Филлер и раннее «да»
+    // Филлер и раннее «да» (без кадра — раннее no_marker)
     ws.server({
       serverContent: {
         modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(48000).toString("base64") } }] },
         outputTranscription: { text: "Секунду..." },
       },
     });
-    await vi.advanceTimersByTimeAsync(1800);
+    await vi.advanceTimersByTimeAsync(3800);
     ws.server({ serverContent: { inputTranscription: { text: "да" } } });
 
     // Дожидаемся 700 мс тишины окончания реплики: ранняя вставка отправлена
@@ -1016,14 +1021,14 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     const confirmationId = req.pending.confirmationId;
     (s as unknown as { storedArgs: Map<string, Record<string, unknown>> }).storedArgs.set(req.pending.argsHash, { id: "2" });
 
-    // Вставка раннего согласия
+    // Вставка раннего согласия (без кадра — раннее no_marker)
     ws.server({
       serverContent: {
         modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(48000).toString("base64") } }] },
         outputTranscription: { text: "Секунду..." },
       },
     });
-    await vi.advanceTimersByTimeAsync(1800);
+    await vi.advanceTimersByTimeAsync(3800);
     ws.server({ serverContent: { inputTranscription: { text: "да" } } });
     await vi.advanceTimersByTimeAsync(20);
 
@@ -1066,8 +1071,9 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     // Модель наконец произносит сам вопрос (с хвостом say «после встречи»)
     gate.onModelTranscript(`Отправить в тред: «${text}»?`, clock.now);
     expect(heard).toBe(1);
-    // Прокручиваем время вперед, чтобы звук вопроса доиграл до владельца
+    // Прокручиваем время вперед; кадр — звук ответа проигран
     clock.advance(11_000);
+    gate.onSpeechStart(1, 10_000, clock.now);
     gate.onOwnerTranscriptChunk("да", clock.now);
     clock.advance(700);
     expect(verdicts).toEqual(["approved"]);
@@ -1085,13 +1091,22 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
     const gate = (s as unknown as { gate: ConfirmationGate }).gate;
     gate.request("thread_send", { text: "тест" }, "C", "Отправить в тред: «тест»?");
 
-    // Модель озвучивает вопрос, и воспроизведение завершается
+    // Модель озвучивает вопрос, и воспроизведение завершается. Транскрипт идёт
+    // после первых 0,1 с звука хода, остальные 0,9 с — следующим сообщением
+    // (§7.2.1: смещение считается по куску с первым словом вопроса).
     ws.server({
       serverContent: {
         modelTurn: {
           parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(4800).toString("base64") } }],
         },
         outputTranscription: { text: "Отправить в тред: «тест»?" },
+      },
+    });
+    ws.server({
+      serverContent: {
+        modelTurn: {
+          parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: Buffer.alloc(43200).toString("base64") } }],
+        },
         turnComplete: true,
       },
     });
@@ -2371,6 +2386,7 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
       g.onModelTranscript("Отправить в тред: «Проверка перебивания", clock.now());
       g.onModelAudio(1, 48 * 3000, clock.now());
       clock.advance(1300 + 500 + 300 + 2000);
+      g.onSpeechStart(1, 4000, clock.now());
       g.onOwnerTranscriptChunk("да", clock.now());
       clock.advance(800);
       expect(log).toEqual(["heard", "verdict:approved:barge"]);
@@ -2446,7 +2462,7 @@ describe("Сценарии восстановления Ф3 и гонки (§9 �
       x.clock.advance(1600);
       x.g.onModelAudio(1, 48 * 2500, x.clock.now());
       x.g.onModelTranscript("Остановить все активные треды?", x.clock.now());
-      x.clock.advance(1200);
+      x.clock.advance(2200); // ≥1,5 с оценки от запроса: без кадра — раннее (no_marker)
       deliverUtterance(x, "да", 800);
       expect(x.log).toEqual(["early"]);
       expect(x.g.windowOpen()).toBe(false);

@@ -2,7 +2,20 @@
 
 `agy` — the Antigravity CLI — as a native bb provider: a provider declaration
 plus a provider bridge, the same shape `provider-claude-code` and
-`provider-codex` use. No ACP in the path.
+`provider-codex` use.
+
+Since 2026-11-10 the default transport is **`agy acp`** through the SDK's
+`experimental_acpProviderBridge` wrapped by `src/acp-wrapper.ts` (account pool,
+quota rotation, session persistence, usage side-channel via `src/acp-shim.mjs`,
+which also drops the `session/load` history replay before the live prompt's
+user-message echo).
+ACP delivers live reasoning, tool-call args/output and per-turn usage; bb
+plugin tools reach the agent through the generic bridge's MCP proxy
+(`mcp/bb-bridge/*.json` under the account's gemini dir). Declared permission
+modes are `["full", "accept-edits"]` — `auto`/`plan`/`default` are not
+deliverable on the generic ACP dialect (thread.start is gated on adapter
+capabilities). The legacy stream-json bridge stays available behind
+`AGY_TRANSPORT=stream-json` for one release as a no-deploy rollback.
 
 Built and verified against **bb 0.40.0** (`@get-bb/plugin-sdk` 0.4.21), which
 speaks **provider bridge protocol version 2** and thread-delta grammar v3.
@@ -404,8 +417,63 @@ If the old account already had a conversation, the retry uses a fresh conversati
 
 Close handling uses only the current child generation's stderr. Only the eligibility diagnostic block is stored as the account's `lastError`; earlier 429 messages and later shutdown chatter are excluded. A SOCKS/network failure during the check and a tool error containing `verify your account` do not trigger eligibility parking or rotation.
 
+#### Account lost Google sign-in (auth-dead)
+
+When agy answers `auth_required` / `Authentication required` (its own log adds
+`Silent sign-in failed`, `not logged into Antigravity`, or
+`error getting token source`), the account's OAuth session is dead — not
+quota, not eligibility, not a tool error. The bridge parks it through the same
+mechanism as an eligibility refusal (long cooldown + `ineligibleAtMs`, shared
+breaker) and additionally stamps `parkedReason: "auth-dead"` in
+`accounts-state.json`. The interrupted turn is replayed on a free sibling with
+`session/replaced` (`contextLost: true`) and the reason
+`the session's account lost its Google sign-in (auth_required)`; `turn/start`
+and `thread/resume` pinned to a parked account take the same path. If no
+sibling is free the thread fails honestly — `every pool account lost its
+Google sign-in; re-authenticate one and retry` — instead of spamming
+rotations. Quota fields and `rateLimits` are untouched.
+
+> [!TIP] Restore a logged-out account
+> Re-login the account (`HOME=accounts/<label> agy` login flow), then set its
+> `cooldownUntilMs` to `0` in `bridge-data/accounts-state.json` — or remove the
+> label from `accounts-parked/` bookkeeping the same way as any parked account.
+
 > [!TIP] Restore a verified account
 > For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then set that account's `cooldownUntilMs` to `0` in `bridge-data/accounts-state.json`, or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
+
+#### Native agy subagents are disabled
+
+Every subagent must be a bb thread, so agy's own invisible agents are turned
+off — by the central provider setting, same as codex/claude-code:
+`bb plugin config provider-agy set subagentsDisabled false` re-enables them
+(default **on**, i.e. native subagents are disabled; the server derives it
+into `options.providerOptions.providerSubagentsEnabled` on every
+thread/start and resume). Resolution order: `AGY_DISABLE_SUBAGENTS` env
+override (`0` allows, anything else forbids) > the derived provider option >
+default disabled. Two enforcement layers: the wrapper passes the decision to
+the shim as `AGY_DISABLE_SUBAGENTS` and the shim injects
+`disableBuiltInTools` (`invoke_subagent`, `manage_subagents`,
+`define_subagent`, `browser_subagent`, `native_swarm`, `manage_swarm`,
+`boost`) into every `session/new` and `session/load`; the wrapper also
+additively merges `antigravityConfig.subagentsConfig.enabled=<resolved>`
+(plus the snake_case twin) and `boostCommandDisabled` into the account
+home's `.gemini/settings.json` on each launch — so a re-enable actually
+takes effect.
+
+#### Native agy memory is disabled
+
+The same class of hidden state: agy's own memory tools persist notes about
+the work inside the account home, invisible to bb. The central setting
+`memoryEnabled` (default **off**;
+`bb plugin config provider-agy set memoryEnabled true` re-enables it) is
+derived as `options.providerOptions.providerMemoryEnabled` — same contract
+as codex/claude-code. Resolution order: `AGY_DISABLE_MEMORY` env override
+(`0` allows) > the derived option > default disabled. Two enforcement
+layers, same as subagents: the shim adds `memory`, `retrieve_memory`,
+`disable_memory` (plus a few speculative names — agy filters unknowns) to
+`disableBuiltInTools` on `session/new`/`session/load`, and the wrapper
+stamps `antigravityConfig.memoryConfig.enabled=<resolved>` (plus the
+snake_case twin) into the account's `.gemini/settings.json` on each launch.
 
 Accounts come in through `scripts/import-accounts.mjs` (from the opencode
 antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single
@@ -510,7 +578,11 @@ Both routes are wired, because bb resolves a provider icon in this order:
 a plugin-registered `app.slots.experimental_providerIcon` component, then its
 vendored brand maps, then the server `logoUrl`. So `app.tsx` renders the mark
 inline (crisp, no fetch) and `icons/agy.svg` stays as the fallback for when the
-frontend has not booted, is disabled, or fails. The palette is explicit rather
+frontend has not booted, is disabled, or fails. The registered component must
+declare intrinsic size (`width`/`height` on the `<svg>`): the host wraps the
+icon in a `min-w/h-max` container, and a dimensionless SVG reports 300×150,
+blowing the slot out of its row. Intrinsic 14px keeps the mark compact in
+14px slots while `size-full` still stretches it wherever the slot is bigger. The palette is explicit rather
 than `currentColor`: an `<img>` SVG is a separate document where `currentColor`
 is black, and a four-colour mark has no single tint to inherit anyway.
 

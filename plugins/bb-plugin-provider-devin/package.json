@@ -21,7 +21,7 @@
   ],
   "scripts": {
     "vendor": "node scripts/vendor-acp-bridge.mjs",
-    "test": "node --test scripts/devin-dialect.test.mjs",
+    "test": "node --test scripts/devin-dialect.test.mjs scripts/subagent-gate.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

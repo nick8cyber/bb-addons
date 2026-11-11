@@ -8,7 +8,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 
 # provider-agy — восстановление после сбоев и сжатие
 
-Контракт поведения моста `provider-agy` (Antigravity CLI как провайдер bb) при сбоях Google, аккаунтов и самого agy, и при сжатии контекста. Подробности реализации — в [README плагина](../../plugins/bb-plugin-provider-agy/README.md); решения — в [ADR 0002](../adr/0002-provider-agy-failure-recovery.md) и [ADR 0003](../adr/0003-provider-agy-compaction-fallback.md).
+Контракт поведения моста `provider-agy` (Antigravity CLI как провайдер bb) при сбоях Google, аккаунтов и самого agy, и при сжатии контекста. Подробности реализации — в [README плагина](../../plugins/bb-plugin-provider-agy/README.md); решения — в [ADR 0002](../adr/0002-provider-agy-failure-recovery.md), [ADR 0003](../adr/0003-provider-agy-compaction-fallback.md) и [ADR 0021](../adr/0021-provider-agy-acp-transport.md) (транспорт ACP с 10.11.2026).
 
 ## 1. Запрос владельца
 
@@ -24,6 +24,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 | «not eligible», нужна проверка | Отложить на 24 ч (`AGY_INELIGIBLE_COOLDOWN_MS`), ссылка проверки в `bridge.log`, ход на свободный аккаунт |
 | «not eligible», страна | Отложить на 2 ч (`AGY_LOCATION_COOLDOWN_MS`), ход на свободный аккаунт |
 | ≥3 разных аккаунта отложены за 10 мин | Предохранитель: больше не откладывать, падать с исходным текстом (подозрение на сеть) |
+| Слёт Google-входа: `auth_required`, «Authentication required», «Silent sign-in failed», «not logged into Antigravity», «error getting token source» (ACP-транспорт) | Припарковать как ineligible + метка `parkedReason:"auth-dead"` в accounts-state.json; ход переигрывается на свободном аккаунте с `contextLost`; свободных нет — честный фейл «every pool account lost its Google sign-in; re-authenticate one and retry». Не квота, не toolError |
 | Google `API error (attempt N): … (code 500/502/503/504)` | `errorInfo {internal, 5xx}` → встроенный bb provider-retry повторяет ход (~1 мин, удвоение, до 4) |
 | Ошибка шага инструмента, auth/billing вместе с 5xx | Метки автоповтора нет |
 | Тишина ≥15 мин во время хода, тул не открыт | Убить agy; если в полёте один принятый ход без очереди — `errorInfo {stream-disconnected}` → bb повторяет |

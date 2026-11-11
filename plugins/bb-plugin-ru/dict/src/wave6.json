@@ -1,0 +1,890 @@
+[
+ {
+  "en": "GitHub Star",
+  "ru": "Звезда GitHub"
+ },
+ {
+  "en": "Asks once for a GitHub star after you have sent a few prompts.",
+  "ru": "Спрашивает один раз о звезде на GitHub после нескольких отправленных промптов."
+ },
+ {
+  "en": "Enjoying bb?",
+  "ru": "Нравится bb?"
+ },
+ {
+  "en": "A star on GitHub helps bb grow.",
+  "ru": "Звезда на GitHub помогает bb развиваться."
+ },
+ {
+  "en": "Star on GitHub",
+  "ru": "Поставить звезду на GitHub"
+ },
+ {
+  "en": "Where agents run",
+  "ru": "Где работают агенты"
+ },
+ {
+  "en": "Where you use bb",
+  "ru": "Где ты используешь bb"
+ },
+ {
+  "en": "Add another machine",
+  "ru": "Добавить другую машину"
+ },
+ {
+  "en": "Choose a provider and sign in below.",
+  "ru": "Выбери провайдера и войди ниже."
+ },
+ {
+  "en": "Enter this code",
+  "ru": "Введи этот код"
+ },
+ {
+  "en": "Hide terminal",
+  "ru": "Скрыть терминал"
+ },
+ {
+  "en": "Last active",
+  "ru": "Последняя активность"
+ },
+ {
+  "en": "Select all projects",
+  "ru": "Выбрать все проекты"
+ },
+ {
+  "en": "Sign in to",
+  "ru": "Войти в"
+ },
+ {
+  "en": "Starting sign in…",
+  "ru": "Начало входа…"
+ },
+ {
+  "en": "Connect this machine",
+  "ru": "Подключить эту машину"
+ },
+ {
+  "en": "Blocked by hooks",
+  "ru": "Заблокировано хуками"
+ },
+ {
+  "en": "Could not start bb",
+  "ru": "Не удалось запустить bb"
+ },
+ {
+  "en": "Please continue.",
+  "ru": "Пожалуйста, продолжай."
+ },
+ {
+  "en": "Pierre Dark Tritanopia",
+  "ru": "Pierre Тёмная (тританопия)"
+ },
+ {
+  "en": "Pierre Light Tritanopia",
+  "ru": "Pierre Светлая (тританопия)"
+ },
+ {
+  "en": "Ultra",
+  "ru": "Ультра"
+ },
+ {
+  "en": "XHigh",
+  "ru": "Очень высокий"
+ },
+ {
+  "en": "Med",
+  "ru": "Средний"
+ },
+ {
+  "en": "Auto Free",
+  "ru": "Авто (бесплатно)"
+ },
+ {
+  "en": "Bypass Permissions",
+  "ru": "Обход разрешений"
+ },
+ {
+  "en": "Session Mode: Bypass Permissions",
+  "ru": "Режим сессии: Обход разрешений"
+ },
+ {
+  "en": "Codex update available",
+  "ru": "Доступно обновление Codex"
+ },
+ {
+  "en": "Pi update available",
+  "ru": "Доступно обновление Pi"
+ },
+ {
+  "en": "Claude Code and Pi updates available",
+  "ru": "Доступны обновления Claude Code и Pi"
+ },
+ {
+  "en": "Codex, Claude Code and Pi updates available",
+  "ru": "Доступны обновления Codex, Claude Code и Pi"
+ },
+ {
+  "en": "Claude Code: Loading models...",
+  "ru": "Claude Code: Загрузка моделей..."
+ },
+ {
+  "en": "Antigravity (agy): Loading models...",
+  "ru": "Antigravity (agy): Загрузка моделей..."
+ },
+ {
+  "en": "Devin: Loading models...",
+  "ru": "Devin: Загрузка моделей..."
+ },
+ {
+  "en": "Pi: Loading models...",
+  "ru": "Pi: Загрузка моделей..."
+ },
+ {
+  "en": "Notifications alt+T",
+  "ru": "Уведомления Alt+T"
+ },
+ {
+  "en": "Queue follow-up (Enter), Ctrl + Enter to steer",
+  "ru": "В очередь (Enter), Ctrl + Enter для направления"
+ },
+ {
+  "en": "Queue follow-up (Enter), ⌘ Enter to steer",
+  "ru": "В очередь (Enter), ⌘ Enter для направления"
+ },
+ {
+  "en": "Close suggestions",
+  "ru": "Закрыть подсказки"
+ },
+ {
+  "en": "assigned to you",
+  "ru": "назначено тебе"
+ },
+ {
+  "en": "Read shell",
+  "ru": "Читать шелл"
+ },
+ {
+  "en": "Uploading image.png",
+  "ru": "Загрузка image.png"
+ },
+ {
+  "en": "(empty message)",
+  "ru": "(пустое сообщение)"
+ },
+ {
+  "en": "Switch to",
+  "ru": "Переключиться на"
+ },
+ {
+  "en": "Dubai-PC is offline",
+  "ru": "Dubai-PC не в сети"
+ },
+ {
+  "en": "offline",
+  "ru": "не в сети"
+ },
+ {
+  "en": "Message link copied",
+  "ru": "Ссылка на сообщение скопирована"
+ },
+ {
+  "en": "Bash was denied automatically",
+  "ru": "Bash был автоматически отклонён"
+ },
+ {
+  "en": "Couldn’t refresh usage. Showing the last available update.",
+  "ru": "Не удалось обновить расход. Показано последнее доступное состояние."
+ },
+ {
+  "en": "Applies edits inside the workspace automatically. Anything beyond the workspace asks you first.",
+  "ru": "Применяет правки внутри рабочего пространства автоматически. Для действий вне его спрашивает подтверждение."
+ },
+ {
+  "en": "Same workspace sandbox, with requests reviewed automatically. High-risk actions can still come back to you.",
+  "ru": "Та же песочница рабочего пространства с автоматическим ревью запросов. Действия с высоким риском по-прежнему требуют твоего подтверждения."
+ },
+ {
+  "en": "Autocompact buffer",
+  "ru": "Буфер автосжатия"
+ },
+ {
+  "en": "Available on demand",
+  "ru": "Доступно по запросу"
+ },
+ {
+  "en": "Free Models Router",
+  "ru": "Маршрутизатор бесплатных моделей"
+ },
+ {
+  "en": "OpenRouter Free Models Router",
+  "ru": "Маршрутизатор бесплатных моделей OpenRouter"
+ },
+ {
+  "en": "Free space",
+  "ru": "Свободное место"
+ },
+ {
+  "en": "Hand off",
+  "ru": "Передать"
+ },
+ {
+  "en": "Close Hand off",
+  "ru": "Закрыть передачу"
+ },
+ {
+  "en": "In context",
+  "ru": "В контексте"
+ },
+ {
+  "en": "Memory files",
+  "ru": "Файлы памяти"
+ },
+ {
+  "en": "exit code",
+  "ru": "код возврата"
+ },
+ {
+  "en": "System prompt",
+  "ru": "Системный промпт"
+ },
+ {
+  "en": "Thread has unsubmitted draft",
+  "ru": "В треде есть неотправленный черновик"
+ },
+ {
+  "en": "Thread has a message waiting to send",
+  "ru": "В треде есть сообщение, ожидающее отправки"
+ },
+ {
+  "en": "Viewed image",
+  "ru": "Просмотренное изображение"
+ },
+ {
+  "en": "Thread Archived",
+  "ru": "Тред заархивирован"
+ },
+ {
+  "en": "Agent threads",
+  "ru": "Треды агентов"
+ },
+ {
+  "en": "User messages",
+  "ru": "Сообщения пользователя"
+ },
+ {
+  "en": "Assistant messages",
+  "ru": "Сообщения ассистента"
+ },
+ {
+  "en": "Attached media preview",
+  "ru": "Предпросмотр прикреплённого медиа"
+ },
+ {
+  "en": "Spawns a new worktree",
+  "ru": "Создаёт новое рабочее дерево"
+ },
+ {
+  "en": "Move to project",
+  "ru": "Переместить в проект"
+ },
+ {
+  "en": "Plugins options",
+  "ru": "Опции плагинов"
+ },
+ {
+  "en": "Skills options",
+  "ru": "Опции навыков"
+ },
+ {
+  "en": "Search threads options",
+  "ru": "Опции поиска тредов"
+ },
+ {
+  "en": "Handing off up to a selected message",
+  "ru": "Передача вплоть до выбранного сообщения"
+ },
+ {
+  "en": "Everything after that message stays out of the handoff.",
+  "ru": "Всё после этого сообщения не включается в передачу."
+ },
+ {
+  "en": "Ran tool run_command",
+  "ru": "Выполнен инструмент run_command"
+ },
+ {
+  "en": "Running tool: run_command",
+  "ru": "Выполняется инструмент: run_command"
+ },
+ {
+  "en": "Ran tool manage_task",
+  "ru": "Выполнен инструмент manage_task"
+ },
+ {
+  "en": "Ran tool view_file",
+  "ru": "Выполнен инструмент view_file"
+ },
+ {
+  "en": "Ran tool read_file",
+  "ru": "Выполнен инструмент read_file"
+ },
+ {
+  "en": "Running tool: schedule",
+  "ru": "Выполняется инструмент: schedule"
+ },
+ {
+  "en": "Running tool: search_web",
+  "ru": "Выполняется инструмент: search_web"
+ },
+ {
+  "en": "Ran tool search_web",
+  "ru": "Выполнен инструмент search_web"
+ },
+ {
+  "en": "Ran security_scan",
+  "ru": "Выполнен security_scan"
+ },
+ {
+  "en": "Running advisor_review",
+  "ru": "Выполняется advisor_review"
+ },
+ {
+  "en": "Ran advisor_review",
+  "ru": "Выполнен advisor_review"
+ },
+ {
+  "en": "Ran headroom_status",
+  "ru": "Выполнен headroom_status"
+ },
+ {
+  "en": "Ran progressive_skill_used",
+  "ru": "Выполнен progressive_skill_used"
+ },
+ {
+  "en": "Antigravity provider",
+  "ru": "Провайдер Antigravity"
+ },
+ {
+  "en": "Favorite Models",
+  "ru": "Избранные модели"
+ },
+ {
+  "en": "Pi Gateways",
+  "ru": "Шлюзы Pi"
+ },
+ {
+  "en": "Sidebar Collapse",
+  "ru": "Сворачивание боковой панели"
+ },
+ {
+  "en": "Disable compact-ui",
+  "ru": "Отключить Compact UI"
+ },
+ {
+  "en": "Provider usage (Pro)",
+  "ru": "Расход провайдеров (Pro)"
+ },
+ {
+  "en": "Web Push Notify",
+  "ru": "Веб-пуш уведомления"
+ },
+ {
+  "en": "Worktree Setup",
+  "ru": "Настройка рабочего дерева"
+ },
+ {
+  "en": "Security Guidance",
+  "ru": "Рекомендации по безопасности"
+ },
+ {
+  "en": "Context Meter",
+  "ru": "Счётчик контекста"
+ },
+ {
+  "en": "Date and time plugin for threads",
+  "ru": "Плагин даты и времени для тредов"
+ },
+ {
+  "en": "AI services",
+  "ru": "ИИ-сервисы"
+ },
+ {
+  "en": "Explore project threads",
+  "ru": "Исследовать треды проекта"
+ },
+ {
+  "en": "Explore plugin workshop",
+  "ru": "Исследовать мастерскую плагинов"
+ },
+ {
+  "en": "Disk Usage",
+  "ru": "Использование диска"
+ },
+ {
+  "en": "Alerts",
+  "ru": "Оповещения"
+ },
+ {
+  "en": "Auto",
+  "ru": "Авто"
+ },
+ {
+  "en": "Concurrency limit",
+  "ru": "Лимит параллелизма"
+ },
+ {
+  "en": "Lanes",
+  "ru": "Дорожки"
+ },
+ {
+  "en": "Headroom",
+  "ru": "Запас квоты"
+ },
+ {
+  "en": "Perspectives",
+  "ru": "Перспективы"
+ },
+ {
+  "en": "Progressive Skill",
+  "ru": "Прогрессивный навык"
+ },
+ {
+  "en": "Push notifications",
+  "ru": "Пуш-уведомления"
+ },
+ {
+  "en": "Tasks Pro",
+  "ru": "Задачи Pro"
+ },
+ {
+  "en": "Tasks Pro panel options",
+  "ru": "Опции панели Задач Pro"
+ },
+ {
+  "en": "Server Switcher",
+  "ru": "Переключатель серверов"
+ },
+ {
+  "en": "Ring color",
+  "ru": "Цвет кольца"
+ },
+ {
+  "en": "Account Pooler [Experimental]",
+  "ru": "Пул аккаунтов [Экспериментально]"
+ },
+ {
+  "en": "Privacy Blur",
+  "ru": "Размытие приватности"
+ },
+ {
+  "en": "Extended",
+  "ru": "Расширенное"
+ },
+ {
+  "en": "🧠 Extended",
+  "ru": "🧠 Расширенное"
+ },
+ {
+  "en": "Drafts plugin details",
+  "ru": "Детали плагина черновиков"
+ },
+ {
+  "en": "Run bb threads with agy, the Antigravity CLI.",
+  "ru": "Запуск тредов bb через agy, CLI Antigravity."
+ },
+ {
+  "en": "ACP providers settings",
+  "ru": "Настройки провайдеров ACP"
+ },
+ {
+  "en": "Antigravity provider settings",
+  "ru": "Настройки провайдера Antigravity"
+ },
+ {
+  "en": "Archived threads settings",
+  "ru": "Настройки архивных тредов"
+ },
+ {
+  "en": "Claude Code provider settings",
+  "ru": "Настройки провайдера Claude Code"
+ },
+ {
+  "en": "Codex provider settings",
+  "ru": "Настройки провайдера Codex"
+ },
+ {
+  "en": "Concurrency limit settings",
+  "ru": "Настройки лимита параллелизма"
+ },
+ {
+  "en": "Diff settings",
+  "ru": "Настройки диффов"
+ },
+ {
+  "en": "Favorite Models settings",
+  "ru": "Настройки избранных моделей"
+ },
+ {
+  "en": "Perspectives settings",
+  "ru": "Настройки «Перспектив»"
+ },
+ {
+  "en": "Pi Gateways settings",
+  "ru": "Настройки шлюзов Pi"
+ },
+ {
+  "en": "Plugin marketplaces settings",
+  "ru": "Настройки маркетплейсов плагинов"
+ },
+ {
+  "en": "Progressive Skill settings",
+  "ru": "Настройки прогрессивного навыка"
+ },
+ {
+  "en": "Projects settings",
+  "ru": "Настройки проектов"
+ },
+ {
+  "en": "Providers settings",
+  "ru": "Настройки провайдеров"
+ },
+ {
+  "en": "Push notifications settings",
+  "ru": "Настройки пуш-уведомлений"
+ },
+ {
+  "en": "Security Guidance settings",
+  "ru": "Настройки рекомендаций по безопасности"
+ },
+ {
+  "en": "Sidebar Collapse settings",
+  "ru": "Настройки сворачивания боковой панели"
+ },
+ {
+  "en": "Speak settings",
+  "ru": "Настройки озвучивания"
+ },
+ {
+  "en": "Updates settings",
+  "ru": "Настройки обновлений"
+ },
+ {
+  "en": "Web Push Notify settings",
+  "ru": "Настройки веб-пуш уведомлений"
+ },
+ {
+  "en": "Workflows settings",
+  "ru": "Настройки воркфлоу"
+ },
+ {
+  "en": "Worktree Setup settings",
+  "ru": "Настройки настройки рабочего дерева"
+ },
+ {
+  "en": "Filter plugins by category: All categories",
+  "ru": "Фильтр плагинов по категории: Все категории"
+ },
+ {
+  "en": "Customize footer",
+  "ru": "Настроить подвал"
+ },
+ {
+  "en": "Hide footer",
+  "ru": "Скрыть подвал"
+ },
+ {
+  "en": "Footer icons",
+  "ru": "Иконки в подвале"
+ },
+ {
+  "en": "Add Mobile apps to footer",
+  "ru": "Добавить «Мобильные приложения» в подвал"
+ },
+ {
+  "en": "Add Report a bug to footer",
+  "ru": "Добавить «Сообщить об ошибке» в подвал"
+ },
+ {
+  "en": "Remove Servers from footer",
+  "ru": "Убрать «Серверы» из подвала"
+ },
+ {
+  "en": "Remove Settings from footer",
+  "ru": "Убрать «Настройки» из подвала"
+ },
+ {
+  "en": "Remove Provider usage from footer",
+  "ru": "Убрать «Расход провайдеров» из подвала"
+ },
+ {
+  "en": "Reorder Mobile apps",
+  "ru": "Изменить порядок мобильных приложений"
+ },
+ {
+  "en": "Reorder Provider usage",
+  "ru": "Изменить порядок расхода провайдеров"
+ },
+ {
+  "en": "Reorder Report a bug",
+  "ru": "Изменить порядок «Сообщить об ошибке»"
+ },
+ {
+  "en": "Reorder Servers",
+  "ru": "Изменить порядок серверов"
+ },
+ {
+  "en": "Reorder Settings",
+  "ru": "Изменить порядок настроек"
+ },
+ {
+  "en": "More menu",
+  "ru": "Меню «Ещё»"
+ },
+ {
+  "en": "More menu items",
+  "ru": "Пункты меню «Ещё»"
+ },
+ {
+  "en": "Customize navigation",
+  "ru": "Настроить навигацию"
+ },
+ {
+  "en": "Loading footer customization",
+  "ru": "Загрузка настроек подвала"
+ },
+ {
+  "en": "Backlog",
+  "ru": "Бэклог"
+ },
+ {
+  "en": "In Progress",
+  "ru": "В работе"
+ },
+ {
+  "en": "In Review",
+  "ru": "На ревью"
+ },
+ {
+  "en": "Priority",
+  "ru": "Приоритет"
+ },
+ {
+  "en": "Labels",
+  "ru": "Метки"
+ },
+ {
+  "en": "Change status, currently Backlog",
+  "ru": "Изменить статус, сейчас: Бэклог"
+ },
+ {
+  "en": "Change status, currently Todo",
+  "ru": "Изменить статус, сейчас: К выполнению"
+ },
+ {
+  "en": "Change status, currently In Progress",
+  "ru": "Изменить статус, сейчас: В работе"
+ },
+ {
+  "en": "Change status, currently In Review",
+  "ru": "Изменить статус, сейчас: На ревью"
+ },
+ {
+  "en": "Change status, currently Done",
+  "ru": "Изменить статус, сейчас: Готово"
+ },
+ {
+  "en": "Change status, currently Canceled",
+  "ru": "Изменить статус, сейчас: Отменено"
+ },
+ {
+  "en": "Project: No project",
+  "ru": "Проект: Без проекта"
+ },
+ {
+  "en": "Environment: Project checkout",
+  "ru": "Окружение: Чек-аут проекта"
+ },
+ {
+  "en": "Thread details: Project checkout",
+  "ru": "Детали треда: Чек-аут проекта"
+ },
+ {
+  "en": "Save drafts.",
+  "ru": "Сохранять черновики."
+ },
+ {
+  "en": "Save multiple servers.",
+  "ru": "Сохранять несколько серверов."
+ },
+ {
+  "en": "Save draft…",
+  "ru": "Сохранить черновик…"
+ },
+ {
+  "en": "Scheduling…",
+  "ru": "Планирование…"
+ },
+ {
+  "en": "Tomorrow morning",
+  "ru": "Завтра утром"
+ },
+ {
+  "en": "Regenerate title",
+  "ru": "Сгенерировать заголовок заново"
+ },
+ {
+  "en": "Searching the web",
+  "ru": "Поиск в вебе"
+ },
+ {
+  "en": "Working with agents",
+  "ru": "Работа с агентами"
+ },
+ {
+  "en": "Workspace and navigation",
+  "ru": "Рабочее пространство и навигация"
+ },
+ {
+  "en": "Move your server — experimental.",
+  "ru": "Перенос сервера — экспериментально."
+ },
+ {
+  "en": "Multi-machine picker — experimental.",
+  "ru": "Выбор из нескольких машин — экспериментально."
+ },
+ {
+  "en": "Composer controls — experimental.",
+  "ru": "Элементы управления полем ввода — экспериментально."
+ },
+ {
+  "en": "Control finished turns.",
+  "ru": "Управление завершёнными ходами."
+ },
+ {
+  "en": "Commands and shortcuts.",
+  "ru": "Команды и горячие клавиши."
+ },
+ {
+  "en": "Accounts and usage.",
+  "ru": "Аккаунты и расход."
+ },
+ {
+  "en": "Forms and timeline entries.",
+  "ru": "Формы и записи в ленте."
+ },
+ {
+  "en": "Machines and configuration",
+  "ru": "Машины и конфигурация"
+ },
+ {
+  "en": "Browser tools",
+  "ru": "Инструменты браузера"
+ },
+ {
+  "en": "Browser extensions — experimental.",
+  "ru": "Расширения браузера — экспериментально."
+ },
+ {
+  "en": "Discoverable RPCs — experimental.",
+  "ru": "Обнаруживаемые RPC — экспериментально."
+ },
+ {
+  "en": "Dispatch context — experimental.",
+  "ru": "Контекст диспетчеризации — экспериментально."
+ },
+ {
+  "en": "A persistent telemetry opt-out is available in settings.",
+  "ru": "В настройках доступно постоянное отключение телеметрии."
+ },
+ {
+  "en": "A searchable picker separates machine selection from environment selection for projects with several machines.",
+  "ru": "Поисковый селектор разделяет выбор машины и выбор окружения для проектов с несколькими машинами."
+ },
+ {
+  "en": "Listed",
+  "ru": "В списке"
+ },
+ {
+  "en": "Adaptive",
+  "ru": "Адаптивный"
+ },
+ {
+  "en": "Fusion",
+  "ru": "Фьюжн"
+ },
+ {
+  "en": "Fast",
+  "ru": "Быстрый"
+ },
+ {
+  "en": "Configure or troubleshoot ACP agent discovery, custom models, skills, and compaction in BB.",
+  "ru": "Настройка и диагностика обнаружения ACP-агентов, кастомных моделей, навыков и сжатия в BB."
+ },
+ {
+  "en": "Inspect BB Pi provider support for message editing and context compaction.",
+  "ru": "Проверка поддержки провайдера BB Pi для редактирования сообщений и сжатия контекста."
+ },
+ {
+  "en": "Inspect or manage BB state with the bb CLI; use for BB commands and configuration.",
+  "ru": "Просмотр и управление состоянием BB через CLI bb; используй для команд и настройки BB."
+ },
+ {
+  "en": "Inspect or change global and per-host limits on concurrently running BB threads.",
+  "ru": "Просмотр и изменение глобальных и хостовых лимитов одновременно работающих тредов BB."
+ },
+ {
+  "en": "Discover CLI commands contributed by installed BB plugins and their invocation paths.",
+  "ru": "Обнаружение команд CLI, добавленных установленными плагинами BB, и путей их вызова."
+ },
+ {
+  "en": "Configure or troubleshoot BB-specific Claude Code provider settings and session behavior.",
+  "ru": "Настройка и диагностика параметров провайдера Claude Code и поведения сессий в BB."
+ },
+ {
+  "en": "Create or improve BB skills, including their triggers, instructions, and supporting resources.",
+  "ru": "Создание и улучшение навыков BB, включая их триггеры, инструкции и вспомогательные ресурсы."
+ },
+ {
+  "en": "Schedule or manage recurring and one-shot BB agent or script automations.",
+  "ru": "Планирование и управление периодическими и разовыми автоматизациями агентов или скриптов BB."
+ },
+ {
+  "en": "Retrieve relevant durable BB memories or save verified knowledge useful to future threads.",
+  "ru": "Извлечение долговременных воспоминаний BB или сохранение проверенных знаний для будущих тредов."
+ },
+ {
+  "en": "Create or change BB plugins and Plugin SDK extensions, including CLI commands, agent tools, providers, and UI surfaces.",
+  "ru": "Создание и изменение плагинов BB и расширений Plugin SDK, включая команды CLI, инструменты агента, провайдеров и поверхности интерфейса."
+ },
+ {
+  "en": "Prepare and submit a BB plugin to the Community marketplace when publication or a marketplace PR is requested.",
+  "ru": "Подготовка и отправка плагина BB в Community маркетплейс при публикации или создании PR."
+ },
+ {
+  "en": "Help the user understand the current topic visually with concise diagrams, code-shape sketches, and focused HTML artifacts.",
+  "ru": "Помощь пользователю в визуальном понимании темы через понятные диаграммы, наброски кода и HTML-артефакты."
+ },
+ {
+  "en": "Author or run durable BB workflows when the user requests workflow execution or multi-agent orchestration.",
+  "ru": "Создание и запуск долговременных воркфлоу BB для выполнения процессов или оркестрации нескольких агентов."
+ },
+ {
+  "en": "Request user-supplied credentials securely into a dotenv file without exposing their values to the agent.",
+  "ru": "Безопасный запрос пользовательских учетных данных в файл .env без раскрытия их значений агенту."
+ },
+ {
+  "en": "Configure or diagnose Account Pooler accounts, authentication, quota routing, and failover through bb pool.",
+  "ru": "Настройка и диагностика аккаунтов пула, аутентификации, маршрутизации квот и переключения при сбоях через bb pool."
+ },
+ {
+  "en": "Diagnose BB-specific Codex session controls, model acceptance, and durable goals.",
+  "ru": "Диагностика управления сессиями Codex в BB, поддержки моделей и долговременных целей."
+ },
+ {
+  "en": "Diagnose automatic retries of BB turns after provider subscription-window limits.",
+  "ru": "Диагностика автоматических повторов ходов BB после исчерпания лимитов окна подписки провайдера."
+ },
+ {
+  "en": "Sign this bb in to or out of its getbb.app account with bb account, and check which account remote access and hosted services use.",
+  "ru": "Вход или выход из аккаунта getbb.app через bb account, проверка аккаунта для удаленного доступа и сервисов."
+ }
+]

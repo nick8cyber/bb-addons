@@ -15,6 +15,7 @@ import type { CallStore } from "./call-store.js";
 import { fetchThreadMessages } from "./thread-messages.js";
 import { buildSecretFilterSet, maskSecrets } from "./secret-filter.js";
 import { truncate } from "./tools.js";
+import { QuestionFlight } from "./single-flight.js";
 import type { Json, ToolResult } from "./contract.js";
 
 /** Бюджет одного вопроса владельца: готовность мозга и все шаги (спека §3). */
@@ -406,7 +407,18 @@ ${catalog}
    * Бюджет 120 с охватывает КАЖДЫЙ await (start/wait/send/events/read): зависший
    * SDK не держит busy, после дедлайна новых вызовов нет (ревью п. 2).
    */
-  async ask(question: string): Promise<ToolResult> {
+  /** Single-flight (спека §7.2.6): совпадающий вопрос присоединяется, другой ждёт очереди. */
+  private askFlight = new QuestionFlight();
+
+  askWillJoin(question: string): boolean {
+    return this.askFlight.willJoin(question);
+  }
+
+  ask(question: string, callId?: string): Promise<ToolResult> {
+    return this.askFlight.ask(question, callId, (callIds) => this.askNow(question, callIds));
+  }
+
+  private async askNow(question: string, callIds: string[]): Promise<ToolResult> {
     if (this.closed || this.state === "closed") {
       return { ok: false, error: { code: "unavailable", message: "мозговой центр остановлен" } };
     }
@@ -427,6 +439,7 @@ ${catalog}
         requestId,
         ms: Date.now() - startedAt,
         status: code,
+        callIds,
       });
       return { ok: false, error: { code, message: this.mask(message) } };
     };
@@ -525,6 +538,7 @@ ${catalog}
             ms: Date.now() - startedAt,
             status: "ok",
             reads,
+            callIds,
           });
           return truncate({
             answer,
