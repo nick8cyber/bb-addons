@@ -125,6 +125,21 @@ describe("enforce: expanded queue shows exactly min(N,3) items", () => {
     expect(section.style.minHeight).toBe("");
     expect(scroll.style.maxHeight).toBe("");
   });
+  it("editor cap skips ProseMirror/scroll inside the queue (inline edit)", () => {
+    const { card, scroll, frame, editor } = buildDom({ rows: 2 });
+    // Inline edit open: the row holds an overflow-auto wrapper with .ProseMirror
+    const qWrap = document.createElement("div");
+    qWrap.className = "overflow-y-auto";
+    const qPm = document.createElement("div");
+    qPm.className = "ProseMirror";
+    qWrap.appendChild(qPm);
+    scroll.appendChild(qWrap);
+    box(card, 400, 420); // over cap → editor must be clamped, queue scroll not
+    enforce(card, win);
+    expect(scroll.style.maxHeight).toBe("140px"); // queue clamp intact
+    expect(editor.style.maxHeight).toBe("104px"); // cap hit the REAL editor
+    expect(qWrap.style.maxHeight).toBe("");       // queue's own scroll untouched
+  });
   it("dividers (h-0, marked) are not counted as items", () => {
     const { card, scroll, lis } = buildDom({ rows: 3 });
     lis[1].setAttribute("data-queued-message-group-divider", "");
