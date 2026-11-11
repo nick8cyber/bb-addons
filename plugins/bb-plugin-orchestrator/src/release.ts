@@ -16,7 +16,8 @@ import {
   chmodSync,
 } from "node:fs";
 import { appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { realpath } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
@@ -110,6 +111,43 @@ export interface ReleaseThreads {
   };
 }
 
+/** PLUG-229: an SDK thread carries `environmentId`, never
+ * `environmentPath`/`environmentBranchName` — release reads those for
+ * the executor's copy (and the coordinator's on a merged round, §14).
+ * This wraps the SDK `threads.get` and fills them from
+ * `bb environment show` (the same source `environmentOf` uses). A
+ * failed show leaves them null, so release refuses with its honest
+ * "no copy" error exactly like a thread without an environment. */
+export const releaseThreadsGet =
+  (
+    sdkGet: (a: { threadId: string }) => Promise<unknown>,
+    environmentFacts: (envId: string) => Promise<{
+      path?: string | null;
+      branchName?: string | null;
+    }>,
+  ): ReleaseThreads["get"] =>
+  async (a) => {
+    const t = (await sdkGet(a)) as ReleaseThreadDto & {
+      environmentId?: string | null;
+    };
+    if (
+      t.environmentId &&
+      (t.environmentPath == null || t.environmentBranchName == null)
+    ) {
+      let environmentPath: string | null = null;
+      let environmentBranchName: string | null = null;
+      try {
+        const env = await environmentFacts(t.environmentId);
+        environmentPath = env.path ?? null;
+        environmentBranchName = env.branchName ?? null;
+      } catch {
+        // show failed → null fields → the step-1 "no copy" refusal.
+      }
+      return { ...t, environmentPath, environmentBranchName };
+    }
+    return t;
+  };
+
 export interface ReleaseDeps {
   store: DelegationStore;
   bbCli: BbCli;
@@ -163,6 +201,12 @@ export interface ReleaseResult {
   status: "auditing";
   auditThreadId: string | null;
   warnings: ScanFinding[];
+  /** §6 (r7): the bb project whose settings the release used — the
+   * project's own entry in the release config. */
+  settingsProjectId: string;
+  /** §6 (r7): the delegation's project (`executor.project_id`) — named
+   * alongside the settings project in the output. */
+  delegationProjectId: string;
 }
 
 // ── Git helpers ────────────────────────────────────────────────────────
@@ -228,6 +272,73 @@ async function emptyCommitKey(
     "--format=%an%x00%ae%x00%B",
     sha,
   ]);
+}
+
+// ── Step 0 (r7): проект настройки по репозиторию ──────────────────────
+
+interface BbProjectListItem {
+  id?: string;
+  sources?: { type?: string; path?: string | null; isDefault?: boolean }[];
+}
+
+/**
+ * §6 (r7): which project's settings a release runs under — the bb
+ * project of the REPOSITORY, not the delegation's. The main checkout
+ * dir of the executor's copy (`git rev-parse --git-common-dir` → its
+ * parent, matched by realpath against project sources) decides; no
+ * match — or any git/CLI failure — falls back to the delegation's
+ * project. Delegations to a nested repo are often dispatched from a
+ * parent project whose root sits above it, and the parent's settings
+ * must not govern the repo's release (ADR-0018, дополнение r7).
+ */
+export async function settingsProjectId(
+  deps: Pick<ReleaseDeps, "cmd" | "bbCli">,
+  repo: string,
+  fallback: string,
+): Promise<string> {
+  try {
+    const res = await deps.cmd.run(
+      "git",
+      [
+        "-C",
+        repo,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+      ],
+      { timeoutMs: 30_000 },
+    );
+    if (res.exitCode !== 0) return fallback;
+    const root = await realpath(dirname(res.stdout.trim()));
+    const projects = await runJson<BbProjectListItem[]>(
+      deps.bbCli,
+      ["project", "list", "--json"],
+      { timeoutMs: 15_000 },
+    );
+    const matches = async (p: BbProjectListItem, wantDefault: boolean) => {
+      for (const s of p.sources ?? []) {
+        if (s.type !== "local_path" || !s.path) continue;
+        if (wantDefault && !s.isDefault) continue;
+        try {
+          if ((await realpath(s.path)) === root) return true;
+        } catch {
+          // a missing source path cannot match
+        }
+      }
+      return false;
+    };
+    // The project path is its default source; a non-default source
+    // match counts only when no project's default matched.
+    for (const p of projects) {
+      if (p.id && (await matches(p, true))) return p.id;
+    }
+    for (const p of projects) {
+      if (p.id && (await matches(p, false))) return p.id;
+    }
+  } catch {
+    // git or `bb project list` failed — the delegation project decides.
+  }
+  return fallback;
 }
 
 // ── Step 1: приёмка ────────────────────────────────────────────────────
@@ -321,7 +432,6 @@ async function acceptTask(
   taskKey: string;
   title: string;
   executor: DelegationRow;
-  project: ResolvedProject;
 }> {
   const { key, show } = await resolveTask(deps, input.taskKey);
   const missing: string[] = [];
@@ -394,10 +504,6 @@ async function acceptTask(
     taskKey: key,
     title: show.task?.title ?? key,
     executor: executor!,
-    project: resolveProject(
-      deps.loadReleaseConfig().config!,
-      executor!.project_id ?? input.caller.projectId,
-    ),
   };
 }
 
@@ -1085,13 +1191,7 @@ export async function runRelease(
   assertInstalledHookFresh(deps);
 
   // Step 1 — приёмка.
-  const { taskKey, title, executor, project } = await acceptTask(input, deps);
-  if (project.excluded) {
-    throw new OrchestratorError(
-      "release-excluded",
-      `проект ${executor.project_id ?? input.caller.projectId} исключён из release (excluded: true)`,
-    );
-  }
+  const { taskKey, title, executor } = await acceptTask(input, deps);
   if (deps.store.activeReleaseByTask(taskKey)) {
     throw new OrchestratorError(
       "release-in-progress",
@@ -1150,6 +1250,25 @@ export async function runRelease(
         "дождитесь завершения хода исполнителя и повторите",
       );
     }
+  }
+  // §6 (r7): the settings project is the REPOSITORY's bb project — a
+  // delegation dispatched from a parent project whose root sits above
+  // the repo must not pick up the parent's settings. The merged and
+  // executor copies are worktrees of one repo, so either copy's
+  // `--git-common-dir` lands on the same main checkout.
+  const delegationProjectId = executor.project_id ?? input.caller.projectId;
+  const settingsProject = await settingsProjectId(
+    deps,
+    repo,
+    delegationProjectId,
+  );
+  const project = resolveProject(cfg.config!, settingsProject);
+  if (project.excluded) {
+    throw new OrchestratorError(
+      "release-excluded",
+      `проект настройки ${settingsProject} исключён из release ` +
+        `(excluded: true); проект делегирования ${delegationProjectId}`,
+    );
   }
   // §16.6 (PLUG-189): a merged result publishes from the COORDINATOR's
   // copy — under the same per-copy lock `merge` takes (§14 check 4: one
@@ -1237,6 +1356,8 @@ export async function runRelease(
         repo,
         branch,
         policyLoad: policyLoad as PolicyLoad & { policy: Policy },
+        settingsProjectId: settingsProject,
+        delegationProjectId,
       },
       input,
       deps,
@@ -1635,6 +1756,9 @@ async function runReleaseSteps(
     branch: string;
     /** Already null-checked in `runRelease` — `policy` is present. */
     policyLoad: PolicyLoad & { policy: Policy };
+    /** §6 (r7): the resolved settings project — reported in the result. */
+    settingsProjectId: string;
+    delegationProjectId: string;
   },
   input: ReleaseInput,
   deps: ReleaseDeps,
@@ -1949,6 +2073,8 @@ async function runReleaseSteps(
       status: "auditing",
       auditThreadId: res.threadId,
       warnings,
+      settingsProjectId: ctx.settingsProjectId,
+      delegationProjectId: ctx.delegationProjectId,
     };
   } catch (e) {
     // Any post-insert failure — sync conflict, a check, the scan, a
@@ -2229,11 +2355,16 @@ async function pushWithToken(
 
 /** The project's `threadIds` at publish time (§16.6; default `true` —
  * a broken config at pump time must not silently drop the contract
- * line CI/CD relies on). */
-function projectThreadIds(deps: ReleaseDeps, projectId: string): boolean {
+ * line CI/CD relies on). §6 (r7): the settings project is resolved by
+ * the released repository, `row.project_id` is only the fallback. */
+async function projectThreadIds(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+): Promise<boolean> {
   const cfg = deps.loadReleaseConfig();
   if (!cfg.config) return true;
-  return resolveProject(cfg.config, projectId).threadIds;
+  const id = await settingsProjectId(deps, row.repo_path, row.project_id);
+  return resolveProject(cfg.config, id).threadIds;
 }
 
 async function publishRelease(
@@ -2291,7 +2422,7 @@ async function publishRelease(
   // recorded at the FIRST release of the task and reused by repeats
   // (one branch and one PR per task, §16.6), and the PR body carries
   // neither «Источник» nor «Задача: <KEY>».
-  const threadIds = projectThreadIds(deps, row.project_id);
+  const threadIds = await projectThreadIds(deps, row);
   // §16.6 (PLUG-194): a publish-branch name is written and reused only
   // in the `release/…` form — an executor branch name recorded while
   // threadIds was on must not be published after it flips off.
@@ -2568,7 +2699,10 @@ async function postCheck(
       const leaks = { machine: "block" as const, bbIds: "block" as const, allow: [] };
       const cfg = deps.loadReleaseConfig().config;
       const proj = cfg
-        ? resolveProject(cfg, row.project_id)
+        ? resolveProject(
+            cfg,
+            await settingsProjectId(deps, row.repo_path, row.project_id),
+          )
         : { threadIds: true, allowedTrailers: [], allowedEmails: [] };
       const findings = await machineScan(deps.cmd, {
         repoPath: repo,

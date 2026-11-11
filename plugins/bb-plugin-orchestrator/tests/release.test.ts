@@ -24,10 +24,13 @@ import {
   parseAuditVerdict,
   reviewVerdictOk,
   docsForChanges,
+  releaseThreadsGet,
   runRelease,
   pumpReleases,
   writePushToken,
+  settingsProjectId,
   type ReleaseDeps,
+  type ReleaseThreads,
 } from "../src/release.js";
 import { parsePolicy } from "../src/policy.js";
 import { OrchestratorError } from "../src/errors.js";
@@ -335,6 +338,14 @@ function makeDeps(repo: string, overrides: Partial<{
   /** §17.3 (ревью PLUG-216 п.2): the executor thread's status — the
    * primary turn signal; absent → the journal heuristic decides. */
   execStatus: string | null;
+  /** §6 (r7): the executor copy path — a worktree path instead of the
+   * main checkout exercises the settings-project resolution. */
+  execPath: string;
+  /** §6 (r7): the executor copy's branch (worktree copies cannot share
+   * the main checkout's branch). */
+  execBranch: string;
+  /** §6 (r7): what `bb project list --json` returns. */
+  projects: unknown[];
 }> = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -400,13 +411,15 @@ function makeDeps(repo: string, overrides: Partial<{
         return ok(JSON.stringify({ preset: { permissionMode: "auto" } }));
       if (key.startsWith("thread options"))
         return ok(JSON.stringify({ options: [] }));
+      if (key.startsWith("project list"))
+        return ok(JSON.stringify(overrides.projects ?? []));
       return ok();
     },
   };
   const threads = {
     get: async ({ threadId }: { threadId: string }) =>
       threadId === "thr_exec"
-        ? { id: threadId, status: overrides.execStatus ?? undefined, environmentPath: repo, environmentBranchName: "feat-x", parentThreadId: null }
+        ? { id: threadId, status: overrides.execStatus ?? undefined, environmentPath: overrides.execPath ?? repo, environmentBranchName: overrides.execBranch ?? "feat-x", parentThreadId: null }
         : threadId === "thr_coord" && overrides.coordPath
           ? { id: threadId, environmentPath: overrides.coordPath, environmentBranchName: null, parentThreadId: null }
           : { id: threadId, parentThreadId: null, title: null, originPluginId: null, projectId: "proj_main" },
@@ -521,6 +534,188 @@ test("release happy path: приёмка → sync → скан → аудит р
   const audit = store.latestDelegationByTaskAndLevel("PLUG-1", "release-audit")!;
   assert.equal(audit.status, "running");
   assert.equal(store.threadRole("thr_audit")?.role, "release-auditor");
+});
+
+// ── PLUG-229: server-side threads.get (environmentId → env show) ─────
+
+test("PLUG-229: SDK thread без envPath — копия из environment show", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  const shown: string[] = [];
+  // The real SDK thread carries `environmentId` only — the mocked
+  // `environmentPath`/`environmentBranchName` hid the bug on live runs.
+  const sdkGet = async ({ threadId }: { threadId: string }) =>
+    threadId === "thr_exec"
+      ? {
+          id: threadId,
+          status: "idle",
+          environmentId: "env_exec",
+          parentThreadId: null,
+          title: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        }
+      : {
+          id: threadId,
+          parentThreadId: null,
+          title: null,
+          originPluginId: null,
+          projectId: "proj_main",
+        };
+  (deps.threads as ReleaseThreads).get = releaseThreadsGet(sdkGet, async (envId) => {
+    shown.push(envId);
+    return { path: repo, branchName: "feat-x" };
+  });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  // Step 1's copy read + the §17.3 turn gate both go through the wrap.
+  assert.deepEqual(shown, ["env_exec", "env_exec"]);
+});
+
+test("PLUG-229: без environmentId — прежний отказ «нет рабочей копии»", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  (deps.threads as ReleaseThreads).get = releaseThreadsGet(
+    async ({ threadId }: { threadId: string }) => ({ id: threadId }),
+    async () => ({ path: repo, branchName: "feat-x" }),
+  );
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /нет рабочей копии/.test((e as OrchestratorError).message),
+  );
+});
+
+test("PLUG-229: ошибка environment show → поля null → тот же отказ", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo);
+  (deps.threads as ReleaseThreads).get = releaseThreadsGet(
+    async ({ threadId }: { threadId: string }) =>
+      threadId === "thr_exec"
+        ? { id: threadId, environmentId: "env_gone" }
+        : { id: threadId },
+    async () => {
+      throw new Error("environment show: no such environment");
+    },
+  );
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "release-refused",
+  );
+});
+
+test("release r7: настройка — по проекту репозитория копии исполнителя", async () => {
+  const { repo } = makeRepo();
+  // The executor copy is a linked worktree of the repo nested inside a
+  // parent project's directory — the spec's own scenario.
+  const wt = join(mkdtempSync(join(tmpdir(), "exec-")), "copy");
+  gitR(repo, ["worktree", "add", "-b", "exec-copy", wt, "HEAD"]);
+  const { deps } = makeDeps(repo, {
+    execPath: wt,
+    execBranch: "exec-copy",
+    projects: [
+      { id: "proj_parent", sources: [{ type: "local_path", path: tmpdir(), isDefault: true }] },
+      { id: "proj_repo", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+    ],
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_repo: {}, proj_main: { excluded: true } },
+    }),
+  });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  // proj_main (the delegation project) is excluded — only the repo
+  // project's settings let the release through.
+  assert.equal(res.ok, true);
+  assert.equal(res.settingsProjectId, "proj_repo");
+  assert.equal(res.delegationProjectId, "proj_main");
+});
+
+test("release r7: excluded у проекта репозитория → отказ с обоими id", async () => {
+  const { repo } = makeRepo();
+  const { deps } = makeDeps(repo, {
+    projects: [
+      { id: "proj_repo", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+    ],
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_repo: { excluded: true }, proj_main: {} },
+    }),
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => {
+      const x = e as OrchestratorError;
+      assert.equal(x.code, "release-excluded");
+      assert.match(x.message, /proj_repo/);
+      assert.match(x.message, /proj_main/);
+      return true;
+    },
+  );
+});
+
+test("release r7: нет bb-проекта на пути репозитория → проект делегирования", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    projects: [],
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: { proj_main: { target: { action: "push", branch: "dev" } } },
+    }),
+  });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.settingsProjectId, "proj_main");
+  // The delegation project's own settings were used — target dev.
+  assert.equal(store.getRelease(res.releaseId)!.target_branch, "dev");
+});
+
+test("settingsProjectId: ошибка git → проект делегирования, без падения", async () => {
+  const cmd: CmdRunner = {
+    run: async () => ({ exitCode: 1, stdout: "", stderr: "fatal" }),
+  };
+  const bbCli: BbCli = { run: async () => ok("[]") };
+  assert.equal(
+    await settingsProjectId({ cmd, bbCli }, "/no/such/dir", "proj_main"),
+    "proj_main",
+  );
+});
+
+test("settingsProjectId: worktree → проект основного каталога репозитория", async () => {
+  const { repo } = makeRepo();
+  const wt = join(mkdtempSync(join(tmpdir(), "exec-")), "copy");
+  gitR(repo, ["worktree", "add", "--detach", wt, "HEAD"]);
+  const cmd: CmdRunner = {
+    run: async (file, args, o) => {
+      try {
+        const out = execFileSync(file, args, {
+          cwd: o?.cwd, encoding: "utf8", input: o?.stdin,
+        });
+        return { exitCode: 0, stdout: out, stderr: "" };
+      } catch (e: unknown) {
+        const x = e as { status?: number; stdout?: string; stderr?: string };
+        return { exitCode: x.status ?? 1, stdout: x.stdout ?? "", stderr: x.stderr ?? "" };
+      }
+    },
+  };
+  const bbCli: BbCli = {
+    run: async () =>
+      ok(JSON.stringify([
+        { id: "proj_repo", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+      ])),
+  };
+  // resolving from the worktree copy finds the main checkout's project
+  assert.equal(
+    await settingsProjectId({ cmd, bbCli }, wt, "proj_main"),
+    "proj_repo",
+  );
+  // and from the checkout itself
+  assert.equal(
+    await settingsProjectId({ cmd, bbCli }, repo, "proj_main"),
+    "proj_repo",
+  );
 });
 
 test("release: scan finding (cat 2 identity) refuses before audit", async () => {

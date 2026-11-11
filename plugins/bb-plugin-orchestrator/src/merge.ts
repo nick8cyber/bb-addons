@@ -132,8 +132,12 @@ export interface MergeDeps {
   mergeAutofix?: () => boolean;
   /** §16.6 `threadIds` of the project's release config: `false` → the
    * merge message drops the task key (`merge r<N> (<sha7>)`). Default
-   * on when unset. */
-  releaseThreadIds?: (projectId: string | null) => boolean;
+   * on when unset. §6 (r7): the settings project is resolved by the
+   * repository (`repoPath`), `projectId` is only the fallback. */
+  releaseThreadIds?: (
+    repoPath: string,
+    projectId: string | null,
+  ) => boolean | Promise<boolean>;
   log?: { warn?(message: string): void };
 }
 
@@ -532,7 +536,10 @@ export async function runMerge(
       // §16.6 `threadIds`: off → the merge message drops the task key
       // (`merge r<N> (<sha7>)`) so a public-facing release scan never
       // trips over the pipeline's own commit.
-      const mergeMessage = (deps.releaseThreadIds?.(row.project_id) ?? true)
+      const mergeMessage = ((await deps.releaseThreadIds?.(
+        repo,
+        row.project_id,
+      )) ?? true)
         ? `merge ${row.task_key} r${row.round} (${sha7(resultSha)})`
         : `merge r${row.round} (${sha7(resultSha)})`;
       const mergeRes = await git(

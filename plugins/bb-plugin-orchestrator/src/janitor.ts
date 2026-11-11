@@ -2614,7 +2614,7 @@ export function createJanitor(deps: JanitorDeps) {
       }
     }
 
-    // §17.4 (ревью PLUG-221): a copy row still sitting at «removing»
+    // §17.4 (ревью PLUG-221, PLUG-227): a copy row still sitting at «removing»
     // whose env BB no longer lists closes as «removed» — a crash
     // between the archive and the settle write left it dangling and the
     // per-env pass above never reaches a gone env (the same closing the
@@ -2635,6 +2635,34 @@ export function createJanitor(deps: JanitorDeps) {
             at,
           );
         }
+        let repoCommon: string | null = null;
+        if (i.path) {
+          const match = repoInfos.find(
+            (r) =>
+              i.path === r.root ||
+              i.path!.startsWith(r.root + "/") ||
+              i.path === r.commonDir ||
+              i.path!.startsWith(r.commonDir + "/"),
+          );
+          if (match) repoCommon = match.commonDir;
+        }
+        if (!repoCommon && seenRoots.length === 1) {
+          repoCommon = seenRoots[0].common;
+        }
+        const repoLabel = repoCommon ?? i.path ?? i.env_id;
+        log.info?.(
+          `orchestrator janitor: removed copy ` +
+            `${repoLabel}:${i.branch ?? "-"} ` +
+            `at ${i.tip_sha ?? "-"} (env gone)`,
+        );
+        summary.removedItems.push({
+          envId: i.env_id,
+          branch: i.branch ?? null,
+          repo: repoCommon,
+          tipSha: i.tip_sha ?? null,
+          headSha: null,
+        });
+        summary.removedCopies += 1;
       }
     }
 

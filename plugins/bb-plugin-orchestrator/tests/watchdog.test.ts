@@ -3233,6 +3233,46 @@ test("§16.5 (PLUG-224): child-interrupted satisfies a coordinator-cancelled row
   assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 0);
 });
 
+// §16.5 (PLUG-227): a coordinator-initiated cancel with non-empty executor
+// output delivers the report.
+test("§16.5 (PLUG-227): a coordinator-cancelled row with non-empty executor output delivers the report", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.outputs.set("thr_e1", "отчёт исполнителя: сделал всё по спеке");
+  h.store.setStatus(row.id, "cancelled");
+  h.store.addSetupError(row.id, "coordinator-cancel", "thr_coord");
+  await settleResults(h);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.result_notice, "plugin");
+  const msg = h.sends.find((x) => x.threadId === "thr_coord");
+  assert.ok(msg, "message must be sent to coordinator");
+  const text = JSON.stringify(msg!.input);
+  assert.match(text, /: cancelled, ветка/);
+  assert.match(text, /отчёт исполнителя: сделал всё по спеке/);
+  assert.ok(!/без отчёта/.test(text));
+});
+
+// §16.2 (PLUG-227): revive clears the coordinator-cancel setup_errors mark.
+test("§16.2 (PLUG-227): revive clears the coordinator-cancel setup_errors mark", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.store.setStatus(row.id, "cancelled");
+  h.store.addSetupError(row.id, "coordinator-cancel", "thr_coord");
+  h.store.addSetupError(row.id, "attach-verify", "other-error");
+  assert.ok(h.store.findSetupError(h.store.get(row.id)!, "coordinator-cancel"));
+
+  // Revive the delegation
+  const revived = h.store.revive(row.id);
+  assert.equal(revived, true);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(h.store.findSetupError(fresh, "coordinator-cancel"), undefined);
+  // Other errors survive
+  assert.ok(h.store.findSetupError(fresh, "attach-verify"));
+});
+
 // PLUG-224: a watchdog-driven cancel (the thread vanished) still tails
 // «без отчёта» — only the coordinator's own cancel is exempt.
 test("§16.5 (PLUG-224): an external cancel still sends «без отчёта»", async () => {

@@ -78,7 +78,12 @@ import {
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
 import { isEnvironmentGone, runMerge } from "./src/merge.js";
-import { pumpReleases, runRelease } from "./src/release.js";
+import {
+  pumpReleases,
+  releaseThreadsGet,
+  runRelease,
+  settingsProjectId,
+} from "./src/release.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -592,13 +597,29 @@ export async function createPlugin(
       return joinPath(homedir(), ".bb", "plugins", "orchestrator");
     }
   };
+  /** `bb environment show <id> --json` — the env's own facts (§4.1,
+   * §14). Shared by `environmentOf` below and release's copy lookup
+   * (PLUG-229): an SDK thread has `environmentId` only, so
+   * `releaseThreadsGet` fills `environmentPath`/`environmentBranchName`
+   * from here — for the executor's copy and, on a merged round, the
+   * coordinator's. */
+  const environmentFacts = (envId: string) =>
+    runJson<{
+      id?: string;
+      path?: string;
+      branchName?: string;
+      mergeBaseBranch?: string | null;
+      baseBranch?: string | { name?: string } | null;
+    }>(bbCli, ["environment", "show", envId, "--json"]);
   const releaseDeps = {
     store,
     bbCli,
     cmd,
     threads: {
-      get: (a: { threadId: string }) =>
-        bb.sdk.threads.get(a) as never,
+      get: releaseThreadsGet(
+        (a: { threadId: string }) => bb.sdk.threads.get(a),
+        environmentFacts,
+      ),
       send: (a: never) => bb.sdk.threads.send(a) as never,
       output: (a: { threadId: string }) =>
         bb.sdk.threads.output(a) as never,
@@ -632,13 +653,7 @@ export async function createPlugin(
       environmentId?: string | null;
     };
     if (!t.environmentId) return null;
-    const env = await runJson<{
-      id?: string;
-      path?: string;
-      branchName?: string;
-      mergeBaseBranch?: string | null;
-      baseBranch?: string | { name?: string } | null;
-    }>(bbCli, ["environment", "show", t.environmentId, "--json"]);
+    const env = await environmentFacts(t.environmentId);
     const mergeBase =
       env.mergeBaseBranch ??
       (typeof env.baseBranch === "string"
@@ -711,10 +726,18 @@ export async function createPlugin(
         janitorConfig().config?.protectedBranches ?? undefined,
       mergeAutofix: () => currentSettings.mergeAutofix === true,
       // §16.6 `threadIds`: off → merge commits drop the task key.
-      releaseThreadIds: (projectId) =>
+      // §6 (r7): the settings project is the repository's bb project —
+      // the delegation's project id is only the fallback.
+      releaseThreadIds: async (repoPath, projectId) =>
         releaseConfig.config
-          ? resolveProject(releaseConfig.config, projectId ?? "")
-              .threadIds
+          ? resolveProject(
+              releaseConfig.config,
+              await settingsProjectId(
+                { cmd, bbCli },
+                repoPath,
+                projectId ?? "",
+              ),
+            ).threadIds
           : true,
       log: bb.log,
     });
@@ -1177,10 +1200,11 @@ export async function createPlugin(
   const fail = (json: boolean, error: unknown) =>
     json ? jsonFail(error) : textFail(error);
 
-  // §17.2 r26 (PLUG-215 мелко 2): a `notify-muted` setup_errors entry is
-  // the quiet-stop mark awaiting the `auto` restore — a pending state,
-  // not a setup failure; render it under its own label instead of
-  // inside `setup_errors`.
+  // §17.2 r26 (PLUG-215 мелко 2, PLUG-227): `notify-muted` and
+  // `coordinator-cancel` setup_errors entries are state marks (the
+  // quiet-stop mark awaiting the `auto` restore; the coordinator cancel
+  // record suppressing «закончил без отчёта»), not setup failures;
+  // render them under their own labels instead of inside `setup_errors`.
   const renderSetupErrors = (raw: string): string => {
     try {
       const entries = JSON.parse(raw) as {
@@ -1188,8 +1212,11 @@ export async function createPlugin(
         message?: string;
       }[];
       if (!Array.isArray(entries)) return ` setup_errors=${raw}`;
-      const errors = entries.filter((e) => e?.step !== "notify-muted");
+      const errors = entries.filter(
+        (e) => e?.step !== "notify-muted" && e?.step !== "coordinator-cancel",
+      );
       const muted = entries.filter((e) => e?.step === "notify-muted");
+      const cancelled = entries.filter((e) => e?.step === "coordinator-cancel");
       let out = errors.length
         ? ` setup_errors=${JSON.stringify(errors)}`
         : "";
@@ -1197,6 +1224,11 @@ export async function createPlugin(
         out +=
           ` notify-muted=${muted.at(-1)?.message ?? "?"}` +
           ` (уведомления заглушены, ждут восстановления auto)`;
+      }
+      if (cancelled.length) {
+        out +=
+          ` coordinator-cancel=${cancelled.at(-1)?.message ?? "?"}` +
+          ` (отменено координатором)`;
       }
       return out;
     } catch {
@@ -1560,7 +1592,9 @@ export async function createPlugin(
                 exitCode: 0,
                 stdout:
                   `release ${res.taskKey}: аудит запущен ` +
-                  `(release #${res.releaseId}, тред ${res.auditThreadId ?? "—"})` +
+                  `(release #${res.releaseId}, тред ${res.auditThreadId ?? "—"}; ` +
+                  `проект настройки ${res.settingsProjectId}, ` +
+                  `проект делегирования ${res.delegationProjectId})` +
                   (res.warnings.length
                     ? `
 предупреждения скана:
