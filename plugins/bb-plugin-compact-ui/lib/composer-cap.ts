@@ -49,15 +49,24 @@ export function enforce(form: Element, win: Window, retry = true): void {
   dbg.ts = Date.now();
   /* BB 0.49 no longer wraps the editor in div.overflow-y-auto — fall back to
      the ProseMirror's own scrollable ancestor, then the element itself. */
-  const pm = form.querySelector(".ProseMirror") as HTMLElement | null;
+  /* The queued-message inline editor is a ProseMirror too and lives inside
+     the queue's own overflow-y-auto scroll — exclude everything under the
+     queue frame or the editor cap clamps the queue viewport to 104px and
+     the open edit renders as a sliver with dead space below. */
+  const inQueue = (el: Element | null | undefined) =>
+    !!el?.closest?.("[data-queued-messages-scroll-frame],[data-queued-messages-scroll]");
+  const pm = (Array.from(form.querySelectorAll(".ProseMirror")) as HTMLElement[])
+    .find((el) => !inQueue(el)) ?? form.querySelector(".ProseMirror") as HTMLElement | null;
   /* BB 0.49 dropped the div.overflow-y-auto editor wrapper — find the real
      scrollable ancestor of the ProseMirror by computed overflow instead. */
   let pmScroll: HTMLElement | null = null;
   for (let el = pm?.parentElement; el && el !== form; el = el.parentElement) {
+    if (inQueue(el)) continue;
     const ov = getComputedStyle(el).overflowY;
     if (ov === "auto" || ov === "scroll") { pmScroll = el as HTMLElement; break; }
   }
-  const scroll = (form.querySelector(EDITOR_SCROLL) ?? pmScroll ?? pm) as HTMLElement | null;
+  const scroll = (Array.from(form.querySelectorAll(EDITOR_SCROLL))
+    .find((el) => !inQueue(el)) ?? pmScroll ?? pm) as HTMLElement | null;
   dbg.editor = scroll ? scroll.tagName + "." + (scroll.className?.toString?.().split(" ")[0] ?? "") : null;
   dbgEl.dataset.capDebug = JSON.stringify(dbg);
   const cap = capPx(win);
