@@ -24,8 +24,10 @@
  * the creation entry — no reflog-type parsing). «Ничего не
  * теряется»: every commit the copy's HEAD or its branch ever pointed
  * at (the whole `git log -g`) is an ancestor of a remote target,
- * patch-equivalent to a commit on it, or an ancestor of the current
- * HEAD whose content already sits on a target — one that is neither
+ * patch-equivalent to a commit on it, or carries content already on a
+ * target — the `merge-tree` sign checked for EACH reflog commit itself
+ * (PLUG-197: «A + revert A» nets to origin, but A's content never
+ * reached it — such a copy stays). One that is neither
  * (a `reset`-orphaned or detached commit, an unpublished pre-amend
  * version) keeps the copy (`unpushed-commits`), or reports it once
  * abandoned. The rule is re-run immediately before archiving, and for
@@ -567,19 +569,23 @@ export function createJanitor(deps: JanitorDeps) {
    * §16.3 (ревизия 25) «ничего не теряется»: every commit the given
    * reflogs (`git log -g --format=%H <ref>`, whole history) ever
    * pointed at must be safe — an ancestor of a remote target,
-   * patch-equivalent to a commit on it, or an ancestor of <anchorSha>
-   * (the copy's HEAD, resp. the orphan branch's tip) whose *content*
-   * already sits on a target (`mergeTreeEquals` — this is what clears
-   * a squash of several commits). «ok» — the reflogs hold nothing
-   * unpublished; «lost» — at least one commit (a `reset`-orphan, a
-   * detached-HEAD commit, an unpublished pre-amend version) would die
-   * with the ref; «unknown» — a reflog or the reachability scan could
-   * not be read, so nothing is proven and the ref stays.
+   * patch-equivalent to a commit on it, or carrying content already on
+   * a target. The content sign is checked for EACH pending commit
+   * itself (PLUG-197): `merge-tree --write-tree <target> <sha>`
+   * reproducing `<target>^{tree}` proves THIS commit's content is on
+   * origin. A whole-tip check cannot clear the middle commits — «A +
+   * revert A» nets to origin while A's content never reached it, and a
+   * squash that rewrote an earlier commit's lines leaves that commit
+   * without a counterpart; both stay («брошено» when abandoned, never
+   * a silent removal). «ok» — the reflogs hold nothing unpublished;
+   * «lost» — at least one commit (a `reset`-orphan, a detached-HEAD
+   * commit, an unpublished pre-amend version) would die with the ref;
+   * «unknown» — a reflog or the reachability scan could not be read,
+   * so nothing is proven and the ref stays.
    */
   const reflogPositionsSafe = async (
     cwd: string,
     refs: string[],
-    anchorSha: string,
     repoRoot: string,
     targets: string[],
   ): Promise<"ok" | "lost" | "unknown"> => {
@@ -615,34 +621,43 @@ export function createJanitor(deps: JanitorDeps) {
       }
     }
     if (!pending.size) return "ok";
-    // The anchor-content sign is computed once: when the anchor's tree
-    // merges clean into a target, every anchor ancestor is safe.
-    let anchorContained: boolean | null = null;
-    const contained = async (): Promise<boolean> => {
-      if (anchorContained === null) {
-        anchorContained = false;
-        for (const t of targets) {
-          if (await mergeTreeEquals(repoRoot, t, anchorSha)) {
-            anchorContained = true;
-            break;
-          }
-        }
+    // `<target>^{tree}` is resolved once per target, not per commit.
+    const targetTrees = new Map<string, string | null>();
+    const ownContentOn = async (t: string, sha: string) => {
+      let tt = targetTrees.get(t);
+      if (tt === undefined) {
+        tt =
+          (
+            await gitOut(deps.cmd, repoRoot, [
+              "rev-parse",
+              `${t}^{tree}`,
+            ])
+          )?.trim() ?? null;
+        targetTrees.set(t, tt);
       }
-      return anchorContained;
+      if (!tt) return false;
+      const mergedTree = (
+        await gitOut(deps.cmd, repoRoot, [
+          "merge-tree",
+          "--write-tree",
+          t,
+          sha,
+        ])
+      )
+        ?.split("\n")[0]
+        ?.trim();
+      return !!mergedTree && mergedTree === tt;
     };
     for (const sha of pending) {
-      if (
-        (await gitOk(deps.cmd, repoRoot, [
-          "merge-base",
-          "--is-ancestor",
-          sha,
-          anchorSha,
-        ])) &&
-        (await contained())
-      ) {
-        continue;
-      }
       if (await patchEquivalent(repoRoot, sha, targets)) continue;
+      let own = false;
+      for (const t of targets) {
+        if (await ownContentOn(t, sha)) {
+          own = true;
+          break;
+        }
+      }
+      if (own) continue;
       return "lost";
     }
     return "ok";
@@ -651,16 +666,14 @@ export function createJanitor(deps: JanitorDeps) {
   /**
    * «Ничего не теряется» for a working copy: the whole reflog of the
    * copy's HEAD (per-worktree) and of the copy's own branches —
-   * `branchName` plus the checked-out one when it differs — with the
-   * copy's HEAD as the content anchor. The repo's other branches are
-   * never scanned — that would multiply every copy's git calls by the
-   * branch count.
+   * `branchName` plus the checked-out one when it differs. The repo's
+   * other branches are never scanned — that would multiply every
+   * copy's git calls by the branch count.
    */
   const nothingLost = async (
     env: EnvDto,
     path: string,
     ownBranch: string | undefined,
-    headSha: string,
     repoRoot: string,
     targets: string[],
   ): Promise<"ok" | "lost" | "unknown"> => {
@@ -681,7 +694,7 @@ export function createJanitor(deps: JanitorDeps) {
         refs.push(ref);
       }
     }
-    return reflogPositionsSafe(path, refs, headSha, repoRoot, targets);
+    return reflogPositionsSafe(path, refs, repoRoot, targets);
   };
 
   const run = async (
@@ -1284,20 +1297,20 @@ export function createJanitor(deps: JanitorDeps) {
       // §16.3 (ревизия 25, главное условие): «ничего не теряется» —
       // every commit the copy's HEAD or its own branch ever pointed at
       // must already sit on a remote target: as an ancestor, as a
-      // patch-equivalent (amend/rebase of published work), or as an
-      // ancestor of HEAD whose content merges clean into the target
-      // (a multi-commit squash). A commit that is neither — one
-      // orphaned by `reset`, made on a detached HEAD, an unpublished
-      // pre-amend version — keeps the copy; once the thread idles past
-      // `abandonedAfter` it goes to the «брошено» report. The whole
-      // reflogs are read (no entry cap), but only the copy's own: HEAD
-      // is per-worktree, plus `branchName` and the checked-out branch
-      // when they exist — the repo's other branches are never scanned.
+      // patch-equivalent (amend/rebase of published work), or by its
+      // own content (`merge-tree` per commit — a multi-commit squash).
+      // A commit that is neither — one orphaned by `reset`, made on a
+      // detached HEAD, an unpublished pre-amend version, an «A» in a
+      // net-zero «A + revert A» — keeps the copy; once the thread
+      // idles past `abandonedAfter` it goes to the «брошено» report.
+      // The whole reflogs are read (no entry cap), but only the
+      // copy's own: HEAD is per-worktree, plus `branchName` and the
+      // checked-out branch when they exist — the repo's other
+      // branches are never scanned.
       const lost = await nothingLost(
         env,
         path,
         ownBranch,
-        head,
         repo.root,
         targets,
       );
@@ -1572,12 +1585,22 @@ export function createJanitor(deps: JanitorDeps) {
           e,
           e.path!,
           ownBranch,
-          head,
           repo.root,
           targets,
         );
         if (lost !== "ok") {
           note(lost === "lost" ? "unpushed-commits" : "unpushed-unknown", e.id);
+          return;
+        }
+        // §15 «Действие» (PLUG-197): a process may have cd'ed into the
+        // copy after the run-start probe — re-check before archiving.
+        const proc = await hasProcessIn(e.path!);
+        if (proc === null) {
+          note("process-unknown", e.id);
+          return;
+        }
+        if (proc) {
+          note("process-inside", e.id);
           return;
         }
       }
@@ -1735,14 +1758,25 @@ export function createJanitor(deps: JanitorDeps) {
       // A failed `worktree list` cannot prove a branch is open nowhere —
       // `branch -D` would refuse anyway, but the sweep skips entirely.
       if (!fetched || worktreeListFailed) continue;
-      // Ledger rows of branches no longer in the repo are closed — a
+      // PLUG-197 PX6: every branch row of THIS repo is a definite
+      // outcome — the sweep either evaluates the branch or proves it
+      // gone. Rows of unswept repos stay unproven and keep their
+      // «брошено» announcement.
+      for (const b of localBranches) {
+        ctx.definite.add(`branch:${commonDir}:${b}`);
+      }
+      // Ledger rows of branches no longer in THIS repo are closed — a
       // manually deleted branch must not linger in the abandoned list.
+      // Rows are keyed `branch:<commonDir>:<name>`, so one repo never
+      // closes another's namesake (PLUG-197 PX5).
+      const prefix = `branch:${commonDir}:`;
       const present = new Set(localBranches);
       for (const i of deps.janitor.items()) {
         if (
-          i.env_id.startsWith("branch:") &&
-          !present.has(i.env_id.slice("branch:".length))
+          i.env_id.startsWith(prefix) &&
+          !present.has(i.env_id.slice(prefix.length))
         ) {
+          ctx.definite.add(i.env_id);
           if (persist) {
             deps.janitor.upsertItem(
               i.env_id,
@@ -1759,8 +1793,9 @@ export function createJanitor(deps: JanitorDeps) {
         if (openBranches.has(branch)) continue;
         if (!(await shaMergedIn(root, branch, protectedTargets))) continue;
         // §15 «Ветки без копий»: every position of the branch's own
-        // reflog must be safe before `branch -D` erases it — the tip is
-        // the content anchor (its mergedness was just proven).
+        // reflog must be safe before `branch -D` erases it — checked
+        // per commit (PLUG-197: «A + revert A» nets to origin, but A
+        // never reached it).
         const tip = (
           await gitOut(deps.cmd, root, [
             "rev-parse",
@@ -1773,12 +1808,11 @@ export function createJanitor(deps: JanitorDeps) {
           ? await reflogPositionsSafe(
               root,
               [`refs/heads/${branch}`],
-              tip,
               root,
               protectedTargets,
             )
           : "unknown";
-        const envId = `branch:${branch}`;
+        const envId = `branch:${commonDir}:${branch}`;
         if (safe !== "ok") {
           keep(summary, "branch-unpushed");
           // Idleness is the reflog's last write; no reflog file means
@@ -1859,6 +1893,33 @@ export function createJanitor(deps: JanitorDeps) {
       }
     }
 
+    // Pre-PX5 rows used the bare `branch:<name>` key — no repo in it.
+    // They close only when NO swept repo still has the branch: a
+    // namesake anywhere keeps the row (and the announcement) alive.
+    {
+      const stillPresent = new Set(
+        repoInfos
+          .filter((r) => r.fetched && !r.worktreeListFailed)
+          .flatMap((r) => r.localBranches),
+      );
+      for (const i of deps.janitor.items()) {
+        if (!i.env_id.startsWith("branch:")) continue;
+        const rest = i.env_id.slice("branch:".length);
+        // New-format rows carry `:<commonDir>:` (an absolute path or a
+        // `:` inside) — they are owned by their repo's sweep above.
+        if (rest.startsWith("/") || rest.includes(":")) continue;
+        if (stillPresent.has(rest)) continue;
+        ctx.definite.add(i.env_id);
+        if (persist) {
+          deps.janitor.upsertItem(
+            i.env_id,
+            { state: "removed", reason: "removed" },
+            at,
+          );
+        }
+      }
+    }
+
     // «Отчёт, без удаления»: abandoned copies collected this run — also
     // used by the coordinator message below (§16.3: only *new* ones).
     for (const { env, reason, threadId, isNew } of reportedNow) {
@@ -1874,7 +1935,8 @@ export function createJanitor(deps: JanitorDeps) {
       });
     }
     // «Ветки без копий» abandoned entries collected by the sweep — the
-    // pseudo env id `branch:<name>` keeps them out of real env rows.
+    // pseudo env id `branch:<commonDir>:<name>` keeps them out of real
+    // env rows.
     for (const b of reportedBranches) {
       summary.reported.push({
         envId: b.envId,
@@ -1920,10 +1982,14 @@ export function createJanitor(deps: JanitorDeps) {
     // envs and the once-a-day limit would be broken (PLUG-192).
     const current = new Set(summary.reported.map((i) => i.envId));
     for (const id of [...announced]) {
-      if (
-        !current.has(id) &&
-        (ctx.definite.has(id) || !ctx.allEnvIds.has(id))
-      ) {
+      // A `branch:<commonDir>:<name>` id is never an env — «gone from
+      // allEnvIds» cannot clear it. It drops only on a run that really
+      // swept its repo (PLUG-197 PX6: a failed fetch must not cause a
+      // repeat announcement).
+      const proven = id.startsWith("branch:")
+        ? ctx.definite.has(id)
+        : ctx.definite.has(id) || !ctx.allEnvIds.has(id);
+      if (!current.has(id) && proven) {
         announced.delete(id);
         announcedMem.delete(id);
       }

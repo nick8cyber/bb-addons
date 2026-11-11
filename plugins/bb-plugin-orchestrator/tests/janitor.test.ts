@@ -2097,15 +2097,20 @@ test("the whole HEAD reflog is scanned — a detached commit past the first 500 
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
   mergeEnv(repo, env);
-  // an orphan commit object nobody references
+  // an orphan commit object nobody references — with a file origin
+  // lacks (an empty-diff commit would be content-equal, not lost)
+  writeFileSync(join(repo, "detached.txt"), "wip\n");
+  git(repo, ["add", "detached.txt"]);
   const orphan = git(repo, [
     "commit-tree",
-    git(repo, ["rev-parse", "HEAD^{tree}"]),
+    git(repo, ["write-tree"]),
     "-p",
     "HEAD",
     "-m",
     "wip: ancient detached",
   ]);
+  git(repo, ["reset", "-q", "HEAD"]);
+  rmSync(join(repo, "detached.txt"));
   const head = git(repo, ["rev-parse", "HEAD"]);
   // 600 newest reflog lines are non-commit noise; the detached commit
   // sits in the 601st (oldest) position — a 500-entry slice would miss it
@@ -2589,9 +2594,10 @@ test("a branch-unpushed orphan idle over abandonedAfter is reported (PLUG-195)",
   assert.equal(res.kept["branch-unpushed"], 1);
   const item = res.reported.find((r) => r.branch === "bb/o");
   assert.ok(item);
-  assert.equal(item.envId, "branch:bb/o");
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/o`;
+  assert.equal(item.envId, key);
   assert.equal(item.reason, "branch-unpushed");
-  assert.equal(w.janitor.item("branch:bb/o")!.state, "reported");
+  assert.equal(w.janitor.item(key)!.state, "reported");
   // when the orphan commit is published the branch becomes sweepable
   // again and the «брошено» row closes
   const u = git(repo, ["rev-parse", "bb/o@{1}"]);
@@ -2599,7 +2605,7 @@ test("a branch-unpushed orphan idle over abandonedAfter is reported (PLUG-195)",
   git(repo, ["push", "origin", "main"]);
   const res2 = await w.jan.run();
   assert.equal(res2.removedBranches, 1);
-  assert.equal(w.janitor.item("branch:bb/o")!.state, "removed");
+  assert.equal(w.janitor.item(key)!.state, "removed");
   assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/o"]));
 });
 
@@ -2674,4 +2680,299 @@ test("a pull-merge entry does not hide own commits — strict «Created from» c
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 1);
   assert.equal(w.janitor.item(env.id)!.state, "removed");
+});
+
+test("PX1: a commit + its revert nets to origin — the commit itself never reached it, copy stays (PLUG-197)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "a.txt", "feat: A");
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  // «A + revert A» leaves the tip tree equal to origin — the old
+  // anchor-content check cleared A anyway and the copy was deleted
+  git(env.path, ["revert", "--no-edit", "HEAD"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported.length, 1);
+  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  // A survives only in the copy's reflogs — it must be found there
+  assert.ok(
+    git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
+  );
+  // the branch is still checked out in the copy — it stays too
+  git(repo, ["rev-parse", "--verify", env.branchName]);
+});
+
+test("PX2: the same on a detached HEAD — the branch has no own commits, the idle copy stays (PLUG-197)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  git(env.path, ["checkout", "--detach"]);
+  commitIn(env.path, "a.txt", "feat: A");
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  git(env.path, ["revert", "--no-edit", "HEAD"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.ok(
+    git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
+  );
+});
+
+test("PX3: a merge that discarded its own change (-X theirs) keeps the copy (PLUG-197)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "base\nmine\n");
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "-m", "feat: A edits f.txt"]);
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  // origin moves ahead with a conflicting f.txt; the merge resolves
+  // 100% «theirs», so the tip tree equals origin — but A's content is
+  // on origin nowhere
+  writeFileSync(join(repo, "f.txt"), "base\norigin\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: origin edits f.txt"]);
+  git(repo, ["push", "origin", "main"]);
+  git(env.path, ["fetch", "origin"]);
+  git(env.path, ["merge", "-X", "theirs", "--no-edit", "origin/main"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.ok(
+    git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
+  );
+});
+
+test("PX4: a copy-less bb/ branch with «A + revert A» is not deleted (PLUG-197)", async () => {
+  const { repo, base } = makeRepo();
+  git(repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(repo, "o.txt"), "unpushed\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: A"]);
+  const a = git(repo, ["rev-parse", "HEAD"]);
+  git(repo, ["revert", "--no-edit", "HEAD"]);
+  git(repo, ["checkout", "main"]);
+  // age the branch reflog past abandonedAfter — «брошено», not delete
+  const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+  utimesSync(join(repo, ".git", "logs", "refs", "heads", "bb", "o"), stale, stale);
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-unpushed"], 1);
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/o`;
+  const item = res.reported.find((r) => r.envId === key);
+  assert.ok(item);
+  assert.equal(item.reason, "branch-unpushed");
+  git(repo, ["rev-parse", "--verify", "bb/o"]);
+  assert.ok(
+    git(repo, ["log", "-g", "--format=%H", "refs/heads/bb/o"]).includes(a),
+  );
+});
+
+test("a squash that rewrote an earlier commit keeps the copy — «брошено» when idle (PLUG-197)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "s.txt", "feat: v1");
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  writeFileSync(join(env.path, "s.txt"), "feat: v2\n");
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "-m", "feat: v2 rewrites v1"]);
+  // the squash on origin holds only the final content: the tip merges
+  // clean (влита), but A's own content never reached origin
+  writeFileSync(join(repo, "s.txt"), "feat: v2\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: squashed v2 only"]);
+  git(repo, ["push", "origin", "main"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.ok(
+    git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
+  );
+});
+
+test("PX5: one repo never closes another repo's «брошено» branch row — key is branch:<commonDir>:<name> (PLUG-197)", async () => {
+  const r1 = makeRepo();
+  const r2 = makeRepo();
+  // repo1: abandoned unpushed orphan bb/o (reset-orphan, aged reflog)
+  git(r1.repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(r1.repo, "u.txt"), "unpushed\n");
+  git(r1.repo, ["add", "."]);
+  git(r1.repo, ["commit", "-m", "feat: unpushed"]);
+  git(r1.repo, ["reset", "--hard", "HEAD~1"]);
+  git(r1.repo, ["checkout", "main"]);
+  const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+  utimesSync(
+    join(r1.repo, ".git", "logs", "refs", "heads", "bb", "o"),
+    stale,
+    stale,
+  );
+  const e1 = addEnv(r1.repo, r1.base, "a");
+  const e2 = addEnv(r2.repo, r2.base, "b");
+  const w = makeWorld({
+    envs: [e1, e2], // repo1 first — its row must survive repo2's sweep
+    threads: {
+      [e1.id]: [idle({ t: Date.now() }, e1.id)],
+      [e2.id]: [idle({ t: Date.now() }, e2.id)],
+    },
+  });
+  const res = await w.jan.run();
+  const c1 = git(e1.path, ["rev-parse", "--git-common-dir"]);
+  const key = `branch:${c1}:bb/o`;
+  // old key `branch:bb/o` was closed by repo2's pass (no bb/o there)
+  assert.equal(w.janitor.item(key)!.state, "reported");
+  const item = res.reported.find((r) => r.envId === key);
+  assert.ok(item);
+  assert.equal(item.branch, "bb/o");
+  // a namesake in another repo gets its own row, not a collision
+  const key2 = `branch:${git(e2.path, ["rev-parse", "--git-common-dir"])}:bb/o`;
+  assert.notEqual(key, key2);
+});
+
+test("PX6: an announced abandoned branch survives a fetch-failed run — no repeat message (PLUG-197)", async () => {
+  const { repo, base, origin } = makeRepo();
+  git(repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(repo, "u.txt"), "unpushed\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: unpushed"]);
+  git(repo, ["reset", "--hard", "HEAD~1"]);
+  git(repo, ["checkout", "main"]);
+  const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+  utimesSync(join(repo, ".git", "logs", "refs", "heads", "bb", "o"), stale, stale);
+  const env = addEnv(repo, base, "a");
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: clock.t }, env.id)] },
+    clock,
+  });
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/o`;
+  // attribution for the daily message: the row's thread → delegation
+  w.janitor.upsertItem(key, { threadId: "thr_a", state: "kept" }, clock.t);
+  const d = w.store.insert({
+    taskKey: "PLUG-197",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w.store.setThreadInfo(d.id, "thr_a");
+  w.store.setStatus(d.id, "done");
+  await w.jan.run();
+  assert.equal(w.sent.length, 1);
+  assert.match(w.janitor.meta("announcedAbandoned") ?? "", new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  // fetch down: the repo is not swept — the branch row is unproven
+  // this run and must stay announced
+  git(repo, ["remote", "set-url", "origin", join(base, "gone.git")]);
+  const res2 = await w.jan.run();
+  assert.equal(res2.reported.length, 0);
+  assert.match(w.janitor.meta("announcedAbandoned") ?? "", /bb\/o/);
+  // fetch back, past the daily watermark: reported again, but no
+  // second message — the announcement never dropped
+  git(repo, ["remote", "set-url", "origin", origin]);
+  w.clock.t += 25 * 60 * 60_000;
+  const res3 = await w.jan.run();
+  assert.equal(res3.reported.filter((r) => r.envId === key).length, 1);
+  assert.equal(w.sent.length, 1);
+});
+
+test("a process entering the copy between the snapshot and the archive keeps it (PLUG-197)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  let calls = 0;
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    // run 1 stops at the afterMerge gate before the probe; call 1 —
+    // run-2 snapshot, call 2 — the pre-archive re-check: a process
+    // cd'ed in meanwhile
+    hasProcessIn: async () => ++calls > 1,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.equal(w.janitor.item(env.id)!.reason, "process-inside");
 });
