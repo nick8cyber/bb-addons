@@ -56,6 +56,10 @@ const DEFAULT_START_SECONDS = 600;
 const DEFAULT_IDLE_SECONDS = 1800;
 /** §16.5: the executor's report rides the result message under this cap. */
 const RESULT_OUTPUT_CAP = 3000;
+/** §16.5: BB is the primary outcome channel — its child-* notice gets
+ * this long to reach the coordinator's journal before the plugin checks
+ * the journal and sends its own line. */
+const RESULT_BB_GRACE_MS = 120_000;
 /** §16.5: the coordinator journal's compaction event (SDK `thread/compacted`). */
 const COMPACTION_EVENT_TYPE = "thread/compacted";
 /** §5.1 rev 18: the BB server rejects `events.list` pages over 100. */
@@ -1587,12 +1591,97 @@ export function createWatchdog(deps: WatchdogDeps) {
   };
 
   /**
-   * §16.5: the plugin itself delivers the `done`/`cancelled` result —
-   * ONE message (branch, sha7, copy cleanliness, executor output ≤ 3000
-   * or «без отчёта»). `result_notified_at` is the durable delivery
-   * record; the §7 pass resends until it is set, and a gone coordinator
-   * records the delivery with a NULL `result_notice` so the row never
-   * rescans. Parent notifications only carry BB's own stuck notices.
+   * §16.5: did BB itself report this executor's outcome to the
+   * coordinator? The coordinator's journal is scanned (pages ≤ 100,
+   * §5.1) for a `client/turn/requested` system message that arrived
+   * after the executor's last turn started: `systemMessageKind`
+   * `child-completed`/`child-interrupted` with
+   * `systemMessageSubject.threadId` = the executor's thread, or a
+   * `child-outcome-batch` listing it in `outcomes`. A batch without a
+   * thread list counts only when it arrived after the executor's last
+   * response — an unattributed batch can only stand in for a turn that
+   * already ended. Returns null when the journal could not be read to
+   * its tail: unproven is not "absent".
+   */
+  const coordinatorSawOutcome = async (
+    row: DelegationRow,
+  ): Promise<boolean | null> => {
+    if (!row.thread_id) return false;
+    const since = row.turn_started_at ?? 0;
+    const turnEnd = Math.max(row.last_response_at ?? 0, since);
+    let after = 0;
+    try {
+      for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+        const chunk = await deps.threads.events.list({
+          threadId: row.coordinator_thread_id,
+          afterSeq: String(after),
+          order: "asc",
+          limit: String(EVENT_PAGE_SIZE),
+          types: ["client/turn/requested"],
+        });
+        for (const e of chunk) {
+          if (e.createdAt <= since) continue;
+          const d = e.data as
+            | {
+                systemMessageKind?: unknown;
+                systemMessageSubject?: {
+                  threadId?: unknown;
+                  outcomes?: unknown;
+                } | null;
+              }
+            | null
+            | undefined;
+          const kind = d?.systemMessageKind;
+          const subj = d?.systemMessageSubject;
+          if (
+            (kind === "child-completed" || kind === "child-interrupted") &&
+            subj?.threadId === row.thread_id
+          ) {
+            return true;
+          }
+          if (kind === "child-outcome-batch") {
+            const outcomes = subj?.outcomes;
+            if (Array.isArray(outcomes) && outcomes.length > 0) {
+              if (
+                outcomes.some(
+                  (o) =>
+                    (o as { threadId?: unknown } | null)?.threadId ===
+                    row.thread_id,
+                )
+              ) {
+                return true;
+              }
+            } else if (turnEnd > 0 && e.createdAt > turnEnd) {
+              return true;
+            }
+          }
+        }
+        if (chunk.length < EVENT_PAGE_SIZE) return false;
+        after = Math.max(...chunk.map((e) => e.seq));
+      }
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: coordinator journal ` +
+          `${row.coordinator_thread_id}: ${message(e)}`,
+      );
+      return null;
+    }
+    return null; // page cap — the journal tail was not proven
+  };
+
+  /**
+   * §16.5: BB is the primary outcome channel — `parentNotifications =
+   * auto` (§4 step 4) makes it report the executor's `done`/`cancelled`
+   * to the coordinator itself. RESULT_BB_GRACE_MS after the finished row
+   * is first seen (and at every §7 pass until confirmed) the plugin
+   * checks the coordinator's journal for BB's notice about the
+   * executor's thread; found — `result_notice = bb`, no message.
+   * Absent — the plugin's own ONE line (branch, sha7, copy cleanliness,
+   * executor output ≤ 3000 or «без отчёта»), `result_notice = plugin`.
+   * An empty or doubtful (§4.1) result always gets the plugin line.
+   * `result_notified_at` is the durable delivery record; a gone
+   * coordinator records the delivery with a NULL `result_notice` so the
+   * row never rescans.
    */
   const deliverResult = async (row: DelegationRow) => {
     // §16.2 hedge: a revived thread voids the outcome — check first.
@@ -1605,6 +1694,19 @@ export function createWatchdog(deps: WatchdogDeps) {
       return;
     }
     if (fresh.status !== "done" && fresh.status !== "cancelled") return;
+    // §16.5: the `result-window` marker opens BB's grace window at the
+    // finished row's first sight (it survives restarts; a revive clears
+    // it in store.revive). A `-1` claim skips the window — that row
+    // already waited it out before the send was claimed (or the claim
+    // predates the window).
+    if (fresh.result_notified_at == null) {
+      const win = store.findSetupError(fresh, "result-window");
+      if (!win) {
+        store.addSetupError(fresh.id, "result-window", String(now()));
+        return;
+      }
+      if (now() - Number(win.message) < RESULT_BB_GRACE_MS) return;
+    }
     // §16.5 exactly-once (PLUG-184): the conditional claim below is the
     // atomic gate — event-driven and reconcile paths cannot both send.
     // Anything that bails afterwards releases the claim so the §7 pass
@@ -1642,6 +1744,31 @@ export function createWatchdog(deps: WatchdogDeps) {
       store.setResultNotified(fresh.id, null);
       return;
     }
+    const report = output?.trim() ?? "";
+    // §16.5 one channel: the round's doubts ride the result message.
+    const doubt = store.findSetupError(fresh, "round-problems")?.message;
+    // §16.5: BB's own notice about this thread in the coordinator's
+    // journal satisfies the delivery (`result_notice = bb`) — except an
+    // empty or doubtful result, which the plugin always reports itself.
+    // An unreadable journal is not "absent": the claim is released so
+    // the §7 pass re-checks — a duplicate line is worse than a late one.
+    if (report.length > 0 && !doubt) {
+      const seen = await coordinatorSawOutcome(fresh);
+      if (seen === null) {
+        store.releaseResultClaim(fresh.id);
+        await trackRetry(
+          fresh,
+          "проверка журнала координатора",
+          "events.list failed",
+        );
+        return;
+      }
+      if (seen) {
+        store.setResultNotified(fresh.id, "bb");
+        store.resetRetry(fresh.id);
+        return;
+      }
+    }
     const branch = fresh.result_branch ?? "—";
     const sha7 = fresh.result_sha ? fresh.result_sha.slice(0, 7) : "—";
     const copy =
@@ -1651,11 +1778,9 @@ export function createWatchdog(deps: WatchdogDeps) {
           ? "грязная"
           : "чистая";
     const body =
-      output && output.trim().length > 0
-        ? output.trim().slice(0, RESULT_OUTPUT_CAP)
+      report.length > 0
+        ? report.slice(0, RESULT_OUTPUT_CAP)
         : "исполнитель закончил без отчёта";
-    // §16.5 one channel: the round's doubts ride the result message.
-    const doubt = store.findSetupError(fresh, "round-problems")?.message;
     try {
       await deps.threads.send({
         threadId: coord.id,
@@ -2250,10 +2375,15 @@ export function createWatchdog(deps: WatchdogDeps) {
     // §16.5/PLUG-184: the executor→coordinator binding is verified by
     // `bb thread show --json` — the SDK thread DTO omits
     // `parentNotifications`, so reading the DTO never confirms and the
-    // update re-applied forever. A drifted binding is re-applied (stuck
-    // keeps BB's own stop/error notices flowing to the coordinator) and
-    // the next pass re-reads the show output.
-    if (fresh.thread_id && !hasSetupError(fresh, "attach-verified")) {
+    // update re-applied forever. A drifted binding is re-applied — `auto`
+    // is required so BB itself delivers the executor's outcome notice
+    // (§16.5) — and the next pass re-reads the show output. The marker
+    // records the mode it confirmed: an r24 `confirmed` row re-verifies
+    // once, which also migrates live `stuck` executors to `auto`.
+    if (
+      fresh.thread_id &&
+      store.findSetupError(fresh, "attach-verified")?.message !== "auto"
+    ) {
       let facts:
         | {
             parentThreadId?: string | null;
@@ -2275,9 +2405,9 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (
         facts &&
         facts.parentThreadId === fresh.coordinator_thread_id &&
-        facts.parentNotifications === "stuck"
+        facts.parentNotifications === "auto"
       ) {
-        store.addSetupError(fresh.id, "attach-verified", "confirmed");
+        store.addSetupError(fresh.id, "attach-verified", "auto");
       } else {
         let err: string | null = readErr;
         try {
@@ -2295,7 +2425,7 @@ export function createWatchdog(deps: WatchdogDeps) {
             "update",
             fresh.thread_id,
             "--parent-notifications",
-            "stuck",
+            "auto",
           ]);
         } catch (e) {
           err = `${err ? `${err}; ` : ""}parent-notifications: ${message(e)}`;

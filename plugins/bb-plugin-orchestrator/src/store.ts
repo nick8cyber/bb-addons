@@ -593,6 +593,21 @@ export class DelegationStore {
            WHERE id = ?`,
         )
         .run(Date.now(), id);
+      // §16.5: the next `done` re-opens BB's grace window — a stale
+      // `result-window` marker would skip it and send over BB's notice.
+      try {
+        const errors = (
+          JSON.parse(row.setup_errors) as { step?: string }[]
+        ).filter((e) => e?.step !== "result-window");
+        this.db
+          .prepare(
+            `UPDATE delegations SET setup_errors = ? WHERE id = ?`,
+          )
+          .run(JSON.stringify(errors), id);
+      } catch {
+        // A corrupt setup_errors stays as is — the window gate tolerates
+        // a stale marker (its timestamp is old, i.e. already elapsed).
+      }
       return true;
     })();
   }

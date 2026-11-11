@@ -141,7 +141,7 @@ test("happy path: record → dispatch → attach → bypass → running → comm
 
   const cmds = calls.map((c) => c.args.join(" "));
   assert.ok(cmds.some((c) => c === "tasks dispatch PLUG-1 --preset simple --json"));
-  assert.ok(cmds.some((c) => c === "thread update thr_exec --parent-notifications stuck"));
+  assert.ok(cmds.some((c) => c === "thread update thr_exec --parent-notifications auto"));
   assert.ok(cmds.some((c) => c === "thread options thr_exec --json"));
   assert.ok(cmds.some((c) => c === "thread options thr_exec --set mode=bypass"));
   assert.ok(
