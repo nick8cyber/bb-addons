@@ -187,13 +187,12 @@ function makeWorld(opts: {
   cmd?: CmdRunner;
   /** Invoked on every `thread list` call (1-based) — lets a test change
    * thread or repo state between the run-start snapshot and the
-   * pre-archive re-read (§15 «Действие», PLUG-188). */
-  onThreadListCall?: (call: number) => void;
+   * pre-archive re-read (§15 «Действие», PLUG-188). The paged SDK
+   * variant also passes its page args, so a mutation can be armed
+   * mid-pass (PLUG-213). */
+  onThreadListCall?: (call: number, page?: { offset?: number }) => void;
   /** Set false to drop the paged SDK seam → CLI `thread list` fallback. */
   sdkList?: boolean;
-  /** Set false to keep the paged list but drop the count seam — the
-   * verified paged path needs both, so the CLI fallback covers it. */
-  sdkCount?: boolean;
 }) {
   const clock = opts.clock ?? { t: Date.now() };
   const db = new Database(":memory:");
@@ -216,11 +215,6 @@ function makeWorld(opts: {
     archived?: boolean;
     limit?: number;
     offset?: number;
-  }[] = [];
-  let sdkCountCalls = 0;
-  const sdkCountArgs: {
-    includeArchived?: boolean;
-    includeHidden?: boolean;
   }[] = [];
   const allThreads = () => {
     const all = Object.entries(threads).flatMap(([envId, list]) =>
@@ -310,7 +304,7 @@ function makeWorld(opts: {
             }) => {
               sdkListCalls += 1;
               threadListCalls += 1;
-              opts.onThreadListCall?.(threadListCalls);
+              opts.onThreadListCall?.(threadListCalls, a);
               sdkListArgs.push(a);
               const offset = a.offset ?? 0;
               return allThreads().slice(
@@ -318,18 +312,6 @@ function makeWorld(opts: {
                 a.limit === undefined ? undefined : offset + a.limit,
               );
             },
-            ...(opts.sdkCount === false
-              ? {}
-              : {
-                  count: async (a: {
-                    includeArchived?: boolean;
-                    includeHidden?: boolean;
-                  }) => {
-                    sdkCountCalls += 1;
-                    sdkCountArgs.push(a);
-                    return { total: allThreads().length };
-                  },
-                }),
           }),
     },
     loadConfig: () => parseJanitorConfig(opts.config ?? CFG()),
@@ -352,12 +334,8 @@ function makeWorld(opts: {
     sent,
     warns,
     sdkListArgs,
-    sdkCountArgs,
     get sdkListCalls() {
       return sdkListCalls;
-    },
-    get sdkCountCalls() {
-      return sdkCountCalls;
     },
     get cliThreadListCalls() {
       return cliThreadListCalls;
@@ -923,8 +901,11 @@ test("a rolled-back cascade member leaves archivedNow — its env is not «remov
     threads: { [envA.id]: [root] },
     archiveFailFor: new Set(["thr_a"]),
     clock,
+    // calls 5-6 are run 2's pre-archive re-read (each sweep is two
+    // paged passes since PLUG-213 — run 1: 1-2, run 2: 3-4 start,
+    // 5-6 re-read)
     onThreadListCall: (n) => {
-      if (n >= 3) w.threadSpecs[envB.id] = [late];
+      if (n >= 5) w.threadSpecs[envB.id] = [late];
     },
   });
   await w.jan.run();
@@ -2333,7 +2314,7 @@ test("a thread that comes alive between the snapshot and the archive re-check ke
     threads: { [env.id]: [t1] },
     clock,
     onThreadListCall: (n) => {
-      if (n >= 2) t1.status = "active";
+      if (n >= 5) t1.status = "active";
     },
   });
   await w.jan.run();
@@ -2354,7 +2335,8 @@ test("a copy dirtied between the snapshot and the archive re-check is kept (PLUG
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
     onThreadListCall: (n) => {
       // dirtied after the run-start git status, before the archive
-      if (n >= 2) writeFileSync(join(env.path, "late.txt"), "x\n");
+      // (calls 5-6 are the pre-archive re-read, PLUG-213 numbering)
+      if (n >= 5) writeFileSync(join(env.path, "late.txt"), "x\n");
     },
   });
   await w.jan.run();
@@ -2393,7 +2375,7 @@ test("a cascade member spawned between the snapshot and the re-read is checked a
     threads: { [env.id]: [root] },
     clock,
     onThreadListCall: (n) => {
-      if (n >= 2) w.threadSpecs[env.id] = [root, kid];
+      if (n >= 5) w.threadSpecs[env.id] = [root, kid];
     },
   });
   await w.jan.run();
@@ -2641,10 +2623,11 @@ test("a copy whose HEAD moved between the snapshot and the archive is kept — h
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
     onThreadListCall: (n) => {
       // a commit lands after the run-start HEAD snapshot, on the
-      // pre-archive re-read (list calls are cumulative across runs:
-      // run 1 → #1, run 2 → #2 initial + #3 fresh) — the archive must
-      // be cancelled
-      if (n >= 3 && !existsSync(join(env.path, "late.txt"))) {
+      // pre-archive re-read (list calls are cumulative across runs;
+      // each sweep is two paged passes since PLUG-213: run 1 → #1-2,
+      // run 2 → #3-4 start, #5-6 re-read) — the archive must be
+      // cancelled
+      if (n >= 5 && !existsSync(join(env.path, "late.txt"))) {
         commitIn(env.path, "late.txt", "feat: late");
       }
     },
@@ -2686,9 +2669,10 @@ test("an env thread created mid-run outside the cascade keeps the copy — fresh
     threads: { [env.id]: [root] },
     clock,
     onThreadListCall: (n) => {
-      // call #3 is run 2's pre-archive re-read — `late` is invisible
-      // to the run-start snapshot and appears only in the fresh graph
-      if (n >= 3) w.threadSpecs[env.id] = [root, late];
+      // calls 5-6 are run 2's pre-archive re-read (two paged passes
+      // per sweep, PLUG-213) — `late` is invisible to the run-start
+      // snapshot and appears only in the fresh graph
+      if (n >= 5) w.threadSpecs[env.id] = [root, late];
     },
   });
   await w.jan.run();
@@ -2827,11 +2811,12 @@ test("PROBE3: a commit + reset between the snapshot and the archive keeps the co
     envs: [env],
     threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
     onThreadListCall: (n) => {
-      // call #2 is the pre-archive re-read: a process commits and
-      // resets right before the archive — HEAD is unchanged and the
-      // tree stays clean, but the reflog now holds an unpublished
-      // commit that would die with the copy
-      if (n === 2) {
+      // call #5 is run 2's pre-archive re-read (two paged passes per
+      // sweep, PLUG-213): a process commits and resets right before
+      // the archive — HEAD is unchanged and the tree stays clean, but
+      // the reflog now holds an unpublished commit that would die
+      // with the copy
+      if (n === 5) {
         commitIn(env.path, "late.txt", "wip: late unpushed");
         git(env.path, ["reset", "--hard", "HEAD~1"]);
       }
@@ -3505,6 +3490,14 @@ test("a branch moved between the check and the delete is not deleted — update-
   assert.equal(res.removedBranches, 0);
   assert.equal(res.kept["branch-delete-failed"], 1);
   assert.equal(git(repo, ["rev-parse", "bb/o"]), moved);
+  // PLUG-213 (ревью №2): the refused `update-ref -d` left the branch
+  // alive — the journal row must not claim `removed` until a later
+  // run actually deletes it
+  const key = `branch:${git(env.path, ["rev-parse", "--git-common-dir"])}:bb/o`;
+  const row = w.janitor.item(key);
+  assert.equal(row?.state, "kept");
+  assert.equal(row?.reason, "branch-delete-failed");
+  assert.equal(row?.removed_at, null);
 });
 
 // ── PLUG-201 ─────────────────────────────────────────────────────────
@@ -4498,11 +4491,13 @@ test("git below 2.39 refuses the whole run with a hint (§17.4 мелко 11)", 
   assert.match(row!.error ?? "", /2\.39/);
 });
 
-// ── PLUG-212 (§17.4 ревью) ───────────────────────────────────────────
+// ── PLUG-212/213 (§17.4 ревью) ───────────────────────────────────────
 
 // Ревью №1 [блокер]: offset paging can silently lose a thread — a
 // deletion or (un)pin on an already-read page shifts later rows up.
-// The count bracket + id dedup detects it: an unstable set retries
+// The list is read twice and the deduplicated id sets compared
+// (PLUG-213 — the count bracket was dropped: the SDK wrapper loses
+// includeArchived/includeHidden). An unstable set retries the pair
 // once, then the list is unproven — threads-unknown, never a hole.
 test("a thread deleted between pages → threads-unknown, not a silent hole (PLUG-212)", async () => {
   const { repo, base } = makeRepo();
@@ -4534,18 +4529,20 @@ test("a thread deleted between pages → threads-unknown, not a silent hole (PLU
   assert.equal(res.kept["threads-unknown"], 1);
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  // the verification ran — count bracketed the traversal
-  assert.ok(w.sdkCountCalls > 0);
+  // the pair of passes ran exactly twice per run (one retry) and the
+  // journal explains the refusal — the differing sets are logged
+  assert.equal(w.sdkListCalls, 16);
   assert.ok(
-    w.sdkCountArgs.every(
-      (a) => a.includeArchived === true && a.includeHidden === true,
+    w.warns.some(
+      (m) => /thread list unproven/.test(m) && /pass sets differ/.test(m),
     ),
+    `warns: ${w.warns.join(" | ")}`,
   );
 });
 
 // Same review, positive side: a thread that moved to a LATER page
-// (unpin) is read twice — dedup by id keeps the list complete and the
-// count check still passes.
+// (unpin) is read twice — dedup inside the pass keeps both id sets
+// equal, so the verified list still stands.
 test("a thread shifting to a later page is deduplicated — the verified list still counts (PLUG-212)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
@@ -4564,7 +4561,7 @@ test("a thread shifting to a later page is deduplicated — the verified list st
     extraThreads: extras,
     clock: { t },
     // mid-traversal the first row moves to the tail — it appears on
-    // two pages; dedup keeps the unique set equal to the count
+    // two pages; dedup keeps both pass sets identical
     onThreadListCall: (call) => {
       if (call === 2) extras.push(extras.shift()!);
     },
@@ -4576,24 +4573,102 @@ test("a thread shifting to a later page is deduplicated — the verified list st
   assert.equal(res.removedCopies, 1);
 });
 
-// The verified path needs BOTH seams — `threads.list` without
-// `threads.count` cannot be trusted; the atomic CLI dump covers it.
-test("threads.list without threads.count falls back to the atomic CLI list (PLUG-212)", async () => {
+// PLUG-213 [блокер]: the SDK `threads.count` wrapper drops
+// includeArchived/includeHidden — live it counted 504 rows where the
+// paged list saw 2400, so a count bracket would fail every sweep.
+// The janitor never consults it: a count mock behaving exactly like
+// the live SDK (visible-live only, flags ignored) must not steer or
+// break the paged list.
+test("a live-SDK count that drops archived/hidden is never consulted — the paged list stands (PLUG-213)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
   mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = [
+    { id: "thr_arch", status: "idle", archivedAt: t - 1000, updatedAt: t },
+    {
+      id: "thr_hid",
+      status: "idle",
+      archivedAt: null,
+      updatedAt: t,
+      visibility: "hidden",
+    },
+  ];
   const w = makeWorld({
     envs: [env],
-    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
-    sdkCount: false,
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+  });
+  // live-SDK semantics: archived and hidden rows are never counted,
+  // whatever the flags — the number can never match the paged total
+  let countCalls = 0;
+  (
+    w.deps.threads as { count?: () => Promise<unknown> }
+  ).count = async () => {
+    countCalls += 1;
+    return { total: 1 };
+  };
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(countCalls, 0);
+  assert.equal(res.kept["threads-unknown"] ?? 0, 0);
+  assert.equal(res.removedCopies, 1);
+});
+
+// PLUG-213 (ревью №3): the one combination a count bracket could never
+// see — a thread deleted on an ALREADY-read page (rows shift up, the
+// next row is skipped) while another is created on a still-unread
+// page. Two back-to-back passes catch the changed set; instability
+// through the retried pair → threads-unknown, never a silent hole.
+test("deleted on a read page + created on an unread page → threads-unknown (PLUG-213)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const t = Date.now();
+  const extras: ThreadSpec[] = Array.from({ length: 250 }, (_, i) => ({
+    id: `thr_x${i}`,
+    status: "idle",
+    archivedAt: null,
+    updatedAt: t,
+  }));
+  let created = 0;
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t }, env.id)] },
+    extraThreads: extras,
+    clock: { t },
+    // every later-page fetch: a row of the already-read first page is
+    // deleted (the set shifts, the next row is skipped) and a fresh
+    // thread lands on the still-unread tail — pass sets never match
+    onThreadListCall: (_call, page) => {
+      if ((page?.offset ?? 0) === 0) return;
+      extras.shift();
+      created += 1;
+      extras.push({
+        id: `thr_new${created}`,
+        status: "idle",
+        archivedAt: null,
+        updatedAt: t,
+      });
+    },
   });
   await w.jan.run();
   w.clock.t += 16 * 60_000;
   const res = await w.jan.run();
-  assert.equal(w.sdkCountCalls, 0);
-  assert.equal(w.cliThreadListCalls > 0, true);
-  assert.equal(res.removedCopies, 1);
+  assert.equal(res.kept["threads-unknown"], 1);
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  // the journal explains why — set sizes and the differing ids
+  assert.ok(
+    w.warns.some(
+      (m) => /thread list unproven/.test(m) && /only-in-/.test(m),
+    ),
+    `warns: ${w.warns.join(" | ")}`,
+  );
 });
 
 // Ревью №2: `janitor report` lists rows of the LAST run — a row not
@@ -4717,10 +4792,11 @@ test("apply leaves a copy held by live threads — not «готова» (PLUG-21
     threads: { [envA.id]: [rootT], [envB.id]: [] },
     archiveFailFor: new Set(["thr_p"]),
     clock: { t },
-    // run1: call1. run2: call2 = run-start sweep, call3 = the
-    // pre-archive re-read inside evalCascade — the spawn lands there
+    // run1: calls 1-2. run2: calls 3-4 = run-start sweep, calls 5-6 =
+    // the pre-archive re-read inside evalCascade (two paged passes
+    // per sweep, PLUG-213) — the spawn lands there
     onThreadListCall: (call) => {
-      if (call === 3 && !injected) {
+      if (call === 5 && !injected) {
         injected = true;
         w.threadSpecs[envB.id]!.push(spawn);
       }

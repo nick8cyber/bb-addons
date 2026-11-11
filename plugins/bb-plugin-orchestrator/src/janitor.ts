@@ -152,20 +152,6 @@ export interface JanitorThreads {
     limit?: number;
     offset?: number;
   }): Promise<unknown>;
-  /**
-   * §17.4 (PLUG-212): `threads.count` with the list's own coverage —
-   * every non-deleted thread, archived and hidden included. It
-   * brackets the paged traversal: offset paging can silently lose a
-   * row when the sorted set shifts under it (a deletion or a
-   * pin/unpin on an already-read page), so the janitor compares the
-   * count before/after and the unique ids collected — a mismatch
-   * means the list is unproven (`threads-unknown`), not «тредов
-   * нет». Absent on older wiring → the CLI list is the fallback.
-   */
-  count?(args: {
-    includeArchived?: boolean;
-    includeHidden?: boolean;
-  }): Promise<unknown>;
 }
 
 export interface JanitorDeps {
@@ -416,39 +402,20 @@ export function createJanitor(deps: JanitorDeps) {
    */
   const THREADS_PAGE = 200;
   const listThreads = async (): Promise<ThreadDto[] | null> => {
-    // §17.4 (PLUG-212): the verified paged path needs BOTH SDK seams.
-    // Offset paging races the server's ordering (`projectId ASC`,
-    // pinned first, `createdAt DESC`, `id DESC`): deleting or
-    // (un)pinning a thread on an already-read page shifts later rows
-    // up and one is never read — a full-looking list with a hole in
-    // it. `threads.count` (same coverage: every non-deleted thread)
-    // brackets the traversal and the ids are deduplicated, so a
-    // shift or a hole is detected; one retry, then «список не
-    // доказан» (threads-unknown). Without either seam the atomic
-    // one-shot CLI list is the fallback.
-    if (deps.threads.list && deps.threads.count) {
-      const countThreads = async (): Promise<number | null> => {
-        try {
-          const res = await deps.threads.count!({
-            includeArchived: true,
-            includeHidden: true,
-          });
-          const total =
-            typeof res === "number"
-              ? res
-              : (res as { total?: unknown } | null)?.total;
-          return typeof total === "number" &&
-            Number.isFinite(total) &&
-            total >= 0
-            ? total
-            : null;
-        } catch {
-          return null;
-        }
-      };
-      const sweep = async (): Promise<ThreadDto[] | null> => {
-        const before = await countThreads();
-        if (before === null) return null;
+    // §17.4 (PLUG-213): offset paging races the server's ordering
+    // (`projectId ASC`, pinned first, `createdAt DESC`, `id DESC`):
+    // deleting or (un)pinning a thread on an already-read page shifts
+    // later rows up and one is never read — a full-looking list with a
+    // hole in it. `threads.count` cannot bracket the traversal: the
+    // SDK wrapper drops `includeArchived`/`includeHidden` (live
+    // measure 504 counted vs 2400 paged rows), so the whole list is
+    // read TWICE and the deduplicated id sets compared. Different
+    // sets → the pair is repeated once; still different → «список не
+    // доказан» (threads-unknown) with the sizes and the differing ids
+    // in the plugin journal. Without the seam the atomic one-shot CLI
+    // list is the fallback.
+    if (deps.threads.list) {
+      const pass = async (): Promise<Map<string, ThreadDto> | null> => {
         const byId = new Map<string, ThreadDto>();
         for (let offset = 0; ; offset += THREADS_PAGE) {
           const page = await deps.threads.list!({
@@ -464,22 +431,45 @@ export function createJanitor(deps: JanitorDeps) {
           }
           if (page.length < THREADS_PAGE) break;
         }
-        const after = await countThreads();
-        // The set moved under the traversal, or the unique ids do not
-        // cover every counted thread — the collected list has a hole.
-        if (after === null || after !== before || byId.size !== after) {
-          return null;
-        }
-        return [...byId.values()];
+        return byId;
       };
+      const sample = (ids: string[]) =>
+        ids.slice(0, 10).join(",") +
+        (ids.length > 10 ? ` +${ids.length - 10} more` : "");
+      let lastIssue = "no pass completed";
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const out = await sweep();
-          if (out !== null) return out;
-        } catch {
-          // a page call threw — the retry may still succeed
+          const first = await pass();
+          if (first === null) {
+            lastIssue = "a page was not an array";
+            continue;
+          }
+          const second = await pass();
+          if (second === null) {
+            lastIssue = "a page was not an array";
+            continue;
+          }
+          const onlyFirst = [...first.keys()].filter(
+            (id) => !second.has(id),
+          );
+          const onlySecond = [...second.keys()].filter(
+            (id) => !first.has(id),
+          );
+          if (onlyFirst.length === 0 && onlySecond.length === 0) {
+            return [...second.values()];
+          }
+          lastIssue =
+            `pass sets differ (${first.size} vs ${second.size} ids; ` +
+            `only-in-first: ${sample(onlyFirst) || "none"}; ` +
+            `only-in-second: ${sample(onlySecond) || "none"})`;
+        } catch (e) {
+          // a page call threw — the retry pair may still succeed
+          lastIssue = `a page call failed: ${message(e)}`;
         }
       }
+      deps.log?.warn?.(
+        `orchestrator janitor: thread list unproven — ${lastIssue}`,
+      );
       return null;
     }
     try {
@@ -2682,6 +2672,7 @@ export function createJanitor(deps: JanitorDeps) {
           });
         }
         if (!cfg.deleteBranches) keep(summary, "branch-kept-config");
+        let deleted = false;
         if (willDelete) {
           // §15/§16.3 (PLUG-199): delete atomically against the tip the
           // checks above verified — `branch -D` removes whatever the
@@ -2696,6 +2687,7 @@ export function createJanitor(deps: JanitorDeps) {
             ])
           ) {
             summary.removedBranches += 1;
+            deleted = true;
           } else {
             keep(summary, "branch-delete-failed");
           }
@@ -2704,7 +2696,9 @@ export function createJanitor(deps: JanitorDeps) {
         // for it closes either way. §17.4 (С9): the row is written in
         // report mode too — `janitor report` lists it as «готова к
         // удалению» (`merged-ready`) only when `deleteBranches` is on;
-        // otherwise `branch-kept-config` (PLUG-212).
+        // otherwise `branch-kept-config` (PLUG-212). A refused
+        // `update-ref -d` leaves the branch alive — the row is `kept`
+        // with `branch-delete-failed`, never `removed` (PLUG-213).
         if (ledger) {
           deps.janitor.upsertItem(
             envId,
@@ -2712,13 +2706,15 @@ export function createJanitor(deps: JanitorDeps) {
               projectId: branchOwner?.project_id ?? null,
               threadId: branchOwner?.thread_id ?? null,
               branch,
-              state: willDelete ? "removed" : "kept",
-              reason: willDelete
+              state: deleted ? "removed" : "kept",
+              reason: deleted
                 ? "removed"
-                : cfg.deleteBranches
-                  ? "merged-ready"
-                  : "branch-kept-config",
-              removedAt: willDelete ? at : null,
+                : willDelete
+                  ? "branch-delete-failed"
+                  : cfg.deleteBranches
+                    ? "merged-ready"
+                    : "branch-kept-config",
+              removedAt: deleted ? at : null,
             },
             at,
           );

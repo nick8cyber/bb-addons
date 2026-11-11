@@ -773,18 +773,10 @@ export async function createPlugin(
     threads: {
       send: (a) => bb.sdk.threads.send(a as never) as never,
       // §17.4 (С7): paged SDK list — the one-shot CLI dump overflowed
-      // its buffer at ~5700 threads.
-      list: (a) => bb.sdk.threads.list(a as never) as never,
-      // §17.4 (PLUG-212): count() brackets the paged traversal — a
-      // shifted page can silently lose a thread. Only wired when the
-      // SDK exposes it; otherwise the janitor falls back to the
-      // atomic one-shot CLI list.
-      ...(bb.sdk.threads.count
-        ? {
-            count: (a: never) =>
-              bb.sdk.threads.count(a as never) as never,
-          }
-        : {}),
+      // its buffer at ~5700 threads. No `count`: the SDK wrapper drops
+      // includeArchived/includeHidden, so the janitor proves the list
+      // by reading it twice and comparing id sets (PLUG-213).
+      list: (a) => bb.sdk.threads.list(a) as Promise<unknown>,
     },
     loadConfig: janitorConfig,
     localHostId: async () => {
