@@ -523,6 +523,7 @@ export async function createPlugin(
     instructions?: string;
     from?: string;
     fresh?: boolean;
+    noCode?: boolean;
     threadId?: string;
   }) =>
     enqueue(async () => {
@@ -1006,6 +1007,10 @@ export async function createPlugin(
         .boolean()
         .optional()
         .describe("Start the round without continuing the previous result (§6 --fresh)"),
+      noCode: z
+        .boolean()
+        .optional()
+        .describe("Mark the delegation «задача без кода» (§4.1 r28): the executor must not commit, the watchdog does not expect commits"),
     }),
     async execute(params, ctx) {
       try {
@@ -1246,6 +1251,7 @@ export async function createPlugin(
   };
   const renderDelegation = (d: DelegationRow) =>
     `#${d.id} ${d.task_key} level=${d.level} route=${d.route} status=${d.status}` +
+    `${d.no_code ? " no-code" : ""}` +
     `${d.thread_id ? ` thread=${d.thread_id}` : ""} ` +
     `coordinator=${d.coordinator_thread_id}` +
     (d.setup_errors !== "[]" ? renderSetupErrors(d.setup_errors) : "");
@@ -1259,7 +1265,7 @@ export async function createPlugin(
         name: "delegate",
         summary: "Dispatch a task to an executor under the policy",
         usage:
-          "bb orchestrator delegate <KEY> --level <level> [--route <route>|--preset <preset>] [--instructions <text>] [--from <sha|branch>] [--fresh] [--json]",
+          "bb orchestrator delegate <KEY> --level <level> [--route <route>|--preset <preset>] [--instructions <text>] [--from <sha|branch>] [--fresh] [--no-code] [--json]",
       },
       {
         name: "status",
@@ -1339,7 +1345,7 @@ export async function createPlugin(
           if (!taskKey || !level) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>|--preset <p>] [--instructions <t>] [--from <sha|branch>] [--fresh]",
+              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>|--preset <p>] [--instructions <t>] [--from <sha|branch>] [--fresh] [--no-code]",
             );
           }
           const res = await delegate({
@@ -1350,6 +1356,7 @@ export async function createPlugin(
             instructions: flag("--instructions"),
             from: flag("--from"),
             fresh: argv.includes("--fresh"),
+            noCode: argv.includes("--no-code"),
             threadId: ctx.threadId,
           });
           return json

@@ -184,6 +184,10 @@ export const MIGRATIONS: readonly string[] = [
   // определённый один раз на шаге 1 — шаги 6–7 и повторные заходы той же
   // выкладки берут его из записи и заново не ищут.
   `ALTER TABLE releases ADD COLUMN settings_project_id TEXT`,
+  // §4.1 r28 (PLUG-237): «задача без кода» — делегирование, не требующее
+  // коммитов. Наследуется перевыпуском (§5.4); новый delegate без флага
+  // — снова обычная раздача.
+  `ALTER TABLE delegations ADD COLUMN no_code INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -237,6 +241,8 @@ export interface DelegationRow {
   result_notice: string | null;
   revived_count: number;
   last_response_at: number | null;
+  /** §4.1 r28: «задача без кода» — коммитов не ждём, коммиты — находка. */
+  no_code: number;
   created_at: number;
   updated_at: number;
 }
@@ -326,6 +332,8 @@ export class DelegationStore {
     continueFrom?: string | null;
     /** §2.3: set when the dispatch named an explicit `--route`/`--preset`. */
     explicitRoute?: boolean;
+    /** §4.1 r28: «задача без кода» (`delegate --no-code`). */
+    noCode?: boolean;
   }): DelegationRow {
     const now = Date.now();
     const info = this.db
@@ -333,8 +341,8 @@ export class DelegationStore {
         `INSERT INTO delegations (
           task_key, task_id, project_id, coordinator_thread_id, level, route,
           preset, provider, status, round, continue_from, explicit_route,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?)`,
+          no_code, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         normalizeTaskKey(input.taskKey),
@@ -348,6 +356,7 @@ export class DelegationStore {
         input.round ?? 1,
         input.continueFrom ?? null,
         input.explicitRoute ? 1 : 0,
+        input.noCode ? 1 : 0,
         now,
         now,
       );
@@ -971,8 +980,8 @@ export class DelegationStore {
           `INSERT INTO delegations (
             task_key, task_id, project_id, coordinator_thread_id, level,
             route, preset, provider, status, reissue_of, round, continue_from,
-            explicit_route, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?)`,
+            explicit_route, no_code, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.task_key,
@@ -990,6 +999,9 @@ export class DelegationStore {
           // restarting the chain and skipping every used route — the
           // flag must reach each reissue, not just the first one.
           row.explicit_route,
+          // §4.1 r28: a reissue is the same dispatch — the «без кода»
+          // mark inherits with the round fields.
+          row.no_code,
           now,
           now,
         );

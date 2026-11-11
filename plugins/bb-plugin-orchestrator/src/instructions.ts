@@ -198,16 +198,25 @@ export function reviewRoundLine(
 }
 
 /**
+ * §4.1 r28: the `--no-code` dispatch's own line — the executor must not
+ * touch the copy, the report IS the result.
+ */
+export const NO_CODE_LINE =
+  "задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт";
+
+/**
  * §2.2: the git-rules text becomes the first section of `--instructions`,
  * then the «Заход N» section when the dispatch continues a previous round,
- * then this call's extra instructions; an empty or over-limit value adds
- * no section (an over-limit value is also flagged needs-configuration so it
- * is never silently dropped). No text at all — no `--instructions` flag.
+ * then the §4.1 r28 «задача без кода» line for a `no_code` row, then this
+ * call's extra instructions; an empty or over-limit value adds no section
+ * (an over-limit value is also flagged needs-configuration so it is never
+ * silently dropped). No text at all — no `--instructions` flag.
  */
 export function mergeDispatchInstructions(
   gitInstructions: string | undefined,
   extra: string | undefined,
   round?: string | undefined,
+  noCode?: boolean,
 ): string | undefined {
   const git =
     gitInstructionsError(gitInstructions) === null
@@ -218,6 +227,7 @@ export function mergeDispatchInstructions(
   const parts = [
     ...(git ? [git] : []),
     ...(r ? [r] : []),
+    ...(noCode ? [NO_CODE_LINE] : []),
     ...(x ? [x] : []),
   ];
   return parts.length ? parts.join("\n\n") : undefined;
