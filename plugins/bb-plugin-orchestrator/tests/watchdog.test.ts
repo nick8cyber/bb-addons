@@ -3688,14 +3688,17 @@ test("§16.5: an r24 'confirmed' binding re-verifies — live stuck migrates to 
 
 test("PLUG-184 B1: an old base's migration marks legacy results; first reconcile sends nothing", async () => {
   const db = new Database(":memory:");
-  for (const m of MIGRATIONS.slice(0, -1)) db.exec(m); // pre-rollout schema
+  // the rollout UPDATE is found by content — later migrations (janitor
+  // tables) may sit behind it in the list
+  const rollout = MIGRATIONS.findIndex((m) => m.includes("'legacy'"));
+  for (const m of MIGRATIONS.slice(0, rollout)) db.exec(m); // pre-rollout schema
   db.prepare(
     `INSERT INTO delegations (task_key, coordinator_thread_id, thread_id,
        level, route, preset, provider, status, created_at, updated_at)
      VALUES ('PLUG-OLD','thr_coord','thr_old','simple','simple','simple',
        'acp-opencode','done',?,?)`,
   ).run(T0 - 10_000, T0 - 9_000);
-  db.exec(MIGRATIONS.at(-1)!); // the rollout UPDATE
+  for (const m of MIGRATIONS.slice(rollout)) db.exec(m); // UPDATE + later
   const stored = db
     .prepare(`SELECT result_notified_at, result_notice FROM delegations`)
     .get() as { result_notified_at: number | null; result_notice: string };
