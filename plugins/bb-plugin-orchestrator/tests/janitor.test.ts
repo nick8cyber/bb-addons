@@ -1244,12 +1244,13 @@ test("cascade: a child's pending interaction blocks the parent", async () => {
   );
 });
 
-test("squash-equivalent branch is «влита» via the content sign (§16.3)", async () => {
+test("squash-equivalent branch is «влита» via patch-id (§16.3)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w.txt", "feat: work");
   // squash-merge on main: same diff, a different sha — bb/a is not an
-  // ancestor of origin/main, but merging it adds nothing (same tree)
+  // ancestor of origin/main, but its single commit is patch-identical
+  // to the squash commit (`git cherry` «-»)
   writeFileSync(join(repo, "w.txt"), "feat: work\n");
   git(repo, ["add", "."]);
   git(repo, ["commit", "-m", "feat: work (squashed)"]);
@@ -1265,9 +1266,10 @@ test("squash-equivalent branch is «влита» via the content sign (§16.3)",
   assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
 
-test("orphan bb/ branch merged only by content is swept", async () => {
+test("orphan bb/ branch merged only by patch is swept", async () => {
   const { repo, base } = makeRepo();
-  // a squash-merged bb/ branch, checked out nowhere
+  // a squash-merged bb/ branch, checked out nowhere — one commit, so
+  // patch-id equivalence with the squash commit makes it «влита»
   git(repo, ["checkout", "-b", "bb/squashed"]);
   writeFileSync(join(repo, "s.txt"), "feat: squash\n");
   git(repo, ["add", "."]);
@@ -2609,14 +2611,15 @@ test("a branch-unpushed orphan idle over abandonedAfter is reported (PLUG-195)",
   assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/o"]));
 });
 
-test("PROBE2: a squash of two or more commits is «влита» by the content sign (PLUG-195)", async () => {
+test("U2: a squash of two or more commits stays — reported «похоже, влито squash» (PLUG-201)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w1.txt", "feat: part 1");
   commitIn(env.path, "w2.txt", "feat: part 2");
   // a single squash commit on main holds both changes — no commit of
-  // bb/a is patch-equivalent (`git cherry` would say «+»), yet merging
-  // bb/a into main adds nothing
+  // bb/a is patch-equivalent (`git cherry` says «+»), so the copy is
+  // never «влита»; merging it adds nothing, which earns the manual
+  // flag in the report — removal is off the table (PLUG-201)
   writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
   writeFileSync(join(repo, "w2.txt"), "feat: part 2\n");
   git(repo, ["add", "."]);
@@ -2629,8 +2632,14 @@ test("PROBE2: a squash of two or more commits is «влита» by the content s
   await w.jan.run();
   w.clock.t += 16 * 60_000;
   const res = await w.jan.run();
-  assert.equal(res.removedCopies, 1);
-  assert.equal(w.janitor.item(env.id)!.state, "removed");
+  assert.equal(res.removedCopies, 0);
+  assert.deepEqual(w.archivedCalls, []);
+  assert.ok(existsSync(env.path));
+  const item = res.reported.find((r) => r.envId === env.id);
+  assert.ok(item);
+  assert.equal(item.reason, "squash-suspect");
+  assert.equal(w.janitor.item(env.id)!.state, "reported");
+  git(repo, ["rev-parse", "--verify", env.branchName]);
 });
 
 test("PROBE3: a commit + reset between the snapshot and the archive keeps the copy (PLUG-195)", async () => {
@@ -2687,8 +2696,10 @@ test("PX1: a commit + its revert nets to origin — the commit itself never reac
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "a.txt", "feat: A");
   const a = git(env.path, ["rev-parse", "HEAD"]);
-  // «A + revert A» leaves the tip tree equal to origin — the old
-  // anchor-content check cleared A anyway and the copy was deleted
+  // «A + revert A» leaves the tip tree equal to origin — the tip
+  // merges as a no-op, so the copy gets the «похоже, влито squash»
+  // report flag, but A's content never reached origin and the copy
+  // is never deleted (PLUG-201)
   git(env.path, ["revert", "--no-edit", "HEAD"]);
   const clock = { t: Date.now() };
   const w = makeWorld({
@@ -2712,7 +2723,7 @@ test("PX1: a commit + its revert nets to origin — the commit itself never reac
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
   assert.equal(res.reported.length, 1);
-  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
   // A survives only in the copy's reflogs — it must be found there
   assert.ok(
     git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
@@ -2749,7 +2760,7 @@ test("PX2: the same on a detached HEAD — the branch has no own commits, the id
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
   assert.ok(
     git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
   );
@@ -2792,7 +2803,7 @@ test("PX3: a merge that discarded its own change (-X theirs) keeps the copy (PLU
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
   assert.ok(
     git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
   );
@@ -2837,7 +2848,8 @@ test("a squash that rewrote an earlier commit keeps the copy — «брошен�
   git(env.path, ["add", "."]);
   git(env.path, ["commit", "-m", "feat: v2 rewrites v1"]);
   // the squash on origin holds only the final content: the tip merges
-  // clean (влита), but A's own content never reached origin
+  // as a no-op («похоже, влито squash» — report flag), but A's own
+  // content never reached origin and the copy is never deleted
   writeFileSync(join(repo, "s.txt"), "feat: v2\n");
   git(repo, ["add", "."]);
   git(repo, ["commit", "-m", "feat: squashed v2 only"]);
@@ -2863,7 +2875,7 @@ test("a squash that rewrote an earlier commit keeps the copy — «брошен�
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
   assert.ok(
     git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
   );
@@ -3001,9 +3013,10 @@ test("Q1: after reflog expiry «A + revert A» still keeps the copy — ancestor
   });
   await w.jan.run();
   w.clock.t += 16 * 60_000;
-  // while the reflog still names A the verdict is already «брошено»
+  // while the reflog still names A the verdict is already reported —
+  // the tip nets to origin, so the flag is «похоже, влито squash»
   let res = await w.jan.run();
-  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
   // `gc.reflogExpire` (90d) erases every position — A is reachable
   // only as an ancestor of the tip; it must still block removal
   git(env.path, ["reflog", "expire", "--expire=now", "--all"]);
@@ -3016,7 +3029,7 @@ test("Q1: after reflog expiry «A + revert A» still keeps the copy — ancestor
   res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
   assert.equal(res.removedBranches, 0);
   git(repo, ["rev-parse", "--verify", env.branchName]);
   assert.ok(git(env.path, ["rev-list", "HEAD"]).includes(a));
@@ -3086,7 +3099,7 @@ test("Q3: commits pulled --ff-only from a third clone keep the copy (PLUG-198)",
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  assert.equal(res.reported[0]!.reason, "abandoned-unpushed");
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
   // X1 lives only on bb/a — the branch must stay too
   assert.equal(res.removedBranches, 0);
   assert.ok(git(env.path, ["rev-list", env.branchName]).includes(x1));
@@ -3107,9 +3120,10 @@ test("Q4: an empty commit has no content — the copy stays (PLUG-198)", async (
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  // an empty commit merges clean («влита»), but it is no content of
-  // its own — «ничего не теряется» keeps the copy
-  assert.equal(res.kept["unpushed-commits"], 1);
+  // an empty commit merges as a no-op — the tip is merge-tree equal,
+  // so the copy gets the «похоже, влито squash» flag; an empty
+  // commit is safe only as an ancestor, so it is never deleted
+  assert.equal(res.reported[0]!.reason, "squash-suspect");
 });
 
 // ── PLUG-199 ─────────────────────────────────────────────────────────
@@ -3315,4 +3329,123 @@ test("a branch moved between the check and the delete is not deleted — update-
   assert.equal(res.removedBranches, 0);
   assert.equal(res.kept["branch-delete-failed"], 1);
   assert.equal(git(repo, ["rev-parse", "bb/o"]), moved);
+});
+
+// ── PLUG-201 ─────────────────────────────────────────────────────────
+
+test("U1: a built-in union merge driver cannot fake removal — the copy stays (PLUG-201)", async () => {
+  const { repo, base } = makeRepo();
+  // `merge=union` needs no `merge.<name>.driver` config at all — the
+  // old per-driver `-c` overrides could never reach it. Only dropping
+  // the content sign from the removal path makes the copy safe.
+  writeFileSync(join(repo, ".gitattributes"), "db.yml merge=union\n");
+  writeFileSync(join(repo, "db.yml"), "db: base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: attrs + db"]);
+  git(repo, ["push", "origin", "main"]);
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "db.yml"), "db: local\n");
+  git(env.path, ["add", "db.yml"]);
+  git(env.path, ["commit", "-m", "feat: A edits db.yml"]);
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repo, "db.yml"), "db: origin\n");
+  git(repo, ["add", "db.yml"]);
+  git(repo, ["commit", "-m", "feat: origin edits db.yml"]);
+  git(repo, ["push", "origin", "main"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.archivedCalls.length, 0);
+  assert.ok(existsSync(env.path));
+  // the union merge would keep BOTH lines — never the target tree, so
+  // no «похоже, влито squash» flag either: plain «брошено» unmerged
+  assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
+  assert.ok(!git(repo, ["branch", "-r", "--contains", a]).includes(a));
+});
+
+test("U1b: the same for a copy-less bb/ branch — union cannot sweep it (PLUG-201)", async () => {
+  const { repo, base } = makeRepo();
+  writeFileSync(join(repo, ".gitattributes"), "db.yml merge=union\n");
+  writeFileSync(join(repo, "db.yml"), "db: base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: attrs + db"]);
+  git(repo, ["checkout", "-b", "bb/o"]);
+  writeFileSync(join(repo, "db.yml"), "db: local\n");
+  git(repo, ["add", "db.yml"]);
+  git(repo, ["commit", "-m", "feat: A"]);
+  git(repo, ["checkout", "main"]);
+  writeFileSync(join(repo, "db.yml"), "db: origin\n");
+  git(repo, ["add", "db.yml"]);
+  git(repo, ["commit", "-m", "feat: origin db"]);
+  git(repo, ["push", "origin", "main"]);
+  const env = addEnv(repo, base, "a");
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedBranches, 0);
+  assert.equal(res.kept["branch-unpushed"], 1);
+  git(repo, ["rev-parse", "--verify", "bb/o"]);
+});
+
+test("E1: a merge driver whose name holds «=» cannot fake removal (PLUG-201)", async () => {
+  const { repo, base } = makeRepo();
+  // `merge.we=ird.driver` is a real driver key, but `git -c` cannot
+  // express it: `-c merge.we=ird.driver=false` splits at the FIRST
+  // `=` and sets an unrelated key — the driver always ran. Attributes
+  // disabled wholesale (`--attr-source`, `core.attributesFile`) is
+  // the only override that reaches it.
+  writeFileSync(join(repo, ".gitattributes"), "db.yml merge=we=ird\n");
+  writeFileSync(join(repo, "db.yml"), "db: base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "chore: attrs + db"]);
+  git(repo, ["push", "origin", "main"]);
+  git(repo, ["config", "merge.we=ird.driver", "cp %A %O"]);
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "db.yml"), "db: local\n");
+  git(env.path, ["add", "db.yml"]);
+  git(env.path, ["commit", "-m", "feat: A edits db.yml"]);
+  const a = git(env.path, ["rev-parse", "HEAD"]);
+  writeFileSync(join(repo, "db.yml"), "db: origin\n");
+  git(repo, ["add", "db.yml"]);
+  git(repo, ["commit", "-m", "feat: origin edits db.yml"]);
+  git(repo, ["push", "origin", "main"]);
+  const clock = { t: Date.now() };
+  const w = makeWorld({
+    envs: [env],
+    threads: {
+      [env.id]: [
+        {
+          id: "thr_a",
+          status: "idle",
+          archivedAt: null,
+          updatedAt: clock.t - 2 * 24 * 60 * 60_000,
+          parentThreadId: "thr_coord",
+        },
+      ],
+    },
+    clock,
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.archivedCalls.length, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
+  assert.ok(!git(repo, ["branch", "-r", "--contains", a]).includes(a));
 });

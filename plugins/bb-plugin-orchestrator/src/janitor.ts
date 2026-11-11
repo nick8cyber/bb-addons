@@ -15,33 +15,38 @@
  * candidates: `workers` (default) covers dispatch threads
  * (`originPluginId=tasks`) and threads with a parent; `all` also covers
  * root chats. A `bb/` branch is deleted only on a later run, once its
- * copy no longer exists. Squash/rebase merges get a second mergedness
- * signal — content equality: `git merge-tree --write-tree <target>
- * <sha>` reproducing `<target>^{tree}` proves the merge adds nothing
- * (multi-commit squashes and merge-commit resolution edits included).
+ * copy no longer exists. «Влита» is ancestry or `git cherry` with no
+ * «+» (patch-id equivalence — a squash of several commits is not
+ * recognized; such copies only go to the report).
  * Own commits are the *reachable* commits of the copy's branch:
  * `rev-list --count <«Created from»>..<tip>` (PLUG-195: strictly from
  * the creation entry — no reflog-type parsing). «Ничего не
  * теряется»: every commit the copy's HEAD or its branch ever pointed
- * at (the whole `git log -g`) is an ancestor of a remote target,
- * patch-equivalent to a commit on it, or carries content already on a
- * target — the `merge-tree` sign checked for EACH commit the reflogs
- * and tips reach beyond origin (PLUG-197: «A + revert A» nets to
- * origin, but A's content never reached it; PLUG-198: ancestors count
- * too — a reflog may have lost the position while the commit stays
- * reachable — such a copy stays). One that is neither
+ * at (the whole `git log -g`) — and every ancestor of those positions
+ * not on origin — is an ancestor of a remote target or
+ * patch-equivalent (`patch-id --stable`, the commit itself,
+ * `rev-list --no-walk`; an empty commit only as an ancestor).
+ * The merge-tree content sign is NOT used for removal (PLUG-201):
+ * merge drivers fake it — a configured `ours`, the built-in `union`
+ * from `.gitattributes`, a driver name with `=` that `-c` cannot
+ * express — three confirmed losses in a row. A commit that is neither
  * (a `reset`-orphaned or detached commit, an unpublished pre-amend
- * version) keeps the copy (`unpushed-commits`), or reports it once
- * abandoned. The rule is re-run immediately before archiving, and for
- * a copy-less `bb/` branch — over the branch's own reflog before
- * `update-ref -d` against the verified tip (`branch-unpushed`), since
- * deleting the branch erases it. `merge-tree` signs run with every
- * configured merge driver disabled (`-c merge.<name>.driver=false`,
- * PLUG-199): a driver like `ours` from `.gitattributes` would
- * otherwise reproduce the target tree for ANY commit and fake «content
- * already on origin». A copy carrying submodules (`.gitmodules` or
- * `$GIT_DIR/modules`) is never removed — their objects live inside
- * the copy's git dir and no origin check covers them.
+ * version, an «A» in a net-zero «A + revert A») keeps the copy
+ * (`unpushed-commits`), or reports it once abandoned. The rule is
+ * re-run immediately before archiving — together with the
+ * unfinished merge/rebase/cherry-pick check — and for a copy-less
+ * `bb/` branch — over the branch's own reflog before `update-ref -d`
+ * against the verified tip (`branch-unpushed`), since deleting the
+ * branch erases it. The content sign survives ONLY as a report
+ * flag: a copy whose branch `git merge-tree --write-tree` (run with
+ * attributes disabled — `--attr-source=<empty tree>` plus
+ * `-c core.attributesFile=/dev/null`, so no merge driver can run)
+ * reproduces the target tree while its commits failed is reported
+ * «похоже, влито squash — проверьте и удалите вручную»
+ * (`squash-suspect`), never removed. A copy carrying submodules
+ * (`.gitmodules` or `$GIT_DIR/modules`) is never removed — their
+ * objects live inside the copy's git dir and no origin check covers
+ * them.
  *
  * §16.4: on `thread.archived` of an executor whose copy is still dirty,
  * the state is saved into `refs/orchestrator/rescue/<thr>` (stash object
@@ -529,41 +534,16 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
-   * §16.3 (PLUG-199): merge drivers configured for the repo must not
-   * run inside a merge-tree sign — `db.yml merge=ours` plus
-   * `merge.ours.driver true` makes merge-tree reproduce the target
-   * tree for ANY commit, faking «content already on origin». Every
-   * `merge.<name>.driver` key is overridden per call with `-c
-   * <key>=false`: the driver errors out, merge-tree reports a conflict
-   * and proves nothing. Cached per repo for the run; an unreadable
-   * config yields no overrides (an unconfigured driver errors the same
-   * way — the sign stays unproven, never faked).
-   */
-  const mergeDriverCache = new Map<string, string[]>();
-  const mergeDriverArgs = async (repoRoot: string): Promise<string[]> => {
-    const hit = mergeDriverCache.get(repoRoot);
-    if (hit) return hit;
-    const out = await gitOut(deps.cmd, repoRoot, [
-      "config",
-      "--get-regexp",
-      "^merge\..*\.driver$",
-    ]);
-    const keys = new Set<string>();
-    for (const line of (out ?? "").split("\n")) {
-      const key = line.split(/\s/, 1)[0]?.trim();
-      if (key && /^merge\..*\.driver$/.test(key)) keys.add(key);
-    }
-    const args = [...keys].flatMap((k) => ["-c", `${k}=false`]);
-    mergeDriverCache.set(repoRoot, args);
-    return args;
-  };
-
-  /**
-   * §16.3 «влита», the content sign: `git merge-tree --write-tree
-   * <target> <sha>` reproducing `<target>^{tree}` proves merging <sha>
-   * into the target adds nothing — every change of <sha> is already
-   * there (a multi-commit squash, a rebase-published tip). A failed or
-   * conflicting merge-tree proves nothing and never counts.
+   * §16.3 the report flag, the ONLY surviving use of the content sign
+   * (PLUG-201): `git merge-tree --write-tree <target> <sha>`
+   * reproducing `<target>^{tree>` proves merging <sha> adds nothing —
+   * «похоже, влито squash». The sign is never trusted for removal, so
+   * merge drivers cannot fake a deletion; still, it runs with
+   * attributes fully disabled (`--attr-source=<empty tree>` +
+   * `-c core.attributesFile=/dev/null`) so the flag itself is honest:
+   * no `.gitattributes` driver (`ours`, `union`, a name `-c` cannot
+   * express) can bend the merge result. A failed or conflicting
+   * merge-tree proves nothing and never flags.
    */
   const mergeTreeEquals = async (
     repoRoot: string,
@@ -572,7 +552,9 @@ export function createJanitor(deps: JanitorDeps) {
   ): Promise<boolean> => {
     const mergedTree = (
       await gitOut(deps.cmd, repoRoot, [
-        ...(await mergeDriverArgs(repoRoot)),
+        `--attr-source=${EMPTY_TREE}`,
+        "-c",
+        "core.attributesFile=/dev/null",
         "merge-tree",
         "--write-tree",
         target,
@@ -589,10 +571,40 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
-   * §16.3 «влита»: a sha is merged into a remote-tracking target when it
-   * is an ancestor — or when its whole content already sits on the
-   * target (`mergeTreeEquals`, the second mergedness sign in place of
-   * `git cherry`, so a squash of two or more commits counts too).
+   * §16.3 the report flag: true when any given tip merges into any
+   * target as a no-op (`mergeTreeEquals`) — «похоже, влито squash».
+   * Ancestor tips are skipped: their no-op merge is trivially true
+   * and the flag would fire on every kept copy, not only on the
+   * squash suspects it is meant for.
+   */
+  const contentSquashedOn = async (
+    repoRoot: string,
+    shas: string[],
+    targets: string[],
+  ): Promise<boolean> => {
+    for (const sha of shas) {
+      for (const t of targets) {
+        if (
+          await gitOk(deps.cmd, repoRoot, [
+            "merge-base",
+            "--is-ancestor",
+            sha,
+            t,
+          ])
+        ) {
+          continue;
+        }
+        if (await mergeTreeEquals(repoRoot, t, sha)) return true;
+      }
+    }
+    return false;
+  };
+
+  /**
+   * §16.3 «влита»: a sha is merged into a remote-tracking target when
+   * it is an ancestor or patch-equivalent to a commit on it (`git
+   * cherry` prints only «-» lines). A multi-commit squash is neither —
+   * such copies are not merged and go to the report instead.
    */
   const shaMergedIn = async (
     repoRoot: string,
@@ -605,9 +617,8 @@ export function createJanitor(deps: JanitorDeps) {
       ) {
         return true;
       }
-      if (await mergeTreeEquals(repoRoot, t, sha)) return true;
     }
-    return false;
+    return patchEquivalent(repoRoot, sha, targets);
   };
 
   /**
@@ -727,48 +738,18 @@ export function createJanitor(deps: JanitorDeps) {
       }
     }
     if (!pending.size) return "ok";
-    // `<target>^{tree}` is resolved once per target, not per commit.
-    const targetTrees = new Map<string, string | null>();
-    const ownContentOn = async (t: string, sha: string) => {
-      let tt = targetTrees.get(t);
-      if (tt === undefined) {
-        tt =
-          (
-            await gitOut(deps.cmd, repoRoot, [
-              "rev-parse",
-              `${t}^{tree}`,
-            ])
-          )?.trim() ?? null;
-        targetTrees.set(t, tt);
-      }
-      if (!tt) return false;
-      const mergedTree = (
-        await gitOut(deps.cmd, repoRoot, [
-          ...(await mergeDriverArgs(repoRoot)),
-          "merge-tree",
-          "--write-tree",
-          t,
-          sha,
-        ])
-      )
-        ?.split("\n")[0]
-        ?.trim();
-      return !!mergedTree && mergedTree === tt;
-    };
+    // §16.3 (PLUG-201): ancestry already excluded the target's own
+    // commits — a pending one is safe ONLY as a patch-equivalent
+    // (`git cherry` «-», the commit itself, `--no-walk`). The
+    // merge-tree content sign is not trusted here: merge drivers
+    // (`ours`, built-in `union`, names with `=`) fake it — three
+    // confirmed losses in a row.
     for (const sha of pending) {
-      if (await patchEquivalent(repoRoot, sha, targets)) continue;
       // §16.3: an empty commit (`--allow-empty`) has no content to find
       // on a target — safe only by ancestry (already excluded) or by
       // patch-id (PLUG-198).
       if (await commitContentless(repoRoot, sha)) return "lost";
-      let own = false;
-      for (const t of targets) {
-        if (await ownContentOn(t, sha)) {
-          own = true;
-          break;
-        }
-      }
-      if (own) continue;
+      if (await patchEquivalent(repoRoot, sha, targets)) continue;
       return "lost";
     }
     return "ok";
@@ -836,11 +817,42 @@ export function createJanitor(deps: JanitorDeps) {
     return existsSync(join(dir, "modules"));
   };
 
+  /**
+   * §15 cond 3: an unfinished merge, rebase or cherry-pick keeps the
+   * copy — the sentinel files live under the copy's git dir
+   * (`MERGE_HEAD` & co., `rebase-merge/`, `rebase-apply/`). Re-run
+   * right before archiving too (PLUG-201): the run-start verdict is
+   * minutes old by then. A failed `--git-dir` probe proves nothing —
+   * `null` keeps the copy (`unfinished-unknown`).
+   */
+  const unfinishedOp = async (
+    path: string,
+    gitDir?: string | null,
+  ): Promise<boolean | null> => {
+    let dir = gitDir;
+    if (dir === undefined) {
+      const raw = await gitOut(deps.cmd, path, [
+        "rev-parse",
+        "--git-dir",
+      ]);
+      if (raw === null) return null;
+      dir = raw.trim();
+      if (dir && !isAbsolute(dir)) dir = join(path, dir);
+    }
+    if (!dir) return null;
+    return (
+      ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REVERT_HEAD"].some(
+        (f) => existsSync(join(dir, f)),
+      ) ||
+      existsSync(join(dir, "rebase-merge")) ||
+      existsSync(join(dir, "rebase-apply"))
+    );
+  };
+
   const run = async (
     opts: JanitorRunOptions = {},
   ): Promise<JanitorRunSummary> => {
     const at = now();
-    mergeDriverCache.clear();
     const summary: JanitorRunSummary = {
       applied: false,
       removedCopies: 0,
@@ -1339,19 +1351,12 @@ export function createJanitor(deps: JanitorDeps) {
       ]);
       // A failed git-dir probe means unfinished-op state is unproven —
       // the copy is kept (`unfinished-unknown`), never silently passed.
-      const gitDirFailed = gitDirRaw === null;
       const gitDir = gitDirRaw
         ? isAbsolute(gitDirRaw.trim())
           ? gitDirRaw.trim()
           : join(path, gitDirRaw.trim())
         : null;
-      const unfinished =
-        !!gitDir &&
-        (["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REVERT_HEAD"].some(
-          (f) => existsSync(join(gitDir, f)),
-        ) ||
-          existsSync(join(gitDir, "rebase-merge")) ||
-          existsSync(join(gitDir, "rebase-apply")));
+      const unfinished = gitDir ? await unfinishedOp(path, gitDir) : null;
 
       const ownBranch = (
         await gitOut(deps.cmd, path, ["branch", "--show-current"])
@@ -1404,9 +1409,19 @@ export function createJanitor(deps: JanitorDeps) {
           ? "abandoned-archived"
           : !abandoned
             ? "not-merged"
-            : dirty || unfinished
+            : dirty || unfinished === true
               ? "abandoned-dirty"
               : "abandoned-unmerged";
+        // §16.3 (PLUG-201): a tip whose merge into a target is a no-op
+        // is «похоже, влито squash» — the multi-commit squash `git
+        // cherry` cannot see. The content sign never decides removal;
+        // it only flags the copy for a manual check in the report.
+        if (
+          (reason === "not-merged" || reason === "abandoned-unmerged") &&
+          (await contentSquashedOn(repo.root, shas, targets))
+        ) {
+          return bad("squash-suspect", true);
+        }
         return bad(reason, reason.startsWith("abandoned"));
       }
 
@@ -1433,8 +1448,8 @@ export function createJanitor(deps: JanitorDeps) {
       if (statusFailed) return after("status-failed");
       if (dirty)
         return after(abandoned ? "abandoned-dirty" : "dirty", abandoned);
+      if (unfinished === null) return after("unfinished-unknown");
       if (unfinished) return after("unfinished-op");
-      if (gitDirFailed) return after("unfinished-unknown");
       // §16.3 (PLUG-199): a copy with submodules is never removed —
       // their objects live inside the copy's git dir and no origin
       // check covers them; idle past abandonedAfter — «брошено».
@@ -1448,13 +1463,14 @@ export function createJanitor(deps: JanitorDeps) {
       }
       // §16.3 (ревизия 25, главное условие): «ничего не теряется» —
       // every commit the copy's HEAD or its own branch ever pointed at
-      // must already sit on a remote target: as an ancestor, as a
-      // patch-equivalent (amend/rebase of published work), or by its
-      // own content (`merge-tree` per commit — a multi-commit squash).
-      // A commit that is neither — one orphaned by `reset`, made on a
-      // detached HEAD, an unpublished pre-amend version, an «A» in a
-      // net-zero «A + revert A» — keeps the copy; once the thread
-      // idles past `abandonedAfter` it goes to the «брошено» report.
+      // must already sit on a remote target: as an ancestor or as a
+      // patch-equivalent (amend/rebase/cherry-pick of published work).
+      // The merge-tree content sign is no longer trusted here
+      // (PLUG-201) — a commit that is neither — one orphaned by
+      // `reset`, made on a detached HEAD, an unpublished pre-amend
+      // version, an «A» in a net-zero «A + revert A» — keeps the copy;
+      // once the thread idles past `abandonedAfter` it goes to the
+      // «брошено» report.
       // The whole reflogs are read (no entry cap), but only the
       // copy's own: HEAD is per-worktree, plus `branchName` and the
       // checked-out branch when they exist — the repo's other
@@ -1468,6 +1484,11 @@ export function createJanitor(deps: JanitorDeps) {
       );
       if (lost === "unknown") return after("unpushed-unknown");
       if (lost === "lost") {
+        // §16.3 (PLUG-201): commits failed but the branch still merges
+        // as a no-op — «похоже, влито squash»: report flag only.
+        if (await contentSquashedOn(repo.root, shas, targets)) {
+          return after("squash-suspect", true);
+        }
         return abandoned
           ? after("abandoned-unpushed", true)
           : after("unpushed-commits");
@@ -1705,6 +1726,16 @@ export function createJanitor(deps: JanitorDeps) {
           note("dirty", e.id);
           return;
         }
+        // §16.3 (PLUG-201): an unfinished merge/rebase/cherry-pick may
+        // have started after the run-start probe — `git status` alone
+        // does not always surface it (a clean merge-in-progress is
+        // quiet), so the sentinel files are re-checked before the
+        // archive too.
+        const unfin = await unfinishedOp(e.path!);
+        if (unfin !== false) {
+          note(unfin === null ? "unfinished-unknown" : "unfinished-op", e.id);
+          return;
+        }
         // §15 «Действие»: HEAD is re-verified against the run-start
         // snapshot — a commit landed meanwhile cancels the archive;
         // the env is re-evaluated on the next run.
@@ -1889,15 +1920,16 @@ export function createJanitor(deps: JanitorDeps) {
     }
 
     // «Ветки без копий»: local `bb/` branches merged on origin (ancestor
-    // or content-equal) and not checked out anywhere are deleted (apply
-    // mode only) — on a *later* run than the copy's own archiving, once
-    // BB has freed the worktree. Deleting a branch erases its own
-    // reflog, where a `reset`-orphaned commit may have its only
-    // reference — so the «nothing lost» rule is re-checked over that
-    // reflog first (§15, PLUG-195); a failure keeps the branch
-    // (`branch-unpushed`, idle over `abandonedAfter` → the «брошено»
-    // report). People's other branches and rescue refs under
-    // `refs/orchestrator/` are never touched (§16).
+    // or patch-equivalent) and not checked out anywhere are deleted
+    // (apply mode only) — on a *later* run than the copy's own
+    // archiving, once BB has freed the worktree. Deleting a branch
+    // erases its own reflog, where a `reset`-orphaned commit may have
+    // its only reference — so the «nothing lost» rule is re-checked
+    // over that reflog first (§15, PLUG-195); a failure — or no merge
+    // at all — keeps the branch (`branch-unpushed`, idle over
+    // `abandonedAfter` → the «брошено» report). People's other
+    // branches and rescue refs under `refs/orchestrator/` are never
+    // touched (§16).
     const reportedBranches: {
       name: string;
       envId: string;
@@ -1950,27 +1982,35 @@ export function createJanitor(deps: JanitorDeps) {
         if (cfg.protectedBranches.includes(branch)) continue;
         if (excludedBranches.has(branch)) continue;
         if (openBranches.has(branch)) continue;
-        if (!(await shaMergedIn(root, branch, protectedTargets))) continue;
+        const merged = await shaMergedIn(root, branch, protectedTargets);
+        // §16.3: a branch that is not «влита» can never pass «ничего
+        // не теряется» — its tip alone is unpublished work — so it
+        // stays (`branch-unpushed`), reported once its reflog idles
+        // past `abandonedAfter`.
+        const tip = merged
+          ? (
+              await gitOut(deps.cmd, root, [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                `refs/heads/${branch}`,
+              ])
+            )?.trim()
+          : null;
         // §15 «Ветки без копий»: every position of the branch's own
         // reflog must be safe before the delete erases it — checked
         // per commit (PLUG-197: «A + revert A» nets to origin, but A
         // never reached it).
-        const tip = (
-          await gitOut(deps.cmd, root, [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            `refs/heads/${branch}`,
-          ])
-        )?.trim();
-        const safe = tip
-          ? await reflogPositionsSafe(
-              root,
-              [`refs/heads/${branch}`],
-              root,
-              protectedTargets,
-            )
-          : "unknown";
+        const safe = !merged
+          ? ("lost" as const)
+          : tip
+            ? await reflogPositionsSafe(
+                root,
+                [`refs/heads/${branch}`],
+                root,
+                protectedTargets,
+              )
+            : "unknown";
         const envId = `branch:${commonDir}:${branch}`;
         if (safe !== "ok") {
           keep(summary, "branch-unpushed");
@@ -2197,7 +2237,12 @@ export function createJanitor(deps: JanitorDeps) {
       if (now() - last < DAY_MS) continue;
       const list = items
         .slice(0, 8)
-        .map((i) => i.branch ?? i.path ?? i.envId)
+        .map(
+          (i) =>
+            (i.branch ?? i.path ?? i.envId) +
+            // §16.3: «похоже, влито squash» — the manual-check flag.
+            (i.reason === "squash-suspect" ? " (squash?)" : ""),
+        )
         .join(", ");
       const more =
         items.length > 8 ? ` и ещё ${items.length - 8}` : "";

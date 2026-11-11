@@ -1523,7 +1523,14 @@ kept: ${keptText}` : "") +
                       (res.reported.length
                         ? `
 abandoned: ${res.reported
-                            .map((i) => `${i.branch ?? i.envId} (${i.reason})`)
+                            .map(
+                              (i) =>
+                                `${i.branch ?? i.envId} (${i.reason}` +
+                                (i.reason === "squash-suspect"
+                                  ? " — похоже, влито squash; проверьте и удалите вручную"
+                                  : "") +
+                                ")",
+                            )
                             .join(", ")}`
                         : "") +
                       (res.errors.length
@@ -1555,7 +1562,11 @@ abandoned: ${res.reported
             if (rep.abandoned.length) {
               out += "abandoned:\n";
               for (const i of rep.abandoned) {
-                out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"} (${i.reason})\n`;
+                out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"} (${i.reason}` +
+                  (i.reason === "squash-suspect"
+                    ? " — похоже, влито squash; проверьте и удалите вручную"
+                    : "") +
+                  ")\n";
               }
             }
             const kept = rep.items.filter((i) => i.state === "kept");
