@@ -296,3 +296,10 @@ bb plugin install git:https://github.com/nick8cyber/bb-addons.git@main --plugin 
 ```
 
 Details and upstream attribution: [Server Switcher](plugins/bb-plugin-server-switcher/README.md).
+
+## Development
+
+`scripts/check-changed-plugins.sh [base-ref]` — release gate: runs `npm test`
+and `tsc --noEmit` only in the `plugins/` directories changed vs the base ref
+(default `origin/main`); exits non-zero on any failure, exits 0 when no plugin
+is affected.
