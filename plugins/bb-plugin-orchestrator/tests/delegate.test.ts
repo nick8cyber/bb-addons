@@ -1879,10 +1879,49 @@ test("§4 r30 (е 2): a record gone mid-dispatch still stops the spawned thread"
     },
   });
   st = h.store;
+  // r30 (в): the dispatch is refused — the record is dropped and the
+  // caller gets `dispatch-failed`; no «Раздано» comment is written.
+  await assert.rejects(
+    runDelegate(
+      { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+      h.deps,
+    ),
+    (e: unknown) => {
+      assert.equal((e as { code?: string }).code, "dispatch-failed");
+      return true;
+    },
+  );
+  assert.ok(h.stops.includes("thr_exec"), "unsupervised executor stopped");
+  assert.ok(
+    !h.calls.some(
+      (c) =>
+        c.args[0] === "tasks" &&
+        c.args[1] === "comment" &&
+        c.args.join(" ").includes("Раздано"),
+    ),
+    "no «Раздано» comment for a refused dispatch",
+  );
+});
+
+test("§4 r30 (в): empty modelId/reasoningLevel in the preset are not passed to spawn", async () => {
+  const h = makeDeps({
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks preset show")) {
+        return ok(
+          JSON.stringify({
+            preset: { ...FULL_PRESET, modelId: "", reasoningLevel: "" },
+          }),
+        );
+      }
+      return defaultCli(args);
+    },
+  });
   const res = await runDelegate(
     { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
     h.deps,
   );
-  assert.deepEqual(h.stops, ["thr_exec"], "unsupervised executor stopped");
-  assert.ok(res.setupErrors.some((s) => s.step === "finalize"));
+  assert.equal(res.status, "running");
+  const spawn = h.spawnArgs[0]!;
+  assert.equal(spawn.model, undefined, "empty modelId → BB default");
+  assert.equal(spawn.reasoningLevel, undefined);
 });

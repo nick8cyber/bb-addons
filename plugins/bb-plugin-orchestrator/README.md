@@ -105,9 +105,11 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
   `dispatching` rows by the `pluginMetadata.delegationId` label under the
-  coordinator (`threads.list` + title/createdAt fallback; `bb tasks
-  threads` only for rows that ran the `bb tasks dispatch` fallback) or
-  drops them, survives restarts without duplicate reissues.
+  coordinator (`threads.list` + title/createdAt fallback — candidates
+  labelled with another delegation's id are skipped; `bb tasks threads`
+  is the last resort for every row: fallback rows and pre-r30 rows
+  without the label) or drops them, survives restarts without duplicate
+  reissues.
   `bb orchestrator reconcile` runs a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `merge`, `policy show|validate`,
   `instructions`, `reconcile`.

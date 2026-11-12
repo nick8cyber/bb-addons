@@ -1010,8 +1010,8 @@ async function dispatchViaSpawn(
       projectId: linkedBbProjectId!,
       environment,
       providerId: p!.providerId,
-      model: p!.modelId ?? undefined,
-      reasoningLevel: p!.reasoningLevel ?? undefined,
+      model: p!.modelId || undefined,
+      reasoningLevel: p!.reasoningLevel || undefined,
       ...(p!.serviceTier ? { serviceTier: p!.serviceTier } : {}),
       permissionMode: p!.permissionMode,
       title,
@@ -1310,12 +1310,12 @@ export async function finishDispatchSteps(
     } catch (e) {
       noteError("cancel-stop", e);
     }
-    noteError(
-      "finalize",
-      new OrchestratorError(
-        "internal-error",
-        `delegation left 'dispatching' before step 6 (now '${current?.status ?? "missing"}')`,
-      ),
+    // r30 (в): the dispatch is REFUSED — dispatchViaSpawn's catch marks
+    // the record `failed` or drops it and the caller gets
+    // `dispatch-failed`; no «Раздано» comment for an unsupervised thread.
+    throw new OrchestratorError(
+      "internal-error",
+      `delegation left 'dispatching' before step 6 (now '${current?.status ?? "missing"}')`,
     );
   }
   try {
