@@ -8,6 +8,8 @@
  */
 import { randomBytes } from "node:crypto";
 import {
+  accessSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   writeFileSync,
@@ -17,7 +19,7 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { isAbsolute, join, relative } from "node:path";
+import { delimiter, isAbsolute, join, relative } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
@@ -40,8 +42,10 @@ import {
   type ScanFinding,
 } from "./scan.js";
 import {
+  DEFAULT_PR_BODY,
   DEFAULT_TIMING,
   resolveProject,
+  type PrProviderLayer,
   type ReleaseConfig,
   type ReleaseConfigLoad,
   type ResolvedProject,
@@ -66,7 +70,7 @@ import type {
   DelegationStore,
   ReleaseRow,
 } from "./store.js";
-import { runChecked, runJson, type BbCli } from "./bb-cli.js";
+import { runChecked, runJson, type BbCli, type BbCliResult } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
 import { dispatchToRoute, type DispatchStepsDeps } from "./delegate.js";
@@ -1423,6 +1427,19 @@ export async function runRelease(
         `(excluded: true); проект делегирования ${delegationProjectId}`,
     );
   }
+  // §18.6: requireNote — без явного --kb/--no-kb шаг 1 отказывает.
+  if (project.requireNote && !input.kb && !input.noKb) {
+    throw new OrchestratorError(
+      "release-refused",
+      `release ${taskKey}: нужна заметка: --kb <заметка> или ` +
+        `--no-kb <причина>`,
+    );
+  }
+  // §18.3 + release §2 п.0 (r11): доступность провайдера PR — на шаге
+  // 1, до платного аудита.
+  if (project.target.action === "pr") {
+    await checkPrProvider(deps, repo, project);
+  }
   // §16.6 (PLUG-189): a merged result publishes from the COORDINATOR's
   // copy — under the same per-copy lock `merge` takes (§14 check 4: one
   // merge/release per copy at a time), with the busy/clean checks BEFORE
@@ -2775,12 +2792,17 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       ) {
         continue;
       }
-      const res = await deps.cmd.run(
-        "gh",
-        ["pr", "view", prUrl, "--json", "state,mergedAt,mergeCommit"],
-        { timeoutMs: t.prCommandTimeoutSec * 1000 },
-      );
-      if (res.exitCode !== 0) {
+      // §18.3: состояние — через провайдера проекта выкладки; любой
+      // сбой/несоответствие контракту — ошибка провайдера, счётчик
+      // до prErrorLimit тактов подряд.
+      const mainDir =
+        row.repo_root ??
+        (await realpath(row.repo_path).catch(() => row.repo_path));
+      let view: PrView;
+      try {
+        const project = await releaseProject(deps, row);
+        view = await providerView(deps, prUrl, project, mainDir);
+      } catch (e) {
         deps.store.recordPrCheck(row.id, true, now);
         const fresh = deps.store.getRelease(row.id);
         if ((fresh?.pr_error_count ?? 0) >= t.prErrorLimit) {
@@ -2790,28 +2812,16 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
             deps.store.setReleaseNotice(
               row.id,
               "pr",
-              `слежение за PR ${row.task_key} невозможно: gh pr view ` +
-                `${prUrl}: ` +
-                `${maskCommandOutput(res.stderr || res.stdout).slice(0, 200)}`,
+              `слежение за PR ${row.task_key} невозможно: ` +
+                maskCommandOutput(message(e)).slice(0, 200),
             );
             await deliverReleaseNotice(deps, row);
           }
         }
         continue;
       }
-      let view: {
-        state?: string;
-        mergedAt?: string | null;
-        mergeCommit?: { oid?: string } | null;
-      };
-      try {
-        view = JSON.parse(res.stdout) as typeof view;
-      } catch {
-        deps.store.recordPrCheck(row.id, true, now);
-        continue;
-      }
       deps.store.recordPrCheck(row.id, false, now);
-      const state = (view.state ?? "").toUpperCase();
+      const state = view.state;
       if (state === "MERGED") {
         // §2 п.6 (r11): «merging» — postPublish `on: merged` идёт до
         // строки «PR влит … → sha7»; без настроенного postPublish насос
@@ -2819,7 +2829,7 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
         if (
           deps.store.transitionPrState(row.id, ["open", "closed"], "merging")
         ) {
-          deps.store.setPrMergeSha(row.id, view.mergeCommit?.oid ?? null);
+          deps.store.setPrMergeSha(row.id, view.mergeCommit);
           await runChecked(deps.bbCli, [
             "tasks", "update", row.task_key, "--status", "done",
           ]).catch((e) =>
@@ -2894,14 +2904,142 @@ interface GhPr {
   baseRefName?: string;
 }
 
-const SOURCE_RE = /Источник:\s*bb тред\s+(thr_[a-z0-9]+)/i;
+/** §18.3: оба маркера тела PR, которые разбор «чей PR» узнаёт —
+ * прежний «Источник: bb тред» установки автора и `BB-Thread:` шаблона
+ * по умолчанию (§18.6 prBody). */
+const PR_THREAD_MARKER_RE =
+  /(?:Источник:\s*bb тред|BB-Thread:)\s*(thr_[a-z0-9]+)/i;
+
+/** §18.6: подстановки шаблона `prBody` — {thread}, {task}, {title}. */
+export function renderPrBody(
+  template: string,
+  parts: { thread: string; task: string; title: string },
+): string {
+  return template
+    .replaceAll("{thread}", parts.thread)
+    .replaceAll("{task}", parts.task)
+    .replaceAll("{title}", parts.title);
+}
+
+interface PrView {
+  state: "OPEN" | "MERGED" | "CLOSED";
+  mergeCommit: string | null;
+}
+
+/** §18.3 command: argv провайдера идёт без shell, каталог запуска —
+ * основной каталог репозитория, таймаут `timing.prCommandTimeoutSec`. */
+async function runPrProvider(
+  deps: ReleaseDeps,
+  spec: {
+    argv: string[];
+    cwd: string;
+    env: Record<string, string>;
+    stdin?: string;
+    timeoutSec: number;
+  },
+): Promise<BbCliResult> {
+  return deps.cmd.run(spec.argv[0]!, spec.argv.slice(1), {
+    cwd: spec.cwd,
+    env: spec.env,
+    stdin: spec.stdin,
+    timeoutMs: spec.timeoutSec * 1000,
+  });
+}
+
+const PR_VIEW_STATES = new Set(["OPEN", "MERGED", "CLOSED"]);
+
+/** §18.3: состояние PR через провайдера проекта — `github` (`gh pr
+ * view … --json state,mergedAt,mergeCommit`) или `command.view`
+ * (ORCH_PR_URL → {"state","mergeCommit"}). Любое несоответствие
+ * контракту — ошибка провайдера (идёт в `timing.prErrorLimit`); вывод,
+ * попадающий в строки, — очисткой вывода команд (§18.5). */
+async function providerView(
+  deps: ReleaseDeps,
+  prUrl: string,
+  project: ResolvedProject | null,
+  mainDir: string,
+): Promise<PrView> {
+  const prov: Pick<PrProviderLayer, "type"> & Partial<PrProviderLayer> =
+    project?.prProvider ?? { type: "github" };
+  const timeoutSec = (project?.timing ?? DEFAULT_TIMING).prCommandTimeoutSec;
+  const tail = (r: BbCliResult) =>
+    maskCommandOutput(r.stderr || r.stdout) || "no output";
+  if (prov.type === "command") {
+    if (!prov.view?.length) {
+      throw new Error("command.view не задан");
+    }
+    const res = await runPrProvider(deps, {
+      argv: prov.view,
+      cwd: mainDir,
+      env: { ORCH_PR_URL: prUrl },
+      timeoutSec,
+    });
+    if (res.exitCode !== 0) {
+      throw new Error(
+        `command.view завершился с кодом ${res.exitCode}: ${tail(res)}`,
+      );
+    }
+    let parsed: { state?: unknown; mergeCommit?: unknown };
+    try {
+      parsed = JSON.parse(res.stdout) as typeof parsed;
+    } catch {
+      throw new Error(
+        `command.view: ответ не JSON: ${maskCommandOutput(res.stdout)}`,
+      );
+    }
+    const state = String(parsed.state ?? "").toUpperCase();
+    if (!PR_VIEW_STATES.has(state)) {
+      throw new Error(
+        `command.view: неожиданный state: ` +
+          maskCommandOutput(String(parsed.state ?? "")),
+      );
+    }
+    return {
+      state: state as PrView["state"],
+      mergeCommit:
+        typeof parsed.mergeCommit === "string" && parsed.mergeCommit
+          ? parsed.mergeCommit
+          : null,
+    };
+  }
+  if (prov.type === "none") {
+    throw new Error("провайдер сменился на none — слежение невозможно");
+  }
+  const res = await deps.cmd.run(
+    "gh",
+    ["pr", "view", prUrl, "--json", "state,mergedAt,mergeCommit"],
+    { timeoutMs: timeoutSec * 1000 },
+  );
+  if (res.exitCode !== 0) {
+    throw new Error(`gh pr view ${prUrl}: ${tail(res)}`);
+  }
+  let view: { state?: string; mergeCommit?: { oid?: string } | null };
+  try {
+    view = JSON.parse(res.stdout) as typeof view;
+  } catch {
+    throw new Error(
+      `gh pr view: ответ не JSON: ${maskCommandOutput(res.stdout)}`,
+    );
+  }
+  const state = (view.state ?? "").toUpperCase();
+  if (!PR_VIEW_STATES.has(state)) {
+    throw new Error(
+      `gh pr view: неожиданный state: ${maskCommandOutput(view.state ?? "")}`,
+    );
+  }
+  return {
+    state: state as PrView["state"],
+    mergeCommit: view.mergeCommit?.oid ?? null,
+  };
+}
 
 async function ghJson<T>(
   deps: ReleaseDeps,
   repo: string,
   args: string[],
+  timeoutMs = 60_000,
 ): Promise<T> {
-  const res = await deps.cmd.run("gh", args, { cwd: repo, timeoutMs: 60_000 });
+  const res = await deps.cmd.run("gh", args, { cwd: repo, timeoutMs });
   if (res.exitCode !== 0) {
     throw new OrchestratorError(
       "gh-failed",
@@ -2917,8 +3055,9 @@ async function ghText(
   deps: ReleaseDeps,
   repo: string,
   args: string[],
+  timeoutMs = 60_000,
 ): Promise<string> {
-  const res = await deps.cmd.run("gh", args, { cwd: repo, timeoutMs: 60_000 });
+  const res = await deps.cmd.run("gh", args, { cwd: repo, timeoutMs });
   if (res.exitCode !== 0) {
     throw new OrchestratorError(
       "gh-failed",
@@ -2953,18 +3092,15 @@ async function pushWithToken(
   }
 }
 
-/** The project's `threadIds` at publish time (§16.6; default `true` —
- * a broken config at pump time must not silently drop the contract
- * line CI/CD relies on). §6 (r7): the settings project is resolved by
- * the released repository, `row.project_id` is only the fallback. */
-async function projectThreadIds(
+/** §6 (r7) п.6: the resolved settings project of a release row — the
+ * recorded `settings_project_id` wins; pre-r8 rows resolve anew (a
+ * resolver error refuses the caller). No usable config → null. */
+async function releaseProject(
   deps: ReleaseDeps,
   row: ReleaseRow,
-): Promise<boolean> {
+): Promise<ResolvedProject | null> {
   const cfg = deps.loadReleaseConfig();
-  if (!cfg.config) return true;
-  // §6 (r8) п.6: the recorded settings project wins; pre-r8 rows
-  // resolve anew (a resolver error refuses the publish).
+  if (!cfg.config) return null;
   const id =
     row.settings_project_id ??
     (await settingsProjectId(
@@ -2973,7 +3109,84 @@ async function projectThreadIds(
       row.project_id,
       cfg.config,
     ));
-  return resolveProject(cfg.config, id).threadIds;
+  return resolveProject(cfg.config, id);
+}
+
+/** §18.3/§2 п.0: основной каталог репозитория копии — каталог запуска
+ * команд провайдера PR (realpath первой записи `git worktree list`). */
+async function repoMainDir(deps: ReleaseDeps, repo: string): Promise<string> {
+  const md =
+    mainWorktreeDir(
+      await git(deps, repo, ["worktree", "list", "--porcelain"], {
+        allowFail: true,
+      }),
+    ) ?? repo;
+  return realpath(md).catch(() => md);
+}
+
+/** §18.3: исполняемый файл — абсолютный путь, относительный (от
+ * каталога запуска) или имя, ищущееся по PATH. */
+function executableExists(file: string, cwd: string): boolean {
+  const candidates = file.includes("/")
+    ? [isAbsolute(file) ? file : join(cwd, file)]
+    : (process.env.PATH ?? "")
+        .split(delimiter)
+        .filter(Boolean)
+        .map((d) => join(d, file));
+  for (const p of candidates) {
+    try {
+      accessSync(p, fsConstants.X_OK);
+      return true;
+    } catch {
+      /* next candidate */
+    }
+  }
+  return false;
+}
+
+/** §18.3 + release §2 п.0 (r11): доступность провайдера PR — проверка
+ * шага 1 ДО аудита: `github` — `gh` есть и авторизован (`gh auth
+ * status`); `command` — исполняемые файлы create/view существуют;
+ * `none` — проверять нечего. */
+async function checkPrProvider(
+  deps: ReleaseDeps,
+  repo: string,
+  project: ResolvedProject,
+): Promise<void> {
+  const prov = project.prProvider;
+  if (prov.type === "none") return;
+  const unavailable = (why: string) =>
+    new OrchestratorError(
+      "release-refused",
+      `провайдер PR недоступен: ${why}`,
+    );
+  if (prov.type === "github") {
+    const res = await deps.cmd.run("gh", ["auth", "status"], {
+      cwd: repo,
+      timeoutMs: project.timing.prCommandTimeoutSec * 1000,
+    });
+    if (res.exitCode !== 0) {
+      throw unavailable(
+        `gh нет или не авторизован (код ${res.exitCode}): ` +
+          (maskCommandOutput(res.stderr || res.stdout) || "no output"),
+      );
+    }
+    return;
+  }
+  const mainDir = await repoMainDir(deps, repo);
+  for (const [kind, argv] of [
+    ["create", prov.create],
+    ["view", prov.view],
+  ] as const) {
+    if (!argv?.length) {
+      throw unavailable(`command.${kind} не задан`);
+    }
+    if (!executableExists(argv[0]!, mainDir)) {
+      throw unavailable(
+        `command.${kind}: исполняемый файл не найден: ${argv[0]}`,
+      );
+    }
+  }
 }
 
 async function publishRelease(
@@ -3019,14 +3232,19 @@ async function publishRelease(
     return;
   }
 
-  // action=pr — §16.6 `threadIds`: the «Источник: bb тред thr_…» line is
+  // action=pr — §16.6 `threadIds`: the thread-id marker line is
   // written only while the project allows thread ids. With it off the
   // local executor branch name (`bb/<key>-…-thr_…`) must not reach the
   // remote either — the published branch is a neutral `release/<sha7>`
   // recorded at the FIRST release of the task and reused by repeats
-  // (one branch and one PR per task, §16.6), and the PR body carries
-  // neither «Источник» nor «Задача: <KEY>».
-  const threadIds = await projectThreadIds(deps, row);
+  // (one branch and one PR per task, §16.6), and the PR body is empty
+  // (§18.6: the prBody template is not applied at all).
+  // §18.3: how the PR is found, created and watched — the project's
+  // `prProvider` (`github` default, `command`, `none`).
+  const project = await releaseProject(deps, row);
+  const threadIds = project?.threadIds ?? true;
+  const prov = project?.prProvider ?? { type: "github" as const };
+  const t = project?.timing ?? DEFAULT_TIMING;
   // §16.6 (PLUG-194): a publish-branch name is written and reused only
   // in the `release/…` form — an executor branch name recorded while
   // threadIds was on must not be published after it flips off.
@@ -3065,42 +3283,110 @@ async function publishRelease(
       );
     }
   }
-  const prs = await ghJson<GhPr[]>(deps, repo, [
-    "pr",
-    "list",
-    "--head",
-    remoteBranch,
-    "--state",
-    "open",
-    "--json",
-    "number,url,body,headRefName,baseRefName",
-    "--limit",
-    "20",
-  ]);
-  const existing = prs.find(
-    (p) =>
-      p.headRefName === remoteBranch && p.baseRefName === row.target_branch,
-  );
-  if (existing) {
-    const src = SOURCE_RE.exec(existing.body ?? "")?.[1];
-    const foreign =
-      src !== undefined
-        ? src !== row.coordinator_thread_id
-        : threadIds
-          ? true // our PRs always carry «Источник» — none means foreign
-          : !existing.url ||
-            !deps.store.prWasReleased(
-              existing.url,
-              row.coordinator_thread_id,
-            );
-    if (foreign) {
-      throw new OrchestratorError(
-        "release-refused",
-        `PR ${existing.url} у ветки ${remoteBranch} создан не этим release ` +
-          `(Источник: ${src ?? "нет"}) — release в чужую ветку PR не пишет`,
-      );
+
+  // §18.3: open PR of the publish branch (if any) + the «чей PR» check —
+  // before the push, so a foreign PR refuses without touching the remote.
+  const foreignPr = (url: string | null | undefined, src?: string) =>
+    new OrchestratorError(
+      "release-refused",
+      `PR ${url ?? "?"} у ветки ${remoteBranch} создан не этим release ` +
+        `(Источник: ${src ?? "нет"}) — release в чужую ветку PR не пишет`,
+    );
+  const mainDir =
+    row.repo_root ?? (await repoMainDir(deps, repo));
+  let existingUrl: string | null = null;
+  if (prov.type === "github") {
+    const prs = await ghJson<GhPr[]>(
+      deps,
+      repo,
+      [
+        "pr",
+        "list",
+        "--head",
+        remoteBranch,
+        "--state",
+        "open",
+        "--json",
+        "number,url,body,headRefName,baseRefName",
+        "--limit",
+        "20",
+      ],
+      t.prCommandTimeoutSec * 1000,
+    );
+    const existing = prs.find(
+      (p) =>
+        p.headRefName === remoteBranch && p.baseRefName === row.target_branch,
+    );
+    if (existing) {
+      // §18.3 «чей PR»: с маркером — по нему (узнаются «Источник: bb
+      // тред» и «BB-Thread:»); без маркера (threadIds off или шаблон
+      // без {thread}) — по своим записям этой задачи этого
+      // координатора.
+      const src = PR_THREAD_MARKER_RE.exec(existing.body ?? "")?.[1];
+      const markerExpected =
+        threadIds && (project?.prBody ?? DEFAULT_PR_BODY).includes("{thread}");
+      const foreign =
+        src !== undefined
+          ? src !== row.coordinator_thread_id
+          : markerExpected
+            ? true // our PRs always carry the marker — none means foreign
+            : !existing.url ||
+              !deps.store.prWasReleased(
+                existing.url,
+                row.coordinator_thread_id,
+                row.task_key,
+              );
+      if (foreign) throw foreignPr(existing.url, src);
+      existingUrl = existing.url ?? null;
+    }
+  } else if (prov.type === "command") {
+    if (prov.find?.length) {
+      // §18.3: `find` — URL открытого PR ветки или пусто; «чей PR» —
+      // только по своим записям (тело через view не читается).
+      const res = await runPrProvider(deps, {
+        argv: prov.find,
+        cwd: mainDir,
+        env: { ORCH_BRANCH: remoteBranch, ORCH_TARGET: row.target_branch },
+        timeoutSec: t.prCommandTimeoutSec,
+      });
+      if (res.exitCode !== 0) {
+        throw new OrchestratorError(
+          "release-refused",
+          `провайдер PR (find) завершился с кодом ${res.exitCode}: ` +
+            (maskCommandOutput(res.stderr || res.stdout) || "no output"),
+        );
+      }
+      existingUrl = GH_PR_URL_RE.exec(res.stdout)?.[0] ?? null;
+      if (
+        existingUrl &&
+        !deps.store.prWasReleased(
+          existingUrl,
+          row.coordinator_thread_id,
+          row.task_key,
+        )
+      ) {
+        throw foreignPr(existingUrl);
+      }
+    } else {
+      // §18.3: без `find` — переиспользуется pr_url прошлой выкладки
+      // этой задачи и ветки, если `view` отвечает OPEN; иначе create.
+      const prevUrl = deps.store.lastPrUrl(row.task_key, remoteBranch);
+      if (prevUrl) {
+        let view: PrView;
+        try {
+          view = await providerView(deps, prevUrl, project, mainDir);
+        } catch (e) {
+          throw new OrchestratorError(
+            "release-refused",
+            `провайдер PR (view): ${message(e)}`,
+          );
+        }
+        if (view.state === "OPEN") existingUrl = prevUrl;
+      }
     }
   }
+  // prov.type === "none": PR не ищется и не создаётся — только ветка.
+
   await pushWithToken(
     deps,
     repo,
@@ -3115,8 +3401,28 @@ async function publishRelease(
     // `threadIds` stays on, see the reuse check above).
     publishBranch: remoteBranch,
   });
-  let prUrl = existing?.url ?? null;
-  if (!existing) {
+
+  if (prov.type === "none") {
+    // §18.3: ветка выпуска опубликована, PR не открывается и не
+    // отслеживается — задачу в in_review, строка «ветка опубликована»
+    // собирается в finishPublished.
+    await runChecked(deps.bbCli, [
+      "tasks",
+      "update",
+      row.task_key,
+      "--status",
+      "in_review",
+    ]).catch((e) =>
+      deps.log?.warn?.(`release task status: ${message(e)}`),
+    );
+    deps.store.updateRelease(row.id, { status: "published" });
+    s.published++;
+    await finishPublished(deps, deps.store.getRelease(row.id) ?? row, null);
+    return;
+  }
+
+  let prUrl = existingUrl;
+  if (!existingUrl) {
     // §16.6: with thread ids off the PR title never carries the task's
     // title or key — the HEAD commit subject when it is free of bb
     // identifiers (`thr_…`, tracker keys), else `release <sha7>`
@@ -3138,22 +3444,65 @@ async function publishRelease(
       : subject && !hasBbIds(subject)
         ? subject
         : `release ${headSha.slice(0, 7)}`;
-    const created = await ghText(deps, repo, [
-      "pr",
-      "create",
-      "--base",
-      row.target_branch,
-      "--head",
-      remoteBranch,
-      "--title",
-      title,
-      "--body",
-      threadIds
-        ? `Источник: bb тред ${row.coordinator_thread_id}\n\n` +
-          `Задача: ${row.task_key}`
-        : "",
-    ]);
-    prUrl = GH_PR_URL_RE.exec(created)?.[0] ?? null;
+    // §18.6: тело — шаблон prBody проекта; при threadIds: false
+    // шаблон не применяется — тело пустое.
+    const body = threadIds
+      ? renderPrBody(project?.prBody ?? DEFAULT_PR_BODY, {
+          thread: row.coordinator_thread_id,
+          task: row.task_key,
+          title,
+        })
+      : "";
+    if (prov.type === "command") {
+      // §18.3: create — env + тело в stdin; ненулевой код — отказ, даже
+      // если URL напечатан; нет URL — «PR не открыт: <вывод>» (ветка
+      // уже запушена, повтор release откроет PR).
+      const res = await runPrProvider(deps, {
+        argv: prov.create!,
+        cwd: mainDir,
+        env: {
+          ORCH_BRANCH: remoteBranch,
+          ORCH_TARGET: row.target_branch,
+          ORCH_TITLE: title,
+        },
+        stdin: body,
+        timeoutSec: t.prCommandTimeoutSec,
+      });
+      if (res.exitCode !== 0) {
+        throw new OrchestratorError(
+          "release-refused",
+          `PR не открыт (код ${res.exitCode}): ` +
+            (maskCommandOutput(res.stderr || res.stdout) || "no output"),
+        );
+      }
+      prUrl = GH_PR_URL_RE.exec(res.stdout)?.[0] ?? null;
+      if (!prUrl) {
+        throw new OrchestratorError(
+          "release-refused",
+          `PR не открыт: ` +
+            (maskCommandOutput(res.stdout || res.stderr) || "нет вывода"),
+        );
+      }
+    } else {
+      const created = await ghText(
+        deps,
+        repo,
+        [
+          "pr",
+          "create",
+          "--base",
+          row.target_branch,
+          "--head",
+          remoteBranch,
+          "--title",
+          title,
+          "--body",
+          body,
+        ],
+        t.prCommandTimeoutSec * 1000,
+      );
+      prUrl = GH_PR_URL_RE.exec(created)?.[0] ?? null;
+    }
   }
   deps.store.updateRelease(row.id, { prUrl });
   // §2 r10 п.3: this row tracks the PR; older published rows on the
@@ -3172,7 +3521,7 @@ async function publishRelease(
   await finishPublished(
     deps,
     deps.store.getRelease(row.id) ?? row,
-    existing !== undefined,
+    existingUrl !== null,
   );
 }
 
@@ -3222,15 +3571,24 @@ async function finishPublished(
       `выложено ${fresh.task_key}: ${headSha.slice(0, 7)} в ` +
         `${fresh.target_branch}; задача done`,
     );
+  } else if (!fresh.pr_url) {
+    // §18.3 `none` (или провайдер, не вернувший URL): ветка легла, PR
+    // нет и слежения нет — без строки «слежу до влития».
+    const provType = await releaseProject(deps, fresh)
+      .then((p) => p?.prProvider.type ?? "github")
+      .catch(() => "github" as const);
+    parts.push(
+      provType === "none"
+        ? `ветка опубликована ${fresh.task_key}: ${pushedBranch}; ` +
+            `PR открой вручную`
+        : `PR открыт ${fresh.task_key}: —; слежу до влития`,
+    );
   } else {
     const existed =
-      prExisted ??
-      (fresh.pr_url
-        ? deps.store.otherReleaseByPrUrl(fresh.pr_url, fresh.id)
-        : false);
+      prExisted ?? deps.store.otherReleaseByPrUrl(fresh.pr_url, fresh.id);
     parts.push(
       `${existed ? "PR обновлён" : "PR открыт"} ${fresh.task_key}: ` +
-        `${fresh.pr_url ?? "—"}; слежу до влития`,
+        `${fresh.pr_url}; слежу до влития`,
     );
   }
   if (fresh.kb_note) parts.push(`KB-заметка: ${fresh.kb_note}`);

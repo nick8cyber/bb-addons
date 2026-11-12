@@ -351,6 +351,11 @@ function makeDeps(repo: string, overrides: Partial<{
   /** Open PRs `gh pr list` reports — a thunk so tests can flip the
    * answer between release rounds. */
   ghPrList: () => unknown[];
+  /** §18.3: ответ `gh` для команд вне встроенных заглушек (`auth
+   * status` и пр.); undefined → стандартный `{}` с кодом 0. */
+  ghFallback?: (
+    args: string[],
+  ) => { exitCode: number; stdout: string; stderr: string } | undefined;
   /** §17.3 (мелко 5): the reviewer thread's final output — the verdict
    * fallback when the task carries no verdict comment. */
   reviewThreadOutput: string | null;
@@ -573,7 +578,7 @@ function makeDeps(repo: string, overrides: Partial<{
   const tmp = mkdtempSync(join(tmpdir(), "hooks-"));
   const deps = {
     store, bbCli, threads: threads as never,
-    cmd: { run: async (file: string, args: string[], o?: { cwd?: string; stdin?: string }) => {
+    cmd: { run: async (file: string, args: string[], o?: { cwd?: string; stdin?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }) => {
       if (file === "gitleaks") return { exitCode: 0, stdout: "", stderr: "" };
       if (file === "gh") {
         overrides.ghCalls?.push(args);
@@ -591,11 +596,14 @@ function makeDeps(repo: string, overrides: Partial<{
             stdout: "https://example.test/pr/7\n",
             stderr: "",
           };
+        const fb = overrides.ghFallback?.(args);
+        if (fb) return fb;
         return { exitCode: 0, stdout: "{}", stderr: "" };
       }
       try {
         const out = execFileSync(file, args, {
           cwd: o?.cwd, encoding: "utf8", input: o?.stdin,
+          env: { ...process.env, ...(o?.env ?? {}) },
         });
         return { exitCode: 0, stdout: out, stderr: "" };
       } catch (e: unknown) {
@@ -1240,13 +1248,15 @@ test("pump: «Источник» line follows threadIds; repeat release on own P
     };
   };
   const on = await publish(true);
-  assert.match(on.body, /Источник: bb тред thr_coord/);
-  assert.match(on.body, /Задача: PLUG-1/);
+  // §18.6: тело по умолчанию — шаблон BB-Thread/BB-Task (прежний
+  // «Источник»/«Задача» — явной настройкой prBody у установки автора).
+  assert.match(on.body, /BB-Thread: thr_coord/);
+  assert.match(on.body, /BB-Task: PLUG-1/);
   assert.equal(on.head, "feat-x"); // local executor branch published as-is
   const off = await publish(false);
   // §16.6: with threadIds off nothing bb-identifiable reaches the remote
-  // — no «Источник», no «Задача: <KEY>», a neutral release/<sha7> head.
-  assert.doesNotMatch(off.body, /Источник|Задача/);
+  // — no thread/task markers, a neutral release/<sha7> head.
+  assert.doesNotMatch(off.body, /Источник|Задача|BB-Thread|BB-Task/);
   assert.match(off.head, /^release\/[0-9a-f]{7}$/);
 });
 
@@ -1470,7 +1480,7 @@ test("parseAddedLines: combined @@@ hunks — only all-+ columns scan", () => {
   ]);
 });
 
-test("f7: prWasReleased is scoped to the coordinator", () => {
+test("f7: prWasReleased is scoped to coordinator AND task (§18.3)", () => {
   const { store } = makeDeps("/tmp/x");
   const r = store.insertRelease({
     taskKey: "PLUG-9",
@@ -1482,8 +1492,20 @@ test("f7: prWasReleased is scoped to the coordinator", () => {
     targetBranch: "main",
   });
   store.updateRelease(r.id, { prUrl: "https://x.test/pr/1" });
-  assert.equal(store.prWasReleased("https://x.test/pr/1", "thr_a"), true);
-  assert.equal(store.prWasReleased("https://x.test/pr/1", "thr_b"), false);
+  assert.equal(
+    store.prWasReleased("https://x.test/pr/1", "thr_a", "PLUG-9"),
+    true,
+  );
+  assert.equal(
+    store.prWasReleased("https://x.test/pr/1", "thr_b", "PLUG-9"),
+    false,
+  );
+  // §18.3: «свой PR» — pr_url прошлых выкладок ЭТОЙ задачи этим
+  // координатором; другая задача того же координатора — чужая.
+  assert.equal(
+    store.prWasReleased("https://x.test/pr/1", "thr_a", "PLUG-8"),
+    false,
+  );
 });
 
 // ── §16.6 (PLUG-191): hunk counting, neutral title, stable branch ─────
@@ -3970,6 +3992,597 @@ test("r10 п.3: три сбоя gh подряд — строка «слежен�
   assert.equal(fresh.pr_state, "error");
   assert.equal(sent.filter((m) => /слежение за PR/.test(m)).length, 1);
 });
+
+// ── §18.3/§18.6: prProvider, prBody, requireNote (PLUG-248) ─────────
+
+test("§18.3 config: command требует create+view argv, find необязателен", () => {
+  const noView = parseReleaseConfig(
+    JSON.stringify({
+      projects: { p: { prProvider: { type: "command", create: ["/x/c"] } } },
+    }),
+  );
+  assert.ok(
+    noView.errors.some((e) => e.path === "projects.p.prProvider.view"),
+  );
+  const badArgv = parseReleaseConfig(
+    JSON.stringify({
+      projects: {
+        p: { prProvider: { type: "command", create: ["/x/c"], view: [] } },
+      },
+    }),
+  );
+  assert.ok(
+    badArgv.errors.some((e) => e.path === "projects.p.prProvider.view"),
+  );
+  const good = parseReleaseConfig(
+    JSON.stringify({
+      projects: {
+        p: {
+          prProvider: {
+            type: "command",
+            create: ["/x/c"],
+            view: ["/x/v"],
+            find: ["/x/f"],
+          },
+        },
+      },
+    }),
+  );
+  assert.equal(good.errors.length, 0);
+  const r = resolveProject(good.config!, "p");
+  assert.equal(r.prProvider.type, "command");
+  assert.deepEqual(r.prProvider.create, ["/x/c"]);
+  assert.deepEqual(r.prProvider.find, ["/x/f"]);
+  // github/none — argv-ключи игнорируются с предупреждением
+  const w = parseReleaseConfig(
+    JSON.stringify({
+      projects: { p: { prProvider: { type: "none", create: ["/x"] } } },
+    }),
+  );
+  assert.equal(w.errors.length, 0);
+  assert.ok(w.warnings.some((x) => x.path === "projects.p.prProvider.create"));
+  assert.equal(resolveProject(w.config!, "p").prProvider.type, "none");
+});
+
+test("§18.6 config: prBody/requireNote — дефолты и переопределение", () => {
+  const d = resolveProject(parseReleaseConfig(RELEASE_CFG).config!, "proj_main");
+  assert.equal(d.prBody, "BB-Thread: {thread}\n\nBB-Task: {task}");
+  assert.equal(d.requireNote, false);
+  const c = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        prBody: "Источник: bb тред {thread}\n\nЗадача: {task}",
+        requireNote: true,
+      },
+      projects: { p: { requireNote: false } },
+    }),
+  );
+  assert.equal(c.errors.length, 0);
+  const r = resolveProject(c.config!, "p");
+  assert.equal(r.requireNote, false, "ключ проекта перекрывает defaults");
+  assert.match(r.prBody, /^Источник: bb тред \{thread\}/);
+  const bad = parseReleaseConfig(
+    JSON.stringify({ projects: { p: { prBody: 42, requireNote: "yes" } } }),
+  );
+  assert.ok(bad.errors.some((e) => e.path === "projects.p.prBody"));
+  assert.ok(bad.errors.some((e) => e.path === "projects.p.requireNote"));
+});
+
+test("§18.3 п.0: gh не авторизован — отказ шага 1 до аудита", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, spawnCalls } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "pr", branch: "main" } },
+    }),
+    ghFallback: (args) =>
+      args[0] === "auth"
+        ? { exitCode: 1, stdout: "", stderr: "not logged in" }
+        : undefined,
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /провайдер PR недоступен/.test((e as OrchestratorError).message),
+  );
+  assert.equal(spawnCalls.length, 0, "аудит не раздавался");
+  assert.equal(
+    store.releasesByStatuses(["auditing", "publishing", "published"]).length,
+    0,
+  );
+});
+
+test("§18.3 п.0: command без исполняемого файла — отказ шага 1", async () => {
+  const { repo } = makeRepo();
+  const { deps, spawnCalls } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        prProvider: {
+          type: "command",
+          create: ["/definitely/missing/pr-create"],
+          view: ["/definitely/missing/pr-view"],
+        },
+      },
+    }),
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      /провайдер PR недоступен/.test((e as OrchestratorError).message) &&
+      /create/.test((e as OrchestratorError).message),
+  );
+  assert.equal(spawnCalls.length, 0);
+});
+
+test("§18.6 requireNote: без --kb/--no-kb — отказ шага 1", async () => {
+  const { repo } = makeRepo();
+  const { deps, spawnCalls } = makeDeps(repo, {
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        requireNote: true,
+      },
+    }),
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      /нужна заметка: --kb <заметка> или --no-kb <причина>/.test(
+        (e as OrchestratorError).message,
+      ),
+  );
+  assert.equal(spawnCalls.length, 0);
+  // с одним из флагов приёмка проходит
+  const res = await runRelease(
+    { taskKey: "PLUG-1", caller: COORD, noKb: "не требуется" },
+    deps,
+  );
+  assert.equal(res.status, "auditing");
+});
+
+test("§18.3 none: ветка опубликована, PR открой вручную, слежения нет", async () => {
+  const { repo } = makeRepo();
+  const ghCalls: string[][] = [];
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    ghCalls,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        prProvider: { type: "none" },
+      },
+    }),
+  });
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(rel.pr_url, null);
+  assert.equal(rel.pr_state, null, "слежения нет");
+  assert.equal(ghCalls.length, 0, "gh не вызывался вообще");
+  assert.ok(
+    sent.some((m) =>
+      /ветка опубликована PLUG-1: feat-x; PR открой вручную/.test(m),
+    ),
+    JSON.stringify(sent),
+  );
+  assert.ok(!sent.some((m) => /слежу до влития/.test(m)));
+  assert.ok(calls.some((c) => c.join(" ").includes("--status in_review")));
+  // и следующий такт ничего не добавляет — досмотр молчит
+  sent.length = 0;
+  await pumpReleases(deps);
+  assert.equal(sent.length, 0);
+});
+
+/** §18.3 command-провайдер: sh-скрипт в tmpdir — ответ и захват
+ * env/stdin файлами рядом со скриптом ($DIR). */
+const writePrTool = (dir: string, name: string, body: string): string => {
+  const p = join(dir, name);
+  writeFileSync(p, `#!/bin/sh\nDIR=$(dirname "$0")\n${body}\n`, {
+    mode: 0o755,
+  });
+  return p;
+};
+
+const PR_CMD_CFG = (create: string, view: string, find?: string) =>
+  JSON.stringify({
+    commitIdentity: "Agent <agent@x.io>",
+    defaults: {
+      target: { action: "pr", branch: "main" },
+      prProvider: {
+        type: "command",
+        create: [create],
+        view: [view],
+        ...(find ? { find: [find] } : {}),
+      },
+    },
+  });
+
+test("§18.3 command: create (env+stdin) → слежение через view", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(
+    dir,
+    "pr-create",
+    `cat > "$DIR/stdin.txt"
+env | grep '^ORCH_' | sort > "$DIR/env.txt"
+echo "https://example.test/pr/9"`,
+  );
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view),
+  });
+  let now = Date.now();
+  deps.now = () => now;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(rel.pr_url, "https://example.test/pr/9");
+  assert.equal(rel.pr_state, "open");
+  // §18.6: тело по умолчанию — BB-Thread/BB-Task — ушло в stdin
+  assert.equal(
+    readFileSync(join(dir, "stdin.txt"), "utf8"),
+    "BB-Thread: thr_coord\n\nBB-Task: PLUG-1",
+  );
+  const env = readFileSync(join(dir, "env.txt"), "utf8");
+  assert.match(env, /ORCH_BRANCH=feat-x/);
+  assert.match(env, /ORCH_TARGET=main/);
+  assert.match(env, /ORCH_TITLE=do x/);
+  assert.ok(
+    sent.some((m) =>
+      /PR открыт PLUG-1: https:\/\/example\.test\/pr\/9/.test(m)
+    ),
+    JSON.stringify(sent),
+  );
+  // §18.3: слежение — через command.view
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "MERGED", mergeCommit: "cafe1234567" }),
+  );
+  now += 6 * 60 * 1000;
+  sent.length = 0;
+  await pumpReleases(deps);
+  assert.equal(store.getRelease(rel.id)!.pr_state, "merged");
+  assert.ok(sent.some((m) => /PR влит PLUG-1: .*→ cafe123/.test(m)));
+  assert.ok(calls.some((c) => c.join(" ").includes("--status done")));
+});
+
+test("§18.3 command: find → «PR обновлён» без create", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(
+    dir,
+    "pr-create",
+    `echo x >> "$DIR/calls.txt"; cat "$DIR/url.txt"`,
+  );
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  const find = writePrTool(
+    dir,
+    "pr-find",
+    `cat "$DIR/find.txt" 2>/dev/null || true`,
+  );
+  writeFileSync(join(dir, "url.txt"), "https://example.test/pr/9\n");
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  writeFileSync(join(dir, "find.txt"), "");
+  const { deps, store, sent, exec, bindReview } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view, find),
+  });
+  await publishPr(deps, store);
+  const rel1 = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(rel1.pr_url, "https://example.test/pr/9");
+  // повторная выкладка: find отвечает URL, записанным у этой задачи
+  // этим координатором → «PR обновлён», create не вызывается
+  writeFileSync(join(dir, "find.txt"), "https://example.test/pr/9\n");
+  writeFileSync(join(repo, "more.txt"), "more\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const tip2 = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x",
+    sha: tip2,
+    commits: 2,
+    dirty: false,
+  });
+  bindReview(tip2);
+  sent.length = 0;
+  await publishPr(deps, store);
+  const rels = store.releasesByStatuses(["published"]);
+  assert.equal(rels.length, 2);
+  assert.equal(rels[1]!.pr_url, "https://example.test/pr/9");
+  assert.ok(
+    sent.some((m) => /PR обновлён PLUG-1/.test(m)),
+    JSON.stringify(sent),
+  );
+  assert.equal(
+    readFileSync(join(dir, "calls.txt"), "utf8").trim().split("\n").length,
+    1,
+    "create вызывался один раз",
+  );
+});
+
+test("§18.3 command: find вернул чужой PR — release в него не пишет", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(dir, "pr-create", `echo "https://example.test/pr/9"`);
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  // URL никогда не был записан выкладкой этой задачи этим координатором
+  const find = writePrTool(dir, "pr-find", `echo "https://example.test/pr/77"`);
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view, find),
+  });
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["failed"])[0]!;
+  assert.match(rel.error ?? "", /создан не этим release/);
+  assert.ok(sent.some((m) => /упала на публикации/.test(m)));
+});
+
+test("§18.3 command без find: view OPEN → переиспользование pr_url", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(
+    dir,
+    "pr-create",
+    `echo x >> "$DIR/calls.txt"; cat "$DIR/url.txt"`,
+  );
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  writeFileSync(join(dir, "url.txt"), "https://example.test/pr/9\n");
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  const { deps, store, sent, exec, bindReview } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view),
+  });
+  await publishPr(deps, store);
+  assert.equal(
+    store.releasesByStatuses(["published"])[0]!.pr_url,
+    "https://example.test/pr/9",
+  );
+  const nextRound = () => {
+    writeFileSync(join(repo, `more-${Date.now()}-${Math.random()}.txt`), "m\n");
+    gitR(repo, ["add", "."]);
+    gitR(repo, ["commit", "-m", "feat: more"]);
+    const tip = gitR(repo, ["rev-parse", "HEAD"]);
+    store.setRoundResult(exec.id, {
+      branch: "feat-x",
+      sha: tip,
+      commits: 2,
+      dirty: false,
+    });
+    bindReview(tip);
+  };
+  // заход 2: view OPEN → pr_url переиспользуется, create не вызывается
+  nextRound();
+  sent.length = 0;
+  await publishPr(deps, store);
+  const rels = store.releasesByStatuses(["published"]);
+  assert.equal(rels[1]!.pr_url, "https://example.test/pr/9");
+  assert.ok(sent.some((m) => /PR обновлён PLUG-1/.test(m)));
+  assert.equal(
+    readFileSync(join(dir, "calls.txt"), "utf8").trim().split("\n").length,
+    1,
+  );
+  // заход 3: view MERGED → новый PR через create
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "MERGED", mergeCommit: "abc1234" }),
+  );
+  writeFileSync(join(dir, "url.txt"), "https://example.test/pr/10\n");
+  nextRound();
+  sent.length = 0;
+  await publishPr(deps, store);
+  const rels3 = store.releasesByStatuses(["published"]);
+  assert.equal(rels3[2]!.pr_url, "https://example.test/pr/10");
+  assert.equal(
+    readFileSync(join(dir, "calls.txt"), "utf8").trim().split("\n").length,
+    2,
+  );
+  assert.ok(sent.some((m) => /PR открыт PLUG-1: https:\/\/example\.test\/pr\/10/.test(m)));
+});
+
+test("§18.3 command: create упал или не отдал URL → «PR не открыт»", async () => {
+  const run = async (createBody: string) => {
+    const { repo } = makeRepo();
+    const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+    const create = writePrTool(dir, "pr-create", createBody);
+    const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+    writeFileSync(join(dir, "view.json"), "{}");
+    const { deps, store, sent } = makeDeps(repo, {
+      auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+      releaseText: PR_CMD_CFG(create, view),
+    });
+    await publishPr(deps, store);
+    return { rel: store.releasesByStatuses(["failed"])[0]!, sent };
+  };
+  // ненулевой код — отказ, даже если URL напечатан
+  const a = await run(`echo "https://example.test/pr/9"; exit 3`);
+  assert.match(a.rel.error ?? "", /PR не открыт \(код 3\)/);
+  // код 0, но URL нет — отказ «PR не открыт: <вывод>»
+  const b = await run(`echo "nothing here"`);
+  assert.match(b.rel.error ?? "", /PR не открыт: nothing here/);
+});
+
+test("§18.3 command: view сломан — prErrorLimit → «слежение невозможно»", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(dir, "pr-create", `echo "https://example.test/pr/9"`);
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view),
+  });
+  let now = Date.now();
+  deps.now = () => now;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  // провайдер начал отвечать не-JSON — ошибка провайдера, не «open»
+  writeFileSync(join(dir, "view.json"), "not-json{{{");
+  for (let i = 0; i < 3; i++) {
+    now += 6 * 60 * 1000;
+    await pumpReleases(deps);
+  }
+  assert.equal(store.getRelease(rel.id)!.pr_state, "error");
+  assert.equal(
+    sent.filter((m) => /слежение за PR/.test(m)).length,
+    1,
+  );
+});
+
+test("§18.3: маркер BB-Thread узнаётся — свой → обновление, чужой → отказ", async () => {
+  const run = async (body: string) => {
+    const { repo } = makeRepo();
+    const ghCalls: string[][] = [];
+    const { deps, store, sent } = makeDeps(repo, {
+      ghCalls,
+      ghPrList: () => [
+        {
+          url: "https://example.test/pr/7",
+          body,
+          headRefName: "feat-x",
+          baseRefName: "main",
+        },
+      ],
+      auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+      releaseText: JSON.stringify({
+        commitIdentity: "Agent <agent@x.io>",
+        defaults: { target: { action: "pr", branch: "main" } },
+      }),
+    });
+    await publishPr(deps, store);
+    return { store, sent, ghCalls };
+  };
+  const own = await run("BB-Thread: thr_coord\n\nBB-Task: PLUG-1");
+  const rel = own.store.releasesByStatuses(["published"])[0]!;
+  assert.equal(rel.pr_url, "https://example.test/pr/7");
+  assert.ok(own.sent.some((m) => /PR обновлён/.test(m)));
+  assert.equal(
+    own.ghCalls.filter((a) => a[1] === "create").length,
+    0,
+    "create не вызывался — PR уже наш",
+  );
+  const foreign = await run("BB-Thread: thr_other\n\nBB-Task: PLUG-2");
+  const failed = foreign.store.releasesByStatuses(["failed"])[0]!;
+  assert.match(failed.error ?? "", /создан не этим release/);
+});
+
+test("§18.3: шаблон без {thread} — «чей PR» по своим записям", async () => {
+  const { repo } = makeRepo();
+  let prs: unknown[] = [];
+  const cfg = JSON.stringify({
+    commitIdentity: "Agent <agent@x.io>",
+    defaults: {
+      target: { action: "pr", branch: "main" },
+      prBody: "custom body without markers",
+    },
+  });
+  const { deps, store, sent, exec, bindReview } = makeDeps(repo, {
+    ghPrList: () => prs,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: cfg,
+  });
+  await publishPr(deps, store);
+  const rel1 = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(rel1.pr_url, "https://example.test/pr/7");
+  // GitHub сообщает открытый PR без маркера — по записям он наш
+  prs = [
+    {
+      url: "https://example.test/pr/7",
+      body: "custom body without markers",
+      headRefName: "feat-x",
+      baseRefName: "main",
+    },
+  ];
+  writeFileSync(join(repo, "more.txt"), "more\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const tip2 = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x",
+    sha: tip2,
+    commits: 2,
+    dirty: false,
+  });
+  bindReview(tip2);
+  sent.length = 0;
+  await publishPr(deps, store);
+  assert.equal(
+    store.releasesByStatuses(["published"])[1]!.pr_url,
+    "https://example.test/pr/7",
+  );
+  assert.ok(sent.some((m) => /PR обновлён/.test(m)));
+  // чужой PR без маркера — записей нет → release в него не пишет
+  const { repo: repo2 } = makeRepo();
+  const { deps: deps2, store: store2 } = makeDeps(repo2, {
+    ghPrList: () => [
+      {
+        url: "https://example.test/pr/8",
+        body: "custom body without markers",
+        headRefName: "feat-x",
+        baseRefName: "main",
+      },
+    ],
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: cfg,
+  });
+  await publishPr(deps2, store2);
+  assert.match(
+    store2.releasesByStatuses(["failed"])[0]!.error ?? "",
+    /создан не этим release/,
+  );
+});
+
+test("§18.6 prBody: дефолт, шаблон автора байт-в-байт, {title}, threadIds off — пусто", async () => {
+  const bodyOf = async (extra: Record<string, unknown>) => {
+    const { repo } = makeRepo();
+    const ghCalls: string[][] = [];
+    const { deps, store } = makeDeps(repo, {
+      ghCalls,
+      auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+      releaseText: JSON.stringify({
+        commitIdentity: "Agent <agent@x.io>",
+        defaults: { target: { action: "pr", branch: "main" }, ...extra },
+      }),
+    });
+    await publishPr(deps, store);
+    const create = ghCalls.find((a) => a[1] === "create")!;
+    return create[create.indexOf("--body") + 1]!;
+  };
+  // дефолт §18.6
+  assert.equal(await bodyOf({}), "BB-Thread: thr_coord\n\nBB-Task: PLUG-1");
+  // живой шаблон установки автора — тело остаётся байт-в-байт как было
+  assert.equal(
+    await bodyOf({ prBody: "Источник: bb тред {thread}\n\nЗадача: {task}" }),
+    "Источник: bb тред thr_coord\n\nЗадача: PLUG-1",
+  );
+  assert.equal(await bodyOf({ prBody: "{title} :: {task}" }), "do x :: PLUG-1");
+  // threadIds: false — шаблон не применяется вовсе
+  assert.equal(
+    await bodyOf({ threadIds: false, prBody: "x {thread} {task}" }),
+    "",
+  );
+});
+
 
 test("r10 п.4: аудит не завершился за 30 мин — отказ и стоп треда", async () => {
   const { repo } = makeRepo();
