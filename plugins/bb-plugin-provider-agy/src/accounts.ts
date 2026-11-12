@@ -141,6 +141,25 @@ function writeJsonAtomic(path: string, value: unknown): void {
 }
 
 /**
+ * Set an own enumerable property on an object without invoking prototype
+ * setters (e.g. `__proto__`). Standard dynamic assignment `obj[k] = v`
+ * triggers Object.prototype.__proto__ setter, poisoning the prototype
+ * instead of storing an own property.
+ */
+function setOwn<T extends object, K extends PropertyKey, V>(
+  obj: T,
+  key: K,
+  val: V,
+): void {
+  Object.defineProperty(obj, key, {
+    value: val,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/**
  * Effective view over shared + instance-local files:
  * - conversations = union(legacy shared field, conversations-state.json),
  *   local wins; legacy pins migrate eagerly so a first shared save cannot
@@ -215,15 +234,15 @@ export function loadLedger(dataDir: string): AccountsLedger {
       // that never carried the field should not hide the diagnostic the
       // shared file still has.
       const parkedReason = o.parkedReason ?? s?.parkedReason;
-      accounts[label] = {
+      setOwn(accounts, label, {
         cooldownUntilMs: Math.max(s?.cooldownUntilMs ?? 0, o.cooldownUntilMs ?? 0),
         lastUsedMs: Math.max(s?.lastUsedMs ?? 0, o.lastUsedMs ?? 0),
         lastError: o.lastError ?? null,
         ...(ineligibleAtMs > 0 ? { ineligibleAtMs } : {}),
         ...(parkedReason !== undefined ? { parkedReason } : {}),
-      };
+      });
     } else if (s !== undefined) {
-      accounts[label] = s;
+      setOwn(accounts, label, s);
     }
   }
   return { accounts, conversations, dirtyLabels: new Set(), overlayStamps };
@@ -259,7 +278,7 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
         ? ledger.conversations[key]
         : undefined;
       if (label !== undefined) {
-        mergedConversations[key] = label;
+        setOwn(mergedConversations, key, label);
       }
     }
     writeJsonAtomic(conversationsPath, {
@@ -364,7 +383,8 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
         entry.ineligibleAtMs ?? 0,
         diskEntry?.ineligibleAtMs ?? 0,
       );
-      merged[label] = {
+      const writtenMs = Math.max(now, diskEntry?.writtenMs ?? 0);
+      setOwn(merged, label, {
         cooldownUntilMs: Math.max(
           entry.cooldownUntilMs ?? 0,
           diskEntry?.cooldownUntilMs ?? 0,
@@ -378,11 +398,11 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
         ...(freshSide.parkedReason !== undefined
           ? { parkedReason: freshSide.parkedReason }
           : {}),
-        writtenMs: Math.max(now, diskEntry?.writtenMs ?? 0),
-      };
+        writtenMs,
+      });
       (ledger.overlayStamps ??= new Map()).set(
         label,
-        merged[label].writtenMs,
+        writtenMs,
       );
     }
     for (const label of Object.keys(merged)) {
@@ -415,7 +435,7 @@ function ledgerEntry(
       lastUsedMs: 0,
       lastError: null,
     };
-    ledger.accounts[label] = entry;
+    setOwn(ledger.accounts, label, entry);
   }
   return entry;
 }
@@ -483,7 +503,7 @@ export function rememberConversation(
   providerThreadId: string,
   label: string,
 ): void {
-  ledger.conversations[providerThreadId] = label;
+  setOwn(ledger.conversations, providerThreadId, label);
   (ledger.dirtyPins ??= new Set()).add(providerThreadId);
 }
 

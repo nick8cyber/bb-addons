@@ -839,6 +839,99 @@ check(
   );
 }
 
+// A29: label "__proto__" cools down honestly — own property in shared and
+// overlay, not polluting Object.prototype; neighbors without entries do not see
+// phantom cooldowns; cooldown is visible to pickAccount.
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-localstate-protowrite-"));
+  mkdirSync(join(dir, "accounts", "__proto__"), { recursive: true });
+  mkdirSync(join(dir, "accounts", "sibling"), { recursive: true });
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      sibling: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  const l = loadLedger(dir);
+  const cooldownUntil = Date.now() + 60_000;
+  markAccountCooldown(l, "__proto__", cooldownUntil, "rate-limit-429");
+  saveLedger(dir, l);
+  const ov = readJson(join(dir, "accounts-overlay.json"))?.accounts ?? {};
+  const sh = readJson(join(dir, "accounts-state.json"))?.accounts ?? {};
+  const homes = [
+    { label: "__proto__", home: join(dir, "accounts", "__proto__"), proxy: null },
+    { label: "sibling", home: join(dir, "accounts", "sibling"), proxy: null },
+  ];
+  const picked = pickAccount(l, homes);
+  const l2 = loadLedger(dir);
+  const picked2 = pickAccount(l2, homes);
+  check(
+    "localstate/proto-cooldown-honest-no-phantom-neighbor",
+    Object.hasOwn(l.accounts, "__proto__") &&
+      l.accounts["__proto__"].cooldownUntilMs === cooldownUntil &&
+      l.accounts["__proto__"].lastError === "rate-limit-429" &&
+      l.accounts.sibling?.cooldownUntilMs === 0 &&
+      l.accounts.other?.cooldownUntilMs === undefined &&
+      Object.hasOwn(ov, "__proto__") &&
+      ov["__proto__"].cooldownUntilMs === cooldownUntil &&
+      ov["__proto__"].lastError === "rate-limit-429" &&
+      ov.other?.cooldownUntilMs === undefined &&
+      Object.hasOwn(sh, "__proto__") &&
+      sh["__proto__"].cooldownUntilMs === cooldownUntil &&
+      sh["__proto__"].lastError === "rate-limit-429" &&
+      sh.other?.cooldownUntilMs === undefined &&
+      Object.hasOwn(l2.accounts, "__proto__") &&
+      l2.accounts["__proto__"].cooldownUntilMs === cooldownUntil &&
+      l2.accounts.sibling?.cooldownUntilMs === 0 &&
+      l2.accounts.other?.cooldownUntilMs === undefined &&
+      picked?.label === "sibling" &&
+      picked2?.label === "sibling" &&
+      !Object.prototype.hasOwnProperty("cooldownUntilMs") &&
+      !Object.prototype.hasOwnProperty("lastError"),
+    JSON.stringify({
+      ov: ov["__proto__"],
+      sh: sh["__proto__"],
+      picked: picked?.label,
+      picked2: picked2?.label,
+      protoPolluted: Object.prototype.hasOwnProperty("cooldownUntilMs"),
+      otherCool: l.accounts.other?.cooldownUntilMs,
+    }),
+  );
+}
+
+// A30: conversation pin with prototype name "__proto__" is saved as an own
+// property in conversations-state.json and survives loadLedger.
+{
+  const cp = mkdtempSync(join(tmpdir(), "agy-localstate-protoconv-proto-"));
+  writeJson(join(cp, "accounts-state.json"), {
+    accounts: {
+      a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  writeJson(join(cp, "conversations-state.json"), {
+    conversations: {},
+  });
+  const l = loadLedger(cp);
+  rememberConversation(l, "__proto__", "a1");
+  saveLedger(cp, l);
+  const conv =
+    readJson(join(cp, "conversations-state.json"))?.conversations ?? {};
+  const l2 = loadLedger(cp);
+  check(
+    "localstate/proto-pin-conversation-persists",
+    Object.hasOwn(l.conversations, "__proto__") &&
+      l.conversations["__proto__"] === "a1" &&
+      conversationAccount(l, "__proto__") === "a1" &&
+      Object.hasOwn(conv, "__proto__") &&
+      conv["__proto__"] === "a1" &&
+      conv.other === undefined &&
+      Object.hasOwn(l2.conversations, "__proto__") &&
+      l2.conversations["__proto__"] === "a1" &&
+      conversationAccount(l2, "__proto__") === "a1" &&
+      !Object.prototype.hasOwnProperty("a1"),
+    JSON.stringify(conv),
+  );
+}
+
 // ===========================================================================
 // Part B — end-to-end on the built bridge, once per transport.
 // ===========================================================================
