@@ -78,9 +78,15 @@ import {
   type ReleaseConfigLoad,
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
+import { createCommandRunner } from "./src/commands.js";
+import {
+  checkExecSettings,
+  execSettingsChanges,
+} from "./src/trust.js";
 import { isEnvironmentGone, runMerge } from "./src/merge.js";
 import {
   pumpReleases,
+  releaseAllPostPublishLocks,
   releaseThreadsGet,
   runRelease,
   settingsProjectId,
@@ -220,6 +226,20 @@ export async function createPlugin(
         "§17.1: plugin ids whose threads continue a human chat (session handoff, chat compaction into a new thread) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default `handoff, external-compact`.",
       default: "handoff external-compact",
     },
+    maxConcurrentCommands: {
+      type: "string",
+      label: "Max concurrent commands",
+      description:
+        "§18.2: cap on simultaneously running journaled commands (postPublish/event hooks). Default 4.",
+      default: "4",
+    },
+    retentionDays: {
+      type: "string",
+      label: "Command journal retention (days)",
+      description:
+        "§18.2: command_runs journal entries older than this are pruned. Default 30.",
+      default: "30",
+    },
     janitor: {
       type: "string",
       label: "Janitor",
@@ -247,6 +267,24 @@ export async function createPlugin(
   const store = new DelegationStore(db);
   const janitorStore = new JanitorStore(db);
   const enqueue = createDelegateQueue();
+  const positiveInt = (v: string | undefined, dflt: number): number => {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 1 ? n : dflt;
+  };
+  // §18.2 (PLUG-245): общий запускатель журнальных команд. Сразу
+  // recover(): running записи прошлого процесса — живая группа
+  // убивается, запись interrupted; queued запустит следующий pump.
+  const commandRunner = createCommandRunner({
+    store,
+    maxConcurrent: () =>
+      positiveInt(currentSettings.maxConcurrentCommands, 4),
+    warn: (m) => bb.log.warn(m),
+  });
+  void commandRunner
+    .recover()
+    .catch((e) =>
+      bb.log.warn(`orchestrator commands recover: ${describeError(e)}`),
+    );
 
   // The probes behind the §3 executor heuristics; one implementation for
   // `configure`, `delegate`, and the CLI caller check.
@@ -427,13 +465,38 @@ export async function createPlugin(
     // message tells the user how to re-check after fixing the setting.
     if (problem) bb.status.needsConfiguration(`orchestrator: ${problem}`);
   };
+  // §18.4 (PLUG-245): доверие по снимку исполняемых настроек —
+  // первый снимок молча, расхождение — строка координаторам с
+  // незавершённой работой + список ключей в plugin_meta (значений нет).
+  const execSettingsCheck = () =>
+    checkExecSettings({
+      store,
+      cfg: releaseConfig.config,
+      cfgBroken: releaseConfig.errors.length > 0,
+      send: async (threadId, text) => {
+        await bb.sdk.threads.send({
+          threadId,
+          mode: "queue-if-active",
+          input: [{ type: "text", text: `[orchestrator] ${text}`, mentions: [] }],
+        });
+      },
+      warn: (m) => bb.log.warn(m),
+    }).catch((e) =>
+      bb.log.warn(`orchestrator exec-settings: ${describeError(e)}`),
+    );
+
   refreshStatus();
   maybeCheckPresets();
+  void execSettingsCheck();
 
   settings.onChange((next) => {
     currentSettings = next;
     policyLoad = parsePolicy(currentSettings.policy ?? "");
     releaseConfig = parseReleaseConfig(currentSettings.release ?? "");
+    for (const w of releaseConfig.warnings) {
+      bb.log.warn(`orchestrator release config: ${w.path}: ${w.message}`);
+    }
+    void execSettingsCheck();
     for (const e of janitorConfig().errors) {
       bb.log.warn(`orchestrator janitor: ${e.path}: ${e.message}`);
     }
@@ -672,6 +735,11 @@ export async function createPlugin(
     // §17.3 (С1): only the release-auditor dispatch goes through the
     // delegate queue — the outer release flow runs outside it.
     enqueue,
+    commandRunner,
+    commandRetentionDays: () =>
+      positiveInt(currentSettings.retentionDays, 30),
+    // PLUG-245 Б2: владелец замков копии postPublish — этот экземпляр.
+    instanceId: `orch-${process.pid}-${Math.random().toString(36).slice(2, 10)}`,
     log: bb.log,
   };
   const pumpRelease = () =>
@@ -895,6 +963,10 @@ export async function createPlugin(
           serviceRunning = false;
           clearInterval(reconcileTimer);
           clearInterval(timersTimer);
+          // §18.2: живым группам SIGTERM, записи — interrupted.
+          void commandRunner.stopAll();
+          // §18.5: замки копий postPublish не переживают экземпляр.
+          releaseAllPostPublishLocks();
           resolve();
         };
         if (signal.aborted) {
@@ -1146,6 +1218,9 @@ export async function createPlugin(
       counts,
       limits: policyLoad.policy?.limits ?? null,
       delegations,
+      // §18.4: изменённые исполняемые настройки — имена и хеши,
+      // без значений.
+      execSettingsChanges: execSettingsChanges(store),
     };
   };
 
@@ -1421,7 +1496,12 @@ export async function createPlugin(
             (res.limits?.maxActive !== undefined
               ? `/${res.limits.maxActive}`
               : "") +
-            `  counts: ${JSON.stringify(res.counts)}\n`;
+            `  counts: ${JSON.stringify(res.counts)}\n` +
+            (res.execSettingsChanges.length
+              ? `изменённые исполняемые настройки: ${res.execSettingsChanges
+                  .map((c) => c.key)
+                  .join(", ")}\n`
+              : "");
           for (const d of res.delegations) out += renderDelegation(d) + "\n";
           if (!res.delegations.length) out += "no delegations\n";
           return { exitCode: 0, stdout: out };
