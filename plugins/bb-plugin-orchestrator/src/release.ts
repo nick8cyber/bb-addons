@@ -2666,16 +2666,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         deps.store.metaDelete(ppMarker);
         continue;
       }
-      const pp = await runPostPublish(deps, fresh, "pr.merged").catch(
-        (e) => {
-          releasePostPublishLock(fresh.id);
-          return {
-            done: true,
-            summary: `postPublish: ${message(e)}`,
-            selfReload: null,
-          };
-        },
-      );
+      const pp = await runPostPublishGuarded(deps, fresh, "pr.merged");
       if (!pp.done) continue;
       // Замок копии не переживает итог postPublish — в том числе при
       // раннем done внутри runPostPublish (идемпотентно).
@@ -3206,15 +3197,10 @@ async function finishPublished(
   let selfReload: { rootDir: string; expectedSha: string } | null = null;
   let ppSummary: string | null = null;
   {
-    const pp = await runPostPublish(deps, fresh, "release.published").catch(
-      (e) => {
-        releasePostPublishLock(fresh.id);
-        return {
-          done: true,
-          summary: `postPublish: ${message(e)}`,
-          selfReload: null,
-        };
-      },
+    const pp = await runPostPublishGuarded(
+      deps,
+      fresh,
+      "release.published",
     );
     if (!pp.done) return;
     // Замок копии не переживает итог postPublish — в том числе при
@@ -3426,6 +3412,41 @@ async function publishedChangedPaths(
     .catch(() => null);
   if (!res || res.exitCode !== 0) return null;
   return res.stdout.split("\n").filter(Boolean);
+}
+
+/** §18.5 (ревью заход 6): бросок из runPostPublish при ЖИВОЙ команде
+ * выкладки — замок и итог держатся (pending, ошибка в журнал плагина),
+ * повтор следующим тактом; журнал не прочитан — консервативно то же.
+ * Без running — как раньше: итог «postPublish: <ошибка>», замок снят. */
+async function runPostPublishGuarded(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+  event: "release.published" | "pr.merged",
+): Promise<PostPublishResult> {
+  try {
+    return await runPostPublish(deps, row, event);
+  } catch (e) {
+    let running = true;
+    try {
+      running = deps.store
+        .commandRunsByGroup(`pp:${row.id}`)
+        .some((r) => r.status === "running");
+    } catch {
+      // журнал не прочитан — считаем команду живой, замок и итог держим
+    }
+    if (running) {
+      deps.log?.warn?.(
+        `orchestrator: postPublish ${row.task_key}: ${message(e)}`,
+      );
+      return { done: false, summary: null, selfReload: null };
+    }
+    releasePostPublishLock(row.id);
+    return {
+      done: true,
+      summary: `postPublish: ${message(e)}`,
+      selfReload: null,
+    };
+  }
 }
 
 /**

@@ -5401,6 +5401,57 @@ test("§18.5 (заход 5): ранний выход при queued — skipped �
   releaseAllPostPublishLocks();
 });
 
+test("§18.5 (заход 6): бросок store при running — замок и итог держатся, после resolve — итог", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }]),
+  });
+  const deps2 = {
+    ...deps,
+    commandRunner: cmdRunner(store, fake),
+    instanceId: "inst-1",
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const lock = join(seed, ".git", "orchestrator-merge.lock");
+  assert.ok(existsSync(lock), "команда в полёте — замок держится");
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:a`)!.status,
+    "running",
+  );
+  // §18.5 (ревью заход 6): store кинул внутри runPostPublish — пока
+  // команда running, замок не снимается и итог не отдаётся (повтор
+  // следующим тактом), ошибка — только в журнал плагина.
+  const origByKey = store.commandRunByKey.bind(store);
+  store.commandRunByKey = () => {
+    throw new Error("store down");
+  };
+  try {
+    await pumpReleases(deps2);
+  } finally {
+    store.commandRunByKey = origByKey;
+  }
+  assert.ok(existsSync(lock), "бросок при running — замок на месте");
+  assert.ok(
+    !sent.some((m) => /выложено/.test(m)),
+    "итог не отдан, пока команда running",
+  );
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:a`)!.status,
+    "running",
+  );
+  // Команда завершилась — следующий такт отдаёт итог и снимает замок.
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.ok(!existsSync(lock), "замок снят после завершения команды");
+  assert.ok(sent.some((m) => /выложено/.test(m)), "итог отдан");
+  releaseAllPostPublishLocks();
+});
+
 test("§18.5 (заход 4): stop во время acquire — замок отпускается сразу", async () => {
   const { repo, seed } = makeRepo();
   const fake = cmdFake();
