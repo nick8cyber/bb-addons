@@ -4,6 +4,7 @@
  * `thread_roles` are added by the roles task (PLUG-141), after these.
  */
 import type { Database } from "better-sqlite3";
+import { OrchestratorError } from "./errors.js";
 
 export const MIGRATIONS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS delegations (
@@ -203,6 +204,25 @@ export const MIGRATIONS: readonly string[] = [
     error TEXT,
     created_at INTEGER NOT NULL
   )`,
+  // orchestrator-release §7 (r10): `notified_at` — итоговая строка п.1
+  // отправлена (захват -1 до отправки, stale 2 мин); `repo_root` —
+  // realpath основного каталога репозитория, идентичность цели п.0;
+  // `pr_*` — слежение за PR п.3 (одна запись на pr_url, 72 ч,
+  // счётчик сбоев gh). В delegations `verdict_*` — напоминание
+  // ревьюеру/аудитору без вердикта (§17 r31).
+  `ALTER TABLE releases ADD COLUMN notified_at INTEGER`,
+  `ALTER TABLE releases ADD COLUMN repo_root TEXT`,
+  `ALTER TABLE releases ADD COLUMN pr_state TEXT`,
+  `ALTER TABLE releases ADD COLUMN pr_checked_at INTEGER`,
+  `ALTER TABLE releases ADD COLUMN pr_closed_at INTEGER`,
+  `ALTER TABLE releases ADD COLUMN pr_stale_notified INTEGER`,
+  `ALTER TABLE releases ADD COLUMN pr_error_count INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE delegations ADD COLUMN verdict_nudged_at INTEGER`,
+  `ALTER TABLE delegations ADD COLUMN verdict_nudge_seq INTEGER`,
+  `UPDATE releases SET notified_at = CAST(strftime('%s','now') AS INTEGER)*1000
+   WHERE status IN ('published','rejected','failed') AND notified_at IS NULL`,
+  `UPDATE releases SET pr_state = 'legacy'
+   WHERE pr_url IS NOT NULL AND pr_state IS NULL`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -258,6 +278,10 @@ export interface DelegationRow {
   last_response_at: number | null;
   /** §4.1 r28: «задача без кода» — коммитов не ждём, коммиты — находка. */
   no_code: number;
+  /** §17 r31: ревьюер/аудитор завершил ход без вердикта — напоминание
+   * отправлено (время и seq журнала на момент отправки). */
+  verdict_nudged_at: number | null;
+  verdict_nudge_seq: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -304,6 +328,18 @@ export interface ReleaseRow {
   pipeline_shas: string | null;
   /** §6 (r8): проект настройки, записанный на шаге 1. */
   settings_project_id: string | null;
+  /** §2 r10 п.5: итоговая строка п.1 отправлена; -1 — захват. */
+  notified_at: number | null;
+  /** §2 r10 п.0: realpath основного каталога репозитория — идентичность
+   * цели вместе с target_branch. */
+  repo_root: string | null;
+  /** §2 r10 п.3: open | closed | merged | stale | error | legacy |
+   * superseded | closed_final. */
+  pr_state: string | null;
+  pr_checked_at: number | null;
+  pr_closed_at: number | null;
+  pr_stale_notified: number | null;
+  pr_error_count: number;
   error: string | null;
   created_at: number;
   updated_at: number;
@@ -1286,32 +1322,247 @@ export class DelegationStore {
     noKbReason?: string | null;
     /** §6 (r8): resolved on step 1; absent only on pre-r8 rows. */
     settingsProjectId?: string | null;
+    /** §2 r10 п.0: realpath основного каталога репозитория. С ним
+     * вставка атомарно отказывает, когда в ту же цель (repo_root +
+     * target_branch) уже идёт auditing/publishing выкладка. */
+    repoRoot?: string | null;
   }): ReleaseRow {
     const now = Date.now();
+    const insert = this.db.transaction((): ReleaseRow => {
+      if (input.repoRoot) {
+        const busy = this.db
+          .prepare(
+            `SELECT id, task_key FROM releases
+             WHERE status IN ('auditing','publishing')
+               AND target_branch = ? AND repo_root = ? LIMIT 1`,
+          )
+          .get(input.targetBranch, input.repoRoot) as
+          | { id: number; task_key: string }
+          | undefined;
+        if (busy) {
+          throw new OrchestratorError(
+            "release-target-busy",
+            `в цель ${input.targetBranch} уже идёт выкладка ` +
+              `${busy.task_key} — одна выкладка в цель за раз`,
+          );
+        }
+      }
+      const info = this.db
+        .prepare(
+          `INSERT INTO releases (
+            task_key, project_id, coordinator_thread_id, repo_path, branch,
+            target_action, target_branch, status, no_docs_reason, kb_note,
+            no_kb_reason, settings_project_id, repo_root, created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'auditing', ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          normalizeTaskKey(input.taskKey),
+          input.projectId,
+          input.coordinatorThreadId,
+          input.repoPath,
+          input.branch,
+          input.targetAction,
+          input.targetBranch,
+          input.noDocsReason ?? null,
+          input.kbNote ?? null,
+          input.noKbReason ?? null,
+          input.settingsProjectId ?? null,
+          input.repoRoot ?? null,
+          now,
+          now,
+        );
+      return this.getRelease(Number(info.lastInsertRowid))!;
+    });
+    return insert();
+  }
+
+  /** §2 r10 п.0: активные выкладки без записанного repo_root — строки
+   * до r10; вызывающий вычисляет корень и дозаписывает, чтобы гейт одной
+   * выкладки в цель их тоже видел. */
+  releasesMissingRepoRoot(): ReleaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases
+         WHERE status IN ('auditing','publishing') AND repo_root IS NULL
+         ORDER BY id`,
+      )
+      .all() as ReleaseRow[];
+  }
+
+  setReleaseRepoRoot(id: number, repoRoot: string): void {
+    this.db
+      .prepare(`UPDATE releases SET repo_root = ? WHERE id = ?`)
+      .run(repoRoot, id);
+  }
+
+  /** §2 r10 п.5: захват итоговой строки — тот же протокол -1/stale
+   * 2 мин, что claimResultDelivery (PLUG-190). */
+  claimReleaseNotify(id: number): boolean {
+    const staleBefore = Date.now() - 120_000;
     const info = this.db
       .prepare(
-        `INSERT INTO releases (
-          task_key, project_id, coordinator_thread_id, repo_path, branch,
-          target_action, target_branch, status, no_docs_reason, kb_note,
-          no_kb_reason, settings_project_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'auditing', ?, ?, ?, ?, ?, ?)`,
+        `UPDATE releases SET notified_at = -1, updated_at = ?
+         WHERE id = ? AND (
+           notified_at IS NULL
+           OR (notified_at = -1 AND updated_at < ?)
+         )`,
       )
-      .run(
-        normalizeTaskKey(input.taskKey),
-        input.projectId,
-        input.coordinatorThreadId,
-        input.repoPath,
-        input.branch,
-        input.targetAction,
-        input.targetBranch,
-        input.noDocsReason ?? null,
-        input.kbNote ?? null,
-        input.noKbReason ?? null,
-        input.settingsProjectId ?? null,
-        now,
-        now,
-      );
-    return this.getRelease(Number(info.lastInsertRowid))!;
+      .run(Date.now(), id, staleBefore);
+    return info.changes > 0;
+  }
+
+  confirmReleaseNotify(id: number): void {
+    this.db
+      .prepare(`UPDATE releases SET notified_at = ? WHERE id = ?`)
+      .run(Date.now(), id);
+  }
+
+  releaseReleaseNotify(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET notified_at = NULL
+         WHERE id = ? AND notified_at = -1`,
+      )
+      .run(id);
+  }
+
+  /** §2 r10 п.5: published-выкладки без подтверждённой итоговой строки —
+   * досмотр конвейера (включая устаревшие захваты). */
+  pendingPublishNotify(): ReleaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases
+         WHERE status = 'published' AND (
+           notified_at IS NULL
+           OR (notified_at = -1 AND updated_at < ?)
+         )
+         ORDER BY id`,
+      )
+      .all(Date.now() - 120_000) as ReleaseRow[];
+  }
+
+  /** §2 r10 п.3: запись только что получила pr_url — начинаем следить.
+   * Повторная инициализация (retry после сбоя) состояние не трогает. */
+  initPrTracking(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET pr_state = 'open'
+         WHERE id = ? AND pr_url IS NOT NULL AND pr_state IS NULL`,
+      )
+      .run(id);
+  }
+
+  /** §2 r10 п.3: записи выкладок, по которым идёт слежение за PR. */
+  trackedPrReleases(): ReleaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases
+         WHERE status = 'published' AND pr_url IS NOT NULL
+           AND pr_state IN ('open','closed')
+         ORDER BY id`,
+      )
+      .all() as ReleaseRow[];
+  }
+
+  /** §2 r10 п.3: одна запись на pr_url — трекинг ведёт новейшая. */
+  latestReleaseByPrUrl(prUrl: string): ReleaseRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM releases WHERE pr_url = ? ORDER BY id DESC LIMIT 1`,
+      )
+      .get(prUrl) as ReleaseRow | undefined;
+  }
+
+  /** Условный переход pr_state — охрана строк п.3: UPDATE не сработал,
+   * значит строку уже отправил другой такт. updated_at НЕ двигаем —
+   * он остаётся моментом публикации PR (база для 72-часового stale). */
+  transitionPrState(
+    id: number,
+    from: readonly string[],
+    to: string,
+    fields?: {
+      prCheckedAt?: number | null;
+      prClosedAt?: number | null;
+      prStaleNotified?: number | null;
+      prErrorCount?: number;
+    },
+  ): boolean {
+    const sets = ["pr_state = ?"];
+    const args: unknown[] = [to];
+    const map: Record<string, string> = {
+      prCheckedAt: "pr_checked_at",
+      prClosedAt: "pr_closed_at",
+      prStaleNotified: "pr_stale_notified",
+      prErrorCount: "pr_error_count",
+    };
+    for (const [key, col] of Object.entries(map)) {
+      if (fields && key in fields) {
+        sets.push(`${col} = ?`);
+        args.push((fields as Record<string, unknown>)[key]);
+      }
+    }
+    const marks = from.map(() => "?").join(",");
+    const info = this.db
+      .prepare(
+        `UPDATE releases SET ${sets.join(", ")}
+         WHERE id = ? AND pr_state IN (${marks})`,
+      )
+      .run(...args, id, ...from);
+    return info.changes > 0;
+  }
+
+  /** Такт gh прошёл без смены состояния — отметка проверки и счётчик
+   * ошибок (updated_at не двигаем: база 72 ч для п.3). */
+  recordPrCheck(id: number, error: boolean, at = Date.now()): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET pr_checked_at = ?,
+           pr_error_count = CASE WHEN ? THEN pr_error_count + 1 ELSE 0 END
+         WHERE id = ?`,
+      )
+      .run(at, error ? 1 : 0, id);
+  }
+
+  /** §2 r10 п.3: старые записи с тем же pr_url слежение не ведут —
+   * треком является новейшая. */
+  supersedePrRows(prUrl: string, keepId: number): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET pr_state = 'superseded'
+         WHERE pr_url = ? AND id != ?
+           AND pr_state IN ('open','closed','stale','error')`,
+      )
+      .run(prUrl, keepId);
+  }
+
+  /** «PR обновлён» при досмотре: выложенная запись с тем же pr_url
+   * была и раньше. */
+  otherReleaseByPrUrl(prUrl: string, excludeId: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 FROM releases
+           WHERE pr_url = ? AND id != ? AND status = 'published' LIMIT 1`,
+        )
+        .get(prUrl, excludeId) !== undefined
+    );
+  }
+
+  metaDelete(key: string): void {
+    this.db.prepare(`DELETE FROM plugin_meta WHERE key = ?`).run(key);
+  }
+
+  /** §17 r31: напоминание ревьюеру без вердикта — время и seq журнала
+   * на момент отправки (второй промах считается только по ходу,
+   * начавшемуся позже). */
+  setVerdictNudge(id: number, nudgeSeq: number): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET verdict_nudged_at = ?,
+           verdict_nudge_seq = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), nudgeSeq, Date.now(), id);
   }
 
   getRelease(id: number): ReleaseRow | undefined {

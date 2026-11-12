@@ -51,6 +51,7 @@ import {
   type Policy,
   type PolicyLoad,
 } from "./policy.js";
+import { ACTIVE_STATUSES } from "./store.js";
 import type { DelegationRow, DelegationStore, ReleaseRow } from "./store.js";
 import { runChecked, runJson, type BbCli } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
@@ -498,25 +499,44 @@ async function resolveTask(
  * reads that line — prose «ОК» markers no longer count, and a report
  * without the line is not accepted. Scans the report for JSON lines and
  * judges by the last one. */
-export function reviewVerdictOk(body: string): boolean {
+/** §17 r31: the strict JSON verdict line of a reviewer report —
+ * "ok"/"not-ok" by the last verdict line, null when the body carries no
+ * verdict line at all ("нет вердикта" is not "не ОК"). */
+export function verdictInBody(body: string): "ok" | "not-ok" | null {
   let verdict: unknown;
   let blockers: unknown;
   for (const raw of body.split("\n")) {
     const line = raw.trim();
-    if (!line.startsWith("{") || !line.endsWith("}")) continue;
-    let parsed: { verdict?: unknown; blockers?: unknown };
-    try {
-      parsed = JSON.parse(line) as { verdict?: unknown; blockers?: unknown };
-    } catch {
-      continue;
+    const start = line.indexOf("{");
+    const end = line.lastIndexOf("}");
+    if (start < 0 || end <= start) continue;
+    // The strict form is the whole line; a `prefix: {"verdict":…}`
+    // tail counts too — a report wrapping the JSON in one line of
+    // prose is a verdict, not "missing".
+    const candidates = [line];
+    const tail = line.slice(start, end + 1);
+    if (tail !== line) candidates.push(tail);
+    for (const cand of candidates) {
+      let parsed: { verdict?: unknown; blockers?: unknown };
+      try {
+        parsed = JSON.parse(cand) as { verdict?: unknown; blockers?: unknown };
+      } catch {
+        continue;
+      }
+      if (parsed.verdict !== "OK" && parsed.verdict !== "CHANGES") continue;
+      verdict = parsed.verdict;
+      blockers = parsed.blockers;
+      break;
     }
-    if (parsed.verdict !== "OK" && parsed.verdict !== "CHANGES") continue;
-    verdict = parsed.verdict;
-    blockers = parsed.blockers;
   }
+  if (verdict === undefined) return null;
   // §16.7 (PLUG-186): the verdict line carries `blockers` — a missing
   // field is not an OK.
-  return verdict === "OK" && blockers === 0;
+  return verdict === "OK" && blockers === 0 ? "ok" : "not-ok";
+}
+
+export function reviewVerdictOk(body: string): boolean {
+  return verdictInBody(body) === "ok";
 }
 
 async function reviewVerdict(
@@ -528,7 +548,13 @@ async function reviewVerdict(
     .filter((c) => c.kind === "agent" && c.threadId === delegation.thread_id)
     .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
   const last = comments.at(-1);
-  if (last?.body) return reviewVerdictOk(last.body) ? "ok" : "not-ok";
+  // §17 r31: a verdict line in the last agent comment decides; a
+  // comment WITHOUT the JSON line falls through to the thread's last
+  // message instead of counting "not OK".
+  if (last?.body) {
+    const v = verdictInBody(last.body);
+    if (v) return v;
+  }
   // §17.3 (мелко 5): no verdict comment — the reviewer's own thread
   // output is the fallback source (a report sent as the final message
   // without a task comment still counts).
@@ -538,7 +564,10 @@ async function reviewVerdict(
         threadId: delegation.thread_id,
       });
       const out = res?.output;
-      if (out) return reviewVerdictOk(out) ? "ok" : "not-ok";
+      if (out) {
+        const v = verdictInBody(out);
+        if (v) return v;
+      }
     } catch {
       // an unreadable thread output counts as no verdict
     }
@@ -1942,6 +1971,37 @@ async function runReleaseSteps(
     projectId: executor.project_id ?? input.caller.projectId,
   });
 
+  // §2 r10 п.0: target identity = the repo's MAIN worktree dir
+  // (realpath of the first `git worktree list` record) + target branch —
+  // different tasks share the repo via different executor copies, so
+  // `repo_path` cannot be the key. The guarded insert below checks and
+  // writes in one transaction.
+  const mainDir =
+    mainWorktreeDir(
+      await git(deps, repo, ["worktree", "list", "--porcelain"], {
+        allowFail: true,
+      }),
+    ) ?? repo;
+  const repoRoot = await realpath(mainDir).catch(() => mainDir);
+  // Pre-r10 rows lack repo_root — backfill so the same-target gate
+  // sees them (a gone copy simply stays NULL).
+  for (const r of deps.store.releasesMissingRepoRoot()) {
+    try {
+      const md =
+        mainWorktreeDir(
+          await git(deps, r.repo_path, ["worktree", "list", "--porcelain"], {
+            allowFail: true,
+          }),
+        ) ?? r.repo_path;
+      deps.store.setReleaseRepoRoot(
+        r.id,
+        await realpath(md).catch(() => md),
+      );
+    } catch {
+      // copy is gone — leave NULL, the row is not a same-target match
+    }
+  }
+
   // The release row exists BEFORE the pipeline mutates the branch — its
   // `pipeline_shas` record survives a mid-run refusal, so the next run's
   // gate does not call the pipeline's own commits foreign.
@@ -1959,8 +2019,10 @@ async function runReleaseSteps(
       kbNote: input.kb ?? null,
       noKbReason: input.noKb ?? null,
       settingsProjectId: ctx.settingsProjectId,
+      repoRoot,
     });
   } catch (e) {
+    if (e instanceof OrchestratorError) throw e;
     if (/UNIQUE constraint/.test(message(e))) {
       throw new OrchestratorError(
         "release-in-progress",
@@ -2311,6 +2373,29 @@ export interface PumpSummary {
   failed: number;
 }
 
+/** §2 r10 п.4: the audit gets 30 minutes from the FIRST audit dispatch
+ * of this release — reissues are inside the budget, not an extension. */
+const AUDIT_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** §2 r10 п.3: how often a tracked PR is polled (`gh pr view`). */
+const PR_WATCH_INTERVAL_MS = 5 * 60 * 1000;
+/** §2 r10 п.3: 72 h — closed-wait window and the stale mark. */
+const PR_STALE_MS = 72 * 60 * 60 * 1000;
+
+/** §2 r10 п.5: the outcome line goes out under a -1 claim captured
+ * BEFORE the send and confirmed after — a stale claim (2 min, the
+ * claimResultDelivery protocol) is retaken by the next tick. A lost
+ * send beats a lost line; a rare duplicate is accepted (spec). */
+async function outcomeLine(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+  text: string,
+): Promise<void> {
+  if (!deps.store.claimReleaseNotify(row.id)) return;
+  await report(deps, row, text);
+  deps.store.confirmReleaseNotify(row.id);
+}
+
 /**
  * Driven from the watchdog beats: for every `auditing` release, look at
  * the latest `release-audit` delegation — `done` means the verdict is in
@@ -2319,6 +2404,17 @@ export interface PumpSummary {
  */
 export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
   const s: PumpSummary = { scanning: 0, published: 0, rejected: 0, failed: 0 };
+  // §2 r10 п.5: published rows whose outcome line was never confirmed —
+  // the publish finished but the tick crashed before the line.
+  for (const row of deps.store.pendingPublishNotify()) {
+    try {
+      await finishPublished(deps, row, null);
+    } catch (e) {
+      deps.log?.warn?.(
+        `orchestrator release: досмотр ${row.task_key}: ${message(e)}`,
+      );
+    }
+  }
   for (const row of deps.store.releasesByStatuses(["auditing", "publishing"])) {
     s.scanning++;
     try {
@@ -2337,7 +2433,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
               error: "выкладка остановилась до раздачи аудита",
             });
             s.failed++;
-            await report(
+            await outcomeLine(
               deps,
               row,
               `выкладка ${row.task_key} остановлена до раздачи аудита ` +
@@ -2351,6 +2447,40 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
           AUDIT_LEVEL,
         );
         if (!delegation || delegation.status === "dispatching" || delegation.status === "running") {
+          // §2 r10 п.4: 30 min from the FIRST audit dispatch — the root
+          // of the reissue chain (audit_delegation_id names it), not the
+          // latest row.
+          const root =
+            (row.audit_delegation_id
+              ? deps.store.get(row.audit_delegation_id)
+              : null) ??
+            delegation ??
+            row;
+          if (
+            (deps.now?.() ?? Date.now()) - root.created_at >
+            AUDIT_TIMEOUT_MS
+          ) {
+            deps.store.updateRelease(row.id, {
+              status: "failed",
+              error: "аудит не завершился за 30 мин",
+            });
+            s.failed++;
+            if (delegation?.thread_id) {
+              await deps.stepsDeps.threads
+                .stop({ threadId: delegation.thread_id })
+                .catch((e) =>
+                  deps.log?.warn?.(
+                    `orchestrator release: auditor stop: ${message(e)}`,
+                  ),
+                );
+            }
+            await outcomeLine(
+              deps,
+              row,
+              `выкладка ${row.task_key} остановлена: аудит не завершился ` +
+                `за 30 мин — повторите release`,
+            );
+          }
           continue;
         }
         if (delegation.status !== "done") {
@@ -2359,7 +2489,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
             error: `аудит завершился исходом ${delegation.status}`,
           });
           s.failed++;
-          await report(
+          await outcomeLine(
             deps,
             row,
             `выкладка ${row.task_key} остановлена: проверяющий агент ` +
@@ -2391,7 +2521,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
                 (f.fix ? ` → ${maskSecrets(f.fix)}` : ""),
             )
             .join("\n");
-          await report(
+          await outcomeLine(
             deps,
             row,
             `аудит выкладки ${row.task_key}: REJECT` +
@@ -2410,14 +2540,140 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         error: message(e).slice(0, 400),
       });
       s.failed++;
-      await report(
+      await outcomeLine(
         deps,
         row,
         `выкладка ${row.task_key} упала на публикации: ${message(e)}`,
       );
     }
   }
+  await prWatch(deps);
   return s;
+}
+
+/**
+ * §2 r10 п.3: track every published row's PR to a terminal outcome —
+ * one tracking record per pr_url (the newest; older rows go
+ * `superseded`). `gh pr view` every 5 min; MERGED → «PR влит» + task
+ * done; CLOSED → «PR закрыт без влития» + 72 h more for a reopen-merge;
+ * 72 h open → one «PR висит 72 ч» line; 3 gh failures in a row → one
+ * «слежение невозможно». Every line is claimed by the conditional
+ * pr_state transition, not by notified_at.
+ */
+async function prWatch(deps: ReleaseDeps): Promise<void> {
+  const now = deps.now?.() ?? Date.now();
+  for (const row of deps.store.trackedPrReleases()) {
+    const prUrl = row.pr_url;
+    if (!prUrl) continue;
+    try {
+      const newest = deps.store.latestReleaseByPrUrl(prUrl);
+      if (newest && newest.id !== row.id) {
+        deps.store.transitionPrState(row.id, ["open", "closed"], "superseded");
+        continue;
+      }
+      if (row.pr_checked_at && now - row.pr_checked_at < PR_WATCH_INTERVAL_MS)
+        continue;
+      const res = await deps.cmd.run(
+        "gh",
+        ["pr", "view", prUrl, "--json", "state,mergedAt,mergeCommit"],
+        { timeoutMs: 60_000 },
+      );
+      if (res.exitCode !== 0) {
+        deps.store.recordPrCheck(row.id, true, now);
+        const fresh = deps.store.getRelease(row.id);
+        if ((fresh?.pr_error_count ?? 0) >= 3) {
+          if (
+            deps.store.transitionPrState(row.id, ["open", "closed"], "error")
+          ) {
+            await report(
+              deps,
+              row,
+              `слежение за PR ${row.task_key} невозможно: gh pr view ` +
+                `${prUrl}: ${(res.stderr || res.stdout).trim().slice(0, 200)}`,
+            );
+          }
+        }
+        continue;
+      }
+      let view: {
+        state?: string;
+        mergedAt?: string | null;
+        mergeCommit?: { oid?: string } | null;
+      };
+      try {
+        view = JSON.parse(res.stdout) as typeof view;
+      } catch {
+        deps.store.recordPrCheck(row.id, true, now);
+        continue;
+      }
+      deps.store.recordPrCheck(row.id, false, now);
+      const state = (view.state ?? "").toUpperCase();
+      if (state === "MERGED") {
+        if (deps.store.transitionPrState(row.id, ["open", "closed"], "merged")) {
+          await runChecked(deps.bbCli, [
+            "tasks", "update", row.task_key, "--status", "done",
+          ]).catch((e) =>
+            deps.log?.warn?.(`release task status: ${message(e)}`),
+          );
+          await report(
+            deps,
+            row,
+            `PR влит ${row.task_key}: ${prUrl}` +
+              (view.mergeCommit?.oid
+                ? ` → ${view.mergeCommit.oid.slice(0, 8)}`
+                : ""),
+          );
+        }
+        continue;
+      }
+      if (row.pr_state === "closed") {
+        if (state === "OPEN") {
+          deps.store.transitionPrState(row.id, ["closed"], "open", {
+            prClosedAt: null,
+          });
+          continue;
+        }
+        if (row.pr_closed_at && now - row.pr_closed_at >= PR_STALE_MS) {
+          deps.store.transitionPrState(row.id, ["closed"], "closed_final");
+        }
+        continue;
+      }
+      // pr_state === 'open'
+      if (state === "CLOSED") {
+        if (
+          deps.store.transitionPrState(row.id, ["open"], "closed", {
+            prClosedAt: now,
+          })
+        ) {
+          await report(
+            deps,
+            row,
+            `PR закрыт без влития ${row.task_key}: ${prUrl}`,
+          );
+        }
+        continue;
+      }
+      // still open — 72 h from the PR's publish (updated_at is frozen
+      // for tracked rows: pr-watch writes do not bump it).
+      if (!row.pr_stale_notified && now - row.updated_at >= PR_STALE_MS) {
+        if (
+          deps.store.transitionPrState(row.id, ["open"], "stale", {
+            prStaleNotified: 1,
+          })
+        ) {
+          await report(
+            deps,
+            row,
+            `PR висит 72 ч ${row.task_key}: ${prUrl}`,
+          );
+        }
+      }
+    } catch (e) {
+      deps.log?.warn?.(
+        `orchestrator release: PR watch ${row.task_key}: ${message(e)}`,
+      );
+    }
+  }
 }
 
 // ── Step 6: публикация ─────────────────────────────────────────────────
@@ -2547,16 +2803,11 @@ async function publishRelease(
       "--status",
       "done",
     ]).catch((e) => deps.log?.warn?.(`release task status: ${message(e)}`));
-    await postCheck(deps, row, headSha, row.target_branch, null);
     deps.store.updateRelease(row.id, { status: "published" });
     s.published++;
-    await commentOnTask(
-      deps,
-      row.task_key,
-      `выложено: ${headSha.slice(0, 10)} в ${row.target_branch}` +
-        (row.kb_note ? `\nKB-заметка: ${row.kb_note}` : "") +
-        (row.no_kb_reason ? `\nKB не требуется: ${row.no_kb_reason}` : ""),
-    );
+    // §2 r10 п.1: ONE outcome line — post-check findings and the
+    // postPublish result are folded into it (finishPublished).
+    await finishPublished(deps, deps.store.getRelease(row.id) ?? row, null);
     return;
   }
 
@@ -2697,6 +2948,10 @@ async function publishRelease(
     prUrl = GH_PR_URL_RE.exec(created)?.[0] ?? null;
   }
   deps.store.updateRelease(row.id, { prUrl });
+  // §2 r10 п.3: this row tracks the PR; older published rows on the
+  // same URL step aside (one tracking record per pr_url).
+  deps.store.initPrTracking(row.id);
+  if (prUrl) deps.store.supersedePrRows(prUrl, row.id);
   await runChecked(deps.bbCli, [
     "tasks",
     "update",
@@ -2704,17 +2959,353 @@ async function publishRelease(
     "--status",
     "in_review",
   ]).catch((e) => deps.log?.warn?.(`release task status: ${message(e)}`));
-  await postCheck(deps, row, headSha, remoteBranch, prUrl);
   deps.store.updateRelease(row.id, { status: "published" });
   s.published++;
-  await commentOnTask(
+  await finishPublished(
     deps,
-    row.task_key,
-    `выложено: ${headSha.slice(0, 10)}, ветка ${remoteBranch}` +
-      (prUrl ? ` / PR ${prUrl}` : "") +
-      (row.kb_note ? `\nKB-заметка: ${row.kb_note}` : "") +
-      (row.no_kb_reason ? `\nKB не требуется: ${row.no_kb_reason}` : ""),
+    deps.store.getRelease(row.id) ?? row,
+    existing !== undefined,
   );
+}
+
+/** §2 r10 п.1: the ONE outcome line — success fact, post-check
+ * findings and the postPublish result in the same message, sent under
+ * the notified_at claim. `prExisted` null → the досмотр tick recomputes
+ * it («PR обновлён» needs the pre-existing-PR fact). */
+async function finishPublished(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+  prExisted: boolean | null,
+): Promise<void> {
+  const fresh = deps.store.getRelease(row.id) ?? row;
+  const headSha = fresh.published_sha ?? fresh.head_sha ?? "";
+  const pushedBranch =
+    fresh.target_action === "push"
+      ? fresh.target_branch
+      : (fresh.publish_branch ?? fresh.branch);
+  const checks = await postCheck(
+    deps,
+    fresh,
+    headSha,
+    pushedBranch,
+    fresh.pr_url,
+  ).catch((e) => [`пост-проверка не удалась: ${message(e)}`]);
+  const parts: string[] = [];
+  if (fresh.target_action === "push") {
+    parts.push(
+      `выложено ${fresh.task_key}: ${headSha.slice(0, 7)} в ` +
+        `${fresh.target_branch}; задача done`,
+    );
+  } else {
+    const existed =
+      prExisted ??
+      (fresh.pr_url
+        ? deps.store.otherReleaseByPrUrl(fresh.pr_url, fresh.id)
+        : false);
+    parts.push(
+      `${existed ? "PR обновлён" : "PR открыт"} ${fresh.task_key}: ` +
+        `${fresh.pr_url ?? "—"}; слежу до влития`,
+    );
+  }
+  if (fresh.kb_note) parts.push(`KB-заметка: ${fresh.kb_note}`);
+  if (fresh.no_kb_reason) parts.push(`KB не требуется: ${fresh.no_kb_reason}`);
+  for (const m of checks) parts.push(`пост-проверка: ${m}`);
+  let selfReload: { checkout: string; expectedSha: string } | null = null;
+  if (fresh.target_action === "push") {
+    const pp = await runPostPublish(deps, fresh).catch((e) => ({
+      summary: `postPublish: ${message(e)}`,
+      selfReload: null,
+    }));
+    if (pp.summary) parts.push(pp.summary);
+    selfReload = pp.selfReload;
+  }
+  const line = parts.join("\n");
+  if (selfReload) {
+    // §6 r10: the plugin cannot reload ITSELF — a one-shot bb
+    // automation reloads orchestrator and delivers the outcome line
+    // (the claim is captured BEFORE `automation create`, confirmed
+    // after its success).
+    if (!deps.store.claimReleaseNotify(fresh.id)) return;
+    const created = await createSelfReloadAutomation(
+      deps,
+      fresh,
+      line,
+      selfReload,
+    );
+    if (created) {
+      deps.store.confirmReleaseNotify(fresh.id);
+      return;
+    }
+    deps.store.releaseReleaseNotify(fresh.id);
+    await outcomeLine(
+      deps,
+      fresh,
+      line +
+        "\norchestrator не перезагрузился автоматически — " +
+        "перезагрузите плагин вручную",
+    );
+    return;
+  }
+  await outcomeLine(deps, fresh, line);
+}
+
+// ── postPublish (§6 r10, push only) ───────────────────────────────────
+
+interface PostPublishResult {
+  summary: string | null;
+  selfReload: { checkout: string; expectedSha: string } | null;
+}
+
+const POSTPUBLISH_META = (id: number) => `release-pp:${id}`;
+
+/**
+ * §6 r10: after a push release the configured checkout is fetched,
+ * fast-forwarded to `origin/<target>` and the changed plugin dirs are
+ * reloaded — dirs with a changed package manifest need `npm ci`,
+ * providers with running turns are postponed, the orchestrator plugin
+ * reloads itself through a one-shot bb automation (`selfReload`).
+ * The base sha is recorded in plugin_meta BEFORE the ff so a crash
+ * mid-step can be resumed by the досмотр tick.
+ */
+async function runPostPublish(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+): Promise<PostPublishResult> {
+  const cfg = deps.loadReleaseConfig().config;
+  if (!cfg) return { summary: null, selfReload: null };
+  const projectId = row.settings_project_id ?? row.project_id;
+  const project = resolveProject(cfg, projectId);
+  const pp = project.postPublish;
+  if (!pp) return { summary: null, selfReload: null };
+  const co = pp.checkout;
+  const fail = (msg: string): PostPublishResult => ({
+    summary: `postPublish: ${msg}`,
+    selfReload: null,
+  });
+  const gitOut = async (args: string[]) =>
+    (
+      await deps.cmd.run("git", ["-C", co, ...args], { timeoutMs: 120_000 })
+    ).stdout.trim();
+  const coOriginRaw = await gitOut(["remote", "get-url", "origin"]).catch(
+    () => "",
+  );
+  const repoOriginRaw = await git(
+    deps,
+    row.repo_path,
+    ["remote", "get-url", "origin"],
+    { allowFail: true },
+  );
+  const coNorm = normalizeGitRemoteUrl(coOriginRaw);
+  const repoNorm = normalizeGitRemoteUrl(repoOriginRaw);
+  // A remote with a host normalizes — those compare by host/path. A
+  // local path remote does not: compare its realpath instead.
+  const sameRepo =
+    coNorm != null && repoNorm != null
+      ? coNorm === repoNorm
+      : coOriginRaw !== "" &&
+        coOriginRaw === repoOriginRaw ||
+        (coNorm == null &&
+          repoNorm == null &&
+          (await realpath(coOriginRaw).catch(() => coOriginRaw)) ===
+            (await realpath(repoOriginRaw).catch(() => repoOriginRaw)));
+  if (!sameRepo) {
+    return fail("копия не обновлена — другой репозиторий");
+  }
+  const curBranch = await gitOut(["symbolic-ref", "--short", "-q", "HEAD"]).catch(
+    () => "",
+  );
+  if (curBranch !== pp.branch) {
+    return fail(`копия не на ${pp.branch} — не обновлена`);
+  }
+  const markerKey = POSTPUBLISH_META(row.id);
+  let base = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
+  const saved = deps.store.metaGet(markerKey);
+  if (saved) {
+    try {
+      const m = JSON.parse(saved) as { base?: string };
+      if (m.base) base = m.base;
+    } catch {
+      // malformed marker — the fresh base wins
+    }
+  } else if (base) {
+    deps.store.metaSet(markerKey, JSON.stringify({ base }));
+  }
+  const fetchRes = await deps.cmd.run(
+    "git",
+    ["-C", co, "fetch", "origin"],
+    { timeoutMs: 180_000 },
+  );
+  if (fetchRes.exitCode !== 0) {
+    return fail(`fetch не удался: ${(fetchRes.stderr || "").slice(0, 200)}`);
+  }
+  const ffRes = await deps.cmd.run(
+    "git",
+    ["-C", co, "merge", "--ff-only", `origin/${row.target_branch}`],
+    { timeoutMs: 120_000 },
+  );
+  if (ffRes.exitCode !== 0) {
+    return fail(
+      `ff не прошёл — перезагрузки нет ` +
+        `(${(ffRes.stderr || ffRes.stdout || "").trim().slice(0, 200)})`,
+    );
+  }
+  const newHead = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
+  deps.store.metaDelete(markerKey);
+  if (!pp.reloadPlugins) {
+    return {
+      summary: "postPublish: копия обновлена; перезагрузка плагинов выключена",
+      selfReload: null,
+    };
+  }
+  const changed = base
+    ? (await gitOut(["diff", "--name-only", `${base}..${newHead}`]).catch(
+        () => "",
+      ))
+        .split("\n")
+        .filter(Boolean)
+    : [];
+  const dirs = [
+    ...new Set(
+      changed
+        .filter((p) => p.startsWith("plugins/"))
+        .map((p) => p.split("/")[1]!)
+        .filter(Boolean),
+    ),
+  ];
+  if (!dirs.length) {
+    return {
+      summary: "postPublish: копия обновлена — плагины не менялись",
+      selfReload: null,
+    };
+  }
+  const list = await runJson<unknown>(deps.bbCli, [
+    "plugin",
+    "list",
+    "--json",
+  ]).catch(() => null);
+  const entries = (Array.isArray(list)
+    ? list
+    : ((list as { plugins?: unknown[] })?.plugins ?? [])
+  ) as { id?: string; name?: string; rootDir?: string; dir?: string; path?: string }[];
+  const coReal = await realpath(co).catch(() => co);
+  const pluginId = async (dir: string): Promise<string> => {
+    const dirReal = await realpath(join(co, "plugins", dir)).catch(
+      () => join(co, "plugins", dir),
+    );
+    for (const e of entries) {
+      const root = e.rootDir ?? e.dir ?? e.path;
+      if (!root) continue;
+      const rootReal = await realpath(root).catch(() => root);
+      if (
+        rootReal === dirReal ||
+        root.replace(/\\/g, "/").endsWith(`/plugins/${dir}`) ||
+        rootReal === join(coReal, "plugins", dir)
+      ) {
+        return e.id ?? e.name ?? dir;
+      }
+    }
+    return dir;
+  };
+  const running = deps.store.listByStatuses(ACTIVE_STATUSES);
+  const reloaded: string[] = [];
+  const skipped: string[] = [];
+  let selfReload: { checkout: string; expectedSha: string } | null = null;
+  for (const dir of dirs) {
+    const id = await pluginId(dir);
+    if (
+      changed.some(
+        (p) =>
+          p === `plugins/${dir}/package.json` ||
+          p === `plugins/${dir}/package-lock.json`,
+      )
+    ) {
+      skipped.push(`${id} (нужен npm ci)`);
+      continue;
+    }
+    if (/provider/.test(dir)) {
+      const candidates = new Set(
+        [dir, id, dir.replace(/^bb-plugin-/, ""), id.replace(/^provider-/, "")]
+          .map((x) => x.replace(/^bb-plugin-/, "")),
+      );
+      if (running.some((d) => candidates.has(d.provider))) {
+        skipped.push(`${id} (идут ходы — перезагрузите позже)`);
+        continue;
+      }
+    }
+    if (id === "orchestrator" || dir === "bb-plugin-orchestrator") {
+      selfReload = { checkout: co, expectedSha: newHead };
+      continue;
+    }
+    const r = await deps.bbCli.run(["plugin", "reload", id]);
+    if (r.exitCode !== 0) {
+      skipped.push(
+        `${id} (reload: ${(r.stderr || r.stdout || "").trim().slice(0, 120)})`,
+      );
+    } else {
+      reloaded.push(id);
+    }
+  }
+  const bits = ["postPublish: копия обновлена"];
+  if (reloaded.length) bits.push(`перезагружено: ${reloaded.join(", ")}`);
+  if (skipped.length) bits.push(`пропущено: ${skipped.join(", ")}`);
+  if (selfReload) bits.push("orchestrator перезагружается автоматизацией");
+  return { summary: bits.join("; "), selfReload };
+}
+
+/**
+ * §6 r10: a one-shot script automation reloads the orchestrator plugin
+ * (it cannot reload itself), then waits up to 3 min for `bb orchestrator
+ * status` and the checkout HEAD == the expected sha, and delivers the
+ * outcome line via `bb thread tell`. Returns true when `bb automation
+ * create` succeeded.
+ */
+async function createSelfReloadAutomation(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+  line: string,
+  selfReload: { checkout: string; expectedSha: string },
+): Promise<boolean> {
+  const script = [
+    "#!/bin/sh",
+    `COORD='${row.coordinator_thread_id}'`,
+    `EXPECTED='${selfReload.expectedSha}'`,
+    `ROOT='${join(selfReload.checkout, "plugins", "bb-plugin-orchestrator")}'`,
+    "TEXT=$(cat <<'BB_PP_EOF'",
+    line,
+    "BB_PP_EOF",
+    ")",
+    "sleep 15",
+    "bb plugin reload orchestrator >/dev/null 2>&1 || true",
+    "i=0",
+    "while [ $i -lt 16 ]; do",
+    "  sleep 10",
+    "  i=$((i+1))",
+    '  cur=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "?")',
+    '  if bb orchestrator status >/dev/null 2>&1 && [ "$cur" = "$EXPECTED" ]; then',
+    '    bb thread tell "$COORD" "$TEXT; перезагружено: orchestrator" >/dev/null 2>&1 || true',
+    "    exit 0",
+    "  fi",
+    "done",
+    'last=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "?")',
+    'bb thread tell "$COORD" "$TEXT; orchestrator после перезагрузки не поднялся / копия на $last, ожидался $EXPECTED" >/dev/null 2>&1 || true',
+  ].join("\n");
+  const res = await deps.bbCli.run([
+    "automation",
+    "create",
+    "--in",
+    "1m",
+    "--script",
+    script,
+    "--project",
+    row.project_id,
+  ]);
+  if (res.exitCode !== 0) {
+    deps.log?.warn?.(
+      `orchestrator release: automation create: ` +
+        (res.stderr || res.stdout || `exit ${res.exitCode}`).slice(0, 200),
+    );
+  }
+  return res.exitCode === 0;
 }
 
 // ── Step 7: пост-проверка ──────────────────────────────────────────────
@@ -2734,20 +3325,18 @@ async function postCheck(
    * when the project's `threadIds` is off). */
   pushedBranch: string,
   prUrl: string | null,
-): Promise<void> {
+): Promise<string[]> {
   row = deps.store.getRelease(row.id) ?? row;
   const repo = row.repo_path;
+  const messages: string[] = [];
   try {
     await git(deps, repo, ["fetch", "origin"], { timeoutMs: 180_000 });
   } catch (e) {
-    await notifyCoordinator(
-      deps,
-      row,
-      `пост-проверка ${row.task_key}: fetch не удался — ${message(e)}`,
-    );
-    return;
+    // §2 r10 п.1: the post-check failure is reported inside the same
+    // outcome line, not as a message of its own.
+    messages.push(`fetch не удался — ${message(e)}`);
+    return messages;
   }
-  const messages: string[] = [];
 
   if (row.target_action === "push") {
     const target = `origin/${row.target_branch}`;
@@ -2906,11 +3495,5 @@ async function postCheck(
     }
   }
 
-  if (messages.length) {
-    await notifyCoordinator(
-      deps,
-      row,
-      `пост-проверка ${row.task_key}:\n${messages.join("\n")}`,
-    );
-  }
+  return messages;
 }

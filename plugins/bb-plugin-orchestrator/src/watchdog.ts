@@ -16,6 +16,7 @@
 import { OrchestratorError } from "./errors.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
+  levelRole,
   quotaGroupOf,
   quotaGroupsForOneOff,
   type PolicyLoad,
@@ -28,7 +29,13 @@ import {
   runJson,
   type BbCli,
 } from "./bb-cli.js";
-import type { DispatchStepsResult, SetupError } from "./delegate.js";
+import {
+  expectedParentNotify,
+  RELEASE_AUDIT_LEVEL,
+  type DispatchStepsResult,
+  type SetupError,
+} from "./delegate.js";
+import { parseAuditVerdict, verdictInBody } from "./release.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -1600,7 +1607,9 @@ export function createWatchdog(deps: WatchdogDeps) {
       // §17.2 r26 (PLUG-211 Б4): a failed `auto` keeps the mark — the §7
       // pass retries the restore instead of dropping the thread's
       // delivery forever.
-      if (await setParentNotify(row.thread_id!, "auto")) {
+      if (
+        await setParentNotify(row.thread_id!, expectedParentNotify(row.level))
+      ) {
         store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
       }
     } else {
@@ -1675,7 +1684,10 @@ export function createWatchdog(deps: WatchdogDeps) {
       store.advanceLastSeq(row.id, turnSeq);
       // §17.2 (r26 PLUG-211 Б4): the mute was for the stop — restore
       // delivery afterwards; a failed restore keeps the mark for §7.
-      if (await setParentNotify(row.thread_id!, "auto")) {
+      // §2 r10 п.4 (release): the auditor's expected mode is `off`.
+      if (
+        await setParentNotify(row.thread_id!, expectedParentNotify(row.level))
+      ) {
         store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
       }
       log.info?.(
@@ -1910,6 +1922,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       return;
     }
     if (fresh.status !== "done" && fresh.status !== "cancelled") return;
+    // §2 r10 п.4 (release): the release-auditor's outcome is read by the
+    // release pump from the journal — the §16.5 handoff is never sent
+    // for it; a recorded delivery keeps the rescan pass out.
+    if (fresh.level === RELEASE_AUDIT_LEVEL) {
+      store.setResultNotified(fresh.id, null);
+      return;
+    }
     // §16.5: the `result-window` marker opens BB's grace window at the
     // finished row's first sight (it survives restarts; a revive clears
     // it in store.revive). A `-1` claim skips the window — that row
@@ -2040,6 +2059,164 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.resetRetry(fresh.id);
   };
 
+  // ── §17 r31 «Вердикт обязателен» ────────────────────────────────────
+
+  /** An unfinished `item/backgroundTask` in the journal tail — the
+   * provider lifts its own turn for it, so a verdict check waits (r31:
+   * no reminder while background work is open). null = journal
+   * unreadable, treated like open work (never a "missing"). */
+  const openBackgroundItem = async (
+    row: DelegationRow,
+  ): Promise<boolean | null> => {
+    if (!row.thread_id) return false;
+    let events: WatchdogThreadEvent[];
+    try {
+      events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "100",
+      });
+    } catch {
+      return null;
+    }
+    const done = new Set<string>();
+    const open = new Set<string>();
+    for (const ev of events) {
+      const item = ((ev.data ?? {}) as {
+        item?: { type?: unknown; id?: unknown };
+      }).item;
+      const id = typeof item?.id === "string" ? item.id : null;
+      if (!id) continue;
+      if (
+        ev.type === "item/backgroundTask/completed" ||
+        (ev.type === "item/completed" && item?.type === "backgroundTask")
+      ) {
+        done.add(id);
+      } else if (
+        (ev.type === "item/started" && item?.type === "backgroundTask") ||
+        ev.type === "item/backgroundTask/progress"
+      ) {
+        open.add(id);
+      }
+    }
+    return [...open].some((id) => !done.has(id));
+  };
+
+  /** The auditor's last message — same `item/completed` agentMessage
+   * text the release pump reads. */
+  const auditorLastMessage = async (
+    row: DelegationRow,
+  ): Promise<string | null | undefined> => {
+    if (!row.thread_id) return null;
+    let events: WatchdogThreadEvent[];
+    try {
+      events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "50",
+        types: ["item/completed"],
+      });
+    } catch {
+      return undefined;
+    }
+    for (const ev of events) {
+      const item = ((ev.data ?? {}) as {
+        item?: { type?: unknown; text?: unknown };
+      }).item;
+      if (item?.type === "agentMessage" && typeof item.text === "string") {
+        return item.text;
+      }
+    }
+    return null;
+  };
+
+  /** §17 r31 verdict check — "verdict" (any parseable verdict), "missing"
+   * (a verdict-less turn end), "wait" (open background work or an
+   * unreadable source — never a miss). Lookup order: for an ordinary
+   * reviewer the last agent task comment, then the thread's last
+   * message; for the release auditor the last thread message ONLY (a
+   * comment-only verdict does not count for it). */
+  const reviewerVerdict = async (
+    row: DelegationRow,
+    role: "auditor" | "release-audit",
+  ): Promise<"verdict" | "missing" | "wait"> => {
+    const bg = await openBackgroundItem(row);
+    if (bg !== false) return "wait";
+    if (role === "release-audit") {
+      const text = await auditorLastMessage(row);
+      if (text === undefined) return "wait";
+      if (text == null) return "missing";
+      return parseAuditVerdict(text).unparseable ? "missing" : "verdict";
+    }
+    try {
+      const show = await runJson<{
+        comments?: {
+          kind?: string;
+          threadId?: string | null;
+          body?: string;
+          createdAt?: string;
+        }[];
+      }>(deps.bbCli, ["tasks", "show", row.task_key, "--json"]);
+      const comments = (show.comments ?? [])
+        .filter((c) => c.kind === "agent" && c.threadId === row.thread_id)
+        .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
+      const last = comments.at(-1);
+      if (last?.body && verdictInBody(last.body) != null) return "verdict";
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: verdict comments ${row.task_key}: ${message(e)}`,
+      );
+      return "wait";
+    }
+    if (row.thread_id) {
+      try {
+        const res = await deps.threads.output({ threadId: row.thread_id });
+        if (res?.output && verdictInBody(res.output) != null) {
+          return "verdict";
+        }
+      } catch (e) {
+        log.warn?.(
+          `orchestrator: verdict output ${row.thread_id}: ${message(e)}`,
+        );
+        return "wait";
+      }
+    }
+    return "missing";
+  };
+
+  /** Journal tip seq at the reminder's send time — a second miss counts
+   * only on a `turn/started` seq ABOVE it (r31). */
+  const journalTipSeq = async (row: DelegationRow): Promise<number> => {
+    if (!row.thread_id) return 0;
+    try {
+      const events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "1",
+      });
+      return events[0]?.seq ?? 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const lastTurnStartedSeq = async (
+    row: DelegationRow,
+  ): Promise<number | null> => {
+    if (!row.thread_id) return null;
+    try {
+      const events = await deps.threads.events.list({
+        threadId: row.thread_id,
+        order: "desc",
+        limit: "1",
+        types: ["turn/started"],
+      });
+      return events[0]?.seq ?? null;
+    } catch {
+      return null;
+    }
+  };
+
   const evaluateIdle = async (
     row: DelegationRow,
     thread: WatchdogThreadDto,
@@ -2110,6 +2287,72 @@ export function createWatchdog(deps: WatchdogDeps) {
         latest.archivedAt
       ) {
         return;
+      }
+      // §17 r31 «Вердикт обязателен»: a reviewer or the release auditor
+      // cannot go `done` without a verdict — the first miss keeps the
+      // row running under ONE reminder; a second verdict-less turn that
+      // STARTED after the reminder ends it without OK (a reviewer gets
+      // the one coordinator line instead of §16.5's delivery; the
+      // auditor's release is rejected «аудит без вердикта»).
+      const r31Role =
+        row.level === RELEASE_AUDIT_LEVEL
+          ? "release-audit"
+          : levelRole((await deps.loadPolicy()).policy, row.level);
+      if (r31Role === "auditor" || r31Role === "release-audit") {
+        const verdict = await reviewerVerdict(row, r31Role);
+        if (verdict === "wait") return;
+        if (verdict === "missing") {
+          const cur = store.get(row.id) ?? row;
+          if (cur.verdict_nudged_at == null) {
+            const tip = await journalTipSeq(row);
+            await sendToExecutor(
+              row,
+              r31Role === "release-audit"
+                ? 'заверши вердиктом: дождись проверок в этом же ходе (не фоном) и закончи строкой JSON {"verdict":"APPROVE"|"REJECT","findings":[…]}'
+                : 'заверши вердиктом: дождись проверок в этом же ходе (не фоном) и закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":N}',
+            );
+            store.setVerdictNudge(row.id, tip);
+            return;
+          }
+          const startedSeq = await lastTurnStartedSeq(row);
+          // The second miss counts only on a turn started AFTER the
+          // reminder — re-evaluating the same completed turn is not it.
+          if (
+            startedSeq == null ||
+            startedSeq <= (cur.verdict_nudge_seq ?? 0)
+          ) {
+            return;
+          }
+          if (!store.setStatusIf(row.id, "running", "done")) return;
+          clearMarks(row.id);
+          const finished = store.get(row.id) ?? row;
+          await collectRoundResult(finished);
+          if (finished.level === RELEASE_AUDIT_LEVEL) {
+            const release = store.activeReleaseByTask(finished.task_key);
+            if (release) {
+              store.updateRelease(release.id, {
+                status: "rejected",
+                error: "аудит без вердикта",
+              });
+            }
+            await report(
+              finished,
+              `аудит выкладки ${finished.task_key} без вердикта — ` +
+                `выкладка отклонена`,
+            );
+          } else {
+            await report(
+              finished,
+              `ревью ${finished.task_key} без вердикта: ` +
+                `${finished.thread_id ?? "—"}`,
+            );
+          }
+          // The one r31 line IS the outcome — §16.5's own delivery does
+          // not ride alongside.
+          store.setResultNotified(finished.id, "plugin");
+          return;
+        }
+        // verdict present — the ordinary done path below
       }
       // PLUG-184: the status move is conditional — a row that left
       // `running` meanwhile (manual cancel, revive) never flips to done.
@@ -2647,9 +2890,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     // the executor's outcome notice (§16.5). The marker records the
     // mode it confirmed: an r24 `confirmed` row re-verifies once,
     // which also migrates live `stuck` executors to `auto`.
+    const wantNotify = expectedParentNotify(fresh.level);
     if (
       fresh.thread_id &&
-      store.findSetupError(fresh, "attach-verified")?.message !== "auto"
+      store.findSetupError(fresh, "attach-verified")?.message !== wantNotify
     ) {
       let facts:
         | {
@@ -2674,10 +2918,10 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (
         facts &&
         facts.parentThreadId === fresh.coordinator_thread_id &&
-        facts.parentNotifications === "auto" &&
+        facts.parentNotifications === wantNotify &&
         facts.visibility === "hidden"
       ) {
-        store.addSetupError(fresh.id, "attach-verified", "auto");
+        store.addSetupError(fresh.id, "attach-verified", wantNotify);
         // A confirmed binding retires every earlier verify failure —
         // different texts must not pile up next to the success marker.
         store.clearSetupError(fresh.id, "attach-verify");
@@ -2710,14 +2954,14 @@ export function createWatchdog(deps: WatchdogDeps) {
             err = `threads.update: ${message(e)}`;
           }
         }
-        if (facts.parentNotifications !== "auto") {
+        if (facts.parentNotifications !== wantNotify) {
           try {
             await runChecked(deps.bbCli, [
               "thread",
               "update",
               fresh.thread_id,
               "--parent-notifications",
-              "auto",
+              wantNotify,
             ]);
           } catch (e) {
             err = `${err ? `${err}; ` : ""}parent-notifications: ${message(e)}`;
@@ -2897,7 +3141,12 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
           continue;
         }
-        if (await setParentNotify(row.thread_id, "auto")) {
+        if (
+          await setParentNotify(
+            row.thread_id,
+            expectedParentNotify(row.level),
+          )
+        ) {
           store.clearSetupError(row.id, NOTIFY_MUTED_STEP);
         }
       } catch (e) {

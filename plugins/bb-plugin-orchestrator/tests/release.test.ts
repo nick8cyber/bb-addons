@@ -577,9 +577,10 @@ function makeDeps(repo: string, overrides: Partial<{
     packetDir: () => mkdtempSync(join(tmpdir(), "pkt-")),
     localHostId: async () => overrides.localHostId ?? "host_test",
     enqueue: <T>(f: () => Promise<T>) => f(),
+    now: undefined as (() => number) | undefined,
     log: {},
   } satisfies ReleaseDeps;
-  return { deps, store, calls, spawnCalls, comments, sent, tmp, exec, rev, bindReview };
+  return { deps, store, calls, spawnCalls, comments, sent, tmp, exec, rev, bindReview, db };
 }
 
 test("release: refuses without release config / level / coordinator", async () => {
@@ -3478,4 +3479,287 @@ test("§4.1 r28.1: no-code round WITH commits — release идёт как обы
   // commits appeared anyway — the pipeline runs its normal gates
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   assert.equal(res.status, "auditing");
+});
+
+// ── r10: детерминированная выкладка (§2 п.0–6) ─────────────────────────
+
+const auditDone = async (
+  deps: ReleaseDeps,
+  store: DelegationStore,
+  key = "PLUG-1",
+) => {
+  const audit = store.latestDelegationByTaskAndLevel(key, "release-audit")!;
+  store.setStatus(audit.id, "done");
+  return pumpReleases(deps);
+};
+
+test("r10 п.0: одна выкладка в цель — repo_root + target_branch", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo);
+  const mainDir = execFileSync(
+    "git", ["-C", repo, "worktree", "list", "--porcelain"],
+    { encoding: "utf8" },
+  ).split("\n").find((l) => l.startsWith("worktree "))!.slice(9);
+  const root = execFileSync("realpath", [mainDir], { encoding: "utf8" }).trim();
+  // другая задача уже выкладывается в ту же цель — через ДРУГУЮ копию
+  store.insertRelease({
+    taskKey: "PLUG-2", projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    repoPath: "/other/copy", branch: "b2",
+    targetAction: "push", targetBranch: "main", repoRoot: root,
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => /уже идёт выкладка/.test((e as OrchestratorError).message),
+  );
+  // атомарность — прямой второй insert той же цели тоже отказан
+  assert.throws(
+    () =>
+      store.insertRelease({
+        taskKey: "PLUG-3", projectId: "proj_main",
+        coordinatorThreadId: "thr_coord", repoPath: "/c3", branch: "b",
+        targetAction: "push", targetBranch: "main", repoRoot: root,
+      }),
+    /уже идёт выкладка/,
+  );
+  // другая цель (другая ветка) — не конфликт
+  const ok = store.insertRelease({
+    taskKey: "PLUG-4", projectId: "proj_main",
+    coordinatorThreadId: "thr_coord", repoPath: "/c4", branch: "b",
+    targetAction: "push", targetBranch: "dev", repoRoot: root,
+  });
+  assert.equal(ok.status, "auditing");
+});
+
+test("r10 п.1: push — одна строка успеха, пост-проверка внутри неё", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const lines = sent.filter((m) => /выложено|пост-проверка/.test(m));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /выложено PLUG-1: [0-9a-f]{7} в main; задача done/);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.ok(rel.notified_at != null && rel.notified_at > 0);
+});
+
+test("r10 п.5: падение между публикацией и строкой — строка в следующем такте", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent, db } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  const before = sent.length;
+  db.prepare(`UPDATE releases SET notified_at = NULL WHERE id = ?`).run(rel.id);
+  sent.length = 0;
+  await pumpReleases(deps);
+  assert.ok(sent.some((m) => /выложено PLUG-1:/.test(m)), "досмотр дослал строку");
+  assert.ok(sent.length > 0);
+});
+
+test("r10 п.2: postPublish — ff копии, перезагрузка изменённых плагинов", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "fakeplug"), { recursive: true });
+  writeFileSync(join(repo, "plugins", "fakeplug", "x.txt"), "1\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: plugin change"]);
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: { checkout: seed, branch: "main", reloadPlugins: true },
+        },
+      },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  // копия догнала удалённую вершину
+  const remoteTip = execFileSync(
+    "git", ["-C", repo, "rev-parse", "origin/main"], { encoding: "utf8" },
+  ).trim();
+  assert.equal(gitR(seed, ["rev-parse", "HEAD"]), remoteTip);
+  assert.ok(
+    calls.some((c) => c.join(" ") === "plugin reload fakeplug"),
+    "изменённый плагин перезагружен",
+  );
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /postPublish: копия обновлена; перезагружено: fakeplug/);
+});
+
+test("r10 п.2: postPublish — orchestrator перезагружает сам себя автоматизацией", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "bb-plugin-orchestrator", "src"), {
+    recursive: true,
+  });
+  writeFileSync(join(repo, "plugins", "bb-plugin-orchestrator", "src", "x.ts"), "");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: orchestrator change"]);
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: { checkout: seed, branch: "main", reloadPlugins: true },
+        },
+      },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const auto = calls.find((c) => c[0] === "automation" && c[1] === "create");
+  assert.ok(auto, "создана разовая автоматизация самоперезагрузки");
+  const script = auto![auto!.indexOf("--script") + 1]!;
+  assert.match(script, /bb plugin reload orchestrator/);
+  assert.match(script, /bb thread tell/);
+  // строку итога шлёт автоматизация, не сам такт
+  assert.ok(!sent.some((m) => /выложено PLUG-1/.test(m)));
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.ok(rel.notified_at != null && rel.notified_at > 0);
+});
+
+const PR_CFG = JSON.stringify({
+  commitIdentity: "Agent <agent@x.io>",
+  defaults: { target: { action: "pr", branch: "main" }, threadIds: false },
+});
+
+const publishPr = async (deps: ReleaseDeps, store: DelegationStore) => {
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  return auditDone(deps, store);
+};
+
+const ghView = (
+  deps: ReleaseDeps,
+  view: string | { exitCode: number; stdout: string; stderr: string },
+) => {
+  const orig = deps.cmd.run;
+  deps.cmd = {
+    run: async (file, args, o) => {
+      if (file === "gh" && args[0] === "pr" && args[1] === "view") {
+        return typeof view === "string"
+          ? { exitCode: 0, stdout: view, stderr: "" }
+          : view;
+      }
+      return orig(file, args, o);
+    },
+  };
+};
+
+test("r10 п.1/п.3: PR открыт — строка «слежу до влития», MERGED → задача done", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CFG,
+  });
+  let now = Date.now();
+  deps.now = () => now;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(rel.pr_state, "open");
+  assert.match(
+    sent.find((m) => /PR открыт/.test(m))!,
+    /PR открыт PLUG-1: https:\/\/example\.test\/pr\/7; слежу до влития/,
+  );
+  ghView(deps, JSON.stringify({
+    state: "MERGED", mergedAt: "2026-01-01",
+    mergeCommit: { oid: "abcdef1234567890" },
+  }));
+  sent.length = 0;
+  now += 6 * 60 * 1000; // следующий такт сторожа — после интервала опроса
+  await pumpReleases(deps);
+  const rel2 = store.getRelease(rel.id)!;
+  assert.equal(rel2.pr_state, "merged");
+  assert.ok(sent.some((m) => /PR влит PLUG-1: .*abcdef12/.test(m)));
+  assert.ok(calls.some((c) => c.join(" ").includes("--status done")));
+});
+
+test("r10 п.3: PR закрыт без влития — строка, 72 ч досмотра, потом конец", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CFG,
+  });
+  let now = Date.now();
+  deps.now = () => now;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  ghView(deps, JSON.stringify({ state: "CLOSED" }));
+  now += 6 * 60 * 1000;
+  await pumpReleases(deps);
+  let fresh = store.getRelease(rel.id)!;
+  assert.equal(fresh.pr_state, "closed");
+  assert.ok(sent.some((m) => /PR закрыт без влития/.test(m)));
+  sent.length = 0;
+  // 72 ч — переоткрытия не было, слежение закончено молча
+  now += 73 * 60 * 60 * 1000;
+  await pumpReleases(deps);
+  fresh = store.getRelease(rel.id)!;
+  assert.equal(fresh.pr_state, "closed_final");
+  assert.equal(sent.length, 0);
+});
+
+test("r10 п.3: PR висит 72 ч — одна строка", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent, db } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CFG,
+  });
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  db.prepare(`UPDATE releases SET updated_at = ?, pr_checked_at = NULL WHERE id = ?`)
+    .run(Date.now() - 73 * 60 * 60 * 1000, rel.id);
+  deps.now = () => Date.now();
+  ghView(deps, JSON.stringify({ state: "OPEN" }));
+  await pumpReleases(deps);
+  const fresh = store.getRelease(rel.id)!;
+  assert.equal(fresh.pr_state, "stale");
+  assert.equal(fresh.pr_stale_notified, 1);
+  assert.equal(sent.filter((m) => /висит 72 ч/.test(m)).length, 1);
+});
+
+test("r10 п.3: три сбоя gh подряд — строка «слежение невозможно»", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CFG,
+  });
+  let now = Date.now();
+  deps.now = () => now;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  ghView(deps, { exitCode: 1, stdout: "", stderr: "gh boom" });
+  for (let i = 0; i < 3; i++) {
+    now += 6 * 60 * 1000;
+    await pumpReleases(deps);
+  }
+  const fresh = store.getRelease(rel.id)!;
+  assert.equal(fresh.pr_state, "error");
+  assert.equal(sent.filter((m) => /слежение за PR/.test(m)).length, 1);
+});
+
+test("r10 п.4: аудит не завершился за 30 мин — отказ и стоп треда", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent, db } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
+  let now = 1_700_000_000_000;
+  deps.now = () => now;
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  // аудит висит 31 минуту — делегирование осталось running
+  db.prepare(`UPDATE delegations SET created_at = ? WHERE level = 'release-audit'`)
+    .run(now - 31 * 60 * 1000);
+  const s = await pumpReleases(deps);
+  assert.equal(s.failed, 1);
+  const rel = store.releasesByStatuses(["failed"])[0]!;
+  assert.match(rel.error ?? "", /30 мин/);
+  assert.ok(sent.some((m) => /аудит не завершился за 30 мин/.test(m)));
 });
