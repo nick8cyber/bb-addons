@@ -333,8 +333,9 @@ export interface ReleaseRow {
   /** §2 r10 п.0: realpath основного каталога репозитория — идентичность
    * цели вместе с target_branch. */
   repo_root: string | null;
-  /** §2 r10 п.3: open | closed | merged | stale | error | legacy |
-   * superseded | closed_final. */
+  /** §2 r10 п.3: open | closed | merged | error | legacy |
+   * superseded | closed_final — «72 ч» это флаг pr_stale_notified,
+   * не состояние (опрос до MERGED/CLOSED продолжается молча). */
   pr_state: string | null;
   pr_checked_at: number | null;
   pr_closed_at: number | null;
@@ -1512,6 +1513,19 @@ export class DelegationStore {
     return info.changes > 0;
   }
 
+  /** §2 r10 п.3: «PR висит 72 ч» — флаг, не состояние: после строки
+   * опрос продолжается молча до MERGED/CLOSED («дальше молча»).
+   * Условный UPDATE — одна строка на все такты. */
+  markPrStaleNotified(id: number): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE releases SET pr_stale_notified = 1
+         WHERE id = ? AND pr_state = 'open' AND pr_stale_notified IS NULL`,
+      )
+      .run(id);
+    return info.changes > 0;
+  }
+
   /** Такт gh прошёл без смены состояния — отметка проверки и счётчик
    * ошибок (updated_at не двигаем: база 72 ч для п.3). */
   recordPrCheck(id: number, error: boolean, at = Date.now()): void {
@@ -1635,6 +1649,26 @@ export class DelegationStore {
     this.db
       .prepare(`UPDATE releases SET ${sets.join(", ")} WHERE id = ?`)
       .run(...args);
+  }
+
+  /** Условный перевод статуса выкладки — тот же приём, что setStatusIf:
+   * кто первый перевёл, тот и владеет строкой об исходе (r31: сторож
+   * отклоняет «аудит без вердикта» до done делегирования, чтобы насос
+   * не успел отклонить своей строкой). */
+  transitionReleaseStatus(
+    id: number,
+    from: readonly ReleaseStatus[],
+    to: ReleaseStatus,
+    error?: string,
+  ): boolean {
+    const marks = from.map(() => "?").join(",");
+    const info = this.db
+      .prepare(
+        `UPDATE releases SET status = ?, error = ?, updated_at = ?
+         WHERE id = ? AND status IN (${marks})`,
+      )
+      .run(to, error ?? null, Date.now(), id, ...from);
+    return info.changes > 0;
   }
 
   /**

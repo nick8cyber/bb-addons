@@ -507,27 +507,21 @@ export function verdictInBody(body: string): "ok" | "not-ok" | null {
   let blockers: unknown;
   for (const raw of body.split("\n")) {
     const line = raw.trim();
-    const start = line.indexOf("{");
-    const end = line.lastIndexOf("}");
-    if (start < 0 || end <= start) continue;
-    // The strict form is the whole line; a `prefix: {"verdict":…}`
-    // tail counts too — a report wrapping the JSON in one line of
-    // prose is a verdict, not "missing".
-    const candidates = [line];
-    const tail = line.slice(start, end + 1);
-    if (tail !== line) candidates.push(tail);
-    for (const cand of candidates) {
-      let parsed: { verdict?: unknown; blockers?: unknown };
-      try {
-        parsed = JSON.parse(cand) as { verdict?: unknown; blockers?: unknown };
-      } catch {
-        continue;
-      }
-      if (parsed.verdict !== "OK" && parsed.verdict !== "CHANGES") continue;
-      verdict = parsed.verdict;
-      blockers = parsed.blockers;
-      break;
+    // §16.7/r31: только отдельная строка-JSON — хвост после прозы
+    // вердиктом не считается (ревью PLUG-244 заход 1, Н8).
+    if (!line.startsWith("{") || !line.endsWith("}")) continue;
+    let parsed: { verdict?: unknown; blockers?: unknown };
+    try {
+      parsed = JSON.parse(line) as {
+        verdict?: unknown;
+        blockers?: unknown;
+      };
+    } catch {
+      continue;
     }
+    if (parsed.verdict !== "OK" && parsed.verdict !== "CHANGES") continue;
+    verdict = parsed.verdict;
+    blockers = parsed.blockers;
   }
   if (verdict === undefined) return null;
   // §16.7 (PLUG-186): the verdict line carries `blockers` — a missing
@@ -2390,10 +2384,27 @@ async function outcomeLine(
   deps: ReleaseDeps,
   row: ReleaseRow,
   text: string,
-): Promise<void> {
-  if (!deps.store.claimReleaseNotify(row.id)) return;
-  await report(deps, row, text);
+): Promise<boolean> {
+  if (!deps.store.claimReleaseNotify(row.id)) return false;
+  // Сообщение в тред координатора — и есть строка п.1: оно бросает,
+  // чтобы временный сбой send снял захват и досмотр повторил отправку
+  // (протокол claimResultDelivery), а не потерял строку навсегда.
+  try {
+    await deps.threads.send({
+      threadId: row.coordinator_thread_id,
+      mode: "queue-if-active",
+      input: [
+        { type: "text", text: `[orchestrator] ${text}`, mentions: [] },
+      ],
+    });
+  } catch (e) {
+    deps.store.releaseReleaseNotify(row.id);
+    deps.log?.warn?.(`orchestrator: release notify: ${message(e)}`);
+    return false;
+  }
+  await commentOnTask(deps, row.task_key, text);
   deps.store.confirmReleaseNotify(row.id);
+  return true;
 }
 
 /**
@@ -2620,7 +2631,7 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
             row,
             `PR влит ${row.task_key}: ${prUrl}` +
               (view.mergeCommit?.oid
-                ? ` → ${view.mergeCommit.oid.slice(0, 8)}`
+                ? ` → ${view.mergeCommit.oid.slice(0, 7)}`
                 : ""),
           );
         }
@@ -2654,13 +2665,11 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
         continue;
       }
       // still open — 72 h from the PR's publish (updated_at is frozen
-      // for tracked rows: pr-watch writes do not bump it).
+      // for tracked rows: pr-watch writes do not bump it). «Дальше
+      // молча» — флаг, не состояние: опрос до MERGED/CLOSED идёт дальше
+      // (ревью PLUG-244 заход 1, Б5).
       if (!row.pr_stale_notified && now - row.updated_at >= PR_STALE_MS) {
-        if (
-          deps.store.transitionPrState(row.id, ["open"], "stale", {
-            prStaleNotified: 1,
-          })
-        ) {
+        if (deps.store.markPrStaleNotified(row.id)) {
           await report(
             deps,
             row,
@@ -3033,20 +3042,31 @@ async function finishPublished(
       selfReload,
     );
     if (created) {
+      // §2 шаг 6: комментарий «выложено» в задачу пишет сам плагин —
+      // скрипт доносит итоговую строку только до треда координатора.
+      await commentOnTask(deps, fresh.task_key, line);
       deps.store.confirmReleaseNotify(fresh.id);
+      // Н7: метка base снимается после подтверждённой строки.
+      deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
       return;
     }
     deps.store.releaseReleaseNotify(fresh.id);
-    await outcomeLine(
-      deps,
-      fresh,
-      line +
-        "\norchestrator не перезагрузился автоматически — " +
-        "перезагрузите плагин вручную",
-    );
+    if (
+      await outcomeLine(
+        deps,
+        fresh,
+        line +
+          "\norchestrator не перезагрузился автоматически — " +
+          "перезагрузите плагин вручную",
+      )
+    ) {
+      deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
+    }
     return;
   }
-  await outcomeLine(deps, fresh, line);
+  if (await outcomeLine(deps, fresh, line)) {
+    deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
+  }
 }
 
 // ── postPublish (§6 r10, push only) ───────────────────────────────────
@@ -3150,7 +3170,10 @@ async function runPostPublish(
     );
   }
   const newHead = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
-  deps.store.metaDelete(markerKey);
+  // Ревью PLUG-244 заход 1 (Н7): метка base НЕ удаляется здесь — до
+  // confirm итоговой строки. Падение между ff/перезагрузками и строкой
+  // досматривается повторным проходом с той же базы; метку снимает
+  // finishPublished после подтверждённой отправки.
   if (!pp.reloadPlugins) {
     return {
       summary: "postPublish: копия обновлена; перезагрузка плагинов выключена",
@@ -3188,7 +3211,12 @@ async function runPostPublish(
     : ((list as { plugins?: unknown[] })?.plugins ?? [])
   ) as { id?: string; name?: string; rootDir?: string; dir?: string; path?: string }[];
   const coReal = await realpath(co).catch(() => co);
-  const pluginId = async (dir: string): Promise<string> => {
+  // Ревью PLUG-244 заход 1 (Н6): плагин перезагружается только когда он
+  // установлен ИЗ этой копии — rootDir записи ровно
+  // <checkout>/plugins/<dir> (суффиксный матч перезагружал плагины,
+  // стоящие из других копий). Не найден — пропуск, без reload по имени
+  // каталога.
+  const pluginId = async (dir: string): Promise<string | null> => {
     const dirReal = await realpath(join(co, "plugins", dir)).catch(
       () => join(co, "plugins", dir),
     );
@@ -3198,13 +3226,48 @@ async function runPostPublish(
       const rootReal = await realpath(root).catch(() => root);
       if (
         rootReal === dirReal ||
-        root.replace(/\\/g, "/").endsWith(`/plugins/${dir}`) ||
         rootReal === join(coReal, "plugins", dir)
       ) {
-        return e.id ?? e.name ?? dir;
+        return e.id ?? null;
       }
     }
-    return dir;
+    return null;
+  };
+  // Ревью PLUG-244 заход 1 (Б2): «провайдер с ходами» сопоставляется по
+  // реестру — `bb provider list` отдаёт каждому провайдеру его
+  // pluginId (`acp-devin` → `provider-devin`), а не угадыванием по
+  // строке. Реестр не прочитался (null) → консервативно: плагин,
+  // похожий на провайдер, пропускается при ЛЮБОМ running-делегировании.
+  let providersByPlugin: Map<string, Set<string>> | null | undefined;
+  const providerIdsOf = async (
+    id: string,
+  ): Promise<Set<string> | null> => {
+    if (providersByPlugin === undefined) {
+      providersByPlugin = null;
+      const list = await runJson<unknown>(deps.bbCli, [
+        "provider",
+        "list",
+        "--json",
+      ]).catch(() => null);
+      if (list != null) {
+        providersByPlugin = new Map();
+        const ps = (Array.isArray(list)
+          ? list
+          : ((list as { providers?: unknown[] })?.providers ?? [])) as {
+          id?: string;
+          pluginId?: string;
+        }[];
+        for (const p of ps) {
+          if (!p.id || !p.pluginId) continue;
+          const bucket =
+            providersByPlugin.get(p.pluginId) ?? new Set<string>();
+          bucket.add(p.id);
+          providersByPlugin.set(p.pluginId, bucket);
+        }
+      }
+    }
+    if (providersByPlugin == null) return null;
+    return providersByPlugin.get(id) ?? new Set();
   };
   const running = deps.store.listByStatuses(ACTIVE_STATUSES);
   const reloaded: string[] = [];
@@ -3212,6 +3275,10 @@ async function runPostPublish(
   let selfReload: { checkout: string; expectedSha: string } | null = null;
   for (const dir of dirs) {
     const id = await pluginId(dir);
+    if (!id) {
+      skipped.push(`${dir} (не установлен из копии — пропуск)`);
+      continue;
+    }
     if (
       changed.some(
         (p) =>
@@ -3222,15 +3289,14 @@ async function runPostPublish(
       skipped.push(`${id} (нужен npm ci)`);
       continue;
     }
-    if (/provider/.test(dir)) {
-      const candidates = new Set(
-        [dir, id, dir.replace(/^bb-plugin-/, ""), id.replace(/^provider-/, "")]
-          .map((x) => x.replace(/^bb-plugin-/, "")),
-      );
-      if (running.some((d) => candidates.has(d.provider))) {
-        skipped.push(`${id} (идут ходы — перезагрузите позже)`);
-        continue;
-      }
+    const pids = await providerIdsOf(id);
+    const isProvider = pids ? pids.size > 0 : /provider/.test(id);
+    if (
+      isProvider &&
+      running.some((d) => (pids ? pids.has(d.provider) : true))
+    ) {
+      skipped.push(`${id} (идут ходы — перезагрузите позже)`);
+      continue;
     }
     if (id === "orchestrator" || dir === "bb-plugin-orchestrator") {
       selfReload = { checkout: co, expectedSha: newHead };
@@ -3271,7 +3337,7 @@ async function createSelfReloadAutomation(
     `EXPECTED='${selfReload.expectedSha}'`,
     `ROOT='${join(selfReload.checkout, "plugins", "bb-plugin-orchestrator")}'`,
     "TEXT=$(cat <<'BB_PP_EOF'",
-    line,
+    `[orchestrator] ${line}`,
     "BB_PP_EOF",
     ")",
     "sleep 15",
@@ -3289,15 +3355,31 @@ async function createSelfReloadAutomation(
     'last=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "?")',
     'bb thread tell "$COORD" "$TEXT; orchestrator после перезагрузки не поднялся / копия на $last, ожидался $EXPECTED" >/dev/null 2>&1 || true',
   ].join("\n");
+  // §6 r10: автоматизация — в проекте КООРДИНАТОРА
+  // (`--project <проект координатора>`), не делегирования.
+  const coordProject =
+    (await deps.threads
+      .get({ threadId: row.coordinator_thread_id })
+      .then((t) => t.projectId)
+      .catch(() => undefined)) ?? row.project_id;
   const res = await deps.bbCli.run([
     "automation",
     "create",
     "--in",
     "1m",
+    // `--name` обязателен (bb automation create --help), `--timeout` —
+    // скрипт спит 15 с и ждёт до ~3 мин, дефолтные 120 с его резали;
+    // `--interpreter sh` — тело на POSIX sh (ревью PLUG-244 заход 1, Б1).
+    "--name",
+    `release ${row.task_key} reload`,
     "--script",
     script,
+    "--interpreter",
+    "sh",
+    "--timeout",
+    "5m",
     "--project",
-    row.project_id,
+    coordProject,
   ]);
   if (res.exitCode !== 0) {
     deps.log?.warn?.(

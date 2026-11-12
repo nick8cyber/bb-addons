@@ -2185,8 +2185,13 @@ export function createWatchdog(deps: WatchdogDeps) {
   };
 
   /** Journal tip seq at the reminder's send time — a second miss counts
-   * only on a `turn/started` seq ABOVE it (r31). */
-  const journalTipSeq = async (row: DelegationRow): Promise<number> => {
+   * only on a `turn/started` seq ABOVE it (r31). null = journal
+   * unreadable: the seq is unknown, so NO reminder is recorded — a 0
+   * would let the next idle count any old turn/started as the second
+   * miss (ревью PLUG-244 заход 1, Н9). */
+  const journalTipSeq = async (
+    row: DelegationRow,
+  ): Promise<number | null> => {
     if (!row.thread_id) return 0;
     try {
       const events = await deps.threads.events.list({
@@ -2196,7 +2201,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       });
       return events[0]?.seq ?? 0;
     } catch {
-      return 0;
+      return null;
     }
   };
 
@@ -2305,6 +2310,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           const cur = store.get(row.id) ?? row;
           if (cur.verdict_nudged_at == null) {
             const tip = await journalTipSeq(row);
+            if (tip == null) return; // журнал не прочитан — wait
             await sendToExecutor(
               row,
               r31Role === "release-audit"
@@ -2323,24 +2329,35 @@ export function createWatchdog(deps: WatchdogDeps) {
           ) {
             return;
           }
+          // Н10 (ревью PLUG-244 заход 1): выкладка аудитора отклоняется
+          // ДО перехода делегирования в done — насос, прочитав
+          // «done + auditing», успел бы отклонить её своей строкой
+          // «ответ не парсится» и вышло бы две строки. Условный перевод
+          // решает гонку: кто перевёл — тот и шлёт строку; уже
+          // отклонённая/отсутствующая выкладка строки не получает.
+          if (row.level === RELEASE_AUDIT_LEVEL) {
+            const release = store.activeReleaseByTask(row.task_key);
+            if (
+              release &&
+              store.transitionReleaseStatus(
+                release.id,
+                ["auditing", "publishing"],
+                "rejected",
+                "аудит без вердикта",
+              )
+            ) {
+              await report(
+                row,
+                `аудит выкладки ${row.task_key} без вердикта — ` +
+                  `выкладка отклонена`,
+              );
+            }
+          }
           if (!store.setStatusIf(row.id, "running", "done")) return;
           clearMarks(row.id);
           const finished = store.get(row.id) ?? row;
           await collectRoundResult(finished);
-          if (finished.level === RELEASE_AUDIT_LEVEL) {
-            const release = store.activeReleaseByTask(finished.task_key);
-            if (release) {
-              store.updateRelease(release.id, {
-                status: "rejected",
-                error: "аудит без вердикта",
-              });
-            }
-            await report(
-              finished,
-              `аудит выкладки ${finished.task_key} без вердикта — ` +
-                `выкладка отклонена`,
-            );
-          } else {
+          if (finished.level !== RELEASE_AUDIT_LEVEL) {
             await report(
               finished,
               `ревью ${finished.task_key} без вердикта: ` +

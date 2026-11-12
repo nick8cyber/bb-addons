@@ -70,6 +70,15 @@ function makeHarness(
     spawnThrow?: () => unknown;
     /** B1: a pre-migrated "old" database — caller drives the schema. */
     db?: import("better-sqlite3").Database;
+    /** r31 (ревью PLUG-244 Н9): fail `events.list` calls matching this
+     * predicate — the journal-tip read for the verdict reminder can
+     * fail while other journal reads succeed. */
+    eventsListFail?: (a: {
+      threadId: string;
+      order?: "asc" | "desc";
+      limit?: string;
+      types?: readonly string[];
+    }) => boolean;
   } = {},
 ) {
   const db = opts.db ?? new Database(":memory:");
@@ -192,6 +201,9 @@ function makeHarness(
         }
         if (eventsBlocked.has(args.threadId)) {
           throw new Error("events.list unavailable (test)");
+        }
+        if (opts.eventsListFail?.(args)) {
+          throw new Error("events.list failed (test)");
         }
         let rows = (eventLog.get(args.threadId) ?? []).slice();
         if (args.types?.length) {
@@ -5880,3 +5892,165 @@ test("§17 r31: вердикт аудитора в сообщении треда
   await idleOnce(h, "thr_a", 3);
   assert.equal(h.store.get(row.id)!.status, "done");
 });
+
+test("§17 r31: комментарий без JSON + вердикт в сообщении — напоминания нет", async () => {
+  const h = makeHarness({
+    cli: (args) =>
+      args.join(" ").startsWith("tasks show")
+        ? ok(
+            JSON.stringify({
+              comments: [
+                {
+                  kind: "agent",
+                  threadId: "thr_r",
+                  body: "итоговый отчёт без JSON-строки",
+                  createdAt: "2026-01-01",
+                },
+              ],
+            }),
+          )
+        : undefined,
+  });
+  const row = reviewerRow(h, {
+    level: "review",
+    threadId: "thr_r",
+    output: 'итог\n{"verdict":"OK","blockers":0}',
+    events: [
+      ev(1, "turn/started", T0),
+      ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+    ],
+  });
+  await idleOnce(h, "thr_r", 2);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.verdict_nudged_at, null);
+  assert.ok(!h.sends.some((m) => m.threadId === "thr_r"));
+});
+
+test("§17 r31 (ревью Н9): сбой чтения вершины журнала — напоминание не ставится", async () => {
+  // journalTipSeq — единственный вызов events.list с desc+limit 1 без
+  // types; он и ломаем. Остальные чтения журнала проходят.
+  let failTip = true;
+  const h = makeHarness({
+    eventsListFail: (a) =>
+      failTip && a.order === "desc" && a.limit === "1" && !a.types,
+  });
+  const row = reviewerRow(h, {
+    level: "review",
+    threadId: "thr_r",
+    output: "отчёт без вердикта",
+    events: [
+      ev(1, "turn/started", T0),
+      ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+    ],
+  });
+  await idleOnce(h, "thr_r", 2);
+  let fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  // seq неизвестен — напоминание НЕ записано и НЕ отправлено
+  assert.equal(fresh.verdict_nudged_at, null);
+  assert.ok(!h.sends.some((m) => m.threadId === "thr_r"));
+  // журнал ожил — следующий idle ставит ПЕРВОЕ напоминание, а не
+  // засчитывает второй промах (ядро находки Н9: seq=0 травил счёт)
+  failTip = false;
+  await h.wd.onThreadIdle(dto("thr_r", "idle"));
+  fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.ok(fresh.verdict_nudged_at != null);
+  assert.equal(fresh.verdict_nudge_seq, 2);
+});
+
+test("§17 r31 (ревью Н10): выкладка уже отклонена насосом — второй строки нет", async () => {
+  const h = makeHarness({});
+  const rel = h.store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    repoPath: "/nonexistent-copy",
+    branch: "feat",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  const row = reviewerRow(h, {
+    level: "release-audit",
+    threadId: "thr_a",
+    events: [
+      ev(1, "turn/started", T0),
+      ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+    ],
+  });
+  await idleOnce(h, "thr_a", 2);
+  assert.equal(h.store.get(row.id)!.status, "running");
+  // насос успел отклонить выкладку своей строкой до нашего второго промаха
+  h.store.updateRelease(rel.id, {
+    status: "rejected",
+    error: "ответ не парсится",
+  });
+  h.eventLog.set("thr_a", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+    ev(3, "turn/started", T0 + 20),
+    ev(4, "turn/completed", T0 + 30, { status: "completed" }),
+  ]);
+  await idleOnce(h, "thr_a", 4);
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  // «без вердикта» не досылается — перевод выкладки не наш (уже rejected)
+  assert.ok(
+    !h.sends.some(
+      (m) =>
+        m.threadId === "thr_coord" &&
+        /без вердикта/.test(JSON.stringify(m.input)),
+    ),
+    "строка «аудит без вердикта» не дублируется",
+  );
+});
+
+test("r10 п.4: release-audit — восстановление muted notify ставит off (§17.2)", async () => {
+  const h = makeHarness({});
+  const row = h.insertActive({
+    threadId: "thr_a",
+    level: "release-audit",
+    route: "simple",
+  });
+  h.threadDtos.set("thr_a", dto("thr_a", "active"));
+  h.store.addSetupError(row.id, "notify-muted", "thr_a");
+  await h.wd.reconcile();
+  assert.ok(
+    h.calls.some(
+      (c) => c.join(" ") === "thread update thr_a --parent-notifications off",
+    ),
+    "восстановление для release-audit возвращает off, не auto",
+  );
+  assert.equal(
+    h.store.findSetupError(h.store.get(row.id)!, "notify-muted"),
+    undefined,
+    "метка снята после успешного восстановления",
+  );
+});
+
+test("r10 п.4: release-audit — сверка привязки требует off (§7)", async () => {
+  const h = makeHarness({});
+  h.insertActive({
+    threadId: "thr_a",
+    level: "release-audit",
+    route: "simple",
+  });
+  // привязан, но BB-сообщения включены — для аудита нужен off
+  h.threadDtos.set(
+    "thr_a",
+    dto("thr_a", "active", {
+      parentThreadId: "thr_coord",
+      parentNotifications: "auto",
+      visibility: "hidden",
+    }),
+  );
+  await h.wd.reconcile();
+  assert.ok(
+    h.calls.some(
+      (c) => c.join(" ") === "thread update thr_a --parent-notifications off",
+    ),
+    "сверка привязки тянет release-audit к off",
+  );
+});
+
