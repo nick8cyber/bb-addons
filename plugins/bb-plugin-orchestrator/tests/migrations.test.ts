@@ -195,12 +195,12 @@ test("the r28 migration adds no_code to an existing db, defaulting 0", () => {
   const db = new Database(":memory:");
   const r28 = MIGRATIONS.findIndex((m) => m.includes("ADD COLUMN no_code"));
   assert.ok(r28 > 0, "r28 migration found");
-  // §16.4 r29 (PLUG-240): the rescue ledger is appended after r28.
-  assert.equal(r28, MIGRATIONS.length - 2, "r28 precedes the r29 rescue ledger");
+  // §16.4 r29 (PLUG-240): the rescue ledger is appended right after
+  // r28 (later revisions append their own migrations after both).
   assert.match(
-    MIGRATIONS.at(-1)!,
+    MIGRATIONS[r28 + 1]!,
     /janitor_rescues/,
-    "the r29 rescue ledger is the last migration",
+    "the r29 rescue ledger follows r28",
   );
   for (const m of MIGRATIONS.slice(0, r28)) db.exec(m);
   db.prepare(

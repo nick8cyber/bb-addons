@@ -54,6 +54,12 @@ export interface ReleaseProjectLayer {
   /** §17.3 (С6): addresses (`a@b.c`) and domains (`@b.c` or `b.c`)
    * that do not count as a personal-email leak. */
   allowedEmails?: string[];
+  /** §6 r10: послевыкладочное обновление настроенной копии (push). */
+  postPublish?: {
+    checkout: string;
+    branch?: string;
+    reloadPlugins?: boolean;
+  };
 }
 
 export interface ReleaseConfig {
@@ -93,6 +99,13 @@ export interface ResolvedProject {
   allowedTrailers: string[];
   /** §17.3 (С6): emails/domains that are not a leak (default []). */
   allowedEmails: string[];
+  /** §6 r10: копия, которую конвейер обновляет после push (`branch`
+   * уже с подставленной целевой). */
+  postPublish: {
+    checkout: string;
+    branch: string;
+    reloadPlugins: boolean;
+  } | null;
 }
 
 const isRecord = (x: unknown): x is Record<string, unknown> =>
@@ -268,6 +281,42 @@ function parseLayer(
       );
     }
   }
+  if (value.postPublish !== undefined) {
+    const pp = value.postPublish;
+    if (!isRecord(pp)) {
+      err(`${path}.postPublish`, "must be an object {checkout, branch?, reloadPlugins?}");
+    } else {
+      let checkout: string | undefined;
+      if (!isNonEmptyString(pp.checkout)) {
+        err(`${path}.postPublish.checkout`, "required non-empty checkout path");
+      } else {
+        checkout = pp.checkout.trim();
+      }
+      let branch: string | undefined;
+      if (pp.branch !== undefined) {
+        if (!isNonEmptyString(pp.branch)) {
+          err(`${path}.postPublish.branch`, "must be a non-empty branch name");
+        } else {
+          branch = pp.branch.trim();
+        }
+      }
+      let reloadPlugins: boolean | undefined;
+      if (pp.reloadPlugins !== undefined) {
+        if (typeof pp.reloadPlugins !== "boolean") {
+          err(`${path}.postPublish.reloadPlugins`, "must be a boolean");
+        } else {
+          reloadPlugins = pp.reloadPlugins;
+        }
+      }
+      if (checkout) {
+        layer.postPublish = {
+          checkout,
+          ...(branch ? { branch } : {}),
+          ...(reloadPlugins !== undefined ? { reloadPlugins } : {}),
+        };
+      }
+    }
+  }
   return layer;
 }
 
@@ -367,5 +416,15 @@ export function resolveProject(
     threadIds: layer.threadIds ?? true,
     allowedTrailers: layer.allowedTrailers ?? [],
     allowedEmails: layer.allowedEmails ?? [],
+    postPublish: layer.postPublish
+      ? {
+          checkout: layer.postPublish.checkout,
+          branch:
+            layer.postPublish.branch ??
+            (layer.target ?? { action: "push" as const, branch: "main" })
+              .branch,
+          reloadPlugins: layer.postPublish.reloadPlugins === true,
+        }
+      : null,
   };
 }

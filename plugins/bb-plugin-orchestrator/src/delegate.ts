@@ -224,6 +224,13 @@ export interface DispatchStepsResult {
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** orchestrator-release §2 r10 п.4: the release-auditor thread is
+ * parent-muted BY CONTRACT — `off` is its expected mode, `auto` every
+ * other delegation's. */
+export const RELEASE_AUDIT_LEVEL = "release-audit";
+export const expectedParentNotify = (level: string): "off" | "auto" =>
+  level === RELEASE_AUDIT_LEVEL ? "off" : "auto";
+
 /** bb task keys look like `PLUG-129`; anything else is resolved as a ULID. */
 const TASK_KEY_RE = /^[A-Za-z][A-Za-z0-9]*-[0-9]+$/;
 
@@ -1017,7 +1024,7 @@ async function dispatchViaSpawn(
       title,
       prompt,
       parentThreadId: row.coordinator_thread_id,
-      parentNotifications: "auto",
+      parentNotifications: expectedParentNotify(row.level),
       visibility: "hidden",
       pluginMetadata: { delegationId: row.id },
     });
@@ -1200,11 +1207,12 @@ async function verifyParentBinding(
     };
   }>(deps.bbCli, ["thread", "show", threadId, "--json"]);
   const facts = show.thread ?? {};
+  const want = expectedParentNotify(row.level);
   const parentOk = facts.parentThreadId === row.coordinator_thread_id;
-  const notifyOk = facts.parentNotifications === "auto";
+  const notifyOk = facts.parentNotifications === want;
   const hiddenOk = facts.visibility === "hidden";
   if (parentOk && notifyOk && hiddenOk) {
-    deps.store.addSetupError(row.id, "attach-verified", "auto");
+    deps.store.addSetupError(row.id, "attach-verified", want);
     return;
   }
   if (!parentOk || !hiddenOk) {
@@ -1220,7 +1228,7 @@ async function verifyParentBinding(
       "update",
       threadId,
       "--parent-notifications",
-      "auto",
+      want,
     ]);
   }
 }
@@ -1458,7 +1466,7 @@ export async function retrySetupSteps(
         "update",
         threadId,
         "--parent-notifications",
-        "auto",
+        expectedParentNotify(row.level),
       ]),
     );
   }

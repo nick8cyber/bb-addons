@@ -102,6 +102,23 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   (`release-settings-unknown` / `release-settings-ambiguous`). Test
   fixtures for leak paths live in `tests/fixtures/leak-samples.ts`
   (listed in `leaks.allow`), negative samples use `/home/example/`.
+  **Deterministic outcome (§2 r10):** one release at a time per
+  repository+target (guarded by the release row's `repo_root`), one
+  outcome line per release — success, post-check findings and the
+  postPublish result fold into it, sent under a `notified_at` claim and
+  re-sent by the pump when a tick died before the line. The audit has
+  30 minutes from its first dispatch; a reviewer or the auditor ending
+  a turn without a verdict gets ONE reminder, a second verdict-less
+  turn ends the round without OK (the auditor's release is rejected
+  «аудит без вердикта»). For `pr` targets the pump tracks the PR
+  (`gh pr view` every 5 min): merged → «PR влит» + task done, closed →
+  one line + 72 h for a reopen-merge, open 72 h → one «PR висит 72 ч»
+  line, three gh failures → one «слежение невозможно» line.
+  `postPublish` (`{checkout, branch?, reloadPlugins}`) fast-forwards a
+  configured checkout after push and reloads the changed plugins —
+  dirs with a changed manifest need `npm ci`, providers with running
+  turns are postponed, and the orchestrator plugin reloads itself via
+  a one-shot script automation (it cannot reload itself).
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
   `dispatching` rows by the `pluginMetadata.delegationId` label under the
