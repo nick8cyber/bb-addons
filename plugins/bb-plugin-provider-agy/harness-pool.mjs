@@ -133,7 +133,14 @@ process.stdout.write = originalWrite;
 
 const envs = readEnvs();
 const bs = boundaries("t-pool");
-const ledger = JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"));
+const ledger = (() => {
+  const shared = JSON.parse(readFileSync(join(root, "accounts-state.json"), "utf8"));
+  let local = {};
+  try {
+    local = JSON.parse(readFileSync(join(root, "conversations-state.json"), "utf8")).conversations ?? {};
+  } catch { /* no local file yet */ }
+  return { ...shared, conversations: { ...(shared.conversations ?? {}), ...local } };
+})();
 const replacedList = replaced();
 
 const checks = [
