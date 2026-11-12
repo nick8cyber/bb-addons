@@ -1502,6 +1502,22 @@ export class DelegationStore {
       .run(text, kind, id);
   }
 
+  /** Итоговая строка + метка postPublish `finish` — одной транзакцией:
+   * крах между записью строки и меткой оставил бы merging-запись без
+   * признака «итог собран», и такт пересобрал бы дубль (PLUG-245 Б6). */
+  setReleaseNoticeWithMeta(
+    id: number,
+    kind: string,
+    text: string,
+    metaKey: string,
+    metaValue: string,
+  ): void {
+    this.db.transaction(() => {
+      this.setReleaseNotice(id, kind, text);
+      this.metaSet(metaKey, metaValue);
+    })();
+  }
+
   /** §2 r10 п.5: захват отправки — минус время захвата, протокол
    * claimResultDelivery (PLUG-190): захват старше 2 мин перехватывается
    * следующим тактом, лучше редкий дубль, чем потеря. Значение -1 от
@@ -2129,8 +2145,8 @@ export class DelegationStore {
 
   attachCommandProcess(
     id: number,
-    pid: number,
-    pgid: number,
+    pid: number | null,
+    pgid: number | null,
     procStart: string | null,
   ): void {
     this.db

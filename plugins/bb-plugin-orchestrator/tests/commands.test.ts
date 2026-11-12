@@ -26,6 +26,7 @@ import {
 import { parsePolicy } from "../src/policy.js";
 import {
   checkExecSettings,
+  execSettingsChanges,
   execSettingsChangedKeys,
   execSettingsFingerprint,
 } from "../src/trust.js";
@@ -263,6 +264,51 @@ test("§18.2: recover — живая группа убивается, запис
   assert.equal(store.commandRunByKey("pp:1:b")!.status, "interrupted");
 });
 
+test("§18.5 (Б5): recover — лидер мёртв, а группа жива: сироты добиваются по pgid", async () => {
+  const { store } = makeStore();
+  const kills: [number, string][] = [];
+  const a = store.enqueueCommandRun(spec({ runKey: "pp:1:a" }), 1);
+  store.claimCommandRun(a.id, 2);
+  store.attachCommandProcess(a.id, 42, 42, "777");
+  const runner = createCommandRunner({
+    store,
+    maxConcurrent: () => 1,
+    killGraceMs: 1,
+    // лидера 42 в /proc нет (null), но группа жива (дети-внучата)
+    procStart: () => null,
+    alive: () => true,
+    killGroup: (pgid, sig) => kills.push([pgid, sig]),
+    [SLE]: async () => {},
+  });
+  await runner.recover();
+  assert.deepEqual(kills, [
+    [42, "SIGTERM"],
+    [42, "SIGKILL"],
+  ]);
+  assert.equal(store.commandRunByKey("pp:1:a")!.status, "interrupted");
+});
+
+test("§18.5 (Б5): recover/stopAll — pgid ≤ 0 не сигналится (ENOENT-spawn не бьёт pid 1)", async () => {
+  const { store } = makeStore();
+  const kills: [number, string][] = [];
+  const a = store.enqueueCommandRun(spec({ runKey: "pp:1:a" }), 1);
+  store.claimCommandRun(a.id, 2);
+  // spawn упал с ENOENT — pid/pgid не записались
+  store.attachCommandProcess(a.id, null, null, null);
+  const runner = createCommandRunner({
+    store,
+    maxConcurrent: () => 1,
+    killGraceMs: 1,
+    procStart: () => null,
+    alive: () => true,
+    killGroup: (pgid, sig) => kills.push([pgid, sig]),
+    [SLE]: async () => {},
+  });
+  await runner.recover();
+  assert.deepEqual(kills, []);
+  assert.equal(store.commandRunByKey("pp:1:a")!.status, "interrupted");
+});
+
 test("§18.2: queued после рестарта запускается новым раннером", async () => {
   const { store } = makeStore();
   store.enqueueCommandRun(spec(), 1);
@@ -293,6 +339,27 @@ test("§18.2: holdForSelfReload — queued не стартуют до новог
   store.enqueueCommandRun(spec(), 1);
   await runner.pump();
   assert.equal(spawned.length, 0);
+});
+
+test("§18.5 (Б3): holdForSelfReload — срок истёк → очередь разблокируется сама", async () => {
+  const { store } = makeStore();
+  const { spawner, spawned } = fakeSpawner();
+  let now = 1_000;
+  const runner = createCommandRunner({
+    store,
+    spawn: spawner,
+    maxConcurrent: () => 4,
+    now: () => now,
+    procStart: () => "1",
+    alive: () => false,
+  });
+  runner.holdForSelfReload(5_000);
+  store.enqueueCommandRun(spec(), 1);
+  await runner.pump();
+  assert.equal(spawned.length, 0, "окно удержания — queued не стартуют");
+  now += 5_001; // автоматизация не сработала — удержание не вечное
+  await runner.pump();
+  assert.equal(spawned.length, 1, "после срока очередь пошла");
 });
 
 test("§18.2: stopAll — живой группе SIGTERM, запись interrupted (реальный процесс)", async () => {
@@ -357,6 +424,11 @@ test("§18.2: globMatch — *, ?, **, ANY-семантика по одному �
   assert.ok(globMatch("?.txt", "f.txt"));
   assert.ok(!globMatch("*.txt", "d/f.txt"));
   assert.ok(!globMatch("docs/**", "src/a.ts"));
+  // `**/x` — «ноль и более каталогов»: матчит и корневой x
+  assert.ok(globMatch("**/x", "x"));
+  assert.ok(globMatch("**/x", "a/b/x"));
+  assert.ok(globMatch("a/**/b", "a/b"));
+  assert.ok(globMatch("a/**/b", "a/c/d/b"));
 });
 
 test("§18.5: timing — слияние по ключам, пределы → warning+default", () => {
@@ -531,4 +603,63 @@ test("§18.4: доверие — первый снимок молча, изме�
   assert.ok(!JSON.stringify(changes).includes("evil.sh"));
   const fp = execSettingsFingerprint(cfg2);
   assert.ok(!JSON.stringify(fp).includes("evil.sh"));
+});
+
+test("§18.4 (мелочь): битый конфиг — снимок не сверяется, «всё убрали» не рассылается", async () => {
+  const { store } = makeStore();
+  const sends: string[] = [];
+  const warns: string[] = [];
+  const cfg = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        postPublish: { commands: [{ name: "deploy", argv: ["./d.sh"] }] },
+      },
+    }),
+  ).config!;
+  await checkExecSettings({ store, cfg, send: async () => {} });
+  // конфиг сломался — снимок не трогаем и ничего не рассылаем
+  const changes = await checkExecSettings({
+    store,
+    cfg: null,
+    cfgBroken: true,
+    send: async (t, text) => {
+      sends.push(`${t}:${text}`);
+    },
+    warn: (m) => warns.push(m),
+  });
+  assert.equal(changes.length, 0, "расхождений нет — сверки не было");
+  assert.equal(sends.length, 0, "ложные «всё убрали» не рассылаются");
+  assert.ok(warns.some((w) => /не парсится/.test(w)));
+});
+
+test("§18.4 (мелочь): status — имена и хеши изменённых записей, без значений", async () => {
+  const { store } = makeStore();
+  const cfg = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        postPublish: { commands: [{ name: "deploy", argv: ["./d.sh"] }] },
+      },
+    }),
+  ).config!;
+  await checkExecSettings({ store, cfg, send: async () => {} });
+  const cfg2 = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        postPublish: { commands: [{ name: "deploy", argv: ["./evil.sh"] }] },
+      },
+    }),
+  ).config!;
+  const changes = await checkExecSettings({
+    store,
+    cfg: cfg2,
+    send: async () => {},
+  });
+  assert.equal(changes.length, 1);
+  const listed = execSettingsChanges(store);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].key, "defaults:postPublish.commands:deploy");
+  assert.match(listed[0].prev, /^[0-9a-f]{16}$/, "старый хеш в status");
+  assert.match(listed[0].next, /^[0-9a-f]{16}$/, "новый хеш в status");
+  assert.notEqual(listed[0].prev, listed[0].next);
+  assert.ok(!listed[0].prev.includes("evil"), "значений нет — только хеши");
 });

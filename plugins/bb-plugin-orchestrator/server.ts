@@ -79,10 +79,14 @@ import {
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
 import { createCommandRunner } from "./src/commands.js";
-import { checkExecSettings, execSettingsChangedKeys } from "./src/trust.js";
+import {
+  checkExecSettings,
+  execSettingsChanges,
+} from "./src/trust.js";
 import { isEnvironmentGone, runMerge } from "./src/merge.js";
 import {
   pumpReleases,
+  releaseAllPostPublishLocks,
   releaseThreadsGet,
   runRelease,
   settingsProjectId,
@@ -229,7 +233,7 @@ export async function createPlugin(
         "§18.2: cap on simultaneously running journaled commands (postPublish/event hooks). Default 4.",
       default: "4",
     },
-    commandRetentionDays: {
+    retentionDays: {
       type: "string",
       label: "Command journal retention (days)",
       description:
@@ -468,6 +472,7 @@ export async function createPlugin(
     checkExecSettings({
       store,
       cfg: releaseConfig.config,
+      cfgBroken: releaseConfig.errors.length > 0,
       send: async (threadId, text) => {
         await bb.sdk.threads.send({
           threadId,
@@ -732,7 +737,9 @@ export async function createPlugin(
     enqueue,
     commandRunner,
     commandRetentionDays: () =>
-      positiveInt(currentSettings.commandRetentionDays, 30),
+      positiveInt(currentSettings.retentionDays, 30),
+    // PLUG-245 Б2: владелец замков копии postPublish — этот экземпляр.
+    instanceId: `orch-${process.pid}-${Math.random().toString(36).slice(2, 10)}`,
     log: bb.log,
   };
   const pumpRelease = () =>
@@ -958,6 +965,8 @@ export async function createPlugin(
           clearInterval(timersTimer);
           // §18.2: живым группам SIGTERM, записи — interrupted.
           void commandRunner.stopAll();
+          // §18.5: замки копий postPublish не переживают экземпляр.
+          releaseAllPostPublishLocks();
           resolve();
         };
         if (signal.aborted) {
@@ -1209,8 +1218,9 @@ export async function createPlugin(
       counts,
       limits: policyLoad.policy?.limits ?? null,
       delegations,
-      // §18.4: изменённые исполняемые настройки (имена ключей).
-      execSettingsChanges: execSettingsChangedKeys(store),
+      // §18.4: изменённые исполняемые настройки — имена и хеши,
+      // без значений.
+      execSettingsChanges: execSettingsChanges(store),
     };
   };
 
@@ -1488,7 +1498,9 @@ export async function createPlugin(
               : "") +
             `  counts: ${JSON.stringify(res.counts)}\n` +
             (res.execSettingsChanges.length
-              ? `изменённые исполняемые настройки: ${res.execSettingsChanges.join(", ")}\n`
+              ? `изменённые исполняемые настройки: ${res.execSettingsChanges
+                  .map((c) => c.key)
+                  .join(", ")}\n`
               : "");
           for (const d of res.delegations) out += renderDelegation(d) + "\n";
           if (!res.delegations.length) out += "no delegations\n";

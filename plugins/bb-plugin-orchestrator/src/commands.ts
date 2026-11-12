@@ -105,6 +105,7 @@ export const defaultSpawner: CommandSpawner = (spec) => {
     pgid,
     done,
     killGroup: (signal) => {
+      if (pgid <= 0) return; // spawn не поднялся — группы нет
       try {
         process.kill(-pgid, signal);
       } catch {
@@ -126,6 +127,7 @@ export function procStartTime(pid: number): string | null {
 }
 
 export function groupAlive(pgid: number): boolean {
+  if (pgid <= 0) return false; // недействительная группа — не живая
   try {
     process.kill(-pgid, 0);
     return true;
@@ -135,6 +137,7 @@ export function groupAlive(pgid: number): boolean {
 }
 
 export function killGroupOf(pgid: number, signal: "SIGTERM" | "SIGKILL") {
+  if (pgid <= 0) return;
   try {
     process.kill(-pgid, signal);
   } catch {
@@ -163,12 +166,18 @@ export interface CommandRunner {
   recover(): Promise<void>;
   /** Остановка плагина: живым группам SIGTERM, записи → interrupted. */
   stopAll(): Promise<void>;
-  /** Самоперезагрузка поставлена — новые queued не стартуют в этом процессе. */
-  holdForSelfReload(): void;
+  /** Самоперезагрузка поставлена — новые queued не стартуют в этом
+   * процессе, пока не истечёт ttlMs (умолчание 5 мин — PLUG-245 Б3:
+   * не сработавшая перезагрузка не держит очередь вечно). */
+  holdForSelfReload(ttlMs?: number): void;
 }
 
 const sleepDefault = (ms: number) =>
   new Promise<void>((r) => setTimeout(r, ms));
+
+/** §18.5: окно самоперезагрузки — если автоматизация не перезапустила
+ * плагин за это время, очередь снимается с удержания сама. */
+export const SELF_RELOAD_HOLD_MS = 5 * 60 * 1000;
 
 export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
   const now = deps.now ?? (() => Date.now());
@@ -180,7 +189,7 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
   const killGrace = deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const warn = deps.warn ?? (() => {});
   const live = new Map<number, SpawnedCommand>();
-  let held = false;
+  let heldUntil: number | null = null;
 
   const startRow = async (row: CommandRunRow): Promise<boolean> => {
     if (!deps.store.claimCommandRun(row.id, now())) return false;
@@ -227,9 +236,9 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
     }
     deps.store.attachCommandProcess(
       row.id,
-      spawned.pid,
-      spawned.pgid,
-      procStart(spawned.pid),
+      spawned.pid > 0 ? spawned.pid : null,
+      spawned.pgid > 0 ? spawned.pgid : null,
+      spawned.pid > 0 ? procStart(spawned.pid) : null,
     );
     live.set(row.id, spawned);
     let timedOut = false;
@@ -269,7 +278,8 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
 
   return {
     async pump() {
-      if (held) return;
+      if (heldUntil !== null && now() < heldUntil) return;
+      heldUntil = null;
       const running = deps.store.runningCommandRuns();
       let slots = Math.max(0, deps.maxConcurrent()) - running.length;
       if (slots <= 0) return;
@@ -288,21 +298,23 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
 
     async recover() {
       for (const row of deps.store.runningCommandRuns()) {
+        const pgid = row.pgid ?? -1;
         let kill = false;
-        if (row.pgid != null && row.pid != null) {
-          const start = procStart(row.pid);
-          // §18.2: убиваем только свою группу — лидер тот же
-          // (proc_start совпал). pid переиспользован чужим процессом —
-          // группу не трогаем, запись всё равно interrupted.
+        if (pgid > 0) {
+          const start =
+            row.pid != null && row.pid > 0 ? procStart(row.pid) : null;
+          // §18.5: живость смотрим по ГРУППЕ — мёртвый лидер не мешает
+          // добить живых детей (pgid не переиспользуется, пока группа
+          // жива — alive(pgid) при мёртвом лидере = наши сироты). А вот
+          // pid, занятый ЧУЖИМ процессом (proc_start не сошёлся),
+          // группу не убивает — защита от переиспользования pid.
           kill =
-            start !== null &&
-            row.proc_start === start &&
-            alive(row.pgid);
+            start === null ? alive(pgid) : row.proc_start === start;
         }
-        if (kill && row.pgid != null) {
-          killGroup(row.pgid, "SIGTERM");
+        if (kill) {
+          killGroup(pgid, "SIGTERM");
           await sleep(killGrace);
-          if (alive(row.pgid)) killGroup(row.pgid, "SIGKILL");
+          if (alive(pgid)) killGroup(pgid, "SIGKILL");
         }
         deps.store.interruptCommandRun(row.id, now());
       }
@@ -315,14 +327,14 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
       }
       const rows = deps.store.runningCommandRuns();
       for (const row of rows) {
-        if (row.pgid != null) killGroup(row.pgid, "SIGTERM");
+        if (row.pgid != null && row.pgid > 0) killGroup(row.pgid, "SIGTERM");
         deps.store.interruptCommandRun(row.id, now());
       }
       if (live.size || rows.length) {
         await sleep(killGrace);
         for (const spawned of live.values()) spawned.killGroup("SIGKILL");
         for (const row of deps.store.runningCommandRuns()) {
-          if (row.pgid != null && alive(row.pgid)) {
+          if (row.pgid != null && row.pgid > 0 && alive(row.pgid)) {
             killGroup(row.pgid, "SIGKILL");
           }
         }
@@ -331,26 +343,34 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
       warn("command runner stopped");
     },
 
-    holdForSelfReload() {
-      held = true;
+    holdForSelfReload(ttlMs = SELF_RELOAD_HOLD_MS) {
+      heldUntil = now() + ttlMs;
     },
   };
 }
 
 /** §18.2/§18.5: glob-диалект when — *, ?, **; любой патч (ANY). */
 export function globMatch(pattern: string, path: string): boolean {
-  const re = new RegExp(
-    "^" +
-      pattern
-        .split(/(\*\*|\*|\?)/)
-        .map((part) => {
-          if (part === "**") return ".*";
-          if (part === "*") return "[^/]*";
-          if (part === "?") return "[^/]";
-          return part.replace(/[.*+^${}()|[\]\\]/g, "\\$&");
-        })
-        .join("") +
-      "$",
-  );
-  return re.test(path);
+  const parts = pattern.split(/(\*\*|\*|\?)/);
+  let re = "^";
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (part === "**") {
+      // `**/x` матчит и корневой `x` — `**/` это «ноль и более каталогов»
+      if (parts[i + 1]?.startsWith("/")) {
+        re += "(?:.*/)?";
+        parts[i + 1] = parts[i + 1].slice(1);
+      } else {
+        re += ".*";
+      }
+    } else if (part === "*") {
+      re += "[^/]*";
+    } else if (part === "?") {
+      re += "[^/]";
+    } else {
+      re += part.replace(/[.*+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  re += "$";
+  return new RegExp(re).test(path);
 }

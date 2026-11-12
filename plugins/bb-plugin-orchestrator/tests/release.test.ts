@@ -28,6 +28,8 @@ import {
   releaseThreadsGet,
   runRelease,
   pumpReleases,
+  releaseAllPostPublishLocks,
+  POSTPUBLISH_MAX_MS,
   writePushToken,
   settingsProjectId,
   type ReleaseDeps,
@@ -4751,10 +4753,12 @@ test("§2 п.6 r11 (без prProvider): postPublish-команды через ж
   const lock = join(seed, ".git", "orchestrator-merge.lock");
   assert.ok(existsSync(lock), "копия под замком на весь postPublish");
   const rel = store.releasesByStatuses(["published"])[0]!;
+  // §18.2: следующая команда ставится только после итога предыдущей —
+  // пока deploy в полёте, записи note ещё нет (защита stopOnFail).
   assert.equal(
-    store.commandRunByKey(`pp:${rel.id}:note`)!.status,
-    "queued",
-    "вторая команда выкладки ждёт группу",
+    store.commandRunByKey(`pp:${rel.id}:note`),
+    undefined,
+    "вторая команда ждёт итога первой, а не очереди",
   );
   sp.resolve({ code: 0, signal: null, output: "ok" });
   await new Promise((r) => setImmediate(r));
@@ -4803,7 +4807,7 @@ test("§2 п.6 r11: when-патчи и пропуски — «нет измен�
   await pumpReleases(deps2);
   const line = sent.find((m) => /выложено/.test(m))!;
   assert.match(line, /docs: пропущена — нет изменений по when/);
-  assert.match(line, /cp: пропущена — нет checkout/);
+  assert.match(line, /cp: нет checkout/);
   assert.match(line, /main: ok/);
 });
 
@@ -5016,4 +5020,447 @@ test("§2 п.6 r11: самоперезагрузка — скрипт без и�
   assert.match(script, /base64 -d/, "значения в скрипт — base64");
   assert.ok(!script.includes("thr_coord"), "id треда не интерполирован");
   assert.ok(!script.includes("выложено"), "текст строки не интерполирован");
+});
+
+// ── PLUG-245 заход 2: регрессии ревью ────────────────────────────────
+
+const ppCfgCmds = (seed: string | null, commands: unknown[], extra: Record<string, unknown> = {}) =>
+  JSON.stringify({
+    commitIdentity: "Agent <agent@x.io>",
+    defaults: { target: { action: "push", branch: "main" }, checks: [] },
+    projects: {
+      proj_main: {
+        postPublish: {
+          ...(seed ? { checkout: seed, branch: "main" } : {}),
+          ...extra,
+          commands,
+        },
+      },
+    },
+  });
+
+test("§18.2 (Б1): следующая команда не ставится, пока предыдущая в полёте", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(null, [
+      { name: "a", run: ["x"] },
+      { name: "b", run: ["y"] },
+    ]),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(fake.spawned.length, 1, "стартовала только a");
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:b`),
+    undefined,
+    "b не в журнале, пока a в полёте — stopOnFail не обгоняется",
+  );
+  // «полёт между тактами»: ещё два такта — b всё так же не стартует
+  await pumpReleases(deps2);
+  await pumpReleases(deps2);
+  assert.equal(fake.spawned.length, 1);
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.equal(fake.spawned.length, 2, "b стартовала после итога a");
+});
+
+test("§18.5 (Б1+Б6): stopOnFail через рестарт — прерванная считается не ok", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(null, [
+      { name: "must", run: ["x"], stopOnFail: true },
+      { name: "later", run: ["y"] },
+      { name: "last", run: ["z"] },
+    ]),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(fake.spawned.length, 1);
+  // рестарт посреди must: группа мертва → interrupted, повтора нет
+  const runner2 = createCommandRunner({
+    store, maxConcurrent: () => 4,
+    procStart: () => null, alive: () => false, killGraceMs: 1,
+  });
+  await runner2.recover();
+  await pumpReleases({ ...deps2, commandRunner: runner2 });
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /must: прервана перезапуском/);
+  assert.match(line, /later: пропущена — не прошла must/);
+  assert.match(line, /last: пропущена — не прошла must/);
+  assert.equal(fake.spawned.length, 1, "later/last не стартовали");
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:later`)!.status,
+    "skipped",
+  );
+});
+
+test("§18.5 (Б2): замок postPublish — владелец-экземпляр, снимается стопом и итогом", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }]),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake), instanceId: "inst-1" };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const lock = join(seed, ".git", "orchestrator-merge.lock");
+  assert.ok(existsSync(lock), "замок держится, пока команда в полёте");
+  const content = readFileSync(lock, "utf8");
+  assert.match(content, /inst-1/, "владелец — экземпляр плагина, не голый pid");
+  assert.equal(content.split("\n")[2], "", "branch не записан — restoreCopy не нужен");
+  // рестарт плагина: стоп снимает файл-замок
+  releaseAllPostPublishLocks();
+  assert.ok(!existsSync(lock), "stop снял замок экземпляра");
+  // «мертвый» экземпляр оставил замок — новый ломает его без restoreCopy,
+  // пока команда ещё в полёте (cwd по умолчанию — копия)
+  writeFileSync(lock, `${process.pid}\n${new Date().toISOString()}\n\n\ninst-0\n`);
+  const deps3 = { ...deps2, instanceId: "inst-2" };
+  await pumpReleases(deps3);
+  assert.match(
+    readFileSync(lock, "utf8"),
+    /inst-2/,
+    "новый экземпляр перевооружил замок, сломав inst-0",
+  );
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps3);
+  assert.ok(!existsSync(lock), "замок снят по итогу postPublish");
+});
+
+test("§18.5 (Б3): общий срок postPublish — истёк → итог с причиной", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(null, [
+      { name: "a", run: ["x"] },
+      { name: "b", run: ["y"] },
+    ]),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  let now = Date.now();
+  deps2.now = () => now;
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  assert.equal(fake.spawned.length, 1);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  now += POSTPUBLISH_MAX_MS + 1;
+  await pumpReleases(deps2);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /postPublish: истёк срок/);
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:b`)!.status,
+    "skipped",
+    "непоставленная команда — skipped по сроку",
+  );
+});
+
+test("§18.2 (Б4): поле run, cwd по умолчанию — checkout, относительный cwd — от репозитория", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(seed, [
+      { name: "a", run: ["echo", "a"] },
+      { name: "b", run: ["echo", "b"], cwd: "sub/dir" },
+    ]),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  assert.equal(fake.spawned.length, 1);
+  assert.equal(
+    fake.spawned[0].spec.cwd,
+    seed,
+    "cwd без значения — checkout, а не каталог репозитория",
+  );
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.equal(fake.spawned.length, 2);
+  assert.equal(
+    fake.spawned[1].spec.cwd,
+    join(repo, "sub/dir"),
+    "относительный cwd — от каталога репозитория",
+  );
+  releaseAllPostPublishLocks();
+});
+
+test("§2 п.6 r11 (Б6): плагин в корне репозитория и в packages/x — перезагрузка по rootDir", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "packages", "x"), { recursive: true });
+  writeFileSync(join(repo, "packages", "x", "x.txt"), "1\n");
+  writeFileSync(join(repo, "rootfile.txt"), "r\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: root+pkg plugin files"]);
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "rootplug", rootDir: seed },
+      { id: "pkgx", rootDir: join(seed, "packages", "x") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.ok(
+    calls.some((c) => c.join(" ") === "plugin reload rootplug"),
+    "rootDir = корень копии — любой diff триггерит",
+  );
+  assert.ok(
+    calls.some((c) => c.join(" ") === "plugin reload pkgx"),
+    "packages/x тоже перезагружен",
+  );
+  assert.match(sent.find((m) => /выложено/.test(m))!, /перезагружено: rootplug, pkgx|перезагружено: pkgx, rootplug/);
+});
+
+test("§2 п.6 r11 (Б6): pnpm-lock.yaml в КОРНЕ копии — «изменены зависимости»", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "fakeplug"), { recursive: true });
+  writeFileSync(join(repo, "plugins", "fakeplug", "x.txt"), "1\n");
+  writeFileSync(join(repo, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "chore: plugin + root lockfile"]);
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "fakeplug", rootDir: join(seed, "plugins", "fakeplug") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.ok(
+    !calls.some((c) => c.join(" ") === "plugin reload fakeplug"),
+    "корневой lockfile — перезагрузки нет",
+  );
+  assert.match(
+    sent.find((m) => /выложено/.test(m))!,
+    /пропущено: fakeplug: изменены зависимости/,
+  );
+});
+
+test("§2 п.6 r11 (Б6): вложенный package.json (фикстура) зависимостями не считается", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "fakeplug", "fixtures"), { recursive: true });
+  writeFileSync(join(repo, "plugins", "fakeplug", "fixtures", "package.json"), "{}\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "chore: fixture manifest"]);
+  const { deps, store, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "fakeplug", rootDir: join(seed, "plugins", "fakeplug") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.ok(
+    calls.some((c) => c.join(" ") === "plugin reload fakeplug"),
+    "фикстурный манифест — перезагрузка идёт",
+  );
+});
+
+test("§2 п.6 r11 (Б6): installsDeps ok — перезагрузка при изменённом манифесте", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "fakeplug"), { recursive: true });
+  writeFileSync(join(repo, "plugins", "fakeplug", "package.json"), "{\"name\":\"x\"}\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "chore: manifest"]);
+  const fake = cmdFake();
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "fakeplug", rootDir: join(seed, "plugins", "fakeplug") },
+    ],
+    releaseText: ppCfgCmds(seed, [
+      { name: "install", run: ["npm", "i"], installsDeps: true },
+    ], { reloadPlugins: true }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  assert.equal(fake.spawned.length, 1);
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.ok(
+    calls.some((c) => c.join(" ") === "plugin reload fakeplug"),
+    "installsDeps ok — перезагрузка идёт",
+  );
+  assert.match(sent.find((m) => /выложено/.test(m))!, /перезагружено: fakeplug/);
+});
+
+test("§2 п.6 r11 (Б6): реестр не прочитан — пропускаются ВСЕ плагины, не только провайдеры", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "fakeplug"), { recursive: true });
+  writeFileSync(join(repo, "plugins", "fakeplug", "x.txt"), "1\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: plugin"]);
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "fakeplug", rootDir: join(seed, "plugins", "fakeplug") },
+    ],
+    providerListFail: true,
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.ok(
+    !calls.some((c) => c[0] === "plugin" && c[1] === "reload"),
+    "реестр не прочитан — ни один плагин не перезагружен",
+  );
+  assert.match(
+    sent.find((m) => /выложено/.test(m))!,
+    /пропущено: fakeplug: реестр провайдеров не прочитан — перезагрузи вручную/,
+  );
+});
+
+test("§2 п.6 r11 (Б3+Б6): самоперезагрузка при running-команде — «идут команды»", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "bb-plugin-orchestrator"), { recursive: true });
+  writeFileSync(join(repo, "plugins", "bb-plugin-orchestrator", "x.ts"), "x\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: orchestrator change"]);
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "orchestrator", rootDir: join(seed, "plugins", "bb-plugin-orchestrator") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  // в журнале — running команда ДРУГОЙ выкладки: самоперезагрузка ждёт
+  const r = store.enqueueCommandRun({
+    source: "postPublish",
+    runKey: "pp:other:x",
+    groupKey: "pp:other",
+    name: "x",
+    argv: ["sleep", "1"],
+    cwd: "/tmp",
+  }, 1);
+  store.claimCommandRun(r.id, 2);
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.ok(
+    !calls.some((c) => c[0] === "automation" && c[1] === "create"),
+    "автоматизация не ставилась — команды ещё идут",
+  );
+  assert.match(
+    sent.find((m) => /выложено/.test(m))!,
+    /пропущено: orchestrator: идут команды — перезагрузи позже/,
+  );
+});
+
+test("§2 п.6 r11 (Б6): merged + рестарт между строкой и merged — одна строка «PR влит»", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent, db } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "pr", branch: "main" }, threadIds: false },
+      projects: {
+        proj_main: {
+          postPublish: { on: "merged", commands: [{ name: "after", run: ["x"] }] },
+        },
+      },
+    }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  let now = Date.now();
+  deps2.now = () => now;
+  await publishPr(deps2, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  ghView(deps2, JSON.stringify({
+    state: "MERGED", mergedAt: "2026-01-01",
+    mergeCommit: { oid: "beef1234567890" },
+  }));
+  now += 6 * 60 * 1000;
+  await pumpReleases(deps2);
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.equal(store.getRelease(rel.id)!.pr_state, "merged");
+  const first = sent.filter((m) => /PR влит/.test(m));
+  assert.equal(first.length, 1);
+  // Реальное окно краха: строка и метка finish записаны одной
+  // транзакцией, переход в merged не случился. Досмотр шлёт текст и
+  // стирает notice_text — такт не должен пересобрать итог и слать дубль.
+  const stored = first[0].replace("[orchestrator] ", "");
+  db.prepare(
+    "UPDATE releases SET pr_state = 'merging', notice_text = ?, " +
+      "notice_kind = 'pr', notified_at = NULL WHERE id = ?",
+  ).run(stored, rel.id);
+  store.metaSet(
+    `release-pp:${rel.id}`,
+    JSON.stringify({ finish: stored }),
+  );
+  sent.length = 0;
+  await pumpReleases(deps2);
+  await pumpReleases(deps2);
+  assert.equal(store.getRelease(rel.id)!.pr_state, "merged");
+  const resent = sent.filter((m) => /PR влит/.test(m));
+  assert.equal(
+    resent.length,
+    1,
+    "строка «PR влит» доставлена ровно один раз, без пересборки итога",
+  );
+  assert.equal(resent[0], first[0], "ушёл сохранённый текст, не новый");
+  assert.ok(
+    store.commandRunByKey(`pp:${rel.id}:after`)!.status === "ok" &&
+      fake.spawned.length === 1,
+    "postPublish не перезапускался",
+  );
+});
+
+test("§2 п.6 r11 (мелочь): сбой fetch в позднем такте не отменяет сделанный ff", async () => {
+  const { repo, seed } = makeRepo();
+  // Файл плагина — в публикуемом коммите: ff копии его принесёт.
+  mkdirSync(join(repo, "plugins", "fakeplug"), { recursive: true });
+  writeFileSync(join(repo, "plugins", "fakeplug", "x.txt"), "1\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: plugin file"]);
+  const fake = cmdFake();
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "fakeplug", rootDir: join(seed, "plugins", "fakeplug") },
+    ],
+    releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }], { reloadPlugins: true }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  // первый такт делает ff; команда уходит в полёт
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  assert.equal(fake.spawned.length, 1);
+  // ломаем fetch копии — мемоизированный итог не пересчитывается
+  const origRun = deps2.cmd.run;
+  deps2.cmd = {
+    run: async (file, args, o) => {
+      if (file === "git" && args.includes("fetch")) {
+        return { exitCode: 1, stdout: "", stderr: "fetch boom" };
+      }
+      return origRun(file, args, o);
+    },
+  };
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /копия обновлена/, "поздний сбой fetch не отменил ff");
+  assert.ok(
+    calls.some((c) => c.join(" ") === "plugin reload fakeplug"),
+    "перезагрузка состоялась по мемоизированному итогу",
+  );
 });

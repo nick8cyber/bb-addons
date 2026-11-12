@@ -66,12 +66,14 @@ export interface ReleaseProjectLayer {
 
 export type PostPublishOn = "published" | "merged";
 
-/** §6 r11: одна postPublish-команда (§18.2 — через общий запускатель). */
+/** §6 r11: одна postPublish-команда (§18.2 — через общий запускатель;
+ * в настройке поле `run`, здесь — уже разрешённый argv). */
 export interface PostPublishCommandLayer {
   name: string;
   argv: string[];
-  /** Абсолютный путь или слово `checkout` — каталог копии;
-   * без значения — основной каталог репозитория. */
+  /** Абсолютный путь, слово `checkout` — каталог копии, или
+   * относительный путь (от каталога репозитория);
+   * без значения — checkout, если настроен, иначе каталог репозитория. */
   cwd?: string;
   timeoutSec?: number;
   /** glob-патчи (ANY) против изменённых путей выкладки. */
@@ -495,7 +497,7 @@ function parsePostPublish(
       for (const [i, c] of value.commands.entries()) {
         const cp = `${path}.commands[${i}]`;
         if (!isRecord(c)) {
-          err(cp, "must be an object {name, argv|command, …}");
+          err(cp, "must be an object {name, run|command, …}");
           continue;
         }
         if (!isNonEmptyString(c.name)) {
@@ -508,22 +510,24 @@ function parsePostPublish(
           warn(`${cp}.name`, `duplicate command name "${name}" — skipped`);
           continue;
         }
+        // §18.2: поле по спеке — `run` (argv-массив); `argv` принимаем
+        // как алиас, `command`-строка — явный выбор владельца на sh -c.
         let argv: string[] | undefined;
-        if (c.argv !== undefined) {
+        const runArr = c.run !== undefined ? c.run : c.argv;
+        if (runArr !== undefined) {
           if (
-            !Array.isArray(c.argv) ||
-            c.argv.length === 0 ||
-            c.argv.some((a) => !isNonEmptyString(a))
+            !Array.isArray(runArr) ||
+            runArr.length === 0 ||
+            runArr.some((a) => !isNonEmptyString(a))
           ) {
-            err(`${cp}.argv`, "must be a non-empty array of strings");
+            err(`${cp}.run`, "must be a non-empty array of strings");
             continue;
           }
-          argv = c.argv.map((a) => (a as string).trim());
+          argv = runArr.map((a) => (a as string).trim());
         } else if (isNonEmptyString(c.command)) {
-          // §18.2: shell только если владелец сам так записал.
           argv = ["sh", "-c", c.command.trim()];
         } else {
-          err(`${cp}.argv`, "required argv array (or a `command` string)");
+          err(`${cp}.run`, "required `run` argv array (or a `command` string)");
           continue;
         }
         const cmd: PostPublishCommandLayer = { name, argv };

@@ -50,16 +50,38 @@ export function execSettingsFingerprint(
   return out;
 }
 
-/** Имена изменённых ключей из последнего снимка (для status). */
-export function execSettingsChangedKeys(store: DelegationStore): string[] {
+/** §18.4: записи «имя + хеши» из последнего снимка (для status;
+ * значения настроек не печатаются). */
+export function execSettingsChanges(
+  store: DelegationStore,
+): ExecSettingsChange[] {
   const raw = store.metaGet(CHANGES_KEY);
   if (!raw) return [];
   try {
     const v = JSON.parse(raw) as unknown;
-    return Array.isArray(v) ? (v as string[]) : [];
+    if (!Array.isArray(v)) return [];
+    return v
+      .map((e): ExecSettingsChange | null => {
+        if (typeof e === "string") return { key: e, prev: "", next: "" };
+        if (e && typeof e === "object" && "key" in e) {
+          const o = e as Record<string, unknown>;
+          return {
+            key: String(o.key),
+            prev: String(o.prev ?? ""),
+            next: String(o.next ?? ""),
+          };
+        }
+        return null;
+      })
+      .filter((e): e is ExecSettingsChange => e !== null);
   } catch {
     return [];
   }
+}
+
+/** Имена изменённых ключей из последнего снимка. */
+export function execSettingsChangedKeys(store: DelegationStore): string[] {
+  return execSettingsChanges(store).map((c) => c.key);
 }
 
 /**
@@ -72,9 +94,18 @@ export function execSettingsChangedKeys(store: DelegationStore): string[] {
 export async function checkExecSettings(deps: {
   store: DelegationStore;
   cfg: ReleaseConfig | null;
+  /** Конфиг не парсится — снимок не сверяем: пустой fingerprint выглядел
+   * бы как «всё убрали» и рассылал бы ложные уведомления. */
+  cfgBroken?: boolean;
   send: (threadId: string, text: string) => Promise<void>;
   warn?: (m: string) => void;
 }): Promise<ExecSettingsChange[]> {
+  if (deps.cfgBroken) {
+    deps.warn?.(
+      "orchestrator: release-конфиг не парсится — снимок исполняемых настроек не сверялся",
+    );
+    return [];
+  }
   const next = execSettingsFingerprint(deps.cfg);
   const prevRaw = deps.store.metaGet(SNAPSHOT_KEY);
   if (prevRaw === undefined) {
@@ -96,7 +127,7 @@ export async function checkExecSettings(deps: {
   }
   if (!changes.length) return [];
   deps.store.metaSet(SNAPSHOT_KEY, JSON.stringify(next));
-  deps.store.metaSet(CHANGES_KEY, JSON.stringify(changes.map((c) => c.key)));
+  deps.store.metaSet(CHANGES_KEY, JSON.stringify(changes));
   const names = changes.map((c) => c.key).join(", ");
   deps.warn?.(`orchestrator: изменены исполняемые настройки: ${names}`);
   const coords = new Set<string>();
