@@ -213,6 +213,106 @@ git -C <репозиторий> branch <ветка> <sha>
 таблицу спасений и видна в `bb orchestrator janitor report` (в т. ч.
 когда строка координатору не дошла).
 
+## Настройка под свой процесс
+
+После выкладки `release` может выполнить шаги `postPublish`: обновить
+настроенную копию, запустить команды через общий запускатель (журнал
+`command_runs`), перезагрузить плагины. Полная схема —
+`docs/specs/orchestrator-release.md` §6 и `docs/specs/orchestrator.md`
+§18; здесь — частые примеры.
+
+> Все команды из этой настройки **исполняет сам плагин с правами BB**.
+> Каждый запуск пишется в журнал (argv, cwd, вывод до 300 символов с
+> маскировкой секретов) и идёт списком аргументов без shell — `sh -c`
+> используется только если вы сами так записали команду. Маскировка —
+> страховка от типовых утечек (токены, пароли в URL), а не гарантия:
+> секрет в нестандартном виде останется в журнале — не печатайте их.
+> Изменение
+> исполняемых полей (`postPublish.commands`, `checks`, `prProvider`)
+> фиксируется снимком доверия и сообщается координаторам с
+> незавершённой работой — не включайте postPublish для настроек,
+> которым не доверяете.
+
+### Плагин в корне репозитория
+
+`checkout` — любой каталог, не обязательно `…/plugins/<id>`:
+перезагружаются плагины, чей `rootDir` в реестре лежит внутри копии и у
+которых изменились файлы. `checkout` можно опустить — тогда выполняются
+только команды.
+
+```json
+{
+  "projects": {
+    "proj_repo": {
+      "postPublish": {
+        "checkout": "/home/example/bb-addons",
+        "branch": "main",
+        "reloadPlugins": true
+      }
+    }
+  }
+}
+```
+
+### Своё действие после выкладки
+
+`commands` — список `{name, run | command, cwd, timeoutSec, when,
+stopOnFail, installsDeps}`: `run` — argv-массив без shell (схема §18.2),
+`command` — строка `sh -c`, если shell нужен явно. `cwd: "checkout"` —
+каталог копии, иначе путь (относительный — от каталога репозитория);
+по умолчанию — `checkout`, если он настроен, иначе основной каталог
+репозитория. В env уходят
+`ORCH_EVENT` (`release.published` | `pr.merged`), `ORCH_TASK`,
+`ORCH_SHA`, `ORCH_BRANCH`, `ORCH_TARGET`, `ORCH_REPO_DIR`:
+
+```json
+"postPublish": {
+  "on": "published",
+  "commands": [
+    { "name": "deploy", "command": "/home/example/deploy.sh main",
+      "timeoutSec": 600, "stopOnFail": true },
+    { "name": "docs", "command": "mkdocs build",
+      "when": ["docs/**", "mkdocs.yml"] }
+  ]
+}
+```
+
+`when` — glob (`*`, `?`, `**`), хотя бы один патч против изменённых
+выкладкой путей; `stopOnFail` — падение обязательной команды пропускает
+все поздние; `installsDeps` — успешная команда снимает с плагинов
+пропуск «изменены зависимости — переустанови вручную».
+
+### GitLab и другие PR-провайдеры
+
+PR-слежение сейчас работает только через `gh` (GitHub) —
+`type: "github"`. Провайдер `command` (в т.ч. GitLab по схеме
+`create/view/find` §18.3) — запланирован в PLUG-248 и пока не
+реализован; `type: "none"` слежение отключает — тогда `on: "merged"`
+не сработает (предупреждение в конфиге).
+
+### Хук в чат
+
+```json
+"postPublish": {
+  "on": "merged",
+  "commands": [
+    { "name": "chat",
+      "command": "curl -sf -X POST https://chat.example.com/hooks/rel -d '{\"text\":\"released\"}'" }
+  ]
+}
+```
+
+### Таймауты
+
+`timing` в слоях `release` (defaults + projects, слияние по ключам):
+`auditTimeoutMinutes` (30), `checksMinutes` (10), `prepareMinutes`
+(20), `prPollMinutes` (5), `prStaleHours` (72), `prReopenWatchHours`
+(72), `prErrorLimit` (3), `prCommandTimeoutSec` (60),
+`commandTimeoutSec` (300). Таймауты сторожа — `policy.timing`:
+`quotaHoldMinutes` (15), `approvalRepeatMinutes` (10),
+`postDispatchGraceMinutes` (5), `bbNotifyWaitSeconds` (120). Значения
+вне пределов — предупреждение и дефолт, не ошибка конфига.
+
 ## Ограничения
 
 - **Исполнители на другой машине не поддержаны.** Итог захода
