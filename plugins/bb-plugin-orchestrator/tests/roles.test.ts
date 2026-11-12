@@ -798,3 +798,69 @@ test("§17.1 r26 (Б1): the one-time migration rewrites plugin orchestrator rows
   assert.equal(store.threadRole("thr_gone")!.role, "orchestrator");
   assert.equal(warns.length, 1);
 });
+
+test("decideRole: an orchestrator-origin (own-spawn) thread is an executor too (r30 д)", () => {
+  // §4 r30 д: own-spawn executors carry originPluginId "orchestrator"
+  assert.equal(
+    decideRole(
+      facts({ originPluginId: "orchestrator", title: "PLUG-7 · do it" }),
+      {
+        ...noProbes,
+        activeDelegationByTaskKey: (k) =>
+          k === "PLUG-7" ? { level: "simple" } : undefined,
+      },
+    ),
+    "executor",
+  );
+  // the level still decides auditor vs executor
+  assert.equal(
+    decideRole(
+      facts({
+        originPluginId: "orchestrator",
+        title: "PLUG-7 · review it",
+        parentThreadId: "thr_parent", // the origin rule beats the parent one
+      }),
+      {
+        ...noProbes,
+        activeDelegationByTaskKey: (k) =>
+          k === "PLUG-7" ? { level: "review" } : undefined,
+      },
+    ),
+    "auditor",
+  );
+  // no delegation row → executor, like a tasks thread
+  assert.equal(
+    decideRole(
+      facts({ originPluginId: "orchestrator", title: null }),
+      noProbes,
+    ),
+    "executor",
+  );
+});
+
+test("hook: an own-spawn (orchestrator-origin) executor gets the delegation's role", () => {
+  const { store, hook } = makeStore();
+  store.insert({
+    taskKey: "PLUG-9",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_a",
+    level: "review",
+    route: "review",
+    preset: "review",
+    provider: "claude-code",
+  });
+  hook(
+    dispatch({
+      thread: {
+        id: "thr_rev",
+        status: "pending",
+        originPluginId: "orchestrator",
+        title: "PLUG-9 · review specs",
+      },
+      origin: "plugin",
+      attempt: "start-turn",
+      project: { id: "proj_a" },
+    }),
+  );
+  assert.equal(store.threadRole("thr_rev")!.role, "auditor");
+});

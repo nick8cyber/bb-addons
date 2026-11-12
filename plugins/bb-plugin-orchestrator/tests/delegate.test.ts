@@ -7,6 +7,9 @@ import {
   createDelegateQueue,
   dispatchToRoute,
   retrySetupSteps,
+  buildSeedPrompt,
+  delegatedThreadTitle,
+  truncateToWidth,
   type DelegateDeps,
 } from "../src/delegate.js";
 import { parsePolicy } from "../src/policy.js";
@@ -130,6 +133,8 @@ function makeDeps(overrides: {
   pluginMetadata?: () => Promise<Record<string, unknown> | null>;
   policyText?: string;
   held?: [string, number][];
+  /** §4 r30 (в): `system.config().primaryHostId` — default "host_1". */
+  primaryHostId?: () => Promise<string>;
 } = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -183,7 +188,7 @@ function makeDeps(overrides: {
       hasFreshDispatching: (s, scope) => store.hasFreshDispatching(s, scope),
       roleByThreadId: (id) => store.threadRole(id)?.role,
     },
-    primaryHostId: async () => "host_1",
+    primaryHostId: overrides.primaryHostId ?? (async () => "host_1"),
   };
   return { deps, store, calls, updates, stops, spawnArgs, metadata, db };
 }
@@ -1630,4 +1635,254 @@ test("§4.1 r28: a reissue inherits no_code, a second hop keeps it", async () =>
     provider: "p",
   })!;
   assert.equal(re2.no_code, 1);
+});
+
+test("§4 r30 (б): the seed prompt repeats BB's buildSeedPrompt sections in order", () => {
+  const prompt = buildSeedPrompt({
+    task: { key: "PLUG-1", title: "do it", description: "the body" },
+    project: { name: "main", linkedBbProjectId: "proj_bb" },
+    subtasks: [{ key: "PLUG-2", title: "sub", status: "todo" }],
+    attachments: [{ fileName: "spec.md", id: "att_1" }],
+    recentComments: [
+      {
+        authorName: "cli",
+        kind: "user",
+        createdAt: "2026-11-12",
+        body: "note",
+      },
+    ],
+    presetInstructions: "preset line",
+    extraInstructions: "extra line",
+  });
+  assert.match(prompt, /^# PLUG-1 · do it\n/);
+  const order = [
+    "## Description",
+    "## Project context",
+    "## Sub-tasks",
+    "## Attachments",
+    "## Recent comments",
+    "## Report-back contract",
+    "## Preset instructions",
+    "## Additional instructions",
+  ];
+  let at = -1;
+  for (const section of order) {
+    const i = prompt.indexOf(section);
+    assert.ok(i > at, `${section} must be present and in order`);
+    at = i;
+  }
+  // attachments are listed with the fetch line, never downloaded
+  assert.match(
+    prompt,
+    /- spec\.md · att_1\n {2}Fetch with: bb tasks attachment get att_1 --out <path>/,
+  );
+  assert.match(prompt, /- PLUG-2 · sub \(todo\)/);
+  assert.match(prompt, /### cli · user · 2026-11-12\n\nnote/);
+  assert.match(prompt, /- Name: main\n- Linked bb project: proj_bb/);
+});
+
+test("§4 r30 (б): empty seed sections collapse; optional ones are absent", () => {
+  const prompt = buildSeedPrompt({
+    task: { key: "PLUG-1", title: "t" },
+    project: {},
+    subtasks: [],
+    attachments: [],
+    recentComments: [],
+  });
+  assert.match(prompt, /## Description\n\nNo description provided\./);
+  assert.match(prompt, /## Sub-tasks\n\nNone\./);
+  assert.match(prompt, /## Attachments\n\nNone\./);
+  assert.match(prompt, /## Recent comments\n\nNone\./);
+  assert.match(prompt, /- Linked bb project: Not linked/);
+  assert.ok(!prompt.includes("## Preset instructions"));
+  assert.ok(!prompt.includes("## Additional instructions"));
+});
+
+test("§4 r30 (б): truncateToWidth clips by display width — CJK and emoji count 2", () => {
+  assert.equal(truncateToWidth("abc", 2), "ab");
+  assert.equal(truncateToWidth("", 120), "");
+  // a wide grapheme past the limit is dropped whole, never halved
+  assert.equal(truncateToWidth("ab界c", 3), "ab");
+  assert.equal(truncateToWidth("ab界c", 4), "ab界");
+  assert.equal(truncateToWidth("a🚀b", 2), "a");
+  assert.equal(truncateToWidth("a🚀b", 3), "a🚀");
+  // the delegated title is `KEY · title` at display width <= 120
+  const long = delegatedThreadTitle("PLUG-1", "x".repeat(300));
+  assert.equal(long.length, 120);
+  assert.ok(long.startsWith("PLUG-1 · "));
+  const cjk = delegatedThreadTitle("PLUG-1", "界".repeat(200));
+  // 9 ASCII + 55 wide graphemes = display width 119 <= 120
+  assert.equal(cjk, `PLUG-1 · ${"界".repeat(55)}`);
+});
+
+test("§4 r30 (а): a preset without modelId/reasoningLevel still spawns — BB defaults apply", async () => {
+  const { deps, spawnArgs } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: {
+              providerId: "acp-devin",
+              modelId: null,
+              reasoningLevel: null,
+              permissionMode: "full",
+              environmentKind: "project-default",
+            },
+          }),
+        );
+      return defaultCli(args);
+    },
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.status, "running");
+  assert.equal(spawnArgs.length, 1);
+  // the fields are left unset, not refused — BB picks the defaults
+  assert.equal(spawnArgs[0]!.model, undefined);
+  assert.equal(spawnArgs[0]!.reasoningLevel, undefined);
+  assert.equal(spawnArgs[0]!.providerId, "acp-devin");
+});
+
+test("§4 r30 (в): a system.config failure is dispatch-unknown — spawn never attempted", async () => {
+  const { deps, store, spawnArgs } = makeDeps({
+    primaryHostId: async () => {
+      throw new Error("system.config unavailable");
+    },
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: { ...FULL_PRESET, environmentKind: "new-worktree" },
+          }),
+        );
+      return defaultCli(args);
+    },
+  });
+  await assert.rejects(
+    runDelegate(
+      { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "dispatch-unknown",
+  );
+  // the row stays dispatching without thread_id for the §7 reconcile
+  const rows = store.list();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.status, "dispatching");
+  assert.equal(rows[0]!.thread_id, null);
+  assert.equal(spawnArgs.length, 0);
+});
+
+test("§4 r30 (в): an empty primaryHostId is an explicit refusal", async () => {
+  const { deps, store, spawnArgs } = makeDeps({
+    primaryHostId: async () => "",
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: { ...FULL_PRESET, environmentKind: "new-worktree" },
+          }),
+        );
+      return defaultCli(args);
+    },
+  });
+  await assert.rejects(
+    runDelegate(
+      { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "dispatch-failed" &&
+      /no default machine/.test((e as OrchestratorError).message),
+  );
+  assert.equal(store.list().length, 0);
+  assert.equal(spawnArgs.length, 0);
+});
+
+test("§4 r30 п.4: a thread show read error performs NO threads.update", async () => {
+  const { deps, updates, calls, store } = makeDeps({
+    cli: (args) => {
+      if (args.join(" ").startsWith("thread show"))
+        return { exitCode: 1, stdout: "", stderr: "server down" };
+      return defaultCli(args);
+    },
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  // the read failure is a setup error, not a dispatch failure — but a
+  // blind update would send ownership-assigned, so none may happen
+  assert.equal(res.status, "running");
+  assert.ok(res.setupErrors.some((s) => s.step === "attach"));
+  assert.deepEqual(updates, []);
+  assert.ok(
+    !calls.some((c) => c.args.join(" ").startsWith("thread update")),
+    "no CLI re-apply either",
+  );
+  assert.match(store.get(res.delegationId)!.setup_errors, /"attach"/);
+});
+
+test("§4 r30 (г): a failed tasks-attach is retried by retrySetupSteps", async () => {
+  let attachCalls = 0;
+  const { deps, store, calls } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks attach")) {
+        attachCalls++;
+        if (attachCalls === 1)
+          return { exitCode: 1, stdout: "", stderr: "db locked" };
+      }
+      return defaultCli(args);
+    },
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.equal(res.status, "running");
+  assert.ok(res.setupErrors.some((s) => s.step === "tasks-attach"));
+
+  const retried = await retrySetupSteps(
+    store.get(res.delegationId)!,
+    deps,
+  );
+  assert.equal(attachCalls, 2, "the reconcile retried the attach");
+  assert.deepEqual(retried, []);
+  assert.doesNotMatch(
+    store.get(res.delegationId)!.setup_errors,
+    /tasks-attach/,
+  );
+  assert.ok(
+    calls.some(
+      (c) => c.args.join(" ") === "tasks update PLUG-1 --status in_progress",
+    ),
+    "the retried attach also moves the task to in_progress",
+  );
+});
+
+test("§4 r30 (е 2): a record gone mid-dispatch still stops the spawned thread", async () => {
+  let st: import("../src/store.js").DelegationStore;
+  const h = makeDeps({
+    cli: (args) => {
+      // the record vanishes mid-dispatch (a remove that is NOT a cancel)
+      if (args.join(" ").startsWith("tasks attach")) {
+        const row = st.list()[0];
+        if (row) st.remove(row.id);
+      }
+      return defaultCli(args);
+    },
+  });
+  st = h.store;
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    h.deps,
+  );
+  assert.deepEqual(h.stops, ["thr_exec"], "unsupervised executor stopped");
+  assert.ok(res.setupErrors.some((s) => s.step === "finalize"));
 });
