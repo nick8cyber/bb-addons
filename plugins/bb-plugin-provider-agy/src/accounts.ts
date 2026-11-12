@@ -199,8 +199,10 @@ export function loadLedger(dataDir: string): AccountsLedger {
     ...Object.keys(sharedAccounts),
     ...Object.keys(overlay),
   ])) {
-    const s = sharedAccounts[label];
-    const o = overlay[label];
+    const s = Object.hasOwn(sharedAccounts, label)
+      ? sharedAccounts[label]
+      : undefined;
+    const o = Object.hasOwn(overlay, label) ? overlay[label] : undefined;
     if (o !== undefined) {
       overlayStamps.set(label, o.writtenMs ?? 0);
     }
@@ -253,7 +255,9 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
   if (pinKeys.size > 0) {
     const mergedConversations = { ...diskConversations };
     for (const key of pinKeys) {
-      const label = ledger.conversations[key];
+      const label = Object.hasOwn(ledger.conversations, key)
+        ? ledger.conversations[key]
+        : undefined;
       if (label !== undefined) {
         mergedConversations[key] = label;
       }
@@ -318,26 +322,37 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
     // above) is purged before the merge: left in, it would resurrect its
     // cooldown, ineligible stamp and strings under a fresh writtenMs.
     for (const label of Object.keys(merged)) {
+      const mergedEntry = Object.hasOwn(merged, label)
+        ? merged[label]
+        : undefined;
+      const diskShared = Object.hasOwn(diskSharedAccounts, label)
+        ? diskSharedAccounts[label]
+        : undefined;
       if (
-        (merged[label].writtenMs ?? 0) <
-        (diskSharedAccounts[label]?.lastUsedMs ?? 0)
+        (mergedEntry?.writtenMs ?? 0) <
+        (diskShared?.lastUsedMs ?? 0)
       ) {
         delete merged[label];
       }
     }
     for (const label of ledger.dirtyLabels) {
-      const entry = ledger.accounts[label];
+      const entry = Object.hasOwn(ledger.accounts, label)
+        ? ledger.accounts[label]
+        : undefined;
       if (entry === undefined) {
         continue;
       }
-      const disk = merged[label];
+      const disk = Object.hasOwn(merged, label) ? merged[label] : undefined;
       const diskWrittenMs = disk?.writtenMs ?? 0;
       // Same applicability rule loadLedger uses: the shadow lives while
       // writtenMs >= shared.lastUsedMs. A dead disk record contributes
       // nothing — not to max(), not to freshSide.
+      const diskShared = Object.hasOwn(diskSharedAccounts, label)
+        ? diskSharedAccounts[label]
+        : undefined;
       const diskEntry =
         disk !== undefined &&
-        diskWrittenMs >= (diskSharedAccounts[label]?.lastUsedMs ?? 0)
+        diskWrittenMs >= (diskShared?.lastUsedMs ?? 0)
           ? disk
           : undefined;
       const stamp = ledger.overlayStamps?.get(label) ?? 0;
@@ -391,11 +406,18 @@ function ledgerEntry(
   ledger: AccountsLedger,
   label: string,
 ): AccountLedgerEntry {
-  return (ledger.accounts[label] ??= {
-    cooldownUntilMs: 0,
-    lastUsedMs: 0,
-    lastError: null,
-  });
+  let entry = Object.hasOwn(ledger.accounts, label)
+    ? ledger.accounts[label]
+    : undefined;
+  if (entry === undefined) {
+    entry = {
+      cooldownUntilMs: 0,
+      lastUsedMs: 0,
+      lastError: null,
+    };
+    ledger.accounts[label] = entry;
+  }
+  return entry;
 }
 
 function markDirty(ledger: AccountsLedger, label: string): void {
@@ -469,7 +491,11 @@ export function conversationAccount(
   ledger: AccountsLedger,
   providerThreadId: string,
 ): string | null {
-  return ledger.conversations[providerThreadId] ?? null;
+  return (
+    (Object.hasOwn(ledger.conversations, providerThreadId)
+      ? ledger.conversations[providerThreadId]
+      : undefined) ?? null
+  );
 }
 
 /**
@@ -488,15 +514,17 @@ export function pickAccount(
   if (candidates.length === 0) {
     return null;
   }
+  const entryOf = (label: string): AccountLedgerEntry | undefined =>
+    Object.hasOwn(ledger.accounts, label) ? ledger.accounts[label] : undefined;
   const cooldown = (a: AccountHome): number =>
-    ledger.accounts[a.label]?.cooldownUntilMs ?? 0;
+    entryOf(a.label)?.cooldownUntilMs ?? 0;
   const available = candidates.filter((a) => cooldown(a) <= now);
   const pool = available.length > 0 ? available : candidates;
   pool.sort(
     (a, b) =>
       cooldown(a) - cooldown(b) ||
-      (ledger.accounts[a.label]?.lastUsedMs ?? 0) -
-        (ledger.accounts[b.label]?.lastUsedMs ?? 0) ||
+      (entryOf(a.label)?.lastUsedMs ?? 0) -
+        (entryOf(b.label)?.lastUsedMs ?? 0) ||
       a.label.localeCompare(b.label),
   );
   return pool[0];

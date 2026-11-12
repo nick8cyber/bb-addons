@@ -773,6 +773,72 @@ check(
   );
 }
 
+// A27: label "constructor" cools down honestly — own property in shared and
+// overlay, not polluting Object.prototype; cooldown is visible to pickAccount.
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-localstate-protocool-"));
+  mkdirSync(join(dir, "accounts", "constructor"), { recursive: true });
+  mkdirSync(join(dir, "accounts", "a2"), { recursive: true });
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      a2: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    },
+  });
+  const l = loadLedger(dir);
+  const cooldownUntil = Date.now() + 60_000;
+  markAccountCooldown(l, "constructor", cooldownUntil, "rate-limit-429");
+  saveLedger(dir, l);
+  const ov = readJson(join(dir, "accounts-overlay.json"))?.accounts ?? {};
+  const sh = readJson(join(dir, "accounts-state.json"))?.accounts ?? {};
+  const homes = [
+    { label: "constructor", home: join(dir, "accounts", "constructor"), proxy: null },
+    { label: "a2", home: join(dir, "accounts", "a2"), proxy: null },
+  ];
+  const picked = pickAccount(l, homes);
+  check(
+    "localstate/proto-constructor-cooldown-honest",
+    Object.hasOwn(l.accounts, "constructor") &&
+      l.accounts.constructor.cooldownUntilMs === cooldownUntil &&
+      l.accounts.constructor.lastError === "rate-limit-429" &&
+      Object.hasOwn(ov, "constructor") &&
+      ov.constructor.cooldownUntilMs === cooldownUntil &&
+      ov.constructor.lastError === "rate-limit-429" &&
+      Object.hasOwn(sh, "constructor") &&
+      sh.constructor.cooldownUntilMs === cooldownUntil &&
+      sh.constructor.lastError === "rate-limit-429" &&
+      picked?.label === "a2" &&
+      !Object.prototype.hasOwnProperty("cooldownUntilMs"),
+    JSON.stringify({
+      ov: ov.constructor,
+      sh: sh.constructor,
+      picked: picked?.label,
+      protoPolluted: Object.prototype.hasOwnProperty("cooldownUntilMs"),
+    }),
+  );
+}
+
+// A28: label "toString" in shared does not get a phantom shadow from overlay
+// (which lacks "toString" as an own key); lastError from shared is preserved.
+{
+  const dir = mkdtempSync(join(tmpdir(), "agy-localstate-protoshadow-"));
+  mkdirSync(join(dir, "accounts", "toString"), { recursive: true });
+  writeJson(join(dir, "accounts-state.json"), {
+    accounts: {
+      toString: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: "shared-auth-error" },
+    },
+  });
+  writeJson(join(dir, "accounts-overlay.json"), {
+    accounts: {},
+  });
+  const l = loadLedger(dir);
+  check(
+    "localstate/proto-tostring-no-phantom-shadow",
+    Object.hasOwn(l.accounts, "toString") &&
+      l.accounts.toString.lastError === "shared-auth-error",
+    JSON.stringify(l.accounts.toString),
+  );
+}
+
 // ===========================================================================
 // Part B — end-to-end on the built bridge, once per transport.
 // ===========================================================================
