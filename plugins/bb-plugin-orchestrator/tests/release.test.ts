@@ -5236,6 +5236,156 @@ test("§18.5 (заход 3 Б2): срок на ожидание в очеред�
   );
 });
 
+test("§18.5 (заход 4 Б1): истёкший срок — строка включает уже сделанное (копия, завершённые команды)", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(seed, [
+      { name: "a", run: ["x"] },
+      { name: "b", run: ["y"] },
+    ]),
+  });
+  let slots = 4;
+  const runner = createCommandRunner({
+    store,
+    spawn: fake.spawner,
+    maxConcurrent: () => slots,
+    procStart: () => "1",
+    alive: () => false,
+    killGraceMs: 1,
+  });
+  const deps2 = { ...deps, commandRunner: runner, instanceId: "inst-1" };
+  let now = Date.now();
+  deps2.now = () => now;
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const lock = join(seed, ".git", "orchestrator-merge.lock");
+  assert.ok(existsSync(lock), "копия обновлена, замок держится — a в полёте");
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  // слотов больше нет — b встанет queued и не стартует
+  slots = 0;
+  await pumpReleases(deps2);
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:b`)!.status,
+    "queued",
+  );
+  now += POSTPUBLISH_MAX_MS + 1;
+  await pumpReleases(deps2);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(
+    line,
+    /postPublish: копия обновлена; a: ok; не дождались очереди команд/,
+    "истёкшее ожидание не теряет уже сделанное",
+  );
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:b`)!.status,
+    "skipped",
+  );
+  assert.ok(!existsSync(lock), "замок снят по истёкшему сроку");
+  releaseAllPostPublishLocks();
+});
+
+test("§18.5 (заход 4 Б1): ранний done снимает замок копии — сломанная настройка и смена on", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }]),
+  });
+  const deps2 = {
+    ...deps,
+    commandRunner: cmdRunner(store, fake),
+    instanceId: "inst-1",
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const lock = join(seed, ".git", "orchestrator-merge.lock");
+  assert.ok(existsSync(lock), "замок держится, пока команда в полёте");
+  // Настройка сломана (cfg = null) → runPostPublish уходит в ранний
+  // done — замок от прошлого такта обязан быть снят.
+  deps2.loadReleaseConfig = () => parseReleaseConfig("");
+  await pumpReleases(deps2);
+  assert.ok(!existsSync(lock), "ранний done снял файл-замок");
+  // merge / вторая выкладка в ту же копию больше не блокируются
+  const release = await acquireCopyLock(
+    async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    seed,
+    lock,
+    { owner: "other" },
+  );
+  release();
+  releaseAllPostPublishLocks();
+});
+
+test("§18.5 (заход 4 Б1): ранний done — postPublish убрали из настройки, замок копии снят", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }]),
+  });
+  const deps2 = {
+    ...deps,
+    commandRunner: cmdRunner(store, fake),
+    instanceId: "inst-1",
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const lock = join(seed, ".git", "orchestrator-merge.lock");
+  assert.ok(existsSync(lock), "замок держится, пока команда в полёте");
+  // postPublish убрали из настройки → ранний done по `!pp` — замок
+  // от прошлого такта обязан быть снят.
+  deps2.loadReleaseConfig = () =>
+    parseReleaseConfig(
+      JSON.stringify({
+        commitIdentity: "Agent <agent@x.io>",
+        defaults: { target: { action: "push", branch: "main" }, checks: [] },
+        projects: { proj_main: {} },
+      }),
+    );
+  await pumpReleases(deps2);
+  assert.ok(!existsSync(lock), "ранний done по `!pp` снял файл-замок");
+  const release = await acquireCopyLock(
+    async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    seed,
+    lock,
+    { owner: "other" },
+  );
+  release();
+  releaseAllPostPublishLocks();
+});
+
+test("§18.5 (заход 4): stop во время acquire — замок отпускается сразу", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }]),
+  });
+  const runner = cmdRunner(store, fake);
+  // isStopped: первый вызов (до acquire) — false, дальше — true:
+  // stop пришёл, пока ждали acquireCopyLock.
+  let isStoppedCalls = 0;
+  const deps2 = {
+    ...deps,
+    commandRunner: { ...runner, isStopped: () => ++isStoppedCalls > 1 },
+    instanceId: "inst-1",
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  const lock = join(seed, ".git", "orchestrator-merge.lock");
+  assert.ok(!existsSync(lock), "замок, взятый после stop, отпущен сразу");
+  assert.equal(
+    fake.spawned.length,
+    0,
+    "команда не ставилась — такт ушёл в pending",
+  );
+  releaseAllPostPublishLocks();
+});
+
 test("§18.5 (заход 3 Б1): замок своего экземпляра занят — вторая выкладка ждёт, merge не заходит", async () => {
   const { repo, seed } = makeRepo();
   const fake = cmdFake();

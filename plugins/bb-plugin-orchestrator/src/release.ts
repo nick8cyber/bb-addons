@@ -60,7 +60,12 @@ import {
   type PolicyLoad,
 } from "./policy.js";
 import { ACTIVE_STATUSES } from "./store.js";
-import type { DelegationRow, DelegationStore, ReleaseRow } from "./store.js";
+import type {
+  CommandRunRow,
+  DelegationRow,
+  DelegationStore,
+  ReleaseRow,
+} from "./store.js";
 import { runChecked, runJson, type BbCli } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
@@ -2672,6 +2677,9 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         },
       );
       if (!pp.done) continue;
+      // Замок копии не переживает итог postPublish — в том числе при
+      // раннем done внутри runPostPublish (идемпотентно).
+      releasePostPublishLock(fresh.id);
       const sha7 = (fresh.pr_merge_sha ?? "").slice(0, 7);
       const parts = [
         `PR влит ${fresh.task_key}: ${fresh.pr_url}` +
@@ -3209,6 +3217,9 @@ async function finishPublished(
       },
     );
     if (!pp.done) return;
+    // Замок копии не переживает итог postPublish — в том числе при
+    // раннем done внутри runPostPublish (идемпотентно).
+    releasePostPublishLock(fresh.id);
     ppSummary = pp.summary;
     selfReload = pp.selfReload;
   }
@@ -3322,6 +3333,29 @@ export function releaseAllPostPublishLocks(): void {
  * тестов как дефолт срока. */
 export const POSTPUBLISH_MAX_MS = 30 * 60 * 1000;
 
+/** §18.2: «<name>: ok» / «<name>: пропущена — <reason>» / … — один
+ * формат для строки итога и для строки истёкшего ожидания (заход 4). */
+const commandRunBit = (name: string, r: CommandRunRow): string => {
+  switch (r.status) {
+    case "ok":
+      return `${name}: ok`;
+    case "skipped":
+      // §18.2: «<name>: нет checkout» — без «пропущена —».
+      return r.output_tail === "нет checkout"
+        ? `${name}: нет checkout`
+        : `${name}: пропущена — ${r.output_tail}`;
+    case "timeout":
+      return `${name}: таймаут`;
+    case "interrupted":
+      return `${name}: прервана перезапуском`;
+    default:
+      return (
+        `${name}: упала (код ${r.exit_code ?? "?"})` +
+        (r.output_tail ? `: ${r.output_tail}` : "")
+      );
+  }
+};
+
 /** Состояние копии в plugin_meta: base пишется один раз, результат ff
  * мемоизируется (поздний сбой fetch не отменяет уже сделанный ff). */
 interface PostPublishMeta {
@@ -3407,11 +3441,14 @@ async function runPostPublish(
   row: ReleaseRow,
   event: "release.published" | "pr.merged",
 ): Promise<PostPublishResult> {
-  const done = (summary: string | null = null): PostPublishResult => ({
-    done: true,
-    summary,
-    selfReload: null,
-  });
+  const done = (summary: string | null = null): PostPublishResult => {
+    // PLUG-245 заход 4 (ревью Б1): любой done снимает замок копии.
+    // Ранние выходы (нет настроек, проект не определён, `on` не совпал)
+    // иначе оставляют замок от прошлого такта навсегда — с замком по
+    // экземпляру следующие выкладки его уже не ломают. Идемпотентно.
+    releasePostPublishLock(row.id);
+    return { done: true, summary, selfReload: null };
+  };
   const pending: PostPublishResult = {
     done: false,
     summary: null,
@@ -3521,6 +3558,18 @@ async function runPostPublish(
           : groupRuns.some((r) => r.status === "queued")
             ? "очереди команд"
             : "завершения шагов";
+      // Уже сделанное не теряем: итог копии и завершённые команды идут
+      // в строку рядом с «не дождались <чего>» (заход 4, ревью).
+      const bits: string[] = [];
+      if (pp.checkout) {
+        bits.push(meta.copy ? "копия обновлена" : "копия не обновлена");
+      }
+      for (const c of pp.commands) {
+        const r = deps.store.commandRunByKey(`${groupKey}:${c.name}`);
+        if (r && r.status !== "queued" && r.status !== "running") {
+          bits.push(commandRunBit(c.name, r));
+        }
+      }
       for (const c of pp.commands) {
         deps.store.markCommandRunSkipped(
           specOf(c, cmdCwd(c)),
@@ -3529,7 +3578,7 @@ async function runPostPublish(
         );
       }
       releasePostPublishLock(row.id);
-      return fail(`не дождались ${waiting}`);
+      return fail([...bits, `не дождались ${waiting}`].join("; "));
     }
     saveMeta();
   }
@@ -3572,6 +3621,12 @@ async function runPostPublish(
       const release = await acquireCopyLock(coGit, co, lockPath, {
         owner: deps.instanceId ?? `postPublish:${process.pid}`,
       });
+      // §18.5 (заход 4): stop мог прийти, пока ждали acquire — такой
+      // замок не числится в карте и не снимется stopAll, отпускаем сразу.
+      if (deps.commandRunner?.isStopped?.()) {
+        release();
+        return false;
+      }
       postPublishLocks.set(row.id, release);
       return true;
     } catch (e) {
@@ -3773,30 +3828,7 @@ async function runPostPublish(
   }
   for (const [c, r] of rowsByCmd) {
     if (!r) continue;
-    switch (r.status) {
-      case "ok":
-        bits.push(`${c.name}: ok`);
-        break;
-      case "skipped":
-        // §18.2: «<name>: нет checkout» — без «пропущена —».
-        bits.push(
-          r.output_tail === "нет checkout"
-            ? `${c.name}: нет checkout`
-            : `${c.name}: пропущена — ${r.output_tail}`,
-        );
-        break;
-      case "timeout":
-        bits.push(`${c.name}: таймаут`);
-        break;
-      case "interrupted":
-        bits.push(`${c.name}: прервана перезапуском`);
-        break;
-      default:
-        bits.push(
-          `${c.name}: упала (код ${r.exit_code ?? "?"})` +
-            (r.output_tail ? `: ${r.output_tail}` : ""),
-        );
-    }
+    bits.push(commandRunBit(c.name, r));
   }
 
   // ── перезагрузка плагинов (r11: любая раскладка, по реестру) ──
