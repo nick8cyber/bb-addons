@@ -2107,6 +2107,19 @@ export class DelegationStore {
       );
   }
 
+  /** §18.5 (заход 5): queued → skipped по существующей записи журнала —
+   * ранний выход postPublish не собирает спеку (команды может уже не
+   * быть в настройке). */
+  skipQueuedCommandRun(id: number, reason: string, at: number): void {
+    this.db
+      .prepare(
+        `UPDATE command_runs
+         SET status = 'skipped', finished_at = ?, output_tail = ?
+         WHERE id = ? AND status = 'queued'`,
+      )
+      .run(at, reason, id);
+  }
+
   commandRunByKey(runKey: string): CommandRunRow | undefined {
     return this.db
       .prepare(`SELECT * FROM command_runs WHERE run_key = ?`)

@@ -3441,6 +3441,7 @@ async function runPostPublish(
   row: ReleaseRow,
   event: "release.published" | "pr.merged",
 ): Promise<PostPublishResult> {
+  const groupKey = `pp:${row.id}`;
   const done = (summary: string | null = null): PostPublishResult => {
     // PLUG-245 заход 4 (ревью Б1): любой done снимает замок копии.
     // Ранние выходы (нет настроек, проект не определён, `on` не совпал)
@@ -3454,10 +3455,27 @@ async function runPostPublish(
     summary: null,
     selfReload: null,
   };
+  // §18.5 (ревью заход 4): ранние выходы смотрят журнал группы — пока
+  // команда выкладки запущена, итог не отдаётся и замок держится даже
+  // при сломанной/убранной настройке; ждущие queued переводятся в
+  // skipped, чтобы pump их не запустил после ушедшего итога.
+  const earlyDone = (
+    summary: string | null = null,
+  ): PostPublishResult => {
+    const rows = deps.store.commandRunsByGroup(groupKey);
+    if (rows.some((r) => r.status === "running")) return pending;
+    const at = deps.now?.() ?? Date.now();
+    for (const r of rows) {
+      if (r.status === "queued") {
+        deps.store.skipQueuedCommandRun(r.id, "настройка сменилась", at);
+      }
+    }
+    return done(summary);
+  };
   const cfg = deps.loadReleaseConfig().config;
-  if (!cfg) return done();
+  if (!cfg) return earlyDone();
   const fail = (msg: string): PostPublishResult =>
-    done(`postPublish: ${msg}`);
+    earlyDone(`postPublish: ${msg}`);
   // §6 (r8) п.6: записанный проект настройки; у pre-r8 записей после
   // публикации postPublish пропускается с причиной — публикация валидна.
   let projectId: string;
@@ -3479,9 +3497,8 @@ async function runPostPublish(
   const project = resolveProject(cfg, projectId);
   const pp = project.postPublish;
   const want = event === "pr.merged" ? "merged" : "published";
-  if (!pp || pp.on !== want) return done();
+  if (!pp || pp.on !== want) return earlyDone();
   const now = deps.now?.() ?? Date.now();
-  const groupKey = `pp:${row.id}`;
   const mainDir =
     row.repo_root ??
     (await realpath(row.repo_path).catch(() => row.repo_path));

@@ -5288,10 +5288,10 @@ test("§18.5 (заход 4 Б1): истёкший срок — строка вк
   releaseAllPostPublishLocks();
 });
 
-test("§18.5 (заход 4 Б1): ранний done снимает замок копии — сломанная настройка и смена on", async () => {
+test("§18.5 (заход 5): ранний выход при running — замок и итог держатся, после resolve — done и замок снят", async () => {
   const { repo, seed } = makeRepo();
   const fake = cmdFake();
-  const { deps, store } = makeDeps(repo, {
+  const { deps, store, sent } = makeDeps(repo, {
     auditVerdict: APPROVE,
     releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }]),
   });
@@ -5304,12 +5304,37 @@ test("§18.5 (заход 4 Б1): ранний done снимает замок к�
   await auditDone(deps2, store);
   const lock = join(seed, ".git", "orchestrator-merge.lock");
   assert.ok(existsSync(lock), "замок держится, пока команда в полёте");
-  // Настройка сломана (cfg = null) → runPostPublish уходит в ранний
-  // done — замок от прошлого такта обязан быть снят.
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  // Настройка сломана (cfg = null), но команда running: итог не
+  // отдаётся и замок держится — merge в копию под живой командой не
+  // заходит (§18.5, ревью заход 4).
   deps2.loadReleaseConfig = () => parseReleaseConfig("");
   await pumpReleases(deps2);
-  assert.ok(!existsSync(lock), "ранний done снял файл-замок");
-  // merge / вторая выкладка в ту же копию больше не блокируются
+  assert.ok(existsSync(lock), "running → замок держится");
+  assert.ok(
+    !sent.some((m) => /выложено/.test(m)),
+    "итог не отдан, пока команда running",
+  );
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:a`)!.status,
+    "running",
+  );
+  // merge берёт замок без owner → живой pid-замок уважается.
+  await assert.rejects(
+    acquireCopyLock(
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      seed,
+      lock,
+    ),
+    /already running/,
+    "merge в копию под живой командой не заходит",
+  );
+  // Команда завершилась — следующий такт отдаёт итог и снимает замок.
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.ok(!existsSync(lock), "замок снят после завершения команды");
+  assert.ok(sent.some((m) => /выложено/.test(m)), "итог отдан");
   const release = await acquireCopyLock(
     async () => ({ exitCode: 0, stdout: "", stderr: "" }),
     seed,
@@ -5320,24 +5345,35 @@ test("§18.5 (заход 4 Б1): ранний done снимает замок к�
   releaseAllPostPublishLocks();
 });
 
-test("§18.5 (заход 4 Б1): ранний done — postPublish убрали из настройки, замок копии снят", async () => {
+test("§18.5 (заход 5): ранний выход при queued — skipped «настройка сменилась», pump её не запускает", async () => {
   const { repo, seed } = makeRepo();
   const fake = cmdFake();
   const { deps, store } = makeDeps(repo, {
     auditVerdict: APPROVE,
     releaseText: ppCfgCmds(seed, [{ name: "a", run: ["x"] }]),
   });
-  const deps2 = {
-    ...deps,
-    commandRunner: cmdRunner(store, fake),
-    instanceId: "inst-1",
-  };
+  // слотов нет — команда висит queued
+  let slots = 0;
+  const runner = createCommandRunner({
+    store,
+    spawn: fake.spawner,
+    maxConcurrent: () => slots,
+    procStart: () => "1",
+    alive: () => false,
+    killGraceMs: 1,
+  });
+  const deps2 = { ...deps, commandRunner: runner, instanceId: "inst-1" };
   await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
   await auditDone(deps2, store);
   const lock = join(seed, ".git", "orchestrator-merge.lock");
-  assert.ok(existsSync(lock), "замок держится, пока команда в полёте");
-  // postPublish убрали из настройки → ранний done по `!pp` — замок
-  // от прошлого такта обязан быть снят.
+  assert.ok(existsSync(lock), "замок держится, пока команда ждёт слот");
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:a`)!.status,
+    "queued",
+  );
+  // postPublish убрали из настройки → ранний done по `!pp`: queued
+  // помечается skipped, замок снят, итог ушёл.
   deps2.loadReleaseConfig = () =>
     parseReleaseConfig(
       JSON.stringify({
@@ -5347,7 +5383,14 @@ test("§18.5 (заход 4 Б1): ранний done — postPublish убрали 
       }),
     );
   await pumpReleases(deps2);
+  const run = store.commandRunByKey(`pp:${rel.id}:a`)!;
+  assert.equal(run.status, "skipped");
+  assert.equal(run.output_tail, "настройка сменилась");
   assert.ok(!existsSync(lock), "ранний done по `!pp` снял файл-замок");
+  // Слоты появились — терминальная запись не стартует.
+  slots = 4;
+  await pumpReleases(deps2);
+  assert.equal(fake.spawned.length, 0, "pump не запустил снятую с очереди");
   const release = await acquireCopyLock(
     async () => ({ exitCode: 0, stdout: "", stderr: "" }),
     seed,
