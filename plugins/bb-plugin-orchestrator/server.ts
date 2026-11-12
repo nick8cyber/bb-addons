@@ -550,7 +550,7 @@ export async function createPlugin(
         threads: bb.sdk.threads as unknown as DelegateThreads,
         loadPolicy: () => loadPolicy(true),
         probes,
-        primaryHostId: localHostId,
+        primaryHostId,
         gitInstructions: () => currentSettings.gitInstructions,
         cmd,
       });
@@ -565,8 +565,8 @@ export async function createPlugin(
   // so a reissued executor gets every later change to those steps for
   // free. `enqueue` serializes watchdog actions against delegate/cancel
   // calls in this process.
-  /** This machine's bb hostId (release §6 r8; janitor host scoping; the
-   * r30 spawn environment's `machineId ?? primaryHostId`). */
+  /** This machine's bb hostId (release §6 r8; janitor host scoping) — a
+   * `system.config` failure is not fatal there and degrades to "". */
   const localHostId = async () => {
     try {
       const sys = await (
@@ -579,11 +579,22 @@ export async function createPlugin(
       return "";
     }
   };
+  /** §4 r30 (в): the dispatch steps' host lookup must NOT swallow a
+   * `system.config` failure — `dispatchViaSpawn` maps a throw to
+   * `dispatch-unknown`; an empty id is an explicit refusal there. */
+  const primaryHostId = async () => {
+    const sys = await (
+      bb.sdk as unknown as {
+        system?: { config?: () => Promise<{ primaryHostId?: string }> };
+      }
+    ).system?.config?.();
+    return sys?.primaryHostId ?? "";
+  };
   const stepsDeps = {
     store,
     bbCli,
     threads: bb.sdk.threads as unknown as DelegateThreads,
-    primaryHostId: localHostId,
+    primaryHostId,
     gitInstructions: () => currentSettings.gitInstructions,
     policy: () => policyLoad.policy,
   };
@@ -1171,7 +1182,6 @@ export async function createPlugin(
         try {
           stopTarget = await findDelegatedThreadId(row, {
             bbCli,
-            store,
             threads: watchdogThreads,
           });
         } catch (e) {

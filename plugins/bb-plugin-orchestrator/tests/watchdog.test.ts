@@ -65,6 +65,9 @@ function makeHarness(
     retryCancelNoPending?: number;
     /** §4.1 round-result seam; absent → the done path skips collection. */
     round?: WatchdogDeps["round"];
+    /** §4 r30 (е): make `threads.spawn` throw this — refusal/unknown
+     * outcome tests. */
+    spawnThrow?: () => unknown;
     /** B1: a pre-migrated "old" database — caller drives the schema. */
     db?: import("better-sqlite3").Database;
   } = {},
@@ -294,6 +297,7 @@ function makeHarness(
         pluginMetadata?: Record<string, unknown>;
       }) => {
         spawnCalls.push(a as Record<string, unknown>);
+        if (opts.spawnThrow) throw opts.spawnThrow();
         const id = opts.dispatchThreadId ?? "thr_new";
         const dto = {
           id,
@@ -5412,5 +5416,182 @@ test("§17.2 r26 (PLUG-215 мелко 3): a compaction-reminder failure does not
     h.store.findSetupError(h.store.get(row.id)!, "notify-muted"),
     undefined,
     "the mark cleared",
+  );
+});
+
+test("reconcile: a dispatching row with thread_id runs tasks attach first (r30 г)", async () => {
+  // the crash window: thread_id recorded, the attach never ran — the
+  // reconcile's finish steps must attach before anything else
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: "thr_e1",
+    status: "dispatching",
+    createdAt: T0 - 6 * 60_000,
+  });
+  h.threadDtos.set(
+    "thr_e1",
+    dto("thr_e1", "active", {
+      parentThreadId: "thr_coord",
+      parentNotifications: "auto",
+      visibility: "hidden",
+    }),
+  );
+  const summary = await h.wd.reconcile();
+  assert.equal(summary.finalized, 1);
+  const cmds = h.calls.map((c) => c.join(" "));
+  assert.ok(cmds.includes("tasks attach PLUG-1 --thread thr_e1"));
+  assert.ok(cmds.includes("tasks update PLUG-1 --status in_progress"));
+  assert.equal(h.store.get(row.id)!.status, "running");
+});
+
+test("reconcile: a thread show read error performs NO update (r30 п.4)", async () => {
+  const h = makeHarness({
+    cli: (args) => {
+      if (args.join(" ").startsWith("thread show"))
+        return { exitCode: 1, stdout: "", stderr: "server down" };
+      return undefined;
+    },
+  });
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.reconcile();
+  assert.equal(h.store.get(row.id)!.status, "running");
+  assert.deepEqual(h.wdUpdates, [], "no blind threads.update");
+  assert.ok(
+    !h.calls.some((c) => c.join(" ").startsWith("thread update")),
+    "no CLI re-apply either",
+  );
+  assert.match(h.store.get(row.id)!.setup_errors, /"step":"attach-verify"/);
+  const notices = h.sends.filter((s) =>
+    JSON.stringify(s.input).includes("не подтверждена"),
+  );
+  assert.equal(notices.length, 1, "one coordinator notice");
+  // the next pass retries the read but does not notify twice
+  await h.wd.reconcile();
+  assert.equal(
+    h.sends.filter((s) => JSON.stringify(s.input).includes("не подтверждена"))
+      .length,
+    1,
+  );
+});
+
+test("reconcile: the title fallback skips a candidate labelled with ANOTHER delegationId (r30 е 4)", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({
+    threadId: null,
+    status: "dispatching",
+    createdAt: T0 - 6 * 60_000,
+  });
+  // an earlier, identically titled child that belongs to a DIFFERENT
+  // record — the label proves it, so the title must not pick it
+  h.threadDtos.set(
+    "thr_foreign",
+    dto("thr_foreign", "active", {
+      parentThreadId: "thr_coord",
+      title: "PLUG-1 · do it",
+      createdAt: T0 - 5 * 60_000,
+    }),
+  );
+  h.pluginMeta.set("thr_foreign", { delegationId: 999 });
+  h.threadDtos.set(
+    "thr_hit",
+    dto("thr_hit", "active", {
+      parentThreadId: "thr_coord",
+      title: "PLUG-1 · do it",
+      createdAt: T0 - 4 * 60_000,
+    }),
+  );
+  const summary = await h.wd.reconcile();
+  assert.equal(summary.relinked, 1);
+  assert.equal(h.store.get(row.id)!.thread_id, "thr_hit");
+});
+
+test("reconcile: no label/title hit → bb tasks threads is the last resort for an UNMARKED row (r30 е 4)", async () => {
+  const h = makeHarness({
+    cli: (args) => {
+      if (args.join(" ").startsWith("tasks threads"))
+        return ok(
+          JSON.stringify({
+            taskThreads: [
+              {
+                threadId: "thr_e2",
+                attachedAt: new Date(T0 - 1000).toISOString(),
+              },
+            ],
+          }),
+        );
+      return undefined;
+    },
+  });
+  // an old record from before the own-spawn marker existed — nothing
+  // under the coordinator matches, yet its dispatch-era thread is still
+  // found through the task attachment instead of being re-dispatched
+  const row = h.insertActive({
+    threadId: null,
+    status: "dispatching",
+    createdAt: T0 - 6 * 60_000,
+  });
+  const summary = await h.wd.reconcile();
+  assert.equal(summary.relinked, 1);
+  assert.equal(h.store.get(row.id)!.thread_id, "thr_e2");
+  assert.ok(
+    h.calls.some((c) => c.join(" ").startsWith("tasks threads")),
+    "tasks threads consulted without the own-spawn marker",
+  );
+  assert.equal(h.spawnCalls.length, 0, "no re-spawn");
+});
+
+test("reconcile: a confirmed binding clears recorded attach-verify errors (r30 п.4)", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set(
+    "thr_e1",
+    dto("thr_e1", "active", {
+      parentThreadId: "thr_coord",
+      parentNotifications: "auto",
+      visibility: "hidden",
+    }),
+  );
+  h.store.addSetupError(row.id, "attach-verify", "thread show: boom");
+  h.store.addSetupError(row.id, "attach-verify", "threads.update: boom");
+  await h.wd.reconcile();
+  const errors = h.store.get(row.id)!.setup_errors;
+  assert.doesNotMatch(errors, /"step":"attach-verify"/);
+  assert.match(errors, /"step":"attach-verified","message":"auto"/);
+  assert.deepEqual(h.wdUpdates, [], "bound thread → no update");
+});
+
+test("reconcile: a spawn refusal on a reissue marks the row failed (r30 е 2)", async () => {
+  const h = makeHarness({
+    spawnThrow: () =>
+      Object.assign(new Error("HTTP 400: provider key rejected"), {
+        code: "provider_error",
+        status: 400,
+        details: { reason: "provider key rejected" },
+      }),
+  });
+  const old = h.insertActive({ threadId: "thr_e1", route: "simple" });
+  h.store.setStatus(old.id, "stalled");
+  const row2 = h.store.reissue(old.id, {
+    route: "simple-alt",
+    preset: "simple-alt",
+    provider: "agy",
+  })!;
+  h.db.prepare(`UPDATE delegations SET created_at = ? WHERE id = ?`).run(
+    T0 - 6 * 60_000,
+    row2.id,
+  );
+
+  await h.wd.reconcile();
+  const fresh = h.store.get(row2.id)!;
+  assert.equal(fresh.status, "failed"); // kept, not removed
+  assert.equal(h.spawnCalls.length, 1, "the own-spawn path ran");
+  assert.ok(
+    !h.calls.some((c) => c.join(" ").startsWith("tasks dispatch")),
+    "no dispatch fallback on a plain 4xx",
+  );
+  assert.match(
+    JSON.stringify(h.sends.at(-1)!.input),
+    /перевыпуск потерян/,
   );
 });

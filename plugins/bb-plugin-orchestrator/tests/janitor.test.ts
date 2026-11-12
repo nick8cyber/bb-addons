@@ -5827,3 +5827,45 @@ test("an old thread without createdAt seen in one pass makes the list unproven �
     `warns: ${w.warns.join(" | ")}`,
   );
 });
+
+test("an own-spawn executor (originPluginId=orchestrator) is a rescue candidate (r30 д)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const w = makeWorld({ envs: [env], threads: {} });
+  await w.jan.onThreadDeleted({
+    id: "thr_own",
+    environmentId: env.id,
+    parentThreadId: null, // the origin alone proves it is a worker
+    sourceThreadId: null,
+    originPluginId: "orchestrator",
+  });
+  git(repo, ["rev-parse", "--verify", "refs/orchestrator/rescue/thr_own"]);
+  assert.equal(w.janitor.rescues().length, 1);
+});
+
+test("scope workers treats an orchestrator-origin thread as a worker (r30 д)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  mergeEnv(repo, env);
+  const clock = { t: Date.now() };
+  const ownSpawn: ThreadSpec = {
+    id: "thr_own",
+    status: "idle",
+    archivedAt: null,
+    updatedAt: clock.t - 60_000,
+    parentThreadId: null, // originPluginId alone must qualify it
+    originPluginId: "orchestrator",
+  };
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [ownSpawn] },
+    clock,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.deepEqual(w.archivedCalls, ["thr_own"]);
+});

@@ -260,7 +260,7 @@ export interface WatchdogThreads {
     visibility?: string;
   }): Promise<unknown>;
   /** §4 r30 (е 4): children of the coordinator for the own-spawn label
-   * lookup. Optional — absent → the marker-gated `tasks threads` path. */
+   * lookup. Optional — absent → straight to the `tasks threads` path. */
   list?(args: {
     parentThreadId?: string;
     includeHidden?: boolean;
@@ -413,15 +413,17 @@ export interface DelegatedThreadFinder {
  * thread is labelled `pluginMetadata.delegationId` and titled `KEY · …`
  * under the coordinator: look at the coordinator's children first —
  * metadata match, then the `createdAt >= row.created_at` + `KEY · `
- * title fallback. `bb tasks threads` stays only for rows whose dispatch
- * ran the `bb tasks dispatch` fallback (the `own-spawn` marker), which
- * the tasks plugin attaches itself.
+ * title fallback (candidates READABLY labelled with another record's
+ * delegationId are skipped — they are proven to be someone else's
+ * executor). `bb tasks threads` is the last resort for EVERY row: an
+ * old record whose dispatch ran before the `own-spawn` marker existed
+ * would otherwise lose its executor — unsupervised, then
+ * double-dispatched on reissue.
  */
 export async function findDelegatedThreadId(
   row: DelegationRow,
   deps: {
     bbCli: BbCli;
-    store: DelegationStore;
     threads?: DelegatedThreadFinder;
   },
 ): Promise<string | null> {
@@ -443,17 +445,21 @@ export async function findDelegatedThreadId(
         typeof t.createdAt === "number" &&
         t.createdAt >= row.created_at,
     );
+    // A candidate READABLY labelled with ANOTHER delegation's id is
+    // proven to belong to a different record — the title fallback must
+    // never pick it (that would steal the other delegation's executor).
+    const foreign = new Set<string>();
     if (deps.threads?.getPluginMetadata) {
       for (const t of candidates) {
         try {
           const meta = await deps.threads.getPluginMetadata({
             threadId: t.id,
           });
-          if (
-            meta &&
-            (meta as { delegationId?: unknown }).delegationId === row.id
-          ) {
-            return t.id;
+          const label = (meta as { delegationId?: unknown } | null)
+            ?.delegationId;
+          if (meta && label !== undefined) {
+            if (label === row.id) return t.id;
+            foreign.add(t.id);
           }
         } catch {
           // unreadable metadata — the title filter below still applies
@@ -461,16 +467,18 @@ export async function findDelegatedThreadId(
       }
     }
     const titled = candidates
+      .filter((t) => !foreign.has(t.id))
       .filter((t) =>
         (t.title ?? t.titleFallback ?? "").startsWith(`${row.task_key} · `),
       )
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
     if (titled[0]) return titled[0].id;
   }
-  if (deps.store.findSetupError(row, "own-spawn") !== undefined) {
-    return findTaskThreadId(deps.bbCli, row.task_key, row.created_at);
-  }
-  return null;
+  // Nothing found under the coordinator: `bb tasks threads` is the last
+  // resort for EVERY row — not only `own-spawn`-marked fallback ones.
+  // An old row whose dispatch pre-dates the marker would otherwise lose
+  // its executor (unsupervised, then double-dispatched on reissue).
+  return findTaskThreadId(deps.bbCli, row.task_key, row.created_at);
 }
 
 export function createWatchdog(deps: WatchdogDeps) {
@@ -2505,12 +2513,11 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (!row.thread_id) {
       // «Результат раздачи неизвестен»: r30 е 4 — an own-spawn thread is
       // found by its `delegationId` label under the coordinator;
-      // `bb tasks threads` stays for `own-spawn`-marked fallback rows.
+      // `bb tasks threads` is the last resort for every row.
       let threadId: string | null;
       try {
         threadId = await findDelegatedThreadId(row, {
           bbCli: deps.bbCli,
-          store,
           threads: deps.threads,
         });
       } catch (e) {
@@ -2671,6 +2678,9 @@ export function createWatchdog(deps: WatchdogDeps) {
         facts.visibility === "hidden"
       ) {
         store.addSetupError(fresh.id, "attach-verified", "auto");
+        // A confirmed binding retires every earlier verify failure —
+        // different texts must not pile up next to the success marker.
+        store.clearSetupError(fresh.id, "attach-verify");
       } else if (!facts) {
         // r30 п.4: a read failure → retry next pass, NO update.
         const err = readErr ?? "thread show: no thread payload";

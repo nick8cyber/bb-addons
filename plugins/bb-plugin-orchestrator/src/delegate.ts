@@ -945,14 +945,12 @@ async function dispatchViaSpawn(
     refuse,
   );
   const p = presetShow.preset;
+  // A preset without modelId/reasoningLevel is NOT refused — the field is
+  // left out of the spawn args and BB applies its default, exactly like
+  // `bb tasks dispatch` does (r30 review: builtin dispatch never requires
+  // them).
   const missing = (
-    [
-      "providerId",
-      "modelId",
-      "reasoningLevel",
-      "permissionMode",
-      "environmentKind",
-    ] as const
+    ["providerId", "permissionMode", "environmentKind"] as const
   ).filter((k) => !p?.[k]);
   if (!p || missing.length) {
     await refuse(
@@ -1293,7 +1291,10 @@ export async function finishDispatchSteps(
   await ensureBypassMode(row, noteError, deps);
 
   // Step 6 — `running` only from `dispatching`: a cancel that landed while
-  // dispatch ran wins, and the executor it created is stopped here.
+  // dispatch ran wins, and the executor it created is stopped here. A
+  // record that vanished or left `dispatching` any other way means the
+  // dispatch is finished WITHOUT supervision — the spawned thread is
+  // stopped too (r30 е 2), then the mismatch is recorded.
   if (!store.setStatusIf(row.id, "dispatching", "running")) {
     const current = store.get(row.id);
     if (current?.status === "cancelled") {
@@ -1303,6 +1304,11 @@ export async function finishDispatchSteps(
         noteError("cancel-stop", e);
       }
       return { status: "cancelled", setupErrors };
+    }
+    try {
+      await deps.threads.stop({ threadId });
+    } catch (e) {
+      noteError("cancel-stop", e);
     }
     noteError(
       "finalize",
