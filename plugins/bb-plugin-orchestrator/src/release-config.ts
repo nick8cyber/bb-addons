@@ -60,8 +60,12 @@ export interface ReleaseProjectLayer {
   /** orchestrator §18.5: таймауты конвейера — по ключам поверх
    * `timing` верхнего слоя. */
   timing?: ReleaseTiming;
-  /** §18.4/§2 п.6: провайдер PR-слежения (полный — PLUG-248). */
+  /** §18.3/§2 п.6: провайдер PR (create/view/find, github по умолчанию). */
   prProvider?: PrProviderLayer;
+  /** §18.6: шаблон тела PR — подстановки {thread}, {task}, {title}. */
+  prBody?: string;
+  /** §18.6: обязательная заметка — без --kb/--no-kb шаг 1 отказывает. */
+  requireNote?: boolean;
 }
 
 export type PostPublishOn = "published" | "merged";
@@ -131,7 +135,17 @@ export interface PrProviderLayer {
   type: PrProviderType;
   /** Сырой объект — снимок доверия хеширует command целиком. */
   raw: unknown;
+  /** §18.3 command: argv создания PR (env + тело в stdin, печатает URL). */
+  create?: string[];
+  /** §18.3 command: argv состояния PR (ORCH_PR_URL → JSON). */
+  view?: string[];
+  /** §18.3 command (необяз.): argv поиска открытого PR ветки. */
+  find?: string[];
 }
+
+/** §18.6: тело PR по умолчанию — маркеры, которые разбор «чей PR»
+ * узнаёт (§18.3). Установка автора задаёт прежний шаблон явно. */
+export const DEFAULT_PR_BODY = "BB-Thread: {thread}\n\nBB-Task: {task}";
 
 export interface ReleaseConfig {
   commitIdentity?: string;
@@ -184,8 +198,14 @@ export interface ResolvedProject {
   } | null;
   /** §18.5: эффективные таймауты (defaults ← проект, по ключам). */
   timing: ResolvedTiming;
-  /** §2 п.6 r11: тип PR-провайдера (`github` по умолчанию). */
-  prProvider: { type: PrProviderType; raw: unknown };
+  /** §2 п.6 r11/§18.3: PR-провайдер (`github` по умолчанию); у
+   * `command` — разобранные argv create/view/find. */
+  prProvider: PrProviderLayer;
+  /** §18.6: шаблон тела PR (по умолчанию DEFAULT_PR_BODY; при
+   * `threadIds: false` не применяется — тело пустое). */
+  prBody: string;
+  /** §18.6: обязательная заметка --kb/--no-kb на шаге 1 (default false). */
+  requireNote: boolean;
 }
 
 export interface ResolvedPostPublishCommand {
@@ -389,13 +409,61 @@ function parseLayer(
   }
   if (value.prProvider !== undefined) {
     const prov = value.prProvider;
+    const pp = `${path}.prProvider`;
     if (
       !isRecord(prov) ||
       (prov.type !== "github" && prov.type !== "command" && prov.type !== "none")
     ) {
-      err(`${path}.prProvider`, `type must be "github", "command" or "none"`);
+      err(pp, `type must be "github", "command" or "none"`);
     } else {
-      layer.prProvider = { type: prov.type, raw: prov };
+      const layer_: PrProviderLayer = { type: prov.type, raw: prov };
+      // §18.3: argv-поля — только у command; у github/none лишние
+      // ключи — мягкое замечание (игнорируются), не ошибка.
+      const argv = (key: "create" | "view" | "find"): string[] | undefined => {
+        const v = prov[key];
+        if (v === undefined) return undefined;
+        if (
+          !Array.isArray(v) ||
+          v.length === 0 ||
+          v.some((a) => !isNonEmptyString(a))
+        ) {
+          err(`${pp}.${key}`, "must be a non-empty argv array of strings");
+          return undefined;
+        }
+        return v.map((a) => (a as string).trim());
+      };
+      if (prov.type === "command") {
+        for (const key of ["create", "view"] as const) {
+          const a = argv(key);
+          if (a) layer_[key] = a;
+          else if (prov[key] === undefined) {
+            err(`${pp}.${key}`, `required for type "command"`);
+          }
+        }
+        const f = argv("find");
+        if (f) layer_.find = f;
+      } else {
+        for (const key of ["create", "view", "find"] as const) {
+          if (prov[key] !== undefined) {
+            warn(`${pp}.${key}`, `ignored — type is "${prov.type}"`);
+          }
+        }
+      }
+      layer.prProvider = layer_;
+    }
+  }
+  if (value.prBody !== undefined) {
+    if (typeof value.prBody !== "string") {
+      err(`${path}.prBody`, "must be a string template");
+    } else {
+      layer.prBody = value.prBody;
+    }
+  }
+  if (value.requireNote !== undefined) {
+    if (typeof value.requireNote !== "boolean") {
+      err(`${path}.requireNote`, "must be a boolean");
+    } else {
+      layer.requireNote = value.requireNote;
     }
   }
   return layer;
@@ -774,5 +842,7 @@ export function resolveProject(
       : null,
     timing,
     prProvider: layer.prProvider ?? { type: "github", raw: undefined },
+    prBody: layer.prBody ?? DEFAULT_PR_BODY,
+    requireNote: layer.requireNote === true,
   };
 }

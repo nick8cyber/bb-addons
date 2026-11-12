@@ -1846,20 +1846,45 @@ export class DelegationStore {
       | undefined;
   }
 
-  /** §16.6: is this PR URL one the release pipeline itself created FOR
-   * THIS COORDINATOR? With `threadIds` off our PRs carry no «Источник»
-   * marker, so a repeat release may write only into a PR this
-   * coordinator's release recorded here — a PR another coordinator's
-   * release created is still foreign (PLUG-189). */
-  prWasReleased(url: string, coordinatorThreadId: string): boolean {
+  /** §16.6 + §18.3: is this PR URL one the release pipeline itself
+   * created FOR THIS TASK by THIS COORDINATOR? With `threadIds` off —
+   * or a template/provider without a thread marker — our PRs carry no
+   * «Источник»/`BB-Thread:` marker, so a repeat release may write only
+   * into a PR this coordinator's release of this task recorded here —
+   * a PR another coordinator's release created is still foreign
+   * (PLUG-189). */
+  prWasReleased(
+    url: string,
+    coordinatorThreadId: string,
+    taskKey: string,
+  ): boolean {
     return (
       this.db
         .prepare(
           `SELECT 1 AS x FROM releases
-           WHERE pr_url = ? AND coordinator_thread_id = ? LIMIT 1`,
+           WHERE pr_url = ? AND coordinator_thread_id = ?
+             AND task_key = ? LIMIT 1`,
         )
-        .get(url, coordinatorThreadId) !== undefined
+        .get(url, coordinatorThreadId, normalizeTaskKey(taskKey)) !==
+        undefined
     );
+  }
+
+  /** §18.3 (command без `find`): pr_url прошлой выкладки этой задачи
+   * на ту же ветку публикации — кандидат на переиспользование, если
+   * `view` отвечает OPEN. */
+  lastPrUrl(taskKey: string, publishBranch: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT pr_url FROM releases
+         WHERE task_key = ? AND pr_url IS NOT NULL
+           AND COALESCE(publish_branch, branch) = ?
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey), publishBranch) as
+      | { pr_url: string }
+      | undefined;
+    return row?.pr_url ?? null;
   }
 
   /** §2 step 7 «выложено в обход»: is this sha a commit release pushed? */

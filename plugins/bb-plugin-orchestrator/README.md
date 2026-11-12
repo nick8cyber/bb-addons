@@ -284,10 +284,67 @@ stopOnFail, installsDeps}`: `run` — argv-массив без shell (схема
 
 ### GitLab и другие PR-провайдеры
 
-PR-слежение сейчас работает только через `gh` (GitHub). Настройка
-`prProvider` (включая `type: "command"` для GitLab по схеме
-`create/view/find` §18.3 и `type: "none"`) — запланирована в PLUG-248
-и пока не реализована и не читается: `gh` следит всегда.
+`prProvider` (в слоях `defaults`/`projects`, слияние по ключам) выбирает,
+чем открывается и досматривается PR (§18.3):
+
+- `{ "type": "github" }` — по умолчанию; работает через `gh`. На шаге 1
+  выкладки, до аудита, проверяется `gh auth status`.
+- `{ "type": "command", "create": [...], "view": [...], "find": [...]? }` —
+  свои исполняемые файлы (argv без shell). `create` и `view` обязательны и
+  проверяются на шаге 1: файла нет или он не исполняемый — выкладка
+  отказывает до аудита. `find` необязателен.
+- `{ "type": "none" }` — ветка публикуется, PR не открывается и не
+  отслеживается: строка «ветка опубликована …; PR открой вручную»,
+  задача `in_review`. `postPublish.on: "merged"` при `none` не сработает
+  никогда — настройка предупреждает об этом при чтении.
+
+Контракт `command` (каталог запуска — основной каталог репозитория,
+таймаут `timing.prCommandTimeoutSec`): `create` получает `ORCH_BRANCH`,
+`ORCH_TARGET`, `ORCH_TITLE` и тело PR в stdin, печатает URL
+(`https?://…` — первая такая строка); ненулевой код — отказ, даже если
+URL напечатан. `view` получает `ORCH_PR_URL`, печатает JSON
+`{"state":"OPEN"|"MERGED"|"CLOSED","mergeCommit":"<sha>"|null}`.
+`find` получает `ORCH_BRANCH`, `ORCH_TARGET`, печатает URL открытого PR
+ветки или пусто; без `find` повторная выкладка задачи переиспользует
+`pr_url` прошлой выкладки этой задачи и ветки, если `view` отвечает
+`OPEN`. Весь вывод провайдера в строках координатору проходит ту же
+очистку и маскировку секретов, что вывод команд.
+
+GitLab через `command` (пример со скриптами-обёртками над `glab`):
+
+```json
+"defaults": {
+  "target": { "action": "pr", "branch": "main" },
+  "prProvider": {
+    "type": "command",
+    "create": ["/home/example/tools/mr-create.sh"],
+    "view": ["/home/example/tools/mr-view.sh"],
+    "find": ["/home/example/tools/mr-find.sh"]
+  }
+}
+```
+
+```sh
+# /home/example/tools/mr-view.sh — печатает JSON для слежения
+glab mr view "$ORCH_PR_URL" -F json | jq '{
+  state: (if .state == "merged" then "MERGED"
+          elif .state == "closed" then "CLOSED" else "OPEN" end),
+  mergeCommit: .merge_commit_sha }'
+```
+
+### Тело PR и заметка в базу знаний
+
+`prBody` (слоёно, по умолчанию `BB-Thread: {thread}\n\nBB-Task: {task}`)
+— шаблон тела PR с подстановками `{thread}`, `{task}`, `{title}`. При
+`threadIds: false` шаблон не применяется — тело пустое (id треда и ключ
+задачи не публикуются, §16.6). Разбор «чей PR» при повторной выкладке —
+по маркеру в теле (узнаются и `BB-Thread:`, и прежний «Источник:
+bb тред»), а без маркера — по своим записям о прошлых выкладках этой
+задачи этим координатором; чужой PR не трогается (§18.3).
+
+`requireNote` (по умолчанию `false`) при `true` делает `--kb <заметка>`
+или `--no-kb <причина>` обязательными: шаг 1 выкладки без одного из
+флагов отказывает «нужна заметка: --kb … или --no-kb …».
 
 ### Хук в чат
 
