@@ -3168,15 +3168,33 @@ async function runPostPublish(
 ): Promise<PostPublishResult> {
   const cfg = deps.loadReleaseConfig().config;
   if (!cfg) return { summary: null, selfReload: null };
-  const projectId = row.settings_project_id ?? row.project_id;
-  const project = resolveProject(cfg, projectId);
-  const pp = project.postPublish;
-  if (!pp) return { summary: null, selfReload: null };
-  const co = pp.checkout;
   const fail = (msg: string): PostPublishResult => ({
     summary: `postPublish: ${msg}`,
     selfReload: null,
   });
+  // §6 (r8) п.6: the recorded settings project wins; pre-r8 rows
+  // resolve anew — never the delegation project silently. A resolver
+  // error means postPublish does not run (fail closed).
+  let projectId: string;
+  try {
+    projectId =
+      row.settings_project_id ??
+      (await settingsProjectId(
+        deps,
+        row.repo_path,
+        row.project_id,
+        cfg,
+      ));
+  } catch (e) {
+    deps.log?.warn?.(
+      `orchestrator: postPublish settings project: ${message(e)}`,
+    );
+    return fail("проект настройки не определён");
+  }
+  const project = resolveProject(cfg, projectId);
+  const pp = project.postPublish;
+  if (!pp) return { summary: null, selfReload: null };
+  const co = pp.checkout;
   const gitOut = async (args: string[]) =>
     (
       await deps.cmd.run("git", ["-C", co, ...args], { timeoutMs: 120_000 })

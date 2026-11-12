@@ -33,6 +33,7 @@ import {
   type ReleaseThreads,
 } from "../src/release.js";
 import {
+  GLUED_PATH_LINE,
   LEAK_HOME_PATH,
   LEAK_USERS_PATH,
   MIXED_PATH_LINE,
@@ -3482,6 +3483,90 @@ test("release r8: пост-проверка pr — commitIdentity repo + leaks.a
   );
 });
 
+test("release r8: postPublish — старая запись решает проект заново, не делегирования", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    projects: [
+      { id: "proj_repo", sources: [{ type: "local_path", path: repo, isDefault: true }] },
+      { id: "proj_main", sources: [{ type: "local_path", path: "/gone/other", isDefault: true }] },
+    ],
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_repo: {
+          postPublish: { checkout: seed, branch: "main", reloadPlugins: false },
+        },
+        proj_main: {},
+      },
+    }),
+  });
+  // a PRE-R8 row: no settings_project_id — the resolver must run anew
+  // (§6 п.6); a silent delegation fallback would find no postPublish.
+  writeFileSync(join(repo, "f2.txt"), "y\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const headSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const r = store.insertRelease({
+    taskKey: "PLUG-1", projectId: "proj_main",
+    coordinatorThreadId: "thr_coord", repoPath: repo, branch: "feat-x",
+    targetAction: "push", targetBranch: "main",
+  });
+  store.updateRelease(r.id, {
+    status: "publishing",
+    headSha,
+    remoteBaseSha: gitR(repo, ["rev-parse", "origin/main"]),
+  });
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  // proj_repo (resolved anew) drove postPublish — the checkout caught
+  // up with the pushed tip.
+  assert.equal(gitR(seed, ["rev-parse", "HEAD"]), headSha);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /postPublish: копия обновлена/);
+});
+
+test("release r8: postPublish — сбой резолвера → строка, postPublish не выполняется", async () => {
+  const { repo, seed } = makeRepo();
+  const seedHead = gitR(seed, ["rev-parse", "HEAD"]);
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    projectListFail: true,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: { checkout: seed, branch: "main", reloadPlugins: false },
+        },
+      },
+    }),
+  });
+  writeFileSync(join(repo, "f2.txt"), "y\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const headSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const r = store.insertRelease({
+    taskKey: "PLUG-1", projectId: "proj_main",
+    coordinatorThreadId: "thr_coord", repoPath: repo, branch: "feat-x",
+    targetAction: "push", targetBranch: "main",
+  });
+  store.updateRelease(r.id, {
+    status: "publishing",
+    headSha,
+    remoteBaseSha: gitR(repo, ["rev-parse", "origin/main"]),
+  });
+  const s = await pumpReleases(deps);
+  // the push itself still landed — only the settings resolution failed
+  assert.equal(s.published, 1);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /postPublish: проект настройки не определён/);
+  // fail closed: postPublish did NOT run even though the delegation
+  // project carries a postPublish config.
+  assert.equal(gitR(seed, ["rev-parse", "HEAD"]), seedHead);
+});
+
 test("machine scan r8: префиксы-фикстуры — не находки, и по каждому вхождению", async () => {
   const scan = (added: { file: string; line: number; text: string }[], body = "") =>
     machineScan(GL_EMPTY, {
@@ -3509,6 +3594,15 @@ test("machine scan r8: префиксы-фикстуры — не находки
   f = await scan(
     [{ file: "f.ts", line: 1, text: MIXED_PATH_LINE }],
     MIXED_PATH_LINE,
+  );
+  assert.ok(f.some((x) => x.category === 3 && x.file === "f.ts"));
+  assert.ok(f.some((x) => x.category === 3 && x.file === null));
+  // a fixture prefix GLUED to a real path with no separator — the
+  // exempt match must not eat the real path's leading slash (ревью
+  // PLUG-231 заход 2); a finding in added lines and in commit text
+  f = await scan(
+    [{ file: "f.ts", line: 1, text: `x = ${GLUED_PATH_LINE}` }],
+    `see ${GLUED_PATH_LINE}`,
   );
   assert.ok(f.some((x) => x.category === 3 && x.file === "f.ts"));
   assert.ok(f.some((x) => x.category === 3 && x.file === null));

@@ -17,3 +17,10 @@ export const SAFE_USERS_PATH = "/Users/example/safe/path";
 /** One line with an exempt fixture prefix next to a real path —
  * the exemption is per occurrence, so this line is still a finding. */
 export const MIXED_PATH_LINE = `cp ${SAFE_HOME_PATH} ${LEAK_HOME_PATH}`;
+
+/** Positive sample — a fixture prefix glued to a real path with NO
+ * separator: the exempt occurrence (`/…/example`) must not swallow
+ * the slash that leads the real path's `home` segment, or the real
+ * path loses its own match and the line goes silent (ревью PLUG-231
+ * заход 2). */
+export const GLUED_PATH_LINE = "/home/example/home/alice/work/secret";

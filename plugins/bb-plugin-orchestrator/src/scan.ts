@@ -224,8 +224,13 @@ interface MachineRule {
 const MACHINE_RULES: MachineRule[] = [
   {
     rule: "home-path",
-    re: /\/(?:home|Users)\/[A-Za-z0-9._-]+\//,
-    exempt: /\/(?:home|Users)\/example\//,
+    // The trailing slash is a LOOKAHEAD, not consumed: a fixture
+    // prefix glued to a real path with no separator (`/…/example/` +
+    // `home/alice`) must leave the real path its own occurrence
+    // (ревью PLUG-231 заход 2). The exempt is anchored — the fixture
+    // is the exact `example` segment, `examplefoo` stays a finding.
+    re: /\/(?:home|Users)\/[A-Za-z0-9._-]+(?=\/)/,
+    exempt: /^\/(?:home|Users)\/example$/,
   },
   { rule: "opt-path", re: /\/opt\/[A-Za-z0-9._-]/ },
   {
