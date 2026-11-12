@@ -57,12 +57,20 @@
  * worktree prune` is never invoked — it erases the HEAD reflog of a
  * manually deleted copy, the last pointer to its commits (PLUG-203).
  *
- * §16.4: on `thread.archived` of an executor whose copy is still dirty,
- * the state is saved into `refs/orchestrator/rescue/<thr>` (stash object
- * including untracked files via a temporary index and
- * `--pathspec-from-file`) — unconditionally, even with the janitor
- * disabled — and the coordinator gets a restore command into a *new*
- * worktree, plus a line when the snapshot is incomplete. The janitor
+ * §16.4: on `thread.archived` AND `thread.deleted` (r29) of an executor
+ * whose copy is still dirty, the state is saved into
+ * `refs/orchestrator/rescue/<thr>` (`-<N>` for a changed repeat
+ * snapshot — trees `^{tree}`/`^2^{tree}`/`^3^{tree}` are compared and an
+ * identical snapshot writes nothing) via a stash object including
+ * untracked files (temporary index + `--pathspec-from-file`) —
+ * unconditionally, even with the janitor disabled — and the
+ * coordinator gets a restore command into a *new* worktree, plus a
+ * line when the snapshot is incomplete or failed (`снимок НЕ удался
+ * (<шаг>: <ошибка>)`). Silence only when another live thread shares
+ * the env; a gone copy is journal-only. The ref is created atomically
+ * (`update-ref <ref> <sha> ""`), rescues of one thread are serialized
+ * by an in-plugin queue, and every attempt lands in the
+ * `janitor_rescues` table that `janitor report` reads. The janitor
  * never deletes refs under `refs/orchestrator/`.
  *
  * «Влитая копия»: the copy's HEAD and the copy's own branch (the env's
@@ -76,6 +84,7 @@
  */
 import {
   existsSync,
+  mkdtempSync,
   readdirSync,
   readlinkSync,
   realpathSync,
@@ -92,6 +101,7 @@ import type { JanitorConfig, JanitorConfigLoad } from "./janitor-config.js";
 import type {
   DelegationStore,
   JanitorItemState,
+  JanitorRescueRow,
   JanitorRunRow,
   JanitorStore,
 } from "./store.js";
@@ -210,6 +220,9 @@ interface ThreadDto {
   /** `bb thread list` precomputes this; absent on older BB → CLI fallback. */
   hasPendingInteraction?: boolean | null;
   archivedAt?: number | null;
+  /** §16.4 r29: soft-deleted threads may still be reported by some BB
+   * versions — a set `deletedAt` counts as not-live. */
+  deletedAt?: number | null;
   updatedAt?: number | null;
   environmentId?: string | null;
   parentThreadId?: string | null;
@@ -283,6 +296,10 @@ export interface JanitorReport {
   abandoned: JanitorReportedItem[];
   /** §17.4 (С9): ledger rows marked «готова к удалению». */
   ready: JanitorReportedItem[];
+  /** §16.4 r29 (PLUG-240): the rescue ledger — every snapshot attempt
+   * (and failure), read from the plugin store so saved work without a
+   * reachable coordinator is still findable. */
+  rescues: JanitorRescueRow[];
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -309,6 +326,20 @@ async function gitOk(
     timeoutMs: GIT_TIMEOUT_MS,
   });
   return res.exitCode === 0;
+}
+
+/** §16.4 r29: full result — failure lines carry the step's stderr. */
+async function gitRes(
+  cmd: CmdRunner,
+  cwd: string,
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const res = await cmd.run("git", ["-C", cwd, ...args], {
+    timeoutMs: GIT_TIMEOUT_MS,
+    env,
+  });
+  return { code: res.exitCode, stdout: res.stdout, stderr: res.stderr };
 }
 
 /**
@@ -3159,14 +3190,38 @@ export function createJanitor(deps: JanitorDeps) {
   const rescueCommit = async (
     path: string,
     threadId: string,
-  ): Promise<{ sha: string | null; partial: boolean }> => {
-    const head = (
-      await gitOut(deps.cmd, path, ["rev-parse", "--verify", "HEAD"])
-    )?.trim();
-    if (!head) return { sha: null, partial: false };
-    const w = (
-      await gitOut(deps.cmd, path, ["stash", "create"])
-    )?.trim() || null;
+  ): Promise<{
+    sha: string | null;
+    partial: boolean;
+    /** §16.4 r29 п.5: the failing step and its error for the
+     * «снимок НЕ удался (<шаг>: <ошибка>)» coordinator line. */
+    step?: string;
+    error?: string;
+  }> => {
+    const headRes = await gitRes(deps.cmd, path, [
+      "rev-parse",
+      "--verify",
+      "HEAD",
+    ]);
+    const head = headRes.code === 0 ? headRes.stdout.trim() : "";
+    if (!head) {
+      return {
+        sha: null,
+        partial: false,
+        step: "rev-parse HEAD",
+        error: headRes.stderr.trim() || `exit ${headRes.code}`,
+      };
+    }
+    const stashRes = await gitRes(deps.cmd, path, ["stash", "create"]);
+    if (stashRes.code !== 0) {
+      return {
+        sha: null,
+        partial: false,
+        step: "stash create",
+        error: stashRes.stderr.trim() || `exit ${stashRes.code}`,
+      };
+    }
+    const w = stashRes.stdout.trim() || null;
     const untracked =
       (await gitOut(deps.cmd, path, [
         "ls-files",
@@ -3185,10 +3240,22 @@ export function createJanitor(deps: JanitorDeps) {
         ...(hidden ?? []),
       ]),
     ];
-    if (!uFiles.length) return { sha: w, partial: hidden === null };
-    const tag = `${process.pid}-${threadId}-${now()}`;
-    const tmpIndex = join(tmpdir(), `jan-rescue-${tag}`);
-    const tmpPaths = join(tmpdir(), `jan-rescue-paths-${tag}`);
+    if (!uFiles.length) {
+      return w === null && hidden !== null && !hidden.length
+        ? {
+            sha: null,
+            partial: false,
+            step: "snapshot",
+            error: "nothing to save",
+          }
+        : { sha: w, partial: hidden === null };
+    }
+    // §16.4 r29 п.4: the temporary index lives in a unique mkdtemp
+    // directory, not a pid+time name (a concurrent rescue of the same
+    // copy cannot collide with itself).
+    const tmpDir = mkdtempSync(join(tmpdir(), "jan-rescue-"));
+    const tmpIndex = join(tmpDir, "index");
+    const tmpPaths = join(tmpDir, "paths");
     const env = { GIT_INDEX_FILE: tmpIndex };
     const partialW = { sha: w, partial: true };
     try {
@@ -3289,34 +3356,114 @@ export function createJanitor(deps: JanitorDeps) {
         partial: false,
       };
     } finally {
-      for (const f of [tmpIndex, tmpPaths]) {
-        try {
-          rmSync(f, { force: true });
-        } catch {
-          // temp file removal failed — harmless
-        }
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        // temp dir removal failed — harmless
       }
     }
   };
 
+  const RESCUE_PREFIX = "refs/orchestrator/rescue/";
+  const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  /** §16.4 r29 п.3: the snapshot number of a thread's rescue ref —
+   * `refs/orchestrator/rescue/<id>` counts as 1, `<id>-N` as N; 0 for
+   * anything else under the prefix. */
+  const rescueN = (base: string, ref: string): number => {
+    if (ref === base) return 1;
+    const m = new RegExp(`^${escapeRe(base)}-(\\d+)$`).exec(ref);
+    return m ? Number(m[1]) : 0;
+  };
+
+  /** §16.4 r29 п.3: all saved snapshots of a thread, oldest first —
+   * `refs/orchestrator/rescue/<id>` counts as N=1, `<id>-N` as N. */
+  const listRescueRefs = async (
+    path: string,
+    threadId: string,
+  ): Promise<string[]> => {
+    const out = await gitOut(deps.cmd, path, [
+      "for-each-ref",
+      "--format=%(refname)",
+      RESCUE_PREFIX.replace(/\/$/, ""),
+    ]);
+    if (!out) return [];
+    const base = `${RESCUE_PREFIX}${threadId}`;
+    return out
+      .split("\n")
+      .map((r) => r.trim())
+      .filter((r) => rescueN(base, r) > 0)
+      .sort((a, b) => rescueN(base, a) - rescueN(base, b));
+  };
+
+  /** The three trees that define a snapshot's content
+   * (`<rev>^{tree}`, `^2^{tree}`, `^3^{tree}` — worktree, index,
+   * untracked); null when even the main tree cannot be resolved. */
+  const snapshotTrees = async (
+    path: string,
+    rev: string,
+  ): Promise<string | null> => {
+    const parts: string[] = [];
+    for (const spec of ["^{tree}", "^2^{tree}", "^3^{tree}"]) {
+      const t =
+        (
+          await gitOut(deps.cmd, path, [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            `${rev}${spec}`,
+          ])
+        )?.trim() ?? "";
+      parts.push(t);
+    }
+    return parts[0] ? parts.join(" ") : null;
+  };
+
+  /** §16.4 r29 п.3: unproven sameness counts as different — a repeated
+   * snapshot is cheaper than lost work. */
+  const sameSnapshot = async (
+    path: string,
+    a: string,
+    b: string,
+  ): Promise<boolean> => {
+    const ta = await snapshotTrees(path, a);
+    const tb = await snapshotTrees(path, b);
+    return ta !== null && ta === tb;
+  };
+
   /**
-   * §16.4: `thread.archived` for an executor thread — while BB still
-   * holds the copy (the ~5-minute window), a dirty state is committed
-   * to `refs/orchestrator/rescue/<thread>` and the coordinator gets a
-   * restore command into a *new* worktree (never the main checkout,
-   * where somebody else's work may be in flight). Rescue is
-   * unconditional: it does not depend on `janitor.enabled` or a valid
-   * config — a user who keeps the janitor off still gets the safety
-   * net. Clean copies and non-executor threads are no-ops; the janitor
-   * never deletes refs under `refs/orchestrator/`.
+   * §16.4: `thread.archived` AND `thread.deleted` (r29) for an executor
+   * thread — while BB still holds the copy (the ~5-minute window after
+   * the first of the two events), a dirty state is committed to
+   * `refs/orchestrator/rescue/<thread>` (`-<N>` for a changed repeat
+   * snapshot) and the coordinator gets a restore command into a *new*
+   * worktree (never the main checkout, where somebody else's work may
+   * be in flight). Rescue is unconditional: it does not depend on
+   * `janitor.enabled` or a valid config — a user who keeps the janitor
+   * off still gets the safety net. Clean copies and non-executor
+   * threads are no-ops; the janitor never deletes refs under
+   * `refs/orchestrator/`.
+   *
+   * r29 п.2: the env phase is NOT checked (a still-active turn keeps
+   * `phase=active` although BB retires the copy); silence only when
+   * another LIVE thread shares the env — BB keeps a shared env. An
+   * unproven thread list means rescue, a gone copy/env means silence
+   * (journal only). r29 п.3: a snapshot identical to the latest saved
+   * one writes no ref and sends no line. r29 п.4: the ref is created
+   * atomically (`update-ref <ref> <sha> ""`), and rescues of one
+   * thread are serialized by an in-plugin queue.
    */
-  const onThreadArchived = async (thread: {
-    id: string;
-    environmentId?: string | null;
-    parentThreadId?: string | null;
-    sourceThreadId?: string | null;
-    originPluginId?: string | null;
-  }): Promise<void> => {
+  const rescueOnGone = async (
+    thread: {
+      id: string;
+      environmentId?: string | null;
+      parentThreadId?: string | null;
+      sourceThreadId?: string | null;
+      originPluginId?: string | null;
+    },
+    cause: "archived" | "deleted",
+  ): Promise<void> => {
+    const reasonWord = cause === "deleted" ? "удалён" : "заархивирован";
     // Scope check when the event carries the fields; absent fields mean
     // «unknown» — rescuing a dirty copy is harmless, so proceed.
     const fieldsKnown =
@@ -3334,7 +3481,15 @@ export function createJanitor(deps: JanitorDeps) {
     if (!envId) return;
     const env = await showEnvironment(envId);
     const path = env?.path;
-    if (!path || !existsSync(path)) return;
+    if (!path || !existsSync(path)) {
+      // §16.4 r29 п.2: the copy/env is already gone (BB retired it
+      // after an earlier archive) — silence, journal only.
+      log.info?.(
+        `orchestrator janitor: rescue ${thread.id} (${cause}): ` +
+          `env ${envId} copy already gone`,
+      );
+      return;
+    }
     const statusText = await gitOut(deps.cmd, path, [
       "status",
       "--porcelain",
@@ -3349,39 +3504,93 @@ export function createJanitor(deps: JanitorDeps) {
       const hidden = await hiddenChangedFiles(path);
       if (!hidden?.length) return;
     }
+    // §16.4 r29 п.2: another LIVE thread of the same env (not
+    // archived, not deleted, not the event's own) keeps the env — BB
+    // does not retire a shared copy, so nothing is at risk. The same
+    // env-thread list the janitor itself uses; an unproven list means
+    // rescue rather than silence.
+    // §16.4 r29 п.2: «живой» only when the DTO proves it — a missing
+    // `archivedAt` cannot prove «не в архиве» (нет поля → спасать,
+    // ревью PLUG-240). `deletedAt` absent is the norm — deleted
+    // threads are excluded from the list server-side; only a set one
+    // disqualifies.
+    const liveThread = (t: ThreadDto) =>
+      t.archivedAt === null && !t.deletedAt;
+    const threadsNow = await listThreads();
+    if (
+      threadsNow !== null &&
+      threadsNow.some(
+        (t) =>
+          t.environmentId === envId &&
+          t.id !== thread.id &&
+          liveThread(t),
+      )
+    ) {
+      return;
+    }
     const coordinator =
       deps.store.byThreadId(thread.id)?.coordinator_thread_id ??
       thread.parentThreadId ??
       null;
-    const tellCoordinator = async (text: string) => {
-      if (!coordinator) return;
+    // §16.4 r29 п.6: the coordinator may be deleted by the same
+    // cascade (r27 makes executors its children) — a proven-absent
+    // coordinator or a failed send lands in the plugin journal (warn)
+    // and the rescue table, so saved work is never lost silently.
+    const coordGone =
+      coordinator !== null &&
+      threadsNow !== null &&
+      !threadsNow.some((t) => t.id === coordinator && liveThread(t));
+    let sendError: string | null = null;
+    const sendLine = async (text: string): Promise<boolean> => {
+      if (!coordinator) return false;
       try {
         await deps.threads.send({
           threadId: coordinator,
           mode: "queue-if-active",
           input: [{ type: "text", text, mentions: [] }],
         });
+        return true;
+      } catch (e) {
+        sendError = message(e);
+        return false;
+      }
+    };
+    const record = (r: {
+      ref: string | null;
+      repoRoot: string | null;
+      notified: boolean;
+      error?: string | null;
+    }) => {
+      try {
+        deps.janitor.addRescue(
+          {
+            threadId: thread.id,
+            ref: r.ref,
+            repoRoot: r.repoRoot,
+            reason: reasonWord,
+            notified: r.notified,
+            error: r.error ?? null,
+          },
+          now(),
+        );
       } catch (e) {
         log.warn?.(
-          `orchestrator janitor: rescue notify ${coordinator}: ${message(e)}`,
+          `orchestrator janitor: rescue record ${thread.id}: ${message(e)}`,
+        );
+      }
+      if (!r.notified) {
+        log.warn?.(
+          `orchestrator janitor: rescue ${thread.id}: ` +
+            (coordinator === null
+              ? "координатор неизвестен"
+              : coordGone
+                ? `координатор ${coordinator} удалён`
+                : `строка координатору ${coordinator} не дошла` +
+                  (sendError ? ` (${sendError})` : "")) +
+            ` — ${r.ref ?? "снимок не удался"} ${path}`,
         );
       }
     };
-    const { sha, partial } = await rescueCommit(path, thread.id);
-    const ref = `refs/orchestrator/rescue/${thread.id}`;
-    if (
-      !sha ||
-      !(await gitOk(deps.cmd, path, ["update-ref", ref, sha]))
-    ) {
-      // The archive still happens — without the line the work is gone
-      // silently (PLUG-185): a failed or partial rescue is reported.
-      await tellCoordinator(
-        `[orchestrator] исполнитель ${thread.id} заархивирован ` +
-          `с несохранённой работой, снимок НЕ удался — копия ${path} ` +
-          `уходит под уборку BB, проверь вручную`,
-      );
-      return;
-    }
     const common = (
       await gitOut(deps.cmd, path, ["rev-parse", "--git-common-dir"])
     )?.trim();
@@ -3392,24 +3601,160 @@ export function createJanitor(deps: JanitorDeps) {
       : path;
     const repoRoot =
       basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
-    const rescueDir = join(
-      dirname(repoRoot),
-      `${basename(repoRoot)}-rescue-${thread.id}`,
-    );
     // POSIX single-quoting — the hint is a copy-paste shell command and
     // a repo path may contain spaces (PLUG-204).
     const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-    await tellCoordinator(
-      `[orchestrator] исполнитель ${thread.id} заархивирован ` +
+    const failLine = (step: string, error: string) =>
+      `[orchestrator] тред ${thread.id} ${reasonWord} ` +
+      `с несохранённой работой, снимок НЕ удался (${step}: ${error}) ` +
+      `— копия ${path} уходит под уборку BB через ≤5 минут, ` +
+      `проверь вручную`;
+    const snap = await rescueCommit(path, thread.id);
+    if (!snap.sha) {
+      const step = snap.step ?? "snapshot";
+      const error = snap.error ?? "unknown";
+      const delivered = await sendLine(failLine(step, error));
+      record({
+        ref: null,
+        repoRoot,
+        notified: delivered && !coordGone,
+        error: `${step}: ${error}`,
+      });
+      return;
+    }
+    const refBase = `${RESCUE_PREFIX}${thread.id}`;
+    const existing = await listRescueRefs(path, thread.id);
+    const latest = existing[existing.length - 1];
+    if (latest && (await sameSnapshot(path, snap.sha, latest))) {
+      // §16.4 r29 п.3: same content already saved — no ref, no line.
+      log.info?.(
+        `orchestrator janitor: rescue ${thread.id}: ` +
+          `snapshot unchanged — already saved at ${latest}`,
+      );
+      return;
+    }
+    // §16.4 r29 п.4: atomic create — `update-ref <ref> <sha> ""`
+    // writes only when the ref is absent; a lost race (or a stale
+    // candidate from listRescueRefs) is not a failure: compare with
+    // the occupying ref, identical → done, different → try N+1.
+    // §16.4 r29 п.3: the new ref is <id>-<maxN+1>, never a filled
+    // hole (ревью PLUG-240) — a freed number reused later would
+    // sit below the newest snapshot the п.3 comparison runs against.
+    const maxN = existing.reduce(
+      (m, r) => Math.max(m, rescueN(refBase, r)),
+      0,
+    );
+    let n = Math.max(1, maxN);
+    let candidate = maxN === 0 ? refBase : `${refBase}-${maxN + 1}`;
+    let ref: string | null = null;
+    let updateErr: string | null = null;
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const r = await gitRes(deps.cmd, path, [
+        "update-ref",
+        candidate,
+        snap.sha,
+        "",
+      ]);
+      if (r.code === 0) {
+        ref = candidate;
+        break;
+      }
+      const occupied = (
+        await gitOut(deps.cmd, path, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          candidate,
+        ])
+      )?.trim();
+      if (!occupied) {
+        updateErr = r.stderr.trim() || `exit ${r.code}`;
+        break;
+      }
+      if (await sameSnapshot(path, snap.sha, candidate)) {
+        log.info?.(
+          `orchestrator janitor: rescue ${thread.id}: ` +
+            `snapshot unchanged — already saved at ${candidate}`,
+        );
+        return;
+      }
+      candidate = `${refBase}-${++n}`;
+    }
+    if (!ref) {
+      const error = updateErr ?? "no free ref name";
+      const delivered = await sendLine(failLine("update-ref", error));
+      record({
+        ref: null,
+        repoRoot,
+        notified: delivered && !coordGone,
+        error: `update-ref: ${error}`,
+      });
+      return;
+    }
+    // §16.4 r29 п.3: a repeat snapshot restores into its own
+    // `<repo>-rescue-<id>-<N>` directory so it cannot collide with an
+    // already-restored first snapshot.
+    const suffix = ref === refBase ? "" : ref.slice(refBase.length);
+    const rescueDir = join(
+      dirname(repoRoot),
+      `${basename(repoRoot)}-rescue-${thread.id}${suffix}`,
+    );
+    const delivered = await sendLine(
+      `[orchestrator] исполнитель ${thread.id} ${reasonWord} ` +
         `с несохранённой работой` +
-        (partial
+        (snap.partial
           ? " (снимок неполный — часть файлов не сохранилась)"
           : "") +
         ` — снимок: ${ref}. ` +
         `Восстановление в новую копию: git -C ${q(repoRoot)} worktree add ` +
         `${q(rescueDir)} ${ref}^1 && git -C ${q(rescueDir)} stash apply ${ref}`,
     );
+    record({ ref, repoRoot, notified: delivered && !coordGone });
   };
+
+  /** §16.4 r29 п.4: rescue calls for one thread run one at a time —
+   * a cascade (archive → delete, coordinator + children deleted
+   * together) cannot interleave two snapshots of the same copy. */
+  const rescueQueue = new Map<string, Promise<void>>();
+  const onThreadGone = (
+    thread: {
+      id: string;
+      environmentId?: string | null;
+      parentThreadId?: string | null;
+      sourceThreadId?: string | null;
+      originPluginId?: string | null;
+    },
+    cause: "archived" | "deleted",
+  ): Promise<void> => {
+    const prev = rescueQueue.get(thread.id) ?? Promise.resolve();
+    const next = prev
+      .then(() => rescueOnGone(thread, cause))
+      .catch((e) =>
+        log.warn?.(
+          `orchestrator janitor: rescue ${thread.id}: ${message(e)}`,
+        ),
+      );
+    rescueQueue.set(thread.id, next);
+    return next.finally(() => {
+      if (rescueQueue.get(thread.id) === next) {
+        rescueQueue.delete(thread.id);
+      }
+    });
+  };
+  const onThreadArchived = (thread: {
+    id: string;
+    environmentId?: string | null;
+    parentThreadId?: string | null;
+    sourceThreadId?: string | null;
+    originPluginId?: string | null;
+  }) => onThreadGone(thread, "archived");
+  const onThreadDeleted = (thread: {
+    id: string;
+    environmentId?: string | null;
+    parentThreadId?: string | null;
+    sourceThreadId?: string | null;
+    originPluginId?: string | null;
+  }) => onThreadGone(thread, "deleted");
 
   const report = async (): Promise<JanitorReport> => {
     const cfgLoad = await deps.loadConfig();
@@ -3465,8 +3810,9 @@ export function createJanitor(deps: JanitorDeps) {
           reason: i.reason ?? "",
           tipSha: shownSha(i),
         })),
+      rescues: deps.janitor.rescues(),
     };
   };
 
-  return { run, report, onThreadArchived };
+  return { run, report, onThreadArchived, onThreadDeleted };
 }
