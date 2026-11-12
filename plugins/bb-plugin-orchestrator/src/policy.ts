@@ -49,10 +49,24 @@ export interface Policy {
    * `firstResponseSeconds`, e.g. `{"codex": 300}`. */
   firstResponseSecondsByProvider?: Record<string, number>;
   maxRunSeconds?: number;
+  /** §18.5 (PLUG-245): таймауты сторожа/плагина — по ключам. */
+  timing?: PolicyTiming;
   /** §2.3: executor level → the auditor level that reviews its work. */
   reviewByLevel?: Record<string, string>;
   levels: Record<string, PolicyLevel>;
   routes: Record<string, PolicyRoute>;
+}
+
+/** §18.5: настраиваемые таймауты сторожа (policy.timing). */
+export interface PolicyTiming {
+  /** Холд квоты/маршрута после quota/unavailable (default 15). */
+  quotaHoldMinutes?: number;
+  /** Повторная строка «ждёт решения» не чаще (default 10). */
+  approvalRepeatMinutes?: number;
+  /** Окно неизвестного результата раздачи (default 5). */
+  postDispatchGraceMinutes?: number;
+  /** Окно ожидания BB-нотифика о результате (default 120 с). */
+  bbNotifyWaitSeconds?: number;
 }
 
 export interface PolicyIssue {
@@ -408,6 +422,33 @@ export function parsePolicy(
       }
     }
   }
+  /* §18.5: policy.timing — вне пределов предупреждение и дефолт. */
+  const timing: PolicyTiming = {};
+  if (raw.timing !== undefined) {
+    if (!isRecord(raw.timing)) {
+      warn("timing", "must be an object of timeout values — ignored");
+    } else {
+      const bounds: Record<keyof PolicyTiming, [number, number]> = {
+        quotaHoldMinutes: [1, 1440],
+        approvalRepeatMinutes: [1, 1440],
+        postDispatchGraceMinutes: [1, 1440],
+        bbNotifyWaitSeconds: [5, 3600],
+      };
+      for (const [key, [min, max]] of Object.entries(bounds) as [
+        keyof PolicyTiming,
+        [number, number],
+      ][]) {
+        const v = raw.timing[key];
+        if (v === undefined) continue;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
+          warn(`timing.${key}`, `out of bounds ${min}..${max} — using default`);
+        } else {
+          timing[key] = v;
+        }
+      }
+    }
+  }
+
   let maxRunSeconds: number | undefined;
   if (raw.maxRunSeconds !== undefined) {
     const v = raw.maxRunSeconds;
@@ -461,6 +502,7 @@ export function parsePolicy(
         ? { firstResponseSecondsByProvider }
         : {}),
       ...(maxRunSeconds !== undefined ? { maxRunSeconds } : {}),
+      ...(Object.keys(timing).length > 0 ? { timing } : {}),
       levels,
       routes,
     },

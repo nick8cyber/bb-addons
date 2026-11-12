@@ -779,14 +779,24 @@ interface LockInfo {
   pid: number;
   branch: string | null;
   head: string | null;
+  /** PLUG-245 заход 2 (Б2): токен владельца-экземпляра (postPublish).
+   * Замки merge/release его не пишут — они живут один вызов и привязаны
+   * к pid. */
+  owner: string | null;
 }
 
-/** `pid\ntime\nbranch\nhead` — branch/head are empty until recorded. */
+/** `pid\ntime\nbranch\nhead\n[owner]` — branch/head/owner are empty
+ * until recorded. */
 function parseLock(content: string): LockInfo | null {
-  const [pidText, , branch, head] = content.split("\n");
+  const [pidText, , branch, head, owner] = content.split("\n");
   const pid = Number(pidText);
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  return { pid, branch: branch || null, head: head || null };
+  return {
+    pid,
+    branch: branch || null,
+    head: head || null,
+    owner: owner || null,
+  };
 }
 
 /**
@@ -822,17 +832,36 @@ export async function acquireCopyLock(
   git: Git,
   repo: string,
   lockPath: string,
+  opts?: { owner?: string },
 ): Promise<() => void> {
   const inProgress = () =>
     new OrchestratorError(
       "merge-in-progress",
       `a merge is already running in ${repo} (lock ${lockPath})`,
     );
+  // PLUG-245 заход 2 (Б2) + заход 3 (Б1): живость замка. Обычный
+  // pid-замок жив, пока жив pid. Замок с owner-токеном (postPublish
+  // между тактами): владелец — экземпляр плагина, а не pid (§18.5).
+  // Замок ТОГО ЖЕ экземпляра занят — вторая выкладка этого же
+  // экземпляра в ту же копию ждёт, а не крадёт замок. Ломаем только
+  // замок ДРУГОГО экземпляра — при мёртвом pid или при нашем pid
+  // (прежний экземпляр в том же процессе BB после reload). Для взятия
+  // без owner (merge/release) любой живой pid уважаем — иначе merge в
+  // том же процессе украл бы замок работающего postPublish.
+  const isAlive = (info: LockInfo): boolean => {
+    if (info.owner !== null && opts?.owner != null) {
+      if (info.owner === opts.owner) return true;
+      return info.pid !== process.pid && pidAlive(info.pid);
+    }
+    return pidAlive(info.pid);
+  };
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       writeFileSync(
         lockPath,
-        `${process.pid}\n${new Date().toISOString()}\n`,
+        opts?.owner != null
+          ? `${process.pid}\n${new Date().toISOString()}\n\n\n${opts.owner}\n`
+          : `${process.pid}\n${new Date().toISOString()}\n`,
         { flag: "wx" },
       );
       return () => {
@@ -857,7 +886,7 @@ export async function acquireCopyLock(
       continue; // vanished between create and read — retry
     }
     const info = parseLock(content);
-    if (!info || pidAlive(info.pid)) {
+    if (!info || isAlive(info)) {
       throw inProgress();
     }
     // §14: a dead owner's lock breaks only after the copy is restored

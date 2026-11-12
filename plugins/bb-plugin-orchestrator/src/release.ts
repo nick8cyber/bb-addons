@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { hostname as osHostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { OrchestratorError } from "./errors.js";
@@ -40,11 +40,19 @@ import {
   type ScanFinding,
 } from "./scan.js";
 import {
+  DEFAULT_TIMING,
   resolveProject,
   type ReleaseConfig,
   type ReleaseConfigLoad,
   type ResolvedProject,
+  type ResolvedPostPublishCommand,
+  type ResolvedTiming,
 } from "./release-config.js";
+import {
+  globMatch,
+  maskCommandOutput,
+  type CommandRunner,
+} from "./commands.js";
 import {
   levelRole,
   pickRoute,
@@ -52,7 +60,12 @@ import {
   type PolicyLoad,
 } from "./policy.js";
 import { ACTIVE_STATUSES } from "./store.js";
-import type { DelegationRow, DelegationStore, ReleaseRow } from "./store.js";
+import type {
+  CommandRunRow,
+  DelegationRow,
+  DelegationStore,
+  ReleaseRow,
+} from "./store.js";
 import { runChecked, runJson, type BbCli } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
@@ -66,11 +79,9 @@ const TOKEN_TTL_MS = 5 * 60 * 1000;
 // while it is this fresh — a request that never reached
 // turn/started would otherwise refuse every release forever.
 const STALE_TURN_REQUEST_MS = 2 * 60 * 1000;
-const CHECK_TIMEOUT_MS = 10 * 60 * 1000;
 /** §17.3: how long a release row may sit in `auditing` without its
  * audit delegation before the pump calls it dead (sync + checks +
  * dispatch window, with margin). */
-const PREPARE_TIMEOUT_MS = 20 * 60 * 1000;
 const PACKET_DIFF_CAP = 200_000;
 const ZERO_SHA = "0000000000000000000000000000000000000000";
 
@@ -168,6 +179,14 @@ export interface ReleaseDeps {
   /** §17.3 (С1): the delegate queue — release itself runs outside it;
    * only the audit dispatch is serialized against other dispatches. */
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
+  /** §18.2 (PLUG-245): общий запускатель журнальных команд. */
+  commandRunner?: CommandRunner;
+  /** §18.2: срок хранения записей журнала, дни (default 30). */
+  commandRetentionDays?: () => number;
+  /** PLUG-245 Б2: токен владельца замка копии postPublish — экземпляр
+   * плагина, не pid: после перезагрузки плагина в том же процессе старый
+   * замок чужой и ломается без restoreCopy. */
+  instanceId?: string;
   /** §6 (r8): this machine's bb hostId — a project source counts only
    * when its path's hostId is this host. */
   localHostId?: () => string | Promise<string>;
@@ -908,11 +927,12 @@ async function runProjectChecks(
   deps: ReleaseDeps,
   repo: string,
   checks: readonly string[],
+  checksMinutes: number,
 ): Promise<void> {
   for (const check of checks) {
     const res = await deps.cmd.run("sh", ["-c", check], {
       cwd: repo,
-      timeoutMs: CHECK_TIMEOUT_MS,
+      timeoutMs: checksMinutes * 60_000,
     });
     if (res.exitCode !== 0) {
       const tail = (res.stderr + "\n" + res.stdout).trim().split("\n");
@@ -2023,7 +2043,7 @@ async function runReleaseSteps(
     // when the checks finish.
 
     // Step 3 — проверки проекта.
-    await runProjectChecks(deps, repo, project.checks);
+    await runProjectChecks(deps, repo, project.checks, project.timing.checksMinutes);
 
     const afterChecksSha = await git(deps, repo, ["rev-parse", "HEAD"]);
     if (afterChecksSha !== postSyncSha) {
@@ -2344,12 +2364,9 @@ export interface PumpSummary {
 
 /** §2 r10 п.4: the audit gets 30 minutes from the FIRST audit dispatch
  * of this release — reissues are inside the budget, not an extension. */
-const AUDIT_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** §2 r10 п.3: how often a tracked PR is polled (`gh pr view`). */
-const PR_WATCH_INTERVAL_MS = 5 * 60 * 1000;
 /** §2 r10 п.3: 72 h — closed-wait window and the stale mark. */
-const PR_STALE_MS = 72 * 60 * 60 * 1000;
 
 /** The deps subset a release-notice delivery needs — pumpReleases and
  * the r31 watchdog share it. */
@@ -2472,7 +2489,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         // mark it failed so a retry is not blocked forever.
         if (!row.audit_delegation_id) {
           const age = (deps.now?.() ?? Date.now()) - row.created_at;
-          if (age > PREPARE_TIMEOUT_MS) {
+          if (age > (await releaseTiming(deps, row)).prepareMinutes * 60_000) {
             if (
               deps.store.transitionReleaseStatus(
                 row.id,
@@ -2507,21 +2524,23 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
               : null) ??
             delegation ??
             row;
+          const auditT = await releaseTiming(deps, row);
           if (
             (deps.now?.() ?? Date.now()) - root.created_at >
-            AUDIT_TIMEOUT_MS
+            auditT.auditTimeoutMinutes * 60_000
           ) {
             if (
               deps.store.transitionReleaseStatus(
                 row.id,
                 ["auditing"],
                 "failed",
-                "аудит не завершился за 30 мин",
+                `аудит не завершился за ${auditT.auditTimeoutMinutes} мин`,
                 {
                   kind: "failed",
                   text:
                     `выкладка ${row.task_key} остановлена: аудит не ` +
-                    `завершился за 30 мин — повторите release`,
+                    `завершился за ${auditT.auditTimeoutMinutes} мин — ` +
+                    `повторите release`,
                 },
               )
             ) {
@@ -2623,6 +2642,113 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
     }
   }
   await prWatch(deps);
+  // §2 п.6 (r11): влитый PR — postPublish `on: merged` до строки «влит»;
+  // журнальные команды в полёте — такт уходит, досмотр следующим.
+  for (const row of deps.store.releasesByPrState("merging")) {
+    try {
+      const fresh = deps.store.getRelease(row.id) ?? row;
+      const ppMarker = POSTPUBLISH_META(fresh.id);
+      let ppMeta: PostPublishMeta = {};
+      try {
+        ppMeta = JSON.parse(
+          deps.store.metaGet(ppMarker) ?? "{}",
+        ) as PostPublishMeta;
+      } catch {
+        ppMeta = {};
+      }
+      if (fresh.notice_text != null || ppMeta.finish != null) {
+        // Итог уже собран: строка в пути у досмотра либо доставлена и
+        // стёрта confirm'ом — метка finish переживает оба состояния.
+        // Добиваем только застрявший pr_state (рестарт между
+        // сохранением строки и переходом): postPublish и дубль строки
+        // не пересобираем.
+        deps.store.transitionPrState(fresh.id, ["merging"], "merged");
+        deps.store.metaDelete(ppMarker);
+        continue;
+      }
+      const pp = await runPostPublish(deps, fresh, "pr.merged").catch(
+        (e) => {
+          releasePostPublishLock(fresh.id);
+          return {
+            done: true,
+            summary: `postPublish: ${message(e)}`,
+            selfReload: null,
+          };
+        },
+      );
+      if (!pp.done) continue;
+      // Замок копии не переживает итог postPublish — в том числе при
+      // раннем done внутри runPostPublish (идемпотентно).
+      releasePostPublishLock(fresh.id);
+      const sha7 = (fresh.pr_merge_sha ?? "").slice(0, 7);
+      const parts = [
+        `PR влит ${fresh.task_key}: ${fresh.pr_url}` +
+          (sha7 ? ` → ${sha7}` : ""),
+      ];
+      if (pp.summary) parts.push(pp.summary);
+      const line = parts.join("\n");
+      // Метка «итог собран» — до перехода в merged: досмотр доставит
+      // строку и сотрёт notice_text confirm'ом; без метки следующий
+      // такт пересобрал бы итог и слал дубль.
+      const finishMeta = JSON.stringify({ ...ppMeta, finish: line });
+      if (pp.selfReload) {
+        deps.store.setReleaseNoticeWithMeta(
+          fresh.id,
+          "self-reload",
+          line,
+          ppMarker,
+          finishMeta,
+        );
+        deps.store.transitionPrState(fresh.id, ["merging"], "merged");
+        if (!deps.store.claimReleaseNotify(fresh.id)) {
+          deps.store.metaDelete(ppMarker);
+          continue;
+        }
+        const createErr = await createSelfReloadAutomation(
+          deps,
+          fresh,
+          line,
+          pp.selfReload,
+        );
+        if (createErr == null) {
+          deps.commandRunner?.holdForSelfReload();
+          await commentOnTask(deps, fresh.task_key, line);
+          deps.store.confirmReleaseNotify(fresh.id, line);
+          deps.store.metaDelete(ppMarker);
+          continue;
+        }
+        deps.store.releaseReleaseNotify(fresh.id);
+        deps.store.setReleaseNotice(
+          fresh.id,
+          "pr",
+          `${line}\nперезагрузи orchestrator вручную: ${createErr}`,
+        );
+      } else {
+        // §2 п.6: строка собрана и сохранена — затем запись уходит в
+        // merged (рестарт между ними досматривается без повтора).
+        deps.store.setReleaseNoticeWithMeta(
+          fresh.id,
+          "pr",
+          line,
+          ppMarker,
+          finishMeta,
+        );
+        deps.store.transitionPrState(fresh.id, ["merging"], "merged");
+      }
+      deps.store.metaDelete(ppMarker);
+      await deliverReleaseNotice(deps, fresh);
+    } catch (e) {
+      deps.log?.warn?.(
+        `orchestrator release: PR merged ${row.task_key}: ${message(e)}`,
+      );
+    }
+  }
+  // §18.2: чистка журнала и запуск очереди — каждый такт.
+  const retentionDays = deps.commandRetentionDays?.() ?? 30;
+  deps.store.pruneCommandRuns(
+    (deps.now?.() ?? Date.now()) - retentionDays * 86_400_000,
+  );
+  await deps.commandRunner?.pump();
   return s;
 }
 
@@ -2651,17 +2777,22 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       // до доставки; досмотр донесёт текст, переход сделает следующий
       // такт.
       if (row.notice_text != null) continue;
-      if (row.pr_checked_at && now - row.pr_checked_at < PR_WATCH_INTERVAL_MS)
+      const t = await releaseTiming(deps, row);
+      if (
+        row.pr_checked_at &&
+        now - row.pr_checked_at < t.prPollMinutes * 60_000
+      ) {
         continue;
+      }
       const res = await deps.cmd.run(
         "gh",
         ["pr", "view", prUrl, "--json", "state,mergedAt,mergeCommit"],
-        { timeoutMs: 60_000 },
+        { timeoutMs: t.prCommandTimeoutSec * 1000 },
       );
       if (res.exitCode !== 0) {
         deps.store.recordPrCheck(row.id, true, now);
         const fresh = deps.store.getRelease(row.id);
-        if ((fresh?.pr_error_count ?? 0) >= 3) {
+        if ((fresh?.pr_error_count ?? 0) >= t.prErrorLimit) {
           if (
             deps.store.transitionPrState(row.id, ["open", "closed"], "error")
           ) {
@@ -2669,7 +2800,8 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
               row.id,
               "pr",
               `слежение за PR ${row.task_key} невозможно: gh pr view ` +
-                `${prUrl}: ${(res.stderr || res.stdout).trim().slice(0, 200)}`,
+                `${prUrl}: ` +
+                `${maskCommandOutput(res.stderr || res.stdout).slice(0, 200)}`,
             );
             await deliverReleaseNotice(deps, row);
           }
@@ -2690,21 +2822,18 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       deps.store.recordPrCheck(row.id, false, now);
       const state = (view.state ?? "").toUpperCase();
       if (state === "MERGED") {
-        if (deps.store.transitionPrState(row.id, ["open", "closed"], "merged")) {
+        // §2 п.6 (r11): «merging» — postPublish `on: merged` идёт до
+        // строки «PR влит … → sha7»; без настроенного postPublish насос
+        // переводит в «merged» и собирает строку тем же тактом.
+        if (
+          deps.store.transitionPrState(row.id, ["open", "closed"], "merging")
+        ) {
+          deps.store.setPrMergeSha(row.id, view.mergeCommit?.oid ?? null);
           await runChecked(deps.bbCli, [
             "tasks", "update", row.task_key, "--status", "done",
           ]).catch((e) =>
             deps.log?.warn?.(`release task status: ${message(e)}`),
           );
-          deps.store.setReleaseNotice(
-            row.id,
-            "pr",
-            `PR влит ${row.task_key}: ${prUrl}` +
-              (view.mergeCommit?.oid
-                ? ` → ${view.mergeCommit.oid.slice(0, 7)}`
-                : ""),
-          );
-          await deliverReleaseNotice(deps, row);
         }
         continue;
       }
@@ -2715,7 +2844,10 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
           });
           continue;
         }
-        if (row.pr_closed_at && now - row.pr_closed_at >= PR_STALE_MS) {
+        if (
+          row.pr_closed_at &&
+          now - row.pr_closed_at >= t.prReopenWatchHours * 3_600_000
+        ) {
           deps.store.transitionPrState(row.id, ["closed"], "closed_final");
         }
         continue;
@@ -2740,12 +2872,15 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       // for tracked rows: pr-watch writes do not bump it). «Дальше
       // молча» — флаг, не состояние: опрос до MERGED/CLOSED идёт дальше
       // (ревью PLUG-244 заход 1, Б5).
-      if (!row.pr_stale_notified && now - row.updated_at >= PR_STALE_MS) {
+      if (
+        !row.pr_stale_notified &&
+        now - row.updated_at >= t.prStaleHours * 3_600_000
+      ) {
         if (deps.store.markPrStaleNotified(row.id)) {
           deps.store.setReleaseNotice(
             row.id,
             "pr",
-            `PR висит 72 ч ${row.task_key}: ${prUrl}`,
+            `PR висит ${t.prStaleHours} ч ${row.task_key}: ${prUrl}`,
           );
           await deliverReleaseNotice(deps, row);
         }
@@ -3065,6 +3200,29 @@ async function finishPublished(
     fresh.target_action === "push"
       ? fresh.target_branch
       : (fresh.publish_branch ?? fresh.branch);
+  // §2 п.6 (r11): postPublish — до сбора строки и до пост-проверки;
+  // журнальные команды в полёте → такт уходит, работа досматривается
+  // следующим проходом (строка ещё не сохранена).
+  let selfReload: { rootDir: string; expectedSha: string } | null = null;
+  let ppSummary: string | null = null;
+  {
+    const pp = await runPostPublish(deps, fresh, "release.published").catch(
+      (e) => {
+        releasePostPublishLock(fresh.id);
+        return {
+          done: true,
+          summary: `postPublish: ${message(e)}`,
+          selfReload: null,
+        };
+      },
+    );
+    if (!pp.done) return;
+    // Замок копии не переживает итог postPublish — в том числе при
+    // раннем done внутри runPostPublish (идемпотентно).
+    releasePostPublishLock(fresh.id);
+    ppSummary = pp.summary;
+    selfReload = pp.selfReload;
+  }
   const checks = await postCheck(
     deps,
     fresh,
@@ -3092,15 +3250,7 @@ async function finishPublished(
   if (fresh.kb_note) parts.push(`KB-заметка: ${fresh.kb_note}`);
   if (fresh.no_kb_reason) parts.push(`KB не требуется: ${fresh.no_kb_reason}`);
   for (const m of checks) parts.push(`пост-проверка: ${m}`);
-  let selfReload: { checkout: string; expectedSha: string } | null = null;
-  if (fresh.target_action === "push") {
-    const pp = await runPostPublish(deps, fresh).catch((e) => ({
-      summary: `postPublish: ${message(e)}`,
-      selfReload: null,
-    }));
-    if (pp.summary) parts.push(pp.summary);
-    selfReload = pp.selfReload;
-  }
+  if (ppSummary) parts.push(ppSummary);
   const line = parts.join("\n");
   // §2 r10 п.5: работа выполнена и текст собран — сначала строка
   // сохраняется в записи, метка base снимается (повтор такта уже не
@@ -3124,6 +3274,8 @@ async function finishPublished(
       selfReload,
     );
     if (createErr == null) {
+      // §18.2: новые queued не стартуют в умирающем процессе.
+      deps.commandRunner?.holdForSelfReload();
       // §2 шаг 6: комментарий «выложено» в задачу пишет сам плагин —
       // скрипт доносит итоговую строку только до треда координатора.
       await commentOnTask(deps, fresh.task_key, line);
@@ -3147,34 +3299,185 @@ async function finishPublished(
 // ── postPublish (§6 r10, push only) ───────────────────────────────────
 
 interface PostPublishResult {
+  /** false — журнальные команды в полёте (queued/running) или замок
+   * занят: насос не блокируется, итог собирает следующий такт. */
+  done: boolean;
   summary: string | null;
-  selfReload: { checkout: string; expectedSha: string } | null;
+  selfReload: { rootDir: string; expectedSha: string } | null;
 }
 
 const POSTPUBLISH_META = (id: number) => `release-pp:${id}`;
 
+/** §6 r11: замок копии держится весь postPublish — в том числе пока
+ * журнальные команды ждут/работают (карта по release id, переживает
+ * такты внутри процесса; файл — между процессами). */
+const postPublishLocks = new Map<number, () => void>();
+
+const releasePostPublishLock = (id: number): void => {
+  postPublishLocks.get(id)?.();
+  postPublishLocks.delete(id);
+};
+
+/** Остановка плагина: все замки копий postPublish снимаются (PLUG-245
+ * Б2 — замок не переживает экземпляр). */
+export function releaseAllPostPublishLocks(): void {
+  for (const release of postPublishLocks.values()) release();
+  postPublishLocks.clear();
+}
+
+/** §18.5 + PLUG-245 заход 3 (Б2): срок шагов postPublish — только на
+ * ОЖИДАНИЕ (замок копии, очередь команд, удержание перезагрузки);
+ * умолчание — timing.postPublishWaitMinutes (30 мин). Пока команда
+ * выкладки запущена, итог не отдаётся и замок держится — её
+ * ограничивает только свой timeoutSec (до 3600 с). Экспортируется для
+ * тестов как дефолт срока. */
+export const POSTPUBLISH_MAX_MS = 30 * 60 * 1000;
+
+/** §18.2: «<name>: ok» / «<name>: пропущена — <reason>» / … — один
+ * формат для строки итога и для строки истёкшего ожидания (заход 4). */
+const commandRunBit = (name: string, r: CommandRunRow): string => {
+  switch (r.status) {
+    case "ok":
+      return `${name}: ok`;
+    case "skipped":
+      // §18.2: «<name>: нет checkout» — без «пропущена —».
+      return r.output_tail === "нет checkout"
+        ? `${name}: нет checkout`
+        : `${name}: пропущена — ${r.output_tail}`;
+    case "timeout":
+      return `${name}: таймаут`;
+    case "interrupted":
+      return `${name}: прервана перезапуском`;
+    default:
+      return (
+        `${name}: упала (код ${r.exit_code ?? "?"})` +
+        (r.output_tail ? `: ${r.output_tail}` : "")
+      );
+  }
+};
+
+/** Состояние копии в plugin_meta: base пишется один раз, результат ff
+ * мемоизируется (поздний сбой fetch не отменяет уже сделанный ff). */
+interface PostPublishMeta {
+  startedAt?: number;
+  /** §18.5: начало ТЕКУЩЕГО ожидания (замок/очередь/удержание);
+   * обнуляется, пока идёт running команда этой выкладки. */
+  waitSince?: number;
+  base?: string;
+  copy?: { head: string; changed: string[] };
+  pub?: string[] | null;
+  /** Собранная итоговая строка postPublish — переживает стирание
+   * notice_text confirm'ом досмотра, чтобы merging-такт не
+   * пересобирал итог и не слал дубль после краха. */
+  finish?: string;
+}
+
+// §6 r11: манифест зависимостей считается строго в rootDir плагина или
+// в корне копии — вложенные package.json (фикстуры) не триггерят.
+const LOCKFILE_NAMES = new Set([
+  "package.json",
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "bun.lockb",
+  "bun.lock",
+  "Cargo.lock",
+  "poetry.lock",
+  "Gemfile.lock",
+  "go.sum",
+  "composer.lock",
+]);
+
+/** §18.5: эффективные таймауты записи выкладки — проект из настройки,
+ * иначе дефолты §18.5. */
+async function releaseTiming(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+): Promise<ResolvedTiming> {
+  const cfg = deps.loadReleaseConfig().config;
+  if (!cfg) return DEFAULT_TIMING;
+  let pid = row.settings_project_id;
+  if (!pid) {
+    try {
+      pid = await settingsProjectId(deps, row.repo_path, row.project_id, cfg);
+    } catch {
+      return DEFAULT_TIMING;
+    }
+  }
+  return resolveProject(cfg, pid).timing;
+}
+
+/** §6 r11: пути, изменённые выкладкой remote_base_sha..published_sha в
+ * основном каталоге — материал для `when` (glob ANY). Диапазон не
+ * вычислился → null → все команды идут (§6 r11). */
+async function publishedChangedPaths(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+  mainDir: string,
+): Promise<string[] | null> {
+  const base = row.remote_base_sha;
+  const head = row.published_sha ?? row.head_sha;
+  if (!base || !head || base === EMPTY_TREE_SHA) return null;
+  const res = await deps.cmd
+    .run("git", ["-C", mainDir, "diff", "--name-only", `${base}..${head}`], {
+      timeoutMs: 60_000,
+    })
+    .catch(() => null);
+  if (!res || res.exitCode !== 0) return null;
+  return res.stdout.split("\n").filter(Boolean);
+}
+
 /**
- * §6 r10: after a push release the configured checkout is fetched,
- * fast-forwarded to `origin/<target>` and the changed plugin dirs are
- * reloaded — dirs with a changed package manifest need `npm ci`,
- * providers with running turns are postponed, the orchestrator plugin
- * reloads itself through a one-shot bb automation (`selfReload`).
- * The base sha is recorded in plugin_meta BEFORE the ff so a crash
- * mid-step can be resumed by the досмотр tick.
+ * §6 r11 (PLUG-245): послевыкладочные шаги — обновление настроенной
+ * копии (опционально), произвольные команды через общий запускатель
+ * (журнал command_runs, событие ORCH_EVENT), перезагрузка плагинов по
+ * реестру установленных (любая раскладка: rootDir записи внутри копии +
+ * изменённые файлы под ним). Всё resumable: base в plugin_meta,
+ * состояние команд в журнале — повтор такта работу не дублирует.
  */
 async function runPostPublish(
   deps: ReleaseDeps,
   row: ReleaseRow,
+  event: "release.published" | "pr.merged",
 ): Promise<PostPublishResult> {
-  const cfg = deps.loadReleaseConfig().config;
-  if (!cfg) return { summary: null, selfReload: null };
-  const fail = (msg: string): PostPublishResult => ({
-    summary: `postPublish: ${msg}`,
+  const groupKey = `pp:${row.id}`;
+  const done = (summary: string | null = null): PostPublishResult => {
+    // PLUG-245 заход 4 (ревью Б1): любой done снимает замок копии.
+    // Ранние выходы (нет настроек, проект не определён, `on` не совпал)
+    // иначе оставляют замок от прошлого такта навсегда — с замком по
+    // экземпляру следующие выкладки его уже не ломают. Идемпотентно.
+    releasePostPublishLock(row.id);
+    return { done: true, summary, selfReload: null };
+  };
+  const pending: PostPublishResult = {
+    done: false,
+    summary: null,
     selfReload: null,
-  });
-  // §6 (r8) п.6: the recorded settings project wins; pre-r8 rows
-  // resolve anew — never the delegation project silently. A resolver
-  // error means postPublish does not run (fail closed).
+  };
+  // §18.5 (ревью заход 4): ранние выходы смотрят журнал группы — пока
+  // команда выкладки запущена, итог не отдаётся и замок держится даже
+  // при сломанной/убранной настройке; ждущие queued переводятся в
+  // skipped, чтобы pump их не запустил после ушедшего итога.
+  const earlyDone = (
+    summary: string | null = null,
+  ): PostPublishResult => {
+    const rows = deps.store.commandRunsByGroup(groupKey);
+    if (rows.some((r) => r.status === "running")) return pending;
+    const at = deps.now?.() ?? Date.now();
+    for (const r of rows) {
+      if (r.status === "queued") {
+        deps.store.skipQueuedCommandRun(r.id, "настройка сменилась", at);
+      }
+    }
+    return done(summary);
+  };
+  const cfg = deps.loadReleaseConfig().config;
+  if (!cfg) return earlyDone();
+  const fail = (msg: string): PostPublishResult =>
+    earlyDone(`postPublish: ${msg}`);
+  // §6 (r8) п.6: записанный проект настройки; у pre-r8 записей после
+  // публикации postPublish пропускается с причиной — публикация валидна.
   let projectId: string;
   try {
     projectId =
@@ -3193,231 +3496,498 @@ async function runPostPublish(
   }
   const project = resolveProject(cfg, projectId);
   const pp = project.postPublish;
-  if (!pp) return { summary: null, selfReload: null };
+  const want = event === "pr.merged" ? "merged" : "published";
+  if (!pp || pp.on !== want) return earlyDone();
+  const now = deps.now?.() ?? Date.now();
+  const mainDir =
+    row.repo_root ??
+    (await realpath(row.repo_path).catch(() => row.repo_path));
+  const pushedBranch =
+    row.target_action === "push"
+      ? row.target_branch
+      : (row.publish_branch ?? row.branch);
+  const cmdEnv = {
+    ORCH_EVENT: event,
+    ORCH_TASK: row.task_key,
+    ORCH_SHA:
+      (event === "pr.merged" ? row.pr_merge_sha : row.published_sha) ??
+      row.published_sha ??
+      row.head_sha ??
+      "",
+    ORCH_BRANCH: pushedBranch,
+    ORCH_TARGET: row.target_branch,
+    ORCH_REPO_DIR: mainDir,
+  };
+  const specOf = (c: ResolvedPostPublishCommand, cwd: string) => ({
+    source: "postPublish",
+    runKey: `${groupKey}:${c.name}`,
+    groupKey,
+    name: c.name,
+    argv: c.argv,
+    cwd,
+    env: cmdEnv,
+    timeoutSec: c.timeoutSec ?? project.timing.commandTimeoutSec,
+  });
+  // §18.2: cwd без значения — checkout, если он настроен, иначе
+  // каталог репозитория; относительный путь — от каталога репозитория
+  // (не от cwd процесса bb).
+  const cmdCwd = (c: ResolvedPostPublishCommand): string => {
+    if (c.cwd === "checkout") return pp.checkout ?? mainDir;
+    if (c.cwd === undefined) return pp.checkout ?? mainDir;
+    return isAbsolute(c.cwd) ? c.cwd : join(mainDir, c.cwd);
+  };
+
+  // ── метка состояния postPublish (переживает такты и рестарты) ──
+  const markerKey = POSTPUBLISH_META(row.id);
+  let meta: PostPublishMeta = {};
+  try {
+    meta = JSON.parse(
+      deps.store.metaGet(markerKey) ?? "{}",
+    ) as PostPublishMeta;
+  } catch {
+    meta = {};
+  }
+  if (meta.startedAt === undefined) {
+    meta.startedAt = now;
+    deps.store.metaSet(markerKey, JSON.stringify(meta));
+  }
+  const saveMeta = () =>
+    deps.store.metaSet(markerKey, JSON.stringify(meta));
+
+  // §18.5 (заход 3 Б2): срок — только на ожидание. Пока у выкладки
+  // есть running команда — итог не отдаётся и замок держится (её
+  // ограничивает свой timeoutSec); счётчик ожидания обнуляется.
+  const groupRuns = deps.store.commandRunsByGroup(groupKey);
+  const waitMs =
+    (project.timing.postPublishWaitMinutes ??
+      POSTPUBLISH_MAX_MS / 60_000) * 60_000;
+  if (groupRuns.some((r) => r.status === "running")) {
+    if (meta.waitSince !== undefined) {
+      delete meta.waitSince;
+      saveMeta();
+    }
+  } else {
+    meta.waitSince ??= now;
+    if (now - meta.waitSince >= waitMs) {
+      const waiting =
+        pp.checkout && !postPublishLocks.has(row.id)
+          ? "замка копии"
+          : groupRuns.some((r) => r.status === "queued")
+            ? "очереди команд"
+            : "завершения шагов";
+      // Уже сделанное не теряем: итог копии и завершённые команды идут
+      // в строку рядом с «не дождались <чего>» (заход 4, ревью).
+      const bits: string[] = [];
+      if (pp.checkout) {
+        bits.push(meta.copy ? "копия обновлена" : "копия не обновлена");
+      }
+      for (const c of pp.commands) {
+        const r = deps.store.commandRunByKey(`${groupKey}:${c.name}`);
+        if (r && r.status !== "queued" && r.status !== "running") {
+          bits.push(commandRunBit(c.name, r));
+        }
+      }
+      for (const c of pp.commands) {
+        deps.store.markCommandRunSkipped(
+          specOf(c, cmdCwd(c)),
+          `не дождались ${waiting}`,
+          now,
+        );
+      }
+      releasePostPublishLock(row.id);
+      return fail([...bits, `не дождались ${waiting}`].join("; "));
+    }
+    saveMeta();
+  }
+
+  // ── копия: тот же репозиторий → ветка → замок → fetch → base → ff ──
+  let copyOk = false;
+  let copyErr: string | null = null;
+  let newHead = "";
+  let copyChanged: string[] = [];
   const co = pp.checkout;
   const gitOut = async (args: string[]) =>
     (
-      await deps.cmd.run("git", ["-C", co, ...args], { timeoutMs: 120_000 })
+      await deps.cmd.run("git", ["-C", co!, ...args], {
+        timeoutMs: 120_000,
+      })
     ).stdout.trim();
-  const coOriginRaw = await gitOut(["remote", "get-url", "origin"]).catch(
-    () => "",
-  );
-  const repoOriginRaw = await git(
-    deps,
-    row.repo_path,
-    ["remote", "get-url", "origin"],
-    { allowFail: true },
-  );
-  const coNorm = normalizeGitRemoteUrl(coOriginRaw);
-  const repoNorm = normalizeGitRemoteUrl(repoOriginRaw);
-  // A remote with a host normalizes — those compare by host/path. A
-  // local path remote does not: compare its realpath instead.
-  const sameRepo =
-    coNorm != null && repoNorm != null
-      ? coNorm === repoNorm
-      : coOriginRaw !== "" &&
-        coOriginRaw === repoOriginRaw ||
-        (coNorm == null &&
-          repoNorm == null &&
-          (await realpath(coOriginRaw).catch(() => coOriginRaw)) ===
-            (await realpath(repoOriginRaw).catch(() => repoOriginRaw)));
-  if (!sameRepo) {
-    return fail("другой репозиторий — не обновлена");
-  }
-  const curBranch = await gitOut(["symbolic-ref", "--short", "-q", "HEAD"]).catch(
-    () => "",
-  );
-  if (curBranch !== pp.branch) {
-    return fail(`копия не на ${pp.branch} — не обновлена`);
-  }
-  const markerKey = POSTPUBLISH_META(row.id);
-  let base = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
-  const saved = deps.store.metaGet(markerKey);
-  if (saved) {
+  const coGit: MergeGit = (args, opts) =>
+    deps.cmd
+      .run("git", ["-C", co!, ...args], {
+        timeoutMs: opts?.timeoutMs ?? 120_000,
+      })
+      .then((r) => ({
+        exitCode: r.exitCode,
+        stdout: r.stdout,
+        stderr: r.stderr,
+      }));
+  // §18.5: замок копии держится весь postPublish — и по командам в
+  // полёте (их cwd по умолчанию — копия), и по перезагрузке. Мапа
+  // in-memory: после рестарта замок перевооружается, протухший замок
+  // умершего экземпляра ломается по владельцу (PLUG-245 Б2).
+  const ensureCopyLock = async (): Promise<boolean> => {
+    if (!co || postPublishLocks.has(row.id)) return true;
+    // §18.5: флаг «остановлен» — идущий такт новых замков не берёт.
+    if (deps.commandRunner?.isStopped?.()) return false;
+    const gitDir = await gitOut(["rev-parse", "--absolute-git-dir"]).catch(
+      () => "",
+    );
+    const lockPath = join(gitDir || join(co, ".git"), MERGE_LOCK_NAME);
     try {
-      const m = JSON.parse(saved) as { base?: string };
-      if (m.base) base = m.base;
-    } catch {
-      // malformed marker — the fresh base wins
-    }
-  } else if (base) {
-    deps.store.metaSet(markerKey, JSON.stringify({ base }));
-  }
-  const fetchRes = await deps.cmd.run(
-    "git",
-    ["-C", co, "fetch", "origin"],
-    { timeoutMs: 180_000 },
-  );
-  if (fetchRes.exitCode !== 0) {
-    return fail(`fetch не удался: ${(fetchRes.stderr || "").slice(0, 200)}`);
-  }
-  const ffRes = await deps.cmd.run(
-    "git",
-    ["-C", co, "merge", "--ff-only", `origin/${row.target_branch}`],
-    { timeoutMs: 120_000 },
-  );
-  if (ffRes.exitCode !== 0) {
-    return fail(
-      `ff не прошёл — перезагрузки нет ` +
-        `(${(ffRes.stderr || ffRes.stdout || "").trim().slice(0, 200)})`,
-    );
-  }
-  const newHead = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
-  // Метка base НЕ удаляется здесь — до сохранения итоговой строки
-  // (notice_text). Падение между ff/перезагрузками и строкой
-  // досматривается повторным проходом с той же базы; метку снимает
-  // finishPublished сразу после setReleaseNotice (п.5: повтор такта
-  // только переотправляет сохранённый текст, работу не повторяет).
-  if (!pp.reloadPlugins) {
-    return {
-      summary: "postPublish: копия обновлена; перезагрузка плагинов выключена",
-      selfReload: null,
-    };
-  }
-  const changed = base
-    ? (await gitOut(["diff", "--name-only", `${base}..${newHead}`]).catch(
-        () => "",
-      ))
-        .split("\n")
-        .filter(Boolean)
-    : [];
-  const dirs = [
-    ...new Set(
-      changed
-        .filter((p) => p.startsWith("plugins/"))
-        .map((p) => p.split("/")[1]!)
-        .filter(Boolean),
-    ),
-  ];
-  if (!dirs.length) {
-    return {
-      summary: "postPublish: копия обновлена — плагины не менялись",
-      selfReload: null,
-    };
-  }
-  const list = await runJson<unknown>(deps.bbCli, [
-    "plugin",
-    "list",
-    "--json",
-  ]).catch(() => null);
-  const entries = (Array.isArray(list)
-    ? list
-    : ((list as { plugins?: unknown[] })?.plugins ?? [])
-  ) as { id?: string; name?: string; rootDir?: string; dir?: string; path?: string }[];
-  const coReal = await realpath(co).catch(() => co);
-  // Ревью PLUG-244 заход 1 (Н6): плагин перезагружается только когда он
-  // установлен ИЗ этой копии — rootDir записи ровно
-  // <checkout>/plugins/<dir> (суффиксный матч перезагружал плагины,
-  // стоящие из других копий). Не найден — пропуск, без reload по имени
-  // каталога.
-  const pluginId = async (dir: string): Promise<string | null> => {
-    const dirReal = await realpath(join(co, "plugins", dir)).catch(
-      () => join(co, "plugins", dir),
-    );
-    for (const e of entries) {
-      const root = e.rootDir ?? e.dir ?? e.path;
-      if (!root) continue;
-      const rootReal = await realpath(root).catch(() => root);
-      if (
-        rootReal === dirReal ||
-        rootReal === join(coReal, "plugins", dir)
-      ) {
-        return e.id ?? null;
+      const release = await acquireCopyLock(coGit, co, lockPath, {
+        owner: deps.instanceId ?? `postPublish:${process.pid}`,
+      });
+      // §18.5 (заход 4): stop мог прийти, пока ждали acquire — такой
+      // замок не числится в карте и не снимется stopAll, отпускаем сразу.
+      if (deps.commandRunner?.isStopped?.()) {
+        release();
+        return false;
       }
+      postPublishLocks.set(row.id, release);
+      return true;
+    } catch (e) {
+      // §6 r11: копия занята merge — такт уходит, команды ждут.
+      deps.log?.warn?.(
+        `orchestrator: postPublish lock ${row.task_key}: ${message(e)}`,
+      );
+      return false;
     }
-    return null;
   };
-  // Ревью PLUG-244 (Б2 + заход 2): «провайдер с ходами» сопоставляется
-  // по реестру — `bb provider list` отдаёт каждому провайдеру его
-  // pluginId (`acp-devin` → `provider-devin`), а не угадыванием по
-  // строке. Реестр не прочитался (null) → спека §2 п.2: пропуск ВСЕХ
-  // плагинов-провайдеров, даже без ходов — по единственному доступному
-  // признаку (provider в id).
-  let providersByPlugin: Map<string, Set<string>> | null | undefined;
-  const providerIdsOf = async (
-    id: string,
-  ): Promise<Set<string> | null> => {
-    if (providersByPlugin === undefined) {
-      providersByPlugin = null;
-      const list = await runJson<unknown>(deps.bbCli, [
-        "provider",
-        "list",
-        "--json",
-      ]).catch(() => null);
-      if (list != null) {
-        providersByPlugin = new Map();
-        const ps = (Array.isArray(list)
-          ? list
-          : ((list as { providers?: unknown[] })?.providers ?? [])) as {
-          id?: string;
-          pluginId?: string;
-        }[];
-        for (const p of ps) {
-          if (!p.id || !p.pluginId) continue;
-          const bucket =
-            providersByPlugin.get(p.pluginId) ?? new Set<string>();
-          bucket.add(p.id);
-          providersByPlugin.set(p.pluginId, bucket);
+  if (co) {
+    if (meta.copy) {
+      // ff уже сделан прошлым тактом — поздний сбой fetch его не
+      // отменяет и повторного прогона нет (ревью: fetch/ff/diff каждые
+      // 5 с, пока команды в полёте).
+      copyOk = true;
+      newHead = meta.copy.head;
+      copyChanged = meta.copy.changed;
+    } else {
+      // §6 r11: сначала «тот же репозиторий» — замок чужой копии не
+      // берём (ревью: замок до проверки origin).
+      const coOriginRaw = await gitOut(["remote", "get-url", "origin"]).catch(
+        () => "",
+      );
+      const repoOriginRaw = await git(
+        deps,
+        row.repo_path,
+        ["remote", "get-url", "origin"],
+        { allowFail: true },
+      );
+      const coNorm = normalizeGitRemoteUrl(coOriginRaw);
+      const repoNorm = normalizeGitRemoteUrl(repoOriginRaw);
+      const sameRepo =
+        coNorm != null && repoNorm != null
+          ? coNorm === repoNorm
+          : (coOriginRaw !== "" && coOriginRaw === repoOriginRaw) ||
+            (coNorm == null &&
+              repoNorm == null &&
+              (await realpath(coOriginRaw).catch(() => coOriginRaw)) ===
+                (await realpath(repoOriginRaw).catch(() => repoOriginRaw)));
+      if (!sameRepo) {
+        copyErr = "другой репозиторий — не обновлена";
+      } else {
+        const curBranch = await gitOut([
+          "symbolic-ref",
+          "--short",
+          "-q",
+          "HEAD",
+        ]).catch(() => "");
+        if (curBranch !== pp.branch) {
+          copyErr = `копия не на ${pp.branch} — не обновлена`;
+        } else {
+          // §18.5: команды с cwd:checkout держат замок на копию весь
+          // postPublish. Владелец — экземпляр плагина (не pid), состояние
+          // branch/head не записывается: протухший замок умершего
+          // экземпляра ломается без restoreCopy (PLUG-245 Б2).
+          if (!(await ensureCopyLock())) return pending;
+          let base = meta.base;
+          if (!base) {
+            base = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
+            if (base) {
+              meta.base = base;
+              saveMeta();
+            }
+          }
+          const fetchRes = await deps.cmd.run(
+            "git",
+            ["-C", co, "fetch", "origin"],
+            { timeoutMs: 180_000 },
+          );
+          if (fetchRes.exitCode !== 0) {
+            copyErr =
+              `fetch не удался: ` +
+              `${maskCommandOutput(fetchRes.stderr || "")}`;
+          } else {
+            const ffRes = await deps.cmd.run(
+              "git",
+              ["-C", co, "merge", "--ff-only", `origin/${row.target_branch}`],
+              { timeoutMs: 120_000 },
+            );
+            if (ffRes.exitCode !== 0) {
+              copyErr =
+                `ff не прошёл ` +
+                `(${maskCommandOutput(ffRes.stderr || ffRes.stdout || "")})`;
+            } else {
+              copyOk = true;
+              newHead = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
+              copyChanged = base
+                ? (
+                    await gitOut([
+                      "diff",
+                      "--name-only",
+                      `${base}..${newHead}`,
+                    ]).catch(() => "")
+                  )
+                    .split("\n")
+                    .filter(Boolean)
+                : [];
+              meta.copy = { head: newHead, changed: copyChanged };
+              saveMeta();
+            }
+          }
         }
       }
     }
-    if (providersByPlugin == null) return null;
-    return providersByPlugin.get(id) ?? new Set();
-  };
-  const running = deps.store.listByStatuses(ACTIVE_STATUSES);
-  const reloaded: string[] = [];
-  const skipped: string[] = [];
-  let selfReload: { checkout: string; expectedSha: string } | null = null;
-  // Тексты пропусков и ошибок — ровно формулировки спеки §2 п.2
-  // (аудит выкладки сверяет «код ↔ спека» посимвольно).
-  for (const dir of dirs) {
-    const id = await pluginId(dir);
-    if (!id) {
-      skipped.push(`${dir}: не установлен из копии`);
+  }
+
+  // ── постановка команд: следующая — только после итога предыдущей ──
+  // (PLUG-245 Б1: очередь всех сразу обгоняла stopOnFail между тактами
+  // и после рестарта; журнал run_key остаётся идемпотентным).
+  const pubPaths =
+    meta.pub !== undefined
+      ? meta.pub
+      : await publishedChangedPaths(deps, row, mainDir);
+  if (meta.pub === undefined) {
+    meta.pub = pubPaths;
+    saveMeta();
+  }
+  // §18.2: stopOnFail — исход «не ok» обязательной команды пропускает
+  // все поздние; «не прошла <имя>» — по имени остановившей. Пропуск по
+  // `when` («нет изменений») — не сбой и цепочку не останавливает.
+  const SKIP_WHEN = "нет изменений по when";
+  const stopsChain = (status: string, tail: string | null): boolean =>
+    status !== "ok" && !(status === "skipped" && tail === SKIP_WHEN);
+  let stopper: string | null = null;
+  let earlierInFlight = false;
+  for (const c of pp.commands) {
+    const runKey = `${groupKey}:${c.name}`;
+    const r = deps.store.commandRunByKey(runKey);
+    if (r && r.status !== "queued" && r.status !== "running") {
+      if (
+        stopper === null &&
+        c.stopOnFail &&
+        stopsChain(r.status, r.output_tail)
+      ) {
+        stopper = c.name;
+      }
       continue;
     }
-    if (
-      changed.some(
-        (p) =>
-          p === `plugins/${dir}/package.json` ||
-          p === `plugins/${dir}/package-lock.json`,
-      )
-    ) {
-      skipped.push(`${id}: изменены зависимости — нужен npm ci`);
-      continue;
-    }
-    const pids = await providerIdsOf(id);
-    if (pids == null && /provider/.test(id)) {
-      skipped.push(`${id}: реестр провайдеров не прочитан — перезагрузи вручную`);
-      continue;
-    }
-    if (
-      pids != null &&
-      pids.size > 0 &&
-      running.some((d) => pids.has(d.provider))
-    ) {
-      skipped.push(`${id}: идут ходы — перезагрузи позже`);
-      continue;
-    }
-    if (id === "orchestrator" || dir === "bb-plugin-orchestrator") {
-      selfReload = { checkout: co, expectedSha: newHead };
-      continue;
-    }
-    const r = await deps.bbCli.run(["plugin", "reload", id]);
-    if (r.exitCode !== 0) {
-      skipped.push(
-        `${id}: перезагрузка не удалась: ` +
-          `${(r.stderr || r.stdout || "").trim().slice(0, 120)}`,
+    if (stopper !== null) {
+      deps.store.markCommandRunSkipped(
+        specOf(c, cmdCwd(c)),
+        `не прошла ${stopper}`,
+        now,
       );
+      continue;
+    }
+    if (earlierInFlight) continue; // ждёт итога предыдущей — не ставим
+    if (r) {
+      earlierInFlight = true;
+      continue;
+    }
+    let reason: string | null = null;
+    // §6 r11 (заход 3 Б3): «копия не обновлена» — по ФАКТИЧЕСКОМУ cwd:
+    // явный "checkout" или cwd по умолчанию при заданном checkout
+    // (иначе команда выполнилась бы в необновлённой/чужой копии).
+    if (c.cwd === "checkout" && !co) {
+      reason = "нет checkout";
+    } else if (
+      co &&
+      !copyOk &&
+      (c.cwd === "checkout" || c.cwd === undefined)
+    ) {
+      reason = "копия не обновлена";
+    }
+    if (
+      !reason &&
+      c.when?.length &&
+      pubPaths !== null &&
+      !c.when.some((w) => pubPaths.some((p) => globMatch(w, p)))
+    ) {
+      reason = SKIP_WHEN;
+    }
+    if (reason) {
+      deps.store.markCommandRunSkipped(specOf(c, cmdCwd(c)), reason, now);
+      if (c.stopOnFail && reason !== SKIP_WHEN) stopper = c.name;
     } else {
-      reloaded.push(id);
+      deps.store.enqueueCommandRun(specOf(c, cmdCwd(c)), now);
+      earlierInFlight = true;
     }
   }
-  const bits = ["postPublish: копия обновлена"];
-  if (reloaded.length) bits.push(`перезагружено: ${reloaded.join(", ")}`);
-  if (skipped.length) bits.push(`пропущено: ${skipped.join(", ")}`);
-  if (selfReload) bits.push("orchestrator перезагружается автоматизацией");
-  return { summary: bits.join("; "), selfReload };
+  const rowsByCmd = pp.commands.map(
+    (c) => [c, deps.store.commandRunByKey(`${groupKey}:${c.name}`)] as const,
+  );
+  if (
+    rowsByCmd.some(
+      ([, r]) => !r || r.status === "queued" || r.status === "running",
+    )
+  ) {
+    // Команды в полёте — замок копии держим и после рестарта (их cwd по
+    // умолчанию — копия); занят merge — ждём следующего такта.
+    if (!(await ensureCopyLock())) return pending;
+    await deps.commandRunner?.pump();
+    return pending;
+  }
+  const bits: string[] = [];
+  if (co) {
+    bits.push(copyOk ? "копия обновлена" : (copyErr ?? "копия не обновлена"));
+  }
+  for (const [c, r] of rowsByCmd) {
+    if (!r) continue;
+    bits.push(commandRunBit(c.name, r));
+  }
+
+  // ── перезагрузка плагинов (r11: любая раскладка, по реестру) ──
+  let selfReload: { rootDir: string; expectedSha: string } | null = null;
+  if (co && copyOk && !stopper) {
+    // Перезагрузка — под тем же замком копии, что и ff (§18.5).
+    if (!(await ensureCopyLock())) return pending;
+    if (!pp.reloadPlugins) {
+      bits.push("перезагрузка плагинов выключена");
+    } else {
+      const installsDepsOk = rowsByCmd.some(
+        ([c, r]) => c.installsDeps && r?.status === "ok",
+      );
+      const list = await runJson<unknown>(deps.bbCli, [
+        "plugin",
+        "list",
+        "--json",
+      ]).catch(() => null);
+      const entries = (Array.isArray(list)
+        ? list
+        : ((list as { plugins?: unknown[] })?.plugins ?? [])) as {
+        id?: string;
+        name?: string;
+        rootDir?: string;
+        dir?: string;
+        path?: string;
+      }[];
+      let providersByPlugin: Map<string, Set<string>> | null | undefined;
+      const providerIdsOf = async (
+        id: string,
+      ): Promise<Set<string> | null> => {
+        if (providersByPlugin === undefined) {
+          providersByPlugin = null;
+          const pl = await runJson<unknown>(deps.bbCli, [
+            "provider",
+            "list",
+            "--json",
+          ]).catch(() => null);
+          if (pl != null) {
+            providersByPlugin = new Map();
+            const ps = (Array.isArray(pl)
+              ? pl
+              : ((pl as { providers?: unknown[] })?.providers ?? [])) as {
+              id?: string;
+              pluginId?: string;
+            }[];
+            for (const p of ps) {
+              if (!p.id || !p.pluginId) continue;
+              const bucket =
+                providersByPlugin.get(p.pluginId) ?? new Set<string>();
+              bucket.add(p.id);
+              providersByPlugin.set(p.pluginId, bucket);
+            }
+          }
+        }
+        if (providersByPlugin == null) return null;
+        return providersByPlugin.get(id) ?? new Set();
+      };
+      const coReal = await realpath(co).catch(() => co);
+      const running = deps.store.listByStatuses(ACTIVE_STATUSES);
+      const reloaded: string[] = [];
+      const skipped: string[] = [];
+      // §6 r11: кандидат — плагин, чей rootDir лежит внутри копии и у
+      // которого есть изменённые файлы base..HEAD под ним. Корень копии
+      // = rootDir → любой diff триггерит. Пути вне rootDir — молча.
+      for (const e of entries) {
+        const id = e.id;
+        const root = e.rootDir ?? e.dir ?? e.path;
+        if (!id || !root) continue;
+        const rootReal = await realpath(root).catch(() => root);
+        const rel = relative(coReal, rootReal);
+        if (rel.startsWith("..") || isAbsolute(rel)) continue;
+        const prefix = rel === "" ? "" : `${rel}/`;
+        const touched = copyChanged.filter(
+          (p) => prefix === "" || p.startsWith(prefix),
+        );
+        if (!touched.length) continue;
+        // Манифест зависимостей строго в rootDir плагина или в корне
+        // копии — вложенные package.json (фикстуры) не считаются.
+        const depsTouched =
+          touched.some((p) =>
+            LOCKFILE_NAMES.has(p.slice(prefix.length)),
+          ) ||
+          copyChanged.some(
+            (p) => !p.includes("/") && LOCKFILE_NAMES.has(p),
+          );
+        if (depsTouched && !installsDepsOk) {
+          skipped.push(
+            `${id}: изменены зависимости — переустанови их и ` +
+              `перезагрузи вручную`,
+          );
+          continue;
+        }
+        const pids = await providerIdsOf(id);
+        if (pids == null) {
+          skipped.push(
+            `${id}: реестр провайдеров не прочитан — перезагрузи вручную`,
+          );
+          continue;
+        }
+        if (pids.size > 0 && running.some((d) => pids.has(d.provider))) {
+          skipped.push(`${id}: идут ходы — перезагрузи позже`);
+          continue;
+        }
+        if (id === "orchestrator") {
+          // §6 r11: самоперезагрузка — когда в журнале нет running.
+          if (deps.store.runningCommandRuns().length > 0) {
+            skipped.push(
+              "orchestrator: идут команды — перезагрузи позже",
+            );
+            continue;
+          }
+          selfReload = { rootDir: rootReal, expectedSha: newHead };
+          continue;
+        }
+        const r = await deps.bbCli.run(["plugin", "reload", id]);
+        if (r.exitCode !== 0) {
+          skipped.push(
+            `${id}: перезагрузка не удалась: ` +
+              `${(r.stderr || r.stdout || "").trim().slice(0, 120)}`,
+          );
+        } else {
+          reloaded.push(id);
+        }
+      }
+      if (reloaded.length) bits.push(`перезагружено: ${reloaded.join(", ")}`);
+      if (skipped.length) bits.push(`пропущено: ${skipped.join(", ")}`);
+      if (selfReload) {
+        bits.push("orchestrator перезагружается автоматизацией");
+      }
+      if (!reloaded.length && !skipped.length && !selfReload) {
+        bits.push("плагины не менялись");
+      }
+    }
+  }
+  releasePostPublishLock(row.id);
+  if (!bits.length) return { done: true, summary: null, selfReload };
+  return {
+    done: true,
+    summary: `postPublish: ${bits.join("; ")}`,
+    selfReload,
+  };
 }
 
 /**
@@ -3432,17 +4002,17 @@ async function createSelfReloadAutomation(
   deps: ReleaseDeps,
   row: ReleaseRow,
   line: string,
-  selfReload: { checkout: string; expectedSha: string },
+  selfReload: { rootDir: string; expectedSha: string },
 ): Promise<string | null> {
+  // §6 r11: значения в скрипт — base64, не интерполяцией в shell.
+  const b64 = (v: string) => Buffer.from(v, "utf8").toString("base64");
+  const dec = (v: string) => `$(printf %s '${b64(v)}' | base64 -d)`;
   const script = [
     "#!/bin/sh",
-    `COORD='${row.coordinator_thread_id}'`,
-    `EXPECTED='${selfReload.expectedSha}'`,
-    `ROOT='${join(selfReload.checkout, "plugins", "bb-plugin-orchestrator")}'`,
-    "TEXT=$(cat <<'BB_PP_EOF'",
-    `[orchestrator] ${line}`,
-    "BB_PP_EOF",
-    ")",
+    `COORD=${dec(row.coordinator_thread_id)}`,
+    `EXPECTED=${dec(selfReload.expectedSha)}`,
+    `ROOT=${dec(selfReload.rootDir)}`,
+    `TEXT=${dec(`[orchestrator] ${line}`)}`,
     "sleep 15",
     "bb plugin reload orchestrator >/dev/null 2>&1 || true",
     "i=0",
