@@ -35,7 +35,11 @@ import {
   type DispatchStepsResult,
   type SetupError,
 } from "./delegate.js";
-import { parseAuditVerdict, verdictInBody } from "./release.js";
+import {
+  deliverReleaseNotice,
+  parseAuditVerdict,
+  verdictInBody,
+} from "./release.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -2337,19 +2341,28 @@ export function createWatchdog(deps: WatchdogDeps) {
           // отклонённая/отсутствующая выкладка строки не получает.
           if (row.level === RELEASE_AUDIT_LEVEL) {
             const release = store.activeReleaseByTask(row.task_key);
+            // «без вердикта» отклоняет только аудит: publishing —
+            // середина публикации, её исход решает насос (ревью заход 2).
+            // Строка пишется в записи атомарно с переходом (п.5 r10) и
+            // уходит тем же протоколом доставки, что строки насоса.
             if (
               release &&
               store.transitionReleaseStatus(
                 release.id,
-                ["auditing", "publishing"],
+                ["auditing"],
                 "rejected",
                 "аудит без вердикта",
+                {
+                  kind: "rejected",
+                  text:
+                    `аудит выкладки ${row.task_key} без вердикта — ` +
+                    `выкладка отклонена`,
+                },
               )
             ) {
-              await report(
-                row,
-                `аудит выкладки ${row.task_key} без вердикта — ` +
-                  `выкладка отклонена`,
+              await deliverReleaseNotice(
+                deps,
+                store.getRelease(release.id) ?? release,
               );
             }
           }

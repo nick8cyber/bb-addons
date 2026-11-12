@@ -1244,24 +1244,8 @@ function assertInstalledHookFresh(deps: ReleaseDeps): void {
 
 // ── Notify / comment helpers ───────────────────────────────────────────
 
-async function notifyCoordinator(
-  deps: ReleaseDeps,
-  row: ReleaseRow,
-  text: string,
-): Promise<void> {
-  try {
-    await deps.threads.send({
-      threadId: row.coordinator_thread_id,
-      mode: "queue-if-active",
-      input: [{ type: "text", text: `[orchestrator] ${text}`, mentions: [] }],
-    });
-  } catch (e) {
-    deps.log?.warn?.(`orchestrator: release notify: ${message(e)}`);
-  }
-}
-
 async function commentOnTask(
-  deps: ReleaseDeps,
+  deps: { bbCli: BbCli; log?: { warn?(m: string): void } },
   taskKey: string,
   text: string,
 ): Promise<void> {
@@ -1277,15 +1261,6 @@ async function commentOnTask(
     deps.log?.warn?.(`orchestrator: release comment: ${message(e)}`);
   }
 }
-
-const report = async (
-  deps: ReleaseDeps,
-  row: ReleaseRow,
-  text: string,
-) => {
-  await notifyCoordinator(deps, row, text);
-  await commentOnTask(deps, row.task_key, text);
-};
 
 // ── runRelease: steps 1–5 dispatch ─────────────────────────────────────
 
@@ -2376,19 +2351,38 @@ const PR_WATCH_INTERVAL_MS = 5 * 60 * 1000;
 /** §2 r10 п.3: 72 h — closed-wait window and the stale mark. */
 const PR_STALE_MS = 72 * 60 * 60 * 1000;
 
-/** §2 r10 п.5: the outcome line goes out under a -1 claim captured
- * BEFORE the send and confirmed after — a stale claim (2 min, the
- * claimResultDelivery protocol) is retaken by the next tick. A lost
- * send beats a lost line; a rare duplicate is accepted (spec). */
-async function outcomeLine(
-  deps: ReleaseDeps,
+/** The deps subset a release-notice delivery needs — pumpReleases and
+ * the r31 watchdog share it. */
+export interface ReleaseNoticeDeps {
+  store: DelegationStore;
+  threads: {
+    send(args: {
+      threadId: string;
+      mode: "queue-if-active";
+      input: unknown[];
+    }): Promise<unknown>;
+  };
+  bbCli: BbCli;
+  log?: { warn?(m: string): void };
+}
+
+/** §2 r10 п.5: the outcome line is SAVED first (`notice_text`) and only
+ * then sent — a tick retry resends the stored text, never reruns the
+ * work that produced it. The send itself runs under a claim captured
+ * before `threads.send` and confirmed after — a stale claim (2 min,
+ * the claimResultDelivery protocol) is retaken by the next tick. A
+ * gone coordinator thread is not an eternal retry: the text lands as
+ * a task comment and the notice is confirmed (spec п.5). */
+export async function deliverReleaseNotice(
+  deps: ReleaseNoticeDeps,
   row: ReleaseRow,
-  text: string,
 ): Promise<boolean> {
   if (!deps.store.claimReleaseNotify(row.id)) return false;
-  // Сообщение в тред координатора — и есть строка п.1: оно бросает,
-  // чтобы временный сбой send снял захват и досмотр повторил отправку
-  // (протокол claimResultDelivery), а не потерял строку навсегда.
+  const text = deps.store.getRelease(row.id)?.notice_text;
+  if (text == null) {
+    deps.store.releaseReleaseNotify(row.id);
+    return false;
+  }
   try {
     await deps.threads.send({
       threadId: row.coordinator_thread_id,
@@ -2398,12 +2392,17 @@ async function outcomeLine(
       ],
     });
   } catch (e) {
+    if (/not.?found|does not exist|deleted|archiv/i.test(message(e))) {
+      await commentOnTask(deps, row.task_key, text);
+      deps.store.confirmReleaseNotify(row.id, text);
+      return true;
+    }
     deps.store.releaseReleaseNotify(row.id);
     deps.log?.warn?.(`orchestrator: release notify: ${message(e)}`);
     return false;
   }
   await commentOnTask(deps, row.task_key, text);
-  deps.store.confirmReleaseNotify(row.id);
+  deps.store.confirmReleaseNotify(row.id, text);
   return true;
 }
 
@@ -2415,11 +2414,19 @@ async function outcomeLine(
  */
 export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
   const s: PumpSummary = { scanning: 0, published: 0, rejected: 0, failed: 0 };
-  // §2 r10 п.5: published rows whose outcome line was never confirmed —
-  // the publish finished but the tick crashed before the line.
-  for (const row of deps.store.pendingPublishNotify()) {
+  // §2 r10 п.5: rows with a saved but undelivered outcome line — the
+  // досмотр resends ONLY the stored text (no post-check, no postPublish,
+  // no automation create — a send failure must not rerun the work every
+  // 5 s, ревью PLUG-244 заход 2 Б1). A published row WITHOUT a saved
+  // line crashed before it was assembled — the work reruns here.
+  for (const row of deps.store.pendingReleaseNotices()) {
     try {
-      await finishPublished(deps, row, null);
+      const fresh = deps.store.getRelease(row.id) ?? row;
+      if (fresh.notice_text != null) {
+        await deliverReleaseNotice(deps, fresh);
+      } else if (fresh.status === "published") {
+        await finishPublished(deps, fresh, null);
+      }
     } catch (e) {
       deps.log?.warn?.(
         `orchestrator release: досмотр ${row.task_key}: ${message(e)}`,
@@ -2439,17 +2446,23 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         if (!row.audit_delegation_id) {
           const age = (deps.now?.() ?? Date.now()) - row.created_at;
           if (age > PREPARE_TIMEOUT_MS) {
-            deps.store.updateRelease(row.id, {
-              status: "failed",
-              error: "выкладка остановилась до раздачи аудита",
-            });
-            s.failed++;
-            await outcomeLine(
-              deps,
-              row,
-              `выкладка ${row.task_key} остановлена до раздачи аудита ` +
-                `— повторите release`,
-            );
+            if (
+              deps.store.transitionReleaseStatus(
+                row.id,
+                ["auditing"],
+                "failed",
+                "выкладка остановилась до раздачи аудита",
+                {
+                  kind: "failed",
+                  text:
+                    `выкладка ${row.task_key} остановлена до раздачи ` +
+                    `аудита — повторите release`,
+                },
+              )
+            ) {
+              s.failed++;
+              await deliverReleaseNotice(deps, row);
+            }
           }
           continue;
         }
@@ -2471,44 +2484,56 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
             (deps.now?.() ?? Date.now()) - root.created_at >
             AUDIT_TIMEOUT_MS
           ) {
-            deps.store.updateRelease(row.id, {
-              status: "failed",
-              error: "аудит не завершился за 30 мин",
-            });
-            s.failed++;
-            if (delegation?.thread_id) {
-              await deps.stepsDeps.threads
-                .stop({ threadId: delegation.thread_id })
-                .catch((e) =>
-                  deps.log?.warn?.(
-                    `orchestrator release: auditor stop: ${message(e)}`,
-                  ),
-                );
+            if (
+              deps.store.transitionReleaseStatus(
+                row.id,
+                ["auditing"],
+                "failed",
+                "аудит не завершился за 30 мин",
+                {
+                  kind: "failed",
+                  text:
+                    `выкладка ${row.task_key} остановлена: аудит не ` +
+                    `завершился за 30 мин — повторите release`,
+                },
+              )
+            ) {
+              s.failed++;
+              if (delegation?.thread_id) {
+                await deps.stepsDeps.threads
+                  .stop({ threadId: delegation.thread_id })
+                  .catch((e) =>
+                    deps.log?.warn?.(
+                      `orchestrator release: auditor stop: ${message(e)}`,
+                    ),
+                  );
+              }
+              await deliverReleaseNotice(deps, row);
             }
-            await outcomeLine(
-              deps,
-              row,
-              `выкладка ${row.task_key} остановлена: аудит не завершился ` +
-                `за 30 мин — повторите release`,
-            );
           }
           continue;
         }
         if (delegation.status !== "done") {
-          deps.store.updateRelease(row.id, {
-            status: "failed",
-            error: `аудит завершился исходом ${delegation.status}`,
-          });
-          s.failed++;
-          await outcomeLine(
-            deps,
-            row,
-            `выкладка ${row.task_key} остановлена: проверяющий агент ` +
-              `завершился исходом ${delegation.status} — ` +
-              (delegation.status === "cancelled"
-                ? "аудит отменён, выкладки нет"
-                : `цепочка ${AUDIT_LEVEL} исчерпана, выкладки нет`),
-          );
+          if (
+            deps.store.transitionReleaseStatus(
+              row.id,
+              ["auditing"],
+              "failed",
+              `аудит завершился исходом ${delegation.status}`,
+              {
+                kind: "failed",
+                text:
+                  `выкладка ${row.task_key} остановлена: проверяющий ` +
+                  `агент завершился исходом ${delegation.status} — ` +
+                  (delegation.status === "cancelled"
+                    ? "аудит отменён, выкладки нет"
+                    : `цепочка ${AUDIT_LEVEL} исчерпана, выкладки нет`),
+              },
+            )
+          ) {
+            s.failed++;
+            await deliverReleaseNotice(deps, row);
+          }
           continue;
         }
         const text = delegation.thread_id
@@ -2516,13 +2541,6 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
           : null;
         const verdict = parseAuditVerdict(text ?? "");
         if (verdict.verdict === "REJECT") {
-          deps.store.updateRelease(row.id, {
-            status: "rejected",
-            error: verdict.unparseable
-              ? "ответ аудитора не парсится"
-              : "REJECT",
-          });
-          s.rejected++;
           const list = verdict.findings
             .slice(0, 15)
             .map(
@@ -2532,13 +2550,24 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
                 (f.fix ? ` → ${maskSecrets(f.fix)}` : ""),
             )
             .join("\n");
-          await outcomeLine(
-            deps,
-            row,
-            `аудит выкладки ${row.task_key}: REJECT` +
-              (verdict.unparseable ? " (ответ не парсится)" : "") +
-              `\n${list || "- без находок в ответе"}`,
-          );
+          if (
+            deps.store.transitionReleaseStatus(
+              row.id,
+              ["auditing"],
+              "rejected",
+              verdict.unparseable ? "ответ аудитора не парсится" : "REJECT",
+              {
+                kind: "rejected",
+                text:
+                  `аудит выкладки ${row.task_key}: REJECT` +
+                  (verdict.unparseable ? " (ответ не парсится)" : "") +
+                  `\n${list || "- без находок в ответе"}`,
+              },
+            )
+          ) {
+            s.rejected++;
+            await deliverReleaseNotice(deps, row);
+          }
           continue;
         }
         deps.store.updateRelease(row.id, { status: "publishing" });
@@ -2546,16 +2575,24 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
       // publishing (fresh or a retry after a crash mid-publish).
       await publishRelease(deps, deps.store.getRelease(row.id) ?? row, s);
     } catch (e) {
-      deps.store.updateRelease(row.id, {
-        status: "failed",
-        error: message(e).slice(0, 400),
-      });
-      s.failed++;
-      await outcomeLine(
-        deps,
-        row,
-        `выкладка ${row.task_key} упала на публикации: ${message(e)}`,
-      );
+      const cur = deps.store.getRelease(row.id) ?? row;
+      // Уже конечная запись (успела опубликоваться или её отклонил
+      // сторож) — строка принадлежит тому, кто перевёл статус.
+      if (
+        deps.store.transitionReleaseStatus(
+          cur.id,
+          ["auditing", "publishing"],
+          "failed",
+          message(e).slice(0, 400),
+          {
+            kind: "failed",
+            text: `выкладка ${row.task_key} упала на публикации: ${message(e)}`,
+          },
+        )
+      ) {
+        s.failed++;
+        await deliverReleaseNotice(deps, cur);
+      }
     }
   }
   await prWatch(deps);
@@ -2596,12 +2633,13 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
           if (
             deps.store.transitionPrState(row.id, ["open", "closed"], "error")
           ) {
-            await report(
-              deps,
-              row,
+            deps.store.setReleaseNotice(
+              row.id,
+              "pr",
               `слежение за PR ${row.task_key} невозможно: gh pr view ` +
                 `${prUrl}: ${(res.stderr || res.stdout).trim().slice(0, 200)}`,
             );
+            await deliverReleaseNotice(deps, row);
           }
         }
         continue;
@@ -2626,14 +2664,15 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
           ]).catch((e) =>
             deps.log?.warn?.(`release task status: ${message(e)}`),
           );
-          await report(
-            deps,
-            row,
+          deps.store.setReleaseNotice(
+            row.id,
+            "pr",
             `PR влит ${row.task_key}: ${prUrl}` +
               (view.mergeCommit?.oid
                 ? ` → ${view.mergeCommit.oid.slice(0, 7)}`
                 : ""),
           );
+          await deliverReleaseNotice(deps, row);
         }
         continue;
       }
@@ -2656,11 +2695,12 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
             prClosedAt: now,
           })
         ) {
-          await report(
-            deps,
-            row,
+          deps.store.setReleaseNotice(
+            row.id,
+            "pr",
             `PR закрыт без влития ${row.task_key}: ${prUrl}`,
           );
+          await deliverReleaseNotice(deps, row);
         }
         continue;
       }
@@ -2670,11 +2710,12 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       // (ревью PLUG-244 заход 1, Б5).
       if (!row.pr_stale_notified && now - row.updated_at >= PR_STALE_MS) {
         if (deps.store.markPrStaleNotified(row.id)) {
-          await report(
-            deps,
-            row,
+          deps.store.setReleaseNotice(
+            row.id,
+            "pr",
             `PR висит 72 ч ${row.task_key}: ${prUrl}`,
           );
+          await deliverReleaseNotice(deps, row);
         }
       }
     } catch (e) {
@@ -3029,44 +3070,42 @@ async function finishPublished(
     selfReload = pp.selfReload;
   }
   const line = parts.join("\n");
+  // §2 r10 п.5: работа выполнена и текст собран — сначала строка
+  // сохраняется в записи, метка base снимается (повтор такта уже не
+  // гоняет работу), затем отправка сохранённого текста.
+  deps.store.setReleaseNotice(fresh.id, "published", line);
+  deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
   if (selfReload) {
     // §6 r10: the plugin cannot reload ITSELF — a one-shot bb
     // automation reloads orchestrator and delivers the outcome line
     // (the claim is captured BEFORE `automation create`, confirmed
-    // after its success).
+    // after its success — the create IS the delivery, spec п.5).
     if (!deps.store.claimReleaseNotify(fresh.id)) return;
-    const created = await createSelfReloadAutomation(
+    const createErr = await createSelfReloadAutomation(
       deps,
       fresh,
       line,
       selfReload,
     );
-    if (created) {
+    if (createErr == null) {
       // §2 шаг 6: комментарий «выложено» в задачу пишет сам плагин —
       // скрипт доносит итоговую строку только до треда координатора.
       await commentOnTask(deps, fresh.task_key, line);
-      deps.store.confirmReleaseNotify(fresh.id);
-      // Н7: метка base снимается после подтверждённой строки.
-      deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
+      deps.store.confirmReleaseNotify(fresh.id, line);
       return;
     }
+    // create упал — захват снимается и уходит обычная строка п.1 с
+    // «перезагрузи orchestrator вручную: <ошибка>» (спека §2 п.2).
     deps.store.releaseReleaseNotify(fresh.id);
-    if (
-      await outcomeLine(
-        deps,
-        fresh,
-        line +
-          "\norchestrator не перезагрузился автоматически — " +
-          "перезагрузите плагин вручную",
-      )
-    ) {
-      deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
-    }
+    deps.store.setReleaseNotice(
+      fresh.id,
+      "published",
+      `${line}\nперезагрузи orchestrator вручную: ${createErr}`,
+    );
+    await deliverReleaseNotice(deps, fresh);
     return;
   }
-  if (await outcomeLine(deps, fresh, line)) {
-    deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
-  }
+  await deliverReleaseNotice(deps, fresh);
 }
 
 // ── postPublish (§6 r10, push only) ───────────────────────────────────
@@ -3170,10 +3209,11 @@ async function runPostPublish(
     );
   }
   const newHead = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
-  // Ревью PLUG-244 заход 1 (Н7): метка base НЕ удаляется здесь — до
-  // confirm итоговой строки. Падение между ff/перезагрузками и строкой
+  // Метка base НЕ удаляется здесь — до сохранения итоговой строки
+  // (notice_text). Падение между ff/перезагрузками и строкой
   // досматривается повторным проходом с той же базы; метку снимает
-  // finishPublished после подтверждённой отправки.
+  // finishPublished сразу после setReleaseNotice (п.5: повтор такта
+  // только переотправляет сохранённый текст, работу не повторяет).
   if (!pp.reloadPlugins) {
     return {
       summary: "postPublish: копия обновлена; перезагрузка плагинов выключена",
@@ -3233,11 +3273,12 @@ async function runPostPublish(
     }
     return null;
   };
-  // Ревью PLUG-244 заход 1 (Б2): «провайдер с ходами» сопоставляется по
-  // реестру — `bb provider list` отдаёт каждому провайдеру его
+  // Ревью PLUG-244 (Б2 + заход 2): «провайдер с ходами» сопоставляется
+  // по реестру — `bb provider list` отдаёт каждому провайдеру его
   // pluginId (`acp-devin` → `provider-devin`), а не угадыванием по
-  // строке. Реестр не прочитался (null) → консервативно: плагин,
-  // похожий на провайдер, пропускается при ЛЮБОМ running-делегировании.
+  // строке. Реестр не прочитался (null) → спека §2 п.2: пропуск ВСЕХ
+  // плагинов-провайдеров, даже без ходов — по единственному доступному
+  // признаку (provider в id).
   let providersByPlugin: Map<string, Set<string>> | null | undefined;
   const providerIdsOf = async (
     id: string,
@@ -3273,10 +3314,12 @@ async function runPostPublish(
   const reloaded: string[] = [];
   const skipped: string[] = [];
   let selfReload: { checkout: string; expectedSha: string } | null = null;
+  // Тексты пропусков и ошибок — ровно формулировки спеки §2 п.2
+  // (аудит выкладки сверяет «код ↔ спека» посимвольно).
   for (const dir of dirs) {
     const id = await pluginId(dir);
     if (!id) {
-      skipped.push(`${dir} (не установлен из копии — пропуск)`);
+      skipped.push(`${dir}: не установлен из копии`);
       continue;
     }
     if (
@@ -3286,16 +3329,20 @@ async function runPostPublish(
           p === `plugins/${dir}/package-lock.json`,
       )
     ) {
-      skipped.push(`${id} (нужен npm ci)`);
+      skipped.push(`${id}: изменены зависимости — нужен npm ci`);
       continue;
     }
     const pids = await providerIdsOf(id);
-    const isProvider = pids ? pids.size > 0 : /provider/.test(id);
+    if (pids == null && /provider/.test(id)) {
+      skipped.push(`${id}: реестр провайдеров не прочитан — перезагрузи вручную`);
+      continue;
+    }
     if (
-      isProvider &&
-      running.some((d) => (pids ? pids.has(d.provider) : true))
+      pids != null &&
+      pids.size > 0 &&
+      running.some((d) => pids.has(d.provider))
     ) {
-      skipped.push(`${id} (идут ходы — перезагрузите позже)`);
+      skipped.push(`${id}: идут ходы — перезагрузи позже`);
       continue;
     }
     if (id === "orchestrator" || dir === "bb-plugin-orchestrator") {
@@ -3305,7 +3352,8 @@ async function runPostPublish(
     const r = await deps.bbCli.run(["plugin", "reload", id]);
     if (r.exitCode !== 0) {
       skipped.push(
-        `${id} (reload: ${(r.stderr || r.stdout || "").trim().slice(0, 120)})`,
+        `${id}: перезагрузка не удалась: ` +
+          `${(r.stderr || r.stdout || "").trim().slice(0, 120)}`,
       );
     } else {
       reloaded.push(id);
@@ -3322,15 +3370,16 @@ async function runPostPublish(
  * §6 r10: a one-shot script automation reloads the orchestrator plugin
  * (it cannot reload itself), then waits up to 3 min for `bb orchestrator
  * status` and the checkout HEAD == the expected sha, and delivers the
- * outcome line via `bb thread tell`. Returns true when `bb automation
- * create` succeeded.
+ * outcome line via `bb thread tell`. Returns null when `bb automation
+ * create` succeeded, else the error text for «перезагрузи orchestrator
+ * вручную: <ошибка>» (спека §2 п.2).
  */
 async function createSelfReloadAutomation(
   deps: ReleaseDeps,
   row: ReleaseRow,
   line: string,
   selfReload: { checkout: string; expectedSha: string },
-): Promise<boolean> {
+): Promise<string | null> {
   const script = [
     "#!/bin/sh",
     `COORD='${row.coordinator_thread_id}'`,
@@ -3348,12 +3397,12 @@ async function createSelfReloadAutomation(
     "  i=$((i+1))",
     '  cur=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "?")',
     '  if bb orchestrator status >/dev/null 2>&1 && [ "$cur" = "$EXPECTED" ]; then',
-    '    bb thread tell "$COORD" "$TEXT; перезагружено: orchestrator" >/dev/null 2>&1 || true',
+    '    bb thread tell "$COORD" --mode queue "$TEXT; перезагружено: orchestrator" >/dev/null 2>&1 || true',
     "    exit 0",
     "  fi",
     "done",
     'last=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "?")',
-    'bb thread tell "$COORD" "$TEXT; orchestrator после перезагрузки не поднялся / копия на $last, ожидался $EXPECTED" >/dev/null 2>&1 || true',
+    'bb thread tell "$COORD" --mode queue "$TEXT; orchestrator после перезагрузки не поднялся / копия на $last, ожидался $EXPECTED" >/dev/null 2>&1 || true',
   ].join("\n");
   // §6 r10: автоматизация — в проекте КООРДИНАТОРА
   // (`--project <проект координатора>`), не делегирования.
@@ -3382,12 +3431,13 @@ async function createSelfReloadAutomation(
     coordProject,
   ]);
   if (res.exitCode !== 0) {
-    deps.log?.warn?.(
-      `orchestrator release: automation create: ` +
-        (res.stderr || res.stdout || `exit ${res.exitCode}`).slice(0, 200),
-    );
+    const err = (res.stderr || res.stdout || `exit ${res.exitCode}`)
+      .trim()
+      .slice(0, 200);
+    deps.log?.warn?.(`orchestrator release: automation create: ${err}`);
+    return err || `exit ${res.exitCode}`;
   }
-  return res.exitCode === 0;
+  return null;
 }
 
 // ── Step 7: пост-проверка ──────────────────────────────────────────────

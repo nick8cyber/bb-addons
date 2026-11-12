@@ -223,6 +223,12 @@ export const MIGRATIONS: readonly string[] = [
    WHERE status IN ('published','rejected','failed') AND notified_at IS NULL`,
   `UPDATE releases SET pr_state = 'legacy'
    WHERE pr_url IS NOT NULL AND pr_state IS NULL`,
+  // orchestrator-release §2 п.5 (r10): итоговая строка собирается один
+  // раз и хранится до доставки (`notice_text`, `notice_kind`) — повтор
+  // такта только переотправляет сохранённый текст, работу п.2 и
+  // пост-проверку заново не выполняет.
+  `ALTER TABLE releases ADD COLUMN notice_text TEXT`,
+  `ALTER TABLE releases ADD COLUMN notice_kind TEXT`,
 ];
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -328,8 +334,13 @@ export interface ReleaseRow {
   pipeline_shas: string | null;
   /** §6 (r8): проект настройки, записанный на шаге 1. */
   settings_project_id: string | null;
-  /** §2 r10 п.5: итоговая строка п.1 отправлена; -1 — захват. */
+  /** §2 r10 п.5: итоговая строка п.1 отправлена; отрицательное —
+   * захват до отправки (минус время захвата, stale 2 мин). */
   notified_at: number | null;
+  /** §2 r10 п.5: итоговая строка, собранная до отправки — повтор такта
+   * переотправляет её, не повторяя работу. */
+  notice_text: string | null;
+  notice_kind: string | null;
   /** §2 r10 п.0: realpath основного каталога репозитория — идентичность
    * цели вместе с target_branch. */
   repo_root: string | null;
@@ -1397,50 +1408,80 @@ export class DelegationStore {
       .run(repoRoot, id);
   }
 
-  /** §2 r10 п.5: захват итоговой строки — тот же протокол -1/stale
-   * 2 мин, что claimResultDelivery (PLUG-190). */
+  /** §2 r10 п.5: итоговая строка собрана — сохранить ДО отправки;
+   * повтор такта только переотправляет этот текст. notified_at
+   * сбрасывается: новая строка считается недоставленной. updated_at
+   * НЕ двигаем — у отслеживаемых PR он остаётся моментом публикации
+   * (база «72 ч» п.3). */
+  setReleaseNotice(id: number, kind: string, text: string): void {
+    this.db
+      .prepare(
+        `UPDATE releases SET notice_text = ?, notice_kind = ?,
+           notified_at = NULL
+         WHERE id = ?`,
+      )
+      .run(text, kind, id);
+  }
+
+  /** §2 r10 п.5: захват отправки — минус время захвата, протокол
+   * claimResultDelivery (PLUG-190): захват старше 2 мин перехватывается
+   * следующим тактом, лучше редкий дубль, чем потеря. Значение -1 от
+   * кода до этой ревизии читается как давно устаревший захват.
+   * updated_at не двигаем — он база «72 ч» п.3. */
   claimReleaseNotify(id: number): boolean {
-    const staleBefore = Date.now() - 120_000;
+    const now = Date.now();
+    const staleAfter = -(now - 120_000);
     const info = this.db
       .prepare(
-        `UPDATE releases SET notified_at = -1, updated_at = ?
+        `UPDATE releases SET notified_at = ?
          WHERE id = ? AND (
            notified_at IS NULL
-           OR (notified_at = -1 AND updated_at < ?)
+           OR (notified_at < 0 AND notified_at >= ?)
          )`,
       )
-      .run(Date.now(), id, staleBefore);
+      .run(-now, id, staleAfter);
     return info.changes > 0;
   }
 
-  confirmReleaseNotify(id: number): void {
+  /** Доставка подтверждена — отметка и снятие сохранённой строки.
+   * Условие на текст: если за время отправки записана СЛЕДУЮЩАЯ строка,
+   * она не подтверждается и не стирается — её доставит досмотр. */
+  confirmReleaseNotify(id: number, text: string): void {
     this.db
-      .prepare(`UPDATE releases SET notified_at = ? WHERE id = ?`)
-      .run(Date.now(), id);
+      .prepare(
+        `UPDATE releases SET notified_at = ?,
+           notice_text = NULL, notice_kind = NULL
+         WHERE id = ? AND notice_text = ?`,
+      )
+      .run(Date.now(), id, text);
   }
 
   releaseReleaseNotify(id: number): void {
     this.db
       .prepare(
         `UPDATE releases SET notified_at = NULL
-         WHERE id = ? AND notified_at = -1`,
+         WHERE id = ? AND notified_at < 0`,
       )
       .run(id);
   }
 
-  /** §2 r10 п.5: published-выкладки без подтверждённой итоговой строки —
-   * досмотр конвейера (включая устаревшие захваты). */
-  pendingPublishNotify(): ReleaseRow[] {
+  /** §2 r10 п.5: записи с недоставленной итоговой строкой — досмотр
+   * конвейера (включая устаревшие захваты). Сохранённая строка —
+   * переотправка; published-запись БЕЗ строки — крах до её сохранения,
+   * работа и текст собираются заново. */
+  pendingReleaseNotices(): ReleaseRow[] {
     return this.db
       .prepare(
         `SELECT * FROM releases
-         WHERE status = 'published' AND (
-           notified_at IS NULL
-           OR (notified_at = -1 AND updated_at < ?)
-         )
+         WHERE (
+             notice_text IS NOT NULL OR status = 'published'
+           ) AND (
+             notified_at IS NULL
+             OR (notified_at < 0 AND notified_at >= ?)
+           )
          ORDER BY id`,
       )
-      .all(Date.now() - 120_000) as ReleaseRow[];
+      .all(-(Date.now() - 120_000)) as ReleaseRow[];
   }
 
   /** §2 r10 п.3: запись только что получила pr_url — начинаем следить.
@@ -1654,20 +1695,29 @@ export class DelegationStore {
   /** Условный перевод статуса выкладки — тот же приём, что setStatusIf:
    * кто первый перевёл, тот и владеет строкой об исходе (r31: сторож
    * отклоняет «аудит без вердикта» до done делегирования, чтобы насос
-   * не успел отклонить своей строкой). */
+   * не успел отклонить своей строкой). `notice` — итоговая строка п.5:
+   * пишется в той же записи, что и переход, — между «статус конечный» и
+   * «строка сохранена» окна нет. */
   transitionReleaseStatus(
     id: number,
     from: readonly ReleaseStatus[],
     to: ReleaseStatus,
     error?: string,
+    notice?: { kind: string; text: string },
   ): boolean {
     const marks = from.map(() => "?").join(",");
+    const sets = "status = ?, error = ?, updated_at = ?";
+    const args: unknown[] = [to, error ?? null, Date.now()];
+    const noticeSet = notice
+      ? ", notice_text = ?, notice_kind = ?, notified_at = NULL"
+      : "";
+    if (notice) args.push(notice.text, notice.kind);
     const info = this.db
       .prepare(
-        `UPDATE releases SET status = ?, error = ?, updated_at = ?
+        `UPDATE releases SET ${sets}${noticeSet}
          WHERE id = ? AND status IN (${marks})`,
       )
-      .run(to, error ?? null, Date.now(), id, ...from);
+      .run(...args, id, ...from);
     return info.changes > 0;
   }
 

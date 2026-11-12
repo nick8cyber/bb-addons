@@ -5864,11 +5864,54 @@ test("§17 r31: аудитор второй раз без вердикта — �
   const relAfter = h.store.getRelease(rel.id)!;
   assert.equal(relAfter.status, "rejected");
   assert.match(relAfter.error ?? "", /аудит без вердикта/);
+  // п.5 r10: строка записана в выкладку и доставлена — отметка стоит
+  assert.ok(relAfter.notified_at != null && relAfter.notified_at > 0);
   assert.ok(
     h.sends.some(
       (m) =>
         m.threadId === "thr_coord" &&
         /аудит выкладки PLUG-1 без вердикта/.test(JSON.stringify(m.input)),
+    ),
+  );
+});
+
+test("§17 r31 (п.5 r10): сбой send при отказе — строка ждёт досмотра насоса", async () => {
+  // два сбоя: напоминание исполнителю и итоговая строка координатору
+  const h = makeHarness({ sendFails: 2 });
+  const rel = h.store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    repoPath: "/nonexistent-copy",
+    branch: "feat",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  const row = reviewerRow(h, {
+    level: "release-audit",
+    threadId: "thr_a",
+    events: [
+      ev(1, "turn/started", T0),
+      ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+    ],
+  });
+  await idleOnce(h, "thr_a", 2);
+  h.eventLog.set("thr_a", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+    ev(3, "turn/started", T0 + 20),
+    ev(4, "turn/completed", T0 + 30, { status: "completed" }),
+  ]);
+  await idleOnce(h, "thr_a", 4);
+  const relAfter = h.store.getRelease(rel.id)!;
+  assert.equal(relAfter.status, "rejected");
+  assert.match(relAfter.notice_text ?? "", /без вердикта/);
+  assert.equal(relAfter.notified_at, null, "недоставлена — досмотр насоса");
+  assert.ok(
+    !h.sends.some(
+      (m) =>
+        m.threadId === "thr_coord" &&
+        /без вердикта/.test(JSON.stringify(m.input)),
     ),
   );
 });
