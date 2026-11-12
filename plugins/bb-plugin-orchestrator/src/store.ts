@@ -229,7 +229,84 @@ export const MIGRATIONS: readonly string[] = [
   // пост-проверку заново не выполняет.
   `ALTER TABLE releases ADD COLUMN notice_text TEXT`,
   `ALTER TABLE releases ADD COLUMN notice_kind TEXT`,
+  // orchestrator §18.2 (r32, PLUG-245): журнал запускаемых команд —
+  // queued переживает рестарт, running сверяется по pid + proc_start,
+  // живая группа убивается до пометки interrupted. argv/cwd/env/stdin
+  // хранятся в строке, чтобы запись queued запускалась после рестарта
+  // без перечитывания конфига.
+  `CREATE TABLE command_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    run_key TEXT NOT NULL UNIQUE,
+    group_key TEXT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    argv TEXT,
+    cwd TEXT,
+    env TEXT,
+    stdin TEXT,
+    timeout_sec INTEGER,
+    pid INTEGER,
+    pgid INTEGER,
+    proc_start TEXT,
+    exit_code INTEGER,
+    output_tail TEXT,
+    queued_at INTEGER,
+    started_at INTEGER,
+    finished_at INTEGER
+  )`,
+  `CREATE INDEX command_runs_status ON command_runs(status)`,
+  `CREATE INDEX command_runs_group ON command_runs(group_key)`,
+  // orchestrator-release §2 п.6 (r11): merge-коммит PR для строки «влит → sha7».
+  `ALTER TABLE releases ADD COLUMN pr_merge_sha TEXT`,
 ];
+
+export type CommandRunStatus =
+  | "queued"
+  | "running"
+  | "ok"
+  | "failed"
+  | "timeout"
+  | "interrupted"
+  | "skipped";
+
+/** §18.2 (r32): запись журнала одного запуска команды. */
+export interface CommandRunRow {
+  id: number;
+  /** postPublish | eventHook | prProvider — источник команды. */
+  source: string;
+  run_key: string;
+  /** Одна running на group_key — команды одной выкладки последовательны. */
+  group_key: string | null;
+  name: string;
+  status: CommandRunStatus;
+  argv: string | null;
+  cwd: string | null;
+  env: string | null;
+  stdin: string | null;
+  timeout_sec: number | null;
+  pid: number | null;
+  pgid: number | null;
+  /** /proc/<pid>/stat starttime — отличие «наш лидер» от чужого pid. */
+  proc_start: string | null;
+  exit_code: number | null;
+  output_tail: string | null;
+  queued_at: number | null;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export interface CommandRunSpec {
+  source: string;
+  runKey: string;
+  groupKey?: string;
+  name: string;
+  argv: string[];
+  cwd: string;
+  env?: Record<string, string>;
+  stdin?: string;
+  timeoutSec?: number;
+}
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
 
@@ -352,6 +429,8 @@ export interface ReleaseRow {
   pr_closed_at: number | null;
   pr_stale_notified: number | null;
   pr_error_count: number;
+  /** §2 п.6 (r11): merge-коммит влитого PR — строка «влит → sha7». */
+  pr_merge_sha: string | null;
   error: string | null;
   created_at: number;
   updated_at: number;
@@ -1947,6 +2026,166 @@ export class DelegationStore {
       )
       .all(sha) as DelegationRow[];
   }
+  /* §18.2 (r32, PLUG-245): журнал команд. run_key уникален — повторная
+   * постановка той же команды выкладки после рестарта не дублирует её
+   * (INSERT ON CONFLICT DO NOTHING + чтение существующей). */
+
+  enqueueCommandRun(spec: CommandRunSpec, at: number): CommandRunRow {
+    this.db
+      .prepare(
+        `INSERT INTO command_runs (
+          source, run_key, group_key, name, status, argv, cwd, env,
+          stdin, timeout_sec, queued_at
+        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_key) DO NOTHING`,
+      )
+      .run(
+        spec.source,
+        spec.runKey,
+        spec.groupKey ?? null,
+        spec.name,
+        JSON.stringify(spec.argv),
+        spec.cwd,
+        spec.env ? JSON.stringify(spec.env) : null,
+        spec.stdin ?? null,
+        spec.timeoutSec ?? null,
+        at,
+      );
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE run_key = ?`)
+      .get(spec.runKey) as CommandRunRow;
+  }
+
+  /** Терминальный skipped: создаёт запись, если её не было; ждущую
+   * очередь переводит в skipped; running и терминальные не трогает. */
+  markCommandRunSkipped(
+    spec: CommandRunSpec,
+    reason: string,
+    at: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO command_runs (
+          source, run_key, group_key, name, status, argv, cwd, env,
+          stdin, timeout_sec, queued_at, finished_at, output_tail
+        ) VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_key) DO UPDATE SET
+          status = 'skipped',
+          finished_at = excluded.finished_at,
+          output_tail = excluded.output_tail
+        WHERE command_runs.status = 'queued'`,
+      )
+      .run(
+        spec.source,
+        spec.runKey,
+        spec.groupKey ?? null,
+        spec.name,
+        JSON.stringify(spec.argv),
+        spec.cwd,
+        spec.env ? JSON.stringify(spec.env) : null,
+        spec.stdin ?? null,
+        spec.timeoutSec ?? null,
+        at,
+        at,
+        reason,
+      );
+  }
+
+  commandRunByKey(runKey: string): CommandRunRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE run_key = ?`)
+      .get(runKey) as CommandRunRow | undefined;
+  }
+
+  commandRunsByGroup(groupKey: string): CommandRunRow[] {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE group_key = ? ORDER BY id`)
+      .all(groupKey) as CommandRunRow[];
+  }
+
+  queuedCommandRuns(): CommandRunRow[] {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE status = 'queued' ORDER BY id`)
+      .all() as CommandRunRow[];
+  }
+
+  runningCommandRuns(): CommandRunRow[] {
+    return this.db
+      .prepare(`SELECT * FROM command_runs WHERE status = 'running' ORDER BY id`)
+      .all() as CommandRunRow[];
+  }
+
+  /** Охрана «запущена один раз» (§18.2): queued → running один раз. */
+  claimCommandRun(id: number, at: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE command_runs SET status = 'running', started_at = ?
+           WHERE id = ? AND status = 'queued'`,
+        )
+        .run(at, id).changes > 0
+    );
+  }
+
+  attachCommandProcess(
+    id: number,
+    pid: number,
+    pgid: number,
+    procStart: string | null,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE command_runs SET pid = ?, pgid = ?, proc_start = ?
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(pid, pgid, procStart, id);
+  }
+
+  finishCommandRun(
+    id: number,
+    status: CommandRunStatus,
+    exitCode: number | null,
+    outputTail: string | null,
+    at: number,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE command_runs
+           SET status = ?, exit_code = ?, output_tail = ?, finished_at = ?
+           WHERE id = ? AND status = 'running'`,
+        )
+        .run(status, exitCode, outputTail, at, id).changes > 0
+    );
+  }
+
+  interruptCommandRun(id: number, at: number): boolean {
+    return this.finishCommandRun(id, "interrupted", null, null, at);
+  }
+
+  /** §18.2: чистка журнала старше retentionDays. */
+  pruneCommandRuns(cutoff: number): number {
+    return this.db
+      .prepare(
+        `DELETE FROM command_runs
+         WHERE finished_at IS NOT NULL AND finished_at < ?`,
+      )
+      .run(cutoff).changes;
+  }
+
+  /** §2 п.6 (r11): merge-коммит влитого PR. */
+  setPrMergeSha(id: number, sha: string | null): void {
+    this.db
+      .prepare(`UPDATE releases SET pr_merge_sha = ? WHERE id = ?`)
+      .run(sha, id);
+  }
+
+  releasesByPrState(state: string): ReleaseRow[] {
+    return this.db
+      .prepare(`SELECT * FROM releases WHERE pr_state = ? ORDER BY id`)
+      .all(state) as ReleaseRow[];
+  }
+
 }
 
 
@@ -2188,4 +2427,5 @@ export class JanitorStore {
       )
       .run(key, value);
   }
+
 }

@@ -56,9 +56,12 @@ const THREAD_START_FAILED = "thread.start failed";
 
 /** §5.2 typed signal: `errorInfo.category` values that mean quota. */
 const QUOTA_CATEGORIES = new Set(["rate-limit", "billing"]);
-const QUOTA_HOLD_MS = 15 * 60 * 1000;
-const APPROVAL_NOTIFY_MS = 10 * 60 * 1000;
-const DISPATCH_GRACE_MS = 5 * 60 * 1000;
+/** §18.5 (PLUG-245): дефолты policy.timing — значения переопределяются
+ * ключами `timing` политики. */
+const DEFAULT_QUOTA_HOLD_MINUTES = 15;
+const DEFAULT_APPROVAL_REPEAT_MINUTES = 10;
+const DEFAULT_POST_DISPATCH_GRACE_MINUTES = 5;
+const DEFAULT_BB_NOTIFY_WAIT_SECONDS = 120;
 const DEFAULT_FIRST_RESPONSE_SECONDS = 90;
 const DEFAULT_MAX_RUN_SECONDS = 7200;
 /** §16.5 `routes.*.startSeconds` — no turn for this long → one message. */
@@ -70,7 +73,6 @@ const RESULT_OUTPUT_CAP = 3000;
 /** §16.5: BB is the primary outcome channel — its child-* notice gets
  * this long to reach the coordinator's journal before the plugin checks
  * the journal and sends its own line. */
-const RESULT_BB_GRACE_MS = 120_000;
 /** §16.5: the coordinator journal's compaction event (SDK `thread/compacted`). */
 const COMPACTION_EVENT_TYPE = "thread/compacted";
 /** §17.2 r26 (PLUG-215 мелко 1): claude-code reports ONE compaction as a
@@ -1031,8 +1033,11 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.setStatus(fresh.id, "quota"); // status first, stop second (§5.3)
     clearMarks(fresh.id);
     const info = await routeInfo(fresh);
+    const { policy: p2 } = await deps.loadPolicy();
+    const holdMs =
+      (p2?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
     for (const group of await info.quotaGroups()) {
-      store.hold(group, now() + QUOTA_HOLD_MS, detail.slice(0, 200));
+      store.hold(group, now() + holdMs, detail.slice(0, 200));
     }
     await afterOutcomeStatus(fresh, "quota", detail);
   };
@@ -1053,7 +1058,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.setStatus(fresh.id, "stalled"); // §5.3: unavailable lands as stalled
     clearMarks(fresh.id);
     const reason = `маршрут недоступен: ${detail.slice(0, 180)}`;
-    store.hold(fresh.route, now() + QUOTA_HOLD_MS, reason);
+    const { policy: p3 } = await deps.loadPolicy();
+    const holdMs =
+      (p3?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
+    store.hold(fresh.route, now() + holdMs, reason);
     store.addSetupError(fresh.id, "outcome-detail", reason);
     await outcomeAndMaybeReissue(fresh, "unavailable", detail);
   };
@@ -1077,8 +1085,11 @@ export function createWatchdog(deps: WatchdogDeps) {
       return false;
     }
     const reason = `маршрут недоступен: ${text.slice(0, 180)}`;
+    const { policy: p4 } = await deps.loadPolicy();
+    const holdMs =
+      (p4?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
     store.setStatus(row.id, "stalled");
-    store.hold(row.route, now() + QUOTA_HOLD_MS, reason);
+    store.hold(row.route, now() + holdMs, reason);
     store.addSetupError(row.id, "outcome-detail", reason);
     await outcomeAndMaybeReissue(store.get(row.id) ?? row, "unavailable", text);
     return true;
@@ -1944,7 +1955,11 @@ export function createWatchdog(deps: WatchdogDeps) {
         store.addSetupError(fresh.id, "result-window", String(now()));
         return;
       }
-      if (now() - Number(win.message) < RESULT_BB_GRACE_MS) return;
+      const { policy: p7 } = await deps.loadPolicy();
+      const bbGrace =
+        (p7?.timing?.bbNotifyWaitSeconds ?? DEFAULT_BB_NOTIFY_WAIT_SECONDS) *
+        1000;
+      if (now() - Number(win.message) < bbGrace) return;
     }
     // §16.5 exactly-once (PLUG-184): the conditional claim below is the
     // atomic gate — event-driven and reconcile paths cannot both send.
@@ -2541,10 +2556,14 @@ export function createWatchdog(deps: WatchdogDeps) {
   ) => {
     const row = store.byThreadId(thread.id);
     if (!row || !isActive(row.status)) return;
-    // §5.3: at most one approval notification per 10 minutes.
+    // §5.3: at most one approval notification per approvalRepeatMinutes.
+    const { policy: p5 } = await deps.loadPolicy();
+    const approvalMs =
+      (p5?.timing?.approvalRepeatMinutes ?? DEFAULT_APPROVAL_REPEAT_MINUTES) *
+      60_000;
     if (
       row.last_approval_notified_at != null &&
-      now() - row.last_approval_notified_at < APPROVAL_NOTIFY_MS
+      now() - row.last_approval_notified_at < approvalMs
     ) {
       return;
     }
@@ -2779,7 +2798,11 @@ export function createWatchdog(deps: WatchdogDeps) {
     row: DelegationRow,
     s: ReconcileSummary,
   ) => {
-    if (now() - row.created_at < DISPATCH_GRACE_MS) return;
+    const { policy: p6 } = await deps.loadPolicy();
+    const dispatchGrace =
+      (p6?.timing?.postDispatchGraceMinutes ??
+        DEFAULT_POST_DISPATCH_GRACE_MINUTES) * 60_000;
+    if (now() - row.created_at < dispatchGrace) return;
     // §7 retry limit: an exhausted reissue stays `dispatching` for the
     // coordinator to resolve by hand — retries stop entirely.
     if (hasSetupError(row, "retry-exhausted")) return;

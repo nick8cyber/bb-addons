@@ -20,6 +20,7 @@ import {
   machineScan,
   runGitleaks,
 } from "../src/scan.js";
+import { createCommandRunner, type SpawnedCommand } from "../src/commands.js";
 import {
   parseAuditVerdict,
   reviewVerdictOk,
@@ -3808,7 +3809,14 @@ test("r10 п.2: postPublish — orchestrator перезагружает сам �
   assert.match(script, /bb plugin reload orchestrator/);
   // ревью заход 2: как у плагина — queue-if-active, не steer
   assert.match(script, /bb thread tell "\$COORD" --mode queue/);
-  assert.match(script, /\[orchestrator\] выложено PLUG-1/);
+  // r11: значения в скрипт — base64, не интерполяцией; декодируем TEXT.
+  const b64 = /TEXT=\$\(printf %s '([A-Za-z0-9+/=]+)' \| base64 -d\)/.exec(
+    script,
+  )![1]!;
+  assert.match(
+    Buffer.from(b64, "base64").toString("utf8"),
+    /\[orchestrator\] выложено PLUG-1/,
+  );
   // строку итога шлёт автоматизация, не сам такт
   assert.ok(!sent.some((m) => /выложено PLUG-1/.test(m)));
   // §2 шаг 6: комментарий «выложено» в задачу пишет сам плагин
@@ -4165,7 +4173,7 @@ test("r10 п.2: изменённый dist/ внутри плагина — ff и
   assert.match(sent.find((m) => /выложено/.test(m))!, /перезагружено: fakeplug/);
 });
 
-test("r10 п.2: package.json у плагина — пропуск «нужен npm ci»", async () => {
+test("r11: package.json у плагина — пропуск «переустанови и перезагрузи вручную»", async () => {
   const { repo, seed } = makeRepo();
   mkdirSync(join(repo, "plugins", "fakeplug"), { recursive: true });
   writeFileSync(
@@ -4189,7 +4197,7 @@ test("r10 п.2: package.json у плагина — пропуск «нужен n
   );
   assert.match(
     sent.find((m) => /выложено/.test(m))!,
-    /пропущено: fakeplug: изменены зависимости — нужен npm ci/,
+    /пропущено: fakeplug: изменены зависимости — переустанови их и перезагрузи вручную/,
   );
 });
 
@@ -4318,9 +4326,11 @@ test("r10 п.2 (ревью Н6): плагин из другой копии — �
     !calls.some((c) => c[0] === "plugin" && c[1] === "reload"),
     "плагин другой копии не перезагружается",
   );
+  // r11: rootDir вне копии — запись не кандидат, молча (изменённые пути
+  // вне rootDir плагина — молча по спеке).
   assert.match(
     sent.find((m) => /выложено/.test(m))!,
-    /пропущено: fakeplug: не установлен из копии/,
+    /плагины не менялись/,
   );
 });
 
@@ -4644,4 +4654,366 @@ test("r10 п.2: plugin reload упал — «перезагрузка не уд�
     sent.find((m) => /выложено/.test(m))!,
     /пропущено: fakeplug: перезагрузка не удалась: reload boom/,
   );
+});
+
+// ── PLUG-245: postPublish r11 (§2 п.6), запускатель в конвейере ────────
+
+/** Фейковый спаунер для депс — done резолвится из теста. */
+function cmdFake() {
+  const spawned: {
+    spec: { argv: string[]; cwd: string; env: Record<string, string> };
+    pid: number;
+    kills: string[];
+    resolve: (r: {
+      code: number | null;
+      signal: string | null;
+      output: string;
+    }) => void;
+  }[] = [];
+  let pid = 200;
+  const spawner = (spec: {
+    argv: string[];
+    cwd: string;
+    env: Record<string, string>;
+  }): SpawnedCommand => {
+    pid += 1;
+    let resolve!: (r: {
+      code: number | null;
+      signal: string | null;
+      output: string;
+    }) => void;
+    const done = new Promise<{
+      code: number | null;
+      signal: string | null;
+      output: string;
+    }>((r) => (resolve = r));
+    const rec = { spec, pid, kills: [] as string[], resolve };
+    spawned.push(rec);
+    return {
+      pid,
+      pgid: pid,
+      done,
+      killGroup: (sig) => {
+        rec.kills.push(sig);
+      },
+    };
+  };
+  return { spawner, spawned };
+}
+
+const cmdRunner = (store: DelegationStore, fake: ReturnType<typeof cmdFake>) =>
+  createCommandRunner({
+    store,
+    spawn: fake.spawner,
+    maxConcurrent: () => 4,
+    procStart: () => "1",
+    alive: () => false,
+    killGraceMs: 1,
+  });
+
+test("§2 п.6 r11 (без prProvider): postPublish-команды через журнал — env, порядок, замок, итог", async () => {
+  const { repo, seed } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          // prProvider не задан вообще — r11 работает без него
+          postPublish: {
+            checkout: seed,
+            branch: "main",
+            on: "published",
+            commands: [
+              { name: "deploy", argv: ["/bin/true"], cwd: "checkout" },
+              { name: "note", argv: ["echo", "hi"] },
+            ],
+          },
+        },
+      },
+    }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  // такт 1: журналная постановка, deploy стартовал, note ждёт группу
+  assert.equal(fake.spawned.length, 1);
+  const sp = fake.spawned[0];
+  assert.equal(sp.spec.cwd, seed, "cwd:checkout — каталог копии");
+  assert.equal(sp.spec.argv[0], "/bin/true");
+  assert.equal(sp.spec.env.ORCH_EVENT, "release.published");
+  assert.equal(sp.spec.env.ORCH_TASK, "PLUG-1");
+  assert.match(sp.spec.env.ORCH_SHA, /^[0-9a-f]{40}$/);
+  assert.equal(sp.spec.env.ORCH_TARGET, "main");
+  // замок копии держится, пока команды в полёте
+  const lock = join(seed, ".git", "orchestrator-merge.lock");
+  assert.ok(existsSync(lock), "копия под замком на весь postPublish");
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(
+    store.commandRunByKey(`pp:${rel.id}:note`)!.status,
+    "queued",
+    "вторая команда выкладки ждёт группу",
+  );
+  sp.resolve({ code: 0, signal: null, output: "ok" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.equal(fake.spawned.length, 2);
+  fake.spawned[1].resolve({ code: 0, signal: null, output: "done" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(
+    line,
+    /postPublish: копия обновлена; deploy: ok; note: ok/,
+  );
+  assert.ok(!existsSync(lock), "замок снят после postPublish");
+  assert.equal(store.commandRunByKey(`pp:${rel.id}:deploy`)!.status, "ok");
+});
+
+test("§2 п.6 r11: when-патчи и пропуски — «нет изменений по when», «нет checkout»", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: {
+            commands: [
+              { name: "docs", argv: ["x"], when: ["docs/**"] },
+              { name: "cp", argv: ["y"], cwd: "checkout" },
+              { name: "main", argv: ["z"] },
+            ],
+          },
+        },
+      },
+    }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  // только main идёт — docs по when не подошла, cp без checkout пропущена
+  assert.equal(fake.spawned.length, 1);
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /docs: пропущена — нет изменений по when/);
+  assert.match(line, /cp: пропущена — нет checkout/);
+  assert.match(line, /main: ok/);
+});
+
+test("§2 п.6 r11: stopOnFail — поздние пропущены «не прошла <имя>»", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: {
+            commands: [
+              { name: "must", argv: ["x"], stopOnFail: true },
+              { name: "later", argv: ["y"] },
+            ],
+          },
+        },
+      },
+    }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  assert.equal(fake.spawned.length, 1);
+  fake.spawned[0].resolve({ code: 2, signal: null, output: "boom" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.equal(fake.spawned.length, 1, "later не запускалась");
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /must: упала \(код 2\): boom/);
+  assert.match(line, /later: пропущена — не прошла must/);
+});
+
+test("§2 п.6 r11: рестарт mid-command — interrupted без повтора", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: { commands: [{ name: "deploy", argv: ["x"] }] },
+        },
+      },
+    }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  assert.equal(fake.spawned.length, 1);
+  // «рестарт»: новый процесс — recover журнала, группы нет → interrupted
+  const runner2 = createCommandRunner({
+    store, maxConcurrent: () => 4,
+    procStart: () => "1", alive: () => false, killGraceMs: 1,
+  });
+  await runner2.recover();
+  await pumpReleases({ ...deps2, commandRunner: runner2 });
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /deploy: прервана перезапуском/);
+  assert.equal(fake.spawned.length, 1, "команда не запускалась повторно");
+});
+
+test("§2 п.6 r11: ff не прошёл — checkout-команда «копия не обновлена», остальные идут", async () => {
+  const { repo, seed } = makeRepo();
+  // расходим копию: локальный коммит на main, которого нет на remote
+  gitR(seed, ["commit", "--allow-empty", "-m", "local only"]);
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: {
+            checkout: seed,
+            branch: "main",
+            commands: [
+              { name: "cp", argv: ["x"], cwd: "checkout" },
+              { name: "main", argv: ["y"] },
+            ],
+          },
+        },
+      },
+    }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps2);
+  await auditDone(deps2, store);
+  assert.equal(fake.spawned.length, 1, "main идёт, cp пропущена");
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(line, /ff не прошёл/);
+  assert.match(line, /cp: пропущена — копия не обновлена/);
+  assert.match(line, /main: ok/);
+});
+
+test("§2 п.6 r11: PR влит → on:merged команды до строки «влит → sha7»", async () => {
+  const { repo } = makeRepo();
+  const fake = cmdFake();
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "pr", branch: "main" }, threadIds: false },
+      projects: {
+        proj_main: {
+          postPublish: {
+            on: "merged",
+            commands: [{ name: "after", argv: ["x"] }],
+          },
+        },
+      },
+    }),
+  });
+  const deps2 = { ...deps, commandRunner: cmdRunner(store, fake) };
+  let now = Date.now();
+  deps2.now = () => now;
+  await publishPr(deps2, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  ghView(
+    deps2,
+    JSON.stringify({
+      state: "MERGED",
+      mergedAt: "2026-01-01",
+      mergeCommit: { oid: "beef1234567890" },
+    }),
+  );
+  sent.length = 0;
+  now += 6 * 60 * 1000;
+  await pumpReleases(deps2);
+  // merging: команда в полёте — строка «влит» ещё не ушла
+  assert.equal(store.getRelease(rel.id)!.pr_state, "merging");
+  assert.equal(fake.spawned.length, 1);
+  assert.equal(fake.spawned[0].spec.env.ORCH_EVENT, "pr.merged");
+  assert.equal(fake.spawned[0].spec.env.ORCH_SHA, "beef1234567890");
+  assert.ok(!sent.some((m) => /PR влит/.test(m)));
+  fake.spawned[0].resolve({ code: 0, signal: null, output: "" });
+  await new Promise((r) => setImmediate(r));
+  await pumpReleases(deps2);
+  assert.equal(store.getRelease(rel.id)!.pr_state, "merged");
+  const line = sent.find((m) => /PR влит/.test(m))!;
+  assert.match(line, /PR влит PLUG-1: .*→ beef123/);
+  assert.match(line, /postPublish: after: ok/);
+});
+
+test("§18.5: timing.prStaleHours — число из настройки в строке", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent, db } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        threadIds: false,
+        timing: { prStaleHours: 1 },
+      },
+    }),
+  });
+  let now = Date.now();
+  deps.now = () => now;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  db.prepare(
+    `UPDATE releases SET updated_at = ?, pr_checked_at = NULL WHERE id = ?`,
+  ).run(Date.now() - 2 * 60 * 60 * 1000, rel.id);
+  ghView(deps, JSON.stringify({ state: "OPEN" }));
+  await pumpReleases(deps);
+  assert.equal(
+    sent.filter((m) => /PR висит 1 ч/.test(m)).length,
+    1,
+    "число из timing попало в текст",
+  );
+});
+
+test("§2 п.6 r11: самоперезагрузка — скрипт без интерполяции (base64)", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "bb-plugin-orchestrator", "src"), {
+    recursive: true,
+  });
+  writeFileSync(join(repo, "plugins", "bb-plugin-orchestrator", "src", "x.ts"), "");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: orchestrator change"]);
+  const { deps, store, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "orchestrator", rootDir: join(seed, "plugins", "bb-plugin-orchestrator") },
+    ],
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: { target: { action: "push", branch: "main" }, checks: [] },
+      projects: {
+        proj_main: {
+          postPublish: { checkout: seed, branch: "main", reloadPlugins: true },
+        },
+      },
+    }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const auto = calls.find((c) => c[0] === "automation" && c[1] === "create")!;
+  const script = auto[auto.indexOf("--script") + 1]!;
+  assert.match(script, /base64 -d/, "значения в скрипт — base64");
+  assert.ok(!script.includes("thr_coord"), "id треда не интерполирован");
+  assert.ok(!script.includes("выложено"), "текст строки не интерполирован");
 });
