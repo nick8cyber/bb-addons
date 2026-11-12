@@ -269,7 +269,7 @@ stopOnFail, installsDeps}`: `run` — argv-массив без shell (схема
 "postPublish": {
   "on": "published",
   "commands": [
-    { "name": "deploy", "command": "/home/example/deploy.sh main",
+    { "name": "deploy", "run": ["/home/example/deploy.sh", "main"],
       "timeoutSec": 600, "stopOnFail": true },
     { "name": "docs", "command": "mkdocs build",
       "when": ["docs/**", "mkdocs.yml"] }
@@ -284,11 +284,10 @@ stopOnFail, installsDeps}`: `run` — argv-массив без shell (схема
 
 ### GitLab и другие PR-провайдеры
 
-PR-слежение сейчас работает только через `gh` (GitHub) —
-`type: "github"`. Провайдер `command` (в т.ч. GitLab по схеме
-`create/view/find` §18.3) — запланирован в PLUG-248 и пока не
-реализован; `type: "none"` слежение отключает — тогда `on: "merged"`
-не сработает (предупреждение в конфиге).
+PR-слежение сейчас работает только через `gh` (GitHub). Настройка
+`prProvider` (включая `type: "command"` для GitLab по схеме
+`create/view/find` §18.3 и `type: "none"`) — запланирована в PLUG-248
+и пока не реализована и не читается: `gh` следит всегда.
 
 ### Хук в чат
 
@@ -308,7 +307,10 @@ PR-слежение сейчас работает только через `gh` (
 `auditTimeoutMinutes` (30), `checksMinutes` (10), `prepareMinutes`
 (20), `prPollMinutes` (5), `prStaleHours` (72), `prReopenWatchHours`
 (72), `prErrorLimit` (3), `prCommandTimeoutSec` (60),
-`commandTimeoutSec` (300). Таймауты сторожа — `policy.timing`:
+`commandTimeoutSec` (300), `postPublishWaitMinutes` (30 — срок
+только на ожидание: замок копии, очередь команд, удержание
+перезагрузки; запущенную команду ограничивает её `timeoutSec`).
+Таймауты сторожа — `policy.timing`:
 `quotaHoldMinutes` (15), `approvalRepeatMinutes` (10),
 `postDispatchGraceMinutes` (5), `bbNotifyWaitSeconds` (120). Значения
 вне пределов — предупреждение и дефолт, не ошибка конфига.

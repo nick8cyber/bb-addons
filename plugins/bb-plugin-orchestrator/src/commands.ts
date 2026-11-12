@@ -170,6 +170,9 @@ export interface CommandRunner {
    * процессе, пока не истечёт ttlMs (умолчание 5 мин — PLUG-245 Б3:
    * не сработавшая перезагрузка не держит очередь вечно). */
   holdForSelfReload(ttlMs?: number): void;
+  /** §18.5: флаг «остановлен» — после stopAll идущий такт не
+   * запускает новых команд (pump пуст) и не берёт замков копии. */
+  isStopped(): boolean;
 }
 
 const sleepDefault = (ms: number) =>
@@ -190,6 +193,7 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
   const warn = deps.warn ?? (() => {});
   const live = new Map<number, SpawnedCommand>();
   let heldUntil: number | null = null;
+  let stopped = false;
 
   const startRow = async (row: CommandRunRow): Promise<boolean> => {
     if (!deps.store.claimCommandRun(row.id, now())) return false;
@@ -278,6 +282,7 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
 
   return {
     async pump() {
+      if (stopped) return; // §18.5: остановлен — новых запусков нет
       if (heldUntil !== null && now() < heldUntil) return;
       heldUntil = null;
       const running = deps.store.runningCommandRuns();
@@ -321,6 +326,10 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
     },
 
     async stopAll() {
+      // §18.5: флаг «остановлен» ставится до убийства групп — идущий
+      // такт, дождавшийся своего await, уже не запустит queued и не
+      // возьмёт замок копии.
+      stopped = true;
       for (const [id, spawned] of live) {
         spawned.killGroup("SIGTERM");
         deps.store.interruptCommandRun(id, now());
@@ -345,6 +354,10 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
 
     holdForSelfReload(ttlMs = SELF_RELOAD_HOLD_MS) {
       heldUntil = now() + ttlMs;
+    },
+
+    isStopped() {
+      return stopped;
     },
   };
 }

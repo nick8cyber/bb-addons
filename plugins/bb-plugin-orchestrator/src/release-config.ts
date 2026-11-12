@@ -104,6 +104,9 @@ export interface ReleaseTiming {
   prErrorLimit?: number;
   prCommandTimeoutSec?: number;
   commandTimeoutSec?: number;
+  /** §18.5: общий срок ОЖИДАНИЯ шагов postPublish (замок копии,
+   * очередь команд, удержание перезагрузки). */
+  postPublishWaitMinutes?: number;
 }
 
 export type ResolvedTiming = Required<ReleaseTiming>;
@@ -119,6 +122,7 @@ export const DEFAULT_TIMING: ResolvedTiming = {
   prErrorLimit: 3,
   prCommandTimeoutSec: 60,
   commandTimeoutSec: 300,
+  postPublishWaitMinutes: 30,
 };
 
 export type PrProviderType = "github" | "command" | "none";
@@ -411,6 +415,7 @@ const TIMING_BOUNDS: Record<
   prErrorLimit: { min: 1, max: 100, unit: "count" },
   prCommandTimeoutSec: { min: 5, max: 3600, unit: "sec" },
   commandTimeoutSec: { min: 5, max: 3600, unit: "sec" },
+  postPublishWaitMinutes: { min: 1, max: 1440, unit: "min" },
 };
 
 /** §18.5: вне пределов — предупреждение и дефолт, не ошибка конфига. */

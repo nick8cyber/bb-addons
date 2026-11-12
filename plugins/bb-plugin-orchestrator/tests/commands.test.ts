@@ -393,6 +393,29 @@ test("§18.2: stopAll — живой группе SIGTERM, запись interrup
   assert.equal(procStartTime(row.pid!), null, "лидер мёртв");
 });
 
+test("§18.5 (заход 3): флаг «остановлен» — pump после stopAll не запускает queued", async () => {
+  const { store } = makeStore();
+  const { spawner, spawned } = fakeSpawner();
+  const runner = createCommandRunner({
+    store,
+    spawn: spawner,
+    maxConcurrent: () => 4,
+    procStart: () => "1",
+    alive: () => false,
+    killGraceMs: 1,
+  });
+  store.enqueueCommandRun(spec(), 1);
+  await runner.stopAll();
+  assert.ok(runner.isStopped());
+  await runner.pump();
+  assert.equal(spawned.length, 0, "остановленный раннер не запускает");
+  assert.equal(
+    store.commandRunByKey("pp:1:deploy")!.status,
+    "queued",
+    "запись ждёт следующего процесса",
+  );
+});
+
 test("§18.2: retention — записи старше срока чистятся", () => {
   const { store } = makeStore();
   const old = store.enqueueCommandRun(spec(), 1);

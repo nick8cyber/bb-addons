@@ -3314,14 +3314,21 @@ export function releaseAllPostPublishLocks(): void {
   postPublishLocks.clear();
 }
 
-/** PLUG-245 Б3: общий срок шагов postPublish — истёк → итоговая строка
- * с причиной вместо вечного pending (занятый замок, зависшая очередь). */
+/** §18.5 + PLUG-245 заход 3 (Б2): срок шагов postPublish — только на
+ * ОЖИДАНИЕ (замок копии, очередь команд, удержание перезагрузки);
+ * умолчание — timing.postPublishWaitMinutes (30 мин). Пока команда
+ * выкладки запущена, итог не отдаётся и замок держится — её
+ * ограничивает только свой timeoutSec (до 3600 с). Экспортируется для
+ * тестов как дефолт срока. */
 export const POSTPUBLISH_MAX_MS = 30 * 60 * 1000;
 
 /** Состояние копии в plugin_meta: base пишется один раз, результат ff
  * мемоизируется (поздний сбой fetch не отменяет уже сделанный ff). */
 interface PostPublishMeta {
   startedAt?: number;
+  /** §18.5: начало ТЕКУЩЕГО ожидания (замок/очередь/удержание);
+   * обнуляется, пока идёт running команда этой выкладки. */
+  waitSince?: number;
   base?: string;
   copy?: { head: string; changed: string[] };
   pub?: string[] | null;
@@ -3493,18 +3500,38 @@ async function runPostPublish(
   const saveMeta = () =>
     deps.store.metaSet(markerKey, JSON.stringify(meta));
 
-  // PLUG-245 Б3: общий срок postPublish — истёк → итог с причиной,
-  // ждущие команды этой выкладки получают skipped.
-  if (now - meta.startedAt >= POSTPUBLISH_MAX_MS) {
-    for (const c of pp.commands) {
-      deps.store.markCommandRunSkipped(
-        specOf(c, cmdCwd(c)),
-        "истёк срок postPublish",
-        now,
-      );
+  // §18.5 (заход 3 Б2): срок — только на ожидание. Пока у выкладки
+  // есть running команда — итог не отдаётся и замок держится (её
+  // ограничивает свой timeoutSec); счётчик ожидания обнуляется.
+  const groupRuns = deps.store.commandRunsByGroup(groupKey);
+  const waitMs =
+    (project.timing.postPublishWaitMinutes ??
+      POSTPUBLISH_MAX_MS / 60_000) * 60_000;
+  if (groupRuns.some((r) => r.status === "running")) {
+    if (meta.waitSince !== undefined) {
+      delete meta.waitSince;
+      saveMeta();
     }
-    releasePostPublishLock(row.id);
-    return fail("истёк срок выполнения — остаток шагов пропущен");
+  } else {
+    meta.waitSince ??= now;
+    if (now - meta.waitSince >= waitMs) {
+      const waiting =
+        pp.checkout && !postPublishLocks.has(row.id)
+          ? "замка копии"
+          : groupRuns.some((r) => r.status === "queued")
+            ? "очереди команд"
+            : "завершения шагов";
+      for (const c of pp.commands) {
+        deps.store.markCommandRunSkipped(
+          specOf(c, cmdCwd(c)),
+          `не дождались ${waiting}`,
+          now,
+        );
+      }
+      releasePostPublishLock(row.id);
+      return fail(`не дождались ${waiting}`);
+    }
+    saveMeta();
   }
 
   // ── копия: тот же репозиторий → ветка → замок → fetch → base → ff ──
@@ -3535,6 +3562,8 @@ async function runPostPublish(
   // умершего экземпляра ломается по владельцу (PLUG-245 Б2).
   const ensureCopyLock = async (): Promise<boolean> => {
     if (!co || postPublishLocks.has(row.id)) return true;
+    // §18.5: флаг «остановлен» — идущий такт новых замков не берёт.
+    if (deps.commandRunner?.isStopped?.()) return false;
     const gitDir = await gitOut(["rev-parse", "--absolute-git-dir"]).catch(
       () => "",
     );
@@ -3662,14 +3691,22 @@ async function runPostPublish(
     saveMeta();
   }
   // §18.2: stopOnFail — исход «не ok» обязательной команды пропускает
-  // все поздние; «не прошла <имя>» — по имени остановившей.
+  // все поздние; «не прошла <имя>» — по имени остановившей. Пропуск по
+  // `when` («нет изменений») — не сбой и цепочку не останавливает.
+  const SKIP_WHEN = "нет изменений по when";
+  const stopsChain = (status: string, tail: string | null): boolean =>
+    status !== "ok" && !(status === "skipped" && tail === SKIP_WHEN);
   let stopper: string | null = null;
   let earlierInFlight = false;
   for (const c of pp.commands) {
     const runKey = `${groupKey}:${c.name}`;
     const r = deps.store.commandRunByKey(runKey);
     if (r && r.status !== "queued" && r.status !== "running") {
-      if (stopper === null && c.stopOnFail && r.status !== "ok") {
+      if (
+        stopper === null &&
+        c.stopOnFail &&
+        stopsChain(r.status, r.output_tail)
+      ) {
         stopper = c.name;
       }
       continue;
@@ -3688,8 +3725,17 @@ async function runPostPublish(
       continue;
     }
     let reason: string | null = null;
-    if (c.cwd === "checkout") {
-      reason = co ? (copyOk ? null : "копия не обновлена") : "нет checkout";
+    // §6 r11 (заход 3 Б3): «копия не обновлена» — по ФАКТИЧЕСКОМУ cwd:
+    // явный "checkout" или cwd по умолчанию при заданном checkout
+    // (иначе команда выполнилась бы в необновлённой/чужой копии).
+    if (c.cwd === "checkout" && !co) {
+      reason = "нет checkout";
+    } else if (
+      co &&
+      !copyOk &&
+      (c.cwd === "checkout" || c.cwd === undefined)
+    ) {
+      reason = "копия не обновлена";
     }
     if (
       !reason &&
@@ -3697,11 +3743,11 @@ async function runPostPublish(
       pubPaths !== null &&
       !c.when.some((w) => pubPaths.some((p) => globMatch(w, p)))
     ) {
-      reason = "нет изменений по when";
+      reason = SKIP_WHEN;
     }
     if (reason) {
       deps.store.markCommandRunSkipped(specOf(c, cmdCwd(c)), reason, now);
-      if (c.stopOnFail) stopper = c.name;
+      if (c.stopOnFail && reason !== SKIP_WHEN) stopper = c.name;
     } else {
       deps.store.enqueueCommandRun(specOf(c, cmdCwd(c)), now);
       earlierInFlight = true;
