@@ -391,6 +391,9 @@ function makeDeps(repo: string, overrides: Partial<{
   pluginReloadFail?: boolean;
   /** r10 п.5 (ревью Б4): первые N `threads.send` бросают. */
   sendFails?: number;
+  /** r10 п.5 (ревью заход 4 Н5): ошибка, которой бросают первые N
+   * send'ов (по умолчанию «send failed (test)»). */
+  sendError?: () => Error;
   /** r10 п.5: тред координатора удалён — send всегда «not found». */
   sendThreadGone?: boolean;
 }> = {}) {
@@ -532,11 +535,16 @@ function makeDeps(repo: string, overrides: Partial<{
           : { id: threadId, parentThreadId: null, title: null, originPluginId: null, projectId: "proj_main" },
     send: async (a: { threadId: string; input: unknown[] }) => {
       if (overrides.sendThreadGone) {
-        throw new Error(`thread not found: ${a.threadId}`);
+        // ревью заход 4 (Н5): SDK отвечает PluginRpcCallError c
+        // code "not_found" — текст сообщения роли не играет.
+        throw Object.assign(
+          new Error(`thread not found: ${a.threadId}`),
+          { code: "not_found", status: 404 },
+        );
       }
       if (sendFailsLeft > 0) {
         sendFailsLeft--;
-        throw new Error("send failed (test)");
+        throw overrides.sendError?.() ?? new Error("send failed (test)");
       }
       sent.push((a.input[0] as { text: string }).text);
       return {};
@@ -3995,7 +4003,7 @@ test("r10 п.2: чужой origin у копии — причина в строк
   await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   await auditDone(deps, store);
   const line = sent.find((m) => /выложено/.test(m))!;
-  assert.match(line, /копия не обновлена — другой репозиторий/);
+  assert.match(line, /другой репозиторий — не обновлена/);
   assert.ok(
     !calls.some((c) => c[0] === "plugin" && c[1] === "reload"),
     "перезагрузки не было",
@@ -4404,6 +4412,122 @@ test("r10 п.5: отказ аудита при сбое send — переотп�
     1,
   );
   assert.ok(store.getRelease(rel.id)!.notified_at! > 0);
+});
+
+test("r10 п.5 (ревью заход 4 Н5): ENOTFOUND — повтор, не комментарий в задачу", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent, comments } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    sendFails: 1,
+    // «тред не найден» решается по коду SDK, не по тексту: ENOTFOUND —
+    // временный сбой, строка ждёт переотправки.
+    sendError: () =>
+      Object.assign(new Error("getaddrinfo ENOTFOUND bb.host"), {
+        code: "ENOTFOUND",
+      }),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(sent.length, 0);
+  assert.equal(rel.notified_at, null, "захват снят — строка ждёт повтора");
+  assert.ok(
+    !comments.some((c) => /выложено PLUG-1:/.test(c)),
+    "временный сбой не уходит комментарием в задачу",
+  );
+  await pumpReleases(deps);
+  assert.ok(sent.some((m) => /выложено PLUG-1:/.test(m)));
+});
+
+test("r10 п.5 (ревью заход 4 Н2): крах до automation create — досмотр шлёт «автоматизация не подтверждена», create не повторяется", async () => {
+  const { repo, seed } = makeRepo();
+  mkdirSync(join(repo, "plugins", "bb-plugin-orchestrator", "src"), {
+    recursive: true,
+  });
+  writeFileSync(join(repo, "plugins", "bb-plugin-orchestrator", "src", "x.ts"), "");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: orchestrator"]);
+  const { deps, store, sent, calls, db } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      {
+        id: "orchestrator",
+        rootDir: join(seed, "plugins", "bb-plugin-orchestrator"),
+      },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  // крах между сохранением строки и automation create: сам вызов бросил
+  const origRun = deps.bbCli.run;
+  deps.bbCli = {
+    run: async (args: string[]) => {
+      if (args[0] === "automation" && args[1] === "create") {
+        calls.push(args);
+        throw new Error("process died");
+      }
+      return origRun(args);
+    },
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.equal(rel.notice_kind, "self-reload");
+  assert.ok(
+    rel.notified_at != null && rel.notified_at < 0,
+    "захват остался висеть",
+  );
+  assert.ok(!sent.some((m) => /выложено/.test(m)), "строки нет");
+  assert.equal(
+    calls.filter((c) => c[0] === "automation" && c[1] === "create").length,
+    1,
+    "попытка create была одна",
+  );
+  // захват устарел (2 мин) — досмотр перехватывает запись
+  db.prepare("UPDATE releases SET notified_at = -1 WHERE id = ?").run(rel.id);
+  await pumpReleases(deps);
+  const line = sent.find((m) => /выложено/.test(m))!;
+  assert.match(
+    line,
+    /перезагрузи orchestrator вручную: автоматизация не подтверждена/,
+  );
+  assert.equal(
+    calls.filter((c) => c[0] === "automation" && c[1] === "create").length,
+    1,
+    "automation create повторно не выполняется",
+  );
+  assert.ok(store.getRelease(rel.id)!.notified_at! > 0);
+});
+
+test("r10 п.3 (ревью заход 4 Н1): PR-переход ждёт доставки строки п.1", async () => {
+  const { repo } = makeRepo();
+  const ghCalls: string[][] = [];
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: PR_CFG,
+    ghCalls,
+    sendFails: 2,
+  });
+  let now = Date.now();
+  deps.now = () => now;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["published"])[0]!;
+  assert.match(rel.notice_text ?? "", /PR открыт/, "строка п.1 сохранена");
+  ghView(deps, JSON.stringify({ state: "MERGED", mergedAt: "2026-01-01", mergeCommit: { oid: "abc1234" } }));
+  now += 6 * 60 * 1000;
+  await pumpReleases(deps);
+  // вторая отправка тоже упала — недоставленная строка не затирается:
+  // gh даже не опрашивался, перехода нет, «PR влит» не ушёл
+  assert.equal(sent.length, 0);
+  assert.ok(
+    !ghCalls.some((a) => a[0] === "pr" && a[1] === "view"),
+    "gh pr view не вызывался, пока строка недоставлена",
+  );
+  assert.equal(store.getRelease(rel.id)!.pr_state, "open");
+  // send починился — досмотр доносит п.1, затем обычный переход MERGED
+  await pumpReleases(deps);
+  assert.match(sent[0] ?? "", /PR открыт PLUG-1:/);
+  assert.match(sent[1] ?? "", /PR влит PLUG-1:/);
+  assert.equal(store.getRelease(rel.id)!.pr_state, "merged");
 });
 
 test("r10 п.2: plugin reload упал — «перезагрузка не удалась: <ошибка>»", async () => {

@@ -105,8 +105,12 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   **Deterministic outcome (§2 r10):** one release at a time per
   repository+target (guarded by the release row's `repo_root`), one
   outcome line per release — success, post-check findings and the
-  postPublish result fold into it, sent under a `notified_at` claim and
-  re-sent by the pump when a tick died before the line. The audit has
+  postPublish result fold into it. The line is stored in the release
+  row (`notice_text`) before it is sent and kept until delivered
+  (`notified_at`): a pump retry only resends the stored text — it never
+  reruns the post-check, postPublish, or `automation create`. A gone
+  coordinator thread is not an eternal retry: the text lands as a task
+  comment and the notice is confirmed. The audit has
   30 minutes from its first dispatch; a reviewer or the auditor ending
   a turn without a verdict gets ONE reminder, a second verdict-less
   turn ends the round without OK (the auditor's release is rejected

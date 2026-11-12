@@ -2373,6 +2373,18 @@ export interface ReleaseNoticeDeps {
  * the claimResultDelivery protocol) is retaken by the next tick. A
  * gone coordinator thread is not an eternal retry: the text lands as
  * a task comment and the notice is confirmed (spec п.5). */
+/** §2 r10 п.5 (ревью PLUG-244 заход 4, Н5): «тред не найден» — только
+ * по коду ошибки SDK (`experimental_PluginRpcCallError.code ===
+ * "not_found"`), не по тексту сообщения: ENOTFOUND/DNS и чужой 404 —
+ * временный сбой с обычным повтором, а не комментарий в задачу. */
+function isThreadGoneError(e: unknown): boolean {
+  return (
+    typeof e === "object" &&
+    e !== null &&
+    (e as { code?: unknown }).code === "not_found"
+  );
+}
+
 export async function deliverReleaseNotice(
   deps: ReleaseNoticeDeps,
   row: ReleaseRow,
@@ -2392,7 +2404,7 @@ export async function deliverReleaseNotice(
       ],
     });
   } catch (e) {
-    if (/not.?found|does not exist|deleted|archiv/i.test(message(e))) {
+    if (isThreadGoneError(e)) {
       await commentOnTask(deps, row.task_key, text);
       deps.store.confirmReleaseNotify(row.id, text);
       return true;
@@ -2422,8 +2434,23 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
   for (const row of deps.store.pendingReleaseNotices()) {
     try {
       const fresh = deps.store.getRelease(row.id) ?? row;
+      if (fresh.notice_kind === "self-reload" && fresh.notice_text != null) {
+        // ревью PLUG-244 заход 4 (Н2): крах между сохранением строки и
+        // `automation create` — автоматизации может не быть. create
+        // повторно не выполняем (спека п.5): сохранённая строка уходит
+        // обычной отправкой с пометкой «автоматизация не подтверждена».
+        deps.store.setReleaseNotice(
+          fresh.id,
+          "published",
+          `${fresh.notice_text}\nперезагрузи orchestrator вручную: ` +
+            `автоматизация не подтверждена`,
+        );
+      }
       if (fresh.notice_text != null) {
-        await deliverReleaseNotice(deps, fresh);
+        await deliverReleaseNotice(
+          deps,
+          deps.store.getRelease(row.id) ?? fresh,
+        );
       } else if (fresh.status === "published") {
         await finishPublished(deps, fresh, null);
       }
@@ -2619,6 +2646,11 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
         deps.store.transitionPrState(row.id, ["open", "closed"], "superseded");
         continue;
       }
+      // ревью PLUG-244 заход 4 (Н1): у записи недоставленная строка —
+      // PR-переход откладывается, иначе setReleaseNotice затёр бы её
+      // до доставки; досмотр донесёт текст, переход сделает следующий
+      // такт.
+      if (row.notice_text != null) continue;
       if (row.pr_checked_at && now - row.pr_checked_at < PR_WATCH_INTERVAL_MS)
         continue;
       const res = await deps.cmd.run(
@@ -3073,7 +3105,11 @@ async function finishPublished(
   // §2 r10 п.5: работа выполнена и текст собран — сначала строка
   // сохраняется в записи, метка base снимается (повтор такта уже не
   // гоняет работу), затем отправка сохранённого текста.
-  deps.store.setReleaseNotice(fresh.id, "published", line);
+  deps.store.setReleaseNotice(
+    fresh.id,
+    selfReload ? "self-reload" : "published",
+    line,
+  );
   deps.store.metaDelete(POSTPUBLISH_META(fresh.id));
   if (selfReload) {
     // §6 r10: the plugin cannot reload ITSELF — a one-shot bb
@@ -3168,7 +3204,7 @@ async function runPostPublish(
           (await realpath(coOriginRaw).catch(() => coOriginRaw)) ===
             (await realpath(repoOriginRaw).catch(() => repoOriginRaw)));
   if (!sameRepo) {
-    return fail("копия не обновлена — другой репозиторий");
+    return fail("другой репозиторий — не обновлена");
   }
   const curBranch = await gitOut(["symbolic-ref", "--short", "-q", "HEAD"]).catch(
     () => "",
