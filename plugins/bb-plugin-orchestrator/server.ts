@@ -269,7 +269,7 @@ export async function createPlugin(
     },
     gitInstructions: {
       type: "string",
-      label: "Git instructions",
+      label: "Working with git",
       description:
         '"Working with git" section (§2.2) prepended to every dispatch\'s --instructions. Empty disables the section.',
       experimental_multiline: true,
@@ -2161,7 +2161,9 @@ abandoned: ${res.reported
                                 `${i.branch ?? i.envId} (${i.reason}` +
                                 (i.reason === "squash-suspect"
                                   ? t("cli.squashSuspect")
-                                  : "") +
+                                  : i.reason === "content-on-target"
+                                    ? t("cli.contentOnTarget")
+                                    : "") +
                                 ")",
                             )
                             .join(", ")}`
@@ -2206,7 +2208,9 @@ abandoned: ${res.reported
                 out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"} (${i.reason}` +
                   (i.reason === "squash-suspect"
                     ? t("cli.squashSuspect")
-                    : "") +
+                    : i.reason === "content-on-target"
+                      ? t("cli.contentOnTarget")
+                      : "") +
                   ")\n";
               }
             }

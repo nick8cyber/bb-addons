@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -2422,6 +2422,32 @@ test("§4.1: a dirty copy reports to the coordinator", async () => {
     /сомнителен/.test(JSON.stringify(s.input)),
   )!;
   assert.match(JSON.stringify(note.input), /грязная/);
+});
+
+test("§4.1 (PLUG-250): untracked node_modules — dir or symlink — is not «dirty»", async () => {
+  for (const kind of ["dir", "link"] as const) {
+    const repo = makeExecutorRepo({ commits: 1 });
+    if (kind === "dir") {
+      mkdirSync(join(repo, "node_modules", "dep"), { recursive: true });
+      writeFileSync(join(repo, "node_modules", "dep", "x.js"), "x");
+    } else {
+      symlinkSync("shared-store", join(repo, "node_modules"));
+    }
+    const h = makeHarness({ round: roundDeps(repo) });
+    const row = await runToDone(h);
+    await settleResults(h);
+    const fresh = h.store.get(row.id)!;
+    assert.equal(fresh.result_dirty, 0, `node_modules ${kind} is clean`);
+    assert.doesNotMatch(fresh.setup_errors, /грязная|round-problems/);
+  }
+  // …while a real untracked file next to node_modules still counts
+  const repo = makeExecutorRepo({ commits: 1 });
+  mkdirSync(join(repo, "node_modules"), { recursive: true });
+  writeFileSync(join(repo, "dirty.txt"), "x");
+  const h = makeHarness({ round: roundDeps(repo) });
+  const row = await runToDone(h);
+  await settleResults(h);
+  assert.equal(h.store.get(row.id)!.result_dirty, 1);
 });
 
 test("§4.1: zero commits reports to the coordinator", async () => {

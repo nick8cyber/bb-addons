@@ -532,6 +532,19 @@ test("§18.5: parseEventHooks — разбор и ошибки", () => {
   assert.equal(dup.hooks.length, 1);
   assert.equal(dup.errors.length, 1);
   assert.equal(dup.errors[0].path, "eventHooks[1].name");
+  // PLUG-250: управляющие символы в имени — ошибка разбора; «\0broken»
+  // совпал бы с ключом-маркером доверия HOOKS_BROKEN_KEY
+  const ctrl = parseEventHooks(
+    JSON.stringify([
+      { name: "\0broken", on: ["e"], run: ["x"] },
+      { name: "ok", on: ["e"], run: ["x"] },
+    ]),
+  );
+  assert.equal(ctrl.hooks.length, 1);
+  assert.equal(ctrl.hooks[0].name, "ok");
+  assert.equal(ctrl.errors.length, 1);
+  assert.equal(ctrl.errors[0].path, "eventHooks[0].name");
+  assert.equal(effectiveHooks(ctrl).length, 0);
   // любая ошибка — действующий список пуст (хуки не запускаются вовсе)
   assert.equal(effectiveHooks(dup).length, 0);
   assert.equal(

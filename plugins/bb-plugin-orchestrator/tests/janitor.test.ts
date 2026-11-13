@@ -3350,15 +3350,16 @@ test("a branch-unpushed orphan idle over abandonedAfter is reported (PLUG-195)",
   assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/o"]));
 });
 
-test("U2: a squash of two or more commits stays — reported «похоже, влито squash» (PLUG-201)", async () => {
+test("U2: a squash of two or more commits stays — reported «содержимое совпадает с целью» (PLUG-201/250)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w1.txt", "feat: part 1");
   commitIn(env.path, "w2.txt", "feat: part 2");
   // a single squash commit on main holds both changes — no commit of
   // bb/a is patch-equivalent (`git cherry` says «+»), so the copy is
-  // never «влита»; merging it adds nothing, which earns the manual
-  // flag in the report — removal is off the table (PLUG-201)
+  // never «влита»; every file the branch changed sits on main at the
+  // branch's version — the report flag says so, removal stays off
+  // the table (§16.3: ancestry + patch-id --verbatim decide)
   writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
   writeFileSync(join(repo, "w2.txt"), "feat: part 2\n");
   git(repo, ["add", "."]);
@@ -3376,9 +3377,180 @@ test("U2: a squash of two or more commits stays — reported «похоже, в�
   assert.ok(existsSync(env.path));
   const item = res.reported.find((r) => r.envId === env.id);
   assert.ok(item);
-  assert.equal(item.reason, "squash-suspect");
+  assert.equal(item.reason, "content-on-target");
   assert.equal(w.janitor.item(env.id)!.state, "reported");
   git(repo, ["rev-parse", "--verify", env.branchName]);
+});
+
+test("a commit rebuilt on merge (`git cherry` «+», identical code) — «содержимое совпадает с целью» flag (PLUG-250)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  // the merge on main rebuilt the commit — different sha and patch
+  // (a README hunk came along), `git cherry` stays «+», but every
+  // file the branch changed matches its version on main: the copy is
+  // flagged for a manual check, never removed (§16.3)
+  writeFileSync(join(repo, "w.txt"), "feat: work\n");
+  writeFileSync(join(repo, "README.md"), "release notes\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: work (rebuilt)"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  const item = res.reported.find((r) => r.envId === env.id);
+  assert.ok(item);
+  assert.equal(item.reason, "content-on-target");
+});
+
+test("a patch differing only in whitespace (`git cherry` «-», verbatim misses) — «содержимое совпадает с целью» flag (PLUG-250)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "w.txt"), "line\n  indented\n");
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "-m", "feat: work"]);
+  // the same patch with a different indent — «-» to cherry's
+  // --stable patch-id, a miss to --verbatim; the blobs differ too,
+  // so only the cherry sign flags this copy
+  writeFileSync(join(repo, "w.txt"), "line\n    indented\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: work"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  const item = res.reported.find((r) => r.envId === env.id);
+  assert.ok(item);
+  assert.equal(item.reason, "content-on-target");
+});
+
+test("a rename keeps the deleted old name on the checklist — no content flag (--no-renames, PLUG-250 r2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  git(env.path, ["mv", "f.txt", "g.txt"]);
+  git(env.path, ["commit", "-m", "refactor: rename f to g"]);
+  // the target has g.txt at the branch's version but keeps f.txt —
+  // with rename detection on, the changed-file list holds only g.txt
+  // and the un-checked deletion of f.txt fakes «content matches»
+  writeFileSync(join(repo, "g.txt"), "base\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: add g"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
+});
+
+test("a pathspec-magic name («:/x») is checked literally — no content flag (--literal-pathspecs, PLUG-250 r2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  // a directory literally named «:» — «:/x» is valid pathspec magic
+  // («from the root, path x») and would silently check the wrong file
+  mkdirSync(join(env.path, ":"));
+  writeFileSync(join(env.path, ":", "x"), "magic\n");
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "-m", "feat: oddly named file"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
+});
+
+test("a file deleted on the target never flags — no content match (PLUG-250 r2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "branch version\n");
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "-m", "feat: branch edits f"]);
+  // the target dropped the file — it cannot sit there «at the
+  // branch's version»
+  git(repo, ["rm", "-q", "f.txt"]);
+  git(repo, ["commit", "-m", "chore: drop f"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
+});
+
+test("a partial squash keeps no flag — only part of the content is on the target (PLUG-250 r2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w1.txt", "feat: part 1");
+  commitIn(env.path, "w2.txt", "feat: part 2");
+  // the squash on main holds only part 1 — w2.txt is not on the
+  // target at the branch's version (it is not there at all)
+  writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: squashed part 1 only"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
+});
+
+test("a binary file the target holds differently never flags (PLUG-250 r2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "bin.dat"), Buffer.from([0, 1, 2, 3]));
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "-m", "feat: add bin"]);
+  writeFileSync(join(repo, "bin.dat"), Buffer.from([9, 8, 7, 6, 5]));
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: add bin"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
+});
+
+test("the target moving ahead on the same file keeps no flag (PLUG-250 r2)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: branch edits");
+  // both sides touched w.txt — the target's version is not the
+  // branch's
+  writeFileSync(join(repo, "w.txt"), "target ahead\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: target edits w"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
 });
 
 test("PROBE3: a commit + reset between the snapshot and the archive keeps the copy (PLUG-195)", async () => {
@@ -3587,9 +3759,10 @@ test("a squash that rewrote an earlier commit keeps the copy — «брошен�
   writeFileSync(join(env.path, "s.txt"), "feat: v2\n");
   git(env.path, ["add", "."]);
   git(env.path, ["commit", "-m", "feat: v2 rewrites v1"]);
-  // the squash on origin holds only the final content: the tip merges
-  // as a no-op («похоже, влито squash» — report flag), but A's own
-  // content never reached origin and the copy is never deleted
+  // the squash on origin holds only the final content: the tip's
+  // files match the target («содержимое совпадает с целью» — report
+  // flag), but A's own content never reached origin and the copy is
+  // never deleted
   writeFileSync(join(repo, "s.txt"), "feat: v2\n");
   git(repo, ["add", "."]);
   git(repo, ["commit", "-m", "feat: squashed v2 only"]);
@@ -3615,7 +3788,7 @@ test("a squash that rewrote an earlier commit keeps the copy — «брошен�
   const res = await w.jan.run();
   assert.equal(res.removedCopies, 0);
   assert.ok(existsSync(env.path));
-  assert.equal(res.reported[0]!.reason, "squash-suspect");
+  assert.equal(res.reported[0]!.reason, "content-on-target");
   assert.ok(
     git(env.path, ["log", "-g", "--format=%H", "HEAD"]).includes(a),
   );
@@ -4380,7 +4553,9 @@ test("PW: «spaces → tab» is not patch-equivalent to «spaces → two spaces�
   git(env.path, ["commit", "-m", "fix: real tab in recipe"]);
   // origin gains «the same» change with 2 spaces: `git cherry` calls A
   // «-» (stable patch-ids ignore whitespace) — verbatim they differ,
-  // so the tab is unpublished work
+  // so the tab is unpublished work; the cherry sign still flags the
+  // copy for a manual check (report only — it is never removed,
+  // PLUG-250)
   writeFileSync(join(repo, "Makefile"), "all:\n  echo hi\n");
   git(repo, ["add", "Makefile"]);
   git(repo, ["commit", "-m", "fix: two-space indent"]);
@@ -4405,7 +4580,7 @@ test("PW: «spaces → tab» is not patch-equivalent to «spaces → two spaces�
   assert.equal(res.removedCopies, 0);
   assert.deepEqual(w.archivedCalls, []);
   assert.ok(existsSync(env.path));
-  assert.equal(res.reported[0]!.reason, "abandoned-unmerged");
+  assert.equal(res.reported[0]!.reason, "content-on-target");
 });
 
 test("WR: a commit held only by refs/worktree/* or refs/bisect/* keeps the copy (PLUG-202)", async () => {
@@ -4536,13 +4711,11 @@ test("copy-less unmerged bb/ branches: daily message counts + first 10, full lis
 test("git < 2.40: no --attr-source → no squash flag, one journal line (PLUG-202)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
-  commitIn(env.path, "w1.txt", "feat: part 1");
-  commitIn(env.path, "w2.txt", "feat: part 2");
-  writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
-  writeFileSync(join(repo, "w2.txt"), "feat: part 2\n");
-  git(repo, ["add", "."]);
-  git(repo, ["commit", "-m", "feat: squashed both parts"]);
-  git(repo, ["push", "origin", "main"]);
+  commitIn(env.path, "a.txt", "feat: A");
+  // «A + revert A»: the tip merges as a no-op — the only shape still
+  // needing the merge-tree flag (PLUG-250: a real squash gets the
+  // file-content flag, which needs no --attr-source)
+  git(env.path, ["revert", "--no-edit", "HEAD"]);
   const oldGit: CmdRunner = {
     run: async (f, a, o) =>
       f === "git" && a[0] === "--version"
