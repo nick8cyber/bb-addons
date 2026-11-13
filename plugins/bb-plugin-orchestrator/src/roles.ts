@@ -24,6 +24,24 @@ export const ROLE_INSTRUCTIONS_MAX = 2500;
  * `handoffPath` setting substitutes it. */
 export const DEFAULT_HANDOFF_PATH = "$BB_THREAD_STORAGE/HANDOFF.md";
 
+/** §18.6: `handoffPath` is one line of at most 256 characters. */
+export const HANDOFF_PATH_MAX = 256;
+
+/**
+ * §18.6: validation error for `handoffPath`, or null when the value is
+ * usable (empty falls back to DEFAULT_HANDOFF_PATH). The setting schema
+ * refuses bad writes; this catches values that bypassed it.
+ */
+export function handoffPathError(text: string | undefined): string | null {
+  if (text === undefined) return null;
+  const t = text.trim();
+  if (!t) return null;
+  if (/[\r\n]/.test(t)) return "handoffPath должен быть одной строкой";
+  return t.length > HANDOFF_PATH_MAX
+    ? `handoffPath длиннее ${HANDOFF_PATH_MAX} символов (${t.length})`
+    : null;
+}
+
 /** §18.6: the review level's name in the orchestrator text without a
  * policy (and when the policy declares no auditor level). */
 export const DEFAULT_REVIEW_LEVEL = "review";
@@ -199,7 +217,16 @@ export interface RoleTextsLoad {
  * that pushes the composed text over the §3 2500-char budget is an
  * error, as is any other key.
  */
-export function parseRoleTexts(text: string | undefined): RoleTextsLoad {
+export function parseRoleTexts(
+  text: string | undefined,
+  opts?: {
+    /** §18.6: the REAL `handoffPath`/`reviewLevel` substitutions — the
+     * 2500-char limit is checked on the composed text with them, not
+     * the defaults. */
+    handoffPath?: string | undefined;
+    reviewLevel?: string | undefined;
+  },
+): RoleTextsLoad {
   const errors: PolicyIssue[] = [];
   const texts: RoleTextsLoad["texts"] = {};
   const done = (): RoleTextsLoad => ({ texts: {}, errors });
@@ -238,8 +265,11 @@ export function parseRoleTexts(text: string | undefined): RoleTextsLoad {
     const extra = value.trim();
     if (!extra) continue;
     if (
-      roleInstructions(key as RoleId, { extra }).length >
-      ROLE_INSTRUCTIONS_MAX
+      roleInstructions(key as RoleId, {
+        extra,
+        handoffPath: opts?.handoffPath,
+        reviewLevel: opts?.reviewLevel,
+      }).length > ROLE_INSTRUCTIONS_MAX
     ) {
       errors.push({
         path,

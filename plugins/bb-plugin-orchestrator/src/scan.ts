@@ -5,9 +5,12 @@
  * range `merge-base(origin/<цель>, HEAD)..HEAD` (§16.6 — a finding added
  * and removed inside the range is still caught) plus the release diff's
  * added lines and the commit metadata. Category 1 (secrets) always
- * blocks; in category 2 a signature mismatch blocks only when
- * `commitIdentity` is configured — a missing one warns (§4 r11) — and
- * foreign-bot trailers follow `leaks.trailers` (§18.6); 3-4 follow the
+ * blocks; in category 2 a signature mismatch blocks whenever an
+ * identity IS configured, a MISSING `commitIdentity` only warns
+ * (§4 r11/§18.6 — `status` reports it), and a `"repo"` identity the
+ * repo config cannot resolve blocks with
+ * «в конфиге репозитория не задан user.name/user.email»; foreign-bot
+ * trailers follow `leaks.trailers` (§18.6); 3-4 follow the
  * project's `leaks` strictness with `allow` places where such mentions
  * are the norm. `thr_…` ids are exempt only while the project's
  * `threadIds` is on (§16.6).
@@ -46,6 +49,25 @@ export interface AddedLine {
   line: number;
   text: string;
 }
+
+/**
+ * §4 r11/§18.6: how the category-2 signature check resolved the
+ * project's `commitIdentity` — the states decide the finding's
+ * severity and suffix:
+ * - `resolved` — the allowed name/email to match (mismatch blocks);
+ * - `unset` — no `commitIdentity` configured: the finding WARNS;
+ * - `repo-unset` — `commitIdentity: "repo"` but the repo config has no
+ *   `user.name`/`user.email`: the finding BLOCKS (as before r11);
+ * - `invalid` — a configured literal that does not parse: BLOCKS;
+ * - `strict` — the post-check without a release config, where the
+ *   pre-§18.6 strict defaults apply: BLOCKS.
+ */
+export type IdentityResolution =
+  | { state: "resolved"; name: string; email: string }
+  | { state: "unset" }
+  | { state: "repo-unset" }
+  | { state: "invalid" }
+  | { state: "strict" };
 
 export const EMPTY_TREE_SHA =
   "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -400,7 +422,7 @@ function scanAddedLines(
 
 function scanCommitMeta(
   commits: readonly CommitMeta[],
-  allowed: { name: string; email: string } | undefined,
+  identity: IdentityResolution,
   leaks: ResolvedProject["leaks"],
   hostname: string | undefined,
   threadIds = true,
@@ -413,11 +435,11 @@ function scanCommitMeta(
   for (const c of commits) {
     // Category 2 — the signature must equal the configured one.
     const ok =
-      allowed !== undefined &&
-      c.authorName === allowed.name &&
-      c.authorEmail === allowed.email &&
-      c.committerName === allowed.name &&
-      c.committerEmail === allowed.email;
+      identity.state === "resolved" &&
+      c.authorName === identity.name &&
+      c.authorEmail === identity.email &&
+      c.committerName === identity.name &&
+      c.committerEmail === identity.email;
     if (!ok) {
       findings.push({
         category: 2,
@@ -427,13 +449,18 @@ function scanCommitMeta(
         problem:
           `коммит ${short(c.sha)}: подпись ` +
           `${c.authorName} <${c.authorEmail}> / ${c.committerName} <${c.committerEmail}>` +
-          (allowed
-            ? ` не совпадает с разрешённой ${allowed.name} <${allowed.email}>`
-            : " — commitIdentity не задан в настройке release"),
-        // §4 r11/§18.6: a signature mismatch blocks the release; a
-        // MISSING commitIdentity only warns — the pipeline goes on and
-        // `status` reports the absent configuration.
-        severity: allowed ? "block" : "warn",
+          (identity.state === "resolved"
+            ? ` не совпадает с разрешённой ${identity.name} <${identity.email}>`
+            : identity.state === "repo-unset"
+              ? " — в конфиге репозитория не задан user.name/user.email"
+              : identity.state === "invalid"
+                ? " — commitIdentity не удалось разобрать"
+                : " — commitIdentity не задан в настройке release"),
+        // §4 r11/§18.6: only a MISSING commitIdentity warns — the
+        // pipeline goes on and `status` reports the absent
+        // configuration. An identity that is configured but
+        // unresolvable (or the post-check's strict fallback) blocks.
+        severity: identity.state === "unset" ? "warn" : "block",
       });
     }
     const trailers = foreignTrailers(c.body, allowedTrailers);
@@ -671,7 +698,9 @@ export async function machineScan(
     /** Added lines across every commit's patch in the range (§16.6). */
     patches?: readonly AddedLine[];
     leaks: ResolvedProject["leaks"];
-    allowedAuthor?: { name: string; email: string } | undefined;
+    /** §18.6: the resolved `commitIdentity` state — absent means
+     * `unset` (the signature check only warns). */
+    identity?: IdentityResolution;
     hostname?: string | undefined;
     /** §16.6 `threadIds` — default `true` (`thr_…` is not a leak). */
     threadIds?: boolean;
@@ -688,7 +717,7 @@ export async function machineScan(
   findings.push(
     ...scanCommitMeta(
       input.commits,
-      input.allowedAuthor,
+      input.identity ?? { state: "unset" },
       input.leaks,
       input.hostname,
       input.threadIds ?? true,

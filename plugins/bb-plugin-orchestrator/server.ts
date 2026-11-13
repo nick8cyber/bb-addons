@@ -66,11 +66,14 @@ import {
 import {
   DEFAULT_HANDOFF_PATH,
   DEFAULT_USER_THREAD_PLUGINS,
+  HANDOFF_PATH_MAX,
   handleMessageDispatch,
+  handoffPathError,
   isRoleId,
   parseRoleTexts,
   PICKABLE_ROLE_IDS,
   reviewLevelName,
+  ROLE_INSTRUCTIONS_MAX,
   roleForLevel,
   roleInstructions,
   roleTextsError,
@@ -167,6 +170,24 @@ interface PresetListEntry {
 const describeError = (e: unknown) =>
   e instanceof Error ? e.message : String(e);
 
+/** §18.6: refuse a multi-line or over-limit `handoffPath` at write time. */
+const handoffPathSchema: StandardSchemaV1<string, string> = {
+  "~standard": {
+    version: 1,
+    vendor: "orchestrator",
+    validate: (v) =>
+      typeof v === "string" && !handoffPathError(v)
+        ? { value: v }
+        : {
+            issues: [
+              {
+                message: `one line, at most ${HANDOFF_PATH_MAX} characters`,
+              },
+            ],
+          },
+  },
+};
+
 /** §2.2: refuse over-limit `gitInstructions` at write time. */
 const gitInstructionsSchema: StandardSchemaV1<string, string> = {
   "~standard": {
@@ -234,7 +255,7 @@ export async function createPlugin(
       type: "string",
       label: "User thread plugins",
       description:
-        "§17.1: plugin ids whose threads continue a human chat (session handoff, chat compaction into a new thread) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default EMPTY — an existing install keeps its own list (the author's sets `handoff, external-compact`).",
+        "§17.1: plugin ids whose threads continue a human chat (session handoff, chat compaction into a new thread) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default EMPTY — only an explicitly saved value is kept (the author's sets `handoff, external-compact`).",
       default: "",
     },
     roleTexts: {
@@ -249,7 +270,8 @@ export async function createPlugin(
       type: "string",
       label: "Handoff path",
       description:
-        "§18.6: the handoff file path shown in role texts and the §16.5 compaction reminder. Empty — the default `$BB_THREAD_STORAGE/HANDOFF.md`.",
+        "§18.6: the handoff file path shown in role texts and the §16.5 compaction reminder — one line, at most 256 characters. Empty — the default `$BB_THREAD_STORAGE/HANDOFF.md`.",
+      experimental_schema: handoffPathSchema,
       default: DEFAULT_HANDOFF_PATH,
     },
     maxConcurrentCommands: {
@@ -464,23 +486,41 @@ export async function createPlugin(
   );
   // §18.6 (PLUG-249): roleTexts — дополнение к текстам ролей; битый
   // документ игнорируется целиком и виден в status/needs-configuration.
-  let roleTextsLoad = parseRoleTexts(currentSettings.roleTexts ?? "");
-  for (const e of roleTextsLoad.errors) {
-    bb.log.warn(`orchestrator roleTexts: ${e.path}: ${e.message}`);
-  }
+  // §18.6: handoffPath — одна строка ≤ 256 символов; невалидное
+  // значение игнорируется (действует умолчание) и видно в status.
   const handoffPath = (): string => {
     const p = currentSettings.handoffPath?.trim();
-    return p ? p : DEFAULT_HANDOFF_PATH;
+    return p && !handoffPathError(p) ? p : DEFAULT_HANDOFF_PATH;
   };
-  /** §18.6: эффективный текст роли — тело + roleTexts + обязательный
-   * хвост; {handoff} из настройки, {review} — имя уровня по политике. */
-  const roleTextFor = (id: RoleId): string =>
-    roleInstructions(id, {
-      extra:
-        id === "release-auditor" ? undefined : roleTextsLoad.texts[id],
+  /** Предел 2500 проверяется на итоговом тексте с РЕАЛЬНЫМИ
+   * подстановками — текущими handoffPath и именем уровня ревью из
+   * политики, а не умолчаниями. */
+  const parseRoleTextsNow = () =>
+    parseRoleTexts(currentSettings.roleTexts ?? "", {
       handoffPath: handoffPath(),
       reviewLevel: reviewLevelName(policyLoad.policy),
     });
+  let roleTextsLoad = parseRoleTextsNow();
+  for (const e of roleTextsLoad.errors) {
+    bb.log.warn(`orchestrator roleTexts: ${e.path}: ${e.message}`);
+  }
+  /** §18.6: эффективный текст роли — тело + roleTexts + обязательный
+   * хвост; {handoff} из настройки, {review} — имя уровня по политике. */
+  const roleTextFor = (id: RoleId): string => {
+    const opts = {
+      handoffPath: handoffPath(),
+      reviewLevel: reviewLevelName(policyLoad.policy),
+    };
+    const extra =
+      id === "release-auditor" ? undefined : roleTextsLoad.texts[id];
+    const text = roleInstructions(id, { extra, ...opts });
+    // Подстановки могли вырасти уже после разбора (смена политики,
+    // handoffPath) — текст за пределом 2500 теряет дополнение, чтобы
+    // обязательный хвост не обрезался лимитом SDK (роль+правило ≤ 4096).
+    return extra && text.length > ROLE_INSTRUCTIONS_MAX
+      ? roleInstructions(id, opts)
+      : text;
+  };
   const janitorConfig = (): JanitorConfigLoad =>
     parseJanitorConfig(currentSettings.janitor ?? "");
   {
@@ -515,6 +555,12 @@ export async function createPlugin(
         for (const w of load.warnings) {
           bb.log.warn(`orchestrator: ${w.path}: ${w.message}`);
         }
+        // §18.6: имя уровня ревью входит в текст оркестратора — смена
+        // политики перепроверяет roleTexts на новых подстановках.
+        roleTextsLoad = parseRoleTextsNow();
+        for (const e of roleTextsLoad.errors) {
+          bb.log.warn(`orchestrator roleTexts: ${e.path}: ${e.message}`);
+        }
         refreshStatus();
       })
       .catch(() => undefined)
@@ -524,40 +570,50 @@ export async function createPlugin(
   };
 
   const refreshStatus = () => {
+    // §18.6 (ревью Н3): проблемы не прячут друг друга — все битые
+    // настройки перечисляются одной строкой, а не только первая.
+    const problems: string[] = [];
     const first = policyLoad.errors[0];
-    const gitError = gitInstructionsError(currentSettings.gitInstructions);
-    let problem: string | null = null;
     if (first) {
       const rest =
         policyLoad.errors.length > 1
           ? ` (+${policyLoad.errors.length - 1} ещё)`
           : "";
-      problem =
+      problems.push(
         `${first.path}: ${first.message}${rest} — ` +
-        "исправьте `policy` и выполните `bb plugin reload orchestrator`";
-    } else if (releaseConfig.errors.length) {
-      const first = releaseConfig.errors[0]!;
-      problem =
-        `release: ${first.path}: ${first.message}` +
-        (releaseConfig.errors.length > 1
-          ? ` (+${releaseConfig.errors.length - 1} ещё)`
-          : "") +
-        " — исправьте `release` и выполните `bb plugin reload orchestrator`";
-    } else if (gitError) {
-      problem =
-        `${gitError} — исправьте ` +
-        "`gitInstructions` и выполните `bb plugin reload orchestrator`";
-    } else {
-      const textsError = roleTextsError(roleTextsLoad);
-      if (textsError) {
-        problem =
-          `${textsError} — исправьте ` +
-          "`roleTexts` и выполните `bb plugin reload orchestrator`";
-      }
+          "исправьте `policy`",
+      );
+    }
+    if (releaseConfig.errors.length) {
+      const e = releaseConfig.errors[0]!;
+      problems.push(
+        `release: ${e.path}: ${e.message}` +
+          (releaseConfig.errors.length > 1
+            ? ` (+${releaseConfig.errors.length - 1} ещё)`
+            : "") +
+          " — исправьте `release`",
+      );
+    }
+    const gitError = gitInstructionsError(currentSettings.gitInstructions);
+    if (gitError) {
+      problems.push(`${gitError} — исправьте ` + "`gitInstructions`");
+    }
+    const hpError = handoffPathError(currentSettings.handoffPath);
+    if (hpError) {
+      problems.push(`${hpError} — исправьте ` + "`handoffPath`");
+    }
+    const textsError = roleTextsError(roleTextsLoad);
+    if (textsError) {
+      problems.push(`${textsError} — исправьте ` + "`roleTexts`");
     }
     // needs-configuration clears only on plugin reload (SDK V1), so the
     // message tells the user how to re-check after fixing the setting.
-    if (problem) bb.status.needsConfiguration(`orchestrator: ${problem}`);
+    if (problems.length) {
+      bb.status.needsConfiguration(
+        `orchestrator: ${problems.join("; ")}` +
+          " — затем `bb plugin reload orchestrator`",
+      );
+    }
   };
   // §18.4 (PLUG-245): доверие по снимку исполняемых настроек —
   // первый снимок молча, расхождение — строка координаторам с
@@ -601,7 +657,7 @@ export async function createPlugin(
     for (const e of hooksLoad.errors) {
       bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
     }
-    roleTextsLoad = parseRoleTexts(currentSettings.roleTexts ?? "");
+    roleTextsLoad = parseRoleTextsNow();
     for (const e of roleTextsLoad.errors) {
       bb.log.warn(`orchestrator roleTexts: ${e.path}: ${e.message}`);
     }

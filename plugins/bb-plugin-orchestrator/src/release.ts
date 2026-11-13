@@ -39,6 +39,7 @@ import {
   formatFinding,
   maskSecrets,
   type CommitMeta,
+  type IdentityResolution,
   type ScanFinding,
 } from "./scan.js";
 import {
@@ -1043,15 +1044,24 @@ async function commitRange(
   return out;
 }
 
-async function allowedAuthor(
+/**
+ * §18.6: resolves the project's `commitIdentity` into the scan's
+ * IdentityResolution — `unset` (nothing configured → the check warns),
+ * `resolved` (a literal or a `"repo"` the repo config answers),
+ * `repo-unset` (`"repo"` without user.name/user.email → the check
+ * blocks) and `invalid` (an unparseable literal → blocks).
+ */
+export async function resolveCommitIdentity(
   deps: ReleaseDeps,
   repo: string,
   identity: string | undefined,
-): Promise<{ name: string; email: string } | undefined> {
-  if (!identity) return undefined;
+): Promise<IdentityResolution> {
+  if (!identity) return { state: "unset" };
   if (identity !== "repo") {
     const m = /^([^\n<>]+?)\s*<([^\s<>]+@[^\s<>]+)>\s*$/.exec(identity);
-    return m ? { name: m[1]!, email: m[2]! } : undefined;
+    return m
+      ? { state: "resolved", name: m[1]!, email: m[2]! }
+      : { state: "invalid" };
   }
   const name = await git(deps, repo, ["config", "user.name"], {
     allowFail: true,
@@ -1059,8 +1069,8 @@ async function allowedAuthor(
   const email = await git(deps, repo, ["config", "user.email"], {
     allowFail: true,
   });
-  if (!name.trim() || !email.trim()) return undefined;
-  return { name: name.trim(), email: email.trim() };
+  if (!name.trim() || !email.trim()) return { state: "repo-unset" };
+  return { state: "resolved", name: name.trim(), email: email.trim() };
 }
 
 // ── Step 5: audit packet + verdict ─────────────────────────────────────
@@ -2194,7 +2204,11 @@ async function runReleaseSteps(
         `${baseSha}..${headSha}`,
       ]),
     );
-    const allowed = await allowedAuthor(deps, repo, project.commitIdentity);
+    const identity = await resolveCommitIdentity(
+      deps,
+      repo,
+      project.commitIdentity,
+    );
     const findings = await machineScan(deps.cmd, {
       repoPath: repo,
       baseSha,
@@ -2203,7 +2217,7 @@ async function runReleaseSteps(
       added,
       patches,
       leaks: project.leaks,
-      allowedAuthor: allowed,
+      identity,
       hostname: deps.hostname ?? osHostname(),
       threadIds: project.threadIds,
       allowedTrailers: project.allowedTrailers,
@@ -4669,7 +4683,9 @@ async function postCheck(
       const cfg = deps.loadReleaseConfig().config;
       // §2 шаг 7: the same project rules as step 4 — the repo's project
       // settings (leaks, commitIdentity, threadIds, allowlists). Without
-      // a release config the previous strict defaults apply.
+      // a release config the previous strict defaults apply — including
+      // the signature check, which BLOCKS (`strict`) instead of the
+      // §18.6 warn.
       const proj: Pick<
         ResolvedProject,
         | "leaks"
@@ -4709,7 +4725,9 @@ async function postCheck(
         added,
         patches,
         leaks: proj.leaks,
-        allowedAuthor: await allowedAuthor(deps, repo, proj.commitIdentity),
+        identity: cfg
+          ? await resolveCommitIdentity(deps, repo, proj.commitIdentity)
+          : { state: "strict" },
         hostname: deps.hostname ?? osHostname(),
         threadIds: proj.threadIds,
         allowedTrailers: proj.allowedTrailers,

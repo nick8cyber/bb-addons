@@ -941,3 +941,67 @@ test("§18.6: status reports a missing commitIdentity as a warning", async () =>
   });
   assert.ok(!/автор коммитов не задан/.test(res2.stdout));
 });
+
+test("§18.6 (ревью Н3): a roleTexts error is not hidden by a gitInstructions error", async () => {
+  const host = await hostWith({
+    gitInstructions: "x".repeat(1501),
+    roleTexts: '{"release-auditor": "x"}',
+  });
+  const msgs = host.harness.needsConfigurationMessages.join(" ");
+  assert.match(msgs, /gitInstructions/);
+  assert.match(msgs, /roleTexts\.release-auditor/);
+});
+
+test("§18.6 (ревью Н3): a roleTexts error appearing after load is reported", async () => {
+  const host = await hostWith();
+  const before = host.harness.needsConfigurationMessages.length;
+  await host.harness.setSettings({ roleTexts: "{bad" });
+  assert.ok(host.harness.needsConfigurationMessages.length > before);
+  assert.match(
+    host.harness.needsConfigurationMessages.join(" "),
+    /roleTexts/,
+  );
+});
+
+test("§18.6: invalid handoffPath — status error, the default is used", async () => {
+  const host = await hostWith({ handoffPath: "a\nb" });
+  assert.match(
+    host.harness.needsConfigurationMessages.join(" "),
+    /handoffPath/,
+  );
+  const resolved = await host.harness.resolveAgentConfiguration(
+    makePluginAgentConfigurationContext({}),
+  );
+  assert.match(
+    resolved.instructions ?? "",
+    /\$BB_THREAD_STORAGE\/HANDOFF\.md/,
+  );
+  // the write schema refuses multi-line / over-limit values too
+  await assert.rejects(
+    host.harness.setSettings({ handoffPath: "a\nb" }),
+    /256|line/i,
+  );
+  await assert.rejects(
+    host.harness.setSettings({ handoffPath: "p".repeat(257) }),
+    /256/,
+  );
+});
+
+test("§18.6: the 2500 limit applies to the REAL handoffPath", async () => {
+  // fits under the default path, overflows under a 256-char one —
+  // the document is ignored whole and the mandatory tail stays
+  const host = await hostWith({
+    handoffPath: "/" + "p".repeat(255),
+    roleTexts: JSON.stringify({ orchestrator: "y".repeat(500) }),
+  });
+  assert.match(
+    host.harness.needsConfigurationMessages.join(" "),
+    /roleTexts/,
+  );
+  const resolved = await host.harness.resolveAgentConfiguration(
+    makePluginAgentConfigurationContext({}),
+  );
+  const text = resolved.instructions ?? "";
+  assert.ok(!text.includes("yyyy"), "addition dropped");
+  assert.match(text, /ни sudo/, "mandatory tail intact");
+});

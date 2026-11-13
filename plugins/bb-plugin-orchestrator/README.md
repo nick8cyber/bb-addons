@@ -187,18 +187,22 @@ map presets onto levels and fallback chains, write the policy, validate.
   `sudo`/package-install/host-change ban on `orchestrator`/`executor`
   and the strict JSON verdict line on `auditor` — so a `roleTexts`
   value cannot remove them; `release-auditor` is not customizable. The
-  composed text must stay within 2500 characters per role; an invalid
-  document or an over-limit result is reported as needs-configuration
-  and ignored whole.
+  composed text must stay within 2500 characters per role, checked on
+  the real substitutions (`handoffPath`, the policy's review level
+  name); an invalid document or an over-limit result is reported as
+  needs-configuration and ignored whole.
 - `handoffPath` (§18.6, default `$BB_THREAD_STORAGE/HANDOFF.md`) — the
   handoff file path substituted into the role texts' handoff rule and
-  the §16.5 compaction reminder. The `~/.cache/bb-handoff/<thread>.md`
-  fallback for providers without `$BB_THREAD_STORAGE` stays built-in.
+  the §16.5 compaction reminder; one line, at most 256 characters. The
+  `~/.cache/bb-handoff/<thread>.md` fallback for providers without
+  `$BB_THREAD_STORAGE` stays built-in.
 - `userThreadPlugins` (§17.1, comma/space-separated) — plugin ids whose
   threads continue a human chat (session handoff, chat compaction) and
   keep the coordinator role. Default EMPTY — a plugin-born thread gets
-  the `none` role unless its id is listed here; an existing install
-  keeps its own value (e.g. `handoff external-compact`).
+  the `none` role unless its id is listed here. Only an explicitly
+  SAVED value is kept on upgrade — set it before updating (e.g.
+  `bb plugin config orchestrator set userThreadPlugins "handoff
+  external-compact"`), not rely on the previous schema default.
 - `needs-configuration` clears only on plugin reload (SDK V1): after
   fixing a setting run `bb plugin reload orchestrator`.
 

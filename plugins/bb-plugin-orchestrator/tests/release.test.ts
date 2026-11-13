@@ -25,6 +25,7 @@ import { createCommandRunner, type SpawnedCommand } from "../src/commands.js";
 import { acquireCopyLock } from "../src/merge.js";
 import {
   parseAuditVerdict,
+  resolveCommitIdentity,
   reviewVerdictOk,
   docsForChanges,
   releaseThreadsGet,
@@ -196,7 +197,7 @@ const SCAN_BASE = {
     { file: ".env", line: 1, text: "X=1" },
   ],
   leaks: { ...LEAKS, allow: ["allow/"] },
-  allowedAuthor: { name: "Agent", email: "agent@x.io" },
+  identity: { state: "resolved" as const, name: "Agent", email: "agent@x.io" },
 };
 
 const GL_EMPTY: CmdRunner = {
@@ -2194,7 +2195,7 @@ test("§17.3 С6: allowedTrailers/allowedEmails parse and exempt matching findin
     commits: [meta],
     added: [{ file: "f.ts", line: 1, text: "contact dev@gmail.com" }],
     leaks: LEAKS,
-    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+    identity: { state: "resolved" as const, name: "Agent", email: "agent@x.io" },
   };
   const strict = await machineScan(GL_EMPTY, base);
   assert.ok(strict.some((f) => f.rule === "foreign-bot-trailer"));
@@ -2237,7 +2238,7 @@ test("§17.3 С6 (PLUG-224): allowedTrailers «name: value prefix», case-insens
     headSha: "b".repeat(40),
     added: [],
     leaks: LEAKS,
-    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+    identity: { state: "resolved" as const, name: "Agent", email: "agent@x.io" },
   };
   const claude =
     "feat: x\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>";
@@ -6862,7 +6863,7 @@ test("§18.6: scan — missing commitIdentity warns; trailers follow leaks.trail
   // configured identity + mismatching signature → blocks
   const withId = await machineScan(GL_EMPTY, {
     ...base,
-    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+    identity: { state: "resolved" as const, name: "Agent", email: "agent@x.io" },
   });
   assert.equal(
     withId.find((f) => f.rule === "commit-identity")!.severity,
@@ -6881,7 +6882,79 @@ test("§18.6: scan — missing commitIdentity warns; trailers follow leaks.trail
         body: "feat: x",
       },
     ],
-    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+    identity: { state: "resolved" as const, name: "Agent", email: "agent@x.io" },
   });
   assert.ok(!okScan.some((f) => f.rule === "commit-identity"));
+  // §18.6 (ревью Б2): "repo" без user.name/user.email в конфиге
+  // репозитория — ОТКАЗ с текстом про репо, не warn
+  const repoUnset = await machineScan(GL_EMPTY, {
+    ...base,
+    identity: { state: "repo-unset" },
+  });
+  const repoFinding = repoUnset.find((f) => f.rule === "commit-identity")!;
+  assert.equal(repoFinding.severity, "block");
+  assert.match(repoFinding.problem, /user\.name\/user\.email/);
+  // an unparseable literal blocks too
+  const invalid = await machineScan(GL_EMPTY, {
+    ...base,
+    identity: { state: "invalid" },
+  });
+  assert.equal(
+    invalid.find((f) => f.rule === "commit-identity")!.severity,
+    "block",
+  );
+  // the post-check's no-config fallback keeps the pre-§18.6 strict
+  // default: the signature check BLOCKS
+  const strict = await machineScan(GL_EMPTY, {
+    ...base,
+    identity: { state: "strict" },
+  });
+  const strictFinding = strict.find(
+    (f) => f.rule === "commit-identity",
+  )!;
+  assert.equal(strictFinding.severity, "block");
+  assert.match(strictFinding.problem, /commitIdentity не задан/);
+});
+
+test("§18.6: resolveCommitIdentity — unset/literal/repo/repo-unset/invalid", async () => {
+  const deps = {
+    cmd: {
+      run: async (_f: string, args: string[]) => {
+        const key = args[args.length - 1];
+        if (key === "user.name")
+          return { exitCode: 0, stdout: "Repo Agent\n", stderr: "" };
+        if (key === "user.email")
+          return { exitCode: 0, stdout: "repo@x.io\n", stderr: "" };
+        return { exitCode: 1, stdout: "", stderr: "" };
+      },
+    },
+  } as unknown as ReleaseDeps;
+  // nothing configured → unset (the scan warns, status reports)
+  assert.deepEqual(await resolveCommitIdentity(deps, "/r", undefined), {
+    state: "unset",
+  });
+  // a literal identity resolves directly
+  assert.deepEqual(
+    await resolveCommitIdentity(deps, "/r", "A <a@x.io>"),
+    { state: "resolved", name: "A", email: "a@x.io" },
+  );
+  // an unparseable literal → invalid (the scan blocks)
+  assert.deepEqual(await resolveCommitIdentity(deps, "/r", "no-email"), {
+    state: "invalid",
+  });
+  // "repo" with user.* in the repo config → resolved from git
+  assert.deepEqual(await resolveCommitIdentity(deps, "/r", "repo"), {
+    state: "resolved",
+    name: "Repo Agent",
+    email: "repo@x.io",
+  });
+  // "repo" without user.* in the repo config → repo-unset (blocks)
+  const noCfg = {
+    cmd: {
+      run: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
+    },
+  } as unknown as ReleaseDeps;
+  assert.deepEqual(await resolveCommitIdentity(noCfg, "/r", "repo"), {
+    state: "repo-unset",
+  });
 });

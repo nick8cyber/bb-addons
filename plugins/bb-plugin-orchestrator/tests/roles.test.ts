@@ -11,7 +11,9 @@ import {
   decideRole,
   DEFAULT_HANDOFF_PATH,
   DEFAULT_USER_THREAD_PLUGINS,
+  HANDOFF_PATH_MAX,
   handleMessageDispatch,
+  handoffPathError,
   parseRoleTexts,
   reviewLevelName,
   roleForLevel,
@@ -1055,4 +1057,78 @@ test("§18.6: parseRoleTexts — keys, types, the 2500 limit, whole-doc errors",
 
 test("§18.6: userThreadPlugins defaults to an EMPTY list", () => {
   assert.deepEqual([...DEFAULT_USER_THREAD_PLUGINS], []);
+});
+
+test("§18.6: handoffPath — one line of at most 256 characters", () => {
+  assert.equal(handoffPathError(undefined), null);
+  assert.equal(handoffPathError(""), null);
+  assert.equal(handoffPathError("   "), null);
+  assert.equal(handoffPathError("/home/example/H.md"), null);
+  assert.equal(handoffPathError("p".repeat(HANDOFF_PATH_MAX)), null);
+  assert.match(
+    handoffPathError("p".repeat(HANDOFF_PATH_MAX + 1)) ?? "",
+    /256/,
+  );
+  assert.match(handoffPathError("a\nb") ?? "", /одной строкой/);
+  assert.match(handoffPathError("a\rb") ?? "", /одной строкой/);
+});
+
+test("§18.6: the 2500 limit is checked on the REAL substitutions", () => {
+  // An addition sized to fit under the default handoffPath (29 chars)…
+  const base = roleInstructions("orchestrator");
+  const extra = "y".repeat(ROLE_INSTRUCTIONS_MAX - base.length - 150);
+  const doc = JSON.stringify({ orchestrator: extra });
+  assert.equal(parseRoleTexts(doc).errors.length, 0, "fits by default");
+  // …overflows once a real 256-char handoffPath is substituted (+227).
+  const longPath = "/" + "p".repeat(HANDOFF_PATH_MAX - 1);
+  const real = parseRoleTexts(doc, { handoffPath: longPath });
+  assert.ok(real.errors.length > 0, "over the limit with the real path");
+  assert.deepEqual(real.texts, {}, "an over-limit document applies nothing");
+  // …and once a real review-level name longer than "review" is used —
+  // only for the orchestrator text, other roles are unaffected (the
+  // executor text carries no {review} and stays well under the limit).
+  const longLevel = "review-" + "l".repeat(HANDOFF_PATH_MAX);
+  const realLevel = parseRoleTexts(doc, { reviewLevel: longLevel });
+  assert.ok(realLevel.errors.length > 0, "over with the real level name");
+  const executorDoc = JSON.stringify({ executor: "- small note" });
+  assert.equal(
+    parseRoleTexts(executorDoc, {
+      handoffPath: longPath,
+      reviewLevel: longLevel,
+    }).errors.length,
+    0,
+    "executor text has no {review} substitution",
+  );
+});
+
+test("§18.6: composed role + a 1500-char rule stays under 4096 — the SDK never truncates the mandatory tail", () => {
+  // The biggest valid addition keeps the role text at exactly 2500; the
+  // coordinator instructions (role + rule + separator) then fit the SDK
+  // limit with the mandatory tail intact — never cut mid-text.
+  for (const id of ["orchestrator", "executor", "auditor"] as const) {
+    const full = roleInstructions(id);
+    const extra = "y".repeat(ROLE_INSTRUCTIONS_MAX - full.length - 1);
+    const text = roleInstructions(id, { extra });
+    assert.equal(text.length, ROLE_INSTRUCTIONS_MAX, id);
+    const config = buildAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: "thr_x" } }),
+      {
+        injectInstructions: true,
+        instructionsText: "r".repeat(1500),
+        probes: {
+          delegationByThreadId: () => undefined,
+          hasFreshDispatching: () => false,
+          roleByThreadId: () => (id === "orchestrator" ? id : undefined),
+        },
+        roleInstructions: () => text,
+      },
+    );
+    const composed = config.instructions ?? "";
+    assert.ok(composed.length <= 4096, `${id}: ${composed.length}`);
+    // the mandatory tail survives inside the composed instructions
+    assert.ok(
+      composed.includes(id === "auditor" ? '"blockers"' : "ни sudo"),
+      `${id}: mandatory tail truncated`,
+    );
+  }
 });
