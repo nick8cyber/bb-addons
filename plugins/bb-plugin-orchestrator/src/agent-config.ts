@@ -202,6 +202,12 @@ export interface AgentConfigDeps {
    * orchestrator does not work anyway). `undefined` = treated as valid.
    */
   policyOk?: boolean;
+  /**
+   * §18.6: the effective role text — built-in body + `roleTexts` addition
+   * + mandatory tail, `{handoff}`/`{review}` substituted. Defaults to the
+   * role's static `instructions` (the plugin defaults).
+   */
+  roleInstructions?(role: RoleId): string;
 }
 
 export function buildAgentConfiguration(
@@ -234,7 +240,10 @@ export function buildAgentConfiguration(
       tools: [...role.tools],
       skills: [...role.skills],
     };
-    if (deps.injectInstructions) config.instructions = role.instructions;
+    if (deps.injectInstructions) {
+      config.instructions =
+        deps.roleInstructions?.(role.id) ?? role.instructions;
+    }
     return config;
   }
 
@@ -256,7 +265,10 @@ export function buildAgentConfiguration(
     // gets the same text as the `orchestrator` role — its instruction
     // plus the routing rule; the row itself is still not written.
     // Budget: instruction ≤ 2500 + rule ≤ 1500 + separator ≤ 4096.
-    const roleText = (role ?? ROLES.orchestrator).instructions;
+    const coordinatorRole = role ?? ROLES.orchestrator;
+    const roleText =
+      deps.roleInstructions?.(coordinatorRole.id) ??
+      coordinatorRole.instructions;
     config.instructions = `${roleText}
 
 ${deps.instructionsText}`;
@@ -275,6 +287,8 @@ export function fallbackAgentConfiguration(
   policyOk: boolean = true,
   /** §17.1 r26 (PLUG-211 Б2): user-continuation plugin ids. */
   userThreadPlugins: readonly string[] = DEFAULT_USER_THREAD_PLUGINS,
+  /** §18.6: the effective orchestrator text (roleTexts + handoffPath). */
+  orchestratorText: string = ROLES.orchestrator.instructions,
 ): PluginAgentConfiguration {
   const coordinator = isCoordinatorByStaticFacts(
     {
@@ -297,7 +311,7 @@ export function fallbackAgentConfiguration(
   // §3 rev 16: the fallback criterion yields the orchestrator role's
   // issuance — instruction + rule — without recording anything.
   if (injectInstructions) {
-    config.instructions = `${ROLES.orchestrator.instructions}
+    config.instructions = `${orchestratorText}
 
 ${instructionsText}`;
   }

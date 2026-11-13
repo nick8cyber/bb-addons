@@ -320,6 +320,9 @@ test("§17.1 r26 (Б2): a handoff plugin thread keeps its orchestrator row", () 
         ...noProbes,
         roleByThreadId: () => "orchestrator",
         writeRole: (id, role) => writes.push([id, role]),
+        // §18.6: the default list is empty now — a listed plugin is
+        // supplied explicitly.
+        userThreadPlugins: () => ["handoff", "external-compact"],
       },
     },
   );
@@ -336,7 +339,13 @@ test("§17.1 r26 (Б2): a handoff plugin thread keeps its orchestrator row", () 
 test("§17.1 r26 (Б2): an unrecorded handoff thread is a coordinator by static facts", () => {
   const config = buildAgentConfiguration(
     ctx({ origin: { pluginId: "handoff" } }),
-    deps,
+    {
+      ...deps,
+      probes: {
+        ...noProbes,
+        userThreadPlugins: () => ["handoff", "external-compact"],
+      },
+    },
   );
   assert.equal(config.tools.length, 4);
 });
@@ -364,6 +373,7 @@ test("§17.1 r26 (PLUG-215 Б1): the lazy fix is two-sided — a none row on a l
       ...noProbes,
       roleByThreadId: () => "none",
       writeRole: (id, role) => writes.push([id, role]),
+      userThreadPlugins: () => ["handoff", "external-compact"],
     },
   });
   // the plugin continues the human chat — the row is stale, the hook

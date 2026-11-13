@@ -97,7 +97,14 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `allowedTrailers` / `allowedEmails` (§17.3 С6) exempt matching
   commit trailers (e.g. `Co-Authored-By`) and e-mail addresses/domains
   from the machine scan's `foreign-bot-trailer` / `personal-email`
-  rules.
+  rules. Non-exempt foreign-bot trailers follow `leaks.trailers`
+  (§18.6): `block` | `warn`, default `warn` — the author's install
+  pins `"block"` explicitly. A missing `commitIdentity` no longer
+  blocks the release: the signature finding downgrades to a warning
+  and `bb orchestrator status` reports «автор коммитов не задан»;
+  secrets (category 1) always block. `leaks` of a project merges
+  with `defaults.leaks` key by key (like `timing`), never replaces
+  it whole.
   The settings project (release spec §6 r8) is the bb project of the
   executor copy's repository, resolved once at step 1 and stored in the
   release row (`settings_project_id`); any resolver error refuses
@@ -174,6 +181,24 @@ map presets onto levels and fallback chains, write the policy, validate.
   «Additional instructions»); empty disables it.
 - `injectInstructions` (default on) — off silences every plugin-generated
   text; tools and `orchestrator-setup` stay.
+- `roleTexts` (multiline JSON, §18.6) — `{orchestrator|executor|auditor:
+  "…"}`: text APPENDED to the built-in role instruction (not a
+  replacement). The plugin always adds the mandatory parts itself — the
+  `sudo`/package-install/host-change ban on `orchestrator`/`executor`
+  and the strict JSON verdict line on `auditor` — so a `roleTexts`
+  value cannot remove them; `release-auditor` is not customizable. The
+  composed text must stay within 2500 characters per role; an invalid
+  document or an over-limit result is reported as needs-configuration
+  and ignored whole.
+- `handoffPath` (§18.6, default `$BB_THREAD_STORAGE/HANDOFF.md`) — the
+  handoff file path substituted into the role texts' handoff rule and
+  the §16.5 compaction reminder. The `~/.cache/bb-handoff/<thread>.md`
+  fallback for providers without `$BB_THREAD_STORAGE` stays built-in.
+- `userThreadPlugins` (§17.1, comma/space-separated) — plugin ids whose
+  threads continue a human chat (session handoff, chat compaction) and
+  keep the coordinator role. Default EMPTY — a plugin-born thread gets
+  the `none` role unless its id is listed here; an existing install
+  keeps its own value (e.g. `handoff external-compact`).
 - `needs-configuration` clears only on plugin reload (SDK V1): after
   fixing a setting run `bb plugin reload orchestrator`.
 
@@ -441,6 +466,30 @@ glab mr view "$ORCH_PR_URL" -F json | jq '{
 `source: "hook"`), записи `events` и журнала хранятся `retentionDays`
 дней (30).
 
+### Тексты ролей, хендофф и userThreadPlugins
+
+`roleTexts` — дополнение к тексту роли (не замена): ключи только
+`orchestrator`, `executor`, `auditor`; обязательные части (запрет
+`sudo`/пакетов/хоста, JSON-вердикт аудитора) плагин добавляет сам
+после вашего текста, `release-auditor` не переопределяется, итог —
+не длиннее 2500 символов. `handoffPath` — путь хендоффа в текстах
+ролей и напоминании о сжатии (по умолчанию
+`$BB_THREAD_STORAGE/HANDOFF.md`). `userThreadPlugins` — id плагинов,
+продолжающих чат человека (по умолчанию пусто).
+
+```json
+"roleTexts": "{\"orchestrator\": \"- Отчёты владельцу — по-русски.\"}",
+"handoffPath": "/home/example/HANDOFF.md",
+"userThreadPlugins": "handoff external-compact"
+```
+
+Поведение прежней установки автора сохраняется явными значениями:
+`userThreadPlugins: "handoff external-compact"`, `leaks.trailers:
+"block"` в `defaults` выкладки, `commitIdentity`, `postPublish.
+reloadPlugins: true`, `prBody: "Источник: bb тред {thread}\n\nЗадача:
+{task}"` — без них умолчания новой установки (пустой список, `warn`,
+нейтральный `prBody`) мягче прежних.
+
 ### Таймауты
 
 `timing` в слоях `release` (defaults + projects, слияние по ключам):
@@ -457,6 +506,17 @@ glab mr view "$ORCH_PR_URL" -F json | jq '{
 
 ## Ограничения
 
+- **Платформа — Linux.** Команды запускаются через `sh` (postPublish
+  `command`, свои обёртки) каждая в своей группе процессов — по
+  таймауту группе шлётся SIGTERM, затем SIGKILL; уборщик читает
+  `/proc/<pid>/cwd`. macOS и Windows не поддерживаются.
+- **Внешние программы.** Обязательные: `git` ≥ 2.39 (`patch-id
+  --verbatim`, `merge-tree --write-tree`) и `gitleaks` — без него шаг
+  машинного скана выкладки отказывает. `gh` — только при
+  `prProvider: "github"` (на шаге 1 проверяется `gh auth status`);
+  `prProvider: "command"`/`"none"` работают без `gh`. Свои программы —
+  `postPublish.commands`, `eventHooks`, `prProvider.command` — по
+  настройке.
 - **Исполнители на другой машине не поддержаны.** Итог захода
   (`result_sha`, `result_commits`, `result_dirty`), `merge` и спасение
   грязной копии читают worktree локальным `git -C` — среда исполнителя

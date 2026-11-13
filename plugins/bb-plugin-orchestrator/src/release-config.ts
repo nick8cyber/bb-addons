@@ -30,6 +30,9 @@ export interface ReleaseTarget {
 export interface ReleaseLeaks {
   machine?: LeakStrictness;
   bbIds?: LeakStrictness;
+  /** §4 r11/§18.6: category-2 commit trailers (Co-Authored-By, ботские
+   * подписи). Default `warn`; the author's install sets `"block"`. */
+  trailers?: LeakStrictness;
   allow?: string[];
 }
 
@@ -175,6 +178,7 @@ export interface ResolvedProject {
   leaks: {
     machine: LeakStrictness;
     bbIds: LeakStrictness;
+    trailers: LeakStrictness;
     allow: string[];
   };
   /** Allowed commit signature, `"repo"` (read from the repo config), or
@@ -323,10 +327,10 @@ function parseLayer(
   }
   if (value.leaks !== undefined) {
     if (!isRecord(value.leaks)) {
-      err(`${path}.leaks`, "must be an object {machine, bbIds, allow}");
+      err(`${path}.leaks`, "must be an object {machine, bbIds, trailers, allow}");
     } else {
       const leaks: ReleaseLeaks = {};
-      for (const key of ["machine", "bbIds"] as const) {
+      for (const key of ["machine", "bbIds", "trailers"] as const) {
         const v = value.leaks[key];
         if (v === undefined) continue;
         if (v === "block" || v === "warn") {
@@ -814,6 +818,10 @@ export function resolveProject(
     leaks: {
       machine: leaks.machine ?? defaultStrictness,
       bbIds: leaks.bbIds ?? defaultStrictness,
+      // §18.6: trailers default to `warn` for a new installation —
+      // public/private does not apply; the author's install pins
+      // `"block"` explicitly.
+      trailers: leaks.trailers ?? "warn",
       allow: leaks.allow ?? [],
     },
     commitIdentity: layer.commitIdentity ?? config.commitIdentity,
@@ -845,4 +853,18 @@ export function resolveProject(
     prBody: layer.prBody ?? DEFAULT_PR_BODY,
     requireNote: layer.requireNote === true,
   };
+}
+
+/**
+ * §4 r11/§18.6: a missing commit identity is a WARNING, not a release
+ * blocker — the scan flags such commits but the pipeline goes on. The
+ * plugin reports it in `status` while no inheritable identity exists:
+ * neither the top-level `commitIdentity` nor `defaults.commitIdentity`
+ * is set (a project with its own layer still covers only itself — any
+ * unlisted project resolves through defaults and would lack one).
+ */
+export function commitIdentityMissing(config: ReleaseConfig): boolean {
+  return (
+    (config.defaults.commitIdentity ?? config.commitIdentity) === undefined
+  );
 }

@@ -64,15 +64,21 @@ import {
   type WatchdogThreads,
 } from "./src/watchdog.js";
 import {
+  DEFAULT_HANDOFF_PATH,
   DEFAULT_USER_THREAD_PLUGINS,
   handleMessageDispatch,
   isRoleId,
+  parseRoleTexts,
   PICKABLE_ROLE_IDS,
+  reviewLevelName,
   roleForLevel,
+  roleInstructions,
+  roleTextsError,
   type RoleDecisionProbes,
   type RoleId,
 } from "./src/roles.js";
 import {
+  commitIdentityMissing,
   parseReleaseConfig,
   resolveProject,
   type ReleaseConfigLoad,
@@ -228,8 +234,23 @@ export async function createPlugin(
       type: "string",
       label: "User thread plugins",
       description:
-        "§17.1: plugin ids whose threads continue a human chat (session handoff, chat compaction into a new thread) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default `handoff, external-compact`.",
-      default: "handoff external-compact",
+        "§17.1: plugin ids whose threads continue a human chat (session handoff, chat compaction into a new thread) — they keep the coordinator role instead of the plugin `none`. Comma/space-separated; default EMPTY — an existing install keeps its own list (the author's sets `handoff, external-compact`).",
+      default: "",
+    },
+    roleTexts: {
+      type: "string",
+      label: "Role texts",
+      description:
+        "§18.6: JSON {orchestrator|executor|auditor: string} — text APPENDED to the built-in role instructions; the mandatory tails (sudo/packages ban, auditor JSON verdict) always stay and `release-auditor` cannot be changed. The composed text must stay within 2500 characters per role. Empty — built-in texts only.",
+      experimental_multiline: true,
+      default: "",
+    },
+    handoffPath: {
+      type: "string",
+      label: "Handoff path",
+      description:
+        "§18.6: the handoff file path shown in role texts and the §16.5 compaction reminder. Empty — the default `$BB_THREAD_STORAGE/HANDOFF.md`.",
+      default: DEFAULT_HANDOFF_PATH,
     },
     maxConcurrentCommands: {
       type: "string",
@@ -441,6 +462,25 @@ export async function createPlugin(
   let releaseConfig: ReleaseConfigLoad = parseReleaseConfig(
     currentSettings.release ?? "",
   );
+  // §18.6 (PLUG-249): roleTexts — дополнение к текстам ролей; битый
+  // документ игнорируется целиком и виден в status/needs-configuration.
+  let roleTextsLoad = parseRoleTexts(currentSettings.roleTexts ?? "");
+  for (const e of roleTextsLoad.errors) {
+    bb.log.warn(`orchestrator roleTexts: ${e.path}: ${e.message}`);
+  }
+  const handoffPath = (): string => {
+    const p = currentSettings.handoffPath?.trim();
+    return p ? p : DEFAULT_HANDOFF_PATH;
+  };
+  /** §18.6: эффективный текст роли — тело + roleTexts + обязательный
+   * хвост; {handoff} из настройки, {review} — имя уровня по политике. */
+  const roleTextFor = (id: RoleId): string =>
+    roleInstructions(id, {
+      extra:
+        id === "release-auditor" ? undefined : roleTextsLoad.texts[id],
+      handoffPath: handoffPath(),
+      reviewLevel: reviewLevelName(policyLoad.policy),
+    });
   const janitorConfig = (): JanitorConfigLoad =>
     parseJanitorConfig(currentSettings.janitor ?? "");
   {
@@ -507,6 +547,13 @@ export async function createPlugin(
       problem =
         `${gitError} — исправьте ` +
         "`gitInstructions` и выполните `bb plugin reload orchestrator`";
+    } else {
+      const textsError = roleTextsError(roleTextsLoad);
+      if (textsError) {
+        problem =
+          `${textsError} — исправьте ` +
+          "`roleTexts` и выполните `bb plugin reload orchestrator`";
+      }
     }
     // needs-configuration clears only on plugin reload (SDK V1), so the
     // message tells the user how to re-check after fixing the setting.
@@ -554,6 +601,10 @@ export async function createPlugin(
     for (const e of hooksLoad.errors) {
       bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
     }
+    roleTextsLoad = parseRoleTexts(currentSettings.roleTexts ?? "");
+    for (const e of roleTextsLoad.errors) {
+      bb.log.warn(`orchestrator roleTexts: ${e.path}: ${e.message}`);
+    }
     void execSettingsCheck();
     for (const e of janitorConfig().errors) {
       bb.log.warn(`orchestrator janitor: ${e.path}: ${e.message}`);
@@ -577,6 +628,7 @@ export async function createPlugin(
         instructionsText: instructionsText(),
         probes,
         policyOk: policyLoad.policy !== null,
+        roleInstructions: roleTextFor,
       });
       // §13.2 п.4: reflect the decided role into display metadata. The
       // hook itself may not touch the network, so the write rides on the
@@ -610,6 +662,7 @@ export async function createPlugin(
         instructionsText(),
         policyLoad.policy !== null,
         userPlugins(),
+        roleTextFor("orchestrator"),
       );
     }
   });
@@ -938,6 +991,7 @@ export async function createPlugin(
       },
     },
     enqueue,
+    handoffPath,
     log: bb.log,
   });
 
@@ -1279,6 +1333,12 @@ export async function createPlugin(
       // §18.4: изменённые исполняемые настройки — имена и хеши,
       // без значений.
       execSettingsChanges: execSettingsChanges(store),
+      // §18.6: предупреждение — ни верхний, ни defaults
+      // `commitIdentity` не задан; подписи коммитов скан лишь
+      // предупреждает (§4 r11), не блокирует.
+      commitIdentityMissing:
+        releaseConfig.config !== null &&
+        commitIdentityMissing(releaseConfig.config),
     };
   };
 
@@ -1559,6 +1619,11 @@ export async function createPlugin(
               ? `изменённые исполняемые настройки: ${res.execSettingsChanges
                   .map((c) => c.key)
                   .join(", ")}\n`
+              : "") +
+            (res.commitIdentityMissing
+              ? "предупреждение: автор коммитов не задан " +
+                "(release.commitIdentity) — подписи коммитов " +
+                "скан не блокирует\n"
               : "");
           for (const d of res.delegations) out += renderDelegation(d) + "\n";
           if (!res.delegations.length) out += "no delegations\n";

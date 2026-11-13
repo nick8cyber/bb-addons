@@ -40,6 +40,7 @@ import {
   parseAuditVerdict,
   verdictDetailsInBody,
 } from "./release.js";
+import { DEFAULT_HANDOFF_PATH } from "./roles.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -355,6 +356,9 @@ export interface WatchdogDeps {
     git(repo: string, args: string[]): Promise<string>;
   };
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
+  /** §18.6: the handoff path for the §16.5 compaction reminder —
+   * read lazily so a settings change applies without a reload. */
+  handoffPath?(): string;
   now?: () => number;
   log?: {
     info?(message: string): void;
@@ -3194,7 +3198,7 @@ export function createWatchdog(deps: WatchdogDeps) {
                 `только через orchestrator_delegate; итоги исполнителей ` +
                 `приходят сообщениями [orchestrator] — ждать в форграунде ` +
                 `нельзя. Делегирования: ${parts || "нет"}. ` +
-                `Хендофф: $BB_THREAD_STORAGE/HANDOFF.md`,
+                `Хендофф: ${deps.handoffPath?.() ?? DEFAULT_HANDOFF_PATH}`,
               mentions: [],
             },
           ],
