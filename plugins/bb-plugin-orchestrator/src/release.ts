@@ -53,9 +53,13 @@ import {
   type ResolvedTiming,
 } from "./release-config.js";
 import {
+  DEFAULT_KILL_GRACE_MS,
+  defaultSpawner,
   globMatch,
   maskCommandOutput,
   type CommandRunner,
+  type CommandSpawner,
+  type SpawnedCommand,
 } from "./commands.js";
 import {
   levelRole,
@@ -185,6 +189,12 @@ export interface ReleaseDeps {
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
   /** §18.2 (PLUG-245): общий запускатель журнальных команд. */
   commandRunner?: CommandRunner;
+  /** §18.3 (ревью PLUG-248): команды провайдера PR — тот же запускатель
+   * (своя группа, SIGTERM→SIGKILL); seam для тестов. */
+  spawn?: CommandSpawner;
+  /** Срок SIGTERM→SIGKILL у команд провайдера (умолчание
+   * DEFAULT_KILL_GRACE_MS); в тестах — короткий. */
+  killGraceMs?: number;
   /** §18.2: срок хранения записей журнала, дни (default 30). */
   commandRetentionDays?: () => number;
   /** PLUG-245 Б2: токен владельца замка копии postPublish — экземпляр
@@ -2927,7 +2937,11 @@ interface PrView {
 }
 
 /** §18.3 command: argv провайдера идёт без shell, каталог запуска —
- * основной каталог репозитория, таймаут `timing.prCommandTimeoutSec`. */
+ * основной каталог репозитория, таймаут `timing.prCommandTimeoutSec`.
+ * Запуск — тем же запускателем, что команды postPublish (§18.5):
+ * процесс в своей группе, по таймауту SIGTERM группе, затем SIGKILL
+ * через killGraceMs — зависший внук не остаётся сиротой и такт не
+ * висит на `close`. Журнал `command_runs` для них не ведётся. */
 async function runPrProvider(
   deps: ReleaseDeps,
   spec: {
@@ -2938,12 +2952,41 @@ async function runPrProvider(
     timeoutSec: number;
   },
 ): Promise<BbCliResult> {
-  return deps.cmd.run(spec.argv[0]!, spec.argv.slice(1), {
-    cwd: spec.cwd,
-    env: spec.env,
-    stdin: spec.stdin,
-    timeoutMs: spec.timeoutSec * 1000,
-  });
+  const spawner = deps.spawn ?? defaultSpawner;
+  let spawned: SpawnedCommand;
+  try {
+    spawned = spawner({
+      argv: spec.argv,
+      cwd: spec.cwd,
+      env: spec.env,
+      stdin: spec.stdin,
+    });
+  } catch (e) {
+    return { exitCode: 127, stdout: "", stderr: message(e) };
+  }
+  const killGrace = deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  let timedOut = false;
+  let termTimer: NodeJS.Timeout | undefined;
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    spawned.killGroup("SIGTERM");
+    termTimer = setTimeout(
+      () => spawned.killGroup("SIGKILL"),
+      killGrace,
+    );
+  }, spec.timeoutSec * 1000);
+  const res = await spawned.done;
+  clearTimeout(timeoutTimer);
+  clearTimeout(termTimer);
+  return {
+    exitCode:
+      res.code ?? (timedOut ? 124 : res.signal !== null ? 1 : 127),
+    stdout: res.stdout ?? res.output,
+    stderr: timedOut
+      ? `timed out after ${spec.timeoutSec * 1000}ms\n${res.stderr ?? ""}`
+      : (res.stderr ?? ""),
+    ...(timedOut ? { timedOut: true } : {}),
+  };
 }
 
 const PR_VIEW_STATES = new Set(["OPEN", "MERGED", "CLOSED"]);
@@ -3068,6 +3111,20 @@ async function ghText(
 }
 
 const GH_PR_URL_RE = /https?:\/\/\S+/;
+
+/** §18.3: первый URL в выводе провайдера; URL с учётными данными
+ * (`user:pass@` в authority) — отказ, в записи, строки и комментарий
+ * задачи он не попадает. */
+function extractPrUrl(stdout: string): string | null {
+  const url = GH_PR_URL_RE.exec(stdout)?.[0] ?? null;
+  if (url && /^https?:\/\/[^/\s]*@/.test(url)) {
+    throw new OrchestratorError(
+      "release-refused",
+      "PR не открыт: URL с учётными данными",
+    );
+  }
+  return url;
+}
 
 /**
  * §5: write the one-time token for `branch`+`sha`, run `git push` (the
@@ -3323,8 +3380,19 @@ async function publishRelease(
       // без {thread}) — по своим записям этой задачи этого
       // координатора.
       const src = PR_THREAD_MARKER_RE.exec(existing.body ?? "")?.[1];
+      // §18.3 (ревью PLUG-248): маркер ожидаем, только если отрендеренный
+      // шаблон prBody даёт один из двух разбираемых маркеров — свой
+      // шаблон с {thread} в другом виде («Thread: {thread}») маркера не
+      // создаёт, и «свой PR» определяется по записям.
       const markerExpected =
-        threadIds && (project?.prBody ?? DEFAULT_PR_BODY).includes("{thread}");
+        threadIds &&
+        PR_THREAD_MARKER_RE.test(
+          renderPrBody(project?.prBody ?? DEFAULT_PR_BODY, {
+            thread: "thr_x",
+            task: row.task_key,
+            title: "",
+          }),
+        );
       const foreign =
         src !== undefined
           ? src !== row.coordinator_thread_id
@@ -3356,7 +3424,7 @@ async function publishRelease(
             (maskCommandOutput(res.stderr || res.stdout) || "no output"),
         );
       }
-      existingUrl = GH_PR_URL_RE.exec(res.stdout)?.[0] ?? null;
+      existingUrl = extractPrUrl(res.stdout);
       if (
         existingUrl &&
         !deps.store.prWasReleased(
@@ -3369,9 +3437,18 @@ async function publishRelease(
       }
     } else {
       // §18.3: без `find` — переиспользуется pr_url прошлой выкладки
-      // этой задачи и ветки, если `view` отвечает OPEN; иначе create.
+      // этой задачи и ветки ЭТИМ координатором, если `view` отвечает
+      // OPEN; запись не своя (выкладывал другой координатор) — чужой
+      // PR, переиспользования нет, новый create.
       const prevUrl = deps.store.lastPrUrl(row.task_key, remoteBranch);
-      if (prevUrl) {
+      if (
+        prevUrl &&
+        deps.store.prWasReleased(
+          prevUrl,
+          row.coordinator_thread_id,
+          row.task_key,
+        )
+      ) {
         let view: PrView;
         try {
           view = await providerView(deps, prevUrl, project, mainDir);
@@ -3475,7 +3552,7 @@ async function publishRelease(
             (maskCommandOutput(res.stderr || res.stdout) || "no output"),
         );
       }
-      prUrl = GH_PR_URL_RE.exec(res.stdout)?.[0] ?? null;
+      prUrl = extractPrUrl(res.stdout);
       if (!prUrl) {
         throw new OrchestratorError(
           "release-refused",
@@ -3501,7 +3578,7 @@ async function publishRelease(
         ],
         t.prCommandTimeoutSec * 1000,
       );
-      prUrl = GH_PR_URL_RE.exec(created)?.[0] ?? null;
+      prUrl = extractPrUrl(created);
     }
   }
   deps.store.updateRelease(row.id, { prUrl });

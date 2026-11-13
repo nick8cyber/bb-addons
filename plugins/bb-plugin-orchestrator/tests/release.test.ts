@@ -648,6 +648,8 @@ function makeDeps(repo: string, overrides: Partial<{
     localHostId: async () => overrides.localHostId ?? "host_test",
     enqueue: <T>(f: () => Promise<T>) => f(),
     now: undefined as (() => number) | undefined,
+    spawn: undefined as ReleaseDeps["spawn"],
+    killGraceMs: undefined as ReleaseDeps["killGraceMs"],
     log: {},
   } satisfies ReleaseDeps;
   return { deps, store, calls, spawnCalls, comments, sent, tmp, exec, rev, bindReview, db };
@@ -4581,6 +4583,233 @@ test("§18.6 prBody: дефолт, шаблон автора байт-в-бай�
     await bodyOf({ threadIds: false, prBody: "x {thread} {task}" }),
     "",
   );
+});
+
+test("§18.3 command: таймаут — SIGTERM группе → SIGKILL, такт не висит", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(dir, "pr-create", `echo never`);
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "pr", branch: "main" },
+        prProvider: { type: "command", create: [create], view: [view] },
+        timing: { prCommandTimeoutSec: 5 },
+      },
+    }),
+  });
+  // запускатель §18.5: «процесс» игнорирует SIGTERM и умирает только по
+  // SIGKILL — убийство идёт группой; без него зависший внук держал бы
+  // такт на `close` бессрочно.
+  const kills: string[] = [];
+  deps.spawn = () => {
+    let resolveDone!: (r: {
+      code: number | null;
+      signal: string | null;
+      output: string;
+      stdout: string;
+      stderr: string;
+    }) => void;
+    const done = new Promise<{
+      code: number | null;
+      signal: string | null;
+      output: string;
+      stdout: string;
+      stderr: string;
+    }>((r) => (resolveDone = r));
+    return {
+      pid: 4242,
+      pgid: 4242,
+      done,
+      killGroup: (sig: "SIGTERM" | "SIGKILL") => {
+        kills.push(sig);
+        if (sig === "SIGKILL") {
+          resolveDone({
+            code: null,
+            signal: "SIGKILL",
+            output: "",
+            stdout: "",
+            stderr: "",
+          });
+        }
+      },
+    };
+  };
+  deps.killGraceMs = 5;
+  await publishPr(deps, store);
+  const rel = store.releasesByStatuses(["failed"])[0]!;
+  assert.match(rel.error ?? "", /PR не открыт \(код 124\)/);
+  assert.match(rel.error ?? "", /timed out/);
+  assert.deepEqual(kills, ["SIGTERM", "SIGKILL"]);
+});
+
+test("§18.3: свой шаблон с {thread} в другом виде — «чей PR» по записям", async () => {
+  const { repo } = makeRepo();
+  const cfg = JSON.stringify({
+    commitIdentity: "Agent <agent@x.io>",
+    defaults: {
+      target: { action: "pr", branch: "main" },
+      prBody: "Thread: {thread} · {task}",
+    },
+  });
+  let prs: unknown[] = [];
+  const { deps, store, sent, exec, bindReview } = makeDeps(repo, {
+    ghPrList: () => prs,
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: cfg,
+  });
+  await publishPr(deps, store);
+  assert.equal(
+    store.releasesByStatuses(["published"])[0]!.pr_url,
+    "https://example.test/pr/7",
+  );
+  // Тело PR — «Thread: thr_coord · PLUG-1»: разбираемого маркера
+  // («Источник: bb тред» / «BB-Thread:») в нём нет, и отрендеренный
+  // шаблон его не создаёт → «свой PR» по своим записям, а не «чужой»
+  // из-за отсутствия маркера.
+  prs = [
+    {
+      url: "https://example.test/pr/7",
+      body: "Thread: thr_coord · PLUG-1",
+      headRefName: "feat-x",
+      baseRefName: "main",
+    },
+  ];
+  writeFileSync(join(repo, "more.txt"), "more\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: more"]);
+  const tip2 = gitR(repo, ["rev-parse", "HEAD"]);
+  store.setRoundResult(exec.id, {
+    branch: "feat-x",
+    sha: tip2,
+    commits: 2,
+    dirty: false,
+  });
+  bindReview(tip2);
+  sent.length = 0;
+  await publishPr(deps, store);
+  assert.equal(
+    store.releasesByStatuses(["published"])[1]!.pr_url,
+    "https://example.test/pr/7",
+  );
+  assert.ok(
+    sent.some((m) => /PR обновлён/.test(m)),
+    JSON.stringify(sent),
+  );
+  // чужой PR с такой же строкой (другой тред) — записей о нём нет →
+  // release в него не пишет
+  const { repo: repo2 } = makeRepo();
+  const { deps: deps2, store: store2 } = makeDeps(repo2, {
+    ghPrList: () => [
+      {
+        url: "https://example.test/pr/8",
+        body: "Thread: thr_other · PLUG-9",
+        headRefName: "feat-x",
+        baseRefName: "main",
+      },
+    ],
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: cfg,
+  });
+  await publishPr(deps2, store2);
+  assert.match(
+    store2.releasesByStatuses(["failed"])[0]!.error ?? "",
+    /создан не этим release/,
+  );
+});
+
+test("§18.3 command без find: чужой pr_url (другой координатор) не переиспользуется", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(
+    dir,
+    "pr-create",
+    `echo x >> "$DIR/calls.txt"; cat "$DIR/url.txt"`,
+  );
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  writeFileSync(join(dir, "url.txt"), "https://example.test/pr/9\n");
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view),
+  });
+  // прошлая выкладка ЭТОЙ задачи на ту же ветку — но ДРУГИМ
+  // координатором: её pr_url переиспользовать нельзя, новый create.
+  const foreign = store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_other",
+    repoPath: repo,
+    branch: "feat-x",
+    targetAction: "pr",
+    targetBranch: "main",
+  });
+  store.updateRelease(foreign.id, {
+    status: "published",
+    prUrl: "https://example.test/pr/55",
+    publishBranch: "feat-x",
+  });
+  await publishPr(deps, store);
+  const rel = store
+    .releasesByStatuses(["published"])
+    .find((r) => r.coordinator_thread_id === "thr_coord")!;
+  assert.equal(rel.pr_url, "https://example.test/pr/9");
+  assert.equal(
+    readFileSync(join(dir, "calls.txt"), "utf8").trim().split("\n").length,
+    1,
+    "create вызван — чужой pr_url не переиспользован",
+  );
+});
+
+test("§18.3 command: URL с учётными данными — отказ, в записи не попадает", async () => {
+  const { repo } = makeRepo();
+  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const create = writePrTool(
+    dir,
+    "pr-create",
+    `echo "https://user:secret@example.test/pr/9"`,
+  );
+  const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
+  const find = writePrTool(
+    dir,
+    "pr-find",
+    `echo "https://user:secret@example.test/pr/77"`,
+  );
+  writeFileSync(
+    join(dir, "view.json"),
+    JSON.stringify({ state: "OPEN", mergeCommit: null }),
+  );
+  // create печатает URL с userinfo — отказ, токен нигде не сохраняется
+  const a = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view),
+  });
+  await publishPr(a.deps, a.store);
+  const relA = a.store.releasesByStatuses(["failed"])[0]!;
+  assert.match(relA.error ?? "", /URL с учётными данными/);
+  assert.equal(relA.pr_url, null);
+  assert.ok(!a.sent.some((m) => /secret/.test(m)), JSON.stringify(a.sent));
+  // find печатает URL с userinfo — тот же отказ до обращения к записям
+  const { repo: repo2 } = makeRepo();
+  const b = makeDeps(repo2, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+    releaseText: PR_CMD_CFG(create, view, find),
+  });
+  await publishPr(b.deps, b.store);
+  const relB = b.store.releasesByStatuses(["failed"])[0]!;
+  assert.match(relB.error ?? "", /URL с учётными данными/);
+  assert.equal(relB.pr_url, null);
+  assert.ok(!b.sent.some((m) => /secret/.test(m)), JSON.stringify(b.sent));
 });
 
 

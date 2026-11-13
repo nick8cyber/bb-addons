@@ -18,7 +18,7 @@ import type { CommandRunRow, CommandRunSpec, DelegationStore } from "./store.js"
 /** §18.2: вывод в журнале — хвост до 300 символов в одну строку. */
 export const OUTPUT_TAIL_LIMIT = 300;
 const RAW_OUTPUT_CAP = 256 * 1024;
-const DEFAULT_KILL_GRACE_MS = 10_000;
+export const DEFAULT_KILL_GRACE_MS = 10_000;
 
 const CONTROL_CHARS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
@@ -52,6 +52,11 @@ export interface SpawnResult {
   code: number | null;
   signal: string | null;
   output: string;
+  /** §18.3: командам провайдера PR нужны потоки раздельно (JSON, URL —
+   * чистый stdout). Необязательны: журнальные фейки отдают только
+   * сведённый `output`. */
+  stdout?: string;
+  stderr?: string;
 }
 
 export interface SpawnedCommand {
@@ -81,19 +86,33 @@ export const defaultSpawner: CommandSpawner = (spec) => {
     stdio: [spec.stdin !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
   });
   let output = "";
-  const append = (chunk: Buffer) => {
-    output += chunk.toString("utf8");
-    if (output.length > RAW_OUTPUT_CAP) {
-      output = output.slice(-RAW_OUTPUT_CAP);
-    }
-  };
-  child.stdout?.on("data", append);
-  child.stderr?.on("data", append);
+  let stdout = "";
+  let stderr = "";
+  const cap = (s: string) =>
+    s.length > RAW_OUTPUT_CAP ? s.slice(-RAW_OUTPUT_CAP) : s;
+  child.stdout?.on("data", (chunk: Buffer) => {
+    const t = chunk.toString("utf8");
+    output = cap(output + t);
+    stdout = cap(stdout + t);
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    const t = chunk.toString("utf8");
+    output = cap(output + t);
+    stderr = cap(stderr + t);
+  });
   const done = new Promise<SpawnResult>((resolve) => {
     child.once("error", (e) => {
-      resolve({ code: null, signal: null, output: output + "\n" + e.message });
+      resolve({
+        code: null,
+        signal: null,
+        output: output + "\n" + e.message,
+        stdout,
+        stderr: stderr + "\n" + e.message,
+      });
     });
-    child.once("close", (code, signal) => resolve({ code, signal, output }));
+    child.once("close", (code, signal) =>
+      resolve({ code, signal, output, stdout, stderr }),
+    );
   });
   if (spec.stdin !== undefined) {
     child.stdin?.write(spec.stdin);

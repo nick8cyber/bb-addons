@@ -89,9 +89,11 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   plugin update re-run `hooks/install.mjs` — `release` refuses
   `hook-stale` when any expected wrapper is missing, differs from the
   plugin's, or a retired `push-to-checkout` wrapper is left over.
-  `threadIds` (default on) keeps the «Источник: bb тред thr_…» line in
-  PR bodies and exempts `thr_…` from the bb-ids leak rule; off — no
-  «Источник» line and every `thr_…` is a `leaks.bbIds` finding.
+  `threadIds` (default on) allows the thread-id marker in the PR body
+  from the `prBody` template (default `BB-Thread: {thread}` /
+  `BB-Task: {task}`) and exempts `thr_…` from the bb-ids leak rule;
+  off — `prBody` is not applied, the body is empty, and every
+  `thr_…` is a `leaks.bbIds` finding (see «Тело PR»).
   `allowedTrailers` / `allowedEmails` (§17.3 С6) exempt matching
   commit trailers (e.g. `Co-Authored-By`) and e-mail addresses/domains
   from the machine scan's `foreign-bot-trailer` / `personal-email`
@@ -114,10 +116,13 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   30 minutes from its first dispatch; a reviewer or the auditor ending
   a turn without a verdict gets ONE reminder, a second verdict-less
   turn ends the round without OK (the auditor's release is rejected
-  «аудит без вердикта»). For `pr` targets the pump tracks the PR
-  (`gh pr view` every 5 min): merged → «PR влит» + task done, closed →
-  one line + 72 h for a reopen-merge, open 72 h → one «PR висит 72 ч»
-  line, three gh failures → one «слежение невозможно» line.
+  «аудит без вердикта»). For `pr` targets the pump checks the PR through `prProvider`
+  (`gh pr view` for `github`, `view` for `command`; `none` — no
+  tracking) every `timing.prPollMinutes` (5): merged → «PR влит» +
+  task done, closed → one line + `timing.prReopenWatchHours` (72 h)
+  for a reopen-merge, open `timing.prStaleHours` (72 h) → one
+  «PR висит 72 ч» line, `timing.prErrorLimit` (3) provider failures
+  in a row → one «слежение невозможно» line.
   `postPublish` (`{checkout, branch?, reloadPlugins}`) fast-forwards a
   configured checkout after push and reloads the changed plugins —
   dirs with a changed manifest need `npm ci`, providers with running
@@ -299,16 +304,22 @@ stopOnFail, installsDeps}`: `run` — argv-массив без shell (схема
   никогда — настройка предупреждает об этом при чтении.
 
 Контракт `command` (каталог запуска — основной каталог репозитория,
-таймаут `timing.prCommandTimeoutSec`): `create` получает `ORCH_BRANCH`,
-`ORCH_TARGET`, `ORCH_TITLE` и тело PR в stdin, печатает URL
-(`https?://…` — первая такая строка); ненулевой код — отказ, даже если
-URL напечатан. `view` получает `ORCH_PR_URL`, печатает JSON
+таймаут `timing.prCommandTimeoutSec`): команды провайдера идут тем же
+запускателем, что `postPublish.commands` — каждая в своей группе
+процессов, по таймауту группе шлётся SIGTERM, затем SIGKILL, так что
+зависшая обёртка не подвешивает выкладку и слежение. `create` получает
+`ORCH_BRANCH`, `ORCH_TARGET`, `ORCH_TITLE` и тело PR в stdin, печатает
+URL (`https?://…` — первая такая строка); ненулевой код — отказ, даже
+если URL напечатан. URL с учётными данными (`user:pass@`) — отказ
+«PR не открыт: URL с учётными данными», в записи и строки он не
+попадает. `view` получает `ORCH_PR_URL`, печатает JSON
 `{"state":"OPEN"|"MERGED"|"CLOSED","mergeCommit":"<sha>"|null}`.
 `find` получает `ORCH_BRANCH`, `ORCH_TARGET`, печатает URL открытого PR
 ветки или пусто; без `find` повторная выкладка задачи переиспользует
-`pr_url` прошлой выкладки этой задачи и ветки, если `view` отвечает
-`OPEN`. Весь вывод провайдера в строках координатору проходит ту же
-очистку и маскировку секретов, что вывод команд.
+`pr_url` прошлой выкладки этой задачи и ветки этим же координатором,
+если `view` отвечает `OPEN`. Весь вывод провайдера в строках
+координатору проходит ту же очистку и маскировку секретов, что вывод
+команд.
 
 GitLab через `command` (пример со скриптами-обёртками над `glab`):
 
@@ -338,9 +349,12 @@ glab mr view "$ORCH_PR_URL" -F json | jq '{
 — шаблон тела PR с подстановками `{thread}`, `{task}`, `{title}`. При
 `threadIds: false` шаблон не применяется — тело пустое (id треда и ключ
 задачи не публикуются, §16.6). Разбор «чей PR» при повторной выкладке —
-по маркеру в теле (узнаются и `BB-Thread:`, и прежний «Источник:
-bb тред»), а без маркера — по своим записям о прошлых выкладках этой
-задачи этим координатором; чужой PR не трогается (§18.3).
+по маркеру в теле; разбираются только два маркера: `BB-Thread: thr_…`
+и прежний «Источник: bb тред thr_…». Свой шаблон с `{thread}` в другом
+виде («Thread: {thread}») разбираемого маркера не создаёт — тогда, как
+и при `threadIds: false`, «свой PR» определяется по своим записям о
+прошлых выкладках этой задачи этим координатором; чужой PR не
+трогается (§18.3).
 
 `requireNote` (по умолчанию `false`) при `true` делает `--kb <заметка>`
 или `--no-kb <причина>` обязательными: шаг 1 выкладки без одного из
