@@ -4691,7 +4691,12 @@ async function postCheck(
               )),
           )
         : {
-            leaks: { machine: "block", bbIds: "block", allow: [] },
+            leaks: {
+              machine: "block",
+              bbIds: "block",
+              trailers: "block",
+              allow: [],
+            },
             threadIds: true,
             allowedTrailers: [],
             allowedEmails: [],

@@ -4,9 +4,12 @@
  * categories 2-4 over the added lines of EVERY commit's patch in the
  * range `merge-base(origin/<цель>, HEAD)..HEAD` (§16.6 — a finding added
  * and removed inside the range is still caught) plus the release diff's
- * added lines and the commit metadata. Categories 1-2 always block; 3-4
- * follow the project's `leaks` strictness with `allow` places where such
- * mentions are the norm. `thr_…` ids are exempt only while the project's
+ * added lines and the commit metadata. Category 1 (secrets) always
+ * blocks; in category 2 a signature mismatch blocks only when
+ * `commitIdentity` is configured — a missing one warns (§4 r11) — and
+ * foreign-bot trailers follow `leaks.trailers` (§18.6); 3-4 follow the
+ * project's `leaks` strictness with `allow` places where such mentions
+ * are the norm. `thr_…` ids are exempt only while the project's
  * `threadIds` is on (§16.6).
  *
  * Findings never carry secret values — a finding that quotes the leak
@@ -427,7 +430,10 @@ function scanCommitMeta(
           (allowed
             ? ` не совпадает с разрешённой ${allowed.name} <${allowed.email}>`
             : " — commitIdentity не задан в настройке release"),
-        severity: "block",
+        // §4 r11/§18.6: a signature mismatch blocks the release; a
+        // MISSING commitIdentity only warns — the pipeline goes on and
+        // `status` reports the absent configuration.
+        severity: allowed ? "block" : "warn",
       });
     }
     const trailers = foreignTrailers(c.body, allowedTrailers);
@@ -438,7 +444,9 @@ function scanCommitMeta(
         line: null,
         rule: "foreign-bot-trailer",
         problem: `коммит ${short(c.sha)}: трейлер чужого бота (${trailers.join(", ")})`,
-        severity: "block",
+        // §18.6: `leaks.trailers` ("warn" by default, "block" on the
+        // author's install) — allowedTrailers still exempts.
+        severity: leaks.trailers,
       });
     }
     // Categories 3–4 over commit text; the BB-Thread trailer is exempt

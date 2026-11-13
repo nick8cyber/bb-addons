@@ -79,6 +79,8 @@ function makeHarness(
       limit?: string;
       types?: readonly string[];
     }) => boolean;
+    /** §18.6: the configured handoff path for the §16.5 memo. */
+    handoffPath?: string;
   } = {},
 ) {
   const db = opts.db ?? new Database(":memory:");
@@ -379,6 +381,9 @@ function makeHarness(
       },
     },
     ...(opts.round ? { round: opts.round } : {}),
+    ...(opts.handoffPath
+      ? { handoffPath: () => opts.handoffPath! }
+      : {}),
     enqueue,
     now: () => nowVal,
     log: { warn: (m) => warns.push(m), info: () => {}, error: () => {} },
@@ -6121,3 +6126,47 @@ test("r10 п.4: release-audit — сверка привязки требует o
   );
 });
 
+
+test("§18.6: the compaction memo names the configured handoffPath", async () => {
+  const h = makeHarness({ handoffPath: "/home/example/H.md" });
+  h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_coord", [ev(9, "thread/compacted", T0)]);
+  await h.wd.reconcile(); // seeds the cursor
+  h.eventLog.set("thr_coord", [
+    ev(9, "thread/compacted", T0),
+    ev(10, "thread/compacted", T0 + 60_000),
+  ]);
+  await h.wd.reconcile();
+  const msgs = h.sends.filter(
+    (x) => x.threadId === "thr_coord" && /сжат/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(msgs.length, 1);
+  assert.match(
+    JSON.stringify(msgs[0]!.input),
+    /Хендофф: \/home\/example\/H\.md/,
+  );
+});
+
+test("§18.6: the compaction memo defaults to $BB_THREAD_STORAGE/HANDOFF.md", async () => {
+  const h = makeHarness();
+  h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_coord", [ev(9, "thread/compacted", T0)]);
+  await h.wd.reconcile();
+  h.eventLog.set("thr_coord", [
+    ev(9, "thread/compacted", T0),
+    ev(10, "thread/compacted", T0 + 60_000),
+  ]);
+  await h.wd.reconcile();
+  const msgs = h.sends.filter(
+    (x) => x.threadId === "thr_coord" && /сжат/.test(JSON.stringify(x.input)),
+  );
+  assert.equal(msgs.length, 1);
+  assert.match(
+    JSON.stringify(msgs[0]!.input),
+    /Хендофф: \$BB_THREAD_STORAGE\/HANDOFF\.md/,
+  );
+});

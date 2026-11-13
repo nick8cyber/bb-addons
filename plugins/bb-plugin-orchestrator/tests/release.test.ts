@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
+  commitIdentityMissing,
   parseReleaseConfig,
   resolveProject,
   isCommitIdentity,
@@ -167,7 +168,12 @@ test("parseAddedLines tracks file+line of + lines", () => {
   ]);
 });
 
-const LEAKS = { machine: "block" as const, bbIds: "warn" as const, allow: [] };
+const LEAKS = {
+  machine: "block" as const,
+  bbIds: "warn" as const,
+  trailers: "block" as const,
+  allow: [],
+};
 
 const SCAN_BASE = {
   repoPath: "/r",
@@ -991,7 +997,12 @@ test("f1: allow does NOT suppress categories 1-2", async () => {
       { file: "docs/PLAN.md", line: 1, text: "vless://srv/x y@gmail.com" },
       { file: "docs/PLAN.md", line: 2, text: "thr_abc1234567" },
     ],
-    leaks: { machine: "block", bbIds: "warn", allow: ["docs/"] },
+    leaks: {
+      machine: "block",
+      bbIds: "warn",
+      trailers: "warn",
+      allow: ["docs/"],
+    },
   });
   assert.ok(findings.some((f) => f.category === 1));
   assert.ok(findings.some((f) => f.category === 2 && f.rule === "personal-email"));
@@ -1037,7 +1048,7 @@ test("f9: task-key template flags PLUG-123, not UTF-8", async () => {
       { file: "a.md", line: 1, text: "see PLUG-123" },
       { file: "b.md", line: 1, text: 'charset="UTF-8"' },
     ],
-    leaks: { machine: "block", bbIds: "warn", allow: [] },
+    leaks: { machine: "block", bbIds: "warn", trailers: "warn", allow: [] },
     // §16.6: the template itself is tested — `threadIds` off, else
     // task-key is exempt like `thr_…` (PLUG-189).
     threadIds: false,
@@ -6743,4 +6754,134 @@ test("§2 п.6 r11 (мелочь): сбой fetch в позднем такте �
     calls.some((c) => c.join(" ") === "plugin reload fakeplug"),
     "перезагрузка состоялась по мемоизированному итогу",
   );
+});
+
+// ── §18.6 (PLUG-249): leaks.trailers / commitIdentity defaults ─────────
+
+test("§18.6: leaks.trailers — warn default, per-key merge, explicit block", () => {
+  const c = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        leaks: { machine: "block", trailers: "block", allow: ["docs/"] },
+      },
+      projects: { p1: { leaks: { bbIds: "warn" } } },
+    }),
+  ).config!;
+  // per-key merge — the project's bbIds wins, every other key inherits
+  const r = resolveProject(c, "p1");
+  assert.equal(r.leaks.bbIds, "warn");
+  assert.equal(r.leaks.machine, "block");
+  assert.equal(r.leaks.trailers, "block");
+  assert.deepEqual(r.leaks.allow, ["docs/"]);
+  // no `trailers` anywhere → "warn" for a new installation — the
+  // public/private strictness does NOT apply to trailers
+  const c2 = parseReleaseConfig(
+    JSON.stringify({ defaults: { public: true }, projects: { p: {} } }),
+  ).config!;
+  const r2 = resolveProject(c2, "p");
+  assert.equal(r2.leaks.machine, "block");
+  assert.equal(r2.leaks.trailers, "warn");
+  // an invalid value is a config error with a path
+  const bad = parseReleaseConfig(
+    JSON.stringify({ defaults: { leaks: { trailers: "x" } } }),
+  );
+  assert.ok(
+    bad.errors.some((e) => e.path === "defaults.leaks.trailers"),
+    JSON.stringify(bad.errors),
+  );
+});
+
+test("§18.6: commitIdentityMissing — no inheritable identity → missing", () => {
+  const none = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {},
+      projects: { p: { commitIdentity: "A <a@x.io>" } },
+    }),
+  ).config!;
+  // a project with its own identity covers only itself — the defaults
+  // context (any unlisted project) still lacks one
+  assert.equal(commitIdentityMissing(none), true);
+  const top = parseReleaseConfig(
+    JSON.stringify({ commitIdentity: "A <a@x.io>" }),
+  ).config!;
+  assert.equal(commitIdentityMissing(top), false);
+  const inDefaults = parseReleaseConfig(
+    JSON.stringify({ defaults: { commitIdentity: "A <a@x.io>" } }),
+  ).config!;
+  assert.equal(commitIdentityMissing(inDefaults), false);
+});
+
+test("§18.6: scan — missing commitIdentity warns; trailers follow leaks.trailers", async () => {
+  const commit = {
+    sha: "b".repeat(40),
+    authorName: "Someone",
+    authorEmail: "s@x.io",
+    committerName: "Someone",
+    committerEmail: "s@x.io",
+    body: "feat: x\n\nCo-Authored-By: bot <b@x>",
+  };
+  const base = {
+    repoPath: "/r",
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    commits: [commit],
+    added: [],
+    leaks: {
+      machine: "block" as const,
+      bbIds: "warn" as const,
+      trailers: "block" as const,
+      allow: [],
+    },
+  };
+  // no commitIdentity → the signature finding WARNS, never blocks
+  const noId = await machineScan(GL_EMPTY, base);
+  assert.equal(
+    noId.find((f) => f.rule === "commit-identity")!.severity,
+    "warn",
+  );
+  // trailers: "block" → the foreign-bot trailer finding blocks
+  assert.equal(
+    noId.find((f) => f.rule === "foreign-bot-trailer")!.severity,
+    "block",
+  );
+  // trailers: "warn" → the same finding warns
+  const trWarn = await machineScan(GL_EMPTY, {
+    ...base,
+    leaks: { ...base.leaks, trailers: "warn" as const },
+  });
+  assert.equal(
+    trWarn.find((f) => f.rule === "foreign-bot-trailer")!.severity,
+    "warn",
+  );
+  // allowedTrailers still exempts, whatever the strictness
+  const exempt = await machineScan(GL_EMPTY, {
+    ...base,
+    allowedTrailers: ["Co-Authored-By"],
+  });
+  assert.ok(!exempt.some((f) => f.rule === "foreign-bot-trailer"));
+  // configured identity + mismatching signature → blocks
+  const withId = await machineScan(GL_EMPTY, {
+    ...base,
+    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+  });
+  assert.equal(
+    withId.find((f) => f.rule === "commit-identity")!.severity,
+    "block",
+  );
+  // matching signature → no identity finding at all
+  const okScan = await machineScan(GL_EMPTY, {
+    ...base,
+    commits: [
+      {
+        ...commit,
+        authorName: "Agent",
+        authorEmail: "agent@x.io",
+        committerName: "Agent",
+        committerEmail: "agent@x.io",
+        body: "feat: x",
+      },
+    ],
+    allowedAuthor: { name: "Agent", email: "agent@x.io" },
+  });
+  assert.ok(!okScan.some((f) => f.rule === "commit-identity"));
 });

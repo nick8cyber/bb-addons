@@ -15,10 +15,18 @@ import type {
   MessageDispatchHookContext,
   MessageDispatchHookDecision,
 } from "@get-bb/plugin-sdk";
-import { levelRole, type Policy } from "./policy.js";
+import { levelRole, type Policy, type PolicyIssue } from "./policy.js";
 
 /** §3 budget: one role instruction ≤ 2500 chars (role + rule ≤ 4096). */
 export const ROLE_INSTRUCTIONS_MAX = 2500;
+
+/** §18.6: the handoff file path in the default role texts — the
+ * `handoffPath` setting substitutes it. */
+export const DEFAULT_HANDOFF_PATH = "$BB_THREAD_STORAGE/HANDOFF.md";
+
+/** §18.6: the review level's name in the orchestrator text without a
+ * policy (and when the policy declares no auditor level). */
+export const DEFAULT_REVIEW_LEVEL = "review";
 
 export type RoleId =
   | "orchestrator"
@@ -36,11 +44,11 @@ export const ROLE_IDS: readonly RoleId[] = [
 /** §13.1 rev 20: `release-auditor` is never offered in the new-chat
  * window — only a `release` pipeline dispatch assigns it (source
  * `delegate`). The RPC enum and the composer list use this subset. */
-export const PICKABLE_ROLE_IDS: readonly RoleId[] = [
+export const PICKABLE_ROLE_IDS = [
   "orchestrator",
   "executor",
   "auditor",
-];
+] as const;
 
 export const DEFAULT_ROLE: RoleId = "orchestrator";
 
@@ -53,31 +61,45 @@ export interface RoleDefinition {
   skills: readonly string[];
 }
 
-const ORCHESTRATOR_INSTRUCTIONS = `Ты — оркестратор. Твоя роль — раздавать работу исполнителям, а не выполнять её самому.
+/**
+ * §18.6: role texts are composed — the BODY (with `{handoff}` and
+ * `{review}` substitutions, `roleTexts` may append to it) plus the
+ * MANDATORY tail the plugin always adds itself: the sudo/packages/host
+ * ban (§17.1) on doers and the JSON verdict line (r31) on `auditor`.
+ * The user cannot remove the mandatory parts via `roleTexts`.
+ * `release-auditor` is not customizable at all.
+ */
+const ORCHESTRATOR_BODY = `Ты — оркестратор. Твоя роль — раздавать работу исполнителям, а не выполнять её самому.
 
 - Составную задачу не делай сам: декомпозируй её в задачи bb tasks со спеками и раздавай исполнителям через orchestrator_delegate (bb orchestrator delegate <KEY> --level <уровень>).
 - Уровень выбирай по сложности; сомневаешься — бери выше, сложное не понижай.
 - После раздачи заканчивай ход: итог исполнителя придёт сам — сообщением [bb system] … completed от BB или строкой [orchestrator] (исход, ветка, sha7, копия, отчёт), ждать в форграунде нельзя.
 - Результат исполнителя проверяй сам, прежде чем сводить и отчитываться.
-- Ревью спек до раздачи и результата после — на уровне review (роль auditor).
+- Ревью спек до раздачи и результата после — на уровне {review} (роль auditor).
 - Сведение и выкладка результата — только твоя зона: исполнители сдают работу тебе.
-- Хендофф: веди файл HANDOFF.md в хранилище своего треда ($BB_THREAD_STORAGE/HANDOFF.md) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше; со ссылками на треды исполнителей и их задачи. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.
+- Хендофф: веди файл HANDOFF.md в хранилище своего треда ({handoff}) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше; со ссылками на треды исполнителей и их задачи. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.
 - Доработку раздавай новым delegate той же задачи: плагин сам продолжит работу с коммита прошлого захода (--from <sha|ветка> — своя точка, --fresh — заново).
 - Ветку и рабочую копию исполнителя не открывай в других копиях: итог захода снимает плагин.
 - Свои поллеры поверх сторожа не ставь: исходы (зависание, квота, падение, перевыпуск) приходят сообщениями [orchestrator].
-- Не раздавай вручную (bb tasks dispatch, bb thread spawn) — только delegate.
-- Машину вне рабочих копий не меняй: ни sudo, ни установки пакетов, ни настроек хоста — чего-то не хватает, сообщи пользователю (он и есть координатор этого чата).`;
+- Не раздавай вручную (bb tasks dispatch, bb thread spawn) — только delegate.`;
 
-const EXECUTOR_INSTRUCTIONS = `Ты — исполнитель. Твоя роль — выполнить поставленную задачу самостоятельно.
+const EXECUTOR_BODY = `Ты — исполнитель. Твоя роль — выполнить поставленную задачу самостоятельно.
 
 - Задачу делаешь ты: субагентов не запускай и работу не перераздавай.
 - Делай строго по спеке задачи; расхождение со спекой — вопрос координатору, а не самодеятельность.
 - Правила работы с git — раздел «Работа с git» в инструкциях задачи.
 - Отчёт — по контракту из описания задачи.
-- Хендофф: веди файл HANDOFF.md в хранилище своего треда ($BB_THREAD_STORAGE/HANDOFF.md) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.
-- Машину вне своей рабочей копии не меняй: ни sudo, ни установки пакетов — чего-то не хватает, сообщи координатору, не делай сам.`;
+- Хендофф: веди файл HANDOFF.md в хранилище своего треда ({handoff}) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.`;
 
-const RELEASE_AUDITOR_INSTRUCTIONS = `Ты — проверяющий агент выкладки (release-auditor). Твоя роль — только читать и проверять выпуск перед публикацией, ничего не меняя.
+const AUDITOR_BODY = `Ты — аудитор. Твоя роль — только читать и проверять, ничего не меняя.
+
+- Не правь файлы, не коммить, не запускай раздачу и субагентов.
+- Проверяй по контракту: документация проекта — источник истины, код сверяй с ней.
+- Формат находок: место (файл:строки) → проблема → исправление. Без находок — явный вердикт «замечаний нет».
+- Разделяй факты и оценки; сомнительное помечай, а не выдавай за факт.
+- Отчёт — список находок или «замечаний нет»; изменений в репозитории быть не должно.`;
+
+const RELEASE_AUDITOR_BODY = `Ты — проверяющий агент выкладки (release-auditor). Твоя роль — только читать и проверять выпуск перед публикацией, ничего не меняя.
 
 - Не правь файлы, не коммить, не пушь, не запускай раздачу и субагентов. Все проверки — только чтением.
 - Вход аудита — файл, указанный в задаче: дифф выкладки, сообщения и метаданные коммитов, список связанных документов, находки машинного скана.
@@ -89,19 +111,159 @@ const RELEASE_AUDITOR_INSTRUCTIONS = `Ты — проверяющий агент
   {"verdict":"APPROVE"|"REJECT","findings":[{"category":"docs|secrets|identity|machine|bbIds|semantic","file":"<path>","line":<n>,"problem":"<что>","fix":"<как исправить>"}]}
   APPROVE — только когда находок нет. Любой другой формат будет засчитан как REJECT.`;
 
-const AUDITOR_INSTRUCTIONS = `Ты — аудитор. Твоя роль — только читать и проверять, ничего не меняя.
+/** §18.6: the mandatory tails — added by the plugin, never removable. */
+const ROLE_MANDATORY: Partial<Record<RoleId, string>> = {
+  orchestrator:
+    "- Машину вне рабочих копий не меняй: ни sudo, ни установки пакетов, ни настроек хоста — чего-то не хватает, сообщи пользователю (он и есть координатор этого чата).",
+  executor:
+    "- Машину вне своей рабочей копии не меняй: ни sudo, ни установки пакетов — чего-то не хватает, сообщи координатору, не делай сам.",
+  auditor:
+    'Заканчивай отчёт строкой JSON {"verdict":"OK"|"CHANGES","blockers":<число блокирующих находок>} — её читает конвейер выкладки.',
+};
 
-- Не правь файлы, не коммить, не запускай раздачу и субагентов.
-- Проверяй по контракту: спека и ADR — источник истины, код сверяй с ними.
-- Формат находок: место (файл:строки) → проблема → исправление. Без находок — явный вердикт «замечаний нет».
-- Разделяй факты и оценки; сомнительное помечай, а не выдавай за факт.
-- Отчёт — список находок или «замечаний нет»; изменений в репозитории быть не должно. Заканчивай отчёт строкой JSON {"verdict":"OK"|"CHANGES","blockers":<число блокирующих находок>} — её читает конвейер выкладки.`;
+const ROLE_BODIES: Record<RoleId, string> = {
+  orchestrator: ORCHESTRATOR_BODY,
+  executor: EXECUTOR_BODY,
+  auditor: AUDITOR_BODY,
+  "release-auditor": RELEASE_AUDITOR_BODY,
+};
+
+/**
+ * §18.6: the effective instruction text — body with `{handoff}`/`{review}`
+ * substituted, the optional `roleTexts` addition, and the mandatory tail
+ * LAST so no `roleTexts` value can remove it.
+ */
+export function roleInstructions(
+  id: RoleId,
+  opts?: {
+    /** The `roleTexts` addition for this role (trimmed). */
+    extra?: string | undefined;
+    /** The `handoffPath` setting; default DEFAULT_HANDOFF_PATH. */
+    handoffPath?: string | undefined;
+    /** The review level's name from the policy (orchestrator text). */
+    reviewLevel?: string | undefined;
+  },
+): string {
+  const body = ROLE_BODIES[id]
+    .replaceAll("{handoff}", opts?.handoffPath ?? DEFAULT_HANDOFF_PATH)
+    .replaceAll("{review}", opts?.reviewLevel ?? DEFAULT_REVIEW_LEVEL);
+  // §18.6: `release-auditor` is not customizable — `roleTexts` keys are
+  // rejected at parse, and the composer ignores an addition here too.
+  const extra =
+    id === "release-auditor" ? undefined : opts?.extra?.trim();
+  const mandatory = ROLE_MANDATORY[id];
+  return (
+    body +
+    (extra ? `\n${extra}` : "") +
+    (mandatory ? `\n${mandatory}` : "")
+  );
+}
+
+/**
+ * §18.6: the review level's name in the orchestrator text — `review`
+ * when the policy declares it, else the first auditor level (never the
+ * pipeline's `release-audit`), else the literal default.
+ */
+export function reviewLevelName(
+  policy: Policy | null | undefined,
+): string {
+  if (policy) {
+    if (
+      policy.levels["review"] &&
+      levelRole(policy, "review") === "auditor"
+    ) {
+      return "review";
+    }
+    const alt = Object.keys(policy.levels).find(
+      (n) => n !== "release-audit" && levelRole(policy, n) === "auditor",
+    );
+    if (alt) return alt;
+  }
+  return DEFAULT_REVIEW_LEVEL;
+}
+
+/** The roles `roleTexts` may add text to — `release-auditor` excluded. */
+export type CustomizableRoleId = (typeof PICKABLE_ROLE_IDS)[number];
+
+export interface RoleTextsLoad {
+  /** The per-role additions; EMPTY whenever `errors` is non-empty — a
+   * malformed document is ignored whole, never partially applied. */
+  texts: Partial<Record<CustomizableRoleId, string>>;
+  errors: PolicyIssue[];
+}
+
+/**
+ * §18.6: the `roleTexts` setting — a JSON object whose only keys are
+ * `orchestrator`, `executor`, `auditor`; each value is appended to that
+ * role's text (the mandatory parts always come after it). An addition
+ * that pushes the composed text over the §3 2500-char budget is an
+ * error, as is any other key.
+ */
+export function parseRoleTexts(text: string | undefined): RoleTextsLoad {
+  const errors: PolicyIssue[] = [];
+  const texts: RoleTextsLoad["texts"] = {};
+  const done = (): RoleTextsLoad => ({ texts: {}, errors });
+  if (!text || text.trim() === "") return { texts, errors };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    errors.push({
+      path: "$",
+      message: `невалидный JSON: ${(e as Error).message}`,
+    });
+    return done();
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    errors.push({ path: "$", message: "roleTexts должен быть JSON-объектом" });
+    return done();
+  }
+  for (const [key, value] of Object.entries(raw)) {
+    const path = `roleTexts.${key}`;
+    if (
+      !(PICKABLE_ROLE_IDS as readonly string[]).includes(key)
+    ) {
+      errors.push({
+        path,
+        message:
+          "ключи — только orchestrator|executor|auditor " +
+          "(release-auditor не переопределяется)",
+      });
+      continue;
+    }
+    if (typeof value !== "string") {
+      errors.push({ path, message: "must be a string" });
+      continue;
+    }
+    const extra = value.trim();
+    if (!extra) continue;
+    if (
+      roleInstructions(key as RoleId, { extra }).length >
+      ROLE_INSTRUCTIONS_MAX
+    ) {
+      errors.push({
+        path,
+        message: `итог длиннее ${ROLE_INSTRUCTIONS_MAX} символов`,
+      });
+      continue;
+    }
+    texts[key as CustomizableRoleId] = extra;
+  }
+  return errors.length ? done() : { texts, errors };
+}
+
+/** The needs-configuration line for a broken `roleTexts` document —
+ * like `gitInstructionsError` the value is ignored until fixed. */
+export function roleTextsError(load: RoleTextsLoad): string | null {
+  const first = load.errors[0];
+  return first ? `roleTexts: ${first.path}: ${first.message}` : null;
+}
 
 export const ROLES: Record<RoleId, RoleDefinition> = {
   orchestrator: {
     id: "orchestrator",
     delegates: true,
-    instructions: ORCHESTRATOR_INSTRUCTIONS,
+    instructions: roleInstructions("orchestrator"),
     tools: [
       "orchestrator_delegate",
       "orchestrator_status",
@@ -113,21 +275,21 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
   executor: {
     id: "executor",
     delegates: false,
-    instructions: EXECUTOR_INSTRUCTIONS,
+    instructions: roleInstructions("executor"),
     tools: [],
     skills: [],
   },
   auditor: {
     id: "auditor",
     delegates: false,
-    instructions: AUDITOR_INSTRUCTIONS,
+    instructions: roleInstructions("auditor"),
     tools: [],
     skills: [],
   },
   "release-auditor": {
     id: "release-auditor",
     delegates: false,
-    instructions: RELEASE_AUDITOR_INSTRUCTIONS,
+    instructions: roleInstructions("release-auditor"),
     tools: [],
     skills: [],
   },
@@ -206,13 +368,11 @@ export interface RoleDecisionProbes {
  * coordinator tools to them at `configure` (audit Б3). */
 export const NO_ROLE = "none";
 
-/** §17.1: plugins continuing a human chat when the `userThreadPlugins`
- * setting is unset — session handoff and `bb external-compact` (chat
- * compaction into a new thread) (PLUG-215 Б1). */
-export const DEFAULT_USER_THREAD_PLUGINS = [
-  "handoff",
-  "external-compact",
-] as const;
+/** §17.1 r32 (§18.6): plugins continuing a human chat when the
+ * `userThreadPlugins` setting is unset — EMPTY for a new installation;
+ * an existing one keeps `handoff, external-compact` (or its own list)
+ * in the explicit setting value. */
+export const DEFAULT_USER_THREAD_PLUGINS: readonly string[] = [];
 
 /**
  * §13.2 п.2 — the role rule, evaluated strictly in the spec's branch order.

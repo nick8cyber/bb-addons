@@ -868,3 +868,76 @@ test("agent tool noCode: true marks the delegation", async () => {
   assert.equal(spawnCalls.length, 1, "executor spawned");
   assert.match(spawnCalls[0]!.prompt!, /задача без кода/);
 });
+
+// ── §18.6 (PLUG-249): roleTexts / handoffPath / userThreadPlugins ──────
+
+test("§18.6: roleTexts + handoffPath reach the coordinator text", async () => {
+  const host = await hostWith({
+    roleTexts: JSON.stringify({ orchestrator: "- custom rule xyz" }),
+    handoffPath: "/home/example/H.md",
+  });
+  const resolved = await host.harness.resolveAgentConfiguration(
+    makePluginAgentConfigurationContext({}),
+  );
+  const text = resolved.instructions ?? "";
+  assert.match(text, /- custom rule xyz/);
+  assert.match(text, /\/home\/example\/H\.md/);
+  // the mandatory tail survives the user's addition
+  assert.match(text, /ни sudo/);
+});
+
+test("§18.6: invalid roleTexts reports needs-configuration", async () => {
+  const host = await hostWith({ roleTexts: '{"release-auditor": "x"}' });
+  assert.ok(host.harness.needsConfigurationMessages.length > 0);
+  assert.match(
+    host.harness.needsConfigurationMessages.join(" "),
+    /roleTexts\.release-auditor/,
+  );
+});
+
+test("§18.6: handoffPath empty falls back to the default", async () => {
+  const host = await hostWith({ handoffPath: "" });
+  const resolved = await host.harness.resolveAgentConfiguration(
+    makePluginAgentConfigurationContext({}),
+  );
+  assert.match(resolved.instructions ?? "", /\$BB_THREAD_STORAGE\/HANDOFF\.md/);
+});
+
+test("§18.6: userThreadPlugins — empty default denies, explicit list allows", async () => {
+  const denied = await hostWith();
+  const res1 = await denied.harness.resolveAgentConfiguration(
+    makePluginAgentConfigurationContext({
+      origin: { pluginId: "handoff" },
+    }),
+  );
+  assert.deepEqual(res1.tools, []);
+  const allowed = await hostWith({
+    userThreadPlugins: "handoff external-compact",
+  });
+  const res2 = await allowed.harness.resolveAgentConfiguration(
+    makePluginAgentConfigurationContext({
+      origin: { pluginId: "handoff" },
+    }),
+  );
+  assert.equal(res2.tools.length, 4);
+});
+
+test("§18.6: status reports a missing commitIdentity as a warning", async () => {
+  const host = await hostWith({
+    release: JSON.stringify({
+      defaults: { target: { action: "push", branch: "main" } },
+    }),
+  });
+  const res = await host.harness.runCli(["status"], { threadId: "thr_c" });
+  assert.match(res.stdout, /автор коммитов не задан/);
+  const okHost = await hostWith({
+    release: JSON.stringify({
+      commitIdentity: "A <a@x.io>",
+      defaults: { target: { action: "push", branch: "main" } },
+    }),
+  });
+  const res2 = await okHost.harness.runCli(["status"], {
+    threadId: "thr_c",
+  });
+  assert.ok(!/автор коммитов не задан/.test(res2.stdout));
+});
