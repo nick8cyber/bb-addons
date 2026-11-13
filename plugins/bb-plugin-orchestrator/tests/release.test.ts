@@ -47,6 +47,8 @@ import {
   SAFE_USERS_PATH,
 } from "./fixtures/leak-samples.js";
 import { parsePolicy } from "../src/policy.js";
+import { createT, type T } from "../src/i18n/index.js";
+import { renderPrePush } from "../src/release.js";
 import { OrchestratorError } from "../src/errors.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import type { CmdRunner } from "../src/cmd.js";
@@ -654,6 +656,7 @@ function makeDeps(repo: string, overrides: Partial<{
     packetDir: () => mkdtempSync(join(tmpdir(), "pkt-")),
     localHostId: async () => overrides.localHostId ?? "host_test",
     enqueue: <T>(f: () => Promise<T>) => f(),
+    t: undefined as T | undefined,
     now: undefined as (() => number) | undefined,
     spawn: undefined as ReleaseDeps["spawn"],
     killGraceMs: undefined as ReleaseDeps["killGraceMs"],
@@ -1434,6 +1437,21 @@ test("release: up-to-date installed hook passes the freshness check", async () =
   installAllWrappers(tmp);
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   assert.equal(res.status, "auditing");
+});
+
+test("§18.1 (ревью PLUG-247a Б1): an installer's ru pre-push under language=en is fresh — synced to en", async () => {
+  const { repo } = makeRepo();
+  const { deps, tmp } = makeDeps(repo);
+  // install.mjs copies the shipped file as is — the ru rendering.
+  installAllWrappers(tmp);
+  deps.t = createT("en");
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  // …and the installed hook was rewritten to the current language.
+  assert.equal(
+    readFileSync(join(tmp, "pre-push"), "utf8"),
+    renderPrePush(createT("en")).toString("utf8"),
+  );
 });
 
 test("§17.3 (ревью PLUG-210): a missing wrapper is stale — a partial install refuses", async () => {

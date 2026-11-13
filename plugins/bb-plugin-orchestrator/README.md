@@ -183,22 +183,24 @@ map presets onto levels and fallback chains, write the policy, validate.
 
 - `language` (`en` | `ru`, default `en`, §18.1) — the language of every
   human/agent-facing text the plugin produces: coordinator messages, CLI
-  and tool output, executor instructions (the «задача без кода» line,
-  «Заход N», the verdict reminder), the routing rule, role texts, the
-  default git memo, and the `pre-push` hook's refusal messages. Strings
-  live in `src/i18n/<lang>.ts` catalogs; a key missing in the selected
-  language falls back to English with a log warning. Machine contracts
-  are never translated: the verdict JSON, error codes, setting and
-  field names, `prBody` markers, and journal labels. A `gitInstructions`
-  value equal to the built-in text of either language counts as the
-  default and is emitted in the current language; a custom value goes
-  out verbatim, empty disables the section. The plugin declares the
-  current language's skill set (`orchestrator-coordinator`/`orchestrator-setup`
-  or their `-ru` twins) and rewrites an installed `pre-push` hook on a
-  language change — its texts are versioned with the language.
+  and tool output, executor instructions (the no-code line, «Round N»),
+  the routing rule, the default git memo, and the `pre-push` hook's
+  refusal messages. Strings live in `src/i18n/<lang>.ts` catalogs; a key
+  missing in the selected language falls back to English with a log
+  warning. Machine contracts are never translated: the verdict JSON,
+  error codes, setting and field names, `prBody` markers, and journal
+  labels. A `gitInstructions` value equal to the built-in text of either
+  language counts as the default and is emitted in the current language;
+  a custom value goes out verbatim, empty disables the section. The
+  plugin declares the current language's skill set
+  (`orchestrator-coordinator`/`orchestrator-setup` or their `-ru` twins)
+  and rewrites an installed `pre-push` hook on a language change — its
+  texts are versioned with the language. Tool descriptions and CLI help
+  are registered at plugin load — after a `language` change they refresh
+  on `bb plugin reload`.
 - `policy` (multiline JSON, §2) — levels, route chains, limits, quota
   groups. Empty or invalid → `needs-configuration`, `delegate` refuses.
-- `gitInstructions` (§2.2, ≤ 1500 chars) — the «Работа с git» section
+- `gitInstructions` (§2.2, ≤ 1500 chars) — the «Working with git» section
   prepended to every dispatch's instructions (the spawn prompt's
   «Additional instructions»); empty disables it.
 - `injectInstructions` (default on) — off silences every plugin-generated

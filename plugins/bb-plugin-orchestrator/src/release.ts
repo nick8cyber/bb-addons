@@ -76,7 +76,7 @@ import type {
   ReleaseRow,
 } from "./store.js";
 import { runChecked, runJson, type BbCli, type BbCliResult } from "./bb-cli.js";
-import { T_RU, type T } from "./i18n/index.js";
+import { createT, LANGS, T_RU, type T } from "./i18n/index.js";
 import type { CmdRunner } from "./cmd.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
 import { dispatchToRoute, type DispatchStepsDeps } from "./delegate.js";
@@ -1275,7 +1275,7 @@ export function renderPrePush(t: T = T_RU): Buffer {
     throw new Error("pre-push source has no MESSAGES block");
   }
   return Buffer.from(
-    src.replace(/^const MESSAGES = .*;$/m, line),
+    src.replace(/^const MESSAGES = .*;$/m, () => line),
     "utf8",
   );
 }
@@ -1309,6 +1309,21 @@ function standardHookNames(): string[] {
   } catch {
     return ["pre-push"];
   }
+}
+
+/** §18.1: true when `installed` is a byte-for-byte `pre-push` rendered
+ * under a language other than the current one — the shipped installer
+ * drops exactly one variant regardless of the `language` setting. */
+function isOtherLanguageRender(installed: Buffer, t: T): boolean {
+  for (const lang of LANGS) {
+    if (lang === t.lang) continue;
+    try {
+      if (installed.equals(renderPrePush(createT(lang)))) return true;
+    } catch {
+      // a broken rendering simply does not match
+    }
+  }
+  return false;
 }
 
 /**
@@ -1352,7 +1367,20 @@ export function assertInstalledHookFresh(deps: ReleaseDeps): void {
     } catch {
       continue;
     }
-    if (!installed.equals(current)) stale.push(name);
+    if (!installed.equals(current)) {
+      // §18.1: the shipped installer copies the repo's `pre-push` as is,
+      // so a fresh install may carry another language's MESSAGES — that
+      // copy is still fresh; sync it to the current language in place.
+      if (name === "pre-push" && isOtherLanguageRender(installed, t)) {
+        try {
+          syncInstalledPrePush(dir, t);
+        } catch {
+          // a failed rewrite still leaves a working hook — not stale
+        }
+        continue;
+      }
+      stale.push(name);
+    }
   }
   // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — a leftover
   // wrapper still disables git's built-in worktree update on

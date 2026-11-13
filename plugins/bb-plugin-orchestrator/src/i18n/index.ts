@@ -24,6 +24,10 @@ export interface T {
 
 const DICTS: Record<Lang, Record<string, string>> = { en: EN, ru: RU };
 
+/** Every language with a catalog — for artifacts rendered per language
+ * (the pre-push hook: an installed copy may carry any of them). */
+export const LANGS = Object.keys(DICTS) as Lang[];
+
 /**
  * §18.1: the `language` setting — `en` | `ru`, default `en`. Any other
  * (e.g. pre-key) value resolves to `en`.

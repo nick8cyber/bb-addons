@@ -493,7 +493,7 @@ export const EN: Record<string, string> = {
   "cli.reminder":
     "The executor's report arrives as a message — end your turn.",
   "cli.noCodeDescribe":
-    "Mark the delegation «задача без кода» (§4.1 r28): the executor " +
+    "Mark the delegation «no-code task» (§4.1 r28): the executor " +
     "must not commit, the watchdog does not expect commits",
   "cli.releaseUsage":
     "bb orchestrator release <KEY> [--no-docs <reason>] " +
@@ -631,7 +631,7 @@ export const EN: Record<string, string> = {
   "rc.mergedOnPush": '"merged" at a push target reads as "published"',
   "rc.mergedNever": '"merged" never fires — prProvider is "none"',
   "rc.missingCheckout":
-    '"{name}" needs the missing checkout — it reports "нет checkout"',
+    '"{name}" needs the missing checkout — it reports "no checkout"',
 
   // ── tool descriptions / CLI help ────────────────────────────────────
   "tool.delegate":

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,8 +29,10 @@ import {
 } from "../src/instructions.js";
 import { skillSet } from "../src/agent-config.js";
 import {
+  assertInstalledHookFresh,
   renderPrePush,
   syncInstalledPrePush,
+  type ReleaseDeps,
 } from "../src/release.js";
 import type { BbCli } from "../src/bb-cli.js";
 
@@ -132,6 +140,56 @@ test("§18.1: syncInstalledPrePush rewrites an installed hook on language change
   assert.equal(
     syncInstalledPrePush(join(dir, "absent"), T_RU),
     false,
+  );
+});
+
+/** Every name `hook-names` lists, like install.mjs: `pre-push` carries
+ * the rendered messages, the rest are byte-copies of `chain`. */
+function installWrappers(dir: string, prePush: Buffer) {
+  const hooksSrc = join(pluginDir, "hooks");
+  mkdirSync(dir, { recursive: true });
+  const names = readFileSync(join(hooksSrc, "hook-names"), "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+  for (const n of names) {
+    if (n === "pre-push") writeFileSync(join(dir, n), prePush);
+    else cpSync(join(hooksSrc, "chain"), join(dir, n));
+  }
+}
+
+test("§18.1 (ревью PLUG-247a п.7): a language change via settings.onChange rewrites the installed pre-push", async () => {
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    settings: {
+      policy:
+        '{"version":1,"levels":{"simple":{"chain":["s"]}},"routes":{"s":{"preset":"s","provider":"p"}}}',
+    },
+  });
+  const hooksDir = join(
+    host.bb.server.experimental_dataDir,
+    "plugins",
+    "orchestrator",
+    "git-hooks",
+  );
+  // what install.mjs drops — the shipped (ru) pre-push
+  installWrappers(hooksDir, renderPrePush(T_RU));
+  await createPlugin(host.bb, { bbCli: cli });
+  // default language=en — the startup sync already rewrote the hook
+  const enRender = renderPrePush(createT("en")).toString("utf8");
+  assert.equal(readFileSync(join(hooksDir, "pre-push"), "utf8"), enRender);
+  // flipping the setting rewrites it again — and release's freshness
+  // check then passes under the new language
+  await host.harness.setSettings({ language: "ru" });
+  assert.equal(
+    readFileSync(join(hooksDir, "pre-push"), "utf8"),
+    renderPrePush(T_RU).toString("utf8"),
+  );
+  assert.doesNotThrow(() =>
+    assertInstalledHookFresh({
+      hooksDir: () => hooksDir,
+      t: createT("ru"),
+    } as unknown as ReleaseDeps),
   );
 });
 

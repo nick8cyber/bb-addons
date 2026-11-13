@@ -271,7 +271,7 @@ export async function createPlugin(
       type: "string",
       label: "Git instructions",
       description:
-        "«Работа с git» section (§2.2) prepended to every dispatch's --instructions. Empty disables the section.",
+        '"Git instructions" section (§2.2) prepended to every dispatch\'s --instructions. Empty disables the section.',
       experimental_multiline: true,
       experimental_schema: gitInstructionsSchema,
       default: DEFAULT_GIT_INSTRUCTIONS,
