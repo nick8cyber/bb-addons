@@ -293,7 +293,22 @@ Uncommitted work in an executor's dirty copy is rescued with a snapshot
 deletion — inside the ~5 minute window before BB cleans the environment
 up; every attempt is written to the rescue ledger and shows in
 `bb orchestrator janitor report` (including when the coordinator line
-never arrived).
+never arrived). For the round result (§4.1 `result_dirty`) an untracked
+`node_modules` — a directory or a symlink, at any depth — is
+reproducible dependency state and does not make a copy dirty; every
+other status line does.
+
+Two report-only flags mark abandoned copies that look already
+published — neither ever leads to removal; both land in
+`janitor report` and the daily coordinator notice, tagged ` (squash?)`
+or ` (content?)` there. `squash-suspect` ("looks squash-merged; check
+and remove manually") fires when the copy's tree matches the target
+under `merge-tree` while its commits failed the ancestry/`patch-id`
+check; `content-on-target` ("content matches the target; check and
+remove manually") is checked first and fires when `git cherry <target>
+<tip>` prints no `+` line, or every file the tip changed against the
+merge-base equals its version on the target (`--no-renames`,
+`--literal-pathspecs`).
 
 ## Fitting your process
 
@@ -492,11 +507,13 @@ hook runs successfully. A "failure" is the `failed` and `timeout`
 outcomes; `interrupted` after a plugin restart ("interrupted by
 restart") counts too when enabled.
 
-Hook names are unique (edge whitespace ignored). On ANY `eventHooks`
-parse error no hooks run at all — events keep landing in the `events`
-journal and the trust check still sees the changes with a broken
-document. A hook that does not read stdin is normal: a write error to
-it is ignored and does not crash the plugin.
+Hook names are unique (edge whitespace ignored) and must not contain
+control characters (`\x00`–`\x1f`) — a duplicate or a control
+character is a parse error. On ANY `eventHooks` parse error no hooks
+run at all — events keep landing in the `events` journal and the trust
+check still sees the changes with a broken document. A hook that does
+not read stdin is normal: a write error to it is ignored and does not
+crash the plugin.
 
 Events v1: `delegation.done` (all levels including review; except
 `release-audit` — its outcome is the release events),

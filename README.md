@@ -303,4 +303,9 @@ Details and upstream attribution: [Server Switcher](plugins/bb-plugin-server-swi
 and `tsc --noEmit` only in the `plugins/` directories changed vs the base ref
 (default `origin/main`); exits non-zero on any failure, exits 0 when no plugin
 is affected. Requires a clean working tree (untracked files are ignored) — only
-committed changes are checked.
+committed changes are checked. A plugin's `node_modules` must be a real
+directory carrying every `devDependencies` binary under `.bin`: a symlink
+(shared store) is unlinked with `rm -f` first, and a missing binary (e.g.
+`tsc`) also makes `npm ci` run again. On failure the tail of the output lists
+the failed test names per plugin — TAP `not ok` and vitest `FAIL`/`×` lines —
+because the release journal keeps only the tail.
