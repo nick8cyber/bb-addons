@@ -2,8 +2,15 @@
 # Check only the plugins changed vs a base ref: npm test (if the plugin
 # defines a "test" script) and tsc --noEmit (if it has tsconfig.json).
 #
+# Dependencies: `node_modules` must be a real directory carrying every
+# binary the plugin's devDependencies declare — a symlink (shared store)
+# or a missing .bin entry means `npm ci` runs again.
+#
 # Usage: scripts/check-changed-plugins.sh [base-ref]   (default: origin/main)
 # Exit:  0 when every affected plugin passes, 1 on any failure.
+# On failure the tail of the output lists the failed `not ok` test names
+# per plugin — the release journal keeps only the tail, so the names
+# must live there.
 
 set -u -o pipefail
 
@@ -43,7 +50,31 @@ if [ "${#PLUGIN_DIRS[@]}" -eq 0 ]; then
   exit 0
 fi
 
+# node_modules is usable only as a real directory where every binary the
+# plugin's devDependencies declare exists under .bin — a symlink or a
+# missing binary (e.g. tsc) means npm ci must run.
+deps_ok() {
+  local dir="$1" nm="$1/node_modules"
+  [ -d "$nm" ] && [ ! -L "$nm" ] || return 1
+  (cd "$dir" && node -e '
+    const fs = require("fs"), path = require("path");
+    const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+    for (const dep of Object.keys(pkg.devDependencies || {})) {
+      let dp;
+      try {
+        dp = JSON.parse(fs.readFileSync(path.join("node_modules", dep, "package.json"), "utf8"));
+      } catch { process.exit(1); }
+      const bin = dp.bin;
+      const names = typeof bin === "string" ? [dep.split("/").pop()] : Object.keys(bin || {});
+      for (const b of names) {
+        if (!fs.existsSync(path.join("node_modules", ".bin", b))) process.exit(1);
+      }
+    }
+  ')
+}
+
 failed=()
+failed_tests=()
 
 for dir in "${PLUGIN_DIRS[@]}"; do
   name="${dir#plugins/}"
@@ -55,14 +86,28 @@ for dir in "${PLUGIN_DIRS[@]}"; do
   echo "==> $name"
   ok=1
 
-  if [ ! -d "$dir/node_modules" ]; then
+  if ! deps_ok "$dir"; then
     echo "    npm ci"
     (cd "$dir" && nice -n 19 npm ci --silent) || ok=0
   fi
 
   if [ "$ok" -eq 1 ] && [ -n "$(cd "$dir" && npm pkg get scripts.test 2>/dev/null | grep -v '^{}')" ]; then
     echo "    npm test"
-    (cd "$dir" && nice -n 19 npm test) || ok=0
+    test_log=$(mktemp "${TMPDIR:-/tmp}/check-plugins-test-XXXXXX.log")
+    if (cd "$dir" && nice -n 19 npm test) >"$test_log" 2>&1; then
+      cat "$test_log"
+    else
+      ok=0
+      cat "$test_log"
+      # TAP `not ok` lines — the failure summary below keeps the names
+      # inside the journal tail (nested subtests included, deduped).
+      while IFS= read -r line; do
+        [ -n "$line" ] && failed_tests+=("$name: $line")
+      done <<EOF2
+$(grep -E '^[[:space:]]*not ok ' "$test_log" | sed 's/^[[:space:]]*//' | sort -u)
+EOF2
+    fi
+    rm -f "$test_log"
   fi
 
   if [ "$ok" -eq 1 ] && [ -f "$dir/tsconfig.json" ]; then
@@ -80,6 +125,10 @@ done
 
 if [ "${#failed[@]}" -gt 0 ]; then
   echo "check-changed-plugins: FAILED: ${failed[*]}" >&2
+  if [ "${#failed_tests[@]}" -gt 0 ]; then
+    echo "check-changed-plugins: failed tests:" >&2
+    printf '    %s\n' "${failed_tests[@]}" >&2
+  fi
   exit 1
 fi
 

@@ -59,6 +59,7 @@ export const EN: Record<string, string> = {
   "ev.hookObject": "a hook must be an object",
   "ev.nameString": "the hook name must be a string",
   "ev.nameUnique": "hook names must be unique",
+  "ev.nameControl": "the hook name must not contain control characters",
   "ev.onArray": "on — a non-empty array of event names",
   "ev.runArray": "run — a non-empty argv array (no shell)",
   "ev.projectsArray": "projects — an array of project ids",

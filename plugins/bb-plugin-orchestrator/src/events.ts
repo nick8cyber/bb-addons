@@ -54,7 +54,9 @@ const isStrArr = (v: unknown): v is string[] =>
  * хуков нет. Невалидный документ — `errors` (needs-configuration как у
  * `release` не ставим: хуки — дополнительная функция, ошибки ложатся
  * в журнал). §18.5 (ревью Б1–Б2): имена уникальны после обрезки
- * пробелов — дубль это ошибка разбора, а при ЛЮБОЙ ошибке хуки не
+ * пробелов — дубль это ошибка разбора, а управляющие символы в имени
+ * (\x00-\x1f) — тоже ошибка (PLUG-250: «\0broken» совпал бы с
+ * ключом-маркером доверия) — при ЛЮБОЙ ошибке хуки не
  * запускаются вовсе (см. effectiveHooks): иначе дубль имени давал бы
  * запуск записи, которой нет в снимке доверия.
  */
@@ -91,6 +93,12 @@ export function parseEventHooks(
       return;
     }
     const name = h.name.trim();
+    // PLUG-250 (ревью PLUG-246): управляющие символы в имени запрещены —
+    // «\0broken» совпал бы с ключом-маркером доверия HOOKS_BROKEN_KEY.
+    if (/[\x00-\x1f]/.test(name)) {
+      errors.push({ path: `${path}.name`, message: t("ev.nameControl") });
+      return;
+    }
     if (hooks.some((x) => x.name === name)) {
       errors.push({
         path: `${path}.name`,

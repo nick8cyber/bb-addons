@@ -15,9 +15,12 @@
  * candidates: `workers` (default) covers dispatch threads
  * (`originPluginId=tasks`) and threads with a parent; `all` also covers
  * root chats. A `bb/` branch is deleted only on a later run, once its
- * copy no longer exists. «Влита» is ancestry or `git cherry` with no
- * «+» (patch-id equivalence — a squash of several commits is not
- * recognized; such copies only go to the report).
+ * copy no longer exists. «Влита» is ancestry, `git cherry` with no
+ * «+» (patch-id equivalence), or the file-content sign (PLUG-250):
+ * every file the branch changed against the merge-base equals the
+ * branch's version on the target — a commit rebuilt on merge
+ * (`git cherry` «+», identical code) counts, as does a multi-commit
+ * squash whose content all reached the target.
  * Own commits are the *reachable* commits of the copy's branch:
  * `rev-list --count <«Created from»>..<tip>` (PLUG-195: strictly from
  * the creation entry — no reflog-type parsing). «Ничего не
@@ -836,9 +839,13 @@ export function createJanitor(deps: JanitorDeps) {
 
   /**
    * §16.3 «влита»: a sha is merged into a remote-tracking target when
-   * it is an ancestor or patch-equivalent to a commit on it (`git
-   * cherry` prints only «-» lines). A multi-commit squash is neither —
-   * such copies are not merged and go to the report instead.
+   * it is an ancestor, patch-equivalent to a commit on it (`git
+   * cherry` prints only «-» lines), or — PLUG-250 — carries no file
+   * the target does not already have at the branch's own version
+   * (`tipContentOn`: a commit rebuilt on merge stays «+» to cherry
+   * while its code is identical; a multi-commit squash whose content
+   * all landed counts too). A squash that rewrote content still fails
+   * — such copies are not merged and go to the report instead.
    */
   const shaMergedIn = async (
     repoRoot: string,
@@ -852,7 +859,8 @@ export function createJanitor(deps: JanitorDeps) {
         return true;
       }
     }
-    return patchEquivalent(repoRoot, sha, targets);
+    if (await patchEquivalent(repoRoot, sha, targets)) return true;
+    return tipContentOn(repoRoot, sha, targets);
   };
 
   /**
@@ -961,6 +969,92 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
+   * §16.3 (PLUG-250): the file-content sign — every file <base>..<tip>
+   * changed exists on <target> at <tip>'s own version (blob equality:
+   * `git diff <target> <tip> -- <files>` is empty). Direct blob
+   * comparison runs no merge drivers — the PLUG-201 objection to the
+   * merge-tree sign does not apply. An empty change proves nothing
+   * («A + revert A» nets to the target) → false; a failed probe
+   * proves nothing → false.
+   */
+  const contentOn = async (
+    repoRoot: string,
+    base: string,
+    tip: string,
+    target: string,
+  ): Promise<boolean> => {
+    const files = await gitOut(deps.cmd, repoRoot, [
+      "diff",
+      "--name-only",
+      "-z",
+      base,
+      tip,
+    ]);
+    if (files === null) return false;
+    const paths = files.split("\0").filter(Boolean);
+    if (!paths.length) return false;
+    for (let i = 0; i < paths.length; i += 200) {
+      const d = await gitOut(deps.cmd, repoRoot, [
+        "diff",
+        "--name-only",
+        target,
+        tip,
+        "--",
+        ...paths.slice(i, i + 200),
+      ]);
+      if (d === null || d.trim() !== "") return false;
+    }
+    return true;
+  };
+
+  /**
+   * §16.3 (PLUG-250): the branch-level file-content sign — <tip>'s
+   * whole change against the merge-base sits on a target (a commit
+   * rebuilt on merge, a full-content squash).
+   */
+  const tipContentOn = async (
+    repoRoot: string,
+    tip: string,
+    targets: string[],
+  ): Promise<boolean> => {
+    for (const t of targets) {
+      const mb = (await gitOut(deps.cmd, repoRoot, ["merge-base", tip, t]))
+        ?.split("\n")[0]
+        ?.trim();
+      if (!mb) continue;
+      if (await contentOn(repoRoot, mb, tip, t)) return true;
+    }
+    return false;
+  };
+
+  /**
+   * §16.3 (PLUG-250): the per-commit file-content sign — the files
+   * <sha> itself changed (diff against its first parent, the empty
+   * tree for a root commit) all sit on a target at <sha>'s version.
+   * A rebuilt merge commit counts too — the check is content, not
+   * patch-id, so the «no patch-id for merges» rule does not apply.
+   */
+  const commitContentOn = async (
+    repoRoot: string,
+    sha: string,
+    targets: string[],
+  ): Promise<boolean> => {
+    const parent = (
+      await gitOut(deps.cmd, repoRoot, [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `${sha}^`,
+      ])
+    )?.trim();
+    const base = parent || EMPTY_TREE;
+    for (const t of targets) {
+      if (await contentOn(repoRoot, base, sha, t)) return true;
+    }
+    return false;
+  };
+
+  /**
    * §16.3 (ревизия 25) «ничего не теряется»: every commit the given
    * reflogs (`git log -g --format=%H <ref>`, whole history) ever
    * pointed at — plus the tips themselves — and every ancestor of
@@ -1048,16 +1142,22 @@ export function createJanitor(deps: JanitorDeps) {
     if (!pending.size) return "ok";
     // §16.3 (PLUG-201): ancestry already excluded the target's own
     // commits — a pending one is safe ONLY as a patch-equivalent
-    // (`git cherry` «-», the commit itself, `--no-walk`). The
-    // merge-tree content sign is not trusted here: merge drivers
-    // (`ours`, built-in `union`, names with `=`) fake it — three
-    // confirmed losses in a row.
+    // (`git cherry` «-», the commit itself, `--no-walk`) or, PLUG-250,
+    // when every file it changed sits on a target at its own version
+    // (a commit rebuilt on merge; direct blob diff — no merge
+    // drivers). The merge-tree content sign is not trusted here:
+    // merge drivers (`ours`, built-in `union`, names with `=`) fake
+    // it — three confirmed losses in a row.
     for (const sha of pending) {
       // §16.3: an empty commit (`--allow-empty`) has no content to find
       // on a target — safe only by ancestry (already excluded) or by
       // patch-id (PLUG-198).
       if (await commitContentless(repoRoot, sha)) return "lost";
       if (await patchEquivalent(repoRoot, sha, targets)) continue;
+      // §16.3 (PLUG-250): a commit rebuilt on merge keeps no patch-id
+      // match, but its content is on the target when every file it
+      // changed sits there at its own version.
+      if (await commitContentOn(repoRoot, sha, targets)) continue;
       return "lost";
     }
     return "ok";

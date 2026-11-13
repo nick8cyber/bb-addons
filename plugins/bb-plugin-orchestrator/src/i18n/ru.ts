@@ -56,6 +56,7 @@ export const RU: Record<string, string> = {
   "ev.hookObject": "хук — объект",
   "ev.nameString": "имя хука — строка",
   "ev.nameUnique": "имя хука должно быть уникальным",
+  "ev.nameControl": "имя хука не должно содержать управляющих символов",
   "ev.onArray": "on — непустой массив имён событий",
   "ev.runArray": "run — непустой массив argv (без shell)",
   "ev.projectsArray": "projects — массив id проектов",

@@ -3350,15 +3350,16 @@ test("a branch-unpushed orphan idle over abandonedAfter is reported (PLUG-195)",
   assert.throws(() => git(repo, ["rev-parse", "--verify", "bb/o"]));
 });
 
-test("U2: a squash of two or more commits stays — reported «похоже, влито squash» (PLUG-201)", async () => {
+test("U2: a squash of two or more commits is «влита» — every commit's content reached origin (PLUG-250)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
   commitIn(env.path, "w1.txt", "feat: part 1");
   commitIn(env.path, "w2.txt", "feat: part 2");
   // a single squash commit on main holds both changes — no commit of
-  // bb/a is patch-equivalent (`git cherry` says «+»), so the copy is
-  // never «влита»; merging it adds nothing, which earns the manual
-  // flag in the report — removal is off the table (PLUG-201)
+  // bb/a is patch-equivalent (`git cherry` says «+»), but every file
+  // the branch changed sits on main at the branch's version, and each
+  // own commit's changed files do too: nothing dies with the copy
+  // (PLUG-250 — before, this stayed «похоже, влито squash»)
   writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
   writeFileSync(join(repo, "w2.txt"), "feat: part 2\n");
   git(repo, ["add", "."]);
@@ -3371,14 +3372,31 @@ test("U2: a squash of two or more commits stays — reported «похоже, в�
   await w.jan.run();
   w.clock.t += 16 * 60_000;
   const res = await w.jan.run();
-  assert.equal(res.removedCopies, 0);
-  assert.deepEqual(w.archivedCalls, []);
-  assert.ok(existsSync(env.path));
-  const item = res.reported.find((r) => r.envId === env.id);
-  assert.ok(item);
-  assert.equal(item.reason, "squash-suspect");
-  assert.equal(w.janitor.item(env.id)!.state, "reported");
-  git(repo, ["rev-parse", "--verify", env.branchName]);
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
+});
+
+test("a commit rebuilt on merge (`git cherry` «+», identical code) is «влита» (PLUG-250)", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  // the merge on main rebuilt the commit — different sha and patch
+  // (a README hunk came along), `git cherry` stays «+», but every
+  // file the branch changed matches its version on main
+  writeFileSync(join(repo, "w.txt"), "feat: work\n");
+  writeFileSync(join(repo, "README.md"), "release notes\n");
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "feat: work (rebuilt)"]);
+  git(repo, ["push", "origin", "main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(w.janitor.item(env.id)!.state, "removed");
 });
 
 test("PROBE3: a commit + reset between the snapshot and the archive keeps the copy (PLUG-195)", async () => {
@@ -4536,13 +4554,11 @@ test("copy-less unmerged bb/ branches: daily message counts + first 10, full lis
 test("git < 2.40: no --attr-source → no squash flag, one journal line (PLUG-202)", async () => {
   const { repo, base } = makeRepo();
   const env = addEnv(repo, base, "a");
-  commitIn(env.path, "w1.txt", "feat: part 1");
-  commitIn(env.path, "w2.txt", "feat: part 2");
-  writeFileSync(join(repo, "w1.txt"), "feat: part 1\n");
-  writeFileSync(join(repo, "w2.txt"), "feat: part 2\n");
-  git(repo, ["add", "."]);
-  git(repo, ["commit", "-m", "feat: squashed both parts"]);
-  git(repo, ["push", "origin", "main"]);
+  commitIn(env.path, "a.txt", "feat: A");
+  // «A + revert A»: the tip merges as a no-op — the only shape still
+  // needing the merge-tree flag (PLUG-250: a real squash is «влита»
+  // by the file-content sign now, which needs no --attr-source)
+  git(env.path, ["revert", "--no-edit", "HEAD"]);
   const oldGit: CmdRunner = {
     run: async (f, a, o) =>
       f === "git" && a[0] === "--version"

@@ -1533,7 +1533,17 @@ export function createWatchdog(deps: WatchdogDeps) {
       const branch = await git(["symbolic-ref", "--short", "HEAD"])
         .then((s) => s.trim())
         .catch(() => null);
-      const dirty = (await git(["status", "--porcelain"])).trim().length > 0;
+      // PLUG-250: untracked `node_modules` (a directory or a symlink)
+      // is reproducible dependency state, not uncommitted work — every
+      // other status line still counts as dirty.
+      const dirty = (await git(["status", "--porcelain"]))
+        .split("\n")
+        .some((l) => {
+          const p = l.trim();
+          if (!p.startsWith("?? ")) return p.length > 0;
+          const f = p.slice(3).replace(/\/$/, "");
+          return f !== "node_modules" && !f.endsWith("/node_modules");
+        });
       // §17.2 (мелко 1): the round's own commits are counted from the
       // round's start — `continue_from` (заходы 2+) or the branch's
       // reflog «branch: Created from <sha>» entry (заход 1, §16.3) —

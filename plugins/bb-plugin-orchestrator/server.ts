@@ -269,7 +269,7 @@ export async function createPlugin(
     },
     gitInstructions: {
       type: "string",
-      label: "Git instructions",
+      label: "Working with git",
       description:
         '"Working with git" section (§2.2) prepended to every dispatch\'s --instructions. Empty disables the section.',
       experimental_multiline: true,
