@@ -8,9 +8,9 @@
 #
 # Usage: scripts/check-changed-plugins.sh [base-ref]   (default: origin/main)
 # Exit:  0 when every affected plugin passes, 1 on any failure.
-# On failure the tail of the output lists the failed `not ok` test names
-# per plugin — the release journal keeps only the tail, so the names
-# must live there.
+# On failure the tail of the output lists the failed test names per
+# plugin — TAP `not ok` lines and vitest `FAIL`/`×` lines; the release
+# journal keeps only the tail, so the names must live there.
 
 set -u -o pipefail
 
@@ -87,6 +87,11 @@ for dir in "${PLUGIN_DIRS[@]}"; do
   ok=1
 
   if ! deps_ok "$dir"; then
+    # a node_modules symlink points into a shared store — `npm ci`
+    # would delete every entry INSIDE the link target (the store of
+    # the main checkout or other worktrees). Unlink it first
+    # (rm -f, never -r); npm ci then creates a real directory.
+    if [ -L "$dir/node_modules" ]; then rm -f "$dir/node_modules"; fi
     echo "    npm ci"
     (cd "$dir" && nice -n 19 npm ci --silent) || ok=0
   fi
@@ -99,12 +104,13 @@ for dir in "${PLUGIN_DIRS[@]}"; do
     else
       ok=0
       cat "$test_log"
-      # TAP `not ok` lines — the failure summary below keeps the names
-      # inside the journal tail (nested subtests included, deduped).
+      # Failing test names — TAP `not ok` lines and vitest
+      # `FAIL`/`×`/`✗` lines — the summary below keeps them inside
+      # the journal tail (nested subtests included, deduped).
       while IFS= read -r line; do
         [ -n "$line" ] && failed_tests+=("$name: $line")
       done <<EOF2
-$(grep -E '^[[:space:]]*not ok ' "$test_log" | sed 's/^[[:space:]]*//' | sort -u)
+$(grep -E '^[[:space:]]*(not ok |FAIL[[:space:]]|[×✗✘][[:space:]])' "$test_log" | sed 's/^[[:space:]]*//' | sort -u)
 EOF2
     fi
     rm -f "$test_log"

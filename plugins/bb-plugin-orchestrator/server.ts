@@ -2161,7 +2161,9 @@ abandoned: ${res.reported
                                 `${i.branch ?? i.envId} (${i.reason}` +
                                 (i.reason === "squash-suspect"
                                   ? t("cli.squashSuspect")
-                                  : "") +
+                                  : i.reason === "content-on-target"
+                                    ? t("cli.contentOnTarget")
+                                    : "") +
                                 ")",
                             )
                             .join(", ")}`
@@ -2206,7 +2208,9 @@ abandoned: ${res.reported
                 out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"} (${i.reason}` +
                   (i.reason === "squash-suspect"
                     ? t("cli.squashSuspect")
-                    : "") +
+                    : i.reason === "content-on-target"
+                      ? t("cli.contentOnTarget")
+                      : "") +
                   ")\n";
               }
             }

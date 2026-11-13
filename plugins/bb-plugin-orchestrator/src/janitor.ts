@@ -15,12 +15,9 @@
  * candidates: `workers` (default) covers dispatch threads
  * (`originPluginId=tasks`) and threads with a parent; `all` also covers
  * root chats. A `bb/` branch is deleted only on a later run, once its
- * copy no longer exists. «Влита» is ancestry, `git cherry` with no
- * «+» (patch-id equivalence), or the file-content sign (PLUG-250):
- * every file the branch changed against the merge-base equals the
- * branch's version on the target — a commit rebuilt on merge
- * (`git cherry` «+», identical code) counts, as does a multi-commit
- * squash whose content all reached the target.
+ * copy no longer exists. «Влита» is ancestry or `git cherry` with no
+ * «+» (patch-id equivalence — a squash of several commits is not
+ * recognized; such copies only go to the report).
  * Own commits are the *reachable* commits of the copy's branch:
  * `rev-list --count <«Created from»>..<tip>` (PLUG-195: strictly from
  * the creation entry — no reflog-type parsing). «Ничего не
@@ -50,7 +47,12 @@
  * `-c core.attributesFile=/dev/null`, so no merge driver can run)
  * reproduces the target tree while its commits failed is reported
  * «похоже, влито squash — проверьте и удалите вручную»
- * (`squash-suspect`), never removed. A copy carrying submodules
+ * (`squash-suspect`), never removed. The file-content/`git cherry`
+ * sign joins it as a second report-only flag (PLUG-250): every file
+ * the tip changed against the merge-base equal to its version on a
+ * target — or a `git cherry` with no «+» at all — is reported
+ * «содержимое совпадает с целью — проверьте и удалите вручную»
+ * (`content-on-target`), never removed. A copy carrying submodules
  * (`.gitmodules`, `$GIT_DIR/modules` or a gitlink `160000` index
  * entry, PLUG-203) is never removed — their objects live inside the
  * copy's git dir and no origin check covers them. The same holds for
@@ -789,6 +791,7 @@ export function createJanitor(deps: JanitorDeps) {
     if (!(await attrSource())) return false;
     const mergedTree = (
       await gitOut(deps.cmd, repoRoot, [
+        "--literal-pathspecs",
         `--attr-source=${EMPTY_TREE}`,
         "-c",
         "core.attributesFile=/dev/null",
@@ -802,7 +805,11 @@ export function createJanitor(deps: JanitorDeps) {
       ?.trim();
     if (!mergedTree) return false;
     const targetTree = (
-      await gitOut(deps.cmd, repoRoot, ["rev-parse", `${target}^{tree}`])
+      await gitOut(deps.cmd, repoRoot, [
+        "--literal-pathspecs",
+        "rev-parse",
+        `${target}^{tree}`,
+      ])
     )?.trim();
     return !!targetTree && mergedTree === targetTree;
   };
@@ -823,6 +830,7 @@ export function createJanitor(deps: JanitorDeps) {
       for (const t of targets) {
         if (
           await gitOk(deps.cmd, repoRoot, [
+            "--literal-pathspecs",
             "merge-base",
             "--is-ancestor",
             sha,
@@ -839,13 +847,9 @@ export function createJanitor(deps: JanitorDeps) {
 
   /**
    * §16.3 «влита»: a sha is merged into a remote-tracking target when
-   * it is an ancestor, patch-equivalent to a commit on it (`git
-   * cherry` prints only «-» lines), or — PLUG-250 — carries no file
-   * the target does not already have at the branch's own version
-   * (`tipContentOn`: a commit rebuilt on merge stays «+» to cherry
-   * while its code is identical; a multi-commit squash whose content
-   * all landed counts too). A squash that rewrote content still fails
-   * — such copies are not merged and go to the report instead.
+   * it is an ancestor or patch-equivalent to a commit on it (`git
+   * cherry` prints only «-» lines). A multi-commit squash is neither —
+   * such copies are not merged and go to the report instead.
    */
   const shaMergedIn = async (
     repoRoot: string,
@@ -859,8 +863,7 @@ export function createJanitor(deps: JanitorDeps) {
         return true;
       }
     }
-    if (await patchEquivalent(repoRoot, sha, targets)) return true;
-    return tipContentOn(repoRoot, sha, targets);
+    return patchEquivalent(repoRoot, sha, targets);
   };
 
   /**
@@ -973,9 +976,14 @@ export function createJanitor(deps: JanitorDeps) {
    * changed exists on <target> at <tip>'s own version (blob equality:
    * `git diff <target> <tip> -- <files>` is empty). Direct blob
    * comparison runs no merge drivers — the PLUG-201 objection to the
-   * merge-tree sign does not apply. An empty change proves nothing
-   * («A + revert A» nets to the target) → false; a failed probe
-   * proves nothing → false.
+   * merge-tree sign does not apply. Still report-only: it flags a
+   * copy for a manual check, never a removal (§16.3 — ancestry and
+   * `patch-id --verbatim` decide). `--no-renames` in both diffs: a
+   * rename must surface as delete+add, or the old name's deletion
+   * escapes the check. `--literal-pathspecs`: the paths come from
+   * git output and a name like `:/x` would otherwise evaluate as
+   * pathspec magic. An empty change proves nothing («A + revert A»
+   * nets to the target) → false; a failed probe → false.
    */
   const contentOn = async (
     repoRoot: string,
@@ -984,8 +992,10 @@ export function createJanitor(deps: JanitorDeps) {
     target: string,
   ): Promise<boolean> => {
     const files = await gitOut(deps.cmd, repoRoot, [
+      "--literal-pathspecs",
       "diff",
       "--name-only",
+      "--no-renames",
       "-z",
       base,
       tip,
@@ -995,8 +1005,10 @@ export function createJanitor(deps: JanitorDeps) {
     if (!paths.length) return false;
     for (let i = 0; i < paths.length; i += 200) {
       const d = await gitOut(deps.cmd, repoRoot, [
+        "--literal-pathspecs",
         "diff",
         "--name-only",
+        "--no-renames",
         target,
         tip,
         "--",
@@ -1010,7 +1022,7 @@ export function createJanitor(deps: JanitorDeps) {
   /**
    * §16.3 (PLUG-250): the branch-level file-content sign — <tip>'s
    * whole change against the merge-base sits on a target (a commit
-   * rebuilt on merge, a full-content squash).
+   * rebuilt on merge, a full-content squash). Report flag only.
    */
   const tipContentOn = async (
     repoRoot: string,
@@ -1018,7 +1030,14 @@ export function createJanitor(deps: JanitorDeps) {
     targets: string[],
   ): Promise<boolean> => {
     for (const t of targets) {
-      const mb = (await gitOut(deps.cmd, repoRoot, ["merge-base", tip, t]))
+      const mb = (
+        await gitOut(deps.cmd, repoRoot, [
+          "--literal-pathspecs",
+          "merge-base",
+          tip,
+          t,
+        ])
+      )
         ?.split("\n")[0]
         ?.trim();
       if (!mb) continue;
@@ -1028,28 +1047,48 @@ export function createJanitor(deps: JanitorDeps) {
   };
 
   /**
-   * §16.3 (PLUG-250): the per-commit file-content sign — the files
-   * <sha> itself changed (diff against its first parent, the empty
-   * tree for a root commit) all sit on a target at <sha>'s version.
-   * A rebuilt merge commit counts too — the check is content, not
-   * patch-id, so the «no patch-id for merges» rule does not apply.
+   * §16.3 (PLUG-250): the report flag «содержимое совпадает с целью»
+   * — a tip whose content or patches already sit on a target while
+   * the copy is not «влита»: `git cherry` prints no «+» at all (a
+   * patch that differs only in whitespace — «-» to the stable id,
+   * still a miss to `--verbatim`), or every file the tip changed
+   * against the merge-base equals its version there (`tipContentOn`
+   * — a commit rebuilt on merge, a full-content squash). Like
+   * `contentSquashedOn` it only flags «check and remove manually»;
+   * removal stays with ancestry and `patch-id --verbatim` alone.
    */
-  const commitContentOn = async (
+  const contentOrPatchOn = async (
     repoRoot: string,
-    sha: string,
+    shas: string[],
     targets: string[],
   ): Promise<boolean> => {
-    const parent = (
-      await gitOut(deps.cmd, repoRoot, [
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        `${sha}^`,
-      ])
-    )?.trim();
-    const base = parent || EMPTY_TREE;
-    for (const t of targets) {
-      if (await contentOn(repoRoot, base, sha, t)) return true;
+    for (const sha of shas) {
+      for (const t of targets) {
+        if (
+          await gitOk(deps.cmd, repoRoot, [
+            "--literal-pathspecs",
+            "merge-base",
+            "--is-ancestor",
+            sha,
+            t,
+          ])
+        ) {
+          continue;
+        }
+        const cherry = await gitOut(deps.cmd, repoRoot, [
+          "--literal-pathspecs",
+          "cherry",
+          t,
+          sha,
+        ]);
+        if (
+          cherry !== null &&
+          !cherry.split("\n").some((l) => l.startsWith("+"))
+        ) {
+          return true;
+        }
+      }
+      if (await tipContentOn(repoRoot, sha, targets)) return true;
     }
     return false;
   };
@@ -1142,22 +1181,17 @@ export function createJanitor(deps: JanitorDeps) {
     if (!pending.size) return "ok";
     // §16.3 (PLUG-201): ancestry already excluded the target's own
     // commits — a pending one is safe ONLY as a patch-equivalent
-    // (`git cherry` «-», the commit itself, `--no-walk`) or, PLUG-250,
-    // when every file it changed sits on a target at its own version
-    // (a commit rebuilt on merge; direct blob diff — no merge
-    // drivers). The merge-tree content sign is not trusted here:
-    // merge drivers (`ours`, built-in `union`, names with `=`) fake
-    // it — three confirmed losses in a row.
+    // (`git cherry` «-», the commit itself, `--no-walk`). The
+    // merge-tree and file-content signs are not trusted here: merge
+    // drivers (`ours`, built-in `union`, names with `=`) fake the
+    // first — three confirmed losses in a row — and a squash that
+    // rewrote an earlier commit's lines slips past the second.
     for (const sha of pending) {
       // §16.3: an empty commit (`--allow-empty`) has no content to find
       // on a target — safe only by ancestry (already excluded) or by
       // patch-id (PLUG-198).
       if (await commitContentless(repoRoot, sha)) return "lost";
       if (await patchEquivalent(repoRoot, sha, targets)) continue;
-      // §16.3 (PLUG-250): a commit rebuilt on merge keeps no patch-id
-      // match, but its content is on the target when every file it
-      // changed sits there at its own version.
-      if (await commitContentOn(repoRoot, sha, targets)) continue;
       return "lost";
     }
     return "ok";
@@ -2058,11 +2092,15 @@ export function createJanitor(deps: JanitorDeps) {
         // is «похоже, влито squash» — the multi-commit squash `git
         // cherry` cannot see. The content sign never decides removal;
         // it only flags the copy for a manual check in the report.
-        if (
-          (reason === "not-merged" || reason === "abandoned-unmerged") &&
-          (await contentSquashedOn(repo.root, shas, targets))
-        ) {
-          return bad("squash-suspect", true);
+        if (reason === "not-merged" || reason === "abandoned-unmerged") {
+          // §16.3 (PLUG-250): content or patches already on a target —
+          // «содержимое совпадает с целью»: report flag only.
+          if (await contentOrPatchOn(repo.root, shas, targets)) {
+            return bad("content-on-target", true);
+          }
+          if (await contentSquashedOn(repo.root, shas, targets)) {
+            return bad("squash-suspect", true);
+          }
         }
         return bad(reason, reason.startsWith("abandoned"));
       }
@@ -2160,6 +2198,10 @@ export function createJanitor(deps: JanitorDeps) {
       if (lost === "lost") {
         // §16.3 (PLUG-201): commits failed but the branch still merges
         // as a no-op — «похоже, влито squash»: report flag only.
+        // PLUG-250: the same for content/patches already on a target.
+        if (await contentOrPatchOn(repo.root, shas, targets)) {
+          return after("content-on-target", true);
+        }
         if (await contentSquashedOn(repo.root, shas, targets)) {
           return after("squash-suspect", true);
         }
@@ -3232,8 +3274,13 @@ export function createJanitor(deps: JanitorDeps) {
           .map(
             (i) =>
               (i.branch ?? i.path ?? i.envId) +
-              // §16.3: «похоже, влито squash» — the manual-check flag.
-              (i.reason === "squash-suspect" ? " (squash?)" : ""),
+              // §16.3: the manual-check flags — «похоже, влито
+              // squash» / «содержимое совпадает с целью».
+              (i.reason === "squash-suspect"
+                ? " (squash?)"
+                : i.reason === "content-on-target"
+                  ? " (content?)"
+                  : ""),
           )
           .join(", ");
         parts.push(

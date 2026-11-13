@@ -833,6 +833,7 @@ export const EN: Record<string, string> = {
   "cli.conflictClean": "conflict, the copy is clean — resolution is up to the coordinator",
   "cli.gitTooOld": "git ≥ 2.39 required — upgrade git on this machine",
   "cli.squashSuspect": " — looks squash-merged; check and remove manually",
+  "cli.contentOnTarget": " — content matches the target; check and remove manually",
   "cli.notDelivered": " — never reached the coordinator",
   "cli.unknownJanitorSub": "unknown janitor subcommand \"{sub}\" (run|report)",
   "cli.unknownSub": "unknown subcommand \"{cmd}\"",

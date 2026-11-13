@@ -837,6 +837,7 @@ export const RU: Record<string, string> = {
   "cli.conflictClean": "конфликт, копия чистая — разбор за координатором",
   "cli.gitTooOld": "git ≥ 2.39 required — обновите git на этой машине",
   "cli.squashSuspect": " — похоже, влито squash; проверьте и удалите вручную",
+  "cli.contentOnTarget": " — содержимое совпадает с целью; проверьте и удалите вручную",
   "cli.notDelivered": " — координатору не дошло",
   "cli.unknownJanitorSub": "unknown janitor subcommand \"{sub}\" (run|report)",
   "cli.unknownSub": "unknown subcommand \"{cmd}\"",
