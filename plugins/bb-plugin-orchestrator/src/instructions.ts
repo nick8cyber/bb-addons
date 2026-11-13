@@ -5,17 +5,14 @@
  * `bb orchestrator instructions` and injected into coordinator threads.
  */
 import { levelRole, type Policy } from "./policy.js";
+import { EN } from "./i18n/en.js";
+import { RU } from "./i18n/ru.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 export const ROUTING_RULE_MAX = 1500;
 
-const HEADER =
-  "Раздача работы исполнителям — только через `bb orchestrator delegate <KEY> --level <уровень>` " +
-  "(инструмент orchestrator_delegate). `--route` — любой маршрут политики, `--preset` — разовый пресет вне неё. " +
-  "Полный порядок — навык `orchestrator-coordinator`. " +
-  "Отчёт исполнителя придёт сообщением — не жди его в форграунде.";
-
-const FOOTER =
-  "Не раздавай исполнителям вручную (`bb tasks dispatch`, `bb thread spawn`) — только delegate.";
+const HEADER = (t: T) => t("instr.ruleHeader");
+const FOOTER = (t: T) => t("instr.ruleFooter");
 
 /**
  * Policy descriptions are user text: the rule must never leak thread ids or
@@ -40,6 +37,7 @@ function levelLine(
   name: string,
   description: string | undefined,
   policy: Policy,
+  t: T,
 ): string {
   const cleanName = sanitize(name) || "level";
   const desc = description ? sanitize(description) : "";
@@ -48,47 +46,47 @@ function levelLine(
   // check instead of doing.
   const tag =
     cleanName === "release-audit"
-      ? " (только конвейер release, не раздавать)"
+      ? t("instr.tagReleasePipeline")
       : levelRole(policy, name) === "auditor"
-        ? " (проверка — только чтение)"
+        ? t("instr.tagAuditor")
         : "";
   return `- ${cleanName}${desc ? ` — ${desc}` : ""}${tag}`;
 }
 
 /** §2.3: one line naming the reviewByLevel map, when configured. */
-function reviewByLevelLine(policy: Policy): string | null {
+function reviewByLevelLine(policy: Policy, t: T): string | null {
   const map = policy.reviewByLevel;
   if (!map || Object.keys(map).length === 0) return null;
   const pairs = Object.entries(map).map(
     ([exec, review]) => `${exec} → ${review}`,
   );
-  return (
-    `Ревью по сложности исполнения: ${pairs.join("; ")} ` +
-    "— `delegate --level review` выберет уровень сам."
-  );
+  return t("instr.reviewByLevel", { pairs: pairs.join("; ") });
 }
 
-function limitsLine(policy: Policy): string | null {
+function limitsLine(policy: Policy, t: T): string | null {
   const limits = policy.limits;
   if (!limits) return null;
   const parts: string[] = [];
   if (limits.maxActive !== undefined) {
-    parts.push(`одновременно активных ≤ ${limits.maxActive}`);
+    parts.push(t("instr.limitActive", { n: limits.maxActive }));
   }
   for (const [level, cap] of Object.entries(limits.perLevel ?? {})) {
     parts.push(`${level} ≤ ${cap}`);
   }
-  return parts.length ? `Лимиты: ${parts.join("; ")}.` : null;
+  return parts.length ? t("instr.limits", { parts: parts.join("; ") }) : null;
 }
 
-export function generateRoutingRule(policy: Policy): string {
-  const limits = limitsLine(policy);
-  const reviewLine = reviewByLevelLine(policy);
+export function generateRoutingRule(
+  policy: Policy,
+  t: T = T_RU,
+): string {
+  const limits = limitsLine(policy, t);
+  const reviewLine = reviewByLevelLine(policy, t);
   const build = (line: (name: string, desc?: string) => string) =>
     [
-      HEADER,
+      HEADER(t),
       "",
-      "Уровни:",
+      t("instr.levelsHeader"),
       ...Object.entries(policy.levels).map(([name, l]) =>
         line(name, l.description),
       ),
@@ -98,7 +96,7 @@ export function generateRoutingRule(policy: Policy): string {
       FOOTER,
     ].join("\n");
 
-  let text = build((name, desc) => levelLine(name, desc, policy));
+  let text = build((name, desc) => levelLine(name, desc, policy, t));
   if (text.length <= ROUTING_RULE_MAX) return text;
   // Long descriptions: keep the shape, shrink each description.
   const budgetPerLevel = Math.max(
@@ -113,16 +111,17 @@ export function generateRoutingRule(policy: Policy): string {
         ? `${desc.slice(0, budgetPerLevel - 1)}…`
         : desc,
       policy,
+      t,
     ),
   );
   if (text.length <= ROUTING_RULE_MAX) return text;
   return text.slice(0, ROUTING_RULE_MAX - 1) + "…";
 }
 
-/** Shown instead of a rule while the policy is missing or invalid. */
-export const SETUP_HINT_TEXT =
-  "Плагин orchestrator: политика не настроена или невалидна — delegate отклонит вызовы. " +
-  "Настройка — навык `orchestrator-setup`, затем `bb orchestrator policy validate`.";
+/** Shown instead of a rule while the policy is missing or invalid.
+ * Compat export — the `ru` catalog value; callers that honor `language`
+ * use `t("instr.setupHint")`. */
+export const SETUP_HINT_TEXT = RU["instr.setupHint"]!;
 
 /**
  * §2.2 — the `gitInstructions` setting: repository git rules for executors,
@@ -130,23 +129,49 @@ export const SETUP_HINT_TEXT =
  */
 export const GIT_INSTRUCTIONS_MAX = 1500;
 
-export const DEFAULT_GIT_INSTRUCTIONS = `Работа с git:
-- Первым шагом: git fetch origin и перенос базовой ветки (git merge --ff-only origin/<база>); не вышло — вопрос координатору.
-- Работай только в своей рабочей копии и своей ветке; не переключай чужие ветки и не трогай основной чекаут.
-- Коммить под автором из конфига репозитория: без --author и git -c user.*; автор не задан — не коммить, напиши в отчёте.
-- Без push и PR: локальный коммит, в отчёте ветка и SHA.
-- Не запускай git reset --hard, git clean, git checkout -- и другие команды, теряющие чужую работу.
-- Обход гейтов запрещён: никаких --no-verify, -c core.hooksPath=…, --author и записи core.hooksPath через git config (в любой области).`;
+/** Compat export — the `ru` catalog value; callers that honor
+ * `language` use `t("instr.gitDefault")`. */
+export const DEFAULT_GIT_INSTRUCTIONS = RU["instr.gitDefault"]!;
+
+/**
+ * §18.1: a `gitInstructions` value matching the built-in text of ANY
+ * language counts as "the default" — the dispatcher emits the current
+ * language's built-in text instead of the stored one. An empty string
+ * still suppresses the section (§2.2); an owner-edited value goes out
+ * verbatim.
+ */
+export function isBuiltinGitInstructions(text: string): boolean {
+  return (
+    text === RU["instr.gitDefault"] || text === EN["instr.gitDefault"]
+  );
+}
+
+/** §18.1: the effective §2.2 text — `undefined` (unset) and a
+ * built-in-language value both render the CURRENT language's memo;
+ * `""` suppresses the section; a custom value passes through. */
+export function effectiveGitInstructions(
+  text: string | undefined,
+  t: T,
+): string | undefined {
+  if (text === undefined) return undefined;
+  if (text.trim() === "") return text;
+  return isBuiltinGitInstructions(text)
+    ? t("instr.gitDefault")
+    : text;
+}
 
 /**
  * Validation error for `gitInstructions`, or null when the value is usable.
  * The setting schema refuses over-limit writes; this catches values that
  * reached storage before the schema or through another path.
  */
-export function gitInstructionsError(text: string | undefined): string | null {
+export function gitInstructionsError(
+  text: string | undefined,
+  t: T = T_RU,
+): string | null {
   if (text === undefined) return null;
   return text.length > GIT_INSTRUCTIONS_MAX
-    ? `gitInstructions длиннее ${GIT_INSTRUCTIONS_MAX} символов (${text.length})`
+    ? t("instr.gitTooLong", { max: GIT_INSTRUCTIONS_MAX, len: text.length })
     : null;
 }
 
@@ -159,6 +184,7 @@ export function roundSection(
   round: number,
   continueFrom: string,
   branch: string | null | undefined,
+  t: T = T_RU,
 ): string {
   const prev = branch ?? continueFrom;
   // §16.6: merges carry an explicit `-m`; the message never embeds a
@@ -166,14 +192,12 @@ export function roundSection(
   const mergeMsg = /^[0-9a-f]{7,40}$/i.test(continueFrom)
     ? `merge ${continueFrom.slice(0, 7)}`
     : "merge";
-  return (
-    `Заход ${round}: продолжение работы с коммита ${continueFrom}` +
-    ` (ветка ${prev} прошлого захода).\n` +
-    `- Первым шагом: git merge --ff-only ${continueFrom}; не fast-forward —` +
-    ` git merge -m "${mergeMsg}" ${continueFrom}; конфликт — вопрос координатору.\n` +
-    `- Ветку прошлого захода не открывай и в её рабочую копию не заходи:` +
-    ` работай только в своей ветке.`
-  );
+  return t("instr.round", {
+    round,
+    continueFrom,
+    prev,
+    mergeMsg,
+  });
 }
 
 /**
@@ -186,23 +210,23 @@ export function reviewRoundLine(
   continueFrom: string,
   branch: string | null | undefined,
   round: number | null | undefined,
+  t: T = T_RU,
 ): string {
   const parts = [
-    ...(branch ? [`ветка ${branch}`] : []),
-    ...(round != null ? [`заход ${round}`] : []),
+    ...(branch ? [t("instr.reviewBranch", { branch })] : []),
+    ...(round != null ? [t("instr.reviewRoundN", { round })] : []),
   ];
-  return (
-    `Проверяемый итог: коммит ${continueFrom}` +
-    (parts.length ? ` (${parts.join(", ")})` : "")
-  );
+  return t("instr.reviewRound", {
+    from: continueFrom,
+    tail: parts.length ? ` (${parts.join(", ")})` : "",
+  });
 }
 
 /**
  * §4.1 r28: the `--no-code` dispatch's own line — the executor must not
  * touch the copy, the report IS the result.
  */
-export const NO_CODE_LINE =
-  "задача без кода: файлы репозитория не менять, не коммитить; итог — отчёт";
+export const NO_CODE_LINE = RU["instr.noCode"]!;
 
 /**
  * §2.2: the git-rules text becomes the first section of `--instructions`,
@@ -223,6 +247,7 @@ export function mergeDispatchInstructions(
   extra: string | undefined,
   round?: string | undefined,
   noCode?: boolean,
+  t: T = T_RU,
 ): string | undefined {
   const git =
     gitInstructionsError(gitInstructions) === null
@@ -233,7 +258,7 @@ export function mergeDispatchInstructions(
   const parts = [
     ...(git && !noCode ? [git] : []),
     ...(r ? [r] : []),
-    ...(noCode ? [NO_CODE_LINE] : []),
+    ...(noCode ? [t("instr.noCode")] : []),
     ...(x ? [x] : []),
   ];
   return parts.length ? parts.join("\n\n") : undefined;

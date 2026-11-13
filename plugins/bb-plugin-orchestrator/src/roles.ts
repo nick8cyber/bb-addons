@@ -16,6 +16,7 @@ import type {
   MessageDispatchHookDecision,
 } from "@get-bb/plugin-sdk";
 import { levelRole, type Policy, type PolicyIssue } from "./policy.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 /** §3 budget: one role instruction ≤ 2500 chars (role + rule ≤ 4096). */
 export const ROLE_INSTRUCTIONS_MAX = 2500;
@@ -32,13 +33,19 @@ export const HANDOFF_PATH_MAX = 256;
  * usable (empty falls back to DEFAULT_HANDOFF_PATH). The setting schema
  * refuses bad writes; this catches values that bypassed it.
  */
-export function handoffPathError(text: string | undefined): string | null {
+export function handoffPathError(
+  text: string | undefined,
+  t: T = T_RU,
+): string | null {
   if (text === undefined) return null;
-  const t = text.trim();
-  if (!t) return null;
-  if (/[\r\n]/.test(t)) return "handoffPath должен быть одной строкой";
-  return t.length > HANDOFF_PATH_MAX
-    ? `handoffPath длиннее ${HANDOFF_PATH_MAX} символов (${t.length})`
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (/[\r\n]/.test(trimmed)) return t("role.handoffOneLine");
+  return trimmed.length > HANDOFF_PATH_MAX
+    ? t("role.handoffTooLong", {
+        max: HANDOFF_PATH_MAX,
+        len: trimmed.length,
+      })
     : null;
 }
 
@@ -225,8 +232,11 @@ export function parseRoleTexts(
      * the defaults. */
     handoffPath?: string | undefined;
     reviewLevel?: string | undefined;
+    /** §18.1: parse errors — the language catalog. */
+    t?: T;
   },
 ): RoleTextsLoad {
+  const t = opts?.t ?? T_RU;
   const errors: PolicyIssue[] = [];
   const texts: RoleTextsLoad["texts"] = {};
   const done = (): RoleTextsLoad => ({ texts: {}, errors });
@@ -237,12 +247,12 @@ export function parseRoleTexts(
   } catch (e) {
     errors.push({
       path: "$",
-      message: `невалидный JSON: ${(e as Error).message}`,
+      message: t("role.badJson", { error: (e as Error).message }),
     });
     return done();
   }
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    errors.push({ path: "$", message: "roleTexts должен быть JSON-объектом" });
+    errors.push({ path: "$", message: t("role.notObject") });
     return done();
   }
   for (const [key, value] of Object.entries(raw)) {
@@ -252,14 +262,12 @@ export function parseRoleTexts(
     ) {
       errors.push({
         path,
-        message:
-          "ключи — только orchestrator|executor|auditor " +
-          "(release-auditor не переопределяется)",
+        message: t("role.badKeys"),
       });
       continue;
     }
     if (typeof value !== "string") {
-      errors.push({ path, message: "must be a string" });
+      errors.push({ path, message: t("role.mustBeString") });
       continue;
     }
     const extra = value.trim();
@@ -273,7 +281,7 @@ export function parseRoleTexts(
     ) {
       errors.push({
         path,
-        message: `итог длиннее ${ROLE_INSTRUCTIONS_MAX} символов`,
+        message: t("role.tooLong", { max: ROLE_INSTRUCTIONS_MAX }),
       });
       continue;
     }
@@ -284,9 +292,14 @@ export function parseRoleTexts(
 
 /** The needs-configuration line for a broken `roleTexts` document —
  * like `gitInstructionsError` the value is ignored until fixed. */
-export function roleTextsError(load: RoleTextsLoad): string | null {
+export function roleTextsError(
+  load: RoleTextsLoad,
+  t: T = T_RU,
+): string | null {
   const first = load.errors[0];
-  return first ? `roleTexts: ${first.path}: ${first.message}` : null;
+  return first
+    ? t("role.textsError", { path: first.path, message: first.message })
+    : null;
 }
 
 export const ROLES: Record<RoleId, RoleDefinition> = {

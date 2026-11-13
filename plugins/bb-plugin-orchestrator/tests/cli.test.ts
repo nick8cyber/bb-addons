@@ -87,8 +87,13 @@ async function hostWith(
 ) {
   const host = createFakePluginHost({
     pluginId: "orchestrator",
-    settings: { policy: POLICY_TEXT, ...settings },
-    agentSkillIds: ["orchestrator-setup", "orchestrator-coordinator"],
+    settings: { policy: POLICY_TEXT, language: "ru", ...settings },
+    agentSkillIds: [
+        "orchestrator-setup",
+        "orchestrator-coordinator",
+        "orchestrator-setup-ru",
+        "orchestrator-coordinator-ru",
+      ],
     sdk,
   });
   await createPlugin(host.bb, { bbCli: cli, ...(now ? { now } : {}) });

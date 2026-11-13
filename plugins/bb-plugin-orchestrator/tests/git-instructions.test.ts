@@ -242,7 +242,12 @@ test("over-limit gitInstructions: schema refuses the write, a stored one flags n
       // write schema, the §2.2 status check catches them instead
       gitInstructions: "x".repeat(GIT_INSTRUCTIONS_MAX + 1),
     },
-    agentSkillIds: ["orchestrator-setup", "orchestrator-coordinator"],
+    agentSkillIds: [
+        "orchestrator-setup",
+        "orchestrator-coordinator",
+        "orchestrator-setup-ru",
+        "orchestrator-coordinator-ru",
+      ],
   });
   await createPlugin(host.bb, {
     bbCli: { run: async () => ok() },
@@ -333,8 +338,13 @@ async function hostWith(
   const spawnCalls: { prompt?: string }[] = [];
   const host = createFakePluginHost({
     pluginId: "orchestrator",
-    settings: { policy: POLICY_TEXT, ...settings },
-    agentSkillIds: ["orchestrator-setup", "orchestrator-coordinator"],
+    settings: { policy: POLICY_TEXT, language: "ru", ...settings },
+    agentSkillIds: [
+        "orchestrator-setup",
+        "orchestrator-coordinator",
+        "orchestrator-setup-ru",
+        "orchestrator-coordinator-ru",
+      ],
     sdk: {
       threads: {
         get: async () => COORDINATOR_THREAD,

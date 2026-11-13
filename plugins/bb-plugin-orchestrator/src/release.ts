@@ -76,6 +76,7 @@ import type {
   ReleaseRow,
 } from "./store.js";
 import { runChecked, runJson, type BbCli, type BbCliResult } from "./bb-cli.js";
+import { T_RU, type T } from "./i18n/index.js";
 import type { CmdRunner } from "./cmd.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
 import { dispatchToRoute, type DispatchStepsDeps } from "./delegate.js";
@@ -198,6 +199,9 @@ export interface ReleaseDeps {
   killGraceMs?: number;
   /** §18.2: срок хранения записей журнала, дни (default 30). */
   commandRetentionDays?: () => number;
+  /** §18.1 (PLUG-247a): catalog lookup — default the historical (ru)
+   * texts. */
+  t?: T;
   /** PLUG-245 Б2: токен владельца замка копии postPublish — экземпляр
    * плагина, не pid: после перезагрузки плагина в том же процессе старый
    * замок чужой и ломается без restoreCopy. */
@@ -256,15 +260,19 @@ async function git(
   args: string[],
   opts: { allowFail?: boolean; timeoutMs?: number } = {},
 ): Promise<string> {
+  const t = deps.t ?? T_RU;
   const res = await deps.cmd.run("git", ["-C", repo, ...args], {
     timeoutMs: opts.timeoutMs ?? 120_000,
   });
   if (res.exitCode !== 0 && !opts.allowFail) {
     throw new OrchestratorError(
       "git-failed",
-      `git ${args.join(" ")} failed (exit ${res.exitCode}): ${
-        res.stderr.trim() || res.stdout.trim() || "no output"
-      }`,
+      t("rel.gitFailed", {
+        cmd: args.join(" "),
+        code: res.exitCode,
+        out:
+          res.stderr.trim() || res.stdout.trim() || t("rel.noOutput"),
+      }),
     );
   }
   return res.stdout.trim();
@@ -380,17 +388,20 @@ export function normalizeGitRemoteUrl(raw: string): string | null {
  * remote url never reaches messages (it may carry a token).
  */
 export async function settingsProjectId(
-  deps: Pick<ReleaseDeps, "cmd" | "bbCli" | "localHostId">,
+  deps: Pick<ReleaseDeps, "cmd" | "bbCli" | "localHostId" | "t">,
   repo: string,
   delegationProjectId: string,
   config: ReleaseConfig | null,
 ): Promise<string> {
+  const t = deps.t ?? T_RU;
   const unknown = (why: string) =>
     new OrchestratorError(
       "release-settings-unknown",
-      `проект настройки не определён (${why}); ` +
-        `проект делегирования ${delegationProjectId}`,
-      "привяжите bb-проект к репозиторию копии (§6) и повторите",
+      t("rel.settingsUnknown", {
+        why,
+        delegation: delegationProjectId,
+      }),
+      t("rel.settingsUnknownHint"),
     );
 
   const wt = await deps.cmd.run(
@@ -399,7 +410,7 @@ export async function settingsProjectId(
     { timeoutMs: 30_000 },
   );
   if (wt.exitCode !== 0) {
-    throw unknown(`git worktree list завершился с кодом ${wt.exitCode}`);
+    throw unknown(t("rel.worktreeListFailed", { code: wt.exitCode }));
   }
   // §6 п.1: a bare first record is no match — the main dir is unset.
   const mainDir = mainWorktreeDir(wt.stdout);
@@ -408,7 +419,7 @@ export async function settingsProjectId(
     timeoutMs: 15_000,
   });
   if (listRes.exitCode !== 0) {
-    throw unknown(`bb project list завершился с кодом ${listRes.exitCode}`);
+    throw unknown(t("rel.projectListFailed", { code: listRes.exitCode }));
   }
   let projects: BbProjectListItem[];
   try {
@@ -416,7 +427,7 @@ export async function settingsProjectId(
     if (!Array.isArray(parsed)) throw new Error("not an array");
     projects = parsed as BbProjectListItem[];
   } catch {
-    throw unknown("bb project list вернул JSON неожиданной формы");
+    throw unknown(t("rel.projectListJson"));
   }
 
   const localHost = deps.localHostId
@@ -440,7 +451,7 @@ export async function settingsProjectId(
     try {
       root = await realpath(mainDir);
     } catch {
-      throw unknown("realpath основного каталога копии не удался");
+      throw unknown(t("rel.realpathFailed"));
     }
     for (const p of projects) {
       if (!p.id) continue;
@@ -464,7 +475,7 @@ export async function settingsProjectId(
       { timeoutMs: 30_000 },
     );
     if (remote.exitCode !== 0) {
-      throw unknown(`git remote get-url завершился с кодом ${remote.exitCode}`);
+      throw unknown(t("rel.remoteUrlFailed", { code: remote.exitCode }));
     }
     const want = normalizeGitRemoteUrl(remote.stdout);
     if (want) {
@@ -489,13 +500,14 @@ export async function settingsProjectId(
     if (candidates.has(delegationProjectId)) return delegationProjectId;
     throw new OrchestratorError(
       "release-settings-ambiguous",
-      `репозиторий копии совпадает с несколькими bb-проектами ` +
-        `(${[...candidates].sort().join(", ")}), проект делегирования ` +
-        `${delegationProjectId} не среди них`,
-      "оставьте один bb-проект на этот репозиторий (§6) и повторите",
+      t("rel.settingsAmbiguous", {
+        list: [...candidates].sort().join(", "),
+        delegation: delegationProjectId,
+      }),
+      t("rel.settingsAmbiguousHint"),
     );
   }
-  throw unknown("ни один bb-проект не совпал с репозиторием копии");
+  throw unknown(t("rel.settingsNoMatch"));
 }
 
 // ── Step 1: приёмка ────────────────────────────────────────────────────
@@ -625,6 +637,7 @@ async function acceptTask(
   title: string;
   executor: DelegationRow;
 }> {
+  const t = deps.t ?? T_RU;
   const { key, show } = await resolveTask(deps, input.taskKey);
   const missing: string[] = [];
 
@@ -637,7 +650,7 @@ async function acceptTask(
   const executor = deps.store
     .delegationsByTask(key)
     .find((d) => roleOf(d.level) === "executor" && d.status === "done");
-  if (!executor) missing.push("нет делегирования в статусе done");
+  if (!executor) missing.push(t("rel.missingNoDone"));
   // §4.1 r28.1: a «задача без кода» round that produced no commits has
   // nothing to publish — a hard refusal before the sha/review gate.
   if (
@@ -647,7 +660,7 @@ async function acceptTask(
   ) {
     throw new OrchestratorError(
       "release-refused",
-      `release ${key}: задача без кода: вливать нечего`,
+      t("rel.noCode", { key }),
     );
   }
 
@@ -663,9 +676,7 @@ async function acceptTask(
       : executor.result_sha
     : null;
   if (executor && !requiredSha) {
-    missing.push(
-      "итог делегирования без зафиксированного sha — ревью не привязать",
-    );
+    missing.push(t("rel.missingNoSha"));
   } else if (executor && executor.merge_status !== "merged") {
     const review = deps.store
       .delegationsByTask(key)
@@ -675,33 +686,33 @@ async function acceptTask(
       );
     if (!review) {
       missing.push(
-        `нет ревью аудиторского уровня на публикуемый итог ` +
-          `${requiredSha!.slice(0, 7)}`,
+        t("rel.missingNoReview", { sha7: requiredSha!.slice(0, 7) }),
       );
     } else if (review.status !== "done") {
       missing.push(
-        `ревью на ${requiredSha!.slice(0, 7)} (уровень ${review.level}) ` +
-          `в статусе ${review.status}`,
+        t("rel.missingReviewStatus", {
+          sha7: requiredSha!.slice(0, 7),
+          level: review.level,
+          status: review.status,
+        }),
       );
     } else {
       const v = await reviewVerdict(deps, show, review);
       if (v === "missing") {
-        missing.push("вердикт ревью не найден ни в комментариях, ни в итоге треда");
+        missing.push(t("rel.verdictMissing"));
       } else if (v === "not-ok") {
-        missing.push("последнее ревью — вердикт не «OK» (§16.7 JSON)");
+        missing.push(t("rel.verdictNotOk"));
       }
     }
   }
 
   if (executor && executor.coordinator_thread_id !== input.caller.threadId) {
-    missing.push(
-      "вызывающий тред — не координатор этого делегирования",
-    );
+    missing.push(t("rel.missingNotCoordinator"));
   }
   if (missing.length) {
     throw new OrchestratorError(
       "release-refused",
-      `release ${key}: приёмка не пройдена — ${missing.join("; ")}`,
+      t("rel.acceptFailed", { key, missing: missing.join("; ") }),
     );
   }
   return {
@@ -742,12 +753,13 @@ async function syncBranch(
    * `expectedSha..HEAD` range: a foreign commit in it stays foreign. */
   pipelineShas: string[];
 }> {
+  const t = deps.t ?? T_RU;
   const dirty = await git(deps, repo, ["status", "--porcelain"]);
   if (dirty) {
     throw new OrchestratorError(
       "release-refused",
-      "в рабочей копии есть незакоммиченные изменения — release отклонён",
-      "закоммить или убрать изменения и повторить",
+      t("rel.dirty"),
+      t("rel.dirtyHint"),
     );
   }
   await git(deps, repo, ["fetch", "origin"], { timeoutMs: 180_000 });
@@ -767,12 +779,20 @@ async function syncBranch(
       .filter(Boolean);
     throw new OrchestratorError(
       "unreviewed-commits",
-      `release ${ctx.taskKey}: во время sync на ветку ${branch} легли ` +
-        `коммиты сверх проверенной вершины ${ctx.expectedSha.slice(0, 7)}` +
-        (extra.length
-          ? `: ${extra.map((x) => x.slice(0, 7)).join(", ")}`
-          : ` (вершина ${fetchedHead.slice(0, 7)})`),
-      "ревью покрывает вершину на момент гейта — повторите release, когда исполнитель остановлен",
+      extra.length
+        ? t("rel.syncCommitsExtra", {
+            taskKey: ctx.taskKey,
+            branch,
+            sha7: ctx.expectedSha.slice(0, 7),
+            list: extra.map((x) => x.slice(0, 7)).join(", "),
+          })
+        : t("rel.syncCommitsHead", {
+            taskKey: ctx.taskKey,
+            branch,
+            sha7: ctx.expectedSha.slice(0, 7),
+            head: fetchedHead.slice(0, 7),
+          }),
+      t("rel.syncCommitsHint"),
     );
   }
   const target = `origin/${project.target.branch}`;
@@ -793,8 +813,8 @@ async function syncBranch(
       if (remote.trim()) {
         throw new OrchestratorError(
           "release-refused",
-          `ветка ${branch} уже запушена — sync=rebase запрещён`,
-          'переведите проект на sync="merge" или заведите новую ветку',
+          t("rel.branchPushed", { branch }),
+          t("rel.branchPushedHint"),
         );
       }
       // §17.3 (ревью PLUG-216 Б1): before the rebase, the patch-ids of
@@ -827,7 +847,7 @@ async function syncBranch(
         await git(deps, repo, ["rebase", "--abort"], { allowFail: true });
         throw new OrchestratorError(
           "release-refused",
-          `rebase на ${target}: конфликт — сведи вручную`,
+          t("rel.rebaseConflict", { target }),
         );
       }
       const preShaSet = new Set(preShas);
@@ -857,10 +877,12 @@ async function syncBranch(
       if (foreign.length) {
         throw new OrchestratorError(
           "unreviewed-commits",
-          `release ${ctx.taskKey}: после rebase на ветке ${branch} ` +
-            `коммиты вне проверенного диапазона: ` +
-            foreign.map((x) => x.slice(0, 7)).join(", "),
-          "повторите release, когда исполнитель остановлен",
+          t("rel.rebaseForeign", {
+            taskKey: ctx.taskKey,
+            branch,
+            list: foreign.map((x) => x.slice(0, 7)).join(", "),
+          }),
+          t("rel.stopHint"),
         );
       }
       // only genuinely rewritten commits are pipeline-made — an
@@ -886,7 +908,7 @@ async function syncBranch(
         await git(deps, repo, ["merge", "--abort"], { allowFail: true });
         throw new OrchestratorError(
           "release-refused",
-          `merge ${target}: конфликт — сведи вручную`,
+          t("rel.mergeConflict", { target }),
         );
       }
       // §17.3 (ревью PLUG-216 Б1): the only tips the sync may leave are
@@ -924,13 +946,15 @@ async function syncBranch(
             .filter(Boolean);
           throw new OrchestratorError(
             "unreviewed-commits",
-            `release ${ctx.taskKey}: во время sync на ветку ${branch} ` +
-              `легли коммиты сверх проверенной вершины ` +
-              `${ctx.expectedSha.slice(0, 7)}: ` +
-              (extra.length
+            t("rel.syncCommitsExtra", {
+              taskKey: ctx.taskKey,
+              branch,
+              sha7: ctx.expectedSha.slice(0, 7),
+              list: extra.length
                 ? extra.map((x) => x.slice(0, 7)).join(", ")
-                : head.slice(0, 7)),
-            "повторите release, когда исполнитель остановлен",
+                : head.slice(0, 7),
+            }),
+            t("rel.stopHint"),
           );
         }
         verifiedTip = head;
@@ -957,6 +981,7 @@ async function runProjectChecks(
   checks: readonly string[],
   checksMinutes: number,
 ): Promise<void> {
+  const t = deps.t ?? T_RU;
   for (const check of checks) {
     const res = await deps.cmd.run("sh", ["-c", check], {
       cwd: repo,
@@ -966,8 +991,11 @@ async function runProjectChecks(
       const tail = (res.stderr + "\n" + res.stdout).trim().split("\n");
       throw new OrchestratorError(
         "release-refused",
-        `проверка проекта упала: ${check} (exit ${res.exitCode})\n` +
-          tail.slice(-20).join("\n"),
+        t("rel.checkFailed", {
+          check,
+          code: res.exitCode,
+          tail: tail.slice(-20).join("\n"),
+        }),
       );
     }
   }
@@ -982,6 +1010,7 @@ async function applyDocsTrailer(
   repo: string,
   reason: string,
 ): Promise<void> {
+  const t = deps.t ?? T_RU;
   const body = await git(deps, repo, ["log", "-1", "--format=%B"]);
   if (DOCS_TRAILER_RE.test(body)) return;
   // An already-published HEAD may not be amended (no force-push ever) —
@@ -998,7 +1027,7 @@ async function applyDocsTrailer(
       "commit",
       "--allow-empty",
       "-m",
-      "release: документы не требуются",
+      t("rel.docsTrailerCommit"),
       "-m",
       trailer,
     ]);
@@ -1108,14 +1137,14 @@ export interface AuditVerdict {
 
 /** §3: the auditor answers strict JSON; fences or prose around it are
  * tolerated on extraction, an unparseable verdict is a REJECT. */
-export function parseAuditVerdict(text: string): AuditVerdict {
+export function parseAuditVerdict(text: string, tr: T = T_RU): AuditVerdict {
   const fail = (): AuditVerdict => ({
     verdict: "REJECT",
     findings: [
       {
         category: "verdict",
-        problem: "ответ проверяющего агента не парсится как строгий JSON",
-        fix: "перезапустить аудит или проверить вручную",
+        problem: tr("rel.verdictUnparsableProblem"),
+        fix: tr("rel.verdictUnparsableFix"),
       },
     ],
     unparseable: true,
@@ -1220,6 +1249,55 @@ export function clearPushToken(file: string): void {
 const PLUGIN_HOOKS_DIR = fileURLToPath(new URL("../hooks", import.meta.url));
 const PLUGIN_HOOK = join(PLUGIN_HOOKS_DIR, "pre-push");
 
+/** §18.1 (PLUG-247a): the hook's refusal texts are versioned with the
+ * plugin language — the installed file carries the `MESSAGES` JSON of
+ * the selected language. The hook source ships the Russian variant, so
+ * `renderPrePush(T_RU)` is byte-identical to `hooks/pre-push`. */
+const PRE_PUSH_MESSAGE_KEYS = [
+  "expired",
+  "wrongBranch",
+  "wrongCommit",
+  "noToken",
+] as const;
+
+export function renderPrePush(t: T = T_RU): Buffer {
+  const src = readFileSync(PLUGIN_HOOK, "utf8");
+  const messages: Record<string, string> = {};
+  for (const k of PRE_PUSH_MESSAGE_KEYS) {
+    // No params — the `{remote}`/`{sha}` placeholders must survive for
+    // the hook's own runtime interpolation.
+    messages[k] = t(`hook.${k}`);
+  }
+  const line = `const MESSAGES = ${JSON.stringify(messages)};`;
+  // Note: renderPrePush(T_RU) reproduces the shipped source byte-for-
+  // byte, so an unchanged result is correct, not an error.
+  if (!/^const MESSAGES = .*;$/m.test(src)) {
+    throw new Error("pre-push source has no MESSAGES block");
+  }
+  return Buffer.from(
+    src.replace(/^const MESSAGES = .*;$/m, line),
+    "utf8",
+  );
+}
+
+/** §18.1 (PLUG-247a): language change (or a plugin update) must rewrite
+ * an installed `pre-push` so its texts match the selected language.
+ * No installed file → nothing to sync (an absent guard stays absent).
+ * Returns true when the file was rewritten. */
+export function syncInstalledPrePush(hooksDir: string, t: T): boolean {
+  const path = join(hooksDir, "pre-push");
+  let installed: Buffer;
+  try {
+    installed = readFileSync(path);
+  } catch {
+    return false;
+  }
+  const current = renderPrePush(t);
+  if (installed.equals(current)) return false;
+  writeFileSync(path, current, { mode: 0o755 });
+  return true;
+}
+
 /** §17.3 (Б2): standard names the installer covers — shared with
  * `hooks/install.mjs`, which reads the same `hook-names` file. */
 function standardHookNames(): string[] {
@@ -1241,7 +1319,8 @@ function standardHookNames(): string[] {
  * a reinstall hint. A missing hook is not an error: the gate is a
  * forgetfulness guard, an absent guard simply does not fire.
  */
-function assertInstalledHookFresh(deps: ReleaseDeps): void {
+export function assertInstalledHookFresh(deps: ReleaseDeps): void {
+  const t = deps.t ?? T_RU;
   // §17.3 (Б2): the installer writes a wrapper under EVERY standard
   // name — `pre-push` is the gate, the rest are copies of `chain`. A
   // stale or missing file of any kind leaves local hooks silently
@@ -1261,11 +1340,15 @@ function assertInstalledHookFresh(deps: ReleaseDeps): void {
       continue;
     }
     present++;
+    // §18.1 (PLUG-247a): `pre-push` is language-versioned — compare the
+    // installed copy with the current language's rendering, not the
+    // Russian source bytes.
     let current: Buffer;
     try {
-      current = readFileSync(
-        join(PLUGIN_HOOKS_DIR, name === "pre-push" ? "pre-push" : "chain"),
-      );
+      current =
+        name === "pre-push"
+          ? renderPrePush(t)
+          : readFileSync(join(PLUGIN_HOOKS_DIR, "chain"));
     } catch {
       continue;
     }
@@ -1283,18 +1366,17 @@ function assertInstalledHookFresh(deps: ReleaseDeps): void {
   const problems = [
     ...stale,
     ...(present > 0 && missing.length
-      ? [`нет обёрток: ${missing.join(", ")}`]
+      ? [t("rel.hookMissingWrappers", { missing: missing.join(", ") })]
       : []),
   ];
   if (problems.length) {
     throw new OrchestratorError(
       "hook-stale",
-      `установленные общие хуки устарели или неполные ` +
-        `(${problems.join(", ")})`,
-      `переустановите хуки: node ${join(
-        PLUGIN_HOOKS_DIR,
-        "install.mjs",
-      )} --hooks-dir ${deps.hooksDir()}`,
+      t("rel.hookStale", { problems: problems.join(", ") }),
+      t("rel.hookStaleHint", {
+        installPath: join(PLUGIN_HOOKS_DIR, "install.mjs"),
+        hooksDir: deps.hooksDir(),
+      }),
     );
   }
 }
@@ -1331,6 +1413,7 @@ export async function runRelease(
   input: ReleaseInput,
   deps: ReleaseDeps,
 ): Promise<ReleaseResult> {
+  const t = deps.t ?? T_RU;
   if (!isCoordinator(input.caller, deps.probes)) {
     throw new OrchestratorError(
       "not-a-coordinator",
@@ -1343,16 +1426,18 @@ export async function runRelease(
   if (cfg.empty) {
     throw new OrchestratorError(
       "release-disabled",
-      "настройка release не задана",
-      "задайте `bb plugin config orchestrator set release '<json>'` (§6)",
+      t("rel.disabled"),
+      t("rel.disabledHint"),
     );
   }
   if (!cfg.config) {
     const first = cfg.errors[0];
     throw new OrchestratorError(
       "release-config-invalid",
-      `release config: ${first ? `${first.path}: ${first.message}` : "invalid"}`,
-      "исправьте настройку `release` и выполните `bb plugin reload orchestrator`",
+      t("rel.cfgInvalid", {
+        detail: first ? `${first.path}: ${first.message}` : "invalid",
+      }),
+      t("rel.cfgInvalidHint"),
     );
   }
 
@@ -1369,8 +1454,8 @@ export async function runRelease(
   if (!policyLoad.policy.levels[AUDIT_LEVEL]) {
     throw new OrchestratorError(
       "release-level-missing",
-      `уровень "${AUDIT_LEVEL}" не задан в политике`,
-      "добавьте уровень release-audit с цепочкой маршрутов в policy (§3)",
+      t("rel.auditLevelMissing", { level: AUDIT_LEVEL }),
+      t("rel.auditLevelMissingHint"),
     );
   }
 
@@ -1384,7 +1469,7 @@ export async function runRelease(
   if (deps.store.activeReleaseByTask(taskKey)) {
     throw new OrchestratorError(
       "release-in-progress",
-      `по задаче ${taskKey} уже идёт выкладка`,
+      t("rel.inProgress", { taskKey }),
     );
   }
   // §16.6: publish the branch that holds the task's result — a merged
@@ -1396,7 +1481,7 @@ export async function runRelease(
     if (!executor.merged_into) {
       throw new OrchestratorError(
         "release-refused",
-        "делегирование помечено merged, но ветка merged_into не записана",
+        t("rel.mergedNoBranch"),
       );
     }
     const coordThread = await deps.threads.get({
@@ -1407,14 +1492,14 @@ export async function runRelease(
     if (!repo) {
       throw new OrchestratorError(
         "release-refused",
-        "итог влит в копию координатора, но у вызывающего треда нет рабочей копии",
+        t("rel.mergedNoCopy"),
       );
     }
   } else {
     if (!executor.thread_id) {
       throw new OrchestratorError(
         "release-refused",
-        "у делегирования нет треда исполнителя — рабочая копия не найдена",
+        t("rel.noExecThread"),
       );
     }
     const execThread = await deps.threads.get({
@@ -1425,7 +1510,7 @@ export async function runRelease(
     if (!repo || !branch) {
       throw new OrchestratorError(
         "release-refused",
-        "у исполнителя нет рабочей копии (environmentPath/environmentBranchName пусты)",
+        t("rel.noCopy"),
       );
     }
     // §17.3 (ревью PLUG-214): a running executor turn can commit onto
@@ -1434,9 +1519,8 @@ export async function runRelease(
     if (await executorTurnActive(deps, executor.thread_id)) {
       throw new OrchestratorError(
         "release-refused",
-        `release ${taskKey}: у треда исполнителя идёт ход — ` +
-          `его новые коммиты не покрыты ревью итога`,
-        "дождитесь завершения хода исполнителя и повторите",
+        t("rel.execTurn", { taskKey }),
+        t("rel.execTurnHint"),
       );
     }
   }
@@ -1456,16 +1540,17 @@ export async function runRelease(
   if (project.excluded) {
     throw new OrchestratorError(
       "release-excluded",
-      `проект настройки ${settingsProject} исключён из release ` +
-        `(excluded: true); проект делегирования ${delegationProjectId}`,
+      t("rel.excluded", {
+        project: settingsProject,
+        delegation: delegationProjectId,
+      }),
     );
   }
   // §18.6: requireNote — без явного --kb/--no-kb шаг 1 отказывает.
   if (project.requireNote && !input.kb && !input.noKb) {
     throw new OrchestratorError(
       "release-refused",
-      `release ${taskKey}: нужна заметка: --kb <заметка> или ` +
-        `--no-kb <причина>`,
+      t("rel.requireNote", { taskKey }),
     );
   }
   // §18.3 + release §2 п.0 (r11): доступность провайдера PR — на шаге
@@ -1500,8 +1585,8 @@ export async function runRelease(
       if (busy.length) {
         throw new OrchestratorError(
           "copy-busy",
-          `в копии координатора незавершённая операция (${busy.join(", ")})`,
-          "завершите или отмените её (git merge|cherry-pick|revert|rebase --abort) и повторите",
+          t("rel.copyBusy", { ops: busy.join(", ") }),
+          t("rel.copyBusyHint"),
         );
       }
       // §16.6: a dirty coordinator copy refuses BEFORE the switch —
@@ -1510,8 +1595,8 @@ export async function runRelease(
       if (porcelain.trim()) {
         throw new OrchestratorError(
           "dirty-coordinator",
-          "копия координатора грязная (незакоммиченные правки)",
-          "закоммить или уберите изменения и повторите",
+          t("rel.copyDirty"),
+          t("rel.copyDirtyHint"),
         );
       }
       const headRef = await git(deps, repo, ["symbolic-ref", "HEAD"], {
@@ -1523,8 +1608,8 @@ export async function runRelease(
       if (!currentBranch) {
         throw new OrchestratorError(
           "detached-head",
-          "копия координатора на отсоединённом HEAD — ветки нет",
-          "перейдите на ветку (git switch <branch>) и повторите",
+          t("rel.detached"),
+          t("rel.detachedHint"),
         );
       }
       const originalHead = await git(deps, repo, ["rev-parse", "HEAD"]);
@@ -1575,8 +1660,8 @@ export async function runRelease(
     if (restoreError) {
       throw new OrchestratorError(
         "copy-not-restored",
-        `копия координатора не вернулась в исходное состояние: ${restoreError}`,
-        `копия ${repo} — разберите вручную, там могло остаться незавершённое слияние`,
+        t("rel.copyNotRestored", { error: restoreError }),
+        t("rel.copyNotRestoredHint", { repo }),
       );
     }
   }
@@ -1754,6 +1839,7 @@ async function reviewGate(
     projectId: string | null;
   },
 ): Promise<void> {
+  const t = deps.t ?? T_RU;
   const { taskKey, executor, project, repo, branch, tipSha, policy } = ctx;
   const pipeline = deps.store.pipelineShasForRepo(repo);
   const projectId = executor.project_id ?? ctx.projectId;
@@ -1763,8 +1849,11 @@ async function reviewGate(
     if (!(await shaExists(deps, repo, need))) {
       throw new OrchestratorError(
         "release-refused",
-        `release ${taskKey}: итог делегирования ${need.slice(0, 7)} ` +
-          `отсутствует в копии ${repo}`,
+        t("rel.resultMissing", {
+          taskKey,
+          sha7: need.slice(0, 7),
+          repo,
+        }),
       );
     }
     // «Опубликовано» — the same notRefs the merged path builds below:
@@ -1794,10 +1883,13 @@ async function reviewGate(
     if (extra.length) {
       throw new OrchestratorError(
         "unreviewed-commits",
-        `release ${taskKey}: ветка ${branch} содержит коммиты сверх ` +
-          `проверенного итога ${need.slice(0, 7)}: ` +
-          extra.map((s) => s.slice(0, 7)).join(", "),
-        "верните ветку к result_sha или раздайте ревью на новый итог",
+        t("rel.unreviewed", {
+          taskKey,
+          branch,
+          sha7: need.slice(0, 7),
+          list: extra.map((x) => x.slice(0, 7)).join(", "),
+        }),
+        t("rel.unreviewedHint"),
       );
     }
     return;
@@ -1850,10 +1942,13 @@ async function reviewGate(
     if (!(await shaExists(deps, repo, row.merged_sha))) {
       throw new OrchestratorError(
         "release-refused",
-        `release ${taskKey}: коммит слияния ` +
-          `${row.merged_sha.slice(0, 7)} (${row.task_key}) отсутствует ` +
-          `в копии ${repo}`,
-        "восстановите коммит слияния или поправьте запись merge",
+        t("rel.mergeCommitMissing", {
+          taskKey,
+          sha7: row.merged_sha.slice(0, 7),
+          key: row.task_key,
+          repo,
+        }),
+        t("rel.mergeCommitMissingHint"),
       );
     }
     if (!(await isAncestor(deps, repo, row.merged_sha, tipSha))) continue;
@@ -1896,18 +1991,21 @@ async function reviewGate(
   if (foreign.length) {
     throw new OrchestratorError(
       "unreviewed-commits",
-      `release ${taskKey}: в диапазоне ${branch} коммиты без влитого ` +
-        `делегирования: ${foreign.map((s) => s.slice(0, 7)).join(", ")}`,
-      `ревью всей вершины покрывает их: bb orchestrator delegate ` +
-        `${taskKey} --level <уровень аудита> --from ${tipSha}`,
+      t("rel.foreignCommits", {
+        taskKey,
+        branch,
+        list: foreign.map((x) => x.slice(0, 7)).join(", "),
+      }),
+      t("rel.foreignCommitsHint", { taskKey, tip: tipSha }),
     );
   }
 
   for (const row of unpublished) {
     const label = `${row.task_key} → ${row.merged_sha!.slice(0, 7)}`;
-    const hint =
-      `раздайте ревью на влитый итог: bb orchestrator delegate ` +
-      `${row.task_key} --level <уровень аудита> --from ${row.merged_sha}`;
+    const hint = t("rel.mergedReviewHint", {
+      key: row.task_key,
+      sha: row.merged_sha,
+    });
     const rReview = deps.store
       .delegationsByTask(row.task_key)
       .find(
@@ -1918,14 +2016,18 @@ async function reviewGate(
     if (!rReview) {
       throw new OrchestratorError(
         "unreviewed-commits",
-        `release ${taskKey}: нет ревью на влитый итог ${label}`,
+        t("rel.noMergedReview", { taskKey, label }),
         hint,
       );
     }
     if (rReview.status !== "done") {
       throw new OrchestratorError(
         "unreviewed-commits",
-        `release ${taskKey}: ревью на ${label} в статусе ${rReview.status}`,
+        t("rel.mergedReviewStatus", {
+          taskKey,
+          label,
+          status: rReview.status,
+        }),
         hint,
       );
     }
@@ -1939,8 +2041,14 @@ async function reviewGate(
     if (v !== "ok") {
       throw new OrchestratorError(
         "unreviewed-commits",
-        `release ${taskKey}: вердикт ревью на ${label} ` +
-          (v === "missing" ? "не найден" : "не «OK»"),
+        t("rel.mergedReviewVerdict", {
+          taskKey,
+          label,
+          word:
+            v === "missing"
+              ? t("rel.verdictMissingWord")
+              : t("rel.verdictNotOkWord"),
+        }),
         hint,
       );
     }
@@ -1966,6 +2074,7 @@ async function runReleaseSteps(
   input: ReleaseInput,
   deps: ReleaseDeps,
 ): Promise<ReleaseResult> {
+  const t = deps.t ?? T_RU;
   const { taskKey, title, executor, project, repo, branch, policyLoad } = ctx;
 
   // Step 1 (продолжение приёмки) — гейт ревью по публикуемым SHA до
@@ -1985,16 +2094,18 @@ async function runReleaseSteps(
     if (!(await shaExists(deps, repo, prevPublished))) {
       throw new OrchestratorError(
         "release-refused",
-        `release ${taskKey}: прошлая опубликованная вершина ` +
-          `${prevPublished.slice(0, 8)} отсутствует в копии ${repo}`,
-        "новый заход продолжает от published_sha — повторите из копии, где этот коммит есть",
+        t("rel.prevPublishedMissing", {
+          taskKey,
+          sha8: prevPublished.slice(0, 8),
+          repo,
+        }),
+        t("rel.prevPublishedMissingHint"),
       );
     }
     if (!(await isAncestor(deps, repo, prevPublished, preSyncSha))) {
       throw new OrchestratorError(
         "release-refused",
-        `ветка публикации не fast-forward от ${prevPublished.slice(0, 8)} ` +
-          `— новый заход должен продолжать от published_sha`,
+        t("rel.notFastForward", { sha8: prevPublished.slice(0, 8) }),
       );
     }
   }
@@ -2059,13 +2170,13 @@ async function runReleaseSteps(
       noKbReason: input.noKb ?? null,
       settingsProjectId: ctx.settingsProjectId,
       repoRoot,
-    });
+    }, t);
   } catch (e) {
     if (e instanceof OrchestratorError) throw e;
     if (/UNIQUE constraint/.test(message(e))) {
       throw new OrchestratorError(
         "release-in-progress",
-        `по задаче ${taskKey} уже идёт выкладка`,
+        t("rel.inProgress", { taskKey }),
       );
     }
     throw e;
@@ -2107,10 +2218,12 @@ async function runReleaseSteps(
         .filter(Boolean);
       throw new OrchestratorError(
         "unreviewed-commits",
-        `release ${taskKey}: во время проверок на ветку ${branch} легли ` +
-          `коммиты сверх проверенной вершины: ` +
-          extra.map((s) => s.slice(0, 7)).join(", "),
-        "ревью покрывает вершину после sync — повторите release, когда исполнитель остановлен",
+        t("rel.checksCommitsDuring", {
+          taskKey,
+          branch,
+          list: extra.map((x) => x.slice(0, 7)).join(", "),
+        }),
+        t("rel.checksCommitsHint"),
       );
     }
 
@@ -2130,10 +2243,12 @@ async function runReleaseSteps(
         .filter(Boolean);
       throw new OrchestratorError(
         "unreviewed-commits",
-        `release ${taskKey}: после проверок на ветку ${branch} легли ` +
-          `коммиты сверх проверенной вершины: ` +
-          extra.map((x) => x.slice(0, 7)).join(", "),
-        "повторите release, когда исполнитель остановлен",
+        t("rel.checksCommitsAfter", {
+          taskKey,
+          branch,
+          list: extra.map((x) => x.slice(0, 7)).join(", "),
+        }),
+        t("rel.stopHint"),
       );
     }
     let trailerTip: string | null = null;
@@ -2158,10 +2273,12 @@ async function runReleaseSteps(
         if (!sameTree || count !== 1) {
           throw new OrchestratorError(
             "unreviewed-commits",
-            `release ${taskKey}: во время записи трейлера на ветку ` +
-              `${branch} легли чужие коммиты (вершина ` +
-              `${trailerTip.slice(0, 7)})`,
-            "повторите release, когда исполнитель остановлен",
+            t("rel.trailerForeign", {
+              taskKey,
+              branch,
+              head: trailerTip.slice(0, 7),
+            }),
+            t("rel.stopHint"),
           );
         }
         deps.store.addReleasePipelineShas(release.id, [trailerTip]);
@@ -2222,14 +2339,21 @@ async function runReleaseSteps(
       threadIds: project.threadIds,
       allowedTrailers: project.allowedTrailers,
       allowedEmails: project.allowedEmails,
+      t,
     });
     const blockers = findings.filter((f) => f.severity === "block");
     const warnings = findings.filter((f) => f.severity === "warn");
     if (blockers.length) {
       throw new OrchestratorError(
         "release-refused",
-        `release ${taskKey}: машинный скан нашёл ${blockers.length} блокирующих находок:\n` +
-          blockers.slice(0, 20).map((f) => `- ${formatFinding(f)}`).join("\n"),
+        t("rel.scanBlockers", {
+          taskKey,
+          n: blockers.length,
+          list: blockers
+            .slice(0, 20)
+            .map((f) => `- ${formatFinding(f, t)}`)
+            .join("\n"),
+        }),
       );
     }
 
@@ -2264,16 +2388,12 @@ async function runReleaseSteps(
       unavailableRoutes: new Set(policyLoad.unavailableRoutes),
       heldGroups: deps.store.heldGroups(deps.now?.() ?? Date.now()),
     });
-    const auditInstructions =
-      `Выкладка задачи ${taskKey}: аудит релиза (шаг 5 конвейера). ` +
-      `Вход аудита — файл ${packetPath}, прочитай его целиком. ` +
-      // §16.6: the auditor checks the exact commit — after the run the
-      // coordinator's copy is restored to its original branch, so a
-      // branch name could point at the wrong tree.
-      `Репозиторий для проверки: ${repo} (коммит ${headSha} — проверяй его, ` +
-      `ветка копии после выкладки может отличаться). ` +
-      `Итог — ОДНО сообщение строгим JSON {"verdict":"APPROVE"|"REJECT","findings":[…]} без пояснений; ` +
-      `находки — без значений секретов (маскируй).`;
+    const auditInstructions = t("rel.auditInstr", {
+      taskKey,
+      packet: packetPath,
+      repo,
+      sha: headSha,
+    });
     // §17.3 (С1): only the audit dispatch is serialized on the delegate
     // queue — release itself runs outside it (the `bb orchestrator
     // release` CLI does not enqueue), so a release invoked while a
@@ -2348,6 +2468,7 @@ async function writeAuditPacket(
     headSha: string;
   },
 ): Promise<string> {
+  const t = deps.t ?? T_RU;
   const dir = deps.packetDir();
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `release-${input.release.id}-audit.md`);
@@ -2358,17 +2479,21 @@ async function writeAuditPacket(
         `\n\n[… diff truncated at ${PACKET_DIFF_CAP} chars …]`
       : input.diff;
   const body = [
-    `# Аудит выкладки ${r.task_key}`,
+    t("packet.title", { taskKey: r.task_key }),
     "",
-    `- Задача: ${r.task_key} — ${input.taskTitle}`,
-    `- Репозиторий (рабочая копия с итогом задачи): ${r.repo_path}`,
-    `- Ветка: ${r.branch} → ${r.target_action} в ${r.target_branch}`,
-    `- Диапазон: ${input.baseSha}..${input.headSha}`,
-    input.noDocs ? `- --no-docs: ${input.noDocs}` : null,
-    input.kb ? `- --kb: ${input.kb}` : null,
-    input.noKb ? `- --no-kb: ${input.noKb}` : null,
+    t("packet.task", { taskKey: r.task_key, title: input.taskTitle }),
+    t("packet.repo", { repo: r.repo_path }),
+    t("packet.branch", {
+      branch: r.branch,
+      action: r.target_action,
+      target: r.target_branch,
+    }),
+    t("packet.range", { base: input.baseSha, head: input.headSha }),
+    input.noDocs ? t("packet.noDocs", { text: input.noDocs }) : null,
+    input.kb ? t("packet.kb", { text: input.kb }) : null,
+    input.noKb ? t("packet.noKb", { text: input.noKb }) : null,
     "",
-    "## Коммиты",
+    t("packet.commits"),
     "",
     ...input.commits.map(
       (c) =>
@@ -2380,21 +2505,21 @@ async function writeAuditPacket(
           .join("\n"),
     ),
     "",
-    "## Связанные документы для проверки актуальности",
+    t("packet.docs"),
     "",
     input.docs === null
-      ? "- карты нет: проверяй все документы репозитория (docs/, README*, ADR)"
+      ? t("packet.noMap")
       : input.docs.length
         ? input.docs.map((d) => `- ${d}`).join("\n")
-        : "- затронутых документов по карте нет",
+        : t("packet.noDocsTouched"),
     "",
-    "## Находки машинного скана (шаг 4)",
+    t("packet.findings"),
     "",
     input.findings.length
-      ? input.findings.map((f) => `- ${formatFinding(f)}`).join("\n")
-      : "- нет",
+      ? input.findings.map((f) => `- ${formatFinding(f, t)}`).join("\n")
+      : t("packet.none"),
     "",
-    "## Дифф выкладки",
+    t("packet.diff"),
     "",
     "```diff",
     truncated,
@@ -2496,6 +2621,7 @@ export async function deliverReleaseNotice(
  * delegation means the chain is exhausted (§3).
  */
 export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
+  const t = deps.t ?? T_RU;
   const s: PumpSummary = { scanning: 0, published: 0, rejected: 0, failed: 0 };
   // §2 r10 п.5: rows with a saved but undelivered outcome line — the
   // досмотр resends ONLY the stored text (no post-check, no postPublish,
@@ -2513,8 +2639,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         deps.store.setReleaseNotice(
           fresh.id,
           "published",
-          `${fresh.notice_text}\nперезагрузи orchestrator вручную: ` +
-            `автоматизация не подтверждена`,
+          fresh.notice_text + t("rel.selfReloadUnconfirmed"),
         );
       }
       if (fresh.notice_text != null) {
@@ -2549,12 +2674,12 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
                 row.id,
                 ["auditing"],
                 "failed",
-                "выкладка остановилась до раздачи аудита",
+                t("rel.stoppedBeforeAudit"),
                 {
                   kind: "failed",
-                  text:
-                    `выкладка ${row.task_key} остановлена до раздачи ` +
-                    `аудита — повторите release`,
+                  text: t("rel.stoppedBeforeAuditNotice", {
+                    taskKey: row.task_key,
+                  }),
                 },
               )
             ) {
@@ -2588,13 +2713,13 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
                 row.id,
                 ["auditing"],
                 "failed",
-                `аудит не завершился за ${auditT.auditTimeoutMinutes} мин`,
+                t("rel.auditTimeout", { min: auditT.auditTimeoutMinutes }),
                 {
                   kind: "failed",
-                  text:
-                    `выкладка ${row.task_key} остановлена: аудит не ` +
-                    `завершился за ${auditT.auditTimeoutMinutes} мин — ` +
-                    `повторите release`,
+                  text: t("rel.auditTimeoutNotice", {
+                    taskKey: row.task_key,
+                    min: auditT.auditTimeoutMinutes,
+                  }),
                 },
               )
             ) {
@@ -2619,15 +2744,17 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
               row.id,
               ["auditing"],
               "failed",
-              `аудит завершился исходом ${delegation.status}`,
+              t("rel.auditOutcome", { status: delegation.status }),
               {
                 kind: "failed",
-                text:
-                  `выкладка ${row.task_key} остановлена: проверяющий ` +
-                  `агент завершился исходом ${delegation.status} — ` +
-                  (delegation.status === "cancelled"
-                    ? "аудит отменён, выкладки нет"
-                    : `цепочка ${AUDIT_LEVEL} исчерпана, выкладки нет`),
+                text: t("rel.auditOutcomeNotice", {
+                  taskKey: row.task_key,
+                  status: delegation.status,
+                  why:
+                    delegation.status === "cancelled"
+                      ? t("rel.auditCancelled")
+                      : t("rel.auditExhausted", { level: AUDIT_LEVEL }),
+                }),
               },
             )
           ) {
@@ -2639,7 +2766,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         const text = delegation.thread_id
           ? await lastAgentMessage(deps, delegation.thread_id)
           : null;
-        const verdict = parseAuditVerdict(text ?? "");
+        const verdict = parseAuditVerdict(text ?? "", t);
         if (verdict.verdict === "REJECT") {
           const list = verdict.findings
             .slice(0, 15)
@@ -2655,13 +2782,18 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
               row.id,
               ["auditing"],
               "rejected",
-              verdict.unparseable ? "ответ аудитора не парсится" : "REJECT",
+              verdict.unparseable
+                ? t("rel.rejectReasonUnparsable")
+                : "REJECT",
               {
                 kind: "rejected",
-                text:
-                  `аудит выкладки ${row.task_key}: REJECT` +
-                  (verdict.unparseable ? " (ответ не парсится)" : "") +
-                  `\n${list || "- без находок в ответе"}`,
+                text: t("rel.rejectNotice", {
+                  taskKey: row.task_key,
+                  unp: verdict.unparseable
+                    ? t("rel.rejectUnparsableSuffix")
+                    : "",
+                  list: list || t("rel.noFindings"),
+                }),
               },
             )
           ) {
@@ -2686,7 +2818,10 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
           message(e).slice(0, 400),
           {
             kind: "failed",
-            text: `выкладка ${row.task_key} упала на публикации: ${message(e)}`,
+            text: t("rel.publishFailed", {
+              taskKey: row.task_key,
+              error: message(e),
+            }),
           },
         )
       ) {
@@ -2727,8 +2862,11 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
       releasePostPublishLock(fresh.id);
       const sha7 = (fresh.pr_merge_sha ?? "").slice(0, 7);
       const parts = [
-        `PR влит ${fresh.task_key}: ${fresh.pr_url}` +
-          (sha7 ? ` → ${sha7}` : ""),
+        t("rel.prMerged", {
+          taskKey: fresh.task_key,
+          url: fresh.pr_url,
+          sha: sha7 ? t("rel.prMergedSha", { sha7 }) : "",
+        }),
       ];
       if (pp.summary) parts.push(pp.summary);
       const line = parts.join("\n");
@@ -2766,7 +2904,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         deps.store.setReleaseNotice(
           fresh.id,
           "pr",
-          `${line}\nперезагрузи orchestrator вручную: ${createErr}`,
+          line + t("rel.selfReloadManual", { error: createErr }),
         );
       } else {
         // §2 п.6: строка собрана и сохранена — затем запись уходит в
@@ -2809,6 +2947,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
  * pr_state transition, not by notified_at.
  */
 async function prWatch(deps: ReleaseDeps): Promise<void> {
+  const t = deps.t ?? T_RU;
   const now = deps.now?.() ?? Date.now();
   for (const row of deps.store.trackedPrReleases()) {
     const prUrl = row.pr_url;
@@ -2824,10 +2963,10 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       // до доставки; досмотр донесёт текст, переход сделает следующий
       // такт.
       if (row.notice_text != null) continue;
-      const t = await releaseTiming(deps, row);
+      const timing = await releaseTiming(deps, row);
       if (
         row.pr_checked_at &&
-        now - row.pr_checked_at < t.prPollMinutes * 60_000
+        now - row.pr_checked_at < timing.prPollMinutes * 60_000
       ) {
         continue;
       }
@@ -2844,15 +2983,17 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       } catch (e) {
         deps.store.recordPrCheck(row.id, true, now);
         const fresh = deps.store.getRelease(row.id);
-        if ((fresh?.pr_error_count ?? 0) >= t.prErrorLimit) {
+        if ((fresh?.pr_error_count ?? 0) >= timing.prErrorLimit) {
           if (
             deps.store.transitionPrState(row.id, ["open", "closed"], "error")
           ) {
             deps.store.setReleaseNotice(
               row.id,
               "pr",
-              `слежение за PR ${row.task_key} невозможно: ` +
-                maskCommandOutput(message(e)).slice(0, 200),
+              t("rel.prWatchImpossible", {
+                taskKey: row.task_key,
+                error: maskCommandOutput(message(e)).slice(0, 200),
+              }),
             );
             await deliverReleaseNotice(deps, row);
           }
@@ -2886,7 +3027,7 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
         }
         if (
           row.pr_closed_at &&
-          now - row.pr_closed_at >= t.prReopenWatchHours * 3_600_000
+          now - row.pr_closed_at >= timing.prReopenWatchHours * 3_600_000
         ) {
           deps.store.transitionPrState(row.id, ["closed"], "closed_final");
         }
@@ -2902,7 +3043,7 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
           deps.store.setReleaseNotice(
             row.id,
             "pr",
-            `PR закрыт без влития ${row.task_key}: ${prUrl}`,
+            t("rel.prClosed", { taskKey: row.task_key, url: prUrl }),
           );
           await deliverReleaseNotice(deps, row);
         }
@@ -2914,13 +3055,17 @@ async function prWatch(deps: ReleaseDeps): Promise<void> {
       // (ревью PLUG-244 заход 1, Б5).
       if (
         !row.pr_stale_notified &&
-        now - row.updated_at >= t.prStaleHours * 3_600_000
+        now - row.updated_at >= timing.prStaleHours * 3_600_000
       ) {
         if (deps.store.markPrStaleNotified(row.id)) {
           deps.store.setReleaseNotice(
             row.id,
             "pr",
-            `PR висит ${t.prStaleHours} ч ${row.task_key}: ${prUrl}`,
+            t("rel.prStale", {
+              hours: timing.prStaleHours,
+              taskKey: row.task_key,
+              url: prUrl,
+            }),
           );
           await deliverReleaseNotice(deps, row);
         }
@@ -3031,14 +3176,15 @@ async function providerView(
   project: ResolvedProject | null,
   mainDir: string,
 ): Promise<PrView> {
+  const t = deps.t ?? T_RU;
   const prov: Pick<PrProviderLayer, "type"> & Partial<PrProviderLayer> =
     project?.prProvider ?? { type: "github" };
   const timeoutSec = (project?.timing ?? DEFAULT_TIMING).prCommandTimeoutSec;
   const tail = (r: BbCliResult) =>
-    maskCommandOutput(r.stderr || r.stdout) || "no output";
+    maskCommandOutput(r.stderr || r.stdout) || t("rel.noOutput");
   if (prov.type === "command") {
     if (!prov.view?.length) {
-      throw new Error("command.view не задан");
+      throw new Error(t("rel.viewNoCmd"));
     }
     const res = await runPrProvider(deps, {
       argv: prov.view,
@@ -3048,7 +3194,7 @@ async function providerView(
     });
     if (res.exitCode !== 0) {
       throw new Error(
-        `command.view завершился с кодом ${res.exitCode}: ${tail(res)}`,
+        t("rel.viewExit", { code: res.exitCode, tail: tail(res) }),
       );
     }
     let parsed: { state?: unknown; mergeCommit?: unknown };
@@ -3056,14 +3202,15 @@ async function providerView(
       parsed = JSON.parse(res.stdout) as typeof parsed;
     } catch {
       throw new Error(
-        `command.view: ответ не JSON: ${maskCommandOutput(res.stdout)}`,
+        t("rel.viewNotJson", { out: maskCommandOutput(res.stdout) }),
       );
     }
     const state = String(parsed.state ?? "").toUpperCase();
     if (!PR_VIEW_STATES.has(state)) {
       throw new Error(
-        `command.view: неожиданный state: ` +
-          maskCommandOutput(String(parsed.state ?? "")),
+        t("rel.viewBadState", {
+          state: maskCommandOutput(String(parsed.state ?? "")),
+        }),
       );
     }
     return {
@@ -3075,7 +3222,7 @@ async function providerView(
     };
   }
   if (prov.type === "none") {
-    throw new Error("провайдер сменился на none — слежение невозможно");
+    throw new Error(t("rel.viewNone"));
   }
   const res = await deps.cmd.run(
     "gh",
@@ -3090,13 +3237,15 @@ async function providerView(
     view = JSON.parse(res.stdout) as typeof view;
   } catch {
     throw new Error(
-      `gh pr view: ответ не JSON: ${maskCommandOutput(res.stdout)}`,
+      t("rel.ghViewNotJson", { out: maskCommandOutput(res.stdout) }),
     );
   }
   const state = (view.state ?? "").toUpperCase();
   if (!PR_VIEW_STATES.has(state)) {
     throw new Error(
-      `gh pr view: неожиданный state: ${maskCommandOutput(view.state ?? "")}`,
+      t("rel.ghViewBadState", {
+        state: maskCommandOutput(view.state ?? ""),
+      }),
     );
   }
   return {
@@ -3144,12 +3293,12 @@ const GH_PR_URL_RE = /https?:\/\/\S+/;
 /** §18.3: первый URL в выводе провайдера; URL с учётными данными
  * (`user:pass@` в authority) — отказ, в записи, строки и комментарий
  * задачи он не попадает. */
-function extractPrUrl(stdout: string): string | null {
+function extractPrUrl(stdout: string, t: T): string | null {
   const url = GH_PR_URL_RE.exec(stdout)?.[0] ?? null;
   if (url && /^https?:\/\/[^/\s]*@/.test(url)) {
     throw new OrchestratorError(
       "release-refused",
-      "PR не открыт: URL с учётными данными",
+      t("rel.prCredUrl"),
     );
   }
   return url;
@@ -3239,12 +3388,13 @@ async function checkPrProvider(
   repo: string,
   project: ResolvedProject,
 ): Promise<void> {
+  const t = deps.t ?? T_RU;
   const prov = project.prProvider;
   if (prov.type === "none") return;
   const unavailable = (why: string) =>
     new OrchestratorError(
       "release-refused",
-      `провайдер PR недоступен: ${why}`,
+      t("rel.prUnavailable", { why }),
     );
   if (prov.type === "github") {
     const res = await deps.cmd.run("gh", ["auth", "status"], {
@@ -3253,8 +3403,12 @@ async function checkPrProvider(
     });
     if (res.exitCode !== 0) {
       throw unavailable(
-        `gh нет или не авторизован (код ${res.exitCode}): ` +
-          (maskCommandOutput(res.stderr || res.stdout) || "no output"),
+        t("rel.ghNotAuth", {
+          code: res.exitCode,
+          tail:
+            maskCommandOutput(res.stderr || res.stdout) ||
+            t("rel.noOutput"),
+        }),
       );
     }
     return;
@@ -3265,11 +3419,11 @@ async function checkPrProvider(
     ["view", prov.view],
   ] as const) {
     if (!argv?.length) {
-      throw unavailable(`command.${kind} не задан`);
+      throw unavailable(t("rel.cmdNotSet", { kind }));
     }
     if (!executableExists(argv[0]!, mainDir)) {
       throw unavailable(
-        `command.${kind}: исполняемый файл не найден: ${argv[0]}`,
+        t("rel.cmdNotFound", { kind, file: argv[0] }),
       );
     }
   }
@@ -3280,6 +3434,7 @@ async function publishRelease(
   row: ReleaseRow,
   s: PumpSummary,
 ): Promise<void> {
+  const t = deps.t ?? T_RU;
   const repo = row.repo_path;
   const headSha = row.head_sha ?? (await git(deps, repo, ["rev-parse", "HEAD"]));
 
@@ -3330,7 +3485,7 @@ async function publishRelease(
   const project = await releaseProject(deps, row);
   const threadIds = project?.threadIds ?? true;
   const prov = project?.prProvider ?? { type: "github" as const };
-  const t = project?.timing ?? DEFAULT_TIMING;
+  const timing = project?.timing ?? DEFAULT_TIMING;
   // §16.6 (PLUG-194): a publish-branch name is written and reused only
   // in the `release/…` form — an executor branch name recorded while
   // threadIds was on must not be published after it flips off.
@@ -3364,8 +3519,7 @@ async function publishRelease(
     if (!ff) {
       throw new OrchestratorError(
         "release-refused",
-        `ветка публикации не fast-forward от ${prevPublished.slice(0, 8)} ` +
-          `— новый заход должен продолжать от published_sha`,
+        t("rel.notFastForward", { sha8: prevPublished.slice(0, 8) }),
       );
     }
   }
@@ -3375,8 +3529,11 @@ async function publishRelease(
   const foreignPr = (url: string | null | undefined, src?: string) =>
     new OrchestratorError(
       "release-refused",
-      `PR ${url ?? "?"} у ветки ${remoteBranch} создан не этим release ` +
-        `(Источник: ${src ?? "нет"}) — release в чужую ветку PR не пишет`,
+      t("rel.foreignPr", {
+        url: url ?? "?",
+        branch: remoteBranch,
+        src: src ?? t("rel.noSrc"),
+      }),
     );
   const mainDir =
     row.repo_root ?? (await repoMainDir(deps, repo));
@@ -3397,7 +3554,7 @@ async function publishRelease(
         "--limit",
         "20",
       ],
-      t.prCommandTimeoutSec * 1000,
+      timing.prCommandTimeoutSec * 1000,
     );
     const existing = prs.find(
       (p) =>
@@ -3444,16 +3601,20 @@ async function publishRelease(
         argv: prov.find,
         cwd: mainDir,
         env: { ORCH_BRANCH: remoteBranch, ORCH_TARGET: row.target_branch },
-        timeoutSec: t.prCommandTimeoutSec,
+        timeoutSec: timing.prCommandTimeoutSec,
       });
       if (res.exitCode !== 0) {
         throw new OrchestratorError(
           "release-refused",
-          `провайдер PR (find) завершился с кодом ${res.exitCode}: ` +
-            (maskCommandOutput(res.stderr || res.stdout) || "no output"),
+          t("rel.findExit", {
+            code: res.exitCode,
+            out:
+              maskCommandOutput(res.stderr || res.stdout) ||
+              t("rel.noOutput"),
+          }),
         );
       }
-      existingUrl = extractPrUrl(res.stdout);
+      existingUrl = extractPrUrl(res.stdout, t);
       if (
         existingUrl &&
         !deps.store.prWasReleased(
@@ -3484,7 +3645,7 @@ async function publishRelease(
         } catch (e) {
           throw new OrchestratorError(
             "release-refused",
-            `провайдер PR (view): ${message(e)}`,
+            t("rel.viewErr", { error: message(e) }),
           );
         }
         if (view.state === "OPEN") existingUrl = prevUrl;
@@ -3572,21 +3733,28 @@ async function publishRelease(
           ORCH_TITLE: title,
         },
         stdin: body,
-        timeoutSec: t.prCommandTimeoutSec,
+        timeoutSec: timing.prCommandTimeoutSec,
       });
       if (res.exitCode !== 0) {
         throw new OrchestratorError(
           "release-refused",
-          `PR не открыт (код ${res.exitCode}): ` +
-            (maskCommandOutput(res.stderr || res.stdout) || "no output"),
+          t("rel.prCreateExit", {
+            code: res.exitCode,
+            out:
+              maskCommandOutput(res.stderr || res.stdout) ||
+              t("rel.noOutput"),
+          }),
         );
       }
-      prUrl = extractPrUrl(res.stdout);
+      prUrl = extractPrUrl(res.stdout, t);
       if (!prUrl) {
         throw new OrchestratorError(
           "release-refused",
-          `PR не открыт: ` +
-            (maskCommandOutput(res.stdout || res.stderr) || "нет вывода"),
+          t("rel.prNoOutput", {
+            out:
+              maskCommandOutput(res.stdout || res.stderr) ||
+              t("rel.prNoOutputWord"),
+          }),
         );
       }
     } else {
@@ -3605,9 +3773,9 @@ async function publishRelease(
           "--body",
           body,
         ],
-        t.prCommandTimeoutSec * 1000,
+        timing.prCommandTimeoutSec * 1000,
       );
-      prUrl = extractPrUrl(created);
+      prUrl = extractPrUrl(created, t);
     }
   }
   deps.store.updateRelease(row.id, { prUrl });
@@ -3640,6 +3808,7 @@ async function finishPublished(
   row: ReleaseRow,
   prExisted: boolean | null,
 ): Promise<void> {
+  const t = deps.t ?? T_RU;
   const fresh = deps.store.getRelease(row.id) ?? row;
   const headSha = fresh.published_sha ?? fresh.head_sha ?? "";
   const pushedBranch =
@@ -3670,12 +3839,15 @@ async function finishPublished(
     headSha,
     pushedBranch,
     fresh.pr_url,
-  ).catch((e) => [`пост-проверка не удалась: ${message(e)}`]);
+  ).catch((e) => [t("rel.postCheckFail", { error: message(e) })]);
   const parts: string[] = [];
   if (fresh.target_action === "push") {
     parts.push(
-      `выложено ${fresh.task_key}: ${headSha.slice(0, 7)} в ` +
-        `${fresh.target_branch}; задача done`,
+      t("rel.published", {
+        taskKey: fresh.task_key,
+        sha7: headSha.slice(0, 7),
+        branch: fresh.target_branch,
+      }),
     );
   } else if (!fresh.pr_url) {
     // §18.3 `none` (или провайдер, не вернувший URL): ветка легла, PR
@@ -3685,21 +3857,30 @@ async function finishPublished(
       .catch(() => "github" as const);
     parts.push(
       provType === "none"
-        ? `ветка опубликована ${fresh.task_key}: ${pushedBranch}; ` +
-            `PR открой вручную`
-        : `PR открыт ${fresh.task_key}: —; слежу до влития`,
+        ? t("rel.branchPublished", {
+            taskKey: fresh.task_key,
+            branch: pushedBranch,
+          })
+        : t("rel.prCreated", { taskKey: fresh.task_key }),
     );
   } else {
     const existed =
       prExisted ?? deps.store.otherReleaseByPrUrl(fresh.pr_url, fresh.id);
     parts.push(
-      `${existed ? "PR обновлён" : "PR открыт"} ${fresh.task_key}: ` +
-        `${fresh.pr_url}; слежу до влития`,
+      t("rel.prLine", {
+        word: existed ? t("rel.prUpdated") : t("rel.prOpened"),
+        taskKey: fresh.task_key,
+        url: fresh.pr_url,
+      }),
     );
   }
-  if (fresh.kb_note) parts.push(`KB-заметка: ${fresh.kb_note}`);
-  if (fresh.no_kb_reason) parts.push(`KB не требуется: ${fresh.no_kb_reason}`);
-  for (const m of checks) parts.push(`пост-проверка: ${m}`);
+  if (fresh.kb_note) {
+    parts.push(t("rel.kbNote", { note: fresh.kb_note }));
+  }
+  if (fresh.no_kb_reason) {
+    parts.push(t("rel.kbNone", { reason: fresh.no_kb_reason }));
+  }
+  for (const m of checks) parts.push(t("rel.postCheck", { msg: m }));
   if (ppSummary) parts.push(ppSummary);
   const line = parts.join("\n");
   // §2 r10 п.5: работа выполнена и текст собран — сначала строка
@@ -3738,7 +3919,7 @@ async function finishPublished(
     deps.store.setReleaseNotice(
       fresh.id,
       "published",
-      `${line}\nперезагрузи orchestrator вручную: ${createErr}`,
+      line + t("rel.selfReloadManual", { error: createErr }),
     );
     await deliverReleaseNotice(deps, fresh);
     return;
@@ -3783,26 +3964,70 @@ export function releaseAllPostPublishLocks(): void {
  * тестов как дефолт срока. */
 export const POSTPUBLISH_MAX_MS = 30 * 60 * 1000;
 
+/** §18.2/§18.5: command-run skip/stop reasons — CANONICAL values stored
+ * in `command_runs.output_tail` (tests and journal rows rely on them;
+ * the display path localizes them via `ppReasonText`). */
+const PP_REASON = {
+  noCheckout: "нет checkout",
+  copyNotUpdated: "копия не обновлена",
+  skipWhen: "нет изменений по when",
+  skippedSetting: "настройка сменилась",
+  waitLock: "замка копии",
+  waitQueue: "очереди команд",
+  waitFinish: "завершения шагов",
+  stoppedBy: (name: string) => `не прошла ${name}`,
+  notWaited: (waiting: string) => `не дождались ${waiting}`,
+} as const;
+
+/** §18.1 (PLUG-247a): a stored canonical reason → the current-language
+ * text for the outcome line; unknown tails (command output) verbatim. */
+function ppReasonText(t: T, tail: string): string {
+  if (tail === PP_REASON.noCheckout) return t("pp.noCheckout");
+  if (tail === PP_REASON.copyNotUpdated) return t("pp.copyNotUpdated");
+  if (tail === PP_REASON.skipWhen) return t("pp.skipWhen");
+  if (tail === PP_REASON.skippedSetting) return t("cmd.skippedSetting");
+  if (tail.startsWith("не прошла ")) {
+    return t("pp.stoppedBy", { name: tail.slice("не прошла ".length) });
+  }
+  if (tail.startsWith("не дождались ")) {
+    const w = tail.slice("не дождались ".length);
+    const waiting =
+      w === PP_REASON.waitLock
+        ? t("pp.waitLock")
+        : w === PP_REASON.waitQueue
+          ? t("pp.waitQueue")
+          : w === PP_REASON.waitFinish
+            ? t("pp.waitFinish")
+            : w;
+    return t("pp.notWaited", { waiting });
+  }
+  return tail;
+}
+
 /** §18.2: «<name>: ok» / «<name>: пропущена — <reason>» / … — один
  * формат для строки итога и для строки истёкшего ожидания (заход 4). */
-const commandRunBit = (name: string, r: CommandRunRow): string => {
+const commandRunBit = (t: T, name: string, r: CommandRunRow): string => {
   switch (r.status) {
     case "ok":
-      return `${name}: ok`;
+      return t("pp.cmdOk", { name });
     case "skipped":
       // §18.2: «<name>: нет checkout» — без «пропущена —».
-      return r.output_tail === "нет checkout"
-        ? `${name}: нет checkout`
-        : `${name}: пропущена — ${r.output_tail}`;
+      return r.output_tail === PP_REASON.noCheckout
+        ? t("pp.cmdNoCheckout", { name })
+        : t("pp.cmdSkipped", {
+            name,
+            tail: ppReasonText(t, r.output_tail ?? ""),
+          });
     case "timeout":
-      return `${name}: таймаут`;
+      return t("pp.cmdTimeout", { name });
     case "interrupted":
-      return `${name}: прервана перезапуском`;
+      return t("pp.cmdInterrupted", { name });
     default:
-      return (
-        `${name}: упала (код ${r.exit_code ?? "?"})` +
-        (r.output_tail ? `: ${r.output_tail}` : "")
-      );
+      return t("pp.cmdFailed", {
+        name,
+        code: r.exit_code ?? "?",
+        tail: r.output_tail ? `: ${r.output_tail}` : "",
+      });
   }
 };
 
@@ -3926,6 +4151,7 @@ async function runPostPublish(
   row: ReleaseRow,
   event: "release.published" | "pr.merged",
 ): Promise<PostPublishResult> {
+  const t = deps.t ?? T_RU;
   const groupKey = `pp:${row.id}`;
   const done = (summary: string | null = null): PostPublishResult => {
     // PLUG-245 заход 4 (ревью Б1): любой done снимает замок копии.
@@ -3952,7 +4178,7 @@ async function runPostPublish(
     const at = deps.now?.() ?? Date.now();
     for (const r of rows) {
       if (r.status === "queued") {
-        deps.store.skipQueuedCommandRun(r.id, "настройка сменилась", at);
+        deps.store.skipQueuedCommandRun(r.id, PP_REASON.skippedSetting, at);
       }
     }
     return done(summary);
@@ -3977,7 +4203,7 @@ async function runPostPublish(
     deps.log?.warn?.(
       `orchestrator: postPublish settings project: ${message(e)}`,
     );
-    return fail("проект настройки не определён");
+    return fail(t("pp.noProject"));
   }
   const project = resolveProject(cfg, projectId);
   const pp = project.postPublish;
@@ -4056,31 +4282,35 @@ async function runPostPublish(
     if (now - meta.waitSince >= waitMs) {
       const waiting =
         pp.checkout && !postPublishLocks.has(row.id)
-          ? "замка копии"
+          ? PP_REASON.waitLock
           : groupRuns.some((r) => r.status === "queued")
-            ? "очереди команд"
-            : "завершения шагов";
+            ? PP_REASON.waitQueue
+            : PP_REASON.waitFinish;
       // Уже сделанное не теряем: итог копии и завершённые команды идут
       // в строку рядом с «не дождались <чего>» (заход 4, ревью).
       const bits: string[] = [];
       if (pp.checkout) {
-        bits.push(meta.copy ? "копия обновлена" : "копия не обновлена");
+        bits.push(
+          meta.copy ? t("pp.copyUpdated") : t("pp.copyNotUpdated"),
+        );
       }
       for (const c of pp.commands) {
         const r = deps.store.commandRunByKey(`${groupKey}:${c.name}`);
         if (r && r.status !== "queued" && r.status !== "running") {
-          bits.push(commandRunBit(c.name, r));
+          bits.push(commandRunBit(t, c.name, r));
         }
       }
       for (const c of pp.commands) {
         deps.store.markCommandRunSkipped(
           specOf(c, cmdCwd(c)),
-          `не дождались ${waiting}`,
+          PP_REASON.notWaited(waiting),
           now,
         );
       }
       releasePostPublishLock(row.id);
-      return fail([...bits, `не дождались ${waiting}`].join("; "));
+      return fail(
+        [...bits, ppReasonText(t, PP_REASON.notWaited(waiting))].join("; "),
+      );
     }
     saveMeta();
   }
@@ -4170,7 +4400,7 @@ async function runPostPublish(
               (await realpath(coOriginRaw).catch(() => coOriginRaw)) ===
                 (await realpath(repoOriginRaw).catch(() => repoOriginRaw)));
       if (!sameRepo) {
-        copyErr = "другой репозиторий — не обновлена";
+        copyErr = t("pp.otherRepo");
       } else {
         const curBranch = await gitOut([
           "symbolic-ref",
@@ -4179,7 +4409,7 @@ async function runPostPublish(
           "HEAD",
         ]).catch(() => "");
         if (curBranch !== pp.branch) {
-          copyErr = `копия не на ${pp.branch} — не обновлена`;
+          copyErr = t("pp.wrongBranch", { branch: pp.branch });
         } else {
           // §18.5: команды с cwd:checkout держат замок на копию весь
           // postPublish. Владелец — экземпляр плагина (не pid), состояние
@@ -4200,9 +4430,9 @@ async function runPostPublish(
             { timeoutMs: 180_000 },
           );
           if (fetchRes.exitCode !== 0) {
-            copyErr =
-              `fetch не удался: ` +
-              `${maskCommandOutput(fetchRes.stderr || "")}`;
+            copyErr = t("pp.fetchFailed", {
+              err: maskCommandOutput(fetchRes.stderr || ""),
+            });
           } else {
             const ffRes = await deps.cmd.run(
               "git",
@@ -4210,9 +4440,9 @@ async function runPostPublish(
               { timeoutMs: 120_000 },
             );
             if (ffRes.exitCode !== 0) {
-              copyErr =
-                `ff не прошёл ` +
-                `(${maskCommandOutput(ffRes.stderr || ffRes.stdout || "")})`;
+              copyErr = t("pp.ffFailed", {
+                err: maskCommandOutput(ffRes.stderr || ffRes.stdout || ""),
+              });
             } else {
               copyOk = true;
               newHead = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
@@ -4250,7 +4480,7 @@ async function runPostPublish(
   // §18.2: stopOnFail — исход «не ok» обязательной команды пропускает
   // все поздние; «не прошла <имя>» — по имени остановившей. Пропуск по
   // `when` («нет изменений») — не сбой и цепочку не останавливает.
-  const SKIP_WHEN = "нет изменений по when";
+  const SKIP_WHEN = PP_REASON.skipWhen;
   const stopsChain = (status: string, tail: string | null): boolean =>
     status !== "ok" && !(status === "skipped" && tail === SKIP_WHEN);
   let stopper: string | null = null;
@@ -4271,7 +4501,7 @@ async function runPostPublish(
     if (stopper !== null) {
       deps.store.markCommandRunSkipped(
         specOf(c, cmdCwd(c)),
-        `не прошла ${stopper}`,
+        PP_REASON.stoppedBy(stopper),
         now,
       );
       continue;
@@ -4286,13 +4516,13 @@ async function runPostPublish(
     // явный "checkout" или cwd по умолчанию при заданном checkout
     // (иначе команда выполнилась бы в необновлённой/чужой копии).
     if (c.cwd === "checkout" && !co) {
-      reason = "нет checkout";
+      reason = PP_REASON.noCheckout;
     } else if (
       co &&
       !copyOk &&
       (c.cwd === "checkout" || c.cwd === undefined)
     ) {
-      reason = "копия не обновлена";
+      reason = PP_REASON.copyNotUpdated;
     }
     if (
       !reason &&
@@ -4326,11 +4556,13 @@ async function runPostPublish(
   }
   const bits: string[] = [];
   if (co) {
-    bits.push(copyOk ? "копия обновлена" : (copyErr ?? "копия не обновлена"));
+    bits.push(
+      copyOk ? t("pp.copyUpdated") : (copyErr ?? t("pp.copyNotUpdated")),
+    );
   }
   for (const [c, r] of rowsByCmd) {
     if (!r) continue;
-    bits.push(commandRunBit(c.name, r));
+    bits.push(commandRunBit(t, c.name, r));
   }
 
   // ── перезагрузка плагинов (r11: любая раскладка, по реестру) ──
@@ -4339,7 +4571,7 @@ async function runPostPublish(
     // Перезагрузка — под тем же замком копии, что и ff (§18.5).
     if (!(await ensureCopyLock())) return pending;
     if (!pp.reloadPlugins) {
-      bits.push("перезагрузка плагинов выключена");
+      bits.push(t("pp.reloadDisabled"));
     } else {
       const installsDepsOk = rowsByCmd.some(
         ([c, r]) => c.installsDeps && r?.status === "ok",
@@ -4419,27 +4651,26 @@ async function runPostPublish(
           );
         if (depsTouched && !installsDepsOk) {
           skipped.push(
-            `${id}: изменены зависимости — переустанови их и ` +
-              `перезагрузи вручную`,
+            t("pp.depsChanged", { id }),
           );
           continue;
         }
         const pids = await providerIdsOf(id);
         if (pids == null) {
           skipped.push(
-            `${id}: реестр провайдеров не прочитан — перезагрузи вручную`,
+            t("pp.registryUnread", { id }),
           );
           continue;
         }
         if (pids.size > 0 && running.some((d) => pids.has(d.provider))) {
-          skipped.push(`${id}: идут ходы — перезагрузи позже`);
+          skipped.push(t("pp.turnsRunning", { id }));
           continue;
         }
         if (id === "orchestrator") {
           // §6 r11: самоперезагрузка — когда в журнале нет running.
           if (deps.store.runningCommandRuns().length > 0) {
             skipped.push(
-              "orchestrator: идут команды — перезагрузи позже",
+              t("pp.cmdsRunning"),
             );
             continue;
           }
@@ -4449,20 +4680,26 @@ async function runPostPublish(
         const r = await deps.bbCli.run(["plugin", "reload", id]);
         if (r.exitCode !== 0) {
           skipped.push(
-            `${id}: перезагрузка не удалась: ` +
-              `${(r.stderr || r.stdout || "").trim().slice(0, 120)}`,
+            t("pp.reloadFailed", {
+              id,
+              err: (r.stderr || r.stdout || "").trim().slice(0, 120),
+            }),
           );
         } else {
           reloaded.push(id);
         }
       }
-      if (reloaded.length) bits.push(`перезагружено: ${reloaded.join(", ")}`);
-      if (skipped.length) bits.push(`пропущено: ${skipped.join(", ")}`);
+      if (reloaded.length) {
+        bits.push(t("pp.reloaded", { list: reloaded.join(", ") }));
+      }
+      if (skipped.length) {
+        bits.push(t("pp.skipped", { list: skipped.join(", ") }));
+      }
       if (selfReload) {
-        bits.push("orchestrator перезагружается автоматизацией");
+        bits.push(t("pp.selfReloading"));
       }
       if (!reloaded.length && !skipped.length && !selfReload) {
-        bits.push("плагины не менялись");
+        bits.push(t("pp.noChanges"));
       }
     }
   }
@@ -4489,6 +4726,7 @@ async function createSelfReloadAutomation(
   line: string,
   selfReload: { rootDir: string; expectedSha: string },
 ): Promise<string | null> {
+  const t = deps.t ?? T_RU;
   // §6 r11: значения в скрипт — base64, не интерполяцией в shell.
   const b64 = (v: string) => Buffer.from(v, "utf8").toString("base64");
   const dec = (v: string) => `$(printf %s '${b64(v)}' | base64 -d)`;
@@ -4506,12 +4744,12 @@ async function createSelfReloadAutomation(
     "  i=$((i+1))",
     '  cur=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "?")',
     '  if bb orchestrator status >/dev/null 2>&1 && [ "$cur" = "$EXPECTED" ]; then',
-    '    bb thread tell "$COORD" --mode queue "$TEXT; перезагружено: orchestrator" >/dev/null 2>&1 || true',
+    `    bb thread tell "$COORD" --mode queue "$TEXT${t("rel.selfReloadOk")}" >/dev/null 2>&1 || true`,
     "    exit 0",
     "  fi",
     "done",
     'last=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "?")',
-    'bb thread tell "$COORD" --mode queue "$TEXT; orchestrator после перезагрузки не поднялся / копия на $last, ожидался $EXPECTED" >/dev/null 2>&1 || true',
+    `bb thread tell "$COORD" --mode queue "$TEXT${t("rel.selfReloadFail")}" >/dev/null 2>&1 || true`,
   ].join("\n");
   // §6 r10: автоматизация — в проекте КООРДИНАТОРА
   // (`--project <проект координатора>`), не делегирования.
@@ -4567,6 +4805,7 @@ async function postCheck(
   pushedBranch: string,
   prUrl: string | null,
 ): Promise<string[]> {
+  const t = deps.t ?? T_RU;
   row = deps.store.getRelease(row.id) ?? row;
   const repo = row.repo_path;
   const messages: string[] = [];
@@ -4575,7 +4814,7 @@ async function postCheck(
   } catch (e) {
     // §2 r10 п.1: the post-check failure is reported inside the same
     // outcome line, not as a message of its own.
-    messages.push(`fetch не удался — ${message(e)}`);
+    messages.push(t("rel.fetchFailed", { error: message(e) }));
     return messages;
   }
 
@@ -4600,8 +4839,10 @@ async function postCheck(
         .filter((sha) => sha !== pushedSha && !deps.store.shaWasReleased(sha));
       if (unknown.length) {
         messages.push(
-          `в ${row.target_branch} легли коммиты вне release: ` +
-            unknown.slice(0, 5).map((s) => s.slice(0, 8)).join(", "),
+          t("rel.landedOutside", {
+            branch: row.target_branch,
+            list: unknown.slice(0, 5).map((x) => x.slice(0, 8)).join(", "),
+          }),
         );
       }
     }
@@ -4616,8 +4857,11 @@ async function postCheck(
     ]).then(() => true).catch(() => false);
     if (!landed) {
       messages.push(
-        `выложенный ${pushedSha.slice(0, 8)} не предок ${target} ` +
-          `(remote head ${remoteHead.slice(0, 8)})`,
+        t("rel.notAncestor", {
+          sha8: pushedSha.slice(0, 8),
+          target,
+          head: remoteHead.slice(0, 8),
+        }),
       );
     }
   } else {
@@ -4627,13 +4871,19 @@ async function postCheck(
     );
     if (remoteSha !== pushedSha) {
       messages.push(
-        `удалённая ветка ${remote} указывает на ${remoteSha.slice(0, 8)}, ` +
-          `выкладывали ${pushedSha.slice(0, 8)}`,
+        t("rel.remoteMismatch", {
+          remote,
+          sha8: remoteSha.slice(0, 8),
+          sha82: pushedSha.slice(0, 8),
+        }),
       );
     }
     if (!prUrl) {
       messages.push(
-        `PR ветки ${pushedBranch} → ${row.target_branch} не найден`,
+        t("rel.prNotFound", {
+          branch: pushedBranch,
+          target: row.target_branch,
+        }),
       );
     }
   }
@@ -4646,11 +4896,10 @@ async function postCheck(
   // silence — the first release onto a new branch has no remote base.
   if (!scanBase) {
     messages.push(
-      "скан пропущен, нет базы удалённого диапазона " +
-        "(первая выкладка в новую ветку)",
+      t("rel.rescanNoBase"),
     );
   } else if (scanBase === pushedSha) {
-    messages.push("скан пропущен, удалённый диапазон пуст");
+    messages.push(t("rel.rescanEmpty"));
   } else {
     try {
       const commits = await commitRange(
@@ -4732,16 +4981,21 @@ async function postCheck(
         threadIds: proj.threadIds,
         allowedTrailers: proj.allowedTrailers,
         allowedEmails: proj.allowedEmails,
+        t,
       });
       const blockers = findings.filter((f) => f.severity === "block");
       if (blockers.length) {
         messages.push(
-          `повторный скан удалённого диапазона нашёл находки:\n` +
-            blockers.slice(0, 10).map((f) => `- ${formatFinding(f)}`).join("\n"),
+          t("rel.rescanFound", {
+            list: blockers
+              .slice(0, 10)
+              .map((f) => `- ${formatFinding(f, t)}`)
+              .join("\n"),
+          }),
         );
       }
     } catch (e) {
-      messages.push(`повторный скан не удался: ${message(e)}`);
+      messages.push(t("rel.rescanFailed", { error: message(e) }));
     }
   }
 

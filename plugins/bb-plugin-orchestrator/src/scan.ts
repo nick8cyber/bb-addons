@@ -19,6 +19,8 @@
  * would itself leak (§3). Descriptions name the rule and the masked hit.
  */
 import { OrchestratorError } from "./errors.js";
+import { RU } from "./i18n/ru.js";
+import { T_RU, type T } from "./i18n/index.js";
 import type { CmdRunner } from "./cmd.js";
 import type { ResolvedProject } from "./release-config.js";
 
@@ -346,6 +348,7 @@ function scanAddedLines(
   hostname: string | undefined,
   threadIds = true,
   allowedEmails: readonly string[] = [],
+  t: T = T_RU,
 ): ScanFinding[] {
   const findings: ScanFinding[] = [];
   const hostRule: MachineRule | undefined =
@@ -366,7 +369,7 @@ function scanAddedLines(
         file,
         line,
         rule: "secret-file",
-        problem: "добавлен файл секрета (.env, ключ, id_*)",
+        problem: t("scan.secretFile"),
         severity: "block",
       });
     }
@@ -376,7 +379,10 @@ function scanAddedLines(
         file,
         line,
         rule,
-        problem: `возможный секрет (${rule}): ${maskSecrets(text.slice(0, 120))}`,
+        problem: t("scan.possibleSecret", {
+          rule,
+          text: maskSecrets(text.slice(0, 120)),
+        }),
         severity: "block",
       });
     }
@@ -386,7 +392,7 @@ function scanAddedLines(
         file,
         line,
         rule: "personal-email",
-        problem: "личная почта в тексте",
+        problem: t("scan.personalEmail"),
         severity: "block",
       });
     }
@@ -397,7 +403,10 @@ function scanAddedLines(
         file,
         line,
         rule,
-        problem: `привязка к машине (${rule}): ${maskSecrets(text.slice(0, 120))}`,
+        problem: t("scan.machine", {
+          rule,
+          text: maskSecrets(text.slice(0, 120)),
+        }),
         severity: leaks.machine,
       });
     }
@@ -412,7 +421,7 @@ function scanAddedLines(
         file,
         line,
         rule,
-        problem: `идентификатор bb (${rule})`,
+        problem: t("scan.bbId", { rule }),
         severity: leaks.bbIds,
       });
     }
@@ -428,6 +437,7 @@ function scanCommitMeta(
   threadIds = true,
   allowedTrailers: readonly string[] = [],
   allowedEmails: readonly string[] = [],
+  t: T = T_RU,
 ): ScanFinding[] {
   const findings: ScanFinding[] = [];
   const short = (sha: string) => sha.slice(0, 8);
@@ -446,16 +456,23 @@ function scanCommitMeta(
         file: null,
         line: null,
         rule: "commit-identity",
-        problem:
-          `коммит ${short(c.sha)}: подпись ` +
-          `${c.authorName} <${c.authorEmail}> / ${c.committerName} <${c.committerEmail}>` +
-          (identity.state === "resolved"
-            ? ` не совпадает с разрешённой ${identity.name} <${identity.email}>`
-            : identity.state === "repo-unset"
-              ? " — в конфиге репозитория не задан user.name/user.email"
-              : identity.state === "invalid"
-                ? " — commitIdentity не удалось разобрать"
-                : " — commitIdentity не задан в настройке release"),
+        problem: t("scan.commitSig", {
+          sha: short(c.sha),
+          sig:
+            `${c.authorName} <${c.authorEmail}> / ` +
+            `${c.committerName} <${c.committerEmail}>`,
+          why:
+            identity.state === "resolved"
+              ? t("scan.sigMismatch", {
+                  name: identity.name,
+                  email: identity.email,
+                })
+              : identity.state === "repo-unset"
+                ? t("scan.sigRepoUnset")
+                : identity.state === "invalid"
+                  ? t("scan.sigInvalid")
+                  : t("scan.sigUnset"),
+        }),
         // §4 r11/§18.6: only a MISSING commitIdentity warns — the
         // pipeline goes on and `status` reports the absent
         // configuration. An identity that is configured but
@@ -470,7 +487,10 @@ function scanCommitMeta(
         file: null,
         line: null,
         rule: "foreign-bot-trailer",
-        problem: `коммит ${short(c.sha)}: трейлер чужого бота (${trailers.join(", ")})`,
+        problem: t("scan.botTrailer", {
+          sha: short(c.sha),
+          trailers: trailers.join(", "),
+        }),
         // §18.6: `leaks.trailers` ("warn" by default, "block" on the
         // author's install) — allowedTrailers still exempts.
         severity: leaks.trailers,
@@ -485,7 +505,10 @@ function scanCommitMeta(
         file: null,
         line: null,
         rule,
-        problem: `коммит ${short(c.sha)}: привязка к машине в сообщении (${rule})`,
+        problem: t("scan.commitMachine", {
+          sha: short(c.sha),
+          rule,
+        }),
         severity: leaks.machine,
       });
     }
@@ -495,7 +518,7 @@ function scanCommitMeta(
         file: null,
         line: null,
         rule: "hostname",
-        problem: `коммит ${short(c.sha)}: имя хоста в сообщении`,
+        problem: t("scan.commitHost", { sha: short(c.sha) }),
         severity: leaks.machine,
       });
     }
@@ -509,7 +532,10 @@ function scanCommitMeta(
         file: null,
         line: null,
         rule,
-        problem: `коммит ${short(c.sha)}: идентификатор bb в сообщении (${rule})`,
+        problem: t("scan.commitBbId", {
+          sha: short(c.sha),
+          rule,
+        }),
         severity: leaks.bbIds,
       });
     }
@@ -519,7 +545,7 @@ function scanCommitMeta(
         file: null,
         line: null,
         rule: "personal-email",
-        problem: `коммит ${short(c.sha)}: личная почта в сообщении`,
+        problem: t("scan.commitEmail", { sha: short(c.sha) }),
         severity: "block",
       });
     }
@@ -630,6 +656,7 @@ export async function runGitleaks(
   repoPath: string,
   baseSha: string,
   headSha: string,
+  t: T = T_RU,
 ): Promise<ScanFinding[]> {
   const res = await cmd.run(
     "gitleaks",
@@ -652,14 +679,18 @@ export async function runGitleaks(
   if (res.exitCode === 127) {
     throw new OrchestratorError(
       "gitleaks-missing",
-      "gitleaks не установлен — машинный скан категории 1 невозможен",
-      "установите gitleaks (https://github.com/gitleaks/gitleaks) и повторите release",
+      t("scan.gitleaksMissing"),
+      t("scan.gitleaksMissingHint"),
     );
   }
   if (res.exitCode !== 0 && res.exitCode !== 7) {
     throw new OrchestratorError(
       "scan-failed",
-      `gitleaks завершился с ошибкой (exit ${res.exitCode}): ${res.stderr.trim().slice(0, 300) || res.stdout.trim().slice(0, 300)}`,
+      t("scan.gitleaksExit", {
+        code: res.exitCode,
+        out:
+          res.stderr.trim().slice(0, 300) || res.stdout.trim().slice(0, 300),
+      }),
     );
   }
   const text = res.stdout.trim();
@@ -671,7 +702,7 @@ export async function runGitleaks(
   } catch {
     throw new OrchestratorError(
       "scan-failed",
-      `gitleaks вернул нечитаемый отчёт: ${text.slice(0, 200)}`,
+      t("scan.gitleaksReport", { text: text.slice(0, 200) }),
     );
   }
   return rows.map((r) => ({
@@ -679,7 +710,7 @@ export async function runGitleaks(
     file: typeof r.File === "string" ? r.File : null,
     line: Number.isFinite(Number(r.StartLine)) ? Number(r.StartLine) : null,
     rule: `gitleaks:${r.RuleID ?? "unknown"}`,
-    problem: `секрет (${r.RuleID ?? "unknown"})`,
+    problem: t("scan.secretRule", { rule: r.RuleID ?? "unknown" }),
     severity: "block",
   }));
 }
@@ -708,11 +739,20 @@ export async function machineScan(
     allowedTrailers?: readonly string[];
     /** §17.3 (С6): emails/domains that are not a leak. */
     allowedEmails?: readonly string[];
+    /** §18.1: finding texts — the language catalog. */
+    t?: T;
   },
 ): Promise<ScanFinding[]> {
+  const t = input.t ?? T_RU;
   const findings: ScanFinding[] = [];
   findings.push(
-    ...(await runGitleaks(cmd, input.repoPath, input.baseSha, input.headSha)),
+    ...(await runGitleaks(
+      cmd,
+      input.repoPath,
+      input.baseSha,
+      input.headSha,
+      t,
+    )),
   );
   findings.push(
     ...scanCommitMeta(
@@ -723,6 +763,7 @@ export async function machineScan(
       input.threadIds ?? true,
       input.allowedTrailers ?? [],
       input.allowedEmails ?? [],
+      t,
     ),
   );
   // Range-diff lines ∪ per-commit patch lines, deduped — the same added
@@ -741,22 +782,34 @@ export async function machineScan(
       input.hostname,
       input.threadIds ?? true,
       input.allowedEmails ?? [],
+      t,
     ),
   );
   return findings;
 }
 
 /** The §2 refusal text: «файл:строка → категория». */
+/** Compat export — the `ru` category names; language-aware callers use
+ * `categoryNames(t)`. */
 export const CATEGORY_NAMES: Record<LeakCategory, string> = {
-  1: "секреты",
-  2: "личность автора",
-  3: "привязка к машине",
-  4: "идентификаторы bb",
+  1: RU["scan.cat1"]!,
+  2: RU["scan.cat2"]!,
+  3: RU["scan.cat3"]!,
+  4: RU["scan.cat4"]!,
 };
 
-export function formatFinding(f: ScanFinding): string {
+export function categoryNames(t: T): Record<LeakCategory, string> {
+  return {
+    1: t("scan.cat1"),
+    2: t("scan.cat2"),
+    3: t("scan.cat3"),
+    4: t("scan.cat4"),
+  };
+}
+
+export function formatFinding(f: ScanFinding, t: T = T_RU): string {
   const where = f.file
     ? `${f.file}${f.line != null ? `:${f.line}` : ""}`
-    : "коммиты";
-  return `${where} → ${CATEGORY_NAMES[f.category]} (${f.rule}): ${f.problem}`;
+    : t("scan.commitsWord");
+  return `${where} → ${categoryNames(t)[f.category]} (${f.rule}): ${f.problem}`;
 }

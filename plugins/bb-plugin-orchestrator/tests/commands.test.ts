@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Database from "better-sqlite3";
+import { RU } from "../src/i18n/ru.js";
 import {
   DelegationStore,
   MIGRATIONS,
@@ -528,9 +529,20 @@ test("§6 r11: postPublish — парсинг r11, warnings on/cwd/дубль", 
     }),
   );
   assert.equal(load.errors.length, 0);
-  assert.ok(load.warnings.some((w) => /reads as "published"/.test(w.message)));
-  assert.ok(load.warnings.some((w) => /duplicate/.test(w.message)));
-  assert.ok(load.warnings.some((w) => /missing checkout/.test(w.message)));
+  assert.ok(
+    load.warnings.some((w) => w.message === RU["rc.mergedOnPush"]),
+  );
+  assert.ok(
+    load.warnings.some(
+      (w) => w.message === RU["rc.dupCommand"]!.replace("{name}", "a"),
+    ),
+  );
+  assert.ok(
+    load.warnings.some(
+      (w) =>
+        w.message === RU["rc.missingCheckout"]!.replace("{name}", "b"),
+    ),
+  );
   const p = resolveProject(load.config!, "x");
   // on: merged при push → published; дубль отброшен; command → sh -c
   assert.equal(p.postPublish!.on, "published");
@@ -552,7 +564,9 @@ test("§6 r11: postPublish — парсинг r11, warnings on/cwd/дубль", 
       },
     }),
   );
-  assert.ok(w.warnings.some((x) => /never fires/.test(x.message)));
+  assert.ok(
+    w.warnings.some((x) => x.message === RU["rc.mergedNever"]),
+  );
   assert.equal(
     resolveProject(w.config!, "p").postPublish!.on,
     "merged",

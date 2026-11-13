@@ -8,6 +8,8 @@
  * level whose whole chain is unavailable refuses delegation at call time.
  */
 import { OrchestratorError } from "./errors.js";
+import { RU } from "./i18n/ru.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 export interface PolicyRoute {
   preset: string;
@@ -84,8 +86,9 @@ export interface PolicyLoad {
   unavailableRoutes: string[];
 }
 
-export const EMPTY_POLICY_MESSAGE =
-  "политика не задана — настройте через навык `orchestrator-setup`";
+/** Compat export — the `ru` catalog value; language-aware callers use
+ * `t("pol.empty")`. */
+export const EMPTY_POLICY_MESSAGE = RU["pol.empty"]!;
 
 const isRecord = (x: unknown): x is Record<string, unknown> =>
   typeof x === "object" && x !== null && !Array.isArray(x);
@@ -106,6 +109,8 @@ export function parsePolicy(
   knownPresets?: ReadonlySet<string>,
   /** §16.8: preset name/id → facts; used for the executor-worktree warning. */
   presetDetails?: ReadonlyMap<string, { environmentKind?: string | null }>,
+  /** §18.1 (PLUG-247a): parse messages come from the language catalog. */
+  t: T = T_RU,
 ): PolicyLoad {
   const errors: PolicyIssue[] = [];
   const warnings: PolicyIssue[] = [];
@@ -121,7 +126,7 @@ export function parsePolicy(
   });
 
   if (!text || text.trim() === "") {
-    err("policy", EMPTY_POLICY_MESSAGE);
+    err("policy", t("pol.empty"));
     return done();
   }
 
@@ -129,19 +134,19 @@ export function parsePolicy(
   try {
     raw = JSON.parse(text);
   } catch (e) {
-    err("$", `невалидный JSON: ${(e as Error).message}`);
+    err("$", t("pol.badJson", { error: (e as Error).message }));
     return done();
   }
   if (!isRecord(raw)) {
-    err("$", "политика должна быть JSON-объектом");
+    err("$", t("pol.notObject"));
     return done();
   }
 
   // Rule 1.
-  if (raw.version !== 1) err("version", "version must be 1");
+  if (raw.version !== 1) err("version", t("pol.version"));
 
   const routesRaw = isRecord(raw.routes) ? raw.routes : undefined;
-  if (!routesRaw) err("routes", "required object of route definitions");
+  if (!routesRaw) err("routes", t("pol.routesReq"));
 
   // Routes.
   const routes: Record<string, PolicyRoute> = {};
@@ -149,17 +154,17 @@ export function parsePolicy(
     for (const [name, value] of Object.entries(routesRaw)) {
       const path = `routes.${name}`;
       if (!isRecord(value)) {
-        err(path, "route must be an object");
+        err(path, t("pol.routeObject"));
         continue;
       }
       if (!isNonEmptyString(value.preset)) {
-        err(`${path}.preset`, "required non-empty preset name");
+        err(`${path}.preset`, t("pol.presetReq"));
       }
       if (!isNonEmptyString(value.provider)) {
-        err(`${path}.provider`, "required non-empty provider id");
+        err(`${path}.provider`, t("pol.providerReq"));
       }
       if (value.quotaGroup !== undefined && !isNonEmptyString(value.quotaGroup)) {
-        err(`${path}.quotaGroup`, "must be a non-empty string");
+        err(`${path}.quotaGroup`, t("pol.nonEmptyString"));
       }
       // Rules 5 + 6: quota and removed-model pattern lists share the shape.
       const patternsOf = (
@@ -168,13 +173,13 @@ export function parsePolicy(
         const raw = value[key];
         if (raw === undefined) return undefined;
         if (!Array.isArray(raw)) {
-          err(`${path}.${key}`, "must be an array of non-empty strings");
+          err(`${path}.${key}`, t("pol.stringArray"));
           return undefined;
         }
-        if (raw.length > 20) err(`${path}.${key}`, "at most 20 patterns");
+        if (raw.length > 20) err(`${path}.${key}`, t("pol.maxPatterns"));
         const bad = raw.findIndex((p) => !isNonEmptyString(p));
         if (bad >= 0) {
-          err(`${path}.${key}[${bad}]`, "must be a non-empty string");
+          err(`${path}.${key}[${bad}]`, t("pol.nonEmptyString"));
           return undefined;
         }
         return raw.map((p) => (p as string).trim());
@@ -186,7 +191,7 @@ export function parsePolicy(
       if (value.firstResponseSeconds !== undefined) {
         const v = value.firstResponseSeconds;
         if (typeof v !== "number" || v < 30 || v > 600) {
-          err(`${path}.firstResponseSeconds`, "must be a number in 30–600");
+          err(`${path}.firstResponseSeconds`, t("pol.seconds30600"));
         } else {
           routeFirst = v;
         }
@@ -197,7 +202,7 @@ export function parsePolicy(
       if (value.startSeconds !== undefined) {
         const v = value.startSeconds;
         if (typeof v !== "number" || v < 30) {
-          err(`${path}.startSeconds`, "must be a number ≥ 30");
+          err(`${path}.startSeconds`, t("pol.numGe30"));
         } else {
           routeStart = v;
         }
@@ -206,7 +211,7 @@ export function parsePolicy(
       if (value.idleSeconds !== undefined) {
         const v = value.idleSeconds;
         if (typeof v !== "number" || v < 60) {
-          err(`${path}.idleSeconds`, "must be a number ≥ 60");
+          err(`${path}.idleSeconds`, t("pol.numGe60"));
         } else {
           routeIdle = v;
         }
@@ -233,19 +238,19 @@ export function parsePolicy(
   // Levels + rule 2 (chain references).
   const levels: Record<string, PolicyLevel> = {};
   if (!isRecord(raw.levels)) {
-    err("levels", "required object of level definitions");
+    err("levels", t("pol.levelsReq"));
   } else {
     for (const [name, value] of Object.entries(raw.levels)) {
       const path = `levels.${name}`;
       if (!isRecord(value)) {
-        err(path, "level must be an object");
+        err(path, t("pol.levelObject"));
         continue;
       }
       if (value.description !== undefined && typeof value.description !== "string") {
-        err(`${path}.description`, "must be a string");
+        err(`${path}.description`, t("pol.isString"));
       }
       if (value.autoFallback !== undefined && typeof value.autoFallback !== "boolean") {
-        err(`${path}.autoFallback`, "must be a boolean");
+        err(`${path}.autoFallback`, t("pol.isBool"));
       }
       // §2.3: the level's role — `auditor` (review) or `executor`.
       if (
@@ -253,23 +258,21 @@ export function parsePolicy(
         value.role !== "auditor" &&
         value.role !== "executor"
       ) {
-        err(`${path}.role`, `must be "auditor" or "executor"`);
+        err(`${path}.role`, t("pol.roleEnum"));
       }
       let chain: string[] = [];
       if (!Array.isArray(value.chain) || value.chain.length === 0) {
-        err(`${path}.chain`, "required non-empty array of route names");
+        err(`${path}.chain`, t("pol.chainReq"));
       } else {
         const bad = value.chain.findIndex((r) => !isNonEmptyString(r));
         if (bad >= 0) {
-          err(`${path}.chain[${bad}]`, "route name must be a non-empty string");
+          err(`${path}.chain[${bad}]`, t("pol.routeNameStr"));
         } else {
           chain = value.chain.map((r) => (r as string).trim());
           chain.forEach((routeName, i) => {
             if (!routesRaw || !(routeName in routesRaw)) {
               err(
-                `${path}.chain[${i}]`,
-                `route "${routeName}" is not declared in routes`,
-              );
+                `${path}.chain[${i}]`, t("pol.routeUndeclared", { route: routeName }));
             }
           });
         }
@@ -294,7 +297,7 @@ export function parsePolicy(
   let reviewByLevel: Record<string, string> | undefined;
   if (raw.reviewByLevel !== undefined) {
     if (!isRecord(raw.reviewByLevel)) {
-      err("reviewByLevel", "must be an object of level → review level");
+      err("reviewByLevel", t("pol.reviewByLevelObject"));
     } else {
       reviewByLevel = {};
       for (const [execLevel, reviewLevel] of Object.entries(
@@ -308,37 +311,29 @@ export function parsePolicy(
           : undefined;
         if (!source) {
           err(
-            `reviewByLevel.${execLevel}`,
-            `level "${execLevel}" is not declared in levels`,
-          );
+            `reviewByLevel.${execLevel}`, t("pol.levelUndeclared", { level: execLevel }));
           continue;
         }
         if (sourceRole !== "executor") {
           err(
-            `reviewByLevel.${execLevel}`,
-            `level "${execLevel}" does not have role "executor"`,
-          );
+            `reviewByLevel.${execLevel}`, t("pol.levelNotExecutor", { level: execLevel }));
           continue;
         }
         if (!isNonEmptyString(reviewLevel)) {
-          err(`reviewByLevel.${execLevel}`, "must be a level name");
+          err(`reviewByLevel.${execLevel}`, t("pol.levelName"));
           continue;
         }
         const target = levels[reviewLevel];
         if (!target) {
           err(
-            `reviewByLevel.${execLevel}`,
-            `level "${reviewLevel}" is not declared in levels`,
-          );
+            `reviewByLevel.${execLevel}`, t("pol.levelUndeclared", { level: reviewLevel }));
           continue;
         }
         const targetRole =
           target.role ?? (reviewLevel === "review" ? "auditor" : "executor");
         if (targetRole !== "auditor") {
           err(
-            `reviewByLevel.${execLevel}`,
-            `level "${reviewLevel}" does not have role "auditor"`,
-          );
+            `reviewByLevel.${execLevel}`, t("pol.levelNotAuditor", { level: reviewLevel }));
           continue;
         }
         reviewByLevel[execLevel] = reviewLevel;
@@ -350,13 +345,13 @@ export function parsePolicy(
   let limits: PolicyLimits | undefined;
   if (raw.limits !== undefined) {
     if (!isRecord(raw.limits)) {
-      err("limits", "must be an object");
+      err("limits", t("pol.isObject"));
     } else {
       const l = raw.limits;
       let maxActive: number | undefined;
       if (l.maxActive !== undefined) {
         if (!isPositiveInt(l.maxActive)) {
-          err("limits.maxActive", "must be an integer ≥ 1");
+          err("limits.maxActive", t("pol.intGe1"));
         } else {
           maxActive = l.maxActive;
         }
@@ -364,19 +359,17 @@ export function parsePolicy(
       let perLevel: Record<string, number> | undefined;
       if (l.perLevel !== undefined) {
         if (!isRecord(l.perLevel)) {
-          err("limits.perLevel", "must be an object of level → cap");
+          err("limits.perLevel", t("pol.perLevelObject"));
         } else {
           perLevel = {};
           for (const [levelName, cap] of Object.entries(l.perLevel)) {
             if (!isPositiveInt(cap)) {
-              err(`limits.perLevel.${levelName}`, "must be an integer ≥ 1");
+              err(`limits.perLevel.${levelName}`, t("pol.intGe1"));
               continue;
             }
             if (maxActive !== undefined && cap > maxActive) {
               err(
-                `limits.perLevel.${levelName}`,
-                `must be ≤ limits.maxActive (${maxActive})`,
-              );
+                `limits.perLevel.${levelName}`, t("pol.capOverMax", { max: maxActive }));
               continue;
             }
             perLevel[levelName] = cap;
@@ -392,7 +385,7 @@ export function parsePolicy(
   if (raw.firstResponseSeconds !== undefined) {
     const v = raw.firstResponseSeconds;
     if (typeof v !== "number" || v < 30 || v > 600) {
-      err("firstResponseSeconds", "must be a number in 30–600");
+      err("firstResponseSeconds", t("pol.seconds30600"));
     } else {
       firstResponseSeconds = v;
     }
@@ -403,9 +396,7 @@ export function parsePolicy(
   if (raw.firstResponseSecondsByProvider !== undefined) {
     if (!isRecord(raw.firstResponseSecondsByProvider)) {
       err(
-        "firstResponseSecondsByProvider",
-        "must be an object of provider id → seconds",
-      );
+        "firstResponseSecondsByProvider", t("pol.byProviderObject"));
     } else {
       firstResponseSecondsByProvider = {};
       for (const [providerId, v] of Object.entries(
@@ -413,9 +404,7 @@ export function parsePolicy(
       )) {
         if (typeof v !== "number" || v < 30 || v > 600) {
           err(
-            `firstResponseSecondsByProvider.${providerId}`,
-            "must be a number in 30–600",
-          );
+            `firstResponseSecondsByProvider.${providerId}`, t("pol.seconds30600"));
           continue;
         }
         firstResponseSecondsByProvider[providerId] = v;
@@ -426,7 +415,7 @@ export function parsePolicy(
   const timing: PolicyTiming = {};
   if (raw.timing !== undefined) {
     if (!isRecord(raw.timing)) {
-      warn("timing", "must be an object of timeout values — ignored");
+      warn("timing", t("pol.timingObjectIgnored"));
     } else {
       const bounds: Record<keyof PolicyTiming, [number, number]> = {
         quotaHoldMinutes: [1, 1440],
@@ -441,7 +430,7 @@ export function parsePolicy(
         const v = raw.timing[key];
         if (v === undefined) continue;
         if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
-          warn(`timing.${key}`, `out of bounds ${min}..${max} — using default`);
+          warn(`timing.${key}`, t("pol.outOfBoundsDefault", { min: min, max: max }));
         } else {
           timing[key] = v;
         }
@@ -453,7 +442,7 @@ export function parsePolicy(
   if (raw.maxRunSeconds !== undefined) {
     const v = raw.maxRunSeconds;
     if (typeof v !== "number" || v < 300) {
-      err("maxRunSeconds", "must be a number ≥ 300");
+      err("maxRunSeconds", t("pol.numGe300"));
     } else {
       maxRunSeconds = v;
     }
@@ -463,7 +452,7 @@ export function parsePolicy(
   if (routesRaw && knownPresets) {
     for (const [name, route] of Object.entries(routes)) {
       if (!knownPresets.has(route.preset)) {
-        warn(`routes.${name}.preset`, `preset "${route.preset}" not found in bb tasks preset list`);
+        warn(`routes.${name}.preset`, t("pol.presetNotFound", { preset: route.preset }));
         unavailableRoutes.push(name);
       }
     }
@@ -481,11 +470,7 @@ export function parsePolicy(
         const detail = presetDetails.get(route.preset);
         if (detail && detail.environmentKind !== "new-worktree") {
           warn(
-            `routes.${routeName}.preset`,
-            `preset "${route.preset}" does not create a worktree ` +
-              `(environmentKind=${detail.environmentKind ?? "—"}); ` +
-              `уровню "${levelName}" исполнителю нужна своя копия`,
-          );
+            `routes.${routeName}.preset`, t("pol.presetNoWorktree", { preset: route.preset, kind: detail.environmentKind ?? "—", level: levelName }));
         }
       }
     }

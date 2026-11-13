@@ -7,6 +7,7 @@
  * запуска этого хука.
  */
 import type { PolicyIssue } from "./policy.js";
+import { T_RU, type T } from "./i18n/index.js";
 import type {
   CommandRunRow,
   CommandRunStatus,
@@ -57,7 +58,10 @@ const isStrArr = (v: unknown): v is string[] =>
  * запускаются вовсе (см. effectiveHooks): иначе дубль имени давал бы
  * запуск записи, которой нет в снимке доверия.
  */
-export function parseEventHooks(raw: string | undefined): EventHooksLoad {
+export function parseEventHooks(
+  raw: string | undefined,
+  t: T = T_RU,
+): EventHooksLoad {
   const errors: PolicyIssue[] = [];
   const hooks: EventHookSetting[] = [];
   if (raw === undefined || raw.trim() === "") return { hooks, errors };
@@ -67,51 +71,51 @@ export function parseEventHooks(raw: string | undefined): EventHooksLoad {
   } catch (e) {
     errors.push({
       path: "eventHooks",
-      message: `не JSON: ${(e as Error).message}`,
+      message: t("ev.notJson", { error: (e as Error).message }),
     });
     return { hooks, errors };
   }
   if (!Array.isArray(doc)) {
-    errors.push({ path: "eventHooks", message: "ожидается массив хуков" });
+    errors.push({ path: "eventHooks", message: t("ev.expectArray") });
     return { hooks, errors };
   }
   doc.forEach((item, i) => {
     const path = `eventHooks[${i}]`;
     if (!item || typeof item !== "object" || Array.isArray(item)) {
-      errors.push({ path, message: "хук — объект" });
+      errors.push({ path, message: t("ev.hookObject") });
       return;
     }
     const h = item as Record<string, unknown>;
     if (typeof h.name !== "string" || h.name.trim() === "") {
-      errors.push({ path: `${path}.name`, message: "имя хука — строка" });
+      errors.push({ path: `${path}.name`, message: t("ev.nameString") });
       return;
     }
     const name = h.name.trim();
     if (hooks.some((x) => x.name === name)) {
       errors.push({
         path: `${path}.name`,
-        message: "имя хука должно быть уникальным",
+        message: t("ev.nameUnique"),
       });
       return;
     }
     if (!isStrArr(h.on)) {
       errors.push({
         path: `${path}.on`,
-        message: "on — непустой массив имён событий",
+        message: t("ev.onArray"),
       });
       return;
     }
     if (!isStrArr(h.run)) {
       errors.push({
         path: `${path}.run`,
-        message: "run — непустой массив argv (без shell)",
+        message: t("ev.runArray"),
       });
       return;
     }
     if (h.projects !== undefined && !isStrArr(h.projects)) {
       errors.push({
         path: `${path}.projects`,
-        message: "projects — массив id проектов",
+        message: t("ev.projectsArray"),
       });
       return;
     }
@@ -123,14 +127,14 @@ export function parseEventHooks(raw: string | undefined): EventHooksLoad {
     ) {
       errors.push({
         path: `${path}.timeoutSec`,
-        message: "timeoutSec — целое 1…3600",
+        message: t("ev.timeoutInt"),
       });
       return;
     }
     if (h.notifyOnFail !== undefined && typeof h.notifyOnFail !== "boolean") {
       errors.push({
         path: `${path}.notifyOnFail`,
-        message: "notifyOnFail — boolean",
+        message: t("ev.notifyBoolean"),
       });
       return;
     }
@@ -181,6 +185,7 @@ export interface HookFinishDeps {
   store: DelegationStore;
   send: (threadId: string, text: string) => Promise<void>;
   warn?: (msg: string) => void;
+  t?: T;
 }
 
 /**
@@ -196,6 +201,7 @@ export function onHookRunFinished(
   status: CommandRunStatus,
   outputTail: string,
 ): void {
+  const t = deps.t ?? T_RU;
   if (row.source !== "hook") return;
   const series = readFailSeries(deps.store);
   if (status === "ok") {
@@ -230,8 +236,11 @@ export function onHookRunFinished(
   deps
     .send(
       coordinator,
-      `хук ${row.name} на ${event || "событие"} упал: ` +
-        (outputTail || status),
+      t("ev.hookFailed", {
+        name: row.name,
+        event: event || t("ev.eventFallback"),
+        outcome: outputTail || status,
+      }),
     )
     .catch((e) =>
       deps.warn?.(

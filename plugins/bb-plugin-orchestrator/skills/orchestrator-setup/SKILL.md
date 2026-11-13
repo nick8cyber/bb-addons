@@ -3,40 +3,40 @@ name: orchestrator-setup
 description: Set up the orchestrator plugin together with the user — their providers and subscriptions, level routes and fallback chains, presets, the policy JSON, git rules for executors. Use when the plugin reports needs-configuration or the user asks to configure delegation.
 ---
 
-# Настройка orchestrator
+# Setting up orchestrator
 
-Готовых наборов моделей в плагине нет: что на каком уровне стоит, выбираешь ты вместе с пользователем. Не выдумывай модели — бери их только из вывода команд ниже.
+There are no ready-made model bundles in the plugin: you choose what sits on each level together with the user. Do not invent models — take them only from the output of the commands below.
 
-## Порядок
+## Procedure
 
-1. **Спроси пользователя**, какие у него подписки и провайдеры и что жалко тратить: какие модели он готов пускать в фоне, а какие — только на главное и на проверку.
-2. **Посмотри, что реально доступно**: `bb provider list`, затем `bb provider models <id>` для каждого подходящего провайдера. Модели и уровни рассуждений — только из этого вывода. Существующие пресеты — `bb tasks preset list`; подходящие можно использовать как есть.
-3. **Предложи уровни и цепочки резерва** — покажи таблицу и дождись согласия:
-   - `complex` — сложное: архитектура, поиск причин, многофайловые фичи, миграции, рефакторинг;
-   - `medium` — среднее: обычные фичи и тесты по ясной спеке;
-   - `simple` — простое: механические правки, документы, сбор данных;
-   - `review` — проверка спек до раздачи и результата после; только чтение.
-   У уровня может быть цепочка маршрутов: при сбое первого (квота, зависание) сторож берёт следующий. Для `complex` и `review` автоперевыпуск обычно выключают (`autoFallback: false`) — перевыпуск решает координатор.
-   Проверочных уровней может быть несколько — уровню ставят `"role": "auditor"` (например `review-complex`, `review-medium`, `review-simple`); без поля уровень исполнительный, а имя `review` по-прежнему считается аудиторским. Связка сложности с проверкой — `"reviewByLevel": {"complex": "review-complex", …}`: `delegate --level review` тогда сам выбирает аудиторский уровень по последнему исполнению задачи.
-4. **Создай недостающие пресеты**:
-   `bb tasks preset create --name <preset> --provider <id> --model <id> --reasoning <level> --permission full --environment worktree [--instructions <текст>]`.
-   В `--instructions` пресетов исполнителей — контракт исполнителя (работать в своей копии, отчёт с веткой и SHA, без push и PR); пресетам проверочных уровней — контракт «только чтение» (ничего не править и не коммитить) плюс требование заканчивать отчёт строкой JSON `{"verdict":"OK"|"CHANGES","blockers":<число>}` — её читает конвейер выкладки.
-   Пресеты исполнительных уровней обязаны создавать рабочую копию (`--environment worktree`): без своей копии исполнитель не может работать изолированно — валидатор предупредит, если environmentKind пресета не `new-worktree`.
-5. **Спроси про правила git** репозитория пользователя: базовая ветка и команда переноса, именование рабочих веток, подпись коммитов, запреты. Текст (≤ 1500 символов) уходит исполнителям первым разделом «Работа с git» при каждой раздаче и перевыпуске. Запиши: `bb plugin config orchestrator set gitInstructions '<текст>'`; пустая строка выключает раздел.
-6. **Запиши политику** и проверь её:
-   `bb plugin config orchestrator set policy '<json>'`, затем `bb orchestrator policy validate`.
-   Формат: `version: 1`, `levels.<имя> = { description, role?, chain: [<маршрут>...], autoFallback }`, `routes.<имя> = { preset, provider, quotaGroup?, quotaPatterns?, firstResponseSeconds? }`, необязательные `reviewByLevel` (уровень исполнения → его аудиторский уровень), `limits`, `firstResponseSeconds` (30–600), `maxRunSeconds` (≥ 300). Пустая или невалидная политика — плагин в `needs-configuration`, `delegate` отклоняет вызовы. После правки настроек перезагрузи плагин, чтобы статус обновился.
-   Маршрутам на провайдерах с долгим холодным стартом (1,5–3 минуты до первого ответа) ставь `routes.<имя>.firstResponseSeconds` ≈ 300 — иначе сторож примет прогрев за зависание. Исполнителям таких провайдеров добавь в `gitInstructions` или инструкции раздачи правило абсолютных путей, если провайдер их требует.
-7. **Выключи субагентов у провайдеров исполнителей**: `bb plugin config <provider-plugin>` — `subagentsDisabled` должно быть `true`. Исполнитель, плодящий субагентов мимо раздачи, теряет сторожа и привязку.
-8. **Предложи защиту ветки на хостинге** (когда пользуешься `release`): общий pre-push хук — это защита от забывчивости (случайный `git push` мимо конвейера), а не от умысла — агент того же пользователя может выписать маркер сам. Там, где нужен жёсткий гейт (main/dev, публичные репозитории), предложи пользователю включить защиту ветки на стороне хостинга (запрет прямого push, обязательные проверки) — решает пользователь.
-9. **Настрой выкладку** (когда пользуешься `release`, спека orchestrator-release §6) — проведи пользователя по трём местам документа `release`:
-   - `commitIdentity` — разрешённая подпись коммитов (`"Имя <email>"` или `"repo"` — из конфига репозитория). Без неё скан только предупреждает о подписях и `bb orchestrator status` пишет «автор коммитов не задан» — предложи задать явно, иначе чужая подпись не блокирует выкладку.
-   - `allowedTrailers`/`allowedEmails` — какие трейлеры (`Co-Authored-By`, `Signed-off-by`, …) и адреса/домены не считаются утечкой личности автора. Трейлер вне списка идёт по `leaks.trailers` (по умолчанию `warn` — для запрета ставь `"block"`), личная почта блокирует всегда.
-   - `leaks` — строгость категорий 3–4: `machine` и `bbIds` (`block`/`warn`, по умолчанию `block` у публичного проекта и `warn` у приватного), `trailers` (по умолчанию `warn`), `allow` — пути, где упоминания норма. `leaks` проекта сливается с `defaults.leaks` по ключам.
-   Остальное по схеме — `target`, `checks`, `docsMap`, `postPublish`, `prProvider`, `prBody`, `requireNote`, `timing`. Проверка: `bb orchestrator status` и пробная выкладка на тестовой ветке.
-10. **Предложи включить уборщик** (спека §15): он убирает влитые рабочие копии, ветки `bb/` и треды исполнителей и сообщает о брошенных. По умолчанию выключен.
-   `bb plugin config orchestrator set janitor '{"enabled": true, "mode": "report"}'` — первым прогоном только отчёт, ничего не удаляет. Посмотри `bb orchestrator janitor report`; если отчёт разумный, переведи в удаление:
-   `bb plugin config orchestrator set janitor '{"enabled": true, "mode": "apply"}'`.
-   Тонкая настройка (JSON, необязательные ключи): `afterMerge` (срок после вливания до уборки, `15m`+, по умолчанию `10h`), `abandonedAfter` (простой для отчёта «брошено», `1d`+, по умолчанию `10d`), `intervalMinutes` (≥ 15, по умолчанию 60), `excludeProjects` (id проектов bb, которыми занимается другой уборщик), `protectedBranches` (по умолчанию `["main","master","dev"]`), `deleteBranches` (по умолчанию `true`), `scope` (`workers` — только среды исполнителей, по умолчанию; `all` — и корневые чаты пользователя). Удаляется только то, что полностью на `origin` и чисто; невлитое и грязное — только в отчёте и в суточном сообщении координатору. Внеочередной прогон — `bb orchestrator janitor run`, сухой — `bb orchestrator janitor run --dry-run`.
+1. **Ask the user** which subscriptions and providers they have and what they are reluctant to spend: which models may run in the background and which — only for the main work and review.
+2. **See what is actually available**: `bb provider list`, then `bb provider models <id>` for each suitable provider. Models and reasoning levels — only from this output. Existing presets — `bb tasks preset list`; suitable ones can be used as is.
+3. **Propose levels and fallback chains** — show a table and wait for agreement:
+   - `complex` — hard: architecture, root-cause analysis, multi-file features, migrations, refactoring;
+   - `medium` — ordinary features and tests against a clear spec;
+   - `simple` — mechanical edits, documents, data gathering;
+   - `review` — checking specs before dispatch and results after; read-only.
+   A level can have a route chain: when the first fails (quota, stall) the watchdog takes the next one. For `complex` and `review` auto-reissue is usually off (`autoFallback: false`) — the coordinator decides about reissue.
+   There can be several review levels — give the level `"role": "auditor"` (e.g. `review-complex`, `review-medium`, `review-simple`); without the field the level is an executor one, and the name `review` still counts as auditor. Binding complexity to review — `"reviewByLevel": {"complex": "review-complex", …}`: `delegate --level review` then picks the auditor level itself by the task's last execution.
+4. **Create the missing presets**:
+   `bb tasks preset create --name <preset> --provider <id> --model <id> --reasoning <level> --permission full --environment worktree [--instructions <text>]`.
+   In executor presets' `--instructions` — the executor contract (work in your own copy, report with branch and SHA, no push or PR); for review-level presets — the read-only contract (change nothing, commit nothing) plus the requirement to end the report with the JSON line `{"verdict":"OK"|"CHANGES","blockers":<number>}` — the release pipeline reads it.
+   Executor-level presets must create a worktree (`--environment worktree`): without its own copy an executor cannot work in isolation — the validator warns when a preset's environmentKind is not `new-worktree`.
+5. **Ask about the git rules** of the user's repository: base branch and its sync command, working-branch naming, commit signature, bans. The text (≤ 1500 characters) goes to executors as the first «Работа с git» section on every dispatch and reissue. Write it: `bb plugin config orchestrator set gitInstructions '<text>'`; an empty string disables the section.
+6. **Write the policy** and verify it:
+   `bb plugin config orchestrator set policy '<json>'`, then `bb orchestrator policy validate`.
+   Format: `version: 1`, `levels.<name> = { description, role?, chain: [<route>...], autoFallback }`, `routes.<name> = { preset, provider, quotaGroup?, quotaPatterns?, firstResponseSeconds? }`, optional `reviewByLevel` (execution level → its auditor level), `limits`, `firstResponseSeconds` (30–600), `maxRunSeconds` (≥ 300). An empty or invalid policy — the plugin goes `needs-configuration` and `delegate` refuses calls. After editing settings, reload the plugin so the status refreshes.
+   Routes on providers with a long cold start (1.5–3 minutes to the first reply) need `routes.<name>.firstResponseSeconds` ≈ 300 — otherwise the watchdog takes the warm-up for a stall. For executors on such providers, add an absolute-paths rule to `gitInstructions` or the dispatch instructions if the provider requires it.
+7. **Disable subagents on executor providers**: `bb plugin config <provider-plugin>` — `subagentsDisabled` must be `true`. An executor that spawns subagents outside the dispatch loses its watchdog and binding.
+8. **Suggest branch protection on the hosting** (when using `release`): the shared pre-push hook protects against forgetfulness (an accidental `git push` bypassing the pipeline), not against intent — an agent of the same user can issue a marker itself. Where a hard gate is needed (main/dev, public repositories), suggest the user enable hosting-side branch protection (direct-push ban, required checks) — the user decides.
+9. **Set up publishing** (when using `release`, spec orchestrator-release §6) — walk the user through three places in the `release` document:
+   - `commitIdentity` — the allowed commit signature (`"Name <email>"` or `"repo"` — from the repository config). Without it the scan only warns about signatures and `bb orchestrator status` prints "no commit author configured" — suggest setting it explicitly, otherwise a foreign signature does not block publishing.
+   - `allowedTrailers`/`allowedEmails` — which trailers (`Co-Authored-By`, `Signed-off-by`, …) and addresses/domains do not count as author-identity leaks. A trailer outside the list is handled by `leaks.trailers` (default `warn` — set `"block"` to forbid); a personal email always blocks.
+   - `leaks` — the strictness of categories 3–4: `machine` and `bbIds` (`block`/`warn`, default `block` for a public project and `warn` for a private one), `trailers` (default `warn`), `allow` — paths where mentions are fine. A project's `leaks` merges with `defaults.leaks` per key.
+   The rest follows the schema — `target`, `checks`, `docsMap`, `postPublish`, `prProvider`, `prBody`, `requireNote`, `timing`. Verification: `bb orchestrator status` and a trial publish on a test branch.
+10. **Suggest enabling the janitor** (spec §15): it removes merged worktrees, `bb/` branches, and executor threads, and reports abandoned ones. Off by default.
+    `bb plugin config orchestrator set janitor '{"enabled": true, "mode": "report"}'` — the first pass only reports, deletes nothing. Look at `bb orchestrator janitor report`; if the report looks sane, switch to deletion:
+    `bb plugin config orchestrator set janitor '{"enabled": true, "mode": "apply"}'`.
+    Fine tuning (JSON, optional keys): `afterMerge` (delay after merging before cleanup, `15m`+, default `10h`), `abandonedAfter` (idle threshold for the "abandoned" report, `1d`+, default `10d`), `intervalMinutes` (≥ 15, default 60), `excludeProjects` (bb project ids another janitor handles), `protectedBranches` (default `["main","master","dev"]`), `deleteBranches` (default `true`), `scope` (`workers` — executor environments only, the default; `all` — also the user's root chats). Only what is fully on `origin` and clean is deleted; unmerged and dirty items go only into the report and the daily coordinator message. An off-schedule pass — `bb orchestrator janitor run`, dry — `bb orchestrator janitor run --dry-run`.
 
-Проверь итог: `bb orchestrator policy show` (политика и предупреждения), `bb orchestrator instructions` (правило, которое увидит координатор) и — если уборщик включён — `bb orchestrator janitor report`.
+Verify the result: `bb orchestrator policy show` (policy and warnings), `bb orchestrator instructions` (the rule the coordinator will see), and — if the janitor is on — `bb orchestrator janitor report`.
