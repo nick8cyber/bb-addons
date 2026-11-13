@@ -22,6 +22,7 @@ import {
 import {
   checkExecSettings,
   execSettingsFingerprint,
+  HOOKS_BROKEN_KEY,
 } from "../src/trust.js";
 import { parseReleaseConfig } from "../src/release-config.js";
 
@@ -539,11 +540,11 @@ test("§18.5: parseEventHooks — разбор и ошибки", () => {
   );
 });
 
-test("§18.5 (ревью Б1–Б2): дубль имени — атака на снимок не проходит", async () => {
+test("§18.5 (ревью Б1–Б2 + заход 3): дубль имени — атака на снимок не проходит", async () => {
   // проба ревьюера: было [a: /bin/true], стало
   // [a: sh -c evil, a: /bin/true] — раньше в снимок ложился второй
   // хук, а запускался первый. Теперь это ошибка разбора: хуки не
-  // запускаются вовсе, прежний ключ снимка не стирается.
+  // запускаются вовсе, а битый документ виден маркером в снимке.
   const { store } = makeStore();
   const cfg = parseReleaseConfig(
     JSON.stringify({ defaults: {} }),
@@ -554,12 +555,11 @@ test("§18.5 (ревью Б1–Б2): дубль имени — атака на �
     hooks: [hook({ name: "a", run: ["/bin/true"] })],
     send: async () => {},
   });
-  const load = parseEventHooks(
-    JSON.stringify([
-      { name: "a", on: ["delegation.done"], run: ["sh", "-c", "evil"] },
-      { name: "a", on: ["delegation.done"], run: ["/bin/true"] },
-    ]),
-  );
+  const brokenRaw = JSON.stringify([
+    { name: "a", on: ["delegation.done"], run: ["sh", "-c", "evil"] },
+    { name: "a", on: ["delegation.done"], run: ["/bin/true"] },
+  ]);
+  const load = parseEventHooks(brokenRaw);
   assert.ok(load.errors.length > 0, "дубль — ошибка разбора");
   assert.equal(effectiveHooks(load).length, 0);
   store.eventHooksProvider = () => ({
@@ -573,27 +573,32 @@ test("§18.5 (ревью Б1–Б2): дубль имени — атака на �
     0,
     "«sh -c evil» в очередь не встал",
   );
-  // битый eventHooks не имитирует «хуки убрали» и не скрывает release
+  // битый eventHooks не молчит (заход 3): ключ хука снят, в снимке —
+  // маркер битого документа; сверка release при этом идёт
   const changes = await checkExecSettings({
     store,
     cfg,
     hooks: load.hooks,
     hooksBroken: true,
+    hooksRaw: brokenRaw,
     send: async () => {},
   });
-  assert.equal(changes.length, 0, "прежний ключ a сохранён");
-  // исправление с ДРУГИМ argv — расхождение видно (сравнение с
-  // настоящим прежним значением, а не с пустотой)
+  assert.deepEqual(changes.map((c) => c.key), [
+    HOOKS_BROKEN_KEY,
+    "plugin:eventHooks:a",
+  ]);
+  // исправление с ДРУГИМ argv — строка «изменены» с именем хука:
+  // маркер снят, ключ хука сравнивается с маркером, а не с пустотой
   const after = await checkExecSettings({
     store,
     cfg,
     hooks: [hook({ name: "a", run: ["/bin/evil2"] })],
     send: async () => {},
   });
-  assert.deepEqual(
-    after.map((c) => c.key),
-    ["plugin:eventHooks:a"],
-  );
+  assert.deepEqual(after.map((c) => c.key), [
+    "plugin:eventHooks:a",
+    HOOKS_BROKEN_KEY,
+  ]);
 });
 
 test("§18.5 (ревью Б2): сверка доверия по частям — битый release не скрывает хуки", async () => {
@@ -648,12 +653,68 @@ test("§18.5 (ревью Б2): сверка доверия по частям —
     cfg: cfg2,
     hooks: [hook({ name: "h" })],
     hooksBroken: true,
+    hooksRaw: "[{битый",
     send: async () => {},
   });
-  assert.deepEqual(
-    changes2.map((c) => c.key),
-    ["defaults:postPublish.commands:deploy"],
+  assert.deepEqual(changes2.map((c) => c.key), [
+    "defaults:postPublish.commands:deploy",
+    HOOKS_BROKEN_KEY,
+    "plugin:eventHooks:h",
+  ]);
+});
+
+test("§18.5 (ревью заход 3): битый eventHooks — маркер виден, а не тишина", async () => {
+  const { store } = makeStore();
+  const cfg = parseReleaseConfig(
+    JSON.stringify({ defaults: {} }),
+  ).config!;
+  const deps = { store, cfg, send: async () => {} };
+  await checkExecSettings({ ...deps, hooks: [hook({ name: "a" })] });
+  // хороший документ → битый: строка (хук снят, маркер поставлен)
+  const bad1 = "[{не json";
+  const c1 = await checkExecSettings({
+    ...deps,
+    hooks: [],
+    hooksBroken: true,
+    hooksRaw: bad1,
+  });
+  assert.deepEqual(c1.map((c) => c.key), [
+    HOOKS_BROKEN_KEY,
+    "plugin:eventHooks:a",
+  ]);
+  // тот же битый документ — тишина
+  assert.equal(
+    (
+      await checkExecSettings({
+        ...deps,
+        hooks: [],
+        hooksBroken: true,
+        hooksRaw: bad1,
+      })
+    ).length,
+    0,
   );
+  // другой битый документ — строка (хеш маркера другой)
+  const c2 = await checkExecSettings({
+    ...deps,
+    hooks: [],
+    hooksBroken: true,
+    hooksRaw: "[{другой битый",
+  });
+  assert.deepEqual(
+    c2.map((c) => c.key),
+    [HOOKS_BROKEN_KEY],
+  );
+  // исправленный документ — строка «изменены» с именами хуков
+  const c3 = await checkExecSettings({
+    ...deps,
+    hooks: [hook({ name: "a" }), hook({ name: "b" })],
+  });
+  assert.deepEqual(c3.map((c) => c.key), [
+    "plugin:eventHooks:a",
+    "plugin:eventHooks:b",
+    HOOKS_BROKEN_KEY,
+  ]);
 });
 
 test("§18.5: переоткрытие PR — повторное pr.closed с новым id события", () => {

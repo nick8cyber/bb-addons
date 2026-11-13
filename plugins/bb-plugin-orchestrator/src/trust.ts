@@ -102,6 +102,13 @@ export function execSettingsChangedKeys(store: DelegationStore): string[] {
  * и частью `release` при покомпонентной сверке. */
 export const HOOKS_KEY_PREFIX = "plugin:eventHooks:";
 
+/** §18.5 (ревью заход 3): при битом документе `eventHooks` в снимок
+ * вместо ключей хуков ложится этот маркер с хешем сырой строки —
+ * NUL в имени не совпадает ни с одним допустимым именем хука,
+ * поэтому переход «документ испорчен» виден как изменение, а не
+ * как тишина. */
+export const HOOKS_BROKEN_KEY = `${HOOKS_KEY_PREFIX}\0broken`;
+
 export async function checkExecSettings(deps: {
   store: DelegationStore;
   cfg: ReleaseConfig | null;
@@ -109,12 +116,15 @@ export async function checkExecSettings(deps: {
   hooks?: readonly EventHookSetting[] | null;
   /** Документ `release` не парсится — его часть снимка не сверяем. */
   cfgBroken?: boolean;
-  /** Документ `eventHooks` не парсится — сверка хуков пропускается,
-   * но прежние ключи этой части из снимка НЕ стираются: пустой
-   * fingerprint выглядел бы как «всё убрали» и рассылал бы ложные
-   * уведомления; исправление документа сравнивается с настоящими
-   * прежними значениями (ревью PLUG-246 Б2). */
+  /** Документ `eventHooks` не парсится — хуки не запускаются, а в
+   * снимок вместо ключей хуков ложится маркер `HOOKS_BROKEN_KEY` с
+   * хешем `hooksRaw`: «хороший → битый» и каждая правка битого
+   * документа видны, исправленный документ сравнивается с маркером
+   * (ревью PLUG-246 заход 3). */
   hooksBroken?: boolean;
+  /** Сырая строка настройки `eventHooks` — источник хеша маркера
+   * `HOOKS_BROKEN_KEY` при `hooksBroken`. */
+  hooksRaw?: string;
   send: (threadId: string, text: string) => Promise<void>;
   warn?: (m: string) => void;
 }): Promise<ExecSettingsChange[]> {
@@ -122,6 +132,13 @@ export async function checkExecSettings(deps: {
     deps.cfgBroken ? null : deps.cfg,
     deps.hooksBroken ? null : deps.hooks,
   );
+  // §18.5 (ревью заход 3): битый `eventHooks` — не перенос прежних
+  // ключей (так «хороший → битый» был бы незаметен), а маркер с хешем
+  // сырой строки: ключи хуков сняты, маркер добавлен, каждая правка
+  // битого документа меняет хеш, исправление сравнивается с маркером.
+  if (deps.hooksBroken) {
+    next[HOOKS_BROKEN_KEY] = hashEntry(deps.hooksRaw ?? "");
+  }
   const prevRaw = deps.store.metaGet(SNAPSHOT_KEY);
   if (prevRaw === undefined) {
     deps.store.metaSet(SNAPSHOT_KEY, JSON.stringify(next));
@@ -133,24 +150,23 @@ export async function checkExecSettings(deps: {
   } catch {
     /* битый снимок — как первый */
   }
-  // Сломанная часть не отключает сверку остальных и не имитирует
-  // «всё убрали»: её прежние ключи переносятся в снимок как есть.
-  if (deps.cfgBroken || deps.hooksBroken) {
-    const brokenPart = (k: string): boolean =>
-      (!!deps.hooksBroken && k.startsWith(HOOKS_KEY_PREFIX)) ||
-      (!!deps.cfgBroken && !k.startsWith(HOOKS_KEY_PREFIX));
+  // Сломанный `release` не отключает сверку хуков и не имитирует
+  // «всё убрали»: его прежние ключи переносятся в снимок как есть.
+  // Битый `eventHooks` так не обрабатываем — там маркер (выше), иначе
+  // переход «хороший → битый» был бы незаметен.
+  if (deps.cfgBroken) {
     for (const [k, v] of Object.entries(prev)) {
-      if (!(k in next) && brokenPart(k)) next[k] = v;
+      if (!(k in next) && !k.startsWith(HOOKS_KEY_PREFIX)) next[k] = v;
     }
-    const what = [
-      deps.cfgBroken ? "release-конфиг" : "",
-      deps.hooksBroken ? "eventHooks" : "",
-    ]
-      .filter(Boolean)
-      .join(" и ");
     deps.warn?.(
-      `orchestrator: ${what} не парсится — эта часть снимка ` +
-        `исполняемых настроек не сверялась (прежние ключи сохранены)`,
+      "orchestrator: release-конфиг не парсится — эта часть снимка " +
+        "исполняемых настроек не сверялась (прежние ключи сохранены)",
+    );
+  }
+  if (deps.hooksBroken) {
+    deps.warn?.(
+      "orchestrator: eventHooks не парсится — хуки не запускаются; " +
+        "в снимке доверия — маркер битого документа",
     );
   }
   const changes: ExecSettingsChange[] = [];

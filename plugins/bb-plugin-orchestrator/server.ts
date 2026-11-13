@@ -524,6 +524,9 @@ export async function createPlugin(
       // отключает проверку хуков и наоборот.
       cfgBroken: releaseConfig.errors.length > 0,
       hooksBroken: hooksLoad.errors.length > 0,
+      // §18.5 (ревью заход 3): сырая строка — хеш маркера битого
+      // документа в снимке доверия.
+      hooksRaw: currentSettings.eventHooks ?? "",
       send: async (threadId, text) => {
         await bb.sdk.threads.send({
           threadId,
