@@ -45,6 +45,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { OrchestratorError } from "./errors.js";
+import { T_RU, type T } from "./i18n/index.js";
 import { runChecked, type BbCli } from "./bb-cli.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
 
@@ -139,6 +140,8 @@ export interface MergeDeps {
     projectId: string | null,
   ) => boolean | Promise<boolean>;
   log?: { warn?(message: string): void };
+  /** §18.1: the language catalog (defaults to T_RU). */
+  t?: T;
 }
 
 export interface MergeDryRunOutcome {
@@ -177,7 +180,7 @@ type Git = MergeGit;
  * call waited (`merged`/`fix-delegated` are terminal for `merge`; the
  * fix round's own row is what gets merged next).
  */
-function assertMergeableRow(row: DelegationRow): string {
+function assertMergeableRow(row: DelegationRow, t: T): string {
   if (row.status !== "done") {
     throw new OrchestratorError(
       "not-done",
@@ -190,7 +193,7 @@ function assertMergeableRow(row: DelegationRow): string {
   if (row.no_code === 1 && (row.result_commits ?? 0) === 0) {
     throw new OrchestratorError(
       "nothing-to-merge",
-      "задача без кода: вливать нечего",
+      t("mg.noCode"),
     );
   }
   if (!row.result_sha) {
@@ -203,21 +206,25 @@ function assertMergeableRow(row: DelegationRow): string {
   if (row.result_dirty === 1) {
     throw new OrchestratorError(
       "dirty-result",
-      "исполнитель не закоммитил: копия захода грязная",
-      "доработка — новым заходом: `bb orchestrator delegate <KEY> --level <уровень>`",
+      t("mg.dirtyResult"),
+      t("mg.dirtyResultHint"),
     );
   }
   if (row.merge_status === "merged") {
     throw new OrchestratorError(
       "already-merged",
-      `делегирование ${row.id} уже влито в ${row.merged_into ?? "?"} (${row.merged_sha ? sha7(row.merged_sha) : "?"})`,
+      t("mg.alreadyMerged", {
+        id: row.id,
+        into: row.merged_into ?? "?",
+        sha: row.merged_sha ? sha7(row.merged_sha) : "?",
+      }),
     );
   }
   if (row.merge_status === "fix-delegated") {
     throw new OrchestratorError(
       "fix-delegated",
-      `по делегированию ${row.id} уже раздан заход разбора конфликта`,
-      "дождитесь его done и влейте его итог: `bb orchestrator merge <id захода разбора>`",
+      t("mg.fixDelegated", { id: row.id }),
+      t("mg.fixDelegatedHint"),
     );
   }
   return row.result_sha;
@@ -228,6 +235,7 @@ export async function runMerge(
   deps: MergeDeps,
 ): Promise<MergeOutcome | MergeDryRunOutcome> {
   const { store } = deps;
+  const t = deps.t ?? T_RU;
   const ref = params.ref.trim();
 
   const numeric = /^\d+$/.test(ref);
@@ -268,11 +276,11 @@ export async function runMerge(
         throw new OrchestratorError(
           "not-done",
           inflight
-            ? `делегирование ${fresh.id} ещё ${fresh.status}, итога нет`
-            : `заход ${fresh.id} завершился ${fresh.status}, итога нет`,
+            ? t("mg.notDoneInflight", { id: fresh.id, status: fresh.status })
+            : t("mg.notDoneFinished", { id: fresh.id, status: fresh.status }),
           row && row.id !== fresh.id
-            ? `прошлый итог — \`bb orchestrator merge ${row.id}\``
-            : "merge works on finished rounds — see `bb orchestrator status`",
+            ? t("mg.prevResultHint", { id: row.id })
+            : t("mg.notDoneHint"),
         );
       }
       // `cancelled` newest round: the newest FINISHED round stays the
@@ -286,14 +294,14 @@ export async function runMerge(
     if (latest) {
       throw new OrchestratorError(
         "not-done",
-        `делегирование ${latest.id} ещё ${latest.status}, итога нет`,
-        "merge works on finished rounds — see `bb orchestrator status`",
+        t("mg.notDoneInflight", { id: latest.id, status: latest.status }),
+        t("mg.notDoneHint"),
       );
     }
     throw new OrchestratorError(
       "not-found",
-      `no mergeable delegation for "${params.ref}"`,
-      "`bb orchestrator status` lists delegations; a task key resolves to its latest done delegation with a result",
+      t("mg.notFoundMsg", { ref: params.ref }),
+      t("mg.notFoundHint"),
     );
   }
   // §17.2 (e2e 1): a numeric ref to a still-`running` row gets the same
@@ -309,7 +317,7 @@ export async function runMerge(
       "only the delegating coordinator may merge its result",
     );
   }
-  const resultSha = assertMergeableRow(row);
+  const resultSha = assertMergeableRow(row, t);
 
   const env = await deps
     .environment(params.callerThreadId)
@@ -343,7 +351,7 @@ export async function runMerge(
 
   const gitDir = (await gitText(["rev-parse", "--absolute-git-dir"])).trim();
   const lockPath = join(gitDir, MERGE_LOCK_NAME);
-  const releaseLock = await acquireCopyLock(git, repo, lockPath);
+  const releaseLock = await acquireCopyLock(git, repo, lockPath, { t });
   try {
     // §14: the row is re-read under the lock — a concurrent merge may
     // have finished (merged), delegated a fix round, or the round result
@@ -352,15 +360,19 @@ export async function runMerge(
     if (!fresh) {
       throw new OrchestratorError(
         "not-found",
-        `делегирование ${row.id} исчезло из хранилища`,
+        t("mg.rowVanished", { id: row.id }),
       );
     }
-    const freshSha = assertMergeableRow(fresh);
+    const freshSha = assertMergeableRow(fresh, t);
     if (freshSha !== resultSha) {
       throw new OrchestratorError(
         "stale-result",
-        `итог делегирования ${row.id} изменился: ${sha7(freshSha)} ≠ записанного ${sha7(resultSha)}`,
-        "вливать нужно новый итог — повторите `bb orchestrator merge`",
+        t("mg.resultChanged", {
+          id: row.id,
+          fresh: sha7(freshSha),
+          sha: sha7(resultSha),
+        }),
+        t("mg.resultChangedHint"),
       );
     }
     row = fresh;
@@ -374,8 +386,8 @@ export async function runMerge(
     if (busy.length > 0) {
       throw new OrchestratorError(
         "copy-busy",
-        `в копии координатора незавершённая операция (${busy.join(", ")})`,
-        "завершите или отмените её (git merge|cherry-pick|revert|rebase --abort) и повторите",
+        t("mg.copyBusy", { ops: busy.join(", ") }),
+        t("mg.copyBusyHint"),
       );
     }
     // The coordinator copy is clean and sits on a branch.
@@ -383,8 +395,8 @@ export async function runMerge(
     if (porcelain.trim()) {
       throw new OrchestratorError(
         "dirty-coordinator",
-        "копия координатора грязная (незакоммиченные правки)",
-        "закоммить или уберите изменения и повторите",
+        t("mg.dirtyCoord"),
+        t("mg.dirtyCoordHint"),
       );
     }
     // `--short` shortens ambiguously (a tag `work` turns `work` into
@@ -400,8 +412,8 @@ export async function runMerge(
     } catch {
       throw new OrchestratorError(
         "detached-head",
-        "копия координатора на отсоединённом HEAD — ветки нет",
-        "перейдите на ветку (git switch <branch>) и повторите",
+        t("mg.detached"),
+        t("mg.detachedHint"),
       );
     }
     // §14: the lock file carries the copy's original state — if this
@@ -429,7 +441,7 @@ export async function runMerge(
       if (!normalized) {
         throw new OrchestratorError(
           "unknown-branch",
-          `ветка-приёмник ${params.into.trim()} — не имя локальной ветки`,
+          t("mg.intoNotBranch", { into: params.into.trim() }),
         );
       }
       into = normalized;
@@ -439,8 +451,8 @@ export async function runMerge(
     if (protectedBranches.includes(into)) {
       throw new OrchestratorError(
         "protected-branch",
-        `вливание в защищённую ветку ${into} запрещено`,
-        "в защищённые ветки код уходит только через `bb orchestrator release`",
+        t("mg.protected", { into }),
+        t("mg.protectedHint"),
       );
     }
     if (params.into?.trim()) {
@@ -452,7 +464,7 @@ export async function runMerge(
       if (local.exitCode !== 0) {
         throw new OrchestratorError(
           "unknown-branch",
-          `ветка-приёмник ${into} — не локальная ветка копии`,
+          t("mg.intoNotLocal", { into }),
         );
       }
     }
@@ -467,8 +479,8 @@ export async function runMerge(
     if (object.exitCode !== 0) {
       throw new OrchestratorError(
         "result-missing",
-        `коммит итога ${sha7(resultSha)} отсутствует в репозитории копии координатора`,
-        "копия исполнителя и копия координатора должны быть worktree одного репозитория",
+        t("mg.resultMissing", { sha: sha7(resultSha) }),
+        t("mg.resultMissingHint"),
       );
     }
 
@@ -491,9 +503,11 @@ export async function runMerge(
       ) {
         throw new OrchestratorError(
           "unsupported-git",
-          `merge --dry-run требует git ≥ 2.39 (merge-tree --write-tree)` +
-            (vm ? `, найден ${vm[1]}.${vm[2]}` : " — `git --version` не прочитан"),
-          "обновите git на машине копии",
+          t("mg.dryRunGit") +
+            (vm
+              ? t("mg.foundVersion", { v: `${vm[1]}.${vm[2]}` })
+              : t("mg.versionUnread")),
+          t("mg.dryRunGitHint"),
         );
       }
       const probe = await git([
@@ -565,7 +579,7 @@ export async function runMerge(
       if (mergeRes.exitCode === 0) {
         const mergedSha = (await gitText(["rev-parse", "HEAD"])).trim();
         store.setMerged(row.id, { into, sha: mergedSha });
-        await comment(row, `Влито в ${into} (${sha7(mergedSha)})`, deps);
+        await comment(row, t("mg.mergedComment", { into, sha: sha7(mergedSha) }), deps);
         return {
           ok: true,
           delegationId: row.id,
@@ -586,9 +600,10 @@ export async function runMerge(
       } else {
         failure = new OrchestratorError(
           "merge-hook-failed",
-          `git merge не завершился без конфликтных файлов` +
-            ` (отказ хука или таймаут, exit ${mergeRes.exitCode}): ` +
-            `${(mergeRes.stderr || mergeRes.stdout).trim() || "no output"}`,
+          t("mg.mergeHookFailed", {
+            code: mergeRes.exitCode,
+            detail: (mergeRes.stderr || mergeRes.stdout).trim() || "no output",
+          }),
         );
       }
     } catch (e) {
@@ -604,13 +619,14 @@ export async function runMerge(
       git,
       currentBranch,
       originalHead,
+      t,
     );
     if (restoreError) {
       store.setMergeStatus(row.id, "failed");
       throw new OrchestratorError(
         "copy-not-restored",
-        `копия координатора не вернулась в исходное состояние: ${restoreError}`,
-        `копия ${repo} — разберите вручную, там могло остаться незавершённое слияние`,
+        t("mg.notRestored", { error: restoreError }),
+        t("mg.manualFixHint", { repo }),
       );
     }
     if (failure) {
@@ -633,9 +649,17 @@ export async function runMerge(
     if (!autofix) {
       await notifyCoordinator(
         row,
-        `${row.task_key}: вливание захода ${row.round} в ${into} — конфликт` +
-          `${base.conflictFiles.length ? ` (${base.conflictFiles.slice(0, 10).join(", ")})` : ""}. ` +
-          `Разбор — вручную или новым заходом delegate (--from ${sha7(resultSha)})`,
+        t("mg.conflictManual", {
+          task: row.task_key,
+          round: row.round,
+          into,
+          files: base.conflictFiles.length
+            ? t("mg.conflictFiles", {
+                files: base.conflictFiles.slice(0, 10).join(", "),
+              })
+            : "",
+          sha: sha7(resultSha),
+        }),
         deps,
       );
       return { ...base, mergeStatus: "conflict" };
@@ -644,11 +668,11 @@ export async function runMerge(
     // §14 autofix: a fix round on the same task and level continues from
     // the conflicted result; its instructions name the target tip to
     // merge — with an explicit `-m`, no branch names (§16.6).
-    const fixInstructions =
-      `Влей ${into}@${sha7(targetTip)} в свою ветку:` +
-      ` git merge -m "merge ${sha7(targetTip)}" ${targetTip};` +
-      ` разреши конфликты по смыслу обеих сторон, прогони тесты, закоммить;` +
-      ` в отчёте — какие файлы и как сведены`;
+    const fixInstructions = t("mg.fixInstructions", {
+      into,
+      sha: sha7(targetTip),
+      tip: targetTip,
+    });
     try {
       const fix = await deps.delegate({
         taskKey: row.task_key,
@@ -659,9 +683,13 @@ export async function runMerge(
       store.setMergeStatus(row.id, "fix-delegated");
       await notifyCoordinator(
         row,
-        `${row.task_key}: вливание захода ${row.round} в ${into} — конфликт;` +
-          ` раздан заход разбора #${fix.delegationId}` +
-          ` (тред ${fix.threadId ?? "—"})`,
+        t("mg.conflictFixDelegated", {
+          task: row.task_key,
+          round: row.round,
+          into,
+          id: fix.delegationId,
+          thread: fix.threadId ?? "—",
+        }),
         deps,
       );
       return {
@@ -675,8 +703,12 @@ export async function runMerge(
       store.addSetupError(row.id, "merge-autofix", msg);
       await notifyCoordinator(
         row,
-        `${row.task_key}: вливание захода ${row.round} в ${into} — конфликт;` +
-          ` автозаход разбора не раздался: ${msg.slice(0, 200)}`,
+        t("mg.conflictFixFailed", {
+          task: row.task_key,
+          round: row.round,
+          into,
+          msg: msg.slice(0, 200),
+        }),
         deps,
       );
       return {
@@ -702,6 +734,7 @@ export async function restoreCopy(
   git: Git,
   branch: string,
   head: string | null,
+  t: T = T_RU,
 ): Promise<string | null> {
   const merging = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
   if (merging.exitCode === 0) {
@@ -736,7 +769,7 @@ export async function restoreCopy(
   }
   if (status.stdout.trim()) {
     const lines = status.stdout.trim().split("\n").slice(0, 5).join("; ");
-    return `копия грязная: ${lines}`;
+    return t("mg.copyDirtyLines", { lines });
   }
   if (head !== null) {
     const tip = await git(["rev-parse", "HEAD"]);
@@ -832,8 +865,9 @@ export async function acquireCopyLock(
   git: Git,
   repo: string,
   lockPath: string,
-  opts?: { owner?: string },
+  opts?: { owner?: string; t?: T },
 ): Promise<() => void> {
+  const t = opts?.t ?? T_RU;
   const inProgress = () =>
     new OrchestratorError(
       "merge-in-progress",
@@ -897,13 +931,16 @@ export async function acquireCopyLock(
     // published branch): restore branch+clean only, or the stale lock
     // would wedge the copy on a HEAD it can never return to (PLUG-191).
     if (info.branch) {
-      const restoreError = await restoreCopy(git, info.branch, info.head);
+      const restoreError = await restoreCopy(git, info.branch, info.head, t);
       if (restoreError) {
         throw new OrchestratorError(
           "copy-not-restored",
-          `старая блокировка ${lockPath}: копия не возвращена к ` +
-            `${info.branch}${info.head ? `@${sha7(info.head)}` : ""}: ${restoreError}`,
-          `копия ${repo} — разберите вручную, там могло остаться незавершённое слияние`,
+          t("mg.staleLock", {
+            path: lockPath,
+            target: `${info.branch}${info.head ? `@${sha7(info.head)}` : ""}`,
+            error: restoreError,
+          }),
+          t("mg.manualFixHint", { repo }),
         );
       }
     }
@@ -955,6 +992,7 @@ async function checkStaleResult(
   resultSha: string,
   deps: MergeDeps,
 ): Promise<void> {
+  const t = deps.t ?? T_RU;
   const lookup = row.result_env_id
     ? () => deps.environmentById?.(row.result_env_id as string)
     : row.thread_id
@@ -968,7 +1006,7 @@ async function checkStaleResult(
     if (isEnvironmentGone(e)) return;
     throw new OrchestratorError(
       "stale-check-failed",
-      `не удалось прочитать копию исполнителя: ${message(e)}`,
+      t("mg.readCopyFailed", { error: message(e) }),
     );
   }
   if (!env?.path) return;
@@ -976,15 +1014,20 @@ async function checkStaleResult(
   if (head.exitCode !== 0) {
     throw new OrchestratorError(
       "stale-check-failed",
-      `не удалось прочитать HEAD копии исполнителя ${env.path}: ` +
-        `${(head.stderr || head.stdout).trim() || "no output"}`,
+      t("mg.readHeadFailed", {
+        path: env.path,
+        detail: (head.stderr || head.stdout).trim() || "no output",
+      }),
     );
   }
   if (head.stdout.trim() !== resultSha) {
     throw new OrchestratorError(
       "stale-result",
-      `итог захода устарел: HEAD копии исполнителя ${head.stdout.trim().slice(0, 7)} ≠ записанного ${sha7(resultSha)}`,
-      "исполнитель продолжил работу после done — дождитесь done нового захода или проверьте копию",
+      t("mg.staleResult", {
+        head: head.stdout.trim().slice(0, 7),
+        sha: sha7(resultSha),
+      }),
+      t("mg.staleResultHint"),
     );
   }
 }

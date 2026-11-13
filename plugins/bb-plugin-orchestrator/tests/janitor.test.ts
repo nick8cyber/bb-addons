@@ -24,6 +24,7 @@ import {
 } from "../src/janitor.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import { createCmd, type CmdRunner } from "../src/cmd.js";
+import { createT, type T } from "../src/i18n/index.js";
 
 const ok = (stdout = ""): BbCliResult => ({ exitCode: 0, stdout, stderr: "" });
 const fail = (stderr = "boom"): BbCliResult => ({
@@ -199,6 +200,8 @@ function makeWorld(opts: {
   onThreadListCall?: (call: number, page?: { offset?: number }) => void;
   /** Set false to drop the paged SDK seam → CLI `thread list` fallback. */
   sdkList?: boolean;
+  /** §18.1: the language catalog under test (default — ru). */
+  t?: T;
 }) {
   const clock = opts.clock ?? { t: Date.now() };
   const db = new Database(":memory:");
@@ -329,6 +332,7 @@ function makeWorld(opts: {
     },
     hasProcessIn: opts.hasProcessIn ?? (async () => false),
     localHostId: () => opts.localHostId ?? "",
+    ...(opts.t ? { t: opts.t } : {}),
   };
   return {
     deps,
@@ -2327,6 +2331,43 @@ test("rescue ledger: every attempt recorded + `janitor report` shows it; deleted
   const rep2 = await w2.jan.report();
   assert.equal(rep2.rescues.length, 1);
   assert.equal(rep2.rescues[0]!.notified, 0);
+});
+
+test("§18.1 (PLUG-247b): the ledger reason stays canonical («удалён») under the en catalog", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  writeFileSync(join(env.path, "f.txt"), "dirty\n");
+  const t = Date.now();
+  const w = makeWorld({
+    envs: [env],
+    threads: {},
+    t: createT("en"),
+    extraThreads: [
+      {
+        id: "thr_coord",
+        status: "idle",
+        archivedAt: null,
+        updatedAt: t,
+        environmentId: null,
+        parentThreadId: null,
+      },
+    ],
+  });
+  await w.jan.onThreadDeleted({
+    id: "thr_r",
+    environmentId: env.id,
+    parentThreadId: "thr_coord",
+  });
+  const rows = w.janitor.rescues();
+  assert.equal(rows.length, 1);
+  // §7: the ledger value is a machine contract, never translated
+  assert.equal(rows[0]!.reason, "удалён");
+  // while the coordinator line and the journal go English
+  assert.equal(w.sent.length, 1);
+  assert.match(
+    w.sent[0]!.text,
+    /executor thr_r deleted with unsaved work/,
+  );
 });
 
 test("a raced ref create: occupied by different content → <id>-2, by identical → silent (r29 п.4)", async () => {

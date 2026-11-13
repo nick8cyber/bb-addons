@@ -93,7 +93,7 @@ export function generateRoutingRule(
       ...(limits ? ["", limits] : []),
       ...(reviewLine ? ["", reviewLine] : []),
       "",
-      FOOTER,
+      FOOTER(t),
     ].join("\n");
 
   let text = build((name, desc) => levelLine(name, desc, policy, t));

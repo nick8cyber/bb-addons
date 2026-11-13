@@ -271,7 +271,7 @@ export async function createPlugin(
       type: "string",
       label: "Git instructions",
       description:
-        '"Git instructions" section (§2.2) prepended to every dispatch\'s --instructions. Empty disables the section.',
+        '"Working with git" section (§2.2) prepended to every dispatch\'s --instructions. Empty disables the section.',
       experimental_multiline: true,
       experimental_schema: gitInstructionsSchema,
       default: DEFAULT_GIT_INSTRUCTIONS,
@@ -565,12 +565,12 @@ export async function createPlugin(
     };
     const extra =
       id === "release-auditor" ? undefined : roleTextsLoad.texts[id];
-    const text = roleInstructions(id, { extra, ...opts });
+    const text = roleInstructions(id, { extra, ...opts, t });
     // Подстановки могли вырасти уже после разбора (смена политики,
     // handoffPath) — текст за пределом 2500 теряет дополнение, чтобы
     // обязательный хвост не обрезался лимитом SDK (роль+правило ≤ 4096).
     return extra && text.length > ROLE_INSTRUCTIONS_MAX
-      ? roleInstructions(id, opts)
+      ? roleInstructions(id, { ...opts, t })
       : text;
   };
   const janitorConfig = (): JanitorConfigLoad =>
@@ -1122,9 +1122,11 @@ export async function createPlugin(
         }
       },
       log: bb.log,
+      t,
     });
 
   const watchdog = createWatchdog({
+    t,
     store,
     bbCli,
     threads: watchdogThreads,
@@ -1273,6 +1275,7 @@ export async function createPlugin(
     loadConfig: janitorConfig,
     localHostId,
     log: bb.log,
+    t,
   });
   let janitorBusy = false;
   let lastJanitorRunAt = 0;
@@ -1817,7 +1820,7 @@ export async function createPlugin(
           if (!ref) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "usage: bb orchestrator cancel <delegationId|threadId>",
+              t("cli.cancelUsage"),
             );
           }
           const res = await cancelDelegation(ref, ctx.threadId);
@@ -1837,14 +1840,14 @@ export async function createPlugin(
           if (!ref) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "usage: bb orchestrator merge <KEY|delegationId> [--into <ветка>] [--no-autofix] [--dry-run]",
+              t("cli.mergeUsage"),
             );
           }
           if (!ctx.threadId) {
             throw new OrchestratorError(
               "no-caller-thread",
-              "merge works only from a bb thread (BB_THREAD_ID is absent)",
-              "run it inside a thread, or via the orchestrator_merge tool",
+              t("cli.mergeNoThread"),
+              t("cli.mergeNoThreadHint"),
             );
           }
           const res = await mergeDelegation({
@@ -1859,23 +1862,37 @@ export async function createPlugin(
             return {
               exitCode: res.wouldConflict ? 1 : 0,
               stdout:
-                `merge ${res.taskKey} r${res.round} → ${res.into}: ` +
-                (res.wouldConflict
-                  ? `конфликт (${res.conflictFiles.slice(0, 10).join(", ")})`
-                  : "чисто") +
-                " (dry-run)\n",
+                t("cli.mergeOut", {
+                  task: res.taskKey,
+                  round: res.round,
+                  into: res.into,
+                  verdict: res.wouldConflict
+                    ? t("cli.conflict", {
+                        files: res.conflictFiles.slice(0, 10).join(", "),
+                      })
+                    : t("cli.clean"),
+                }) +
+                t("cli.mergeDrySuffix") +
+                "\n",
             };
           }
           return {
             exitCode: 0,
             stdout:
-              `merge ${res.taskKey} r${res.round} → ${res.into}: ` +
-              (res.mergeStatus === "merged"
-                ? `влито ${res.mergedSha?.slice(0, 7) ?? ""}`
-                : res.mergeStatus === "fix-delegated"
-                  ? `конфликт, раздан заход разбора #${res.fixDelegationId}` +
-                    ` (тред ${res.fixThreadId ?? "—"})`
-                  : "конфликт, копия чистая — разбор за координатором") +
+              t("cli.mergeOut", {
+                task: res.taskKey,
+                round: res.round,
+                into: res.into,
+                verdict:
+                  res.mergeStatus === "merged"
+                    ? t("cli.merged", { sha: res.mergedSha?.slice(0, 7) ?? "" })
+                    : res.mergeStatus === "fix-delegated"
+                      ? t("cli.fixDelegated", {
+                          id: res.fixDelegationId,
+                          thread: res.fixThreadId ?? "—",
+                        })
+                      : t("cli.conflictClean"),
+              }) +
               (res.warning ? `\nwarning: ${res.warning}` : "") +
               "\n",
           };
@@ -2091,8 +2108,7 @@ export async function createPlugin(
               if (res.skipped === "unsupported-git") {
                 throw new OrchestratorError(
                   "unsupported-git",
-                  res.errors[0] ??
-                    `git ≥ 2.39 required — обновите git на этой машине`,
+                  res.errors[0] ?? t("cli.gitTooOld"),
                 );
               }
               const keptText = Object.entries(res.kept)
@@ -2144,7 +2160,7 @@ abandoned: ${res.reported
                               (i) =>
                                 `${i.branch ?? i.envId} (${i.reason}` +
                                 (i.reason === "squash-suspect"
-                                  ? " — похоже, влито squash; проверьте и удалите вручную"
+                                  ? t("cli.squashSuspect")
                                   : "") +
                                 ")",
                             )
@@ -2189,7 +2205,7 @@ abandoned: ${res.reported
               for (const i of rep.abandoned) {
                 out += `  ${i.envId} ${i.branch ?? "-"} ${i.path ?? "-"} (${i.reason}` +
                   (i.reason === "squash-suspect"
-                    ? " — похоже, влито squash; проверьте и удалите вручную"
+                    ? t("cli.squashSuspect")
                     : "") +
                   ")\n";
               }
@@ -2215,10 +2231,10 @@ abandoned: ${res.reported
               for (const r of rep.rescues) {
                 if (!shown.has(r)) continue;
                 out +=
-                  `  ${r.thread_id} ${r.ref ?? "снимок не удался"} ` +
+                  `  ${r.thread_id} ${r.ref ?? t("jn.snapFailed")} ` +
                   `${r.reason}` +
                   (r.repo_root ? ` (${r.repo_root})` : "") +
-                  (r.notified ? "" : " — координатору не дошло") +
+                  (r.notified ? "" : t("cli.notDelivered")) +
                   (r.error ? ` [${r.error}]` : "") +
                   "\n";
               }
@@ -2230,14 +2246,14 @@ abandoned: ${res.reported
           }
           throw new OrchestratorError(
             "invalid-arguments",
-            `unknown janitor subcommand "${sub}" (run|report)`,
+            t("cli.unknownJanitorSub", { sub }),
           );
         }
 
         throw new OrchestratorError(
           "invalid-arguments",
-          `unknown subcommand "${cmd ?? ""}"`,
-          "commands: delegate, status, show, cancel, merge, policy, instructions, reconcile, janitor",
+          t("cli.unknownSub", { cmd: cmd ?? "" }),
+          t("cli.commandsHint"),
         );
       } catch (e) {
         return fail(json, e);

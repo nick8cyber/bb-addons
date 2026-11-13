@@ -18,14 +18,14 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   survives only as a fallback for a schema refusal on the own-spawn
   fields), attaches the task (`bb tasks attach`), best-effort
   `mode=bypass` for `permissionMode=full` presets, marks `running`, and
-  comments «Раздано» on the task. `--no-code` (tool `noCode`) marks a
+  comments "Delegated" on the task. `--no-code` (tool `noCode`) marks a
   delegation that expects no commits (§4.1 r28): the executor is told to
   report only — the §2.2 git memo's commit/branch/SHA requirements are
-  left out (r28.1); the watchdog drops «коммитов нет» and flags commits
+  left out (r28.1); the watchdog drops "no commits" and flags commits
   that appear anyway; the mark rides watchdog reissues only (a new
   `delegate` without the flag is an ordinary dispatch), shows as
   `no-code` in `status`/`show`, and makes `merge`/`release` refuse
-  «задача без кода: вливать нечего» when the last round produced no
+  "a no-code task: nothing to merge" when the last round produced no
   commits (r28.1).
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only threads whose role may delegate (`delegates`, §13);
@@ -50,12 +50,12 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `release` owns them.
 - **`release`** (CLI `bb orchestrator release <KEY>`, spec
   orchestrator-release §17.3): the only path code takes to a remote —
-  приёмка (включая гейт ревью по публикуемым SHA) → branch sync →
+  acceptance (including the per-published-SHA review gate) → branch sync →
   project checks → machine leak scan (every commit's patch, §16.6) →
   audit agent → publish (`push` or `pr`) → post-check.
   A merged round publishes its `merged_into` branch from the
   coordinator's copy; anything else the executor's branch.
-  **Review gate (§17.3 Б4):** the branch being published must be
+  **Review gate (§17.3 B4):** the branch being published must be
   reviewed — an executor branch's tip must equal the reviewed
   `result_sha`; commits above it refuse with `unreviewed-commits`
   (the pipeline's own sync-merge/docs-trailer commits, recorded in the
@@ -64,9 +64,9 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   included); without one, every merged delegation whose `merged_sha`
   is on the tip but not yet published needs its own OK review, and no
   commit may remain unexplained. Re-review a new tip with
-  `bb orchestrator delegate <KEY> --level <аудит> --from <sha>` —
+  `bb orchestrator delegate <KEY> --level <audit> --from <sha>` —
   `--from <merged_sha>` binds the review to a merged result.
-  **Shared hooks (§17.3 Б2):** `hooks/install.mjs` sets a global
+  **Shared hooks (§17.3 B2):** `hooks/install.mjs` sets a global
   `core.hooksPath` and installs a wrapper under every `githooks(5)`
   name EXCEPT `push-to-checkout` — its mere presence disables git's
   built-in worktree update on `receive.denyCurrentBranch=updateInstead`;
@@ -93,21 +93,19 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   from the `prBody` template (default `BB-Thread: {thread}` /
   `BB-Task: {task}`) and exempts `thr_…` from the bb-ids leak rule;
   off — `prBody` is not applied, the body is empty, and every
-  `thr_…` is a `leaks.bbIds` finding (see «Тело PR»).
-  `allowedTrailers` / `allowedEmails` (§17.3 С6) exempt matching
+  `thr_…` is a `leaks.bbIds` finding (see "PR body").
+  `allowedTrailers` / `allowedEmails` (§17.3 C6) exempt matching
   commit trailers (e.g. `Co-Authored-By`) and e-mail addresses/domains
   from the machine scan's `foreign-bot-trailer` / `personal-email`
   rules. Non-exempt foreign-bot trailers follow `leaks.trailers`
   (§18.6): `block` | `warn`, default `warn` — the author's install
   pins `"block"` explicitly. The `commitIdentity` signature check
   (§18.6) has four outcomes: no key at all → the signature finding
-  only warns and `bb orchestrator status` reports «автор коммитов
-  не задан»; a resolved identity (a literal `Имя <email>` or `"repo"`
+  only warns and `bb orchestrator status` reports "commit author not configured"; a resolved identity (a literal `Name <email>` or `"repo"`
   answered by the repo config) blocks every commit whose signature
   differs; `"repo"` with no `user.name`/`user.email` in the repo
-  config refuses «в конфиге репозитория не задан
-  user.name/user.email», and a literal that does not parse refuses
-  «commitIdentity не удалось разобрать». The post-check (§2 step 7)
+  config refuses "user.name/user.email not set in the repo config", and a literal that does not parse refuses
+  "could not parse commitIdentity". The post-check (§2 step 7)
   without a release config keeps the pre-§18.6 strict defaults — the
   signature finding blocks there too. Secrets (category 1) always
   block. `leaks` of a project merges with `defaults.leaks` key by key
@@ -130,13 +128,13 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   30 minutes from its first dispatch; a reviewer or the auditor ending
   a turn without a verdict gets ONE reminder, a second verdict-less
   turn ends the round without OK (the auditor's release is rejected
-  «аудит без вердикта»). For `pr` targets the pump checks the PR through `prProvider`
+  "audit without a verdict"). For `pr` targets the pump checks the PR through `prProvider`
   (`gh pr view` for `github`, `view` for `command`; `none` — no
-  tracking) every `timing.prPollMinutes` (5): merged → «PR влит» +
+  tracking) every `timing.prPollMinutes` (5): merged → "PR merged" +
   task done, closed → one line + `timing.prReopenWatchHours` (72 h)
   for a reopen-merge, open `timing.prStaleHours` (72 h) → one
-  «PR висит 72 ч» line, `timing.prErrorLimit` (3) provider failures
-  in a row → one «слежение невозможно» line.
+  "PR open for 72 h" line, `timing.prErrorLimit` (3) provider failures
+  in a row → one "tracking impossible" line.
   `postPublish` (`{checkout, branch?, reloadPlugins}`) fast-forwards a
   configured checkout after push and reloads the changed plugins —
   dirs with a changed manifest need `npm ci`, providers with running
@@ -152,15 +150,15 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   reissues.
   `bb orchestrator reconcile` runs a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `merge`, `policy show|validate`,
-  `instructions`, `reconcile`.
+  `instructions`, `reconcile`, `release`, `janitor`, `hooks-dir`.
 
-## Роли
+## Roles
 
 Three built-in roles (§13.1): `orchestrator` (the default, the only one
 with `delegates: true`), `executor`, `auditor`. A role is its instruction
 text plus the plugin tools and skills the thread may use.
 
-- **Picker**: the new-chat window gets a «Роль» dropdown
+- **Picker**: the new-chat window gets a "Role" dropdown
   (`composer.customize`, new-thread area); the current pick is stored per
   project in `pending_roles`.
 - **Decision**: the `message.dispatch` hook decides the role once, on the
@@ -168,14 +166,14 @@ text plus the plugin tools and skills the thread may use.
   truth (`pluginMetadata.role` is display-only). Threads the hook never
   saw fall back to the §3 criterion: no parent and no executor markers →
   coordinator.
-- **Limitations** (§13.2 п.5, §13.3): the plugin grants and withholds only
+- **Limitations** (§13.2 item 5, §13.3): the plugin grants and withholds only
   its own tools — provider built-ins (file edits, shell) stay governed by
   the preset's permission mode. The role's instruction reaches the agent
   only if the provider delivers BB instructions; on a provider that does
   not, the role carries no text (agy on the ACP bridge delivers it; `acp-devin`
   restores instructions after compaction via `provider-devin`).
 
-## Настройка
+## Setup
 
 No bundled model sets — setup is a walkthrough the agent runs with the
 user via the `orchestrator-setup` skill (§2.1): inventory the providers,
@@ -232,10 +230,30 @@ map presets onto levels and fallback chains, write the policy, validate.
   SAVED value is kept on upgrade — set it before updating (e.g.
   `bb plugin config orchestrator set userThreadPlugins "handoff
   external-compact"`), not rely on the previous schema default.
+- `release` (multiline JSON, orchestrator-release §6) — the release
+  pipeline config: `commitIdentity`, `defaults` and per-project
+  overrides (`target`, `sync`, `checks`, `public`, `docsMap`, `leaks`,
+  `excluded`, `threadIds`). Empty — `release` refuses (the pipeline is
+  disabled).
+- `mergeAutofix` (default off, §14/§16.6) — on a merge conflict,
+  delegate a fix round to the same task and level; off — only report
+  the conflict to the coordinator.
+- `maxConcurrentCommands` (§18.2, default 4) — cap on simultaneously
+  running journaled commands (postPublish and event hooks).
+- `retentionDays` (§18.2, default 30) — `command_runs` and `events`
+  entries older than this are pruned.
+- `eventHooks` (multiline JSON, §18.5) — event hooks
+  `[{name, on, run, projects?, timeoutSec?, notifyOnFail?}]`; see
+  "Event hooks (`eventHooks`)" below. Empty — no hooks.
+- `janitor` (multiline JSON, §15–16, default `{"enabled": false}`) —
+  the janitor config: `enabled`, `mode apply|report`, `afterMerge`,
+  `abandonedAfter`, `intervalMinutes`, `excludeProjects`,
+  `protectedBranches`, `deleteBranches`, `scope workers|all`. An
+  invalid document warns in the journal and keeps the janitor off.
 - `needs-configuration` clears only on plugin reload (SDK V1): after
   fixing a setting run `bb plugin reload orchestrator`.
 
-## Переход с ручной раздачи
+## Migrating from manual dispatch
 
 Per §8: while manual dispatch instructions are still in place, keep
 `injectInstructions = false` so the plugin's rule does not duplicate
@@ -254,56 +272,57 @@ watchdog — it would risk a double reissue.
   playbook, §3) and `orchestrator-setup` (§2.1) ship in `skills/` —
   setup always, coordinator only when `injectInstructions` is on.
 
-## Уборщик: восстановление
+## Janitor: recovery
 
-Перед каждым удалением уборщик записывает SHA удаляемого в базу
-(`janitor_items.tip_sha`) и строку в журнал плагина
-(`removed branch|copy <репозиторий>:<ветка> at <sha>`; для копии — ещё
-её HEAD); `bb orchestrator janitor run`/`report --json` выводят их.
-Вернуть удалённую ветку:
+Before every removal the janitor records the removed object's SHA in the
+database (`janitor_items.tip_sha`) and a plugin journal line
+(`removed branch|copy <repo>:<branch> at <sha>`; for a copy — also its
+HEAD); `bb orchestrator janitor run`/`report --json` print them. To
+bring back a removed branch:
 
 ```
-git -C <репозиторий> branch <ветка> <sha>
+git -C <repo> branch <branch> <sha>
 ```
 
-Восстановление работает, пока `git gc` не убрал объекты — ориентировочно
-две недели (стандартный `gc.pruneExpire`). После — ни ветку, ни копию
-не вернуть.
+Recovery works until `git gc` drops the objects — roughly two weeks
+(the default `gc.pruneExpire`). After that neither the branch nor the
+copy can be restored.
 
-Незакоммиченное в грязной копии исполнителя спасается снимком
-(`refs/orchestrator/rescue/<тред>[-<N>]`) и при архиве треда, и при его
-удалении — в окне ~5 минут до уборки среды BB; каждая попытка пишется в
-таблицу спасений и видна в `bb orchestrator janitor report` (в т. ч.
-когда строка координатору не дошла).
+Uncommitted work in an executor's dirty copy is rescued with a snapshot
+(`refs/orchestrator/rescue/<thread>[-<N>]`) on both thread archival and
+deletion — inside the ~5 minute window before BB cleans the environment
+up; every attempt is written to the rescue ledger and shows in
+`bb orchestrator janitor report` (including when the coordinator line
+never arrived).
 
-## Настройка под свой процесс
+## Fitting your process
 
-После выкладки `release` может выполнить шаги `postPublish`: обновить
-настроенную копию, запустить команды через общий запускатель (журнал
-`command_runs`), перезагрузить плагины. Полная схема —
-`docs/specs/orchestrator-release.md` §6 и `docs/specs/orchestrator.md`
-§18; здесь — частые примеры.
+After a publish, `release` can run `postPublish` steps: update a
+configured checkout, run commands through the shared runner (the
+`command_runs` ledger), reload plugins. The full schema is
+`docs/specs/orchestrator-release.md` §6 and `docs/specs/orchestrator.md`
+§18; frequent examples follow.
 
-> Все команды из этой настройки **исполняет сам плагин с правами BB**.
-> Каждый запуск пишется в журнал (argv, cwd, вывод до 300 символов с
-> маскировкой секретов) и идёт списком аргументов без shell — `sh -c`
-> используется только если вы сами так записали команду. Маскировка —
-> страховка от типовых утечек (токены, пароли в URL), а не гарантия:
-> секрет в нестандартном виде останется в журнале — не печатайте их.
-> Изменение исполняемых полей (`eventHooks`, `postPublish.commands`,
-> `checks`, `prProvider` с типом `command`) фиксируется снимком
-> доверия и сообщается координаторам с незавершённой работой — не
-> включайте хуки и postPublish для настроек, которым не доверяете.
-> Хуки и команды выполняются от пользователя BB: агент с доступом к
-> shell (и к `bb` CLI) может изменить эти настройки — давать агентам
-> shell значит доверять им это.
+> Every command in this section is **executed by the plugin itself with
+> BB's rights**. Each run is journaled (argv, cwd, up to 300 chars of
+> output with secrets masked) and goes as an argv list without a shell —
+> `sh -c` is used only when you write the command that way yourself.
+> Masking is a safety net against typical leaks (tokens, passwords in
+> URLs), not a guarantee: a secret in a non-standard shape stays in the
+> journal — do not print them. Changing executable fields (`eventHooks`,
+> `postPublish.commands`, `checks`, a `command`-type `prProvider`) is
+> captured by the trust snapshot and reported to coordinators with
+> unfinished work — do not enable hooks and postPublish for settings you
+> do not trust. Hooks and commands run as the BB user: an agent with
+> shell access (and the `bb` CLI) can change these settings — giving
+> agents a shell means trusting them with it.
 
-### Плагин в корне репозитория
+### Plugin at the repository root
 
-`checkout` — любой каталог, не обязательно `…/plugins/<id>`:
-перезагружаются плагины, чей `rootDir` в реестре лежит внутри копии и у
-которых изменились файлы. `checkout` можно опустить — тогда выполняются
-только команды.
+`checkout` is any directory, not necessarily `…/plugins/<id>`: the
+plugins reloaded are those whose `rootDir` in the registry lies inside
+the checkout and whose files changed. `checkout` may be omitted — then
+only the commands run.
 
 ```json
 {
@@ -319,14 +338,14 @@ git -C <репозиторий> branch <ветка> <sha>
 }
 ```
 
-### Своё действие после выкладки
+### A custom action after publish
 
-`commands` — список `{name, run | command, cwd, timeoutSec, when,
-stopOnFail, installsDeps}`: `run` — argv-массив без shell (схема §18.2),
-`command` — строка `sh -c`, если shell нужен явно. `cwd: "checkout"` —
-каталог копии, иначе путь (относительный — от каталога репозитория);
-по умолчанию — `checkout`, если он настроен, иначе основной каталог
-репозитория. В env уходят
+`commands` is a list of `{name, run | command, cwd, timeoutSec, when,
+stopOnFail, installsDeps}`: `run` — an argv array without a shell
+(schema §18.2), `command` — an `sh -c` string when a shell is really
+needed. `cwd: "checkout"` — the checkout directory, otherwise a path
+(relative — from the repository directory); the default is `checkout`
+when configured, else the repository's main directory. The env carries
 `ORCH_EVENT` (`release.published` | `pr.merged`), `ORCH_TASK`,
 `ORCH_SHA`, `ORCH_BRANCH`, `ORCH_TARGET`, `ORCH_REPO_DIR`:
 
@@ -342,48 +361,48 @@ stopOnFail, installsDeps}`: `run` — argv-массив без shell (схема
 }
 ```
 
-`when` — glob (`*`, `?`, `**`), хотя бы один патч против изменённых
-выкладкой путей; `stopOnFail` — падение обязательной команды пропускает
-все поздние; `installsDeps` — успешная команда снимает с плагинов
-пропуск «изменены зависимости — переустанови вручную».
+`when` — globs (`*`, `?`, `**`), at least one must match a path the
+publish changed; `stopOnFail` — a failed required command skips all
+later ones; `installsDeps` — a successful command clears the plugins'
+"dependencies changed — reinstall manually" skip.
 
-### GitLab и другие PR-провайдеры
+### GitLab and other PR providers
 
-`prProvider` задаётся в слоях `defaults`/`projects`; объект проекта
-заменяет объект `defaults` целиком, без слияния по ключам — в отличие
-от `timing` и `leaks`. Выбирает, чем открывается и досматривается PR
+`prProvider` is set in the `defaults`/`projects` layers; a project's
+object replaces the `defaults` object whole, with no per-key merge —
+unlike `timing` and `leaks`. It picks what opens and tracks the PR
 (§18.3):
 
-- `{ "type": "github" }` — по умолчанию; работает через `gh`. На шаге 1
-  выкладки, до аудита, проверяется `gh auth status`.
+- `{ "type": "github" }` — the default; works through `gh`. `gh auth
+  status` is checked at release step 1, before the audit.
 - `{ "type": "command", "create": [...], "view": [...], "find": [...]? }` —
-  свои исполняемые файлы (argv без shell). `create` и `view` обязательны и
-  проверяются на шаге 1: файла нет или он не исполняемый — выкладка
-  отказывает до аудита. `find` необязателен.
-- `{ "type": "none" }` — ветка публикуется, PR не открывается и не
-  отслеживается: строка «ветка опубликована …; PR открой вручную»,
-  задача `in_review`. `postPublish.on: "merged"` при `none` не сработает
-  никогда — настройка предупреждает об этом при чтении.
+  your own executables (argv, no shell). `create` and `view` are required
+  and checked at step 1: a missing or non-executable file refuses the
+  release before the audit. `find` is optional.
+- `{ "type": "none" }` — the branch is published, no PR is opened or
+  tracked: the "branch published …; open the PR manually" line, task
+  `in_review`. `postPublish.on: "merged"` never fires with `none` — the
+  setting warns about it when read.
 
-Контракт `command` (каталог запуска — основной каталог репозитория,
-таймаут `timing.prCommandTimeoutSec`): команды провайдера идут тем же
-запускателем, что `postPublish.commands` — каждая в своей группе
-процессов, по таймауту группе шлётся SIGTERM, затем SIGKILL, так что
-зависшая обёртка не подвешивает выкладку и слежение. `create` получает
-`ORCH_BRANCH`, `ORCH_TARGET`, `ORCH_TITLE` и тело PR в stdin, печатает
-URL (`https?://…` — первая такая строка); ненулевой код — отказ, даже
-если URL напечатан. URL с учётными данными (`user:pass@`) — отказ
-«PR не открыт: URL с учётными данными», в записи и строки он не
-попадает. `view` получает `ORCH_PR_URL`, печатает JSON
+The `command` contract (working directory — the repository's main
+directory, timeout `timing.prCommandTimeoutSec`): provider commands go
+through the same runner as `postPublish.commands` — each in its own
+process group, on timeout the group gets SIGTERM then SIGKILL, so a
+stuck wrapper cannot wedge the release or the tracking. `create` gets
+`ORCH_BRANCH`, `ORCH_TARGET`, `ORCH_TITLE` and the PR body on stdin and
+prints the URL (`https?://…` — the first such line); a non-zero exit is
+a refusal even when a URL was printed. A URL with credentials
+(`user:pass@`) is refused with "PR not opened: URL with credentials" —
+it reaches neither the record nor the line. `view` gets `ORCH_PR_URL`
+and prints JSON
 `{"state":"OPEN"|"MERGED"|"CLOSED","mergeCommit":"<sha>"|null}`.
-`find` получает `ORCH_BRANCH`, `ORCH_TARGET`, печатает URL открытого PR
-ветки или пусто; без `find` повторная выкладка задачи переиспользует
-`pr_url` прошлой выкладки этой задачи и ветки этим же координатором,
-если `view` отвечает `OPEN`. Весь вывод провайдера в строках
-координатору проходит ту же очистку и маскировку секретов, что вывод
-команд.
+`find` gets `ORCH_BRANCH`, `ORCH_TARGET` and prints the branch's open
+PR URL or nothing; without `find` a repeated release of the task reuses
+the `pr_url` of this task+branch's earlier release by this coordinator
+when `view` answers `OPEN`. All provider output in coordinator lines
+gets the same cleanup and secret masking as command output.
 
-GitLab через `command` (пример со скриптами-обёртками над `glab`):
+GitLab via `command` (example with `glab` wrapper scripts):
 
 ```json
 "defaults": {
@@ -398,31 +417,32 @@ GitLab через `command` (пример со скриптами-обёртка
 ```
 
 ```sh
-# /home/example/tools/mr-view.sh — печатает JSON для слежения
+# /home/example/tools/mr-view.sh — prints the tracking JSON
 glab mr view "$ORCH_PR_URL" -F json | jq '{
   state: (if .state == "merged" then "MERGED"
           elif .state == "closed" then "CLOSED" else "OPEN" end),
   mergeCommit: .merge_commit_sha }'
 ```
 
-### Тело PR и заметка в базу знаний
+### The PR body and the knowledge-base note
 
-`prBody` (слоёно, по умолчанию `BB-Thread: {thread}\n\nBB-Task: {task}`)
-— шаблон тела PR с подстановками `{thread}`, `{task}`, `{title}`. При
-`threadIds: false` шаблон не применяется — тело пустое (id треда и ключ
-задачи не публикуются, §16.6). Разбор «чей PR» при повторной выкладке —
-по маркеру в теле; разбираются только два маркера: `BB-Thread: thr_…`
-и прежний «Источник: bb тред thr_…». Свой шаблон с `{thread}` в другом
-виде («Thread: {thread}») разбираемого маркера не создаёт — тогда, как
-и при `threadIds: false`, «свой PR» определяется по своим записям о
-прошлых выкладках этой задачи этим координатором; чужой PR не
-трогается (§18.3).
+`prBody` (layered, default `BB-Thread: {thread}\n\nBB-Task: {task}`) —
+the PR body template with `{thread}`, `{task}`, `{title}`
+substitutions. With `threadIds: false` the template is not applied —
+the body is empty (the thread id and task key are not published,
+§16.6). "Whose PR" resolution on a repeated release goes by the body
+marker; only two markers are parsed: `BB-Thread: thr_…` and the
+previous "Источник: bb тред thr_…". A custom template spelling
+`{thread}` differently ("Thread: {thread}") creates no parseable
+marker — then, as with `threadIds: false`, "own PR" is determined from
+the coordinator's own records of this task's earlier releases; a
+foreign PR is never touched (§18.3).
 
-`requireNote` (по умолчанию `false`) при `true` делает `--kb <заметка>`
-или `--no-kb <причина>` обязательными: шаг 1 выкладки без одного из
-флагов отказывает «нужна заметка: --kb … или --no-kb …».
+`requireNote` (default `false`) at `true` makes `--kb <note>` or
+`--no-kb <reason>` mandatory: release step 1 without one of the flags
+refuses "a note is required: --kb … or --no-kb …".
 
-### Хук в чат
+### A chat hook
 
 ```json
 "postPublish": {
@@ -434,15 +454,15 @@ glab mr view "$ORCH_PR_URL" -F json | jq '{
 }
 ```
 
-### Хуки событий (`eventHooks`)
+### Event hooks (`eventHooks`)
 
-Хуки — отдельная настройка плагина `eventHooks` (уровня плагина, не
-документа `release`; имя `hooks` занято git-хуками): реакция на
-события конвейера, не только на выкладку. Каждое событие пишется в
-таблицу `events` в той же транзакции, что и породивший его переход, и
-там же сопоставляется с действующими хуками — хук, добавленный или
-переименованный после события, по нему не запускается. История до
-миграции событий не порождает.
+Hooks are a separate plugin setting `eventHooks` (plugin-level, not the
+`release` document; the `hooks` name is taken by git hooks): a reaction
+to pipeline events, not only releases. Each event is written to the
+`events` table in the same transaction as the transition that produced
+it and matched against the active hooks there — a hook added or
+renamed after the event does not fire for it. Pre-migration history
+produces no events.
 
 ```json
 [
@@ -462,105 +482,106 @@ glab mr view "$ORCH_PR_URL" -F json | jq '{
 ]
 ```
 
-Поля хука: `on` — виды событий; `run` — argv без shell (каталог
-запуска — каталог данных плагина; свой каталог задавайте в команде);
-`projects` — необязательный фильтр по проекту события; `timeoutSec` —
-120 по умолчанию; `notifyOnFail` — по умолчанию `false`, при `true`
-плагин шлёт координатору одну строку «хук name на событие упал:
-итог» на серию сбоев — следующая только после успешного запуска этого
-хука. «Сбой» — исходы `failed` и `timeout`; `interrupted` после
-рестарта плагина («прервана перезапуском») — тоже строка, если
-включено.
+Hook fields: `on` — event kinds; `run` — argv without a shell (working
+directory — the plugin data dir; set your own directory inside the
+command); `projects` — an optional filter by the event's project;
+`timeoutSec` — 120 by default; `notifyOnFail` — `false` by default, at
+`true` the plugin sends the coordinator one "hook <name> failed on the
+event: <result>" line per failure streak — the next one only after this
+hook runs successfully. A "failure" is the `failed` and `timeout`
+outcomes; `interrupted` after a plugin restart ("interrupted by
+restart") counts too when enabled.
 
-Имена хуков уникальны (пробелы по краям не считаются). При любой
-ошибке разбора `eventHooks` хуки не запускаются вовсе — события в
-журнал `events` продолжают писаться, а сверка доверия видит изменения
-и с битым документом. Хук, не читающий stdin, — норма: ошибка записи
-в него игнорируется и не роняет плагин.
+Hook names are unique (edge whitespace ignored). On ANY `eventHooks`
+parse error no hooks run at all — events keep landing in the `events`
+journal and the trust check still sees the changes with a broken
+document. A hook that does not read stdin is normal: a write error to
+it is ignored and does not crash the plugin.
 
-События v1: `delegation.done` (все уровни, включая ревью; кроме
-`release-audit` — его исход это события выкладки), `delegation.failed`,
-`delegation.stalled` (`reason`: `stalled`/`quota`), `review.verdict`
-(делегирование ревью с прочитанным вердиктом — один раз на
-делегирование; `verdict`, `blockers`), `release.published`,
-`release.rejected`, `release.failed`, `pr.merged`, `pr.closed`.
-Оживлённый тред (`done` → `running` → `done`) порождает
-`delegation.done` повторно — с новым id события; пишите хуки
-идемпотентными по `delegationId`, если это важно.
+Events v1: `delegation.done` (all levels including review; except
+`release-audit` — its outcome is the release events),
+`delegation.failed`, `delegation.stalled` (`reason`:
+`stalled`/`quota`), `review.verdict` (a review delegation with a read
+verdict — once per delegation; `verdict`, `blockers`),
+`release.published`, `release.rejected`, `release.failed`, `pr.merged`,
+`pr.closed`. A revived thread (`done` → `running` → `done`) produces
+`delegation.done` again — with a new event id; write hooks idempotent
+by `delegationId` where it matters.
 
-Хук получает JSON события v1 в stdin — `{ "version": 1, "event",
+A hook receives the v1 event JSON on stdin — `{ "version": 1, "event",
 "at", "task", "project", "coordinatorThreadId", "delegationId"?,
 "level"?, "route"?, "threadId"?, "reason"?, "verdict"?, "blockers"?,
-"releaseId"?, "sha"?, "branch"?, "target"?, "prUrl"? }` — и окружение
-`ORCH_EVENT`, `ORCH_TASK`, `ORCH_PROJECT`. У событий делегирования
-`project` — проект делегирования; у событий выкладки и PR — проект
-настройки выкладки (`settings_project_id`), с ним же сравнивается
-`projects` хука. Запуск — общим запускателем (журнал `command_runs`,
-`source: "hook"`), записи `events` и журнала хранятся `retentionDays`
-дней (30).
+"releaseId"?, "sha"?, "branch"?, "target"?, "prUrl"? }` — and the
+`ORCH_EVENT`, `ORCH_TASK`, `ORCH_PROJECT` environment. For delegation
+events `project` is the delegation's project; for release and PR
+events — the release settings project (`settings_project_id`), which
+the hook's `projects` is compared against. Execution goes through the
+shared runner (the `command_runs` ledger, `source: "hook"`); `events`
+and journal records are kept `retentionDays` days (30).
 
-### Тексты ролей, хендофф и userThreadPlugins
+### Role texts, handoff and userThreadPlugins
 
-`roleTexts` — дополнение к тексту роли (не замена): ключи только
-`orchestrator`, `executor`, `auditor`; обязательные части (запрет
-`sudo`/пакетов/хоста, JSON-вердикт аудитора) плагин добавляет сам
-после вашего текста, `release-auditor` не переопределяется, итог —
-не длиннее 2500 символов. `handoffPath` — путь хендоффа в текстах
-ролей и напоминании о сжатии (по умолчанию
-`$BB_THREAD_STORAGE/HANDOFF.md`). `userThreadPlugins` — id плагинов,
-продолжающих чат человека (по умолчанию пусто).
+`roleTexts` — an addition to a role's text (not a replacement): the only
+keys are `orchestrator`, `executor`, `auditor`; the mandatory parts (the
+`sudo`/packages/host ban, the auditor's JSON verdict) are appended by the
+plugin after your text, `release-auditor` cannot be overridden, the
+result must stay within 2500 characters. `handoffPath` — the handoff
+path in the role texts and the compaction reminder (default
+`$BB_THREAD_STORAGE/HANDOFF.md`). `userThreadPlugins` — ids of plugins
+that continue a human's chat (empty by default).
 
 ```json
-"roleTexts": "{\"orchestrator\": \"- Отчёты владельцу — по-русски.\"}",
+"roleTexts": "{\"orchestrator\": \"- Owner reports go in Russian.\"}",
 "handoffPath": "/home/example/HANDOFF.md",
 "userThreadPlugins": "handoff external-compact"
 ```
 
-Поведение прежней установки автора сохраняется явными значениями:
+The previous author install's behavior is preserved by explicit values:
 `userThreadPlugins: "handoff external-compact"`, `leaks.trailers:
-"block"` в `defaults` выкладки, `commitIdentity`, `postPublish.
+"block"` in the release `defaults`, `commitIdentity`, `postPublish.
 reloadPlugins: true`, `prBody: "Источник: bb тред {thread}\n\nЗадача:
-{task}"` — без них умолчания новой установки (пустой список, `warn`,
-нейтральный `prBody`) мягче прежних.
+{task}"` — without them the new install's defaults (an empty list,
+`warn`, a neutral `prBody`) are softer than the old ones.
 
-### Таймауты
+### Timeouts
 
-`timing` в слоях `release` (defaults + projects, слияние по ключам):
+`timing` in the `release` layers (defaults + projects, per-key merge):
 `auditTimeoutMinutes` (30), `checksMinutes` (10), `prepareMinutes`
 (20), `prPollMinutes` (5), `prStaleHours` (72), `prReopenWatchHours`
 (72), `prErrorLimit` (3), `prCommandTimeoutSec` (60),
-`commandTimeoutSec` (300), `postPublishWaitMinutes` (30 — срок
-только на ожидание: замок копии, очередь команд, удержание
-перезагрузки; запущенную команду ограничивает её `timeoutSec`).
-Таймауты сторожа — `policy.timing`:
-`quotaHoldMinutes` (15), `approvalRepeatMinutes` (10),
-`postDispatchGraceMinutes` (5), `bbNotifyWaitSeconds` (120). Значения
-вне пределов — предупреждение и дефолт, не ошибка конфига.
+`commandTimeoutSec` (300), `postPublishWaitMinutes` (30 — the limit
+covers only waiting: the copy lock, the command queue, the reload
+postponement; a running command is bounded by its `timeoutSec`).
+Watchdog timeouts — `policy.timing`: `quotaHoldMinutes` (15),
+`approvalRepeatMinutes` (10), `postDispatchGraceMinutes` (5),
+`bbNotifyWaitSeconds` (120). Out-of-range values warn and fall back to
+the default, not a config error.
 
-## Ограничения
+## Limitations
 
-- **Платформа — Linux.** Команды запускаются через `sh` (postPublish
-  `command`, свои обёртки) каждая в своей группе процессов — по
-  таймауту группе шлётся SIGTERM, затем SIGKILL; уборщик читает
-  `/proc/<pid>/cwd`. macOS и Windows не поддерживаются.
-- **Внешние программы.** Обязательные: `git` ≥ 2.39 (`patch-id
-  --verbatim`, `merge-tree --write-tree`) и `gitleaks` — без него шаг
-  машинного скана выкладки отказывает. `gh` — только при
-  `prProvider: "github"` (на шаге 1 проверяется `gh auth status`);
-  `prProvider: "command"`/`"none"` работают без `gh`. Свои программы —
-  `postPublish.commands`, `eventHooks`, `prProvider.command` — по
-  настройке.
-- **Исполнители на другой машине не поддержаны.** Итог захода
-  (`result_sha`, `result_commits`, `result_dirty`), `merge` и спасение
-  грязной копии читают worktree локальным `git -C` — среда исполнителя
-  должна жить на том же хосте, что и сервер bb с плагином.
-- **Без `/proc` уборщик ничего не удаляет.** Проверка «в копии нет
-  живого процесса» (§15 п.5) читает `/proc/<pid>/cwd`; на системе без
-  `/proc` (например macOS) каждая копия остаётся `process-unknown` —
-  прогоны работают, но ничего не снимается.
-- **Git ≥ 2.39.** Ниже — `patch-id --verbatim` не существует: уборщик
-  отказывает прогон, а `merge --dry-run` — с подсказкой обновить git
-  (`merge-tree --write-tree` — с 2.38).
+- **Linux only.** Commands run through `sh` (postPublish `command`,
+  custom wrappers) each in its own process group — on timeout the group
+  gets SIGTERM then SIGKILL; the janitor reads `/proc/<pid>/cwd`. macOS
+  and Windows are not supported.
+- **External programs.** Required: `git` ≥ 2.39 (`patch-id --verbatim`,
+  `merge-tree --write-tree`) and `gitleaks` — without it the release's
+  machine-scan step refuses. `gh` — only with `prProvider: "github"`
+  (`gh auth status` is checked at step 1); `prProvider:
+  "command"`/`"none"` work without `gh`. Custom programs —
+  `postPublish.commands`, `eventHooks`, `prProvider.command` — per
+  configuration.
+- **Executors on another machine are unsupported.** The round result
+  (`result_sha`, `result_commits`, `result_dirty`), `merge` and the
+  dirty-copy rescue read the worktree via local `git -C` — the
+  executor's environment must live on the same host as the bb server
+  running the plugin.
+- **Without `/proc` the janitor removes nothing.** The "no live process
+  in the copy" check (§15 item 5) reads `/proc/<pid>/cwd`; on a system
+  without `/proc` (e.g. macOS) every copy stays `process-unknown` —
+  passes run but nothing is removed.
+- **Git ≥ 2.39.** Below that `patch-id --verbatim` does not exist: the
+  janitor refuses the pass and `merge --dry-run` hints to upgrade git
+  (`merge-tree --write-tree` exists since 2.38).
 
 ## Development
 

@@ -94,63 +94,17 @@ export interface RoleDefinition {
  * The user cannot remove the mandatory parts via `roleTexts`.
  * `release-auditor` is not customizable at all.
  */
-const ORCHESTRATOR_BODY = `Ты — оркестратор. Твоя роль — раздавать работу исполнителям, а не выполнять её самому.
-
-- Составную задачу не делай сам: декомпозируй её в задачи bb tasks со спеками и раздавай исполнителям через orchestrator_delegate (bb orchestrator delegate <KEY> --level <уровень>).
-- Уровень выбирай по сложности; сомневаешься — бери выше, сложное не понижай.
-- После раздачи заканчивай ход: итог исполнителя придёт сам — сообщением [bb system] … completed от BB или строкой [orchestrator] (исход, ветка, sha7, копия, отчёт), ждать в форграунде нельзя.
-- Результат исполнителя проверяй сам, прежде чем сводить и отчитываться.
-- Ревью спек до раздачи и результата после — на уровне {review} (роль auditor).
-- Сведение и выкладка результата — только твоя зона: исполнители сдают работу тебе.
-- Хендофф: веди файл HANDOFF.md в хранилище своего треда ({handoff}) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше; со ссылками на треды исполнителей и их задачи. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.
-- Доработку раздавай новым delegate той же задачи: плагин сам продолжит работу с коммита прошлого захода (--from <sha|ветка> — своя точка, --fresh — заново).
-- Ветку и рабочую копию исполнителя не открывай в других копиях: итог захода снимает плагин.
-- Свои поллеры поверх сторожа не ставь: исходы (зависание, квота, падение, перевыпуск) приходят сообщениями [orchestrator].
-- Не раздавай вручную (bb tasks dispatch, bb thread spawn) — только delegate.`;
-
-const EXECUTOR_BODY = `Ты — исполнитель. Твоя роль — выполнить поставленную задачу самостоятельно.
-
-- Задачу делаешь ты: субагентов не запускай и работу не перераздавай.
-- Делай строго по спеке задачи; расхождение со спекой — вопрос координатору, а не самодеятельность.
-- Правила работы с git — раздел «Работа с git» в инструкциях задачи.
-- Отчёт — по контракту из описания задачи.
-- Хендофф: веди файл HANDOFF.md в хранилище своего треда ({handoff}) — цель, решения пользователя, что сделано (ветки, SHA, задачи), что в работе и что дальше. Обновляй после каждого значимого шага и до того, как контекст заполнится; после сжатия контекста или перезапуска первым делом прочитай его. Нет $BB_THREAD_STORAGE у провайдера — ~/.cache/bb-handoff/<id треда>.md, не в рабочей копии.`;
-
-const AUDITOR_BODY = `Ты — аудитор. Твоя роль — только читать и проверять, ничего не меняя.
-
-- Не правь файлы, не коммить, не запускай раздачу и субагентов.
-- Проверяй по контракту: документация проекта — источник истины, код сверяй с ней.
-- Формат находок: место (файл:строки) → проблема → исправление. Без находок — явный вердикт «замечаний нет».
-- Разделяй факты и оценки; сомнительное помечай, а не выдавай за факт.
-- Отчёт — список находок или «замечаний нет»; изменений в репозитории быть не должно.`;
-
-const RELEASE_AUDITOR_BODY = `Ты — проверяющий агент выкладки (release-auditor). Твоя роль — только читать и проверять выпуск перед публикацией, ничего не меняя.
-
-- Не правь файлы, не коммить, не пушь, не запускай раздачу и субагентов. Все проверки — только чтением.
-- Вход аудита — файл, указанный в задаче: дифф выкладки, сообщения и метаданные коммитов, список связанных документов, находки машинного скана.
-- Проверь два блока:
-  1. Документация актуальна: каждое изменение поведения в коде отражено в связанных спеках, ADR и документации; нет противоречий «код ↔ спека»; ревизии и даты обновлены. Если указан явный отказ от правки документов (флаг --no-docs с причиной, трейлер Docs-not-needed) — оцени, обоснована ли причина.
-  2. Утечки всех категорий: секреты (токены, ключи, .env, VPN-конфиги, ссылки vless://), личность автора (личная почта, чужие подписи и трейлеры ботов), привязка к машине (абсолютные пути, имена хостов, внутренние IP), идентификаторы bb (thr_/proj_/env_/*.getbb.app в коде и документах; трейлер BB-Thread: в сообщении коммита разрешён), смысловые (имена людей, описание личной инфраструктуры, приватные переписки).
-- Находки не содержат значений секретов: значение маскируй (например ghp_abc123 → ghp_…***), иначе находка сама становится утечкой.
-- Итог — ОДНО сообщение строгим JSON без пояснений вокруг:
-  {"verdict":"APPROVE"|"REJECT","findings":[{"category":"docs|secrets|identity|machine|bbIds|semantic","file":"<path>","line":<n>,"problem":"<что>","fix":"<как исправить>"}]}
-  APPROVE — только когда находок нет. Любой другой формат будет засчитан как REJECT.`;
-
-/** §18.6: the mandatory tails — added by the plugin, never removable. */
-const ROLE_MANDATORY: Partial<Record<RoleId, string>> = {
-  orchestrator:
-    "- Машину вне рабочих копий не меняй: ни sudo, ни установки пакетов, ни настроек хоста — чего-то не хватает, сообщи пользователю (он и есть координатор этого чата).",
-  executor:
-    "- Машину вне своей рабочей копии не меняй: ни sudo, ни установки пакетов — чего-то не хватает, сообщи координатору, не делай сам.",
-  auditor:
-    'Заканчивай отчёт строкой JSON {"verdict":"OK"|"CHANGES","blockers":<число блокирующих находок>} — её читает конвейер выкладки.',
+const ROLE_BODY_KEYS: Record<RoleId, string> = {
+  orchestrator: "role.body.orchestrator",
+  executor: "role.body.executor",
+  auditor: "role.body.auditor",
+  "release-auditor": "role.body.releaseAuditor",
 };
 
-const ROLE_BODIES: Record<RoleId, string> = {
-  orchestrator: ORCHESTRATOR_BODY,
-  executor: EXECUTOR_BODY,
-  auditor: AUDITOR_BODY,
-  "release-auditor": RELEASE_AUDITOR_BODY,
+const ROLE_MANDATORY_KEYS: Partial<Record<RoleId, string>> = {
+  orchestrator: "role.mand.orchestrator",
+  executor: "role.mand.executor",
+  auditor: "role.mand.auditor",
 };
 
 /**
@@ -167,16 +121,21 @@ export function roleInstructions(
     handoffPath?: string | undefined;
     /** The review level's name from the policy (orchestrator text). */
     reviewLevel?: string | undefined;
+    /** §18.1: the language catalog (defaults to T_RU). */
+    t?: T | undefined;
   },
 ): string {
-  const body = ROLE_BODIES[id]
-    .replaceAll("{handoff}", opts?.handoffPath ?? DEFAULT_HANDOFF_PATH)
-    .replaceAll("{review}", opts?.reviewLevel ?? DEFAULT_REVIEW_LEVEL);
+  const t = opts?.t ?? T_RU;
+  const body = t(ROLE_BODY_KEYS[id]!, {
+    handoff: opts?.handoffPath ?? DEFAULT_HANDOFF_PATH,
+    review: opts?.reviewLevel ?? DEFAULT_REVIEW_LEVEL,
+  });
   // §18.6: `release-auditor` is not customizable — `roleTexts` keys are
   // rejected at parse, and the composer ignores an addition here too.
   const extra =
     id === "release-auditor" ? undefined : opts?.extra?.trim();
-  const mandatory = ROLE_MANDATORY[id];
+  const mandatoryKey = ROLE_MANDATORY_KEYS[id];
+  const mandatory = mandatoryKey ? t(mandatoryKey) : undefined;
   return (
     body +
     (extra ? `\n${extra}` : "") +
@@ -277,6 +236,7 @@ export function parseRoleTexts(
         extra,
         handoffPath: opts?.handoffPath,
         reviewLevel: opts?.reviewLevel,
+        t,
       }).length > ROLE_INSTRUCTIONS_MAX
     ) {
       errors.push({

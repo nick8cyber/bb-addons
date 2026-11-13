@@ -22,6 +22,7 @@ import {
   type WatchdogThreadDto,
   type WatchdogThreadEvent,
 } from "../src/watchdog.js";
+import { createT } from "../src/i18n/index.js";
 
 const POLICY = JSON.stringify({
   version: 1,
@@ -79,6 +80,8 @@ function makeHarness(
       limit?: string;
       types?: readonly string[];
     }) => boolean;
+    /** §18.1: the language catalog under test (default — ru). */
+    t?: WatchdogDeps["t"];
     /** §18.6: the configured handoff path for the §16.5 memo. */
     handoffPath?: string;
   } = {},
@@ -380,6 +383,7 @@ function makeHarness(
         else retryPendingRows.delete(threadId);
       },
     },
+    ...(opts.t ? { t: opts.t } : {}),
     ...(opts.round ? { round: opts.round } : {}),
     ...(opts.handoffPath
       ? { handoffPath: () => opts.handoffPath! }
@@ -654,6 +658,18 @@ test("timeout → one coordinator message, never repeated", async () => {
   assert.match(JSON.stringify(h.sends[0]!.input), /maxRunSeconds/);
   await h.wd.checkTimers();
   assert.equal(h.sends.length, 1);
+});
+
+test("§18.1: the timeout notice goes English under the en catalog", async () => {
+  const h = makeHarness({ t: createT("en") });
+  h.insertActive({ threadId: "thr_e1", createdAt: T0 - 400_000 });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  await h.wd.checkTimers();
+  assert.equal(h.sends.length, 1);
+  assert.match(
+    JSON.stringify(h.sends[0]!.input),
+    /over maxRunSeconds \(300s\): task .* thread thr_e1 — not stopping it/,
+  );
 });
 
 test("idle with a non-empty queue stays running; empty → done", async () => {

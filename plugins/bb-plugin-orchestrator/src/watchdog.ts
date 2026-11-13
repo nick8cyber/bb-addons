@@ -41,6 +41,7 @@ import {
   verdictDetailsInBody,
 } from "./release.js";
 import { DEFAULT_HANDOFF_PATH } from "./roles.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
 export const BUILTIN_QUOTA_PATTERNS = [
@@ -312,6 +313,8 @@ export interface ReconcileSummary {
 
 export interface WatchdogDeps {
   store: DelegationStore;
+  /** §18.1: the language catalog (defaults to T_RU). */
+  t?: T;
   bbCli: BbCli;
   threads: WatchdogThreads;
   loadPolicy(): Promise<PolicyLoad>;
@@ -502,6 +505,7 @@ export function createWatchdog(deps: WatchdogDeps) {
   const store = deps.store;
   const now = deps.now ?? Date.now;
   const log = deps.log ?? {};
+  const t = deps.t ?? T_RU;
   /** `system/thread/interrupted` seen in the stream since the latest turn. */
   const interrupted = new Set<number>();
   /** Latest provider/system error text per delegation, for `failed` reports. */
@@ -799,18 +803,18 @@ export function createWatchdog(deps: WatchdogDeps) {
     const info = await routeInfo(row);
     const outcomeText =
       outcome === "stalled"
-        ? "исполнитель завис"
+        ? t("wd.stalled")
         : outcome === "unavailable"
           ? detail
-            ? `маршрут недоступен (${detail.slice(0, 120)})`
-            : "маршрут недоступен"
+            ? t("wd.unavailableDetail", { detail: detail.slice(0, 120) })
+            : t("wd.unavailable")
           : outcome === "failed"
             ? detail
-              ? `исполнитель завершился с ошибкой (${detail.slice(0, 120)})`
-              : "исполнитель завершился с ошибкой"
+              ? t("wd.failedDetail", { detail: detail.slice(0, 120) })
+              : t("wd.failed")
             : detail
-              ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
-              : "квота исполнителя исчерпана";
+              ? t("wd.quotaDetail", { detail: detail.slice(0, 120) })
+              : t("wd.quota");
     // §16.1: no reissue while the thread's own auto-retry is uncancelled
     // — the queued retry would lift the reissued-away thread back. A
     // cancel failure is a stop-not-confirmed: the §7 retry loop covers
@@ -822,16 +826,19 @@ export function createWatchdog(deps: WatchdogDeps) {
         store.addSetupError(
           row.id,
           "watchdog-stop",
-          `stop not confirmed: ${cancelled}`,
+          t("wd.stopNotConfirmed", { cancelled }),
         );
       }
       if (!hasSetupError(current, "watchdog-stop-reported")) {
         store.addSetupError(row.id, "watchdog-stop-reported", "coordinator notified");
         await report(
           row,
-          `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} — ` +
-            `не удалось отменить автоповтор исполнителя (${cancelled}), ` +
-            `перевыпуска нет, сверка повторит`,
+          t("wd.cancelRetryFailed", {
+            outcome: outcomeText,
+            task: row.task_key,
+            route: row.route,
+            cancelled,
+          }),
         );
       }
       return;
@@ -891,9 +898,11 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.addSetupError(row.id, "reissue-conflict", message(e));
           await report(
             row,
-            `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} — ` +
-              `перевыпуск за координатором: у задачи уже есть активное ` +
-              `делегирование`,
+            t("wd.reissueConflict", {
+              outcome: outcomeText,
+              task: row.task_key,
+              route: row.route,
+            }),
           );
         }
         return;
@@ -905,8 +914,13 @@ export function createWatchdog(deps: WatchdogDeps) {
           });
           await report(
             row,
-            `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} → ` +
-              `перевыпущено на ${nextName}, новый тред ${res.threadId ?? "—"}`,
+            t("wd.reissued", {
+              outcome: outcomeText,
+              task: row.task_key,
+              route: row.route,
+              next: nextName,
+              thread: res.threadId ?? "—",
+            }),
           );
         } catch (e) {
           const code = (e as { code?: string }).code;
@@ -919,24 +933,36 @@ export function createWatchdog(deps: WatchdogDeps) {
           await report(
             row,
             code === "dispatch-failed"
-              ? `${outcomeText}: задача ${row.task_key}, перевыпуск потерян — ` +
-                  `раздача на ${nextName} отклонена (${message(e)})`
-              : `${outcomeText}: задача ${row.task_key}, перевыпуск на ` +
-                  `${nextName} не удался: ${message(e)}`,
+              ? t("wd.reissueRefused", {
+                  outcome: outcomeText,
+                  task: row.task_key,
+                  next: nextName,
+                  error: message(e),
+                })
+              : t("wd.reissueFailed", {
+                  outcome: outcomeText,
+                  task: row.task_key,
+                  next: nextName,
+                  error: message(e),
+                }),
           );
         }
         return;
       }
     }
     const reason = !info.level?.autoFallback
-      ? "autoFallback выключен"
+      ? t("wd.noAutoFallback")
       : nextName
-        ? "запись уже ушла из исхода"
-        : "нет доступного маршрута в цепочке";
+        ? t("wd.rowGone")
+        : t("wd.noRoute");
     await report(
       row,
-      `${outcomeText}: задача ${row.task_key}, маршрут ${row.route} — ` +
-        `перевыпуск за координатором (${reason})`,
+      t("wd.reissueCoordinator", {
+        outcome: outcomeText,
+        task: row.task_key,
+        route: row.route,
+        reason,
+      }),
     );
   };
 
@@ -955,14 +981,14 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (detail) store.addSetupError(row.id, "outcome-detail", detail);
     const outcomeText =
       outcome === "stalled"
-        ? "исполнитель завис"
+        ? t("wd.stalled")
         : outcome === "failed"
           ? detail
-            ? `исполнитель завершился с ошибкой (${detail.slice(0, 120)})`
-            : "исполнитель завершился с ошибкой"
+            ? t("wd.failedDetail", { detail: detail.slice(0, 120) })
+            : t("wd.failed")
           : detail
-            ? `квота исполнителя исчерпана (${detail.slice(0, 120)})`
-            : "квота исполнителя исчерпана";
+            ? t("wd.quotaDetail", { detail: detail.slice(0, 120) })
+            : t("wd.quota");
     if (await confirmStop(row)) {
       await outcomeAndMaybeReissue(row, outcome, detail);
       return;
@@ -973,9 +999,12 @@ export function createWatchdog(deps: WatchdogDeps) {
       store.addSetupError(row.id, "watchdog-stop-reported", "coordinator notified");
       await report(
         row,
-        `${outcomeText}: задача ${row.task_key}, маршрут ${row.route}, ` +
-          `тред ${row.thread_id ?? "—"} — не удалось остановить исполнителя, ` +
-          `перевыпуск отложен, сверка повторит`,
+        t("wd.stopFailed", {
+          outcome: outcomeText,
+          task: row.task_key,
+          route: row.route,
+          thread: row.thread_id ?? "—",
+        }),
       );
     }
   };
@@ -998,7 +1027,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     const fresh = store.get(row.id);
     if (!fresh || fresh.status !== "running") return true;
     if (hasSetupError(fresh, "interrupted-resume-sent")) {
-      await toStalled(fresh, `повторное прерывание хода (${reason})`);
+      await toStalled(fresh, t("wd.interruptedAgain", { reason }));
       return true;
     }
     // §5.3 rev 15: the interrupt time opens the window for the NEW turn —
@@ -1010,12 +1039,16 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.setTurnStarted(fresh.id, at);
     store.addSetupError(fresh.id, "resume-await", reason);
     store.addSetupError(fresh.id, "interrupted-resume-sent", "1");
-    await sendToExecutor(fresh, `ход прерван (${reason}), продолжай задачу`);
+    await sendToExecutor(fresh, t("wd.resumeInterrupt", { reason }));
     await notifyCoordinator(
       fresh,
-      `ход исполнителя прерван (${reason}): задача ${fresh.task_key}, ` +
-        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"} — ` +
-        `послал продолжение (resume #${fresh.resume_count + 1})`,
+      t("wd.resumed", {
+        reason,
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+        n: fresh.resume_count + 1,
+      }),
     );
     return false;
   };
@@ -1061,7 +1094,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     store.setStatus(fresh.id, "stalled"); // §5.3: unavailable lands as stalled
     clearMarks(fresh.id);
-    const reason = `маршрут недоступен: ${detail.slice(0, 180)}`;
+    const reason = t("wd.unavailableReason", { detail: detail.slice(0, 180) });
     const { policy: p3 } = await deps.loadPolicy();
     const holdMs =
       (p3?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
@@ -1088,7 +1121,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     ) {
       return false;
     }
-    const reason = `маршрут недоступен: ${text.slice(0, 180)}`;
+    const reason = t("wd.unavailableReason", { detail: text.slice(0, 180) });
     const { policy: p4 } = await deps.loadPolicy();
     const holdMs =
       (p4?.timing?.quotaHoldMinutes ?? DEFAULT_QUOTA_HOLD_MINUTES) * 60_000;
@@ -1121,13 +1154,17 @@ export function createWatchdog(deps: WatchdogDeps) {
       store.addSetupError(
         fresh.id,
         "watchdog-stop",
-        `stop not confirmed: ${cancelled}`,
+        t("wd.stopNotConfirmed", { cancelled }),
       );
     }
     await report(
       fresh,
-      `исполнитель завершился с ошибкой: задача ${fresh.task_key}, ` +
-        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"} — ${errorText.slice(0, 300)}`,
+      t("wd.failedReport", {
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+        error: errorText.slice(0, 300),
+      }),
     );
   };
 
@@ -1149,8 +1186,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     // stopped the thread — nothing to stop.
     await commentOnTask(
       fresh,
-      `делегирование отменено: ${reason} (задача ${fresh.task_key}, ` +
-        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"})`,
+      t("wd.cancelledComment", {
+        reason,
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+      }),
     );
     // §16.5: cancelled delivers a result too — the same one-message
     // format as `done` («без отчёта» when the output is empty).
@@ -1438,7 +1479,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       return;
     }
     if (hasSetupError(fresh, "errored-resume-sent")) {
-      await toFailed(fresh, `повторный обрыв хода ошибкой: ${text.slice(0, 200)}`);
+      await toFailed(fresh, t("wd.erroredAgain", { text: text.slice(0, 200) }));
       return;
     }
     // The resume opens a new first-response window — `resume-await`
@@ -1450,14 +1491,17 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.addSetupError(fresh.id, "errored-resume-sent", "1");
     await sendToExecutor(
       fresh,
-      `ход оборвался ошибкой: ${text.slice(0, 300)}. Продолжай задачу`,
+      t("wd.resumeErrored", { text: text.slice(0, 300) }),
     );
     await notifyCoordinator(
       fresh,
-      `ход исполнителя оборвался ошибкой: задача ${fresh.task_key}, ` +
-        `маршрут ${fresh.route}, тред ${fresh.thread_id ?? "—"} — ` +
-        `послал продолжение (resume #${fresh.resume_count + 1}). ` +
-        `Ошибка: ${text.slice(0, 300)}`,
+      t("wd.resumedErrored", {
+        task: fresh.task_key,
+        route: fresh.route,
+        thread: fresh.thread_id ?? "—",
+        n: fresh.resume_count + 1,
+        text: text.slice(0, 300),
+      }),
     );
   };
 
@@ -1480,7 +1524,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         store.addSetupError(
           row.id,
           "round-result",
-          "среда исполнителя не найдена",
+          t("wd.noEnv"),
         );
         return;
       }
@@ -1535,7 +1579,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       const problems: string[] = [];
       if (env.branchName && branch !== env.branchName) {
         problems.push(
-          `ветка ${branch ?? "—"} вместо ${env.branchName} (ушёл в чужую ветку)`,
+          t("wd.wrongBranch", { branch: branch ?? "—", expected: env.branchName }),
         );
       }
       // §16.5 one channel (PLUG-184): the doubts ride the single result
@@ -1545,12 +1589,12 @@ export function createWatchdog(deps: WatchdogDeps) {
       // нет» never applies; commits that appeared anyway are the doubt.
       if (row.no_code) {
         if (commits !== null && commits > 0) {
-          problems.push(`задача без кода, но есть коммиты: ${commits}`);
+          problems.push(t("wd.noCodeCommits", { n: commits }));
         }
       } else if (commits === 0 && row.status !== "cancelled") {
-        problems.push("коммитов нет");
+        problems.push(t("wd.noCommits"));
       }
-      if (dirty) problems.push("копия грязная (незакоммиченные правки)");
+      if (dirty) problems.push(t("wd.dirtyCopy"));
       if (problems.length) {
         store.addSetupError(row.id, "round-problems", problems.join("; "));
       } else {
@@ -1645,9 +1689,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       );
       await notifyCoordinator(
         row,
-        `${row.task_key}: исполнитель ${row.thread_id} поднял новый ход ` +
-          `после исхода «${row.status}» — ${reason}: автоповтор отменён, ` +
-          `тред ${confirmed ? "остановлен" : "останавливаю"}`,
+        t("wd.revived", {
+          task: row.task_key,
+          thread: row.thread_id ?? "—",
+          status: row.status,
+          reason,
+          action: confirmed ? t("wd.stopped") : t("wd.stopping"),
+        }),
       );
     }
   };
@@ -1800,8 +1848,8 @@ export function createWatchdog(deps: WatchdogDeps) {
         row,
         turnSeq,
         newer
-          ? "у задачи есть более новое делегирование"
-          : `исход «${row.status}» уже зафиксирован`,
+          ? t("wd.newerExists")
+          : t("wd.outcomeRecorded", { status: row.status }),
       );
       return "suppressed";
     }
@@ -1811,7 +1859,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       await suppressWake(
         row,
         turnSeq,
-        "у задачи есть более новое делегирование",
+        t("wd.newerExists"),
       );
       return "suppressed";
     }
@@ -2026,7 +2074,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (seen === null) {
         await trackRetry(
           fresh,
-          "проверка журнала координатора",
+          t("wd.journalCheck"),
           "events.list failed",
         );
         const retried = store.get(fresh.id) ?? fresh;
@@ -2048,14 +2096,14 @@ export function createWatchdog(deps: WatchdogDeps) {
       fresh.result_dirty == null
         ? "—"
         : fresh.result_dirty
-          ? "грязная"
-          : "чистая";
+          ? t("wd.copyDirty")
+          : t("wd.copyClean");
     const body =
       report.length > 0
         ? report.slice(0, RESULT_OUTPUT_CAP)
         : selfCancelled
           ? ""
-          : "исполнитель закончил без отчёта";
+          : t("wd.noReport");
     try {
       await deps.threads.send({
         threadId: coord.id,
@@ -2064,10 +2112,16 @@ export function createWatchdog(deps: WatchdogDeps) {
           {
             type: "text",
             text:
-              `[orchestrator] ${fresh.task_key} (${fresh.level}, тред ` +
-              `${fresh.thread_id ?? "—"}): ${fresh.status}, ветка ${branch}, ` +
-              `коммит ${sha7}, копия ${copy}` +
-              (doubt ? `, итог сомнителен: ${doubt}` : "") +
+              t("wd.resultLine", {
+                task: fresh.task_key,
+                level: fresh.level,
+                thread: fresh.thread_id ?? "—",
+                status: fresh.status,
+                branch,
+                sha: sha7,
+                copy,
+              }) +
+              (doubt ? t("wd.doubtSuffix", { doubt }) : "") +
               (bbCarried || body === "" ? "" : `\n${body}`),
             mentions: [],
           },
@@ -2075,7 +2129,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       });
     } catch (e) {
       store.releaseResultClaim(fresh.id);
-      await trackRetry(fresh, "доставка итога координатору", message(e));
+      await trackRetry(fresh, t("wd.deliverResult"), message(e));
       return;
     }
     store.setResultNotified(fresh.id, "plugin");
@@ -2273,7 +2327,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (thread.deletedAt || thread.archivedAt) {
       await toCancelled(
         row,
-        thread.deletedAt ? "тред удалён" : "тред в архиве",
+        thread.deletedAt ? t("wd.threadDeleted") : t("wd.threadArchived"),
       );
       return;
     }
@@ -2283,7 +2337,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     const interruptedNow = await recentInterrupt(row);
     if (interruptedNow === null) return; // interrupt lookup failed too
     if (interruptedNow) {
-      await toCancelled(row, "ход прерван (system/thread/interrupted)");
+      await toCancelled(row, t("wd.interruptedCancel"));
       return;
     }
     // `done` only after a turn started and with an empty queue (§5.3).
@@ -2303,9 +2357,9 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (resumeAwait) {
       if (queue.length === 0) {
         if (resumeAwait.message.startsWith("errored:")) {
-          await toFailed(row, "продолжение не подняло новый ход");
+          await toFailed(row, t("wd.resumeNoTurn"));
         } else {
-          await toStalled(row, "продолжение не подняло новый ход");
+          await toStalled(row, t("wd.resumeNoTurn"));
         }
       }
       return; // queue holds the resume message — give it time to deliver
@@ -2362,8 +2416,8 @@ export function createWatchdog(deps: WatchdogDeps) {
             await sendToExecutor(
               row,
               r31Role === "release-audit"
-                ? 'заверши вердиктом: дождись проверок в этом же ходе (не фоном) и закончи строкой JSON {"verdict":"APPROVE"|"REJECT","findings":[…]}'
-                : 'заверши вердиктом: дождись проверок в этом же ходе (не фоном) и закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":N}',
+                ? t("wd.verdictNudgeRelease")
+                : t("wd.verdictNudgeReview"),
             );
             store.setVerdictNudge(row.id, tip);
             return;
@@ -2395,12 +2449,11 @@ export function createWatchdog(deps: WatchdogDeps) {
                 release.id,
                 ["auditing"],
                 "rejected",
-                "аудит без вердикта",
+                t("wd.noVerdictReason"),
                 {
                   kind: "rejected",
                   text:
-                    `аудит выкладки ${row.task_key} без вердикта — ` +
-                    `выкладка отклонена`,
+                    t("wd.releaseRejectedText", { task: row.task_key }),
                 },
               )
             ) {
@@ -2417,8 +2470,10 @@ export function createWatchdog(deps: WatchdogDeps) {
           if (finished.level !== RELEASE_AUDIT_LEVEL) {
             await report(
               finished,
-              `ревью ${finished.task_key} без вердикта: ` +
-                `${finished.thread_id ?? "—"}`,
+              t("wd.reviewNoVerdict", {
+                task: finished.task_key,
+                thread: finished.thread_id ?? "—",
+              }),
             );
           }
           // The one r31 line IS the outcome — §16.5's own delivery does
@@ -2609,9 +2664,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       (interaction as { id?: string } | undefined)?.id ?? "<interactionId>";
     await notifyCoordinator(
       row,
-      `исполнитель ждёт решения: задача ${row.task_key}, маршрут ${row.route}, ` +
-        `тред ${row.thread_id} — ${describeInteraction(interaction)}. ` +
-        `Реши: bb thread interactions approve|deny|grant|answer|respond ${id} ${row.thread_id}`,
+      t("wd.approvalWait", {
+        task: row.task_key,
+        route: row.route,
+        thread: row.thread_id ?? "—",
+        interaction: describeInteraction(interaction),
+        id,
+      }),
     );
   };
 
@@ -2623,10 +2682,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     if (!row || !isActive(row.status)) return;
     const text =
       reason === "archived"
-        ? "тред в архиве"
+        ? t("wd.threadArchived")
         : reason === "deleted"
-          ? "тред удалён"
-          : "тред не найден";
+          ? t("wd.threadDeleted")
+          : t("wd.threadNotFound");
     await toCancelled(row, text);
   };
 
@@ -2668,14 +2727,14 @@ export function createWatchdog(deps: WatchdogDeps) {
       1000;
     const maxRunMs =
       (policy?.maxRunSeconds ?? DEFAULT_MAX_RUN_SECONDS) * 1000;
-    const t = now();
+    const nowMs = now();
     for (const row of store.listActive()) {
       if (row.status !== "running") continue;
       const firstMs = firstMsOf(row);
       if (
         row.turn_started_at != null &&
         row.first_response_at == null &&
-        t - row.turn_started_at > firstMs
+        nowMs - row.turn_started_at > firstMs
       ) {
         // §5.1 rev 13: drain the event log first — a response already
         // recorded after `last_seq` cancels the stalled decision.
@@ -2689,7 +2748,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           fresh.status !== "running" ||
           fresh.turn_started_at == null ||
           fresh.first_response_at != null ||
-          t - fresh.turn_started_at <= firstMs
+          nowMs - fresh.turn_started_at <= firstMs
         ) {
           continue;
         }
@@ -2706,9 +2765,9 @@ export function createWatchdog(deps: WatchdogDeps) {
               .catch(() => null);
             if (queue && queue.length === 0) {
               if (resumeAwait.message.startsWith("errored:")) {
-                await toFailed(fresh, "продолжение не подняло новый ход");
+                await toFailed(fresh, t("wd.resumeNoTurn"));
               } else {
-                await toStalled(fresh, "продолжение не подняло новый ход");
+                await toStalled(fresh, t("wd.resumeNoTurn"));
               }
             }
           }
@@ -2717,19 +2776,23 @@ export function createWatchdog(deps: WatchdogDeps) {
         if (thread && thread.status === "active") {
           await toStalled(
             fresh,
-            `нет первого ответа за ${Math.round(firstMs / 1000)}с`,
+            t("wd.noFirstResponse", { s: Math.round(firstMs / 1000) }),
           );
           continue;
         }
       }
-      if (row.timeout_notified_at == null && t - row.created_at > maxRunMs) {
-        store.setTimeoutNotified(row.id, t);
+      if (row.timeout_notified_at == null && nowMs - row.created_at > maxRunMs) {
+        store.setTimeoutNotified(row.id, nowMs);
         // §5.3: one message, never a stop.
         await notifyCoordinator(
           row,
-          `делегирование #${row.id} дольше maxRunSeconds ` +
-            `(${Math.round(maxRunMs / 1000)}с): задача ${row.task_key}, ` +
-            `маршрут ${row.route}, тред ${row.thread_id} — не останавливаю`,
+          t("wd.maxRunNotice", {
+            id: row.id,
+            s: Math.round(maxRunMs / 1000),
+            task: row.task_key,
+            route: row.route,
+            thread: row.thread_id ?? "—",
+          }),
         );
       }
       // §16.5 `startSeconds`: the executor never started a turn — one
@@ -2738,15 +2801,18 @@ export function createWatchdog(deps: WatchdogDeps) {
       if (
         row.turn_started_at == null &&
         !hasSetupError(row, "start-notified") &&
-        t - row.created_at > startMs
+        nowMs - row.created_at > startMs
       ) {
         store.addSetupError(row.id, "start-notified", "1");
         await notifyCoordinator(
           row,
-          `делегирование #${row.id}: исполнитель не начал ход за ` +
-            `${Math.round(startMs / 1000)}с — задача ${row.task_key}, ` +
-            `маршрут ${row.route}, тред ${row.thread_id ?? "—"} — ` +
-            `не останавливаю`,
+          t("wd.startNotice", {
+            id: row.id,
+            s: Math.round(startMs / 1000),
+            task: row.task_key,
+            route: row.route,
+            thread: row.thread_id ?? "—",
+          }),
         );
       }
       // §16.5 `idleSeconds`: response silence — one message. PLUG-184:
@@ -2763,15 +2829,18 @@ export function createWatchdog(deps: WatchdogDeps) {
         lastResp > 0 &&
         !hasSetupError(row, "idle-notified") &&
         !hasSetupError(row, "provider-retry-pending") &&
-        t - lastResp > idleMs
+        nowMs - lastResp > idleMs
       ) {
         store.addSetupError(row.id, "idle-notified", "1");
         await notifyCoordinator(
           row,
-          `делегирование #${row.id}: нет событий ответа дольше ` +
-            `${Math.round(idleMs / 1000)}с — задача ${row.task_key}, ` +
-            `маршрут ${row.route}, тред ${row.thread_id ?? "—"} — ` +
-            `не останавливаю`,
+          t("wd.idleNotice", {
+            id: row.id,
+            s: Math.round(idleMs / 1000),
+            task: row.task_key,
+            route: row.route,
+            thread: row.thread_id ?? "—",
+          }),
         );
       }
     }
@@ -2795,10 +2864,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     store.addSetupError(row.id, "retry-exhausted", last);
     await report(
       row,
-      `исчерпан предел повторов (${RETRY_LIMIT}): ${action} по ` +
-        `делегированию #${row.id} — последняя ошибка: ${last}. Ручное ` +
-        `решение: \`bb orchestrator show ${row.id}\` и ` +
-        `\`bb orchestrator cancel ${row.id}\`, затем раздать заново`,
+      t("wd.retryExhausted", {
+        limit: RETRY_LIMIT,
+        action,
+        id: row.id,
+        last,
+      }),
     );
   };
 
@@ -2825,9 +2896,12 @@ export function createWatchdog(deps: WatchdogDeps) {
   const reportReissueDone = async (row: DelegationRow) => {
     const prev = row.reissue_of != null ? store.get(row.reissue_of) : undefined;
     const text =
-      `перевыпуск завершён: задача ${row.task_key}, ` +
-      `маршрут ${prev?.route ?? "?"} → ${row.route}, ` +
-      `новый тред ${row.thread_id ?? "—"}`;
+      t("wd.reissueDone", {
+        task: row.task_key,
+        prev: prev?.route ?? "?",
+        route: row.route,
+        thread: row.thread_id ?? "—",
+      });
     await report(row, text);
   };
 
@@ -2855,7 +2929,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         });
       } catch (e) {
         if (row.reissue_of != null) {
-          await trackRetry(row, "доведение перевыпуска", message(e));
+          await trackRetry(row, t("wd.finishReissue"), message(e));
         }
         throw new OrchestratorError("bb-cli-failed", message(e));
       }
@@ -2891,13 +2965,16 @@ export function createWatchdog(deps: WatchdogDeps) {
               );
               await report(
                 row,
-                `перевыпуск потерян: задача ${row.task_key}, маршрут ` +
-                  `${row.route} — раздача отклонена (${message(e)})`,
+                t("wd.reissueDispatchLost", {
+                  task: row.task_key,
+                  route: row.route,
+                  error: message(e),
+                }),
               );
             } else {
               // `dispatch-unknown` leaves the row `dispatching`; the
               // §7 limit bounds how long the next passes may retry.
-              await trackRetry(row, "доведение перевыпуска", message(e));
+              await trackRetry(row, t("wd.finishReissue"), message(e));
             }
           }
           return;
@@ -2906,8 +2983,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         s.removed++;
         await commentOnTask(
           row,
-          `раздача не подтверждена: делегирование #${row.id} удалено ` +
-            `(тред раздачи не найден)`,
+          t("wd.dispatchNotConfirmed", { id: row.id }),
         );
         return;
       }
@@ -2930,14 +3006,14 @@ export function createWatchdog(deps: WatchdogDeps) {
   const reconcileRunning = async (row: DelegationRow, s: ReconcileSummary) => {
     const thread = await getThread(row.thread_id);
     if (!thread) {
-      await toCancelled(row, "тред не найден");
+      await toCancelled(row, t("wd.threadNotFound"));
       s.cancelled++;
       return;
     }
     if (thread.deletedAt || thread.archivedAt) {
       await toCancelled(
         row,
-        thread.deletedAt ? "тред удалён" : "тред в архиве",
+        thread.deletedAt ? t("wd.threadDeleted") : t("wd.threadArchived"),
       );
       s.cancelled++;
       return;
@@ -3024,8 +3100,11 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.addSetupError(fresh.id, "attach-verify-reported", "1");
           await notifyCoordinator(
             fresh,
-            `${fresh.task_key}: привязка исполнителя ${fresh.thread_id} ` +
-              `не подтверждена (${err}) — сверка повторяет`,
+            t("wd.attachVerify", {
+              task: fresh.task_key,
+              thread: fresh.thread_id ?? "—",
+              err,
+            }),
           );
         }
       } else {
@@ -3064,8 +3143,11 @@ export function createWatchdog(deps: WatchdogDeps) {
             store.addSetupError(fresh.id, "attach-verify-reported", "1");
             await notifyCoordinator(
               fresh,
-              `${fresh.task_key}: привязка исполнителя ${fresh.thread_id} ` +
-                `не подтверждена (${err}) — сверка повторяет`,
+              t("wd.attachVerify", {
+                task: fresh.task_key,
+                thread: fresh.thread_id ?? "—",
+                err,
+              }),
             );
           }
         } else {
@@ -3194,11 +3276,10 @@ export function createWatchdog(deps: WatchdogDeps) {
             {
               type: "text",
               text:
-                `[orchestrator] контекст был сжат — напоминание §3: раздача ` +
-                `только через orchestrator_delegate; итоги исполнителей ` +
-                `приходят сообщениями [orchestrator] — ждать в форграунде ` +
-                `нельзя. Делегирования: ${parts || "нет"}. ` +
-                `Хендофф: ${deps.handoffPath?.() ?? DEFAULT_HANDOFF_PATH}`,
+                t("wd.compactReminder", {
+                  parts: parts || t("wd.none"),
+                  handoff: deps.handoffPath?.() ?? DEFAULT_HANDOFF_PATH,
+                }),
               mentions: [],
             },
           ],
@@ -3410,7 +3491,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           const fresh = store.get(row.id) ?? row;
           await trackRetry(
             fresh,
-            "остановка исполнителя",
+            t("wd.executorStop"),
             store.findSetupError(fresh, "watchdog-stop")?.message ??
               "stop not confirmed",
           );

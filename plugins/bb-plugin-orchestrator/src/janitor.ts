@@ -96,6 +96,7 @@ import { readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { runJson, type BbCli } from "./bb-cli.js";
+import { T_RU, type T } from "./i18n/index.js";
 import type { CmdRunner } from "./cmd.js";
 import type { JanitorConfig, JanitorConfigLoad } from "./janitor-config.js";
 import type {
@@ -173,6 +174,8 @@ export interface JanitorDeps {
   loadConfig(): JanitorConfigLoad | Promise<JanitorConfigLoad>;
   now?: () => number;
   log?: JanitorLog;
+  /** §18.1: the language catalog (defaults to T_RU). */
+  t?: T;
   /**
    * §15 cond 5 seam — default scans `/proc/<pid>/cwd` of the current
    * user. `null` means the check cannot prove anything (no `/proc`,
@@ -419,6 +422,7 @@ function parseWorktreeList(
 export function createJanitor(deps: JanitorDeps) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? {};
+  const t = deps.t ?? T_RU;
   const hasProcessIn =
     deps.hasProcessIn ?? (async (p: string) => defaultHasProcessIn(p));
   // §15 (ревизия 25): «--dry-run и mode: report не ставят first_seen_at
@@ -755,10 +759,7 @@ export function createJanitor(deps: JanitorDeps) {
     attrSourceCached =
       !!v && (v.major > 2 || (v.major === 2 && v.minor >= 40));
     if (!attrSourceCached) {
-      log.warn?.(
-        "orchestrator janitor: git < 2.40 — пометка «влито squash» " +
-          "недоступна (нужен --attr-source)",
-      );
+      log.warn?.(t("jn.attrSourceWarn"));
     }
     return attrSourceCached;
   };
@@ -1398,11 +1399,13 @@ export function createJanitor(deps: JanitorDeps) {
     // non-zero (a silent skip looked like a healthy pass).
     const gv = await gitVersion();
     if (!(await gitSupported())) {
-      const text =
-        `git ≥ ${MIN_GIT[0]}.${MIN_GIT[1]} required ` +
-        "(patch-id --verbatim, merge-tree --write-tree)" +
-        (gv ? `, found ${gv.major}.${gv.minor}` : " — `git --version` failed") +
-        " — обновите git на этой машине";
+      const text = t("jn.unsupportedGit", {
+        maj: MIN_GIT[0],
+        min: MIN_GIT[1],
+        found: gv
+          ? t("jn.foundVersion", { v: `${gv.major}.${gv.minor}` })
+          : t("jn.versionFailed"),
+      });
       summary.skipped = "unsupported-git";
       summary.errors.push(text);
       log.warn?.(`orchestrator janitor: ${text}`);
@@ -3134,8 +3137,10 @@ export function createJanitor(deps: JanitorDeps) {
           )
           .join(", ");
         parts.push(
-          `новых брошенных ${copies.length} копий: ${list}` +
-            (copies.length > 8 ? ` и ещё ${copies.length - 8}` : ""),
+          t("jn.newAbandonedCopies", { n: copies.length, list }) +
+            (copies.length > 8
+              ? t("jn.andMore", { n: copies.length - 8 })
+              : ""),
         );
       }
       if (branches.length) {
@@ -3144,9 +3149,9 @@ export function createJanitor(deps: JanitorDeps) {
           .map((b) => b.branch ?? b.envId)
           .join(", ");
         parts.push(
-          `брошенных веток bb/ без копий: ${branches.length} — ${names}` +
+          t("jn.abandonedBranches", { n: branches.length, names }) +
             (branches.length > 10
-              ? ` и ещё ${branches.length - 10}`
+              ? t("jn.andMore", { n: branches.length - 10 })
               : ""),
         );
       }
@@ -3158,8 +3163,7 @@ export function createJanitor(deps: JanitorDeps) {
             {
               type: "text",
               text:
-                `[orchestrator] уборщик: ${parts.join("; ")} — ` +
-                `разбор: bb orchestrator janitor report`,
+                t("jn.notify", { parts: parts.join("; ") }),
               mentions: [],
             },
           ],
@@ -3463,7 +3467,10 @@ export function createJanitor(deps: JanitorDeps) {
     },
     cause: "archived" | "deleted",
   ): Promise<void> => {
-    const reasonWord = cause === "deleted" ? "удалён" : "заархивирован";
+    const reasonWord =
+      cause === "deleted"
+        ? t("jn.reasonDeleted")
+        : t("jn.reasonArchived");
     // Scope check when the event carries the fields; absent fields mean
     // «unknown» — rescuing a dirty copy is harmless, so proceed.
     const fieldsKnown =
@@ -3567,7 +3574,9 @@ export function createJanitor(deps: JanitorDeps) {
             threadId: thread.id,
             ref: r.ref,
             repoRoot: r.repoRoot,
-            reason: reasonWord,
+            // §7: the ledger `reason` is a machine contract
+            // («заархивирован|удалён») — never the translated word.
+            reason: cause === "deleted" ? "удалён" : "заархивирован",
             notified: r.notified,
             error: r.error ?? null,
           },
@@ -3581,13 +3590,21 @@ export function createJanitor(deps: JanitorDeps) {
       if (!r.notified) {
         log.warn?.(
           `orchestrator janitor: rescue ${thread.id}: ` +
-            (coordinator === null
-              ? "координатор неизвестен"
-              : coordGone
-                ? `координатор ${coordinator} удалён`
-                : `строка координатору ${coordinator} не дошла` +
-                  (sendError ? ` (${sendError})` : "")) +
-            ` — ${r.ref ?? "снимок не удался"} ${path}`,
+            t("jn.rescueNotDelivered", {
+              id: thread.id,
+              reason:
+                coordinator === null
+                  ? t("jn.coordUnknown")
+                  : coordGone
+                    ? t("jn.coordDeleted", { id: coordinator })
+                    : t("jn.lineNotDelivered", { id: coordinator }),
+              err:
+                coordinator !== null && !coordGone && sendError
+                  ? ` (${sendError})`
+                  : "",
+              ref: r.ref ?? t("jn.snapFailed"),
+              path,
+            }),
         );
       }
     };
@@ -3605,10 +3622,13 @@ export function createJanitor(deps: JanitorDeps) {
     // a repo path may contain spaces (PLUG-204).
     const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
     const failLine = (step: string, error: string) =>
-      `[orchestrator] тред ${thread.id} ${reasonWord} ` +
-      `с несохранённой работой, снимок НЕ удался (${step}: ${error}) ` +
-      `— копия ${path} уходит под уборку BB через ≤5 минут, ` +
-      `проверь вручную`;
+      t("jn.failLine", {
+        id: thread.id,
+        reason: reasonWord,
+        step,
+        error,
+        path,
+      });
     const snap = await rescueCommit(path, thread.id);
     if (!snap.sha) {
       const step = snap.step ?? "snapshot";
@@ -3700,14 +3720,14 @@ export function createJanitor(deps: JanitorDeps) {
       `${basename(repoRoot)}-rescue-${thread.id}${suffix}`,
     );
     const delivered = await sendLine(
-      `[orchestrator] исполнитель ${thread.id} ${reasonWord} ` +
-        `с несохранённой работой` +
-        (snap.partial
-          ? " (снимок неполный — часть файлов не сохранилась)"
-          : "") +
-        ` — снимок: ${ref}. ` +
-        `Восстановление в новую копию: git -C ${q(repoRoot)} worktree add ` +
-        `${q(rescueDir)} ${ref}^1 && git -C ${q(rescueDir)} stash apply ${ref}`,
+      t("jn.rescueLine", {
+        id: thread.id,
+        reason: reasonWord,
+        partial: snap.partial ? t("jn.partialSuffix") : "",
+        ref,
+        repo: q(repoRoot),
+        dir: q(rescueDir),
+      }),
     );
     record({ ref, repoRoot, notified: delivered && !coordGone });
   };

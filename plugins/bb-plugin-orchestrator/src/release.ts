@@ -16,6 +16,7 @@ import {
   readFileSync,
   rmSync,
   chmodSync,
+  renameSync,
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
@@ -1294,7 +1295,16 @@ export function syncInstalledPrePush(hooksDir: string, t: T): boolean {
   }
   const current = renderPrePush(t);
   if (installed.equals(current)) return false;
-  writeFileSync(path, current, { mode: 0o755 });
+  // Atomic install: a crash mid-write must not leave a torn hook —
+  // write the sibling temp file, then rename over the target.
+  const tmp = `${path}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, current, { mode: 0o755 });
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
   return true;
 }
 
@@ -1603,7 +1613,7 @@ export async function runRelease(
     });
   const gitDir = await git(deps, repo, ["rev-parse", "--absolute-git-dir"]);
   const lockPath = join(gitDir, MERGE_LOCK_NAME);
-  const releaseLock = await acquireCopyLock(mgit, repo, lockPath);
+  const releaseLock = await acquireCopyLock(mgit, repo, lockPath, { t });
   let copyToRestore: { branch: string; head: string | null } | null = null;
   try {
     if (coordinatorCopy) {
@@ -1682,7 +1692,7 @@ export async function runRelease(
     // §16.6: after the run (success or refusal) the coordinator copy
     // returns to its original branch with a clean status.
     const restoreError = copyToRestore
-      ? await restoreCopy(mgit, copyToRestore.branch, copyToRestore.head)
+      ? await restoreCopy(mgit, copyToRestore.branch, copyToRestore.head, t)
       : null;
     releaseLock();
     if (restoreError) {
@@ -2680,7 +2690,7 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
       }
     } catch (e) {
       deps.log?.warn?.(
-        `orchestrator release: досмотр ${row.task_key}: ${message(e)}`,
+        t("pp.reviewSweepError", { task: row.task_key, error: message(e) }),
       );
     }
   }
@@ -4380,6 +4390,7 @@ async function runPostPublish(
     try {
       const release = await acquireCopyLock(coGit, co, lockPath, {
         owner: deps.instanceId ?? `postPublish:${process.pid}`,
+        t,
       });
       // §18.5 (заход 4): stop мог прийти, пока ждали acquire — такой
       // замок не числится в карте и не снимется stopAll, отпускаем сразу.

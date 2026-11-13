@@ -8,16 +8,18 @@ import {
   definePluginApp,
   useComposerView,
   useRpc,
+  useSettings,
 } from "@get-bb/plugin-sdk/app";
 import { useEffect, useState, type ChangeEvent } from "react";
 import type { rpcContract } from "./server";
+import { createT, resolveLang } from "./src/i18n/index.js";
 
 type Contract = typeof rpcContract;
 
 const ROLE_OPTIONS = [
-  { id: "orchestrator", label: "Оркестратор" },
-  { id: "executor", label: "Исполнитель" },
-  { id: "auditor", label: "Аудитор" },
+  { id: "orchestrator", labelKey: "app.roleOrchestrator" },
+  { id: "executor", labelKey: "app.roleExecutor" },
+  { id: "auditor", labelKey: "app.roleAuditor" },
 ] as const;
 type RoleId = (typeof ROLE_OPTIONS)[number]["id"];
 const DEFAULT_ROLE: RoleId = "orchestrator";
@@ -25,6 +27,8 @@ const DEFAULT_ROLE: RoleId = "orchestrator";
 function RoleSelect() {
   const view = useComposerView();
   const rpc = useRpc<Contract>();
+  const { values } = useSettings();
+  const t = createT(resolveLang(values?.language));
   const scope = view.scope;
   const projectId = scope.kind === "new-thread" ? scope.projectId : null;
   const [role, setRole] = useState<RoleId>(DEFAULT_ROLE);
@@ -85,7 +89,7 @@ function RoleSelect() {
         whiteSpace: "nowrap",
       }}
     >
-      Роль
+      {t("app.role")}
       <select
         value={role}
         onChange={onChange}
@@ -101,7 +105,7 @@ function RoleSelect() {
       >
         {ROLE_OPTIONS.map((option) => (
           <option key={option.id} value={option.id}>
-            {option.label}
+            {t(option.labelKey)}
           </option>
         ))}
       </select>

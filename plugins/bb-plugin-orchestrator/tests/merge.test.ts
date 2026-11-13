@@ -21,6 +21,7 @@ import {
 } from "../src/merge.js";
 import { OrchestratorError } from "../src/errors.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
+import { createT } from "../src/i18n/index.js";
 
 const ok = (stdout = ""): BbCliResult => ({ exitCode: 0, stdout, stderr: "" });
 
@@ -198,6 +199,18 @@ test("clean merge: merge commit, record, task comment", async () => {
   assert.deepEqual(comments, [
     `Влито в work (${head.slice(0, 7)})`,
   ]);
+});
+
+test("§18.1: the merge comment goes English under the en catalog", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row, comments } = makeDeps({ coord, exec });
+  deps.t = createT("en");
+  recordResult(store, row, resultSha);
+
+  const res = await runMerge(PARAMS, deps);
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  const head = gitR(coord, ["rev-parse", "HEAD"]);
+  assert.deepEqual(comments, [`Merged into work (${head.slice(0, 7)})`]);
 });
 
 test("§16.6 threadIds=false: merge message drops the task key", async () => {

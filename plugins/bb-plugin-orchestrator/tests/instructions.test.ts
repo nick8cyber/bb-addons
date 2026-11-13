@@ -5,6 +5,9 @@ import {
   ROUTING_RULE_MAX,
 } from "../src/instructions.js";
 import type { Policy } from "../src/policy.js";
+import { EN } from "../src/i18n/en.js";
+import { RU } from "../src/i18n/ru.js";
+import { createT } from "../src/i18n/index.js";
 import { LEAK_HOME_PATH } from "./fixtures/leak-samples.js";
 
 const POLICY: Policy = {
@@ -103,4 +106,18 @@ test("§2.3: auditor levels are tagged and reviewByLevel is surfaced", () => {
   assert.match(text, /review-hard \(проверка — только чтение\)/);
   assert.match(text, /complex → review-hard/);
   assert.match(text, /delegate --level review/);
+});
+
+test("the rule's last line is the footer text — for en and ru (§18.1)", () => {
+  // PLUG-247b review: a missed `FOOTER(t)` call once shipped the
+  // function source as the rule's tail — pin the real last line.
+  for (const [lang, dict] of [
+    ["en", EN],
+    ["ru", RU],
+  ] as const) {
+    const text = generateRoutingRule(POLICY, createT(lang));
+    const lines = text.trimEnd().split("\n");
+    assert.equal(lines[lines.length - 1], dict["instr.ruleFooter"]);
+    assert.doesNotMatch(text, /=>/);
+  }
 });
