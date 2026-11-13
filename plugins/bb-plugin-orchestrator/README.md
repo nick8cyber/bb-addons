@@ -99,12 +99,19 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   from the machine scan's `foreign-bot-trailer` / `personal-email`
   rules. Non-exempt foreign-bot trailers follow `leaks.trailers`
   (§18.6): `block` | `warn`, default `warn` — the author's install
-  pins `"block"` explicitly. A missing `commitIdentity` no longer
-  blocks the release: the signature finding downgrades to a warning
-  and `bb orchestrator status` reports «автор коммитов не задан»;
-  secrets (category 1) always block. `leaks` of a project merges
-  with `defaults.leaks` key by key (like `timing`), never replaces
-  it whole.
+  pins `"block"` explicitly. The `commitIdentity` signature check
+  (§18.6) has four outcomes: no key at all → the signature finding
+  only warns and `bb orchestrator status` reports «автор коммитов
+  не задан»; a resolved identity (a literal `Имя <email>` or `"repo"`
+  answered by the repo config) blocks every commit whose signature
+  differs; `"repo"` with no `user.name`/`user.email` in the repo
+  config refuses «в конфиге репозитория не задан
+  user.name/user.email», and a literal that does not parse refuses
+  «commitIdentity не удалось разобрать». The post-check (§2 step 7)
+  without a release config keeps the pre-§18.6 strict defaults — the
+  signature finding blocks there too. Secrets (category 1) always
+  block. `leaks` of a project merges with `defaults.leaks` key by key
+  (like `timing`), never replaces it whole.
   The settings project (release spec §6 r8) is the bb project of the
   executor copy's repository, resolved once at step 1 and stored in the
   release row (`settings_project_id`); any resolver error refuses
@@ -190,12 +197,17 @@ map presets onto levels and fallback chains, write the policy, validate.
   composed text must stay within 2500 characters per role, checked on
   the real substitutions (`handoffPath`, the policy's review level
   name); an invalid document or an over-limit result is reported as
-  needs-configuration and ignored whole.
+  needs-configuration and ignored whole. If later substitutions (a
+  policy or `handoffPath` change) push the composed text over the
+  limit at use time, the addition is dropped for that render — the
+  mandatory tail is never cut.
 - `handoffPath` (§18.6, default `$BB_THREAD_STORAGE/HANDOFF.md`) — the
   handoff file path substituted into the role texts' handoff rule and
-  the §16.5 compaction reminder; one line, at most 256 characters. The
-  `~/.cache/bb-handoff/<thread>.md` fallback for providers without
-  `$BB_THREAD_STORAGE` stays built-in.
+  the §16.5 compaction reminder; one line, at most 256 characters — a
+  multi-line or over-limit value is refused at write time, and a
+  stored invalid one is ignored (the default applies) with a
+  needs-configuration line. The `~/.cache/bb-handoff/<thread>.md`
+  fallback for providers without `$BB_THREAD_STORAGE` stays built-in.
 - `userThreadPlugins` (§17.1, comma/space-separated) — plugin ids whose
   threads continue a human chat (session handoff, chat compaction) and
   keep the coordinator role. Default EMPTY — a plugin-born thread gets
