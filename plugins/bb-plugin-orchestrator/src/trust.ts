@@ -1,13 +1,15 @@
 /**
- * orchestrator §18.4 (r32, PLUG-245): доверие по снимку исполняемых
+ * orchestrator §18.4/§18.5 (r32): доверие по снимку исполняемых
  * настроек. Хешируются исполняемые поля слоёв release-конфига —
- * `postPublish.commands`, `checks`, `prProvider` с типом command
- * (eventHooks — PLUG-246, подключаются сюда же). Первый снимок —
- * молча; расхождение — предупреждение в лог и одна строка
- * координаторам с незавершёнными делегированиями/выкладками; имена и
- * хеши в `exec-settings-changes`, значения не печатаются.
+ * `postPublish.commands`, `checks`, `prProvider` с типом command — и
+ * хуки событий `eventHooks` (PLUG-246, контекст `plugin:` — настройка
+ * уровня плагина, не слоя проекта). Первый снимок — молча; расхождение
+ * — предупреждение в лог и одна строка координаторам с незавершёнными
+ * делегированиями/выкладками; имена и хеши в `exec-settings-changes`,
+ * значения не печатаются.
  */
 import { createHash } from "node:crypto";
+import type { EventHookSetting } from "./events.js";
 import type { ReleaseConfig, ReleaseProjectLayer } from "./release-config.js";
 import { ACTIVE_STATUSES } from "./store.js";
 import type { DelegationStore } from "./store.js";
@@ -28,11 +30,16 @@ const hashEntry = (v: unknown): string =>
     .digest("hex")
     .slice(0, 16);
 
-/** §18.4: карта «ключ → хеш» исполняемых настроек. */
+/** §18.4/§18.5: карта «ключ → хеш» исполняемых настроек. Хуки —
+ * контекст `plugin` (настройка плагина, а не слой release-конфига). */
 export function execSettingsFingerprint(
   cfg: ReleaseConfig | null,
+  hooks?: readonly EventHookSetting[] | null,
 ): Record<string, string> {
   const out: Record<string, string> = {};
+  for (const h of hooks ?? []) {
+    out[`plugin:eventHooks:${h.name}`] = hashEntry(h);
+  }
   if (!cfg) return out;
   const layer = (ctx: string, l: ReleaseProjectLayer) => {
     for (const c of l.postPublish?.commands ?? []) {
@@ -94,6 +101,8 @@ export function execSettingsChangedKeys(store: DelegationStore): string[] {
 export async function checkExecSettings(deps: {
   store: DelegationStore;
   cfg: ReleaseConfig | null;
+  /** §18.5: действующие хуки — часть снимка доверия. */
+  hooks?: readonly EventHookSetting[] | null;
   /** Конфиг не парсится — снимок не сверяем: пустой fingerprint выглядел
    * бы как «всё убрали» и рассылал бы ложные уведомления. */
   cfgBroken?: boolean;
@@ -106,7 +115,7 @@ export async function checkExecSettings(deps: {
     );
     return [];
   }
-  const next = execSettingsFingerprint(deps.cfg);
+  const next = execSettingsFingerprint(deps.cfg, deps.hooks);
   const prevRaw = deps.store.metaGet(SNAPSHOT_KEY);
   if (prevRaw === undefined) {
     deps.store.metaSet(SNAPSHOT_KEY, JSON.stringify(next));

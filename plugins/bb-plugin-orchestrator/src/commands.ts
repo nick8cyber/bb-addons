@@ -13,7 +13,12 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { maskSecrets } from "./scan.js";
-import type { CommandRunRow, CommandRunSpec, DelegationStore } from "./store.js";
+import type {
+  CommandRunRow,
+  CommandRunSpec,
+  CommandRunStatus,
+  DelegationStore,
+} from "./store.js";
 
 /** §18.2: вывод в журнале — хвост до 300 символов в одну строку. */
 export const OUTPUT_TAIL_LIMIT = 300;
@@ -172,6 +177,15 @@ export interface CommandRunnerDeps {
   killGroup?: (pgid: number, signal: "SIGTERM" | "SIGKILL") => void;
   /** Лимит одновременно running (настройка maxConcurrentCommands). */
   maxConcurrent: () => number;
+  /** §18.5: итог естественного завершения записи (ok/failed/timeout) —
+   * для notifyOnFail хуков. Вызывается после записи терминального
+   * статуса; interrupted/skipped сюда не приходят. */
+  onFinish?: (
+    row: CommandRunRow,
+    status: CommandRunStatus,
+    exitCode: number | null,
+    outputTail: string,
+  ) => void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   killGraceMs?: number;
@@ -288,13 +302,20 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
         : res.code === 0
           ? "ok"
           : "failed";
-      deps.store.finishCommandRun(
-        row.id,
-        status,
-        res.code,
-        maskCommandOutput(res.output),
-        now(),
-      );
+      const tail = maskCommandOutput(res.output);
+      // условный переход проиграл — итог уже записал stopAll/recover
+      // (interrupted): notifyOnFail по чужой записи не шлём.
+      if (!deps.store.finishCommandRun(row.id, status, res.code, tail, now())) {
+        return;
+      }
+      try {
+        deps.onFinish?.(row, status, res.code, tail);
+      } catch (e) {
+        warn(
+          `orchestrator command onFinish ${row.run_key}: ` +
+            `${(e as Error).message}`,
+        );
+      }
     });
     return true;
   };

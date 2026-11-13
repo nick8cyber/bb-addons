@@ -5,6 +5,7 @@
  */
 import type { Database } from "better-sqlite3";
 import { OrchestratorError } from "./errors.js";
+import type { EventHookSetting } from "./events.js";
 
 export const MIGRATIONS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS delegations (
@@ -259,6 +260,19 @@ export const MIGRATIONS: readonly string[] = [
   `CREATE INDEX command_runs_group ON command_runs(group_key)`,
   // orchestrator-release §2 п.6 (r11): merge-коммит PR для строки «влит → sha7».
   `ALTER TABLE releases ADD COLUMN pr_merge_sha TEXT`,
+  // orchestrator §18.5 (r32, PLUG-246): таблица событий — запись идёт в
+  // той же транзакции, что и переход, и там же сопоставляется с хуками
+  // (queued в command_runs); позже событие хукам не сопоставляется.
+  // verdict_event_at — отметка «review.verdict уже порождён» (один раз
+  // на делегирование). notify_on_fail — флаг хука на момент постановки.
+  `CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `ALTER TABLE delegations ADD COLUMN verdict_event_at INTEGER`,
+  `ALTER TABLE command_runs ADD COLUMN notify_on_fail INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export type CommandRunStatus =
@@ -291,6 +305,8 @@ export interface CommandRunRow {
   proc_start: string | null;
   exit_code: number | null;
   output_tail: string | null;
+  /** §18.5: флаг notifyOnFail хука на момент постановки (0/1). */
+  notify_on_fail: number;
   queued_at: number | null;
   started_at: number | null;
   finished_at: number | null;
@@ -306,6 +322,17 @@ export interface CommandRunSpec {
   env?: Record<string, string>;
   stdin?: string;
   timeoutSec?: number;
+  /** §18.5: у хуков — флаг notifyOnFail на момент постановки. */
+  notifyOnFail?: boolean;
+}
+
+/** §18.5: запись таблицы событий — payload это JSON события v1
+ * (тот же документ, что уходит хуку в stdin). */
+export interface EventRow {
+  id: number;
+  kind: string;
+  payload: string;
+  created_at: number;
 }
 
 export const ACTIVE_STATUSES = ["dispatching", "running"] as const;
@@ -365,6 +392,10 @@ export interface DelegationRow {
    * отправлено (время и seq журнала на момент отправки). */
   verdict_nudged_at: number | null;
   verdict_nudge_seq: number | null;
+  /** §18.5: событие review.verdict уже порождено (один раз на
+   * делегирование — оживший тред повторяет delegation.done, но не
+   * review.verdict). */
+  verdict_event_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -456,6 +487,14 @@ export const normalizeTaskKey = (key: string) => key.trim().toUpperCase();
 
 export class DelegationStore {
   private readonly db: Database;
+
+  /** §18.5: действующие хуки событий и каталог их запуска — назначает
+   * сервер после разбора настройки `eventHooks`; провайдер синхронный
+   * (сопоставление — внутри транзакции перехода). null — хуков нет,
+   * события в таблицу пишутся всё равно. */
+  eventHooksProvider:
+    | (() => { hooks: EventHookSetting[]; cwd: string } | null)
+    | null = null;
 
   constructor(db: Database) {
     this.db = db;
@@ -605,9 +644,16 @@ export class DelegationStore {
   }
 
   setStatus(id: number, status: DelegationStatus): void {
-    this.db
-      .prepare(`UPDATE delegations SET status = ?, updated_at = ? WHERE id = ?`)
-      .run(status, Date.now(), id);
+    this.db.transaction(() => {
+      const at = Date.now();
+      this.db
+        .prepare(
+          `UPDATE delegations SET status = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(status, at, id);
+      const row = this.get(id);
+      if (row) this.emitDelegationTransition(row, status, at);
+    })();
   }
 
   /**
@@ -619,14 +665,23 @@ export class DelegationStore {
     id: number,
     from: DelegationStatus,
     to: DelegationStatus,
+    /** §18.5: у делегирования ревью — прочитанный вердикт (r31) для
+     * события review.verdict в той же транзакции. */
+    opts?: { reviewVerdict?: { verdict: string; blockers: number | null } },
   ): boolean {
-    const info = this.db
-      .prepare(
-        `UPDATE delegations SET status = ?, updated_at = ?
-         WHERE id = ? AND status = ?`,
-      )
-      .run(to, Date.now(), id, from);
-    return info.changes > 0;
+    return this.db.transaction(() => {
+      const at = Date.now();
+      const info = this.db
+        .prepare(
+          `UPDATE delegations SET status = ?, updated_at = ?
+           WHERE id = ? AND status = ?`,
+        )
+        .run(to, at, id, from);
+      if (info.changes === 0) return false;
+      const row = this.get(id);
+      if (row) this.emitDelegationTransition(row, to, at, opts);
+      return true;
+    })();
   }
 
   addSetupError(id: number, step: string, message: string): void {
@@ -1625,28 +1680,34 @@ export class DelegationStore {
       prErrorCount?: number;
     },
   ): boolean {
-    const sets = ["pr_state = ?"];
-    const args: unknown[] = [to];
-    const map: Record<string, string> = {
-      prCheckedAt: "pr_checked_at",
-      prClosedAt: "pr_closed_at",
-      prStaleNotified: "pr_stale_notified",
-      prErrorCount: "pr_error_count",
-    };
-    for (const [key, col] of Object.entries(map)) {
-      if (fields && key in fields) {
-        sets.push(`${col} = ?`);
-        args.push((fields as Record<string, unknown>)[key]);
+    return this.db.transaction(() => {
+      const sets = ["pr_state = ?"];
+      const args: unknown[] = [to];
+      const map: Record<string, string> = {
+        prCheckedAt: "pr_checked_at",
+        prClosedAt: "pr_closed_at",
+        prStaleNotified: "pr_stale_notified",
+        prErrorCount: "pr_error_count",
+      };
+      for (const [key, col] of Object.entries(map)) {
+        if (fields && key in fields) {
+          sets.push(`${col} = ?`);
+          args.push((fields as Record<string, unknown>)[key]);
+        }
       }
-    }
-    const marks = from.map(() => "?").join(",");
-    const info = this.db
-      .prepare(
-        `UPDATE releases SET ${sets.join(", ")}
-         WHERE id = ? AND pr_state IN (${marks})`,
-      )
-      .run(...args, id, ...from);
-    return info.changes > 0;
+      const marks = from.map(() => "?").join(",");
+      const info = this.db
+        .prepare(
+          `UPDATE releases SET ${sets.join(", ")}
+           WHERE id = ? AND pr_state IN (${marks})`,
+        )
+        .run(...args, id, ...from);
+      if (info.changes === 0) return false;
+      // §18.5: событие PR — в той же транзакции, что и переход.
+      const row = this.getRelease(id);
+      if (row) this.emitPrTransition(row, to, Date.now());
+      return true;
+    })();
   }
 
   /** §2 r10 п.3: «PR висит 72 ч» — флаг, не состояние: после строки
@@ -1782,9 +1843,19 @@ export class DelegationStore {
     if (!sets.length) return;
     sets.push("updated_at = ?");
     args.push(Date.now(), id);
-    this.db
-      .prepare(`UPDATE releases SET ${sets.join(", ")} WHERE id = ?`)
-      .run(...args);
+    this.db.transaction(() => {
+      // §18.5: терминальный статус через updateRelease (публикация в
+      // release.ts идёт этим методом) — событие в той же транзакции,
+      // но только при реальном переходе, не при повторной записи.
+      const prev = this.getRelease(id);
+      this.db
+        .prepare(`UPDATE releases SET ${sets.join(", ")} WHERE id = ?`)
+        .run(...args);
+      if (fields.status && prev && prev.status !== fields.status) {
+        const row = this.getRelease(id);
+        if (row) this.emitReleaseTransition(row, fields.status, Date.now());
+      }
+    })();
   }
 
   /** Условный перевод статуса выкладки — тот же приём, что setStatusIf:
@@ -1800,20 +1871,27 @@ export class DelegationStore {
     error?: string,
     notice?: { kind: string; text: string },
   ): boolean {
-    const marks = from.map(() => "?").join(",");
-    const sets = "status = ?, error = ?, updated_at = ?";
-    const args: unknown[] = [to, error ?? null, Date.now()];
-    const noticeSet = notice
-      ? ", notice_text = ?, notice_kind = ?, notified_at = NULL"
-      : "";
-    if (notice) args.push(notice.text, notice.kind);
-    const info = this.db
-      .prepare(
-        `UPDATE releases SET ${sets}${noticeSet}
-         WHERE id = ? AND status IN (${marks})`,
-      )
-      .run(...args, id, ...from);
-    return info.changes > 0;
+    return this.db.transaction(() => {
+      const at = Date.now();
+      const marks = from.map(() => "?").join(",");
+      const sets = "status = ?, error = ?, updated_at = ?";
+      const args: unknown[] = [to, error ?? null, at];
+      const noticeSet = notice
+        ? ", notice_text = ?, notice_kind = ?, notified_at = NULL"
+        : "";
+      if (notice) args.push(notice.text, notice.kind);
+      const info = this.db
+        .prepare(
+          `UPDATE releases SET ${sets}${noticeSet}
+           WHERE id = ? AND status IN (${marks})`,
+        )
+        .run(...args, id, ...from);
+      if (info.changes === 0) return false;
+      // §18.5: событие выкладки — в той же транзакции, что и переход.
+      const row = this.getRelease(id);
+      if (row) this.emitReleaseTransition(row, to, at);
+      return true;
+    })();
   }
 
   /**
@@ -2067,6 +2145,196 @@ export class DelegationStore {
       )
       .all(sha) as DelegationRow[];
   }
+  /* §18.5 (r32, PLUG-246): события. Запись в `events` и сопоставление
+   * с действующими хуками идут в ТОЙ ЖЕ транзакции, что породивший
+   * переход: для подходящего хука — запись command_runs `queued`
+   * (run_key — `event:<id>:<имя>`). Позже событие хукам не
+   * сопоставляется: добавленный/переименованный после события хук по
+   * нему не запускается. */
+
+  private emitEvent(
+    kind: string,
+    fields: Record<string, unknown>,
+    at: number,
+  ): number {
+    const doc: Record<string, unknown> = {
+      version: 1,
+      event: kind,
+      at,
+      ...fields,
+    };
+    const info = this.db
+      .prepare(
+        `INSERT INTO events (kind, payload, created_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(kind, JSON.stringify(doc), at);
+    const eventId = Number(info.lastInsertRowid);
+    const ctx = this.eventHooksProvider?.();
+    if (!ctx?.hooks.length) return eventId;
+    for (const h of ctx.hooks) {
+      if (!h.on.includes(kind)) continue;
+      if (
+        h.projects !== undefined &&
+        (typeof doc.project !== "string" ||
+          !h.projects.includes(doc.project))
+      ) {
+        continue;
+      }
+      this.enqueueCommandRun(
+        {
+          source: "hook",
+          runKey: `event:${eventId}:${h.name}`,
+          name: h.name,
+          argv: h.run,
+          cwd: ctx.cwd,
+          env: {
+            ORCH_EVENT: kind,
+            ORCH_TASK: String(doc.task ?? ""),
+            ORCH_PROJECT:
+              typeof doc.project === "string" ? doc.project : "",
+          },
+          stdin: JSON.stringify(doc),
+          timeoutSec: h.timeoutSec ?? 120,
+          notifyOnFail: h.notifyOnFail ?? false,
+        },
+        at,
+      );
+    }
+    return eventId;
+  }
+
+  /** §18.5 таблица переходов: делегирование → событие. `cancelled`,
+   * `reissued` и промежуточные статусы — внутренние, событий нет;
+   * `release-audit` не порождает delegation.done — его исход это
+   * события выкладки. */
+  private emitDelegationTransition(
+    row: DelegationRow,
+    to: DelegationStatus,
+    at: number,
+    opts?: { reviewVerdict?: { verdict: string; blockers: number | null } },
+  ): void {
+    const base = {
+      task: row.task_key,
+      project: row.project_id,
+      coordinatorThreadId: row.coordinator_thread_id,
+      delegationId: row.id,
+      level: row.level,
+      route: row.route,
+      threadId: row.thread_id,
+    };
+    if (to === "done") {
+      if (row.level !== "release-audit") {
+        this.emitEvent("delegation.done", base, at);
+      }
+      // review.verdict — делегирование ревью, ушедшее в done с
+      // прочитанным вердиктом (r31); один раз на делегирование —
+      // отметка verdict_event_at в той же транзакции (оживлённый тред
+      // повторяет delegation.done, но не review.verdict).
+      if (opts?.reviewVerdict) {
+        const claimed =
+          this.db
+            .prepare(
+              `UPDATE delegations SET verdict_event_at = ?
+               WHERE id = ? AND verdict_event_at IS NULL`,
+            )
+            .run(at, row.id).changes > 0;
+        if (claimed) {
+          this.emitEvent(
+            "review.verdict",
+            {
+              ...base,
+              verdict: opts.reviewVerdict.verdict,
+              blockers: opts.reviewVerdict.blockers,
+            },
+            at,
+          );
+        }
+      }
+      return;
+    }
+    if (to === "failed") {
+      this.emitEvent("delegation.failed", base, at);
+      return;
+    }
+    if (to === "stalled" || to === "quota") {
+      this.emitEvent("delegation.stalled", { ...base, reason: to }, at);
+    }
+  }
+
+  private emitReleaseEvent(
+    kind: string,
+    row: ReleaseRow,
+    at: number,
+  ): void {
+    this.emitEvent(
+      kind,
+      {
+        task: row.task_key,
+        // §18.5: у событий выкладки и PR — проект настройки выкладки.
+        project: row.settings_project_id ?? row.project_id,
+        coordinatorThreadId: row.coordinator_thread_id,
+        releaseId: row.id,
+        sha: row.pr_merge_sha ?? row.published_sha ?? row.head_sha,
+        branch: row.publish_branch ?? row.branch,
+        target: row.target_branch,
+        prUrl: row.pr_url,
+      },
+      at,
+    );
+  }
+
+  /** Статус выкладки → событие (§18.5). auditing/publishing —
+   * промежуточные, событий нет. */
+  private emitReleaseTransition(
+    row: ReleaseRow,
+    to: ReleaseStatus,
+    at: number,
+  ): void {
+    const kind =
+      to === "published"
+        ? "release.published"
+        : to === "rejected"
+          ? "release.rejected"
+          : to === "failed"
+            ? "release.failed"
+            : null;
+    if (kind) this.emitReleaseEvent(kind, row, at);
+  }
+
+  /** pr_state → событие (§18.5): только merged/closed — open, merging,
+   * superseded, error, closed_final — внутренние. */
+  private emitPrTransition(row: ReleaseRow, to: string, at: number): void {
+    const kind =
+      to === "merged" ? "pr.merged" : to === "closed" ? "pr.closed" : null;
+    if (kind) this.emitReleaseEvent(kind, row, at);
+  }
+
+  /** §18.5: событие по id — для строк notifyOnFail и тестов. */
+  eventById(id: number): EventRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM events WHERE id = ?`)
+      .get(id) as EventRow | undefined;
+  }
+
+  /** События по порядку записи (опционально — одного вида). */
+  listEvents(kind?: string): EventRow[] {
+    return (kind
+      ? this.db
+          .prepare(`SELECT * FROM events WHERE kind = ? ORDER BY id`)
+          .all(kind)
+      : this.db.prepare(`SELECT * FROM events ORDER BY id`).all()) as
+      EventRow[];
+  }
+
+  /** §18.5: срок хранения events тот же, что у command_runs
+   * (retentionDays). */
+  pruneEvents(cutoff: number): number {
+    return this.db
+      .prepare(`DELETE FROM events WHERE created_at < ?`)
+      .run(cutoff).changes;
+  }
+
   /* §18.2 (r32, PLUG-245): журнал команд. run_key уникален — повторная
    * постановка той же команды выкладки после рестарта не дублирует её
    * (INSERT ON CONFLICT DO NOTHING + чтение существующей). */
@@ -2076,8 +2344,8 @@ export class DelegationStore {
       .prepare(
         `INSERT INTO command_runs (
           source, run_key, group_key, name, status, argv, cwd, env,
-          stdin, timeout_sec, queued_at
-        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+          stdin, timeout_sec, notify_on_fail, queued_at
+        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_key) DO NOTHING`,
       )
       .run(
@@ -2090,6 +2358,7 @@ export class DelegationStore {
         spec.env ? JSON.stringify(spec.env) : null,
         spec.stdin ?? null,
         spec.timeoutSec ?? null,
+        spec.notifyOnFail ? 1 : 0,
         at,
       );
     return this.db
@@ -2108,8 +2377,9 @@ export class DelegationStore {
       .prepare(
         `INSERT INTO command_runs (
           source, run_key, group_key, name, status, argv, cwd, env,
-          stdin, timeout_sec, queued_at, finished_at, output_tail
-        ) VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?, ?, ?, ?, ?, ?)
+          stdin, timeout_sec, notify_on_fail, queued_at, finished_at,
+          output_tail
+        ) VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_key) DO UPDATE SET
           status = 'skipped',
           finished_at = excluded.finished_at,
@@ -2126,6 +2396,7 @@ export class DelegationStore {
         spec.env ? JSON.stringify(spec.env) : null,
         spec.stdin ?? null,
         spec.timeoutSec ?? null,
+        spec.notifyOnFail ? 1 : 0,
         at,
         at,
         reason,

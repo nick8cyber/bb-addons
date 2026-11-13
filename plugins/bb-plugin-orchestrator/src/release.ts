@@ -536,8 +536,22 @@ async function resolveTask(
  * "ok"/"not-ok" by the last verdict line, null when the body carries no
  * verdict line at all ("нет вердикта" is not "не ОК"). */
 export function verdictInBody(body: string): "ok" | "not-ok" | null {
-  let verdict: unknown;
-  let blockers: unknown;
+  const d = verdictDetailsInBody(body);
+  if (!d) return null;
+  // §16.7 (PLUG-186): the verdict line carries `blockers` — a missing
+  // field is not an OK.
+  return d.verdict === "OK" && d.blockers === 0 ? "ok" : "not-ok";
+}
+
+/** §18.5: сам вердикт (не только ok/not-ok) — для события
+ * review.verdict. Тот же разбор, что verdictInBody: последняя
+ * отдельная строка-JSON с verdict OK|CHANGES; blockers — число или
+ * null. */
+export function verdictDetailsInBody(
+  body: string,
+): { verdict: "OK" | "CHANGES"; blockers: number | null } | null {
+  let verdict: "OK" | "CHANGES" | undefined;
+  let blockers: number | null = null;
   for (const raw of body.split("\n")) {
     const line = raw.trim();
     // §16.7/r31: только отдельная строка-JSON — хвост после прозы
@@ -554,12 +568,11 @@ export function verdictInBody(body: string): "ok" | "not-ok" | null {
     }
     if (parsed.verdict !== "OK" && parsed.verdict !== "CHANGES") continue;
     verdict = parsed.verdict;
-    blockers = parsed.blockers;
+    blockers =
+      typeof parsed.blockers === "number" ? parsed.blockers : null;
   }
   if (verdict === undefined) return null;
-  // §16.7 (PLUG-186): the verdict line carries `blockers` — a missing
-  // field is not an OK.
-  return verdict === "OK" && blockers === 0 ? "ok" : "not-ok";
+  return { verdict, blockers };
 }
 
 export function reviewVerdictOk(body: string): boolean {
@@ -2763,9 +2776,11 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
   }
   // §18.2: чистка журнала и запуск очереди — каждый такт.
   const retentionDays = deps.commandRetentionDays?.() ?? 30;
-  deps.store.pruneCommandRuns(
-    (deps.now?.() ?? Date.now()) - retentionDays * 86_400_000,
-  );
+  const pruneCutoff =
+    (deps.now?.() ?? Date.now()) - retentionDays * 86_400_000;
+  deps.store.pruneCommandRuns(pruneCutoff);
+  // §18.5: срок хранения events тот же, что у журнала команд.
+  deps.store.pruneEvents(pruneCutoff);
   await deps.commandRunner?.pump();
   return s;
 }
