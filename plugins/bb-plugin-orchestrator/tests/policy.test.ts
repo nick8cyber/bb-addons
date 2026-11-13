@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { RU } from "../src/i18n/ru.js";
 import test from "node:test";
 import {
   levelRole,
@@ -284,7 +285,10 @@ test("§2.3 reviewByLevel: keys must name declared executor levels", () => {
   let l2 = parsePolicy(JSON.stringify(bad), ROLE_PRESETS);
   assert.ok(
     l2.errors.some(
-      (e) => e.path === "reviewByLevel.ghost" && /not declared/.test(e.message),
+      (e) =>
+        e.path === "reviewByLevel.ghost" &&
+        e.message ===
+          RU["pol.levelUndeclared"]!.replace("{level}", "ghost"),
     ),
   );
   // Auditor-level key → error.
@@ -293,7 +297,9 @@ test("§2.3 reviewByLevel: keys must name declared executor levels", () => {
   assert.ok(
     l2.errors.some(
       (e) =>
-        e.path === "reviewByLevel.review-mid" && /executor/.test(e.message),
+        e.path === "reviewByLevel.review-mid" &&
+        e.message ===
+          RU["pol.levelNotExecutor"]!.replace("{level}", "review-mid"),
     ),
   );
   // The level named `review` (implicit auditor) as a key → error too.
@@ -303,7 +309,10 @@ test("§2.3 reviewByLevel: keys must name declared executor levels", () => {
   l2 = parsePolicy(JSON.stringify(legacy), presets);
   assert.ok(
     l2.errors.some(
-      (e) => e.path === "reviewByLevel.review" && /executor/.test(e.message),
+      (e) =>
+        e.path === "reviewByLevel.review" &&
+        e.message ===
+          RU["pol.levelNotExecutor"]!.replace("{level}", "review"),
     ),
   );
 });

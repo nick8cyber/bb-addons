@@ -17,6 +17,7 @@
  */
 import type { PolicyIssue } from "./policy.js";
 import { parseAllowedTrailer } from "./scan.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 export type ReleaseAction = "push" | "pr";
 export type SyncMode = "merge" | "rebase";
@@ -240,21 +241,22 @@ function parseTarget(
   value: unknown,
   path: string,
   err: (p: string, m: string) => void,
+  t: T,
 ): ReleaseTarget | undefined {
   if (value === undefined) return undefined;
   if (!isRecord(value)) {
-    err(path, "must be an object {action, branch}");
+    err(path, t("rc.targetObject"));
     return undefined;
   }
   let action: ReleaseAction | undefined;
   if (value.action !== "push" && value.action !== "pr") {
-    err(`${path}.action`, `must be "push" or "pr"`);
+    err(`${path}.action`, t("rc.actionEnum"));
   } else {
     action = value.action;
   }
   let branch: string | undefined;
   if (!isNonEmptyString(value.branch)) {
-    err(`${path}.branch`, "required non-empty branch name");
+    err(`${path}.branch`, t("rc.branchReq"));
   } else {
     branch = value.branch.trim();
   }
@@ -266,28 +268,29 @@ function parseLayer(
   path: string,
   err: (p: string, m: string) => void,
   warn: (p: string, m: string) => void,
+  t: T,
 ): ReleaseProjectLayer {
   const layer: ReleaseProjectLayer = {};
   if (!isRecord(value)) {
-    err(path, "must be an object");
+    err(path, t("rc.isObject"));
     return layer;
   }
-  const target = parseTarget(value.target, `${path}.target`, err);
+  const target = parseTarget(value.target, `${path}.target`, err, t);
   if (target) layer.target = target;
   if (value.sync !== undefined) {
     if (value.sync === "merge" || value.sync === "rebase") {
       layer.sync = value.sync;
     } else {
-      err(`${path}.sync`, `must be "merge" or "rebase"`);
+      err(`${path}.sync`, t("rc.syncEnum"));
     }
   }
   if (value.checks !== undefined) {
     if (!Array.isArray(value.checks)) {
-      err(`${path}.checks`, "must be an array of non-empty commands");
+      err(`${path}.checks`, t("rc.checksArray"));
     } else {
       const bad = value.checks.findIndex((c) => !isNonEmptyString(c));
       if (bad >= 0) {
-        err(`${path}.checks[${bad}]`, "must be a non-empty command");
+        err(`${path}.checks[${bad}]`, t("rc.commandNonEmpty"));
       } else {
         layer.checks = value.checks.map((c) => (c as string).trim());
       }
@@ -295,19 +298,19 @@ function parseLayer(
   }
   if (value.public !== undefined) {
     if (typeof value.public !== "boolean") {
-      err(`${path}.public`, "must be a boolean");
+      err(`${path}.public`, t("rc.isBool"));
     } else {
       layer.public = value.public;
     }
   }
   if (value.docsMap !== undefined) {
     if (!isRecord(value.docsMap)) {
-      err(`${path}.docsMap`, "must be an object path-prefix → doc paths");
+      err(`${path}.docsMap`, t("rc.docsMapObject"));
     } else {
       const docsMap: Record<string, string[]> = {};
       for (const [prefix, docs] of Object.entries(value.docsMap)) {
         if (!isNonEmptyString(prefix)) {
-          err(`${path}.docsMap`, "path prefixes must be non-empty strings");
+          err(`${path}.docsMap`, t("rc.docsMapPrefixes"));
           continue;
         }
         if (
@@ -315,9 +318,7 @@ function parseLayer(
           docs.some((d) => !isNonEmptyString(d))
         ) {
           err(
-            `${path}.docsMap.${prefix}`,
-            "must be an array of non-empty doc paths",
-          );
+            `${path}.docsMap.${prefix}`, t("rc.docsArray"));
           continue;
         }
         docsMap[prefix] = docs.map((d) => (d as string).trim());
@@ -327,7 +328,7 @@ function parseLayer(
   }
   if (value.leaks !== undefined) {
     if (!isRecord(value.leaks)) {
-      err(`${path}.leaks`, "must be an object {machine, bbIds, trailers, allow}");
+      err(`${path}.leaks`, t("rc.leaksObject"));
     } else {
       const leaks: ReleaseLeaks = {};
       for (const key of ["machine", "bbIds", "trailers"] as const) {
@@ -336,7 +337,7 @@ function parseLayer(
         if (v === "block" || v === "warn") {
           leaks[key] = v;
         } else {
-          err(`${path}.leaks.${key}`, `must be "block" or "warn"`);
+          err(`${path}.leaks.${key}`, t("rc.leaksEnum"));
         }
       }
       if (value.leaks.allow !== undefined) {
@@ -344,7 +345,7 @@ function parseLayer(
           !Array.isArray(value.leaks.allow) ||
           value.leaks.allow.some((a) => !isNonEmptyString(a))
         ) {
-          err(`${path}.leaks.allow`, "must be an array of non-empty paths");
+          err(`${path}.leaks.allow`, t("rc.pathsArray"));
         } else {
           leaks.allow = value.leaks.allow.map((a) => (a as string).trim());
         }
@@ -354,7 +355,7 @@ function parseLayer(
   }
   if (value.excluded !== undefined) {
     if (typeof value.excluded !== "boolean") {
-      err(`${path}.excluded`, "must be a boolean");
+      err(`${path}.excluded`, t("rc.isBool"));
     } else {
       layer.excluded = value.excluded;
     }
@@ -362,16 +363,14 @@ function parseLayer(
   if (value.commitIdentity !== undefined) {
     if (!isCommitIdentity(value.commitIdentity)) {
       err(
-        `${path}.commitIdentity`,
-        'must be "repo" or a "Name <email>" signature',
-      );
+        `${path}.commitIdentity`, t("rc.commitIdentity"));
     } else {
       layer.commitIdentity = value.commitIdentity;
     }
   }
   if (value.threadIds !== undefined) {
     if (typeof value.threadIds !== "boolean") {
-      err(`${path}.threadIds`, "must be a boolean");
+      err(`${path}.threadIds`, t("rc.isBool"));
     } else {
       layer.threadIds = value.threadIds;
     }
@@ -380,7 +379,7 @@ function parseLayer(
     const v = value[key];
     if (v === undefined) continue;
     if (!Array.isArray(v) || v.some((a) => !isNonEmptyString(a))) {
-      err(`${path}.${key}`, "must be an array of non-empty strings");
+      err(`${path}.${key}`, t("rc.stringArray"));
     } else {
       layer[key] = v.map((a) => (a as string).trim());
     }
@@ -394,9 +393,7 @@ function parseLayer(
     );
     if (bad >= 0) {
       err(
-        `${path}.allowedTrailers[${bad}]`,
-        'must be a known trailer name ("Co-Authored-By", "Signed-off-by", "Generated with", "Generated-by"), optionally ": <value prefix>"',
-      );
+        `${path}.allowedTrailers[${bad}]`, t("rc.trailerName"));
     }
   }
   if (value.postPublish !== undefined) {
@@ -405,10 +402,11 @@ function parseLayer(
       `${path}.postPublish`,
       err,
       warn,
+      t,
     );
   }
   if (value.timing !== undefined) {
-    const timing = parseTiming(value.timing, `${path}.timing`, err, warn);
+    const timing = parseTiming(value.timing, `${path}.timing`, err, warn, t);
     if (timing) layer.timing = timing;
   }
   if (value.prProvider !== undefined) {
@@ -418,7 +416,7 @@ function parseLayer(
       !isRecord(prov) ||
       (prov.type !== "github" && prov.type !== "command" && prov.type !== "none")
     ) {
-      err(pp, `type must be "github", "command" or "none"`);
+      err(pp, t("rc.providerType"));
     } else {
       const layer_: PrProviderLayer = { type: prov.type, raw: prov };
       // §18.3: argv-поля — только у command; у github/none лишние
@@ -431,7 +429,7 @@ function parseLayer(
           v.length === 0 ||
           v.some((a) => !isNonEmptyString(a))
         ) {
-          err(`${pp}.${key}`, "must be a non-empty argv array of strings");
+          err(`${pp}.${key}`, t("rc.argvArray"));
           return undefined;
         }
         return v.map((a) => (a as string).trim());
@@ -441,7 +439,7 @@ function parseLayer(
           const a = argv(key);
           if (a) layer_[key] = a;
           else if (prov[key] === undefined) {
-            err(`${pp}.${key}`, `required for type "command"`);
+            err(`${pp}.${key}`, t("rc.requiredForCommand"));
           }
         }
         const f = argv("find");
@@ -449,7 +447,7 @@ function parseLayer(
       } else {
         for (const key of ["create", "view", "find"] as const) {
           if (prov[key] !== undefined) {
-            warn(`${pp}.${key}`, `ignored — type is "${prov.type}"`);
+            warn(`${pp}.${key}`, t("rc.ignoredForType", { type: prov.type }));
           }
         }
       }
@@ -458,14 +456,14 @@ function parseLayer(
   }
   if (value.prBody !== undefined) {
     if (typeof value.prBody !== "string") {
-      err(`${path}.prBody`, "must be a string template");
+      err(`${path}.prBody`, t("rc.templateString"));
     } else {
       layer.prBody = value.prBody;
     }
   }
   if (value.requireNote !== undefined) {
     if (typeof value.requireNote !== "boolean") {
-      err(`${path}.requireNote`, "must be a boolean");
+      err(`${path}.requireNote`, t("rc.isBool"));
     } else {
       layer.requireNote = value.requireNote;
     }
@@ -496,9 +494,10 @@ function parseTiming(
   path: string,
   err: (p: string, m: string) => void,
   warn: (p: string, m: string) => void,
+  t: T,
 ): ReleaseTiming | undefined {
   if (!isRecord(value)) {
-    err(path, "must be an object of timeout values");
+    err(path, t("rc.timingObject"));
     return undefined;
   }
   const timing: ReleaseTiming = {};
@@ -513,9 +512,7 @@ function parseTiming(
       v > bounds.max
     ) {
       warn(
-        `${path}.${key}`,
-        `out of bounds ${bounds.min}..${bounds.max} — using default`,
-      );
+        `${path}.${key}`, t("rc.outOfBoundsDefault", { min: bounds.min, max: bounds.max }));
       continue;
     }
     timing[key] = v;
@@ -528,32 +525,31 @@ function parsePostPublish(
   path: string,
   err: (p: string, m: string) => void,
   warn: (p: string, m: string) => void,
+  t: T,
 ): PostPublishLayer | undefined {
   if (!isRecord(value)) {
     err(
-      path,
-      "must be an object {checkout?, branch?, reloadPlugins?, on?, commands?}",
-    );
+      path, t("rc.ppObject"));
     return undefined;
   }
   const pp: PostPublishLayer = {};
   if (value.checkout !== undefined) {
     if (!isNonEmptyString(value.checkout)) {
-      err(`${path}.checkout`, "must be a non-empty checkout path");
+      err(`${path}.checkout`, t("rc.checkoutPath"));
     } else {
       pp.checkout = value.checkout.trim();
     }
   }
   if (value.branch !== undefined) {
     if (!isNonEmptyString(value.branch)) {
-      err(`${path}.branch`, "must be a non-empty branch name");
+      err(`${path}.branch`, t("rc.branchNonEmpty"));
     } else {
       pp.branch = value.branch.trim();
     }
   }
   if (value.reloadPlugins !== undefined) {
     if (typeof value.reloadPlugins !== "boolean") {
-      err(`${path}.reloadPlugins`, "must be a boolean");
+      err(`${path}.reloadPlugins`, t("rc.isBool"));
     } else {
       pp.reloadPlugins = value.reloadPlugins;
     }
@@ -562,29 +558,29 @@ function parsePostPublish(
     if (value.on === "published" || value.on === "merged") {
       pp.on = value.on;
     } else {
-      err(`${path}.on`, `must be "published" or "merged"`);
+      err(`${path}.on`, t("rc.onEnum"));
     }
   }
   if (value.commands !== undefined) {
     if (!Array.isArray(value.commands)) {
-      err(`${path}.commands`, "must be an array of command objects");
+      err(`${path}.commands`, t("rc.commandsArray"));
     } else {
       const commands: PostPublishCommandLayer[] = [];
       const seen = new Set<string>();
       for (const [i, c] of value.commands.entries()) {
         const cp = `${path}.commands[${i}]`;
         if (!isRecord(c)) {
-          err(cp, "must be an object {name, run|command, …}");
+          err(cp, t("rc.commandObject"));
           continue;
         }
         if (!isNonEmptyString(c.name)) {
-          err(`${cp}.name`, "required non-empty command name");
+          err(`${cp}.name`, t("rc.commandNameReq"));
           continue;
         }
         const name = c.name.trim();
         if (seen.has(name)) {
           // §6 r11: дубль name — предупреждение, вторая не выполняется.
-          warn(`${cp}.name`, `duplicate command name "${name}" — skipped`);
+          warn(`${cp}.name`, t("rc.dupCommand", { name: name }));
           continue;
         }
         // §18.2: поле по спеке — `run` (argv-массив); `argv` принимаем
@@ -597,20 +593,20 @@ function parsePostPublish(
             runArr.length === 0 ||
             runArr.some((a) => !isNonEmptyString(a))
           ) {
-            err(`${cp}.run`, "must be a non-empty array of strings");
+            err(`${cp}.run`, t("rc.stringArray"));
             continue;
           }
           argv = runArr.map((a) => (a as string).trim());
         } else if (isNonEmptyString(c.command)) {
           argv = ["sh", "-c", c.command.trim()];
         } else {
-          err(`${cp}.run`, "required `run` argv array (or a `command` string)");
+          err(`${cp}.run`, t("rc.runReq"));
           continue;
         }
         const cmd: PostPublishCommandLayer = { name, argv };
         if (c.cwd !== undefined) {
           if (!isNonEmptyString(c.cwd)) {
-            err(`${cp}.cwd`, "must be a non-empty path or `checkout`");
+            err(`${cp}.cwd`, t("rc.cwdPath"));
           } else {
             cmd.cwd = c.cwd.trim();
           }
@@ -622,7 +618,7 @@ function parsePostPublish(
             c.timeoutSec < 5 ||
             c.timeoutSec > 3600
           ) {
-            warn(`${cp}.timeoutSec`, "out of bounds 5..3600 — ignored");
+            warn(`${cp}.timeoutSec`, t("rc.timeoutBounds"));
           } else {
             cmd.timeoutSec = c.timeoutSec;
           }
@@ -632,7 +628,7 @@ function parsePostPublish(
             !Array.isArray(c.when) ||
             c.when.some((w) => !isNonEmptyString(w))
           ) {
-            err(`${cp}.when`, "must be an array of non-empty glob patterns");
+            err(`${cp}.when`, t("rc.whenArray"));
           } else {
             cmd.when = c.when.map((w) => (w as string).trim());
           }
@@ -640,7 +636,7 @@ function parsePostPublish(
         for (const key of ["stopOnFail", "installsDeps"] as const) {
           if (c[key] !== undefined) {
             if (typeof c[key] !== "boolean") {
-              err(`${cp}.${key}`, "must be a boolean");
+              err(`${cp}.${key}`, t("rc.isBool"));
             } else {
               cmd[key] = c[key] as boolean;
             }
@@ -653,7 +649,7 @@ function parsePostPublish(
     }
   }
   if (pp.checkout === undefined && (pp.commands?.length ?? 0) === 0) {
-    err(path, "needs at least a checkout or one command");
+    err(path, t("rc.ppNeedsSomething"));
     return undefined;
   }
   return pp;
@@ -661,6 +657,7 @@ function parsePostPublish(
 
 export function parseReleaseConfig(
   text: string | undefined,
+  t: T = T_RU,
 ): ReleaseConfigLoad {
   const errors: PolicyIssue[] = [];
   const warnings: PolicyIssue[] = [];
@@ -681,11 +678,11 @@ export function parseReleaseConfig(
   try {
     raw = JSON.parse(text);
   } catch (e) {
-    err("$", `невалидный JSON: ${(e as Error).message}`);
+    err("$", t("rc.badJson", { error: (e as Error).message }));
     return done();
   }
   if (!isRecord(raw)) {
-    err("$", "настройка release должна быть JSON-объектом");
+    err("$", t("rc.notObject"));
     return done();
   }
 
@@ -693,27 +690,25 @@ export function parseReleaseConfig(
   if (raw.commitIdentity !== undefined) {
     if (!isCommitIdentity(raw.commitIdentity)) {
       err(
-        "commitIdentity",
-        'must be "repo" or a "Name <email>" signature',
-      );
+        "commitIdentity", t("rc.commitIdentity"));
     } else {
       commitIdentity = raw.commitIdentity;
     }
   }
 
-  const defaults = parseLayer(raw.defaults ?? {}, "defaults", err, warn);
+  const defaults = parseLayer(raw.defaults ?? {}, "defaults", err, warn, t);
 
   const projects: Record<string, ReleaseProjectLayer> = {};
   if (raw.projects !== undefined) {
     if (!isRecord(raw.projects)) {
-      err("projects", "must be an object of bb-project overrides");
+      err("projects", t("rc.projectsObject"));
     } else {
       for (const [id, value] of Object.entries(raw.projects)) {
         if (!isNonEmptyString(id)) {
-          err("projects", "project ids must be non-empty strings");
+          err("projects", t("rc.projectIds"));
           continue;
         }
-        projects[id] = parseLayer(value, `projects.${id}`, err, warn);
+        projects[id] = parseLayer(value, `projects.${id}`, err, warn, t);
       }
     }
   }
@@ -743,23 +738,19 @@ export function parseReleaseConfig(
     const target = layer.target ?? { action: "push" as const, branch: "main" };
     const on = pp.on ?? (target.action === "pr" ? "merged" : "published");
     if (on === "merged" && target.action === "push") {
-      warn(`${ctx}.postPublish.on`, `"merged" at a push target reads as "published"`);
+      warn(`${ctx}.postPublish.on`, t("rc.mergedOnPush"));
     }
     if (
       effectiveOn(pp, target) === "merged" &&
       (layer.prProvider?.type ?? "github") === "none"
     ) {
       warn(
-        `${ctx}.postPublish.on`,
-        `"merged" never fires — prProvider is "none"`,
-      );
+        `${ctx}.postPublish.on`, t("rc.mergedNever"));
     }
     for (const cmd of pp.commands ?? []) {
       if (cmd.cwd === "checkout" && pp.checkout === undefined) {
         warn(
-          `${ctx}.postPublish.commands`,
-          `"${cmd.name}" needs the missing checkout — it reports "нет checkout"`,
-        );
+          `${ctx}.postPublish.commands`, t("rc.missingCheckout", { name: cmd.name }));
       }
     }
   }

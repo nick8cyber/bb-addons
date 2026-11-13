@@ -40,6 +40,26 @@ export const COORDINATOR_TOOLS = [
  */
 export const SKILL_SETUP = "orchestrator-setup";
 export const SKILL_COORDINATOR = "orchestrator-coordinator";
+/** §18.1 (PLUG-247a): the Russian skill set — declared only while
+ * `language: "ru"`. */
+export const SKILL_SETUP_RU = "orchestrator-setup-ru";
+export const SKILL_COORDINATOR_RU = "orchestrator-coordinator-ru";
+
+export interface SkillSet {
+  setup: string;
+  coordinator: string;
+}
+export const SKILLS_EN: SkillSet = {
+  setup: SKILL_SETUP,
+  coordinator: SKILL_COORDINATOR,
+};
+export const SKILLS_RU: SkillSet = {
+  setup: SKILL_SETUP_RU,
+  coordinator: SKILL_COORDINATOR_RU,
+};
+export function skillSet(lang: "en" | "ru"): SkillSet {
+  return lang === "ru" ? SKILLS_RU : SKILLS_EN;
+}
 
 /** Dispatch titles are `<KEY> · <task title>` (e.g. `PLUG-129 · …`). */
 export const DISPATCH_TITLE_RE = /^[A-Z][A-Z0-9]+-\d+ · /;
@@ -208,6 +228,9 @@ export interface AgentConfigDeps {
    * role's static `instructions` (the plugin defaults).
    */
   roleInstructions?(role: RoleId): string;
+  /** §18.1 (PLUG-247a): the skill ids to declare — default the English
+   * set (tests and bare calls keep the historical names). */
+  skills?: SkillSet;
 }
 
 export function buildAgentConfiguration(
@@ -250,15 +273,16 @@ export function buildAgentConfiguration(
   // §16.7 r25 (PLUG-182): policy invalid + a coordinator (a role-less
   // root thread OR a recorded `orchestrator` role — the new-chat window
   // writes that pick itself) → setup skill only, no tools or texts.
+  const skills = deps.skills ?? SKILLS_EN;
   if (deps.policyOk === false) {
-    return { tools: [], skills: [SKILL_SETUP] };
+    return { tools: [], skills: [skills.setup] };
   }
 
   const config: PluginAgentConfiguration = {
     tools: [...COORDINATOR_TOOLS],
     skills: deps.injectInstructions
-      ? [SKILL_COORDINATOR, SKILL_SETUP]
-      : [SKILL_SETUP],
+      ? [skills.coordinator, skills.setup]
+      : [skills.setup],
   };
   if (deps.injectInstructions) {
     // §3 rev 16: a fallback-decided coordinator (no `thread_roles` row)
@@ -289,6 +313,8 @@ export function fallbackAgentConfiguration(
   userThreadPlugins: readonly string[] = DEFAULT_USER_THREAD_PLUGINS,
   /** §18.6: the effective orchestrator text (roleTexts + handoffPath). */
   orchestratorText: string = ROLES.orchestrator.instructions,
+  /** §18.1 (PLUG-247a): the skill set to declare — default English. */
+  skills: SkillSet = SKILLS_EN,
 ): PluginAgentConfiguration {
   const coordinator = isCoordinatorByStaticFacts(
     {
@@ -301,12 +327,12 @@ export function fallbackAgentConfiguration(
     userThreadPlugins,
   );
   if (!coordinator) return { tools: [], skills: [] };
-  if (!policyOk) return { tools: [], skills: [SKILL_SETUP] };
+  if (!policyOk) return { tools: [], skills: [skills.setup] };
   const config: PluginAgentConfiguration = {
     tools: [...COORDINATOR_TOOLS],
     skills: injectInstructions
-      ? [SKILL_COORDINATOR, SKILL_SETUP]
-      : [SKILL_SETUP],
+      ? [skills.coordinator, skills.setup]
+      : [skills.setup],
   };
   // §3 rev 16: the fallback criterion yields the orchestrator role's
   // issuance — instruction + rule — without recording anything.

@@ -27,6 +27,16 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HOOK_NAME = "pre-push";
+// §18.1 (PLUG-247a): refusal texts are versioned with the plugin's
+// `language` setting — the plugin rewrites this JSON block on install
+// and whenever the language changes (`renderPrePush` in release.ts).
+// This file carries the Russian variant; English installs get en texts.
+const MESSAGES = {"expired":"push отклонён: маркер release истёк — повторите `bb orchestrator release`","wrongBranch":"push отклонён: маркер release выписан на другую ветку ({remote} ≠ ветка маркера)","wrongCommit":"push отклонён: маркер release выписан на другой коммит ({sha})","noToken":"push отклонён: выкладка только через `bb orchestrator release` (нет одноразового маркера)"};
+function msg(k, p = {}) {
+  return String(MESSAGES[k] ?? k).replace(/\{(\w+)\}/g, (m, n) =>
+    n in p ? String(p[n]) : m,
+  );
+}
 const dir = dirname(fileURLToPath(import.meta.url));
 const exclusionsFile = join(dir, "exclusions");
 const ZERO = "0000000000000000000000000000000000000000";
@@ -159,24 +169,13 @@ for (const p of pushed) {
   }
   if (!match) {
     if (sawExpired) {
-      refuse(
-        "push отклонён: маркер release истёк — повторите `bb orchestrator release`",
-      );
+      refuse(msg("expired"));
     } else if (sawSha && sawBranch) {
-      refuse(
-        `push отклонён: маркер release выписан на другую ветку ` +
-          `(${p.remote} ≠ ветка маркера)`,
-      );
+      refuse(msg("wrongBranch", { remote: p.remote }));
     } else if (tokenFiles.length) {
-      refuse(
-        `push отклонён: маркер release выписан на другой коммит ` +
-          `(${p.sha.slice(0, 8)})`,
-      );
+      refuse(msg("wrongCommit", { sha: p.sha.slice(0, 8) }));
     } else {
-      refuse(
-        "push отклонён: выкладка только через `bb orchestrator release` " +
-          "(нет одноразового маркера)",
-      );
+      refuse(msg("noToken"));
     }
   }
   consumed.push(match);

@@ -13,6 +13,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { maskSecrets } from "./scan.js";
+import { T_RU, type T } from "./i18n/index.js";
 import type {
   CommandRunRow,
   CommandRunSpec,
@@ -175,6 +176,8 @@ export function killGroupOf(pgid: number, signal: "SIGTERM" | "SIGKILL") {
 
 export interface CommandRunnerDeps {
   store: DelegationStore;
+  /** §18.1: итоги записей журнала — из каталога строк. */
+  t?: T;
   spawn?: CommandSpawner;
   procStart?: (pid: number) => string | null;
   alive?: (pgid: number) => boolean;
@@ -223,6 +226,7 @@ const sleepDefault = (ms: number) =>
 export const SELF_RELOAD_HOLD_MS = 5 * 60 * 1000;
 
 export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
+  const t = deps.t ?? T_RU;
   const now = deps.now ?? (() => Date.now());
   const sleep = deps.sleep ?? sleepDefault;
   const spawner = deps.spawn ?? defaultSpawner;
@@ -273,7 +277,7 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
     } catch (e) {
       // §18.5 (ревью Н6): синхронный сбой до spawn — тоже итог для
       // notifyOnFail/серии сбоев.
-      const tail = `битая спецификация: ${(e as Error).message}`;
+      const tail = t("cmd.badSpec", { error: (e as Error).message });
       if (deps.store.finishCommandRun(row.id, "failed", 127, tail, now())) {
         finished(row, "failed", 127, tail);
       }
@@ -380,7 +384,7 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
         // §18.5 (ревью Б4): interrupted после рестарта — итог для
         // notifyOnFail, строка «прервана перезапуском».
         if (deps.store.interruptCommandRun(row.id, now())) {
-          finished(row, "interrupted", null, "прервана перезапуском");
+          finished(row, "interrupted", null, t("cmd.interruptedRestart"));
         }
       }
     },
@@ -393,14 +397,14 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
       for (const [id, ent] of live) {
         ent.cmd.killGroup("SIGTERM");
         if (deps.store.interruptCommandRun(id, now())) {
-          finished(ent.row, "interrupted", null, "остановка плагина");
+          finished(ent.row, "interrupted", null, t("cmd.interruptedStop"));
         }
       }
       const rows = deps.store.runningCommandRuns();
       for (const row of rows) {
         if (row.pgid != null && row.pgid > 0) killGroup(row.pgid, "SIGTERM");
         if (deps.store.interruptCommandRun(row.id, now())) {
-          finished(row, "interrupted", null, "остановка плагина");
+          finished(row, "interrupted", null, t("cmd.interruptedStop"));
         }
       }
       if (live.size || rows.length) {

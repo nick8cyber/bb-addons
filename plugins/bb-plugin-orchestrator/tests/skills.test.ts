@@ -10,12 +10,15 @@ import { createPlugin } from "../server.js";
 import {
   buildAgentConfiguration,
   SKILL_COORDINATOR,
+  SKILL_COORDINATOR_RU,
   SKILL_SETUP,
+  SKILL_SETUP_RU,
   type ExecutorProbes,
 } from "../src/agent-config.js";
 import type { BbCli } from "../src/bb-cli.js";
 
 const SKILL_IDS = [SKILL_SETUP, SKILL_COORDINATOR] as const;
+const SKILL_IDS_RU = [SKILL_SETUP_RU, SKILL_COORDINATOR_RU] as const;
 const pluginDir = fileURLToPath(new URL("..", import.meta.url));
 const readSkill = (name: string) =>
   readFileSync(`${pluginDir}/skills/${name}/SKILL.md`, "utf8");
@@ -30,7 +33,7 @@ test("the manifest declares the skills root and both skills exist", () => {
     readFileSync(`${pluginDir}/package.json`, "utf8"),
   ) as { bb?: { skills?: string[] } };
   assert.deepEqual(manifest.bb?.skills, ["skills"]);
-  for (const id of SKILL_IDS) {
+  for (const id of [...SKILL_IDS, ...SKILL_IDS_RU]) {
     const file = `${pluginDir}/skills/${id}/SKILL.md`;
     assert.ok(existsSync(file), `missing ${file}`);
     const frontmatter = readSkill(id).split("---")[1] ?? "";
@@ -97,7 +100,7 @@ test("resolveAgentConfiguration passes the declared skills through", async () =>
 test("skill texts contain no thread ids, filesystem paths or model names", () => {
   const forbidden =
     /thr_[a-z0-9]+|\/(home|Users|opt|srv|var|tmp)\/|\b(claude|opus|sonnet|gemini|deepseek|nemotron|minimax|gpt-|codex|devin|opencode|kilo|agy|swe-?[0-9])/i;
-  for (const id of SKILL_IDS) {
+  for (const id of [...SKILL_IDS, ...SKILL_IDS_RU]) {
     const text = readSkill(id);
     assert.doesNotMatch(text, forbidden, `${id} leaks a forbidden token`);
   }

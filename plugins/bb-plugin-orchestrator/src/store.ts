@@ -6,6 +6,7 @@
 import type { Database } from "better-sqlite3";
 import { OrchestratorError } from "./errors.js";
 import type { EventHookSetting } from "./events.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 export const MIGRATIONS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS delegations (
@@ -1472,7 +1473,7 @@ export class DelegationStore {
      * вставка атомарно отказывает, когда в ту же цель (repo_root +
      * target_branch) уже идёт auditing/publishing выкладка. */
     repoRoot?: string | null;
-  }): ReleaseRow {
+  }, t: T = T_RU): ReleaseRow {
     const now = Date.now();
     const insert = this.db.transaction((): ReleaseRow => {
       if (input.repoRoot) {
@@ -1488,8 +1489,10 @@ export class DelegationStore {
         if (busy) {
           throw new OrchestratorError(
             "release-target-busy",
-            `в цель ${input.targetBranch} уже идёт выкладка ` +
-              `${busy.task_key} — одна выкладка в цель за раз`,
+            t("store.busyTarget", {
+              target: input.targetBranch,
+              busyKey: busy.task_key,
+            }),
           );
         }
       }

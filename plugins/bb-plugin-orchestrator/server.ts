@@ -38,15 +38,16 @@ import {
   buildAgentConfiguration,
   fallbackAgentConfiguration,
   migratePluginThreadRoles,
+  skillSet,
   type ExecutorProbes,
   type ThreadFacts,
 } from "./src/agent-config.js";
 import {
   DEFAULT_GIT_INSTRUCTIONS,
+  effectiveGitInstructions,
   generateRoutingRule,
   GIT_INSTRUCTIONS_MAX,
   gitInstructionsError,
-  SETUP_HINT_TEXT,
 } from "./src/instructions.js";
 import {
   createDelegateQueue,
@@ -99,12 +100,20 @@ import {
 } from "./src/trust.js";
 import { isEnvironmentGone, runMerge } from "./src/merge.js";
 import {
+  assertInstalledHookFresh,
   pumpReleases,
   releaseAllPostPublishLocks,
   releaseThreadsGet,
   runRelease,
   settingsProjectId,
+  syncInstalledPrePush,
 } from "./src/release.js";
+import {
+  createT,
+  resolveLang,
+  type Params,
+  type T,
+} from "./src/i18n/index.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -188,6 +197,18 @@ const handoffPathSchema: StandardSchemaV1<string, string> = {
   },
 };
 
+/** §18.1 (PLUG-247a): the UI/log language — `en` (default) or `ru`. */
+const languageSchema: StandardSchemaV1<string, string> = {
+  "~standard": {
+    version: 1,
+    vendor: "orchestrator",
+    validate: (v) =>
+      v === "en" || v === "ru"
+        ? { value: v }
+        : { issues: [{ message: '"en" or "ru"' }] },
+  },
+};
+
 /** §2.2: refuse over-limit `gitInstructions` at write time. */
 const gitInstructionsSchema: StandardSchemaV1<string, string> = {
   "~standard": {
@@ -212,6 +233,17 @@ export async function createPlugin(
   const now = deps.now ?? Date.now;
 
   const settings = bb.settings.define({
+    // §18.1 (PLUG-247a): UI/log language — catalog `src/i18n/<lang>.ts`.
+    language: {
+      type: "string",
+      label: "Language",
+      description:
+        "Interface language for coordinator messages, CLI output, " +
+        "instructions and the pre-push hook: `en` (default) or `ru`. " +
+        "Missing strings fall back to English with a log warning.",
+      experimental_schema: languageSchema,
+      default: "en",
+    },
     policy: {
       type: "string",
       label: "Policy",
@@ -307,6 +339,17 @@ export async function createPlugin(
   });
 
   let currentSettings = await settings.get();
+  /** §18.1 (PLUG-247a): the selected language and its translator.
+   * `t` is a STABLE forwarding wrapper — deps objects capture it once,
+   * a `language` change only rebinds `currentT`, and every later call
+   * picks up the new language. Missing keys fall back to English with
+   * a one-time warning each. */
+  let lang = resolveLang(currentSettings.language);
+  let currentT = createT(lang, (m) => bb.log.warn(m));
+  const t: T = Object.assign(
+    (key: string, params?: Params) => currentT(key, params),
+    { get lang() { return currentT.lang; } },
+  );
 
   /** §17.1 r26 (PLUG-211 Б2): plugin ids continuing a human chat —
    * comma/space-separated in the `userThreadPlugins` setting. */
@@ -333,7 +376,7 @@ export async function createPlugin(
   // §18.5 (PLUG-246): хуки событий — разбор настройки `eventHooks`;
   // сопоставление — синхронно внутри транзакции перехода, поэтому
   // провайдер отдаёт последний разобранный список.
-  let hooksLoad = parseEventHooks(currentSettings.eventHooks ?? "");
+  let hooksLoad = parseEventHooks(currentSettings.eventHooks ?? "", t);
   for (const e of hooksLoad.errors) {
     bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
   }
@@ -349,6 +392,7 @@ export async function createPlugin(
     maxConcurrent: () =>
       positiveInt(currentSettings.maxConcurrentCommands, 4),
     warn: (m) => bb.log.warn(m),
+    t,
     // §18.5 notifyOnFail: строка координатору на серию сбоев хука.
     onFinish: (row, status, _code, tail) =>
       onHookRunFinished(
@@ -364,6 +408,7 @@ export async function createPlugin(
             });
           },
           warn: (m) => bb.log.warn(m),
+          t,
         },
         row,
         status,
@@ -439,7 +484,7 @@ export async function createPlugin(
    */
   const loadPolicy = async (checkPresets = false): Promise<PolicyLoad> => {
     const text = currentSettings.policy ?? "";
-    if (!checkPresets) return parsePolicy(text);
+    if (!checkPresets) return parsePolicy(text, undefined, undefined, t);
     let knownPresets: Set<string> | undefined;
     let presetDetails:
       | Map<string, { environmentKind?: string | null }>
@@ -472,7 +517,7 @@ export async function createPlugin(
     } catch (e) {
       presetWarning = `preset check skipped: ${describeError(e)}`;
     }
-    const load = parsePolicy(text, knownPresets, presetDetails);
+    const load = parsePolicy(text, knownPresets, presetDetails, t);
     if (presetWarning) {
       load.warnings.push({ path: "policy", message: presetWarning });
     }
@@ -480,9 +525,15 @@ export async function createPlugin(
   };
 
   // Structural validation only — nothing may block plugin load on the CLI.
-  let policyLoad = parsePolicy(currentSettings.policy ?? "");
+  let policyLoad = parsePolicy(
+    currentSettings.policy ?? "",
+    undefined,
+    undefined,
+    t,
+  );
   let releaseConfig: ReleaseConfigLoad = parseReleaseConfig(
     currentSettings.release ?? "",
+    t,
   );
   // §18.6 (PLUG-249): roleTexts — дополнение к текстам ролей; битый
   // документ игнорируется целиком и виден в status/needs-configuration.
@@ -499,6 +550,7 @@ export async function createPlugin(
     parseRoleTexts(currentSettings.roleTexts ?? "", {
       handoffPath: handoffPath(),
       reviewLevel: reviewLevelName(policyLoad.policy),
+      t,
     });
   let roleTextsLoad = parseRoleTextsNow();
   for (const e of roleTextsLoad.errors) {
@@ -577,11 +629,11 @@ export async function createPlugin(
     if (first) {
       const rest =
         policyLoad.errors.length > 1
-          ? ` (+${policyLoad.errors.length - 1} ещё)`
+          ? t("status.moreErrs", { n: policyLoad.errors.length - 1 })
           : "";
       problems.push(
         `${first.path}: ${first.message}${rest} — ` +
-          "исправьте `policy`",
+          t("status.fixSetting", { name: "policy" }),
       );
     }
     if (releaseConfig.errors.length) {
@@ -589,29 +641,43 @@ export async function createPlugin(
       problems.push(
         `release: ${e.path}: ${e.message}` +
           (releaseConfig.errors.length > 1
-            ? ` (+${releaseConfig.errors.length - 1} ещё)`
+            ? t("status.moreErrs", {
+                n: releaseConfig.errors.length - 1,
+              })
             : "") +
-          " — исправьте `release`",
+          " — " +
+          t("status.fixSetting", { name: "release" }),
       );
     }
-    const gitError = gitInstructionsError(currentSettings.gitInstructions);
+    const gitError = gitInstructionsError(
+      currentSettings.gitInstructions,
+      t,
+    );
     if (gitError) {
-      problems.push(`${gitError} — исправьте ` + "`gitInstructions`");
+      problems.push(
+        `${gitError} — ` +
+          t("status.fixSetting", { name: "gitInstructions" }),
+      );
     }
-    const hpError = handoffPathError(currentSettings.handoffPath);
+    const hpError = handoffPathError(currentSettings.handoffPath, t);
     if (hpError) {
-      problems.push(`${hpError} — исправьте ` + "`handoffPath`");
+      problems.push(
+        `${hpError} — ` + t("status.fixSetting", { name: "handoffPath" }),
+      );
     }
-    const textsError = roleTextsError(roleTextsLoad);
+    const textsError = roleTextsError(roleTextsLoad, t);
     if (textsError) {
-      problems.push(`${textsError} — исправьте ` + "`roleTexts`");
+      problems.push(
+        `${textsError} — ` +
+          t("status.fixSetting", { name: "roleTexts" }),
+      );
     }
     // needs-configuration clears only on plugin reload (SDK V1), so the
     // message tells the user how to re-check after fixing the setting.
     if (problems.length) {
       bb.status.needsConfiguration(
         `orchestrator: ${problems.join("; ")}` +
-          " — затем `bb plugin reload orchestrator`",
+          t("status.reloadHint"),
       );
     }
   };
@@ -638,6 +704,7 @@ export async function createPlugin(
         });
       },
       warn: (m) => bb.log.warn(m),
+      t,
     }).catch((e) =>
       bb.log.warn(`orchestrator exec-settings: ${describeError(e)}`),
     );
@@ -648,12 +715,36 @@ export async function createPlugin(
 
   settings.onChange((next) => {
     currentSettings = next;
-    policyLoad = parsePolicy(currentSettings.policy ?? "");
-    releaseConfig = parseReleaseConfig(currentSettings.release ?? "");
+    // §18.1 (PLUG-247a): a language change rebuilds the translator and
+    // rewrites the installed pre-push (its texts are versioned with the
+    // language); everything below re-parses under the new `t`.
+    const nextLang = resolveLang(currentSettings.language);
+    if (nextLang !== lang) {
+      lang = nextLang;
+      currentT = createT(lang, (m) => bb.log.warn(m));
+      try {
+        if (
+          syncInstalledPrePush(
+            joinPath(pluginDataDir(), "git-hooks"),
+            t,
+          )
+        ) {
+          bb.log.warn(
+            "orchestrator: pre-push rewritten for the new language",
+          );
+        }
+      } catch (e) {
+        bb.log.warn(
+          `orchestrator: pre-push sync: ${describeError(e)}`,
+        );
+      }
+    }
+    policyLoad = parsePolicy(currentSettings.policy ?? "", undefined, undefined, t);
+    releaseConfig = parseReleaseConfig(currentSettings.release ?? "", t);
     for (const w of releaseConfig.warnings) {
       bb.log.warn(`orchestrator release config: ${w.path}: ${w.message}`);
     }
-    hooksLoad = parseEventHooks(currentSettings.eventHooks ?? "");
+    hooksLoad = parseEventHooks(currentSettings.eventHooks ?? "", t);
     for (const e of hooksLoad.errors) {
       bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
     }
@@ -671,8 +762,8 @@ export async function createPlugin(
 
   const instructionsText = () =>
     policyLoad.policy
-      ? generateRoutingRule(policyLoad.policy)
-      : SETUP_HINT_TEXT;
+      ? generateRoutingRule(policyLoad.policy, t)
+      : t("instr.setupHint");
 
   // §3: one configure handler, the choice delegated to agent-config.ts. A
   // throw inside must not silence the plugin (SDK fail-closed), so it falls
@@ -685,6 +776,7 @@ export async function createPlugin(
         probes,
         policyOk: policyLoad.policy !== null,
         roleInstructions: roleTextFor,
+        skills: skillSet(lang),
       });
       // §13.2 п.4: reflect the decided role into display metadata. The
       // hook itself may not touch the network, so the write rides on the
@@ -719,6 +811,7 @@ export async function createPlugin(
         policyLoad.policy !== null,
         userPlugins(),
         roleTextFor("orchestrator"),
+        skillSet(lang),
       );
     }
   });
@@ -781,8 +874,10 @@ export async function createPlugin(
         loadPolicy: () => loadPolicy(true),
         probes,
         primaryHostId,
-        gitInstructions: () => currentSettings.gitInstructions,
+        gitInstructions: () =>
+        effectiveGitInstructions(currentSettings.gitInstructions, t),
         cmd,
+        t,
       });
     });
 
@@ -825,8 +920,10 @@ export async function createPlugin(
     bbCli,
     threads: bb.sdk.threads as unknown as DelegateThreads,
     primaryHostId,
-    gitInstructions: () => currentSettings.gitInstructions,
+    gitInstructions: () =>
+        effectiveGitInstructions(currentSettings.gitInstructions, t),
     policy: () => policyLoad.policy,
+    t,
   };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),
@@ -908,7 +1005,15 @@ export async function createPlugin(
     // PLUG-245 Б2: владелец замков копии postPublish — этот экземпляр.
     instanceId: `orch-${process.pid}-${Math.random().toString(36).slice(2, 10)}`,
     log: bb.log,
+    t,
   };
+  // §18.1 (PLUG-247a): an installed pre-push is language-versioned —
+  // sync it at startup too (a plugin update may have added MESSAGES).
+  try {
+    syncInstalledPrePush(releaseDeps.hooksDir(), t);
+  } catch (e) {
+    bb.log.warn(`orchestrator: pre-push sync: ${describeError(e)}`);
+  }
   const pumpRelease = () =>
     pumpReleases(releaseDeps).catch((e) =>
       bb.log.warn(`orchestrator release pump: ${describeError(e)}`),
@@ -1249,40 +1354,38 @@ export async function createPlugin(
 
   bb.agents.registerTool({
     name: "orchestrator_delegate",
-    description:
-      "Delegate a bb task to an executor thread under the routing policy: dispatch, attach as hidden child, parent notifications, and setup in one call.",
-    instructions:
-      "Use orchestrator_delegate instead of running `bb tasks dispatch` + `bb thread update` by hand. The executor's report arrives as a message — finish your turn after delegating.",
+    description: t("tool.delegate"),
+    instructions: t("tool.delegateInstr"),
     parameters: z.object({
-      taskKey: z.string().min(1).describe("Task key, e.g. PLUG-129"),
+      taskKey: z.string().min(1).describe(t("tool.delTaskKey")),
       level: z
         .string()
         .min(1)
-        .describe("Level name from the routing policy"),
+        .describe(t("tool.delLevel")),
       route: z
         .string()
         .optional()
-        .describe("Any route name declared in the policy (not only the level's chain); defaults to the first available"),
+        .describe(t("tool.delRoute")),
       preset: z
         .string()
         .optional()
-        .describe("One-off: an existing `bb tasks` preset name, dispatched outside the policy. Mutually exclusive with `route`"),
+        .describe(t("tool.delPreset")),
       instructions: z
         .string()
         .optional()
-        .describe("Extra instructions for this dispatch only"),
+        .describe(t("tool.delInstructions")),
       from: z
         .string()
         .optional()
-        .describe("Continue this round from an explicit sha or branch (§6 --from)"),
+        .describe(t("tool.delFrom")),
       fresh: z
         .boolean()
         .optional()
-        .describe("Start the round without continuing the previous result (§6 --fresh)"),
+        .describe(t("tool.delFresh")),
       noCode: z
         .boolean()
         .optional()
-        .describe("Mark the delegation «задача без кода» (§4.1 r28): the executor must not commit, the watchdog does not expect commits"),
+        .describe(t("cli.noCodeDescribe")),
     }),
     async execute(params, ctx) {
       try {
@@ -1292,7 +1395,7 @@ export async function createPlugin(
           // §2.3 (PLUG-182): `res.note` carries the reviewByLevel mapping
           // («review → review-medium по сложности…») — the reminder must
           // not overwrite it.
-          reminder: "Ответ исполнителя придёт сообщением — закончи ход.",
+          reminder: t("cli.reminder"),
         });
       } catch (e) {
         return JSON.stringify(errorJson(e));
@@ -1302,13 +1405,12 @@ export async function createPlugin(
 
   bb.agents.registerTool({
     name: "orchestrator_status",
-    description:
-      "List this coordinator's delegations and counters (active vs policy limits).",
+    description: t("tool.status"),
     parameters: z.object({
       all: z
         .boolean()
         .optional()
-        .describe("Include delegations of all coordinators"),
+        .describe(t("tool.statusAll")),
     }),
     async execute(params, ctx) {
       try {
@@ -1324,13 +1426,12 @@ export async function createPlugin(
 
   bb.agents.registerTool({
     name: "orchestrator_cancel",
-    description:
-      "Cancel a delegation: stop the executor thread and mark the record cancelled. Accepts a delegation id or thread id.",
+    description: t("tool.cancel"),
     parameters: z.object({
       target: z
         .string()
         .min(1)
-        .describe("Delegation id (number) or executor thread id (thr_…)"),
+        .describe(t("tool.cancelTarget")),
     }),
     async execute(params, _ctx) {
       try {
@@ -1404,8 +1505,8 @@ export async function createPlugin(
       if (!row) {
         throw new OrchestratorError(
           "not-found",
-          `no delegation ${ref}`,
-          "see `bb orchestrator status`",
+          t("cli.noDelegation", { ref }),
+          t("cli.noDelegationHint"),
         );
       }
       // §6: from a thread, only the coordinator that owns this delegation.
@@ -1517,12 +1618,12 @@ export async function createPlugin(
       if (muted.length) {
         out +=
           ` notify-muted=${muted.at(-1)?.message ?? "?"}` +
-          ` (уведомления заглушены, ждут восстановления auto)`;
+          t("status.notifyMuted");
       }
       if (cancelled.length) {
         out +=
           ` coordinator-cancel=${cancelled.at(-1)?.message ?? "?"}` +
-          ` (отменено координатором)`;
+          t("status.coordCancel");
       }
       return out;
     } catch {
@@ -1538,67 +1639,63 @@ export async function createPlugin(
 
   bb.cli.register({
     name: "orchestrator",
-    summary:
-      "Delegate bb tasks to executor threads under the routing policy (spec: docs/specs/orchestrator.md)",
+    summary: t("cli.helpSummary"),
     commands: [
       {
         name: "delegate",
-        summary: "Dispatch a task to an executor under the policy",
+        summary: t("cli.helpDelegateS"),
         usage:
           "bb orchestrator delegate <KEY> --level <level> [--route <route>|--preset <preset>] [--instructions <text>] [--from <sha|branch>] [--fresh] [--no-code] [--json]",
       },
       {
         name: "status",
-        summary: "Delegations and counters",
+        summary: t("cli.helpStatusS"),
         usage: "bb orchestrator status [--coordinator <thr>] [--all] [--json]",
       },
       {
         name: "show",
-        summary: "One delegation by id or thread id",
+        summary: t("cli.helpShowS"),
         usage: "bb orchestrator show <delegationId|threadId> [--json]",
       },
       {
         name: "cancel",
-        summary: "Stop the executor and mark the delegation cancelled",
+        summary: t("cli.helpCancelS"),
         usage: "bb orchestrator cancel <delegationId|threadId> [--json]",
       },
       {
         name: "merge",
-        summary:
-          "Merge a finished round's result into the coordinator's worktree (§14)",
+        summary: t("cli.helpMergeS"),
         usage:
           "bb orchestrator merge <KEY|delegationId> [--into <branch>] [--no-autofix] [--dry-run] [--json]",
       },
       {
         name: "policy",
-        summary: "Show or validate the configured policy",
+        summary: t("cli.helpPolicyS"),
         usage: "bb orchestrator policy [show|validate] [--json]",
       },
       {
         name: "instructions",
-        summary: "Print the generated routing rule (§3)",
+        summary: t("cli.helpInstructionsS"),
         usage: "bb orchestrator instructions",
       },
       {
         name: "reconcile",
-        summary: "Force a reconciliation pass (watchdog stage)",
+        summary: t("cli.helpReconcileS"),
         usage: "bb orchestrator reconcile [--json]",
       },
       {
         name: "release",
-        summary:
-          "Deterministic publish pipeline (spec orchestrator-release §2)",
-        usage:
-          "bb orchestrator release <KEY> [--no-docs <причина>] [--kb <заметка>|--no-kb <причина>] [--json]",
+        summary: t("cli.helpReleaseS"),
+        usage: t("cli.releaseUsage"),
       },
       {
         name: "hooks-dir",
-        summary: "Directory of the shared pre-push hook + push token",
+        summary: t("cli.helpHooksDirS"),
         usage: "bb orchestrator hooks-dir",
       },
       {
         name: "janitor",
-        summary: "Janitor: merged copy/branch/thread cleanup (§15)",
+        summary: t("cli.helpJanitorS"),
         usage: "bb orchestrator janitor [run|report] [--dry-run] [--json]",
       },
     ],
@@ -1625,7 +1722,7 @@ export async function createPlugin(
           if (!taskKey || !level) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "usage: bb orchestrator delegate <KEY> --level <level> [--route <r>|--preset <p>] [--instructions <t>] [--from <sha|branch>] [--fresh] [--no-code]",
+              t("cli.delegateUsage"),
             );
           }
           const res = await delegate({
@@ -1644,10 +1741,23 @@ export async function createPlugin(
             : {
                 exitCode: 0,
                 stdout:
-                  `delegated ${res.taskKey}: level=${res.level} route=${res.route} thread=${res.threadId} (delegation #${res.delegationId})` +
-                  (res.note ? `\nnote: ${res.note}` : "") +
+                  t("cli.delegated", {
+                    taskKey: res.taskKey,
+                    level: res.level,
+                    route: res.route,
+                    thread: res.threadId ?? "—",
+                    id: res.delegationId,
+                  }) +
+                  (res.note
+                    ? "\n" + t("cli.note", { note: res.note })
+                    : "") +
                   (res.setupErrors.length
-                    ? `\nsetup errors: ${res.setupErrors.map((s) => `${s.step}: ${s.message}`).join("; ")}`
+                    ? "\n" +
+                      t("cli.setupErrors", {
+                        list: res.setupErrors
+                          .map((s) => `${s.step}: ${s.message}`)
+                          .join("; "),
+                      })
                     : "") +
                   "\n",
               };
@@ -1672,17 +1782,18 @@ export async function createPlugin(
               : "") +
             `  counts: ${JSON.stringify(res.counts)}\n` +
             (res.execSettingsChanges.length
-              ? `изменённые исполняемые настройки: ${res.execSettingsChanges
-                  .map((c) => c.key)
-                  .join(", ")}\n`
+              ? t("status.execChanged", {
+                  names: res.execSettingsChanges
+                    .map((c) => c.key)
+                    .join(", "),
+                }) + "\n"
               : "") +
             (res.commitIdentityMissing
-              ? "предупреждение: автор коммитов не задан " +
-                "(release.commitIdentity) — подписи коммитов " +
-                "скан не блокирует\n"
+              ? t("status.noIdentity") + "\n"
               : "");
           for (const d of res.delegations) out += renderDelegation(d) + "\n";
-          if (!res.delegations.length) out += "no delegations\n";
+          if (!res.delegations.length)
+            out += t("status.noDelegations") + "\n";
           return { exitCode: 0, stdout: out };
         }
 
@@ -1692,8 +1803,8 @@ export async function createPlugin(
           if (!row) {
             throw new OrchestratorError(
               "not-found",
-              `no delegation ${ref ?? ""}`,
-              "see `bb orchestrator status`",
+              t("cli.noDelegation", { ref: ref ?? "" }),
+              t("cli.noDelegationHint"),
             );
           }
           return json
@@ -1714,8 +1825,10 @@ export async function createPlugin(
             ? jsonOk(res)
             : {
                 exitCode: 0,
-                stdout: `cancelled delegation #${res.delegationId}` +
-                  (res.warning ? ` (${res.warning})` : "") + "\n",
+                stdout:
+                  t("cli.cancelled", { id: res.delegationId }) +
+                  (res.warning ? ` (${res.warning})` : "") +
+                  "\n",
               };
         }
 
@@ -1781,7 +1894,8 @@ export async function createPlugin(
                 raw: text,
               });
             }
-            let out = text.trim() ? text + "\n" : "(policy is empty)\n";
+            let out =
+              text.trim() ? text + "\n" : t("cli.policyEmpty") + "\n";
             for (const e of policyLoad.errors)
               out += `error ${e.path}: ${e.message}\n`;
             for (const w of policyLoad.warnings)
@@ -1831,7 +1945,7 @@ export async function createPlugin(
               : {
                   exitCode: 0,
                   stdout:
-                    "policy is valid\n" +
+                    t("cli.policyValid") + "\n" +
                     policyLoad.warnings
                       .map((w) => `warning ${w.path}: ${w.message}\n`)
                       .join(""),
@@ -1839,7 +1953,7 @@ export async function createPlugin(
           }
           throw new OrchestratorError(
             "invalid-arguments",
-            `unknown policy subcommand "${sub}" (show|validate)`,
+            t("cli.unknownPolicySub", { sub }),
           );
         }
 
@@ -1847,11 +1961,13 @@ export async function createPlugin(
           if (!policyLoad.policy) {
             throw new OrchestratorError(
               "policy-invalid",
-              "cannot generate the routing rule without a valid policy",
-              "set it up via the `orchestrator-setup` skill (§2.1), then `bb orchestrator policy validate`",
+              t("cli.cannotGenerate"),
+              t("cli.cannotGenerateHint", {
+                skill: skillSet(lang).setup,
+              }),
             );
           }
-          const text = generateRoutingRule(policyLoad.policy);
+          const text = generateRoutingRule(policyLoad.policy, t);
           return json
             ? jsonOk({ ok: true, instructions: text })
             : { exitCode: 0, stdout: text + "\n" };
@@ -1862,19 +1978,19 @@ export async function createPlugin(
           if (!key) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "usage: bb orchestrator release <KEY> [--no-docs <причина>] [--kb <заметка>|--no-kb <причина>]",
+              t("cli.releaseUsageShort"),
             );
           }
           if (flag("--kb") && flag("--no-kb")) {
             throw new OrchestratorError(
               "invalid-arguments",
-              "--kb и --no-kb несовместимы",
+              t("cli.kbConflict"),
             );
           }
           if (!ctx.threadId) {
             throw new OrchestratorError(
               "no-caller-thread",
-              "release works only from a bb thread (BB_THREAD_ID is absent)",
+              t("cli.noCallerThread"),
             );
           }
           const caller = await callerFacts(ctx.threadId);
@@ -1897,21 +2013,25 @@ export async function createPlugin(
             : {
                 exitCode: 0,
                 stdout:
-                  `release ${res.taskKey}: аудит запущен ` +
-                  `(release #${res.releaseId}, тред ${res.auditThreadId ?? "—"}; ` +
-                  `проект настройки ${res.settingsProjectId}, ` +
-                  `проект делегирования ${res.delegationProjectId})` +
+                  t("cli.releaseStarted", {
+                    taskKey: res.taskKey,
+                    id: res.releaseId,
+                    thread: res.auditThreadId ?? "—",
+                    settings: res.settingsProjectId,
+                    delegation: res.delegationProjectId,
+                  }) +
                   (res.warnings.length
-                    ? `
-предупреждения скана:
-${res.warnings
-                        .slice(0, 10)
-                        .map((f) => `- ${f.file ?? ""}:${f.line ?? ""} ${f.problem}`)
-                        .join("\n")}`
+                    ? t("cli.scanWarnings", {
+                        list: res.warnings
+                          .slice(0, 10)
+                          .map(
+                            (f) =>
+                              `- ${f.file ?? ""}:${f.line ?? ""} ${f.problem}`,
+                          )
+                          .join("\n"),
+                      })
                     : "") +
-                  `
-итог придёт сообщением [orchestrator] — закончи ход.
-`,
+                  t("cli.releaseReminder"),
               };
         }
 

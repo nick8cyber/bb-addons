@@ -13,6 +13,7 @@ import type { EventHookSetting } from "./events.js";
 import type { ReleaseConfig, ReleaseProjectLayer } from "./release-config.js";
 import { ACTIVE_STATUSES } from "./store.js";
 import type { DelegationStore } from "./store.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 const SNAPSHOT_KEY = "exec-snapshot";
 const CHANGES_KEY = "exec-settings-changes";
@@ -127,7 +128,9 @@ export async function checkExecSettings(deps: {
   hooksRaw?: string;
   send: (threadId: string, text: string) => Promise<void>;
   warn?: (m: string) => void;
+  t?: T;
 }): Promise<ExecSettingsChange[]> {
+  const t = deps.t ?? T_RU;
   const next = execSettingsFingerprint(
     deps.cfgBroken ? null : deps.cfg,
     deps.hooksBroken ? null : deps.hooks,
@@ -158,16 +161,10 @@ export async function checkExecSettings(deps: {
     for (const [k, v] of Object.entries(prev)) {
       if (!(k in next) && !k.startsWith(HOOKS_KEY_PREFIX)) next[k] = v;
     }
-    deps.warn?.(
-      "orchestrator: release-конфиг не парсится — эта часть снимка " +
-        "исполняемых настроек не сверялась (прежние ключи сохранены)",
-    );
+    deps.warn?.(`orchestrator: ${t("trust.cfgBroken")}`);
   }
   if (deps.hooksBroken) {
-    deps.warn?.(
-      "orchestrator: eventHooks не парсится — хуки не запускаются; " +
-        "в снимке доверия — маркер битого документа",
-    );
+    deps.warn?.(`orchestrator: ${t("trust.hooksBroken")}`);
   }
   const changes: ExecSettingsChange[] = [];
   for (const [k, v] of Object.entries(next)) {
@@ -180,7 +177,8 @@ export async function checkExecSettings(deps: {
   deps.store.metaSet(SNAPSHOT_KEY, JSON.stringify(next));
   deps.store.metaSet(CHANGES_KEY, JSON.stringify(changes));
   const names = changes.map((c) => c.key).join(", ");
-  deps.warn?.(`orchestrator: изменены исполняемые настройки: ${names}`);
+  const changedLine = t("trust.changed", { names });
+  deps.warn?.(`orchestrator: ${changedLine}`);
   const coords = new Set<string>();
   for (const d of deps.store.listByStatuses(ACTIVE_STATUSES)) {
     coords.add(d.coordinator_thread_id);
@@ -190,7 +188,7 @@ export async function checkExecSettings(deps: {
   }
   for (const t of coords) {
     await deps
-      .send(t, `изменены исполняемые настройки: ${names}`)
+      .send(t, changedLine)
       .catch(() => {});
   }
   return changes;

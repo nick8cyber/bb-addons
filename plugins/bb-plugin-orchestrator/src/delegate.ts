@@ -42,6 +42,7 @@ import {
   type BbCli,
 } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
+import { T_RU, type T } from "./i18n/index.js";
 
 export interface SetupError {
   step: string;
@@ -192,8 +193,10 @@ export interface DelegateDeps {
    * it `continuePoint` falls back to the timestamp heuristic. */
   cmd?: CmdRunner;
   /** §2.2 git rules, read fresh at dispatch so edits and reissues see the
-   * current setting. */
+   * current setting (the server resolves built-in values to `language`). */
   gitInstructions?: () => string | undefined;
+  /** §18.1: human-facing texts — the language catalog. */
+  t?: T;
 }
 
 /**
@@ -213,6 +216,7 @@ export interface DispatchStepsDeps {
   gitInstructions?: DelegateDeps["gitInstructions"];
   /** §2.3 r24: parsed policy for the level→role map; absent = name rule. */
   policy?: () => Policy | null;
+  t?: T;
 }
 
 export interface DispatchStepsResult {
@@ -238,6 +242,7 @@ export async function runDelegate(
   params: DelegateParams,
   deps: DelegateDeps,
 ): Promise<DelegateResult> {
+  const t = deps.t ?? T_RU;
   const { store, bbCli } = deps;
 
   // Caller gate (§4): only a coordinator may delegate, even from a CLI shell
@@ -245,8 +250,8 @@ export async function runDelegate(
   if (!isCoordinator(params.caller, deps.probes)) {
     throw new OrchestratorError(
       "not-a-coordinator",
-      `thread ${params.caller.threadId} is not a coordinator (has a parent or executor markers)`,
-      "delegate is only available to coordinator threads",
+      t("del.notCoordinator", { threadId: params.caller.threadId }),
+      t("del.notCoordinatorHint"),
     );
   }
 
@@ -260,13 +265,13 @@ export async function runDelegate(
     ).catch((e) => {
       throw new OrchestratorError(
         "task-not-found",
-        `cannot resolve task "${params.taskKey}": ${message(e)}`,
+        t("del.taskNotFound", { input: params.taskKey, error: message(e) }),
       );
     });
     if (!shown.task?.key) {
       throw new OrchestratorError(
         "task-not-found",
-        `cannot resolve task "${params.taskKey}" to a key`,
+        t("del.taskNoKey", { input: params.taskKey }),
       );
     }
     taskKey = shown.task.key;
@@ -279,8 +284,10 @@ export async function runDelegate(
     const first = load.errors[0];
     throw new OrchestratorError(
       "policy-invalid",
-      `policy is not usable: ${first ? `${first.path}: ${first.message}` : "empty"}`,
-      "fix it via `bb plugin config orchestrator set policy …`, then `bb orchestrator policy validate`",
+      t("del.policyInvalid", {
+        detail: first ? `${first.path}: ${first.message}` : "empty",
+      }),
+      t("del.policyInvalidHint"),
     );
   }
 
@@ -289,8 +296,8 @@ export async function runDelegate(
   if (params.route && params.preset) {
     throw new OrchestratorError(
       "incompatible-flags",
-      "--route and --preset cannot be combined",
-      "--route names a policy route; --preset dispatches a one-off existing preset",
+      t("del.routePresetConflict"),
+      t("del.routePresetHint"),
     );
   }
 
@@ -313,8 +320,10 @@ export async function runDelegate(
     if (latestExec) {
       const mapped = policy.reviewByLevel[latestExec.level] ?? "review";
       if (mapped !== "review") {
-        levelNote =
-          `review → ${mapped} по сложности исполнения ${latestExec.level}`;
+        levelNote = t("del.levelNote", {
+          mapped,
+          level: latestExec.level,
+        });
       }
       level = mapped;
     }
@@ -325,8 +334,8 @@ export async function runDelegate(
   if (level === "release-audit") {
     throw new OrchestratorError(
       "level-forbidden",
-      `--level release-audit назначает только конвейер выкладки`,
-      "раздавай уровни исполнения и ревью из политики",
+      t("del.levelForbidden"),
+      t("del.levelForbiddenHint"),
     );
   }
 
@@ -337,8 +346,8 @@ export async function runDelegate(
   if (params.from && params.fresh) {
     throw new OrchestratorError(
       "incompatible-flags",
-      "--from and --fresh cannot be combined",
-      "--from names the commit to continue from; --fresh starts the round from the base",
+      t("del.fromFreshConflict"),
+      t("del.fromFreshHint"),
     );
   }
 
@@ -352,8 +361,10 @@ export async function runDelegate(
     if (!policy.levels[level]) {
       throw new OrchestratorError(
         "unknown-level",
-        `level "${level}" is not in the policy`,
-        `levels: ${Object.keys(policy.levels).join(", ")}`,
+        t("del.unknownLevel", { level }),
+        t("del.unknownLevelHint", {
+          levels: Object.keys(policy.levels).join(", "),
+        }),
       );
     }
     // §2.3: a one-off preset dispatches outside the policy routes —
@@ -368,14 +379,14 @@ export async function runDelegate(
     ).catch((e) => {
       throw new OrchestratorError(
         "unknown-preset",
-        `preset "${params.preset}": ${message(e)}`,
+        t("del.unknownPreset", { preset: params.preset!, error: message(e) }),
       );
     });
     const provider = show.preset?.providerId;
     if (!provider) {
       throw new OrchestratorError(
         "unknown-preset",
-        `preset "${params.preset}" has no providerId in bb tasks preset show`,
+        t("del.presetNoProvider", { preset: params.preset! }),
       );
     }
     routeName = `preset:${params.preset}`;
@@ -393,8 +404,8 @@ export async function runDelegate(
     if (blocked) {
       throw new OrchestratorError(
         "route-held",
-        `provider quota group "${blocked}" is on hold`,
-        "wait for the hold to expire or pick a preset on another provider",
+        t("del.routeHeld", { group: blocked }),
+        t("del.routeHeldHint"),
       );
     }
     route = { preset: params.preset, provider };
@@ -415,8 +426,8 @@ export async function runDelegate(
     if (count >= maxActive) {
       throw new OrchestratorError(
         "limit-exceeded",
-        `active delegations ${count}/${maxActive}`,
-        "wait for an active delegation to finish or raise limits.maxActive",
+        t("del.limitActive", { count, max: maxActive }),
+        t("del.limitActiveHint"),
       );
     }
   }
@@ -426,7 +437,7 @@ export async function runDelegate(
     if (count >= perLevel) {
       throw new OrchestratorError(
         "limit-exceeded",
-        `active "${params.level}" delegations ${count}/${perLevel}`,
+        t("del.limitLevel", { level: params.level, count, max: perLevel }),
       );
     }
   }
@@ -487,8 +498,8 @@ export async function runDelegate(
     ) {
       throw new OrchestratorError(
         "task-already-delegated",
-        `task ${taskKey} already has an active executor`,
-        "use `bb orchestrator status` / `bb orchestrator cancel` first",
+        t("del.taskDelegated", { taskKey }),
+        t("del.taskDelegatedHint"),
       );
     }
     throw e;
@@ -522,11 +533,11 @@ export async function runDelegate(
         store.hold(
           routeName,
           Date.now() + 15 * 60 * 1000,
-          `маршрут недоступен: ${text.slice(0, 180)}`,
+          t("del.holdReason", { text: text.slice(0, 180) }),
         );
         throw new OrchestratorError(
           "dispatch-failed",
-          `${text} — маршрут ${routeName} отмечен недоступным на 15 минут`,
+          t("del.routeHeldNote", { text, route: routeName }),
           e instanceof OrchestratorError ? e.hint : undefined,
         );
       }
@@ -581,6 +592,7 @@ export async function dispatchToRoute(
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
+  const t = deps.t ?? T_RU;
   const { store } = deps;
 
   // §2.2: the «Работа с git» section leads --instructions; a continuation
@@ -598,10 +610,21 @@ export async function dispatchToRoute(
     opts.instructions,
     row.continue_from
       ? roleForLevel(row.level, deps.policy?.()) === "auditor"
-        ? reviewRoundLine(row.continue_from, resultRef?.branch, resultRef?.round)
-        : roundSection(row.round, row.continue_from, resultRef?.branch)
+        ? reviewRoundLine(
+            row.continue_from,
+            resultRef?.branch,
+            resultRef?.round,
+            t,
+          )
+        : roundSection(
+            row.round,
+            row.continue_from,
+            resultRef?.branch,
+            t,
+          )
       : undefined,
     row.no_code === 1,
+    t,
   );
   // §4 r30: the plugin spawns the executor itself — the parent,
   // `hidden`, `parentNotifications=auto` and the
@@ -614,10 +637,11 @@ export async function dispatchToRoute(
     return await dispatchViaSpawn(row, instructions, opts, deps);
   } catch (e) {
     if (!(e instanceof SpawnSchemaRefusal)) throw e;
+    const t = deps.t ?? T_RU;
     store.addSetupError(
       row.id,
       "own-spawn",
-      `свой запуск недоступен: ${message(e)}`,
+      t("del.ownSpawnUnavailable", { error: message(e) }),
     );
     return dispatchViaTasksCli(row, instructions, opts, deps);
   }
@@ -838,6 +862,7 @@ async function refuseDispatch(
   deps: DispatchStepsDeps,
   detail: string,
 ): Promise<never> {
+  const t = deps.t ?? T_RU;
   // §17.2 (e2e 6 + PLUG-211 С4): an undispatchable route (bad reasoning
   // level, removed model) leaves its reason as a task comment — once.
   // The watchdog reissue path skips this (its `report` comments the
@@ -849,7 +874,10 @@ async function refuseDispatch(
         "comment",
         row.task_key,
         "--body",
-        `раздача на ${row.route} отклонена: ${detail.slice(0, 500)}`,
+        t("del.dispatchRefused", {
+          route: row.route,
+          detail: detail.slice(0, 500),
+        }),
       ]);
     } catch {
       // A failed comment must not hide the dispatch refusal itself.
@@ -913,12 +941,13 @@ async function dispatchViaSpawn(
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
+  const t = deps.t ?? T_RU;
   const { store, bbCli } = deps;
   const unknownDispatch: UnknownDispatch = (detail) =>
     new OrchestratorError(
       "dispatch-unknown",
-      `результат раздачи неизвестен (${detail})`,
-      "the delegation stays `dispatching`; the reconcile pass will link the thread or remove the record",
+      t("del.dispatchUnknown", { detail }),
+      t("del.dispatchUnknownHint"),
     );
   const refuse = (detail: string) => refuseDispatch(row, opts, deps, detail);
 
@@ -1080,7 +1109,7 @@ async function dispatchViaSpawn(
     }
     throw new OrchestratorError(
       "dispatch-failed",
-      `dispatch failed after spawn: ${message(fatal)}`,
+      t("del.dispatchAfterSpawn", { error: message(fatal) }),
     );
   }
 }
@@ -1112,11 +1141,14 @@ async function dispatchViaTasksCli(
     ],
     { timeoutMs: deps.dispatchTimeoutMs ?? 120_000 },
   );
+  const t = deps.t ?? T_RU;
   const unknownDispatch = () =>
     new OrchestratorError(
       "dispatch-unknown",
-      `результат раздачи неизвестен (dispatch did not answer cleanly: exit ${dispatchRes.exitCode})`,
-      "the delegation stays `dispatching`; the reconcile pass will link the thread or remove the record",
+      t("del.dispatchUnknown", {
+        detail: t("del.dispatchUnclean", { code: dispatchRes.exitCode }),
+      }),
+      t("del.dispatchUnknownHint"),
     );
   if (dispatchRes.exitCode !== 0 && !dispatchRes.timedOut) {
     const detail =
@@ -1246,12 +1278,13 @@ export async function finishDispatchSteps(
   deps: DispatchStepsDeps,
   opts: { levelNote?: string; taskStatus?: string } = {},
 ): Promise<{ status: "running" | "cancelled"; setupErrors: SetupError[] }> {
+  const t = deps.t ?? T_RU;
   const { store, bbCli } = deps;
   const threadId = row.thread_id;
   if (!threadId) {
     throw new OrchestratorError(
       "internal-error",
-      `delegation ${row.id} has no thread_id for the setup steps`,
+      t("del.noThreadId", { id: row.id }),
     );
   }
   const setupErrors: SetupError[] = [];
@@ -1323,7 +1356,9 @@ export async function finishDispatchSteps(
     // `dispatch-failed`; no «Раздано» comment for an unsupervised thread.
     throw new OrchestratorError(
       "internal-error",
-      `delegation left 'dispatching' before step 6 (now '${current?.status ?? "missing"}')`,
+      t("del.leftDispatching", {
+        status: current?.status ?? "missing",
+      }),
     );
   }
   try {
@@ -1332,7 +1367,12 @@ export async function finishDispatchSteps(
       "comment",
       row.task_key,
       "--body",
-      `Раздано: ${opts.levelNote ?? `уровень ${row.level}`}, маршрут ${row.route}, пресет ${row.preset}, тред ${threadId}`,
+      t("del.comment", {
+        note: opts.levelNote ?? t("del.levelWord", { level: row.level }),
+        route: row.route,
+        preset: row.preset,
+        threadId,
+      }),
     ]);
   } catch (e) {
     noteError("comment", e);
@@ -1419,6 +1459,7 @@ export async function retrySetupSteps(
   row: DelegationRow,
   deps: DispatchStepsDeps,
 ): Promise<SetupError[]> {
+  const t = deps.t ?? T_RU;
   const { store } = deps;
   const threadId = row.thread_id;
   if (!threadId) return [];
@@ -1513,7 +1554,12 @@ export async function retrySetupSteps(
         "comment",
         row.task_key,
         "--body",
-        `Раздано: уровень ${row.level}, маршрут ${row.route}, пресет ${row.preset}, тред ${threadId}`,
+        t("del.comment", {
+          note: t("del.levelWord", { level: row.level }),
+          route: row.route,
+          preset: row.preset,
+          threadId,
+        }),
       ]),
     );
   }
