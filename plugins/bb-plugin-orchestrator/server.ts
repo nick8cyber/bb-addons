@@ -79,6 +79,7 @@ import {
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
 import { createCommandRunner } from "./src/commands.js";
+import { onHookRunFinished, parseEventHooks } from "./src/events.js";
 import {
   checkExecSettings,
   execSettingsChanges,
@@ -237,8 +238,16 @@ export async function createPlugin(
       type: "string",
       label: "Command journal retention (days)",
       description:
-        "§18.2: command_runs journal entries older than this are pruned. Default 30.",
+        "§18.2: command_runs and events entries older than this are pruned. Default 30.",
       default: "30",
+    },
+    eventHooks: {
+      type: "string",
+      label: "Event hooks",
+      description:
+        "§18.5: JSON array of event hooks — [{name, on:[<event>…], run:[argv…], projects?:[proj_…], timeoutSec?:120, notifyOnFail?:false}]. Hook commands run via the shared command runner from the plugin data dir; the v1 event JSON goes to stdin, ORCH_EVENT/ORCH_TASK/ORCH_PROJECT to the env. Empty — no hooks.",
+      experimental_multiline: true,
+      default: "",
     },
     janitor: {
       type: "string",
@@ -274,11 +283,42 @@ export async function createPlugin(
   // §18.2 (PLUG-245): общий запускатель журнальных команд. Сразу
   // recover(): running записи прошлого процесса — живая группа
   // убивается, запись interrupted; queued запустит следующий pump.
+  // §18.5 (PLUG-246): хуки событий — разбор настройки `eventHooks`;
+  // сопоставление — синхронно внутри транзакции перехода, поэтому
+  // провайдер отдаёт последний разобранный список.
+  let hooksLoad = parseEventHooks(currentSettings.eventHooks ?? "");
+  for (const e of hooksLoad.errors) {
+    bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
+  }
+  store.eventHooksProvider = () => ({
+    hooks: hooksLoad.hooks,
+    cwd: pluginDataDir(),
+  });
   const commandRunner = createCommandRunner({
     store,
     maxConcurrent: () =>
       positiveInt(currentSettings.maxConcurrentCommands, 4),
     warn: (m) => bb.log.warn(m),
+    // §18.5 notifyOnFail: строка координатору на серию сбоев хука.
+    onFinish: (row, status, _code, tail) =>
+      onHookRunFinished(
+        {
+          store,
+          send: async (threadId, text) => {
+            await bb.sdk.threads.send({
+              threadId,
+              mode: "queue-if-active",
+              input: [
+                { type: "text", text: `[orchestrator] ${text}`, mentions: [] },
+              ],
+            });
+          },
+          warn: (m) => bb.log.warn(m),
+        },
+        row,
+        status,
+        tail,
+      ),
   });
   void commandRunner
     .recover()
@@ -472,7 +512,9 @@ export async function createPlugin(
     checkExecSettings({
       store,
       cfg: releaseConfig.config,
-      cfgBroken: releaseConfig.errors.length > 0,
+      hooks: hooksLoad.hooks,
+      cfgBroken:
+        releaseConfig.errors.length > 0 || hooksLoad.errors.length > 0,
       send: async (threadId, text) => {
         await bb.sdk.threads.send({
           threadId,
@@ -495,6 +537,10 @@ export async function createPlugin(
     releaseConfig = parseReleaseConfig(currentSettings.release ?? "");
     for (const w of releaseConfig.warnings) {
       bb.log.warn(`orchestrator release config: ${w.path}: ${w.message}`);
+    }
+    hooksLoad = parseEventHooks(currentSettings.eventHooks ?? "");
+    for (const e of hooksLoad.errors) {
+      bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
     }
     void execSettingsCheck();
     for (const e of janitorConfig().errors) {

@@ -38,7 +38,7 @@ import {
 import {
   deliverReleaseNotice,
   parseAuditVerdict,
-  verdictInBody,
+  verdictDetailsInBody,
 } from "./release.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
@@ -2158,14 +2158,21 @@ export function createWatchdog(deps: WatchdogDeps) {
   const reviewerVerdict = async (
     row: DelegationRow,
     role: "auditor" | "release-audit",
-  ): Promise<"verdict" | "missing" | "wait"> => {
+  ): Promise<{
+    state: "verdict" | "missing" | "wait";
+    /** §18.5: у вердикта ревьюера — значения для review.verdict. */
+    verdict?: "OK" | "CHANGES";
+    blockers?: number | null;
+  }> => {
     const bg = await openBackgroundItem(row);
-    if (bg !== false) return "wait";
+    if (bg !== false) return { state: "wait" };
     if (role === "release-audit") {
       const text = await auditorLastMessage(row);
-      if (text === undefined) return "wait";
-      if (text == null) return "missing";
-      return parseAuditVerdict(text).unparseable ? "missing" : "verdict";
+      if (text === undefined) return { state: "wait" };
+      if (text == null) return { state: "missing" };
+      return parseAuditVerdict(text).unparseable
+        ? { state: "missing" }
+        : { state: "verdict" };
     }
     try {
       const show = await runJson<{
@@ -2180,27 +2187,39 @@ export function createWatchdog(deps: WatchdogDeps) {
         .filter((c) => c.kind === "agent" && c.threadId === row.thread_id)
         .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
       const last = comments.at(-1);
-      if (last?.body && verdictInBody(last.body) != null) return "verdict";
+      if (last?.body) {
+        const d = verdictDetailsInBody(last.body);
+        if (d) {
+          return { state: "verdict", verdict: d.verdict, blockers: d.blockers };
+        }
+      }
     } catch (e) {
       log.warn?.(
         `orchestrator: verdict comments ${row.task_key}: ${message(e)}`,
       );
-      return "wait";
+      return { state: "wait" };
     }
     if (row.thread_id) {
       try {
         const res = await deps.threads.output({ threadId: row.thread_id });
-        if (res?.output && verdictInBody(res.output) != null) {
-          return "verdict";
+        if (res?.output) {
+          const d = verdictDetailsInBody(res.output);
+          if (d) {
+            return {
+              state: "verdict",
+              verdict: d.verdict,
+              blockers: d.blockers,
+            };
+          }
         }
       } catch (e) {
         log.warn?.(
           `orchestrator: verdict output ${row.thread_id}: ${message(e)}`,
         );
-        return "wait";
+        return { state: "wait" };
       }
     }
-    return "missing";
+    return { state: "missing" };
   };
 
   /** Journal tip seq at the reminder's send time — a second miss counts
@@ -2322,10 +2341,16 @@ export function createWatchdog(deps: WatchdogDeps) {
         row.level === RELEASE_AUDIT_LEVEL
           ? "release-audit"
           : levelRole((await deps.loadPolicy()).policy, row.level);
+      // §18.5: вердикт ревьюера — в событие review.verdict той же
+      // транзакцией, что и переход в done (у release-audit исход —
+      // события выкладки).
+      let reviewVerdict:
+        | { verdict: string; blockers: number | null }
+        | undefined;
       if (r31Role === "auditor" || r31Role === "release-audit") {
-        const verdict = await reviewerVerdict(row, r31Role);
-        if (verdict === "wait") return;
-        if (verdict === "missing") {
+        const verdictCheck = await reviewerVerdict(row, r31Role);
+        if (verdictCheck.state === "wait") return;
+        if (verdictCheck.state === "missing") {
           const cur = store.get(row.id) ?? row;
           if (cur.verdict_nudged_at == null) {
             const tip = await journalTipSeq(row);
@@ -2397,11 +2422,19 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.setResultNotified(finished.id, "plugin");
           return;
         }
+        if (r31Role === "auditor" && verdictCheck.verdict) {
+          reviewVerdict = {
+            verdict: verdictCheck.verdict,
+            blockers: verdictCheck.blockers ?? null,
+          };
+        }
         // verdict present — the ordinary done path below
       }
       // PLUG-184: the status move is conditional — a row that left
       // `running` meanwhile (manual cancel, revive) never flips to done.
-      if (!store.setStatusIf(row.id, "running", "done")) return;
+      if (!store.setStatusIf(row.id, "running", "done", { reviewVerdict })) {
+        return;
+      }
       clearMarks(row.id);
       const finished = store.get(row.id) ?? row;
       await collectRoundResult(finished);
