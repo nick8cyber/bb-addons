@@ -51,8 +51,11 @@ const isStrArr = (v: unknown): v is string[] =>
 /**
  * Разбор настройки `eventHooks` — JSON-массив хуков. Пустая строка —
  * хуков нет. Невалидный документ — `errors` (needs-configuration как у
- * `release` не ставим: хуки — дополнительная функция, битая запись
- * пропускается и ложится в журнал).
+ * `release` не ставим: хуки — дополнительная функция, ошибки ложатся
+ * в журнал). §18.5 (ревью Б1–Б2): имена уникальны после обрезки
+ * пробелов — дубль это ошибка разбора, а при ЛЮБОЙ ошибке хуки не
+ * запускаются вовсе (см. effectiveHooks): иначе дубль имени давал бы
+ * запуск записи, которой нет в снимке доверия.
  */
 export function parseEventHooks(raw: string | undefined): EventHooksLoad {
   const errors: PolicyIssue[] = [];
@@ -81,6 +84,14 @@ export function parseEventHooks(raw: string | undefined): EventHooksLoad {
     const h = item as Record<string, unknown>;
     if (typeof h.name !== "string" || h.name.trim() === "") {
       errors.push({ path: `${path}.name`, message: "имя хука — строка" });
+      return;
+    }
+    const name = h.name.trim();
+    if (hooks.some((x) => x.name === name)) {
+      errors.push({
+        path: `${path}.name`,
+        message: "имя хука должно быть уникальным",
+      });
       return;
     }
     if (!isStrArr(h.on)) {
@@ -124,7 +135,7 @@ export function parseEventHooks(raw: string | undefined): EventHooksLoad {
       return;
     }
     hooks.push({
-      name: h.name.trim(),
+      name,
       on: [...(h.on as string[])],
       run: [...(h.run as string[])],
       ...(h.projects !== undefined
@@ -139,6 +150,12 @@ export function parseEventHooks(raw: string | undefined): EventHooksLoad {
     });
   });
   return { hooks, errors };
+}
+
+/** §18.5: при ошибке разбора `eventHooks` хуки не запускаются вовсе —
+ * действующий список пуст, пока документ не исправят. */
+export function effectiveHooks(load: EventHooksLoad): EventHookSetting[] {
+  return load.errors.length ? [] : load.hooks;
 }
 
 /** Ключ серии сбоев — по имени хука (§18.5: следующая строка только

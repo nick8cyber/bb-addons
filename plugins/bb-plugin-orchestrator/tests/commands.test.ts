@@ -12,6 +12,7 @@ import {
 } from "../src/store.js";
 import {
   createCommandRunner,
+  defaultSpawner,
   globMatch,
   maskCommandOutput,
   procStartTime,
@@ -685,4 +686,93 @@ test("§18.4 (мелочь): status — имена и хеши изменённ�
   assert.match(listed[0].next, /^[0-9a-f]{16}$/, "новый хеш в status");
   assert.notEqual(listed[0].prev, listed[0].next);
   assert.ok(!listed[0].prev.includes("evil"), "значений нет — только хеши");
+});
+
+test("§18.5 (ревью Б3): хук, не читающий stdin — EPIPE не роняет процесс", async () => {
+  // реальный defaultSpawner: дочерний процесс сразу закрывает stdin и
+  // живёт дальше — запись большого payload гарантированно бьёт в
+  // закрытый канал. Без обработчика 'error' на stdin это было бы
+  // необработанным исключением и падением всего тестового процесса.
+  const spawned = defaultSpawner({
+    argv: ["sh", "-c", `exec 0<&-; ${SLE} 0.2`],
+    cwd: "/tmp",
+    env: {},
+    stdin: "x".repeat(512 * 1024),
+  });
+  const res = await spawned.done;
+  assert.equal(res.code, 0, "команда завершилась, плагин не упал");
+  // окно для отложенного 'error' на stdin — он игнорируется
+  await new Promise((r) => setTimeout(r, 50));
+});
+
+test("§18.5 (ревью Б4): recover — interrupted даёт onFinish для notifyOnFail", async () => {
+  const { store } = makeStore();
+  const fins: string[] = [];
+  const a = store.enqueueCommandRun(spec({ runKey: "pp:1:a", name: "a" }), 1);
+  store.claimCommandRun(a.id, 2);
+  store.attachCommandProcess(a.id, 42, 42, "777");
+  const runner = createCommandRunner({
+    store,
+    maxConcurrent: () => 1,
+    killGraceMs: 1,
+    procStart: () => "777",
+    alive: () => false,
+    killGroup: () => {},
+    onFinish: (row, status, code, tail) =>
+      fins.push(`${row.name}:${status}:${code}:${tail}`),
+    [SLE]: async () => {},
+  });
+  await runner.recover();
+  assert.equal(store.commandRunByKey("pp:1:a")!.status, "interrupted");
+  assert.deepEqual(fins, ["a:interrupted:null:прервана перезапуском"]);
+});
+
+test("§18.5 (ревью Б4): stopAll — interrupted даёт onFinish для notifyOnFail", async () => {
+  const { store } = makeStore();
+  const fins: string[] = [];
+  const { spawner, spawned } = fakeSpawner();
+  const runner = createCommandRunner({
+    store,
+    spawn: spawner,
+    maxConcurrent: () => 4,
+    procStart: () => "1",
+    alive: () => false,
+    killGraceMs: 1,
+    onFinish: (row, status, code, tail) =>
+      fins.push(`${row.name}:${status}:${code}:${tail}`),
+    [SLE]: async () => {},
+  });
+  store.enqueueCommandRun(spec({ runKey: "pp:1:a", name: "a" }), 1);
+  await runner.pump();
+  assert.equal(spawned.length, 1);
+  await runner.stopAll();
+  assert.equal(store.commandRunByKey("pp:1:a")!.status, "interrupted");
+  assert.deepEqual(fins, ["a:interrupted:null:остановка плагина"]);
+});
+
+test("§18.5 (ревью Н6): сбои до spawn — битая спецификация и ошибка spawn дают onFinish(failed)", async () => {
+  const { store, db } = makeStore();
+  const fins: string[] = [];
+  const runner = createCommandRunner({
+    store,
+    spawn: () => {
+      throw new Error("spawn ENOENT");
+    },
+    maxConcurrent: () => 4,
+    procStart: () => "1",
+    alive: () => false,
+    onFinish: (row, status, code) =>
+      fins.push(`${row.name}:${status}:${code}`),
+  });
+  const a = store.enqueueCommandRun(spec({ runKey: "pp:1:a", name: "a" }), 1);
+  // спецификация бита в журнале — разбор argv падает
+  db.prepare(`UPDATE command_runs SET argv = '{' WHERE id = ?`).run(a.id);
+  store.enqueueCommandRun(
+    spec({ runKey: "pp:1:b", name: "b", groupKey: "pp:2" }),
+    2,
+  );
+  await runner.pump();
+  assert.equal(store.commandRunByKey("pp:1:a")!.status, "failed");
+  assert.equal(store.commandRunByKey("pp:1:b")!.status, "failed");
+  assert.deepEqual(fins, ["a:failed:127", "b:failed:127"]);
 });

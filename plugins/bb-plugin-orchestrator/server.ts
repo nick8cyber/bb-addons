@@ -79,7 +79,11 @@ import {
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
 import { createCommandRunner } from "./src/commands.js";
-import { onHookRunFinished, parseEventHooks } from "./src/events.js";
+import {
+  effectiveHooks,
+  onHookRunFinished,
+  parseEventHooks,
+} from "./src/events.js";
 import {
   checkExecSettings,
   execSettingsChanges,
@@ -290,8 +294,11 @@ export async function createPlugin(
   for (const e of hooksLoad.errors) {
     bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
   }
+  // §18.5 (ревью Б2): ошибка разбора eventHooks — хуки не запускаются
+  // вовсе (действующий список пуст, события в `events` пишутся всё
+  // равно).
   store.eventHooksProvider = () => ({
-    hooks: hooksLoad.hooks,
+    hooks: effectiveHooks(hooksLoad),
     cwd: pluginDataDir(),
   });
   const commandRunner = createCommandRunner({
@@ -513,8 +520,10 @@ export async function createPlugin(
       store,
       cfg: releaseConfig.config,
       hooks: hooksLoad.hooks,
-      cfgBroken:
-        releaseConfig.errors.length > 0 || hooksLoad.errors.length > 0,
+      // §18.5 (ревью Б2): сверка идёт по частям — битый `release` не
+      // отключает проверку хуков и наоборот.
+      cfgBroken: releaseConfig.errors.length > 0,
+      hooksBroken: hooksLoad.errors.length > 0,
       send: async (threadId, text) => {
         await bb.sdk.threads.send({
           threadId,

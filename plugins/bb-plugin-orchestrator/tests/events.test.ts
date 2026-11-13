@@ -14,6 +14,7 @@ import {
   type DelegationRow,
 } from "../src/store.js";
 import {
+  effectiveHooks,
   onHookRunFinished,
   parseEventHooks,
   type EventHookSetting,
@@ -520,4 +521,197 @@ test("§18.5: parseEventHooks — разбор и ошибки", () => {
   );
   assert.equal(badFields.hooks.length, 0);
   assert.equal(badFields.errors.length, 3);
+  // §18.5 (ревью Б1): имена уникальны после обрезки пробелов
+  const dup = parseEventHooks(
+    JSON.stringify([
+      { name: "a", on: ["e"], run: ["x"] },
+      { name: " a ", on: ["e"], run: ["y"] },
+    ]),
+  );
+  assert.equal(dup.hooks.length, 1);
+  assert.equal(dup.errors.length, 1);
+  assert.equal(dup.errors[0].path, "eventHooks[1].name");
+  // любая ошибка — действующий список пуст (хуки не запускаются вовсе)
+  assert.equal(effectiveHooks(dup).length, 0);
+  assert.equal(
+    effectiveHooks(parseEventHooks("не json")).length,
+    0,
+  );
+});
+
+test("§18.5 (ревью Б1–Б2): дубль имени — атака на снимок не проходит", async () => {
+  // проба ревьюера: было [a: /bin/true], стало
+  // [a: sh -c evil, a: /bin/true] — раньше в снимок ложился второй
+  // хук, а запускался первый. Теперь это ошибка разбора: хуки не
+  // запускаются вовсе, прежний ключ снимка не стирается.
+  const { store } = makeStore();
+  const cfg = parseReleaseConfig(
+    JSON.stringify({ defaults: {} }),
+  ).config!;
+  await checkExecSettings({
+    store,
+    cfg,
+    hooks: [hook({ name: "a", run: ["/bin/true"] })],
+    send: async () => {},
+  });
+  const load = parseEventHooks(
+    JSON.stringify([
+      { name: "a", on: ["delegation.done"], run: ["sh", "-c", "evil"] },
+      { name: "a", on: ["delegation.done"], run: ["/bin/true"] },
+    ]),
+  );
+  assert.ok(load.errors.length > 0, "дубль — ошибка разбора");
+  assert.equal(effectiveHooks(load).length, 0);
+  store.eventHooksProvider = () => ({
+    hooks: effectiveHooks(load),
+    cwd: "/tmp/hooks",
+  });
+  const d = running(store);
+  store.setStatusIf(d.id, "running", "done");
+  assert.equal(
+    store.queuedCommandRuns().length,
+    0,
+    "«sh -c evil» в очередь не встал",
+  );
+  // битый eventHooks не имитирует «хуки убрали» и не скрывает release
+  const changes = await checkExecSettings({
+    store,
+    cfg,
+    hooks: load.hooks,
+    hooksBroken: true,
+    send: async () => {},
+  });
+  assert.equal(changes.length, 0, "прежний ключ a сохранён");
+  // исправление с ДРУГИМ argv — расхождение видно (сравнение с
+  // настоящим прежним значением, а не с пустотой)
+  const after = await checkExecSettings({
+    store,
+    cfg,
+    hooks: [hook({ name: "a", run: ["/bin/evil2"] })],
+    send: async () => {},
+  });
+  assert.deepEqual(
+    after.map((c) => c.key),
+    ["plugin:eventHooks:a"],
+  );
+});
+
+test("§18.5 (ревью Б2): сверка доверия по частям — битый release не скрывает хуки", async () => {
+  const { store } = makeStore();
+  const cfg = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        postPublish: { commands: [{ name: "deploy", argv: ["./d.sh"] }] },
+      },
+    }),
+  ).config!;
+  await checkExecSettings({
+    store,
+    cfg,
+    hooks: [hook({ name: "h" })],
+    send: async () => {},
+  });
+  const warns: string[] = [];
+  // release сломан, хук изменён — изменение хука видно
+  const changes = await checkExecSettings({
+    store,
+    cfg,
+    cfgBroken: true,
+    hooks: [hook({ name: "h", run: ["/bin/evil"] })],
+    send: async () => {},
+    warn: (m) => warns.push(m),
+  });
+  assert.deepEqual(
+    changes.map((c) => c.key),
+    ["plugin:eventHooks:h"],
+    "сверка хуков не пропущена из-за битого release",
+  );
+  assert.ok(warns.some((w) => /release-конфиг не парсится/.test(w)));
+  // ключи release не стёрты: исправление с прежними значениями — тишина
+  const again = await checkExecSettings({
+    store,
+    cfg,
+    hooks: [hook({ name: "h", run: ["/bin/evil"] })],
+    send: async () => {},
+  });
+  assert.equal(again.length, 0);
+  // зеркально: битый eventHooks не скрывает изменение release
+  const cfg2 = parseReleaseConfig(
+    JSON.stringify({
+      defaults: {
+        postPublish: { commands: [{ name: "deploy", argv: ["./e.sh"] }] },
+      },
+    }),
+  ).config!;
+  const changes2 = await checkExecSettings({
+    store,
+    cfg: cfg2,
+    hooks: [hook({ name: "h" })],
+    hooksBroken: true,
+    send: async () => {},
+  });
+  assert.deepEqual(
+    changes2.map((c) => c.key),
+    ["defaults:postPublish.commands:deploy"],
+  );
+});
+
+test("§18.5: переоткрытие PR — повторное pr.closed с новым id события", () => {
+  const { store } = makeStore([hook({ on: ["pr.closed"] })]);
+  const r = store.insertRelease({
+    taskKey: "PLUG-1",
+    projectId: "p",
+    coordinatorThreadId: "thr_c",
+    repoPath: "/r",
+    branch: "b",
+    targetAction: "pr",
+    targetBranch: "dev",
+  });
+  store.updateRelease(r.id, {
+    status: "published",
+    prUrl: "https://example.com/pr/11",
+  });
+  store.initPrTracking(r.id);
+  assert.equal(store.transitionPrState(r.id, ["open"], "closed"), true);
+  // переоткрыли — события нет
+  assert.equal(store.transitionPrState(r.id, ["closed"], "open"), true);
+  // повторное закрытие — второе событие с новым id
+  assert.equal(store.transitionPrState(r.id, ["open"], "closed"), true);
+  const closed = store.listEvents("pr.closed");
+  assert.equal(closed.length, 2);
+  assert.notEqual(closed[0].id, closed[1].id);
+  assert.equal(store.queuedCommandRuns().length, 2);
+});
+
+test("§18.5 (ревью Б4): notifyOnFail — interrupted после рестарта тоже строка", async () => {
+  const { store } = makeStore();
+  const sends: string[] = [];
+  const deps = {
+    store,
+    send: async (t: string, text: string) => {
+      sends.push(`${t}|${text}`);
+    },
+  };
+  const row = store.enqueueCommandRun(
+    {
+      source: "hook",
+      runKey: "event:7:h",
+      name: "h",
+      argv: ["x"],
+      cwd: "/tmp",
+      stdin: JSON.stringify({
+        version: 1,
+        event: "delegation.done",
+        coordinatorThreadId: "thr_c",
+      }),
+      notifyOnFail: true,
+    },
+    Date.now(),
+  );
+  onHookRunFinished(deps, row, "interrupted", "прервана перезапуском");
+  assert.equal(sends.length, 1);
+  assert.match(
+    sends[0],
+    /хук h на delegation\.done упал: прервана перезапуском/,
+  );
 });

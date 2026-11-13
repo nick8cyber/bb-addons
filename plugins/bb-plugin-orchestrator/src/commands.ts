@@ -120,6 +120,10 @@ export const defaultSpawner: CommandSpawner = (spec) => {
     );
   });
   if (spec.stdin !== undefined) {
+    // §18.5 (ревью Б3): хук, не читающий stdin, завершается раньше
+    // записи — EPIPE на stdin игнорируется, иначе необработанный
+    // 'error' роняет весь процесс плагина.
+    child.stdin?.on("error", () => {});
     child.stdin?.write(spec.stdin);
     child.stdin?.end();
   }
@@ -177,9 +181,12 @@ export interface CommandRunnerDeps {
   killGroup?: (pgid: number, signal: "SIGTERM" | "SIGKILL") => void;
   /** Лимит одновременно running (настройка maxConcurrentCommands). */
   maxConcurrent: () => number;
-  /** §18.5: итог естественного завершения записи (ok/failed/timeout) —
-   * для notifyOnFail хуков. Вызывается после записи терминального
-   * статуса; interrupted/skipped сюда не приходят. */
+  /** §18.5: итог терминального статуса записи — для notifyOnFail
+   * хуков. Вызывается после УСПЕШНОЙ записи терминала: ok/failed/
+   * timeout при завершении процесса (включая синхронные сбои запуска —
+   * битая спецификация, ошибка spawn), interrupted при recover/stopAll.
+   * skipped сюда не приходят; итог, проигравший условный переход (уже
+   * записан другим путём), колбэка не даёт. */
   onFinish?: (
     row: CommandRunRow,
     status: CommandRunStatus,
@@ -224,7 +231,27 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
   const killGroup = deps.killGroup ?? killGroupOf;
   const killGrace = deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const warn = deps.warn ?? (() => {});
-  const live = new Map<number, SpawnedCommand>();
+  const live = new Map<
+    number,
+    { cmd: SpawnedCommand; row: CommandRunRow }
+  >();
+  /** §18.5: уведомление об итоге записи — ошибки колбэка не роняют
+   * запускатель (ревью Б4/Н6). */
+  const finished = (
+    row: CommandRunRow,
+    status: CommandRunStatus,
+    exitCode: number | null,
+    outputTail: string,
+  ): void => {
+    try {
+      deps.onFinish?.(row, status, exitCode, outputTail);
+    } catch (e) {
+      warn(
+        `orchestrator command onFinish ${row.run_key}: ` +
+          `${(e as Error).message}`,
+      );
+    }
+  };
   let heldUntil: number | null = null;
   let stopped = false;
 
@@ -244,13 +271,12 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
         timeoutSec: row.timeout_sec ?? undefined,
       };
     } catch (e) {
-      deps.store.finishCommandRun(
-        row.id,
-        "failed",
-        127,
-        `битая спецификация: ${(e as Error).message}`,
-        now(),
-      );
+      // §18.5 (ревью Н6): синхронный сбой до spawn — тоже итог для
+      // notifyOnFail/серии сбоев.
+      const tail = `битая спецификация: ${(e as Error).message}`;
+      if (deps.store.finishCommandRun(row.id, "failed", 127, tail, now())) {
+        finished(row, "failed", 127, tail);
+      }
       return true;
     }
     let spawned: SpawnedCommand;
@@ -262,13 +288,10 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
         stdin: spec.stdin,
       });
     } catch (e) {
-      deps.store.finishCommandRun(
-        row.id,
-        "failed",
-        127,
-        maskCommandOutput((e as Error).message),
-        now(),
-      );
+      const tail = maskCommandOutput((e as Error).message);
+      if (deps.store.finishCommandRun(row.id, "failed", 127, tail, now())) {
+        finished(row, "failed", 127, tail);
+      }
       return true;
     }
     deps.store.attachCommandProcess(
@@ -277,7 +300,7 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
       spawned.pgid > 0 ? spawned.pgid : null,
       spawned.pid > 0 ? procStart(spawned.pid) : null,
     );
-    live.set(row.id, spawned);
+    live.set(row.id, { cmd: spawned, row });
     let timedOut = false;
     let termTimer: NodeJS.Timeout | undefined;
     let timeoutTimer: NodeJS.Timeout | undefined;
@@ -308,14 +331,7 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
       if (!deps.store.finishCommandRun(row.id, status, res.code, tail, now())) {
         return;
       }
-      try {
-        deps.onFinish?.(row, status, res.code, tail);
-      } catch (e) {
-        warn(
-          `orchestrator command onFinish ${row.run_key}: ` +
-            `${(e as Error).message}`,
-        );
-      }
+      finished(row, status, res.code, tail);
     });
     return true;
   };
@@ -361,7 +377,11 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
           await sleep(killGrace);
           if (alive(pgid)) killGroup(pgid, "SIGKILL");
         }
-        deps.store.interruptCommandRun(row.id, now());
+        // §18.5 (ревью Б4): interrupted после рестарта — итог для
+        // notifyOnFail, строка «прервана перезапуском».
+        if (deps.store.interruptCommandRun(row.id, now())) {
+          finished(row, "interrupted", null, "прервана перезапуском");
+        }
       }
     },
 
@@ -370,18 +390,22 @@ export function createCommandRunner(deps: CommandRunnerDeps): CommandRunner {
       // такт, дождавшийся своего await, уже не запустит queued и не
       // возьмёт замок копии.
       stopped = true;
-      for (const [id, spawned] of live) {
-        spawned.killGroup("SIGTERM");
-        deps.store.interruptCommandRun(id, now());
+      for (const [id, ent] of live) {
+        ent.cmd.killGroup("SIGTERM");
+        if (deps.store.interruptCommandRun(id, now())) {
+          finished(ent.row, "interrupted", null, "остановка плагина");
+        }
       }
       const rows = deps.store.runningCommandRuns();
       for (const row of rows) {
         if (row.pgid != null && row.pgid > 0) killGroup(row.pgid, "SIGTERM");
-        deps.store.interruptCommandRun(row.id, now());
+        if (deps.store.interruptCommandRun(row.id, now())) {
+          finished(row, "interrupted", null, "остановка плагина");
+        }
       }
       if (live.size || rows.length) {
         await sleep(killGrace);
-        for (const spawned of live.values()) spawned.killGroup("SIGKILL");
+        for (const ent of live.values()) ent.cmd.killGroup("SIGKILL");
         for (const row of deps.store.runningCommandRuns()) {
           if (row.pgid != null && row.pgid > 0 && alive(row.pgid)) {
             killGroup(row.pgid, "SIGKILL");

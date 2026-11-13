@@ -5796,6 +5796,30 @@ test("§17 r31: вердикт ревьюера в комментарии зад
   assert.equal(h.store.get(row.id)!.status, "done");
 });
 
+test("§18.5 (ревью Н7): review.verdict порождается на пути сторожа, один раз", async () => {
+  const h = makeHarness({});
+  const row = reviewerRow(h, {
+    level: "review",
+    threadId: "thr_r",
+    output: 'итог\n{"verdict":"CHANGES","blockers":2}',
+    events: [
+      ev(1, "turn/started", T0),
+      ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+    ],
+  });
+  await idleOnce(h, "thr_r", 2);
+  assert.equal(h.store.get(row.id)!.status, "done");
+  const kinds = h.store.listEvents().map((e) => e.kind);
+  assert.deepEqual(kinds, ["delegation.done", "review.verdict"]);
+  const doc = JSON.parse(
+    h.store.listEvents("review.verdict")[0]!.payload,
+  ) as Record<string, unknown>;
+  assert.equal(doc.verdict, "CHANGES");
+  assert.equal(doc.blockers, 2);
+  assert.equal(doc.delegationId, row.id);
+  assert.equal(doc.task, "PLUG-1");
+});
+
 test("§17 r31: вердикт аудитора только в комментарии — считается отсутствующим", async () => {
   const h = makeHarness({
     cli: (args) =>
