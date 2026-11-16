@@ -906,8 +906,12 @@ export function procVisibleTargets(): Set<string> | null {
       if (scanned > PROC_FD_SCAN_CAP) return null;
       try {
         targets.add(readlinkSync(`/proc/${pid}/fd/${fd}`));
-      } catch {
-        // fd churn between readdir and readlink is normal.
+      } catch (error) {
+        // fd churn between readdir and readlink is normal — but only
+        // ENOENT/ESRCH mean the fd vanished; anything else (e.g. EACCES
+        // when dumpable drops mid-scan) is classified per spec §12.3(c).
+        const outcome = classifyUnreadableProcess(pid, error, ourSession);
+        if (outcome === "reference") return null;
       }
     }
   }
