@@ -178,6 +178,12 @@ export const EN: Record<string, string> = {
   "del.levelWord": "level {level}",
   "del.spawnRefused": "spawn refused{code}: {reason}",
   "del.spawnNoId": "threads.spawn returned no thread id",
+  "del.baseUnchecked": "base not checked: {reason}",
+  "del.baseSkip.no-cmd": "no command runner",
+  "del.baseSkip.remote-host": "the target host is not this machine",
+  "del.baseSkip.project-list": "bb project list unreadable",
+  "del.baseSkip.no-local-path":
+    "the project has no local_path source on the target host",
 
   // ── release.ts ──────────────────────────────────────────────────────
   "rel.gitFailed": "git {cmd} failed (exit {code}): {out}",
@@ -453,6 +459,23 @@ export const EN: Record<string, string> = {
   "pp.wrongBranch": "the copy is not on {branch} — not updated",
   "pp.fetchFailed": "fetch failed: {err}",
   "pp.ffFailed": "ff failed ({err})",
+  // §22.3: friendly reasons in the copy-check order (raw git output —
+  // the plugin log only).
+  "pp.copyWrongState":
+    "the copy is on {where} — the new version is not loaded; " +
+    "switch the copy to {target}",
+  "pp.detached": "a detached commit",
+  "pp.copyDiverged":
+    "the copy has {n} local commits not in {target} — " +
+    "the new version is not loaded",
+  "pp.copyDirty":
+    "the copy has uncommitted changes ({n} files) — " +
+    "the new version is not loaded",
+  "pp.copyUpdateFailed":
+    "could not update the copy — the new version is not loaded; " +
+    "details in the plugin log",
+  // §22.4: the outcome-line tail for reloaded interface plugins.
+  "pp.reloadPage": "reload the BB page to see the new version: {list}",
   "pp.reloadDisabled": "plugin reload is off",
   "pp.depsChanged":
     "{id}: dependencies changed — reinstall them and reload manually",
@@ -481,6 +504,14 @@ export const EN: Record<string, string> = {
   "hook.noToken":
     "push refused: publishing goes only through " +
     "`bb orchestrator release` (no one-time marker)",
+  // §22.1: shared `pre-commit` gate texts — the finding format and the
+  // type names ("<file>:<line> — <type>: <fragment>").
+  "hookPc.finding": "{file}:{line} — {type}: {text}",
+  "hookPc.findingWarn": "{file}:{line} — {type}: {text} (warning)",
+  "hookPc.typeMachine": "machine path",
+  "hookPc.typeThreadId": "thread id",
+  "hookPc.typeEmail": "email",
+  "hookPc.typeSecret": "secret",
   "status.moreErrs": " (+{n} more)",
   "status.fixSetting": "fix `{name}`",
   "status.reloadHint": " — then `bb plugin reload orchestrator`",

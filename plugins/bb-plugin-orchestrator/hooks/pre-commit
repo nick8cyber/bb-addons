@@ -1,0 +1,214 @@
+#!/usr/bin/env node
+/**
+ * Shared git pre-commit hook for the bb orchestrator release pipeline
+ * (spec orchestrator §22.1). Installed next to `pre-push` by the same
+ * `install.mjs` into the global `core.hooksPath` — the release-time
+ * leak scan runs at COMMIT time too, on the staged diff, so a machine
+ * path, thread id, personal address or secret never reaches a commit
+ * for the release gate to find later.
+ *
+ * What it scans: `git diff --cached -U0 --no-color --diff-filter=ACMR`
+ * — ADDED lines only, so a commit that removes an old leak passes.
+ * Rules live in `leak-scan.ts` next to this file — the same template
+ * set the release machine scan uses (no duplicated rules). Project
+ * `leaks` settings (`allow` places, `machine`/`bbIds` strictness,
+ * `threadIds`, `allowedEmails`, `excluded`) come from
+ * `<git common dir>/orchestrator-leaks.json`, which the plugin writes
+ * when it resolves a repository's release settings; without the file
+ * the built-in rules apply with default strictness.
+ *
+ * `--no-verify` bypasses this hook but opens nothing: the release
+ * scan still covers every published commit. After its own checks the
+ * hook chains to the repository's local `$GIT_DIR/hooks/pre-commit`,
+ * like `pre-push` does. Any infrastructure failure (no git, no
+ * scanner module) fails OPEN — a hook must not wedge `git commit`.
+ */
+import {
+  accessSync,
+  constants,
+  existsSync,
+  readFileSync,
+} from "node:fs";
+import { spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HOOK_NAME = "pre-commit";
+// §18.1: refusal texts are versioned with the plugin's `language`
+// setting — the plugin rewrites this JSON block on install and whenever
+// the language changes (`renderPreCommit` in release.ts). This file
+// carries the Russian variant; English installs get en texts.
+const MESSAGES = {"finding":"{file}:{line} — {type}: {text}","findingWarn":"{file}:{line} — {type}: {text} (предупреждение)","typeMachine":"путь машины","typeThreadId":"id треда","typeEmail":"почта","typeSecret":"секрет"};
+function msg(k, p = {}) {
+  return String(MESSAGES[k] ?? k).replace(/\{(\w+)\}/g, (m, n) =>
+    n in p ? String(p[n]) : m,
+  );
+}
+const dir = dirname(fileURLToPath(import.meta.url));
+const exclusionsFile = join(dir, "exclusions");
+
+// The staged diff can hold a >1 MiB one-line `.map` file in a single
+// added line — the buffer must fit whole blobs, not just findings
+// (spec §22.1: потоково или maxBuffer ≥ 64 МБ).
+const DIFF_MAX_BUFFER = 128 * 1024 * 1024;
+
+function git(args, opts = {}) {
+  return spawnSync("git", args, {
+    encoding: "utf8",
+    maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
+  });
+}
+
+/** The repository's own hook (the global core.hooksPath shadows it):
+ * `$GIT_DIR/hooks/<name>` — the env var first, then the common dir for
+ * worktrees. Executable files only, exactly like git itself. */
+function localHookPath() {
+  const candidates = [];
+  if (process.env.GIT_DIR) {
+    candidates.push(join(resolve(process.env.GIT_DIR), "hooks", HOOK_NAME));
+  }
+  const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (common.status === 0) {
+    candidates.push(join(common.stdout.trim(), "hooks", HOOK_NAME));
+  }
+  const self = fileURLToPath(import.meta.url);
+  for (const c of candidates) {
+    if (c === self || !existsSync(c)) continue;
+    try {
+      accessSync(c, constants.X_OK);
+    } catch {
+      continue; // not executable — git would skip it, so do we
+    }
+    return c;
+  }
+  return null;
+}
+
+function chainLocal() {
+  const local = localHookPath();
+  if (!local) return 0;
+  const res = spawnSync(local, process.argv.slice(2), {
+    encoding: "utf8",
+    stdio: ["pipe", "inherit", "inherit"],
+  });
+  return res.status ?? 1;
+}
+
+// ── Exclusions: service repositories (same file as `pre-push`). ──────
+// In a linked worktree `--show-toplevel` names the WORKTREE, not the
+// repository root — `dirname(<common dir>)` is the main copy's path
+// (spec §22.1). An exclusion naming either path skips the gate.
+const repoTop = git(["rev-parse", "--show-toplevel"]);
+if (repoTop.status !== 0) process.exit(chainLocal());
+const common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+if (common.status !== 0) process.exit(chainLocal());
+const commonDir = common.stdout.trim();
+const repoRoots = new Set([repoTop.stdout.trim(), dirname(commonDir)]);
+let excluded = false;
+try {
+  for (const line of readFileSync(exclusionsFile, "utf8").split("\n")) {
+    const e = line.trim();
+    if (!e || e.startsWith("#")) continue;
+    for (const repo of repoRoots) {
+      if (e.endsWith("/") ? repo.startsWith(e) : repo === e) {
+        excluded = true;
+        break;
+      }
+    }
+    if (excluded) break;
+  }
+} catch { /* no exclusions file — nothing excluded */ }
+if (excluded) process.exit(chainLocal());
+
+// ── The project's `leaks` settings — the plugin's snapshot in the
+// COMMON git dir, so every worktree (coordinator's and executors'
+// copies alike) resolves the same settings. Missing/broken file —
+// built-in rules with default strictness; `excluded` skips the scan.
+let leaks = {
+  allow: [],
+  machine: "block",
+  bbIds: "block",
+  threadIds: true,
+  allowedEmails: [],
+  hostname: undefined,
+  excluded: false,
+};
+try {
+  const snap = JSON.parse(
+    readFileSync(join(commonDir, "orchestrator-leaks.json"), "utf8"),
+  );
+  if (snap && typeof snap === "object") {
+    if (Array.isArray(snap.allow)) leaks.allow = snap.allow;
+    if (snap.machine === "block" || snap.machine === "warn") {
+      leaks.machine = snap.machine;
+    }
+    if (snap.bbIds === "block" || snap.bbIds === "warn") {
+      leaks.bbIds = snap.bbIds;
+    }
+    if (typeof snap.threadIds === "boolean") leaks.threadIds = snap.threadIds;
+    if (Array.isArray(snap.allowedEmails)) {
+      leaks.allowedEmails = snap.allowedEmails;
+    }
+    if (typeof snap.hostname === "string" && snap.hostname) {
+      leaks.hostname = snap.hostname;
+    }
+    if (snap.excluded === true) leaks.excluded = true;
+  }
+} catch { /* no snapshot — built-in rules apply */ }
+if (leaks.excluded) process.exit(chainLocal());
+
+// ── Staged added lines (spec §22.1: `+` lines only — a commit that
+// REMOVES an old leak passes; hunk `@@` headers give the post-image
+// line numbers). `--diff-filter=ACMR` follows renames.
+const diff = git(
+  ["diff", "--cached", "-U0", "--no-color", "--diff-filter=ACMR"],
+  { maxBuffer: DIFF_MAX_BUFFER },
+);
+if (diff.status !== 0 || diff.error) process.exit(chainLocal());
+const diffText = diff.stdout ?? "";
+if (!diffText.trim()) process.exit(chainLocal());
+
+// The shared scan core — plain-JS-loadable TS (node ≥22.18 strips
+// types). Missing on an old install or under an old node — fail open,
+// the release-time scan still guards the publish.
+let scan;
+try {
+  scan = await import("./leak-scan.ts");
+} catch {
+  process.exit(chainLocal());
+}
+const added = scan.parseAddedLines(diffText);
+if (!added.length) process.exit(chainLocal());
+
+const findings = scan.scanAddedLinesCore(added, {
+  allow: leaks.allow,
+  hostname: leaks.hostname,
+  threadIds: leaks.threadIds,
+  // §22.1: `thr_…` in a FILE is always a finding — the `threadIds`
+  // exemption covers the `BB-Thread:` trailer in commit MESSAGES,
+  // which this hook does not scan at all.
+  flagThreadIds: true,
+  allowedEmails: leaks.allowedEmails,
+});
+
+const TYPE_KEY = {
+  "secret-file": "typeSecret",
+  secret: "typeSecret",
+  "personal-email": "typeEmail",
+  machine: "typeMachine",
+  bbid: "typeThreadId",
+};
+const severityOf = (f) =>
+  f.category <= 2 ? "block" : f.category === 3 ? leaks.machine : leaks.bbIds;
+
+let blocked = false;
+for (const f of findings) {
+  const type = msg(TYPE_KEY[f.kind] ?? "typeSecret");
+  const sev = severityOf(f);
+  const key = sev === "warn" ? "findingWarn" : "finding";
+  const text = msg(key, { file: f.file, line: f.line, type, text: f.fragment });
+  process.stderr.write(`[orchestrator] ${text}\n`);
+  if (sev === "block") blocked = true;
+}
+if (blocked) process.exit(1);
+process.exit(chainLocal());

@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
@@ -12,6 +16,7 @@ import {
   truncateToWidth,
   type DelegateDeps,
 } from "../src/delegate.js";
+import { createCmd } from "../src/cmd.js";
 import { parsePolicy } from "../src/policy.js";
 import { OrchestratorError } from "../src/errors.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
@@ -135,6 +140,11 @@ function makeDeps(overrides: {
   held?: [string, number][];
   /** §4 r30 (в): `system.config().primaryHostId` — default "host_1". */
   primaryHostId?: () => Promise<string>;
+  /** §22.2: real git runner + local host id for the base check. */
+  cmd?: DelegateDeps["cmd"];
+  localHostId?: () => string | Promise<string>;
+  /** §22.1 (ревью): leaks-snapshot callback the base check invokes. */
+  leaksSnapshot?: DelegateDeps["leaksSnapshot"];
 } = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -189,6 +199,13 @@ function makeDeps(overrides: {
       roleByThreadId: (id) => store.threadRole(id)?.role,
     },
     primaryHostId: overrides.primaryHostId ?? (async () => "host_1"),
+    ...(overrides.cmd ? { cmd: overrides.cmd } : {}),
+    ...(overrides.localHostId
+      ? { localHostId: overrides.localHostId }
+      : {}),
+    ...(overrides.leaksSnapshot
+      ? { leaksSnapshot: overrides.leaksSnapshot }
+      : {}),
   };
   return { deps, store, calls, updates, stops, spawnArgs, metadata, db };
 }
@@ -1925,4 +1942,538 @@ test("§4 r30 (в): empty modelId/reasoningLevel in the preset are not passed to
   const spawn = h.spawnArgs[0]!;
   assert.equal(spawn.model, undefined, "empty modelId → BB default");
   assert.equal(spawn.reasoningLevel, undefined);
+});
+
+// ── §22.2 (r33.1): база копии — только опубликованная цель ────────────
+
+const WT_PRESET = {
+  ...FULL_PRESET,
+  environmentKind: "new-worktree",
+  machineId: "host_1",
+  baseBranch: "main",
+};
+
+const gitR = (repo: string, args: string[]) =>
+  execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+/** bare `origin` + a cloned working repo on `main` (§22.2 test env). */
+function makeClone() {
+  const base = mkdtempSync(join(tmpdir(), "d22-"));
+  const origin = join(base, "origin.git");
+  const seed = join(base, "seed");
+  execFileSync("git", ["init", "--bare", origin]);
+  execFileSync("git", ["init", seed]);
+  for (const [k, v] of [
+    ["user.email", "a@b.c"],
+    ["user.name", "T"],
+  ]) gitR(seed, ["config", k, v]);
+  writeFileSync(join(seed, "f.txt"), "one\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "one"]);
+  gitR(seed, ["branch", "-M", "main"]);
+  gitR(seed, ["remote", "add", "origin", origin]);
+  gitR(seed, ["push", "-u", "origin", "main"]);
+  execFileSync("git", ["-C", origin, "symbolic-ref", "HEAD", "refs/heads/main"]);
+  const repo = join(base, "copy");
+  execFileSync("git", ["clone", "-q", origin, repo]);
+  for (const [k, v] of [
+    ["user.email", "a@b.c"],
+    ["user.name", "T"],
+  ]) gitR(repo, ["config", k, v]);
+  return { base, origin, repo };
+}
+
+const projectListJson = (repo: string) =>
+  JSON.stringify([
+    {
+      id: "proj_bb",
+      sources: [
+        {
+          type: "local_path",
+          path: repo,
+          isDefault: true,
+          hostId: "host_1",
+        },
+      ],
+    },
+  ]);
+
+const wtCli = (repo: string) => (args: string[]) => {
+  const key = args.join(" ");
+  if (key.startsWith("project list")) return ok(projectListJson(repo));
+  if (key.startsWith("tasks preset show"))
+    return ok(JSON.stringify({ preset: WT_PRESET }));
+  return defaultCli(args);
+};
+
+const commitLocal = (repo: string, name = "local.txt") => {
+  writeFileSync(join(repo, name), "local\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "local"]);
+  return gitR(repo, ["rev-parse", "HEAD"]);
+};
+
+test("§22.2: первая раздача — fetch + база origin/<base>, не локальный main", async () => {
+  const { repo } = makeClone();
+  commitLocal(repo); // локальный main впереди origin/main
+  const { deps, spawnArgs } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.deepEqual(
+    (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "origin/main" },
+  );
+});
+
+test("§22.2: --from main с незапушенными — from-unpublished", async () => {
+  const { repo } = makeClone();
+  commitLocal(repo);
+  const { deps } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        from: "main",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "dispatch-failed" &&
+      /from-unpublished: 1 коммитов не в origin\/main и не из этой задачи/.test(
+        (e as Error).message,
+      ),
+  );
+});
+
+test("§22.2: --from ветки спеки координатора — проходит, база всё равно origin", async () => {
+  const { repo } = makeClone();
+  gitR(repo, ["checkout", "-b", "spec-1"]);
+  commitLocal(repo);
+  gitR(repo, ["checkout", "main"]);
+  const { deps, spawnArgs, store } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "simple",
+      from: "spec-1",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.status, "running");
+  assert.equal(store.get(res.delegationId)!.continue_from, "spec-1");
+  assert.deepEqual(
+    (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "origin/main" },
+  );
+});
+
+test("§22.2: fetch упал — base-unavailable", async () => {
+  const { repo } = makeClone();
+  gitR(repo, ["remote", "set-url", "origin", "/nonexistent-nowhere.git"]);
+  const { deps } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  await assert.rejects(
+    runDelegate(
+      { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "dispatch-failed" &&
+      /base-unavailable:/.test((e as Error).message),
+  );
+});
+
+test("§22.2: новый заход без --from — от вершины прошлого захода", async () => {
+  const { repo } = makeClone();
+  const { deps, store, spawnArgs } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  const r1 = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  const sha = "c".repeat(40);
+  store.setRoundResult(r1.delegationId, {
+    branch: "w",
+    sha,
+    commits: 1,
+    dirty: false,
+  });
+  store.setStatus(r1.delegationId, "done");
+  const r2 = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  const row2 = store.get(r2.delegationId)!;
+  assert.equal(row2.round, 2);
+  assert.equal(row2.continue_from, sha);
+  assert.deepEqual(
+    (spawnArgs[1]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "origin/main" },
+  );
+});
+
+test("§22.2: далёкий хост — проверки пропускаются, база как в пресете + строка «база не проверена»", async () => {
+  const { repo } = makeClone();
+  const { deps, spawnArgs } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: { ...WT_PRESET, machineId: "host_remote" },
+          }),
+        );
+      if (key.startsWith("project list")) return ok(projectListJson(repo));
+      return defaultCli(args);
+    },
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.deepEqual(
+    (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "main" },
+  );
+  // §22.2: the skip is named in the delegate response.
+  assert.equal(
+    res.baseUnchecked,
+    "база не проверена: целевая машина — не эта",
+  );
+});
+
+test("§22.2: нет local_path на целевом хосте — пропуск со строкой", async () => {
+  const { repo: _r } = makeClone();
+  const { deps, spawnArgs } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(JSON.stringify({ preset: WT_PRESET }));
+      // A project list that resolves no local_path source for proj_bb.
+      if (key.startsWith("project list"))
+        return ok(JSON.stringify([{ id: "proj_bb", sources: [] }]));
+      return defaultCli(args);
+    },
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.deepEqual(
+    (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "main" },
+  );
+  assert.equal(
+    res.baseUnchecked,
+    "база не проверена: у проекта нет источника local_path на целевой машине",
+  );
+});
+
+test("§22.2 (ревью): --from refs/heads/main — та же ветка, тот же отказ", async () => {
+  const { repo } = makeClone();
+  commitLocal(repo);
+  const { deps } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        from: "refs/heads/main",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "dispatch-failed" &&
+      /from-unpublished: 1 коммитов не в origin\/main и не из этой задачи/.test(
+        (e as Error).message,
+      ),
+  );
+});
+
+test("§22.2 (ревью): --from HEAD на main — нормализуется к main и отказывает", async () => {
+  const { repo } = makeClone();
+  commitLocal(repo);
+  const { deps } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        from: "HEAD",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "dispatch-failed" &&
+      /from-unpublished:/.test((e as Error).message),
+  );
+});
+
+/** Записывает в журнал задачу PLUG-2, влитую в `into` через
+ * `bb orchestrator merge`: её коммиты — «из задачи» по контракту §22.2. */
+const recordMergedTask = (
+  store: ReturnType<typeof makeDeps>["store"],
+  into: string,
+  continueFrom: string,
+  taskTip: string,
+  mergeSha: string,
+) => {
+  const other = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_c",
+    level: "simple",
+    route: "s",
+    preset: "s",
+    provider: "p",
+    continueFrom,
+  });
+  store.setRoundResult(other.id, {
+    branch: "task-w",
+    sha: taskTip,
+    commits: 1,
+    dirty: false,
+  });
+  store.setMerged(other.id, { into, sha: mergeSha });
+  // `insert` starts `dispatching` — a fresh dispatching row in the
+  // caller's project would fail the coordinator check (§3).
+  store.setStatus(other.id, "done");
+};
+
+test("§22.2 (ревью): merge-коммит `bb orchestrator merge` на main — «из задачи», проходит", async () => {
+  const { repo } = makeClone();
+  gitR(repo, ["checkout", "-b", "task-w"]);
+  const taskTip = commitLocal(repo, "task.txt");
+  gitR(repo, ["checkout", "main"]);
+  const originTip = gitR(repo, ["rev-parse", "origin/main"]);
+  gitR(repo, ["merge", "--no-ff", "task-w", "-m", "merge PLUG-2 r1"]);
+  const mergeSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const { deps, store } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  recordMergedTask(store, "main", originTip, taskTip, mergeSha);
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "simple",
+      from: "main",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.status, "running");
+});
+
+test("§22.2 (ревью): merge-коммит без записанного merged_sha — exempt по родителю-вершине задачи", async () => {
+  const { repo } = makeClone();
+  gitR(repo, ["checkout", "-b", "task-w"]);
+  const taskTip = commitLocal(repo, "task.txt");
+  gitR(repo, ["checkout", "main"]);
+  const originTip = gitR(repo, ["rev-parse", "origin/main"]);
+  gitR(repo, ["merge", "--no-ff", "task-w", "-m", "merge PLUG-2 r1"]);
+  const mergeSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const { deps, store, db } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  // merged_sha не записан (старая запись до r33.1) — merge всё равно
+  // опознаётся: его второй родитель — вершина задачи.
+  const other = store.insert({
+    taskKey: "PLUG-2",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_c",
+    level: "simple",
+    route: "s",
+    preset: "s",
+    provider: "p",
+    continueFrom: originTip,
+  });
+  store.setRoundResult(other.id, {
+    branch: "task-w",
+    sha: taskTip,
+    commits: 1,
+    dirty: false,
+  });
+  store.setMerged(other.id, { into: "main", sha: mergeSha });
+  db.prepare(
+    "UPDATE delegations SET merged_sha = NULL WHERE id = ?",
+  ).run(other.id);
+  store.setStatus(other.id, "done");
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "simple",
+      from: "main",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.status, "running");
+});
+
+test("§22.2 (ревью): чужой коммит под merge задачи — не «из задачи», отказ", async () => {
+  const { repo } = makeClone();
+  gitR(repo, ["checkout", "-b", "task-w"]);
+  const taskTip = commitLocal(repo, "task.txt");
+  gitR(repo, ["checkout", "main"]);
+  commitLocal(repo, "foreign.txt"); // F — на main, вне диапазона задачи
+  gitR(repo, ["merge", "--no-ff", "task-w", "-m", "merge PLUG-2 r1"]);
+  const mergeSha = gitR(repo, ["rev-parse", "HEAD"]);
+  const { deps, store } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  const originTip = gitR(repo, ["rev-parse", "origin/main"]);
+  recordMergedTask(store, "main", originTip, taskTip, mergeSha);
+  // Старый `--not <task sha>` прятал F под вершиной задачи; диапазоны
+  // C..R закрывают только коммиты самой задачи — F остаётся и отказывает.
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "simple",
+        from: "main",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "dispatch-failed" &&
+      /from-unpublished: 1 коммитов не в origin\/main и не из этой задачи/.test(
+        (e as Error).message,
+      ),
+  );
+});
+
+test("§22.2 (ревью): local_path без hostId — источник считается этой машиной", async () => {
+  const { repo } = makeClone();
+  const { deps, spawnArgs } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("project list"))
+        return ok(
+          JSON.stringify([
+            {
+              id: "proj_bb",
+              sources: [{ type: "local_path", path: repo, isDefault: true }],
+            },
+          ]),
+        );
+      if (key.startsWith("tasks preset show"))
+        return ok(JSON.stringify({ preset: WT_PRESET }));
+      return defaultCli(args);
+    },
+    cmd: createCmd(),
+    // hostId не определён (""): pre-hostfield источник без hostId всё
+    // равно резолвится — раньше проверка молча пропускалась.
+    localHostId: async () => "",
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.deepEqual(
+    (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "origin/main" },
+  );
+});
+
+test("§22.2 (ревью): единственный local_path без isDefault — резолвится", async () => {
+  const { repo } = makeClone();
+  const { deps, spawnArgs } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("project list"))
+        return ok(
+          JSON.stringify([
+            {
+              id: "proj_bb",
+              sources: [
+                { type: "local_path", path: repo, hostId: "host_1" },
+                { type: "git_remote", url: "x" },
+              ],
+            },
+          ]),
+        );
+      if (key.startsWith("tasks preset show"))
+        return ok(JSON.stringify({ preset: WT_PRESET }));
+      return defaultCli(args);
+    },
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.deepEqual(
+    (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "origin/main" },
+  );
+});
+
+test("§22.1 (ревью): раздача обновляет снимок leaks репо проекта", async () => {
+  const { repo } = makeClone();
+  const seen: { repo: string; projectId: string }[] = [];
+  const { deps } = makeDeps({
+    cli: wtCli(repo),
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+    leaksSnapshot: (r, pid) => {
+      seen.push({ repo: r, projectId: pid });
+    },
+  });
+  await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.deepEqual(seen, [{ repo, projectId: "proj_bb" }]);
 });
