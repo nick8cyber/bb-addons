@@ -440,7 +440,7 @@ describe("PLUG-117: проверяемые критерии приёмки §14.
       writeFileSync(
         scriptPath,
         `process.on('SIGTERM', () => {});
-setInterval(() => {}, 1000);`,
+const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);`,
       );
 
       const child = spawn(process.execPath, [scriptPath], { detached: true });

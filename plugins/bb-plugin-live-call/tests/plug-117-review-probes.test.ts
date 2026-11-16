@@ -158,7 +158,7 @@ describe("Round-6 independent contract probes", () => {
     const p = join(d, "fixture.mjs");
     writeFileSync(
       p,
-      `import readline from "node:readline";setInterval(()=>{},1000);
+      `import readline from "node:readline";const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);
 readline.createInterface({input:process.stdin}).on("line",line=>{const r=JSON.parse(line);
 if(r.method==="initialize")process.stdout.write(JSON.stringify({id:r.id,result:{}})+"\\n");
 if(r.method==="tools/list")process.stdout.write(JSON.stringify({id:r.id,result:{tools:[]}})+"\\n");});`,
@@ -621,7 +621,7 @@ describe("Round-7 independent review probes", () => {
   // ---------- R7-1: второй hello убивает коннекторы стартовавшего звонка ----------
   describe("R7-1 hello at server.ts:578 force-kills live call connectors", () => {
     it("concurrent thread-hello reaching line 578 after call A became active must not SIGKILL A's connector", async () => {
-      const cfg = fixture("setInterval(()=>{},1000);");
+      const cfg = fixture("const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);");
       const mock = await approvedMock(cfg, { geminiKeys: "fake_review_key" });
       let sessionA: CallSession | undefined;
       const realSessionStart = CallSession.prototype.start;
@@ -864,7 +864,7 @@ describe("Round-7 independent review probes", () => {
   // ---------- R7-7: дубль connector_stop_failed ----------
   describe("R7-7 stop-failed events", () => {
     it("one stop failure in end() writes one call event", async () => {
-      const cfg = fixture("setInterval(()=>{},1000);");
+      const cfg = fixture("const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);");
       const mock = await approvedMock(cfg, { geminiKeys: "fake_review_key" });
       const children = interceptSignals();
       let session: CallSession | undefined;
@@ -1119,7 +1119,7 @@ describe("Round-5 adjusted review probes", () => {
     });
 
     it("failed diagnostic cleanup holds CLI/WS busy and clears after real exit", async () => {
-      const cfg = fixture("setInterval(()=>{},1000);");
+      const cfg = fixture("const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);");
       const mock = await approvedMock(cfg);
       const children = interceptSignals();
       try {
@@ -1155,7 +1155,7 @@ describe("Round-5 adjusted review probes", () => {
     }, 12000);
 
     it("failed CALL cleanup must keep CLI busy until actual exit", async () => {
-      const cfg = fixture("setInterval(()=>{},1000);");
+      const cfg = fixture("const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);");
       const mock = await approvedMock(cfg, { geminiKeys: "fake_review_key" });
       const children = interceptSignals();
       let session: CallSession | undefined;
@@ -1192,7 +1192,7 @@ describe("Round-5 adjusted review probes", () => {
     }, 12000);
 
     it("retry close after ALL signal paths fail resends SIGKILL and stops actual child", async () => {
-      const cfg = fixture("setInterval(()=>{},1000); process.on('SIGTERM',()=>{});");
+      const cfg = fixture("const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000); process.on('SIGTERM',()=>{});");
       const children = interceptSignals();
       const client = new McpClient(cfg.connectors[0] as never);
       try {
@@ -1350,7 +1350,7 @@ describe("Round-8 Opus independent review probes", () => {
   describe("R8-A гонка двух hello по проекту (§14.8 п. 1а)", () => {
     it("одновременные hello A и B: ровно один ready, второй busy; коннектор первого не получает сигналов", async () => {
       mockVoice();
-      const mock = await approvedMock(fixture({ pre: "setInterval(()=>{},1000);" }), { geminiKeys: "fake_review_key" });
+      const mock = await approvedMock(fixture({ pre: "const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);" }), { geminiKeys: "fake_review_key" });
       const sessions: CallSession[] = [];
       const realStart = CallSession.prototype.start;
       vi.spyOn(CallSession.prototype, "start").mockImplementation(async function (this: CallSession) {
@@ -1384,7 +1384,7 @@ describe("Round-8 Opus independent review probes", () => {
   describe("R8-B живой звонок + диагностика (§14.8 п. 1б, 1в)", () => {
     it("CLI во время старта и во время звонка — busy без сигналов коннектору звонка; после конца — exit 0", async () => {
       mockVoice();
-      const mock = await approvedMock(fixture({ pre: "setInterval(()=>{},1000);", tools: ["read_probe"], initDelayMs: 400 }), {
+      const mock = await approvedMock(fixture({ pre: "const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);", tools: ["read_probe"], initDelayMs: 400 }), {
         geminiKeys: "fake_review_key",
       });
       let session: CallSession | undefined;

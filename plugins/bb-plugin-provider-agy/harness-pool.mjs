@@ -11,11 +11,13 @@
  *
  * Usage: node harness-pool.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const root = mkdtempSync(join(tmpdir(), "agy-pool-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-pool-"));
 const workspace = join(root, "ws");
 mkdirSync(workspace, { recursive: true });
 const shim = join(root, "agy-shim");

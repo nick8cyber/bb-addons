@@ -27,15 +27,18 @@
  * Usage: node harness-rotation.mjs
  */
 import {
-  mkdtempSync,
   mkdirSync,
   writeFileSync,
   chmodSync,
   readFileSync,
-  renameSync, unlinkSync } from "node:fs";
+  renameSync,
+  unlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
 const BARE =
   "⚠ Rate limit reached (429): slow down and try again later.";
@@ -51,7 +54,7 @@ try {
   process.exit(2);
 }
 
-const root = mkdtempSync(join(tmpdir(), "agy-rotation-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-rotation-"));
 const workspace = join(root, "ws");
 mkdirSync(workspace, { recursive: true });
 // A git repo with an uncommitted change, so the handoff's diff --stat has

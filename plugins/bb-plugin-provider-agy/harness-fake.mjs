@@ -6,11 +6,13 @@
  *
  * Usage: node harness-fake.mjs
  */
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const workspace = mkdtempSync(join(tmpdir(), "agy-fake-"));
+const workspace = trackedMkdtemp(join(tmpdir(), "agy-fake-"));
 // The shim is written here, next to the fake it runs: an AGY_PATH pointing at
 // some other checkout's fake is a test that proves nothing about this one.
 const shim = join(workspace, "agy-shim");

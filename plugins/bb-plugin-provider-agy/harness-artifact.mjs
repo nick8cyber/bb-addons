@@ -10,11 +10,13 @@
  *
  * Usage: node harness-artifact.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const root = mkdtempSync(join(tmpdir(), "agy-artifact-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-artifact-"));
 const transcript = join(root, "stdin.ndjson");
 writeFileSync(transcript, "");
 const shim = join(root, "agy-shim");
