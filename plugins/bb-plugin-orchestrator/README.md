@@ -27,6 +27,24 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `no-code` in `status`/`show`, and makes `merge`/`release` refuse
   "a no-code task: nothing to merge" when the last round produced no
   commits (r28.1).
+  **Delegation base (§22.2):** a managed-worktree dispatch runs
+  `git fetch` on the target repo and bases the executor copy on
+  `origin/<baseBranch>` (the remote's default branch when the preset
+  names none) — never on the project copy's local branch, which may
+  carry unpushed commits. A new round of the same task without
+  `--from` still continues the work from the previous round's tip
+  (§4.1) — the executor merges it onto the fresh base. `--from <ref>`
+  is checked as `origin/<target>..<ref>` and refuses only when
+  `<ref>` is the copy's local target branch (`main`/`master`/`dev`)
+  carrying commits that are neither in `origin/<base>` nor from this
+  task (its own rounds, results merged by `bb orchestrator merge`,
+  release-pipeline shas): `from-unpublished: <n> коммитов не в
+  origin/<цель> и не из этой задачи`; a coordinator's spec branch, a
+  sha or `HEAD` always pass. A failed `git fetch` or a missing
+  `origin/<baseBranch>` refuses `base-unavailable: <error>`; where
+  git is unreachable (a foreign target host, no `local_path` source
+  on it, no cmd runner) the check skips and the spawn keeps the
+  preset's base.
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only threads whose role may delegate (`delegates`, §13);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).
@@ -154,7 +172,23 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   configured checkout after push and reloads the changed plugins —
   dirs with a changed manifest need `npm ci`, providers with running
   turns are postponed, and the orchestrator plugin reloads itself via
-  a one-shot script automation (it cannot reload itself).
+  a one-shot script automation (it cannot reload itself). Before the
+  fast-forward the copy is checked in order (§22.3), each failure
+  with its own line: "the copy is on <branch|a detached commit> —
+  the new version is not loaded; switch the copy to <target>" (not on
+  the target branch or detached), "the copy has <n> local commits not
+  in <target> — the new version is not loaded" (diverged from
+  origin), "the copy has uncommitted changes (<n> files) — the new
+  version is not loaded" (dirty per `git status --porcelain -uno`, or
+  untracked files colliding with `git diff --name-only
+  HEAD..origin/<target>` — other untracked files do not block); when
+  the checks pass but the fast-forward itself fails — "could not
+  update the copy — the new version is not loaded; details in the
+  plugin log". Raw git output goes only to the plugin log, and no
+  reloads run in these cases. When at least one reloaded plugin has
+  an `app` field in its `plugin.json` (or the file it points at
+  exists), the outcome line ends with "reload the BB page to see the
+  new version: <id>, <id>" (§22.4).
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
   `dispatching` rows by the `pluginMetadata.delegationId` label under the

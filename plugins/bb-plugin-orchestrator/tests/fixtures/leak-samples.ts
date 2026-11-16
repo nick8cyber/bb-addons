@@ -31,8 +31,9 @@ export const GLUED_PATH_LINE = "/home/example/home/alice/work/secret";
 // exception is the r11.1 transition (release §4 «Переход», step 1,
 // PLUG-273): the still-installed pre-r11.1 scanner counts a literal
 // token/address a finding even inside this allow-listed file, so the
-// category 1–2 samples come from `synthetic(prefix, len)` until step 2
-// lands them as literals and removes the helper.
+// category 1–2 samples come from the fixture functions `synthetic` /
+// `syntheticEmail` until step 2 lands them as literals and removes
+// the helpers.
 
 /** Machine-path prefix matching the `home-path` rule. */
 export const LEAK_HOME_PREFIX = "/home/alice";
@@ -56,10 +57,19 @@ export const IP_VERSION_LIKE = "172.16.0";
 export const synthetic = (prefix: string, len: number): string =>
   prefix + "x".repeat(len);
 
+/** Transition step 1 helper for the category-2 sample: the WHOLE
+ * address comes from one fixture function — the `EXAMPLE` marker plus
+ * the `domain` — with no concatenation at the call site (release §4
+ * «Переход» allows only fixture functions on step 1; assembling a
+ * sample outside them is a §5 bypass). Step 2 lands it as a literal
+ * and removes this function. */
+export const syntheticEmail = (domain: string): string =>
+  `EXAMPLE@${domain}`;
+
 /** §4 r11.1 synthetic address. The `EXAMPLE` marker makes it exempt
  * inside this allow-listed fixture file only; the same address in any
  * other file is a category-2 `personal-email` finding. */
-export const LEAK_PERSONAL_EMAIL = synthetic("EXAMPLE", 0) + "@gmail.com";
+export const LEAK_PERSONAL_EMAIL = syntheticEmail("gmail.com");
 /** §4 r11.1 synthetic secret: `ghp_` + a single repeated char. Exempt
  * inside this fixture file only; anywhere else it is a category-1
  * `github-token` finding. */
