@@ -20,8 +20,10 @@
  *
  * The check runs only where the plugin can actually reach git: a target
  * host other than this machine, a project without a `local_path`
- * source on that host, or a missing `cmd` runner all skip — the spawn
- * then keeps the preset's own base, exactly as before r33.1.
+ * source on that host, an unreadable `bb project list`, or a missing
+ * `cmd` runner all skip — the spawn then keeps the preset's own base,
+ * exactly as before r33.1, and the `delegate` response names the skip
+ * reason («база не проверена: <причина>»).
  */
 import type { BbCli } from "./bb-cli.js";
 import type { CmdRunner } from "./cmd.js";
@@ -59,11 +61,24 @@ export interface DelegateBaseArgs {
   callerProjectId?: string | null;
 }
 
+/** §22.2: why the published-base check did not run — each reason maps
+ * to a line of the delegate response («база не проверена: <причина>»). */
+export type BaseSkipReason =
+  /** No `cmd` runner to reach git with. */
+  | "no-cmd"
+  /** The spawn target host is not this machine. */
+  | "remote-host"
+  /** `bb project list` failed or returned no usable JSON. */
+  | "project-list"
+  /** The project has no `local_path` source on the target host. */
+  | "no-local-path";
+
 export type DelegateBaseResult =
   | { kind: "named"; name: string }
   | { kind: "default" }
-  /** The check cannot run here — keep the preset's base unchanged. */
-  | "skip"
+  /** The check cannot run here — keep the preset's base unchanged and
+   * say why in the delegate response. */
+  | { kind: "skip"; reason: BaseSkipReason }
   /** A refusal the caller must surface (`base-unavailable` /
    * `from-unpublished`, detail after the colon). */
   | { refuse: string };
@@ -225,7 +240,7 @@ export async function delegateBase(
   deps: DelegateBaseDeps,
   args: DelegateBaseArgs,
 ): Promise<DelegateBaseResult> {
-  if (!deps.cmd) return "skip";
+  if (!deps.cmd) return { kind: "skip", reason: "no-cmd" };
   const cmd = deps.cmd;
 
   const localHost = deps.localHostId
@@ -233,22 +248,26 @@ export async function delegateBase(
     : "";
   // §22.2 applies only where this process can run git — a managed
   // worktree on another host keeps the preset's base.
-  if (localHost && args.hostId && args.hostId !== localHost) return "skip";
+  if (localHost && args.hostId && args.hostId !== localHost) {
+    return { kind: "skip", reason: "remote-host" };
+  }
 
   const list = await deps.bbCli.run(["project", "list", "--json"], {
     timeoutMs: 30_000,
   });
-  if (list.exitCode !== 0) return "skip";
+  if (list.exitCode !== 0) return { kind: "skip", reason: "project-list" };
   let projects: BbProjectListItem[];
   try {
     const parsed: unknown = JSON.parse(list.stdout);
-    if (!Array.isArray(parsed)) return "skip";
+    if (!Array.isArray(parsed)) {
+      return { kind: "skip", reason: "project-list" };
+    }
     projects = parsed as BbProjectListItem[];
   } catch {
-    return "skip";
+    return { kind: "skip", reason: "project-list" };
   }
   const repo = projectRepoPath(projects, args.projectId, args.hostId, localHost);
-  if (!repo) return "skip";
+  if (!repo) return { kind: "skip", reason: "no-local-path" };
 
   // Every delegation refreshes `origin` first — a stale remote ref is
   // as wrong a base as a local branch.

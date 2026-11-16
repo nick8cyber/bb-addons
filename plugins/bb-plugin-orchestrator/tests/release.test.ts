@@ -209,16 +209,27 @@ const GL_EMPTY: CmdRunner = {
     file === "gitleaks" ? { exitCode: 7, stdout: "[]", stderr: "" } : ok(),
 };
 
-test("machine scan: categories 1-3 always; threadIds on → thr_ exempt (§16.6)", async () => {
+test("machine scan: categories 1-3 always; threadIds on → thr_ in the diff flags, trailer exempt (§22.5)", async () => {
   const findings = await machineScan(GL_EMPTY, SCAN_BASE);
   const cat = (n: number) => findings.filter((f) => f.category === n);
   assert.ok(cat(1).some((f) => f.rule === "secret-file" && f.file === ".env"));
   assert.ok(cat(2).some((f) => f.rule === "commit-identity"));
   assert.ok(cat(2).some((f) => f.rule === "foreign-bot-trailer"));
   assert.ok(cat(3).some((f) => f.rule === "home-path"));
-  // §16.6 default: thr_ ids are anonymized — no bb-thread-id finding
-  // anywhere (diff, allow-listed file or BB-Thread trailer).
-  assert.ok(!findings.some((f) => f.rule === "bb-thread-id"));
+  // §22.5: thr_ in FILE content is a finding even with threadIds on —
+  // the setting exempts only the BB-Thread trailer in commit messages;
+  // `allow` places relax category 4.
+  assert.ok(
+    cat(4).some((f) => f.rule === "bb-thread-id" && f.file === "f.ts"),
+  );
+  assert.ok(
+    !findings.some(
+      (f) => f.rule === "bb-thread-id" && f.file === "allow/x.md",
+    ),
+  );
+  assert.ok(
+    !findings.some((f) => f.rule === "bb-thread-id" && f.file === null),
+  );
 });
 
 test("machine scan: threadIds off → thr_ a finding incl. BB-Thread trailer", async () => {

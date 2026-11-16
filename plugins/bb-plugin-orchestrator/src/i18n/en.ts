@@ -178,6 +178,12 @@ export const EN: Record<string, string> = {
   "del.levelWord": "level {level}",
   "del.spawnRefused": "spawn refused{code}: {reason}",
   "del.spawnNoId": "threads.spawn returned no thread id",
+  "del.baseUnchecked": "base not checked: {reason}",
+  "del.baseSkip.no-cmd": "no command runner",
+  "del.baseSkip.remote-host": "the target host is not this machine",
+  "del.baseSkip.project-list": "bb project list unreadable",
+  "del.baseSkip.no-local-path":
+    "the project has no local_path source on the target host",
 
   // ── release.ts ──────────────────────────────────────────────────────
   "rel.gitFailed": "git {cmd} failed (exit {code}): {out}",

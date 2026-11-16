@@ -12,8 +12,9 @@
  * «в конфиге репозитория не задан user.name/user.email»; foreign-bot
  * trailers follow `leaks.trailers` (§18.6); 3-4 follow the
  * project's `leaks` strictness with `allow` places where such mentions
- * are the norm. `thr_…` ids are exempt only while the project's
- * `threadIds` is on (§16.6).
+ * are the norm. `threadIds` (§16.6) exempts only the `BB-Thread:`
+ * trailer in commit MESSAGES — §22.5: `thr_…` in file content is a
+ * finding at release too, `leaks.allow` places aside.
  *
  * Findings never carry secret values — a finding that quotes the leak
  * would itself leak (§3). Descriptions name the rule and the masked hit.
@@ -175,6 +176,9 @@ function scanAddedLines(
     allow: leaks.allow,
     hostname,
     threadIds,
+    // §22.5: `threadIds` exempts only the commit-message trailer —
+    // `thr_…` in the diff is a finding (allow places aside).
+    flagThreadIds: true,
     allowedEmails,
   });
   const at = (f: CoreFinding, problem: string, severity: "block" | "warn") =>
@@ -478,7 +482,9 @@ export async function machineScan(
      * `unset` (the signature check only warns). */
     identity?: IdentityResolution;
     hostname?: string | undefined;
-    /** §16.6 `threadIds` — default `true` (`thr_…` is not a leak). */
+    /** §16.6 `threadIds` — default `true`: the `BB-Thread:` trailer in
+     * commit messages is not a leak; §22.5 — `thr_…` in file content
+     * still is. */
     threadIds?: boolean;
     /** §17.3 (С6): foreign-bot trailers the project accepts. */
     allowedTrailers?: readonly string[];

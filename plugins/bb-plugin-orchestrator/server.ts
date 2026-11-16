@@ -2246,6 +2246,8 @@ export async function createPlugin(
                   (res.note
                     ? "\n" + t("cli.note", { note: res.note })
                     : "") +
+                  // §22.2: the skipped published-base check names why.
+                  (res.baseUnchecked ? "\n" + res.baseUnchecked : "") +
                   (res.setupErrors.length
                     ? "\n" +
                       t("cli.setupErrors", {

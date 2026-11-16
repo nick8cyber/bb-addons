@@ -2138,7 +2138,7 @@ test("§22.2: новый заход без --from — от вершины про
   );
 });
 
-test("§22.2: далёкий хост — проверки пропускаются, база как в пресете", async () => {
+test("§22.2: далёкий хост — проверки пропускаются, база как в пресете + строка «база не проверена»", async () => {
   const { repo } = makeClone();
   const { deps, spawnArgs } = makeDeps({
     cli: (args) => {
@@ -2155,7 +2155,7 @@ test("§22.2: далёкий хост — проверки пропускают�
     cmd: createCmd(),
     localHostId: async () => "host_1",
   });
-  await runDelegate(
+  const res = await runDelegate(
     { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
     deps,
   );
@@ -2163,6 +2163,41 @@ test("§22.2: далёкий хост — проверки пропускают�
     (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
       .workspace.baseBranch,
     { kind: "named", name: "main" },
+  );
+  // §22.2: the skip is named in the delegate response.
+  assert.equal(
+    res.baseUnchecked,
+    "база не проверена: целевая машина — не эта",
+  );
+});
+
+test("§22.2: нет local_path на целевом хосте — пропуск со строкой", async () => {
+  const { repo: _r } = makeClone();
+  const { deps, spawnArgs } = makeDeps({
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(JSON.stringify({ preset: WT_PRESET }));
+      // A project list that resolves no local_path source for proj_bb.
+      if (key.startsWith("project list"))
+        return ok(JSON.stringify([{ id: "proj_bb", sources: [] }]));
+      return defaultCli(args);
+    },
+    cmd: createCmd(),
+    localHostId: async () => "host_1",
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "simple", caller: COORDINATOR },
+    deps,
+  );
+  assert.deepEqual(
+    (spawnArgs[0]!.environment as { workspace: { baseBranch: unknown } })
+      .workspace.baseBranch,
+    { kind: "named", name: "main" },
+  );
+  assert.equal(
+    res.baseUnchecked,
+    "база не проверена: у проекта нет источника local_path на целевой машине",
   );
 });
 

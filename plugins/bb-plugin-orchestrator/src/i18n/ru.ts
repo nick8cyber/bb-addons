@@ -175,6 +175,12 @@ export const RU: Record<string, string> = {
   "del.levelWord": "уровень {level}",
   "del.spawnRefused": "spawn refused{code}: {reason}",
   "del.spawnNoId": "threads.spawn returned no thread id",
+  "del.baseUnchecked": "база не проверена: {reason}",
+  "del.baseSkip.no-cmd": "нет запускателя команд",
+  "del.baseSkip.remote-host": "целевая машина — не эта",
+  "del.baseSkip.project-list": "bb project list не прочитался",
+  "del.baseSkip.no-local-path":
+    "у проекта нет источника local_path на целевой машине",
 
   // ── release.ts ──────────────────────────────────────────────────────
   "rel.gitFailed": "git {cmd} failed (exit {code}): {out}",

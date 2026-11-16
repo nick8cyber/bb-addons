@@ -39,12 +39,16 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   carrying commits that are neither in `origin/<base>` nor from this
   task (its own rounds, results merged by `bb orchestrator merge`,
   release-pipeline shas): `from-unpublished: <n> коммитов не в
-  origin/<цель> и не из этой задачи`; a coordinator's spec branch, a
-  sha or `HEAD` always pass. A failed `git fetch` or a missing
-  `origin/<baseBranch>` refuses `base-unavailable: <error>`; where
-  git is unreachable (a foreign target host, no `local_path` source
-  on it, no cmd runner) the check skips and the spawn keeps the
-  preset's base.
+  origin/<цель> и не из этой задачи`. `HEAD` resolves to the copy's
+  current branch first, so `--from HEAD` on a local target branch
+  with unpublished commits refuses just like `--from main` — only a
+  coordinator's spec branch and a bare sha always pass. A failed
+  `git fetch` or a missing `origin/<baseBranch>` refuses
+  `base-unavailable: <error>`; where git is unreachable (a foreign
+  target host, no `local_path` source on it, an unreadable
+  `bb project list`, no cmd runner) the check skips, the spawn keeps
+  the preset's base, and the delegate response names the reason:
+  "base not checked: <reason>".
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only threads whose role may delegate (`delegates`, §13);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).
@@ -123,10 +127,14 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   (`tests/fixtures/leak-samples.ts`). `threadIds` (default on) allows
   the thread-id marker in the PR body from the `prBody` template
   (default `BB-Thread: {thread}` / `BB-Task: {task}`) and exempts
-  `thr_…` from the bb-ids leak rule in COMMIT MESSAGES; in file
-  content `thr_…` is a finding regardless. Off — `prBody` is not
+  `thr_…` in COMMIT MESSAGES from the bb-ids leak rule — the
+  `BB-Thread:` trailer in the release machine scan's commit scan
+  (§16.6) and in `pre-commit` alike. In file CONTENT `thr_…` is a
+  finding everywhere (§22.5): the release scan flags it in the
+  release diff and every commit's patch, `pre-commit` in the staged
+  lines — `leaks.allow` places aside in both. Off — `prBody` is not
   applied, the body is empty, and every `thr_…` is a `leaks.bbIds`
-  finding (see "PR body").
+  finding, the commit-message trailer included (see "PR body").
   `allowedTrailers` / `allowedEmails` (§17.3 C6) exempt matching
   commit trailers (e.g. `Co-Authored-By`) and e-mail addresses/domains
   from the machine scan's `foreign-bot-trailer` / `personal-email`
