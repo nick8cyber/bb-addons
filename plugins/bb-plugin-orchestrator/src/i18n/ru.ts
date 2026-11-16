@@ -448,6 +448,24 @@ export const RU: Record<string, string> = {
   "pp.wrongBranch": "копия не на {branch} — не обновлена",
   "pp.fetchFailed": "fetch не удался: {err}",
   "pp.ffFailed": "ff не прошёл ({err})",
+  // §22.3: понятные причины по порядку проверок копии (сырой вывод git —
+  // только в журнал).
+  "pp.copyWrongState":
+    "копия на {where} — новая версия не загружена; " +
+    "переключи копию на {target}",
+  "pp.detached": "отдельном коммите",
+  "pp.copyDiverged":
+    "в копии {n} локальных коммитов не в {target} — " +
+    "новая версия не загружена",
+  "pp.copyDirty":
+    "в копии незакоммиченные правки ({n} файлов) — " +
+    "новая версия не загружена",
+  "pp.copyUpdateFailed":
+    "копию обновить не удалось — новая версия не загружена; " +
+    "подробности в журнале плагина",
+  // §22.4: хвост строки итога — у перезагруженных плагинов с интерфейсом.
+  "pp.reloadPage":
+    "обнови страницу BB, чтобы увидеть новую версию: {list}",
   "pp.reloadDisabled": "перезагрузка плагинов выключена",
   "pp.depsChanged":
     "{id}: изменены зависимости — переустанови их и перезагрузи вручную",
@@ -474,6 +492,14 @@ export const RU: Record<string, string> = {
   "hook.noToken":
     "push отклонён: выкладка только через `bb orchestrator release` " +
     "(нет одноразового маркера)",
+  // §22.1: тексты общего хука `pre-commit` — формат находки и названия
+  // типов («<файл>:<строка> — <тип>: <фрагмент>»).
+  "hookPc.finding": "{file}:{line} — {type}: {text}",
+  "hookPc.findingWarn": "{file}:{line} — {type}: {text} (предупреждение)",
+  "hookPc.typeMachine": "путь машины",
+  "hookPc.typeThreadId": "id треда",
+  "hookPc.typeEmail": "почта",
+  "hookPc.typeSecret": "секрет",
   "status.moreErrs": " (+{n} ещё)",
   "status.fixSetting": "исправьте `{name}`",
   "status.reloadHint": " — затем `bb plugin reload orchestrator`",

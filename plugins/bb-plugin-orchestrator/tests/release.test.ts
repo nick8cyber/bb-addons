@@ -40,7 +40,9 @@ import {
 } from "../src/release.js";
 import {
   GLUED_PATH_LINE,
+  LEAK_GHP_SECRET,
   LEAK_HOME_PATH,
+  LEAK_PERSONAL_EMAIL,
   LEAK_USERS_PATH,
   MIXED_PATH_LINE,
   SAFE_HOME_PATH,
@@ -242,6 +244,113 @@ test("gitleaks missing → gitleaks-missing with hint", async () => {
     ),
     (e: unknown) => (e as OrchestratorError).code === "gitleaks-missing",
   );
+});
+
+// ── §4 r11.1: синтетические секреты только в файлах фикстур ────────────
+
+test("§4 r11.1: шаблоны — синтетика в фикстурах проходит; вне и реальная форма — отказ", async () => {
+  const FIX = "tests/fixtures/leak-samples.ts";
+  // §5: a real-form literal may not exist anywhere (it is always a
+  // finding, fixture file included) — tests corrupt one char of the
+  // imported synthetic sample at runtime instead.
+  const realForm = LEAK_GHP_SECRET.replace(/x$/, "xQ");
+  const realMail = LEAK_PERSONAL_EMAIL.replace("EXAMPLE", "petr");
+  const scan = (added: { file: string; line: number; text: string }[]) =>
+    machineScan(GL_EMPTY, {
+      repoPath: "/r",
+      baseSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      commits: [],
+      added,
+      leaks: LEAKS,
+    });
+  const okScan = await scan([
+    { file: FIX, line: 1, text: `export const s = "${LEAK_GHP_SECRET}";` },
+    { file: FIX, line: 2, text: `export const e = "${LEAK_PERSONAL_EMAIL}";` },
+  ]);
+  assert.ok(
+    !okScan.some((f) => f.category <= 2),
+    `synthetic fixture values exempt: ${JSON.stringify(okScan)}`,
+  );
+  const bad = await scan([
+    { file: "a.ts", line: 1, text: `const s = "${LEAK_GHP_SECRET}";` },
+    { file: "a.ts", line: 2, text: `const e = "${LEAK_PERSONAL_EMAIL}";` },
+    { file: FIX, line: 3, text: `export const s = "${realForm}";` },
+    { file: FIX, line: 4, text: `export const e = "${realMail}";` },
+    // synthetic + real on ONE fixture line — still a finding
+    {
+      file: FIX,
+      line: 5,
+      text: `export const a = "${LEAK_GHP_SECRET}", b = "${realForm}";`,
+    },
+  ]);
+  assert.ok(bad.some((f) => f.rule === "github-token" && f.file === "a.ts"));
+  assert.ok(bad.some((f) => f.rule === "personal-email" && f.file === "a.ts"));
+  assert.ok(bad.some((f) => f.rule === "github-token" && f.file === FIX));
+  assert.ok(bad.some((f) => f.rule === "personal-email" && f.file === FIX));
+  assert.ok(bad.some((f) => f.rule === "github-token" && f.line === 5));
+});
+
+test("§4 r11.1: gitleaks — синтетика в фикстурах не находка, остальное остаётся", async () => {
+  const sha = "c".repeat(40);
+  const hit = (file: string, line: number) => ({
+    RuleID: "github-pat",
+    File: file,
+    StartLine: line,
+    Commit: sha,
+  });
+  const gl = (rows: unknown[], blobs: Record<string, string>): CmdRunner => ({
+    run: async (file, args) => {
+      if (file === "gitleaks") {
+        return { exitCode: 7, stdout: JSON.stringify(rows), stderr: "" };
+      }
+      if (file === "git" && args.includes("show")) {
+        const f = String(args[args.length - 1]).split(":").slice(1).join(":");
+        return { exitCode: 0, stdout: blobs[f] ?? "", stderr: "" };
+      }
+      return ok();
+    },
+  });
+  const FIX = "tests/fixtures/leak-samples.ts";
+  const scan = (rows: unknown[], blobs: Record<string, string>) =>
+    runGitleaks(gl(rows, blobs), "/r", "a".repeat(40), sha);
+
+  // synthetic line in the builtin fixture file → dropped
+  const dropped = await scan([hit(FIX, 1)], {
+    [FIX]: `export const s = "${LEAK_GHP_SECRET}";\n`,
+  });
+  assert.equal(dropped.length, 0);
+
+  // real-form line in the fixture file → kept
+  const realForm = LEAK_GHP_SECRET.replace(/x$/, "xQ");
+  const keptReal = await scan([hit(FIX, 1)], {
+    [FIX]: `export const s = "${realForm}";\n`,
+  });
+  assert.equal(keptReal.length, 1);
+  assert.equal(keptReal[0]!.severity, "block");
+
+  // synthetic line but NOT an allow file → kept
+  const keptFile = await scan([hit("a.ts", 1)], {
+    "a.ts": `const s = "${LEAK_GHP_SECRET}";\n`,
+  });
+  assert.equal(keptFile.length, 1);
+
+  // project leaks.allow entry (not the builtin path) exempts too —
+  // checked through machineScan so the allow list flows into gitleaks
+  const proj = await machineScan(
+    gl([hit("fx/l.ts", 2)], {
+      "fx/l.ts": `// f\nexport const s = "${LEAK_GHP_SECRET}";\n`,
+    }),
+    {
+      repoPath: "/r",
+      baseSha: "a".repeat(40),
+      headSha: sha,
+      commits: [],
+      added: [],
+      leaks: { ...LEAKS, allow: ["fx/l.ts"] },
+    },
+  );
+  assert.ok(!proj.some((f) => f.rule.startsWith("gitleaks:")));
 });
 
 // ── verdict parsing ────────────────────────────────────────────────────
@@ -1417,8 +1526,9 @@ test("release: stale installed hook refuses with reinstall hint", async () => {
   );
 });
 
-/** Install the full wrapper set into `dir` — pre-push is the gate,
- * every other name is a byte-copy of `chain` (what install.mjs does). */
+/** Install the full wrapper set into `dir` — `pre-push`/`pre-commit`
+ * are the gates (§22.1), every other name is a byte-copy of `chain`,
+ * `leak-scan.ts` lands alongside (what install.mjs does). */
 function installAllWrappers(dir: string) {
   const src = new URL("../hooks", import.meta.url).pathname;
   const names = readFileSync(join(src, "hook-names"), "utf8")
@@ -1426,8 +1536,12 @@ function installAllWrappers(dir: string) {
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"));
   for (const n of names) {
-    cpSync(join(src, n === "pre-push" ? "pre-push" : "chain"), join(dir, n));
+    cpSync(
+      join(src, n === "pre-push" || n === "pre-commit" ? n : "chain"),
+      join(dir, n),
+    );
   }
+  cpSync(join(src, "leak-scan.ts"), join(dir, "leak-scan.ts"));
   return names;
 }
 
@@ -4963,7 +5077,10 @@ test("r10 п.2: копия не на целевой ветке — причин�
   await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   await auditDone(deps, store);
   const line = sent.find((m) => /выложено/.test(m))!;
-  assert.match(line, /копия не на main — не обновлена/);
+  assert.match(
+    line,
+    /копия на side — новая версия не загружена; переключи копию на main/,
+  );
   assert.ok(
     !calls.some((c) => c[0] === "plugin" && c[1] === "reload"),
     "перезагрузки не было",
@@ -5000,7 +5117,10 @@ test("r10 п.2: ff не прошёл — причина в строке, пер�
   await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   await auditDone(deps, store);
   const line = sent.find((m) => /выложено/.test(m))!;
-  assert.match(line, /ff не прошёл/);
+  assert.match(
+    line,
+    /в копии 1 локальных коммитов не в main — новая версия не загружена/,
+  );
   assert.ok(
     !calls.some((c) => c[0] === "plugin" && c[1] === "reload"),
     "перезагрузки не было",
@@ -5789,7 +5909,7 @@ test("§2 п.6 r11 (заход 3 Б3): ff не прошёл — пропуск �
   await new Promise((r) => setImmediate(r));
   await pumpReleases(deps2);
   const line = sent.find((m) => /выложено/.test(m))!;
-  assert.match(line, /ff не прошёл/);
+  assert.match(line, /в копии 1 локальных коммитов не в main/);
   assert.match(line, /cp: пропущена — копия не обновлена/);
   assert.match(line, /def: пропущена — копия не обновлена/);
   assert.match(line, /main: ok/);
@@ -6975,4 +7095,284 @@ test("§18.6: resolveCommitIdentity — unset/literal/repo/repo-unset/invalid", 
   assert.deepEqual(await resolveCommitIdentity(noCfg, "/r", "repo"), {
     state: "repo-unset",
   });
+});
+
+// ── §22.3 (r33.1): понятные причины postPublish по порядку проверок ────
+
+const ppLine = (sent: string[]) => sent.find((m) => /выложено/.test(m))!;
+const noReload = (calls: string[][]) =>
+  !calls.some((c) => c[0] === "plugin" && c[1] === "reload");
+
+test("§22.3: отделённый HEAD — причина «отдельном коммите», без перезагрузки", async () => {
+  const { repo, seed } = makeRepo();
+  gitR(seed, ["checkout", "--detach", "HEAD"]);
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(
+    ppLine(sent),
+    /копия на отдельном коммите — новая версия не загружена; переключи копию на main/,
+  );
+  assert.ok(noReload(calls));
+});
+
+test("§22.3: правки в отслеживаемых — причина «незакоммиченные правки»", async () => {
+  const { repo, seed } = makeRepo();
+  writeFileSync(join(seed, "base.txt"), "dirty\n"); // отслеживаемый, не коммитим
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(
+    ppLine(sent),
+    /в копии незакоммиченные правки \(1 файлов\) — новая версия не загружена/,
+  );
+  assert.ok(noReload(calls));
+});
+
+test("§22.3: неотслеживаемый файл из входящего диффа — блокирует", async () => {
+  const { repo, seed } = makeRepo();
+  // входящий дифф: f.txt (первый коммит repo) — создаём его в копии
+  // без индекса: ff его перезаписал бы.
+  writeFileSync(join(seed, "f.txt"), "untracked\n");
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(
+    ppLine(sent),
+    /в копии незакоммиченные правки \(1 файлов\) — новая версия не загружена/,
+  );
+  assert.ok(noReload(calls));
+});
+
+test("§22.3: чужой неотслеживаемый файл — не мешает, копия обновлена", async () => {
+  const { repo, seed } = makeRepo();
+  writeFileSync(join(seed, "scratch.txt"), "mine\n"); // не во входящем диффе
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(ppLine(sent), /postPublish: копия обновлена/);
+});
+
+test("§22.3: fetch упал — «не удалось», сырое — только в журнал", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfg(seed),
+  });
+  const warned: string[] = [];
+  deps.log = { warn: (m: string) => warned.push(m) };
+  const realRun = deps.cmd.run.bind(deps.cmd);
+  deps.cmd = {
+    run: async (file: string, args: string[], o?: never) =>
+      file === "git" && args[1] === seed && args.includes("fetch")
+        ? { exitCode: 128, stdout: "", stderr: "fetch exploded x9" }
+        : realRun(file, args, o),
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const line = ppLine(sent);
+  assert.match(
+    line,
+    /копию обновить не удалось — новая версия не загружена; подробности в журнале плагина/,
+  );
+  assert.ok(!/fetch exploded/.test(line), "сырой stderr не в строке");
+  assert.ok(
+    warned.some((m) => /fetch exploded/.test(m)),
+    "сырой stderr в журнале",
+  );
+  assert.ok(noReload(calls));
+});
+
+test("§22.3: ff упал после проверок — «не удалось», сырое в журнал", async () => {
+  const { repo, seed } = makeRepo();
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfg(seed),
+  });
+  const warned: string[] = [];
+  deps.log = { warn: (m: string) => warned.push(m) };
+  const realRun = deps.cmd.run.bind(deps.cmd);
+  deps.cmd = {
+    run: async (file: string, args: string[], o?: never) =>
+      file === "git" && args[1] === seed && args.includes("merge")
+        ? { exitCode: 128, stdout: "", stderr: "merge exploded q7" }
+        : realRun(file, args, o),
+  };
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const line = ppLine(sent);
+  assert.match(line, /копию обновить не удалось — новая версия не загружена/);
+  assert.ok(!/merge exploded/.test(line));
+  assert.ok(warned.some((m) => /merge exploded/.test(m)));
+  assert.ok(noReload(calls));
+});
+
+// ── §22.4 (r33.1): хвост «обнови страницу BB» для плагинов с app ──────
+
+const withPluginChange = (repo: string, id: string, manifest?: string) => {
+  mkdirSync(join(repo, "plugins", id), { recursive: true });
+  writeFileSync(join(repo, "plugins", id, "x.txt"), "1\n");
+  if (manifest !== undefined) {
+    writeFileSync(join(repo, "plugins", id, "plugin.json"), manifest);
+    if (/"app"/.test(manifest)) {
+      writeFileSync(join(repo, "plugins", id, "app.tsx"), "x\n");
+    }
+  }
+  gitR(repo, ["add", "."]);
+};
+
+test("§22.4: один плагин с app — хвост «обнови страницу BB»", async () => {
+  const { repo, seed } = makeRepo();
+  withPluginChange(repo, "appplug", JSON.stringify({ app: "./app.tsx" }));
+  gitR(repo, ["commit", "-m", "feat: app plug"]);
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "appplug", rootDir: join(seed, "plugins", "appplug") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(
+    ppLine(sent),
+    /обнови страницу BB, чтобы увидеть новую версию: appplug$/,
+  );
+});
+
+test("§22.4: серверный плагин без app — хвоста нет", async () => {
+  const { repo, seed } = makeRepo();
+  withPluginChange(repo, "srvplug", JSON.stringify({ name: "srvplug" }));
+  gitR(repo, ["commit", "-m", "feat: server plug"]);
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "srvplug", rootDir: join(seed, "plugins", "srvplug") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(ppLine(sent), /перезагружено: srvplug/);
+  assert.ok(!/обнови страницу BB/.test(ppLine(sent)));
+});
+
+test("§22.4: несколько плагинов с app — все в хвосте", async () => {
+  const { repo, seed } = makeRepo();
+  for (const id of ["ui1", "ui2"]) {
+    withPluginChange(repo, id, JSON.stringify({ app: "./app.tsx" }));
+  }
+  gitR(repo, ["commit", "-m", "feat: two ui plugs"]);
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "ui1", rootDir: join(seed, "plugins", "ui1") },
+      { id: "ui2", rootDir: join(seed, "plugins", "ui2") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(
+    ppLine(sent),
+    /обнови страницу BB, чтобы увидеть новую версию: ui1, ui2$/,
+  );
+});
+
+test("§22.3 (ревью): неотслеживаемый ФАЙЛ foo блокирует входящий foo/bar.ts", async () => {
+  const { repo, seed } = makeRepo();
+  // Входящий дифф несёт файл ВНУТРИ каталога foo — а в копии `foo`
+  // занято неотслеживаемым ФАЙЛОМ: ff бы упал, проверка ловит раньше.
+  mkdirSync(join(repo, "foo"), { recursive: true });
+  writeFileSync(join(repo, "foo", "bar.ts"), "x\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: foo dir"]);
+  writeFileSync(join(seed, "foo"), "untracked file, not a dir\n");
+  const { deps, store, sent, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(
+    ppLine(sent),
+    /в копии незакоммиченные правки \(1 файлов\) — новая версия не загружена/,
+  );
+  assert.ok(noReload(calls));
+});
+
+test("§22.4 (ревью): объявленное поле app без собранного файла — хвост всё равно", async () => {
+  const { repo, seed } = makeRepo();
+  // plugin.json declares `app` pointing to a not-yet-built file — the
+  // declaration alone means «есть интерфейс»: браузер держит старую
+  // сборку в любом случае.
+  mkdirSync(join(repo, "plugins", "declplug"), { recursive: true });
+  writeFileSync(
+    join(repo, "plugins", "declplug", "plugin.json"),
+    JSON.stringify({ app: "./dist/app.js" }),
+  );
+  writeFileSync(join(repo, "plugins", "declplug", "x.txt"), "1\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: declared app"]);
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "declplug", rootDir: join(seed, "plugins", "declplug") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  assert.match(
+    ppLine(sent),
+    /обнови страницу BB, чтобы увидеть новую версию: declplug$/,
+  );
+});
+
+test("§22.4 (ревью): самоперезагрузка orchestrator с app — id в хвосте автоматизации", async () => {
+  const { repo, seed } = makeRepo();
+  // The orchestrator itself declares an interface — its self-reload
+  // still ends the outcome line with the reload-page tail.
+  mkdirSync(join(repo, "plugins", "orchestrator"), { recursive: true });
+  writeFileSync(
+    join(repo, "plugins", "orchestrator", "plugin.json"),
+    JSON.stringify({ app: "./app.tsx" }),
+  );
+  writeFileSync(join(repo, "plugins", "orchestrator", "app.tsx"), "x\n");
+  writeFileSync(join(repo, "plugins", "orchestrator", "x.txt"), "1\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: orchestrator ui"]);
+  const { deps, store, calls } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "orchestrator", rootDir: join(seed, "plugins", "orchestrator") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  await auditDone(deps, store);
+  const auto = calls.find(
+    (c) => c[0] === "automation" && c[1] === "create",
+  );
+  assert.ok(auto, "создана разовая автоматизация самоперезагрузки");
+  const script = auto![auto!.indexOf("--script") + 1]!;
+  const b64 = /TEXT=\$\(printf %s '([A-Za-z0-9+/=]+)' \| base64 -d\)/.exec(
+    script,
+  )![1]!;
+  assert.match(
+    Buffer.from(b64, "base64").toString("utf8"),
+    /обнови страницу BB, чтобы увидеть новую версию: orchestrator/,
+  );
 });

@@ -74,9 +74,11 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   name. The same shadowing works the other way too: while a global
   `core.hooksPath` is set git reads hooks ONLY from it, so a
   repository's own `.git/hooks/push-to-checkout` never fires anyway —
-  keeping the name in the wrapper set would buy nothing. `pre-push` is the orchestrator gate; the rest are copies of
-  `chain`, which execs the repo's own `.git/hooks/<name>` — only when
-  it is executable, like git itself. The shared `pre-push` is a
+  keeping the name in the wrapper set would buy nothing. `pre-push` is
+  the orchestrator push gate and `pre-commit` (§22.1) the staged-diff
+  leak gate — both chain to the local hook afterwards; the rest are
+  copies of `chain`, which execs the repo's own `.git/hooks/<name>` —
+  only when it is executable, like git itself. The shared `pre-push` is a
   **forgetfulness guard, not a hard gate**: it stops an accidental
   `git push` via a one-time `push-token-*.json` binding branch+sha,
   but an agent running as the same user could write the token itself —
@@ -89,11 +91,24 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   plugin update re-run `hooks/install.mjs` — `release` refuses
   `hook-stale` when any expected wrapper is missing, differs from the
   plugin's, or a retired `push-to-checkout` wrapper is left over.
-  `threadIds` (default on) allows the thread-id marker in the PR body
-  from the `prBody` template (default `BB-Thread: {thread}` /
-  `BB-Task: {task}`) and exempts `thr_…` from the bb-ids leak rule;
-  off — `prBody` is not applied, the body is empty, and every
-  `thr_…` is a `leaks.bbIds` finding (see "PR body").
+  **Shared `pre-commit` (§22.1):** scans the staged diff's added lines
+  with the same leak rules the release machine scan uses — the shared
+  core lives in `hooks/leak-scan.ts` and ships next to the wrappers.
+  Severity `block` refuses the commit, `warn` prints a warning and
+  lets it through. The hook reads the resolved leak settings from
+  `<git-common-dir>/orchestrator-leaks.json`, which the plugin refreshes
+  on settings load, on every settings save, on each delegation and
+  whenever it resolves the repo's release project; written from a
+  worktree the snapshot lands in the shared git dir, so every linked
+  worktree is covered. With no snapshot the embedded defaults apply —
+  including `os.hostname()` and the built-in `leaks.allow` exceptions
+  (`tests/fixtures/leak-samples.ts`). `threadIds` (default on) allows
+  the thread-id marker in the PR body from the `prBody` template
+  (default `BB-Thread: {thread}` / `BB-Task: {task}`) and exempts
+  `thr_…` from the bb-ids leak rule in COMMIT MESSAGES; in file
+  content `thr_…` is a finding regardless. Off — `prBody` is not
+  applied, the body is empty, and every `thr_…` is a `leaks.bbIds`
+  finding (see "PR body").
   `allowedTrailers` / `allowedEmails` (§17.3 C6) exempt matching
   commit trailers (e.g. `Co-Authored-By`) and e-mail addresses/domains
   from the machine scan's `foreign-bot-trailer` / `personal-email`
