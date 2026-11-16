@@ -3,7 +3,7 @@ title: Usage Pro — переключатель биллинга Claude (под�
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 2 (аудит: семантическое сравнение приёмки, опрос статуса, санитарные ошибки, дополненная подсказка)
+revision: 3 (claude-key on дополнительно пишет env.CLAUDE_CODE_PROMPT_CACHE_TTL="1h", off снимает оба ключа и пустой env; приёмка расширена)
 tags: [usage-pro, claude-code, billing]
 ---
 
@@ -17,7 +17,7 @@ tags: [usage-pro, claude-code, billing]
 
 - ключ лежит в `~/.claude/secrets/anthropic-console.env` (0600);
 - `~/.claude/secrets/key-helper.sh` печатает ключ для `apiKeyHelper`;
-- CLI `~/.local/bin/claude-key on|off|status` атомарно (через `jq` + tmp + rename) добавляет/удаляет `apiKeyHelper` в `~/.claude/settings.json`, перед правкой копирует файл в `settings.json.bak-claude-key`.
+- CLI `~/.local/bin/claude-key on|off|status` атомарно (через `jq` + tmp + rename) правит `~/.claude/settings.json`, перед правкой копирует файл в `settings.json.bak-claude-key`. `on` добавляет `apiKeyHelper` **и** `env.CLAUDE_CODE_PROMPT_CACHE_TTL="1h"` (на ключе дефолт кэша 5 минут — переменная выравнивает его до часа). `off` удаляет оба ключа, а опустевший объект `env` — целиком. Признак ON по-прежнему один — наличие `apiKeyHelper`.
 
 ## 2. Контракт
 
@@ -41,7 +41,7 @@ tags: [usage-pro, claude-code, billing]
 - Расположение: вкладка `claude-code` блока «Provider usage», отдельная строка под карточками аккаунтов.
 - Подписи: OFF — «Подписка», ON — «Ключ Console ($ из кредитов орг.)».
 - В ON переключатель визуально выделен (amber/warning), потому что тратятся деньги.
-- Подсказка (`title` у строки): «Действует со следующего хода во всех тредах Claude Code; кэш тредов перезапишется на первом ходе».
+- Подсказка (`title` у строки): «Действует со следующего хода во всех тредах Claude Code; кэш тредов перезапишется на первом ходе; на ключе кэш 1h».
 - Пока статус не прочитан или идёт переключение — контрол disabled.
 - Свежесть: UI перечитывает `claudeKey.status` при монтировании вкладки, после каждого `set` и опросом раз в ~30 с, чтобы `claude-key on|off` из терминала отражался в UI без перезагрузки.
 - Ошибка `set` в UI — короткое «Не удалось переключить», затем перечитывание статуса.
@@ -60,8 +60,8 @@ tags: [usage-pro, claude-code, billing]
 | Сценарий | Результат |
 |---|---|
 | Статус при OFF и при ON | Совпадает с `claude-key status` и содержимым settings.json |
-| Клик OFF→ON | В settings.json появляется `apiKeyHelper`, UI показывает «Ключ Console» |
-| Клик ON→OFF | Ключ удалён; `jq -S .` результата семантически равен `settings.json.bak-20261116` (основной критерий); побайтовое равенство — дополнительно и может не выполняться при ручных правках файла |
-| Посторонние ключи settings.json | Не изменены (jq трогает только `apiKeyHelper`) |
+| Клик OFF→ON | В settings.json появляется `apiKeyHelper` **и** `env.CLAUDE_CODE_PROMPT_CACHE_TTL="1h"`, UI показывает «Ключ Console» |
+| Клик ON→OFF | Оба ключа удалены, `env.CLAUDE_CODE_PROMPT_CACHE_TTL` отсутствует (пустой `env` снят целиком); `jq -S .` результата семантически равен `settings.json.bak-20261116` (основной критерий); побайтовое равенство — дополнительно и может не выполняться при ручных правках файла |
+| Посторонние ключи settings.json | Не изменены (jq трогает только `apiKeyHelper` и `env.CLAUDE_CODE_PROMPT_CACHE_TTL`) |
 | RPC-ответы и логи | Нет значения хелпера, ключа и env-файла |
 | Финал | Состояние OFF (подписка) |
