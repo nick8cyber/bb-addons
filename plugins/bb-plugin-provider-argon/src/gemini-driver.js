@@ -165,6 +165,13 @@ async function ensureChrome(opts = {}) {
     return targetProfile;
   }
 
+  if (process.env.GEMINI_NO_AUTOSPAWN) {
+    throw new Error(
+      `GEMINI_NO_AUTOSPAWN: refusing to ${cdpUp ? 'restart' : 'spawn'} chrome on :${port} ` +
+        `(cdpUp=${cdpUp}, profileMatches=${Boolean(profileMatches)}, modeMatches=${modeMatches})`
+    );
+  }
+
   await stopChrome(port);
 
   const { spawn } = require('child_process');
