@@ -3,7 +3,7 @@ title: provider-agy — миграция на ACP-транспорт
 status: draft
 owner: coordinator
 date: 2026-11-16
-revision: 6 (§12 — правки аудита выкладки release #88: хост-пути, атрибуция plug117_*, актуализация §12.3)
+revision: 6 (§12 — правки аудитов выкладки #88 и #90: хост-пути, атрибуция plug117_*, актуализация §12.3, teardown §12.4 по коду, примеры префиксов)
 tags: [bb, plugins, provider-agy, acp]
 ---
 
@@ -177,7 +177,7 @@ Shim входит в orderly shutdown при любом из:
 - **Каталоги `<os.tmpdir()>/agy-acp-*`** (остатки харнессов) — удалить только при ВСЕХ условиях: (a) каталог ≠ собственному `dataDir`/`shimDir` и не является его предком — реапер в `start()` крутится внутри процесса харнеса и увидит свежесозданный root «пустым»; (b) устаревание — ни одного файла с `mtime` моложе N мин (N=60): env харнеса выставляется после exec и в `/proc/<pid>/environ` его нет, значит единственный рабочий критерий «живости» — свежая запись; (c) ни один `/proc/*/cwd` или `/proc/*/fd/*` не указывает внутрь каталога; `EPERM` при скане чужого proc = «ссылается», не удалять.
 
 ### 12.4 Харнессы — тот же kill-контракт
-- `harness-acp.mjs` и родственные `harness-*.mjs`: `installTeardown()` из `harness-teardown.mjs` — на `exit`/`SIGINT`/`SIGTERM` шлёт `SIGTERM` прямым детям по PID (список собирается из `/proc/*/stat` по совпадению ppid) и удаляет все корни, созданные через `trackedMkdtemp` (префикс свой у каждого харнесса: `agy-acp-*`, `agy-artifact-*`, `agy-errors-*`, `agy-fake-*`, `agy-localstate-*`, `agy-pool-*`, `agy-rebuild-*`, `agy-relay-*`, `agy-rotation-*`, `agy-steer-*`, `agy-conformance-*`, `shimreplay-*`). Группу не убивает специально: detached-группу `agy acp` добивает собственный shutdown шима по §12.2 — SIGKILL шиму сиротил бы то самое дерево, ради которого контракт. Своя уборка первична; реапер §12.3 — страховка для аварийных смертей и только для `agy-acp-*` корней.
+- `harness-acp.mjs` и родственные `harness-*.mjs`: `installTeardown()` из `harness-teardown.mjs` — на `exit`/`SIGINT`/`SIGTERM` шлёт `SIGTERM` прямым детям по PID (список собирается из `/proc/*/stat` по совпадению ppid) и удаляет все корни, созданные через `trackedMkdtemp` (префикс свой у каждого харнесса — примеры, список не исчерпывающий: `agy-acp-*`, `agy-artifact-*`, `agy-errors-*`, `agy-fake-*`, `agy-localstate-*` и `agy-priority-*` семействами в `harness-local-state.mjs`, `agy-pool-*`, `agy-rebuild-*`, `agy-relay-*`, `agy-rotation-*`, `agy-steer-*`, `agy-conformance-*`, `shimreplay-*`). Группу не убивает специально: detached-группу `agy acp` добивает собственный shutdown шима по §12.2 — SIGKILL шиму сиротил бы то самое дерево, ради которого контракт. Своя уборка первична; реапер §12.3 — страховка для аварийных смертей и только для `agy-acp-*` корней.
 - `fake-agy-*.mjs`: teardown нет — детей и tmp-корней не держат; выход по EOF stdin, по `SIGINT`/`SIGTERM`/`SIGHUP` и по ppid-сторожу (~1.5 с): репарент на init/systemd → `process.exit(0)`.
 - `/tmp/plug117_*` фикстуры `bb-plugin-live-call` (`server|fixture|unruly.mjs`): `plugins/bb-plugin-live-call/tests/plug-117-*.test.ts` (`makeTmpDir("plug117_…")`) и `research/fixtures/test-connector.mjs` — процессы фикстур умирают с родителем: ppid-сторож, обработка сигналов и stdin EOF — тот же kill-контракт.
 - `bb-plugin-provider-argon` — `tests/provider-argon.test.mjs` спавнит `acp-server.mjs` с `detached: true` (своя process-группа); teardown на выходе убивает группу (`process.kill(-pid, "SIGKILL")`, fallback на прямой `proc.kill`) и удаляет каталоги `argon-test-state-*`.
