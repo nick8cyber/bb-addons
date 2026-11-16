@@ -791,20 +791,32 @@ function newestMtimeMs(dir: string, budget: { left: number }): number {
   return newest;
 }
 
-/** Every filesystem target visible in /proc — cwd and fd symlinks of every
- * readable process. "unknown" marks a proc we could not inspect (EPERM on a
- * foreign /proc entry): the spec counts it as a reference, never as proof
- * the dir is free. Returns null when a proc hid its fds. */
-function procVisibleTargets(): Set<string> | null {
+/** Every filesystem target visible in /proc — cwd and fd symlinks of processes
+ * belonging to our uid. Foreign processes are skipped without reading cwd/fd
+ * (mkdtemp roots are 0700 so foreign uids cannot enter them, per spec §12.3(c)).
+ * An unreadable process of our own uid (EPERM/EACCES) conservatively counts
+ * as a reference and returns null. Returns null on scan budget overflow. */
+export function procVisibleTargets(): Set<string> | null {
   let pids: string[] = [];
   try {
     pids = readdirSync("/proc").filter((e) => /^\d+$/.test(e));
   } catch {
     return null;
   }
+  const myUid = typeof process.getuid === "function" ? process.getuid() : -1;
   const targets = new Set<string>();
   let scanned = 0;
   for (const pid of pids) {
+    let st;
+    try {
+      st = statSync(`/proc/${pid}`);
+    } catch {
+      continue; // raced exit before stat — not a reference
+    }
+    if (st.uid !== myUid) {
+      // 0700 mkdtemp roots cannot be accessed by foreign uids; skip without reading
+      continue;
+    }
     try {
       targets.add(readlinkSync(`/proc/${pid}/cwd`));
     } catch (error) {
@@ -836,7 +848,7 @@ function procVisibleTargets(): Set<string> | null {
  * removed only when it is not this instance's own dataDir/shimDir (or their
  * ancestor), carries no file younger than an hour, and no live process
  * references it — all three, per spec §12.3. */
-function sweepStaleShimTmpDirs(): void {
+export function sweepStaleShimTmpDirs(): void {
   let names: string[] = [];
   try {
     names = readdirSync(tmpdir());
