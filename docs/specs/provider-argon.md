@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 7
+revision: 8
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -199,3 +199,34 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   2. Полный цикл JSON-RPC в `acp-server.mjs` (`ARGON_FAKE=1` с временным `ARGON_STATE_DIR` и `ARGON_POOL_FILE`): `initialize`, `session/new`, `session/set_model`, `session/set_config_option`, `session/prompt` (стриминг `agent_message_chunk` + `stopReason: "end_turn"`), `session/cancel` (`stopReason: "cancelled"`), автоматическое снятие аренды при закрытии `stdin` / `SIGTERM`. Поддержка `ARGON_FAKE_DELAY_MS` для проверки удержания аренды во время выполнения запроса и корректного освобождения аренды при отмене хода и `SIGTERM`.
   3. Функции `parseResetTimeMs` и `classifyFailure` на всех вариантах английских и русских сообщений о лимитах, недоступности уровня `thinking` и истечении дедлайна.
   4. Строгий режим `selectModelAndThinking` (`isDisabled` при `strict: true` порождает `rate-limit` ошибку `thinking level is rate-limited`) и индекс `responses[idx]` без отката к `responses[responses.length - 1]`.
+
+---
+
+## 7. Жизненный цикл аккаунта: добавление, ручной логин, выключение
+
+### 7.1 Выключение аккаунта — два источника истины
+
+- `loadBackends` читает `pool.json` **и** `$STATE_DIR/accounts/<label>/backend.json` как независимые источники (§3.1): запись из `backend.json` попадает в пул fallback'ом, даже если её нет в `pool.json`.
+- Выключение аккаунта = **два действия**: удалить запись из `pool.json` и переименовать `accounts/<label>/backend.json` → `backend.json.disabled`. Одного действия недостаточно — второй источник вернёт аккаунт в пул.
+- Возврат — симметрично: запись в `pool.json` + `backend.json.disabled` → `backend.json`.
+
+### 7.2 Ручной логин через web-VNC (когда `glogin.mjs` ловит `signin/rejected`)
+
+Автоматический логин на холодном профиле регулярно отбивается антиботом Google (`signin/rejected`, «This browser or app may not be secure»). Рабочая процедура — ручной вход владельца:
+
+1. `scripts/pool-add.mjs <label> <cdp-port> <email>` с принудительным `GEMINI_CHROME_BIN` = playwright-хром. **Snap-chromium запрещён**: он игнорирует `--user-data-dir` и пишет в общий системный профиль → перекрёстное заражение сессиями аккаунтов.
+2. Headed Chrome под Xvfb на выделенный CDP-порт (`--ozone-platform=x11 --no-sandbox --disable-blink-features=AutomationControlled --user-data-dir=~/.config/google-chrome-<label>`).
+3. Web-VNC мост (CDP-screencast → HTTP-polling кадров, клики через playwright mouse API, ввод текста — поле ввода + `insertText`), наружу через `bb connect expose`. Владелец проходит вход и любые верификации сам.
+
+Правила, выведенные из инцидентов 16.11 (`incidents/2026-11-16-argon-manual-logins.md`):
+
+- **Гейт первого визита `/app`**: клиентский отскок `/app → /` с визуально «мёртвой» CTA. Открывается только **реальным кликом владельца** через VNC — synthetic click (playwright mouse, DOM `.click()`) не проходит. Вердикт «нет eligibility у аккаунта» допустим только после того, как не помог и реальный клик.
+- **Recovery-speedbump пароля** имеет опцию `Continue`, пропускающую смену пароля. Новый пароль не генерируется, пока пропуск существует в DOM.
+- Окно Chrome **не закрывается вручную** после логина (закрытие последнего окна убивает процесс; при не-graceful смерти свежие auth-куки могут не долиться на диск профиля).
+- Пароли аккаунтов через `bb secret request`, файл удаляется после использования; передача секретов владельцу — через временную веб-страницу, не через чат.
+
+### 7.3 Проверка пригодности аккаунта после логина
+
+- Личность и бейдж подписки читаются с любой Google-страницы профиля (`[aria-label*="@"]`).
+- Пригодность к `/app` — только по факту: редактор `div[contenteditable="true"][role="textbox"]` на `gemini.google.com/app` + успешный `sendPrompt` end-to-end через драйвер (headless, боевой `GEMINI_CHROME_BIN`).
+- `signin/rejected` и account-recovery отказ при автоматическом логине — это антибот-защита окружения, **не** доказательство блокировки аккаунта; вердикт по аккаунту — только после ручной попытки.

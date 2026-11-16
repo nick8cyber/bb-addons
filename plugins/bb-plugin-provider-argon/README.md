@@ -35,6 +35,12 @@ ACP-провайдер «Gemini (Argon)» (`acp-argon`) для bb поверх �
 
 Также поддерживается обратная совместимость со структурой каталогов `$ARGON_STATE_DIR/accounts/<label>/backend.json`.
 
+**Выключение аккаунта — два действия**: удалить из `pool.json` И переименовать `accounts/<label>/backend.json` → `backend.json.disabled` (оба файла — независимые источники пула).
+
+### Ручной логин нового аккаунта
+
+Если `scripts/glogin.mjs` упирается в `signin/rejected` (антибот Google на холодном профиле), вход делает владелец через web-VNC: headed-хром под Xvfb на CDP-порту аккаунта + VNC-мост наружу через `bb connect expose`. Процедура и правила (гейт `/app` открывается только реальным кликом владельца; `Continue` на speedbump пароля пропускает смену; не закрывать окно Chrome) — в спецификации `docs/specs/provider-argon.md` §7 и `infra/provider-argon.md` в KB.
+
 ## Переменные окружения
 
 - `ARGON_FAKE=1`: офлайн-режим заглушки для тестов протокола (без запуска Chrome и пула).
