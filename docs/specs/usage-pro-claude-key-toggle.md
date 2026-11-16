@@ -3,7 +3,7 @@ title: Usage Pro — переключатель биллинга Claude (под�
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 3 (claude-key on дополнительно пишет env.CLAUDE_CODE_PROMPT_CACHE_TTL="1h", off снимает оба ключа и пустой env; приёмка расширена)
+revision: 4 (стоп на живое переключение: приёмка ON только на временной копии через CLAUDE_KEY_SETTINGS — активные треды жгут кэш по тарифам API; live-проверка сводится к OFF + status)
 tags: [usage-pro, claude-code, billing]
 ---
 
@@ -34,7 +34,7 @@ tags: [usage-pro, claude-code, billing]
 - `claudeKey.status` — вход `{}`, выход `{ enabled: boolean, settingsReadable: boolean }`.
 - `claudeKey.set` — вход `{ enabled: boolean }`, выход `{ enabled: boolean }` — фактическое состояние после операции, перечитанное из файла.
 
-Переключение выполняет существующий `~/.local/bin/claude-key` (execFile, без shell): логика правки одна, резервная копия `.bak-claude-key` сохраняется. Параллельные `set` сериализуются; во время операции повторный вызов ждёт её или отклоняется — UI в это время держит disabled. Скрипт отсутствует или завершился ненулевым кодом → `set` возвращает ошибку **без stderr и stdout** (там может оказаться ключ) — в RPC-ответ и логи уходит только код отказа.
+Переключение выполняет существующий `~/.local/bin/claude-key` (execFile, без shell): логика правки одна, резервная копия `.bak-claude-key` сохраняется. Путь к settings.json настраиваемый: читается из `CLAUDE_KEY_SETTINGS` (дефолт `~/.claude/settings.json`) и пробрасывается скрипту тем же env — плагин и скрипт всегда правят один и тот же файл. В тестах и e2e подставляется временная копия файла; живой `~/.claude/settings.json` приёмкой не переключается (включение ключа заставляет активные треды переписывать кэш всего контекста по тарифам API). Параллельные `set` сериализуются; во время операции повторный вызов ждёт её или отклоняется — UI в это время держит disabled. Скрипт отсутствует или завершился ненулевым кодом → `set` возвращает ошибку **без stderr и stdout** (там может оказаться ключ) — в RPC-ответ и логи уходит только код отказа.
 
 ### UI
 
@@ -60,8 +60,9 @@ tags: [usage-pro, claude-code, billing]
 | Сценарий | Результат |
 |---|---|
 | Статус при OFF и при ON | Совпадает с `claude-key status` и содержимым settings.json |
-| Клик OFF→ON | В settings.json появляется `apiKeyHelper` **и** `env.CLAUDE_CODE_PROMPT_CACHE_TTL="1h"`, UI показывает «Ключ Console» |
-| Клик ON→OFF | Оба ключа удалены, `env.CLAUDE_CODE_PROMPT_CACHE_TTL` отсутствует (пустой `env` снят целиком); `jq -S .` результата семантически равен `settings.json.bak-20261116` (основной критерий); побайтовое равенство — дополнительно и может не выполняться при ручных правках файла |
+| Клик OFF→ON (временная копия через `CLAUDE_KEY_SETTINGS`) | В копии появляется `apiKeyHelper` **и** `env.CLAUDE_CODE_PROMPT_CACHE_TTL="1h"`, UI показывает ON-состояние |
+| Клик ON→OFF (временная копия) | Оба ключа удалены, `env.CLAUDE_CODE_PROMPT_CACHE_TTL` отсутствует (пустой `env` снят целиком); `jq -S .` результата семантически равен исходной копии |
+| Живой файл | **Только чтение:** UI показывает OFF, совпадающий с `claude-key status`; переключений на живом `settings.json` приёмка не делает |
 | Посторонние ключи settings.json | Не изменены (jq трогает только `apiKeyHelper` и `env.CLAUDE_CODE_PROMPT_CACHE_TTL`) |
 | RPC-ответы и логи | Нет значения хелпера, ключа и env-файла |
 | Финал | Состояние OFF (подписка) |

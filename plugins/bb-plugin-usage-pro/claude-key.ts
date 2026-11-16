@@ -6,7 +6,8 @@ import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-const DEFAULT_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
+const DEFAULT_SETTINGS_PATH =
+  process.env.CLAUDE_KEY_SETTINGS ?? join(homedir(), ".claude", "settings.json");
 const DEFAULT_SWITCH_SCRIPT = join(homedir(), ".local", "bin", "claude-key");
 const SWITCH_TIMEOUT_MS = 10_000;
 
@@ -33,7 +34,7 @@ export const claudeKeyContract = defineRpcContract({
 export interface ClaudeKeyDeps {
   settingsPath: string;
   switchScript: string;
-  run: (script: string, args: string[]) => Promise<void>;
+  run: (script: string, args: string[], env?: Record<string, string>) => Promise<void>;
 }
 
 export interface ClaudeKeyState {
@@ -44,8 +45,11 @@ export interface ClaudeKeyState {
 export const claudeKeyDefaults: ClaudeKeyDeps = {
   settingsPath: DEFAULT_SETTINGS_PATH,
   switchScript: DEFAULT_SWITCH_SCRIPT,
-  run: async (script, args) => {
-    await promisify(execFile)(script, args, { timeout: SWITCH_TIMEOUT_MS });
+  run: async (script, args, env) => {
+    await promisify(execFile)(script, args, {
+      timeout: SWITCH_TIMEOUT_MS,
+      env: { ...process.env, ...env },
+    });
   },
 };
 
@@ -82,7 +86,9 @@ export function createClaudeKeyHandlers(deps: ClaudeKeyDeps = claudeKeyDefaults)
       const current = await readClaudeKeyState(deps.settingsPath);
       if (current.enabled !== enabled) {
         try {
-          await deps.run(deps.switchScript, [enabled ? "on" : "off"]);
+          await deps.run(deps.switchScript, [enabled ? "on" : "off"], {
+            CLAUDE_KEY_SETTINGS: deps.settingsPath,
+          });
         } catch {
           throw new Error("claude-key switch failed");
         }

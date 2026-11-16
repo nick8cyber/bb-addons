@@ -62,6 +62,18 @@ describe("claudeKey.set", () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
+  it("forwards CLAUDE_KEY_SETTINGS to the switch script environment", async () => {
+    await writeFile(settingsPath, JSON.stringify({ theme: "dark" }));
+    let seen: Record<string, string> | undefined;
+    const run = vi.fn(async (_s: string, _a: string[], env?: Record<string, string>) => {
+      seen = env;
+      await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "/h" }));
+    });
+    const h = createClaudeKeyHandlers(deps(run));
+    await h.set({ enabled: true });
+    expect(seen?.CLAUDE_KEY_SETTINGS).toBe(settingsPath);
+  });
+
   it("does not run the script when already in desired state", async () => {
     await writeFile(settingsPath, JSON.stringify({ apiKeyHelper: "/h" }));
     const run = vi.fn(async () => {});
