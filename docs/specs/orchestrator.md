@@ -380,7 +380,7 @@ SQLite плагина, миграции только добавлением.
    - есть `thread.parentThreadId` → `executor`;
    - `origin = "app"` (новый чат из окна) → текущий выбор проекта (`pending_roles.role`); выбора нет → `orchestrator`;
    - иначе (`cli`, `plugin`, `sdk`, автоматизации) → `orchestrator`.
-   Результат — в `thread_roles(thread_id, role, decided_at, source)`, `source ∈ {hook, delegate}` (запасной критерий §3 ничего не записывает).
+   Результат — в `thread_roles(thread_id, role, decided_at, source)`, `source ∈ {hook, delegate, owner}` (где `owner` добавляется при ручной смене роли владельцем в окне треда по §25; запасной критерий §3 ничего не записывает).
    **Хук fail-closed по SDK:** исключение или ответ дольше 10 с не дают сообщению уйти, а хуки выполняются под общей блокировкой сервера. Поэтому весь обработчик — в `try/catch` с ответом «пропустить» при любой ошибке, внутри только синхронный SQLite плагина: без CLI, сети и `await`. Тесты: исключение внутри → «пропустить»; время обработчика в тестах < 50 мс.
 3. **`configure` только читает `thread_roles`;** нет строки — запасной критерий §3. Тест на порядок «хук раньше первого `configure`» — в PLUG-141, живая проверка — в приёмке §8 п.6.
 4. **`pluginMetadata.role`** пишется после решения — только для показа и других плагинов. Источник правды — `thread_roles`: метаданные плагина может переписать сам агент треда.
@@ -400,7 +400,7 @@ SQLite плагина, миграции только добавлением.
 bb orchestrator merge <KEY|delegationId> [--into <ветка>] [--no-autofix] [--dry-run] [--json]
 ```
 
-Вливает итог захода (§4.1) в рабочую копию координатора. Вызывает только координатор этого делегирования (тред вызова = `coordinator_thread_id`); рабочая копия — среда треда координатора. `<KEY>` — последнее `done`-делегирование задачи с `result_sha`.
+Вливает итог захода (§4.1) в рабочую копию вызывающего треда. Вызывать может любой тред с ролью orchestrator (§25 п.3), не обязательно автор раздачи; рабочая копия — среда вызывающего треда. `<KEY>` — последнее `done`-делегирование задачи с `result_sha`.
 
 Проверки до вливания (каждая — отказ с кодом и подсказкой):
 0. (r28.1) Делегирование без кода (`no_code`) без коммитов (`result_commits` 0 или NULL) — отказ `nothing-to-merge` «задача без кода: вливать нечего»; проверяется раньше проверки итога (`no-result`).
@@ -781,7 +781,7 @@ SDK: часть нужного (`environment: {type: "reuse", environmentId}`, �
 
 **Понижение роли.** `bb orchestrator role set <threadId> none` — только понижение до `none` (повысить роль из CLI или агентом нельзя: это путь GH-672 в обход окна; любую смену роли владелец делает переключателем в окне треда, §25). Отказ, если тред участвует в любом активном делегировании или помощнике — как исполнитель (`delegations.thread_id`, `helpers.thread_id`), как координатор (`delegations.coordinator_thread_id`, `helpers.coordinator_thread_id`) или как вызвавший (`helpers.caller_thread_id`). Запись — `thread_roles` (`source = delegate`) и событие `role.manual` в таблице событий §18.5 (кто, когда, какая роль была) — так ручная запись отличима от записи раздачи.
 
-**Таблица `helpers`:** `id`, `caller_thread_id`, `caller_delegation_id` (если вызвавший — исполнитель делегирования), `coordinator_thread_id` (координатор вызвавшего, иначе = вызвавший), `thread_id`, `project_id`, `preset`, `route`, `level`, `title`, `status` (`dispatching`|`running`|`done`|`failed`|`stalled`|`quota`|`cancelled`), `resume_count`, `turn_started_at`, `last_seq`, `notified_at`, `created_at`, `updated_at`. Индексы: `thread_id`, `(caller_thread_id, status)`, `caller_delegation_id`. `thread_roles.source` — без изменений (миграции только добавлением).
+**Таблица `helpers`:** `id`, `caller_thread_id`, `caller_delegation_id` (если вызвавший — исполнитель делегирования), `coordinator_thread_id` (координатор вызвавшего, иначе = вызвавший), `thread_id`, `project_id`, `preset`, `route`, `level`, `title`, `status` (`dispatching`|`running`|`done`|`failed`|`stalled`|`quota`|`cancelled`), `resume_count`, `turn_started_at`, `last_seq`, `notified_at`, `created_at`, `updated_at`. Индексы: `thread_id`, `(caller_thread_id, status)`, `caller_delegation_id`. `thread_roles.source`: по §25 п.2 таблица пересоздаётся миграцией, и CHECK расширяется значением 'owner' (`source ∈ {hook, delegate, owner}`).
 
 **Настройки:** `helpers.maxActive` (3), `helpers.defaultLevel` (`simple`), `defaultRole` (`executor`). Неизвестный уровень или роль → `needs-configuration`.
 
