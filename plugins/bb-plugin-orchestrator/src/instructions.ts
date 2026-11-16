@@ -49,7 +49,11 @@ function levelLine(
       ? t("instr.tagReleasePipeline")
       : levelRole(policy, name) === "auditor"
         ? t("instr.tagAuditor")
-        : "";
+        : // §21.1 (r33): a researcher-role level — internet search,
+          // no project work.
+          levelRole(policy, name) === "researcher"
+          ? t("instr.tagResearcher")
+          : "";
   return `- ${cleanName}${desc ? ` — ${desc}` : ""}${tag}`;
 }
 

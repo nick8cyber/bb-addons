@@ -74,3 +74,13 @@ export const LEAK_PERSONAL_EMAIL = syntheticEmail("gmail.com");
  * inside this fixture file only; anywhere else it is a category-1
  * `github-token` finding. */
 export const LEAK_GHP_SECRET = synthetic("ghp_", 36);
+
+/** §20.2 (PLUG-269): token-shaped samples for the tool-less packet
+ * tests — `synthetic` keeps each exempt inside this allow-listed
+ * file; the same value anywhere else is a category-1 `github-token`
+ * finding. */
+export const LEAK_GH_TOKEN = synthetic("ghp_", 12);
+export const LEAK_GH_TOKEN_2 = synthetic("ghp_", 18);
+/** The packet tests' mask pattern over the sample shape — a regex,
+ * not a secret value. */
+export const GH_TOKEN_RE = /ghp_[A-Za-z0-9]+/g;

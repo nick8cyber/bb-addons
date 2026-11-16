@@ -103,6 +103,8 @@ import {
   type ReleaseConfigLoad,
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
+import { maskLeakText } from "./src/scan.js";
+import { hostname as osHostname } from "node:os";
 import { createCommandRunner } from "./src/commands.js";
 import {
   effectiveHooks,
@@ -142,7 +144,7 @@ export const rpcContract = defineRpcContract({
   setPendingRole: {
     input: z.object({
       projectId: z.string().nullable(),
-      role: z.enum(["none", "orchestrator", "executor", "auditor"]),
+      role: z.enum(["none", "orchestrator", "executor", "auditor", "researcher"]),
     }),
     output: z.object({ ok: z.literal(true) }),
   },
@@ -150,7 +152,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().nullable() }),
     output: z.object({
       role: z
-        .enum(["none", "orchestrator", "executor", "auditor"])
+        .enum(["none", "orchestrator", "executor", "auditor", "researcher"])
         .nullable(),
     }),
   },
@@ -744,7 +746,7 @@ export async function createPlugin(
       reviewLevel: reviewLevelName(policyLoad.policy),
     };
     const extra =
-      id === "release-auditor" || id === "helper"
+      id === "release-auditor" || id === "helper" || id === "researcher"
         ? undefined
         : roleTextsLoad.texts[id];
     const text = roleInstructions(id, { extra, ...opts, t });
@@ -1107,11 +1109,37 @@ export async function createPlugin(
   for (const e of helpersLoad.errors) {
     bb.log.warn(`orchestrator helpers: ${e.path}: ${e.message}`);
   }
+  /** §20.2 (r33): the release scanner as the packet's outbound mask —
+   * built-in rules plus the project's `leaks` (`allow` relaxes
+   * categories 3–4 inside its paths — `ctx.file` names the block's
+   * source), `threadIds` and `allowedEmails`. Shared by the delegate
+   * dispatch and the helper spawn on a `tools: false` route. */
+  const packetMask = (
+    text: string,
+    ctx: { projectId?: string | null; file?: string },
+  ) => {
+    let proj: ReturnType<typeof resolveProject> | null = null;
+    if (releaseConfig.config && ctx.projectId) {
+      try {
+        proj = resolveProject(releaseConfig.config, ctx.projectId);
+      } catch {
+        proj = null;
+      }
+    }
+    return maskLeakText(text, {
+      hostname: osHostname(),
+      threadIds: proj?.threadIds,
+      allowedEmails: proj?.allowedEmails,
+      allow: proj?.leaks.allow,
+      file: ctx.file,
+    });
+  };
   const helperDeps = {
     store,
     threads: helperThreads,
     enqueue,
     loadPolicy: () => loadPolicy(true),
+    packetMask,
     helpers: (): HelpersSettings => helpersLoad.config,
     callerFacts: helperCallerFacts,
     // §19.1: the route's preset resolves into the spawn's provider/model
@@ -1309,6 +1337,33 @@ export async function createPlugin(
         effectiveGitInstructions(currentSettings.gitInstructions, t),
     policy: () => policyLoad.policy,
     t,
+    // §20.2 (r33): the tool-less packet seams — the clock, the
+    // unavailable-route set, the repo path (the checked env's copy),
+    // git itself, and the §4 leak scanner as the outbound mask.
+    now: () => Date.now(),
+    unavailableRoutes: () => new Set(policyLoad.unavailableRoutes),
+    repoPath: async (row: DelegationRow) => {
+      const envId =
+        row.result_env_id ??
+        (await bb.sdk.threads
+          .get({ threadId: row.coordinator_thread_id })
+          .then((th) => th.environmentId ?? undefined)
+          .catch(() => undefined));
+      if (!envId) return null;
+      try {
+        return (await environmentFacts(envId)).path ?? null;
+      } catch {
+        return null;
+      }
+    },
+    packetGit: async (repo: string, args: string[]) => {
+      const res = await cmd.run("git", ["-C", repo, ...args]);
+      if (res.exitCode !== 0) {
+        throw new Error(res.stderr || res.stdout || `git ${args[0]} failed`);
+      }
+      return res.stdout;
+    },
+    packetMask,
   };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),
@@ -1830,6 +1885,10 @@ export async function createPlugin(
         .boolean()
         .optional()
         .describe(t("cli.noCodeDescribe")),
+      attach: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(t("tool.delAttach")),
     }),
     async execute(params, ctx) {
       try {
@@ -2149,7 +2208,7 @@ export async function createPlugin(
         name: "delegate",
         summary: t("cli.helpDelegateS"),
         usage:
-          "bb orchestrator delegate <KEY> --level <level> [--route <route>|--preset <preset>] [--instructions <text>] [--from <sha|branch>] [--fresh] [--no-code] [--json]",
+          "bb orchestrator delegate <KEY> --level <level> [--route <route>|--preset <preset>] [--instructions <text>] [--from <sha|branch>] [--attach <path>]… [--fresh] [--no-code] [--json]",
       },
       {
         name: "status",
@@ -2221,6 +2280,11 @@ export async function createPlugin(
         const i = argv.indexOf(name);
         return i >= 0 ? argv[i + 1] : undefined;
       };
+      // §20.2 (r33): `--attach` is repeatable — collect every value.
+      const flags = (name: string): string[] =>
+        argv.flatMap((a, i) =>
+          a === name && argv[i + 1] !== undefined ? [argv[i + 1]!] : [],
+        );
       const positional = argv.filter(
         (a, i) => !a.startsWith("--") && argv[i - 1] !== "--level" &&
           argv[i - 1] !== "--route" && argv[i - 1] !== "--preset" &&
@@ -2229,6 +2293,7 @@ export async function createPlugin(
           argv[i - 1] !== "--into" && argv[i - 1] !== "--no-docs" &&
           argv[i - 1] !== "--kb" && argv[i - 1] !== "--no-kb" &&
           argv[i - 1] !== "--prompt" && argv[i - 1] !== "--prompt-file" &&
+          argv[i - 1] !== "--attach" &&
           argv[i - 1] !== "--title",
       );
       const cmd = positional[0];
@@ -2317,6 +2382,7 @@ export async function createPlugin(
               t("cli.delegateUsage"),
             );
           }
+          const attach = flags("--attach");
           const res = await delegate({
             taskKey,
             level,
@@ -2326,6 +2392,7 @@ export async function createPlugin(
             from: flag("--from"),
             fresh: argv.includes("--fresh"),
             noCode: argv.includes("--no-code"),
+            ...(attach.length ? { attach } : {}),
             threadId: ctx.threadId,
           });
           return json

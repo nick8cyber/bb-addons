@@ -58,6 +58,7 @@ export type RoleId =
   | "executor"
   | "auditor"
   | "release-auditor"
+  | "researcher"
   | "helper";
 
 export const ROLE_IDS: readonly RoleId[] = [
@@ -65,6 +66,7 @@ export const ROLE_IDS: readonly RoleId[] = [
   "executor",
   "auditor",
   "release-auditor",
+  "researcher",
   "helper",
 ];
 
@@ -84,6 +86,9 @@ export const PICKABLE_ROLE_IDS = [
 export const WINDOW_ROLE_IDS = [
   "none",
   ...PICKABLE_ROLE_IDS,
+  // §21.1 (r33): researcher is a real window pick — a chat that only
+  // searches the internet without touching the project.
+  "researcher",
 ] as const;
 
 export const DEFAULT_ROLE: RoleId = "orchestrator";
@@ -110,6 +115,7 @@ const ROLE_BODY_KEYS: Record<RoleId, string> = {
   executor: "role.body.executor",
   auditor: "role.body.auditor",
   "release-auditor": "role.body.releaseAuditor",
+  researcher: "role.body.researcher",
   helper: "role.body.helper",
 };
 
@@ -319,6 +325,15 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
     tools: [],
     skills: [],
   },
+  // §21.1 (r33): researchers gather internet facts — no plugin tools,
+  // no skills, no JSON verdict (ordinary turn completion is enough).
+  researcher: {
+    id: "researcher",
+    delegates: false,
+    instructions: roleInstructions("researcher"),
+    tools: [],
+    skills: [],
+  },
   // §19.1-19.2: helpers are created by the plugin only — no tools, no
   // skills, never in the role window.
   helper: {
@@ -348,7 +363,11 @@ export const roleForLevel = (
     ? "release-auditor"
     : levelRole(policy, level) === "auditor"
       ? "auditor"
-      : "executor";
+      : // §21.2: a `research` level's dispatches are researchers — no
+        // reviewByLevel entry decides this, the level's role does.
+        levelRole(policy, level) === "researcher"
+        ? "researcher"
+        : "executor";
 
 /** §19.1: helper spawns carry `helper#<id> · <title>` from birth. */
 const HELPER_TITLE_RE = /^helper#(\d+) · /;
@@ -410,7 +429,10 @@ export interface RoleDecisionProbes {
   /** §19.1: a `helper#<id>` spawn title is verified against the helpers
    * table before the helper role is written (a faked title alone does
    * not get it). */
-  helperById?(id: number): { status: string } | undefined;
+  helperById?(id: number): {
+    status: string;
+    level?: string | null;
+  } | undefined;
   /** §19.5: manual children of role threads pass only for the operator
    * allowlist of `originPluginId`s (the `allowForeignChildren`
    * setting). Absent probe / no match = refused. */
@@ -464,8 +486,16 @@ export function decideRole(
     facts.originPluginId === "orchestrator"
   ) {
     const helperId = helperIdFromTitle(facts.title);
-    if (helperId !== null && probes.helperById?.(helperId)) {
-      return "helper";
+    if (helperId !== null) {
+      const helper = probes.helperById?.(helperId);
+      if (helper) {
+        // §21.2: a helper on a researcher-role level is a researcher —
+        // internet research without project tools.
+        return levelRole(probes.policy?.(), helper.level ?? "") ===
+          "researcher"
+          ? "researcher"
+          : "helper";
+      }
     }
     const key = taskKeyFromTitle(facts.title);
     const row = key ? probes.activeDelegationByTaskKey(key) : undefined;
