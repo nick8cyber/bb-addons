@@ -205,6 +205,33 @@ describe("live-ws (§4, §9)", () => {
     expect(sock.frames().at(-1)).toMatchObject({ type: "final", engine: "silence", text: "" });
   });
 
+  it("interim activity + low-RMS PCM → not silence, normal finish (§4.4 расширение)", async () => {
+    const { tokens, sessions, fallbackCalls, deps } = makeDeps();
+    const { handler, sock } = connect(deps);
+    await hello(deps, handler, sock, tokens.issue());
+    sessions[0].callbacks.onSetupComplete();
+    await handler.onMessage?.(sock, new Uint8Array(pcm(0))); // тихий микрофон: RMS < порога
+    sessions[0].callbacks.onInterim("раз два"); // Gemini речь слышит (тихий сигнал)
+    const endSpy = vi.spyOn(sessions[0], "end");
+    await handler.onMessage?.(sock, JSON.stringify({ type: "end" }));
+    expect(endSpy).toHaveBeenCalled(); // сессию спросили, а не отрезали как «тишину»
+    expect(fallbackCalls).toHaveLength(0);
+    expect(sock.frames().at(-1)).toMatchObject({ type: "final", text: "текст", engine: "gemini-live" });
+  });
+
+  it("session activity + low-RMS + empty transcript → fallback (случай §4.4б)", async () => {
+    const { tokens, sessions, fallbackCalls, deps } = makeDeps();
+    const { handler, sock } = connect(deps);
+    await hello(deps, handler, sock, tokens.issue());
+    sessions[0].callbacks.onSetupComplete();
+    await handler.onMessage?.(sock, new Uint8Array(pcm(0)));
+    sessions[0].callbacks.onInterim("раз два");
+    sessions[0].endResult = "";
+    await handler.onMessage?.(sock, JSON.stringify({ type: "end" }));
+    expect(fallbackCalls).toHaveLength(1);
+    expect(sock.frames().at(-1)).toMatchObject({ type: "final", text: "фоллбэк", engine: "codex", degraded: true });
+  });
+
   it("empty transcript with real audio → fallback → final degraded", async () => {
     const { tokens, sessions, fallbackCalls, deps } = makeDeps();
     const { handler, sock } = connect(deps);

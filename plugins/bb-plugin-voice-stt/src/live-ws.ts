@@ -97,6 +97,8 @@ interface ConnState {
   config: LiveVoiceConfig | null;
   keyIndex: number;
   ready: boolean;
+  /** Сессия прислала хоть один кадр транскрипт-активности (§4.4 расширение). */
+  hadSessionActivity: boolean;
   /** Время hello — для диагностики длительности в логе. */
   startedAt: number;
   finishing: boolean;
@@ -135,6 +137,7 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
       config: null,
       keyIndex: 0,
       ready: false,
+      hadSessionActivity: false,
       startedAt: 0,
       finishing: false,
       torn: false,
@@ -182,7 +185,12 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
         model: config.geminiLiveModel,
         language: config.language,
         vocabulary: config.vocabulary,
-        onInterim: (text) => send({ type: "interim", text }),
+        onInterim: (text) => {
+          // Активность Gemini (интерим/финал/VAD) — вердикт «тишина» по RMS
+          // запрещён §4.4 расширение: тихие микрофоны ниже порога, но речь шла.
+          state.hadSessionActivity = true;
+          send({ type: "interim", text });
+        },
         onSetupComplete: () => {
           state.ready = true;
           send({ type: "ready" });
@@ -220,7 +228,9 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
       if (state.finishing || state.torn) return;
       state.finishing = true;
       const pcm = Buffer.concat(state.pcm);
-      const silent = pcm.byteLength === 0 || pcmRms(pcm) < SILENCE_RMS_INT16;
+      const silent =
+        !state.hadSessionActivity &&
+        (pcm.byteLength === 0 || pcmRms(pcm) < SILENCE_RMS_INT16);
       const endSession = async (): Promise<string | null> => {
         const session = state.session;
         if (session === null) return null;
