@@ -203,14 +203,105 @@ test("3. git: запрещённые подкоманды — отказ без 
   assert.equal(count.trim(), "1");
 });
 
-test("3. git: опции записи (--output, --exec) отклоняются", () => {
+test("3. git: опции записи (--output, --exec, --contents) и пути вне cwd отклоняются", () => {
   const repo = mkGitRepo();
-  const r = executeTool(
+  // 1. --output
+  const rOutput = executeTool(
     { name: "git", args: { args: "diff --output=/tmp/x HEAD" }, attrs: [["args", "diff --output=/tmp/x HEAD"]] },
     { cwd: repo },
   );
-  assert.equal(r.ok, false);
-  assert.match(r.output, /git option not allowed/);
+  assert.equal(rOutput.ok, false);
+  assert.match(rOutput.output, /git option not allowed/);
+
+  // 2. --contents в git blame (Finding 1)
+  const rContents = executeTool(
+    {
+      name: "git",
+      args: { args: "blame --contents /etc/passwd -- tracked.txt" },
+      attrs: [["args", "blame --contents /etc/passwd -- tracked.txt"]],
+    },
+    { cwd: repo },
+  );
+  assert.equal(rContents.ok, false);
+  assert.doesNotMatch(rContents.output, /root:x:0:0/);
+
+  // 3. --contents=... форма
+  const rContentsEq = executeTool(
+    {
+      name: "git",
+      args: { args: "blame --contents=/etc/passwd -- tracked.txt" },
+      attrs: [["args", "blame --contents=/etc/passwd -- tracked.txt"]],
+    },
+    { cwd: repo },
+  );
+  assert.equal(rContentsEq.ok, false);
+
+  // 4. Абсолютный путь вне cwd
+  const rAbs = executeTool(
+    { name: "git", args: { args: "blame /etc/passwd" }, attrs: [["args", "blame /etc/passwd"]] },
+    { cwd: repo },
+  );
+  assert.equal(rAbs.ok, false);
+  assert.match(rAbs.output, /access denied: path outside cwd/);
+
+  // 5. .. путь вне cwd
+  const rDotDot = executeTool(
+    { name: "git", args: { args: "blame ../other.txt" }, attrs: [["args", "blame ../other.txt"]] },
+    { cwd: repo },
+  );
+  assert.equal(rDotDot.ok, false);
+  assert.match(rDotDot.output, /access denied: path outside cwd/);
+});
+
+test("3. git: patch-вывод show/log -p/diff фильтрует hunks конфиденциальных файлов (Finding 2)", () => {
+  const repo = mkGitRepo();
+  const git = (args) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  fs.writeFileSync(path.join(repo, "code.js"), "console.log('safe code');\n");
+  fs.writeFileSync(path.join(repo, ".env"), "DB_PASS=hunter2_secret_pwd_999\n");
+  fs.mkdirSync(path.join(repo, "secrets"));
+  fs.writeFileSync(path.join(repo, "secrets", "key.pem"), "RSAKEY=rsa_super_secret_key_888\n");
+  fs.writeFileSync(path.join(repo, "id_rsa"), "SSHKEY=ssh_secret_value_777\n");
+  git(["add", "code.js", ".env", "secrets/key.pem", "id_rsa"]);
+  git(["commit", "-q", "-m", "commit with secrets and safe code"]);
+  const headSha = git(["rev-parse", "HEAD"]).trim();
+
+  // 1. git log -p без pathspec
+  const rLog = executeTool(
+    { name: "git", args: { args: "log -p -n 1" }, attrs: [["args", "log -p -n 1"]] },
+    { cwd: repo },
+  );
+  assert.equal(rLog.ok, true);
+  assert.match(rLog.output, /commit with secrets and safe code/);
+  assert.match(rLog.output, /safe code/);
+  assert.doesNotMatch(rLog.output, /hunter2_secret_pwd/);
+  assert.doesNotMatch(rLog.output, /rsa_super_secret_key/);
+  assert.doesNotMatch(rLog.output, /ssh_secret_value/);
+  assert.doesNotMatch(rLog.output, /\+\+\+ b\/\.env/);
+  assert.doesNotMatch(rLog.output, /\+\+\+ b\/id_rsa/);
+  assert.doesNotMatch(rLog.output, /\+\+\+ b\/secrets\/key\.pem/);
+
+  // 2. git show <sha>
+  const rShow = executeTool(
+    { name: "git", args: { args: `show ${headSha}` }, attrs: [["args", `show ${headSha}`]] },
+    { cwd: repo },
+  );
+  assert.equal(rShow.ok, true);
+  assert.match(rShow.output, /safe code/);
+  assert.doesNotMatch(rShow.output, /hunter2_secret_pwd/);
+  assert.doesNotMatch(rShow.output, /rsa_super_secret_key/);
+  assert.doesNotMatch(rShow.output, /ssh_secret_value/);
+
+  // 3. git diff HEAD~1 HEAD
+  const rDiff = executeTool(
+    { name: "git", args: { args: "diff HEAD~1 HEAD" }, attrs: [["args", "diff HEAD~1 HEAD"]] },
+    { cwd: repo },
+  );
+  assert.equal(rDiff.ok, true);
+  assert.match(rDiff.output, /safe code/);
+  assert.doesNotMatch(rDiff.output, /hunter2_secret_pwd/);
+  assert.doesNotMatch(rDiff.output, /rsa_super_secret_key/);
+  assert.doesNotMatch(rDiff.output, /ssh_secret_value/);
 });
 
 test("3. git: пути к чувствительным файлам отклоняются с SENSITIVE_DENIED", () => {
@@ -295,6 +386,66 @@ test("4. isSensitivePath и read_file: .env, .env.prod, secrets/key.pem — от
   );
   assert.equal(g.ok, false);
   assert.match(g.output, /access denied to sensitive file/);
+});
+
+test("4. isSensitivePath и git: glob-паттерны (.e*, id_?sa, *.ke?, [.]env, sec?ets/*) отклоняются (Finding 3)", () => {
+  const repo = mkGitRepo();
+  const git = (args) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  fs.writeFileSync(path.join(repo, ".env"), "DB_PASS=hunter2_glob_bypass_fail\n");
+  fs.writeFileSync(path.join(repo, "id_rsa"), "RSAKEY=rsa_glob_bypass_fail\n");
+  fs.writeFileSync(path.join(repo, "app.key"), "KEY=app_key_glob_fail\n");
+  fs.mkdirSync(path.join(repo, "secrets"));
+  fs.writeFileSync(path.join(repo, "secrets", "pass.txt"), "SECRET=secrets_glob_fail\n");
+  git(["add", ".env", "id_rsa", "app.key", "secrets/pass.txt"]);
+  git(["commit", "-q", "-m", "add secrets for glob test"]);
+
+  const patterns = [".e*", "id_?sa", "*.ke?", "[.]env", "sec?ets/*", "*.pe?", "id_*"];
+  for (const pat of patterns) {
+    assert.equal(isSensitivePath(pat), true, `isSensitivePath(${pat}) should be true`);
+  }
+
+  // 1. git log -p -- .e*
+  const rEnv = executeTool(
+    { name: "git", args: { args: "log -p -- .e*" }, attrs: [["args", "log -p -- .e*"]] },
+    { cwd: repo },
+  );
+  assert.equal(rEnv.ok, false);
+  assert.match(rEnv.output, /access denied to sensitive file/);
+  assert.doesNotMatch(rEnv.output, /hunter2_glob_bypass/);
+
+  // 2. git log -p -- id_?sa
+  const rId = executeTool(
+    { name: "git", args: { args: "log -p -- id_?sa" }, attrs: [["args", "log -p -- id_?sa"]] },
+    { cwd: repo },
+  );
+  assert.equal(rId.ok, false);
+  assert.match(rId.output, /access denied to sensitive file/);
+  assert.doesNotMatch(rId.output, /rsa_glob_bypass/);
+
+  // 3. git log -p -- *.ke?
+  const rKey = executeTool(
+    { name: "git", args: { args: "log -p -- *.ke?" }, attrs: [["args", "log -p -- *.ke?"]] },
+    { cwd: repo },
+  );
+  assert.equal(rKey.ok, false);
+  assert.match(rKey.output, /access denied to sensitive file/);
+
+  // 4. git log -p -- [.]env
+  const rDot = executeTool(
+    { name: "git", args: { args: "log -p -- [.]env" }, attrs: [["args", "log -p -- [.]env"]] },
+    { cwd: repo },
+  );
+  assert.equal(rDot.ok, false);
+  assert.match(rDot.output, /access denied to sensitive file/);
+
+  // 5. git log -p -- sec?ets/*
+  const rSec = executeTool(
+    { name: "git", args: { args: "log -p -- sec?ets/*" }, attrs: [["args", "log -p -- sec?ets/*"]] },
+    { cwd: repo },
+  );
+  assert.equal(rSec.ok, false);
+  assert.match(rSec.output, /access denied to sensitive file/);
 });
 
 test("4. grep fallback git grep: чувствительные файлы исключаются из выдачи", () => {
@@ -585,6 +736,25 @@ test("7. packFirstMessage: дифф и статус вкладываются в 
   assert.match(r.message, /=== git status --short ===/);
   assert.match(r.message, /=== git diff HEAD ===/);
   assert.match(r.message, /changed/);
+});
+
+test("7. packFirstMessage: авто-дифф HEAD и статус исключают конфиденциальные файлы (Finding 4)", () => {
+  const repo = mkGitRepo();
+  const git = (args) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  fs.writeFileSync(path.join(repo, ".env"), "DB_PASS=hunter2_first_msg_leak_fail\n");
+  git(["add", ".env"]);
+  git(["commit", "-q", "-m", "track .env"]);
+
+  // Изменяем tracked.txt и .env
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "line1\nline2\npublic_changed_content\n");
+  fs.writeFileSync(path.join(repo, ".env"), "DB_PASS=hunter2_modified_leak_fail\n");
+
+  const r = packFirstMessage({ text: "ревью изменений в репозитории", cwd: repo });
+  assert.match(r.message, /=== git diff HEAD ===/);
+  assert.match(r.message, /public_changed_content/);
+  assert.doesNotMatch(r.message, /hunter2_/);
+  assert.doesNotMatch(r.message, /\.env/);
 });
 
 test("7. packFirstMessage: переполнение — подсказка «Можно запросить инструментом:»", () => {

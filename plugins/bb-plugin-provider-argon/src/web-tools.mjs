@@ -106,6 +106,35 @@ export function maskForWeb(text) {
 export const SENSITIVE_DENIED =
   "access denied to sensitive file (.env*, secrets/, *.pem, *.key)";
 
+function globToRegex(glob) {
+  let reStr = "^";
+  let inGroup = false;
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      reStr += ".*";
+    } else if (c === "?") {
+      reStr += ".";
+    } else if (c === "[") {
+      inGroup = true;
+      reStr += "[";
+    } else if (c === "]" && inGroup) {
+      inGroup = false;
+      reStr += "]";
+    } else if (inGroup) {
+      reStr += c;
+    } else {
+      reStr += c.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+    }
+  }
+  reStr += "$";
+  try {
+    return new RegExp(reStr, "i");
+  } catch {
+    return null;
+  }
+}
+
 export function isSensitivePath(rel) {
   let norm = String(rel ?? "").replace(/\\/g, "/").trim();
   if (!norm) return false;
@@ -131,13 +160,52 @@ export function isSensitivePath(rel) {
   norm = norm.replace(/^["']|["']$/g, "");
   const segs = norm.split("/").filter((s) => s && s !== "." && s !== "**");
   if (!segs.length) return false;
-  if (segs.some((s) => s.toLowerCase() === "secrets" || /^\*?secrets\*?$/i.test(s))) return true;
+
+  // 1. Проверка директории secrets (включая шаблоны glob)
+  for (const s of segs) {
+    const sLower = s.toLowerCase();
+    if (sLower === "secrets" || /^\*?secrets\*?$/i.test(s)) return true;
+    if (/[*?\[]/.test(s)) {
+      if ((sLower.includes("sec") || sLower.includes("cret")) && globToRegex(s)?.test("secrets")) {
+        return true;
+      }
+    }
+  }
+
   const base = segs[segs.length - 1] || "";
-  return (
+
+  // 2. Литеральные префиксы/суффиксы
+  if (
     /^\.env/i.test(base) ||
     /\.(pem|key)(?:\*|$)/i.test(base) ||
     /^id_(?:rsa|ed25519|\*)/i.test(base)
-  );
+  ) {
+    return true;
+  }
+
+  // 3. Шаблоны glob, покрывающие .env*, secrets/**, *.pem, *.key, id_*
+  if (/[*?\[]/.test(base)) {
+    if (
+      (base.startsWith(".") || base.includes("env") || base.startsWith("[.]") || base.startsWith("?") || base.startsWith("*.")) &&
+      (globToRegex(base)?.test(".env") || globToRegex(base)?.test(".env.local"))
+    ) {
+      return true;
+    }
+    if (
+      (base.includes(".pe") || base.includes(".ke") || /\.(?:pem|key)/i.test(base) || base.endsWith("?") || base.endsWith("]")) &&
+      (globToRegex(base)?.test("a.pem") || globToRegex(base)?.test("a.key"))
+    ) {
+      return true;
+    }
+    if (
+      /^id[_\?*\[]/i.test(base) &&
+      (globToRegex(base)?.test("id_rsa") || globToRegex(base)?.test("id_ed25519"))
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /* ---------- §4: песочница cwd ---------- */
@@ -255,7 +323,8 @@ const lineNo = (v) => {
 
 /* ---------- §4: инструменты ---------- */
 const GIT_WHITELIST = new Set(["show", "diff", "log", "blame", "ls-files", "status"]);
-const GIT_DENIED_OPT_RE = /^--output\b|^--exec\b|^--ext-diff\b|^-O\S*/;
+const GIT_DENIED_OPT_RE =
+  /^--output\b|^--exec\b|^--ext-diff\b|^--contents\b|^--work-tree\b|^--git-dir\b|^-O\S*/;
 
 function splitArgs(s) {
   const out = [];
@@ -442,7 +511,14 @@ export function extractGitPaths(argv) {
       }
       continue;
     }
-    if (token.startsWith("-")) continue;
+    if (token.startsWith("-")) {
+      const eqIdx = token.indexOf("=");
+      if (eqIdx !== -1) {
+        const val = token.slice(eqIdx + 1).replace(/^["']|["']$/g, "");
+        if (val) paths.push(val);
+      }
+      continue;
+    }
 
     const colonIdx = token.indexOf(":");
     if (colonIdx !== -1) {
@@ -463,6 +539,166 @@ export function extractGitPaths(argv) {
   return paths;
 }
 
+function extractPathsFromDiffLine(line) {
+  const paths = [];
+  if (line.startsWith("diff --git ")) {
+    const rest = line.slice("diff --git ".length).trim();
+    const m = rest.match(/^(?:"a\/(.*?)"|a\/(.*?))\s+(?:"b\/(.*?)"|b\/(.*?))$/);
+    if (m) {
+      const p1 = m[1] ?? m[2];
+      const p2 = m[3] ?? m[4];
+      if (p1 && p1 !== "/dev/null") paths.push(p1);
+      if (p2 && p2 !== "/dev/null") paths.push(p2);
+    } else {
+      const parts = rest.split(/\s+/);
+      for (const pt of parts) {
+        const clean = pt.replace(/^["']|["']$/g, "");
+        if (clean.startsWith("a/") || clean.startsWith("b/")) {
+          paths.push(clean.slice(2));
+        }
+      }
+    }
+  } else if (line.startsWith("diff --cc ") || line.startsWith("diff --combined ")) {
+    let p = line.replace(/^diff --(?:cc|combined)\s+/, "").trim();
+    if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1);
+    if (p) paths.push(p);
+  }
+  return paths;
+}
+
+function extractPathFromHeader(line) {
+  if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+    let p = line.slice(4).trim();
+    if (p === "/dev/null") return null;
+    if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1);
+    if (p.startsWith("a/") || p.startsWith("b/")) p = p.slice(2);
+    return p;
+  }
+  if (/^(?:rename|copy) (?:from|to) /.test(line)) {
+    let p = line.replace(/^(?:rename|copy) (?:from|to)\s+/, "").trim();
+    if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1);
+    return p;
+  }
+  return null;
+}
+
+function extractPathFromStatLine(line) {
+  const m = line.match(/^\s*(\S.*?)\s+\|\s+(?:\d+|Bin\b)/);
+  if (m) {
+    let p = m[1].trim();
+    if (p.startsWith('"') && p.endsWith('"')) p = p.slice(1, -1);
+    const arrowIdx = p.indexOf("=>");
+    if (arrowIdx !== -1) {
+      const parts = p.replace(/[{}]/g, "").split("=>").map((s) => s.trim());
+      for (const part of parts) {
+        if (isSensitivePath(part)) return part;
+      }
+      return parts.pop();
+    }
+    return p;
+  }
+  return null;
+}
+
+export function filterGitPatchOutput(stdout) {
+  if (!stdout) return "";
+  const lines = String(stdout).replace(/\r\n/g, "\n").split("\n");
+  const result = [];
+  let currentBlock = null;
+
+  function flushBlock() {
+    if (!currentBlock) return;
+    if (!currentBlock.sensitive) {
+      result.push(...currentBlock.lines);
+    }
+    currentBlock = null;
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (
+      line.startsWith("diff --git ") ||
+      line.startsWith("diff --cc ") ||
+      line.startsWith("diff --combined ")
+    ) {
+      flushBlock();
+      currentBlock = {
+        lines: [line],
+        sensitive: false,
+      };
+      const paths = extractPathsFromDiffLine(line);
+      if (paths.some((p) => isSensitivePath(p))) {
+        currentBlock.sensitive = true;
+      }
+      continue;
+    }
+
+    if (/^commit [0-9a-f]{7,}/i.test(line)) {
+      flushBlock();
+      result.push(line);
+      continue;
+    }
+
+    if (currentBlock) {
+      currentBlock.lines.push(line);
+      if (!currentBlock.sensitive) {
+        const p = extractPathFromHeader(line);
+        if (p && isSensitivePath(p)) {
+          currentBlock.sensitive = true;
+        }
+      }
+    } else {
+      const statPath = extractPathFromStatLine(line);
+      if (statPath && isSensitivePath(statPath)) {
+        continue;
+      }
+      result.push(line);
+    }
+  }
+
+  flushBlock();
+  return result.join("\n");
+}
+
+export function filterGitStatusOutput(stdout) {
+  if (!stdout) return "";
+  const lines = String(stdout).replace(/\r\n/g, "\n").split("\n");
+  const filtered = [];
+  for (const line of lines) {
+    if (!line) continue;
+    if (line.length < 4) {
+      filtered.push(line);
+      continue;
+    }
+    let p = line.slice(3).trim();
+    if (p.includes(" -> ")) {
+      const parts = p.split(" -> ");
+      const p1 = parts[0].trim().replace(/^["']|["']$/g, "");
+      const p2 = parts[1].trim().replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p1) || isSensitivePath(p2)) continue;
+    } else {
+      p = p.replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p)) continue;
+    }
+    filtered.push(line);
+  }
+  return filtered.join("\n");
+}
+
+function isExcludePathspec(p) {
+  const s = String(p ?? "").trim().replace(/^["']|["']$/g, "");
+  if (s.startsWith(":!") || s.startsWith(":^")) return true;
+  if (s.startsWith(":(")) {
+    const end = s.indexOf(")");
+    if (end !== -1) {
+      const magic = s.slice(2, end);
+      return magic.includes("exclude") || magic.includes("!");
+    }
+  }
+  return false;
+}
+
 function toolGit(args, ctx) {
   const argv = splitArgs(args.args ?? "");
   if (!argv.length) return err("missing required arg: args");
@@ -477,6 +713,29 @@ function toolGit(args, ctx) {
     if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(p)) {
       return err("access denied: path outside cwd");
     }
+    if (path.isAbsolute(p)) {
+      const rAbs = resolveInCwd(ctx.cwd, p);
+      if (rAbs.error) return err("access denied: path outside cwd");
+    }
+    if (!isExcludePathspec(p) && /[*?\[]/.test(p)) {
+      const r = resolveInCwd(ctx.cwd, ".");
+      if (!r.error) {
+        const ls = runCmd("git", ["ls-files", "-z", "--", p], { cwd: r.base });
+        if (ls.status === 0 && ls.stdout) {
+          const files = ls.stdout.split("\0").filter(Boolean);
+          for (const f of files) {
+            if (isSensitivePath(f)) return err(SENSITIVE_DENIED);
+          }
+        }
+        const hist = runCmd("git", ["log", "-n", "30", "--name-only", "--format=", "--", p], { cwd: r.base });
+        if (hist.status === 0 && hist.stdout) {
+          const files = hist.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+          for (const f of files) {
+            if (isSensitivePath(f)) return err(SENSITIVE_DENIED);
+          }
+        }
+      }
+    }
   }
   const r = resolveInCwd(ctx.cwd, ".");
   if (r.error) return err(r.error);
@@ -489,6 +748,10 @@ function toolGit(args, ctx) {
   if (sub === "ls-files") {
     const lines = out.split("\n").filter((l) => !isSensitivePath(l.trim()));
     out = lines.join("\n");
+  } else if (sub === "status") {
+    out = filterGitStatusOutput(out);
+  } else if (sub === "diff" || sub === "show" || sub === "log") {
+    out = filterGitPatchOutput(out);
   }
   return { output: out };
 }
@@ -717,6 +980,18 @@ function linkCandidates(resourceLinks, cwd, seen, out) {
   }
 }
 
+export const GIT_DIFF_DENY_PATHSPECS = [
+  ":(exclude).env*",
+  ":(exclude)*/.env*",
+  ":(exclude)**/secrets/**",
+  ":(exclude)*secrets*",
+  ":(exclude)*.pem",
+  ":(exclude)*.key",
+  ":(exclude)id_rsa*",
+  ":(exclude)id_ed25519*",
+  ":(exclude)id_*",
+];
+
 /**
  * Собрать первое сообщение сессии: системная шапка + текст задачи +
  * вложения (дифф, файлы, треды, задачи), уложенные в maxBytes.
@@ -748,7 +1023,17 @@ export function packFirstMessage({
         candidates.push({
           block: "git diff HEAD",
           hint: 'git("diff HEAD")',
-          fetch: () => executeTool({ name: "git", args: { args: "diff HEAD" }, attrs: [["args", "diff HEAD"]] }, { cwd }),
+          fetch: () => {
+            const excludeArgs = GIT_DIFF_DENY_PATHSPECS.map((s) => `"${s}"`).join(" ");
+            return executeTool(
+              {
+                name: "git",
+                args: { args: `diff HEAD -- . ${excludeArgs}` },
+                attrs: [["args", "diff HEAD"]],
+              },
+              { cwd },
+            );
+          },
         });
       }
     }
