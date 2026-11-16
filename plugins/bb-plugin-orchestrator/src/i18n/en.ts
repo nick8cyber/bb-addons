@@ -417,6 +417,12 @@ export const EN: Record<string, string> = {
   "rel.kbNote": "KB note: {note}",
   "rel.kbNone": "KB not required: {reason}",
   "rel.postCheck": "post-check: {msg}",
+  "rel.taskCleanupDone":
+    "task cleanup: removed {envs} copies, {branches} branches",
+  "rel.taskCleanupRescued": "rescued {n} dirty copies",
+  "rel.taskCleanupKept": "leftover {n}: {list}",
+  "rel.taskCleanupBlocked": "task cleanup skipped: {reason}",
+  "rel.taskCleanupFailed": "task cleanup failed: {error}",
   "rel.postCheckFail": "the post-check failed: {error}",
   "rel.selfReloadOk": "; reloaded: orchestrator",
   "rel.selfReloadFail":

@@ -28,7 +28,11 @@ import {
   parseJanitorConfig,
   type JanitorConfigLoad,
 } from "./src/janitor-config.js";
-import { createJanitor } from "./src/janitor.js";
+import {
+  createJanitor,
+  type TaskCleanupArgs,
+  type TaskCleanupSummary,
+} from "./src/janitor.js";
 import {
   createBbCli,
   runChecked,
@@ -1412,6 +1416,9 @@ export async function createPlugin(
       mergeBaseBranch?: string | null;
       baseBranch?: string | { name?: string } | null;
     }>(bbCli, ["environment", "show", envId, "--json"]);
+  // Janitor is created after releaseDeps — the lazy taskCleanup
+  // seam above reads this binding on each pump tick.
+  let janitor: ReturnType<typeof createJanitor> | undefined;
   const releaseDeps = {
     store,
     bbCli,
@@ -1443,6 +1450,20 @@ export async function createPlugin(
       positiveInt(currentSettings.retentionDays, 30),
     // PLUG-245 Б2: владелец замков копии postPublish — этот экземпляр.
     instanceId: `orch-${process.pid}-${Math.random().toString(36).slice(2, 10)}`,
+    // §15 (r33.7) + release §2 п.2: автоочистка копий задачи. Уборщик
+    // создаётся ниже — замыкание ленивое: если насос тикнул до
+    // присвоения, очистка пропускается до следующего такта.
+    taskCleanup: (a: TaskCleanupArgs): Promise<TaskCleanupSummary> =>
+      janitor
+        ? janitor.taskCleanup(a)
+        : Promise.resolve<TaskCleanupSummary>({
+            blocked: "fetch-failed",
+            envsRemoved: 0,
+            branchesRemoved: 0,
+            threadsArchived: 0,
+            rescued: 0,
+            kept: [],
+          }),
     log: bb.log,
     t,
   };
@@ -1747,7 +1768,7 @@ export async function createPlugin(
   // the janitor owns disk. It ticks every minute and runs a pass when the
   // configured interval elapsed; the first pass goes right away so a
   // plugin restart never postpones a due cleanup.
-  const janitor = createJanitor({
+  janitor = createJanitor({
     store,
     janitor: janitorStore,
     bbCli,
