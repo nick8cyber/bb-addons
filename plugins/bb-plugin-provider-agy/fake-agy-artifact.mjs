@@ -43,7 +43,18 @@ out({
 
 let step = 0;
 let turns = 0;
-createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
+// Lifecycle (spec §12.4): die with the owner — stdin EOF, a signal, or a
+// reparented ppid (owner died, init/systemd adopted us) all end the fake.
+const ownerPpid = process.ppid;
+setInterval(() => {
+  if (process.ppid !== ownerPpid) process.exit(0);
+}, 1_500).unref();
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => process.exit(0));
+}
+const rlFake = createInterface({ input: process.stdin, crlfDelay: Infinity });
+rlFake.on("close", () => process.exit(0));
+rlFake.on("line", (line) => {
   if (line.trim().length === 0) return;
   appendFileSync(transcript, `${line}\n`);
   turns += 1;

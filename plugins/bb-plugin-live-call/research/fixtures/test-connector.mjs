@@ -10,11 +10,21 @@
 import readline from "node:readline";
 import crypto from "node:crypto";
 
+// Фикстуры умирают с владельцем: stdin EOF, сигнал или пересаженный ppid.
+const ownerPpid = process.ppid;
+setInterval(() => {
+  if (process.ppid !== ownerPpid) process.exit(0);
+}, 1500).unref();
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => process.exit(0));
+}
+
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
   terminal: false,
 });
+rl.on("close", () => process.exit(0));
 
 rl.on("line", (line) => {
   const trimmed = line.trim();

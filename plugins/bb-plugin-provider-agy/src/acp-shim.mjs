@@ -34,7 +34,13 @@
  * AGY_SHIM_CONTROL, AGY_SHIM_THREAD_ID, AGY_SHIM_NONCE, AGY_SHIM_SET_MODE.
  */
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, watch } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  unlinkSync,
+  watch,
+} from "node:fs";
 import { createInterface } from "node:readline";
 
 const REAL_BIN = process.env.AGY_SHIM_REAL_BIN ?? "";
@@ -95,6 +101,10 @@ function emitEvent(fields) {
 const child = spawn(REAL_BIN, process.argv.slice(2), {
   stdio: ["pipe", "pipe", "inherit"],
   env: process.env,
+  // Own process group: shutdown kills the whole agy tree with kill(-pid)
+  // instead of orphaning agy's node grandchildren on the init system
+  // (incident 16.11: 432 shim orphans, 6.1 GB RSS — spec §12.2.2).
+  detached: true,
 });
 
 let sessionId = null;
@@ -176,6 +186,7 @@ function promptTextTail(params) {
   return n.length === 0 ? null : n.slice(-160);
 }
 let modeApplied = INITIAL_MODE.length === 0;
+let modeSettleTimer = null;
 const ownRequestIds = new Set();
 /** client request id → {method, sessionId} for sniffing prompt responses. */
 const pendingClientRequests = new Map();
@@ -216,7 +227,11 @@ function maybeApplyInitialMode(newSessionId) {
     // Apply after the session settles: the agent may answer set_mode more
     // reliably right after session/new|load than in the same tick.
     const mode = INITIAL_MODE;
-    setTimeout(() => sendSetMode(mode), SET_MODE_SETTLE_MS).unref?.();
+    modeSettleTimer = setTimeout(() => {
+      modeSettleTimer = null;
+      sendSetMode(mode);
+    }, SET_MODE_SETTLE_MS);
+    modeSettleTimer.unref?.();
   }
 }
 
@@ -244,12 +259,13 @@ function drainControlFile() {
   }
   controlSeenLines = lines.length;
 }
+let controlWatcher = null;
 if (CONTROL_FILE !== null) {
   try {
     // fs.watch throws ENOENT synchronously on a missing file and the catch
     // would swallow it — the file must exist before the watch registers.
     if (!existsSync(CONTROL_FILE)) appendFileSync(CONTROL_FILE, "");
-    watch(CONTROL_FILE, () => {
+    controlWatcher = watch(CONTROL_FILE, () => {
       try { drainControlFile(); } catch {}
     });
   } catch {}
@@ -316,14 +332,7 @@ rlIn.on("line", (line) => {
   }
   writeChild(line);
 });
-rlIn.on("close", () => {
-  acceptingClientInput = false;
-  if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
-  const t = setTimeout(() => {
-    if (!child.killed) child.kill("SIGTERM");
-  }, 2500);
-  t.unref?.();
-});
+rlIn.on("close", () => shutdown("stdin-eof"));
 
 // --- child → stdout --------------------------------------------------------
 
@@ -449,11 +458,7 @@ child.stdin.on("error", () => { acceptingClientInput = false; });
 child.stdout.on("error", () => {});
 process.stdin.on("error", () => {});
 process.stdout.on("error", (err) => {
-  if (err?.code === "EPIPE") {
-    acceptingClientInput = false;
-    if (!child.killed) child.kill("SIGTERM");
-    process.exitCode = 0;
-  }
+  if (err?.code === "EPIPE") shutdown("epipe");
 });
 
 child.on("error", (err) => {
@@ -461,13 +466,113 @@ child.on("error", (err) => {
   process.stderr.write(`acp-shim: failed to spawn ${REAL_BIN}: ${err.message}\n`);
 });
 child.on("close", (code, signal) => {
-  acceptingClientInput = false;
-  rlIn.close();
-  process.exitCode = code ?? (signal ? 128 : 1);
+  childClosed = true;
+  childCloseExitCode = code ?? (signal ? 128 : 1);
+  shutdown("child-close");
 });
 
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(signal, () => {
-    if (!child.killed) child.kill(signal);
+// --- lifecycle: die with the owner (spec §12.1–12.2) ------------------------
+// Every trigger below means the bridge side is gone or ordered us down:
+// stdin EOF, a reparented ppid (the bridge worker died and init/systemd
+// adopted us — PR_SET_PDEATHSIG has no portable Node binding), a signal, the
+// child's own close, or EPIPE on the relay back. Shutdown kills the child's
+// whole process group — agy spawns a small forest of node grandchildren that
+// a plain child.kill() would orphan on the init system — then removes the
+// private control file and exits explicitly instead of waiting for the
+// event loop to drain (fs.watch and pending timers can outlive every
+// trigger — that is how the 16.11 orphans stayed alive for days).
+const SHUTDOWN_STDIN_GRACE_MS = 2_000;
+const SHUTDOWN_TERM_GRACE_MS = 4_000;
+const SHUTDOWN_DEADLINE_MS = 8_000;
+let shuttingDown = false;
+let childClosed = false;
+let childCloseExitCode = null;
+
+function killChildGroup(signal) {
+  // detached makes the child a process-group leader; kill(-pid) reaches
+  // `agy acp` and every grandchild it spawned. ESRCH means the group is
+  // already gone — the fallback direct kill then simply no-ops too.
+  try {
+    process.kill(-child.pid, signal);
+    return;
+  } catch {}
+  try {
+    child.kill(signal);
+  } catch {}
+}
+
+function finishShutdown(code) {
+  // Explicit exit — never wait for the loop to drain (spec §12.2.4).
+  process.exit(code);
+}
+
+function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  acceptingClientInput = false;
+  emitEvent({ t: "shim-shutdown", reason });
+  try {
+    rlIn.close();
+  } catch {}
+  if (controlWatcher !== null) {
+    try {
+      controlWatcher.close();
+    } catch {}
+    controlWatcher = null;
+  }
+  clearReplayTimer();
+  if (modeSettleTimer !== null) {
+    clearTimeout(modeSettleTimer);
+    modeSettleTimer = null;
+  }
+  clearInterval(ppidWatch);
+  // The control file is private to this shim (covers ctl-models.ndjson of
+  // the maintenance shim too); the shared data dir is left alone.
+  if (CONTROL_FILE !== null) {
+    try {
+      unlinkSync(CONTROL_FILE);
+    } catch {}
+  }
+  const exitCode = reason === "child-close" ? (childCloseExitCode ?? 1) : 0;
+  if (childClosed) {
+    finishShutdown(exitCode);
+    return;
+  }
+  try {
+    if (!child.stdin.destroyed && !child.stdin.writableEnded) {
+      child.stdin.end();
+    }
+  } catch {}
+  // stdin.end → grace ~2 s → SIGTERM on the group → ~4 s → SIGKILL on the
+  // group; the deadline is insurance only and deliberately NOT unref'd —
+  // the loop must be gone by ~8 s no matter what still holds it (§12.2).
+  const termTimer = setTimeout(
+    () => killChildGroup("SIGTERM"),
+    SHUTDOWN_STDIN_GRACE_MS,
+  );
+  const killTimer = setTimeout(() => {
+    killChildGroup("SIGKILL");
+    finishShutdown(exitCode);
+  }, SHUTDOWN_STDIN_GRACE_MS + SHUTDOWN_TERM_GRACE_MS);
+  const deadline = setTimeout(
+    () => finishShutdown(exitCode),
+    SHUTDOWN_DEADLINE_MS,
+  );
+  child.once("close", () => {
+    clearTimeout(termTimer);
+    clearTimeout(killTimer);
+    clearTimeout(deadline);
+    finishShutdown(exitCode);
   });
+}
+
+// Parent-death watchdog: a reparented ppid means the bridge worker is gone.
+const ownerPpid = process.ppid;
+const ppidWatch = setInterval(() => {
+  if (process.ppid !== ownerPpid) shutdown("parent-death");
+}, 1_500);
+ppidWatch.unref();
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => shutdown(`sig-${signal.toLowerCase()}`));
 }

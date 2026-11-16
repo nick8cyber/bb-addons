@@ -813,7 +813,7 @@ rl.on("line", (line) => {
         `import readline from "node:readline";
 import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
-setInterval(() => {}, 1000);
+const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const r = JSON.parse(line);
   if (r.method === "initialize") process.stdout.write(JSON.stringify({ id: r.id, result: { protocolVersion: "2025-06-18" } }) + "\\n");
@@ -1165,7 +1165,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         path,
         `import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
-setInterval(() => {}, 1000);
+const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);
 process.stdin.resume();`,
       );
       const client = new McpClient({
@@ -1238,7 +1238,7 @@ process.stdin.resume();`,
           path,
           `import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
-setInterval(() => {}, 1000);
+const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);
 process.stdin.resume();`,
         );
         const cfg: ProjectConfig = {
@@ -1317,7 +1317,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       writeFileSync(
         path,
         `import readline from "node:readline";
-setInterval(() => {}, 1000);
+const __ownerPpid=process.ppid;setInterval(()=>{if(process.ppid!==__ownerPpid)process.exit(0);},1000);
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const r = JSON.parse(line);
   if (r.method === "initialize") process.stdout.write(JSON.stringify({ id: r.id, result: {} }) + "\\n");

@@ -4,13 +4,15 @@
  *
  * Usage: node harness.mjs <model>
  */
-import { mkdtempSync } from "node:fs";
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createBridgeDeltaEventCollector } from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
 const MODEL = process.argv[2] ?? "gemini-3.5-flash-low";
-const workspace = mkdtempSync(join(tmpdir(), "agy-conformance-"));
+const workspace = trackedMkdtemp(join(tmpdir(), "agy-conformance-"));
 
 // --- capture the bridge's stdout ------------------------------------------
 const messages = [];

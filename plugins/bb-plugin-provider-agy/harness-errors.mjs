@@ -14,11 +14,13 @@
  *
  * Usage: node harness-errors.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const root = mkdtempSync(join(tmpdir(), "agy-errors-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-errors-"));
 const transcript = join(root, "stdin.ndjson");
 writeFileSync(transcript, "");
 const shim = join(root, "agy-shim");
