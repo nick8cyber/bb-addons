@@ -1,7 +1,8 @@
 /**
  * `merge` — §14 (+ §16.2/§16.6): merge a finished round's result into the
- * coordinator's worktree. Only the delegation's own coordinator may call it;
- * the target copy is that thread's environment. Refusals carry codes:
+ * coordinator's worktree. §25 (r33.4): any thread with the orchestrator
+ * role may call it (the delegation's author no longer owns the merge);
+ * the target copy is the CALLER's environment. Refusals carry codes:
  * `dirty-result`, `protected-branch`, `stale-result`, `stale-check-failed`,
  * `not-done`, `no-result`, `no-environment`, `dirty-coordinator`,
  * `detached-head`, `unknown-branch`, `result-missing`, `merge-in-progress`,
@@ -83,7 +84,8 @@ export interface MergeParams {
   into?: string;
   noAutofix?: boolean;
   dryRun?: boolean;
-  /** The calling thread — must equal the delegation's coordinator. */
+  /** The calling thread — §25 (r33.4): must carry the orchestrator role
+   * (`callerIsCoordinator`), not necessarily be the delegation's author. */
   callerThreadId: string;
 }
 
@@ -107,6 +109,13 @@ export interface MergeDeps {
       input: unknown[];
     }): Promise<unknown>;
   };
+  /**
+   * §25 (r33.4): the caller gate — a thread whose role is `orchestrator`
+   * may merge ANY delegation's result into its own copy (the
+   * `coordinator_thread_id` author match is gone). Absent dep = the
+   * pre-r33.4 author check.
+   */
+  callerIsCoordinator?(threadId: string): Promise<boolean>;
   /** The §14 conflict-fix round: same task/level, `--from result_sha`. */
   delegate(input: {
     taskKey: string;
@@ -310,11 +319,16 @@ export async function runMerge(
     await deps.syncRow(row).catch(() => {});
     row = store.get(row.id) ?? row;
   }
-  if (params.callerThreadId !== row.coordinator_thread_id) {
+  // §25 (r33.4): the role decides, not the delegation's author — a
+  // thread with the orchestrator role merges any delegation's result.
+  const callerOk = deps.callerIsCoordinator
+    ? await deps.callerIsCoordinator(params.callerThreadId)
+    : params.callerThreadId === row.coordinator_thread_id;
+  if (!callerOk) {
     throw new OrchestratorError(
       "not-a-coordinator",
-      `thread ${params.callerThreadId} is not the coordinator of delegation ${row.id}`,
-      "only the delegating coordinator may merge its result",
+      `thread ${params.callerThreadId} has no orchestrator role`,
+      "only a thread with the orchestrator role may merge results",
     );
   }
   // §19.1 (r33): a delegation's merge refuses while its helpers are

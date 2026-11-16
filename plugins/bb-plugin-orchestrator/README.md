@@ -63,6 +63,11 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `autoFallback` allows (one transaction, `reissue_of`, reuses the §4
   dispatch steps); coordinator messages via `threads.send`
   `queue-if-active` prefixed `[orchestrator]`, task comments throughout.
+  §25.6: a delegation the coordinator cancelled itself (`bb orchestrator
+  cancel`) produces NO result delivery at all — no `[orchestrator]`
+  line, no output tail, no journal check; the row is recorded
+  `result_notice = 'self-cancel'` (a cancel NOT by the coordinator —
+  UI, cascade, archive — still gets its one line).
 - **`merge`** (agent tool `orchestrator_merge` + CLI, §14): merges a
   finished round's `result_sha` into the coordinator's worktree after the
   §14 checks (clean result, clean coordinator copy, non-protected target,
@@ -220,11 +225,22 @@ explicit "no plugin" verdict: no tools, no skills, no instructions, no
 coordinator fallback. A role is its instruction text plus the plugin
 tools and skills the thread may use.
 
-- **Picker**: the new-chat window gets a "Role" dropdown
-  (`composer.customize`, new-thread area) with `none` ("No plugin") first;
-  the window only READS the stored pick — it writes nothing on open, so
-  an explicit selection is distinguishable. The pick is stored per
-  project in `pending_roles`.
+- **Picker**: the "Role" dropdown (`composer.customize`) sits in the
+  composer of BOTH the new-chat window and any thread window (§25) with
+  `none` ("No plugin") first. In the new-chat window it only READS the
+  stored pick — it writes nothing on open, so an explicit selection is
+  distinguishable; the pick is stored per project in `pending_roles`.
+  In a thread window it shows the thread's decided role from
+  `thread_roles` (no row → "No plugin"; a helper thread's list is
+  disabled showing "Helper") and the owner's change writes the row
+  with `source = "owner"`, refreshes the `pluginMetadata.role` badge,
+  and journals `role.manual` — it takes effect on the thread's NEXT
+  turn (`configure` re-reads the role every turn); the running turn is
+  not interrupted. There are no participation restrictions: the owner
+  may re-role a thread that runs delegations or helpers — a thread
+  that became `orchestrator` may `delegate`/`merge`/`release`, even
+  delegations another coordinator authored (merge/release check the
+  caller's role, not `coordinator_thread_id`).
 - **Decision**: the `message.dispatch` hook decides the role once, on the
   thread's first message, and writes it to `thread_roles` — the source of
   truth (`pluginMetadata.role` is display-only). A CLI thread without a
@@ -232,11 +248,14 @@ tools and skills the thread may use.
   Threads older than the r33 migration fall back to the §3 criterion:
   no parent and no executor markers → coordinator; newer threads without
   a recorded role are `none` (a journal warning names the hole).
-- **Manual role**: `bb orchestrator role set <thread> none` is the ONLY
-  manual change (§19.4) — every other target refuses `role-not-allowed`;
-  promotion is hook/plugin-managed. A helper thread's role cannot be
-  touched, active work refuses `role-active`, and the demotion clears
-  the `pluginMetadata.role` badge. Writes record a `role.manual` event.
+- **Manual role**: the owner changes the role in the thread window
+  (§25 — see Picker). From the CLI, `bb orchestrator role set <thread>
+  none` is the ONLY manual change (§19.4) — every other target refuses
+  `role-not-allowed`; an agent never promotes a role (the `setThreadRole`
+  RPC is technically reachable, so every change lands in `role.manual`
+  with its actor and the role texts forbid calling it). A helper
+  thread's role cannot be touched, active work refuses `role-active`,
+  and the demotion clears the `pluginMetadata.role` badge.
 - **Limitations** (§13.2 item 5, §13.3): the plugin grants and withholds only
   its own tools — provider built-ins (file edits, shell) stay governed by
   the preset's permission mode. The role's instruction reaches the agent

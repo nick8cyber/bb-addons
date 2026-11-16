@@ -1,8 +1,12 @@
 /**
- * bb-plugin-orchestrator — Frontend entry (spec §13.2 п.1): the «Роль»
- * picker in the new-thread composer's action row. The pick persists per
- * project in `pending_roles` via the plugin's RPC; the `message.dispatch`
- * hook applies it to the thread's first message.
+ * bb-plugin-orchestrator — Frontend entry (spec §13.2 п.1 + §25): the
+ * «Роль» picker in the composer action row. In the new-thread window
+ * (scope `new-thread`) the pick persists per project in `pending_roles`
+ * via the plugin's RPC; the `message.dispatch` hook applies it to the
+ * thread's first message. In a thread window (scope `thread`, §25) the
+ * list shows the thread's decided role from `thread_roles` and the
+ * owner's change writes it with `source = "owner"` — effective on the
+ * thread's next turn.
  */
 import {
   definePluginApp,
@@ -27,6 +31,7 @@ const ROLE_OPTIONS = [
 ] as const;
 type RoleId = (typeof ROLE_OPTIONS)[number]["id"];
 const DEFAULT_ROLE: RoleId = "executor";
+const PICKABLE = new Set<string>(ROLE_OPTIONS.map((o) => o.id));
 
 function RoleSelect() {
   const view = useComposerView();
@@ -34,10 +39,22 @@ function RoleSelect() {
   const { values } = useSettings();
   const t = createT(resolveLang(values?.language));
   const scope = view.scope;
+  const isThread = scope.kind === "thread";
   const projectId = scope.kind === "new-thread" ? scope.projectId : null;
-  const [role, setRole] = useState<RoleId>(DEFAULT_ROLE);
+  const threadId = scope.kind === "thread" ? scope.threadId : null;
+  const [role, setRole] = useState<string>(DEFAULT_ROLE);
+  // §25: a non-pickable decided role (helper, release-auditor, anything
+  // the list does not offer) renders the select disabled with the
+  // role's own label — «Помощник» for a helper thread.
+  const [lockedLabel, setLockedLabel] = useState<string | null>(null);
 
   const report = (next: RoleId) => {
+    if (isThread && threadId) {
+      void rpc
+        .call("setThreadRole", { threadId, role: next })
+        .catch(() => undefined);
+      return;
+    }
     void rpc
       .call("setPendingRole", { projectId, role: next })
       .catch(() => undefined);
@@ -47,31 +64,52 @@ function RoleSelect() {
   // server default) and writes ONLY on a user change — the window's own
   // open used to write `orchestrator`, which is exactly the default
   // r33 removed. A transient read failure retries once after a second.
+  // §25: in a thread window the select reads the thread's decided role
+  // instead (no row → «Без плагина») — and writes through `setThreadRole`.
   useEffect(() => {
     let alive = true;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    const apply = (next: RoleId) => {
-      if (alive) setRole(next);
+    const apply = (next: string) => {
+      if (!alive) return;
+      if (PICKABLE.has(next)) {
+        setRole(next);
+        setLockedLabel(null);
+      } else {
+        setLockedLabel(next === "helper" ? t("app.roleHelper") : next);
+      }
     };
     const load = () =>
-      rpc
-        .call("pendingRole", { projectId })
-        .then((res) => apply(res?.role ?? DEFAULT_ROLE))
-        .catch(() => {
-          retryTimer = setTimeout(() => {
-            if (!alive) return;
-            void rpc
-              .call("pendingRole", { projectId })
-              .then((res) => apply(res?.role ?? DEFAULT_ROLE))
-              .catch(() => apply(DEFAULT_ROLE));
-          }, 1000);
-        });
+      isThread && threadId
+        ? rpc
+            .call("threadRole", { threadId })
+            .then((res) => apply(res?.role ?? "none"))
+            .catch(() => {
+              retryTimer = setTimeout(() => {
+                if (!alive) return;
+                void rpc
+                  .call("threadRole", { threadId })
+                  .then((res) => apply(res?.role ?? "none"))
+                  .catch(() => apply("none"));
+              }, 1000);
+            })
+        : rpc
+            .call("pendingRole", { projectId })
+            .then((res) => apply(res?.role ?? DEFAULT_ROLE))
+            .catch(() => {
+              retryTimer = setTimeout(() => {
+                if (!alive) return;
+                void rpc
+                  .call("pendingRole", { projectId })
+                  .then((res) => apply(res?.role ?? DEFAULT_ROLE))
+                  .catch(() => apply(DEFAULT_ROLE));
+              }, 1000);
+            });
     void load();
     return () => {
       alive = false;
       if (retryTimer !== undefined) clearTimeout(retryTimer);
     };
-  }, [projectId]);
+  }, [projectId, threadId, isThread]);
 
   const onChange = (event: ChangeEvent<HTMLSelectElement>) => {
     const next = event.target.value as RoleId;
@@ -92,8 +130,9 @@ function RoleSelect() {
     >
       {t("app.role")}
       <select
-        value={role}
+        value={lockedLabel !== null ? "__locked" : role}
         onChange={onChange}
+        disabled={lockedLabel !== null}
         style={{
           font: "inherit",
           color: "inherit",
@@ -104,11 +143,15 @@ function RoleSelect() {
           colorScheme: "dark",
         }}
       >
-        {ROLE_OPTIONS.map((option) => (
-          <option key={option.id} value={option.id}>
-            {t(option.labelKey)}
-          </option>
-        ))}
+        {lockedLabel !== null ? (
+          <option value="__locked">{lockedLabel}</option>
+        ) : (
+          ROLE_OPTIONS.map((option) => (
+            <option key={option.id} value={option.id}>
+              {t(option.labelKey)}
+            </option>
+          ))
+        )}
       </select>
     </label>
   );
@@ -117,7 +160,7 @@ function RoleSelect() {
 export default definePluginApp((app) => {
   app.composer.customize({
     id: "orchestrator-role",
-    scopes: ["new-thread"],
+    scopes: ["new-thread", "thread"],
     actions: [{ id: "role-select", component: RoleSelect }],
   });
 });

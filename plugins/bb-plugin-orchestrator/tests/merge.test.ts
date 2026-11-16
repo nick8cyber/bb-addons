@@ -97,6 +97,9 @@ function makeDeps(opts: {
   mergeAutofix?: boolean;
   delegateFail?: Error;
   noCode?: boolean;
+  /** §25 (r33.4): which thread ids the caller gate accepts as
+   * orchestrator — default only `thr_coord`. */
+  coordinatorIds?: readonly string[];
 }) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
@@ -153,6 +156,9 @@ function makeDeps(opts: {
       return { delegationId: 42, threadId: "thr_fix" };
     },
     mergeAutofix: () => opts.mergeAutofix ?? false,
+    // §25 (r33.4): the role gate, not the delegation's author.
+    callerIsCoordinator: async (id) =>
+      (opts.coordinatorIds ?? ["thr_coord"]).includes(id),
   };
   return { deps, store, row, comments, sent, delegated };
 }
@@ -437,7 +443,7 @@ test("refusal: detached HEAD", async () => {
   );
 });
 
-test("refusal: a foreign thread is not this delegation's coordinator", async () => {
+test("refusal: a foreign thread without the orchestrator role", async () => {
   const { coord, exec, resultSha } = makeRepos();
   const { deps, row } = makeDeps({ coord, exec });
   recordResult(deps.store, row, resultSha);
@@ -445,6 +451,31 @@ test("refusal: a foreign thread is not this delegation's coordinator", async () 
     runMerge({ ...PARAMS, callerThreadId: "thr_other" }, deps),
     (e: unknown) => (e as OrchestratorError).code === "not-a-coordinator",
   );
+});
+
+// §25 (r33.4): a thread that BECAME orchestrator merges another
+// coordinator's delegation — the author match is gone; the merge lands
+// in the CALLER's copy.
+test("§25: an orchestrator-role caller merges a foreign delegation", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({
+    coord,
+    exec,
+    coordinatorIds: ["thr_other"],
+  });
+  recordResult(deps.store, row, resultSha);
+  // The caller's own worktree is `coord` here — `environment()` answers
+  // by the CALLER id.
+  deps.environment = async (threadId) =>
+    threadId === "thr_other" ? { path: coord } : null;
+  const res = await runMerge(
+    { ...PARAMS, callerThreadId: "thr_other" },
+    deps,
+  );
+  assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
+  const head = gitR(coord, ["rev-parse", "HEAD"]);
+  assert.equal(res.mergedSha, head);
+  assert.equal(store.get(row.id)!.merge_status, "merged");
 });
 
 test("refusal: not-done / no-result / not-found", async () => {

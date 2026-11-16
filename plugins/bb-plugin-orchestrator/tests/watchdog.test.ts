@@ -3483,9 +3483,10 @@ test("§16.5: cancelled delivers a result message too", async () => {
   assert.match(JSON.stringify(msg!.input), /: cancelled, ветка/);
 });
 
-// PLUG-224: `orchestrator cancel` marks the row — the §16.5 delivery
-// sends the cancelled header but never tails «без отчёта» on it.
-test("§16.5 (PLUG-224): a coordinator-initiated cancel never sends «без отчёта»", async () => {
+// §25.6 (r33.4, supersedes PLUG-224): `orchestrator cancel` marks the
+// row — the §16.5 delivery is skipped ENTIRELY: no result line, no
+// output tail, no journal check; `result_notice = self-cancel`.
+test("§25.6 (PLUG-224): a coordinator-initiated cancel sends nothing at all", async () => {
   const h = makeHarness();
   const row = h.insertActive({ threadId: "thr_e1" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
@@ -3494,16 +3495,15 @@ test("§16.5 (PLUG-224): a coordinator-initiated cancel never sends «без о�
   h.store.addSetupError(row.id, "coordinator-cancel", "thr_coord");
   await settleResults(h);
   const fresh = h.store.get(row.id)!;
-  assert.equal(fresh.result_notice, "plugin");
-  const msg = h.sends.find((x) => x.threadId === "thr_coord");
-  const text = JSON.stringify(msg!.input);
-  assert.match(text, /: cancelled, ветка/);
-  assert.ok(!/без отчёта/.test(text), text);
+  assert.equal(fresh.result_notice, "self-cancel");
+  assert.ok(fresh.result_notified_at != null);
+  assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 0);
 });
 
-// PLUG-224: BB's own child-interrupted notice satisfies even an
-// empty-report coordinator-cancelled row — no plugin line at all.
-test("§16.5 (PLUG-224): child-interrupted satisfies a coordinator-cancelled row", async () => {
+// §25.6: even with BB's child-interrupted notice in the journal the
+// coordinator-cancelled row is marked self-cancel — no journal read
+// decides it, no line goes out.
+test("§25.6 (PLUG-224): child-interrupted does not change a coordinator-cancelled row", async () => {
   const h = makeHarness();
   const row = h.insertActive({ threadId: "thr_e1" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
@@ -3515,13 +3515,13 @@ test("§16.5 (PLUG-224): child-interrupted satisfies a coordinator-cancelled row
   ]);
   await settleResults(h);
   const fresh = h.store.get(row.id)!;
-  assert.equal(fresh.result_notice, "bb");
+  assert.equal(fresh.result_notice, "self-cancel");
   assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 0);
 });
 
-// §16.5 (PLUG-227): a coordinator-initiated cancel with non-empty executor
-// output delivers the report.
-test("§16.5 (PLUG-227): a coordinator-cancelled row with non-empty executor output delivers the report", async () => {
+// §25.6 (PLUG-227): a coordinator-initiated cancel drops even a
+// non-empty executor report — no line, no tail.
+test("§25.6 (PLUG-227): a coordinator-cancelled row with non-empty executor output still sends nothing", async () => {
   const h = makeHarness();
   const row = h.insertActive({ threadId: "thr_e1" });
   h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
@@ -3531,13 +3531,38 @@ test("§16.5 (PLUG-227): a coordinator-cancelled row with non-empty executor out
   h.store.addSetupError(row.id, "coordinator-cancel", "thr_coord");
   await settleResults(h);
   const fresh = h.store.get(row.id)!;
-  assert.equal(fresh.result_notice, "plugin");
-  const msg = h.sends.find((x) => x.threadId === "thr_coord");
-  assert.ok(msg, "message must be sent to coordinator");
-  const text = JSON.stringify(msg!.input);
-  assert.match(text, /: cancelled, ветка/);
-  assert.match(text, /отчёт исполнителя: сделал всё по спеке/);
-  assert.ok(!/без отчёта/.test(text));
+  assert.equal(fresh.result_notice, "self-cancel");
+  assert.equal(h.sends.filter((x) => x.threadId === "thr_coord").length, 0);
+});
+
+// §25.6: a reissue after the coordinator's cancel produces no line
+// about the cancelled round — the new round's result delivers as usual.
+test("§25.6: a reissue after a coordinator cancel — no line about the cancelled round", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ threadId: "thr_e1" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "idle"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.threadDtos.set("thr_e2", dto("thr_e2", "idle"));
+  h.store.setStatus(row.id, "cancelled");
+  h.store.addSetupError(row.id, "coordinator-cancel", "thr_coord");
+  // The coordinator reissued the task: a new delegation row + a new
+  // thread finishing normally.
+  const row2 = h.insertActive({ threadId: "thr_e2" });
+  h.outputs.set("thr_e2", "итог второго захода");
+  h.eventLog.set("thr_e2", [
+    ev(1, "turn/started", T0 - 1000),
+    ev(2, "turn/completed", T0 - 100, { status: "completed" }),
+  ]);
+  await h.wd.onThreadIdle(dto("thr_e2", "idle"));
+  await settleResults(h);
+  assert.equal(h.store.get(row.id)!.result_notice, "self-cancel");
+  assert.equal(h.store.get(row2.id)!.status, "done");
+  const msgs = h.sends.filter((x) => x.threadId === "thr_coord");
+  // At most the second round's own line — nothing about round 1.
+  assert.ok(msgs.length <= 1, `expected ≤1 line, got ${msgs.length}`);
+  for (const m of msgs) {
+    assert.doesNotMatch(JSON.stringify(m.input), /cancelled/);
+  }
 });
 
 // §16.2 (PLUG-227): revive clears the coordinator-cancel setup_errors mark.

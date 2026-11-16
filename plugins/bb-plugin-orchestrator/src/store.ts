@@ -319,6 +319,19 @@ export const MIGRATIONS: readonly string[] = [
   // §19.6 (r33): the once-archived mark — the 24 h cleanup pass selects
   // terminal helpers without it instead of re-archiving every minute.
   `ALTER TABLE helpers ADD COLUMN archived_at INTEGER`,
+  // §25 (r33.4): the owner's in-window role pick writes
+  // `thread_roles.source = 'owner'` — SQLite cannot widen a CHECK, so
+  // the table is recreated; old rows move over untouched.
+  `CREATE TABLE thread_roles_owner (
+    thread_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    decided_at INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('hook','delegate','owner'))
+  );
+  INSERT INTO thread_roles_owner (thread_id, role, decided_at, source)
+    SELECT thread_id, role, decided_at, source FROM thread_roles;
+  DROP TABLE thread_roles;
+  ALTER TABLE thread_roles_owner RENAME TO thread_roles`,
 ];
 
 export type CommandRunStatus =
@@ -513,7 +526,7 @@ export interface ReleaseRow {
   updated_at: number;
 }
 
-export type ThreadRoleSource = "hook" | "delegate";
+export type ThreadRoleSource = "hook" | "delegate" | "owner";
 
 export interface ThreadRoleRow {
   thread_id: string;
@@ -904,9 +917,13 @@ export class DelegationStore {
   /**
    * §16.5: the coordinator was told (or could not be told — a gone
    * coordinator records `result_notified_at` with a NULL `result_notice`
-   * so the delivery does not rescan forever).
+   * so the delivery does not rescan forever). §25.6: `self-cancel` —
+   * the coordinator's own `cancel` needs no result delivery at all.
    */
-  setResultNotified(id: number, notice: "bb" | "plugin" | "legacy" | null): void {
+  setResultNotified(
+    id: number,
+    notice: "bb" | "plugin" | "legacy" | "self-cancel" | null,
+  ): void {
     this.db
       .prepare(
         `UPDATE delegations SET result_notified_at = ?, result_notice = ?,
@@ -1894,12 +1911,18 @@ export class DelegationStore {
 
   /** §19.4: `role set … none` — the manual write is distinguishable from
    * a dispatch's: `thread_roles` keeps `source = delegate` and the §18.5
-   * events table gets `role.manual` (who, when, the replaced role). */
-  setRoleManual(threadId: string, role: string, actor: string): void {
+   * events table gets `role.manual` (who, when, the replaced role).
+   * §25 (r33.4): the owner's in-window pick passes `source = "owner"`. */
+  setRoleManual(
+    threadId: string,
+    role: string,
+    actor: string,
+    source: "delegate" | "owner" = "delegate",
+  ): void {
     const previous = this.threadRole(threadId)?.role ?? null;
     const at = Date.now();
     this.db.transaction(() => {
-      this.setThreadRole(threadId, role, "delegate");
+      this.setThreadRole(threadId, role, source);
       this.emitEvent(
         "role.manual",
         { thread: threadId, role, previous, actor },

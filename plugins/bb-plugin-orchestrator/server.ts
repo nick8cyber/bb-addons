@@ -154,6 +154,21 @@ export const rpcContract = defineRpcContract({
         .nullable(),
     }),
   },
+  // §25 (r33.4): the thread window's «Роль» picker reads the decided
+  // role (`threadRole`) and writes the owner's pick (`setThreadRole`).
+  // `role` is a plain string — a helper/release-auditor row reads back
+  // too; `setThreadRole` itself accepts only the pickable list.
+  threadRole: {
+    input: z.object({ threadId: z.string() }),
+    output: z.object({
+      role: z.string(),
+      source: z.string().nullable(),
+    }),
+  },
+  setThreadRole: {
+    input: z.object({ threadId: z.string(), role: z.string() }),
+    output: z.object({ ok: z.literal(true) }),
+  },
 });
 
 /** The `pending_roles` RPC handlers; `projectId = null` (projectless
@@ -199,6 +214,70 @@ export function pendingRoleRpc(
             ? (fallback as "none" | "orchestrator" | "executor" | "auditor")
             : null,
       };
+    },
+  };
+}
+
+/** §25 (r33.4): the thread-window picker's RPC — `threadRole` reads the
+ * decided role (`none`/null source when no row), `setThreadRole` writes
+ * the owner's pick with `source = 'owner'`, mirrors the display badge
+ * (`pluginMetadata.role`) and journals `role.manual` (actor `ui`).
+ * Participation in active delegations/helpers is NO refusal — the
+ * owner may re-role any thread (the helper role itself is never a
+ * pickable target). */
+export function threadRoleRpc(
+  store: DelegationStore,
+  deps?: {
+    updatePluginMetadata?(args: {
+      threadId: string;
+      set?: Record<string, unknown>;
+      remove?: string[];
+    }): Promise<unknown>;
+    log?: { warn?(message: string): void };
+  },
+) {
+  return {
+    threadRole({ threadId }: { threadId: string }) {
+      const row = store.threadRole(threadId);
+      return { role: row?.role ?? "none", source: row?.source ?? null };
+    },
+    async setThreadRole({
+      threadId,
+      role,
+    }: {
+      threadId: string;
+      role: string;
+    }) {
+      if (!(WINDOW_ROLE_IDS as readonly string[]).includes(role)) {
+        throw new OrchestratorError(
+          "role-not-allowed",
+          `role "${role}" is not a pickable role`,
+          "the pickable roles are: none, orchestrator, executor, auditor",
+        );
+      }
+      // §19.4: a helper thread's role is plugin-managed — the window
+      // renders it disabled, and the RPC refuses it the same way.
+      if (store.threadRole(threadId)?.role === "helper") {
+        throw new OrchestratorError(
+          "role-not-allowed",
+          "a helper thread's role is plugin-managed — it cannot be changed",
+        );
+      }
+      store.setRoleManual(threadId, role, "ui", "owner");
+      if (deps?.updatePluginMetadata) {
+        await deps
+          .updatePluginMetadata(
+            isRoleId(role)
+              ? { threadId, set: { role } }
+              : { threadId, remove: ["role"] },
+          )
+          .catch((e) =>
+            deps.log?.warn?.(
+              `orchestrator: role badge: ${describeError(e)}`,
+            ),
+          );
+      }
+      return { ok: true as const };
     },
   };
 }
@@ -1397,6 +1476,16 @@ export async function createPlugin(
       threads: {
         send: (a) => bb.sdk.threads.send(a as never) as Promise<unknown>,
       },
+      // §25 (r33.4): the caller's orchestrator role gates merge — not the
+      // delegation's `coordinator_thread_id`; any orchestrator thread may
+      // merge another coordinator's result into its own copy.
+      callerIsCoordinator: async (threadId) => {
+        try {
+          return isCoordinator(await callerFacts(threadId), probes);
+        } catch {
+          return false;
+        }
+      },
       delegate: (d) =>
         delegate({ ...d, threadId: input.callerThreadId }),
       // §17.2 (e2e 1): BB's notice can outrun the watchdog's `done` —
@@ -1692,10 +1781,18 @@ export async function createPlugin(
     },
   });
 
-  // ── RPC (§13.2 п.1): the composer's «Роль» picker. ─────────────────
+  // ── RPC (§13.2 п.1 + §25): the composer's «Роль» picker. ────────────
   // `projectId = null` is a projectless compose — the default role
-  // applies and nothing is stored.
-  bb.rpc.register(rpcContract, pendingRoleRpc(store, defaultRole));
+  // applies and nothing is stored. `threadRole`/`setThreadRole` serve
+  // the same picker in a thread window (the owner's mid-thread change).
+  bb.rpc.register(rpcContract, {
+    ...pendingRoleRpc(store, defaultRole),
+    ...threadRoleRpc(store, {
+      updatePluginMetadata: (a) =>
+        bb.sdk.threads.updatePluginMetadata(a as never),
+      log: bb.log,
+    }),
+  });
 
   // ── Agent tools (§6): coordinators only, via configure. ──────────────
 
