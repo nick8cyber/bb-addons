@@ -17,6 +17,8 @@
   "include": [
     "server.ts",
     "credit-retry.ts",
+    "claude-key.ts",
+    "claude-key.test.ts",
     "credit-retry.test.ts",
     "usage-policy.ts",
     "usage-policy.test.ts",
