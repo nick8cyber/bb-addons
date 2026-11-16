@@ -14,6 +14,8 @@ import {
   loadBackends,
   withStateLock,
   pickBackendFromState,
+  getAccountPriority,
+  getAccountTier,
   MODELS,
 } from "../acp-server.mjs";
 
@@ -1112,4 +1114,32 @@ test("8. Smart model routing: pickBackendFromState prioritizes pro accounts for 
   fakeState.accounts.karina.lockedModels = ["carbon"];
   const nonePick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
   assert.equal(nonePick.none, true, "Must return none when all candidates have carbon locked");
+
+  // Priority tests:
+  // 1. Equal priority (all 10): "при прочих равных" Pro accounts are preferred for Argon over Ultra (Karina in end)
+  fakeState.accounts.karina.lockedModels = [];
+  fakeState.accounts.karina.priority = 10;
+  fakeState.accounts.nomerok2u.priority = 10;
+  fakeState.accounts.shat.priority = 10;
+  fakeState.accounts.karina.lastUsedMs = 10; // Karina has lowest lastUsedMs
+  fakeState.accounts.nomerok2u.lastUsedMs = 100;
+  fakeState.accounts.shat.lastUsedMs = 200;
+  const equalPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.equal(equalPrioPick.backend.id, "nomerok2u", "Equal priority should still prioritize pro account over ultra for argon");
+
+  // 2. Explicit priority ladder: higher priority picked first regardless of lastUsedMs
+  fakeState.accounts.shat.priority = 20; // Shat has priority 20
+  const higherPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.equal(higherPrioPick.backend.id, "shat", "Priority 20 must beat priority 10");
+
+  // 3. Priority 0: account is disabled and never picked
+  fakeState.accounts.shat.priority = 0;
+  fakeState.accounts.nomerok2u.priority = 0;
+  // Now only karina is left (> 0)
+  const onlyKarinaPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.equal(onlyKarinaPick.backend.id, "karina", "Priority 0 accounts must be ignored, picking remaining account");
+
+  fakeState.accounts.karina.priority = 0;
+  const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
 });

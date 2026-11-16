@@ -39,13 +39,14 @@ try {
     } catch {}
   }
   const idx = pool.accounts.findIndex((a) => a.id === label);
+  const isUltra = tier && tier.toLowerCase() === "ultra";
   const accountEntry = {
     id: label,
     email: email || `${label}@example.com`,
     profileDir: `~/.config/google-chrome-${label}`,
     cdpPort: Number(port),
-    priority: backend.priority ?? 10,
-    tier: tier && tier.toLowerCase() === "ultra" ? "ultra" : "pro",
+    priority: backend.priority ?? (isUltra ? 1 : 10),
+    tier: isUltra ? "ultra" : "pro",
   };
   if (idx >= 0) {
     pool.accounts[idx] = accountEntry;

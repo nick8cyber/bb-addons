@@ -322,6 +322,18 @@ export function getAccountTier(b, state) {
   return "pro";
 }
 
+export function getAccountPriority(b, state) {
+  if (!b) return 10;
+  const e = accEntry(state, b.id);
+  if (typeof e?.priority === "number" && Number.isInteger(e.priority) && e.priority >= 0) {
+    return e.priority;
+  }
+  if (typeof b?.priority === "number" && Number.isInteger(b.priority) && b.priority >= 0) {
+    return b.priority;
+  }
+  return 10;
+}
+
 export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null) {
   const isLeased = (b) => {
     const l = state.leases && state.leases[b.id];
@@ -334,7 +346,8 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
 
   const req = requestedModel ? requestedModel.toLowerCase() : null;
   const candidates = BACKENDS.filter((b) => {
-    if (b.id === excludeId || b.priority <= 0) return false;
+    const prio = getAccountPriority(b, state);
+    if (b.id === excludeId || prio <= 0) return false;
     const tier = getAccountTier(b, state);
     if (req === "carbon" && tier !== "ultra") return false;
     if (req) {
@@ -351,8 +364,10 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
     (b) => (accEntry(state, b.id)?.cooldownUntilMs ?? 0) <= now && isLeased(b) === 0
   );
   if (free.length === 0) {
+    const maxCandidatePrio = Math.max(...candidates.map((b) => getAccountPriority(b, state)));
+    const topCandidates = candidates.filter((b) => getAccountPriority(b, state) === maxCandidatePrio);
     const soonest = Math.min(
-      ...candidates.map((b) => {
+      ...topCandidates.map((b) => {
         const freeAt = Math.max(isLeased(b), accEntry(state, b.id)?.cooldownUntilMs ?? 0);
         return freeAt > now ? freeAt : Infinity;
       })
@@ -363,23 +378,27 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
       : { cooledUntil: soonest };
   }
 
-  // When not requesting carbon, prefer pro accounts first to keep ultra accounts free for Carbon
-  let poolToPick = free;
+  // Pick highest priority tier first
+  const maxP = Math.max(...free.map((b) => getAccountPriority(b, state)));
+  const topTier = free.filter((b) => getAccountPriority(b, state) === maxP);
+
+  // When not requesting carbon, "при прочих равных" (equal priorities):
+  // prefer Pro accounts first to reserve Ultra accounts (Karina) for Carbon
+  let eligibleTier = topTier;
   if (req !== "carbon") {
-    const proAccounts = free.filter((b) => getAccountTier(b, state) === "pro");
+    const proAccounts = topTier.filter((b) => getAccountTier(b, state) === "pro");
     if (proAccounts.length > 0) {
-      poolToPick = proAccounts;
+      eligibleTier = proAccounts;
     }
   }
 
-  const maxP = Math.max(...poolToPick.map((b) => b.priority));
-  const topTier = poolToPick.filter((b) => b.priority === maxP);
-  topTier.sort(
+  // Within the eligible tier: LRU by lastUsedMs, tie-break by ID
+  eligibleTier.sort(
     (a, b) =>
       (accEntry(state, a.id)?.lastUsedMs ?? 0) - (accEntry(state, b.id)?.lastUsedMs ?? 0) ||
       a.id.localeCompare(b.id)
   );
-  return { backend: topTier[0] };
+  return { backend: eligibleTier[0] };
 }
 
 function acquireInState(state, b, owner, now) {
@@ -573,13 +592,13 @@ async function settleBackend(backendId, sessionId, untilMs, message, parkedReaso
       }
     }
     if (parkedReason) {
-      const enabled = BACKENDS.filter((b) => b.priority > 0).length;
+      const enabled = BACKENDS.filter((b) => getAccountPriority(b, state) > 0).length;
       const parked = Object.entries(state.accounts).filter(
         ([k, v]) =>
           k !== backendId &&
           v.parkedReason &&
           (v.cooldownUntilMs ?? 0) > Date.now() &&
-          BACKENDS.some((b) => b.id === k && b.priority > 0)
+          BACKENDS.some((b) => b.id === k && getAccountPriority(b, state) > 0)
       ).length;
       if (enabled > 1 && parked >= enabled - 1) {
         state.breaker = { at: Date.now(), reason: parkedReason, account: backendId };
