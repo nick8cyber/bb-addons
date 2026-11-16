@@ -40,6 +40,7 @@ import {
   type ThreadFacts,
 } from "./agent-config.js";
 import { NO_ROLE, roleForLevel } from "./roles.js";
+import { delegateBase } from "./delegate-base.js";
 import {
   presetModelMap,
   runChecked,
@@ -84,6 +85,9 @@ export interface DelegateResult {
   /** `cancelled` when the delegation was cancelled while dispatch ran. */
   status: "running" | "cancelled";
   setupErrors: SetupError[];
+  /** §22.2: «база не проверена: <причина>» when the published-base
+   * check did not run for this dispatch. */
+  baseUnchecked?: string;
 }
 
 interface DispatchResponse {
@@ -197,6 +201,13 @@ export interface DelegateDeps {
   /** §17.3: git access for the continue-point ancestry check — without
    * it `continuePoint` falls back to the timestamp heuristic. */
   cmd?: CmdRunner;
+  /** §22.2: this machine's bb hostId — the published-base check runs
+   * only for a worktree on THIS host. */
+  localHostId?: () => string | Promise<string>;
+  /** §22.1: refresh the repo's `orchestrator-leaks.json` snapshot on
+   * delegation — the executor's worktree scans staged diffs against
+   * these rules from its first commit. Best-effort. */
+  leaksSnapshot?: (repo: string, projectId: string) => void | Promise<void>;
   /** §2.2 git rules, read fresh at dispatch so edits and reissues see the
    * current setting (the server resolves built-in values to `language`). */
   gitInstructions?: () => string | undefined;
@@ -218,6 +229,13 @@ export interface DispatchStepsDeps {
    * presets without an explicit `machineId`. */
   primaryHostId(): Promise<string>;
   dispatchTimeoutMs?: number;
+  /** §22.2: git access for the published-base check (fetch +
+   * origin/<base>); absent — the preset's base passes unchanged. */
+  cmd?: CmdRunner;
+  /** §22.2: this machine's bb hostId — the published-base check runs
+   * only for a worktree on THIS host. */
+  localHostId?: () => string | Promise<string>;
+  leaksSnapshot?: DelegateDeps["leaksSnapshot"];
   gitInstructions?: DelegateDeps["gitInstructions"];
   /** §2.3 r24: parsed policy for the level→role map; absent = name rule. */
   policy?: () => Policy | null;
@@ -229,6 +247,9 @@ export interface DispatchStepsResult {
   /** `cancelled` when the delegation was cancelled while dispatch ran. */
   status: "running" | "cancelled";
   setupErrors: SetupError[];
+  /** §22.2: the published-base check did not run — the localized
+   * «база не проверена: <причина>» line for the delegate response. */
+  baseUnchecked?: string;
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -537,6 +558,7 @@ export async function runDelegate(
         levelNote,
         // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
         commentOnRefusal: true,
+        from: params.from,
       },
       { ...deps, policy: () => policy },
     );
@@ -576,6 +598,7 @@ export async function runDelegate(
     note: levelNote,
     status: res.status,
     setupErrors: res.setupErrors,
+    baseUnchecked: res.baseUnchecked,
   };
 }
 
@@ -610,6 +633,10 @@ export async function dispatchToRoute(
      * double the reason in the task trail.
      */
     commentOnRefusal?: boolean;
+    /** §22.2: the caller's explicit `--from` (not the continue point it
+     * resolved to) — a LOCAL target branch with unpublished commits
+     * refuses `from-unpublished` before the spawn. */
+    from?: string;
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
@@ -959,6 +986,8 @@ async function dispatchViaSpawn(
     levelNote?: string;
     onDispatchFailure?: "remove" | "fail";
     commentOnRefusal?: boolean;
+    /** §22.2: the caller's explicit `--from`, if any. */
+    from?: string;
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
@@ -1017,6 +1046,9 @@ async function dispatchViaSpawn(
 
   // (в) The environment from the preset — `presetSpawnEnvironment`.
   let environment: unknown;
+  // §22.2: set when the published-base check could not run — the
+  // delegate response carries «база не проверена: <причина>».
+  let baseUnchecked: string | undefined;
   if (p!.environmentKind === "project-default") {
     environment = { type: "project-default" };
   } else {
@@ -1034,16 +1066,44 @@ async function dispatchViaSpawn(
           "BB has no default machine",
       );
     }
-    environment = {
-      type: "host",
+    // §22.2: the copy's base is `origin/<baseBranch>` after a fresh
+    // fetch — never the local branch of the project copy, which may
+    // carry unpushed commits the executor would silently inherit. An
+    // explicit `--from` on a local target branch with such commits
+    // refuses `from-unpublished`; a fetch/branch failure refuses
+    // `base-unavailable`. The check skips where git is unreachable
+    // (another host, no local_path source, no runner) — the response
+    // then names the reason («база не проверена: <причина>»).
+    const base = await delegateBase(deps, {
+      projectId: linkedBbProjectId!,
       hostId,
-      workspace: {
-        type: "managed-worktree",
-        baseBranch: p!.baseBranch
-          ? { kind: "named", name: p!.baseBranch }
-          : { kind: "default" },
-      },
-    };
+      baseBranchName: p!.baseBranch ?? null,
+      from: opts.from,
+      taskKey: row.task_key,
+      callerProjectId: row.project_id ?? null,
+    });
+    if ("refuse" in base) {
+      await refuse(base.refuse);
+    } else {
+      if (base.kind === "skip") {
+        baseUnchecked = t("del.baseUnchecked", {
+          reason: t(`del.baseSkip.${base.reason}`),
+        });
+      }
+      environment = {
+        type: "host",
+        hostId,
+        workspace: {
+          type: "managed-worktree",
+          baseBranch:
+            base.kind === "skip"
+              ? p!.baseBranch
+                ? { kind: "named", name: p!.baseBranch }
+                : { kind: "default" }
+              : base,
+        },
+      };
+    }
   }
 
   // (б) The BB seed prompt and the `KEY · title` width-120 title.
@@ -1112,7 +1172,12 @@ async function dispatchViaSpawn(
       levelNote: opts.levelNote,
       taskStatus: task!.status,
     });
-    return { threadId, status: done.status, setupErrors: done.setupErrors };
+    return {
+      threadId,
+      status: done.status,
+      setupErrors: done.setupErrors,
+      baseUnchecked,
+    };
   } catch (fatal) {
     try {
       await deps.threads.stop({ threadId });
@@ -1121,7 +1186,7 @@ async function dispatchViaSpawn(
     }
     if (store.get(row.id)?.status === "cancelled") {
       // A cancel that landed meanwhile already owns the outcome.
-      return { threadId, status: "cancelled", setupErrors: [] };
+      return { threadId, status: "cancelled", setupErrors: [], baseUnchecked };
     }
     if (opts.onDispatchFailure === "fail") {
       store.setStatus(row.id, "failed");
