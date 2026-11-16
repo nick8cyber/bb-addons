@@ -61,7 +61,8 @@ tags: [bb, plugins, files, download, pwa]
 
 ## 4. Проверка
 
-- [ ] Юнит-тесты `src/resolve.ts`: три `source.kind`, base64/utf8 → Blob, basename, ошибки разрешения.
-- [ ] `tsc --noEmit`, `bb plugin build`.
-- [ ] Живой прогон на инстансе владельца: клик по ссылке на `.md`/`.zip` из треда → файл в загрузках браузера; предпросмотр на месте; повтор через кнопку.
-- [ ] Установка на инстанс Орнеллы (path-install, как остальные).
+- [x] Юнит-тесты `src/resolve.ts`: три `source.kind`, base64/utf8 → Blob, basename, ошибки разрешения — 13/13.
+- [x] `tsc --noEmit`, `bb plugin build` на SDK 0.6.132.
+- [x] Плагин в реестре сервера (`running`) на обоих инстансах; байтовый путь `bb file read` подтверждён.
+- [ ] Живой клик в UI (headless-браузер на хосте не стартует — первую загрузку подтверждает владелец).
+- [x] Установка на инстанс Орнеллы через bb-addons-ornella-sync → `file-download@0.1.0 running` из `/opt/bb-addons-ornella`.
