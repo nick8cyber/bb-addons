@@ -40,7 +40,7 @@ try {
   const accountEntry = {
     id: label,
     email: email || `${label}@example.com`,
-    profileDir: `~/.config/google-chrome-${label}`,
+    profileDir: join(homedir(), ".config", `google-chrome-${label}`),
     cdpPort: Number(port),
     priority: backend.priority ?? 10,
   };
