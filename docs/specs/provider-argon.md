@@ -52,10 +52,10 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB (`Low`, `Medium`, `High`);
     - `account` (категория `"account"`, возвращается при наличии более одного аккаунта в пуле): выбор аккаунта (`"auto"` или конкретный `id` аккаунта).
   Все опции принимаются и обрабатываются в `session/set_config_option`.
-- **`session/set_model`** — меняет `s.model` и синхронизирует `s.thinking` по умолчанию (`medium` для `argon` и `carbon`).
+- **`session/set_model`** — меняет `s.model` через `resolveModelId`; `s.thinking` не изменяет — при незаданном уровне подставляется `medium`.
 - **`session/set_config_option`**:
   - при `configId === "thought_level"` (или `configId === "thinking"`) обновляет уровень мышления `s.thinking`: `"low"` → `"low"`, `"medium"` → `"medium"`, `"high"` → `"high"`, не затрагивая выбранную модель `s.model`;
-  - при `configId === "model"`: updates `s.model` to one of `argon`, `carbon`, `hydrogen`, `pro`, `flash-lite` via `resolveModelId` (aliases `fast`/`flash`/`lite` → `flash-lite`); an unknown value returns -32602 `unknown model`;
+  - при `configId === "model"` обновляет `s.model` через `resolveModelId` до одного из `argon`, `carbon`, `hydrogen`, `pro`, `flash-lite` (псевдонимы `fast`/`flash`/`lite` → `flash-lite`); неизвестное значение — ошибка -32602 `unknown model`;
   - при `configId === "account"` обновляет `s.account` (`"auto"` или id аккаунта); при смене аккаунта сбрасывает `s.backend = null` и `s.convId = null`.
 - **Передача в веб-драйвер**:
   - В драйвер передаётся `model: s.model` (`"argon"` передаётся как есть, без подмены на `"thinking"`, чтобы селектор модели не искал несуществующую модель).
