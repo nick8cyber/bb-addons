@@ -319,17 +319,10 @@ export const MIGRATIONS: readonly string[] = [
   // §19.6 (r33): the once-archived mark — the 24 h cleanup pass selects
   // terminal helpers without it instead of re-archiving every minute.
   `ALTER TABLE helpers ADD COLUMN archived_at INTEGER`,
-  // §20.2 (r33): a busy `maxActive` route parks the delegation
-  // `dispatching` with `queued_at` set — the watchdog retries in
-  // `queued_at` order until `routeBusyWaitSeconds` runs out. `attach`
-  // holds the dispatch's packet spec as JSON
-  // (`{"paths":[…],"from":…}`) so a reissue rebuilds the same packet.
-  `ALTER TABLE delegations ADD COLUMN queued_at INTEGER`,
-  `ALTER TABLE delegations ADD COLUMN attach TEXT`,
-  // §25 (r33.4): the owner's in-window role pick writes
+  // §25 (r33.4, PLUG-283): the owner's in-window role pick writes
   // `thread_roles.source = 'owner'` — SQLite cannot widen a CHECK, so
-  // the table is recreated; old rows move over untouched. Stays LAST —
-  // the §25 test slices the tail entry off to build an «old» database.
+  // the table is recreated; old rows move over untouched. Must stay at
+  // index 52 — live DBs already recorded its statement hash.
   `CREATE TABLE thread_roles_owner (
     thread_id TEXT PRIMARY KEY,
     role TEXT NOT NULL,
@@ -340,6 +333,13 @@ export const MIGRATIONS: readonly string[] = [
     SELECT thread_id, role, decided_at, source FROM thread_roles;
   DROP TABLE thread_roles;
   ALTER TABLE thread_roles_owner RENAME TO thread_roles`,
+  // §20.2 (r33): a busy `maxActive` route parks the delegation
+  // `dispatching` with `queued_at` set — the watchdog retries in
+  // `queued_at` order until `routeBusyWaitSeconds` runs out. `attach`
+  // holds the dispatch's packet spec as JSON
+  // (`{"paths":[…],"from":…}`) so a reissue rebuilds the same packet.
+  `ALTER TABLE delegations ADD COLUMN queued_at INTEGER`,
+  `ALTER TABLE delegations ADD COLUMN attach TEXT`,
 ];
 
 export type CommandRunStatus =

@@ -118,7 +118,11 @@ test("§25 (r33.4): the CHECK migration keeps old rows and allows 'owner'", () =
   // An "old" database — every migration but the CHECK widen — with
   // hook/delegate rows already inside; the recreate must keep them.
   const db = new Database(":memory:");
-  for (const m of MIGRATIONS.slice(0, -1)) db.exec(m);
+  const ownerIndex = MIGRATIONS.findIndex((m) =>
+    m.includes("thread_roles_owner"),
+  );
+  assert.ok(ownerIndex >= 0, "thread_roles_owner migration must exist");
+  for (const m of MIGRATIONS.slice(0, ownerIndex)) db.exec(m);
   db.prepare(
     `INSERT INTO thread_roles (thread_id, role, decided_at, source)
      VALUES ('thr_h', 'executor', 1, 'hook'),
@@ -131,7 +135,7 @@ test("§25 (r33.4): the CHECK migration keeps old rows and allows 'owner'", () =
        VALUES ('thr_o', 'executor', 1, 'owner')`,
     ).run(),
   );
-  db.exec(MIGRATIONS.at(-1)!);
+  db.exec(MIGRATIONS[ownerIndex]!);
   const store = new DelegationStore(db);
   assert.equal(store.threadRole("thr_h")!.source, "hook");
   assert.equal(store.threadRole("thr_d")!.source, "delegate");
