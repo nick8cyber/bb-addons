@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +33,8 @@ import { skillSet } from "../src/agent-config.js";
 import {
   assertInstalledHookFresh,
   renderPrePush,
+  syncInstalledGateHooks,
+  syncInstalledLeakScan,
   syncInstalledPrePush,
   type ReleaseDeps,
 } from "../src/release.js";
@@ -144,7 +148,8 @@ test("§18.1: syncInstalledPrePush rewrites an installed hook on language change
 });
 
 /** Every name `hook-names` lists, like install.mjs: `pre-push` carries
- * the rendered messages, the rest are byte-copies of `chain`. */
+ * the rendered messages, `pre-commit` the staged gate, the rest are
+ * byte-copies of `chain`; `leak-scan.ts` lands alongside (§22.1). */
 function installWrappers(dir: string, prePush: Buffer) {
   const hooksSrc = join(pluginDir, "hooks");
   mkdirSync(dir, { recursive: true });
@@ -154,9 +159,51 @@ function installWrappers(dir: string, prePush: Buffer) {
     .filter((l) => l && !l.startsWith("#"));
   for (const n of names) {
     if (n === "pre-push") writeFileSync(join(dir, n), prePush);
+    else if (n === "pre-commit") cpSync(join(hooksSrc, n), join(dir, n));
     else cpSync(join(hooksSrc, "chain"), join(dir, n));
   }
+  cpSync(join(hooksSrc, "leak-scan.ts"), join(dir, "leak-scan.ts"));
 }
+
+test("§22.1 (ревью): syncInstalledGateHooks кладёт leak-scan.ts рядом с установленным pre-commit", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-scan-"));
+  // A pre-r33.1 install: the gate is there, the scanner module is not.
+  cpSync(join(pluginDir, "hooks", "pre-commit"), join(dir, "pre-commit"));
+  assert.equal(syncInstalledGateHooks(dir, T_RU), true);
+  assert.equal(
+    readFileSync(join(dir, "leak-scan.ts"), "utf8"),
+    readFileSync(join(pluginDir, "hooks", "leak-scan.ts"), "utf8"),
+  );
+  // A stale copy is replaced byte-for-byte; a fresh one is left alone.
+  writeFileSync(join(dir, "leak-scan.ts"), "stale\n");
+  assert.equal(syncInstalledLeakScan(dir), true);
+  assert.equal(syncInstalledGateHooks(dir, T_RU), false);
+  // No installed pre-commit → nothing to drop the scanner for.
+  const bare = mkdtempSync(join(tmpdir(), "orch-scan-none-"));
+  assert.equal(syncInstalledLeakScan(bare), false);
+  assert.equal(existsSync(join(bare, "leak-scan.ts")), false);
+});
+
+test("§22.1 (ревью): assertInstalledHookFresh чинит leak-scan.ts на месте, а не отказывает", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-scan-fresh-"));
+  installWrappers(dir, renderPrePush(T_RU));
+  const deps = () =>
+    ({
+      hooksDir: () => dir,
+      t: T_RU,
+    }) as unknown as ReleaseDeps;
+  // A corrupted scanner is synced in place — the check then passes.
+  writeFileSync(join(dir, "leak-scan.ts"), "stale\n");
+  assert.doesNotThrow(() => assertInstalledHookFresh(deps()));
+  assert.equal(
+    readFileSync(join(dir, "leak-scan.ts"), "utf8"),
+    readFileSync(join(pluginDir, "hooks", "leak-scan.ts"), "utf8"),
+  );
+  // A missing scanner is restored the same way.
+  rmSync(join(dir, "leak-scan.ts"));
+  assert.doesNotThrow(() => assertInstalledHookFresh(deps()));
+  assert.equal(existsSync(join(dir, "leak-scan.ts")), true);
+});
 
 test("§18.1 (ревью PLUG-247a п.7): a language change via settings.onChange rewrites the installed pre-push", async () => {
   const host = createFakePluginHost({

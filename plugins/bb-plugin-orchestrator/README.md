@@ -27,6 +27,24 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `no-code` in `status`/`show`, and makes `merge`/`release` refuse
   "a no-code task: nothing to merge" when the last round produced no
   commits (r28.1).
+  **Delegation base (§22.2):** a managed-worktree dispatch runs
+  `git fetch` on the target repo and bases the executor copy on
+  `origin/<baseBranch>` (the remote's default branch when the preset
+  names none) — never on the project copy's local branch, which may
+  carry unpushed commits. A new round of the same task without
+  `--from` still continues the work from the previous round's tip
+  (§4.1) — the executor merges it onto the fresh base. `--from <ref>`
+  is checked as `origin/<target>..<ref>` and refuses only when
+  `<ref>` is the copy's local target branch (`main`/`master`/`dev`)
+  carrying commits that are neither in `origin/<base>` nor from this
+  task (its own rounds, results merged by `bb orchestrator merge`,
+  release-pipeline shas): `from-unpublished: <n> коммитов не в
+  origin/<цель> и не из этой задачи`; a coordinator's spec branch, a
+  sha or `HEAD` always pass. A failed `git fetch` or a missing
+  `origin/<baseBranch>` refuses `base-unavailable: <error>`; where
+  git is unreachable (a foreign target host, no `local_path` source
+  on it, no cmd runner) the check skips and the spawn keeps the
+  preset's base.
 - **Coordinator gating**: the `orchestrator_*` tools and the routing rule
   reach only threads whose role may delegate (`delegates`, §13);
   `delegate` re-checks the caller at call time (`not-a-coordinator`).
@@ -74,9 +92,11 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   name. The same shadowing works the other way too: while a global
   `core.hooksPath` is set git reads hooks ONLY from it, so a
   repository's own `.git/hooks/push-to-checkout` never fires anyway —
-  keeping the name in the wrapper set would buy nothing. `pre-push` is the orchestrator gate; the rest are copies of
-  `chain`, which execs the repo's own `.git/hooks/<name>` — only when
-  it is executable, like git itself. The shared `pre-push` is a
+  keeping the name in the wrapper set would buy nothing. `pre-push` is
+  the orchestrator push gate and `pre-commit` (§22.1) the staged-diff
+  leak gate — both chain to the local hook afterwards; the rest are
+  copies of `chain`, which execs the repo's own `.git/hooks/<name>` —
+  only when it is executable, like git itself. The shared `pre-push` is a
   **forgetfulness guard, not a hard gate**: it stops an accidental
   `git push` via a one-time `push-token-*.json` binding branch+sha,
   but an agent running as the same user could write the token itself —
@@ -89,11 +109,24 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   plugin update re-run `hooks/install.mjs` — `release` refuses
   `hook-stale` when any expected wrapper is missing, differs from the
   plugin's, or a retired `push-to-checkout` wrapper is left over.
-  `threadIds` (default on) allows the thread-id marker in the PR body
-  from the `prBody` template (default `BB-Thread: {thread}` /
-  `BB-Task: {task}`) and exempts `thr_…` from the bb-ids leak rule;
-  off — `prBody` is not applied, the body is empty, and every
-  `thr_…` is a `leaks.bbIds` finding (see "PR body").
+  **Shared `pre-commit` (§22.1):** scans the staged diff's added lines
+  with the same leak rules the release machine scan uses — the shared
+  core lives in `hooks/leak-scan.ts` and ships next to the wrappers.
+  Severity `block` refuses the commit, `warn` prints a warning and
+  lets it through. The hook reads the resolved leak settings from
+  `<git-common-dir>/orchestrator-leaks.json`, which the plugin refreshes
+  on settings load, on every settings save, on each delegation and
+  whenever it resolves the repo's release project; written from a
+  worktree the snapshot lands in the shared git dir, so every linked
+  worktree is covered. With no snapshot the embedded defaults apply —
+  including `os.hostname()` and the built-in `leaks.allow` exceptions
+  (`tests/fixtures/leak-samples.ts`). `threadIds` (default on) allows
+  the thread-id marker in the PR body from the `prBody` template
+  (default `BB-Thread: {thread}` / `BB-Task: {task}`) and exempts
+  `thr_…` from the bb-ids leak rule in COMMIT MESSAGES; in file
+  content `thr_…` is a finding regardless. Off — `prBody` is not
+  applied, the body is empty, and every `thr_…` is a `leaks.bbIds`
+  finding (see "PR body").
   `allowedTrailers` / `allowedEmails` (§17.3 C6) exempt matching
   commit trailers (e.g. `Co-Authored-By`) and e-mail addresses/domains
   from the machine scan's `foreign-bot-trailer` / `personal-email`
@@ -139,7 +172,23 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   configured checkout after push and reloads the changed plugins —
   dirs with a changed manifest need `npm ci`, providers with running
   turns are postponed, and the orchestrator plugin reloads itself via
-  a one-shot script automation (it cannot reload itself).
+  a one-shot script automation (it cannot reload itself). Before the
+  fast-forward the copy is checked in order (§22.3), each failure
+  with its own line: "the copy is on <branch|a detached commit> —
+  the new version is not loaded; switch the copy to <target>" (not on
+  the target branch or detached), "the copy has <n> local commits not
+  in <target> — the new version is not loaded" (diverged from
+  origin), "the copy has uncommitted changes (<n> files) — the new
+  version is not loaded" (dirty per `git status --porcelain -uno`, or
+  untracked files colliding with `git diff --name-only
+  HEAD..origin/<target>` — other untracked files do not block); when
+  the checks pass but the fast-forward itself fails — "could not
+  update the copy — the new version is not loaded; details in the
+  plugin log". Raw git output goes only to the plugin log, and no
+  reloads run in these cases. When at least one reloaded plugin has
+  an `app` field in its `plugin.json` (or the file it points at
+  exists), the outcome line ends with "reload the BB page to see the
+  new version: <id>, <id>" (§22.4).
 - **Reconcile** (§7): on service start and every 60 s — re-reads threads
   and events after `last_seq`, finishes half-done §4.4–4.6 steps, relinks
   `dispatching` rows by the `pluginMetadata.delegationId` label under the

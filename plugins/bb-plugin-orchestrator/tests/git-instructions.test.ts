@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
@@ -667,4 +671,55 @@ test("§4.1 r28: a reissue of a no_code row dispatches the line too", async () =
   assert.equal(fresh.no_code, 1);
   await dispatchToRoute(fresh, {}, deps);
   assert.match(dispatchedInstructions(spawnCalls)!, /задача без кода/);
+});
+
+// ── §22.1 (ревью): снимок leaks — при загрузке и сохранении настроек ────
+
+test("§22.1 (ревью): загрузка и сохранение настроек пишут orchestrator-leaks.json", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "snaprepo-"));
+  execFileSync("git", ["init", repo]);
+  const release = (allow: string[]) =>
+    JSON.stringify({ projects: { proj_repo: { leaks: { allow } } } });
+  const { cli } = fakeCli((args) =>
+    args.join(" ").startsWith("project list")
+      ? ok(
+          JSON.stringify([
+            {
+              id: "proj_repo",
+              sources: [
+                { type: "local_path", path: repo, isDefault: true },
+              ],
+            },
+          ]),
+        )
+      : undefined,
+  );
+  const { host } = await hostWith({ release: release(["docs/"]) }, cli);
+  const snap = join(repo, ".git", "orchestrator-leaks.json");
+  const read = () => {
+    try {
+      return JSON.parse(readFileSync(snap, "utf8")) as {
+        allow?: string[];
+      };
+    } catch {
+      return null;
+    }
+  };
+  for (let i = 0; i < 60 && !read(); i++) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.deepEqual(
+    read()?.allow,
+    ["docs/"],
+    "snapshot written on settings load",
+  );
+  await host.harness.setSettings({ release: release(["gen/**"]) });
+  for (let i = 0; i < 60 && read()?.allow?.[0] !== "gen/**"; i++) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.deepEqual(
+    read()?.allow,
+    ["gen/**"],
+    "snapshot rewritten on settings save",
+  );
 });

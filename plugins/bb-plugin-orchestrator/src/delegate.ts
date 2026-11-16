@@ -40,6 +40,7 @@ import {
   type ThreadFacts,
 } from "./agent-config.js";
 import { NO_ROLE, roleForLevel } from "./roles.js";
+import { delegateBase } from "./delegate-base.js";
 import {
   presetModelMap,
   runChecked,
@@ -197,6 +198,13 @@ export interface DelegateDeps {
   /** §17.3: git access for the continue-point ancestry check — without
    * it `continuePoint` falls back to the timestamp heuristic. */
   cmd?: CmdRunner;
+  /** §22.2: this machine's bb hostId — the published-base check runs
+   * only for a worktree on THIS host. */
+  localHostId?: () => string | Promise<string>;
+  /** §22.1: refresh the repo's `orchestrator-leaks.json` snapshot on
+   * delegation — the executor's worktree scans staged diffs against
+   * these rules from its first commit. Best-effort. */
+  leaksSnapshot?: (repo: string, projectId: string) => void | Promise<void>;
   /** §2.2 git rules, read fresh at dispatch so edits and reissues see the
    * current setting (the server resolves built-in values to `language`). */
   gitInstructions?: () => string | undefined;
@@ -218,6 +226,13 @@ export interface DispatchStepsDeps {
    * presets without an explicit `machineId`. */
   primaryHostId(): Promise<string>;
   dispatchTimeoutMs?: number;
+  /** §22.2: git access for the published-base check (fetch +
+   * origin/<base>); absent — the preset's base passes unchanged. */
+  cmd?: CmdRunner;
+  /** §22.2: this machine's bb hostId — the published-base check runs
+   * only for a worktree on THIS host. */
+  localHostId?: () => string | Promise<string>;
+  leaksSnapshot?: DelegateDeps["leaksSnapshot"];
   gitInstructions?: DelegateDeps["gitInstructions"];
   /** §2.3 r24: parsed policy for the level→role map; absent = name rule. */
   policy?: () => Policy | null;
@@ -537,6 +552,7 @@ export async function runDelegate(
         levelNote,
         // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
         commentOnRefusal: true,
+        from: params.from,
       },
       { ...deps, policy: () => policy },
     );
@@ -610,6 +626,10 @@ export async function dispatchToRoute(
      * double the reason in the task trail.
      */
     commentOnRefusal?: boolean;
+    /** §22.2: the caller's explicit `--from` (not the continue point it
+     * resolved to) — a LOCAL target branch with unpublished commits
+     * refuses `from-unpublished` before the spawn. */
+    from?: string;
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
@@ -959,6 +979,8 @@ async function dispatchViaSpawn(
     levelNote?: string;
     onDispatchFailure?: "remove" | "fail";
     commentOnRefusal?: boolean;
+    /** §22.2: the caller's explicit `--from`, if any. */
+    from?: string;
   },
   deps: DispatchStepsDeps,
 ): Promise<DispatchStepsResult> {
@@ -1034,14 +1056,35 @@ async function dispatchViaSpawn(
           "BB has no default machine",
       );
     }
+    // §22.2: the copy's base is `origin/<baseBranch>` after a fresh
+    // fetch — never the local branch of the project copy, which may
+    // carry unpushed commits the executor would silently inherit. An
+    // explicit `--from` on a local target branch with such commits
+    // refuses `from-unpublished`; a fetch/branch failure refuses
+    // `base-unavailable`. The check skips where git is unreachable
+    // (another host, no local_path source, no runner).
+    const base = await delegateBase(deps, {
+      projectId: linkedBbProjectId!,
+      hostId,
+      baseBranchName: p!.baseBranch ?? null,
+      from: opts.from,
+      taskKey: row.task_key,
+      callerProjectId: row.project_id ?? null,
+    });
+    if (typeof base === "object" && "refuse" in base) {
+      await refuse(base.refuse);
+    }
     environment = {
       type: "host",
       hostId,
       workspace: {
         type: "managed-worktree",
-        baseBranch: p!.baseBranch
-          ? { kind: "named", name: p!.baseBranch }
-          : { kind: "default" },
+        baseBranch:
+          base === "skip"
+            ? p!.baseBranch
+              ? { kind: "named", name: p!.baseBranch }
+              : { kind: "default" }
+            : base,
       },
     };
   }

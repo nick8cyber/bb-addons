@@ -121,8 +121,13 @@ import {
   releaseThreadsGet,
   runRelease,
   settingsProjectId,
-  syncInstalledPrePush,
+  syncInstalledGateHooks,
+  writeLeaksSnapshot,
 } from "./src/release.js";
+import {
+  projectRepoPath,
+  type BbProjectListItem,
+} from "./src/delegate-base.js";
 import {
   createT,
   resolveLang,
@@ -822,7 +827,7 @@ export async function createPlugin(
       currentT = createT(lang, (m) => bb.log.warn(m));
       try {
         if (
-          syncInstalledPrePush(
+          syncInstalledGateHooks(
             joinPath(pluginDataDir(), "git-hooks"),
             t,
           )
@@ -842,6 +847,15 @@ export async function createPlugin(
     for (const w of releaseConfig.warnings) {
       bb.log.warn(`orchestrator release config: ${w.path}: ${w.message}`);
     }
+    // §22.1 (ревью): a settings save rewrites every configured
+    // project's leaks snapshot — the pre-commit gate tracks the
+    // change without waiting for a release or a delegation. Deferred:
+    // this handler can fire before `syncLeaksSnapshots` is initialized.
+    void Promise.resolve()
+      .then(() => syncLeaksSnapshots())
+      .catch((e) =>
+        bb.log.warn(`orchestrator: leaks snapshot sync: ${describeError(e)}`),
+      );
     hooksLoad = parseEventHooks(currentSettings.eventHooks ?? "", t);
     for (const e of hooksLoad.errors) {
       bb.log.warn(`orchestrator eventHooks: ${e.path}: ${e.message}`);
@@ -1119,6 +1133,8 @@ export async function createPlugin(
         gitInstructions: () =>
         effectiveGitInstructions(currentSettings.gitInstructions, t),
         cmd,
+        localHostId,
+        leaksSnapshot,
         t,
       });
     });
@@ -1157,11 +1173,59 @@ export async function createPlugin(
     ).system?.config?.();
     return sys?.primaryHostId ?? "";
   };
+  const cmd = deps.cmd ?? createCmd();
+  /** §22.1 (ревью): `<common>/.git/orchestrator-leaks.json` feeds the
+   * shared `pre-commit` scan — refresh it on delegation too, not only
+   * at release settings resolution. Best-effort at the call site. */
+  const leaksSnapshot = async (repo: string, projectId: string) => {
+    const config = releaseConfig.config;
+    if (!config) return;
+    await writeLeaksSnapshot(
+      { cmd },
+      repo,
+      resolveProject(config, projectId),
+    );
+  };
+  /** §22.1 (ревью): write the leaks snapshot for EVERY configured
+   * project on settings load and on every settings save — a fresh
+   * worktree scans staged diffs against current rules before any
+   * release ever ran. Best-effort throughout. */
+  const syncLeaksSnapshots = async () => {
+    const config = releaseConfig.config;
+    if (!config?.projects || !Object.keys(config.projects).length) return;
+    const list = await bbCli.run(["project", "list", "--json"], {
+      timeoutMs: 30_000,
+    });
+    if (list.exitCode !== 0) return;
+    let projects: BbProjectListItem[];
+    try {
+      const parsed: unknown = JSON.parse(list.stdout);
+      if (!Array.isArray(parsed)) return;
+      projects = parsed as BbProjectListItem[];
+    } catch {
+      return;
+    }
+    const localHost = String((await localHostId()) ?? "");
+    for (const pid of Object.keys(config.projects)) {
+      const repo = projectRepoPath(projects, pid, localHost, localHost);
+      if (!repo) continue;
+      try {
+        await leaksSnapshot(repo, pid);
+      } catch {
+        // one project's write must not starve the rest
+      }
+    }
+  };
   const stepsDeps = {
     store,
     bbCli,
     threads: bb.sdk.threads as unknown as DelegateThreads,
     primaryHostId,
+    // §22.2: the published-base check needs git (cmd) and the local
+    // host id to skip worktrees spawned on another machine.
+    cmd,
+    localHostId,
+    leaksSnapshot,
     gitInstructions: () =>
         effectiveGitInstructions(currentSettings.gitInstructions, t),
     policy: () => policyLoad.policy,
@@ -1185,7 +1249,6 @@ export async function createPlugin(
     getPluginMetadata: (a: { threadId: string }) =>
       bb.sdk.threads.getPluginMetadata(a),
   };
-  const cmd = deps.cmd ?? createCmd();
   const pluginDataDir = () => {
     try {
       return joinPath(
@@ -1252,10 +1315,16 @@ export async function createPlugin(
   // §18.1 (PLUG-247a): an installed pre-push is language-versioned —
   // sync it at startup too (a plugin update may have added MESSAGES).
   try {
-    syncInstalledPrePush(releaseDeps.hooksDir(), t);
+    syncInstalledGateHooks(releaseDeps.hooksDir(), t);
   } catch (e) {
     bb.log.warn(`orchestrator: pre-push sync: ${describeError(e)}`);
   }
+  // §22.1 (ревью): the leaks snapshot is refreshed on settings LOAD
+  // (here), on every settings save (the onChange handler) and on each
+  // delegation — the pre-commit gate never waits for a release.
+  void syncLeaksSnapshots().catch((e) =>
+    bb.log.warn(`orchestrator: leaks snapshot sync: ${describeError(e)}`),
+  );
   const pumpRelease = () =>
     pumpReleases(releaseDeps).catch((e) =>
       bb.log.warn(`orchestrator release pump: ${describeError(e)}`),

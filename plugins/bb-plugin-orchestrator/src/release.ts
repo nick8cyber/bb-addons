@@ -494,11 +494,29 @@ export async function settingsProjectId(
     }
   }
 
+  // §22.1: the resolved `leaks` settings feed the shared `pre-commit`
+  // gate via a snapshot in the COMMON git dir — every worktree of this
+  // repo (the coordinator's and the executors' copies alike) scans
+  // staged diffs with the same rules. Best-effort: a failed write must
+  // not break the release pipeline.
+  const finish = async (pid: string) => {
+    if (config) {
+      try {
+        await writeLeaksSnapshot(deps, repo, resolveProject(config, pid));
+      } catch {
+        // the hook scans with built-in rules without a snapshot
+      }
+    }
+    return pid;
+  };
+
   // §6 п.4: one candidate → it; several → the delegation's project if
   // among them, else ambiguous; none → unknown.
-  if (candidates.size === 1) return [...candidates][0]!;
+  if (candidates.size === 1) return finish([...candidates][0]!);
   if (candidates.size > 1) {
-    if (candidates.has(delegationProjectId)) return delegationProjectId;
+    if (candidates.has(delegationProjectId)) {
+      return finish(delegationProjectId);
+    }
     throw new OrchestratorError(
       "release-settings-ambiguous",
       t("rel.settingsAmbiguous", {
@@ -509,6 +527,40 @@ export async function settingsProjectId(
     );
   }
   throw unknown(t("rel.settingsNoMatch"));
+}
+
+/** §22.1: `<git common dir>/orchestrator-leaks.json` — the settings
+ * snapshot the shared `pre-commit` gate scans with. Carries only what
+ * the staged-diff rules need: `allow` places, `machine`/`bbIds`
+ * strictness, `threadIds`, `allowedEmails`, the host name for the
+ * machine-binding rule and `excluded` (a fully excluded project skips
+ * the scan entirely). */
+export async function writeLeaksSnapshot(
+  deps: Pick<ReleaseDeps, "cmd">,
+  repo: string,
+  project: ResolvedProject,
+): Promise<void> {
+  const common = await deps.cmd.run(
+    "git",
+    ["-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { timeoutMs: 15_000 },
+  );
+  if (common.exitCode !== 0) return;
+  const payload = {
+    version: 1,
+    allow: project.leaks.allow,
+    machine: project.leaks.machine,
+    bbIds: project.leaks.bbIds,
+    threadIds: project.threadIds,
+    allowedEmails: project.allowedEmails,
+    hostname: osHostname(),
+    excluded: project.excluded,
+    updatedAt: Date.now(),
+  };
+  writeFileSync(
+    join(common.stdout.trim(), "orchestrator-leaks.json"),
+    `${JSON.stringify(payload)}\n`,
+  );
 }
 
 // ── Step 1: приёмка ────────────────────────────────────────────────────
@@ -1261,19 +1313,37 @@ const PRE_PUSH_MESSAGE_KEYS = [
   "noToken",
 ] as const;
 
-export function renderPrePush(t: T = T_RU): Buffer {
-  const src = readFileSync(PLUGIN_HOOK, "utf8");
+/** §22.1: the `pre-commit` gate is language-versioned the same way —
+ * finding format + type names (`hookPc.*` catalog keys). */
+const PRE_COMMIT_MESSAGE_KEYS = [
+  "finding",
+  "findingWarn",
+  "typeMachine",
+  "typeThreadId",
+  "typeEmail",
+  "typeSecret",
+] as const;
+
+const PLUGIN_PRE_COMMIT = join(PLUGIN_HOOKS_DIR, "pre-commit");
+
+function renderHook(
+  sourcePath: string,
+  keys: readonly string[],
+  keyPrefix: string,
+  t: T,
+): Buffer {
+  const src = readFileSync(sourcePath, "utf8");
   const messages: Record<string, string> = {};
-  for (const k of PRE_PUSH_MESSAGE_KEYS) {
-    // No params — the `{remote}`/`{sha}` placeholders must survive for
-    // the hook's own runtime interpolation.
-    messages[k] = t(`hook.${k}`);
+  for (const k of keys) {
+    // No params — the `{remote}`/`{file}`/`{line}`… placeholders must
+    // survive for the hook's own runtime interpolation.
+    messages[k] = t(`${keyPrefix}.${k}`);
   }
   const line = `const MESSAGES = ${JSON.stringify(messages)};`;
-  // Note: renderPrePush(T_RU) reproduces the shipped source byte-for-
-  // byte, so an unchanged result is correct, not an error.
+  // Note: render*(T_RU) reproduces the shipped source byte-for-byte,
+  // so an unchanged result is correct, not an error.
   if (!/^const MESSAGES = .*;$/m.test(src)) {
-    throw new Error("pre-push source has no MESSAGES block");
+    throw new Error(`${sourcePath} source has no MESSAGES block`);
   }
   return Buffer.from(
     src.replace(/^const MESSAGES = .*;$/m, () => line),
@@ -1281,19 +1351,33 @@ export function renderPrePush(t: T = T_RU): Buffer {
   );
 }
 
+export function renderPrePush(t: T = T_RU): Buffer {
+  return renderHook(PLUGIN_HOOK, PRE_PUSH_MESSAGE_KEYS, "hook", t);
+}
+
+/** §22.1: `renderPreCommit(T_RU)` is byte-identical to `hooks/pre-commit`. */
+export function renderPreCommit(t: T = T_RU): Buffer {
+  return renderHook(PLUGIN_PRE_COMMIT, PRE_COMMIT_MESSAGE_KEYS, "hookPc", t);
+}
+
 /** §18.1 (PLUG-247a): language change (or a plugin update) must rewrite
  * an installed `pre-push` so its texts match the selected language.
  * No installed file → nothing to sync (an absent guard stays absent).
  * Returns true when the file was rewritten. */
-export function syncInstalledPrePush(hooksDir: string, t: T): boolean {
-  const path = join(hooksDir, "pre-push");
+function syncInstalledHook(
+  hooksDir: string,
+  name: string,
+  render: (t: T) => Buffer,
+  t: T,
+): boolean {
+  const path = join(hooksDir, name);
   let installed: Buffer;
   try {
     installed = readFileSync(path);
   } catch {
     return false;
   }
-  const current = renderPrePush(t);
+  const current = render(t);
   if (installed.equals(current)) return false;
   // Atomic install: a crash mid-write must not leave a torn hook —
   // write the sibling temp file, then rename over the target.
@@ -1306,6 +1390,47 @@ export function syncInstalledPrePush(hooksDir: string, t: T): boolean {
     throw e;
   }
   return true;
+}
+
+export function syncInstalledPrePush(hooksDir: string, t: T): boolean {
+  return syncInstalledHook(hooksDir, "pre-push", renderPrePush, t);
+}
+
+/** §22.1 (ревью): `pre-commit` loads `leak-scan.ts` from its own
+ * directory — a plugin update must copy the scanner beside an
+ * installed gate, atomically like the gates themselves, or the hook
+ * fails open. No installed `pre-commit` → nothing to sync. Returns
+ * true when the file moved. */
+export function syncInstalledLeakScan(hooksDir: string): boolean {
+  const preCommit = join(hooksDir, "pre-commit");
+  if (!existsSync(preCommit)) return false;
+  const path = join(hooksDir, "leak-scan.ts");
+  const current = readFileSync(join(PLUGIN_HOOKS_DIR, "leak-scan.ts"));
+  try {
+    if (readFileSync(path).equals(current)) return false;
+  } catch {
+    // missing — write it
+  }
+  const tmp = `${path}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, current);
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+  return true;
+}
+
+/** §18.1 + §22.1: every language-versioned gate the installer drops
+ * (`pre-push` AND `pre-commit`) — a language change or plugin update
+ * rewrites each installed one, plus the scanner module `pre-commit`
+ * loads. Returns true when any file moved. */
+export function syncInstalledGateHooks(hooksDir: string, t: T): boolean {
+  const a = syncInstalledHook(hooksDir, "pre-push", renderPrePush, t);
+  const b = syncInstalledHook(hooksDir, "pre-commit", renderPreCommit, t);
+  const c = syncInstalledLeakScan(hooksDir);
+  return a || b || c;
 }
 
 /** §17.3 (Б2): standard names the installer covers — shared with
@@ -1324,11 +1449,15 @@ function standardHookNames(): string[] {
 /** §18.1: true when `installed` is a byte-for-byte `pre-push` rendered
  * under a language other than the current one — the shipped installer
  * drops exactly one variant regardless of the `language` setting. */
-function isOtherLanguageRender(installed: Buffer, t: T): boolean {
+function isOtherLanguageRender(
+  installed: Buffer,
+  render: (t: T) => Buffer,
+  t: T,
+): boolean {
   for (const lang of LANGS) {
     if (lang === t.lang) continue;
     try {
-      if (installed.equals(renderPrePush(createT(lang)))) return true;
+      if (installed.equals(render(createT(lang)))) return true;
     } catch {
       // a broken rendering simply does not match
     }
@@ -1365,25 +1494,31 @@ export function assertInstalledHookFresh(deps: ReleaseDeps): void {
       continue;
     }
     present++;
-    // §18.1 (PLUG-247a): `pre-push` is language-versioned — compare the
-    // installed copy with the current language's rendering, not the
-    // Russian source bytes.
+    // §18.1 (PLUG-247a): the gates are language-versioned — compare an
+    // installed `pre-push`/`pre-commit` with the current language's
+    // rendering, not the Russian source bytes.
+    const gateRender =
+      name === "pre-push"
+        ? renderPrePush
+        : name === "pre-commit"
+          ? renderPreCommit
+          : null;
     let current: Buffer;
     try {
-      current =
-        name === "pre-push"
-          ? renderPrePush(t)
-          : readFileSync(join(PLUGIN_HOOKS_DIR, "chain"));
+      current = gateRender
+        ? gateRender(t)
+        : readFileSync(join(PLUGIN_HOOKS_DIR, "chain"));
     } catch {
       continue;
     }
     if (!installed.equals(current)) {
-      // §18.1: the shipped installer copies the repo's `pre-push` as is,
-      // so a fresh install may carry another language's MESSAGES — that
-      // copy is still fresh; sync it to the current language in place.
-      if (name === "pre-push" && isOtherLanguageRender(installed, t)) {
+      // §18.1: the shipped installer copies the repo's gate sources as
+      // is, so a fresh install may carry another language's MESSAGES —
+      // that copy is still fresh; sync it to the current language in
+      // place.
+      if (gateRender && isOtherLanguageRender(installed, gateRender, t)) {
         try {
-          syncInstalledPrePush(dir, t);
+          syncInstalledHook(dir, name, gateRender, t);
         } catch {
           // a failed rewrite still leaves a working hook — not stale
         }
@@ -1392,6 +1527,29 @@ export function assertInstalledHookFresh(deps: ReleaseDeps): void {
       stale.push(name);
     }
   }
+  // §22.1: `pre-commit` imports `leak-scan.ts` from its own directory —
+  // a stale or missing copy silently disables the staged scan (the hook
+  // fails open). It is not language-versioned, so with `pre-commit`
+  // installed the scanner is synced in place; a failed sync (or a stale
+  // file without the gate) stays part of the freshness report.
+  const scanName = "leak-scan.ts";
+  const scanFresh = () => {
+    try {
+      return readFileSync(join(dir, scanName)).equals(
+        readFileSync(join(PLUGIN_HOOKS_DIR, scanName)),
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (!scanFresh() && existsSync(join(dir, "pre-commit"))) {
+    try {
+      syncInstalledLeakScan(dir);
+    } catch {
+      // stays stale below
+    }
+  }
+  if (!scanFresh() && present > 0) stale.push(scanName);
   // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — a leftover
   // wrapper still disables git's built-in worktree update on
   // updateInstead pushes. Its presence alone is a stale install.
@@ -4447,8 +4605,16 @@ async function runPostPublish(
           "-q",
           "HEAD",
         ]).catch(() => "");
+        // §22.3: проверки копии до `ff` — по порядку (1) не на целевой
+        // ветке или detached, (2) целевая разошлась с origin, (3) грязная
+        // (правки в отслеживаемых + неотслеживаемые, пересекающиеся со
+        // входящим диффом). Отказ — понятной строкой без сырого вывода
+        // git (он уходит только в журнал), перезагрузки не выполняются.
         if (curBranch !== pp.branch) {
-          copyErr = t("pp.wrongBranch", { branch: pp.branch });
+          copyErr = t("pp.copyWrongState", {
+            where: curBranch === "" ? t("pp.detached") : curBranch,
+            target: pp.branch,
+          });
         } else {
           // §18.5: команды с cwd:checkout держат замок на копию весь
           // postPublish. Владелец — экземпляр плагина (не pid), состояние
@@ -4468,36 +4634,103 @@ async function runPostPublish(
             ["-C", co, "fetch", "origin"],
             { timeoutMs: 180_000 },
           );
-          if (fetchRes.exitCode !== 0) {
-            copyErr = t("pp.fetchFailed", {
-              err: maskCommandOutput(fetchRes.stderr || ""),
-            });
-          } else {
-            const ffRes = await deps.cmd.run(
-              "git",
-              ["-C", co, "merge", "--ff-only", `origin/${row.target_branch}`],
-              { timeoutMs: 120_000 },
+          // §22.3: инфраструктурный сбой (fetch/ff) — понятная строка,
+          // сырой вывод git — только в журнал плагина.
+          const copyInfraFailed = (
+            cmdline: string,
+            res: { stdout: string; stderr: string },
+          ) => {
+            deps.log?.warn?.(
+              `orchestrator: postPublish ${cmdline} ${row.task_key}: ` +
+                (res.stderr || res.stdout || "").trim().slice(0, 2000),
             );
-            if (ffRes.exitCode !== 0) {
-              copyErr = t("pp.ffFailed", {
-                err: maskCommandOutput(ffRes.stderr || ffRes.stdout || ""),
+            copyErr = t("pp.copyUpdateFailed");
+          };
+          if (fetchRes.exitCode !== 0) {
+            copyInfraFailed("fetch", fetchRes);
+          } else {
+            const origin = `origin/${row.target_branch}`;
+            // (2) целевая ветка разошлась с origin — локальные коммиты,
+            // которых в удалённой цели нет.
+            const ahead = Number(
+              await gitOut(["rev-list", "--count", `${origin}..HEAD`]).catch(
+                () => "",
+              ),
+            );
+            if (ahead > 0) {
+              copyErr = t("pp.copyDiverged", {
+                n: ahead,
+                target: row.target_branch,
               });
             } else {
-              copyOk = true;
-              newHead = await gitOut(["rev-parse", "HEAD"]).catch(() => "");
-              copyChanged = base
-                ? (
-                    await gitOut([
-                      "diff",
-                      "--name-only",
-                      `${base}..${newHead}`,
-                    ]).catch(() => "")
-                  )
-                    .split("\n")
-                    .filter(Boolean)
-                : [];
-              meta.copy = { head: newHead, changed: copyChanged };
-              saveMeta();
+              // (3) грязная: правки в отслеживаемых файлах или
+              // неотслеживаемые файлы, пересекающиеся с входящим диффом
+              // `HEAD..origin/<цель>` (прочие untracked не мешают).
+              const trackedDirty = (
+                await gitOut(["status", "--porcelain", "-uno"]).catch(
+                  () => "",
+                )
+              )
+                .split("\n")
+                .filter(Boolean).length;
+              const incoming = new Set(
+                (
+                  await gitOut([
+                    "diff",
+                    "--name-only",
+                    `HEAD..${origin}`,
+                  ]).catch(() => "")
+                )
+                  .split("\n")
+                  .filter(Boolean),
+              );
+              const untrackedOverlap = (
+                await gitOut(["status", "--porcelain"]).catch(() => "")
+              )
+                .split("\n")
+                .filter((l) => l.startsWith("?? "))
+                .map((l) => l.slice(3).trim().replace(/^"|"$/g, ""))
+                .filter(
+                  (f) =>
+                    incoming.has(f) ||
+                    // `?? foo/` is an untracked DIRECTORY; an untracked
+                    // FILE `foo` also overlaps `foo/bar.ts` — a checked-
+                    // out `foo/bar.ts` cannot coexist with it.
+                    [...incoming].some((p) =>
+                      p.startsWith(f.endsWith("/") ? f : `${f}/`),
+                    ),
+                ).length;
+              const dirtyN = trackedDirty + untrackedOverlap;
+              if (dirtyN > 0) {
+                copyErr = t("pp.copyDirty", { n: dirtyN });
+              } else {
+                const ffRes = await deps.cmd.run(
+                  "git",
+                  ["-C", co, "merge", "--ff-only", origin],
+                  { timeoutMs: 120_000 },
+                );
+                if (ffRes.exitCode !== 0) {
+                  copyInfraFailed("ff", ffRes);
+                } else {
+                  copyOk = true;
+                  newHead = await gitOut(["rev-parse", "HEAD"]).catch(
+                    () => "",
+                  );
+                  copyChanged = base
+                    ? (
+                        await gitOut([
+                          "diff",
+                          "--name-only",
+                          `${base}..${newHead}`,
+                        ]).catch(() => "")
+                      )
+                        .split("\n")
+                        .filter(Boolean)
+                    : [];
+                  meta.copy = { head: newHead, changed: copyChanged };
+                  saveMeta();
+                }
+              }
             }
           }
         }
@@ -4664,6 +4897,7 @@ async function runPostPublish(
       const running = deps.store.listByStatuses(ACTIVE_STATUSES);
       const reloaded: string[] = [];
       const skipped: string[] = [];
+      const appPlugins: string[] = [];
       // §6 r11: кандидат — плагин, чей rootDir лежит внутри копии и у
       // которого есть изменённые файлы base..HEAD под ним. Корень копии
       // = rootDir → любой diff триггерит. Пути вне rootDir — молча.
@@ -4714,6 +4948,9 @@ async function runPostPublish(
             continue;
           }
           selfReload = { rootDir: rootReal, expectedSha: newHead };
+          // §22.4: the orchestrator itself may carry an interface — a
+          // self-reload still needs the reload-page tail.
+          if (await pluginHasApp(rootReal)) appPlugins.push(id);
           continue;
         }
         const r = await deps.bbCli.run(["plugin", "reload", id]);
@@ -4726,6 +4963,10 @@ async function runPostPublish(
           );
         } else {
           reloaded.push(id);
+          // §22.4: a plugin with an interface (plugin.json `app`, or
+          // the file it points to) — the browser keeps the old build,
+          // so the outcome line ends with the reload-page tail.
+          if (await pluginHasApp(rootReal)) appPlugins.push(id);
         }
       }
       if (reloaded.length) {
@@ -4740,6 +4981,11 @@ async function runPostPublish(
       if (!reloaded.length && !skipped.length && !selfReload) {
         bits.push(t("pp.noChanges"));
       }
+      // §22.4: the tail goes LAST — «обнови страницу BB…: <id>, <id>»
+      // only when at least one reloaded plugin carries an interface.
+      if (appPlugins.length) {
+        bits.push(t("pp.reloadPage", { list: appPlugins.join(", ") }));
+      }
     }
   }
   releasePostPublishLock(row.id);
@@ -4749,6 +4995,30 @@ async function runPostPublish(
     summary: `postPublish: ${bits.join("; ")}`,
     selfReload,
   };
+}
+
+/** §22.4: has the plugin an interface — its manifest (`plugin.json`
+ * first, `package.json` `bb.app` for repo checkouts) declares a
+ * nonempty `app` field, OR the file that field points to exists in
+ * the plugin root. A declared-but-not-yet-built `app` still counts —
+ * the browser keeps the old build either way. */
+async function pluginHasApp(rootDir: string): Promise<boolean> {
+  for (const name of ["plugin.json", "package.json"]) {
+    let manifest: { app?: unknown; bb?: { app?: unknown } };
+    try {
+      const parsed: unknown = JSON.parse(
+        readFileSync(join(rootDir, name), "utf8"),
+      );
+      if (!parsed || typeof parsed !== "object") continue;
+      manifest = parsed as typeof manifest;
+    } catch {
+      continue;
+    }
+    const app = manifest.app ?? manifest.bb?.app;
+    if (typeof app === "string" ? app.trim().length > 0 : Boolean(app))
+      return true;
+  }
+  return false;
 }
 
 /**
