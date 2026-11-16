@@ -667,7 +667,7 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const modelOpt4 = r4.result.configOptions.find((o) => o.id === "model");
   assert.equal(modelOpt4?.currentValue, "argon", "Model must remain 'argon' when thought_level changes on argon model");
 
-  // Verify non-argon model updates to pro when thought_level is set to high
+  // Verify non-argon/non-carbon model updates to pro when thought_level is set to high
   sendReq({
     jsonrpc: "2.0",
     id: 401,
@@ -684,16 +684,39 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   });
   const r402 = await waitForResponse(402);
   const modelOpt402 = r402.result.configOptions.find((o) => o.id === "model");
-  assert.equal(modelOpt402?.currentValue, "pro", "Model must update to 'pro' when thought_level is high and s.model !== 'argon'");
+  assert.equal(modelOpt402?.currentValue, "pro", "Model must update to 'pro' when thought_level is high and s.model is fast");
 
-  // Reset back to argon for the rest of the test
+  // Verify carbon model supports custom thought_level without model overwrite
   sendReq({
     jsonrpc: "2.0",
     id: 403,
     method: "session/set_model",
+    params: { sessionId, modelId: "carbon" },
+  });
+  const r403 = await waitForResponse(403);
+  const modelOpt403 = r403.result.configOptions.find((o) => o.id === "model");
+  assert.equal(modelOpt403?.currentValue, "carbon");
+
+  sendReq({
+    jsonrpc: "2.0",
+    id: 404,
+    method: "session/set_config_option",
+    params: { sessionId, configId: "thought_level", value: "low" },
+  });
+  const r404 = await waitForResponse(404);
+  const modelOpt404 = r404.result.configOptions.find((o) => o.id === "model");
+  const thoughtOpt404 = r404.result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(modelOpt404?.currentValue, "carbon", "Carbon model must be preserved when thought_level changes");
+  assert.equal(thoughtOpt404?.currentValue, "low", "Carbon thought_level must update to low");
+
+  // Reset back to argon for the rest of the test
+  sendReq({
+    jsonrpc: "2.0",
+    id: 405,
+    method: "session/set_model",
     params: { sessionId, modelId: "argon" },
   });
-  await waitForResponse(403);
+  await waitForResponse(405);
 
   // 5. session/prompt (streaming with lease retention check during execution)
   sendReq({
@@ -1020,7 +1043,7 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("8. Smart model routing: pickBackendFromState skips locked models and routes to available account", () => {
+test("8. Smart model routing: pickBackendFromState prioritizes pro accounts for argon and ultra for carbon", () => {
   const fakeState = {
     accounts: {
       nomerok2u: {
@@ -1044,21 +1067,37 @@ test("8. Smart model routing: pickBackendFromState skips locked models and route
     leases: {},
   };
 
-  // For argon: karina is least recently used (50 < 100 < 200)
+  // For argon: pro accounts (nomerok2u, shat) are prioritized over ultra (karina) to reserve ultra for carbon!
+  // Between nomerok2u (100) and shat (200), nomerok2u is least recently used
   const argonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
   assert.ok(argonPick.backend, "Should pick a backend for argon");
-  assert.equal(argonPick.backend.id, "karina");
+  assert.equal(argonPick.backend.id, "nomerok2u", "Argon should pick pro tier account first");
 
-  // When karina is leased, argon routes to nomerok2u (not locked for argon)
-  // Use a pseudo-PID that is alive or mock
+  // When nomerok2u is busy, argon picks shat (the remaining pro account)
+  fakeState.accounts.nomerok2u.inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts.nomerok2u.owner = "other-process";
+  const argonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.ok(argonPick2.backend, "Should pick shat for argon when nomerok2u is busy");
+  assert.equal(argonPick2.backend.id, "shat");
+
+  // When both pro accounts are busy, argon falls back to ultra (karina)
+  fakeState.accounts.shat.inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts.shat.owner = "other-process";
+  const argonPick3 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.ok(argonPick3.backend, "Should fall back to ultra account for argon when all pro accounts are busy");
+  assert.equal(argonPick3.backend.id, "karina");
+
+  // Reset pro accounts
+  fakeState.accounts.nomerok2u.inUseUntilMs = 0;
+  fakeState.accounts.nomerok2u.owner = null;
+  fakeState.accounts.shat.inUseUntilMs = 0;
+  fakeState.accounts.shat.owner = null;
+
+  // When requesting carbon: only ultra accounts (karina) are eligible.
+  // nomerok2u and shat are skipped (pro tier and locked).
+  // If karina is leased, it returns busyUntil
   fakeState.accounts.karina.inUseUntilMs = Date.now() + 60000;
   fakeState.accounts.karina.owner = "other-process";
-  const argonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
-  assert.ok(argonPick2.backend, "Should pick a backend for argon when karina is busy");
-  assert.equal(argonPick2.backend.id, "nomerok2u");
-
-  // When requesting carbon: nomerok2u and shat are skipped because carbon is in lockedModels
-  // Karina is inUse, so it should return busyUntil
   const carbonBusy = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
   assert.ok(carbonBusy.busyUntil, "Should return busyUntil for carbon when only karina supports it and is busy");
 
@@ -1069,15 +1108,8 @@ test("8. Smart model routing: pickBackendFromState skips locked models and route
   assert.ok(carbonPick.backend, "Should pick karina for carbon");
   assert.equal(carbonPick.backend.id, "karina");
 
-  // If all accounts have carbon locked, pickBackendFromState returns none
-  const allLockedState = {
-    accounts: {
-      nomerok2u: { cooldownUntilMs: 0, lockedModels: ["carbon"] },
-      shat: { cooldownUntilMs: 0, lockedModels: ["carbon"] },
-      karina: { cooldownUntilMs: 0, lockedModels: ["carbon"] },
-    },
-    leases: {},
-  };
-  const nonePick = pickBackendFromState(allLockedState, null, "test-owner", Date.now(), "carbon");
+  // If karina also gets carbon locked (e.g. lock icon detected, downgraded to pro), pickBackendFromState returns none
+  fakeState.accounts.karina.lockedModels = ["carbon"];
+  const nonePick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
   assert.equal(nonePick.none, true, "Must return none when all candidates have carbon locked");
 });

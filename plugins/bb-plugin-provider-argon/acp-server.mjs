@@ -67,6 +67,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profile: acc.profile || acc.id,
             cdp,
             priority: Number.isInteger(acc.priority) ? acc.priority : 10,
+            tier: acc.tier && acc.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
           });
         }
       }
@@ -97,6 +98,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profile: b.profile || ent.name,
             cdp,
             priority: Number.isInteger(b.priority) ? b.priority : 10,
+            tier: b.tier && b.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
           });
         } catch {}
       }
@@ -130,6 +132,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
               profile: b.profile || ent.name,
               cdp,
               priority: Number.isInteger(b.priority) ? b.priority : 10,
+              tier: b.tier && b.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
             });
           } catch {}
         }
@@ -153,6 +156,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profile: b.profile || null,
             cdp,
             priority: Number.isInteger(b.priority) ? b.priority : 10,
+            tier: b.tier && b.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
           });
         }
       }
@@ -171,6 +175,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
       profile: "default",
       cdp: /^\d{2,5}$/.test(envCdp) ? envCdp : "9222",
       priority: 10,
+      tier: "pro",
     });
   }
 
@@ -302,6 +307,21 @@ const accEnsure = (state, id) => {
   return state.accounts[id];
 };
 
+export function getAccountTier(b, state) {
+  if (!b) return "pro";
+  const e = accEntry(state, b.id);
+  if (e?.lockedModels && e.lockedModels.includes("carbon")) {
+    return "pro";
+  }
+  if (e?.tier) {
+    return e.tier.toLowerCase() === "ultra" ? "ultra" : "pro";
+  }
+  if (b?.tier) {
+    return b.tier.toLowerCase() === "ultra" ? "ultra" : "pro";
+  }
+  return "pro";
+}
+
 export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null) {
   const isLeased = (b) => {
     const l = state.leases && state.leases[b.id];
@@ -315,6 +335,8 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
   const req = requestedModel ? requestedModel.toLowerCase() : null;
   const candidates = BACKENDS.filter((b) => {
     if (b.id === excludeId || b.priority <= 0) return false;
+    const tier = getAccountTier(b, state);
+    if (req === "carbon" && tier !== "ultra") return false;
     if (req) {
       const e = accEntry(state, b.id);
       if (e?.lockedModels && e.lockedModels.includes(req)) {
@@ -341,14 +363,23 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
       : { cooledUntil: soonest };
   }
 
-  const maxP = Math.max(...free.map((b) => b.priority));
-  const tier = free.filter((b) => b.priority === maxP);
-  tier.sort(
+  // When not requesting carbon, prefer pro accounts first to keep ultra accounts free for Carbon
+  let poolToPick = free;
+  if (req !== "carbon") {
+    const proAccounts = free.filter((b) => getAccountTier(b, state) === "pro");
+    if (proAccounts.length > 0) {
+      poolToPick = proAccounts;
+    }
+  }
+
+  const maxP = Math.max(...poolToPick.map((b) => b.priority));
+  const topTier = poolToPick.filter((b) => b.priority === maxP);
+  topTier.sort(
     (a, b) =>
       (accEntry(state, a.id)?.lastUsedMs ?? 0) - (accEntry(state, b.id)?.lastUsedMs ?? 0) ||
       a.id.localeCompare(b.id)
   );
-  return { backend: tier[0] };
+  return { backend: topTier[0] };
 }
 
 function acquireInState(state, b, owner, now) {
@@ -537,6 +568,9 @@ async function settleBackend(backendId, sessionId, untilMs, message, parkedReaso
       if (!e.lockedModels.includes(lockedModel)) {
         e.lockedModels.push(lockedModel);
       }
+      if (lockedModel === "carbon") {
+        e.tier = "pro";
+      }
     }
     if (parkedReason) {
       const enabled = BACKENDS.filter((b) => b.priority > 0).length;
@@ -690,6 +724,10 @@ async function bindBackend(s, sessionId) {
     const st = withStateLock((state) => {
       const now = Date.now();
       const e = accEntry(state, b.id);
+      const tier = getAccountTier(b, state);
+      if (reqModel === "carbon" && tier !== "ultra") {
+        return { error: `account "${b.id}" has ${tier} tier and does not support Carbon (Ultra tier required)` };
+      }
       if (reqModel && e?.lockedModels?.includes(reqModel)) {
         return { error: `account "${b.id}" does not support model "${reqModel}" (locked: paid upgrade required)` };
       }
@@ -715,7 +753,8 @@ async function bindBackend(s, sessionId) {
     const now = Date.now();
     if (s.backend) {
       const e = accEntry(state, s.backend.id);
-      const isLocked = reqModel && e?.lockedModels?.includes(reqModel);
+      const tier = getAccountTier(s.backend, state);
+      const isLocked = (reqModel && e?.lockedModels?.includes(reqModel)) || (reqModel === "carbon" && tier !== "ultra");
       const cool = e?.cooldownUntilMs ?? 0;
       const l = state.leases && state.leases[s.backend.id];
       const busy = l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid);
@@ -727,7 +766,7 @@ async function bindBackend(s, sessionId) {
       const prev = s.backend.id;
       if (s.convId) {
         if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
-        if (isLocked) return { error: `account "${prev}" does not support model "${reqModel}"; this conversation is pinned to it` };
+        if (isLocked) return { error: `account "${prev}" does not support model "${reqModel}" (tier: ${tier}); this conversation is pinned to it` };
         return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()}; this conversation is pinned to it` };
       }
       const r = pickBackendFromState(state, prev, owner, now, reqModel);
@@ -1158,13 +1197,13 @@ export function dispatch(msg) {
       if (cid === "thought_level") {
         if (val === "low") {
           s.thinking = "low";
-          if (s.model !== "argon") s.model = "fast";
+          if (s.model !== "argon" && s.model !== "carbon") s.model = "fast";
         } else if (val === "medium") {
           s.thinking = "medium";
-          if (s.model !== "argon") s.model = "thinking";
+          if (s.model !== "argon" && s.model !== "carbon") s.model = "thinking";
         } else if (val === "high") {
           s.thinking = "high";
-          if (s.model !== "argon") s.model = "pro";
+          if (s.model !== "argon" && s.model !== "carbon") s.model = "pro";
         } else {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown thought_level "${val}"` } });
           return;
@@ -1172,13 +1211,13 @@ export function dispatch(msg) {
       } else if (cid === "thinking") {
         if (val === "fast" || val === "low") {
           s.thinking = "low";
-          if (s.model !== "argon") s.model = "fast";
+          if (s.model !== "argon" && s.model !== "carbon") s.model = "fast";
         } else if (val === "thinking" || val === "medium") {
           s.thinking = "medium";
-          if (s.model !== "argon") s.model = "thinking";
+          if (s.model !== "argon" && s.model !== "carbon") s.model = "thinking";
         } else if (val === "pro" || val === "high") {
           s.thinking = "high";
-          if (s.model !== "argon") s.model = "pro";
+          if (s.model !== "argon" && s.model !== "carbon") s.model = "pro";
         } else {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown thinking "${val}"` } });
           return;
@@ -1192,7 +1231,7 @@ export function dispatch(msg) {
         if (val === "argon") {
           if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
         } else if (val === "carbon") {
-          s.thinking = "high";
+          if (!s.thinking) s.thinking = "medium";
         } else if (val === "fast") {
           s.thinking = "low";
         } else if (val === "thinking") {
@@ -1237,7 +1276,7 @@ export function dispatch(msg) {
       if (val === "argon") {
         if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
       } else if (val === "carbon") {
-        s.thinking = "high";
+        if (!s.thinking) s.thinking = "medium";
       } else if (val === "fast") {
         s.thinking = "low";
       } else if (val === "thinking") {
