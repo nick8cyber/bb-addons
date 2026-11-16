@@ -15,12 +15,14 @@
  *
  * Usage: node harness-rebuild.mjs
  */
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createBridgeDeltaEventCollector } from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const root = mkdtempSync(join(tmpdir(), "agy-rebuild-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-rebuild-"));
 const transcript = join(root, "stdin.ndjson");
 writeFileSync(transcript, "");
 const shim = join(root, "agy-shim");

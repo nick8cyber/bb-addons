@@ -5,16 +5,18 @@
 // Run: node harness-shim-replay.mjs
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const shim = join(here, "src", "acp-shim.mjs");
 const fake = join(here, "fake-agy-acp.mjs");
 
-const tmp = mkdtempSync(join(tmpdir(), "shimreplay-"));
+const tmp = trackedMkdtemp(join(tmpdir(), "shimreplay-"));
 const bin = join(tmp, "fake-bin.sh");
 writeFileSync(bin, `#!/bin/sh\nexec /usr/bin/node "${fake}" "$@"\n`);
 chmodSync(bin, 0o755);
@@ -122,6 +124,101 @@ check("long/live-answer-flows", post2texts.some((t) => t.includes("capybaras")),
 // With a content boundary, replayed old answers are dropped — "elephants"
 // (first turn's answer text) must not reappear after the second load.
 check("long/old-answer-suppressed", !post2texts.some((t) => t.includes("elephants")), `found=${post2texts.filter((t) => t.includes("elephants")).length}`);
+
+// --- lifecycle (§12): the shim dies with its owner --------------------------
+// A disposable "bridge parent" owns the shim; killing it -9 must take the
+// shim and its whole detached child group down within 10 s (incident 16.11).
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const childrenOf = (pid) => {
+  const out = [];
+  try {
+    for (const e of readdirSync("/proc")) {
+      if (!/^\d+$/.test(e)) continue;
+      try {
+        const stat = readFileSync(`/proc/${e}/stat`, "utf8");
+        const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(" ")[1]);
+        if (ppid === pid) out.push(Number(e));
+      } catch { /* raced exit */ }
+    }
+  } catch { /* no /proc */ }
+  return out;
+};
+async function waitForSoft(pred, ms) {
+  const deadline = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > deadline) return false;
+    await sleep(30);
+  }
+  return true;
+}
+
+const lifecycleDir = join(tmp, "lifecycle");
+mkdirSync(lifecycleDir, { recursive: true });
+const ctlOrphan = join(lifecycleDir, "ctl-orphan.ndjson");
+writeFileSync(ctlOrphan, "");
+const parentScript = join(tmp, "fake-parent.mjs");
+writeFileSync(parentScript, `
+import { spawn } from "node:child_process";
+const kid = spawn(${JSON.stringify(process.execPath)}, [${JSON.stringify(shim)}, "acp"], {
+  stdio: ["pipe", "pipe", "inherit"],
+  env: process.env,
+});
+process.stdout.write(String(kid.pid));
+setInterval(() => {}, 1000);
+`);
+const parent = spawn(process.execPath, [parentScript], {
+  stdio: ["pipe", "pipe", "inherit"],
+  env: {
+    ...process.env,
+    AGY_SHIM_REAL_BIN: bin,
+    AGY_SHIM_EVENTS: eventsFile,
+    AGY_SHIM_CONTROL: ctlOrphan,
+    AGY_SHIM_THREAD_ID: "orphan-check",
+    AGY_DISABLE_SUBAGENTS: "0",
+  },
+});
+let pidText = "";
+parent.stdout.on("data", (d) => { pidText += d.toString(); });
+await waitFor(() => pidText.trim().length > 0, 10000, "parent reports shim pid");
+const orphanShimPid = Number(pidText.trim());
+await waitFor(() => childrenOf(orphanShimPid).length >= 1, 10000, "orphan-check fake spawned");
+const orphanFakePids = childrenOf(orphanShimPid);
+check("lifecycle/setup-alive", alive(orphanShimPid) && orphanFakePids.every(alive), `shim=${orphanShimPid} kids=${orphanFakePids}`);
+parent.kill("SIGKILL");
+const orphanT0 = Date.now();
+const orphanGone = await waitForSoft(
+  () => !alive(orphanShimPid) && orphanFakePids.every((p) => !alive(p)),
+  10000,
+);
+check("lifecycle/no-orphan-on-parent-death", orphanGone,
+  `${Date.now() - orphanT0}ms shimAlive=${alive(orphanShimPid)} kidsAlive=${orphanFakePids.filter(alive)}`);
+check("lifecycle/control-removed", !existsSync(ctlOrphan), "");
+
+// SIGTERM on a live shim: clean exit with cleanup — no kill -9 needed.
+const ctlTerm = join(lifecycleDir, "ctl-term.ndjson");
+writeFileSync(ctlTerm, "");
+const termShim = spawn(process.execPath, [shim, "acp"], {
+  stdio: ["pipe", "ignore", "inherit"],
+  env: {
+    ...process.env,
+    AGY_SHIM_REAL_BIN: bin,
+    AGY_SHIM_EVENTS: eventsFile,
+    AGY_SHIM_CONTROL: ctlTerm,
+    AGY_SHIM_THREAD_ID: "term-check",
+    AGY_DISABLE_SUBAGENTS: "0",
+  },
+});
+await waitFor(() => childrenOf(termShim.pid).length >= 1, 10000, "term-check fake spawned");
+const termFakePids = childrenOf(termShim.pid);
+const termT0 = Date.now();
+termShim.kill("SIGTERM");
+const termGone = await waitForSoft(
+  () => !alive(termShim.pid) && termFakePids.every((p) => !alive(p)),
+  10000,
+);
+check("lifecycle/sigterm-clean-exit", termGone,
+  `${Date.now() - termT0}ms shimAlive=${alive(termShim.pid)} kidsAlive=${termFakePids.filter(alive)}`);
+check("lifecycle/sigterm-control-removed", !existsSync(ctlTerm), "");
 
 console.log(`\n${passed}/${passed + failed} passed`);
 child.kill("SIGTERM");

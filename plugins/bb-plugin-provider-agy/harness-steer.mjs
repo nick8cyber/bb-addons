@@ -13,12 +13,14 @@
  *
  * Usage: node harness-steer.mjs
  */
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { experimental_createBridgeDeltaEventCollector } from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const root = mkdtempSync(join(tmpdir(), "agy-steer-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-steer-"));
 const transcript = join(root, "stdin.ndjson");
 const release = join(root, "release");
 writeFileSync(transcript, "");
