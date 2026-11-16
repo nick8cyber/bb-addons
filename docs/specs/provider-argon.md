@@ -42,22 +42,19 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   - `session/new` создаёт новую запись сессии `{ id, cwd, model, thinking, convId, account, backend }`.
   - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
   - Возвращают список моделей `models.availableModels` в виде объектов `{ modelId, name }` по схеме ACP:
-    - `'argon'` — «Gemini (Argon)» (модель по умолчанию для Gemini 4)
-    - `'carbon'` — «Gemini (Carbon)» (топовая модель, доступная на тарифе Ultra)
-    - `'fast'` — «Gemini 3 Flash (Fast)»
-    - `'thinking'` — «Gemini 3 Flash (Thinking)»
-    - `'pro'` — «Gemini 3.1 Pro (старая 3.1, не рекомендуется)»
+    - `'argon'` — «Gemini 4 Argon» (модель по умолчанию)
+    - `'carbon'` — «Gemini 4 Carbon» (топовая модель, доступная на тарифе Ultra)
+    - `'fast'` — «Gemini 2.5 Flash»
+    - `'pro'` — «Gemini 2.5 Pro»
   - Возвращают конфигурационные опции `configOptions`:
-    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `fast`, `thinking`, `pro`);
-    - `thinking` (категория `"thought_level"`): значения `fast` / `thinking` / `pro`;
-    - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB;
+    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `fast`, `pro`);
+    - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB (`Low`, `Medium`, `High`);
     - `account` (категория `"account"`, возвращается при наличии более одного аккаунта в пуле): выбор аккаунта (`"auto"` или конкретный `id` аккаунта).
   Все опции принимаются и обрабатываются в `session/set_config_option`.
-- **`session/set_model`** — меняет `s.model` и синхронизирует `s.thinking`, если `modelId` входит в `{ "argon", "carbon", "fast", "thinking", "pro" }`. Для модели `argon` режим рассуждения по умолчанию — `medium` (или `high` при запрошенном reasoning `high`); для модели `carbon` уровень рассуждений настраивается пользователем (`low`, `medium`, `high`), по умолчанию `medium`.
+- **`session/set_model`** — меняет `s.model` и синхронизирует `s.thinking` по умолчанию (`medium` для `argon` и `carbon`).
 - **`session/set_config_option`**:
-  - при `configId === "thought_level"` преобразует уровень: `"low"` → `thinking: "low"`, `"medium"` → `thinking: "medium"`, `"high"` → `thinking: "high"`; имя модели `s.model` обновляется на `fast` / `thinking` / `pro` **только** если `s.model !== "argon" && s.model !== "carbon"` (для моделей `"argon"` и `"carbon"` имя модели всегда сохраняется неизменным во всех трёх уровнях `low`, `medium`, `high`), обеспечивая полную совместимость с пресетами оркестратора и выбор уровня размышлений для Carbon;
-  - при `configId === "thinking"` обновляет `s.thinking` (`fast` / `low` → `"low"`, `thinking` / `medium` → `"medium"`, `pro` / `high` → `"high"`) и аналогично обновляет имя модели на `fast` / `thinking` / `pro` **только** если `s.model !== "argon" && s.model !== "carbon"`;
-  - при `configId === "model"` обновляет `s.model` и уровень `s.thinking` по умолчанию;
+  - при `configId === "thought_level"` (или `configId === "thinking"`) обновляет уровень мышления `s.thinking`: `"low"` → `"low"`, `"medium"` → `"medium"`, `"high"` → `"high"`, не затрагивая выбранную модель `s.model`;
+  - при `configId === "model"` обновляет `s.model` (`argon`, `carbon`, `fast`, `pro`);
   - при `configId === "account"` обновляет `s.account` (`"auto"` или id аккаунта); при смене аккаунта сбрасывает `s.backend = null` и `s.convId = null`.
 - **Передача в веб-драйвер**:
   - В драйвер передаётся `model: s.model` (`"argon"` передаётся как есть, без подмены на `"thinking"`, чтобы селектор модели не искал несуществующую модель).

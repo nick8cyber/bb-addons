@@ -623,11 +623,19 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const modelIds = r2.result.models.availableModels.map((m) => m.modelId);
   assert.ok(modelIds.includes("argon"));
   assert.ok(modelIds.includes("pro"));
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "argon")?.name,
+    "Gemini 4 Argon"
+  );
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "carbon")?.name,
+    "Gemini 4 Carbon"
+  );
   const proModel = r2.result.models.availableModels.find((m) => m.modelId === "pro");
-  assert.equal(proModel?.name, "Gemini 3.1 Pro (старая 3.1, не рекомендуется)");
+  assert.equal(proModel?.name, "Gemini 2.5 Pro");
   assert.equal(
     MODELS.find((m) => m.value === "pro")?.name,
-    "Gemini 3.1 Pro (старая 3.1, не рекомендуется)"
+    "Gemini 2.5 Pro"
   );
 
   // 2b. session/load also returns availableModels as { modelId, name } objects
@@ -669,7 +677,7 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const modelOpt4 = r4.result.configOptions.find((o) => o.id === "model");
   assert.equal(modelOpt4?.currentValue, "argon", "Model must remain 'argon' when thought_level changes on argon model");
 
-  // Verify non-argon/non-carbon model updates to pro when thought_level is set to high
+  // Verify non-argon/non-carbon model updates thought_level to high cleanly
   sendReq({
     jsonrpc: "2.0",
     id: 401,
@@ -685,8 +693,8 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
     params: { sessionId, configId: "thought_level", value: "high" },
   });
   const r402 = await waitForResponse(402);
-  const modelOpt402 = r402.result.configOptions.find((o) => o.id === "model");
-  assert.equal(modelOpt402?.currentValue, "pro", "Model must update to 'pro' when thought_level is high and s.model is fast");
+  const thoughtOpt402 = r402.result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(thoughtOpt402?.currentValue, "high", "thought_level must update to high");
 
   // Verify carbon model supports custom thought_level without model overwrite
   sendReq({

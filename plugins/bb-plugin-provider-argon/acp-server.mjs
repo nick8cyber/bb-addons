@@ -632,16 +632,14 @@ export function normalizeThinking(val) {
 }
 
 export const MODELS = [
-  { value: "argon", name: "Gemini (Argon)" },
-  { value: "carbon", name: "Gemini (Carbon)" },
-  { value: "fast", name: "Gemini 3 Flash (Fast)" },
-  { value: "thinking", name: "Gemini 3 Flash (Thinking)" },
-  { value: "pro", name: "Gemini 3.1 Pro (старая 3.1, не рекомендуется)" },
+  { value: "argon", name: "Gemini 4 Argon" },
+  { value: "carbon", name: "Gemini 4 Carbon" },
+  { value: "fast", name: "Gemini 2.5 Flash" },
+  { value: "pro", name: "Gemini 2.5 Pro" },
 ];
 
 function configOptionsFor(s, backends = BACKENDS) {
   const normalizedLevel = normalizeThinking(s.thinking);
-  const thinkingVal = normalizedLevel === "low" ? "fast" : normalizedLevel === "high" ? "pro" : "thinking";
   const opts = [
     {
       id: "model",
@@ -651,25 +649,14 @@ function configOptionsFor(s, backends = BACKENDS) {
       options: MODELS.map((m) => ({ value: m.value, name: m.name })),
     },
     {
-      id: "thinking",
-      category: "thought_level",
-      type: "select",
-      currentValue: thinkingVal,
-      options: [
-        { value: "fast", name: "fast" },
-        { value: "thinking", name: "thinking" },
-        { value: "pro", name: "pro" },
-      ],
-    },
-    {
       id: "thought_level",
       category: "thought_level",
       type: "select",
       currentValue: normalizedLevel,
       options: [
-        { value: "low", name: "low" },
-        { value: "medium", name: "medium" },
-        { value: "high", name: "high" },
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
       ],
     },
   ];
@@ -1213,32 +1200,15 @@ export function dispatch(msg) {
       }
       const cid = p.configId ?? p.id ?? p.optionId;
       const val = p.value;
-      if (cid === "thought_level") {
-        if (val === "low") {
+      if (cid === "thought_level" || cid === "thinking") {
+        if (val === "low" || val === "fast") {
           s.thinking = "low";
-          if (s.model !== "argon" && s.model !== "carbon") s.model = "fast";
-        } else if (val === "medium") {
+        } else if (val === "medium" || val === "thinking") {
           s.thinking = "medium";
-          if (s.model !== "argon" && s.model !== "carbon") s.model = "thinking";
-        } else if (val === "high") {
+        } else if (val === "high" || val === "pro") {
           s.thinking = "high";
-          if (s.model !== "argon" && s.model !== "carbon") s.model = "pro";
         } else {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown thought_level "${val}"` } });
-          return;
-        }
-      } else if (cid === "thinking") {
-        if (val === "fast" || val === "low") {
-          s.thinking = "low";
-          if (s.model !== "argon" && s.model !== "carbon") s.model = "fast";
-        } else if (val === "thinking" || val === "medium") {
-          s.thinking = "medium";
-          if (s.model !== "argon" && s.model !== "carbon") s.model = "thinking";
-        } else if (val === "pro" || val === "high") {
-          s.thinking = "high";
-          if (s.model !== "argon" && s.model !== "carbon") s.model = "pro";
-        } else {
-          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown thinking "${val}"` } });
           return;
         }
       } else if (cid === "model") {
@@ -1247,17 +1217,7 @@ export function dispatch(msg) {
           return;
         }
         s.model = val;
-        if (val === "argon") {
-          if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
-        } else if (val === "carbon") {
-          if (!s.thinking) s.thinking = "medium";
-        } else if (val === "fast") {
-          s.thinking = "low";
-        } else if (val === "thinking") {
-          s.thinking = "medium";
-        } else if (val === "pro") {
-          s.thinking = "high";
-        }
+        if (!s.thinking) s.thinking = "medium";
       } else if (cid === "account") {
         if (val !== "auto" && !BACKENDS.some((b) => b.id === val)) {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown account "${val}"` } });
