@@ -8,11 +8,14 @@
  *
  * Usage: node harness-acp.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync, chmodSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const root = mkdtempSync(join(tmpdir(), "agy-acp-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-acp-"));
 const workspace = join(root, "ws");
 mkdirSync(workspace, { recursive: true });
 const shim = join(root, "agy-bin");
@@ -368,6 +371,87 @@ check("models/answered", replies(90)[0].result?.models?.length >= 1, JSON.string
 const ladderModel = (replies(90)[0].result?.models ?? []).find((m) => m.id === "fake-model") ?? replies(90)[0].result?.models?.[0];
 const ladderEfforts = (ladderModel?.supportedReasoningEfforts ?? []).map((e) => e.reasoningEffort);
 check("models/effort-ladder", ladderEfforts.includes("low") && ladderEfforts.includes("medium") && ladderEfforts.includes("high"), JSON.stringify(ladderEfforts));
+
+// --- lifecycle: the §12.3 reaper kills planted orphans and spares the live --
+{
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const childrenOf = (pid) => {
+    const out = [];
+    try {
+      for (const e of readdirSync("/proc")) {
+        if (!/^\d+$/.test(e)) continue;
+        try {
+          const stat = readFileSync(`/proc/${e}/stat`, "utf8");
+          const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(" ")[1]);
+          if (ppid === pid) out.push(Number(e));
+        } catch { /* raced exit */ }
+      }
+    } catch { /* no /proc */ }
+    return out;
+  };
+  const ppidOf = (pid) => {
+    try {
+      const m = readFileSync(`/proc/${pid}/status`, "utf8").match(/^PPid:\s*(\d+)$/m);
+      return m ? Number(m[1]) : null;
+    } catch { return null; }
+  };
+  const commOf = (pid) => {
+    try { return readFileSync(`/proc/${pid}/comm`, "utf8").trim(); } catch { return null; }
+  };
+  const planted = join(root, "planted");
+  mkdirSync(planted, { recursive: true });
+  // A stubborn "old" shim: correct basename for the candidate filter, SIGTERM
+  // ignored, one detached child — the ladder must reach BOTH (spec §12.3).
+  const orphanScript = join(planted, "acp-shim.mjs");
+  writeFileSync(orphanScript, `
+import { spawn } from "node:child_process";
+process.on("SIGTERM", () => {});
+spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: "ignore", detached: true });
+setInterval(() => {}, 1000);
+`);
+  const planterScript = join(planted, "planter.mjs");
+  writeFileSync(planterScript, `
+import { spawn } from "node:child_process";
+const kid = spawn(process.execPath, [${JSON.stringify(orphanScript)}], { stdio: "ignore" });
+process.stdout.write(String(kid.pid));
+setInterval(() => {}, 1000);
+`);
+  const planter = spawn(process.execPath, [planterScript], { stdio: ["ignore", "pipe", "inherit"] });
+  let pidText = "";
+  planter.stdout.on("data", (d) => { pidText += d.toString(); });
+  await waitFor(() => pidText.trim().length > 0, 10000, "planter reports orphan pid");
+  const orphanPid = Number(pidText.trim());
+  planter.kill("SIGKILL");
+  // The planted shim counts as an orphan only once init/systemd adopts it.
+  await waitFor(() => {
+    const pp = ppidOf(orphanPid);
+    return pp !== null && (pp === 1 || commOf(pp) === "systemd");
+  }, 10000, "planted shim reparented");
+  // The orphan's node bootstrap may lag the reparent; wait for its detached
+  // child so the tree check below cannot degenerate into an empty every().
+  await waitFor(() => childrenOf(orphanPid).length >= 1, 10000, "planted orphan spawned its child");
+  const orphanKids = childrenOf(orphanPid);
+  check("lifecycle/planted-orphan", alive(orphanPid) && orphanKids.length >= 1, `pid=${orphanPid} kids=${orphanKids}`);
+
+  // Live probe: a REAL materialized shim owned by this harness — the reaper
+  // must leave it alone (its ppid is a live node, not init/systemd).
+  const liveShim = spawn(process.execPath, [join(root, "acp-shim.mjs"), "acp"], {
+    stdio: ["pipe", "ignore", "inherit"],
+    env: { ...process.env, AGY_SHIM_REAL_BIN: shim, AGY_SHIM_THREAD_ID: "live-probe", AGY_DISABLE_SUBAGENTS: "0" },
+  });
+  // A fresh bridge instance re-runs start() — the reaper inside it must reap
+  // the planted orphan tree and ignore every live shim.
+  const probe = (await import(new URL("./dist/host.js?reaper-check", import.meta.url).href)).experimental_providerBridge;
+  probe.start?.({ pluginId: "provider-agy", dataDir: root, tempDir: root });
+  await waitFor(
+    () => !alive(orphanPid) && orphanKids.every((p) => !alive(p)),
+    30000,
+    "reaper kills the planted orphan tree",
+  );
+  check("lifecycle/reaper-kills-orphan-tree", !alive(orphanPid) && orphanKids.every((p) => !alive(p)), `pid=${orphanPid} kids=${orphanKids.filter(alive)}`);
+  check("lifecycle/reaper-spares-live", alive(liveShim.pid), `pid=${liveShim.pid}`);
+  liveShim.kill("SIGTERM");
+}
 
 process.stdout.write = originalWrite;
 say(`\n${checks.filter(([, ok]) => ok).length}/${checks.length} passed`);

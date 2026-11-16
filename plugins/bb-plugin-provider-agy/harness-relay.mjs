@@ -8,11 +8,13 @@
  *
  * Usage: node harness-relay.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
-const root = mkdtempSync(join(tmpdir(), "agy-relay-"));
+const root = trackedMkdtemp(join(tmpdir(), "agy-relay-"));
 const workspace = join(root, "ws");
 mkdirSync(workspace, { recursive: true });
 const shim = join(root, "agy-shim");

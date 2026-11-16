@@ -28,6 +28,42 @@ const {
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+// Fixture lifecycle (same contract as provider-agy §12.4): fixture servers
+// die with the test process — detached gives each its own group so the exit
+// teardown can take the whole tree — and mkdtemp dirs are removed.
+const spawnedServers = [];
+const tmpDirs = [];
+function trackTmpDir(dir) {
+  tmpDirs.push(dir);
+  return dir;
+}
+function spawnServer(env) {
+  const proc = spawn("node", ["acp-server.mjs"], {
+    cwd: PLUGIN_ROOT,
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: true,
+  });
+  spawnedServers.push(proc);
+  return proc;
+}
+process.on("exit", () => {
+  for (const proc of spawnedServers) {
+    try {
+      process.kill(-proc.pid, "SIGKILL");
+    } catch {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }
+  for (const dir of tmpDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
 test("1. Syntax and hygiene checks across plugin files", () => {
   function getFiles(dir) {
     const res = [];
@@ -463,7 +499,7 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
 });
 
 test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease retention and selective cancel", async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "argon-test-state-"));
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-test-state-")));
   const poolFile = path.join(tmpDir, "pool.json");
   fs.writeFileSync(
     poolFile,
@@ -480,16 +516,12 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
     })
   );
 
-  const serverProc = spawn("node", ["acp-server.mjs"], {
-    cwd: PLUGIN_ROOT,
-    env: {
-      ...process.env,
-      ARGON_FAKE: "1",
-      ARGON_FAKE_DELAY_MS: "300",
-      ARGON_STATE_DIR: tmpDir,
-      ARGON_POOL_FILE: poolFile,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
+  const serverProc = spawnServer({
+    ...process.env,
+    ARGON_FAKE: "1",
+    ARGON_FAKE_DELAY_MS: "300",
+    ARGON_STATE_DIR: tmpDir,
+    ARGON_POOL_FILE: poolFile,
   });
 
   const lines = [];
@@ -729,7 +761,7 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
 });
 
 test("6. Automatic lease release upon SIGTERM during prompt execution", async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "argon-term-test-"));
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-term-test-")));
   const poolFile = path.join(tmpDir, "pool.json");
   fs.writeFileSync(
     poolFile,
@@ -746,16 +778,12 @@ test("6. Automatic lease release upon SIGTERM during prompt execution", async ()
     })
   );
 
-  const serverProc = spawn("node", ["acp-server.mjs"], {
-    cwd: PLUGIN_ROOT,
-    env: {
-      ...process.env,
-      ARGON_FAKE: "1",
-      ARGON_FAKE_DELAY_MS: "1200",
-      ARGON_STATE_DIR: tmpDir,
-      ARGON_POOL_FILE: poolFile,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
+  const serverProc = spawnServer({
+    ...process.env,
+    ARGON_FAKE: "1",
+    ARGON_FAKE_DELAY_MS: "1200",
+    ARGON_STATE_DIR: tmpDir,
+    ARGON_POOL_FILE: poolFile,
   });
 
   const lines = [];
@@ -830,7 +858,7 @@ test("6. Automatic lease release upon SIGTERM during prompt execution", async ()
 });
 
 test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 releases lease swiftly", async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "argon-stdin-delay-test-"));
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-stdin-delay-test-")));
   const poolFile = path.join(tmpDir, "pool.json");
   fs.writeFileSync(
     poolFile,
@@ -847,16 +875,12 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
     })
   );
 
-  const serverProc = spawn("node", ["acp-server.mjs"], {
-    cwd: PLUGIN_ROOT,
-    env: {
-      ...process.env,
-      ARGON_FAKE: "1",
-      ARGON_FAKE_DELAY_MS: "10000",
-      ARGON_STATE_DIR: tmpDir,
-      ARGON_POOL_FILE: poolFile,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
+  const serverProc = spawnServer({
+    ...process.env,
+    ARGON_FAKE: "1",
+    ARGON_FAKE_DELAY_MS: "10000",
+    ARGON_STATE_DIR: tmpDir,
+    ARGON_POOL_FILE: poolFile,
   });
 
   const lines = [];

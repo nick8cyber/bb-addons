@@ -14,7 +14,6 @@
  * Usage: node --experimental-strip-types harness-local-state.mjs
  */
 import {
-  mkdtempSync,
   mkdirSync,
   writeFileSync,
   chmodSync,
@@ -24,6 +23,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
+installTeardown();
 
 const say = (...a) => process.stderr.write(`${a.join(" ")}\n`);
 const checks = [];
@@ -57,7 +58,7 @@ const {
   pickAccount,
 } = acct;
 
-const rootA = mkdtempSync(join(tmpdir(), "agy-localstate-"));
+const rootA = trackedMkdtemp(join(tmpdir(), "agy-localstate-"));
 // Real pool labels always have accounts/<label>/ homes — overlay records
 // for labels absent from BOTH the shared file and accounts/ are ghosts
 // and get cleaned on save.
@@ -231,7 +232,7 @@ check(
 // survives w2's stale snapshot, and w2's fresher strings win (its null
 // lastError is a value, not an absence).
 {
-  const race = mkdtempSync(join(tmpdir(), "agy-localstate-race-"));
+  const race = trackedMkdtemp(join(tmpdir(), "agy-localstate-race-"));
   writeJson(join(race, "accounts-state.json"), {
     accounts: {
       a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
@@ -258,7 +259,7 @@ check(
 // A11: re-pin race — a stale ledger must not write a neighbour's re-pin
 // back: save pushes only dirtyPins keys over the disk map.
 {
-  const repin = mkdtempSync(join(tmpdir(), "agy-localstate-repin-"));
+  const repin = trackedMkdtemp(join(tmpdir(), "agy-localstate-repin-"));
   writeJson(join(repin, "accounts-state.json"), { accounts: {} });
   const w1 = loadLedger(repin);
   rememberConversation(w1, "conv", "a1");
@@ -281,7 +282,7 @@ check(
 // A12: broken JSON in each of the three files — load treats each as empty
 // instead of throwing.
 {
-  const broken = mkdtempSync(join(tmpdir(), "agy-localstate-broken-"));
+  const broken = trackedMkdtemp(join(tmpdir(), "agy-localstate-broken-"));
   writeFileSync(join(broken, "accounts-state.json"), "{ nope");
   writeFileSync(join(broken, "conversations-state.json"), "%%%");
   writeFileSync(join(broken, "accounts-overlay.json"), "not json");
@@ -303,7 +304,7 @@ check(
 // A13: the shadow dies by untilMs too — an expired overlay cooldown stops
 // masking the account; expiry is decided against `now` at use.
 {
-  const exp = mkdtempSync(join(tmpdir(), "agy-localstate-exp-"));
+  const exp = trackedMkdtemp(join(tmpdir(), "agy-localstate-exp-"));
   writeJson(join(exp, "accounts-state.json"), {
     accounts: {
       a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
@@ -333,7 +334,7 @@ check(
 // shared file and accounts/ is dropped on the next dirty save and does
 // not leak into the shared write; a label with an accounts/ dir survives.
 {
-  const ghost = mkdtempSync(join(tmpdir(), "agy-localstate-ghost-"));
+  const ghost = trackedMkdtemp(join(tmpdir(), "agy-localstate-ghost-"));
   mkdirSync(join(ghost, "accounts", "a1"), { recursive: true });
   mkdirSync(join(ghost, "accounts", "dirkept"), { recursive: true });
   writeJson(join(ghost, "accounts-state.json"), {
@@ -369,7 +370,7 @@ check(
 // A15: eager migration fires on a broken local file — legacy shared pins
 // are rewritten locally even though conversations-state.json exists.
 {
-  const em = mkdtempSync(join(tmpdir(), "agy-localstate-eager-"));
+  const em = trackedMkdtemp(join(tmpdir(), "agy-localstate-eager-"));
   writeJson(join(em, "accounts-state.json"), {
     accounts: {},
     conversations: { "leg-1": "a1" },
@@ -390,7 +391,7 @@ check(
 // (equal stamps are deliberate: only strictly fresher shared lifts it);
 // ineligibleAtMs merges by max, here won by the shared side.
 {
-  const bnd = mkdtempSync(join(tmpdir(), "agy-localstate-bound-"));
+  const bnd = trackedMkdtemp(join(tmpdir(), "agy-localstate-bound-"));
   const T = Date.now();
   writeJson(join(bnd, "accounts-state.json"), {
     accounts: {
@@ -426,7 +427,7 @@ check(
 // yield parkedReason/lastError to the neighbour's fresher overlay record
 // instead of erasing them with the load-time snapshot.
 {
-  const rr = mkdtempSync(join(tmpdir(), "agy-localstate-revrace-"));
+  const rr = trackedMkdtemp(join(tmpdir(), "agy-localstate-revrace-"));
   writeJson(join(rr, "accounts-state.json"), {
     accounts: {
       a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
@@ -454,7 +455,7 @@ check(
 // the shared file — the label exists only as an overlay shadow, absent
 // from both the shared accounts and the accounts/ directory.
 {
-  const gs = mkdtempSync(join(tmpdir(), "agy-localstate-ghostpin-"));
+  const gs = trackedMkdtemp(join(tmpdir(), "agy-localstate-ghostpin-"));
   writeJson(join(gs, "accounts-state.json"), {
     accounts: {
       a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
@@ -486,7 +487,7 @@ check(
 // A19: two loadLedger calls racing the eager migration both write the
 // union — whoever persists second still lands the same pin set, no loss.
 {
-  const mig = mkdtempSync(join(tmpdir(), "agy-localstate-mig-"));
+  const mig = trackedMkdtemp(join(tmpdir(), "agy-localstate-mig-"));
   writeJson(join(mig, "accounts-state.json"), {
     accounts: {},
     conversations: { "mig-1": "a1", "mig-2": "a2" },
@@ -513,7 +514,7 @@ check(
 // resurrect the label: the dead disk record (writtenMs behind the shared
 // lastUsedMs) contributes nothing to max(), freshSide or writtenMs.
 {
-  const res = mkdtempSync(join(tmpdir(), "agy-localstate-resurr-"));
+  const res = trackedMkdtemp(join(tmpdir(), "agy-localstate-resurr-"));
   mkdirSync(join(res, "accounts", "a1"), { recursive: true });
   const T = Date.now();
   writeJson(join(res, "accounts-state.json"), {
@@ -553,7 +554,7 @@ check(
 // not win parkedReason/lastError through freshSide. markAccountUse does
 // not re-stamp, so stamp stays behind the neighbour's writtenMs.
 {
-  const sv = mkdtempSync(join(tmpdir(), "agy-localstate-shadowstamp-"));
+  const sv = trackedMkdtemp(join(tmpdir(), "agy-localstate-shadowstamp-"));
   mkdirSync(join(sv, "accounts", "a1"), { recursive: true });
   const T = Date.now();
   writeJson(join(sv, "accounts-state.json"), {
@@ -597,7 +598,7 @@ check(
 // it must NOT bump stampStrings, so a neighbour's fresher overlay record
 // still wins the string fields on save.
 {
-  const st = mkdtempSync(join(tmpdir(), "agy-localstate-stamp-"));
+  const st = trackedMkdtemp(join(tmpdir(), "agy-localstate-stamp-"));
   mkdirSync(join(st, "accounts", "a1"), { recursive: true });
   writeJson(join(st, "accounts-state.json"), {
     accounts: {
@@ -639,7 +640,7 @@ check(
 // outside accounts/ so existsSync alone would bless it; both must be
 // dropped from the overlay and kept out of the shared write.
 {
-  const gh = mkdtempSync(join(tmpdir(), "agy-localstate-ghostname-"));
+  const gh = trackedMkdtemp(join(tmpdir(), "agy-localstate-ghostname-"));
   mkdirSync(join(gh, "accounts", "a1"), { recursive: true });
   mkdirSync(join(gh, "evil"), { recursive: true }); // ../evil target exists
   writeJson(join(gh, "accounts-state.json"), {
@@ -678,7 +679,7 @@ check(
 // A24: label containing dots (e.g. "x..y") is valid and not a ghost when
 // its accounts/ directory exists; only literal ".." is a ghost.
 {
-  const xy = mkdtempSync(join(tmpdir(), "agy-localstate-dots-"));
+  const xy = trackedMkdtemp(join(tmpdir(), "agy-localstate-dots-"));
   mkdirSync(join(xy, "accounts", "a1"), { recursive: true });
   mkdirSync(join(xy, "accounts", "x..y"), { recursive: true });
   writeJson(join(xy, "accounts-state.json"), {
@@ -716,7 +717,7 @@ check(
 // A25: conversation pin with prototype name (e.g. "constructor", "toString")
 // is detected as absent from disk and written to conversations-state.json.
 {
-  const cp = mkdtempSync(join(tmpdir(), "agy-localstate-protoconv-"));
+  const cp = trackedMkdtemp(join(tmpdir(), "agy-localstate-protoconv-"));
   writeJson(join(cp, "accounts-state.json"), {
     accounts: {
       a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
@@ -744,7 +745,7 @@ check(
 // A26: empty label "" is a ghost even though existsSync(join(accountsDir, ""))
 // resolves to accountsDir and returns true.
 {
-  const eg = mkdtempSync(join(tmpdir(), "agy-localstate-emptyghost-"));
+  const eg = trackedMkdtemp(join(tmpdir(), "agy-localstate-emptyghost-"));
   mkdirSync(join(eg, "accounts", "a1"), { recursive: true });
   writeJson(join(eg, "accounts-state.json"), {
     accounts: {
@@ -776,7 +777,7 @@ check(
 // A27: label "constructor" cools down honestly — own property in shared and
 // overlay, not polluting Object.prototype; cooldown is visible to pickAccount.
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-localstate-protocool-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-localstate-protocool-"));
   mkdirSync(join(dir, "accounts", "constructor"), { recursive: true });
   mkdirSync(join(dir, "accounts", "a2"), { recursive: true });
   writeJson(join(dir, "accounts-state.json"), {
@@ -820,7 +821,7 @@ check(
 // A28: label "toString" in shared does not get a phantom shadow from overlay
 // (which lacks "toString" as an own key); lastError from shared is preserved.
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-localstate-protoshadow-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-localstate-protoshadow-"));
   mkdirSync(join(dir, "accounts", "toString"), { recursive: true });
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
@@ -843,7 +844,7 @@ check(
 // overlay, not polluting Object.prototype; neighbors without entries do not see
 // phantom cooldowns; cooldown is visible to pickAccount.
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-localstate-protowrite-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-localstate-protowrite-"));
   mkdirSync(join(dir, "accounts", "__proto__"), { recursive: true });
   mkdirSync(join(dir, "accounts", "sibling"), { recursive: true });
   writeJson(join(dir, "accounts-state.json"), {
@@ -901,7 +902,7 @@ check(
 // A30: conversation pin with prototype name "__proto__" is saved as an own
 // property in conversations-state.json and survives loadLedger.
 {
-  const cp = mkdtempSync(join(tmpdir(), "agy-localstate-protoconv-proto-"));
+  const cp = trackedMkdtemp(join(tmpdir(), "agy-localstate-protoconv-proto-"));
   writeJson(join(cp, "accounts-state.json"), {
     accounts: {
       a1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
@@ -938,7 +939,7 @@ check(
 
 // A31: highest priority tier is picked first among available accounts
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-highest-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-highest-"));
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
       low: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
@@ -960,7 +961,7 @@ check(
 
 // A32: equal priorities follow LRU by lastUsedMs, with label tie-break
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-lru-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-lru-"));
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
       a1: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 20 },
@@ -988,7 +989,7 @@ check(
 
 // A33: cooled-down higher tier yields to available lower tier
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-cooldown-fallback-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-cooldown-fallback-"));
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
       high: { cooldownUntilMs: Date.now() + 60_000, lastUsedMs: 100, lastError: "quota 429", priority: 20 },
@@ -1010,7 +1011,7 @@ check(
 
 // A34: priority 0 is NEVER picked, even if only free account, and excluded from "whole pool cooling" fallback
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-zero-never-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-zero-never-"));
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
       p0: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
@@ -1050,7 +1051,7 @@ check(
 
 // A35: missing or invalid priority defaults to 10
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-default-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-default-"));
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
       missing: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null },
@@ -1082,7 +1083,7 @@ check(
 
 // A36: lower tier writes markAccountUse and participates in LRU within its tier
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-lower-lru-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-lower-lru-"));
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
       high: { cooldownUntilMs: Date.now() + 60_000, lastUsedMs: 100, lastError: "quota", priority: 20 },
@@ -1110,7 +1111,7 @@ check(
 
 // A37: shared-owned: overlay does not carry priority, merge leaves priority intact, helpers do not touch priority
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-shared-owned-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-shared-owned-"));
   mkdirSync(join(dir, "accounts", "a1"), { recursive: true });
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
@@ -1138,7 +1139,7 @@ check(
 
 // A38: fallback when all candidates cooling down operates strictly within the highest present tier
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-fallback-highest-tier-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-fallback-highest-tier-"));
   const now = Date.now();
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
@@ -1166,7 +1167,7 @@ check(
 
 // A39: operator deletes priority from disk -> next saveLedger does not resurrect it
 {
-  const dir = mkdtempSync(join(tmpdir(), "agy-priority-operator-deleted-"));
+  const dir = trackedMkdtemp(join(tmpdir(), "agy-priority-operator-deleted-"));
   mkdirSync(join(dir, "accounts", "a1"), { recursive: true });
   writeJson(join(dir, "accounts-state.json"), {
     accounts: {
@@ -1222,7 +1223,7 @@ const options = {
 };
 
 async function bridgeRun(transport) {
-  const root = mkdtempSync(join(tmpdir(), `agy-localstate-${transport}-`));
+  const root = trackedMkdtemp(join(tmpdir(), `agy-localstate-${transport}-`));
   const transcriptPath = join(root, "transcript.ndjson");
   const shim = join(root, "agy-bin");
   if (transport === "acp") {

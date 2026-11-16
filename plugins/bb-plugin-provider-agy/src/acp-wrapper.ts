@@ -27,7 +27,7 @@
 import { experimental_acpProviderBridge as acpBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
 import { ACP_SHIM_SOURCE_B64 } from "./acp-shim-source.js";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
@@ -35,11 +35,16 @@ import {
   fstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   readSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   accountByLabel,
@@ -599,6 +604,308 @@ function materializeShim(): string {
     }
   }
   return join(here, "acp-shim.mjs");
+}
+
+// ---------------------------------------------------------------------------
+// Orphan-shim reaper and graceful process-tree kills (spec §12.3, the
+// defense-in-depth half of incident 16.11 — the shim's own §12.2 lifecycle is
+// the primary fix; this reaps shims that outlived their bridge worker anyway
+// and sweeps stale harness tmp roots).
+// ---------------------------------------------------------------------------
+
+const REAPER_TERM_GRACE_MS = 9_000;
+const STALE_SHIM_TMP_MS = 60 * 60_000;
+const PROC_DESCENDANT_CAP = 512;
+const PROC_FD_SCAN_CAP = 200_000;
+
+function readProcText(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Direct + transitive children of pid, read BEFORE the pid is killed —
+ * afterwards they re-parent and the tree becomes invisible (the same orphan
+ * class this reaper exists to remove). */
+function procDescendants(pid: number): number[] {
+  const seen = new Set<number>([pid]);
+  const queue = [pid];
+  const out: number[] = [];
+  while (queue.length > 0 && out.length < PROC_DESCENDANT_CAP) {
+    const cur = queue.shift() as number;
+    let tids: string[] = [];
+    try {
+      tids = readdirSync(`/proc/${cur}/task`);
+    } catch {
+      continue;
+    }
+    for (const tid of tids) {
+      const text = readProcText(`/proc/${cur}/task/${tid}/children`);
+      if (text === null) continue;
+      for (const tok of text.trim().split(/\s+/)) {
+        const child = Number(tok);
+        if (!Number.isInteger(child) || child <= 0 || seen.has(child)) {
+          continue;
+        }
+        seen.add(child);
+        out.push(child);
+        queue.push(child);
+      }
+    }
+  }
+  return out;
+}
+
+function procPpid(pid: number): number | null {
+  const status = readProcText(`/proc/${pid}/status`);
+  const match = status?.match(/^PPid:\s*(\d+)$/m);
+  return match ? Number(match[1]) : null;
+}
+
+function procComm(pid: number): string | null {
+  const comm = readProcText(`/proc/${pid}/comm`);
+  return comm === null ? null : comm.trim();
+}
+
+/** argv[0] must be the node interpreter itself and argv[1] the shim — a
+ * `vim`/`grep acp-shim.mjs` cmdline must never earn a kill (spec §12.3). */
+function isAcpShimProcess(pid: number): boolean {
+  let raw: Buffer;
+  try {
+    raw = readFileSync(`/proc/${pid}/cmdline`);
+  } catch {
+    return false;
+  }
+  const argv = raw
+    .toString("utf8")
+    .split("\0")
+    .filter((part) => part.length > 0);
+  if (argv.length < 2) {
+    return false;
+  }
+  if (!/^node(js)?$/.test(basename(argv[0]))) {
+    return false;
+  }
+  return basename(argv[1]) === "acp-shim.mjs";
+}
+
+/** Orphan = reparented: straight to PID 1, or adopted by a systemd
+ * (user-)instance/subreaper — no resolve of the foreign pid needed. */
+function isOrphanProcess(pid: number): boolean {
+  const ppid = procPpid(pid);
+  if (ppid === null) {
+    return false;
+  }
+  return ppid === 1 || procComm(ppid) === "systemd";
+}
+
+function reapOrphanShim(pid: number): void {
+  const environ = readProcText(`/proc/${pid}/environ`);
+  const threadId =
+    environ
+      ?.split("\0")
+      .find((kv) => kv.startsWith("AGY_SHIM_THREAD_ID="))
+      ?.slice("AGY_SHIM_THREAD_ID=".length) ?? "?";
+  let ageS = -1;
+  try {
+    ageS = Math.round((Date.now() - statSync(`/proc/${pid}`).mtimeMs) / 1000);
+  } catch {}
+  log(`reaper: orphan acp-shim pid=${pid} thread=${threadId} age=${ageS}s TERM`);
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {}
+  // The TERM grace lets a current shim run its own §12.2 shutdown (it
+  // group-kills agy acp itself); an old shim at least forwards it. On KILL
+  // the shim's children are taken down explicitly — collect them BEFORE the
+  // kill or agy's tree re-orphans, the same leak class this removes.
+  const killTimer = setTimeout(() => {
+    const descendants = procDescendants(pid);
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+    for (const descendant of descendants) {
+      try {
+        process.kill(descendant, "SIGKILL");
+      } catch {}
+    }
+    log(
+      `reaper: orphan acp-shim pid=${pid} KILL sent (+${descendants.length} descendants)`,
+    );
+  }, REAPER_TERM_GRACE_MS);
+  killTimer.unref?.();
+}
+
+/** TERM → grace → KILL ladder for the maintenance probes — the bare
+ * child.kill("SIGKILL") they used left `agy acp` behind on stdin EOF. */
+function killProcessTreeGracefully(child: ChildProcess): void {
+  const pid = child.pid;
+  try {
+    child.kill("SIGTERM");
+  } catch {}
+  if (pid === undefined) {
+    return;
+  }
+  const killTimer = setTimeout(() => {
+    const descendants = procDescendants(pid);
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+    for (const descendant of descendants) {
+      try {
+        process.kill(descendant, "SIGKILL");
+      } catch {}
+    }
+  }, REAPER_TERM_GRACE_MS);
+  killTimer.unref?.();
+}
+
+function newestMtimeMs(dir: string, budget: { left: number }): number {
+  let newest = 0;
+  if (budget.left <= 0) {
+    return newest;
+  }
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return newest;
+  }
+  for (const name of names) {
+    if (budget.left <= 0) break;
+    budget.left -= 1;
+    const path = join(dir, name);
+    let st;
+    try {
+      st = statSync(path);
+    } catch {
+      continue;
+    }
+    if (st.mtimeMs > newest) newest = st.mtimeMs;
+    if (st.isDirectory()) {
+      const nested = newestMtimeMs(path, budget);
+      if (nested > newest) newest = nested;
+    }
+  }
+  return newest;
+}
+
+/** Every filesystem target visible in /proc — cwd and fd symlinks of every
+ * readable process. "unknown" marks a proc we could not inspect (EPERM on a
+ * foreign /proc entry): the spec counts it as a reference, never as proof
+ * the dir is free. Returns null when a proc hid its fds. */
+function procVisibleTargets(): Set<string> | null {
+  let pids: string[] = [];
+  try {
+    pids = readdirSync("/proc").filter((e) => /^\d+$/.test(e));
+  } catch {
+    return null;
+  }
+  const targets = new Set<string>();
+  let scanned = 0;
+  for (const pid of pids) {
+    try {
+      targets.add(readlinkSync(`/proc/${pid}/cwd`));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM" || code === "EACCES") return null;
+    }
+    let fds: string[] = [];
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM" || code === "EACCES") return null;
+      continue; // raced exit, etc.
+    }
+    for (const fd of fds) {
+      scanned += 1;
+      if (scanned > PROC_FD_SCAN_CAP) return null;
+      try {
+        targets.add(readlinkSync(`/proc/${pid}/fd/${fd}`));
+      } catch {
+        // fd churn between readdir and readlink is normal.
+      }
+    }
+  }
+  return targets;
+}
+
+/** Leftover `<os.tmpdir()>/agy-acp-*` roots of dead harnesses. A dir is
+ * removed only when it is not this instance's own dataDir/shimDir (or their
+ * ancestor), carries no file younger than an hour, and no live process
+ * references it — all three, per spec §12.3. */
+function sweepStaleShimTmpDirs(): void {
+  let names: string[] = [];
+  try {
+    names = readdirSync(tmpdir());
+  } catch {
+    return;
+  }
+  const candidates = names
+    .filter((name) => name.startsWith("agy-acp-"))
+    .map((name) => join(tmpdir(), name))
+    .filter((dir) => {
+      try {
+        return statSync(dir).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+  if (candidates.length === 0) {
+    return;
+  }
+  const targets = procVisibleTargets();
+  for (const dir of candidates) {
+    try {
+      const resolved = resolve(dir);
+      const own =
+        [dataDir, shimDir()]
+          .filter((base) => base !== "")
+          .map((base) => resolve(base))
+          .some(
+            (base) => resolved === base || base.startsWith(resolved + sep),
+          );
+      if (own) continue;
+      const budget = { left: 10_000 };
+      if (Date.now() - newestMtimeMs(dir, budget) < STALE_SHIM_TMP_MS) {
+        continue;
+      }
+      if (
+        targets === null ||
+        [...targets].some(
+          (t) => t === resolved || t.startsWith(resolved + sep),
+        )
+      ) {
+        continue;
+      }
+      rmSync(dir, { recursive: true, force: true });
+      log(`reaper: removed stale shim tmp dir ${dir}`);
+    } catch {
+      // A dir that resists any check is left for the next pass.
+    }
+  }
+}
+
+/** Defense in depth: shims orphaned onto init/systemd are reaped here even
+ * though the shim's own lifecycle is the primary fix. No-op outside Linux;
+ * any scan failure degrades to log+skip — start()/onClose() never fall. */
+function reapOrphanShims(): void {
+  if (process.platform !== "linux") {
+    return;
+  }
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (!isAcpShimProcess(pid) || !isOrphanProcess(pid)) continue;
+      reapOrphanShim(pid);
+    }
+    sweepStaleShimTmpDirs();
+  } catch (error) {
+    log(`reaper: scan failed: ${String(error)}`);
+  }
 }
 
 /**
@@ -1208,7 +1515,7 @@ function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
     }
     let stdout = "";
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killProcessTreeGracefully(child);
     }, 30_000);
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
@@ -1255,7 +1562,7 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
     const pending = new Map<number, (result: unknown) => void>();
     let nextId = 1;
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killProcessTreeGracefully(child);
       resolve([]);
     }, 15_000);
     const send = (method: string, params: Record<string, unknown>) =>
@@ -1318,7 +1625,7 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
         resolve([]);
       } finally {
         clearTimeout(timer);
-        child.kill("SIGKILL");
+        killProcessTreeGracefully(child);
       }
     })();
   });
@@ -2725,6 +3032,9 @@ export const experimental_providerBridge = {
     ensureStarted();
     loadModelDiskCache();
     log(`acp wrapper started (dataDir=${context.dataDir})`);
+    // Defense-in-depth sweep (spec §12.3): orphans of dead workers and stale
+    // harness tmp roots. Best-effort — never lets a scan failure break start.
+    reapOrphanShims();
   },
   handleLine,
   onClose: () => {
@@ -2733,6 +3043,7 @@ export const experimental_providerBridge = {
         clearTimeout(session.waitTimer);
       }
     }
+    reapOrphanShims();
     return acpBridge.onClose?.();
   },
   onSigterm: () => acpBridge.onSigterm?.(),
