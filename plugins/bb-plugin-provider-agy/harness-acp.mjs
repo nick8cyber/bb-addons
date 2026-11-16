@@ -427,6 +427,9 @@ setInterval(() => {}, 1000);
     const pp = ppidOf(orphanPid);
     return pp !== null && (pp === 1 || commOf(pp) === "systemd");
   }, 10000, "planted shim reparented");
+  // The orphan's node bootstrap may lag the reparent; wait for its detached
+  // child so the tree check below cannot degenerate into an empty every().
+  await waitFor(() => childrenOf(orphanPid).length >= 1, 10000, "planted orphan spawned its child");
   const orphanKids = childrenOf(orphanPid);
   check("lifecycle/planted-orphan", alive(orphanPid) && orphanKids.length >= 1, `pid=${orphanPid} kids=${orphanKids}`);
 
