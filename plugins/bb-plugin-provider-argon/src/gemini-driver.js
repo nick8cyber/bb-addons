@@ -359,7 +359,7 @@ async function getPickerButton(page) {
   // Fallback: a visible button whose text/aria-label names a known model.
   const handle = await page.evaluateHandle(() => {
     const vis = (el) => !!(el && el.offsetParent !== null);
-    const re = /argon|hydrogen|flash|flash-lite|\bpro\b|lite/i;
+    const re = /argon|hydrogen|flash|flash-lite|\bpro\b|lite|carbon/i;
     return [...document.querySelectorAll('button,[role="button"]')]
       .filter(vis)
       .find((e) => re.test(e.innerText + ' ' + (e.getAttribute('aria-label') || '')));
@@ -391,12 +391,32 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
     await page.waitForTimeout(300);
   };
 
-  if (model && model.toLowerCase() !== 'argon') {
+  if (model) {
     try {
       const btn = await getPickerButton(page);
       const btnText = (await btn.innerText()).trim().toLowerCase();
       const btnAria = ((await btn.getAttribute('aria-label')) || '').toLowerCase();
-      const alreadySelected = btnText.includes(model.toLowerCase()) || btnAria.includes(model.toLowerCase());
+      const m = model.toLowerCase();
+      const modelKeywords = {
+        argon: ['argon', 'код и анализ'],
+        carbon: ['carbon', 'самые сложные задачи'],
+        hydrogen: ['hydrogen', 'повседневные дела'],
+        pro: ['pro', 'исследования'],
+        'flash-lite': ['flash-lite', 'lite', 'быстрые ответы'],
+        lite: ['flash-lite', 'lite', 'быстрые ответы'],
+        flash: ['flash'],
+        fast: ['flash-lite', 'lite', 'быстрые ответы', 'flash'],
+      }[m] || [m];
+
+      const alreadySelected = (() => {
+        if (m === 'flash' || m === 'fast') {
+          if (btnText.includes('lite') || btnAria.includes('lite')) return false;
+          return wordMatch(btnText, 'flash') || wordMatch(btnAria, 'flash');
+        }
+        return modelKeywords.some(
+          (kw) => wordMatch(btnText, kw) || wordMatch(btnAria, kw) || btnText.includes(kw) || btnAria.includes(kw)
+        );
+      })();
 
       if (!alreadySelected) {
         await openMenu();
@@ -407,16 +427,43 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
           // Item layout varies: "ModelName" (EN) or "RU description\nVER ModelName"
           // — check every line, not just the first.
           const lines = rawText.split('\n').map((l) => l.trim().toLowerCase()).filter(Boolean);
-          const hasWord = (w) => lines.some((l) => wordMatch(l, w));
-          const m = model.toLowerCase();
+          const hasWord = (w) => lines.some((l) => wordMatch(l, w) || l.includes(w));
           const matches =
             (m === 'lite' || m === 'flash-lite')
-              ? hasWord('flash-lite') || hasWord('lite')
+              ? hasWord('flash-lite') || hasWord('lite') || hasWord('быстрые ответы')
               : (m === 'flash' || m === 'fast')
                 ? hasWord('flash') && !lines.some((l) => l.includes('lite'))
-                : hasWord(m);
+                : (m === 'carbon')
+                  ? hasWord('carbon') || hasWord('самые сложные задачи')
+                  : (m === 'hydrogen')
+                    ? hasWord('hydrogen') || hasWord('повседневные дела')
+                    : (m === 'pro')
+                      ? hasWord('pro') || hasWord('исследования')
+                      : (m === 'argon')
+                        ? hasWord('argon') || hasWord('код и анализ')
+                        : hasWord(m);
 
           if (matches) {
+            // Check for lock icon before clicking
+            const isLocked = await item.evaluate((el) => {
+              const icons = [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')];
+              return icons.some((icon) => {
+                const t = (icon.innerText || '').trim().toLowerCase();
+                const attr = (icon.getAttribute('data-mat-icon-name') || icon.getAttribute('aria-label') || '').toLowerCase();
+                return t === 'lock' || attr === 'lock' || (icon.className && icon.className.includes('lock'));
+              });
+            });
+            if (isLocked) {
+              if (strict) {
+                const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
+                err.isLocked = true;
+                err.lockedModel = m;
+                throw err;
+              }
+              console.warn(`[gemini-driver] Model "${model}" is locked (paid upgrade required).`);
+              break;
+            }
+
             const isDisabled = await item.evaluate(
               (el) =>
                 el.hasAttribute('disabled') ||
@@ -450,7 +497,12 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
                   if (b) b.click();
                   return true;
                 });
-                if (upsell) throw new ModelUnavailable('model', `${model} locked: paid upgrade required`);
+                if (upsell) {
+                  const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
+                  err.isLocked = true;
+                  err.lockedModel = m;
+                  throw err;
+                }
               }
             }
             break;
