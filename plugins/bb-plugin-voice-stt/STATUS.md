@@ -37,6 +37,9 @@
   быть `voice = gemini-live` — значение `bb cloud`/Automatic отправляет
   аудио в облачную транскрибацию мимо плагина (симптом: чужой язык).
   `language = "ru"` выставлен на обоих инстансах стенда.
+  `transcriptionMode` (select `smart`|`verbatim`, default `smart`) →
+  `inputAudioTranscription.mode`; расхождение по дизайну: владелец —
+  `verbatim`, второй инстанс — `smart`.
 - Тесты: 178 (`npx vitest run`), `npx tsc --noEmit`, `bb plugin build .`.
 
 Проверено 07.11: эмуляция WebKit (iPhone 15, десктоп 1440×900) и
