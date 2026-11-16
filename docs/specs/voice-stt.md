@@ -86,6 +86,7 @@ devDependencies: `@get-bb/plugin-sdk` (та же линия, что у live-call
 | `language` | string | нет | `""` | BCP-47 (`ru`, `ru-RU`); пусто = автодетект. Валидация `^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$`, невалидно → null. Gemini получает как есть (`languageCodes`), для Groq срезается регион (`ru-RU`→`ru`, ISO-639-1). |
 | `geminiLiveModel` | string | нет | `gemini-3.5-transcribe-live` | live-модель; `models/` добавляется в setup. |
 | `groqModel` | string | нет | `whisper-large-v3-turbo` | батч-модель Groq. |
+| `transcriptionMode` | select | нет | `smart` | `inputAudioTranscription.mode` Gemini Live: `smart` — чистка дисфлюэнсий/самокоррекций и форматирование; `verbatim` — дословный транскрипт без правки. На проводе uppercase (`SMART`/`VERBATIM`); на Groq/Codex не действует. Невалидное значение нормализуется в `smart`. |
 
 Чтение `geminiKeys`: `raw.split(/\r?\n/).map(trim).filter(Boolean).slice(0,2)` —
 ровно как `keysList` в live-call.
@@ -252,6 +253,7 @@ Setup (первым, один раз):
 ```
 
 - `model` — `models/` + id, если префикса нет.
+- `mode` — из настройки `transcriptionMode` (`"smart"`/`"verbatim"` → `SMART`/`VERBATIM`).
 - `custom_vocabulary` — из `hint` (см. `vocabularyTerms` §6.4); пустой список →
   ключ отсутствует.
 - `languageCodes` — только когда `language` задан (`["ru"]`); строковое поле

@@ -297,6 +297,8 @@ codex/groq multipart.
 Секреты те же: `geminiKeys`, `groqApiKey`, `groqModel`, `geminiLiveModel`.
 `language` (BCP-47, `""` = автодетект) действует на все пути: live-сессия
 получает `languageCodes: ["<lang>"]`, Groq-фоллбэк — `language=<lang>`.
+`transcriptionMode` (`smart`/`verbatim`, default `smart`) тоже общий —
+live-сессия и файловый путь шлют его в `inputAudioTranscription.mode`.
 
 Новые настройки:
 - `liveInput` (boolean, default `true`) — выключает плавающую кнопку,

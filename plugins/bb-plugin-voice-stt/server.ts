@@ -15,6 +15,7 @@ import {
   STATUS_HOST_TIMEOUT_MS,
   contract,
   normalizeLanguage,
+  normalizeTranscriptionMode,
   transcribeOutputSchema,
   voiceSttHostContract,
   type CodexAuthState,
@@ -104,6 +105,14 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Батч-модель транскрибации Groq.",
       default: DEFAULT_GROQ_MODEL,
     },
+    transcriptionMode: {
+      type: "select",
+      label: "Режим транскрибации Gemini",
+      description:
+        "inputAudioTranscription.mode: smart — чистка дисфлюэнсий и форматирование; verbatim — дословно, без коррекции.",
+      options: ["smart", "verbatim"],
+      default: "smart",
+    },
     liveInput: {
       type: "boolean",
       label: "Живой ввод (диктовка)",
@@ -146,6 +155,7 @@ export default async function plugin(bb: BbPluginApi) {
       groqApiKey: str(s.groqApiKey) || null,
       groqModel: str(s.groqModel, DEFAULT_GROQ_MODEL),
       language: normalizeLanguage(s.language),
+      transcriptionMode: normalizeTranscriptionMode(s.transcriptionMode),
     };
   };
 
@@ -160,6 +170,7 @@ export default async function plugin(bb: BbPluginApi) {
         .slice(0, 2),
       geminiLiveModel: str(s.geminiLiveModel, DEFAULT_GEMINI_MODEL),
       language: normalizeLanguage(s.language),
+      transcriptionMode: normalizeTranscriptionMode(s.transcriptionMode),
       vocabulary: vocabularyTerms(str(s.vocabularyTerms)),
     };
   };

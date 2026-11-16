@@ -70,6 +70,7 @@ function makeDeps(over: Partial<LiveVoiceDeps> = {}) {
       geminiKeys: ["k1", "k2"],
       geminiLiveModel: "m",
       language: null,
+      transcriptionMode: "smart" as const,
       vocabulary: [],
     }),
     createSession: (opts) => {
@@ -346,7 +347,7 @@ describe("live-ws (§4, §9)", () => {
 
   it("no Gemini keys → error + close", async () => {
     const { tokens, deps } = makeDeps({
-      readConfig: async () => ({ geminiKeys: [], geminiLiveModel: "m", language: null, vocabulary: [] }),
+      readConfig: async () => ({ geminiKeys: [], geminiLiveModel: "m", language: null, transcriptionMode: "smart" as const, vocabulary: [] }),
     });
     const { handler, sock } = connect(deps);
     await hello(deps, handler, sock, tokens.issue());

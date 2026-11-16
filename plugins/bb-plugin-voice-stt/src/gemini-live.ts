@@ -16,13 +16,11 @@ import {
   maskKeyParam,
   maskSecretValue,
   type FailureCode,
+  type TranscriptionMode,
 } from "./contract.js";
 
 export const GEMINI_LIVE_WS_URL =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-
-/** Режим транскрибации — uppercase (у batch Interactions API — lowercase "smart"). */
-const SMART_MODE = "SMART";
 
 /** ~100 мс PCM16 при 16 кГц (спека §6.2). */
 const AUDIO_CHUNK_BYTES = 3_200;
@@ -164,8 +162,12 @@ export function setupMessage(options: {
   model: string;
   vocabularyTerms: string[];
   languageCodes: string[] | null;
+  /** `inputAudioTranscription.mode` — на проводе uppercase ("SMART"/"VERBATIM"). */
+  mode: TranscriptionMode;
 }): string {
-  const inputAudioTranscription: Record<string, unknown> = { mode: SMART_MODE };
+  const inputAudioTranscription: Record<string, unknown> = {
+    mode: options.mode.toUpperCase(),
+  };
   if (options.vocabularyTerms.length > 0) {
     inputAudioTranscription["custom_vocabulary"] = options.vocabularyTerms;
   }
@@ -224,6 +226,8 @@ export interface GeminiLiveSessionOptions {
   pcm: Buffer;
   /** BCP-47 (`ru`, `ru-RU`) или null = автодетект. */
   language: string | null;
+  /** Режим транскрибации (настройка `transcriptionMode`). */
+  transcriptionMode: TranscriptionMode;
   /** Подсказка словаря (pre-trimmed) или null. */
   hint: string | null;
   /** Бюджет ключ-сессии (спека §5: ≤12 c). */
@@ -249,6 +253,7 @@ export function transcribeGeminiLive(options: GeminiLiveSessionOptions): Promise
     model,
     pcm,
     language,
+    transcriptionMode,
     hint,
     timeoutMs,
     signal,
@@ -457,6 +462,7 @@ export function transcribeGeminiLive(options: GeminiLiveSessionOptions): Promise
           model,
           vocabularyTerms: vocabulary,
           languageCodes: language === null ? null : [language],
+          mode: transcriptionMode,
         }),
       );
     };

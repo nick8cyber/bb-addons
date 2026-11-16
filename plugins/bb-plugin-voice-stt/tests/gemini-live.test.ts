@@ -23,6 +23,7 @@ const baseOptions = () => ({
   model: "gemini-3.5-transcribe-live",
   pcm: Buffer.alloc(9600, 1), // ~300 мс PCM16 16 кГц → 3 чанка по 3200 байт
   language: null as string | null,
+  transcriptionMode: "smart" as const,
   hint: null as string | null,
   timeoutMs: 12_000,
   wsFactory: FakeWebSocket.factory,
@@ -46,11 +47,18 @@ describe("vocabularyTerms (§6.4)", () => {
 describe("setupMessage (§6.2)", () => {
   it("adds models/ prefix and SMART mode", () => {
     const frame = JSON.parse(
-      setupMessage({ model: "gemini-3.5-transcribe-live", vocabularyTerms: [], languageCodes: null }),
+      setupMessage({ model: "gemini-3.5-transcribe-live", vocabularyTerms: [], languageCodes: null, mode: "smart" }),
     );
     expect(frame.setup.model).toBe("models/gemini-3.5-transcribe-live");
     expect(frame.setup.generationConfig.responseModalities).toEqual(["TEXT"]);
     expect(frame.setup.inputAudioTranscription.mode).toBe("SMART");
+  });
+
+  it("emits VERBATIM mode when requested", () => {
+    const frame = JSON.parse(
+      setupMessage({ model: "m", vocabularyTerms: [], languageCodes: null, mode: "verbatim" }),
+    );
+    expect(frame.setup.inputAudioTranscription.mode).toBe("VERBATIM");
   });
 
   it("keeps an existing models/ prefix", () => {
@@ -59,7 +67,7 @@ describe("setupMessage (§6.2)", () => {
 
   it("omits custom_vocabulary and languageCodes when empty", () => {
     const frame = JSON.parse(
-      setupMessage({ model: "m", vocabularyTerms: [], languageCodes: null }),
+      setupMessage({ model: "m", vocabularyTerms: [], languageCodes: null, mode: "smart" }),
     );
     expect(frame.setup.inputAudioTranscription).not.toHaveProperty("custom_vocabulary");
     expect(frame.setup.inputAudioTranscription).not.toHaveProperty("languageCodes");
@@ -68,7 +76,7 @@ describe("setupMessage (§6.2)", () => {
 
   it("includes custom_vocabulary (snake_case, как OmniFlow) and languageCodes", () => {
     const frame = JSON.parse(
-      setupMessage({ model: "m", vocabularyTerms: ["bb"], languageCodes: ["ru"] }),
+      setupMessage({ model: "m", vocabularyTerms: ["bb"], languageCodes: ["ru"], mode: "smart" }),
     );
     expect(frame.setup.inputAudioTranscription.custom_vocabulary).toEqual(["bb"]);
     expect(frame.setup.inputAudioTranscription.languageCodes).toEqual(["ru"]);

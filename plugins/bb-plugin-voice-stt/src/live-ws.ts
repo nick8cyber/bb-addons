@@ -7,7 +7,7 @@
  * onOpen/onMessage/onClose, структурно совместимый с
  * `bb.http.experimental_websocket` — тесты гоняют его без сети.
  */
-import { AiServiceFailure, type EngineId, type TranscribeOutput } from "./contract.js";
+import { AiServiceFailure, type EngineId, type TranscribeOutput, type TranscriptionMode } from "./contract.js";
 import type { LiveTokenStore } from "./live-token.js";
 import { pcmToWav } from "./wav.js";
 
@@ -55,6 +55,7 @@ export interface LiveVoiceConfig {
   geminiKeys: string[];
   geminiLiveModel: string;
   language: string | null;
+  transcriptionMode: TranscriptionMode;
   vocabulary: string[];
 }
 
@@ -71,6 +72,7 @@ export interface LiveVoiceDeps {
     apiKey: string;
     model: string;
     language: string | null;
+    transcriptionMode: TranscriptionMode;
     vocabulary: string[];
   } & LiveVoiceSessionCallbacks): LiveVoiceSessionLike;
   /** PCM→WAV уже сделан — здесь только host-RPC codex→groq (§4.5). */
@@ -184,6 +186,7 @@ export function createLiveVoiceHandler(deps: LiveVoiceDeps): LiveVoiceWsHandler 
         apiKey,
         model: config.geminiLiveModel,
         language: config.language,
+        transcriptionMode: config.transcriptionMode,
         vocabulary: config.vocabulary,
         onInterim: (text) => {
           // Активность Gemini (интерим/финал/VAD) — вердикт «тишина» по RMS

@@ -10,6 +10,7 @@ const makeSession = (over: Partial<ConstructorParameters<typeof LiveGeminiSessio
     apiKey: API_KEY,
     model: "gemini-3.5-transcribe-live",
     language: null,
+    transcriptionMode: "smart",
     vocabulary: [],
     wsFactory: FakeWebSocket.factory,
     ...over,

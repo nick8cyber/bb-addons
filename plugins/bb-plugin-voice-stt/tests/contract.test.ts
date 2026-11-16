@@ -76,6 +76,7 @@ describe("host RPC contract (§5)", () => {
       groqApiKey: null,
       groqModel: "w",
       language: null,
+      transcriptionMode: "smart" as const,
     },
     timeoutMs: 65_000,
   };

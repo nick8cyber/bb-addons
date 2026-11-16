@@ -21,6 +21,7 @@ const baseInput = (over: Partial<TranscribeInput> = {}): TranscribeInput => ({
     groqApiKey: "gsk_test",
     groqModel: "whisper-large-v3-turbo",
     language: null,
+    transcriptionMode: "smart" as const,
   },
   timeoutMs: 65_000,
   ...over,

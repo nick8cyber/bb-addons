@@ -163,6 +163,7 @@ export async function runTranscribeChain(
                 model: cfg.geminiLiveModel,
                 pcm,
                 language: cfg.language,
+                transcriptionMode: cfg.transcriptionMode,
                 hint: input.hint,
                 timeoutMs: budget(sessionMs),
                 signal: context.signal,

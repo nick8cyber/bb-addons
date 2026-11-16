@@ -14,7 +14,7 @@
  *   провал; turnComplete после нашего streamEnd → resolve (§4.4).
  */
 import { LiveTranscriptAccumulator } from "./accumulator.js";
-import { AiServiceFailure, maskKeyParam, maskSecretValue } from "./contract.js";
+import { AiServiceFailure, maskKeyParam, maskSecretValue, type TranscriptionMode } from "./contract.js";
 import {
   AUDIO_STREAM_END_MESSAGE,
   PRE_SETUP_FAILURE_MESSAGE,
@@ -44,6 +44,8 @@ export interface LiveGeminiSessionOptions {
   model: string;
   /** BCP-47 (`ru`, `ru-RU`) или null = автодетект. */
   language: string | null;
+  /** Режим транскрибации (настройка `transcriptionMode`). */
+  transcriptionMode: TranscriptionMode;
   /** Термины `custom_vocabulary` — с живого пути из настройки, не из hint. */
   vocabulary: string[];
   setupTimeoutMs?: number;
@@ -116,6 +118,7 @@ export class LiveGeminiSession {
           model: this.options.model,
           vocabularyTerms: this.options.vocabulary,
           languageCodes: this.options.language === null ? null : [this.options.language],
+          mode: this.options.transcriptionMode,
         }),
       );
     }) as never);

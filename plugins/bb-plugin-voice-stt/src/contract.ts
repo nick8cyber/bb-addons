@@ -76,6 +76,7 @@ export const transcribeConfigSchema = z
     groqApiKey: z.string().nullable(),
     groqModel: z.string(),
     language: z.string().nullable(),
+    transcriptionMode: z.enum(["smart", "verbatim"]),
   })
   .strict();
 export type TranscribeConfig = z.infer<typeof transcribeConfigSchema>;
@@ -171,4 +172,15 @@ export function languageBaseCode(language: string | null): string | null {
   if (language === null) return null;
   const base = language.split("-", 1)[0]?.trim() ?? "";
   return base === "" ? null : base;
+}
+
+// --- Режим транскрибации Gemini Live (inputAudioTranscription.mode) ---
+
+export type TranscriptionMode = "smart" | "verbatim";
+
+/** Нормализация настройки `transcriptionMode`: невалидное/пустое → "smart". */
+export function normalizeTranscriptionMode(raw: unknown): TranscriptionMode {
+  return typeof raw === "string" && raw.trim().toLowerCase() === "verbatim"
+    ? "verbatim"
+    : "smart";
 }
