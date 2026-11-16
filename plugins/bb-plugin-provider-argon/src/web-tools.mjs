@@ -107,14 +107,36 @@ export const SENSITIVE_DENIED =
   "access denied to sensitive file (.env*, secrets/, *.pem, *.key)";
 
 export function isSensitivePath(rel) {
-  const norm = String(rel ?? "").replace(/\\/g, "/");
-  const segs = norm.split("/").filter((s) => s && s !== ".");
-  if (segs.some((s) => s.toLowerCase() === "secrets")) return true;
+  let norm = String(rel ?? "").replace(/\\/g, "/").trim();
+  if (!norm) return false;
+  norm = norm.replace(/^["']|["']$/g, "");
+  if (norm.startsWith(":(")) {
+    const end = norm.indexOf(")");
+    if (end !== -1) {
+      const magic = norm.slice(2, end);
+      if (magic.includes("exclude") || magic.includes("!")) return false;
+      norm = norm.slice(end + 1);
+    }
+  } else if (norm.startsWith(":!") || norm.startsWith(":^")) {
+    return false;
+  } else if (norm.startsWith(":/")) {
+    norm = norm.slice(2);
+  }
+  const colonIdx = norm.lastIndexOf(":");
+  if (colonIdx !== -1 && !norm.startsWith("-")) {
+    if (!(colonIdx === 1 && /^[a-zA-Z]:/.test(norm))) {
+      norm = norm.slice(colonIdx + 1);
+    }
+  }
+  norm = norm.replace(/^["']|["']$/g, "");
+  const segs = norm.split("/").filter((s) => s && s !== "." && s !== "**");
+  if (!segs.length) return false;
+  if (segs.some((s) => s.toLowerCase() === "secrets" || /^\*?secrets\*?$/i.test(s))) return true;
   const base = segs[segs.length - 1] || "";
   return (
-    /^\.env(?:\.|$)/i.test(base) ||
-    /\.(pem|key)$/i.test(base) ||
-    /^id_(?:rsa|ed25519)/i.test(base)
+    /^\.env/i.test(base) ||
+    /\.(pem|key)(?:\*|$)/i.test(base) ||
+    /^id_(?:rsa|ed25519|\*)/i.test(base)
   );
 }
 
@@ -321,6 +343,19 @@ const GREP_DENY_GLOBS = [
   "-g", "!*.key",
   "-g", "!id_rsa*",
   "-g", "!id_ed25519*",
+  "-g", "!id_*",
+];
+
+const GIT_GREP_DENY_PATHSPECS = [
+  ":(exclude).env*",
+  ":(exclude)*/.env*",
+  ":(exclude)**/secrets/**",
+  ":(exclude)*secrets*",
+  ":(exclude)*.pem",
+  ":(exclude)*.key",
+  ":(exclude)id_rsa*",
+  ":(exclude)id_ed25519*",
+  ":(exclude)id_*",
 ];
 
 function capLines(text, max) {
@@ -328,6 +363,21 @@ function capLines(text, max) {
   while (lines.length && lines[lines.length - 1] === "") lines.pop();
   if (lines.length <= max) return lines.join("\n");
   return lines.slice(0, max).join("\n") + TRUNC_SUFFIX;
+}
+
+function filterGrepOutput(stdout) {
+  const lines = String(stdout ?? "").replace(/\r\n/g, "\n").split("\n");
+  const filtered = [];
+  for (const line of lines) {
+    if (!line) continue;
+    const colonIdx = line.indexOf(":");
+    if (colonIdx !== -1) {
+      const file = line.slice(0, colonIdx).trim();
+      if (isSensitivePath(file)) continue;
+    }
+    filtered.push(line);
+  }
+  return filtered.join("\n");
 }
 
 function toolGrep(args, ctx) {
@@ -343,9 +393,11 @@ function toolGrep(args, ctx) {
   ]);
   if (res.error === "command not found: rg") {
     const rel = path.relative(r.base, r.abs) || ".";
-    const g = runCmd("git", ["grep", "-n", "-I", "-e", pattern, "--", rel], {
-      cwd: r.base,
-    });
+    const g = runCmd(
+      "git",
+      ["grep", "-n", "-I", "-e", pattern, "--", rel, ...GIT_GREP_DENY_PATHSPECS],
+      { cwd: r.base },
+    );
     if (g.error) return err(g.error);
     if (g.status !== 0) {
       if (g.stderr && !g.stdout) {
@@ -353,14 +405,62 @@ function toolGrep(args, ctx) {
       }
       return { output: "(no matches)" };
     }
-    return { output: capLines(g.stdout, MAX_GREP_LINES) };
+    const filtered = filterGrepOutput(g.stdout);
+    if (!filtered) return { output: "(no matches)" };
+    return { output: capLines(filtered, MAX_GREP_LINES) };
   }
   if (res.error) return err(res.error);
   if (res.status === 1) return { output: "(no matches)" };
   if (res.status !== 0) {
     return err(`rg failed: ${String(res.stderr || "").split("\n")[0] || "exit " + res.status}`);
   }
-  return { output: capLines(res.stdout, MAX_GREP_LINES) };
+  const filtered = filterGrepOutput(res.stdout);
+  if (!filtered) return { output: "(no matches)" };
+  return { output: capLines(filtered, MAX_GREP_LINES) };
+}
+
+export function extractGitPaths(argv) {
+  const paths = [];
+  const rest = argv.slice(1);
+  const dashDashIdx = rest.indexOf("--");
+
+  if (dashDashIdx !== -1) {
+    for (let i = dashDashIdx + 1; i < rest.length; i++) {
+      if (rest[i]) paths.push(rest[i]);
+    }
+  }
+
+  const beforeDashDash = dashDashIdx !== -1 ? rest.slice(0, dashDashIdx) : rest;
+  for (let i = 0; i < beforeDashDash.length; i++) {
+    const token = beforeDashDash[i];
+    if (!token) continue;
+    if (token.startsWith("-L")) {
+      const c = token.lastIndexOf(":");
+      if (c !== -1) {
+        const f = token.slice(c + 1).replace(/^["']|["']$/g, "");
+        if (f) paths.push(f);
+      }
+      continue;
+    }
+    if (token.startsWith("-")) continue;
+
+    const colonIdx = token.indexOf(":");
+    if (colonIdx !== -1) {
+      if (!token.startsWith(":/")) {
+        let p = token.slice(colonIdx + 1);
+        if (/^[0-3]:/.test(p)) {
+          p = p.slice(2);
+        }
+        p = p.replace(/^["']|["']$/g, "");
+        if (p) paths.push(p);
+      }
+      continue;
+    }
+
+    paths.push(token.replace(/^["']|["']$/g, ""));
+  }
+
+  return paths;
 }
 
 function toolGit(args, ctx) {
@@ -371,6 +471,13 @@ function toolGit(args, ctx) {
   if (argv.some((a) => GIT_DENIED_OPT_RE.test(a))) {
     return err(`git option not allowed: ${argv.find((a) => GIT_DENIED_OPT_RE.test(a))}`);
   }
+  const paths = extractGitPaths(argv);
+  for (const p of paths) {
+    if (isSensitivePath(p)) return err(SENSITIVE_DENIED);
+    if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(p)) {
+      return err("access denied: path outside cwd");
+    }
+  }
   const r = resolveInCwd(ctx.cwd, ".");
   if (r.error) return err(r.error);
   const res = runCmd("git", argv, { cwd: r.base });
@@ -378,7 +485,12 @@ function toolGit(args, ctx) {
   if (res.status !== 0) {
     return err(`git ${sub} failed: ${String(res.stderr || "").split("\n")[0] || "exit " + res.status}`);
   }
-  return { output: res.stdout };
+  let out = res.stdout;
+  if (sub === "ls-files") {
+    const lines = out.split("\n").filter((l) => !isSensitivePath(l.trim()));
+    out = lines.join("\n");
+  }
+  return { output: out };
 }
 
 const bbBin = () => process.env.BB_CLI || "bb";

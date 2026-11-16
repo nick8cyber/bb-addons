@@ -213,6 +213,62 @@ test("3. git: опции записи (--output, --exec) отклоняются"
   assert.match(r.output, /git option not allowed/);
 });
 
+test("3. git: пути к чувствительным файлам отклоняются с SENSITIVE_DENIED", () => {
+  const repo = mkGitRepo();
+  const git = (args) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  fs.writeFileSync(path.join(repo, ".env"), "DB_PASS_WORD=very_secret_pass_123\n");
+  fs.mkdirSync(path.join(repo, "secrets"));
+  fs.writeFileSync(path.join(repo, "secrets", "key.pem"), "CERT_KEY=pem_content_abc\n");
+  fs.writeFileSync(path.join(repo, "id_rsa"), "SSH_KEY=rsa_private_xyz\n");
+  fs.writeFileSync(path.join(repo, "app.key"), "APP_KEY=key_content_789\n");
+  git(["add", ".env", "secrets/key.pem", "id_rsa", "app.key"]);
+  git(["commit", "-q", "-m", "add secrets"]);
+
+  // 1. Форма <rev>:<path>: git show HEAD:.env
+  const rShow = executeTool(
+    { name: "git", args: { args: "show HEAD:.env" }, attrs: [["args", "show HEAD:.env"]] },
+    { cwd: repo },
+  );
+  assert.equal(rShow.ok, false);
+  assert.match(rShow.output, /access denied to sensitive file/);
+  assert.doesNotMatch(rShow.output, /very_secret_pass/);
+
+  // 2. Токены после '--': git log -p -- secrets/key.pem
+  const rLog = executeTool(
+    { name: "git", args: { args: "log -p -- secrets/key.pem" }, attrs: [["args", "log -p -- secrets/key.pem"]] },
+    { cwd: repo },
+  );
+  assert.equal(rLog.ok, false);
+  assert.match(rLog.output, /access denied to sensitive file/);
+  assert.doesNotMatch(rLog.output, /pem_content/);
+
+  // 3. Голый pathspec: git blame id_rsa
+  const rBlame = executeTool(
+    { name: "git", args: { args: "blame id_rsa" }, attrs: [["args", "blame id_rsa"]] },
+    { cwd: repo },
+  );
+  assert.equal(rBlame.ok, false);
+  assert.match(rBlame.output, /access denied to sensitive file/);
+  assert.doesNotMatch(rBlame.output, /rsa_private/);
+
+  // 4. Wildcard pathspec: git diff -- *.key
+  const rDiff = executeTool(
+    { name: "git", args: { args: "diff -- *.key" }, attrs: [["args", "diff -- *.key"]] },
+    { cwd: repo },
+  );
+  assert.equal(rDiff.ok, false);
+  assert.match(rDiff.output, /access denied to sensitive file/);
+
+  // 5. Разрешённые файлы читаются без ошибок
+  const rOk = executeTool(
+    { name: "git", args: { args: "show HEAD:tracked.txt" }, attrs: [["args", "show HEAD:tracked.txt"]] },
+    { cwd: repo },
+  );
+  assert.equal(rOk.ok, true);
+  assert.match(rOk.output, /line1/);
+});
+
 /* ---------- 4. Чёрный список конфиденциальных файлов ---------- */
 
 test("4. isSensitivePath и read_file: .env, .env.prod, secrets/key.pem — отказ без чтения", () => {
@@ -239,6 +295,43 @@ test("4. isSensitivePath и read_file: .env, .env.prod, secrets/key.pem — от
   );
   assert.equal(g.ok, false);
   assert.match(g.output, /access denied to sensitive file/);
+});
+
+test("4. grep fallback git grep: чувствительные файлы исключаются из выдачи", () => {
+  const repo = mkGitRepo();
+  const git = (args) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  fs.writeFileSync(path.join(repo, "tracked.txt"), "TARGET_TOKEN_SEARCH = public_value\n");
+  fs.writeFileSync(path.join(repo, ".env"), "TARGET_TOKEN_SEARCH = config_secret_val\n");
+  fs.mkdirSync(path.join(repo, "secrets"));
+  fs.writeFileSync(path.join(repo, "secrets", "key.pem"), "TARGET_TOKEN_SEARCH = pem_secret_val\n");
+  fs.writeFileSync(path.join(repo, "id_rsa"), "TARGET_TOKEN_SEARCH = rsa_secret_val\n");
+  git(["add", "tracked.txt", ".env", "secrets/key.pem", "id_rsa"]);
+  git(["commit", "-q", "-m", "add test files"]);
+
+  const prevPath = process.env.PATH;
+  const noRgDir = mkTmp("argon-norg-");
+  const gitBin = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  fs.symlinkSync(gitBin, path.join(noRgDir, "git"));
+  process.env.PATH = noRgDir;
+
+  try {
+    const res = executeTool(
+      { name: "grep", args: { pattern: "TARGET_TOKEN_SEARCH" }, attrs: [["pattern", "TARGET_TOKEN_SEARCH"]] },
+      { cwd: repo },
+    );
+    assert.equal(res.ok, true);
+    assert.match(res.output, /tracked\.txt/);
+    assert.match(res.output, /public_value/);
+    assert.doesNotMatch(res.output, /\.env/);
+    assert.doesNotMatch(res.output, /secrets/);
+    assert.doesNotMatch(res.output, /id_rsa/);
+    assert.doesNotMatch(res.output, /config_secret_val/);
+    assert.doesNotMatch(res.output, /pem_secret_val/);
+    assert.doesNotMatch(res.output, /rsa_secret_val/);
+  } finally {
+    process.env.PATH = prevPath;
+  }
 });
 
 /* ---------- 5. Маскировка секретов ---------- */
