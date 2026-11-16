@@ -759,9 +759,10 @@ async function acceptTask(
     }
   }
 
-  if (executor && executor.coordinator_thread_id !== input.caller.threadId) {
-    missing.push(t("rel.missingNotCoordinator"));
-  }
+  // §25 (r33.4): no `coordinator_thread_id` equality here — the
+  // runRelease entry gate already proved the caller's orchestrator
+  // role, and any orchestrator thread may release another
+  // coordinator's delegation.
   if (missing.length) {
     throw new OrchestratorError(
       "release-refused",

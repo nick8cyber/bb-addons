@@ -147,11 +147,17 @@ export function roleInstructions(
   // rejected at parse, and the composer ignores an addition here too.
   const extra =
     id === "release-auditor" ? undefined : opts?.extra?.trim();
+  // §25 п.4 (r33.4): every role text carries the owner-only role-change
+  // line — the setThreadRole RPC is reachable by any user process, so
+  // the agent must never call it itself. It sits BEFORE the per-role
+  // mandatory tail so the auditor's verdict line stays last.
+  const ownerLine = t("role.mand.roleOwner");
   const mandatoryKey = ROLE_MANDATORY_KEYS[id];
   const mandatory = mandatoryKey ? t(mandatoryKey) : undefined;
   return (
     body +
     (extra ? `\n${extra}` : "") +
+    `\n${ownerLine}` +
     (mandatory ? `\n${mandatory}` : "")
   );
 }

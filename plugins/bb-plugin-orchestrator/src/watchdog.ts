@@ -1986,7 +1986,8 @@ export function createWatchdog(deps: WatchdogDeps) {
    * repeat (PLUG-200 #1); an empty result always gets the plugin line.
    * `result_notified_at` is the durable delivery record; a gone
    * coordinator records the delivery with a NULL `result_notice` so the
-   * row never rescans.
+   * row never rescans. §25.6: a coordinator's own `cancel` skips the
+   * whole delivery — `result_notice = self-cancel`, nothing is sent.
    */
   const deliverResult = async (row: DelegationRow) => {
     // §16.2 hedge: a revived thread voids the outcome — check first.
@@ -1999,6 +2000,18 @@ export function createWatchdog(deps: WatchdogDeps) {
       return;
     }
     if (fresh.status !== "done" && fresh.status !== "cancelled") return;
+    // §25.6: the coordinator's own `cancel` (the `coordinator-cancel`
+    // mark) is answered by the command's own confirmation — no §16.5
+    // delivery at all: no result line, no output tail, no journal
+    // check; the row is simply recorded delivered. A cancel NOT by the
+    // coordinator (UI, cascade, archive) keeps the delivery.
+    if (
+      fresh.status === "cancelled" &&
+      hasSetupError(fresh, "coordinator-cancel")
+    ) {
+      store.setResultNotified(fresh.id, "self-cancel");
+      return;
+    }
     // §2 r10 п.4 (release): the release-auditor's outcome is read by the
     // release pump from the journal — the §16.5 handoff is never sent
     // for it; a recorded delivery keeps the rescan pass out.
@@ -2071,15 +2084,8 @@ export function createWatchdog(deps: WatchdogDeps) {
     // journal is not "absent": the claim is released so the §7 pass
     // re-checks — until the retry limit is spent, after which a late
     // duplicate beats a lost result (PLUG-200 #2).
-    // PLUG-224: the coordinator's own `orchestrator cancel` never gets
-    // a «без отчёта» tail — and BB's `child-interrupted` notice may
-    // satisfy the delivery even with an empty report, so the journal
-    // check runs for it too.
-    const selfCancelled =
-      fresh.status === "cancelled" &&
-      hasSetupError(fresh, "coordinator-cancel");
     let bbCarried = false;
-    if (report.length > 0 || selfCancelled) {
+    if (report.length > 0) {
       const seen = await coordinatorSawOutcome(fresh);
       if (seen === null) {
         await trackRetry(
@@ -2111,9 +2117,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     const body =
       report.length > 0
         ? report.slice(0, RESULT_OUTPUT_CAP)
-        : selfCancelled
-          ? ""
-          : t("wd.noReport");
+        : t("wd.noReport");
     try {
       await deps.threads.send({
         threadId: coord.id,
@@ -2132,7 +2136,7 @@ export function createWatchdog(deps: WatchdogDeps) {
                 copy,
               }) +
               (doubt ? t("wd.doubtSuffix", { doubt }) : "") +
-              (bbCarried || body === "" ? "" : `\n${body}`),
+              (bbCarried ? "" : `\n${body}`),
             mentions: [],
           },
         ],

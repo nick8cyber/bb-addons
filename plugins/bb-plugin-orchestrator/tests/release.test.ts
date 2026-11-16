@@ -820,6 +820,22 @@ test("release happy path: приёмка → sync → скан → аудит р
   assert.equal(store.threadRole("thr_audit")?.role, "release-auditor");
 });
 
+// §25 (r33.4): the caller gate is the orchestrator ROLE — a thread that
+// became orchestrator releases another coordinator's delegation; the
+// `coordinator_thread_id` author match is gone.
+test("§25: an orchestrator-role caller releases another coordinator's delegation", async () => {
+  const { repo } = makeRepo();
+  const { deps, spawnCalls } = makeDeps(repo);
+  deps.probes.roleByThreadId = (id: string) =>
+    id === "thr_other" || id === "thr_coord" ? "orchestrator" : undefined;
+  const res = await runRelease(
+    { taskKey: "PLUG-1", caller: { ...COORD, threadId: "thr_other" } },
+    deps,
+  );
+  assert.equal(res.status, "auditing");
+  assert.equal(spawnCalls.length, 1);
+});
+
 // ── PLUG-229: server-side threads.get (environmentId → env show) ─────
 
 test("PLUG-229: SDK thread без envPath — копия из environment show", async () => {

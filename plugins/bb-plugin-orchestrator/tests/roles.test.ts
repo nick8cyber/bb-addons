@@ -24,11 +24,12 @@ import {
   type RoleDecisionProbes,
 } from "../src/roles.js";
 import { parsePolicy } from "../src/policy.js";
+import { createT } from "../src/i18n/index.js";
 import {
   buildAgentConfiguration,
   migratePluginThreadRoles,
 } from "../src/agent-config.js";
-import { pendingRoleRpc } from "../server.js";
+import { pendingRoleRpc, threadRoleRpc } from "../server.js";
 
 function makeStore() {
   const db = new Database(":memory:");
@@ -107,10 +108,35 @@ test("store: pending pick upserts per project; thread role records source", () =
   const row = store.threadRole("thr_1")!;
   assert.equal(row.role, "auditor");
   assert.equal(row.source, "delegate");
-  // `source` is checked: anything outside hook|delegate is rejected.
+  // `source` is checked: anything outside hook|delegate|owner is rejected.
   assert.throws(() =>
     store.setThreadRole("thr_1", "executor", "bogus" as never),
   );
+});
+
+test("§25 (r33.4): the CHECK migration keeps old rows and allows 'owner'", () => {
+  // An "old" database — every migration but the CHECK widen — with
+  // hook/delegate rows already inside; the recreate must keep them.
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS.slice(0, -1)) db.exec(m);
+  db.prepare(
+    `INSERT INTO thread_roles (thread_id, role, decided_at, source)
+     VALUES ('thr_h', 'executor', 1, 'hook'),
+            ('thr_d', 'orchestrator', 1, 'delegate')`,
+  ).run();
+  // 'owner' does not fit the OLD check.
+  assert.throws(() =>
+    db.prepare(
+      `INSERT INTO thread_roles (thread_id, role, decided_at, source)
+       VALUES ('thr_o', 'executor', 1, 'owner')`,
+    ).run(),
+  );
+  db.exec(MIGRATIONS.at(-1)!);
+  const store = new DelegationStore(db);
+  assert.equal(store.threadRole("thr_h")!.source, "hook");
+  assert.equal(store.threadRole("thr_d")!.source, "delegate");
+  store.setThreadRole("thr_o", "orchestrator", "owner");
+  assert.equal(store.threadRole("thr_o")!.source, "owner");
 });
 
 test("decideRole: not the first message → no decision", () => {
@@ -428,6 +454,141 @@ test("projectId = null: nothing stored, the read-back is the default", () => {
   assert.deepEqual(rpc.pendingRole({ projectId: "proj_a" }), {
     role: "executor",
   });
+});
+
+// ── §25 (r33.4): the thread window's role picker RPC ─────────────────
+
+test("§25: threadRole reads the decided role; no row → none", () => {
+  const { store } = makeStore();
+  const rpc = threadRoleRpc(store);
+  assert.deepEqual(rpc.threadRole({ threadId: "thr_x" }), {
+    role: "none",
+    source: null,
+  });
+  store.setThreadRole("thr_e", "executor", "hook");
+  assert.deepEqual(rpc.threadRole({ threadId: "thr_e" }), {
+    role: "executor",
+    source: "hook",
+  });
+  // a helper row reads back too — the schema is a plain string, the
+  // window renders it disabled.
+  store.setThreadRole("thr_h", "helper", "delegate");
+  assert.equal(rpc.threadRole({ threadId: "thr_h" }).role, "helper");
+});
+
+test("§25: setThreadRole writes source=owner + role.manual; next configure gives orchestrator tools", async () => {
+  const { store } = makeStore();
+  const meta: { set?: unknown; remove?: string[] }[] = [];
+  const rpc = threadRoleRpc(store, {
+    updatePluginMetadata: async (a) => {
+      meta.push(a);
+      return {};
+    },
+  });
+  store.setThreadRole("thr_t", "executor", "hook");
+  const res = await rpc.setThreadRole({
+    threadId: "thr_t",
+    role: "orchestrator",
+  });
+  assert.deepEqual(res, { ok: true });
+  const row = store.threadRole("thr_t")!;
+  assert.equal(row.role, "orchestrator");
+  assert.equal(row.source, "owner");
+  const ev = store.listEvents("role.manual").at(-1)!;
+  const payload = JSON.parse(ev.payload) as {
+    thread: string;
+    role: string;
+    previous: string;
+    actor: string;
+  };
+  assert.equal(payload.thread, "thr_t");
+  assert.equal(payload.previous, "executor");
+  assert.equal(payload.role, "orchestrator");
+  assert.equal(payload.actor, "ui");
+  assert.deepEqual(meta, [{ threadId: "thr_t", set: { role: "orchestrator" } }]);
+  // The very next configure issues the orchestrator tool set.
+  const config = buildAgentConfiguration(
+    makePluginAgentConfigurationContext({ thread: { id: "thr_t" } }),
+    {
+      injectInstructions: true,
+      instructionsText: "RULE",
+      probes: {
+        delegationByThreadId: () => undefined,
+        hasFreshDispatching: () => false,
+        roleByThreadId: (id) => store.threadRole(id)?.role,
+      },
+    },
+  );
+  assert.equal(config.tools.length, 5);
+});
+
+test("§25: setThreadRole refuses non-pickable roles and clears the badge on none", async () => {
+  const { store } = makeStore();
+  const meta: { set?: unknown; remove?: string[] }[] = [];
+  const rpc = threadRoleRpc(store, {
+    updatePluginMetadata: async (a) => {
+      meta.push(a);
+      return {};
+    },
+  });
+  for (const role of ["helper", "release-auditor", "bogus"]) {
+    await assert.rejects(
+      rpc.setThreadRole({ threadId: "thr_t", role }),
+      (e: unknown) => (e as { code?: string }).code === "role-not-allowed",
+    );
+  }
+  assert.equal(store.threadRole("thr_t"), undefined);
+  // a helper thread's own role is plugin-managed — refused as a target.
+  store.setThreadRole("thr_hp", "helper", "delegate");
+  await assert.rejects(
+    rpc.setThreadRole({ threadId: "thr_hp", role: "executor" }),
+    (e: unknown) => (e as { code?: string }).code === "role-not-allowed",
+  );
+  assert.equal(store.threadRole("thr_hp")!.role, "helper");
+  // orchestrator → none while the thread runs an ACTIVE delegation:
+  // §25 п.3 — no participation refusal, the row is written, the
+  // delegation is untouched, the badge is removed.
+  const d = store.insert({
+    taskKey: "PLUG-1",
+    coordinatorThreadId: "thr_c",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  store.setStatus(d.id, "running");
+  store.setThreadRole("thr_c", "orchestrator", "delegate");
+  await rpc.setThreadRole({ threadId: "thr_c", role: "none" });
+  const row = store.threadRole("thr_c")!;
+  assert.equal(row.role, "none");
+  assert.equal(row.source, "owner");
+  assert.equal(store.get(d.id)!.status, "running");
+  assert.deepEqual(meta.at(-1), { threadId: "thr_c", remove: ["role"] });
+});
+
+test("§25 п.4: every role text carries the owner-only role-change line", () => {
+  for (const role of Object.values(ROLES)) {
+    assert.match(
+      role.instructions,
+      /Роль треда меняет только владелец в окне треда — не вызывай RPC плагина сам/,
+      role.id,
+    );
+  }
+  const en = createT("en");
+  for (const id of ["orchestrator", "executor", "auditor", "release-auditor", "helper"] as const) {
+    assert.match(
+      roleInstructions(id, { t: en }),
+      /Only the owner changes thread role in the thread UI — do not call the plugin RPC yourself/,
+      id,
+    );
+  }
+});
+
+test("§25: app.roleHelper exists in both catalogs", async () => {
+  const { EN } = await import("../src/i18n/en.js");
+  const { RU } = await import("../src/i18n/ru.js");
+  assert.equal(RU["app.roleHelper"], "Помощник");
+  assert.equal(EN["app.roleHelper"], "Helper");
 });
 
 test("§3 budget: longest role + a 1500-char rule stays under 4096", () => {
