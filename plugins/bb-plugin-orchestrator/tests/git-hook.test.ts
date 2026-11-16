@@ -5,8 +5,19 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writePushToken } from "../src/release.js";
+import {
+  IP_VERSION_LIKE,
+  LEAK_GHP_SECRET,
+  LEAK_HOME_PREFIX,
+  LEAK_MACHINE_PATH,
+  LEAK_PERSONAL_EMAIL,
+  LEAK_PRIVATE_IP,
+  LEAK_THREAD_ID,
+} from "./fixtures/leak-samples.js";
 
 const HOOK_SRC = new URL("../hooks/pre-push", import.meta.url).pathname;
+const PC_SRC = new URL("../hooks/pre-commit", import.meta.url).pathname;
+const SCAN_SRC = new URL("../hooks/leak-scan.ts", import.meta.url).pathname;
 const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
 
@@ -216,13 +227,19 @@ test("Б2/мелко9: installer covers every standard hook name; shared token d
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"));
   const gateSrc = readFileSync(HOOK_SRC, "utf8");
+  const pcSrc = readFileSync(PC_SRC, "utf8");
   const chainSrc = readFileSync(CHAIN_SRC, "utf8");
   for (const n of names) {
     const f = join(gd, n);
     assert.ok(existsSync(f), `${n} installed`);
-    // pre-push carries the gate; every other name is the chain wrapper
-    assert.equal(readFileSync(f, "utf8"), n === "pre-push" ? gateSrc : chainSrc);
+    // pre-push and pre-commit carry gates; the rest are chain wrappers
+    assert.equal(
+      readFileSync(f, "utf8"),
+      n === "pre-push" ? gateSrc : n === "pre-commit" ? pcSrc : chainSrc,
+    );
   }
+  // §22.1: the shared scanner core lands next to the hooks.
+  assert.ok(existsSync(join(gd, "leak-scan.ts")), "leak-scan.ts installed");
   assert.match(readFileSync(gcfg, "utf8"), /hookspath/i);
   // the token dir is the SAME dir the installer installs into — the
   // plugin's writePushToken lands where the installed hook scans
@@ -435,4 +452,277 @@ test("§17.3 (PLUG-216): --self-test/--dry-run need no hooks-dir and no bb", () 
   );
   assert.equal(st.status, 0, st.stdout + st.stderr);
   assert.match(st.stdout, /OK  self-test passed/);
+});
+
+// ── §22.1: общий хук `pre-commit` — утечки на staged diff ─────────────
+
+function makePcEnv(withLocalHook = false) {
+  const base = mkdtempSync(join(tmpdir(), "pcenv-"));
+  const hooksDir = join(base, "global-hooks");
+  const repo = join(base, "repo");
+  mkdirSync(hooksDir, { recursive: true });
+  cpSync(PC_SRC, join(hooksDir, "pre-commit"));
+  cpSync(SCAN_SRC, join(hooksDir, "leak-scan.ts"));
+  execFileSync("git", ["init", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "a@b.c"]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+  execFileSync("git", ["-C", repo, "commit", "--allow-empty", "-m", "init"]);
+  if (withLocalHook) {
+    const local = join(repo, ".git", "hooks", "pre-commit");
+    writeFileSync(local, "#!/bin/sh\necho LOCAL > \"$GIT_DIR/../pc-local-ran\"\nexit 0\n");
+    execFileSync("chmod", ["+x", local]);
+  }
+  return { base, hooksDir, repo };
+}
+
+function stage(repo: string, file: string, text: string) {
+  mkdirSync(join(repo, file, ".."), { recursive: true });
+  writeFileSync(join(repo, file), text);
+  execFileSync("git", ["-C", repo, "add", file]);
+}
+
+function runPreCommit(repo: string, hooksDir: string) {
+  return spawnSync("node", [join(hooksDir, "pre-commit")], {
+    cwd: repo,
+    env: { ...process.env, GIT_DIR: join(repo, ".git") },
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+}
+
+test("§22.1: чистый коммит проходит и цепляет локальный хук", () => {
+  const { repo, hooksDir } = makePcEnv(true);
+  stage(repo, "a.ts", "const y = 1;\n");
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 0);
+  assert.equal(existsSync(join(repo, "pc-local-ran")), true);
+});
+
+test("§22.1: путь машины в добавленной строке — отказ «файл:строка — тип: фрагмент»", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "a.ts", `const x = '${LEAK_MACHINE_PATH}';\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /a\.ts:1 — путь машины: /);
+});
+
+test("§22.1: однострочный .map > 1 МБ — отказ с усечённым фрагментом ≤120", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "big.map", `${"x".repeat(2 * 1024 * 1024)}${LEAK_HOME_PREFIX}/y`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  const line = r.stderr.split("\n").find((l) => /big\.map/.test(l))!;
+  const frag = line.split("— путь машины: ")[1]!.trim();
+  assert.ok(frag.length <= 120, `fragment ${frag.length} <= 120`);
+});
+
+test("§22.1 (ревью): фрагмент вокруг совпадения — не первые 120 байт строки", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "a.ts", `${"pad".repeat(100)} ${LEAK_MACHINE_PATH}\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  const line = r.stderr.split("\n").find((l) => /a\.ts/.test(l))!;
+  const frag = line.split("— путь машины: ")[1]!.trim();
+  assert.ok(frag.length <= 120, `fragment ${frag.length} <= 120`);
+  // The match sits far past the first 120 bytes — the fragment must
+  // still carry the leak itself.
+  assert.match(frag, /alice/);
+});
+
+test("§22.1 (ревью): фрагмент маскирует секрет ДО обрезки до 120", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "a.ts", `${"q".repeat(90)} ${LEAK_GHP_SECRET} ${"z".repeat(90)}\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  const line = r.stderr.split("\n").find((l) => /a\.ts/.test(l))!;
+  const frag = line.split("— секрет: ")[1]!.trim();
+  assert.ok(frag.length <= 120, `fragment ${frag.length} <= 120`);
+  assert.match(frag, /\*\*\*/);
+  assert.ok(!frag.includes(LEAK_GHP_SECRET.slice(6)), "raw secret tail hidden");
+});
+
+test("§22.1 (ревью): private-ip — три октета не адрес, четыре — блок", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "v.ts", `const ver = "${IP_VERSION_LIKE}";\n`);
+  const ok = runPreCommit(repo, hooksDir);
+  assert.equal(ok.status, 0, `version string is not an address: ${ok.stderr}`);
+  stage(
+    repo,
+    "v.ts",
+    `const ver = "${IP_VERSION_LIKE}";\nconst ip = "${LEAK_PRIVATE_IP}";\n`,
+  );
+  const bad = runPreCommit(repo, hooksDir);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /v\.ts:2 — путь машины: /);
+});
+
+test("§22.1: удаление строки с утечкой проходит", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "a.ts", `const x = '${LEAK_MACHINE_PATH}';\nconst ok = 1;\n`);
+  execFileSync("git", ["-C", repo, "commit", "-m", "with leak"]);
+  writeFileSync(join(repo, "a.ts"), "const ok = 1;\n");
+  execFileSync("git", ["-C", repo, "add", "a.ts"]);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 0);
+});
+
+test("§22.1: thr_ id при threadIds:false — отказ «id треда»", () => {
+  const { repo, hooksDir } = makePcEnv();
+  writeFileSync(
+    join(repo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({ version: 1, threadIds: false }),
+  );
+  stage(repo, "a.ts", `const t = "${LEAK_THREAD_ID}";\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /a\.ts:1 — id треда: /);
+});
+
+test("§22.1 (ревью): thr_ в ФАЙЛЕ — отказ даже при threadIds:true и без снапшота", () => {
+  const { repo, hooksDir } = makePcEnv();
+  // `threadIds` анонимизирует только трейлер BB-Thread: в сообщении —
+  // в добавленных строках файла thr_ флагается всегда.
+  stage(repo, "a.ts", `const t = "${LEAK_THREAD_ID}";\n`);
+  const noSnap = runPreCommit(repo, hooksDir);
+  assert.equal(noSnap.status, 1);
+  assert.match(noSnap.stderr, /a\.ts:1 — id треда: /);
+  execFileSync("git", ["-C", repo, "reset", "-q"]);
+  writeFileSync(
+    join(repo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({ version: 1, threadIds: true }),
+  );
+  stage(repo, "a.ts", `const t = "${LEAK_THREAD_ID}";\n`);
+  const anon = runPreCommit(repo, hooksDir);
+  assert.equal(anon.status, 1);
+  assert.match(anon.stderr, /a\.ts:1 — id треда: /);
+});
+
+test("§22.1 (ревью): встроенный allow — файл фикстур утечек свободен и без снапшота", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(
+    repo,
+    "tests/fixtures/leak-samples.ts",
+    `export const p = "${LEAK_MACHINE_PATH}";\nexport const t = "${LEAK_THREAD_ID}";\n`,
+  );
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 0, `builtin fixture allow: ${r.stderr}`);
+});
+
+test("§22.1 (ревью): без снапшота hostname берётся из os.hostname()", () => {
+  const { repo, hooksDir } = makePcEnv();
+  const host = execFileSync("hostname", { encoding: "utf8" }).trim();
+  assert.ok(host.length > 2, "test needs a host name");
+  stage(repo, "a.ts", `const h = "${host}";\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /a\.ts:1 — путь машины: /);
+});
+
+test("§22.1 (ревью): exclusions по корню ОСНОВНОГО репо — из worktree тоже пропуск", () => {
+  const { repo, hooksDir, base } = makePcEnv();
+  const wt = join(base, "copy-excluded");
+  execFileSync("git", ["-C", repo, "worktree", "add", wt, "--detach"]);
+  // `?? wt` — не копия repo: --show-toplevel в worktree НЕ даёт корень
+  // основного репо, только dirname(commonDir).
+  writeFileSync(join(hooksDir, "exclusions"), `${repo}\n`);
+  stage(wt, "a.ts", `const x = '${LEAK_MACHINE_PATH}';\n`);
+  const r = runPreCommit(wt, hooksDir);
+  assert.equal(r.status, 0, `excluded main root covers worktrees: ${r.stderr}`);
+});
+
+test("§22.1: настройки проекта из снапшота общего каталога — worktree копии", () => {
+  const { repo, hooksDir, base } = makePcEnv();
+  // `allow` в снапшоте общего .git — копия (worktree) применяет её же.
+  writeFileSync(
+    join(repo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({
+      version: 1,
+      allow: ["gen/**"],
+      threadIds: false,
+    }),
+  );
+  const wt = join(base, "copy");
+  execFileSync("git", ["-C", repo, "worktree", "add", wt, "--detach"]);
+  stage(wt, "gen/out.ts", `const x = '${LEAK_MACHINE_PATH}';\n`);
+  const r = runPreCommit(wt, hooksDir);
+  assert.equal(r.status, 0, `allow из снапшота: ${r.stderr}`);
+  // а файл вне allow — отказ даже в копии
+  stage(wt, "b.ts", `const x = '${LEAK_MACHINE_PATH}';\n`);
+  const r2 = runPreCommit(wt, hooksDir);
+  assert.equal(r2.status, 1);
+  // excluded:true — скан пропущен целиком
+  writeFileSync(
+    join(repo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({ version: 1, excluded: true }),
+  );
+  const r3 = runPreCommit(wt, hooksDir);
+  assert.equal(r3.status, 0);
+});
+
+test("§22.1: warn-строгость — предупреждение, коммит проходит", () => {
+  const { repo, hooksDir } = makePcEnv();
+  writeFileSync(
+    join(repo, ".git", "orchestrator-leaks.json"),
+    JSON.stringify({ version: 1, machine: "warn" }),
+  );
+  stage(repo, "a.ts", `const x = '${LEAK_MACHINE_PATH}';\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 0);
+  assert.match(r.stderr, /предупреждение/);
+});
+
+test("§22.1: нет снапшота — встроенные правила с дефолтной строгостью", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "a.ts", `const e = '${LEAK_PERSONAL_EMAIL}';\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /— почта: /);
+});
+
+test("§4 r11.1: синтетика (секрет и почта) в файле фикстур — проходит", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(
+    repo,
+    "tests/fixtures/leak-samples.ts",
+    `export const s = "${LEAK_GHP_SECRET}";\nexport const e = "${LEAK_PERSONAL_EMAIL}";\n`,
+  );
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 0, `synthetic fixture values exempt: ${r.stderr}`);
+});
+
+test("§4 r11.1: та же синтетика в обычном файле — отказ «секрет»", () => {
+  const { repo, hooksDir } = makePcEnv();
+  stage(repo, "a.ts", `const s = "${LEAK_GHP_SECRET}";\n`);
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /a\.ts:1 — секрет: /);
+});
+
+test("§4 r11.1: реальная форма (неповторяющееся тело) в файле фикстур — отказ", () => {
+  const { repo, hooksDir } = makePcEnv();
+  // §5: a real-form literal may not exist ANYWHERE (it is always a
+  // finding, fixture file included) — the test corrupts one char of
+  // the imported synthetic sample at runtime instead.
+  const realForm = LEAK_GHP_SECRET.replace(/x$/, "xQ");
+  stage(
+    repo,
+    "tests/fixtures/leak-samples.ts",
+    `export const s = "${realForm}";\n`,
+  );
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /leak-samples\.ts:1 — секрет: /);
+});
+
+test("§4 r11.1: реальная почта в файле фикстур — отказ «почта»", () => {
+  const { repo, hooksDir } = makePcEnv();
+  const realMail = LEAK_PERSONAL_EMAIL.replace("EXAMPLE", "petr");
+  stage(
+    repo,
+    "tests/fixtures/leak-samples.ts",
+    `export const e = "${realMail}";\n`,
+  );
+  const r = runPreCommit(repo, hooksDir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /leak-samples\.ts:1 — почта: /);
 });

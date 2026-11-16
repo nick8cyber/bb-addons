@@ -14,9 +14,12 @@
  *    reaches them), which are excluded (service repos with autopush —
  *    put them in `--exclude`, else their autopush breaks).
  * 2. Installs a wrapper under EVERY standard hook name (`hook-names`):
- *    `pre-push` is the orchestrator token gate that chains to the local
- *    hook afterwards; every other name is a copy of `chain` — a plain
- *    pass-through to `$GIT_DIR/hooks/<name>`. Then writes `exclusions`.
+ *    `pre-push` is the orchestrator token gate and `pre-commit` (§22.1)
+ *    the staged-diff leak gate — both chain to the local hook
+ *    afterwards; every other name is a copy of `chain` — a plain
+ *    pass-through to `$GIT_DIR/hooks/<name>`. `leak-scan.ts` (the shared
+ *    scanner core `pre-commit` loads) lands next to them. Then writes
+ *    `exclusions`.
  * 3. Sets `git config --global core.hooksPath <hooks dir>` unless one is
  *    already configured (then it only reports — `--force` overrides).
  */
@@ -191,8 +194,9 @@ if (selfTest) {
   const testHooksDir = join(tmp, "hooks");
   mkdirSync(testHooksDir, { recursive: true });
   const srcDir = dirname(fileURLToPath(import.meta.url));
+  const GATE_HOOKS = new Set(["pre-push", "pre-commit"]);
   for (const name of HOOK_NAMES) {
-    const srcName = name === "pre-push" ? "pre-push" : "chain";
+    const srcName = GATE_HOOKS.has(name) ? name : "chain";
     const dst = join(testHooksDir, name);
     copyFileSync(
       hooksDir && existsSync(join(hooksDir, name))
@@ -202,6 +206,13 @@ if (selfTest) {
     );
     execFileSync("chmod", ["755", dst]);
   }
+  // §22.1: `pre-commit` loads `leak-scan.ts` from its own directory.
+  copyFileSync(
+    hooksDir && existsSync(join(hooksDir, "leak-scan.ts"))
+      ? join(hooksDir, "leak-scan.ts")
+      : join(srcDir, "leak-scan.ts"),
+    join(testHooksDir, "leak-scan.ts"),
+  );
   const SHA = "a".repeat(40);
   const LINE = `refs/heads/x ${SHA} refs/heads/x ${"0".repeat(40)}\n`;
   const kinds = [
@@ -239,8 +250,8 @@ if (selfTest) {
           JSON.stringify({ token: "t", sha: SHA, branch: "x", expiresAt: Date.now() + 60000 }));
       }
       const wrapper = join(testHooksDir, name);
-      const r = name === "pre-push"
-        ? spawnSync("node", [wrapper], { cwd: repo, input: LINE, env, encoding: "utf8" })
+      const r = GATE_HOOKS.has(name)
+        ? spawnSync("node", [wrapper], { cwd: repo, input: name === "pre-push" ? LINE : "", env, encoding: "utf8" })
         : spawnSync(wrapper, [], { cwd: repo, env, encoding: "utf8" });
       const ok = r.status === 0 && existsSync(mark);
       if (!ok) {
@@ -283,11 +294,17 @@ if (hooksPathNow && resolve(hooksPathNow) !== hooksDir && !force) {
 // pass-through so repository-local hooks keep firing.
 mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
 for (const name of HOOK_NAMES) {
-  const src = join(HOOKS_SRC, name === "pre-push" ? "pre-push" : "chain");
+  const src = join(
+    HOOKS_SRC,
+    name === "pre-push" || name === "pre-commit" ? name : "chain",
+  );
   const dst = join(hooksDir, name);
   copyFileSync(src, dst);
   execFileSync("chmod", ["755", dst]);
 }
+// §22.1: the shared scanner core `pre-commit` imports — lives next to
+// the hook, not executable and not a hook name.
+copyFileSync(join(HOOKS_SRC, "leak-scan.ts"), join(hooksDir, "leak-scan.ts"));
 // §17.3 (ревью PLUG-214): `push-to-checkout` is retired — its mere
 // presence disables git's built-in worktree update on
 // receive.denyCurrentBranch=updateInstead. Remove a wrapper an older
