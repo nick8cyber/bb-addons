@@ -117,8 +117,12 @@ test("store: pending pick upserts per project; thread role records source", () =
 test("§25 (r33.4): the CHECK migration keeps old rows and allows 'owner'", () => {
   // An "old" database — every migration but the CHECK widen — with
   // hook/delegate rows already inside; the recreate must keep them.
+  // The migration is found by its `thread_roles_owner` marker, not by
+  // position — later revisions append their own after it (r33.5).
+  const idx = MIGRATIONS.findIndex((m) => m.includes("thread_roles_owner"));
+  assert.ok(idx > 0, "thread_roles_owner migration found");
   const db = new Database(":memory:");
-  for (const m of MIGRATIONS.slice(0, -1)) db.exec(m);
+  for (const m of MIGRATIONS.slice(0, idx)) db.exec(m);
   db.prepare(
     `INSERT INTO thread_roles (thread_id, role, decided_at, source)
      VALUES ('thr_h', 'executor', 1, 'hook'),
@@ -131,7 +135,7 @@ test("§25 (r33.4): the CHECK migration keeps old rows and allows 'owner'", () =
        VALUES ('thr_o', 'executor', 1, 'owner')`,
     ).run(),
   );
-  db.exec(MIGRATIONS.at(-1)!);
+  db.exec(MIGRATIONS[idx]!);
   const store = new DelegationStore(db);
   assert.equal(store.threadRole("thr_h")!.source, "hook");
   assert.equal(store.threadRole("thr_d")!.source, "delegate");

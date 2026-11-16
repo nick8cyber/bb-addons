@@ -307,6 +307,13 @@ export const RU: Record<string, string> = {
     "проект делегирования {delegation}",
   "rel.requireNote":
     "release {taskKey}: нужна заметка: --kb <заметка> или --no-kb <причина>",
+  // §2 шаг 0.1 (r11.4): немедленный отказ до платного аудита — CLI
+  // печатает его как `release-refused: unmerged-ui: …`.
+  "rel.unmergedUi":
+    "unmerged-ui: задача {key} с изменениями UI ({files}) ещё не влита; " +
+    "выкладка текущей ветки сбросит рабочий интерфейс на {target} и " +
+    "сотрёт её компоненты. Влей коммит задачи {key} или укажи " +
+    "--force-drop-unmerged <причина>",
   "rel.copyBusy": "в копии координатора незавершённая операция ({ops})",
   "rel.copyBusyHint":
     "завершите или отмените её (git merge|cherry-pick|revert|rebase --abort) и повторите",
@@ -448,6 +455,9 @@ export const RU: Record<string, string> = {
   "packet.noDocs": "- --no-docs: {text}",
   "packet.kb": "- --kb: {text}",
   "packet.noKb": "- --no-kb: {text}",
+  "packet.forceDropUnmerged":
+    "- --force-drop-unmerged: {reason} — сброшены незамерженные " +
+    "UI-фичи: {tasks}",
   "packet.commits": "## Коммиты",
   "packet.docs": "## Связанные документы для проверки актуальности",
   "packet.noMap":
@@ -545,10 +555,11 @@ export const RU: Record<string, string> = {
     "не должен коммитить, сторож коммитов не ждёт",
   "cli.releaseUsage":
     "bb orchestrator release <KEY> [--no-docs <причина>] " +
-    "[--kb <заметка>|--no-kb <причина>] [--json]",
+    "[--kb <заметка>|--no-kb <причина>] " +
+    "[--force-drop-unmerged <причина>] [--json]",
   "cli.releaseUsageShort":
     "bb orchestrator release <KEY> [--no-docs <причина>] " +
-    "[--kb <заметка>|--no-kb <причина>]",
+    "[--kb <заметка>|--no-kb <причина>] [--force-drop-unmerged <причина>]",
   "cli.kbConflict": "--kb и --no-kb несовместимы",
   "cli.releaseStarted":
     "release {taskKey}: аудит запущен (release #{id}, тред {thread}; " +

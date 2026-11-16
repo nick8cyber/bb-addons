@@ -301,6 +301,13 @@ export const EN: Record<string, string> = {
     "(excluded: true); delegation project {delegation}",
   "rel.requireNote":
     "release {taskKey}: a note is required: --kb <note> or --no-kb <reason>",
+  // §2 step 0.1 (r11.4): an immediate refusal before the paid audit —
+  // the CLI prints it as `release-refused: unmerged-ui: …`.
+  "rel.unmergedUi":
+    "unmerged-ui: task {key} has unmerged UI changes ({files}); " +
+    "publishing the current branch would reset the working UI to " +
+    "{target} and wipe its components. Merge task {key}'s commit or " +
+    "pass --force-drop-unmerged <reason>",
   "rel.copyBusy":
     "the coordinator copy has an unfinished operation ({ops})",
   "rel.copyBusyHint":
@@ -443,6 +450,9 @@ export const EN: Record<string, string> = {
   "packet.noDocs": "- --no-docs: {text}",
   "packet.kb": "- --kb: {text}",
   "packet.noKb": "- --no-kb: {text}",
+  "packet.forceDropUnmerged":
+    "- --force-drop-unmerged: {reason} — dropped unmerged UI " +
+    "features: {tasks}",
   "packet.commits": "## Commits",
   "packet.docs": "## Related documents to check for staleness",
   "packet.noMap":
@@ -541,10 +551,11 @@ export const EN: Record<string, string> = {
     "must not commit, the watchdog does not expect commits",
   "cli.releaseUsage":
     "bb orchestrator release <KEY> [--no-docs <reason>] " +
-    "[--kb <note>|--no-kb <reason>] [--json]",
+    "[--kb <note>|--no-kb <reason>] [--force-drop-unmerged <reason>] " +
+    "[--json]",
   "cli.releaseUsageShort":
     "bb orchestrator release <KEY> [--no-docs <reason>] " +
-    "[--kb <note>|--no-kb <reason>]",
+    "[--kb <note>|--no-kb <reason>] [--force-drop-unmerged <reason>]",
   "cli.kbConflict": "--kb and --no-kb are mutually exclusive",
   "cli.releaseStarted":
     "release {taskKey}: audit dispatched (release #{id}, thread " +
