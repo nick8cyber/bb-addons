@@ -806,10 +806,12 @@ export function procSession(pid: string): string | null {
 
 export type ProcAccessOutcome = "skipProcess" | "reference" | "dead";
 
-/** Classifies an unreadable same-uid process (EPERM/EACCES on cwd/fd) per spec §12.3(c) rev 9.
- * Foreign session daemons (setsid, dumpable=0) with a known session differing from ours
- * are skipped. Same-uid processes in our own session, or when our own session cannot be
- * determined, conservatively count as a reference (fail-close).
+/** Classifies an unreadable same-uid process (cwd/fd error) per spec §12.3(c) rev 9.
+ * Only ENOENT/ESRCH means the process exited (dead, not a reference).
+ * EPERM/EACCES is resolved by session: foreign session daemons (setsid, dumpable=0)
+ * with a known session differing from ours are skipped. Same-uid processes in our own session,
+ * or when our own session cannot be determined, conservatively count as a reference (fail-close).
+ * Any other cwd/fd error (or missing error code) is conservatively treated as a reference.
  * When reading /proc/<pid>/stat, only ENOENT/ESRCH means the process exited (dead).
  * Any other stat read error (EPERM/EACCES) or unparseable stat is conservatively treated
  * as a reference. */
@@ -819,8 +821,11 @@ export function classifyUnreadableProcess(
   ourSession: string | null,
 ): ProcAccessOutcome {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "ENOENT" || code === "ESRCH") {
+    return "dead"; // Process exited during readlink/readdir — not a reference
+  }
   if (code !== "EPERM" && code !== "EACCES") {
-    return "dead"; // ENOENT, ESRCH or raced exit on cwd/fd — not a reference
+    return "reference"; // EIO, ENOMEM, or missing/unknown error code — fail-close: conservative reference
   }
   let stat: string;
   try {
