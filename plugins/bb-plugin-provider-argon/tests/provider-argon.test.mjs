@@ -1046,21 +1046,27 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
 });
 
 test("8. Smart model routing: pickBackendFromState prioritizes pro accounts for argon and ultra for carbon", () => {
+  const testBackends = [
+    { id: "pro-1", priority: 10, tier: "pro", cdp: "9222" },
+    { id: "pro-2", priority: 10, tier: "pro", cdp: "9223" },
+    { id: "ultra-1", priority: 10, tier: "ultra", cdp: "9224" },
+  ];
+
   const fakeState = {
     accounts: {
-      nomerok2u: {
+      "pro-1": {
         cooldownUntilMs: 0,
         lastUsedMs: 100,
         lastError: null,
         lockedModels: ["carbon"],
       },
-      shat: {
+      "pro-2": {
         cooldownUntilMs: 0,
         lastUsedMs: 200,
         lastError: null,
         lockedModels: ["carbon"],
       },
-      karina: {
+      "ultra-1": {
         cooldownUntilMs: 0,
         lastUsedMs: 50,
         lastError: null,
@@ -1069,77 +1075,77 @@ test("8. Smart model routing: pickBackendFromState prioritizes pro accounts for 
     leases: {},
   };
 
-  // For argon: pro accounts (nomerok2u, shat) are prioritized over ultra (karina) to reserve ultra for carbon!
-  // Between nomerok2u (100) and shat (200), nomerok2u is least recently used
-  const argonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  // For argon: pro accounts (pro-1, pro-2) are prioritized over ultra (ultra-1) to reserve ultra for carbon!
+  // Between pro-1 (100) and pro-2 (200), pro-1 is least recently used
+  const argonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
   assert.ok(argonPick.backend, "Should pick a backend for argon");
-  assert.equal(argonPick.backend.id, "nomerok2u", "Argon should pick pro tier account first");
+  assert.equal(argonPick.backend.id, "pro-1", "Argon should pick pro tier account first");
 
-  // When nomerok2u is busy, argon picks shat (the remaining pro account)
-  fakeState.accounts.nomerok2u.inUseUntilMs = Date.now() + 60000;
-  fakeState.accounts.nomerok2u.owner = "other-process";
-  const argonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
-  assert.ok(argonPick2.backend, "Should pick shat for argon when nomerok2u is busy");
-  assert.equal(argonPick2.backend.id, "shat");
+  // When pro-1 is busy, argon picks pro-2 (the remaining pro account)
+  fakeState.accounts["pro-1"].inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts["pro-1"].owner = "other-process";
+  const argonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.ok(argonPick2.backend, "Should pick pro-2 for argon when pro-1 is busy");
+  assert.equal(argonPick2.backend.id, "pro-2");
 
-  // When both pro accounts are busy, argon falls back to ultra (karina)
-  fakeState.accounts.shat.inUseUntilMs = Date.now() + 60000;
-  fakeState.accounts.shat.owner = "other-process";
-  const argonPick3 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  // When both pro accounts are busy, argon falls back to ultra (ultra-1)
+  fakeState.accounts["pro-2"].inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts["pro-2"].owner = "other-process";
+  const argonPick3 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
   assert.ok(argonPick3.backend, "Should fall back to ultra account for argon when all pro accounts are busy");
-  assert.equal(argonPick3.backend.id, "karina");
+  assert.equal(argonPick3.backend.id, "ultra-1");
 
   // Reset pro accounts
-  fakeState.accounts.nomerok2u.inUseUntilMs = 0;
-  fakeState.accounts.nomerok2u.owner = null;
-  fakeState.accounts.shat.inUseUntilMs = 0;
-  fakeState.accounts.shat.owner = null;
+  fakeState.accounts["pro-1"].inUseUntilMs = 0;
+  fakeState.accounts["pro-1"].owner = null;
+  fakeState.accounts["pro-2"].inUseUntilMs = 0;
+  fakeState.accounts["pro-2"].owner = null;
 
-  // When requesting carbon: only ultra accounts (karina) are eligible.
-  // nomerok2u and shat are skipped (pro tier and locked).
-  // If karina is leased, it returns busyUntil
-  fakeState.accounts.karina.inUseUntilMs = Date.now() + 60000;
-  fakeState.accounts.karina.owner = "other-process";
-  const carbonBusy = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
-  assert.ok(carbonBusy.busyUntil, "Should return busyUntil for carbon when only karina supports it and is busy");
+  // When requesting carbon: only ultra accounts (ultra-1) are eligible.
+  // pro-1 and pro-2 are skipped (pro tier and locked).
+  // If ultra-1 is leased, it returns busyUntil
+  fakeState.accounts["ultra-1"].inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts["ultra-1"].owner = "other-process";
+  const carbonBusy = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon", testBackends);
+  assert.ok(carbonBusy.busyUntil, "Should return busyUntil for carbon when only ultra-1 supports it and is busy");
 
-  // Release karina: carbon immediately routes to karina
-  fakeState.accounts.karina.inUseUntilMs = 0;
-  fakeState.accounts.karina.owner = null;
-  const carbonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
-  assert.ok(carbonPick.backend, "Should pick karina for carbon");
-  assert.equal(carbonPick.backend.id, "karina");
+  // Release ultra-1: carbon immediately routes to ultra-1
+  fakeState.accounts["ultra-1"].inUseUntilMs = 0;
+  fakeState.accounts["ultra-1"].owner = null;
+  const carbonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon", testBackends);
+  assert.ok(carbonPick.backend, "Should pick ultra-1 for carbon");
+  assert.equal(carbonPick.backend.id, "ultra-1");
 
-  // If karina also gets carbon locked (e.g. lock icon detected, downgraded to pro), pickBackendFromState returns none
-  fakeState.accounts.karina.lockedModels = ["carbon"];
-  const nonePick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
+  // If ultra-1 also gets carbon locked (e.g. lock icon detected, downgraded to pro), pickBackendFromState returns none
+  fakeState.accounts["ultra-1"].lockedModels = ["carbon"];
+  const nonePick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon", testBackends);
   assert.equal(nonePick.none, true, "Must return none when all candidates have carbon locked");
 
   // Priority tests:
-  // 1. Equal priority (all 10): "при прочих равных" Pro accounts are preferred for Argon over Ultra (Karina in end)
-  fakeState.accounts.karina.lockedModels = [];
-  fakeState.accounts.karina.priority = 10;
-  fakeState.accounts.nomerok2u.priority = 10;
-  fakeState.accounts.shat.priority = 10;
-  fakeState.accounts.karina.lastUsedMs = 10; // Karina has lowest lastUsedMs
-  fakeState.accounts.nomerok2u.lastUsedMs = 100;
-  fakeState.accounts.shat.lastUsedMs = 200;
-  const equalPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
-  assert.equal(equalPrioPick.backend.id, "nomerok2u", "Equal priority should still prioritize pro account over ultra for argon");
+  // 1. Equal priority (all 10): "при прочих равных" Pro accounts are preferred for Argon over Ultra (Ultra in end)
+  fakeState.accounts["ultra-1"].lockedModels = [];
+  fakeState.accounts["ultra-1"].priority = 10;
+  fakeState.accounts["pro-1"].priority = 10;
+  fakeState.accounts["pro-2"].priority = 10;
+  fakeState.accounts["ultra-1"].lastUsedMs = 10; // ultra-1 has lowest lastUsedMs
+  fakeState.accounts["pro-1"].lastUsedMs = 100;
+  fakeState.accounts["pro-2"].lastUsedMs = 200;
+  const equalPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.equal(equalPrioPick.backend.id, "pro-1", "Equal priority should still prioritize pro account over ultra for argon");
 
   // 2. Explicit priority ladder: higher priority picked first regardless of lastUsedMs
-  fakeState.accounts.shat.priority = 20; // Shat has priority 20
-  const higherPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
-  assert.equal(higherPrioPick.backend.id, "shat", "Priority 20 must beat priority 10");
+  fakeState.accounts["pro-2"].priority = 20; // pro-2 has priority 20
+  const higherPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.equal(higherPrioPick.backend.id, "pro-2", "Priority 20 must beat priority 10");
 
   // 3. Priority 0: account is disabled and never picked
-  fakeState.accounts.shat.priority = 0;
-  fakeState.accounts.nomerok2u.priority = 0;
-  // Now only karina is left (> 0)
-  const onlyKarinaPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
-  assert.equal(onlyKarinaPick.backend.id, "karina", "Priority 0 accounts must be ignored, picking remaining account");
+  fakeState.accounts["pro-2"].priority = 0;
+  fakeState.accounts["pro-1"].priority = 0;
+  // Now only ultra-1 is left (> 0)
+  const onlyUltraPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.equal(onlyUltraPick.backend.id, "ultra-1", "Priority 0 accounts must be ignored, picking remaining account");
 
-  fakeState.accounts.karina.priority = 0;
-  const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  fakeState.accounts["ultra-1"].priority = 0;
+  const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
   assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
 });

@@ -334,7 +334,7 @@ export function getAccountPriority(b, state) {
   return 10;
 }
 
-export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null) {
+export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null, backends = BACKENDS) {
   const isLeased = (b) => {
     const l = state.leases && state.leases[b.id];
     if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
@@ -345,7 +345,7 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
   };
 
   const req = requestedModel ? requestedModel.toLowerCase() : null;
-  const candidates = BACKENDS.filter((b) => {
+  const candidates = backends.filter((b) => {
     const prio = getAccountPriority(b, state);
     if (b.id === excludeId || prio <= 0) return false;
     const tier = getAccountTier(b, state);
@@ -382,8 +382,8 @@ export function pickBackendFromState(state, excludeId, owner, now, requestedMode
   const maxP = Math.max(...free.map((b) => getAccountPriority(b, state)));
   const topTier = free.filter((b) => getAccountPriority(b, state) === maxP);
 
-  // When not requesting carbon, "при прочих равных" (equal priorities):
-  // prefer Pro accounts first to reserve Ultra accounts (Karina) for Carbon
+  // When not requesting carbon, "all other things being equal" (equal priorities):
+  // prefer Pro accounts first to reserve Ultra accounts for Carbon
   let eligibleTier = topTier;
   if (req !== "carbon") {
     const proAccounts = topTier.filter((b) => getAccountTier(b, state) === "pro");
