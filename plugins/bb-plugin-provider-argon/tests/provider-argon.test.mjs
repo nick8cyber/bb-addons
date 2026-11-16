@@ -327,6 +327,45 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   );
   assert.equal(clickedLocked, false, "Locked model item must not be clicked");
 
+  // Test resolveModelId for aliases and official labels
+  const { resolveModelId } = await import("../acp-server.mjs");
+  assert.equal(resolveModelId("argon"), "argon");
+  assert.equal(resolveModelId("Gemini 4 Argon"), "argon");
+  assert.equal(resolveModelId("carbon"), "carbon");
+  assert.equal(resolveModelId("Gemini 4 Carbon"), "carbon");
+  assert.equal(resolveModelId("hydrogen"), "hydrogen");
+  assert.equal(resolveModelId("Gemini 4 Hydrogen"), "hydrogen");
+  assert.equal(resolveModelId("pro"), "pro");
+  assert.equal(resolveModelId("Gemini 3.1 Pro"), "pro");
+  assert.equal(resolveModelId("flash-lite"), "flash-lite");
+  assert.equal(resolveModelId("Gemini 3.5 Flash-Lite"), "flash-lite");
+  assert.equal(resolveModelId("fast"), "flash-lite");
+  assert.equal(resolveModelId("flash"), "flash-lite");
+  assert.equal(resolveModelId("unknown-xyz"), null);
+
+  // Test successful selection of argon in Russian UI
+  let clickedArgon = false;
+  const mockPageArgon = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Код и анализ\n4 Argon",
+        evaluate: async () => false,
+        click: async () => { clickedArgon = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async () => ({
+      innerText: async () => "3.5 Flash-Lite",
+      getAttribute: async () => "3.5 Flash-Lite",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  await selectModelAndThinking(mockPageArgon, "argon", null, true);
+  assert.equal(clickedArgon, true, "Argon in Russian UI must be clicked when requested");
+
   // Verification that target is validated after last user-query with promptPrefix
   assert.ok(
     driverSrc.includes("queries[queries.length - 1]"),

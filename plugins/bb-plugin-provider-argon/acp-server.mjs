@@ -642,8 +642,13 @@ export const MODELS = [
 export function resolveModelId(val) {
   if (!val || typeof val !== "string") return null;
   const v = val.toLowerCase().trim();
-  if (v === "fast" || v === "flash" || v === "lite") return "flash-lite";
-  if (MODELS.some((m) => m.value === v)) return v;
+  if (v === "fast" || v === "flash" || v === "lite" || v.includes("flash-lite") || v.includes("flash")) return "flash-lite";
+  if (v.includes("carbon")) return "carbon";
+  if (v.includes("argon")) return "argon";
+  if (v.includes("hydrogen")) return "hydrogen";
+  if (v.includes("pro")) return "pro";
+  const exact = MODELS.find((m) => m.value === v || m.name.toLowerCase() === v);
+  if (exact) return exact.value;
   return null;
 }
 
