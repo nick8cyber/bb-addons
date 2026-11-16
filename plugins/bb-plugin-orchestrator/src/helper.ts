@@ -14,9 +14,24 @@
  */
 
 import { OrchestratorError } from "./errors.js";
-import { pickRoute, type PolicyLoad, type PolicyRoute } from "./policy.js";
+import {
+  levelRole,
+  pickRoute,
+  quotaGroupOf,
+  type PolicyLoad,
+  type PolicyRoute,
+} from "./policy.js";
+import {
+  EMPTY_SPEC,
+  PacketSkip,
+  wrapPromptWithPacket,
+  type MaskFn,
+} from "./packet.js";
 import { NO_ROLE, isRoleId } from "./roles.js";
-import type { SpawnThreadArgs } from "./delegate.js";
+import {
+  quotaGroupsOfRow,
+  type SpawnThreadArgs,
+} from "./delegate.js";
 import type {
   DelegationStore,
   HelperRow,
@@ -210,6 +225,10 @@ export interface HelperDeps {
     permissionMode?: string;
     instructions?: string;
   } | undefined>;
+  /** §20.2/§21.3 (r33): the outbound mask for a `tools: false`
+   * route's packet — the same release scanner the delegate dispatch
+   * uses. */
+  packetMask?: MaskFn;
   /** §19.1 pre-r33 compatibility: a thread WITHOUT a role row may still
    * be a §3 coordinator (delegations were recorded before roles
    * existed). Returns true only for that shape. */
@@ -384,6 +403,19 @@ function resolveRoute(
         `levels: ${Object.keys(policy.levels).join(", ")}`,
       );
     }
+    // §20.3 (r33): a `tools: false` route may be hand-picked only for a
+    // level whose role is auditor or researcher — a doer helper would
+    // get a provider that cannot do its work.
+    if (
+      route.tools === false &&
+      levelRole(policy, input.level ?? name) !== "auditor" &&
+      levelRole(policy, input.level ?? name) !== "researcher"
+    ) {
+      throw new OrchestratorError(
+        "preset-not-allowed",
+        `preset "${input.preset}" is a tool-less route and cannot be selected for a helper (preset-not-allowed)`,
+      );
+    }
     return {
       level: input.level ?? name,
       routeName: name,
@@ -446,6 +478,76 @@ export async function runHelper(
       );
     }
     const route = resolveRoute(input, load.policy, load, deps);
+    // §20.2/§21.4 (r33): a `tools: false` route's `maxActive` counts
+    // the whole `quotaGroup` — active delegations AND helpers (the
+    // argon tab is one for all). A level pick walks the rest of the
+    // chain for a usable non-busy route — helpers never queue — while
+    // an explicit --preset refuses `route-busy`.
+    // r33 аудит C: a delegation occupies a slot only once it holds
+    // something — `thread_id` (dispatched/running) or `queued_at` (a
+    // parked claim, FIFO ahead of any new helper — a helper never
+    // jumps the parked queue even in a freed-slot gap). A row still
+    // building its packet (dispatching, no thread, no queued_at) holds
+    // no claim — same rank-LAST rule as the delegate busy gate.
+    const groupBusy = (name: string, r: PolicyRoute): number => {
+      const group = quotaGroupOf(r, name);
+      const delegations = deps.store
+        .listActive()
+        .filter(
+          (d) =>
+            (d.thread_id !== null || d.queued_at !== null) &&
+            quotaGroupsOfRow(d, load.policy).has(group),
+        ).length;
+      const helpers = deps.store
+        .listActiveHelpers()
+        .filter((h) => {
+          if (!h.route) return false;
+          const hr = load.policy?.routes[h.route];
+          return (hr ? quotaGroupOf(hr, h.route) : h.route) === group;
+        }).length;
+      return delegations + helpers;
+    };
+    const busyRoute = (name: string, r: PolicyRoute) =>
+      r.tools === false &&
+      r.maxActive !== undefined &&
+      groupBusy(name, r) >= r.maxActive;
+    const held = deps.store.heldGroups(deps.now?.() ?? Date.now());
+    const unavailable = new Set(load.unavailableRoutes);
+    /** §20.2/§21.4 (r33): the next usable chain route after
+     * `fromRoute` — same filters for the busy walk and a packet skip
+     * (unavailable, held group, busy quotaGroup). */
+    const advanceChain = (
+      fromRoute: string,
+    ): { name: string; route: PolicyRoute } | undefined => {
+      const chain = load.policy!.levels[route.level]?.chain ?? [];
+      for (const name of chain.slice(chain.indexOf(fromRoute) + 1)) {
+        const r = load.policy!.routes[name];
+        if (
+          !r ||
+          unavailable.has(name) ||
+          held.has(name) ||
+          held.has(quotaGroupOf(r, name)) ||
+          busyRoute(name, r)
+        ) {
+          continue;
+        }
+        return { name, route: r };
+      }
+      return undefined;
+    };
+    if (busyRoute(route.routeName, route.route)) {
+      const busyError = () =>
+        new OrchestratorError(
+          "route-busy",
+          deps.t("cli.helperRouteBusy", { route: route.routeName }),
+        );
+      if (input.preset !== undefined) throw busyError();
+      const next = advanceChain(route.routeName);
+      if (!next) throw busyError();
+      route.routeName = next.name;
+      route.preset = next.route.preset;
+      route.route = next.route;
+    }
     if (caller.environmentId === null || caller.environmentId === undefined) {
       throw new OrchestratorError(
         "no-environment",
@@ -483,20 +585,74 @@ export async function runHelper(
     );
     // §19.1: the spawn carries the route's preset RESOLVED — the server
     // spawn schema has no `preset` field; provider/model/etc. carry it
-    // (same mechanism as the delegate dispatch, §4 r30).
-    const p = deps.presetShow
-      ? await deps.presetShow(route.preset)
-      : undefined;
-    if (deps.presetShow && !p?.providerId) {
-      deps.store.setHelperTerminal(row.id, "failed");
-      throw new OrchestratorError(
-        "dispatch-failed",
-        `bb tasks preset show ${route.preset}: missing providerId`,
-      );
+    // (same mechanism as the delegate dispatch, §4 r30). §20.2/§21.4:
+    // a packet skip on a tool-less route without --preset walks the
+    // level chain to the next usable route — the preset is re-read and
+    // the prompt rebuilt for it (no packet when `tools !== false`);
+    // an explicit --preset keeps the caller's pick and refuses.
+    let p:
+      | Awaited<ReturnType<NonNullable<HelperDeps["presetShow"]>>>
+      | undefined;
+    let prompt = input.prompt;
+    for (;;) {
+      p = deps.presetShow
+        ? await deps.presetShow(route.preset)
+        : undefined;
+      if (deps.presetShow && !p?.providerId) {
+        deps.store.setHelperTerminal(row.id, "failed");
+        throw new OrchestratorError(
+          "dispatch-failed",
+          `bb tasks preset show ${route.preset}: missing providerId`,
+        );
+      }
+      prompt = p?.instructions
+        ? `${input.prompt}\n\n${p.instructions}`
+        : input.prompt;
+      if (route.route.tools !== false) break;
+      try {
+        // §20.2/§21.3 (r33): a `tools: false` route's helper gets the
+        // material packet — header by the level's role plus the prompt
+        // (the helper's own material: no diff, no --attach, no
+        // `packet-empty`), masked before it leaves for the web service.
+        prompt = (
+          await wrapPromptWithPacket({
+            role:
+              levelRole(load.policy, route.level) === "researcher"
+                ? "researcher"
+                : "auditor",
+            prompt,
+            spec: EMPTY_SPEC,
+            continueFrom: null,
+            maxPromptBytes: route.route.maxPromptBytes,
+            repoPath: null,
+            emptyOk: true,
+            mask: deps.packetMask,
+            projectId: caller.projectId,
+            t: deps.t,
+          })
+        ).prompt;
+        break;
+      } catch (e) {
+        if (!(e instanceof PacketSkip)) throw e;
+        if (input.preset === undefined) {
+          const next = advanceChain(route.routeName);
+          if (next) {
+            route.routeName = next.name;
+            route.preset = next.route.preset;
+            route.route = next.route;
+            deps.store.updateHelperRoute(row.id, {
+              route: next.name,
+              preset: next.route.preset,
+            });
+            continue;
+          }
+        }
+        // No advance (explicit --preset or chain exhausted) — the skip
+        // reason surfaces as a caller-facing refusal, not an untyped
+        // throw.
+        throw new OrchestratorError(e.reason, `helper prompt: ${e.reason}`);
+      }
     }
-    const prompt = p?.instructions
-      ? `${input.prompt}\n\n${p.instructions}`
-      : input.prompt;
     let spawned: { id?: string } | undefined;
     try {
       spawned = await deps.threads.spawn({
@@ -548,7 +704,13 @@ export async function runHelper(
     const threadId = spawned?.id;
     if (threadId) {
       deps.store.setHelperThread(row.id, threadId);
-      deps.store.setThreadRole(threadId, "helper", "delegate");
+      // §21.2: a helper on a researcher-role level gets the researcher
+      // role (internet research, no project tools).
+      const helperRole =
+        levelRole(load.policy, route.level) === "researcher"
+          ? "researcher"
+          : "helper";
+      deps.store.setThreadRole(threadId, helperRole, "delegate");
       deps.store.setHelperTurnStarted(row.id, deps.now?.() ?? Date.now());
       deps.store.setHelperStatusIf(row.id, "dispatching", "running");
     }
@@ -902,8 +1064,26 @@ export function createHelperWatchdog(deps: HelperWatchdogDeps) {  /** In-memory 
   };
 
   /** §19.1 `interrupted`: exactly one continuation; a second
-   * interruption is `failed` (NOT stalled — the review correction). */
+   * interruption is `failed` (NOT stalled — the review correction).
+   * §20.3 (r33): a `tools: false` route never continues — the
+   * interrupted turn IS the route's failure, and a helper has no
+   * reissue path, so the row is `failed` at once, no resume message. */
   const resumeHelper = async (r: HelperRow) => {
+    const load = await deps
+      .loadPolicy()
+      .catch(() => ({ policy: null }) as PolicyLoad);
+    const helperRoute = r.route ? load.policy?.routes[r.route] : undefined;
+    if (helperRoute?.tools === false) {
+      await finish(
+        r,
+        "failed",
+        t()("wd.helperFailed", {
+          id: r.id,
+          detail: t()("wd.toollessRoute"),
+        }),
+      );
+      return;
+    }
     if (r.resume_count >= 1) {
       await finish(
         r,

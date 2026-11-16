@@ -44,6 +44,8 @@ export const EN: Record<string, string> = {
   "instr.reviewRound": "Result under review: commit {from}{tail}",
   "instr.reviewBranch": "branch {branch}",
   "instr.reviewRoundN": "round {round}",
+  "instr.tagResearcher": " (research — internet search)",
+  "instr.attachList": "Attached files (read them in the repo): {list}",
   "instr.noCode":
     "no-code task: do not change repository files, do not commit; the report is the result",
 
@@ -184,6 +186,18 @@ export const EN: Record<string, string> = {
   "del.baseSkip.project-list": "bb project list unreadable",
   "del.baseSkip.no-local-path":
     "the project has no local_path source on the target host",
+  "del.presetNotAllowed":
+    "preset/route \"{preset}\" is a tool-less route and cannot be selected on level \"{level}\" (preset-not-allowed)",
+  "del.routeBusy": "route \"{route}\" is busy — the delegation is queued",
+  "del.routeBusyExhausted":
+    "route \"{route}\" stayed busy past the wait — the next route takes over",
+  "del.routeSkipped": "route \"{route}\" skipped: {reason}",
+  "pkt.headerAudit":
+    "=== REVIEW MATERIAL ===\nYou have no tools and no access to the project's files — the whole material is below, in this very message. Do not ask for files; everything missing for the check goes under \"Not checked\". The last line of your reply must be the JSON verdict.{masked}",
+  "pkt.headerResearch":
+    "=== RESEARCH MATERIAL ===\nYou have no tools and no access to the project's files, but internet search is allowed and expected. The material is below, in this very message; do not ask for files. Whatever you cannot find goes under \"Not found\".{masked}",
+  "pkt.masked": " Masked fragments: {n} ([скрыто: type]).",
+  "wd.toollessRoute": "a tool-less route does not continue",
 
   // ── release.ts ──────────────────────────────────────────────────────
   "rel.gitFailed": "git {cmd} failed (exit {code}): {out}",
@@ -559,7 +573,7 @@ export const EN: Record<string, string> = {
   "cli.delegateUsage":
     "usage: bb orchestrator delegate <KEY> --level <level> " +
     "[--route <r>|--preset <p>] [--instructions <t>] " +
-    "[--from <sha|branch>] [--fresh] [--no-code]",
+    "[--from <sha|branch>] [--attach <p>]… [--fresh] [--no-code]",
 
   // ── policy.ts parse errors ──────────────────────────────────────────
   "pol.empty":
@@ -581,7 +595,9 @@ export const EN: Record<string, string> = {
   "pol.levelObject": "level must be an object",
   "pol.isString": "must be a string",
   "pol.isBool": "must be a boolean",
-  "pol.roleEnum": 'must be "auditor" or "executor"',
+  "pol.roleEnum": 'must be "auditor", "researcher" or "executor"',
+  "pol.toolsForbidden":
+    'tools:false is allowed only on auditor/researcher levels, not "{level}"',
   "pol.chainReq": "required non-empty array of route names",
   "pol.routeNameStr": "route name must be a non-empty string",
   "pol.routeUndeclared": 'route "{route}" is not declared in routes',
@@ -682,6 +698,8 @@ export const EN: Record<string, string> = {
   "tool.delFresh":
     "Start the round without continuing the previous result " +
     "(§6 --fresh)",
+  "tool.delAttach":
+    "Repo file paths — a tool-less route receives their contents (§20.2)",
   "tool.status":
     "List this coordinator's delegations and counters (active vs " +
     "policy limits).",
@@ -873,7 +891,8 @@ export const EN: Record<string, string> = {
   "app.roleExecutor": "Executor",
   "app.roleAuditor": "Auditor",
   "app.roleHelper": "Helper",
-  "role.body.orchestrator": "You are the orchestrator. Your role is to hand work out to executors, not to do it yourself.\n\n- Do not do a composite task yourself: decompose it into bb tasks with specs and delegate to executors via orchestrator_delegate (bb orchestrator delegate <KEY> --level <level>).\n- Pick the level by complexity; when in doubt go higher, never downgrade a complex task.\n- End your turn after delegating: the executor's result arrives on its own — a [bb system] … completed message from BB or an [orchestrator] line (outcome, branch, sha7, copy, report); foreground waiting is not allowed.\n- Check the executor's result yourself before consolidating and reporting.\n- Review of specs before delegating and of the result afterwards is at level {review} (role auditor).\n- Consolidating and releasing the result is your zone only: executors hand their work to you.\n- Handoff: keep a HANDOFF.md file in your thread's storage ({handoff}) — the goal, the user's decisions, what is done (branches, SHAs, tasks), what is in flight and what is next; with links to the executor threads and their tasks. Update it after every significant step and before the context fills up; after a context compaction or a restart, read it first. If the provider has no $BB_THREAD_STORAGE — ~/.cache/bb-handoff/<thread id>.md, not in the working copy.\n- Hand rework out as a new delegate of the same task: the plugin continues from the previous round's commit itself (--from <sha|branch> — a custom point, --fresh — from scratch).\n- Do not open the executor's branch and working copy in other copies: the plugin collects the round result.\n- Do not put your own pollers on top of the watchdog: outcomes (stall, quota, crash, reissue) arrive as [orchestrator] messages.\n- Never dispatch manually (bb tasks dispatch, bb thread spawn) — delegate only; a helper without a task goes through orchestrator_helper (`bb orchestrator helper`) — hidden, in your own copy, its result arrives as a message.",
+  "app.roleResearcher": "Researcher",
+  "role.body.orchestrator": "You are the orchestrator. Your role is to hand work out to executors, not to do it yourself.\n\n- Do not do a composite task yourself: decompose it into bb tasks with specs and delegate to executors via orchestrator_delegate (bb orchestrator delegate <KEY> --level <level>).\n- Pick the level by complexity; when in doubt go higher, never downgrade a complex task.\n- End your turn after delegating: the executor's result arrives on its own — a [bb system] … completed message from BB or an [orchestrator] line (outcome, branch, sha7, copy, report); foreground waiting is not allowed.\n- Check the executor's result yourself before consolidating and reporting.\n- Review of specs before delegating and of the result afterwards is at level {review} (role auditor).\n- Consolidating and releasing the result is your zone only: executors hand their work to you.\n- Handoff: keep a HANDOFF.md file in your thread's storage ({handoff}) — the goal, the user's decisions, what is done (branches, SHAs, tasks), what is in flight and what is next; with links to the executor threads and their tasks. Update it after every significant step and before the context fills up; after a context compaction or a restart, read it first. If the provider has no $BB_THREAD_STORAGE — ~/.cache/bb-handoff/<thread id>.md, not in the working copy.\n- Hand rework out as a new delegate of the same task: the plugin continues from the previous round's commit itself (--from <sha|branch> — a custom point, --fresh — from scratch).\n- Do not open the executor's branch and working copy in other copies: the plugin collects the round result.\n- Do not put your own pollers on top of the watchdog: outcomes (stall, quota, crash, reissue) arrive as [orchestrator] messages.\n- Never dispatch manually (bb tasks dispatch, bb thread spawn) — delegate only; a helper without a task goes through orchestrator_helper (`bb orchestrator helper`) — hidden, in your own copy, its result arrives as a message.\n- Missing facts for a large task (market, libraries, APIs, outside experience) — delegate research first: delegate --level research or orchestrator_helper with level: research; do not research personally — it burns coordinator tokens.",
   "role.body.executor": "You are the executor. Your role is to complete the assigned task yourself.\n\n- You do the task: do not re-delegate the work. Helpers — only through the orchestrator_helper tool (or `bb orchestrator helper`); a bare `bb thread spawn`/`bb tasks dispatch` is forbidden.\n- Work strictly to the task's spec; a divergence from the spec is a question to the coordinator, not improvisation.\n- The git rules are the \"Working with git\" section of the task instructions.\n- Report per the contract in the task description.\n- Do not commit and do not report the work finished until your helpers have returned their results.\n- Handoff: keep a HANDOFF.md file in your thread's storage ({handoff}) — the goal, the user's decisions, what is done (branches, SHAs, tasks), what is in flight and what is next. Update it after every significant step and before the context fills up; after a context compaction or a restart, read it first. If the provider has no $BB_THREAD_STORAGE — ~/.cache/bb-handoff/<thread id>.md, not in the working copy.",
   "role.body.auditor": "You are the auditor. Your role is to only read and check, changing nothing.\n\n- Do not edit files, do not commit, do not dispatch or spawn subagents.\n- Check by the contract: the project documentation is the source of truth, verify the code against it.\n- Finding format: location (file:lines) → problem → fix. With no findings — an explicit \"no findings\" verdict.\n- Separate facts from judgements; mark the doubtful instead of presenting it as fact.\n- The report is a list of findings or \"no findings\"; the repository must stay unchanged.",
   // Examples below stay \u-escaped (\u002f, \u0061): the §4 scan
@@ -884,6 +903,7 @@ export const EN: Record<string, string> = {
   "role.mand.orchestrator": "- Do not modify the machine outside the working copies: no sudo, no package installs, no host settings — if something is missing, tell the user (they are this chat's coordinator).",
   "role.mand.executor": "- Do not modify the machine outside your own working copy: no sudo, no package installs — if something is missing, tell the caller instead of doing it yourself.",
   "role.mand.auditor": "End the report with the JSON line {\"verdict\":\"OK\"|\"CHANGES\",\"blockers\":<number of blocking findings>} — the release pipeline reads it.",
+  "role.body.researcher": "You are the researcher. Your role is to gather and verify information, changing nothing.\n\n- Search the internet; cross-check facts across sources.\n- Cite a source for every material claim.\n- Separate facts from conclusions; flag what is uncertain.\n- Whatever you could not find goes under \"Not found\" — do not invent.\n- Do not modify project code or files, do not commit, push, or create branches or PRs.\n- Do not launch subagents or helpers — work alone.\n- You have no plugin tools and no handoff file — the whole result goes in your final reply.",
   "role.body.helper": "You are the helper. Your role is to do exactly the assigned task and report back.\n\n- Do only the assigned task — nothing beyond it.\n- Do not launch subagents or helpers — a helper never fans out.\n- Do not commit, do not push, do not create branches or PRs — leave all changes in the working tree for the caller.\n- Report a short result in your final response — the caller reads it from the child notification.",
   "role.mand.helper": "- Do not modify the machine outside your own working copy: no sudo, no package installs — if something is missing, tell the coordinator instead of doing it yourself.",
   "role.mand.roleOwner": "- Only the owner changes thread role in the thread UI — do not call the plugin RPC yourself.",
@@ -897,6 +917,8 @@ export const EN: Record<string, string> = {
   "cli.helperCancelUsage": "usage: bb orchestrator helper cancel <id>",
   "cli.helperStarted":
     "helper#{id} launched: {preset} (thread {thread}); the result arrives as a message",
+  "cli.helperRouteBusy":
+    "route \"{route}\" is busy — retry later or pick another level",
   "cli.helperCancelled": "helper#{id} cancelled",
   "cli.noHelper": "no helper {ref}",
   "cli.helpRoleS": "manual role change for a thread",

@@ -23,10 +23,25 @@ export interface PolicyRoute {
   startSeconds?: number;
   /** §16.5: response silence this long → one coordinator message (default 1800). */
   idleSeconds?: number;
+  /** §20.1 (r33): `false` — the provider has no repo tools (a web
+   * session); the plugin ships the whole material packet in the first
+   * prompt. Only on auditor/researcher level routes, never
+   * `release-audit` (§20.1, §21.3). */
+  tools?: boolean;
+  /** §20.2: parallel dispatches cap for this route (a web provider has
+   * one tab); the excess stays `dispatching` in the `queued_at` queue.
+   * Counted per quota group (§21.4). */
+  maxActive?: number;
+  /** §20.2: byte cap for the material packet prompt (default 150 000). */
+  maxPromptBytes?: number;
+  /** §20.2: how long a queued dispatch waits for a busy route before
+   * the next chain route is tried (default 1200). */
+  routeBusyWaitSeconds?: number;
 }
 
-/** §2.3: what a level's delegation does — executes or only checks. */
-export type LevelRole = "auditor" | "executor";
+/** §2.3: what a level's delegation does — executes, only checks, or
+ * researches (§21). */
+export type LevelRole = "auditor" | "executor" | "researcher";
 
 export interface PolicyLevel {
   description?: string;
@@ -216,6 +231,26 @@ export function parsePolicy(
           routeIdle = v;
         }
       }
+      // §20.1/§20.2 (r33): `tools` — a provider without repo tools;
+      // `maxActive` — a busy-route queue; `maxPromptBytes` and
+      // `routeBusyWaitSeconds` — packet cap and queue wait.
+      if (value.tools !== undefined && typeof value.tools !== "boolean") {
+        err(`${path}.tools`, t("pol.isBool"));
+      }
+      const numField = (
+        key: "maxActive" | "maxPromptBytes" | "routeBusyWaitSeconds",
+      ): number | undefined => {
+        const v = value[key];
+        if (v === undefined) return undefined;
+        if (!isPositiveInt(v)) {
+          err(`${path}.${key}`, t("pol.intGe1"));
+          return undefined;
+        }
+        return v;
+      };
+      const routeMaxActive = numField("maxActive");
+      const routeMaxPrompt = numField("maxPromptBytes");
+      const routeBusyWait = numField("routeBusyWaitSeconds");
       if (isNonEmptyString(value.preset) && isNonEmptyString(value.provider)) {
         routes[name] = {
           preset: value.preset,
@@ -230,6 +265,16 @@ export function parsePolicy(
             : {}),
           ...(routeStart !== undefined ? { startSeconds: routeStart } : {}),
           ...(routeIdle !== undefined ? { idleSeconds: routeIdle } : {}),
+          ...(value.tools === false ? { tools: false } : {}),
+          ...(routeMaxActive !== undefined
+            ? { maxActive: routeMaxActive }
+            : {}),
+          ...(routeMaxPrompt !== undefined
+            ? { maxPromptBytes: routeMaxPrompt }
+            : {}),
+          ...(routeBusyWait !== undefined
+            ? { routeBusyWaitSeconds: routeBusyWait }
+            : {}),
         };
       }
     }
@@ -252,11 +297,13 @@ export function parsePolicy(
       if (value.autoFallback !== undefined && typeof value.autoFallback !== "boolean") {
         err(`${path}.autoFallback`, t("pol.isBool"));
       }
-      // §2.3: the level's role — `auditor` (review) or `executor`.
+      // §2.3: the level's role — `auditor` (review), `executor`, or
+      // `researcher` (§21).
       if (
         value.role !== undefined &&
         value.role !== "auditor" &&
-        value.role !== "executor"
+        value.role !== "executor" &&
+        value.role !== "researcher"
       ) {
         err(`${path}.role`, t("pol.roleEnum"));
       }
@@ -281,7 +328,9 @@ export function parsePolicy(
         ...(typeof value.description === "string"
           ? { description: value.description }
           : {}),
-        ...(value.role === "auditor" || value.role === "executor"
+        ...(value.role === "auditor" ||
+        value.role === "executor" ||
+        value.role === "researcher"
           ? { role: value.role }
           : {}),
         chain,
@@ -472,6 +521,27 @@ export function parsePolicy(
           warn(
             `routes.${routeName}.preset`, t("pol.presetNoWorktree", { preset: route.preset, kind: detail.environmentKind ?? "—", level: levelName }));
         }
+      }
+    }
+  }
+
+  // §20.1/§21.3 (r33): a `tools: false` route may stand only in levels
+  // whose role is `auditor` or `researcher` — never in `release-audit`
+  // or an executor level.
+  for (const [levelName, level] of Object.entries(levels)) {
+    const role =
+      level.role ?? (levelName === "review" ? "auditor" : "executor");
+    for (const routeName of level.chain) {
+      const route = routes[routeName];
+      if (!route || route.tools !== false) continue;
+      if (
+        levelName === "release-audit" ||
+        (role !== "auditor" && role !== "researcher")
+      ) {
+        err(
+          `routes.${routeName}.tools`,
+          t("pol.toolsForbidden", { level: levelName }),
+        );
       }
     }
   }

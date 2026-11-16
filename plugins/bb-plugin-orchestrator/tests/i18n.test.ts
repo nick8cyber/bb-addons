@@ -208,6 +208,10 @@ test("§22.1 (ревью): assertInstalledHookFresh чинит leak-scan.ts на
 test("§18.1 (ревью PLUG-247a п.7): a language change via settings.onChange rewrites the installed pre-push", async () => {
   const host = createFakePluginHost({
     pluginId: "orchestrator",
+    // Own dataDir — the SDK default is a fixed /tmp path shared by every
+    // test process: a parallel host's startup syncInstalledPrePush would
+    // rewrite the same installed pre-push mid-assertion.
+    dataDir: mkdtempSync(join(tmpdir(), "orch-i18n-")),
     settings: {
       policy:
         '{"version":1,"levels":{"simple":{"chain":["s"]}},"routes":{"s":{"preset":"s","provider":"p"}}}',
@@ -286,5 +290,16 @@ test("§18.1: language=ru declares only the Russian skill set", async () => {
   assert.deepEqual(
     [...resolved.skills].sort(),
     ["orchestrator-coordinator-ru", "orchestrator-setup-ru"],
+  );
+});
+
+test("§19 (аудит выкладки PLUG-269): role.body.executor keeps the helpers-done rule", () => {
+  assert.match(
+    EN["role.body.executor"],
+    /Do not commit and do not report the work finished until your helpers have returned their results\./,
+  );
+  assert.match(
+    RU["role.body.executor"],
+    /Не коммить и не отчитывайся о готовности, пока твои помощники не вернули итог\./,
   );
 });

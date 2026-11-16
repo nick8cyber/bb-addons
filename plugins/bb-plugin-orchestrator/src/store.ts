@@ -319,9 +319,17 @@ export const MIGRATIONS: readonly string[] = [
   // §19.6 (r33): the once-archived mark — the 24 h cleanup pass selects
   // terminal helpers without it instead of re-archiving every minute.
   `ALTER TABLE helpers ADD COLUMN archived_at INTEGER`,
+  // §20.2 (r33): a busy `maxActive` route parks the delegation
+  // `dispatching` with `queued_at` set — the watchdog retries in
+  // `queued_at` order until `routeBusyWaitSeconds` runs out. `attach`
+  // holds the dispatch's packet spec as JSON
+  // (`{"paths":[…],"from":…}`) so a reissue rebuilds the same packet.
+  `ALTER TABLE delegations ADD COLUMN queued_at INTEGER`,
+  `ALTER TABLE delegations ADD COLUMN attach TEXT`,
   // §25 (r33.4): the owner's in-window role pick writes
   // `thread_roles.source = 'owner'` — SQLite cannot widen a CHECK, so
-  // the table is recreated; old rows move over untouched.
+  // the table is recreated; old rows move over untouched. Stays LAST —
+  // the §25 test slices the tail entry off to build an «old» database.
   `CREATE TABLE thread_roles_owner (
     thread_id TEXT PRIMARY KEY,
     role TEXT NOT NULL,
@@ -455,6 +463,13 @@ export interface DelegationRow {
    * делегирование — оживший тред повторяет delegation.done, но не
    * review.verdict). */
   verdict_event_at: number | null;
+  /** §20.2 (r33): parked behind a busy `maxActive` route — the watchdog
+   * retries in `queued_at` order; null when not queued. */
+  queued_at: number | null;
+  /** §20.2 (r33): the dispatch's packet spec JSON
+   * (`{"paths":string[],"from":string|null}`) — `--attach` files and the
+   * explicit `--from` ref, inherited by reissues. */
+  attach: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -619,6 +634,8 @@ export class DelegationStore {
     explicitRoute?: boolean;
     /** §4.1 r28: «задача без кода» (`delegate --no-code`). */
     noCode?: boolean;
+    /** §20.2 (r33): the packet spec JSON — `{"paths","from"}`. */
+    attach?: string | null;
   }): DelegationRow {
     const now = Date.now();
     const info = this.db
@@ -626,8 +643,8 @@ export class DelegationStore {
         `INSERT INTO delegations (
           task_key, task_id, project_id, coordinator_thread_id, level, route,
           preset, provider, status, round, continue_from, explicit_route,
-          no_code, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?)`,
+          no_code, attach, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         normalizeTaskKey(input.taskKey),
@@ -642,6 +659,7 @@ export class DelegationStore {
         input.continueFrom ?? null,
         input.explicitRoute ? 1 : 0,
         input.noCode ? 1 : 0,
+        input.attach ?? null,
         now,
         now,
       );
@@ -741,7 +759,8 @@ export class DelegationStore {
   setThreadInfo(id: number, threadId: string, taskId?: string): void {
     this.db
       .prepare(
-        `UPDATE delegations SET thread_id = ?, task_id = COALESCE(?, task_id), updated_at = ?
+        `UPDATE delegations SET thread_id = ?, task_id = COALESCE(?, task_id),
+           queued_at = NULL, updated_at = ?
          WHERE id = ?`,
       )
       .run(threadId, taskId ?? null, Date.now(), id);
@@ -793,6 +812,41 @@ export class DelegationStore {
       this.onDelegationFinished?.(id, to);
     }
     return moved;
+  }
+
+  /**
+   * §20.2 (r33): park/unpark a `dispatching` row behind a busy
+   * `maxActive` route — `queued_at` keeps the first-come order across
+   * retries (a re-check does not re-stamp).
+   */
+  setQueuedAt(id: number, at: number | null): void {
+    this.db
+      .prepare(
+        `UPDATE delegations SET queued_at = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(at, Date.now(), id);
+  }
+
+  /**
+   * §20.2 (r33): a skipped or timed-out tool-less route hands the SAME
+   * dispatching row to the next chain route — only while the row is
+   * still `dispatching` with no thread (the route is not yet burned).
+   * `explicit_route` drops with the caller's pick: the new route is
+   * plugin-chosen, so a later advance/reissue walks the chain from
+   * its position instead of restarting into the burned route.
+   */
+  updateRoute(
+    id: number,
+    next: { route: string; preset: string; provider: string },
+  ): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE delegations SET route = ?, preset = ?, provider = ?,
+           queued_at = NULL, explicit_route = 0, updated_at = ?
+         WHERE id = ? AND status = 'dispatching' AND thread_id IS NULL`,
+      )
+      .run(next.route, next.preset, next.provider, Date.now(), id);
+    return info.changes > 0;
   }
 
   addSetupError(id: number, step: string, message: string): void {
@@ -1313,8 +1367,8 @@ export class DelegationStore {
           `INSERT INTO delegations (
             task_key, task_id, project_id, coordinator_thread_id, level,
             route, preset, provider, status, reissue_of, round, continue_from,
-            explicit_route, no_code, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?, ?)`,
+            explicit_route, no_code, attach, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.task_key,
@@ -1335,6 +1389,9 @@ export class DelegationStore {
           // §4.1 r28: a reissue is the same dispatch — the «без кода»
           // mark inherits with the round fields.
           row.no_code,
+          // §20.2: the packet spec survives the reissue — the tool-less
+          // route's material is rebuilt from the same spec.
+          row.attach,
           now,
           now,
         );
@@ -1757,6 +1814,25 @@ export class DelegationStore {
         `UPDATE helpers SET thread_id = ?, updated_at = ? WHERE id = ?`,
       )
       .run(threadId, Date.now(), id);
+  }
+
+  /**
+   * §21.4 (r33 ревью 2): a packet skip inside a tool-less helper moves
+   * the SAME dispatching row to the next chain route — helpers never
+   * queue; the row's preset/route must match where it actually spawns
+   * (the shared `quotaGroup` busy count reads them).
+   */
+  updateHelperRoute(
+    id: number,
+    next: { route: string; preset: string },
+  ): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE helpers SET route = ?, preset = ?, updated_at = ?
+         WHERE id = ? AND status = 'dispatching' AND thread_id IS NULL`,
+      )
+      .run(next.route, next.preset, Date.now(), id);
+    return info.changes > 0;
   }
 
   setHelperStatus(id: number, status: HelperStatus): void {

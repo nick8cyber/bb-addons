@@ -28,6 +28,9 @@ const ROLE_OPTIONS = [
   { id: "orchestrator", labelKey: "app.roleOrchestrator" },
   { id: "executor", labelKey: "app.roleExecutor" },
   { id: "auditor", labelKey: "app.roleAuditor" },
+  // §21.1 (r33): «Ресерчер» / "Researcher" — internet research, no
+  // project tools.
+  { id: "researcher", labelKey: "app.roleResearcher" },
 ] as const;
 type RoleId = (typeof ROLE_OPTIONS)[number]["id"];
 const DEFAULT_ROLE: RoleId = "executor";

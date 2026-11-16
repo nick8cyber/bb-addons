@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   createFakePluginHost,
@@ -87,6 +90,12 @@ async function hostWith(
 ) {
   const host = createFakePluginHost({
     pluginId: "orchestrator",
+    // The SDK default "/tmp/bb-fake-data-dir" is shared by every test
+    // process on the machine — release's assertInstalledHookFresh reads
+    // `<dataDir>/plugins/orchestrator/git-hooks`, so another run's
+    // leftover (or a parallel process's mid-write) hooks make the release
+    // test fail before `tasks show` is ever called.
+    dataDir: mkdtempSync(join(tmpdir(), "orch-cli-")),
     settings: { policy: POLICY_TEXT, language: "ru", ...settings },
     agentSkillIds: [
         "orchestrator-setup",

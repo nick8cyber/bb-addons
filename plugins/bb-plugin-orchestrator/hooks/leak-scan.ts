@@ -162,7 +162,7 @@ const SECRET_FILE_RE =
 
 // ── Category 2: author identity ────────────────────────────────────────
 
-const PERSONAL_EMAIL_RE =
+export const PERSONAL_EMAIL_RE =
   // §22.1: the local part is bounded (RFC 5321: ≤64 chars) — an
   // unbounded `[\w.+-]+` is quadratic on a >1 MiB one-line `.map`
   // blob without a single '@' (greedy consume + per-char backtrack).
