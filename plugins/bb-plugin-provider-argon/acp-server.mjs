@@ -634,9 +634,18 @@ export function normalizeThinking(val) {
 export const MODELS = [
   { value: "argon", name: "Gemini 4 Argon" },
   { value: "carbon", name: "Gemini 4 Carbon" },
-  { value: "fast", name: "Gemini 2.5 Flash" },
-  { value: "pro", name: "Gemini 2.5 Pro" },
+  { value: "hydrogen", name: "Gemini 4 Hydrogen" },
+  { value: "pro", name: "Gemini 3.1 Pro" },
+  { value: "flash-lite", name: "Gemini 3.5 Flash-Lite" },
 ];
+
+export function resolveModelId(val) {
+  if (!val || typeof val !== "string") return null;
+  const v = val.toLowerCase().trim();
+  if (v === "fast" || v === "flash" || v === "lite") return "flash-lite";
+  if (MODELS.some((m) => m.value === v)) return v;
+  return null;
+}
 
 function configOptionsFor(s, backends = BACKENDS) {
   const normalizedLevel = normalizeThinking(s.thinking);
@@ -1212,11 +1221,12 @@ export function dispatch(msg) {
           return;
         }
       } else if (cid === "model") {
-        if (!MODELS.some((m) => m.value === val)) {
+        const targetModel = resolveModelId(val);
+        if (!targetModel) {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown model "${val}"` } });
           return;
         }
-        s.model = val;
+        s.model = targetModel;
         if (!s.thinking) s.thinking = "medium";
       } else if (cid === "account") {
         if (val !== "auto" && !BACKENDS.some((b) => b.id === val)) {
@@ -1242,27 +1252,18 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown session "${p.sessionId}"` } });
         return;
       }
-      const val = p.modelId ?? p.value;
-      if (typeof val !== "string" || !MODELS.some((m) => m.value === val)) {
+      const rawVal = p.modelId ?? p.value;
+      const val = resolveModelId(rawVal);
+      if (!val) {
         out({
           jsonrpc: "2.0",
           id: msg.id,
-          error: { code: -32602, message: `unknown model "${typeof val === "string" ? val : JSON.stringify(val)}"` },
+          error: { code: -32602, message: `unknown model "${typeof rawVal === "string" ? rawVal : JSON.stringify(rawVal)}"` },
         });
         return;
       }
       s.model = val;
-      if (val === "argon") {
-        if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
-      } else if (val === "carbon") {
-        if (!s.thinking) s.thinking = "medium";
-      } else if (val === "fast") {
-        s.thinking = "low";
-      } else if (val === "thinking") {
-        s.thinking = "medium";
-      } else if (val === "pro") {
-        s.thinking = "high";
-      }
+      if (!s.thinking) s.thinking = "medium";
       out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS) } });
       return;
     }

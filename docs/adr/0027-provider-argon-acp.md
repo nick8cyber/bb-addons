@@ -8,10 +8,10 @@ date: 2026-11-16
 
 ## Контекст
 
-Для задач ревью и исследования без инструментов ([orchestrator.md §§20–21](../specs/orchestrator.md)) требуется прямой доступ к моделям Gemini (`Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 2.5 Flash`, `Gemini 2.5 Pro`) через веб-интерфейс `gemini.google.com` без расхода платных API-ключей и квот `agy`. При этом провайдер должен:
+Для задач ревью и исследования без инструментов ([orchestrator.md §§20–21](../specs/orchestrator.md)) требуется прямой доступ к моделям Gemini (`Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 4 Hydrogen`, `Gemini 3.1 Pro`, `Gemini 3.5 Flash-Lite`) через веб-интерфейс `gemini.google.com` без расхода платных API-ключей и квот `agy`. При этом провайдер должен:
 
 1. Быть **полностью универсальным, гибким и обезличенным**: не иметь никакой привязки к конкретным машинам, именам пользователей или личным аккаунтам; конфигурация задаётся исключительно внешним файлом `pool.json` или переменными окружения.
-2. Работать как стандартный провайдер BB через `experimental_acpProviderBridge` (JSON-RPC 2.0 ACP поверх stdio) с поддержкой выбора модели (`Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 2.5 Flash`, `Gemini 2.5 Pro`), единым селектором уровня рассуждений `thought_level` (`low`, `medium`, `high` — Low, Medium, High), потоковой выдачи (`agent_message_chunk`), многоходовых диалогов (`convId`) и отмены хода (`session/cancel`).
+2. Работать как стандартный провайдер BB через `experimental_acpProviderBridge` (JSON-RPC 2.0 ACP поверх stdio) с поддержкой выбора модели (`Gemini 4 Argon`, `Gemini 4 Carbon`, `Gemini 4 Hydrogen`, `Gemini 3.1 Pro`, `Gemini 3.5 Flash-Lite`), единым селектором уровня рассуждений `thought_level` (`low`, `medium`, `high` — Low, Medium, High), потоковой выдачи (`agent_message_chunk`), многоходовых диалогов (`convId`) и отмены хода (`session/cancel`).
 3. Поддерживать пул независимых Google-аккаунтов разных тарифов (`pro` и `ultra`) в отдельных headless-профилях Chrome на разных портах CDP с эксклюзивной арендой на время хода, автоматической классификацией лимитов (`Limit resets ...`) и прозрачной ротацией аккаунтов.
 4. Рационально распределять квоты: запросы к дорогой модели Carbon направлять строго на Ultra-аккаунты, а обычные запросы к Argon распределять в первую очередь на Pro-аккаунты («при прочих равных» приоритетах), сберегая квоту Ultra для Carbon.
 5. Выдерживать длинные размышления (`SEND_DEADLINE_MS = 1_200_000`, `MAX_WAIT_MS = 900_000` до 15–20 минут) и большие пакеты данных, не потребляя CPU в простое между ходами.

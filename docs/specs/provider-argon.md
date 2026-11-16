@@ -42,12 +42,13 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   - `session/new` создаёт новую запись сессии `{ id, cwd, model, thinking, convId, account, backend }`.
   - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
   - Возвращают список моделей `models.availableModels` в виде объектов `{ modelId, name }` по схеме ACP:
-    - `'argon'` — «Gemini 4 Argon» (модель по умолчанию)
-    - `'carbon'` — «Gemini 4 Carbon» (топовая модель, доступная на тарифе Ultra)
-    - `'fast'` — «Gemini 2.5 Flash»
-    - `'pro'` — «Gemini 2.5 Pro»
+    - `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию)
+    - `'carbon'` — «Gemini 4 Carbon» (Самые сложные задачи, тариф Ultra)
+    - `'hydrogen'` — «Gemini 4 Hydrogen» (Повседневные дела)
+    - `'pro'` — «Gemini 3.1 Pro» (Исследования)
+    - `'flash-lite'` — «Gemini 3.5 Flash-Lite» (Быстрые ответы)
   - Возвращают конфигурационные опции `configOptions`:
-    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `fast`, `pro`);
+    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `hydrogen`, `pro`, `flash-lite`);
     - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB (`Low`, `Medium`, `High`);
     - `account` (категория `"account"`, возвращается при наличии более одного аккаунта в пуле): выбор аккаунта (`"auto"` или конкретный `id` аккаунта).
   Все опции принимаются и обрабатываются в `session/set_config_option`.

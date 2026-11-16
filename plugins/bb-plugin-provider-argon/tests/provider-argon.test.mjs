@@ -622,7 +622,10 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   }
   const modelIds = r2.result.models.availableModels.map((m) => m.modelId);
   assert.ok(modelIds.includes("argon"));
+  assert.ok(modelIds.includes("carbon"));
+  assert.ok(modelIds.includes("hydrogen"));
   assert.ok(modelIds.includes("pro"));
+  assert.ok(modelIds.includes("flash-lite"));
   assert.equal(
     r2.result.models.availableModels.find((m) => m.modelId === "argon")?.name,
     "Gemini 4 Argon"
@@ -631,11 +634,19 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
     r2.result.models.availableModels.find((m) => m.modelId === "carbon")?.name,
     "Gemini 4 Carbon"
   );
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "hydrogen")?.name,
+    "Gemini 4 Hydrogen"
+  );
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "flash-lite")?.name,
+    "Gemini 3.5 Flash-Lite"
+  );
   const proModel = r2.result.models.availableModels.find((m) => m.modelId === "pro");
-  assert.equal(proModel?.name, "Gemini 2.5 Pro");
+  assert.equal(proModel?.name, "Gemini 3.1 Pro");
   assert.equal(
     MODELS.find((m) => m.value === "pro")?.name,
-    "Gemini 2.5 Pro"
+    "Gemini 3.1 Pro"
   );
 
   // 2b. session/load also returns availableModels as { modelId, name } objects

@@ -29,11 +29,12 @@ tags: [bb, plugins, provider-argon, acp, gemini, tools]
 
 ## 1. Модели и уровни рассуждений
 
-Список моделей провайдера в ACP (`models.availableModels`) содержит корректные официальные названия без субъективных оценок:
-- `'argon'` — «Gemini 4 Argon» (модель по умолчанию)
-- `'carbon'` — «Gemini 4 Carbon» (топовая модель для тарифа Ultra)
-- `'fast'` — «Gemini 2.5 Flash» (быстрая легковесная модель)
-- `'pro'` — «Gemini 2.5 Pro» (модель повышенной точности)
+Список моделей провайдера в ACP (`models.availableModels`) строго соответствует официальному меню Gemini:
+- `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию)
+- `'carbon'` — «Gemini 4 Carbon» (Самые сложные задачи, тариф Ultra)
+- `'hydrogen'` — «Gemini 4 Hydrogen» (Повседневные дела)
+- `'pro'` — «Gemini 3.1 Pro» (Исследования)
+- `'flash-lite'` — «Gemini 3.5 Flash-Lite» (Быстрые ответы)
 
 ### Уровни рассуждений (Reasoning Levels):
 - В интерфейсе BB провайдер регистрирует единый селектор `thought_level` категории `"thought_level"` со значениями `Low`, `Medium`, `High` (`low`, `medium`, `high`).

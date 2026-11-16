@@ -15,10 +15,11 @@ ACP-провайдер «Gemini (Argon)» (`acp-argon`) для bb поверх �
 
 ## Модели и возможности
 
-- **`Gemini 4 Argon`** (`argon`) — основная модель по умолчанию.
-- **`Gemini 4 Carbon`** (`carbon`) — флагманская модель для аккаунтов с тарифом Ultra.
-- **`Gemini 2.5 Flash`** (`fast` / `flash`) — быстрая модель.
-- **`Gemini 2.5 Pro`** (`pro`) — модель повышенной точности.
+- **`Gemini 4 Argon`** (`argon`) — Код и анализ (модель по умолчанию).
+- **`Gemini 4 Carbon`** (`carbon`) — Самые сложные задачи (тариф Ultra).
+- **`Gemini 4 Hydrogen`** (`hydrogen`) — Повседневные дела.
+- **`Gemini 3.1 Pro`** (`pro`) — Исследования.
+- **`Gemini 3.5 Flash-Lite`** (`flash-lite`, псевдоним `fast`) — Быстрые ответы.
 - Уровни рассуждений (`thought_level`): **Low**, **Medium**, **High** (`low`, `medium`, `high`).
 - Потоковая передача чанков (`supportsStreaming: true`), отмена генерации (`supportsCancel: true`).
 
