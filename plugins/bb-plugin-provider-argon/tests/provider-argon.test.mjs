@@ -13,6 +13,7 @@ import {
   classifyFailure,
   loadBackends,
   withStateLock,
+  pickBackendFromState,
   MODELS,
 } from "../acp-server.mjs";
 
@@ -200,6 +201,16 @@ test("3. classifyFailure correctly classifies errors", () => {
   assert.equal(cThinkingNF.category, "model-unavailable");
   assert.equal(cThinkingNF.rotatable, true);
   assert.equal(cThinkingNF.cooldownMs, 6 * 3600_000);
+
+  // Model locked (paid upgrade required): rotatable, zero cooldown, records lockedModel
+  const errCarbonLocked = new ModelUnavailable("model", "carbon locked: paid upgrade required");
+  errCarbonLocked.isLocked = true;
+  errCarbonLocked.lockedModel = "carbon";
+  const cCarbonLocked = classifyFailure(errCarbonLocked);
+  assert.equal(cCarbonLocked.category, "model-locked");
+  assert.equal(cCarbonLocked.rotatable, true);
+  assert.equal(cCarbonLocked.cooldownMs, 0);
+  assert.equal(cCarbonLocked.lockedModel, "carbon");
 });
 
 test("4. gemini-driver strict selectModelAndThinking and no fallback", async () => {
@@ -259,6 +270,60 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
       return true;
     }
   );
+
+  // Test locked Carbon model (lock icon) rejection without clicking
+  let clickedLocked = false;
+  const mockPageLocked = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Самые сложные задачи\n4 Carbon",
+        evaluate: async (fn) => {
+          const fakeEl = {
+            querySelectorAll: () => [
+              {
+                innerText: "lock",
+                getAttribute: () => "lock",
+                className: "mat-icon",
+              },
+            ],
+            hasAttribute: () => false,
+            getAttribute: () => null,
+            classList: { contains: () => false },
+          };
+          try {
+            return fn(fakeEl);
+          } catch {
+            return false;
+          }
+        },
+        click: async () => {
+          clickedLocked = true;
+        },
+      },
+    ],
+    waitForSelector: async () => ({
+      innerText: async () => "Hydrogen",
+      getAttribute: () => "Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await assert.rejects(
+    async () => {
+      await selectModelAndThinking(mockPageLocked, "carbon", null, true);
+    },
+    (err) => {
+      assert.ok(err instanceof ModelUnavailable);
+      assert.equal(err.isLocked, true);
+      assert.equal(err.lockedModel, "carbon");
+      assert.match(err.message, /carbon locked: paid upgrade required/i);
+      return true;
+    }
+  );
+  assert.equal(clickedLocked, false, "Locked model item must not be clicked");
 
   // Verification that target is validated after last user-query with promptPrefix
   assert.ok(
@@ -953,4 +1018,66 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
   assert.equal(endTurnMsg, undefined, "Response with stopReason 'end_turn' must not be sent on stdin close");
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("8. Smart model routing: pickBackendFromState skips locked models and routes to available account", () => {
+  const fakeState = {
+    accounts: {
+      nomerok2u: {
+        cooldownUntilMs: 0,
+        lastUsedMs: 100,
+        lastError: null,
+        lockedModels: ["carbon"],
+      },
+      shat: {
+        cooldownUntilMs: 0,
+        lastUsedMs: 200,
+        lastError: null,
+        lockedModels: ["carbon"],
+      },
+      karina: {
+        cooldownUntilMs: 0,
+        lastUsedMs: 50,
+        lastError: null,
+      },
+    },
+    leases: {},
+  };
+
+  // For argon: karina is least recently used (50 < 100 < 200)
+  const argonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.ok(argonPick.backend, "Should pick a backend for argon");
+  assert.equal(argonPick.backend.id, "karina");
+
+  // When karina is leased, argon routes to nomerok2u (not locked for argon)
+  // Use a pseudo-PID that is alive or mock
+  fakeState.accounts.karina.inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts.karina.owner = "other-process";
+  const argonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon");
+  assert.ok(argonPick2.backend, "Should pick a backend for argon when karina is busy");
+  assert.equal(argonPick2.backend.id, "nomerok2u");
+
+  // When requesting carbon: nomerok2u and shat are skipped because carbon is in lockedModels
+  // Karina is inUse, so it should return busyUntil
+  const carbonBusy = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
+  assert.ok(carbonBusy.busyUntil, "Should return busyUntil for carbon when only karina supports it and is busy");
+
+  // Release karina: carbon immediately routes to karina
+  fakeState.accounts.karina.inUseUntilMs = 0;
+  fakeState.accounts.karina.owner = null;
+  const carbonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon");
+  assert.ok(carbonPick.backend, "Should pick karina for carbon");
+  assert.equal(carbonPick.backend.id, "karina");
+
+  // If all accounts have carbon locked, pickBackendFromState returns none
+  const allLockedState = {
+    accounts: {
+      nomerok2u: { cooldownUntilMs: 0, lockedModels: ["carbon"] },
+      shat: { cooldownUntilMs: 0, lockedModels: ["carbon"] },
+      karina: { cooldownUntilMs: 0, lockedModels: ["carbon"] },
+    },
+    leases: {},
+  };
+  const nonePick = pickBackendFromState(allLockedState, null, "test-owner", Date.now(), "carbon");
+  assert.equal(nonePick.none, true, "Must return none when all candidates have carbon locked");
 });

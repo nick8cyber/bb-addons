@@ -302,7 +302,7 @@ const accEnsure = (state, id) => {
   return state.accounts[id];
 };
 
-function pickBackendFromState(state, excludeId, owner, now) {
+export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null) {
   const isLeased = (b) => {
     const l = state.leases && state.leases[b.id];
     if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
@@ -312,7 +312,17 @@ function pickBackendFromState(state, excludeId, owner, now) {
     return e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
   };
 
-  const candidates = BACKENDS.filter((b) => b.id !== excludeId && b.priority > 0);
+  const req = requestedModel ? requestedModel.toLowerCase() : null;
+  const candidates = BACKENDS.filter((b) => {
+    if (b.id === excludeId || b.priority <= 0) return false;
+    if (req) {
+      const e = accEntry(state, b.id);
+      if (e?.lockedModels && e.lockedModels.includes(req)) {
+        return false;
+      }
+    }
+    return true;
+  });
   if (candidates.length === 0) return { none: true };
 
   const free = candidates.filter(
@@ -467,7 +477,26 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 4. model-unavailable
+  // 4. model-locked (specific model requires subscription / has lock icon)
+  if (
+    (err && (err.isLocked || err.code === "ARGON_MODEL_LOCKED")) ||
+    /locked:\s*paid upgrade required|paid upgrade required/i.test(message)
+  ) {
+    const lockedModel = (
+      err?.lockedModel ||
+      (message.match(/^(\w+)\s+locked/i)?.[1] || "carbon")
+    ).toLowerCase();
+    return {
+      category: "model-locked",
+      cooldownMs: 0,
+      untilMs: 0,
+      rotatable: true,
+      parkedReason: null,
+      lockedModel,
+    };
+  }
+
+  // 5. model-unavailable
   if (
     (err && err.code === "ARGON_MODEL_UNAVAILABLE") ||
     /modelunavailable|model is unavailable|not available for this account|недоступна/i.test(message)
@@ -481,7 +510,7 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 5. default transient
+  // 6. default transient
   return {
     category: "transient",
     cooldownMs: 0,
@@ -491,7 +520,7 @@ export function classifyFailure(err, authHint = null) {
   };
 }
 
-async function settleBackend(backendId, sessionId, untilMs, message, parkedReason) {
+async function settleBackend(backendId, sessionId, untilMs, message, parkedReason, lockedModel = null) {
   const owner = `${process.pid}:${sessionId}`;
   return withStateLock((state) => {
     if (state.leases && state.leases[backendId] && state.leases[backendId].pid === process.pid) {
@@ -503,6 +532,12 @@ async function settleBackend(backendId, sessionId, untilMs, message, parkedReaso
       e.owner = null;
     }
     e.lastError = String(message).slice(0, 500);
+    if (lockedModel) {
+      if (!Array.isArray(e.lockedModels)) e.lockedModels = [];
+      if (!e.lockedModels.includes(lockedModel)) {
+        e.lockedModels.push(lockedModel);
+      }
+    }
     if (parkedReason) {
       const enabled = BACKENDS.filter((b) => b.priority > 0).length;
       const parked = Object.entries(state.accounts).filter(
@@ -545,6 +580,7 @@ export function normalizeThinking(val) {
 
 export const MODELS = [
   { value: "argon", name: "Gemini (Argon)" },
+  { value: "carbon", name: "Gemini (Carbon)" },
   { value: "fast", name: "Gemini 3 Flash (Fast)" },
   { value: "thinking", name: "Gemini 3 Flash (Thinking)" },
   { value: "pro", name: "Gemini 3.1 Pro (старая 3.1, не рекомендуется)" },
@@ -644,6 +680,8 @@ async function probeAuthHint(backend) {
 /* ---------- backend binding ---------- */
 async function bindBackend(s, sessionId) {
   const owner = `${process.pid}:${sessionId}`;
+  const reqModel = s.model ? s.model.toLowerCase() : null;
+
   if (s.account && s.account !== "auto") {
     const b = BACKENDS.find((x) => x.id === s.account);
     if (!b) {
@@ -652,6 +690,9 @@ async function bindBackend(s, sessionId) {
     const st = withStateLock((state) => {
       const now = Date.now();
       const e = accEntry(state, b.id);
+      if (reqModel && e?.lockedModels?.includes(reqModel)) {
+        return { error: `account "${b.id}" does not support model "${reqModel}" (locked: paid upgrade required)` };
+      }
       const cool = e?.cooldownUntilMs ?? 0;
       if (cool > now) {
         return { error: `account "${b.id}" is in cooldown until ${new Date(cool).toISOString()}` };
@@ -674,35 +715,43 @@ async function bindBackend(s, sessionId) {
     const now = Date.now();
     if (s.backend) {
       const e = accEntry(state, s.backend.id);
+      const isLocked = reqModel && e?.lockedModels?.includes(reqModel);
       const cool = e?.cooldownUntilMs ?? 0;
       const l = state.leases && state.leases[s.backend.id];
       const busy = l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid);
 
-      if (cool <= now && !busy) {
+      if (cool <= now && !busy && !isLocked) {
         acquireInState(state, s.backend, owner, now);
         return { backend: s.backend };
       }
       const prev = s.backend.id;
       if (s.convId) {
         if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+        if (isLocked) return { error: `account "${prev}" does not support model "${reqModel}"; this conversation is pinned to it` };
         return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()}; this conversation is pinned to it` };
       }
-      const r = pickBackendFromState(state, prev, owner, now);
+      const r = pickBackendFromState(state, prev, owner, now, reqModel);
       if (r.backend) {
         acquireInState(state, r.backend, owner, now);
         return { backend: r.backend };
       }
       if (r.busyUntil) return { busyUntil: r.busyUntil };
       if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+      if (r.none) {
+        return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "all accounts are in cooldown or busy and no sibling is free" };
+      }
       return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()} and no sibling is free` };
     }
 
-    const r = pickBackendFromState(state, null, owner, now);
+    const r = pickBackendFromState(state, null, owner, now, reqModel);
     if (r.backend) {
       acquireInState(state, r.backend, owner, now);
       return { backend: r.backend };
     }
     if (r.busyUntil) return { busyUntil: r.busyUntil };
+    if (r.none) {
+      return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "account pool is empty (no enabled backends)" };
+    }
     if (r.cooledUntil) {
       const brk = state.breaker ? ` (breaker: ${state.breaker.reason} on ${state.breaker.account})` : "";
       return { error: `all accounts are in cooldown; nearest reopen ${new Date(r.cooledUntil).toISOString()}${brk}` };
@@ -930,7 +979,7 @@ async function runPrompt(id, sessionId, text) {
           }
           const hint = await probeAuthHint(backend);
           const cls = classifyFailure(err, hint);
-          const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, hint || err.message, cls.parkedReason);
+          const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, hint || err.message, cls.parkedReason, cls.lockedModel);
           activeBackendId = null;
           activeAbort = null;
           activeAttempt = null;
@@ -1142,6 +1191,8 @@ export function dispatch(msg) {
         s.model = val;
         if (val === "argon") {
           if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
+        } else if (val === "carbon") {
+          s.thinking = "high";
         } else if (val === "fast") {
           s.thinking = "low";
         } else if (val === "thinking") {
@@ -1185,6 +1236,8 @@ export function dispatch(msg) {
       s.model = val;
       if (val === "argon") {
         if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
+      } else if (val === "carbon") {
+        s.thinking = "high";
       } else if (val === "fast") {
         s.thinking = "low";
       } else if (val === "thinking") {
