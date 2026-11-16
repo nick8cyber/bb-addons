@@ -107,8 +107,10 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     4. `ARGON_BACKENDS` (JSON-массив бэкендов из переменной окружения);
     5. Одиночный профиль по умолчанию: id: "default", profile: "default", profileDir из GEMINI_PROFILE_DIR / GEMINI_PROFILE или ~/.gemini-cli-profile; порт CDP из GEMINI_CDP_PORT или 9222.
   - Утилита `scripts/pool-add.mjs` актуализируется: при добавлении аккаунта она обновляет и `pool.json`, и подкаталог аккаунта.
-  - Поле профиля, передаваемое в драйвер: `backend.profileDir || backend.profile || backend.id`. Тильда `~/` раскрывается через `os.homedir()`. Аккаунты с `priority === 0` исключаются из автоматического выбора.
-- Состояние хранится в `ARGON_STATE_DIR/accounts-state.json` (по умолчанию `~/.bb/plugins/provider-argon/accounts-state.json`).
+  - Поле профиля, передаваемое в драйвер: `backend.profileDir || backend.profile || backend.id`. Тильда `~/` раскрывается через `os.homedir()` — **в домашний каталог читающего процесса**. Аккаунты с `priority === 0` исключаются из автоматического выбора.
+  - **Разделяемый пул (несколько uid):** когда один `pool.json`/`ARGON_STATE_DIR` читают процессы разных OS-пользователей, `profileDir` обязан быть **абсолютным** — `~` у второго юзера резолвится в его HOME, `resolveProfile` не совпадёт с реальным `--user-data-dir` запущенного Chrome (`profileMatches=false`). `scripts/pool-add.mjs` пишет `profileDir` абсолютным на момент добавления (дом добавившего = владелец профиля).
+  - **`GEMINI_NO_AUTOSPAWN=1`** (env): при проверке профиля несовпадении (`profileMatches=false`) или холодном/чужом CDP драйвер **бросает ошибку до** `stopChrome`/авто-спауна Chrome, вместо перезапуска. Обязательно для второго юзера на разделяемом пуле — её процесс не имеет права трогать Chrome первого (чужие профили не рестартуются). Без флага драйвер пытается остановить и перезапустить браузер — допустимо только у владельца пула.
+- Состояние хранится в `ARGON_STATE_DIR/accounts-state.json` (по умолчанию `~/.bb/plugins/provider-argon/accounts-state.json`). При разделении между uid'ами каталог общий: второму юзеру нужен default-ACL `rwx` на `ARGON_STATE_DIR` и `accounts/` (аренды/состояние пишутся tmp+rename, inode меняется — прав нужно на каталог, не только на файлы).
 - Любая модификация `accounts-state.json` выполняется через `withStateLock(fn)`:
   - захват эксклюзивного файла-замка `accounts-state.json.lock` (`O_CREAT | O_EXCL`);
   - если замок старше `LOCK_STALE_MS = 5000` мс — принудительное снятие устаревшего замка;
