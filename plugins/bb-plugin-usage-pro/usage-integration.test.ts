@@ -1315,6 +1315,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     // The disabled 5h bucket is emitted verbatim, matching the pool card.
     expect(card.usage.windows).toHaveLength(3);
     const byLabel = Object.fromEntries(card.usage.windows.map((w: any) => [w.label, w]));
+    // Regression: the Claude model quota re-states the weekly reset; a
+    // distance-based label must not alias it into a phantom "Daily" window.
+    expect(byLabel["Claude Daily"]).toBeUndefined();
     expect(byLabel["Claude Weekly"].usedPercent).toBe(100);
     expect(byLabel["Claude Weekly"].resetsAt).toBe("2026-11-18T05:18:41Z");
     expect(byLabel["Claude 5h"].usedPercent).toBe(0);

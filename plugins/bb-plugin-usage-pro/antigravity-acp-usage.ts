@@ -101,7 +101,7 @@ function windowKind(resetsAt: string | null, now: number): string {
  * entire family (Google reports only the third-party group for some tiers), so
  * the tightest remaining share across the family's models becomes its window.
  */
-function modelWindows(response: Json, taken: Set<string>, now: number): UsageWindow[] {
+function modelWindows(response: Json, existing: UsageWindow[], now: number): UsageWindow[] {
   const models = object(response.models);
   const families = new Map<string, { fraction: number; resetsAt: string | null }>();
   for (const raw of Object.values(models)) {
@@ -128,7 +128,14 @@ function modelWindows(response: Json, taken: Set<string>, now: number): UsageWin
   const windows: UsageWindow[] = [];
   for (const [family, quota] of families) {
     const label = `${family} ${windowKind(quota.resetsAt, now)}`;
-    if (taken.has(label)) continue;
+    // A summary bucket already covers this family when it lands on the same
+    // reset instant — distance-named labels can alias it into a fake second
+    // window (e.g. a weekly reset ~35h out would read as "Daily").
+    const dupe = existing.some(w => w.label === label ||
+      (w.label.startsWith(`${family} `) && w.resetsAt !== null &&
+       quota.resetsAt !== null &&
+       Math.abs(Date.parse(w.resetsAt) - Date.parse(quota.resetsAt)) < 120_000));
+    if (dupe) continue;
     windows.push({
       label,
       usedPercent: Math.round((1 - quota.fraction) * 10_000) / 100,
@@ -258,9 +265,7 @@ export function createAntigravityAcpUsage(options: {
       }),
     ]);
     const windows = quotaWindows(summary);
-    const taken = new Set(windows.map(w => w.label));
-    const derived = modelWindows(models, taken, options.now());
-    for (const w of derived) taken.add(w.label);
+    const derived = modelWindows(models, windows, options.now());
     windows.push(...derived);
     if (windows.length === 0) {
       throw new QuotaError("Google did not report usable quota windows.");
