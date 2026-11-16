@@ -3,7 +3,7 @@ title: provider-agy — миграция на ACP-транспорт
 status: draft
 owner: coordinator
 date: 2026-11-14
-revision: 4 (§12 жизненный цикл acp-shim, PLUG-274)
+revision: 5 (§12 жизненный цикл acp-shim, PLUG-274 — находки ревью #634)
 tags: [bb, plugins, provider-agy, acp]
 ---
 
@@ -159,20 +159,25 @@ Shim входит в orderly shutdown при любом из:
 2. **Смерть родителя** — сторож: на старте запоминается `process.ppid`; unref-интервал ≤2 с сверяет `process.ppid` — сменился (пересадка на init/systemd) → shutdown. `PR_SET_PDEATHSIG` из чистого Node недоступен; ppid-поллинг — портируемый эквивалент.
 3. **SIGTERM/SIGINT/SIGHUP** — сигнал = приказ завершиться, не только форвард ребёнку.
 4. **`close` ребёнка** — `agy acp` умер сам: как сейчас, но с реальным выходом процесса (п. 12.2.3–4).
+5. **EPIPE на stdout** — запись мосту упёрлась в закрытый пайп (родитель мёртв): тот же shutdown.
 
 ### 12.2 Порядок shutdown (≤10 с суммарно)
 1. `acceptingClientInput=false`; закрыть `rlIn`, снять `fs.watch` control-файла, сбросить таймеры (replay fallback, set_mode settle) — event-loop обязан освобождаться.
 2. `child.stdin.end()`; grace ~2 с → `SIGTERM` на **группу** ребёнка; ещё ~3–5 с → `SIGKILL` на группу. Ребёнок спавнится `detached: true` (своя process-группа), убийство — `kill(-child.pid, sig)`: гибнут `agy acp` и все его node-внуки. Вне Linux — fallback на прямой `child.kill` (деградация, не блокер).
-3. Удалить свой `ctl-<threadId>-<nonce>.ndjson` из `acp-shim/` (файл сессии; каталог данных не трогать — он общий).
-4. `process.exit` гарантирован: жёсткий не-unref-нутый дедлайн ~8 с от входа в shutdown вызывает `exit` принудительно, даже если ребёнок/таймеры повисли.
+3. Удалить свой файл `$AGY_SHIM_CONTROL` (покрывает и maintenance-шим `__models__` с `ctl-models.ndjson`); каталог данных не трогать — он общий.
+4. Чистый путь завершается явным `process.exit()` — шим не ждёт опустошения loop. Дедлайн ~8 с от входа в shutdown (не unref) — только страховка: принудительный `exit`, если ребёнок/таймеры повисли; в норме не срабатывает.
+5. **Идемпотентность**: вход в shutdown — одноразовый (флаг); при смерти worker'а могут сработать EOF+ppid-сторож+сигнал одновременно. Убийства терпят `ESRCH`, fs-операции — `ENOENT`, запись в закрытый `child.stdin` — `ERR_STREAM_DESTROYED`; ребёнок, мёртвый до входа в shutdown, не ломает путь.
 
 ### 12.3 Реапер на стороне обёртки (defense in depth)
-`src/acp-wrapper.ts` — `reapOrphanShims()` в `start()` (при каждом поднятии worker) и в `onClose()`:
-- Скан `/proc/[0-9]+/cmdline` на `acp-shim.mjs`; из `/proc/<pid>/status` читается `PPid`. Сирота = `PPid` равен 1 или PID `systemd --user` — shim с мёртвым родителем всегда мусор (живой shim — ребёнок bridge-worker'а). `SIGKILL` + строка в `acp-wrapper.log` (pid, `AGY_SHIM_THREAD_ID` из `/proc/<pid>/environ`, возраст).
-- Каталоги `<os.tmpdir()>/agy-acp-*` (остатки харнессов): удалить, если ни один живой процесс не ссылается на каталог в `cmdline`/`environ` — проверка обязательна, живой харнес не трогаем.
+`src/acp-wrapper.ts` — `reapOrphanShims()` в `start()` (при каждом поднятии worker) и в `onClose()`. Реапер — no-op вне Linux и никогда не роняет `start()`/`onClose()`: весь скан обёрнут, любая ошибка → log+skip.
+
+- **Найти сироту.** Скан `/proc/[0-9]+/cmdline`: кандидат — `argv[0]` node-подобный И `basename(argv[1]) == "acp-shim.mjs"` (иначе `vim`/`grep acp-shim.mjs` получит kill). Из `/proc/<pid>/status` читается `PPid`. Сирота = `PPid` равен 1 или `/proc/<ppid>/comm == "systemd"` (покрывает PID1 и user-инстансы/subreaper'ов без резолва чужого PID).
+- **Убить с деревом.** Лесенка, не голый KILL: `SIGTERM` шиму → grace ~8–10 с (новый shim сам добьёт detached-группу по §12.2; старый хотя бы форварднёт TERM ребёнку — acp-shim.mjs:471) → `SIGKILL` шиму **и** явно его детям из `/proc/<pid>/task/*/children` (собрать до KILL, иначе дерево `agy` уйдёт в сироты — тот же класс утечки). Строка в `acp-wrapper.log`: pid, `AGY_SHIM_THREAD_ID` из `/proc/<pid>/environ`, возраст.
+- **Свои maintenance-убийства** (`child.kill("SIGKILL")` у probes ~L1211/~L1258) перевести на ту же лесенку TERM→grace→KILL — сейчас они оставляют `agy acp` на EOF.
+- **Каталоги `<os.tmpdir()>/agy-acp-*`** (остатки харнессов) — удалить только при ВСЕХ условиях: (a) каталог ≠ собственному `dataDir`/`shimDir` и не является его предком — реапер в `start()` крутится внутри процесса харнеса и увидит свежесозданный root «пустым»; (b) устаревание — ни одного файла с `mtime` моложе N мин (N=60): env харнеса выставляется после exec и в `/proc/<pid>/environ` его нет, значит единственный рабочий критерий «живости» — свежая запись; (c) ни один `/proc/*/cwd` или `/proc/*/fd/*` не указывает внутрь каталога; `EPERM` при скане чужого proc = «ссылается», не удалять.
 
 ### 12.4 Харнессы — тот же kill-контракт
-- `harness-acp.mjs` и родственные `harness-*.mjs`/`fake-agy-*.mjs`: teardown на `exit`/`SIGINT`/`SIGTERM` — убить свои дочерние процессы группой и `rm -rf` свой `mkdtemp`-корень `/tmp/agy-acp-*`.
+- `harness-acp.mjs` и родственные `harness-*.mjs`/`fake-agy-*.mjs`: teardown на `exit`/`SIGINT`/`SIGTERM` — убить свои дочерние процессы группой и `rm -rf` свой `mkdtemp`-корень `/tmp/agy-acp-*` (своя уборка первична; реапер §12.3 — только страховка для аварийных смертей).
 - `/tmp/plug117_*` фикстуры provider-argon (`server|fixture|unruly.mjs`): процессы фикстур умирают с родителем — тот же контракт (ppid-сторож или группа + teardown в харнессе argon).
 
 Не в scope: generic-мост bb (чужой код), stream-json мост (legacy за флагом), сторонний `google-antigravity-acp` (свой репозиторий rawizhere — та же болезнь, чинится отдельно).
