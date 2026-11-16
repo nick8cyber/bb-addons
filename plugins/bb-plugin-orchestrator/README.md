@@ -128,8 +128,9 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   the thread-id marker in the PR body from the `prBody` template
   (default `BB-Thread: {thread}` / `BB-Task: {task}`) and exempts
   `thr_…` in COMMIT MESSAGES from the bb-ids leak rule — the
-  `BB-Thread:` trailer in the release machine scan's commit scan
-  (§16.6) and in `pre-commit` alike. In file CONTENT `thr_…` is a
+  `BB-Thread:` trailer and the message text (§22.5), only in the
+  release machine scan's commit scan (§16.6): `pre-commit` never
+  reads the commit message. In file CONTENT `thr_…` is a
   finding everywhere (§22.5): the release scan flags it in the
   release diff and every commit's patch, `pre-commit` in the staged
   lines — `leaks.allow` places aside in both. Off — `prBody` is not
