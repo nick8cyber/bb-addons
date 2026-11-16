@@ -791,11 +791,47 @@ function newestMtimeMs(dir: string, budget: { left: number }): number {
   return newest;
 }
 
+export function procSession(pid: string): string | null {
+  const stat = readProcText(`/proc/${pid}/stat`);
+  if (stat === null) return null;
+  const idx = stat.lastIndexOf(")");
+  if (idx === -1) return null;
+  const fields = stat.substring(idx + 2).split(" ");
+  return fields[3] || null;
+}
+
+export type ProcAccessOutcome = "skipProcess" | "reference" | "dead";
+
+/** Classifies an unreadable same-uid process (EPERM/EACCES) per spec §12.3(c) rev 9.
+ * Foreign session daemons (setsid, dumpable=0) are skipped. Same-uid processes
+ * in our own session conservatively count as a reference. Unreadable stat
+ * (ENOENT/ESRCH) means the process exited and is not a reference. */
+export function classifyUnreadableProcess(
+  pid: string,
+  error: unknown,
+  ourSession: string | null,
+): ProcAccessOutcome {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code !== "EPERM" && code !== "EACCES") {
+    return "dead"; // ENOENT, ESRCH or raced exit — not a reference
+  }
+  const session = procSession(pid);
+  if (session === null) {
+    return "dead"; // stat unreadable (ENOENT/race) — not a reference
+  }
+  if (ourSession !== null && session === ourSession) {
+    return "reference"; // same-uid in our own session: conservative reference
+  }
+  return "skipProcess"; // foreign-session daemon
+}
+
 /** Every filesystem target visible in /proc — cwd and fd symlinks of processes
  * belonging to our uid. Foreign processes are skipped without reading cwd/fd
- * (mkdtemp roots are 0700 so foreign uids cannot enter them, per spec §12.3(c)).
- * An unreadable process of our own uid (EPERM/EACCES) conservatively counts
- * as a reference and returns null. Returns null on scan budget overflow. */
+ * (mkdtemp roots are 0700 so foreign uids cannot enter them, per spec §12.3(c) rev 9).
+ * Unreadable same-uid processes (EPERM/EACCES) are resolved by session via /proc/<pid>/stat:
+ * foreign session daemons (dumpable=0) are skipped, while same-uid processes in our own
+ * session conservatively count as a reference and return null. Returns null on scan budget
+ * overflow. */
 export function procVisibleTargets(): Set<string> | null {
   let pids: string[] = [];
   try {
@@ -804,6 +840,7 @@ export function procVisibleTargets(): Set<string> | null {
     return null;
   }
   const myUid = typeof process.getuid === "function" ? process.getuid() : -1;
+  const ourSession = procSession("self");
   const targets = new Set<string>();
   let scanned = 0;
   for (const pid of pids) {
@@ -820,16 +857,17 @@ export function procVisibleTargets(): Set<string> | null {
     try {
       targets.add(readlinkSync(`/proc/${pid}/cwd`));
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EPERM" || code === "EACCES") return null;
+      const outcome = classifyUnreadableProcess(pid, error, ourSession);
+      if (outcome === "reference") return null;
+      continue; // skipProcess or dead: do not scan fds
     }
     let fds: string[] = [];
     try {
       fds = readdirSync(`/proc/${pid}/fd`);
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EPERM" || code === "EACCES") return null;
-      continue; // raced exit, etc.
+      const outcome = classifyUnreadableProcess(pid, error, ourSession);
+      if (outcome === "reference") return null;
+      continue; // skipProcess or dead
     }
     for (const fd of fds) {
       scanned += 1;
