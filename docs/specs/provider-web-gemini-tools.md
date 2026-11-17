@@ -2,7 +2,7 @@
 title: provider-web-gemini-tools — Инструменты чтения для веб-провайдера Gemini (Argon)
 status: approved
 owner: coordinator
-date: 2026-11-16
+date: 2026-11-17
 revision: 4
 tags: [bb, plugins, provider-argon, acp, gemini, tools]
 ---
