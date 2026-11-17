@@ -1602,6 +1602,27 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
     "Hidden dialog is ignored"
   );
 
+  // Real Playwright calls page.evaluate(fn) with NO argument — the function
+  // must take the page's `document` itself, not crash on `undefined`.
+  const savedDocument = globalThis.document;
+  delete globalThis.document;
+  try {
+    assert.equal(
+      upsellDialogConfirmsLock(),
+      false,
+      "No-arg call (real page.evaluate path) without a document must return false, not throw"
+    );
+    globalThis.document = doc([dlg([btn("Сменить план")])]);
+    assert.equal(
+      upsellDialogConfirmsLock(),
+      true,
+      "No-arg call must read the dialog from globalThis.document"
+    );
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
+
   // --- selectModelAndThinking end-to-end on the same fixtures ---
   const unlockedItemEl = {
     querySelectorAll: () => [icon({ className: "mat-icon unlock" })],
@@ -1643,6 +1664,8 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   // no lock, no throw.
   let clickedPromo = false;
   const promoDoc = doc([dlg([btn("Попробуйте Ultra — 1999 ₽/мес"), btn("Не сейчас")])]);
+  // page.evaluate mocks call fn() with NO args — like real Playwright — and
+  // the page `document` is provided via globalThis, as in the browser.
   const mockPagePromo = {
     $: async () => null,
     $$: async () => [
@@ -1658,7 +1681,7 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
         click: async () => { clickedPromo = true; },
       },
     ],
-    evaluate: async (fn) => fn(promoDoc),
+    evaluate: async (fn) => fn(),
     waitForSelector: async () => ({
       innerText: async () => "3.5 Flash-Lite",
       getAttribute: async () => "3.5 Flash-Lite",
@@ -1667,7 +1690,12 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
     waitForTimeout: async () => {},
     keyboard: { press: async () => {} },
   };
-  await selectModelAndThinking(mockPagePromo, "argon", null, true);
+  globalThis.document = promoDoc;
+  try {
+    await selectModelAndThinking(mockPagePromo, "argon", null, true);
+  } finally {
+    delete globalThis.document;
+  }
   assert.equal(clickedPromo, true, "Promo popup after click must not mark the model locked");
 
   // Plan-change dialog after click and model not selected → locked.
@@ -1687,17 +1715,22 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
         click: async () => {},
       },
     ],
-    evaluate: async (fn) => fn(upsellDoc),
+    evaluate: async (fn) => fn(),
   };
-  await assert.rejects(
-    async () => selectModelAndThinking(mockPageUpsell, "argon", null, true),
-    (err) => {
-      assert.ok(err instanceof ModelUnavailable);
-      assert.equal(err.isLocked, true);
-      assert.equal(err.lockedModel, "argon");
-      return true;
-    }
-  );
+  globalThis.document = upsellDoc;
+  try {
+    await assert.rejects(
+      async () => selectModelAndThinking(mockPageUpsell, "argon", null, true),
+      (err) => {
+        assert.ok(err instanceof ModelUnavailable);
+        assert.equal(err.isLocked, true);
+        assert.equal(err.lockedModel, "argon");
+        return true;
+      }
+    );
+  } finally {
+    delete globalThis.document;
+  }
 
   // Model actually selected — an upsell-looking popup alongside is not a
   // lock. First picker read returns the old model (forces the click); the
@@ -1705,7 +1738,7 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   let pickerCalls = 0;
   const mockPageSelected = {
     ...mockPageUpsell,
-    evaluate: async (fn) => fn(upsellDoc),
+    evaluate: async (fn) => fn(),
     waitForSelector: async () => {
       pickerCalls += 1;
       const label = pickerCalls === 1 ? "3.5 Flash-Lite" : "4 Argon";
@@ -1716,7 +1749,12 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
       };
     },
   };
-  await selectModelAndThinking(mockPageSelected, "argon", null, true);
+  globalThis.document = upsellDoc;
+  try {
+    await selectModelAndThinking(mockPageSelected, "argon", null, true);
+  } finally {
+    delete globalThis.document;
+  }
   assert.ok(pickerCalls > 1, "post-click picker re-check must have run");
 
   // --- ops: `node acp-server.mjs unlock <id|all> [model]` clears lockedModels ---

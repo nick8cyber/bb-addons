@@ -471,11 +471,15 @@ function menuItemHasLockIcon(el) {
 
 // PLUG-282: a post-click dialog counts as lock proof only when it carries an
 // explicit plan-change CTA. A generic promo popup with price text
-// ("попробуйте …/мес") is not a lock. Self-contained for page.evaluate.
-function upsellDialogConfirmsLock(doc) {
+// ("попробуйте …/мес") is not a lock. Self-contained for page.evaluate:
+// Playwright invokes fn() with no args, so the document comes from the
+// page's global — `globalThis.document` also resolves safely under Node
+// tests where `document` is not a declared identifier.
+function upsellDialogConfirmsLock(doc = globalThis.document) {
   const PLAN_CTA =
     /сменить (план|подписку)|сменить тариф|change (plan|subscription)|upgrade|перейти на (тариф|план|ultra|pro)|оформить подписку|перейти на платную/i;
   const DISMISS = /не сейчас|not now|no thanks|maybe later/i;
+  if (!doc || typeof doc.querySelectorAll !== 'function') return false;
   const dlgs = [...doc.querySelectorAll('mat-dialog-container, [role="dialog"]')]
     .filter((e) => e.offsetParent !== null);
   for (const dlg of dlgs) {
