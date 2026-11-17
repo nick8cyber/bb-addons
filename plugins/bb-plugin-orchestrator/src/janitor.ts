@@ -296,6 +296,36 @@ export interface JanitorRunSummary {
   runId?: number;
 }
 
+/** §15 (r33.7) / release §2 п.2 + ADR-0024 п.2: аргументы автоочистки
+ * копий задачи после подтверждённой публикации. */
+export interface TaskCleanupArgs {
+  taskKey: string;
+  /** Каталог копии выкладки — отсюда общий git-dir репозитория. */
+  repoPath: string;
+  /** Опубликованный коммит — гейт «100% подтверждение origin». */
+  publishedSha: string;
+  /** Целевая ветка (`main`, `dev`, …) — `origin/<targetBranch>`. */
+  targetBranch: string;
+}
+
+export interface TaskCleanupKept {
+  kind: "env" | "branch";
+  id: string;
+  reason: string;
+}
+
+export interface TaskCleanupSummary {
+  /** Очистка не запускалась вовсе — гейт origin не подтверждён. */
+  blocked?: "fetch-failed" | "not-confirmed" | "no-repo";
+  envsRemoved: number;
+  branchesRemoved: number;
+  threadsArchived: number;
+  /** Сколько грязных копий спасено в `refs/orchestrator/rescue/*`. */
+  rescued: number;
+  /** Что осталось и почему — этап «мусор» пост-проверки (release §2). */
+  kept: TaskCleanupKept[];
+}
+
 export interface JanitorReport {
   config: JanitorConfig | null;
   configErrors: { path: string; message: string }[];
@@ -1128,6 +1158,12 @@ export function createJanitor(deps: JanitorDeps) {
     repoRoot: string,
     targets: string[],
     extraTips: string[] = [],
+    /**
+     * §15 (r33.7): позиции, чьи достижимые коммиты считаются покрытыми
+     * (публикация задачи + tip_sha в базе и журнале). Проверяются
+     * только коммиты вне их достижимости — сироты reflog.
+     */
+    coveredTips: string[] = [],
   ): Promise<"ok" | "lost" | "unknown"> => {
     const shas = new Set<string>(extraTips);
     for (const ref of refs) {
@@ -1171,6 +1207,9 @@ export function createJanitor(deps: JanitorDeps) {
         ...list.slice(i, i + 200),
         "--not",
         ...targets,
+        // §15 (r33.7): task-merged вершины покрыты публикацией задачи —
+        // в проверке остаются только сироты reflog вне их достижимости.
+        ...coveredTips,
       ]);
       if (out === null) return "unknown";
       for (const l of out.split("\n")) {
@@ -1210,6 +1249,9 @@ export function createJanitor(deps: JanitorDeps) {
     ownBranch: string | undefined,
     repoRoot: string,
     targets: string[],
+    /** §15 (r33.7): вершины, чья достижимость уже покрыта публикацией
+     * задачи — проверке подлежат только сироты reflog вне их. */
+    coveredTips: string[] = [],
   ): Promise<"ok" | "lost" | "unknown"> => {
     const refs = ["HEAD"];
     for (const b of [env.branchName?.trim(), ownBranch?.trim()]) {
@@ -1248,7 +1290,14 @@ export function createJanitor(deps: JanitorDeps) {
       .filter(Boolean)) {
       if (!refs.includes(r)) refs.push(r);
     }
-    return reflogPositionsSafe(path, refs, repoRoot, targets);
+    return reflogPositionsSafe(
+      path,
+      refs,
+      repoRoot,
+      targets,
+      [],
+      coveredTips,
+    );
   };
 
   /**
@@ -1635,6 +1684,57 @@ export function createJanitor(deps: JanitorDeps) {
       );
     const delegatedThreads = activeDelegations();
 
+    // §15 (r33.7, ADR-0024 п.4): «влита по задаче» — среда/ветка
+    // промежуточного захода признаётся влитой, когда задача
+    // подтверждённо опубликована на origin/<цель>: у её делегирования
+    // есть запись `published` и её `published_sha` — предок
+    // `origin/<target_branch>` (после успешного fetch прогона). Прямое
+    // `merge-base --is-ancestor` для каждого промежуточного коммита не
+    // требуется — re-review, доработки и squash-переписи с финальным
+    // SHA не совпадают. Проверки безопасности (чистый `git status`,
+    // процессы, сироты reflog — см. nothingLost) сохраняются полностью.
+    const taskIndex = deps.store.delegationTaskIndex();
+    const taskByEnv = new Map<string, string>();
+    const taskByThread = new Map<string, string>();
+    const taskByBranch = new Map<string, string>();
+    for (const d of taskIndex) {
+      if (d.envId) taskByEnv.set(d.envId, d.taskKey);
+      if (d.threadId) taskByThread.set(d.threadId, d.taskKey);
+      if (d.branch) taskByBranch.set(d.branch, d.taskKey);
+    }
+    const publishedByTask = new Map(
+      deps.store.publishedReleases().map((r) => [r.taskKey, r]),
+    );
+    const taskMergedCache = new Map<string, boolean>();
+    const taskMergedOn = async (
+      taskKey: string,
+      repoRoot: string,
+    ): Promise<boolean> => {
+      const rel = publishedByTask.get(taskKey);
+      if (!rel) return false;
+      const cacheKey = `${repoRoot}\n${taskKey}`;
+      const hit = taskMergedCache.get(cacheKey);
+      if (hit !== undefined) return hit;
+      const ok = await gitOk(deps.cmd, repoRoot, [
+        "merge-base",
+        "--is-ancestor",
+        rel.publishedSha,
+        `origin/${rel.targetBranch}`,
+      ]);
+      taskMergedCache.set(cacheKey, ok);
+      return ok;
+    };
+    const taskKeyOfEnv = (env: EnvDto): string | null => {
+      const direct = taskByEnv.get(env.id);
+      if (direct) return direct;
+      // Старые делегирования без `result_env_id` — привязка через тред.
+      for (const t of graph.byEnv.get(env.id) ?? []) {
+        const k = taskByThread.get(t.id);
+        if (k) return k;
+      }
+      return null;
+    };
+
     // §16.3: one global thread list builds the cascade graph — children
     // via `parentThreadId`, hidden forks via `sourceThreadId`. The graph
     // is rebuilt right before archiving (§15 «Действие»): the run-start
@@ -1951,6 +2051,10 @@ export function createJanitor(deps: JanitorDeps) {
       firstSeenAt: number | null;
       /** HEAD at the run-start evaluation — re-verified before archive. */
       headSha?: string;
+      /** §15 (r33.7): task-merged — вершины копии покрыты публикацией
+       * задачи; пре-архивный «ничего не теряется» проверяет только
+       * сироты reflog вне их достижимости. */
+      coveredTips?: string[];
     }
     const factsCache = new Map<string, EnvFacts>();
     const envFacts = async (env: EnvDto): Promise<EnvFacts> => {
@@ -2080,6 +2184,23 @@ export function createJanitor(deps: JanitorDeps) {
         }
       }
 
+      // §15 (r33.7): «влита по задаче» — когда прямое доказательство не
+      // прошло, копия промежуточного захода опубликованной задачи
+      // признаётся влитой по факту публикации (`published_sha` — предок
+      // `origin/<target>` после fetch прогона). Остальные условия §15
+      // и проверки безопасности ниже не ослабляются: поштучное
+      // доказательство отменяется только для коммитов, достижимых из
+      // вершин копии (их SHA уходят в tip_sha журнала и базы до
+      // удаления — ADR-0024 п.3).
+      let taskMerged = false;
+      if (!merged) {
+        const taskKey = taskKeyOfEnv(env);
+        if (taskKey && (await taskMergedOn(taskKey, repo.root))) {
+          merged = true;
+          taskMerged = true;
+        }
+      }
+
       if (!merged) {
         const reason = allArchived
           ? "abandoned-archived"
@@ -2187,12 +2308,18 @@ export function createJanitor(deps: JanitorDeps) {
       // copy's own: HEAD is per-worktree, plus `branchName` and the
       // checked-out branch when they exist — the repo's other
       // branches are never scanned.
+      // §15 (r33.7): у task-merged копии коммиты, достижимые из её
+      // вершин (HEAD и ветка — их SHA зафиксированы в tip_sha до
+      // удаления), покрыты публикацией задачи и доказательства не
+      // требуют; позиции reflog, из вершин недостижимые (сироты
+      // `reset`, коммиты на detached HEAD), проверяются как раньше.
       const lost = await nothingLost(
         env,
         path,
         ownBranch,
         repo.root,
         targets,
+        taskMerged ? [...new Set(shas)] : [],
       );
       if (lost === "unknown") return after("unpushed-unknown");
       if (lost === "lost") {
@@ -2218,6 +2345,7 @@ export function createJanitor(deps: JanitorDeps) {
         reported: false,
         firstSeenAt,
         headSha: head,
+        coveredTips: taskMerged ? [...new Set(shas)] : undefined,
       };
     };
 
@@ -2488,6 +2616,7 @@ export function createJanitor(deps: JanitorDeps) {
           ownBranch,
           repo.root,
           targets,
+          f.coveredTips ?? [],
         );
         if (lost !== "ok") {
           note(lost === "lost" ? "unpushed-commits" : "unpushed-unknown", e.id);
@@ -2909,7 +3038,19 @@ export function createJanitor(deps: JanitorDeps) {
         if (cfg.protectedBranches.includes(branch)) continue;
         if (excludedBranches.has(branch)) continue;
         if (openBranches.has(branch)) continue;
-        const merged = await shaMergedIn(root, branch, protectedTargets);
+        let merged = await shaMergedIn(root, branch, protectedTargets);
+        // §15 (r33.7): ветка промежуточного захода опубликованной
+        // задачи — «влита по задаче»; её вершина покрыта публикацией и
+        // зафиксируется в tip_sha до удаления (ADR-0024 п.3), сироты
+        // reflog проверяются как раньше.
+        let taskMergedBranch = false;
+        if (!merged) {
+          const tk = taskByBranch.get(branch);
+          if (tk && (await taskMergedOn(tk, root))) {
+            merged = true;
+            taskMergedBranch = true;
+          }
+        }
         // §16.3: a branch that is not «влита» can never pass «ничего
         // не теряется» — its tip alone is unpublished work — so it
         // stays (`branch-unpushed`), reported once its reflog idles
@@ -2936,6 +3077,8 @@ export function createJanitor(deps: JanitorDeps) {
                 [`refs/heads/${branch}`],
                 root,
                 protectedTargets,
+                [],
+                taskMergedBranch ? [tip] : [],
               )
             : "unknown";
         const envId = `branch:${commonDir}:${branch}`;
@@ -3604,6 +3747,18 @@ export function createJanitor(deps: JanitorDeps) {
    * atomically (`update-ref <ref> <sha> ""`), and rescues of one
    * thread are serialized by an in-plugin queue.
    */
+  /**
+   * §16.4/§15 r33.7: исход спасения — нужен автоочистке копий задачи
+   * (`taskCleanup`), чтобы решить, убирать ли копию дальше: «failed»
+   * копия остаётся нетронутой (ADR-0024 п.2), прочее — продолжить.
+   */
+  type RescueOutcome =
+    | "skipped" // вне области/копии уже нет — спасать нечего
+    | "clean" // спасать нечего — копия чистая
+    | "unchanged" // то же состояние уже сохранено
+    | "saved" // ref записан
+    | "failed"; // снимок или запись ref не удались — копия остаётся
+
   const rescueOnGone = async (
     thread: {
       id: string;
@@ -3613,7 +3768,13 @@ export function createJanitor(deps: JanitorDeps) {
       originPluginId?: string | null;
     },
     cause: "archived" | "deleted",
-  ): Promise<void> => {
+    /**
+     * §15 (r33.7): автоочистка сама убирает среду целиком — проверка
+     * «другой живой тред среды» не применяется (живые треды этой же
+     * среды архивируются тем же проходом, копия уходит в любом случае).
+     */
+    opts?: { assumeEnvEnds?: boolean },
+  ): Promise<RescueOutcome> => {
     const reasonWord =
       cause === "deleted"
         ? t("jn.reasonDeleted")
@@ -3630,9 +3791,9 @@ export function createJanitor(deps: JanitorDeps) {
       thread.originPluginId === "orchestrator" ||
       !!thread.parentThreadId ||
       !!thread.sourceThreadId;
-    if (fieldsKnown && !worker) return;
+    if (fieldsKnown && !worker) return "skipped";
     const envId = thread.environmentId;
-    if (!envId) return;
+    if (!envId) return "skipped";
     const env = await showEnvironment(envId);
     const path = env?.path;
     if (!path || !existsSync(path)) {
@@ -3642,7 +3803,7 @@ export function createJanitor(deps: JanitorDeps) {
         `orchestrator janitor: rescue ${thread.id} (${cause}): ` +
           `env ${envId} copy already gone`,
       );
-      return;
+      return "skipped";
     }
     const statusText = await gitOut(deps.cmd, path, [
       "status",
@@ -3650,13 +3811,13 @@ export function createJanitor(deps: JanitorDeps) {
       "--untracked-files=all",
       "--ignore-submodules=none",
     ]);
-    if (statusText === null) return;
+    if (statusText === null) return "failed";
     // §15 п.3 (PLUG-202): a copy whose only changes hide behind
     // `skip-worktree`/`assume-unchanged` looks clean to `git status`
     // but still holds work — rescue it the same way.
     if (!statusText.trim()) {
       const hidden = await hiddenChangedFiles(path);
-      if (!hidden?.length) return;
+      if (!hidden?.length) return "clean";
     }
     // §16.4 r29 п.2: another LIVE thread of the same env (not
     // archived, not deleted, not the event's own) keeps the env — BB
@@ -3672,6 +3833,7 @@ export function createJanitor(deps: JanitorDeps) {
       t.archivedAt === null && !t.deletedAt;
     const threadsNow = await listThreads();
     if (
+      !opts?.assumeEnvEnds &&
       threadsNow !== null &&
       threadsNow.some(
         (t) =>
@@ -3680,7 +3842,7 @@ export function createJanitor(deps: JanitorDeps) {
           liveThread(t),
       )
     ) {
-      return;
+      return "skipped";
     }
     const coordinator =
       deps.store.byThreadId(thread.id)?.coordinator_thread_id ??
@@ -3787,7 +3949,7 @@ export function createJanitor(deps: JanitorDeps) {
         notified: delivered && !coordGone,
         error: `${step}: ${error}`,
       });
-      return;
+      return "failed";
     }
     const refBase = `${RESCUE_PREFIX}${thread.id}`;
     const existing = await listRescueRefs(path, thread.id);
@@ -3798,7 +3960,7 @@ export function createJanitor(deps: JanitorDeps) {
         `orchestrator janitor: rescue ${thread.id}: ` +
           `snapshot unchanged — already saved at ${latest}`,
       );
-      return;
+      return "unchanged";
     }
     // §16.4 r29 п.4: atomic create — `update-ref <ref> <sha> ""`
     // writes only when the ref is absent; a lost race (or a stale
@@ -3843,7 +4005,7 @@ export function createJanitor(deps: JanitorDeps) {
           `orchestrator janitor: rescue ${thread.id}: ` +
             `snapshot unchanged — already saved at ${candidate}`,
         );
-        return;
+        return "unchanged";
       }
       candidate = `${refBase}-${++n}`;
     }
@@ -3856,7 +4018,7 @@ export function createJanitor(deps: JanitorDeps) {
         notified: delivered && !coordGone,
         error: `update-ref: ${error}`,
       });
-      return;
+      return "failed";
     }
     // §16.4 r29 п.3: a repeat snapshot restores into its own
     // `<repo>-rescue-<id>-<N>` directory so it cannot collide with an
@@ -3877,6 +4039,7 @@ export function createJanitor(deps: JanitorDeps) {
       }),
     );
     record({ ref, repoRoot, notified: delivered && !coordGone });
+    return "saved";
   };
 
   /** §16.4 r29 п.4: rescue calls for one thread run one at a time —
@@ -3895,7 +4058,9 @@ export function createJanitor(deps: JanitorDeps) {
   ): Promise<void> => {
     const prev = rescueQueue.get(thread.id) ?? Promise.resolve();
     const next = prev
-      .then(() => rescueOnGone(thread, cause))
+      .then(async () => {
+        await rescueOnGone(thread, cause);
+      })
       .catch((e) =>
         log.warn?.(
           `orchestrator janitor: rescue ${thread.id}: ${message(e)}`,
@@ -3922,6 +4087,453 @@ export function createJanitor(deps: JanitorDeps) {
     sourceThreadId?: string | null;
     originPluginId?: string | null;
   }) => onThreadGone(thread, "deleted");
+
+  /**
+   * §15 (r33.7, ADR-0024 п.2) + release §2 п.2: автоочистка копий и
+   * веток задачи после того, как шаги 6–7 выкладки подтвердили
+   * `published_sha` на `origin/<target>`. Работает и при выключенном
+   * уборщике — это часть конвейера выкладки, не фонового прогона.
+   *
+   * Гарантии «ничего не теряется»: (1) гейт повторяет fetch +
+   * `merge-base --is-ancestor` сам — сбой сети блокирует всю очистку;
+   * (2) грязная копия спасается в `refs/orchestrator/rescue/*` до
+   * архива, сбой спасения — копия нетронута; (3) `tip_sha` каждой
+   * удаляемой ветки (и копии) пишется в `janitor_items` и журнал до
+   * удаления; (4) живой процесс, активный тред/делегирование или
+   * сирота reflog вне вершин копии копию/ветку сохраняют — остатки
+   * уходят в `kept`, который пост-проверка рапортует координатору.
+   */
+  const taskCleanup = async (
+    args: TaskCleanupArgs,
+  ): Promise<TaskCleanupSummary> => {
+    const summary: TaskCleanupSummary = {
+      envsRemoved: 0,
+      branchesRemoved: 0,
+      threadsArchived: 0,
+      rescued: 0,
+      kept: [],
+    };
+    const at = now();
+    // Гейт 1: fetch + 100%-е подтверждение на origin/<цель>.
+    const fetchRes = await deps.cmd.run(
+      "git",
+      ["-C", args.repoPath, "fetch", "origin"],
+      { timeoutMs: 180_000 },
+    );
+    if (fetchRes.exitCode !== 0) {
+      summary.blocked = "fetch-failed";
+      return summary;
+    }
+    const targetRef = `origin/${args.targetBranch}`;
+    const confirmed = await gitOk(deps.cmd, args.repoPath, [
+      "merge-base",
+      "--is-ancestor",
+      args.publishedSha,
+      targetRef,
+    ]);
+    if (!confirmed) {
+      summary.blocked = "not-confirmed";
+      return summary;
+    }
+    const common = (
+      await gitOut(deps.cmd, args.repoPath, [
+        "rev-parse",
+        "--git-common-dir",
+      ])
+    )?.trim();
+    if (!common) {
+      summary.blocked = "no-repo";
+      return summary;
+    }
+    const commonDir = isAbsolute(common)
+      ? common
+      : join(args.repoPath, common);
+    // Каталог для гит-операций фазы веток: `repoPath` — сама копия
+    // выкладки — может уйти при `environment cleanup`, поэтому ветки
+    // крутим из основного worktree (первый в `worktree list`), который
+    // переживает очистку.
+    const mainWorktree = (
+      await gitOut(deps.cmd, args.repoPath, [
+        "worktree",
+        "list",
+        "--porcelain",
+      ])
+    )
+      ?.split("\n")
+      .find((l) => l.startsWith("worktree "))
+      ?.slice("worktree ".length)
+      .trim();
+    const branchCwd = mainWorktree ?? args.repoPath;
+    const targets = [targetRef];
+    const keepEnv = (id: string, reason: string) =>
+      summary.kept.push({ kind: "env", id, reason });
+    const keepBranch = (name: string, reason: string) =>
+      summary.kept.push({ kind: "branch", id: name, reason });
+
+    // Делегирования задачи → их среды и ветки.
+    const delegations = deps.store.delegationsByTask(args.taskKey);
+    const envIds = new Set<string>();
+    const branchSet = new Set<string>();
+    for (const d of delegations) {
+      if (d.result_env_id) envIds.add(d.result_env_id);
+      if (d.result_branch) branchSet.add(d.result_branch);
+    }
+    // Один список тредов на очистку: fallback «тред → среда» для старых
+    // делегирований без result_env_id и проверка живых тредов среды.
+    const threadsAll = await listThreads();
+    if (threadsAll !== null) {
+      const byId = new Map(threadsAll.map((x) => [x.id, x]));
+      for (const d of delegations) {
+        if (!d.result_env_id && d.thread_id) {
+          const eid = byId.get(d.thread_id)?.environmentId;
+          if (eid) envIds.add(eid);
+        }
+      }
+    }
+    const liveThread = (x: ThreadDto) => !x.archivedAt && !x.deletedAt;
+
+    for (const envId of envIds) {
+      const env = await showEnvironment(envId);
+      const path = env?.path ?? null;
+      if (!path || !existsSync(path)) continue; // копии уже нет
+      const envBranch = env?.branchName?.trim() || null;
+      if (envBranch) branchSet.add(envBranch);
+      if (threadsAll === null) {
+        keepEnv(envId, "threads-unknown");
+        continue;
+      }
+      const envThreads = threadsAll.filter(
+        (x) => x.environmentId === envId && liveThread(x),
+      );
+      const activeDelegation = delegations.some(
+        (d) =>
+          (d.status === "dispatching" || d.status === "running") &&
+          (d.result_env_id === envId ||
+            envThreads.some((x) => x.id === d.thread_id)),
+      );
+      if (activeDelegation) {
+        keepEnv(envId, "delegation-active");
+        continue;
+      }
+      const busy = envThreads.find(
+        (x) =>
+          !QUIESCENT_THREAD_STATUSES.has(x.status ?? "") ||
+          x.queuedWork !== "none",
+      );
+      if (busy) {
+        keepEnv(envId, "threads-active");
+        continue;
+      }
+      let pending = false;
+      for (const x of envThreads) {
+        const p =
+          typeof x.hasPendingInteraction === "boolean"
+            ? x.hasPendingInteraction
+            : await hasPendingInteraction(x.id);
+        if (p) {
+          pending = true;
+          break;
+        }
+      }
+      if (pending) {
+        keepEnv(envId, "interactions-pending");
+        continue;
+      }
+      const proc = await hasProcessIn(path);
+      if (proc !== false) {
+        keepEnv(envId, proc === null ? "process-unknown" : "process-inside");
+        continue;
+      }
+
+      // Грязная копия — спасение до архива; сбой → копия нетронута.
+      const statusText = await gitOut(deps.cmd, path, [
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+      ]);
+      if (statusText === null) {
+        keepEnv(envId, "status-failed");
+        continue;
+      }
+      let dirty = statusText.trim().length > 0;
+      if (!dirty) {
+        const hidden = await hiddenChangedFiles(path);
+        dirty = !!hidden?.length;
+      }
+      if (dirty) {
+        const threadRef =
+          delegations.find(
+            (d) =>
+              d.result_env_id === envId ||
+              envThreads.some((x) => x.id === d.thread_id),
+          )?.thread_id ??
+          envThreads[0]?.id ??
+          `env-${envId}`;
+        const outcome = await rescueOnGone(
+          {
+            id: threadRef,
+            environmentId: envId,
+            originPluginId: "orchestrator",
+          },
+          "archived",
+          { assumeEnvEnds: true },
+        );
+        if (outcome === "saved" || outcome === "unchanged") {
+          summary.rescued += 1;
+        } else if (outcome === "failed") {
+          keepEnv(envId, "rescue-failed");
+          continue;
+        }
+        // «clean» — гонка с нашей проверкой: чистая копия идёт дальше.
+      }
+
+      // Сироты reflog вне вершин копии — по правилу «ничего не
+      // теряется»: коммиты, достижимые из HEAD/ветки, покрыты
+      // публикацией (вершина уходит в tip_sha), прочие проверяются.
+      const headSha = (
+        await gitOut(deps.cmd, path, ["rev-parse", "--verify", "HEAD"])
+      )?.trim();
+      const ownBranch = (
+        await gitOut(deps.cmd, path, ["branch", "--show-current"])
+      )?.trim();
+      const tipSha = envBranch
+        ? (
+            await gitOut(deps.cmd, path, [
+              "rev-parse",
+              "--verify",
+              "--quiet",
+              `refs/heads/${envBranch}`,
+            ])
+          )?.trim() || null
+        : null;
+      const coveredTips = [headSha, tipSha].filter(
+        (x): x is string => !!x,
+      );
+      const refs: string[] = [];
+      if (headSha) refs.push("HEAD");
+      for (const b of [envBranch, ownBranch]) {
+        if (!b) continue;
+        const ref = `refs/heads/${b}`;
+        if (refs.includes(ref)) continue;
+        if (
+          await gitOk(deps.cmd, path, [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            ref,
+          ])
+        ) {
+          refs.push(ref);
+        }
+      }
+      const safe = refs.length
+        ? await reflogPositionsSafe(
+            path,
+            refs,
+            path,
+            targets,
+            [],
+            coveredTips,
+          )
+        : "unknown";
+      if (safe !== "ok") {
+        keepEnv(
+          envId,
+          safe === "lost" ? "unpushed-commits" : "unpushed-unknown",
+        );
+        continue;
+      }
+
+      // Вершины — в журнал и базу ДО архива (сбой ниже оставляет SHA).
+      const tip = tipSha ?? headSha ?? null;
+      log.info?.(
+        `orchestrator janitor: removing copy ` +
+          `${commonDir}:${envBranch ?? "-"} at ${tip ?? "-"} ` +
+          `head ${headSha ?? "-"} (task ${args.taskKey} published)`,
+      );
+      deps.janitor.upsertItem(
+        envId,
+        {
+          projectId: env?.projectId ?? null,
+          path,
+          branch: envBranch,
+          threadId: envThreads[0]?.id ?? null,
+          state: "kept",
+          reason: "removing",
+          tipSha: tip,
+        },
+        at,
+      );
+      // Архив живых тредов среды (каскад детей делает BB). Отказ —
+      // разархив уже заархивированных, копия остаётся.
+      const done: string[] = [];
+      let archiveFailed = false;
+      for (const x of envThreads) {
+        const res = await deps.bbCli.run(["thread", "archive", x.id]);
+        if (res.exitCode !== 0) {
+          archiveFailed = true;
+          for (const u of done) {
+            await deps.bbCli.run(["thread", "unarchive", u]);
+          }
+          break;
+        }
+        done.push(x.id);
+        summary.threadsArchived += 1;
+      }
+      if (archiveFailed) {
+        keepEnv(envId, "archive-failed");
+        continue;
+      }
+      const clean = await deps.bbCli.run([
+        "environment",
+        "cleanup",
+        envId,
+      ]);
+      if (clean.exitCode !== 0) {
+        keepEnv(envId, "cleanup-failed");
+        log.warn?.(
+          `orchestrator janitor: environment cleanup ${envId} ` +
+            `failed: ${clean.stderr.trim() || `exit ${clean.exitCode}`}`,
+        );
+        continue;
+      }
+      summary.envsRemoved += 1;
+      log.info?.(
+        `orchestrator janitor: removed copy ` +
+          `${commonDir}:${envBranch ?? "-"} at ${tip} ` +
+          `(task ${args.taskKey})`,
+      );
+      deps.janitor.upsertItem(
+        envId,
+        {
+          projectId: env?.projectId ?? null,
+          path,
+          branch: envBranch,
+          threadId: envThreads[0]?.id ?? null,
+          state: "removed",
+          reason: "removed",
+          removedAt: at,
+          tipSha: tip,
+        },
+        at,
+      );
+    }
+
+    // Ветки задачи: записанные за делегированиями/средами плюс
+    // `bb/<task>-*` — только локальные, tip фиксируется до удаления.
+    const keyPrefix = `${BRANCH_PREFIX}${args.taskKey.toLowerCase()}-`;
+    const allBranches = await gitOut(deps.cmd, branchCwd, [
+      "for-each-ref",
+      "--format=%(refname:short)",
+      "refs/heads/",
+    ]);
+    for (const b of (allBranches ?? "")
+      .split("\n")
+      .map((x) => x.trim())
+      .filter(Boolean)) {
+      if (b.startsWith(keyPrefix)) branchSet.add(b);
+    }
+    // Свежий worktree list — ветка, открытая в оставшейся копии, не
+    // удаляется (своя копия к этому моменту уже убрана или оставлена).
+    const wtl = await gitOut(deps.cmd, branchCwd, [
+      "worktree",
+      "list",
+      "--porcelain",
+    ]);
+    const openBranches =
+      wtl === null
+        ? null
+        : new Set(
+            parseWorktreeList(wtl)
+              .worktrees.filter((w) => !w.prunable && existsSync(w.path))
+              .map((w) => w.branch)
+              .filter((b): b is string => !!b),
+          );
+    for (const branch of branchSet) {
+      if (!branch.startsWith(BRANCH_PREFIX)) continue;
+      if (branch === args.targetBranch) continue;
+      if (openBranches === null) {
+        keepBranch(branch, "branch-open-unknown");
+        continue;
+      }
+      if (openBranches.has(branch)) continue;
+      const itemId = `branch:${commonDir}:${branch}`;
+      const tip = (
+        await gitOut(deps.cmd, branchCwd, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          `refs/heads/${branch}`,
+        ])
+      )?.trim();
+      if (!tip) continue;
+      // Сироты reflog ветки вне её вершины — как у уборщика (§15).
+      const safe = await reflogPositionsSafe(
+        branchCwd,
+        [`refs/heads/${branch}`],
+        branchCwd,
+        targets,
+        [],
+        [tip],
+      );
+      if (safe !== "ok") {
+        keepBranch(
+          branch,
+          safe === "lost" ? "unpushed-commits" : "unpushed-unknown",
+        );
+        continue;
+      }
+      const owner = deps.janitor
+        .items()
+        .find((i) => i.branch === branch && i.env_id !== itemId);
+      log.info?.(
+        `orchestrator janitor: removing branch ` +
+          `${commonDir}:${branch} at ${tip} (task ${args.taskKey})`,
+      );
+      deps.janitor.upsertItem(
+        itemId,
+        {
+          projectId: owner?.project_id ?? null,
+          threadId: owner?.thread_id ?? null,
+          branch,
+          state: "kept",
+          reason: "removing",
+          tipSha: tip,
+        },
+        at,
+      );
+      const deleted = await gitOk(deps.cmd, branchCwd, [
+        "update-ref",
+        "-d",
+        `refs/heads/${branch}`,
+        tip,
+      ]);
+      if (!deleted) {
+        keepBranch(branch, "branch-delete-failed");
+        continue;
+      }
+      summary.branchesRemoved += 1;
+      log.info?.(
+        `orchestrator janitor: removed branch ` +
+          `${commonDir}:${branch} at ${tip}`,
+      );
+      deps.janitor.upsertItem(
+        itemId,
+        {
+          projectId: owner?.project_id ?? null,
+          threadId: owner?.thread_id ?? null,
+          branch,
+          state: "removed",
+          reason: "removed",
+          removedAt: at,
+          tipSha: tip,
+        },
+        at,
+      );
+    }
+    return summary;
+  };
 
   const report = async (): Promise<JanitorReport> => {
     const cfgLoad = await deps.loadConfig();
@@ -3981,5 +4593,5 @@ export function createJanitor(deps: JanitorDeps) {
     };
   };
 
-  return { run, report, onThreadArchived, onThreadDeleted };
+  return { run, report, onThreadArchived, onThreadDeleted, taskCleanup };
 }

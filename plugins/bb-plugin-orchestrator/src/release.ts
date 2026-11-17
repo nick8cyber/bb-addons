@@ -78,6 +78,7 @@ import type {
 } from "./store.js";
 import { runChecked, runJson, type BbCli, type BbCliResult } from "./bb-cli.js";
 import { createT, LANGS, T_RU, type T } from "./i18n/index.js";
+import type { TaskCleanupArgs, TaskCleanupSummary } from "./janitor.js";
 import type { CmdRunner } from "./cmd.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
 import { dispatchToRoute, type DispatchStepsDeps } from "./delegate.js";
@@ -210,6 +211,11 @@ export interface ReleaseDeps {
   /** §6 (r8): this machine's bb hostId — a project source counts only
    * when its path's hostId is this host. */
   localHostId?: () => string | Promise<string>;
+  /** §15 (r33.7) + release §2 п.2: автоочистка копий и веток задачи
+   * после подтверждённой публикации — работу делает уборщик (rescue,
+   * tip_sha, архив, environment cleanup). Внутри свой гейт
+   * «100% подтверждение origin». */
+  taskCleanup?: (args: TaskCleanupArgs) => Promise<TaskCleanupSummary>;
   hostname?: string;
   now?: () => number;
   log?: {
@@ -3066,6 +3072,12 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
         }),
       ];
       if (pp.summary) parts.push(pp.summary);
+      // §2 п.2 (r11.6): у `pr` автоочистка идёт при влитии — только
+      // тогда published_sha достижим из origin/<target>.
+      {
+        const cleanupLine = await runTaskCleanup(deps, fresh);
+        if (cleanupLine) parts.push(cleanupLine);
+      }
       const line = parts.join("\n");
       // Метка «итог собран» — до перехода в merged: досмотр доставит
       // строку и сотрёт notice_text confirm'ом; без метки следующий
@@ -3996,6 +4008,64 @@ async function publishRelease(
   );
 }
 
+/**
+ * §2 п.2 (r11.6, orchestrator §15 r33.7, ADR-0024 п.2): автоочистка
+ * копий и веток задачи после подтверждённой публикации — работу делает
+ * уборщик (rescue грязных копий, tip_sha в базе/журнале, архив тредов,
+ * environment cleanup, update-ref -d веток). Остатки — этап «мусор»
+ * пост-проверки — возвращаются текстом в итоговую строку.
+ */
+async function runTaskCleanup(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+): Promise<string | null> {
+  const t = deps.t ?? T_RU;
+  if (!deps.taskCleanup) return null;
+  // У `pr` опубликованный коммит — pr_merge_sha (коммит влития на
+  // origin/<target>); head_sha — лишь вершина ветки PR и при
+  // squash-merge предком цели не является.
+  const publishedSha =
+    row.pr_merge_sha ?? row.published_sha ?? row.head_sha;
+  if (!publishedSha) return null;
+  let s: TaskCleanupSummary;
+  try {
+    s = await deps.taskCleanup({
+      taskKey: row.task_key,
+      repoPath: row.repo_root ?? row.repo_path,
+      publishedSha,
+      targetBranch: row.target_branch,
+    });
+  } catch (e) {
+    deps.log?.warn?.(
+      `orchestrator release: task cleanup ${row.task_key}: ${message(e)}`,
+    );
+    return t("rel.taskCleanupFailed", { error: message(e) });
+  }
+  if (s.blocked) {
+    return t("rel.taskCleanupBlocked", { reason: s.blocked });
+  }
+  const bits: string[] = [];
+  if (s.envsRemoved || s.branchesRemoved) {
+    bits.push(
+      t("rel.taskCleanupDone", {
+        envs: s.envsRemoved,
+        branches: s.branchesRemoved,
+      }),
+    );
+  }
+  if (s.rescued) {
+    bits.push(t("rel.taskCleanupRescued", { n: s.rescued }));
+  }
+  if (s.kept.length) {
+    const list = s.kept
+      .slice(0, 5)
+      .map((k) => `${k.kind} ${k.id}:${k.reason}`)
+      .join(", ");
+    bits.push(t("rel.taskCleanupKept", { n: s.kept.length, list }));
+  }
+  return bits.length ? bits.join("; ") : null;
+}
+
 /** §2 r10 п.1: the ONE outcome line — success fact, post-check
  * findings and the postPublish result in the same message, sent under
  * the notified_at claim. `prExisted` null → the досмотр tick recomputes
@@ -4079,6 +4149,12 @@ async function finishPublished(
   }
   for (const m of checks) parts.push(t("rel.postCheck", { msg: m }));
   if (ppSummary) parts.push(ppSummary);
+  // §2 п.2 (r11.6): автоочистка копий задачи + контроль мусора — после
+  // подтверждения публикации шагами 6–7 (у `pr` — при влитии, см. насос).
+  if (fresh.target_action === "push") {
+    const cleanupLine = await runTaskCleanup(deps, fresh);
+    if (cleanupLine) parts.push(cleanupLine);
+  }
   const line = parts.join("\n");
   // §2 r10 п.5: работа выполнена и текст собран — сначала строка
   // сохраняется в записи, метка base снимается (повтор такта уже не

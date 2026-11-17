@@ -421,6 +421,12 @@ export const RU: Record<string, string> = {
   "rel.kbNote": "KB-заметка: {note}",
   "rel.kbNone": "KB не требуется: {reason}",
   "rel.postCheck": "пост-проверка: {msg}",
+  "rel.taskCleanupDone":
+    "очистка задачи: убрано копий {envs}, веток {branches}",
+  "rel.taskCleanupRescued": "спасено грязных копий {n}",
+  "rel.taskCleanupKept": "осталось {n}: {list}",
+  "rel.taskCleanupBlocked": "очистка задачи пропущена: {reason}",
+  "rel.taskCleanupFailed": "очистка задачи не удалась: {error}",
   "rel.postCheckFail": "пост-проверка не удалась: {error}",
   "rel.selfReloadOk": "; перезагружено: orchestrator",
   "rel.selfReloadFail":
