@@ -2452,3 +2452,73 @@ test("17. PLUG-285: bb <system_instructions> blocks stripped from session/prompt
   await new Promise((resolve) => serverProc.on("exit", resolve));
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+test("18. PLUG-286: driver/page failures are transient — never model-unavailable, never parked", () => {
+  // The oleg-6h symptom: waitForSelector timeout on a hung insert — a
+  // driver transient, rotatable (retry on the next account inside the
+  // deadline), parkedReason null so no account is ever parked.
+  const selectorTimeout = classifyFailure(new Error("page.waitForSelector: Timeout 8000ms exceeded."));
+  assert.equal(selectorTimeout.category, "transient");
+  assert.equal(selectorTimeout.rotatable, true);
+  assert.equal(selectorTimeout.parkedReason, null);
+  assert.equal(selectorTimeout.cooldownMs, 0);
+
+  // Playwright TimeoutError is caught by name even without a message match.
+  const namedTimeout = new Error("waiting failed: frame detached");
+  namedTimeout.name = "TimeoutError";
+  const cNamed = classifyFailure(namedTimeout);
+  assert.equal(cNamed.category, "transient");
+  assert.equal(cNamed.parkedReason, null);
+
+  // Page crash / CDP / navigation failures — the same transient class.
+  for (const m of [
+    "Target crashed",
+    "Session closed. Most likely the page has been closed.",
+    "Protocol error (Runtime.callFunctionOn): Session closed",
+    "page.goto: net::ERR_CONNECTION_REFUSED at https://gemini.google.com/app",
+    "Execution context was destroyed, most likely because of a navigation",
+    "browser has been closed",
+    "waiting for selector \"gem-menu-item\" failed: timeout 5000ms exceeded",
+    "Chrome CDP failed to become ready on port 9222 within 15s (mode: headless)",
+  ]) {
+    const c = classifyFailure(new Error(m));
+    assert.equal(c.category, "transient", `"${m}" must be transient, got ${c.category}`);
+    assert.equal(c.rotatable, true, `"${m}" must be rotatable`);
+    assert.equal(c.parkedReason, null, `"${m}" must not park`);
+    assert.equal(c.cooldownMs, 0);
+  }
+
+  // A nav-error page text is NOT model proof: bare "недоступна" without
+  // model context must not park 6h as model-unavailable.
+  const navErr = classifyFailure(new Error("navigation failed: страница недоступна"));
+  assert.notEqual(navErr.category, "model-unavailable");
+  assert.equal(navErr.parkedReason, null);
+
+  // DOM-proven signs still classify as before: upsell/lock → model-locked
+  // (no park, lockedModels entry); missing item → model-unavailable + 6h.
+  const locked = new ModelUnavailable("model", "argon locked: paid upgrade required");
+  locked.isLocked = true;
+  locked.lockedModel = "argon";
+  const cLocked = classifyFailure(locked);
+  assert.equal(cLocked.category, "model-locked");
+  assert.equal(cLocked.parkedReason, null);
+
+  const missing = new ModelUnavailable("model", "argon not in picker");
+  const cMissing = classifyFailure(missing);
+  assert.equal(cMissing.category, "model-unavailable");
+  assert.equal(cMissing.parkedReason, "model-unavailable");
+  assert.equal(cMissing.cooldownMs, 6 * 3600_000);
+
+  const ruMissing = classifyFailure(new Error("модель временно недоступна для этого аккаунта"));
+  assert.equal(ruMissing.category, "model-unavailable");
+  assert.equal(ruMissing.cooldownMs, 6 * 3600_000);
+
+  // transient-retry → repeat → error-to-caller: N identical driver failures
+  // never produce parkedReason, so runPrompt rotates within maxAttempts and
+  // then throws to the caller — the account stays unparked throughout.
+  for (let i = 0; i < 5; i++) {
+    const c = classifyFailure(new Error("page.waitForSelector: Timeout 8000ms exceeded."));
+    assert.equal(c.parkedReason, null, `attempt ${i + 1} must not park`);
+    assert.equal(c.untilMs, 0, `attempt ${i + 1} must not cool down`);
+  }
+});

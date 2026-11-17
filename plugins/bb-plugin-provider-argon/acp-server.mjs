@@ -517,6 +517,15 @@ export function isBbSystemInstructionsBlock(block) {
 
 /* ---------- classify failure (§3.3) ---------- */
 
+// PLUG-286: driver/page faults — selector and navigation timeouts, page
+// crashes, CDP/network drops — are transient browser-session failures, never
+// DOM proof that the model is missing. They are rotatable so the turn
+// retries on the next account inside the deadline, and parkedReason stays
+// null so a repeat surfaces to the caller without parking the account
+// (previously such errors could land on 6h model-unavailable).
+const DRIVER_TRANSIENT_RE =
+  /timeout|timed out|waiting for selector|waiting failed|target (?:closed|crashed|destroyed)|session closed|protocol error|websocket|connection (?:closed|refused|reset)|net::err_|navigation (?:failed|timeout)|frame (?:was )?detached|execution context (?:was destroyed|is not available)|inspected target navigated|browser (?:has been |was )?closed|page crashed|econnrefused|econnreset|socket hang up|failed to become ready|did not start within/i;
+
 export function classifyFailure(err, authHint = null) {
   const message = (err?.message || String(err || "")).trim();
 
@@ -534,12 +543,13 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 2. transient (including timeout cap)
+  // 2. transient (stream caps + driver/page faults, PLUG-286)
   if (
     /generation still running after (?:540|900|\d+)s cap|stream_timeout|argon_stream_timeout|hung page|stalled generation/i.test(
       message
     ) ||
-    (err && err.code === "ARGON_STREAM_TIMEOUT")
+    (err && (err.code === "ARGON_STREAM_TIMEOUT" || err.name === "TimeoutError")) ||
+    DRIVER_TRANSIENT_RE.test(message)
   ) {
     return {
       category: "transient",
@@ -591,10 +601,17 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 5. model-unavailable
+  // 5. model-unavailable — DOM proof only (PLUG-286): the driver raises
+  // ModelUnavailable (code) solely on proven absence — item missing from the
+  // picker, level disabled/locked, upsell dialog confirmed by the §3.4
+  // predicate. The text branch is a fallback for those same errors: a bare
+  // "недоступна" without model context (e.g. a nav-error page) is not proof
+  // and falls through to default transient.
   if (
     (err && err.code === "ARGON_MODEL_UNAVAILABLE") ||
-    /modelunavailable|model is unavailable|not available for this account|недоступна/i.test(message)
+    /(?:model|thinking)[- ]?unavailable|model is unavailable|not available for this account|модел\w*[^.\n]{0,40}недоступн|недоступн\w*[^.\n]{0,40}модел|недоступн\w* для (?:этого|вашего) аккаунта/i.test(
+      message
+    )
   ) {
     return {
       category: "model-unavailable",

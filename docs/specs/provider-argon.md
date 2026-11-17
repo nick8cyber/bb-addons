@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-17
-revision: 17
+revision: 18
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -175,8 +175,22 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   1. **`auth-dead`** (`CooldownMs = 7 * 24 * 3600_000`): `"not logged in"`, `"Sign in"`, `"Войти"`, `"check login status"`.
   2. **`model-locked`** (`CooldownMs = 0`, `rotatable: true`): ошибка `err.isLocked` детектора замка §3.4 (вид `<model> locked: paid upgrade required`). Не накладывает временной кулдаун на аккаунт, записывает `lockedModels: [<lockedModel>]` (и `tier: "pro"` при `carbon`) в состояние аккаунта, и немедленно инициирует прозрачную ротацию на следующий аккаунт.
   3. **`rate-limit`** (`CooldownMs = parsedResetMs || 30 * 60_000`): `"rate-limit"`, `"rate limit"`, `"quota"`, `"limit resets"`, `"thinking level unavailable"`, `"thinking level is rate-limited"`, `"try again later"`, `"too many requests"`, `"лимит"`, `"повторите попытку позже"`.
-  4. **`model-unavailable`** (`CooldownMs = 6 * 3600_000`): `"modelunavailable"`, `"model is unavailable"`, `"not available for this account"`, `"недоступна"` — **только по DOM-доказательству**: драйвер бросает `ModelUnavailable` (`code = "ARGON_MODEL_UNAVAILABLE"`) лишь когда пункт реально отсутствует в меню выбора, уровень отключён/залочен, или есть апсейл-диалог. Сбои селекторов, таймауты `waitForSelector`, ошибки навигации/клика в `selectModelAndThinking` при `strict` **пробрасываются как есть** (`throw err`) и классифицируются как `transient` — аккаунт не паркуется (PLUG-286: раньше catch-all заворачивал их в `ModelUnavailable` → 6 ч кулдауна по ложному поводу).
-  5. **`transient`** (без кулдауна аккаунта, но с попыткой переключения на другой свободный аккаунт в рамках текущего хода): сетевые/CDP сбои, таймаут ожидания генерации.
+  4. **`model-unavailable`** (`CooldownMs = 6 * 3600_000`, `parkedReason: "model-unavailable"`): `err.code === "ARGON_MODEL_UNAVAILABLE"`, `"(model|thinking)[- ]unavailable"`, `"model is unavailable"`, `"not available for this account"`, `недоступн…` **только в контексте модели** (`модел… недоступн`, `недоступн… модел`, `недоступн… для этого/вашего аккаунта`) — **только по DOM-доказательству**: драйвер бросает `ModelUnavailable` (`code = "ARGON_MODEL_UNAVAILABLE"`) лишь когда пункт реально отсутствует в меню выбора, уровень отключён/залочен, или есть апсейл-диалог. Сбои селекторов, таймауты `waitForSelector`, ошибки навигации/клика в `selectModelAndThinking` при `strict` **пробрасываются как есть** (`throw err`) и классифицируются как `transient` — аккаунт не паркуется (PLUG-286: раньше catch-all заворачивал их в `ModelUnavailable` → 6 ч кулдауна по ложному поводу). Голое `недоступна` без контекста модели (навигационная ошибка вида «страница недоступна») вердиктом `model-unavailable` не является: до PLUG-286 любое вхождение слова в текст ошибки парковало здоровый аккаунт на 6 ч.
+  5. **`transient`** (без кулдауна аккаунта и без `parkedReason`, но с попыткой переключения на другой свободный аккаунт в рамках текущего хода): сетевые/CDP сбои, таймаут ожидания генерации, **сбои драйвера и страницы** (PLUG-286 — `DRIVER_TRANSIENT_RE` и `err.name === "TimeoutError"`): таймауты селекторов и навигации (`waitForSelector`, `waiting for selector`, `navigation failed/timeout`), крэш страницы и браузера (`Target crashed`, `page crashed`, `Session closed`, `browser closed`), сетевые отказы (`net::ERR_*`, `ECONNREFUSED`/`ECONNRESET`, `socket hang up`, `protocol error`, `websocket`), разрушение execution context при навигации, неготовность CDP-порта (`failed to become ready`). Ротация и есть «короткий ретрай в рамках дедлайна»: при повторе до исчерпания `maxAttempts` вызывающему возвращается исходная ошибка, а аккаунт не паркуется и в кулдаун не уходит.
+  6. **`transient` по умолчанию** (`rotatable: false`): любая прочая ошибка — без парка и кулдауна, но и без ротации: вызывающему возвращается сразу.
+- Матрица классификации сбоев (PLUG-286) — источник признака и эффект на аккаунт:
+
+  | Признак отказа | Источник признака | Вердикт | `parkedReason` / кулдаун | Ротация |
+  |---|---|---|---|---|
+  | `authHint` / «not logged in», «sign-in», «войти» | DOM/проверка логина | `auth-dead` | `auth-dead`, 7 сут | да |
+  | Иконка замка в пункте меню; апсейл-диалог с план-CTA (предикат §3.4) | DOM | `model-locked` | нет; `lockedModels += model` | да |
+  | Текст квоты/лимита (`rate limit`, `quota`, `Limit resets …`, `лимит`) | DOM-текст меню | `rate-limit` | нет; кулдаун до reset (≤ 7 сут) | да |
+  | Пункт отсутствует в меню выбора, уровень отключён/залочен, апсейл-диалог | DOM | `model-unavailable` | `model-unavailable`, 6 ч | да |
+  | Таймаут селектора/навигации, `TimeoutError`, крэш страницы, CDP/network-сбой | сбой драйвера | `transient` | нет | да |
+  | Таймаут ожидания генерации (stream cap, `hung page`) | сбой драйвера | `transient` | нет | да |
+  | Любая прочая ошибка | — | `transient` (default) | нет | нет — сразу вызывающему |
+
+  Правило PLUG-286: ни один таймаут или сбой страницы не даёт `model-unavailable` без DOM-признака; `model-unavailable` ставится только по DOM-доказательству.
 - Итоговый кулдаун ограничен потолком 7 суток: `Math.min(cooldownMs, 7 * 86_400_000)`.
 - Разбор времени сброса квоты `parseResetTimeMs(msg, nowMs)` поддерживает:
   - английские форматы: `"Limit resets 2:19 AM"`, `"Limit resets at 14:30"`, `"Limit resets tomorrow at 11:00 AM"`, `"Limit resets Oct 15, 2:19 AM"`, `"Limit resets on Nov 16, 11:00 PM"`;
@@ -313,6 +327,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   12. Интеграция `sendPrompt` с фиксацией лимитов в `finally` (вызов как при успешном ответе, так и при сбое/rate-limit хода, отсутствие зависания при медленном или зависшем `captureUsageLimits`, проброс `backend.tier`) (§4.4).
   13. Точный предикат замка и ops-очистку `lockedModels` (PLUG-282): `menuItemHasLockIcon` на DOM-фикстурах — видимый замок по каждому каналу (innerText/data-mat-icon-name/aria-label/class-токен) детектится, `'unlock'`/`'lock_open'`/`'mat-icon-lock-reset'`/скрытая иконка — нет; `upsellDialogConfirmsLock` — промо с ценой без план-CTA не замок и не дисмиссится, диалог с `Сменить план` — замок с дисмиссом, скрытый диалог игнорируется, помеченный `data-argon-pre-click` диалог с CTA — не замок, вызовы без аргумента берут `globalThis.document` и не падают без него; e2e `selectModelAndThinking` — пункт с иконкой `unlock` кликается, промо-попап после клика не лочит, диалог-отклик с CTA лочит (`isLocked`/`lockedModel`), предсуществующий CTA-промо не лочит, выбравшаяся модель гасит замок; ops `node acp-server.mjs unlock <id|all> [model]` — точечное снятие модели, `all`, восстановление `tier` при снятии `carbon`, кулдаун и `parkedReason` не трогаются.
   14. Вырезание bb-контекста `<system_instructions>` из `session/prompt` (PLUG-285): предикат `isBbSystemInstructionsBlock` по началу текста с `trimStart`, отбрасывание таких блоков до склейки, сохранение метки внутри пользовательского текста и не-text блоков, edge «только контекст» → немедленный `end_turn` без аренды.
+  15. Честную классификацию сбоев драйвера (PLUG-286): таймаут `waitForSelector` и `TimeoutError` по имени ошибки, крэш страницы/браузера, CDP и сетевые отказы → `transient` с `rotatable: true`, `parkedReason: null`, без кулдауна; «страница недоступна» без контекста модели — не `model-unavailable`; DOM-доказательства сохраняются (замок/апсейл → `model-locked`, отсутствие пункта в меню → `model-unavailable` 6 ч); повторные transient-сбои не паркуют аккаунт — исходная ошибка уходит вызывающему.
 - Набор `tests/provider-web-gemini-tools.test.mjs` (47 тестов, офлайн) покрывает инструменты чтения веб-Gemini по спеке `provider-web-gemini-tools.md`: разбор текстового протокола вызовов инструментов, sandbox `cwd` (запрет `..`, абсолютных путей и симлинков наружу, чёрный список чувствительных файлов), белый список `git`-команд, маскировку секретов `[скрыто: <тип>]`, раунды tool-loop и лимит `ARGON_MAX_TOOL_ROUNDS`, упаковку первого сообщения (вложения файлов/тредов/задач, потолок `ARGON_MAX_MESSAGE_BYTES`).
 
 ---
