@@ -2602,6 +2602,18 @@ test("19. PLUG-291: uploads/downloads — collectUploadFiles, pruneDir, spill ho
   const errMany = collectUploadFiles(many, sess);
   assert.ok(errMany.error && /too many upload files/.test(errMany.error));
 
+  // Лимит — после дедупликации: 6 блоков на один файл не считаются 6 файлами.
+  const dupMany = [];
+  for (let i = 0; i < 6; i++) dupMany.push({ type: "resource_link", uri: `file://${f1}` });
+  const okDup = collectUploadFiles(dupMany, sess);
+  assert.ok(!okDup.error, `dup blocks must dedup before count limit: ${okDup.error}`);
+  assert.deepEqual(okDup.files, [fs.realpathSync(f1)]);
+
+  // Относительный path блока резолвится от cwd сессии, не от process.cwd().
+  const okRel = collectUploadFiles([{ type: "localFile", path: "notes.txt" }], sess);
+  assert.ok(!okRel.error, `relative path must resolve against session cwd: ${okRel.error}`);
+  assert.deepEqual(okRel.files, [fs.realpathSync(f2)]);
+
   // Симлинк внутри cwd → наружу: realpath вне корней → отказ.
   const linkInside = path.join(cwd, "link-out.txt");
   try {

@@ -1294,37 +1294,6 @@ function fileCandidates(text, cwd, seen, out) {
   }
 }
 
-function linkCandidates(resourceLinks, cwd, seen, out) {
-  if (!cwd) return;
-  for (const link of resourceLinks) {
-    const uri = String(link?.uri ?? link ?? "");
-    if (!uri.startsWith("file://")) continue;
-    let abs;
-    try {
-      abs = decodeURIComponent(new URL(uri).pathname);
-    } catch {
-      continue;
-    }
-    const r = resolveInCwd(cwd, abs);
-    if (!r.abs) continue;
-    try {
-      if (!fs.statSync(r.abs).isFile()) continue;
-    } catch {
-      continue;
-    }
-    const rel = path.relative(r.base, r.abs);
-    if (isSensitivePath(rel)) continue;
-    const key = `file:${rel}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({
-      block: `file: ${rel}`,
-      hint: `read_file("${rel}")`,
-      fetch: () => executeTool({ name: "read_file", args: { path: rel }, attrs: [["path", rel]] }, { cwd }),
-    });
-  }
-}
-
 export const GIT_DIFF_DENY_PATHSPECS = [
   ":(exclude).env*",
   ":(exclude)*/.env*",
@@ -1368,7 +1337,6 @@ function writeSpillPackage(spillDir, spillId, content) {
 export function packFirstMessage({
   text,
   cwd = null,
-  resourceLinks = [],
   embeddedResources = [],
   maxBytes = MAX_MESSAGE_BYTES,
   maxRounds = MAX_TOOL_ROUNDS,
@@ -1436,7 +1404,6 @@ export function packFirstMessage({
     });
   }
 
-  linkCandidates(resourceLinks, cwd, seen, candidates);
   if (cwd) fileCandidates(text, cwd, seen, candidates);
 
   // Треды: <t>hr_…, @thread:<t>hr_…, …/threads/<t>hr_…[#msg=N].

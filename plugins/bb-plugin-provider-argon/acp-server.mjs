@@ -633,16 +633,14 @@ export function collectUploadFiles(promptBlocks, s) {
   }
   const maxCount = argonMaxUploadCount();
   const maxBytes = argonMaxUploadBytes();
-  if (cands.length > maxCount) {
-    return {
-      error: `too many upload files: ${cands.length} exceeds limit ${maxCount} (ARGON_MAX_UPLOAD_COUNT)`,
-    };
-  }
   const roots = uploadRootsFor(s);
+  // Относительные path из блоков (image/localFile) резолвятся от cwd
+  // сессии, а не от process.cwd() сервера.
+  const base = (s && typeof s.cwd === "string" && s.cwd.trim()) || ".";
   const out = [];
   const seen = new Set();
   for (const raw of cands) {
-    const abs = resolve(raw);
+    const abs = resolve(base, raw);
     let st;
     try {
       st = statSync(abs);
@@ -669,6 +667,13 @@ export function collectUploadFiles(promptBlocks, s) {
     }
     if (seen.has(real)) continue;
     seen.add(real);
+    // Лимит считается по уникальным файлам после дедупликации:
+    // N блоков на один и тот же файл — это один файл.
+    if (out.length >= maxCount) {
+      return {
+        error: `too many upload files: exceeds limit ${maxCount} (ARGON_MAX_UPLOAD_COUNT)`,
+      };
+    }
     out.push(real);
   }
   return { files: out };
@@ -1212,7 +1217,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         sessionUpdate: "agent_message_chunk",
         content: {
           type: "resource_link",
-          uri: `file://${f.path}`,
+          uri: `file://${encodeURI(f.path)}`,
           name: f.name || basename(f.path),
           ...(f.mimeType ? { mimeType: f.mimeType } : {}),
         },
@@ -1292,13 +1297,16 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         : webTools.packFirstMessage({
             text,
             cwd: s.cwd,
-            resourceLinks: attachments.resourceLinks ?? [],
             embeddedResources: attachments.embeddedResources ?? [],
             // PLUG-291: материалы сверх лимита первого сообщения уходят
             // .md-файлом в uploads/ и прикладываются как веб-вложение.
             spillDir: UPLOADS_DIR,
             spillId: sessionId,
           });
+      // Spill-пакет идёт сверх ARGON_MAX_UPLOAD_COUNT и без проверки
+      // ARGON_MAX_UPLOAD_BYTES: это наш сгенерированный .md с материалами
+      // задачи, его доставка обязательна; лимиты выше — про пользовательские
+      // пути на валидации collectUploadFiles.
       if (packed.spilledFile) uploadFiles.push(packed.spilledFile);
 
       while (true) {
@@ -1578,7 +1586,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             ? {
                 attachments: turnFiles.map((f) => ({
                   type: "resource_link",
-                  uri: `file://${f.path}`,
+                  uri: `file://${encodeURI(f.path)}`,
                   name: f.name || basename(f.path),
                   ...(f.mimeType ? { mimeType: f.mimeType } : {}),
                 })),
@@ -1828,17 +1836,10 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
         return;
       }
-      // §5 + PLUG-291: приложенные ресурсы ACP (embeddedContext) — ссылки и
+      // §5 + PLUG-291: приложенные ресурсы ACP (embeddedContext) —
       // встроенные текстовые ресурсы идут во вложения первого сообщения.
-      // file:// ссылки исключены: они уходят веб-вложением через upload,
-      // а не дублируются текстом в insertText.
-      const resourceLinks = p.prompt.filter(
-        (b) =>
-          b &&
-          b.type === "resource_link" &&
-          typeof b.uri === "string" &&
-          !b.uri.startsWith("file://"),
-      );
+      // resource_link обрабатывается только как file:// (collectUploadFiles
+      // ниже) — URL и не-файловые ссылки в материалы не вкладываются.
       const embeddedResources = p.prompt.filter(
         (b) => b && b.type === "resource" && b.resource && typeof b.resource.text === "string",
       );
@@ -1851,7 +1852,6 @@ export function dispatch(msg) {
         return;
       }
       void runPrompt(msg.id, p.sessionId, text, {
-        resourceLinks,
         embeddedResources,
         uploadFiles: upload.files,
       });

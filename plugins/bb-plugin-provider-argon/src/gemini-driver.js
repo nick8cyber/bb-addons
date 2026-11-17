@@ -1811,6 +1811,11 @@ async function collectGeneratedFiles(page, opts = {}) {
   const skipNote = (name, reason) =>
     skipped.push({ name: String(name || 'file').slice(0, 120), reason: String(reason).slice(0, 160) });
 
+  // Потолок попыток: длинный хвост неудачных кандидатов по ~15–25с
+  // таймаутов не должен растягивать ход на минуты (ревью PLUG-291).
+  const attemptBudget = Math.max(8, maxCount * 2);
+  let tries = 0;
+
   const tryDownloadByClick = async (c, fallbackName) => {
     const el = await safeQuery(page, `[data-argon-dl="${c.tag}"]`);
     if (!el) {
@@ -1860,6 +1865,11 @@ async function collectGeneratedFiles(page, opts = {}) {
         return { files, skipped };
       }
     }
+    if (tries >= attemptBudget) {
+      skipNote(c.name || c.href || 'file', `attempt budget (${attemptBudget})`);
+      continue;
+    }
+    tries += 1;
     if (c.kind === 'link') {
       let done = false;
       try {
