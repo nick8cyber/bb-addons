@@ -128,7 +128,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 - `classifyFailure(err)` относит ошибку к одной из категорий:
   1. **`auth-dead`** (`CooldownMs = 7 * 24 * 3600_000`): `"not logged in"`, `"Sign in"`, `"Войти"`, `"check login status"`.
   2. **`rate-limit`** (`CooldownMs = parsedResetMs || 30 * 60_000`): `"rate-limit"`, `"rate limit"`, `"quota"`, `"limit resets"`, `"thinking level unavailable"`, `"thinking level is rate-limited"`, `"try again later"`, `"too many requests"`, `"лимит"`, `"повторите попытку позже"`.
-  3. **`model-unavailable`** (`CooldownMs = 6 * 3600_000`): `"modelunavailable"`, `"model is unavailable"`, `"not available for this account"`, `"недоступна"`.
+  3. **`model-unavailable`** (`CooldownMs = 6 * 3600_000`): `"modelunavailable"`, `"model is unavailable"`, `"not available for this account"`, `"недоступна"` — **только по DOM-доказательству**: драйвер бросает `ModelUnavailable` (`code = "ARGON_MODEL_UNAVAILABLE"`) лишь когда пункт реально отсутствует в меню выбора, уровень отключён/залочен, или есть апсейл-диалог. Сбои селекторов, таймауты `waitForSelector`, ошибки навигации/клика в `selectModelAndThinking` при `strict` **пробрасываются как есть** (`throw err`) и классифицируются как `transient` — аккаунт не паркуется (PLUG-286: раньше catch-all заворачивал их в `ModelUnavailable` → 6 ч кулдауна по ложному поводу).
   4. **`transient`** (без кулдауна аккаунта, но с попыткой переключения на другой свободный аккаунт в рамках текущего хода): сетевые/CDP сбои, таймаут ожидания генерации.
 - Итоговый кулдаун ограничен потолком 7 суток: `Math.min(cooldownMs, 7 * 86_400_000)`.
 - Разбор времени сброса квоты `parseResetTimeMs(msg, nowMs)` поддерживает:
@@ -149,6 +149,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 ### 4.1 Надёжная вставка больших промптов и однократная отправка
 
 - Промпты ревью и аудита могут достигать 50–150 КБ и содержать тысячи строк.
+- **Гард размера промпта (PLUG-281):** при ~100 КБ и выше `execCommand('insertText')` в Chrome зависает, а таймаут последующего `waitForSelector` раньше ошибочно парковал здоровый аккаунт на 6 ч (`model-unavailable`). Поэтому размер проверяется заранее в байтах UTF-8: `ARGON_MAX_PROMPT_BYTES` (не задан → `100 * 1024`; `0`/отрицательное → без лимита; нечисловое значение → дефолт). Превышение — немедленная ошибка `ARGON_PROMPT_TOO_LARGE`: в `runPrompt` брос внутри `try` до `enqueue`/аренды (клиент получает `-32000`, лиз и кулдаун не затрагиваются; брос выше `try` недопустим — `void runPrompt()` без catch дал бы unhandled rejection и уронил процесс), в `sendPrompt` драйвера — до любой работы со страницей.
 - Вставка текста в редактор (`.ql-editor, div[contenteditable="true"], [role="textbox"]`):
   - Для текста длиной свыше 500 символов (или содержащего переводы строк) сначала выполняется быстрая вставка через `page.evaluate`: фокусировка редактора, очистка и `document.execCommand('insertText', false, text)`.
   - Если после `execCommand` длина текста в редакторе меньше ожидаемой (`gotText.length < Math.min(prompt.length * 0.9, prompt.length - 10)`), драйвер очищает поле и использует резервный `page.keyboard.insertText(prompt)`.

@@ -4,13 +4,12 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS, type DelegationRow } from "../src/store.js";
@@ -61,7 +60,7 @@ interface Repos {
  * `conflict: true` gives `work` a competing change to the same file.
  */
 function makeRepos(opts: { conflict?: boolean } = {}): Repos {
-  const base = mkdtempSync(join(tmpdir(), "merge-"));
+  const base = makeTempDir("merge-");
   const remote = join(base, "remote.git");
   execFileSync("git", ["init", "--bare", remote]);
   const coord = join(base, "coord");

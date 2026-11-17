@@ -7,6 +7,7 @@
 import { registerHooks } from "node:module";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { afterEach } from "node:test";
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -29,4 +30,27 @@ registerHooks({
     }
     return nextResolve(specifier, context);
   },
+});
+
+// Dynamic import: a static `import "./helpers/temp.js"` would resolve before
+// registerHooks() above runs, so the .js → .ts mapping must be in place first.
+// The module loads in every `--test` child process, so the hook and handlers
+// below apply to each test file's own temp dirs.
+const { cleanupTrackedTempDirs, cleanStaleTempDirs } = await import(
+  "./helpers/temp.js"
+);
+
+// Reap dirs a previous killed/crashed run left behind before this run adds
+// new ones.
+cleanStaleTempDirs();
+
+afterEach(cleanupTrackedTempDirs);
+process.on("exit", cleanupTrackedTempDirs);
+process.on("SIGINT", () => {
+  cleanupTrackedTempDirs();
+  process.exit(130);
+});
+process.on("SIGTERM", () => {
+  cleanupTrackedTempDirs();
+  process.exit(143);
 });

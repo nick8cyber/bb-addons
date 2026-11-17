@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS, type DelegationRow } from "../src/store.js";
@@ -2349,7 +2349,7 @@ const git = (repo: string, args: string[]) =>
   execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 
 function makeExecutorRepo(opts: { commits?: number; dirty?: boolean } = {}) {
-  const repo = mkdtempSync(join(tmpdir(), "round-"));
+  const repo = makeTempDir("round-");
   execFileSync("git", ["init", repo]);
   git(repo, ["config", "user.email", "a@b.c"]);
   git(repo, ["config", "user.name", "T"]);

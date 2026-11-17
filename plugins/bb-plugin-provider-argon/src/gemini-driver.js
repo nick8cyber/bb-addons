@@ -377,6 +377,26 @@ class ModelUnavailable extends Error {
   }
 }
 
+// PLUG-281: >~100KB prompts hang execCommand('insertText') — fail fast before
+// any page work. Unset → 100KB default; non-positive env → no limit.
+function argonMaxPromptBytes() {
+  const raw = process.env.ARGON_MAX_PROMPT_BYTES;
+  if (raw == null || raw === '') return 100 * 1024;
+  const v = Number(raw);
+  // NaN/garbage → default; non-positive → explicit "no limit".
+  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100 * 1024;
+}
+
+function throwIfPromptTooLarge(prompt) {
+  const bytes = Buffer.byteLength(prompt || '', 'utf8');
+  const limit = argonMaxPromptBytes();
+  if (bytes > limit) {
+    const err = new Error(`prompt too large: ${bytes} bytes > ARGON_MAX_PROMPT_BYTES (${limit})`);
+    err.code = 'ARGON_PROMPT_TOO_LARGE';
+    throw err;
+  }
+}
+
 async function selectModelAndThinking(page, model, thinking, strict = false) {
   const isMenuOpen = async () => {
     const menu = await page.$('gem-menu[role="menu"], [role="menuitem"]');
@@ -465,9 +485,10 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
     } catch (err) {
       if (err instanceof ModelUnavailable) throw err;
       if (strict) {
-        // Any failure — missing button, menu that never opened, dead click —
-        // means "can't guarantee the requested model": fail the send.
-        throw new ModelUnavailable('model', err.message);
+        // PLUG-286: selector/timeout/navigation failures are NOT DOM proof
+        // the model is missing — rethrow as-is so the pool sees a transient
+        // error instead of parking the account 6h as model-unavailable.
+        throw err;
       }
       console.warn(`[gemini-driver] Failed to select model "${model}":`, err.message);
       await page.keyboard.press('Escape').catch(() => {});
@@ -574,7 +595,9 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
     } catch (err) {
       if (err instanceof ModelUnavailable) throw err;
       if (strict) {
-        throw new ModelUnavailable('thinking', err.message);
+        // PLUG-286: same as model selection — timeouts/navigation stay
+        // transient; ModelUnavailable is only thrown on DOM-proven absence.
+        throw err;
       }
       console.warn(`[gemini-driver] Failed to select thinking level "${thinking}":`, err.message);
       await page.keyboard.press('Escape').catch(() => {});
@@ -665,6 +688,7 @@ async function sendPrompt({
   shouldCancel = null
 }) {
   const isStrict = Boolean(strict || strictModel);
+  throwIfPromptTooLarge(prompt);
   const promptPrefix = prompt.replace(/\s+/g, ' ').trim().slice(0, 40);
   // Port-local: never read the module-global CDP_PORT here. A cancelled send
   // finishing after the queue moved on must still only touch its own backend.

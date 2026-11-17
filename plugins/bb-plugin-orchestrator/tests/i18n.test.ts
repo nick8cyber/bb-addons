@@ -4,13 +4,12 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import { fileURLToPath } from "node:url";
 import {
   createFakePluginHost,
@@ -131,7 +130,7 @@ test("§18.1: renderPrePush(ru) is the shipped source; en is versioned", () => {
 });
 
 test("§18.1: syncInstalledPrePush rewrites an installed hook on language change", () => {
-  const dir = mkdtempSync(join(tmpdir(), "orch-hook-"));
+  const dir = makeTempDir("orch-hook-");
   const hookPath = join(dir, "pre-push");
   writeFileSync(hookPath, renderPrePush(createT("en")));
   assert.equal(syncInstalledPrePush(dir, createT("en")), false);
@@ -166,7 +165,7 @@ function installWrappers(dir: string, prePush: Buffer) {
 }
 
 test("§22.1 (ревью): syncInstalledGateHooks кладёт leak-scan.ts рядом с установленным pre-commit", () => {
-  const dir = mkdtempSync(join(tmpdir(), "orch-scan-"));
+  const dir = makeTempDir("orch-scan-");
   // A pre-r33.1 install: the gate is there, the scanner module is not.
   cpSync(join(pluginDir, "hooks", "pre-commit"), join(dir, "pre-commit"));
   assert.equal(syncInstalledGateHooks(dir, T_RU), true);
@@ -179,13 +178,13 @@ test("§22.1 (ревью): syncInstalledGateHooks кладёт leak-scan.ts ря
   assert.equal(syncInstalledLeakScan(dir), true);
   assert.equal(syncInstalledGateHooks(dir, T_RU), false);
   // No installed pre-commit → nothing to drop the scanner for.
-  const bare = mkdtempSync(join(tmpdir(), "orch-scan-none-"));
+  const bare = makeTempDir("orch-scan-none-");
   assert.equal(syncInstalledLeakScan(bare), false);
   assert.equal(existsSync(join(bare, "leak-scan.ts")), false);
 });
 
 test("§22.1 (ревью): assertInstalledHookFresh чинит leak-scan.ts на месте, а не отказывает", () => {
-  const dir = mkdtempSync(join(tmpdir(), "orch-scan-fresh-"));
+  const dir = makeTempDir("orch-scan-fresh-");
   installWrappers(dir, renderPrePush(T_RU));
   const deps = () =>
     ({
@@ -211,7 +210,7 @@ test("§18.1 (ревью PLUG-247a п.7): a language change via settings.onChang
     // Own dataDir — the SDK default is a fixed /tmp path shared by every
     // test process: a parallel host's startup syncInstalledPrePush would
     // rewrite the same installed pre-push mid-assertion.
-    dataDir: mkdtempSync(join(tmpdir(), "orch-i18n-")),
+    dataDir: makeTempDir("orch-i18n-"),
     settings: {
       policy:
         '{"version":1,"levels":{"simple":{"chain":["s"]}},"routes":{"s":{"preset":"s","provider":"p"}}}',

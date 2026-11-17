@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
@@ -676,7 +676,7 @@ test("§4.1 r28: a reissue of a no_code row dispatches the line too", async () =
 // ── §22.1 (ревью): снимок leaks — при загрузке и сохранении настроек ────
 
 test("§22.1 (ревью): загрузка и сохранение настроек пишут orchestrator-leaks.json", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "snaprepo-"));
+  const repo = makeTempDir("snaprepo-");
   execFileSync("git", ["init", repo]);
   const release = (allow: string[]) =>
     JSON.stringify({ projects: { proj_repo: { leaks: { allow } } } });

@@ -4,15 +4,14 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import { execFileSync, spawn } from "node:child_process";
 import Database from "better-sqlite3";
 import { DelegationStore, JanitorStore, MIGRATIONS } from "../src/store.js";
@@ -96,7 +95,7 @@ const CFG = (over: Record<string, unknown> = {}) =>
 
 /** A repo: bare origin + one checkout on `main`, envs are its worktrees. */
 function makeRepo(prefix = "jan-") {
-  const base = mkdtempSync(join(tmpdir(), prefix));
+  const base = makeTempDir(prefix);
   const origin = join(base, "origin.git");
   const repo = join(base, "repo");
   execFileSync("git", ["init", "--bare", origin]);
@@ -797,7 +796,7 @@ test("a delegation in dispatching/running keeps the env", async () => {
 
 test("defaultHasProcessIn matches a live process through a symlinked path", async (t) => {
   if (!existsSync("/proc")) return t.skip("/proc not available");
-  const dir = mkdtempSync(join(tmpdir(), "jan-proc-"));
+  const dir = makeTempDir("jan-proc-");
   const real = join(dir, "real");
   mkdirSync(real);
   const link = join(dir, "link");

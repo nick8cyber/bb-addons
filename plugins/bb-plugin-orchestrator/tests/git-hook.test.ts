@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import { writePushToken } from "../src/release.js";
 import {
   IP_VERSION_LIKE,
@@ -22,7 +22,7 @@ const SHA = "a".repeat(40);
 const OTHER = "b".repeat(40);
 
 function makeEnv(withLocalHook = false) {
-  const base = mkdtempSync(join(tmpdir(), "hookenv-"));
+  const base = makeTempDir("hookenv-");
   const hooksDir = join(base, "global-hooks");
   const repo = join(base, "repo");
   mkdirSync(hooksDir, { recursive: true });
@@ -167,7 +167,7 @@ test("hook: exclusions file skips the gate", () => {
 });
 
 test("f4/f6: installer inventory sees .bb worktrees, real --self-test run", () => {
-  const root = mkdtempSync(join(tmpdir(), "inv-"));
+  const root = makeTempDir("inv-");
   const wtRoot = join(root, ".bb", "plugins", "environment-git-worktree", "host-data", "worktrees", "x");
   mkdirSync(wtRoot, { recursive: true });
   execFileSync("git", ["init", wtRoot]);
@@ -208,7 +208,7 @@ const CHAIN_SRC = new URL("../hooks/chain", import.meta.url).pathname;
 const NAMES_SRC = new URL("../hooks/hook-names", import.meta.url).pathname;
 
 test("Б2/мелко9: installer covers every standard hook name; shared token dir", () => {
-  const root = mkdtempSync(join(tmpdir(), "install-"));
+  const root = makeTempDir("install-");
   const gd = join(root, "hooks");
   const gcfg = join(root, "gitconfig");
   execFileSync(
@@ -348,7 +348,7 @@ test("§17.3: hook-names covers every githooks(5) name incl. server side", () =>
 });
 
 test("§17.3 (PLUG-210): installer takes the token dir from `bb orchestrator hooks-dir`", () => {
-  const root = mkdtempSync(join(tmpdir(), "install-dir-"));
+  const root = makeTempDir("install-dir-");
   const pluginDir = join(root, "plugin-hooks");
   // a stub `bb` answering `orchestrator hooks-dir` with the plugin's dir
   const bbStub = join(root, "bb-stub");
@@ -373,7 +373,7 @@ test("§17.3 (PLUG-210): installer takes the token dir from `bb orchestrator hoo
 // ── ревью PLUG-214: без push-to-checkout, отказы установщика ──────────
 
 test("§17.3 (PLUG-214): install removes a stale push-to-checkout wrapper", () => {
-  const root = mkdtempSync(join(tmpdir(), "install-retire-"));
+  const root = makeTempDir("install-retire-");
   const gd = join(root, "hooks");
   mkdirSync(gd, { recursive: true });
   // a pre-fix install left the retired wrapper — the update must remove
@@ -394,7 +394,7 @@ test("§17.3 (PLUG-214): install removes a stale push-to-checkout wrapper", () =
 });
 
 test("§17.3 (PLUG-214): no --hooks-dir and no bb answer → refuse with a hint", () => {
-  const root = mkdtempSync(join(tmpdir(), "install-nodir-"));
+  const root = makeTempDir("install-nodir-");
   const r = spawnSync(
     "node",
     ["hooks/install.mjs", "--repos-root", join(root, "empty")],
@@ -410,7 +410,7 @@ test("§17.3 (PLUG-214): no --hooks-dir and no bb answer → refuse with a hint"
 });
 
 test("§17.3 (PLUG-214): a foreign global core.hooksPath refuses BEFORE copying", () => {
-  const root = mkdtempSync(join(tmpdir(), "install-hp-"));
+  const root = makeTempDir("install-hp-");
   const gd = join(root, "hooks");
   const gcfg = join(root, "gitconfig");
   writeFileSync(gcfg, "[core]\n\thooksPath = /other/hooks\n");
@@ -430,7 +430,7 @@ test("§17.3 (PLUG-214): a foreign global core.hooksPath refuses BEFORE copying"
 });
 
 test("§17.3 (PLUG-216): --self-test/--dry-run need no hooks-dir and no bb", () => {
-  const root = mkdtempSync(join(tmpdir(), "install-needless-"));
+  const root = makeTempDir("install-needless-");
   const env = {
     ...process.env,
     // a `bb` that cannot answer `orchestrator hooks-dir`, and a clean
@@ -457,7 +457,7 @@ test("§17.3 (PLUG-216): --self-test/--dry-run need no hooks-dir and no bb", () 
 // ── §22.1: общий хук `pre-commit` — утечки на staged diff ─────────────
 
 function makePcEnv(withLocalHook = false) {
-  const base = mkdtempSync(join(tmpdir(), "pcenv-"));
+  const base = makeTempDir("pcenv-");
   const hooksDir = join(base, "global-hooks");
   const repo = join(base, "repo");
   mkdirSync(hooksDir, { recursive: true });
