@@ -866,6 +866,10 @@ async function runPrompt(id, sessionId, text) {
               strictModel: true,
               signal: abortCtrl.signal,
               shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen,
+              backend: backend,
+              accountId: backend.id,
+              tier: backend.tier,
+              stateDir: STATE_DIR,
               onChunk: (c) => {
                 if (c && !s.cancelled && s.activeGen === gen) {
                   streamedAny = true;
