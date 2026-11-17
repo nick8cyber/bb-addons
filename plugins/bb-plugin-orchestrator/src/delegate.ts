@@ -227,6 +227,18 @@ export interface DelegateDeps {
   /** §2.2 git rules, read fresh at dispatch so edits and reissues see the
    * current setting (the server resolves built-in values to `language`). */
   gitInstructions?: () => string | undefined;
+  /** §20.2 (r33): clock override for tests. */
+  now?: () => number;
+  /** §2.3 r24: parsed policy for the level→role map; absent = name rule. */
+  policy?: () => Policy | null;
+  /** §20.2 (r33): routes the policy load marked unavailable. */
+  unavailableRoutes?: () => ReadonlySet<string>;
+  /** §20.2: the coordinator's repo path for the packet's git reads. */
+  repoPath?: (row: DelegationRow) => Promise<string | null>;
+  /** §20.2: `git -C <repo> …` for the packet (absent → `packet-repo`). */
+  packetGit?: PacketGit;
+  /** §20.2: release scanner masking over the packet text. */
+  packetMask?: MaskFn;
   /** §18.1: human-facing texts — the language catalog. */
   t?: T;
 }
@@ -642,7 +654,13 @@ export async function runDelegate(
         commentOnRefusal: true,
         from: params.from,
       },
-      { ...deps, policy: () => policy },
+      {
+        ...deps,
+        policy: () => policy,
+        unavailableRoutes: load.unavailableRoutes?.length
+          ? () => new Set(load.unavailableRoutes)
+          : deps.unavailableRoutes,
+      },
     );
   } catch (e) {
     // §5.3 rev 19: a synchronous refusal naming a removed model puts the

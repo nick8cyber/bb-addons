@@ -498,6 +498,10 @@ function makeDelegateDeps(
       roleByThreadId: (id) => store.threadRole(id)?.role,
     },
     primaryHostId: async () => "host_1",
+    now: overrides.now ?? (() => nowVal),
+    repoPath: overrides.repoPath ?? (async () => "/repo"),
+    packetGit: overrides.packetGit,
+    packetMask: overrides.packetMask,
   };
   const stepsDeps: DispatchStepsDeps = {
     store,
@@ -568,6 +572,35 @@ test("§20.3: the same preset on the auditor level is allowed (tool-less flag by
       return true;
     },
   );
+});
+
+test("PLUG-294: runDelegate on tool-less route with packetGit/repoPath succeeds without packet-repo", async () => {
+  const { git } = fakeGit({
+    diffStat: " a.ts | 2 +-\n",
+    diff: "DIFF_BODY",
+    files: { "src/a.ts": "FILE_CONTENT" },
+  });
+  const { deps, store, spawnArgs } = makeDelegateDeps({
+    packetGit: git,
+    repoPath: async () => "/repo",
+  });
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "review",
+      route: "argon-review",
+      from: "shaLINK",
+      attach: ["src/a.ts"],
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.status, "running");
+  assert.equal(store.threadRole("thr_exec")?.role, "auditor");
+  const prompt = String(spawnArgs[0]!.prompt);
+  assert.match(prompt, /МАТЕРИАЛ ДЛЯ ПРОВЕРКИ/);
+  assert.ok(prompt.includes("FILE_CONTENT"));
+  assert.ok(prompt.includes("DIFF_BODY"));
 });
 
 test("§20.2: --attach rejects paths escaping the repo", async () => {
