@@ -13,27 +13,36 @@ ACP-провайдер «Gemini (Argon)» (`acp-argon`) для bb поверх �
 - `playwright` или `playwright-core` (драйвер пробует сначала `playwright`, затем `playwright-core`);
 - Пул аккаунтов (`pool.json`) с авторизованными профилями.
 
-## Архитектура
+## Модели и возможности
 
-1. **`index.mjs`**: манифест плагина BB (`export default function plugin(bb)`), регистрация провайдера `acp-argon` с возможностями потоковой передачи (`supportsStreaming: true`), отмены (`supportsCancel: true`), уровнями рассуждений `low`, `medium`, `high`.
-2. **`acp-server.mjs`**: JSON-RPC 2.0 ACP-сервер (stdio). Управляет пулом аккаунтов (`pool.json`), файлом состояния и эксклюзивной аренды (`accounts-state.json`), разбором времени сброса квот, ротацией и корректным завершением с освобождением аренды при закрытии или `SIGTERM`.
-3. **`src/gemini-driver.js`**: веб-драйвер на базе CDP (`playwright` или `playwright-core`), надёжная вставка больших промптов через `execCommand('insertText')`, отслеживание многоходовых ответов строго через `findTurnTarget` без утечки предыдущего ответа, парковка вкладки на `about:blank` в простое для нулевой фоновой нагрузки CPU.
-4. **`src/profile-manager.js`**, **`bin/gemini.js`**, **`scripts/`**: утилиты ручного входа в аккаунты Google и управления пулом профилей.
+- **`Gemini 4 Argon`** (`argon`) — Код и анализ (модель по умолчанию).
+- **`Gemini 4 Carbon`** (`carbon`) — Самые сложные задачи (тариф Ultra).
+- **`Gemini 4 Hydrogen`** (`hydrogen`) — Повседневные дела.
+- **`Gemini 3.1 Pro`** (`pro`) — Исследования.
+- **`Gemini 3.5 Flash-Lite`** (`flash-lite`, псевдоним `fast`) — Быстрые ответы.
+- Уровни рассуждений (`thought_level`): **Low**, **Medium**, **High** (`low`, `medium`, `high`).
+- Потоковая передача чанков (`supportsStreaming: true`), отмена генерации (`supportsCancel: true`).
 
-## Настройка пула аккаунтов
+## Универсальная настройка пула аккаунтов
 
 Конфигурация пула задаётся файлом `pool.json` в каталоге состояния (`ARGON_POOL_FILE` или `~/.bb/plugins/provider-argon/pool.json`):
 
 ```json
 {
   "accounts": [
-    { "id": "acc1", "email": "user1@example.com", "profileDir": "~/.gemini-cli-profile", "cdpPort": 9222, "priority": 1 },
-    { "id": "acc2", "email": "user2@example.com", "profileDir": "~/.gemini-cli-profile-2", "cdpPort": 9223, "priority": 1 }
+    { "id": "acc1", "email": "user1@example.com", "profileDir": "~/.gemini-cli-profile", "cdpPort": 9222, "priority": 10, "tier": "pro" },
+    { "id": "acc2", "email": "user2@example.com", "profileDir": "~/.gemini-cli-profile-2", "cdpPort": 9223, "priority": 10, "tier": "ultra" }
   ]
 }
 ```
 
-Также поддерживается обратная совместимость со структурой каталогов `$ARGON_STATE_DIR/accounts/<label>/backend.json`.
+### Параметры аккаунтов:
+- `id`: уникальный идентификатор профиля/аккаунта;
+- `email`: контактный email (для информации);
+- `profileDir`: путь к каталогу профиля Chrome (`~/` раскрывается автоматически);
+- `cdpPort`: порт удалённой отладки Chrome CDP;
+- `tier`: тариф аккаунта — `"pro"` (по умолчанию) или `"ultra"`. Запросы к модели Carbon направляются строго на Ultra-аккаунты. При запросах к Argon Pro-аккаунты вызываются первыми, сохраняя квоту Ultra для Carbon;
+- `priority`: числовой приоритет аккаунта (по умолчанию `10`). Чем выше приоритет, тем раньше вызывается аккаунт. Значение `priority <= 0` полностью отключает аккаунт.
 
 **Выключение аккаунта — два действия**: удалить из `pool.json` И переименовать `accounts/<label>/backend.json` → `backend.json.disabled` (оба файла — независимые источники пула).
 
@@ -46,13 +55,16 @@ ACP-провайдер «Gemini (Argon)» (`acp-argon`) для bb поверх �
 - `ARGON_FAKE=1`: офлайн-режим заглушки для тестов протокола (без запуска Chrome и пула).
 - `ARGON_STATE_DIR`: путь к каталогу состояния (по умолчанию `~/.bb/plugins/provider-argon`).
 - `ARGON_POOL_FILE`: путь к файлу пула (по умолчанию `$ARGON_STATE_DIR/pool.json`).
-- `ARGON_BACKENDS`: JSON-массив описаний бэкендов в виде строки (альтернативный способ передачи пула через окружение).
+- `ARGON_BACKENDS`: JSON-массив описаний бэкендов в виде строки.
 - `ARGON_SEND_DEADLINE_MS`: таймаут генерации на ход (по умолчанию 1 200 000 мс — 20 минут).
 - `ARGON_MAX_PROMPT_BYTES`: потолок размера исходящего промпта в байтах UTF-8 (по умолчанию `100000` — ниже порога ~120 КБ, на котором Chrome виснет на `insertText`; `0`/отрицательное — без лимита). Превышение — немедленный отказ `prompt too large: … exceeds limit …` до выбора аккаунта и аренды, без кулдауна.
+- `ARGON_MAX_TOOL_ROUNDS`: потолок раундов инструментов чтения за ход (по умолчанию 8; spec `provider-web-gemini-tools`).
+- `ARGON_MAX_MESSAGE_BYTES`: потолок первого сообщения сессии с упакованными вложениями (по умолчанию 120 000 байт).
+- `ARGON_TOOL_TIMEOUT_MS`: таймаут одного вызова локального инструмента (по умолчанию 15 000 мс).
 - `GEMINI_MAX_WAIT_MS`: внутренний потолок ожидания стрима в драйвере (по умолчанию 900 000 мс — 15 минут).
 - `GEMINI_PARK_IDLE`: парковка вкладки на `about:blank` в простое (`1` по умолчанию, `0` для отключения).
 - `GEMINI_PROFILE_DIR`: путь к каталогу профиля Chrome для одиночного профиля по умолчанию.
-- `GEMINI_PROFILE`: имя или каталог профиля Chrome для одиночного профиля по умолчанию (резервный вариант, если не задан `GEMINI_PROFILE_DIR`; по умолчанию `~/.gemini-cli-profile`).
+- `GEMINI_PROFILE`: имя или каталог профиля Chrome для одиночного профиля по умолчанию (по умолчанию `~/.gemini-cli-profile`).
 - `GEMINI_CDP_PORT`: порт CDP для одиночного профиля по умолчанию (по умолчанию `9222`).
 - `ARGON_USE_BUNDLED=1`: принудительное использование встроенного `acp-server.mjs`.
 - `GEMINI_NO_AUTOSPAWN=1`: запрет авто-перезапуска Chrome — при несовпадении профиля или чужом/холодном CDP драйвер бросает ошибку вместо `stopChrome`/спауна. Обязательно для OS-пользователя, которому раздали пул по CDP (чужие браузеры не трогает).

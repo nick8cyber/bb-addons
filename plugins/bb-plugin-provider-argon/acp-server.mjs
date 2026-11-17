@@ -10,6 +10,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import * as webTools from "./src/web-tools.mjs";
 import {
   existsSync,
   mkdirSync,
@@ -21,6 +22,7 @@ import {
   renameSync,
   statSync,
   writeFileSync,
+  appendFileSync,
   constants,
 } from "node:fs";
 
@@ -67,6 +69,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profile: acc.profile || acc.id,
             cdp,
             priority: Number.isInteger(acc.priority) ? acc.priority : 10,
+            tier: acc.tier && acc.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
           });
         }
       }
@@ -97,6 +100,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profile: b.profile || ent.name,
             cdp,
             priority: Number.isInteger(b.priority) ? b.priority : 10,
+            tier: b.tier && b.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
           });
         } catch {}
       }
@@ -130,6 +134,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
               profile: b.profile || ent.name,
               cdp,
               priority: Number.isInteger(b.priority) ? b.priority : 10,
+              tier: b.tier && b.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
             });
           } catch {}
         }
@@ -153,6 +158,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profile: b.profile || null,
             cdp,
             priority: Number.isInteger(b.priority) ? b.priority : 10,
+            tier: b.tier && b.tier.toLowerCase() === "ultra" ? "ultra" : "pro",
           });
         }
       }
@@ -171,6 +177,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
       profile: "default",
       cdp: /^\d{2,5}$/.test(envCdp) ? envCdp : "9222",
       priority: 10,
+      tier: "pro",
     });
   }
 
@@ -302,7 +309,34 @@ const accEnsure = (state, id) => {
   return state.accounts[id];
 };
 
-function pickBackendFromState(state, excludeId, owner, now) {
+export function getAccountTier(b, state) {
+  if (!b) return "pro";
+  const e = accEntry(state, b.id);
+  if (e?.lockedModels && e.lockedModels.includes("carbon")) {
+    return "pro";
+  }
+  if (e?.tier) {
+    return e.tier.toLowerCase() === "ultra" ? "ultra" : "pro";
+  }
+  if (b?.tier) {
+    return b.tier.toLowerCase() === "ultra" ? "ultra" : "pro";
+  }
+  return "pro";
+}
+
+export function getAccountPriority(b, state) {
+  if (!b) return 10;
+  const e = accEntry(state, b.id);
+  if (typeof e?.priority === "number" && Number.isInteger(e.priority) && e.priority >= 0) {
+    return e.priority;
+  }
+  if (typeof b?.priority === "number" && Number.isInteger(b.priority) && b.priority >= 0) {
+    return b.priority;
+  }
+  return 10;
+}
+
+export function pickBackendFromState(state, excludeId, owner, now, requestedModel = null, backends = BACKENDS) {
   const isLeased = (b) => {
     const l = state.leases && state.leases[b.id];
     if (l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid)) {
@@ -312,15 +346,30 @@ function pickBackendFromState(state, excludeId, owner, now) {
     return e && (e.inUseUntilMs ?? 0) > now && e.owner !== owner ? e.inUseUntilMs : 0;
   };
 
-  const candidates = BACKENDS.filter((b) => b.id !== excludeId && b.priority > 0);
+  const req = requestedModel ? requestedModel.toLowerCase() : null;
+  const candidates = backends.filter((b) => {
+    const prio = getAccountPriority(b, state);
+    if (b.id === excludeId || prio <= 0) return false;
+    const tier = getAccountTier(b, state);
+    if (req === "carbon" && tier !== "ultra") return false;
+    if (req) {
+      const e = accEntry(state, b.id);
+      if (e?.lockedModels && e.lockedModels.includes(req)) {
+        return false;
+      }
+    }
+    return true;
+  });
   if (candidates.length === 0) return { none: true };
 
   const free = candidates.filter(
     (b) => (accEntry(state, b.id)?.cooldownUntilMs ?? 0) <= now && isLeased(b) === 0
   );
   if (free.length === 0) {
+    const maxCandidatePrio = Math.max(...candidates.map((b) => getAccountPriority(b, state)));
+    const topCandidates = candidates.filter((b) => getAccountPriority(b, state) === maxCandidatePrio);
     const soonest = Math.min(
-      ...candidates.map((b) => {
+      ...topCandidates.map((b) => {
         const freeAt = Math.max(isLeased(b), accEntry(state, b.id)?.cooldownUntilMs ?? 0);
         return freeAt > now ? freeAt : Infinity;
       })
@@ -331,14 +380,27 @@ function pickBackendFromState(state, excludeId, owner, now) {
       : { cooledUntil: soonest };
   }
 
-  const maxP = Math.max(...free.map((b) => b.priority));
-  const tier = free.filter((b) => b.priority === maxP);
-  tier.sort(
+  // Pick highest priority tier first
+  const maxP = Math.max(...free.map((b) => getAccountPriority(b, state)));
+  const topTier = free.filter((b) => getAccountPriority(b, state) === maxP);
+
+  // When not requesting carbon, "all other things being equal" (equal priorities):
+  // prefer Pro accounts first to reserve Ultra accounts for Carbon
+  let eligibleTier = topTier;
+  if (req !== "carbon") {
+    const proAccounts = topTier.filter((b) => getAccountTier(b, state) === "pro");
+    if (proAccounts.length > 0) {
+      eligibleTier = proAccounts;
+    }
+  }
+
+  // Within the eligible tier: LRU by lastUsedMs, tie-break by ID
+  eligibleTier.sort(
     (a, b) =>
       (accEntry(state, a.id)?.lastUsedMs ?? 0) - (accEntry(state, b.id)?.lastUsedMs ?? 0) ||
       a.id.localeCompare(b.id)
   );
-  return { backend: tier[0] };
+  return { backend: eligibleTier[0] };
 }
 
 function acquireInState(state, b, owner, now) {
@@ -493,7 +555,26 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 4. model-unavailable
+  // 4. model-locked (specific model requires subscription / has lock icon)
+  if (
+    (err && (err.isLocked || err.code === "ARGON_MODEL_LOCKED")) ||
+    /locked:\s*paid upgrade required|paid upgrade required/i.test(message)
+  ) {
+    const lockedModel = (
+      err?.lockedModel ||
+      (message.match(/^(\w+)\s+locked/i)?.[1] || "carbon")
+    ).toLowerCase();
+    return {
+      category: "model-locked",
+      cooldownMs: 0,
+      untilMs: 0,
+      rotatable: true,
+      parkedReason: null,
+      lockedModel,
+    };
+  }
+
+  // 5. model-unavailable
   if (
     (err && err.code === "ARGON_MODEL_UNAVAILABLE") ||
     /modelunavailable|model is unavailable|not available for this account|недоступна/i.test(message)
@@ -507,7 +588,7 @@ export function classifyFailure(err, authHint = null) {
     };
   }
 
-  // 5. default transient
+  // 6. default transient
   return {
     category: "transient",
     cooldownMs: 0,
@@ -517,7 +598,7 @@ export function classifyFailure(err, authHint = null) {
   };
 }
 
-async function settleBackend(backendId, sessionId, untilMs, message, parkedReason) {
+async function settleBackend(backendId, sessionId, untilMs, message, parkedReason, lockedModel = null) {
   const owner = `${process.pid}:${sessionId}`;
   return withStateLock((state) => {
     if (state.leases && state.leases[backendId] && state.leases[backendId].pid === process.pid) {
@@ -529,14 +610,23 @@ async function settleBackend(backendId, sessionId, untilMs, message, parkedReaso
       e.owner = null;
     }
     e.lastError = String(message).slice(0, 500);
+    if (lockedModel) {
+      if (!Array.isArray(e.lockedModels)) e.lockedModels = [];
+      if (!e.lockedModels.includes(lockedModel)) {
+        e.lockedModels.push(lockedModel);
+      }
+      if (lockedModel === "carbon") {
+        e.tier = "pro";
+      }
+    }
     if (parkedReason) {
-      const enabled = BACKENDS.filter((b) => b.priority > 0).length;
+      const enabled = BACKENDS.filter((b) => getAccountPriority(b, state) > 0).length;
       const parked = Object.entries(state.accounts).filter(
         ([k, v]) =>
           k !== backendId &&
           v.parkedReason &&
           (v.cooldownUntilMs ?? 0) > Date.now() &&
-          BACKENDS.some((b) => b.id === k && b.priority > 0)
+          BACKENDS.some((b) => b.id === k && getAccountPriority(b, state) > 0)
       ).length;
       if (enabled > 1 && parked >= enabled - 1) {
         state.breaker = { at: Date.now(), reason: parkedReason, account: backendId };
@@ -558,6 +648,84 @@ function getDriver() {
 const out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Stage log: every prompt transition lands here so a silent hang shows its
+// exact stage (bindBackend wait, driver call, streaming) — postmortem 17.11.
+export const slog = (stage, extra) => {
+  try {
+    const dir = process.env.ARGON_STATE_DIR || STATE_DIR;
+    appendFileSync(
+      join(dir, "acp-server.log"),
+      `${new Date().toISOString()} pid=${process.pid} ${stage}${extra ? " " + JSON.stringify(extra) : ""}\n`
+    );
+  } catch {}
+};
+
+// --- process lifecycle & orphan reaper (PLUG-278 / PLUG-274 postmortem) ---
+const serverFilePath = fileURLToPath(import.meta.url);
+let startupMtime = 0;
+try {
+  startupMtime = statSync(serverFilePath).mtimeMs;
+} catch {}
+
+export function checkStaleCode() {
+  if (startupMtime <= 0) return false;
+  try {
+    const curMtime = statSync(serverFilePath).mtimeMs;
+    if (curMtime > startupMtime) {
+      slog("server:stale-code-exit", { startupMtime, curMtime });
+      void cleanShutdown();
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+export function reapOrphanAcpServers() {
+  if (process.platform !== "linux") return 0;
+  let reaped = 0;
+  try {
+    const entries = readdirSync("/proc");
+    const myPid = process.pid;
+    for (const ent of entries) {
+      if (!/^\d+$/.test(ent)) continue;
+      const pid = Number(ent);
+      if (pid === myPid) continue;
+      try {
+        const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+        if (!cmdline.includes("acp-server.mjs")) continue;
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const match = stat.match(/\)\s+[RSDZTW]\s+(\d+)/);
+        if (!match) continue;
+        const ppid = Number(match[1]);
+        if (ppid === 1) {
+          slog("reaper:killing-orphan", { pid });
+          try {
+            process.kill(pid, "SIGTERM");
+            reaped++;
+          } catch {}
+        }
+      } catch {}
+    }
+  } catch (e) {
+    slog("reaper:error", { error: String(e) });
+  }
+  return reaped;
+}
+
+// Parent-death watchdog: reparented onto init/systemd means bridge parent died
+const ownerPpid = process.ppid;
+const ppidWatch = setInterval(() => {
+  if (process.ppid !== ownerPpid || process.ppid === 1) {
+    slog("process:reparented-exit", { ownerPpid, currentPpid: process.ppid });
+    void cleanShutdown();
+    return;
+  }
+  if (!activePromptSessionId) {
+    checkStaleCode();
+  }
+}, 5_000);
+ppidWatch.unref?.();
+
 /* ---------- session state ---------- */
 const sessions = new Map();
 let sessionCounter = 0;
@@ -570,15 +738,28 @@ export function normalizeThinking(val) {
 }
 
 export const MODELS = [
-  { value: "argon", name: "Gemini (Argon)" },
-  { value: "fast", name: "Gemini 3 Flash (Fast)" },
-  { value: "thinking", name: "Gemini 3 Flash (Thinking)" },
-  { value: "pro", name: "Gemini 3.1 Pro (старая 3.1, не рекомендуется)" },
+  { value: "argon", name: "Gemini 4 Argon" },
+  { value: "carbon", name: "Gemini 4 Carbon" },
+  { value: "hydrogen", name: "Gemini 4 Hydrogen" },
+  { value: "pro", name: "Gemini 3.1 Pro" },
+  { value: "flash-lite", name: "Gemini 3.5 Flash-Lite" },
 ];
+
+export function resolveModelId(val) {
+  if (!val || typeof val !== "string") return null;
+  const v = val.toLowerCase().trim();
+  if (v === "fast" || v === "flash" || v === "lite" || v.includes("flash-lite") || v.includes("flash")) return "flash-lite";
+  if (v.includes("carbon")) return "carbon";
+  if (v.includes("argon")) return "argon";
+  if (v.includes("hydrogen")) return "hydrogen";
+  if (v.includes("pro")) return "pro";
+  const exact = MODELS.find((m) => m.value === v || m.name.toLowerCase() === v);
+  if (exact) return exact.value;
+  return null;
+}
 
 function configOptionsFor(s, backends = BACKENDS) {
   const normalizedLevel = normalizeThinking(s.thinking);
-  const thinkingVal = normalizedLevel === "low" ? "fast" : normalizedLevel === "high" ? "pro" : "thinking";
   const opts = [
     {
       id: "model",
@@ -588,25 +769,14 @@ function configOptionsFor(s, backends = BACKENDS) {
       options: MODELS.map((m) => ({ value: m.value, name: m.name })),
     },
     {
-      id: "thinking",
-      category: "thought_level",
-      type: "select",
-      currentValue: thinkingVal,
-      options: [
-        { value: "fast", name: "fast" },
-        { value: "thinking", name: "thinking" },
-        { value: "pro", name: "pro" },
-      ],
-    },
-    {
       id: "thought_level",
       category: "thought_level",
       type: "select",
       currentValue: normalizedLevel,
       options: [
-        { value: "low", name: "low" },
-        { value: "medium", name: "medium" },
-        { value: "high", name: "high" },
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
       ],
     },
   ];
@@ -670,6 +840,8 @@ async function probeAuthHint(backend) {
 /* ---------- backend binding ---------- */
 async function bindBackend(s, sessionId) {
   const owner = `${process.pid}:${sessionId}`;
+  const reqModel = s.model ? s.model.toLowerCase() : null;
+
   if (s.account && s.account !== "auto") {
     const b = BACKENDS.find((x) => x.id === s.account);
     if (!b) {
@@ -678,6 +850,13 @@ async function bindBackend(s, sessionId) {
     const st = withStateLock((state) => {
       const now = Date.now();
       const e = accEntry(state, b.id);
+      const tier = getAccountTier(b, state);
+      if (reqModel === "carbon" && tier !== "ultra") {
+        return { error: `account "${b.id}" has ${tier} tier and does not support Carbon (Ultra tier required)` };
+      }
+      if (reqModel && e?.lockedModels?.includes(reqModel)) {
+        return { error: `account "${b.id}" does not support model "${reqModel}" (locked: paid upgrade required)` };
+      }
       const cool = e?.cooldownUntilMs ?? 0;
       if (cool > now) {
         return { error: `account "${b.id}" is in cooldown until ${new Date(cool).toISOString()}` };
@@ -700,35 +879,44 @@ async function bindBackend(s, sessionId) {
     const now = Date.now();
     if (s.backend) {
       const e = accEntry(state, s.backend.id);
+      const tier = getAccountTier(s.backend, state);
+      const isLocked = (reqModel && e?.lockedModels?.includes(reqModel)) || (reqModel === "carbon" && tier !== "ultra");
       const cool = e?.cooldownUntilMs ?? 0;
       const l = state.leases && state.leases[s.backend.id];
       const busy = l && l.pid !== process.pid && now - (l.acquiredMs || 0) < LEASE_TTL_MS && isPidAlive(l.pid);
 
-      if (cool <= now && !busy) {
+      if (cool <= now && !busy && !isLocked) {
         acquireInState(state, s.backend, owner, now);
         return { backend: s.backend };
       }
       const prev = s.backend.id;
       if (s.convId) {
         if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+        if (isLocked) return { error: `account "${prev}" does not support model "${reqModel}" (tier: ${tier}); this conversation is pinned to it` };
         return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()}; this conversation is pinned to it` };
       }
-      const r = pickBackendFromState(state, prev, owner, now);
+      const r = pickBackendFromState(state, prev, owner, now, reqModel);
       if (r.backend) {
         acquireInState(state, r.backend, owner, now);
         return { backend: r.backend };
       }
       if (r.busyUntil) return { busyUntil: r.busyUntil };
       if (busy) return { busyUntil: l.acquiredMs + LEASE_TTL_MS, account: prev };
+      if (r.none) {
+        return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "all accounts are in cooldown or busy and no sibling is free" };
+      }
       return { error: `account "${prev}" is in cooldown until ${new Date(cool).toISOString()} and no sibling is free` };
     }
 
-    const r = pickBackendFromState(state, null, owner, now);
+    const r = pickBackendFromState(state, null, owner, now, reqModel);
     if (r.backend) {
       acquireInState(state, r.backend, owner, now);
       return { backend: r.backend };
     }
     if (r.busyUntil) return { busyUntil: r.busyUntil };
+    if (r.none) {
+      return { error: reqModel === "carbon" ? "no accounts in pool with Carbon available" : "account pool is empty (no enabled backends)" };
+    }
     if (r.cooledUntil) {
       const brk = state.breaker ? ` (breaker: ${state.breaker.reason} on ${state.breaker.account})` : "";
       return { error: `all accounts are in cooldown; nearest reopen ${new Date(r.cooledUntil).toISOString()}${brk}` };
@@ -746,7 +934,7 @@ let activeAbort = null;
 let activeAttempt = null;
 let activePromptSessionId = null;
 
-async function runPrompt(id, sessionId, text) {
+async function runPrompt(id, sessionId, text, attachments = {}) {
   const s = sessions.get(sessionId) ?? {
     model: "argon",
     thinking: "thinking",
@@ -764,8 +952,10 @@ async function runPrompt(id, sessionId, text) {
   s.cancelled = false;
 
   try {
+    slog("prompt:enqueue", { sessionId, chars: text.length, model: s.model });
     const result = await enqueue(async () => {
       if (s.cancelled) return { cancelled: true };
+      slog("prompt:dequeue", { sessionId });
 
       if (FAKE) {
         const bound = await bindBackend(s, sessionId);
@@ -818,15 +1008,31 @@ async function runPrompt(id, sessionId, text) {
       let lastErr = null;
       let streamedAny = false;
 
+      // §5 web-gemini-tools: первое сообщение нового разговора несёт
+      // системную шапку инструментов и упакованные материалы (дифф, файлы,
+      // треды, задачи). У существующего разговора (s.convId) текст идёт как есть.
+      const packed = s.convId
+        ? { message: text }
+        : webTools.packFirstMessage({
+            text,
+            cwd: s.cwd,
+            resourceLinks: attachments.resourceLinks ?? [],
+            embeddedResources: attachments.embeddedResources ?? [],
+          });
+
       while (true) {
         if (s.cancelled) return { cancelled: true };
         const bound = await bindBackend(s, sessionId);
-        if (bound.error) throw new Error(bound.error);
+        if (bound.error) {
+          slog("bind:error", { sessionId, error: bound.error });
+          throw new Error(bound.error);
+        }
         if (bound.busyUntil) {
           if (s.cancelled) return { cancelled: true };
           if (Date.now() >= waitDeadline) {
             throw new Error(`account "${bound.account || "picked"}" is busy until ${new Date(bound.busyUntil).toISOString()}`);
           }
+          slog("bind:busy", { sessionId, account: bound.account, busyUntil: new Date(bound.busyUntil).toISOString() });
           const wakeAt = Math.min(Date.now() + Math.max(bound.busyUntil - Date.now() + 500, 3000), Date.now() + 15_000);
           while (!s.cancelled && Date.now() < wakeAt) await sleep(500);
           continue;
@@ -857,33 +1063,91 @@ async function runPrompt(id, sessionId, text) {
         const attempt = (async () => {
           try {
             const driverMod = getDriver();
-            const res = await driverMod.sendPrompt({
-              prompt: text,
-              model: s.model,
-              thinking: mappedThinking,
-              convId: s.convId,
-              isNewChat: !s.convId,
-              headless: HEADLESS,
-              profile: backend.profileDir || backend.profile || backend.id,
-              cdpPort: backend.cdp,
-              strict: true,
-              strictModel: true,
-              signal: abortCtrl.signal,
-              shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen,
-              onChunk: (c) => {
-                if (c && !s.cancelled && s.activeGen === gen) {
-                  streamedAny = true;
-                  upd({
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: c },
-                  });
-                }
+            // §3 Tool Loop: все раунды — в том же convId на том же бэкенде,
+            // лиз удерживается до конца хода.
+            const sendOnce = async (message) => {
+              // PLUG-281/§4.1: каждый уходящий в Gemini текст (первое
+              // упакованное сообщение, блоки результатов инструментов,
+              // принудительный финал) проверяется до отправки — это ошибка
+              // вызывающего, драйвер повторяет проверку последним рубежом.
+              const tooLargeMsg = promptTooLargeError(message);
+              if (tooLargeMsg) throw tooLargeMsg;
+              slog("driver:send", {
+                sessionId,
+                account: backend.id,
+                model: s.model,
+                thinking: mappedThinking,
+                chars: message.length,
+                convId: s.convId || null,
+              });
+              const res = await driverMod.sendPrompt({
+                prompt: message,
+                model: s.model,
+                thinking: mappedThinking,
+                convId: s.convId,
+                isNewChat: !s.convId,
+                headless: HEADLESS,
+                profile: backend.profileDir || backend.profile || backend.id,
+                cdpPort: backend.cdp,
+                strict: true,
+                strictModel: true,
+                signal: abortCtrl.signal,
+                shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen,
+                onChunk: (c) => {
+                  if (c && !s.cancelled && s.activeGen === gen) {
+                    streamedAny = true;
+                    upd({
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: c },
+                    });
+                  }
+                },
+              });
+              if (res && res.convId) {
+                s.convId = res.convId;
+              }
+              slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
+              return res;
+            };
+            let toolSeq = 0;
+            const loop = await webTools.runToolLoop({
+              firstMessage: s.convId ? text : packed.message,
+              send: sendOnce,
+              execute: (call) => webTools.executeTool(call, { cwd: s.cwd }),
+              onToolStart: (call) => {
+                const toolCallId = `argtool-${++toolSeq}`;
+                upd({
+                  sessionUpdate: "tool_call",
+                  toolCallId,
+                  title: webTools.toolTitle(call),
+                  kind: webTools.toolKind(call.name),
+                  status: "in_progress",
+                  rawInput: { name: call.name, args: call.args },
+                });
+                return toolCallId;
               },
+              onToolEnd: (toolCallId, call, r) => {
+                upd({
+                  sessionUpdate: "tool_call_update",
+                  toolCallId,
+                  status: r.ok ? "completed" : "failed",
+                  content: [
+                    {
+                      type: "content",
+                      content: { type: "text", text: String(r.output ?? "").slice(0, 2000) },
+                    },
+                  ],
+                });
+              },
+              maxRounds: webTools.MAX_TOOL_ROUNDS,
+              isCancelled: () => s.cancelled || abortCtrl.signal.aborted,
             });
-            if (res && res.convId) {
-              s.convId = res.convId;
+            if (loop.cancelled) {
+              const e = new Error("prompt cancelled by user");
+              e.code = "ARGON_CANCELLED";
+              throw e;
             }
-            return res;
+            return loop.lastRes ?? { text: loop.finalText };
           } finally {
             clearInterval(renew);
           }
@@ -946,6 +1210,12 @@ async function runPrompt(id, sessionId, text) {
           return r;
         } catch (err) {
           lastErr = err;
+          slog("driver:error", {
+            sessionId,
+            account: backend.id,
+            error: err && err.message ? String(err.message).slice(0, 300) : String(err),
+            code: err && err.code,
+          });
           if (err && err.code === "ARGON_CANCELLED") {
             await releaseLease(backend.id);
             activeBackendId = null;
@@ -966,7 +1236,7 @@ async function runPrompt(id, sessionId, text) {
           }
           const hint = await probeAuthHint(backend);
           const cls = classifyFailure(err, hint);
-          const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, hint || err.message, cls.parkedReason);
+          const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, hint || err.message, cls.parkedReason, cls.lockedModel);
           activeBackendId = null;
           activeAbort = null;
           activeAttempt = null;
@@ -1020,6 +1290,7 @@ let isExiting = false;
 async function cleanShutdown() {
   if (isExiting) return;
   isExiting = true;
+  clearInterval(ppidWatch);
   try {
     if (activeAbort) {
       activeAbort.abort();
@@ -1147,49 +1418,25 @@ export function dispatch(msg) {
       }
       const cid = p.configId ?? p.id ?? p.optionId;
       const val = p.value;
-      if (cid === "thought_level") {
-        if (val === "low") {
+      if (cid === "thought_level" || cid === "thinking") {
+        if (val === "low" || val === "fast") {
           s.thinking = "low";
-          if (s.model !== "argon") s.model = "fast";
-        } else if (val === "medium") {
+        } else if (val === "medium" || val === "thinking") {
           s.thinking = "medium";
-          if (s.model !== "argon") s.model = "thinking";
-        } else if (val === "high") {
+        } else if (val === "high" || val === "pro") {
           s.thinking = "high";
-          if (s.model !== "argon") s.model = "pro";
         } else {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown thought_level "${val}"` } });
           return;
         }
-      } else if (cid === "thinking") {
-        if (val === "fast" || val === "low") {
-          s.thinking = "low";
-          if (s.model !== "argon") s.model = "fast";
-        } else if (val === "thinking" || val === "medium") {
-          s.thinking = "medium";
-          if (s.model !== "argon") s.model = "thinking";
-        } else if (val === "pro" || val === "high") {
-          s.thinking = "high";
-          if (s.model !== "argon") s.model = "pro";
-        } else {
-          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown thinking "${val}"` } });
-          return;
-        }
       } else if (cid === "model") {
-        if (!MODELS.some((m) => m.value === val)) {
+        const targetModel = resolveModelId(val);
+        if (!targetModel) {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown model "${val}"` } });
           return;
         }
-        s.model = val;
-        if (val === "argon") {
-          if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
-        } else if (val === "fast") {
-          s.thinking = "low";
-        } else if (val === "thinking") {
-          s.thinking = "medium";
-        } else if (val === "pro") {
-          s.thinking = "high";
-        }
+        s.model = targetModel;
+        if (!s.thinking) s.thinking = "medium";
       } else if (cid === "account") {
         if (val !== "auto" && !BACKENDS.some((b) => b.id === val)) {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown account "${val}"` } });
@@ -1214,25 +1461,18 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown session "${p.sessionId}"` } });
         return;
       }
-      const val = p.modelId ?? p.value;
-      if (typeof val !== "string" || !MODELS.some((m) => m.value === val)) {
+      const rawVal = p.modelId ?? p.value;
+      const val = resolveModelId(rawVal);
+      if (!val) {
         out({
           jsonrpc: "2.0",
           id: msg.id,
-          error: { code: -32602, message: `unknown model "${typeof val === "string" ? val : JSON.stringify(val)}"` },
+          error: { code: -32602, message: `unknown model "${typeof rawVal === "string" ? rawVal : JSON.stringify(rawVal)}"` },
         });
         return;
       }
       s.model = val;
-      if (val === "argon") {
-        if (!s.thinking || s.thinking === "low" || s.thinking === "fast") s.thinking = "medium";
-      } else if (val === "fast") {
-        s.thinking = "low";
-      } else if (val === "thinking") {
-        s.thinking = "medium";
-      } else if (val === "pro") {
-        s.thinking = "high";
-      }
+      if (!s.thinking) s.thinking = "medium";
       out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS) } });
       return;
     }
@@ -1261,7 +1501,15 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
         return;
       }
-      void runPrompt(msg.id, p.sessionId, text);
+      // §5: приложенные ресурсы ACP (embeddedContext) — file:// ссылки и
+      // встроенные текстовые ресурсы идут во вложения первого сообщения.
+      const resourceLinks = p.prompt.filter(
+        (b) => b && b.type === "resource_link" && typeof b.uri === "string",
+      );
+      const embeddedResources = p.prompt.filter(
+        (b) => b && b.type === "resource" && b.resource && typeof b.resource.text === "string",
+      );
+      void runPrompt(msg.id, p.sessionId, text, { resourceLinks, embeddedResources });
       return;
     }
 
@@ -1289,6 +1537,7 @@ export function dispatch(msg) {
 
 /* ---------- CLI entrypoint ---------- */
 export function startServer() {
+  reapOrphanAcpServers();
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on("line", (line) => {
     let msg;
