@@ -13,7 +13,13 @@ import {
   classifyFailure,
   loadBackends,
   withStateLock,
+  pickBackendFromState,
+  getAccountPriority,
+  getAccountTier,
   MODELS,
+  slog,
+  reapOrphanAcpServers,
+  checkStaleCode,
 } from "../acp-server.mjs";
 
 const require = createRequire(import.meta.url);
@@ -236,6 +242,16 @@ test("3. classifyFailure correctly classifies errors", () => {
   assert.equal(cThinkingNF.category, "model-unavailable");
   assert.equal(cThinkingNF.rotatable, true);
   assert.equal(cThinkingNF.cooldownMs, 6 * 3600_000);
+
+  // Model locked (paid upgrade required): rotatable, zero cooldown, records lockedModel
+  const errCarbonLocked = new ModelUnavailable("model", "carbon locked: paid upgrade required");
+  errCarbonLocked.isLocked = true;
+  errCarbonLocked.lockedModel = "carbon";
+  const cCarbonLocked = classifyFailure(errCarbonLocked);
+  assert.equal(cCarbonLocked.category, "model-locked");
+  assert.equal(cCarbonLocked.rotatable, true);
+  assert.equal(cCarbonLocked.cooldownMs, 0);
+  assert.equal(cCarbonLocked.lockedModel, "carbon");
 });
 
 test("4. gemini-driver strict selectModelAndThinking and no fallback", async () => {
@@ -295,6 +311,99 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
       return true;
     }
   );
+
+  // Test locked Carbon model (lock icon) rejection without clicking
+  let clickedLocked = false;
+  const mockPageLocked = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Самые сложные задачи\n4 Carbon",
+        evaluate: async (fn) => {
+          const fakeEl = {
+            querySelectorAll: () => [
+              {
+                innerText: "lock",
+                getAttribute: () => "lock",
+                className: "mat-icon",
+              },
+            ],
+            hasAttribute: () => false,
+            getAttribute: () => null,
+            classList: { contains: () => false },
+          };
+          try {
+            return fn(fakeEl);
+          } catch {
+            return false;
+          }
+        },
+        click: async () => {
+          clickedLocked = true;
+        },
+      },
+    ],
+    waitForSelector: async () => ({
+      innerText: async () => "Hydrogen",
+      getAttribute: () => "Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await assert.rejects(
+    async () => {
+      await selectModelAndThinking(mockPageLocked, "carbon", null, true);
+    },
+    (err) => {
+      assert.ok(err instanceof ModelUnavailable);
+      assert.equal(err.isLocked, true);
+      assert.equal(err.lockedModel, "carbon");
+      assert.match(err.message, /carbon locked: paid upgrade required/i);
+      return true;
+    }
+  );
+  assert.equal(clickedLocked, false, "Locked model item must not be clicked");
+
+  // Test resolveModelId for aliases and official labels
+  const { resolveModelId } = await import("../acp-server.mjs");
+  assert.equal(resolveModelId("argon"), "argon");
+  assert.equal(resolveModelId("Gemini 4 Argon"), "argon");
+  assert.equal(resolveModelId("carbon"), "carbon");
+  assert.equal(resolveModelId("Gemini 4 Carbon"), "carbon");
+  assert.equal(resolveModelId("hydrogen"), "hydrogen");
+  assert.equal(resolveModelId("Gemini 4 Hydrogen"), "hydrogen");
+  assert.equal(resolveModelId("pro"), "pro");
+  assert.equal(resolveModelId("Gemini 3.1 Pro"), "pro");
+  assert.equal(resolveModelId("flash-lite"), "flash-lite");
+  assert.equal(resolveModelId("Gemini 3.5 Flash-Lite"), "flash-lite");
+  assert.equal(resolveModelId("fast"), "flash-lite");
+  assert.equal(resolveModelId("flash"), "flash-lite");
+  assert.equal(resolveModelId("unknown-xyz"), null);
+
+  // Test successful selection of argon in Russian UI
+  let clickedArgon = false;
+  const mockPageArgon = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Код и анализ\n4 Argon",
+        evaluate: async () => false,
+        click: async () => { clickedArgon = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async () => ({
+      innerText: async () => "3.5 Flash-Lite",
+      getAttribute: async () => "3.5 Flash-Lite",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  await selectModelAndThinking(mockPageArgon, "argon", null, true);
+  assert.equal(clickedArgon, true, "Argon in Russian UI must be clicked when requested");
 
   // Verification that target is validated after last user-query with promptPrefix
   assert.ok(
@@ -587,12 +696,31 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   }
   const modelIds = r2.result.models.availableModels.map((m) => m.modelId);
   assert.ok(modelIds.includes("argon"));
+  assert.ok(modelIds.includes("carbon"));
+  assert.ok(modelIds.includes("hydrogen"));
   assert.ok(modelIds.includes("pro"));
+  assert.ok(modelIds.includes("flash-lite"));
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "argon")?.name,
+    "Gemini 4 Argon"
+  );
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "carbon")?.name,
+    "Gemini 4 Carbon"
+  );
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "hydrogen")?.name,
+    "Gemini 4 Hydrogen"
+  );
+  assert.equal(
+    r2.result.models.availableModels.find((m) => m.modelId === "flash-lite")?.name,
+    "Gemini 3.5 Flash-Lite"
+  );
   const proModel = r2.result.models.availableModels.find((m) => m.modelId === "pro");
-  assert.equal(proModel?.name, "Gemini 3.1 Pro (старая 3.1, не рекомендуется)");
+  assert.equal(proModel?.name, "Gemini 3.1 Pro");
   assert.equal(
     MODELS.find((m) => m.value === "pro")?.name,
-    "Gemini 3.1 Pro (старая 3.1, не рекомендуется)"
+    "Gemini 3.1 Pro"
   );
 
   // 2b. session/load also returns availableModels as { modelId, name } objects
@@ -634,7 +762,7 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const modelOpt4 = r4.result.configOptions.find((o) => o.id === "model");
   assert.equal(modelOpt4?.currentValue, "argon", "Model must remain 'argon' when thought_level changes on argon model");
 
-  // Verify non-argon model updates to pro when thought_level is set to high
+  // Verify non-argon/non-carbon model updates thought_level to high cleanly
   sendReq({
     jsonrpc: "2.0",
     id: 401,
@@ -650,17 +778,40 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
     params: { sessionId, configId: "thought_level", value: "high" },
   });
   const r402 = await waitForResponse(402);
-  const modelOpt402 = r402.result.configOptions.find((o) => o.id === "model");
-  assert.equal(modelOpt402?.currentValue, "pro", "Model must update to 'pro' when thought_level is high and s.model !== 'argon'");
+  const thoughtOpt402 = r402.result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(thoughtOpt402?.currentValue, "high", "thought_level must update to high");
 
-  // Reset back to argon for the rest of the test
+  // Verify carbon model supports custom thought_level without model overwrite
   sendReq({
     jsonrpc: "2.0",
     id: 403,
     method: "session/set_model",
+    params: { sessionId, modelId: "carbon" },
+  });
+  const r403 = await waitForResponse(403);
+  const modelOpt403 = r403.result.configOptions.find((o) => o.id === "model");
+  assert.equal(modelOpt403?.currentValue, "carbon");
+
+  sendReq({
+    jsonrpc: "2.0",
+    id: 404,
+    method: "session/set_config_option",
+    params: { sessionId, configId: "thought_level", value: "low" },
+  });
+  const r404 = await waitForResponse(404);
+  const modelOpt404 = r404.result.configOptions.find((o) => o.id === "model");
+  const thoughtOpt404 = r404.result.configOptions.find((o) => o.id === "thought_level");
+  assert.equal(modelOpt404?.currentValue, "carbon", "Carbon model must be preserved when thought_level changes");
+  assert.equal(thoughtOpt404?.currentValue, "low", "Carbon thought_level must update to low");
+
+  // Reset back to argon for the rest of the test
+  sendReq({
+    jsonrpc: "2.0",
+    id: 405,
+    method: "session/set_model",
     params: { sessionId, modelId: "argon" },
   });
-  await waitForResponse(403);
+  await waitForResponse(405);
 
   // 5. session/prompt (streaming with lease retention check during execution)
   sendReq({
@@ -977,4 +1128,143 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
   assert.equal(endTurnMsg, undefined, "Response with stopReason 'end_turn' must not be sent on stdin close");
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("8. Smart model routing: pickBackendFromState prioritizes pro accounts for argon and ultra for carbon", () => {
+  const testBackends = [
+    { id: "pro-1", priority: 10, tier: "pro", cdp: "9222" },
+    { id: "pro-2", priority: 10, tier: "pro", cdp: "9223" },
+    { id: "ultra-1", priority: 10, tier: "ultra", cdp: "9224" },
+  ];
+
+  const fakeState = {
+    accounts: {
+      "pro-1": {
+        cooldownUntilMs: 0,
+        lastUsedMs: 100,
+        lastError: null,
+        lockedModels: ["carbon"],
+      },
+      "pro-2": {
+        cooldownUntilMs: 0,
+        lastUsedMs: 200,
+        lastError: null,
+        lockedModels: ["carbon"],
+      },
+      "ultra-1": {
+        cooldownUntilMs: 0,
+        lastUsedMs: 50,
+        lastError: null,
+      },
+    },
+    leases: {},
+  };
+
+  // For argon: pro accounts (pro-1, pro-2) are prioritized over ultra (ultra-1) to reserve ultra for carbon!
+  // Between pro-1 (100) and pro-2 (200), pro-1 is least recently used
+  const argonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.ok(argonPick.backend, "Should pick a backend for argon");
+  assert.equal(argonPick.backend.id, "pro-1", "Argon should pick pro tier account first");
+
+  // When pro-1 is busy, argon picks pro-2 (the remaining pro account)
+  fakeState.accounts["pro-1"].inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts["pro-1"].owner = "other-process";
+  const argonPick2 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.ok(argonPick2.backend, "Should pick pro-2 for argon when pro-1 is busy");
+  assert.equal(argonPick2.backend.id, "pro-2");
+
+  // When both pro accounts are busy, argon falls back to ultra (ultra-1)
+  fakeState.accounts["pro-2"].inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts["pro-2"].owner = "other-process";
+  const argonPick3 = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.ok(argonPick3.backend, "Should fall back to ultra account for argon when all pro accounts are busy");
+  assert.equal(argonPick3.backend.id, "ultra-1");
+
+  // Reset pro accounts
+  fakeState.accounts["pro-1"].inUseUntilMs = 0;
+  fakeState.accounts["pro-1"].owner = null;
+  fakeState.accounts["pro-2"].inUseUntilMs = 0;
+  fakeState.accounts["pro-2"].owner = null;
+
+  // When requesting carbon: only ultra accounts (ultra-1) are eligible.
+  // pro-1 and pro-2 are skipped (pro tier and locked).
+  // If ultra-1 is leased, it returns busyUntil
+  fakeState.accounts["ultra-1"].inUseUntilMs = Date.now() + 60000;
+  fakeState.accounts["ultra-1"].owner = "other-process";
+  const carbonBusy = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon", testBackends);
+  assert.ok(carbonBusy.busyUntil, "Should return busyUntil for carbon when only ultra-1 supports it and is busy");
+
+  // Release ultra-1: carbon immediately routes to ultra-1
+  fakeState.accounts["ultra-1"].inUseUntilMs = 0;
+  fakeState.accounts["ultra-1"].owner = null;
+  const carbonPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon", testBackends);
+  assert.ok(carbonPick.backend, "Should pick ultra-1 for carbon");
+  assert.equal(carbonPick.backend.id, "ultra-1");
+
+  // If ultra-1 also gets carbon locked (e.g. lock icon detected, downgraded to pro), pickBackendFromState returns none
+  fakeState.accounts["ultra-1"].lockedModels = ["carbon"];
+  const nonePick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "carbon", testBackends);
+  assert.equal(nonePick.none, true, "Must return none when all candidates have carbon locked");
+
+  // Priority tests:
+  // 1. Equal priority (all 10): "при прочих равных" Pro accounts are preferred for Argon over Ultra (Ultra in end)
+  fakeState.accounts["ultra-1"].lockedModels = [];
+  fakeState.accounts["ultra-1"].priority = 10;
+  fakeState.accounts["pro-1"].priority = 10;
+  fakeState.accounts["pro-2"].priority = 10;
+  fakeState.accounts["ultra-1"].lastUsedMs = 10; // ultra-1 has lowest lastUsedMs
+  fakeState.accounts["pro-1"].lastUsedMs = 100;
+  fakeState.accounts["pro-2"].lastUsedMs = 200;
+  const equalPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.equal(equalPrioPick.backend.id, "pro-1", "Equal priority should still prioritize pro account over ultra for argon");
+
+  // 2. Explicit priority ladder: higher priority picked first regardless of lastUsedMs
+  fakeState.accounts["pro-2"].priority = 20; // pro-2 has priority 20
+  const higherPrioPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.equal(higherPrioPick.backend.id, "pro-2", "Priority 20 must beat priority 10");
+
+  // 3. Priority 0: account is disabled and never picked
+  fakeState.accounts["pro-2"].priority = 0;
+  fakeState.accounts["pro-1"].priority = 0;
+  // Now only ultra-1 is left (> 0)
+  const onlyUltraPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.equal(onlyUltraPick.backend.id, "ultra-1", "Priority 0 accounts must be ignored, picking remaining account");
+
+  fakeState.accounts["ultra-1"].priority = 0;
+  const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
+  assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
+});
+
+test("9. acp-server slog and lifecycle guards, driver :visible and RU selectors", async () => {
+  // 1. slog writes to acp-server.log under STATE_DIR
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-slog-test-")));
+  process.env.ARGON_STATE_DIR = tmpDir;
+  slog("test:stage", { foo: "bar" });
+  const logFile = path.join(tmpDir, "acp-server.log");
+  assert.ok(fs.existsSync(logFile), "acp-server.log must be created");
+  const logContent = fs.readFileSync(logFile, "utf8");
+  assert.match(logContent, /test:stage \{"foo":"bar"\}/);
+
+  // 2. reapOrphanAcpServers safely executes on linux
+  const reaped = reapOrphanAcpServers();
+  assert.equal(typeof reaped, "number");
+
+  // 3. Driver :visible and RU selectors
+  const driverSrc = fs.readFileSync(path.join(PLUGIN_ROOT, "src/gemini-driver.js"), "utf8");
+  assert.ok(
+    driverSrc.includes("gem-menu-item[data-mode-id]:visible"),
+    "driver must prioritize gem-menu-item[data-mode-id]:visible in openMenu / isMenuOpen"
+  );
+  assert.ok(
+    driverSrc.includes("local-images-files-uploader-button"),
+    "driver must check local-images-files-uploader-button first in attachFile"
+  );
+  assert.ok(
+    driverSrc.includes("Загрузить файлы"),
+    "driver must support RU 'Загрузить файлы' in attachFile"
+  );
+  assert.ok(
+    driverSrc.includes("Удалить"),
+    "driver must support RU 'Удалить' in delete conversation"
+  );
 });
