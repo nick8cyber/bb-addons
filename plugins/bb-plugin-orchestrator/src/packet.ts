@@ -13,6 +13,7 @@
  */
 import { OrchestratorError } from "./errors.js";
 import { T_RU, type T } from "./i18n/index.js";
+import type { DelegationRow } from "./store.js";
 
 /** §20.2: the packet byte cap when the route sets no `maxPromptBytes`. */
 export const DEFAULT_MAX_PROMPT_BYTES = 150_000;
@@ -123,22 +124,67 @@ function diffChunks(diff: string): { text: string; file?: string }[] {
 }
 
 /** First ref from `candidates` that resolves, else undefined. */
-async function resolveRef(
+export async function resolveRef(
   git: PacketGit,
   repo: string,
   candidates: readonly string[],
+  skip?: (sha: string) => boolean,
 ): Promise<string | undefined> {
   for (const name of candidates) {
     try {
       const sha = (
         await git(repo, ["rev-parse", "--verify", `${name}^{commit}`])
       ).trim();
-      if (sha) return sha;
+      if (sha && (!skip || !skip(sha))) return sha;
     } catch {
       // next candidate
     }
   }
   return undefined;
+}
+
+/**
+ * §20.2: resolve the repository path for the material packet.
+ * Candidate chain:
+ * 1. row.result_env_id (the row's own environment)
+ * 2. store.latestDoneResultByTask(row.task_key)?.result_env_id (the task's last done execution)
+ * 3. coordinator's thread environmentId (the calling coordinator's copy)
+ * The first candidate yielding a living environment with a path wins.
+ */
+export async function resolveRepoPath(
+  row: DelegationRow,
+  deps: {
+    store: { latestDoneResultByTask: (taskKey: string) => DelegationRow | undefined };
+    threads: { get: (a: { threadId: string }) => Promise<{ environmentId?: string | null }> };
+    environmentFacts: (envId: string) => Promise<{ path?: string | null }>;
+  },
+): Promise<string | null> {
+  const candidates: (
+    | string
+    | null
+    | undefined
+    | (() => Promise<string | null | undefined>)
+  )[] = [
+    row.result_env_id,
+    deps.store.latestDoneResultByTask(row.task_key)?.result_env_id,
+    async () =>
+      deps.threads
+        .get({ threadId: row.coordinator_thread_id })
+        .then((th) => th.environmentId ?? undefined)
+        .catch(() => undefined),
+  ];
+  for (const candidate of candidates) {
+    const envId =
+      typeof candidate === "function" ? await candidate() : candidate;
+    if (!envId) continue;
+    try {
+      const facts = await deps.environmentFacts(envId);
+      if (facts?.path) return facts.path;
+    } catch {
+      // dead env or failed lookup -> try next candidate
+    }
+  }
+  return null;
 }
 
 export interface MaskFn {
@@ -205,17 +251,38 @@ export async function wrapPromptWithPacket(args: {
   const git = args.git!;
 
   // The merge-base target: the preset's baseBranch (origin copy first),
-  // else the remote default, else the checkout's HEAD.
+  // else the remote default, else local default branches (baseBranch
+  // without origin, main, master), else the checkout's HEAD.
+  // Target must not equal link — if a candidate resolves to link, skip it.
   let target: string | undefined;
   if (needsRepo) {
-    const candidates = [
-      ...(args.baseBranch
-        ? [`origin/${args.baseBranch}`, args.baseBranch]
-        : []),
-      "origin/HEAD",
-      "HEAD",
-    ];
-    target = await resolveRef(git, repo!, candidates);
+    let linkSha: string | undefined;
+    if (link !== null) {
+      try {
+        linkSha = (
+          await git(repo!, ["rev-parse", "--verify", `${link}^{commit}`])
+        ).trim();
+      } catch {
+        linkSha = link;
+      }
+    }
+    const cleanBase = args.baseBranch?.replace(/^origin\//, "") || undefined;
+    const candidates = Array.from(
+      new Set(
+        [
+          ...(cleanBase ? [`origin/${cleanBase}`, cleanBase] : []),
+          "origin/HEAD",
+          ...(cleanBase ? [cleanBase] : []),
+          "main",
+          "master",
+          "HEAD",
+        ].filter((x): x is string => Boolean(x)),
+      ),
+    );
+    const skip = (sha: string) =>
+      link !== null &&
+      (sha === link || (linkSha !== undefined && sha === linkSha));
+    target = await resolveRef(git, repo!, candidates, skip);
     if (!target) {
       throw new OrchestratorError(
         "packet-repo",

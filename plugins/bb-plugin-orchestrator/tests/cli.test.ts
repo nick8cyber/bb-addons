@@ -274,7 +274,10 @@ test("PLUG-294: CLI delegate on tool-less route with --from forwards stepsDeps a
   const gitCmd: CmdRunner = {
     run: async (_file, args) => {
       const line = args.join(" ");
-      if (line.includes("rev-parse")) return { exitCode: 0, stdout: "sha123\n", stderr: "" };
+      if (line.includes("rev-parse")) {
+        if (line.includes("sha123")) return { exitCode: 0, stdout: "sha123\n", stderr: "" };
+        return { exitCode: 0, stdout: "shaTARGET\n", stderr: "" };
+      }
       if (line.includes("merge-base")) return { exitCode: 0, stdout: "shaBASE\n", stderr: "" };
       if (line.includes("diff") && line.includes("--stat")) return { exitCode: 0, stdout: " a.ts | 2 +-\n", stderr: "" };
       if (line.includes("diff")) return { exitCode: 0, stdout: "DIFF_OUTPUT\n", stderr: "" };

@@ -6,6 +6,7 @@ import { parsePolicy, levelRole } from "../src/policy.js";
 import { OrchestratorError } from "../src/errors.js";
 import {
   wrapPromptWithPacket,
+  resolveRepoPath,
   PacketSkip,
   parseAttachSpec,
   DEFAULT_MAX_PROMPT_BYTES,
@@ -601,6 +602,93 @@ test("PLUG-294: runDelegate on tool-less route with packetGit/repoPath succeeds 
   assert.match(prompt, /МАТЕРИАЛ ДЛЯ ПРОВЕРКИ/);
   assert.ok(prompt.includes("FILE_CONTENT"));
   assert.ok(prompt.includes("DIFF_BODY"));
+});
+
+test("PLUG-295: runDelegate on fresh review row uses resolveRepoPath to pick last done result env", async () => {
+  const { git } = fakeGit({
+    diffStat: " a.ts | 2 +-\n",
+    diff: "DIFF_FROM_EXEC_REPO",
+  });
+  const envFacts: Record<string, { id: string; path?: string }> = {
+    env_exec: { id: "env_exec", path: "/path/to/exec/worktree" },
+    env_coord: { id: "env_coord", path: "/path/to/coord" },
+  };
+  const { deps, store, spawnArgs } = makeDelegateDeps({
+    packetGit: git,
+    repoPath: (row) =>
+      resolveRepoPath(row, {
+        store,
+        threads: {
+          get: async () => ({ environmentId: "env_coord" }),
+        },
+        environmentFacts: async (id) => envFacts[id] ?? {},
+      }),
+  });
+  // Record a prior done execution for PLUG-1
+  const prev = store.insert({
+    taskKey: "PLUG-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "route_exec",
+    preset: "preset_exec",
+    provider: "provider_exec",
+    round: 1,
+    continueFrom: null,
+    explicitRoute: false,
+    noCode: false,
+    attach: null,
+  });
+  store.setRoundResult(prev.id, {
+    envId: "env_exec",
+    branch: "bb/plug-1",
+    sha: "shaDONE",
+    commits: 1,
+    dirty: false,
+  });
+  store.setStatus(prev.id, "done");
+
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "review",
+      route: "argon-review",
+      from: "shaDONE",
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(res.status, "running");
+  assert.equal(store.threadRole("thr_exec")?.role, "auditor");
+  const prompt = String(spawnArgs[0]!.prompt);
+  assert.match(prompt, /МАТЕРИАЛ ДЛЯ ПРОВЕРКИ/);
+  assert.ok(prompt.includes("DIFF_FROM_EXEC_REPO"));
+});
+
+test("PLUG-295: runDelegate on tool-less route when all envs dead throws packet-repo", async () => {
+  const { git } = fakeGit({});
+  const { deps } = makeDelegateDeps({
+    packetGit: git,
+    repoPath: async () => null,
+  });
+  await assert.rejects(
+    () =>
+      runDelegate(
+        {
+          taskKey: "PLUG-1",
+          level: "review",
+          route: "argon-review",
+          from: "shaLINK",
+          caller: COORDINATOR,
+        },
+        deps,
+      ),
+    (e: OrchestratorError) => {
+      assert.equal(e.code, "packet-repo");
+      assert.match(e.message, /no repository access/);
+      return true;
+    },
+  );
 });
 
 test("§20.2: --attach rejects paths escaping the repo", async () => {
