@@ -12,7 +12,7 @@
     "name": "File Download",
     "description": "Клик по ссылке на файл открывает предпросмотр и сразу сохраняет файл загрузкой браузера (веб/PWA)",
     "branding": {
-      "icon": "Download"
+      "icon": "File"
     },
     "server": "./server.ts",
     "app": "./app.tsx"
