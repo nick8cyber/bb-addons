@@ -92,8 +92,11 @@ for dir in "${PLUGIN_DIRS[@]}"; do
     # the main checkout or other worktrees). Unlink it first
     # (rm -f, never -r); npm ci then creates a real directory.
     if [ -L "$dir/node_modules" ]; then rm -f "$dir/node_modules"; fi
-    echo "    npm ci"
-    (cd "$dir" && nice -n 19 npm ci --silent) || ok=0
+    # The release pipeline runs the checks from the plugin host process
+    # with NODE_ENV=production, where npm omits devDependencies — tsc and
+    # other devDeps would go missing. --include=dev overrides the omit.
+    echo "    npm ci --include=dev"
+    (cd "$dir" && nice -n 19 npm ci --include=dev --silent) || ok=0
   fi
 
   if [ "$ok" -eq 1 ] && [ -n "$(cd "$dir" && npm pkg get scripts.test 2>/dev/null | grep -v '^{}')" ]; then
