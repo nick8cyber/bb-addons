@@ -985,7 +985,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             };
             let toolSeq = 0;
             const loop = await webTools.runToolLoop({
-              firstMessage: packed.message,
+              firstMessage: s.convId ? text : packed.message,
               send: sendOnce,
               execute: (call) => webTools.executeTool(call, { cwd: s.cwd }),
               onToolStart: (call) => {

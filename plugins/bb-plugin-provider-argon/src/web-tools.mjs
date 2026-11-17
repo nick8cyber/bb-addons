@@ -178,7 +178,7 @@ export function isSensitivePath(rel) {
   if (
     /^\.env/i.test(base) ||
     /\.(pem|key)(?:\*|$)/i.test(base) ||
-    /^id_(?:rsa|ed25519|\*)/i.test(base)
+    /^id_(?:rsa|ed25519|dsa|ecdsa|\*)/i.test(base)
   ) {
     return true;
   }
@@ -199,7 +199,10 @@ export function isSensitivePath(rel) {
     }
     if (
       /^id[_\?*\[]/i.test(base) &&
-      (globToRegex(base)?.test("id_rsa") || globToRegex(base)?.test("id_ed25519"))
+      (globToRegex(base)?.test("id_rsa") ||
+        globToRegex(base)?.test("id_ed25519") ||
+        globToRegex(base)?.test("id_dsa") ||
+        globToRegex(base)?.test("id_ecdsa"))
     ) {
       return true;
     }
@@ -512,24 +515,24 @@ export function extractGitPaths(argv) {
       continue;
     }
     if (token.startsWith("-")) {
-      const eqIdx = token.indexOf("=");
-      if (eqIdx !== -1) {
-        const val = token.slice(eqIdx + 1).replace(/^["']|["']$/g, "");
-        if (val) paths.push(val);
-      }
+      continue;
+    }
+
+    if (token.startsWith(":/")) {
       continue;
     }
 
     const colonIdx = token.indexOf(":");
     if (colonIdx !== -1) {
-      if (!token.startsWith(":/")) {
-        let p = token.slice(colonIdx + 1);
-        if (/^[0-3]:/.test(p)) {
-          p = p.slice(2);
-        }
-        p = p.replace(/^["']|["']$/g, "");
-        if (p) paths.push(p);
+      let p = token.slice(colonIdx + 1);
+      if (/^[0-3]:/.test(p)) {
+        p = p.slice(2);
       }
+      p = p.replace(/^["']|["']$/g, "");
+      if (p.startsWith("/")) {
+        p = p.replace(/^\/+/, "");
+      }
+      if (p) paths.push(p);
       continue;
     }
 
@@ -653,6 +656,25 @@ export function filterGitPatchOutput(stdout) {
       if (statPath && isSensitivePath(statPath)) {
         continue;
       }
+      // git log/show/diff --name-status: "M\t.env", "R100\told\t.env"
+      if (/^[MADRCU][0-9]*\t/.test(line)) {
+        const parts = line.split("\t").slice(1).map((s) => s.trim().replace(/^["']|["']$/g, ""));
+        if (parts.some((p) => isSensitivePath(p))) {
+          continue;
+        }
+      }
+      // git log/show/diff --raw: ":100644 100644 ... M\t.env"
+      if (/^:[0-7]{6}\s/.test(line) && line.includes("\t")) {
+        const parts = line.split("\t").slice(1).map((s) => s.trim().replace(/^["']|["']$/g, ""));
+        if (parts.some((p) => isSensitivePath(p))) {
+          continue;
+        }
+      }
+      // git log/show/diff --name-only: голые имена файлов
+      const bare = line.trim().replace(/^["']|["']$/g, "");
+      if (bare && isSensitivePath(bare)) {
+        continue;
+      }
       result.push(line);
     }
   }
@@ -666,21 +688,57 @@ export function filterGitStatusOutput(stdout) {
   const lines = String(stdout).replace(/\r\n/g, "\n").split("\n");
   const filtered = [];
   for (const line of lines) {
-    if (!line) continue;
-    if (line.length < 4) {
+    if (!line) {
       filtered.push(line);
       continue;
     }
-    let p = line.slice(3).trim();
-    if (p.includes(" -> ")) {
-      const parts = p.split(" -> ");
-      const p1 = parts[0].trim().replace(/^["']|["']$/g, "");
-      const p2 = parts[1].trim().replace(/^["']|["']$/g, "");
-      if (isSensitivePath(p1) || isSensitivePath(p2)) continue;
-    } else {
-      p = p.replace(/^["']|["']$/g, "");
-      if (isSensitivePath(p)) continue;
+
+    // 1. Короткий формат: "XY path" (например "?? .env", " M file.js", "R  a -> .env")
+    const shortMatch = line.match(/^([ MADRCU?!]{2})\s+(.*)$/);
+    if (shortMatch) {
+      let p = shortMatch[2].trim();
+      if (p.includes(" -> ")) {
+        const parts = p.split(" -> ");
+        const p1 = parts[0].trim().replace(/^["']|["']$/g, "");
+        const p2 = parts[1].trim().replace(/^["']|["']$/g, "");
+        if (isSensitivePath(p1) || isSensitivePath(p2)) continue;
+      } else {
+        p = p.replace(/^["']|["']$/g, "");
+        if (isSensitivePath(p)) continue;
+      }
+      filtered.push(line);
+      continue;
     }
+
+    // 2. Длинный формат: строки с отступом (таб или пробелы)
+    if (/^\s+/.test(line)) {
+      const trimmed = line.trim();
+      // Статусные строки: "modified:   .env", "new file:   secrets/k.pem", "renamed:    a -> .env"
+      const statusColonMatch = trimmed.match(
+        /^(?:modified|new file|deleted|renamed|typechange|both modified|both added):\s+(.*)$/,
+      );
+      if (statusColonMatch) {
+        let p = statusColonMatch[1].trim();
+        if (p.includes(" -> ")) {
+          const parts = p.split(" -> ");
+          const p1 = parts[0].trim().replace(/^["']|["']$/g, "");
+          const p2 = parts[1].trim().replace(/^["']|["']$/g, "");
+          if (isSensitivePath(p1) || isSensitivePath(p2)) continue;
+        } else {
+          p = p.replace(/^["']|["']$/g, "");
+          if (isSensitivePath(p)) continue;
+        }
+        filtered.push(line);
+        continue;
+      }
+
+      // Неотслеживаемые файлы: "\t.env" или строки в блоке Untracked files
+      const cleanPath = trimmed.replace(/^["']|["']$/g, "");
+      if (!cleanPath.startsWith("(") && !cleanPath.startsWith("#")) {
+        if (isSensitivePath(cleanPath)) continue;
+      }
+    }
+
     filtered.push(line);
   }
   return filtered.join("\n");
@@ -1114,8 +1172,8 @@ export function packFirstMessage({
   const header = toolSystemHeader(maxRounds);
   const body = String(text ?? "");
   const len = (s) => Buffer.byteLength(s, "utf8");
-  // Небольшой резерв на строку «Можно запросить инструментом:».
-  let used = len(header) + len(body) + 220;
+  // Резерв на строку «Можно запросить инструментом:».
+  let used = len(header) + len(body) + 300;
   const blocks = [];
   const attached = [];
   const overflow = [];
@@ -1135,11 +1193,40 @@ export function packFirstMessage({
     }
   }
 
-  const head = overflow.length
-    ? `${header}\nМожно запросить инструментом: ${overflow.join(", ")}`
-    : header;
-  const message = maskForWeb(
-    head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : ""),
-  );
+  const prefix = "\nМожно запросить инструментом: ";
+  let head = header;
+  if (overflow.length > 0) {
+    head = `${header}${prefix}${overflow.join(", ")}`;
+  }
+
+  // Если общее сообщение превышает maxBytes, ужимаем:
+  // 1) сначала удаляем блоки из конца, освобождая место под подсказки и лимит;
+  // 2) если блоков больше нет, но подсказок слишком много (>120 КБ), обрезаем список подсказок.
+  let fullText = head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : "");
+  while (blocks.length > 0 && len(fullText) > maxBytes) {
+    blocks.pop();
+    attached.pop();
+    fullText = head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : "");
+  }
+
+  if (overflow.length > 0 && maxBytes >= 10000 && len(fullText) > maxBytes) {
+    const baseLen = len(header + prefix + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : ""));
+    const available = maxBytes - baseLen;
+    const included = [];
+    let cur = 0;
+    for (const h of overflow) {
+      const add = len((included.length ? ", " : "") + h);
+      if (cur + add <= available) {
+        included.push(h);
+        cur += add;
+      } else {
+        break;
+      }
+    }
+    head = included.length ? `${header}${prefix}${included.join(", ")}` : header;
+    fullText = head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : "");
+  }
+
+  const message = maskForWeb(fullText);
   return { message, attached, overflow };
 }

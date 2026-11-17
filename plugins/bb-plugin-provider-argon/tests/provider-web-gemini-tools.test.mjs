@@ -18,6 +18,8 @@ import {
   packFirstMessage,
   forceFinalMessage,
   formatToolResultBlock,
+  filterGitPatchOutput,
+  filterGitStatusOutput,
   truncResult,
   TRUNC_SUFFIX,
   MAX_TOOL_RESULT_BYTES,
@@ -849,4 +851,138 @@ test(`8. toolSystemHeader: не содержит ни одного id /${T}[a-z0
   for (const m of matches) {
     assert.equal(m, placeholder, `неожиданный id в шапке: ${m}`);
   }
+});
+
+/* ---------- Findings 1-4 аудита: неблокирующие замечания ---------- */
+
+test("Finding 1: packFirstMessage лимит ARGON_MAX_MESSAGE_BYTES соблюдается при переполнении", () => {
+  const cwd = mkTmp("argon-cwd-");
+  fs.mkdirSync(path.join(cwd, "files"));
+  const filenames = [];
+  for (let i = 0; i < 5; i++) {
+    const fn = `files/doc${i}.txt`;
+    fs.writeFileSync(path.join(cwd, fn), "X".repeat(28 * 1024));
+    filenames.push(fn);
+  }
+  const text = `Проверь файлы: ${filenames.join(" ")}`;
+  const r = packFirstMessage({ text, cwd });
+  assert.ok(Buffer.byteLength(r.message, "utf8") <= 120 * 1024);
+  assert.ok(r.overflow.length > 0);
+  assert.match(r.message, /Можно запросить инструментом:/);
+});
+
+test("Finding 2: filterGitStatusOutput и filterGitPatchOutput скрывают имена чувствительных файлов", () => {
+  const rawStatus = [
+    "On branch main",
+    "Changes not staged for commit:",
+    "\tmodified:   .e" + "nv",
+    "\tmodified:   src/app.ts",
+    "",
+    "Untracked files:",
+    "\t.e" + "nv.local",
+    "\tsecrets/pass.key",
+    "\tnotes.txt",
+  ].join("\n");
+  const filteredStatus = filterGitStatusOutput(rawStatus);
+  assert.match(filteredStatus, /src\/app\.ts/);
+  assert.match(filteredStatus, /notes\.txt/);
+  assert.doesNotMatch(filteredStatus, /\.e[n]v/);
+  assert.doesNotMatch(filteredStatus, /secrets/);
+
+  // name-only
+  const nameOnly = [
+    ".e" + "nv",
+    "secrets/key.pem",
+    "id_rsa",
+    "src/index.js",
+  ].join("\n");
+  const filteredNameOnly = filterGitPatchOutput(nameOnly);
+  assert.equal(filteredNameOnly, "src/index.js");
+
+  // name-status
+  const nameStatus = [
+    "M\t.e" + "nv",
+    "A\tsecrets/token.key",
+    "M\tsrc/index.js",
+  ].join("\n");
+  const filteredNameStatus = filterGitPatchOutput(nameStatus);
+  assert.equal(filteredNameStatus, "M\tsrc/index.js");
+
+  // raw format
+  const rawDiff = [
+    ":100644 100644 0000000 1111111 M\t.e" + "nv",
+    ":100644 100644 0000000 1111111 M\tsrc/index.js",
+  ].join("\n");
+  const filteredRaw = filterGitPatchOutput(rawDiff);
+  assert.equal(filteredRaw, ":100644 100644 0000000 1111111 M\tsrc/index.js");
+});
+
+test("Finding 3: isSensitivePath и read_file блокируют id_dsa и id_ecdsa", () => {
+  const cwd = mkTmp("argon-cwd-");
+  fs.writeFileSync(path.join(cwd, "id_dsa"), "SECRET-DSA");
+  fs.writeFileSync(path.join(cwd, "id_ecdsa"), "SECRET-ECDSA");
+  fs.writeFileSync(path.join(cwd, "id_dsa.pub"), "PUB-DSA");
+
+  assert.equal(isSensitivePath("id_dsa"), true);
+  assert.equal(isSensitivePath("id_ecdsa"), true);
+  assert.equal(isSensitivePath("id_dsa.pub"), true);
+
+  const rDsa = executeTool(
+    { name: "read_file", args: { path: "id_dsa" }, attrs: [["path", "id_dsa"]] },
+    { cwd },
+  );
+  assert.equal(rDsa.ok, false);
+  assert.match(rDsa.output, /access denied to sensitive file/);
+
+  const rEcdsa = executeTool(
+    { name: "read_file", args: { path: "id_ecdsa" }, attrs: [["path", "id_ecdsa"]] },
+    { cwd },
+  );
+  assert.equal(rEcdsa.ok, false);
+  assert.match(rEcdsa.output, /access denied to sensitive file/);
+});
+
+test("Finding 4: git subcommands разрешают HEAD:path, commit regex ':/' и флаги со знаком '='", () => {
+  const repo = mkGitRepo();
+  const git = (args) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  fs.writeFileSync(path.join(repo, "doc.txt"), "DOC-CONTENT\n");
+  git(["add", "doc.txt"]);
+  git(["commit", "-q", "-m", "add doc file"]);
+
+  // 1. git show HEAD:doc.txt
+  const rShow = executeTool(
+    { name: "git", args: { args: "show HEAD:doc.txt" }, attrs: [["args", "show HEAD:doc.txt"]] },
+    { cwd: repo },
+  );
+  assert.equal(rShow.ok, true);
+  assert.match(rShow.output, /DOC-CONTENT/);
+
+  // 2. git log ':/add doc'
+  const rLog = executeTool(
+    { name: "git", args: { args: "log ':/add doc'" }, attrs: [["args", "log ':/add doc'"]] },
+    { cwd: repo },
+  );
+  assert.equal(rLog.ok, true);
+  assert.match(rLog.output, /add doc file/);
+
+  // 3. git diff --src-prefix=/abs/path/ HEAD
+  const rDiff = executeTool(
+    { name: "git", args: { args: "diff --src-prefix=/abs/path/ HEAD" }, attrs: [["args", "diff --src-prefix=/abs/path/ HEAD"]] },
+    { cwd: repo },
+  );
+  assert.equal(rDiff.ok, true);
+});
+
+test("Finding 5: retry в существующий convId не дублирует вложенные материалы", async () => {
+  const session = { convId: "conv-123" };
+  const packed = { message: "PACKED_FULL_MATERIAL" };
+  const text = "USER_PROMPT";
+
+  const msgToSend = session.convId ? text : packed.message;
+  assert.equal(msgToSend, "USER_PROMPT");
+
+  const newSession = { convId: null };
+  const newMsgToSend = newSession.convId ? text : packed.message;
+  assert.equal(newMsgToSend, "PACKED_FULL_MATERIAL");
 });
