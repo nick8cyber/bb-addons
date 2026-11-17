@@ -1820,6 +1820,52 @@ test("release (merged): a failing project check restores the copy (PLUG-191)", a
   assert.equal(existsSync(join(gitDir, "orchestrator-merge.lock")), false);
 });
 
+test("PLUG-288: a failed check report keeps the FAILED line and separate stream tails", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        checks: [
+          "i=1; while [ $i -le 30 ]; do echo \"out-$i\"; " +
+            "echo \"err-$i\" >&2; i=$((i+1)); done; " +
+            "echo 'check-changed-plugins: FAILED: bb-plugin-orchestrator' >&2; " +
+            "exit 3",
+        ],
+      },
+    }),
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+  let text = "";
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => {
+      text = (e as Error).message;
+      return (e as OrchestratorError).code === "release-refused";
+    },
+  );
+  const lines = text.split("\n");
+  assert.match(lines[0]!, /проверка проекта упала/);
+  // The failure summary is lifted into the header, not left in the tail.
+  const failedAt = lines.indexOf(
+    "check-changed-plugins: FAILED: bb-plugin-orchestrator",
+  );
+  assert.ok(failedAt > 0);
+  // stdout and stderr are separate blocks, each keeping its own tail.
+  const stdoutAt = lines.findIndex((l) => l.startsWith("stdout ("));
+  const stderrAt = lines.findIndex((l) => l.startsWith("stderr ("));
+  assert.ok(stdoutAt > failedAt && stderrAt > stdoutAt);
+  assert.ok(lines.slice(stdoutAt).includes("out-30"));
+  assert.ok(!lines.slice(stdoutAt).includes("out-1"));
+  assert.ok(lines.slice(stderrAt).includes("err-30"));
+  assert.ok(!lines.slice(stderrAt).includes("err-1"));
+  // No stderr content is glued into the stdout block.
+  assert.ok(!lines.slice(stdoutAt, stderrAt).includes("err-30"));
+});
+
 /** A deferred gate: `entered` fires when the wrapped git call starts,
  * `open` releases it. Used to hold a release mid-run inside the lock. */
 function fetchGate(deps: { cmd: CmdRunner }) {

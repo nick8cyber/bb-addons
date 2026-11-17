@@ -263,7 +263,11 @@ export const EN: Record<string, string> = {
     "release {taskKey}: while writing the trailer, foreign commits " +
     "landed on {branch} (tip {head})",
   "rel.checkFailed":
-    "project check failed: {check} (exit {code})\n{tail}",
+    "project check failed: {check} (exit {code})",
+  "rel.checkStdout":
+    "stdout (last {lines} lines):\n{tail}",
+  "rel.checkStderr":
+    "stderr (last {lines} lines):\n{tail}",
   "rel.docsTrailerCommit": "release: docs not required",
   "rel.verdictUnparsableProblem":
     "the reviewing agent's reply does not parse as strict JSON",

@@ -1038,6 +1038,59 @@ async function syncBranch(
 
 // ── Step 3: проверки проекта ───────────────────────────────────────────
 
+/** PLUG-288: how many trailing lines of EACH stream a failed check
+ * report keeps. The old `stderr + stdout` tail mixed two independently
+ * collected streams into one order (npm/tsc write to stderr, the check
+ * script to stdout) and could push the failure summary out of the log. */
+const CHECK_TAIL_LINES = 20;
+
+/** PLUG-288: the summary line a checks script writes when a plugin
+ * fails — `check-changed-plugins: FAILED: <plugin>` (the bare `FAILED:`
+ * form is accepted too). Lifted into the report header so a long test
+ * log cannot hide it beyond the tail. */
+const CHECK_FAILED_LINE = /^\s*(?:[\w.-]+:\s*)?FAILED:/;
+
+/** PLUG-288: one stream's tail with its own label — stdout and stderr
+ * are reported as separate blocks, each in its original line order. */
+function checkStreamTail(
+  t: T,
+  stream: "stdout" | "stderr",
+  text: string,
+): string {
+  const trimmed = text.replace(/\s+$/, "");
+  if (trimmed === "") return "";
+  const lines = trimmed.split("\n").slice(-CHECK_TAIL_LINES);
+  return t(
+    stream === "stdout" ? "rel.checkStdout" : "rel.checkStderr",
+    { lines: lines.length, tail: lines.join("\n") },
+  );
+}
+
+/** PLUG-288: the whole refusal text: header (check, exit code, the
+ * explicitly extracted failure line) followed by separate stdout and
+ * stderr tails. */
+function formatCheckFailure(
+  t: T,
+  check: string,
+  res: BbCliResult,
+): string {
+  const failed = [
+    ...new Set(
+      `${res.stderr}\n${res.stdout}`
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => CHECK_FAILED_LINE.test(line)),
+    ),
+  ];
+  const parts = [t("rel.checkFailed", { check, code: res.exitCode })];
+  parts.push(...failed);
+  for (const stream of ["stdout", "stderr"] as const) {
+    const block = checkStreamTail(t, stream, res[stream]);
+    if (block !== "") parts.push(block);
+  }
+  return parts.join("\n");
+}
+
 async function runProjectChecks(
   deps: ReleaseDeps,
   repo: string,
@@ -1051,14 +1104,9 @@ async function runProjectChecks(
       timeoutMs: checksMinutes * 60_000,
     });
     if (res.exitCode !== 0) {
-      const tail = (res.stderr + "\n" + res.stdout).trim().split("\n");
       throw new OrchestratorError(
         "release-refused",
-        t("rel.checkFailed", {
-          check,
-          code: res.exitCode,
-          tail: tail.slice(-20).join("\n"),
-        }),
+        formatCheckFailure(t, check, res),
       );
     }
   }

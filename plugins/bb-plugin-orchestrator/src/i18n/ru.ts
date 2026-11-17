@@ -270,7 +270,11 @@ export const RU: Record<string, string> = {
     "release {taskKey}: во время записи трейлера на ветку {branch} " +
     "легли чужие коммиты (вершина {head})",
   "rel.checkFailed":
-    "проверка проекта упала: {check} (exit {code})\n{tail}",
+    "проверка проекта упала: {check} (exit {code})",
+  "rel.checkStdout":
+    "stdout (последние {lines} строк):\n{tail}",
+  "rel.checkStderr":
+    "stderr (последние {lines} строк):\n{tail}",
   "rel.docsTrailerCommit": "release: документы не требуются",
   "rel.verdictUnparsableProblem":
     "ответ проверяющего агента не парсится как строгий JSON",
