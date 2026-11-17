@@ -75,6 +75,11 @@ export const LEAK_PERSONAL_EMAIL = syntheticEmail("gmail.com");
  * `github-token` finding. */
 export const LEAK_GHP_SECRET = synthetic("ghp_", 36);
 
+/** §4 r11.1 synthetic private key sample. The `EXAMPLE` marker makes it exempt
+ * inside this allow-listed fixture file only; anywhere else it is a category-1
+ * `private-key` finding. */
+export const LEAK_PRIVATE_KEY = "-----BEGIN EXAMPLE RSA PRIVATE KEY-----";
+
 /** §20.2 (PLUG-269): token-shaped samples for the tool-less packet
  * tests — `synthetic` keeps each exempt inside this allow-listed
  * file; the same value anywhere else is a category-1 `github-token`

@@ -523,7 +523,7 @@ test("§25: setThreadRole writes source=owner + role.manual; next configure give
       },
     },
   );
-  assert.equal(config.tools.length, 5);
+  assert.equal(config.tools.length, 6);
 });
 
 test("§25: setThreadRole refuses non-pickable roles and clears the badge on none", async () => {
@@ -648,15 +648,15 @@ test("injectInstructions=false: no texts for any role, tools stay", () => {
     probes: probes("orchestrator"),
   });
   assert.equal(orch.instructions, undefined);
-  assert.equal(orch.tools.length, 5);
+  assert.equal(orch.tools.length, 6);
   assert.deepEqual(orch.skills, ["orchestrator-setup"]);
   const exec = buildAgentConfiguration(ctxFor("thr_e"), {
     ...deps,
     probes: probes("executor"),
   });
   assert.equal(exec.instructions, undefined);
-  // §19.1: the executor's only tool — helpers through the plugin.
-  assert.deepEqual(exec.tools, ["orchestrator_helper"]);
+  // §19.1/§26.4: helpers and kb.
+  assert.deepEqual(exec.tools, ["orchestrator_helper", "orchestrator_kb"]);
   assert.deepEqual(exec.skills, []);
 });
 
@@ -676,7 +676,7 @@ test("a role row beats the fallback markers in both directions", () => {
       probes: { ...base, roleByThreadId: () => "executor" },
     },
   );
-  assert.deepEqual(exec.tools, ["orchestrator_helper"]);
+  assert.deepEqual(exec.tools, ["orchestrator_helper", "orchestrator_kb"]);
   assert.equal(exec.instructions, ROLES.executor.instructions);
   // orchestrator role + executor-looking facts (a parent) → coordinator
   const orch = buildAgentConfiguration(
@@ -689,7 +689,7 @@ test("a role row beats the fallback markers in both directions", () => {
       probes: { ...base, roleByThreadId: () => "orchestrator" },
     },
   );
-  assert.equal(orch.tools.length, 5);
+  assert.equal(orch.tools.length, 6);
   assert.ok(orch.instructions!.includes("RULE"));
 });
 

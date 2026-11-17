@@ -863,13 +863,13 @@ test("configure during the dispatch window: unlinked executor gets nothing", asy
   await runDelegate({ taskKey: "PLUG-1", level: "simple", caller: COORDINATOR }, deps);
   assert.deepEqual(seenInWindow, []);
   // After the link, the delegations.row marker keeps it an executor —
-  // §19.1: the executor's only tool is orchestrator_helper.
+  // §19.1 + §26.4: executor tools are orchestrator_helper and orchestrator_kb.
   const config = buildAgentConfiguration(executorCtx, {
     injectInstructions: true,
     instructionsText: "RULE",
     probes: deps.probes,
   });
-  assert.deepEqual(config.tools, ["orchestrator_helper"]);
+  assert.deepEqual(config.tools, ["orchestrator_helper", "orchestrator_kb"]);
 });
 
 test("step 4: the executor's role is recorded and mirrored to metadata", async () => {

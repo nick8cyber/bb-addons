@@ -7280,6 +7280,45 @@ test("§22.4: один плагин с app — хвост «обнови стр�
   );
 });
 
+test("§22.4 / §26.6: плагин с app + --kb — строка KB предшествует хвосту «обнови страницу BB»", async () => {
+  const { repo, seed } = makeRepo();
+  withPluginChange(repo, "appplug", JSON.stringify({ app: "./app.tsx" }));
+  gitR(repo, ["commit", "-m", "feat: app plug with kb"]);
+  const kbDir = makeTempDir("kb-repo-");
+  gitR(kbDir, ["init", "-q"]);
+  gitR(kbDir, ["config", "user.name", "Agent"]);
+  gitR(kbDir, ["config", "user.email", "agent@test.local"]);
+  writeFileSync(join(kbDir, "README.md"), "# KB\n");
+  gitR(kbDir, ["add", "."]);
+  gitR(kbDir, ["commit", "-m", "init kb"]);
+
+  const { deps, store, sent } = makeDeps(repo, {
+    auditVerdict: APPROVE,
+    pluginList: () => [
+      { id: "appplug", rootDir: join(seed, "plugins", "appplug") },
+    ],
+    releaseText: ppCfg(seed),
+  });
+  (deps as unknown as ReleaseDeps).kbConfig = () => ({
+    enabled: true,
+    path: kbDir,
+    autoSync: false,
+    requireCleanOnRelease: false,
+  });
+
+  await runRelease({ taskKey: "PLUG-1", caller: COORD, kb: "Release with app" }, deps);
+  await auditDone(deps, store);
+  const line = ppLine(sent);
+  assert.match(
+    line,
+    /обнови страницу BB, чтобы увидеть новую версию: appplug$/,
+  );
+  assert.match(line, /KB: записан локально/);
+  const kbIdx = line.indexOf("KB: записан");
+  const reloadIdx = line.indexOf("обнови страницу BB");
+  assert.ok(kbIdx < reloadIdx, "KB status bit must precede reloadPage tail");
+});
+
 test("§22.4: серверный плагин без app — хвоста нет", async () => {
   const { repo, seed } = makeRepo();
   withPluginChange(repo, "srvplug", JSON.stringify({ name: "srvplug" }));

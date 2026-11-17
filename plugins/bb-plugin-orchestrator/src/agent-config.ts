@@ -32,6 +32,7 @@ export const COORDINATOR_TOOLS = [
   "orchestrator_cancel",
   "orchestrator_merge",
   "orchestrator_helper",
+  "orchestrator_kb",
 ] as const;
 
 /**

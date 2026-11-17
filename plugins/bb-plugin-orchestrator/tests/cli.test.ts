@@ -128,6 +128,7 @@ test("configure wires the registered tools for a coordinator thread", async () =
       "orchestrator_cancel",
       "orchestrator_delegate",
       "orchestrator_helper",
+      "orchestrator_kb",
       "orchestrator_merge",
       "orchestrator_status",
     ],
@@ -933,7 +934,7 @@ test("§18.6: userThreadPlugins — empty default denies, explicit list allows",
       origin: { pluginId: "handoff" },
     }),
   );
-  assert.equal(res2.tools.length, 5);
+  assert.equal(res2.tools.length, 6);
 });
 
 test("§18.6: status reports a missing commitIdentity as a warning", async () => {
