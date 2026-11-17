@@ -26,6 +26,8 @@ function getPlaywright() {
   } catch (e) {}
 
   try {
+    const localWebGemini = path.join(os.homedir(), '.local/share/web-gemini/node_modules/playwright-core');
+    if (fs.existsSync(localWebGemini)) return require(localWebGemini);
     const localShared = path.join(os.homedir(), '.local/share/argon-gemini/node_modules/playwright-core');
     if (fs.existsSync(localShared)) return require(localShared);
   } catch (e) {}
@@ -235,7 +237,7 @@ async function checkRobotVerification(page, options = {}) {
 
   let hasCaptchaText = false;
   try {
-    hasCaptchaText = await page.evaluate(() => {
+    hasCaptchaText = await safeEval(page, () => {
       const text = document.body ? document.body.innerText.toLowerCase() : '';
       return (
         text.includes('unusual traffic from your computer network') ||
@@ -359,7 +361,7 @@ async function getPickerButton(page) {
   // Fallback: a visible button whose text/aria-label names a known model.
   const handle = await page.evaluateHandle(() => {
     const vis = (el) => !!(el && el.offsetParent !== null);
-    const re = /argon|hydrogen|flash|flash-lite|\bpro\b|lite/i;
+    const re = /argon|hydrogen|flash|flash-lite|\bpro\b|lite|carbon/i;
     return [...document.querySelectorAll('button,[role="button"]')]
       .filter(vis)
       .find((e) => re.test(e.innerText + ' ' + (e.getAttribute('aria-label') || '')));
@@ -377,21 +379,66 @@ class ModelUnavailable extends Error {
   }
 }
 
-// PLUG-281: >~100KB prompts hang execCommand('insertText') — fail fast before
-// any page work. Unset → 100KB default; non-positive env → no limit.
-function argonMaxPromptBytes() {
-  const raw = process.env.ARGON_MAX_PROMPT_BYTES;
-  if (raw == null || raw === '') return 100 * 1024;
-  const v = Number(raw);
-  // NaN/garbage → default; non-positive → explicit "no limit".
-  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100 * 1024;
+// Gemini SPA navigation destroys the JS execution context mid-poll — retry a
+// few times instead of killing an already-sent turn.
+function isContextDestroyed(err) {
+  return /Execution context (was destroyed|is not available)|Cannot find context|detached [Ff]rame|frame was detached|Cannot find object|Inspected target navigated/i.test(
+    String(err && (err.message || err))
+  );
 }
 
-function throwIfPromptTooLarge(prompt) {
+async function safeEval(page, fn, arg, retries = 3) {
+  for (let i = 0; ; i++) {
+    try {
+      return arg === undefined ? await page.evaluate(fn) : await page.evaluate(fn, arg);
+    } catch (err) {
+      if (!isContextDestroyed(err) || i >= retries) throw err;
+      await page.waitForTimeout(300).catch(() => {});
+    }
+  }
+}
+
+async function safeQuery(page, selector, retries = 3) {
+  for (let i = 0; ; i++) {
+    try {
+      return await page.$(selector);
+    } catch (err) {
+      if (!isContextDestroyed(err) || i >= retries) throw err;
+      await page.waitForTimeout(300).catch(() => {});
+    }
+  }
+}
+
+async function safeQueryAll(page, selector, retries = 3) {
+  for (let i = 0; ; i++) {
+    try {
+      return await page.$$(selector);
+    } catch (err) {
+      if (!isContextDestroyed(err) || i >= retries) throw err;
+      await page.waitForTimeout(300).catch(() => {});
+    }
+  }
+}
+
+// PLUG-281: >~100KB prompts hang execCommand('insertText') — fail fast before
+// any page work. Unset → 100000 default; non-positive env → no limit.
+function argonMaxPromptBytes() {
+  const raw = process.env.ARGON_MAX_PROMPT_BYTES;
+  if (raw == null || raw === '') return 100_000;
+  const v = Number(raw);
+  // NaN/garbage → default; non-positive → explicit "no limit".
+  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100_000;
+}
+
+function throwIfPromptTooLarge(prompt, fieldMaxBytes = null) {
   const bytes = Buffer.byteLength(prompt || '', 'utf8');
-  const limit = argonMaxPromptBytes();
+  // A real maxlength on the web input field lowers the effective limit.
+  const ml = Number(fieldMaxBytes);
+  const limit = Number.isFinite(ml) && ml > 0 ? Math.min(argonMaxPromptBytes(), ml) : argonMaxPromptBytes();
   if (bytes > limit) {
-    const err = new Error(`prompt too large: ${bytes} bytes > ARGON_MAX_PROMPT_BYTES (${limit})`);
+    const err = new Error(
+      `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.`
+    );
     err.code = 'ARGON_PROMPT_TOO_LARGE';
     throw err;
   }
@@ -399,44 +446,83 @@ function throwIfPromptTooLarge(prompt) {
 
 async function selectModelAndThinking(page, model, thinking, strict = false) {
   const isMenuOpen = async () => {
-    const menu = await page.$('gem-menu[role="menu"], [role="menuitem"]');
-    return menu ? await menu.isVisible().catch(() => false) : false;
+    const menu = await safeQuery(page, 'gem-menu[role="menu"]:visible, gem-menu-item[data-mode-id]:visible, [role="menuitem"]:visible');
+    return menu !== null;
   };
 
   const openMenu = async () => {
     if (await isMenuOpen()) return;
     const btn = await getPickerButton(page);
     await btn.click({ timeout: 8000 });
-    await page.waitForSelector('[role="menuitem"], gem-menu-item', { timeout: 8000 });
+    await page.waitForSelector('gem-menu-item[data-mode-id]:visible, gem-menu-item:visible, [role="menuitem"]:visible', { timeout: 8000 });
     await page.waitForTimeout(300);
   };
 
-  if (model && model.toLowerCase() !== 'argon') {
+  if (model) {
     try {
       const btn = await getPickerButton(page);
       const btnText = (await btn.innerText()).trim().toLowerCase();
       const btnAria = ((await btn.getAttribute('aria-label')) || '').toLowerCase();
-      const alreadySelected = btnText.includes(model.toLowerCase()) || btnAria.includes(model.toLowerCase());
+      const m = model.toLowerCase();
+      const modelKeywords = {
+        argon: ['argon', 'код и анализ'],
+        carbon: ['carbon', 'самые сложные задачи'],
+        hydrogen: ['hydrogen', 'повседневные дела'],
+        pro: ['pro', 'исследования'],
+        'flash-lite': ['flash-lite', 'lite', 'быстрые ответы'],
+        lite: ['flash-lite', 'lite', 'быстрые ответы'],
+        flash: ['flash'],
+        fast: ['flash-lite', 'lite', 'быстрые ответы', 'flash'],
+      }[m] || [m];
+
+      const alreadySelected = (() => {
+        if (m === 'flash' || m === 'fast') {
+          if (btnText.includes('lite') || btnAria.includes('lite')) return false;
+          return wordMatch(btnText, 'flash') || wordMatch(btnAria, 'flash');
+        }
+        return modelKeywords.some(
+          (kw) => wordMatch(btnText, kw) || wordMatch(btnAria, kw) || btnText.includes(kw) || btnAria.includes(kw)
+        );
+      })();
 
       if (!alreadySelected) {
         await openMenu();
-        const items = await page.$$('gem-menu-item[data-mode-id], [role="menuitem"], .mat-mdc-menu-item');
+        const items = await safeQueryAll(page, 'gem-menu-item[data-mode-id]:visible, [role="menuitem"]:visible, .mat-mdc-menu-item:visible');
         let clicked = false;
         for (const item of items) {
           const rawText = await item.innerText();
           // Item layout varies: "ModelName" (EN) or "RU description\nVER ModelName"
           // — check every line, not just the first.
           const lines = rawText.split('\n').map((l) => l.trim().toLowerCase()).filter(Boolean);
-          const hasWord = (w) => lines.some((l) => wordMatch(l, w));
-          const m = model.toLowerCase();
+          const hasWord = (w) => lines.some((l) => wordMatch(l, w) || l.includes(w));
           const matches =
             (m === 'lite' || m === 'flash-lite')
-              ? hasWord('flash-lite') || hasWord('lite')
+              ? hasWord('flash-lite') || hasWord('lite') || hasWord('быстрые ответы')
               : (m === 'flash' || m === 'fast')
                 ? hasWord('flash') && !lines.some((l) => l.includes('lite'))
-                : hasWord(m);
+                : modelKeywords.some((kw) => hasWord(kw));
 
           if (matches) {
+            // Check for lock icon before clicking
+            const isLocked = await item.evaluate((el) => {
+              const icons = [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')];
+              return icons.some((icon) => {
+                const t = (icon.innerText || '').trim().toLowerCase();
+                const attr = (icon.getAttribute('data-mat-icon-name') || icon.getAttribute('aria-label') || '').toLowerCase();
+                return t === 'lock' || attr === 'lock' || (icon.className && icon.className.includes('lock'));
+              });
+            });
+            if (isLocked) {
+              if (strict) {
+                const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
+                err.isLocked = true;
+                err.lockedModel = m;
+                throw err;
+              }
+              console.warn(`[gemini-driver] Model "${model}" is locked (paid upgrade required).`);
+              break;
+            }
+
             const isDisabled = await item.evaluate(
               (el) =>
                 el.hasAttribute('disabled') ||
@@ -458,7 +544,7 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
                 // Locked models are clickable: the click opens a paid-upgrade
                 // dialog instead of selecting — detect and report.
                 await page.waitForTimeout(500);
-                const upsell = await page.evaluate(() => {
+                const upsell = await safeEval(page, () => {
                   const dlgs = [...document.querySelectorAll('mat-dialog-container, [role="dialog"]')]
                     .filter((e) => e.offsetParent !== null);
                   const dlg = dlgs.find((d) =>
@@ -470,7 +556,12 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
                   if (b) b.click();
                   return true;
                 });
-                if (upsell) throw new ModelUnavailable('model', `${model} locked: paid upgrade required`);
+                if (upsell) {
+                  const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
+                  err.isLocked = true;
+                  err.lockedModel = m;
+                  throw err;
+                }
               }
             }
             break;
@@ -515,7 +606,7 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
         await openMenu();
 
         // Expand Thinking level submenu
-        const thinkingTrigger = await page.$(
+        const thinkingTrigger = await safeQuery(page,
           '[value="thinking_level"], [role="menuitem"]:has-text("Thinking level"), gem-menu-item:has-text("Thinking level"), gem-menu-item:has-text("Уровень рассуждений"), [role="menuitem"]:has-text("Уровень рассуждений")'
         );
         if (thinkingTrigger) {
@@ -544,7 +635,7 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
             ? `#${submenuId} gem-menu-item, #${submenuId} [role="menuitem"], .submenu-container gem-menu-item, .submenu-container [role="menuitem"]`
             : `.submenu-container gem-menu-item, [role="menuitem"]`;
 
-          const items = await page.$$(subSelector);
+          const items = await safeQueryAll(page, subSelector);
           let clicked = false;
           for (const item of items) {
             const rawText = (await item.innerText()).trim();
@@ -608,7 +699,7 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
 async function stopGeneration(page) {
   if (!page) return;
   try {
-    const stopBtn = await page.$('button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
+    const stopBtn = await safeQuery(page, 'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
     if (stopBtn) {
       await stopBtn.click({ timeout: 2000 }).catch(() => {});
     }
@@ -640,10 +731,10 @@ async function waitForHistoryStabilization(
   { intervalMs = 350, ceilingMs = 10000, throwIfCancelled = null } = {}
 ) {
   if (!convId) {
-    return (await page.$$('model-response')).length;
+    return (await safeQueryAll(page, 'model-response')).length;
   }
   const deadline = Date.now() + ceilingMs;
-  let prevCount = (await page.$$('model-response')).length;
+  let prevCount = (await safeQueryAll(page, 'model-response')).length;
   let stableMeasurements = 0;
   while (Date.now() < deadline) {
     if (page.waitForTimeout) {
@@ -652,7 +743,7 @@ async function waitForHistoryStabilization(
       await new Promise((r) => setTimeout(r, intervalMs));
     }
     if (throwIfCancelled) await throwIfCancelled();
-    const current = (await page.$$('model-response')).length;
+    const current = (await safeQueryAll(page, 'model-response')).length;
     if (current === prevCount) {
       stableMeasurements++;
       if (stableMeasurements >= 2) {
@@ -663,7 +754,7 @@ async function waitForHistoryStabilization(
       prevCount = current;
     }
   }
-  return (await page.$$('model-response')).length;
+  return (await safeQueryAll(page, 'model-response')).length;
 }
 
 async function sendPrompt({
@@ -734,6 +825,17 @@ async function sendPrompt({
       await page.waitForSelector(textboxSelector, { timeout: 10000 });
     }
 
+    // PLUG-281: if the web input exposes a real maxlength, it wins over env.
+    const fieldMaxBytes = await page
+      .evaluate((sel) => {
+        const el = document.querySelector(sel);
+        const v = el && (el.maxLength ?? el.getAttribute?.('maxlength'));
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      }, textboxSelector)
+      .catch(() => null);
+    if (fieldMaxBytes) throwIfPromptTooLarge(prompt, fieldMaxBytes);
+
     if (model || thinking) {
       await selectModelAndThinking(page, model, thinking, isStrict);
     }
@@ -763,7 +865,7 @@ async function sendPrompt({
         await page.waitForTimeout(100);
 
         if (prompt.length > 500 || prompt.includes('\n')) {
-          await page.evaluate(({ sel, text }) => {
+          await safeEval(page, ({ sel, text }) => {
             const el = document.querySelector(sel);
             if (el) {
               el.focus();
@@ -772,7 +874,7 @@ async function sendPrompt({
           }, { sel: textboxSelector, text: prompt });
           await page.waitForTimeout(200);
 
-          const gotText = await page.evaluate((sel) => {
+          const gotText = await safeEval(page, (sel) => {
             return ((document.querySelector(sel) || {}).innerText || '');
           }, textboxSelector);
 
@@ -788,7 +890,7 @@ async function sendPrompt({
           await page.waitForTimeout(200);
         }
 
-        typed = await page.evaluate(
+        typed = await safeEval(page,
           ({ sel, want }) => {
             const t = (((document.querySelector(sel) || {}).innerText) || '')
               .replace(/\s+/g, ' ').trim();
@@ -807,7 +909,7 @@ async function sendPrompt({
 
     const sendBtnSelector =
       'button[aria-label*="Send message" i], button[aria-label*="Отправить" i], button.send-button, button[aria-label*="сообщение" i]';
-    const sendBtn = await page.$(sendBtnSelector);
+    const sendBtn = await safeQuery(page, sendBtnSelector);
     let sent = false;
     if (sendBtn && !(await sendBtn.isDisabled().catch(() => true))) {
       try {
@@ -825,7 +927,7 @@ async function sendPrompt({
     const genDeadline = Date.now() + 120000;
     for (;;) {
       await throwIfCancelled();
-      const started = await page.evaluate(
+      const started = await safeEval(page,
         ({ idx, promptPrefix, fnSrc }) => {
           const stopBtn = document.querySelector(
             'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]'
@@ -859,7 +961,7 @@ async function sendPrompt({
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
 
-      const currentText = await page.evaluate(
+      const currentText = await safeEval(page,
         ({ idx, promptPrefix, fnSrc }) => {
           if (!window.__argonFindTurnTarget && fnSrc) {
             // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
@@ -896,9 +998,9 @@ async function sendPrompt({
         }
       }
 
-      const stopButton = await page.$('button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
+      const stopButton = await safeQuery(page, 'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
 
-      const hasFinishedContent = await page.evaluate(
+      const hasFinishedContent = await safeEval(page,
         ({ idx, promptPrefix, fnSrc }) => {
           if (!window.__argonFindTurnTarget && fnSrc) {
             // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
@@ -928,7 +1030,7 @@ async function sendPrompt({
     }
 
     // Hit the cap mid-generation → the answer is truncated, not complete.
-    if (Date.now() - streamStartTime >= MAX_WAIT_MS && (await page.$(
+    if (Date.now() - streamStartTime >= MAX_WAIT_MS && (await safeQuery(page,
       'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]'
     ))) {
       await stopGeneration(page);
@@ -989,7 +1091,7 @@ async function dismissOverlays(page) {
     // 0. Google consent wall ("Before you continue to Google") mounts late —
     //    retry up to ~4s until the mat-dialog-container is gone.
     for (let i = 0; i < 5; i++) {
-      const consent = await page.evaluate(() => {
+      const consent = await safeEval(page, () => {
         const dlg = document.querySelector('mat-dialog-container, .cdk-overlay-pane [role="dialog"], .cdk-overlay-pane');
         if (!dlg || !(dlg.innerText || '').includes('Before you continue')) return 'none';
         const btns = Array.from(dlg.querySelectorAll('button,[role="button"],a'));
@@ -1011,7 +1113,7 @@ async function dismissOverlays(page) {
     //     landing page until this button is clicked; the choice persists
     //     server-side, so this runs only once per account.
     for (let i = 0; i < 4; i++) {
-      const useBtn = await page.evaluate(() => {
+      const useBtn = await safeEval(page, () => {
         const vis = (el) => !!(el && el.offsetParent !== null);
         const e = [...document.querySelectorAll('button,[role="button"]')]
           .filter(vis)
@@ -1028,7 +1130,7 @@ async function dismissOverlays(page) {
     // 0.7. Paid-tier upsell dialog (locked model click → "Сменить план / Не сейчас").
     //     Dismiss via the negative button; the plan is never changed.
     for (let i = 0; i < 3; i++) {
-      const dismissed = await page.evaluate(() => {
+      const dismissed = await safeEval(page, () => {
         const dlgs = [...document.querySelectorAll('mat-dialog-container, [role="dialog"]')]
           .filter((e) => e.offsetParent !== null);
         const dlg = dlgs.find((d) =>
@@ -1046,8 +1148,8 @@ async function dismissOverlays(page) {
     }
 
     // 1. Google Cookie / Privacy Consent dialogs ("Before you continue to Google")
-    const consentBtn = await page.$(
-      'button:has-text("Accept all"), [aria-label*="Accept all" i], button:has-text("I agree"), [aria-label*="I agree" i]'
+    const consentBtn = await safeQuery(page,
+      'button:has-text("Accept all"), button:has-text("Принять все"), button:has-text("Принять всё"), [aria-label*="Accept all" i], button:has-text("I agree"), button:has-text("Согласен"), [aria-label*="I agree" i]'
     );
     if (consentBtn) {
       const isVisible = await consentBtn.isVisible().catch(() => false);
@@ -1058,8 +1160,8 @@ async function dismissOverlays(page) {
     }
 
     // 2. "Stay signed out" / "Dismiss" prompts
-    const staySignedOutBtn = await page.$(
-      'button:has-text("Stay signed out"), [aria-label*="Stay signed out" i], button:has-text("Dismiss"), button:has-text("No thanks")'
+    const staySignedOutBtn = await safeQuery(page,
+      'button:has-text("Stay signed out"), button:has-text("Не входить в аккаунт"), [aria-label*="Stay signed out" i], button:has-text("Dismiss"), button:has-text("No thanks"), button:has-text("Не сейчас"), button:has-text("Спасибо, не надо")'
     );
     if (staySignedOutBtn) {
       const isVisible = await staySignedOutBtn.isVisible().catch(() => false);
@@ -1070,8 +1172,8 @@ async function dismissOverlays(page) {
     }
 
     // 3. Onboarding / "Got it" / "Next" dialogs
-    const gotItBtn = await page.$(
-      'button:has-text("Got it"), [aria-label*="Got it" i], button:has-text("Done"), [aria-label*="Done" i], button:has-text("Continue")'
+    const gotItBtn = await safeQuery(page,
+      'button:has-text("Got it"), button:has-text("Понятно"), [aria-label*="Got it" i], button:has-text("Done"), button:has-text("Готово"), [aria-label*="Done" i], button:has-text("Continue"), button:has-text("Продолжить")'
     );
     if (gotItBtn) {
       const isVisible = await gotItBtn.isVisible().catch(() => false);
@@ -1082,7 +1184,7 @@ async function dismissOverlays(page) {
     }
 
     // 4. Any leftover CDK backdrop
-    const backdrop = await page.$('.cdk-overlay-backdrop');
+    const backdrop = await safeQuery(page, '.cdk-overlay-backdrop');
     if (backdrop && (await backdrop.isVisible().catch(() => false))) {
       await page.keyboard.press('Escape');
       await page.waitForTimeout(200);
@@ -1094,7 +1196,7 @@ async function ensureSidebarOpen(page) {
   await dismissOverlays(page);
   await page.waitForSelector('side-navigation-v2, nav, [role="navigation"]', { timeout: 10000 }).catch(() => {});
 
-  const openBtn = await page.$(
+  const openBtn = await safeQuery(page,
     'button[aria-label*="Open sidebar" i], button[data-test-id="side-nav-sparkle-button"][aria-label*="Open sidebar" i], button[aria-label*="Expand sidebar" i]'
   );
   if (openBtn) {
@@ -1116,7 +1218,7 @@ async function listConversationsInternal(page) {
   await page
     .waitForSelector('gem-nav-list-item a[href*="/app/"], a[href*="/app/"]', { timeout: 10000 })
     .catch(() => {});
-  return await page.evaluate(() => {
+  return await safeEval(page, () => {
     const items = Array.from(
       document.querySelectorAll(
         'gem-nav-list-item[data-test-id="conversation"], gem-nav-list-item:has(a[href*="/app/"])'
@@ -1212,7 +1314,7 @@ async function getConversationTranscript(idOrIndex, opts = {}) {
       await page.waitForTimeout(500);
     }
 
-    const transcriptData = await page.evaluate(async () => {
+    const transcriptData = await safeEval(page, async () => {
       const turnEls = Array.from(document.querySelectorAll('user-query, model-response'));
       const turns = [];
 
@@ -1275,7 +1377,7 @@ async function getConversationTranscript(idOrIndex, opts = {}) {
 
 async function deleteConversationInternal(page, targetId) {
   await ensureSidebarOpen(page);
-  const item = await page.$(`gem-nav-list-item:has(a[href*="/app/${targetId}"])`);
+  const item = await safeQuery(page, `gem-nav-list-item:has(a[href*="/app/${targetId}"])`);
   if (!item) {
     throw new Error(`Conversation element not found for ID: ${targetId}`);
   }
@@ -1294,13 +1396,13 @@ async function deleteConversationInternal(page, targetId) {
   await moreBtn.click();
 
   const deleteMenuItem = await page.waitForSelector(
-    '[data-test-id="delete-button"], [role="menuitem"]:has-text("Delete")',
+    '[data-test-id="delete-button"], [role="menuitem"]:has-text("Delete"), [role="menuitem"]:has-text("Удалить")',
     { timeout: 3000 }
   );
   await deleteMenuItem.click();
 
   const dialog = await page.waitForSelector('mat-dialog-container', { timeout: 5000 });
-  const confirmBtn = await dialog.waitForSelector('button:has-text("Delete")', { timeout: 3000 });
+  const confirmBtn = await dialog.waitForSelector('button:has-text("Delete"), button:has-text("Удалить"), [data-test-id="confirm-button"]', { timeout: 3000 });
   await confirmBtn.click();
 
   await dialog.waitForElementState('hidden', { timeout: 5000 }).catch(() => {});
@@ -1325,8 +1427,8 @@ async function deleteConversation(idOrIndex, opts = {}) {
 }
 
 async function getUploadToolsButton(page) {
-  return page.$(
-    'button[aria-label="Upload & tools"], button[aria-label*="Upload & tools" i], button[aria-label*="tools" i], button:has([data-mat-icon-name="plus"])'
+  return safeQuery(page,
+    'button[aria-label="Upload & tools"], button[aria-label*="Upload & tools" i], button[aria-label*="tools" i], button:has([data-mat-icon-name="plus"]), [data-test-id="upload-button"], button[aria-label*="Загрузка" i], button[aria-label*="инструменты" i], button:has([data-mat-icon-name="add"])'
   );
 }
 
@@ -1346,25 +1448,37 @@ async function attachFile(page, filePath) {
   await btn.click();
   await page.waitForTimeout(300);
 
-  const uploadItem = await page.$(
-    '[role="menuitem"]:has-text("Upload files"), .mat-mdc-menu-item:has-text("Upload files")'
-  );
-  if (!uploadItem) {
-    throw new Error('"Upload files" option not found in tools menu.');
+  // Input-first: the "+" menu mounts a hidden DOM twin of the upload item —
+  // a text-matched page.$ can pick it, the click is a no-op and no filechooser
+  // ever fires. Opening the menu then driving a real (even if visually hidden)
+  // input[type="file"] works regardless of menu-item duplicates.
+  const fileInput = await page.waitForSelector('input[type="file"]', {
+    state: 'attached',
+    timeout: 8000,
+  }).catch(() => null);
+
+  if (fileInput) {
+    await fileInput.setInputFiles(resolvedPath);
+  } else {
+    // Fallback: a VISIBLE upload item (data-test-id first, then localized text).
+    const uploadItem = await safeQuery(page,
+      '[data-test-id="local-images-files-uploader-button"], [role="menuitem"]:has-text("Upload files"):visible, [role="menuitem"]:has-text("Загрузить файлы"):visible, .mat-mdc-menu-item:has-text("Upload files"):visible, .mat-mdc-menu-item:has-text("Загрузить файлы"):visible'
+    );
+    if (!uploadItem) {
+      throw new Error('"Upload files" option not found in tools menu.');
+    }
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent('filechooser', { timeout: 8000 }),
+      uploadItem.click()
+    ]);
+    await fileChooser.setFiles(resolvedPath);
   }
-
-  const [fileChooser] = await Promise.all([
-    page.waitForEvent('filechooser', { timeout: 8000 }),
-    uploadItem.click()
-  ]);
-
-  await fileChooser.setFiles(resolvedPath);
   await page.waitForTimeout(1000);
 
   // Wait up to 15s for file preview chip to appear and send button to become enabled
   await page.waitForFunction(() => {
     const hasChip = document.querySelector('[aria-label*="close" i], [aria-label*="remove" i], file-preview') !== null;
-    const btn = document.querySelector('button[aria-label*="Send message"], button[aria-label="Send message"]');
+    const btn = document.querySelector('button[aria-label*="Send message"], button[aria-label="Send message"], button[aria-label*="Отправить"], button.send-button');
     const btnReady = btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
     return hasChip && btnReady;
   }, { timeout: 15000 }).catch(() => {});
@@ -1378,7 +1492,7 @@ async function downloadGeneratedMedia(page, targetPath) {
   await page.waitForTimeout(1000);
 
   // 1. Check for rendered image in latest response via canvas toDataURL
-  const imgDataUrl = await page.evaluate(() => {
+  const imgDataUrl = await safeEval(page, () => {
     const lastResp = document.querySelector('model-response:last-of-type');
     if (!lastResp) return null;
     const img = lastResp.querySelector(
@@ -1410,7 +1524,7 @@ async function downloadGeneratedMedia(page, targetPath) {
   }
 
   // 2. Check for download button on latest response
-  const downloadBtn = await page.$(
+  const downloadBtn = await safeQuery(page,
     'model-response:last-of-type button[aria-label*="Download" i], model-response:last-of-type a[download], [data-test-id*="download"]'
   );
 
@@ -1430,7 +1544,7 @@ async function downloadGeneratedMedia(page, targetPath) {
   }
 
   // 3. Check for generated image in latest response with data: URI
-  const imgData = await page.evaluate(() => {
+  const imgData = await safeEval(page, () => {
     const lastResp = document.querySelector('model-response:last-of-type');
     if (!lastResp) return null;
     const img = lastResp.querySelector(

@@ -41,6 +41,7 @@ import {
   verdictDetailsInBody,
 } from "./release.js";
 import { DEFAULT_HANDOFF_PATH } from "./roles.js";
+import { isPluginUiFile, pluginNameForPaths } from "./staged.js";
 import { T_RU, type T } from "./i18n/index.js";
 
 /** §5.2 built-in quota text patterns; `routes.*.quotaPatterns` extends. */
@@ -1608,6 +1609,57 @@ export function createWatchdog(deps: WatchdogDeps) {
         commits,
         dirty,
       });
+      // §24.2 (r33.5): stage the round's plugin work — the paths the
+      // task's commits touched (from the merge base with origin/main to
+      // `sha`), which of them are UI, and the plugin they belong to.
+      // A failure here never fails the round result.
+      try {
+        let filesBase: string | null = null;
+        const candidateRefs: string[] = [];
+        if (env.mergeBaseBranch) {
+          candidateRefs.push(
+            `origin/${env.mergeBaseBranch}`,
+            env.mergeBaseBranch,
+          );
+        }
+        candidateRefs.push("origin/main", "main", "origin/master", "master");
+        for (const ref of candidateRefs) {
+          const mb = await git(["merge-base", sha, ref]).catch(() => "");
+          if (mb.trim()) {
+            filesBase = mb.trim();
+            break;
+          }
+        }
+        if (!filesBase && start) {
+          filesBase = start;
+        }
+        if (filesBase) {
+          const changed = (
+            await git(["diff", "--name-only", filesBase, sha])
+          )
+            .split("\n")
+            .filter(Boolean);
+          if (changed.length) {
+            const uiFiles = changed.filter(isPluginUiFile);
+            store.recordStagedFeature({
+              taskKey: row.task_key,
+              projectId: row.project_id,
+              pluginName: pluginNameForPaths(
+                uiFiles.length ? uiFiles : changed,
+                env.path!,
+              ),
+              branchName: branch,
+              resultSha: sha,
+              uiTouched: uiFiles.length > 0,
+              uiFiles,
+            });
+          }
+        }
+      } catch (e) {
+        log.warn?.(
+          `orchestrator: staged feature ${row.task_key}: ${message(e)}`,
+        );
+      }
       const problems: string[] = [];
       if (env.branchName && branch !== env.branchName) {
         problems.push(

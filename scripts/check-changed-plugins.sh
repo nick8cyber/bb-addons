@@ -18,6 +18,12 @@ BASE="${1:-origin/main}"
 
 cd "$(dirname "$0")/.." || exit 1
 
+# Serialize npm ci runs of this script: npm ci holds an exclusive flock on
+# .deps-install.lock in the repository root, so concurrent runs of the script
+# cannot race installs or wipe node_modules/.bin mid-check. The lock file is
+# gitignored.
+LOCK_FILE="$(git rev-parse --show-toplevel)/.deps-install.lock"
+
 if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
   echo "check-changed-plugins: base ref '$BASE' not found (fetch first?)" >&2
   exit 1
@@ -87,16 +93,23 @@ for dir in "${PLUGIN_DIRS[@]}"; do
   ok=1
 
   if ! deps_ok "$dir"; then
-    # a node_modules symlink points into a shared store — `npm ci`
-    # would delete every entry INSIDE the link target (the store of
-    # the main checkout or other worktrees). Unlink it first
-    # (rm -f, never -r); npm ci then creates a real directory.
-    if [ -L "$dir/node_modules" ]; then rm -f "$dir/node_modules"; fi
-    # The release pipeline runs the checks from the plugin host process
-    # with NODE_ENV=production, where npm omits devDependencies — tsc and
-    # other devDeps would go missing. --include=dev overrides the omit.
-    echo "    npm ci --include=dev"
-    (cd "$dir" && nice -n 19 npm ci --include=dev --silent) || ok=0
+    (
+      flock -x 200 || exit 1
+      # Double-checked locking: a concurrent process may have finished
+      # `npm ci` while we waited for the lock — no need to reinstall.
+      if ! deps_ok "$dir"; then
+        # a node_modules symlink points into a shared store — `npm ci`
+        # would delete every entry INSIDE the link target (the store of
+        # the main checkout or other worktrees). Unlink it first
+        # (rm -f, never -r); npm ci then creates a real directory.
+        if [ -L "$dir/node_modules" ]; then rm -f "$dir/node_modules"; fi
+        # The release pipeline runs the checks from the plugin host process
+        # with NODE_ENV=production, where npm omits devDependencies — tsc and
+        # other devDeps would go missing. --include=dev overrides the omit.
+        echo "    npm ci --include=dev"
+        (cd "$dir" && nice -n 19 npm ci --include=dev --silent) || exit 1
+      fi
+    ) 200>"$LOCK_FILE" || ok=0
   fi
 
   if [ "$ok" -eq 1 ] && [ -n "$(cd "$dir" && npm pkg get scripts.test 2>/dev/null | grep -v '^{}')" ]; then

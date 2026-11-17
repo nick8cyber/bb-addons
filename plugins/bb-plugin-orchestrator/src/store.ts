@@ -340,6 +340,27 @@ export const MIGRATIONS: readonly string[] = [
   // (`{"paths":[…],"from":…}`) so a reissue rebuilds the same packet.
   `ALTER TABLE delegations ADD COLUMN queued_at INTEGER`,
   `ALTER TABLE delegations ADD COLUMN attach TEXT`,
+  // §24.2 (r33.5): staged executor results per plugin — the release
+  // gate's record of in-review rounds whose UI commits a release would
+  // silently revert (`ui_touched`/`ui_files` feed the unmerged-ui
+  // refusal); `releases.dropped_unmerged_reason` carries the
+  // `--force-drop-unmerged` reason.
+  `CREATE TABLE IF NOT EXISTS plugin_staged_features (
+    task_key TEXT PRIMARY KEY,
+    project_id TEXT,
+    plugin_name TEXT NOT NULL,
+    branch_name TEXT,
+    result_sha TEXT NOT NULL,
+    ui_touched INTEGER NOT NULL DEFAULT 0,
+    ui_files TEXT,
+    status TEXT NOT NULL CHECK (status IN ('in_review', 'merged', 'dropped')),
+    dropped_reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS plugin_staged_features_plugin_idx
+    ON plugin_staged_features(plugin_name, status);
+  ALTER TABLE releases ADD COLUMN dropped_unmerged_reason TEXT`,
 ];
 
 export type CommandRunStatus =
@@ -536,6 +557,9 @@ export interface ReleaseRow {
   pr_error_count: number;
   /** §2 п.6 (r11): merge-коммит влитого PR — строка «влит → sha7». */
   pr_merge_sha: string | null;
+  /** §24.2 (r33.5): причина `--force-drop-unmerged` — выкладка прошла
+   * поверх незамерженных UI-фич того же плагина. */
+  dropped_unmerged_reason: string | null;
   error: string | null;
   created_at: number;
   updated_at: number;
@@ -548,6 +572,27 @@ export interface ThreadRoleRow {
   role: string;
   decided_at: number;
   source: ThreadRoleSource;
+}
+
+export type StagedFeatureStatus = "in_review" | "merged" | "dropped";
+
+/** §24.2 (r33.5): one task's staged plugin work — which plugin the
+ * round's commits touched and whether UI files were among them. The
+ * release gate reads `in_review` rows with `ui_touched = 1` whose
+ * `result_sha` is not an ancestor of the published HEAD. */
+export interface StagedFeatureRow {
+  task_key: string;
+  project_id: string | null;
+  plugin_name: string;
+  branch_name: string | null;
+  result_sha: string;
+  ui_touched: number;
+  /** JSON-массив путей интерфейса из диффа захода. */
+  ui_files: string | null;
+  status: StagedFeatureStatus;
+  dropped_reason: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
 /** §19.1/§19.4: helper statuses — no `reissued` (helpers are never
@@ -2412,6 +2457,7 @@ export class DelegationStore {
       auditDelegationId?: number | null;
       prUrl?: string | null;
       publishBranch?: string | null;
+      droppedUnmergedReason?: string | null;
       error?: string | null;
     },
   ): void {
@@ -2425,6 +2471,7 @@ export class DelegationStore {
       auditDelegationId: "audit_delegation_id",
       prUrl: "pr_url",
       publishBranch: "publish_branch",
+      droppedUnmergedReason: "dropped_unmerged_reason",
       error: "error",
     };
     for (const [key, col] of Object.entries(map)) {
@@ -3183,6 +3230,137 @@ export class DelegationStore {
     return this.db
       .prepare(`SELECT * FROM releases WHERE pr_state = ? ORDER BY id`)
       .all(state) as ReleaseRow[];
+  }
+
+  /** §24.2 (r33.5): record a finished round's staged plugin work. The
+   * task_key is the primary key — a re-run refreshes the row's sha,
+   * branch, plugin and UI flags. When updating an existing row, ui_files
+   * are unioned and ui_touched remains true if either old or new touched UI. */
+  recordStagedFeature(feature: {
+    taskKey: string;
+    projectId?: string | null;
+    pluginName: string;
+    branchName?: string | null;
+    resultSha: string;
+    uiTouched: boolean;
+    uiFiles: string[];
+    status?: StagedFeatureStatus;
+    droppedReason?: string | null;
+  }): void {
+    const now = Date.now();
+    const key = normalizeTaskKey(feature.taskKey);
+    const existing = this.stagedFeature(key);
+    let uiTouched = feature.uiTouched;
+    let uiFiles = [...feature.uiFiles];
+    if (existing) {
+      if (existing.ui_touched === 1) {
+        uiTouched = true;
+      }
+      try {
+        const oldFiles = JSON.parse(existing.ui_files || "[]");
+        if (Array.isArray(oldFiles)) {
+          const set = new Set([...oldFiles, ...uiFiles]);
+          uiFiles = Array.from(set);
+        }
+      } catch {
+        // malformed old json — keep new files
+      }
+    }
+    if (uiFiles.length > 0) {
+      uiTouched = true;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO plugin_staged_features (
+          task_key, project_id, plugin_name, branch_name, result_sha,
+          ui_touched, ui_files, status, dropped_reason, created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_key) DO UPDATE SET
+          project_id = excluded.project_id,
+          plugin_name = excluded.plugin_name,
+          branch_name = excluded.branch_name,
+          result_sha = excluded.result_sha,
+          ui_touched = excluded.ui_touched,
+          ui_files = excluded.ui_files,
+          status = excluded.status,
+          dropped_reason = excluded.dropped_reason,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        key,
+        feature.projectId ?? null,
+        feature.pluginName,
+        feature.branchName ?? null,
+        feature.resultSha,
+        uiTouched ? 1 : 0,
+        JSON.stringify(uiFiles),
+        feature.status ?? "in_review",
+        feature.droppedReason ?? null,
+        now,
+        now,
+      );
+  }
+
+  /** §24.2: staged features of one plugin — the release gate reads
+   * `status = 'in_review'`; callers may ask for another status. */
+  stagedFeaturesForPlugin(
+    pluginName: string,
+    status?: string,
+  ): StagedFeatureRow[] {
+    return status === undefined
+      ? (this.db
+          .prepare(
+            `SELECT * FROM plugin_staged_features
+             WHERE plugin_name = ? ORDER BY task_key`,
+          )
+          .all(pluginName) as StagedFeatureRow[])
+      : (this.db
+          .prepare(
+            `SELECT * FROM plugin_staged_features
+             WHERE plugin_name = ? AND status = ? ORDER BY task_key`,
+          )
+          .all(pluginName, status) as StagedFeatureRow[]);
+  }
+
+  /** §24.2: `--force-drop-unmerged <причина>` — незамерженные строки
+   * уходят в `dropped` с причиной. */
+  markStagedFeaturesDropped(taskKeys: string[], reason: string): void {
+    if (!taskKeys.length) return;
+    const now = Date.now();
+    const marks = taskKeys.map(() => "?").join(",");
+    this.db
+      .prepare(
+        `UPDATE plugin_staged_features
+         SET status = 'dropped', dropped_reason = ?, updated_at = ?
+         WHERE task_key IN (${marks}) AND status = 'in_review'`,
+      )
+      .run(
+        reason,
+        now,
+        ...taskKeys.map((k) => normalizeTaskKey(k)),
+      );
+  }
+
+  /** §24.2: the §14 merge landed — the staged row stops guarding. */
+  markStagedFeatureMerged(taskKey: string): void {
+    this.db
+      .prepare(
+        `UPDATE plugin_staged_features
+         SET status = 'merged', updated_at = ? WHERE task_key = ?`,
+      )
+      .run(Date.now(), normalizeTaskKey(taskKey));
+  }
+
+  stagedFeature(taskKey: string): StagedFeatureRow | null {
+    return (
+      (this.db
+        .prepare(
+          `SELECT * FROM plugin_staged_features WHERE task_key = ?`,
+        )
+        .get(normalizeTaskKey(taskKey)) as StagedFeatureRow | undefined) ??
+      null
+    );
   }
 
 }

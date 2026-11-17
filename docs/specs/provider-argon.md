@@ -2,8 +2,8 @@
 title: provider-argon — ACP-провайдер веб-интерфейса Gemini (Argon)
 status: approved
 owner: coordinator
-date: 2026-11-16
-revision: 8
+date: 2026-11-17
+revision: 12
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -42,21 +42,20 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   - `session/new` создаёт новую запись сессии `{ id, cwd, model, thinking, convId, account, backend }`.
   - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
   - Возвращают список моделей `models.availableModels` в виде объектов `{ modelId, name }` по схеме ACP:
-    - `'argon'` — «Gemini (Argon)» (модель по умолчанию для Gemini 4)
-    - `'fast'` — «Gemini 3 Flash (Fast)»
-    - `'thinking'` — «Gemini 3 Flash (Thinking)»
-    - `'pro'` — «Gemini 3.1 Pro (старая 3.1, не рекомендуется)»
+    - `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию)
+    - `'carbon'` — «Gemini 4 Carbon» (Самые сложные задачи, тариф Ultra)
+    - `'hydrogen'` — «Gemini 4 Hydrogen» (Повседневные дела)
+    - `'pro'` — «Gemini 3.1 Pro» (Исследования)
+    - `'flash-lite'` — «Gemini 3.5 Flash-Lite» (Быстрые ответы)
   - Возвращают конфигурационные опции `configOptions`:
-    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `fast`, `thinking`, `pro`);
-    - `thinking` (категория `"thought_level"`): значения `fast` / `thinking` / `pro`;
-    - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB;
+    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `hydrogen`, `pro`, `flash-lite`);
+    - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB (`Low`, `Medium`, `High`);
     - `account` (категория `"account"`, возвращается при наличии более одного аккаунта в пуле): выбор аккаунта (`"auto"` или конкретный `id` аккаунта).
   Все опции принимаются и обрабатываются в `session/set_config_option`.
-- **`session/set_model`** — меняет `s.model` и синхронизирует `s.thinking`, если `modelId` входит в `{ "argon", "fast", "thinking", "pro" }`. Для модели `argon` режим рассуждения по умолчанию — `medium` (или `high` при запрошенном reasoning `high`).
+- **`session/set_model`** — меняет `s.model` через `resolveModelId`; `s.thinking` не изменяет — при незаданном уровне подставляется `medium`.
 - **`session/set_config_option`**:
-  - при `configId === "thought_level"` преобразует уровень: `"low"` → `thinking: "low"`, `"medium"` → `thinking: "medium"`, `"high"` → `thinking: "high"`; имя модели `s.model` обновляется на `fast` / `thinking` / `pro` **только** если `s.model !== "argon"` (для модели `"argon"` имя модели всегда сохраняется неизменным во всех трёх уровнях `low`, `medium`, `high`, в соответствии с кодом `acp-server.mjs:1104–1116`), обеспечивая полную совместимость с пресетами оркестратора `argon-review` и `argon-research` (передающими `model: "argon"`, `reasoning: "high"` по §§20.4, 21.4);
-  - при `configId === "thinking"` обновляет `s.thinking` (`fast` / `low` → `"low"`, `thinking` / `medium` → `"medium"`, `pro` / `high` → `"high"`) и аналогично обновляет имя модели на `fast` / `thinking` / `pro` **только** если `s.model !== "argon"`;
-  - при `configId === "model"` обновляет `s.model` и уровень `s.thinking` по умолчанию;
+  - при `configId === "thought_level"` (или `configId === "thinking"`) обновляет уровень мышления `s.thinking`: `"low"` → `"low"`, `"medium"` → `"medium"`, `"high"` → `"high"`, не затрагивая выбранную модель `s.model`;
+  - при `configId === "model"` обновляет `s.model` через `resolveModelId` до одного из `argon`, `carbon`, `hydrogen`, `pro`, `flash-lite` (псевдонимы `fast`/`flash`/`lite` → `flash-lite`); неизвестное значение — ошибка -32602 `unknown model`;
   - при `configId === "account"` обновляет `s.account` (`"auto"` или id аккаунта); при смене аккаунта сбрасывает `s.backend = null` и `s.convId = null`.
 - **Передача в веб-драйвер**:
   - В драйвер передаётся `model: s.model` (`"argon"` передаётся как есть, без подмены на `"thinking"`, чтобы селектор модели не искал несуществующую модель).
@@ -69,20 +68,37 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 - На каждый вызов `session/prompt`:
   1. Текстовые блоки из `params.prompt` склеиваются в строку `text`; при пустом тексте немедленно возвращается `{ stopReason: "end_turn" }`.
-  2. При `ARGON_FAKE=1` сервер отправляет нотификацию `session/update` (`sessionUpdate: "agent_message_chunk"`, `text: "FAKE_ARGON_ECHO: " + text.slice(0, 80)`). Если задана задержка `process.env.ARGON_FAKE_DELAY_MS`, генерация удерживает аренду в течение этой паузы для проверки отмены и корректного завершения. По завершении возвращает `{ stopReason: "end_turn" }`.
-  3. В боевом режиме выбирается аккаунт из пула (§3), захватывается аренда через `bindBackend` / `acquireInState`, и драйвер вызывает `sendPrompt` с единым объектом параметров: `{ prompt: text, model: s.model, thinking: mappedThinking, convId: s.convId, isNewChat: !s.convId, cdpPort: backend.cdp, strictModel: true, shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen, headless: HEADLESS, profile: backend.profileDir || backend.profile || backend.id, strict: true, onChunk, signal: abortCtrl.signal }`.
-  4. Каждая дельта `onChunk(delta)` немедленно отправляется нотификацией `session/update` с `sessionUpdate: "agent_message_chunk"`.
-  5. После завершения генерации `s.convId` извлекается из `res.convId` (драйвер самостоятельно читает URL вкладки и возвращает `convId` в объекте результата), аренда освобождается (`releaseLease`), и возвращается `{ stopReason: "end_turn" }`.
+  2. **Гард размера промпта (PLUG-281):** `Buffer.byteLength(text)` сверяется с лимитом `ARGON_MAX_PROMPT_BYTES` (см. §4.1). Превышение — немедленный JSON-RPC error `-32000` с сообщением `prompt too large: <N> bytes exceeds limit <L> bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.` — синхронно в `dispatch`, до очереди `enqueue`, выбора аккаунта и аренды. Это ошибка вызывающего, а не аккаунта: пул, аренды и кулдауны не затрагиваются.
+  3. При `ARGON_FAKE=1` сервер отправляет нотификацию `session/update` (`sessionUpdate: "agent_message_chunk"`, `text: "FAKE_ARGON_ECHO: " + text.slice(0, 80)`). Если задана задержка `process.env.ARGON_FAKE_DELAY_MS`, генерация удерживает аренду в течение этой паузы для проверки отмены и корректного завершения. По завершении возвращает `{ stopReason: "end_turn" }`.
+  4. В боевом режиме выбирается аккаунт из пула (§3), захватывается аренда через `bindBackend` / `acquireInState`, и драйвер вызывает `sendPrompt` с единым объектом параметров: `{ prompt: text, model: s.model, thinking: mappedThinking, convId: s.convId, isNewChat: !s.convId, cdpPort: backend.cdp, strictModel: true, shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen, headless: HEADLESS, profile: backend.profileDir || backend.profile || backend.id, strict: true, onChunk, signal: abortCtrl.signal }`.
+  5. Каждая дельта `onChunk(delta)` немедленно отправляется нотификацией `session/update` с `sessionUpdate: "agent_message_chunk"`.
+  6. После завершения генерации `s.convId` извлекается из `res.convId` (драйвер самостоятельно читает URL вкладки и возвращает `convId` в объекте результата), аренда освобождается (`releaseLease`), и возвращается `{ stopReason: "end_turn" }`.
+- **Цикл выполнения инструментов (Tool Loop)**:
+  - Полный контракт вызовов, формата упаковки, каталога инструментов и лимитов зафиксирован в [provider-web-gemini-tools.md](provider-web-gemini-tools.md).
+  - При первом отправлении на новом `convId` текст сообщения пакуется функцией `packFirstMessage`: формируется системная шапка с каталогом доступных инструментов, автоматические вложения обнаруженных ссылок (`=== file: ... ===`, `=== thread: ... ===`, `=== task: ... ===`) и доступный статус/дифф репозитория (`git status`, `git diff`) в пределах лимита `ARGON_MAX_MESSAGE_BYTES` (по умолчанию 120 000 байт). При переполнении добавляется подсказка `Можно запросить инструментом: ...`.
+  - Ответ модели разбирается на XML-теги вызова инструментов `<tool name="..." .../>`.
+  - Инструменты выполняются только на чтение в пределах рабочей директории сессии (`cwd`), с проверкой `resolveInCwd`, запретом `..`, симлинков наружу и черным списком секретных файлов (`.env*`, `secrets/*`, `*.pem`, `*.key`).
+  - Результаты инструментов форматируются блоками `=== tool: <name> <args> ===` и отправляются единым следующим сообщением в том же `convId` на том же бэкенде под той же активной арендой.
+  - Количество раундов ограничено `ARGON_MAX_TOOL_ROUNDS` (по умолчанию 8 раундов). При исчерпании лимита модель принудительно запрашивается сформировать финальный ответ на базе уже полученных данных.
+  - Промежуточные вызовы транслируются в тред BB через нотификации протокола ACP: `session/update` с блоками `tool_call` и последующим обновлением статуса `tool_call_update`.
 - При получении **`session/cancel`** (как нотификации, так и запроса):
   - отмена инициируется только для сессии, чей `id === params.sessionId`: если `activePromptSessionId === s.id`, вызывается `activePrompt.abort.abort()` (сессии с неизвестным `sessionId` или без него не прерывают чужой активный ход);
   - драйвер перед выходом из `sendPrompt` кликает по кнопке остановки генерации в веб-интерфейсе Gemini (`button[aria-label*="Stop" i], button[aria-label*="Остановить" i]`), чтобы браузерная вкладка немедленно прекратила генерацию;
   - `session/prompt` завершается со `{ stopReason: "cancelled" }` без пометки аккаунта кулдауном.
 - При закрытии `stdin` (`rl.on("close")`), а также по сигналам `SIGTERM` и `SIGINT`, `acp-server.mjs` прерывает активный ход (`activePrompt?.abort.abort()`), ожидает завершения вызова драйвера (срабатывание Stop и парковка вкладки на `about:blank`) с таймаутом до 10–15 с, дожидается `releaseLease(activeBackendId)` и только затем завершает процесс. Это гарантирует отсутствие осиротевших аренд и остановку генерации в браузере.
+- **Жизненный цикл процесса и сторожа**:
+  - Журнал этапов: `slog(stage, extra)` дописывает строки вида `<ISO-ts> pid=<pid> <stage> <json>` в `acp-server.log` в `ARGON_STATE_DIR` — по нему видна точная стадия зависшего или тихого хода (постановка в очередь, аренда, вызов драйвера, стриминг, ошибки).
+  - Реапер сирот (только Linux): `reapOrphanAcpServers()` вызывается при старте сервера (`startServer`), сканирует `/proc` и шлёт `SIGTERM` другим процессам `acp-server.mjs` с `ppid == 1` (перерождённым на init), чтобы старые копии не держали профили Chrome и аренды.
+  - Сторож родителя: таймер каждые 5 с сравнивает `process.ppid` с захваченным при старте `ownerPpid`; при смене родителя или `ppid === 1` (reparenting на init — родительский мост BB умер) пишет `process:reparented-exit` и вызывает `cleanShutdown()`. Таймер `unref`-нут и сам по себе процесс не держит.
+  - Выход по смене кода: в том же 5-секундном цикле, когда нет активного хода (`!activePromptSessionId`), `checkStaleCode()` сравнивает `mtime` файла `acp-server.mjs` с зафиксированным при старте; обновление файла (новая версия плагина) → `server:stale-code-exit` и `cleanShutdown()` — процесс не продолжает работать на устаревшем коде и перезапускается мостом на следующем ходе.
 
-### 2.3 Дедлайны генерации
+### 2.3 Дедлайны и переменные окружения генерации
 
 - Внешний дедлайн хода в `acp-server.mjs`: `SEND_DEADLINE_MS = Number(process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000` (20 минут, предотвращает обрыв длинных глубоких ревью на `argon` high).
 - Внутренний потолок ожидания генерации в `src/gemini-driver.js`: `MAX_WAIT_MS = Number(process.env.GEMINI_MAX_WAIT_MS) || 900_000` (15 минут).
+- `ARGON_MAX_TOOL_ROUNDS`: максимальное количество раундов вызова инструментов за один ход (по умолчанию `8`).
+- `ARGON_MAX_MESSAGE_BYTES`: максимальный размер первого упакованного сообщения (по умолчанию `120_000` байт).
+- `ARGON_TOOL_TIMEOUT_MS`: таймаут выполнения каждого локального инструмента чтения (по умолчанию `15_000` мс / 15 с).
 
 ---
 
@@ -95,11 +111,14 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   ```json
   {
     "accounts": [
-      { "id": "acc1", "email": "user1@example.com", "profileDir": "~/.gemini-cli-profile", "cdpPort": 9222, "priority": 1 },
-      { "id": "acc2", "email": "user2@example.com", "profileDir": "~/.gemini-cli-profile-2", "cdpPort": 9223, "priority": 1 }
+      { "id": "acc1", "email": "user1@example.com", "profileDir": "~/.gemini-cli-profile", "cdpPort": 9222, "priority": 10, "tier": "pro" },
+      { "id": "acc2", "email": "user2@example.com", "profileDir": "~/.gemini-cli-profile-2", "cdpPort": 9223, "priority": 10, "tier": "ultra" }
     ]
   }
   ```
+  Поле `tier` определяет тариф аккаунта:
+  - `"ultra"` — тариф Ultra (доступна модель Carbon);
+  - `"pro"` (по умолчанию) — обычный тариф Pro (модель Carbon недоступна / заблокирована значком замка).
   - Источники конфигурации пула перечисляются функцией `loadBackends` строго в порядке их чтения:
     1. `ARGON_POOL_FILE` (по умолчанию `$STATE_DIR/pool.json`);
     2. `$STATE_DIR/accounts/<label>/backend.json`;
@@ -107,7 +126,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     4. `ARGON_BACKENDS` (JSON-массив бэкендов из переменной окружения);
     5. Одиночный профиль по умолчанию: id: "default", profile: "default", profileDir из GEMINI_PROFILE_DIR / GEMINI_PROFILE или ~/.gemini-cli-profile; порт CDP из GEMINI_CDP_PORT или 9222.
   - Утилита `scripts/pool-add.mjs` актуализируется: при добавлении аккаунта она обновляет и `pool.json`, и подкаталог аккаунта.
-  - Поле профиля, передаваемое в драйвер: `backend.profileDir || backend.profile || backend.id`. Тильда `~/` раскрывается через `os.homedir()` — **в домашний каталог читающего процесса**. Аккаунты с `priority === 0` исключаются из автоматического выбора.
+  - Поле профиля, передаваемое в драйвер: `backend.profileDir || backend.profile || backend.id`. Тильда `~/` раскрывается через `os.homedir()` — **в домашний каталог читающего процесса**. Аккаунты с эффективным приоритетом `<= 0` (§3.3, `getAccountPriority`) исключаются из автоматического выбора.
   - **Разделяемый пул (несколько uid):** когда один `pool.json`/`ARGON_STATE_DIR` читают процессы разных OS-пользователей, `profileDir` обязан быть **абсолютным** — `~` у второго юзера резолвится в его HOME, `resolveProfile` не совпадёт с реальным `--user-data-dir` запущенного Chrome (`profileMatches=false`). `scripts/pool-add.mjs` пишет `profileDir` абсолютным на момент добавления (дом добавившего = владелец профиля).
   - **`GEMINI_NO_AUTOSPAWN=1`** (env): при проверке профиля несовпадении (`profileMatches=false`) или холодном/чужом CDP драйвер **бросает ошибку до** `stopChrome`/авто-спауна Chrome, вместо перезапуска. Обязательно для второго юзера на разделяемом пуле — её процесс не имеет права трогать Chrome первого (чужие профили не рестартуются). Без флага драйвер пытается остановить и перезапустить браузер — допустимо только у владельца пула.
 - Состояние хранится в `ARGON_STATE_DIR/accounts-state.json` (по умолчанию `~/.bb/plugins/provider-argon/accounts-state.json`). При разделении между uid'ами каталог общий: второму юзеру нужен default-ACL `rwx` на `ARGON_STATE_DIR` и `accounts/` (аренды/состояние пишутся tmp+rename, inode меняется — прав нужно на каталог, не только на файлы).
@@ -123,19 +142,42 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 - При чтении состояния просроченные аренды (`now - acquiredMs >= LEASE_TTL_MS`, где `LEASE_TTL_MS = 10 * 60_000`) и аренды мёртвых процессов (`!isPidAlive(pid)`) автоматически очищаются. Таймаут `LEASE_TTL_MS = 10` минут срабатывает только для зависших или аварийно завершившихся процессов.
 - При закрытии `stdin` (`rl.on("close")`), а также по сигналам `SIGTERM` и `SIGINT`, `acp-server.mjs` прерывает активный ход (`activePrompt?.abort.abort()`), дожидается `releaseLease(activeBackendId)` и только затем завершает процесс. Это гарантирует отсутствие осиротевших аренд при перезапуске моста или отмене треда демоном BB.
 
-### 3.3 Классификация отказов и ротация
+### 3.3 Умная маршрутизация пула по тарифам и моделям
+
+- Определение эффективного тарифа аккаунта (`getAccountTier(b, state)`):
+  - если в состоянии аккаунта `lockedModels` содержит `"carbon"` — тариф строго `"pro"`;
+  - иначе, если в состоянии `e.tier` явно задано `"ultra"` — тариф `"ultra"`;
+  - иначе берётся `b.tier` из конфигурации пула (`"ultra"` или `"pro"`, по умолчанию `"pro"`).
+- Определение эффективного приоритета аккаунта (`getAccountPriority(b, state)`) — порядок разрешения:
+  1. `state.accounts[<id>].priority` из `accounts-state.json` — если это целое число `>= 0`;
+  2. иначе `b.priority` из конфигурации пула (`pool.json` / `backend.json`) — если это целое число `>= 0`;
+  3. иначе дефолт `10`.
+  Приоритет из файла состояния важнее конфигурации пула: `e.priority = 0` в `accounts-state.json` отключает аккаунт из автоматического выбора, даже если запись в `pool.json` включена. Эффективный приоритет `<= 0` исключает аккаунт из автоматического выбора (§3.1).
+- Выбор бэкенда в режиме `account: "auto"` (`pickBackendFromState`):
+  - Из кандидатов исключаются: аккаунт `excludeId`, аккаунты с эффективным приоритетом `<= 0`, при запросе `carbon` — аккаунты с тарифом не `"ultra"`, при запросе любой модели — аккаунты, у которых `lockedModels` содержит эту модель.
+  - Среди **свободных** кандидатов (не в кулдауне и без аренды) сначала отбираются аккаунты с **максимальным эффективным приоритетом** (`maxP`) — фильтр по приоритету применяется ДО предпочтения по тарифу.
+  - При запросе **`carbon`**: кандидатами являются **только** аккаунты с тарифом `"ultra"`. Аккаунты тарифа `"pro"` исключаются ещё на этапе фильтрации кандидатов.
+  - При запросе **`argon`** (или других моделей): предпочтение тарифа **`"pro"`** действует **только среди свободных аккаунтов с равным максимальным приоритетом `maxP`** — чтобы приберечь Ultra-аккаунты для Carbon. Если свободных `pro`-аккаунтов с приоритетом `maxP` нет, выбирается `ultra`-аккаунт с тем же `maxP`; аккаунт с меньшим приоритетом не выбирается, пока есть свободный с `maxP`.
+  - Внутри итогового набора выбор — LRU по `lastUsedMs` с тай-брейком по `id`.
+  - Если свободных кандидатов нет, ближайшее время освобождения (`busyUntil` / `cooledUntil`) вычисляется только среди кандидатов с максимальным эффективным приоритетом.
+- Ручной выбор аккаунта:
+  - Если в сессии явно выбран конкретный аккаунт (`s.account !== "auto"`), а запрошена модель `carbon` на аккаунте с тарифом `"pro"`, `bindBackend` возвращает мгновенную понятную ошибку без обращения к браузеру: `account "<id>" has pro tier and does not support Carbon (Ultra tier required)`.
+
+### 3.4 Классификация отказов и ротация
 
 - `classifyFailure(err)` относит ошибку к одной из категорий:
   1. **`auth-dead`** (`CooldownMs = 7 * 24 * 3600_000`): `"not logged in"`, `"Sign in"`, `"Войти"`, `"check login status"`.
-  2. **`rate-limit`** (`CooldownMs = parsedResetMs || 30 * 60_000`): `"rate-limit"`, `"rate limit"`, `"quota"`, `"limit resets"`, `"thinking level unavailable"`, `"thinking level is rate-limited"`, `"try again later"`, `"too many requests"`, `"лимит"`, `"повторите попытку позже"`.
-  3. **`model-unavailable`** (`CooldownMs = 6 * 3600_000`): `"modelunavailable"`, `"model is unavailable"`, `"not available for this account"`, `"недоступна"` — **только по DOM-доказательству**: драйвер бросает `ModelUnavailable` (`code = "ARGON_MODEL_UNAVAILABLE"`) лишь когда пункт реально отсутствует в меню выбора, уровень отключён/залочен, или есть апсейл-диалог. Сбои селекторов, таймауты `waitForSelector`, ошибки навигации/клика в `selectModelAndThinking` при `strict` **пробрасываются как есть** (`throw err`) и классифицируются как `transient` — аккаунт не паркуется (PLUG-286: раньше catch-all заворачивал их в `ModelUnavailable` → 6 ч кулдауна по ложному поводу).
-  4. **`transient`** (без кулдауна аккаунта, но с попыткой переключения на другой свободный аккаунт в рамках текущего хода): сетевые/CDP сбои, таймаут ожидания генерации.
+  2. **`model-locked`** (`CooldownMs = 0`, `rotatable: true`): ошибка вида `carbon locked: paid upgrade required` или значок замка (`<mat-icon>lock</mat-icon>`). Не накладывает временной кулдаун на аккаунт, записывает `lockedModels: ["carbon"]` и `tier: "pro"` в состояние аккаунта, и немедленно инициирует прозрачную ротацию на следующий аккаунт.
+  3. **`rate-limit`** (`CooldownMs = parsedResetMs || 30 * 60_000`): `"rate-limit"`, `"rate limit"`, `"quota"`, `"limit resets"`, `"thinking level unavailable"`, `"thinking level is rate-limited"`, `"try again later"`, `"too many requests"`, `"лимит"`, `"повторите попытку позже"`.
+  4. **`model-unavailable`** (`CooldownMs = 6 * 3600_000`): `"modelunavailable"`, `"model is unavailable"`, `"not available for this account"`, `"недоступна"` — **только по DOM-доказательству**: драйвер бросает `ModelUnavailable` (`code = "ARGON_MODEL_UNAVAILABLE"`) лишь когда пункт реально отсутствует в меню выбора, уровень отключён/залочен, или есть апсейл-диалог. Сбои селекторов, таймауты `waitForSelector`, ошибки навигации/клика в `selectModelAndThinking` при `strict` **пробрасываются как есть** (`throw err`) и классифицируются как `transient` — аккаунт не паркуется (PLUG-286: раньше catch-all заворачивал их в `ModelUnavailable` → 6 ч кулдауна по ложному поводу).
+  5. **`transient`** (без кулдауна аккаунта, но с попыткой переключения на другой свободный аккаунт в рамках текущего хода): сетевые/CDP сбои, таймаут ожидания генерации.
 - Итоговый кулдаун ограничен потолком 7 суток: `Math.min(cooldownMs, 7 * 86_400_000)`.
 - Разбор времени сброса квоты `parseResetTimeMs(msg, nowMs)` поддерживает:
   - английские форматы: `"Limit resets 2:19 AM"`, `"Limit resets at 14:30"`, `"Limit resets tomorrow at 11:00 AM"`, `"Limit resets Oct 15, 2:19 AM"`, `"Limit resets on Nov 16, 11:00 PM"`;
   - русские форматы: `"Лимит обновится в 14:30"`, `"Лимит сбросится завтра в 09:15"`.
   Правило переноса года: если дата в сообщении указана без года (например, `"Oct 15"`), то если вычисленная дата оказывается раньше текущей больше чем на 30 дней (`targetMs < nowMs - 30 * 86_400_000`), она переносится на следующий год, иначе остаётся в текущем году. К вычисленному времени добавляется буфер 2 минуты (`+ 2 * 60_000`).
-- **Строгий выбор уровня мышления (`strict: true`) и ротация**:
+- **Детектирование значка замка и строгий выбор уровня мышления**:
+  - При выборе модели `carbon` драйвер проверяет наличие значка замка (`mat-icon`, `gem-icon` с текстом или атрибутом `lock`). Если замок обнаружен, драйвер не совершает клик по платному пункту (чтобы не вызывать модальное окно с предложением сменить план) и сразу выбрасывает `ModelUnavailable('model', 'carbon locked: paid upgrade required')` с `isLocked = true`.
   - Если в меню выбора режима мышления (`selectModelAndThinking`) запрошенный пункт (`Fast`, `Thinking` или `Pro`) имеет `isDisabled === true` (`aria-disabled="true"` / класс `disabled`), при `strict: true` драйвер обязан выбросить `new ModelUnavailable('thinking', '<thinking> thinking level is rate-limited (<reset text>)')` **до** общей проверки `if (strict) throw new ModelUnavailable('thinking', ... 'not found')`.
   - Благодаря этому `acp-server.mjs` классифицирует отказ как `rate-limit` с точным временем сброса из текста меню (`Limit resets ...`). Для новых чатов (когда `!s.convId` и клиенту ещё не отправлен ни один чанк `!streamedAny`) сервер прозрачно переключает запрос на следующий свободный аккаунт пула, не блокируя аккаунт на 6 часов как `model-unavailable`.
   - Ротация на следующий аккаунт пула при исчерпании лимита или временной ошибке выполняется **только** для новых чатов (до фиксации `s.convId` и до отправки первого чанка клиенту). Если беседа уже имеет зафиксированный `s.convId`, она остаётся строго привязана к своему аккаунту (`s.backend`), так как история и ID беседы принадлежат конкретному аккаунту Google. Запрос не переключается на другие аккаунты пула, и обрабатываются два случая:
@@ -149,7 +191,11 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 ### 4.1 Надёжная вставка больших промптов и однократная отправка
 
 - Промпты ревью и аудита могут достигать 50–150 КБ и содержать тысячи строк.
-- **Гард размера промпта (PLUG-281):** при ~100 КБ и выше `execCommand('insertText')` в Chrome зависает, а таймаут последующего `waitForSelector` раньше ошибочно парковал здоровый аккаунт на 6 ч (`model-unavailable`). Поэтому размер проверяется заранее в байтах UTF-8: `ARGON_MAX_PROMPT_BYTES` (не задан → `100 * 1024`; `0`/отрицательное → без лимита; нечисловое значение → дефолт). Превышение — немедленная ошибка `ARGON_PROMPT_TOO_LARGE`: в `runPrompt` брос внутри `try` до `enqueue`/аренды (клиент получает `-32000`, лиз и кулдаун не затрагиваются; брос выше `try` недопустим — `void runPrompt()` без catch дал бы unhandled rejection и уронил процесс), в `sendPrompt` драйвера — до любой работы со страницей.
+- **Гард размера промпта (PLUG-281):** при ~100 КБ и выше `execCommand('insertText')` в Chrome зависает, а таймаут последующего `waitForSelector` раньше ошибочно парковал здоровый аккаунт на 6 ч (`model-unavailable`). Поэтому размер исходящего текста проверяется заранее в байтах UTF-8 на каждой отправке в Gemini:
+  - Лимит — `ARGON_MAX_PROMPT_BYTES` (не задан → `100000`, ниже наблюдаемого обрыва ~120 КБ; `0`/отрицательное → без лимита; нечисловое значение → дефолт). При реализации упаковки первого сообщения и инструментов (PLUG-278): потолок упаковки `ARGON_MAX_MESSAGE_BYTES` обязан быть `≤ ARGON_MAX_PROMPT_BYTES − ~4 КБ` (запас на системную шапку инструментов), иначе упаковка сама соберёт заведомо неотправимое сообщение; заданное большим значение логируется и зажимается до потолка.
+  - `session/prompt`: отказ синхронно в `dispatch` сразу после склейки блоков — JSON-RPC error `-32000`, message `prompt too large: <N> bytes exceeds limit <L> bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.` — до `enqueue`, выбора аккаунта и аренды (§2.2 п.2).
+  - `sendPrompt` драйвера: `throwIfPromptTooLarge` — первая строка функции, до `ensureChrome`, подключения CDP и любой работы со страницей; это последний рубеж для всех отправок в Gemini (включая будущие отправки первого сообщения и раундов инструментов PLUG-278), включая повторную проверку после чтения `maxlength` поля ввода (эффективный лимит = `min(env, maxlength)`; `contenteditable` maxlength не несёт — тогда действует только env).
+  - Ошибка `ARGON_PROMPT_TOO_LARGE` — ошибка вызывающего, а не аккаунта: в `runPrompt` она пробрасывается без `probeAuthHint`, классификации, ротации и кулдауна (аренда лишь освобождается), а в ответ агенту уходит verbatim без обёртки `Gemini web driver error:`.
 - Вставка текста в редактор (`.ql-editor, div[contenteditable="true"], [role="textbox"]`):
   - Для текста длиной свыше 500 символов (или содержащего переводы строк) сначала выполняется быстрая вставка через `page.evaluate`: фокусировка редактора, очистка и `document.execCommand('insertText', false, text)`.
   - Если после `execCommand` длина текста в редакторе меньше ожидаемой (`gotText.length < Math.min(prompt.length * 0.9, prompt.length - 10)`), драйвер очищает поле и использует резервный `page.keyboard.insertText(prompt)`.
@@ -202,6 +248,10 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   2. Полный цикл JSON-RPC в `acp-server.mjs` (`ARGON_FAKE=1` с временным `ARGON_STATE_DIR` и `ARGON_POOL_FILE`): `initialize`, `session/new`, `session/set_model`, `session/set_config_option`, `session/prompt` (стриминг `agent_message_chunk` + `stopReason: "end_turn"`), `session/cancel` (`stopReason: "cancelled"`), автоматическое снятие аренды при закрытии `stdin` / `SIGTERM`. Поддержка `ARGON_FAKE_DELAY_MS` для проверки удержания аренды во время выполнения запроса и корректного освобождения аренды при отмене хода и `SIGTERM`.
   3. Функции `parseResetTimeMs` и `classifyFailure` на всех вариантах английских и русских сообщений о лимитах, недоступности уровня `thinking` и истечении дедлайна.
   4. Строгий режим `selectModelAndThinking` (`isDisabled` при `strict: true` порождает `rate-limit` ошибку `thinking level is rate-limited`) и индекс `responses[idx]` без отката к `responses[responses.length - 1]`.
+  5. Гард размера промпта (PLUG-281): отказ `ARGON_PROMPT_TOO_LARGE` на границе драйвера (`sendPrompt` до `ensureChrome`/CDP) и немедленный синхронный ответ `-32000` в `session/prompt` до выбора аккаунта и захвата аренды; подсчёт размера в байтах UTF-8; проход промпта размером `<=` лимита `ARGON_MAX_PROMPT_BYTES`.
+  6. Умную маршрутизацию `pickBackendFromState`: выбор `pro`-аккаунтов для `argon` и `ultra` для `carbon`, разрешение эффективного приоритета (`state` → `pool` → дефолт `10`, `<= 0` исключает аккаунт), учёт `lockedModels` и LRU по `lastUsedMs` (§3.3).
+  7. Жизненный цикл процесса и селекторы драйвера: запись `slog` в `acp-server.log`, `reapOrphanAcpServers` (снятие осиротевших acp-server), visible-селекторы (`gem-menu-item[data-mode-id]:visible`) и русские подписи (`Загрузить файлы`, `Удалить`) в `gemini-driver.js`.
+- Набор `tests/provider-web-gemini-tools.test.mjs` (47 тестов, офлайн) покрывает инструменты чтения веб-Gemini по спеке `provider-web-gemini-tools.md`: разбор текстового протокола вызовов инструментов, sandbox `cwd` (запрет `..`, абсолютных путей и симлинков наружу, чёрный список чувствительных файлов), белый список `git`-команд, маскировку секретов `[скрыто: <тип>]`, раунды tool-loop и лимит `ARGON_MAX_TOOL_ROUNDS`, упаковку первого сообщения (вложения файлов/тредов/задач, потолок `ARGON_MAX_MESSAGE_BYTES`).
 
 ---
 
@@ -217,7 +267,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 Автоматический логин на холодном профиле регулярно отбивается антиботом Google (`signin/rejected`, «This browser or app may not be secure»). Рабочая процедура — ручной вход владельца:
 
-1. `scripts/pool-add.mjs <label> <cdp-port> <email>` с принудительным `GEMINI_CHROME_BIN` = playwright-хром. **Snap-chromium запрещён**: он игнорирует `--user-data-dir` и пишет в общий системный профиль → перекрёстное заражение сессиями аккаунтов.
+1. `scripts/pool-add.mjs <label> <cdp-port> [priority] [email] [tier]` — позиционные аргументы строго в этом порядке: `<label>` (id в пуле и профиля Chrome `~/.config/google-chrome-<label>`), `<cdp-port>`, `[priority]` (по умолчанию `10`; для `tier=ultra` без явного priority — `1`), `[email]` (без него в `pool.json` пишется заглушка `<label>@example.com`), `[tier]` — `pro` (по умолчанию) или `ultra`. С принудительным `GEMINI_CHROME_BIN` = playwright-хром. **Snap-chromium запрещён**: он игнорирует `--user-data-dir` и пишет в общий системный профиль → перекрёстное заражение сессиями аккаунтов.
 2. Headed Chrome под Xvfb на выделенный CDP-порт (`--ozone-platform=x11 --no-sandbox --disable-blink-features=AutomationControlled --user-data-dir=~/.config/google-chrome-<label>`).
 3. Web-VNC мост (CDP-screencast → HTTP-polling кадров, клики через playwright mouse API, ввод текста — поле ввода + `insertText`), наружу через `bb connect expose`. Владелец проходит вход и любые верификации сам.
 

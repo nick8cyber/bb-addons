@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cpSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { makeTempDir } from "./helpers/temp.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -53,6 +53,11 @@ import { parsePolicy } from "../src/policy.js";
 import { createT, type T } from "../src/i18n/index.js";
 import { renderPrePush } from "../src/release.js";
 import { OrchestratorError } from "../src/errors.js";
+import {
+  isPluginUiFile,
+  pluginNameForPaths,
+  pluginNameForRepo,
+} from "../src/staged.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
 import type { CmdRunner } from "../src/cmd.js";
 import type { ThreadFacts } from "../src/agent-config.js";
@@ -1818,6 +1823,52 @@ test("release (merged): a failing project check restores the copy (PLUG-191)", a
   assert.equal(gitR(coord, ["status", "--porcelain"]), "");
   const gitDir = gitR(coord, ["rev-parse", "--absolute-git-dir"]);
   assert.equal(existsSync(join(gitDir, "orchestrator-merge.lock")), false);
+});
+
+test("PLUG-288: a failed check report keeps the FAILED line and separate stream tails", async () => {
+  const { coord, workTip } = makeMergedCoordinatorCopy();
+  const { deps, store, exec, bindReview } = makeDeps("/nonexistent-exec", {
+    coordPath: coord,
+    releaseText: JSON.stringify({
+      commitIdentity: "Agent <agent@x.io>",
+      defaults: {
+        target: { action: "push", branch: "main" },
+        checks: [
+          "i=1; while [ $i -le 30 ]; do echo \"out-$i\"; " +
+            "echo \"err-$i\" >&2; i=$((i+1)); done; " +
+            "echo 'check-changed-plugins: FAILED: bb-plugin-orchestrator' >&2; " +
+            "exit 3",
+        ],
+      },
+    }),
+  });
+  store.setMerged(exec.id, { into: "work", sha: workTip });
+  bindReview(workTip);
+  let text = "";
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => {
+      text = (e as Error).message;
+      return (e as OrchestratorError).code === "release-refused";
+    },
+  );
+  const lines = text.split("\n");
+  assert.match(lines[0]!, /проверка проекта упала/);
+  // The failure summary is lifted into the header, not left in the tail.
+  const failedAt = lines.indexOf(
+    "check-changed-plugins: FAILED: bb-plugin-orchestrator",
+  );
+  assert.ok(failedAt > 0);
+  // stdout and stderr are separate blocks, each keeping its own tail.
+  const stdoutAt = lines.findIndex((l) => l.startsWith("stdout ("));
+  const stderrAt = lines.findIndex((l) => l.startsWith("stderr ("));
+  assert.ok(stdoutAt > failedAt && stderrAt > stdoutAt);
+  assert.ok(lines.slice(stdoutAt).includes("out-30"));
+  assert.ok(!lines.slice(stdoutAt).includes("out-1"));
+  assert.ok(lines.slice(stderrAt).includes("err-30"));
+  assert.ok(!lines.slice(stderrAt).includes("err-1"));
+  // No stderr content is glued into the stdout block.
+  assert.ok(!lines.slice(stdoutAt, stderrAt).includes("err-30"));
 });
 
 /** A deferred gate: `entered` fires when the wrapped git call starts,
@@ -7442,4 +7493,316 @@ test("§22.4 (ревью): самоперезагрузка orchestrator с app 
     Buffer.from(b64, "base64").toString("utf8"),
     /обнови страницу BB, чтобы увидеть новую версию: orchestrator/,
   );
+});
+
+// ── §24.2 (r33.5): файлы UI и имя плагина ─────────────────────────────
+
+test("§24.2: isPluginUiFile — UI-файлы, тесты и служебные исключены", () => {
+  for (const p of [
+    "app.tsx",
+    "app.css",
+    "plugins/x/app.tsx",
+    "plugins/x/ui/main.ts",
+    "plugins/x/components/Btn.ts",
+    "plugins/x/manifest.json",
+    "pkg/page.jsx",
+    "pkg/styles.css",
+  ]) {
+    assert.equal(isPluginUiFile(p), true, p);
+  }
+  for (const p of [
+    "plugins/x/app.test.tsx",
+    "plugins/x/app.spec.css",
+    "plugins/x/node_modules/y/app.tsx",
+    "plugins/x/dist/app.tsx",
+    "src/server.ts",
+    "docs/readme.md",
+    "x/ui.ts", // «ui» в имени файла — не каталог /ui/
+  ]) {
+    assert.equal(isPluginUiFile(p), false, p);
+  }
+});
+
+test("§24.2: pluginNameForPaths — монорепо plugins/<name>, иначе пакет/каталог", () => {
+  const dir = mkdtempSync(join(tmpdir(), "staged-"));
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({ name: "my-plugin" }),
+  );
+  assert.equal(pluginNameForPaths(["plugins/orch/app.tsx"], dir), "orch");
+  assert.equal(
+    pluginNameForPaths(["src/app.tsx", "src/a.css"], dir),
+    "my-plugin",
+  );
+  const bare = mkdtempSync(join(tmpdir(), "staged-bare-"));
+  assert.equal(pluginNameForPaths(["src/app.tsx"], bare), basename(bare));
+  assert.equal(pluginNameForRepo(bare), basename(bare));
+});
+
+// ── §24.2 (r33.5) / release §2 шаг 0.1 (r11.4): гейт unmerged-ui ──────
+
+/** Коммит «задачи A» на боковой ветке — вне истории feat-x. */
+function sideCommit(repo: string): string {
+  gitR(repo, ["checkout", "-b", "side-a"]);
+  writeFileSync(join(repo, "a.txt"), "a\n");
+  gitR(repo, ["add", "."]);
+  gitR(repo, ["commit", "-m", "feat: a"]);
+  const sha = gitR(repo, ["rev-parse", "HEAD"]);
+  gitR(repo, ["checkout", "feat-x"]);
+  return sha;
+}
+
+function stageA(
+  store: ReturnType<typeof makeDeps>["store"],
+  repo: string,
+  opts: { sha: string; ui?: boolean; plugin?: string },
+) {
+  store.recordStagedFeature({
+    taskKey: "PLUG-A",
+    pluginName: opts.plugin ?? pluginNameForRepo(repo),
+    branchName: "side-a",
+    resultSha: opts.sha,
+    uiTouched: opts.ui ?? true,
+    uiFiles: opts.ui === false ? [] : ["app.tsx"],
+  });
+}
+
+test("§24.2/r11.4: незамерженная UI-фича того же плагина — отказ unmerged-ui", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo);
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => {
+      const err = e as OrchestratorError;
+      return (
+        err.code === "release-refused" &&
+        err.message.includes("unmerged-ui") &&
+        err.message.includes("PLUG-A") &&
+        err.message.includes("app.tsx")
+      );
+    },
+  );
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+});
+
+test("§24.2/r11.4: фича без UI (ui_touched=0) — выкладка проходит", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo);
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA, ui: false });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+});
+
+test("§24.2/r11.4: UI-фича другого плагина — выкладка проходит", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo);
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA, plugin: "other-plugin" });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+});
+
+test("§24.2/r11.4: коммит фичи влит в выкладываемую ветку — проходит", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo);
+  // Задача A влита в ветку выкладки — merge коммит делает shaA предком.
+  gitR(repo, ["merge", "--no-edit", "side-a"]);
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+});
+
+test("§24.2/r11.4: --force-drop-unmerged — проходит, фича в dropped после публикации", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo);
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
+  const pktDir = mkdtempSync(join(tmpdir(), "pkt-drop-"));
+  deps.packetDir = () => pktDir;
+  stageA(store, repo, { sha: shaA });
+  const res = await runRelease(
+    {
+      taskKey: "PLUG-1",
+      caller: COORD,
+      forceDropUnmerged: "задача A заброшена",
+    },
+    deps,
+  );
+  assert.equal(res.status, "auditing");
+  // r11.5: `dropped` фиксируется только после успешной публикации —
+  // на шаге 0.1 запись ещё `in_review` и сторожит гейт.
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+  const rel = store.getRelease(res.releaseId)!;
+  assert.equal(rel.dropped_unmerged_reason, "задача A заброшена");
+  // r11.4: обход гейта виден аудитору — причина и сброшенная задача
+  // печатаются в пакете аудита.
+  const packet = readFileSync(
+    join(pktDir, `release-${res.releaseId}-audit.md`),
+    "utf8",
+  );
+  assert.ok(packet.includes("--force-drop-unmerged: задача A заброшена"));
+  assert.ok(packet.includes("PLUG-A"));
+  assert.ok(packet.includes("app.tsx"));
+  // Публикация — запись уходит в `dropped` с сохранённой причиной.
+  const audit = store.latestDelegationByTaskAndLevel(
+    "PLUG-1",
+    "release-audit",
+  )!;
+  store.setStatus(audit.id, "done");
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  const a = store.stagedFeature("PLUG-A")!;
+  assert.equal(a.status, "dropped");
+  assert.equal(a.dropped_reason, "задача A заброшена");
+});
+
+test("§24.2/r11.5: коммит фичи в origin/<target>, ветка от старой базы — проходит", async () => {
+  const { repo, seed } = makeRepo();
+  // Задача A опубликована раньше: её коммит уже в origin/main, а
+  // выкладываемая ветка отведена от более старой базы и его не содержит.
+  writeFileSync(join(seed, "a.txt"), "a\n");
+  gitR(seed, ["add", "."]);
+  gitR(seed, ["commit", "-m", "feat: a"]);
+  const shaA = gitR(seed, ["rev-parse", "HEAD"]);
+  gitR(seed, ["push", "origin", "main"]);
+  gitR(repo, ["fetch", "origin"]);
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+});
+
+test("§24.2/r11.5: опубликованный релиз покрывает result_sha — гейт пропускает", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo); // ни HEAD, ни origin/main его не содержит
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA });
+  const relA = store.insertRelease({
+    taskKey: "PLUG-A",
+    projectId: "p",
+    coordinatorThreadId: "t",
+    repoPath: repo,
+    branch: "side-a",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  store.updateRelease(relA.id, { status: "published", publishedSha: shaA });
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "auditing");
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+});
+
+test("§24.2/r11.5: опубликованный релиз НЕ покрывает result_sha — отказ unmerged-ui", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo); // ни HEAD, ни origin/main его не содержит
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA });
+  // Задача A публиковалась ранее, но `published_sha` — коммит прошлого
+  // захода: новый `result_sha` он не содержит — фича снова сторожит гейт.
+  const relA = store.insertRelease({
+    taskKey: "PLUG-A",
+    projectId: "p",
+    coordinatorThreadId: "t",
+    repoPath: repo,
+    branch: "side-a",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  const oldSha = gitR(repo, ["rev-parse", "origin/main"]);
+  store.updateRelease(relA.id, {
+    status: "published",
+    publishedSha: oldSha,
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => {
+      const err = e as OrchestratorError;
+      return (
+        err.code === "release-refused" &&
+        err.message.includes("unmerged-ui") &&
+        err.message.includes("PLUG-A")
+      );
+    },
+  );
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+});
+
+test("§24.2/r11.5: после публикации выкладки её фича → merged", async () => {
+  const { repo } = makeRepo();
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
+  store.recordStagedFeature({
+    taskKey: "PLUG-1",
+    pluginName: pluginNameForRepo(repo),
+    branchName: "feat-x",
+    resultSha: gitR(repo, ["rev-parse", "HEAD"]),
+    uiTouched: true,
+    uiFiles: ["app.tsx"],
+  });
+  await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  const audit = store.latestDelegationByTaskAndLevel(
+    "PLUG-1",
+    "release-audit",
+  )!;
+  store.setStatus(audit.id, "done");
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  assert.equal(store.stagedFeature("PLUG-1")!.status, "merged");
+});
+
+test("§24.2: recordStagedFeature — повторный заход без UI сохраняет ui_touched=1 и ui_files", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // Заход 1: правил UI (app.tsx)
+  store.recordStagedFeature({
+    taskKey: "PLUG-100",
+    pluginName: "my-plugin",
+    branchName: "feat-100",
+    resultSha: "sha1",
+    uiTouched: true,
+    uiFiles: ["src/app.tsx"],
+  });
+  let row = store.stagedFeature("PLUG-100")!;
+  assert.equal(row.ui_touched, 1);
+  assert.deepEqual(JSON.parse(row.ui_files!), ["src/app.tsx"]);
+  assert.equal(row.result_sha, "sha1");
+
+  // Заход 2: правил только бекенд (server.ts), без UI
+  store.recordStagedFeature({
+    taskKey: "PLUG-100",
+    pluginName: "my-plugin",
+    branchName: "feat-100",
+    resultSha: "sha2",
+    uiTouched: false,
+    uiFiles: [],
+  });
+  row = store.stagedFeature("PLUG-100")!;
+  assert.equal(row.ui_touched, 1);
+  assert.deepEqual(JSON.parse(row.ui_files!), ["src/app.tsx"]);
+  assert.equal(row.result_sha, "sha2");
+
+  // Заход 3: добавил ещё один UI файл (app.css)
+  store.recordStagedFeature({
+    taskKey: "PLUG-100",
+    pluginName: "my-plugin",
+    branchName: "feat-100",
+    resultSha: "sha3",
+    uiTouched: true,
+    uiFiles: ["src/app.css"],
+  });
+  row = store.stagedFeature("PLUG-100")!;
+  assert.equal(row.ui_touched, 1);
+  assert.deepEqual(JSON.parse(row.ui_files!), ["src/app.tsx", "src/app.css"]);
+  assert.equal(row.result_sha, "sha3");
 });

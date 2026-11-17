@@ -604,6 +604,9 @@ export async function runMerge(
       if (mergeRes.exitCode === 0) {
         const mergedSha = (await gitText(["rev-parse", "HEAD"])).trim();
         store.setMerged(row.id, { into, sha: mergedSha });
+        // §24.2 (r33.5): the task's staged feature is in the target
+        // branch now — it stops guarding releases.
+        store.markStagedFeatureMerged(row.task_key);
         await comment(row, t("mg.mergedComment", { into, sha: sha7(mergedSha) }), deps);
         return {
           ok: true,
