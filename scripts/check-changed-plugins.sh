@@ -18,10 +18,10 @@ BASE="${1:-origin/main}"
 
 cd "$(dirname "$0")/.." || exit 1
 
-# Serialize `npm ci` against the background provisioning of the same
-# worktree (environment-git-worktree): a second concurrent `npm ci`
-# wipes node_modules/.bin while the checks run. The lock file lives in
-# the repository root and is gitignored.
+# Serialize npm ci runs of this script: npm ci holds an exclusive flock on
+# .deps-install.lock in the repository root, so concurrent runs of the script
+# cannot race installs or wipe node_modules/.bin mid-check. The lock file is
+# gitignored.
 LOCK_FILE="$(git rev-parse --show-toplevel)/.deps-install.lock"
 
 if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
