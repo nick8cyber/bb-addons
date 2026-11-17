@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-17
-revision: 11
+revision: 12
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -250,7 +250,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   4. Строгий режим `selectModelAndThinking` (`isDisabled` при `strict: true` порождает `rate-limit` ошибку `thinking level is rate-limited`) и индекс `responses[idx]` без отката к `responses[responses.length - 1]`.
   5. Гард размера промпта (PLUG-281): отказ `ARGON_PROMPT_TOO_LARGE` на границе драйвера (`sendPrompt` до `ensureChrome`/CDP) и немедленный синхронный ответ `-32000` в `session/prompt` до выбора аккаунта и захвата аренды; подсчёт размера в байтах UTF-8; проход промпта размером `<=` лимита `ARGON_MAX_PROMPT_BYTES`.
   6. Умную маршрутизацию `pickBackendFromState`: выбор `pro`-аккаунтов для `argon` и `ultra` для `carbon`, разрешение эффективного приоритета (`state` → `pool` → дефолт `10`, `<= 0` исключает аккаунт), учёт `lockedModels` и LRU по `lastUsedMs` (§3.3).
-  7. Жизненный цикл процесса и селекторы драйвера: запись `slog` в `acp-server.log`, `reapOrphanAcpServers` (снятие осиротевших acp-server), сторож reparenting/`checkStaleCode`, visible-селекторы (`gem-menu-item[data-mode-id]:visible`) и русские подписи (`Загрузить файлы`, `Удалить`) в `gemini-driver.js`.
+  7. Жизненный цикл процесса и селекторы драйвера: запись `slog` в `acp-server.log`, `reapOrphanAcpServers` (снятие осиротевших acp-server), visible-селекторы (`gem-menu-item[data-mode-id]:visible`) и русские подписи (`Загрузить файлы`, `Удалить`) в `gemini-driver.js`.
 - Набор `tests/provider-web-gemini-tools.test.mjs` (47 тестов, офлайн) покрывает инструменты чтения веб-Gemini по спеке `provider-web-gemini-tools.md`: разбор текстового протокола вызовов инструментов, sandbox `cwd` (запрет `..`, абсолютных путей и симлинков наружу, чёрный список чувствительных файлов), белый список `git`-команд, маскировку секретов `[скрыто: <тип>]`, раунды tool-loop и лимит `ARGON_MAX_TOOL_ROUNDS`, упаковку первого сообщения (вложения файлов/тредов/задач, потолок `ARGON_MAX_MESSAGE_BYTES`).
 
 ---
