@@ -343,6 +343,7 @@ function toolReadFile(args, ctx) {
   if (isSensitivePath(relStr)) return err(SENSITIVE_DENIED);
   const r = resolveInCwd(ctx.cwd, relStr);
   if (r.error) return err(r.error);
+  if (isSensitivePath(path.relative(r.base, r.abs))) return err(SENSITIVE_DENIED);
   let st;
   try {
     st = fs.statSync(r.abs);
@@ -369,8 +370,10 @@ function toolReadFile(args, ctx) {
 
 function toolListDir(args, ctx) {
   const relStr = String(args.path ?? ".").trim() || ".";
+  if (isSensitivePath(relStr)) return err(SENSITIVE_DENIED);
   const r = resolveInCwd(ctx.cwd, relStr);
   if (r.error) return err(r.error);
+  if (isSensitivePath(path.relative(r.base, r.abs))) return err(SENSITIVE_DENIED);
   let st;
   try {
     st = fs.statSync(r.abs);
@@ -459,6 +462,7 @@ function toolGrep(args, ctx) {
   if (isSensitivePath(relStr)) return err(SENSITIVE_DENIED);
   const r = resolveInCwd(ctx.cwd, relStr);
   if (r.error) return err(r.error);
+  if (isSensitivePath(path.relative(r.base, r.abs))) return err(SENSITIVE_DENIED);
   const res = runCmd("rg", [
     "--line-number", "--no-heading", "--color=never",
     ...GREP_DENY_GLOBS, "--", pattern, r.abs,
@@ -615,8 +619,17 @@ export function filterGitPatchZOutput(stdout) {
     let indicator = token;
     const lastNl = token.lastIndexOf("\n");
     if (lastNl !== -1 && (token.startsWith("commit ") || token.includes("\ncommit "))) {
-      header = token.slice(0, lastNl + 1);
-      indicator = token.slice(lastNl + 1);
+      const doubleNl = token.lastIndexOf("\n\n");
+      if (doubleNl !== -1 && doubleNl === lastNl - 1) {
+        header = token.slice(0, doubleNl + 2);
+        indicator = token.slice(doubleNl + 2);
+      } else {
+        header = token.slice(0, lastNl + 1);
+        indicator = token.slice(lastNl + 1);
+      }
+    } else if (token.startsWith("\n")) {
+      header = "\n";
+      indicator = token.slice(1);
     }
 
     // 1. --raw -z: starts with ":100644"
@@ -641,8 +654,10 @@ export function filterGitPatchZOutput(stdout) {
     }
 
     // 2. --name-status -z: status tag like "M", "A", "R100"
-    if (/^[MADRCU][0-9]*$/.test(indicator.trim())) {
-      const isRename = /^[RC][0-9]*$/.test(indicator.trim());
+    // Важно: статус git никогда не содержит ведущих пробелов!
+    // Строки коммит-сообщения с отступом (например "    M") НЕ должны считаться индикатором.
+    if (/^[MADRCU][0-9]*$/.test(indicator)) {
+      const isRename = /^[RC][0-9]*$/.test(indicator);
       const p1 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
       if (isRename) {
         const p2 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
@@ -1203,6 +1218,23 @@ export async function runToolLoop({
 /* ---------- §5: упаковка первого сообщения ---------- */
 const FILE_TOKEN_TRIMS = /^[`'"([{<]+|[`'")\]}>.,;:!?]+$/g;
 
+const BARE_FILE_NAMES = new Set([
+  "makefile", "dockerfile", "readme", "license", "licence",
+  "procfile", "gemfile", "rakefile", "vagrantfile", "containerfile",
+  "brewfile", "justfile", "build", "workspace", "tiltfile", "guardfile",
+]);
+
+function isFileCandidateToken(tok, cwd) {
+  if (tok.includes("/") || /\.[A-Za-z0-9]{1,8}$/.test(tok)) return true;
+  if (BARE_FILE_NAMES.has(tok.toLowerCase())) return true;
+  try {
+    const p = path.join(cwd, tok);
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function fileCandidates(text, cwd, seen, out) {
   const baseR = resolveInCwd(cwd, ".");
   if (baseR.error) return;
@@ -1212,9 +1244,9 @@ function fileCandidates(text, cwd, seen, out) {
     tok = tok.replace(FILE_TOKEN_TRIMS, "");
     if (!tok || tok.length > 200) continue;
     if (/^[a-z][a-z0-9+.-]*:\/\//i.test(tok)) continue;
-    if (!tok.includes("/") && !/\.[A-Za-z0-9]{1,8}$/.test(tok)) continue;
-    inspected += 1;
     if (isSensitivePath(tok)) continue;
+    if (!isFileCandidateToken(tok, cwd)) continue;
+    inspected += 1;
     const r = resolveInCwd(cwd, tok);
     if (!r.abs) continue;
     try {
@@ -1223,6 +1255,7 @@ function fileCandidates(text, cwd, seen, out) {
       continue;
     }
     const rel = path.relative(r.base, r.abs);
+    if (isSensitivePath(rel)) continue;
     const key = `file:${rel}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -1444,7 +1477,7 @@ export function packFirstMessage({
   }
 
   // 2) Если блоков не осталось, а подсказок слишком много (>maxBytes), ужимаем список подсказок.
-  if (overflow.length > 0 && maxBytes >= 10000 && len(fullText) > maxBytes) {
+  if (overflow.length > 0 && len(fullText) > maxBytes) {
     const baseLen = len(header + prefix + "\n\n" + body + (blocks.length ? "\n\n" + blocks.map((b) => b.text).join("\n\n") : ""));
     const available = maxBytes - baseLen;
     const included = [];
@@ -1464,7 +1497,7 @@ export function packFirstMessage({
 
   // 3) Если даже без блоков и подсказок текст задачи (body) превышает maxBytes,
   // ужимаем body (§5.4/§7.1: потолок ARGON_MAX_MESSAGE_BYTES обязателен).
-  if (maxBytes >= 10000 && len(fullText) > maxBytes) {
+  if (len(fullText) > maxBytes) {
     head = header;
     const headerWithSepLen = len(head + "\n\n");
     const availableForBody = maxBytes - headerWithSepLen;
@@ -1481,7 +1514,7 @@ export function packFirstMessage({
   }
 
   let message = maskForWeb(fullText);
-  if (maxBytes >= 10000 && len(message) > maxBytes) {
+  if (len(message) > maxBytes) {
     message = truncateUtf8(message, maxBytes);
   }
   return { message, attached, overflow };

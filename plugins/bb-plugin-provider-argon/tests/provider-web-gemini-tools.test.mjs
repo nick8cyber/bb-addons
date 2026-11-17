@@ -19,6 +19,7 @@ import {
   forceFinalMessage,
   formatToolResultBlock,
   filterGitPatchOutput,
+  filterGitPatchZOutput,
   filterGitStatusOutput,
   truncResult,
   TRUNC_SUFFIX,
@@ -764,7 +765,7 @@ test("7. packFirstMessage: переполнение — подсказка «М�
   fs.mkdirSync(path.join(cwd, "src"));
   fs.writeFileSync(path.join(cwd, "src", "alpha.md"), "ALPHA-BODY");
   const text = `Проверь src/alpha.md, тред ${THREAD_ID} и задачу PLUG-129.`;
-  const r = withBbStub(() => packFirstMessage({ text, cwd, maxBytes: 900 }));
+  const r = withBbStub(() => packFirstMessage({ text, cwd, maxBytes: 1200 }));
   assert.match(r.message, /Можно запросить инструментом:/);
   assert.match(r.message, /read_file\("src\/alpha\.md"\)/);
   assert.match(r.message, new RegExp(`bb_thread_output\\("${THREAD_ID}"\\)`));
@@ -1162,4 +1163,79 @@ test("Audit 12 Finding 4: packFirstMessage сохраняет подсказки
     const isOverflow = r.overflow.some((h) => h.includes(fn));
     assert.ok(isAttached || isOverflow, `файл ${fn} должен быть либо во вложениях, либо в подсказках`);
   }
+});
+
+test("Audit 13 Finding 1: toolReadFile и resolveInCwd блокируют чтение конфиденциального файла через симлинк внутри cwd", () => {
+  const cwd = mkTmp("argon-cwd-");
+  fs.writeFileSync(path.join(cwd, ".env"), "SECRET=hunter2");
+  fs.symlinkSync(".env", path.join(cwd, "symlink.txt"));
+
+  const r = executeTool(
+    { name: "read_file", args: { path: "symlink.txt" }, attrs: [["path", "symlink.txt"]] },
+    { cwd },
+  );
+  assert.equal(r.ok, false);
+  assert.match(r.output, /access denied to sensitive file/);
+
+  // Также в поддиректории
+  fs.mkdirSync(path.join(cwd, "nested"));
+  fs.symlinkSync("../.env", path.join(cwd, "nested", "link_to_dot_env"));
+  const r2 = executeTool(
+    { name: "read_file", args: { path: "nested/link_to_dot_env" }, attrs: [["path", "nested/link_to_dot_env"]] },
+    { cwd },
+  );
+  assert.equal(r2.ok, false);
+  assert.match(r2.output, /access denied to sensitive file/);
+});
+
+test("Audit 13 Finding 2: packFirstMessage распознает и вкладывает файлы без расширения (Makefile, README, Dockerfile, кастомные файлы)", () => {
+  const cwd = mkTmp("argon-cwd-");
+  fs.writeFileSync(path.join(cwd, "Makefile"), "all:\n\techo make");
+  fs.writeFileSync(path.join(cwd, "README"), "README CONTENT");
+  fs.writeFileSync(path.join(cwd, "Dockerfile"), "FROM node:20");
+  fs.writeFileSync(path.join(cwd, "CUSTOM_FILE"), "CUSTOM CONTENT");
+
+  const text = "Проверь Makefile, README, Dockerfile и CUSTOM_FILE в проекте.";
+  const r = packFirstMessage({ text, cwd });
+  assert.ok(r.attached.includes("file: Makefile"));
+  assert.ok(r.attached.includes("file: README"));
+  assert.ok(r.attached.includes("file: Dockerfile"));
+  assert.ok(r.attached.includes("file: CUSTOM_FILE"));
+  assert.match(r.message, /=== file: Makefile ===\nall:\n\techo make/);
+  assert.match(r.message, /=== file: README ===\nREADME CONTENT/);
+  assert.match(r.message, /=== file: Dockerfile ===\nFROM node:20/);
+  assert.match(r.message, /=== file: CUSTOM_FILE ===\nCUSTOM CONTENT/);
+  assert.ok(!r.attached.some((a) => a.includes("Проверь") || a.includes("проекте")));
+});
+
+test("Audit 13 Finding 3: packFirstMessage гарантирует потолок ARGON_MAX_MESSAGE_BYTES даже при малом maxBytes (<10 КБ)", () => {
+  const hugeText = "Заголовок задачи: " + "X".repeat(20 * 1024);
+  const r1 = packFirstMessage({ text: hugeText, maxBytes: 5000 });
+  assert.ok(Buffer.byteLength(r1.message, "utf8") <= 5000, `размер ${Buffer.byteLength(r1.message, "utf8")} превышает 5000 Б`);
+  assert.match(r1.message, /\[\.\.\. текст задачи обрезан по лимиту сообщения \.\.\.\]/);
+
+  const r2 = packFirstMessage({ text: hugeText, maxBytes: 8000 });
+  assert.ok(Buffer.byteLength(r2.message, "utf8") <= 8000, `размер ${Buffer.byteLength(r2.message, "utf8")} превышает 8000 Б`);
+  assert.match(r2.message, /\[\.\.\. текст задачи обрезан по лимиту сообщения \.\.\.\]/);
+});
+
+test("Audit 13 Finding 4: filterGitPatchZOutput не путает строки коммит-сообщения со статусом git и не съедает следующий токен", () => {
+  const commit1 = "commit 1111111111111111111111111111111111111111\nAuthor: user <user@example.com>\nDate:   Tue Nov 17 00:00:00 2026\n\n    title\n    M\n";
+  const commit2 = "commit 2222222222222222222222222222222222222222\nAuthor: user <user@example.com>\nDate:   Tue Nov 17 00:01:00 2026\n\n    next title\n";
+  const rawZ = `${commit1}\0${commit2}\0`;
+
+  const filtered = filterGitPatchZOutput(rawZ);
+  const parts = filtered.split("\0");
+  assert.ok(parts[0].includes("commit 11111111"), "первый коммит сохранен");
+  assert.ok(parts[0].includes("    M"), "сообщение первого коммита сохранено");
+  assert.ok(parts[1].includes("commit 22222222"), "второй коммит сохранен и не съеден как путь к файлу");
+
+  const repo = mkGitRepo();
+  const git = (args) =>
+    execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  git(["commit", "--allow-empty", "-m", "line1\n\n    M"]);
+  const logZ = git(["log", "-z", "-n", "2", "--name-status"]);
+  const filteredLog = filterGitPatchZOutput(logZ);
+  assert.ok(filteredLog.includes("line1"), "сообщение коммита присутствует");
+  assert.ok(filteredLog.includes("init"), "предыдущий коммит присутствует и не съеден");
 });
