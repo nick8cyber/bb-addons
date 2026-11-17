@@ -3234,7 +3234,8 @@ export class DelegationStore {
 
   /** §24.2 (r33.5): record a finished round's staged plugin work. The
    * task_key is the primary key — a re-run refreshes the row's sha,
-   * branch, plugin and UI flags. */
+   * branch, plugin and UI flags. When updating an existing row, ui_files
+   * are unioned and ui_touched remains true if either old or new touched UI. */
   recordStagedFeature(feature: {
     taskKey: string;
     projectId?: string | null;
@@ -3247,6 +3248,27 @@ export class DelegationStore {
     droppedReason?: string | null;
   }): void {
     const now = Date.now();
+    const key = normalizeTaskKey(feature.taskKey);
+    const existing = this.stagedFeature(key);
+    let uiTouched = feature.uiTouched;
+    let uiFiles = [...feature.uiFiles];
+    if (existing) {
+      if (existing.ui_touched === 1) {
+        uiTouched = true;
+      }
+      try {
+        const oldFiles = JSON.parse(existing.ui_files || "[]");
+        if (Array.isArray(oldFiles)) {
+          const set = new Set([...oldFiles, ...uiFiles]);
+          uiFiles = Array.from(set);
+        }
+      } catch {
+        // malformed old json — keep new files
+      }
+    }
+    if (uiFiles.length > 0) {
+      uiTouched = true;
+    }
     this.db
       .prepare(
         `INSERT INTO plugin_staged_features (
@@ -3266,13 +3288,13 @@ export class DelegationStore {
           updated_at = excluded.updated_at`,
       )
       .run(
-        normalizeTaskKey(feature.taskKey),
+        key,
         feature.projectId ?? null,
         feature.pluginName,
         feature.branchName ?? null,
         feature.resultSha,
-        feature.uiTouched ? 1 : 0,
-        JSON.stringify(feature.uiFiles),
+        uiTouched ? 1 : 0,
+        JSON.stringify(uiFiles),
         feature.status ?? "in_review",
         feature.droppedReason ?? null,
         now,

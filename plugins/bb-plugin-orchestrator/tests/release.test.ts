@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cpSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { makeTempDir } from "./helpers/temp.js";
@@ -7709,4 +7709,52 @@ test("§24.2/r11.5: после публикации выкладки её фич
   const s = await pumpReleases(deps);
   assert.equal(s.published, 1);
   assert.equal(store.stagedFeature("PLUG-1")!.status, "merged");
+});
+
+test("§24.2: recordStagedFeature — повторный заход без UI сохраняет ui_touched=1 и ui_files", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // Заход 1: правил UI (app.tsx)
+  store.recordStagedFeature({
+    taskKey: "PLUG-100",
+    pluginName: "my-plugin",
+    branchName: "feat-100",
+    resultSha: "sha1",
+    uiTouched: true,
+    uiFiles: ["src/app.tsx"],
+  });
+  let row = store.stagedFeature("PLUG-100")!;
+  assert.equal(row.ui_touched, 1);
+  assert.deepEqual(JSON.parse(row.ui_files!), ["src/app.tsx"]);
+  assert.equal(row.result_sha, "sha1");
+
+  // Заход 2: правил только бекенд (server.ts), без UI
+  store.recordStagedFeature({
+    taskKey: "PLUG-100",
+    pluginName: "my-plugin",
+    branchName: "feat-100",
+    resultSha: "sha2",
+    uiTouched: false,
+    uiFiles: [],
+  });
+  row = store.stagedFeature("PLUG-100")!;
+  assert.equal(row.ui_touched, 1);
+  assert.deepEqual(JSON.parse(row.ui_files!), ["src/app.tsx"]);
+  assert.equal(row.result_sha, "sha2");
+
+  // Заход 3: добавил ещё один UI файл (app.css)
+  store.recordStagedFeature({
+    taskKey: "PLUG-100",
+    pluginName: "my-plugin",
+    branchName: "feat-100",
+    resultSha: "sha3",
+    uiTouched: true,
+    uiFiles: ["src/app.css"],
+  });
+  row = store.stagedFeature("PLUG-100")!;
+  assert.equal(row.ui_touched, 1);
+  assert.deepEqual(JSON.parse(row.ui_files!), ["src/app.tsx", "src/app.css"]);
+  assert.equal(row.result_sha, "sha3");
 });

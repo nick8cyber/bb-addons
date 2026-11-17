@@ -1610,26 +1610,28 @@ export function createWatchdog(deps: WatchdogDeps) {
         dirty,
       });
       // §24.2 (r33.5): stage the round's plugin work — the paths the
-      // round's commits touched (from `continue_from`/the branch's
-      // merge base to `sha`), which of them are UI, and the plugin
-      // they belong to. A failure here never fails the round result.
+      // task's commits touched (from the merge base with origin/main to
+      // `sha`), which of them are UI, and the plugin they belong to.
+      // A failure here never fails the round result.
       try {
-        let filesBase = start;
-        if (!filesBase && env.mergeBaseBranch) {
-          // mergeBaseBranch — имя ветки («main»); её remote-tracking
-          // ref есть всегда, локальная ветка в копии может отсутствовать.
-          for (const ref of [
+        let filesBase: string | null = null;
+        const candidateRefs: string[] = [];
+        if (env.mergeBaseBranch) {
+          candidateRefs.push(
             `origin/${env.mergeBaseBranch}`,
             env.mergeBaseBranch,
-          ]) {
-            const mb = await git(["merge-base", sha, ref]).catch(
-              () => "",
-            );
-            if (mb.trim()) {
-              filesBase = mb.trim();
-              break;
-            }
+          );
+        }
+        candidateRefs.push("origin/main", "main", "origin/master", "master");
+        for (const ref of candidateRefs) {
+          const mb = await git(["merge-base", sha, ref]).catch(() => "");
+          if (mb.trim()) {
+            filesBase = mb.trim();
+            break;
           }
+        }
+        if (!filesBase && start) {
+          filesBase = start;
         }
         if (filesBase) {
           const changed = (
