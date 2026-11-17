@@ -87,6 +87,7 @@ async function hostWith(
   cli: BbCli = fakeCli().cli,
   sdk: NonNullable<Parameters<typeof createFakePluginHost>[0]>["sdk"] = {},
   now?: () => number,
+  cmd?: CmdRunner,
 ) {
   const host = createFakePluginHost({
     pluginId: "orchestrator",
@@ -105,7 +106,11 @@ async function hostWith(
       ],
     sdk,
   });
-  await createPlugin(host.bb, { bbCli: cli, ...(now ? { now } : {}) });
+  await createPlugin(host.bb, {
+    bbCli: cli,
+    ...(now ? { now } : {}),
+    ...(cmd ? { cmd } : {}),
+  });
   return host;
 }
 
@@ -240,6 +245,94 @@ test("CLI delegate end-to-end through the fake host", async () => {
     "no parent-notifications repair call",
   );
   assert.deepEqual(updates, []);
+});
+
+test("PLUG-294: CLI delegate on tool-less route with --from forwards stepsDeps and succeeds", async () => {
+  const { cli } = fakeCli((args) => {
+    const key = args.join(" ");
+    if (key.startsWith("tasks preset list")) {
+      return ok(JSON.stringify({ presets: [{ name: "argon-preset", id: "p_argon" }] }));
+    }
+    if (key.startsWith("tasks preset show")) {
+      return ok(
+        JSON.stringify({
+          preset: {
+            providerId: "acp-argon",
+            modelId: "argon-1",
+            reasoningLevel: "medium",
+            permissionMode: "auto",
+            environmentKind: "project-default",
+          },
+        }),
+      );
+    }
+    if (key.startsWith("environment show env_main")) {
+      return ok(JSON.stringify({ id: "env_main", path: "/test/repo" }));
+    }
+    return undefined;
+  });
+  const gitCmd: CmdRunner = {
+    run: async (_file, args) => {
+      const line = args.join(" ");
+      if (line.includes("rev-parse")) return { exitCode: 0, stdout: "sha123\n", stderr: "" };
+      if (line.includes("merge-base")) return { exitCode: 0, stdout: "shaBASE\n", stderr: "" };
+      if (line.includes("diff") && line.includes("--stat")) return { exitCode: 0, stdout: " a.ts | 2 +-\n", stderr: "" };
+      if (line.includes("diff")) return { exitCode: 0, stdout: "DIFF_OUTPUT\n", stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+  const spawnCalls: { prompt?: string }[] = [];
+  const host = await hostWith(
+    {
+      policy: JSON.stringify({
+        version: 1,
+        limits: { maxActive: 5 },
+        levels: { review: { chain: ["argon"], role: "auditor" } },
+        routes: {
+          argon: { preset: "argon-preset", provider: "acp-argon", tools: false },
+        },
+      }),
+    },
+    cli,
+    {
+      threads: {
+        get: async () => ({
+          id: "thr_coord",
+          parentThreadId: null,
+          title: "coordinator",
+          titleFallback: null,
+          originPluginId: null,
+          projectId: "proj_main",
+          environmentId: "env_main",
+        }),
+        spawn: async (a: { prompt?: string }) => {
+          spawnCalls.push(a);
+          return { id: "thr_exec" };
+        },
+        list: async () => [],
+        update: async () => ({}),
+      },
+    },
+    undefined,
+    gitCmd,
+  );
+  const res = await host.harness.runCli(
+    ["delegate", "PLUG-1", "--level", "review", "--route", "argon", "--from", "sha123", "--json"],
+    { threadId: "thr_coord" },
+  );
+  assert.equal(res.exitCode, 0, res.stderr || res.stdout);
+  const body = JSON.parse(res.stdout) as {
+    ok: boolean;
+    threadId: string;
+    route: string;
+    delegationId: number;
+  };
+  assert.equal(body.ok, true);
+  assert.equal(body.threadId, "thr_exec");
+  assert.equal(body.route, "argon");
+  assert.equal(spawnCalls.length, 1);
+  assert.match(spawnCalls[0]!.prompt ?? "", /МАТЕРИАЛ ДЛЯ ПРОВЕРКИ/);
+  assert.ok(spawnCalls[0]!.prompt?.includes("DIFF_OUTPUT"));
 });
 
 test("policy validate rejects an invalid policy with a path", async () => {
