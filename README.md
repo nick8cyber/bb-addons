@@ -335,6 +335,9 @@ is affected. Requires a clean working tree (untracked files are ignored) — onl
 committed changes are checked. A plugin's `node_modules` must be a real
 directory carrying every `devDependencies` binary under `.bin`: a symlink
 (shared store) is unlinked with `rm -f` first, and a missing binary (e.g.
-`tsc`) also makes `npm ci` run again. On failure the tail of the output lists
-the failed test names per plugin — TAP `not ok` and vitest `FAIL`/`×` lines —
-because the release journal keeps only the tail.
+`tsc`) also makes `npm ci` run again. `npm ci` is serialized with `flock` on
+`.deps-install.lock` in the repository root, so a concurrent install (e.g. the
+background worktree provisioning) cannot wipe `node_modules/.bin` mid-check. On
+failure the tail of the output lists the failed test names per plugin — TAP
+`not ok` and vitest `FAIL`/`×` lines — because the release journal keeps only
+the tail.
