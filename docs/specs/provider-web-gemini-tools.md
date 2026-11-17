@@ -3,7 +3,7 @@ title: provider-web-gemini-tools — Инструменты чтения для 
 status: approved
 owner: coordinator
 date: 2026-11-16
-revision: 3
+revision: 4
 tags: [bb, plugins, provider-argon, acp, gemini, tools]
 ---
 
@@ -124,7 +124,7 @@ flowchart TD
 
 ## 5. Предварительное раскрытие ссылок и упаковка первого сообщения
 
-До запуска первого раунда в веб-интерфейсе провайдер анализирует входной текст задачи (`params.prompt`):
+До запуска первого раунда в веб-интерфейсе провайдер анализирует входной текст задачи (`params.prompt`), уже очищенный от bb-контекста — текст-блоки `<system_instructions>…</system_instructions>` отбрасывает `session/prompt` (provider-argon.md §2.2, PLUG-285):
 
 1. **Распознаваемые сущности:**
    - Пути файлов репозитория (существующие внутри `cwd`);

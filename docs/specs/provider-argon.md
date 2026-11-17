@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-17
-revision: 16
+revision: 17
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -73,6 +73,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 - На каждый вызов `session/prompt`:
   1. Текстовые блоки из `params.prompt` склеиваются в строку `text`; при пустом тексте немедленно возвращается `{ stopReason: "end_turn" }`.
+     - **Вырезание bb-контекста (PLUG-285):** текст-блоки, чей текст начинается с `<system_instructions>` (агентский контекст bb — инструкции плагинов, манифест инструментов, навыки), целиком отбрасываются до склейки; упоминание метки в середине пользовательского текста и не-text блоки не затрагиваются. Без этого веб-Gemini читал обвязку как «нет инструментов и сети» и отказывался работать.
   2. **Гард размера промпта (PLUG-281):** `Buffer.byteLength(text)` сверяется с лимитом `ARGON_MAX_PROMPT_BYTES` (см. §4.1). Превышение — немедленный JSON-RPC error `-32000` с сообщением `prompt too large: <N> bytes exceeds limit <L> bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.` — синхронно в `dispatch`, до очереди `enqueue`, выбора аккаунта и аренды. Это ошибка вызывающего, а не аккаунта: пул, аренды и кулдауны не затрагиваются.
   3. При `ARGON_FAKE=1` сервер отправляет нотификацию `session/update` (`sessionUpdate: "agent_message_chunk"`, `text: "FAKE_ARGON_ECHO: " + text.slice(0, 80)`). Если задана задержка `process.env.ARGON_FAKE_DELAY_MS`, генерация удерживает аренду в течение этой паузы для проверки отмены и корректного завершения. По завершении возвращает `{ stopReason: "end_turn" }`.
   4. В боевом режиме выбирается аккаунт из пула (§3), захватывается аренда через `bindBackend` / `acquireInState`, и драйвер вызывает `sendPrompt` с единым объектом параметров: `{ prompt: text, model: s.model, thinking: mappedThinking, convId: s.convId, isNewChat: !s.convId, cdpPort: backend.cdp, strictModel: true, shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen, headless: HEADLESS, profile: backend.profileDir || backend.profile || backend.id, strict: true, onChunk, signal: abortCtrl.signal }`.

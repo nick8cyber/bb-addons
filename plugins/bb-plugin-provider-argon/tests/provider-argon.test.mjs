@@ -20,6 +20,7 @@ import {
   slog,
   reapOrphanAcpServers,
   checkStaleCode,
+  isBbSystemInstructionsBlock,
 } from "../acp-server.mjs";
 
 const require = createRequire(import.meta.url);
@@ -2301,4 +2302,153 @@ test("16. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   runUnlock("all");
   st = readState();
   assert.deepEqual(st.accounts["pro-1"].lockedModels, [], "unlock all clears every account");
+});
+
+test("17. PLUG-285: bb <system_instructions> blocks stripped from session/prompt", async () => {
+  // Predicate: only a text block whose text STARTS with the marker is bb
+  // context; marker inside user text and non-text blocks are untouched.
+  assert.equal(
+    isBbSystemInstructionsBlock({ type: "text", text: "<system_instructions>\nctx\n</system_instructions>" }),
+    true
+  );
+  assert.equal(
+    isBbSystemInstructionsBlock({ type: "text", text: "  \n<system_instructions>x</system_instructions>" }),
+    true,
+    "leading whitespace before the marker still marks the block"
+  );
+  assert.equal(
+    isBbSystemInstructionsBlock({ type: "text", text: "расскажи про <system_instructions> тег" }),
+    false,
+    "marker inside user text must not mark the block"
+  );
+  assert.equal(
+    isBbSystemInstructionsBlock({ type: "resource", resource: { text: "<system_instructions>x" } }),
+    false,
+    "non-text blocks are never stripped"
+  );
+  assert.equal(isBbSystemInstructionsBlock({ type: "text" }), false);
+  assert.equal(isBbSystemInstructionsBlock(null), false);
+
+  // Server path (FAKE): the joined prompt reaching the driver contains only
+  // the user text — the ~29KB bb context block is dropped before the join.
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-strip-test-")));
+  const poolFile = path.join(tmpDir, "pool.json");
+  fs.writeFileSync(
+    poolFile,
+    JSON.stringify({
+      accounts: [
+        {
+          id: "fake-acc-strip",
+          email: "strip@example.com",
+          profileDir: path.join(tmpDir, "p1"),
+          cdpPort: 9222,
+          priority: 10,
+        },
+      ],
+    })
+  );
+
+  const serverProc = spawnServer({
+    ...process.env,
+    ARGON_FAKE: "1",
+    ARGON_STATE_DIR: tmpDir,
+    ARGON_POOL_FILE: poolFile,
+  });
+
+  const lines = [];
+  serverProc.stdout.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) {
+        try {
+          lines.push(JSON.parse(line.trim()));
+        } catch {}
+      }
+    }
+  });
+
+  function sendReq(req) {
+    serverProc.stdin.write(JSON.stringify(req) + "\n");
+  }
+
+  async function waitForResponse(id, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.id === id);
+      if (idx >= 0) {
+        return lines.splice(idx, 1)[0];
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`Timeout waiting for response id=${id}`);
+  }
+
+  sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+  await waitForResponse(1);
+  sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });
+  const r2 = await waitForResponse(2);
+  const sessionId = r2.result.sessionId;
+
+  // Contract: prompt = bb <system_instructions> block + user block (+ a
+  // resource block that must pass through untouched) → the driver-facing
+  // text is only the user's.
+  sendReq({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [
+        {
+          type: "text",
+          text: "<system_instructions>\nBBCTX_SECRET_MARKER agent context, no tools\n</system_instructions>",
+        },
+        { type: "text", text: "Найди новости про <system_instructions> тег" },
+        { type: "resource", resource: { uri: "file:///tmp/notes.txt", text: "res" } },
+      ],
+    },
+  });
+  const r3 = await waitForResponse(3);
+  assert.equal(r3.result?.stopReason, "end_turn");
+
+  const chunk = lines.find(
+    (l) => l.method === "session/update" && l.params?.update?.sessionUpdate === "agent_message_chunk"
+  );
+  assert.ok(chunk, "FAKE echo chunk must be emitted");
+  const echo = String(chunk.params.update.text ?? chunk.params.update.content?.text ?? "");
+  assert.ok(echo.includes("FAKE_ARGON_ECHO"), "echo prefix expected");
+  assert.ok(echo.includes("Найди новости"), "user text must reach the driver");
+  assert.ok(
+    echo.includes("<system_instructions>"),
+    "marker inside user text must be preserved, not cut"
+  );
+  assert.equal(
+    echo.includes("BBCTX_SECRET_MARKER"),
+    false,
+    "bb system_instructions block must not reach the driver"
+  );
+
+  // Edge case: prompt containing ONLY the bb context block → empty text →
+  // immediate end_turn without touching accounts (same as blank prompt).
+  sendReq({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "<system_instructions>\nonly context\n</system_instructions>" }],
+    },
+  });
+  const r4 = await waitForResponse(4);
+  assert.equal(r4.result?.stopReason, "end_turn");
+  assert.equal(
+    lines.filter(
+      (l) => l.method === "session/update" && l.params?.update?.sessionUpdate === "agent_message_chunk"
+    ).length,
+    1,
+    "context-only prompt must not produce a second echo chunk"
+  );
+
+  serverProc.stdin.end();
+  await new Promise((resolve) => serverProc.on("exit", resolve));
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 });

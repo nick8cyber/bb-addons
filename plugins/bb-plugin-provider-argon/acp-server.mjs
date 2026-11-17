@@ -498,6 +498,23 @@ export function promptTooLargeError(text) {
   return err;
 }
 
+/* ---------- bb <system_instructions> strip (PLUG-285, §2.2) ---------- */
+// bb кладёт свой агентский контекст (~29 КБ инструкций плагинов, манифеста
+// инструментов и навыков) первым текст-блоком session/prompt. Веб-Gemini
+// читал его как «нет инструментов и сети» и отказывался работать
+// (инциденты 16.11). Блок, чей текст начинается с маркера
+// `<system_instructions>`, — целиком bb-инъекция и вырезается до склейки;
+// упоминание метки внутри пользовательского текста блок не портит.
+const BB_SYSTEM_INSTRUCTIONS_MARKER = "<system_instructions>";
+export function isBbSystemInstructionsBlock(block) {
+  return Boolean(
+    block &&
+      block.type === "text" &&
+      typeof block.text === "string" &&
+      block.text.trimStart().startsWith(BB_SYSTEM_INSTRUCTIONS_MARKER)
+  );
+}
+
 /* ---------- classify failure (§3.3) ---------- */
 
 export function classifyFailure(err, authHint = null) {
@@ -1546,8 +1563,11 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "prompt must be an array of blocks" } });
         return;
       }
+      // PLUG-285: блоки с агентским контекстом bb (<system_instructions>…)
+      // отбрасываются целиком, до склейки — до драйвера доходит только
+      // текст пользователя. Ресурсы и не-text блоки не затрагиваются.
       const text = p.prompt
-        .filter((b) => b && b.type === "text")
+        .filter((b) => b && b.type === "text" && !isBbSystemInstructionsBlock(b))
         .map((b) => String(b.text ?? ""))
         .join("\n");
       if (!text.trim()) {
