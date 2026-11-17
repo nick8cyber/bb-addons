@@ -450,6 +450,72 @@ function throwIfPromptTooLarge(prompt, fieldMaxBytes = null) {
   }
 }
 
+// PLUG-282: exact lock-badge predicate. The old substring check
+// `className.includes('lock')` false-positived on 'unlock', 'lock_open',
+// 'mat-icon-lock-reset' etc. A real lock badge is a *visible* icon whose
+// Material identity is exactly 'lock'. Self-contained so Playwright can
+// serialize it into the page and unit tests can call it on a fake DOM.
+function menuItemHasLockIcon(el) {
+  const icons = [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')];
+  return icons.some((icon) => {
+    if (icon.offsetParent === null) return false;
+    const t = (icon.innerText || '').trim().toLowerCase();
+    if (t === 'lock') return true;
+    const attr = (
+      icon.getAttribute('data-mat-icon-name') ||
+      icon.getAttribute('aria-label') ||
+      ''
+    ).trim().toLowerCase();
+    if (attr === 'lock' || attr === 'lock-filled') return true;
+    const cls =
+      typeof icon.className === 'string'
+        ? icon.className
+        : String((icon.className && icon.className.baseVal) || '');
+    return cls.split(/\s+/).some((c) => c === 'lock' || c === 'lock-filled');
+  });
+}
+
+// PLUG-282: a post-click dialog counts as lock proof only when it carries an
+// explicit plan-change CTA. A generic promo popup with price text
+// ("попробуйте …/мес") is not a lock. Self-contained for page.evaluate:
+// Playwright invokes fn() with no args, so the document comes from the
+// page's global — `globalThis.document` also resolves safely under Node
+// tests where `document` is not a declared identifier.
+function upsellDialogConfirmsLock(doc = globalThis.document) {
+  const PLAN_CTA =
+    /сменить (план|подписку)|сменить тариф|change (plan|subscription)|upgrade|перейти на (тариф|план|ultra|pro)|оформить подписку|перейти на платную/i;
+  const DISMISS = /не сейчас|not now|no thanks|maybe later/i;
+  if (!doc || typeof doc.querySelectorAll !== 'function') return false;
+  const dlgs = [...doc.querySelectorAll('mat-dialog-container, [role="dialog"]')]
+    .filter((e) => e.offsetParent !== null);
+  for (const dlg of dlgs) {
+    // Skip dialogs that were already open before the model-item click — a
+    // pre-existing promo with a plan CTA is not a response to this click.
+    if (typeof dlg.getAttribute === 'function' && dlg.getAttribute('data-argon-pre-click') !== null) continue;
+    const actions = [...dlg.querySelectorAll('button,[role="button"],a')];
+    if (!actions.some((x) => PLAN_CTA.test((x.innerText || '').trim()))) continue;
+    const dismiss = actions.find((x) => DISMISS.test((x.innerText || '').trim()));
+    if (dismiss) dismiss.click();
+    return true;
+  }
+  return false;
+}
+
+// PLUG-282: tag dialogs already on screen so the post-click upsell check only
+// counts a dialog that appeared as a direct response to the click. Hidden
+// dialogs are left untagged — a pre-existing hidden element shown in response
+// to the click is still a click response. Self-contained for page.evaluate.
+function markVisibleDialogs(doc = globalThis.document) {
+  if (!doc || typeof doc.querySelectorAll !== 'function') return 0;
+  let n = 0;
+  for (const d of doc.querySelectorAll('mat-dialog-container, [role="dialog"]')) {
+    if (d.offsetParent === null || typeof d.setAttribute !== 'function') continue;
+    d.setAttribute('data-argon-pre-click', '1');
+    n += 1;
+  }
+  return n;
+}
+
 async function selectModelAndThinking(page, model, thinking, strict = false) {
   const isMenuOpen = async () => {
     const menu = await safeQuery(page, 'gem-menu[role="menu"]:visible, gem-menu-item[data-mode-id]:visible, [role="menuitem"]:visible');
@@ -510,14 +576,7 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
 
           if (matches) {
             // Check for lock icon before clicking
-            const isLocked = await item.evaluate((el) => {
-              const icons = [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')];
-              return icons.some((icon) => {
-                const t = (icon.innerText || '').trim().toLowerCase();
-                const attr = (icon.getAttribute('data-mat-icon-name') || icon.getAttribute('aria-label') || '').toLowerCase();
-                return t === 'lock' || attr === 'lock' || (icon.className && icon.className.includes('lock'));
-              });
-            });
+            const isLocked = await item.evaluate(menuItemHasLockIcon);
             if (isLocked) {
               if (strict) {
                 const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
@@ -544,24 +603,33 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
                 `[gemini] Model "${model}" is currently rate-limited (${resetMatch ? resetMatch[0] : 'limit reached'}). Continuing with available model.`
               );
             } else {
+              if (strict) await safeEval(page, markVisibleDialogs);
               await item.click({ timeout: 5000 });
               clicked = true;
               if (strict) {
                 // Locked models are clickable: the click opens a paid-upgrade
-                // dialog instead of selecting — detect and report.
+                // dialog instead of selecting. PLUG-282: a dialog is lock
+                // proof only with an explicit plan-change CTA, and only when
+                // the model did NOT get selected — a promo popup alongside a
+                // successful selection is not a lock.
                 await page.waitForTimeout(500);
-                const upsell = await safeEval(page, () => {
-                  const dlgs = [...document.querySelectorAll('mat-dialog-container, [role="dialog"]')]
-                    .filter((e) => e.offsetParent !== null);
-                  const dlg = dlgs.find((d) =>
-                    /сменить план|change (plan|subscription)|per month|\/\s*(мес|month)/i.test(d.innerText || '')
-                  );
-                  if (!dlg) return false;
-                  const b = [...dlg.querySelectorAll('button,[role="button"],a')]
-                    .find((x) => /не сейчас|not now|no thanks|maybe later/i.test((x.innerText || '').trim()));
-                  if (b) b.click();
-                  return true;
-                });
+                const selectedNow = await (async () => {
+                  try {
+                    const b2 = await getPickerButton(page);
+                    const t2 = (await b2.innerText()).trim().toLowerCase();
+                    const a2 = ((await b2.getAttribute('aria-label')) || '').toLowerCase();
+                    if (m === 'flash' || m === 'fast') {
+                      if (t2.includes('lite') || a2.includes('lite')) return false;
+                      return wordMatch(t2, 'flash') || wordMatch(a2, 'flash');
+                    }
+                    return modelKeywords.some(
+                      (kw) => wordMatch(t2, kw) || wordMatch(a2, kw) || t2.includes(kw) || a2.includes(kw)
+                    );
+                  } catch {
+                    return false;
+                  }
+                })();
+                const upsell = selectedNow ? false : await safeEval(page, upsellDialogConfirmsLock);
                 if (upsell) {
                   const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
                   err.isLocked = true;
@@ -1674,6 +1742,9 @@ module.exports = {
   ModelUnavailable,
   RESET_REGEX_EXTENDED,
   selectModelAndThinking,
+  menuItemHasLockIcon,
+  upsellDialogConfirmsLock,
+  markVisibleDialogs,
   stopGeneration,
   findTurnTarget,
   waitForHistoryStabilization,

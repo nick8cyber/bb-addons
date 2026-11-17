@@ -38,6 +38,9 @@ const {
   captureUsageLimits,
   sendPrompt,
   _setDriverHooks,
+  menuItemHasLockIcon,
+  upsellDialogConfirmsLock,
+  markVisibleDialogs,
 } = driver;
 const { withUsageLock, KNOWN_CANDIDATE_RPCIDS } = usageLimitsModule;
 
@@ -1934,4 +1937,350 @@ test("15. PLUG-280 model↔account selector filtering and incompatibility resets
   serverProc.stdin.end();
   await new Promise((resolve) => serverProc.on("exit", resolve));
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", async () => {
+  // --- lock-icon predicate on DOM fixtures ---
+  const icon = (props = {}) => ({
+    offsetParent: {},
+    innerText: "",
+    className: "",
+    getAttribute: () => null,
+    ...props,
+  });
+  const item = (icons) => ({ querySelectorAll: () => icons });
+
+  // Real lock badge → locked (each detection channel).
+  assert.equal(menuItemHasLockIcon(item([icon({ innerText: "lock" })])), true, "innerText 'lock'");
+  assert.equal(
+    menuItemHasLockIcon(item([icon({ getAttribute: (n) => (n === "data-mat-icon-name" ? "lock" : null) })])),
+    true,
+    "data-mat-icon-name 'lock'"
+  );
+  assert.equal(
+    menuItemHasLockIcon(item([icon({ getAttribute: (n) => (n === "aria-label" ? "Lock" : null) })])),
+    true,
+    "aria-label 'lock'"
+  );
+  assert.equal(menuItemHasLockIcon(item([icon({ className: "gem-icon lock" })])), true, "class token 'lock'");
+  assert.equal(menuItemHasLockIcon(item([icon({ className: "mat-icon lock-filled" })])), true, "class token 'lock-filled'");
+
+  // Substring traps → NOT locked (the 16.11 false-positive paths).
+  assert.equal(menuItemHasLockIcon(item([icon({ className: "mat-icon unlock" })])), false, "'unlock' class");
+  assert.equal(menuItemHasLockIcon(item([icon({ className: "mat-icon lock_open" })])), false, "'lock_open' class");
+  assert.equal(menuItemHasLockIcon(item([icon({ className: "mat-icon-lock-reset" })])), false, "'mat-icon-lock-reset' class");
+  assert.equal(menuItemHasLockIcon(item([icon({ innerText: "lock_open" })])), false, "innerText 'lock_open'");
+  assert.equal(
+    menuItemHasLockIcon(item([icon({ getAttribute: (n) => (n === "aria-label" ? "unlock" : null) })])),
+    false,
+    "aria-label 'unlock'"
+  );
+
+  // Hidden badge and no-icon items → NOT locked.
+  assert.equal(menuItemHasLockIcon(item([icon({ innerText: "lock", offsetParent: null })])), false, "hidden icon");
+  assert.equal(menuItemHasLockIcon(item([])), false, "no icons");
+
+  // --- upsell dialog predicate: lock only with an explicit plan-change CTA ---
+  const btn = (text, onClick) => ({ innerText: text, click: onClick || (() => {}) });
+  const dlg = (buttons, { visible = true, attrs = {} } = {}) => ({
+    offsetParent: visible ? {} : null,
+    querySelectorAll: () => buttons,
+    getAttribute: (n) => (n in attrs ? attrs[n] : null),
+    setAttribute: (n, v) => {
+      attrs[n] = v;
+    },
+  });
+  const doc = (dialogs) => ({ querySelectorAll: () => dialogs });
+
+  // Promo popup with price text but no plan-change CTA → NOT a lock, untouched.
+  let promoDismissed = false;
+  assert.equal(
+    upsellDialogConfirmsLock(
+      doc([dlg([btn("Попробуйте Pro — 999 ₽/мес"), btn("Не сейчас", () => { promoDismissed = true; })])])
+    ),
+    false,
+    "Promo dialog with price text must not count as a lock"
+  );
+  assert.equal(promoDismissed, false, "Promo dialog must not be auto-dismissed as a lock");
+  assert.equal(
+    upsellDialogConfirmsLock(doc([dlg([btn("Подробнее"), btn("Закрыть")])])),
+    false,
+    "Informational dialog is not a lock"
+  );
+
+  // Real upsell with plan-change CTA → lock; the negative button is clicked.
+  let dismissed = false;
+  assert.equal(
+    upsellDialogConfirmsLock(doc([dlg([btn("Сменить план"), btn("Не сейчас", () => { dismissed = true; })])])),
+    true,
+    "Dialog with 'Сменить план' CTA confirms the lock"
+  );
+  assert.equal(dismissed, true, "Lock dialog must be dismissed via the negative button");
+  assert.equal(
+    upsellDialogConfirmsLock(doc([dlg([btn("Сменить план")], { visible: false })])),
+    false,
+    "Hidden dialog is ignored"
+  );
+
+  // Direct-response gate: dialogs already open before the click are marked by
+  // markVisibleDialogs and skipped — only a dialog appearing as the click's
+  // own response counts (the reviewer's "Upgrade promo" residual FP path).
+  const preDlg = dlg([btn("Upgrade"), btn("Не сейчас")]);
+  const preDoc = doc([preDlg]);
+  assert.equal(markVisibleDialogs(preDoc), 1, "visible pre-click dialog is marked");
+  assert.equal(preDlg.getAttribute("data-argon-pre-click"), "1");
+  assert.equal(
+    upsellDialogConfirmsLock(preDoc),
+    false,
+    "Pre-existing dialog with a plan CTA is not a click response"
+  );
+  assert.equal(
+    markVisibleDialogs(doc([dlg([btn("Сменить план")], { visible: false })])),
+    0,
+    "Hidden dialog is not marked — showing it after the click IS a response"
+  );
+  {
+    const savedDoc = globalThis.document;
+    delete globalThis.document;
+    try {
+      assert.equal(markVisibleDialogs(), 0, "No-arg call without a document returns 0, not a crash");
+    } finally {
+      if (savedDoc === undefined) delete globalThis.document;
+      else globalThis.document = savedDoc;
+    }
+  }
+
+  // Real Playwright calls page.evaluate(fn) with NO argument — the function
+  // must take the page's `document` itself, not crash on `undefined`.
+  const savedDocument = globalThis.document;
+  delete globalThis.document;
+  try {
+    assert.equal(
+      upsellDialogConfirmsLock(),
+      false,
+      "No-arg call (real page.evaluate path) without a document must return false, not throw"
+    );
+    globalThis.document = doc([dlg([btn("Сменить план")])]);
+    assert.equal(
+      upsellDialogConfirmsLock(),
+      true,
+      "No-arg call must read the dialog from globalThis.document"
+    );
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
+
+  // --- selectModelAndThinking end-to-end on the same fixtures ---
+  const unlockedItemEl = {
+    querySelectorAll: () => [icon({ className: "mat-icon unlock" })],
+    hasAttribute: () => false,
+    getAttribute: () => null,
+    classList: { contains: () => false },
+  };
+  let clickedUnlock = false;
+  const mockPageUnlock = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Код и анализ\n4 Argon",
+        evaluate: async (fn) => fn(unlockedItemEl),
+        click: async () => { clickedUnlock = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: (() => {
+      let n = 0;
+      return async () => {
+        n += 1;
+        // First read: another model selected, so the item must be clicked.
+        const label = n === 1 ? "3.5 Flash-Lite" : "4 Argon";
+        return {
+          innerText: async () => label,
+          getAttribute: async () => label,
+          click: async () => {},
+        };
+      };
+    })(),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  await selectModelAndThinking(mockPageUnlock, "argon", null, true);
+  assert.equal(clickedUnlock, true, "Item with an 'unlock' class icon must be clicked, not locked");
+
+  // Promo dialog after a click, model not reflected in the picker yet →
+  // no lock, no throw.
+  let clickedPromo = false;
+  const promoDoc = doc([dlg([btn("Попробуйте Ultra — 1999 ₽/мес"), btn("Не сейчас")])]);
+  // page.evaluate mocks call fn() with NO args — like real Playwright — and
+  // the page `document` is provided via globalThis, as in the browser.
+  const mockPagePromo = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Код и анализ\n4 Argon",
+        evaluate: async (fn) =>
+          fn({
+            querySelectorAll: () => [],
+            hasAttribute: () => false,
+            getAttribute: () => null,
+            classList: { contains: () => false },
+          }),
+        click: async () => { clickedPromo = true; },
+      },
+    ],
+    evaluate: async (fn) => fn(),
+    waitForSelector: async () => ({
+      innerText: async () => "3.5 Flash-Lite",
+      getAttribute: async () => "3.5 Flash-Lite",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  globalThis.document = promoDoc;
+  try {
+    await selectModelAndThinking(mockPagePromo, "argon", null, true);
+  } finally {
+    delete globalThis.document;
+  }
+  assert.equal(clickedPromo, true, "Promo popup after click must not mark the model locked");
+
+  // Plan-change dialog appearing AS the click's response, model not
+  // selected → locked. The dialog is pushed into the live doc on click.
+  const upsellDialogs = [];
+  const upsellDoc = doc(upsellDialogs);
+  const mockPageUpsell = {
+    ...mockPagePromo,
+    $$: async () => [
+      {
+        innerText: async () => "Код и анализ\n4 Argon",
+        evaluate: async (fn) =>
+          fn({
+            querySelectorAll: () => [],
+            hasAttribute: () => false,
+            getAttribute: () => null,
+            classList: { contains: () => false },
+          }),
+        click: async () => {
+          upsellDialogs.push(dlg([btn("Сменить план"), btn("Не сейчас")]));
+        },
+      },
+    ],
+    evaluate: async (fn) => fn(),
+  };
+  globalThis.document = upsellDoc;
+  try {
+    await assert.rejects(
+      async () => selectModelAndThinking(mockPageUpsell, "argon", null, true),
+      (err) => {
+        assert.ok(err instanceof ModelUnavailable);
+        assert.equal(err.isLocked, true);
+        assert.equal(err.lockedModel, "argon");
+        return true;
+      }
+    );
+  } finally {
+    delete globalThis.document;
+  }
+
+  // Promo dialog with a plan CTA that was ALREADY open before the click →
+  // marked and skipped; not a click response, so no lock even though the
+  // model did not get selected.
+  const preDialogs = [dlg([btn("Upgrade"), btn("Не сейчас")])];
+  const mockPagePre = {
+    ...mockPageUpsell,
+    $$: async () => [
+      {
+        innerText: async () => "Код и анализ\n4 Argon",
+        evaluate: async (fn) =>
+          fn({
+            querySelectorAll: () => [],
+            hasAttribute: () => false,
+            getAttribute: () => null,
+            classList: { contains: () => false },
+          }),
+        click: async () => {},
+      },
+    ],
+  };
+  globalThis.document = doc(preDialogs);
+  try {
+    await selectModelAndThinking(mockPagePre, "argon", null, true);
+  } finally {
+    delete globalThis.document;
+  }
+  assert.equal(
+    preDialogs[0].getAttribute("data-argon-pre-click"),
+    "1",
+    "Pre-existing upsell-looking dialog must be marked and ignored"
+  );
+
+  // Model actually selected — an upsell-looking popup alongside is not a
+  // lock. First picker read returns the old model (forces the click); the
+  // post-click read returns the requested one.
+  let pickerCalls = 0;
+  const mockPageSelected = {
+    ...mockPageUpsell,
+    evaluate: async (fn) => fn(),
+    waitForSelector: async () => {
+      pickerCalls += 1;
+      const label = pickerCalls === 1 ? "3.5 Flash-Lite" : "4 Argon";
+      return {
+        innerText: async () => label,
+        getAttribute: async () => label,
+        click: async () => {},
+      };
+    },
+  };
+  globalThis.document = upsellDoc;
+  try {
+    await selectModelAndThinking(mockPageSelected, "argon", null, true);
+  } finally {
+    delete globalThis.document;
+  }
+  assert.ok(pickerCalls > 1, "post-click picker re-check must have run");
+
+  // --- ops: `node acp-server.mjs unlock <id|all> [model]` clears lockedModels ---
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-unlock-")));
+  const statePath = path.join(tmpDir, "accounts-state.json");
+  const writeUnlockState = () =>
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        accounts: {
+          "ultra-1": {
+            cooldownUntilMs: 123,
+            lastUsedMs: 1,
+            lastError: null,
+            lockedModels: ["carbon"],
+            tier: "pro",
+            parkedReason: "model-unavailable",
+          },
+          "pro-1": { cooldownUntilMs: 0, lastUsedMs: 2, lastError: null, lockedModels: ["argon", "hydrogen"] },
+        },
+        leases: {},
+      }) + "\n"
+    );
+  const unlockEnv = { ...process.env, ARGON_STATE_DIR: tmpDir, ARGON_BACKENDS: "[]" };
+  const runUnlock = (args) =>
+    execSync(`node acp-server.mjs unlock ${args}`, { cwd: PLUGIN_ROOT, env: unlockEnv, stdio: "pipe" });
+  const readState = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
+
+  writeUnlockState();
+  runUnlock("pro-1 argon");
+  let st = readState();
+  assert.deepEqual(st.accounts["pro-1"].lockedModels, ["hydrogen"], "unlock <id> <model> removes only that model");
+  assert.deepEqual(st.accounts["ultra-1"].lockedModels, ["carbon"], "unlock <id> leaves other accounts untouched");
+
+  runUnlock("ultra-1");
+  st = readState();
+  assert.deepEqual(st.accounts["ultra-1"].lockedModels, [], "unlock <id> clears all lockedModels");
+  assert.equal("tier" in st.accounts["ultra-1"], false, "carbon unlock must restore the pool-configured tier");
+  assert.equal(st.accounts["ultra-1"].cooldownUntilMs, 123, "unlock must not touch cooldown");
+  assert.equal(st.accounts["ultra-1"].parkedReason, "model-unavailable", "unlock must not touch parkedReason");
+
+  runUnlock("all");
+  st = readState();
+  assert.deepEqual(st.accounts["pro-1"].lockedModels, [], "unlock all clears every account");
 });

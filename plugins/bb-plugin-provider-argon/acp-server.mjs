@@ -1647,6 +1647,28 @@ if (process.argv[2] === "unpark") {
   process.exit(0);
 }
 
+// Ops unlock subcommand: `node acp-server.mjs unlock <id|all> [model]`.
+// Clears lockedModels entries recorded by the lock detector — PLUG-282:
+// false-positive locks previously had no CLI undo, only manual state edits.
+// Removing "carbon" also drops the persisted tier downgrade so
+// getAccountTier falls back to the pool-configured tier again.
+if (process.argv[2] === "unlock") {
+  const target = process.argv[3] || "all";
+  const model = process.argv[4] ? process.argv[4].toLowerCase() : null;
+  withStateLock((state) => {
+    const ids = target === "all" ? Object.keys(state.accounts) : [target];
+    for (const id of ids) {
+      const e = accEntry(state, id);
+      if (!e || !Array.isArray(e.lockedModels) || e.lockedModels.length === 0) continue;
+      const hadCarbon = e.lockedModels.includes("carbon");
+      e.lockedModels = model ? e.lockedModels.filter((x) => x !== model) : [];
+      if (hadCarbon && !e.lockedModels.includes("carbon")) delete e.tier;
+    }
+    console.error(`unlocked: ${ids.join(", ") || "(none)"}${model ? ` model=${model}` : ""}`);
+  });
+  process.exit(0);
+}
+
 const isMain =
   process.argv[1] &&
   (process.argv[1] === fileURLToPath(import.meta.url) ||
