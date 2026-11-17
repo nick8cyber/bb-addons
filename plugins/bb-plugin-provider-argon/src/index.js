@@ -20,5 +20,12 @@ module.exports = {
   dismissOverlays: driver.dismissOverlays,
   getUploadToolsButton: driver.getUploadToolsButton,
   checkRobotVerification: driver.checkRobotVerification,
+  captureUsageLimits: driver.captureUsageLimits,
+  parseUsageLimits: driver.parseUsageLimits,
+  extractWrbFrames: driver.extractWrbFrames,
+  findMetricRecords: driver.findMetricRecords,
+  readAccountsUsage: driver.readAccountsUsage,
+  updateAccountUsage: driver.updateAccountUsage,
+  usageLimits: driver.usageLimits,
   profileManager
 };
