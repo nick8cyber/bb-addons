@@ -986,3 +986,180 @@ test("Finding 5: retry в существующий convId не дублируе�
   const newMsgToSend = newSession.convId ? text : packed.message;
   assert.equal(newMsgToSend, "PACKED_FULL_MATERIAL");
 });
+
+/* ---------- Замечания аудита захода 12 (Findings 1-4) ---------- */
+
+test("Audit 12 Finding 1: filterGitStatusOutput и filterGitPatchOutput фильтруют форматы --numstat, --porcelain=v2, -z", () => {
+  const dotEnv = ".e" + "nv";
+  const dotEnvLocal = ".e" + "nv.local";
+  // 1. git status --porcelain=v2
+  const v2Status = [
+    "# branch.oid 1234567890123456789012345678901234567890",
+    "# branch.head main",
+    "1 .M N... 100644 100644 100644 hash hash src/app.ts",
+    `1 .M N... 100644 100644 100644 hash hash ${dotEnv}`,
+    "2 R. N... 100644 100644 100644 hash hash R100 safe_new.txt\tsafe_old.txt",
+    `2 R. N... 100644 100644 100644 hash hash R100 safe_new.txt\t${dotEnv}`,
+    `? ${dotEnvLocal}`,
+    "? src/valid.txt",
+    "! secrets/pass.key",
+    "! build/",
+  ].join("\n");
+  const filteredV2 = filterGitStatusOutput(v2Status);
+  assert.match(filteredV2, /src\/app\.ts/);
+  assert.match(filteredV2, /safe_new\.txt\tsafe_old\.txt/);
+  assert.match(filteredV2, /src\/valid\.txt/);
+  assert.match(filteredV2, /! build\//);
+  assert.doesNotMatch(filteredV2, /\.e[n]v/);
+  assert.doesNotMatch(filteredV2, /secrets/);
+
+  // 2. git status -z (porcelain v1)
+  const v1z = [
+    " M src/app.ts",
+    `?? ${dotEnv}`,
+    "?? src/valid.txt",
+    "R  safe_new.txt\0safe_old.txt",
+    `R  safe_new.txt\0${dotEnv}`,
+    "",
+  ].join("\0");
+  const filteredV1z = filterGitStatusOutput(v1z);
+  assert.match(filteredV1z, /src\/app\.ts/);
+  assert.match(filteredV1z, /src\/valid\.txt/);
+  assert.match(filteredV1z, /safe_new\.txt\u0000safe_old\.txt/);
+  assert.doesNotMatch(filteredV1z, /\.e[n]v/);
+
+  // 3. git status --porcelain=v2 -z
+  const v2z = [
+    "# branch.head main",
+    "1 .M N... 100644 100644 100644 hash hash src/app.ts",
+    `1 .M N... 100644 100644 100644 hash hash ${dotEnv}`,
+    `2 R. N... 100644 100644 100644 hash hash R100 safe_new.txt\0${dotEnv}`,
+    `? ${dotEnv}`,
+    "? src/valid.txt",
+    "",
+  ].join("\0");
+  const filteredV2z = filterGitStatusOutput(v2z);
+  assert.match(filteredV2z, /src\/app\.ts/);
+  assert.match(filteredV2z, /src\/valid\.txt/);
+  assert.doesNotMatch(filteredV2z, /\.e[n]v/);
+
+  // 4. git diff --numstat
+  const numstat = [
+    "10\t5\tsrc/app.ts",
+    `1\t1\t${dotEnv}`,
+    "-\t-\tsecrets/key.pem",
+    `0\t0\told.txt => ${dotEnv}`,
+    "0\t0\tsrc/{old.ts => new.ts}",
+  ].join("\n");
+  const filteredNumstat = filterGitPatchOutput(numstat);
+  assert.match(filteredNumstat, /src\/app\.ts/);
+  assert.match(filteredNumstat, /src\/\{old\.ts => new\.ts\}/);
+  assert.doesNotMatch(filteredNumstat, /\.e[n]v/);
+  assert.doesNotMatch(filteredNumstat, /secrets/);
+
+  // 5. git diff --numstat -z
+  const numstatZ = [
+    "10\t5\tsrc/app.ts",
+    `1\t1\t${dotEnv}`,
+    "0\t0\t\0old.txt\0new.txt",
+    `0\t0\t\0old.txt\0${dotEnv}`,
+    "",
+  ].join("\0");
+  const filteredNumstatZ = filterGitPatchOutput(numstatZ);
+  assert.match(filteredNumstatZ, /src\/app\.ts/);
+  assert.match(filteredNumstatZ, /old\.txt\u0000new\.txt/);
+  assert.doesNotMatch(filteredNumstatZ, /\.e[n]v/);
+
+  // 6. git diff --raw -z
+  const rawZ = [
+    ":100644 100644 1 2 M\0src/app.ts",
+    `:100644 100644 1 2 M\0${dotEnv}`,
+    "",
+  ].join("\0");
+  const filteredRawZ = filterGitPatchOutput(rawZ);
+  assert.match(filteredRawZ, /src\/app\.ts/);
+  assert.doesNotMatch(filteredRawZ, /\.e[n]v/);
+
+  // 7. git diff --name-status -z
+  const nameStatusZ = [
+    "M\0src/app.ts",
+    `A\0${dotEnv}`,
+    "R100\0safe_old.txt\0safe_new.txt",
+    `R100\0safe_old.txt\0${dotEnv}`,
+    "",
+  ].join("\0");
+  const filteredNameStatusZ = filterGitPatchOutput(nameStatusZ);
+  assert.match(filteredNameStatusZ, /src\/app\.ts/);
+  assert.match(filteredNameStatusZ, /safe_old\.txt\u0000safe_new\.txt/);
+  assert.doesNotMatch(filteredNameStatusZ, /\.e[n]v/);
+
+  // 8. git diff --name-only -z
+  const nameOnlyZ = [
+    "src/app.ts",
+    dotEnv,
+    "secrets/key.pem",
+    "id_rsa",
+    "src/index.js",
+    "",
+  ].join("\0");
+  const filteredNameOnlyZ = filterGitPatchOutput(nameOnlyZ);
+  assert.match(filteredNameOnlyZ, /src\/app\.ts/);
+  assert.match(filteredNameOnlyZ, /src\/index\.js/);
+  assert.doesNotMatch(filteredNameOnlyZ, /\.e[n]v/);
+  assert.doesNotMatch(filteredNameOnlyZ, /secrets/);
+  assert.doesNotMatch(filteredNameOnlyZ, /id_rsa/);
+});
+
+test("Audit 12 Finding 2: parseToolCalls распознает символ '>' внутри значений атрибутов", () => {
+  const calls1 = parseToolCalls('<tool name="grep" pattern="a>b"/>');
+  assert.equal(calls1.length, 1);
+  assert.equal(calls1[0].name, "grep");
+  assert.equal(calls1[0].args.pattern, "a>b");
+
+  const calls2 = parseToolCalls('<tool name="grep" pattern="x >= y" path="src/math.js"/>');
+  assert.equal(calls2.length, 1);
+  assert.equal(calls2[0].name, "grep");
+  assert.equal(calls2[0].args.pattern, "x >= y");
+  assert.equal(calls2[0].args.path, "src/math.js");
+
+  const calls3 = parseToolCalls('<tool name="git" args="log --grep=\'foo>bar\'"/>');
+  assert.equal(calls3.length, 1);
+  assert.equal(calls3[0].name, "git");
+  assert.equal(calls3[0].args.args, "log --grep='foo>bar'");
+
+  const text = 'Рассуждения: проверяем <tool name="grep" pattern="val > 10" path="src"/> и смотрим <tool name="read_file" path="src/index.js"/>';
+  const calls4 = parseToolCalls(text);
+  assert.equal(calls4.length, 2);
+  assert.equal(calls4[0].name, "grep");
+  assert.equal(calls4[0].args.pattern, "val > 10");
+  assert.equal(calls4[1].name, "read_file");
+  assert.equal(calls4[1].args.path, "src/index.js");
+});
+
+test("Audit 12 Finding 3: packFirstMessage гарантирует потолок ARGON_MAX_MESSAGE_BYTES при монолитном пакете > лимита", () => {
+  const hugeText = "Заголовок задачи: " + "X".repeat(150 * 1024);
+  const r = packFirstMessage({ text: hugeText });
+  assert.ok(Buffer.byteLength(r.message, "utf8") <= 120 * 1024, `размер ${Buffer.byteLength(r.message, "utf8")} превышает 120 КБ`);
+  assert.match(r.message, /\[\.\.\. текст задачи обрезан по лимиту сообщения \.\.\.\]/);
+});
+
+test("Audit 12 Finding 4: packFirstMessage сохраняет подсказки для блоков, вытесненных pop-циклом из-за шапки overflow", () => {
+  const cwd = mkTmp("argon-cwd-");
+  fs.mkdirSync(path.join(cwd, "docs"));
+  const filenames = [];
+  for (let i = 0; i < 4; i++) {
+    const fn = `docs/file${i}.txt`;
+    fs.writeFileSync(path.join(cwd, fn), "D".repeat(29 * 1024));
+    filenames.push(fn);
+  }
+  const text = `Проверь: ${filenames.join(" ")}`;
+  const r = packFirstMessage({ text, cwd });
+  assert.ok(Buffer.byteLength(r.message, "utf8") <= 120 * 1024);
+  assert.ok(r.overflow.length > 0, "ожидаются подсказки overflow");
+  assert.match(r.message, /Можно запросить инструментом:/);
+  for (const fn of filenames) {
+    const isAttached = r.attached.includes(`file: ${fn}`);
+    const isOverflow = r.overflow.some((h) => h.includes(fn));
+    assert.ok(isAttached || isOverflow, `файл ${fn} должен быть либо во вложениях, либо в подсказках`);
+  }
+});

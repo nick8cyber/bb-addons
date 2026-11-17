@@ -250,7 +250,7 @@ export function resolveInCwd(cwd, rel) {
 }
 
 /* ---------- §2: строгий разбор вызовов <tool .../> ---------- */
-const TOOL_TAG_RE = /<tool\b[^>]*?\/>/g;
+const TOOL_TAG_RE = /<tool\b(?:[^>"']|"[^"]*"|'[^']*')*?\/>/g;
 const TOOL_ATTR_RE = /([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
 
 export function parseToolCalls(text) {
@@ -603,8 +603,114 @@ function extractPathFromStatLine(line) {
   return null;
 }
 
+export function filterGitPatchZOutput(stdout) {
+  const tokens = String(stdout).split("\0");
+  const result = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (i === tokens.length - 1 && token === "") break;
+    if (!token) continue;
+
+    let header = "";
+    let indicator = token;
+    const lastNl = token.lastIndexOf("\n");
+    if (lastNl !== -1 && (token.startsWith("commit ") || token.includes("\ncommit "))) {
+      header = token.slice(0, lastNl + 1);
+      indicator = token.slice(lastNl + 1);
+    }
+
+    // 1. --raw -z: starts with ":100644"
+    if (/^:[0-7]{6}\s/.test(indicator)) {
+      const isRename = /\s[RC][0-9]*$/.test(indicator);
+      const p1 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
+      if (isRename) {
+        const p2 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
+        if (isSensitivePath(p1) || isSensitivePath(p2)) {
+          if (header) result.push(header);
+          continue;
+        }
+        result.push(token, p1, p2);
+      } else {
+        if (isSensitivePath(p1)) {
+          if (header) result.push(header);
+          continue;
+        }
+        result.push(token, p1);
+      }
+      continue;
+    }
+
+    // 2. --name-status -z: status tag like "M", "A", "R100"
+    if (/^[MADRCU][0-9]*$/.test(indicator.trim())) {
+      const isRename = /^[RC][0-9]*$/.test(indicator.trim());
+      const p1 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
+      if (isRename) {
+        const p2 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
+        if (isSensitivePath(p1) || isSensitivePath(p2)) {
+          if (header) result.push(header);
+          continue;
+        }
+        result.push(token, p1, p2);
+      } else {
+        if (isSensitivePath(p1)) {
+          if (header) result.push(header);
+          continue;
+        }
+        result.push(token, p1);
+      }
+      continue;
+    }
+
+    // 3. --numstat -z: "added\tdeleted\tpath" or "added\tdeleted\t"
+    const numstatMatch = indicator.match(/^(\d+|-)\t(\d+|-)\t(.*)$/);
+    if (numstatMatch) {
+      const p = numstatMatch[3].trim().replace(/^["']|["']$/g, "");
+      if (!p) {
+        // rename format: next token is oldPath, next is newPath
+        const p1 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
+        const p2 = (tokens[++i] ?? "").trim().replace(/^["']|["']$/g, "");
+        if (isSensitivePath(p1) || isSensitivePath(p2)) {
+          if (header) result.push(header);
+          continue;
+        }
+        result.push(token, p1, p2);
+      } else {
+        if (p.includes("=>")) {
+          const parts = p.replace(/[{}]/g, "").split("=>").map((s) => s.trim());
+          if (parts.some((part) => isSensitivePath(part))) {
+            if (header) result.push(header);
+            continue;
+          }
+        } else if (isSensitivePath(p)) {
+          if (header) result.push(header);
+          continue;
+        }
+        result.push(token);
+      }
+      continue;
+    }
+
+    if (token.includes("diff --git ") || token.includes("@@")) {
+      const filtered = filterGitPatchOutput(token);
+      if (filtered) result.push(filtered);
+      continue;
+    }
+
+    const clean = indicator.trim().replace(/^["']|["']$/g, "");
+    if (clean && isSensitivePath(clean)) {
+      if (header) result.push(header);
+      continue;
+    }
+    result.push(token);
+  }
+  return result.length ? result.join("\0") + "\0" : "";
+}
+
 export function filterGitPatchOutput(stdout) {
   if (!stdout) return "";
+  if (stdout.includes("\0")) {
+    return filterGitPatchZOutput(stdout);
+  }
   const lines = String(stdout).replace(/\r\n/g, "\n").split("\n");
   const result = [];
   let currentBlock = null;
@@ -656,6 +762,19 @@ export function filterGitPatchOutput(stdout) {
       if (statPath && isSensitivePath(statPath)) {
         continue;
       }
+      // git log/show/diff --numstat: "1\t1\t.env", "0\t0\told => .env"
+      const numstatMatch = line.match(/^(\d+|-)\t(\d+|-)\t(.*)$/);
+      if (numstatMatch) {
+        let p = numstatMatch[3].trim().replace(/^["']|["']$/g, "");
+        if (p.includes("=>")) {
+          const parts = p.replace(/[{}]/g, "").split("=>").map((s) => s.trim());
+          if (parts.some((part) => isSensitivePath(part))) {
+            continue;
+          }
+        } else if (isSensitivePath(p)) {
+          continue;
+        }
+      }
       // git log/show/diff --name-status: "M\t.env", "R100\told\t.env"
       if (/^[MADRCU][0-9]*\t/.test(line)) {
         const parts = line.split("\t").slice(1).map((s) => s.trim().replace(/^["']|["']$/g, ""));
@@ -683,12 +802,108 @@ export function filterGitPatchOutput(stdout) {
   return result.join("\n");
 }
 
+export function filterGitStatusZOutput(stdout) {
+  const tokens = String(stdout).split("\0");
+  const result = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (i === tokens.length - 1 && token === "") break;
+    if (!token) continue;
+
+    if (token.startsWith("#")) {
+      result.push(token);
+      continue;
+    }
+    const v2Type2 = token.match(/^2\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.*)$/);
+    if (v2Type2) {
+      const p1 = v2Type2[1].trim().replace(/^["']|["']$/g, "");
+      const origToken = tokens[++i] ?? "";
+      const p2 = origToken.trim().replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p1) || isSensitivePath(p2)) continue;
+      result.push(token, origToken);
+      continue;
+    }
+    const v2Type1 = token.match(/^[1u]\s+(?:\S+\s+){7,9}(.*)$/);
+    if (v2Type1) {
+      const p = v2Type1[1].trim().replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p)) continue;
+      result.push(token);
+      continue;
+    }
+    const v2Untracked = token.match(/^[?!]\s+(.*)$/);
+    if (v2Untracked) {
+      const p = v2Untracked[1].trim().replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p)) continue;
+      result.push(token);
+      continue;
+    }
+
+    const v1Match = token.match(/^([ MADRCU?!]{2})\s*(.*)$/);
+    if (v1Match) {
+      const status = v1Match[1];
+      const p = v1Match[2].trim().replace(/^["']|["']$/g, "");
+      if (status.includes("R") || status.includes("C")) {
+        const origToken = tokens[++i] ?? "";
+        const p2 = origToken.trim().replace(/^["']|["']$/g, "");
+        if (isSensitivePath(p) || isSensitivePath(p2)) continue;
+        result.push(token, origToken);
+      } else {
+        if (isSensitivePath(p)) continue;
+        result.push(token);
+      }
+      continue;
+    }
+
+    const clean = token.trim().replace(/^["']|["']$/g, "");
+    if (isSensitivePath(clean)) continue;
+    result.push(token);
+  }
+  return result.length ? result.join("\0") + "\0" : "";
+}
+
 export function filterGitStatusOutput(stdout) {
   if (!stdout) return "";
+  if (stdout.includes("\0")) {
+    return filterGitStatusZOutput(stdout);
+  }
   const lines = String(stdout).replace(/\r\n/g, "\n").split("\n");
   const filtered = [];
   for (const line of lines) {
     if (!line) {
+      filtered.push(line);
+      continue;
+    }
+
+    // 0. Porcelain v2
+    if (line.startsWith("#")) {
+      filtered.push(line);
+      continue;
+    }
+    const v2Type1 = line.match(/^1\s+(?:\S+\s+){7}(.*)$/);
+    if (v2Type1) {
+      const p = v2Type1[1].trim().replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p)) continue;
+      filtered.push(line);
+      continue;
+    }
+    const v2Type2 = line.match(/^2\s+(?:\S+\s+){8}(.*)$/);
+    if (v2Type2) {
+      const parts = v2Type2[1].split("\t").map((s) => s.trim().replace(/^["']|["']$/g, ""));
+      if (parts.some((p) => isSensitivePath(p))) continue;
+      filtered.push(line);
+      continue;
+    }
+    const v2TypeU = line.match(/^u\s+(?:\S+\s+){9}(.*)$/);
+    if (v2TypeU) {
+      const p = v2TypeU[1].trim().replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p)) continue;
+      filtered.push(line);
+      continue;
+    }
+    const v2Untracked = line.match(/^[?!]\s+(.*)$/);
+    if (v2Untracked) {
+      const p = v2Untracked[1].trim().replace(/^["']|["']$/g, "");
+      if (isSensitivePath(p)) continue;
       filtered.push(line);
       continue;
     }
@@ -804,8 +1019,9 @@ function toolGit(args, ctx) {
   }
   let out = res.stdout;
   if (sub === "ls-files") {
-    const lines = out.split("\n").filter((l) => !isSensitivePath(l.trim()));
-    out = lines.join("\n");
+    const sep = out.includes("\0") ? "\0" : "\n";
+    const files = out.split(sep).filter((l) => l.length > 0 && !isSensitivePath(l.trim()));
+    out = files.join(sep) + (out.endsWith(sep) && files.length ? sep : "");
   } else if (sub === "status") {
     out = filterGitStatusOutput(out);
   } else if (sub === "diff" || sub === "show" || sub === "log") {
@@ -869,6 +1085,17 @@ export function truncResult(text) {
     Buffer.from(s, "utf8").subarray(0, MAX_TOOL_RESULT_BYTES).toString("utf8") +
     TRUNC_SUFFIX
   );
+}
+
+/** Обрезка UTF-8 строки по байтовому лимиту с сохранением валидности символов. */
+export function truncateUtf8(str, maxBytes) {
+  const buf = Buffer.from(String(str ?? ""), "utf8");
+  if (buf.length <= maxBytes) return String(str ?? "");
+  let s = buf.subarray(0, maxBytes).toString("utf8");
+  while (Buffer.byteLength(s, "utf8") > maxBytes) {
+    s = s.slice(0, -1);
+  }
+  return s;
 }
 
 /**
@@ -1170,7 +1397,7 @@ export function packFirstMessage({
   }
 
   const header = toolSystemHeader(maxRounds);
-  const body = String(text ?? "");
+  let body = String(text ?? "");
   const len = (s) => Buffer.byteLength(s, "utf8");
   // Резерв на строку «Можно запросить инструментом:».
   let used = len(header) + len(body) + 300;
@@ -1185,7 +1412,7 @@ export function packFirstMessage({
     const block = `=== ${c.block} ===\n${output}`;
     const size = len(block) + 2;
     if (used + size <= maxBytes) {
-      blocks.push(block);
+      blocks.push({ text: block, blockName: c.block, hint: c.hint });
       used += size;
       attached.push(c.block);
     } else {
@@ -1199,18 +1426,26 @@ export function packFirstMessage({
     head = `${header}${prefix}${overflow.join(", ")}`;
   }
 
-  // Если общее сообщение превышает maxBytes, ужимаем:
-  // 1) сначала удаляем блоки из конца, освобождая место под подсказки и лимит;
-  // 2) если блоков больше нет, но подсказок слишком много (>120 КБ), обрезаем список подсказок.
-  let fullText = head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : "");
+  const buildFull = () =>
+    head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.map((b) => b.text).join("\n\n") : "");
+
+  let fullText = buildFull();
+
+  // 1) Если общее сообщение превышает maxBytes, вытесняем блоки с конца.
+  // Вытесненные блоки обязаны попадать в overflow-подсказки (§5.5).
   while (blocks.length > 0 && len(fullText) > maxBytes) {
-    blocks.pop();
+    const popped = blocks.pop();
     attached.pop();
-    fullText = head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : "");
+    if (!overflow.includes(popped.hint)) {
+      overflow.unshift(popped.hint);
+    }
+    head = `${header}${prefix}${overflow.join(", ")}`;
+    fullText = buildFull();
   }
 
+  // 2) Если блоков не осталось, а подсказок слишком много (>maxBytes), ужимаем список подсказок.
   if (overflow.length > 0 && maxBytes >= 10000 && len(fullText) > maxBytes) {
-    const baseLen = len(header + prefix + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : ""));
+    const baseLen = len(header + prefix + "\n\n" + body + (blocks.length ? "\n\n" + blocks.map((b) => b.text).join("\n\n") : ""));
     const available = maxBytes - baseLen;
     const included = [];
     let cur = 0;
@@ -1224,9 +1459,30 @@ export function packFirstMessage({
       }
     }
     head = included.length ? `${header}${prefix}${included.join(", ")}` : header;
-    fullText = head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.join("\n\n") : "");
+    fullText = buildFull();
   }
 
-  const message = maskForWeb(fullText);
+  // 3) Если даже без блоков и подсказок текст задачи (body) превышает maxBytes,
+  // ужимаем body (§5.4/§7.1: потолок ARGON_MAX_MESSAGE_BYTES обязателен).
+  if (maxBytes >= 10000 && len(fullText) > maxBytes) {
+    head = header;
+    const headerWithSepLen = len(head + "\n\n");
+    const availableForBody = maxBytes - headerWithSepLen;
+    const truncBodySuffix = "\n[... текст задачи обрезан по лимиту сообщения ...]";
+    const suffixLen = len(truncBodySuffix);
+    if (availableForBody > suffixLen) {
+      body = truncateUtf8(body, availableForBody - suffixLen) + truncBodySuffix;
+    } else if (availableForBody > 0) {
+      body = truncateUtf8(body, availableForBody);
+    } else {
+      body = "";
+    }
+    fullText = head + (body ? "\n\n" + body : "");
+  }
+
+  let message = maskForWeb(fullText);
+  if (maxBytes >= 10000 && len(message) > maxBytes) {
+    message = truncateUtf8(message, maxBytes);
+  }
   return { message, attached, overflow };
 }
