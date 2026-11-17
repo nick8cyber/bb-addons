@@ -758,15 +758,58 @@ export function resolveModelId(val) {
   return null;
 }
 
-function configOptionsFor(s, backends = BACKENDS) {
+// PLUG-280 §2.1: model↔account compatibility predicate — mirrors the
+// runtime checks in pickBackendFromState and bindBackend (lockedModels in
+// accounts-state.json + carbon requires the ultra tier).
+export function modelSupportedOnAccount(model, b, state) {
+  const req = model ? String(model).toLowerCase() : null;
+  if (!req || !b) return true;
+  const st = state || { accounts: Object.create(null) };
+  const e = accEntry(st, b.id);
+  if (e?.lockedModels && e.lockedModels.includes(req)) return false;
+  if (req === "carbon" && getAccountTier(b, st) !== "ultra") return false;
+  return true;
+}
+
+// The user's intent is the value just picked; the other axis falls back to
+// its default when the combination became incompatible.
+function resetAccountForModel(s, backends = BACKENDS) {
+  if (!s.account || s.account === "auto") return;
+  const b = backends.find((x) => x.id === s.account);
+  if (b && !modelSupportedOnAccount(s.model, b, loadState())) {
+    s.account = "auto";
+    s.backend = null;
+    s.convId = null;
+  }
+}
+
+function resetModelForAccount(s, backends = BACKENDS) {
+  if (!s.account || s.account === "auto") return;
+  const b = backends.find((x) => x.id === s.account);
+  if (b && !modelSupportedOnAccount(s.model, b, loadState())) {
+    s.model = "argon";
+  }
+}
+
+export function configOptionsFor(s, backends = BACKENDS, state = null) {
   const normalizedLevel = normalizeThinking(s.thinking);
+  const st = state || { accounts: Object.create(null) };
+  const explicit =
+    s.account && s.account !== "auto"
+      ? backends.find((b) => b.id === s.account) || null
+      : null;
   const opts = [
     {
       id: "model",
       category: "model",
       type: "select",
       currentValue: s.model,
-      options: MODELS.map((m) => ({ value: m.value, name: m.name })),
+      options: MODELS.filter((m) =>
+        explicit
+          ? modelSupportedOnAccount(m.value, explicit, st)
+          : backends.length === 0 ||
+            backends.some((b) => modelSupportedOnAccount(m.value, b, st))
+      ).map((m) => ({ value: m.value, name: m.name })),
     },
     {
       id: "thought_level",
@@ -781,12 +824,22 @@ function configOptionsFor(s, backends = BACKENDS) {
     },
   ];
   if (backends.length > 1) {
+    const capable = backends.filter((b) => modelSupportedOnAccount(s.model, b, st));
+    let currentAccount = "auto";
+    if (explicit && modelSupportedOnAccount(s.model, explicit, st)) {
+      currentAccount = explicit.id;
+    } else if (capable.length === 1) {
+      currentAccount = capable[0].id;
+    }
     opts.push({
       id: "account",
       category: "account",
       type: "select",
-      currentValue: s.account || "auto",
-      options: [{ value: "auto", name: "auto" }, ...backends.map((b) => ({ value: b.id, name: b.id }))],
+      currentValue: currentAccount,
+      options: [
+        { value: "auto", name: "auto" },
+        ...capable.map((b) => ({ value: b.id, name: b.id })),
+      ],
     });
   }
   return opts;
@@ -1368,7 +1421,7 @@ export function dispatch(msg) {
             availableModels: MODELS.map((m) => ({ modelId: m.value, name: m.name })),
             currentModelId: s.model,
           },
-          configOptions: configOptionsFor(s, BACKENDS),
+          configOptions: configOptionsFor(s, BACKENDS, loadState()),
           modes,
         },
       });
@@ -1399,7 +1452,7 @@ export function dispatch(msg) {
             availableModels: MODELS.map((m) => ({ modelId: m.value, name: m.name })),
             currentModelId: s.model,
           },
-          configOptions: configOptionsFor(s, BACKENDS),
+          configOptions: configOptionsFor(s, BACKENDS, loadState()),
           modes,
         },
       });
@@ -1437,6 +1490,7 @@ export function dispatch(msg) {
         }
         s.model = targetModel;
         if (!s.thinking) s.thinking = "medium";
+        resetAccountForModel(s);
       } else if (cid === "account") {
         if (val !== "auto" && !BACKENDS.some((b) => b.id === val)) {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown account "${val}"` } });
@@ -1446,12 +1500,13 @@ export function dispatch(msg) {
           s.account = val;
           s.backend = null;
           s.convId = null;
+          resetModelForAccount(s);
         }
       } else {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown config option "${cid}"` } });
         return;
       }
-      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS) } });
+      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS, loadState()) } });
       return;
     }
 
@@ -1473,7 +1528,8 @@ export function dispatch(msg) {
       }
       s.model = val;
       if (!s.thinking) s.thinking = "medium";
-      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS) } });
+      resetAccountForModel(s);
+      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS, loadState()) } });
       return;
     }
 
