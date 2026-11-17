@@ -1,6 +1,7 @@
 // Add an account to the argon rotation pool (agy-parity: pool = dir of accounts).
-// usage: node scripts/pool-add.mjs <label> <cdp-port> [priority] [email]
+// usage: node scripts/pool-add.mjs <label> <cdp-port> [priority] [email] [tier]
 //   <label>   = pool id AND chrome profile id (~/.config/google-chrome-<label>)
+//   <tier>    = "pro" (default) or "ultra"
 // Steps it does: write $ARGON_STATE_DIR/accounts/<label>/backend.json and pool.json,
 // spawn the account's chrome under xvfb on <cdp-port>. Then run scripts/glogin.mjs
 // <email> <secrets.env> with GEMINI_CDP_PORT=<port> to sign in.
@@ -12,9 +13,9 @@ import { createRequire } from "node:module";
 const require = createRequire(new URL("../package.json", import.meta.url));
 const driver = require(new URL("../src/gemini-driver.js", import.meta.url).pathname);
 
-const [label, port, prio, email] = process.argv.slice(2);
+const [label, port, prio, email, tier] = process.argv.slice(2);
 if (!label || !port) {
-  console.error("usage: node scripts/pool-add.mjs <label> <cdp-port> [priority] [email]");
+  console.error("usage: node scripts/pool-add.mjs <label> <cdp-port> [priority] [email] [tier]");
   process.exit(2);
 }
 const STATE_DIR = process.env.ARGON_STATE_DIR || join(homedir(), ".bb", "plugins", "provider-argon");
@@ -23,6 +24,7 @@ fs.mkdirSync(dir, { recursive: true });
 const backend = { profile: label, cdp: String(port) };
 if (prio !== undefined) backend.priority = parseInt(prio, 10);
 if (email) backend.email = email;
+if (tier) backend.tier = tier.toLowerCase() === "ultra" ? "ultra" : "pro";
 fs.writeFileSync(join(dir, "backend.json"), JSON.stringify(backend, null, 2) + "\n");
 console.log(`pool entry: ${dir}/backend.json ->`, JSON.stringify(backend));
 
@@ -37,12 +39,14 @@ try {
     } catch {}
   }
   const idx = pool.accounts.findIndex((a) => a.id === label);
+  const isUltra = tier && tier.toLowerCase() === "ultra";
   const accountEntry = {
     id: label,
     email: email || `${label}@example.com`,
     profileDir: join(homedir(), ".config", `google-chrome-${label}`),
     cdpPort: Number(port),
-    priority: backend.priority ?? 10,
+    priority: backend.priority ?? (isUltra ? 1 : 10),
+    tier: isUltra ? "ultra" : "pro",
   };
   if (idx >= 0) {
     pool.accounts[idx] = accountEntry;
