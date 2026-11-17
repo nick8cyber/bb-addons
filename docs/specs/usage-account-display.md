@@ -2,7 +2,7 @@
 title: Usage Pro — идентичность аккаунтов и локальные ошибки квот
 status: approved
 owner: coordinator
-date: 2026-11-16
+date: 2026-11-17
 revision: 2.3 (§7 — карточки acp-argon по accounts-usage.json от provider-argon; 2.2 — §6.2 — дедуп модельных окон по мгновению сброса; §6.5 — порядок окон блоками семейств; 2.1 — §6.3 — отключённые бакеты как у пула; 2 — §6 — карточка acp-antigravity, исключение из запрета фильтра по email)
 tags: [usage-pro, codex, accounts]
 ---
