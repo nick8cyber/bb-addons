@@ -1405,7 +1405,7 @@ export function dispatch(msg) {
       return;
 
     case "session/new": {
-      const sessionId = `argon-${++sessionCounter}`;
+      const sessionId = `argon-${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
       const s = {
         id: sessionId,
         cwd: p.cwd || null,
@@ -1433,7 +1433,7 @@ export function dispatch(msg) {
     }
 
     case "session/load": {
-      const sessionId = p.sessionId || `argon-${++sessionCounter}`;
+      const sessionId = p.sessionId || `argon-${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
       let s = sessions.get(sessionId);
       if (!s) {
         s = {

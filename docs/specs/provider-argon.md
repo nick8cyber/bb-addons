@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-17
-revision: 15
+revision: 16
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -41,6 +41,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 - **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "argon-gemini", version: "0.2.0" }, agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }`.
 - **`session/new` и `session/load`**:
   - `session/new` создаёт новую запись сессии `{ id, cwd, model, thinking, convId, account, backend }`.
+  - `sessionId` генерируется глобально уникальным в формате `argon-<pid>-<base36-метка-времени>-<счётчик>` (PLUG-284): счётчик только в памяти процесса давал коллизии `argon-N` между параллельными процессами провайдера и после рестартов — bb отказывал в resume с HTTP 409. Формат строки свободный, внешние потребители его не парсят.
   - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
   - Возвращают список моделей `models.availableModels` в виде объектов `{ modelId, name }` по схеме ACP:
     - `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию)

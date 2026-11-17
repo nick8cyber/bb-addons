@@ -695,7 +695,11 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });
   const r2 = await waitForResponse(2);
   const sessionId = r2.result.sessionId;
-  assert.ok(sessionId.startsWith("argon-"));
+  assert.ok(sessionId.startsWith(`argon-${serverProc.pid}-`));
+  sendReq({ jsonrpc: "2.0", id: 22, method: "session/new", params: { cwd: "/tmp" } });
+  const r22 = await waitForResponse(22);
+  assert.ok(r22.result.sessionId.startsWith(`argon-${serverProc.pid}-`));
+  assert.notEqual(r22.result.sessionId, sessionId);
   assert.ok(Array.isArray(r2.result.models.availableModels));
   assert.ok(r2.result.models.availableModels.length > 0);
   for (const m of r2.result.models.availableModels) {
@@ -964,6 +968,18 @@ test("6. Automatic lease release upon SIGTERM during prompt execution", async ()
     serverProc.stdin.write(JSON.stringify(req) + "\n");
   }
 
+  async function waitForResponse(id, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.id === id);
+      if (idx >= 0) {
+        return lines.splice(idx, 1)[0];
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`Timeout waiting for response id=${id}`);
+  }
+
   async function waitForNotification(method, timeoutMs = 5000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -988,12 +1004,14 @@ test("6. Automatic lease release upon SIGTERM during prompt execution", async ()
     method: "session/new",
     params: { cwd: "/tmp" },
   });
+  const r2 = await waitForResponse(2);
+  const sessionId = r2.result.sessionId;
   sendReq({
     jsonrpc: "2.0",
     id: 3,
     method: "session/prompt",
     params: {
-      sessionId: "argon-1",
+      sessionId,
       prompt: [{ type: "text", text: "Long turn before term" }],
     },
   });
