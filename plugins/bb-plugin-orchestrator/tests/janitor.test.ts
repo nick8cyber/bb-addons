@@ -6226,6 +6226,51 @@ test("§15 r33.7: task-merged не спасает копию с сиротой r
   );
 });
 
+test("§15 r33.7: squash-merged PR — task-merged через pr_merge_sha", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: intermediate attempt");
+  const envTip = git(env.path, ["rev-parse", "HEAD"]);
+  // Squash-merge: голова PR-ветки (published_sha) предком origin/main
+  // не является — влитие пришло отдельным коммитом (pr_merge_sha).
+  const prHead = envTip;
+  commitIn(repo, "final.txt", "feat: final version (squashed)");
+  git(repo, ["push", "origin", "main"]);
+  const mergeSha = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  bindDelegation(w, "PLUG-292", env, envTip);
+  const rel = w.store.insertRelease({
+    taskKey: "PLUG-292",
+    projectId: "p",
+    coordinatorThreadId: "thr_coord",
+    repoPath: repo,
+    branch: "main",
+    targetAction: "pr",
+    targetBranch: "main",
+    repoRoot: repo,
+  });
+  w.store.updateRelease(rel.id, {
+    status: "published",
+    publishedSha: prHead,
+  });
+  w.store.setPrMergeSha(rel.id, mergeSha);
+  // publishedReleases отдаёт коммит влития, а не голову PR-ветки
+  const pub = w.store
+    .publishedReleases()
+    .find((r) => r.taskKey === "PLUG-292");
+  assert.equal(pub!.publishedSha, mergeSha);
+  let res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "merged-wait");
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(res.archivedThreads, 1);
+});
+
 test("release §2 п.2: taskCleanup убирает копии задачи, грязную — через rescue, tip_sha в базе", async () => {
   const { repo, base } = makeRepo();
   const clean = addEnv(repo, base, "clean");

@@ -2539,7 +2539,10 @@ export class DelegationStore {
   /**
    * §15 (r33.7): последний подтверждённый релиз каждой задачи — ключ к
    * признанию копии «влитой по задаче» (`task-merged`) и к автоочистке
-   * после выкладки. Только `published` с зафиксированным sha.
+   * после выкладки. Только `published` с подтверждённым коммитом на
+   * origin/<цель>: `published_sha` для push, `pr_merge_sha` для PR
+   * (после squash-merge вершина ветки PR не предок целевой — берётся
+   * коммит влития).
    */
   publishedReleases(): {
     taskKey: string;
@@ -2549,9 +2552,11 @@ export class DelegationStore {
   }[] {
     const rows = this.db
       .prepare(
-        `SELECT task_key, published_sha, target_branch, repo_path
+        `SELECT task_key, COALESCE(pr_merge_sha, published_sha) AS published_sha,
+                target_branch, repo_path
          FROM releases
-         WHERE status = 'published' AND published_sha IS NOT NULL
+         WHERE status = 'published'
+           AND COALESCE(pr_merge_sha, published_sha) IS NOT NULL
          ORDER BY id`,
       )
       .all() as {
