@@ -4,6 +4,11 @@ const os = require('os');
 const profileManager = require('./profile-manager');
 const usageLimits = require('./usage-limits');
 
+let driverHooks = null;
+function _setDriverHooks(hooks) {
+  driverHooks = hooks;
+}
+
 let CDP_PORT = process.env.GEMINI_CDP_PORT || '9222';
 const cdpUrl = (port) => `http://localhost:${port ?? CDP_PORT}`;
 function setCdpPort(port) { CDP_PORT = String(port); }
@@ -686,7 +691,11 @@ async function sendPrompt({
   cdpPort = null,
   strictModel = false,
   strict = false,
-  shouldCancel = null
+  shouldCancel = null,
+  backend = null,
+  accountId = null,
+  tier = null,
+  stateDir = null
 }) {
   const isStrict = Boolean(strict || strictModel);
   throwIfPromptTooLarge(prompt);
@@ -704,16 +713,34 @@ async function sendPrompt({
     }
   };
   await throwIfCancelled();
-  await ensureChrome({ headless, profile, restart, port });
+  if (driverHooks?.ensureChrome) {
+    await driverHooks.ensureChrome({ headless, profile, restart, port });
+  } else {
+    await ensureChrome({ headless, profile, restart, port });
+  }
   await throwIfCancelled();
 
-  const playwright = getPlaywright();
-  const browser = await playwright.chromium.connectOverCDP(cdpUrl(port));
+  const playwright = driverHooks?.getPlaywright ? driverHooks.getPlaywright() : getPlaywright();
+  const browser = driverHooks?.connectOverCDP
+    ? await driverHooks.connectOverCDP(cdpUrl(port))
+    : await playwright.chromium.connectOverCDP(cdpUrl(port));
 
   try {
-    page = await getGeminiPage(browser, { waitForVerification, port });
+    page = driverHooks?.getGeminiPage
+      ? await driverHooks.getGeminiPage(browser, { waitForVerification, port })
+      : await getGeminiPage(browser, { waitForVerification, port });
     await throwIfCancelled();
 
+    let lastText = '';
+    let returnedConvId = convId;
+    let downloadedPath = null;
+
+    if (driverHooks?.runTurn) {
+      const turnRes = await driverHooks.runTurn(page);
+      lastText = turnRes.text || '';
+      returnedConvId = turnRes.convId || convId;
+      downloadedPath = turnRes.downloaded || null;
+    } else {
     if (page.url() === 'about:blank' || (convId && !page.url().includes(convId))) {
       const targetUrl = convId ? `https://gemini.google.com/app/${convId}` : GEMINI_APP_URL;
       await page.goto(targetUrl, { timeout: 15000, waitUntil: 'domcontentloaded' });
@@ -848,7 +875,7 @@ async function sendPrompt({
       await page.waitForTimeout(1000);
     }
 
-    let lastText = '';
+    lastText = '';
     let lastSrc = null;
     let stableStartTime = null;
     const STABLE_DURATION_MS = 500;
@@ -938,7 +965,7 @@ async function sendPrompt({
       throw e;
     }
 
-    let returnedConvId = convId;
+    returnedConvId = convId;
     if (isNewChat) {
       const deadline = Date.now() + 3000;
       while (Date.now() < deadline) {
@@ -962,12 +989,12 @@ async function sendPrompt({
       } catch {}
     }
 
-    let downloadedPath = null;
     if (download) {
       downloadedPath = await downloadGeneratedMedia(page, download).catch((err) => {
         console.warn('[gemini] Download error:', err.message);
         return null;
       });
+    }
     }
 
     const resObj = new String(lastText);
@@ -981,10 +1008,10 @@ async function sendPrompt({
     try {
       if (page && page.url && page.url().includes('gemini.google.com')) {
         await usageLimits.captureUsageLimits(page, {
-          accountId: opts.accountId || opts.account || opts.profile,
-          backend: opts.backend,
-          stateDir: opts.stateDir,
-          tier: opts.tier || (opts.backend && opts.backend.tier),
+          accountId: accountId || (backend && backend.id) || profile,
+          backend,
+          stateDir,
+          tier: tier || (backend && backend.tier),
         });
       }
     } catch (err) {
@@ -1554,5 +1581,6 @@ module.exports = {
   readAccountsUsage: usageLimits.readAccountsUsage,
   updateAccountUsage: usageLimits.updateAccountUsage,
   usageLimits,
-  profileManager
+  profileManager,
+  _setDriverHooks
 };

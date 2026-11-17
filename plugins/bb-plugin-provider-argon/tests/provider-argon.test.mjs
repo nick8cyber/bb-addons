@@ -29,6 +29,8 @@ const {
   updateAccountUsage,
   readAccountsUsage,
   captureUsageLimits,
+  sendPrompt,
+  _setDriverHooks,
 } = driver;
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1031,7 +1033,7 @@ test("9. accounts-usage.json multi-process merge logic and atomic file updates",
     tier: "pro",
   };
   const r1 = { rpcid: "jSf9Qc", args: "[]" };
-  const d1 = updateAccountUsage(tmpDir, "acc1", u1, r1);
+  const d1 = await updateAccountUsage(tmpDir, "acc1", u1, r1);
 
   assert.ok(d1.accounts.acc1);
   assert.deepEqual(d1.accounts.acc1.daily, u1.daily);
@@ -1046,7 +1048,7 @@ test("9. accounts-usage.json multi-process merge logic and atomic file updates",
     weekly: { percent: 80, resetEpochSec: 1763960000 },
     tier: "ultra",
   };
-  const d2 = updateAccountUsage(tmpDir, "acc2", u2, r1);
+  const d2 = await updateAccountUsage(tmpDir, "acc2", u2, r1);
 
   assert.ok(d2.accounts.acc1, "acc1 must be preserved when acc2 is updated");
   assert.ok(d2.accounts.acc2, "acc2 must be present");
@@ -1060,7 +1062,7 @@ test("9. accounts-usage.json multi-process merge logic and atomic file updates",
 
   // Update recipe self-healing: rpcid changes to kAb7Z
   const r2 = { rpcid: "kAb7Z", args: "[]" };
-  const d3 = updateAccountUsage(tmpDir, "acc1", { ...u1, daily: { percent: 20, resetEpochSec: 1763351000 } }, r2);
+  const d3 = await updateAccountUsage(tmpDir, "acc1", { ...u1, daily: { percent: 20, resetEpochSec: 1763351000 } }, r2);
   assert.equal(d3.recipe.rpcid, "kAb7Z");
   assert.equal(d3.accounts.acc1.daily.percent, 20);
   assert.equal(d3.accounts.acc2.daily.percent, 50);
@@ -1068,16 +1070,13 @@ test("9. accounts-usage.json multi-process merge logic and atomic file updates",
   // Concurrency test: simulate 10 parallel updates across different accounts
   const promises = [];
   for (let i = 0; i < 10; i++) {
+    const accId = `worker-${i}`;
     promises.push(
-      new Promise((resolve) => {
-        const accId = `worker-${i}`;
-        const res = updateAccountUsage(tmpDir, accId, {
-          daily: { percent: i * 10, resetEpochSec: 1763350000 + i },
-          weekly: { percent: i * 10, resetEpochSec: 1763950000 + i },
-          tier: i % 2 === 0 ? "ultra" : "pro",
-        }, r2);
-        resolve(res);
-      })
+      updateAccountUsage(tmpDir, accId, {
+        daily: { percent: i * 10, resetEpochSec: 1763350000 + i },
+        weekly: { percent: i * 10, resetEpochSec: 1763950000 + i },
+        tier: i % 2 === 0 ? "ultra" : "pro",
+      }, r2)
     );
   }
   await Promise.all(promises);
@@ -1147,4 +1146,97 @@ test("10. captureUsageLimits domain gating, evaluate execution, and throttling",
   });
   assert.ok(forcedRes !== null, "force: true must bypass throttle");
   assert.equal(evalCalled, true);
+});
+
+test("11. sendPrompt signature, opts hygiene, mock integration with captureUsageLimits, and backend.tier propagation", async () => {
+  const driverSrc = fs.readFileSync(path.join(PLUGIN_ROOT, "src/gemini-driver.js"), "utf8");
+
+  // 1. Smoke checks: sendPrompt signature and opts.* hygiene
+  assert.ok(driverSrc.includes("backend = null"), "sendPrompt must accept backend parameter");
+  assert.ok(driverSrc.includes("accountId = null"), "sendPrompt must accept accountId parameter");
+  assert.ok(driverSrc.includes("tier = null"), "sendPrompt must accept tier parameter");
+  assert.ok(driverSrc.includes("stateDir = null"), "sendPrompt must accept stateDir parameter");
+
+  const sendPromptMatch = driverSrc.match(/async function sendPrompt\(\{[\s\S]*?\}\) \{([\s\S]*?)\nasync function dismissOverlays/);
+  assert.ok(sendPromptMatch, "sendPrompt function body must be found");
+  const sendPromptBody = sendPromptMatch[1];
+  assert.equal(sendPromptBody.includes("opts."), false, "sendPrompt body must not contain opts.* references");
+
+  // 2. Integration test: sendPrompt with mock dependencies reaches captureUsageLimits
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "sendprompt-usage-test-")));
+  let closedBrowser = false;
+  let parkedBlank = false;
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({
+      close: async () => { closedBrowser = true; },
+    }),
+    getGeminiPage: async () => ({
+      url: () => "https://gemini.google.com/app",
+      goto: async (url) => { if (url === "about:blank") parkedBlank = true; },
+      evaluate: async () => ({
+        text: `)]}'\n[["wrb.fr","jSf9Qc","[null,[[1,0.35,1,[[1763350000,0]]],[2,0.75,2,[[1763950000,0]]]]]",null,null,null,"generic"]]`,
+        domTier: "ultra",
+      }),
+    }),
+    runTurn: async () => ({
+      text: "Integration test reply text",
+      convId: "conv-int-test-1",
+    }),
+  });
+
+  try {
+    const res = await sendPrompt({
+      prompt: "hello test",
+      backend: { id: "test-pool-acc", tier: "ultra" },
+      accountId: "test-pool-acc",
+      tier: "ultra",
+      stateDir: tmpDir,
+    });
+
+    assert.equal(String(res), "Integration test reply text");
+    assert.equal(res.convId, "conv-int-test-1");
+    assert.equal(closedBrowser, true, "Browser must be closed in finally");
+    assert.equal(parkedBlank, true, "Tab must be parked on about:blank in finally");
+
+    const usageData = readAccountsUsage(tmpDir);
+    assert.ok(usageData.accounts["test-pool-acc"], "accounts-usage.json must record test-pool-acc");
+    assert.equal(usageData.accounts["test-pool-acc"].daily.percent, 35);
+    assert.equal(usageData.accounts["test-pool-acc"].weekly.percent, 75);
+    assert.equal(usageData.accounts["test-pool-acc"].tier, "ultra");
+  } finally {
+    _setDriverHooks(null);
+  }
+
+  // 3. Tier propagation in loadBackends from pool.json and fallbacks
+  const poolTmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "backends-tier-test-")));
+  const poolFile = path.join(poolTmpDir, "pool.json");
+  fs.writeFileSync(
+    poolFile,
+    JSON.stringify({
+      accounts: [
+        { id: "acc-ultra", cdpPort: 9223, tier: "ultra" },
+        { id: "acc-pro", cdpPort: 9224, tier: "pro" },
+        { id: "acc-notier", cdpPort: 9225 },
+      ],
+    })
+  );
+
+  const backends = loadBackends(poolTmpDir, poolFile);
+  const byId = new Map(backends.map((b) => [b.id, b]));
+  assert.equal(byId.get("acc-ultra")?.tier, "ultra");
+  assert.equal(byId.get("acc-pro")?.tier, "pro");
+  assert.equal(byId.get("acc-notier")?.tier, null);
+
+  // Fallback compatibility accounts/<label>/backend.json
+  const fallbackAccountsDir = path.join(poolTmpDir, "accounts", "acc-compat");
+  fs.mkdirSync(fallbackAccountsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(fallbackAccountsDir, "backend.json"),
+    JSON.stringify({ cdp: 9226, tier: "ultra" })
+  );
+  const fallbackBackends = loadBackends(poolTmpDir, path.join(poolTmpDir, "no-pool.json"));
+  const fallbackById = new Map(fallbackBackends.map((b) => [b.id, b]));
+  assert.equal(fallbackById.get("acc-compat")?.tier, "ultra");
 });

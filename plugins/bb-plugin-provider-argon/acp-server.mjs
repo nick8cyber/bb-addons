@@ -66,6 +66,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profileDir,
             profile: acc.profile || acc.id,
             cdp,
+            tier: acc.tier || null,
             priority: Number.isInteger(acc.priority) ? acc.priority : 10,
           });
         }
@@ -96,6 +97,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profileDir,
             profile: b.profile || ent.name,
             cdp,
+            tier: b.tier || null,
             priority: Number.isInteger(b.priority) ? b.priority : 10,
           });
         } catch {}
@@ -129,6 +131,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
               profileDir,
               profile: b.profile || ent.name,
               cdp,
+              tier: b.tier || null,
               priority: Number.isInteger(b.priority) ? b.priority : 10,
             });
           } catch {}
@@ -152,6 +155,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
             profileDir: b.profileDir || "",
             profile: b.profile || null,
             cdp,
+            tier: b.tier || null,
             priority: Number.isInteger(b.priority) ? b.priority : 10,
           });
         }
@@ -170,6 +174,7 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
       profileDir: envProfile,
       profile: "default",
       cdp: /^\d{2,5}$/.test(envCdp) ? envCdp : "9222",
+      tier: process.env.GEMINI_TIER || null,
       priority: 10,
     });
   }

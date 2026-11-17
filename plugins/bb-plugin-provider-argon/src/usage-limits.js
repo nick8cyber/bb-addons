@@ -10,14 +10,14 @@ const DEFAULT_RECIPE = {
 
 const lastCaptureMap = new Map();
 
-function withUsageLock(lockFile, fn) {
+async function withUsageLock(lockFile, fn) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
       const fd = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR);
       fs.closeSync(fd);
       try {
-        return fn();
+        return await fn();
       } finally {
         try { fs.unlinkSync(lockFile); } catch {}
       }
@@ -30,8 +30,7 @@ function withUsageLock(lockFile, fn) {
           continue;
         }
       } catch {}
-      const start = Date.now();
-      while (Date.now() - start < 30) {}
+      await new Promise((resolve) => setTimeout(resolve, 30));
     }
   }
   throw new Error(`usage lock held for over 10s: ${lockFile}`);
@@ -46,7 +45,7 @@ function extractWrbFrames(rawText) {
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    if (trimmed.startsWith('[[') || trimmed.startsWith('[')) {
+    if (trimmed.startsWith('[')) {
       try {
         const parsed = JSON.parse(trimmed);
         if (Array.isArray(parsed)) {
@@ -182,12 +181,12 @@ function readAccountsUsage(stateDir) {
   return { accounts: {}, recipe: { ...DEFAULT_RECIPE } };
 }
 
-function updateAccountUsage(stateDir, accountId, usage, recipe) {
+async function updateAccountUsage(stateDir, accountId, usage, recipe) {
   fs.mkdirSync(stateDir, { recursive: true });
   const file = path.join(stateDir, 'accounts-usage.json');
   const lock = path.join(stateDir, 'accounts-usage.json.lock');
 
-  return withUsageLock(lock, () => {
+  return await withUsageLock(lock, () => {
     let data = { accounts: {}, recipe: { ...DEFAULT_RECIPE } };
     try {
       if (fs.existsSync(file)) {
@@ -338,7 +337,7 @@ async function captureUsageLimits(page, opts = {}) {
   const tier = String(rawTier).toLowerCase().includes('ultra') ? 'ultra' : 'pro';
 
   try {
-    const updated = updateAccountUsage(
+    const updated = await updateAccountUsage(
       stateDir,
       accountId,
       { daily: parsed.daily, weekly: parsed.weekly, tier },
