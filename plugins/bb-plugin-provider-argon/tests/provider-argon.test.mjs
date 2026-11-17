@@ -1392,3 +1392,131 @@ test("10. acp-server slog and lifecycle guards, driver :visible and RU selectors
     "driver must support RU 'Удалить' in delete conversation"
   );
 });
+
+test("11. PLUG-280 model↔account selector filtering and incompatibility resets", async () => {
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-compat-test-")));
+  const poolFile = path.join(tmpDir, "pool.json");
+  const statePath = path.join(tmpDir, "accounts-state.json");
+  fs.writeFileSync(
+    poolFile,
+    JSON.stringify({
+      accounts: [
+        { id: "pro-1", email: "pro1@example.com", profileDir: path.join(tmpDir, "p1"), cdpPort: 9222, priority: 10, tier: "pro" },
+        { id: "karina", email: "karina@example.com", profileDir: path.join(tmpDir, "p2"), cdpPort: 9223, priority: 10, tier: "ultra" },
+        { id: "ultra-2", email: "ultra2@example.com", profileDir: path.join(tmpDir, "p3"), cdpPort: 9224, priority: 10, tier: "ultra" },
+      ],
+    })
+  );
+
+  const serverProc = spawnServer({
+    ...process.env,
+    ARGON_FAKE: "1",
+    ARGON_STATE_DIR: tmpDir,
+    ARGON_POOL_FILE: poolFile,
+  });
+
+  const lines = [];
+  serverProc.stdout.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) {
+        try {
+          lines.push(JSON.parse(line.trim()));
+        } catch {}
+      }
+    }
+  });
+
+  function sendReq(req) {
+    serverProc.stdin.write(JSON.stringify(req) + "\n");
+  }
+
+  async function waitForResponse(id, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.id === id);
+      if (idx >= 0) {
+        return lines.splice(idx, 1)[0];
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`Timeout waiting for response id=${id}`);
+  }
+
+  const optById = (r, id) => r.result.configOptions.find((o) => o.id === id);
+  const values = (o) => (o?.options || []).map((x) => x.value);
+  const writeState = (accounts) =>
+    fs.writeFileSync(statePath, JSON.stringify({ accounts, leases: {} }) + "\n");
+
+  sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+  await waitForResponse(1);
+  sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });
+  const r2 = await waitForResponse(2);
+  const sessionId = r2.result.sessionId;
+
+  // Baseline: model argon is supported everywhere — all accounts listed, all 5 models.
+  assert.deepEqual(values(optById(r2, "account")), ["auto", "pro-1", "karina", "ultra-2"]);
+  assert.equal(optById(r2, "account").currentValue, "auto");
+  assert.deepEqual(values(optById(r2, "model")), ["argon", "carbon", "hydrogen", "pro", "flash-lite"]);
+
+  // Case 1: carbon + exactly one capable ultra (ultra-2 has carbon locked)
+  // → account list [auto, karina], currentValue "karina" (single-capable rule).
+  writeState({ "ultra-2": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, lockedModels: ["carbon"] } });
+  sendReq({ jsonrpc: "2.0", id: 3, method: "session/set_model", params: { sessionId, modelId: "carbon" } });
+  const r3 = await waitForResponse(3);
+  assert.deepEqual(values(optById(r3, "account")), ["auto", "karina"], "Only the carbon-capable ultra account must be listed");
+  assert.equal(optById(r3, "account").currentValue, "karina", "Single capable account must surface as currentValue");
+  assert.ok(values(optById(r3, "model")).includes("carbon"), "auto union must keep carbon while one ultra supports it");
+
+  // Case 2: carbon + two capable ultras → currentValue "auto".
+  writeState({});
+  sendReq({ jsonrpc: "2.0", id: 4, method: "session/set_config_option", params: { sessionId, configId: "thought_level", value: "medium" } });
+  const r4 = await waitForResponse(4);
+  assert.deepEqual(values(optById(r4, "account")), ["auto", "karina", "ultra-2"], "pro-1 must be filtered out for carbon");
+  assert.equal(optById(r4, "account").currentValue, "auto");
+
+  // Case 5 (runs before 3 to observe the reset): picking a pro account while
+  // the model is carbon resets s.model to the "argon" default.
+  sendReq({ jsonrpc: "2.0", id: 5, method: "session/set_config_option", params: { sessionId, configId: "account", value: "pro-1" } });
+  const r5 = await waitForResponse(5);
+  assert.equal(optById(r5, "model").currentValue, "argon", "Incompatible model must reset to argon on account change");
+  assert.equal(optById(r5, "account").currentValue, "pro-1");
+  assert.deepEqual(values(optById(r5, "account")), ["auto", "pro-1", "karina", "ultra-2"]);
+
+  // Case 3: with a pro account selected, carbon is gone from the model list.
+  assert.ok(!values(optById(r5, "model")).includes("carbon"), "carbon must be filtered out on a pro account");
+  assert.ok(values(optById(r5, "model")).includes("argon"));
+
+  // Case 6: ultra account selected → all 5 models visible.
+  sendReq({ jsonrpc: "2.0", id: 6, method: "session/set_config_option", params: { sessionId, configId: "account", value: "karina" } });
+  const r6 = await waitForResponse(6);
+  assert.deepEqual(values(optById(r6, "model")), ["argon", "carbon", "hydrogen", "pro", "flash-lite"], "Ultra account must see all models");
+  assert.equal(optById(r6, "account").currentValue, "karina");
+
+  // Case 4: switching to carbon while a pro account is explicitly selected
+  // resets s.account to "auto" (plus backend/convId).
+  sendReq({ jsonrpc: "2.0", id: 7, method: "session/set_config_option", params: { sessionId, configId: "account", value: "pro-1" } });
+  await waitForResponse(7);
+  sendReq({ jsonrpc: "2.0", id: 8, method: "session/set_model", params: { sessionId, modelId: "carbon" } });
+  const r8 = await waitForResponse(8);
+  assert.ok(values(optById(r8, "model")).includes("carbon"), "carbon in the union model list proves the account fell back to auto");
+  assert.deepEqual(values(optById(r8, "account")), ["auto", "karina", "ultra-2"]);
+  assert.equal(optById(r8, "account").currentValue, "auto");
+
+  // Case 7: lockedModels excludes a model from both axes. pro-1 gets hydrogen
+  // locked → hydrogen drops out of its model list; pro-1 drops out of the
+  // account list while hydrogen is selected.
+  writeState({ "pro-1": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, lockedModels: ["hydrogen"] } });
+  sendReq({ jsonrpc: "2.0", id: 9, method: "session/set_model", params: { sessionId, modelId: "hydrogen" } });
+  const r9 = await waitForResponse(9);
+  assert.ok(!values(optById(r9, "account")).includes("pro-1"), "Account with hydrogen locked must be filtered out");
+  assert.deepEqual(values(optById(r9, "account")), ["auto", "karina", "ultra-2"]);
+  sendReq({ jsonrpc: "2.0", id: 10, method: "session/set_config_option", params: { sessionId, configId: "account", value: "pro-1" } });
+  const r10 = await waitForResponse(10);
+  assert.equal(optById(r10, "model").currentValue, "argon", "Locked model must reset to argon");
+  assert.ok(!values(optById(r10, "model")).includes("hydrogen"), "lockedModels entry must hide the model");
+  assert.ok(!values(optById(r10, "model")).includes("carbon"), "pro tier must still hide carbon");
+
+  serverProc.stdin.end();
+  await new Promise((resolve) => serverProc.on("exit", resolve));
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});

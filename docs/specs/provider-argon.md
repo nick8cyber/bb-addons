@@ -48,15 +48,18 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     - `'pro'` — «Gemini 3.1 Pro» (Исследования)
     - `'flash-lite'` — «Gemini 3.5 Flash-Lite» (Быстрые ответы)
   - Возвращают конфигурационные опции `configOptions`:
-    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `hydrogen`, `pro`, `flash-lite`);
+    - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `hydrogen`, `pro`, `flash-lite`), отфильтрованного по совместимости с выбранным аккаунтом (см. предикат `supported` ниже): при явном `s.account` — только модели, поддерживаемые этим аккаунтом; при `s.account === "auto"` — объединение: модель видна, если её поддерживает хотя бы один аккаунт пула (например, `carbon` видна только при наличии незалоченного Ultra-аккаунта);
     - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB (`Low`, `Medium`, `High`);
-    - `account` (категория `"account"`, возвращается при наличии более одного аккаунта в пуле): выбор аккаунта (`"auto"` или конкретный `id` аккаунта).
+    - `account` (категория `"account"`, возвращается при наличии более одного аккаунта в пуле): `"auto"` плюс только те аккаунты, которые поддерживают текущую `s.model`; `currentValue` — `s.account`, если он поддерживает `s.model`; иначе единственный поддерживающий аккаунт (правило single-capable); иначе `"auto"`.
   Все опции принимаются и обрабатываются в `session/set_config_option`.
-- **`session/set_model`** — меняет `s.model` через `resolveModelId`; `s.thinking` не изменяет — при незаданном уровне подставляется `medium`.
+- **Совместимость модели и аккаунта (предикат `supported(model, account)`, PLUG-280)** — зеркало рантайм-проверок `pickBackendFromState`/`bindBackend` (§3): модель поддерживается аккаунтом, если её нет в `accounts-state.json → accounts[<id>].lockedModels` и не выполняется условие `model === "carbon" && tier(account) !== "ultra"` (эффективный тир — `getAccountTier`: `lockedModels` с `carbon` понижает аккаунт до `pro`). Фильтрация двунаправленная и работает только на уровне селекторов: явные ошибки тира/лока в `bindBackend` остаются страховкой под ней. При несовместимости намерением считается только что выбранное значение, а вторая ось откатывается к дефолту:
+  - при смене модели (`session/set_model` или `set_config_option` `model`), если явно выбранный `s.account` не поддерживает новую модель, `s.account` сбрасывается в `"auto"` с тем же сбросом `s.backend = null` и `s.convId = null`, что и при смене аккаунта (auto сроутирует на совместимый аккаунт);
+  - при смене аккаунта (`set_config_option` `account`), если `s.model` не поддерживается новым аккаунтом, `s.model` сбрасывается в `"argon"` (дефолт).
+- **`session/set_model`** — меняет `s.model` через `resolveModelId`; `s.thinking` не изменяет — при незаданном уровне подставляется `medium`; применяет сброс несовместимого аккаунта (см. выше).
 - **`session/set_config_option`**:
   - при `configId === "thought_level"` (или `configId === "thinking"`) обновляет уровень мышления `s.thinking`: `"low"` → `"low"`, `"medium"` → `"medium"`, `"high"` → `"high"`, не затрагивая выбранную модель `s.model`;
-  - при `configId === "model"` обновляет `s.model` через `resolveModelId` до одного из `argon`, `carbon`, `hydrogen`, `pro`, `flash-lite` (псевдонимы `fast`/`flash`/`lite` → `flash-lite`); неизвестное значение — ошибка -32602 `unknown model`;
-  - при `configId === "account"` обновляет `s.account` (`"auto"` или id аккаунта); при смене аккаунта сбрасывает `s.backend = null` и `s.convId = null`.
+  - при `configId === "model"` обновляет `s.model` через `resolveModelId` до одного из `argon`, `carbon`, `hydrogen`, `pro`, `flash-lite` (псевдонимы `fast`/`flash`/`lite` → `flash-lite`); неизвестное значение — ошибка -32602 `unknown model`; применяет сброс несовместимого аккаунта (см. выше);
+  - при `configId === "account"` обновляет `s.account` (`"auto"` или id аккаунта); при смене аккаунта сбрасывает `s.backend = null` и `s.convId = null`; применяет сброс несовместимой модели в `"argon"` (см. выше).
 - **Передача в веб-драйвер**:
   - В драйвер передаётся `model: s.model` (`"argon"` передаётся как есть, без подмены на `"thinking"`, чтобы селектор модели не искал несуществующую модель).
   - Уровни размышлений в UI и словаре драйвера — строго `low` / `medium` / `high` (и их русские аналоги «низкий» / «средний» / «высокий»). Сервер ACP нормализует значение `s.thinking` перед передачей в `sendPrompt`:
