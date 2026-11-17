@@ -29,7 +29,8 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 3. **`src/gemini-driver.js`** — CDP-драйвер веб-интерфейса `gemini.google.com` на базе `playwright` или `playwright-core` (драйвер пробует сначала `playwright`, затем `playwright-core`):
    - Подключается к запущенному headless Chrome по `http://127.0.0.1:<cdpPort>` или поднимает новый процесс Chrome с изолированным `--user-data-dir=<profileDir>`.
    - Выбирает режим мышления (`Fast`, `Thinking`, `Pro`), отправляет промпт, опрашивает текст ответа через `findTurnTarget`, отслеживает завершение генерации, извлекает `convId` беседы и паркует вкладку в простое.
-4. **`src/profile-manager.js`, `bin/gemini.js`, `scripts/glogin.mjs`, `scripts/pool-add.mjs`** — CLI и утилиты управления профилями и интерактивного входа в аккаунты пула.
+4. **`src/usage-limits.js`** — модуль сбора лимитов Gemini Web (5h + weekly) через `batchexecute` RPC и ведения файла `accounts-usage.json` (§4.4).
+5. **`src/profile-manager.js`, `bin/gemini.js`, `scripts/glogin.mjs`, `scripts/pool-add.mjs`** — CLI и утилиты управления профилями и интерактивного входа в аккаунты пула.
 
 ---
 
@@ -230,6 +231,51 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     `await page.goto(convId ? `https://gemini.google.com/app/${convId}` : GEMINI_APP_URL, { timeout: 15000 })`.
   - При наличии `convId` в сессии восстанавливается контекст беседы; если `convId` отсутствует (например, ход 1 был отменён до извлечения ID), выполняется переход на новый чат `GEMINI_APP_URL`. В обоих случаях поиск редактора и ввод текста не зависают на `about:blank`.
 
+### 4.4 Сбор лимитов Gemini Web (`batchexecute`) и файл состояния `accounts-usage.json` (PLUG-289)
+
+- **Назначение:** парсинг лимитов Gemini Web (5-часовое скользящее окно `daily` и недельный лимит `weekly`) по каждому аккаунту пула и запись в `$ARGON_STATE_DIR/accounts-usage.json` для последующего чтения плагином Usage Pro.
+- **Механика batchexecute:**
+  - Gemini отдаёт лимиты через внутренний RPC-канал `batchexecute` (тот же интерфейс, что использует веб-страница `/usage`).
+  - Вызов выполняется функцией `captureUsageLimits(page, opts)` через `Runtime.evaluate` (`page.evaluate`) в контексте страницы `gemini.google.com`:
+    1. Из глобального объекта `window.WIZ_global_data` читаются параметры: `SNlM0e` (`at`-токен), `cfb2h` (`bl`), `FdrFJe` (`f.sid`). Токены `at` и `f.sid` используются исключительно in-memory и никогда не сохраняются на диск.
+    2. Выполняется `POST /_/BardChatUi/data/batchexecute?rpcids=<rpcids>&source-path=/usage&bl=<bl>&f.sid=<fsid>&hl=en&_reqid=<rnd>&rt=c` с заголовком `Content-Type: application/x-www-form-urlencoded;charset=UTF-8`, телом `f.req=[[[rpcid1,args,null,"generic"],[rpcid2,...]]]&at=<at>` и `credentials: "include"`. Внутри браузерного запроса вызов защищён сигналом `AbortController` (таймаут 8 с), а сам `page.evaluate` обёрнут в `Promise.race` с таймаутом 9 с.
+    3. Дефолтный рецепт RPC: `rpcid = "jSf9Qc"`, `args = "[]"`. Список кандидатов RPC ID: `['jSf9Qc', 'kAb7Z']`.
+    4. **Самолечение рецепта (self-healing):** запрос отправляет батч из 2-3 кандидатов RPC ID (`f.req`/`rpcids`). При сбое батча предусмотрен последовательный фолбэк по списку кандидатов. Парсер обходит все `wrb.fr`-фреймы в ответе. Фрейм, содержащий записи метрик, возвращает свой рабочий `rpcid`. Если он отличается от сохранённого рецепта, поле `recipe` в `accounts-usage.json` обновляется с новым `rpcid`.
+    5. **Разбор ответа:** ответ очищается от анти-XSSI префикса `)]}'`, извлекаются фреймы `[["wrb.fr", rpcid, payloadJson], …]`. В `payload` рекурсивно ищется массив записей-метрик `e`:
+       - `e[1]` — доля использования 0..1.5 (`percent = Math.round(e[1] * 100)`);
+       - `e[2]` — период (`1` = 5-часовое окно/daily, `2` = недельный/weekly);
+       - `e[3][0][0]` — время сброса квоты в секундах Unix epoch (`>= 1.6e9`).
+       Итог разбора: `{ daily: { percent, resetEpochSec }, weekly: { percent, resetEpochSec }, workingRpcid }`.
+- **Условия вызова и ограничения:**
+  - **Только в живой вкладке:** вызов выполняется ТОЛЬКО когда вкладка аккаунта уже активна на домене `gemini.google.com` (URL содержит `gemini.google.com`, не `about:blank`).
+  - **Никакого запуска Chrome ради статистики:** если Chrome не поднимался для выполнения хода — сбор безусловно пропускается.
+  - **Точки обновления:** сбор вызывается в `sendPrompt` в блоке `finally` после завершения каждого хода (независимо от исхода — как при успешном ответе, так и при ошибке хода / rate-limit, когда фиксация лимитов наиболее ценна), непосредственно перед парковкой вкладки на `about:blank`.
+  - **Таймаут и изоляция сбоев хода:** вызов `captureUsageLimits` в `finally` ограничен `Promise.race` с таймаутом 10 с. Любой сбой (сетевой, таймаут, отсутствие `SNlM0e`, смена формата) логируется только в debug-режиме (`ARGON_DEBUG`) и ни при каких условиях не влияет на результат или ошибку хода.
+  - **Троттлинг:** не чаще одного раза в `ARGON_USAGE_REFRESH_MS` (дефолт 300 000 мс / 5 минут) на каждый аккаунт. Троттлинг проверяется в памяти процесса и по штампу `updatedAt` в `accounts-usage.json`.
+- **Формат файла `$ARGON_STATE_DIR/accounts-usage.json`:**
+  ```json
+  {
+    "accounts": {
+      "<id>": {
+        "daily": { "percent": 25, "resetEpochSec": 1763350000 },
+        "weekly": { "percent": 60, "resetEpochSec": 1763950000 },
+        "tier": "ultra|pro",
+        "updatedAt": 1763345000000,
+        "stale": false
+      }
+    },
+    "recipe": {
+      "rpcid": "jSf9Qc",
+      "args": "[]",
+      "updatedAt": 1763345000000
+    }
+  }
+  ```
+  - Определение `tier`: значение из `backend.tier` (из `pool.json`), либо детектируется по DOM (`gemini advanced`/`gemini ultra` → `"ultra"`, иначе `"pro"`). При обновлении предотвращается случайный даунгрейд с `ultra` до `pro` при пропуске DOM-детекции.
+  - Multi-process пул и частичные ответы:
+    - Запись в файл выполняется атомарно через файл-замок `accounts-usage.json.lock`, содержащий уникальный токен процесса (`pid:ts:random`). Замок снимается в `finally` только при точном совпадении токена (защита от гонок при снятии чужого перехваченного лока).
+    - Read-merge-write: при частичном ответе сервера (наличие только одной из метрик `daily`/`weekly`) существующие метрики аккаунта объединяются со снапшотом предыдущего состояния (`daily ?? prev?.daily ?? null`). Записи других аккаунтов пула сохраняются.
+
 ---
 
 ## 5. Переносимость и гигиена репозитория
@@ -255,6 +301,10 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   6. Умную маршрутизацию `pickBackendFromState`: выбор `pro`-аккаунтов для `argon` и `ultra` для `carbon`, разрешение эффективного приоритета (`state` → `pool` → дефолт `10`, `<= 0` исключает аккаунт), учёт `lockedModels` и LRU по `lastUsedMs` (§3.3).
   7. Жизненный цикл процесса и селекторы драйвера: запись `slog` в `acp-server.log`, `reapOrphanAcpServers` (снятие осиротевших acp-server), visible-селекторы (`gem-menu-item[data-mode-id]:visible`) и русские подписи (`Загрузить файлы`, `Удалить`) в `gemini-driver.js`.
   8. Двунаправленную фильтрацию селекторов model ↔ account (PLUG-280): ограничение списка моделей возможностями выбранного аккаунта (union по пулу при s.account === "auto"), ограничение списка аккаунтов поддержкой текущей модели, правило single-capable для currentValue аккаунта, сброс несовместимого аккаунта в "auto" при смене модели и сброс несовместимой модели в "argon" при смене аккаунта.
+  9. Разбор batchexecute wrb.fr фреймов функцией `parseUsageLimits` (daily/weekly, проценты, reset epoch sec, самолечение recipe при смене rpcid) (§4.4).
+  10. Multi-process merge-логика и атомарная запись `accounts-usage.json` (сохранение чужих аккаунтов пула при параллельных обновлениях, слияние со снапшотом предыдущего состояния без затирания частичных метрик, сохранение `tier: ultra`, защита файла замка через уникальный токен `pid:ts:random`) (§4.4).
+  11. Гейтинг и троттлинг `captureUsageLimits` (пропуск вызова на `about:blank`, соблюдение `ARGON_USAGE_REFRESH_MS`, обход через `force: true`, изоляция таймаута браузерного запроса и батчинг кандидатов RPC ID) (§4.4).
+  12. Интеграция `sendPrompt` с фиксацией лимитов в `finally` (вызов как при успешном ответе, так и при сбое/rate-limit хода, отсутствие зависания при медленном или зависшем `captureUsageLimits`, проброс `backend.tier`) (§4.4).
 - Набор `tests/provider-web-gemini-tools.test.mjs` (47 тестов, офлайн) покрывает инструменты чтения веб-Gemini по спеке `provider-web-gemini-tools.md`: разбор текстового протокола вызовов инструментов, sandbox `cwd` (запрет `..`, абсолютных путей и симлинков наружу, чёрный список чувствительных файлов), белый список `git`-команд, маскировку секретов `[скрыто: <тип>]`, раунды tool-loop и лимит `ARGON_MAX_TOOL_ROUNDS`, упаковку первого сообщения (вложения файлов/тредов/задач, потолок `ARGON_MAX_MESSAGE_BYTES`).
 
 ---
