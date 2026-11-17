@@ -1939,7 +1939,7 @@ test("15. PLUG-280 model↔account selector filtering and incompatibility resets
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", async () => {
+test("16. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", async () => {
   // --- lock-icon predicate on DOM fixtures ---
   const icon = (props = {}) => ({
     offsetParent: {},
