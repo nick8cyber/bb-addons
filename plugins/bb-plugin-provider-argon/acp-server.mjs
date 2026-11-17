@@ -411,16 +411,32 @@ export function parseResetTimeMs(msg, nowMs = Date.now()) {
   return null;
 }
 
-/* ---------- classify failure (§3.3) ---------- */
-// PLUG-281: prompt-size guard. Unset → 100KB (the observed insertText hang
-// threshold); ARGON_MAX_PROMPT_BYTES=N overrides; non-positive → no limit.
+/* ---------- prompt-size guard (PLUG-281, §2.2/§4.1) ---------- */
+// Unset → 100000 (below the observed ~120KB insertText hang);
+// ARGON_MAX_PROMPT_BYTES=N overrides; non-positive → no limit.
 function argonMaxPromptBytes() {
   const raw = process.env.ARGON_MAX_PROMPT_BYTES;
-  if (raw == null || raw === "") return 100 * 1024;
+  if (raw == null || raw === "") return 100_000;
   const v = Number(raw);
   // NaN/garbage → default; non-positive → explicit "no limit".
-  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100 * 1024;
+  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100_000;
 }
+
+// Central outbound-text check applied to every send to Gemini (§2.2):
+// session/prompt text here, and the driver repeats it at the last boundary
+// before page work so internal sends (packed/tool-loop messages) are covered.
+export function promptTooLargeError(text) {
+  const bytes = Buffer.byteLength(text || "", "utf8");
+  const limit = argonMaxPromptBytes();
+  if (bytes <= limit) return null;
+  const err = new Error(
+    `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.`
+  );
+  err.code = "ARGON_PROMPT_TOO_LARGE";
+  return err;
+}
+
+/* ---------- classify failure (§3.3) ---------- */
 
 export function classifyFailure(err, authHint = null) {
   const message = (err?.message || String(err || "")).trim();
@@ -748,18 +764,6 @@ async function runPrompt(id, sessionId, text) {
   s.cancelled = false;
 
   try {
-    // PLUG-281: >~100KB prompts hang execCommand('insertText') in the driver
-    // and used to surface as model-unavailable — fail fast BEFORE any
-    // lease/park, but inside try so the client gets a -32000, not a dead
-    // server (throw above try → void runPrompt() → unhandled rejection).
-    const maxPromptBytes = argonMaxPromptBytes();
-    if (Buffer.byteLength(text || "", "utf8") > maxPromptBytes) {
-      const err = new Error(
-        `prompt too large: ${Buffer.byteLength(text || "", "utf8")} bytes > ARGON_MAX_PROMPT_BYTES (${maxPromptBytes})`
-      );
-      err.code = "ARGON_PROMPT_TOO_LARGE";
-      throw err;
-    }
     const result = await enqueue(async () => {
       if (s.cancelled) return { cancelled: true };
 
@@ -950,6 +954,16 @@ async function runPrompt(id, sessionId, text) {
             activePromptSessionId = null;
             return { cancelled: true };
           }
+          // PLUG-281: oversized prompt is the caller's error, not the
+          // account's — release the lease, never probe/rotate/cool down.
+          if (err && err.code === "ARGON_PROMPT_TOO_LARGE") {
+            await releaseLease(backend.id);
+            activeBackendId = null;
+            activeAbort = null;
+            activeAttempt = null;
+            activePromptSessionId = null;
+            throw err;
+          }
           const hint = await probeAuthHint(backend);
           const cls = classifyFailure(err, hint);
           const cooled = await settleBackend(backend.id, sessionId, cls.untilMs, hint || err.message, cls.parkedReason);
@@ -989,9 +1003,14 @@ async function runPrompt(id, sessionId, text) {
   } catch (err) {
     if (s.activeGen === gen) s.activeGen = null;
     if (!isExiting) {
-      const hint = FAKE ? null : (err.authHint ?? (s.backend ? await probeAuthHint(s.backend) : null));
-      const msg = hint ? `${hint}\n\n(driver error: ${err.message})` : `Gemini web driver error: ${err.message}`;
-      out({ jsonrpc: "2.0", id, error: { code: -32000, message: msg } });
+      // PLUG-281: caller-side refusal — report verbatim, no driver framing.
+      if (err && err.code === "ARGON_PROMPT_TOO_LARGE") {
+        out({ jsonrpc: "2.0", id, error: { code: -32000, message: err.message } });
+      } else {
+        const hint = FAKE ? null : (err.authHint ?? (s.backend ? await probeAuthHint(s.backend) : null));
+        const msg = hint ? `${hint}\n\n(driver error: ${err.message})` : `Gemini web driver error: ${err.message}`;
+        out({ jsonrpc: "2.0", id, error: { code: -32000, message: msg } });
+      }
     }
   }
 }
@@ -1233,6 +1252,13 @@ export function dispatch(msg) {
         .join("\n");
       if (!text.trim()) {
         out({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+        return;
+      }
+      // PLUG-281: refuse oversized prompts synchronously — before the queue,
+      // account selection and any lease (§2.2).
+      const tooLarge = promptTooLargeError(text);
+      if (tooLarge) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
         return;
       }
       void runPrompt(msg.id, p.sessionId, text);

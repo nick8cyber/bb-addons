@@ -378,20 +378,24 @@ class ModelUnavailable extends Error {
 }
 
 // PLUG-281: >~100KB prompts hang execCommand('insertText') — fail fast before
-// any page work. Unset → 100KB default; non-positive env → no limit.
+// any page work. Unset → 100000 default; non-positive env → no limit.
 function argonMaxPromptBytes() {
   const raw = process.env.ARGON_MAX_PROMPT_BYTES;
-  if (raw == null || raw === '') return 100 * 1024;
+  if (raw == null || raw === '') return 100_000;
   const v = Number(raw);
   // NaN/garbage → default; non-positive → explicit "no limit".
-  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100 * 1024;
+  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100_000;
 }
 
-function throwIfPromptTooLarge(prompt) {
+function throwIfPromptTooLarge(prompt, fieldMaxBytes = null) {
   const bytes = Buffer.byteLength(prompt || '', 'utf8');
-  const limit = argonMaxPromptBytes();
+  // A real maxlength on the web input field lowers the effective limit.
+  const ml = Number(fieldMaxBytes);
+  const limit = Number.isFinite(ml) && ml > 0 ? Math.min(argonMaxPromptBytes(), ml) : argonMaxPromptBytes();
   if (bytes > limit) {
-    const err = new Error(`prompt too large: ${bytes} bytes > ARGON_MAX_PROMPT_BYTES (${limit})`);
+    const err = new Error(
+      `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.`
+    );
     err.code = 'ARGON_PROMPT_TOO_LARGE';
     throw err;
   }
@@ -733,6 +737,17 @@ async function sendPrompt({
       await checkRobotVerification(page, { waitForVerification, port });
       await page.waitForSelector(textboxSelector, { timeout: 10000 });
     }
+
+    // PLUG-281: if the web input exposes a real maxlength, it wins over env.
+    const fieldMaxBytes = await page
+      .evaluate((sel) => {
+        const el = document.querySelector(sel);
+        const v = el && (el.maxLength ?? el.getAttribute?.('maxlength'));
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      }, textboxSelector)
+      .catch(() => null);
+    if (fieldMaxBytes) throwIfPromptTooLarge(prompt, fieldMaxBytes);
 
     if (model || thinking) {
       await selectModelAndThinking(page, model, thinking, isStrict);

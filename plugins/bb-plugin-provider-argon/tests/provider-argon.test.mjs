@@ -978,3 +978,127 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before any lease", async () => {
+  // Driver boundary: sendPrompt must reject before ensureChrome/CDP —
+  // every send to Gemini passes through it (incl. packed/tool-loop messages).
+  const prevEnv = process.env.ARGON_MAX_PROMPT_BYTES;
+  process.env.ARGON_MAX_PROMPT_BYTES = "100";
+  try {
+    await assert.rejects(driver.sendPrompt({ prompt: "x".repeat(200) }), (err) => {
+      assert.equal(err.code, "ARGON_PROMPT_TOO_LARGE");
+      assert.equal(
+        err.message,
+        "prompt too large: 200 bytes exceeds limit 100 bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry."
+      );
+      return true;
+    });
+  } finally {
+    if (prevEnv === undefined) delete process.env.ARGON_MAX_PROMPT_BYTES;
+    else process.env.ARGON_MAX_PROMPT_BYTES = prevEnv;
+  }
+
+  // Server boundary: synchronous refusal in dispatch — no queue, no account
+  // selection, no lease, no state file on disk.
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-guard-test-")));
+  const poolFile = path.join(tmpDir, "pool.json");
+  fs.writeFileSync(
+    poolFile,
+    JSON.stringify({
+      accounts: [
+        {
+          id: "fake-acc-guard",
+          email: "guard@example.com",
+          profileDir: path.join(tmpDir, "p1"),
+          cdpPort: 9222,
+          priority: 10,
+        },
+      ],
+    })
+  );
+
+  const serverProc = spawnServer({
+    ...process.env,
+    ARGON_FAKE: "1",
+    ARGON_MAX_PROMPT_BYTES: "100",
+    ARGON_STATE_DIR: tmpDir,
+    ARGON_POOL_FILE: poolFile,
+  });
+
+  const lines = [];
+  serverProc.stdout.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) {
+        try {
+          lines.push(JSON.parse(line.trim()));
+        } catch {}
+      }
+    }
+  });
+
+  function sendReq(req) {
+    serverProc.stdin.write(JSON.stringify(req) + "\n");
+  }
+
+  async function waitForResponse(id, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.id === id);
+      if (idx >= 0) {
+        return lines.splice(idx, 1)[0];
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`Timeout waiting for response id=${id}`);
+  }
+
+  sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+  await waitForResponse(1);
+  sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });
+  const r2 = await waitForResponse(2);
+  const sessionId = r2.result.sessionId;
+
+  // 200 bytes > limit 100 → immediate error with exact contract message.
+  sendReq({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: { sessionId, prompt: [{ type: "text", text: "x".repeat(200) }] },
+  });
+  const r3 = await waitForResponse(3);
+  assert.equal(r3.error?.code, -32000);
+  assert.equal(
+    r3.error?.message,
+    "prompt too large: 200 bytes exceeds limit 100 bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry."
+  );
+
+  // UTF-8 is measured in bytes, not characters: 60 × 'й' = 120 bytes > 100.
+  sendReq({
+    jsonrpc: "2.0",
+    id: 31,
+    method: "session/prompt",
+    params: { sessionId, prompt: [{ type: "text", text: "й".repeat(60) }] },
+  });
+  const r31 = await waitForResponse(31);
+  assert.equal(r31.error?.code, -32000);
+  assert.match(r31.error?.message, /^prompt too large: 120 bytes exceeds limit 100 bytes/);
+
+  // No lease taken, no account touched: the state file is only written by
+  // bindBackend/withStateLock, which the refusal never reaches.
+  const statePath = path.join(tmpDir, "accounts-state.json");
+  assert.equal(fs.existsSync(statePath), false, "Oversized prompt must not create leases/state");
+
+  // Under the limit passes through to the normal (FAKE) path.
+  sendReq({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "session/prompt",
+    params: { sessionId, prompt: [{ type: "text", text: "short ok" }] },
+  });
+  const r4 = await waitForResponse(4);
+  assert.equal(r4.result?.stopReason, "end_turn");
+
+  serverProc.stdin.end();
+  await new Promise((resolve) => serverProc.on("exit", resolve));
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
