@@ -24,6 +24,11 @@ const {
   RESET_REGEX_EXTENDED,
   waitForHistoryStabilization,
   findTurnTarget,
+  parseUsageLimits,
+  extractWrbFrames,
+  updateAccountUsage,
+  readAccountsUsage,
+  captureUsageLimits,
 } = driver;
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -977,4 +982,169 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
   assert.equal(endTurnMsg, undefined, "Response with stopReason 'end_turn' must not be sent on stdin close");
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("8. parseUsageLimits parses batchexecute wrb.fr frames and handles self-healing recipe rpcid", () => {
+  // 1. Standard fixture with default rpcid jSf9Qc
+  const snippetStandard = `)]}'\n\n162\n[["wrb.fr","jSf9Qc","[null,[[1,0.25,1,[[1763350000,0]]],[2,0.6,2,[[1763950000,0]]]]]",null,null,null,"generic"]]\n`;
+  const resStandard = parseUsageLimits(snippetStandard);
+  assert.ok(resStandard !== null);
+  assert.equal(resStandard.workingRpcid, "jSf9Qc");
+  assert.deepEqual(resStandard.daily, { percent: 25, resetEpochSec: 1763350000 });
+  assert.deepEqual(resStandard.weekly, { percent: 60, resetEpochSec: 1763950000 });
+
+  // 2. Self-healing recipe with alternative rpcid
+  const snippetHealed = `)]}'\n\n162\n[["wrb.fr","kAb7Z","[null,[[1,0.12,1,[[1763354000,0]]],[2,0.85,2,[[1763954000,0]]]]]",null,null,null,"generic"]]\n`;
+  const resHealed = parseUsageLimits(snippetHealed);
+  assert.ok(resHealed !== null);
+  assert.equal(resHealed.workingRpcid, "kAb7Z");
+  assert.deepEqual(resHealed.daily, { percent: 12, resetEpochSec: 1763354000 });
+  assert.deepEqual(resHealed.weekly, { percent: 85, resetEpochSec: 1763954000 });
+
+  // 3. Over-quota usage (> 1.0, e.g. 1.25 -> 125%)
+  const snippetOverQuota = `)]}'\n[["wrb.fr","jSf9Qc","[null,[[1,1.25,1,[[1763350000,0]]],[2,0.5,2,[[1763950000,0]]]]]",null,null,null,"generic"]]`;
+  const resOverQuota = parseUsageLimits(snippetOverQuota);
+  assert.equal(resOverQuota.daily.percent, 125);
+
+  // 4. Multiple envelopes, metrics in second frame
+  const snippetMulti = `)]}'\n\n40\n[["wrb.fr","otherRpc","[null]",null,null,null,"generic"]]\n162\n[["wrb.fr","jSf9Qc","[null,[[1,0.3,1,[[1763350000,0]]],[2,0.7,2,[[1763950000,0]]]]]",null,null,null,"generic"]]\n`;
+  const resMulti = parseUsageLimits(snippetMulti);
+  assert.ok(resMulti !== null);
+  assert.equal(resMulti.workingRpcid, "jSf9Qc");
+  assert.equal(resMulti.daily.percent, 30);
+  assert.equal(resMulti.weekly.percent, 70);
+
+  // 5. Invalid / non-metric inputs
+  assert.equal(parseUsageLimits(""), null);
+  assert.equal(parseUsageLimits(")]}'\n"), null);
+  assert.equal(parseUsageLimits(")]}'\n40\n[[\"di\",45]]\n"), null);
+  assert.equal(parseUsageLimits("invalid non-json text"), null);
+});
+
+test("9. accounts-usage.json multi-process merge logic and atomic file updates", async () => {
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "usage-merge-test-")));
+
+  // Initial write for acc1
+  const u1 = {
+    daily: { percent: 15, resetEpochSec: 1763350000 },
+    weekly: { percent: 45, resetEpochSec: 1763950000 },
+    tier: "pro",
+  };
+  const r1 = { rpcid: "jSf9Qc", args: "[]" };
+  const d1 = updateAccountUsage(tmpDir, "acc1", u1, r1);
+
+  assert.ok(d1.accounts.acc1);
+  assert.deepEqual(d1.accounts.acc1.daily, u1.daily);
+  assert.deepEqual(d1.accounts.acc1.weekly, u1.weekly);
+  assert.equal(d1.accounts.acc1.tier, "pro");
+  assert.equal(d1.accounts.acc1.stale, false);
+  assert.equal(d1.recipe.rpcid, "jSf9Qc");
+
+  // Subsequent write for acc2 (multi-process pool simulation: does NOT overwrite acc1)
+  const u2 = {
+    daily: { percent: 50, resetEpochSec: 1763360000 },
+    weekly: { percent: 80, resetEpochSec: 1763960000 },
+    tier: "ultra",
+  };
+  const d2 = updateAccountUsage(tmpDir, "acc2", u2, r1);
+
+  assert.ok(d2.accounts.acc1, "acc1 must be preserved when acc2 is updated");
+  assert.ok(d2.accounts.acc2, "acc2 must be present");
+  assert.equal(d2.accounts.acc1.tier, "pro");
+  assert.equal(d2.accounts.acc2.tier, "ultra");
+
+  // Read back via readAccountsUsage
+  const onDisk = readAccountsUsage(tmpDir);
+  assert.equal(Object.keys(onDisk.accounts).length, 2);
+  assert.equal(onDisk.recipe.rpcid, "jSf9Qc");
+
+  // Update recipe self-healing: rpcid changes to kAb7Z
+  const r2 = { rpcid: "kAb7Z", args: "[]" };
+  const d3 = updateAccountUsage(tmpDir, "acc1", { ...u1, daily: { percent: 20, resetEpochSec: 1763351000 } }, r2);
+  assert.equal(d3.recipe.rpcid, "kAb7Z");
+  assert.equal(d3.accounts.acc1.daily.percent, 20);
+  assert.equal(d3.accounts.acc2.daily.percent, 50);
+
+  // Concurrency test: simulate 10 parallel updates across different accounts
+  const promises = [];
+  for (let i = 0; i < 10; i++) {
+    promises.push(
+      new Promise((resolve) => {
+        const accId = `worker-${i}`;
+        const res = updateAccountUsage(tmpDir, accId, {
+          daily: { percent: i * 10, resetEpochSec: 1763350000 + i },
+          weekly: { percent: i * 10, resetEpochSec: 1763950000 + i },
+          tier: i % 2 === 0 ? "ultra" : "pro",
+        }, r2);
+        resolve(res);
+      })
+    );
+  }
+  await Promise.all(promises);
+
+  const finalCheck = readAccountsUsage(tmpDir);
+  assert.ok(finalCheck.accounts.acc1);
+  assert.ok(finalCheck.accounts.acc2);
+  for (let i = 0; i < 10; i++) {
+    assert.ok(finalCheck.accounts[`worker-${i}`], `worker-${i} must exist after concurrent updates`);
+  }
+});
+
+test("10. captureUsageLimits domain gating, evaluate execution, and throttling", async () => {
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "usage-capture-test-")));
+
+  // 1. Tab not on gemini.google.com -> skips evaluate and returns null
+  let evalCalled = false;
+  const mockBlankPage = {
+    url: () => "about:blank",
+    evaluate: async () => {
+      evalCalled = true;
+      return {};
+    },
+  };
+  const blankRes = await captureUsageLimits(mockBlankPage, { stateDir: tmpDir, accountId: "test-acc-1" });
+  assert.equal(blankRes, null);
+  assert.equal(evalCalled, false, "evaluate must NOT be called when url is about:blank");
+
+  // 2. Tab on gemini.google.com -> executes evaluate and captures usage
+  const mockGeminiPage = {
+    url: () => "https://gemini.google.com/app",
+    evaluate: async () => {
+      evalCalled = true;
+      return {
+        text: `)]}'\n[["wrb.fr","jSf9Qc","[null,[[1,0.35,1,[[1763350000,0]]],[2,0.75,2,[[1763950000,0]]]]]",null,null,null,"generic"]]`,
+        domTier: "ultra",
+      };
+    },
+  };
+
+  const capRes = await captureUsageLimits(mockGeminiPage, {
+    stateDir: tmpDir,
+    accountId: "test-acc-1",
+    force: true,
+  });
+  assert.ok(capRes !== null);
+  assert.equal(evalCalled, true);
+  assert.equal(capRes.accounts["test-acc-1"].daily.percent, 35);
+  assert.equal(capRes.accounts["test-acc-1"].weekly.percent, 75);
+  assert.equal(capRes.accounts["test-acc-1"].tier, "ultra");
+
+  // 3. Throttling: second call without force within ARGON_USAGE_REFRESH_MS returns null
+  evalCalled = false;
+  const throttledRes = await captureUsageLimits(mockGeminiPage, {
+    stateDir: tmpDir,
+    accountId: "test-acc-1",
+    force: false,
+  });
+  assert.equal(throttledRes, null, "Call within refresh interval must be throttled");
+  assert.equal(evalCalled, false, "evaluate must NOT be called when throttled");
+
+  // 4. Force bypasses throttle
+  const forcedRes = await captureUsageLimits(mockGeminiPage, {
+    stateDir: tmpDir,
+    accountId: "test-acc-1",
+    force: true,
+  });
+  assert.ok(forcedRes !== null, "force: true must bypass throttle");
+  assert.equal(evalCalled, true);
 });

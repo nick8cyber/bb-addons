@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const profileManager = require('./profile-manager');
+const usageLimits = require('./usage-limits');
 
 let CDP_PORT = process.env.GEMINI_CDP_PORT || '9222';
 const cdpUrl = (port) => `http://localhost:${port ?? CDP_PORT}`;
@@ -975,6 +976,23 @@ async function sendPrompt({
     resObj.meta = {};
     resObj.convId = returnedConvId;
     resObj.downloaded = downloadedPath;
+
+    // Capture usage limits post-turn before parking tab on about:blank
+    try {
+      if (page && page.url && page.url().includes('gemini.google.com')) {
+        await usageLimits.captureUsageLimits(page, {
+          accountId: opts.accountId || opts.account || opts.profile,
+          backend: opts.backend,
+          stateDir: opts.stateDir,
+          tier: opts.tier || (opts.backend && opts.backend.tier),
+        });
+      }
+    } catch (err) {
+      if (process.env.ARGON_DEBUG) {
+        console.warn('[argon] captureUsageLimits post-turn error:', err.message);
+      }
+    }
+
     return resObj;
   } finally {
     if (page && process.env.GEMINI_PARK_IDLE !== '0') {
@@ -1529,5 +1547,12 @@ module.exports = {
   getConversationTranscript,
   deleteConversation,
   deleteConversationInternal,
+  captureUsageLimits: usageLimits.captureUsageLimits,
+  parseUsageLimits: usageLimits.parseUsageLimits,
+  extractWrbFrames: usageLimits.extractWrbFrames,
+  findMetricRecords: usageLimits.findMetricRecords,
+  readAccountsUsage: usageLimits.readAccountsUsage,
+  updateAccountUsage: usageLimits.updateAccountUsage,
+  usageLimits,
   profileManager
 };
