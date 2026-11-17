@@ -27,6 +27,8 @@
     "usage-races.test.ts",
     "usage-disabled-pool.test.ts",
     "antigravity-acp-usage.ts",
+    "argon-usage.ts",
+    "argon-usage.test.ts",
     "dist/provider-usage-base.d.ts"
   ]
 }

@@ -5,6 +5,7 @@ export type CollectorOptions = {
   spawn?: (command: string, args: string[], options?: any) => any;
   runner?: (command: string, args: string[], options?: any) => any;
   agyPath?: string | (() => string);
+  argonStateDir?: string | (() => string | undefined);
   now?: () => number;
   prewarm?: boolean;
 };

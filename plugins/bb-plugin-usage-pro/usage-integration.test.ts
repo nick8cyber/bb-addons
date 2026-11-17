@@ -270,6 +270,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       execFile: mockRunner as any,
       spawn: mockSpawn as any,
       now: cfg.now ?? (() => currentTime),
+      argonStateDir: path.join(tmpUserHome, ".bb", "plugins", "provider-argon"),
       prewarm: false,
     };
 
@@ -1403,5 +1404,137 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
 
     // Xm card renderer displays warning in amber styling above card content
     expect(bundleContent).toContain('text-2xs text-amber-500 mb-1 leading-tight');
+  });
+
+  // PLUG-290: Gemini Web (Argon) section — quotas from accounts-usage.json
+  function writeArgonUsageFile(body: unknown) {
+    const dir = path.join(tmpUserHome, ".bb", "plugins", "provider-argon");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "accounts-usage.json"),
+      typeof body === "string" ? body : JSON.stringify(body),
+    );
+  }
+
+  function argonCards(snapshot: any) {
+    const primary = snapshot.machines.find((m: any) => m.id === "host-primary");
+    return primary.providers.filter((p: any) => p.providerId === "acp-argon");
+  }
+
+  const argonBaseCfg = () => ({
+    hosts: [{ id: "host-primary", name: "Primary Server", status: "connected" as const }],
+    primaryHostId: "host-primary",
+    sources: [] as { pluginId: string; displayName?: string }[],
+    inventories: {},
+    providers: [{ id: "acp-argon", displayName: "Gemini (Argon)", logoUrl: null }],
+  });
+
+  it("PLUG-290: Argon accounts render daily/weekly windows, tier and data age", async () => {
+    writeArgonUsageFile({
+      accounts: {
+        work: {
+          daily: { percent: 25, resetEpochSec: Math.floor((currentTime + 3_600_000) / 1000) },
+          weekly: { percent: 60, resetEpochSec: Math.floor((currentTime + 86_400_000) / 1000) },
+          tier: "ultra",
+          updatedAt: currentTime - 5 * 60_000,
+          stale: false,
+        },
+        home: {
+          daily: null,
+          weekly: { percent: 90, resetEpochSec: Math.floor((currentTime + 86_400_000) / 1000) },
+          tier: "pro",
+          updatedAt: currentTime - 60_000,
+          stale: false,
+        },
+      },
+    });
+
+    const h = setupHarness(argonBaseCfg());
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    const snapshot = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60_000,
+    });
+
+    const cards = argonCards(snapshot);
+    expect(cards).toHaveLength(2);
+
+    const work = cards.find((c: any) => c.accountLabel === "work");
+    expect(work.displayName).toBe("Gemini Web (Argon)");
+    expect(work.usage.status).toBe("ok");
+    expect(work.usage.planLabel).toBe("Ultra");
+    expect(work.usage.accountEmail).toBe("Обновлено 5 мин назад");
+    expect(work.warning).toBeNull();
+    expect(work.usage.windows.map((w: any) => w.label)).toEqual(["Gemini 5h", "Gemini Weekly"]);
+    expect(work.usage.windows[0].usedPercent).toBe(25);
+    expect(work.usage.windows[0].resetsAt).toBe(new Date(currentTime + 3_600_000).toISOString());
+    expect(work.usage.windows[1].usedPercent).toBe(60);
+
+    const home = cards.find((c: any) => c.accountLabel === "home");
+    expect(home.usage.planLabel).toBe("Pro");
+    expect(home.usage.windows.map((w: any) => w.label)).toEqual(["Gemini Weekly"]);
+    expect(home.warning).toBeNull();
+  });
+
+  it("PLUG-290: section stays hidden without the file or on a broken file", async () => {
+    const h = setupHarness(argonBaseCfg());
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    let snapshot = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60_000,
+    });
+    expect(argonCards(snapshot)).toHaveLength(0);
+
+    writeArgonUsageFile("{ broken json");
+    snapshot = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+    expect(argonCards(snapshot)).toHaveLength(0);
+    expect(snapshot.machines[0].error).toBeNull();
+  });
+
+  it("PLUG-290: data older than 30 minutes is marked stale", async () => {
+    writeArgonUsageFile({
+      accounts: {
+        stale1: {
+          daily: { percent: 10, resetEpochSec: Math.floor((currentTime + 3_600_000) / 1000) },
+          weekly: null,
+          tier: "pro",
+          updatedAt: currentTime - 45 * 60_000,
+          stale: false,
+        },
+      },
+    });
+
+    const h = setupHarness(argonBaseCfg());
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    const snapshot = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60_000,
+    });
+
+    const cards = argonCards(snapshot);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].warning).toBe("Данные устарели — обновлено 45 мин назад");
+    expect(cards[0].usage.accountEmail).toBeNull();
+    expect(cards[0].usage.windows.map((w: any) => w.label)).toEqual(["Gemini 5h"]);
+  });
+
+  it("PLUG-290: providerId=acp-argon request returns the section alone", async () => {
+    writeArgonUsageFile({
+      accounts: {
+        work: {
+          daily: { percent: 25, resetEpochSec: Math.floor((currentTime + 3_600_000) / 1000) },
+          weekly: null,
+          tier: "ultra",
+          updatedAt: currentTime - 60_000,
+          stale: false,
+        },
+      },
+    });
+
+    const h = setupHarness(argonBaseCfg());
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    const snapshot = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "acp-argon", maxAgeMs: 60_000,
+    });
+    expect(argonCards(snapshot)).toHaveLength(1);
   });
 });

@@ -7,6 +7,12 @@ import {
   selectAccountResources
 } from "../usage-policy.js";
 import { createAntigravityAcpUsage } from "../antigravity-acp-usage.js";
+import {
+  ARGON_PROVIDER_ID,
+  argonTierLabel,
+  createArgonUsage,
+  formatArgonAge
+} from "../argon-usage.js";
 const require = __createRequire(import.meta.url);
 const __bbUserHome = require("node:os").homedir();
 const __bbToolPath = [`${__bbUserHome}/.local/bin`, `${__bbUserHome}/.npm-global/bin`, "/usr/local/bin", "/usr/bin", "/bin"].join(":");
@@ -15331,6 +15337,9 @@ function providerUsagePlugin(bb, options = {}) {
   const nativeAntigravity = createAntigravityAcpUsage({
     userHome: getUserHome, fetch: customFetch, now: getNow
   });
+  const argonUsage = createArgonUsage({
+    userHome: getUserHome, now: getNow, stateDir: options.argonStateDir
+  });
   const runExecFileSync = (file, args, opts) => {
     if (typeof options.execFile === "function") {
       return options.execFile(file, args, opts);
@@ -16178,6 +16187,18 @@ function providerUsagePlugin(bb, options = {}) {
       agyAccounts = getCachedAgyAccounts();
     }
 
+    // Argon quotas live in a local file written by provider-argon; reading it
+    // is cheap, so every request re-reads. A missing/broken file hides the
+    // section without an error.
+    let argonAccounts = [];
+    if (request.providerId === null || request.providerId === ARGON_PROVIDER_ID) {
+      try {
+        argonAccounts = argonUsage.readAccounts();
+      } catch {
+        argonAccounts = [];
+      }
+    }
+
     const machines = hosts.map((host) => ({
       id: host.id,
       displayName: host.name,
@@ -16346,15 +16367,70 @@ function providerUsagePlugin(bb, options = {}) {
           warning: nativeAcpUsage.warning
         });
       }
+      if (machine.id === primaryHostId) {
+        const argonMeta = providers.find((p) => p.id === ARGON_PROVIDER_ID);
+        for (const acc of argonAccounts) {
+          // The file's `daily` metric is Gemini Web's 5-hour sliding window
+          // (provider-argon spec §4.4), so it carries the 5h label.
+          const windows = [];
+          if (acc.daily) {
+            windows.push({
+              label: "Gemini 5h",
+              usedPercent: acc.daily.percent,
+              resetsAt: acc.daily.resetEpochSec !== null
+                ? new Date(acc.daily.resetEpochSec * 1000).toISOString()
+                : null,
+              cost: null
+            });
+          }
+          if (acc.weekly) {
+            windows.push({
+              label: "Gemini Weekly",
+              usedPercent: acc.weekly.percent,
+              resetsAt: acc.weekly.resetEpochSec !== null
+                ? new Date(acc.weekly.resetEpochSec * 1000).toISOString()
+                : null,
+              cost: null
+            });
+          }
+          const ageText = acc.ageMs !== null ? formatArgonAge(acc.ageMs) : null;
+          machine.providers.push({
+            id: "acp-argon:" + acc.id,
+            providerId: ARGON_PROVIDER_ID,
+            displayName: "Gemini Web (Argon)",
+            accountLabel: acc.id,
+            logoUrl: argonMeta?.logoUrl ?? null,
+            icon: argonMeta?.icon ?? { glyph: "Sparkles" },
+            strings: { iconTint: normalizedTint(argonMeta?.strings?.iconTint) },
+            signInHint: "Add a Gemini Web account to the Argon pool, then reload usage.",
+            expiredHint: "The Gemini Web session expired. Sign in again via the Argon provider.",
+            usage: {
+              status: "ok",
+              // The subtitle line is the only always-visible place for the
+              // data age; on stale entries it moves into the warning instead.
+              accountEmail: acc.stale || ageText === null ? null : `Обновлено ${ageText}`,
+              planLabel: argonTierLabel(acc.tier),
+              windows
+            },
+            warning: acc.stale
+              ? ageText !== null
+                ? `Данные устарели — обновлено ${ageText}`
+                : "Данные устарели"
+              : null
+          });
+        }
+      }
       machine.providers = machine.providers.filter((p) =>
-        !p.providerId.startsWith("acp-") || p.providerId === "acp-antigravity");
+        !p.providerId.startsWith("acp-") || p.providerId === "acp-antigravity" ||
+        p.providerId === ARGON_PROVIDER_ID);
     }
 
     const providerOrder = new Map([
       ["codex", 0],
       ["claude-code", 1],
       ["agy", 2],
-      ["acp-antigravity", 3]
+      ["acp-antigravity", 3],
+      ["acp-argon", 4]
     ]);
     for (const machine of machines) {
       machine.providers.sort(
