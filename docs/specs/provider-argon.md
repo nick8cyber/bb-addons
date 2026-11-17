@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-17
-revision: 9
+revision: 10
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
@@ -86,6 +86,11 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   - драйвер перед выходом из `sendPrompt` кликает по кнопке остановки генерации в веб-интерфейсе Gemini (`button[aria-label*="Stop" i], button[aria-label*="Остановить" i]`), чтобы браузерная вкладка немедленно прекратила генерацию;
   - `session/prompt` завершается со `{ stopReason: "cancelled" }` без пометки аккаунта кулдауном.
 - При закрытии `stdin` (`rl.on("close")`), а также по сигналам `SIGTERM` и `SIGINT`, `acp-server.mjs` прерывает активный ход (`activePrompt?.abort.abort()`), ожидает завершения вызова драйвера (срабатывание Stop и парковка вкладки на `about:blank`) с таймаутом до 10–15 с, дожидается `releaseLease(activeBackendId)` и только затем завершает процесс. Это гарантирует отсутствие осиротевших аренд и остановку генерации в браузере.
+- **Жизненный цикл процесса и сторожа**:
+  - Журнал этапов: `slog(stage, extra)` дописывает строки вида `<ISO-ts> pid=<pid> <stage> <json>` в `acp-server.log` в `ARGON_STATE_DIR` — по нему видна точная стадия зависшего или тихого хода (постановка в очередь, аренда, вызов драйвера, стриминг, ошибки).
+  - Реапер сирот (только Linux): `reapOrphanAcpServers()` вызывается при старте сервера (`startServer`), сканирует `/proc` и шлёт `SIGTERM` другим процессам `acp-server.mjs` с `ppid == 1` (перерождённым на init), чтобы старые копии не держали профили Chrome и аренды.
+  - Сторож родителя: таймер каждые 5 с сравнивает `process.ppid` с захваченным при старте `ownerPpid`; при смене родителя или `ppid === 1` (reparenting на init — родительский мост BB умер) пишет `process:reparented-exit` и вызывает `cleanShutdown()`. Таймер `unref`-нут и сам по себе процесс не держит.
+  - Выход по смене кода: в том же 5-секундном цикле, когда нет активного хода (`!activePromptSessionId`), `checkStaleCode()` сравнивает `mtime` файла `acp-server.mjs` с зафиксированным при старте; обновление файла (новая версия плагина) → `server:stale-code-exit` и `cleanShutdown()` — процесс не продолжает работать на устаревшем коде и перезапускается мостом на следующем ходе.
 
 ### 2.3 Дедлайны и переменные окружения генерации
 
@@ -249,7 +254,7 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 
 Автоматический логин на холодном профиле регулярно отбивается антиботом Google (`signin/rejected`, «This browser or app may not be secure»). Рабочая процедура — ручной вход владельца:
 
-1. `scripts/pool-add.mjs <label> <cdp-port> <email>` с принудительным `GEMINI_CHROME_BIN` = playwright-хром. **Snap-chromium запрещён**: он игнорирует `--user-data-dir` и пишет в общий системный профиль → перекрёстное заражение сессиями аккаунтов.
+1. `scripts/pool-add.mjs <label> <cdp-port> [priority] [email] [tier]` — позиционные аргументы строго в этом порядке: `<label>` (id в пуле и профиля Chrome `~/.config/google-chrome-<label>`), `<cdp-port>`, `[priority]` (по умолчанию `10`; для `tier=ultra` без явного priority — `1`), `[email]` (без него в `pool.json` пишется заглушка `<label>@example.com`), `[tier]` — `pro` (по умолчанию) или `ultra`. С принудительным `GEMINI_CHROME_BIN` = playwright-хром. **Snap-chromium запрещён**: он игнорирует `--user-data-dir` и пишет в общий системный профиль → перекрёстное заражение сессиями аккаунтов.
 2. Headed Chrome под Xvfb на выделенный CDP-порт (`--ozone-platform=x11 --no-sandbox --disable-blink-features=AutomationControlled --user-data-dir=~/.config/google-chrome-<label>`).
 3. Web-VNC мост (CDP-screencast → HTTP-polling кадров, клики через playwright mouse API, ввод текста — поле ввода + `insertText`), наружу через `bb connect expose`. Владелец проходит вход и любые верификации сам.
 
