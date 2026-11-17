@@ -17,6 +17,7 @@ import {
   DOWNLOAD_EXTENSIONS,
   baseName,
   fileContentToBlob,
+  formatBytes,
   readSourceFile,
 } from "./src/resolve";
 
@@ -31,7 +32,10 @@ export default definePluginApp((_app) => {
     const sdk = useSdk();
     const [state, setState] = useState<DownloadState>({ status: "idle" });
     const [objectUrl, setObjectUrl] = useState<string | null>(null);
+    const [sizeBytes, setSizeBytes] = useState<number | null>(null);
     const blobRef = useRef<Blob | null>(null);
+    const abortRef = useRef<AbortController | null>(null);
+    const busyRef = useRef(false);
     const fileName = baseName(path);
     const isPdf = /\.pdf$/i.test(fileName);
     const pdfPreview =
@@ -46,12 +50,17 @@ export default definePluginApp((_app) => {
       [objectUrl],
     );
 
+    // Отмена чтений при размонтировании вкладки превью.
+    useEffect(() => () => abortRef.current?.abort(), []);
+
     // Чтение файла → Blob (кэшируется: один проход и для превью, и для «Скачать»).
     const ensureBlob = useCallback(async (): Promise<Blob> => {
       if (blobRef.current) return blobRef.current;
-      const file = await readSourceFile(sdk, path, source);
+      abortRef.current ??= new AbortController();
+      const file = await readSourceFile(sdk, path, source, abortRef.current.signal);
       const blob = fileContentToBlob(file);
       blobRef.current = blob;
+      setSizeBytes(file.sizeBytes ?? null);
       setObjectUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return URL.createObjectURL(blob);
@@ -60,6 +69,8 @@ export default definePluginApp((_app) => {
     }, [sdk, path, source]);
 
     const download = useCallback(async () => {
+      if (busyRef.current) return;
+      busyRef.current = true;
       setState({ status: "loading" });
       try {
         const blob = await ensureBlob();
@@ -74,6 +85,8 @@ export default definePluginApp((_app) => {
           status: "failed",
           message: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        busyRef.current = false;
       }
     }, [ensureBlob, fileName]);
 
@@ -96,18 +109,20 @@ export default definePluginApp((_app) => {
       <div className="flex h-full min-h-0 flex-col">
         <div className="flex shrink-0 items-center gap-2 border-b border-border bg-card px-3 py-1.5 text-xs text-muted-foreground">
           <a
-            href={objectUrl ?? "about:blank"}
+            href={objectUrl ?? undefined}
             download={fileName}
+            aria-disabled={state.status === "loading"}
             onClick={(event) => {
               event.preventDefault();
               void download();
             }}
-            className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-0.5 font-medium text-foreground hover:bg-state-hover"
+            className={`inline-flex items-center gap-1 rounded-md border border-border px-2 py-0.5 font-medium text-foreground hover:bg-state-hover${state.status === "loading" ? " pointer-events-none opacity-50" : ""}`}
           >
             Скачать
           </a>
           <span className="truncate" title={path}>
             {fileName}
+            {sizeBytes != null && ` · ${formatBytes(sizeBytes)}`}
           </span>
           <span className="ml-auto shrink-0">
             {state.status === "loading" && "Скачивание…"}

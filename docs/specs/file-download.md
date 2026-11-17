@@ -42,12 +42,14 @@ tags: [bb, plugins, files, download, pwa]
 
 Расширения исходного кода (`ts, py, go, …`) не покрываются: их открывают ради просмотра/редактирования, лишняя загрузка при каждом открытии — мусор. Для непокрытого файла путь — «Open with → Download» недоступен (слот фильтрует по расширению); расширение списка — правкой кода.
 
+**Пересечение `md` с `md-editor`.** Оба плагина регистрируют `md` на слоте `fileOpener`; дефолт решает порядок слотов платформы, второй остаётся в «Open with». Решение (аудит 17.11): `md` остаётся у `file-download` — типовой сценарий «агент отдал файл» выигрывает предпросмотр с кнопкой «Скачать», а Markdown PRO доступен через «Open with → Markdown PRO». Пин открывателя по расширению — клиент-локальная настройка (`bb.fileOpenerByExtension`), централизованно не выставляется; владелец может переключить дефолт в Settings → Files на конкретном клиенте.
+
 ### 2.3. Разрешение байтов по `source.kind`
 
 | `source.kind` | Вызов SDK |
 |---|---|
 | `workspace` | `sdk.projects.fileContent({ projectId, environmentId?, hostId?, path })` — `path` относительно worktree. Если `source.projectId` пуст (непроектный воркспейс) — `sdk.environments.get(environmentId)` добирает `projectId`; у среды без проекта — `files.read` по `env.path + path` |
-| `host` | `sdk.files.read({ hostId?, path })` — `path` абсолютный на хосте треда |
+| `host` | `sdk.files.read({ hostId?, path })` — `path` абсолютный на хосте треда. `hostId`: сначала `source.experimental_hostId`; если пуст и есть `source.threadId` — `threads.get → environmentId → environments.get → hostId` (файл треда на удалённой ноде не должен читаться с primary host); если и тогда пуст — понятная ошибка. Без `threadId` — дефолт SDK (primary host) |
 | `thread-storage` | `sdk.threads.storageLocation({ threadId })` → `{ hostId, storageRootPath }`, затем `sdk.files.read({ hostId, path: storageRootPath + "/" + path })` |
 
 Все ответы дают `{ content, contentEncoding: "base64"|"utf8", mimeType?, sizeBytes }`. Из них собирается `Blob` (`base64` → бинарные байты, `utf8` → текст, `type = mimeType || "application/octet-stream"`) и передаётся в `app.experimental_saveFile({ fileName, blob })` — собственный download-путь bb: в браузере и Desktop — обычная загрузка, в iOS-приложении — share sheet. `fileName` — basename пути.
@@ -58,16 +60,18 @@ tags: [bb, plugins, files, download, pwa]
 - `experimental_saveFile` вернул `failed` — bb сам показывает тост; плашка дополнительно помечается.
 - Предпросмотр git-ref-снапшотов слотом не подменяется (ограничение платформы) — там Download не появляется.
 - Файлы на удалённых хостах читаются через тот же `files.read` с `hostId` — требуется онлайн-демон хоста.
+- **Лимит размера — 100 МБ.** Файл целиком гоняется через `base64 → Uint8Array → Blob` в память вкладки; stat-API в SDK нет, поэтому размер проверяется пост-чтением по `sizeBytes` до сборки Blob — гигантский файл отклоняется с понятным текстом в плашке и не удваивает расход памяти ещё одним Blob.
+- Повторный клик во время загрузки не запускает параллельное чтение (`busy`-гейт); размонтирование вкладки отменяет чтение через `AbortController`.
 
 ## 3. Устройство
 
-- `app.tsx` — `definePluginApp`, регистрация `app.slots.fileOpener({ id: "download", title: "Download", extensions, component })` и сам компонент: плашка (имя, размер, состояние, кнопка-якорь с `href=blob-URL` + `download`) над `<Original/>`.
-- `src/resolve.ts` — чистые функции: разрешение `{content, contentEncoding, mimeType}` по `source`, сборка `Blob`, basename. Тестируются моком sdk.
+- `app.tsx` — `definePluginApp`, регистрация `app.slots.fileOpener({ id: "download", title: "Download", extensions, component })` и сам компонент: плашка (имя, размер `sizeBytes`, состояние, кнопка-якорь с `href=blob-URL` + `download`, disabled на время загрузки) над `<Original/>`.
+- `src/resolve.ts` — чистые функции: разрешение `{content, contentEncoding, mimeType, sizeBytes}` по `source`, сборка `Blob`, basename, `joinPath` с вычисткой `..`-сегментов, гейт `MAX_DOWNLOAD_BYTES`. Тестируются моком sdk.
 - Настроек плагина нет. HTTP-роутов нет — байты не покидают авторизованную сессию, произвольные пути хоста недостижимы извне.
 
 ## 4. Проверка
 
-- [x] Юнит-тесты `src/resolve.ts`: три `source.kind`, base64/utf8 → Blob, basename, ошибки разрешения — 13/13.
+- [x] Юнит-тесты `src/resolve.ts`: три `source.kind` + резолв hostId треда, base64/utf8 → Blob, basename, `joinPath` без `..`, гейт размера, `formatBytes`, ошибки разрешения — 23/23.
 - [x] `tsc --noEmit`, `bb plugin build` на SDK 0.6.132.
 - [x] Плагин в реестре сервера (`running`) на обоих инстансах; байтовый путь `bb file read` подтверждён.
 - [ ] Живой клик в UI (headless-браузер на хосте не стартует — первую загрузку подтверждает владелец).

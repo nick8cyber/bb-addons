@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PluginBrowserBbSdk } from "@get-bb/plugin-sdk/app";
 import {
+  MAX_DOWNLOAD_BYTES,
+  assertSizeWithinLimit,
   base64ToBytes,
   baseName,
   fileContentToBlob,
+  formatBytes,
   joinPath,
   readSourceFile,
 } from "../src/resolve";
@@ -21,11 +24,15 @@ function mockSdk(over: {
   read?: ReturnType<typeof vi.fn>;
   storageLocation?: ReturnType<typeof vi.fn>;
   envGet?: ReturnType<typeof vi.fn>;
+  threadGet?: ReturnType<typeof vi.fn>;
 }): PluginBrowserBbSdk {
   return {
     projects: { fileContent: over.fileContent ?? vi.fn() },
     files: { read: over.read ?? vi.fn() },
-    threads: { storageLocation: over.storageLocation ?? vi.fn() },
+    threads: {
+      storageLocation: over.storageLocation ?? vi.fn(),
+      get: over.threadGet ?? vi.fn(),
+    },
     environments: { get: over.envGet ?? vi.fn() },
   } as unknown as PluginBrowserBbSdk;
 }
@@ -48,6 +55,36 @@ describe("joinPath", () => {
     expect(joinPath("/root/store", "a/b.txt")).toBe("/root/store/a/b.txt");
     expect(joinPath("/root/store/", "/a/b.txt")).toBe("/root/store/a/b.txt");
     expect(joinPath("/", "x")).toBe("/x");
+  });
+  it("вычищает . и .. — выход за корень невозможен", () => {
+    expect(joinPath("/root/store", "../etc/passwd")).toBe("/root/store/etc/passwd");
+    expect(joinPath("/root/store", "a/../../b.txt")).toBe("/root/store/a/b.txt");
+    expect(joinPath("/root/store", "./x/./y.md")).toBe("/root/store/x/y.md");
+  });
+});
+
+describe("formatBytes", () => {
+  it("подбирает единицу по размеру", () => {
+    expect(formatBytes(512)).toBe("512 Б");
+    expect(formatBytes(2048)).toBe("2.0 КБ");
+    expect(formatBytes(1.5 * 1024 * 1024)).toBe("1.5 МБ");
+    expect(formatBytes(2 * 1024 * 1024 * 1024)).toBe("2.0 ГБ");
+  });
+});
+
+describe("assertSizeWithinLimit", () => {
+  it("пропускает файлы в лимите и без sizeBytes", () => {
+    const file = { content: "x", contentEncoding: "utf8" as const, sizeBytes: 10 };
+    expect(assertSizeWithinLimit(file)).toBe(file);
+    expect(assertSizeWithinLimit({ content: "x", contentEncoding: "utf8" })).toBeTruthy();
+  });
+  it("бросает на файлах больше лимита", () => {
+    expect(() =>
+      assertSizeWithinLimit({ content: "", contentEncoding: "base64", sizeBytes: MAX_DOWNLOAD_BYTES + 1 }),
+    ).toThrow("слишком большой");
+    expect(() =>
+      assertSizeWithinLimit({ content: "", contentEncoding: "base64", sizeBytes: MAX_DOWNLOAD_BYTES }),
+    ).not.toThrow();
   });
 });
 
@@ -134,6 +171,42 @@ describe("readSourceFile", () => {
       source({ kind: "host", experimental_hostId: "h2" }),
     );
     expect(read).toHaveBeenCalledWith({ hostId: "h2", path: "/tmp/out.pdf", signal: undefined });
+  });
+  it("host: без hostId и threadId — primary host", async () => {
+    const read = vi.fn().mockResolvedValue({ content: "x", contentEncoding: "utf8" });
+    await readSourceFile(mockSdk({ read }), "/tmp/out.pdf", source({ kind: "host" }));
+    expect(read).toHaveBeenCalledWith({ hostId: undefined, path: "/tmp/out.pdf", signal: undefined });
+  });
+  it("host: без hostId резолвит хост треда через environment", async () => {
+    const read = vi.fn().mockResolvedValue({ content: "x", contentEncoding: "utf8" });
+    const threadGet = vi.fn().mockResolvedValue({ environmentId: "e7" });
+    const envGet = vi.fn().mockResolvedValue({ hostId: "h-remote" });
+    await readSourceFile(
+      mockSdk({ read, threadGet, envGet }),
+      "/tmp/out.pdf",
+      source({ kind: "host", threadId: "t9" }),
+    );
+    expect(threadGet).toHaveBeenCalledWith({ threadId: "t9", signal: undefined });
+    expect(envGet).toHaveBeenCalledWith({ environmentId: "e7", signal: undefined });
+    expect(read).toHaveBeenCalledWith({ hostId: "h-remote", path: "/tmp/out.pdf", signal: undefined });
+  });
+  it("host: хост треда не разрешился — понятная ошибка, чужой файл не читаем", async () => {
+    const read = vi.fn();
+    const threadGet = vi.fn().mockResolvedValue({ environmentId: null });
+    await expect(
+      readSourceFile(mockSdk({ read, threadGet }), "/tmp/out.pdf", source({ kind: "host", threadId: "t9" })),
+    ).rejects.toThrow("hostId");
+    expect(read).not.toHaveBeenCalled();
+  });
+  it("host: файл сверх лимита — ошибка до чтения байтов в Blob", async () => {
+    const read = vi.fn().mockResolvedValue({
+      content: "",
+      contentEncoding: "base64",
+      sizeBytes: MAX_DOWNLOAD_BYTES + 1,
+    });
+    await expect(
+      readSourceFile(mockSdk({ read }), "/big.zip", source({ kind: "host", experimental_hostId: "h2" })),
+    ).rejects.toThrow("слишком большой");
   });
   it("thread-storage: storageLocation → files.read по root+path", async () => {
     const storageLocation = vi.fn().mockResolvedValue({ hostId: "h1", storageRootPath: "/home/u/.bb/thread-storage/t1" });
