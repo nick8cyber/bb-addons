@@ -2018,8 +2018,8 @@ function stagedUiFileList(row: StagedFeatureRow): string {
  * без такого диффа — имя плагина из собственной staged-записи задачи,
  * иначе имя пакета/каталога репозитория. Запись мешает выкладке, когда
  * её `result_sha` — не предок ни HEAD, ни `origin/<target>`
- * (`merge-base --is-ancestor` ≠ 0), и у задачи нет опубликованного
- * релиза. Сама выкладываемая задача не считается.
+ * (`merge-base --is-ancestor` ≠ 0) и не покрыт опубликованным релизом
+ * задачи. Сама выкладываемая задача не считается.
  */
 async function unmergedUiFeatures(
   deps: ReleaseDeps,
@@ -2068,9 +2068,15 @@ async function unmergedUiFeatures(
     )) {
       if (row.ui_touched !== 1 || row.task_key === self) continue;
       if (seen.has(row.task_key)) continue;
-      // r11.5: задача уже опубликована — её коммит на целевой ветке или
-      // в открытом PR, выкладка её работу не сбрасывает.
-      if (deps.store.lastPublishedSha(row.task_key) != null) continue;
+      // r11.5: пропуск только когда `result_sha` покрыт опубликованным
+      // релизом — задача, опубликованная ранее и доработанная новым
+      // заходом (новый sha старый релиз не содержит), сторожится снова.
+      const publishedSha = deps.store.lastPublishedSha(row.task_key);
+      if (
+        publishedSha &&
+        (await isAncestor(deps, repo, row.result_sha, publishedSha))
+      )
+        continue;
       if (await isAncestor(deps, repo, row.result_sha, "HEAD")) continue;
       // r11.5: коммит уже в `origin/<target>` — синк шага 2 подтянет
       // его в выкладываемую ветку, сброса интерфейса не будет.
@@ -2583,17 +2589,19 @@ async function runReleaseSteps(
     // нет незамерженных задач `in_review` с `ui_touched = 1`, чьи
     // коммиты отсутствуют в выкладываемой ветке — иначе публикация
     // производит скрытый откат их интерфейса. `--force-drop-unmerged
-    // <причина>` снимает блокировку: причина в запись выкладки, строки
-    // фич — в `dropped`.
+    // <причина>` снимает блокировку: причина в запись выкладки, а строки
+    // фич — в `dropped` только после успешной публикации
+    // (finishPublished): падение выкладки до неё оставляет их
+    // `in_review`, и гейт сторожит их дальше.
     const unmerged = await unmergedUiFeatures(deps, repo, project, taskKey);
     if (unmerged.length) {
       if (input.forceDropUnmerged) {
         deps.store.updateRelease(release.id, {
           droppedUnmergedReason: input.forceDropUnmerged,
         });
-        deps.store.markStagedFeaturesDropped(
-          unmerged.map((r) => r.task_key),
-          input.forceDropUnmerged,
+        deps.store.metaSet(
+          DROP_UNMERGED_META(release.id),
+          JSON.stringify(unmerged.map((r) => r.task_key)),
         );
       } else {
         throw new OrchestratorError(
@@ -4321,6 +4329,24 @@ async function finishPublished(
   // она перестаёт сторожить гейт unmerged-ui. Вызывается из всех путей
   // publishRelease и из досмотра уже опубликованных строк; идемпотентно.
   deps.store.markStagedFeatureMerged(fresh.task_key);
+  // §2 шаг 0.1 (r11.5): `--force-drop-unmerged` — сброшенные записи
+  // уходят в `dropped` только после успешной публикации. Ключи лежат в
+  // мете релиза с шага 0.1; идемпотентно (мета снимается сразу).
+  const dropMeta = deps.store.metaGet(DROP_UNMERGED_META(fresh.id));
+  if (dropMeta) {
+    deps.store.metaDelete(DROP_UNMERGED_META(fresh.id));
+    try {
+      const keys = JSON.parse(dropMeta) as unknown;
+      if (Array.isArray(keys)) {
+        deps.store.markStagedFeaturesDropped(
+          keys.filter((k): k is string => typeof k === "string"),
+          fresh.dropped_unmerged_reason ?? "",
+        );
+      }
+    } catch {
+      // битый JSON мети — причина и задачи видны в записи выкладки
+    }
+  }
   const headSha = fresh.published_sha ?? fresh.head_sha ?? "";
   const pushedBranch =
     fresh.target_action === "push"
@@ -4455,6 +4481,9 @@ interface PostPublishResult {
 }
 
 const POSTPUBLISH_META = (id: number) => `release-pp:${id}`;
+/** §2 шаг 0.1 (r11.5): task_keys сброшенных `--force-drop-unmerged`
+ * фич — переводятся в `dropped` в finishPublished после публикации. */
+const DROP_UNMERGED_META = (id: number) => `release-drop-unmerged:${id}`;
 
 /** §6 r11: замок копии держится весь postPublish — в том числе пока
  * журнальные команды ждут/работают (карта по release id, переживает

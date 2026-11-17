@@ -7618,10 +7618,12 @@ test("§24.2/r11.4: коммит фичи влит в выкладываемую
   assert.equal(res.status, "auditing");
 });
 
-test("§24.2/r11.4: --force-drop-unmerged — проходит, фича в dropped с причиной", async () => {
+test("§24.2/r11.4: --force-drop-unmerged — проходит, фича в dropped после публикации", async () => {
   const { repo } = makeRepo();
   const shaA = sideCommit(repo);
-  const { deps, store } = makeDeps(repo);
+  const { deps, store } = makeDeps(repo, {
+    auditVerdict: '{"verdict":"APPROVE","findings":[]}',
+  });
   const pktDir = mkdtempSync(join(tmpdir(), "pkt-drop-"));
   deps.packetDir = () => pktDir;
   stageA(store, repo, { sha: shaA });
@@ -7634,9 +7636,9 @@ test("§24.2/r11.4: --force-drop-unmerged — проходит, фича в drop
     deps,
   );
   assert.equal(res.status, "auditing");
-  const a = store.stagedFeature("PLUG-A")!;
-  assert.equal(a.status, "dropped");
-  assert.equal(a.dropped_reason, "задача A заброшена");
+  // r11.5: `dropped` фиксируется только после успешной публикации —
+  // на шаге 0.1 запись ещё `in_review` и сторожит гейт.
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
   const rel = store.getRelease(res.releaseId)!;
   assert.equal(rel.dropped_unmerged_reason, "задача A заброшена");
   // r11.4: обход гейта виден аудитору — причина и сброшенная задача
@@ -7648,6 +7650,17 @@ test("§24.2/r11.4: --force-drop-unmerged — проходит, фича в drop
   assert.ok(packet.includes("--force-drop-unmerged: задача A заброшена"));
   assert.ok(packet.includes("PLUG-A"));
   assert.ok(packet.includes("app.tsx"));
+  // Публикация — запись уходит в `dropped` с сохранённой причиной.
+  const audit = store.latestDelegationByTaskAndLevel(
+    "PLUG-1",
+    "release-audit",
+  )!;
+  store.setStatus(audit.id, "done");
+  const s = await pumpReleases(deps);
+  assert.equal(s.published, 1);
+  const a = store.stagedFeature("PLUG-A")!;
+  assert.equal(a.status, "dropped");
+  assert.equal(a.dropped_reason, "задача A заброшена");
 });
 
 test("§24.2/r11.5: коммит фичи в origin/<target>, ветка от старой базы — проходит", async () => {
@@ -7667,7 +7680,7 @@ test("§24.2/r11.5: коммит фичи в origin/<target>, ветка от с
   assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
 });
 
-test("§24.2/r11.5: у задачи опубликованный релиз — гейт пропускает", async () => {
+test("§24.2/r11.5: опубликованный релиз покрывает result_sha — гейт пропускает", async () => {
   const { repo } = makeRepo();
   const shaA = sideCommit(repo); // ни HEAD, ни origin/main его не содержит
   const { deps, store } = makeDeps(repo);
@@ -7684,6 +7697,41 @@ test("§24.2/r11.5: у задачи опубликованный релиз — 
   store.updateRelease(relA.id, { status: "published", publishedSha: shaA });
   const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
   assert.equal(res.status, "auditing");
+  assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
+});
+
+test("§24.2/r11.5: опубликованный релиз НЕ покрывает result_sha — отказ unmerged-ui", async () => {
+  const { repo } = makeRepo();
+  const shaA = sideCommit(repo); // ни HEAD, ни origin/main его не содержит
+  const { deps, store } = makeDeps(repo);
+  stageA(store, repo, { sha: shaA });
+  // Задача A публиковалась ранее, но `published_sha` — коммит прошлого
+  // захода: новый `result_sha` он не содержит — фича снова сторожит гейт.
+  const relA = store.insertRelease({
+    taskKey: "PLUG-A",
+    projectId: "p",
+    coordinatorThreadId: "t",
+    repoPath: repo,
+    branch: "side-a",
+    targetAction: "push",
+    targetBranch: "main",
+  });
+  const oldSha = gitR(repo, ["rev-parse", "origin/main"]);
+  store.updateRelease(relA.id, {
+    status: "published",
+    publishedSha: oldSha,
+  });
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => {
+      const err = e as OrchestratorError;
+      return (
+        err.code === "release-refused" &&
+        err.message.includes("unmerged-ui") &&
+        err.message.includes("PLUG-A")
+      );
+    },
+  );
   assert.equal(store.stagedFeature("PLUG-A")!.status, "in_review");
 });
 

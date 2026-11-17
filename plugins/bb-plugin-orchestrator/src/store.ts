@@ -3333,7 +3333,7 @@ export class DelegationStore {
       .prepare(
         `UPDATE plugin_staged_features
          SET status = 'dropped', dropped_reason = ?, updated_at = ?
-         WHERE task_key IN (${marks})`,
+         WHERE task_key IN (${marks}) AND status = 'in_review'`,
       )
       .run(
         reason,
