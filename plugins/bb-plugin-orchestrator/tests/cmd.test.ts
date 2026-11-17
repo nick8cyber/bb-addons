@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import { createCmd } from "../src/cmd.js";
 
 function makeRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "cmd-"));
+  const dir = makeTempDir("cmd-");
   execFileSync("git", ["init", "-b", "main", dir]);
   execFileSync("git", ["-C", dir, "config", "user.name", "Agent"]);
   execFileSync("git", ["-C", dir, "config", "user.email", "agent@x.io"]);

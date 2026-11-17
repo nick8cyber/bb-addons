@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import Database from "better-sqlite3";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import {
@@ -1958,7 +1958,7 @@ const gitR = (repo: string, args: string[]) =>
 
 /** bare `origin` + a cloned working repo on `main` (§22.2 test env). */
 function makeClone() {
-  const base = mkdtempSync(join(tmpdir(), "d22-"));
+  const base = makeTempDir("d22-");
   const origin = join(base, "origin.git");
   const seed = join(base, "seed");
   execFileSync("git", ["init", "--bare", origin]);

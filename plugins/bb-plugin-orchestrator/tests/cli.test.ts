@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { makeTempDir } from "./helpers/temp.js";
 import {
   createFakePluginHost,
   makePluginAgentConfigurationContext,
@@ -95,7 +94,7 @@ async function hostWith(
     // `<dataDir>/plugins/orchestrator/git-hooks`, so another run's
     // leftover (or a parallel process's mid-write) hooks make the release
     // test fail before `tasks show` is ever called.
-    dataDir: mkdtempSync(join(tmpdir(), "orch-cli-")),
+    dataDir: makeTempDir("orch-cli-"),
     settings: { policy: POLICY_TEXT, language: "ru", ...settings },
     agentSkillIds: [
         "orchestrator-setup",

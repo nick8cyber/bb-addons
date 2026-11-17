@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cpSync, existsSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { makeTempDir } from "./helpers/temp.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import Database from "better-sqlite3";
@@ -438,7 +439,7 @@ function gitR(repo: string, args: string[]): string {
 }
 
 function makeRepo(): { repo: string; remote: string; seed: string } {
-  const base = mkdtempSync(join(tmpdir(), "rel-"));
+  const base = makeTempDir("rel-");
   const remote = join(base, "remote.git");
   const repo = join(base, "wt");
   execFileSync("git", ["init", "--bare", remote]);
@@ -704,7 +705,7 @@ function makeDeps(repo: string, overrides: Partial<{
         ? { output: overrides.reviewThreadOutput ?? null }
         : { output: null },
   };
-  const tmp = mkdtempSync(join(tmpdir(), "hooks-"));
+  const tmp = makeTempDir("hooks-");
   const deps = {
     store, bbCli, threads: threads as never,
     cmd: { run: async (file: string, args: string[], o?: { cwd?: string; stdin?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }) => {
@@ -773,7 +774,7 @@ function makeDeps(repo: string, overrides: Partial<{
         id === "thr_coord" ? "orchestrator" : undefined,
     },
     hooksDir: () => tmp,
-    packetDir: () => mkdtempSync(join(tmpdir(), "pkt-")),
+    packetDir: () => makeTempDir("pkt-"),
     localHostId: async () => overrides.localHostId ?? "host_test",
     enqueue: <T>(f: () => Promise<T>) => f(),
     t: undefined as T | undefined,
@@ -909,7 +910,7 @@ test("release r7: настройка — по проекту репозитор�
   const { repo } = makeRepo();
   // The executor copy is a linked worktree of the repo nested inside a
   // parent project's directory — the spec's own scenario.
-  const wt = join(mkdtempSync(join(tmpdir(), "exec-")), "copy");
+  const wt = join(makeTempDir("exec-"), "copy");
   gitR(repo, ["worktree", "add", "-b", "exec-copy", wt, "HEAD"]);
   const { deps } = makeDeps(repo, {
     execPath: wt,
@@ -989,7 +990,7 @@ test("settingsProjectId r8: ошибка git → отказ, не проект �
 
 test("settingsProjectId: worktree → проект основного каталога репозитория", async () => {
   const { repo } = makeRepo();
-  const wt = join(mkdtempSync(join(tmpdir(), "exec-")), "copy");
+  const wt = join(makeTempDir("exec-"), "copy");
   gitR(repo, ["worktree", "add", "--detach", wt, "HEAD"]);
   const cmd: CmdRunner = {
     run: async (file, args, o) => {
@@ -1113,7 +1114,7 @@ test("pump: audit chain exhausted → failed + message", async () => {
 });
 
 test("push token file: branch+sha+expiry, one file per run (§16.6)", () => {
-  const dir = mkdtempSync(join(tmpdir(), "tok-"));
+  const dir = makeTempDir("tok-");
   const file = writePushToken(dir, "abc123", "main");
   const data = JSON.parse(readFileSync(file, "utf8"));
   assert.equal(data.sha, "abc123");
@@ -1285,7 +1286,7 @@ test("release step 1: auditor-level rows never count as executor work", async ()
 
 test("release: merged round publishes merged_into from coordinator copy", async () => {
   const { remote } = makeRepo();
-  const base = mkdtempSync(join(tmpdir(), "rel-coord-"));
+  const base = makeTempDir("rel-coord-");
   const coord = join(base, "coord");
   execFileSync("git", ["clone", "--branch", "main", remote, coord]);
   gitR(coord, ["config", "user.name", "Agent"]);
@@ -1423,7 +1424,7 @@ function makeMergedCoordinatorCopy(): {
   seed: string;
 } {
   const { remote, seed } = makeRepo();
-  const base = mkdtempSync(join(tmpdir(), "rel-coord-"));
+  const base = makeTempDir("rel-coord-");
   const coord = join(base, "coord");
   execFileSync("git", ["clone", "--branch", "main", remote, coord]);
   gitR(coord, ["config", "user.name", "Agent"]);
@@ -2029,7 +2030,7 @@ test("pump: threadIds=false — HEAD subject with a task key → release <sha7> 
 
 test("release (merged): sync=rebase never applies — merge keeps the resolution (PLUG-194)", async () => {
   const { remote, seed } = makeRepo();
-  const base = mkdtempSync(join(tmpdir(), "rel-coord-"));
+  const base = makeTempDir("rel-coord-");
   const coord = join(base, "coord");
   execFileSync("git", ["clone", "--branch", "main", remote, coord]);
   gitR(coord, ["config", "user.name", "Agent"]);
@@ -3441,10 +3442,10 @@ test("settingsProjectId r8: несколько кандидатов → прое
 });
 
 test("settingsProjectId r8: bare-копия — совпадение по origin с явной записью", async () => {
-  const base = mkdtempSync(join(tmpdir(), "rel-bare-"));
+  const base = makeTempDir("rel-bare-");
   const bare = join(base, "bare.git");
   execFileSync("git", ["init", "--bare", bare]);
-  const projDir = mkdtempSync(join(tmpdir(), "projdir-"));
+  const projDir = makeTempDir("projdir-");
   const cfg = parseReleaseConfig(
     JSON.stringify({
       defaults: { target: { action: "push", branch: "main" } },
@@ -3470,7 +3471,7 @@ test("settingsProjectId r8: bare-копия — совпадение по origin
 });
 
 test("settingsProjectId r8: совпадение по origin без явной записи и без пути → unknown", async () => {
-  const base = mkdtempSync(join(tmpdir(), "rel-bare-"));
+  const base = makeTempDir("rel-bare-");
   const bare = join(base, "bare.git");
   execFileSync("git", ["init", "--bare", bare]);
   const cfg = parseReleaseConfig(
@@ -4376,7 +4377,7 @@ const PR_CMD_CFG = (create: string, view: string, find?: string) =>
 
 test("§18.3 command: create (env+stdin) → слежение через view", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(
     dir,
     "pr-create",
@@ -4429,7 +4430,7 @@ echo "https://example.test/pr/9"`,
 
 test("§18.3 command: find → «PR обновлён» без create", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(
     dir,
     "pr-create",
@@ -4486,7 +4487,7 @@ test("§18.3 command: find → «PR обновлён» без create", async () 
 
 test("§18.3 command: find вернул чужой PR — release в него не пишет", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(dir, "pr-create", `echo "https://example.test/pr/9"`);
   const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
   // URL никогда не был записан выкладкой этой задачи этим координатором
@@ -4507,7 +4508,7 @@ test("§18.3 command: find вернул чужой PR — release в него н
 
 test("§18.3 command без find: view OPEN → переиспользование pr_url", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(
     dir,
     "pr-create",
@@ -4573,7 +4574,7 @@ test("§18.3 command без find: view OPEN → переиспользовани
 test("§18.3 command: create упал или не отдал URL → «PR не открыт»", async () => {
   const run = async (createBody: string) => {
     const { repo } = makeRepo();
-    const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+    const dir = makeTempDir("prtool-");
     const create = writePrTool(dir, "pr-create", createBody);
     const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
     writeFileSync(join(dir, "view.json"), "{}");
@@ -4594,7 +4595,7 @@ test("§18.3 command: create упал или не отдал URL → «PR не �
 
 test("§18.3 command: view сломан — prErrorLimit → «слежение невозможно»", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(dir, "pr-create", `echo "https://example.test/pr/9"`);
   const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
   writeFileSync(
@@ -4758,7 +4759,7 @@ test("§18.6 prBody: дефолт, шаблон автора байт-в-бай�
 
 test("§18.3 command: таймаут — SIGTERM группе → SIGKILL, такт не висит", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(dir, "pr-create", `echo never`);
   const view = writePrTool(dir, "pr-view", `cat "$DIR/view.json"`);
   writeFileSync(
@@ -4898,7 +4899,7 @@ test("§18.3: свой шаблон с {thread} в другом виде — «�
 
 test("§18.3 command без find: чужой pr_url (другой координатор) не переиспользуется", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(
     dir,
     "pr-create",
@@ -4944,7 +4945,7 @@ test("§18.3 command без find: чужой pr_url (другой координ
 
 test("§18.3 command: URL с учётными данными — отказ, в записи не попадает", async () => {
   const { repo } = makeRepo();
-  const dir = mkdtempSync(join(tmpdir(), "prtool-"));
+  const dir = makeTempDir("prtool-");
   const create = writePrTool(
     dir,
     "pr-create",
