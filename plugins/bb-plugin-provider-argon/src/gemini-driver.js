@@ -444,6 +444,50 @@ function throwIfPromptTooLarge(prompt, fieldMaxBytes = null) {
   }
 }
 
+// PLUG-282: exact lock-badge predicate. The old substring check
+// `className.includes('lock')` false-positived on 'unlock', 'lock_open',
+// 'mat-icon-lock-reset' etc. A real lock badge is a *visible* icon whose
+// Material identity is exactly 'lock'. Self-contained so Playwright can
+// serialize it into the page and unit tests can call it on a fake DOM.
+function menuItemHasLockIcon(el) {
+  const icons = [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')];
+  return icons.some((icon) => {
+    if (icon.offsetParent === null) return false;
+    const t = (icon.innerText || '').trim().toLowerCase();
+    if (t === 'lock') return true;
+    const attr = (
+      icon.getAttribute('data-mat-icon-name') ||
+      icon.getAttribute('aria-label') ||
+      ''
+    ).trim().toLowerCase();
+    if (attr === 'lock' || attr === 'lock-filled') return true;
+    const cls =
+      typeof icon.className === 'string'
+        ? icon.className
+        : String((icon.className && icon.className.baseVal) || '');
+    return cls.split(/\s+/).some((c) => c === 'lock' || c === 'lock-filled');
+  });
+}
+
+// PLUG-282: a post-click dialog counts as lock proof only when it carries an
+// explicit plan-change CTA. A generic promo popup with price text
+// ("попробуйте …/мес") is not a lock. Self-contained for page.evaluate.
+function upsellDialogConfirmsLock(doc) {
+  const PLAN_CTA =
+    /сменить (план|подписку)|сменить тариф|change (plan|subscription)|upgrade|перейти на (тариф|план|ultra|pro)|оформить подписку|перейти на платную/i;
+  const DISMISS = /не сейчас|not now|no thanks|maybe later/i;
+  const dlgs = [...doc.querySelectorAll('mat-dialog-container, [role="dialog"]')]
+    .filter((e) => e.offsetParent !== null);
+  for (const dlg of dlgs) {
+    const actions = [...dlg.querySelectorAll('button,[role="button"],a')];
+    if (!actions.some((x) => PLAN_CTA.test((x.innerText || '').trim()))) continue;
+    const dismiss = actions.find((x) => DISMISS.test((x.innerText || '').trim()));
+    if (dismiss) dismiss.click();
+    return true;
+  }
+  return false;
+}
+
 async function selectModelAndThinking(page, model, thinking, strict = false) {
   const isMenuOpen = async () => {
     const menu = await safeQuery(page, 'gem-menu[role="menu"]:visible, gem-menu-item[data-mode-id]:visible, [role="menuitem"]:visible');
@@ -504,14 +548,7 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
 
           if (matches) {
             // Check for lock icon before clicking
-            const isLocked = await item.evaluate((el) => {
-              const icons = [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')];
-              return icons.some((icon) => {
-                const t = (icon.innerText || '').trim().toLowerCase();
-                const attr = (icon.getAttribute('data-mat-icon-name') || icon.getAttribute('aria-label') || '').toLowerCase();
-                return t === 'lock' || attr === 'lock' || (icon.className && icon.className.includes('lock'));
-              });
-            });
+            const isLocked = await item.evaluate(menuItemHasLockIcon);
             if (isLocked) {
               if (strict) {
                 const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
@@ -542,20 +579,28 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
               clicked = true;
               if (strict) {
                 // Locked models are clickable: the click opens a paid-upgrade
-                // dialog instead of selecting — detect and report.
+                // dialog instead of selecting. PLUG-282: a dialog is lock
+                // proof only with an explicit plan-change CTA, and only when
+                // the model did NOT get selected — a promo popup alongside a
+                // successful selection is not a lock.
                 await page.waitForTimeout(500);
-                const upsell = await safeEval(page, () => {
-                  const dlgs = [...document.querySelectorAll('mat-dialog-container, [role="dialog"]')]
-                    .filter((e) => e.offsetParent !== null);
-                  const dlg = dlgs.find((d) =>
-                    /сменить план|change (plan|subscription)|per month|\/\s*(мес|month)/i.test(d.innerText || '')
-                  );
-                  if (!dlg) return false;
-                  const b = [...dlg.querySelectorAll('button,[role="button"],a')]
-                    .find((x) => /не сейчас|not now|no thanks|maybe later/i.test((x.innerText || '').trim()));
-                  if (b) b.click();
-                  return true;
-                });
+                const selectedNow = await (async () => {
+                  try {
+                    const b2 = await getPickerButton(page);
+                    const t2 = (await b2.innerText()).trim().toLowerCase();
+                    const a2 = ((await b2.getAttribute('aria-label')) || '').toLowerCase();
+                    if (m === 'flash' || m === 'fast') {
+                      if (t2.includes('lite') || a2.includes('lite')) return false;
+                      return wordMatch(t2, 'flash') || wordMatch(a2, 'flash');
+                    }
+                    return modelKeywords.some(
+                      (kw) => wordMatch(t2, kw) || wordMatch(a2, kw) || t2.includes(kw) || a2.includes(kw)
+                    );
+                  } catch {
+                    return false;
+                  }
+                })();
+                const upsell = selectedNow ? false : await safeEval(page, upsellDialogConfirmsLock);
                 if (upsell) {
                   const err = new ModelUnavailable('model', `${model} locked: paid upgrade required`);
                   err.isLocked = true;
@@ -1622,6 +1667,8 @@ module.exports = {
   ModelUnavailable,
   RESET_REGEX_EXTENDED,
   selectModelAndThinking,
+  menuItemHasLockIcon,
+  upsellDialogConfirmsLock,
   stopGeneration,
   findTurnTarget,
   waitForHistoryStabilization,
