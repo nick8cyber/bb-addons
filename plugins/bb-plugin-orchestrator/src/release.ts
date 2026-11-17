@@ -69,13 +69,18 @@ import {
   type Policy,
   type PolicyLoad,
 } from "./policy.js";
-import { ACTIVE_STATUSES } from "./store.js";
+import { ACTIVE_STATUSES, normalizeTaskKey } from "./store.js";
 import type {
   CommandRunRow,
   DelegationRow,
   DelegationStore,
   ReleaseRow,
+  StagedFeatureRow,
 } from "./store.js";
+import {
+  pluginNameForRepo,
+  pluginNamesForPaths,
+} from "./staged.js";
 import { runChecked, runJson, type BbCli, type BbCliResult } from "./bb-cli.js";
 import { createT, LANGS, T_RU, type T } from "./i18n/index.js";
 import { recordReleaseNote, type KbConfig } from "./kb.js";
@@ -245,6 +250,10 @@ export interface ReleaseInput {
   noDocs?: string;
   kb?: string;
   noKb?: string;
+  /** §2 шаг 0.1 (r11.4): `--force-drop-unmerged <причина>` — снять
+   * блокировку unmerged-ui и перевести незамерженные UI-фичи того же
+   * плагина в `dropped`. */
+  forceDropUnmerged?: string;
 }
 
 export interface ReleaseResult {
@@ -1986,6 +1995,101 @@ async function isAncestor(
   return res.exitCode === 0;
 }
 
+/** §24.2: читаемый список UI-файлов записи для строки отказа. */
+function stagedUiFileList(row: StagedFeatureRow): string {
+  try {
+    const files = JSON.parse(row.ui_files ?? "[]") as unknown;
+    if (Array.isArray(files)) {
+      return files
+        .filter((f): f is string => typeof f === "string")
+        .slice(0, 10)
+        .join(", ");
+    }
+  } catch {
+    // битый JSON — имя файла в отказе не критично
+  }
+  return "";
+}
+
+/**
+ * §2 шаг 0.1 (r11.5) / orchestrator §24.2 (r33.6): незамерженные
+ * UI-фичи того же плагина. Плагин(ы) выкладываемой ветки — каждый
+ * каталог `plugins/<name>/` в её диффе от merge-base с целевой веткой;
+ * без такого диффа — имя плагина из собственной staged-записи задачи,
+ * иначе имя пакета/каталога репозитория. Запись мешает выкладке, когда
+ * её `result_sha` — не предок ни HEAD, ни `origin/<target>`
+ * (`merge-base --is-ancestor` ≠ 0), и у задачи нет опубликованного
+ * релиза. Сама выкладываемая задача не считается.
+ */
+async function unmergedUiFeatures(
+  deps: ReleaseDeps,
+  repo: string,
+  project: ResolvedProject,
+  taskKey: string,
+): Promise<StagedFeatureRow[]> {
+  const names = new Set<string>();
+  let base: string | null = null;
+  for (const ref of [
+    `origin/${project.target.branch}`,
+    project.target.branch,
+  ]) {
+    if (!(await gitRefExists(deps, repo, ref))) continue;
+    const mb = await git(deps, repo, ["merge-base", ref, "HEAD"], {
+      allowFail: true,
+      timeoutMs: 30_000,
+    });
+    if (mb.trim()) {
+      base = mb.trim();
+      break;
+    }
+  }
+  if (base) {
+    const changed = (
+      await git(deps, repo, ["diff", "--name-only", base, "HEAD"], {
+        allowFail: true,
+        timeoutMs: 60_000,
+      })
+    )
+      .split("\n")
+      .filter(Boolean);
+    for (const n of pluginNamesForPaths(changed)) names.add(n);
+  }
+  if (!names.size) {
+    const own = deps.store.stagedFeature(taskKey);
+    names.add(own?.plugin_name ?? pluginNameForRepo(repo));
+  }
+  const self = normalizeTaskKey(taskKey);
+  const seen = new Set<string>();
+  const offenders: StagedFeatureRow[] = [];
+  for (const name of names) {
+    for (const row of deps.store.stagedFeaturesForPlugin(
+      name,
+      "in_review",
+    )) {
+      if (row.ui_touched !== 1 || row.task_key === self) continue;
+      if (seen.has(row.task_key)) continue;
+      // r11.5: задача уже опубликована — её коммит на целевой ветке или
+      // в открытом PR, выкладка её работу не сбрасывает.
+      if (deps.store.lastPublishedSha(row.task_key) != null) continue;
+      if (await isAncestor(deps, repo, row.result_sha, "HEAD")) continue;
+      // r11.5: коммит уже в `origin/<target>` — синк шага 2 подтянет
+      // его в выкладываемую ветку, сброса интерфейса не будет.
+      if (
+        await isAncestor(
+          deps,
+          repo,
+          row.result_sha,
+          `origin/${project.target.branch}`,
+        )
+      )
+        continue;
+      seen.add(row.task_key);
+      offenders.push(row);
+    }
+  }
+  return offenders;
+}
+
 /** §17.3 (ревью PLUG-214): first parent of `sha` — the review gate
  * descends through the pipeline's own commits; null for a root. */
 async function firstParent(
@@ -2475,6 +2579,38 @@ async function runReleaseSteps(
   }
 
   try {
+    // §2 шаг 0.1 (r11.4) / orchestrator §24.2 (r33.5): в том же плагине
+    // нет незамерженных задач `in_review` с `ui_touched = 1`, чьи
+    // коммиты отсутствуют в выкладываемой ветке — иначе публикация
+    // производит скрытый откат их интерфейса. `--force-drop-unmerged
+    // <причина>` снимает блокировку: причина в запись выкладки, строки
+    // фич — в `dropped`.
+    const unmerged = await unmergedUiFeatures(deps, repo, project, taskKey);
+    if (unmerged.length) {
+      if (input.forceDropUnmerged) {
+        deps.store.updateRelease(release.id, {
+          droppedUnmergedReason: input.forceDropUnmerged,
+        });
+        deps.store.markStagedFeaturesDropped(
+          unmerged.map((r) => r.task_key),
+          input.forceDropUnmerged,
+        );
+      } else {
+        throw new OrchestratorError(
+          "release-refused",
+          unmerged
+            .map((r) =>
+              t("rel.unmergedUi", {
+                key: r.task_key,
+                files: stagedUiFileList(r),
+                target: project.target.branch,
+              }),
+            )
+            .join("\n"),
+        );
+      }
+    }
+
     // Step 2 — sync по режиму проекта.
     // §16.6 (PLUG-194): a §14-merged result is synced by MERGE only —
     // `git rebase` flattens merge commits, silently dropping the
@@ -2672,6 +2808,10 @@ async function runReleaseSteps(
       noDocs: input.noDocs,
       kb: input.kb,
       noKb: input.noKb,
+      // §2 шаг 0.1 (r11.4): `--force-drop-unmerged` — обход гейта
+      // виден аудитору: причина и сброшенные задачи — в пакете.
+      forceDropUnmerged: input.forceDropUnmerged,
+      droppedFeatures: input.forceDropUnmerged ? unmerged : [],
       baseSha,
       headSha,
     });
@@ -2756,6 +2896,8 @@ async function writeAuditPacket(
     noDocs?: string;
     kb?: string;
     noKb?: string;
+    forceDropUnmerged?: string;
+    droppedFeatures?: StagedFeatureRow[];
     baseSha: string;
     headSha: string;
   },
@@ -2784,6 +2926,14 @@ async function writeAuditPacket(
     input.noDocs ? t("packet.noDocs", { text: input.noDocs }) : null,
     input.kb ? t("packet.kb", { text: input.kb }) : null,
     input.noKb ? t("packet.noKb", { text: input.noKb }) : null,
+    input.forceDropUnmerged
+      ? t("packet.forceDropUnmerged", {
+          reason: input.forceDropUnmerged,
+          tasks: (input.droppedFeatures ?? [])
+            .map((d) => `${d.task_key} (${stagedUiFileList(d) || "—"})`)
+            .join("; "),
+        })
+      : null,
     "",
     t("packet.commits"),
     "",
@@ -4166,6 +4316,11 @@ async function finishPublished(
 ): Promise<void> {
   const t = deps.t ?? T_RU;
   const fresh = deps.store.getRelease(row.id) ?? row;
+  // §2 шаг 0.1 (r11.5) / orchestrator §24.2 (r33.6): опубликованная
+  // выкладка переводит свою запись plugin_staged_features в `merged` —
+  // она перестаёт сторожить гейт unmerged-ui. Вызывается из всех путей
+  // publishRelease и из досмотра уже опубликованных строк; идемпотентно.
+  deps.store.markStagedFeatureMerged(fresh.task_key);
   const headSha = fresh.published_sha ?? fresh.head_sha ?? "";
   const pushedBranch =
     fresh.target_action === "push"

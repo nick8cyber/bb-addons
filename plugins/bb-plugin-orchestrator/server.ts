@@ -2467,6 +2467,7 @@ export async function createPlugin(
           argv[i - 1] !== "--coordinator" && argv[i - 1] !== "--from" &&
           argv[i - 1] !== "--into" && argv[i - 1] !== "--no-docs" &&
           argv[i - 1] !== "--kb" && argv[i - 1] !== "--no-kb" &&
+          argv[i - 1] !== "--force-drop-unmerged" &&
           argv[i - 1] !== "--prompt" && argv[i - 1] !== "--prompt-file" &&
           argv[i - 1] !== "--attach" &&
           argv[i - 1] !== "--title" &&
@@ -3039,6 +3040,7 @@ export async function createPlugin(
               noDocs: flag("--no-docs"),
               kb: flag("--kb"),
               noKb: flag("--no-kb"),
+              forceDropUnmerged: flag("--force-drop-unmerged"),
             },
             releaseDeps,
           );
