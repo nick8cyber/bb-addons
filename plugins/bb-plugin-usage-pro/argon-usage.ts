@@ -93,6 +93,10 @@ export function createArgonUsage(options: {
     const now = options.now();
     const snapshots: ArgonAccountSnapshot[] = [];
     for (const [id, raw] of Object.entries(accounts)) {
+      // A blank key would serialize as "" and fail the nonemptyString schema
+      // of the whole getUsage response downstream.
+      const accountId = id.trim();
+      if (accountId === "") continue;
       if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
       const entry = raw as Record<string, unknown>;
       const updatedAt = entry.updatedAt;
@@ -102,7 +106,7 @@ export function createArgonUsage(options: {
           : null;
       const ageMs = updatedAtMs === null ? null : Math.max(0, now - updatedAtMs);
       snapshots.push({
-        id,
+        id: accountId,
         daily: metric(entry.daily),
         weekly: metric(entry.weekly),
         tier:

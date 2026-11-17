@@ -16188,15 +16188,14 @@ function providerUsagePlugin(bb, options = {}) {
     }
 
     // Argon quotas live in a local file written by provider-argon; reading it
-    // is cheap, so every request re-reads. A missing/broken file hides the
-    // section without an error.
+    // is cheap, so every request re-reads — including requests scoped to
+    // another provider tab, otherwise the section would vanish on that tab's
+    // refresh. A missing/broken file hides the section without an error.
     let argonAccounts = [];
-    if (request.providerId === null || request.providerId === ARGON_PROVIDER_ID) {
-      try {
-        argonAccounts = argonUsage.readAccounts();
-      } catch {
-        argonAccounts = [];
-      }
+    try {
+      argonAccounts = argonUsage.readAccounts();
+    } catch {
+      argonAccounts = [];
     }
 
     const machines = hosts.map((host) => ({
@@ -16398,17 +16397,21 @@ function providerUsagePlugin(bb, options = {}) {
             id: "acp-argon:" + acc.id,
             providerId: ARGON_PROVIDER_ID,
             displayName: "Gemini Web (Argon)",
-            accountLabel: acc.id,
-            logoUrl: argonMeta?.logoUrl ?? null,
+            // Tab rows render usage.accountEmail ?? accountLabel, so the data
+            // age rides inside accountLabel; in accountEmail it would hide the
+            // account id and make pool rows indistinguishable. On stale
+            // entries the age is already in the warning.
+            accountLabel: acc.stale || ageText === null
+              ? acc.id
+              : `${acc.id} · обновлено ${ageText}`,
+            logoUrl: argonMeta?.logoUrl ?? "/api/v1/system/providers/acp-argon/logo",
             icon: argonMeta?.icon ?? { glyph: "Sparkles" },
             strings: { iconTint: normalizedTint(argonMeta?.strings?.iconTint) },
             signInHint: "Add a Gemini Web account to the Argon pool, then reload usage.",
             expiredHint: "The Gemini Web session expired. Sign in again via the Argon provider.",
             usage: {
               status: "ok",
-              // The subtitle line is the only always-visible place for the
-              // data age; on stale entries it moves into the warning instead.
-              accountEmail: acc.stale || ageText === null ? null : `Обновлено ${ageText}`,
+              accountEmail: null,
               planLabel: argonTierLabel(acc.tier),
               windows
             },

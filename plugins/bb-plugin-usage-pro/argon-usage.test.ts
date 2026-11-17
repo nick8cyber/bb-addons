@@ -127,6 +127,19 @@ describe("createArgonUsage", () => {
     expect(timeless.ageMs).toBeNull();
   });
 
+  it("skips blank account keys that would break the strict output schema", () => {
+    write({
+      accounts: {
+        "": { daily: { percent: 1, resetEpochSec: 1_763_402_000 }, weekly: null, tier: "pro", updatedAt: NOW, stale: false },
+        "  ": { daily: null, weekly: null, tier: "pro", updatedAt: NOW, stale: false },
+        " spaced ": { daily: null, weekly: null, tier: "pro", updatedAt: NOW, stale: false },
+      },
+    });
+    const accounts = reader().readAccounts();
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0].id).toBe("spaced");
+  });
+
   it("drops malformed metrics and implausible reset times", () => {
     write({
       accounts: {

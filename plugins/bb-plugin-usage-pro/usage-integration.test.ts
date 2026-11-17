@@ -1458,18 +1458,20 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     const cards = argonCards(snapshot);
     expect(cards).toHaveLength(2);
 
-    const work = cards.find((c: any) => c.accountLabel === "work");
+    const work = cards.find((c: any) => c.id === "acp-argon:work");
     expect(work.displayName).toBe("Gemini Web (Argon)");
+    expect(work.accountLabel).toBe("work · обновлено 5 мин назад");
     expect(work.usage.status).toBe("ok");
     expect(work.usage.planLabel).toBe("Ultra");
-    expect(work.usage.accountEmail).toBe("Обновлено 5 мин назад");
+    expect(work.usage.accountEmail).toBeNull();
     expect(work.warning).toBeNull();
     expect(work.usage.windows.map((w: any) => w.label)).toEqual(["Gemini 5h", "Gemini Weekly"]);
     expect(work.usage.windows[0].usedPercent).toBe(25);
     expect(work.usage.windows[0].resetsAt).toBe(new Date(currentTime + 3_600_000).toISOString());
     expect(work.usage.windows[1].usedPercent).toBe(60);
 
-    const home = cards.find((c: any) => c.accountLabel === "home");
+    const home = cards.find((c: any) => c.id === "acp-argon:home");
+    expect(home.accountLabel).toBe("home · обновлено 1 мин назад");
     expect(home.usage.planLabel).toBe("Pro");
     expect(home.usage.windows.map((w: any) => w.label)).toEqual(["Gemini Weekly"]);
     expect(home.warning).toBeNull();
@@ -1512,6 +1514,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
 
     const cards = argonCards(snapshot);
     expect(cards).toHaveLength(1);
+    expect(cards[0].accountLabel).toBe("stale1");
     expect(cards[0].warning).toBe("Данные устарели — обновлено 45 мин назад");
     expect(cards[0].usage.accountEmail).toBeNull();
     expect(cards[0].usage.windows.map((w: any) => w.label)).toEqual(["Gemini 5h"]);
@@ -1534,6 +1537,27 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     await providerUsagePlugin(h.bb, h.collectorOpts);
     const snapshot = await h.registeredRpc.getUsage({
       force: false, machineIds: null, providerId: "acp-argon", maxAgeMs: 60_000,
+    });
+    expect(argonCards(snapshot)).toHaveLength(1);
+  });
+
+  it("PLUG-290: request scoped to another provider still returns the section", async () => {
+    writeArgonUsageFile({
+      accounts: {
+        work: {
+          daily: { percent: 25, resetEpochSec: Math.floor((currentTime + 3_600_000) / 1000) },
+          weekly: null,
+          tier: "ultra",
+          updatedAt: currentTime - 60_000,
+          stale: false,
+        },
+      },
+    });
+
+    const h = setupHarness(argonBaseCfg());
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    const snapshot = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: "codex", maxAgeMs: 60_000,
     });
     expect(argonCards(snapshot)).toHaveLength(1);
   });
