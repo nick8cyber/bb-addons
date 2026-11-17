@@ -32,6 +32,7 @@ const {
   findTurnTarget,
   menuItemHasLockIcon,
   upsellDialogConfirmsLock,
+  markVisibleDialogs,
 } = driver;
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1566,9 +1567,13 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
 
   // --- upsell dialog predicate: lock only with an explicit plan-change CTA ---
   const btn = (text, onClick) => ({ innerText: text, click: onClick || (() => {}) });
-  const dlg = (buttons, { visible = true } = {}) => ({
+  const dlg = (buttons, { visible = true, attrs = {} } = {}) => ({
     offsetParent: visible ? {} : null,
     querySelectorAll: () => buttons,
+    getAttribute: (n) => (n in attrs ? attrs[n] : null),
+    setAttribute: (n, v) => {
+      attrs[n] = v;
+    },
   });
   const doc = (dialogs) => ({ querySelectorAll: () => dialogs });
 
@@ -1601,6 +1606,34 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
     false,
     "Hidden dialog is ignored"
   );
+
+  // Direct-response gate: dialogs already open before the click are marked by
+  // markVisibleDialogs and skipped — only a dialog appearing as the click's
+  // own response counts (the reviewer's "Upgrade promo" residual FP path).
+  const preDlg = dlg([btn("Upgrade"), btn("Не сейчас")]);
+  const preDoc = doc([preDlg]);
+  assert.equal(markVisibleDialogs(preDoc), 1, "visible pre-click dialog is marked");
+  assert.equal(preDlg.getAttribute("data-argon-pre-click"), "1");
+  assert.equal(
+    upsellDialogConfirmsLock(preDoc),
+    false,
+    "Pre-existing dialog with a plan CTA is not a click response"
+  );
+  assert.equal(
+    markVisibleDialogs(doc([dlg([btn("Сменить план")], { visible: false })])),
+    0,
+    "Hidden dialog is not marked — showing it after the click IS a response"
+  );
+  {
+    const savedDoc = globalThis.document;
+    delete globalThis.document;
+    try {
+      assert.equal(markVisibleDialogs(), 0, "No-arg call without a document returns 0, not a crash");
+    } finally {
+      if (savedDoc === undefined) delete globalThis.document;
+      else globalThis.document = savedDoc;
+    }
+  }
 
   // Real Playwright calls page.evaluate(fn) with NO argument — the function
   // must take the page's `document` itself, not crash on `undefined`.
@@ -1698,8 +1731,10 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   }
   assert.equal(clickedPromo, true, "Promo popup after click must not mark the model locked");
 
-  // Plan-change dialog after click and model not selected → locked.
-  const upsellDoc = doc([dlg([btn("Сменить план"), btn("Не сейчас")])]);
+  // Plan-change dialog appearing AS the click's response, model not
+  // selected → locked. The dialog is pushed into the live doc on click.
+  const upsellDialogs = [];
+  const upsellDoc = doc(upsellDialogs);
   const mockPageUpsell = {
     ...mockPagePromo,
     $$: async () => [
@@ -1712,7 +1747,9 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
             getAttribute: () => null,
             classList: { contains: () => false },
           }),
-        click: async () => {},
+        click: async () => {
+          upsellDialogs.push(dlg([btn("Сменить план"), btn("Не сейчас")]));
+        },
       },
     ],
     evaluate: async (fn) => fn(),
@@ -1731,6 +1768,38 @@ test("12. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   } finally {
     delete globalThis.document;
   }
+
+  // Promo dialog with a plan CTA that was ALREADY open before the click →
+  // marked and skipped; not a click response, so no lock even though the
+  // model did not get selected.
+  const preDialogs = [dlg([btn("Upgrade"), btn("Не сейчас")])];
+  const mockPagePre = {
+    ...mockPageUpsell,
+    $$: async () => [
+      {
+        innerText: async () => "Код и анализ\n4 Argon",
+        evaluate: async (fn) =>
+          fn({
+            querySelectorAll: () => [],
+            hasAttribute: () => false,
+            getAttribute: () => null,
+            classList: { contains: () => false },
+          }),
+        click: async () => {},
+      },
+    ],
+  };
+  globalThis.document = doc(preDialogs);
+  try {
+    await selectModelAndThinking(mockPagePre, "argon", null, true);
+  } finally {
+    delete globalThis.document;
+  }
+  assert.equal(
+    preDialogs[0].getAttribute("data-argon-pre-click"),
+    "1",
+    "Pre-existing upsell-looking dialog must be marked and ignored"
+  );
 
   // Model actually selected — an upsell-looking popup alongside is not a
   // lock. First picker read returns the old model (forces the click); the

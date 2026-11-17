@@ -483,6 +483,9 @@ function upsellDialogConfirmsLock(doc = globalThis.document) {
   const dlgs = [...doc.querySelectorAll('mat-dialog-container, [role="dialog"]')]
     .filter((e) => e.offsetParent !== null);
   for (const dlg of dlgs) {
+    // Skip dialogs that were already open before the model-item click — a
+    // pre-existing promo with a plan CTA is not a response to this click.
+    if (typeof dlg.getAttribute === 'function' && dlg.getAttribute('data-argon-pre-click') !== null) continue;
     const actions = [...dlg.querySelectorAll('button,[role="button"],a')];
     if (!actions.some((x) => PLAN_CTA.test((x.innerText || '').trim()))) continue;
     const dismiss = actions.find((x) => DISMISS.test((x.innerText || '').trim()));
@@ -490,6 +493,21 @@ function upsellDialogConfirmsLock(doc = globalThis.document) {
     return true;
   }
   return false;
+}
+
+// PLUG-282: tag dialogs already on screen so the post-click upsell check only
+// counts a dialog that appeared as a direct response to the click. Hidden
+// dialogs are left untagged — a pre-existing hidden element shown in response
+// to the click is still a click response. Self-contained for page.evaluate.
+function markVisibleDialogs(doc = globalThis.document) {
+  if (!doc || typeof doc.querySelectorAll !== 'function') return 0;
+  let n = 0;
+  for (const d of doc.querySelectorAll('mat-dialog-container, [role="dialog"]')) {
+    if (d.offsetParent === null || typeof d.setAttribute !== 'function') continue;
+    d.setAttribute('data-argon-pre-click', '1');
+    n += 1;
+  }
+  return n;
 }
 
 async function selectModelAndThinking(page, model, thinking, strict = false) {
@@ -579,6 +597,7 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
                 `[gemini] Model "${model}" is currently rate-limited (${resetMatch ? resetMatch[0] : 'limit reached'}). Continuing with available model.`
               );
             } else {
+              if (strict) await safeEval(page, markVisibleDialogs);
               await item.click({ timeout: 5000 });
               clicked = true;
               if (strict) {
@@ -1673,6 +1692,7 @@ module.exports = {
   selectModelAndThinking,
   menuItemHasLockIcon,
   upsellDialogConfirmsLock,
+  markVisibleDialogs,
   stopGeneration,
   findTurnTarget,
   waitForHistoryStabilization,
