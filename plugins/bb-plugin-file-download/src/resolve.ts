@@ -30,10 +30,40 @@ export function baseName(path: string): string {
   return segments.length > 0 ? segments[segments.length - 1]! : "download";
 }
 
-/** Склейка корня хранилища и относительного пути без двойных/пропавших слэшей. */
+/**
+ * Склейка корня хранилища и относительного пути без двойных/пропавших слэшей.
+ * Сегменты `.`/`..` выкидываются — относительный путь не может выйти за корень.
+ */
 export function joinPath(root: string, relativePath: string): string {
-  const rel = relativePath.replace(/^\/+/, "");
-  return root.endsWith("/") ? root + rel : root + "/" + rel;
+  const safe = relativePath
+    .split(/[\\/]+/)
+    .filter((s) => s.length > 0 && s !== "." && s !== "..")
+    .join("/");
+  return root.endsWith("/") ? root + safe : root + "/" + safe;
+}
+
+/** Потолок на размер скачиваемого файла — всё содержимое живёт в памяти вкладки. */
+export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+
+export function formatBytes(size: number): string {
+  if (size >= 1024 * 1024 * 1024) return `${(size / 1073741824).toFixed(1)} ГБ`;
+  if (size >= 1024 * 1024) return `${(size / 1048576).toFixed(1)} МБ`;
+  if (size >= 1024) return `${(size / 1024).toFixed(1)} КБ`;
+  return `${size} Б`;
+}
+
+/**
+ * Гейт по размеру. SDK не даёт stat-API — размер известен только после чтения,
+ * но проверка до сборки Blob не даёт удвоить расход памяти на гигантских файлах.
+ */
+export function assertSizeWithinLimit(file: ResolvedFileContent): ResolvedFileContent {
+  const size = file.sizeBytes ?? 0;
+  if (size > MAX_DOWNLOAD_BYTES) {
+    throw new Error(
+      `файл слишком большой для скачивания через браузер (${formatBytes(size)} > ${formatBytes(MAX_DOWNLOAD_BYTES)})`,
+    );
+  }
+  return file;
 }
 
 export function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
@@ -71,11 +101,11 @@ export async function readSourceFile(
       const env = await sdk.environments.get({ environmentId: source.environmentId, signal });
       projectId = env.projectId || null;
       if (!projectId && env.path) {
-        return sdk.files.read({
-          hostId: env.hostId ?? source.experimental_hostId,
+        return assertSizeWithinLimit(await sdk.files.read({
+          hostId: env.hostId || source.experimental_hostId,
           path: joinPath(env.path, path),
           signal,
-        });
+        }));
       }
     }
     if (!projectId) throw new Error("workspace-файл без projectId — не разрешить");
@@ -84,12 +114,26 @@ export async function readSourceFile(
       : source.experimental_hostId
         ? { hostId: source.experimental_hostId }
         : {};
-    return sdk.projects.fileContent({ projectId, path, signal, ...routing });
+    return assertSizeWithinLimit(await sdk.projects.fileContent({ projectId, path, signal, ...routing }));
   }
   if (source.kind === "thread-storage") {
     if (!source.threadId) throw new Error("thread-storage-файл без threadId — не разрешить");
     const location = await sdk.threads.storageLocation({ threadId: source.threadId, signal });
-    return sdk.files.read({ hostId: location.hostId, path: joinPath(location.storageRootPath, path), signal });
+    return assertSizeWithinLimit(await sdk.files.read({ hostId: location.hostId, path: joinPath(location.storageRootPath, path), signal }));
   }
-  return sdk.files.read({ hostId: source.experimental_hostId, path, signal });
+  // kind === "host": без experimental_hostId files.read молча уйдёт на primary
+  // host — для файла треда с удалённой ноды это чужой путь. Резолвим хост треда.
+  let hostId = source.experimental_hostId || undefined;
+  if (!hostId && source.threadId) {
+    const thread = await sdk.threads.get({ threadId: source.threadId, signal });
+    const environmentId = thread.environmentId;
+    const env = environmentId
+      ? await sdk.environments.get({ environmentId, signal })
+      : null;
+    hostId = env?.hostId || undefined;
+    if (!hostId) {
+      throw new Error("host-файл треда: не удалось разрешить hostId удалённого хоста");
+    }
+  }
+  return assertSizeWithinLimit(await sdk.files.read({ hostId, path, signal }));
 }

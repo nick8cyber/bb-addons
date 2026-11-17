@@ -3,14 +3,14 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Download files from the bb web app/PWA: file links open the preview and start a real browser download",
+  "description": "Download files from the bb web app/PWA: preview stays, explicit Download button triggers a real browser download",
   "engines": {
     "bb": ">=0.48",
     "bbPluginSdk": ">=0.6.104"
   },
   "bb": {
     "name": "File Download",
-    "description": "Клик по ссылке на файл открывает предпросмотр и сразу сохраняет файл загрузкой браузера (веб/PWA)",
+    "description": "Предпросмотр файла с кнопкой «Скачать» — настоящая загрузка браузером в веб/PWA (нативной кнопки там нет)",
     "branding": {
       "icon": "File"
     },
