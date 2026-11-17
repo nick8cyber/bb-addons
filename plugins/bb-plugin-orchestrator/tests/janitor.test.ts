@@ -6083,3 +6083,302 @@ test("scope workers treats an orchestrator-origin thread as a worker (r30 д)", 
   assert.equal(res.removedCopies, 1);
   assert.deepEqual(w.archivedCalls, ["thr_own"]);
 });
+
+
+// ── §15 (r33.7) / release §2 п.2 (r11.6): task-merged + автоочистка ──
+
+/** Делегирование задачи, привязанное к копии (записанный результат). */
+function bindDelegation(
+  w: ReturnType<typeof makeWorld>,
+  taskKey: string,
+  env: EnvSpec,
+  sha: string,
+): number {
+  const d = w.store.insert({
+    taskKey,
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "r",
+    preset: "p",
+    provider: "p",
+  });
+  w.store.setThreadInfo(d.id, `thr_${env.id}`);
+  w.store.setRoundResult(d.id, {
+    envId: env.id,
+    branch: env.branchName,
+    sha,
+    commits: 1,
+    dirty: false,
+  });
+  w.store.setStatus(d.id, "done");
+  return d.id;
+}
+
+/** Подтверждённая выкладка задачи (published_sha — предок origin/<t>). */
+function publishTask(
+  w: ReturnType<typeof makeWorld>,
+  taskKey: string,
+  repo: string,
+  sha: string,
+  targetBranch = "main",
+): void {
+  const rel = w.store.insertRelease({
+    taskKey,
+    projectId: "p",
+    coordinatorThreadId: "thr_coord",
+    repoPath: repo,
+    branch: "main",
+    targetAction: "push",
+    targetBranch,
+    repoRoot: repo,
+  });
+  w.store.updateRelease(rel.id, {
+    status: "published",
+    publishedSha: sha,
+  });
+}
+
+test("§15 r33.7: промежуточный заход опубликованной задачи — task-merged, копия уходит", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: intermediate attempt");
+  const envTip = git(env.path, ["rev-parse", "HEAD"]);
+  // Финальная версия легла на origin ДРУГИМ коммитом — вершина копии
+  // предком origin/main не является (re-review / squash-перепись).
+  commitIn(repo, "final.txt", "feat: final version");
+  git(repo, ["push", "origin", "main"]);
+  const published = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  bindDelegation(w, "PLUG-292", env, envTip);
+  publishTask(w, "PLUG-292", repo, published);
+  let res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "merged-wait");
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(res.archivedThreads, 1);
+});
+
+test("§15 r33.7: заход НЕопубликованной задачи остаётся", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: intermediate attempt");
+  const envTip = git(env.path, ["rev-parse", "HEAD"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  bindDelegation(w, "PLUG-292", env, envTip);
+  // выкладки published нет — только auditing
+  w.store.insertRelease({
+    taskKey: "PLUG-292",
+    projectId: "p",
+    coordinatorThreadId: "thr_coord",
+    repoPath: repo,
+    branch: "main",
+    targetAction: "push",
+    targetBranch: "main",
+    repoRoot: repo,
+  });
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  assert.equal(w.janitor.item(env.id)!.reason, "not-merged");
+});
+
+test("§15 r33.7: task-merged не спасает копию с сиротой reflog вне вершин", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: intermediate attempt");
+  const envTip = git(env.path, ["rev-parse", "HEAD"]);
+  // Сирота: коммит, потом reset назад — позиция reflog вне вершины,
+  // на origin её нет и patch-эквивалента тоже.
+  writeFileSync(join(env.path, "orphan.txt"), "orphan work\n");
+  git(env.path, ["add", "."]);
+  git(env.path, ["commit", "-m", "feat: orphaned work"]);
+  git(env.path, ["reset", "--hard", envTip]);
+  commitIn(repo, "final.txt", "feat: final version");
+  git(repo, ["push", "origin", "main"]);
+  const published = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  bindDelegation(w, "PLUG-292", env, envTip);
+  publishTask(w, "PLUG-292", repo, published);
+  await w.jan.run();
+  w.clock.t += 16 * 60_000;
+  const res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.ok(existsSync(env.path));
+  const reason = w.janitor.item(env.id)!.reason;
+  assert.ok(
+    reason === "unpushed-commits" || reason === "abandoned-unpushed" ||
+      reason === "unpushed-unknown" || reason === "squash-suspect" ||
+      reason === "content-on-target",
+    `unexpected reason: ${reason}`,
+  );
+});
+
+test("§15 r33.7: squash-merged PR — task-merged через pr_merge_sha", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: intermediate attempt");
+  const envTip = git(env.path, ["rev-parse", "HEAD"]);
+  // Squash-merge: голова PR-ветки (published_sha) предком origin/main
+  // не является — влитие пришло отдельным коммитом (pr_merge_sha).
+  const prHead = envTip;
+  commitIn(repo, "final.txt", "feat: final version (squashed)");
+  git(repo, ["push", "origin", "main"]);
+  const mergeSha = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  bindDelegation(w, "PLUG-292", env, envTip);
+  const rel = w.store.insertRelease({
+    taskKey: "PLUG-292",
+    projectId: "p",
+    coordinatorThreadId: "thr_coord",
+    repoPath: repo,
+    branch: "main",
+    targetAction: "pr",
+    targetBranch: "main",
+    repoRoot: repo,
+  });
+  w.store.updateRelease(rel.id, {
+    status: "published",
+    publishedSha: prHead,
+  });
+  w.store.setPrMergeSha(rel.id, mergeSha);
+  // publishedReleases отдаёт коммит влития, а не голову PR-ветки
+  const pub = w.store
+    .publishedReleases()
+    .find((r) => r.taskKey === "PLUG-292");
+  assert.equal(pub!.publishedSha, mergeSha);
+  let res = await w.jan.run();
+  assert.equal(res.removedCopies, 0);
+  assert.equal(w.janitor.item(env.id)!.reason, "merged-wait");
+  w.clock.t += 16 * 60_000;
+  res = await w.jan.run();
+  assert.equal(res.removedCopies, 1);
+  assert.equal(res.archivedThreads, 1);
+});
+
+test("release §2 п.2: taskCleanup убирает копии задачи, грязную — через rescue, tip_sha в базе", async () => {
+  const { repo, base } = makeRepo();
+  const clean = addEnv(repo, base, "clean");
+  commitIn(clean.path, "a.txt", "feat: clean attempt");
+  const cleanTip = git(clean.path, ["rev-parse", "HEAD"]);
+  const dirty = addEnv(repo, base, "dirty");
+  commitIn(dirty.path, "b.txt", "feat: dirty attempt");
+  const dirtyTip = git(dirty.path, ["rev-parse", "HEAD"]);
+  writeFileSync(join(dirty.path, "unsaved.txt"), "dirty work\n");
+  commitIn(repo, "final.txt", "feat: final version");
+  git(repo, ["push", "origin", "main"]);
+  const published = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [clean, dirty],
+    threads: {
+      [clean.id]: [idle({ t: Date.now() }, clean.id)],
+      [dirty.id]: [idle({ t: Date.now() }, dirty.id)],
+    },
+  });
+  bindDelegation(w, "PLUG-292", clean, cleanTip);
+  bindDelegation(w, "PLUG-292", dirty, dirtyTip);
+  publishTask(w, "PLUG-292", repo, published);
+  const res = await w.jan.taskCleanup({
+    taskKey: "PLUG-292",
+    repoPath: clean.path,
+    publishedSha: published,
+    targetBranch: "main",
+  });
+  assert.equal(res.blocked, undefined);
+  assert.equal(res.envsRemoved, 2);
+  assert.equal(res.threadsArchived, 2);
+  assert.equal(res.rescued, 1);
+  assert.equal(res.branchesRemoved, 2);
+  assert.deepEqual(res.kept, []);
+  assert.ok(!existsSync(clean.path));
+  assert.ok(!existsSync(dirty.path));
+  assert.deepEqual(w.archivedCalls.sort(), [
+    `thr_${clean.id}`,
+    `thr_${dirty.id}`,
+  ].sort());
+  assert.deepEqual(w.cleanedUp.sort(), [clean.id, dirty.id].sort());
+  // ветки удалены, вершины записаны в базу до удаления
+  for (const [env, tip] of [[clean, cleanTip], [dirty, dirtyTip]] as const) {
+    assert.throws(() => git(repo, ["rev-parse", "--verify", env.branchName]));
+    assert.equal(w.janitor.item(env.id)!.state, "removed");
+    assert.equal(w.janitor.item(env.id)!.tip_sha, tip);
+    const branchItem = w.janitor
+      .items()
+      .find((i) => i.branch === env.branchName && i.state === "removed");
+    assert.equal(branchItem?.tip_sha, tip);
+  }
+  // грязная копия спасена — rescue ref есть
+  assert.ok(
+    git(repo, ["for-each-ref", "refs/orchestrator/rescue/"]).length > 0,
+  );
+});
+
+test("release §2 п.2: taskCleanup без подтверждения origin — blocked, ничего не трогает", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  const envTip = git(env.path, ["rev-parse", "HEAD"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+  });
+  bindDelegation(w, "PLUG-292", env, envTip);
+  // «опубликованный» коммит не лежит на origin/main (не запушен)
+  commitIn(repo, "final.txt", "feat: never pushed");
+  const unpublished = git(repo, ["rev-parse", "HEAD"]);
+  const res = await w.jan.taskCleanup({
+    taskKey: "PLUG-292",
+    repoPath: env.path,
+    publishedSha: unpublished,
+    targetBranch: "main",
+  });
+  assert.equal(res.blocked, "not-confirmed");
+  assert.equal(res.envsRemoved, 0);
+  assert.equal(res.branchesRemoved, 0);
+  assert.ok(existsSync(env.path));
+  assert.deepEqual(w.archivedCalls, []);
+});
+
+test("release §2 п.2: taskCleanup держит копию с живым процессом — остаток в kept", async () => {
+  const { repo, base } = makeRepo();
+  const env = addEnv(repo, base, "a");
+  commitIn(env.path, "w.txt", "feat: work");
+  const envTip = git(env.path, ["rev-parse", "HEAD"]);
+  commitIn(repo, "final.txt", "feat: final version");
+  git(repo, ["push", "origin", "main"]);
+  const published = git(repo, ["rev-parse", "origin/main"]);
+  const w = makeWorld({
+    envs: [env],
+    threads: { [env.id]: [idle({ t: Date.now() }, env.id)] },
+    hasProcessIn: async () => true,
+  });
+  bindDelegation(w, "PLUG-292", env, envTip);
+  publishTask(w, "PLUG-292", repo, published);
+  const res = await w.jan.taskCleanup({
+    taskKey: "PLUG-292",
+    repoPath: env.path,
+    publishedSha: published,
+    targetBranch: "main",
+  });
+  assert.equal(res.envsRemoved, 0);
+  assert.deepEqual(res.kept, [
+    { kind: "env", id: env.id, reason: "process-inside" },
+  ]);
+  assert.ok(existsSync(env.path));
+  assert.deepEqual(w.cleanedUp, []);
+});

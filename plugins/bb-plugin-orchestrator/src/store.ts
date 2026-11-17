@@ -2500,6 +2500,87 @@ export class DelegationStore {
       .all(normalizeTaskKey(taskKey)) as DelegationRow[];
   }
 
+  /**
+   * §15 (r33.7): «копия/тред → задача» индекс всех делегирований — для
+   * `task-merged` в уборщике и автоочистки копий задачи. Одна выборка за
+   * прогон вместо запроса на каждую среду.
+   */
+  delegationTaskIndex(): {
+    taskKey: string;
+    threadId: string | null;
+    envId: string | null;
+    branch: string | null;
+    status: string;
+  }[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT task_key, thread_id, result_env_id, result_branch, status
+           FROM delegations
+           WHERE result_env_id IS NOT NULL OR thread_id IS NOT NULL
+              OR result_branch IS NOT NULL`,
+        )
+        .all() as {
+        task_key: string;
+        thread_id: string | null;
+        result_env_id: string | null;
+        result_branch: string | null;
+        status: string;
+      }[]
+    ).map((r) => ({
+      taskKey: r.task_key,
+      threadId: r.thread_id,
+      envId: r.result_env_id,
+      branch: r.result_branch,
+      status: r.status,
+    }));
+  }
+
+  /**
+   * §15 (r33.7): последний подтверждённый релиз каждой задачи — ключ к
+   * признанию копии «влитой по задаче» (`task-merged`) и к автоочистке
+   * после выкладки. Только `published` с подтверждённым коммитом на
+   * origin/<цель>: `published_sha` для push, `pr_merge_sha` для PR
+   * (после squash-merge вершина ветки PR не предок целевой — берётся
+   * коммит влития).
+   */
+  publishedReleases(): {
+    taskKey: string;
+    publishedSha: string;
+    targetBranch: string;
+    repoPath: string;
+  }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT task_key, COALESCE(pr_merge_sha, published_sha) AS published_sha,
+                target_branch, repo_path
+         FROM releases
+         WHERE status = 'published'
+           AND COALESCE(pr_merge_sha, published_sha) IS NOT NULL
+         ORDER BY id`,
+      )
+      .all() as {
+      task_key: string;
+      published_sha: string;
+      target_branch: string;
+      repo_path: string;
+    }[];
+    // ORDER BY id ASC — последняя запись задачи перезаписывает прежние.
+    const byTask = new Map<
+      string,
+      { taskKey: string; publishedSha: string; targetBranch: string; repoPath: string }
+    >();
+    for (const r of rows) {
+      byTask.set(r.task_key, {
+        taskKey: r.task_key,
+        publishedSha: r.published_sha,
+        targetBranch: r.target_branch,
+        repoPath: r.repo_path,
+      });
+    }
+    return [...byTask.values()];
+  }
+
   /** Latest release-audit delegation of a task (§3): the chain reissue
    * inserts newer rows, so "the audit's delegation" is always the newest
    * `release-audit` row for the task key. */
