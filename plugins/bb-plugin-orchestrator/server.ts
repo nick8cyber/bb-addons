@@ -1229,6 +1229,7 @@ export async function createPlugin(
     from?: string;
     fresh?: boolean;
     noCode?: boolean;
+    attach?: string[];
     threadId?: string;
   }) =>
     enqueue(async () => {
@@ -1256,11 +1257,17 @@ export async function createPlugin(
         probes,
         primaryHostId,
         gitInstructions: () =>
-        effectiveGitInstructions(currentSettings.gitInstructions, t),
+          effectiveGitInstructions(currentSettings.gitInstructions, t),
         cmd,
         localHostId,
         leaksSnapshot,
         t,
+        now: stepsDeps.now,
+        policy: stepsDeps.policy,
+        unavailableRoutes: stepsDeps.unavailableRoutes,
+        repoPath: stepsDeps.repoPath,
+        packetGit: stepsDeps.packetGit,
+        packetMask: stepsDeps.packetMask,
       });
     });
 
