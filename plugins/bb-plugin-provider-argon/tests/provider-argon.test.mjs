@@ -2454,7 +2454,7 @@ test("17. PLUG-285: bb <system_instructions> blocks stripped from session/prompt
 });
 
 test("18. PLUG-286: driver/page failures are transient — never model-unavailable, never parked", () => {
-  // The oleg-6h symptom: waitForSelector timeout on a hung insert — a
+  // The 6h-park symptom: waitForSelector timeout on a hung insert — a
   // driver transient, rotatable (retry on the next account inside the
   // deadline), parkedReason null so no account is ever parked.
   const selectorTimeout = classifyFailure(new Error("page.waitForSelector: Timeout 8000ms exceeded."));

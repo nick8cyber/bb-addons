@@ -412,7 +412,7 @@ function acquireInState(state, b, owner, now) {
   state.leases[b.id] = { pid: process.pid, acquiredMs: now };
 }
 
-/* ---------- parse reset time (§3.3) ---------- */
+/* ---------- parse reset time (§3.4) ---------- */
 export function parseResetTimeMs(msg, nowMs = Date.now()) {
   const str = String(msg || "");
   const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -515,7 +515,7 @@ export function isBbSystemInstructionsBlock(block) {
   );
 }
 
-/* ---------- classify failure (§3.3) ---------- */
+/* ---------- classify failure (§3.4) ---------- */
 
 // PLUG-286: driver/page faults — selector and navigation timeouts, page
 // crashes, CDP/network drops — are transient browser-session failures, never
