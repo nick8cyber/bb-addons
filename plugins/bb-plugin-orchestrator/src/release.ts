@@ -78,6 +78,7 @@ import type {
 } from "./store.js";
 import { runChecked, runJson, type BbCli, type BbCliResult } from "./bb-cli.js";
 import { createT, LANGS, T_RU, type T } from "./i18n/index.js";
+import { recordReleaseNote, type KbConfig } from "./kb.js";
 import type { TaskCleanupArgs, TaskCleanupSummary } from "./janitor.js";
 import type { CmdRunner } from "./cmd.js";
 import { isCoordinator, type ExecutorProbes, type ThreadFacts } from "./agent-config.js";
@@ -216,6 +217,8 @@ export interface ReleaseDeps {
    * tip_sha, архив, environment cleanup). Внутри свой гейт
    * «100% подтверждение origin». */
   taskCleanup?: (args: TaskCleanupArgs) => Promise<TaskCleanupSummary>;
+  /** §26 (r33.8, ADR-0028): KB configuration for release gate and postPublish. */
+  kbConfig?: () => KbConfig;
   hostname?: string;
   now?: () => number;
   log?: {
@@ -1755,6 +1758,44 @@ export async function runRelease(
       "release-refused",
       t("rel.requireNote", { taskKey }),
     );
+  }
+  // (r11.7, orchestrator §26.5, ADR-0028) KB cleanliness gate:
+  // При kb.enabled: true и requireCleanOnRelease: true (по умолчанию) проверяется git -C <kb.path> status --porcelain;
+  // при наличии незакоммиченных изменений — отказ release-refused: uncommitted-kb: в базе знаний незакоммиченные файлы (<файлы>)
+  // (при requireCleanOnRelease: false проверка только при наличии флага --kb).
+  const kbCfg = deps.kbConfig?.();
+  if (kbCfg && kbCfg.enabled) {
+    const shouldCheckClean =
+      kbCfg.requireCleanOnRelease || Boolean(input.kb);
+    if (shouldCheckClean) {
+      const kbStatus = await deps.cmd.run("git", [
+        "-C",
+        kbCfg.path,
+        "status",
+        "--porcelain",
+      ]);
+      if (kbStatus.exitCode !== 0) {
+        throw new OrchestratorError(
+          "release-refused",
+          t("rel.uncommittedKbFailed", {
+            error: kbStatus.stderr.trim() || kbStatus.stdout.trim(),
+          }),
+        );
+      }
+      const dirtyLines = kbStatus.stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (dirtyLines.length > 0) {
+        const files = dirtyLines
+          .map((l) => l.replace(/^[A-Z?!\s]+\s+/, ""))
+          .join(", ");
+        throw new OrchestratorError(
+          "release-refused",
+          t("rel.uncommittedKb", { files }),
+        );
+      }
+    }
   }
   // §18.3 + release §2 п.0 (r11): доступность провайдера PR — на шаге
   // 1, до платного аудита.
@@ -4318,6 +4359,8 @@ interface PostPublishMeta {
    * notice_text confirm'ом досмотра, чтобы merging-такт не
    * пересобирал итог и не слал дубль после краха. */
   finish?: string;
+  /** §26 (r33.8, ADR-0028): результат автозаписи в KB. */
+  kbResult?: string;
 }
 
 // §6 r11: манифест зависимостей считается строго в rootDir плагина или
@@ -4419,12 +4462,13 @@ async function runPostPublishGuarded(
  * изменённые файлы под ним). Всё resumable: base в plugin_meta,
  * состояние команд в журнале — повтор такта работу не дублирует.
  */
-async function runPostPublish(
+export async function runPostPublish(
   deps: ReleaseDeps,
   row: ReleaseRow,
   event: "release.published" | "pr.merged",
 ): Promise<PostPublishResult> {
   const t = deps.t ?? T_RU;
+  const now = deps.now?.() ?? Date.now();
   const groupKey = `pp:${row.id}`;
   const done = (summary: string | null = null): PostPublishResult => {
     // PLUG-245 заход 4 (ревью Б1): любой done снимает замок копии.
@@ -4439,13 +4483,69 @@ async function runPostPublish(
     summary: null,
     selfReload: null,
   };
+
+  // ── метка состояния postPublish (переживает такты и рестарты) ──
+  const markerKey = POSTPUBLISH_META(row.id);
+  let meta: PostPublishMeta = {};
+  try {
+    meta = JSON.parse(
+      deps.store?.metaGet(markerKey) ?? "{}",
+    ) as PostPublishMeta;
+  } catch {
+    meta = {};
+  }
+  if (meta.startedAt === undefined) {
+    meta.startedAt = now;
+    deps.store?.metaSet(markerKey, JSON.stringify(meta));
+  }
+  const saveMeta = () =>
+    deps.store?.metaSet(markerKey, JSON.stringify(meta));
+
+  const runKb = async (bits: string[]) => {
+    if (!row.kb_note) return;
+    if (meta.kbResult) {
+      bits.push(meta.kbResult);
+      return;
+    }
+    const kbCfg = deps.kbConfig?.();
+    if (!kbCfg || !kbCfg.enabled) {
+      const line = t("pp.kbWriteFailed", { error: "kb-disabled" });
+      meta.kbResult = line;
+      saveMeta();
+      bits.push(line);
+      return;
+    }
+    try {
+      const kbRes = await recordReleaseNote(kbCfg.path, deps.cmd, {
+        taskKey: row.task_key,
+        sha7: (row.published_sha ?? row.head_sha ?? "").slice(0, 7),
+        targetBranch: row.target_branch,
+        note: row.kb_note,
+        now: deps.now,
+        t: deps.t,
+      });
+      const line = kbRes.synced
+        ? t("pp.kbSuccess", { file: kbRes.file })
+        : t("pp.kbSyncFailed", { error: kbRes.syncError ?? "sync failed" });
+      meta.kbResult = line;
+      saveMeta();
+      bits.push(line);
+    } catch (e) {
+      deps.log?.warn?.(`orchestrator: postPublish KB failed: ${message(e)}`);
+      const line = t("pp.kbWriteFailed", { error: message(e) });
+      meta.kbResult = line;
+      saveMeta();
+      bits.push(line);
+    }
+  };
+
   // §18.5 (ревью заход 4): ранние выходы смотрят журнал группы — пока
   // команда выкладки запущена, итог не отдаётся и замок держится даже
   // при сломанной/убранной настройке; ждущие queued переводятся в
   // skipped, чтобы pump их не запустил после ушедшего итога.
-  const earlyDone = (
+  const earlyDone = async (
     summary: string | null = null,
-  ): PostPublishResult => {
+  ): Promise<PostPublishResult> => {
     const rows = deps.store.commandRunsByGroup(groupKey);
     if (rows.some((r) => r.status === "running")) return pending;
     const at = deps.now?.() ?? Date.now();
@@ -4454,12 +4554,14 @@ async function runPostPublish(
         deps.store.skipQueuedCommandRun(r.id, PP_REASON.skippedSetting, at);
       }
     }
-    return done(summary);
+    const bits: string[] = summary ? [summary] : [];
+    await runKb(bits);
+    return done(bits.length ? (summary ? bits.join("; ") : `postPublish: ${bits.join("; ")}`) : null);
   };
   const cfg = deps.loadReleaseConfig().config;
-  if (!cfg) return earlyDone();
-  const fail = (msg: string): PostPublishResult =>
-    earlyDone(`postPublish: ${msg}`);
+  if (!cfg) return await earlyDone();
+  const fail = async (msg: string): Promise<PostPublishResult> =>
+    await earlyDone(`postPublish: ${msg}`);
   // §6 (r8) п.6: записанный проект настройки; у pre-r8 записей после
   // публикации postPublish пропускается с причиной — публикация валидна.
   let projectId: string;
@@ -4476,13 +4578,12 @@ async function runPostPublish(
     deps.log?.warn?.(
       `orchestrator: postPublish settings project: ${message(e)}`,
     );
-    return fail(t("pp.noProject"));
+    return await fail(t("pp.noProject"));
   }
   const project = resolveProject(cfg, projectId);
   const pp = project.postPublish;
   const want = event === "pr.merged" ? "merged" : "published";
-  if (!pp || pp.on !== want) return earlyDone();
-  const now = deps.now?.() ?? Date.now();
+  if (!pp || pp.on !== want) return await earlyDone();
   const mainDir =
     row.repo_root ??
     (await realpath(row.repo_path).catch(() => row.repo_path));
@@ -4520,23 +4621,6 @@ async function runPostPublish(
     if (c.cwd === undefined) return pp.checkout ?? mainDir;
     return isAbsolute(c.cwd) ? c.cwd : join(mainDir, c.cwd);
   };
-
-  // ── метка состояния postPublish (переживает такты и рестарты) ──
-  const markerKey = POSTPUBLISH_META(row.id);
-  let meta: PostPublishMeta = {};
-  try {
-    meta = JSON.parse(
-      deps.store.metaGet(markerKey) ?? "{}",
-    ) as PostPublishMeta;
-  } catch {
-    meta = {};
-  }
-  if (meta.startedAt === undefined) {
-    meta.startedAt = now;
-    deps.store.metaSet(markerKey, JSON.stringify(meta));
-  }
-  const saveMeta = () =>
-    deps.store.metaSet(markerKey, JSON.stringify(meta));
 
   // §18.5 (заход 3 Б2): срок — только на ожидание. Пока у выкладки
   // есть running команда — итог не отдаётся и замок держится (её
@@ -4916,6 +5000,7 @@ async function runPostPublish(
 
   // ── перезагрузка плагинов (r11: любая раскладка, по реестру) ──
   let selfReload: { rootDir: string; expectedSha: string } | null = null;
+  const appPlugins: string[] = [];
   if (co && copyOk && !stopper) {
     // Перезагрузка — под тем же замком копии, что и ff (§18.5).
     if (!(await ensureCopyLock())) return pending;
@@ -4974,7 +5059,6 @@ async function runPostPublish(
       const running = deps.store.listByStatuses(ACTIVE_STATUSES);
       const reloaded: string[] = [];
       const skipped: string[] = [];
-      const appPlugins: string[] = [];
       // §6 r11: кандидат — плагин, чей rootDir лежит внутри копии и у
       // которого есть изменённые файлы base..HEAD под ним. Корень копии
       // = rootDir → любой diff триггерит. Пути вне rootDir — молча.
@@ -5058,13 +5142,20 @@ async function runPostPublish(
       if (!reloaded.length && !skipped.length && !selfReload) {
         bits.push(t("pp.noChanges"));
       }
-      // §22.4: the tail goes LAST — «обнови страницу BB…: <id>, <id>»
-      // only when at least one reloaded plugin carries an interface.
-      if (appPlugins.length) {
-        bits.push(t("pp.reloadPage", { list: appPlugins.join(", ") }));
-      }
     }
   }
+
+  // (r11.7, orchestrator §26.6, ADR-0028) KB release notes auto-recording:
+  await runKb(bits);
+
+  // §22.4: the tail goes LAST — «обнови страницу BB…: <id>, <id>»
+  // only when at least one reloaded plugin carries an interface.
+  // It is placed strictly at the end after all other postPublish bits,
+  // including KB release notes.
+  if (appPlugins.length) {
+    bits.push(t("pp.reloadPage", { list: appPlugins.join(", ") }));
+  }
+
   releasePostPublishLock(row.id);
   if (!bits.length) return { done: true, summary: null, selfReload };
   return {

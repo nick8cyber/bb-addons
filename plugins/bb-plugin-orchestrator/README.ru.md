@@ -217,7 +217,7 @@
   `bb orchestrator reconcile` запускает проход немедленно.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `merge`, `policy
   show|validate`, `instructions`, `reconcile`, `release`, `janitor`,
-  `hooks-dir`, `helper`, `role set`.
+  `hooks-dir`, `helper`, `role set`, `kb`.
 
 ## Роли
 
@@ -305,6 +305,17 @@ BB, плагин шлёт только строку запуска и строк
   ролевого треда отклоняется на первом сообщении — детей ролевых тредов
   создаёт только плагин. `allowForeignChildren` — белый список
   `originPluginId` (пустой — отказ всем).
+
+## База знаний (§26)
+
+`orchestrator_kb` (инструмент агента) и `bb orchestrator kb` обеспечивают безопасную
+работу со встроенной базой знаний (`list`, `search`, `read`, `write`, `append`, `sync`, `status`)
+в каталоге `<kb.path>` (`~/kb` или `~/.bb/kb`):
+- Изоляция путей (запрет `..`, `.git/`, null-байтов и выхода через symlink).
+- Скан содержимого на секреты перед записью и коммитом (§22).
+- Эксклюзивный замок (`orchestrator-kb.lock`) с очисткой мёртвых PID.
+- RBAC: полный доступ у ролей `orchestrator` и `executor`; остальным ролям инструмент не выдаётся; при явном подключении их доступ ограничен операциями чтения (`list`, `search`, `read`, `status`), а мутирующие операции отклоняются с `permission-denied`.
+- Интеграция с release: шаг 1 проверяет чистоту KB (`requireCleanOnRelease`); шаг 7 автоматически записывает детерминированные UTC-заметки релиза в `<kb.path>/releases/<YYYY-MM-DD>-<KEY>.md` с идемпотентностью.
 
 ## Маршруты без инструментов: пакет аудитора и ресерчер (§20–§21)
 
@@ -441,6 +452,10 @@ BB, плагин шлёт только строку запуска и строк
   `excludeProjects`, `protectedBranches`, `deleteBranches`, `scope
   workers|all`. Битый документ предупреждает в журнале и держит
   уборщик выключенным.
+- `kb` (многострочный JSON, §26) — настройка базы знаний: `enabled`
+  (по умолчанию `true`), `path` (по умолчанию `~/kb` или `~/.bb/kb`),
+  `autoSync` (по умолчанию `true`), `requireCleanOnRelease` (по умолчанию
+  `true`). Пустое или незаданное использует значения по умолчанию.
 - `needs-configuration` снимается только перезагрузкой плагина (SDK V1):
   после исправления настройки — `bb plugin reload orchestrator`.
 

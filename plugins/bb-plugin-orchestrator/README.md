@@ -216,7 +216,7 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   `bb orchestrator reconcile` runs a pass immediately.
 - **CLI**: `delegate`, `status`, `show`, `cancel`, `merge`, `policy show|validate`,
   `instructions`, `reconcile`, `release`, `janitor`, `hooks-dir`, `helper`,
-  `role set`.
+  `role set`, `kb`.
 
 ## Roles
 
@@ -302,6 +302,17 @@ notification, the plugin sends only the launch notice and outcome lines.
   child of a role thread is rejected on its first message — children of
   role threads are plugin-created only. `allowForeignChildren` is an
   `originPluginId` allowlist (empty — refuse all).
+
+## Knowledge Base (§26)
+
+`orchestrator_kb` (agent tool) and `bb orchestrator kb` provide safe knowledge base
+operations (`list`, `search`, `read`, `write`, `append`, `sync`, `status`) inside
+`<kb.path>` (`~/kb` or `~/.bb/kb`):
+- Path boundary containment (no `..`, `.git/`, null bytes or symlink escapes).
+- Secret leak scanning on content before write and commit.
+- Exclusive file lock (`orchestrator-kb.lock`) with stale PID cleanup.
+- RBAC: full access for `orchestrator` and `executor`; other roles are not granted the tool; if explicitly attached, their access is restricted to read-only (`list`, `search`, `read`, `status`), and mutating operations are rejected with `permission-denied`.
+- Release integration: Step 1 verifies a clean repository (`requireCleanOnRelease`); Step 7 auto-records UTC release notes into `<kb.path>/releases/<YYYY-MM-DD>-<KEY>.md` with idempotency.
 
 ## Tool-less routes: the auditor packet and the researcher (§20–§21)
 
@@ -435,6 +446,9 @@ map presets onto levels and fallback chains, write the policy, validate.
   `abandonedAfter`, `intervalMinutes`, `excludeProjects`,
   `protectedBranches`, `deleteBranches`, `scope workers|all`. An
   invalid document warns in the journal and keeps the janitor off.
+- `kb` (multiline JSON, §26) — knowledge base settings: `enabled` (default
+  `true`), `path` (default `~/kb` or `~/.bb/kb`), `autoSync` (default `true`),
+  `requireCleanOnRelease` (default `true`). Empty or unset uses defaults.
 - `needs-configuration` clears only on plugin reload (SDK V1): after
   fixing a setting run `bb plugin reload orchestrator`.
 

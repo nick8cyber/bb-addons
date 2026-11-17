@@ -140,6 +140,7 @@ import {
   type Params,
   type T,
 } from "./src/i18n/index.js";
+import { KbService, parseKbConfig, type KbConfig } from "./src/kb.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -488,6 +489,15 @@ export async function createPlugin(
       label: "Allow foreign children",
       description:
         "§19.5: comma-separated originPluginId allowlist whose threads may run as children of threads with any plugin role except `none` (empty — the message.dispatch hook refuses their first message and archives the thread). `true` accepts a legacy boolean as allow-all.",
+      default: "",
+    },
+    // §26 (r33.8, ADR-0028): knowledge base setting.
+    kb: {
+      type: "string",
+      label: "Knowledge base (KB)",
+      description:
+        "§26 (r33.8, ADR-0028): KB JSON {enabled?: boolean, path?: string, autoSync?: boolean, requireCleanOnRelease?: boolean}. Empty or invalid uses defaults.",
+      experimental_multiline: true,
       default: "",
     },
   });
@@ -932,6 +942,10 @@ export async function createPlugin(
     for (const w of releaseConfig.warnings) {
       bb.log.warn(`orchestrator release config: ${w.path}: ${w.message}`);
     }
+    currentKb = parseKbConfig(currentSettings.kb, t);
+    for (const w of currentKb.errors) {
+      bb.log.warn(`orchestrator kb config: ${w.path}: ${w.message}`);
+    }
     // §22.1 (ревью): a settings save rewrites every configured
     // project's leaks snapshot — the pre-commit gate tracks the
     // change without waiting for a release or a delegation. Deferred:
@@ -1292,6 +1306,13 @@ export async function createPlugin(
     return sys?.primaryHostId ?? "";
   };
   const cmd = deps.cmd ?? createCmd();
+  let currentKb = parseKbConfig(currentSettings.kb, t);
+  const kbService = new KbService({
+    cmd,
+    config: () => currentKb.config,
+    t,
+    now,
+  });
   /** §22.1 (ревью): `<common>/.git/orchestrator-leaks.json` feeds the
    * shared `pre-commit` scan — refresh it on delegation too, not only
    * at release settings resolution. Best-effort at the call site. */
@@ -1471,6 +1492,7 @@ export async function createPlugin(
             rescued: 0,
             kept: [],
           }),
+    kbConfig: () => currentKb.config,
     log: bb.log,
     t,
   };
@@ -2061,6 +2083,126 @@ export async function createPlugin(
     },
   });
 
+  const resolveTaskKey = (threadId: string | undefined): string | undefined => {
+    if (!threadId) return undefined;
+    const delegation = store.byThreadId(threadId);
+    if (delegation?.task_key) return delegation.task_key;
+    const helper = store.helperByThreadId(threadId);
+    if (helper?.caller_delegation_id) {
+      const parentDel = store.get(helper.caller_delegation_id);
+      if (parentDel?.task_key) return parentDel.task_key;
+    }
+    return undefined;
+  };
+
+  bb.agents.registerTool({
+    name: "orchestrator_kb",
+    description: t("tool.kb"),
+    instructions: t("tool.kbInstr"),
+    parameters: z.object({
+      action: z
+        .enum(["list", "search", "read", "write", "append", "sync", "status"])
+        .describe(t("tool.kbAction")),
+      path: z.string().optional().describe(t("tool.kbPath")),
+      content: z.string().optional().describe(t("tool.kbContent")),
+      query: z.string().optional().describe(t("tool.kbQuery")),
+      message: z.string().optional().describe(t("tool.kbMessage")),
+      limit: z.number().int().positive().optional().describe(t("tool.kbLimit")),
+    }),
+    async execute(params, ctx) {
+      try {
+        kbService.assertEnabled();
+
+        const callerRole = ctx.threadId
+          ? store.threadRole(ctx.threadId)?.role
+          : undefined;
+        const isMutation =
+          params.action === "write" ||
+          params.action === "append" ||
+          params.action === "sync";
+        if (isMutation) {
+          const isAllowed =
+            callerRole === "orchestrator" || callerRole === "executor";
+          if (!isAllowed) {
+            throw new OrchestratorError(
+              "permission-denied",
+              t("tool.kbPermissionDenied", { role: callerRole ?? "unknown" }),
+            );
+          }
+        }
+
+        switch (params.action) {
+          case "list": {
+            const files = await kbService.list();
+            return JSON.stringify({ ok: true, files });
+          }
+          case "search": {
+            if (!params.query) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.kbQueryRequired"),
+              );
+            }
+            const results = await kbService.search(params.query, params.limit);
+            return JSON.stringify({ ok: true, results });
+          }
+          case "read": {
+            if (!params.path) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.kbPathRequired", { action: "read" }),
+              );
+            }
+            const content = await kbService.read(params.path);
+            return JSON.stringify({ ok: true, path: params.path, content });
+          }
+          case "write": {
+            if (!params.path) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.kbPathRequired", { action: "write" }),
+              );
+            }
+            const res = await kbService.write({
+              path: params.path,
+              content: params.content ?? "",
+              message: params.message,
+              taskKey: resolveTaskKey(ctx.threadId),
+              actor: ctx.threadId,
+            });
+            return JSON.stringify(res);
+          }
+          case "append": {
+            if (!params.path) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.kbPathRequired", { action: "append" }),
+              );
+            }
+            const res = await kbService.append({
+              path: params.path,
+              content: params.content ?? "",
+              message: params.message,
+              taskKey: resolveTaskKey(ctx.threadId),
+              actor: ctx.threadId,
+            });
+            return JSON.stringify(res);
+          }
+          case "sync": {
+            const res = await kbService.sync();
+            return JSON.stringify(res);
+          }
+          case "status": {
+            const res = await kbService.status();
+            return JSON.stringify(res);
+          }
+        }
+      } catch (e) {
+        return JSON.stringify(errorJson(e));
+      }
+    },
+  });
+
   const statusReport = (filter: { coordinatorThreadId?: string }) => {
     const delegations = store.list(filter);
     const counts = store.countsByStatus();
@@ -2301,6 +2443,11 @@ export async function createPlugin(
         summary: t("cli.helpRoleS"),
         usage: "bb orchestrator role set <thread> none [--json]",
       },
+      {
+        name: "kb",
+        summary: t("cli.helpKbS"),
+        usage: t("cli.kbUsage"),
+      },
     ],
     async run(argv, ctx: PluginCliContext) {
       const json = argv.includes("--json");
@@ -2322,11 +2469,182 @@ export async function createPlugin(
           argv[i - 1] !== "--kb" && argv[i - 1] !== "--no-kb" &&
           argv[i - 1] !== "--prompt" && argv[i - 1] !== "--prompt-file" &&
           argv[i - 1] !== "--attach" &&
-          argv[i - 1] !== "--title",
+          argv[i - 1] !== "--title" &&
+          argv[i - 1] !== "--message" && argv[i - 1] !== "--file" &&
+          argv[i - 1] !== "--content" && argv[i - 1] !== "--query" &&
+          argv[i - 1] !== "--limit",
       );
       const cmd = positional[0];
 
       try {
+        if (cmd === "kb") {
+          const sub = positional[1];
+          if (!sub) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              t("cli.kbUsage"),
+            );
+          }
+
+          if (sub === "list") {
+            const files = await kbService.list();
+            return json
+              ? jsonOk({ ok: true, files })
+              : {
+                  exitCode: 0,
+                  stdout: files.length > 0 ? files.join("\n") + "\n" : "",
+                };
+          }
+
+          if (sub === "search") {
+            const query = positional[2] ?? flag("--query");
+            if (!query) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.kbQueryRequired"),
+              );
+            }
+            const limitStr = flag("--limit");
+            let limit: number | undefined;
+            if (limitStr !== undefined) {
+              const parsed = Number(limitStr);
+              if (!Number.isInteger(parsed) || parsed <= 0) {
+                throw new OrchestratorError(
+                  "invalid-arguments",
+                  t("cli.kbLimitInvalid", { limit: limitStr }),
+                );
+              }
+              limit = parsed;
+            }
+            const results = await kbService.search(query, limit);
+            return json
+              ? jsonOk({ ok: true, query, results })
+              : {
+                  exitCode: 0,
+                  stdout:
+                    results.length > 0
+                      ? results
+                          .map((r) => `${r.file}:${r.line}: ${r.text}`)
+                          .join("\n") + "\n"
+                      : "",
+                };
+          }
+
+          if (sub === "read") {
+            const subPath = positional[2];
+            if (!subPath) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.kbPathRequired", { action: "read" }),
+              );
+            }
+            const content = await kbService.read(subPath);
+            return json
+              ? jsonOk({ ok: true, path: subPath, content })
+              : { exitCode: 0, stdout: content };
+          }
+
+          if (sub === "write" || sub === "append") {
+            const subPath = positional[2];
+            if (!subPath) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                t("cli.kbPathRequired", { action: sub }),
+              );
+            }
+            let content = flag("--content");
+            const fileArg = flag("--file");
+            if (content === undefined && fileArg !== undefined) {
+              try {
+                content = readFileSync(fileArg, "utf8");
+              } catch (e) {
+                throw new OrchestratorError(
+                  "invalid-arguments",
+                  t("cli.kbFileUnreadable", {
+                    file: fileArg,
+                    error: describeError(e),
+                  }),
+                );
+              }
+            }
+            if (content === undefined) {
+              content = "";
+            }
+            const message = flag("--message");
+            const taskKey = resolveTaskKey(ctx.threadId);
+            const res =
+              sub === "write"
+                ? await kbService.write({
+                    path: subPath,
+                    content,
+                    message,
+                    taskKey,
+                    actor: ctx.threadId,
+                  })
+                : await kbService.append({
+                    path: subPath,
+                    content,
+                    message,
+                    taskKey,
+                    actor: ctx.threadId,
+                  });
+            const shaPart = res.committed
+              ? ` (${res.sha.slice(0, 7)})`
+              : t("cli.kbUnchanged");
+            return json
+              ? jsonOk(res)
+              : {
+                  exitCode: 0,
+                  stdout: t("cli.kbMutation", {
+                    action: sub,
+                    file: res.file,
+                    detail: shaPart,
+                  }),
+                };
+          }
+
+          if (sub === "sync") {
+            const res = await kbService.sync();
+            if (json) return jsonOk(res);
+            return {
+              exitCode: res.synced ? 0 : 1,
+              stdout: res.synced
+                ? t("cli.kbSyncOk")
+                : t("cli.kbSyncNotSynced", {
+                    message: res.message ?? t("cli.kbNoRemotes"),
+                  }),
+            };
+          }
+
+          if (sub === "status") {
+            const res = await kbService.status();
+            if (json) return jsonOk(res);
+            const state = res.clean
+              ? t("cli.kbStatusClean")
+              : t("cli.kbStatusDirty");
+            const counts =
+              res.ahead || res.behind
+                ? t("cli.kbStatusCounts", {
+                    ahead: res.ahead,
+                    behind: res.behind,
+                  })
+                : "";
+            let stdout = t("cli.kbStatus", { state, counts });
+            if (res.dirtyFiles.length > 0) {
+              stdout += res.dirtyFiles.map((f) => `  ${f}`).join("\n") + "\n";
+            }
+            return {
+              exitCode: 0,
+              stdout,
+            };
+          }
+
+          throw new OrchestratorError(
+            "invalid-arguments",
+            t("cli.kbUsage"),
+          );
+        }
+
         if (cmd === "helper") {
           if (positional[1] === "cancel") {
             const ref = positional[2];

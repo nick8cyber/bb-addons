@@ -41,6 +41,7 @@ test("a root app thread is a coordinator: gets tools and the rule", () => {
       "orchestrator_cancel",
       "orchestrator_merge",
       "orchestrator_helper",
+      "orchestrator_kb",
     ],
   );
   // §3 rev 16: a fallback-decided coordinator gets the orchestrator
@@ -55,7 +56,7 @@ test("injectInstructions=false silences texts but keeps the tools", () => {
     ...deps,
     injectInstructions: false,
   });
-  assert.equal(config.tools.length, 5);
+  assert.equal(config.tools.length, 6);
   assert.equal(config.instructions, undefined);
 });
 
@@ -164,7 +165,7 @@ test("each executor marker alone is enough — one test per marker", () => {
     [],
   );
   // none of the markers → coordinator
-  assert.equal(buildAgentConfiguration(clean, deps).tools.length, 5);
+  assert.equal(buildAgentConfiguration(clean, deps).tools.length, 6);
 });
 
 test("the fallback uses static facts only when probes throw", () => {
@@ -181,7 +182,7 @@ test("the fallback uses static facts only when probes throw", () => {
     buildAgentConfiguration(ctx({}), { ...deps, probes: broken }),
   );
   const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
-  assert.equal(fb.tools.length, 5);
+  assert.equal(fb.tools.length, 6);
   const fbExec = fallbackAgentConfiguration(
     ctx({ thread: { parentThreadId: "thr_p" } }),
     true,
@@ -220,7 +221,7 @@ test("a broken role read falls back to the static-facts result", () => {
     buildAgentConfiguration(ctx({}), { ...deps, probes: broken }),
   );
   const fb = fallbackAgentConfiguration(ctx({}), true, "RULE");
-  assert.equal(fb.tools.length, 5);
+  assert.equal(fb.tools.length, 6);
   assert.equal(fb.instructions, `${ORCH_TEXT}
 
 RULE`);
@@ -234,7 +235,7 @@ test("configure without a thread_roles row: fallback gives orchestrator texts", 
     ...deps,
     probes: { ...noProbes, roleByThreadId: () => undefined },
   });
-  assert.equal(config.tools.length, 5);
+  assert.equal(config.tools.length, 6);
   assert.equal(config.instructions, `${ORCH_TEXT}
 
 RULE`);
@@ -271,7 +272,7 @@ test("§16.7: invalid policy → role-less root thread gets only the setup skill
   assert.equal(withRole.instructions, undefined);
   // Valid policy → full coordinator issuance as before.
   const ok = buildAgentConfiguration(ctx({}), { ...deps, policyOk: true });
-  assert.equal(ok.tools.length, 5);
+  assert.equal(ok.tools.length, 6);
 });
 
 test("§16.7: the error fallback honors policyOk — coordinator gets setup only", () => {
@@ -334,6 +335,7 @@ test("§17.1 r26 (Б2): a handoff plugin thread keeps its orchestrator row", () 
     "orchestrator_cancel",
     "orchestrator_merge",
     "orchestrator_helper",
+    "orchestrator_kb",
   ]);
   assert.deepEqual(writes, []);
 });
@@ -349,7 +351,7 @@ test("§17.1 r26 (Б2): an unrecorded handoff thread is a coordinator by static 
       },
     },
   );
-  assert.equal(config.tools.length, 5);
+  assert.equal(config.tools.length, 6);
 });
 
 test("§17.1 r26 (Б2): a configured-empty userThreadPlugins denies a handoff thread", () => {

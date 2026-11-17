@@ -298,6 +298,7 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
       "orchestrator_cancel",
       "orchestrator_merge",
       "orchestrator_helper",
+      "orchestrator_kb",
     ],
     skills: ["orchestrator-coordinator", "orchestrator-setup"],
   },
@@ -308,7 +309,8 @@ export const ROLES: Record<RoleId, RoleDefinition> = {
     // §19.1: helpers are the executor's only fan-out — every other
     // spawn/dispatch path is forbidden by the role text and the §19.5
     // hook gate.
-    tools: ["orchestrator_helper"],
+    // §26.4: orchestrator_kb for knowledge base reading and writing.
+    tools: ["orchestrator_helper", "orchestrator_kb"],
     skills: [],
   },
   auditor: {
