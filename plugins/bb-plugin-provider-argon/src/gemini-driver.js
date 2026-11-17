@@ -847,6 +847,8 @@ async function sendPrompt({
   files = null,
   waitForVerification = false,
   download = null,
+  sessionId = null,
+  downloadsDir = null,
   cdpPort = null,
   strictModel = false,
   strict = false,
@@ -893,12 +895,24 @@ async function sendPrompt({
     let lastText = '';
     let returnedConvId = convId;
     let downloadedPath = null;
+    let generatedFiles = [];
+    let skippedDownloads = [];
+
+    // PLUG-291: пользовательские файлы прикладываются веб-вложениями до
+    // вставки текста/хода — в т.ч. на хуковом пути runTurn (тесты).
+    const uploadList = Array.isArray(files) ? files : (file ? [file] : []);
+    const attachFn = driverHooks && driverHooks.attachFile ? driverHooks.attachFile : attachFile;
 
     if (driverHooks?.runTurn) {
+      for (const f of uploadList) {
+        await attachFn(page, f);
+      }
       const turnRes = await driverHooks.runTurn(page);
       lastText = turnRes.text || '';
       returnedConvId = turnRes.convId || convId;
       downloadedPath = turnRes.downloaded || null;
+      generatedFiles = turnRes.files || [];
+      skippedDownloads = turnRes.skippedDownloads || [];
     } else {
     if (page.url() === 'about:blank' || (convId && !page.url().includes(convId))) {
       const targetUrl = convId ? `https://gemini.google.com/app/${convId}` : GEMINI_APP_URL;
@@ -937,11 +951,8 @@ async function sendPrompt({
     }
     await throwIfCancelled();
 
-    if (file || files) {
-      const fileList = Array.isArray(files) ? files : (file ? [file] : []);
-      for (const f of fileList) {
-        await attachFile(page, f);
-      }
+    for (const f of uploadList) {
+      await attachFn(page, f);
     }
 
     const initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled });
@@ -1149,6 +1160,23 @@ async function sendPrompt({
       }
     }
 
+    if (downloadsDir) {
+      // PLUG-291: файлы, сгенерированные в ответе, скачиваются post-turn —
+      // пока DOM текущего ответа ещё жив (до ephemeral-удаления и парковки).
+      const coll = await collectGeneratedFiles(page, {
+        dir: downloadsDir,
+        sessionId: sessionId || returnedConvId || 'dl',
+        turnIndex: initialCount,
+        promptPrefix,
+        throwIfCancelled,
+      }).catch((err) => {
+        console.warn('[gemini] collectGeneratedFiles error:', err && err.message);
+        return { files: [], skipped: [] };
+      });
+      generatedFiles = coll.files || [];
+      skippedDownloads = coll.skipped || [];
+    }
+
     if (ephemeral) {
       try {
         const url = page.url();
@@ -1173,6 +1201,8 @@ async function sendPrompt({
     resObj.meta = {};
     resObj.convId = returnedConvId;
     resObj.downloaded = downloadedPath;
+    resObj.files = generatedFiles;
+    resObj.skippedDownloads = skippedDownloads;
 
     return resObj;
   } finally {
@@ -1604,6 +1634,293 @@ async function attachFile(page, filePath) {
   }, { timeout: 15000 }).catch(() => {});
 }
 
+/* ---------- PLUG-291: файлы, сгенерированные Gemini в ответе ---------- */
+const numEnv = (name, dflt) => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : dflt;
+};
+
+function sanitizeDownloadName(name) {
+  const s = String(name ?? '')
+    .replace(/[\\/<>:"|?*\x00-\x1f]/g, '_')
+    .replace(/\.\./g, '_')
+    .trim();
+  return (s || 'file').slice(0, 120);
+}
+
+// Белый список доменов Gemini/Google — клики и выгрузки только по нему.
+// googleapis.com — хостинг файлов (storage.googleapis.com и др.).
+function isAllowedDownloadHost(h) {
+  const x = String(h || '').toLowerCase();
+  return (
+    x === 'google.com' ||
+    x.endsWith('.google.com') ||
+    x === 'googleusercontent.com' ||
+    x.endsWith('.googleusercontent.com') ||
+    x === 'googleapis.com' ||
+    x.endsWith('.googleapis.com')
+  );
+}
+
+const MIME_BY_EXT = {
+  '.pdf': 'application/pdf',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.xls': 'application/vnd.ms-excel',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.doc': 'application/msword',
+  '.md': 'text/markdown',
+  '.txt': 'text/plain',
+  '.csv': 'text/csv',
+  '.tsv': 'text/tab-separated-values',
+  '.json': 'application/json',
+  '.zip': 'application/zip',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.html': 'text/html',
+  '.htm': 'text/html',
+  '.ics': 'text/calendar',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.mp4': 'video/mp4',
+};
+
+function mimeFromName(name) {
+  const ext = path.extname(String(name || '')).toLowerCase();
+  return MIME_BY_EXT[ext] || null;
+}
+
+function fileNameFromDisposition(disposition) {
+  const h = String(disposition || '');
+  const star = h.match(/filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ''));
+    } catch {}
+  }
+  const plain = h.match(/filename\s*=\s*"?([^";]+)"?/);
+  return plain ? plain[1].trim() : null;
+}
+
+/**
+ * Сбор файлов, которые Gemini Web сгенерировал в текущем ответе.
+ * Сканируется только DOM ответа текущего хода (findTurnTarget), никогда
+ * `model-response:last-of-type` — иначе файлы прошлых ходов качались бы
+ * повторно. Два канала: прямые download-URL белого списка доменов через
+ * context.request и кнопки Download/Export через download-событие (клик).
+ * Ссылки вне белого списка не кликаются и не выгружаются.
+ */
+async function collectGeneratedFiles(page, opts = {}) {
+  const dir = opts.dir;
+  const files = [];
+  const skipped = [];
+  if (!dir || !page) return { files, skipped };
+  const maxCount = numEnv('ARGON_MAX_DOWNLOAD_COUNT', 5);
+  const maxBytes = numEnv('ARGON_MAX_DOWNLOAD_BYTES', 50 * 1024 * 1024);
+  const nonce = `n${Date.now().toString(36)}`;
+
+  let cands = null;
+  try {
+    cands = await safeEval(
+      page,
+      ({ idx, promptPrefix, fnSrc, tagAttr }) => {
+        if (!window.__argonFindTurnTarget && fnSrc) {
+          window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+        }
+        const fn = window.__argonFindTurnTarget;
+        const target = fn ? fn(document, idx, promptPrefix) : null;
+        if (!target) return [];
+        const FILE_EXT_RE =
+          /\.(pdf|pptx?|xlsx?|docx?|csv|tsv|md|txt|zip|json|png|jpe?g|gif|svg|webp|mp3|wav|mp4|html?|ics|epub)(?:$|[?#])/i;
+        const okHost = (u) => {
+          try {
+            const h = new URL(u, location.href).hostname.toLowerCase();
+            return (
+              h === 'google.com' ||
+              h.endsWith('.google.com') ||
+              h === 'googleusercontent.com' ||
+              h.endsWith('.googleusercontent.com') ||
+              h === 'googleapis.com' ||
+              h.endsWith('.googleapis.com')
+            );
+          } catch {
+            return false;
+          }
+        };
+        const out = [];
+        const seen = new Set();
+        let seq = 0;
+        for (const a of target.querySelectorAll('a[href]')) {
+          const href = a.href || a.getAttribute('href') || '';
+          if (!href || seen.has(href)) continue;
+          if (!okHost(href)) continue;
+          const hasDl = a.hasAttribute('download');
+          const label = ((a.getAttribute('aria-label') || '') + ' ' + (a.innerText || '')).trim();
+          const dlText = /download|скачать|export|экспорт/i.test(label);
+          if (!hasDl && !dlText && !FILE_EXT_RE.test(href)) continue;
+          seen.add(href);
+          const tag = `${tagAttr}-${seq++}`;
+          a.setAttribute('data-argon-dl', tag);
+          out.push({
+            kind: 'link',
+            tag,
+            href,
+            name: (a.getAttribute('download') || label || '').slice(0, 120),
+            canClick: hasDl,
+          });
+        }
+        for (const b of target.querySelectorAll('button, [role="button"], a:not([href])')) {
+          const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).trim();
+          if (!/download|скачать|export|экспорт/i.test(label)) continue;
+          const tag = `${tagAttr}-${seq++}`;
+          b.setAttribute('data-argon-dl', tag);
+          out.push({ kind: 'click', tag, name: label.slice(0, 120) });
+        }
+        return out;
+      },
+      { idx: opts.turnIndex ?? 0, promptPrefix: opts.promptPrefix || '', fnSrc: findTurnTarget.toString(), tagAttr: nonce }
+    );
+  } catch {
+    return { files, skipped };
+  }
+
+  if (!Array.isArray(cands) || !cands.length) return { files, skipped };
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    return { files, skipped };
+  }
+  const sessTag = sanitizeDownloadName(opts.sessionId || 'dl');
+  const ts = Date.now();
+  let seq = 0;
+  const destFor = (name) => path.join(dir, `${sessTag}-${ts}-${++seq}-${sanitizeDownloadName(name)}`);
+  const nameFromUrl = (u) => {
+    try {
+      const p = new URL(u).pathname;
+      return p.split('/').filter(Boolean).pop() || null;
+    } catch {
+      return null;
+    }
+  };
+  const skipNote = (name, reason) =>
+    skipped.push({ name: String(name || 'file').slice(0, 120), reason: String(reason).slice(0, 160) });
+
+  const tryDownloadByClick = async (c, fallbackName) => {
+    const el = await safeQuery(page, `[data-argon-dl="${c.tag}"]`);
+    if (!el) {
+      skipNote(fallbackName || c.name || 'download', 'element gone');
+      return;
+    }
+    try {
+      const [dl] = await Promise.all([
+        page.waitForEvent('download', { timeout: 10000 }),
+        el.click({ timeout: 5000 }),
+      ]);
+      const name = sanitizeDownloadName(
+        (dl.suggestedFilename && dl.suggestedFilename()) || fallbackName || c.name || 'file'
+      );
+      const dest = destFor(name);
+      await dl.saveAs(`${dest}.part`);
+      let st;
+      try {
+        st = fs.statSync(`${dest}.part`);
+      } catch {
+        skipNote(name, 'download did not materialize');
+        return;
+      }
+      if (st.size > maxBytes) {
+        try {
+          fs.unlinkSync(`${dest}.part`);
+        } catch {}
+        skipNote(name, `too large (${st.size} bytes > ${maxBytes})`);
+        return;
+      }
+      fs.renameSync(`${dest}.part`, dest);
+      files.push({ path: dest, name, mimeType: mimeFromName(name), sizeBytes: st.size });
+    } catch (e) {
+      skipNote(fallbackName || c.name || 'download', String((e && e.message) || e));
+    }
+  };
+
+  for (const c of cands) {
+    if (files.length >= maxCount) {
+      skipNote(c.name || c.href || 'file', `count limit (${maxCount})`);
+      continue;
+    }
+    if (opts.throwIfCancelled) {
+      try {
+        await opts.throwIfCancelled();
+      } catch {
+        return { files, skipped };
+      }
+    }
+    if (c.kind === 'link') {
+      let done = false;
+      try {
+        const ctx = page.context && page.context();
+        const req = ctx && ctx.request;
+        if (!req) throw new Error('no request context');
+        const resp = await req.get(c.href, { timeout: 15000 });
+        if (!resp.ok()) {
+          if (c.canClick) {
+            await tryDownloadByClick(c);
+          } else {
+            skipNote(c.name || nameFromUrl(c.href) || 'file', `http ${resp.status()}`);
+          }
+          done = true;
+        } else {
+          const headers = resp.headers();
+          const cl = Number(headers['content-length'] || 0);
+          if (cl > maxBytes) {
+            skipNote(c.name || nameFromUrl(c.href) || 'file', `too large (${cl} bytes > ${maxBytes})`);
+            done = true;
+          } else {
+            const body = await resp.body();
+            if (body.length > maxBytes) {
+              skipNote(c.name || nameFromUrl(c.href) || 'file', `too large (${body.length} bytes > ${maxBytes})`);
+            } else {
+              const name = sanitizeDownloadName(
+                fileNameFromDisposition(headers['content-disposition']) ||
+                  c.name ||
+                  nameFromUrl(c.href) ||
+                  'file'
+              );
+              const dest = destFor(name);
+              const tmp = `${dest}.part`;
+              fs.writeFileSync(tmp, body);
+              fs.renameSync(tmp, dest);
+              files.push({
+                path: dest,
+                name,
+                mimeType: String(headers['content-type'] || '').split(';')[0].trim() || mimeFromName(name),
+                sizeBytes: body.length,
+              });
+            }
+            done = true;
+          }
+        }
+      } catch (e) {
+        if (c.canClick) {
+          await tryDownloadByClick(c);
+        } else {
+          skipNote(c.name || nameFromUrl(c.href) || 'file', String((e && e.message) || e));
+        }
+        done = true;
+      }
+      void done;
+    } else {
+      await tryDownloadByClick(c);
+    }
+  }
+  return { files, skipped };
+}
+
 async function downloadGeneratedMedia(page, targetPath) {
   const fs = require('fs');
   const path = require('path');
@@ -1760,6 +2077,9 @@ module.exports = {
   getBrowserStatus,
   getUploadToolsButton,
   attachFile,
+  collectGeneratedFiles,
+  sanitizeDownloadName,
+  isAllowedDownloadHost,
   downloadGeneratedMedia,
   listConversations,
   listConversationsInternal,

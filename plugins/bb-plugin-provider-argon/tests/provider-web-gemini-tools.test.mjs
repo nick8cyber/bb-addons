@@ -1239,3 +1239,37 @@ test("Audit 13 Finding 4: filterGitPatchZOutput не путает строки �
   assert.ok(filteredLog.includes("line1"), "сообщение коммита присутствует");
   assert.ok(filteredLog.includes("init"), "предыдущий коммит присутствует и не съеден");
 });
+
+test("PLUG-291: packFirstMessage переливает материалы >лимита в .md-файл (spillDir/spilledFile)", () => {
+  const cwd = mkTmp("argon-cwd-spill-");
+  fs.mkdirSync(path.join(cwd, "files"));
+  const filenames = [];
+  for (let i = 0; i < 5; i++) {
+    const fn = `files/doc${i}.txt`;
+    fs.writeFileSync(path.join(cwd, fn), "Y".repeat(28 * 1024));
+    filenames.push(fn);
+  }
+  const spillDir = path.join(mkTmp("argon-spill-"), "uploads");
+  const text = `Проверь файлы: ${filenames.join(" ")}`;
+  const r = packFirstMessage({ text, cwd, spillDir, spillId: "sess-1" });
+  assert.ok(r.spilledFile, "spilledFile expected for oversized package");
+  assert.ok(fs.existsSync(r.spilledFile));
+  assert.ok(r.spilledFile.startsWith(spillDir));
+  assert.match(path.basename(r.spilledFile), /^pkg-sess-1-\d+\.md$/);
+  // Сообщение компактное: в пределах лимита, с пометкой о вложении вместо обрезки.
+  assert.ok(Buffer.byteLength(r.message, "utf8") <= 120 * 1024);
+  assert.match(r.message, /файлом-вложением/);
+  assert.match(r.message, /pkg-sess-1-/);
+  assert.deepEqual(r.overflow, []);
+  assert.ok(r.attached.length >= filenames.length);
+  // Пакет содержит все блоки-материалы целиком.
+  const pkg = fs.readFileSync(r.spilledFile, "utf8");
+  for (const fn of filenames) {
+    assert.ok(pkg.includes(fn), `pkg must name ${fn}`);
+  }
+  assert.ok(pkg.includes("Y".repeat(100)), "pkg must contain file bodies");
+  // Без spillDir — прежнее поведение: вытеснение блоков + подсказка.
+  const r2 = packFirstMessage({ text, cwd });
+  assert.equal(r2.spilledFile, undefined);
+  assert.ok(r2.overflow.length > 0);
+});
