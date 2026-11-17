@@ -399,15 +399,15 @@ function throwIfPromptTooLarge(prompt) {
 
 async function selectModelAndThinking(page, model, thinking, strict = false) {
   const isMenuOpen = async () => {
-    const menu = await page.$('gem-menu[role="menu"], [role="menuitem"]');
-    return menu ? await menu.isVisible().catch(() => false) : false;
+    const menu = await page.$('gem-menu[role="menu"]:visible, gem-menu-item[data-mode-id]:visible, [role="menuitem"]:visible');
+    return menu !== null;
   };
 
   const openMenu = async () => {
     if (await isMenuOpen()) return;
     const btn = await getPickerButton(page);
     await btn.click({ timeout: 8000 });
-    await page.waitForSelector('[role="menuitem"], gem-menu-item', { timeout: 8000 });
+    await page.waitForSelector('gem-menu-item[data-mode-id]:visible, gem-menu-item:visible, [role="menuitem"]:visible', { timeout: 8000 });
     await page.waitForTimeout(300);
   };
 
@@ -1099,7 +1099,7 @@ async function dismissOverlays(page) {
 
     // 1. Google Cookie / Privacy Consent dialogs ("Before you continue to Google")
     const consentBtn = await page.$(
-      'button:has-text("Accept all"), [aria-label*="Accept all" i], button:has-text("I agree"), [aria-label*="I agree" i]'
+      'button:has-text("Accept all"), button:has-text("Принять все"), button:has-text("Принять всё"), [aria-label*="Accept all" i], button:has-text("I agree"), button:has-text("Согласен"), [aria-label*="I agree" i]'
     );
     if (consentBtn) {
       const isVisible = await consentBtn.isVisible().catch(() => false);
@@ -1111,7 +1111,7 @@ async function dismissOverlays(page) {
 
     // 2. "Stay signed out" / "Dismiss" prompts
     const staySignedOutBtn = await page.$(
-      'button:has-text("Stay signed out"), [aria-label*="Stay signed out" i], button:has-text("Dismiss"), button:has-text("No thanks")'
+      'button:has-text("Stay signed out"), button:has-text("Не входить в аккаунт"), [aria-label*="Stay signed out" i], button:has-text("Dismiss"), button:has-text("No thanks"), button:has-text("Не сейчас"), button:has-text("Спасибо, не надо")'
     );
     if (staySignedOutBtn) {
       const isVisible = await staySignedOutBtn.isVisible().catch(() => false);
@@ -1123,7 +1123,7 @@ async function dismissOverlays(page) {
 
     // 3. Onboarding / "Got it" / "Next" dialogs
     const gotItBtn = await page.$(
-      'button:has-text("Got it"), [aria-label*="Got it" i], button:has-text("Done"), [aria-label*="Done" i], button:has-text("Continue")'
+      'button:has-text("Got it"), button:has-text("Понятно"), [aria-label*="Got it" i], button:has-text("Done"), button:has-text("Готово"), [aria-label*="Done" i], button:has-text("Continue"), button:has-text("Продолжить")'
     );
     if (gotItBtn) {
       const isVisible = await gotItBtn.isVisible().catch(() => false);
@@ -1346,13 +1346,13 @@ async function deleteConversationInternal(page, targetId) {
   await moreBtn.click();
 
   const deleteMenuItem = await page.waitForSelector(
-    '[data-test-id="delete-button"], [role="menuitem"]:has-text("Delete")',
+    '[data-test-id="delete-button"], [role="menuitem"]:has-text("Delete"), [role="menuitem"]:has-text("Удалить")',
     { timeout: 3000 }
   );
   await deleteMenuItem.click();
 
   const dialog = await page.waitForSelector('mat-dialog-container', { timeout: 5000 });
-  const confirmBtn = await dialog.waitForSelector('button:has-text("Delete")', { timeout: 3000 });
+  const confirmBtn = await dialog.waitForSelector('button:has-text("Delete"), button:has-text("Удалить"), [data-test-id="confirm-button"]', { timeout: 3000 });
   await confirmBtn.click();
 
   await dialog.waitForElementState('hidden', { timeout: 5000 }).catch(() => {});
@@ -1378,7 +1378,7 @@ async function deleteConversation(idOrIndex, opts = {}) {
 
 async function getUploadToolsButton(page) {
   return page.$(
-    'button[aria-label="Upload & tools"], button[aria-label*="Upload & tools" i], button[aria-label*="tools" i], button:has([data-mat-icon-name="plus"])'
+    '[data-test-id="upload-button"], button[aria-label="Upload & tools"], button[aria-label*="Upload & tools" i], button[aria-label*="tools" i], button[aria-label*="Загрузка" i], button[aria-label*="инструменты" i], button:has([data-mat-icon-name="plus"]), button:has([data-mat-icon-name="add"])'
   );
 }
 
@@ -1399,7 +1399,7 @@ async function attachFile(page, filePath) {
   await page.waitForTimeout(300);
 
   const uploadItem = await page.$(
-    '[role="menuitem"]:has-text("Upload files"), .mat-mdc-menu-item:has-text("Upload files")'
+    '[data-test-id="local-images-files-uploader-button"], [role="menuitem"]:has-text("Upload files"), [role="menuitem"]:has-text("Загрузить файлы"), .mat-mdc-menu-item:has-text("Upload files"), .mat-mdc-menu-item:has-text("Загрузить файлы")'
   );
   if (!uploadItem) {
     throw new Error('"Upload files" option not found in tools menu.');
@@ -1416,7 +1416,7 @@ async function attachFile(page, filePath) {
   // Wait up to 15s for file preview chip to appear and send button to become enabled
   await page.waitForFunction(() => {
     const hasChip = document.querySelector('[aria-label*="close" i], [aria-label*="remove" i], file-preview') !== null;
-    const btn = document.querySelector('button[aria-label*="Send message"], button[aria-label="Send message"]');
+    const btn = document.querySelector('button[aria-label*="Send message"], button[aria-label="Send message"], button[aria-label*="Отправить"], button.send-button');
     const btnReady = btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
     return hasChip && btnReady;
   }, { timeout: 15000 }).catch(() => {});

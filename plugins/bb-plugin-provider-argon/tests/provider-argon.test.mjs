@@ -17,6 +17,9 @@ import {
   getAccountPriority,
   getAccountTier,
   MODELS,
+  slog,
+  reapOrphanAcpServers,
+  checkStaleCode,
 } from "../acp-server.mjs";
 
 const require = createRequire(import.meta.url);
@@ -1230,4 +1233,38 @@ test("8. Smart model routing: pickBackendFromState prioritizes pro accounts for 
   fakeState.accounts["ultra-1"].priority = 0;
   const zeroPick = pickBackendFromState(fakeState, null, "test-owner", Date.now(), "argon", testBackends);
   assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
+});
+
+test("9. acp-server slog and lifecycle guards, driver :visible and RU selectors", async () => {
+  // 1. slog writes to acp-server.log under STATE_DIR
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-slog-test-")));
+  process.env.ARGON_STATE_DIR = tmpDir;
+  slog("test:stage", { foo: "bar" });
+  const logFile = path.join(tmpDir, "acp-server.log");
+  assert.ok(fs.existsSync(logFile), "acp-server.log must be created");
+  const logContent = fs.readFileSync(logFile, "utf8");
+  assert.match(logContent, /test:stage \{"foo":"bar"\}/);
+
+  // 2. reapOrphanAcpServers safely executes on linux
+  const reaped = reapOrphanAcpServers();
+  assert.equal(typeof reaped, "number");
+
+  // 3. Driver :visible and RU selectors
+  const driverSrc = fs.readFileSync(path.join(PLUGIN_ROOT, "src/gemini-driver.js"), "utf8");
+  assert.ok(
+    driverSrc.includes("gem-menu-item[data-mode-id]:visible"),
+    "driver must prioritize gem-menu-item[data-mode-id]:visible in openMenu / isMenuOpen"
+  );
+  assert.ok(
+    driverSrc.includes("local-images-files-uploader-button"),
+    "driver must check local-images-files-uploader-button first in attachFile"
+  );
+  assert.ok(
+    driverSrc.includes("Загрузить файлы"),
+    "driver must support RU 'Загрузить файлы' in attachFile"
+  );
+  assert.ok(
+    driverSrc.includes("Удалить"),
+    "driver must support RU 'Удалить' in delete conversation"
+  );
 });

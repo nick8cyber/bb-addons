@@ -22,6 +22,7 @@ import {
   renameSync,
   statSync,
   writeFileSync,
+  appendFileSync,
   constants,
 } from "node:fs";
 
@@ -631,6 +632,84 @@ function getDriver() {
 const out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Stage log: every prompt transition lands here so a silent hang shows its
+// exact stage (bindBackend wait, driver call, streaming) — postmortem 17.11.
+export const slog = (stage, extra) => {
+  try {
+    const dir = process.env.ARGON_STATE_DIR || STATE_DIR;
+    appendFileSync(
+      join(dir, "acp-server.log"),
+      `${new Date().toISOString()} pid=${process.pid} ${stage}${extra ? " " + JSON.stringify(extra) : ""}\n`
+    );
+  } catch {}
+};
+
+// --- process lifecycle & orphan reaper (PLUG-278 / PLUG-274 postmortem) ---
+const serverFilePath = fileURLToPath(import.meta.url);
+let startupMtime = 0;
+try {
+  startupMtime = statSync(serverFilePath).mtimeMs;
+} catch {}
+
+export function checkStaleCode() {
+  if (startupMtime <= 0) return false;
+  try {
+    const curMtime = statSync(serverFilePath).mtimeMs;
+    if (curMtime > startupMtime) {
+      slog("server:stale-code-exit", { startupMtime, curMtime });
+      void cleanShutdown();
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+export function reapOrphanAcpServers() {
+  if (process.platform !== "linux") return 0;
+  let reaped = 0;
+  try {
+    const entries = readdirSync("/proc");
+    const myPid = process.pid;
+    for (const ent of entries) {
+      if (!/^\d+$/.test(ent)) continue;
+      const pid = Number(ent);
+      if (pid === myPid) continue;
+      try {
+        const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+        if (!cmdline.includes("acp-server.mjs")) continue;
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const match = stat.match(/\)\s+[RSDZTW]\s+(\d+)/);
+        if (!match) continue;
+        const ppid = Number(match[1]);
+        if (ppid === 1) {
+          slog("reaper:killing-orphan", { pid });
+          try {
+            process.kill(pid, "SIGTERM");
+            reaped++;
+          } catch {}
+        }
+      } catch {}
+    }
+  } catch (e) {
+    slog("reaper:error", { error: String(e) });
+  }
+  return reaped;
+}
+
+// Parent-death watchdog: reparented onto init/systemd means bridge parent died
+const ownerPpid = process.ppid;
+const ppidWatch = setInterval(() => {
+  if (process.ppid !== ownerPpid || process.ppid === 1) {
+    slog("process:reparented-exit", { ownerPpid, currentPpid: process.ppid });
+    void cleanShutdown();
+    return;
+  }
+  if (!activePromptSessionId) {
+    checkStaleCode();
+  }
+}, 5_000);
+ppidWatch.unref?.();
+
 /* ---------- session state ---------- */
 const sessions = new Map();
 let sessionCounter = 0;
@@ -869,8 +948,10 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       err.code = "ARGON_PROMPT_TOO_LARGE";
       throw err;
     }
+    slog("prompt:enqueue", { sessionId, chars: text.length, model: s.model });
     const result = await enqueue(async () => {
       if (s.cancelled) return { cancelled: true };
+      slog("prompt:dequeue", { sessionId });
 
       if (FAKE) {
         const bound = await bindBackend(s, sessionId);
@@ -938,12 +1019,16 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       while (true) {
         if (s.cancelled) return { cancelled: true };
         const bound = await bindBackend(s, sessionId);
-        if (bound.error) throw new Error(bound.error);
+        if (bound.error) {
+          slog("bind:error", { sessionId, error: bound.error });
+          throw new Error(bound.error);
+        }
         if (bound.busyUntil) {
           if (s.cancelled) return { cancelled: true };
           if (Date.now() >= waitDeadline) {
             throw new Error(`account "${bound.account || "picked"}" is busy until ${new Date(bound.busyUntil).toISOString()}`);
           }
+          slog("bind:busy", { sessionId, account: bound.account, busyUntil: new Date(bound.busyUntil).toISOString() });
           const wakeAt = Math.min(Date.now() + Math.max(bound.busyUntil - Date.now() + 500, 3000), Date.now() + 15_000);
           while (!s.cancelled && Date.now() < wakeAt) await sleep(500);
           continue;
@@ -977,6 +1062,14 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             // §3 Tool Loop: все раунды — в том же convId на том же бэкенде,
             // лиз удерживается до конца хода.
             const sendOnce = async (message) => {
+              slog("driver:send", {
+                sessionId,
+                account: backend.id,
+                model: s.model,
+                thinking: mappedThinking,
+                chars: message.length,
+                convId: s.convId || null,
+              });
               const res = await driverMod.sendPrompt({
                 prompt: message,
                 model: s.model,
@@ -1003,6 +1096,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               if (res && res.convId) {
                 s.convId = res.convId;
               }
+              slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
               return res;
             };
             let toolSeq = 0;
@@ -1106,6 +1200,12 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           return r;
         } catch (err) {
           lastErr = err;
+          slog("driver:error", {
+            sessionId,
+            account: backend.id,
+            error: err && err.message ? String(err.message).slice(0, 300) : String(err),
+            code: err && err.code,
+          });
           if (err && err.code === "ARGON_CANCELLED") {
             await releaseLease(backend.id);
             activeBackendId = null;
@@ -1165,6 +1265,7 @@ let isExiting = false;
 async function cleanShutdown() {
   if (isExiting) return;
   isExiting = true;
+  clearInterval(ppidWatch);
   try {
     if (activeAbort) {
       activeAbort.abort();
@@ -1404,6 +1505,7 @@ export function dispatch(msg) {
 
 /* ---------- CLI entrypoint ---------- */
 export function startServer() {
+  reapOrphanAcpServers();
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on("line", (line) => {
     let msg;
