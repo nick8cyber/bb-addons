@@ -1004,15 +1004,24 @@ async function sendPrompt({
     resObj.convId = returnedConvId;
     resObj.downloaded = downloadedPath;
 
-    // Capture usage limits post-turn before parking tab on about:blank
+    return resObj;
+  } finally {
+    // Capture usage limits post-turn on every turn (including rate-limited / failed turns)
+    // before parking tab on about:blank
     try {
-      if (page && page.url && page.url().includes('gemini.google.com')) {
-        await usageLimits.captureUsageLimits(page, {
-          accountId: accountId || (backend && backend.id) || profile,
-          backend,
-          stateDir,
-          tier: tier || (backend && backend.tier),
-        });
+      if (page && !page.isClosed?.() && typeof page.url === 'function' && page.url().includes('gemini.google.com')) {
+        const timeoutMs = Number(process.env.ARGON_USAGE_TIMEOUT_MS || 10_000);
+        await Promise.race([
+          usageLimits.captureUsageLimits(page, {
+            accountId: accountId || (backend && backend.id) || profile,
+            backend,
+            stateDir,
+            tier: tier || (backend && backend.tier),
+          }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('captureUsageLimits timeout')), timeoutMs)
+          ),
+        ]);
       }
     } catch (err) {
       if (process.env.ARGON_DEBUG) {
@@ -1020,8 +1029,6 @@ async function sendPrompt({
       }
     }
 
-    return resObj;
-  } finally {
     if (page && process.env.GEMINI_PARK_IDLE !== '0') {
       await page.goto('about:blank', { timeout: 5000 }).catch(() => {});
     }

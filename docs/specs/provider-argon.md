@@ -189,9 +189,9 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   - Gemini отдаёт лимиты через внутренний RPC-канал `batchexecute` (тот же интерфейс, что использует веб-страница `/usage`).
   - Вызов выполняется функцией `captureUsageLimits(page, opts)` через `Runtime.evaluate` (`page.evaluate`) в контексте страницы `gemini.google.com`:
     1. Из глобального объекта `window.WIZ_global_data` читаются параметры: `SNlM0e` (`at`-токен), `cfb2h` (`bl`), `FdrFJe` (`f.sid`). Токены `at` и `f.sid` используются исключительно in-memory и никогда не сохраняются на диск.
-    2. Выполняется `POST /_/BardChatUi/data/batchexecute?rpcids=<rpcid>&source-path=/usage&bl=<bl>&f.sid=<fsid>&hl=en&_reqid=<rnd>&rt=c` с заголовком `Content-Type: application/x-www-form-urlencoded;charset=UTF-8`, телом `f.req=[[[rpcid,args,null,"generic"]]]&at=<at>` и `credentials: "include"`.
-    3. Дефолтный рецепт RPC: `rpcid = "jSf9Qc"`, `args = "[]"`.
-    4. **Самолечение рецепта (self-healing):** парсер обходит все `wrb.fr`-фреймы в ответе. Фрейм, содержащий записи метрик, возвращает свой рабочий `rpcid`. Если он отличается от сохранённого рецепта, поле `recipe` в `accounts-usage.json` обновляется с новым `rpcid`.
+    2. Выполняется `POST /_/BardChatUi/data/batchexecute?rpcids=<rpcids>&source-path=/usage&bl=<bl>&f.sid=<fsid>&hl=en&_reqid=<rnd>&rt=c` с заголовком `Content-Type: application/x-www-form-urlencoded;charset=UTF-8`, телом `f.req=[[[rpcid1,args,null,"generic"],[rpcid2,...]]]&at=<at>` и `credentials: "include"`. Внутри браузерного запроса вызов защищён сигналом `AbortController` (таймаут 8 с), а сам `page.evaluate` обёрнут в `Promise.race` с таймаутом 9 с.
+    3. Дефолтный рецепт RPC: `rpcid = "jSf9Qc"`, `args = "[]"`. Список кандидатов RPC ID: `['jSf9Qc', 'kAb7Z']`.
+    4. **Самолечение рецепта (self-healing):** запрос отправляет батч из 2-3 кандидатов RPC ID (`f.req`/`rpcids`). При сбое батча предусмотрен последовательный фолбэк по списку кандидатов. Парсер обходит все `wrb.fr`-фреймы в ответе. Фрейм, содержащий записи метрик, возвращает свой рабочий `rpcid`. Если он отличается от сохранённого рецепта, поле `recipe` в `accounts-usage.json` обновляется с новым `rpcid`.
     5. **Разбор ответа:** ответ очищается от анти-XSSI префикса `)]}'`, извлекаются фреймы `[["wrb.fr", rpcid, payloadJson], …]`. В `payload` рекурсивно ищется массив записей-метрик `e`:
        - `e[1]` — доля использования 0..1.5 (`percent = Math.round(e[1] * 100)`);
        - `e[2]` — период (`1` = 5-часовое окно/daily, `2` = недельный/weekly);
@@ -200,9 +200,9 @@ tags: [bb, plugins, provider-argon, acp, gemini]
 - **Условия вызова и ограничения:**
   - **Только в живой вкладке:** вызов выполняется ТОЛЬКО когда вкладка аккаунта уже активна на домене `gemini.google.com` (URL содержит `gemini.google.com`, не `about:blank`).
   - **Никакого запуска Chrome ради статистики:** если Chrome не поднимался для выполнения хода — сбор безусловно пропускается.
-  - **Точки обновления:** сбор вызывается в `sendPrompt` после успешного завершения хода, непосредственно перед парковкой вкладки на `about:blank`.
+  - **Точки обновления:** сбор вызывается в `sendPrompt` в блоке `finally` после завершения каждого хода (независимо от исхода — как при успешном ответе, так и при ошибке хода / rate-limit, когда фиксация лимитов наиболее ценна), непосредственно перед парковкой вкладки на `about:blank`.
+  - **Таймаут и изоляция сбоев хода:** вызов `captureUsageLimits` в `finally` ограничен `Promise.race` с таймаутом 10 с. Любой сбой (сетевой, таймаут, отсутствие `SNlM0e`, смена формата) логируется только в debug-режиме (`ARGON_DEBUG`) и ни при каких условиях не влияет на результат или ошибку хода.
   - **Троттлинг:** не чаще одного раза в `ARGON_USAGE_REFRESH_MS` (дефолт 300 000 мс / 5 минут) на каждый аккаунт. Троттлинг проверяется в памяти процесса и по штампу `updatedAt` в `accounts-usage.json`.
-  - **Изоляция ошибок:** любой сбой (сетевой, отсутствие `SNlM0e`, смена формата) логируется только в debug-режиме (`ARGON_DEBUG`) и не влияет на результат хода или состояние сессии.
 - **Формат файла `$ARGON_STATE_DIR/accounts-usage.json`:**
   ```json
   {
@@ -222,8 +222,10 @@ tags: [bb, plugins, provider-argon, acp, gemini]
     }
   }
   ```
-  - Определение `tier`: значение из `backend.tier` (из `pool.json`), либо детектируется по DOM (`gemini advanced`/`gemini ultra` → `"ultra"`, иначе `"pro"`).
-  - Multi-process пул: запись в файл выполняется атомарно через файл-замок `accounts-usage.json.lock`, временный файл `.tmp` и `renameSync`. Существующие записи других аккаунтов не затираются (контракт read-merge-write).
+  - Определение `tier`: значение из `backend.tier` (из `pool.json`), либо детектируется по DOM (`gemini advanced`/`gemini ultra` → `"ultra"`, иначе `"pro"`). При обновлении предотвращается случайный даунгрейд с `ultra` до `pro` при пропуске DOM-детекции.
+  - Multi-process пул и частичные ответы:
+    - Запись в файл выполняется атомарно через файл-замок `accounts-usage.json.lock`, содержащий уникальный токен процесса (`pid:ts:random`). Замок снимается в `finally` только при точном совпадении токена (защита от гонок при снятии чужого перехваченного лока).
+    - Read-merge-write: при частичном ответе сервера (наличие только одной из метрик `daily`/`weekly`) существующие метрики аккаунта объединяются со снапшотом предыдущего состояния (`daily ?? prev?.daily ?? null`). Записи других аккаунтов пула сохраняются.
 
 ---
 
@@ -247,8 +249,9 @@ tags: [bb, plugins, provider-argon, acp, gemini]
   3. Функции `parseResetTimeMs` и `classifyFailure` на всех вариантах английских и русских сообщений о лимитах, недоступности уровня `thinking` и истечении дедлайна.
   4. Строгий режим `selectModelAndThinking` (`isDisabled` при `strict: true` порождает `rate-limit` ошибку `thinking level is rate-limited`) и индекс `responses[idx]` без отката к `responses[responses.length - 1]`.
   5. Разбор batchexecute wrb.fr фреймов функцией `parseUsageLimits` (daily/weekly, проценты, reset epoch sec, самолечение recipe при смене rpcid).
-  6. Multi-process merge-логика и атомарная запись `accounts-usage.json` (сохранение чужих аккаунтов пула при параллельных обновлениях).
-  7. Гейтинг и троттлинг `captureUsageLimits` (пропуск вызова на `about:blank`, соблюдение `ARGON_USAGE_REFRESH_MS`, обход через `force: true`).
+  6. Multi-process merge-логика и атомарная запись `accounts-usage.json` (сохранение чужих аккаунтов пула при параллельных обновлениях, слияние со снапшотом предыдущего состояния без затирания частичных метрик, сохранение `tier: ultra`, защита файла замка через уникальный токен `pid:ts:random`).
+  7. Гейтинг и троттлинг `captureUsageLimits` (пропуск вызова на `about:blank`, соблюдение `ARGON_USAGE_REFRESH_MS`, обход через `force: true`, изоляция таймаута браузерного запроса и батчинг кандидатов RPC ID).
+  8. Интеграция `sendPrompt` с фиксацией лимитов в `finally` (вызов как при успешном ответе, так и при сбое/rate-limit хода, отсутствие зависания при медленном или зависшем `captureUsageLimits`, проброс `backend.tier`).
 
 ---
 

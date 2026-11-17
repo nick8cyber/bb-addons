@@ -18,6 +18,7 @@ import {
 
 const require = createRequire(import.meta.url);
 const driver = require("../src/gemini-driver.js");
+const usageLimitsModule = require("../src/usage-limits.js");
 const {
   selectModelAndThinking,
   ModelUnavailable,
@@ -32,6 +33,7 @@ const {
   sendPrompt,
   _setDriverHooks,
 } = driver;
+const { withUsageLock, KNOWN_CANDIDATE_RPCIDS } = usageLimitsModule;
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -987,6 +989,11 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
 });
 
 test("8. parseUsageLimits parses batchexecute wrb.fr frames and handles self-healing recipe rpcid", () => {
+  // 0. Verify candidate rpcids list
+  assert.ok(Array.isArray(KNOWN_CANDIDATE_RPCIDS), "KNOWN_CANDIDATE_RPCIDS must be an array");
+  assert.ok(KNOWN_CANDIDATE_RPCIDS.includes("jSf9Qc"), "KNOWN_CANDIDATE_RPCIDS must contain default rpcid jSf9Qc");
+  assert.ok(KNOWN_CANDIDATE_RPCIDS.includes("kAb7Z"), "KNOWN_CANDIDATE_RPCIDS must contain candidate kAb7Z");
+
   // 1. Standard fixture with default rpcid jSf9Qc
   const snippetStandard = `)]}'\n\n162\n[["wrb.fr","jSf9Qc","[null,[[1,0.25,1,[[1763350000,0]]],[2,0.6,2,[[1763950000,0]]]]]",null,null,null,"generic"]]\n`;
   const resStandard = parseUsageLimits(snippetStandard);
@@ -1067,6 +1074,29 @@ test("9. accounts-usage.json multi-process merge logic and atomic file updates",
   assert.equal(d3.accounts.acc1.daily.percent, 20);
   assert.equal(d3.accounts.acc2.daily.percent, 50);
 
+  // Partial merge: update with only weekly record preserves existing daily and protects ultra tier
+  const uPart = {
+    daily: null,
+    weekly: { percent: 90, resetEpochSec: 1763990000 },
+    tier: "pro", // acc2 was previously ultra; DOM miss should not downgrade
+  };
+  const d4 = await updateAccountUsage(tmpDir, "acc2", uPart, r2);
+  assert.equal(d4.accounts.acc2.daily.percent, 50, "Existing daily metric must be preserved on partial update");
+  assert.equal(d4.accounts.acc2.weekly.percent, 90, "Weekly metric must be updated");
+  assert.equal(d4.accounts.acc2.tier, "ultra", "Ultra tier must NOT be downgraded to pro on fallback tier");
+
+  // Lock token race prevention: lock is only unlinked if token matches
+  const customLock = path.join(tmpDir, "race-test.lock");
+  await withUsageLock(customLock, async () => {
+    assert.ok(fs.existsSync(customLock));
+    // Simulate another process stealing the lock and putting its own token
+    fs.writeFileSync(customLock, "foreign-pid:99999:other-token");
+  });
+  // The foreign token lock must NOT have been unlinked by the original holder's finally block
+  assert.ok(fs.existsSync(customLock), "Foreign lock token must NOT be deleted by a prior lock holder");
+  assert.equal(fs.readFileSync(customLock, "utf8").trim(), "foreign-pid:99999:other-token");
+  fs.unlinkSync(customLock);
+
   // Concurrency test: simulate 10 parallel updates across different accounts
   const promises = [];
   for (let i = 0; i < 10; i++) {
@@ -1146,6 +1176,43 @@ test("10. captureUsageLimits domain gating, evaluate execution, and throttling",
   });
   assert.ok(forcedRes !== null, "force: true must bypass throttle");
   assert.equal(evalCalled, true);
+
+  // 5. Candidate rpcid batching & self-healing in evaluate
+  let receivedEvalArgs = null;
+  const mockCandidatesPage = {
+    url: () => "https://gemini.google.com/app",
+    evaluate: async (fn, arg) => {
+      receivedEvalArgs = arg;
+      return {
+        text: `)]}'\n[["wrb.fr","kAb7Z","[null,[[1,0.4,1,[[1763350000,0]]],[2,0.8,2,[[1763950000,0]]]]]",null,null,null,"generic"]]`,
+        domTier: "ultra",
+      };
+    },
+  };
+  const candRes = await captureUsageLimits(mockCandidatesPage, {
+    stateDir: tmpDir,
+    accountId: "test-cand",
+    force: true,
+  });
+  assert.ok(candRes !== null);
+  assert.ok(Array.isArray(receivedEvalArgs.candidates), "evaluate must receive candidates array");
+  assert.ok(receivedEvalArgs.candidates.includes("jSf9Qc"), "candidates must contain jSf9Qc");
+  assert.ok(receivedEvalArgs.candidates.includes("kAb7Z"), "candidates must contain kAb7Z");
+  assert.equal(candRes.recipe.rpcid, "kAb7Z", "Recipe must be healed to kAb7Z from candidate frame");
+
+  // 6. Evaluate rejection / timeout handling (returns null, does not throw)
+  const mockErrPage = {
+    url: () => "https://gemini.google.com/app",
+    evaluate: async () => {
+      throw new Error("CDP evaluate execution failed: page closed");
+    },
+  };
+  const errRes = await captureUsageLimits(mockErrPage, {
+    stateDir: tmpDir,
+    accountId: "test-err",
+    force: true,
+  });
+  assert.equal(errRes, null, "Evaluate error must return null without throwing");
 });
 
 test("11. sendPrompt signature, opts hygiene, mock integration with captureUsageLimits, and backend.tier propagation", async () => {
@@ -1239,4 +1306,91 @@ test("11. sendPrompt signature, opts hygiene, mock integration with captureUsage
   const fallbackBackends = loadBackends(poolTmpDir, path.join(poolTmpDir, "no-pool.json"));
   const fallbackById = new Map(fallbackBackends.map((b) => [b.id, b]));
   assert.equal(fallbackById.get("acc-compat")?.tier, "ultra");
+
+  // 4. Rate-limit / failed turn: captureUsageLimits executes in finally before parking
+  const failedTurnTmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "sendprompt-failed-test-")));
+  let failedParkedBlank = false;
+  let failedClosedBrowser = false;
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({
+      close: async () => { failedClosedBrowser = true; },
+    }),
+    getGeminiPage: async () => ({
+      url: () => "https://gemini.google.com/app",
+      goto: async (url) => { if (url === "about:blank") failedParkedBlank = true; },
+      evaluate: async () => ({
+        text: `)]}'\n[["wrb.fr","jSf9Qc","[null,[[1,0.99,1,[[1763350000,0]]],[2,0.95,2,[[1763950000,0]]]]]",null,null,null,"generic"]]`,
+        domTier: "pro",
+      }),
+    }),
+    runTurn: async () => {
+      const err = new ModelUnavailable("thinking", "high thinking level is rate-limited (Limit resets 2:19 AM)");
+      throw err;
+    },
+  });
+
+  try {
+    await assert.rejects(
+      async () => {
+        await sendPrompt({
+          prompt: "test rate-limited prompt",
+          backend: { id: "rate-limited-acc", tier: "pro" },
+          accountId: "rate-limited-acc",
+          tier: "pro",
+          stateDir: failedTurnTmpDir,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ModelUnavailable);
+        assert.ok(err.message.includes("rate-limited"));
+        return true;
+      }
+    );
+
+    assert.equal(failedParkedBlank, true, "Tab must be parked on about:blank even when turn failed");
+    assert.equal(failedClosedBrowser, true, "Browser must be closed in finally even when turn failed");
+
+    const failedUsageData = readAccountsUsage(failedTurnTmpDir);
+    assert.ok(failedUsageData.accounts["rate-limited-acc"], "accounts-usage.json must record rate-limited account in finally");
+    assert.equal(failedUsageData.accounts["rate-limited-acc"].daily.percent, 99);
+    assert.equal(failedUsageData.accounts["rate-limited-acc"].weekly.percent, 95);
+  } finally {
+    _setDriverHooks(null);
+  }
+
+  // 5. Hung captureUsageLimits timeout: ARGON_USAGE_TIMEOUT_MS ensures prompt does not hang
+  const timeoutTmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "sendprompt-timeout-test-")));
+  process.env.ARGON_USAGE_TIMEOUT_MS = "50";
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({
+      close: async () => {},
+    }),
+    getGeminiPage: async () => ({
+      url: () => "https://gemini.google.com/app",
+      goto: async () => {},
+      evaluate: async () => new Promise((resolve) => setTimeout(resolve, 5000)),
+    }),
+    runTurn: async () => ({
+      text: "Prompt finished before hung usage capture",
+      convId: "conv-timeout-1",
+    }),
+  });
+
+  try {
+    const res = await sendPrompt({
+      prompt: "test prompt with slow limits capture",
+      backend: { id: "timeout-acc", tier: "pro" },
+      accountId: "timeout-acc",
+      tier: "pro",
+      stateDir: timeoutTmpDir,
+    });
+    assert.equal(String(res), "Prompt finished before hung usage capture");
+  } finally {
+    delete process.env.ARGON_USAGE_TIMEOUT_MS;
+    _setDriverHooks(null);
+  }
 });

@@ -8,18 +8,32 @@ const DEFAULT_RECIPE = {
   updatedAt: 0,
 };
 
+const KNOWN_CANDIDATE_RPCIDS = ['jSf9Qc', 'kAb7Z'];
+
 const lastCaptureMap = new Map();
 
 async function withUsageLock(lockFile, fn) {
   const deadline = Date.now() + 10_000;
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   while (Date.now() < deadline) {
     try {
       const fd = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR);
-      fs.closeSync(fd);
+      try {
+        fs.writeFileSync(fd, token, 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
       try {
         return await fn();
       } finally {
-        try { fs.unlinkSync(lockFile); } catch {}
+        try {
+          if (fs.existsSync(lockFile)) {
+            const currentToken = fs.readFileSync(lockFile, 'utf8').trim();
+            if (currentToken === token) {
+              fs.unlinkSync(lockFile);
+            }
+          }
+        } catch {}
       }
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
@@ -199,10 +213,23 @@ async function updateAccountUsage(stateDir, accountId, usage, recipe) {
     } catch {}
 
     const now = Date.now();
+    const prev = data.accounts[accountId] || null;
+
+    let resolvedTier = 'pro';
+    if (usage.tier && String(usage.tier).toLowerCase().includes('ultra')) {
+      resolvedTier = 'ultra';
+    } else if (prev && prev.tier === 'ultra' && !usage.explicitDowngrade) {
+      resolvedTier = 'ultra';
+    } else if (usage.tier && String(usage.tier).toLowerCase().includes('pro')) {
+      resolvedTier = 'pro';
+    } else if (prev && prev.tier) {
+      resolvedTier = prev.tier;
+    }
+
     data.accounts[accountId] = {
-      daily: usage.daily || null,
-      weekly: usage.weekly || null,
-      tier: (usage.tier && String(usage.tier).toLowerCase().includes('ultra')) ? 'ultra' : 'pro',
+      daily: usage.daily ?? prev?.daily ?? null,
+      weekly: usage.weekly ?? prev?.weekly ?? null,
+      tier: resolvedTier,
       updatedAt: now,
       stale: false,
     };
@@ -254,63 +281,101 @@ async function captureUsageLimits(page, opts = {}) {
   }
 
   const currentUsage = readAccountsUsage(stateDir);
-  const rpcid = currentUsage.recipe?.rpcid || DEFAULT_RECIPE.rpcid;
+  const activeRpcid = currentUsage.recipe?.rpcid || DEFAULT_RECIPE.rpcid;
   const args = currentUsage.recipe?.args || DEFAULT_RECIPE.args;
+  const candidates = Array.from(new Set([activeRpcid, ...KNOWN_CANDIDATE_RPCIDS].filter(Boolean))).slice(0, 3);
 
   let evalRes;
   try {
-    evalRes = await page.evaluate(async ({ rpcid, args }) => {
-      try {
-        const wiz = window.WIZ_global_data || {};
-        const at = wiz.SNlM0e;
-        const bl = wiz.cfb2h || '';
-        const fsid = wiz.FdrFJe || '';
-        if (!at) {
-          return { error: 'Missing SNlM0e at-token in window.WIZ_global_data' };
-        }
-        const reqid = Math.floor(100000 + Math.random() * 900000);
-        const params = new URLSearchParams({
-          rpcids: rpcid,
-          'source-path': '/usage',
-          bl: bl,
-          'f.sid': fsid,
-          hl: 'en',
-          _reqid: String(reqid),
-          rt: 'c',
-        });
-        const url = `/_/BardChatUi/data/batchexecute?${params.toString()}`;
-        const reqPayload = [[[rpcid, args, null, 'generic']]];
-        const body = `f.req=${encodeURIComponent(JSON.stringify(reqPayload))}&at=${encodeURIComponent(at)}`;
-
-        const resp = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-          },
-          credentials: 'include',
-          body: body,
-        });
-
-        if (!resp.ok) {
-          return { error: `batchexecute status ${resp.status}` };
-        }
-        const text = await resp.text();
-
-        let domTier = null;
+    evalRes = await Promise.race([
+      page.evaluate(async ({ candidates, rpcid, args }) => {
         try {
-          const bodyText = document.body ? document.body.innerText : '';
-          if (/gemini ultra|gemini advanced/i.test(bodyText) || document.querySelector('[aria-label*="Advanced" i], [aria-label*="Ultra" i]')) {
-            domTier = 'ultra';
-          } else if (/gemini pro/i.test(bodyText) || document.querySelector('[aria-label*="Pro" i]')) {
-            domTier = 'pro';
-          }
-        } catch {}
+          const rpcidList = (Array.isArray(candidates) && candidates.length > 0)
+            ? candidates
+            : [rpcid || 'jSf9Qc'];
 
-        return { text, domTier };
-      } catch (e) {
-        return { error: e.message || String(e) };
-      }
-    }, { rpcid, args });
+          const wiz = window.WIZ_global_data || {};
+          const at = wiz.SNlM0e;
+          const bl = wiz.cfb2h || '';
+          const fsid = wiz.FdrFJe || '';
+          if (!at) {
+            return { error: 'Missing SNlM0e at-token in window.WIZ_global_data' };
+          }
+
+          let domTier = null;
+          try {
+            const bodyText = document.body ? document.body.innerText : '';
+            if (/gemini ultra|gemini advanced/i.test(bodyText) || document.querySelector('[aria-label*="Advanced" i], [aria-label*="Ultra" i]')) {
+              domTier = 'ultra';
+            } else if (/gemini pro/i.test(bodyText) || document.querySelector('[aria-label*="Pro" i]')) {
+              domTier = 'pro';
+            }
+          } catch {}
+
+          async function sendBatchexecute(targets) {
+            const reqid = Math.floor(100000 + Math.random() * 900000);
+            const params = new URLSearchParams({
+              rpcids: targets.join(','),
+              'source-path': '/usage',
+              bl: bl,
+              'f.sid': fsid,
+              hl: 'en',
+              _reqid: String(reqid),
+              rt: 'c',
+            });
+            const url = `/_/BardChatUi/data/batchexecute?${params.toString()}`;
+            const reqPayload = [targets.map((id) => [id, args, null, 'generic'])];
+            const body = `f.req=${encodeURIComponent(JSON.stringify(reqPayload))}&at=${encodeURIComponent(at)}`;
+
+            const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const timeoutId = setTimeout(() => {
+              if (controller) controller.abort();
+            }, 8000);
+
+            try {
+              const resp = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                },
+                credentials: 'include',
+                body: body,
+                signal: controller ? controller.signal : undefined,
+              });
+
+              if (!resp.ok) {
+                return { error: `batchexecute status ${resp.status}` };
+              }
+              const text = await resp.text();
+              return { text };
+            } finally {
+              clearTimeout(timeoutId);
+            }
+          }
+
+          // 1. Try batch of candidate rpcids in a single request
+          const batchRes = await sendBatchexecute(rpcidList);
+          if (batchRes && !batchRes.error && batchRes.text) {
+            return { text: batchRes.text, domTier };
+          }
+
+          // 2. Fallback: if batch request failed (e.g. 400 status), try candidates individually
+          for (const cand of rpcidList) {
+            const singleRes = await sendBatchexecute([cand]);
+            if (singleRes && !singleRes.error && singleRes.text) {
+              return { text: singleRes.text, domTier };
+            }
+          }
+
+          return { error: batchRes?.error || 'All rpcid candidates failed' };
+        } catch (e) {
+          return { error: e.message || String(e) };
+        }
+      }, { candidates, rpcid: candidates[0], args }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('page.evaluate timeout after 9s')), 9000)
+      ),
+    ]);
   } catch (err) {
     if (process.env.ARGON_DEBUG) {
       console.warn('[argon] Runtime.evaluate failed during captureUsageLimits:', err.message);
@@ -355,11 +420,13 @@ async function captureUsageLimits(page, opts = {}) {
 
 module.exports = {
   DEFAULT_RECIPE,
+  KNOWN_CANDIDATE_RPCIDS,
   extractWrbFrames,
   findMetricRecords,
   parseUsageLimits,
   readAccountsUsage,
   updateAccountUsage,
   captureUsageLimits,
+  withUsageLock,
   _lastCaptureMap: lastCaptureMap,
 };
