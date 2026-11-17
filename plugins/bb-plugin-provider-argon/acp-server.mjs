@@ -412,6 +412,16 @@ export function parseResetTimeMs(msg, nowMs = Date.now()) {
 }
 
 /* ---------- classify failure (§3.3) ---------- */
+// PLUG-281: prompt-size guard. Unset → 100KB (the observed insertText hang
+// threshold); ARGON_MAX_PROMPT_BYTES=N overrides; non-positive → no limit.
+function argonMaxPromptBytes() {
+  const raw = process.env.ARGON_MAX_PROMPT_BYTES;
+  if (raw == null || raw === "") return 100 * 1024;
+  const v = Number(raw);
+  // NaN/garbage → default; non-positive → explicit "no limit".
+  return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100 * 1024;
+}
+
 export function classifyFailure(err, authHint = null) {
   const message = (err?.message || String(err || "")).trim();
 
@@ -738,6 +748,18 @@ async function runPrompt(id, sessionId, text) {
   s.cancelled = false;
 
   try {
+    // PLUG-281: >~100KB prompts hang execCommand('insertText') in the driver
+    // and used to surface as model-unavailable — fail fast BEFORE any
+    // lease/park, but inside try so the client gets a -32000, not a dead
+    // server (throw above try → void runPrompt() → unhandled rejection).
+    const maxPromptBytes = argonMaxPromptBytes();
+    if (Buffer.byteLength(text || "", "utf8") > maxPromptBytes) {
+      const err = new Error(
+        `prompt too large: ${Buffer.byteLength(text || "", "utf8")} bytes > ARGON_MAX_PROMPT_BYTES (${maxPromptBytes})`
+      );
+      err.code = "ARGON_PROMPT_TOO_LARGE";
+      throw err;
+    }
     const result = await enqueue(async () => {
       if (s.cancelled) return { cancelled: true };
 
