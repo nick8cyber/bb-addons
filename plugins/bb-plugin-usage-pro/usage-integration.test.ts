@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { createRequire } from "node:module";
 import { EventEmitter } from "node:events";
 import { createFakePluginHost, makeHostResponse } from "@get-bb/plugin-sdk/testing";
 import providerUsagePlugin, { createProviderUsagePlugin } from "./dist/provider-usage-base.js";
@@ -61,14 +62,6 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     spawnRunner?: (bin: string, args: string[]) => any;
     now?: () => number;
     antigravityProfile?: any;
-    googleResponses?: {
-      token?: { status: number; body: any };
-      userinfo?: { status: number; body: any };
-      loadCodeAssist?: { status: number; body: any };
-      quota?: { status: number; body: any };
-      models?: { status: number; body: any };
-      modelsDaily?: { status: number; body: any };
-    };
   };
 
   function setupHarness(cfg: TestRigConfig) {
@@ -122,37 +115,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       fs.writeFileSync(path.join(agDir, "acp_token.json"), JSON.stringify(cfg.antigravityProfile));
     }
 
-    const googleReply = (resp?: { status: number; body: any }) => {
-      const r = resp ?? { status: 500, body: { error: "unconfigured google endpoint" } };
-      return {
-        ok: r.status >= 200 && r.status < 300,
-        status: r.status,
-        json: async () => r.body,
-        text: async () => JSON.stringify(r.body),
-      } as Response;
-    };
-
     // Mock fetch for Pi
     const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const urlStr = url.toString();
-      if (urlStr === "https://oauth2.googleapis.com/token") {
-        return googleReply(cfg.googleResponses?.token);
-      }
-      if (urlStr.includes("googleapis.com/oauth2/v2/userinfo")) {
-        return googleReply(cfg.googleResponses?.userinfo);
-      }
-      if (urlStr.includes("cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")) {
-        return googleReply(cfg.googleResponses?.loadCodeAssist);
-      }
-      if (urlStr.includes("cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")) {
-        return googleReply(cfg.googleResponses?.quota);
-      }
-      if (urlStr.includes("daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")) {
-        return googleReply(cfg.googleResponses?.modelsDaily ?? cfg.googleResponses?.models ?? { status: 200, body: { models: {} } });
-      }
-      if (urlStr.includes("cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")) {
-        return googleReply(cfg.googleResponses?.models ?? { status: 200, body: { models: {} } });
-      }
       if (urlStr.includes("chatgpt.com/backend-api/wham/usage")) {
         if (!cfg.piUsageResponse) {
           throw new Error("No Pi usage response configured in test");
@@ -222,7 +187,9 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
 
     fakeHost.harness.sdk.stub("system.config", async () => ({ primaryHostId }));
 
+    const rpcCalls: { pluginId: string; method: string; resourceId?: string }[] = [];
     fakeHost.harness.sdk.stub("plugins.callRpc", async ({ pluginId, method, input, outputSchema }: any) => {
+      rpcCalls.push({ pluginId, method, resourceId: input?.resourceId });
       if (method === usageListMethod) {
         const inv = inventoryMap.get(pluginId);
         if (!inv) {
@@ -285,6 +252,7 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       registeredRpc,
       inventoryMap,
       measurementMap,
+      rpcCalls,
       mockFetch,
       mockRunner,
       mockSpawn,
@@ -1244,8 +1212,10 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(snap.machines).toHaveLength(1);
   });
 
-  // Native Antigravity ACP: dedicated provider card fed by Google quota APIs
-  it("Native ACP: acp-antigravity card collects real Google quota on the primary host", async () => {
+  // Spec §6.1-6.2: usage-pro never calls Google itself. A lying
+  // acp_token.json fixture must not cause a single network call (injected or
+  // global fetch) and no acp-antigravity card is synthesized on any host.
+  it("Spec 6.1-6.2: lying acp_token.json causes no network call and no acp-antigravity card", async () => {
     const h = setupHarness({
       hosts: [
         { id: "host-primary", name: "Primary", status: "connected" },
@@ -1262,42 +1232,6 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
         client_id: "cid", client_secret: "cs",
         refresh_token: "rt", project_id: "proj-1",
       },
-      googleResponses: {
-        token: { status: 200, body: { access_token: "at-1", expires_in: 3600 } },
-        userinfo: { status: 200, body: { email: "user-a@example.com", verified_email: true } },
-        loadCodeAssist: { status: 200, body: { currentTier: { id: "free-tier", name: "Antigravity" } } },
-        quota: {
-          status: 200,
-          body: {
-            groups: [{
-              displayName: "Claude and GPT models",
-              buckets: [
-                { bucketId: "3p-weekly", window: "weekly", resetTime: "2026-11-18T05:18:41Z", remainingFraction: 0 },
-                { bucketId: "3p-5h", window: "5h", disabled: true, resetTime: "2026-11-16T03:18:12Z", remainingFraction: 1 },
-              ],
-            }],
-          },
-        },
-        // The grouped summary omits the Gemini family for this tier;
-        // fetchAvailableModels on the tier's daily base reports the governing
-        // window — here the weekly cycle, because it is nearly exhausted.
-        modelsDaily: {
-          status: 200,
-          body: {
-            models: {
-              "gemini-3-flash": {
-                displayName: "Gemini 3 Flash",
-                apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
-                quotaInfo: { remainingFraction: 0.04, resetTime: "2026-11-20T23:08:16Z" },
-              },
-              "claude-sonnet-5-5-low": {
-                apiProvider: "API_PROVIDER_ANTHROPIC_VERTEX",
-                quotaInfo: { resetTime: "2026-11-18T05:18:41Z" },
-              },
-            },
-          },
-        },
-      },
     });
 
     await providerUsagePlugin(h.bb, h.collectorOpts);
@@ -1306,42 +1240,63 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       force: true, machineIds: null, providerId: null, maxAgeMs: 0,
     });
 
-    const primary = snap.machines.find((m: any) => m.id === "host-primary");
-    const card = primary.providers.find((p: any) => p.providerId === "acp-antigravity");
-    expect(card).toBeDefined();
-    expect(card.id).toBe("acp-antigravity");
-    expect(card.accountLabel).toBe("user-a@example.com");
-    expect(card.usage.status).toBe("ok");
-    expect(card.usage.planLabel).toBe("Antigravity");
-    // The disabled 5h bucket is emitted verbatim, matching the pool card.
-    expect(card.usage.windows).toHaveLength(3);
-    const byLabel = Object.fromEntries(card.usage.windows.map((w: any) => [w.label, w]));
-    // Regression: the Claude model quota re-states the weekly reset; a
-    // distance-based label must not alias it into a phantom "Daily" window.
-    expect(byLabel["Claude Daily"]).toBeUndefined();
-    expect(byLabel["Claude Weekly"].usedPercent).toBe(100);
-    expect(byLabel["Claude Weekly"].resetsAt).toBe("2026-11-18T05:18:41Z");
-    expect(byLabel["Claude 5h"].usedPercent).toBe(0);
-    expect(byLabel["Claude 5h"].resetsAt).toBe("2026-11-16T03:18:12Z");
-    expect(byLabel["Gemini Weekly"].usedPercent).toBe(96);
-    expect(byLabel["Gemini Weekly"].resetsAt).toBe("2026-11-20T23:08:16Z");
-
-    // The native card must not leak onto other hosts.
-    const remote = snap.machines.find((m: any) => m.id === "host-remote");
-    expect(remote.providers.filter((p: any) => p.providerId === "acp-antigravity")).toHaveLength(0);
+    expect(h.mockFetch).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    for (const machine of snap.machines) {
+      expect(
+        machine.providers.filter((p: any) => p.providerId === "acp-antigravity"),
+      ).toHaveLength(0);
+    }
   });
 
-  // Pool exclusion: account parked at priority 0 and owned by the native card
-  // must disappear from the agy pool listing.
-  it("Native ACP: migrated pool account leaves the agy tab once the native card reports", async () => {
+  // Spec §6.5: usage-pro never requests or renders any acp-* resource a
+  // source plugin might offer.
+  it("Spec 6.5: acp-antigravity resource from a source plugin is neither fetched nor rendered", async () => {
+    const h = setupHarness({
+      hosts: [{ id: "host-primary", name: "Primary", status: "connected" }],
+      primaryHostId: "host-primary",
+      sources: [{ pluginId: "source-acp", displayName: "ACP Source" }],
+      inventories: {
+        "source-acp": {
+          resources: [
+            {
+              id: "res-acp-1",
+              label: "ACP Antigravity Usage",
+              providerId: "acp-antigravity",
+              scope: { kind: "host", hostId: "host-primary", hostName: "Primary" },
+              accountKey: null,
+            },
+          ],
+        },
+      },
+      providers: [
+        { id: "agy", displayName: "Antigravity", logoUrl: null },
+        { id: "acp-antigravity", displayName: "Google Antigravity", logoUrl: null },
+      ],
+    });
+
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    const snap = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+
+    expect(h.rpcCalls.filter((c) => c.method === usageFetchMethod)).toHaveLength(0);
+    const primary = snap.machines.find((m: any) => m.id === "host-primary");
+    expect(
+      primary.providers.filter((p: any) => p.providerId.startsWith("acp-")),
+    ).toHaveLength(0);
+  });
+
+  // Spec §6.3–6.4: a pool account parked at priority 0 stays on the agy tab
+  // labelled "Out of rotation"; it is spawned only on explicit force refresh.
+  it("Spec 6.3-6.4: parked pool account shows 'Out of rotation' and polls only on force", async () => {
+    const cjsFs = createRequire(import.meta.url)("node:fs") as typeof fs;
+    const readSpy = vi.spyOn(cjsFs, "readFileSync");
     const baseDir = path.join(tmpUserHome, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
     for (const label of ["user-a@example.com", "other@example.com"]) {
       const dir = path.join(baseDir, label, ".gemini", "antigravity-cli");
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(
-        path.join(dir, "antigravity-oauth-token"),
-        JSON.stringify({ token: "t", auth_method: "consumer", id_token_email: label }),
-      );
+      fs.writeFileSync(path.join(dir, "antigravity-oauth-token"), "mock-token");
     }
     fs.writeFileSync(
       path.join(baseDir, "..", "accounts-state.json"),
@@ -1356,42 +1311,147 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
       primaryHostId: "host-primary",
       sources: [],
       inventories: {},
-      providers: [
-        { id: "agy", displayName: "Antigravity", logoUrl: null },
-        { id: "acp-antigravity", displayName: "Google Antigravity", logoUrl: null },
-      ],
-      antigravityProfile: {
-        client_id: "cid", client_secret: "cs",
-        refresh_token: "rt", project_id: "proj-1",
-      },
-      googleResponses: {
-        token: { status: 200, body: { access_token: "at-1", expires_in: 3600 } },
-        userinfo: { status: 200, body: { email: "user-a@example.com", verified_email: true } },
-        loadCodeAssist: { status: 200, body: { currentTier: { name: "Antigravity" } } },
-        quota: {
-          status: 200,
-          body: {
-            groups: [{
-              displayName: "Gemini models",
-              buckets: [
-                { bucketId: "g-5h", window: "5h", resetTime: "2026-11-16T03:18:12Z", remainingFraction: 0.5 },
-              ],
-            }],
-          },
-        },
-      },
+      providers: [{ id: "agy", displayName: "Antigravity", logoUrl: null }],
     });
 
     await providerUsagePlugin(h.bb, h.collectorOpts);
 
     const snap = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60000,
+    });
+
+    const primary = snap.machines.find((m: any) => m.id === "host-primary");
+    const agyCards = primary.providers.filter((p: any) => p.providerId === "agy");
+    const parkedCard = agyCards.find((p: any) => p.accountLabel === "user-a@example.com");
+    expect(parkedCard).toBeDefined();
+    expect(parkedCard.usage.status).toBe("ok");
+    expect(parkedCard.usage.planLabel).toBe("Out of rotation");
+    expect(parkedCard.usage.windows).toHaveLength(0);
+    expect(agyCards.some((p: any) => p.accountLabel === "other@example.com")).toBe(true);
+
+    // The token file decides inclusion by existence only; it is never read.
+    expect(
+      readSpy.mock.calls.filter(
+        (call) => String(call[0]).endsWith("antigravity-oauth-token"),
+      ),
+    ).toHaveLength(0);
+
+    // Without force the parked account is never spawned; the rotating one is.
+    const spawnedHomes = h.mockSpawn.mock.calls.map((call: any) => call[2]?.env?.HOME);
+    expect(spawnedHomes).toEqual([path.join(baseDir, "other@example.com")]);
+
+    h.mockSpawn.mockClear();
+    const snap2 = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+    const parkedCalls = h.mockSpawn.mock.calls.filter(
+      (call: any) => call[2]?.env?.HOME === path.join(baseDir, "user-a@example.com"));
+    expect(parkedCalls).toHaveLength(1);
+    expect(parkedCalls[0][1]).toEqual(["--output-format", "json", "-p", "/usage"]);
+
+    const parkedAfter = snap2.machines[0].providers
+      .find((p: any) => p.providerId === "agy" && p.accountLabel === "user-a@example.com");
+    expect(parkedAfter.usage.planLabel).toBe("Out of rotation");
+  });
+
+  // Spec §6.3: the marker is stamped at read time. An account polled while
+  // rotating, then parked, serves cached windows under "Out of rotation"
+  // with no agy launch; unparked, it shows the polled label again.
+  it("Spec 6.3: account parked after polling keeps cached windows under 'Out of rotation'", async () => {
+    const baseDir = path.join(tmpUserHome, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
+    const statePath = path.join(baseDir, "..", "accounts-state.json");
+    const label = "rotated@example.com";
+    const dir = path.join(baseDir, label, ".gemini", "antigravity-cli");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "antigravity-oauth-token"), "mock-token");
+    fs.writeFileSync(statePath, JSON.stringify({ accounts: { [label]: { priority: 1 } } }));
+
+    const h = setupHarness({
+      hosts: [{ id: "host-primary", name: "Primary", status: "connected" }],
+      primaryHostId: "host-primary",
+      sources: [],
+      inventories: {},
+      providers: [{ id: "agy", displayName: "Antigravity", logoUrl: null }],
+    });
+
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    const snapPolled = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+    const polledCard = snapPolled.machines[0].providers
+      .find((p: any) => p.providerId === "agy" && p.accountLabel === label);
+    expect(polledCard.usage.planLabel).toBe("Direct");
+    expect(polledCard.usage.windows.length).toBeGreaterThan(0);
+
+    fs.writeFileSync(statePath, JSON.stringify({ accounts: { [label]: { priority: 0 } } }));
+    h.mockSpawn.mockClear();
+    const snapParked = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60000,
+    });
+    const parkedCard = snapParked.machines[0].providers
+      .find((p: any) => p.providerId === "agy" && p.accountLabel === label);
+    expect(parkedCard.usage.planLabel).toBe("Out of rotation");
+    expect(parkedCard.usage.windows.length).toBeGreaterThan(0);
+    expect(h.mockSpawn).not.toHaveBeenCalled();
+
+    fs.writeFileSync(statePath, JSON.stringify({ accounts: { [label]: { priority: 1 } } }));
+    const snapBack = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60000,
+    });
+    const backCard = snapBack.machines[0].providers
+      .find((p: any) => p.providerId === "agy" && p.accountLabel === label);
+    expect(backCard.usage.planLabel).toBe("Direct");
+    expect(h.mockSpawn).not.toHaveBeenCalled();
+  });
+
+  // Spec §6.4: a parked account is not spawned when its cache goes stale nor
+  // when thread.idle resets every entry's loadedAt.
+  it("Spec 6.4: parked account is not spawned on stale cache or thread.idle", async () => {
+    const baseDir = path.join(tmpUserHome, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
+    for (const label of ["parked@example.com", "active@example.com"]) {
+      const dir = path.join(baseDir, label, ".gemini", "antigravity-cli");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "antigravity-oauth-token"), "mock-token");
+    }
+    fs.writeFileSync(
+      path.join(baseDir, "..", "accounts-state.json"),
+      JSON.stringify({ accounts: {
+        "parked@example.com": { priority: 0 },
+        "active@example.com": { priority: 1 },
+      } }),
+    );
+
+    const h = setupHarness({
+      hosts: [{ id: "host-primary", name: "Primary", status: "connected" }],
+      primaryHostId: "host-primary",
+      sources: [],
+      inventories: {},
+      providers: [{ id: "agy", displayName: "Antigravity", logoUrl: null }],
+    });
+
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    await h.registeredRpc.getUsage({
       force: true, machineIds: null, providerId: null, maxAgeMs: 0,
     });
 
-    const agyLabels = snap.machines[0].providers
-      .filter((p: any) => p.providerId === "agy")
-      .map((p: any) => p.accountLabel);
-    expect(agyLabels).toEqual(["other@example.com"]);
+    // Stale cache: only the rotating account respawns.
+    currentTime += 600_000;
+    h.mockSpawn.mockClear();
+    await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+    expect(h.mockSpawn.mock.calls.map((call: any) => call[2]?.env?.HOME))
+      .toEqual([path.join(baseDir, "active@example.com")]);
+
+    // thread.idle resets every cache entry's loadedAt; the parked account
+    // still does not launch.
+    await h.fakeHost.harness.behavior.emitThreadEvent("thread.idle", {} as any);
+    h.mockSpawn.mockClear();
+    await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+    expect(h.mockSpawn.mock.calls.map((call: any) => call[2]?.env?.HOME))
+      .toEqual([path.join(baseDir, "active@example.com")]);
   });
 
   // Frontend regression: app.bundle.js client schema and card warning renderer

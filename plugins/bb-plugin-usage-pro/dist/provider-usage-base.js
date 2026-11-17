@@ -6,7 +6,6 @@ import {
   actualPlanLabel,
   selectAccountResources
 } from "../usage-policy.js";
-import { createAntigravityAcpUsage } from "../antigravity-acp-usage.js";
 import {
   ARGON_PROVIDER_ID,
   argonTierLabel,
@@ -15334,9 +15333,6 @@ function providerUsagePlugin(bb, options = {}) {
     }
     return globalThis.fetch(url, init);
   };
-  const nativeAntigravity = createAntigravityAcpUsage({
-    userHome: getUserHome, fetch: customFetch, now: getNow
-  });
   const argonUsage = createArgonUsage({
     userHome: getUserHome, now: getNow, stateDir: options.argonStateDir
   });
@@ -15690,26 +15686,37 @@ function providerUsagePlugin(bb, options = {}) {
     const fs = require("node:fs");
     const path = require("node:path");
     if (!fs.existsSync(baseDir)) return [];
-    let state = {};
-    try {
-      state = JSON.parse(fs.readFileSync(path.join(baseDir, "..", "accounts-state.json"), "utf8"));
-    } catch {}
     return fs.readdirSync(baseDir, { withFileTypes: true })
       .filter(entry => entry.isDirectory())
       .map(entry => entry.name)
-      .filter(label => {
-        const token = path.join(baseDir, label, ".gemini", "antigravity-cli", "antigravity-oauth-token");
-        if (!fs.existsSync(token)) return false;
-        // A profile explicitly removed from rotation and transferred to ACP
-        // belongs to that provider's card. Leave all other pool entries alone.
-        if (state.accounts?.[label]?.priority !== 0) return true;
-        let email = null;
-        try {
-          email = JSON.parse(fs.readFileSync(token, "utf8"))?.id_token_email ?? null;
-        } catch {}
-        return email === null || email !== nativeAntigravity.accountEmail();
-      })
+      .filter(label => fs.existsSync(
+        path.join(baseDir, label, ".gemini", "antigravity-cli", "antigravity-oauth-token")))
       .sort();
+  };
+
+  const agyOutOfRotation = (baseDir) => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const parked = new Set();
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(baseDir, "..", "accounts-state.json"), "utf8"));
+      for (const label of Object.keys(state.accounts ?? {})) {
+        if (state.accounts[label]?.priority === 0) parked.add(label);
+      }
+    } catch {}
+    return parked;
+  };
+
+  const agyUnpolledUsage = (label) => ({
+    status: "ok", accountEmail: label, planLabel: "Out of rotation", windows: []
+  });
+
+  // The "Out of rotation" marker is stamped on every read, never on the
+  // cached poll result: an account parked after polling still shows it.
+  const agyUsageFor = (label, parked) => {
+    const usage = agyAccountsCache.get(label)?.usage ?? null;
+    if (!parked.has(label)) return usage;
+    return { ...(usage ?? agyUnpolledUsage(label)), planLabel: "Out of rotation" };
   };
 
   const getCachedAgyAccounts = () => {
@@ -15719,9 +15726,10 @@ function providerUsagePlugin(bb, options = {}) {
       const home = getUserHome();
       const baseDir = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
       const labels = agyAccountLabels(baseDir);
+      const parked = agyOutOfRotation(baseDir);
       return labels.map(label => ({
         label,
-        usage: agyAccountsCache.get(label)?.usage ?? null
+        usage: agyUsageFor(label, parked)
       }));
     } catch {
       return [];
@@ -15863,12 +15871,15 @@ function providerUsagePlugin(bb, options = {}) {
       const baseDir = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
       const statePath = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts-state.json");
       const labels = agyAccountLabels(baseDir);
+      const parked = agyOutOfRotation(baseDir);
 
       const ttl = Math.max(maxAgeMs || 0, 180000);
       const staleLabels = [];
       const missingLabels = [];
 
       for (const label of labels) {
+        // Accounts parked at priority 0 are only polled on explicit refresh.
+        if (parked.has(label)) continue;
         const cached = agyAccountsCache.get(label);
         if (!cached) {
           missingLabels.push(label);
@@ -15896,7 +15907,7 @@ function providerUsagePlugin(bb, options = {}) {
 
       return labels.map(label => ({
         label,
-        usage: agyAccountsCache.get(label)?.usage ?? null
+        usage: agyUsageFor(label, parked)
       }));
     } catch (e) {
       console.error("[usage-pro] agy fetch error:", e);
@@ -16130,7 +16141,7 @@ function providerUsagePlugin(bb, options = {}) {
 
     const selected = [...inventories.values()].flatMap(
       (source) => source.resources.filter((resource) => {
-        if (resource.providerId.startsWith("acp-") && resource.providerId !== "acp-antigravity") return false;
+        if (resource.providerId.startsWith("acp-")) return false;
         const machineId = resource.scope.kind === "shared" ? (hosts[0]?.id ?? `source:${source.pluginId}`) : resource.scope.hostId;
         return (request.providerId === null || resource.providerId === request.providerId) &&
                (request.machineIds === null || request.machineIds.includes(machineId)) &&
@@ -16159,19 +16170,6 @@ function providerUsagePlugin(bb, options = {}) {
 
     const shouldFetchCodex = request.providerId === null || request.providerId === "codex";
     const shouldFetchAgy = request.providerId === null || request.providerId === "agy";
-    const nativeAcpMeta = providers.find(p => p.id === "acp-antigravity" && p.available !== false);
-    const nativeAcpSource = [...inventories.values()].some(source =>
-      source.resources.some(resource => resource.providerId === "acp-antigravity" &&
-        resource.scope.kind === "host" && resource.scope.hostId === primaryHostId));
-    const shouldFetchNativeAcp = nativeAcpMeta && !nativeAcpSource &&
-      hosts.some(host => host.id === primaryHostId && host.status === "connected") &&
-      (request.machineIds === null || request.machineIds.includes(primaryHostId)) &&
-      (request.providerId === null || request.providerId === "acp-antigravity");
-    const nativeAcpUsage = nativeAcpMeta && !nativeAcpSource
-      ? shouldFetchNativeAcp
-        ? await nativeAntigravity.get(request.force, request.maxAgeMs)
-        : nativeAntigravity.getCached()
-      : null;
 
     let piResult = null;
     if (shouldFetchCodex) {
@@ -16348,24 +16346,6 @@ function providerUsagePlugin(bb, options = {}) {
         }
       }
 
-      if (machine.id === primaryHostId && nativeAcpUsage !== null) {
-        machine.providers.push({
-          // providerId owns the separate provider tab. Keep id free of the
-          // "agy" prefix: this card's only quota can be third-party models,
-          // and the agy pool's optional filter must not blank it.
-          id: "acp-antigravity",
-          providerId: "acp-antigravity",
-          displayName: nativeAcpMeta?.displayName ?? "Google Antigravity",
-          accountLabel: nativeAcpUsage.usage?.accountEmail ?? null,
-          logoUrl: nativeAcpMeta?.logoUrl ?? "/api/v1/system/providers/acp-antigravity/logo",
-          icon: nativeAcpMeta?.icon ?? null,
-          strings: { iconTint: normalizedTint(nativeAcpMeta?.strings?.iconTint) },
-          signInHint: "Sign in to the Google Antigravity ACP provider.",
-          expiredHint: "The Google Antigravity sign-in expired. Reconnect that provider.",
-          usage: normalizedUsage(nativeAcpUsage.usage),
-          warning: nativeAcpUsage.warning
-        });
-      }
       if (machine.id === primaryHostId) {
         const argonMeta = providers.find((p) => p.id === ARGON_PROVIDER_ID);
         for (const acc of argonAccounts) {
@@ -16424,16 +16404,14 @@ function providerUsagePlugin(bb, options = {}) {
         }
       }
       machine.providers = machine.providers.filter((p) =>
-        !p.providerId.startsWith("acp-") || p.providerId === "acp-antigravity" ||
-        p.providerId === ARGON_PROVIDER_ID);
+        !p.providerId.startsWith("acp-") || p.providerId === ARGON_PROVIDER_ID);
     }
 
     const providerOrder = new Map([
       ["codex", 0],
       ["claude-code", 1],
       ["agy", 2],
-      ["acp-antigravity", 3],
-      ["acp-argon", 4]
+      ["acp-argon", 3]
     ]);
     for (const machine of machines) {
       machine.providers.sort(
@@ -16448,7 +16426,6 @@ function providerUsagePlugin(bb, options = {}) {
     for (const value of measurements.values()) value.loadedAt = 0;
     codexPiCache.loadedAt = 0;
     for (const v of agyAccountsCache.values()) v.loadedAt = 0;
-    nativeAntigravity.invalidate();
   };
   bb.events.on("thread.idle", markDirty);
   bb.events.on("thread.failed", markDirty);
