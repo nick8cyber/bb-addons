@@ -1,9 +1,11 @@
 // bb-plugin-file-download — фронтенд.
 //
-// fileOpener на документные расширения: открытие файла запускает настоящее
-// скачивание через experimental_saveFile (в веб-клиенте нативной кнопки
-// Download нет — она зашита на capability nativeDownloads, которое сервер
-// не отдаёт). Под плашкой рендерится Original — предпросмотр сохраняется.
+// fileOpener на документные расширения: над предпросмотром плашка с кнопкой
+// «Скачать» — реальная загрузка через experimental_saveFile (в веб-клиенте
+// нативной кнопки Download нет — она зашита на capability nativeDownloads,
+// которое сервер не отдаёт). Автозагрузки нет — только по кнопке (слово
+// владельца). PDF рендерится iframe'ом с blob-URL, когда браузер умеет
+// встроенный PDF viewer (navigator.pdfViewerEnabled) — иначе Original.
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   definePluginApp,
@@ -24,27 +26,43 @@ type DownloadState =
   | { status: "done"; fileName: string }
   | { status: "failed"; message: string };
 
-export default definePluginApp((app) => {
+export default definePluginApp((_app) => {
   function DownloadOpener({ path, source, Original }: PluginFileOpenerProps) {
     const sdk = useSdk();
     const [state, setState] = useState<DownloadState>({ status: "idle" });
-    const blobUrl = useRef<string | null>(null);
+    const [objectUrl, setObjectUrl] = useState<string | null>(null);
+    const blobRef = useRef<Blob | null>(null);
     const fileName = baseName(path);
+    const isPdf = /\.pdf$/i.test(fileName);
+    const pdfPreview =
+      isPdf &&
+      typeof navigator !== "undefined" &&
+      navigator.pdfViewerEnabled === true;
 
     useEffect(
       () => () => {
-        if (blobUrl.current) URL.revokeObjectURL(blobUrl.current);
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
       },
-      [],
+      [objectUrl],
     );
+
+    // Чтение файла → Blob (кэшируется: один проход и для превью, и для «Скачать»).
+    const ensureBlob = useCallback(async (): Promise<Blob> => {
+      if (blobRef.current) return blobRef.current;
+      const file = await readSourceFile(sdk, path, source);
+      const blob = fileContentToBlob(file);
+      blobRef.current = blob;
+      setObjectUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(blob);
+      });
+      return blob;
+    }, [sdk, path, source]);
 
     const download = useCallback(async () => {
       setState({ status: "loading" });
       try {
-        const file = await readSourceFile(sdk, path, source);
-        const blob = fileContentToBlob(file);
-        if (blobUrl.current) URL.revokeObjectURL(blobUrl.current);
-        blobUrl.current = URL.createObjectURL(blob);
+        const blob = await ensureBlob();
         const outcome = await experimental_saveFile({ fileName, blob });
         setState(
           outcome === "started"
@@ -57,15 +75,28 @@ export default definePluginApp((app) => {
           message: error instanceof Error ? error.message : String(error),
         });
       }
-    }, [sdk, path, source, fileName]);
+    }, [ensureBlob, fileName]);
 
-    // Автозагрузки нет по слову владельца: открытие предпросмотра ≠ решение
-    // качать. Скачивание — только по кнопке «Скачать».
+    // PDF-превью: байты грузим при маунте; ошибку показываем в плашке,
+    // ниже остаётся карточка Original.
+    const [previewError, setPreviewError] = useState<string | null>(null);
+    useEffect(() => {
+      if (!pdfPreview) return;
+      let cancelled = false;
+      ensureBlob().catch((error) => {
+        if (cancelled) return;
+        setPreviewError(error instanceof Error ? error.message : String(error));
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [pdfPreview, ensureBlob]);
+
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="flex shrink-0 items-center gap-2 border-b border-border bg-card px-3 py-1.5 text-xs text-muted-foreground">
           <a
-            href={blobUrl.current ?? "about:blank"}
+            href={objectUrl ?? "about:blank"}
             download={fileName}
             onClick={(event) => {
               event.preventDefault();
@@ -84,16 +115,33 @@ export default definePluginApp((app) => {
             {state.status === "failed" && (
               <span className="text-destructive">Ошибка: {state.message}</span>
             )}
+            {state.status !== "failed" && previewError && (
+              <span className="text-destructive">Ошибка: {previewError}</span>
+            )}
           </span>
         </div>
         <div className="min-h-0 flex-1">
-          <Original />
+          {pdfPreview && !previewError ? (
+            objectUrl ? (
+              <iframe
+                title={fileName}
+                src={objectUrl}
+                className="h-full w-full border-0"
+              />
+            ) : (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                Загрузка превью…
+              </div>
+            )
+          ) : (
+            <Original />
+          )}
         </div>
       </div>
     );
   }
 
-  app.slots.fileOpener({
+  _app.slots.fileOpener({
     id: "download",
     title: "Download",
     extensions: DOWNLOAD_EXTENSIONS,
