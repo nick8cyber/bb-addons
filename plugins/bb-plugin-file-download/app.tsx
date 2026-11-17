@@ -29,7 +29,6 @@ export default definePluginApp((app) => {
     const sdk = useSdk();
     const [state, setState] = useState<DownloadState>({ status: "idle" });
     const blobUrl = useRef<string | null>(null);
-    const autoDone = useRef(false);
     const fileName = baseName(path);
 
     useEffect(
@@ -60,15 +59,8 @@ export default definePluginApp((app) => {
       }
     }, [sdk, path, source, fileName]);
 
-    // Одна автозагрузка на маунт и только при активной жесте пользователя:
-    // восстановленные после перезагрузки приложения вкладки не должны качать.
-    useEffect(() => {
-      if (autoDone.current) return;
-      if (navigator.userActivation?.isActive !== true) return;
-      autoDone.current = true;
-      void download();
-    }, [download]);
-
+    // Автозагрузки нет по слову владельца: открытие предпросмотра ≠ решение
+    // качать. Скачивание — только по кнопке «Скачать».
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="flex shrink-0 items-center gap-2 border-b border-border bg-card px-3 py-1.5 text-xs text-muted-foreground">

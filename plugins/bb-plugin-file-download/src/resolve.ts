@@ -65,13 +65,26 @@ export async function readSourceFile(
   signal?: AbortSignal,
 ): Promise<ResolvedFileContent> {
   if (source.kind === "workspace") {
-    if (!source.projectId) throw new Error("workspace-файл без projectId — не разрешить");
+    let projectId = source.projectId;
+    if (!projectId && source.environmentId) {
+      // У непроектных воркспейсов projectId в source пуст — добираем из environment.
+      const env = await sdk.environments.get({ environmentId: source.environmentId, signal });
+      projectId = env.projectId || null;
+      if (!projectId && env.path) {
+        return sdk.files.read({
+          hostId: env.hostId ?? source.experimental_hostId,
+          path: joinPath(env.path, path),
+          signal,
+        });
+      }
+    }
+    if (!projectId) throw new Error("workspace-файл без projectId — не разрешить");
     const routing = source.environmentId
       ? { environmentId: source.environmentId }
       : source.experimental_hostId
         ? { hostId: source.experimental_hostId }
         : {};
-    return sdk.projects.fileContent({ projectId: source.projectId, path, signal, ...routing });
+    return sdk.projects.fileContent({ projectId, path, signal, ...routing });
   }
   if (source.kind === "thread-storage") {
     if (!source.threadId) throw new Error("thread-storage-файл без threadId — не разрешить");

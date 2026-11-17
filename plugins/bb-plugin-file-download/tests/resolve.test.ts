@@ -20,11 +20,13 @@ function mockSdk(over: {
   fileContent?: ReturnType<typeof vi.fn>;
   read?: ReturnType<typeof vi.fn>;
   storageLocation?: ReturnType<typeof vi.fn>;
+  envGet?: ReturnType<typeof vi.fn>;
 }): PluginBrowserBbSdk {
   return {
     projects: { fileContent: over.fileContent ?? vi.fn() },
     files: { read: over.read ?? vi.fn() },
     threads: { storageLocation: over.storageLocation ?? vi.fn() },
+    environments: { get: over.envGet ?? vi.fn() },
   } as unknown as PluginBrowserBbSdk;
 }
 
@@ -98,7 +100,28 @@ describe("readSourceFile", () => {
     );
     expect(fileContent).toHaveBeenCalledWith({ projectId: "p1", path: "a.md", signal: undefined, hostId: "h9" });
   });
-  it("workspace: без projectId — понятная ошибка", async () => {
+  it("workspace: без projectId добирает его из environment", async () => {
+    const envGet = vi.fn().mockResolvedValue({ projectId: "p9", path: "/wt", hostId: "h1" });
+    const fileContent = vi.fn().mockResolvedValue({ content: "x", contentEncoding: "utf8" });
+    await readSourceFile(
+      mockSdk({ fileContent, envGet }),
+      "a.md",
+      source({ kind: "workspace", environmentId: "e5" }),
+    );
+    expect(envGet).toHaveBeenCalledWith({ environmentId: "e5", signal: undefined });
+    expect(fileContent).toHaveBeenCalledWith({ projectId: "p9", path: "a.md", signal: undefined, environmentId: "e5" });
+  });
+  it("workspace: env без projectId — читает через env.path + files.read", async () => {
+    const envGet = vi.fn().mockResolvedValue({ projectId: null, path: "/wt/root", hostId: "h3" });
+    const read = vi.fn().mockResolvedValue({ content: "x", contentEncoding: "utf8" });
+    await readSourceFile(
+      mockSdk({ read, envGet }),
+      "dir/a.md",
+      source({ kind: "workspace", environmentId: "e5" }),
+    );
+    expect(read).toHaveBeenCalledWith({ hostId: "h3", path: "/wt/root/dir/a.md", signal: undefined });
+  });
+  it("workspace: без projectId и environmentId — понятная ошибка", async () => {
     await expect(
       readSourceFile(mockSdk({}), "a.md", source({ kind: "workspace" })),
     ).rejects.toThrow("projectId");
