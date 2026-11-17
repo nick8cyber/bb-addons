@@ -136,6 +136,7 @@ import {
   type Params,
   type T,
 } from "./src/i18n/index.js";
+import { resolveRepoPath } from "./src/packet.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -1349,20 +1350,14 @@ export async function createPlugin(
     // git itself, and the §4 leak scanner as the outbound mask.
     now: () => Date.now(),
     unavailableRoutes: () => new Set(policyLoad.unavailableRoutes),
-    repoPath: async (row: DelegationRow) => {
-      const envId =
-        row.result_env_id ??
-        (await bb.sdk.threads
-          .get({ threadId: row.coordinator_thread_id })
-          .then((th) => th.environmentId ?? undefined)
-          .catch(() => undefined));
-      if (!envId) return null;
-      try {
-        return (await environmentFacts(envId)).path ?? null;
-      } catch {
-        return null;
-      }
-    },
+    repoPath: async (row: DelegationRow) =>
+      resolveRepoPath(row, {
+        store,
+        threads: bb.sdk.threads as unknown as {
+          get: (a: { threadId: string }) => Promise<{ environmentId?: string | null }>;
+        },
+        environmentFacts,
+      }),
     packetGit: async (repo: string, args: string[]) => {
       const res = await cmd.run("git", ["-C", repo, ...args]);
       if (res.exitCode !== 0) {
