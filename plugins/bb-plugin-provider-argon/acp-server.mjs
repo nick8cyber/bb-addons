@@ -8,7 +8,7 @@
 import { createInterface } from "node:readline";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import * as webTools from "./src/web-tools.mjs";
 import {
@@ -21,6 +21,7 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  realpathSync,
   writeFileSync,
   appendFileSync,
   constants,
@@ -42,6 +43,19 @@ const LOCK_FILE = join(STATE_DIR, "accounts-state.json.lock");
 const LOCK_STALE_MS = 5000;
 const LEASE_TTL_MS = 10 * 60_000;
 const SEND_DEADLINE_MS = Number(process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000;
+
+// PLUG-291: каталоги веб-вложений (исходящие uploads, входящие downloads) и
+// их чистка при старте — TTL 24ч и не более 20 файлов на каталог.
+const UPLOADS_DIR = join(STATE_DIR, "uploads");
+const DOWNLOADS_DIR = join(STATE_DIR, "downloads");
+const FILES_MAX_AGE_MS = 24 * 3600_000;
+const FILES_KEEP_COUNT = 20;
+const numEnv = (name, dflt) => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : dflt;
+};
+const argonMaxUploadBytes = () => numEnv("ARGON_MAX_UPLOAD_BYTES", 25 * 1024 * 1024);
+const argonMaxUploadCount = () => Math.floor(numEnv("ARGON_MAX_UPLOAD_COUNT", 5));
 
 /* ---------- account pool loading (§3.1) ---------- */
 export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
@@ -513,6 +527,151 @@ export function isBbSystemInstructionsBlock(block) {
       typeof block.text === "string" &&
       block.text.trimStart().startsWith(BB_SYSTEM_INSTRUCTIONS_MARKER)
   );
+}
+
+/* ---------- PLUG-291: пользовательские файлы-вложения ---------- */
+
+// Чистка каталогов uploads/downloads при старте: файлы старше maxAgeMs и
+// сверх keep последних по mtime удаляются.
+export function pruneDir(dir, { maxAgeMs = FILES_MAX_AGE_MS, keep = FILES_KEEP_COUNT } = {}) {
+  let removed = 0;
+  try {
+    if (!existsSync(dir)) return { removed };
+    const now = Date.now();
+    const ents = readdirSync(dir)
+      .map((n) => {
+        try {
+          return { n, st: statSync(join(dir, n)) };
+        } catch {
+          return null;
+        }
+      })
+      .filter((e) => e && e.st.isFile())
+      .sort((a, b) => a.st.mtimeMs - b.st.mtimeMs);
+    let remaining = ents.length;
+    for (const e of ents) {
+      if (now - e.st.mtimeMs > maxAgeMs || remaining > keep) {
+        try {
+          unlinkSync(join(dir, e.n));
+          removed += 1;
+          remaining -= 1;
+        } catch {}
+      }
+    }
+  } catch {}
+  return { removed };
+}
+
+// Корни, в пределах которых разрешена отправка локальных файлов в Gemini:
+// cwd сессии + additionalDirectories/roots из session/new|load.
+function uploadRootsFor(s) {
+  const roots = [];
+  const extra = s && Array.isArray(s.roots) ? s.roots : [];
+  for (const r of [s && s.cwd, ...extra]) {
+    if (typeof r !== "string" || !r.trim()) continue;
+    try {
+      roots.push(realpathSync(r));
+    } catch {}
+  }
+  return roots;
+}
+
+// additionalDirectories/roots из params session/new|load → список каталогов.
+// Принимаются строки и объекты { uri: "file://…" }.
+function dirRootsFrom(p) {
+  const list = [];
+  const raw = p
+    ? Array.isArray(p.additionalDirectories)
+      ? p.additionalDirectories
+      : Array.isArray(p.roots)
+        ? p.roots
+        : []
+    : [];
+  for (const r of raw) {
+    if (typeof r === "string" && r.trim()) {
+      list.push(r);
+      continue;
+    }
+    const uri = r && typeof r.uri === "string" ? r.uri : "";
+    if (uri.startsWith("file://")) {
+      try {
+        list.push(decodeURIComponent(new URL(uri).pathname));
+      } catch {}
+    }
+  }
+  return list;
+}
+
+/**
+ * Собрать локальные файлы-вложения из блоков ACP-промпта. Берутся
+ * resource_link с uri=file://… и блоки image/localFile/localImage с полем
+ * path; URL и не-файловые ресурсы не загружаются. Каждый путь проверяется:
+ * существует, обычный файл, ≤ ARGON_MAX_UPLOAD_BYTES, внутри корней сессии,
+ * не в чёрном списке чувствительных файлов. Ошибка → { error } —
+ * session/prompt отвечает JSON-RPC -32602.
+ */
+export function collectUploadFiles(promptBlocks, s) {
+  const cands = [];
+  for (const b of promptBlocks || []) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type === "resource_link" && typeof b.uri === "string") {
+      if (!b.uri.startsWith("file://")) continue;
+      let p;
+      try {
+        p = decodeURIComponent(new URL(b.uri).pathname);
+      } catch {
+        continue;
+      }
+      cands.push(p);
+    } else if (
+      (b.type === "localFile" || b.type === "localImage" || b.type === "image") &&
+      typeof b.path === "string" &&
+      b.path.trim()
+    ) {
+      cands.push(b.path);
+    }
+  }
+  const maxCount = argonMaxUploadCount();
+  const maxBytes = argonMaxUploadBytes();
+  if (cands.length > maxCount) {
+    return {
+      error: `too many upload files: ${cands.length} exceeds limit ${maxCount} (ARGON_MAX_UPLOAD_COUNT)`,
+    };
+  }
+  const roots = uploadRootsFor(s);
+  const out = [];
+  const seen = new Set();
+  for (const raw of cands) {
+    const abs = resolve(raw);
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      return { error: `upload file not found: ${raw}` };
+    }
+    if (!st.isFile()) return { error: `upload path is not a file: ${raw}` };
+    if (st.size > maxBytes) {
+      return {
+        error: `upload file too large: ${raw} (${st.size} bytes exceeds limit ${maxBytes} bytes)`,
+      };
+    }
+    let real;
+    try {
+      real = realpathSync(abs);
+    } catch {
+      real = abs;
+    }
+    const root = roots.find((r) => real === r || real.startsWith(r.endsWith(sep) ? r : r + sep));
+    if (!root) return { error: `upload file outside session roots: ${raw}` };
+    const rel = relative(root, real);
+    if (webTools.isSensitivePath(rel)) {
+      return { error: `upload denied to sensitive file: ${rel}` };
+    }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    out.push(real);
+  }
+  return { files: out };
 }
 
 /* ---------- classify failure (§3.4) ---------- */
@@ -1038,6 +1197,36 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   s.activeGen = gen;
   s.cancelled = false;
 
+  // PLUG-291: локальные файлы-вложения текущего промпта (уже провалидированы
+  // в session/prompt через collectUploadFiles) + собранные файлы Gemini.
+  const uploadFiles = Array.isArray(attachments.uploadFiles) ? attachments.uploadFiles.slice() : [];
+  const turnFiles = [];
+  const turnSkipped = [];
+  const seenFilePaths = new Set();
+  const emitGenerated = (res) => {
+    for (const f of (res && res.files) || []) {
+      if (!f || !f.path || seenFilePaths.has(f.path)) continue;
+      seenFilePaths.add(f.path);
+      turnFiles.push(f);
+      upd({
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "resource_link",
+          uri: `file://${f.path}`,
+          name: f.name || basename(f.path),
+          ...(f.mimeType ? { mimeType: f.mimeType } : {}),
+        },
+      });
+    }
+    for (const sk of (res && res.skippedDownloads) || []) {
+      turnSkipped.push(sk);
+      upd({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `\n\n[Файл Gemini пропущен: ${sk.name} — ${sk.reason}]` },
+      });
+    }
+  };
+
   try {
     slog("prompt:enqueue", { sessionId, chars: text.length, model: s.model });
     const result = await enqueue(async () => {
@@ -1105,7 +1294,12 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             cwd: s.cwd,
             resourceLinks: attachments.resourceLinks ?? [],
             embeddedResources: attachments.embeddedResources ?? [],
+            // PLUG-291: материалы сверх лимита первого сообщения уходят
+            // .md-файлом в uploads/ и прикладываются как веб-вложение.
+            spillDir: UPLOADS_DIR,
+            spillId: sessionId,
           });
+      if (packed.spilledFile) uploadFiles.push(packed.spilledFile);
 
       while (true) {
         if (s.cancelled) return { cancelled: true };
@@ -1150,6 +1344,10 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         const attempt = (async () => {
           try {
             const driverMod = getDriver();
+            // PLUG-291: пользовательские файлы идут веб-вложениями первой
+            // отправкой попытки (перед вставкой текста, без insertText);
+            // при ротации на новый чат файлы прикладываются заново.
+            let filesPending = uploadFiles.length ? uploadFiles.slice() : null;
             // §3 Tool Loop: все раунды — в том же convId на том же бэкенде,
             // лиз удерживается до конца хода.
             const sendOnce = async (message) => {
@@ -1179,6 +1377,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 strict: true,
                 strictModel: true,
                 signal: abortCtrl.signal,
+                files: filesPending,
+                sessionId,
+                downloadsDir: DOWNLOADS_DIR,
                 shouldCancel: () => s.cancelled || abortCtrl.signal.aborted || s.activeGen !== gen,
                 backend: backend,
                 accountId: backend.id,
@@ -1194,9 +1395,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   }
                 },
               });
+              filesPending = null;
               if (res && res.convId) {
                 s.convId = res.convId;
               }
+              emitGenerated(res);
               slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
               return res;
             };
@@ -1237,6 +1440,18 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               const e = new Error("prompt cancelled by user");
               e.code = "ARGON_CANCELLED";
               throw e;
+            }
+            // PLUG-291: текстовая строка-указатель на скачанные файлы —
+            // resource_link-чанки уже отправлены выше, здесь видимая
+            // человеку сводка со ссылками file://.
+            if (turnFiles.length) {
+              const links = turnFiles
+                .map((f) => `[${f.name || basename(f.path)}](file://${encodeURI(f.path)})`)
+                .join(" · ");
+              upd({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: `\n\nФайлы Gemini: ${links}` },
+              });
             }
             return loop.lastRes ?? { text: loop.finalText };
           } finally {
@@ -1357,7 +1572,19 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       out({
         jsonrpc: "2.0",
         id,
-        result: { stopReason: isCancelled ? "cancelled" : "end_turn" },
+        result: {
+          stopReason: isCancelled ? "cancelled" : "end_turn",
+          ...(turnFiles.length
+            ? {
+                attachments: turnFiles.map((f) => ({
+                  type: "resource_link",
+                  uri: `file://${f.path}`,
+                  name: f.name || basename(f.path),
+                  ...(f.mimeType ? { mimeType: f.mimeType } : {}),
+                })),
+              }
+            : {}),
+        },
       });
     }
     if (s.activeGen === gen) s.activeGen = null;
@@ -1443,6 +1670,7 @@ export function dispatch(msg) {
       const s = {
         id: sessionId,
         cwd: p.cwd || null,
+        roots: dirRootsFrom(p),
         model: "argon",
         thinking: "medium",
         convId: null,
@@ -1473,6 +1701,7 @@ export function dispatch(msg) {
         s = {
           id: sessionId,
           cwd: p.cwd || null,
+          roots: dirRootsFrom(p),
           model: "argon",
           thinking: "medium",
           convId: null,
@@ -1572,7 +1801,8 @@ export function dispatch(msg) {
     }
 
     case "session/prompt": {
-      if (!sessions.has(p.sessionId)) {
+      const sess = sessions.get(p.sessionId);
+      if (!sess) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown session "${p.sessionId}"` } });
         return;
       }
@@ -1598,15 +1828,33 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
         return;
       }
-      // §5: приложенные ресурсы ACP (embeddedContext) — file:// ссылки и
+      // §5 + PLUG-291: приложенные ресурсы ACP (embeddedContext) — ссылки и
       // встроенные текстовые ресурсы идут во вложения первого сообщения.
+      // file:// ссылки исключены: они уходят веб-вложением через upload,
+      // а не дублируются текстом в insertText.
       const resourceLinks = p.prompt.filter(
-        (b) => b && b.type === "resource_link" && typeof b.uri === "string",
+        (b) =>
+          b &&
+          b.type === "resource_link" &&
+          typeof b.uri === "string" &&
+          !b.uri.startsWith("file://"),
       );
       const embeddedResources = p.prompt.filter(
         (b) => b && b.type === "resource" && b.resource && typeof b.resource.text === "string",
       );
-      void runPrompt(msg.id, p.sessionId, text, { resourceLinks, embeddedResources });
+      // PLUG-291: локальные файлы-вложения (file://, image/localFile path)
+      // валидируются синхронно по корням сессии и лимитам — ошибка идёт
+      // JSON-RPC error, валидные пути уходят драйверу веб-вложениями.
+      const upload = collectUploadFiles(p.prompt, sess);
+      if (upload.error) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: upload.error } });
+        return;
+      }
+      void runPrompt(msg.id, p.sessionId, text, {
+        resourceLinks,
+        embeddedResources,
+        uploadFiles: upload.files,
+      });
       return;
     }
 
@@ -1635,6 +1883,9 @@ export function dispatch(msg) {
 /* ---------- CLI entrypoint ---------- */
 export function startServer() {
   reapOrphanAcpServers();
+  // PLUG-291: чистка каталогов веб-вложений при старте (TTL 24ч, ≤20 файлов).
+  pruneDir(UPLOADS_DIR);
+  pruneDir(DOWNLOADS_DIR);
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on("line", (line) => {
     let msg;

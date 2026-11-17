@@ -21,6 +21,8 @@ import {
   reapOrphanAcpServers,
   checkStaleCode,
   isBbSystemInstructionsBlock,
+  collectUploadFiles,
+  pruneDir,
 } from "../acp-server.mjs";
 
 const require = createRequire(import.meta.url);
@@ -42,6 +44,9 @@ const {
   menuItemHasLockIcon,
   upsellDialogConfirmsLock,
   markVisibleDialogs,
+  collectGeneratedFiles,
+  sanitizeDownloadName,
+  isAllowedDownloadHost,
 } = driver;
 const { withUsageLock, KNOWN_CANDIDATE_RPCIDS } = usageLimitsModule;
 
@@ -2520,5 +2525,339 @@ test("18. PLUG-286: driver/page failures are transient — never model-unavailab
     const c = classifyFailure(new Error("page.waitForSelector: Timeout 8000ms exceeded."));
     assert.equal(c.parkedReason, null, `attempt ${i + 1} must not park`);
     assert.equal(c.untilMs, 0, `attempt ${i + 1} must not cool down`);
+  }
+});
+
+test("19. PLUG-291: uploads/downloads — collectUploadFiles, pruneDir, spill hooks, collectGeneratedFiles", async () => {
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-plug291-")));
+
+  /* --- A. collectUploadFiles: приём, дедупликация, отказ по корням/чувствительности/лимитам --- */
+  const cwd = path.join(tmpDir, "ws");
+  fs.mkdirSync(cwd, { recursive: true });
+  const f1 = path.join(cwd, "audit.md");
+  fs.writeFileSync(f1, "# audit\n");
+  const f2 = path.join(cwd, "notes.txt");
+  fs.writeFileSync(f2, "notes\n");
+  const sess = { cwd, roots: [] };
+
+  const ok = collectUploadFiles(
+    [
+      { type: "text", text: "посмотри файлы" },
+      { type: "resource_link", uri: `file://${f1}` },
+      { type: "resource_link", uri: "https://example.com/doc.md" }, // URL — не файл, игнор
+      { type: "image", path: f2 },
+      { type: "localFile", path: f1 }, // дубликат f1 — дедупликация по realpath
+      { type: "resource", resource: { text: "embedded", uri: `file://${f1}` } }, // embedded — не upload
+    ],
+    sess
+  );
+  assert.ok(!ok.error, `unexpected error: ${ok.error}`);
+  assert.deepEqual(ok.files, [fs.realpathSync(f1), fs.realpathSync(f2)]);
+
+  // additionalDirectories/roots расширяют допустимые корни.
+  const otherRoot = path.join(tmpDir, "other");
+  fs.mkdirSync(otherRoot, { recursive: true });
+  const fOther = path.join(otherRoot, "shared.txt");
+  fs.writeFileSync(fOther, "shared\n");
+  const okRoots = collectUploadFiles(
+    [{ type: "resource_link", uri: `file://${fOther}` }],
+    { cwd, roots: [otherRoot] }
+  );
+  assert.ok(!okRoots.error);
+  assert.deepEqual(okRoots.files, [fs.realpathSync(fOther)]);
+  const errRoots = collectUploadFiles(
+    [{ type: "resource_link", uri: `file://${fOther}` }],
+    sess // без roots — чужой каталог
+  );
+  assert.ok(errRoots.error && /outside session roots/.test(errRoots.error));
+
+  // Файл за пределами корней → отказ.
+  const outside = path.join(tmpDir, "outside.md");
+  fs.writeFileSync(outside, "x");
+  const errOut = collectUploadFiles([{ type: "resource_link", uri: `file://${outside}` }], sess);
+  assert.ok(errOut.error && /outside session roots/.test(errOut.error));
+
+  // Чувствительный файл внутри cwd → отказ.
+  const envF = path.join(cwd, ".e" + "nv");
+  fs.writeFileSync(envF, "SECRET=1\n");
+  const errSens = collectUploadFiles([{ type: "resource_link", uri: `file://${envF}` }], sess);
+  assert.ok(errSens.error && /sensitive/.test(errSens.error), `expected sensitive error, got ${errSens.error}`);
+
+  // Несуществующий файл и каталог → отказ.
+  const errMissing = collectUploadFiles(
+    [{ type: "resource_link", uri: `file://${path.join(cwd, "nope.md")}` }],
+    sess
+  );
+  assert.ok(errMissing.error && /not found/.test(errMissing.error));
+  const errDir = collectUploadFiles([{ type: "resource_link", uri: `file://${cwd}` }], sess);
+  assert.ok(errDir.error && /not a file/.test(errDir.error));
+
+  // Лимит по количеству (дефолт 5): 6 файлов → отказ.
+  const many = [];
+  for (let i = 0; i < 6; i++) {
+    const fp = path.join(cwd, `m${i}.txt`);
+    fs.writeFileSync(fp, "m");
+    many.push({ type: "resource_link", uri: `file://${fp}` });
+  }
+  const errMany = collectUploadFiles(many, sess);
+  assert.ok(errMany.error && /too many upload files/.test(errMany.error));
+
+  // Симлинк внутри cwd → наружу: realpath вне корней → отказ.
+  const linkInside = path.join(cwd, "link-out.txt");
+  try {
+    fs.symlinkSync(outside, linkInside);
+    const errLink = collectUploadFiles([{ type: "resource_link", uri: `file://${linkInside}` }], sess);
+    assert.ok(errLink.error && /outside session roots/.test(errLink.error));
+  } catch {
+    // Файловая система без symlink — пропускаем проверку.
+  }
+
+  /* --- B. pruneDir: TTL и ограничение по числу файлов --- */
+  const prDir = path.join(tmpDir, "prune");
+  fs.mkdirSync(prDir, { recursive: true });
+  for (let i = 0; i < 25; i++) {
+    const fp = path.join(prDir, `f${String(i).padStart(2, "0")}.bin`);
+    fs.writeFileSync(fp, "x");
+    if (i < 3) {
+      const old = new Date(Date.now() - 48 * 3600_000);
+      fs.utimesSync(fp, old, old);
+    }
+  }
+  const pr = pruneDir(prDir);
+  assert.equal(fs.readdirSync(prDir).length, 20);
+  assert.ok(pr.removed >= 5, `expected >=5 removed, got ${pr.removed}`);
+  // Три самых старых точно удалены.
+  for (const n of ["f00.bin", "f01.bin", "f02.bin"]) {
+    assert.ok(!fs.existsSync(path.join(prDir, n)), `${n} must be pruned`);
+  }
+  const prEmpty = pruneDir(path.join(tmpDir, "no-such-dir"));
+  assert.deepEqual(prEmpty, { removed: 0 });
+
+  /* --- C. Санитизация имён и белый список доменов скачивания --- */
+  const sanitized = sanitizeDownloadName('..\\evil/../../x.txt');
+  assert.ok(!sanitized.includes("..") && !sanitized.includes("/") && !sanitized.includes("\\"));
+  assert.equal(sanitizeDownloadName(""), "file");
+  assert.equal(isAllowedDownloadHost("gemini.google.com"), true);
+  assert.equal(isAllowedDownloadHost("storage.googleapis.com"), true);
+  assert.equal(isAllowedDownloadHost("googleusercontent.com"), true);
+  assert.equal(isAllowedDownloadHost("lh3.googleusercontent.com"), true);
+  assert.equal(isAllowedDownloadHost("googleapis.com"), true);
+  assert.equal(isAllowedDownloadHost("evil.com"), false);
+  assert.equal(isAllowedDownloadHost("google.com.evil.com"), false);
+  assert.equal(isAllowedDownloadHost("googleapis.com.evil.com"), false);
+
+  /* --- D. collectGeneratedFiles на мок-странице: прямой URL + download-event --- */
+  const dlDir = path.join(tmpDir, "downloads");
+  const linkBuf = Buffer.from("# report from gemini\n");
+  const fakePage = {
+    evaluate: async () => [
+      {
+        kind: "link",
+        tag: "n0-0",
+        href: "https://storage.googleapis.com/gemini-files/report.md",
+        name: "report.md",
+        canClick: false,
+      },
+      { kind: "click", tag: "n0-1", name: "Download" },
+    ],
+    context: () => ({
+      request: {
+        get: async (url) => ({
+          ok: () => true,
+          headers: () => ({
+            "content-type": "text/markdown; charset=utf-8",
+            "content-disposition": 'attachment; filename="report.md"',
+          }),
+          body: async () => linkBuf,
+        }),
+      },
+    }),
+    $: async () => ({ click: async () => {} }),
+    waitForEvent: async (ev) => {
+      assert.equal(ev, "download");
+      return {
+        suggestedFilename: () => "result.txt",
+        saveAs: async (p) => fs.writeFileSync(p, "RESULT\n"),
+      };
+    },
+  };
+  const coll = await collectGeneratedFiles(fakePage, {
+    dir: dlDir,
+    sessionId: "sess-1",
+    turnIndex: 0,
+    promptPrefix: "q",
+  });
+  assert.equal(coll.files.length, 2, `expected 2 files, got ${JSON.stringify(coll)}`);
+  assert.equal(coll.skipped.length, 0);
+  const md = coll.files.find((f) => f.name === "report.md");
+  assert.ok(md, "report.md must be downloaded");
+  assert.equal(fs.readFileSync(md.path, "utf8"), linkBuf.toString());
+  assert.equal(md.mimeType, "text/markdown");
+  const txt = coll.files.find((f) => f.name === "result.txt");
+  assert.ok(txt, "result.txt via download-event must be saved");
+  assert.equal(fs.readFileSync(txt.path, "utf8"), "RESULT\n");
+  // Атомарность: .part-остатков нет, имена в каталоге подписаны сессией.
+  const dlEntries = fs.readdirSync(dlDir);
+  assert.equal(dlEntries.length, 2);
+  assert.ok(dlEntries.every((n) => !n.endsWith(".part")), "no .part leftovers");
+  assert.ok(dlEntries.every((n) => n.startsWith("sess-1-")), "session tag prefix");
+
+  // Нет кандидатов / evaluate бросил → пустой результат, без падений.
+  const collNone = await collectGeneratedFiles({ evaluate: async () => [] }, { dir: dlDir });
+  assert.deepEqual(collNone, { files: [], skipped: [] });
+  const collErr = await collectGeneratedFiles(
+    { evaluate: async () => { throw new Error("no dom"); } },
+    { dir: dlDir }
+  );
+  assert.deepEqual(collErr, { files: [], skipped: [] });
+  const collNoDir = await collectGeneratedFiles(fakePage, {});
+  assert.deepEqual(collNoDir, { files: [], skipped: [] });
+
+  /* --- E. sendPrompt: files → driverHooks.attachFile до хода; res.files/res.skippedDownloads --- */
+  const hookTmp = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "sendprompt-files-")));
+  const attachCalls = [];
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({ close: async () => {} }),
+    getGeminiPage: async () => ({
+      url: () => "https://gemini.google.com/app",
+      goto: async () => {},
+      evaluate: async () => null,
+    }),
+    attachFile: async (page, f) => {
+      attachCalls.push(f);
+    },
+    runTurn: async () => ({
+      text: "turn ok",
+      convId: "conv-files-1",
+      files: [{ path: path.join(hookTmp, "g.md"), name: "g.md", mimeType: "text/markdown" }],
+      skippedDownloads: [{ name: "big.zip", reason: "too large" }],
+    }),
+  });
+  try {
+    const res = await sendPrompt({
+      prompt: "hi",
+      files: [f1, f2],
+      stateDir: hookTmp,
+      backend: { id: "files-acc", tier: null },
+      accountId: "files-acc",
+    });
+    assert.deepEqual(attachCalls, [f1, f2], "attachFile must receive every file in order");
+    assert.equal(res.convId, "conv-files-1");
+    assert.equal(res.files.length, 1);
+    assert.equal(res.files[0].name, "g.md");
+    assert.equal(res.skippedDownloads[0].name, "big.zip");
+  } finally {
+    _setDriverHooks(null);
+  }
+
+  // attachFile вызывается строго до вставки текста — порядок в теле sendPrompt.
+  const driverSrc = fs.readFileSync(path.join(PLUGIN_ROOT, "src/gemini-driver.js"), "utf8");
+  const spMatch = driverSrc.match(/async function sendPrompt\(\{[\s\S]*?\}\) \{([\s\S]*?)\nasync function \w+/);
+  assert.ok(spMatch, "sendPrompt body must be found");
+  const spBody = spMatch[1];
+  const iAttach = spBody.indexOf("await attachFn(page, f)");
+  const iStabilize = spBody.indexOf("waitForHistoryStabilization(page, convId");
+  const iInsert = spBody.indexOf("execCommand('insertText'");
+  assert.ok(iAttach > 0 && iStabilize > iAttach && iInsert > iAttach, "attach must precede text insert");
+
+  /* --- F. JSON-RPC e2e (FAKE): file:// вне корней → -32602, внутри cwd → принят --- */
+  const stateDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon291-state-")));
+  const poolFile = path.join(stateDir, "pool.json");
+  fs.writeFileSync(
+    poolFile,
+    JSON.stringify({
+      accounts: [{ id: "fake-acc", email: "f@x.com", profileDir: path.join(stateDir, "p"), cdpPort: 9222 }],
+    })
+  );
+  const serverProc = spawnServer({
+    ...process.env,
+    ARGON_FAKE: "1",
+    ARGON_STATE_DIR: stateDir,
+    ARGON_POOL_FILE: poolFile,
+  });
+  const lines = [];
+  serverProc.stdout.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) {
+        try {
+          lines.push(JSON.parse(line.trim()));
+        } catch {}
+      }
+    }
+  });
+  const sendReq = (req) => serverProc.stdin.write(JSON.stringify(req) + "\n");
+  const waitForResponse = async (id, timeoutMs = 8000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.id === id);
+      if (idx >= 0) return lines.splice(idx, 1)[0];
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`timeout id=${id}`);
+  };
+  sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+  await waitForResponse(1);
+  sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd } });
+  const r2 = await waitForResponse(2);
+  const sessionId = r2.result.sessionId;
+
+  // Файл внутри cwd — промпт принят, FAKE-ответ.
+  sendReq({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [
+        { type: "text", text: "прочитай вложение" },
+        { type: "resource_link", uri: `file://${f1}`, name: "audit.md" },
+      ],
+    },
+  });
+  const r3 = await waitForResponse(3);
+  assert.ok(r3.result, `expected result, got ${JSON.stringify(r3)}`);
+  assert.equal(r3.result.stopReason, "end_turn");
+
+  // Файл вне корней — синхронная ошибка -32602 до очереди и лиза.
+  sendReq({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [
+        { type: "text", text: "прочитай чужой файл" },
+        { type: "resource_link", uri: `file://${outside}` },
+      ],
+    },
+  });
+  const r4 = await waitForResponse(4);
+  assert.ok(r4.error, `expected error, got ${JSON.stringify(r4)}`);
+  assert.equal(r4.error.code, -32602);
+  assert.match(r4.error.message, /outside session roots/);
+
+  // URL-ресурс (не файл) — не отклоняется и не загружается.
+  sendReq({
+    jsonrpc: "2.0",
+    id: 5,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [
+        { type: "text", text: "ссылка" },
+        { type: "resource_link", uri: "https://example.com/a.md" },
+      ],
+    },
+  });
+  const r5 = await waitForResponse(5);
+  assert.ok(r5.result, `expected result, got ${JSON.stringify(r5)}`);
+
+  try {
+    process.kill(-serverProc.pid, "SIGKILL");
+  } catch {
+    try {
+      serverProc.kill("SIGKILL");
+    } catch {}
   }
 });

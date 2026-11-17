@@ -1337,11 +1337,33 @@ export const GIT_DIFF_DENY_PATHSPECS = [
   ":(exclude)id_*",
 ];
 
+const SPILL_NAME_SAFE_RE = /[^\w.-]+/g;
+
+/**
+ * PLUG-291: перелив тела материалов в .md-файл веб-вложения.
+ * Пишется атомарно (tmp + rename) в spillDir/pkg-<id>-<ts>.md;
+ * имя каталога не создаётся заранее — mkdir только при реальной записи.
+ */
+function writeSpillPackage(spillDir, spillId, content) {
+  const safeId = String(spillId ?? "pkg").replace(SPILL_NAME_SAFE_RE, "_") || "pkg";
+  const pkgName = `pkg-${safeId}-${Date.now()}.md`;
+  const pkgPath = path.join(spillDir, pkgName);
+  fs.mkdirSync(spillDir, { recursive: true });
+  const tmp = `${pkgPath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, content, "utf8");
+  fs.renameSync(tmp, pkgPath);
+  return { pkgName, pkgPath };
+}
+
 /**
  * Собрать первое сообщение сессии: системная шапка + текст задачи +
  * вложения (дифф, файлы, треды, задачи), уложенные в maxBytes.
  * Всё, что не поместилось, перечисляется в шапке строкой
  * «Можно запросить инструментом: …».
+ *
+ * PLUG-291: при заданном spillDir и переполнении собранного сообщения
+ * материалы-блоки уходят файлом-вложением .md в spillDir (возвращается
+ * `spilledFile`), в тексте — короткая пометка о вложении вместо обрезки.
  */
 export function packFirstMessage({
   text,
@@ -1350,6 +1372,8 @@ export function packFirstMessage({
   embeddedResources = [],
   maxBytes = MAX_MESSAGE_BYTES,
   maxRounds = MAX_TOOL_ROUNDS,
+  spillDir = null,
+  spillId = null,
 }) {
   maxBytes = effectiveMessageBytes(maxBytes);
   const seen = new Set();
@@ -1463,6 +1487,7 @@ export function packFirstMessage({
   // Резерв на строку «Можно запросить инструментом:».
   let used = len(header) + len(body) + 300;
   const blocks = [];
+  const allBlocks = [];
   const attached = [];
   const overflow = [];
 
@@ -1471,6 +1496,7 @@ export function packFirstMessage({
     const output = res && res.ok ? String(res.output ?? "") : "";
     if (!output.trim()) continue; // пустой материал — не вложение и не подсказка
     const block = `=== ${c.block} ===\n${output}`;
+    allBlocks.push({ text: block, blockName: c.block, hint: c.hint });
     const size = len(block) + 2;
     if (used + size <= maxBytes) {
       blocks.push({ text: block, blockName: c.block, hint: c.hint });
@@ -1491,6 +1517,48 @@ export function packFirstMessage({
     head + "\n\n" + body + (blocks.length ? "\n\n" + blocks.map((b) => b.text).join("\n\n") : "");
 
   let fullText = buildFull();
+
+  // 0) PLUG-291: перелив — материалы не влезли в maxBytes (overflow) или
+  // собранное сообщение перевалило лимит → ВЕСЬ пакет материалов уходит
+  // .md-файлом веб-вложения в spillDir, в сообщении остаются шапка, задача
+  // и пометка о вложении. При неудаче записи — обычный путь вытеснения.
+  if (spillDir && allBlocks.length > 0 && (overflow.length > 0 || len(fullText) > maxBytes)) {
+    try {
+      const { pkgName, pkgPath } = writeSpillPackage(
+        spillDir,
+        spillId,
+        allBlocks.map((b) => b.text).join("\n\n") + "\n",
+      );
+      const note =
+        `\n\n[Материалы задачи (${allBlocks.length} блоков: ` +
+        allBlocks.map((b) => b.blockName).join(", ") +
+        `) переданы файлом-вложением «${pkgName}» — изучи его целиком.]`;
+      const headNote = header + "\n\n";
+      let msg = headNote + body + note;
+      if (len(msg) > maxBytes) {
+        const truncBodySuffix = "\n[... текст задачи обрезан по лимиту сообщения ...]";
+        const avail = maxBytes - len(headNote) - len(note);
+        if (avail > len(truncBodySuffix)) {
+          body = truncateUtf8(body, avail - len(truncBodySuffix)) + truncBodySuffix;
+        } else {
+          body = avail > 0 ? truncateUtf8(body, avail) : "";
+        }
+        msg = headNote + body + note;
+      }
+      let message = maskForWeb(msg);
+      if (len(message) > maxBytes) {
+        message = truncateUtf8(message, maxBytes);
+      }
+      return {
+        message,
+        attached: allBlocks.map((b) => b.blockName),
+        overflow: [],
+        spilledFile: pkgPath,
+      };
+    } catch (e) {
+      process.stderr.write(`[provider-argon] spill to file failed: ${e.message}\n`);
+    }
+  }
 
   // 1) Если общее сообщение превышает maxBytes, вытесняем блоки с конца.
   // Вытесненные блоки обязаны попадать в overflow-подсказки (§5.5).
