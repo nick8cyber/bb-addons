@@ -3,7 +3,7 @@ title: provider-argon — ACP-провайдер веб-интерфейса Gem
 status: approved
 owner: coordinator
 date: 2026-11-17
-revision: 13
+revision: 14
 tags: [bb, plugins, provider-argon, acp, gemini]
 ---
 
