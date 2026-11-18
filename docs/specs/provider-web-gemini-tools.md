@@ -174,9 +174,9 @@ flowchart TD
    - На каждый вызов локального инструмента — таймаут 15 секунд.
    - На ход в веб-интерфейсе — `SEND_DEADLINE_MS` (20 минут).
 4. **Файлы-вложения и сгенерированные файлы (PLUG-291):**
-   - Исходящие пользовательские файлы за один `session/prompt`: ≤ `ARGON_MAX_UPLOAD_COUNT` (по умолчанию 5) уникальных файлов, ≤ `ARGON_MAX_UPLOAD_BYTES` (по умолчанию 25 МБ) каждый; нарушение — синхронная ошибка `-32602` до обращения к аккаунту.
-   - Скачивание сгенерированных файлов за один ответ: ≤ `ARGON_MAX_DOWNLOAD_COUNT` (по умолчанию 5) файлов, ≤ `ARGON_MAX_DOWNLOAD_BYTES` (по умолчанию 50 МБ) на файл; потолок попыток скачивания `max(8, 2 × ARGON_MAX_DOWNLOAD_COUNT)`; превышение — файл пропускается с пометкой в тексте ответа, ход не падает.
-   - Каталоги `$ARGON_STATE_DIR/uploads/` и `$ARGON_STATE_DIR/downloads/` чистятся при старте сервера: файлы старше 24 ч и сверх 20 последних по mtime удаляются; запись атомарная (tmp + rename).
+   - Исходящие пользовательские файлы за один `session/prompt`: ≤ `WEB_GEMINI_MAX_UPLOAD_COUNT` / `ARGON_MAX_UPLOAD_COUNT` (по умолчанию 5) уникальных файлов, ≤ `WEB_GEMINI_MAX_UPLOAD_BYTES` / `ARGON_MAX_UPLOAD_BYTES` (по умолчанию 25 МБ) каждый; нарушение — синхронная ошибка `-32602` до обращения к аккаунту.
+   - Скачивание сгенерированных файлов за один ответ: ≤ `WEB_GEMINI_MAX_DOWNLOAD_COUNT` / `ARGON_MAX_DOWNLOAD_COUNT` (по умолчанию 5) файлов, ≤ `WEB_GEMINI_MAX_DOWNLOAD_BYTES` / `ARGON_MAX_DOWNLOAD_BYTES` (по умолчанию 50 МБ) на файл; потолок попыток скачивания `max(8, 2 × WEB_GEMINI_MAX_DOWNLOAD_COUNT / ARGON_MAX_DOWNLOAD_COUNT)`; превышение — файл пропускается с пометкой в тексте ответа, ход не падает.
+   - Каталоги `uploads/` и `downloads/` внутри `$STATE_DIR` (`WEB_GEMINI_STATE_DIR` / `ARGON_STATE_DIR`, дефолт `~/.bb/plugins/provider-web-gemini`, фолбэк `provider-argon`) чистятся при старте сервера: файлы старше 24 ч и сверх 20 последних по mtime удаляются; запись атомарная (tmp + rename).
 
 ---
 
