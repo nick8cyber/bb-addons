@@ -84,6 +84,11 @@ import {
   type AccountHome,
   type AccountsLedger,
 } from "./accounts.js";
+import {
+  registryLogLine,
+  resolveInstall,
+  type InstallResolution,
+} from "./installs.js";
 
 // ---------------------------------------------------------------------------
 // Wire plumbing. One stdout writer, protocol traffic only — a stray log line
@@ -1139,7 +1144,8 @@ type BridgeRotationCause =
   | "ineligible"
   | "auth-dead"
   | "tos-disabled"
-  | "validation-required";
+  | "validation-required"
+  | "install";
 
 /**
  * Point-2 guard: before (re)spawning onto the session's pinned account,
@@ -1167,7 +1173,11 @@ function rotateCooldownAccount(
   const entry = ledger.accounts[session.accountLabel];
   const untilMs = entry?.cooldownUntilMs ?? 0;
   const parkedReason = entry?.parkedReason;
-  if (parkedReason === undefined && untilMs <= Date.now()) {
+  // §5 п.2 (provider-agy-installs): a pinned account whose install cannot
+  // run here is a dead home exactly like a parked one — a resume/turn
+  // moves it to a free sibling instead of launching a substitute binary.
+  const installDead = !locallyAvailable(ledger, session.accountLabel);
+  if (parkedReason === undefined && untilMs <= Date.now() && !installDead) {
     return null;
   }
   const from = session.accountLabel;
@@ -1179,20 +1189,26 @@ function rotateCooldownAccount(
       : parkedReason !== undefined ||
           isAccountIneligible(entry?.lastError ?? "")
         ? "ineligible"
-        : "quota";
+        : installDead
+          ? "install"
+          : "quota";
   const accounts = listAccounts(cliproxyRelayDataDir);
-  const candidate = pickAccount(ledger, accounts, session.accountLabel);
+  const candidate = pickAccount(ledger, accounts, session.accountLabel, {
+    locallyAvailable: (label) => locallyAvailable(ledger, label),
+  });
   const candidateUntilMs =
     candidate === null
       ? 0
       : (ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0);
   if (candidate === null || candidateUntilMs > Date.now()) {
-    if (parkedReason !== undefined) {
+    if (parkedReason !== undefined || installDead) {
       // A parked account is never "stayed on": no free sibling means the
       // caller must fail honestly — launching agy on a banned home is off
-      // the table by contract (spec §10, ревизия 14).
+      // the table by contract (spec §10, ревизия 14). A locally dead
+      // install is the same kind of permanent dead home (§5 п.2
+      // provider-agy-installs): no free sibling — an honest refusal.
       log(
-        `${where}: account ${from} is parked (${parkedReason}) and no sibling is free; failing honestly`,
+        `${where}: account ${from} ${parkedReason !== undefined ? `is parked (${parkedReason})` : "install is unavailable on this host"} and no sibling is free; failing honestly`,
       );
       return { from, to: null, cause };
     }
@@ -1213,7 +1229,9 @@ function rotateCooldownAccount(
   log(
     parkedReason !== undefined
       ? `${where}: account ${from} is parked (${parkedReason}); rotated to free sibling ${candidate.label}`
-      : `${where}: account ${from} cools until ${new Date(untilMs).toISOString()}; rotated to free sibling ${candidate.label}`,
+      : installDead
+        ? `${where}: account ${from} install unavailable on this host; rotated to free sibling ${candidate.label}`
+        : `${where}: account ${from} cools until ${new Date(untilMs).toISOString()}; rotated to free sibling ${candidate.label}`,
   );
   return { from, to: candidate.label, cause };
 }
@@ -1229,6 +1247,8 @@ function parkedAccountPhrase(rotation: { from: string; cause: BridgeRotationCaus
       return `${rotation.from} was disabled by Google (Terms of Service)`;
     case "validation-required":
       return `${rotation.from} needs Google account verification`;
+    case "install":
+      return `${rotation.from} cannot run on this host (its install is unavailable)`;
     default:
       return `${rotation.from} is in quota cooldown`;
   }
@@ -1341,7 +1361,9 @@ function scheduleAccountRetry(
     const accounts = listAccounts(cliproxyRelayDataDir);
     const candidate = failedTurn === null
       ? null
-      : pickAccount(ledger, accounts, session.accountLabel);
+      : pickAccount(ledger, accounts, session.accountLabel, {
+          locallyAvailable: (label) => locallyAvailable(ledger, label),
+        });
     if (
       candidate !== null &&
       (ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0) <= Date.now()
@@ -1714,6 +1736,62 @@ function cliproxyChildEnvOverlay(): Record<string, string> {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Parallel installs (provider-agy-installs): the registry at
+// <dataDir>/agy-installs.json binds each account's `install` field to a
+// binary — strictly, with no substitution (§5). The bridge resolves it for
+// every pick and every spawn; without the file the resolveAgyCommand answer
+// is exactly what it was before.
+// ---------------------------------------------------------------------------
+
+/** One locally-unavailable warning per account per 5 minutes (§5 п.2). */
+const installUnavailableLoggedAt = new Map<string, number>();
+
+function noteInstallUnavailable(label: string, reason: string): void {
+  const now = Date.now();
+  if (now - (installUnavailableLoggedAt.get(label) ?? 0) < 5 * 60_000) {
+    return;
+  }
+  installUnavailableLoggedAt.set(label, now);
+  log(`account ${label} install unavailable on this host: ${reason}`);
+}
+
+/** The §5 п.2 availability gate for pickAccount calls in this bridge. */
+function locallyAvailable(ledger: AccountsLedger, label: string): boolean {
+  if (cliproxyRelayDataDir === null) {
+    return true;
+  }
+  const entry = Object.hasOwn(ledger.accounts, label)
+    ? ledger.accounts[label]
+    : undefined;
+  const resolution = resolveInstall(cliproxyRelayDataDir, entry?.install);
+  if (
+    resolution.kind === "unavailable" ||
+    resolution.kind === "broken"
+  ) {
+    noteInstallUnavailable(label, resolution.reason);
+    return false;
+  }
+  return true;
+}
+
+/** The install resolution behind a session's pinned account (§6 п.9). */
+function sessionInstallResolution(session: Session): InstallResolution {
+  if (cliproxyRelayDataDir === null) {
+    return { kind: "legacy" };
+  }
+  const install =
+    session.accountLabel !== null
+      ? (() => {
+          const accounts = loadLedger(cliproxyRelayDataDir).accounts;
+          return Object.hasOwn(accounts, session.accountLabel as string)
+            ? accounts[session.accountLabel as string]?.install
+            : undefined;
+        })()
+      : undefined;
+  return resolveInstall(cliproxyRelayDataDir, install);
+}
+
 /**
  * The account-pool overlay, and the first word on where a child lives: when
  * the pool has accounts, every session is pinned to one and runs agy as a
@@ -1728,7 +1806,9 @@ function childEnvOverlay(session: Session): Record<string, string> {
     if (accounts.length > 0) {
       if (session.accountLabel === null) {
         const ledger = loadLedger(cliproxyRelayDataDir);
-        const picked = pickAccount(ledger, accounts);
+        const picked = pickAccount(ledger, accounts, null, {
+          locallyAvailable: (label) => locallyAvailable(ledger, label),
+        });
         session.accountLabel = picked?.label ?? null;
         log(
           `session ${session.threadId}: pinned to account ${session.accountLabel ?? "none"} (pool ${accounts.length})`,
@@ -1804,13 +1884,6 @@ function startChild(args: StartChildArgs): void {
   const childStderr = { tail: "", history: "" };
   session.childStderr = childStderr;
   const generation = session.generation;
-  let command: string;
-  try {
-    command = resolveAgyCommand(process.env);
-  } catch (error) {
-    failSession(session, error instanceof Error ? error.message : String(error));
-    return;
-  }
   const spawnArgs = agySpawnArgs({
     model: args.model,
     reasoningLevel: args.reasoningLevel,
@@ -1824,6 +1897,33 @@ function startChild(args: StartChildArgs): void {
   // the session's declared passthrough.
   const env = withoutBridgeRuntimeEnv(process.env);
   const overlay = childEnvOverlay(session);
+  // §6 п.9 (provider-agy-installs): the overlay just pinned the account,
+  // so its install resolves now — a bound account never sees another
+  // install's binary (§5 п.2), and the install's env rides as the first
+  // layer under the passthrough and the protected overlay keys.
+  const resolution = sessionInstallResolution(session);
+  let command: string;
+  if (resolution.kind === "unavailable" || resolution.kind === "broken") {
+    noteInstallUnavailable(
+      session.accountLabel ?? "direct",
+      resolution.reason,
+    );
+    failSession(session, `agy install unavailable: ${resolution.reason}`);
+    return;
+  }
+  if (resolution.kind === "bin") {
+    command = resolution.bin;
+    for (const [key, value] of Object.entries(resolution.env)) {
+      env[key] = value;
+    }
+  } else {
+    try {
+      command = resolveAgyCommand(process.env);
+    } catch (error) {
+      failSession(session, error instanceof Error ? error.message : String(error));
+      return;
+    }
+  }
   for (const [key, value] of Object.entries(args.envVars ?? {})) {
     env[key] = value;
   }
@@ -1841,7 +1941,7 @@ function startChild(args: StartChildArgs): void {
     delete env.GOOGLE_GEMINI_BASE_URL;
   }
   log(
-    `spawn gen ${generation} conv ${args.conversationId ?? "fresh"} account ${session.accountLabel ?? "none"} env ${"GEMINI_API_KEY" in overlay ? "relay" : session.accountLabel !== null ? "pool" : "direct"} HOME ${env.HOME ?? "<unset>"} proxy ${"HTTPS_PROXY" in overlay ? "yes" : "no"}: ${command} ${spawnArgs.map((a) => JSON.stringify(a)).join(" ")} (cwd ${session.cwd})`,
+    `spawn gen ${generation} conv ${args.conversationId ?? "fresh"} account ${session.accountLabel ?? "none"} env ${"GEMINI_API_KEY" in overlay ? "relay" : session.accountLabel !== null ? "pool" : "direct"}${resolution.kind === "bin" ? ` install=${resolution.name}` : ""} HOME ${env.HOME ?? "<unset>"} proxy ${"HTTPS_PROXY" in overlay ? "yes" : "no"}: ${command} ${spawnArgs.map((a) => JSON.stringify(a)).join(" ")} (cwd ${session.cwd})`,
   );
   const child = spawn(command, spawnArgs, {
     cwd: session.cwd,
@@ -2955,15 +3055,42 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
     // The catalog is account-independent enough; whichever home the pool or
     // the relay offers first reads it, so a pooled host lists what its own
     // accounts can actually serve.
+    let bin = resolveAgyCommand(process.env);
     if (cliproxyRelayDataDir !== null && accountsEnabled(process.env)) {
       const ledger = loadLedger(cliproxyRelayDataDir);
-      const account = pickAccount(ledger, listAccounts(cliproxyRelayDataDir));
+      const account = pickAccount(
+        ledger,
+        listAccounts(cliproxyRelayDataDir),
+        null,
+        {
+          locallyAvailable: (label) => locallyAvailable(ledger, label),
+        },
+      );
       if (account !== null) {
         env.HOME = account.home;
         if (account.proxy !== null) {
           env.HTTPS_PROXY = account.proxy;
           env.https_proxy = account.proxy;
         }
+        // §6 п.10: the probe runs the picked account's install binary.
+        const resolution = resolveInstall(
+          cliproxyRelayDataDir,
+          ledger.accounts[account.label]?.install,
+        );
+        if (resolution.kind === "bin") {
+          for (const [key, value] of Object.entries(resolution.env)) {
+            env[key] = value;
+          }
+          bin = resolution.bin;
+        }
+      }
+    } else if (cliproxyRelayDataDir !== null) {
+      const resolution = resolveInstall(cliproxyRelayDataDir, undefined);
+      if (resolution.kind === "bin") {
+        for (const [key, value] of Object.entries(resolution.env)) {
+          env[key] = value;
+        }
+        bin = resolution.bin;
       }
     }
     if (env.HOME === process.env.HOME) {
@@ -2971,7 +3098,7 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
         env[key] = value;
       }
     }
-    const child = spawn(resolveAgyCommand(process.env), ["models"], {
+    const child = spawn(bin, ["models"], {
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -3111,7 +3238,9 @@ const handlers: Record<string, RequestHandler> = {
     if (accountsEnabled(process.env) && cliproxyRelayDataDir !== null) {
       const ledger = loadLedger(cliproxyRelayDataDir);
       const accounts = listAccounts(cliproxyRelayDataDir);
-      const picked = pickAccount(ledger, accounts);
+      const picked = pickAccount(ledger, accounts, null, {
+        locallyAvailable: (label) => locallyAvailable(ledger, label),
+      });
       session.accountLabel = picked?.label ?? null;
       if (picked !== null) {
         // Reserve at pick time, not at init: N simultaneous thread/start
@@ -3709,6 +3838,9 @@ export const experimental_providerBridge = experimental_defineProviderBridge({
     log(
       `bridge started for plugin ${context.pluginId}; agy=${agy} HOME=${process.env.HOME ?? "<unset>"} PATH=${process.env.PATH ?? "<unset>"}${relayOn ? "" : "; direct mode"}`,
     );
+    // §9 п.1 (provider-agy-installs): registry registration at startup —
+    // names and binary paths; version reporting waits on §13 п.1.
+    log(registryLogLine(context.dataDir));
   },
   onClose: shutdown,
   onSigterm: shutdown,

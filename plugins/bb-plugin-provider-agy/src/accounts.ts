@@ -60,6 +60,15 @@ export interface AccountLedgerEntry {
    * Shared-owned field: lives in accounts-state.json only, ignored by overlay.
    */
   priority?: number;
+  /**
+   * Install binding (provider-agy-installs §3): the name this account's
+   * binary comes from, resolved through the instance-local
+   * agy-installs.json. Shared-owned exactly like priority — disk wins on
+   * save, absent means the registry's default install, and a value that
+   * fails the install-name pattern counts as an unknown install (the
+   * account is locally unavailable, never silently rebound to default).
+   */
+  install?: string;
 }
 
 export const DEFAULT_ACCOUNT_PRIORITY = 10;
@@ -260,6 +269,7 @@ export function loadLedger(dataDir: string): AccountsLedger {
         ...(ineligibleAtMs > 0 ? { ineligibleAtMs } : {}),
         ...(parkedReason !== undefined ? { parkedReason } : {}),
         ...(s?.priority !== undefined ? { priority: s.priority } : {}),
+        ...(s?.install !== undefined ? { install: s.install } : {}),
       });
     } else if (s !== undefined) {
       setOwn(accounts, label, s);
@@ -433,30 +443,55 @@ export function saveLedger(dataDir: string, ledger: AccountsLedger): void {
     writeJsonAtomic(overlayPath, { accounts: merged });
   }
 
+  // §3 п.1 (provider-agy-installs): labels present on disk but absent from
+  // this ledger's snapshot — an account added concurrently between
+  // loadLedger and saveLedger — ride through verbatim: a stale memory
+  // snapshot must not drop the record together with its install binding.
+  const diskOnlyLabels = Object.entries(diskSharedAccounts).filter(
+    ([label]) => !Object.hasOwn(ledger.accounts, label),
+  );
   writeJsonAtomic(sharedPath, {
-    accounts: Object.fromEntries(
-      Object.entries(ledger.accounts)
+    accounts: Object.fromEntries([
+      ...diskOnlyLabels,
+      ...Object.entries(ledger.accounts)
         .filter(([label]) => !isGhostLabel(label))
         .map(([label, entry]) => {
           const hasDisk = Object.hasOwn(diskSharedAccounts, label);
           const diskPriority = hasDisk
             ? diskSharedAccounts[label]?.priority
             : undefined;
+          const diskInstall = hasDisk
+            ? diskSharedAccounts[label]?.install
+            : undefined;
           const priority = hasDisk ? diskPriority : entry.priority;
+          const install = hasDisk ? diskInstall : entry.install;
           if (hasDisk) {
             if (diskPriority !== undefined) {
               entry.priority = diskPriority;
             } else {
               delete entry.priority;
             }
+            if (diskInstall !== undefined) {
+              entry.install = diskInstall;
+            } else {
+              delete entry.install;
+            }
           }
-          const { priority: _stalePriority, ...rest } = entry;
+          const {
+            priority: _stalePriority,
+            install: _staleInstall,
+            ...rest
+          } = entry;
           return [
             label,
-            priority !== undefined ? { ...rest, priority } : rest,
+            {
+              ...rest,
+              ...(priority !== undefined ? { priority } : {}),
+              ...(install !== undefined ? { install } : {}),
+            },
           ];
         }),
-    ),
+    ]),
   });
 }
 
@@ -581,11 +616,18 @@ export function pickAccount(
     /** Fresh per-account catalogs from loadAccountModels. */
     models?: AccountModelCatalog;
     nowMs?: number;
+    /**
+     * Local availability gate (provider-agy-installs §5 п.2): the only
+     * place the install binding matters — a label this predicate rejects
+     * never becomes a candidate, exactly like a parked account.
+     */
+    locallyAvailable?: (label: string) => boolean;
   },
 ): AccountHome | null {
   const now = options?.nowMs ?? Date.now();
   const family = options?.family ?? null;
   const models = options?.models ?? {};
+  const locallyAvailable = options?.locallyAvailable;
   const entryOf = (label: string): AccountLedgerEntry | undefined =>
     Object.hasOwn(ledger.accounts, label) ? ledger.accounts[label] : undefined;
   const priorityOf = (a: AccountHome): number =>
@@ -606,6 +648,7 @@ export function pickAccount(
       a.label !== excludeLabel &&
       priorityOf(a) > 0 &&
       entryOf(a.label)?.parkedReason === undefined &&
+      (locallyAvailable === undefined || locallyAvailable(a.label)) &&
       stateOf(a) !== "unsupported",
   );
   if (candidates.length === 0) {
