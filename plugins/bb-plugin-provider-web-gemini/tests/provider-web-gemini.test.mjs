@@ -3274,7 +3274,7 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
   let evalStep = 0;
   const streamedChunks = [];
   const mockPage = {
-    url: () => (evalStep >= 3 ? "https://gemini.google.com/app/6f8b32c10512f501" : "https://gemini.google.com/app"),
+    url: () => (evalStep >= 3 ? "https://gemini.google.com/app/deadbeefcafef00d" : "https://gemini.google.com/app"),
     goto: async () => {},
     waitForSelector: async () => ({ click: async () => {} }),
     waitForTimeout: async () => {},
@@ -3337,7 +3337,7 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
       "Full 11799 character completed response without early cutoff.",
       "sendPrompt must return full completed response, not truncated 42-char thinking text"
     );
-    assert.equal(res.convId, "6f8b32c10512f501", "sendPrompt must capture convId from url");
+    assert.equal(res.convId, "deadbeefcafef00d", "sendPrompt must capture convId from url");
     assert.ok(streamedChunks.length > 0, "onChunk must have received stream chunks");
     assert.equal(
       streamedChunks.join(""),
