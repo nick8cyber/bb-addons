@@ -2,8 +2,8 @@
 title: provider-agy — миграция на ACP-транспорт
 status: draft
 owner: coordinator
-date: 2026-11-16
-revision: 9 (§12.3(c) — same-uid EPERM/EACCES разрешается по session: чужая сессия пропускается, наша — блокирует; «мёртв» только ENOENT/ESRCH в любой ветке чтения; аудит #121: номер поля session; аудит #125: readlink fd — только ENOENT/ESRCH не-ссылка)
+date: 2026-11-18
+revision: 10 (§12.5 — рантайм шима в настольном bb: ELECTRON_RUN_AS_NODE; ранее 9: §12.3(c) — same-uid EPERM/EACCES разрешается по session: чужая сессия пропускается, наша — блокирует; «мёртв» только ENOENT/ESRCH в любой ветке чтения; аудит #121: номер поля session; аудит #125: readlink fd — только ENOENT/ESRCH не-ссылка)
 tags: [bb, plugins, provider-agy, acp]
 ---
 
@@ -181,5 +181,12 @@ Shim входит в orderly shutdown при любом из:
 - `fake-agy-*.mjs`: teardown нет — детей и tmp-корней не держат; выход по EOF stdin, по `SIGINT`/`SIGTERM`/`SIGHUP` и по ppid-сторожу (~1.5 с): репарент на init/systemd → `process.exit(0)`.
 - `/tmp/plug117_*` фикстуры `bb-plugin-live-call` (`server|fixture|unruly.mjs`): `plugins/bb-plugin-live-call/tests/plug-117-*.test.ts` (`makeTmpDir("plug117_…")`) и `research/fixtures/test-connector.mjs` — процессы фикстур умирают с родителем: ppid-сторож, обработка сигналов и stdin EOF — тот же kill-контракт.
 - `bb-plugin-provider-argon` — `tests/provider-argon.test.mjs` спавнит `acp-server.mjs` с `detached: true` (своя process-группа); teardown на выходе убивает группу (`process.kill(-pid, "SIGKILL")`, fallback на прямой `proc.kill`) и удаляет каталоги `argon-test-state-*`.
+
+### 12.5 Рантайм шима (настольный bb, 18.11.2026)
+Шим — JS-файл, его запускает рантайм самого хоста: `process.execPath` в `buildLaunch()` (`launchSpec.command`) и в `queryAcpSessionModels()`. В серверном bb это `node`. В настольном bb (Electron, macOS/Linux/Windows) хост плагина — исполняемый файл `bb.app`, работающий как Node только при `ELECTRON_RUN_AS_NODE=1`; мост SDK вырезает эту переменную из окружения ребёнка (`withoutBridgeRuntimeEnv`), поэтому без неё бинарь bb стартует как приложение и сразу выходит (`exited (code 0)` до `initialize`).
+
+- **Обёртка.** Если хост — Electron (`process.versions.electron` задан), в env шима в обоих местах запуска добавляется `ELECTRON_RUN_AS_NODE=1` (тот же приём, что у SDK для своего MCP-процесса). Отдельный Node на машине не нужен. В серверном bb env не меняется.
+- **Шим.** Перед запуском настоящего `agy` удаляет `ELECTRON_RUN_AS_NODE` из env ребёнка — `agy` и его дочерние процессы не должны унаследовать режим.
+- **Реапер §12.3.** Кандидат — `argv[0]` node-подобный **или** равен `process.execPath` хоста; остальные условия без изменений.
 
 Не в scope: generic-мост bb (чужой код), stream-json мост (legacy за флагом), сторонний `google-antigravity-acp` (свой репозиторий rawizhere — та же болезнь, чинится отдельно).
