@@ -14,7 +14,7 @@ date: 2026-11-18
 
 ## Решения (ревизия 34, спека §27–§32)
 
-1. **Узел задачи — запись в базе, а не текст хендоффа.** Таблица `task_queue` (очередь: `task_key`, `project_id`, `coordinator_thread_id`, `route`, `level`, `node`, `status`, `priority`, `depends_on`, `confirmation_mode`, `interaction_id`, `spec_sha`, `acceptance_sha`, `release_note`, `spec_review_rounds`, `check_attempts`, `code_review_rounds`, `design_check_rounds`, `entered_at`, `deadline_at`, `node_alarm_at`, `deferred_by`, `deferred_reason`) и неизменяемый журнал `task_transitions` (`task_key`, `from_node`, `to_node`, `from_status`, `to_status`, `actor`, `reason`, `payload`, `created_at`). Единая модель: узел — рабочий этап (`node`), операционное состояние — статус (`status`). Отложить пункт очереди можно только явным решением владельца.
+1. **Узел задачи — запись в базе, а не текст хендоффа.** Таблица `task_queue` (очередь: `task_key`, `project_id`, `coordinator_thread_id`, `route`, `level`, `node`, `status`, `priority`, `depends_on`, `confirmation_mode`, `interaction_id`, `spec_sha`, `acceptance_sha`, `result_sha`, `release_note`, `spec_review_rounds`, `check_attempts`, `code_review_rounds`, `design_check_rounds`, `entered_at`, `deadline_at`, `node_alarm_at`, `deferred_by`, `deferred_reason`) и неизменяемый журнал `task_transitions` (`task_key`, `from_node`, `to_node`, `from_status`, `to_status`, `actor`, `reason`, `payload`, `created_at`). Единая модель: узел — рабочий этап (`node`), операционное состояние — статус (`status`). Отложить пункт очереди можно только явным решением владельца.
 2. **Детерминированный граф задачи:**
    `start → design → spec → spec_review → [owner_gate] → code → checks → review → design_check → release → done`.
    Переход делает только код и только по доказательству: коммит, вердикт ревью, машинные тесты, решение владельца, итог выкладки, таймаут будильника. Маршруты:
@@ -26,12 +26,12 @@ date: 2026-11-18
 3. **Конвейер `run-queue` (фоновая служба плагина и CLI `bb orchestrator run-queue`):**
    - Фоновый процесс плагина, действующий от лица координатора задачи (`coordinator_thread_id`, роль `orchestrator`). CLI выполняет один такт (`--once`).
    - Автопереходы по событиям: сдача `design` → коммит договора плагином (`acceptance_sha`) → раздача `spec` с `--from <acceptance_sha>` → сдача `spec` (`spec_sha`) → автозапуск `spec_review` (по `reviewByLevel["spec"]`) → при OK в `auto` сразу раздача `code` с `--from <spec_sha>` (спека не теряется!), в `manual` — переход в `owner_gate` → сдача кода → машинный узел `checks` (запуск безопасных тестов и проверок договора из `acceptance_sha`) → при успехе автозапуск ревью по `reviewByLevel` → при `{"verdict":"OK","blockers":0}` → автозапуск `design_check` (для `feature`) → при OK → автозапуск `release` → `published` → автоочистка копий `taskCleanup` → взятие следующей задачи из `task_queue`. Для PR-режима: статус `pr_open` до события слияния `on: merged`.
-   - Замечания ревью — возврат на доработку новым заходом; потолок — **3 круга**, дальше статус `blocked` и эскалация к архитектору или владельцу.
-4. **Будильник на каждом рабочем узле, включая координатора.** У каждого активного рабочего узла (`design`, `spec`, `spec_review`, `code`, `checks`, `review`, `design_check`, `release`, `research`) — детерминированный срок (`node_policy`). Пассивные состояния ожидания (`owner_gate`, `waiting_release_note`, `pr_open`, `deferred`, `blocked`, `stalled`, `done`) будильник не взводят. Сброс будильника происходит **строго по доказательствам текущего узла этой задачи** (коммит, вердикт, переход); такты `run-queue` и чужие задачи будильник не сбрасывают. Координатор спит, пока задачи идут штатно, и просыпается только по блокировкам (`blocked`, `stalled`, `waiting_release_note`). В §5.6 задачи из `task_queue` при `workGraph ≠ "off"` исключены из автонапоминаний простоя.
+   - Замечания ревью — возврат на доработку новым заходом; потолок — **3 круга**, дальше статус `blocked` и эскалация владельцу.
+4. **Будильник на каждом рабочем узле, включая координатора.** У каждого активного рабочего узла (`design`, `spec`, `spec_review`, `code`, `checks`, `review`, `design_check`, `release`, `research`) — детерминированный срок (`node_policy`). Пассивные состояния ожидания (`owner_gate`, `waiting_release_note`, `pr_open`, `deferred`, `blocked`, `stalled`, `done`) будильник не взводят. При живом исполнителе в ходе будильник задачу не останавливает. Сброс будильника происходит **строго по доказательствам текущего узла этой задачи** (коммит, вердикт, переход); такты `run-queue` и чужие задачи будильник не сбрасывают. Координатор спит, пока задачи идут штатно, и просыпается только по блокировкам (`blocked`, `stalled`, `waiting_release_note`). В §5.6 задачи из `task_queue` при `workGraph ≠ "off"` исключены из автонапоминаний простоя.
 5. **Режимы одобрения (`approvalMode`):**
    - `auto`: полная автономность по цепочке;
    - `manual` (режим «сам»): обязательный шлюз владельца (`owner_gate`) после `spec_review` перед переходом к `code`. Владелец подтверждает коммит спеки и договора приёмки карточкой в интерфейсе (`PluginInteractionRequest`) либо через CLI владельца.
-   - Защита от обхода: инструменты одобрения исключены из агентских схем (`tools: []`). В CLI проверка контекста отвергает вызовы с агентским `BB_THREAD_ID`. Защита от необоснованного занижения маршрута: отклоняется `route-downgrade-refused` и требует подтверждения владельца через UI.
+   - Защита от обхода: инструменты одобрения исключены из агентских схем (`tools: []`). В CLI проверка контекста отвергает вызовы с агентским `BB_THREAD_ID`. Флаг `--mode auto` и облегчённые маршруты для сложных задач разрешены только владельцу.
 6. **Роль и уровень `architect` (§30):**
    - Роль `architect` (Opus 5.5 / Gemini 3.8 Pro): сильная модель проектирует на старте (узел `design`) и валидирует в конце (узел `design_check`).
    - Архитектор код не пишет и не коммитит (`tools: []`), сдаёт результаты текстом — исключён риск «второго координатора».
@@ -40,16 +40,16 @@ date: 2026-11-18
    - `research` — исследования (Gemini 3.8 / web-gemini).
    - При `workGraph: "off"` отсутствие уровней даёт предупреждение, не ломая действующую политику r33; при `workGraph ≠ "off"` — валидируется тестом связи (§27.3).
 8. **Договор приёмки до кода (узел `design`) и машинные проверки (`checks`):**
-   - Архитектор формирует проверяемые критерии с командами верификации в отчёте; процесс плагина коммитит их в `docs/specs/acceptance/<KEY>.md` в функциональной ветке задачи под автором из git-конфига репозитория (`acceptance_sha`).
-   - `spec` раздаётся с `--from <acceptance_sha>`, `code` раздаётся с `--from <spec_sha>`. Изменение договора исполнителем кода строго запрещено и отклоняется проверкой diff.
+   - Архитектор формирует проверяемые критерии с командами верификации в отчёте; процесс плагина коммитит их через git plumbing в `docs/specs/acceptance/<KEY>.md` в функциональной ветке задачи под автором из git-конфига репозитория (`acceptance_sha`).
+   - `spec` раздаётся с `--from <acceptance_sha>`, `code` раздаётся с `--from <spec_sha>`. Изменение договора писателем спеки или исполнителем кода строго запрещено и блокируется проверкой diff.
    - Машинный узел `checks` перед ревью: считывает договор строго из блоба `acceptance_sha` и запускает команды из белого списка проекта (`checks.allowedRunners`) и одобренные владельцем команды договора, возвращая ошибки исполнителю без траты токенов аудитора. Произвольные unapproved команды отклоняются.
    - Закон трёх исходов: прошло, упало, не запускалось; «не запускалось» не считается проходом.
 9. **Команды управления очередью (§6):**
-   - `bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research|architect] [--acceptance <файл|текст>] [--release-note "<текст>"]`
+   - `bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research|architect] [--acceptance <файл|текст>] [--release-note "<текст>"] [--depends-on "<k1,k2>"]`
    - `bb orchestrator release-note <KEY> "<заметка>"` (передача заметки для waiting_release_note)
    - `bb orchestrator defer <KEY> --reason "<причина>"` (только владелец)
-   - `bb orchestrator reject <KEY> --reason "<причина>"` (возврат текущего узла на доработку)
-   - `bb orchestrator resume <KEY>` (возобновление задачи из deferred/blocked/stalled)
+   - `bb orchestrator reject <KEY> [--target spec|design|code] --reason "<причина>"` (возврат текущего узла на доработку)
+   - `bb orchestrator resume <KEY>` (возобновление задачи из deferred/blocked/stalled; blocked/deferred — только владелец)
    - `bb orchestrator approve <KEY>` (одобрение перехода owner_gate владельцем)
    - `bb orchestrator run-queue [--once] [--json]`
 10. **Порядок реализации срезами (за флагом `workGraph`):**
