@@ -39,6 +39,7 @@ import {
   readFileSync,
   readlinkSync,
   readSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -183,11 +184,35 @@ function writeOutbound(message: Record<string, unknown>): void {
   rawWrite(`${JSON.stringify(message)}\n`);
 }
 
+/**
+ * Daemon-visible terminal answers captured for wrapper-driven requests: an
+ * internal id registered here still runs the WHOLE normal handler (pool
+ * picks, retries, sibling transforms — only the final response is diverted
+ * to the waiter instead of the wire). The unknown-session restore
+ * (PLUG-310) re-drives the daemon's own thread/resume end-to-end this way.
+ */
+const internalAnswers = new Map<
+  JsonRpcId,
+  (ok: boolean, result: unknown, error: unknown) => void
+>();
+
 function sendResult(id: JsonRpcId, result: unknown): void {
+  const sink = internalAnswers.get(id);
+  if (sink !== undefined) {
+    internalAnswers.delete(id);
+    sink(true, result, undefined);
+    return;
+  }
   writeOutbound({ jsonrpc: "2.0", id, result });
 }
 
 function sendError(id: JsonRpcId, code: number, message: string): void {
+  const sink = internalAnswers.get(id);
+  if (sink !== undefined) {
+    internalAnswers.delete(id);
+    sink(false, undefined, { code, message });
+    return;
+  }
   writeOutbound({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
@@ -203,7 +228,96 @@ function emitDeltas(threadId: string, ...deltas: Record<string, unknown>[]): voi
   sendNotification("thread/delta", { threadId, deltas });
 }
 
+/**
+ * The env keys acp-shim.mjs reads at startup (it exits 2 when REAL_BIN is
+ * absent). Kept in sync with src/acp-shim.mjs's prologue.
+ */
+const REQUIRED_SHIM_ENV = [
+  "AGY_SHIM_REAL_BIN",
+  "AGY_SHIM_EVENTS",
+  "AGY_SHIM_CONTROL",
+  "AGY_SHIM_THREAD_ID",
+  "AGY_SHIM_NONCE",
+  "AGY_SHIM_SET_MODE",
+] as const;
+
+/**
+ * PLUG-310 belt: a request must NEVER carry our shim spec without its
+ * AGY_SHIM_* env — the bridge merges launchSpec.env into the child env at
+ * spawn AND at every reconcile-driven rebuild, so an env-less spec makes
+ * the shim exit 2 ("AGY_SHIM_REAL_BIN is not set"). A spec on a known
+ * session is topped up from session.launchEnv; an env-less spec on an
+ * unknown thread gets a minimal synthesized set so the shim at least runs
+ * (its events are ignored — the nonce is not ours).
+ */
+function completeShimLaunchEnv(message: Record<string, unknown>): void {
+  const params = optionsRecord(message.params);
+  const options = optionsRecord(params.options);
+  const providerOptions = optionsRecord(options.providerOptions);
+  const spec = providerOptions.acpLaunchSpec;
+  if (typeof spec !== "object" || spec === null || Array.isArray(spec)) {
+    return;
+  }
+  const rec = spec as Record<string, unknown>;
+  // Only OUR shim spec — a static/foreign spec (command "agy" from the
+  // server's bridgeOptions) stays untouched.
+  if (rec.command !== process.execPath) {
+    return;
+  }
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(optionsRecord(rec.env))) {
+    if (typeof v === "string") {
+      env[k] = v;
+    }
+  }
+  if (
+    REQUIRED_SHIM_ENV.every((k) => typeof env[k] === "string") &&
+    env.AGY_SHIM_REAL_BIN !== "" &&
+    env.AGY_SHIM_THREAD_ID !== ""
+  ) {
+    return;
+  }
+  const session =
+    typeof params.threadId === "string"
+      ? sessions.get(params.threadId)
+      : undefined;
+  if (session !== undefined && Object.keys(session.launchEnv).length > 0) {
+    rec.env = { ...env, ...session.launchEnv };
+  } else {
+    const fill: Record<string, string> = {
+      AGY_SHIM_REAL_BIN: resolveAgyCommand(process.env),
+      AGY_SHIM_EVENTS: dataDir !== "" ? eventsFilePath() : "",
+      AGY_SHIM_CONTROL: "",
+      AGY_SHIM_THREAD_ID:
+        typeof params.threadId === "string" ? params.threadId : "",
+      AGY_SHIM_NONCE: "",
+      AGY_SHIM_SET_MODE: "",
+    };
+    const merged: Record<string, string> = {
+      ...shimRuntimeEnv(),
+      ...fill,
+      ...env,
+    };
+    for (const k of REQUIRED_SHIM_ENV) {
+      if (typeof merged[k] !== "string") {
+        merged[k] = fill[k];
+      }
+    }
+    if (merged.AGY_SHIM_REAL_BIN === "") {
+      merged.AGY_SHIM_REAL_BIN = fill.AGY_SHIM_REAL_BIN;
+    }
+    if (merged.AGY_SHIM_THREAD_ID === "") {
+      merged.AGY_SHIM_THREAD_ID = fill.AGY_SHIM_THREAD_ID;
+    }
+    rec.env = merged;
+  }
+  log(
+    `thread ${String(params.threadId ?? "?")}: ${String(message.method)} carried a shim launch spec without AGY_SHIM_* — completed defensively`,
+  );
+}
+
 function feedLine(message: Record<string, unknown>): void {
+  completeShimLaunchEnv(message);
   acpBridge.handleLine(JSON.stringify(message));
 }
 
@@ -481,6 +595,9 @@ interface WSession {
   model: string | undefined;
   reasoningLevel: string | undefined;
   rotating: boolean;
+  /** Session is being rebuilt from a thread record (unknown-session
+   * restore): every queued turn waits until the resume resolves. */
+  restoring: boolean;
   rotationCause: RotationCause | null;
   armedError: ArmedError | null;
   waitTimer: NodeJS.Timeout | null;
@@ -541,6 +658,7 @@ function newSession(threadId: string, cwd: string): WSession {
     model: undefined,
     reasoningLevel: undefined,
     rotating: false,
+    restoring: false,
     rotationCause: null,
     armedError: null,
     waitTimer: null,
@@ -568,6 +686,96 @@ function newSession(threadId: string, cwd: string): WSession {
     agentMessageText: "",
     modelRefusalMoved: new Set<string>(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Thread records (dataDir/threads-state.json): bbThreadId -> {cwd,
+// providerThreadId}. Outlives a wrapper restart — the unknown-session
+// restore (PLUG-310) rebuilds a session from this when a turn arrives for a
+// thread the wrapper no longer has in memory.
+// ---------------------------------------------------------------------------
+
+const THREADS_STATE_FILE = "threads-state.json";
+
+interface ThreadRecord {
+  cwd: string;
+  providerThreadId: string | null;
+}
+
+function loadThreadRecords(): Record<string, ThreadRecord> {
+  if (dataDir === "") {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(
+      readFileSync(join(dataDir, THREADS_STATE_FILE), "utf8"),
+    ) as {
+      threads?: Record<
+        string,
+        { cwd?: unknown; providerThreadId?: unknown }
+      >;
+    };
+    const out: Record<string, ThreadRecord> = {};
+    for (const [tid, rec] of Object.entries(parsed.threads ?? {})) {
+      if (typeof rec?.cwd === "string" && rec.cwd.length > 0) {
+        out[tid] = {
+          cwd: rec.cwd,
+          providerThreadId:
+            typeof rec.providerThreadId === "string"
+              ? rec.providerThreadId
+              : null,
+        };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeThreadRecords(records: Record<string, ThreadRecord>): void {
+  if (dataDir === "") {
+    return;
+  }
+  const target = join(dataDir, THREADS_STATE_FILE);
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    writeFileSync(
+      tmp,
+      `${JSON.stringify({ threads: records }, null, 1)}\n`,
+      "utf8",
+    );
+    renameSync(tmp, target);
+  } catch {
+    // Best-effort bookkeeping: a lost record only means a later restore
+    // cannot happen — never a wrong session.
+  }
+}
+
+function rememberThreadRecord(
+  threadId: string,
+  cwd: string,
+  providerThreadId: string | null,
+): void {
+  const records = loadThreadRecords();
+  records[threadId] = {
+    cwd,
+    providerThreadId:
+      providerThreadId ?? records[threadId]?.providerThreadId ?? null,
+  };
+  writeThreadRecords(records);
+}
+
+function threadRecord(threadId: string): ThreadRecord | null {
+  return loadThreadRecords()[threadId] ?? null;
+}
+
+function forgetThreadRecord(threadId: string): void {
+  const records = loadThreadRecords();
+  if (Object.hasOwn(records, threadId)) {
+    delete records[threadId];
+    writeThreadRecords(records);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2245,7 +2453,12 @@ function enqueueDaemonTurn(
 
 function drainQueue(session: WSession): void {
   for (;;) {
-    if (session.stopped || session.bridgeTurnBusy || session.queue.length === 0) {
+    if (
+      session.stopped ||
+      session.bridgeTurnBusy ||
+      session.restoring ||
+      session.queue.length === 0
+    ) {
       return;
     }
     const head = session.queue[0];
@@ -3057,6 +3270,7 @@ function onThreadIdentity(params: Record<string, unknown>): void {
   }
   session.providerThreadId =
     typeof providerThreadId === "string" ? providerThreadId : null;
+  rememberThreadRecord(threadId, session.cwd, session.providerThreadId);
   if (
     session.providerThreadId !== null &&
     session.accountLabel !== null &&
@@ -3397,8 +3611,14 @@ function interceptOutbound(line: string): void {
         return;
       }
     }
+    const sink = internalAnswers.get(msg.id as JsonRpcId);
     const pending = pendingDaemonSessions.get(msg.id as JsonRpcId);
     if (pending === undefined) {
+      if (sink !== undefined) {
+        internalAnswers.delete(msg.id as JsonRpcId);
+        sink(!("error" in msg), msg.result, msg.error);
+        return;
+      }
       rawWrite(`${line}\n`);
       return;
     }
@@ -3428,6 +3648,11 @@ function interceptOutbound(line: string): void {
       // build parks the account — the thread moves to a sibling or fails
       // honestly.
       retryDaemonSessionParked(msg.id as JsonRpcId, pending, parkedCause);
+      return;
+    }
+    if (sink !== undefined) {
+      internalAnswers.delete(msg.id as JsonRpcId);
+      sink(errorText === null, msg.result, msg.error);
       return;
     }
     rawWrite(`${line}\n`);
@@ -3876,6 +4101,9 @@ function discardSession(session: WSession): void {
   }
   resolveInteractions(session.threadId);
   sessions.delete(session.threadId);
+  // The thread record survives discard: it is the rebuild source for
+  // unknown-session turns after a wrapper restart or a transient resume
+  // failure. Only an explicit thread/discard forgets it.
 }
 
 function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void {
@@ -3891,6 +4119,7 @@ function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void
   }
   const session = newSession(threadId, cwd);
   sessions.set(threadId, session);
+  rememberThreadRecord(threadId, cwd, null);
   session.baseParams = { ...params };
   delete session.baseParams.options;
   session.baseOptions = optionsRecord(params.options);
@@ -3972,6 +4201,7 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
   }
   const session = newSession(threadId, cwd);
   sessions.set(threadId, session);
+  rememberThreadRecord(threadId, cwd, providerThreadId);
   session.baseParams = { ...params };
   delete session.baseParams.options;
   session.baseOptions = optionsRecord(params.options);
@@ -4090,6 +4320,104 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
   );
 }
 
+/**
+ * A turn arrived for a thread the wrapper does not know (typically a
+ * wrapper restart: the daemon still owns the thread). Rebuild the session
+ * through the NORMAL resume path — pool pin lookup, cooling checks,
+ * buildLaunch, rewriteOptions, sibling transforms — by re-driving the
+ * daemon's own thread/resume on an internal id whose terminal answer is
+ * captured instead of reaching the wire. The original request waits in the
+ * session queue and drains once the session is live; on failure the daemon
+ * gets the resume's real error. Forwarding raw was the PLUG-310 bug: the
+ * bridge either answered "No active ACP session" or launched the shim
+ * without AGY_SHIM_* env.
+ */
+function restoreUnknownSession(
+  id: JsonRpcId,
+  method: "turn/start" | "turn/steer",
+  params: Record<string, unknown>,
+): void {
+  const threadId = params.threadId as string;
+  const record = threadRecord(threadId);
+  const providerThreadId =
+    typeof params.providerThreadId === "string" &&
+    params.providerThreadId.length > 0
+      ? params.providerThreadId
+      : (record?.providerThreadId ?? null);
+  const cwd =
+    typeof params.cwd === "string" && params.cwd.length > 0
+      ? params.cwd
+      : (record?.cwd ?? null);
+  if (cwd === null || providerThreadId === null) {
+    sendError(
+      id,
+      -32000,
+      `agy: no live session for thread ${threadId} and no recorded conversation to rebuild it from`,
+    );
+    return;
+  }
+  log(
+    `thread ${threadId}: ${method} for an unknown session — rebuilding via thread/resume first`,
+  );
+  internalIdCounter -= 1;
+  const rid = internalIdCounter;
+  const done = new Promise<{ ok: boolean; error: unknown }>((resolve) => {
+    internalAnswers.set(rid, (ok, _result, error) => {
+      resolve({ ok, error });
+    });
+    handleThreadResume(rid, {
+      threadId,
+      cwd,
+      providerThreadId,
+      options: optionsRecord(params.options),
+      instructionMode: params.instructionMode ?? "append",
+    });
+  });
+  const session = sessions.get(threadId);
+  let queuedTurn: QueuedDaemonTurn | null = null;
+  if (session !== undefined) {
+    session.restoring = true;
+    // A steered input becomes a fresh turn on the rebuilt session — the
+    // daemon's request is answered when the bridge accepts it (or never
+    // runs and answers with the resume error).
+    queuedTurn = { kind: "daemon", requestId: id, params };
+    session.queue.push(queuedTurn);
+  }
+  void done.then(({ ok, error }) => {
+    // A racing restore or an explicit discard may have replaced our
+    // session: touching the new one's restoring flag or queue would
+    // corrupt its own rebuild, and our queued turn was already answered
+    // with "thread stopped" when the old session went away.
+    const s = sessions.get(threadId);
+    if (s !== undefined && s !== session) {
+      return;
+    }
+    if (ok && s !== undefined && !s.stopped) {
+      s.restoring = false;
+      drainQueue(s);
+      return;
+    }
+    const errorText = ok
+      ? `agy: rebuild for thread ${threadId} ended without a session`
+      : errorMessageOf(error).slice(0, 300);
+    if (s !== undefined) {
+      // The real resume error beats discardSession's generic
+      // "thread stopped" for the request that caused the rebuild.
+      if (queuedTurn !== null && s.queue.includes(queuedTurn)) {
+        s.queue.splice(s.queue.indexOf(queuedTurn), 1);
+        sendError(id, -32000, errorText);
+      }
+      discardSession(s);
+      return;
+    }
+    if (queuedTurn === null) {
+      // The resume never produced a session — the request was never
+      // queued anywhere, so answer it directly.
+      sendError(id, -32000, errorText);
+    }
+  });
+}
+
 function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
   const threadId = params.threadId;
   if (typeof threadId !== "string") {
@@ -4098,14 +4426,15 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
   }
   const session = sessions.get(threadId);
   if (session === undefined) {
-    feedLine({ jsonrpc: "2.0", id, method: "turn/start", params });
+    restoreUnknownSession(id, "turn/start", params);
     return;
   }
   drainShimEvents();
   // §7: a turn on a cooled account rotates first, then replays as handoff;
   // §2.3: a turn whose options name a model the session's account does not
-  // offer rotates the same way, with the "model" cause.
-  if (!session.rotating && !session.stopped) {
+  // offer rotates the same way, with the "model" cause. A restoring session
+  // already ran those checks inside its rebuild — turns just queue on it.
+  if (!session.rotating && !session.stopped && !session.restoring) {
     const turnOptions = optionsRecord(params.options);
     const incoming = resolveModelSelection(
       typeof turnOptions.model === "string" ? turnOptions.model : undefined,
@@ -4204,7 +4533,17 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
   const session =
     typeof threadId === "string" ? sessions.get(threadId) : undefined;
   if (session === undefined) {
+    if (typeof threadId === "string") {
+      restoreUnknownSession(id, "turn/steer", params);
+      return;
+    }
     feedLine({ jsonrpc: "2.0", id, method: "turn/steer", params });
+    return;
+  }
+  if (session.restoring) {
+    // The rebuild lands the steered input as a fresh turn afterwards.
+    enqueueDaemonTurn(session, id, params);
+    drainQueue(session);
     return;
   }
   if (session.rotating && !session.bridgeTurnBusy) {
@@ -4227,6 +4566,10 @@ function handleTurnSteer(id: JsonRpcId, params: Record<string, unknown>): void {
     });
     return;
   }
+  // PLUG-310: a raw steer rides queuedInputs into the bridge's reconcile
+  // carrying the daemon's static launch spec (env:{}) — the rebuilt session
+  // then spawns the shim WITHOUT AGY_SHIM_* and it exits 2.
+  params.options = rewriteOptions(session, optionsRecord(params.options));
   feedLine({ jsonrpc: "2.0", id, method: "turn/steer", params });
 }
 
@@ -4295,6 +4638,9 @@ function handleLine(line: string): void {
           : undefined;
       if (session !== undefined) {
         discardSession(session);
+      }
+      if (typeof params.threadId === "string") {
+        forgetThreadRecord(params.threadId);
       }
       acpBridge.handleLine(line);
       return;
