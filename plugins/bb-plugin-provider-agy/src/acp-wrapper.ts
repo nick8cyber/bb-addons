@@ -60,6 +60,7 @@ import {
   isAuthDead,
   isModelRefusal,
   isTosDisabled,
+  isValidationRequired,
   listAccounts,
   loadAccountModels,
   loadLedger,
@@ -422,7 +423,13 @@ interface ArmedError {
  * the family is marked unsupported for the account instead. "tos-disabled"
  * is permanent parking until a manual unpark.
  */
-type RotationCause = "quota" | "ineligible" | "auth-dead" | "tos-disabled" | "model";
+type RotationCause =
+  | "quota"
+  | "ineligible"
+  | "auth-dead"
+  | "tos-disabled"
+  | "validation-required"
+  | "model";
 
 interface QueuedDaemonTurn {
   kind: "daemon";
@@ -501,6 +508,12 @@ interface WSession {
   needsHandoff: boolean;
   autoRetryCount: number;
   stopped: boolean;
+  /** §2.3 п.11: a VALIDATION_REQUIRED answer surfaced as agent text — the
+   * turn must not deliver it, its boundary becomes a parking+rotation. */
+  validationRefusal: boolean;
+  /** §2.3 п.10: families this session already moved once for — a second
+   * refusal for the same family fails honestly instead of chaining. */
+  modelRefusalMoved: Set<string>;
 }
 
 const sessions = new Map<string, WSession>();
@@ -546,6 +559,8 @@ function newSession(threadId: string, cwd: string): WSession {
     needsHandoff: false,
     autoRetryCount: 0,
     stopped: false,
+    validationRefusal: false,
+    modelRefusalMoved: new Set<string>(),
   };
 }
 
@@ -1906,6 +1921,89 @@ function waitModelProbes(): Promise<void> {
   });
 }
 
+/** §2.3 п.9: a cold-start pick waits on catalog probes at most this long. */
+const MODEL_PICK_PROBE_WAIT_MS = 30_000;
+
+/** waitModelProbes with the §2.3 п.9 overall cap. */
+function waitModelProbesBounded(): Promise<void> {
+  return Promise.race([
+    waitModelProbes(),
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, MODEL_PICK_PROBE_WAIT_MS);
+      timer.unref?.();
+    }),
+  ]).then(() => undefined);
+}
+
+/**
+ * §2.3 пп. 9–10: queue an `agy models` probe for one account when the
+ * per-label throttle allows — used for accounts a refusal just disproved
+ * and for cold-start picks over record-less/empty catalogs. The §2.3 п.1
+ * exclusions apply: never a parked account.
+ */
+function maybeProbeCatalog(label: string): void {
+  if (dataDir === "" || !accountsEnabled(process.env)) {
+    return;
+  }
+  const now = Date.now();
+  if (now - (modelProbeLastAtMs.get(label) ?? 0) < MODEL_PROBE_MIN_INTERVAL_MS) {
+    return;
+  }
+  const ledger = loadLedger(dataDir);
+  if (ledger.accounts[label]?.parkedReason !== undefined) {
+    return;
+  }
+  const account = accountByLabel(listAccounts(dataDir), label);
+  if (account !== null) {
+    queueModelProbe(account);
+  }
+}
+
+/**
+ * §2.3 п.9 cold start: no probe-eligible account's record names the family
+ * while at least one has no usable record (absent or families: []) — the
+ * pick must wait for `agy models` answers instead of guessing. Returns
+ * true when probes worth waiting on were queued.
+ */
+function coldStartNeedsProbes(family: string): boolean {
+  if (dataDir === "" || !accountsEnabled(process.env)) {
+    return false;
+  }
+  const ledger = loadLedger(dataDir);
+  const catalog = accountModelCatalog();
+  const now = Date.now();
+  let supporter = false;
+  let waitWorthy = false;
+  for (const account of listAccounts(dataDir)) {
+    const entry = ledger.accounts[account.label];
+    if (accountPriority(entry) <= 0) {
+      continue;
+    }
+    if (entry?.parkedReason !== undefined) {
+      continue;
+    }
+    if ((entry?.cooldownUntilMs ?? 0) - now > ACCOUNT_MODELS_TTL_MS) {
+      continue;
+    }
+    const record = Object.hasOwn(catalog, account.label)
+      ? catalog[account.label]
+      : undefined;
+    if (record !== undefined && record.families.includes(family)) {
+      supporter = true;
+      continue;
+    }
+    // A record with no families is "unknown" (e.g. refusal marks on a
+    // virgin account): it must be probed like a missing one.
+    if (record === undefined || record.families.length === 0) {
+      if (now - (modelProbeLastAtMs.get(account.label) ?? 0) >= MODEL_PROBE_MIN_INTERVAL_MS) {
+        queueModelProbe(account);
+        waitWorthy = true;
+      }
+    }
+  }
+  return !supporter && waitWorthy;
+}
+
 /**
  * The union of every eligible account's `raw` catalog — deduped by id,
  * first displayName wins (§2.3) — or null while no account catalog record
@@ -2178,12 +2276,30 @@ function sessionAccountCooled(
 function freeSibling(
   session: WSession,
   exclude: string | null,
+  options: { freshModelOnly?: boolean } = {},
 ): { account: { label: string; home: string; proxy: string | null } | null } {
   if (dataDir === "" || !accountsEnabled(process.env)) {
     return { account: null };
   }
   const ledger = loadLedger(dataDir);
-  const accounts = listAccounts(dataDir);
+  let accounts = listAccounts(dataDir);
+  if (options.freshModelOnly === true && session.model !== undefined) {
+    // §2.3 п.10: a move after a model refusal may land only on an account
+    // whose FRESH catalog names the family — stale records and unpolled
+    // accounts are exactly the guesses that chained the live incident.
+    const now = Date.now();
+    const catalog = loadAccountModels(dataDir);
+    accounts = accounts.filter((a) => {
+      const record = Object.hasOwn(catalog, a.label)
+        ? catalog[a.label]
+        : undefined;
+      return (
+        record !== undefined &&
+        now - record.atMs <= ACCOUNT_MODELS_TTL_MS &&
+        accountModelState(record, session.model as string, now) === "supports"
+      );
+    });
+  }
   // §2.3: a sibling must also offer the session's model family — the
   // catalog drives the filter, an unpolled account only counts as a
   // last resort behind known supporters.
@@ -2226,9 +2342,9 @@ function coolSessionAccount(
   if (cause === "model") {
     return "none";
   }
-  if (cause === "tos-disabled") {
+  if (cause === "tos-disabled" || cause === "validation-required") {
     // Permanent parking: no retry timer, no breaker — only a manual
-    // operator unpark brings this account back (§2.3).
+    // operator unpark brings this account back (§2.3 пп. 7, 11).
     markAccountCooldown(
       ledger,
       session.accountLabel,
@@ -2236,11 +2352,13 @@ function coolSessionAccount(
       message,
     );
     markAccountIneligible(ledger, session.accountLabel, {
-      parkedReason: "tos-disabled",
+      parkedReason: cause,
     });
     saveLedger(dataDir, ledger);
     log(
-      `thread ${session.threadId}: account ${session.accountLabel} parked (tos-disabled; manual unpark required)`,
+      cause === "validation-required"
+        ? `thread ${session.threadId}: account ${session.accountLabel} parked (validation-required; manual unpark required); owner verifies the account in a browser: https://support.google.com/accounts/answer/185833`
+        : `thread ${session.threadId}: account ${session.accountLabel} parked (tos-disabled; manual unpark required)`,
     );
     return "cooled";
   }
@@ -2298,7 +2416,18 @@ function planRotation(
   if (cooled === "breaker") {
     return "fail";
   }
-  const { account } = freeSibling(session, session.accountLabel);
+  // §2.3 п.10: one move for a model refusal, and only onto a fresh-catalog
+  // supporter — the second refusal for the same family fails honestly.
+  if (
+    cause === "model" &&
+    session.model !== undefined &&
+    session.modelRefusalMoved.has(session.model)
+  ) {
+    return "fail";
+  }
+  const { account } = freeSibling(session, session.accountLabel, {
+    freshModelOnly: cause === "model",
+  });
   if (account !== null) {
     return "rotate";
   }
@@ -2462,12 +2591,18 @@ function startRotation(
   const { account } = freeSibling(
     session,
     allowSameAccount ? null : session.accountLabel,
+    { freshModelOnly: cause === "model" },
   );
   if (account === null) {
     log(
       `thread ${session.threadId}: rotation found no free sibling; failing out`,
     );
     if (cause === "model") {
+      // §2.3 п.10: nothing fresh-catalogued carries the family — probe the
+      // refuser so the next pick knows better, then fail honestly.
+      if (session.accountLabel !== null) {
+        maybeProbeCatalog(session.accountLabel);
+      }
       failOutModel(session, message);
     } else {
       failOut(session, poolExhaustedText(cause, message));
@@ -2476,6 +2611,10 @@ function startRotation(
   }
   session.rotating = true;
   session.rotationCause = cause;
+  if (cause === "model" && session.model !== undefined) {
+    session.modelRefusalMoved.add(session.model);
+  }
+  const movedFrom = session.accountLabel;
   session.accountLabel = account.label;
   if (dataDir !== "") {
     const ledger = loadLedger(dataDir);
@@ -2483,8 +2622,9 @@ function startRotation(
     saveLedger(dataDir, ledger);
   }
   buildLaunch(session);
+  // §2.3 п.12: every move is journaled — thread, from → to, reason.
   log(
-    `thread ${session.threadId}: rotating to account ${account.label} (${cause})`,
+    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (${cause})`,
   );
   void synthThreadStart(session).then(({ ok, error }) => {
     if (ok) {
@@ -2498,14 +2638,20 @@ function startRotation(
       `thread ${session.threadId}: rotation session failed to start: ${errorText.slice(0, 300)}`,
     );
     // A model refusal disproves the sibling's catalog record: mark the
-    // family unsupported and try the next suitable sibling — this is not
-    // a session-start fluke and earns no cooldown.
+    // family unsupported. For the "model" cause this was the one allowed
+    // move (§2.3 п.10) — probe the refuser and fail honestly instead of
+    // chaining to the next guess.
     if (
       dataDir !== "" &&
       session.model !== undefined &&
       isModelRefusal(errorText)
     ) {
       markAccountModelUnsupported(dataDir, account.label, session.model);
+      if (cause === "model") {
+        maybeProbeCatalog(account.label);
+        failOutModel(session, message);
+        return;
+      }
       startRotation(session, cause, message);
       return;
     }
@@ -2569,6 +2715,11 @@ function handleClassifiedError(
       return;
     case "fail":
       if (cause === "model") {
+        // §2.3 п.10: no fresh supporter to move to — re-poll the refuser's
+        // catalog (throttle permitting) so the next pick knows better.
+        if (session.accountLabel !== null) {
+          maybeProbeCatalog(session.accountLabel);
+        }
         failOutModel(session, message);
       } else {
         failOut(session, poolExhaustedText(cause, message));
@@ -2804,6 +2955,8 @@ function rotationReason(cause: RotationCause): string {
       return "the session's account lost its Google sign-in (auth_required); the turn is being re-run on another account, so the conversation context does not carry over";
     case "tos-disabled":
       return "the session's account was disabled by Google (Terms of Service); the turn is being re-run on another account, so the conversation context does not carry over";
+    case "validation-required":
+      return "the session's account needs Google account verification; the turn is being re-run on another account, so the conversation context does not carry over";
     case "model":
       return "the session's account does not offer the selected model; the turn is being re-run on another account, so the conversation context does not carry over";
     case "quota":
@@ -2854,6 +3007,27 @@ function onThreadIdentity(params: Record<string, unknown>): void {
   }
 }
 
+/**
+ * §2.3 п.11: the swallowed "⚠ Verification Required" turn ends here —
+ * park the owner and rotate to a sibling (or fail honestly) exactly like
+ * a classified refusal. daemonTurnOpen stays set so failOut can still
+ * close the client-visible turn with a failed boundary.
+ */
+function onValidationRefusalBoundary(session: WSession): void {
+  session.bridgeTurnBusy = false;
+  session.suppressOpenNext = false;
+  session.suppressAcceptedNext = false;
+  session.settledInternal = null;
+  log(
+    `thread ${session.threadId}: agent text carried VALIDATION_REQUIRED on ${session.accountLabel ?? "?"}; parking and rotating`,
+  );
+  handleClassifiedError(
+    session,
+    "validation-required",
+    `account ${session.accountLabel ?? "?"} needs Google account verification`,
+  );
+}
+
 function onProviderErrorDelta(
   session: WSession | undefined,
   delta: Record<string, unknown>,
@@ -2876,7 +3050,8 @@ function onProviderErrorDelta(
     !isAccountIneligible(text) &&
     !isAuthDead(text) &&
     !isTosDisabled(text) &&
-    !isModelRefusal(text)
+    !isModelRefusal(text) &&
+    !isValidationRequired(text)
   ) {
     // Consumed once for classification: leaving it armed would let this old
     // error text shadow the classification of later boundaries for 60s.
@@ -2903,11 +3078,13 @@ function onProviderErrorDelta(
     ? "tos-disabled"
     : category === "rate-limit"
       ? "quota"
-      : isAuthDead(text)
-        ? "auth-dead"
-        : isModelRefusal(text)
-          ? "model"
-          : "ineligible";
+      : isValidationRequired(text)
+        ? "validation-required"
+        : isAuthDead(text)
+          ? "auth-dead"
+          : isModelRefusal(text)
+            ? "model"
+            : "ineligible";
   if (
     cause === "model" &&
     dataDir !== "" &&
@@ -2999,6 +3176,14 @@ function processDeltaLine(
         continue;
       }
       case "turn.boundary": {
+        if (session.validationRefusal) {
+          // §2.3 п.11: the "⚠ Verification Required" turn never completes —
+          // its boundary becomes the same parking + rotation/failure a
+          // classified error drives.
+          session.validationRefusal = false;
+          onValidationRefusalBoundary(session);
+          continue;
+        }
         out.push(delta);
         onTurnBoundary(session, delta);
         continue;
@@ -3016,6 +3201,19 @@ function processDeltaLine(
           delta.channel === "agentMessage" &&
           typeof delta.text === "string"
         ) {
+          // §2.3 п.11: agy reports VALIDATION_REQUIRED inside the agent
+          // message itself — swallow the text and flag the turn so its
+          // boundary can park + rotate instead of showing it to the user.
+          if (session.validationRefusal) {
+            continue;
+          }
+          if (
+            isValidationRequired(session.recentAssistantText + delta.text)
+          ) {
+            session.validationRefusal = true;
+            session.recentAssistantText = "";
+            continue;
+          }
           if (session.compact?.collecting) {
             session.compact.summaryBuf += delta.text;
           }
@@ -3121,6 +3319,17 @@ function interceptOutbound(line: string): void {
       // disproves it (§2.3). Mark and re-drive on the next suitable
       // sibling; the daemon sees only the final answer.
       retryDaemonSession(msg.id as JsonRpcId, pending, msg);
+      return;
+    }
+    if (
+      errorText !== null &&
+      isValidationRequired(errorText) &&
+      pending.session.accountLabel !== null &&
+      dataDir !== ""
+    ) {
+      // §2.3 п.11: a 403 VALIDATION_REQUIRED at session build parks the
+      // account — the thread moves to a sibling or fails honestly.
+      retryDaemonSessionParked(msg.id as JsonRpcId, pending);
       return;
     }
     rawWrite(`${line}\n`);
@@ -3267,6 +3476,9 @@ function resumeOnSibling(
 ): void {
   session.needsHandoff = true;
   session.rotating = true; // hold daemon turns until the sibling is up
+  log(
+    `thread ${session.threadId}: move ${session.accountLabel ?? "none"} → ${account.label} (resume on sibling)`,
+  );
   session.accountLabel = account.label;
   const ledger = loadLedger(dataDir);
   markAccountUse(ledger, account.label);
@@ -3283,10 +3495,27 @@ function resumeOnSibling(
     session.rotating = false;
     if (!ok) {
       session.needsHandoff = false;
+      const errorText = errorMessageOf(error);
+      // §2.3 п.10: the sibling's own model refusal means the fresh record
+      // lied — mark it, probe it, and answer honestly; no third hop.
+      if (
+        dataDir !== "" &&
+        session.model !== undefined &&
+        isModelRefusal(errorText)
+      ) {
+        markAccountModelUnsupported(dataDir, account.label, session.model);
+        maybeProbeCatalog(account.label);
+        sendError(
+          id,
+          -32000,
+          `model ${session.model} is not offered by any pool account`,
+        );
+        return;
+      }
       sendError(
         id,
         -32000,
-        `agy could not start on the resume sibling: ${errorMessageOf(error).slice(0, 300)}`,
+        `agy could not start on the resume sibling: ${errorText.slice(0, 300)}`,
       );
       return;
     }
@@ -3323,15 +3552,33 @@ function retryDaemonSession(
     session.accountLabel as string,
     session.model as string,
   );
+  const family = session.model;
+  const honestUnoffered = (): void => {
+    if (session.accountLabel !== null) {
+      maybeProbeCatalog(session.accountLabel);
+    }
+    sendError(
+      id,
+      -32000,
+      `model ${family ?? "?"} is not offered by any pool account`,
+    );
+  };
   if (pending.kind === "resume") {
     const providerThreadId =
       typeof pending.params.providerThreadId === "string"
         ? pending.params.providerThreadId
         : session.providerThreadId ?? "";
-    const { account } = freeSibling(session, session.accountLabel);
+    // §2.3 п.10: the one allowed hop lands only on a fresh-catalog
+    // supporter — no fresh supporter, no move.
+    const { account } = freeSibling(session, session.accountLabel, {
+      freshModelOnly: true,
+    });
     if (account === null) {
-      writeOutbound(refusalMessage);
+      honestUnoffered();
       return;
+    }
+    if (family !== undefined) {
+      session.modelRefusalMoved.add(family);
     }
     resumeOnSibling(
       session,
@@ -3343,17 +3590,32 @@ function retryDaemonSession(
     return;
   }
   const retry = (): void => {
-    const { account } = freeSibling(session, session.accountLabel);
-    if (account === null) {
-      // Nothing suitable left: the honest refusal stands as the answer.
-      writeOutbound(refusalMessage);
+    if (family !== undefined && session.modelRefusalMoved.has(family)) {
+      // §2.3 п.10: the move was already spent — a second refusal for the
+      // same family ends honestly, never chains to the next guess.
+      honestUnoffered();
       return;
     }
+    const { account } = freeSibling(session, session.accountLabel, {
+      freshModelOnly: true,
+    });
+    if (account === null) {
+      // No fresh-catalog supporter: the honest refusal stands.
+      honestUnoffered();
+      return;
+    }
+    if (family !== undefined) {
+      session.modelRefusalMoved.add(family);
+    }
+    const movedFrom = session.accountLabel;
     session.accountLabel = account.label;
     const ledger = loadLedger(dataDir);
     markAccountUse(ledger, account.label);
     saveLedger(dataDir, ledger);
     buildLaunch(session);
+    log(
+      `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (model refusal)`,
+    );
     const params = {
       ...pending.params,
       options: rewriteOptions(session, { ...session.baseOptions }),
@@ -3368,7 +3630,8 @@ function retryDaemonSession(
         const errorText = errorMessageOf(error);
         if (isModelRefusal(errorText) && session.model !== undefined) {
           markAccountModelUnsupported(dataDir, account.label, session.model);
-          retry();
+          maybeProbeCatalog(account.label);
+          honestUnoffered();
           return;
         }
         sendError(id, -32000, errorText);
@@ -3376,6 +3639,66 @@ function retryDaemonSession(
     );
   };
   retry();
+}
+
+/**
+ * §2.3 п.11: a pending session that answered 403 VALIDATION_REQUIRED —
+ * park the account (permanent, manual unpark only) and drive the request
+ * on a sibling, or answer "account <label> needs Google account
+ * verification" when none is free.
+ */
+function retryDaemonSessionParked(
+  id: JsonRpcId,
+  pending: PendingDaemonSession,
+): void {
+  const { session } = pending;
+  const owner = session.accountLabel;
+  coolSessionAccount(
+    session,
+    "validation-required",
+    `account ${owner ?? "?"} needs Google account verification`,
+  );
+  const honest = `account ${owner ?? "?"} needs Google account verification`;
+  const { account } = freeSibling(session, owner);
+  if (account === null) {
+    sendError(id, -32000, honest);
+    return;
+  }
+  if (pending.kind === "resume") {
+    const providerThreadId =
+      typeof pending.params.providerThreadId === "string"
+        ? pending.params.providerThreadId
+        : session.providerThreadId ?? "";
+    resumeOnSibling(
+      session,
+      id,
+      providerThreadId,
+      account,
+      `resumed conversation ${providerThreadId} belongs to an account that needs Google account verification; resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
+    );
+    return;
+  }
+  const movedFrom = session.accountLabel;
+  session.accountLabel = account.label;
+  const ledger = loadLedger(dataDir);
+  markAccountUse(ledger, account.label);
+  saveLedger(dataDir, ledger);
+  buildLaunch(session);
+  log(
+    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (validation-required)`,
+  );
+  const params = {
+    ...pending.params,
+    options: rewriteOptions(session, { ...session.baseOptions }),
+  };
+  delete (params as { providerThreadId?: unknown }).providerThreadId;
+  void internalRequest("thread/start", params).then(({ ok, result, error }) => {
+    if (ok) {
+      sendResult(id, result);
+      return;
+    }
+    sendError(id, -32000, errorMessageOf(error));
+  });
 }
 
 function discardSession(session: WSession): void {
@@ -3428,6 +3751,28 @@ function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void
   session.model = earlySelection.modelId ?? session.model;
   session.reasoningLevel =
     earlySelection.reasoningLevel ?? session.reasoningLevel;
+  if (session.model !== undefined && coldStartNeedsProbes(session.model)) {
+    // §2.3 п.9: catalogs first, pick second — the request waits on the
+    // probe round (≤30 s) instead of spraying sessions across guesses.
+    log(
+      `thread ${threadId}: cold start — no account catalog names ${session.model}; waiting on agy models probes`,
+    );
+    void waitModelProbesBounded().then(() => {
+      if (sessions.get(threadId) !== session || session.stopped) {
+        return;
+      }
+      finishThreadStart(session, id, params);
+    });
+    return;
+  }
+  finishThreadStart(session, id, params);
+}
+
+function finishThreadStart(
+  session: WSession,
+  id: JsonRpcId,
+  params: Record<string, unknown>,
+): void {
   const poolPick = poolPickAccount(session);
   if (poolPick === "unoffered" || poolPick === "parked") {
     sendError(

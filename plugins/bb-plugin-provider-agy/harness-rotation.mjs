@@ -1539,6 +1539,249 @@ await sleep(100);
       typeof m.params?.reason === "string" && m.params.reason.includes("disabled by Google")),
     `${statuses("t-turn-parked")} news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsH3)}`);
 
+  const acpProbes = (label) =>
+    acpTranscript().filter((l) => l.__models === true && l.home === label).length;
+  const freshRecord = (ids) => ({
+    raw: ids.map((id) => ({ id, displayName: id })),
+    families: ids,
+    unsupported: {},
+    atMs: Date.now(),
+  });
+
+  // I+J. §2.3 п.9 cold start — on FRESH bridge instances: the probe
+  // throttle lives in module memory, so a bridge that already polled every
+  // label in the lazy-poll case cannot show the wait-and-probe path again.
+  // Each variant gets its own dataDir and import query (fresh module
+  // state). The model lives only on m4 — the JUNIOR tier (priority 5, vs
+  // the senior m1–m3 at 10): without the probe wait the pick falls back
+  // to the highest-priority guess and lands on m1.
+  const coldStartRun = async (threadId, dataDirName, seedModels) => {
+    const dir = join(root, dataDirName);
+    for (const label of ["m1", "m2", "m3", "m4"]) {
+      const cli = join(dir, "accounts", label, ".gemini", "antigravity-cli");
+      mkdirSync(cli, { recursive: true });
+      writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+    }
+    writeFileSync(join(dir, "accounts-state.json"), JSON.stringify({ accounts: {
+      m1: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+      m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+      m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+      m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 5 },
+    } }, null, 1));
+    if (seedModels !== null) {
+      writeFileSync(join(dir, "accounts-models.json"), JSON.stringify({ accounts: seedModels }, null, 1));
+    }
+    const bridge = (await import(
+      new URL(`./dist/host.js?${dataDirName}`, import.meta.url).href
+    )).experimental_providerBridge;
+    bridge.start?.({ pluginId: "provider-agy", dataDir: dir, tempDir: dir });
+    const prev = activeBridge;
+    activeBridge = bridge;
+    const news = newsSnapshot();
+    const probes = { m1: acpProbes("m1"), m2: acpProbes("m2"), m3: acpProbes("m3"), m4: acpProbes("m4") };
+    const reply = await startModel(threadId, "cold-model");
+    await sleep(200);
+    activeBridge = prev;
+    return { reply, news, probes };
+  };
+  const coldStartCheck = (tag, run) => check(tag,
+    !run.reply?.error &&
+    acpNews("m4") === run.news.m4 + 1 &&
+    acpNews("m1") === run.news.m1 && acpNews("m2") === run.news.m2 &&
+    acpNews("m3") === run.news.m3 &&
+    ["m1", "m2", "m3", "m4"].every((l) => acpProbes(l) > run.probes[l]),
+    run.reply?.error?.message ??
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(run.news)} ` +
+      `probes m1=${acpProbes("m1")}/${run.probes.m1} m4=${acpProbes("m4")}/${run.probes.m4}`);
+  acpControl.modeByLabel = {};
+  acpControl.modelsByLabel = {
+    m1: [["fake-model", "Fake Model"]],
+    m2: [["fake-model", "Fake Model"]],
+    m3: [["fake-model", "Fake Model"]],
+    m4: [["fake-model", "Fake Model"], ["cold-model", "Cold Model"]],
+  };
+  writeAcpControl();
+  // I: no accounts-models.json at all — every account recordless.
+  coldStartCheck("models/cold-start-waits-catalogs",
+    await coldStartRun("t-cold-start", "acp-cold1", null));
+  // J: every record is raw:[]/families:[] — "unknown", probed alike.
+  coldStartCheck("models/empty-record-is-probed",
+    await coldStartRun("t-cold-empty", "acp-cold2",
+      Object.fromEntries(["m1", "m2", "m3", "m4"].map((l) =>
+        [l, { raw: [], families: [], unsupported: {}, atMs: 0 }]))));
+
+  // K. §2.3 п.10 session-build refusal: records claim pro on m1/m2/m4
+  // (fresh) and m3 (STALE — exactly the guess the fresh-only filter must
+  // reject, LRU-first among siblings) while the fake serves it nowhere —
+  // exactly ONE hop (m1 → m2), then the honest "not offered". m3's and
+  // m4's spawns stay untouched.
+  writeAcpModels({
+    m1: freshRecord(["fake-model", "pro-model"]),
+    m2: freshRecord(["fake-model", "pro-model"]),
+    m3: { ...freshRecord(["fake-model", "pro-model"]), atMs: Date.now() - 7 * 3_600_000 },
+    m4: freshRecord(["fake-model", "pro-model"]),
+  });
+  acpControl.modelsByLabel = {
+    m1: [["fake-model", "Fake Model"]],
+    m2: [["fake-model", "Fake Model"]],
+    m3: [["fake-model", "Fake Model"]],
+    m4: [["fake-model", "Fake Model"]],
+  };
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  const newsK = newsSnapshot();
+  const capReply = await startModel("t-model-cap", "pro-model");
+  await sleep(300);
+  check("models/refusal-moves-once-then-fails",
+    typeof capReply?.error?.message === "string" &&
+    capReply.error.message.includes("not offered") &&
+    acpNews("m1") === newsK.m1 + 1 &&
+    acpNews("m2") === newsK.m2 + 1 &&
+    acpNews("m3") === newsK.m3 &&
+    acpNews("m4") === newsK.m4 &&
+    (readAcpModels().m1?.unsupported?.["pro-model"] ?? 0) > 0 &&
+    (readAcpModels().m2?.unsupported?.["pro-model"] ?? 0) > 0 &&
+    (readAcpModels().m3?.unsupported?.["pro-model"] ?? 0) === 0,
+    `reply=${JSON.stringify(capReply?.error ?? capReply?.result ?? null)} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsK)}`);
+
+  // L. §2.3 п.10 in-flight refusal: the session starts fine, the turn
+  // refuses the model — again at most one move before the honest failure.
+  writeAcpModels({
+    m1: freshRecord(["fake-model", "pro-model"]),
+    m2: freshRecord(["fake-model", "pro-model"]),
+    m3: { ...freshRecord(["fake-model", "pro-model"]), atMs: Date.now() - 7 * 3_600_000 },
+    m4: freshRecord(["fake-model", "pro-model"]),
+  });
+  acpControl.modelsByLabel = {
+    m1: [["fake-model", "Fake Model"], ["pro-model", "Pro Model"]],
+    m2: [["fake-model", "Fake Model"]],
+    m3: [["fake-model", "Fake Model"]],
+    m4: [["fake-model", "Fake Model"]],
+  };
+  acpControl.modeByLabel = { m1: "unknown-model-once" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  const newsL = newsSnapshot();
+  await startModel("t-model-inflight-cap", "pro-model");
+  await turnModel("t-model-inflight-cap", "model refused mid-flight", "pro-model");
+  await sleep(400);
+  const capErr = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-model-inflight-cap" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.message === "string" && d.message.includes("not offered")));
+  check("models/inflight-refusal-moves-once",
+    capErr &&
+    acpNews("m1") === newsL.m1 + 1 &&
+    acpNews("m2") === newsL.m2 + 1 &&
+    acpNews("m3") === newsL.m3 &&
+    acpNews("m4") === newsL.m4 &&
+    (readAcpModels().m1?.unsupported?.["pro-model"] ?? 0) > 0 &&
+    (readAcpModels().m2?.unsupported?.["pro-model"] ?? 0) > 0,
+    `capErr=${capErr} news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsL)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // M. §2.3 п.11: VALIDATION_REQUIRED arrives as ordinary agent text —
+  // swallowed before the user sees it, account parked without expiry,
+  // thread re-run on a sibling; the wrapper log journals the move.
+  writeAcpModels({
+    m1: freshRecord(["fake-model"]),
+    m2: freshRecord(["fake-model"]),
+    m3: freshRecord(["fake-model"]),
+    m4: freshRecord(["fake-model"]),
+  });
+  acpControl.modeByLabel = { m1: "validation" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  const newsM = newsSnapshot();
+  await startModel("t-validation", "fake-model");
+  await turnModel("t-validation", "verify me", "fake-model");
+  await sleep(400);
+  const valEntry = readAcpLedger().accounts.m1 ?? {};
+  const valSawText = messages.some((m) => m.method === "thread/delta" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.text === "string" && d.text.includes("Verification Required")));
+  check("models/validation-parks-and-moves",
+    valEntry.parkedReason === "validation-required" &&
+    (valEntry.cooldownUntilMs ?? 0) > Date.now() + 365 * 24 * 3_600_000 &&
+    !valSawText &&
+    statuses("t-validation") === "completed" &&
+    acpNews("m1") === newsM.m1 + 1 &&
+    acpNews("m2") + acpNews("m3") + acpNews("m4") ===
+      newsM.m2 + newsM.m3 + newsM.m4 + 1,
+    `entry=${JSON.stringify(valEntry)} sawText=${valSawText} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsM)}`);
+  const wrapLog = readFileSync(join(acpData, "acp-wrapper.log"), "utf8");
+  check("models/move-journal-lines",
+    wrapLog.includes("parked (validation-required") &&
+    /move m1 → m[234] \(validation-required\)/u.test(wrapLog),
+    "acp-wrapper.log lacks the move/park journal lines");
+
+  // Manual unpark revives the account (§2.3 п.11: operator clears the mark).
+  {
+    const ledger = readAcpLedger();
+    delete ledger.accounts.m1.parkedReason;
+    delete ledger.accounts.m1.ineligibleAtMs;
+    ledger.accounts.m1.cooldownUntilMs = 0;
+    ledger.accounts.m1.lastUsedMs = 0;
+    ledger.accounts.m1.lastError = null;
+    writeAcpLedger(ledger);
+  }
+  const newsM2 = newsSnapshot();
+  await startModel("t-unparked", "fake-model");
+  await sleep(200);
+  check("models/validation-manual-unpark",
+    acpNews("m1") === newsM2.m1 + 1,
+    `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsM2)}`);
+
+  // No free sibling → honest "needs Google account verification", still no
+  // ⚠ text and no launch anywhere else.
+  acpControl.modeByLabel = { m1: "validation" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { ...parkedEntry }, m3: { ...parkedEntry }, m4: { ...parkedEntry },
+  } });
+  const newsM3 = newsSnapshot();
+  await startModel("t-validation-fail", "fake-model");
+  await turnModel("t-validation-fail", "verify me again", "fake-model");
+  await sleep(400);
+  const vFailErr = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-validation-fail" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.message === "string" && d.message.includes("needs Google account verification")));
+  const vFailSawText = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-validation-fail" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.text === "string" && d.text.includes("Verification Required")));
+  check("models/validation-no-sibling-fails",
+    vFailErr && !vFailSawText &&
+    boundaries("t-validation-fail").at(-1)?.status === "failed" &&
+    acpNews("m2") + acpNews("m3") + acpNews("m4") ===
+      newsM3.m2 + newsM3.m3 + newsM3.m4,
+    `vFailErr=${vFailErr} sawText=${vFailSawText} ` +
+      `boundaries=${statuses("t-validation-fail")} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsM3)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
   // NOTE: never call activeBridge.onClose() here — the embedded generic
   // bridge's onClose ends with process.exit(0) and would skip the report.
   await sleep(100);

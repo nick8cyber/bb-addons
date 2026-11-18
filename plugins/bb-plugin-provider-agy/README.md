@@ -463,6 +463,41 @@ pick (spec §2.3, ADR-0030; ACP transport only).
   quota turn waits out the earliest suitable window and may land back on the
   session's own account; `rateLimits` reports the nearest resetsAt among
   accounts that could serve the model.
+- **Cold start waits on catalogs**: when no eligible account's catalog names
+  the requested family and at least one account still has no usable record
+  (absent, or `raw: []` — an empty record means "unknown", e.g. refusal marks
+  on a virgin account), `thread/start` waits for the `agy models` probe round
+  before picking (at most two probes in parallel, 30 seconds overall; the
+  polling exclusions and the 30-minute throttle above still apply). The pick
+  then lands straight on the account that actually serves the model instead
+  of spraying sessions across guesses.
+- **One move per model refusal**: when a turn is refused on the model
+  in-flight, the thread moves at most once — and only onto an account whose
+  *fresh* catalog names the family. A stale or missing record no longer
+  counts as a candidate (those are the guesses that chained the live
+  incident). If no fresh catalog offers the model, or the move's session
+  refuses the same model again, the refused account's catalog is re-polled
+  when the throttle allows and the turn fails honestly with
+  `model <id> is not offered by any pool account` (or `rateLimits` blocked
+  until the nearest carrier's resetsAt when every carrier is cooling).
+- **validation-required**: a Google `VALIDATION_REQUIRED` refusal —
+  including agy's `⚠ Verification Required` agent text — parks the account
+  permanently (`parkedReason: "validation-required"`, effectively infinite
+  cooldown, outside the eligibility breaker, the merged catalog, and every
+  poll). The warning text never reaches the user as a model answer; the
+  thread moves to a free sibling or fails honestly with
+  `account <label> needs Google account verification…`, and only a manual
+  edit of `accounts-state.json` (clear `parkedReason` and the cooldown)
+  brings the account back.
+- **Move journal**: every pool pick, move, and parking writes one line to
+  `acp-wrapper.log` next to the pool files —
+  `thread <id>: move <from> → <to> (<reason>)` — so a rotation trail can be
+  audited without instrumenting agy.
+- **Merged-list cache**: `model/list` answers are also cached in
+  `acp-models-cache.json` for six hours, so after an upgrade (or after
+  parking/unparking accounts) the merged model list may keep its old shape
+  until that file's TTL expires — delete `acp-models-cache.json` to refresh
+  it immediately.
 
 The same rules drive turn-level model changes (`turn/start` with a new
 `options.model` rotates off an unfit account), `thread/resume` (an owner

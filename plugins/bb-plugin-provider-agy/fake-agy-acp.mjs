@@ -164,6 +164,14 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, error: { code: 403, message: "This service has been disabled in this account for violation of Terms of Service." } });
     return;
   }
+  // §2.3 п.11: real agy reports 403 VALIDATION_REQUIRED as ordinary agent
+  // text ("⚠ Verification Required") and still closes the turn cleanly —
+  // the wrapper must swallow it, park the account and move the thread.
+  if (text.includes("[[validation]]") || mode === "validation" || (mode === "validation-once" && once("val"))) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Verification Required" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
   if (mode === "ineligible" && once("inel")) {
     out({ jsonrpc: "2.0", id, error: { code: 403, message: ineligibleMsg } });
     return;

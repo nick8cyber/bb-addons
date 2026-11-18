@@ -765,14 +765,16 @@ export function writeAccountHome(
 }
 
 /** True when too many accounts were parked inside the breaker window — the
- * egress looks guilty, not the accounts, so no more parking. A tos-disabled
- * parking is the account's own ban (§2.3 п.7): it neither feeds the count
- * nor is held back by an open breaker. */
+ * egress looks guilty, not the accounts, so no more parking. tos-disabled
+ * and validation-required parkings are the account's own ban/verification
+ * (§2.3 пп. 7, 11): they neither feed the count nor are held back by an
+ * open breaker. */
 export function checkIneligibleBreaker(ledger: AccountsLedger, nowMs = Date.now()): boolean {
   const windowMs = ineligibleBreakerWindowMs();
   const parkedCount = Object.values(ledger.accounts).filter(
     (entry) =>
       entry.parkedReason !== "tos-disabled" &&
+      entry.parkedReason !== "validation-required" &&
       typeof entry.ineligibleAtMs === "number" &&
       entry.ineligibleAtMs > nowMs - windowMs &&
       entry.ineligibleAtMs <= nowMs,
@@ -798,6 +800,21 @@ const TOS_DISABLED_PATTERN =
 
 export function isTosDisabled(message: string): boolean {
   return TOS_DISABLED_PATTERN.test(message);
+}
+
+/**
+ * Signature of Google's 403 PERMISSION_DENIED / VALIDATION_REQUIRED
+ * ("Verify your account to continue"): the account itself needs a manual
+ * verification in a browser — not quota, not ToS, not auth-dead, and not
+ * plain eligibility (it parks permanently like tos-disabled, §2.3 п.11).
+ * agy reports it two ways: the 403 reason in its log and the literal
+ * "⚠ Verification Required" inside the agent message text.
+ */
+const VALIDATION_REQUIRED_PATTERN =
+  /validation_required|verify your account to continue|⚠\s*verification required/iu;
+
+export function isValidationRequired(message: string): boolean {
+  return VALIDATION_REQUIRED_PATTERN.test(message);
 }
 
 /**
