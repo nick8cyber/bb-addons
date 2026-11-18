@@ -1950,6 +1950,116 @@ await sleep(100);
   acpControl.modeByLabel = {};
   writeAcpControl();
 
+  // U. §2.3 п.11 (ревизия 13.1): the sibling reached by the model-refusal
+  // retry refuses its internal thread/start with VALIDATION_REQUIRED —
+  // same parkedCause classification as every other internal start, not a
+  // bare error to the caller. m1's record lies about pro-model so the
+  // pick trusts it; m2's mode fails session/new with the 403.
+  writeAcpModels({
+    m1: freshRecord(["fake-model", "pro-model"]),
+    m2: freshRecord(["fake-model", "pro-model"]),
+    m3: freshRecord(["fake-model", "pro-model"]),
+    m4: freshRecord(["fake-model"]),
+  });
+  acpControl.modelsByLabel = {
+    m1: [["fake-model", "Fake Model"]],
+    m2: [["fake-model", "Fake Model"], ["pro-model", "Pro Model"]],
+    m3: [["fake-model", "Fake Model"], ["pro-model", "Pro Model"]],
+    m4: [["fake-model", "Fake Model"]],
+  };
+  acpControl.modeByLabel = { m2: "validation-error" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  const newsU = newsSnapshot();
+  const uReply = await startModel("t-retry-validation", "pro-model");
+  await sleep(400);
+  const uLedger = readAcpLedger().accounts;
+  const uLog = readFileSync(join(acpData, "acp-wrapper.log"), "utf8");
+  check("models/retry-sibling-validation-parks",
+    !uReply?.error &&
+    uLedger.m2?.parkedReason === "validation-required" &&
+    (uLedger.m2?.cooldownUntilMs ?? 0) > Date.now() + 365 * 24 * 3_600_000 &&
+    (readAcpModels().m1?.unsupported?.["pro-model"] ?? 0) > 0 &&
+    acpNews("m3") === newsU.m3 + 1 &&
+    uLog.includes("move m1 → m2 (model refusal)") &&
+    uLog.includes("move m2 → m3 (validation-required)"),
+    `reply=${JSON.stringify(uReply?.error ?? null)} ` +
+      `parked m2=${uLedger.m2?.parkedReason} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsU)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // V. §2.3 п.11 (ревизия 13.1): the marker arriving as the turn's SECOND
+  // agent text segment — prose, a tool call closing the first stream
+  // (item.textClose), then "⚠ Verification Required" — still parks and is
+  // still swallowed; the earlier prose reaches the user normally.
+  writeAcpModels({
+    m1: freshRecord(["fake-model"]),
+    m2: freshRecord(["fake-model"]),
+    m3: freshRecord(["fake-model"]),
+    m4: freshRecord(["fake-model"]),
+  });
+  acpControl.modeByLabel = { m1: "validation-second-segment" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  await startModel("t-validation-segment", "fake-model");
+  await turnModel("t-validation-segment", "second segment marker", "fake-model");
+  await sleep(400);
+  const vSegEntry = readAcpLedger().accounts.m1 ?? {};
+  const vSegSawMarker = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-validation-segment" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.text === "string" && d.text.includes("Verification Required")));
+  const vSegSawProse = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-validation-segment" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.text === "string" && d.text.includes("working on it")));
+  check("models/validation-second-segment-parks",
+    vSegEntry.parkedReason === "validation-required" &&
+    !vSegSawMarker && vSegSawProse &&
+    statuses("t-validation-segment") === "completed",
+    `entry=${JSON.stringify(vSegEntry)} marker=${vSegSawMarker} ` +
+      `prose=${vSegSawProse} statuses=${statuses("t-validation-segment")}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // W. §2.3 п.11: turn/start on an owner parked validation-required — the
+  // rotation cause and the session/replaced reason speak of account
+  // verification, not the eligibility fallback.
+  writeAcpLedger({ accounts: {
+    m1: { ...parkedEntry }, m2: { ...parkedEntry },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+  } });
+  await startModel("t-turn-validation-owner", "fake-model");
+  writeAcpLedger({ accounts: {
+    m1: { ...parkedEntry }, m2: { ...parkedEntry },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    m4: { ...parkedEntry, parkedReason: "validation-required" },
+  } });
+  const newsW = newsSnapshot();
+  await turnModel("t-turn-validation-owner", "leave the verification-parked owner", "fake-model");
+  await sleep(300);
+  const wReasons = replacedFor("t-turn-validation-owner")
+    .map((r) => (typeof r?.params?.reason === "string" ? r.params.reason : ""));
+  check("models/turn-validation-owner-reason",
+    wReasons.some((r) => r.includes("verification")) &&
+    !wReasons.some((r) => r.includes("eligibility")) &&
+    acpNews("m3") === newsW.m3 + 1 &&
+    acpNews("m4") === newsW.m4,
+    `reasons=${JSON.stringify(wReasons)} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsW)}`);
+
   // NOTE: never call activeBridge.onClose() here — the embedded generic
   // bridge's onClose ends with process.exit(0) and would skip the report.
   await sleep(100);

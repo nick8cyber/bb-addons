@@ -178,6 +178,17 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, error: { code: 403, message: "PERMISSION_DENIED: VALIDATION_REQUIRED — Verify your account to continue" } });
     return;
   }
+  // §2.3 п.11 (ревизия 13.1): the marker as the turn's SECOND agent text
+  // segment — ordinary prose, a tool call (which closes the first text
+  // stream), then "⚠ Verification Required" on the same agent message.
+  if (mode === "validation-second-segment") {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working on it" } });
+    upd({ sessionUpdate: "tool_call", toolCallId: "tc-vseg", title: "run_command", kind: "execute", status: "in_progress", rawInput: { command: "ls" } });
+    upd({ sessionUpdate: "tool_call_update", toolCallId: "tc-vseg", status: "completed", rawOutput: "ok" });
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "⚠ Verification Required" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
   if (mode === "ineligible" && once("inel")) {
     out({ jsonrpc: "2.0", id, error: { code: 403, message: ineligibleMsg } });
     return;

@@ -2668,11 +2668,7 @@ function startRotation(
     // §2.3 п.11 (ревизия 13.1): a sibling answering the internal start
     // with VALIDATION_REQUIRED/ToS parks permanently — never the 60 s
     // blind cooldown — and the rotation moves to the next free one.
-    const parkedCause = isValidationRequired(errorText)
-      ? ("validation-required" as const)
-      : isTosDisabled(errorText)
-        ? ("tos-disabled" as const)
-        : null;
+    const parkedCause = parkedCauseOf(errorText);
     if (dataDir !== "" && parkedCause !== null) {
       coolSessionAccount(session, parkedCause, errorText.slice(0, 300));
       startRotation(session, cause, message);
@@ -3259,6 +3255,17 @@ function processDeltaLine(
         out.push(delta);
         continue;
       }
+      case "item.textClose": {
+        if (delta.channel === "agentMessage") {
+          // A closed text segment ends the current-message buffer too:
+          // prose + item.textClose + a "⚠ Verification Required" segment
+          // must still match the exact agy form, not "prose + marker"
+          // (§2.3 п.11, ревизия 13.1).
+          session.agentMessageText = "";
+        }
+        out.push(delta);
+        continue;
+      }
       case "session.reset": {
         session.recentAssistantText = "";
         out.push(delta);
@@ -3348,15 +3355,17 @@ function interceptOutbound(line: string): void {
       retryDaemonSession(msg.id as JsonRpcId, pending, msg);
       return;
     }
-    if (
+    const parkedCause =
       errorText !== null &&
-      isValidationRequired(errorText) &&
       pending.session.accountLabel !== null &&
       dataDir !== ""
-    ) {
-      // §2.3 п.11: a 403 VALIDATION_REQUIRED at session build parks the
-      // account — the thread moves to a sibling or fails honestly.
-      retryDaemonSessionParked(msg.id as JsonRpcId, pending);
+        ? parkedCauseOf(errorText)
+        : null;
+    if (parkedCause !== null) {
+      // §2.3 п.11: a parking refusal (VALIDATION_REQUIRED/ToS) at session
+      // build parks the account — the thread moves to a sibling or fails
+      // honestly.
+      retryDaemonSessionParked(msg.id as JsonRpcId, pending, parkedCause);
       return;
     }
     rawWrite(`${line}\n`);
@@ -3542,11 +3551,7 @@ function resumeOnSibling(
       // §2.3 п.11 (ревизия 13.1): the sibling itself refuses with
       // VALIDATION_REQUIRED/ToS — park it permanently and try the next
       // free account instead of a bare error.
-      const parkedCause = isValidationRequired(errorText)
-        ? ("validation-required" as const)
-        : isTosDisabled(errorText)
-          ? ("tos-disabled" as const)
-          : null;
+      const parkedCause = parkedCauseOf(errorText);
       if (dataDir !== "" && parkedCause !== null) {
         coolSessionAccount(session, parkedCause, errorText.slice(0, 300));
         const { account: next } = freeSibling(session, account.label);
@@ -3589,6 +3594,22 @@ function resumeOnSibling(
     });
     drainQueue(session);
   });
+}
+
+/**
+ * The parking classes an error string can carry: VALIDATION_REQUIRED or
+ * the eligibility "Verify your account to continue" (both permanent
+ * validation parking) and a Terms-of-Service disable. One classifier for
+ * every internal start path so none of them invents its own list.
+ */
+function parkedCauseOf(
+  errorText: string,
+): "validation-required" | "tos-disabled" | null {
+  return isValidationRequired(errorText)
+    ? "validation-required"
+    : isTosDisabled(errorText)
+      ? "tos-disabled"
+      : null;
 }
 
 /**
@@ -3691,6 +3712,14 @@ function retryDaemonSession(
           honestUnoffered();
           return;
         }
+        // §2.3 п.11 (ревизия 13.1): the sibling refuses the internal start
+        // with VALIDATION_REQUIRED/ToS — park it and keep driving on the
+        // next free account, exactly like the other internal-start paths.
+        const parkedCause = parkedCauseOf(errorText);
+        if (dataDir !== "" && parkedCause !== null) {
+          retryDaemonSessionParked(id, pending, parkedCause);
+          return;
+        }
         sendError(id, -32000, errorText);
       },
     );
@@ -3758,11 +3787,7 @@ function retryDaemonSessionParked(
     // the same way — park it too and drive the request on the next free
     // account; only a non-parking error reaches the caller verbatim.
     const errorText = errorMessageOf(error);
-    const parkedCause = isValidationRequired(errorText)
-      ? ("validation-required" as const)
-      : isTosDisabled(errorText)
-        ? ("tos-disabled" as const)
-        : null;
+    const parkedCause = parkedCauseOf(errorText);
     if (dataDir !== "" && parkedCause !== null) {
       retryDaemonSessionParked(id, pending, parkedCause);
       return;
@@ -3995,8 +4020,11 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
         : ownerParkedReason === "tos-disabled"
           ? `resumed conversation ${providerThreadId} belongs to an account disabled by Google (Terms of Service); ` +
             `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`
-          : `resumed conversation ${providerThreadId} belongs to an account in quota cooldown; ` +
-            `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
+          : ownerParkedReason === "validation-required"
+            ? `resumed conversation ${providerThreadId} belongs to an account that needs Google account verification; ` +
+              `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`
+            : `resumed conversation ${providerThreadId} belongs to an account in quota cooldown; ` +
+              `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
   );
 }
 
@@ -4048,9 +4076,11 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
           ? "auth-dead"
           : ownerEntry?.parkedReason === "tos-disabled"
             ? "tos-disabled"
-            : ownerEntry?.ineligibleAtMs !== undefined
-              ? "ineligible"
-              : "quota";
+            : ownerEntry?.parkedReason === "validation-required"
+              ? "validation-required"
+              : ownerEntry?.ineligibleAtMs !== undefined
+                ? "ineligible"
+                : "quota";
       startRotation(
         session,
         cause,
@@ -4058,9 +4088,11 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
           ? "account lost its Google sign-in (auth_required)"
           : cause === "tos-disabled"
             ? "account disabled by Google (Terms of Service)"
-            : cause === "ineligible"
-              ? "account parked after eligibility refusal"
-              : "account in quota cooldown",
+            : cause === "validation-required"
+              ? "account needs Google account verification"
+              : cause === "ineligible"
+                ? "account parked after eligibility refusal"
+                : "account in quota cooldown",
       );
       return;
     }
