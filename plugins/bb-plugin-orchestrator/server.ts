@@ -1631,6 +1631,7 @@ export async function createPlugin(
     into?: string;
     noAutofix?: boolean;
     dryRun?: boolean;
+    markMerged?: boolean | string;
     callerThreadId: string;
   }) =>
     runMerge(input, {
@@ -1691,6 +1692,20 @@ export async function createPlugin(
       protectedBranches:
         janitorConfig().config?.protectedBranches ?? undefined,
       mergeAutofix: () => currentSettings.mergeAutofix === true,
+      // §14 `--mark-merged` (r34.1): the upstream seams.
+      upstream: {
+        projects: async () =>
+          (await bb.sdk.projects.list().catch(() => [])) as BbProjectListItem[],
+        localHostId,
+        releaseConfig: () => releaseConfig,
+        settingsProjectId: (repo, pid, config) =>
+          settingsProjectId(
+            { cmd, bbCli, localHostId },
+            repo,
+            pid ?? "",
+            config as never,
+          ),
+      },
       // §16.6 `threadIds`: off → merge commits drop the task key.
       // §6 (r8) п.7: the settings project is the repository's bb
       // project; a resolver error or ambiguity counts `threadIds:
@@ -1743,6 +1758,26 @@ export async function createPlugin(
         return res.stdout;
       },
     },
+    // §5.6 (r34.1): upstream/tracker reconcile seams — bb projects for
+    // `projectRepoPath`, the host id, the release config, non-throwing
+    // git (cmd.run already returns {exitCode,stdout,stderr}).
+    upstream: {
+      projects: async () =>
+        (await bb.sdk.projects.list().catch(() => [])) as BbProjectListItem[],
+      localHostId,
+      releaseConfig: () => releaseConfig,
+      git: async (repo, args, opts) => {
+        const res = await cmd.run("git", ["-C", repo, ...args], {
+          timeoutMs: opts?.timeoutMs,
+        });
+        return {
+          exitCode: res.exitCode,
+          stdout: res.stdout,
+          stderr: res.stderr,
+        };
+      },
+    },
+    workGraphMode: getWorkGraphMode,
     enqueue,
     handoffPath,
     log: bb.log,
@@ -1838,6 +1873,10 @@ export async function createPlugin(
         await helperWatchdog.reconcile();
         await pumpRelease();
       });
+      // §5.6 п.9 (r34.1): the one-time historical upstream sweep at
+      // plugin start — outside `beat`/`enqueue`: git+network must not
+      // serialize against dispatch/finalize.
+      run(live(() => watchdog.reconcileHistory()));
       maybeCheckPresets();
       const reconcileTimer = setInterval(() => {
         beat(async () => {
@@ -1845,6 +1884,9 @@ export async function createPlugin(
           await helperWatchdog.reconcile();
           await pumpRelease();
         });
+        // §5.6 (r34.1): the 60 s tracker+git fact-check — OFF
+        // `enqueue`, single-flight inside the watchdog.
+        run(live(() => watchdog.reconcileUpstream()));
         maybeCheckPresets();
       }, 60_000);
       const timersTimer = setInterval(
@@ -2163,6 +2205,12 @@ export async function createPlugin(
         .boolean()
         .optional()
         .describe("Checks + merge-tree only; the worktree stays untouched"),
+      markMerged: z
+        .union([z.boolean(), z.string()])
+        .optional()
+        .describe(
+          "§14 (r34.1): mark the round merged in upstream WITHOUT touching the copy — for external PR/squash/rebase merges. `true` verifies result_sha on origin/<targetBranch> (ancestor or merge-tree equal); a string names the explicit upstream commit.",
+        ),
     }),
     async execute(params, ctx) {
       // §5.6 (r33.11): a productive call resets the idle nudge schedule.
@@ -2507,7 +2555,7 @@ export async function createPlugin(
         name: "merge",
         summary: t("cli.helpMergeS"),
         usage:
-          "bb orchestrator merge <KEY|delegationId> [--into <branch>] [--no-autofix] [--dry-run] [--json]",
+          "bb orchestrator merge <KEY|delegationId> [--into <branch>] [--no-autofix] [--dry-run] [--mark-merged [sha]] [--json]",
       },
       {
         name: "policy",
@@ -2628,9 +2676,18 @@ export async function createPlugin(
           argv[i - 1] !== "--priority" && argv[i - 1] !== "--mode" &&
           argv[i - 1] !== "--acceptance" && argv[i - 1] !== "--release-note" &&
           argv[i - 1] !== "--depends-on" && argv[i - 1] !== "--reason" &&
-          argv[i - 1] !== "--target" && argv[i - 1] !== "--comment",
+          argv[i - 1] !== "--target" && argv[i - 1] !== "--comment" &&
+          argv[i - 1] !== "--mark-merged",
       );
       const cmd = positional[0];
+      // §14 (r34.1): `--mark-merged` carries an OPTIONAL sha — the next
+      // arg counts only when it is not another flag.
+      const markMergedArg = (() => {
+        const i = argv.indexOf("--mark-merged");
+        if (i < 0) return undefined;
+        const v = argv[i + 1];
+        return v !== undefined && !v.startsWith("--") ? v : true;
+      })();
 
       try {
         // §5.6 (r33.11): a productive CLI call from a coordinator thread
@@ -3058,6 +3115,7 @@ export async function createPlugin(
             into: flag("--into"),
             noAutofix: argv.includes("--no-autofix"),
             dryRun: argv.includes("--dry-run"),
+            markMerged: markMergedArg,
             callerThreadId: ctx.threadId,
           });
           if (json) return jsonOk(res);
@@ -3089,6 +3147,11 @@ export async function createPlugin(
                 verdict:
                   res.mergeStatus === "merged"
                     ? t("cli.merged", { sha: res.mergedSha?.slice(0, 7) ?? "" })
+                    : res.mergeStatus === "merged-upstream"
+                      ? t("cli.mergedUpstream", {
+                          sha: res.mergedSha?.slice(0, 7) ?? "",
+                          into: res.into,
+                        })
                     : res.mergeStatus === "fix-delegated"
                       ? t("cli.fixDelegated", {
                           id: res.fixDelegationId,
@@ -3230,18 +3293,28 @@ export async function createPlugin(
             },
             releaseDeps,
           );
+          // §2 п.0.2 (r11.9): upstream-выкладка завершается сразу —
+          // аудита и «слежу» нет.
+          const started =
+            res.status === "published"
+              ? t("cli.releaseDoneUpstream", {
+                  taskKey: res.taskKey,
+                  id: res.releaseId,
+                })
+              : t("cli.releaseStarted", {
+                  taskKey: res.taskKey,
+                  id: res.releaseId,
+                  thread: res.auditThreadId ?? "—",
+                  settings: res.settingsProjectId,
+                  delegation: res.delegationProjectId,
+                }) +
+                t("cli.releaseReminder");
           return json
             ? jsonOk(res)
             : {
                 exitCode: 0,
                 stdout:
-                  t("cli.releaseStarted", {
-                    taskKey: res.taskKey,
-                    id: res.releaseId,
-                    thread: res.auditThreadId ?? "—",
-                    settings: res.settingsProjectId,
-                    delegation: res.delegationProjectId,
-                  }) +
+                  started +
                   (res.warnings.length
                     ? t("cli.scanWarnings", {
                         list: res.warnings
@@ -3252,8 +3325,7 @@ export async function createPlugin(
                           )
                           .join("\n"),
                       })
-                    : "") +
-                  t("cli.releaseReminder"),
+                    : ""),
               };
         }
 

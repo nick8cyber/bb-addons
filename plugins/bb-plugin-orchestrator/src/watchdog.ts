@@ -44,8 +44,25 @@ import {
 import {
   deliverReleaseNotice,
   parseAuditVerdict,
+  settingsProjectId,
   verdictDetailsInBody,
 } from "./release.js";
+import {
+  resolveProject,
+  type ReleaseConfigLoad,
+} from "./release-config.js";
+import {
+  projectRepoPath,
+  type BbProjectListItem,
+} from "./delegate-base.js";
+import {
+  budgetGit,
+  fetchTargetBranch,
+  shaObjectExists,
+  upstreamContains,
+  upstreamMergedSha,
+  type UpstreamGit,
+} from "./upstream.js";
 import { DEFAULT_HANDOFF_PATH } from "./roles.js";
 import { isPluginUiFile, pluginNameForPaths } from "./staged.js";
 import { T_RU, type T } from "./i18n/index.js";
@@ -78,9 +95,22 @@ const DEFAULT_MAX_RUN_SECONDS = 7200;
  * `coordinatorWatchdogEnabled`). */
 const DEFAULT_COORDINATOR_IDLE_MINUTES = 5;
 const DEFAULT_COORDINATOR_MAX_NUDGES = 3;
-/** §5.6 п.1в: the backlog read is two `bb tasks` calls — cached per
- * bb project for a minute. */
-const COORD_BACKLOG_CACHE_MS = 60_000;
+/** §5.6 (r34.1): a coordinator thread quiet (no owner turn, no
+ * productive action) longer than this is never woken. */
+const DEFAULT_COORDINATOR_MAX_THREAD_AGE_HOURS = 24;
+/** §5.6 (r34.1): `plugin_meta` keys — the watchdog's epoch (refreshed
+ * whenever the setting flips off→on), the setting's last seen state,
+ * and the one-time historical reconcile mark. */
+const META_INSTALLED_AT = "coordinator_watchdog_installed_at";
+const META_ENABLED_LAST = "coordinator_watchdog_enabled_last";
+const META_HISTORY_RECONCILED = "coordinator_history_reconciled_at";
+/** §5.6 (r34.1): tracker task statuses cached by the 60 s
+ * `reconcileUpstreamPass` — `done`/`canceled` tasks drop out of the
+ * pending set for this long (stale-on-error keeps the last answer). */
+const TRACKER_CACHE_TTL_MS = 10 * 60_000;
+/** §5.6 (r34.1): journal back-scans of uninitialized coordinators per
+ * tick — a storm of restored rows must not stall the pass. */
+const COORD_BACKSCAN_PER_TICK = 5;
 /** Coordinators without a state row get a DTO probe only on this beat —
  * the per-row pass itself runs with checkTimers. */
 const COORD_DISCOVERY_MS = 60_000;
@@ -144,13 +174,15 @@ const SUPERSEDED = new Set(["reissued", "stalled", "quota"]);
 /** §16.2: the tasks plugin's comment fan-out prefix — a turn opened by
  * it is a notification wake, not a revive. */
 const TRACKER_COMMENT_PREFIX = "New comment on task ";
-/** §5.6 п.4б (r33.11): journal request texts that never count as a user
- * message — the watchdog's own lines and BB/task-tracker fan-outs. */
+/** §5.6 п.4б (r33.11, r34.1): journal request texts that never count as
+ * a user message — the watchdog's own lines, BB/task-tracker fan-outs
+ * and automation pings. */
 const COORD_SYS_PREFIXES = [
   "[orchestrator]",
   "[orchestrator:alert]",
   "[bb system]",
   "[bb message from thread:",
+  "[bb automation",
   TRACKER_COMMENT_PREFIX,
 ] as const;
 
@@ -282,6 +314,9 @@ export interface WatchdogThreads {
     list(args: {
       threadId: string;
       afterSeq?: string;
+      /** §5.6 (r34.1): the journal back-scan's cursor — events strictly
+       * below this seq (SDK `beforeSeq`). */
+      beforeSeq?: string;
       order?: "asc" | "desc";
       limit?: string;
       types?: readonly string[];
@@ -388,6 +423,22 @@ export interface WatchdogDeps {
     environment(threadId: string): Promise<RoundEnvironment | null>;
     git(repo: string, args: string[]): Promise<string>;
   };
+  /**
+   * §5.6 (r34.1): seams of `reconcileUpstreamPass`/`reconcileHistoryOnce`
+   * — bb projects (for `projectRepoPath`), the host id, the release
+   * config and a non-throwing git. Absent → the passes no-op (tests
+   * that never exercise the upstream check need no fakes; the tracker
+   * status check uses `bbCli` and still runs).
+   */
+  upstream?: {
+    projects(): Promise<BbProjectListItem[]>;
+    localHostId(): Promise<string> | string;
+    releaseConfig(): ReleaseConfigLoad;
+    git: UpstreamGit;
+  };
+  /** §5.6 (r34): the work-graph mode — when not `off`, task_queue owns
+   * its tasks and the watchdog only wakes on its intervention states. */
+  workGraphMode?(): string;
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
   /** §18.6: the handoff path for the §16.5 compaction reminder —
    * read lazily so a settings change applies without a reload. */
@@ -3185,49 +3236,80 @@ export function createWatchdog(deps: WatchdogDeps) {
     baseMs * (2 ** Math.min(k, 3) - 1 + Math.max(0, k - 3) * 4);
 
   const coordSeqKey = (id: string) => `coordwd:jseq:${id}`;
-  /** projectId → backlog task keys — the 60 s cache (two CLI calls). */
-  const backlogCache = new Map<string, { at: number; keys: string[] }>();
   let lastCoordDiscovery = 0;
 
   const isCoordinatorThread = (threadId: string) =>
     store.threadRole(threadId)?.role === "orchestrator";
 
+  /** §5.6 п.1 (r34.1): criteria 1–5 — a `client/turn/requested` counts
+   * as the OWNER's turn only when it is unlabeled, has no sender
+   * thread, is not a `tell`, and its text has no system prefix
+   * (`COORD_SYS_PREFIXES`: watchdog nudges, `[bb system]`, thread
+   * tells, automation pings, tracker comment fan-outs). */
+  const isOwnerTurnEvent = (e: WatchdogThreadEvent): boolean => {
+    const d = e.data as
+      | {
+          systemMessageKind?: unknown;
+          senderThreadId?: unknown;
+          source?: unknown;
+        }
+      | null
+      | undefined;
+    const kind = d?.systemMessageKind;
+    if (kind !== undefined && kind !== null && kind !== "unlabeled") {
+      return false;
+    }
+    if (d?.senderThreadId != null || d?.source === "tell") return false;
+    const text = requestText(e);
+    if (COORD_SYS_PREFIXES.some((p) => text.startsWith(p))) return false;
+    return true;
+  };
+
   /**
-   * §5.6 п.4б: a real user/owner message resets the nudge schedule —
-   * the watchdog's own `[orchestrator]` texts, BB `[bb system]` lines,
-   * typed system notices and the task-tracker comment fan-out never
-   * count. The journal cursor rides `plugin_meta`; a request qualifies
-   * only when it is newer than the last nudge (a stale backlog after a
-   * quiet spell must not reset a schedule it predates).
+   * §5.6 (r34.1): the coordinator's LAST owner turn — the journal is
+   * scanned BACKWARDS (≤ EVENT_MAX_PAGES pages of turn requests) to
+   * restore `last_activity_at` for rows created with 0 (lazy rows,
+   * the r34.1 migration reset).
    */
-  const coordinatorSawUserMessage = async (
+  const coordinatorFindLastUserTurn = async (
+    threadId: string,
+  ): Promise<WatchdogThreadEvent | null> => {
+    let before: number | null = null;
+    for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+      const chunk = await deps.threads.events.list({
+        threadId,
+        ...(before != null ? { beforeSeq: String(before) } : {}),
+        order: "desc",
+        limit: "50",
+        types: ["client/turn/requested"],
+      });
+      if (!chunk.length) break;
+      for (const e of chunk) {
+        if (isOwnerTurnEvent(e)) return e;
+      }
+      before = Math.min(...chunk.map((e) => e.seq)) - 1;
+      if (chunk.length < 50) break;
+    }
+    return null;
+  };
+
+  /**
+   * §5.6 (r34.1): ONE forward journal pass from the `coordwd:jseq`
+   * cursor serves both goals — (a) `last_activity_at` tracks the
+   * newest owner turn, (b) an owner turn newer than the last nudge
+   * resets the nudge schedule and closes the idle epoch. System
+   * prefixed lines, thread tells and automation pings never count;
+   * the cursor advances once per pass. Returns the newest owner-turn
+   * timestamp found (0 — none).
+   */
+  const coordinatorScanJournal = async (
     threadId: string,
     lastNudgeAt: number | null,
-  ): Promise<boolean> => {
+  ): Promise<number> => {
     const key = coordSeqKey(threadId);
     let after = Number(store.metaGet(key) ?? 0) || 0;
-    let found = false;
+    let latest = 0;
     try {
-      if (after === 0) {
-        // First pass for this coordinator: anchor at the journal tip —
-        // its whole history is old news, not a fresh message. When the
-        // tip postdates the last nudge a fresh message may hide inside —
-        // then the scan starts at 0 and the `createdAt` guard below
-        // skips the old history event by event.
-        const tip = await deps.threads.events.list({
-          threadId,
-          order: "desc",
-          limit: "1",
-          types: ["client/turn/requested"],
-        });
-        if (
-          tip.length &&
-          (lastNudgeAt == null || tip[0]!.createdAt <= lastNudgeAt)
-        ) {
-          after = tip[0]!.seq;
-          store.metaSet(key, String(after));
-        }
-      }
       for (let page = 0; page < EVENT_MAX_PAGES; page++) {
         const chunk = await deps.threads.events.list({
           threadId,
@@ -3238,25 +3320,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         });
         if (!chunk.length) break;
         for (const e of chunk) {
-          const d = e.data as
-            | {
-                systemMessageKind?: unknown;
-                senderThreadId?: unknown;
-                source?: unknown;
-              }
-            | null
-            | undefined;
-          const kind = d?.systemMessageKind;
-          if (kind !== undefined && kind !== null && kind !== "unlabeled") {
-            continue;
-          }
-          if (d?.senderThreadId != null || d?.source === "tell") {
-            continue;
-          }
-          if (lastNudgeAt != null && e.createdAt <= lastNudgeAt) continue;
-          const text = requestText(e);
-          if (COORD_SYS_PREFIXES.some((p) => text.startsWith(p))) continue;
-          found = true;
+          if (isOwnerTurnEvent(e)) latest = Math.max(latest, e.createdAt);
         }
         after = Math.max(...chunk.map((e) => e.seq));
         store.metaSet(key, String(after));
@@ -3267,81 +3331,338 @@ export function createWatchdog(deps: WatchdogDeps) {
         `orchestrator: coordinator journal ${threadId}: ${message(e)}`,
       );
     }
-    return found;
-  };
-
-  /**
-   * §5.6 п.1в: project backlog — tasks of the tracker projects linked
-   * to the coordinator's bb project in `backlog`/`todo`/`in_progress`.
-   * Two CLI calls per project — cached for COORD_BACKLOG_CACHE_MS.
-   */
-  const coordinatorBacklogKeys = async (
-    projectId: string | null | undefined,
-  ): Promise<string[]> => {
-    if (!projectId) return [];
-    const hit = backlogCache.get(projectId);
-    if (hit && now() - hit.at < COORD_BACKLOG_CACHE_MS) return hit.keys;
-    const keys: string[] = [];
-    try {
-      const res = await runJson<{
-        projects?: { prefix?: string; linkedBbProjectId?: string | null }[];
-      }>(deps.bbCli, ["tasks", "project", "list", "--json"], {
-        timeoutMs: 15_000,
-      });
-      const prefixes = (res.projects ?? [])
-        .filter((p) => p.linkedBbProjectId === projectId && p.prefix)
-        .map((p) => p.prefix as string);
-      for (const prefix of prefixes) {
-        const list = await runJson<{ tasks?: { key?: string }[] }>(
-          deps.bbCli,
-          [
-            "tasks",
-            "list",
-            "--project",
-            prefix,
-            "--status",
-            "backlog,todo,in_progress",
-            "--limit",
-            "50",
-            "--json",
-          ],
-          { timeoutMs: 15_000 },
-        );
-        for (const task of list.tasks ?? []) {
-          if (task.key) keys.push(task.key);
+    if (latest > 0) {
+      const w = store.coordinatorWatchdogGet(threadId);
+      if (w) {
+        const patch: { last_activity_at: number } = {
+          last_activity_at: Math.max(w.last_activity_at, latest),
+        };
+        store.coordinatorWatchdogPatch(threadId, patch);
+        if (lastNudgeAt != null && latest > lastNudgeAt) {
+          // §5.6 п.4б: a real owner message newer than the last nudge
+          // resets the schedule and closes the open epoch.
+          store.coordinatorWatchdogReset(threadId);
         }
       }
-    } catch (e) {
-      log.warn?.(`orchestrator: backlog check ${projectId}: ${message(e)}`);
-      return hit?.keys ?? [];
     }
-    backlogCache.set(projectId, { at: now(), keys });
-    return keys;
+    return latest;
+  };
+
+  // ── §5.6 (r34.1): upstream/tracker reconcile (60 s, off-queue) ─────
+
+  /**
+   * Tracker statuses of pending tasks — `done`/`canceled` tasks drop
+   * out of the watchdog's pending set for TRACKER_CACHE_TTL_MS.
+   * Stale-on-error: a failed `bb tasks show` keeps the previous answer
+   * (TTL refreshed), so a tracker outage never re-arms nudges.
+   */
+  const trackerTaskStatusCache = new Map<
+    string,
+    { status: string; at: number }
+  >();
+  /** §5.6 (r34.1): nudges wait for the FIRST reconcileUpstreamPass
+   * attempt (error or success) — a cold start must not fire reminders
+   * for tasks the tracker already closed. */
+  let trackerCacheWarmedUp = false;
+
+  const trackerTaskClosed = (taskKey: string): boolean => {
+    const hit = trackerTaskStatusCache.get(taskKey);
+    if (!hit || now() - hit.at > TRACKER_CACHE_TTL_MS) return false;
+    return hit.status === "done" || hit.status === "canceled";
+  };
+
+  /** `bb tasks show <key> --json` → the task's tracker status. */
+  const trackerTaskStatus = async (
+    taskKey: string,
+  ): Promise<string | null> => {
+    const res = await deps.bbCli.run(
+      ["tasks", "show", taskKey, "--json"],
+      { timeoutMs: 15_000 },
+    );
+    if (res.exitCode !== 0) {
+      throw new Error(
+        `bb tasks show ${taskKey}: exit ${res.exitCode} ` +
+          (res.stderr || res.stdout).slice(0, 200),
+      );
+    }
+    try {
+      const parsed = JSON.parse(res.stdout) as {
+        task?: { status?: string };
+        status?: string;
+      };
+      return parsed.task?.status ?? parsed.status ?? null;
+    } catch {
+      return null;
+    }
   };
 
   /**
-   * §5.6: the coordinator pass — runs inside `checkTimers`. Per
-   * orchestrator thread: no running executors (sleeping is then the
-   * contract), pending own delegations or project backlog under the
-   * `maxActive` cap → nudges at cumulative N/3N/7N of quiet idle,
-   * escalation to the parent thread (or a push for a root chat) at 11N.
+   * §5.6 (r34.1): one repository's upstream check — fetch the target
+   * once, then for every pending `done` row decide `merged-upstream`
+   * by ancestor or merge-tree equivalence (squash). Everything runs
+   * under a shared 15 s budget; any failure just defers the row to
+   * the next pass.
+   */
+  const reconcileRepoUpstream = async (
+    rows: DelegationRow[],
+    projectId: string | null,
+    history: boolean,
+  ): Promise<{ fetchFailed: boolean }> => {
+    if (!deps.upstream || !projectId || !rows.length) {
+      return { fetchFailed: false };
+    }
+    const u = deps.upstream;
+    try {
+      const projects = await u.projects();
+      const localHost = String((await u.localHostId()) ?? "");
+      const repo = projectRepoPath(projects, projectId, localHost, localHost);
+      if (!repo) return { fetchFailed: false };
+      const cfg = u.releaseConfig();
+      if (!cfg.config) return { fetchFailed: false };
+      let target = "main";
+      try {
+        const pid = await settingsProjectId(
+          {
+            cmd: {
+              run: (name: string, args: string[], opts?: { timeoutMs?: number }) =>
+                name === "git" && args[0] === "-C"
+                  ? u.git(args[1]!, args.slice(2), {
+                      timeoutMs: opts?.timeoutMs,
+                    }).then((r) => ({
+                      exitCode: r.exitCode,
+                      stdout: r.stdout,
+                      stderr: r.stderr,
+                      signal: null,
+                    }))
+                  : Promise.reject(new Error(`unexpected command ${name}`)),
+            } as never,
+            bbCli: deps.bbCli,
+            localHostId: u.localHostId,
+            t: deps.t ?? T_RU,
+          },
+          repo,
+          projectId,
+          cfg.config,
+        );
+        target =
+          resolveProject(cfg.config, pid)?.target?.branch ?? "main";
+      } catch {
+        // settings project unresolved / ambiguous — the whole project
+        // is skipped this pass (spec: «проект пропускается»).
+        return { fetchFailed: false };
+      }
+      const git = budgetGit(u.git);
+      const fetchRes = await fetchTargetBranch(git, repo, target, {
+        timeoutMs: 15_000,
+      });
+      if (fetchRes.exitCode !== 0) {
+        return { fetchFailed: true };
+      }
+      for (const row of rows) {
+        try {
+          if (row.status !== "done" || !row.result_sha) continue;
+          if (!(await shaObjectExists(git, repo, row.result_sha))) {
+            continue;
+          }
+          const c = await upstreamContains(
+            git,
+            repo,
+            target,
+            row.result_sha,
+          );
+          if (!c.merged) continue;
+          store.markMergedUpstream(
+            row.id,
+            row.result_sha,
+            `origin/${target}`,
+            upstreamMergedSha(undefined, row.result_sha, c),
+          );
+        } catch (e) {
+          log.warn?.(
+            `orchestrator: upstream check ${row.task_key}: ${message(e)}`,
+          );
+        }
+      }
+      return { fetchFailed: false };
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: upstream pass ${projectId}: ${message(e)}`,
+      );
+      return { fetchFailed: false };
+    }
+  };
+
+  let upstreamRunning = false;
+  /**
+   * §5.6 (r34.1): the 60 s fact check — OFF the `enqueue` queue,
+   * single-flight. For every pending delegation of every coordinator
+   * (criteria (a)+(b), `finished_at >= installed_at`): the tracker's
+   * task status is refreshed into `trackerTaskStatusCache`, and `done`
+   * rows with commits get the `merged-upstream` mark when their
+   * `result_sha` is already on `origin/<targetBranch>` (ancestor or
+   * squash-equal). The 5 s tick never does network/git itself.
+   */
+  const reconcileUpstreamPass = async (): Promise<void> => {
+    if (upstreamRunning) return;
+    upstreamRunning = true;
+    try {
+      const installedAt =
+        Number(store.metaGet(META_INSTALLED_AT) ?? 0) || 0;
+      const byProject = new Map<string | null, DelegationRow[]>();
+      const seen = new Set<number>();
+      for (const threadId of store.orchestratorThreadIds()) {
+        for (const row of store.coordinatorPendingDelegations(
+          threadId,
+          installedAt,
+        )) {
+          if (seen.has(row.id)) continue;
+          seen.add(row.id);
+          // 1) tracker status — every pending task is checked.
+          try {
+            const status = await trackerTaskStatus(row.task_key);
+            if (status != null) {
+              trackerTaskStatusCache.set(row.task_key, {
+                status,
+                at: now(),
+              });
+            }
+          } catch (e) {
+            const hit = trackerTaskStatusCache.get(row.task_key);
+            if (hit) hit.at = now();
+            log.warn?.(
+              `orchestrator: tracker check ${row.task_key}: ${message(e)}`,
+            );
+          }
+          if (trackerTaskClosed(row.task_key)) continue;
+          // 2) git upstream check — `done` rows with commits only.
+          if (
+            row.status === "done" &&
+            row.result_sha &&
+            (row.result_commits ?? 0) > 0
+          ) {
+            const list = byProject.get(row.project_id) ?? [];
+            list.push(row);
+            byProject.set(row.project_id, list);
+          }
+        }
+      }
+      for (const [projectId, rows] of byProject) {
+        await reconcileRepoUpstream(rows, projectId, false);
+      }
+    } catch (e) {
+      log.warn?.(`orchestrator: upstream pass: ${message(e)}`);
+    } finally {
+      upstreamRunning = false;
+      // Warm-up completes on the FIRST attempt — even a failed one —
+      // so nudges never wait on a dead tracker (stale-on-error).
+      trackerCacheWarmedUp = true;
+    }
+  };
+
+  /**
+   * §5.6 п.9 (r34.1): the one-time historical sweep at plugin start —
+   * `done` rows with commits get `merged-upstream` marks WITHOUT the
+   * `finished_at` epoch filter so `bb orchestrator status` stops
+   * showing old tasks as unmerged. Runs once per install: the
+   * `coordinator_history_reconciled_at` mark is written only after a
+   * pass where no repository's `git fetch` failed.
+   */
+  const reconcileHistoryOnce = async (): Promise<void> => {
+    if (store.metaGet(META_HISTORY_RECONCILED)) return;
+    if (!deps.upstream) {
+      store.metaSet(META_HISTORY_RECONCILED, String(now()));
+      return;
+    }
+    const byProject = new Map<string | null, DelegationRow[]>();
+    for (const row of store.doneDelegationsForReconcile()) {
+      const list = byProject.get(row.project_id) ?? [];
+      list.push(row);
+      byProject.set(row.project_id, list);
+    }
+    let fetchFailed = false;
+    for (const [projectId, rows] of byProject) {
+      const r = await reconcileRepoUpstream(rows, projectId, true);
+      fetchFailed = fetchFailed || r.fetchFailed;
+    }
+    if (!fetchFailed) {
+      store.metaSet(META_HISTORY_RECONCILED, String(now()));
+    }
+  };
+
+  /**
+   * §5.6 (r33.11 + r34.1): the coordinator pass — runs inside
+   * `checkTimers`, reads only SQLite + memory (network/git live in the
+   * 60 s `reconcileUpstreamPass`). Per orchestrator thread: archived/
+   * deleted threads are ignored; pending own delegations finished
+   * after `coordinator_watchdog_installed_at` (minus tracker-closed
+   * tasks) or graph intervention states → journal maintenance
+   * (`last_activity_at` back-scan + forward scan) → a thread quiet
+   * longer than `coordinatorMaxThreadAgeHours` is never woken →
+   * nudges at cumulative N/3N/7N of quiet idle, escalation to the
+   * parent thread (or a push for a root chat) at 11N. Until the
+   * tracker cache has warmed up, no nudges leave at all.
    */
   const coordinatorPass = async (nowMs: number) => {
     const { policy } = await deps.loadPolicy();
     const tm = policy?.timing;
-    if (tm?.coordinatorWatchdogEnabled === false) return;
+    // §5.6 (r34.1): the watchdog never acts on history — the epoch
+    // `coordinator_watchdog_installed_at` is (re)stamped whenever the
+    // setting flips off→on, on a live tick (no restart needed).
+    const enabled = tm?.coordinatorWatchdogEnabled !== false;
+    const enabledLast = store.metaGet(META_ENABLED_LAST);
+    if (!enabled) {
+      if (enabledLast !== "false") {
+        store.metaSet(META_ENABLED_LAST, "false");
+      }
+      return;
+    }
+    if (enabledLast !== "true") {
+      store.metaSet(META_INSTALLED_AT, String(nowMs));
+      store.metaSet(META_ENABLED_LAST, "true");
+    }
+    const installedAt =
+      Number(store.metaGet(META_INSTALLED_AT) ?? 0) || 0;
     const baseMs =
       (tm?.coordinatorIdleMinutes ?? DEFAULT_COORDINATOR_IDLE_MINUTES) *
       60_000;
     const maxNudges =
       tm?.coordinatorMaxNudges ?? DEFAULT_COORDINATOR_MAX_NUDGES;
+    const maxAgeMs =
+      (tm?.coordinatorMaxThreadAgeHours ??
+        DEFAULT_COORDINATOR_MAX_THREAD_AGE_HOURS) * 3_600_000;
+    const graphOn =
+      (deps.workGraphMode?.() ?? "off") !== "off";
     const fullDiscovery = nowMs - lastCoordDiscovery >= COORD_DISCOVERY_MS;
     if (fullDiscovery) lastCoordDiscovery = nowMs;
+    let backScans = 0;
 
     for (const threadId of store.orchestratorThreadIds()) {
       try {
         let w = store.coordinatorWatchdogGet(threadId);
-        const pending = store.coordinatorPendingTasks(threadId);
+        // Cheap filter first: pending deals minus tracker-closed tasks;
+        // with the graph on, queued tasks are driven by run-queue and
+        // only its intervention states wake the coordinator (§5.6 r34).
+        const queuedKeys = graphOn
+          ? store.taskQueueKeys(threadId)
+          : new Set<string>();
+        const pending = store
+          .coordinatorPendingTasks(threadId, installedAt)
+          .filter(
+            (p) =>
+              !queuedKeys.has(p.task_key) &&
+              !trackerTaskClosed(p.task_key),
+          );
+        const taskList = pending.map((p) => p.task_key);
+        if (graphOn) {
+          for (const key of store.taskQueueWatchKeys(threadId)) {
+            if (
+              !trackerTaskClosed(key) &&
+              !taskList.includes(key)
+            ) {
+              taskList.push(key);
+            }
+          }
+        }
         // §5.6 п.1: working executors make sleeping the contract — the
         // idle anchor restarts at the last executor's completion.
         if (store.hasActiveForCoordinator(threadId)) {
@@ -3350,12 +3671,15 @@ export function createWatchdog(deps: WatchdogDeps) {
           }
           continue;
         }
-        if (!w && !pending.length && !fullDiscovery) continue;
+        if (!w && !taskList.length && !fullDiscovery) continue;
         const thread = await getThread(threadId);
-        if (!thread) {
+        if (!thread || thread.deletedAt != null) {
+          // §5.6 (r34.1): deleted and gone threads leave no watch row.
           store.coordinatorWatchdogDelete(threadId);
           continue;
         }
+        // §5.6 (r34.1): archived threads are ignored unconditionally.
+        if (thread.archivedAt != null) continue;
         if (thread.status === "active") {
           // An active turn ends the quiet epoch — but a nudge-woken
           // turn must not move the anchor: the cumulative N/3N/7N/11N
@@ -3364,25 +3688,6 @@ export function createWatchdog(deps: WatchdogDeps) {
             store.coordinatorWatchdogPatch(threadId, { idle_since: null });
           }
           continue;
-        }
-        // §5.6 п.4б: a fresh user/owner message resets the schedule.
-        if (w && (w.nudge_count > 0 || w.escalated_at != null)) {
-          if (await coordinatorSawUserMessage(threadId, w.last_nudge_at)) {
-            store.coordinatorWatchdogReset(threadId);
-            continue;
-          }
-        }
-        const taskList = pending.map((p) => p.task_key);
-        // §5.6 п.1в: the backlog counts only under the maxActive cap.
-        const maxActive = policy?.limits?.maxActive;
-        const active =
-          store.activeCount() + store.helperActiveCount();
-        if (maxActive === undefined || active < maxActive) {
-          for (const key of await coordinatorBacklogKeys(
-            thread.projectId,
-          )) {
-            if (!taskList.includes(key)) taskList.push(key);
-          }
         }
         if (!taskList.length) {
           // §5.6 п.4в: every deal is settled — the schedule resets and
@@ -3398,6 +3703,55 @@ export function createWatchdog(deps: WatchdogDeps) {
           continue;
         }
         if (!w) w = store.coordinatorWatchdogEnsure(threadId);
+        // §5.6 (r34.1): journal maintenance runs only after the cheap
+        // filters (role, live thread, idle, pending work, no running
+        // executors) — then before the inactivity gate.
+        if (w.last_activity_at === 0) {
+          if (backScans >= COORD_BACKSCAN_PER_TICK) continue;
+          backScans++;
+          const turn = await coordinatorFindLastUserTurn(threadId);
+          // No owner turn inside 100 pages → the thread's creation
+          // time stands as its last activity.
+          const activity = turn?.createdAt ?? thread.createdAt ?? nowMs;
+          store.coordinatorWatchdogPatch(threadId, {
+            last_activity_at: activity,
+          });
+          // The forward-scan cursor starts at the found turn (or the
+          // journal tip when there was none) — history is not
+          // replayed on every tick.
+          const cursor = turn
+            ? turn.seq
+            : Number(
+                (
+                  await deps.threads.events
+                    .list({
+                      threadId,
+                      order: "desc",
+                      limit: "1",
+                      types: ["client/turn/requested"],
+                    })
+                    .catch(() => [])
+                )[0]?.seq ?? 0,
+              );
+          store.metaSet(coordSeqKey(threadId), String(cursor));
+          w = store.coordinatorWatchdogGet(threadId)!;
+        }
+        // One forward pass — refreshes last_activity_at AND resets the
+        // nudge schedule on an owner turn newer than the last nudge.
+        await coordinatorScanJournal(threadId, w.last_nudge_at);
+        w = store.coordinatorWatchdogGet(threadId)!;
+        // §5.6 (r34.1): the inactivity gate — a thread with no owner
+        // turn or productive action longer than the limit is a dead
+        // thread: no nudges, no escalation, ever.
+        if (
+          w.last_activity_at !== 0 &&
+          nowMs - w.last_activity_at > maxAgeMs
+        ) {
+          continue;
+        }
+        // §5.6 (r34.1): nudges wait for the tracker cache warm-up —
+        // otherwise stale closed tasks would fire false reminders.
+        if (!trackerCacheWarmedUp) continue;
         if (w.idle_since == null) {
           store.coordinatorWatchdogPatch(threadId, { idle_since: nowMs });
           continue;
@@ -3504,13 +3858,21 @@ export function createWatchdog(deps: WatchdogDeps) {
   };
 
   /**
-   * §5.6 п.4а: a plugin tool/CLI call from a coordinator is productive
-   * — the nudge schedule (and the post-escalation wait) resets. Called
-   * synchronously by tool `execute` and the CLI `run` — a pure store
-   * write, safe inside or outside `enqueue`.
+   * §5.6 п.4а (r34.1): a plugin tool/CLI call from a coordinator is a
+   * productive action — it unconditionally refreshes
+   * `last_activity_at` (this is what makes a still-working
+   * coordinator younger than the 24 h inactivity gate) and resets
+   * the nudge schedule. Called synchronously by tool `execute` and
+   * the CLI `run` — a pure store write, safe inside or outside
+   * `enqueue`. `reconcile`, `status`, `policy`, reminders and
+   * `bb thread tell` never call this.
    */
   const markCoordinatorAction = (threadId: string | undefined | null) => {
     if (!threadId || !isCoordinatorThread(threadId)) return;
+    store.coordinatorWatchdogEnsure(threadId);
+    store.coordinatorWatchdogPatch(threadId, {
+      last_activity_at: now(),
+    });
     const w = store.coordinatorWatchdogGet(threadId);
     if (
       w &&
@@ -4286,6 +4648,13 @@ export function createWatchdog(deps: WatchdogDeps) {
     ) => deps.enqueue(() => onThreadGone(thread, reason)),
     checkTimers: () => deps.enqueue(() => checkTimers()),
     reconcile: () => deps.enqueue(() => reconcile()),
+    /** §5.6 (r34.1): the 60 s tracker/git fact-check — OFF `enqueue`
+     * on purpose: it runs network + git I/O and must not serialise
+     * against dispatch/finalize. Single-flight internally. */
+    reconcileUpstream: () => reconcileUpstreamPass(),
+    /** §5.6 п.9 (r34.1): the one-time post-deploy historical sweep —
+     * runs once, marks `coordinator_history_reconciled_at`. */
+    reconcileHistory: () => reconcileHistoryOnce(),
     /** §5.6 п.4а: a coordinator's productive plugin call — resets the
      * nudge schedule. Synchronous on purpose: callers inside `enqueue`
      * (delegate/merge) must not re-enter it. */

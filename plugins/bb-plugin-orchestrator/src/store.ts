@@ -427,6 +427,20 @@ export const MIGRATIONS: readonly string[] = [
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_key, created_at)`,
+  // §5.6 (r34.1, PLUG-317): the coordinator watchdog must not act on
+  // history — `finished_at` marks when a delegation went terminal (the
+  // migration backfills it from `updated_at` for terminal rows only),
+  // and `last_activity_at` records the coordinator's last owner turn or
+  // productive action (0 = not yet resolved). The watchdog state table
+  // is reset on upgrade: rows are lazily recreated on the next
+  // coordinatorPass and `last_activity_at` is restored via the journal
+  // back-scan (coordinatorFindLastUserTurn).
+  `ALTER TABLE delegations ADD COLUMN finished_at INTEGER DEFAULT NULL;
+   UPDATE delegations SET finished_at = updated_at
+     WHERE status IN ('done','failed','stalled','quota','cancelled')
+       AND finished_at IS NULL;
+   ALTER TABLE coordinator_watchdog_state ADD COLUMN last_activity_at INTEGER NOT NULL DEFAULT 0;
+   DELETE FROM coordinator_watchdog_state`,
 ];
 
 export type CommandRunStatus =
@@ -557,6 +571,11 @@ export interface DelegationRow {
    * (`{"paths":string[],"from":string|null}`) — `--attach` files and the
    * explicit `--from` ref, inherited by reissues. */
   attach: string | null;
+  /** §5.6 (r34.1): immutable timestamp of the terminal transition
+   * (done/failed/stalled/quota/cancelled); NULL on revive to `running`.
+   * The coordinator watchdog ignores rows finished before
+   * `coordinator_watchdog_installed_at`. */
+  finished_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -652,6 +671,11 @@ export interface CoordinatorWatchdogRow {
   last_nudge_at: number | null;
   /** Owner escalation time — afterwards the watchdog waits silently. */
   escalated_at: number | null;
+  /** §5.6 (r34.1): last owner turn or productive action of the
+   * coordinator (0 = not resolved yet — the watchdog restores it via a
+   * journal back-scan). A thread quiet longer than
+   * `coordinatorMaxThreadAgeHours` is never woken. */
+  last_activity_at: number;
   updated_at: number;
 }
 
@@ -999,9 +1023,14 @@ export class DelegationStore {
       const at = Date.now();
       this.db
         .prepare(
-          `UPDATE delegations SET status = ?, updated_at = ? WHERE id = ?`,
+          `UPDATE delegations SET status = ?, updated_at = ?,
+           finished_at = CASE
+             WHEN ? IN ('done','failed','stalled','quota','cancelled') THEN ?
+             WHEN ? = 'running' THEN NULL
+             ELSE finished_at END
+           WHERE id = ?`,
         )
-        .run(status, at, id);
+        .run(status, at, status, at, status, id);
       const row = this.get(id);
       if (row) this.emitDelegationTransition(row, status, at);
     })();
@@ -1027,10 +1056,14 @@ export class DelegationStore {
       const at = Date.now();
       const info = this.db
         .prepare(
-          `UPDATE delegations SET status = ?, updated_at = ?
+          `UPDATE delegations SET status = ?, updated_at = ?,
+           finished_at = CASE
+             WHEN ? IN ('done','failed','stalled','quota','cancelled') THEN ?
+             WHEN ? = 'running' THEN NULL
+             ELSE finished_at END
            WHERE id = ? AND status = ?`,
         )
-        .run(to, at, id, from);
+        .run(to, at, to, at, to, id, from);
       if (info.changes === 0) return false;
       const row = this.get(id);
       if (row) this.emitDelegationTransition(row, to, at, opts);
@@ -1239,7 +1272,8 @@ export class DelegationStore {
           `UPDATE delegations SET status = 'running',
            revived_count = revived_count + 1,
            result_notified_at = NULL, result_notice = NULL,
-           first_response_at = NULL, last_response_at = NULL, updated_at = ?
+           first_response_at = NULL, last_response_at = NULL,
+           finished_at = NULL, updated_at = ?
            WHERE id = ?`,
         )
         .run(Date.now(), id);
@@ -1929,6 +1963,7 @@ export class DelegationStore {
       nudge_count?: number;
       last_nudge_at?: number | null;
       escalated_at?: number | null;
+      last_activity_at?: number;
     },
   ): void {
     const sets: string[] = [];
@@ -1938,6 +1973,7 @@ export class DelegationStore {
       "nudge_count",
       "last_nudge_at",
       "escalated_at",
+      "last_activity_at",
     ] as const) {
       if (key in patch) {
         sets.push(`${key} = ?`);
@@ -1956,13 +1992,16 @@ export class DelegationStore {
   }
 
   /** §5.6 п.4: a productive action or cleared queue — the schedule,
-   * the escalation wait and the idle anchor all restart from zero. */
+   * the escalation wait and the idle anchor all restart from zero, and
+   * `last_activity_at` is unconditionally refreshed (a reset trigger
+   * IS coordinator activity). */
   coordinatorWatchdogReset(coordinatorThreadId: string): void {
     this.coordinatorWatchdogPatch(coordinatorThreadId, {
       idle_since: null,
       nudge_count: 0,
       last_nudge_at: null,
       escalated_at: null,
+      last_activity_at: Date.now(),
     });
   }
 
@@ -1982,13 +2021,13 @@ export class DelegationStore {
    * `failed`/`stalled`/`quota` without a later round. Rows whose staged
    * feature the owner explicitly dropped (`--force-drop-unmerged`) are
    * settled and skipped.
+   * §5.6 (r34.1): only rows finished at or after `installedAt`
+   * (`coordinator_watchdog_installed_at`) count — history before the
+   * watchdog's epoch never enters the pending list; `merged`/
+   * `merged-upstream` rows never qualify (the merge_status filters).
    */
-  coordinatorPendingTasks(
-    coordinatorThreadId: string,
-  ): { task_key: string; status: string; updated_at: number }[] {
-    return this.db
-      .prepare(
-        `SELECT d.task_key, d.status, d.updated_at FROM delegations d
+  private coordinatorPendingSelect(columns: string): string {
+    return `SELECT ${columns} FROM delegations d
          WHERE d.coordinator_thread_id = ?
            AND d.id = (
              SELECT MAX(id) FROM delegations WHERE task_key = d.task_key
@@ -2000,6 +2039,7 @@ export class DelegationStore {
              ) AND NOT (d.no_code = 1 AND COALESCE(d.result_commits, 0) = 0))
              OR d.status IN ('failed', 'stalled', 'quota')
            )
+           AND d.finished_at >= ?
            AND d.task_key NOT IN (
              SELECT task_key FROM plugin_staged_features
              WHERE status = 'dropped'
@@ -2008,13 +2048,102 @@ export class DelegationStore {
              SELECT task_key FROM releases
              WHERE status IN ('auditing', 'publishing', 'published')
            )
-         ORDER BY d.updated_at`,
+         ORDER BY d.updated_at`;
+  }
+
+  coordinatorPendingTasks(
+    coordinatorThreadId: string,
+    installedAt = 0,
+  ): { task_key: string; status: string; updated_at: number }[] {
+    return this.db
+      .prepare(
+        this.coordinatorPendingSelect("d.task_key, d.status, d.updated_at"),
       )
-      .all(coordinatorThreadId) as {
+      .all(coordinatorThreadId, installedAt) as {
       task_key: string;
       status: string;
       updated_at: number;
     }[];
+  }
+
+  /** §5.6 (r34.1): the same pending set as full rows — the 60 s
+   * `reconcileUpstreamPass` reads result_sha/commits/project from them. */
+  coordinatorPendingDelegations(
+    coordinatorThreadId: string,
+    installedAt = 0,
+  ): DelegationRow[] {
+    return this.db
+      .prepare(this.coordinatorPendingSelect("d.*"))
+      .all(coordinatorThreadId, installedAt) as DelegationRow[];
+  }
+
+  /** §5.6 п.9 (r34.1): `reconcileHistoryOnce` — every `done` row with a
+   * recorded result and no landed merge status, WITHOUT the
+   * `finished_at` epoch filter: historical rows get their
+   * `merged-upstream` mark here once, so `bb orchestrator status`
+   * stops showing them as unmerged. */
+  doneDelegationsForReconcile(): DelegationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM delegations
+         WHERE status = 'done'
+           AND result_sha IS NOT NULL
+           AND COALESCE(result_commits, 0) > 0
+           AND (merge_status IS NULL
+             OR merge_status IN ('conflict', 'failed'))
+         ORDER BY id`,
+      )
+      .all() as DelegationRow[];
+  }
+
+  /**
+   * §5.6 (r34.1): the upstream-merge mark — atomic on purpose: the
+   * WHERE still requires the same `result_sha` and an unmerged status,
+   * so a fresh round or a local `merge` landing between the check and
+   * the write can never be overwritten.
+   */
+  markMergedUpstream(
+    id: number,
+    resultSha: string,
+    mergedInto: string,
+    upstreamSha: string,
+  ): boolean {
+    const now = Date.now();
+    const info = this.db
+      .prepare(
+        `UPDATE delegations SET merge_status = 'merged-upstream',
+         merged_into = ?, merged_sha = ?, merged_at = ?, updated_at = ?
+         WHERE id = ? AND status = 'done' AND result_sha = ?
+           AND (merge_status IS NULL
+             OR merge_status IN ('conflict', 'failed'))`,
+      )
+      .run(mergedInto, upstreamSha, now, now, id, resultSha);
+    return info.changes > 0;
+  }
+
+  /** §5.6 (r34): with the work graph on, task_queue owns its tasks —
+   * the watchdog wakes the coordinator only for these queue states. */
+  taskQueueWatchKeys(coordinatorThreadId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT task_key AS k FROM task_queue
+         WHERE coordinator_thread_id = ?
+           AND status IN ('blocked', 'stalled', 'waiting_release_note')`,
+      )
+      .all(coordinatorThreadId) as { k: string }[];
+    return rows.map((r) => r.k);
+  }
+
+  /** §5.6 (r34): keys registered in the task queue — excluded from the
+   * delegation-based pending set while the graph drives them. */
+  taskQueueKeys(coordinatorThreadId: string): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT task_key AS k FROM task_queue
+         WHERE coordinator_thread_id = ?`,
+      )
+      .all(coordinatorThreadId) as { k: string }[];
+    return new Set(rows.map((r) => r.k));
   }
 
   /** §5.6 п.1: the coordinator still owns a working executor — while it

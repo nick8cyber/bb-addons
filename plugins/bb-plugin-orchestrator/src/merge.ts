@@ -49,6 +49,22 @@ import { OrchestratorError } from "./errors.js";
 import { T_RU, type T } from "./i18n/index.js";
 import { runChecked, type BbCli } from "./bb-cli.js";
 import type { DelegationRow, DelegationStore } from "./store.js";
+import {
+  projectRepoPath,
+  type BbProjectListItem,
+} from "./delegate-base.js";
+import type { ReleaseConfigLoad } from "./release-config.js";
+import { resolveProject } from "./release-config.js";
+import {
+  fetchTargetBranch,
+  isAncestor,
+  mergeTreeEqualsRef,
+  shaObjectExists,
+  upstreamContains,
+  upstreamMergedSha,
+  type GitResult,
+  type UpstreamGit,
+} from "./upstream.js";
 
 /**
  * §14 check 3 — protected branches refuse `merge` (code goes out through
@@ -84,6 +100,13 @@ export interface MergeParams {
   into?: string;
   noAutofix?: boolean;
   dryRun?: boolean;
+  /** §14 `--mark-merged [sha]` (r34.1): mark the round merged in
+   * upstream WITHOUT touching the coordinator copy — for external
+   * PR/squash/rebase merges. `true` = verify `result_sha` on
+   * `origin/<targetBranch>` (ancestor or merge-tree equal); a string
+   * is the explicit upstream commit (must itself be on the target AND
+   * contain the executor's changes). */
+  markMerged?: boolean | string;
   /** The calling thread — §25 (r33.4): must carry the orchestrator role
    * (`callerIsCoordinator`), not necessarily be the delegation's author. */
   callerThreadId: string;
@@ -140,6 +163,21 @@ export interface MergeDeps {
   protectedBranches?: readonly string[];
   /** §16.6 `mergeAutofix` setting — off by default (report only). */
   mergeAutofix?: () => boolean;
+  /** §14 `--mark-merged` (r34.1): upstream-verification seams — bb
+   * projects (for `projectRepoPath`), the host id, the release
+   * config, and the settings-project resolver (defaults to the real
+   * `settingsProjectId` against `deps.git`/`deps.bbCli`). Absent →
+   * `--mark-merged` refuses `no-repo`. */
+  upstream?: {
+    projects(): Promise<BbProjectListItem[]>;
+    localHostId(): Promise<string> | string;
+    releaseConfig(): ReleaseConfigLoad;
+    settingsProjectId?(
+      repo: string,
+      delegationProjectId: string | null,
+      config: unknown,
+    ): Promise<string>;
+  };
   /** §16.6 `threadIds` of the project's release config: `false` → the
    * merge message drops the task key (`merge r<N> (<sha7>)`). Default
    * on when unset. §6 (r7): the settings project is resolved by the
@@ -170,7 +208,7 @@ export interface MergeOutcome {
   taskKey: string;
   round: number;
   into: string;
-  mergeStatus: "merged" | "conflict" | "fix-delegated";
+  mergeStatus: "merged" | "conflict" | "fix-delegated" | "merged-upstream";
   mergedSha?: string;
   conflictFiles?: string[];
   fixDelegationId?: number;
@@ -187,9 +225,15 @@ type Git = MergeGit;
  * §14 check 1 + repeat calls, as a reusable unit: they run before the
  * copy lock AND again under it — the row may have changed while the
  * call waited (`merged`/`fix-delegated` are terminal for `merge`; the
- * fix round's own row is what gets merged next).
+ * fix round's own row is what gets merged next). `--mark-merged`
+ * (r34.1) runs the same row checks minus `result_dirty` — the
+ * coordinator copy is not touched (spec: проверки 0 и 1).
  */
-function assertMergeableRow(row: DelegationRow, t: T): string {
+function assertMergeableRow(
+  row: DelegationRow,
+  t: T,
+  opts?: { skipDirty?: boolean },
+): string {
   if (row.status !== "done") {
     throw new OrchestratorError(
       "not-done",
@@ -212,14 +256,16 @@ function assertMergeableRow(row: DelegationRow, t: T): string {
       "the watchdog could not read the executor worktree — check setup_errors in `bb orchestrator show`",
     );
   }
-  if (row.result_dirty === 1) {
+  if (row.result_dirty === 1 && !opts?.skipDirty) {
     throw new OrchestratorError(
       "dirty-result",
       t("mg.dirtyResult"),
       t("mg.dirtyResultHint"),
     );
   }
-  if (row.merge_status === "merged") {
+  // §14 (r34.1): 'merged' (local) and 'merged-upstream' (external
+  // landing) both refuse — the work is already in its target.
+  if (row.merge_status === "merged" || row.merge_status === "merged-upstream") {
     throw new OrchestratorError(
       "already-merged",
       t("mg.alreadyMerged", {
@@ -237,6 +283,138 @@ function assertMergeableRow(row: DelegationRow, t: T): string {
     );
   }
   return row.result_sha;
+}
+
+/**
+ * §14 `--mark-merged [sha]` (r34.1): the work is already in
+ * `origin/<targetBranch>` — via a manual merge, a PR, a squash or a
+ * rebase — so the row only needs the `merged-upstream` mark; the
+ * coordinator copy is never touched.
+ *
+ * Resolution: `repoRoot = projectRepoPath(projects, projectId,
+ * localHost, localHost)` → `no-repo`; missing release config →
+ * `no-repo`; `settingsProjectId` → `resolveProject(...).target.branch`
+ * (`main` fallback); `git fetch origin <targetBranch>`; then
+ * М1: `sha` must be an ancestor of `origin/<target>` (explicit sha) or
+ * `result_sha` ancestor/tree-equal (`upstreamContains`, no sha) →
+ * `not-on-upstream`; М2 (explicit sha): `result_sha` is an ancestor of
+ * `sha` OR `merge-tree --write-tree <sha> <result_sha>` produces
+ * exactly `<sha>^{tree}` → `unrelated-sha`. Success writes
+ * `merged-upstream`/`origin/<target>`/`merged_sha`/`merged_at` through
+ * `markMergedUpstream` (atomic — a local merge landing meanwhile wins).
+ */
+async function runMarkMerged(
+  row: DelegationRow,
+  markMerged: boolean | string,
+  deps: MergeDeps,
+  t: T,
+): Promise<MergeOutcome> {
+  const explicitSha = typeof markMerged === "string" ? markMerged : undefined;
+  // Check 1 minus `result_dirty` — the coordinator copy is not touched.
+  const resultSha = assertMergeableRow(row, t, { skipDirty: true });
+  const u = deps.upstream;
+  const noRepo = (detail: string) =>
+    new OrchestratorError("no-repo", `no-repo: ${detail}`);
+  if (!u) {
+    throw noRepo(t("mg.noUpstreamSeam"));
+  }
+  const projects = await u.projects();
+  const localHost = String((await u.localHostId()) ?? "");
+  const repo = projectRepoPath(
+    projects,
+    row.project_id ?? "",
+    localHost,
+    localHost,
+  );
+  if (!repo) {
+    throw noRepo(t("mg.noRepoPath"));
+  }
+  const config = u.releaseConfig().config;
+  if (!config) {
+    throw noRepo(t("mg.noReleaseConfig"));
+  }
+  let pid: string;
+  try {
+    pid = u.settingsProjectId
+      ? await u.settingsProjectId(repo, row.project_id, config)
+      : row.project_id ?? "";
+  } catch {
+    throw noRepo(t("mg.settingsProjectUnknown"));
+  }
+  const target = resolveProject(config, pid)?.target?.branch ?? "main";
+  const git: UpstreamGit = (r, args, opts) => deps.git(r, args, opts);
+  const fetch = await fetchTargetBranch(git, repo, target);
+  if (fetch.exitCode !== 0) {
+    throw new OrchestratorError(
+      "git-failed",
+      `git fetch origin ${target} failed (exit ${fetch.exitCode}): ` +
+        (fetch.stderr || fetch.stdout).trim().slice(0, 200),
+    );
+  }
+  let mergedSha: string;
+  if (explicitSha !== undefined) {
+    // М1: the named commit is on the target branch.
+    if (!(await isAncestor(git, repo, explicitSha, `origin/${target}`))) {
+      throw new OrchestratorError(
+        "not-on-upstream",
+        t("mg.shaNotOnUpstream", { sha: sha7(explicitSha), target }),
+      );
+    }
+    // М2: it really carries the executor's changes — `result_sha` is
+    // its ancestor, or a trial merge adds exactly nothing.
+    const carries =
+      (await isAncestor(git, repo, resultSha, explicitSha)) ||
+      (await mergeTreeEqualsRef(git, repo, explicitSha, resultSha));
+    if (!carries) {
+      throw new OrchestratorError(
+        "unrelated-sha",
+        t("mg.unrelatedSha", { sha: sha7(explicitSha), result: sha7(resultSha) }),
+      );
+    }
+    mergedSha = explicitSha;
+  } else {
+    // М1 without a sha: the result is on the target directly
+    // (ancestor) or through a squash/rebase (tree-equal merge).
+    if (!(await shaObjectExists(git, repo, resultSha))) {
+      throw new OrchestratorError(
+        "not-on-upstream",
+        t("mg.resultNotOnUpstream", { sha: sha7(resultSha), target }),
+      );
+    }
+    const c = await upstreamContains(git, repo, target, resultSha);
+    if (!c.merged) {
+      throw new OrchestratorError(
+        "not-on-upstream",
+        t("mg.resultNotOnUpstream", { sha: sha7(resultSha), target }),
+      );
+    }
+    mergedSha = upstreamMergedSha(undefined, resultSha, c);
+  }
+  const marked = deps.store.markMergedUpstream(
+    row.id,
+    resultSha,
+    `origin/${target}`,
+    mergedSha,
+  );
+  if (!marked) {
+    // Lost a race (a local merge landed, or the round re-ran) — the
+    // authoritative refusal comes from a fresh row check.
+    const fresh = deps.store.get(row.id);
+    if (fresh) assertMergeableRow(fresh, t, { skipDirty: true });
+    throw new OrchestratorError(
+      "not-done",
+      `delegation ${row.id} changed during --mark-merged`,
+    );
+  }
+  return {
+    ok: true,
+    delegationId: row.id,
+    taskKey: row.task_key,
+    round: row.round,
+    into: `origin/${target}`,
+    mergeStatus: "merged-upstream",
+    mergedSha,
+  };
 }
 
 export async function runMerge(
@@ -330,6 +508,12 @@ export async function runMerge(
       `thread ${params.callerThreadId} has no orchestrator role`,
       "only a thread with the orchestrator role may merge results",
     );
+  }
+  // §14 `--mark-merged` (r34.1): only checks 0 (caller role) and 1
+  // (row state, minus `result_dirty`) — helpers/environment/lock/
+  // copy checks do not apply; no local merge happens.
+  if (params.markMerged !== undefined && params.markMerged !== false) {
+    return await runMarkMerged(row, params.markMerged, deps, t);
   }
   // §19.1 (r33): a delegation's merge refuses while its helpers are
   // still active — their unmerged work would be left behind.

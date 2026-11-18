@@ -414,6 +414,53 @@ const EXPECTED_MIGRATION_HASHES_0_54: readonly string[] = [
   "16d38186e522513d01981bd9fb2d3265de10f481022dabea0f1de5e0bb308f82", // 54: attach
 ];
 
+test("§5.6 (r34.1): migration backfills finished_at for terminal rows, adds last_activity_at, wipes coordinator_watchdog_state", () => {
+  const db = new Database(":memory:");
+  const r341 = MIGRATIONS.findIndex((m) =>
+    m.includes("ADD COLUMN finished_at"),
+  );
+  assert.ok(r341 > 0, "r34.1 migration found");
+  for (const m of MIGRATIONS.slice(0, r341)) db.exec(m);
+  const ins = db.prepare(
+    `INSERT INTO delegations (
+      task_key, coordinator_thread_id, level, route, preset, provider,
+      status, created_at, updated_at
+    ) VALUES (?, 'thr_c', 'simple', 'simple', 'simple', 'p', ?, 1, ?)`,
+  );
+  ins.run("PLUG-1", "done", 200);
+  ins.run("PLUG-2", "running", 300);
+  db.prepare(
+    `INSERT INTO coordinator_watchdog_state (
+      coordinator_thread_id, idle_since, nudge_count, last_nudge_at,
+      escalated_at, updated_at
+    ) VALUES ('thr_c', 1, 2, 3, 4, 5)`,
+  ).run();
+  db.exec(MIGRATIONS[r341]!);
+  const done = db
+    .prepare(`SELECT finished_at f FROM delegations WHERE task_key = 'PLUG-1'`)
+    .get() as { f: number | null };
+  assert.equal(
+    done.f,
+    200,
+    "terminal rows get finished_at = updated_at — staying out of the watchdog epoch",
+  );
+  const running = db
+    .prepare(`SELECT finished_at f FROM delegations WHERE task_key = 'PLUG-2'`)
+    .get() as { f: number | null };
+  assert.equal(running.f, null, "live rows keep finished_at NULL");
+  const cols = (db
+    .prepare(`PRAGMA table_info(coordinator_watchdog_state)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.ok(
+    cols.includes("last_activity_at"),
+    "last_activity_at added (DEFAULT 0)",
+  );
+  const left = db
+    .prepare(`SELECT COUNT(*) c FROM coordinator_watchdog_state`)
+    .get() as { c: number };
+  assert.equal(left.c, 0, "DELETE FROM coordinator_watchdog_state ran");
+});
+
 test("migrations 0..54 immutable SHA-256 hash guard (anti-shift, PLUG-283)", () => {
   assert.ok(
     MIGRATIONS.length >= EXPECTED_MIGRATION_HASHES_0_54.length,

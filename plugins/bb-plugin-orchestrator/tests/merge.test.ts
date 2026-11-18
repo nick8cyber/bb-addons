@@ -17,6 +17,7 @@ import {
   runMerge,
   type MergeDeps,
   type MergeGitResult,
+  type MergeOutcome,
 } from "../src/merge.js";
 import { OrchestratorError } from "../src/errors.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
@@ -1407,4 +1408,190 @@ test("§4.1 r28.1: a no-code round WITH commits merges as usual", async () => {
   const res = await runMerge(PARAMS, deps);
   assert.ok("mergeStatus" in res && res.mergeStatus === "merged");
   assert.equal(res.delegationId, row.id);
+});
+
+// ── §14 (r34.1, PLUG-317): merge --mark-merged ────────────────────────
+
+/** `deps.upstream` seams for `--mark-merged`: `repo` is the project
+ * checkout (a real clone with `origin`); `settingsProjectId` is
+ * injected straight so the worktree/remote resolution isn't exercised
+ * here. */
+function makeUpstreamDep(repo: string) {
+  return {
+    projects: async () => [
+      {
+        id: "proj_main",
+        sources: [
+          { type: "local_path", path: repo, isDefault: true, hostId: "h1" },
+        ],
+      },
+    ],
+    localHostId: () => "h1",
+    releaseConfig: () => ({
+      config: {
+        defaults: {},
+        projects: {
+          proj_main: { target: { action: "push" as const, branch: "main" } },
+        },
+      },
+      empty: false,
+      errors: [],
+      warnings: [],
+    }),
+    settingsProjectId: async () => "proj_main",
+  };
+}
+
+/** Squash `bb/plug-1` into `main` in the coord clone and push it —
+ * `origin/<target>` then holds the executor's changes under a foreign
+ * commit. Returns the squash commit sha. */
+function squashIntoMain(coord: string): string {
+  const cur = gitR(coord, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  gitR(coord, ["switch", "main"]);
+  gitR(coord, ["merge", "--squash", "bb/plug-1"]);
+  gitR(coord, ["commit", "-m", "squashed plug-1"]);
+  const sha = gitR(coord, ["rev-parse", "HEAD"]);
+  gitR(coord, ["push", "origin", "main"]);
+  gitR(coord, ["switch", cur]);
+  return sha;
+}
+
+test("§14 (r34.1): --mark-merged on an ancestor landing — merged-upstream, copies untouched", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  // The executor's work landed on origin/main directly.
+  gitR(exec, ["push", "origin", "bb/plug-1:main"]);
+  deps.upstream = makeUpstreamDep(coord);
+  const execHead = gitR(exec, ["rev-parse", "HEAD"]);
+  const coordBranch = gitR(coord, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const res = (await runMerge({ ...PARAMS, markMerged: true }, deps)) as MergeOutcome;
+  assert.equal(res.mergeStatus, "merged-upstream");
+  assert.equal(res.into, "origin/main");
+  assert.equal(res.mergedSha, resultSha, "ancestor records the result sha");
+  const fresh = store.get(row.id)!;
+  assert.equal(fresh.merge_status, "merged-upstream");
+  assert.equal(fresh.merged_into, "origin/main");
+  assert.equal(gitR(exec, ["rev-parse", "HEAD"]), execHead);
+  assert.equal(
+    gitR(coord, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    coordBranch,
+  );
+});
+
+test("§14 (r34.1) п.16: --mark-merged on a 3-commit squash — merge-tree proves the landing", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  // Two more executor commits → the PR carries three.
+  writeFileSync(join(exec, "g.txt"), "second\n");
+  gitR(exec, ["add", "."]);
+  gitR(exec, ["commit", "-m", "feat 2"]);
+  writeFileSync(join(exec, "h.txt"), "third\n");
+  gitR(exec, ["add", "."]);
+  gitR(exec, ["commit", "-m", "feat 3"]);
+  const tip = gitR(exec, ["rev-parse", "HEAD"]);
+  assert.notEqual(tip, resultSha);
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, tip);
+  const squashSha = squashIntoMain(coord);
+  deps.upstream = makeUpstreamDep(coord);
+  const res = (await runMerge({ ...PARAMS, markMerged: true }, deps)) as MergeOutcome;
+  assert.equal(res.mergeStatus, "merged-upstream");
+  assert.equal(res.mergedSha, squashSha, "squash records the target tip");
+  const fresh = store.get(row.id)!;
+  assert.equal(fresh.merge_status, "merged-upstream");
+  assert.equal(fresh.merged_sha, squashSha);
+});
+
+test("§14 (r34.1): --mark-merged <squashSha> — the explicit sha carries the work", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  const squashSha = squashIntoMain(coord);
+  deps.upstream = makeUpstreamDep(coord);
+  const res = (await runMerge(
+    { ...PARAMS, markMerged: squashSha },
+    deps,
+  )) as MergeOutcome;
+  assert.equal(res.mergeStatus, "merged-upstream");
+  assert.equal(res.mergedSha, squashSha);
+});
+
+test("§14 (r34.1) п.13: --mark-merged <unrelatedSha> — a foreign target commit is refused, copies untouched", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  // An unrelated commit lands on origin/main.
+  gitR(coord, ["switch", "main"]);
+  writeFileSync(join(coord, "unrelated.txt"), "other\n");
+  gitR(coord, ["add", "."]);
+  gitR(coord, ["commit", "-m", "unrelated"]);
+  const foreign = gitR(coord, ["rev-parse", "HEAD"]);
+  gitR(coord, ["push", "origin", "main"]);
+  gitR(coord, ["switch", "work"]);
+  deps.upstream = makeUpstreamDep(coord);
+  const execHead = gitR(exec, ["rev-parse", "HEAD"]);
+  await assert.rejects(
+    runMerge({ ...PARAMS, markMerged: foreign }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "unrelated-sha",
+  );
+  assert.equal(gitR(exec, ["rev-parse", "HEAD"]), execHead);
+  assert.equal(gitR(exec, ["status", "--porcelain"]), "");
+  assert.equal(store.get(row.id)!.merge_status, null);
+});
+
+test("§14 (r34.1): --mark-merged without a landing — not-on-upstream", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  deps.upstream = makeUpstreamDep(coord);
+  await assert.rejects(
+    runMerge({ ...PARAMS, markMerged: true }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "not-on-upstream",
+  );
+  assert.equal(store.get(row.id)!.merge_status, null);
+});
+
+test("§14 (r34.1): --mark-merged without the upstream seams — no-repo", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  await assert.rejects(
+    runMerge({ ...PARAMS, markMerged: true }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "no-repo",
+  );
+  // Project without a repo path — still no-repo.
+  deps.upstream = {
+    projects: async () => [],
+    localHostId: () => "h1",
+    releaseConfig: () => ({
+      config: { defaults: {}, projects: {} },
+      empty: false,
+      errors: [],
+      warnings: [],
+    }),
+    settingsProjectId: async () => "proj_main",
+  };
+  await assert.rejects(
+    runMerge({ ...PARAMS, markMerged: true }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "no-repo",
+  );
+});
+
+test("§14 (r34.1) п.8: a merged-upstream row refuses a plain merge — already-merged", async () => {
+  const { coord, exec, resultSha } = makeRepos();
+  const { deps, store, row } = makeDeps({ coord, exec });
+  recordResult(store, row, resultSha);
+  assert.ok(
+    store.markMergedUpstream(row.id, resultSha, "origin/main", resultSha),
+  );
+  await assert.rejects(
+    runMerge(PARAMS, deps),
+    (e: unknown) => (e as OrchestratorError).code === "already-merged",
+  );
+  // …and a repeated --mark-merged is refused the same way.
+  deps.upstream = makeUpstreamDep(coord);
+  await assert.rejects(
+    runMerge({ ...PARAMS, markMerged: true }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "already-merged",
+  );
 });

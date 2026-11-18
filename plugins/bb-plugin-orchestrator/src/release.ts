@@ -81,6 +81,13 @@ import {
   pluginNameForRepo,
   pluginNamesForPaths,
 } from "./staged.js";
+import { projectRepoPath } from "./delegate-base.js";
+import {
+  fetchTargetBranch,
+  isAncestor as upstreamIsAncestor,
+  mergeTreeEqualsRef,
+  type UpstreamGit,
+} from "./upstream.js";
 import { runChecked, runJson, type BbCli, type BbCliResult } from "./bb-cli.js";
 import { createT, LANGS, T_RU, type T } from "./i18n/index.js";
 import { recordReleaseNote, type KbConfig } from "./kb.js";
@@ -260,7 +267,10 @@ export interface ReleaseResult {
   ok: true;
   releaseId: number;
   taskKey: string;
-  status: "auditing";
+  /** `auditing` — the machine scan went to the release-auditor;
+   * `published` — §2 п.0.2 (r11.9): the `merged-upstream` path finished
+   * synchronously (no audit is ever dispatched). */
+  status: "auditing" | "published";
   auditThreadId: string | null;
   warnings: ScanFinding[];
   /** §6 (r7): the bb project whose settings the release used — the
@@ -1672,6 +1682,49 @@ async function commentOnTask(
  * `OrchestratorError` on any step failure — the task stays with the
  * coordinator. Returns as soon as the audit thread is dispatched.
  */
+/** (r11.7, orchestrator §26.5, ADR-0028) KB cleanliness gate:
+ * При kb.enabled: true и requireCleanOnRelease: true (по умолчанию) проверяется git -C <kb.path> status --porcelain;
+ * при наличии незакоммиченных изменений — отказ release-refused: uncommitted-kb: в базе знаний незакоммиченные файлы (<файлы>)
+ * (при requireCleanOnRelease: false проверка только при наличии флага --kb).
+ * Shared by the normal pipeline and the §2 п.0.2 `merged-upstream` path. */
+async function assertKbCleanOnRelease(
+  deps: ReleaseDeps,
+  input: ReleaseInput,
+): Promise<void> {
+  const t = deps.t ?? T_RU;
+  const kbCfg = deps.kbConfig?.();
+  if (!kbCfg || !kbCfg.enabled) return;
+  const shouldCheckClean = kbCfg.requireCleanOnRelease || Boolean(input.kb);
+  if (!shouldCheckClean) return;
+  const kbStatus = await deps.cmd.run("git", [
+    "-C",
+    kbCfg.path,
+    "status",
+    "--porcelain",
+  ]);
+  if (kbStatus.exitCode !== 0) {
+    throw new OrchestratorError(
+      "release-refused",
+      t("rel.uncommittedKbFailed", {
+        error: kbStatus.stderr.trim() || kbStatus.stdout.trim(),
+      }),
+    );
+  }
+  const dirtyLines = kbStatus.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (dirtyLines.length > 0) {
+    const files = dirtyLines
+      .map((l) => l.replace(/^[A-Z?!\s]+\s+/, ""))
+      .join(", ");
+    throw new OrchestratorError(
+      "release-refused",
+      t("rel.uncommittedKb", { files }),
+    );
+  }
+}
+
 export async function runRelease(
   input: ReleaseInput,
   deps: ReleaseDeps,
@@ -1733,6 +1786,20 @@ export async function runRelease(
     throw new OrchestratorError(
       "release-in-progress",
       t("rel.inProgress", { taskKey }),
+    );
+  }
+  // §2 п.0.2 (r11.9) + orchestrator §5.6 (r34.1): the result is already
+  // on `origin/<target>` (external PR, squash, manual merge + the
+  // `--mark-merged` mark). No copy, branch switch, local merge, project
+  // checks or audit — steps 0/0.1 and the step-7 upstream proof run
+  // before the task is closed.
+  if (executor.merge_status === "merged-upstream") {
+    return await runReleaseMergedUpstream(
+      input,
+      deps,
+      cfg.config!,
+      taskKey,
+      executor,
     );
   }
   // §16.6: publish the branch that holds the task's result — a merged
@@ -1816,44 +1883,7 @@ export async function runRelease(
       t("rel.requireNote", { taskKey }),
     );
   }
-  // (r11.7, orchestrator §26.5, ADR-0028) KB cleanliness gate:
-  // При kb.enabled: true и requireCleanOnRelease: true (по умолчанию) проверяется git -C <kb.path> status --porcelain;
-  // при наличии незакоммиченных изменений — отказ release-refused: uncommitted-kb: в базе знаний незакоммиченные файлы (<файлы>)
-  // (при requireCleanOnRelease: false проверка только при наличии флага --kb).
-  const kbCfg = deps.kbConfig?.();
-  if (kbCfg && kbCfg.enabled) {
-    const shouldCheckClean =
-      kbCfg.requireCleanOnRelease || Boolean(input.kb);
-    if (shouldCheckClean) {
-      const kbStatus = await deps.cmd.run("git", [
-        "-C",
-        kbCfg.path,
-        "status",
-        "--porcelain",
-      ]);
-      if (kbStatus.exitCode !== 0) {
-        throw new OrchestratorError(
-          "release-refused",
-          t("rel.uncommittedKbFailed", {
-            error: kbStatus.stderr.trim() || kbStatus.stdout.trim(),
-          }),
-        );
-      }
-      const dirtyLines = kbStatus.stdout
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
-      if (dirtyLines.length > 0) {
-        const files = dirtyLines
-          .map((l) => l.replace(/^[A-Z?!\s]+\s+/, ""))
-          .join(", ");
-        throw new OrchestratorError(
-          "release-refused",
-          t("rel.uncommittedKb", { files }),
-        );
-      }
-    }
-  }
+  await assertKbCleanOnRelease(deps, input);
   // §18.3 + release §2 п.0 (r11): доступность провайдера PR — на шаге
   // 1, до платного аудита.
   if (project.target.action === "pr") {
@@ -2458,6 +2488,299 @@ async function reviewGate(
 }
 
 // ── Steps 2–5: sync → checks → scan → audit dispatch ──────────────────
+
+/**
+ * §2 п.0.2 (r11.9) + orchestrator §5.6 (r34.1): выкладка результата,
+ * уже лежащего в `origin/<target>` — внешний PR, squash-merge, ручной
+ * merge + `bb orchestrator merge <KEY> --mark-merged`. Шаги 0 и 0.1
+ * выполняются штатно (захват цели, UI-гейт, приёмочные проверки шага 1 —
+ * гейт ревью на `result_sha` уже прошёл в acceptTask); шаги 2–5
+ * пропускаются: копия координатора не переключается, локального merge и
+ * прогона проверок/скана/аудита нет. Шаг 7 — проверка наличия
+ * `merged_sha` на `origin/<target>` — выполняется ДО смены статуса;
+ * задача переводится в done при любом целевом действии, PR не
+ * открывается.
+ */
+async function runReleaseMergedUpstream(
+  input: ReleaseInput,
+  deps: ReleaseDeps,
+  config: ReleaseConfig,
+  taskKey: string,
+  executor: DelegationRow,
+): Promise<ReleaseResult> {
+  const t = deps.t ?? T_RU;
+  const delegationProjectId = executor.project_id ?? input.caller.projectId;
+
+  // Репозиторий — собственная копия проекта; копия исполнителя и
+  // координатора не нужны.
+  const listRes = await deps.bbCli.run(["project", "list", "--json"], {
+    timeoutMs: 15_000,
+  });
+  let projects: BbProjectListItem[] = [];
+  if (listRes.exitCode === 0) {
+    try {
+      const parsed: unknown = JSON.parse(listRes.stdout);
+      if (Array.isArray(parsed)) {
+        projects = parsed as BbProjectListItem[];
+      }
+    } catch {
+      // нечитаемый список → repo не найден → отказ ниже
+    }
+  }
+  const localHost = deps.localHostId
+    ? String((await deps.localHostId()) ?? "")
+    : "";
+  const repo = projectRepoPath(
+    projects,
+    delegationProjectId,
+    localHost,
+    localHost,
+  );
+  if (!repo) {
+    throw new OrchestratorError(
+      "no-repo",
+      t("rel.upstreamNoRepo", { project: delegationProjectId }),
+    );
+  }
+  const settingsProject = await settingsProjectId(
+    deps,
+    repo,
+    delegationProjectId,
+    config,
+  );
+  const project = resolveProject(config, settingsProject);
+  if (project.excluded) {
+    throw new OrchestratorError(
+      "release-excluded",
+      t("rel.excluded", {
+        project: settingsProject,
+        delegation: delegationProjectId,
+      }),
+    );
+  }
+  if (project.requireNote && !input.kb && !input.noKb) {
+    throw new OrchestratorError(
+      "release-refused",
+      t("rel.requireNote", { taskKey }),
+    );
+  }
+  await assertKbCleanOnRelease(deps, input);
+
+  const targetBranch = project.target.branch;
+  const ugit: UpstreamGit = (r, args, opts) =>
+    deps.cmd.run("git", ["-C", r, ...args], {
+      timeoutMs: opts?.timeoutMs ?? 60_000,
+    });
+
+  // Шаг 0 — захват цели: одна выкладка на (repo_root, target_branch).
+  const mainDir =
+    mainWorktreeDir(
+      await git(deps, repo, ["worktree", "list", "--porcelain"], {
+        allowFail: true,
+      }),
+    ) ?? repo;
+  const repoRoot = await realpath(mainDir).catch(() => mainDir);
+  let release: ReleaseRow;
+  try {
+    release = deps.store.insertRelease(
+      {
+        taskKey,
+        projectId: delegationProjectId,
+        coordinatorThreadId: input.caller.threadId,
+        repoPath: repo,
+        branch: executor.merged_into ?? `origin/${targetBranch}`,
+        // Результат уже на origin/<target> — запись ведёт себя как
+        // push-выкладка: postCheck проверяет предка на цели, PR нет и
+        // не открывается (действие проекта при этом значения не имеет).
+        targetAction: "push",
+        targetBranch,
+        noDocsReason: input.noDocs ?? null,
+        kbNote: input.kb ?? null,
+        noKbReason: input.noKb ?? null,
+        settingsProjectId: settingsProject,
+        repoRoot,
+      },
+      t,
+    );
+  } catch (e) {
+    if (e instanceof OrchestratorError) throw e;
+    if (/UNIQUE constraint/.test(message(e))) {
+      throw new OrchestratorError(
+        "release-in-progress",
+        t("rel.inProgress", { taskKey }),
+      );
+    }
+    throw e;
+  }
+
+  const markFailed = (e: unknown): void => {
+    try {
+      deps.store.updateRelease(release.id, {
+        status: "failed",
+        error: message(e),
+      });
+    } catch {
+      // отказ ниже — авторитетный исход
+    }
+  };
+
+  try {
+    // Шаг 0.1 — гейт незамерженных UI-фич.
+    const unmerged = await unmergedUiFeatures(
+      deps,
+      repo,
+      project,
+      taskKey,
+    );
+    if (unmerged.length) {
+      if (input.forceDropUnmerged) {
+        deps.store.updateRelease(release.id, {
+          droppedUnmergedReason: input.forceDropUnmerged,
+        });
+        deps.store.metaSet(
+          DROP_UNMERGED_META(release.id),
+          JSON.stringify(unmerged.map((r) => r.task_key)),
+        );
+      } else {
+        throw new OrchestratorError(
+          "release-refused",
+          unmerged
+            .map((r) =>
+              t("rel.unmergedUi", {
+                key: r.task_key,
+                files: stagedUiFileList(r),
+                target: project.target.branch,
+              }),
+            )
+            .join("\n"),
+        );
+      }
+    }
+
+    // Шаг 7 ДО смены статуса (п.0.2): опубликованный sha должен быть на
+    // `origin/<target>` — предком (`merge-base --is-ancestor`) или
+    // точным деревом пробного merge (`merge-tree --write-tree`, для
+    // squash/rebase). Иначе release-refused: upstream-commit-missing —
+    // задача не done, ветки и копии не трогаем.
+    const mergedSha = executor.merged_sha ?? "";
+    const targetRef = `origin/${targetBranch}`;
+    const fetch = await fetchTargetBranch(ugit, repo, targetBranch);
+    const landed =
+      fetch.exitCode === 0 &&
+      mergedSha !== "" &&
+      ((await upstreamIsAncestor(ugit, repo, mergedSha, targetRef)) ||
+        (executor.result_sha != null &&
+          (await mergeTreeEqualsRef(
+            ugit,
+            repo,
+            targetRef,
+            executor.result_sha,
+          ))));
+    if (!landed) {
+      throw new OrchestratorError(
+        "release-refused",
+        t("rel.upstreamCommitMissing", {
+          taskKey,
+          sha7: mergedSha.slice(0, 7) || "—",
+          target: targetBranch,
+        }),
+      );
+    }
+
+    // Шаг 6: published_sha = merged_sha; задача done при любом целевом
+    // действии (PR не открывается — код уже в цели).
+    const parent = await ugit(
+      repo,
+      ["rev-parse", "--verify", "--quiet", `${mergedSha}^`],
+      { timeoutMs: 30_000 },
+    );
+    deps.store.updateRelease(release.id, {
+      status: "published",
+      headSha: executor.result_sha ?? null,
+      publishedSha: mergedSha,
+      remoteBaseSha:
+        parent.exitCode === 0 && parent.stdout.trim()
+          ? parent.stdout.trim()
+          : mergedSha,
+    });
+    await runChecked(deps.bbCli, [
+      "tasks",
+      "update",
+      taskKey,
+      "--status",
+      "done",
+    ]).catch((e) =>
+      deps.log?.warn?.(`release task status: ${message(e)}`),
+    );
+
+    await finishMergedUpstream(
+      deps,
+      deps.store.getRelease(release.id) ?? release,
+    );
+
+    return {
+      ok: true,
+      releaseId: release.id,
+      taskKey,
+      status: "published",
+      auditThreadId: null,
+      warnings: [],
+      settingsProjectId: settingsProject,
+      delegationProjectId,
+    };
+  } catch (e) {
+    markFailed(e);
+    throw e;
+  }
+}
+
+/** §2 п.0.2 (r11.9): итог merged-upstream выкладки — та же доставка,
+ * что у finishPublished, но ведущая строка «уже в <target>», задача уже
+ * done и postPublish идёт принудительно (независимо от `on`). */
+async function finishMergedUpstream(
+  deps: ReleaseDeps,
+  row: ReleaseRow,
+): Promise<void> {
+  const t = deps.t ?? T_RU;
+  const fresh = deps.store.getRelease(row.id) ?? row;
+  markPublishedFeatures(deps, fresh);
+  const headSha = fresh.published_sha ?? "";
+  let selfReload: { rootDir: string; expectedSha: string } | null = null;
+  let ppSummary: string | null = null;
+  const pp = await runPostPublishGuarded(deps, fresh, "release.published", {
+    force: true,
+  });
+  if (!pp.done) return;
+  releasePostPublishLock(fresh.id);
+  ppSummary = pp.summary;
+  selfReload = pp.selfReload;
+  const checks = await postCheck(
+    deps,
+    fresh,
+    headSha,
+    fresh.target_branch,
+    null,
+  ).catch((e) => [t("rel.postCheckFail", { error: message(e) })]);
+  const parts: string[] = [
+    t("rel.publishedUpstream", {
+      taskKey: fresh.task_key,
+      sha7: headSha.slice(0, 7),
+      branch: fresh.target_branch,
+    }),
+  ];
+  if (fresh.kb_note) parts.push(t("rel.kbNote", { note: fresh.kb_note }));
+  if (fresh.no_kb_reason) {
+    parts.push(t("rel.kbNone", { reason: fresh.no_kb_reason }));
+  }
+  for (const m of checks) parts.push(t("rel.postCheck", { msg: m }));
+  if (ppSummary) parts.push(ppSummary);
+  // §2 п.2 (r11.6): автоочистка копий задачи — при любом целевом
+  // действии (у push она и так шла; для upstream-выкладки независимо от
+  // записанного действия).
+  const cleanupLine = await runTaskCleanup(deps, fresh);
+  if (cleanupLine) parts.push(cleanupLine);
+  await deliverReleaseOutcome(deps, fresh, parts.join("\n"), selfReload);
+}
 
 async function runReleaseSteps(
   ctx: {
@@ -4324,29 +4647,7 @@ async function finishPublished(
 ): Promise<void> {
   const t = deps.t ?? T_RU;
   const fresh = deps.store.getRelease(row.id) ?? row;
-  // §2 шаг 0.1 (r11.5) / orchestrator §24.2 (r33.6): опубликованная
-  // выкладка переводит свою запись plugin_staged_features в `merged` —
-  // она перестаёт сторожить гейт unmerged-ui. Вызывается из всех путей
-  // publishRelease и из досмотра уже опубликованных строк; идемпотентно.
-  deps.store.markStagedFeatureMerged(fresh.task_key);
-  // §2 шаг 0.1 (r11.5): `--force-drop-unmerged` — сброшенные записи
-  // уходят в `dropped` только после успешной публикации. Ключи лежат в
-  // мете релиза с шага 0.1; идемпотентно (мета снимается сразу).
-  const dropMeta = deps.store.metaGet(DROP_UNMERGED_META(fresh.id));
-  if (dropMeta) {
-    deps.store.metaDelete(DROP_UNMERGED_META(fresh.id));
-    try {
-      const keys = JSON.parse(dropMeta) as unknown;
-      if (Array.isArray(keys)) {
-        deps.store.markStagedFeaturesDropped(
-          keys.filter((k): k is string => typeof k === "string"),
-          fresh.dropped_unmerged_reason ?? "",
-        );
-      }
-    } catch {
-      // битый JSON мети — причина и задачи видны в записи выкладки
-    }
-  }
+  markPublishedFeatures(deps, fresh);
   const headSha = fresh.published_sha ?? fresh.head_sha ?? "";
   const pushedBranch =
     fresh.target_action === "push"
@@ -4425,10 +4726,46 @@ async function finishPublished(
     const cleanupLine = await runTaskCleanup(deps, fresh);
     if (cleanupLine) parts.push(cleanupLine);
   }
-  const line = parts.join("\n");
-  // §2 r10 п.5: работа выполнена и текст собран — сначала строка
-  // сохраняется в записи, метка base снимается (повтор такта уже не
-  // гоняет работу), затем отправка сохранённого текста.
+  await deliverReleaseOutcome(deps, fresh, parts.join("\n"), selfReload);
+}
+
+/** §2 шаг 0.1 (r11.5) / orchestrator §24.2 (r33.6): опубликованная
+ * выкладка переводит свою запись plugin_staged_features в `merged` —
+ * она перестаёт сторожить гейт unmerged-ui. Вызывается из всех путей
+ * publishRelease, из досмотра уже опубликованных строк и из п.0.2
+ * upstream-выкладки; идемпотентно. */
+function markPublishedFeatures(deps: ReleaseDeps, fresh: ReleaseRow): void {
+  deps.store.markStagedFeatureMerged(fresh.task_key);
+  // §2 шаг 0.1 (r11.5): `--force-drop-unmerged` — сброшенные записи
+  // уходят в `dropped` только после успешной публикации. Ключи лежат в
+  // мете релиза с шага 0.1; идемпотентно (мета снимается сразу).
+  const dropMeta = deps.store.metaGet(DROP_UNMERGED_META(fresh.id));
+  if (!dropMeta) return;
+  deps.store.metaDelete(DROP_UNMERGED_META(fresh.id));
+  try {
+    const keys = JSON.parse(dropMeta) as unknown;
+    if (Array.isArray(keys)) {
+      deps.store.markStagedFeaturesDropped(
+        keys.filter((k): k is string => typeof k === "string"),
+        fresh.dropped_unmerged_reason ?? "",
+      );
+    }
+  } catch {
+    // битый JSON мети — причина и задачи видны в записи выкладки
+  }
+}
+
+/** §2 r10 п.5: работа выполнена и текст собран — сначала строка
+ * сохраняется в записи, метка base снимается (повтор такта уже не
+ * гоняет работу), затем отправка сохранённого текста. Общий хвост
+ * finishPublished и finishMergedUpstream (п.0.2). */
+async function deliverReleaseOutcome(
+  deps: ReleaseDeps,
+  fresh: ReleaseRow,
+  line: string,
+  selfReload: { rootDir: string; expectedSha: string } | null,
+): Promise<void> {
+  const t = deps.t ?? T_RU;
   deps.store.setReleaseNotice(
     fresh.id,
     selfReload ? "self-reload" : "published",
@@ -4659,9 +4996,10 @@ async function runPostPublishGuarded(
   deps: ReleaseDeps,
   row: ReleaseRow,
   event: "release.published" | "pr.merged",
+  opts?: { force?: boolean },
 ): Promise<PostPublishResult> {
   try {
-    return await runPostPublish(deps, row, event);
+    return await runPostPublish(deps, row, event, opts);
   } catch (e) {
     let running = true;
     try {
@@ -4698,6 +5036,10 @@ export async function runPostPublish(
   deps: ReleaseDeps,
   row: ReleaseRow,
   event: "release.published" | "pr.merged",
+  /** §2 п.0.2 (r11.9): merged-upstream выкладка запускает шаги сразу,
+   * независимо от значения `postPublish.on` (код уже в цели — событие
+   * «выложено» фактически произошло). */
+  opts?: { force?: boolean },
 ): Promise<PostPublishResult> {
   const t = deps.t ?? T_RU;
   const now = deps.now?.() ?? Date.now();
@@ -4815,7 +5157,7 @@ export async function runPostPublish(
   const project = resolveProject(cfg, projectId);
   const pp = project.postPublish;
   const want = event === "pr.merged" ? "merged" : "published";
-  if (!pp || pp.on !== want) return await earlyDone();
+  if (!pp || (pp.on !== want && !opts?.force)) return await earlyDone();
   const mainDir =
     row.repo_root ??
     (await realpath(row.repo_path).catch(() => row.repo_path));
