@@ -524,9 +524,9 @@ which always read the session's pinned account.
 If Google refuses an account during eligibility checks, behavior depends on the refusal type:
 - A refusal requiring manual verification (`VALIDATION_REQUIRED` / `verify your account to continue` / agent text `⚠ Verification Required`) triggers permanent parking (`validation-required`, `cooldownUntilMs` in the far future, no automatic unpark or expiry, manual unpark only — see `validation-required` above).
 - A generic eligibility refusal (`not eligible for Antigravity` / `Eligibility check failed` without verification markers) uses a 24-hour cooldown (`AGY_INELIGIBLE_COOLDOWN_MS`).
-- A location refusal (`not eligible for Antigravity, because it is not currently available in your location` without verification markers) uses a separate 2-hour cooldown (`AGY_LOCATION_COOLDOWN_MS`) and is logged with reason `location`; it may have no verification URL.
+- A location refusal (`not eligible for Antigravity, because it is not currently available in your location` with no `verify your account` text and no verification URL) uses a separate 2-hour cooldown (`AGY_LOCATION_COOLDOWN_MS`) and is logged with reason `location`.
 
-The failed turn re-runs on a free sibling after about one second. A refusal that also requests verification or supplies a verification URL uses the permanent `validation-required` parking.
+The failed turn re-runs on a free sibling after about one second. A refusal that mentions verification or supplies a verification URL without matching the verification markers falls back to the generic 24-hour `AGY_INELIGIBLE_COOLDOWN_MS` cooldown — never the 2-hour location cooldown, even when the refusal also names the location — and counts toward the ineligible breaker. Only refusals matching the verification markers (`VALIDATION_REQUIRED` / `verify your account to continue` / `⚠ Verification Required`) trigger permanent `validation-required` parking.
 
 | Environment variable | Default | Behaviour |
 | --- | ---: | --- |
