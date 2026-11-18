@@ -27,16 +27,29 @@ export interface BbCli {
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_BUFFER = 8 * 1024 * 1024;
 
-export function createBbCli(bin: string = process.env.BB_CLI ?? "bb"): BbCli {
+export function createBbCli(
+  bin: string = process.env.BB_CLI ?? "bb",
+  serverUrl?: () => string | undefined,
+): BbCli {
   return {
     run: (args, opts) =>
       new Promise<BbCliResult>((resolve) => {
+        // §4 r33.10 (PLUG-158/NET-36): plugin workers get a sanitized
+        // `process.env` without `BB_SERVER_URL` — on an instance with a
+        // non-default port the CLI would dial the default one. Every
+        // call hands the CLI this server's loopback address explicitly;
+        // the getter is resolved per call (it is bind-gated until the
+        // server listens) with `process.env.BB_SERVER_URL` as fallback.
+        const bbServerUrl = serverUrl?.() ?? process.env.BB_SERVER_URL;
         execFile(
           bin,
           args,
           {
             timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
             maxBuffer: MAX_BUFFER,
+            env: bbServerUrl
+              ? { ...process.env, BB_SERVER_URL: bbServerUrl }
+              : process.env,
           },
           (error, stdout, stderr) => {
             if (error && (error as NodeJS.ErrnoException).code === "ENOENT") {

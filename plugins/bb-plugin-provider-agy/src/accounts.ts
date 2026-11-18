@@ -557,8 +557,14 @@ export function conversationAccount(
 }
 
 /**
- * Pick the account a session should run on (§2.2):
- * - Candidates: not excludeLabel and priority > 0 (priority 0 is never picked).
+ * Pick the account a session should run on (§2.2, model-aware per §2.3):
+ * - Candidates: not excludeLabel, priority > 0 (priority 0 is never picked),
+ *   never parked (any parkedReason), and suitable for `options.family`
+ *   when one is given.
+ * - Suitability: an account whose fresh catalog lacks the family — or whose
+ *   unsupported mark for it is still fresh — is out. An account without a
+ *   catalog record counts as suitable but is only picked while no AVAILABLE
+ *   account has a catalog that names the family.
  * - Choose highest priority among available accounts (cooldownUntilMs <= now).
  * - Within that tier: LRU by lastUsedMs, tie-break label.
  * - When every candidate is cooling down: fallback to the account whose window
@@ -569,20 +575,49 @@ export function pickAccount(
   ledger: AccountsLedger,
   accounts: AccountHome[],
   excludeLabel?: string | null,
+  options?: {
+    /** Model family the session needs, already effort-stripped. */
+    family?: string | null;
+    /** Fresh per-account catalogs from loadAccountModels. */
+    models?: AccountModelCatalog;
+    nowMs?: number;
+  },
 ): AccountHome | null {
-  const now = Date.now();
+  const now = options?.nowMs ?? Date.now();
+  const family = options?.family ?? null;
+  const models = options?.models ?? {};
   const entryOf = (label: string): AccountLedgerEntry | undefined =>
     Object.hasOwn(ledger.accounts, label) ? ledger.accounts[label] : undefined;
   const priorityOf = (a: AccountHome): number =>
     accountPriority(entryOf(a.label));
   const cooldown = (a: AccountHome): number =>
     entryOf(a.label)?.cooldownUntilMs ?? 0;
+  const stateOf = (a: AccountHome): AccountModelState =>
+    family === null
+      ? "supports"
+      : accountModelState(
+          Object.hasOwn(models, a.label) ? models[a.label] : undefined,
+          family,
+          now,
+        );
 
-  const candidates = accounts.filter(
-    (a) => a.label !== excludeLabel && priorityOf(a) > 0,
+  let candidates = accounts.filter(
+    (a) =>
+      a.label !== excludeLabel &&
+      priorityOf(a) > 0 &&
+      entryOf(a.label)?.parkedReason === undefined &&
+      stateOf(a) !== "unsupported",
   );
   if (candidates.length === 0) {
     return null;
+  }
+  if (family !== null) {
+    // A catalog-less account counts as suitable only when no available
+    // account carries the family in its own catalog (§2.3).
+    const knownSupport = candidates.filter((a) => stateOf(a) === "supports");
+    if (knownSupport.some((a) => cooldown(a) <= now)) {
+      candidates = knownSupport;
+    }
   }
 
   const available = candidates.filter((a) => cooldown(a) <= now);
@@ -730,14 +765,235 @@ export function writeAccountHome(
 }
 
 /** True when too many accounts were parked inside the breaker window — the
- * egress looks guilty, not the accounts, so no more parking. */
+ * egress looks guilty, not the accounts, so no more parking. A tos-disabled
+ * parking is the account's own ban (§2.3 п.7): it neither feeds the count
+ * nor is held back by an open breaker. */
 export function checkIneligibleBreaker(ledger: AccountsLedger, nowMs = Date.now()): boolean {
   const windowMs = ineligibleBreakerWindowMs();
   const parkedCount = Object.values(ledger.accounts).filter(
     (entry) =>
+      entry.parkedReason !== "tos-disabled" &&
       typeof entry.ineligibleAtMs === "number" &&
       entry.ineligibleAtMs > nowMs - windowMs &&
       entry.ineligibleAtMs <= nowMs,
   ).length;
   return parkedCount >= ineligibleBreakerMax();
+}
+
+// ---------------------------------------------------------------------------
+// Terms-of-Service parking (spec §2.3). Distinct from eligibility/auth-dead:
+// Google disabled the account itself, so there is no automatic retry and no
+// cooldown clock — the account is excluded from selection until an operator
+// manually clears the mark.
+// ---------------------------------------------------------------------------
+
+/**
+ * Signature of a Google ToS account disable
+ * ("This service has been disabled in this account for violation of Terms
+ * of Service"). Kept here with the other failure signatures so the
+ * stream-json and ACP paths classify it identically.
+ */
+const TOS_DISABLED_PATTERN =
+  /disabled in this account for violation of terms of service/iu;
+
+export function isTosDisabled(message: string): boolean {
+  return TOS_DISABLED_PATTERN.test(message);
+}
+
+/**
+ * The far-future stamp a tos-disabled parking puts on cooldownUntilMs:
+ * effectively permanent, but still readable by every "is this account in
+ * cooldown" check that predates the mark.
+ */
+export const TOS_DISABLED_COOLDOWN_UNTIL_MS = 8_640_000_000_000_000;
+
+/**
+ * The account refused the requested model — "Unknown model ID" on
+ * session/set_config_option|set_model or on session/prompt, and the
+ * "not available for the current authentication method" variant. Not
+ * quota: the refusal marks the family unsupported for that account in
+ * accounts-models.json instead of cooling the whole account.
+ */
+const MODEL_REFUSAL_PATTERN =
+  /unknown model id|not available for the current authentication method/iu;
+
+export function isModelRefusal(message: string): boolean {
+  return MODEL_REFUSAL_PATTERN.test(message);
+}
+
+// ---------------------------------------------------------------------------
+// Per-account model catalog (spec §2.3, ADR-0030). accounts-models.json is
+// instance-local (the keeper syncs accounts-state.json only): each record
+// is what `agy --gemini-dir <home>/.gemini models` answered for that
+// account, plus negative knowledge from in-flight refusals.
+// ---------------------------------------------------------------------------
+
+const ACCOUNTS_MODELS_FILE = "accounts-models.json";
+
+/** Same lifetime as the merged provider model cache: six hours. */
+export const ACCOUNT_MODELS_TTL_MS = 6 * 60 * 60 * 1000;
+
+export interface AccountModelRecord {
+  /** What `agy models` printed for this account. */
+  raw: { id: string; displayName: string }[];
+  /** Model families (effort suffix stripped) the account offers. */
+  families: string[];
+  /** family -> atMs of the latest in-flight refusal; fresh marks exclude. */
+  unsupported: Record<string, number>;
+  /** When the record was last (re)written. */
+  atMs: number;
+}
+
+export type AccountModelCatalog = Record<string, AccountModelRecord>;
+
+export type AccountModelState = "supports" | "unsupported" | "unknown";
+
+const MODEL_EFFORT_SUFFIX =
+  /-(none|low|medium|high|xhigh|ultra|ultracode|max)$/u;
+
+/** The family a model id belongs to: the id minus an effort suffix (§8). */
+export function modelFamilyOf(model: string): string {
+  const base = model.replace(MODEL_EFFORT_SUFFIX, "");
+  return base.length > 0 ? base : model;
+}
+
+/**
+ * Per-account model records keyed by label. A record older than the
+ * six-hour TTL is STILL returned (§2.3 п.1): it stays valid for selection
+ * until a successful poll replaces it — callers that schedule refreshes
+ * compare `atMs` themselves. Unsupported marks past the TTL are pruned;
+ * each mark has its own lifetime (see accountModelState).
+ */
+export function loadAccountModels(dataDir: string): AccountModelCatalog {
+  const parsed =
+    readJsonFile<{ accounts?: AccountModelCatalog }>(
+      join(dataDir, ACCOUNTS_MODELS_FILE),
+    )?.accounts ?? {};
+  const now = Date.now();
+  const out: AccountModelCatalog = {};
+  for (const [label, rec] of Object.entries(parsed)) {
+    if (
+      rec === null ||
+      typeof rec !== "object" ||
+      !Array.isArray(rec.raw) ||
+      !Array.isArray(rec.families) ||
+      typeof rec.atMs !== "number"
+    ) {
+      continue;
+    }
+    const unsupported: Record<string, number> = {};
+    for (const [family, atMs] of Object.entries(rec.unsupported ?? {})) {
+      if (typeof atMs === "number" && now - atMs <= ACCOUNT_MODELS_TTL_MS) {
+        setOwn(unsupported, family, atMs);
+      }
+    }
+    setOwn(out, label, {
+      raw: rec.raw.filter(
+        (e): e is { id: string; displayName: string } =>
+          typeof e === "object" && e !== null && typeof e.id === "string",
+      ).map((e) => ({
+        id: e.id,
+        displayName:
+          typeof e.displayName === "string" ? e.displayName : e.id,
+      })),
+      families: rec.families.filter((f): f is string => typeof f === "string"),
+      unsupported,
+      atMs: rec.atMs,
+    });
+  }
+  return out;
+}
+
+function writeAccountModels(
+  dataDir: string,
+  mutate: (accounts: AccountModelCatalog) => void,
+): void {
+  const path = join(dataDir, ACCOUNTS_MODELS_FILE);
+  const accounts = { ...(readJsonFile<{ accounts?: AccountModelCatalog }>(path)?.accounts ?? {}) };
+  mutate(accounts);
+  try {
+    writeJsonAtomic(path, { accounts });
+  } catch {
+    // Instance-local file: a write failure must never take the bridge down.
+  }
+}
+
+/**
+ * Merge-on-save a fresh poll for one account: raw/families/atMs are
+ * authoritative for the label, but the unsupported marks union with what
+ * sits on disk — a parallel wrapper's in-flight refusal must survive.
+ * Callers pass a non-empty raw only: an empty or failed poll never
+ * overwrites a previous valid record.
+ */
+export function saveAccountModelRecord(
+  dataDir: string,
+  label: string,
+  raw: { id: string; displayName: string }[],
+): void {
+  writeAccountModels(dataDir, (accounts) => {
+    const previous = Object.hasOwn(accounts, label) ? accounts[label] : undefined;
+    setOwn(accounts, label, {
+      raw,
+      families: [...new Set(raw.map((e) => modelFamilyOf(e.id)))],
+      unsupported: { ...(previous?.unsupported ?? {}) },
+      atMs: Date.now(),
+    });
+  });
+}
+
+/**
+ * An in-flight refusal says this account does not serve the family —
+ * persist it so the next pick (this rotation included) skips the account
+ * for that family. The mark survives later poll writes
+ * (saveAccountModelRecord unions it), and a never-polled account gets a
+ * raw-empty record that still reads as "unknown" for every other family.
+ */
+export function markAccountModelUnsupported(
+  dataDir: string,
+  label: string,
+  family: string,
+): void {
+  writeAccountModels(dataDir, (accounts) => {
+    const previous = Object.hasOwn(accounts, label) ? accounts[label] : undefined;
+    const unsupported = { ...(previous?.unsupported ?? {}) };
+    setOwn(unsupported, family, Date.now());
+    setOwn(accounts, label, {
+      raw: previous?.raw ?? [],
+      families: previous?.families ?? [],
+      unsupported,
+      // A refusal is negative knowledge, not a fresh poll: re-stamping
+      // Date.now() would validate a stale record for another TTL and
+      // silence the refresh queue. A never-polled account gets atMs 0 —
+      // stale on arrival, so the lazy probe still runs (§2.3 п.1).
+      atMs: previous?.atMs ?? 0,
+    });
+  });
+}
+
+/**
+ * An account's standing for a model family:
+ * - "supports": a live catalog names the family and no fresh refusal mark
+ *   contradicts it;
+ * - "unsupported": a fresh unsupported mark, or the family is absent from
+ *   a catalog that did answer (`raw` non-empty);
+ * - "unknown": never polled, or the record carries refusal marks only.
+ */
+export function accountModelState(
+  record: AccountModelRecord | undefined,
+  family: string,
+  nowMs: number,
+): AccountModelState {
+  if (record === undefined) {
+    return "unknown";
+  }
+  const marked = Object.hasOwn(record.unsupported, family)
+    ? record.unsupported[family]
+    : undefined;
+  if (typeof marked === "number" && nowMs - marked <= ACCOUNT_MODELS_TTL_MS) {
+    return "unsupported";
+  }
+  if (record.families.includes(family)) {
+    return "supports";
+  }
+  return record.raw.length > 0 ? "unsupported" : "unknown";
 }
