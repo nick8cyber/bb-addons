@@ -1459,23 +1459,24 @@ await sleep(100);
     (readAcpModels().m4?.unsupported?.["pro-model"] ?? 0) > 0,
     staleReply?.error?.message ?? `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsG)}`);
 
-  // H. thread/resume on a parked owner with no free sibling: §2.3 п.7 —
-  // the honest parked-pool error and not a single agy launch on the banned
-  // home. The ledger is written directly so the conversation pin (the
-  // resume's owner lookup) survives in conversations-state.json.
+  // H. §2.3 п.7 — "parked" is parkedReason alone, never "parked and still
+  // cooling": every launch path treats the owner as untouchable even when
+  // cooldownUntilMs already expired (parkedReason has no expiry — only an
+  // operator clears it). The ledger is written directly so the
+  // conversation pin (the resume's owner lookup) survives in
+  // conversations-state.json.
   favor("m4");
   const parkedOwnerStart = await startModel("t-parked-owner", "fake-model");
   const parkedOwnerConv = parkedOwnerStart.result?.providerThreadId;
   stop("t-parked-owner");
   await sleep(100);
+  const parkedEntry = { cooldownUntilMs: 0, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" };
+  // H1: no free sibling — honest parked-pool error, zero launches.
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
+    m1: { ...parkedEntry }, m2: { ...parkedEntry }, m3: { ...parkedEntry }, m4: { ...parkedEntry },
+  } }, null, 1));
   const newsH = newsSnapshot();
   const loadsBeforeH = acpTranscript().filter((l) => l.method === "session/load").length;
-  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
-    m1: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
-    m2: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
-    m3: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
-    m4: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
-  } }, null, 1));
   const parkedResumeId = nextId++;
   send({ jsonrpc: "2.0", id: parkedResumeId, method: "thread/resume",
     params: { threadId: "t-resume-parked", providerThreadId: parkedOwnerConv, cwd: workspace,
@@ -1491,6 +1492,52 @@ await sleep(100);
     acpTranscript().filter((l) => l.method === "session/load").length === loadsBeforeH,
     `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsH)} ` +
       `loads=${acpTranscript().filter((l) => l.method === "session/load").length} before=${loadsBeforeH}`);
+
+  // H2: one free sibling — the resume leaves the banned owner for it.
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
+    m1: { ...parkedEntry }, m2: { ...parkedEntry }, m4: { ...parkedEntry },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+  } }, null, 1));
+  const newsH2 = newsSnapshot();
+  const sibResumeId = nextId++;
+  send({ jsonrpc: "2.0", id: sibResumeId, method: "thread/resume",
+    params: { threadId: "t-resume-parked-sib", providerThreadId: parkedOwnerConv, cwd: workspace,
+      options: { model: "fake-model", ...pol }, instructionMode: "append" } });
+  await waitFor(() => messages.some((m) => m.id === sibResumeId), 15_000, "t-resume-parked-sib: resume");
+  const sibResumeReply = messages.find((m) => m.id === sibResumeId);
+  check("models/resume-parked-owner-uses-sibling",
+    !sibResumeReply?.error &&
+    acpNews("m3") === newsH2.m3 + 1 &&
+    acpNews("m4") === newsH2.m4 &&
+    acpTranscript().filter((l) => l.method === "session/load").length === loadsBeforeH &&
+    replacedFor("t-resume-parked-sib").some((m) =>
+      typeof m.params?.reason === "string" && m.params.reason.includes("disabled by Google")),
+    sibResumeReply?.error?.message ?? `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsH2)}`);
+
+  // H3: a turn on a session whose owner is parked — cooldown expired —
+  // rotates to the sibling instead of replaying on the banned home.
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
+    m1: { ...parkedEntry }, m2: { ...parkedEntry },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+  } }, null, 1));
+  await startModel("t-turn-parked", "fake-model");
+  await turnModel("t-turn-parked", "first on m4", "fake-model");
+  const newsH3 = newsSnapshot();
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
+    m1: { ...parkedEntry }, m2: { ...parkedEntry },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null },
+    m4: { ...parkedEntry },
+  } }, null, 1));
+  await turnModel("t-turn-parked", "must leave the parked owner", "fake-model", 2);
+  await sleep(200);
+  check("models/turn-on-parked-owner-rotates",
+    statuses("t-turn-parked") === "completed,completed" &&
+    acpNews("m3") === newsH3.m3 + 1 &&
+    acpNews("m4") === newsH3.m4 &&
+    replacedFor("t-turn-parked").some((m) =>
+      typeof m.params?.reason === "string" && m.params.reason.includes("disabled by Google")),
+    `${statuses("t-turn-parked")} news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsH3)}`);
 
   // NOTE: never call activeBridge.onClose() here — the embedded generic
   // bridge's onClose ends with process.exit(0) and would skip the report.

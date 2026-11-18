@@ -3512,7 +3512,18 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
       session.model,
       Date.now(),
     ) === "unsupported";
-  if ((!cooled && !ownerUnfit) || dataDir === "" || !accountsEnabled(process.env)) {
+  const ledger = loadLedger(dataDir);
+  // §2.3 п.7: a parked owner is out on parkedReason alone — an expired
+  // cooldown must not resurrect a banned home.
+  const ownerParkedReason =
+    session.accountLabel !== null
+      ? ledger.accounts[session.accountLabel]?.parkedReason
+      : undefined;
+  if (
+    (!cooled && !ownerUnfit && ownerParkedReason === undefined) ||
+    dataDir === "" ||
+    !accountsEnabled(process.env)
+  ) {
     buildLaunch(session);
     params.options = rewriteOptions(session, { ...session.baseOptions });
     log(
@@ -3522,22 +3533,17 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
     return;
   }
-  // The owner is cooling or cannot serve the model: the resume becomes a
-  // fresh thread on a free sibling, and the first turn rides a handoff
-  // prompt (spec §7 / §2.3).
-  const ledger = loadLedger(dataDir);
+  // The owner is cooling, parked, or cannot serve the model: the resume
+  // becomes a fresh thread on a free sibling, and the first turn rides a
+  // handoff prompt (spec §7 / §2.3).
   const { account } = freeSibling(session, session.accountLabel);
   log(
-    `thread ${threadId}: resume owner ${session.accountLabel} ${ownerUnfit ? `does not offer ${session.model ?? "?"}` : `cools until ${new Date(untilMs).toISOString()}`}; sibling ${account?.label ?? "none"}`,
+    `thread ${threadId}: resume owner ${session.accountLabel} ${ownerParkedReason !== undefined ? `parked (${ownerParkedReason})` : ownerUnfit ? `does not offer ${session.model ?? "?"}` : `cools until ${new Date(untilMs).toISOString()}`}; sibling ${account?.label ?? "none"}`,
   );
   if (account === null) {
     // §2.3 п.7: a parked owner is never touched — with no free sibling the
     // resume fails honestly instead of launching agy on the banned home.
-    const ownerEntry =
-      session.accountLabel !== null
-        ? ledger.accounts[session.accountLabel]
-        : undefined;
-    if (ownerEntry?.parkedReason !== undefined) {
+    if (ownerParkedReason !== undefined) {
       const eligible = listAccounts(dataDir).filter(
         (a) => accountPriority(ledger.accounts[a.label]) > 0,
       );
@@ -3549,7 +3555,7 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
             (a) => ledger.accounts[a.label]?.parkedReason !== undefined,
           )
           ? "every pool account is parked; clear a parkedReason in accounts-state.json and retry"
-          : `account ${session.accountLabel} is parked (${ownerEntry.parkedReason}); unpark it in accounts-state.json and retry`,
+          : `account ${session.accountLabel} is parked (${ownerParkedReason}); unpark it in accounts-state.json and retry`,
       );
       discardSession(session);
       return;
@@ -3560,9 +3566,6 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
     return;
   }
-  const ownerLabel = session.accountLabel;
-  const ownerParkedReason =
-    ownerLabel !== null ? ledger.accounts[ownerLabel]?.parkedReason : undefined;
   resumeOnSibling(
     session,
     id,
@@ -3613,22 +3616,24 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
       session.baseOptions = { ...session.baseOptions, model: turnOptions.model };
     }
     const { cooled } = sessionAccountCooled(session);
-    if (cooled) {
+    // §2.3 п.7: parked counts on parkedReason alone — an expired cooldown
+    // must not let a turn through to a banned home.
+    const ownerEntry =
+      dataDir !== "" && session.accountLabel !== null
+        ? loadLedger(dataDir).accounts[session.accountLabel]
+        : undefined;
+    if (cooled || ownerEntry?.parkedReason !== undefined) {
       log(
-        `thread ${threadId}: turn/start on cooled account ${session.accountLabel}; rotating first`,
+        `thread ${threadId}: turn/start on ${ownerEntry?.parkedReason !== undefined ? `parked account ${session.accountLabel} (${ownerEntry.parkedReason})` : `cooled account ${session.accountLabel}`}; rotating first`,
       );
       const queued: QueuedDaemonTurn = { kind: "daemon", requestId: id, params };
       session.pendingConsume = queued;
-      const entry =
-        dataDir !== "" && session.accountLabel !== null
-          ? loadLedger(dataDir).accounts[session.accountLabel]
-          : undefined;
       const cause: RotationCause =
-        entry?.parkedReason === "auth-dead"
+        ownerEntry?.parkedReason === "auth-dead"
           ? "auth-dead"
-          : entry?.parkedReason === "tos-disabled"
+          : ownerEntry?.parkedReason === "tos-disabled"
             ? "tos-disabled"
-            : entry?.ineligibleAtMs !== undefined
+            : ownerEntry?.ineligibleAtMs !== undefined
               ? "ineligible"
               : "quota";
       startRotation(
