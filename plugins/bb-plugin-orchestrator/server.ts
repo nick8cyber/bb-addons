@@ -358,7 +358,18 @@ export async function createPlugin(
   bb: BbPluginApi,
   deps: OrchestratorDeps = {},
 ) {
-  const bbCli = deps.bbCli ?? createBbCli();
+  // §4 r33.10 (PLUG-158/NET-36): every `bb` CLI call must reach THIS
+  // server — `bb.server.loopbackBaseUrl` is bind-gated (throws until
+  // the server listens), so it is resolved lazily inside each run.
+  const bbCli =
+    deps.bbCli ??
+    createBbCli(undefined, () => {
+      try {
+        return bb.server.loopbackBaseUrl;
+      } catch {
+        return undefined;
+      }
+    });
   const now = deps.now ?? Date.now;
 
   const settings = bb.settings.define({
