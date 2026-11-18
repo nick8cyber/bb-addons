@@ -1523,6 +1523,8 @@ export async function createPlugin(
             kept: [],
           }),
     kbConfig: () => currentKb.config,
+    markCoordinatorAction: (threadId: string | undefined | null) =>
+      watchdog.markCoordinatorAction(threadId),
     log: bb.log,
     t,
   };
@@ -1726,6 +1728,8 @@ export async function createPlugin(
           return false;
         }
       },
+      markCoordinatorAction: (threadId) =>
+        watchdog.markCoordinatorAction(threadId),
       log: bb.log,
       t,
     });
@@ -2219,7 +2223,17 @@ export async function createPlugin(
         let taskKey = params.ref;
         if (/^\d+$/.test(taskKey)) {
           const row = store.get(Number(taskKey));
-          if (row) taskKey = row.task_key;
+          if (row) {
+            taskKey = row.task_key;
+            if (row.coordinator_thread_id) {
+              watchdog.markCoordinatorAction(row.coordinator_thread_id);
+            }
+          }
+        } else {
+          const row = store.latestDoneResultByTask(taskKey);
+          if (row?.coordinator_thread_id) {
+            watchdog.markCoordinatorAction(row.coordinator_thread_id);
+          }
         }
         assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode());
         return JSON.stringify(
@@ -2676,18 +2690,9 @@ export async function createPlugin(
           argv[i - 1] !== "--priority" && argv[i - 1] !== "--mode" &&
           argv[i - 1] !== "--acceptance" && argv[i - 1] !== "--release-note" &&
           argv[i - 1] !== "--depends-on" && argv[i - 1] !== "--reason" &&
-          argv[i - 1] !== "--target" && argv[i - 1] !== "--comment" &&
-          argv[i - 1] !== "--mark-merged",
+          argv[i - 1] !== "--target" && argv[i - 1] !== "--comment",
       );
       const cmd = positional[0];
-      // §14 (r34.1): `--mark-merged` carries an OPTIONAL sha — the next
-      // arg counts only when it is not another flag.
-      const markMergedArg = (() => {
-        const i = argv.indexOf("--mark-merged");
-        if (i < 0) return undefined;
-        const v = argv[i + 1];
-        return v !== undefined && !v.startsWith("--") ? v : true;
-      })();
 
       try {
         // §5.6 (r33.11): a productive CLI call from a coordinator thread
@@ -3091,7 +3096,30 @@ export async function createPlugin(
         }
 
         if (cmd === "merge") {
-          let ref = positional[1];
+          const hasMarkMerged = argv.includes("--mark-merged");
+          let markMergedVal: boolean | string | undefined = undefined;
+          let ref: string | undefined = undefined;
+
+          if (hasMarkMerged) {
+            const markIdx = argv.indexOf("--mark-merged");
+            const nextArg = argv[markIdx + 1];
+            const nonFlagArgs = positional.slice(1);
+            if (nextArg !== undefined && !nextArg.startsWith("--")) {
+              if (nonFlagArgs.length >= 2) {
+                markMergedVal = nextArg;
+                ref = nonFlagArgs.find((a) => a !== nextArg) ?? nonFlagArgs[0];
+              } else {
+                ref = nextArg;
+                markMergedVal = true;
+              }
+            } else {
+              ref = nonFlagArgs[0];
+              markMergedVal = true;
+            }
+          } else {
+            ref = positional[1];
+          }
+
           if (!ref) {
             throw new OrchestratorError(
               "invalid-arguments",
@@ -3100,7 +3128,17 @@ export async function createPlugin(
           }
           if (/^\d+$/.test(ref)) {
             const row = store.get(Number(ref));
-            if (row) ref = row.task_key;
+            if (row) {
+              ref = row.task_key;
+              if (row.coordinator_thread_id) {
+                watchdog.markCoordinatorAction(row.coordinator_thread_id);
+              }
+            }
+          } else {
+            const row = store.latestDoneResultByTask(ref);
+            if (row?.coordinator_thread_id) {
+              watchdog.markCoordinatorAction(row.coordinator_thread_id);
+            }
           }
           assertGraphAllowsDirectAction(store, ref, getWorkGraphMode());
           if (!ctx.threadId) {
@@ -3115,7 +3153,7 @@ export async function createPlugin(
             into: flag("--into"),
             noAutofix: argv.includes("--no-autofix"),
             dryRun: argv.includes("--dry-run"),
-            markMerged: markMergedArg,
+            markMerged: markMergedVal,
             callerThreadId: ctx.threadId,
           });
           if (json) return jsonOk(res);
@@ -3278,6 +3316,10 @@ export async function createPlugin(
             );
           }
           const caller = await callerFacts(ctx.threadId);
+          const latestDel = store.latestDoneResultByTask(key);
+          if (latestDel?.coordinator_thread_id) {
+            watchdog.markCoordinatorAction(latestDel.coordinator_thread_id);
+          }
           // §17.3 (С1): release runs OUTSIDE the delegate queue — only
           // the release-auditor dispatch inside it is enqueued. A queued
           // release that internally dispatches would deadlock waiting
@@ -3335,14 +3377,17 @@ export async function createPlugin(
 
         if (cmd === "reconcile") {
           const res = await watchdog.reconcile();
+          const upstreamRes = await watchdog.reconcileUpstream();
           return json
-            ? jsonOk({ ok: true, ...res })
+            ? jsonOk({ ok: true, ...res, upstream: upstreamRes })
             : {
                 exitCode: res.errors.length ? 1 : 0,
                 stdout:
                   `reconcile: scanned=${res.scanned} cancelled=${res.cancelled} ` +
                   `relinked=${res.relinked} removed=${res.removed} ` +
-                  `finalized=${res.finalized} retried=${res.retriedSteps}\n` +
+                  `finalized=${res.finalized} retried=${res.retriedSteps} ` +
+                  `upstream_tracker=${upstreamRes.trackerChecked} ` +
+                  `upstream_marked=${upstreamRes.upstreamMarked}\n` +
                   res.errors.map((e) => `error: ${e}\n`).join(""),
               };
         }

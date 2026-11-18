@@ -169,10 +169,3 @@ export function budgetGit(
     });
   };
 }
-
-/** `no-repo` refusal shared by `--mark-merged` paths. */
-export function noRepoError(detail: string): OrchestratorError {
-  return new OrchestratorError("no-repo", `no-repo: ${detail}`);
-}
-
-export { message as upstreamMessage };

@@ -233,6 +233,7 @@ export interface ReleaseDeps {
   kbConfig?: () => KbConfig;
   hostname?: string;
   now?: () => number;
+  markCoordinatorAction?: (threadId: string | undefined | null) => void;
   log?: {
     info?(m: string): void;
     warn?(m: string): void;
@@ -796,6 +797,10 @@ async function acceptTask(
       "release-refused",
       t("rel.acceptFailed", { key, missing: missing.join("; ") }),
     );
+  }
+  // §5.6 п.4а (r34.1): release marks both the caller and the delegation coordinator active
+  if (executor?.coordinator_thread_id) {
+    deps.markCoordinatorAction?.(executor.coordinator_thread_id);
   }
   return {
     taskKey: key,
@@ -3421,7 +3426,12 @@ export async function pumpReleases(deps: ReleaseDeps): Promise<PumpSummary> {
           deps.store.getRelease(row.id) ?? fresh,
         );
       } else if (fresh.status === "published") {
-        await finishPublished(deps, fresh, null);
+        const latestDel = deps.store.latestDoneResultByTask(fresh.task_key);
+        if (latestDel?.merge_status === "merged-upstream") {
+          await finishMergedUpstream(deps, fresh);
+        } else {
+          await finishPublished(deps, fresh, null);
+        }
       }
     } catch (e) {
       deps.log?.warn?.(

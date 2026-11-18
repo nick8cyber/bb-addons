@@ -3406,19 +3406,18 @@ export function createWatchdog(deps: WatchdogDeps) {
   const reconcileRepoUpstream = async (
     rows: DelegationRow[],
     projectId: string | null,
-    history: boolean,
-  ): Promise<{ fetchFailed: boolean }> => {
+  ): Promise<{ fetchFailed: boolean; marked: number }> => {
     if (!deps.upstream || !projectId || !rows.length) {
-      return { fetchFailed: false };
+      return { fetchFailed: false, marked: 0 };
     }
     const u = deps.upstream;
     try {
       const projects = await u.projects();
       const localHost = String((await u.localHostId()) ?? "");
       const repo = projectRepoPath(projects, projectId, localHost, localHost);
-      if (!repo) return { fetchFailed: false };
+      if (!repo) return { fetchFailed: false, marked: 0 };
       const cfg = u.releaseConfig();
-      if (!cfg.config) return { fetchFailed: false };
+      if (!cfg.config) return { fetchFailed: false, marked: 0 };
       let target = "main";
       try {
         const pid = await settingsProjectId(
@@ -3449,15 +3448,24 @@ export function createWatchdog(deps: WatchdogDeps) {
       } catch {
         // settings project unresolved / ambiguous — the whole project
         // is skipped this pass (spec: «проект пропускается»).
-        return { fetchFailed: false };
+        return { fetchFailed: false, marked: 0 };
       }
       const git = budgetGit(u.git);
-      const fetchRes = await fetchTargetBranch(git, repo, target, {
-        timeoutMs: 15_000,
-      });
-      if (fetchRes.exitCode !== 0) {
-        return { fetchFailed: true };
+      let fetchRes;
+      try {
+        fetchRes = await fetchTargetBranch(git, repo, target, {
+          timeoutMs: 15_000,
+        });
+      } catch (e) {
+        log.warn?.(
+          `orchestrator: fetch target branch ${target} in ${repo}: ${message(e)}`,
+        );
+        return { fetchFailed: true, marked: 0 };
       }
+      if (fetchRes.exitCode !== 0) {
+        return { fetchFailed: true, marked: 0 };
+      }
+      let marked = 0;
       for (const row of rows) {
         try {
           if (row.status !== "done" || !row.result_sha) continue;
@@ -3477,18 +3485,19 @@ export function createWatchdog(deps: WatchdogDeps) {
             `origin/${target}`,
             upstreamMergedSha(undefined, row.result_sha, c),
           );
+          marked++;
         } catch (e) {
           log.warn?.(
             `orchestrator: upstream check ${row.task_key}: ${message(e)}`,
           );
         }
       }
-      return { fetchFailed: false };
+      return { fetchFailed: false, marked };
     } catch (e) {
       log.warn?.(
         `orchestrator: upstream pass ${projectId}: ${message(e)}`,
       );
-      return { fetchFailed: false };
+      return { fetchFailed: true, marked: 0 };
     }
   };
 
@@ -3502,9 +3511,14 @@ export function createWatchdog(deps: WatchdogDeps) {
    * `result_sha` is already on `origin/<targetBranch>` (ancestor or
    * squash-equal). The 5 s tick never does network/git itself.
    */
-  const reconcileUpstreamPass = async (): Promise<void> => {
-    if (upstreamRunning) return;
+  const reconcileUpstreamPass = async (): Promise<{
+    trackerChecked: number;
+    upstreamMarked: number;
+  }> => {
+    if (upstreamRunning) return { trackerChecked: 0, upstreamMarked: 0 };
     upstreamRunning = true;
+    let trackerChecked = 0;
+    let upstreamMarked = 0;
     try {
       const installedAt =
         Number(store.metaGet(META_INSTALLED_AT) ?? 0) || 0;
@@ -3517,6 +3531,7 @@ export function createWatchdog(deps: WatchdogDeps) {
         )) {
           if (seen.has(row.id)) continue;
           seen.add(row.id);
+          trackerChecked++;
           // 1) tracker status — every pending task is checked.
           try {
             const status = await trackerTaskStatus(row.task_key);
@@ -3547,7 +3562,8 @@ export function createWatchdog(deps: WatchdogDeps) {
         }
       }
       for (const [projectId, rows] of byProject) {
-        await reconcileRepoUpstream(rows, projectId, false);
+        const r = await reconcileRepoUpstream(rows, projectId);
+        upstreamMarked += r.marked;
       }
     } catch (e) {
       log.warn?.(`orchestrator: upstream pass: ${message(e)}`);
@@ -3557,6 +3573,7 @@ export function createWatchdog(deps: WatchdogDeps) {
       // so nudges never wait on a dead tracker (stale-on-error).
       trackerCacheWarmedUp = true;
     }
+    return { trackerChecked, upstreamMarked };
   };
 
   /**
@@ -3581,7 +3598,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     }
     let fetchFailed = false;
     for (const [projectId, rows] of byProject) {
-      const r = await reconcileRepoUpstream(rows, projectId, true);
+      const r = await reconcileRepoUpstream(rows, projectId);
       fetchFailed = fetchFailed || r.fetchFailed;
     }
     if (!fetchFailed) {
@@ -3736,10 +3753,6 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.metaSet(coordSeqKey(threadId), String(cursor));
           w = store.coordinatorWatchdogGet(threadId)!;
         }
-        // One forward pass — refreshes last_activity_at AND resets the
-        // nudge schedule on an owner turn newer than the last nudge.
-        await coordinatorScanJournal(threadId, w.last_nudge_at);
-        w = store.coordinatorWatchdogGet(threadId)!;
         // §5.6 (r34.1): the inactivity gate — a thread with no owner
         // turn or productive action longer than the limit is a dead
         // thread: no nudges, no escalation, ever.
@@ -3769,7 +3782,20 @@ export function createWatchdog(deps: WatchdogDeps) {
           nextIdx <= maxNudges
             ? coordinatorIntervalMs(nextIdx, baseMs)
             : coordinatorIntervalMs(maxNudges, baseMs) + 4 * baseMs;
-        if (nowMs - anchor < targetMs) {
+        // §5.6 п.1 (r34.1): journal forward-scan runs only after the
+        // cheap filters — when due for a nudge/escalation OR to check if
+        // an owner turn answered an already-sent nudge.
+        if (w.nudge_count > 0 || nowMs - anchor >= targetMs) {
+          await coordinatorScanJournal(threadId, w.last_nudge_at);
+          w = store.coordinatorWatchdogGet(threadId)!;
+        }
+        if (w.idle_since == null || nowMs - w.idle_since < targetMs) {
+          continue;
+        }
+        if (
+          w.last_activity_at !== 0 &&
+          nowMs - w.last_activity_at > maxAgeMs
+        ) {
           continue;
         }
         const tasksText =

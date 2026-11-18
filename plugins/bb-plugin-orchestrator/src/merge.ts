@@ -186,6 +186,8 @@ export interface MergeDeps {
     repoPath: string,
     projectId: string | null,
   ) => boolean | Promise<boolean>;
+  /** §5.6 п.4а (r34.1): productive merge marks the delegation's coordinator active. */
+  markCoordinatorAction?: (threadId: string | undefined | null) => void;
   log?: { warn?(message: string): void };
   /** §18.1: the language catalog (defaults to T_RU). */
   t?: T;
@@ -508,6 +510,10 @@ export async function runMerge(
       `thread ${params.callerThreadId} has no orchestrator role`,
       "only a thread with the orchestrator role may merge results",
     );
+  }
+  // §5.6 п.4а (r34.1): merge marks both caller and task coordinator active
+  if (row.coordinator_thread_id) {
+    deps.markCoordinatorAction?.(row.coordinator_thread_id);
   }
   // §14 `--mark-merged` (r34.1): only checks 0 (caller role) and 1
   // (row state, minus `result_dirty`) — helpers/environment/lock/
