@@ -533,11 +533,21 @@ export async function createPlugin(
         "§32 (r34): Task work-graph mode: `off` (default, r33 compatibility), `shadow` (audit/DB tracking, CLI queue commands enabled), or `strict` (graph-managed tasks, direct delegate/merge/release blocked outside run-queue).",
       default: "off",
     },
+    // §28.2 (r34, ADR-0032): maximum concurrent running tasks in task_queue.
+    maxActiveTasks: {
+      type: "number",
+      label: "Max active graph tasks",
+      description:
+        "§28.2: Maximum concurrently running tasks in task_queue (default 1).",
+      default: 1,
+    },
   });
 
   let currentSettings = await settings.get();
   const getWorkGraphMode = (): WorkGraphMode =>
     normalizeWorkGraphMode(currentSettings.workGraph);
+  const getMaxActiveTasks = (): number =>
+    Math.max(1, Number(currentSettings.maxActiveTasks) || 1);
   /** §18.1 (PLUG-247a): the selected language and its translator.
    * `t` is a STABLE forwarding wrapper — deps objects capture it once,
    * a `language` change only rebinds `currentT`, and every later call
@@ -1544,6 +1554,22 @@ export async function createPlugin(
       bb.log.warn(`orchestrator release pump: ${describeError(e)}`),
     );
 
+  const pumpRunQueue = () => {
+    const mode = getWorkGraphMode();
+    if (mode === "off") return Promise.resolve();
+    return runRunQueue({
+      store,
+      workGraphMode: mode,
+      maxActiveTasks: getMaxActiveTasks(),
+      repoRoot: process.cwd(),
+      cmd,
+      bbCli,
+      t,
+    }).catch((e) =>
+      bb.log.warn(`orchestrator run-queue: ${describeError(e)}`),
+    );
+  };
+
   /**
    * A thread's worktree: `threads.get` gives the environment id, `bb
    * environment show` its facts (§4.1, §14). Shared by the watchdog's
@@ -1837,6 +1863,7 @@ export async function createPlugin(
         await watchdog.reconcile();
         await helperWatchdog.reconcile();
         await pumpRelease();
+        await pumpRunQueue();
       });
       maybeCheckPresets();
       const reconcileTimer = setInterval(() => {
@@ -1844,6 +1871,7 @@ export async function createPlugin(
           await watchdog.reconcile();
           await helperWatchdog.reconcile();
           await pumpRelease();
+          await pumpRunQueue();
         });
         maybeCheckPresets();
       }, 60_000);
@@ -1853,6 +1881,7 @@ export async function createPlugin(
             await watchdog.checkTimers();
             await helperWatchdog.checkTimers();
             await pumpRelease();
+            await pumpRunQueue();
           }),
         5_000,
       );
@@ -3699,6 +3728,11 @@ abandoned: ${res.reported
           const res = await runRunQueue({
             store,
             workGraphMode: getWorkGraphMode(),
+            maxActiveTasks: getMaxActiveTasks(),
+            repoRoot: ctx.cwd || process.cwd(),
+            cmd: cmdRunner,
+            bbCli,
+            t,
           });
           return json
             ? jsonOk(res)
