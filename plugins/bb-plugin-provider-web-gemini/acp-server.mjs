@@ -961,7 +961,7 @@ export function resolveModelId(val) {
   const v = val.toLowerCase().trim();
   if (v === "fast" || v === "flash" || v === "lite" || v.includes("flash-lite") || v.includes("flash")) return "flash-lite";
   if (v.includes("carbon")) return "carbon";
-  if (v.includes("argon")) return "argon";
+  if (v.includes("argon") || v.includes("neon")) return "argon";
   if (v.includes("hydrogen")) return "hydrogen";
   if (v.includes("pro")) return "pro";
   const exact = MODELS.find((m) => m.value === v || m.name.toLowerCase() === v);

@@ -387,10 +387,60 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   );
   assert.equal(clickedLocked, false, "Locked model item must not be clicked");
 
+  // PLUG-324: Test ModelUnavailable on «Code & complex work | 4 Carbon» with upsell_* mode-id
+  let clickedCarbonUpsell = false;
+  const mockPageCarbonUpsell = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Code & complex work | 4 Carbon",
+        evaluate: async (fn) => {
+          const fakeEl = {
+            querySelectorAll: () => [],
+            hasAttribute: () => false,
+            getAttribute: (n) => (n === "data-mode-id" ? "upsell_MODE_CATEGORY_ULTRA" : null),
+            classList: { contains: () => false },
+          };
+          try {
+            return fn(fakeEl);
+          } catch {
+            return false;
+          }
+        },
+        click: async () => {
+          clickedCarbonUpsell = true;
+        },
+      },
+    ],
+    waitForSelector: async () => ({
+      innerText: async () => "4 Hydrogen",
+      getAttribute: async () => "4 Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await assert.rejects(
+    async () => {
+      await selectModelAndThinking(mockPageCarbonUpsell, "carbon", null, true);
+    },
+    (err) => {
+      assert.ok(err instanceof ModelUnavailable);
+      assert.equal(err.isLocked, true);
+      assert.equal(err.lockedModel, "carbon");
+      assert.match(err.message, /carbon locked: paid upgrade required/i);
+      return true;
+    }
+  );
+  assert.equal(clickedCarbonUpsell, false, "Carbon item with upsell_* mode-id must not be clicked");
+
   // Test resolveModelId for aliases and official labels
   const { resolveModelId } = await import("../acp-server.mjs");
   assert.equal(resolveModelId("argon"), "argon");
   assert.equal(resolveModelId("Gemini 4 Argon"), "argon");
+  assert.equal(resolveModelId("neon"), "argon");
+  assert.equal(resolveModelId("Gemini 4 Neon"), "argon");
   assert.equal(resolveModelId("carbon"), "carbon");
   assert.equal(resolveModelId("Gemini 4 Carbon"), "carbon");
   assert.equal(resolveModelId("hydrogen"), "hydrogen");
@@ -425,6 +475,200 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   };
   await selectModelAndThinking(mockPageArgon, "argon", null, true);
   assert.equal(clickedArgon, true, "Argon in Russian UI must be clicked when requested");
+
+  // PLUG-324: Test successful selection of argon with renamed picker item "Deeper analysis | 4 Neon"
+  let clickedNeon = false;
+  const mockPageNeon = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Deeper analysis | 4 Neon",
+        evaluate: async () => false,
+        click: async () => { clickedNeon = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async () => ({
+      innerText: async () => "4 Hydrogen",
+      getAttribute: async () => "4 Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  await selectModelAndThinking(mockPageNeon, "argon", null, true);
+  assert.equal(clickedNeon, true, "Picker item 'Deeper analysis | 4 Neon' must be clicked when requested model is argon");
+
+  // PLUG-324: Test Russian variant "Глубокий анализ | 4 Neon"
+  let clickedNeonRu = false;
+  const mockPageNeonRu = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Глубокий анализ | 4 Neon",
+        evaluate: async () => false,
+        click: async () => { clickedNeonRu = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async () => ({
+      innerText: async () => "4 Hydrogen",
+      getAttribute: async () => "4 Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  await selectModelAndThinking(mockPageNeonRu, "argon", null, true);
+  assert.equal(clickedNeonRu, true, "Picker item 'Глубокий анализ | 4 Neon' must be clicked when requested model is argon");
+
+  // PLUG-324: Test fallback path of getPickerButton when primary selector is not found
+  // (a) Mock page whose waitForSelector returns null and evaluateHandle runs the regex
+  // against a visible "Deeper analysis | 4 Neon" button in document.querySelectorAll.
+  let clickedFallbackNeon = false;
+  const mockFallbackNeonButton = {
+    offsetParent: {}, // visible
+    innerText: "4 Neon",
+    getAttribute: (name) => (name === "aria-label" ? "Deeper analysis" : null),
+  };
+  const mockHiddenNeonButton = {
+    offsetParent: null, // invisible, must be filtered out
+    innerText: "Deeper analysis | 4 Neon",
+    getAttribute: () => "Deeper analysis",
+  };
+  const mockOtherButton = {
+    offsetParent: {},
+    innerText: "Settings",
+    getAttribute: () => "Settings",
+  };
+
+  const mockPageFallbackNeon = {
+    $: async () => null,
+    $$: async () => [],
+    evaluate: async () => false,
+    waitForSelector: async () => null, // primary picker button selector fails
+    evaluateHandle: async (fn) => {
+      const prevDoc = globalThis.document;
+      try {
+        globalThis.document = {
+          querySelectorAll: () => [mockHiddenNeonButton, mockOtherButton, mockFallbackNeonButton],
+        };
+        const domEl = fn();
+        if (!domEl) return { asElement: () => null };
+        return {
+          asElement: () => ({
+            innerText: async () => domEl.innerText,
+            getAttribute: async (name) => domEl.getAttribute(name),
+            click: async () => { clickedFallbackNeon = true; },
+          }),
+        };
+      } finally {
+        globalThis.document = prevDoc;
+      }
+    },
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  // When fallback button already shows Neon / Deeper analysis, selectModelAndThinking recognizes argon is selected
+  await selectModelAndThinking(mockPageFallbackNeon, "argon", null, true);
+
+  // Test fallback button showing another model (Hydrogen) opening menu to select Neon
+  let clickedMenuNeonFromFallback = false;
+  const mockFallbackHydrogenButton = {
+    offsetParent: {},
+    innerText: "4 Hydrogen",
+    getAttribute: (name) => (name === "aria-label" ? "Hydrogen" : null),
+  };
+  const mockPageFallbackHydrogen = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Deeper analysis | 4 Neon",
+        evaluate: async () => false,
+        click: async () => { clickedMenuNeonFromFallback = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async (sel) => {
+      if (typeof sel === "string" && sel.includes("gem-menu-item")) {
+        return { innerText: async () => "" };
+      }
+      return null;
+    },
+    evaluateHandle: async (fn) => {
+      const prevDoc = globalThis.document;
+      try {
+        globalThis.document = {
+          querySelectorAll: () => [mockHiddenNeonButton, mockOtherButton, mockFallbackHydrogenButton],
+        };
+        const domEl = fn();
+        if (!domEl) return { asElement: () => null };
+        return {
+          asElement: () => ({
+            innerText: async () => domEl.innerText,
+            getAttribute: async (name) => domEl.getAttribute(name),
+            click: async () => {},
+          }),
+        };
+      } finally {
+        globalThis.document = prevDoc;
+      }
+    },
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await selectModelAndThinking(mockPageFallbackHydrogen, "argon", null, true);
+  assert.equal(clickedMenuNeonFromFallback, true, "Menu item Neon must be clicked after opening menu from fallback Hydrogen button");
+
+  // Test fallback button failure when no button matches known model regex
+  const mockPageFallbackFail = {
+    $: async () => null,
+    $$: async () => [],
+    evaluate: async () => false,
+    waitForSelector: async () => null,
+    evaluateHandle: async (fn) => {
+      const prevDoc = globalThis.document;
+      try {
+        globalThis.document = {
+          querySelectorAll: () => [mockOtherButton],
+        };
+        const domEl = fn();
+        if (!domEl) return { asElement: () => null };
+        return {
+          asElement: () => ({
+            innerText: async () => domEl.innerText,
+            getAttribute: async (name) => domEl.getAttribute(name),
+            click: async () => {},
+          }),
+        };
+      } finally {
+        globalThis.document = prevDoc;
+      }
+    },
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await assert.rejects(
+    async () => selectModelAndThinking(mockPageFallbackFail, "argon", null, true),
+    /Model picker button not found/,
+    "When fallback button does not match known models regex, getPickerButton must throw"
+  );
+
+  // (b) Source assertion on getPickerButton fallback regex literal
+  const pickerFallbackMatch = driverSrc.match(/getPickerButton[\s\S]*?const\s+re\s*=\s*\/([^/]+)\/i/);
+  assert.ok(pickerFallbackMatch, "gemini-driver.js must have fallback regex in getPickerButton");
+  const fallbackRegexBody = pickerFallbackMatch[1];
+  assert.ok(
+    fallbackRegexBody.includes("neon"),
+    `getPickerButton fallback regex must include 'neon' (got: /${fallbackRegexBody}/i)`
+  );
+  assert.ok(
+    fallbackRegexBody.includes("deeper analysis"),
+    `getPickerButton fallback regex must include 'deeper analysis' (got: /${fallbackRegexBody}/i)`
+  );
 
   // Verification that target is validated after last user-query with promptPrefix
   assert.ok(
@@ -2161,6 +2405,52 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   // Hidden badge and no-icon items → NOT locked.
   assert.equal(menuItemHasLockIcon(item([icon({ innerText: "lock", offsetParent: null })])), false, "hidden icon");
   assert.equal(menuItemHasLockIcon(item([])), false, "no icons");
+
+  // PLUG-324: data-mode-id upsell format (e.g. upsell_MODE_CATEGORY_ULTRA)
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "upsell_MODE_CATEGORY_ULTRA" : null),
+    }),
+    true,
+    "data-mode-id 'upsell_MODE_CATEGORY_ULTRA' must be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "upsell_PRO_PLUS" : null),
+    }),
+    true,
+    "data-mode-id 'upsell_*' must be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "MODE_CATEGORY_NEON" : null),
+    }),
+    false,
+    "data-mode-id without upsell prefix must not be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "mode_no_upsell" : null),
+    }),
+    false,
+    "data-mode-id containing 'upsell' as substring must not be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "upselling_tier" : null),
+    }),
+    false,
+    "data-mode-id with 'upsell' not followed by underscore must not be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: () => null,
+      querySelector: () => ({ getAttribute: () => "upsell_MODE_CATEGORY_ULTRA" }),
+      closest: () => ({ getAttribute: () => "upsell_MODE_CATEGORY_ULTRA" }),
+    }),
+    false,
+    "descendant or ancestor data-mode-id must not lock the item (only own attribute)"
+  );
 
   // --- upsell dialog predicate: lock only with an explicit plan-change CTA ---
   const btn = (text, onClick) => ({ innerText: text, click: onClick || (() => {}) });
