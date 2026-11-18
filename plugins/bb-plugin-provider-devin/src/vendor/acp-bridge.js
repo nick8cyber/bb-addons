@@ -24576,6 +24576,7 @@ function runTurn(session, firstInput, turnAlreadyOpen = false) {
                     {
                       type: "text",
                       text: "[bb recovery] Предыдущий ответ прервался из-за зависания стрима CLI. Продолжи выполнение последнего запроса без повторения уже завершённых шагов.",
+                      mentions: [],
                     },
                   ],
                   requestId: null,

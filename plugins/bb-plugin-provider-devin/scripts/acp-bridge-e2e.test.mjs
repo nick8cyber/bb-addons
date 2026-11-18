@@ -80,6 +80,10 @@ class BridgeTestHarness {
     });
   }
 
+  configureSkills(roots = [{ id: "root-1", path: this.testDir, skills: [{ name: "test-skill", description: "Test skill" }] }]) {
+    return this.send("skills/configure", { roots });
+  }
+
   startThread(threadId = "thr_test1", permissionMode = "accept-edits", command = this.fakeAgentPath, instructions = undefined) {
     const isFull = permissionMode === "full";
     return this.send("thread/start", {
@@ -631,6 +635,7 @@ rl.on("line", (line) => {
     BB_DEVIN_CANCEL_GRACE_MS: "80",
   });
   try {
+    await harness.configureSkills();
     await harness.startThread();
     await harness.startTurn("thr_test1", "my test prompt");
     const delta = await harness.waitForDelta((d) => d.kind === "item.textDelta" && d.text?.includes("Предыдущий ответ прервался"), 3500);
@@ -1073,6 +1078,7 @@ rl.on("line", (line) => {
     BB_DEVIN_CANCEL_GRACE_MS: "80",
   });
   try {
+    await harness.configureSkills();
     await harness.startThread("thr_test1", "accept-edits", harness.fakeAgentPath, "System rules");
     await harness.startTurn("thr_test1", "prompt 1");
     const delta = await harness.waitForDelta((d) => d.kind === "item.textDelta" && d.text?.includes("isRecovery"), 4000);
