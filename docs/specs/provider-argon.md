@@ -3,7 +3,7 @@ title: provider-web-gemini (ранее provider-argon) — ACP-провайде�
 status: approved
 owner: coordinator
 date: 2026-11-18
-revision: 23 (r23 — PLUG-303 перелив текста промпта в файл-вложение + PLUG-304 предикат завершения хода и усиленный convId)
+revision: 24 (r24 — PLUG-324 маппинг пикера моделей Neon/Carbon/Hydrogen, префикс «4 », каноническое имя argon покрывает UI-имя Neon, детект upsell_* в data-mode-id)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 ---
 
@@ -45,11 +45,11 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
   - `sessionId` генерируется глобально уникальным в формате `web-gemini-<pid>-<base36-метка-времени>-<счётчик>` (PLUG-284): счётчик только в памяти процесса давал коллизии между параллельными процессами провайдера и после рестартов — bb отказывал в resume с HTTP 409. Сгенерированный id дублируется в `sessions` алиасом `argon-<pid>-<base36-метка-времени>-<счётчик>` для обратной совместимости. Формат строки свободный, внешние потребители его не парсят.
   - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
   - Возвращают список моделей `models.availableModels` в виде объектов `{ modelId, name }` по схеме ACP:
-    - `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию)
-    - `'carbon'` — «Gemini 4 Carbon» (Самые сложные задачи, тариф Ultra)
-    - `'hydrogen'` — «Gemini 4 Hydrogen» (Повседневные дела)
-    - `'pro'` — «Gemini 3.1 Pro» (Исследования)
-    - `'flash-lite'` — «Gemini 3.5 Flash-Lite» (Быстрые ответы)
+    - `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию). В UI Gemini веб-интерфейса слот Argon переименован в «Neon» («4 Neon» / «Deeper analysis» / «Глубокий анализ»). В BB сохраняется каноническое имя `argon`, покрывающее UI-имя Neon;
+    - `'carbon'` — «Gemini 4 Carbon» («4 Carbon» / «Code & complex work» / «Самые сложные задачи», тариф Ultra);
+    - `'hydrogen'` — «Gemini 4 Hydrogen» («4 Hydrogen» / «Повседневные дела»);
+    - `'pro'` — «Gemini 3.1 Pro» (Исследования);
+    - `'flash-lite'` — «Gemini 3.5 Flash-Lite» (Быстрые ответы).
   - Возвращают конфигурационные опции `configOptions`:
     - `model` (категория `"model"`): выбор модели из списка `MODELS` (`argon`, `carbon`, `hydrogen`, `pro`, `flash-lite`), отфильтрованного по совместимости с выбранным аккаунтом (см. предикат `supported` ниже): при явном `s.account` — только модели, поддерживаемые этим аккаунтом; при `s.account === "auto"` — объединение: модель видна, если её поддерживает хотя бы один аккаунт пула (например, `carbon` видна только при наличии незалоченного Ultra-аккаунта);
     - `thought_level` (категория `"thought_level"`): значения `low` / `medium` / `high`, синхронизированные с `capabilities.reasoningLevels` BB (`Low`, `Medium`, `High`);
@@ -219,8 +219,8 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
   - английские форматы: `"Limit resets 2:19 AM"`, `"Limit resets at 14:30"`, `"Limit resets tomorrow at 11:00 AM"`, `"Limit resets Oct 15, 2:19 AM"`, `"Limit resets on Nov 16, 11:00 PM"`;
   - русские форматы: `"Лимит обновится в 14:30"`, `"Лимит сбросится завтра в 09:15"`.
   Правило переноса года: если дата в сообщении указана без года (например, `"Oct 15"`), то если вычисленная дата оказывается раньше текущей больше чем на 30 дней (`targetMs < nowMs - 30 * 86_400_000`), она переносится на следующий год, иначе остаётся в текущем году. К вычисленному времени добавляется буфер 2 минуты (`+ 2 * 60_000`).
-- **Детектирование значка замка и строгий выбор уровня мышления** (точный предикат — PLUG-282, ложнопозитивы 16.11 помечали `argon` залоченным на аккаунтах, где модель доступна):
-  - `menuItemHasLockIcon(el)` — замком считается **только визуально видимая** иконка (`offsetParent !== null`) внутри именно этого пункта меню, чья Material-идентичность **точно** равна `lock`/`lock-filled` по одному из каналов: `innerText` === `'lock'`, `data-mat-icon-name`/`aria-label` === `'lock'`/`'lock-filled'`, либо точный токен `'lock'`/`'lock-filled'` среди классов (split по пробелам с равенством). Подстроки в `className`/`innerText` — `'unlock'`, `'lock_open'`, `'mat-icon-lock-reset'` — замком **не** являются. Если замок обнаружен, драйвер не совершает клик по платному пункту (чтобы не вызывать модальное окно с предложением сменить план) и сразу выбрасывает `ModelUnavailable('model', '<model> locked: paid upgrade required')` с `isLocked = true` и `lockedModel`.
+- **Детектирование значка замка и строгий выбор уровня мышления** (точный предикат — PLUG-282, ложнопозитивы 16.11 помечали `argon` залоченным на аккаунтах, где модель доступна; PLUG-324 — детектирование `upsell_*` в `data-mode-id`):
+  - `menuItemHasLockIcon(el)` — замком считается признак `upsell_*` в атрибуте `data-mode-id` пункта меню (например, `upsell_MODE_CATEGORY_ULTRA` для заблокированной модели Carbon в новом пикере), либо **только визуально видимая** иконка (`offsetParent !== null`) внутри именно этого пункта меню, чья Material-идентичность **точно** равна `lock`/`lock-filled` по одному из каналов: `innerText` === `'lock'`, `data-mat-icon-name`/`aria-label` === `'lock'`/`'lock-filled'`, либо точный токен `'lock'`/`'lock-filled'` среди классов (split по пробелам с равенством). Подстроки в `className`/`innerText` — `'unlock'`, `'lock_open'`, `'mat-icon-lock-reset'` — замком **не** являются. Если замок обнаружен, драйвер не совершает клик по платному пункту (чтобы не вызывать модальное окно с предложением сменить план) и сразу выбрасывает `ModelUnavailable('model', '<model> locked: paid upgrade required')` с `isLocked = true` и `lockedModel`.
   - Замок по посткликовому диалогу (заблокированная модель кликабельна — клик открывает апсейл) засчитывается только при **двух** условиях: диалог появился **прямым откликом на клик** по этому пункту **и** несёт явный апгрейд-CTA:
     - перед кликом (strict-путь) `markVisibleDialogs` помечает все видимые диалоги атрибутом `data-web-gemini-pre-click`; `upsellDialogConfirmsLock` пропускает помеченные — открытое ранее промо, даже с кнопкой смены плана, замком не является (показ скрытого до клика диалога — отклик, он не помечен);
     - после клика (+500 мс) `selectedNow` перечитывает кнопку пикера: если запрошенная модель выбралась — замка нет независимо от попапов;
@@ -334,6 +334,21 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 - **Два канала скачивания:** прямой GET через `context.request` того же браузерного контекста (имя из `Content-Disposition`, атрибута `download` или пути URL; `content-length` проверяется до чтения тела) и клик по элементу с перехватом `page.waitForEvent('download')` (хост `download.url()` сверяется с `isAllowedDownloadHost`, когда доступен; `suggestedFilename` → `saveAs`). Сохранение атомарное — `<dest>.part` + `rename` — в `downloads/<sessionId>-<ts>-<n>-<name>`; имя проходит `sanitizeDownloadName` (≤120 символов, без `..`, сепараторов, `#` и управляющих символов).
 - **Лимиты и отказоустойчивость:** ≤ `WEB_GEMINI_MAX_DOWNLOAD_BYTES` / `ARGON_MAX_DOWNLOAD_BYTES` (по умолчанию 50 МБ) на файл, ≤ `WEB_GEMINI_MAX_DOWNLOAD_COUNT` / `ARGON_MAX_DOWNLOAD_COUNT` (по умолчанию 5) за ответ и потолок попыток `max(8, 2 × WEB_GEMINI_MAX_DOWNLOAD_COUNT / ARGON_MAX_DOWNLOAD_COUNT)` — длинный хвост неудачных кандидатов не растягивает ход. Превышение и ошибки кандидатов попадают в `skipped` и не роняют ход; сбой самого сканера — только `console.warn`. Отмена хода проверяется между кандидатами через `throwIfCancelled`. Результат — `res.files[]` (`{ path, name, mimeType, sizeBytes }`) и `res.skippedDownloads[]` (`{ name, reason }`), которые `acp-server.mjs` превращает в `resource_link`-чанки и текстовые пометки (§2.2 п.7, §2.4).
 
+### 4.6 Выбор модели в веб-интерфейсе и маппинг пикера (PLUG-324)
+
+- В веб-интерфейсе Gemini слот модели «Argon» переименован в «Neon» («4 Neon» / «Deeper analysis» / «Глубокий анализ»).
+- Каноническое имя в BB остаётся `argon`, покрывая UI-имя Neon:
+  - в `acp-server.mjs`: `resolveModelId` сопоставляет `'neon'` и `'gemini 4 neon'` со значением `'argon'`;
+  - в `src/gemini-driver.js`: карта `modelKeywords` связывает канонические имена с подписями нового и прежнего UI:
+    - `argon`: `['argon', 'neon', 'deeper analysis', 'глубокий анализ', 'код и анализ']` (плюс зеркальный алиас `neon`);
+    - `carbon`: `['carbon', 'code & complex work', 'code and complex work', 'самые сложные задачи']`;
+    - `hydrogen`: `['hydrogen', 'повседневные дела']`;
+    - `pro`: `['pro', 'исследования']`;
+    - `flash-lite` / `lite` / `fast`: `['flash-lite', 'lite', 'быстрые ответы']`.
+- Префикс «4 » («4 Neon», «4 Carbon», «4 Hydrogen») поддерживается за счёт разбиения текста пунктов на строки и поиска подстрок (`includes` / `wordMatch`).
+- Детектирование Ultra-lock: пункты с `data-mode-id`, начинающимся на `upsell_` (например, `upsell_MODE_CATEGORY_ULTRA` для заблокированной модели Carbon), распознаются функцией `menuItemHasLockIcon` как заблокированные до совершения клика, предотвращая показ диалога апгрейда плана и инициируя прозрачную ротацию на подходящий аккаунт.
+- Fallback-поиск кнопки пикера `getPickerButton`: регулярное выражение включает `neon` и `deeper analysis`.
+
 ---
 
 ## 5. Переносимость и гигиена репозитория
@@ -369,6 +384,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
   16. Веб-вложения файлов (PLUG-291): `collectUploadFiles` — приём `file://` `resource_link` и `image`/`localFile`, игнор URL и `resource`-блоков, дедуп по `realpath` до count-лимита, resolve относительных `path` от `s.cwd`, корни `cwd` + `additionalDirectories`/`roots`, отказы `outside session roots` / `not found` / `not a file` / `sensitive` / `too many upload files`, симлинк наружу; `pruneDir` — TTL и ограничение по числу файлов; `sanitizeDownloadName` и `isAllowedDownloadHost` (включая отказ `google.com.evil.com`); `collectGeneratedFiles` на mock-DOM — прямой URL через `context.request` и клик через `download`-событие, атомарные имена `<sessionId>-<ts>-<n>-<name>` без `.part`-остатков, пустой результат без DOM/каталога; `sendPrompt` — `attachFile` для каждого файла строго до вставки текста, `res.files`/`skippedDownloads` в результате; e2e FAKE — `file://` вне корней → `-32602`, внутри `cwd` → принят (§2.4, §4.5).
   17. Обратную совместимость переименования `provider-argon` → `provider-web-gemini` (PLUG-298): двойную регистрацию провайдеров — основной `acp-web-gemini` (`Gemini (Web)`, бейдж `Gemini`) и legacy-алиас `acp-argon` (`Gemini (Argon)`); приём переменных `WEB_GEMINI_*` (`WEB_GEMINI_FAKE`, `WEB_GEMINI_FAKE_DELAY_MS`, `WEB_GEMINI_STATE_DIR`, `WEB_GEMINI_POOL_FILE`, `WEB_GEMINI_USE_BUNDLED`) с фолбэком на `ARGON_*`; генерацию sessionId с префиксом `web-gemini-*` и регистрацию алиаса `argon-*` в `sessions` (`session/new` и `session/load`), чтобы клиенты, продолжающие сессии по старому префиксу, попадали в ту же сессию.
   18. Предикат завершения хода (PLUG-304): `checkTurnStatus` на DOM-фикстурах — инцидент «42 символа в `message-content` + spinner/thinking при отсутствии stop-кнопки» не завершает ход; сценарии паузы после thinking без action-кнопок, завершённого ответа с action-кнопками (Copy/Good response), avatar-изображения до появления `message-content`, наличия stop-кнопки, `aria-busy`/`shimmer`/`thinking-indicator`; двойной порог `isTurnComplete` (500 мс с action-кнопками / 5000 мс фолбэк) и сброс стабильности при росте текста; интеграционный `sendPrompt` — полный текст ответа вместо усечённого thinking-фрагмента, стриминг чанков `onChunk`, захват `convId` из URL (§4.2, §4.3).
+  19. Маппинг переименованного пикера моделей (Neon/Carbon/Hydrogen) и детект Ultra-lock (PLUG-324): выбор пункта пикера «Deeper analysis | 4 Neon» (и RU-варианта «Глубокий анализ | 4 Neon») при `model: 'argon'`; детектирование пункта «Code & complex work | 4 Carbon» со значением `upsell_MODE_CATEGORY_ULTRA` (и любым `upsell_*`) в `data-mode-id` как заблокированного (`isLocked: true`, `ModelUnavailable`) без совершения клика; сохранение обратной совместимости старых подписей («Argon», «Код и анализ», «Самые сложные задачи»); распознавание Neon в `resolveModelId` как `argon`; поддержка fallback-кнопки пикера с Neon/Deeper analysis (§4.6).
 - Набор `tests/provider-web-gemini-tools.test.mjs` (47 тестов, офлайн) покрывает инструменты чтения веб-Gemini по спеке `provider-web-gemini-tools.md`: разбор текстового протокола вызовов инструментов, sandbox `cwd` (запрет `..`, абсолютных путей и симлинков наружу, чёрный список чувствительных файлов), белый список `git`-команд, маскировку секретов `[скрыто: <тип>]`, раунды tool-loop и лимит `WEB_GEMINI_MAX_TOOL_ROUNDS` / `ARGON_MAX_TOOL_ROUNDS`, упаковку первого сообщения (вложения файлов/тредов/задач, потолок `WEB_GEMINI_MAX_MESSAGE_BYTES` / `ARGON_MAX_MESSAGE_BYTES`).
 
 ---

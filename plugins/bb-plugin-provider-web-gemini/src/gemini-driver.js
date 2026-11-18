@@ -367,7 +367,7 @@ async function getPickerButton(page) {
   // Fallback: a visible button whose text/aria-label names a known model.
   const handle = await page.evaluateHandle(() => {
     const vis = (el) => !!(el && el.offsetParent !== null);
-    const re = /argon|hydrogen|flash|flash-lite|\bpro\b|lite|carbon/i;
+    const re = /argon|neon|deeper analysis|hydrogen|flash|flash-lite|\bpro\b|lite|carbon/i;
     return [...document.querySelectorAll('button,[role="button"]')]
       .filter(vis)
       .find((e) => re.test(e.innerText + ' ' + (e.getAttribute('aria-label') || '')));
@@ -455,15 +455,27 @@ function throwIfPromptTooLarge(prompt, fieldMaxBytes = null) {
 // 'mat-icon-lock-reset' etc. A real lock badge is a *visible* icon whose
 // Material identity is exactly 'lock'. Self-contained so Playwright can
 // serialize it into the page and unit tests can call it on a fake DOM.
+// PLUG-324: check data-mode-id attribute for upsell markers (e.g. upsell_MODE_CATEGORY_ULTRA).
 function menuItemHasLockIcon(el) {
-  const icons = [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')];
+  if (!el) return false;
+  const rawModeId =
+    (typeof el.getAttribute === 'function' ? el.getAttribute('data-mode-id') : null) ||
+    (el.dataset && el.dataset.modeId) ||
+    (typeof el.querySelector === 'function' ? el.querySelector('[data-mode-id]')?.getAttribute('data-mode-id') : null) ||
+    (typeof el.closest === 'function' ? el.closest('[data-mode-id]')?.getAttribute('data-mode-id') : null) ||
+    '';
+  const modeId = String(rawModeId).trim().toLowerCase();
+  if (modeId.startsWith('upsell_') || modeId.startsWith('upsell') || modeId.includes('upsell')) return true;
+
+  const icons = typeof el.querySelectorAll === 'function'
+    ? [...el.querySelectorAll('mat-icon, [class*="icon"], gem-icon')]
+    : [];
   return icons.some((icon) => {
     if (icon.offsetParent === null) return false;
     const t = (icon.innerText || '').trim().toLowerCase();
     if (t === 'lock') return true;
     const attr = (
-      icon.getAttribute('data-mat-icon-name') ||
-      icon.getAttribute('aria-label') ||
+      (typeof icon.getAttribute === 'function' && (icon.getAttribute('data-mat-icon-name') || icon.getAttribute('aria-label'))) ||
       ''
     ).trim().toLowerCase();
     if (attr === 'lock' || attr === 'lock-filled') return true;
@@ -537,8 +549,9 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
       const btnAria = ((await btn.getAttribute('aria-label')) || '').toLowerCase();
       const m = model.toLowerCase();
       const modelKeywords = {
-        argon: ['argon', 'код и анализ'],
-        carbon: ['carbon', 'самые сложные задачи'],
+        argon: ['argon', 'neon', 'deeper analysis', 'глубокий анализ', 'код и анализ'],
+        neon: ['neon', 'deeper analysis', 'глубокий анализ', 'argon', 'код и анализ'],
+        carbon: ['carbon', 'code & complex work', 'code and complex work', 'самые сложные задачи'],
         hydrogen: ['hydrogen', 'повседневные дела'],
         pro: ['pro', 'исследования'],
         'flash-lite': ['flash-lite', 'lite', 'быстрые ответы'],

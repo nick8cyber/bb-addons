@@ -387,10 +387,60 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   );
   assert.equal(clickedLocked, false, "Locked model item must not be clicked");
 
+  // PLUG-324: Test ModelUnavailable on «Code & complex work | 4 Carbon» with upsell_* mode-id
+  let clickedCarbonUpsell = false;
+  const mockPageCarbonUpsell = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Code & complex work | 4 Carbon",
+        evaluate: async (fn) => {
+          const fakeEl = {
+            querySelectorAll: () => [],
+            hasAttribute: () => false,
+            getAttribute: (n) => (n === "data-mode-id" ? "upsell_MODE_CATEGORY_ULTRA" : null),
+            classList: { contains: () => false },
+          };
+          try {
+            return fn(fakeEl);
+          } catch {
+            return false;
+          }
+        },
+        click: async () => {
+          clickedCarbonUpsell = true;
+        },
+      },
+    ],
+    waitForSelector: async () => ({
+      innerText: async () => "4 Hydrogen",
+      getAttribute: async () => "4 Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await assert.rejects(
+    async () => {
+      await selectModelAndThinking(mockPageCarbonUpsell, "carbon", null, true);
+    },
+    (err) => {
+      assert.ok(err instanceof ModelUnavailable);
+      assert.equal(err.isLocked, true);
+      assert.equal(err.lockedModel, "carbon");
+      assert.match(err.message, /carbon locked: paid upgrade required/i);
+      return true;
+    }
+  );
+  assert.equal(clickedCarbonUpsell, false, "Carbon item with upsell_* mode-id must not be clicked");
+
   // Test resolveModelId for aliases and official labels
   const { resolveModelId } = await import("../acp-server.mjs");
   assert.equal(resolveModelId("argon"), "argon");
   assert.equal(resolveModelId("Gemini 4 Argon"), "argon");
+  assert.equal(resolveModelId("neon"), "argon");
+  assert.equal(resolveModelId("Gemini 4 Neon"), "argon");
   assert.equal(resolveModelId("carbon"), "carbon");
   assert.equal(resolveModelId("Gemini 4 Carbon"), "carbon");
   assert.equal(resolveModelId("hydrogen"), "hydrogen");
@@ -425,6 +475,52 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   };
   await selectModelAndThinking(mockPageArgon, "argon", null, true);
   assert.equal(clickedArgon, true, "Argon in Russian UI must be clicked when requested");
+
+  // PLUG-324: Test successful selection of argon with renamed picker item "Deeper analysis | 4 Neon"
+  let clickedNeon = false;
+  const mockPageNeon = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Deeper analysis | 4 Neon",
+        evaluate: async () => false,
+        click: async () => { clickedNeon = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async () => ({
+      innerText: async () => "4 Hydrogen",
+      getAttribute: async () => "4 Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  await selectModelAndThinking(mockPageNeon, "argon", null, true);
+  assert.equal(clickedNeon, true, "Picker item 'Deeper analysis | 4 Neon' must be clicked when requested model is argon");
+
+  // PLUG-324: Test Russian variant "Глубокий анализ | 4 Neon"
+  let clickedNeonRu = false;
+  const mockPageNeonRu = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Глубокий анализ | 4 Neon",
+        evaluate: async () => false,
+        click: async () => { clickedNeonRu = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async () => ({
+      innerText: async () => "4 Hydrogen",
+      getAttribute: async () => "4 Hydrogen",
+      click: async () => {},
+    }),
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+  await selectModelAndThinking(mockPageNeonRu, "argon", null, true);
+  assert.equal(clickedNeonRu, true, "Picker item 'Глубокий анализ | 4 Neon' must be clicked when requested model is argon");
 
   // Verification that target is validated after last user-query with promptPrefix
   assert.ok(
@@ -2161,6 +2257,29 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   // Hidden badge and no-icon items → NOT locked.
   assert.equal(menuItemHasLockIcon(item([icon({ innerText: "lock", offsetParent: null })])), false, "hidden icon");
   assert.equal(menuItemHasLockIcon(item([])), false, "no icons");
+
+  // PLUG-324: data-mode-id upsell format (e.g. upsell_MODE_CATEGORY_ULTRA)
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "upsell_MODE_CATEGORY_ULTRA" : null),
+    }),
+    true,
+    "data-mode-id 'upsell_MODE_CATEGORY_ULTRA' must be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "upsell_PRO_PLUS" : null),
+    }),
+    true,
+    "data-mode-id 'upsell_*' must be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "MODE_CATEGORY_NEON" : null),
+    }),
+    false,
+    "data-mode-id without upsell prefix must not be locked"
+  );
 
   // --- upsell dialog predicate: lock only with an explicit plan-change CTA ---
   const btn = (text, onClick) => ({ innerText: text, click: onClick || (() => {}) });
