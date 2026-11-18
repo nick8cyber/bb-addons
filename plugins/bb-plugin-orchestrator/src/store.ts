@@ -374,6 +374,59 @@ export const MIGRATIONS: readonly string[] = [
     escalated_at INTEGER,
     updated_at INTEGER NOT NULL
   )`,
+  // §27.1 (r34, PLUG-309): task_queue and task_transitions for work graph
+  `CREATE TABLE IF NOT EXISTS task_queue (
+    task_key TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    coordinator_thread_id TEXT NOT NULL,
+    route TEXT NOT NULL CHECK(route IN ('feature', 'fix', 'docs', 'simple', 'research')),
+    level TEXT NOT NULL CHECK(level IN ('complex', 'medium', 'simple', 'spec', 'research', 'architect')),
+    node TEXT NOT NULL CHECK(node IN (
+      'start', 'design', 'spec', 'spec_review', 'owner_gate', 'code', 'checks',
+      'review', 'design_check', 'release', 'research'
+    )),
+    status TEXT NOT NULL CHECK(status IN (
+      'queued', 'running', 'waiting_approval', 'waiting_release_note',
+      'pr_open', 'blocked', 'stalled', 'deferred', 'done', 'cancelled'
+    )),
+    priority INTEGER NOT NULL DEFAULT 100,
+    depends_on TEXT DEFAULT NULL,
+    confirmation_mode TEXT NOT NULL DEFAULT 'manual' CHECK(confirmation_mode IN ('auto', 'manual')),
+    branch TEXT DEFAULT NULL,
+    interaction_id TEXT DEFAULT NULL,
+    spec_sha TEXT DEFAULT NULL,
+    acceptance_sha TEXT DEFAULT NULL,
+    result_sha TEXT DEFAULT NULL,
+    release_note TEXT DEFAULT NULL,
+    spec_attempts INTEGER NOT NULL DEFAULT 0,
+    spec_review_rounds INTEGER NOT NULL DEFAULT 0,
+    code_attempts INTEGER NOT NULL DEFAULT 0,
+    check_attempts INTEGER NOT NULL DEFAULT 0,
+    code_review_rounds INTEGER NOT NULL DEFAULT 0,
+    design_check_rounds INTEGER NOT NULL DEFAULT 0,
+    release_attempts INTEGER NOT NULL DEFAULT 0,
+    entered_at INTEGER NOT NULL,
+    deadline_at INTEGER DEFAULT NULL,
+    node_alarm_at INTEGER DEFAULT NULL,
+    deferred_by TEXT DEFAULT NULL,
+    deferred_reason TEXT DEFAULT NULL,
+    payload TEXT DEFAULT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS task_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key TEXT NOT NULL,
+    from_node TEXT NOT NULL,
+    to_node TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    payload TEXT DEFAULT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_key, created_at)`,
 ];
 
 export type CommandRunStatus =
@@ -666,6 +719,108 @@ export interface HelperRow {
 interface SetupError {
   step: string;
   message: string;
+}
+
+// ── §27.1 / §28.1 (r34, PLUG-309): task work-graph types ─────────────
+
+export type TaskRoute = "feature" | "fix" | "docs" | "simple" | "research";
+export type TaskLevel =
+  | "complex"
+  | "medium"
+  | "simple"
+  | "spec"
+  | "research"
+  | "architect";
+export type TaskNode =
+  | "start"
+  | "design"
+  | "spec"
+  | "spec_review"
+  | "owner_gate"
+  | "code"
+  | "checks"
+  | "review"
+  | "design_check"
+  | "release"
+  | "research";
+export type TaskStatus =
+  | "queued"
+  | "running"
+  | "waiting_approval"
+  | "waiting_release_note"
+  | "pr_open"
+  | "blocked"
+  | "stalled"
+  | "deferred"
+  | "done"
+  | "cancelled";
+export type ConfirmationMode = "auto" | "manual";
+
+export interface TaskQueueRow {
+  task_key: string;
+  project_id: string;
+  coordinator_thread_id: string;
+  route: TaskRoute;
+  level: TaskLevel;
+  node: TaskNode;
+  status: TaskStatus;
+  priority: number;
+  depends_on: string | null;
+  confirmation_mode: ConfirmationMode;
+  branch: string | null;
+  interaction_id: string | null;
+  spec_sha: string | null;
+  acceptance_sha: string | null;
+  result_sha: string | null;
+  release_note: string | null;
+  spec_attempts: number;
+  spec_review_rounds: number;
+  code_attempts: number;
+  check_attempts: number;
+  code_review_rounds: number;
+  design_check_rounds: number;
+  release_attempts: number;
+  entered_at: number;
+  deadline_at: number | null;
+  node_alarm_at: number | null;
+  deferred_by: string | null;
+  deferred_reason: string | null;
+  payload: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface TaskTransitionRow {
+  id: number;
+  task_key: string;
+  from_node: TaskNode;
+  to_node: TaskNode;
+  from_status: TaskStatus;
+  to_status: TaskStatus;
+  actor: string;
+  reason: string;
+  payload: string | null;
+  created_at: number;
+}
+
+export interface TransitionTaskInput {
+  taskKey: string;
+  expectedNode: TaskNode;
+  expectedStatus: TaskStatus;
+  toNode: TaskNode;
+  toStatus: TaskStatus;
+  actor: string;
+  reason: string;
+  now?: number;
+  updates?: Partial<Omit<TaskQueueRow, "task_key" | "created_at">>;
+  transitionPayload?: string | null;
+}
+
+export interface TransitionTaskResult {
+  ok: boolean;
+  conflict?: boolean;
+  task?: TaskQueueRow;
+  transitionId?: number;
 }
 
 /** Task keys are case-insensitive in bb; store them uppercased so the
@@ -3544,6 +3699,299 @@ export class DelegationStore {
         .get(normalizeTaskKey(taskKey)) as StagedFeatureRow | undefined) ??
       null
     );
+  }
+
+  // ── §27.1 / §28.1 / §32 (r34, PLUG-309): task_queue and task_transitions ───
+
+  getTask(taskKey: string): TaskQueueRow | null {
+    const row = this.db
+      .prepare(`SELECT * FROM task_queue WHERE task_key = ?`)
+      .get(normalizeTaskKey(taskKey)) as TaskQueueRow | undefined;
+    return row ?? null;
+  }
+
+  insertTask(
+    input: {
+      taskKey: string;
+      projectId: string;
+      coordinatorThreadId: string;
+      route: TaskRoute;
+      level: TaskLevel;
+      priority?: number;
+      dependsOn?: string[] | null;
+      confirmationMode?: ConfirmationMode;
+      branch?: string | null;
+      releaseNote?: string | null;
+      payload?: string | null;
+      actor?: string;
+    },
+    now: number = Date.now(),
+  ): TaskQueueRow {
+    return this.db.transaction(() => {
+      const key = normalizeTaskKey(input.taskKey);
+      const priority = input.priority ?? 100;
+      const confirmationMode = input.confirmationMode ?? "manual";
+      const dependsOn =
+        input.dependsOn && input.dependsOn.length > 0
+          ? JSON.stringify(input.dependsOn.map(normalizeTaskKey))
+          : null;
+
+      this.db
+        .prepare(
+          `INSERT INTO task_queue (
+            task_key, project_id, coordinator_thread_id, route, level,
+            node, status, priority, depends_on, confirmation_mode, branch,
+            release_note, payload, entered_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, 'start', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          key,
+          input.projectId,
+          input.coordinatorThreadId,
+          input.route,
+          input.level,
+          priority,
+          dependsOn,
+          confirmationMode,
+          input.branch ?? null,
+          input.releaseNote ?? null,
+          input.payload ?? null,
+          now,
+          now,
+          now,
+        );
+
+      this.db
+        .prepare(
+          `INSERT INTO task_transitions (
+            task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
+          ) VALUES (?, 'start', 'start', 'queued', 'queued', ?, 'enqueue', ?, ?)`,
+        )
+        .run(
+          key,
+          input.actor ?? "coordinator",
+          input.payload ?? null,
+          now,
+        );
+
+      return this.getTask(key)!;
+    })();
+  }
+
+  resetTaskForEnqueue(
+    input: {
+      taskKey: string;
+      projectId?: string;
+      coordinatorThreadId?: string;
+      route: TaskRoute;
+      level: TaskLevel;
+      priority?: number;
+      dependsOn?: string[] | null;
+      confirmationMode?: ConfirmationMode;
+      branch?: string | null;
+      releaseNote?: string | null;
+      payload?: string | null;
+      actor?: string;
+    },
+    now: number = Date.now(),
+  ): TaskQueueRow {
+    return this.db.transaction(() => {
+      const key = normalizeTaskKey(input.taskKey);
+      const existing = this.getTask(key);
+      if (!existing) {
+        throw new OrchestratorError("task-not-found", `task ${key} not found`);
+      }
+      const priority = input.priority ?? 100;
+      const confirmationMode = input.confirmationMode ?? "manual";
+      const dependsOn =
+        input.dependsOn && input.dependsOn.length > 0
+          ? JSON.stringify(input.dependsOn.map(normalizeTaskKey))
+          : null;
+      const branch = input.branch !== undefined ? input.branch : existing.branch;
+
+      this.db
+        .prepare(
+          `UPDATE task_queue SET
+            route = ?, level = ?, priority = ?, depends_on = ?, confirmation_mode = ?,
+            branch = ?, release_note = ?, payload = ?,
+            node = 'start', status = 'queued',
+            spec_sha = NULL, acceptance_sha = NULL, result_sha = NULL, interaction_id = NULL,
+            spec_attempts = 0, spec_review_rounds = 0, code_attempts = 0, check_attempts = 0,
+            code_review_rounds = 0, design_check_rounds = 0, release_attempts = 0,
+            deadline_at = NULL, node_alarm_at = NULL, deferred_by = NULL, deferred_reason = NULL,
+            entered_at = ?, created_at = ?, updated_at = ?
+          WHERE task_key = ?`,
+        )
+        .run(
+          input.route,
+          input.level,
+          priority,
+          dependsOn,
+          confirmationMode,
+          branch,
+          input.releaseNote ?? null,
+          input.payload ?? null,
+          now,
+          now,
+          now,
+          key,
+        );
+
+      this.db
+        .prepare(
+          `INSERT INTO task_transitions (
+            task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
+          ) VALUES (?, ?, 'start', ?, 'queued', ?, 'enqueue', ?, ?)`,
+        )
+        .run(
+          key,
+          existing.node,
+          existing.status,
+          input.actor ?? "coordinator",
+          input.payload ?? null,
+          now,
+        );
+
+      return this.getTask(key)!;
+    })();
+  }
+
+  updateTask(
+    taskKey: string,
+    updates: Partial<TaskQueueRow>,
+    now: number = Date.now(),
+  ): void {
+    const key = normalizeTaskKey(taskKey);
+    const setClauses: string[] = ["updated_at = ?"];
+    const values: unknown[] = [now];
+    for (const [k, v] of Object.entries(updates)) {
+      if (k !== "task_key" && k !== "updated_at" && v !== undefined) {
+        setClauses.push(`${k} = ?`);
+        values.push(v);
+      }
+    }
+    values.push(key);
+    this.db
+      .prepare(`UPDATE task_queue SET ${setClauses.join(", ")} WHERE task_key = ?`)
+      .run(...values);
+  }
+
+  transitionTask(
+    input: TransitionTaskInput,
+    now: number = Date.now(),
+  ): TransitionTaskResult {
+    return this.db.transaction(() => {
+      const key = normalizeTaskKey(input.taskKey);
+      const existing = this.getTask(key);
+      if (!existing) {
+        return { ok: false, conflict: true };
+      }
+      if (
+        existing.node !== input.expectedNode ||
+        existing.status !== input.expectedStatus
+      ) {
+        return { ok: false, conflict: true, task: existing };
+      }
+
+      const setClauses: string[] = [
+        "node = :toNode",
+        "status = :toStatus",
+        "updated_at = :now",
+      ];
+      const params: Record<string, unknown> = {
+        taskKey: key,
+        expectedNode: input.expectedNode,
+        expectedStatus: input.expectedStatus,
+        toNode: input.toNode,
+        toStatus: input.toStatus,
+        now,
+      };
+
+      if (input.toNode !== input.expectedNode) {
+        setClauses.push("entered_at = :now");
+      }
+
+      if (input.updates) {
+        for (const [k, v] of Object.entries(input.updates)) {
+          if (v !== undefined) {
+            setClauses.push(`${k} = :${k}`);
+            params[k] = v;
+          }
+        }
+      }
+
+      const info = this.db
+        .prepare(
+          `UPDATE task_queue SET ${setClauses.join(", ")}
+           WHERE task_key = :taskKey AND node = :expectedNode AND status = :expectedStatus`,
+        )
+        .run(params);
+
+      if (info.changes === 0) {
+        return {
+          ok: false,
+          conflict: true,
+          task: this.getTask(key) ?? undefined,
+        };
+      }
+
+      const transInfo = this.db
+        .prepare(
+          `INSERT INTO task_transitions (
+            task_key, from_node, to_node, from_status, to_status, actor, reason, payload, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          key,
+          input.expectedNode,
+          input.toNode,
+          input.expectedStatus,
+          input.toStatus,
+          input.actor,
+          input.reason,
+          input.transitionPayload ?? null,
+          now,
+        );
+
+      const updated = this.getTask(key)!;
+      return {
+        ok: true,
+        task: updated,
+        transitionId: Number(transInfo.lastInsertRowid),
+      };
+    })();
+  }
+
+  listQueuedTasks(): TaskQueueRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_queue WHERE status = 'queued' ORDER BY priority DESC, created_at ASC`,
+      )
+      .all() as TaskQueueRow[];
+  }
+
+  listActiveTasks(): TaskQueueRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_queue WHERE status = 'running' ORDER BY priority DESC, created_at ASC`,
+      )
+      .all() as TaskQueueRow[];
+  }
+
+  listAllTasks(): TaskQueueRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_queue ORDER BY priority DESC, created_at ASC`,
+      )
+      .all() as TaskQueueRow[];
+  }
+
+  listTransitions(taskKey: string): TaskTransitionRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_transitions WHERE task_key = ? ORDER BY created_at ASC, id ASC`,
+      )
+      .all(normalizeTaskKey(taskKey)) as TaskTransitionRow[];
   }
 
 }

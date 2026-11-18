@@ -1047,4 +1047,14 @@ export const RU: Record<string, string> = {
   "kb.syncConflict": "kb-refused: sync-conflict: конфликт при синхронизации базы знаний ({error})",
   "kb.syncFailed": "kb-refused: sync-failed: сбой синхронизации с upstream ({error})",
   "kb.disabled": "kb-refused: kb-disabled: база знаний отключена в настройках",
+
+  // ── workgraph.ts / §27–§32 (r34, ADR-0032) — task work graph CLI ────
+  "cli.helpEnqueueS": "Поставить задачу в очередь графа",
+  "cli.helpDequeueS": "Снять задачу с очереди графа (только владелец)",
+  "cli.helpDeferS": "Отложить задачу (только владелец)",
+  "cli.helpRejectS": "Возврат узла на доработку",
+  "cli.helpResumeS": "Возобновить задачу из deferred/blocked/stalled",
+  "cli.helpApproveS": "Одобрение перехода owner_gate в режиме manual",
+  "cli.helpReleaseNoteS": "Передать заметку релиза при статусе waiting_release_note",
+  "cli.helpRunQueueS": "Один такт конвейера графа задач",
 };

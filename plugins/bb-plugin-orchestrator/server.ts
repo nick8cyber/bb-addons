@@ -142,6 +142,19 @@ import {
 } from "./src/i18n/index.js";
 import { resolveRepoPath } from "./src/packet.js";
 import { KbService, parseKbConfig, type KbConfig } from "./src/kb.js";
+import {
+  assertGraphAllowsDirectAction,
+  normalizeWorkGraphMode,
+  runApprove,
+  runDequeue,
+  runDefer,
+  runEnqueue,
+  runReject,
+  runReleaseNote,
+  runResume,
+  runRunQueue,
+  type WorkGraphMode,
+} from "./src/workgraph.js";
 
 /** §13.2 п.1: the new-chat window's role picker writes the project's
  * current selection through `setPendingRole`; `pendingRole` reads it back
@@ -512,9 +525,19 @@ export async function createPlugin(
       experimental_multiline: true,
       default: "",
     },
+    // §32 (r34, ADR-0032): task work graph mode.
+    workGraph: {
+      type: "string",
+      label: "Work graph mode",
+      description:
+        "§32 (r34): Task work-graph mode: `off` (default, r33 compatibility), `shadow` (audit/DB tracking, CLI queue commands enabled), or `strict` (graph-managed tasks, direct delegate/merge/release blocked outside run-queue).",
+      default: "off",
+    },
   });
 
   let currentSettings = await settings.get();
+  const getWorkGraphMode = (): WorkGraphMode =>
+    normalizeWorkGraphMode(currentSettings.workGraph);
   /** §18.1 (PLUG-247a): the selected language and its translator.
    * `t` is a STABLE forwarding wrapper — deps objects capture it once,
    * a `language` change only rebinds `currentT`, and every later call
@@ -1317,7 +1340,8 @@ export async function createPlugin(
     ).system?.config?.();
     return sys?.primaryHostId ?? "";
   };
-  const cmd = deps.cmd ?? createCmd();
+  const cmdRunner = deps.cmd ?? createCmd();
+  const cmd = cmdRunner;
   let currentKb = parseKbConfig(currentSettings.kb, t);
   const kbService = new KbService({
     cmd,
@@ -1541,6 +1565,27 @@ export async function createPlugin(
       path: env.path,
       branchName: env.branchName,
       mergeBaseBranch: mergeBase,
+    };
+  };
+
+  const resolveWorktreeContext = async (threadId?: string) => {
+    if (threadId) {
+      const env = await environmentOf(threadId).catch(() => null);
+      if (env?.path) {
+        return {
+          repoRoot: env.path,
+          mergeBaseBranch: env.mergeBaseBranch || "main",
+        };
+      }
+    }
+    const rev = await cmd
+      .run("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd() })
+      .catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+    const repoRoot =
+      rev.exitCode === 0 && rev.stdout.trim() ? rev.stdout.trim() : process.cwd();
+    return {
+      repoRoot,
+      mergeBaseBranch: "main",
     };
   };
 
@@ -1950,6 +1995,7 @@ export async function createPlugin(
       // §5.6 (r33.11): a productive call resets the idle nudge schedule.
       watchdog.markCoordinatorAction(ctx.threadId);
       try {
+        assertGraphAllowsDirectAction(store, params.taskKey, getWorkGraphMode());
         const res = await delegate({ ...params, threadId: ctx.threadId });
         return JSON.stringify({
           ...res,
@@ -2088,6 +2134,12 @@ export async function createPlugin(
       // §5.6 (r33.11): a productive call resets the idle nudge schedule.
       watchdog.markCoordinatorAction(ctx.threadId);
       try {
+        let taskKey = params.ref;
+        if (/^\d+$/.test(taskKey)) {
+          const row = store.get(Number(taskKey));
+          if (row) taskKey = row.task_key;
+        }
+        assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode());
         return JSON.stringify(
           await mergeDelegation({ ...params, callerThreadId: ctx.threadId }),
         );
@@ -2470,6 +2522,49 @@ export async function createPlugin(
         summary: t("cli.helpKbS"),
         usage: t("cli.kbUsage"),
       },
+      {
+        name: "enqueue",
+        summary: t("cli.helpEnqueueS"),
+        usage:
+          "bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research] [--acceptance <file|text>] [--release-note <text>] [--depends-on <k1,k2>] [--force-reset-branch] [--json]",
+      },
+      {
+        name: "dequeue",
+        summary: t("cli.helpDequeueS"),
+        usage: "bb orchestrator dequeue <KEY> [--reason <reason>] [--json]",
+      },
+      {
+        name: "defer",
+        summary: t("cli.helpDeferS"),
+        usage: "bb orchestrator defer <KEY> --reason <reason> [--json]",
+      },
+      {
+        name: "reject",
+        summary: t("cli.helpRejectS"),
+        usage:
+          "bb orchestrator reject <KEY> [--target spec|design|code] --reason <reason> [--json]",
+      },
+      {
+        name: "resume",
+        summary: t("cli.helpResumeS"),
+        usage:
+          "bb orchestrator resume <KEY> [--target spec|design|code|release] [--reopen] [--json]",
+      },
+      {
+        name: "approve",
+        summary: t("cli.helpApproveS"),
+        usage: "bb orchestrator approve <KEY> [--comment <text>] [--json]",
+      },
+      {
+        name: "release-note",
+        summary: t("cli.helpReleaseNoteS"),
+        usage: 'bb orchestrator release-note <KEY> "<note>" [--json]',
+      },
+      {
+        name: "run-queue",
+        summary: t("cli.helpRunQueueS"),
+        usage: "bb orchestrator run-queue [--once] [--json]",
+      },
     ],
     async run(argv, ctx: PluginCliContext) {
       const json = argv.includes("--json");
@@ -2495,7 +2590,11 @@ export async function createPlugin(
           argv[i - 1] !== "--title" &&
           argv[i - 1] !== "--message" && argv[i - 1] !== "--file" &&
           argv[i - 1] !== "--content" && argv[i - 1] !== "--query" &&
-          argv[i - 1] !== "--limit",
+          argv[i - 1] !== "--limit" &&
+          argv[i - 1] !== "--priority" && argv[i - 1] !== "--mode" &&
+          argv[i - 1] !== "--acceptance" && argv[i - 1] !== "--release-note" &&
+          argv[i - 1] !== "--depends-on" && argv[i - 1] !== "--reason" &&
+          argv[i - 1] !== "--target" && argv[i - 1] !== "--comment",
       );
       const cmd = positional[0];
 
@@ -2505,9 +2604,22 @@ export async function createPlugin(
         // outcome need not succeed).
         if (
           cmd !== undefined &&
-          ["delegate", "cancel", "merge", "release", "helper", "kb"].includes(
-            cmd,
-          )
+          [
+            "delegate",
+            "cancel",
+            "merge",
+            "release",
+            "helper",
+            "kb",
+            "enqueue",
+            "dequeue",
+            "defer",
+            "reject",
+            "resume",
+            "approve",
+            "release-note",
+            "run-queue",
+          ].includes(cmd)
         ) {
           watchdog.markCoordinatorAction(ctx.threadId);
         }
@@ -2762,6 +2874,7 @@ export async function createPlugin(
               t("cli.delegateUsage"),
             );
           }
+          assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode());
           const attach = flags("--attach");
           const res = await delegate({
             taskKey,
@@ -2887,13 +3000,18 @@ export async function createPlugin(
         }
 
         if (cmd === "merge") {
-          const ref = positional[1];
+          let ref = positional[1];
           if (!ref) {
             throw new OrchestratorError(
               "invalid-arguments",
               t("cli.mergeUsage"),
             );
           }
+          if (/^\d+$/.test(ref)) {
+            const row = store.get(Number(ref));
+            if (row) ref = row.task_key;
+          }
+          assertGraphAllowsDirectAction(store, ref, getWorkGraphMode());
           if (!ctx.threadId) {
             throw new OrchestratorError(
               "no-caller-thread",
@@ -3049,6 +3167,7 @@ export async function createPlugin(
               t("cli.releaseUsageShort"),
             );
           }
+          assertGraphAllowsDirectAction(store, key, getWorkGraphMode());
           if (flag("--kb") && flag("--no-kb")) {
             throw new OrchestratorError(
               "invalid-arguments",
@@ -3304,6 +3423,202 @@ abandoned: ${res.reported
             "invalid-arguments",
             t("cli.unknownJanitorSub", { sub }),
           );
+        }
+
+        if (cmd === "enqueue") {
+          const taskKey = positional[1];
+          if (!taskKey) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "укажи ключ задачи: bb orchestrator enqueue <KEY> ...",
+            );
+          }
+          const wtCtx = await resolveWorktreeContext(ctx.threadId);
+          const res = await runEnqueue(
+            {
+              taskKey,
+              priority:
+                flag("--priority") !== undefined
+                  ? Number(flag("--priority"))
+                  : undefined,
+              mode: flag("--mode"),
+              route: flag("--route"),
+              level: flag("--level"),
+              acceptance: flag("--acceptance"),
+              releaseNote: flag("--release-note"),
+              dependsOn: flag("--depends-on"),
+              forceResetBranch: argv.includes("--force-reset-branch"),
+            },
+            {
+              store,
+              cmd: cmdRunner,
+              bbCli,
+              ctx,
+              workGraphMode: getWorkGraphMode(),
+              repoRoot: wtCtx.repoRoot,
+              mergeBaseBranch: wtCtx.mergeBaseBranch,
+              now,
+              hasChecksCommands: Boolean(
+                releaseConfig.config?.defaults?.checks &&
+                  releaseConfig.config.defaults.checks.length > 0,
+              ),
+            },
+          );
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `enqueued ${res.task.task_key} (${res.task.route}/${res.task.level}, branch: ${res.task.branch ?? "none"}, status: ${res.task.status})\n`,
+              };
+        }
+
+        if (cmd === "dequeue") {
+          const taskKey = positional[1];
+          if (!taskKey) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "укажи ключ задачи: bb orchestrator dequeue <KEY> ...",
+            );
+          }
+          const wtCtx = await resolveWorktreeContext(ctx.threadId);
+          const res = await runDequeue(taskKey, flag("--reason"), {
+            store,
+            cmd: cmdRunner,
+            ctx,
+            workGraphMode: getWorkGraphMode(),
+            repoRoot: wtCtx.repoRoot,
+            now,
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `dequeued ${res.task.task_key} (status: ${res.task.status})\n`,
+              };
+        }
+
+        if (cmd === "defer") {
+          const taskKey = positional[1];
+          if (!taskKey) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "укажи ключ задачи: bb orchestrator defer <KEY> --reason <причина>",
+            );
+          }
+          const res = await runDefer(taskKey, flag("--reason"), {
+            store,
+            ctx,
+            workGraphMode: getWorkGraphMode(),
+            now,
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `deferred ${res.task.task_key} (${res.task.deferred_reason})\n`,
+              };
+        }
+
+        if (cmd === "reject") {
+          const taskKey = positional[1];
+          if (!taskKey) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "укажи ключ задачи: bb orchestrator reject <KEY> [--target <t>] --reason <причина>",
+            );
+          }
+          const res = await runReject(taskKey, flag("--target"), flag("--reason"), {
+            store,
+            ctx,
+            workGraphMode: getWorkGraphMode(),
+            now,
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `rejected ${res.task.task_key} -> node: ${res.task.node}, status: ${res.task.status}\n`,
+              };
+        }
+
+        if (cmd === "resume") {
+          const taskKey = positional[1];
+          if (!taskKey) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "укажи ключ задачи: bb orchestrator resume <KEY> [--target <t>]",
+            );
+          }
+          const res = await runResume(taskKey, flag("--target"), {
+            store,
+            ctx,
+            workGraphMode: getWorkGraphMode(),
+            now,
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `resumed ${res.task.task_key} -> node: ${res.task.node}, status: ${res.task.status}\n`,
+              };
+        }
+
+        if (cmd === "approve") {
+          const taskKey = positional[1];
+          if (!taskKey) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              "укажи ключ задачи: bb orchestrator approve <KEY> [--comment <text>]",
+            );
+          }
+          const res = await runApprove(taskKey, flag("--comment"), {
+            store,
+            ctx,
+            workGraphMode: getWorkGraphMode(),
+            now,
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `approved ${res.task.task_key} -> node: ${res.task.node}, status: ${res.task.status}\n`,
+              };
+        }
+
+        if (cmd === "release-note") {
+          const taskKey = positional[1];
+          const note = positional[2];
+          if (!taskKey || !note) {
+            throw new OrchestratorError(
+              "invalid-arguments",
+              'укажи ключ и заметку: bb orchestrator release-note <KEY> "<заметка>"',
+            );
+          }
+          const res = await runReleaseNote(taskKey, note, {
+            store,
+            ctx,
+            workGraphMode: getWorkGraphMode(),
+            now,
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `release note recorded for ${res.task.task_key}\n`,
+              };
+        }
+
+        if (cmd === "run-queue") {
+          const res = await runRunQueue({
+            store,
+            workGraphMode: getWorkGraphMode(),
+          });
+          return json
+            ? jsonOk(res)
+            : {
+                exitCode: 0,
+                stdout: `run-queue: active=${res.activeCount} queued=${res.queuedCount} ready=${res.readyCount}\n`,
+              };
         }
 
         throw new OrchestratorError(

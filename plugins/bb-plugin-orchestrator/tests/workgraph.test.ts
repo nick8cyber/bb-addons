@@ -1,0 +1,866 @@
+import assert from "node:assert/strict";
+import test, { beforeEach, after } from "node:test";
+import Database from "better-sqlite3";
+import { makeTempDir } from "./helpers/temp.js";
+import {
+  createFakePluginHost,
+} from "@get-bb/plugin-sdk/testing";
+import type { BbCli, BbCliResult } from "../src/bb-cli.js";
+import type { CmdRunner } from "../src/cmd.js";
+import { DelegationStore, MIGRATIONS } from "../src/store.js";
+import { createPlugin } from "../server.js";
+import {
+  computeTaskBranch,
+  isOwnerCalling,
+  normalizeWorkGraphMode,
+} from "../src/workgraph.js";
+
+const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
+beforeEach(() => {
+  delete process.env.BB_THREAD_ID;
+});
+after(() => {
+  if (ORIGINAL_BB_THREAD_ID !== undefined) {
+    process.env.BB_THREAD_ID = ORIGINAL_BB_THREAD_ID;
+  } else {
+    delete process.env.BB_THREAD_ID;
+  }
+});
+
+const ok = (stdout = ""): BbCliResult => ({ exitCode: 0, stdout, stderr: "" });
+
+const POLICY_TEXT = JSON.stringify({
+  version: 1,
+  limits: { maxActive: 5 },
+  levels: {
+    simple: { chain: ["simple"] },
+    complex: { chain: ["simple"] },
+  },
+  routes: {
+    simple: { preset: "simple", provider: "acp-opencode" },
+  },
+});
+
+function fakeCli(respond?: (args: string[]) => BbCliResult | undefined): {
+  cli: BbCli;
+  calls: string[][];
+} {
+  const calls: string[][] = [];
+  return {
+    calls,
+    cli: {
+      run: async (args) => {
+        calls.push(args);
+        const custom = respond?.(args);
+        if (custom) return custom;
+        const key = args.join(" ");
+        if (key.startsWith("tasks preset list"))
+          return ok(JSON.stringify({ presets: [{ name: "simple", id: "p1" }] }));
+        if (key.startsWith("tasks preset show"))
+          return ok(
+            JSON.stringify({
+              preset: {
+                providerId: "p",
+                modelId: "m1",
+                reasoningLevel: "medium",
+                permissionMode: "auto",
+                environmentKind: "project-default",
+              },
+            }),
+          );
+        if (key.startsWith("tasks show"))
+          return ok(
+            JSON.stringify({
+              task: {
+                id: "task-1",
+                key: args[2] ?? "PLUG-1",
+                title: "Test Task Slug Feature",
+                status: "in_progress",
+              },
+              project: { name: "p", linkedBbProjectId: "proj_bb" },
+              subtasks: [],
+              attachments: [],
+              comments: [],
+            }),
+          );
+        if (key.startsWith("thread show"))
+          return ok(
+            JSON.stringify({
+              thread: {
+                parentThreadId: "thr_coord",
+                parentNotifications: "auto",
+                visibility: "hidden",
+              },
+            }),
+          );
+        return ok();
+      },
+    },
+  };
+}
+
+function fakeCmd(
+  overrides?: (file: string, args: string[]) => BbCliResult | undefined,
+): { cmd: CmdRunner; calls: { file: string; args: string[] }[] } {
+  const calls: { file: string; args: string[] }[] = [];
+  return {
+    calls,
+    cmd: {
+      run: async (file, args) => {
+        calls.push({ file, args });
+        const res = overrides?.(file, args);
+        if (res) return res;
+        const key = `${file} ${args.join(" ")}`;
+        if (key.includes("rev-parse --show-toplevel")) {
+          return ok("/tmp/fake-repo");
+        }
+        if (key.includes("rev-parse --verify")) {
+          // default: refs don't exist
+          return { exitCode: 1, stdout: "", stderr: "fatal: Needed a single revision" };
+        }
+        if (key.includes("ls-remote")) {
+          return ok("");
+        }
+        return ok();
+      },
+    },
+  };
+}
+
+async function hostWith(
+  settings: Record<string, string | boolean> = {},
+  cli: BbCli = fakeCli().cli,
+  cmdRunner?: CmdRunner,
+) {
+  const host = createFakePluginHost({
+    pluginId: "orchestrator",
+    dataDir: makeTempDir("orch-wg-"),
+    settings: {
+      policy: POLICY_TEXT,
+      language: "ru",
+      workGraph: "shadow",
+      ...settings,
+    },
+    agentSkillIds: [
+      "orchestrator-setup",
+      "orchestrator-coordinator",
+      "orchestrator-setup-ru",
+      "orchestrator-coordinator-ru",
+    ],
+  });
+  await createPlugin(host.bb, {
+    bbCli: cli,
+    ...(cmdRunner ? { cmd: cmdRunner } : {}),
+  });
+  return host;
+}
+
+// ── 1. Schema & Check Constraints (§27.1) ─────────────────────────────
+
+test("task_queue and task_transitions check constraints and defaults", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // Insert valid task
+  const task = store.insertTask({
+    taskKey: "PLUG-10",
+    projectId: "proj_1",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    priority: 150,
+  });
+
+  assert.equal(task.task_key, "PLUG-10");
+  assert.equal(task.route, "feature");
+  assert.equal(task.level, "complex");
+  assert.equal(task.node, "start");
+  assert.equal(task.status, "queued");
+  assert.equal(task.priority, 150);
+  assert.equal(task.confirmation_mode, "manual");
+  assert.equal(task.spec_attempts, 0);
+  assert.equal(task.code_attempts, 0);
+
+  // Initial transition recorded
+  const transitions = store.listTransitions("PLUG-10");
+  assert.equal(transitions.length, 1);
+  assert.equal(transitions[0]!.from_node, "start");
+  assert.equal(transitions[0]!.to_node, "start");
+  assert.equal(transitions[0]!.from_status, "queued");
+  assert.equal(transitions[0]!.to_status, "queued");
+  assert.equal(transitions[0]!.reason, "enqueue");
+
+  // Invalid route rejected by CHECK constraint
+  assert.throws(
+    () =>
+      db
+        .prepare(
+          `INSERT INTO task_queue (
+            task_key, project_id, coordinator_thread_id, route, level,
+            node, status, entered_at, created_at, updated_at
+          ) VALUES ('PLUG-INV-1', 'p', 'c', 'invalid_route', 'complex', 'start', 'queued', 1, 1, 1)`,
+        )
+        .run(),
+    /CHECK constraint failed/,
+  );
+
+  // Invalid level rejected
+  assert.throws(
+    () =>
+      db
+        .prepare(
+          `INSERT INTO task_queue (
+            task_key, project_id, coordinator_thread_id, route, level,
+            node, status, entered_at, created_at, updated_at
+          ) VALUES ('PLUG-INV-2', 'p', 'c', 'feature', 'ultra_complex', 'start', 'queued', 1, 1, 1)`,
+        )
+        .run(),
+    /CHECK constraint failed/,
+  );
+
+  // Invalid node rejected
+  assert.throws(
+    () =>
+      db
+        .prepare(
+          `INSERT INTO task_queue (
+            task_key, project_id, coordinator_thread_id, route, level,
+            node, status, entered_at, created_at, updated_at
+          ) VALUES ('PLUG-INV-3', 'p', 'c', 'feature', 'complex', 'invalid_node', 'queued', 1, 1, 1)`,
+        )
+        .run(),
+    /CHECK constraint failed/,
+  );
+
+  // Invalid status rejected
+  assert.throws(
+    () =>
+      db
+        .prepare(
+          `INSERT INTO task_queue (
+            task_key, project_id, coordinator_thread_id, route, level,
+            node, status, entered_at, created_at, updated_at
+          ) VALUES ('PLUG-INV-4', 'p', 'c', 'feature', 'complex', 'start', 'invalid_status', 1, 1, 1)`,
+        )
+        .run(),
+    /CHECK constraint failed/,
+  );
+
+  // Duplicate task_key rejected by PRIMARY KEY
+  assert.throws(
+    () =>
+      store.insertTask({
+        taskKey: "PLUG-10",
+        projectId: "proj_1",
+        coordinatorThreadId: "thr_coord",
+        route: "feature",
+        level: "complex",
+      }),
+    /UNIQUE constraint failed/,
+  );
+});
+
+// ── 2. CAS Deterministic Transitions (§27.1 п.2, §28.1) ───────────────
+
+test("transitionTask executes atomic CAS and logs in task_transitions", () => {
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  store.insertTask(
+    {
+      taskKey: "PLUG-20",
+      projectId: "proj_1",
+      coordinatorThreadId: "thr_coord",
+      route: "feature",
+      level: "complex",
+    },
+    1000,
+  );
+
+  // Step 1: start/queued -> design/running
+  const res1 = store.transitionTask(
+    {
+      taskKey: "PLUG-20",
+      expectedNode: "start",
+      expectedStatus: "queued",
+      toNode: "design",
+      toStatus: "running",
+      actor: "run-queue",
+      reason: "dispatch-design",
+      now: 1100,
+    },
+    1100,
+  );
+
+  assert.equal(res1.ok, true);
+  assert.equal(res1.task!.node, "design");
+  assert.equal(res1.task!.status, "running");
+  assert.equal(res1.task!.entered_at, 1100);
+  assert.equal(res1.task!.updated_at, 1100);
+
+  // Conflict test: parallel CAS with wrong expectedNode
+  const conflictRes = store.transitionTask(
+    {
+      taskKey: "PLUG-20",
+      expectedNode: "start", // Stale expectation!
+      expectedStatus: "queued",
+      toNode: "spec",
+      toStatus: "running",
+      actor: "parallel-worker",
+      reason: "conflict-attempt",
+      now: 1200,
+    },
+    1200,
+  );
+
+  assert.equal(conflictRes.ok, false);
+  assert.equal(conflictRes.conflict, true);
+  // Row did not change
+  assert.equal(store.getTask("PLUG-20")!.node, "design");
+
+  // Step 2: design/running -> spec/running with acceptance_sha update
+  const res2 = store.transitionTask(
+    {
+      taskKey: "PLUG-20",
+      expectedNode: "design",
+      expectedStatus: "running",
+      toNode: "spec",
+      toStatus: "running",
+      actor: "architect",
+      reason: "acceptance-committed",
+      now: 1300,
+      updates: {
+        acceptance_sha: "sha_acceptance_1",
+      },
+    },
+    1300,
+  );
+
+  assert.equal(res2.ok, true);
+  assert.equal(res2.task!.node, "spec");
+  assert.equal(res2.task!.acceptance_sha, "sha_acceptance_1");
+
+  // Transitions log has 3 entries: enqueue, design, spec
+  const transitions = store.listTransitions("PLUG-20");
+  assert.equal(transitions.length, 3);
+  assert.equal(transitions[1]!.from_node, "start");
+  assert.equal(transitions[1]!.to_node, "design");
+  assert.equal(transitions[1]!.actor, "run-queue");
+  assert.equal(transitions[2]!.from_node, "design");
+  assert.equal(transitions[2]!.to_node, "spec");
+  assert.equal(transitions[2]!.actor, "architect");
+});
+
+// ── 3. Branch Slug & Helper Functions ─────────────────────────────────
+
+test("computeTaskBranch generates deterministic normalized slug", () => {
+  // Route feature with title
+  const b1 = computeTaskBranch("PLUG-100", "feature", "Support OAuth2 Login & Flow!");
+  assert.equal(b1, "bb/plug-100-support-oauth2-login-flow");
+
+  // Long title clamped to 30 chars
+  const b2 = computeTaskBranch(
+    "PLUG-101",
+    "fix",
+    "A Very Long Feature Title That Exceeds Thirty Characters In Length",
+  );
+  assert.equal(b2, "bb/plug-101-a-very-long-feature-title-that");
+  assert.ok(b2!.length <= 30 + "bb/plug-101-".length);
+
+  // Title without latin letters falls back to route
+  const b3 = computeTaskBranch("PLUG-102", "simple", "Проверка русских символов");
+  assert.equal(b3, "bb/plug-102-simple");
+
+  // Route research has no branch
+  const b4 = computeTaskBranch("PLUG-103", "research", "Market Analysis");
+  assert.equal(b4, null);
+});
+
+test("isOwnerCalling checks BB_THREAD_ID and context", () => {
+  // Clean env, no threadId
+  const prevEnv = process.env.BB_THREAD_ID;
+  try {
+    delete process.env.BB_THREAD_ID;
+    assert.equal(isOwnerCalling(), true);
+    assert.equal(isOwnerCalling({ threadId: "" }), true);
+    assert.equal(isOwnerCalling({ threadId: "thr_agent" } as any), false);
+
+    process.env.BB_THREAD_ID = "thr_agent_env";
+    assert.equal(isOwnerCalling(), false);
+    assert.equal(isOwnerCalling({} as any), false);
+  } finally {
+    delete process.env.BB_THREAD_ID;
+  }
+});
+
+test("normalizeWorkGraphMode parses settings", () => {
+  assert.equal(normalizeWorkGraphMode("off"), "off");
+  assert.equal(normalizeWorkGraphMode("shadow"), "shadow");
+  assert.equal(normalizeWorkGraphMode("strict"), "strict");
+  assert.equal(normalizeWorkGraphMode("SHADOW"), "shadow");
+  assert.equal(normalizeWorkGraphMode("unknown"), "off");
+  assert.equal(normalizeWorkGraphMode(undefined), "off");
+});
+
+// ── 4. CLI Queue Commands: enqueue, dequeue, defer, reject, resume, approve, release-note, run-queue ─
+
+test("CLI enqueue creates new task with branch and defaults", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  const res = await host.harness.runCli([
+    "enqueue",
+    "PLUG-200",
+    "--route",
+    "feature",
+    "--level",
+    "complex",
+    "--priority",
+    "80",
+    "--release-note",
+    "feat: initial release note",
+    "--json",
+  ]);
+
+  assert.equal(res.exitCode, 0);
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.task.task_key, "PLUG-200");
+  assert.equal(data.task.route, "feature");
+  assert.equal(data.task.level, "complex");
+  assert.equal(data.task.status, "queued");
+  assert.equal(data.task.priority, 80);
+  assert.equal(data.task.release_note, "feat: initial release note");
+  assert.match(data.task.branch, /^bb\/plug-200-/);
+});
+
+test("CLI enqueue rejects code route with spec or architect level", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  const res = await host.harness.runCli([
+    "enqueue",
+    "PLUG-201",
+    "--route",
+    "feature",
+    "--level",
+    "spec",
+    "--json",
+  ]);
+
+  assert.equal(res.exitCode, 1);
+  const err = JSON.parse(res.stdout);
+  assert.equal(err.error.code, "invalid-level");
+});
+
+test("CLI enqueue prevents double active enqueue", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "PLUG-202", "--route", "feature", "--json"]);
+
+  const res = await host.harness.runCli([
+    "enqueue",
+    "PLUG-202",
+    "--route",
+    "feature",
+    "--json",
+  ]);
+
+  assert.equal(res.exitCode, 1);
+  const err = JSON.parse(res.stdout);
+  assert.equal(err.error.code, "task-already-enqueued");
+});
+
+test("CLI enqueue owner-only flags are rejected from agent thread", async () => {
+  const prevEnv = process.env.BB_THREAD_ID;
+  try {
+    process.env.BB_THREAD_ID = "thr_agent";
+    const host = await hostWith({ workGraph: "shadow" });
+
+    // --mode rejected
+    const resMode = await host.harness.runCli([
+      "enqueue",
+      "PLUG-203",
+      "--mode",
+      "auto",
+      "--json",
+    ]);
+    assert.equal(resMode.exitCode, 1);
+    assert.equal(JSON.parse(resMode.stdout).error.code, "permission-denied");
+    assert.match(
+      JSON.parse(resMode.stdout).error.message,
+      /--mode flag is restricted to owner/,
+    );
+
+    // --acceptance rejected
+    const resAcc = await host.harness.runCli([
+      "enqueue",
+      "PLUG-204",
+      "--acceptance",
+      "acceptance text",
+      "--json",
+    ]);
+    assert.equal(resAcc.exitCode, 1);
+    assert.equal(JSON.parse(resAcc.stdout).error.code, "permission-denied");
+  } finally {
+    delete process.env.BB_THREAD_ID;
+  }
+});
+
+test("CLI enqueue with unmerged branch requires --force-reset-branch", async () => {
+  const fake = fakeCmd((file, args) => {
+    const k = args.join(" ");
+    if (k.includes("rev-parse --verify refs/heads/bb/plug-205")) {
+      return ok("sha_local_unmerged");
+    }
+    if (k.includes("merge-base --is-ancestor")) {
+      // not an ancestor!
+      return { exitCode: 1, stdout: "", stderr: "" };
+    }
+    return undefined;
+  });
+
+  const host = await hostWith({ workGraph: "shadow" }, fakeCli().cli, fake.cmd);
+
+  // Without force reset -> error unmerged-branch-exists
+  const resFail = await host.harness.runCli([
+    "enqueue",
+    "PLUG-205",
+    "--route",
+    "feature",
+    "--json",
+  ]);
+  assert.equal(resFail.exitCode, 1);
+  assert.equal(JSON.parse(resFail.stdout).error.code, "unmerged-branch-exists");
+
+  // With force reset -> passes and archives
+  const resOk = await host.harness.runCli([
+    "enqueue",
+    "PLUG-205",
+    "--route",
+    "feature",
+    "--force-reset-branch",
+    "--json",
+  ]);
+  assert.equal(resOk.exitCode, 0);
+  assert.equal(JSON.parse(resOk.stdout).ok, true);
+
+  // Tag archive created
+  const tagCall = fake.calls.find(
+    (c) =>
+      c.args.includes("tag") &&
+      c.args.some((a) => a.includes("refs/tags/archive/plug-205-force-reset-")),
+  );
+  assert.ok(tagCall, "archive tag should be created on force reset");
+});
+
+test("CLI dequeue owner-only, cancels task and archives branch", async () => {
+  const fake = fakeCmd((file, args) => {
+    const k = args.join(" ");
+    if (k.includes("rev-parse --verify refs/heads/bb/plug-206")) {
+      return ok("sha_local_to_cancel");
+    }
+    return undefined;
+  });
+
+  const host = await hostWith({ workGraph: "shadow" }, fakeCli().cli, fake.cmd);
+  await host.harness.runCli(["enqueue", "PLUG-206", "--json"]);
+
+  // Dequeue with thread ID (agent) -> permission denied
+  const prevEnv = process.env.BB_THREAD_ID;
+  try {
+    process.env.BB_THREAD_ID = "thr_agent";
+    const resAgent = await host.harness.runCli([
+      "dequeue",
+      "PLUG-206",
+      "--reason",
+      "test",
+      "--json",
+    ]);
+    assert.equal(resAgent.exitCode, 1);
+    assert.equal(JSON.parse(resAgent.stdout).error.code, "permission-denied");
+  } finally {
+    delete process.env.BB_THREAD_ID;
+  }
+
+  // Dequeue as owner -> success
+  const resOwner = await host.harness.runCli([
+    "dequeue",
+    "PLUG-206",
+    "--reason",
+    "owner cancelled",
+    "--json",
+  ]);
+  assert.equal(resOwner.exitCode, 0);
+  const data = JSON.parse(resOwner.stdout);
+  assert.equal(data.task.status, "cancelled");
+
+  // Tag archive created for cancelled task
+  const cancelTag = fake.calls.find(
+    (c) =>
+      c.args.includes("tag") &&
+      c.args.some((a) => a.includes("refs/tags/archive/plug-206-cancelled-")),
+  );
+  assert.ok(cancelTag, "archive tag should be created on dequeue");
+});
+
+test("CLI defer and resume from deferred", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "PLUG-207", "--json"]);
+
+  // Defer requires reason
+  const resNoReason = await host.harness.runCli(["defer", "PLUG-207", "--json"]);
+  assert.equal(resNoReason.exitCode, 1);
+  assert.equal(JSON.parse(resNoReason.stdout).error.code, "invalid-arguments");
+
+  // Defer as owner
+  const resDefer = await host.harness.runCli([
+    "defer",
+    "PLUG-207",
+    "--reason",
+    "postponed to next sprint",
+    "--json",
+  ]);
+  assert.equal(resDefer.exitCode, 0);
+  assert.equal(JSON.parse(resDefer.stdout).task.status, "deferred");
+  assert.equal(JSON.parse(resDefer.stdout).task.deferred_by, "owner");
+
+  // Resume from deferred
+  const resResume = await host.harness.runCli(["resume", "PLUG-207", "--json"]);
+  assert.equal(resResume.exitCode, 0);
+  assert.equal(JSON.parse(resResume.stdout).task.status, "running");
+  assert.equal(JSON.parse(resResume.stdout).task.deferred_by, null);
+});
+
+test("CLI reject at owner_gate for feature and docs routes", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "PLUG-208", "--route", "feature", "--json"]);
+
+  // Directly advance store to owner_gate / waiting_approval for testing
+  const db = (host.bb.storage as any).database();
+  const store = new DelegationStore(db);
+  store.transitionTask({
+    taskKey: "PLUG-208",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "owner_gate",
+    toStatus: "waiting_approval",
+    actor: "system",
+    reason: "test-advance",
+  });
+
+  // Reject with target design
+  const resReject = await host.harness.runCli([
+    "reject",
+    "PLUG-208",
+    "--target",
+    "design",
+    "--reason",
+    "redesign required",
+    "--json",
+  ]);
+  assert.equal(resReject.exitCode, 0);
+  const data = JSON.parse(resReject.stdout);
+  assert.equal(data.task.node, "design");
+  assert.equal(data.task.status, "running");
+});
+
+test("CLI approve at owner_gate transitions to code (feature) or release (docs)", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "PLUG-209", "--route", "feature", "--json"]);
+
+  const db = (host.bb.storage as any).database();
+  const store = new DelegationStore(db);
+  store.transitionTask({
+    taskKey: "PLUG-209",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "owner_gate",
+    toStatus: "waiting_approval",
+    actor: "system",
+    reason: "test-advance",
+  });
+
+  // Approve
+  const resApprove = await host.harness.runCli([
+    "approve",
+    "PLUG-209",
+    "--comment",
+    "specs look great",
+    "--json",
+  ]);
+  assert.equal(resApprove.exitCode, 0);
+  const data = JSON.parse(resApprove.stdout);
+  assert.equal(data.task.node, "code");
+  assert.equal(data.task.status, "running");
+
+  // Transitions log reflects approval
+  const transitions = store.listTransitions("PLUG-209");
+  const last = transitions[transitions.length - 1]!;
+  assert.equal(last.from_node, "owner_gate");
+  assert.equal(last.to_node, "code");
+  assert.equal(last.actor, "owner");
+  assert.equal(last.reason, "specs look great");
+});
+
+test("CLI release-note only works when waiting_release_note", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "PLUG-210", "--json"]);
+
+  // Fails when task is queued
+  const resFail = await host.harness.runCli([
+    "release-note",
+    "PLUG-210",
+    "v1.0.0 released",
+    "--json",
+  ]);
+  assert.equal(resFail.exitCode, 1);
+  assert.equal(JSON.parse(resFail.stdout).error.code, "invalid-status");
+
+  // Advance to waiting_release_note
+  const db = (host.bb.storage as any).database();
+  const store = new DelegationStore(db);
+  store.transitionTask({
+    taskKey: "PLUG-210",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "release",
+    toStatus: "waiting_release_note",
+    actor: "system",
+    reason: "need-note",
+  });
+
+  const resOk = await host.harness.runCli([
+    "release-note",
+    "PLUG-210",
+    "v1.0.0 released with features",
+    "--json",
+  ]);
+  assert.equal(resOk.exitCode, 0);
+  const data = JSON.parse(resOk.stdout);
+  assert.equal(data.task.release_note, "v1.0.0 released with features");
+  assert.equal(data.task.status, "running");
+});
+
+test("CLI resume from blocked resets counters according to target", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "PLUG-211", "--route", "feature", "--json"]);
+
+  const db = (host.bb.storage as any).database();
+  const store = new DelegationStore(db);
+
+  // Set counters and blocked status at checks
+  store.transitionTask({
+    taskKey: "PLUG-211",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "checks",
+    toStatus: "blocked",
+    actor: "checks-runner",
+    reason: "3 failed test rounds",
+    updates: {
+      code_attempts: 3,
+      check_attempts: 3,
+      code_review_rounds: 1,
+    },
+  });
+
+  // Resume to release from unverified checks -> rejected!
+  const resInvalid = await host.harness.runCli([
+    "resume",
+    "PLUG-211",
+    "--target",
+    "release",
+    "--json",
+  ]);
+  assert.equal(resInvalid.exitCode, 1);
+  assert.equal(JSON.parse(resInvalid.stdout).error.code, "target-invalid");
+
+  // Resume to code -> resets code_attempts, check_attempts
+  const resResume = await host.harness.runCli([
+    "resume",
+    "PLUG-211",
+    "--target",
+    "code",
+    "--json",
+  ]);
+  assert.equal(resResume.exitCode, 0);
+  const data = JSON.parse(resResume.stdout);
+  assert.equal(data.task.node, "code");
+  assert.equal(data.task.status, "running");
+  assert.equal(data.task.code_attempts, 0);
+  assert.equal(data.task.check_attempts, 0);
+});
+
+test("CLI run-queue --once reports queue statistics and dependencies", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "DEP-1", "--json"]);
+  await host.harness.runCli([
+    "enqueue",
+    "TASK-MAIN",
+    "--depends-on",
+    "DEP-1",
+    "--json",
+  ]);
+
+  const res = await host.harness.runCli(["run-queue", "--once", "--json"]);
+  assert.equal(res.exitCode, 0);
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.queuedCount, 2);
+  // DEP-1 has no dependencies so readyCount = 1, TASK-MAIN depends on DEP-1 which is queued (not done)
+  assert.equal(data.readyCount, 1);
+});
+
+test("Strict workGraph mode blocks direct delegate, merge, release", async () => {
+  const host = await hostWith({ workGraph: "strict" });
+
+  // 1. Direct delegate of un-enqueued task fails with graph-required
+  const resDelUnk = await host.harness.runCli([
+    "delegate",
+    "UNENQUEUED-1",
+    "--level",
+    "simple",
+    "--json",
+  ]);
+  assert.equal(resDelUnk.exitCode, 1);
+  assert.equal(JSON.parse(resDelUnk.stdout).error.code, "graph-required");
+
+  // 2. Direct delegate of active queued task fails with graph-managed
+  await host.harness.runCli(["enqueue", "PLUG-220", "--json"]);
+  const resDelActive = await host.harness.runCli([
+    "delegate",
+    "PLUG-220",
+    "--level",
+    "simple",
+    "--json",
+  ]);
+  assert.equal(resDelActive.exitCode, 1);
+  assert.equal(JSON.parse(resDelActive.stdout).error.code, "graph-managed");
+  assert.match(
+    JSON.parse(resDelActive.stdout).error.message,
+    /управляется графом/,
+  );
+
+  // 3. Direct merge of un-enqueued task fails with graph-required
+  const resMerge = await host.harness.runCli([
+    "merge",
+    "UNENQUEUED-2",
+    "--json",
+  ]);
+  assert.equal(resMerge.exitCode, 1);
+  assert.equal(JSON.parse(resMerge.stdout).error.code, "graph-required");
+
+  // 4. Direct release of un-enqueued task fails with graph-required
+  const resRelease = await host.harness.runCli([
+    "release",
+    "UNENQUEUED-3",
+    "--json",
+  ]);
+  assert.equal(resRelease.exitCode, 1);
+  assert.equal(JSON.parse(resRelease.stdout).error.code, "graph-required");
+});
+
+test("When workGraph is off, queue commands reject with graph-disabled", async () => {
+  const host = await hostWith({ workGraph: "off" });
+  const res = await host.harness.runCli(["enqueue", "PLUG-230", "--json"]);
+  assert.equal(res.exitCode, 1);
+  assert.equal(JSON.parse(res.stdout).error.code, "graph-disabled");
+});

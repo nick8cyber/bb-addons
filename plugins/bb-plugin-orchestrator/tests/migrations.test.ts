@@ -72,6 +72,60 @@ test("migrations create the §7 schema", () => {
     "removed",
     "started_at",
   ]);
+
+  // §27.1 (r34, PLUG-309): task_queue and task_transitions columns
+  const taskQueueColumns = (db
+    .prepare(`PRAGMA table_info(task_queue)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.deepEqual(taskQueueColumns.sort(), [
+    "acceptance_sha",
+    "branch",
+    "check_attempts",
+    "code_attempts",
+    "code_review_rounds",
+    "confirmation_mode",
+    "coordinator_thread_id",
+    "created_at",
+    "deadline_at",
+    "deferred_by",
+    "deferred_reason",
+    "depends_on",
+    "design_check_rounds",
+    "entered_at",
+    "interaction_id",
+    "level",
+    "node",
+    "node_alarm_at",
+    "payload",
+    "priority",
+    "project_id",
+    "release_attempts",
+    "release_note",
+    "result_sha",
+    "route",
+    "spec_attempts",
+    "spec_review_rounds",
+    "spec_sha",
+    "status",
+    "task_key",
+    "updated_at",
+  ]);
+
+  const taskTransitionsColumns = (db
+    .prepare(`PRAGMA table_info(task_transitions)`)
+    .all() as { name: string }[]).map((c) => c.name);
+  assert.deepEqual(taskTransitionsColumns.sort(), [
+    "actor",
+    "created_at",
+    "from_node",
+    "from_status",
+    "id",
+    "payload",
+    "reason",
+    "task_key",
+    "to_node",
+    "to_status",
+  ]);
 });
 
 test("the partial unique index allows one active row per task", () => {
