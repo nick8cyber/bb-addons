@@ -592,6 +592,32 @@ antigravity plugin's accounts file, a CLIProxyAPI auth dir, or a single
 token file) or by logging in directly into a home:
 `HOME=accounts/<label> agy`. New accounts are picked up on the next spawn.
 
+**Adding an account — the recommended way.** Sign in with the native CLI
+into the account's own home, nothing else touches the credential:
+
+1. `mkdir -p accounts/<label>` and run `HOME=accounts/<label> agy` from
+   inside it (an interactive terminal; there is no `login` subcommand and
+   `--gemini-dir` belongs to `agy acp` only). Pick *Google OAuth*, open the
+   link, paste the code back. Quit `agy` right after the sign-in screen —
+   do not send a prompt from there.
+2. Google often asks a freshly signed-in account to confirm it is you. The
+   pool sees that as `403 VALIDATION_REQUIRED` and parks the account
+   (`validation-required`, see above). Prefer to clear it up front: sign in
+   to the same Google account in a browser and pass the check before the
+   account takes traffic. After a check, unpark by hand: delete
+   `parkedReason` (and the far-future `cooldownUntilMs`) from its entry in
+   `accounts-state.json`.
+3. A higher plan (more models, scarcer quota) gets a priority **below** the
+   default 10 — e.g. `"priority": 5` — so shared models stay on the regular
+   accounts and only its own models (Argon, Carbon, …) go to it. Its
+   catalog is picked up by the next `agy models` probe; until then the
+   merged model list may still be the old cached one (see the
+   `acp-models-cache.json` note above).
+
+Importing tokens from third-party tools (`scripts/import-accounts.mjs`)
+keeps working, but a native sign-in is the safer path: the credential is
+then only ever used by Google's own binary.
+
 Mode precedence, each level falling back to the next: **pool** (non-empty;
 `AGY_ACCOUNTS=0` skips) → **cliproxy relay** (below; `AGY_CLIPROXY=0`
 skips) → the real HOME, exactly as before the pool existed. Old
