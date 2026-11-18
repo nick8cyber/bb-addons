@@ -2008,6 +2008,87 @@ export function createWatchdog(deps: WatchdogDeps) {
   };
 
   /**
+   * §16.2 r33.10 (PLUG-158): a `bb thread tell` to an executor whose
+   * delegation is already `done`/`failed`/`cancelled` flips the thread
+   * active before the provider's first `turn/started` lands in the
+   * journal — reviving only on the journal event left the rework
+   * unsupervised in between. `thread.active` on a REVIVABLE row now
+   * revives immediately (`store.revive` → `running`, delivery marks and
+   * the terminal setup_errors cleared) and opens the §5.1 first-response
+   * and `maxRunSeconds` clocks at once (`turn_started_at = now`).
+   *
+   * The tracker filter is unchanged: the queued `client/turn/requested`
+   * entries after `last_seq` decide — only a genuine (non-tracker)
+   * request revives. An all-tracker or request-less wake waits for its
+   * `turn/started`, where `scanTerminalWake`'s verdict applies — a
+   * tracker request can race this read, so nothing revives here without
+   * a proven genuine request; an unreadable journal defers to that
+   * same later pass.
+   */
+  const reviveOnActive = async (row: DelegationRow) => {
+    const requests: WatchdogThreadEvent[] = [];
+    let tailReached = false;
+    try {
+      let after = row.last_seq ?? 0;
+      for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+        const chunk = await deps.threads.events.list({
+          threadId: row.thread_id!,
+          afterSeq: String(after),
+          order: "asc",
+          limit: "50",
+          types: ["client/turn/requested"],
+        });
+        requests.push(...chunk);
+        if (chunk.length < 50) {
+          tailReached = true;
+          break;
+        }
+        after = Math.max(...chunk.map((e) => e.seq));
+      }
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: revive-on-active check ${row.thread_id}: ${message(e)}`,
+      );
+      return;
+    }
+    if (!tailReached) {
+      // The all-tracker verdict needs EVERY request — the tail is
+      // unread, a later pass re-checks.
+      log.warn?.(
+        `orchestrator: revive-on-active check ${row.thread_id}: page cap reached`,
+      );
+      return;
+    }
+    if (
+      !requests.some(
+        (r) => !requestText(r).startsWith(TRACKER_COMMENT_PREFIX),
+      )
+    ) {
+      return;
+    }
+    const wakeSeq = Math.max(...requests.map((r) => r.seq));
+    // §16.2's general rule: a past round (a newer delegation exists) or
+    // a lost revive race is a rogue turn — stopped, coordinator hears
+    // one line.
+    if (
+      store.hasNewerForTask(row.task_key, row.id) ||
+      !store.revive(row.id)
+    ) {
+      await suppressWake(row, wakeSeq, t("wd.newerExists"));
+      return;
+    }
+    store.setTurnStarted(row.id, now());
+    clearMarks(row.id);
+    log.info?.(
+      `orchestrator: delegation #${row.id} revived (thread.active)`,
+    );
+    // Drain the stream — the consumed requests leave the cursor and a
+    // landed `turn/started` re-stamps `turn_started_at` with its own
+    // createdAt.
+    await processStream(store.get(row.id) ?? row);
+  };
+
+  /**
    * §16.5: did BB itself report this executor's outcome to the
    * coordinator? The coordinator's journal is scanned (pages ≤ 100,
    * §5.1) for a `client/turn/requested` system message that arrived
@@ -2681,10 +2762,17 @@ export function createWatchdog(deps: WatchdogDeps) {
   /** §5.1: a transition into `active` opens the window when no turn did. */
   const onThreadActive = async (thread: WatchdogThreadDto) => {
     const row = store.byThreadId(thread.id);
-    if (!row || row.status !== "running" || row.turn_started_at != null) {
+    if (!row) return;
+    if (row.status === "running") {
+      if (row.turn_started_at == null) store.setTurnStarted(row.id, now());
       return;
     }
-    store.setTurnStarted(row.id, now());
+    // §16.2 r33.10 (PLUG-158): a tell to a FINISHED executor revives it
+    // on `thread.active` — supervision from the first second, not from
+    // the provider's first `turn/started`.
+    if (REVIVABLE.has(row.status) && row.thread_id) {
+      await reviveOnActive(row);
+    }
   };
 
   const onThreadIdle = async (thread: WatchdogThreadDto) => {

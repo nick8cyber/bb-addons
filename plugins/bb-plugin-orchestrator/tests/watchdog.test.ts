@@ -6276,3 +6276,136 @@ test("PLUG-298: reissue matches chain index and used routes across aliases", asy
   // Reissued to next candidate in chain: "simple-alt", not restarting at review-web-gemini
   assert.equal(active[0]!.route, "simple-alt");
 });
+
+// §16.2 r33.10 (PLUG-158): `thread.active` on a FINISHED delegation —
+// a `bb thread tell` rework — revives before the first `turn/started`.
+test("PLUG-158: thread.active on a done row with a genuine request revives", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.store.setResultNotified(row.id, "plugin");
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  // The tell is queued (`client/turn/requested`) but the provider's
+  // `turn/started` has not landed yet — the gap the fix covers.
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0 + 100, {
+      input: [{ text: "[bb message from thread:thr_coord] доделай" }],
+    }),
+  ]);
+  await h.wd.onThreadActive(dto("thr_e1", "active"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(fresh.revived_count, 1);
+  assert.equal(fresh.result_notified_at, null, "delivery re-armed");
+  assert.equal(fresh.turn_started_at, T0, "the §5.1 clock opens at once");
+  assert.equal(fresh.first_response_at, null);
+  assert.equal(fresh.last_seq, 6, "the consumed request leaves the cursor");
+});
+
+test("PLUG-158: a landed turn/started re-stamps the revived clock", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0 + 100, {
+      input: [{ text: "[bb message from thread:thr_coord] доделай" }],
+    }),
+    ev(7, "turn/started", T0 + 200),
+  ]);
+  await h.wd.onThreadActive(dto("thr_e1", "active"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "running");
+  assert.equal(
+    fresh.turn_started_at,
+    T0 + 200,
+    "the turn's own start time wins",
+  );
+});
+
+test("PLUG-158: a tracker-only wake on thread.active does not revive", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: fyi" }],
+    }),
+  ]);
+  await h.wd.onThreadActive(dto("thr_e1", "active"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done");
+  assert.equal(fresh.revived_count, 0);
+  assert.equal(fresh.last_seq, 5, "cursor stays for the turn/started pass");
+  assert.deepEqual(h.stops, [], "the §16.2 silent stop owns the stop");
+  // …and once the turn/started lands, the existing path silent-stops it.
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0, {
+      input: [{ text: "New comment on task PLUG-1 from thr_x: fyi" }],
+    }),
+    ev(7, "turn/started", T0 + 100),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 7 });
+  assert.equal(h.store.get(row.id)!.status, "done");
+  assert.deepEqual(h.stops, ["thr_e1"]);
+});
+
+test("PLUG-158: a request-less thread.active does not revive", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  // An unattributed wake (auto-retry resume) — the turn/started pass
+  // decides, never this early path.
+  await h.wd.onThreadActive(dto("thr_e1", "active"));
+  assert.equal(h.store.get(row.id)!.status, "done");
+  assert.equal(h.store.get(row.id)!.revived_count, 0);
+});
+
+test("PLUG-158: a tell to a past round on thread.active is suppressed", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  // A NEWER delegation owns the task — the old thread must not work.
+  const newer = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e2" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.threadDtos.set("thr_e2", dto("thr_e2", "active"));
+  h.threadDtos.set("thr_coord", dto("thr_coord", "idle"));
+  h.eventLog.set("thr_e1", [
+    ev(6, "client/turn/requested", T0 + 100, {
+      input: [{ text: "[bb message from thread:thr_coord] доделай" }],
+    }),
+  ]);
+  await h.wd.onThreadActive(dto("thr_e1", "active"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done", "a past round never revives");
+  assert.equal(fresh.revived_count, 0);
+  assert.deepEqual(h.stops, ["thr_e1"], "the rogue turn is stopped");
+  assert.equal(
+    h.sends.filter((x) => x.threadId === "thr_coord").length,
+    1,
+    "the coordinator hears one line",
+  );
+  assert.equal(h.store.get(newer.id)!.status, "running");
+});
+
+test("PLUG-158: an unreadable journal defers the revive-on-active check", async () => {
+  const h = makeHarness();
+  const row = h.insertActive({ taskKey: "PLUG-1", threadId: "thr_e1" });
+  h.store.setStatus(row.id, "done");
+  h.store.advanceLastSeq(row.id, 5);
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventsBlocked.add("thr_e1");
+  await h.wd.onThreadActive(dto("thr_e1", "active"));
+  const fresh = h.store.get(row.id)!;
+  assert.equal(fresh.status, "done", "unproven is not a revive");
+  assert.equal(fresh.revived_count, 0);
+});
