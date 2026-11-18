@@ -570,7 +570,7 @@ rotations. Quota fields and `rateLimits` are untouched.
 > bookkeeping the same way as any parked account.
 
 > [!TIP] Restore a verified account
-> For verification failures, open the verification link from `bridge.log` (or `acp-wrapper.log`) in your browser and verify the account. Since `validation-required` is permanent parking without auto-expiration, unpark by hand after verification: clear `parkedReason` and set `cooldownUntilMs` to `0` (and `lastUsedMs` to the current time on the owner instance, or remove the label's record from `bridge-data/accounts-overlay.json` on a satellite). When present, the verification URL is also logged on its own line.
+> For verification failures, open the verification link from `bridge.log` (or `acp-wrapper.log`) in your browser and verify the account. Since `validation-required` is permanent parking without auto-expiration, unpark by hand after verification: clear `parkedReason` and set `cooldownUntilMs` to `0` (and `lastUsedMs` to the current time on the owner instance, or remove the label's record from `bridge-data/accounts-overlay.json` on a satellite). When present, the verification URL is also logged on its own line. A refusal that fell back to the 24-hour cooldown (verification URL in the log but no verification markers) expires on its own — manual unpark is optional there.
 
 #### Native agy subagents are disabled
 
