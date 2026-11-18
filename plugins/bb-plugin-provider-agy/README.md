@@ -500,10 +500,9 @@ pick (spec §2.3, ADR-0030; ACP transport only).
   until that file's TTL expires — delete `acp-models-cache.json` to refresh
   it immediately.
 - **Recorded thread state (`threads-state.json`)**: maps each `threadId` to
-  `{ cwd, providerThreadId, atMs }` in the plugin data directory. The file is
-  instance-local (keeper never syncs it) and bounded to 2000 entries (evicting
-  the oldest records by `atMs`), allowing the wrapper to restore an unknown
-  thread's session after a wrapper restart.
+  `{ cwd, providerThreadId }` in the plugin data directory. The file is
+  instance-local (keeper never syncs it), allowing the wrapper to restore an
+  unknown thread's session after a wrapper restart.
 
 The shim always receives its own environment: every request carrying options
 (`thread/start|resume`, `turn/start`, `turn/steer`, internal starts) passes
