@@ -982,3 +982,87 @@ test("§5.6 (r34.1/r34): work graph on — only intervention queue states wake t
   assert.match(text, /PLUG-6/);
   assert.doesNotMatch(text, /PLUG-5/);
 });
+
+test("§5.6 (r34.1): an owner message after escalation revives the coordinator", async () => {
+  const h = makeHarness();
+  const c = h.coordinator("thr_c", { parentThreadId: null });
+  h.doneDelegation("thr_c");
+  await h.warm();
+  await h.watchdog.onThreadIdle(c);
+  for (const wait of [1, 2, 4]) {
+    h.advance(wait * NUDGE_MIN * 60_000 + 1);
+    await h.watchdog.checkTimers();
+    await h.watchdog.onThreadActive(c);
+    c.status = "idle";
+    await h.watchdog.onThreadIdle(c);
+  }
+  h.advance(4 * NUDGE_MIN * 60_000 + 1);
+  await h.watchdog.checkTimers();
+  const wEsc = h.store.coordinatorWatchdogGet("thr_c")!;
+  assert.ok(wEsc.escalated_at != null, "coordinator is escalated");
+  assert.equal(wEsc.nudge_count, 3);
+
+  // In quiet idle, subsequent passes send nothing while escalated
+  h.advance(10_000);
+  await h.watchdog.checkTimers();
+
+  // Now the owner responds to the thread
+  const ownerTurnAt = wEsc.escalated_at + 1000;
+  h.eventLog.set("thr_c", [
+    request(20, ownerTurnAt, "понял, сейчас займусь задачами"),
+  ]);
+  c.status = "idle";
+  await h.watchdog.onThreadIdle(c);
+  await h.watchdog.checkTimers();
+
+  const wRevived = h.store.coordinatorWatchdogGet("thr_c")!;
+  assert.equal(
+    wRevived.escalated_at,
+    null,
+    "escalation cleared by owner message",
+  );
+  assert.equal(wRevived.nudge_count, 0, "nudge schedule reset");
+  assert.ok(
+    wRevived.last_activity_at > wEsc.escalated_at,
+    "activity refreshed",
+  );
+});
+
+test("§5.6 (r34.1): an owner message after 24h inactivity un-gates the thread", async () => {
+  const h = makeHarness();
+  const c = h.coordinator("thr_c");
+  h.doneDelegation("thr_c");
+  await h.warm();
+  await h.watchdog.onThreadIdle(c);
+  await h.watchdog.checkTimers(); // back-scan initializes last_activity_at = T0
+  assert.equal(
+    h.store.coordinatorWatchdogGet("thr_c")!.last_activity_at,
+    T0,
+  );
+
+  // Fast forward past 24 hours
+  h.advance(25 * 3_600_000);
+  await h.watchdog.checkTimers();
+  assert.equal(h.sends.length, 0, "24h inactivity gate blocks nudges");
+
+  // Owner sends a fresh turn
+  const ownerTurnAt = T0 + 25 * 3_600_000 + 1000;
+  h.eventLog.set("thr_c", [
+    request(30, ownerTurnAt, "продолжаем работу над проектом"),
+  ]);
+  c.status = "idle";
+  await h.watchdog.onThreadIdle(c);
+  await h.watchdog.checkTimers();
+
+  const wFresh = h.store.coordinatorWatchdogGet("thr_c")!;
+  assert.equal(
+    wFresh.last_activity_at,
+    ownerTurnAt,
+    "activity refreshed to fresh owner turn",
+  );
+
+  // Advance 5 minutes after fresh turn: nudge should now fire
+  h.advance(NUDGE_MIN * 60_000 + 1);
+  await h.watchdog.checkTimers();
+  assert.equal(h.sends.length, 1, "nudge fires after un-gating");
+});

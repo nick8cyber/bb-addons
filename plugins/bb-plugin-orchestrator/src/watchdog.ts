@@ -3753,6 +3753,27 @@ export function createWatchdog(deps: WatchdogDeps) {
           store.metaSet(coordSeqKey(threadId), String(cursor));
           w = store.coordinatorWatchdogGet(threadId)!;
         }
+        const anchor = w.idle_since ?? nowMs;
+        const nextIdx = w.nudge_count + 1;
+        const targetMs =
+          nextIdx <= maxNudges
+            ? coordinatorIntervalMs(nextIdx, baseMs)
+            : coordinatorIntervalMs(maxNudges, baseMs) + 4 * baseMs;
+        // §5.6 п.1 (r34.1): journal forward-scan runs before the inactivity
+        // and escalation gates:
+        // - if nudged/escalated, to catch the owner's answer and reset (§5.6 п.3, п.4б);
+        // - if older than maxAge, to allow a fresh owner turn to un-gate (§5.6 п.1);
+        // - if due for a nudge/escalation, to ensure the quiet spell is genuine.
+        if (
+          w.nudge_count > 0 ||
+          w.escalated_at != null ||
+          (w.last_activity_at !== 0 && nowMs - w.last_activity_at > maxAgeMs) ||
+          nowMs - anchor >= targetMs
+        ) {
+          await coordinatorScanJournal(threadId, w.last_nudge_at);
+          w = store.coordinatorWatchdogGet(threadId)!;
+        }
+
         // §5.6 (r34.1): the inactivity gate — a thread with no owner
         // turn or productive action longer than the limit is a dead
         // thread: no nudges, no escalation, ever.
@@ -3772,32 +3793,13 @@ export function createWatchdog(deps: WatchdogDeps) {
         // §5.6 п.3: escalated — silent until a productive action or a
         // user message (both reset the schedule above/in the tools).
         if (w.escalated_at != null) continue;
-        const anchor = w.idle_since;
+        if (nowMs - w.idle_since < targetMs) {
+          continue;
+        }
         const idleMinutes = Math.max(
           1,
-          Math.round((nowMs - anchor) / 60_000),
+          Math.round((nowMs - w.idle_since) / 60_000),
         );
-        const nextIdx = w.nudge_count + 1;
-        const targetMs =
-          nextIdx <= maxNudges
-            ? coordinatorIntervalMs(nextIdx, baseMs)
-            : coordinatorIntervalMs(maxNudges, baseMs) + 4 * baseMs;
-        // §5.6 п.1 (r34.1): journal forward-scan runs only after the
-        // cheap filters — when due for a nudge/escalation OR to check if
-        // an owner turn answered an already-sent nudge.
-        if (w.nudge_count > 0 || nowMs - anchor >= targetMs) {
-          await coordinatorScanJournal(threadId, w.last_nudge_at);
-          w = store.coordinatorWatchdogGet(threadId)!;
-        }
-        if (w.idle_since == null || nowMs - w.idle_since < targetMs) {
-          continue;
-        }
-        if (
-          w.last_activity_at !== 0 &&
-          nowMs - w.last_activity_at > maxAgeMs
-        ) {
-          continue;
-        }
         const tasksText =
           taskList.slice(0, 10).join(", ") +
           (taskList.length > 10 ? ` +${taskList.length - 10}` : "");
