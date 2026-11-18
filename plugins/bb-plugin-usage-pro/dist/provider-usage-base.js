@@ -12912,6 +12912,9 @@ var providerUsageSchema = external_exports.discriminatedUnion("status", [
     status: external_exports.literal("ok"),
     accountEmail: external_exports.nullable(nonemptyStringSchema),
     planLabel: external_exports.nullable(nonemptyStringSchema),
+    // provider-agy parallel installs (§9 п.3): which install serves the
+    // account; absent/null for providers without the notion.
+    install: external_exports.optional(external_exports.nullable(nonemptyStringSchema)),
     windows: external_exports.array(usageWindowSchema)
   }),
   external_exports.strictObject({ status: external_exports.literal("not_installed") }),
@@ -15111,7 +15114,10 @@ var usagePlanSchema = external_exports2.object({
 var accountFields = {
   plan: usagePlanSchema.nullable().default(null),
   accountEmail: external_exports2.string().nullable(),
-  planLabel: external_exports2.string().nullable()
+  planLabel: external_exports2.string().nullable(),
+  // provider-agy parallel installs (§9 п.3): optional so non-agy sources
+  // never have to emit it.
+  install: external_exports2.string().nullable().optional()
 };
 var usageWindowKindSchema = external_exports2.enum([
   "five-hour",
@@ -15225,6 +15231,7 @@ function normalizedUsage(usage) {
         status: "ok",
         accountEmail: usage.accountEmail || null,
         planLabel: usage.planLabel || null,
+        install: typeof usage.install === "string" ? usage.install : null,
         windows: usage.windows.map((window) => ({
           label: window.label,
           usedPercent: window.usedPercent,
@@ -15727,18 +15734,177 @@ function providerUsagePlugin(bb, options = {}) {
     status: "ok", accountEmail: label, planLabel: "Out of rotation", windows: []
   });
 
-  // The parked/rotation markers are stamped on every read, never on the
-  // cached poll result: an account parked after polling still shows it.
-  const agyUsageFor = (label, parked, parkedReasons) => {
+  // -------------------------------------------------------------------
+  // Parallel installs (provider-agy-installs §9 п.3): the registry is the
+  // provider-agy plugin's own file — usage-pro reads it from the same
+  // dataDir, keeps no copy, and never polls an account whose install
+  // cannot run on this host.
+  // -------------------------------------------------------------------
+
+  const AGY_INSTALL_NAME_RE = /^[a-z0-9-]{1,32}$/u;
+  // §2 п.3: keys the plugin, the shim and the account own — a registry env
+  // section may not carry them; any presence breaks the whole registry.
+  const AGY_FORBIDDEN_ENV_EXACT = new Set([
+    "HOME",
+    "ELECTRON_RUN_AS_NODE",
+    "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL"
+  ]);
+  const AGY_FORBIDDEN_ENV_PROXY = new Set([
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY"
+  ]);
+  const forbiddenEnvKey = (key) =>
+    AGY_FORBIDDEN_ENV_EXACT.has(key) ||
+    AGY_FORBIDDEN_ENV_PROXY.has(key.toUpperCase()) ||
+    key.startsWith("AGY_");
+
+  /** Read and validate <dataDir>/agy-installs.json (§2). */
+  const agyInstallsRegistry = (baseDir) => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const file = path.join(baseDir, "..", "agy-installs.json");
+    if (!fs.existsSync(file)) return { state: "absent" };
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (e) {
+      return { state: "broken", reason: `${file}: not parseable JSON (${e.message})` };
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { state: "broken", reason: `${file}: registry is not a JSON object` };
+    }
+    const installs = {};
+    const installsRaw = parsed.installs;
+    if (installsRaw === null || typeof installsRaw !== "object" || Array.isArray(installsRaw)) {
+      return { state: "broken", reason: `${file}: "installs" is not an object` };
+    }
+    for (const [name, raw] of Object.entries(installsRaw)) {
+      if (!AGY_INSTALL_NAME_RE.test(name)) {
+        return { state: "broken", reason: `${file}: install name ${JSON.stringify(name)} is invalid` };
+      }
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        return { state: "broken", reason: `${file}: install ${name} is not an object` };
+      }
+      if (typeof raw.bin !== "string" || !raw.bin.startsWith("/")) {
+        return { state: "broken", reason: `${file}: install ${name} "bin" is not an absolute path` };
+      }
+      const env = {};
+      if (raw.env !== undefined) {
+        if (raw.env === null || typeof raw.env !== "object" || Array.isArray(raw.env)) {
+          return { state: "broken", reason: `${file}: install ${name} "env" is not an object` };
+        }
+        for (const [key, value] of Object.entries(raw.env)) {
+          if (forbiddenEnvKey(key)) {
+            return { state: "broken", reason: `${file}: install ${name} env key ${key} is managed by the plugin and cannot be overridden` };
+          }
+          if (typeof value !== "string") {
+            return { state: "broken", reason: `${file}: install ${name} env ${key} is not a string` };
+          }
+          env[key] = value;
+        }
+      }
+      installs[name] = { bin: raw.bin, env };
+    }
+    if (typeof parsed.default !== "string" || !Object.hasOwn(installs, parsed.default)) {
+      return { state: "broken", reason: `${file}: "default" does not name an entry in "installs"` };
+    }
+    return { state: "ok", installs, default: parsed.default };
+  };
+
+  /**
+   * Per-label install resolution for the collector (§6 п.13): the account's
+   * own install binary, the registry default for unbound accounts, or a
+   * locally-unavailable marker (§5 п.2) — never a substitute binary.
+   * Returns Map<label, { name, bin, env, unavailable }>.
+   */
+  const agyInstallsFor = (baseDir) => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const registry = agyInstallsRegistry(baseDir);
+    const out = new Map();
+    let state = {};
+    try {
+      state = JSON.parse(
+        fs.readFileSync(path.join(baseDir, "..", "accounts-state.json"), "utf8"));
+    } catch {}
+    const executable = (bin) => {
+      try { fs.accessSync(bin, fs.constants.X_OK); return true; } catch { return false; }
+    };
+    const resolveOne = (raw) => {
+      if (raw !== undefined) {
+        if (typeof raw !== "string" || !AGY_INSTALL_NAME_RE.test(raw)) {
+          return { name: typeof raw === "string" ? raw : "?", bin: null, env: {}, unavailable: `install ${JSON.stringify(raw)} is not a valid install name` };
+        }
+        if (registry.state === "absent") {
+          return { name: raw, bin: null, env: {}, unavailable: `install ${raw}: no agy-installs.json on this host` };
+        }
+        if (registry.state === "broken") {
+          return { name: raw, bin: null, env: {}, unavailable: registry.reason };
+        }
+        const record = registry.installs[raw];
+        if (record === undefined) {
+          return { name: raw, bin: null, env: {}, unavailable: `install ${raw} is not declared in agy-installs.json` };
+        }
+        if (!executable(record.bin)) {
+          return { name: raw, bin: null, env: {}, unavailable: `install ${raw} binary ${record.bin} is missing or not executable` };
+        }
+        return { name: raw, bin: record.bin, env: record.env, unavailable: null };
+      }
+      if (registry.state === "broken") {
+        return { name: null, bin: null, env: {}, unavailable: registry.reason };
+      }
+      if (registry.state === "absent") {
+        return { name: null, bin: null, env: {}, unavailable: null };
+      }
+      const record = registry.installs[registry.default];
+      if (!executable(record.bin)) {
+        return {
+          name: registry.default, bin: null, env: {},
+          unavailable: `default install ${registry.default} binary ${record.bin} is missing or not executable`
+        };
+      }
+      return { name: registry.default, bin: record.bin, env: record.env, unavailable: null };
+    };
+    // Every account directory on disk resolves — a label missing from
+    // accounts-state.json is an unbound account, which §3 binds to the
+    // registry default, not to the implicit binary.
+    const labels = new Set([
+      ...Object.keys(state.accounts ?? {}),
+      ...agyAccountLabels(baseDir)
+    ]);
+    for (const label of labels) {
+      out.set(label, resolveOne(state.accounts?.[label]?.install));
+    }
+    return out;
+  };
+
+  // The parked/rotation/install markers are stamped on every read, never
+  // on the cached poll result: a state that flips after polling still shows.
+  const agyUsageFor = (label, parked, parkedReasons, installs = new Map()) => {
     const usage = agyAccountsCache.get(label)?.usage ?? null;
+    const info = installs.get(label);
+    const installTag = info?.name != null ? { install: info.name } : {};
     if (parkedReasons.has(label)) {
       return {
         ...(usage ?? agyUnpolledUsage(label)),
-        planLabel: `Parked: ${parkedReasons.get(label)}`
+        planLabel: `Parked: ${parkedReasons.get(label)}`,
+        ...installTag
       };
     }
-    if (!parked.has(label)) return usage;
-    return { ...(usage ?? agyUnpolledUsage(label)), planLabel: "Out of rotation" };
+    // §9 п.3: an install this host cannot run is never polled — the card
+    // shows the marker over whatever the cache still holds.
+    if (info?.unavailable) {
+      return {
+        ...(usage ?? agyUnpolledUsage(label)),
+        planLabel: `Install unavailable: ${info.name ?? "?"}`,
+        ...installTag
+      };
+    }
+    if (!parked.has(label)) return usage === null ? usage : { ...usage, ...installTag };
+    return { ...(usage ?? agyUnpolledUsage(label)), planLabel: "Out of rotation", ...installTag };
   };
 
   const getCachedAgyAccounts = () => {
@@ -15750,16 +15916,17 @@ function providerUsagePlugin(bb, options = {}) {
       const labels = agyAccountLabels(baseDir);
       const parked = agyOutOfRotation(baseDir);
       const parkedReasons = agyParkedReasons(baseDir);
+      const installs = agyInstallsFor(baseDir);
       return labels.map(label => ({
         label,
-        usage: agyUsageFor(label, parked, parkedReasons)
+        usage: agyUsageFor(label, parked, parkedReasons, installs)
       }));
     } catch {
       return [];
     }
   };
 
-  const runAgySingleAccount = async (baseDir, label, agyBin, statePath) => {
+  const runAgySingleAccount = async (baseDir, label, agyBin, statePath, installEnv = {}) => {
     if (agyInFlight.has(label)) {
       return agyInFlight.get(label);
     }
@@ -15786,6 +15953,7 @@ function providerUsagePlugin(bb, options = {}) {
         const res = await new Promise((resolve) => {
           const env = {
             ...(nodeProcess.env || {}),
+            ...installEnv,
             HOME: accDir,
             PATH: __bbToolPath,
             ...(proxyUrl ? { HTTPS_PROXY: proxyUrl, HTTP_PROXY: proxyUrl } : {})
@@ -15896,6 +16064,13 @@ function providerUsagePlugin(bb, options = {}) {
       const labels = agyAccountLabels(baseDir);
       const parked = agyOutOfRotation(baseDir);
       const parkedReasons = agyParkedReasons(baseDir);
+      // §6 п.13 / §9 п.3: per-label install binary; an install that cannot
+      // run on this host is never polled — not by warm-up, not by refresh.
+      const installs = agyInstallsFor(baseDir);
+      const agyBinFor = (label) => installs.get(label)?.bin ?? agyBin;
+      const installEnvFor = (label) => installs.get(label)?.env ?? {};
+      const pollable = (label) =>
+        !parkedReasons.has(label) && installs.get(label)?.unavailable == null;
 
       const ttl = Math.max(maxAgeMs || 0, 180000);
       const staleLabels = [];
@@ -15904,7 +16079,7 @@ function providerUsagePlugin(bb, options = {}) {
       for (const label of labels) {
         // Accounts parked at priority 0 are only polled on explicit refresh;
         // a parkedReason account is never polled at all (§6 п.4а).
-        if (parked.has(label) || parkedReasons.has(label)) continue;
+        if (parked.has(label) || !pollable(label)) continue;
         const cached = agyAccountsCache.get(label);
         if (!cached) {
           missingLabels.push(label);
@@ -15916,25 +16091,25 @@ function providerUsagePlugin(bb, options = {}) {
       if (force) {
         await Promise.all(
           labels
-            .filter(label => !parkedReasons.has(label))
-            .map(label => runAgySingleAccount(baseDir, label, agyBin, statePath))
+            .filter(label => pollable(label))
+            .map(label => runAgySingleAccount(baseDir, label, agyBinFor(label), statePath, installEnvFor(label)))
         );
       } else {
         if (missingLabels.length > 0) {
           await Promise.all(
-            missingLabels.map(label => runAgySingleAccount(baseDir, label, agyBin, statePath))
+            missingLabels.map(label => runAgySingleAccount(baseDir, label, agyBinFor(label), statePath, installEnvFor(label)))
           );
         }
         if (staleLabels.length > 0) {
           await Promise.all(
-            staleLabels.map(label => runAgySingleAccount(baseDir, label, agyBin, statePath))
+            staleLabels.map(label => runAgySingleAccount(baseDir, label, agyBinFor(label), statePath, installEnvFor(label)))
           );
         }
       }
 
       return labels.map(label => ({
         label,
-        usage: agyUsageFor(label, parked, parkedReasons)
+        usage: agyUsageFor(label, parked, parkedReasons, installs)
       }));
     } catch (e) {
       console.error("[usage-pro] agy fetch error:", e);
