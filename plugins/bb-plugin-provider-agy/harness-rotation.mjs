@@ -1322,6 +1322,64 @@ await sleep(100);
     acpNews("m1") === newsC.m1 && acpNews("m4") === newsC.m4,
     `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsC)}`);
 
+  // C2. The same in-flight refusal, but the only other suitable carrier
+  // is cooling: §2.3 п.5 wants the whole-pool-cooled branch — rateLimits
+  // blocked to the carrier's resetsAt — not the false "not offered".
+  // m2's pro-model mark from case C is lifted and replaced by a 1h
+  // cooldown, so m3 is the only live carrier when its turn refuses. The
+  // whole catalog is restored afterwards so later cases see case C's
+  // world (m2 marked, m3 free).
+  const modelsBeforeC2 = readAcpModels();
+  favor("m3");
+  {
+    const models = readAcpModels();
+    delete models.m2?.unsupported?.["pro-model"];
+    writeAcpModels(models);
+  }
+  {
+    const ledger = readAcpLedger();
+    ledger.accounts.m2.cooldownUntilMs = Date.now() + 3_600_000;
+    ledger.accounts.m2.lastError = "test-injected pro cooldown";
+    writeAcpLedger(ledger);
+  }
+  const proCooldownEnd = readAcpLedger().accounts.m2.cooldownUntilMs;
+  acpControl.modeByLabel = { m3: "unknown-model-once" };
+  writeAcpControl();
+  const newsC2 = newsSnapshot();
+  await startModel("t-model-cooled", "pro-model");
+  const cooledTurnId = nextId++;
+  send({ jsonrpc: "2.0", id: cooledTurnId, method: "turn/start",
+    params: { threadId: "t-model-cooled", providerThreadId: acpThreads.get("t-model-cooled"),
+      input: [{ type: "text", text: "carrier cooling", mentions: [] }],
+      clientRequestId: creq(), options: { model: "pro-model", ...pol } } });
+  await waitFor(() => boundaries("t-model-cooled").length >= 1, 30_000, "t-model-cooled: failed turn");
+  await sleep(200);
+  const cooledBlocked = messages.find((m) => m.method === "thread/delta"
+    && m.params?.threadId === "t-model-cooled"
+    && (m.params.deltas ?? []).some((d) => d.kind === "provider.rateLimits" && d.rateLimits?.status === "blocked"));
+  const cooledWindow = (cooledBlocked?.params?.deltas ?? [])
+    .find((d) => d.kind === "provider.rateLimits")?.rateLimits?.windows?.[0];
+  const cooledErr = errorsFor("t-model-cooled").at(-1);
+  check("models/cooled-carrier-emits-ratelimits",
+    boundaries("t-model-cooled").at(-1)?.status === "failed" &&
+    typeof cooledWindow?.resetsAtMs === "number" &&
+    Math.abs(cooledWindow.resetsAtMs - proCooldownEnd) < 15_000 &&
+    cooledErr?.errorInfo?.category === "rate-limit" &&
+    !String(cooledErr?.message ?? "").includes("is not offered by any pool account"),
+    `resetsAt=${cooledWindow?.resetsAtMs ?? "none"} err=${String(cooledErr?.message ?? "").slice(0, 120)}`);
+  check("models/cooled-carrier-no-sibling-spawned",
+    acpNews("m3") === newsC2.m3 + 1 && acpNews("m2") === newsC2.m2,
+    `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsC2)}`);
+  writeAcpModels(modelsBeforeC2);
+  {
+    const ledger = readAcpLedger();
+    ledger.accounts.m2.cooldownUntilMs = 0;
+    ledger.accounts.m2.lastError = null;
+    writeAcpLedger(ledger);
+  }
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
   // D. A model no account offers fails honestly — nothing is spawned.
   const newsD = newsSnapshot();
   const ghostReply = await startModel("t-model-nowhere", "ghost-model");

@@ -427,15 +427,24 @@ pick (spec §2.3, ADR-0030; ACP transport only).
   `accounts-state.json`:
   `accounts[label] = { raw, families, unsupported, atMs }`. Records are
   refreshed lazily — when a pick or `model/list` sees an entry older than six
-  hours — and `priority: 0` accounts are never polled.
+  hours — but a stale record stays valid for selection until a successful
+  poll replaces it; a failed or empty poll never erases it and re-polls a
+  label at most once every 30 minutes (`agy models` does not respawn on
+  every turn). Never polled: `priority: 0` accounts, parked accounts (any
+  `parkedReason`), and accounts cooling down past the record's TTL.
 - **Selection rule**: for a specialized family the pick is restricted to
-  accounts whose catalog advertises it; a specialized account beats no
-  priority it lacks support for. Common models take the ordinary §2.2 order
-  (priority tier → LRU). Accounts with no catalog record count as candidates
-  of last resort: they fill in only when no known supporter is free, so a
-  cold pool behaves exactly like before revision 10.
+  accounts whose catalog advertises it. Common models take the ordinary
+  §2.2 order (priority tier → LRU) — so an expensive senior-tier account
+  gets a **lower** `priority` number than the regular ones (for example
+  5 against their 10): it then serves a common model only once every
+  regular account is cooling, while for its exclusive models it is the
+  only candidate and priority does not matter. Accounts with no catalog
+  record count as candidates of last resort: they fill in only when no
+  known supporter is free, so a cold pool behaves exactly like before
+  revision 10.
 - **Merged discovery**: `model/list` answers the union of all non-zero
-  priority catalogs, each raw entry expanded into effort variants as before.
+  priority, non-parked catalogs, each raw entry expanded into effort
+  variants as before.
 - **Honest refusal**: asking for a family no account offers fails the
   `thread/start` with `model <id> is not offered by any pool account` —
   nothing is launched. If a catalog record lies (agy refuses the model at
@@ -444,9 +453,12 @@ pick (spec §2.3, ADR-0030; ACP transport only).
   refused account takes no cooldown.
 - **tos-disabled**: a refusal reading `disabled … violation of Terms of
   Service` parks the account permanently (`parkedReason: "tos-disabled"` and
-  an effectively infinite cooldown in `accounts-state.json`): it is never
-  polled, never picked, and only a manual edit brings it back — distinct
-  from the eligibility breaker, which must not fire for it.
+  an effectively infinite cooldown in `accounts-state.json`): like every
+  parked account it is never polled, never picked, left out of the merged
+  catalog, and only a manual edit brings it back — and a tos parking
+  neither counts toward the eligibility breaker nor is held back by it.
+  When every account is parked, even a model-less `thread/start` fails
+  honestly instead of silently falling back to direct mode.
 - **Same-account waits**: when the only suitable carriers are cooling, a
   quota turn waits out the earliest suitable window and may land back on the
   session's own account; `rateLimits` reports the nearest resetsAt among

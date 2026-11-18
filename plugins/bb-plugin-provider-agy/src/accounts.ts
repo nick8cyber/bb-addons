@@ -559,7 +559,8 @@ export function conversationAccount(
 /**
  * Pick the account a session should run on (§2.2, model-aware per §2.3):
  * - Candidates: not excludeLabel, priority > 0 (priority 0 is never picked),
- *   never tos-disabled, and suitable for `options.family` when one is given.
+ *   never parked (any parkedReason), and suitable for `options.family`
+ *   when one is given.
  * - Suitability: an account whose fresh catalog lacks the family — or whose
  *   unsupported mark for it is still fresh — is out. An account without a
  *   catalog record counts as suitable but is only picked while no AVAILABLE
@@ -604,7 +605,7 @@ export function pickAccount(
     (a) =>
       a.label !== excludeLabel &&
       priorityOf(a) > 0 &&
-      entryOf(a.label)?.parkedReason !== "tos-disabled" &&
+      entryOf(a.label)?.parkedReason === undefined &&
       stateOf(a) !== "unsupported",
   );
   if (candidates.length === 0) {
@@ -764,11 +765,14 @@ export function writeAccountHome(
 }
 
 /** True when too many accounts were parked inside the breaker window — the
- * egress looks guilty, not the accounts, so no more parking. */
+ * egress looks guilty, not the accounts, so no more parking. A tos-disabled
+ * parking is the account's own ban (§2.3 п.7): it neither feeds the count
+ * nor is held back by an open breaker. */
 export function checkIneligibleBreaker(ledger: AccountsLedger, nowMs = Date.now()): boolean {
   const windowMs = ineligibleBreakerWindowMs();
   const parkedCount = Object.values(ledger.accounts).filter(
     (entry) =>
+      entry.parkedReason !== "tos-disabled" &&
       typeof entry.ineligibleAtMs === "number" &&
       entry.ineligibleAtMs > nowMs - windowMs &&
       entry.ineligibleAtMs <= nowMs,
@@ -854,9 +858,11 @@ export function modelFamilyOf(model: string): string {
 }
 
 /**
- * Fresh per-account model records keyed by label. A record older than the
- * six-hour TTL reads as absent (the account falls back to "unknown" and
- * gets re-polled lazily); unsupported marks past the TTL are pruned.
+ * Per-account model records keyed by label. A record older than the
+ * six-hour TTL is STILL returned (§2.3 п.1): it stays valid for selection
+ * until a successful poll replaces it — callers that schedule refreshes
+ * compare `atMs` themselves. Unsupported marks past the TTL are pruned;
+ * each mark has its own lifetime (see accountModelState).
  */
 export function loadAccountModels(dataDir: string): AccountModelCatalog {
   const parsed =
@@ -871,8 +877,7 @@ export function loadAccountModels(dataDir: string): AccountModelCatalog {
       typeof rec !== "object" ||
       !Array.isArray(rec.raw) ||
       !Array.isArray(rec.families) ||
-      typeof rec.atMs !== "number" ||
-      now - rec.atMs > ACCOUNT_MODELS_TTL_MS
+      typeof rec.atMs !== "number"
     ) {
       continue;
     }
@@ -956,7 +961,11 @@ export function markAccountModelUnsupported(
       raw: previous?.raw ?? [],
       families: previous?.families ?? [],
       unsupported,
-      atMs: Date.now(),
+      // A refusal is negative knowledge, not a fresh poll: re-stamping
+      // Date.now() would validate a stale record for another TTL and
+      // silence the refresh queue. A never-polled account gets atMs 0 —
+      // stale on arrival, so the lazy probe still runs (§2.3 п.1).
+      atMs: previous?.atMs ?? 0,
     });
   });
 }

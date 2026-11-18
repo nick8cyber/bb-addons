@@ -136,11 +136,13 @@ await sleep(100);
 // ---- ACP phase (spec §2.3): per-account model catalogs in
 // accounts-models.json, model-aware account selection, merged model/list.
 // m1 (priority 10) carries the common models, m2 (priority 5) is the only
-// pro-model account, m3 is priority 0 — never polled, never picked.
+// pro-model account, m3 is priority 0 — never polled, never picked — and
+// m5 is parked (tos-disabled): never polled, never picked, excluded from
+// the merged catalog. m4 is created later for the failed-probe throttle.
 const acpChecks = [];
 const acpCheck = (id, ok, detail = "") => acpChecks.push([id, ok, detail]);
 const acpData = join(root, "acp-data");
-for (const label of ["m1", "m2", "m3"]) {
+for (const label of ["m1", "m2", "m3", "m5"]) {
   const cli = join(acpData, "accounts", label, ".gemini", "antigravity-cli");
   mkdirSync(cli, { recursive: true });
   writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
@@ -155,15 +157,24 @@ delete process.env.AGY_FAKE_ERROR_MODE;
 process.env.AGY_IDLE_KILL_MS = "0";
 process.env.AGY_FAKE_TRANSCRIPT = join(root, "acp-stdin.ndjson");
 process.env.AGY_FAKE_CONTROL = join(root, "acp-control.json");
+const M5_PARKED = { cooldownUntilMs: 0, lastUsedMs: 0, lastError: "tos", priority: 10, ineligibleAtMs: 1, parkedReason: "tos-disabled" };
 writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
   m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
   m2: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 5 },
   m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
+  m5: { ...M5_PARKED },
+} }, null, 1));
+// Seed a catalog record for the parked account before the bridge starts —
+// its models must never reach the merged model/list (§2.3 п.2). Probe
+// saves merge by label, so coexisting with later m1/m2 records is safe.
+writeFileSync(join(acpData, "accounts-models.json"), JSON.stringify({ accounts: {
+  m5: { raw: [{ id: "parked-model", displayName: "Parked Model" }], families: ["parked-model"], unsupported: {}, atMs: Date.now() },
 } }, null, 1));
 writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify({ modelsByLabel: {
   m1: [["fake-model", "Fake Model"], ["shared-model", "Shared Model"]],
   m2: [["fake-model", "Fake Model"], ["shared-model", "Shared Model"], ["pro-model", "Pro Model"]],
   m3: [["pro-model", "Pro Model"]],
+  m5: [["parked-model", "Parked Model"]],
 } }, null, 1));
 
 const acpTranscript = () =>
@@ -227,8 +238,14 @@ acpCheck("models/per-account-catalog-file",
 acpCheck("models/priority-zero-never-polled",
   acpProbes("m1") >= 1 && acpProbes("m2") >= 1 && acpProbes("m3") === 0,
   `probes m1=${acpProbes("m1")} m2=${acpProbes("m2")} m3=${acpProbes("m3")}`);
+acpCheck("models/parked-never-polled",
+  acpProbes("m5") === 0,
+  `probes m5=${acpProbes("m5")}`);
 acpCheck("models/list-merges-union",
   ["fake-model", "shared-model", "pro-model"].every((mid) => listed.some((m) => m.id === mid)),
+  JSON.stringify(listed.map((m) => m.id)));
+acpCheck("models/list-excludes-parked",
+  !listed.some((m) => m.id === "parked-model"),
   JSON.stringify(listed.map((m) => m.id)));
 
 // shared-model sits in both catalogs: priority decides (m1 over m2) and a
@@ -242,6 +259,7 @@ writeAcpLedger({
   m1: { cooldownUntilMs: Date.now() + 3_600_000, lastUsedMs: Date.now(), lastError: "test cooldown", priority: 10 },
   m2: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 5 },
   m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
+  m5: { ...M5_PARKED },
 });
 const sh2 = await acpStart("t-shared-2", "shared-model");
 acpCheck("models/common-model-cooldown-falls-to-sibling",
@@ -251,6 +269,7 @@ writeAcpLedger({
   m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
   m2: { cooldownUntilMs: 0, lastUsedMs: Date.now(), lastError: null, priority: 5 },
   m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
+  m5: { ...M5_PARKED },
 });
 const sh3 = await acpStart("t-shared-3", "shared-model");
 acpCheck("models/common-model-uncooled-returns-to-priority",
@@ -265,7 +284,39 @@ acpCheck("models/unoffered-fails-honestly",
   acpNews("m1") + acpNews("m2") + acpNews("m3") === newsBeforeGhost,
   ghost.error?.message ?? "unexpected success");
 
-for (const tid of ["t-pro-early", "t-shared-1", "t-shared-2", "t-shared-3"]) {
+// Probe throttle (§2.3 п.1): m4's `agy models` prints nothing, so its poll
+// always fails — two catalog reads in a row must still spawn it only once.
+{
+  const cli = join(acpData, "accounts", "m4", ".gemini", "antigravity-cli");
+  mkdirSync(cli, { recursive: true });
+  writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+  const ctl = JSON.parse(readFileSync(process.env.AGY_FAKE_CONTROL, "utf8"));
+  ctl.modelsByLabel.m4 = [];
+  writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify(ctl));
+}
+await acpStart("t-throttle-1", "shared-model");
+await waitFor(() => acpProbes("m4") >= 1, 10_000, "first m4 probe");
+await acpStart("t-throttle-2", "shared-model");
+await sleep(500);
+acpCheck("models/failed-probe-throttled",
+  acpProbes("m4") === 1 && acpProbes("m5") === 0,
+  `probes m4=${acpProbes("m4")} m5=${acpProbes("m5")}`);
+
+// Every pool account parked (any parkedReason): even a model-less start
+// fails honestly instead of silently dropping to direct mode (§2.3 п.7).
+writeAcpLedger({
+  m1: { ...M5_PARKED, parkedReason: "tos-disabled" },
+  m2: { ...M5_PARKED, priority: 5, parkedReason: "auth-dead" },
+  m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
+  m4: { ...M5_PARKED, parkedReason: "tos-disabled" },
+  m5: { ...M5_PARKED },
+});
+const allParkedReply = await acpStart("t-all-parked", undefined);
+acpCheck("models/all-parked-fails-honestly",
+  allParkedReply?.error !== undefined && /parked/iu.test(allParkedReply.error.message ?? ""),
+  allParkedReply?.error?.message ?? "unexpected success");
+
+for (const tid of ["t-pro-early", "t-shared-1", "t-shared-2", "t-shared-3", "t-throttle-1", "t-throttle-2"]) {
   sendAcp({ jsonrpc: "2.0", id: acpId++, method: "thread/stop", params: { threadId: tid, intent: "release", activeTurnId: null } });
 }
 
@@ -283,7 +334,7 @@ const ledger = (() => {
 })();
 const replacedList = replaced();
 
-const { pickAccount, accountPriority } = await import(
+const { pickAccount, accountPriority, loadAccountModels, markAccountModelUnsupported, checkIneligibleBreaker } = await import(
   new URL("./src/accounts.ts", import.meta.url).href
 );
 const prioTestHomes = [
@@ -346,6 +397,56 @@ acpCheck("models/fresh-unsupported-mark-excludes",
 acpCheck("models/no-catalog-is-legacy-behaviour",
   pickAccount(mLedger, mHomes, null, { family: "pro", models: {} })?.label === "m-b",
   "expected m-b");
+
+// §2.3 п.1: a stale catalog record (>6h) stays valid for selection — the
+// lower-priority senior tier must not surface just because the ordinary
+// account's record ran past its TTL.
+const modelsDir = join(root, "models-check");
+mkdirSync(modelsDir, { recursive: true });
+const staleAtMs = Date.now() - 7 * 3_600_000;
+writeFileSync(join(modelsDir, "accounts-models.json"), JSON.stringify({ accounts: {
+  "stale-a": { raw: [{ id: "shared-x", displayName: "Shared X" }], families: ["shared-x"], unsupported: {}, atMs: staleAtMs },
+  "fresh-b": { raw: [{ id: "shared-x", displayName: "Shared X" }], families: ["shared-x"], unsupported: {}, atMs: Date.now() },
+} }, null, 1));
+const staleCatalog = loadAccountModels(modelsDir);
+const staleLedger = { accounts: {
+  "stale-a": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+  "fresh-b": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 5 },
+}, conversations: {} };
+const stalePicked = pickAccount(staleLedger,
+  [{ label: "stale-a", home: "", proxy: null }, { label: "fresh-b", home: "", proxy: null }],
+  null, { family: "shared-x", models: staleCatalog });
+acpCheck("models/stale-record-still-selects",
+  staleCatalog["stale-a"] !== undefined && stalePicked?.label === "stale-a",
+  `picked=${stalePicked?.label ?? "none"}`);
+
+// §2.3 п.1: an in-flight refusal mark keeps the record's own atMs — a
+// fresh stamp would re-validate a stale record and silence the probe
+// queue; a never-polled label gets atMs 0 (stale on arrival).
+markAccountModelUnsupported(modelsDir, "stale-a", "denied-x");
+const markedRec = JSON.parse(readFileSync(join(modelsDir, "accounts-models.json"), "utf8")).accounts["stale-a"];
+acpCheck("models/refusal-mark-keeps-atms",
+  markedRec?.atMs === staleAtMs && (markedRec.unsupported?.["denied-x"] ?? 0) > 0 && markedRec.raw.length === 1,
+  `atMs=${markedRec?.atMs} staleAt=${staleAtMs}`);
+markAccountModelUnsupported(modelsDir, "never-polled", "denied-x");
+const virginRec = JSON.parse(readFileSync(join(modelsDir, "accounts-models.json"), "utf8")).accounts["never-polled"];
+acpCheck("models/refusal-mark-virgin-atms-zero",
+  virginRec?.atMs === 0 && Array.isArray(virginRec.raw) && virginRec.raw.length === 0,
+  JSON.stringify(virginRec));
+
+// §2.3 п.7: a tos-disabled parking does not feed the eligibility breaker —
+// one tos mark plus two genuine eligibility parks stays below the default
+// threshold of three.
+const breakerBase = { accounts: {
+  "bk-tos": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, ineligibleAtMs: Date.now(), parkedReason: "tos-disabled" },
+  "bk-e1": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, ineligibleAtMs: Date.now() },
+  "bk-e2": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, ineligibleAtMs: Date.now() },
+}, conversations: {} };
+const breakerPlusOne = { accounts: { ...breakerBase.accounts,
+  "bk-e3": { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, ineligibleAtMs: Date.now() } }, conversations: {} };
+acpCheck("models/tos-parking-skips-breaker",
+  checkIneligibleBreaker(breakerBase) === false && checkIneligibleBreaker(breakerPlusOne) === true,
+  `tos+2=${checkIneligibleBreaker(breakerBase)} tos+3=${checkIneligibleBreaker(breakerPlusOne)}`);
 
 const checks = [
   ...acpChecks,

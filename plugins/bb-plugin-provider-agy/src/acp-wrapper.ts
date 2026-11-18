@@ -1761,6 +1761,12 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
 
 /** Never more than two `agy models` children at once (§2.3). */
 const MAX_MODEL_PROBES = 2;
+/**
+ * One probe attempt per label per interval (§2.3 п.1): a failed or empty
+ * poll must not respawn `agy models` on every catalog read.
+ */
+const MODEL_PROBE_MIN_INTERVAL_MS = 30 * 60 * 1000;
+const modelProbeLastAtMs = new Map<string, number>();
 const modelProbes = {
   running: 0,
   queued: new Set<string>(),
@@ -1768,10 +1774,12 @@ const modelProbes = {
 };
 
 /**
- * Load the fresh per-account catalog and lazily (re)poll eligible accounts
- * whose record is missing or stale. Priority 0 accounts are never polled;
- * a missing/stale record only queues a probe — selection still decides on
- * what is already on disk.
+ * Load the per-account catalog and lazily (re)poll eligible accounts whose
+ * record is missing or stale. Records outlive the TTL for selection —
+ * staleness only queues a probe. Never polled (§2.3 п.1): priority 0
+ * accounts, parked accounts (any parkedReason), and accounts cooling down
+ * past the record's whole TTL. A failed probe does not requeue the label
+ * until MODEL_PROBE_MIN_INTERVAL_MS has passed.
  */
 function accountModelCatalog(): AccountModelCatalog {
   if (dataDir === "" || !accountsEnabled(process.env)) {
@@ -1779,12 +1787,27 @@ function accountModelCatalog(): AccountModelCatalog {
   }
   const catalog = loadAccountModels(dataDir);
   const ledger = loadLedger(dataDir);
+  const now = Date.now();
   for (const account of listAccounts(dataDir)) {
-    if (accountPriority(ledger.accounts[account.label]) <= 0) {
+    const entry = ledger.accounts[account.label];
+    if (accountPriority(entry) <= 0) {
       continue;
     }
-    if (Object.hasOwn(catalog, account.label)) {
-      continue; // loadAccountModels already dropped stale records
+    if (entry?.parkedReason !== undefined) {
+      continue;
+    }
+    if ((entry?.cooldownUntilMs ?? 0) - now > ACCOUNT_MODELS_TTL_MS) {
+      continue;
+    }
+    const record = Object.hasOwn(catalog, account.label)
+      ? catalog[account.label]
+      : undefined;
+    if (record !== undefined && now - record.atMs <= ACCOUNT_MODELS_TTL_MS) {
+      continue;
+    }
+    const lastProbe = modelProbeLastAtMs.get(account.label) ?? 0;
+    if (now - lastProbe < MODEL_PROBE_MIN_INTERVAL_MS) {
+      continue;
     }
     queueModelProbe(account);
   }
@@ -1824,6 +1847,7 @@ function pumpModelProbes(): void {
 }
 
 function runModelProbe(account: AccountHome, done: () => void): void {
+  modelProbeLastAtMs.set(account.label, Date.now());
   let child: ChildProcess;
   try {
     child = spawn(
@@ -1898,7 +1922,11 @@ async function mergedAccountCatalog(): Promise<
   const fresh = loadAccountModels(dataDir);
   const ledger = loadLedger(dataDir);
   const eligible = listAccounts(dataDir)
-    .filter((a) => accountPriority(ledger.accounts[a.label]) > 0)
+    .filter(
+      (a) =>
+        accountPriority(ledger.accounts[a.label]) > 0 &&
+        ledger.accounts[a.label]?.parkedReason === undefined,
+    )
     .sort((a, b) => a.label.localeCompare(b.label));
   const seen = new Set<string>();
   const merged: { id: string; displayName: string }[] = [];
@@ -1934,7 +1962,7 @@ function poolOffersModel(
   return accounts.some(
     (a) =>
       accountPriority(ledger.accounts[a.label]) > 0 &&
-      ledger.accounts[a.label]?.parkedReason !== "tos-disabled" &&
+      ledger.accounts[a.label]?.parkedReason === undefined &&
       accountModelState(
         Object.hasOwn(catalog, a.label) ? catalog[a.label] : undefined,
         family,
@@ -2311,7 +2339,7 @@ function nearestCooldownEnd(session: WSession): number | null {
     .filter(
       (a) =>
         accountPriority(ledger.accounts[a.label]) > 0 &&
-        ledger.accounts[a.label]?.parkedReason !== "tos-disabled",
+        ledger.accounts[a.label]?.parkedReason === undefined,
     )
     .filter(
       (a) =>
@@ -2332,13 +2360,20 @@ function nearestCooldownEnd(session: WSession): number | null {
  * errorInfo provider-retry reads, the blocked rateLimits snapshot, and — for
  * a turn the daemon still holds open — the failed boundary that closes it.
  */
-function failOut(session: WSession, message: string): void {
+function failOut(
+  session: WSession,
+  message: string,
+  options: { blockedUntilMs?: number } = {},
+): void {
   resolveInteractions(session.threadId);
   if (session.pendingConsume !== null) {
     sendError(session.pendingConsume.requestId, -32000, message);
     session.pendingConsume = null;
   }
-  const info = nativeErrorInfo(message);
+  const info =
+    options.blockedUntilMs !== undefined
+      ? { category: "rate-limit" as const, providerCode: null, httpStatusCode: 429 }
+      : nativeErrorInfo(message);
   emitDeltas(session.threadId, {
     kind: "provider.error",
     message,
@@ -2353,7 +2388,9 @@ function failOut(session: WSession, message: string): void {
     });
     session.daemonTurnOpen = false;
   }
-  if (classifyError(message) === "rate-limit") {
+  if (options.blockedUntilMs !== undefined) {
+    emitRateLimits(session, "blocked", options.blockedUntilMs, message);
+  } else if (classifyError(message) === "rate-limit") {
     emitRateLimits(
       session,
       "blocked",
@@ -2364,6 +2401,31 @@ function failOut(session: WSession, message: string): void {
   session.rotating = false;
   session.rotationCause = null;
   drainQueue(session);
+}
+
+/**
+ * §2.3 п.5: a model failure ends two ways. No pool account can serve the
+ * family → the honest "not offered" refusal, no cooldowns, no rotation.
+ * Suitable carriers exist but every one is cooling → the §3
+ * whole-pool-cooled branch: provider.error carrying rate-limit errorInfo
+ * and rateLimits blocked until the nearest suitable resetsAt, so
+ * provider-retry waits the window out and re-runs the turn.
+ */
+function failOutModel(session: WSession, message: string): void {
+  const resetsAt = nearestCooldownEnd(session);
+  if (resetsAt === null) {
+    failOut(
+      session,
+      `model ${session.model ?? "?"} is not offered by any pool account`,
+    );
+    return;
+  }
+  failOut(
+    session,
+    `model ${session.model ?? "?"} is cooling on every pool account that offers it; ` +
+      `earliest window reopens at ${new Date(resetsAt).toISOString()} (${message})`,
+    { blockedUntilMs: resetsAt },
+  );
 }
 
 /** Synthesize thread/start for the session's current account. */
@@ -2405,7 +2467,11 @@ function startRotation(
     log(
       `thread ${session.threadId}: rotation found no free sibling; failing out`,
     );
-    failOut(session, poolExhaustedText(session, cause, message));
+    if (cause === "model") {
+      failOutModel(session, message);
+    } else {
+      failOut(session, poolExhaustedText(cause, message));
+    }
     return;
   }
   session.rotating = true;
@@ -2482,15 +2548,7 @@ function scheduleWaitRetry(
 }
 
 /** The classified error now decides the open turn's fate. */
-function poolExhaustedText(
-  session: WSession,
-  cause: RotationCause,
-  message: string,
-): string {
-  if (cause === "model") {
-    // §2.3: the honest failure when nothing suitable can run the turn.
-    return `model ${session.model ?? "?"} is not offered by any pool account`;
-  }
+function poolExhaustedText(cause: RotationCause, message: string): string {
   return cause === "auth-dead"
     ? `${message} — every pool account lost its Google sign-in; re-authenticate one and retry`
     : message;
@@ -2510,7 +2568,11 @@ function handleClassifiedError(
       scheduleWaitRetry(session, cause, message);
       return;
     case "fail":
-      failOut(session, poolExhaustedText(session, cause, message));
+      if (cause === "model") {
+        failOutModel(session, message);
+      } else {
+        failOut(session, poolExhaustedText(cause, message));
+      }
       return;
   }
 }
@@ -3144,7 +3206,7 @@ const pendingDaemonSessions = new Map<JsonRpcId, PendingDaemonSession>();
 
 function poolPickAccount(
   session: WSession,
-): "picked" | "direct" | "unoffered" {
+): "picked" | "direct" | "unoffered" | "parked" {
   if (dataDir === "" || !accountsEnabled(process.env)) {
     session.accountLabel = null;
     return "direct";
@@ -3158,6 +3220,20 @@ function poolPickAccount(
   });
   session.accountLabel = picked?.label ?? null;
   if (picked === null) {
+    // §2.3 п.7: with every pool account parked (any parkedReason), even a
+    // model-less request must fail honestly — a silent direct-mode fall
+    // onto the default HOME would hide the parked pool.
+    const eligible = accounts.filter(
+      (a) => accountPriority(ledger.accounts[a.label]) > 0,
+    );
+    if (
+      eligible.length > 0 &&
+      eligible.every(
+        (a) => ledger.accounts[a.label]?.parkedReason !== undefined,
+      )
+    ) {
+      return "parked";
+    }
     // §2.3: when every eligible account's catalog says it cannot serve the
     // model, fail honestly instead of landing on an account without it.
     if (
@@ -3352,11 +3428,14 @@ function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void
   session.model = earlySelection.modelId ?? session.model;
   session.reasoningLevel =
     earlySelection.reasoningLevel ?? session.reasoningLevel;
-  if (poolPickAccount(session) === "unoffered") {
+  const poolPick = poolPickAccount(session);
+  if (poolPick === "unoffered" || poolPick === "parked") {
     sendError(
       id,
       -32000,
-      `model ${session.model ?? "?"} is not offered by any pool account`,
+      poolPick === "unoffered"
+        ? `model ${session.model ?? "?"} is not offered by any pool account`
+        : "every pool account is parked; clear a parkedReason in accounts-state.json and retry",
     );
     discardSession(session);
     return;
