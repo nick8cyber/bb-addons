@@ -12912,6 +12912,9 @@ var providerUsageSchema = external_exports.discriminatedUnion("status", [
     status: external_exports.literal("ok"),
     accountEmail: external_exports.nullable(nonemptyStringSchema),
     planLabel: external_exports.nullable(nonemptyStringSchema),
+    // provider-agy parallel installs (§9 п.3): which install serves the
+    // account; absent/null for providers without the notion.
+    install: external_exports.optional(external_exports.nullable(nonemptyStringSchema)),
     windows: external_exports.array(usageWindowSchema)
   }),
   external_exports.strictObject({ status: external_exports.literal("not_installed") }),
@@ -15111,7 +15114,10 @@ var usagePlanSchema = external_exports2.object({
 var accountFields = {
   plan: usagePlanSchema.nullable().default(null),
   accountEmail: external_exports2.string().nullable(),
-  planLabel: external_exports2.string().nullable()
+  planLabel: external_exports2.string().nullable(),
+  // provider-agy parallel installs (§9 п.3): optional so non-agy sources
+  // never have to emit it.
+  install: external_exports2.string().nullable().optional()
 };
 var usageWindowKindSchema = external_exports2.enum([
   "five-hour",
@@ -15225,6 +15231,7 @@ function normalizedUsage(usage) {
         status: "ok",
         accountEmail: usage.accountEmail || null,
         planLabel: usage.planLabel || null,
+        install: typeof usage.install === "string" ? usage.install : null,
         windows: usage.windows.map((window) => ({
           label: window.label,
           usedPercent: window.usedPercent,
@@ -15735,6 +15742,24 @@ function providerUsagePlugin(bb, options = {}) {
   // -------------------------------------------------------------------
 
   const AGY_INSTALL_NAME_RE = /^[a-z0-9-]{1,32}$/u;
+  // §2 п.3: keys the plugin, the shim and the account own — a registry env
+  // section may not carry them; any presence breaks the whole registry.
+  const AGY_FORBIDDEN_ENV_EXACT = new Set([
+    "HOME",
+    "ELECTRON_RUN_AS_NODE",
+    "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL"
+  ]);
+  const AGY_FORBIDDEN_ENV_PROXY = new Set([
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY"
+  ]);
+  const forbiddenEnvKey = (key) =>
+    AGY_FORBIDDEN_ENV_EXACT.has(key) ||
+    AGY_FORBIDDEN_ENV_PROXY.has(key.toUpperCase()) ||
+    key.startsWith("AGY_");
 
   /** Read and validate <dataDir>/agy-installs.json (§2). */
   const agyInstallsRegistry = (baseDir) => {
@@ -15766,7 +15791,22 @@ function providerUsagePlugin(bb, options = {}) {
       if (typeof raw.bin !== "string" || !raw.bin.startsWith("/")) {
         return { state: "broken", reason: `${file}: install ${name} "bin" is not an absolute path` };
       }
-      installs[name] = { bin: raw.bin, env: raw.env && typeof raw.env === "object" ? raw.env : {} };
+      const env = {};
+      if (raw.env !== undefined) {
+        if (raw.env === null || typeof raw.env !== "object" || Array.isArray(raw.env)) {
+          return { state: "broken", reason: `${file}: install ${name} "env" is not an object` };
+        }
+        for (const [key, value] of Object.entries(raw.env)) {
+          if (forbiddenEnvKey(key)) {
+            return { state: "broken", reason: `${file}: install ${name} env key ${key} is managed by the plugin and cannot be overridden` };
+          }
+          if (typeof value !== "string") {
+            return { state: "broken", reason: `${file}: install ${name} env ${key} is not a string` };
+          }
+          env[key] = value;
+        }
+      }
+      installs[name] = { bin: raw.bin, env };
     }
     if (typeof parsed.default !== "string" || !Object.hasOwn(installs, parsed.default)) {
       return { state: "broken", reason: `${file}: "default" does not name an entry in "installs"` };
@@ -15828,8 +15868,15 @@ function providerUsagePlugin(bb, options = {}) {
       }
       return { name: registry.default, bin: record.bin, env: record.env, unavailable: null };
     };
-    for (const label of Object.keys(state.accounts ?? {})) {
-      out.set(label, resolveOne(state.accounts[label]?.install));
+    // Every account directory on disk resolves — a label missing from
+    // accounts-state.json is an unbound account, which §3 binds to the
+    // registry default, not to the implicit binary.
+    const labels = new Set([
+      ...Object.keys(state.accounts ?? {}),
+      ...agyAccountLabels(baseDir)
+    ]);
+    for (const label of labels) {
+      out.set(label, resolveOne(state.accounts?.[label]?.install));
     }
     return out;
   };

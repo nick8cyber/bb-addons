@@ -3055,7 +3055,30 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
     // The catalog is account-independent enough; whichever home the pool or
     // the relay offers first reads it, so a pooled host lists what its own
     // accounts can actually serve.
-    let bin = resolveAgyCommand(process.env);
+    let bin: string | null = resolveAgyCommand(process.env);
+    let blockReason: string | null = null;
+    // §5 п.2: a resolution that cannot run is answered honestly — the
+    // implicit resolveAgyCommand binary is never a substitute for a bound
+    // install, and a pool pick with no usable account still probes through
+    // the default install rather than the implicit binary.
+    const applyResolution = (
+      resolution: ReturnType<typeof resolveInstall>,
+    ): void => {
+      if (
+        resolution.kind === "unavailable" ||
+        resolution.kind === "broken"
+      ) {
+        bin = null;
+        blockReason = resolution.reason;
+        return;
+      }
+      if (resolution.kind === "bin") {
+        for (const [key, value] of Object.entries(resolution.env)) {
+          env[key] = value;
+        }
+        bin = resolution.bin;
+      }
+    };
     if (cliproxyRelayDataDir !== null && accountsEnabled(process.env)) {
       const ledger = loadLedger(cliproxyRelayDataDir);
       const account = pickAccount(
@@ -3073,25 +3096,22 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
           env.https_proxy = account.proxy;
         }
         // §6 п.10: the probe runs the picked account's install binary.
-        const resolution = resolveInstall(
-          cliproxyRelayDataDir,
-          ledger.accounts[account.label]?.install,
+        applyResolution(
+          resolveInstall(
+            cliproxyRelayDataDir,
+            ledger.accounts[account.label]?.install,
+          ),
         );
-        if (resolution.kind === "bin") {
-          for (const [key, value] of Object.entries(resolution.env)) {
-            env[key] = value;
-          }
-          bin = resolution.bin;
-        }
+      } else {
+        applyResolution(resolveInstall(cliproxyRelayDataDir, undefined));
       }
     } else if (cliproxyRelayDataDir !== null) {
-      const resolution = resolveInstall(cliproxyRelayDataDir, undefined);
-      if (resolution.kind === "bin") {
-        for (const [key, value] of Object.entries(resolution.env)) {
-          env[key] = value;
-        }
-        bin = resolution.bin;
-      }
+      applyResolution(resolveInstall(cliproxyRelayDataDir, undefined));
+    }
+    if (bin === null) {
+      log(`models list skipped: ${blockReason ?? "install unavailable"}`);
+      resolve([]);
+      return;
     }
     if (env.HOME === process.env.HOME) {
       for (const [key, value] of Object.entries(cliproxyChildEnvOverlay())) {
