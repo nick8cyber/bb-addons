@@ -49,8 +49,8 @@ date: 2026-11-18
 
    - `bb orchestrator release-note <KEY> "<заметка>"` (передача заметки для waiting_release_note)
    - `bb orchestrator defer <KEY> --reason "<причина>"` (только владелец)
-   - `bb orchestrator dequeue <KEY> [--reason "<причина>"]` (снятие задачи с очереди владельцем, архивация ветки в теги refs/tags/archive/<KEY>-cancelled-<ts> и удаление локально и в origin, статус cancelled)
-   - `bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route ...] [--level ...] [--acceptance <файл|текст>] [--release-note <текст>] [--depends-on ...] [--force-reset-branch]` (постановка и повторный запуск задачи; флаг --acceptance и смена договора — только владелец; флаг --force-reset-branch архивирует прошлую ветку в тег refs/tags/archive/<KEY>-force-reset-<ts> и пересоздаёт чистую ветку)
+   - `bb orchestrator dequeue <KEY> [--reason "<причина>"]` (снятие задачи с очереди владельцем, архивация ветки в теги refs/tags/archive/<KEY>-cancelled-<ts> и удаление локально и в origin при наличии ветки, статус cancelled)
+   - `bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route ...] [--level ...] [--acceptance <файл|текст>] [--release-note <текст>] [--depends-on ...] [--force-reset-branch]` (постановка и повторный запуск задачи; флаг --acceptance и смена договора — только владелец; синхронная проверка невлитой ветки в enqueue: отказ unmerged-branch-exists без изменения записи, либо синхронная архивация в тег refs/tags/archive/<KEY>-force-reset-<ts> и удаление старой ветки при --force-reset-branch)
    - `bb orchestrator reject <KEY> [--target spec|design|code] --reason "<причина>"` (возврат текущего узла на доработку в рамках маршрута; при blocked/deferred запрещён)
    - `bb orchestrator resume <KEY> [--target spec|design|code|release] [--reopen]` (возобновление задачи из deferred/blocked/stalled; blocked/deferred — только владелец, с допустимыми целями строго по маршруту)
    - `bb orchestrator approve <KEY> [--comment <текст>]` (одобрение перехода owner_gate владельцем)
