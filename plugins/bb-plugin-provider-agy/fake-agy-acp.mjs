@@ -172,6 +172,12 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }
+  // §2.3 п.11 (ревизия 13.1): the same refusal as a hard 403 — arrives as
+  // a JSON-RPC error (session/prompt or session/new), not agent text.
+  if (text.includes("[[validation-error]]") || mode === "validation-error" || (mode === "validation-error-once" && once("ve"))) {
+    out({ jsonrpc: "2.0", id, error: { code: 403, message: "PERMISSION_DENIED: VALIDATION_REQUIRED — Verify your account to continue" } });
+    return;
+  }
   if (mode === "ineligible" && once("inel")) {
     out({ jsonrpc: "2.0", id, error: { code: 403, message: ineligibleMsg } });
     return;
@@ -255,6 +261,10 @@ rlFake.on("line", (line) => {
         authMethods: [] } });
       return;
     case "session/new":
+      if ((control().modeByLabel?.[homeLabel] ?? control().errorMode ?? modeEnv) === "validation-error") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: 403, message: "PERMISSION_DENIED: VALIDATION_REQUIRED — Verify your account to continue" } });
+        return;
+      }
       sessionId = `fake-acp-${++sessionCounter}-${homeLabel}`;
       out({ jsonrpc: "2.0", id: msg.id, result: { sessionId, configOptions: configOptionsFor(), modes } });
       return;

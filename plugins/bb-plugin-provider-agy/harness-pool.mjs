@@ -164,13 +164,25 @@ writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
   m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
   m5: { ...M5_PARKED },
 } }, null, 1));
-// Seed a catalog record for the parked account before the bridge starts —
-// its models must never reach the merged model/list (§2.3 п.2). The record
-// is deliberately STALE (older than the 6h TTL): only the parkedReason
-// guard keeps m5 out of the probe queue, so dropping the guard makes
-// models/parked-never-polled fail. Probe saves merge by label, so
-// coexisting with later m1/m2 records is safe.
+// Seed catalog records before the bridge starts. m5's is deliberately
+// STALE (older than the 6h TTL): only the parkedReason guard keeps it out
+// of the probe queue, so dropping the guard makes models/parked-never-polled
+// fail. m1's fresh record deliberately LIES about pro-model (its real
+// catalog lacks it): the catalog-claims-vs-agy-refusal path below needs a
+// pick that trusts the record, and §2.3 п.9 forbids guessing on recordless
+// accounts. Probe saves merge by label, so these coexist with later
+// probe-written records.
 writeFileSync(join(acpData, "accounts-models.json"), JSON.stringify({ accounts: {
+  m1: {
+    raw: [
+      { id: "fake-model", displayName: "Fake Model" },
+      { id: "shared-model", displayName: "Shared Model" },
+      { id: "pro-model", displayName: "Pro Model" },
+    ],
+    families: ["fake-model", "shared-model", "pro-model"],
+    unsupported: {},
+    atMs: Date.now(),
+  },
   m5: { raw: [{ id: "parked-model", displayName: "Parked Model" }], families: ["parked-model"], unsupported: {}, atMs: Date.now() - 7 * 3_600_000 },
 } }, null, 1));
 writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify({ modelsByLabel: {
@@ -216,9 +228,17 @@ const acpStart = async (threadId, model) => {
   return acpReply(id);
 };
 
-// Before any catalog exists every account is a candidate: the unpolled
-// pick takes m1 (priority 10), whose session refuses pro-model at session
-// build; the wrapper marks m1's family unsupported and re-drives on m2.
+// model/list runs the lazy per-account poll up front so the record for
+// the recordless eligible account (m2) is fresh before the retry below:
+// §2.3 п.10 allows a model-refusal move only onto a FRESH catalog.
+const listId = acpId++;
+sendAcp({ jsonrpc: "2.0", id: listId, method: "model/list", params: {} });
+await waitFor(() => acpReply(listId) !== undefined, 20_000, "acp model/list");
+const listed = acpReply(listId)?.result?.models ?? [];
+
+// m1's seeded record claims pro-model but its agy refuses it at session
+// build; the wrapper marks the family unsupported and moves once to m2,
+// whose probed catalog names pro-model.
 const early = await acpStart("t-pro-early", "pro-model");
 await sleep(200);
 acpCheck("models/start-refusal-retries-suitable",
@@ -228,19 +248,14 @@ acpCheck("models/refusal-marked-unsupported",
   (readAcpModels().m1?.unsupported?.["pro-model"] ?? 0) > 0,
   JSON.stringify(readAcpModels().m1?.unsupported ?? null));
 
-// model/list merges the per-account catalogs the lazy poll just wrote.
-const listId = acpId++;
-sendAcp({ jsonrpc: "2.0", id: listId, method: "model/list", params: {} });
-await waitFor(() => acpReply(listId) !== undefined, 20_000, "acp model/list");
-const listed = acpReply(listId)?.result?.models ?? [];
 acpCheck("models/per-account-catalog-file",
   (readAcpModels().m1?.families ?? []).includes("shared-model") &&
   (readAcpModels().m2?.families ?? []).includes("pro-model") &&
   readAcpModels().m3 === undefined,
   JSON.stringify(Object.fromEntries(Object.entries(readAcpModels()).map(([k, v]) => [k, v.families]))));
 acpCheck("models/priority-zero-never-polled",
-  acpProbes("m1") >= 1 && acpProbes("m2") >= 1 && acpProbes("m3") === 0,
-  `probes m1=${acpProbes("m1")} m2=${acpProbes("m2")} m3=${acpProbes("m3")}`);
+  acpProbes("m2") >= 1 && acpProbes("m3") === 0,
+  `probes m2=${acpProbes("m2")} m3=${acpProbes("m3")}`);
 acpCheck("models/parked-never-polled",
   acpProbes("m5") === 0,
   `probes m5=${acpProbes("m5")}`);

@@ -818,6 +818,21 @@ export function isValidationRequired(message: string): boolean {
 }
 
 /**
+ * §2.3 п.11 (ревизия 13.1): inside streamed agent output only the exact
+ * agy form counts — a message whose trimmed content IS the
+ * "⚠ Verification Required" marker and nothing substantial after it.
+ * Ordinary prose mentioning these words (a quote, a discussion of the
+ * error itself) never triggers parking; the wide VALIDATION_REQUIRED
+ * pattern above stays reserved for real error strings.
+ */
+const AGENT_VALIDATION_MESSAGE_PATTERN =
+  /^⚠\s*Verification Required\.?\s*$/iu;
+
+export function isAgentValidationMessage(text: string): boolean {
+  return AGENT_VALIDATION_MESSAGE_PATTERN.test(text.trim());
+}
+
+/**
  * The far-future stamp a tos-disabled parking puts on cooldownUntilMs:
  * effectively permanent, but still readable by every "is this account in
  * cooldown" check that predates the mark.

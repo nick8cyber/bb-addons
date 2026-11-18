@@ -1555,14 +1555,14 @@ await sleep(100);
   // state). The model lives only on m4 — the JUNIOR tier (priority 5, vs
   // the senior m1–m3 at 10): without the probe wait the pick falls back
   // to the highest-priority guess and lands on m1.
-  const coldStartRun = async (threadId, dataDirName, seedModels) => {
+  const coldStartRun = async (threadId, dataDirName, seedModels, seedLedger) => {
     const dir = join(root, dataDirName);
     for (const label of ["m1", "m2", "m3", "m4"]) {
       const cli = join(dir, "accounts", label, ".gemini", "antigravity-cli");
       mkdirSync(cli, { recursive: true });
       writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
     }
-    writeFileSync(join(dir, "accounts-state.json"), JSON.stringify({ accounts: {
+    writeFileSync(join(dir, "accounts-state.json"), JSON.stringify(seedLedger ?? { accounts: {
       m1: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
       m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
       m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
@@ -1584,15 +1584,16 @@ await sleep(100);
     activeBridge = prev;
     return { reply, news, probes };
   };
-  const coldStartCheck = (tag, run) => check(tag,
+  const coldStartCheck = (tag, run, probeLabels) => check(tag,
     !run.reply?.error &&
     acpNews("m4") === run.news.m4 + 1 &&
     acpNews("m1") === run.news.m1 && acpNews("m2") === run.news.m2 &&
     acpNews("m3") === run.news.m3 &&
-    ["m1", "m2", "m3", "m4"].every((l) => acpProbes(l) > run.probes[l]),
+    probeLabels.every((l) => acpProbes(l) > run.probes[l]),
     run.reply?.error?.message ??
       `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(run.news)} ` +
-      `probes m1=${acpProbes("m1")}/${run.probes.m1} m4=${acpProbes("m4")}/${run.probes.m4}`);
+      `probes m1=${acpProbes("m1")}/${run.probes.m1} m3=${acpProbes("m3")}/${run.probes.m3} ` +
+      `m4=${acpProbes("m4")}/${run.probes.m4}`);
   acpControl.modeByLabel = {};
   acpControl.modelsByLabel = {
     m1: [["fake-model", "Fake Model"]],
@@ -1603,12 +1604,31 @@ await sleep(100);
   writeAcpControl();
   // I: no accounts-models.json at all — every account recordless.
   coldStartCheck("models/cold-start-waits-catalogs",
-    await coldStartRun("t-cold-start", "acp-cold1", null));
+    await coldStartRun("t-cold-start", "acp-cold1", null),
+    ["m1", "m2", "m3", "m4"]);
   // J: every record is raw:[]/families:[] — "unknown", probed alike.
   coldStartCheck("models/empty-record-is-probed",
     await coldStartRun("t-cold-empty", "acp-cold2",
       Object.fromEntries(["m1", "m2", "m3", "m4"].map((l) =>
-        [l, { raw: [], families: [], unsupported: {}, atMs: 0 }]))));
+        [l, { raw: [], families: [], unsupported: {}, atMs: 0 }]))),
+    ["m1", "m2", "m3", "m4"]);
+  // N: §2.3 п.9 (ревизия 13.1) — only TWO unknown accounts: their probes
+  // launch immediately (≤2 slots) and are already stamped by the time the
+  // wait decision runs — the pick must still wait for them instead of
+  // guessing m3 by LRU.
+  coldStartCheck("models/cold-start-few-unknowns",
+    await coldStartRun("t-cold-few", "acp-cold3",
+      {
+        m1: freshRecord(["fake-model"]),
+        m2: freshRecord(["fake-model"]),
+      },
+      { accounts: {
+        m1: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+        m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+        m3: { cooldownUntilMs: 0, lastUsedMs: 100, lastError: null, priority: 10 },
+        m4: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+      } }),
+    ["m3", "m4"]);
 
   // K. §2.3 п.10 session-build refusal: records claim pro on m1/m2/m4
   // (fresh) and m3 (STALE — exactly the guess the fresh-only filter must
@@ -1779,6 +1799,154 @@ await sleep(100);
     `vFailErr=${vFailErr} sawText=${vFailSawText} ` +
       `boundaries=${statuses("t-validation-fail")} ` +
       `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsM3)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // O. §2.3 п.11 (ревизия 13.1): the marker tokens inside ORDINARY agent
+  // prose never park — only the exact whole-message "⚠ Verification
+  // Required" does. The fake echoes the prompt tail, so the tokens sit
+  // mid-message.
+  writeAcpModels({
+    m1: freshRecord(["fake-model"]),
+    m2: freshRecord(["fake-model"]),
+    m3: freshRecord(["fake-model"]),
+    m4: freshRecord(["fake-model"]),
+  });
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  await startModel("t-validation-prose", "fake-model");
+  await turnModel("t-validation-prose", "please explain VALIDATION_REQUIRED today", "fake-model");
+  await turnModel("t-validation-prose", "what does verify your account to continue mean", "fake-model", 2);
+  await turnModel("t-validation-prose", "the log showed ⚠ Verification Required and then nothing", "fake-model", 3);
+  // The token now lives in recentAssistantText — the NEXT turn must not
+  // trip on the previous turn's tail (ревизия 13.1).
+  await turnModel("t-validation-prose", "and one ordinary follow-up", "fake-model", 4);
+  await sleep(300);
+  const proseEntry = readAcpLedger().accounts.m1 ?? {};
+  const proseSaw = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-validation-prose" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.text === "string" && d.text.includes("VALIDATION_REQUIRED")));
+  check("models/validation-prose-not-parked",
+    proseEntry.parkedReason === undefined &&
+    (proseEntry.cooldownUntilMs ?? 0) <= Date.now() &&
+    statuses("t-validation-prose") === "completed,completed,completed,completed" &&
+    proseSaw,
+    `entry=${JSON.stringify(proseEntry)} saw=${proseSaw} ` +
+      `statuses=${statuses("t-validation-prose")}`);
+
+  // Q. §2.3 п.11 (ревизия 13.1): VALIDATION_REQUIRED on the INTERNAL
+  // thread/start of a rotation sibling parks it permanently — not the
+  // generic 60-second "session start failed" cooldown.
+  acpControl.modeByLabel = { m1: "quota-once", m2: "validation-error" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  const newsQ = newsSnapshot();
+  await startModel("t-sibling-validation", "fake-model");
+  await turnModel("t-sibling-validation", "trip quota then refuse the sibling", "fake-model");
+  await sleep(400);
+  const qEntry = readAcpLedger().accounts.m2 ?? {};
+  check("models/sibling-validation-parks-too",
+    qEntry.parkedReason === "validation-required" &&
+    (qEntry.cooldownUntilMs ?? 0) > Date.now() + 365 * 24 * 3_600_000 &&
+    statuses("t-sibling-validation") === "completed" &&
+    acpNews("m3") === newsQ.m3 + 1,
+    `entry=${JSON.stringify(qEntry)} statuses=${statuses("t-sibling-validation")} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsQ)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // R. §2.3 п.11: the eligibility-shaped "Verify your account to continue"
+  // text classifies as validation-required — permanent parking, not the
+  // 24 h ineligible cooldown (куратор принял замечание 4). The "-once"
+  // mode fails only the prompt, so the session starts normally first.
+  acpControl.modeByLabel = { m1: "validation-error-once" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  await startModel("t-eligible-text", "fake-model");
+  await turnModel("t-eligible-text", "verify me via eligibility text", "fake-model");
+  await sleep(400);
+  const rEntry = readAcpLedger().accounts.m1 ?? {};
+  check("models/eligibility-text-is-validation",
+    rEntry.parkedReason === "validation-required" &&
+    (rEntry.cooldownUntilMs ?? 0) > Date.now() + 365 * 24 * 3_600_000 &&
+    statuses("t-eligible-text") === "completed",
+    `entry=${JSON.stringify(rEntry)} statuses=${statuses("t-eligible-text")}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // S. §2.3 п.11: client thread/start hits VALIDATION_REQUIRED on m1's
+  // session/new AND on the retry sibling's internal start — both park.
+  acpControl.modeByLabel = { m1: "validation-error", m2: "validation-error" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  const newsS = newsSnapshot();
+  const sReply = await startModel("t-start-validation", "fake-model");
+  await sleep(300);
+  const sLedger = readAcpLedger().accounts;
+  check("models/start-validation-parks-chain",
+    !sReply?.error &&
+    sLedger.m1?.parkedReason === "validation-required" &&
+    sLedger.m2?.parkedReason === "validation-required" &&
+    acpNews("m3") === newsS.m3 + 1,
+    `reply=${JSON.stringify(sReply?.error ?? null)} ` +
+      `parked m1=${sLedger.m1?.parkedReason} m2=${sLedger.m2?.parkedReason} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsS)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // T. §2.3 п.11: the resume-on-sibling internal start refuses with
+  // VALIDATION_REQUIRED too — park that sibling, land on the next one.
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+  favor("m4");
+  const resValStart = await startModel("t-res-validation", "fake-model");
+  const resValConv = resValStart.result?.providerThreadId;
+  stop("t-res-validation");
+  await sleep(100);
+  acpControl.modeByLabel = { m2: "validation-error" };
+  writeAcpControl();
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 500, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1000, lastError: null, priority: 10 },
+    m4: { ...parkedEntry, parkedReason: "tos-disabled" },
+  } }, null, 1));
+  const newsT = newsSnapshot();
+  const resValId = nextId++;
+  send({ jsonrpc: "2.0", id: resValId, method: "thread/resume",
+    params: { threadId: "t-res-validation", providerThreadId: resValConv, cwd: workspace,
+      options: { model: "fake-model", ...pol }, instructionMode: "append" } });
+  await waitFor(() => messages.some((m) => m.id === resValId), 15_000, "t-res-validation: resume");
+  const resValReply = messages.find((m) => m.id === resValId);
+  await sleep(300);
+  const tEntry = readAcpLedger().accounts.m2 ?? {};
+  check("models/resume-sibling-validation-parks",
+    !resValReply?.error &&
+    tEntry.parkedReason === "validation-required" &&
+    acpNews("m3") === newsT.m3 + 1 &&
+    replacedFor("t-res-validation").length >= 1,
+    `reply=${JSON.stringify(resValReply?.error ?? null)} entry=${JSON.stringify(tEntry)} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsT)}`);
   acpControl.modeByLabel = {};
   writeAcpControl();
 

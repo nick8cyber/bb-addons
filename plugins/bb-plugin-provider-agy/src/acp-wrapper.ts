@@ -57,6 +57,7 @@ import {
   checkIneligibleBreaker,
   ineligibleCooldownMs,
   isAccountIneligible,
+  isAgentValidationMessage,
   isAuthDead,
   isModelRefusal,
   isTosDisabled,
@@ -511,6 +512,10 @@ interface WSession {
   /** §2.3 п.11: a VALIDATION_REQUIRED answer surfaced as agent text — the
    * turn must not deliver it, its boundary becomes a parking+rotation. */
   validationRefusal: boolean;
+  /** §2.3 п.11 (ревизия 13.1): text of the CURRENT agent message — the
+   * strict marker match runs only against this, never against the
+   * cross-turn recentAssistantText tail. */
+  agentMessageText: string;
   /** §2.3 п.10: families this session already moved once for — a second
    * refusal for the same family fails honestly instead of chaining. */
   modelRefusalMoved: Set<string>;
@@ -560,6 +565,7 @@ function newSession(threadId: string, cwd: string): WSession {
     autoRetryCount: 0,
     stopped: false,
     validationRefusal: false,
+    agentMessageText: "",
     modelRefusalMoved: new Set<string>(),
   };
 }
@@ -1993,11 +1999,15 @@ function coldStartNeedsProbes(family: string): boolean {
       continue;
     }
     // A record with no families is "unknown" (e.g. refusal marks on a
-    // virgin account): it must be probed like a missing one.
+    // virgin account): it must be probed like a missing one — and the
+    // pick waits on its probe whether it is queued, already running, or
+    // just throttled out (§2.3 п.9, ревизия 13.1). waitModelProbes
+    // resolves instantly when nothing is actually in flight, so a
+    // throttled unknown costs no real wait.
     if (record === undefined || record.families.length === 0) {
+      waitWorthy = true;
       if (now - (modelProbeLastAtMs.get(account.label) ?? 0) >= MODEL_PROBE_MIN_INTERVAL_MS) {
         queueModelProbe(account);
-        waitWorthy = true;
       }
     }
   }
@@ -2655,6 +2665,19 @@ function startRotation(
       startRotation(session, cause, message);
       return;
     }
+    // §2.3 п.11 (ревизия 13.1): a sibling answering the internal start
+    // with VALIDATION_REQUIRED/ToS parks permanently — never the 60 s
+    // blind cooldown — and the rotation moves to the next free one.
+    const parkedCause = isValidationRequired(errorText)
+      ? ("validation-required" as const)
+      : isTosDisabled(errorText)
+        ? ("tos-disabled" as const)
+        : null;
+    if (dataDir !== "" && parkedCause !== null) {
+      coolSessionAccount(session, parkedCause, errorText.slice(0, 300));
+      startRotation(session, cause, message);
+      return;
+    }
     // Park this sibling briefly and try the next; give up into failOut.
     if (dataDir !== "") {
       const ledger = loadLedger(dataDir);
@@ -3167,6 +3190,7 @@ function processDeltaLine(
     switch (delta.kind) {
       case "turn.open": {
         session.bridgeTurnBusy = true;
+        session.agentMessageText = "";
         if (session.suppressOpenNext) {
           session.suppressOpenNext = false;
           continue;
@@ -3201,15 +3225,15 @@ function processDeltaLine(
           delta.channel === "agentMessage" &&
           typeof delta.text === "string"
         ) {
-          // §2.3 п.11: agy reports VALIDATION_REQUIRED inside the agent
-          // message itself — swallow the text and flag the turn so its
-          // boundary can park + rotate instead of showing it to the user.
+          // §2.3 п.11 (ревизия 13.1): agy reports VALIDATION_REQUIRED as
+          // the whole agent message "⚠ Verification Required" — only that
+          // exact shape of the CURRENT message is a refusal; prose that
+          // merely mentions the words must reach the user.
           if (session.validationRefusal) {
             continue;
           }
-          if (
-            isValidationRequired(session.recentAssistantText + delta.text)
-          ) {
+          session.agentMessageText += delta.text;
+          if (isAgentValidationMessage(session.agentMessageText)) {
             session.validationRefusal = true;
             session.recentAssistantText = "";
             continue;
@@ -3228,6 +3252,9 @@ function processDeltaLine(
         const item = optionsRecord(delta.item);
         if (item.type === "compaction") {
           session.compactInFlight = true;
+        }
+        if (item.type === "agentMessage") {
+          session.agentMessageText = "";
         }
         out.push(delta);
         continue;
@@ -3512,6 +3539,36 @@ function resumeOnSibling(
         );
         return;
       }
+      // §2.3 п.11 (ревизия 13.1): the sibling itself refuses with
+      // VALIDATION_REQUIRED/ToS — park it permanently and try the next
+      // free account instead of a bare error.
+      const parkedCause = isValidationRequired(errorText)
+        ? ("validation-required" as const)
+        : isTosDisabled(errorText)
+          ? ("tos-disabled" as const)
+          : null;
+      if (dataDir !== "" && parkedCause !== null) {
+        coolSessionAccount(session, parkedCause, errorText.slice(0, 300));
+        const { account: next } = freeSibling(session, account.label);
+        if (next === null) {
+          sendError(
+            id,
+            -32000,
+            parkedCause === "validation-required"
+              ? `account ${account.label} needs Google account verification`
+              : `account ${account.label} was disabled by Google (Terms of Service)`,
+          );
+          return;
+        }
+        resumeOnSibling(
+          session,
+          id,
+          providerThreadId,
+          next,
+          `account ${account.label} is parked (${parkedCause}); resumed on free sibling ${next.label} instead, so the conversation context does not carry over`,
+        );
+        return;
+      }
       sendError(
         id,
         -32000,
@@ -3650,15 +3707,15 @@ function retryDaemonSession(
 function retryDaemonSessionParked(
   id: JsonRpcId,
   pending: PendingDaemonSession,
+  cause: "validation-required" | "tos-disabled" = "validation-required",
 ): void {
   const { session } = pending;
   const owner = session.accountLabel;
-  coolSessionAccount(
-    session,
-    "validation-required",
-    `account ${owner ?? "?"} needs Google account verification`,
-  );
-  const honest = `account ${owner ?? "?"} needs Google account verification`;
+  const honest =
+    cause === "validation-required"
+      ? `account ${owner ?? "?"} needs Google account verification`
+      : `account ${owner ?? "?"} was disabled by Google (Terms of Service)`;
+  coolSessionAccount(session, cause, honest);
   const { account } = freeSibling(session, owner);
   if (account === null) {
     sendError(id, -32000, honest);
@@ -3674,7 +3731,7 @@ function retryDaemonSessionParked(
       id,
       providerThreadId,
       account,
-      `resumed conversation ${providerThreadId} belongs to an account that needs Google account verification; resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
+      `resumed conversation ${providerThreadId} belongs to an account that ${cause === "validation-required" ? "needs Google account verification" : "was disabled by Google (Terms of Service)"}; resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
     );
     return;
   }
@@ -3685,7 +3742,7 @@ function retryDaemonSessionParked(
   saveLedger(dataDir, ledger);
   buildLaunch(session);
   log(
-    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (validation-required)`,
+    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (${cause})`,
   );
   const params = {
     ...pending.params,
@@ -3697,7 +3754,20 @@ function retryDaemonSessionParked(
       sendResult(id, result);
       return;
     }
-    sendError(id, -32000, errorMessageOf(error));
+    // §2.3 п.11 (ревизия 13.1): the sibling refuses the internal start
+    // the same way — park it too and drive the request on the next free
+    // account; only a non-parking error reaches the caller verbatim.
+    const errorText = errorMessageOf(error);
+    const parkedCause = isValidationRequired(errorText)
+      ? ("validation-required" as const)
+      : isTosDisabled(errorText)
+        ? ("tos-disabled" as const)
+        : null;
+    if (dataDir !== "" && parkedCause !== null) {
+      retryDaemonSessionParked(id, pending, parkedCause);
+      return;
+    }
+    sendError(id, -32000, errorText);
   });
 }
 
