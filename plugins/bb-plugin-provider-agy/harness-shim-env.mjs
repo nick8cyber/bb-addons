@@ -160,6 +160,69 @@ send({ jsonrpc: "2.0", id: 30, method: "turn/start", params: { threadId: "t-ghos
 await waitFor(() => replies(30).length === 1, 20000, "ghost answered");
 check("restore/ghost-refused", replies(30)[0].error !== undefined, JSON.stringify(replies(30)[0]).slice(0, 160));
 
+// --- PLUG-306 (ревизия 14): restore internals never hang -------------------
+// A synchronous throw inside the internal thread/resume (a non-executable
+// AGY_PATH is the deterministic trigger — resolveAgyCommand throws before
+// any spawn) must reach the daemon's request as a real -32000, not leak as
+// an unhandled rejection or a dangling waiter.
+let unhandledRejections = 0;
+process.on("unhandledRejection", () => { unhandledRejections += 1; });
+const deadBin = join(root, "agy-dead");
+writeFileSync(deadBin, "not executable\n"); // 0644 — pinned but not X_OK
+const savedAgyPath = process.env.AGY_PATH;
+process.env.AGY_PATH = deadBin;
+send({ jsonrpc: "2.0", id: 40, method: "turn/start", params: { threadId: "t-throw", providerThreadId: "fake-dead-conv", cwd: workspace, input: [{ type: "text", text: "boom", mentions: [] }], clientRequestId: creq(), options: daemonOptions } });
+await waitFor(() => replies(40).length === 1, 20000, "t-throw answered");
+process.env.AGY_PATH = savedAgyPath;
+check("restore/sync-throw-is-32000",
+  replies(40)[0]?.error?.code === -32000 && /is not executable/u.test(replies(40)[0].error.message ?? ""),
+  JSON.stringify(replies(40)[0]).slice(0, 200));
+await sleep(300);
+check("restore/no-unhandled-rejection", unhandledRejections === 0, `count=${unhandledRejections}`);
+
+// --- PLUG-306 (ревизия 14): threads-state.json is bounded ------------------
+// 2002 records on disk (one atMs-less — the legacy shape) plus a fresh
+// thread/start leave exactly 2000, evicting the atMs-less record and the
+// oldest timestamps first.
+{
+  const recs = {};
+  for (let i = 0; i <= 2000; i += 1) {
+    recs[`r${i}`] = { cwd: workspace, providerThreadId: `fake-r${i}`, atMs: i + 1 };
+  }
+  recs["r-noatms"] = { cwd: workspace, providerThreadId: "fake-noatms" };
+  writeFileSync(threadsState, JSON.stringify({ threads: recs }));
+}
+start(50, "t-bound");
+await waitFor(() => replies(50).length === 1, 20000, "t-bound start");
+{
+  const kept = JSON.parse(readFileSync(threadsState, "utf8")).threads ?? {};
+  check("threads-state/bounded-2000",
+    Object.keys(kept).length === 2000 &&
+    kept["r-noatms"] === undefined && kept.r0 === undefined && kept.r1 === undefined &&
+    kept.r2 !== undefined && kept["t-bound"] !== undefined &&
+    typeof kept["t-bound"].atMs === "number",
+    `kept=${Object.keys(kept).length} r0=${kept.r0 !== undefined} r2=${kept.r2 !== undefined} t-bound.atMs=${typeof kept["t-bound"]?.atMs}`);
+}
+
+// --- PLUG-306 (ревизия 14): defensive shim-env synth -----------------------
+// A raw request carrying OUR shim spec with env:{} and no session to top it
+// up gets the fill synthesized defensively. A malformed thread/resume is
+// the only message that reaches feedLine untouched; the wrapper log names
+// the completion and the shim never runs env-less.
+const synthOptions = { ...daemonOptions, providerOptions: {
+  ...daemonOptions.providerOptions,
+  acpLaunchSpec: { command: process.execPath,
+    args: [join(root, "acp-shim.mjs"), "acp"], env: {} },
+} };
+send({ jsonrpc: "2.0", id: 60, method: "thread/resume", params: {
+  threadId: "t-synth", options: synthOptions, instructionMode: "append" } });
+await waitFor(() => replies(60).length === 1 || shimCrashes().length > 0, 20000, "t-synth answered");
+await sleep(200);
+const synthLog = readFileSync(join(root, "acp-wrapper.log"), "utf8");
+check("synth/launch-env-filled-defensively",
+  synthLog.includes("thread t-synth: thread/resume carried a shim launch spec without AGY_SHIM_* — completed defensively") && shimCrashes().length === 0,
+  `crashes=${shimCrashes().length}`);
+
 check("no-shim-crash-anywhere", shimCrashes().length === 0, `crashes=${shimCrashes().length}`);
 
 const failed = checks.filter(([, ok]) => !ok);

@@ -46,11 +46,28 @@ const homeLabel = geminiDir
 const modesByLabel = JSON.parse(process.env.AGY_FAKE_MODE_BY_LABEL ?? "{}");
 const modeEnv = modesByLabel[homeLabel] ?? process.env.AGY_FAKE_ERROR_MODE ?? "ok";
 // Dynamic modes ride a control file (children keep their spawn env):
-// {"modeByLabel": {"a2": "quota-always"}, "compactMode": "fail", "summaryMode": "empty"}
+// {"modeByLabel": {"a2": "quota-always"}, "compactMode": "fail", "summaryMode": "empty",
+//  "startFailByLabel": {"m1": "validation"|"tos"|"generic"}, "loadFailByLabel": {"m1": ...}}
 const controlFile = process.env.AGY_FAKE_CONTROL ?? null;
 function control() {
   if (controlFile === null) return {};
   try { return JSON.parse(readFileSync(controlFile, "utf8")); } catch { return {}; }
+}
+// Sequential per-label failures — {"startFailByLabel": {"a1": ["generic","tos"]}}
+// consumes one entry per answered request. Consumption is written back to the
+// control file because every launch is a fresh fake process.
+function takeFail(kind, label) {
+  if (controlFile === null) return null;
+  const c = control();
+  const spec = c[kind]?.[label];
+  if (spec === undefined) return null;
+  if (!Array.isArray(spec)) return spec;
+  if (spec.length === 0) return null;
+  const value = spec[0];
+  try {
+    writeFileSync(controlFile, JSON.stringify({ ...c, [kind]: { ...c[kind], [label]: spec.slice(1) } }));
+  } catch {}
+  return value;
 }
 const transcript = process.env.AGY_FAKE_TRANSCRIPT ?? null;
 const recordEnv = (process.env.AGY_FAKE_RECORD_ENV ?? "").split(",").filter(Boolean);
@@ -292,7 +309,20 @@ rlFake.on("line", (line) => {
         agentCapabilities: { loadSession: true, promptCapabilities: { image: false }, sessionCapabilities: {} },
         authMethods: [] } });
       return;
-    case "session/new":
+    case "session/new": {
+      const startFail = takeFail("startFailByLabel", homeLabel);
+      if (startFail === "validation") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: 403, message: "PERMISSION_DENIED: VALIDATION_REQUIRED — Verify your account to continue" } });
+        return;
+      }
+      if (startFail === "tos") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: 403, message: "This service has been disabled in this account for violation of Terms of Service." } });
+        return;
+      }
+      if (startFail) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: `injected session/new failure (${startFail})` } });
+        return;
+      }
       if ((control().modeByLabel?.[homeLabel] ?? control().errorMode ?? modeEnv) === "validation-error") {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: 403, message: "PERMISSION_DENIED: VALIDATION_REQUIRED — Verify your account to continue" } });
         return;
@@ -300,7 +330,21 @@ rlFake.on("line", (line) => {
       sessionId = `fake-acp-${++sessionCounter}-${homeLabel}`;
       out({ jsonrpc: "2.0", id: msg.id, result: { sessionId, configOptions: configOptionsFor(), modes } });
       return;
+    }
     case "session/load": {
+      const loadFail = takeFail("loadFailByLabel", homeLabel);
+      if (loadFail === "validation") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: 403, message: "PERMISSION_DENIED: VALIDATION_REQUIRED — Verify your account to continue" } });
+        return;
+      }
+      if (loadFail === "tos") {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: 403, message: "This service has been disabled in this account for violation of Terms of Service." } });
+        return;
+      }
+      if (loadFail) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: `injected session/load failure (${loadFail})` } });
+        return;
+      }
       if (typeof p.sessionId !== "string" || !p.sessionId.startsWith("fake-")) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: `no such session ${p.sessionId}` } });
         return;

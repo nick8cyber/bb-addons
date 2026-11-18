@@ -696,10 +696,14 @@ function newSession(threadId: string, cwd: string): WSession {
 // ---------------------------------------------------------------------------
 
 const THREADS_STATE_FILE = "threads-state.json";
+/** §12.6 (ревизия 14): the file is bounded — evict beyond this count. */
+const THREADS_STATE_MAX_RECORDS = 2_000;
 
 interface ThreadRecord {
   cwd: string;
   providerThreadId: string | null;
+  /** Last write time; a record without it counts as the oldest on evict. */
+  atMs?: number;
 }
 
 function loadThreadRecords(): Record<string, ThreadRecord> {
@@ -712,7 +716,7 @@ function loadThreadRecords(): Record<string, ThreadRecord> {
     ) as {
       threads?: Record<
         string,
-        { cwd?: unknown; providerThreadId?: unknown }
+        { cwd?: unknown; providerThreadId?: unknown; atMs?: unknown }
       >;
     };
     const out: Record<string, ThreadRecord> = {};
@@ -724,6 +728,7 @@ function loadThreadRecords(): Record<string, ThreadRecord> {
             typeof rec.providerThreadId === "string"
               ? rec.providerThreadId
               : null,
+          ...(typeof rec.atMs === "number" ? { atMs: rec.atMs } : {}),
         };
       }
     }
@@ -736,6 +741,20 @@ function loadThreadRecords(): Record<string, ThreadRecord> {
 function writeThreadRecords(records: Record<string, ThreadRecord>): void {
   if (dataDir === "") {
     return;
+  }
+  // §12.6 (ревизия 14): bound the file — over the cap, the oldest records
+  // by atMs are evicted first; a record without atMs counts as the oldest.
+  const keys = Object.keys(records);
+  if (keys.length > THREADS_STATE_MAX_RECORDS) {
+    const byAge = keys
+      .map((key) => ({ key, atMs: records[key]?.atMs ?? 0 }))
+      .sort((a, b) => a.atMs - b.atMs);
+    for (const { key } of byAge.slice(
+      0,
+      keys.length - THREADS_STATE_MAX_RECORDS,
+    )) {
+      delete records[key];
+    }
   }
   const target = join(dataDir, THREADS_STATE_FILE);
   const tmp = `${target}.${process.pid}.tmp`;
@@ -762,6 +781,7 @@ function rememberThreadRecord(
     cwd,
     providerThreadId:
       providerThreadId ?? records[threadId]?.providerThreadId ?? null,
+    atMs: Date.now(),
   };
   writeThreadRecords(records);
 }
@@ -1744,6 +1764,8 @@ function maintenanceEnvAndArgs(): {
   env: Record<string, string>;
   args: string[];
   home: string | null;
+  /** Pool label the pick landed on, or null on relay/direct. */
+  label: string | null;
 } {
   const env: Record<string, string> = {};
   const args: string[] = [];
@@ -1758,7 +1780,7 @@ function maintenanceEnvAndArgs(): {
         env.HTTP_PROXY = account.proxy;
         env.http_proxy = account.proxy;
       }
-      return { env, args, home: account.home };
+      return { env, args, home: account.home, label: account.label };
     }
   }
   if (dataDir !== "") {
@@ -1769,10 +1791,10 @@ function maintenanceEnvAndArgs(): {
       env.GOOGLE_GEMINI_BASE_URL = relay.baseUrl;
       // The relay home holds the Gemini-API settings flip — without it
       // `agy models` would run on the user's real Antigravity account.
-      return { env, args, home: relay.home };
+      return { env, args, home: relay.home, label: null };
     }
   }
-  return { env, args, home: null };
+  return { env, args, home: null, label: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -1918,7 +1940,7 @@ function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
  */
 function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]> {
   return new Promise((resolve) => {
-    const { env, args } = maintenanceEnvAndArgs();
+    const { env, args, label } = maintenanceEnvAndArgs();
     let child;
     try {
       child = spawn(process.execPath, [materializeShim(), "acp", ...args], {
@@ -1940,16 +1962,19 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
       return;
     }
     let tail = "";
-    const pending = new Map<number, (result: unknown) => void>();
+    const pending = new Map<
+      number,
+      (result: unknown, error: unknown) => void
+    >();
     let nextId = 1;
     const timer = setTimeout(() => {
       killProcessTreeGracefully(child);
       resolve([]);
     }, 15_000);
     const send = (method: string, params: Record<string, unknown>) =>
-      new Promise<unknown>((res, rej) => {
+      new Promise<{ result: unknown; error: unknown }>((res, rej) => {
         const id = nextId++;
-        pending.set(id, res);
+        pending.set(id, (result, error) => res({ result, error }));
         child.stdin.write(
           `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
         );
@@ -1966,9 +1991,13 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
         const line = tail.slice(0, nl);
         tail = tail.slice(nl + 1);
         try {
-          const msg = JSON.parse(line) as { id?: number; result?: unknown };
+          const msg = JSON.parse(line) as {
+            id?: number;
+            result?: unknown;
+            error?: unknown;
+          };
           if (typeof msg.id === "number" && pending.has(msg.id)) {
-            pending.get(msg.id)?.(msg.result);
+            pending.get(msg.id)?.(msg.result, msg.error);
             pending.delete(msg.id);
           }
         } catch {
@@ -1983,10 +2012,30 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
           clientCapabilities: {},
           clientInfo: { name: "bb", version: "1" },
         });
-        const session = (await send("session/new", {
+        const newResp = await send("session/new", {
           cwd: process.cwd(),
           mcpServers: [],
-        })) as {
+        });
+        // §2.3 п.11 (ревизия 14): the probe reads session/new's error — a
+        // VALIDATION_REQUIRED/ToS refusal parks the maintenance pick; the
+        // probe reports nothing (the §8 cache fallback covers the list).
+        if (newResp.error !== undefined && newResp.error !== null) {
+          const errorText = errorMessageOf(newResp.error);
+          const parkedCause = parkedCauseOf(errorText);
+          if (dataDir !== "" && label !== null && parkedCause !== null) {
+            parkAccountPermanently(
+              label,
+              parkedCause,
+              errorText.slice(0, 300),
+            );
+            log(
+              `models probe: account ${label} parked (${parkedCause}) on session/new refusal`,
+            );
+          }
+          resolve([]);
+          return;
+        }
+        const session = newResp.result as {
           configOptions?: {
             id?: string;
             options?: { value?: string; name?: string }[];
@@ -2594,6 +2643,26 @@ function freeSibling(
 }
 
 /**
+ * Permanent parking for a bare pool label (§2.3 пп. 7, 11): far-future
+ * cooldown + parkedReason, manual operator unpark only. Session-bound
+ * callers go through coolSessionAccount for the thread-tagged log line;
+ * session-less paths (the models probe) call this directly.
+ */
+function parkAccountPermanently(
+  label: string,
+  cause: "tos-disabled" | "validation-required",
+  message: string,
+): void {
+  if (dataDir === "") {
+    return;
+  }
+  const ledger = loadLedger(dataDir);
+  markAccountCooldown(ledger, label, TOS_DISABLED_COOLDOWN_UNTIL_MS, message);
+  markAccountIneligible(ledger, label, { parkedReason: cause });
+  saveLedger(dataDir, ledger);
+}
+
+/**
  * Book the failure on the session's account: quota cools it (reset text or
  * the default 30m), an eligibility refusal parks it for the long cooldown —
  * unless the breaker sees a wave of parkings and suspects the egress. A
@@ -2621,16 +2690,7 @@ function coolSessionAccount(
   if (cause === "tos-disabled" || cause === "validation-required") {
     // Permanent parking: no retry timer, no breaker — only a manual
     // operator unpark brings this account back (§2.3 пп. 7, 11).
-    markAccountCooldown(
-      ledger,
-      session.accountLabel,
-      TOS_DISABLED_COOLDOWN_UNTIL_MS,
-      message,
-    );
-    markAccountIneligible(ledger, session.accountLabel, {
-      parkedReason: cause,
-    });
-    saveLedger(dataDir, ledger);
+    parkAccountPermanently(session.accountLabel, cause, message);
     log(
       cause === "validation-required"
         ? `thread ${session.threadId}: account ${session.accountLabel} parked (validation-required; manual unpark required); owner verifies the account in a browser: https://support.google.com/accounts/answer/185833`
@@ -3119,8 +3179,19 @@ function runCompactSeed(session: WSession): void {
       "agy could not compact this conversation; the thread continues on a fresh conversation that starts from the agent's own summary of the old one",
     contextLost: true,
   });
-  void synthThreadStart(session).then(({ ok }) => {
+  void synthThreadStart(session).then(({ ok, error }) => {
     if (!ok) {
+      const errorText = errorMessageOf(error);
+      // §2.3 п.11 (ревизия 14): the internal start reads its error — a
+      // VALIDATION_REQUIRED/ToS refusal parks the account and moves the
+      // compaction to a sibling; staying on the dead session is not an
+      // option.
+      const parkedCause =
+        dataDir !== "" ? parkedCauseOf(errorText) : null;
+      if (parkedCause !== null) {
+        compactParked(session, parkedCause, errorText);
+        return;
+      }
       compactRestore(session);
       return;
     }
@@ -3175,13 +3246,70 @@ function compactRestore(session: WSession): void {
     providerThreadId: compact.oldProviderThreadId,
     options: rewriteOptions(session, { ...session.baseOptions }),
   };
-  void internalRequest("thread/resume", params).then(() => {
+  void internalRequest("thread/resume", params).then(({ ok, error }) => {
+    if (!ok) {
+      const errorText = errorMessageOf(error);
+      // §2.3 п.11 (ревизия 14): the restore reads its error too — the
+      // account answering VALIDATION_REQUIRED/ToS parks, and the thread
+      // continues on a sibling or fails honestly, never silently parked
+      // on a dead session.
+      const parkedCause =
+        dataDir !== "" ? parkedCauseOf(errorText) : null;
+      if (parkedCause !== null) {
+        compactParked(session, parkedCause, errorText);
+        return;
+      }
+      log(
+        `thread ${session.threadId}: compaction restore failed: ${errorText.slice(0, 300)}`,
+      );
+    }
     session.compact = null;
     drainQueue(session);
   });
   log(
     `thread ${session.threadId}: compaction fallback restores conversation ${compact.oldProviderThreadId}`,
   );
+}
+
+/**
+ * §2.3 п.11 (ревизия 14): a compaction internal start/resume answered
+ * with a parked cause (VALIDATION_REQUIRED/ToS). The account parks for
+ * good; the thread continues on a free sibling — the seed stage re-runs
+ * there, which is the best context the fallback can still offer — or
+ * fails honestly when no sibling is free. The dead session is never kept.
+ */
+function compactParked(
+  session: WSession,
+  cause: "validation-required" | "tos-disabled",
+  errorText: string,
+): void {
+  coolSessionAccount(session, cause, errorText.slice(0, 300));
+  const { account } = freeSibling(session, session.accountLabel);
+  if (account === null) {
+    const owner = session.accountLabel;
+    session.compact = null;
+    failOut(
+      session,
+      cause === "validation-required"
+        ? `account ${owner ?? "?"} needs Google account verification and no free pool account can take over the compaction fallback`
+        : `account ${owner ?? "?"} was disabled by Google (Terms of Service) and no free pool account can take over the compaction fallback`,
+    );
+    return;
+  }
+  const movedFrom = session.accountLabel;
+  session.accountLabel = account.label;
+  const ledger = loadLedger(dataDir);
+  markAccountUse(ledger, account.label);
+  saveLedger(dataDir, ledger);
+  buildLaunch(session);
+  log(
+    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (${cause})`,
+  );
+  if (session.compact === null) {
+    drainQueue(session);
+    return;
+  }
+  runCompactSeed(session);
 }
 
 // ---------------------------------------------------------------------------
@@ -3922,6 +4050,11 @@ function retryDaemonSession(
     if (session.accountLabel !== null) {
       maybeProbeCatalog(session.accountLabel);
     }
+    // §2.3 п.12 (ревизия 14): the no-carrier refusal is journaled —
+    // thread, model, reason.
+    log(
+      `thread ${session.threadId}: thread/start refused (model ${family ?? "default"}): model ${family ?? "?"} is not offered by any pool account`,
+    );
     sendError(
       id,
       -32000,
@@ -4034,6 +4167,10 @@ function retryDaemonSessionParked(
   coolSessionAccount(session, cause, honest);
   const { account } = freeSibling(session, owner);
   if (account === null) {
+    // §2.3 п.12 (ревизия 14): journal the refusal — thread, model, reason.
+    log(
+      `thread ${session.threadId}: ${pending.kind === "resume" ? "thread/resume" : "thread/start"} refused (model ${session.model ?? "default"}): ${honest}`,
+    );
     sendError(id, -32000, honest);
     return;
   }
@@ -4161,13 +4298,16 @@ function finishThreadStart(
 ): void {
   const poolPick = poolPickAccount(session);
   if (poolPick === "unoffered" || poolPick === "parked") {
-    sendError(
-      id,
-      -32000,
+    const reason =
       poolPick === "unoffered"
         ? `model ${session.model ?? "?"} is not offered by any pool account`
-        : "every pool account is parked; clear a parkedReason in accounts-state.json and retry",
+        : "every pool account is parked; clear a parkedReason in accounts-state.json and retry";
+    // §2.3 п.12 (ревизия 14): a thread/start refused before any account
+    // pick is journaled too — thread, model, reason.
+    log(
+      `thread ${session.threadId}: thread/start refused (model ${session.model ?? "default"}): ${reason}`,
     );
+    sendError(id, -32000, reason);
     discardSession(session);
     return;
   }
@@ -4365,13 +4505,21 @@ function restoreUnknownSession(
     internalAnswers.set(rid, (ok, _result, error) => {
       resolve({ ok, error });
     });
-    handleThreadResume(rid, {
-      threadId,
-      cwd,
-      providerThreadId,
-      options: optionsRecord(params.options),
-      instructionMode: params.instructionMode ?? "append",
-    });
+    try {
+      handleThreadResume(rid, {
+        threadId,
+        cwd,
+        providerThreadId,
+        options: optionsRecord(params.options),
+        instructionMode: params.instructionMode ?? "append",
+      });
+    } catch (error) {
+      // §12.6 (ревизия 14): a synchronous throw inside the internal resume
+      // must not leak the waiter slot or reject the executor — the daemon's
+      // request gets the honest -32000 from `done` below instead.
+      internalAnswers.delete(rid);
+      resolve({ ok: false, error });
+    }
   });
   const session = sessions.get(threadId);
   let queuedTurn: QueuedDaemonTurn | null = null;

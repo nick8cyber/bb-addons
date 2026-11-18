@@ -392,6 +392,12 @@ interface Session {
   compactFallbackOld: string | null;
   compactSeedAttempts: number;
   /**
+   * Set when the compaction restore moved to a free sibling because the old
+   * conversation's owner is parked: the restore then starts a FRESH
+   * conversation and announces contextLost honestly (ревизия 14, PLUG-306).
+   */
+  compactRestoreFresh: boolean;
+  /**
    * How many quota auto-retries this session has already run. Reset when a
    * turn plainly completes, so one burnt window does not spend the budget of
    * the next one.
@@ -951,14 +957,17 @@ function wakeCompactFallback(
     reason:
       stage === "seed"
         ? "agy could not compact this conversation; the thread continues on a fresh conversation that starts from the agent's own summary of the old one"
-        : stage === "restore"
-          ? "the compaction fallback could not open a fresh conversation; the thread goes back to its previous, uncompacted conversation"
-          : "agy could not compact this conversation; restarting it on the same conversation to ask the agent for its own summary",
-    contextLost: stage === "seed",
+        : stage === "restore" && session.compactRestoreFresh
+          ? "the compaction fallback could not open a fresh conversation and the old conversation's account is parked; the thread continues on a fresh conversation on a free sibling"
+          : stage === "restore"
+            ? "the compaction fallback could not open a fresh conversation; the thread goes back to its previous, uncompacted conversation"
+            : "agy could not compact this conversation; restarting it on the same conversation to ask the agent for its own summary",
+    contextLost: stage === "seed" || (stage === "restore" && session.compactRestoreFresh),
   });
   if (stage === "restore") {
     session.compactFallbackOld = null;
     session.compactSeedAttempts = 0;
+    session.compactRestoreFresh = false;
   }
   startChild({
     session,
@@ -1037,6 +1046,34 @@ function restoreCompactConversation(session: Session, failedTurn: Turn): boolean
   if (cliproxyRelayDataDir !== null && accountsEnabled(process.env)) {
     const owner = conversationAccount(loadLedger(cliproxyRelayDataDir), old);
     if (owner !== null) session.accountLabel = owner;
+    // Ревизия 14 (PLUG-306): a parked owner is never launched — the
+    // restore moves to a free sibling (fresh conversation; the old one
+    // stays on the banned HOME) or fails the queued turns honestly.
+    const rotation = rotateCooldownAccount(
+      session,
+      `compaction restore for thread ${session.threadId}`,
+    );
+    if (rotation !== null && rotation.to === null) {
+      const message = `account ${rotation.from} is parked (${rotation.cause}) and no free pool account can take over the compaction fallback`;
+      log(`turn ${failedTurn.turnId}: ${message}`);
+      while (session.turns.length > 0) {
+        session.pending.push(session.turns.shift() as Turn);
+      }
+      for (const queued of session.pending.splice(0)) {
+        settleTurnFailed(session, queued, message);
+      }
+      return true;
+    }
+    if (rotation !== null) {
+      // The sibling cannot load `old` — it lives on the parked owner's
+      // HOME. The restore continues as a fresh conversation there.
+      session.compactFallbackOld = null;
+      session.compactRestoreFresh = true;
+      log(
+        `turn ${failedTurn.turnId}: compaction restore moves to free sibling ${rotation.to} ` +
+          `(account ${rotation.from} is parked); the old conversation does not carry over`,
+      );
+    }
   }
   while (session.turns.length > 0) {
     session.pending.push(session.turns.shift() as Turn);
@@ -1096,16 +1133,29 @@ function buildQuotaHandoffPrompt(session: Session, failedTurn: Turn): string {
   );
 }
 
+/** What cooled or parked the account a rotation moves off. */
+type BridgeRotationCause =
+  | "quota"
+  | "ineligible"
+  | "auth-dead"
+  | "tos-disabled"
+  | "validation-required";
+
 /**
  * Point-2 guard: before (re)spawning onto the session's pinned account,
- * check its pool cooldown. A cooled account rotates to a free sibling NOW
- * instead of restarting on a dead HOME. Returns the rotation, or null when
- * the pinned account is usable (or the pool does not apply).
+ * check its pool cooldown AND its parkedReason. A cooled account rotates
+ * to a free sibling NOW instead of restarting on a dead HOME. A parked
+ * account (any parkedReason) is never launched either: the pick lands on
+ * a free sibling, or — with none free — the caller gets `to: null` and
+ * must fail honestly rather than "wait it out" (a parked HOME stays dead
+ * no matter how long anyone waits). Returns null when the pinned account
+ * is usable, when the pool does not apply, or when a merely cooled owner
+ * has no free sibling (the caller stays and the quota path waits it out).
  */
 function rotateCooldownAccount(
   session: Session,
   where: string,
-): { from: string; to: string; cause: "quota" | "ineligible" } | null {
+): { from: string; to: string | null; cause: BridgeRotationCause } | null {
   if (
     cliproxyRelayDataDir === null ||
     !accountsEnabled(process.env) ||
@@ -1114,18 +1164,41 @@ function rotateCooldownAccount(
     return null;
   }
   const ledger = loadLedger(cliproxyRelayDataDir);
-  const untilMs = ledger.accounts[session.accountLabel]?.cooldownUntilMs ?? 0;
-  if (untilMs <= Date.now()) {
+  const entry = ledger.accounts[session.accountLabel];
+  const untilMs = entry?.cooldownUntilMs ?? 0;
+  const parkedReason = entry?.parkedReason;
+  if (parkedReason === undefined && untilMs <= Date.now()) {
     return null;
   }
+  const from = session.accountLabel;
+  const cause: BridgeRotationCause =
+    parkedReason === "auth-dead" ||
+    parkedReason === "tos-disabled" ||
+    parkedReason === "validation-required"
+      ? parkedReason
+      : parkedReason !== undefined ||
+          isAccountIneligible(entry?.lastError ?? "")
+        ? "ineligible"
+        : "quota";
   const accounts = listAccounts(cliproxyRelayDataDir);
   const candidate = pickAccount(ledger, accounts, session.accountLabel);
-  if (candidate === null) {
-    return null;
-  }
   const candidateUntilMs =
-    ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0;
-  if (candidateUntilMs > Date.now()) {
+    candidate === null
+      ? 0
+      : (ledger.accounts[candidate.label]?.cooldownUntilMs ?? 0);
+  if (candidate === null || candidateUntilMs > Date.now()) {
+    if (parkedReason !== undefined) {
+      // A parked account is never "stayed on": no free sibling means the
+      // caller must fail honestly — launching agy on a banned home is off
+      // the table by contract (spec §10, ревизия 14).
+      log(
+        `${where}: account ${from} is parked (${parkedReason}) and no sibling is free; failing honestly`,
+      );
+      return { from, to: null, cause };
+    }
+    if (candidate === null) {
+      return null;
+    }
     // pickAccount names the soonest-opening sibling when all are cooling;
     // that is still a dead HOME, so stay and let the caller wait it out.
     log(
@@ -1134,27 +1207,31 @@ function rotateCooldownAccount(
     );
     return null;
   }
-  const from = session.accountLabel;
-  // Why the account is parked: an eligibility refusal stores its own text.
-  const cause: "quota" | "ineligible" = isAccountIneligible(
-    ledger.accounts[from]?.lastError ?? "",
-  )
-    ? "ineligible"
-    : "quota";
   session.accountLabel = candidate.label;
   markAccountUse(ledger, candidate.label);
   saveLedger(cliproxyRelayDataDir, ledger);
   log(
-    `${where}: account ${from} cools until ${new Date(untilMs).toISOString()}; rotated to free sibling ${candidate.label}`,
+    parkedReason !== undefined
+      ? `${where}: account ${from} is parked (${parkedReason}); rotated to free sibling ${candidate.label}`
+      : `${where}: account ${from} cools until ${new Date(untilMs).toISOString()}; rotated to free sibling ${candidate.label}`,
   );
   return { from, to: candidate.label, cause };
 }
 
 /** How a cooldown rotation explains the parked account to the thread. */
-function parkedAccountPhrase(rotation: { from: string; cause: "quota" | "ineligible" }): string {
-  return rotation.cause === "ineligible"
-    ? `${rotation.from} is parked after failing Google's Antigravity eligibility check`
-    : `${rotation.from} is in quota cooldown`;
+function parkedAccountPhrase(rotation: { from: string; cause: BridgeRotationCause }): string {
+  switch (rotation.cause) {
+    case "ineligible":
+      return `${rotation.from} is parked after failing Google's Antigravity eligibility check`;
+    case "auth-dead":
+      return `${rotation.from} lost its Google sign-in (auth_required)`;
+    case "tos-disabled":
+      return `${rotation.from} was disabled by Google (Terms of Service)`;
+    case "validation-required":
+      return `${rotation.from} needs Google account verification`;
+    default:
+      return `${rotation.from} is in quota cooldown`;
+  }
 }
 
 function clearQuotaRetryTimer(session: Session): void {
@@ -2774,6 +2851,17 @@ function enqueueTurn(session: Session, turn: Turn): void {
       session,
       `enqueueTurn rebuild for thread ${session.threadId}`,
     );
+    if (cooldownRotation !== null && cooldownRotation.to === null) {
+      // Ревизия 14 (PLUG-306): a parked pin with no free sibling must not
+      // respawn on the banned HOME — the turn (and everything queued with
+      // it) fails honestly instead.
+      const message = `account ${cooldownRotation.from} is parked (${cooldownRotation.cause}) and no free pool account can take over`;
+      log(`enqueueTurn rebuild for thread ${session.threadId}: ${message}`);
+      for (const queued of [...session.pending.splice(0), turn]) {
+        settleTurnFailed(session, queued, message);
+      }
+      return;
+    }
     log(
       cooldownRotation !== null
         ? `sessionReplaced for thread ${session.threadId}: child gone, restarting on free sibling ${cooldownRotation.to} (account ${cooldownRotation.from} still cools; contextLost=true)`
@@ -3011,6 +3099,7 @@ const handlers: Record<string, RequestHandler> = {
       writeGuardrail: false,
       compactFallbackOld: null,
       compactSeedAttempts: 0,
+      compactRestoreFresh: false,
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
@@ -3115,6 +3204,7 @@ const handlers: Record<string, RequestHandler> = {
       writeGuardrail: false,
       compactFallbackOld: null,
       compactSeedAttempts: 0,
+      compactRestoreFresh: false,
       autoRetryCount: 0,
       autoRetryTimer: null,
       accountLabel: null,
@@ -3134,10 +3224,21 @@ const handlers: Record<string, RequestHandler> = {
     }
     // A resume that lands on a still-cooling account must not restart on a
     // dead HOME: rotate to a free sibling and start fresh there instead.
+    // A PARKED owner with no free sibling fails honestly — agy is never
+    // launched on a banned home (ревизия 14, PLUG-306).
     const resumeRotation = rotateCooldownAccount(
       session,
       `thread/resume ${data.threadId}`,
     );
+    if (resumeRotation !== null && resumeRotation.to === null) {
+      sessions.delete(data.threadId);
+      respondError(
+        id,
+        BRIDGE_JSON_RPC_ERRORS.SESSION_NOT_RESTORABLE,
+        `account ${resumeRotation.from} is parked (${resumeRotation.cause}) and no free pool account can take over; unpark it in accounts-state.json and retry`,
+      );
+      return;
+    }
     startChild({
       session,
       model: data.options.model,

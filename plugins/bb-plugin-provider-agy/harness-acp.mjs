@@ -453,6 +453,166 @@ setInterval(() => {}, 1000);
   liveShim.kill("SIGTERM");
 }
 
+// --- PLUG-306 (ревизия 14): compaction internals read their errors --------
+// A VALIDATION_REQUIRED/ToS answer to the fallback's internal thread/start
+// or thread/resume parks the account and moves the thread to a free
+// sibling — never a silent stay on the dead session.
+const resetAcpPool = () => {
+  const l = ledger();
+  for (const a of ["a1", "a2", "a3", "a4"]) {
+    l.accounts[a] = { cooldownUntilMs: 0,
+      lastUsedMs: a === "a1" ? 0 : 1_700_000_000_000, lastError: null };
+    delete l.accounts[a].parkedReason;
+    delete l.accounts[a].ineligibleAtMs;
+  }
+  writeShared(l);
+};
+const handoffHomes = () => transcriptLines()
+  .filter((l) => l.method === "session/prompt" &&
+    (l.params?.prompt ?? []).map((b) => b.text ?? "").join("\n").includes("[compaction-handoff]"))
+  .map((l) => l.home);
+const compactMention = { start: 0, end: 8, resource: { kind: "command",
+  trigger: "/", name: "compact", source: "command", origin: "builtin",
+  label: "/compact", argumentHint: null } };
+const compactTurn = (id, tid) =>
+  send({ jsonrpc: "2.0", id, method: "turn/start", params: { threadId: tid,
+    providerThreadId: ptidOf(tid), clientRequestId: creq(), options,
+    input: [{ type: "text", text: "/compact", mentions: [compactMention] }] } });
+
+// C1: the seed stage's internal thread/start is refused VALIDATION_REQUIRED
+// on the owner — the owner parks and the seed lands on a free sibling.
+resetAcpPool();
+threadReqIds.t306a = 300;
+start(300, "t306a");
+await waitFor(() => replies(300).length === 1, 20000, "t306a start");
+const t306aBase = news("a1").length;
+setControl({ compactMode: "fail", startFailByLabel: { a1: "validation" } });
+compactTurn(301, "t306a");
+await waitFor(() => ledger().accounts.a1?.parkedReason === "validation-required", 30000, "t306a owner parks");
+await waitFor(() => handoffHomes().some((h) => h !== "a1"), 30000, "t306a seed on sibling");
+const c1Entry = ledger().accounts.a1 ?? {};
+const c1Home = handoffHomes().at(-1);
+check("compact/seed-parked-owner", c1Entry.parkedReason === "validation-required" &&
+  (c1Entry.cooldownUntilMs ?? 0) > Date.now() + 365 * 24 * 3_600_000 &&
+  news("a1").length === t306aBase + 1 && c1Home !== "a1",
+  `home=${c1Home} entry=${JSON.stringify(c1Entry).slice(0, 160)} newsA1=${news("a1").length - t306aBase}`);
+setControl({ compactMode: "ok", startFailByLabel: {} });
+
+// C2: the seed start fails with a plain error, then the restore's internal
+// thread/resume is refused ToS — the owner parks and the fallback moves.
+resetAcpPool();
+threadReqIds.t306b = 310;
+start(310, "t306b");
+await waitFor(() => replies(310).length === 1, 20000, "t306b start");
+setControl({ compactMode: "fail",
+  // seed's session/new takes "generic"; the restore's session/load fails
+  // (bridge swallows it) and its session/new fallback answers ToS.
+  startFailByLabel: { a1: ["generic", "tos"] }, loadFailByLabel: { a1: "generic" } });
+compactTurn(311, "t306b");
+await waitFor(() => ledger().accounts.a1?.parkedReason === "tos-disabled", 30000, "t306b owner parks");
+await waitFor(() => handoffHomes().some((h) => h !== "a1"), 30000, "t306b seed on sibling");
+const c2Entry = ledger().accounts.a1 ?? {};
+check("compact/restore-parked-owner", c2Entry.parkedReason === "tos-disabled" &&
+  (c2Entry.cooldownUntilMs ?? 0) > Date.now() + 365 * 24 * 3_600_000 &&
+  handoffHomes().at(-1) !== "a1",
+  `entry=${JSON.stringify(c2Entry).slice(0, 160)} home=${handoffHomes().at(-1)}`);
+setControl({ compactMode: "ok", startFailByLabel: {}, loadFailByLabel: {} });
+
+// C3: parked cause and no free sibling — the queued turns fail honestly
+// with the reason named.
+resetAcpPool();
+{
+  const l = ledger();
+  for (const a of ["a2", "a3", "a4"]) {
+    l.accounts[a] = { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000,
+      lastError: "x", ineligibleAtMs: 1, parkedReason: "tos-disabled" };
+  }
+  writeShared(l);
+}
+threadReqIds.t306c = 320;
+start(320, "t306c");
+await waitFor(() => replies(320).length === 1, 20000, "t306c start");
+setControl({ compactMode: "fail", startFailByLabel: { a1: "validation" } });
+compactTurn(321, "t306c");
+await waitFor(() => perrors("t306c").some((e) =>
+  typeof e.message === "string" && e.message.includes("no free pool account can take over the compaction fallback")), 30000, "t306c honest fail");
+check("compact/parked-no-sibling-fails",
+  ledger().accounts.a1?.parkedReason === "validation-required" &&
+  perrors("t306c").at(-1)?.message.includes("needs Google account verification"),
+  perrors("t306c").at(-1)?.message?.slice(0, 140) ?? "none");
+setControl({ compactMode: "ok", startFailByLabel: {} });
+resetAcpPool();
+
+// C4: §2.3 п.11 — the session/new inside the model-catalog probe reads its
+// error too: VALIDATION_REQUIRED parks the maintenance pick and the probe
+// answers [] (the honest default list covers the reply).
+{
+  const probeDir = join(root, "probe-park");
+  for (const label of ["p1", "p2"]) {
+    const cli = join(probeDir, "accounts", label, ".gemini", "antigravity-cli");
+    mkdirSync(cli, { recursive: true });
+    writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+  }
+  writeFileSync(join(probeDir, "accounts-state.json"), JSON.stringify({ accounts: {
+    p1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null },
+    p2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null },
+  } }));
+  setControl({ modelsFailByLabel: { p1: "injected catalog failure", p2: "injected catalog failure" },
+    startFailByLabel: { p1: "validation" } });
+  const probeBridge = (await import(new URL("./dist/host.js?plug306-probe", import.meta.url).href)).experimental_providerBridge;
+  probeBridge.start?.({ pluginId: "provider-agy", dataDir: probeDir, tempDir: probeDir });
+  probeBridge.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 990, method: "model/list", params: {} }));
+  await waitFor(() => messages.some((m) => m.id === 990), 30000, "probe model/list");
+  const probeLedger = JSON.parse(readFileSync(join(probeDir, "accounts-state.json"), "utf8")).accounts;
+  const probeReply = messages.find((m) => m.id === 990);
+  const probeLog = existsSync(join(probeDir, "acp-wrapper.log"))
+    ? readFileSync(join(probeDir, "acp-wrapper.log"), "utf8") : "";
+  check("models/probe-parks-account", probeLedger.p1?.parkedReason === "validation-required" &&
+    probeLedger.p2?.parkedReason === undefined &&
+    probeReply?.result?.models?.length === 1 &&
+    probeLog.includes("models probe: account p1 parked (validation-required)"),
+    `p1=${probeLedger.p1?.parkedReason} p2=${probeLedger.p2?.parkedReason} models=${probeReply?.result?.models?.length}`);
+  setControl({ modelsFailByLabel: {}, startFailByLabel: {} });
+}
+
+// C5: §2.3 п.12 — a thread/start refused without an account pick is
+// journaled: thread id, model, reason. "Not offered" and "all parked"
+// variants.
+{
+  const fresh = { raw: [{ id: "fake-model", displayName: "Fake Model" }],
+    families: ["fake-model"], unsupported: {}, atMs: Date.now() };
+  writeFileSync(join(root, "accounts-models.json"), JSON.stringify({
+    accounts: { a1: fresh, a2: fresh, a3: fresh, a4: fresh } }));
+  resetAcpPool();
+  const refusedId = 991;
+  send({ jsonrpc: "2.0", id: refusedId, method: "thread/start", params: {
+    threadId: "t-ref-model", cwd: workspace,
+    options: { ...options, model: "ghost-model" }, instructionMode: "append" } });
+  await waitFor(() => replies(refusedId).length === 1, 20000, "t-ref-model refused");
+  {
+    const l = ledger();
+    for (const a of ["a1", "a2", "a3", "a4"]) {
+      l.accounts[a] = { cooldownUntilMs: 0, lastUsedMs: 0, lastError: "x",
+        ineligibleAtMs: 1, parkedReason: "tos-disabled" };
+    }
+    writeShared(l);
+  }
+  const parkedRefuseId = 992;
+  send({ jsonrpc: "2.0", id: parkedRefuseId, method: "thread/start", params: {
+    threadId: "t-ref-parked", cwd: workspace, options, instructionMode: "append" } });
+  await waitFor(() => replies(parkedRefuseId).length === 1, 20000, "t-ref-parked refused");
+  const refuseLog = readFileSync(join(root, "acp-wrapper.log"), "utf8");
+  check("journal/unoffered-refused-logged",
+    replies(refusedId)[0]?.error?.message === "model ghost-model is not offered by any pool account" &&
+    refuseLog.includes("thread t-ref-model: thread/start refused (model ghost-model): model ghost-model is not offered"),
+    replies(refusedId)[0]?.error?.message ?? "no error");
+  check("journal/parked-refused-logged",
+    replies(parkedRefuseId)[0]?.error?.message === "every pool account is parked; clear a parkedReason in accounts-state.json and retry" &&
+    refuseLog.includes("thread t-ref-parked: thread/start refused (model fake-model): every pool account is parked"),
+    replies(parkedRefuseId)[0]?.error?.message ?? "no error");
+  resetAcpPool();
+}
+
 process.stdout.write = originalWrite;
 say(`\n${checks.filter(([, ok]) => ok).length}/${checks.length} passed`);
 process.exit(checks.every(([, ok]) => ok) ? 0 : 1);

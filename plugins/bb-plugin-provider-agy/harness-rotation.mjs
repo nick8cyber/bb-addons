@@ -31,6 +31,7 @@ import {
   mkdirSync,
   writeFileSync,
   chmodSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -1105,6 +1106,155 @@ stop("t-breaker-custom-max");
 delete process.env.AGY_INELIGIBLE_BREAKER_WINDOW_MS;
 delete process.env.AGY_INELIGIBLE_BREAKER_MAX;
 delete process.env.AGY_FAKE_MODE_BY_LABEL;
+
+// ---- PLUG-306 (ревизия 14): a parkedReason account is never launched ------
+// parkedReason alone (cooldown already 0) makes the home banned: resume,
+// the enqueueTurn rebuild and the compaction restore all move to a free
+// sibling — or fail honestly when none exists. The fake never sees a spawn
+// on the parked HOME.
+{
+  const parkedEntry = { cooldownUntilMs: 0, lastUsedMs: 0, lastError: "tos",
+    ineligibleAtMs: 1, parkedReason: "tos-disabled" };
+  const parkOwner = (label, conv) => {
+    const ledger = readLedger();
+    for (const l of ["a1", "a2", "a3"]) {
+      ledger.accounts[l] = { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null };
+      delete ledger.accounts[l].parkedReason;
+      delete ledger.accounts[l].ineligibleAtMs;
+    }
+    if (conv !== undefined) ledger.conversations[conv] = label;
+    ledger.accounts[label] = { ...parkedEntry };
+    writeLedger(ledger);
+  };
+  const parkAll = (conv) => {
+    const ledger = readLedger();
+    for (const l of readdirSync(join(root, "accounts"))) {
+      ledger.accounts[l] = { ...parkedEntry };
+    }
+    if (conv !== undefined) ledger.conversations[conv] = "a1";
+    writeLedger(ledger);
+  };
+  const cfIdentities = (id) => messages
+    .filter((m) => m.method === "thread/identity" && m.params.threadId === id)
+    .map((m) => m.params.providerThreadId);
+  process.env.AGY_FAKE_ERROR_MODE = "succeed";
+
+  // P1: resume whose owner carries parkedReason → fresh spawn on a sibling,
+  // honest contextLost notice; the parked HOME is never spawned.
+  parkOwner("a1", "fake-conv-park");
+  const parkSpawnBase = spawns().length;
+  const parkResume = await resumeThread("t-resume-parked-sib", "fake-conv-park");
+  const parkSpawn = spawns().at(-1);
+  check("parked/resume-rotates-to-sibling",
+    !parkResume.error && spawns().length === parkSpawnBase + 1 &&
+    homeLabel(parkSpawn?.__env?.HOME) !== "a1" &&
+    !parkSpawn?.__argv?.includes("--conversation") &&
+    replacedFor("t-resume-parked-sib").some((m) => m.params.contextLost === true &&
+      typeof m.params.reason === "string" && m.params.reason.includes("disabled by Google")),
+    parkResume?.error?.message ?? `spawn=${homeLabel(parkSpawn?.__env?.HOME)}`);
+  stop("t-resume-parked-sib");
+
+  // P2: resume whose owner is parked and every sibling is parked too →
+  // honest SESSION_NOT_RESTORABLE, zero spawns.
+  parkAll("fake-conv-park");
+  const deadSpawnBase = spawns().length;
+  const deadResume = await resumeThread("t-resume-parked-dead", "fake-conv-park");
+  check("parked/resume-all-parked-fails",
+    deadResume?.error !== undefined && /parked/iu.test(deadResume.error.message ?? "") &&
+    spawns().length === deadSpawnBase,
+    deadResume?.error?.message ?? "unexpected success");
+  resetPool();
+
+  // P3: enqueueTurn rebuild on a parked pin — the child idles out, the next
+  // turn must spawn on a sibling, never restart on the banned HOME.
+  process.env.AGY_IDLE_KILL_MS = "1500";
+  resetPool();
+  await startThread("t-rebuild-parked");
+  await turn("t-rebuild-parked", "one", 1);
+  const rebuildOwner = homeLabel(spawns().at(-1)?.__env?.HOME);
+  {
+    const ledger = readLedger();
+    ledger.accounts[rebuildOwner] = { ...parkedEntry };
+    writeLedger(ledger);
+  }
+  await sleep(2_500); // past the idle kill: the child is gone
+  const rebuildSpawnBase = spawns().length;
+  await turn("t-rebuild-parked", "two", 2);
+  check("parked/rebuild-rotates-to-sibling",
+    statuses("t-rebuild-parked") === "completed,completed" &&
+    spawns().length === rebuildSpawnBase + 1 &&
+    homeLabel(spawns().at(-1)?.__env?.HOME) !== rebuildOwner &&
+    replacedFor("t-rebuild-parked").some((m) => m.params.contextLost === true),
+    `${statuses("t-rebuild-parked")} owner=${rebuildOwner} spawn=${homeLabel(spawns().at(-1)?.__env?.HOME)}`);
+  stop("t-rebuild-parked");
+
+  // P4: the same rebuild with every account parked → the queued turn fails
+  // honestly instead of respawning on the banned HOME.
+  resetPool();
+  await startThread("t-rebuild-dead");
+  await turn("t-rebuild-dead", "one", 1);
+  {
+    const ledger = readLedger();
+    for (const l of readdirSync(join(root, "accounts"))) {
+      ledger.accounts[l] = { ...parkedEntry };
+    }
+    writeLedger(ledger);
+  }
+  await sleep(2_500);
+  const deadSpawnBase2 = spawns().length;
+  await turn("t-rebuild-dead", "two", 2);
+  const deadTurnErr = boundaries("t-rebuild-dead").at(-1)?.error?.message ?? "";
+  check("parked/rebuild-all-parked-fails",
+    statuses("t-rebuild-dead") === "completed,failed" &&
+    spawns().length === deadSpawnBase2 &&
+    (/parked/iu.test(deadTurnErr) || errorsFor("t-rebuild-dead").some((e) => /parked/iu.test(e.message ?? ""))),
+    `${statuses("t-rebuild-dead")} err=${deadTurnErr.slice(0, 120)}`);
+  stop("t-rebuild-dead");
+  process.env.AGY_IDLE_KILL_MS = "0";
+
+  // P5: compaction restore on a parked owner — seed fails twice, then the
+  // restore must open a FRESH conversation on a free sibling; resuming the
+  // old conversation would mean launching agy on the banned HOME.
+  resetPool();
+  process.env.AGY_FAKE_ERROR_MODE = "compact-fail";
+  process.env.AGY_FAKE_SUMMARY_MODE = "ok";
+  process.env.AGY_FAKE_SEED_MODE = "fail";
+  process.env.AGY_FAKE_FRESH_IDS = "1";
+  await startThread("t-cf-parked");
+  await turn("t-cf-parked", "first successful turn", 1);
+  const cfOwner = homeLabel(spawns().at(-1)?.__env?.HOME);
+  const cfOldConv = cfIdentities("t-cf-parked").at(-1);
+  {
+    const ledger = readLedger();
+    ledger.accounts[cfOwner] = { ...parkedEntry };
+    writeLedger(ledger);
+  }
+  const cfSpawnBase = spawns().length;
+  send({ jsonrpc: "2.0", id: nextId++, method: "turn/start", params: { threadId: "t-cf-parked", providerThreadId: "fake-conv-rotation",
+    input: [{ type: "text", text: "/compact", mentions: [] }], clientRequestId: creq(), options } });
+  // Queued behind the whole compact chain; lands on the restore's sibling.
+  await turn("t-cf-parked", "queued user turn", 6);
+  const cfSpawns = spawns().slice(cfSpawnBase);
+  const cfLast = cfSpawns.at(-1);
+  check("parked/compact-restore-moves-to-sibling-fresh",
+    statuses("t-cf-parked") === "completed,failed,completed,failed,failed,completed" &&
+    cfLast !== undefined && homeLabel(cfLast.__env?.HOME) !== cfOwner &&
+    !cfLast.__argv?.includes("--conversation") &&
+    cfIdentities("t-cf-parked").at(-1) !== cfOldConv,
+    `${statuses("t-cf-parked")} owner=${cfOwner} last=${homeLabel(cfLast?.__env?.HOME)} ` +
+      `argv=${JSON.stringify(cfLast?.__argv?.includes("--conversation"))}`);
+  check("parked/compact-restore-notice-honest",
+    replacedFor("t-cf-parked").at(-1)?.params.contextLost === true &&
+    /parked/iu.test(replacedFor("t-cf-parked").at(-1)?.params.reason ?? ""),
+    JSON.stringify(replacedFor("t-cf-parked").map((m) => m.params.contextLost)));
+  stop("t-cf-parked");
+  delete process.env.AGY_FAKE_SEED_MODE;
+  delete process.env.AGY_FAKE_SUMMARY_MODE;
+  delete process.env.AGY_FAKE_FRESH_IDS;
+  delete process.env.AGY_FAKE_COMPACT_MODE;
+  process.env.AGY_FAKE_ERROR_MODE = "succeed";
+  resetPool();
+}
 
 activeBridge.onClose?.();
 // A separately imported bridge that never received start has no dataDir.
