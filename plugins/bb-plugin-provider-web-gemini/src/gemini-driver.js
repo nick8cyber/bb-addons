@@ -773,7 +773,10 @@ async function selectModelAndThinking(page, model, thinking, strict = false) {
 async function stopGeneration(page) {
   if (!page) return;
   try {
-    const stopBtn = await safeQuery(page, 'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
+    const stopBtn = await safeQuery(
+      page,
+      'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i], .stop-button'
+    );
     if (stopBtn) {
       await stopBtn.click({ timeout: 2000 }).catch(() => {});
     }
@@ -797,6 +800,143 @@ function findTurnTarget(doc, idx, promptPrefix) {
     return null;
   }
   return target;
+}
+
+function checkTurnStatus(doc, idx, promptPrefix) {
+  if (!doc) {
+    return {
+      targetFound: false,
+      hasStopButton: false,
+      isBusyOrThinking: false,
+      hasFinishedContent: false,
+      hasActionButtons: false,
+      currentText: null,
+    };
+  }
+
+  const findFn =
+    (typeof window !== 'undefined' && (window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget)) ||
+    (typeof findTurnTarget !== 'undefined' ? findTurnTarget : null);
+  const target = typeof findFn === 'function' ? findFn(doc, idx, promptPrefix) : null;
+
+  const stopBtnSelector = [
+    'button[aria-label*="Stop" i]',
+    'button[aria-label*="Остановить" i]',
+    'button[aria-label*="Прекратить" i]',
+    'button[data-test-id="stop-button"]',
+    'button[data-test-id*="stop" i]',
+    '.stop-button',
+  ].join(', ');
+  const stopEl = doc.querySelector(stopBtnSelector);
+  const hasStopButton =
+    stopEl !== null &&
+    !stopEl.disabled &&
+    stopEl.getAttribute('aria-disabled') !== 'true';
+
+  const busySelector = [
+    '[aria-busy="true"]',
+    'mat-spinner',
+    'mat-progress-bar',
+    '[role="progressbar"]',
+    '.spinner',
+    '.loading-spinner',
+    '.mat-mdc-progress-spinner',
+    '.mat-mdc-progress-bar',
+    '[data-test-id*="spinner" i]',
+    '[data-test-id*="loader" i]',
+    '[data-test-id*="loading" i]',
+    '.shimmer',
+    '[class*="shimmer" i]',
+    'sparkle-animation',
+    '[class*="sparkle-anim" i]',
+    '.animated-sparkle',
+    '.loading-dots',
+    '[class*="loading-dot" i]',
+    'thinking-indicator',
+    '.thinking-indicator',
+    '[data-test-id*="thinking-indicator" i]',
+    '[class*="thinking-spinner" i]',
+    '[class*="thinking-process-spinner" i]',
+  ].join(', ');
+
+  let isBusyOrThinking = false;
+  if (target) {
+    if (target.getAttribute('aria-busy') === 'true' || target.querySelector(busySelector) !== null) {
+      isBusyOrThinking = true;
+    }
+  }
+  if (!isBusyOrThinking) {
+    const globalBusy = doc.querySelector(
+      '.conversation-container [aria-busy="true"], main [aria-busy="true"], .input-area [aria-busy="true"]'
+    );
+    if (globalBusy) isBusyOrThinking = true;
+  }
+
+  let currentText = null;
+  let hasFinishedContent = false;
+  let hasActionButtons = false;
+
+  if (target) {
+    const mc = target.querySelector('message-content');
+    if (mc) {
+      currentText = { src: 'mc', text: mc.innerText || '' };
+    } else {
+      currentText = { src: 'raw', text: target.innerText || '' };
+    }
+
+    const hasText = mc ? (mc.innerText || '').trim().length > 0 : false;
+    const hasImg =
+      target.querySelector(
+        'generated-image, img.generated-image, message-content img, .image-container img[src*="googleusercontent"], .image-container img[src*="blob:"], .image-container img[src*="data:image"]'
+      ) !== null;
+    hasFinishedContent = hasText || hasImg;
+
+    const actionSelector = [
+      'response-feedback',
+      '.response-feedback',
+      '.actions-container',
+      '.luminous-actions-container',
+      'message-actions',
+      '[data-test-id="response-actions"]',
+      '[data-test-id="message-actions"]',
+      'button[aria-label*="Copy" i]',
+      'button[aria-label*="Копировать" i]',
+      'button[data-test-id="copy-button"]',
+      'button[data-test-id*="copy" i]',
+      'button[aria-label*="Good response" i]',
+      'button[aria-label*="Хороший ответ" i]',
+      'button[aria-label*="Thumbs up" i]',
+      'button[aria-label*="Нравится" i]',
+      'button[data-test-id*="thumb" i]',
+      'button[data-test-id*="like" i]',
+      'button[aria-label*="Bad response" i]',
+      'button[aria-label*="Плохой ответ" i]',
+      'button[aria-label*="Share" i]',
+      'button[aria-label*="Поделиться" i]',
+    ].join(', ');
+    hasActionButtons = target.querySelector(actionSelector) !== null;
+  }
+
+  return {
+    targetFound: target !== null,
+    hasStopButton,
+    isBusyOrThinking,
+    hasFinishedContent,
+    hasActionButtons,
+    currentText,
+  };
+}
+
+function isTurnComplete(status, { stableMs = 0, stableDurationMs = 500, fallbackDurationMs = 5000 } = {}) {
+  if (!status || !status.targetFound) return false;
+  if (status.hasStopButton) return false;
+  if (status.isBusyOrThinking) return false;
+  if (!status.hasFinishedContent) return false;
+
+  if (status.hasActionButtons) {
+    return stableMs >= stableDurationMs;
+  }
+  return stableMs >= fallbackDurationMs;
 }
 
 async function waitForHistoryStabilization(
@@ -886,6 +1026,8 @@ async function sendPrompt({
     ? await driverHooks.connectOverCDP(cdpUrl(port))
     : await playwright.chromium.connectOverCDP(cdpUrl(port));
 
+  let resObj = null;
+  let returnedConvId = convId;
   try {
     page = driverHooks?.getGeminiPage
       ? await driverHooks.getGeminiPage(browser, { waitForVerification, port })
@@ -893,7 +1035,6 @@ async function sendPrompt({
     await throwIfCancelled();
 
     let lastText = '';
-    let returnedConvId = convId;
     let downloadedPath = null;
     let generatedFiles = [];
     let skippedDownloads = [];
@@ -1059,7 +1200,8 @@ async function sendPrompt({
     lastText = '';
     let lastSrc = null;
     let stableStartTime = null;
-    const STABLE_DURATION_MS = 500;
+    const STABLE_DURATION_MS = Number(process.env.WEB_GEMINI_STABLE_DURATION_MS || process.env.ARGON_STABLE_DURATION_MS) || 500;
+    const STABLE_FALLBACK_MS = Number(process.env.WEB_GEMINI_STABLE_NO_ACTIONS_MS || process.env.ARGON_STABLE_NO_ACTIONS_MS) || 5000;
     const POLL_INTERVAL_MS = 200;
     const MAX_WAIT_MS = Number(process.env.GEMINI_MAX_WAIT_MS) || 900_000;
     const streamStartTime = Date.now();
@@ -1068,26 +1210,48 @@ async function sendPrompt({
       await throwIfCancelled();
       await page.waitForTimeout(POLL_INTERVAL_MS);
 
-      const currentText = await safeEval(page,
-        ({ idx, promptPrefix, fnSrc }) => {
+      const status = await safeEval(page,
+        ({ idx, promptPrefix, fnSrc, checkSrc }) => {
           if (!window.__webGeminiFindTurnTarget && !window.__argonFindTurnTarget && fnSrc) {
             // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
             window.__webGeminiFindTurnTarget = (0, eval)('(' + fnSrc + ')');
           }
+          if (!window.__webGeminiCheckTurnStatus && checkSrc) {
+            // Safe driver evaluation: checkSrc is checkTurnStatus.toString() from gemini-driver.js
+            window.__webGeminiCheckTurnStatus = (0, eval)('(' + checkSrc + ')');
+          }
+          const checkFn = window.__webGeminiCheckTurnStatus;
+          if (checkFn) {
+            return checkFn(document, idx, promptPrefix);
+          }
           const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
-          const target = fn(document, idx, promptPrefix);
+          const target = fn ? fn(document, idx, promptPrefix) : null;
           if (!target) return null;
           const mc = target.querySelector('message-content');
-          // Track which source produced the text: before message-content exists
-          // the whole model-response (incl. "Show thinking" chrome) is read —
-          // when mc appears the text shrinks, so a length-slice would skip the
-          // answer's start. Reset on source switch or non-prefix text.
           const src = mc ? 'mc' : 'raw';
-          return { src, text: ((mc || target).innerText || '') };
+          return {
+            targetFound: true,
+            hasStopButton: document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Остановить" i]') !== null,
+            isBusyOrThinking: false,
+            hasFinishedContent: (mc?.innerText || '').trim().length > 0,
+            hasActionButtons: false,
+            currentText: { src, text: ((mc || target).innerText || '') },
+          };
         },
-        { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }
+        {
+          idx: initialCount,
+          promptPrefix,
+          fnSrc: findTurnTarget.toString(),
+          checkSrc: checkTurnStatus.toString(),
+        }
       );
 
+      if (!status || !status.targetFound) {
+        stableStartTime = null;
+        continue;
+      }
+
+      const currentText = status.currentText;
       if (currentText !== null && currentText.text.length) {
         if (currentText.src !== lastSrc || !currentText.text.startsWith(lastText)) {
           lastText = '';
@@ -1105,29 +1269,25 @@ async function sendPrompt({
         }
       }
 
-      const stopButton = await safeQuery(page, 'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]');
-
-      const hasFinishedContent = await safeEval(page,
-        ({ idx, promptPrefix, fnSrc }) => {
-          if (!window.__webGeminiFindTurnTarget && !window.__argonFindTurnTarget && fnSrc) {
-            // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
-            window.__webGeminiFindTurnTarget = (0, eval)('(' + fnSrc + ')');
-          }
-          const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
-          const last = fn(document, idx, promptPrefix);
-          if (!last) return false;
-          const hasText = (last.querySelector('message-content')?.innerText || '').trim().length > 0;
-          const hasImg = last.querySelector('img, generated-image, .image-container') !== null;
-          return hasText || hasImg;
-        },
-        { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }
+      const stopButton = await safeQuery(
+        page,
+        'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
       );
 
-      if (!stopButton) {
-        if (hasFinishedContent) {
-          if (stableStartTime === null) {
-            stableStartTime = Date.now();
-          } else if (Date.now() - stableStartTime >= STABLE_DURATION_MS) {
+      const effectiveStatus = {
+        ...status,
+        hasStopButton: status.hasStopButton || Boolean(stopButton),
+      };
+
+      if (!effectiveStatus.hasStopButton && !effectiveStatus.isBusyOrThinking && effectiveStatus.hasFinishedContent) {
+        if (stableStartTime === null) {
+          stableStartTime = Date.now();
+        } else {
+          const stableMs = Date.now() - stableStartTime;
+          if (isTurnComplete(effectiveStatus, { stableMs, stableDurationMs: STABLE_DURATION_MS, fallbackDurationMs: STABLE_FALLBACK_MS })) {
+            if (process.env.WEB_GEMINI_DEBUG || process.env.ARGON_DEBUG) {
+              console.log(`[web-gemini] stream complete: length=${lastText.length}, actions=${effectiveStatus.hasActionButtons}, stableMs=${stableMs}`);
+            }
             break;
           }
         }
@@ -1138,7 +1298,7 @@ async function sendPrompt({
 
     // Hit the cap mid-generation → the answer is truncated, not complete.
     if (Date.now() - streamStartTime >= MAX_WAIT_MS && (await safeQuery(page,
-      'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]'
+      'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[aria-label*="Прекратить" i], button[data-test-id="stop-button"], button[data-test-id*="stop" i]'
     ))) {
       await stopGeneration(page);
       const e = new Error(`generation still running after ${MAX_WAIT_MS / 1000}s cap — answer truncated`);
@@ -1146,14 +1306,48 @@ async function sendPrompt({
       throw e;
     }
 
+    // Final check for the latest message-content text
+    try {
+      const finalText = await safeEval(page,
+        ({ idx, promptPrefix, fnSrc }) => {
+          const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
+          if (!fn) return null;
+          const target = fn(document, idx, promptPrefix);
+          if (!target) return null;
+          const mc = target.querySelector('message-content');
+          return mc ? mc.innerText : null;
+        },
+        { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }
+      );
+      if (finalText && finalText.length > 0) {
+        if (finalText.length > lastText.length && onChunk && typeof onChunk === 'function') {
+          onChunk(finalText.slice(lastText.length));
+        }
+        lastText = finalText;
+      }
+    } catch {}
+
     returnedConvId = convId;
     if (isNewChat) {
-      const deadline = Date.now() + 3000;
+      const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
         const u = page.url();
         const match = u.match(/\/app\/([a-f0-9]{8,})/i) || u.match(/\/app\/([a-zA-Z0-9_-]+)/);
-        if (match && match[1]) {
+        if (match && match[1] && match[1] !== 'new') {
           returnedConvId = match[1];
+          break;
+        }
+        const domId = await safeEval(page, () => {
+          const a = document.querySelector(
+            'gem-nav-list-item[data-test-id="conversation"] a[href*="/app/"], gem-nav-list-item a[href*="/app/"], a[href*="/app/"]'
+          );
+          if (!a) return null;
+          const href = a.getAttribute('href') || '';
+          const m = href.match(/\/app\/([a-f0-9]{8,})/i) || href.match(/\/app\/([a-zA-Z0-9_-]+)/);
+          return m && m[1] && m[1] !== 'new' ? m[1] : null;
+        }).catch(() => null);
+        if (domId) {
+          returnedConvId = domId;
           break;
         }
         await page.waitForTimeout(200);
@@ -1195,7 +1389,7 @@ async function sendPrompt({
     }
     }
 
-    const resObj = new String(lastText);
+    resObj = new String(lastText);
     resObj.text = lastText;
     resObj.thinking = null;
     resObj.meta = {};
@@ -1227,6 +1421,22 @@ async function sendPrompt({
       if (process.env.WEB_GEMINI_DEBUG || process.env.ARGON_DEBUG) {
         console.warn('[argon] captureUsageLimits post-turn error:', err.message);
       }
+    }
+
+    if (isNewChat && !returnedConvId && page && !page.isClosed?.() && typeof page.url === 'function') {
+      try {
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          const u = page.url();
+          const match = u.match(/\/app\/([a-f0-9]{8,})/i) || u.match(/\/app\/([a-zA-Z0-9_-]+)/);
+          if (match && match[1] && match[1] !== 'new') {
+            returnedConvId = match[1];
+            if (resObj) resObj.convId = returnedConvId;
+            break;
+          }
+          await page.waitForTimeout(200);
+        }
+      } catch {}
     }
 
     if (page && process.env.GEMINI_PARK_IDLE !== '0') {
@@ -2101,6 +2311,8 @@ module.exports = {
   markVisibleDialogs,
   stopGeneration,
   findTurnTarget,
+  checkTurnStatus,
+  isTurnComplete,
   waitForHistoryStabilization,
   getGeminiPage,
   checkRobotVerification,
