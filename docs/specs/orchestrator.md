@@ -624,6 +624,7 @@ BB сам ставит повтор упавшего хода в очередь 
 - Гейт ревью привязан к публикуемым коммитам и проверяется **на шаге 1** (приёмка), до любых действий конвейера (Б4; по ревью PLUG-210):
   - публикуемая вершина = ветка исполнителя → она обязана совпадать с `result_sha`, и на `result_sha` есть ОК-ревью; иначе `unreviewed-commits` со списком лишних коммитов (уже опубликованное — предки `origin/<цель>` и прошлого `published_sha` — лишним не считается); вершина для аудита и публикации — ровно та, что сверена, без повторного чтения `HEAD`;
   - публикуемая вершина = ветка `merged_into` → проходит, если есть ОК-ревью **на самой вершине** (покрывает всё под ней, включая коммиты координатора — например документы, которые по release §1 правит координатор), либо у каждого влитого делегирования, ещё не опубликованного (после последнего `published_sha` / вне `origin/<цель>`), есть ОК-ревью на его `merged_sha` и сверх влитого нет коммитов, кроме созданных самим конвейером; иначе `unreviewed-commits`;
+  - публикуемая вершина = функциональная ветка графа задач `bb/<KEY>-...` (при `workGraph ≠ "off"`): публикуемая вершина обязана совпадать с `result_sha` (для маршрутов с кодом: `feature`, `fix`, `simple`) или `spec_sha` (для маршрута `docs`). На этой вершине обязано быть ОК-ревью (§28.1). Продвижение функциональной ветки `bb/<KEY>-...` выполняется атомарно: `git update-ref refs/heads/bb/<KEY>-... <new_sha> <old_sha>` с обязательной проверкой `git merge-base --is-ancestor <old_sha> <new_sha>` (строго fast-forward). Шаги 2 (синк-слияние) и 3 (проверки проекта) выполняются в изолированной рабочей копии последнего захода исполнителя (`result_env_id`, путь из `delegations`), в которой переключается ветка `bb/<KEY>-...`. При возврате в узел `code` (после сбоя шагов 2–4 выкладки, отклонения аудитором или `resume --target code` после `pr.closed`) новый заход исполнителя кода раздаётся строго от текущей вершины ветки `bb/<KEY>-...` (`from: refs/heads/bb/<KEY>-...`), гарантируя сохранение всей опубликованной истории ветки PR и строго fast-forward продолжение;
   - коммиты, которые создал сам конвейер (синк-слияние, правка трейлера `--no-docs`), записываются в `releases` и в гейте не считаются чужими, в том числе на повторном запуске после отказа;
   - коммит слияния, которого нет в копии, — понятный отказ, не ошибка git;
   - вершина, проверенная гейтом (после синк-слияния), запоминается; после проверок проекта и перед аудитом/публикацией `HEAD` обязан с ней совпадать, иначе `unreviewed-commits`; на пути ветки исполнителя — отказ на шаге 1, если у его треда идёт ход (по ревью PLUG-214);
@@ -753,12 +754,21 @@ BB сам ставит повтор упавшего хода в очередь 
 - Платформа: Linux (используются `sh`, `/proc`, группы процессов); macOS и Windows не поддерживаются. Внешние программы: `git` ≥ 2.39, `gitleaks` (без него выкладка отказывает), `gh` — только для `prProvider: github`. Всё записано в README.
 - Реестр провайдеров не прочитан — перезагрузка пропускается для **всех** плагинов (а не по слову `provider` в id — это было соглашение автора об именах).
 
-### 18.7 Что остаётся завязанным и почему
+### 18.7 Настройки графа задач и конвейера `run-queue` (r34)
+Каталог настроек проекта в объекте `orchestrator.*`:
+- `orchestrator.workGraph`: режим графа задач — `'off' | 'shadow' | 'strict'`, по умолчанию `'off'` (§32);
+- `orchestrator.approvalMode`: режим подтверждения шлюза владельца — `'auto' | 'manual'`, по умолчанию `'manual'` (§29);
+- `orchestrator.maxActiveTasks`: целое положительное число (по умолчанию 1) — лимит одновременно выполняющихся активных задач в статусе `running` (§28.2);
+- `orchestrator.checks.allowedRunners`: массив разрешённых команд/префиксов раннеров (по умолчанию `["npm test", "npm run test", "npm run test:*", "npm run lint", "pytest", "cargo test", "go test ./..."]`, §31.3);
+- `orchestrator.checks.timeout_seconds`: целое число секунд (по умолчанию 300) — таймаут выполнения машинного узла `checks` (§31.3);
+- `orchestrator.node_policy`: сопоставление узлов графа с тайм-аутами и лимитами повторов: `{ [nodeName]: { timeout_seconds: number, max_retries: number, level?: string } }` (§28.2).
+
+### 18.8 Что остаётся завязанным и почему
 - Стартовый промпт исполнителя — копия шаблона BB (§4 r30 б): дрейф при обновлении BB принят, тест разделов ловит расхождение, запасной путь — `bb tasks dispatch`.
 - Протокол с BB (события, `threads.spawn`, `bb automation`) — платформа плагина.
 - Инструменты стенда автора (синхронизация второго пользователя, `safe-push.sh`) — вне плагина.
 
-### 18.8 Порядок работ и приёмка
+### 18.9 Порядок работ и приёмка
 Строго последовательно (миграции только добавлением в конец, перестановка относительно применённых ломает загрузку; общий запускатель):
 1. **PLUG-245** — запускатель и журнал `command_runs` (§18.5 первая часть: группы процессов, `queued`, завершение после рестарта, очередь и пределы, срок хранения, маскировка), журнал изменений исполняемых настроек (§18.5 «Доверие»), `postPublish` r11 (любая раскладка, `commands`, `on`, `installsDeps`, без `checkout`), `timing` (release + политика), строки п.2–4 из `timing`.
 2. **PLUG-248** — `prProvider` (github/command/none, `find`, проверка на шаге 1), `prBody`, `requireNote`.
@@ -1169,10 +1179,12 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 
 ### 28.1 Полная матрица переходов «Маршрут × Узел × Событие → Следующий Узел / Новый Статус»
 
-**Вершина выкладки и синхронизация функциональной ветки перед выкладкой:**
-Перед запуском шага 1 выкладки (`node = 'release'`) сервис `run-queue` выполняет fast-forward обновление функциональной ветки `bb/<KEY>-...` до проверенной вершины конвейера через `git update-ref refs/heads/bb/<KEY>-... <sha>`:
+**Вершина выкладки, рабочая копия и синхронизация функциональной ветки:**
+Перед запуском шага 1 выкладки (`node = 'release'`) сервис `run-queue` выполняет атомарное fast-forward обновление функциональной ветки `bb/<KEY>-...` до проверенной вершины конвейера через `git update-ref refs/heads/bb/<KEY>-... <new_sha> <old_sha>` с предварительной проверкой `git merge-base --is-ancestor <old_sha> <new_sha>`:
 - Для маршрутов с кодом (`feature`, `fix`, `simple`): публикуемой вершиной является `result_sha` (содержит коммит договора `acceptance_sha` и коммит спеки `spec_sha` в своей истории git по правилам вершины §17.3);
 - Для маршрута `docs`: публикуемой вершиной является `spec_sha` (договор `acceptance_sha = NULL`);
+- Рабочая копия для шагов 2 (синк-слияние) и 3 (проверки проекта): используется изолированная копия последнего захода исполнителя (`result_env_id`, путь из `delegations`), в которой переключается ветка `bb/<KEY>-...` (при отсутствии — чистая служебная копия `wt/release/<KEY>`);
+- При возврате в узел `code` (отказ выкладки или `resume --target code` после `pr.closed`) новый заход раздаётся строго от текущей вершины ветки `bb/<KEY>-...` (`from: refs/heads/bb/<KEY>-...`), сохраняя всю историю ветки PR и обеспечивая строго fast-forward push.
 Выкладка выполняется от ветки `bb/<KEY>-...` с `head_sha = <sha>`, гарантируя попадание и неизменяемого договора приёмки, и утверждённой спецификации, и проверенного кода в удалённую цель (`origin/<target>`) либо Pull Request.
 
 | Маршрут | Текущий узел (`node`) | Исполнитель / Механизм | Событие / Исход | Следующий узел (`node`) | Новый статус (`status`) | Доказательство / Действие |
@@ -1193,8 +1205,8 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `feature`, `docs` | `spec_review` | `reviewByLevel["spec"]` (по умолч. `review`) | `verdict: OK, blockers: 0` при `mode: manual` | `owner_gate` | `waiting_approval` | Плагин создаёт `PluginInteractionRequest` (уведомление) владельцу с `spec_sha` и `acceptance_sha` |
 | `feature` | `spec_review` | `reviewByLevel["spec"]` | `verdict: OK, blockers: 0` при `mode: auto` | `code` | `running` | Автопереход к реализации кода: раздача узла `code` строго с `--from <spec_sha>` (спека не теряется!) |
 | `docs` | `spec_review` | `reviewByLevel["spec"]` | `verdict: OK, blockers: 0` при `mode: auto` | `release` | `running` | Автопереход к выкладке документации с `--from <spec_sha>` |
-| `feature`, `docs` | `spec_review` | `reviewByLevel["spec"]` | Замечания (`CHANGES`/`blockers>0`), раунд < 3 | `spec` | `running` | Инкремент `spec_review_rounds`, новый заход с замечаниями |
-| `feature`, `docs` | `spec_review` | `reviewByLevel["spec"]` | Замечания (`CHANGES`/`blockers>0`), раунд ≥ 3 | `spec_review` | `blocked` | Потолок кругов: эскалация архитектору и владельцу (`task.blocked`), сводка в `task_queue.payload` |
+| `feature`, `docs` | `spec_review` | `reviewByLevel["spec"]` | Замечания (`CHANGES`/`blockers>0`): инкремент `spec_review_rounds += 1`, раунд < 3 | `spec` | `running` | Новый заход писателя спек с замечаниями аудитора |
+| `feature`, `docs` | `spec_review` | `reviewByLevel["spec"]` | Замечания (`CHANGES`/`blockers>0`): инкремент `spec_review_rounds += 1`, раунд ≥ 3 | `spec_review` | `blocked` | Потолок 3 кругов (урок 6): эскалация архитектору и владельцу (`task.blocked`), сводка в `task_queue.payload` и консультация архитектора |
 | `feature`, `docs` | `spec_review` | `reviewByLevel["spec"]` | Сбой / таймаут / квота / отмена ревьюера | `spec_review` | `running` (перевыпуск) / `stalled` | Перевыпуск по цепочке уровня ревью; при исчерпании — `stalled` |
 | `feature`, `docs` | `spec_review` | `reviewByLevel["spec"]` | Ход завершился вопросом / без JSON-вердикта (урок 7) | `spec_review` | `running` | Узел в работе, повторный nudge ревьюеру с требованием вердикта |
 | `feature`, `fix`, `simple`, `docs` | `owner_gate` | Владелец (человек, без `BB_THREAD_ID`) | Одобрено владельцем через UI плагина / команду CLI `approve <KEY>` | `code` (feature/fix/simple) / `release` (docs) | `running` | Разблокировка конвейера. Раздача `code` для feature с `--from <spec_sha>`, для fix/simple с `--from <acceptance_sha>`. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
@@ -1213,20 +1225,20 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `feature`, `fix`, `simple` | `checks` | Машина | Исход «не запускалось» (таймаут, запрещённая команда §23/§31.3) | `checks` | `stalled` | Закон «неизвестное — не ноль»: проверка не пройдена, остановка |
 | `feature`, `fix`, `simple` | `review` | `reviewByLevel[task.level]` (роль `auditor`) | `verdict: OK, blockers: 0` для `feature` | `design_check` | `running` | Автопереход к архитектурной валидации |
 | `fix`, `simple` | `review` | `reviewByLevel[task.level]` | `verdict: OK, blockers: 0` для `fix`/`simple` | `release` | `running` | Автопереход к конвейеру выкладки |
-| `feature`, `fix`, `simple` | `review` | `reviewByLevel[task.level]` | Замечания (`CHANGES`), раунд < 3 | `code` | `running` | Инкремент `code_review_rounds`, новый заход с замечаниями |
-| `feature`, `fix`, `simple` | `review` | `reviewByLevel[task.level]` | Замечания (`CHANGES`), раунд ≥ 3 | `review` | `blocked` | Потолок кругов: эскалация архитектору/владельцу (`task.blocked`), сводка в `task_queue.payload` |
+| `feature`, `fix`, `simple` | `review` | `reviewByLevel[task.level]` | Замечания (`CHANGES`): инкремент `code_review_rounds += 1`, раунд < 3 | `code` | `running` | Новый заход исполнителя кода с замечаниями аудитора |
+| `feature`, `fix`, `simple` | `review` | `reviewByLevel[task.level]` | Замечания (`CHANGES`): инкремент `code_review_rounds += 1`, раунд ≥ 3 | `review` | `blocked` | Потолок 3 кругов (урок 6): эскалация архитектору/владельцу (`task.blocked`), сводка в `task_queue.payload` и консультация архитектора |
 | `feature`, `fix`, `simple` | `review` | `reviewByLevel[task.level]` | Сбой / таймаут / квота / отмена ревьюера | `review` | `running` (перевыпуск) / `stalled` | Перевыпуск по цепочке уровня ревью; при исчерпании — `stalled` |
 | `feature`, `fix`, `simple` | `review` | `reviewByLevel[task.level]` | Ход завершился вопросом / без JSON-вердикта (урок 7) | `review` | `running` | Повторный nudge ревьюеру с требованием вердикта |
 | `feature` | `design_check` | `architect` (роль `architect`) | `verdict: OK, blockers: 0` | `release` | `running` | Архитектура и договор приёмки подтверждены |
-| `feature` | `design_check` | `architect` | Замечания (`target: "code"` в вердикте), раунд < 3 | `code` | `running` | Инкремент `design_check_rounds`, возврат исполнителю кода |
-| `feature` | `design_check` | `architect` | Замечания (`target: "design"` в вердикте), раунд < 3 | `design` | `running` | Инкремент `design_check_rounds`, возврат архитектору на redesign |
-| `feature` | `design_check` | `architect` | Замечания по архитектуре, раунд ≥ 3 | `design_check` | `blocked` | Потолок кругов: эскалация владельцу |
+| `feature` | `design_check` | `architect` | Замечания (`target: "code"`): инкремент `design_check_rounds += 1`, раунд < 3 | `code` | `running` | Возврат исполнителю кода с замечаниями архитектора |
+| `feature` | `design_check` | `architect` | Замечания (`target: "design"`): инкремент `design_check_rounds += 1`, раунд < 3 | `design` | `running` | Возврат архитектору на redesign с замечаниями архитектора |
+| `feature` | `design_check` | `architect` | Замечания по архитектуре: инкремент `design_check_rounds += 1`, раунд ≥ 3 | `design_check` | `blocked` | Потолок 3 кругов (урок 6): эскалация владельцу со сводкой разногласий в `task_queue.payload` |
 | `feature` | `design_check` | `architect` | Сбой / таймаут / квота / отмена архитектора | `design_check` | `running` (перевыпуск) / `stalled` | Перевыпуск по цепочке уровня `architect`; при исчерпании — `stalled` |
 | `feature` | `design_check` | `architect` | Ход завершился вопросом / без JSON-вердикта (урок 7) | `design_check` | `running` | Повторный nudge архитектору с требованием вердикта |
 | `*` (push-режим) | `release` | Конвейер release (§2, роль `orchestrator`) | Публикация успешна (`published`) | `release` | `done` | Автоочистка копий `taskCleanup`, закрытие задачи в трекере |
 | `*` (pr-режим) | `release` | Конвейер release | PR успешно открыт (`published`) | `release` | `pr_open` | Переход в ожидание слияния PR |
 | `*` (pr-режим) | `release` | Webhook / Polling PR | PR слит в целевую ветку (`pr.merged`) | `release` | `done` | Автоочистка копий `taskCleanup`, закрытие задачи в трекере |
-| `*` (pr-режим) | `release` | Webhook / Polling PR | PR закрыт без слияния (`pr.closed`) | `release` | `stalled` | Запись `pr_closed`, ожидание решения владельца (в течение 72 ч следит за переоткрытием; `resume` опрашивает PR, `resume --target code` возвращает в код для новой ветки, `resume --reopen` переоткрывает PR) |
+| `*` (pr-режим) | `release` | Webhook / Polling PR | PR закрыт без слияния (`pr.closed`) | `release` | `stalled` | Запись `pr_closed`, ожидание решения владельца (в течение 72 ч следит за переоткрытием; `resume` опрашивает PR, `resume --target code` возвращает в код от текущей вершины функциональной ветки `bb/<KEY>-...`, `resume --reopen` переоткрывает PR) |
 | `*` | `release` | Конвейер release | Отказ `release-refused: uncommitted-kb` | `release` | `stalled` | Ожидание очистки KB координатором |
 | `*` | `release` | Конвейер release | Отказ `release-refused: unmerged-ui` | `release` | `stalled` | Ожидание слияния зависимости или `--force-drop-unmerged` |
 | `*` | `release` | Конвейер release | Пустая заметка при `requireNote: true` | `release` | `waiting_release_note` | Ожидание заметки релиза от координатора/владельца |
@@ -1237,7 +1249,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `*` | `release` | Конвейер release | Сбой выполнения скрипта выкладки | `release` | `stalled` | Оповещение координатора об ошибке выкладки |
 | `*` | `release` | Координатор / Владелец | Передана заметка: `bb orchestrator release-note <KEY> "..."` строго при статусе `waiting_release_note` | `release` | `running` | Перезапуск шага 1 выкладки с указанной заметкой. При любом ином статусе задачи команда отклоняется с ошибкой `invalid-status: task is not waiting for release note (current: node=<node>, status=<status>)` |
 | `*` | `[любой узел]` | Координатор / Владелец | `resume <KEY>` при статусе `stalled` (или автоустранение причины: очистка KB, слияние UI) | Текущий узел (`node`) | `running` | Снятие состояния зависания, повторный запуск этапа узла. Счётчики раундов blocked не сбрасываются |
-| `*` | `[любой узел]` | Только Владелец (человек, без `BB_THREAD_ID`) | `resume <KEY> [--target spec|design|code]` при статусе `blocked` | Допустимый узел маршрута | `running` | Сброс счётчиков раундов заблокированного узла. Цель по умолчанию — заблокированный узел (для checks/review — `code`, для spec_review — `spec`, для design_check — `design`). Допустимые цели строго по маршруту: feature — `code`, `spec`, `design`; fix/simple — строго `code`; docs — строго `spec`. Попытка указать узел вне маршрута отклоняется `target-invalid`. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
+| `*` | `[любой узел]` | Только Владелец (человек, без `BB_THREAD_ID`) | `resume <KEY> [--target spec|design|code|release]` при статусе `blocked` | Допустимый узел маршрута | `running` | Сброс счётчиков раундов целевого узла (при target code сбрасываются `code_attempts`, `check_attempts` и `release_attempts = 0`; при target release сбрасывается `release_attempts = 0`). Цель по умолчанию — заблокированный узел (для checks/review — `code`, для spec_review — `spec`, для design_check — `design`, для release — `release`). Допустимые цели строго по маршруту: feature — `code`, `spec`, `design`, `release`; fix/simple — строго `code`, `release`; docs — строго `spec`, `release`. Попытка указать узел вне маршрута отклоняется `target-invalid`. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
 | `*` | `[любой узел]` | Только Владелец (человек, без `BB_THREAD_ID`) | `resume <KEY>` при статусе `deferred` | Текущий узел (`node`) | `running` / `waiting_approval` | Возобновление работы владельцем. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
 | `research` | `research` | `research` (роль `researcher`) | Отчёт сдан (`status: done`) | `research` | `done` | Сохранение отчёта в базу/KB, закрытие задачи |
 | `research` | `research` | `research` | Сбой / таймаут / квота / отмена исследователя | `research` | `running` (перевыпуск) / `stalled` | Перевыпуск по цепочке уровня `research`; при исчерпании — `stalled` |
@@ -1250,7 +1262,12 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 3. **Конфигурация узлов (`node_policy`):** Объект конфигурации в политике проекта:
    `node_policy: { [nodeName]: { timeout_seconds: number, max_retries: number, level?: string } }`.
    Умолчания при отсутствии явной записи: `timeout_seconds = 3600`, `max_retries = 3`.
-4. **Будильник узла (`node_alarm_at`):**
+4. **Механизм эскалации архитектору при блокировке (урок 6 аудита):**
+   При достижении потолка 3 кругов на узлах `spec_review`, `review`, `checks` или `design_check` задача переходит в статус `blocked`. Сервис `run-queue` формирует сводку разногласий в `task_queue.payload` и автоматически запрашивает консультацию уровня `architect` (роль `architect`, `tools: []`):
+   «Задача <KEY> заблокирована после 3 кругов замечаний. Изучи сводку разногласий в payload и дай рекомендацию владельцу: целесообразен ли редизайн, смягчение договора приёмки или отказ от фичи».
+   Резолюция архитектора дописывается в `task_queue.payload` и выводится владельцу в чат. Владелец разрешает тупик командой `bb orchestrator resume <KEY> [--target design|spec|code]` либо `bb orchestrator defer <KEY>`.
+
+5. **Будильник узла (`node_alarm_at`):**
    - Будильник узла взводится **ТОЛЬКО на активных рабочих узлах**: `design`, `spec`, `spec_review`, `code`, `checks`, `review`, `design_check`, `release`, `research`.
    - Пассивные состояния ожидания (`owner_gate`, `waiting_release_note`, `pr_open`, `deferred`, `blocked`, `done`, `stalled`) будильник **НЕ взводят** (задача вправе ждать решения человека или слияния PR).
    - **Лимит выполнения при живом исполнителе:** если тред исполнителя находится в активном выполнении хода (`thread.status === 'running'`), будильник не переводит задачу в `stalled` до истечения предельного лимита времени выполнения хода (по умолчанию 3× `timeout_seconds`, т.е. 3 часа) либо срабатывания сторожа зависаний §5 (отсутствие активности дольше `firstResponseSeconds`). По истечении предельного времени тред останавливается и задача переводится в `stalled`.
@@ -1281,17 +1298,17 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
      - `bb orchestrator reject <KEY>` (на узле `owner_gate`)
      - передача флага `--mode` в `bb orchestrator enqueue`
      выполненный при наличии переменной окружения `BB_THREAD_ID` (независимо от объявленной роли в треде: `orchestrator`, `helper`, `executor`, `auditor`, `researcher`, `architect`, `release-auditor` или при отсутствии роли), **СТРОГО ОТКЛОНЯЕТСЯ** кодом плагина с ошибкой `permission-denied: owner-only`.
-   - Честная фиксация границы SDK и локальной платформы (по аналогии с §23.3):
-     В локальной однопользовательской ОС субпроцессы пользователя работают с одинаковым UID; в SDK плагинов входящие RPC имеют категорию `{kind: 'client'}`, охватывающую и браузерный UI, и CLI `bb`, и агентские треды.
-     Поэтому команда `approve` защищена тем же проверенным контуром, что и `settings approve|reject` (§23.3), `defer` и `resume`:
-     1) Инструменты `orchestrator_approve`, `orchestrator_defer` и `orchestrator_resume` полностью исключены из схем инструментов агентов (`tools: []` для всех ролей);
+   - Честная фиксация границы платформы (строго по аналогии с §23.3):
+     В локальной однопользовательской ОС субпроцессы агентов работают под той же учётной записью пользователя ОС, поэтому агент технически может попытаться вызвать команду напрямую (`env -u BB_THREAD_ID bb orchestrator approve ...`). В SDK плагинов входящие RPC имеют категорию `{kind: 'client'}`, охватывающую и браузерный UI, и CLI `bb`, и агентские треды.
+     Поэтому защита команды `approve` строится на совокупности мер, аналогичных §23.3 для `settings approve`:
+     1) Инструменты одобрения и откладывания исключены из схемы инструментов агентов (`tools: []` для всех ролей, включая координатора: координатор не одобряет задачи за владельца — слово владельца 18.11);
      2) Проверка контекста процессов: отказ при наличии `BB_THREAD_ID` в переменных окружения;
-     3) Карточка уведомления (`PluginInteractionRequest`) используется исключительно как форма отображения для владельца; любые ответы на неё от агентских тредов через `bb thread interactions respond` игнорируются плагином (статус задачи не меняется);
-     4) Сквозной неизменяемый аудит: каждое решение фиксируется в `task_transitions` и немедленно отправляет push-оповещение владельцу в чат. Любая попытка несанкционированного вызова видна владельцу в статусе.
+     3) Карточка уведомления (`PluginInteractionRequest`) используется исключительно как форма отображения для владельца; любые программные ответы на неё от агентских тредов через `bb thread interactions respond` игнорируются плагином (статус задачи не меняется);
+     4) Сквозной неизменяемый аудит: каждое решение фиксируется в `task_transitions` и немедленно отправляет push-оповещение владельцу в чат. Если агент технически выполнит команду в обход переменной окружения, владелец сразу видит несанкционированное событие в статусе и журнале аудита.
 4. **Защита от необоснованного занижения маршрута:**
    - Если агент ставит задачу в очередь с любым маршрутом, отличным от `feature` (кроме `research`), задача **принудительно переводится в режим `confirmation_mode = 'manual'`** (попытка передать `--mode auto` отклоняется п.2).
    - На маршрутах `fix` и `simple` режим `manual` активирует шлюз владельца `start → owner_gate → code`: сразу при старте плагин фиксирует договор `acceptance_sha` и переводит задачу в статус `waiting_approval` на узле `owner_gate`. Код не раздаётся и не пишется без явного одобрения владельцем.
-   - Попытка агента обойти шлюз владельца через маршруты `docs` или `fix` полностью блокируется: без одобрения человека конвейер не начнёт написание кода и не выполнит выкладку.
+   - Попытка агента обойти шлюз владельца через маршруты `docs` или `fix` пресекается кодом конвейера: при отсутствии одобрения человека конвейер не начинает написание кода и не выполняет выкладку.
 
 ## 30. Ревизия 34: роль и уровень `architect`
 
@@ -1336,7 +1353,7 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
    - Честная фиксация границы безопасности на узле `checks` (по аналогии с §23.3): запуск раннера (`npm test`, `pytest`, `cargo test`, `go test`) неизбежно исполняет код тестов и конфигурации из рабочего дерева (`package.json`, `conftest.py`, `build.rs`). Белый список раннеров отсекает произвольный шелл и скачивание внешних утилит (`curl|bash`, `npx`, `go run`). Для защиты хоста узел `checks`: (1) запускается в изолированной временной копии задачи (`wt/<KEY>`); (2) очищает переменные окружения от хостовых секретов (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `BB_API_KEY`); (3) ограничен жёстким тайм-аутом (`checks.timeout_seconds`, по умолч. 300 с / 5 мин) с завершением по `SIGKILL`.
    - Если проверки упали (`exit ≠ 0`): задача возвращается исполнителю в узел `code` с выводом ошибки без траты токенов ревьюера. Ревьюер подключается только к зелёному коду.
 4. **Закон трёх исходов каждого пункта:** «прошло», «упало», «не запускалось». «Не запускалось» не считается проходом («неизвестное — не ноль»). Пустой договор или все пункты «не запускалось» — проверка не пройдена.
-5. **Изменение договора:** изменение договора после завершения фазы `design` сбрасывает одобрение §29 и возвращает задачу на проектирование.
+5. **Неизменяемость договора агентами:** любая модификация или удаление файла `docs/specs/acceptance/<KEY>.md` писателем спеки или исполнителем кода строго запрещена кодом плагина и приводит к отказу захода (`spec-refused: acceptance-contract-modified` на спеке, `acceptance-contract-tampered` на коде) без смены узла, с инкрементом счётчика попыток этапа (при ≥ 3 → `blocked`). Изменить договор приёмки вправе исключительно владелец через возврат задачи на перепроектирование архитектору (`reject --target design` на узле `owner_gate` либо `resume --target design` из статуса `blocked`).
 6. **Замечания ревью:** замечания аудиторов вне рамок договора приёмки оформляются как неблокирующие предложения и не раздувают круги ревью.
 
 ## 32. Ревизия 34: порядок реализации (конспект agent-work-graphs)
@@ -1345,12 +1362,14 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 - **`off` (по умолчанию):** полная совместимость с r33. Очередь `task_queue` не ведётся, команды `delegate`, `merge`, `release` работают в классическом ручном режиме координатора.
 - **`shadow` (пассивный режим):** таблицы `task_queue` и `task_transitions` ведутся, команды очереди `enqueue`, `defer`, `reject`, `resume`, `approve` функционируют, сервис `run-queue` работает в режиме аудита/наблюдения. Прямые вызовы команд `delegate`, `merge`, `release` не блокируются, позволяя безопасно сравнивать поведение старого и нового конвейеров.
 - **`strict` (строгий режим графа задач):** закон «задачу ведёт код, а не агент». Любая задача проекта обязана управляться через граф:
-  1) Прямые вызовы команд `bb orchestrator delegate <KEY>`, `bb orchestrator merge <KEY>` и `bb orchestrator release <KEY>` вне сервиса `run-queue` **СТРОГО БЛОКИРУЮТСЯ**:
+  1) Прямые вызовы команд `bb orchestrator delegate <KEY>`, `bb orchestrator merge <KEY>` (включая `merge <delegationId>`, где проверяется задача раздачи) и `bb orchestrator release <KEY>` вне сервиса `run-queue` **СТРОГО БЛОКИРУЮТСЯ**:
      - если задача `<KEY>` отсутствует в `task_queue`: отказ `graph-required: задача <KEY> не зарегистрирована в очереди графа; поставь задачу через bb orchestrator enqueue <KEY>`;
-     - если задача `<KEY>` зарегистрирована в `task_queue` и не находится в статусе `done`: отказ `graph-managed: задача <KEY> управляется графом (текущее состояние: node=<node>, status=<status>). Прямой вызов запрещён; продвижение выполняется конвейером run-queue`.
+     - если задача `<KEY>` зарегистрирована в `task_queue` со статусом `done`: прямой вызов запрещён, отказ `graph-managed: задача <KEY> завершена (done); для повторной доработки выполни bb orchestrator enqueue <KEY>`;
+     - если задача `<KEY>` зарегистрирована в `task_queue` со статусом, отличным от `done`: отказ `graph-managed: задача <KEY> управляется графом (текущее состояние: node=<node>, status=<status>). Прямой вызов запрещён; продвижение выполняется конвейером run-queue`.
      (Исключение: локальные помощники координатора `orchestrator_helper` по §19.1 не требуют задачи в трекере и выполняются вне очереди).
-  2) Выкладка задачи (шаг 1 [orchestrator-release](orchestrator-release.md)) допускается исключительно при условии, что задача зарегистрирована в `task_queue` и её состояние строго равно `node = 'release', status = 'running'`.
-  3) Координатор освобождается от ручной диспетчеризации — задача продвигается детерминированным конвейером по машинным доказательствам.
+  2) Повторная постановка в очередь (`enqueue <KEY>` для существующего ключа): если задача с ключом `<KEY>` уже существует в `task_queue` со статусом `done`, повторный вызов `bb orchestrator enqueue <KEY>` атомарно обновляет существующую запись в SQLite (`status = 'queued'`, `node = 'start'`, сбрасываются в 0 все 7 счётчиков попыток, обновляются `created_at` и `updated_at`), позволяя корректно вести повторные доработки задачи через граф.
+  3) Выкладка задачи (шаг 1 [orchestrator-release](orchestrator-release.md)) допускается исключительно при условии, что задача зарегистрирована в `task_queue` и её состояние строго равно `node = 'release', status = 'running'`.
+  4) Координатор освобождается от ручной диспетчеризации — задача продвигается детерминированным конвейером по машинным доказательствам.
 
 Код реализуется срезами за флагом `workGraph`:
 
