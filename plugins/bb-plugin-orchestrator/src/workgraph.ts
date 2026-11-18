@@ -201,12 +201,24 @@ export async function checkAndPrepareTaskBranch(
 
   const ts = Date.now();
   if (localExists && localSha) {
-    await cmd.run(
+    const tagRes = await cmd.run(
       "git",
       ["tag", `refs/tags/archive/${normKey}-force-reset-${ts}`, `refs/heads/${branch}`],
       { cwd: repoRoot },
     );
-    await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+    if (tagRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось создать архивный тег для ветки ${branch}: ${tagRes.stderr}`,
+      );
+    }
+    const delRes = await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+    if (delRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось удалить локальную ветку ${branch}: ${delRes.stderr}`,
+      );
+    }
   }
 
   if (remoteExists && remoteSha) {
@@ -256,12 +268,24 @@ export async function archiveAndCleanupTaskBranch(
     { cwd: repoRoot },
   );
   if (localRes.exitCode === 0) {
-    await cmd.run(
+    const tagRes = await cmd.run(
       "git",
       ["tag", `refs/tags/archive/${normKey}-cancelled-${ts}`, `refs/heads/${branch}`],
       { cwd: repoRoot },
     );
-    await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+    if (tagRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось создать архивный тег для ветки ${branch}: ${tagRes.stderr}`,
+      );
+    }
+    const delRes = await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+    if (delRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось удалить локальную ветку ${branch}: ${delRes.stderr}`,
+      );
+    }
   }
 
   const lsRemote = await cmd.run(
@@ -441,15 +465,7 @@ export async function runEnqueue(
           if (existing.payload) existingPayload = JSON.parse(existing.payload);
         } catch {}
         existingPayload.acceptance_text = acceptanceText;
-        deps.store.updateTask(
-          taskKey,
-          {
-            payload: JSON.stringify(existingPayload),
-            status: "waiting_approval",
-          },
-          now,
-        );
-        deps.store.transitionTask(
+        const res = deps.store.transitionTask(
           {
             taskKey,
             expectedNode: "owner_gate",
@@ -458,11 +474,22 @@ export async function runEnqueue(
             toStatus: "waiting_approval",
             actor: "owner",
             reason: "update-acceptance",
+            updates: {
+              payload: JSON.stringify(existingPayload),
+              deferred_by: null,
+              deferred_reason: null,
+            },
             now,
           },
           now,
         );
-        return { ok: true, task: deps.store.getTask(taskKey)! };
+        if (!res.ok) {
+          throw new OrchestratorError(
+            "transition-failed",
+            "не удалось обновить договор приёмки",
+          );
+        }
+        return { ok: true, task: res.task! };
       }
 
       if (existing.route === "feature" && input.acceptance !== undefined) {
@@ -672,6 +699,12 @@ export async function runDefer(
   }
 
   const now = deps.now ? deps.now() : Date.now();
+  let existingPayload: Record<string, unknown> = {};
+  try {
+    if (task.payload) existingPayload = JSON.parse(task.payload);
+  } catch {}
+  existingPayload.previous_status = task.status;
+
   const res = deps.store.transitionTask(
     {
       taskKey: key,
@@ -685,6 +718,7 @@ export async function runDefer(
       updates: {
         deferred_by: "owner",
         deferred_reason: reason,
+        payload: JSON.stringify(existingPayload),
       },
     },
     now,
@@ -977,11 +1011,19 @@ export async function runResume(
       }
       tgt = target as TaskNode;
     } else {
-      if (task.node === "checks" || task.node === "review") tgt = "code";
-      else if (task.node === "spec_review") tgt = "spec";
-      else if (task.node === "design_check") tgt = "design";
+      if (task.node === "checks" || task.node === "review" || task.node === "code") tgt = "code";
+      else if (task.node === "spec_review" || task.node === "spec") tgt = "spec";
+      else if (task.node === "design_check" || task.node === "design") tgt = "design";
       else if (task.node === "release") tgt = "release";
-      else tgt = "code";
+      else tgt = (validTargetsByRoute[task.route]?.[0] as TaskNode) ?? "code";
+    }
+
+    const allowed = validTargetsByRoute[task.route] ?? [];
+    if (!allowed.includes(tgt)) {
+      throw new OrchestratorError(
+        "target-invalid",
+        `цель ${tgt} недопустима для маршрута ${task.route}`,
+      );
     }
 
     if (tgt === "release" && task.node !== "release") {
@@ -1037,7 +1079,28 @@ export async function runResume(
 
   if (task.status === "deferred") {
     assertOwnerOnly(deps.ctx);
-    const toStatus = task.node === "owner_gate" ? "waiting_approval" : "running";
+    let prevStatus = "";
+    try {
+      if (task.payload) {
+        const parsed = JSON.parse(task.payload);
+        if (typeof parsed.previous_status === "string") {
+          prevStatus = parsed.previous_status;
+        }
+      }
+    } catch {}
+    let toStatus: TaskStatus = "running";
+    if (
+      prevStatus === "queued" ||
+      prevStatus === "waiting_approval" ||
+      prevStatus === "waiting_release_note" ||
+      prevStatus === "pr_open"
+    ) {
+      toStatus = prevStatus as TaskStatus;
+    } else if (task.node === "owner_gate") {
+      toStatus = "waiting_approval";
+    } else if (task.node === "start") {
+      toStatus = "queued";
+    }
     const res = deps.store.transitionTask(
       {
         taskKey: key,

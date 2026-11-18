@@ -622,11 +622,60 @@ test("CLI defer and resume from deferred", async () => {
   assert.equal(JSON.parse(resDefer.stdout).task.status, "deferred");
   assert.equal(JSON.parse(resDefer.stdout).task.deferred_by, "owner");
 
-  // Resume from deferred
+  // Resume from deferred (queued on start)
   const resResume = await host.harness.runCli(["resume", "PLUG-207", "--json"]);
   assert.equal(resResume.exitCode, 0);
-  assert.equal(JSON.parse(resResume.stdout).task.status, "running");
+  assert.equal(JSON.parse(resResume.stdout).task.status, "queued");
+  assert.equal(JSON.parse(resResume.stdout).task.node, "start");
   assert.equal(JSON.parse(resResume.stdout).task.deferred_by, null);
+
+  // Advance to owner_gate and defer on fix route, then update acceptance via enqueue
+  await host.harness.runCli([
+    "enqueue",
+    "FIX-207",
+    "--route",
+    "fix",
+    "--acceptance",
+    "initial-contract",
+    "--json",
+  ]);
+  const db = (host.bb.storage as any).database();
+  const store = new DelegationStore(db);
+  store.transitionTask({
+    taskKey: "FIX-207",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "owner_gate",
+    toStatus: "deferred",
+    actor: "owner",
+    reason: "hold",
+    updates: {
+      deferred_by: "owner",
+      deferred_reason: "hold",
+    },
+  });
+
+  // Updating acceptance at owner_gate/deferred atomically transitions to waiting_approval
+  const resAccept = await host.harness.runCli([
+    "enqueue",
+    "FIX-207",
+    "--acceptance",
+    "updated-acceptance-contract",
+    "--json",
+  ]);
+  assert.equal(resAccept.exitCode, 0);
+  const acceptTask = JSON.parse(resAccept.stdout).task;
+  assert.equal(acceptTask.status, "waiting_approval");
+  assert.equal(acceptTask.node, "owner_gate");
+  assert.equal(acceptTask.deferred_by, null);
+  assert.equal(acceptTask.deferred_reason, null);
+
+  // Verify transition is logged in task_transitions
+  const trans = store.listTransitions("FIX-207");
+  const updateTrans = trans.find((t) => t.reason === "update-acceptance");
+  assert.ok(updateTrans, "update-acceptance transition must be recorded in task_transitions");
+  assert.equal(updateTrans.from_status, "deferred");
+  assert.equal(updateTrans.to_status, "waiting_approval");
 });
 
 test("CLI reject at owner_gate for feature and docs routes", async () => {
@@ -787,6 +836,31 @@ test("CLI resume from blocked resets counters according to target", async () => 
   assert.equal(data.task.status, "running");
   assert.equal(data.task.code_attempts, 0);
   assert.equal(data.task.check_attempts, 0);
+
+  // Resume without --target from spec/blocked on docs route -> targets spec (not code)
+  await host.harness.runCli(["enqueue", "DOCS-1", "--route", "docs", "--json"]);
+  store.transitionTask({
+    taskKey: "DOCS-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "spec",
+    toStatus: "blocked",
+    actor: "spec-runner",
+    reason: "3 failed spec rounds",
+    updates: {
+      spec_attempts: 3,
+    },
+  });
+  const resDocsResume = await host.harness.runCli([
+    "resume",
+    "DOCS-1",
+    "--json",
+  ]);
+  assert.equal(resDocsResume.exitCode, 0);
+  const docsData = JSON.parse(resDocsResume.stdout);
+  assert.equal(docsData.task.node, "spec");
+  assert.equal(docsData.task.status, "running");
+  assert.equal(docsData.task.spec_attempts, 0);
 });
 
 test("CLI run-queue --once reports queue statistics and dependencies", async () => {

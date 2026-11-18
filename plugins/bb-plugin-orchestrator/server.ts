@@ -1568,7 +1568,11 @@ export async function createPlugin(
     };
   };
 
-  const resolveWorktreeContext = async (threadId?: string) => {
+  const resolveWorktreeContext = async (
+    threadId?: string,
+    projectId?: string,
+    callCwd?: string,
+  ) => {
     if (threadId) {
       const env = await environmentOf(threadId).catch(() => null);
       if (env?.path) {
@@ -1578,14 +1582,51 @@ export async function createPlugin(
         };
       }
     }
-    const rev = await cmd
-      .run("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd() })
-      .catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
-    const repoRoot =
-      rev.exitCode === 0 && rev.stdout.trim() ? rev.stdout.trim() : process.cwd();
+    let repoRoot: string | null = null;
+    let mergeBaseBranch = "main";
+    if (projectId) {
+      try {
+        const projects = (await bb.sdk.projects.list().catch(() => [])) as BbProjectListItem[];
+        const localHost = String((await localHostId()) ?? "");
+        const projRepo = projectRepoPath(projects, projectId, localHost, localHost);
+        if (projRepo) {
+          repoRoot = projRepo;
+        }
+      } catch {}
+      if (releaseConfig.config) {
+        try {
+          const proj = resolveProject(releaseConfig.config, projectId);
+          if (proj?.target?.branch) {
+            mergeBaseBranch = proj.target.branch;
+          }
+        } catch {}
+      }
+    }
+    if (!repoRoot && callCwd) {
+      const rev = await cmd
+        .run("git", ["rev-parse", "--show-toplevel"], { cwd: callCwd })
+        .catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+      if (rev.exitCode === 0 && rev.stdout.trim()) {
+        repoRoot = rev.stdout.trim();
+      }
+    }
+    if (!repoRoot) {
+      const rev = await cmd
+        .run("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd() })
+        .catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+      if (rev.exitCode === 0 && rev.stdout.trim()) {
+        repoRoot = rev.stdout.trim();
+      }
+    }
+    if (!repoRoot) {
+      throw new OrchestratorError(
+        "no-repo",
+        `не найден репозиторий проекта ${projectId ?? ""}`,
+      );
+    }
     return {
       repoRoot,
-      mergeBaseBranch: "main",
+      mergeBaseBranch,
     };
   };
 
@@ -3433,7 +3474,11 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator enqueue <KEY> ...",
             );
           }
-          const wtCtx = await resolveWorktreeContext(ctx.threadId);
+          const wtCtx = await resolveWorktreeContext(
+            ctx.threadId,
+            ctx.projectId,
+            ctx.cwd,
+          );
           const res = await runEnqueue(
             {
               taskKey,
@@ -3480,7 +3525,11 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator dequeue <KEY> ...",
             );
           }
-          const wtCtx = await resolveWorktreeContext(ctx.threadId);
+          const wtCtx = await resolveWorktreeContext(
+            ctx.threadId,
+            ctx.projectId,
+            ctx.cwd,
+          );
           const res = await runDequeue(taskKey, flag("--reason"), {
             store,
             cmd: cmdRunner,
