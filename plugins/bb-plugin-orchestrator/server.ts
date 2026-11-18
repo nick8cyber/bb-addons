@@ -1602,17 +1602,10 @@ export async function createPlugin(
         } catch {}
       }
     }
-    if (!repoRoot && callCwd) {
+    const cwdToCheck = callCwd || process.cwd();
+    if (!repoRoot && cwdToCheck) {
       const rev = await cmd
-        .run("git", ["rev-parse", "--show-toplevel"], { cwd: callCwd })
-        .catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
-      if (rev.exitCode === 0 && rev.stdout.trim()) {
-        repoRoot = rev.stdout.trim();
-      }
-    }
-    if (!repoRoot) {
-      const rev = await cmd
-        .run("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd() })
+        .run("git", ["rev-parse", "--show-toplevel"], { cwd: cwdToCheck })
         .catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
       if (rev.exitCode === 0 && rev.stdout.trim()) {
         repoRoot = rev.stdout.trim();
@@ -3474,10 +3467,40 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator enqueue <KEY> ...",
             );
           }
+          if (getWorkGraphMode() === "off") {
+            throw new OrchestratorError(
+              "graph-disabled",
+              "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+            );
+          }
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
+          if (!isOwner && flag("--mode") !== undefined) {
+            throw new OrchestratorError(
+              "permission-denied",
+              "owner-only (--mode flag is restricted to owner)",
+            );
+          }
+          if (!isOwner && flag("--acceptance") !== undefined) {
+            throw new OrchestratorError("permission-denied", "owner-only");
+          }
           const wtCtx = await resolveWorktreeContext(
             ctx.threadId,
             ctx.projectId,
             ctx.cwd,
+          );
+          const hasChecks = Boolean(
+            (releaseConfig.config?.defaults?.checks &&
+              releaseConfig.config.defaults.checks.length > 0) ||
+              (ctx.projectId &&
+                releaseConfig.config &&
+                (() => {
+                  try {
+                    const p = resolveProject(releaseConfig.config, ctx.projectId);
+                    return Boolean(p?.checks && p.checks.length > 0);
+                  } catch {
+                    return false;
+                  }
+                })()),
           );
           const res = await runEnqueue(
             {
@@ -3503,10 +3526,7 @@ abandoned: ${res.reported
               repoRoot: wtCtx.repoRoot,
               mergeBaseBranch: wtCtx.mergeBaseBranch,
               now,
-              hasChecksCommands: Boolean(
-                releaseConfig.config?.defaults?.checks &&
-                  releaseConfig.config.defaults.checks.length > 0,
-              ),
+              hasChecksCommands: hasChecks,
             },
           );
           return json
@@ -3524,6 +3544,16 @@ abandoned: ${res.reported
               "invalid-arguments",
               "укажи ключ задачи: bb orchestrator dequeue <KEY> ...",
             );
+          }
+          if (getWorkGraphMode() === "off") {
+            throw new OrchestratorError(
+              "graph-disabled",
+              "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+            );
+          }
+          const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
+          if (!isOwner) {
+            throw new OrchestratorError("permission-denied", "owner-only");
           }
           const wtCtx = await resolveWorktreeContext(
             ctx.threadId,

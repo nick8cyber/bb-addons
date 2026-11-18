@@ -182,7 +182,13 @@ export async function checkAndPrepareTaskBranch(
 
   if (localMerged && remoteMerged) {
     if (localExists) {
-      await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+      const del = await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+      if (del.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось удалить локальную ветку ${branch}: ${del.stderr}`,
+        );
+      }
     }
     if (remoteExists) {
       await cmd
@@ -233,7 +239,7 @@ export async function checkAndPrepareTaskBranch(
       ).exitCode !== 0;
 
     if (remoteDiffers) {
-      await cmd.run(
+      const remTag = await cmd.run(
         "git",
         [
           "tag",
@@ -242,6 +248,12 @@ export async function checkAndPrepareTaskBranch(
         ],
         { cwd: repoRoot },
       );
+      if (remTag.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось создать архивный тег для удалённой ветки ${branch}: ${remTag.stderr}`,
+        );
+      }
     }
     await cmd
       .run("git", ["push", "origin", "--delete", branch], { cwd: repoRoot })
@@ -306,7 +318,7 @@ export async function archiveAndCleanupTaskBranch(
       (revRemote.exitCode === 0 ? revRemote.stdout.trim() : null) ||
       lsRemote.stdout.trim().split(/\s+/)[0];
     if (remoteSha) {
-      await cmd.run(
+      const remTag = await cmd.run(
         "git",
         [
           "tag",
@@ -315,6 +327,12 @@ export async function archiveAndCleanupTaskBranch(
         ],
         { cwd: repoRoot },
       );
+      if (remTag.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось создать архивный тег для удалённой ветки ${branch}: ${remTag.stderr}`,
+        );
+      }
       await cmd
         .run("git", ["push", "origin", "--delete", branch], { cwd: repoRoot })
         .catch(() => {});
@@ -400,6 +418,18 @@ export async function runEnqueue(
     );
   }
 
+  // Priority validation
+  let priority = 100;
+  if (input.priority !== undefined) {
+    if (typeof input.priority !== "number" || isNaN(input.priority)) {
+      throw new OrchestratorError(
+        "invalid-arguments",
+        `некорректный приоритет: ${input.priority} (должно быть число)`,
+      );
+    }
+    priority = input.priority;
+  }
+
   // Route & level validation (§27.2)
   let level = input.level as TaskLevel | undefined;
   if (!level) {
@@ -408,13 +438,45 @@ export async function runEnqueue(
     else level = "complex";
   }
 
+  const validLevels = [
+    "complex",
+    "medium",
+    "simple",
+    "spec",
+    "research",
+    "architect",
+  ];
+  if (!validLevels.includes(level)) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      `недопустимый уровень: ${input.level} (разрешены: ${validLevels.join(", ")})`,
+    );
+  }
+
   if (["feature", "fix", "simple"].includes(route)) {
-    if (level === "spec" || level === "architect") {
+    if (level === "spec" || level === "architect" || level === "research") {
       throw new OrchestratorError(
         "invalid-level",
         "узел code требует уровня с инструментами написания кода (роль executor)",
       );
     }
+  }
+
+  if (
+    route === "docs" &&
+    (level === "complex" || level === "architect" || level === "research")
+  ) {
+    throw new OrchestratorError(
+      "invalid-level",
+      `маршрут docs не поддерживает уровень ${level}`,
+    );
+  }
+
+  if (route === "research" && level !== "research") {
+    throw new OrchestratorError(
+      "invalid-level",
+      "маршрут research поддерживает только уровень research",
+    );
   }
 
   // Confirmation mode
@@ -465,6 +527,7 @@ export async function runEnqueue(
           if (existing.payload) existingPayload = JSON.parse(existing.payload);
         } catch {}
         existingPayload.acceptance_text = acceptanceText;
+        delete existingPayload.previous_status;
         const res = deps.store.transitionTask(
           {
             taskKey,
@@ -504,18 +567,18 @@ export async function runEnqueue(
         `задача ${taskKey} уже находится в очереди (текущее состояние: node=${existing.node}, status=${existing.status}); повторная постановка допустима только после завершения (status=done) либо отмены (status=cancelled)`,
       );
     }
-  } else {
-    // New task: acceptance missing check for fix/simple (§31)
-    if (
-      ["fix", "simple"].includes(route) &&
-      !acceptanceText &&
-      !deps.hasChecksCommands
-    ) {
-      throw new OrchestratorError(
-        "acceptance-missing",
-        "укажи --acceptance или настрой checks.commands проекта",
-      );
-    }
+  }
+
+  // §31: acceptance-missing check for fix/simple routes on both new and re-enqueued tasks
+  if (
+    ["fix", "simple"].includes(route) &&
+    !acceptanceText &&
+    !deps.hasChecksCommands
+  ) {
+    throw new OrchestratorError(
+      "acceptance-missing",
+      "укажи --acceptance или настрой checks.commands проекта",
+    );
   }
 
   // Branch calculation & git check
@@ -549,7 +612,6 @@ export async function runEnqueue(
     }
   }
 
-  const priority = input.priority !== undefined ? Number(input.priority) : 100;
   const dependsOn = input.dependsOn
     ? input.dependsOn.split(",").map((s) => s.trim()).filter(Boolean)
     : null;
@@ -655,6 +717,12 @@ export async function runDequeue(
     },
     now,
   );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось отменить задачу ${key}: конфликт CAS`,
+    );
+  }
 
   return { ok: true, task: res.task! };
 }
@@ -723,6 +791,12 @@ export async function runDefer(
     },
     now,
   );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось отложить задачу ${key}: конфликт CAS`,
+    );
+  }
 
   return { ok: true, task: res.task! };
 }
@@ -787,6 +861,12 @@ export async function runReject(
         },
         now,
       );
+      if (!res.ok) {
+        throw new OrchestratorError(
+          "transition-failed",
+          `не удалось отклонить задачу ${key}: конфликт CAS`,
+        );
+      }
       return { ok: true, task: res.task! };
     }
 
@@ -811,6 +891,12 @@ export async function runReject(
         },
         now,
       );
+      if (!res.ok) {
+        throw new OrchestratorError(
+          "transition-failed",
+          `не удалось отклонить задачу ${key}: конфликт CAS`,
+        );
+      }
       return { ok: true, task: res.task! };
     }
 
@@ -821,6 +907,12 @@ export async function runReject(
           "для маршрутов fix и simple цель --target не поддерживается",
         );
       }
+      let rejectPayload: Record<string, unknown> = {};
+      try {
+        if (task.payload) rejectPayload = JSON.parse(task.payload);
+      } catch {}
+      delete rejectPayload.previous_status;
+
       const res = deps.store.transitionTask(
         {
           taskKey: key,
@@ -834,10 +926,17 @@ export async function runReject(
           updates: {
             deferred_by: "owner",
             deferred_reason: reason ?? "rejected at owner_gate",
+            payload: JSON.stringify(rejectPayload),
           },
         },
         now,
       );
+      if (!res.ok) {
+        throw new OrchestratorError(
+          "transition-failed",
+          `не удалось отклонить задачу ${key}: конфликт CAS`,
+        );
+      }
       return { ok: true, task: res.task! };
     }
   }
@@ -868,6 +967,12 @@ export async function runReject(
       },
       now,
     );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось отклонить задачу ${key}: конфликт CAS`,
+      );
+    }
     return { ok: true, task: res.task! };
   }
 
@@ -1074,33 +1179,44 @@ export async function runResume(
       },
       now,
     );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось возобновить задачу ${key}: конфликт CAS`,
+      );
+    }
     return { ok: true, task: res.task! };
   }
 
   if (task.status === "deferred") {
     assertOwnerOnly(deps.ctx);
+    let parsedPayload: Record<string, unknown> = {};
     let prevStatus = "";
     try {
       if (task.payload) {
-        const parsed = JSON.parse(task.payload);
-        if (typeof parsed.previous_status === "string") {
-          prevStatus = parsed.previous_status;
+        parsedPayload = JSON.parse(task.payload);
+        if (typeof parsedPayload.previous_status === "string") {
+          prevStatus = parsedPayload.previous_status;
         }
       }
     } catch {}
+    delete parsedPayload.previous_status;
+
     let toStatus: TaskStatus = "running";
-    if (
-      prevStatus === "queued" ||
-      prevStatus === "waiting_approval" ||
-      prevStatus === "waiting_release_note" ||
-      prevStatus === "pr_open"
-    ) {
-      toStatus = prevStatus as TaskStatus;
+    if (task.node === "start") {
+      toStatus = "queued";
     } else if (task.node === "owner_gate") {
       toStatus = "waiting_approval";
-    } else if (task.node === "start") {
-      toStatus = "queued";
+    } else if (task.node === "release") {
+      if (prevStatus === "waiting_release_note" || prevStatus === "pr_open") {
+        toStatus = prevStatus as TaskStatus;
+      } else {
+        toStatus = "running";
+      }
+    } else {
+      toStatus = "running";
     }
+
     const res = deps.store.transitionTask(
       {
         taskKey: key,
@@ -1114,10 +1230,17 @@ export async function runResume(
         updates: {
           deferred_by: null,
           deferred_reason: null,
+          payload: JSON.stringify(parsedPayload),
         },
       },
       now,
     );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось возобновить задачу ${key}: конфликт CAS`,
+      );
+    }
     return { ok: true, task: res.task! };
   }
 
@@ -1176,6 +1299,12 @@ export async function runApprove(
     },
     now,
   );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось одобрить задачу ${key}: конфликт CAS`,
+    );
+  }
 
   return { ok: true, task: res.task! };
 }
@@ -1236,6 +1365,14 @@ export async function runReleaseNote(
     },
     now,
   );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось сохранить release note для задачи ${key}: конфликт CAS`,
+    );
+  }
+
+  return { ok: true, task: res.task! };
 
   return { ok: true, task: res.task! };
 }

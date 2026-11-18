@@ -449,6 +449,41 @@ test("CLI enqueue rejects code route with spec or architect level", async () => 
   assert.equal(res.exitCode, 1);
   const err = JSON.parse(res.stdout);
   assert.equal(err.error.code, "invalid-level");
+
+  // Invalid level string
+  const resBadLevel = await host.harness.runCli([
+    "enqueue",
+    "PLUG-201",
+    "--level",
+    "foo",
+    "--json",
+  ]);
+  assert.equal(resBadLevel.exitCode, 1);
+  assert.equal(JSON.parse(resBadLevel.stdout).error.code, "invalid-arguments");
+
+  // Invalid priority string
+  const resBadPri = await host.harness.runCli([
+    "enqueue",
+    "PLUG-201",
+    "--priority",
+    "abc",
+    "--json",
+  ]);
+  assert.equal(resBadPri.exitCode, 1);
+  assert.equal(JSON.parse(resBadPri.stdout).error.code, "invalid-arguments");
+
+  // docs route with complex level rejected
+  const resDocsComplex = await host.harness.runCli([
+    "enqueue",
+    "PLUG-201",
+    "--route",
+    "docs",
+    "--level",
+    "complex",
+    "--json",
+  ]);
+  assert.equal(resDocsComplex.exitCode, 1);
+  assert.equal(JSON.parse(resDocsComplex.stdout).error.code, "invalid-level");
 });
 
 test("CLI enqueue prevents double active enqueue", async () => {
@@ -599,6 +634,20 @@ test("CLI dequeue owner-only, cancels task and archives branch", async () => {
       c.args.some((a) => a.includes("refs/tags/archive/plug-206-cancelled-")),
   );
   assert.ok(cancelTag, "archive tag should be created on dequeue");
+
+  // Re-enqueue from cancelled on fix route without acceptance -> rejected!
+  const resReenqueueNoAcc = await host.harness.runCli([
+    "enqueue",
+    "PLUG-206",
+    "--route",
+    "fix",
+    "--json",
+  ]);
+  assert.equal(resReenqueueNoAcc.exitCode, 1);
+  assert.equal(
+    JSON.parse(resReenqueueNoAcc.stdout).error.code,
+    "acceptance-missing",
+  );
 });
 
 test("CLI defer and resume from deferred", async () => {
@@ -676,6 +725,43 @@ test("CLI defer and resume from deferred", async () => {
   assert.ok(updateTrans, "update-acceptance transition must be recorded in task_transitions");
   assert.equal(updateTrans.from_status, "deferred");
   assert.equal(updateTrans.to_status, "waiting_approval");
+
+  // Chain test: start/queued -> defer -> resume -> advance to owner_gate -> reject -> resume
+  // Must return to owner_gate/waiting_approval, NEVER owner_gate/queued!
+  await host.harness.runCli([
+    "enqueue",
+    "CHAIN-1",
+    "--route",
+    "fix",
+    "--acceptance",
+    "contract",
+    "--json",
+  ]);
+  await host.harness.runCli(["defer", "CHAIN-1", "--reason", "pause", "--json"]);
+  await host.harness.runCli(["resume", "CHAIN-1", "--json"]);
+  // Advance to owner_gate / waiting_approval
+  store.transitionTask({
+    taskKey: "CHAIN-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "owner_gate",
+    toStatus: "waiting_approval",
+    actor: "system",
+    reason: "entered_owner_gate",
+  });
+  // Reject at owner_gate -> moves to deferred
+  await host.harness.runCli(["reject", "CHAIN-1", "--reason", "needs-fix", "--json"]);
+  const chainDeferred = store.getTask("CHAIN-1")!;
+  assert.equal(chainDeferred.node, "owner_gate");
+  assert.equal(chainDeferred.status, "deferred");
+  // Resume from deferred at owner_gate must be waiting_approval, not queued!
+  const chainResumed = await host.harness.runCli(["resume", "CHAIN-1", "--json"]);
+  assert.equal(chainResumed.exitCode, 0);
+  const chainData = JSON.parse(chainResumed.stdout).task;
+  assert.equal(chainData.node, "owner_gate");
+  assert.equal(chainData.status, "waiting_approval");
+  const payloadParsed = chainData.payload ? JSON.parse(chainData.payload) : {};
+  assert.equal(payloadParsed.previous_status, undefined);
 });
 
 test("CLI reject at owner_gate for feature and docs routes", async () => {
