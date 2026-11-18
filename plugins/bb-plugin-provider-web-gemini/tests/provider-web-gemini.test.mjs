@@ -3054,6 +3054,7 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
   }
 
   function matchSingle(node, sel) {
+    sel = sel.replace(/\s+i(?=\])/g, "");
     if (sel.includes(" ")) {
       const subParts = sel.split(/\s+/);
       if (subParts.length >= 2) {
@@ -3269,6 +3270,99 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
   };
   const statusBusy = checkTurnStatus(docBusy, 0, "Run security audit");
   assert.equal(statusBusy.isBusyOrThinking, true, "aria-busy marks turn as busy");
+  assert.equal(
+    isTurnComplete(statusBusy, { stableMs: 10000 }),
+    false,
+    "aria-busy blocks completion even after 10s of textual stability"
+  );
+
+  // --- Scenario 6b: shimmer indicator via class substring (no stop button, 42-char text) ---
+  const shimmerNode = createMockElement({
+    tagName: "div",
+    attributes: { class: "skeleton-shimmer" },
+  });
+  const mcShimmer = createMockElement({
+    tagName: "message-content",
+    innerText: "Analyzing repository architecture and files", // 42 chars
+  });
+  const respShimmer = createMockElement({
+    id: "resp-shimmer",
+    tagName: "model-response",
+    children: [mcShimmer, shimmerNode],
+    preceding: ["query-shimmer"],
+  });
+  const queryShimmer = createMockElement({
+    id: "query-shimmer",
+    tagName: "user-query",
+    innerText: "Run security audit",
+    following: ["resp-shimmer"],
+  });
+  const docShimmer = {
+    querySelectorAll(sel) {
+      if (sel === "model-response") return [respShimmer];
+      if (sel === "user-query") return [queryShimmer];
+      return [];
+    },
+    querySelector() {
+      return null;
+    },
+  };
+  const statusShimmer = checkTurnStatus(docShimmer, 0, "Run security audit");
+  assert.equal(statusShimmer.targetFound, true, "Shimmer target must be found");
+  assert.equal(statusShimmer.hasStopButton, false, "Stop button is absent during shimmer");
+  assert.equal(statusShimmer.isBusyOrThinking, true, "shimmer class marks turn as busy");
+  assert.equal(statusShimmer.hasFinishedContent, true, "42-char thinking fragment is present");
+  assert.equal(
+    isTurnComplete(statusShimmer, { stableMs: 10000 }),
+    false,
+    "Turn must NOT complete while shimmer indicator is active"
+  );
+
+  // --- Scenario 6c: thinking-indicator element (no stop button, 42-char text) ---
+  const thinkingIndicatorNode = createMockElement({
+    tagName: "thinking-indicator",
+    attributes: { class: "thinking-indicator" },
+  });
+  const mcThinkingIndicator = createMockElement({
+    tagName: "message-content",
+    innerText: "Analyzing repository architecture and files", // 42 chars
+  });
+  const respThinkingIndicator = createMockElement({
+    id: "resp-thinking-indicator",
+    tagName: "model-response",
+    children: [mcThinkingIndicator, thinkingIndicatorNode],
+    preceding: ["query-thinking-indicator"],
+  });
+  const queryThinkingIndicator = createMockElement({
+    id: "query-thinking-indicator",
+    tagName: "user-query",
+    innerText: "Run security audit",
+    following: ["resp-thinking-indicator"],
+  });
+  const docThinkingIndicator = {
+    querySelectorAll(sel) {
+      if (sel === "model-response") return [respThinkingIndicator];
+      if (sel === "user-query") return [queryThinkingIndicator];
+      return [];
+    },
+    querySelector() {
+      return null;
+    },
+  };
+  const statusThinkingIndicator = checkTurnStatus(docThinkingIndicator, 0, "Run security audit");
+  assert.equal(statusThinkingIndicator.targetFound, true, "thinking-indicator target must be found");
+  assert.equal(statusThinkingIndicator.hasStopButton, false, "Stop button is absent during thinking-indicator");
+  assert.equal(
+    statusThinkingIndicator.isBusyOrThinking,
+    true,
+    "thinking-indicator element marks turn as busy"
+  );
+  assert.equal(statusThinkingIndicator.hasFinishedContent, true, "42-char thinking fragment is present");
+  assert.equal(
+    isTurnComplete(statusThinkingIndicator, { stableMs: 10000 }),
+    false,
+    "Turn must NOT complete while thinking-indicator is active"
+  );
 
   // --- Scenario 7: Full integration test with sendPrompt simulating thinking phase ---
   let evalStep = 0;
@@ -3346,5 +3440,100 @@ test("20. PLUG-304: turn completion predicate and thinking/pause guards", async 
     );
   } finally {
     _setDriverHooks(null);
+  }
+
+  // --- Scenario 8: stability threshold resets when answer text grows ---
+  // Fake clock makes waitForTimeout advance Date.now deterministically, so a
+  // stale stability window would finish the turn at the first text growth.
+  const realDateNow = Date.now;
+  let fakeNow = 1_000_000;
+  Date.now = () => fakeNow;
+  const growthTexts = [
+    "Seed",
+    "Seed",
+    "Seed",
+    "Seed and more",
+    "Seed and more",
+    "Seed and more still",
+    "Seed and more still and",
+    "Seed and more still and final",
+  ];
+  const finalGrowthText = growthTexts[growthTexts.length - 1];
+  const lastGrowthPoll = growthTexts.length - 1;
+  let growthPoll = 0;
+  let lastGrowthAt = null;
+  const growthChunks = [];
+  const growthPage = {
+    url: () => "https://gemini.google.com/app",
+    goto: async () => {},
+    waitForSelector: async () => ({ click: async () => {} }),
+    waitForTimeout: async () => {
+      fakeNow += 200;
+    },
+    keyboard: { press: async () => {}, insertText: async () => {} },
+    $: async () => null,
+    $$: async () => [],
+    evaluate: async (fn, arg) => {
+      if (typeof fn === "function" && fn.toString().includes("maxLength")) {
+        return null;
+      }
+      if (arg && arg.sel) {
+        return true;
+      }
+      if (arg && arg.fnSrc && !arg.checkSrc) {
+        return true;
+      }
+      if (arg && arg.checkSrc) {
+        const poll = growthPoll++;
+        const text = poll < growthTexts.length ? growthTexts[poll] : finalGrowthText;
+        if (poll === lastGrowthPoll) lastGrowthAt = fakeNow;
+        return {
+          targetFound: true,
+          hasStopButton: false,
+          isBusyOrThinking: false,
+          hasFinishedContent: true,
+          hasActionButtons: true,
+          currentText: { src: "mc", text },
+        };
+      }
+      return null;
+    },
+  };
+
+  _setDriverHooks({
+    ensureChrome: async () => {},
+    connectOverCDP: async () => ({ close: async () => {} }),
+    getGeminiPage: async () => growthPage,
+  });
+
+  try {
+    const res = await sendPrompt({
+      prompt: "Stability reset audit",
+      isNewChat: false,
+      onChunk: (c) => growthChunks.push(c),
+    });
+
+    assert.equal(
+      String(res),
+      finalGrowthText,
+      "Turn must not complete on a stale stability window while text is still growing"
+    );
+    assert.equal(
+      growthChunks.join(""),
+      finalGrowthText,
+      "Every growth segment must stream as a chunk in order"
+    );
+    assert.ok(lastGrowthAt !== null, "Last text growth must be observed");
+    assert.ok(
+      fakeNow - lastGrowthAt >= 500,
+      "Completion must wait the full 500ms stability window after the last growth"
+    );
+    assert.ok(
+      growthPoll >= lastGrowthPoll + 3,
+      "Driver must keep polling for at least 500ms after the last growth"
+    );
+  } finally {
+    _setDriverHooks(null);
+    Date.now = realDateNow;
   }
 });
