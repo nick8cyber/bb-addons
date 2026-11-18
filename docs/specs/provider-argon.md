@@ -344,7 +344,9 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
     - `carbon`: `['carbon', 'code & complex work', 'code and complex work', 'самые сложные задачи']`;
     - `hydrogen`: `['hydrogen', 'повседневные дела']`;
     - `pro`: `['pro', 'исследования']`;
-    - `flash-lite` / `lite` / `fast`: `['flash-lite', 'lite', 'быстрые ответы']`.
+    - `flash-lite` / `lite`: `['flash-lite', 'lite', 'быстрые ответы']`;
+    - `flash`: `['flash']`;
+    - `fast`: `['flash-lite', 'lite', 'быстрые ответы', 'flash']`.
 - Префикс «4 » («4 Neon», «4 Carbon», «4 Hydrogen») поддерживается за счёт разбиения текста пунктов на строки и поиска подстрок (`includes` / `wordMatch`).
 - Детектирование Ultra-lock: пункты с `data-mode-id`, начинающимся на `upsell_` (например, `upsell_MODE_CATEGORY_ULTRA` для заблокированной модели Carbon), распознаются функцией `menuItemHasLockIcon` как заблокированные до совершения клика, предотвращая показ диалога апгрейда плана и инициируя прозрачную ротацию на подходящий аккаунт.
 - Fallback-поиск кнопки пикера `getPickerButton`: регулярное выражение включает `neon` и `deeper analysis`.

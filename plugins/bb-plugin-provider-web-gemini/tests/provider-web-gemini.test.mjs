@@ -2280,6 +2280,29 @@ test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
     false,
     "data-mode-id without upsell prefix must not be locked"
   );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "mode_no_upsell" : null),
+    }),
+    false,
+    "data-mode-id containing 'upsell' as substring must not be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: (n) => (n === "data-mode-id" ? "upselling_tier" : null),
+    }),
+    false,
+    "data-mode-id with 'upsell' not followed by underscore must not be locked"
+  );
+  assert.equal(
+    menuItemHasLockIcon({
+      getAttribute: () => null,
+      querySelector: () => ({ getAttribute: () => "upsell_MODE_CATEGORY_ULTRA" }),
+      closest: () => ({ getAttribute: () => "upsell_MODE_CATEGORY_ULTRA" }),
+    }),
+    false,
+    "descendant or ancestor data-mode-id must not lock the item (only own attribute)"
+  );
 
   // --- upsell dialog predicate: lock only with an explicit plan-change CTA ---
   const btn = (text, onClick) => ({ innerText: text, click: onClick || (() => {}) });
