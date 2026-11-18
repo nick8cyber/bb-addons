@@ -381,18 +381,21 @@ function completeShimLaunchEnv(message: Record<string, unknown>): void {
     // §6 п.2 (provider-agy-installs): the defensive fill answers the
     // binary the thread's account is bound to — for a known account with
     // an unavailable install that is "" (an honest launch failure), never
-    // a silent default substitution.
-    const realBin =
-      session === undefined || dataDir === ""
-        ? resolveAgyCommand(process.env)
-        : (() => {
-            const r = sessionInstall(session);
-            return r.kind === "bin"
-              ? r.bin
-              : r.kind === "legacy"
-                ? resolveAgyCommand(process.env)
-                : "";
-          })();
+    // a silent default substitution. An unknown thread resolves through
+    // the registry default, not the implicit binary.
+    const realBin = (() => {
+      const r =
+        dataDir === ""
+          ? ({ kind: "legacy" } as InstallResolution)
+          : session === undefined
+            ? resolveInstall(dataDir, undefined)
+            : sessionInstall(session);
+      return r.kind === "bin"
+        ? r.bin
+        : r.kind === "legacy"
+          ? resolveAgyCommand(process.env)
+          : "";
+    })();
     const fill: Record<string, string> = {
       AGY_SHIM_REAL_BIN: realBin,
       AGY_SHIM_EVENTS: dataDir !== "" ? eventsFilePath() : "",

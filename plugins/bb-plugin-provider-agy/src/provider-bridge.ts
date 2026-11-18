@@ -3055,12 +3055,14 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
     // The catalog is account-independent enough; whichever home the pool or
     // the relay offers first reads it, so a pooled host lists what its own
     // accounts can actually serve.
-    let bin: string | null = resolveAgyCommand(process.env);
+    let bin: string | null = null;
     let blockReason: string | null = null;
     // §5 п.2: a resolution that cannot run is answered honestly — the
     // implicit resolveAgyCommand binary is never a substitute for a bound
     // install, and a pool pick with no usable account still probes through
-    // the default install rather than the implicit binary.
+    // the default install rather than the implicit binary. The implicit
+    // resolution runs lazily, only on the legacy branch: a broken AGY_PATH
+    // must not kill the listing before the registry is even consulted.
     const applyResolution = (
       resolution: ReturnType<typeof resolveInstall>,
     ): void => {
@@ -3076,8 +3078,11 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
         for (const [key, value] of Object.entries(resolution.env)) {
           env[key] = value;
         }
-        bin = resolution.bin;
       }
+      bin =
+        resolution.kind === "bin"
+          ? resolution.bin
+          : resolveAgyCommand(process.env);
     };
     if (cliproxyRelayDataDir !== null && accountsEnabled(process.env)) {
       const ledger = loadLedger(cliproxyRelayDataDir);
@@ -3107,6 +3112,8 @@ function listAgyModels(): Promise<{ id: string; displayName: string }[]> {
       }
     } else if (cliproxyRelayDataDir !== null) {
       applyResolution(resolveInstall(cliproxyRelayDataDir, undefined));
+    } else {
+      bin = resolveAgyCommand(process.env);
     }
     if (bin === null) {
       log(`models list skipped: ${blockReason ?? "install unavailable"}`);
