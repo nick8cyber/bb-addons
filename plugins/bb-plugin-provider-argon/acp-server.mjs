@@ -7,7 +7,7 @@
  */
 import { createInterface } from "node:readline";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import * as webTools from "./src/web-tools.mjs";
@@ -1206,7 +1206,6 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   // в session/prompt через collectUploadFiles) + собранные файлы Gemini.
   const uploadFiles = Array.isArray(attachments.uploadFiles) ? attachments.uploadFiles.slice() : [];
   const turnFiles = [];
-  const turnSkipped = [];
   const seenFilePaths = new Set();
   const emitGenerated = (res) => {
     for (const f of (res && res.files) || []) {
@@ -1217,14 +1216,13 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         sessionUpdate: "agent_message_chunk",
         content: {
           type: "resource_link",
-          uri: `file://${encodeURI(f.path)}`,
+          uri: pathToFileURL(f.path).href,
           name: f.name || basename(f.path),
           ...(f.mimeType ? { mimeType: f.mimeType } : {}),
         },
       });
     }
     for (const sk of (res && res.skippedDownloads) || []) {
-      turnSkipped.push(sk);
       upd({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: `\n\n[Файл Gemini пропущен: ${sk.name} — ${sk.reason}]` },
@@ -1454,7 +1452,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             // человеку сводка со ссылками file://.
             if (turnFiles.length) {
               const links = turnFiles
-                .map((f) => `[${f.name || basename(f.path)}](file://${encodeURI(f.path)})`)
+                .map((f) => `[${f.name || basename(f.path)}](${pathToFileURL(f.path).href})`)
                 .join(" · ");
               upd({
                 sessionUpdate: "agent_message_chunk",
@@ -1586,7 +1584,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             ? {
                 attachments: turnFiles.map((f) => ({
                   type: "resource_link",
-                  uri: `file://${encodeURI(f.path)}`,
+                  uri: pathToFileURL(f.path).href,
                   name: f.name || basename(f.path),
                   ...(f.mimeType ? { mimeType: f.mimeType } : {}),
                 })),

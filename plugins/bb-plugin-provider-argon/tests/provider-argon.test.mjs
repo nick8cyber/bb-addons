@@ -47,6 +47,7 @@ const {
   collectGeneratedFiles,
   sanitizeDownloadName,
   isAllowedDownloadHost,
+  downloadUrlHost,
 } = driver;
 const { withUsageLock, KNOWN_CANDIDATE_RPCIDS } = usageLimitsModule;
 
@@ -2649,6 +2650,11 @@ test("19. PLUG-291: uploads/downloads — collectUploadFiles, pruneDir, spill ho
   const sanitized = sanitizeDownloadName('..\\evil/../../x.txt');
   assert.ok(!sanitized.includes("..") && !sanitized.includes("/") && !sanitized.includes("\\"));
   assert.equal(sanitizeDownloadName(""), "file");
+  // '#' в имени ломал file:// URI в BB — sanitize вырезает (ревью PLUG-291).
+  assert.ok(!sanitizeDownloadName("C# notes.md").includes("#"));
+  assert.equal(downloadUrlHost("https://storage.googleapis.com/x/f.bin"), "storage.googleapis.com");
+  assert.equal(downloadUrlHost("blob:https://gemini.google.com/uuid-1"), "gemini.google.com");
+  assert.equal(downloadUrlHost("data:text/plain,hi"), null);
   assert.equal(isAllowedDownloadHost("gemini.google.com"), true);
   assert.equal(isAllowedDownloadHost("storage.googleapis.com"), true);
   assert.equal(isAllowedDownloadHost("googleusercontent.com"), true);

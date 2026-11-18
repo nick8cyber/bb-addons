@@ -1642,7 +1642,7 @@ const numEnv = (name, dflt) => {
 
 function sanitizeDownloadName(name) {
   const s = String(name ?? '')
-    .replace(/[\\/<>:"|?*\x00-\x1f]/g, '_')
+    .replace(/[\\/<>:"|?*#\x00-\x1f]/g, '_')
     .replace(/\.\./g, '_')
     .trim();
   return (s || 'file').slice(0, 120);
@@ -1660,6 +1660,18 @@ function isAllowedDownloadHost(h) {
     x === 'googleapis.com' ||
     x.endsWith('.googleapis.com')
   );
+}
+
+// Хост URL скачивания; blob:<origin>/… — хост внутри пути.
+// null — хост определить не удалось (data:, нестандартная схема).
+function downloadUrlHost(u) {
+  try {
+    const x = new URL(u);
+    if (x.protocol === 'blob:') return new URL(x.pathname).hostname || null;
+    return x.hostname || null;
+  } catch {
+    return null;
+  }
 }
 
 const MIME_BY_EXT = {
@@ -1827,6 +1839,18 @@ async function collectGeneratedFiles(page, opts = {}) {
         page.waitForEvent('download', { timeout: 10000 }),
         el.click({ timeout: 5000 }),
       ]);
+      // У click-кандидатов href в DOM не было — хост download-события
+      // сверяем с белым списком здесь (ревью PLUG-291). Хост не
+      // определён (data:, blob без origin) — пропускаем проверку.
+      let dlHost = null;
+      try {
+        const u = dl.url && dl.url();
+        dlHost = u ? downloadUrlHost(u) : null;
+      } catch {}
+      if (dlHost && !isAllowedDownloadHost(dlHost)) {
+        skipNote(fallbackName || c.name || 'download', `host not allowed (${dlHost})`);
+        return;
+      }
       const name = sanitizeDownloadName(
         (dl.suggestedFilename && dl.suggestedFilename()) || fallbackName || c.name || 'file'
       );
@@ -2090,6 +2114,7 @@ module.exports = {
   collectGeneratedFiles,
   sanitizeDownloadName,
   isAllowedDownloadHost,
+  downloadUrlHost,
   downloadGeneratedMedia,
   listConversations,
   listConversationsInternal,
