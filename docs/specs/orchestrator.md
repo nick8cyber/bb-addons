@@ -339,7 +339,7 @@ SQLite плагина, миграции только добавлением.
 
 `coordinator_watchdog_state` (r33.11, §5.6): `coordinator_thread_id` (первичный ключ), `idle_since` (мс начала простоя), `nudge_count` (число отправленных напоминаний 0..3), `last_nudge_at` (мс последнего напоминания), `escalated_at` (мс эскалации владельцу), `updated_at`.
 
-`task_queue` и `task_transitions` (r34, §27.1): очередь задач графа (узел, статус, приоритет, зависимости, режим подтверждения, `spec_sha`, `acceptance_sha`, `result_sha`, `release_note`, `payload`, 6 изолированных счётчиков: `spec_attempts`, `spec_review_rounds`, `code_attempts`, `check_attempts`, `code_review_rounds`, `design_check_rounds`, отметки «отложено владельцем») и неизменяемый журнал смен узлов (`task_key`, `from_node`, `to_node`, `from_status`, `to_status`, `actor`, `reason`, `payload`, `created_at`).
+`task_queue` и `task_transitions` (r34, §27.1): очередь задач графа (узел, статус, приоритет, зависимости, режим подтверждения, `spec_sha`, `acceptance_sha`, `result_sha`, `release_note`, `payload`, 7 изолированных счётчиков: `spec_attempts`, `spec_review_rounds`, `code_attempts`, `check_attempts`, `code_review_rounds`, `design_check_rounds`, `release_attempts`, отметки «отложено владельцем») и неизменяемый журнал смен узлов (`task_key`, `from_node`, `to_node`, `from_status`, `to_status`, `actor`, `reason`, `payload`, `created_at`).
 
 Сверка — при старте сервиса и каждые 60 с: для каждого `running` перечитать тред и события после `last_seq`, применить §5; повторить незавершённые шаги §4.4–4.6. Тред не найден, удалён или в архиве → `cancelled`, повторы прекращаются.
 
@@ -1096,6 +1096,7 @@ CREATE TABLE IF NOT EXISTS task_queue (
   check_attempts INTEGER NOT NULL DEFAULT 0,
   code_review_rounds INTEGER NOT NULL DEFAULT 0,
   design_check_rounds INTEGER NOT NULL DEFAULT 0,
+  release_attempts INTEGER NOT NULL DEFAULT 0,
   entered_at INTEGER NOT NULL,
   deadline_at INTEGER DEFAULT NULL,
   node_alarm_at INTEGER DEFAULT NULL,
@@ -1168,6 +1169,12 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 
 ### 28.1 Полная матрица переходов «Маршрут × Узел × Событие → Следующий Узел / Новый Статус»
 
+**Вершина выкладки и синхронизация функциональной ветки перед выкладкой:**
+Перед запуском шага 1 выкладки (`node = 'release'`) сервис `run-queue` выполняет fast-forward обновление функциональной ветки `bb/<KEY>-...` до проверенной вершины конвейера через `git update-ref refs/heads/bb/<KEY>-... <sha>`:
+- Для маршрутов с кодом (`feature`, `fix`, `simple`): публикуемой вершиной является `result_sha` (содержит коммит договора `acceptance_sha` и коммит спеки `spec_sha` в своей истории git по правилам вершины §17.3);
+- Для маршрута `docs`: публикуемой вершиной является `spec_sha` (договор `acceptance_sha = NULL`);
+Выкладка выполняется от ветки `bb/<KEY>-...` с `head_sha = <sha>`, гарантируя попадание и неизменяемого договора приёмки, и утверждённой спецификации, и проверенного кода в удалённую цель (`origin/<target>`) либо Pull Request.
+
 | Маршрут | Текущий узел (`node`) | Исполнитель / Механизм | Событие / Исход | Следующий узел (`node`) | Новый статус (`status`) | Доказательство / Действие |
 |---|---|---|---|---|---|---|
 | `feature` | `start` | `run-queue` | Задача взята в работу из очереди | `design` | `running` | Создание ветки `bb/<KEY>-...` от `origin/<mergeBaseBranch>` |
@@ -1223,10 +1230,12 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 | `*` | `release` | Конвейер release | Отказ `release-refused: uncommitted-kb` | `release` | `stalled` | Ожидание очистки KB координатором |
 | `*` | `release` | Конвейер release | Отказ `release-refused: unmerged-ui` | `release` | `stalled` | Ожидание слияния зависимости или `--force-drop-unmerged` |
 | `*` | `release` | Конвейер release | Пустая заметка при `requireNote: true` | `release` | `waiting_release_note` | Ожидание заметки релиза от координатора/владельца |
-| `feature`, `fix`, `simple` | `release` | Конвейер release | Отказ `no-code`, `conflict`, сбой шагов 3/4, аудит-код `REJECT` | `code` | `running` | Возврат в `code` с текстом отказа выкладки |
-| `docs` | `release` | Конвейер release | Отказ шага 5 аудит-спека `REJECT` или сбой выкладки docs | `spec` | `running` | Возврат в `spec` с текстом находок аудита |
+| `feature`, `fix`, `simple` | `release` | Конвейер release | Отказ `no-code`, `conflict`, сбой шагов 3/4, аудит-код `REJECT`, попыток < 3 | `code` | `running` | Инкремент `release_attempts`, возврат в `code` с текстом отказа выкладки |
+| `feature`, `fix`, `simple` | `release` | Конвейер release | Отказ выкладки, попыток ≥ 3 | `release` | `blocked` | Потолок попыток выкладки (урок 6): эскалация владельцу со сводкой в `payload` |
+| `docs` | `release` | Конвейер release | Отказ шага 5 аудит-спека `REJECT` или сбой выкладки docs, попыток < 3 | `spec` | `running` | Инкремент `release_attempts`, возврат в `spec` с текстом находок аудита |
+| `docs` | `release` | Конвейер release | Отказ выкладки docs, попыток ≥ 3 | `release` | `blocked` | Потолок попыток выкладки docs: эскалация владельцу со сводкой в `payload` |
 | `*` | `release` | Конвейер release | Сбой выполнения скрипта выкладки | `release` | `stalled` | Оповещение координатора об ошибке выкладки |
-| `*` | `release` | Координатор / Владелец | Передана заметка: `bb orchestrator release-note <KEY> "..."` | `release` | `running` | Перезапуск шага 1 выкладки с указанной заметкой |
+| `*` | `release` | Координатор / Владелец | Передана заметка: `bb orchestrator release-note <KEY> "..."` строго при статусе `waiting_release_note` | `release` | `running` | Перезапуск шага 1 выкладки с указанной заметкой. При любом ином статусе задачи команда отклоняется с ошибкой `invalid-status: task is not waiting for release note (current: node=<node>, status=<status>)` |
 | `*` | `[любой узел]` | Координатор / Владелец | `resume <KEY>` при статусе `stalled` (или автоустранение причины: очистка KB, слияние UI) | Текущий узел (`node`) | `running` | Снятие состояния зависания, повторный запуск этапа узла. Счётчики раундов blocked не сбрасываются |
 | `*` | `[любой узел]` | Только Владелец (человек, без `BB_THREAD_ID`) | `resume <KEY> [--target spec|design|code]` при статусе `blocked` | Допустимый узел маршрута | `running` | Сброс счётчиков раундов заблокированного узла. Цель по умолчанию — заблокированный узел (для checks/review — `code`, для spec_review — `spec`, для design_check — `design`). Допустимые цели строго по маршруту: feature — `code`, `spec`, `design`; fix/simple — строго `code`; docs — строго `spec`. Попытка указать узел вне маршрута отклоняется `target-invalid`. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
 | `*` | `[любой узел]` | Только Владелец (человек, без `BB_THREAD_ID`) | `resume <KEY>` при статусе `deferred` | Текущий узел (`node`) | `running` / `waiting_approval` | Возобновление работы владельцем. При наличии `BB_THREAD_ID` отказ `permission-denied: owner-only` |
@@ -1266,20 +1275,19 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
    3) Умолчание по маршруту: маршруты со спекой (`feature`) по умолчанию `manual`; облегчённые маршруты без спеки (`fix`, `docs`, `simple`, `research`) по умолчанию `auto` (при постановке человеком).
 3. **Единое строгое правило «только владелец» (согласованно с §23 п.3):**
    - Любой вызов команд управления очередью, требующих человеческого решения:
-     - `bb orchestrator approve <KEY>`
-     - `bb orchestrator defer <KEY>`
+     - `bb orchestrator approve <KEY> [--comment <текст>]`
+     - `bb orchestrator defer <KEY> --reason <причина>`
      - `bb orchestrator resume <KEY>` (при статусе `blocked` или `deferred`)
      - `bb orchestrator reject <KEY>` (на узле `owner_gate`)
      - передача флага `--mode` в `bb orchestrator enqueue`
      выполненный при наличии переменной окружения `BB_THREAD_ID` (независимо от объявленной роли в треде: `orchestrator`, `helper`, `executor`, `auditor`, `researcher`, `architect`, `release-auditor` или при отсутствии роли), **СТРОГО ОТКЛОНЯЕТСЯ** кодом плагина с ошибкой `permission-denied: owner-only`.
    - Честная фиксация границы SDK и локальной платформы (по аналогии с §23.3):
-     1) В SDK вызовы RPC имеют только категорию `{kind: 'client'}` или `{kind: 'plugin'}`, что не позволяет ядру плагина гарантированно отличать RPC-вызов браузерного интерфейса владельца от программного RPC-вызова агента.
-     2) Поэтому безопасность строится на многоуровневой защите:
-        - Инструменты одобрения и откладывания исключены из схемы инструментов агентов (`tools: []` для всех ролей);
-        - Проверка окружения CLI: отказ при наличии `BB_THREAD_ID`;
-        - Одноразовый токен подтверждения (`approval_token`): при входе в `owner_gate` плагин генерирует криптографически стойкий эфемерный токен, который передаётся только в форму уведомления владельца. Подтверждение через CLI (`bb orchestrator approve <KEY> --token <TOKEN>`) или RPC окна задач требует совпадения этого токена;
-        - Карточка взаимодействия (`PluginInteractionRequest`) используется исключительно как форма уведомления владельца. Любые программные ответы на карточку, полученные плагином от агентских тредов через `bb thread interactions respond`, полностью игнорируются плагином (статус задачи не меняется, факт попытки логируется как предупреждение);
-        - Сквозной неизменяемый журнал: каждое одобрение фиксируется в `task_transitions` с немедленным push-оповещением владельцу в чат. В локальной однопользовательской ОС субпроцессы, очищающие переменные окружения (`env -u BB_THREAD_ID`), не могут быть криптографически изолированы демоном, но любое действие фиксируется в журнале и открыто владельцу.
+     В локальной однопользовательской ОС субпроцессы пользователя работают с одинаковым UID; в SDK плагинов входящие RPC имеют категорию `{kind: 'client'}`, охватывающую и браузерный UI, и CLI `bb`, и агентские треды.
+     Поэтому команда `approve` защищена тем же проверенным контуром, что и `settings approve|reject` (§23.3), `defer` и `resume`:
+     1) Инструменты `orchestrator_approve`, `orchestrator_defer` и `orchestrator_resume` полностью исключены из схем инструментов агентов (`tools: []` для всех ролей);
+     2) Проверка контекста процессов: отказ при наличии `BB_THREAD_ID` в переменных окружения;
+     3) Карточка уведомления (`PluginInteractionRequest`) используется исключительно как форма отображения для владельца; любые ответы на неё от агентских тредов через `bb thread interactions respond` игнорируются плагином (статус задачи не меняется);
+     4) Сквозной неизменяемый аудит: каждое решение фиксируется в `task_transitions` и немедленно отправляет push-оповещение владельцу в чат. Любая попытка несанкционированного вызова видна владельцу в статусе.
 4. **Защита от необоснованного занижения маршрута:**
    - Если агент ставит задачу в очередь с любым маршрутом, отличным от `feature` (кроме `research`), задача **принудительно переводится в режим `confirmation_mode = 'manual'`** (попытка передать `--mode auto` отклоняется п.2).
    - На маршрутах `fix` и `simple` режим `manual` активирует шлюз владельца `start → owner_gate → code`: сразу при старте плагин фиксирует договор `acceptance_sha` и переводит задачу в статус `waiting_approval` на узле `owner_gate`. Код не раздаётся и не пишется без явного одобрения владельцем.
@@ -1336,9 +1344,12 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_ke
 Сначала журнал и очередь в базе, затем репетиция пути с подставными агентами, и только затем живые прогоны. Управление графом регулируется настройкой проекта `orchestrator.workGraph`:
 - **`off` (по умолчанию):** полная совместимость с r33. Очередь `task_queue` не ведётся, команды `delegate`, `merge`, `release` работают в классическом ручном режиме координатора.
 - **`shadow` (пассивный режим):** таблицы `task_queue` и `task_transitions` ведутся, команды очереди `enqueue`, `defer`, `reject`, `resume`, `approve` функционируют, сервис `run-queue` работает в режиме аудита/наблюдения. Прямые вызовы команд `delegate`, `merge`, `release` не блокируются, позволяя безопасно сравнивать поведение старого и нового конвейеров.
-- **`strict` (строгий режим графа задач):** закон «задачу ведёт код, а не агент». Если задача зарегистрирована в `task_queue` со статусом, отличным от `done`:
-  1) Прямые вызовы команд `bb orchestrator delegate <KEY>`, `bb orchestrator merge <KEY>` и `bb orchestrator release <KEY>` вне сервиса `run-queue` **СТРОГО БЛОКИРУЮТСЯ** с ошибкой `graph-managed: задача <KEY> управляется графом (текущее состояние: node=<node>, status=<status>). Прямой вызов запрещён; продвижение выполняется конвейером run-queue`.
-  2) Выкладка задачи (шаг 1 [orchestrator-release](orchestrator-release.md)) допускается исключительно при состоянии `node = 'release', status = 'running'`.
+- **`strict` (строгий режим графа задач):** закон «задачу ведёт код, а не агент». Любая задача проекта обязана управляться через граф:
+  1) Прямые вызовы команд `bb orchestrator delegate <KEY>`, `bb orchestrator merge <KEY>` и `bb orchestrator release <KEY>` вне сервиса `run-queue` **СТРОГО БЛОКИРУЮТСЯ**:
+     - если задача `<KEY>` отсутствует в `task_queue`: отказ `graph-required: задача <KEY> не зарегистрирована в очереди графа; поставь задачу через bb orchestrator enqueue <KEY>`;
+     - если задача `<KEY>` зарегистрирована в `task_queue` и не находится в статусе `done`: отказ `graph-managed: задача <KEY> управляется графом (текущее состояние: node=<node>, status=<status>). Прямой вызов запрещён; продвижение выполняется конвейером run-queue`.
+     (Исключение: локальные помощники координатора `orchestrator_helper` по §19.1 не требуют задачи в трекере и выполняются вне очереди).
+  2) Выкладка задачи (шаг 1 [orchestrator-release](orchestrator-release.md)) допускается исключительно при условии, что задача зарегистрирована в `task_queue` и её состояние строго равно `node = 'release', status = 'running'`.
   3) Координатор освобождается от ручной диспетчеризации — задача продвигается детерминированным конвейером по машинным доказательствам.
 
 Код реализуется срезами за флагом `workGraph`:

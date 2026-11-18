@@ -14,7 +14,7 @@ date: 2026-11-18
 
 ## Решения (ревизия 34, спека §27–§32)
 
-1. **Узел задачи — запись в базе, а не текст хендоффа.** Таблица `task_queue` (очередь: `task_key`, `project_id`, `coordinator_thread_id`, `route`, `level`, `node`, `status`, `priority`, `depends_on`, `confirmation_mode`, `interaction_id`, `spec_sha`, `acceptance_sha`, `result_sha`, `release_note`, `payload`, 6 изолированных счётчиков: `spec_attempts`, `spec_review_rounds`, `code_attempts`, `check_attempts`, `code_review_rounds`, `design_check_rounds`, `entered_at`, `deadline_at`, `node_alarm_at`, `deferred_by`, `deferred_reason`) и неизменяемый журнал `task_transitions` (`task_key`, `from_node`, `to_node`, `from_status`, `to_status`, `actor`, `reason`, `payload`, `created_at`). Единая модель: узел — рабочий этап (`node`), операционное состояние — статус (`status`). Отложить пункт очереди можно только явным решением владельца.
+1. **Узел задачи — запись в базе, а не текст хендоффа.** Таблица `task_queue` (очередь: `task_key`, `project_id`, `coordinator_thread_id`, `route`, `level`, `node`, `status`, `priority`, `depends_on`, `confirmation_mode`, `interaction_id`, `spec_sha`, `acceptance_sha`, `result_sha`, `release_note`, `payload`, 7 изолированных счётчиков: `spec_attempts`, `spec_review_rounds`, `code_attempts`, `check_attempts`, `code_review_rounds`, `design_check_rounds`, `release_attempts`, `entered_at`, `deadline_at`, `node_alarm_at`, `deferred_by`, `deferred_reason`) и неизменяемый журнал `task_transitions` (`task_key`, `from_node`, `to_node`, `from_status`, `to_status`, `actor`, `reason`, `payload`, `created_at`). Единая модель: узел — рабочий этап (`node`), операционное состояние — статус (`status`). Отложить пункт очереди можно только явным решением владельца.
 2. **Детерминированный граф задачи:**
    `start → design → spec → spec_review → [owner_gate] → code → checks → review → design_check → release → done`.
    Переход делает только код и только по доказательству: коммит, вердикт ревью, машинные тесты, решение владельца, итог выкладки, таймаут будильника. Маршруты:
@@ -31,7 +31,7 @@ date: 2026-11-18
 5. **Режимы одобрения (`approvalMode`):**
    - `auto`: полная автономность по цепочке;
    - `manual` (режим «сам»): обязательный шлюз владельца (`owner_gate`) перед реализацией кода (на `feature`, `fix`, `simple`) или перед выкладкой (`docs`). Владелец подтверждает коммит спеки/договора через UI плагина либо CLI владельца.
-   - Единое строгое правило «только владелец» (согласованно с §23 п.3): любой вызов команд `approve`, `defer`, `resume` (из `blocked`/`deferred`), `reject` на `owner_gate` и передача флага `--mode` в `enqueue` при наличии переменной окружения `BB_THREAD_ID` (независимо от роли) СТРОГО ОТКЛОНЯЕТСЯ с ошибкой `permission-denied: owner-only`. Доступ разрешён только человеку: CLI без `BB_THREAD_ID` или UI RPC с одноразовым токеном подтверждения (`approval_token`).
+   - Единое строгое правило «только владелец» (согласованно с §23 п.3): любой вызов команд `approve`, `defer`, `resume` (из `blocked`/`deferred`), `reject` на `owner_gate` и передача флага `--mode` в `enqueue` при наличии переменной окружения `BB_THREAD_ID` (независимо от роли) СТРОГО ОТКЛОНЯЕТСЯ с ошибкой `permission-denied: owner-only`. Доступ разрешён только человеку: CLI без `BB_THREAD_ID` или UI (защита по §23.3: tools: [], проверка BB_THREAD_ID, игнорирование ответов карточки, сквозной аудит в task_transitions).
    - Защита от необоснованного занижения маршрута: если агент ставит облегчённый маршрут (`docs`, `fix`, `simple`), задача принудительно переводится в режим `manual` и проходит обязательный шлюз владельца `owner_gate` перед кодом (`start → owner_gate → code`).
 6. **Роль и уровень `architect` (§30):**
    - Роль `architect` (Opus 5.5 / Gemini 3.8 Pro): сильная модель проектирует на старте (узел `design`) и валидирует в конце (узел `design_check`).
@@ -51,10 +51,10 @@ date: 2026-11-18
    - `bb orchestrator defer <KEY> --reason "<причина>"` (только владелец)
    - `bb orchestrator reject <KEY> [--target spec|design|code] --reason "<причина>"` (возврат текущего узла на доработку в рамках маршрута; при blocked/deferred запрещён)
    - `bb orchestrator resume <KEY> [--target spec|design|code] [--reopen]` (возобновление задачи из deferred/blocked/stalled; blocked/deferred — только владелец, с допустимыми целями строго по маршруту)
-   - `bb orchestrator approve <KEY> [--token <TOKEN>]` (одобрение перехода owner_gate владельцем)
+   - `bb orchestrator approve <KEY> [--comment <текст>]` (одобрение перехода owner_gate владельцем)
    - `bb orchestrator run-queue [--once] [--json]`
 10. **Порядок реализации срезами (за флагом `workGraph`):**
-    - Режимы `workGraph`: `off` (по умолчанию, совместимость r33), `shadow` (пассивный режим: аудит и БД), `strict` (строгий режим: блокировка прямых delegate/merge/release вне run-queue, выкладка только при node=release, status=running).
+    - Режимы `workGraph`: `off` (по умолчанию, совместимость r33), `shadow` (пассивный режим: аудит и БД), `strict` (строгий режим: блокировка прямых delegate/merge/release вне run-queue для любых задач вне очереди (graph-required) и внутри очереди (graph-managed), выкладка строго при node=release, status=running).
     - Срезы 5а (таблицы, transitions, CLI run-queue в `shadow`), 5б (репетиция с подставными агентами: сквозной прогон всех уровней для валидации связи), 5в (автопереходы и будильник за флагом `strict`), 5г (`approvalMode`, архитектор, договор приёмки).
 
 ## Последствия
