@@ -1,21 +1,26 @@
 import assert from "node:assert/strict";
 import test, { beforeEach, after } from "node:test";
+import { writeFileSync } from "node:fs";
+import path from "node:path";
 import Database from "better-sqlite3";
 import { makeTempDir } from "./helpers/temp.js";
 import {
   createFakePluginHost,
 } from "@get-bb/plugin-sdk/testing";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
-import type { CmdRunner } from "../src/cmd.js";
+import { type CmdRunner, createCmd } from "../src/cmd.js";
 import { DelegationStore, MIGRATIONS } from "../src/store.js";
 import { createPlugin } from "../server.js";
 import {
+  checkAndPrepareTaskBranch,
+  archiveAndCleanupTaskBranch,
   computeTaskBranch,
   isOwnerCalling,
   normalizeWorkGraphMode,
 } from "../src/workgraph.js";
 
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
+delete process.env.BB_THREAD_ID;
 beforeEach(() => {
   delete process.env.BB_THREAD_ID;
 });
@@ -83,6 +88,19 @@ function fakeCli(respond?: (args: string[]) => BbCliResult | undefined): {
               comments: [],
             }),
           );
+        if (key.startsWith("projects list"))
+          return ok(
+            JSON.stringify({
+              projects: [
+                {
+                  id: "proj_bb",
+                  name: "p",
+                  repoRoot: "/tmp/fake-repo",
+                  hosts: [{ hostId: "local", repoPath: "/tmp/fake-repo" }],
+                },
+              ],
+            }),
+          );
         if (key.startsWith("thread show"))
           return ok(
             JSON.stringify({
@@ -114,6 +132,12 @@ function fakeCmd(
         if (key.includes("rev-parse --show-toplevel")) {
           return ok("/tmp/fake-repo");
         }
+        if (
+          key.includes("rev-parse --verify origin/main") ||
+          key.includes("rev-parse --verify refs/remotes/origin/main")
+        ) {
+          return ok("0000000000000000000000000000000000000001");
+        }
         if (key.includes("rev-parse --verify")) {
           // default: refs don't exist
           return { exitCode: 1, stdout: "", stderr: "fatal: Needed a single revision" };
@@ -130,7 +154,7 @@ function fakeCmd(
 async function hostWith(
   settings: Record<string, string | boolean> = {},
   cli: BbCli = fakeCli().cli,
-  cmdRunner?: CmdRunner,
+  cmdRunner: CmdRunner = fakeCmd().cmd,
 ) {
   const host = createFakePluginHost({
     pluginId: "orchestrator",
@@ -150,8 +174,12 @@ async function hostWith(
   });
   await createPlugin(host.bb, {
     bbCli: cli,
-    ...(cmdRunner ? { cmd: cmdRunner } : {}),
+    cmd: cmdRunner,
   });
+  const origRunCli = host.harness.runCli.bind(host.harness);
+  host.harness.runCli = (argv, ctx = {}) => {
+    return origRunCli(argv, { cwd: "/tmp/fake-repo", ...ctx });
+  };
   return host;
 }
 
@@ -581,7 +609,7 @@ test("CLI enqueue with unmerged branch requires --force-reset-branch", async () 
   const tagCall = fake.calls.find(
     (c) =>
       c.args.includes("tag") &&
-      c.args.some((a) => a.includes("refs/tags/archive/plug-205-force-reset-")),
+      c.args.some((a) => a.includes("archive/PLUG-205-force-reset-")),
   );
   assert.ok(tagCall, "archive tag should be created on force reset");
 });
@@ -631,7 +659,7 @@ test("CLI dequeue owner-only, cancels task and archives branch", async () => {
   const cancelTag = fake.calls.find(
     (c) =>
       c.args.includes("tag") &&
-      c.args.some((a) => a.includes("refs/tags/archive/plug-206-cancelled-")),
+      c.args.some((a) => a.includes("archive/PLUG-206-cancelled-")),
   );
   assert.ok(cancelTag, "archive tag should be created on dequeue");
 
@@ -1023,4 +1051,252 @@ test("When workGraph is off, queue commands reject with graph-disabled", async (
   const res = await host.harness.runCli(["enqueue", "PLUG-230", "--json"]);
   assert.equal(res.exitCode, 1);
   assert.equal(JSON.parse(res.stdout).error.code, "graph-disabled");
+});
+
+test("Archive tags create true git refs refs/tags/archive/<KEY>-... in real repository", async () => {
+  const originDir = makeTempDir("real-git-origin-");
+  const repoDir = makeTempDir("real-git-repo-");
+  const cmd = createCmd();
+  await cmd.run("git", ["init", "--bare", originDir]);
+  await cmd.run("git", ["init", repoDir]);
+  await cmd.run("git", ["-C", repoDir, "config", "user.name", "Tester"]);
+  await cmd.run("git", ["-C", repoDir, "config", "user.email", "tester@test.com"]);
+  await cmd.run("git", ["-C", repoDir, "commit", "--allow-empty", "-m", "init"]);
+  await cmd.run("git", ["-C", repoDir, "branch", "-M", "main"]);
+  await cmd.run("git", ["-C", repoDir, "remote", "add", "origin", originDir]);
+  await cmd.run("git", ["-C", repoDir, "push", "-u", "origin", "main"]);
+  await cmd.run("git", ["-C", repoDir, "checkout", "-b", "bb/plug-real-branch"]);
+  await cmd.run("git", ["-C", repoDir, "commit", "--allow-empty", "-m", "feature-work"]);
+  await cmd.run("git", ["-C", repoDir, "checkout", "main"]);
+
+  // Force-reset archiving
+  const resReset = await checkAndPrepareTaskBranch(
+    cmd,
+    repoDir,
+    "bb/plug-real-branch",
+    "PLUG-REAL",
+    "main",
+    true,
+  );
+  assert.equal(resReset.ok, true);
+  assert.equal(resReset.action, "force-reset-archived");
+
+  // Verify true refs with git for-each-ref
+  const refsReset = await cmd.run("git", ["-C", repoDir, "for-each-ref", "--format=%(refname)"]);
+  const allRefsReset = refsReset.stdout.split("\n").filter(Boolean);
+  const foundResetTag = allRefsReset.find((r) => r.startsWith("refs/tags/archive/PLUG-REAL-force-reset-"));
+  assert.ok(foundResetTag, `must have true ref refs/tags/archive/PLUG-REAL-force-reset-...; found: ${allRefsReset.join(", ")}`);
+  assert.ok(!allRefsReset.some((r) => r.includes("refs/tags/refs/tags/")), "must NOT have duplicated refs/tags/ prefix");
+
+  // Dequeue archiving
+  await cmd.run("git", ["-C", repoDir, "checkout", "-b", "bb/plug-real-dequeue"]);
+  await cmd.run("git", ["-C", repoDir, "commit", "--allow-empty", "-m", "dequeue-work"]);
+  await cmd.run("git", ["-C", repoDir, "checkout", "main"]);
+  await archiveAndCleanupTaskBranch(cmd, repoDir, "bb/plug-real-dequeue", "PLUG-REAL");
+
+  const refsDequeue = await cmd.run("git", ["-C", repoDir, "for-each-ref", "--format=%(refname)"]);
+  const allRefsDequeue = refsDequeue.stdout.split("\n").filter(Boolean);
+  const foundCancelTag = allRefsDequeue.find((r) => r.startsWith("refs/tags/archive/PLUG-REAL-cancelled-"));
+  assert.ok(foundCancelTag, `must have true ref refs/tags/archive/PLUG-REAL-cancelled-...; found: ${allRefsDequeue.join(", ")}`);
+  assert.ok(!allRefsDequeue.some((r) => r.includes("refs/tags/refs/tags/")), "must NOT have duplicated refs/tags/ prefix");
+});
+
+test("Git network/remote errors during branch check throw git-failed", async () => {
+  const fake = fakeCmd((file, args) => {
+    const k = args.join(" ");
+    if (k.includes("ls-remote")) {
+      return { exitCode: 128, stdout: "", stderr: "fatal: remote origin unreachable" };
+    }
+    return undefined;
+  });
+
+  await assert.rejects(
+    async () => {
+      await checkAndPrepareTaskBranch(
+        fake.cmd,
+        "/tmp/fake-repo",
+        "bb/test-err",
+        "PLUG-ERR",
+        "main",
+        false,
+      );
+    },
+    (err: any) => err.code === "git-failed" && /remote origin unreachable/.test(err.message),
+  );
+});
+
+test("Squash-merged PR without commit in merge-base is verified via PR state and deleted", async () => {
+  const prHeadSha = "deadbeef1234567890abcdef1234567890abcdef";
+  const fake = fakeCmd((file, args) => {
+    const k = `${file} ${args.join(" ")}`;
+    if (k.includes("rev-parse --verify refs/heads/bb/squash-branch")) {
+      return ok(prHeadSha);
+    }
+    if (k.includes("ls-remote")) {
+      return ok("");
+    }
+    if (k.includes("merge-base --is-ancestor deadbeef origin/main")) {
+      // Squash merge: commit is NOT an ancestor of origin/main
+      return { exitCode: 1, stdout: "", stderr: "" };
+    }
+    if (k.includes("gh pr list")) {
+      return ok(
+        JSON.stringify([
+          {
+            number: 42,
+            state: "MERGED",
+            headRefOid: prHeadSha,
+          },
+        ]),
+      );
+    }
+    return undefined;
+  });
+
+  const res = await checkAndPrepareTaskBranch(
+    fake.cmd,
+    "/tmp/fake-repo",
+    "bb/squash-branch",
+    "PLUG-SQ",
+    "main",
+    false,
+  );
+  assert.equal(res.ok, true);
+  assert.equal(res.action, "deleted-merged");
+
+  // But if extra commit was pushed after PR was merged -> merge is NOT confirmed
+  const fakeExtra = fakeCmd((file, args) => {
+    const k = `${file} ${args.join(" ")}`;
+    if (k.includes("rev-parse --verify refs/heads/bb/squash-branch")) {
+      return ok("newcommit9999");
+    }
+    if (k.includes("ls-remote")) return ok("");
+    if (k.includes("merge-base --is-ancestor newcommit9999 origin/main")) return { exitCode: 1, stdout: "", stderr: "" };
+    if (k.includes("gh pr list")) {
+      return ok(
+        JSON.stringify([
+          {
+            number: 42,
+            state: "MERGED",
+            headRefOid: prHeadSha, // older sha than newcommit9999
+          },
+        ]),
+      );
+    }
+    if (k.includes("merge-base --is-ancestor newcommit9999 deadbeef")) {
+      // new commit is NOT ancestor of PR head
+      return { exitCode: 1, stdout: "", stderr: "" };
+    }
+    return undefined;
+  });
+
+  await assert.rejects(
+    async () => {
+      await checkAndPrepareTaskBranch(
+        fakeExtra.cmd,
+        "/tmp/fake-repo",
+        "bb/squash-branch",
+        "PLUG-SQ",
+        "main",
+        false,
+      );
+    },
+    (err: any) => err.code === "unmerged-branch-exists",
+  );
+});
+
+test("--acceptance resolves relative file against caller cwd and fails on missing path", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  const testDir = makeTempDir("acc-cwd-");
+  const accFile = path.join(testDir, "contract.md");
+  writeFileSync(accFile, "# Acceptance Criteria\nAll tests pass.");
+
+  // Missing path fails with acceptance-missing
+  const resMissing = await host.harness.runCli([
+    "enqueue",
+    "ACC-MISS",
+    "--route",
+    "fix",
+    "--acceptance",
+    "./nonexistent-contract.md",
+    "--json",
+  ], { cwd: testDir });
+  assert.equal(resMissing.exitCode, 1);
+  assert.equal(JSON.parse(resMissing.stdout).error.code, "acceptance-missing");
+  assert.match(JSON.parse(resMissing.stdout).error.message, /nonexistent-contract\.md/);
+
+  // Existing relative path resolves correctly
+  const resOk = await host.harness.runCli([
+    "enqueue",
+    "ACC-OK",
+    "--route",
+    "fix",
+    "--acceptance",
+    "./contract.md",
+    "--json",
+  ], { cwd: testDir });
+  assert.equal(resOk.exitCode, 0);
+  const task = JSON.parse(resOk.stdout).task;
+  const payload = JSON.parse(task.payload);
+  assert.match(payload.acceptance_text, /All tests pass/);
+});
+
+test("Owner-only CLI commands reject caller with threadId in ctx", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "OWN-1", "--route", "feature", "--json"]);
+
+  // 1. approve
+  const resApprove = await host.harness.runCli(["approve", "OWN-1", "--json"], {
+    threadId: "thr_agent",
+  });
+  assert.equal(resApprove.exitCode, 1);
+  assert.equal(JSON.parse(resApprove.stdout).error.code, "permission-denied");
+
+  // 2. defer
+  const resDefer = await host.harness.runCli(["defer", "OWN-1", "--reason", "r", "--json"], {
+    threadId: "thr_agent",
+  });
+  assert.equal(resDefer.exitCode, 1);
+  assert.equal(JSON.parse(resDefer.stdout).error.code, "permission-denied");
+
+  // 3. dequeue
+  const resDequeue = await host.harness.runCli(["dequeue", "OWN-1", "--reason", "r", "--json"], {
+    threadId: "thr_agent",
+  });
+  assert.equal(resDequeue.exitCode, 1);
+  assert.equal(JSON.parse(resDequeue.stdout).error.code, "permission-denied");
+
+  // 4. enqueue --mode
+  const resMode = await host.harness.runCli(["enqueue", "OWN-MODE", "--mode", "manual", "--json"], {
+    threadId: "thr_agent",
+  });
+  assert.equal(resMode.exitCode, 1);
+  assert.equal(JSON.parse(resMode.stdout).error.code, "permission-denied");
+
+  // 5. enqueue --acceptance
+  const resAcc = await host.harness.runCli(["enqueue", "OWN-ACC", "--acceptance", "text", "--json"], {
+    threadId: "thr_agent",
+  });
+  assert.equal(resAcc.exitCode, 1);
+  assert.equal(JSON.parse(resAcc.stdout).error.code, "permission-denied");
+});
+
+test("Repeat defer on already deferred task rejects with invalid-status", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "DEF-REP", "--json"]);
+  const res1 = await host.harness.runCli(["defer", "DEF-REP", "--reason", "hold1", "--json"]);
+  assert.equal(res1.exitCode, 0);
+
+  const res2 = await host.harness.runCli(["defer", "DEF-REP", "--reason", "hold2", "--json"]);
+  assert.equal(res2.exitCode, 1);
+  assert.equal(JSON.parse(res2.stdout).error.code, "invalid-status");
+  assert.match(JSON.parse(res2.stdout).error.message, /уже отложена/);
+});
+
+test("reject requires --reason argument", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  await host.harness.runCli(["enqueue", "REJ-NOREASON", "--json"]);
+  const res = await host.harness.runCli(["reject", "REJ-NOREASON", "--json"]);
+  assert.equal(res.exitCode, 1);
+  assert.equal(JSON.parse(res.stdout).error.code, "missing-reason");
 });

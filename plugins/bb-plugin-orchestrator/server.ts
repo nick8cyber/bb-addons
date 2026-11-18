@@ -1602,7 +1602,7 @@ export async function createPlugin(
         } catch {}
       }
     }
-    const cwdToCheck = callCwd || process.cwd();
+    const cwdToCheck = callCwd;
     if (!repoRoot && cwdToCheck) {
       const rev = await cmd
         .run("git", ["rev-parse", "--show-toplevel"], { cwd: cwdToCheck })
@@ -3628,11 +3628,19 @@ abandoned: ${res.reported
               "укажи ключ задачи: bb orchestrator resume <KEY> [--target <t>]",
             );
           }
+          const wtCtx = await resolveWorktreeContext(
+            ctx.threadId,
+            ctx.projectId,
+            ctx.cwd,
+          ).catch(() => null);
           const res = await runResume(taskKey, flag("--target"), {
             store,
             ctx,
             workGraphMode: getWorkGraphMode(),
             now,
+            reopen: argv.includes("--reopen"),
+            cmd: cmdRunner,
+            repoRoot: wtCtx?.repoRoot,
           });
           return json
             ? jsonOk(res)

@@ -5,6 +5,7 @@
  * release-note, run-queue) and owner-only guards.
  */
 import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { OrchestratorError } from "./errors.js";
 import type { CmdRunner } from "./cmd.js";
 import type { BbCli } from "./bb-cli.js";
@@ -110,8 +111,9 @@ export async function checkAndPrepareTaskBranch(
   taskKey: string,
   mergeBaseBranch: string,
   forceResetBranch: boolean,
+  prNumber?: number,
 ): Promise<{ ok: boolean; action: string }> {
-  const normKey = normalizeTaskKey(taskKey).toLowerCase();
+  const normKey = normalizeTaskKey(taskKey).toUpperCase();
   const localRes = await cmd.run(
     "git",
     ["rev-parse", "--verify", `refs/heads/${branch}`],
@@ -125,20 +127,31 @@ export async function checkAndPrepareTaskBranch(
     ["ls-remote", "--heads", "origin", `refs/heads/${branch}`],
     { cwd: repoRoot },
   );
-  const remoteExists =
-    lsRemote.exitCode === 0 && lsRemote.stdout.trim().length > 0;
-  let remoteSha: string | null = remoteExists
-    ? lsRemote.stdout.trim().split(/\s+/)[0] ?? null
-    : null;
+  if (lsRemote.exitCode !== 0) {
+    throw new OrchestratorError(
+      "git-failed",
+      `не удалось проверить удалённую ветку origin/${branch}: ${lsRemote.stderr}`,
+    );
+  }
+  const remoteExists = lsRemote.stdout.trim().length > 0;
+  let remoteSha: string | null = null;
 
   if (!localExists && !remoteExists) {
     return { ok: true, action: "clean" };
   }
 
   if (remoteExists) {
-    await cmd.run("git", ["fetch", "origin", `refs/heads/${branch}`], {
-      cwd: repoRoot,
-    });
+    const fetchRes = await cmd.run(
+      "git",
+      ["fetch", "origin", `refs/heads/${branch}`],
+      { cwd: repoRoot },
+    );
+    if (fetchRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось выполнить fetch для ветки origin/${branch}: ${fetchRes.stderr}`,
+      );
+    }
     const revRemote = await cmd.run(
       "git",
       ["rev-parse", "--verify", `refs/remotes/origin/${branch}`],
@@ -146,38 +159,110 @@ export async function checkAndPrepareTaskBranch(
     );
     if (revRemote.exitCode === 0 && revRemote.stdout.trim()) {
       remoteSha = revRemote.stdout.trim();
+    } else {
+      remoteSha = lsRemote.stdout.trim().split(/\s+/)[0] ?? null;
+    }
+    if (!remoteSha) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось определить sha удалённой ветки origin/${branch}`,
+      );
     }
   }
 
-  // Check if tips are ancestors of origin/<mergeBaseBranch>
-  let targetRef = `origin/${mergeBaseBranch}`;
+  // Check if tips are ancestors of origin/<mergeBaseBranch> or confirmed via PR (§32 п.2)
+  const targetRef = `origin/${mergeBaseBranch}`;
   const targetCheck = await cmd.run(
     "git",
     ["rev-parse", "--verify", targetRef],
     { cwd: repoRoot },
   );
   if (targetCheck.exitCode !== 0) {
-    targetRef = mergeBaseBranch;
+    throw new OrchestratorError(
+      "git-failed",
+      `базовая ветка ${targetRef} не найдена в репозитории`,
+    );
   }
+
+  const isShaMerged = async (sha: string): Promise<boolean> => {
+    // Condition a: sha is an ancestor of origin/<mergeBaseBranch>
+    const anc = await cmd.run(
+      "git",
+      ["merge-base", "--is-ancestor", sha, targetRef],
+      { cwd: repoRoot },
+    );
+    if (anc.exitCode === 0) {
+      return true;
+    }
+
+    // Condition b: found PR for this branch (by prNumber or head branch) with state === MERGED (§32 п.2)
+    let prData: { state?: string; mergedAt?: string | null; headRefOid?: string } | null = null;
+    if (prNumber) {
+      const prRes = await cmd.run(
+        "gh",
+        ["pr", "view", String(prNumber), "--json", "state,mergedAt,headRefOid"],
+        { cwd: repoRoot },
+      );
+      if (prRes.exitCode === 0) {
+        try {
+          prData = JSON.parse(prRes.stdout);
+        } catch {}
+      }
+    }
+    if (!prData) {
+      const listRes = await cmd.run(
+        "gh",
+        [
+          "pr",
+          "list",
+          "--head",
+          branch,
+          "--state",
+          "all",
+          "--limit",
+          "1",
+          "--json",
+          "state,mergedAt,headRefOid",
+        ],
+        { cwd: repoRoot },
+      );
+      if (listRes.exitCode === 0) {
+        try {
+          const arr = JSON.parse(listRes.stdout);
+          if (Array.isArray(arr) && arr.length > 0) {
+            prData = arr[0];
+          }
+        } catch {}
+      }
+    }
+
+    if (
+      prData &&
+      (prData.state?.toUpperCase() === "MERGED" || Boolean(prData.mergedAt))
+    ) {
+      const headOid = prData.headRefOid;
+      if (headOid) {
+        if (sha === headOid) return true;
+        const prAnc = await cmd.run(
+          "git",
+          ["merge-base", "--is-ancestor", sha, headOid],
+          { cwd: repoRoot },
+        );
+        if (prAnc.exitCode === 0) return true;
+      }
+    }
+
+    return false;
+  };
 
   let localMerged = true;
   if (localExists && localSha) {
-    const r = await cmd.run(
-      "git",
-      ["merge-base", "--is-ancestor", localSha, targetRef],
-      { cwd: repoRoot },
-    );
-    localMerged = r.exitCode === 0;
+    localMerged = await isShaMerged(localSha);
   }
 
   let remoteMerged = true;
   if (remoteExists && remoteSha) {
-    const r = await cmd.run(
-      "git",
-      ["merge-base", "--is-ancestor", remoteSha, targetRef],
-      { cwd: repoRoot },
-    );
-    remoteMerged = r.exitCode === 0;
+    remoteMerged = await isShaMerged(remoteSha);
   }
 
   if (localMerged && remoteMerged) {
@@ -191,9 +276,17 @@ export async function checkAndPrepareTaskBranch(
       }
     }
     if (remoteExists) {
-      await cmd
-        .run("git", ["push", "origin", "--delete", branch], { cwd: repoRoot })
-        .catch(() => {});
+      const delRemote = await cmd.run(
+        "git",
+        ["push", "origin", "--delete", branch],
+        { cwd: repoRoot },
+      );
+      if (delRemote.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось удалить ветку в origin: ${delRemote.stderr}`,
+        );
+      }
     }
     return { ok: true, action: "deleted-merged" };
   }
@@ -209,7 +302,7 @@ export async function checkAndPrepareTaskBranch(
   if (localExists && localSha) {
     const tagRes = await cmd.run(
       "git",
-      ["tag", `refs/tags/archive/${normKey}-force-reset-${ts}`, `refs/heads/${branch}`],
+      ["tag", `archive/${normKey}-force-reset-${ts}`, localSha],
       { cwd: repoRoot },
     );
     if (tagRes.exitCode !== 0) {
@@ -243,7 +336,7 @@ export async function checkAndPrepareTaskBranch(
         "git",
         [
           "tag",
-          `refs/tags/archive/${normKey}-remote-force-reset-${ts}`,
+          `archive/${normKey}-remote-force-reset-${ts}`,
           remoteSha,
         ],
         { cwd: repoRoot },
@@ -255,9 +348,17 @@ export async function checkAndPrepareTaskBranch(
         );
       }
     }
-    await cmd
-      .run("git", ["push", "origin", "--delete", branch], { cwd: repoRoot })
-      .catch(() => {});
+    const pushDel = await cmd.run(
+      "git",
+      ["push", "origin", "--delete", branch],
+      { cwd: repoRoot },
+    );
+    if (pushDel.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось удалить удалённую ветку ${branch}: ${pushDel.stderr}`,
+      );
+    }
   }
 
   return { ok: true, action: "force-reset-archived" };
@@ -271,7 +372,7 @@ export async function archiveAndCleanupTaskBranch(
   taskKey: string,
 ): Promise<void> {
   if (!branch) return;
-  const normKey = normalizeTaskKey(taskKey).toLowerCase();
+  const normKey = normalizeTaskKey(taskKey).toUpperCase();
   const ts = Date.now();
 
   const localRes = await cmd.run(
@@ -280,9 +381,10 @@ export async function archiveAndCleanupTaskBranch(
     { cwd: repoRoot },
   );
   if (localRes.exitCode === 0) {
+    const localSha = localRes.stdout.trim();
     const tagRes = await cmd.run(
       "git",
-      ["tag", `refs/tags/archive/${normKey}-cancelled-${ts}`, `refs/heads/${branch}`],
+      ["tag", `archive/${normKey}-cancelled-${ts}`, localSha],
       { cwd: repoRoot },
     );
     if (tagRes.exitCode !== 0) {
@@ -305,10 +407,24 @@ export async function archiveAndCleanupTaskBranch(
     ["ls-remote", "--heads", "origin", `refs/heads/${branch}`],
     { cwd: repoRoot },
   );
-  if (lsRemote.exitCode === 0 && lsRemote.stdout.trim().length > 0) {
-    await cmd.run("git", ["fetch", "origin", `refs/heads/${branch}`], {
-      cwd: repoRoot,
-    });
+  if (lsRemote.exitCode !== 0) {
+    throw new OrchestratorError(
+      "git-failed",
+      `не удалось проверить удалённую ветку origin/${branch}: ${lsRemote.stderr}`,
+    );
+  }
+  if (lsRemote.stdout.trim().length > 0) {
+    const fetchRes = await cmd.run(
+      "git",
+      ["fetch", "origin", `refs/heads/${branch}`],
+      { cwd: repoRoot },
+    );
+    if (fetchRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось выполнить fetch для ветки origin/${branch}: ${fetchRes.stderr}`,
+      );
+    }
     const revRemote = await cmd.run(
       "git",
       ["rev-parse", "--verify", `refs/remotes/origin/${branch}`],
@@ -322,7 +438,7 @@ export async function archiveAndCleanupTaskBranch(
         "git",
         [
           "tag",
-          `refs/tags/archive/${normKey}-remote-cancelled-${ts}`,
+          `archive/${normKey}-remote-cancelled-${ts}`,
           remoteSha,
         ],
         { cwd: repoRoot },
@@ -333,9 +449,17 @@ export async function archiveAndCleanupTaskBranch(
           `не удалось создать архивный тег для удалённой ветки ${branch}: ${remTag.stderr}`,
         );
       }
-      await cmd
-        .run("git", ["push", "origin", "--delete", branch], { cwd: repoRoot })
-        .catch(() => {});
+      const pushDel = await cmd.run(
+        "git",
+        ["push", "origin", "--delete", branch],
+        { cwd: repoRoot },
+      );
+      if (pushDel.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось удалить удалённую ветку ${branch}: ${pushDel.stderr}`,
+        );
+      }
     }
   }
 
@@ -501,12 +625,30 @@ export async function runEnqueue(
   // Acceptance contract reading
   let acceptanceText: string | null = null;
   if (input.acceptance) {
-    if (existsSync(input.acceptance)) {
+    const raw = input.acceptance.trim();
+    const looksLikePath =
+      !raw.includes("\n") &&
+      (raw.startsWith("./") ||
+        raw.startsWith("../") ||
+        raw.startsWith("/") ||
+        raw.startsWith("~/") ||
+        /\.(md|txt|markdown|rst)$/i.test(raw));
+
+    const candidatePath = path.resolve(deps.ctx?.cwd ?? process.cwd(), raw);
+    if (existsSync(candidatePath)) {
       try {
-        acceptanceText = readFileSync(input.acceptance, "utf8");
-      } catch {
-        acceptanceText = input.acceptance;
+        acceptanceText = readFileSync(candidatePath, "utf8");
+      } catch (err) {
+        throw new OrchestratorError(
+          "acceptance-missing",
+          `не удалось прочитать файл договора приёмки ${raw}: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
+    } else if (looksLikePath) {
+      throw new OrchestratorError(
+        "acceptance-missing",
+        `файл договора приёмки не найден: ${raw}`,
+      );
     } else {
       acceptanceText = input.acceptance;
     }
@@ -601,6 +743,13 @@ export async function runEnqueue(
     }
 
     if (branch) {
+      let prNumber: number | undefined;
+      if (existing?.payload) {
+        try {
+          const p = JSON.parse(existing.payload);
+          if (typeof p.pr_number === "number") prNumber = p.pr_number;
+        } catch {}
+      }
       await checkAndPrepareTaskBranch(
         deps.cmd,
         deps.repoRoot,
@@ -608,6 +757,7 @@ export async function runEnqueue(
         taskKey,
         deps.mergeBaseBranch,
         Boolean(input.forceResetBranch),
+        prNumber,
       );
     }
   }
@@ -765,6 +915,12 @@ export async function runDefer(
       `задача ${key} уже завершена или отменена (status=${task.status})`,
     );
   }
+  if (task.status === "deferred") {
+    throw new OrchestratorError(
+      "invalid-status",
+      `задача ${key} уже отложена (status=deferred)`,
+    );
+  }
 
   const now = deps.now ? deps.now() : Date.now();
   let existingPayload: Record<string, unknown> = {};
@@ -816,6 +972,12 @@ export async function runReject(
     throw new OrchestratorError(
       "graph-disabled",
       "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+  if (!reason || reason.trim().length === 0) {
+    throw new OrchestratorError(
+      "missing-reason",
+      "укажи причину отклонения: bb orchestrator reject <KEY> --reason <причина>",
     );
   }
 
@@ -990,6 +1152,9 @@ export async function runResume(
     ctx: PluginCliContext;
     workGraphMode: WorkGraphMode;
     now?: () => number;
+    reopen?: boolean;
+    cmd?: CmdRunner;
+    repoRoot?: string;
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow }> {
   if (deps.workGraphMode === "off") {
@@ -1012,6 +1177,21 @@ export async function runResume(
   const isOwner = isOwnerCalling(deps.ctx);
 
   if (task.status === "stalled") {
+    if (deps.reopen && deps.cmd && deps.repoRoot) {
+      let prNum: number | undefined;
+      if (task.payload) {
+        try {
+          const p = JSON.parse(task.payload);
+          if (typeof p.pr_number === "number") prNum = p.pr_number;
+        } catch {}
+      }
+      if (prNum) {
+        await deps.cmd
+          .run("gh", ["pr", "reopen", String(prNum)], { cwd: deps.repoRoot })
+          .catch(() => {});
+      }
+    }
+
     if (target !== undefined) {
       assertOwnerOnly(deps.ctx);
       if (task.node === "release") {
@@ -1042,6 +1222,12 @@ export async function runResume(
             },
             now,
           );
+          if (!res.ok) {
+            throw new OrchestratorError(
+              "transition-failed",
+              `не удалось возобновить задачу ${key}: конфликт CAS`,
+            );
+          }
           return { ok: true, task: res.task! };
         }
         if (task.route === "docs") {
@@ -1069,6 +1255,12 @@ export async function runResume(
             },
             now,
           );
+          if (!res.ok) {
+            throw new OrchestratorError(
+              "transition-failed",
+              `не удалось возобновить задачу ${key}: конфликт CAS`,
+            );
+          }
           return { ok: true, task: res.task! };
         }
       }
@@ -1091,6 +1283,12 @@ export async function runResume(
       },
       now,
     );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось возобновить задачу ${key}: конфликт CAS`,
+      );
+    }
     return { ok: true, task: res.task! };
   }
 
@@ -1371,8 +1569,6 @@ export async function runReleaseNote(
       `не удалось сохранить release note для задачи ${key}: конфликт CAS`,
     );
   }
-
-  return { ok: true, task: res.task! };
 
   return { ok: true, task: res.task! };
 }
