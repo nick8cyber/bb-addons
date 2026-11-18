@@ -522,6 +522,154 @@ test("4. gemini-driver strict selectModelAndThinking and no fallback", async () 
   await selectModelAndThinking(mockPageNeonRu, "argon", null, true);
   assert.equal(clickedNeonRu, true, "Picker item 'Глубокий анализ | 4 Neon' must be clicked when requested model is argon");
 
+  // PLUG-324: Test fallback path of getPickerButton when primary selector is not found
+  // (a) Mock page whose waitForSelector returns null and evaluateHandle runs the regex
+  // against a visible "Deeper analysis | 4 Neon" button in document.querySelectorAll.
+  let clickedFallbackNeon = false;
+  const mockFallbackNeonButton = {
+    offsetParent: {}, // visible
+    innerText: "4 Neon",
+    getAttribute: (name) => (name === "aria-label" ? "Deeper analysis" : null),
+  };
+  const mockHiddenNeonButton = {
+    offsetParent: null, // invisible, must be filtered out
+    innerText: "Deeper analysis | 4 Neon",
+    getAttribute: () => "Deeper analysis",
+  };
+  const mockOtherButton = {
+    offsetParent: {},
+    innerText: "Settings",
+    getAttribute: () => "Settings",
+  };
+
+  const mockPageFallbackNeon = {
+    $: async () => null,
+    $$: async () => [],
+    evaluate: async () => false,
+    waitForSelector: async () => null, // primary picker button selector fails
+    evaluateHandle: async (fn) => {
+      const prevDoc = globalThis.document;
+      try {
+        globalThis.document = {
+          querySelectorAll: () => [mockHiddenNeonButton, mockOtherButton, mockFallbackNeonButton],
+        };
+        const domEl = fn();
+        if (!domEl) return { asElement: () => null };
+        return {
+          asElement: () => ({
+            innerText: async () => domEl.innerText,
+            getAttribute: async (name) => domEl.getAttribute(name),
+            click: async () => { clickedFallbackNeon = true; },
+          }),
+        };
+      } finally {
+        globalThis.document = prevDoc;
+      }
+    },
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  // When fallback button already shows Neon / Deeper analysis, selectModelAndThinking recognizes argon is selected
+  await selectModelAndThinking(mockPageFallbackNeon, "argon", null, true);
+
+  // Test fallback button showing another model (Hydrogen) opening menu to select Neon
+  let clickedMenuNeonFromFallback = false;
+  const mockFallbackHydrogenButton = {
+    offsetParent: {},
+    innerText: "4 Hydrogen",
+    getAttribute: (name) => (name === "aria-label" ? "Hydrogen" : null),
+  };
+  const mockPageFallbackHydrogen = {
+    $: async () => null,
+    $$: async () => [
+      {
+        innerText: async () => "Deeper analysis | 4 Neon",
+        evaluate: async () => false,
+        click: async () => { clickedMenuNeonFromFallback = true; },
+      },
+    ],
+    evaluate: async () => false,
+    waitForSelector: async (sel) => {
+      if (typeof sel === "string" && sel.includes("gem-menu-item")) {
+        return { innerText: async () => "" };
+      }
+      return null;
+    },
+    evaluateHandle: async (fn) => {
+      const prevDoc = globalThis.document;
+      try {
+        globalThis.document = {
+          querySelectorAll: () => [mockHiddenNeonButton, mockOtherButton, mockFallbackHydrogenButton],
+        };
+        const domEl = fn();
+        if (!domEl) return { asElement: () => null };
+        return {
+          asElement: () => ({
+            innerText: async () => domEl.innerText,
+            getAttribute: async (name) => domEl.getAttribute(name),
+            click: async () => {},
+          }),
+        };
+      } finally {
+        globalThis.document = prevDoc;
+      }
+    },
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await selectModelAndThinking(mockPageFallbackHydrogen, "argon", null, true);
+  assert.equal(clickedMenuNeonFromFallback, true, "Menu item Neon must be clicked after opening menu from fallback Hydrogen button");
+
+  // Test fallback button failure when no button matches known model regex
+  const mockPageFallbackFail = {
+    $: async () => null,
+    $$: async () => [],
+    evaluate: async () => false,
+    waitForSelector: async () => null,
+    evaluateHandle: async (fn) => {
+      const prevDoc = globalThis.document;
+      try {
+        globalThis.document = {
+          querySelectorAll: () => [mockOtherButton],
+        };
+        const domEl = fn();
+        if (!domEl) return { asElement: () => null };
+        return {
+          asElement: () => ({
+            innerText: async () => domEl.innerText,
+            getAttribute: async (name) => domEl.getAttribute(name),
+            click: async () => {},
+          }),
+        };
+      } finally {
+        globalThis.document = prevDoc;
+      }
+    },
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+  };
+
+  await assert.rejects(
+    async () => selectModelAndThinking(mockPageFallbackFail, "argon", null, true),
+    /Model picker button not found/,
+    "When fallback button does not match known models regex, getPickerButton must throw"
+  );
+
+  // (b) Source assertion on getPickerButton fallback regex literal
+  const pickerFallbackMatch = driverSrc.match(/getPickerButton[\s\S]*?const\s+re\s*=\s*\/([^/]+)\/i/);
+  assert.ok(pickerFallbackMatch, "gemini-driver.js must have fallback regex in getPickerButton");
+  const fallbackRegexBody = pickerFallbackMatch[1];
+  assert.ok(
+    fallbackRegexBody.includes("neon"),
+    `getPickerButton fallback regex must include 'neon' (got: /${fallbackRegexBody}/i)`
+  );
+  assert.ok(
+    fallbackRegexBody.includes("deeper analysis"),
+    `getPickerButton fallback regex must include 'deeper analysis' (got: /${fallbackRegexBody}/i)`
+  );
+
   // Verification that target is validated after last user-query with promptPrefix
   assert.ok(
     driverSrc.includes("queries[queries.length - 1]"),
