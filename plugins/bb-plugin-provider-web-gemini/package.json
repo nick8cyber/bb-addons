@@ -1,7 +1,7 @@
 {
-  "name": "bb-plugin-provider-argon",
+  "name": "bb-plugin-provider-web-gemini",
   "version": "0.2.0",
-  "description": "ACP provider for Google Gemini Web (Argon) with multi-account CDP pooling and rate-limit rotation.",
+  "description": "ACP provider for Google Gemini Web with multi-account CDP pooling and rate-limit rotation.",
   "main": "index.mjs",
   "bin": {
     "gemini": "./bin/gemini.js",

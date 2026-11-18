@@ -51,17 +51,24 @@ export function argonTierLabel(tier: string | null): string | null {
 }
 
 function defaultStateDir(userHome: () => string): string {
-  const env = process.env.ARGON_STATE_DIR;
+  const env = process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR;
   if (typeof env === "string" && env.trim() !== "") return env;
-  return join(userHome(), ".bb", "plugins", "provider-argon");
+  const geminiDir = join(userHome(), ".bb", "plugins", "provider-web-gemini");
+  const argonDir = join(userHome(), ".bb", "plugins", "provider-argon");
+  if (existsSync(geminiDir)) return geminiDir;
+  if (existsSync(argonDir)) return argonDir;
+  return geminiDir;
 }
 
 /**
- * Reads the usage file written by provider-argon (PLUG-289 contract):
- * `$ARGON_STATE_DIR/accounts-usage.json` with per-account daily/weekly
- * percent, reset epoch seconds, tier, updatedAt and stale flag. The file is
- * the only source; a missing or unreadable file yields an empty list so the
- * section simply stays hidden.
+ * Reads the usage file written by provider-web-gemini, formerly provider-argon
+ * (PLUG-289 contract): `$STATE_DIR/accounts-usage.json` where $STATE_DIR is
+ * `WEB_GEMINI_STATE_DIR`, else `ARGON_STATE_DIR`, else the default state dir —
+ * `~/.bb/plugins/provider-web-gemini` when present, `provider-argon` as the
+ * legacy fallback (mirrors the writer's resolveDefaultStateDir). The file has
+ * per-account daily/weekly percent, reset epoch seconds, tier, updatedAt and
+ * stale flag. The file is the only source; a missing or unreadable file yields
+ * an empty list so the section simply stays hidden.
  */
 export function createArgonUsage(options: {
   userHome: () => string;

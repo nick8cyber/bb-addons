@@ -15,6 +15,12 @@
 
 import { OrchestratorError } from "./errors.js";
 import {
+  PRESET_ALIASES,
+  ROUTE_ALIASES,
+  canonicalQuotaGroup,
+  canonicalRouteName,
+  findRoute,
+  resolvePolicyRoute,
   levelRole,
   pickRoute,
   quotaGroupOf,
@@ -376,9 +382,13 @@ function resolveRoute(
 } {
   const cfg = deps.helpers();
   const held = deps.store.heldGroups(deps.now?.() ?? Date.now());
+  const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
   if (input.preset !== undefined) {
     const found = Object.entries(policy.routes).find(
-      ([, r]) => r.preset === input.preset,
+      ([, r]) =>
+        r.preset === input.preset ||
+        (PRESET_ALIASES[input.preset!] !== undefined &&
+          r.preset === PRESET_ALIASES[input.preset!]),
     );
     if (!found) {
       throw new OrchestratorError(
@@ -388,9 +398,26 @@ function resolveRoute(
       );
     }
     const [name, route] = found;
+    const alias = ROUTE_ALIASES[name];
+    const canon = canonicalRouteName(name);
+    const qg = route.quotaGroup ?? name;
+    const cqg = canonicalQuotaGroup(qg);
+    const isUnavailable =
+      load.unavailableRoutes.includes(name) ||
+      (alias !== undefined && load.unavailableRoutes.includes(alias)) ||
+      (canon !== undefined && load.unavailableRoutes.includes(canon));
     const heldGroup =
-      route.quotaGroup !== undefined && held.has(route.quotaGroup);
-    if (load.unavailableRoutes.includes(name) || heldGroup) {
+      (route.quotaGroup !== undefined &&
+        (held.has(route.quotaGroup) ||
+          held.has(canonicalQuotaGroup(route.quotaGroup)) ||
+          canonHeld.has(canonicalQuotaGroup(route.quotaGroup)))) ||
+      held.has(name) ||
+      (alias !== undefined && held.has(alias)) ||
+      (canon !== undefined && held.has(canon)) ||
+      held.has(qg) ||
+      held.has(cqg) ||
+      canonHeld.has(cqg);
+    if (isUnavailable || heldGroup) {
       throw new OrchestratorError(
         "route-unavailable",
         `route "${name}" is unavailable (missing preset or route/quota hold)`,
@@ -502,8 +529,11 @@ export async function runHelper(
         .listActiveHelpers()
         .filter((h) => {
           if (!h.route) return false;
-          const hr = load.policy?.routes[h.route];
-          return (hr ? quotaGroupOf(hr, h.route) : h.route) === group;
+          const hr = findRoute(load.policy, h.route);
+          return (
+            (hr ? quotaGroupOf(hr, h.route) : canonicalQuotaGroup(h.route)) ===
+            group
+          );
         }).length;
       return delegations + helpers;
     };
@@ -512,6 +542,7 @@ export async function runHelper(
       r.maxActive !== undefined &&
       groupBusy(name, r) >= r.maxActive;
     const held = deps.store.heldGroups(deps.now?.() ?? Date.now());
+    const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
     const unavailable = new Set(load.unavailableRoutes);
     /** §20.2/§21.4 (r33): the next usable chain route after
      * `fromRoute` — same filters for the busy walk and a packet skip
@@ -520,18 +551,34 @@ export async function runHelper(
       fromRoute: string,
     ): { name: string; route: PolicyRoute } | undefined => {
       const chain = load.policy!.levels[route.level]?.chain ?? [];
-      for (const name of chain.slice(chain.indexOf(fromRoute) + 1)) {
-        const r = load.policy!.routes[name];
+      const matchRoute = (a: string, b: string) =>
+        a === b ||
+        canonicalRouteName(a) === canonicalRouteName(b) ||
+        ROUTE_ALIASES[a] === b;
+      const fromIdx = chain.findIndex((c) => matchRoute(c, fromRoute));
+      const isUnavailable = (name: string) =>
+        unavailable.has(name) ||
+        (ROUTE_ALIASES[name] !== undefined && unavailable.has(ROUTE_ALIASES[name])) ||
+        unavailable.has(canonicalRouteName(name));
+      for (const name of chain.slice(fromIdx === -1 ? 0 : fromIdx + 1)) {
+        if (fromIdx === -1 && matchRoute(name, fromRoute)) continue;
+        const r = findRoute(load.policy, name);
+        if (!r || isUnavailable(name)) continue;
+        const alias = ROUTE_ALIASES[name];
+        const canon = canonicalRouteName(name);
+        const qg = quotaGroupOf(r, name);
         if (
-          !r ||
-          unavailable.has(name) ||
           held.has(name) ||
-          held.has(quotaGroupOf(r, name)) ||
+          (alias && held.has(alias)) ||
+          held.has(canon) ||
+          held.has(qg) ||
+          canonHeld.has(qg) ||
           busyRoute(name, r)
         ) {
           continue;
         }
-        return { name, route: r };
+        const resolved = resolvePolicyRoute(load.policy, name);
+        return resolved ?? { name, route: r };
       }
       return undefined;
     };
@@ -1072,7 +1119,7 @@ export function createHelperWatchdog(deps: HelperWatchdogDeps) {  /** In-memory 
     const load = await deps
       .loadPolicy()
       .catch(() => ({ policy: null }) as PolicyLoad);
-    const helperRoute = r.route ? load.policy?.routes[r.route] : undefined;
+    const helperRoute = r.route ? findRoute(load.policy, r.route) : undefined;
     if (helperRoute?.tools === false) {
       await finish(
         r,
@@ -1290,7 +1337,7 @@ export function createHelperWatchdog(deps: HelperWatchdogDeps) {  /** In-memory 
         .loadPolicy()
         .catch(() => ({ policy: null }) as PolicyLoad);
       const firstMsOf = (r: HelperRow) =>
-        ((r.route ? load.policy?.routes[r.route]?.firstResponseSeconds : undefined) ??
+        ((r.route ? findRoute(load.policy, r.route)?.firstResponseSeconds : undefined) ??
           load.policy?.firstResponseSeconds ??
           60) * 1000;
       for (const r of deps.store.listActiveHelpers()) {

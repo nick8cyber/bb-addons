@@ -20,7 +20,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build": "bb plugin build ."
+    "postinstall": "node scripts/patch-zod-locales.mjs",
+    "build": "node scripts/build.mjs"
   },
   "dependencies": {
     "@get-bb/plugin-sdk": "0.6.49",

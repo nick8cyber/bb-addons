@@ -428,8 +428,8 @@ async function safeQueryAll(page, selector, retries = 3) {
 
 // PLUG-281: >~100KB prompts hang execCommand('insertText') — fail fast before
 // any page work. Unset → 100000 default; non-positive env → no limit.
-function argonMaxPromptBytes() {
-  const raw = process.env.ARGON_MAX_PROMPT_BYTES;
+function webGeminiMaxPromptBytes() {
+  const raw = process.env.WEB_GEMINI_MAX_PROMPT_BYTES ?? process.env.ARGON_MAX_PROMPT_BYTES;
   if (raw == null || raw === '') return 100_000;
   const v = Number(raw);
   // NaN/garbage → default; non-positive → explicit "no limit".
@@ -440,12 +440,12 @@ function throwIfPromptTooLarge(prompt, fieldMaxBytes = null) {
   const bytes = Buffer.byteLength(prompt || '', 'utf8');
   // A real maxlength on the web input field lowers the effective limit.
   const ml = Number(fieldMaxBytes);
-  const limit = Number.isFinite(ml) && ml > 0 ? Math.min(argonMaxPromptBytes(), ml) : argonMaxPromptBytes();
+  const limit = Number.isFinite(ml) && ml > 0 ? Math.min(webGeminiMaxPromptBytes(), ml) : webGeminiMaxPromptBytes();
   if (bytes > limit) {
     const err = new Error(
-      `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.`
+      `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (WEB_GEMINI_MAX_PROMPT_BYTES). Shrink the request and retry.`
     );
-    err.code = 'ARGON_PROMPT_TOO_LARGE';
+    err.code = 'WEB_GEMINI_PROMPT_TOO_LARGE';
     throw err;
   }
 }
@@ -491,7 +491,7 @@ function upsellDialogConfirmsLock(doc = globalThis.document) {
   for (const dlg of dlgs) {
     // Skip dialogs that were already open before the model-item click — a
     // pre-existing promo with a plan CTA is not a response to this click.
-    if (typeof dlg.getAttribute === 'function' && dlg.getAttribute('data-argon-pre-click') !== null) continue;
+    if (typeof dlg.getAttribute === 'function' && dlg.getAttribute('data-web-gemini-pre-click') !== null) continue;
     const actions = [...dlg.querySelectorAll('button,[role="button"],a')];
     if (!actions.some((x) => PLAN_CTA.test((x.innerText || '').trim()))) continue;
     const dismiss = actions.find((x) => DISMISS.test((x.innerText || '').trim()));
@@ -510,7 +510,7 @@ function markVisibleDialogs(doc = globalThis.document) {
   let n = 0;
   for (const d of doc.querySelectorAll('mat-dialog-container, [role="dialog"]')) {
     if (d.offsetParent === null || typeof d.setAttribute !== 'function') continue;
-    d.setAttribute('data-argon-pre-click', '1');
+    d.setAttribute('data-web-gemini-pre-click', '1');
     n += 1;
   }
   return n;
@@ -1040,11 +1040,11 @@ async function sendPrompt({
             'button[aria-label*="Stop" i], button[aria-label*="Остановить" i], button[data-test-id="stop-button"]'
           );
           if (stopBtn !== null) return true;
-          if (!window.__argonFindTurnTarget && fnSrc) {
+          if (!window.__webGeminiFindTurnTarget && !window.__argonFindTurnTarget && fnSrc) {
             // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
-            window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+            window.__webGeminiFindTurnTarget = (0, eval)('(' + fnSrc + ')');
           }
-          const fn = window.__argonFindTurnTarget;
+          const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
           return fn(document, idx, promptPrefix) !== null;
         },
         { idx: initialCount, promptPrefix, fnSrc: findTurnTarget.toString() }
@@ -1070,11 +1070,11 @@ async function sendPrompt({
 
       const currentText = await safeEval(page,
         ({ idx, promptPrefix, fnSrc }) => {
-          if (!window.__argonFindTurnTarget && fnSrc) {
+          if (!window.__webGeminiFindTurnTarget && !window.__argonFindTurnTarget && fnSrc) {
             // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
-            window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+            window.__webGeminiFindTurnTarget = (0, eval)('(' + fnSrc + ')');
           }
-          const fn = window.__argonFindTurnTarget;
+          const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
           const target = fn(document, idx, promptPrefix);
           if (!target) return null;
           const mc = target.querySelector('message-content');
@@ -1109,11 +1109,11 @@ async function sendPrompt({
 
       const hasFinishedContent = await safeEval(page,
         ({ idx, promptPrefix, fnSrc }) => {
-          if (!window.__argonFindTurnTarget && fnSrc) {
+          if (!window.__webGeminiFindTurnTarget && !window.__argonFindTurnTarget && fnSrc) {
             // Safe driver evaluation: fnSrc is findTurnTarget.toString() from gemini-driver.js
-            window.__argonFindTurnTarget = (0, eval)('(' + fnSrc + ')');
+            window.__webGeminiFindTurnTarget = (0, eval)('(' + fnSrc + ')');
           }
-          const fn = window.__argonFindTurnTarget;
+          const fn = window.__webGeminiFindTurnTarget || window.__argonFindTurnTarget;
           const last = fn(document, idx, promptPrefix);
           if (!last) return false;
           const hasText = (last.querySelector('message-content')?.innerText || '').trim().length > 0;
@@ -1142,7 +1142,7 @@ async function sendPrompt({
     ))) {
       await stopGeneration(page);
       const e = new Error(`generation still running after ${MAX_WAIT_MS / 1000}s cap — answer truncated`);
-      e.code = 'ARGON_STREAM_TIMEOUT';
+      e.code = 'WEB_GEMINI_STREAM_TIMEOUT';
       throw e;
     }
 
@@ -1210,7 +1210,7 @@ async function sendPrompt({
     // before parking tab on about:blank
     try {
       if (page && !page.isClosed?.() && typeof page.url === 'function' && page.url().includes('gemini.google.com')) {
-        const timeoutMs = Number(process.env.ARGON_USAGE_TIMEOUT_MS || 10_000);
+        const timeoutMs = Number(process.env.WEB_GEMINI_USAGE_TIMEOUT_MS || process.env.ARGON_USAGE_TIMEOUT_MS || 10_000);
         await Promise.race([
           usageLimits.captureUsageLimits(page, {
             accountId: accountId || (backend && backend.id) || profile,
@@ -1224,7 +1224,7 @@ async function sendPrompt({
         ]);
       }
     } catch (err) {
-      if (process.env.ARGON_DEBUG) {
+      if (process.env.WEB_GEMINI_DEBUG || process.env.ARGON_DEBUG) {
         console.warn('[argon] captureUsageLimits post-turn error:', err.message);
       }
     }
@@ -1635,9 +1635,12 @@ async function attachFile(page, filePath) {
 }
 
 /* ---------- PLUG-291: файлы, сгенерированные Gemini в ответе ---------- */
-const numEnv = (name, dflt) => {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) && v > 0 ? v : dflt;
+const numEnv = (names, dflt) => {
+  for (const name of [].concat(names)) {
+    const v = Number(process.env[name]);
+    if (Number.isFinite(v) && v > 0) return v;
+  }
+  return dflt;
 };
 
 function sanitizeDownloadName(name) {
@@ -1732,8 +1735,8 @@ async function collectGeneratedFiles(page, opts = {}) {
   const files = [];
   const skipped = [];
   if (!dir || !page) return { files, skipped };
-  const maxCount = numEnv('ARGON_MAX_DOWNLOAD_COUNT', 5);
-  const maxBytes = numEnv('ARGON_MAX_DOWNLOAD_BYTES', 50 * 1024 * 1024);
+  const maxCount = numEnv(['WEB_GEMINI_MAX_DOWNLOAD_COUNT', 'ARGON_MAX_DOWNLOAD_COUNT'], 5);
+  const maxBytes = numEnv(['WEB_GEMINI_MAX_DOWNLOAD_BYTES', 'ARGON_MAX_DOWNLOAD_BYTES'], 50 * 1024 * 1024);
   const nonce = `n${Date.now().toString(36)}`;
 
   let cands = null;

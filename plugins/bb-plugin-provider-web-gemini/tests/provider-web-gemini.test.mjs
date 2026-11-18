@@ -694,7 +694,7 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   // 1. initialize
   sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
   const r1 = await waitForResponse(1);
-  assert.equal(r1.result.agentInfo.name, "argon-gemini");
+  assert.ok(r1.result.agentInfo.name === "web-gemini" || r1.result.agentInfo.name === "argon-gemini");
   assert.equal(r1.result.agentInfo.version, "0.2.0");
   assert.equal(r1.result.agentCapabilities.loadSession, false);
 
@@ -702,10 +702,10 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });
   const r2 = await waitForResponse(2);
   const sessionId = r2.result.sessionId;
-  assert.ok(sessionId.startsWith(`argon-${serverProc.pid}-`));
+  assert.ok(sessionId.startsWith(`web-gemini-${serverProc.pid}-`));
   sendReq({ jsonrpc: "2.0", id: 22, method: "session/new", params: { cwd: "/tmp" } });
   const r22 = await waitForResponse(22);
-  assert.ok(r22.result.sessionId.startsWith(`argon-${serverProc.pid}-`));
+  assert.ok(r22.result.sessionId.startsWith(`web-gemini-${serverProc.pid}-`));
   assert.notEqual(r22.result.sessionId, sessionId);
   assert.ok(Array.isArray(r2.result.models.availableModels));
   assert.ok(r2.result.models.availableModels.length > 0);
@@ -850,8 +850,8 @@ test("5. Full JSON-RPC cycle of acp-server.mjs in ARGON_FAKE=1 mode with lease r
   const update = await waitForNotification("session/update");
   assert.equal(update.params.sessionId, sessionId);
   assert.ok(
-    update.params.update?.content?.text?.includes("FAKE_ARGON_ECHO") ||
-    update.params.update?.text?.includes("FAKE_ARGON_ECHO")
+    update.params.update?.content?.text?.includes("FAKE_") ||
+    update.params.update?.text?.includes("FAKE_")
   );
 
   // Verify lease is actively held while execution is delayed
@@ -1173,10 +1173,10 @@ test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before
   process.env.ARGON_MAX_PROMPT_BYTES = "100";
   try {
     await assert.rejects(driver.sendPrompt({ prompt: "x".repeat(200) }), (err) => {
-      assert.equal(err.code, "ARGON_PROMPT_TOO_LARGE");
+      assert.equal(err.code, "WEB_GEMINI_PROMPT_TOO_LARGE");
       assert.equal(
         err.message,
-        "prompt too large: 200 bytes exceeds limit 100 bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry."
+        "prompt too large: 200 bytes exceeds limit 100 bytes (WEB_GEMINI_MAX_PROMPT_BYTES). Shrink the request and retry."
       );
       return true;
     });
@@ -1256,7 +1256,7 @@ test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before
   assert.equal(r3.error?.code, -32000);
   assert.equal(
     r3.error?.message,
-    "prompt too large: 200 bytes exceeds limit 100 bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry."
+    "prompt too large: 200 bytes exceeds limit 100 bytes (WEB_GEMINI_MAX_PROMPT_BYTES). Shrink the request and retry."
   );
 
   // UTF-8 is measured in bytes, not characters: 60 × 'й' = 120 bytes > 100.
@@ -1290,7 +1290,112 @@ test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("9. Smart model routing: pickBackendFromState prioritizes pro accounts for argon and ultra for carbon", () => {
+
+test("9. Backward compatibility and web-gemini naming convention", async () => {
+  const { resolveServerScript, default: plugin } = await import("../index.mjs");
+
+  // Verify plugin registration registers both acp-web-gemini and acp-argon
+  const registered = [];
+  plugin({
+    providers: {
+      register(p) {
+        registered.push(p);
+      },
+    },
+  });
+  assert.equal(registered.length, 2);
+  const primary = registered.find((p) => p.id === "acp-web-gemini");
+  assert.ok(primary, "Primary provider acp-web-gemini must be registered");
+  assert.equal(primary.displayName, "Gemini (Web)");
+  assert.equal(primary.badgeLabel, "Gemini");
+
+  const legacy = registered.find((p) => p.id === "acp-argon");
+  assert.ok(legacy, "Legacy provider acp-argon must be registered for backward compatibility");
+  assert.equal(legacy.displayName, "Gemini (Argon)");
+
+  // Test resolveServerScript with WEB_GEMINI_USE_BUNDLED
+  const prevUse = process.env.WEB_GEMINI_USE_BUNDLED;
+  try {
+    process.env.WEB_GEMINI_USE_BUNDLED = "1";
+    assert.equal(resolveServerScript(), path.resolve(PLUGIN_ROOT, "acp-server.mjs"));
+  } finally {
+    if (prevUse === undefined) delete process.env.WEB_GEMINI_USE_BUNDLED;
+    else process.env.WEB_GEMINI_USE_BUNDLED = prevUse;
+  }
+
+  // Test acp-server.mjs with WEB_GEMINI_FAKE=1 and WEB_GEMINI_* environment
+  const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "gemini-compat-test-")));
+  const poolFile = path.join(tmpDir, "pool.json");
+  fs.writeFileSync(
+    poolFile,
+    JSON.stringify({
+      accounts: [
+        {
+          id: "compat-acc-1",
+          email: "compat@example.com",
+          profileDir: path.join(tmpDir, "p1"),
+          cdpPort: 9222,
+          priority: 1,
+        },
+      ],
+    })
+  );
+
+  const serverProc = spawnServer({
+    ...process.env,
+    WEB_GEMINI_FAKE: "1",
+    WEB_GEMINI_FAKE_DELAY_MS: "50",
+    WEB_GEMINI_STATE_DIR: tmpDir,
+    WEB_GEMINI_POOL_FILE: poolFile,
+  });
+
+  const lines = [];
+  serverProc.stdout.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) {
+        try {
+          lines.push(JSON.parse(line.trim()));
+        } catch {}
+      }
+    }
+  });
+
+  function sendReq(req) {
+    serverProc.stdin.write(JSON.stringify(req) + "\n");
+  }
+
+  async function waitForResponse(id, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const idx = lines.findIndex((l) => l.id === id);
+      if (idx >= 0) return lines.splice(idx, 1)[0];
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    throw new Error(`Timeout waiting for response id=${id}`);
+  }
+
+  sendReq({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1 } });
+  const r1 = await waitForResponse(1);
+  assert.equal(r1.result.agentInfo.name, "web-gemini");
+
+  sendReq({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/tmp" } });
+  const r2 = await waitForResponse(2);
+  const sessionId = r2.result.sessionId;
+  assert.ok(sessionId.startsWith("web-gemini-"));
+
+  const legacySessionId = `argon-${sessionId.slice("web-gemini-".length)}`;
+  sendReq({ jsonrpc: "2.0", id: 3, method: "session/set_model", params: { sessionId: legacySessionId, modelId: "carbon" } });
+  const r3 = await waitForResponse(3);
+  assert.ok(!r3.error, `legacy sessionId must be accepted: ${r3.error?.message}`);
+  sendReq({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId } });
+  const r4 = await waitForResponse(4);
+  assert.equal(r4.result.models.currentModelId, "carbon");
+
+  serverProc.stdin.end();
+  await new Promise((resolve) => serverProc.on("exit", resolve));
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+test("10. Smart model routing: pickBackendFromState prioritizes pro accounts for argon and ultra for carbon", () => {
   const testBackends = [
     { id: "pro-1", priority: 10, tier: "pro", cdp: "9222" },
     { id: "pro-2", priority: 10, tier: "pro", cdp: "9223" },
@@ -1395,7 +1500,7 @@ test("9. Smart model routing: pickBackendFromState prioritizes pro accounts for 
   assert.equal(zeroPick.none, true, "When all accounts have priority 0, pickBackendFromState returns none");
 });
 
-test("10. acp-server slog and lifecycle guards, driver :visible and RU selectors", async () => {
+test("11. acp-server slog and lifecycle guards, driver :visible and RU selectors", async () => {
   // 1. slog writes to acp-server.log under STATE_DIR
   const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-slog-test-")));
   process.env.ARGON_STATE_DIR = tmpDir;
@@ -1429,7 +1534,7 @@ test("10. acp-server slog and lifecycle guards, driver :visible and RU selectors
   );
 });
 
-test("11. parseUsageLimits parses batchexecute wrb.fr frames and handles self-healing recipe rpcid", () => {
+test("12. parseUsageLimits parses batchexecute wrb.fr frames and handles self-healing recipe rpcid", () => {
   // 0. Verify candidate rpcids list
   assert.ok(Array.isArray(KNOWN_CANDIDATE_RPCIDS), "KNOWN_CANDIDATE_RPCIDS must be an array");
   assert.ok(KNOWN_CANDIDATE_RPCIDS.includes("jSf9Qc"), "KNOWN_CANDIDATE_RPCIDS must contain default rpcid jSf9Qc");
@@ -1471,7 +1576,7 @@ test("11. parseUsageLimits parses batchexecute wrb.fr frames and handles self-he
   assert.equal(parseUsageLimits("invalid non-json text"), null);
 });
 
-test("12. accounts-usage.json multi-process merge logic and atomic file updates", async () => {
+test("13. accounts-usage.json multi-process merge logic and atomic file updates", async () => {
   const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "usage-merge-test-")));
 
   // Initial write for acc1
@@ -1560,7 +1665,7 @@ test("12. accounts-usage.json multi-process merge logic and atomic file updates"
   }
 });
 
-test("13. captureUsageLimits domain gating, evaluate execution, and throttling", async () => {
+test("14. captureUsageLimits domain gating, evaluate execution, and throttling", async () => {
   const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "usage-capture-test-")));
 
   // 1. Tab not on gemini.google.com -> skips evaluate and returns null
@@ -1656,7 +1761,7 @@ test("13. captureUsageLimits domain gating, evaluate execution, and throttling",
   assert.equal(errRes, null, "Evaluate error must return null without throwing");
 });
 
-test("14. sendPrompt signature, opts hygiene, mock integration with captureUsageLimits, and backend.tier propagation", async () => {
+test("15. sendPrompt signature, opts hygiene, mock integration with captureUsageLimits, and backend.tier propagation", async () => {
   const driverSrc = fs.readFileSync(path.join(PLUGIN_ROOT, "src/gemini-driver.js"), "utf8");
 
   // 1. Smoke checks: sendPrompt signature and opts.* hygiene
@@ -1836,7 +1941,7 @@ test("14. sendPrompt signature, opts hygiene, mock integration with captureUsage
   }
 });
 
-test("15. PLUG-280 model↔account selector filtering and incompatibility resets", async () => {
+test("16. PLUG-280 model↔account selector filtering and incompatibility resets", async () => {
   const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-compat-test-")));
   const poolFile = path.join(tmpDir, "pool.json");
   const statePath = path.join(tmpDir, "accounts-state.json");
@@ -1964,7 +2069,7 @@ test("15. PLUG-280 model↔account selector filtering and incompatibility resets
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("16. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", async () => {
+test("17. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", async () => {
   // --- lock-icon predicate on DOM fixtures ---
   const icon = (props = {}) => ({
     offsetParent: {},
@@ -2053,7 +2158,7 @@ test("16. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   const preDlg = dlg([btn("Upgrade"), btn("Не сейчас")]);
   const preDoc = doc([preDlg]);
   assert.equal(markVisibleDialogs(preDoc), 1, "visible pre-click dialog is marked");
-  assert.equal(preDlg.getAttribute("data-argon-pre-click"), "1");
+  assert.equal(preDlg.getAttribute("data-web-gemini-pre-click"), "1");
   assert.equal(
     upsellDialogConfirmsLock(preDoc),
     false,
@@ -2236,7 +2341,7 @@ test("16. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
     delete globalThis.document;
   }
   assert.equal(
-    preDialogs[0].getAttribute("data-argon-pre-click"),
+    preDialogs[0].getAttribute("data-web-gemini-pre-click"),
     "1",
     "Pre-existing upsell-looking dialog must be marked and ignored"
   );
@@ -2310,7 +2415,7 @@ test("16. PLUG-282: exact lock predicate, upsell CTA gate, and ops unlock", asyn
   assert.deepEqual(st.accounts["pro-1"].lockedModels, [], "unlock all clears every account");
 });
 
-test("17. PLUG-285: bb <system_instructions> blocks stripped from session/prompt", async () => {
+test("18. PLUG-285: bb <system_instructions> blocks stripped from session/prompt", async () => {
   // Predicate: only a text block whose text STARTS with the marker is bb
   // context; marker inside user text and non-text blocks are untouched.
   assert.equal(
@@ -2421,7 +2526,7 @@ test("17. PLUG-285: bb <system_instructions> blocks stripped from session/prompt
   );
   assert.ok(chunk, "FAKE echo chunk must be emitted");
   const echo = String(chunk.params.update.text ?? chunk.params.update.content?.text ?? "");
-  assert.ok(echo.includes("FAKE_ARGON_ECHO"), "echo prefix expected");
+  assert.ok(echo.includes("FAKE_WEB_GEMINI_ECHO"), "echo prefix expected");
   assert.ok(echo.includes("Найди новости"), "user text must reach the driver");
   assert.ok(
     echo.includes("<system_instructions>"),
@@ -2459,7 +2564,7 @@ test("17. PLUG-285: bb <system_instructions> blocks stripped from session/prompt
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("18. PLUG-286: driver/page failures are transient — never model-unavailable, never parked", () => {
+test("19. PLUG-286: driver/page failures are transient — never model-unavailable, never parked", () => {
   // The 6h-park symptom: waitForSelector timeout on a hung insert — a
   // driver transient, rotatable (retry on the next account inside the
   // deadline), parkedReason null so no account is ever parked.

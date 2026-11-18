@@ -6237,3 +6237,42 @@ test("§18.6: the compaction memo defaults to $BB_THREAD_STORAGE/HANDOFF.md", as
     /Хендофф: \$BB_THREAD_STORAGE\/HANDOFF\.md/,
   );
 });
+
+test("PLUG-298: reissue matches chain index and used routes across aliases", async () => {
+  const customPolicy = JSON.stringify({
+    version: 1,
+    firstResponseSeconds: 30,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["review-web-gemini", "simple-alt"],
+        autoFallback: true,
+      },
+    },
+    routes: {
+      "review-web-gemini": {
+        preset: "simple",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+      },
+      "simple-alt": {
+        preset: "simple-alt",
+        provider: "agy",
+      },
+    },
+  });
+  const h = makeHarness({ policyText: customPolicy });
+  // Row ran on legacy name "review-argon"
+  const row = h.insertActive({ threadId: "thr_e1", level: "review", route: "review-argon" });
+  h.threadDtos.set("thr_e1", dto("thr_e1", "active"));
+  h.eventLog.set("thr_e1", [ev(1, "turn/started", T0)]);
+  await h.wd.onThreadEvents({ thread: dto("thr_e1"), sequence: 1 });
+  h.setNow(T0 + 31_000);
+  await h.wd.checkTimers();
+
+  assert.equal(h.store.get(row.id)!.status, "reissued");
+  const active = h.store.listActive();
+  assert.equal(active.length, 1);
+  // Reissued to next candidate in chain: "simple-alt", not restarting at review-web-gemini
+  assert.equal(active[0]!.route, "simple-alt");
+});
