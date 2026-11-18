@@ -161,34 +161,49 @@ describe("createArgonUsage", () => {
     expect(acc.tier).toBeNull();
   });
 
-  it("uses the injected stateDir, then ARGON_STATE_DIR, then the default path", () => {
+  it("resolves injected stateDir, then WEB_GEMINI_STATE_DIR, ARGON_STATE_DIR, then default dirs", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "argon-home-"));
-    try {
-      const viaEnv = createArgonUsage({ userHome: () => home, now: () => NOW });
-      const envDir = fs.mkdtempSync(path.join(os.tmpdir(), "argon-env-"));
-      fs.mkdirSync(path.join(envDir), { recursive: true });
+    const argonEnvDir = fs.mkdtempSync(path.join(os.tmpdir(), "argon-env-"));
+    const geminiEnvDir = fs.mkdtempSync(path.join(os.tmpdir(), "web-gemini-env-"));
+    const writeUsage = (dir: string, id: string) => {
+      fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(
-        path.join(envDir, "accounts-usage.json"),
-        JSON.stringify({ accounts: { a: { updatedAt: NOW, stale: false } } }),
+        path.join(dir, "accounts-usage.json"),
+        JSON.stringify({ accounts: { [id]: { updatedAt: NOW, stale: false } } }),
       );
-      const prevEnv = process.env.ARGON_STATE_DIR;
-      process.env.ARGON_STATE_DIR = envDir;
-      try {
-        expect(viaEnv.readAccounts().map((a) => a.id)).toEqual(["a"]);
-      } finally {
-        if (prevEnv === undefined) delete process.env.ARGON_STATE_DIR;
-        else process.env.ARGON_STATE_DIR = prevEnv;
+    };
+    const saved = {
+      WEB_GEMINI_STATE_DIR: process.env.WEB_GEMINI_STATE_DIR,
+      ARGON_STATE_DIR: process.env.ARGON_STATE_DIR,
+    };
+    const restore = () => {
+      for (const key of Object.keys(saved) as (keyof typeof saved)[]) {
+        const value = saved[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
       }
-      const fallbackDir = path.join(home, ".bb", "plugins", "provider-argon");
-      fs.mkdirSync(fallbackDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(fallbackDir, "accounts-usage.json"),
-        JSON.stringify({ accounts: { b: { updatedAt: NOW, stale: false } } }),
-      );
-      expect(viaEnv.readAccounts().map((a) => a.id)).toEqual(["b"]);
-      fs.rmSync(envDir, { recursive: true, force: true });
+    };
+    try {
+      const viaDefault = createArgonUsage({ userHome: () => home, now: () => NOW });
+      const legacyDir = path.join(home, ".bb", "plugins", "provider-argon");
+      writeUsage(legacyDir, "legacy");
+      expect(viaDefault.readAccounts().map((a) => a.id)).toEqual(["legacy"]);
+      const geminiDir = path.join(home, ".bb", "plugins", "provider-web-gemini");
+      writeUsage(geminiDir, "gemini");
+      expect(viaDefault.readAccounts().map((a) => a.id)).toEqual(["gemini"]);
+      writeUsage(argonEnvDir, "argon-env");
+      process.env.ARGON_STATE_DIR = argonEnvDir;
+      expect(viaDefault.readAccounts().map((a) => a.id)).toEqual(["argon-env"]);
+      writeUsage(geminiEnvDir, "web-gemini-env");
+      process.env.WEB_GEMINI_STATE_DIR = geminiEnvDir;
+      expect(viaDefault.readAccounts().map((a) => a.id)).toEqual(["web-gemini-env"]);
+      write({ accounts: { injected: { updatedAt: NOW, stale: false } } });
+      expect(reader().readAccounts().map((a) => a.id)).toEqual(["injected"]);
     } finally {
+      restore();
       fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(argonEnvDir, { recursive: true, force: true });
+      fs.rmSync(geminiEnvDir, { recursive: true, force: true });
     }
   });
 });

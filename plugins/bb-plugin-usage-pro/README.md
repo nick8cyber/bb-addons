@@ -23,7 +23,7 @@
   - Определение статуса кулдауна (`cooldownUntilMs`) при исчерпании лимитов.
   - Аккаунт с `priority=0` в `accounts-state.json` (выведен из ротации) показывается с пометкой `Out of rotation` и опрашивается только по явному обновлению — фонового опроса для него нет.
 - **Gemini Web (Argon) — карточки `acp-argon`**:
-  - Отдельный таб с квотами веб-аккаунтов Gemini из `$ARGON_STATE_DIR/accounts-usage.json` (пишет provider-argon; дефолт `~/.bb/plugins/provider-argon`). Плагин только читает файл — он не запускает сбор и не меняет аккаунты.
+  - Отдельный таб с квотами веб-аккаунтов Gemini из `$STATE_DIR/accounts-usage.json` ($STATE_DIR = `WEB_GEMINI_STATE_DIR`, иначе `ARGON_STATE_DIR`; дефолт `~/.bb/plugins/provider-web-gemini` с фолбэком на `provider-argon`) — файл пишет provider-web-gemini (ранее provider-argon). Плагин только читает файл — он не запускает сбор и не меняет аккаунты.
   - По каждому аккаунту — окна `Gemini 5h` и `Gemini Weekly` с процентом и временем сброса, бейдж тира (`Ultra`/`Pro`) и возраст данных в подписи аккаунта (`<id> · обновлено N мин назад`). Данные старше 30 минут (или флаг `stale` в файле) помечаются предупреждением «Данные устарели — обновлено …».
   - Файл отсутствует или не парсится — секция не показывается, без ошибок.
 - **Claude Code**:
@@ -70,7 +70,7 @@ bb plugin reload usage-pro
 - `server.ts` — серверная точка входа, подключающая сохранённый сборщик квот и обработчик повторов.
 - `credit-retry.ts` и `credit-retry.test.ts` — ограниченный автоповтор и тесты на официальном fake-host SDK.
 - `usage-policy.ts` — чистая политика идентичности, выбора измерения и подписи тарифа.
-- `argon-usage.ts` — чтение квот Gemini Web из `accounts-usage.json` provider-argon (секция `acp-argon`): парсинг, возраст данных и пометка stale; `argon-usage.test.ts` — тесты.
+- `argon-usage.ts` — чтение квот Gemini Web из `accounts-usage.json` provider-web-gemini, ранее provider-argon (секция `acp-argon`): парсинг, возраст данных и пометка stale; `argon-usage.test.ts` — тесты.
 - `dist/provider-usage-base.js` — исходный backend-артефакт сборщика с поддержкой канонических аккаунтов и локальных ошибок; хранится в `dist`, чтобы сборщик CSS не сканировал его как frontend-исходник. Не удалять при очистке сгенерированных файлов.
 - `dist/server.js` — итоговая серверная сборка: опрос квот, кэширование и автоповтор.
 - `app.js` — стабильная frontend-точка входа; импортирует исходные стили и реэкспортирует клиентский bundle.

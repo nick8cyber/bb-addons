@@ -3,7 +3,7 @@ title: Usage Pro — идентичность аккаунтов и локаль
 status: approved
 owner: coordinator
 date: 2026-11-17
-revision: 3 (§6 переписан — аккаунты Antigravity только через родной agy, прямой сборщик acp-antigravity удалён, ADR-0029; 2.3 — §7 — карточки acp-argon по accounts-usage.json от provider-argon; 2.2 — §6.2 — дедуп модельных окон по мгновению сброса; §6.5 — порядок окон блоками семейств; 2.1 — §6.3 — отключённые бакеты как у пула; 2 — §6 — карточка acp-antigravity, исключение из запрета фильтра по email)
+revision: 3.1 (§7/§7.1 — dual-контракт $STATE_DIR: WEB_GEMINI_STATE_DIR/ARGON_STATE_DIR, дефолт provider-web-gemini с фолбэком provider-argon, писатель provider-web-gemini, PLUG-298; 3 — §6 переписан — аккаунты Antigravity только через родной agy, прямой сборщик acp-antigravity удалён, ADR-0029; 2.3 — §7 — карточки acp-argon по accounts-usage.json от provider-argon; 2.2 — §6.2 — дедуп модельных окон по мгновению сброса; §6.5 — порядок окон блоками семейств; 2.1 — §6.3 — отключённые бакеты как у пула; 2 — §6 — карточка acp-antigravity, исключение из запрета фильтра по email)
 tags: [usage-pro, codex, accounts]
 ---
 
@@ -119,9 +119,9 @@ Live: у основного хоста один healthy Codex account (Team) с 
 
 ## 7. Gemini Web (Argon) — карточки `acp-argon:<id>` (ревизия 2.3, 17.11)
 
-Секция usage-pro по данным provider-argon (контракт PLUG-289, спека provider-argon §4.4); реализация — PLUG-290.
+Секция usage-pro по данным provider-web-gemini, ранее provider-argon (контракт PLUG-289, спека provider-argon §4.4); реализация — PLUG-290.
 
-1. **Источник.** Локальный файл `$ARGON_STATE_DIR/accounts-usage.json` (дефолт `~/.bb/plugins/provider-argon/accounts-usage.json`), который пишет provider-argon: `{"accounts": {"<id>": {"daily": {"percent": N, "resetEpochSec": N}, "weekly": {…}, "tier": "ultra"|"pro", "updatedAt": N, "stale": bool}}}`. Читается безусловно на каждый `getUsage`: файл дешёвый, а кэш или гейт по `providerId` прятали бы секцию при scoped-рефреше чужого таба — весь snapshot ответа заменяется фронтом целиком (agy и acp-antigravity переживают scoped-запросы за счёт своих кэшей). Карточки привязываются к primary host — файл локален для машины collector'а.
+1. **Источник.** Локальный файл `$STATE_DIR/accounts-usage.json`, который пишет provider-web-gemini (ранее provider-argon): `{"accounts": {"<id>": {"daily": {"percent": N, "resetEpochSec": N}, "weekly": {…}, "tier": "ultra"|"pro", "updatedAt": N, "stale": bool}}}`. `$STATE_DIR` резолвится как у писателя (спека provider-argon §4.4): `WEB_GEMINI_STATE_DIR`, иначе `ARGON_STATE_DIR`, иначе `~/.bb/plugins/provider-web-gemini` при его наличии, с фолбэком на `~/.bb/plugins/provider-argon`. Читается безусловно на каждый `getUsage`: файл дешёвый, а кэш или гейт по `providerId` прятали бы секцию при scoped-рефреше чужого таба — весь snapshot ответа заменяется фронтом целиком (agy и acp-antigravity переживают scoped-запросы за счёт своих кэшей). Карточки привязываются к primary host — файл локален для машины collector'а.
 2. **Окна.** `daily` — 5-часовое скользящее окно Gemini Web → подпись «Gemini 5h»; `weekly` → «Gemini Weekly». `percent` — доля использования → `usedPercent` без инверсии; `resetEpochSec` в секундах → `resetsAt` ISO (×1000); невалидное время (не число или <1.6e9) → `resetsAt=null`.
 3. **Идентичность и возраст.** id карточки `acp-argon:<account-id>`; `accountLabel` = `<id> · обновлено <возраст>` («только что» / «N мин назад» / «N ч назад» / «N д назад»), `accountEmail=null`: строки таба рендерят `accountEmail ?? accountLabel`, и возраст в accountEmail затенял бы id, делая строки пула неразличимыми. `usage.status="ok"`, `planLabel` — по tier: ultra→Ultra, pro→Pro, прочий непустой — с заглавной буквы, отсутствующий → null.
 4. **Stale.** `stale=true` в записи, отсутствующий `updatedAt` или возраст >30 мин → warning «Данные устарели — обновлено <возраст>» (без возраста — «Данные устарели»), `accountLabel` = голый `<id>` — возраст уже в warning.

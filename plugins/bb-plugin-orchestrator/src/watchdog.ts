@@ -16,6 +16,12 @@
 import { OrchestratorError } from "./errors.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
+  PRESET_ALIASES,
+  ROUTE_ALIASES,
+  canonicalQuotaGroup,
+  canonicalRouteName,
+  findRoute,
+  resolvePolicyRoute,
   levelRole,
   quotaGroupOf,
   quotaGroupsForOneOff,
@@ -548,7 +554,7 @@ export function createWatchdog(deps: WatchdogDeps) {
   /** Route facts from the live policy, falling back to the stored row. */
   const routeInfo = async (row: DelegationRow) => {
     const load = await deps.loadPolicy();
-    const route = load.policy?.routes[row.route];
+    const route = findRoute(load.policy, row.route);
     // §2.3 r24 (PLUG-182): a `preset:` one-off is not in the policy
     // routes — a quota burn holds the quota group of every same-provider
     // AND same-model policy route plus the one-off's own name. The
@@ -571,7 +577,7 @@ export function createWatchdog(deps: WatchdogDeps) {
           models,
         );
       } else {
-        cachedGroups = [row.route];
+        cachedGroups = [canonicalQuotaGroup(row.route)];
       }
       return cachedGroups;
     };
@@ -588,7 +594,11 @@ export function createWatchdog(deps: WatchdogDeps) {
         route?.tools === false ||
         (row.route.startsWith("preset:") &&
           Object.values(load.policy?.routes ?? {}).some(
-            (r) => r.preset === row.preset && r.tools === false,
+            (r) =>
+              r.tools === false &&
+              (r.preset === row.preset ||
+                (PRESET_ALIASES[row.preset] !== undefined &&
+                  r.preset === PRESET_ALIASES[row.preset])),
           )),
       patterns: [...BUILTIN_QUOTA_PATTERNS, ...(route?.quotaPatterns ?? [])],
       unavailablePatterns: [
@@ -862,8 +872,13 @@ export function createWatchdog(deps: WatchdogDeps) {
       // NULL`). An explicit --route/--preset delegation restarts from the
       // chain's beginning and skips every route this task already ran on.
       const held = store.heldGroups(now());
+      const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
       const unavailable = new Set(info.load.unavailableRoutes);
-      const idx = info.level.chain.indexOf(row.route);
+      const matchRoute = (a: string, b: string) =>
+        a === b ||
+        canonicalRouteName(a) === canonicalRouteName(b) ||
+        ROUTE_ALIASES[a] === b;
+      const idx = info.level.chain.findIndex((c) => matchRoute(c, row.route));
       const restart = idx === -1 || row.explicit_route !== 0;
       const candidates = restart
         ? info.level.chain
@@ -879,14 +894,34 @@ export function createWatchdog(deps: WatchdogDeps) {
       const used = restart
         ? store.chainUsedRoutes(row)
         : store.chainUsedRoutes(row, { reissuesOnly: true });
+      const isUsed = (name: string) =>
+        used.has(name) ||
+        (ROUTE_ALIASES[name] !== undefined && used.has(ROUTE_ALIASES[name])) ||
+        used.has(canonicalRouteName(name));
+      const isUnavailable = (name: string) =>
+        unavailable.has(name) ||
+        (ROUTE_ALIASES[name] !== undefined && unavailable.has(ROUTE_ALIASES[name])) ||
+        unavailable.has(canonicalRouteName(name));
       for (const name of candidates) {
-        const r = info.policy.routes[name];
-        if (!r || used.has(name) || unavailable.has(name)) continue;
+        const r = findRoute(info.policy, name);
+        if (!r || isUsed(name) || isUnavailable(name)) continue;
+        const alias = ROUTE_ALIASES[name];
+        const canon = canonicalRouteName(name);
+        const qg = quotaGroupOf(r, name);
         // §5.2 holds sit on quota groups, §5.3 `unavailable` on route
         // names — a candidate is out when either is held.
-        if (held.has(name) || held.has(quotaGroupOf(r, name))) continue;
-        nextName = name;
-        nextRoute = r;
+        if (
+          held.has(name) ||
+          (alias && held.has(alias)) ||
+          held.has(canon) ||
+          held.has(qg) ||
+          canonHeld.has(qg)
+        ) {
+          continue;
+        }
+        const resolved = resolvePolicyRoute(info.policy, name);
+        nextName = resolved?.name ?? name;
+        nextRoute = resolved?.route ?? r;
         break;
       }
     }
@@ -2807,7 +2842,7 @@ export function createWatchdog(deps: WatchdogDeps) {
     // `policy.routes` — it borrows the window of ANY policy route on the
     // same provider, then `firstResponseSecondsByProvider`, then global.
     const firstMsOf = (row: DelegationRow) => {
-      const own = policy?.routes[row.route]?.firstResponseSeconds;
+      const own = findRoute(policy, row.route)?.firstResponseSeconds;
       if (own !== undefined) return own * 1000;
       if (policy && row.route.startsWith("preset:")) {
         const routeWindow = Object.values(policy.routes).find(
@@ -2829,10 +2864,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     // `routes.*.idleSeconds` (response silence) — one message each,
     // never a stop.
     const startMsOf = (row: DelegationRow) =>
-      (policy?.routes[row.route]?.startSeconds ?? DEFAULT_START_SECONDS) *
+      (findRoute(policy, row.route)?.startSeconds ?? DEFAULT_START_SECONDS) *
       1000;
     const idleMsOf = (row: DelegationRow) =>
-      (policy?.routes[row.route]?.idleSeconds ?? DEFAULT_IDLE_SECONDS) *
+      (findRoute(policy, row.route)?.idleSeconds ?? DEFAULT_IDLE_SECONDS) *
       1000;
     const maxRunMs =
       (policy?.maxRunSeconds ?? DEFAULT_MAX_RUN_SECONDS) * 1000;

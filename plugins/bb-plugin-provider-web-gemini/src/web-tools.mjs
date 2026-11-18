@@ -14,26 +14,26 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 
-const num = (name, dflt) => {
-  const v = Number(process.env[name]);
+const num = (name, legacyName, dflt) => {
+  const v = Number(process.env[name] ?? process.env[legacyName]);
   return Number.isFinite(v) && v > 0 ? v : dflt;
 };
 
-export const TOOL_TIMEOUT_MS = num("ARGON_TOOL_TIMEOUT_MS", 15_000);
+export const TOOL_TIMEOUT_MS = num("WEB_GEMINI_TOOL_TIMEOUT_MS", "ARGON_TOOL_TIMEOUT_MS", 15_000);
 export const MAX_TOOL_RESULT_BYTES = 60_000;
-export const MAX_MESSAGE_BYTES = num("ARGON_MAX_MESSAGE_BYTES", 120_000);
+export const MAX_MESSAGE_BYTES = num("WEB_GEMINI_MAX_MESSAGE_BYTES", "ARGON_MAX_MESSAGE_BYTES", 120_000);
 
-// provider-argon §4.1: бюджет исходящего промпта (зеркалит
-// argonMaxPromptBytes() из acp-server.mjs — модуль самодостаточен).
+// provider-web-gemini §4.1: бюджет исходящего промпта (зеркалит
+// webGeminiMaxPromptBytes() из acp-server.mjs — модуль самодостаточен).
 const promptBudgetBytes = () => {
-  const raw = process.env.ARGON_MAX_PROMPT_BYTES;
+  const raw = process.env.WEB_GEMINI_MAX_PROMPT_BYTES ?? process.env.ARGON_MAX_PROMPT_BYTES;
   if (raw == null || raw === "") return 100_000;
   const v = Number(raw);
   return Number.isFinite(v) ? (v > 0 ? v : Number.POSITIVE_INFINITY) : 100_000;
 };
 
 let messageCapWarned = false;
-// provider-argon §4.1: потолок упаковки обязан быть ≤ бюджету промпта минус
+// provider-web-gemini §4.1: потолок упаковки обязан быть ≤ бюджету промпта минус
 // ~4 КБ запаса — иначе packFirstMessage соберёт заведомо неотправимое
 // сообщение. Заданное большим значение логируется и зажимается до потолка.
 export function effectiveMessageBytes(maxBytes = MAX_MESSAGE_BYTES) {
@@ -44,12 +44,12 @@ export function effectiveMessageBytes(maxBytes = MAX_MESSAGE_BYTES) {
   if (!messageCapWarned) {
     messageCapWarned = true;
     process.stderr.write(
-      `[provider-argon] ARGON_MAX_MESSAGE_BYTES=${maxBytes} exceeds prompt budget; clamped to ${cap}\n`,
+      `[provider-web-gemini] WEB_GEMINI_MAX_MESSAGE_BYTES=${maxBytes} exceeds prompt budget; clamped to ${cap}\n`,
     );
   }
   return cap;
 }
-export const MAX_TOOL_ROUNDS = num("ARGON_MAX_TOOL_ROUNDS", 8);
+export const MAX_TOOL_ROUNDS = num("WEB_GEMINI_MAX_TOOL_ROUNDS", "ARGON_MAX_TOOL_ROUNDS", 8);
 export const MAX_LIST_ENTRIES = 200;
 export const MAX_GREP_LINES = 100;
 export const TRUNC_SUFFIX =
@@ -1559,7 +1559,7 @@ export function packFirstMessage({
   }
 
   // 3) Если даже без блоков и подсказок текст задачи (body) превышает maxBytes,
-  // ужимаем body (§5.4/§7.1: потолок ARGON_MAX_MESSAGE_BYTES обязателен).
+  // ужимаем body (§5.4/§7.1: потолок WEB_GEMINI_MAX_MESSAGE_BYTES обязателен).
   if (len(fullText) > maxBytes) {
     head = header;
     const headerWithSepLen = len(head + "\n\n");

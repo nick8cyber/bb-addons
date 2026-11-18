@@ -16,6 +16,7 @@ import {
   runDelegate,
   dispatchToRoute,
   createDelegateQueue,
+  quotaGroupsOfRow,
   type DelegateDeps,
   type DispatchStepsDeps,
 } from "../src/delegate.js";
@@ -460,6 +461,7 @@ function makeDelegateDeps(
   overrides: {
     cli?: (args: string[]) => BbCliResult | Promise<BbCliResult>;
     policyText?: string;
+    presets?: Set<string>;
     spawn?: (a: Record<string, unknown>) => Promise<{ id?: string }>;
     now?: () => number;
     repoPath?: (row: DelegationRow) => Promise<string | null>;
@@ -492,7 +494,7 @@ function makeDelegateDeps(
       updatePluginMetadata: async () => ({}),
     },
     loadPolicy: async () =>
-      parsePolicy(overrides.policyText ?? POLICY_TEXT, PRESETS),
+      parsePolicy(overrides.policyText ?? POLICY_TEXT, overrides.presets ?? PRESETS),
     probes: {
       delegationByThreadId: (id) => store.byThreadId(id),
       hasFreshDispatching: (s, scope) => store.hasFreshDispatching(s, scope),
@@ -510,7 +512,7 @@ function makeDelegateDeps(
     threads: deps.threads,
     primaryHostId: deps.primaryHostId,
     policy: () =>
-      parsePolicy(overrides.policyText ?? POLICY_TEXT, PRESETS).policy,
+      parsePolicy(overrides.policyText ?? POLICY_TEXT, overrides.presets ?? PRESETS).policy,
     now: overrides.now ?? (() => nowVal),
     repoPath: overrides.repoPath ?? (async () => "/repo"),
     packetGit: overrides.packetGit,
@@ -858,7 +860,7 @@ test("§21.2: the orchestrator role text tells the coordinator to delegate resea
   }
 });
 
-function makeHelperDeps(policyText = POLICY_TEXT) {
+function makeHelperDeps(policyText = POLICY_TEXT, presets = PRESETS) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
@@ -880,7 +882,7 @@ function makeHelperDeps(policyText = POLICY_TEXT) {
       update: async () => ({}),
     } as HelperDeps["threads"],
     enqueue: (fn) => fn(),
-    loadPolicy: async () => parsePolicy(policyText, PRESETS),
+    loadPolicy: async () => parsePolicy(policyText, presets),
     helpers: () => ({ maxActive: 3, defaultLevel: "simple" }),
     callerFacts: async () => ({
       threadId: "thr_call",
@@ -940,7 +942,7 @@ const dto = (
     ...extra,
   }) as WatchdogThreadDto;
 
-function makeWatchdog(policyText = POLICY_TEXT) {
+function makeWatchdog(policyText = POLICY_TEXT, presets = PRESETS) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m);
   const store = new DelegationStore(db);
@@ -1030,7 +1032,7 @@ function makeWatchdog(policyText = POLICY_TEXT) {
       stop: threads.stop,
     },
     primaryHostId: async () => "host_1",
-    policy: () => parsePolicy(policyText, PRESETS).policy,
+    policy: () => parsePolicy(policyText, presets).policy,
     now: () => nowVal,
     repoPath: async () => "/repo",
     packetGit: fakeGit({}).git,
@@ -1039,7 +1041,7 @@ function makeWatchdog(policyText = POLICY_TEXT) {
     store,
     bbCli: cli,
     threads: threads as never,
-    loadPolicy: async () => parsePolicy(policyText, PRESETS),
+    loadPolicy: async () => parsePolicy(policyText, presets),
     dispatch: (row, o) => dispatchToRoute(row, o ?? {}, stepsDeps),
     finalize: async () => ({ status: "running" as const, setupErrors: [] }),
     retrySetup: async () => [],
@@ -1892,4 +1894,237 @@ test("r33 аудит C: an expired queue plus a schema refusal advances off the 
   const fresh = store.get(row.id)!;
   assert.equal(fresh.route, "opus-review");
   assert.equal(fresh.queued_at, null);
+});
+
+// ── PLUG-298 tests ───────────────────────────────────────────────────
+
+test("PLUG-298: advanceRoute normalizes legacy routes, aliases, and holds", async () => {
+  const policyText = JSON.stringify({
+    version: 1,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["review-web-gemini", "opus-review"],
+        autoFallback: true,
+      },
+    },
+    routes: {
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+        tools: false,
+        maxActive: 1,
+      },
+      "opus-review": {
+        preset: "o-r",
+        provider: "acp-devin",
+      },
+    },
+  });
+  const { stepsDeps, store } = makeDelegateDeps({
+    policyText,
+    packetGit: fakeGit({}).git,
+    spawn: async () => {
+      throw schemaRefusal();
+    },
+  });
+  // Row with legacy route "review-argon"
+  const row = store.insert({
+    taskKey: "PLUG-100",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "review-argon",
+    preset: "argon-review",
+    provider: "acp-web-gemini",
+    attach: JSON.stringify({ paths: [], from: "shaLINK" }),
+  });
+  // Advance route should find review-argon matching review-web-gemini, not restart to review-web-gemini,
+  // and advance to opus-review!
+  const res = await dispatchToRoute(store.get(row.id)!, {}, stepsDeps);
+  assert.equal(res.status, "running");
+  const fresh = store.get(row.id)!;
+  assert.equal(fresh.route, "opus-review");
+});
+
+test("PLUG-298: advanceRoute skips review-web-gemini when held on 'argon'", async () => {
+  const policyText = JSON.stringify({
+    version: 1,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["start-route", "review-web-gemini", "opus-review"],
+        autoFallback: true,
+      },
+    },
+    routes: {
+      "start-route": {
+        preset: "start",
+        provider: "acp-devin",
+        tools: false,
+      },
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+        tools: false,
+      },
+      "opus-review": {
+        preset: "o-r",
+        provider: "acp-devin",
+      },
+    },
+  });
+  const { stepsDeps, store } = makeDelegateDeps({
+    policyText,
+    presets: new Set(["start", "web-gemini-review", "o-r"]),
+    packetGit: fakeGit({}).git,
+    spawn: async () => {
+      throw schemaRefusal();
+    },
+  });
+  store.hold("argon", T0 + 100_000, "held");
+  const row = store.insert({
+    taskKey: "PLUG-101",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "start-route",
+    preset: "start",
+    provider: "acp-devin",
+    attach: JSON.stringify({ paths: [], from: "shaLINK" }),
+  });
+  const res = await dispatchToRoute(store.get(row.id)!, {}, stepsDeps);
+  assert.equal(res.status, "running");
+  const fresh = store.get(row.id)!;
+  // review-web-gemini was skipped because "argon" is held!
+  assert.equal(fresh.route, "opus-review");
+});
+
+test("PLUG-298: helper advanceChain respects held 'argon' and advances past review-web-gemini", async () => {
+  const policyText = JSON.stringify({
+    version: 1,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["review-web-gemini", "simple"],
+        autoFallback: true,
+      },
+    },
+    routes: {
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+        tools: false,
+        maxActive: 1,
+      },
+      simple: {
+        preset: "simple",
+        provider: "acp-opencode",
+      },
+    },
+  });
+  const { deps, store } = makeHelperDeps(policyText, new Set(["web-gemini-review", "simple"]));
+  // Hold "argon"
+  store.hold("argon", T0 + 100_000, "held");
+  const res = await runHelper({ prompt: "audit this", level: "review", threadId: "thr_call" }, deps);
+  assert.equal(res.route, "simple");
+});
+
+test("PLUG-298: helper --preset argon-review resolves and respects held 'argon'", async () => {
+  const policyText = JSON.stringify({
+    version: 1,
+    levels: {
+      review: { role: "auditor", chain: ["review-web-gemini"] },
+    },
+    routes: {
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+        tools: false,
+      },
+    },
+  });
+  const { deps, store } = makeHelperDeps(policyText, new Set(["web-gemini-review"]));
+  // Without hold: resolves successfully via alias
+  const res = await runHelper({ prompt: "audit this", preset: "argon-review", level: "review", threadId: "thr_call" }, deps);
+  assert.equal(res.route, "review-web-gemini");
+
+  // With hold on "argon": fails with route-unavailable
+  store.hold("argon", T0 + 100_000, "held");
+  await assert.rejects(
+    async () => runHelper({ prompt: "audit this", preset: "argon-review", level: "review", threadId: "thr_call" }, deps),
+    (err: any) => err instanceof OrchestratorError && err.code === "route-unavailable",
+  );
+});
+
+test("PLUG-298: toolless flag preserved for preset:argon-review via PRESET_ALIASES", async () => {
+  const policyText = JSON.stringify({
+    version: 1,
+    levels: {
+      review: { role: "auditor", chain: ["review-web-gemini", "opus-review"], autoFallback: true },
+    },
+    routes: {
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        tools: false,
+      },
+      "opus-review": { preset: "o-r", provider: "acp-devin" },
+    },
+  });
+  const presets = new Set(["web-gemini-review", "o-r"]);
+  const policy = parsePolicy(policyText, presets).policy;
+  const { store, stepsDeps, spawnArgs } = makeDelegateDeps({
+    policyText,
+    presets,
+    packetGit: fakeGit({}).git,
+  });
+
+  const row = store.insert({
+    taskKey: "PLUG-102",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    level: "review",
+    route: "preset:argon-review",
+    preset: "argon-review",
+    provider: "acp-web-gemini",
+    attach: JSON.stringify({ paths: [], from: "shaLINK" }),
+  });
+  const res = await dispatchToRoute(store.get(row.id)!, {}, stepsDeps);
+  assert.equal(res.status, "running");
+  assert.ok(
+    String(spawnArgs[0]?.prompt ?? "").includes("МАТЕРИАЛ ДЛЯ ПРОВЕРКИ"),
+    "auditor packet expected for preset:argon-review",
+  );
+
+  // Watchdog recognizes toolless: missing verdict triggers immediate reissue without reminder
+  const h = makeWatchdog(policyText, presets);
+  const rowWd = h.insertActive({
+    threadId: "thr_wd",
+    level: "review",
+    route: "preset:argon-review",
+    preset: "argon-review",
+    provider: "acp-web-gemini",
+  });
+  h.threadDtos.set("thr_wd", dto("thr_wd", "idle"));
+  h.outputs.set("thr_wd", "отчёт без вердикта");
+  h.eventLog.set("thr_wd", [
+    ev(1, "turn/started", T0),
+    ev(2, "turn/completed", T0 + 10, { status: "completed" }),
+  ]);
+  await h.wd.onThreadEvents({ thread: dto("thr_wd"), sequence: 2 });
+  await h.wd.onThreadIdle(dto("thr_wd", "idle"));
+  const freshWd = h.store.get(rowWd.id)!;
+  assert.equal(freshWd.status, "reissued");
+  assert.equal(h.sends.filter((s) => s.threadId === "thr_wd").length, 0);
+
+  // quotaGroupsOfRow returns both canonical and alias groups
+  const groups = quotaGroupsOfRow(row, policy);
+  assert.ok(groups.has("preset:web-gemini-review"));
+  assert.ok(groups.has("preset:argon-review"));
+  assert.ok(groups.has("web-gemini"));
 });

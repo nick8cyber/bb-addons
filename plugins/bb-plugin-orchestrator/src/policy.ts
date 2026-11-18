@@ -514,7 +514,7 @@ export function parsePolicy(
       const role = level.role ?? (levelName === "review" ? "auditor" : "executor");
       if (role !== "executor") continue;
       for (const routeName of level.chain) {
-        const route = routes[routeName];
+        const route = findRoute(routes, routeName);
         if (!route) continue;
         const detail = presetDetails.get(route.preset);
         if (detail && detail.environmentKind !== "new-worktree") {
@@ -532,7 +532,7 @@ export function parsePolicy(
     const role =
       level.role ?? (levelName === "review" ? "auditor" : "executor");
     for (const routeName of level.chain) {
-      const route = routes[routeName];
+      const route = findRoute(routes, routeName);
       if (!route || route.tools !== false) continue;
       if (
         levelName === "release-audit" ||
@@ -567,9 +567,110 @@ export function parsePolicy(
   };
 }
 
+/** Canonical preset name: transforms legacy argon preset names to web-gemini. */
+export function canonicalPresetName(name: string | undefined): string {
+  if (!name) return "";
+  if (name === "argon-review") return "web-gemini-review";
+  if (name === "argon-research") return "web-gemini-research";
+  return name;
+}
+
+export const PRESET_ALIASES: Record<string, string> = {
+  "argon-review": "web-gemini-review",
+  "argon-research": "web-gemini-research",
+  "web-gemini-review": "argon-review",
+  "web-gemini-research": "argon-research",
+};
+
+/** Canonical route name: transforms legacy argon route names to web-gemini. */
+export function canonicalRouteName(name: string | undefined): string {
+  if (!name) return "";
+  if (name === "review-argon") return "review-web-gemini";
+  if (name === "research-argon") return "research-web-gemini";
+  if (name === "argon-review") return "web-gemini-review";
+  if (name === "argon-research") return "web-gemini-research";
+  return name;
+}
+
+/** Canonical quota group: "argon" and "web-gemini" share the same slot counter. */
+export function canonicalQuotaGroup(g: string): string {
+  if (
+    g === "argon" ||
+    g === "web-gemini" ||
+    g === "review-argon" ||
+    g === "review-web-gemini" ||
+    g === "research-argon" ||
+    g === "research-web-gemini" ||
+    g === "argon-review" ||
+    g === "web-gemini-review" ||
+    g === "argon-research" ||
+    g === "web-gemini-research"
+  ) {
+    return "web-gemini";
+  }
+  if (g.startsWith("preset:")) {
+    const p = g.slice("preset:".length);
+    return `preset:${canonicalPresetName(p)}`;
+  }
+  return g;
+}
+
+/** Route aliases for backward compatibility between argon and web-gemini naming. */
+export const ROUTE_ALIASES: Record<string, string> = {
+  "review-argon": "review-web-gemini",
+  "research-argon": "research-web-gemini",
+  "review-web-gemini": "review-argon",
+  "research-web-gemini": "research-argon",
+  "argon-review": "web-gemini-review",
+  "argon-research": "web-gemini-research",
+  "web-gemini-review": "argon-review",
+  "web-gemini-research": "argon-research",
+};
+
+/** Resolves a route from a policy or routes map by direct name or alias. */
+export function findRoute(
+  policyOrRoutes: Policy | Record<string, PolicyRoute> | null | undefined,
+  name: string | undefined,
+): PolicyRoute | undefined {
+  if (!policyOrRoutes || !name) return undefined;
+  const routes: Record<string, PolicyRoute> =
+    "version" in policyOrRoutes && policyOrRoutes.version === 1
+      ? (policyOrRoutes as Policy).routes
+      : (policyOrRoutes as Record<string, PolicyRoute>);
+  const canon = canonicalRouteName(name);
+  if (routes[canon]) return routes[canon];
+  if (routes[name]) return routes[name];
+  const alias = ROUTE_ALIASES[name];
+  if (alias && routes[alias]) return routes[alias];
+  return undefined;
+}
+
+/**
+ * Resolves a route by name from policy.routes, checking canonical name,
+ * exact name, and ROUTE_ALIASES. Returns the resolved route name and route object.
+ */
+export function resolvePolicyRoute(
+  policy: Policy | null | undefined,
+  name: string | undefined,
+): { name: string; route: PolicyRoute } | undefined {
+  if (!policy || !name) return undefined;
+  const canon = canonicalRouteName(name);
+  if (policy.routes[canon]) {
+    return { name: canon, route: policy.routes[canon] };
+  }
+  if (policy.routes[name]) {
+    return { name, route: policy.routes[name] };
+  }
+  const alias = ROUTE_ALIASES[name];
+  if (alias && policy.routes[alias]) {
+    return { name: alias, route: policy.routes[alias] };
+  }
+  return undefined;
+}
+
 /** Quota group a route belongs to: its `quotaGroup`, or itself. */
 export function quotaGroupOf(route: PolicyRoute, name: string): string {
-  return route.quotaGroup ?? name;
+  return canonicalQuotaGroup(route.quotaGroup ?? canonicalRouteName(name));
 }
 
 /**
@@ -600,7 +701,13 @@ export function quotaGroupsForOneOff(
   oneOff: { route: string; provider: string; modelId?: string | null },
   presetModels: ReadonlyMap<string, string | null | undefined>,
 ): string[] {
-  const groups = new Set<string>([oneOff.route]);
+  const canon = canonicalQuotaGroup(oneOff.route);
+  const groups = new Set<string>([canon]);
+  if (canon.startsWith("preset:")) {
+    const p = canon.slice("preset:".length);
+    const alias = PRESET_ALIASES[p];
+    if (alias) groups.add(`preset:${alias}`);
+  }
   const want = baseModelId(oneOff.modelId);
   if (!policy || !want) return [...groups];
   for (const [name, route] of Object.entries(policy.routes)) {
@@ -650,35 +757,48 @@ export function pickRoute(
   }
   const unavailable = opts.unavailableRoutes ?? new Set<string>();
   const held = opts.heldGroups ?? new Set<string>();
+  const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
   const usable = (name: string) => {
-    const route = policy.routes[name];
+    const resolved = resolvePolicyRoute(policy, name);
+    const route = resolved?.route;
     if (!route) return false;
+    const resolvedName = resolved.name;
+    const alias = ROUTE_ALIASES[name];
+    const canon = canonicalRouteName(name);
+    const qg = quotaGroupOf(route, resolvedName);
     // Holds sit on quota groups (§5.2) and on route names (§5.3
     // `unavailable`) — a route is unusable when either is on hold.
     return (
       !unavailable.has(name) &&
+      (!alias || !unavailable.has(alias)) &&
+      (!canon || !unavailable.has(canon)) &&
+      (!resolvedName || !unavailable.has(resolvedName)) &&
       !held.has(name) &&
-      !held.has(quotaGroupOf(route, name))
+      (!alias || !held.has(alias)) &&
+      (!canon || !held.has(canon)) &&
+      (!resolvedName || !held.has(resolvedName)) &&
+      !held.has(qg) &&
+      !canonHeld.has(qg)
     );
   };
   if (opts.requested !== undefined) {
-    const name = opts.requested;
+    const resolved = resolvePolicyRoute(policy, opts.requested);
     // §2.3: `--route` names any route of the policy, not only the level's
     // chain — the chain is only the fallback order.
-    if (!policy.routes[name]) {
+    if (!resolved) {
       throw new OrchestratorError(
         "unknown-route",
-        `route "${name}" is not declared in routes`,
+        `route "${opts.requested}" is not declared in routes`,
         `routes: ${Object.keys(policy.routes).join(", ")}`,
       );
     }
-    if (!usable(name)) {
+    if (!usable(resolved.name) && !usable(opts.requested)) {
       throw new OrchestratorError(
         "route-unavailable",
-        `route "${name}" is unavailable (missing preset or route/quota hold)`,
+        `route "${opts.requested}" is unavailable (missing preset or route/quota hold)`,
       );
     }
-    return { name, route: policy.routes[name]! };
+    return resolved;
   }
   const name = level.chain.find(usable);
   if (!name) {
@@ -688,5 +808,13 @@ export function pickRoute(
       `chain: ${level.chain.join(" → ")}`,
     );
   }
-  return { name, route: policy.routes[name]! };
+  const resolved = resolvePolicyRoute(policy, name);
+  if (!resolved) {
+    throw new OrchestratorError(
+      "unknown-route",
+      `route "${name}" in chain is not declared in routes`,
+      `routes: ${Object.keys(policy.routes).join(", ")}`,
+    );
+  }
+  return resolved;
 }
