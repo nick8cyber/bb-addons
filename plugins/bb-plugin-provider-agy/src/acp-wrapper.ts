@@ -47,21 +47,33 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ACCOUNT_MODELS_TTL_MS,
+  TOS_DISABLED_COOLDOWN_UNTIL_MS,
   accountByLabel,
+  accountModelState,
+  accountPriority,
   accountsEnabled,
   conversationAccount,
   checkIneligibleBreaker,
   ineligibleCooldownMs,
   isAccountIneligible,
   isAuthDead,
+  isModelRefusal,
+  isTosDisabled,
   listAccounts,
+  loadAccountModels,
   loadLedger,
   markAccountCooldown,
   markAccountIneligible,
+  markAccountModelUnsupported,
   markAccountUse,
   pickAccount,
   rememberConversation,
+  saveAccountModelRecord,
   saveLedger,
+  type AccountHome,
+  type AccountModelCatalog,
+  type AccountsLedger,
 } from "./accounts.js";
 import {
   ARTIFACT_PATH_REFUSAL,
@@ -404,6 +416,14 @@ interface ArmedError {
   handled: boolean;
 }
 
+/**
+ * Why the automaton replaced the session's account. "model" is the §2.3
+ * in-flight refusal or model switch: not quota, so nothing is cooled —
+ * the family is marked unsupported for the account instead. "tos-disabled"
+ * is permanent parking until a manual unpark.
+ */
+type RotationCause = "quota" | "ineligible" | "auth-dead" | "tos-disabled" | "model";
+
 interface QueuedDaemonTurn {
   kind: "daemon";
   requestId: JsonRpcId;
@@ -453,7 +473,7 @@ interface WSession {
   model: string | undefined;
   reasoningLevel: string | undefined;
   rotating: boolean;
-  rotationCause: "quota" | "ineligible" | "auth-dead" | null;
+  rotationCause: RotationCause | null;
   armedError: ArmedError | null;
   waitTimer: NodeJS.Timeout | null;
   waitUntilMs: number;
@@ -1735,12 +1755,210 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
   });
 }
 
+// ---------------------------------------------------------------------------
+// Per-account model catalog (spec §2.3, ADR-0030)
+// ---------------------------------------------------------------------------
+
+/** Never more than two `agy models` children at once (§2.3). */
+const MAX_MODEL_PROBES = 2;
+const modelProbes = {
+  running: 0,
+  queued: new Set<string>(),
+  waiters: [] as (() => void)[],
+};
+
+/**
+ * Load the fresh per-account catalog and lazily (re)poll eligible accounts
+ * whose record is missing or stale. Priority 0 accounts are never polled;
+ * a missing/stale record only queues a probe — selection still decides on
+ * what is already on disk.
+ */
+function accountModelCatalog(): AccountModelCatalog {
+  if (dataDir === "" || !accountsEnabled(process.env)) {
+    return {};
+  }
+  const catalog = loadAccountModels(dataDir);
+  const ledger = loadLedger(dataDir);
+  for (const account of listAccounts(dataDir)) {
+    if (accountPriority(ledger.accounts[account.label]) <= 0) {
+      continue;
+    }
+    if (Object.hasOwn(catalog, account.label)) {
+      continue; // loadAccountModels already dropped stale records
+    }
+    queueModelProbe(account);
+  }
+  return catalog;
+}
+
+function queueModelProbe(account: AccountHome): void {
+  if (modelProbes.queued.has(account.label)) {
+    return;
+  }
+  modelProbes.queued.add(account.label);
+  pumpModelProbes();
+}
+
+function pumpModelProbes(): void {
+  while (modelProbes.running < MAX_MODEL_PROBES && modelProbes.queued.size > 0) {
+    const label = modelProbes.queued.values().next().value;
+    if (label === undefined) {
+      break;
+    }
+    modelProbes.queued.delete(label);
+    const account = accountByLabel(listAccounts(dataDir), label);
+    if (account === null) {
+      continue;
+    }
+    modelProbes.running += 1;
+    runModelProbe(account, () => {
+      modelProbes.running -= 1;
+      pumpModelProbes();
+      if (modelProbes.running === 0 && modelProbes.queued.size === 0) {
+        for (const waiter of modelProbes.waiters.splice(0)) {
+          waiter();
+        }
+      }
+    });
+  }
+}
+
+function runModelProbe(account: AccountHome, done: () => void): void {
+  let child: ChildProcess;
+  try {
+    child = spawn(
+      resolveAgyCommand(process.env),
+      ["--gemini-dir", join(account.home, ".gemini"), "models"],
+      {
+        env: {
+          ...process.env,
+          ...(account.proxy !== null
+            ? {
+                HTTPS_PROXY: account.proxy,
+                https_proxy: account.proxy,
+                HTTP_PROXY: account.proxy,
+                http_proxy: account.proxy,
+              }
+            : {}),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch {
+    done();
+    return;
+  }
+  let stdout = "";
+  const timer = setTimeout(() => {
+    killProcessTreeGracefully(child);
+  }, 30_000);
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.on("error", () => {
+    clearTimeout(timer);
+    done();
+  });
+  child.on("close", () => {
+    clearTimeout(timer);
+    const raw = parseAgyModelsOutput(stdout);
+    // An empty or failed answer never overwrites a previous valid record.
+    if (raw.length > 0) {
+      saveAccountModelRecord(dataDir, account.label, raw);
+      log(`models catalog for ${account.label}: ${raw.length} entries`);
+    }
+    done();
+  });
+}
+
+/** Wait for the refresh round a caller triggered to land on disk. */
+function waitModelProbes(): Promise<void> {
+  if (modelProbes.running === 0 && modelProbes.queued.size === 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    modelProbes.waiters.push(resolve);
+  });
+}
+
+/**
+ * The union of every eligible account's `raw` catalog — deduped by id,
+ * first displayName wins (§2.3) — or null while no account catalog record
+ * exists at all, which keeps the legacy cold fallback alive.
+ */
+async function mergedAccountCatalog(): Promise<
+  { id: string; displayName: string }[] | null
+> {
+  if (dataDir === "" || !accountsEnabled(process.env)) {
+    return null;
+  }
+  accountModelCatalog(); // kick the lazy refresh
+  await waitModelProbes();
+  const fresh = loadAccountModels(dataDir);
+  const ledger = loadLedger(dataDir);
+  const eligible = listAccounts(dataDir)
+    .filter((a) => accountPriority(ledger.accounts[a.label]) > 0)
+    .sort((a, b) => a.label.localeCompare(b.label));
+  const seen = new Set<string>();
+  const merged: { id: string; displayName: string }[] = [];
+  for (const account of eligible) {
+    const record = Object.hasOwn(fresh, account.label)
+      ? fresh[account.label]
+      : undefined;
+    if (record === undefined) {
+      continue;
+    }
+    for (const entry of record.raw) {
+      if (!seen.has(entry.id)) {
+        seen.add(entry.id);
+        merged.push(entry);
+      }
+    }
+  }
+  return merged.length > 0 ? merged : null;
+}
+
+/**
+ * Can any eligible account serve the family right now? Catalog-less
+ * accounts count — only a fresh catalog that lacks the family (or a fresh
+ * refusal mark) disqualifies.
+ */
+function poolOffersModel(
+  ledger: AccountsLedger,
+  accounts: AccountHome[],
+  catalog: AccountModelCatalog,
+  family: string,
+): boolean {
+  const now = Date.now();
+  return accounts.some(
+    (a) =>
+      accountPriority(ledger.accounts[a.label]) > 0 &&
+      ledger.accounts[a.label]?.parkedReason !== "tos-disabled" &&
+      accountModelState(
+        Object.hasOwn(catalog, a.label) ? catalog[a.label] : undefined,
+        family,
+        now,
+      ) !== "unsupported",
+  );
+}
+
 function handleModelList(id: JsonRpcId): void {
   if (!modelCacheStale()) {
     sendResult(id, buildModelListResult());
     return;
   }
   void (async () => {
+    // §2.3: the provider's model list is the union of the per-account
+    // catalogs; the single-account probe stays as the cold fallback while
+    // no account catalog exists.
+    const merged = await mergedAccountCatalog();
+    if (merged !== null) {
+      modelCatalog = { raw: merged, atMs: Date.now() };
+      saveModelDiskCache();
+      sendResult(id, buildModelListResult());
+      return;
+    }
     let raw = await queryAgyModels();
     if (raw.length === 0) {
       raw = await queryAcpSessionModels();
@@ -1938,7 +2156,13 @@ function freeSibling(
   }
   const ledger = loadLedger(dataDir);
   const accounts = listAccounts(dataDir);
-  const candidate = pickAccount(ledger, accounts, exclude);
+  // §2.3: a sibling must also offer the session's model family — the
+  // catalog drives the filter, an unpolled account only counts as a
+  // last resort behind known supporters.
+  const candidate = pickAccount(ledger, accounts, exclude, {
+    family: session.model ?? null,
+    models: accountModelCatalog(),
+  });
   if (candidate === null) {
     return { account: null };
   }
@@ -1952,11 +2176,14 @@ function freeSibling(
 /**
  * Book the failure on the session's account: quota cools it (reset text or
  * the default 30m), an eligibility refusal parks it for the long cooldown —
- * unless the breaker sees a wave of parkings and suspects the egress.
+ * unless the breaker sees a wave of parkings and suspects the egress. A
+ * tos-disabled refusal parks permanently (manual unpark only, no breaker);
+ * a model refusal needs nothing here — its mark already lives in
+ * accounts-models.json.
  */
 function coolSessionAccount(
   session: WSession,
-  cause: "quota" | "ineligible" | "auth-dead",
+  cause: RotationCause,
   message: string,
 ): "cooled" | "breaker" | "none" {
   if (
@@ -1968,6 +2195,27 @@ function coolSessionAccount(
   }
   const ledger = loadLedger(dataDir);
   const now = Date.now();
+  if (cause === "model") {
+    return "none";
+  }
+  if (cause === "tos-disabled") {
+    // Permanent parking: no retry timer, no breaker — only a manual
+    // operator unpark brings this account back (§2.3).
+    markAccountCooldown(
+      ledger,
+      session.accountLabel,
+      TOS_DISABLED_COOLDOWN_UNTIL_MS,
+      message,
+    );
+    markAccountIneligible(ledger, session.accountLabel, {
+      parkedReason: "tos-disabled",
+    });
+    saveLedger(dataDir, ledger);
+    log(
+      `thread ${session.threadId}: account ${session.accountLabel} parked (tos-disabled; manual unpark required)`,
+    );
+    return "cooled";
+  }
   if (cause === "ineligible" || cause === "auth-dead") {
     if (checkIneligibleBreaker(ledger, now)) {
       log(
@@ -2015,7 +2263,7 @@ function coolSessionAccount(
  */
 function planRotation(
   session: WSession,
-  cause: "quota" | "ineligible" | "auth-dead",
+  cause: RotationCause,
   message: string,
 ): "rotate" | "wait" | "fail" {
   const cooled = coolSessionAccount(session, cause, message);
@@ -2026,8 +2274,11 @@ function planRotation(
   if (account !== null) {
     return "rotate";
   }
-  if (cause === "ineligible" || cause === "auth-dead") {
-    return "fail"; // dead causes never wait: rotate or fail
+  if (cause !== "quota") {
+    // Dead causes never wait on a cooldown clock: rotate or fail. A model
+    // refusal fails honestly — the session's model decides which accounts
+    // could ever be siblings, so waiting cannot help.
+    return "fail";
   }
   const resetAt = quotaResetAtMs(message);
   const waitMs =
@@ -2050,9 +2301,29 @@ function nearestCooldownEnd(session: WSession): number | null {
     return null;
   }
   const ledger = loadLedger(dataDir);
-  const ends = Object.values(ledger.accounts)
-    .map((entry) => entry.cooldownUntilMs)
-    .filter((ms) => ms > Date.now());
+  // §2.3: the reported resetsAt is computed over accounts that could serve
+  // the session's model — a cooled account without the family must not
+  // pull the estimate early.
+  const catalog = accountModelCatalog();
+  const family = session.model;
+  const now = Date.now();
+  const ends = listAccounts(dataDir)
+    .filter(
+      (a) =>
+        accountPriority(ledger.accounts[a.label]) > 0 &&
+        ledger.accounts[a.label]?.parkedReason !== "tos-disabled",
+    )
+    .filter(
+      (a) =>
+        family === undefined ||
+        accountModelState(
+          Object.hasOwn(catalog, a.label) ? catalog[a.label] : undefined,
+          family,
+          now,
+        ) !== "unsupported",
+    )
+    .map((a) => ledger.accounts[a.label]?.cooldownUntilMs ?? 0)
+    .filter((ms) => ms > now);
   return ends.length > 0 ? Math.min(...ends) : null;
 }
 
@@ -2117,18 +2388,24 @@ function synthThreadStart(session: WSession): Promise<{
  */
 function startRotation(
   session: WSession,
-  cause: "quota" | "ineligible" | "auth-dead",
+  cause: RotationCause,
   message: string,
+  allowSameAccount = false,
 ): void {
   // The dying session's pending permission dialogs would hang in the UI
   // forever — resolve them before the session is released or replaced.
   resolveInteractions(session.threadId);
-  const { account } = freeSibling(session, session.accountLabel);
+  // A quota-wait retry may land back on the session's own account: that is
+  // the window it waited on — every other caller rotates OFF it (§2.3).
+  const { account } = freeSibling(
+    session,
+    allowSameAccount ? null : session.accountLabel,
+  );
   if (account === null) {
     log(
       `thread ${session.threadId}: rotation found no free sibling; failing out`,
     );
-    failOut(session, poolExhaustedText(cause, message));
+    failOut(session, poolExhaustedText(session, cause, message));
     return;
   }
   session.rotating = true;
@@ -2150,9 +2427,22 @@ function startRotation(
       drainQueue(session);
       return;
     }
+    const errorText = errorMessageOf(error);
     log(
-      `thread ${session.threadId}: rotation session failed to start: ${JSON.stringify(error)?.slice(0, 300)}`,
+      `thread ${session.threadId}: rotation session failed to start: ${errorText.slice(0, 300)}`,
     );
+    // A model refusal disproves the sibling's catalog record: mark the
+    // family unsupported and try the next suitable sibling — this is not
+    // a session-start fluke and earns no cooldown.
+    if (
+      dataDir !== "" &&
+      session.model !== undefined &&
+      isModelRefusal(errorText)
+    ) {
+      markAccountModelUnsupported(dataDir, account.label, session.model);
+      startRotation(session, cause, message);
+      return;
+    }
     // Park this sibling briefly and try the next; give up into failOut.
     if (dataDir !== "") {
       const ledger = loadLedger(dataDir);
@@ -2170,7 +2460,7 @@ function startRotation(
 
 function scheduleWaitRetry(
   session: WSession,
-  cause: "quota" | "ineligible" | "auth-dead",
+  cause: RotationCause,
   message: string,
 ): void {
   const waitMs = session.waitUntilMs;
@@ -2183,7 +2473,7 @@ function scheduleWaitRetry(
     }
     log(`thread ${session.threadId}: quota wait elapsed; retrying rotation`);
     session.rotating = false;
-    startRotation(session, cause, message);
+    startRotation(session, cause, message, true);
   }, waitMs);
   session.waitTimer.unref?.();
   log(
@@ -2191,11 +2481,16 @@ function scheduleWaitRetry(
   );
 }
 
-/** The quota/eligibility/auth-dead error now decides the open turn's fate. */
+/** The classified error now decides the open turn's fate. */
 function poolExhaustedText(
-  cause: "quota" | "ineligible" | "auth-dead",
+  session: WSession,
+  cause: RotationCause,
   message: string,
 ): string {
+  if (cause === "model") {
+    // §2.3: the honest failure when nothing suitable can run the turn.
+    return `model ${session.model ?? "?"} is not offered by any pool account`;
+  }
   return cause === "auth-dead"
     ? `${message} — every pool account lost its Google sign-in; re-authenticate one and retry`
     : message;
@@ -2203,7 +2498,7 @@ function poolExhaustedText(
 
 function handleClassifiedError(
   session: WSession,
-  cause: "quota" | "ineligible" | "auth-dead",
+  cause: RotationCause,
   message: string,
 ): void {
   const plan = planRotation(session, cause, message);
@@ -2215,7 +2510,7 @@ function handleClassifiedError(
       scheduleWaitRetry(session, cause, message);
       return;
     case "fail":
-      failOut(session, poolExhaustedText(cause, message));
+      failOut(session, poolExhaustedText(session, cause, message));
       return;
   }
 }
@@ -2429,6 +2724,31 @@ function resolveInteractions(threadId: string): void {
   }
 }
 
+function errorMessageOf(error: unknown): string {
+  if (typeof error === "object" && error !== null) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") {
+      return message;
+    }
+  }
+  return typeof error === "string" ? error : (JSON.stringify(error) ?? "");
+}
+
+function rotationReason(cause: RotationCause): string {
+  switch (cause) {
+    case "ineligible":
+      return "this account failed Google's Antigravity eligibility check; the turn is being re-run on another account, so the conversation context does not carry over";
+    case "auth-dead":
+      return "the session's account lost its Google sign-in (auth_required); the turn is being re-run on another account, so the conversation context does not carry over";
+    case "tos-disabled":
+      return "the session's account was disabled by Google (Terms of Service); the turn is being re-run on another account, so the conversation context does not carry over";
+    case "model":
+      return "the session's account does not offer the selected model; the turn is being re-run on another account, so the conversation context does not carry over";
+    case "quota":
+      return "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over";
+  }
+}
+
 function onThreadIdentity(params: Record<string, unknown>): void {
   const threadId = params.threadId;
   const providerThreadId = params.providerThreadId;
@@ -2458,12 +2778,7 @@ function onThreadIdentity(params: Record<string, unknown>): void {
     sendNotification("session/replaced", {
       threadId: session.threadId,
       providerThreadId: session.providerThreadId,
-      reason:
-        session.rotationCause === "ineligible"
-          ? "this account failed Google's Antigravity eligibility check; the turn is being re-run on another account, so the conversation context does not carry over"
-          : session.rotationCause === "auth-dead"
-            ? "the session's account lost its Google sign-in (auth_required); the turn is being re-run on another account, so the conversation context does not carry over"
-            : "the quota window closed on this account; the turn is being re-run on another account, so the conversation context does not carry over",
+      reason: rotationReason(session.rotationCause),
       contextLost: true,
     });
     // The failed turn (or the daemon turn that triggered the rotation) is
@@ -2497,7 +2812,9 @@ function onProviderErrorDelta(
   if (
     category !== "rate-limit" &&
     !isAccountIneligible(text) &&
-    !isAuthDead(text)
+    !isAuthDead(text) &&
+    !isTosDisabled(text) &&
+    !isModelRefusal(text)
   ) {
     // Consumed once for classification: leaving it armed would let this old
     // error text shadow the classification of later boundaries for 60s.
@@ -2520,15 +2837,30 @@ function onProviderErrorDelta(
   // this generic one is dropped either way, along with the trailing
   // `error` notification it travels with.
   session.suppressErrorNotify = true;
-  handleClassifiedError(
-    session,
-    category === "rate-limit"
+  const cause: RotationCause = isTosDisabled(text)
+    ? "tos-disabled"
+    : category === "rate-limit"
       ? "quota"
       : isAuthDead(text)
         ? "auth-dead"
-        : "ineligible",
-    text,
-  );
+        : isModelRefusal(text)
+          ? "model"
+          : "ineligible";
+  if (
+    cause === "model" &&
+    dataDir !== "" &&
+    session.accountLabel !== null &&
+    session.model !== undefined
+  ) {
+    // The in-flight refusal marks the family on this account; the rotation
+    // (and every later pick) now skips it for that model (§2.3).
+    markAccountModelUnsupported(
+      dataDir,
+      session.accountLabel,
+      session.model,
+    );
+  }
+  handleClassifiedError(session, cause, text);
   return "drop";
 }
 
@@ -2709,6 +3041,26 @@ function interceptOutbound(line: string): void {
         return;
       }
     }
+    const pending = pendingDaemonSessions.get(msg.id as JsonRpcId);
+    if (pending === undefined) {
+      rawWrite(`${line}\n`);
+      return;
+    }
+    pendingDaemonSessions.delete(msg.id as JsonRpcId);
+    const errorText = "error" in msg ? errorMessageOf(msg.error) : null;
+    if (
+      errorText !== null &&
+      isModelRefusal(errorText) &&
+      pending.session.accountLabel !== null &&
+      pending.session.model !== undefined &&
+      dataDir !== ""
+    ) {
+      // The picked account's catalog claimed the family — the refusal
+      // disproves it (§2.3). Mark and re-drive on the next suitable
+      // sibling; the daemon sees only the final answer.
+      retryDaemonSession(msg.id as JsonRpcId, pending, msg);
+      return;
+    }
     rawWrite(`${line}\n`);
     return;
   }
@@ -2775,21 +3127,179 @@ function interceptOutbound(line: string): void {
 // Inbound dispatch
 // ---------------------------------------------------------------------------
 
-function poolPickAccount(session: WSession): void {
+/**
+ * Daemon-bound thread/start|thread/resume requests we forwarded: when the
+ * picked account refuses the model at session build (a stale catalog
+ * record — set_config_option/set_model or session/load says
+ * "Unknown model ID"), the wrapper marks the family unsupported and drives
+ * the same request on the next suitable sibling. The daemon only ever sees
+ * the final answer.
+ */
+interface PendingDaemonSession {
+  session: WSession;
+  kind: "start" | "resume";
+  params: Record<string, unknown>;
+}
+const pendingDaemonSessions = new Map<JsonRpcId, PendingDaemonSession>();
+
+function poolPickAccount(
+  session: WSession,
+): "picked" | "direct" | "unoffered" {
   if (dataDir === "" || !accountsEnabled(process.env)) {
     session.accountLabel = null;
-    return;
+    return "direct";
   }
   const ledger = loadLedger(dataDir);
-  const picked = pickAccount(ledger, listAccounts(dataDir));
+  const accounts = listAccounts(dataDir);
+  const catalog = accountModelCatalog();
+  const picked = pickAccount(ledger, accounts, null, {
+    family: session.model ?? null,
+    models: catalog,
+  });
   session.accountLabel = picked?.label ?? null;
-  if (picked !== null) {
-    markAccountUse(ledger, picked.label);
-    saveLedger(dataDir, ledger);
-    log(
-      `thread ${session.threadId}: pinned to account ${picked.label} (proxy ${picked.proxy !== null ? "yes" : "no"})`,
-    );
+  if (picked === null) {
+    // §2.3: when every eligible account's catalog says it cannot serve the
+    // model, fail honestly instead of landing on an account without it.
+    if (
+      session.model !== undefined &&
+      accounts.length > 0 &&
+      !poolOffersModel(ledger, accounts, catalog, session.model)
+    ) {
+      return "unoffered";
+    }
+    return "direct";
   }
+  markAccountUse(ledger, picked.label);
+  saveLedger(dataDir, ledger);
+  log(
+    `thread ${session.threadId}: pinned to account ${picked.label} (model ${session.model ?? "default"}, proxy ${picked.proxy !== null ? "yes" : "no"})`,
+  );
+  return "picked";
+}
+
+/**
+ * The session's owner cannot serve the requested model: resume becomes a
+ * fresh thread on a free sibling — the same transform the cooled-owner
+ * path runs — with session/replaced carrying the model reason.
+ */
+function resumeOnSibling(
+  session: WSession,
+  id: JsonRpcId,
+  providerThreadId: string,
+  account: AccountHome,
+  reason: string,
+): void {
+  session.needsHandoff = true;
+  session.rotating = true; // hold daemon turns until the sibling is up
+  session.accountLabel = account.label;
+  const ledger = loadLedger(dataDir);
+  markAccountUse(ledger, account.label);
+  saveLedger(dataDir, ledger);
+  buildLaunch(session);
+  const startParams = {
+    ...session.baseParams,
+    threadId: session.threadId,
+    cwd: session.cwd,
+    options: rewriteOptions(session, { ...session.baseOptions }),
+  };
+  delete (startParams as { providerThreadId?: unknown }).providerThreadId;
+  void internalRequest("thread/start", startParams).then(({ ok, error }) => {
+    session.rotating = false;
+    if (!ok) {
+      session.needsHandoff = false;
+      sendError(
+        id,
+        -32000,
+        `agy could not start on the resume sibling: ${errorMessageOf(error).slice(0, 300)}`,
+      );
+      return;
+    }
+    sendNotification("session/replaced", {
+      threadId: session.threadId,
+      providerThreadId: session.providerThreadId,
+      reason,
+      contextLost: true,
+    });
+    // The thread/start response doubles as the resume answer.
+    sendResult(id, {
+      providerThreadId: session.providerThreadId,
+      sessionRestorable: true,
+    });
+    drainQueue(session);
+  });
+}
+
+/**
+ * A delegated thread/start|resume failed with a model refusal: the
+ * account's catalog record lied. Mark the family unsupported, then — for
+ * a start — re-drive the request on the next suitable sibling until one
+ * accepts or the pool runs out; for a resume the sibling transform opens
+ * a fresh thread instead (the conversation cannot move).
+ */
+function retryDaemonSession(
+  id: JsonRpcId,
+  pending: PendingDaemonSession,
+  refusalMessage: Record<string, unknown>,
+): void {
+  const { session } = pending;
+  markAccountModelUnsupported(
+    dataDir,
+    session.accountLabel as string,
+    session.model as string,
+  );
+  if (pending.kind === "resume") {
+    const providerThreadId =
+      typeof pending.params.providerThreadId === "string"
+        ? pending.params.providerThreadId
+        : session.providerThreadId ?? "";
+    const { account } = freeSibling(session, session.accountLabel);
+    if (account === null) {
+      writeOutbound(refusalMessage);
+      return;
+    }
+    resumeOnSibling(
+      session,
+      id,
+      providerThreadId,
+      account,
+      `resumed conversation ${providerThreadId} belongs to an account that does not offer the selected model; resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
+    );
+    return;
+  }
+  const retry = (): void => {
+    const { account } = freeSibling(session, session.accountLabel);
+    if (account === null) {
+      // Nothing suitable left: the honest refusal stands as the answer.
+      writeOutbound(refusalMessage);
+      return;
+    }
+    session.accountLabel = account.label;
+    const ledger = loadLedger(dataDir);
+    markAccountUse(ledger, account.label);
+    saveLedger(dataDir, ledger);
+    buildLaunch(session);
+    const params = {
+      ...pending.params,
+      options: rewriteOptions(session, { ...session.baseOptions }),
+    };
+    delete (params as { providerThreadId?: unknown }).providerThreadId;
+    void internalRequest("thread/start", params).then(
+      ({ ok, result, error }) => {
+        if (ok) {
+          sendResult(id, result);
+          return;
+        }
+        const errorText = errorMessageOf(error);
+        if (isModelRefusal(errorText) && session.model !== undefined) {
+          markAccountModelUnsupported(dataDir, account.label, session.model);
+          retry();
+          return;
+        }
+        sendError(id, -32000, errorText);
+      },
+    );
+  };
+  retry();
 }
 
 function discardSession(session: WSession): void {
@@ -2801,6 +3311,11 @@ function discardSession(session: WSession): void {
   for (const queued of session.queue.splice(0)) {
     if (queued.kind === "daemon") {
       sendError(queued.requestId, -32000, "thread stopped");
+    }
+  }
+  for (const [id, pending] of pendingDaemonSessions) {
+    if (pending.session === session) {
+      pendingDaemonSessions.delete(id);
     }
   }
   resolveInteractions(session.threadId);
@@ -2824,7 +3339,28 @@ function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void
   delete session.baseParams.options;
   session.baseOptions = optionsRecord(params.options);
   session.envVars = filterEnvVars(session.baseOptions.envVars);
-  poolPickAccount(session);
+  // §2.3: the model is parsed BEFORE the account pick — the family decides
+  // which accounts are candidates for this thread at all.
+  const earlySelection = resolveModelSelection(
+    typeof session.baseOptions.model === "string"
+      ? session.baseOptions.model
+      : undefined,
+    typeof session.baseOptions.reasoningLevel === "string"
+      ? session.baseOptions.reasoningLevel
+      : undefined,
+  );
+  session.model = earlySelection.modelId ?? session.model;
+  session.reasoningLevel =
+    earlySelection.reasoningLevel ?? session.reasoningLevel;
+  if (poolPickAccount(session) === "unoffered") {
+    sendError(
+      id,
+      -32000,
+      `model ${session.model ?? "?"} is not offered by any pool account`,
+    );
+    discardSession(session);
+    return;
+  }
   const declared =
     typeof session.baseOptions.permissionMode === "string"
       ? session.baseOptions.permissionMode
@@ -2833,6 +3369,7 @@ function handleThreadStart(id: JsonRpcId, params: Record<string, unknown>): void
   session.agyMode = mapPermissionMode(declared).agy;
   buildLaunch(session);
   params.options = rewriteOptions(session, { ...session.baseOptions });
+  pendingDaemonSessions.set(id, { session, kind: "start", params });
   feedLine({ jsonrpc: "2.0", id, method: "thread/start", params });
 }
 
@@ -2858,6 +3395,17 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
   delete session.baseParams.options;
   session.baseOptions = optionsRecord(params.options);
   session.envVars = filterEnvVars(session.baseOptions.envVars);
+  const resumeSelection = resolveModelSelection(
+    typeof session.baseOptions.model === "string"
+      ? session.baseOptions.model
+      : undefined,
+    typeof session.baseOptions.reasoningLevel === "string"
+      ? session.baseOptions.reasoningLevel
+      : undefined,
+  );
+  session.model = resumeSelection.modelId ?? session.model;
+  session.reasoningLevel =
+    resumeSelection.reasoningLevel ?? session.reasoningLevel;
   // Sticky owner: the conversation belongs to the account that made it.
   if (dataDir !== "" && accountsEnabled(process.env)) {
     session.accountLabel = conversationAccount(
@@ -2872,73 +3420,64 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
   session.declaredMode = declared;
   session.agyMode = mapPermissionMode(declared).agy;
   const { cooled, untilMs } = sessionAccountCooled(session);
-  if (!cooled || dataDir === "" || !accountsEnabled(process.env)) {
+  // §2.3: an owner whose catalog lacks the requested model is unfit for
+  // this resume, exactly like a cooled one — the sibling transform below.
+  const catalog = accountModelCatalog();
+  const ownerUnfit =
+    session.model !== undefined &&
+    session.accountLabel !== null &&
+    accountModelState(
+      Object.hasOwn(catalog, session.accountLabel)
+        ? catalog[session.accountLabel]
+        : undefined,
+      session.model,
+      Date.now(),
+    ) === "unsupported";
+  if ((!cooled && !ownerUnfit) || dataDir === "" || !accountsEnabled(process.env)) {
     buildLaunch(session);
     params.options = rewriteOptions(session, { ...session.baseOptions });
     log(
       `thread ${threadId}: resuming ${providerThreadId} on account ${session.accountLabel ?? "direct"}`,
     );
+    pendingDaemonSessions.set(id, { session, kind: "resume", params });
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
     return;
   }
-  // The owner is cooling: the resume becomes a fresh thread on a free
-  // sibling, and the first turn rides a handoff prompt (spec §7).
+  // The owner is cooling or cannot serve the model: the resume becomes a
+  // fresh thread on a free sibling, and the first turn rides a handoff
+  // prompt (spec §7 / §2.3).
   const { account } = freeSibling(session, session.accountLabel);
   log(
-    `thread ${threadId}: resume owner ${session.accountLabel} cools until ${new Date(untilMs).toISOString()}; sibling ${account?.label ?? "none"}`,
+    `thread ${threadId}: resume owner ${session.accountLabel} ${ownerUnfit ? `does not offer ${session.model ?? "?"}` : `cools until ${new Date(untilMs).toISOString()}`}; sibling ${account?.label ?? "none"}`,
   );
   if (account === null) {
     buildLaunch(session);
     params.options = rewriteOptions(session, { ...session.baseOptions });
+    pendingDaemonSessions.set(id, { session, kind: "resume", params });
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
     return;
   }
-  session.needsHandoff = true;
-  session.rotating = true; // hold daemon turns until the sibling is up
   const ownerLabel = session.accountLabel;
-  session.accountLabel = account.label;
   const ledger = loadLedger(dataDir);
-  markAccountUse(ledger, account.label);
-  const ownerParkedAuthDead =
-    (ownerLabel !== null ? ledger.accounts[ownerLabel]?.parkedReason : undefined) ===
-    "auth-dead";
-  saveLedger(dataDir, ledger);
-  buildLaunch(session);
-  const startParams = {
-    ...session.baseParams,
-    threadId,
-    cwd,
-    options: rewriteOptions(session, { ...session.baseOptions }),
-  };
-  delete (startParams as { providerThreadId?: unknown }).providerThreadId;
-  void internalRequest("thread/start", startParams).then(({ ok, error }) => {
-    session.rotating = false;
-    if (!ok) {
-      session.needsHandoff = false;
-      sendError(
-        id,
-        -32000,
-        `agy could not start on the resume sibling: ${JSON.stringify(error)?.slice(0, 300)}`,
-      );
-      return;
-    }
-    sendNotification("session/replaced", {
-      threadId,
-      providerThreadId: session.providerThreadId,
-      reason: ownerParkedAuthDead
+  const ownerParkedReason =
+    ownerLabel !== null ? ledger.accounts[ownerLabel]?.parkedReason : undefined;
+  resumeOnSibling(
+    session,
+    id,
+    providerThreadId,
+    account,
+    ownerUnfit
+      ? `resumed conversation ${providerThreadId} belongs to an account that does not offer the selected model; ` +
+          `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`
+      : ownerParkedReason === "auth-dead"
         ? `resumed conversation ${providerThreadId} belongs to an account that lost its Google sign-in (auth_required); ` +
           `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`
-        : `resumed conversation ${providerThreadId} belongs to an account in quota cooldown; ` +
-          `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
-      contextLost: true,
-    });
-    // The thread/start response doubles as the resume answer.
-    sendResult(id, {
-      providerThreadId: session.providerThreadId,
-      sessionRestorable: true,
-    });
-    drainQueue(session);
-  });
+        : ownerParkedReason === "tos-disabled"
+          ? `resumed conversation ${providerThreadId} belongs to an account disabled by Google (Terms of Service); ` +
+            `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`
+          : `resumed conversation ${providerThreadId} belongs to an account in quota cooldown; ` +
+            `resumed on free sibling ${account.label} instead, so the conversation context does not carry over`,
+  );
 }
 
 function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
@@ -2953,8 +3492,24 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
     return;
   }
   drainShimEvents();
-  // §7: a turn on a cooled account rotates first, then replays as handoff.
+  // §7: a turn on a cooled account rotates first, then replays as handoff;
+  // §2.3: a turn whose options name a model the session's account does not
+  // offer rotates the same way, with the "model" cause.
   if (!session.rotating && !session.stopped) {
+    const turnOptions = optionsRecord(params.options);
+    const incoming = resolveModelSelection(
+      typeof turnOptions.model === "string" ? turnOptions.model : undefined,
+      typeof turnOptions.reasoningLevel === "string"
+        ? turnOptions.reasoningLevel
+        : undefined,
+    );
+    if (incoming.modelId !== undefined && incoming.modelId !== session.model) {
+      // The new model rides every later session build (rotation included)
+      // via baseOptions — the generic bridge only applies it at session
+      // construction.
+      session.model = incoming.modelId;
+      session.baseOptions = { ...session.baseOptions, model: turnOptions.model };
+    }
     const { cooled } = sessionAccountCooled(session);
     if (cooled) {
       log(
@@ -2966,20 +3521,50 @@ function handleTurnStart(id: JsonRpcId, params: Record<string, unknown>): void {
         dataDir !== "" && session.accountLabel !== null
           ? loadLedger(dataDir).accounts[session.accountLabel]
           : undefined;
-      const cause =
+      const cause: RotationCause =
         entry?.parkedReason === "auth-dead"
           ? "auth-dead"
-          : entry?.ineligibleAtMs !== undefined
-            ? "ineligible"
-            : "quota";
+          : entry?.parkedReason === "tos-disabled"
+            ? "tos-disabled"
+            : entry?.ineligibleAtMs !== undefined
+              ? "ineligible"
+              : "quota";
       startRotation(
         session,
         cause,
         cause === "auth-dead"
           ? "account lost its Google sign-in (auth_required)"
-          : cause === "ineligible"
-            ? "account parked after eligibility refusal"
-            : "account in quota cooldown",
+          : cause === "tos-disabled"
+            ? "account disabled by Google (Terms of Service)"
+            : cause === "ineligible"
+              ? "account parked after eligibility refusal"
+              : "account in quota cooldown",
+      );
+      return;
+    }
+    const catalog = accountModelCatalog();
+    if (
+      session.model !== undefined &&
+      session.accountLabel !== null &&
+      dataDir !== "" &&
+      accountsEnabled(process.env) &&
+      accountModelState(
+        Object.hasOwn(catalog, session.accountLabel)
+          ? catalog[session.accountLabel]
+          : undefined,
+        session.model,
+        Date.now(),
+      ) === "unsupported"
+    ) {
+      log(
+        `thread ${threadId}: account ${session.accountLabel} does not offer ${session.model}; rotating first`,
+      );
+      const queued: QueuedDaemonTurn = { kind: "daemon", requestId: id, params };
+      session.pendingConsume = queued;
+      startRotation(
+        session,
+        "model",
+        `model ${session.model} is not offered by account ${session.accountLabel}`,
       );
       return;
     }

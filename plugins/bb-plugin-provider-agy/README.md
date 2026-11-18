@@ -414,6 +414,50 @@ Account selection order in the pool is governed by a numeric priority — layere
 - **Pool-less fallback**: if all pool accounts have `priority: 0` (or the pool is empty), `pickAccount` returns `null` and the session is not pinned to a pool account — like an empty pool it runs through the cliproxy relay if configured, or in direct mode on the machine's default credential.
 - **Backward compatibility**: a pool with no `priority` fields defaults every account to tier 10, preserving pure LRU selection.
 
+#### Model-aware account selection (`accounts-models.json`)
+
+Selecting an account before knowing the model pinned threads to accounts
+that could never serve them (`Unknown model ID` at session build), so the
+pool keeps a per-account catalog and the model family participates in every
+pick (spec §2.3, ADR-0030; ACP transport only).
+
+- **Per-account catalog**: the bridge polls `agy models` inside each account
+  home (at most two probe children at a time, each bounded and reaped like a
+  session child) and writes `accounts-models.json` next to
+  `accounts-state.json`:
+  `accounts[label] = { raw, families, unsupported, atMs }`. Records are
+  refreshed lazily — when a pick or `model/list` sees an entry older than six
+  hours — and `priority: 0` accounts are never polled.
+- **Selection rule**: for a specialized family the pick is restricted to
+  accounts whose catalog advertises it; a specialized account beats no
+  priority it lacks support for. Common models take the ordinary §2.2 order
+  (priority tier → LRU). Accounts with no catalog record count as candidates
+  of last resort: they fill in only when no known supporter is free, so a
+  cold pool behaves exactly like before revision 10.
+- **Merged discovery**: `model/list` answers the union of all non-zero
+  priority catalogs, each raw entry expanded into effort variants as before.
+- **Honest refusal**: asking for a family no account offers fails the
+  `thread/start` with `model <id> is not offered by any pool account` —
+  nothing is launched. If a catalog record lies (agy refuses the model at
+  session build or mid-turn), that family is stamped into the record's
+  `unsupported` map and the turn retries on the next suitable sibling; the
+  refused account takes no cooldown.
+- **tos-disabled**: a refusal reading `disabled … violation of Terms of
+  Service` parks the account permanently (`parkedReason: "tos-disabled"` and
+  an effectively infinite cooldown in `accounts-state.json`): it is never
+  polled, never picked, and only a manual edit brings it back — distinct
+  from the eligibility breaker, which must not fire for it.
+- **Same-account waits**: when the only suitable carriers are cooling, a
+  quota turn waits out the earliest suitable window and may land back on the
+  session's own account; `rateLimits` reports the nearest resetsAt among
+  accounts that could serve the model.
+
+The same rules drive turn-level model changes (`turn/start` with a new
+`options.model` rotates off an unfit account), `thread/resume` (an owner
+that does not offer the requested model is replaced by a fresh start on a
+suitable sibling — the account is never spawned), and maintenance queries,
+which always read the session's pinned account.
+
 #### Account not eligible
 
 If agy reports `not eligible for Antigravity` or `verify your account`, the bridge parks that pool account and re-runs the failed turn on a free sibling after about one second. Verification refusals use a 24-hour cooldown. The refusal `not eligible for Antigravity, because it is not currently available in your location` uses a separate 2-hour cooldown and is logged with reason `location`; it may have no verification URL. A refusal that also requests verification or supplies a verification URL uses the verification cooldown.

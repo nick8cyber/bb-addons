@@ -21,6 +21,7 @@ writeFileSync(
   `#!/bin/sh\nexec /usr/bin/node ${new URL("./fake-agy.mjs", import.meta.url).pathname} "$@"\n`,
 );
 chmodSync(shim, 0o755);
+process.env.AGY_TRANSPORT ??= "stream-json";
 process.env.AGY_PATH = shim;
 // hermetic: the host may or may not have an agent-proxy core to auto-detect
 process.env.AGY_CLIPROXY = "0";

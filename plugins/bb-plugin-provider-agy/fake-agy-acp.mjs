@@ -10,6 +10,7 @@
  *   AGY_FAKE_MODE_BY_LABEL  JSON {"<homeLabel>": "<mode>"} — the label is the
  *                           basename of the --gemini-dir's parent dir
  *   AGY_FAKE_ERROR_MODE     fallback mode: "ok" | "quota-once" | "quota-always" | "ineligible"
+ *                           | "unknown-model" | "unknown-model-once" | "tos-disabled" | "tos-once"
  *   AGY_FAKE_QUOTA_MSG      quota error text (must carry "Resets in …")
  *   AGY_FAKE_RELEASE        a [[hold]] prompt finishes when this file exists
  *   AGY_FAKE_COMPACT_MODE   "fail" makes a standalone "/compact" prompt error
@@ -17,7 +18,17 @@
  *
  * Prompt markers: [[quota]] (prompt errors with quota text), [[hold]],
  * [[artifact]] (tool_call_update with artifact-path refusal), [[askperm]]
- * (session/request_permission that hangs until answered), [[die]] (exit).
+ * (session/request_permission that hangs until answered), [[die]] (exit),
+ * [[unknown-model]] (prompt errors "Unknown model ID"), [[tos]] (prompt
+ * errors with the Terms-of-Service disable text).
+ *
+ * Per-account model catalogs (spec §2.3): control key or env
+ * `modelsByLabel` / `AGY_FAKE_MODELS_BY_LABEL` maps a label to
+ * [["id","displayName"],...] entries. `agy --gemini-dir <home>/.gemini
+ * models` prints them as TSV, session/new|load advertises them as the
+ * model config option, and — when a label has an explicit entry —
+ * session/set_config_option|set_model for a value outside the catalog
+ * fails "Unknown model ID" the way real agy does.
  */
 import { createInterface } from "node:readline";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -57,9 +68,52 @@ const record = (obj) => {
   if (transcript) appendFileSync(transcript, `${JSON.stringify({ home: homeLabel, __env: envRecord, ...obj })}\n`);
 };
 
-const configOptions = [
-  { id: "model", category: "model", type: "select", currentValue: "fake-model",
-    options: [{ value: "fake-model", name: "Fake Model" }] },
+// Per-account model catalogs (spec §2.3): a label with an explicit entry
+// serves exactly those ids — `agy models` prints them and model-set calls
+// outside the list are refused with "Unknown model ID". Without an entry
+// the fake stays permissive: everything is accepted.
+const defaultCatalog = [{ id: "fake-model", displayName: "Fake Model" }];
+function modelsByLabelMap() {
+  const byLabel = control().modelsByLabel ?? JSON.parse(process.env.AGY_FAKE_MODELS_BY_LABEL ?? "null");
+  return typeof byLabel === "object" && byLabel !== null ? byLabel : null;
+}
+function catalogFor(label) {
+  const byLabel = modelsByLabelMap();
+  if (byLabel !== null && Array.isArray(byLabel[label])) {
+    return byLabel[label].map((e) =>
+      Array.isArray(e)
+        ? { id: e[0], displayName: e[1] ?? e[0] }
+        : { id: e.id, displayName: e.displayName ?? e.id });
+  }
+  const tsv = control().modelsOut ?? process.env.AGY_FAKE_MODELS_OUT;
+  if (typeof tsv === "string" && tsv.length > 0) {
+    return tsv.split("\n").filter((l) => l.includes("\t")).map((l) => {
+      const [id, ...rest] = l.split("\t");
+      return { id, displayName: rest.join("\t") || id };
+    });
+  }
+  return defaultCatalog;
+}
+function modelRefused(label, value) {
+  const byLabel = modelsByLabelMap();
+  if (byLabel === null || !Array.isArray(byLabel[label])) return false;
+  return !catalogFor(label).some((e) => e.id === value);
+}
+
+// `agy --gemini-dir <home>/.gemini models`: the account's catalog as TSV,
+// one "id\tdisplayName" line per entry.
+if (argv.includes("models")) {
+  record({ __models: true });
+  for (const entry of catalogFor(homeLabel)) {
+    process.stdout.write(`${entry.id}\t${entry.displayName}\n`);
+  }
+  process.exit(0);
+}
+
+const configOptionsFor = () => [
+  { id: "model", category: "model", type: "select",
+    currentValue: catalogFor(homeLabel)[0]?.id ?? "fake-model",
+    options: catalogFor(homeLabel).map((e) => ({ value: e.id, name: e.displayName })) },
   { id: "thought_level", category: "thought_level", type: "select", currentValue: "medium",
     options: [{ value: "low", name: "low" }, { value: "medium", name: "medium" }, { value: "high", name: "high" }] },
 ];
@@ -100,6 +154,14 @@ async function runPrompt(id, text) {
   }
   if (text.trimStart().startsWith("[[quota]]") || mode === "quota-always" || (mode === "quota-once" && once("q"))) {
     out({ jsonrpc: "2.0", id, error: { code: 429, message: quotaMsg } });
+    return;
+  }
+  if (text.includes("[[unknown-model]]") || mode === "unknown-model" || (mode === "unknown-model-once" && once("um"))) {
+    out({ jsonrpc: "2.0", id, error: { code: -32000, message: `Unknown model ID: "${catalogFor(homeLabel)[0]?.id ?? "fake-model"}"` } });
+    return;
+  }
+  if (text.includes("[[tos]]") || mode === "tos-disabled" || (mode === "tos-once" && once("tos"))) {
+    out({ jsonrpc: "2.0", id, error: { code: 403, message: "This service has been disabled in this account for violation of Terms of Service." } });
     return;
   }
   if (mode === "ineligible" && once("inel")) {
@@ -186,7 +248,7 @@ rlFake.on("line", (line) => {
       return;
     case "session/new":
       sessionId = `fake-acp-${++sessionCounter}-${homeLabel}`;
-      out({ jsonrpc: "2.0", id: msg.id, result: { sessionId, configOptions, modes } });
+      out({ jsonrpc: "2.0", id: msg.id, result: { sessionId, configOptions: configOptionsFor(), modes } });
       return;
     case "session/load": {
       if (typeof p.sessionId !== "string" || !p.sessionId.startsWith("fake-")) {
@@ -194,7 +256,7 @@ rlFake.on("line", (line) => {
         return;
       }
       sessionId = p.sessionId;
-      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions, modes } });
+      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(), modes } });
       // Real agy answers session/load mid-replay: the stored history keeps
       // streaming as session/update notifications after the response.
       const replay = replayed.splice(0);
@@ -205,9 +267,19 @@ rlFake.on("line", (line) => {
       out({ jsonrpc: "2.0", id: msg.id, result: {} });
       return;
     case "session/set_config_option":
-    case "session/set_model":
-      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions } });
+    case "session/set_model": {
+      const configId = msg.method === "session/set_config_option" ? p.configId : "model";
+      const value =
+        msg.method === "session/set_config_option"
+          ? p.value
+          : (p.modelId ?? p.model ?? p.value);
+      if (configId === "model" && typeof value === "string" && modelRefused(homeLabel, value)) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: `Unknown model ID: "${value}"` } });
+        return;
+      }
+      out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor() } });
       return;
+    }
     case "session/prompt": {
       const text = (p.prompt ?? []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
       cancelled = false;

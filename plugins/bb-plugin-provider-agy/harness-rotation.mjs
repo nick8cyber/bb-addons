@@ -27,6 +27,7 @@
  * Usage: node harness-rotation.mjs
  */
 import {
+  existsSync,
   mkdirSync,
   writeFileSync,
   chmodSync,
@@ -77,6 +78,7 @@ process.env.AGY_FAKE_RECORD_ENV = "HOME,HTTPS_PROXY";
 process.env.AGY_FAKE_TRANSCRIPT = join(root, "stdin.ndjson");
 process.env.AGY_CLIPROXY = "0";
 process.env.AGY_IDLE_KILL_MS = "1500";
+process.env.AGY_TRANSPORT ??= "stream-json";
 for (const name of ["AGY_LOCATION_COOLDOWN_MS", "AGY_INELIGIBLE_BREAKER_WINDOW_MS", "AGY_INELIGIBLE_BREAKER_MAX", "AGY_FAKE_MODE_BY_LABEL"]) {
   delete process.env[name];
 }
@@ -1112,6 +1114,297 @@ process.env.FAKE_INELIGIBLE_LABEL = homeLabel(process.env.HOME);
 await expectStartupFailure("t-ineligible-no-data-dir", VERIFY_URL);
 activeBridge.onClose?.();
 await sleep(100);
+
+// ---- PLUG-301 ACP phase (spec §2.3): model-aware selection drives
+// rotation — quota waits on the only carrier, model changes and in-flight
+// refusals rotate to a suitable sibling, tos-disabled parks the account
+// forever, and stale catalog entries are marked unsupported on refusal.
+{
+  const acpData = join(root, "acp-data");
+  for (const label of ["m1", "m2", "m3", "m4"]) {
+    const cli = join(acpData, "accounts", label, ".gemini", "antigravity-cli");
+    mkdirSync(cli, { recursive: true });
+    writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+  }
+  const acpShim = join(root, "agy-acp-shim");
+  const acpFake = new URL("./fake-agy-acp.mjs", import.meta.url).pathname;
+  writeFileSync(acpShim, `#!/bin/sh\nexec /usr/bin/node ${acpFake} "$@"\n`);
+  chmodSync(acpShim, 0o755);
+  process.env.AGY_PATH = acpShim;
+  delete process.env.AGY_TRANSPORT;
+  delete process.env.AGY_FAKE_ERROR_MODE;
+  delete process.env.AGY_FAKE_MODE_BY_LABEL;
+  delete process.env.AGY_FAKE_SUMMARY_MODE;
+  delete process.env.AGY_FAKE_COMPACT_MODE;
+  delete process.env.AGY_FAKE_SEED_MODE;
+  delete process.env.FAKE_INELIGIBLE_LABEL;
+  process.env.AGY_IDLE_KILL_MS = "0";
+  process.env.AGY_AUTO_RETRY_MAX = "2";
+  process.env.AGY_AUTO_RETRY_MAX_WAIT_MS = "30000";
+  process.env.AGY_FAKE_QUOTA_MSG = "Quota exhausted for this account; retry later. Resets in 0h0m3s.";
+  process.env.AGY_FAKE_TRANSCRIPT = join(root, "acp-stdin.ndjson");
+  process.env.AGY_FAKE_CONTROL = join(root, "acp-control.json");
+  const acpControl = { modelsByLabel: {
+    m1: [["fake-model", "Fake Model"]],
+    m2: [["fake-model", "Fake Model"], ["pro-model", "Pro Model"], ["solo-model", "Solo Model"]],
+    m3: [["fake-model", "Fake Model"], ["pro-model", "Pro Model"]],
+    m4: [["fake-model", "Fake Model"]],
+  } };
+  const writeAcpControl = () =>
+    writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify(acpControl, null, 1));
+  writeAcpControl();
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {} }, null, 1));
+
+  const acpTranscript = () =>
+    (existsSync(process.env.AGY_FAKE_TRANSCRIPT)
+      ? readFileSync(process.env.AGY_FAKE_TRANSCRIPT, "utf8")
+      : "")
+      .split("\n").filter((l) => l.trim().length > 0)
+      .map((l) => { try { return JSON.parse(l); } catch { return {}; } });
+  const acpNews = (label) => acpTranscript().filter((l) => l.method === "session/new" && l.home === label).length;
+  const readAcpLedger = () => {
+    const shared = JSON.parse(readFileSync(join(acpData, "accounts-state.json"), "utf8"));
+    let local = {};
+    try {
+      local = JSON.parse(readFileSync(join(acpData, "conversations-state.json"), "utf8")).conversations ?? {};
+    } catch { /* absent */ }
+    return { ...shared, conversations: { ...(shared.conversations ?? {}), ...local } };
+  };
+  const writeAcpLedger = (ledger) => {
+    writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify(ledger));
+    try { unlinkSync(join(acpData, "accounts-overlay.json")); } catch { /* absent */ }
+    try { unlinkSync(join(acpData, "conversations-state.json")); } catch { /* absent */ }
+  };
+  const readAcpModels = () => {
+    try {
+      return JSON.parse(readFileSync(join(acpData, "accounts-models.json"), "utf8")).accounts ?? {};
+    } catch { return {}; }
+  };
+  const writeAcpModels = (accounts) =>
+    writeFileSync(join(acpData, "accounts-models.json"), JSON.stringify({ accounts }, null, 1));
+  // Set lastUsed so `winner` wins the LRU pick; the tos-disabled cooldown
+  // is preserved so the parked-account checks stay valid.
+  const favor = (winner) => {
+    const ledger = readAcpLedger();
+    for (const label of ["m1", "m2", "m3", "m4"]) {
+      const entry = ledger.accounts[label] ?? { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null };
+      if (entry.parkedReason !== "tos-disabled") entry.cooldownUntilMs = 0;
+      entry.lastUsedMs = label === winner ? 0 : 1_700_000_000_000;
+      ledger.accounts[label] = entry;
+    }
+    writeAcpLedger(ledger);
+  };
+  const newsSnapshot = () => ({ m1: acpNews("m1"), m2: acpNews("m2"), m3: acpNews("m3"), m4: acpNews("m4") });
+
+  activeBridge = (await import(
+    new URL("./dist/host.js?acp-rotation", import.meta.url).href
+  )).experimental_providerBridge;
+  activeBridge.start?.({ pluginId: "provider-agy", dataDir: acpData, tempDir: acpData });
+  const acpThreads = new Map();
+  const startModel = async (threadId, model) => {
+    const startId = nextId++;
+    send({ jsonrpc: "2.0", id: startId, method: "thread/start",
+      params: { threadId, cwd: workspace, options: { model, ...pol }, instructionMode: "append" } });
+    await waitFor(() => messages.some((m) => m.id === startId), 15_000, `${threadId}: start`);
+    const reply = messages.find((m) => m.id === startId);
+    if (typeof reply?.result?.providerThreadId === "string") {
+      acpThreads.set(threadId, reply.result.providerThreadId);
+    }
+    return reply;
+  };
+  const turnModel = async (threadId, text, model, ordinal = 1) => {
+    send({ jsonrpc: "2.0", id: nextId++, method: "turn/start",
+      params: { threadId, providerThreadId: acpThreads.get(threadId),
+        input: [{ type: "text", text, mentions: [] }], clientRequestId: creq(),
+        options: { model, ...pol } } });
+    await waitFor(() => boundaries(threadId).length >= ordinal, 30_000, `${threadId}: turn`);
+  };
+  // Populate accounts-models.json with one model/list (lazy per-account poll).
+  const listId = nextId++;
+  send({ jsonrpc: "2.0", id: listId, method: "model/list", params: {} });
+  await waitFor(() => messages.some((m) => m.id === listId), 20_000, "acp model/list");
+  check("models/per-account-catalogs-persist",
+    ["m1", "m2", "m3", "m4"].every((l) => Array.isArray(readAcpModels()[l]?.families)) &&
+    readAcpModels().m2.families.includes("solo-model") &&
+    !readAcpModels().m1.families.includes("pro-model"),
+    JSON.stringify(Object.fromEntries(Object.entries(readAcpModels()).map(([k, v]) => [k, v.families]))));
+
+  // A. Quota on the only solo-model carrier: no suitable sibling exists, so
+  // the wrapper waits out the reset and replays the turn on the same account.
+  // quota-once is a per-home sentinel: the replayed prompt succeeds.
+  acpControl.modeByLabel = { m2: "quota-once" };
+  writeAcpControl();
+  favor("m2");
+  const newsA = newsSnapshot();
+  await startModel("t-model-quota", "solo-model");
+  await turnModel("t-model-quota", "wait on the only carrier", "solo-model");
+  await sleep(300);
+  const spawnedA = acpTranscript().filter((l) => l.method === "session/new").map((l) => l.home);
+  check("models/quota-waits-on-the-only-carrier",
+    statuses("t-model-quota") === "completed" &&
+    acpNews("m2") === newsA.m2 + 2 &&
+    acpNews("m1") === newsA.m1 && acpNews("m3") === newsA.m3 && acpNews("m4") === newsA.m4,
+    `${statuses("t-model-quota")} homes=${JSON.stringify(spawnedA)}`);
+
+  // The same model with the carrier cooled for an hour: honest failure and
+  // a blocked rateLimits named by that account's cooldown end.
+  {
+    const ledger = readAcpLedger();
+    ledger.accounts.m2.cooldownUntilMs = Date.now() + 3_600_000;
+    ledger.accounts.m2.lastError = "test-injected solo cooldown";
+    writeAcpLedger(ledger);
+  }
+  const resetsAt = Date.now() + 3_600_000;
+  await startModel("t-model-blocked", "solo-model");
+  const blockTurnId = nextId++;
+  send({ jsonrpc: "2.0", id: blockTurnId, method: "turn/start",
+    params: { threadId: "t-model-blocked", providerThreadId: acpThreads.get("t-model-blocked"),
+      input: [{ type: "text", text: "still blocked", mentions: [] }],
+      clientRequestId: creq(), options: { model: "solo-model", ...pol } } });
+  await waitFor(() => messages.some((m) => m.id === blockTurnId), 15_000, "t-model-blocked: turn reply");
+  const blockReply = messages.find((m) => m.id === blockTurnId);
+  const blockedDelta = messages.find((m) => m.method === "thread/delta"
+    && m.params?.threadId === "t-model-blocked"
+    && (m.params.deltas ?? []).some((d) => d.kind === "provider.rateLimits" && d.rateLimits?.status === "blocked"));
+  const blockedWindow = (blockedDelta?.params?.deltas ?? [])
+    .find((d) => d.kind === "provider.rateLimits")?.rateLimits?.windows?.[0];
+  check("models/blocked-ratelimits-name-carrier-reset",
+    blockReply?.error?.message === "account in quota cooldown" &&
+    typeof blockedWindow?.resetsAtMs === "number" &&
+    Math.abs(blockedWindow.resetsAtMs - resetsAt) < 15_000,
+    `err=${blockReply?.error?.message ?? "none"} resetsAt=${blockedWindow?.resetsAtMs ?? "none"}`);
+  writeAcpLedger(readAcpLedger()); // keep entries; drop per-instance pins
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // B. A turn-level model change the pinned account cannot serve rotates to
+  // a suitable sibling — without recording any cooldown on the old one.
+  {
+    const ledger = readAcpLedger();
+    ledger.accounts.m2.cooldownUntilMs = 0;
+    ledger.accounts.m2.lastError = null;
+    writeAcpLedger(ledger);
+  }
+  favor("m1");
+  const newsB = newsSnapshot();
+  await startModel("t-model-change", "fake-model");
+  await turnModel("t-model-change", "switch this thread to pro-model", "pro-model");
+  await sleep(200);
+  check("models/turn-start-model-change-rotates",
+    statuses("t-model-change") === "completed" &&
+    acpNews("m1") === newsB.m1 + 1 &&
+    (acpNews("m2") === newsB.m2 + 1 || acpNews("m3") === newsB.m3 + 1) &&
+    acpNews("m4") === newsB.m4 &&
+    replacedFor("t-model-change").some((m) =>
+      typeof m.params?.reason === "string" && m.params.reason.includes("does not offer the selected model")),
+    `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsB)}`);
+  check("models/rotation-takes-no-cooldown",
+    (readAcpLedger().accounts.m1?.cooldownUntilMs ?? 0) === 0 &&
+    readAcpLedger().accounts.m1?.parkedReason === undefined,
+    JSON.stringify(readAcpLedger().accounts.m1 ?? null));
+
+  // C. An in-flight "Unknown model ID" on m2 marks the family unsupported
+  // and replays the turn on a suitable sibling. unknown-model-once is a
+  // per-home sentinel, so the handoff's replay on m3 answers normally.
+  acpControl.modeByLabel = { m2: "unknown-model-once" };
+  writeAcpControl();
+  favor("m2");
+  const newsC = newsSnapshot();
+  await startModel("t-model-inflight", "pro-model");
+  await turnModel("t-model-inflight", "hits mid-flight", "pro-model");
+  await sleep(200);
+  check("models/inflight-refusal-marks-unsupported",
+    (readAcpModels().m2?.unsupported?.["pro-model"] ?? 0) > 0,
+    JSON.stringify(readAcpModels().m2?.unsupported ?? null));
+  check("models/inflight-refusal-rotates-suitable",
+    statuses("t-model-inflight") === "completed" &&
+    acpNews("m3") === newsC.m3 + 1 &&
+    acpNews("m1") === newsC.m1 && acpNews("m4") === newsC.m4,
+    `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsC)}`);
+
+  // D. A model no account offers fails honestly — nothing is spawned.
+  const newsD = newsSnapshot();
+  const ghostReply = await startModel("t-model-nowhere", "ghost-model");
+  check("models/unoffered-model-fails-honestly",
+    ghostReply.error?.message === "model ghost-model is not offered by any pool account" &&
+    acpNews("m1") === newsD.m1 && acpNews("m2") === newsD.m2 &&
+    acpNews("m3") === newsD.m3 && acpNews("m4") === newsD.m4 &&
+    replacedFor("t-model-nowhere").length === 0,
+    ghostReply.error?.message ?? "unexpected success");
+
+  // E. tos-disabled: parked until a manual clear, never picked again.
+  // tos-once is a per-home sentinel — the sibling's replay answers normally.
+  acpControl.modeByLabel = { m1: "tos-once" };
+  writeAcpControl();
+  favor("m1");
+  const newsE = newsSnapshot();
+  await startModel("t-tos", "fake-model");
+  await turnModel("t-tos", "disable the account", "fake-model");
+  await sleep(200);
+  const tosEntry = readAcpLedger().accounts.m1 ?? {};
+  check("models/tos-parks-account-permanently",
+    tosEntry.parkedReason === "tos-disabled" &&
+    (tosEntry.ineligibleAtMs ?? 0) > 0 &&
+    tosEntry.cooldownUntilMs > Date.now() + 365 * 24 * 3_600_000 &&
+    statuses("t-tos") === "completed" &&
+    (acpNews("m2") === newsE.m2 + 1 || acpNews("m3") === newsE.m3 + 1 || acpNews("m4") === newsE.m4 + 1),
+    JSON.stringify(tosEntry));
+  favor("m1"); // tos cooldown survives favor(); LRU favours m1 anyway
+  const newsE2 = newsSnapshot();
+  await startModel("t-tos-next", "fake-model");
+  check("models/tos-account-never-repicked",
+    acpNews("m1") === newsE2.m1 &&
+    (acpNews("m2") === newsE2.m2 + 1 || acpNews("m3") === newsE2.m3 + 1 || acpNews("m4") === newsE2.m4 + 1),
+    `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsE2)}`);
+
+  // F. Resume on an owner that does not offer the requested model becomes a
+  // fresh start on a suitable sibling — the owner is never spawned.
+  favor("m1");
+  const ownerReply = await startModel("t-resume-owner", "fake-model");
+  const ownerConv = ownerReply.result?.providerThreadId;
+  stop("t-resume-owner");
+  await sleep(100);
+  const newsF = newsSnapshot();
+  const resumeId = nextId++;
+  send({ jsonrpc: "2.0", id: resumeId, method: "thread/resume",
+    params: { threadId: "t-resume-unfit", providerThreadId: ownerConv, cwd: workspace,
+      options: { model: "pro-model", ...pol }, instructionMode: "append" } });
+  await waitFor(() => messages.some((m) => m.id === resumeId), 15_000, "t-resume-unfit: resume");
+  const resumeReply = messages.find((m) => m.id === resumeId);
+  check("models/resume-unfit-owner-moves-to-sibling",
+    !resumeReply?.error &&
+    acpNews("m1") === newsF.m1 &&
+    (acpNews("m2") === newsF.m2 + 1 || acpNews("m3") === newsF.m3 + 1) &&
+    replacedFor("t-resume-unfit").some((m) =>
+      typeof m.params?.reason === "string" && m.params.reason.includes("does not offer the selected model")),
+    resumeReply?.error?.message ?? `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsF)}`);
+
+  // G. A stale catalog entry (m4 claims pro-model the fake does not have)
+  // is refused at session build, marked unsupported and retried on a
+  // suitable sibling.
+  const seeded = readAcpModels();
+  seeded.m4 = {
+    raw: [{ id: "fake-model", displayName: "Fake Model" }, { id: "pro-model", displayName: "Pro Model" }],
+    families: ["fake-model", "pro-model"],
+    unsupported: {},
+    atMs: Date.now(),
+  };
+  writeAcpModels(seeded);
+  favor("m4");
+  const newsG = newsSnapshot();
+  const staleReply = await startModel("t-model-stale", "pro-model");
+  await sleep(200);
+  check("models/stale-catalog-retries-suitable",
+    !staleReply?.error &&
+    acpNews("m4") === newsG.m4 + 1 &&
+    (acpNews("m2") === newsG.m2 + 1 || acpNews("m3") === newsG.m3 + 1) &&
+    (readAcpModels().m4?.unsupported?.["pro-model"] ?? 0) > 0,
+    staleReply?.error?.message ?? `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsG)}`);
+
+  // NOTE: never call activeBridge.onClose() here — the embedded generic
+  // bridge's onClose ends with process.exit(0) and would skip the report.
+  await sleep(100);
+}
 process.stdout.write = originalWrite;
 
 const bsA = boundaries("t-bare");
