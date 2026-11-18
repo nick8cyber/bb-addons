@@ -109,6 +109,7 @@ provider is configured and not only here.
 | `icons/agy.svg` | the same mark as a file, served to clients as the provider `logoUrl` |
 | `harness.mjs` | protocol suite against the real agy (see below) |
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
+| `harness-shim-env.mjs` | regression suite for shim environment and unknown-session restore (reproduces steer without `AGY_SHIM_*` exiting code 2, proves option rewriting, fallback shim check, and `threads-state.json` restore on unknown threadId) |
 | `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay, the immediate reject whose exit 1 must not add a raw banner, the native `provider/rateLimits/updated` blocked→allowed snapshot, and live named `tool` items with settle progress |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
@@ -498,6 +499,19 @@ pick (spec §2.3, ADR-0030; ACP transport only).
   parking/unparking accounts) the merged model list may keep its old shape
   until that file's TTL expires — delete `acp-models-cache.json` to refresh
   it immediately.
+- **Recorded thread state (`threads-state.json`)**: maps each `threadId` to
+  `{ cwd, providerThreadId, atMs }` in the plugin data directory. The file is
+  instance-local (keeper never syncs it) and bounded to 2000 entries (evicting
+  the oldest records by `atMs`), allowing the wrapper to restore an unknown
+  thread's session after a wrapper restart.
+
+The shim always receives its own environment: every request carrying options
+(`thread/start|resume`, `turn/start`, `turn/steer`, internal starts) passes
+through `rewriteOptions`, ensuring `acpLaunchSpec` contains the environment
+configured for the session's account; unknown threads are restored via
+`threads-state.json` (spec §12.6). In desktop bb (Electron), the shim starts
+with `ELECTRON_RUN_AS_NODE=1` so the executable acts as a Node runtime rather
+than an app process (§12.5).
 
 The same rules drive turn-level model changes (`turn/start` with a new
 `options.model` rotates off an unfit account), `thread/resume` (an owner
@@ -507,11 +521,16 @@ which always read the session's pinned account.
 
 #### Account not eligible
 
-If agy reports `not eligible for Antigravity` or `verify your account`, the bridge parks that pool account and re-runs the failed turn on a free sibling after about one second. Verification refusals use a 24-hour cooldown. The refusal `not eligible for Antigravity, because it is not currently available in your location` uses a separate 2-hour cooldown and is logged with reason `location`; it may have no verification URL. A refusal that also requests verification or supplies a verification URL uses the verification cooldown.
+If Google refuses an account during eligibility checks, behavior depends on the refusal type:
+- A refusal requiring manual verification (`VALIDATION_REQUIRED` / `verify your account to continue` / agent text `⚠ Verification Required`) triggers permanent parking (`validation-required`, `cooldownUntilMs` in the far future, no automatic unpark or expiry, manual unpark only — see `validation-required` above).
+- A generic eligibility refusal (`not eligible for Antigravity` / `Eligibility check failed` without verification markers) uses a 24-hour cooldown (`AGY_INELIGIBLE_COOLDOWN_MS`).
+- A location refusal (`not eligible for Antigravity, because it is not currently available in your location` with no `verify your account` text and no verification URL) uses a separate 2-hour cooldown (`AGY_LOCATION_COOLDOWN_MS`) and is logged with reason `location`.
+
+The failed turn re-runs on a free sibling after about one second. A refusal that mentions verification or supplies a verification URL without matching the verification markers falls back to the generic 24-hour `AGY_INELIGIBLE_COOLDOWN_MS` cooldown — never the 2-hour location cooldown, even when the refusal also names the location — and counts toward the ineligible breaker. Only refusals matching the verification markers (`VALIDATION_REQUIRED` / `verify your account to continue` / `⚠ Verification Required`) trigger permanent `validation-required` parking.
 
 | Environment variable | Default | Behaviour |
 | --- | ---: | --- |
-| `AGY_INELIGIBLE_COOLDOWN_MS` | `86400000` (24 hours) | Verification cooldown; `0` disables parking and rotation for this kind only. |
+| `AGY_INELIGIBLE_COOLDOWN_MS` | `86400000` (24 hours) | Cooldown for generic eligibility refusals (without verification markers and not location-specific); `0` disables parking and rotation for this kind only. |
 | `AGY_LOCATION_COOLDOWN_MS` | `7200000` (2 hours) | Location cooldown; `0` disables parking and rotation for this kind only. |
 | `AGY_INELIGIBLE_BREAKER_WINDOW_MS` | `600000` (10 minutes) | Positive time window for counting distinct accounts parked after either kind of eligibility refusal. |
 | `AGY_INELIGIBLE_BREAKER_MAX` | `3` | Positive integer threshold: after this many distinct accounts were parked within the window, the next refusal fails without parking or rotation. |
@@ -551,7 +570,7 @@ rotations. Quota fields and `rateLimits` are untouched.
 > bookkeeping the same way as any parked account.
 
 > [!TIP] Restore a verified account
-> For verification failures, open the verification link from `bridge.log` in your browser and verify the account. Then unpark by side — **on the owner instance**: set that account's `cooldownUntilMs` to `0` **and** `lastUsedMs` to the current time in `bridge-data/accounts-state.json` (or run one turn); **on a satellite**: remove the label's record from `bridge-data/accounts-overlay.json`, since the keeper reverts shared edits within ~30 s. Or wait for the 24-hour cooldown to expire. When present, the verification URL is also logged on its own line.
+> For verification failures, open the verification link from `bridge.log` (or `acp-wrapper.log`) in your browser and verify the account. Since `validation-required` is permanent parking without auto-expiration, unpark by hand after verification: clear `parkedReason` and set `cooldownUntilMs` to `0` (and `lastUsedMs` to the current time on the owner instance, or remove the label's record from `bridge-data/accounts-overlay.json` on a satellite). When present, the verification URL is also logged on its own line.
 
 #### Native agy subagents are disabled
 

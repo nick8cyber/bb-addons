@@ -55,11 +55,16 @@ What it handles on its own (details in the plugin README):
 - **Account pool.** Several Google accounts, one agy HOME each; a thread is
   pinned to the least-used free account, and on a quota limit the turn moves
   to a free sibling with a compact handoff.
-- **Accounts Google refuses.** "Not eligible for Antigravity" parks the
-  account (2 h for a location refusal, 24 h when verification is required,
-  with the verification link in `bridge.log`) and re-runs the turn on a free
-  sibling; a breaker stops parking after 3 accounts in 10 minutes, so a
-  network fault cannot park the whole pool.
+- **Accounts Google refuses.** Google account verification (`VALIDATION_REQUIRED`
+  / "Verify your account to continue") and Terms of Service bans
+  (`tos-disabled`) park the account permanently until manual unpark; location
+  refusals park for 2 h; generic eligibility refusals park for 24 h; the turn
+  re-runs on a free sibling; a breaker stops parking after 3 accounts in 10
+  minutes, so a network fault cannot park the whole pool.
+- **Model-aware account selection.** Each account has its own model catalog
+  (`accounts-models.json`) polled via `agy models`; turns pick only among
+  accounts supporting the model family; senior-tier plans enter via lower
+  `priority` to serve exclusive models directly and common models only as reserve.
 - **Transient failures are retried by bb itself.** Google's own 5xx errors
   and a frozen agy (stall-kill with no tool running) reach bb tagged so its
   builtin `provider-retry` re-runs the turn (about 1 minute, doubling, up to

@@ -2,8 +2,8 @@
 title: provider-agy — восстановление после сбоев и сжатие
 status: approved
 owner: coordinator
-date: 2026-11-14
-revision: 2 (§2 — выбор по тирам priority, PLUG-253)
+date: 2026-11-18
+revision: 3 (синхронизация со спекой ACP рев. 14: бессрочные парковки validation-required/tos-disabled, отказ по модели, уточнение строк 24 ч/2 ч — отказ со словами «verify your account» или ссылкой проверки без «to continue» идёт в общие 24 ч, PLUG-313; ранее 2: §2 — выбор по тирам priority, PLUG-253)
 tags: [bb, plugins, provider-agy, recovery, compaction]
 ---
 
@@ -22,15 +22,21 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 | Сбой | Что делает мост |
 |---|---|
 | Квота аккаунта | Аккаунт откладывается до сброса (без срока — 30 мин); ход сразу на свободный аккаунт, новый разговор + короткая сводка; нет свободного — ожидание окна (до 55 мин, до 2 раз) |
-| «not eligible», нужна проверка | Отложить на 24 ч (`AGY_INELIGIBLE_COOLDOWN_MS`), ссылка проверки в `bridge.log`, ход на свободный аккаунт |
-| «not eligible», страна | Отложить на 2 ч (`AGY_LOCATION_COOLDOWN_MS`), ход на свободный аккаунт |
+| Нужна проверка Google: `VALIDATION_REQUIRED` / «Verify your account to continue» / агентский маркер `⚠ Verification Required` | Бессрочная парковка `validation-required` (`parkedReason: "validation-required"`, `cooldownUntilMs` в далёком будущем), без автоповторов, вне предохранителя массовой парковки; ссылка проверки пишется в лог без токенов; ход переигрывается на свободном подходящем сиблинге или честный фейл; снятие только вручную оператором после проверки в браузере (см. [provider-agy-acp.md](provider-agy-acp.md) §2.3 п. 11) |
+| Бан Google за Terms of Service: «This service has been disabled in this account for violation of Terms of Service» | Бессрочная парковка `tos-disabled` (`parkedReason: "tos-disabled"`, `cooldownUntilMs` в далёком будущем), без автоповторов, вне предохранителя массовой парковки; ход переигрывается на свободном подходящем сиблинге или честный фейл; снятие только вручную оператором ([provider-agy-acp.md](provider-agy-acp.md) §2.3 п. 7) |
+| «not eligible», общий отказ eligibility без маркеров `validation-required` («not eligible for Antigravity» / «Eligibility check failed»; сюда же — отказ со словами «verify your account» или ссылкой accounts.google.com без «to continue»: он получает 24 ч, а не бессрочную парковку) | Отложить на 24 ч (`AGY_INELIGIBLE_COOLDOWN_MS`), ход на свободный подходящий аккаунт, учитывается в предохранителе массовой парковки |
+| «not eligible», страна («not currently available in your location» без слов «verify your account» и без ссылки проверки) | Отложить на 2 ч (`AGY_LOCATION_COOLDOWN_MS`), лог с причиной `location`, ход на свободный подходящий аккаунт, учитывается в предохранителе |
 | ≥3 разных аккаунта отложены за 10 мин | Предохранитель: больше не откладывать, падать с исходным текстом (подозрение на сеть) |
 | Слёт Google-входа: `auth_required`, «Authentication required», «Silent sign-in failed», «not logged into Antigravity», «error getting token source» (ACP-транспорт) | Припарковать как ineligible + метка `parkedReason:"auth-dead"` в accounts-state.json; ход переигрывается на свободном аккаунте с `contextLost`; свободных нет — честный фейл «every pool account lost its Google sign-in; re-authenticate one and retry». Не квота, не toolError |
+| Отказ по модели в полёте: `Unknown model ID` / «not available for the current authentication method» | Без кулдауна всего аккаунта; семейство модели записывается в `unsupported` аккаунта в `accounts-models.json`; не больше одного переезда на аккаунт с моделью в свежем каталоге; если подходящих нет или повторный отказ — честная ошибка ([provider-agy-acp.md](provider-agy-acp.md) §2.3 пп. 4, 10) |
+| Все аккаунты пула припаркованы (любой `parkedReason`) | Честная ошибка без ухода в direct-режим на дефолтный HOME (даже для запросов без модели `acp-default`); на `thread/resume` — честная ошибка без запуска `agy` ([provider-agy-acp.md](provider-agy-acp.md) §2.3 п. 7) |
 | Google `API error (attempt N): … (code 500/502/503/504)` | `errorInfo {internal, 5xx}` → встроенный bb provider-retry повторяет ход (~1 мин, удвоение, до 4) |
 | Ошибка шага инструмента, auth/billing вместе с 5xx | Метки автоповтора нет |
 | Тишина ≥15 мин во время хода, тул не открыт | Убить agy; если в полёте один принятый ход без очереди — `errorInfo {stream-disconnected}` → bb повторяет |
 | Тишина ≥2 ч с открытым тулом | Убить agy, без автоповтора (команды не повторяются) |
 | `AGY_PATH` указан, но не исполняемый | Явная ошибка, без отката на системный agy |
+
+Правила парковки по `parkedReason` действуют на ACP-транспорте; для stream-json — см. [provider-agy-acp.md](provider-agy-acp.md) §10 (аккаунт с любым `parkedReason` в stream-json не запускается).
 
 Таймер тишины считается с момента, когда ход отдан agy, а не с его прошлого вывода: agy между ходами живёт до 30 мин (`AGY_IDLE_KILL_MS`).
 
