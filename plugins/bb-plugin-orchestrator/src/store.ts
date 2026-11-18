@@ -361,6 +361,19 @@ export const MIGRATIONS: readonly string[] = [
   CREATE INDEX IF NOT EXISTS plugin_staged_features_plugin_idx
     ON plugin_staged_features(plugin_name, status);
   ALTER TABLE releases ADD COLUMN dropped_unmerged_reason TEXT`,
+  // §5.6 (r33.11): the coordinator watchdog's per-coordinator state —
+  // survives a plugin restart so the idle countdown continues on real
+  // time. `idle_since` anchors the CURRENT quiet epoch (NULL while the
+  // coordinator is active or has running executors); `nudge_count` and
+  // `escalated_at` persist across epochs until a productive action.
+  `CREATE TABLE IF NOT EXISTS coordinator_watchdog_state (
+    coordinator_thread_id TEXT PRIMARY KEY,
+    idle_since INTEGER,
+    nudge_count INTEGER NOT NULL DEFAULT 0,
+    last_nudge_at INTEGER,
+    escalated_at INTEGER,
+    updated_at INTEGER NOT NULL
+  )`,
 ];
 
 export type CommandRunStatus =
@@ -572,6 +585,21 @@ export interface ThreadRoleRow {
   role: string;
   decided_at: number;
   source: ThreadRoleSource;
+}
+
+/** §5.6 (r33.11): the coordinator watchdog row — one per thread with the
+ * confirmed `orchestrator` role. */
+export interface CoordinatorWatchdogRow {
+  coordinator_thread_id: string;
+  /** Start of the current quiet idle epoch, or NULL while the thread is
+   * active / has running executors / has no pending work. */
+  idle_since: number | null;
+  /** Nudges sent since the last productive action. */
+  nudge_count: number;
+  last_nudge_at: number | null;
+  /** Owner escalation time — afterwards the watchdog waits silently. */
+  escalated_at: number | null;
+  updated_at: number;
 }
 
 export type StagedFeatureStatus = "in_review" | "merged" | "dropped";
@@ -1691,6 +1719,161 @@ export class DelegationStore {
            source = excluded.source`,
       )
       .run(threadId, role, Date.now(), source);
+  }
+
+  // ── Coordinator watchdog (§5.6, r33.11) ──────────────────────────
+
+  /** Threads whose decided role is `orchestrator` — the watchdog's scope. */
+  orchestratorThreadIds(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT thread_id AS t FROM thread_roles WHERE role = 'orchestrator'`,
+      )
+      .all() as { t: string }[];
+    return rows.map((r) => r.t);
+  }
+
+  coordinatorWatchdogGet(
+    coordinatorThreadId: string,
+  ): CoordinatorWatchdogRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_watchdog_state
+         WHERE coordinator_thread_id = ?`,
+      )
+      .get(coordinatorThreadId) as CoordinatorWatchdogRow | undefined;
+  }
+
+  coordinatorWatchdogList(): CoordinatorWatchdogRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM coordinator_watchdog_state
+         ORDER BY coordinator_thread_id`,
+      )
+      .all() as CoordinatorWatchdogRow[];
+  }
+
+  /** Get-or-create the row with a zeroed schedule. */
+  coordinatorWatchdogEnsure(
+    coordinatorThreadId: string,
+  ): CoordinatorWatchdogRow {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO coordinator_watchdog_state
+           (coordinator_thread_id, updated_at) VALUES (?, ?)`,
+      )
+      .run(coordinatorThreadId, Date.now());
+    return this.coordinatorWatchdogGet(coordinatorThreadId)!;
+  }
+
+  /** Partial update — every listed key is written verbatim (NULL too). */
+  coordinatorWatchdogPatch(
+    coordinatorThreadId: string,
+    patch: {
+      idle_since?: number | null;
+      nudge_count?: number;
+      last_nudge_at?: number | null;
+      escalated_at?: number | null;
+    },
+  ): void {
+    const sets: string[] = [];
+    const args: unknown[] = [];
+    for (const key of [
+      "idle_since",
+      "nudge_count",
+      "last_nudge_at",
+      "escalated_at",
+    ] as const) {
+      if (key in patch) {
+        sets.push(`${key} = ?`);
+        args.push(patch[key]);
+      }
+    }
+    if (!sets.length) return;
+    this.coordinatorWatchdogEnsure(coordinatorThreadId);
+    this.db
+      .prepare(
+        `UPDATE coordinator_watchdog_state
+         SET ${sets.join(", ")}, updated_at = ?
+         WHERE coordinator_thread_id = ?`,
+      )
+      .run(...args, Date.now(), coordinatorThreadId);
+  }
+
+  /** §5.6 п.4: a productive action or cleared queue — the schedule,
+   * the escalation wait and the idle anchor all restart from zero. */
+  coordinatorWatchdogReset(coordinatorThreadId: string): void {
+    this.coordinatorWatchdogPatch(coordinatorThreadId, {
+      idle_since: null,
+      nudge_count: 0,
+      last_nudge_at: null,
+      escalated_at: null,
+    });
+  }
+
+  coordinatorWatchdogDelete(coordinatorThreadId: string): void {
+    this.db
+      .prepare(
+        `DELETE FROM coordinator_watchdog_state
+         WHERE coordinator_thread_id = ?`,
+      )
+      .run(coordinatorThreadId);
+  }
+
+  /**
+   * §5.6 п.1а–б: tasks waiting on THIS coordinator — per task, its NEWEST
+   * delegation is `done` and not landed (`merge_status IS NULL` or a
+   * failed `conflict`/`failed` merge), or sits in a terminal
+   * `failed`/`stalled`/`quota` without a later round. Rows whose staged
+   * feature the owner explicitly dropped (`--force-drop-unmerged`) are
+   * settled and skipped.
+   */
+  coordinatorPendingTasks(
+    coordinatorThreadId: string,
+  ): { task_key: string; status: string; updated_at: number }[] {
+    return this.db
+      .prepare(
+        `SELECT d.task_key, d.status, d.updated_at FROM delegations d
+         WHERE d.coordinator_thread_id = ?
+           AND d.id = (
+             SELECT MAX(id) FROM delegations WHERE task_key = d.task_key
+           )
+           AND (
+             (d.status = 'done' AND (
+               d.merge_status IS NULL
+               OR d.merge_status IN ('conflict', 'failed')
+             ) AND NOT (d.no_code = 1 AND COALESCE(d.result_commits, 0) = 0))
+             OR d.status IN ('failed', 'stalled', 'quota')
+           )
+           AND d.task_key NOT IN (
+             SELECT task_key FROM plugin_staged_features
+             WHERE status = 'dropped'
+           )
+           AND d.task_key NOT IN (
+             SELECT task_key FROM releases
+             WHERE status IN ('auditing', 'publishing', 'published')
+           )
+         ORDER BY d.updated_at`,
+      )
+      .all(coordinatorThreadId) as {
+      task_key: string;
+      status: string;
+      updated_at: number;
+    }[];
+  }
+
+  /** §5.6 п.1: the coordinator still owns a working executor — while it
+   * runs, sleeping is the contract, not a stall. */
+  hasActiveForCoordinator(coordinatorThreadId: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 AS x FROM delegations
+           WHERE coordinator_thread_id = ?
+             AND status IN ('dispatching','running') LIMIT 1`,
+        )
+        .get(coordinatorThreadId) !== undefined
+    );
   }
 
   // ── Helpers (§19.1/§19.4, r33) ─────────────────────────────────

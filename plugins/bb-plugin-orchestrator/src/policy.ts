@@ -84,6 +84,13 @@ export interface PolicyTiming {
   postDispatchGraceMinutes?: number;
   /** Окно ожидания BB-нотифика о результате (default 120 с). */
   bbNotifyWaitSeconds?: number;
+  /** §5.6 (r33.11): порог простоя координатора до напоминания #1
+   * (default 5 мин). */
+  coordinatorIdleMinutes?: number;
+  /** §5.6 (r33.11): напоминаний до эскалации владельцу (default 3). */
+  coordinatorMaxNudges?: number;
+  /** §5.6 (r33.11): сторож координатора включён (default true). */
+  coordinatorWatchdogEnabled?: boolean;
 }
 
 export interface PolicyIssue {
@@ -466,11 +473,15 @@ export function parsePolicy(
     if (!isRecord(raw.timing)) {
       warn("timing", t("pol.timingObjectIgnored"));
     } else {
-      const bounds: Record<keyof PolicyTiming, [number, number]> = {
+      const bounds: Partial<
+        Record<keyof PolicyTiming, [number, number]>
+      > = {
         quotaHoldMinutes: [1, 1440],
         approvalRepeatMinutes: [1, 1440],
         postDispatchGraceMinutes: [1, 1440],
         bbNotifyWaitSeconds: [5, 3600],
+        coordinatorIdleMinutes: [1, 1440],
+        coordinatorMaxNudges: [1, 100],
       };
       for (const [key, [min, max]] of Object.entries(bounds) as [
         keyof PolicyTiming,
@@ -481,7 +492,15 @@ export function parsePolicy(
         if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
           warn(`timing.${key}`, t("pol.outOfBoundsDefault", { min: min, max: max }));
         } else {
-          timing[key] = v;
+          (timing as Record<string, unknown>)[key] = v;
+        }
+      }
+      const enabled = raw.timing.coordinatorWatchdogEnabled;
+      if (enabled !== undefined) {
+        if (typeof enabled === "boolean") {
+          timing.coordinatorWatchdogEnabled = enabled;
+        } else {
+          warn("timing.coordinatorWatchdogEnabled", t("pol.isBool"));
         }
       }
     }

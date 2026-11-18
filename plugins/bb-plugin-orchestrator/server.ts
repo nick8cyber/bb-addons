@@ -1947,6 +1947,8 @@ export async function createPlugin(
         .describe(t("tool.delAttach")),
     }),
     async execute(params, ctx) {
+      // §5.6 (r33.11): a productive call resets the idle nudge schedule.
+      watchdog.markCoordinatorAction(ctx.threadId);
       try {
         const res = await delegate({ ...params, threadId: ctx.threadId });
         return JSON.stringify({
@@ -1998,6 +2000,8 @@ export async function createPlugin(
         .describe(t("tool.cancelHelperId")),
     }),
     async execute(params, _ctx) {
+      // §5.6 (r33.11): a productive call resets the idle nudge schedule.
+      watchdog.markCoordinatorAction(_ctx.threadId);
       try {
         if (params.helperId !== undefined) {
           return JSON.stringify(
@@ -2044,6 +2048,8 @@ export async function createPlugin(
         .describe(t("tool.helperPreset")),
     }),
     async execute(params, ctx) {
+      // §5.6 (r33.11): a productive call resets the idle nudge schedule.
+      watchdog.markCoordinatorAction(ctx.threadId);
       try {
         return JSON.stringify(
           await helper({ ...params, threadId: ctx.threadId, via: "tool" }),
@@ -2079,6 +2085,8 @@ export async function createPlugin(
         .describe("Checks + merge-tree only; the worktree stays untouched"),
     }),
     async execute(params, ctx) {
+      // §5.6 (r33.11): a productive call resets the idle nudge schedule.
+      watchdog.markCoordinatorAction(ctx.threadId);
       try {
         return JSON.stringify(
           await mergeDelegation({ ...params, callerThreadId: ctx.threadId }),
@@ -2116,6 +2124,8 @@ export async function createPlugin(
       limit: z.number().int().positive().optional().describe(t("tool.kbLimit")),
     }),
     async execute(params, ctx) {
+      // §5.6 (r33.11): a productive call resets the idle nudge schedule.
+      watchdog.markCoordinatorAction(ctx.threadId);
       try {
         kbService.assertEnabled();
 
@@ -2256,7 +2266,13 @@ export async function createPlugin(
           "only the delegating coordinator may cancel it",
         );
       }
-      if (row.status !== "dispatching" && row.status !== "running") {
+      if (
+        row.status !== "dispatching" &&
+        row.status !== "running" &&
+        row.status !== "failed" &&
+        row.status !== "stalled" &&
+        row.status !== "quota"
+      ) {
         throw new OrchestratorError(
           "not-active",
           `delegation ${row.id} is already ${row.status}`,
@@ -2484,6 +2500,17 @@ export async function createPlugin(
       const cmd = positional[0];
 
       try {
+        // §5.6 (r33.11): a productive CLI call from a coordinator thread
+        // resets its idle nudge schedule (the call itself counts — the
+        // outcome need not succeed).
+        if (
+          cmd !== undefined &&
+          ["delegate", "cancel", "merge", "release", "helper", "kb"].includes(
+            cmd,
+          )
+        ) {
+          watchdog.markCoordinatorAction(ctx.threadId);
+        }
         if (cmd === "kb") {
           const sub = positional[1];
           if (!sub) {

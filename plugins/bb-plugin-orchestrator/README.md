@@ -70,6 +70,17 @@ Policy-driven delegation of `bb tasks` to executor threads (spec:
   line, no output tail, no journal check; the row is recorded
   `result_notice = 'self-cancel'` (a cancel NOT by the coordinator —
   UI, cascade, archive — still gets its one line).
+- **Coordinator watchdog** (§5.6): supervises idle coordinator threads
+  when work is pending (backlog below `maxActive`, done unmerged
+  without an active release (settled no-code rounds and dropped staged
+  features excepted), failed, or stalled/quota delegations). Sends
+  reminders at cumulative $N$, $3N$, $7N$ of silent idle; after
+  `coordinatorMaxNudges` reminders (+4N) escalates to the parent
+  thread or sends a push notification to the owner for root coordinators.
+  Active executors pause the timer. The schedule resets on productive
+  plugin actions (tools, CLI delegate|cancel|merge|release|helper|kb),
+  user messages (excluding system notices and `bb thread tell` messages),
+  or when all pending work is cleared.
 - **`merge`** (agent tool `orchestrator_merge` + CLI, §14): merges a
   finished round's `result_sha` into the coordinator's worktree after the
   §14 checks (clean result, clean coordinator copy, non-protected target,
@@ -770,7 +781,8 @@ covers only waiting: the copy lock, the command queue, the reload
 postponement; a running command is bounded by its `timeoutSec`).
 Watchdog timeouts — `policy.timing`: `quotaHoldMinutes` (15),
 `approvalRepeatMinutes` (10), `postDispatchGraceMinutes` (5),
-`bbNotifyWaitSeconds` (120). Out-of-range values warn and fall back to
+`bbNotifyWaitSeconds` (120), `coordinatorWatchdogEnabled` (true),
+`coordinatorIdleMinutes` (5), `coordinatorMaxNudges` (3). Out-of-range values warn and fall back to
 the default, not a config error.
 
 ## Limitations

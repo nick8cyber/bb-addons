@@ -73,6 +73,17 @@ const DEFAULT_POST_DISPATCH_GRACE_MINUTES = 5;
 const DEFAULT_BB_NOTIFY_WAIT_SECONDS = 120;
 const DEFAULT_FIRST_RESPONSE_SECONDS = 90;
 const DEFAULT_MAX_RUN_SECONDS = 7200;
+/** §5.6 (r33.11): coordinator idle watchdog defaults — `policy.timing`
+ * overrides (`coordinatorIdleMinutes`, `coordinatorMaxNudges`,
+ * `coordinatorWatchdogEnabled`). */
+const DEFAULT_COORDINATOR_IDLE_MINUTES = 5;
+const DEFAULT_COORDINATOR_MAX_NUDGES = 3;
+/** §5.6 п.1в: the backlog read is two `bb tasks` calls — cached per
+ * bb project for a minute. */
+const COORD_BACKLOG_CACHE_MS = 60_000;
+/** Coordinators without a state row get a DTO probe only on this beat —
+ * the per-row pass itself runs with checkTimers. */
+const COORD_DISCOVERY_MS = 60_000;
 /** §16.5 `routes.*.startSeconds` — no turn for this long → one message. */
 const DEFAULT_START_SECONDS = 600;
 /** §16.5 `routes.*.idleSeconds` — response silence → one message. */
@@ -133,6 +144,15 @@ const SUPERSEDED = new Set(["reissued", "stalled", "quota"]);
 /** §16.2: the tasks plugin's comment fan-out prefix — a turn opened by
  * it is a notification wake, not a revive. */
 const TRACKER_COMMENT_PREFIX = "New comment on task ";
+/** §5.6 п.4б (r33.11): journal request texts that never count as a user
+ * message — the watchdog's own lines and BB/task-tracker fan-outs. */
+const COORD_SYS_PREFIXES = [
+  "[orchestrator]",
+  "[orchestrator:alert]",
+  "[bb system]",
+  "[bb message from thread:",
+  TRACKER_COMMENT_PREFIX,
+] as const;
 
 /** §16.2: text of a `client/turn/requested` journal entry. */
 const requestText = (e: WatchdogThreadEvent): string =>
@@ -238,6 +258,9 @@ export interface WatchdogThreadDto {
   /** §16.5 binding verify: the executor's parent link and notify mode. */
   parentThreadId?: string | null;
   parentNotifications?: string | null;
+  /** §5.6 (r33.11): the coordinator's bb project — the backlog check
+   * lists tasks of the tracker projects linked to it. */
+  projectId?: string | null;
   /** §4 r30 (е 4): label-lookup fields the `list` seam returns. */
   title?: string | null;
   titleFallback?: string | null;
@@ -2762,7 +2785,19 @@ export function createWatchdog(deps: WatchdogDeps) {
   /** §5.1: a transition into `active` opens the window when no turn did. */
   const onThreadActive = async (thread: WatchdogThreadDto) => {
     const row = store.byThreadId(thread.id);
-    if (!row) return;
+    if (!row) {
+      // §5.6: a coordinator's own turn ends its quiet epoch — but only
+      // before the nudge schedule has started. A turn woken BY a nudge
+      // (nudge_count > 0) leaves the anchor alone so the cumulative
+      // N/3N/7N/11N targets keep measuring the whole quiet spell.
+      const w = isCoordinatorThread(thread.id)
+        ? store.coordinatorWatchdogGet(thread.id)
+        : undefined;
+      if (w && w.idle_since != null && w.nudge_count === 0) {
+        store.coordinatorWatchdogPatch(thread.id, { idle_since: null });
+      }
+      return;
+    }
     if (row.status === "running") {
       if (row.turn_started_at == null) store.setTurnStarted(row.id, now());
       return;
@@ -2777,7 +2812,22 @@ export function createWatchdog(deps: WatchdogDeps) {
 
   const onThreadIdle = async (thread: WatchdogThreadDto) => {
     const row = store.byThreadId(thread.id);
-    if (!row || !isActive(row.status)) return;
+    if (!row) {
+      // §5.6: an orchestrator-role thread going idle opens a fresh
+      // quiet epoch — but a re-idle after a nudge-woken turn must NOT
+      // move the anchor (the cumulative schedule measures the whole
+      // spell), so only a missing anchor is (re-)armed here.
+      if (isCoordinatorThread(thread.id)) {
+        const w = store.coordinatorWatchdogGet(thread.id);
+        if (!w || w.idle_since == null) {
+          store.coordinatorWatchdogPatch(thread.id, {
+            idle_since: now(),
+          });
+        }
+      }
+      return;
+    }
+    if (!isActive(row.status)) return;
     const streamRead = await processStream(row);
     const fresh = store.get(row.id);
     if (!fresh || fresh.status !== "running") return;
@@ -2911,7 +2961,12 @@ export function createWatchdog(deps: WatchdogDeps) {
     reason: "archived" | "deleted" | "not-found",
   ) => {
     const row = store.byThreadId(thread.id);
-    if (!row || !isActive(row.status)) return;
+    if (!row) {
+      // §5.6: a gone coordinator stops being watched at all.
+      store.coordinatorWatchdogDelete(thread.id);
+      return;
+    }
+    if (!isActive(row.status)) return;
     const text =
       reason === "archived"
         ? t("wd.threadArchived")
@@ -3113,6 +3168,357 @@ export function createWatchdog(deps: WatchdogDeps) {
           }),
         );
       }
+    }
+    // §5.6 (r33.11): the coordinator pass rides the same 5 s beat.
+    await coordinatorPass(nowMs);
+  };
+
+  // ── Coordinator watchdog (§5.6, r33.11) ────────────────────────────
+
+  /** Quiet spacing before nudge #k measured from the current idle
+   * epoch's start: N, +2N, +4N — and +4N again before the escalation. */
+  /** §5.6 п.2–3: cumulative targets measured from `idle_since` —
+   * nudges #1/#2/#3 at N/3N/7N of quiet idle, the owner escalation at
+   * 11N; if `coordinatorMaxNudges` is raised, later nudges keep the
+   * +4N step. */
+  const coordinatorIntervalMs = (k: number, baseMs: number) =>
+    baseMs * (2 ** Math.min(k, 3) - 1 + Math.max(0, k - 3) * 4);
+
+  const coordSeqKey = (id: string) => `coordwd:jseq:${id}`;
+  /** projectId → backlog task keys — the 60 s cache (two CLI calls). */
+  const backlogCache = new Map<string, { at: number; keys: string[] }>();
+  let lastCoordDiscovery = 0;
+
+  const isCoordinatorThread = (threadId: string) =>
+    store.threadRole(threadId)?.role === "orchestrator";
+
+  /**
+   * §5.6 п.4б: a real user/owner message resets the nudge schedule —
+   * the watchdog's own `[orchestrator]` texts, BB `[bb system]` lines,
+   * typed system notices and the task-tracker comment fan-out never
+   * count. The journal cursor rides `plugin_meta`; a request qualifies
+   * only when it is newer than the last nudge (a stale backlog after a
+   * quiet spell must not reset a schedule it predates).
+   */
+  const coordinatorSawUserMessage = async (
+    threadId: string,
+    lastNudgeAt: number | null,
+  ): Promise<boolean> => {
+    const key = coordSeqKey(threadId);
+    let after = Number(store.metaGet(key) ?? 0) || 0;
+    let found = false;
+    try {
+      if (after === 0) {
+        // First pass for this coordinator: anchor at the journal tip —
+        // its whole history is old news, not a fresh message. When the
+        // tip postdates the last nudge a fresh message may hide inside —
+        // then the scan starts at 0 and the `createdAt` guard below
+        // skips the old history event by event.
+        const tip = await deps.threads.events.list({
+          threadId,
+          order: "desc",
+          limit: "1",
+          types: ["client/turn/requested"],
+        });
+        if (
+          tip.length &&
+          (lastNudgeAt == null || tip[0]!.createdAt <= lastNudgeAt)
+        ) {
+          after = tip[0]!.seq;
+          store.metaSet(key, String(after));
+        }
+      }
+      for (let page = 0; page < EVENT_MAX_PAGES; page++) {
+        const chunk = await deps.threads.events.list({
+          threadId,
+          afterSeq: String(after),
+          order: "asc",
+          limit: "50",
+          types: ["client/turn/requested"],
+        });
+        if (!chunk.length) break;
+        for (const e of chunk) {
+          const d = e.data as
+            | {
+                systemMessageKind?: unknown;
+                senderThreadId?: unknown;
+                source?: unknown;
+              }
+            | null
+            | undefined;
+          const kind = d?.systemMessageKind;
+          if (kind !== undefined && kind !== null && kind !== "unlabeled") {
+            continue;
+          }
+          if (d?.senderThreadId != null || d?.source === "tell") {
+            continue;
+          }
+          if (lastNudgeAt != null && e.createdAt <= lastNudgeAt) continue;
+          const text = requestText(e);
+          if (COORD_SYS_PREFIXES.some((p) => text.startsWith(p))) continue;
+          found = true;
+        }
+        after = Math.max(...chunk.map((e) => e.seq));
+        store.metaSet(key, String(after));
+        if (chunk.length < 50) break;
+      }
+    } catch (e) {
+      log.warn?.(
+        `orchestrator: coordinator journal ${threadId}: ${message(e)}`,
+      );
+    }
+    return found;
+  };
+
+  /**
+   * §5.6 п.1в: project backlog — tasks of the tracker projects linked
+   * to the coordinator's bb project in `backlog`/`todo`/`in_progress`.
+   * Two CLI calls per project — cached for COORD_BACKLOG_CACHE_MS.
+   */
+  const coordinatorBacklogKeys = async (
+    projectId: string | null | undefined,
+  ): Promise<string[]> => {
+    if (!projectId) return [];
+    const hit = backlogCache.get(projectId);
+    if (hit && now() - hit.at < COORD_BACKLOG_CACHE_MS) return hit.keys;
+    const keys: string[] = [];
+    try {
+      const res = await runJson<{
+        projects?: { prefix?: string; linkedBbProjectId?: string | null }[];
+      }>(deps.bbCli, ["tasks", "project", "list", "--json"], {
+        timeoutMs: 15_000,
+      });
+      const prefixes = (res.projects ?? [])
+        .filter((p) => p.linkedBbProjectId === projectId && p.prefix)
+        .map((p) => p.prefix as string);
+      for (const prefix of prefixes) {
+        const list = await runJson<{ tasks?: { key?: string }[] }>(
+          deps.bbCli,
+          [
+            "tasks",
+            "list",
+            "--project",
+            prefix,
+            "--status",
+            "backlog,todo,in_progress",
+            "--limit",
+            "50",
+            "--json",
+          ],
+          { timeoutMs: 15_000 },
+        );
+        for (const task of list.tasks ?? []) {
+          if (task.key) keys.push(task.key);
+        }
+      }
+    } catch (e) {
+      log.warn?.(`orchestrator: backlog check ${projectId}: ${message(e)}`);
+      return hit?.keys ?? [];
+    }
+    backlogCache.set(projectId, { at: now(), keys });
+    return keys;
+  };
+
+  /**
+   * §5.6: the coordinator pass — runs inside `checkTimers`. Per
+   * orchestrator thread: no running executors (sleeping is then the
+   * contract), pending own delegations or project backlog under the
+   * `maxActive` cap → nudges at cumulative N/3N/7N of quiet idle,
+   * escalation to the parent thread (or a push for a root chat) at 11N.
+   */
+  const coordinatorPass = async (nowMs: number) => {
+    const { policy } = await deps.loadPolicy();
+    const tm = policy?.timing;
+    if (tm?.coordinatorWatchdogEnabled === false) return;
+    const baseMs =
+      (tm?.coordinatorIdleMinutes ?? DEFAULT_COORDINATOR_IDLE_MINUTES) *
+      60_000;
+    const maxNudges =
+      tm?.coordinatorMaxNudges ?? DEFAULT_COORDINATOR_MAX_NUDGES;
+    const fullDiscovery = nowMs - lastCoordDiscovery >= COORD_DISCOVERY_MS;
+    if (fullDiscovery) lastCoordDiscovery = nowMs;
+
+    for (const threadId of store.orchestratorThreadIds()) {
+      try {
+        let w = store.coordinatorWatchdogGet(threadId);
+        const pending = store.coordinatorPendingTasks(threadId);
+        // §5.6 п.1: working executors make sleeping the contract — the
+        // idle anchor restarts at the last executor's completion.
+        if (store.hasActiveForCoordinator(threadId)) {
+          if (w?.idle_since != null) {
+            store.coordinatorWatchdogPatch(threadId, { idle_since: null });
+          }
+          continue;
+        }
+        if (!w && !pending.length && !fullDiscovery) continue;
+        const thread = await getThread(threadId);
+        if (!thread) {
+          store.coordinatorWatchdogDelete(threadId);
+          continue;
+        }
+        if (thread.status === "active") {
+          // An active turn ends the quiet epoch — but a nudge-woken
+          // turn must not move the anchor: the cumulative N/3N/7N/11N
+          // targets measure the whole quiet spell (§5.6 п.4).
+          if (w?.idle_since != null && w.nudge_count === 0) {
+            store.coordinatorWatchdogPatch(threadId, { idle_since: null });
+          }
+          continue;
+        }
+        // §5.6 п.4б: a fresh user/owner message resets the schedule.
+        if (w && (w.nudge_count > 0 || w.escalated_at != null)) {
+          if (await coordinatorSawUserMessage(threadId, w.last_nudge_at)) {
+            store.coordinatorWatchdogReset(threadId);
+            continue;
+          }
+        }
+        const taskList = pending.map((p) => p.task_key);
+        // §5.6 п.1в: the backlog counts only under the maxActive cap.
+        const maxActive = policy?.limits?.maxActive;
+        const active =
+          store.activeCount() + store.helperActiveCount();
+        if (maxActive === undefined || active < maxActive) {
+          for (const key of await coordinatorBacklogKeys(
+            thread.projectId,
+          )) {
+            if (!taskList.includes(key)) taskList.push(key);
+          }
+        }
+        if (!taskList.length) {
+          // §5.6 п.4в: every deal is settled — the schedule resets and
+          // the anchor clears (work appearing later re-anchors it).
+          if (
+            w &&
+            (w.idle_since != null ||
+              w.nudge_count > 0 ||
+              w.escalated_at != null)
+          ) {
+            store.coordinatorWatchdogReset(threadId);
+          }
+          continue;
+        }
+        if (!w) w = store.coordinatorWatchdogEnsure(threadId);
+        if (w.idle_since == null) {
+          store.coordinatorWatchdogPatch(threadId, { idle_since: nowMs });
+          continue;
+        }
+        // §5.6 п.3: escalated — silent until a productive action or a
+        // user message (both reset the schedule above/in the tools).
+        if (w.escalated_at != null) continue;
+        const anchor = w.idle_since;
+        const idleMinutes = Math.max(
+          1,
+          Math.round((nowMs - anchor) / 60_000),
+        );
+        const nextIdx = w.nudge_count + 1;
+        const targetMs =
+          nextIdx <= maxNudges
+            ? coordinatorIntervalMs(nextIdx, baseMs)
+            : coordinatorIntervalMs(maxNudges, baseMs) + 4 * baseMs;
+        if (nowMs - anchor < targetMs) {
+          continue;
+        }
+        const tasksText =
+          taskList.slice(0, 10).join(", ") +
+          (taskList.length > 10 ? ` +${taskList.length - 10}` : "");
+        if (nextIdx <= maxNudges) {
+          await deps.threads.send({
+            threadId,
+            mode: "queue-if-active",
+            input: [
+              {
+                type: "text",
+                text:
+                  `[orchestrator] ` +
+                  t("watchdog.coordinatorNudge", {
+                    nudge: nextIdx,
+                    max: maxNudges,
+                    idleMinutes,
+                    taskList: tasksText,
+                  }),
+                mentions: [],
+              },
+            ],
+          });
+          store.coordinatorWatchdogPatch(threadId, {
+            nudge_count: nextIdx,
+            last_nudge_at: nowMs,
+          });
+          continue;
+        }
+        // §5.6 п.3: owner escalation — the parent thread when there is
+        // one, a push notification for a root chat.
+        const text = t("watchdog.coordinatorEscalation", {
+          thread: threadId,
+          max: maxNudges,
+          idleMinutes,
+          taskList: tasksText,
+        });
+        if (thread.parentThreadId) {
+          try {
+            await deps.threads.send({
+              threadId: thread.parentThreadId,
+              mode: "queue-if-active",
+              input: [
+                {
+                  type: "text",
+                  text: `[orchestrator:alert] ${text}`,
+                  mentions: [],
+                },
+              ],
+            });
+          } catch (e) {
+            // A failed send must not re-fire the escalation on every
+            // tick — `escalated_at` is set below either way and the
+            // watchdog goes quiet until a reset.
+            log.warn?.(
+              `orchestrator: escalation send ${threadId}: ${message(e)}`,
+            );
+          }
+        } else {
+          try {
+            await runChecked(deps.bbCli, [
+              "push-notifications",
+              "send",
+              "--title",
+              `[orchestrator:alert] ${t("watchdog.escalationTitle")}`,
+              "--body",
+              text,
+              "--thread",
+              threadId,
+            ]);
+          } catch (e) {
+            // A missing push plugin must not re-arm the escalation.
+            log.warn?.(
+              `orchestrator: escalation push ${threadId}: ${message(e)}`,
+            );
+          }
+        }
+        store.coordinatorWatchdogPatch(threadId, { escalated_at: nowMs });
+      } catch (e) {
+        log.warn?.(
+          `orchestrator: coordinator watchdog ${threadId}: ${message(e)}`,
+        );
+      }
+    }
+  };
+
+  /**
+   * §5.6 п.4а: a plugin tool/CLI call from a coordinator is productive
+   * — the nudge schedule (and the post-escalation wait) resets. Called
+   * synchronously by tool `execute` and the CLI `run` — a pure store
+   * write, safe inside or outside `enqueue`.
+   */
+  const markCoordinatorAction = (threadId: string | undefined | null) => {
+    if (!threadId || !isCoordinatorThread(threadId)) return;
+    const w = store.coordinatorWatchdogGet(threadId);
+    if (
+      w &&
+      (w.nudge_count > 0 ||
+        w.last_nudge_at != null ||
+        w.escalated_at != null)
+    ) {
+      store.coordinatorWatchdogReset(threadId);
     }
   };
 
@@ -3880,6 +4286,10 @@ export function createWatchdog(deps: WatchdogDeps) {
     ) => deps.enqueue(() => onThreadGone(thread, reason)),
     checkTimers: () => deps.enqueue(() => checkTimers()),
     reconcile: () => deps.enqueue(() => reconcile()),
+    /** §5.6 п.4а: a coordinator's productive plugin call — resets the
+     * nudge schedule. Synchronous on purpose: callers inside `enqueue`
+     * (delegate/merge) must not re-enter it. */
+    markCoordinatorAction,
   };
 }
 
