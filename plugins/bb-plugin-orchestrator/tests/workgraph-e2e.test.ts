@@ -526,8 +526,8 @@ test("Tampered acceptance contract rejected and blocks after 3 attempts", async 
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
-    acceptanceSha: "sha-original-acc",
   });
+  store.updateTask("TAMPER-1", { acceptance_sha: "sha-original-acc" });
 
   await runRunQueue({ store, workGraphMode: "strict", cmd });
 

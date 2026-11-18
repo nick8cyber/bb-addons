@@ -22,6 +22,27 @@ import type {
 import { normalizeTaskKey } from "./store.js";
 import type { PluginCliContext } from "@get-bb/plugin-sdk";
 import type { T } from "./i18n/index.js";
+import {
+  TRANSITION_TABLE,
+  resolveTransition,
+  extractCounters,
+  type TransitionCounters,
+  type TransitionEvent,
+  type TransitionInput,
+  type TransitionResolution,
+  type TransitionRule,
+} from "./transition-matrix.js";
+
+export {
+  TRANSITION_TABLE,
+  resolveTransition,
+  extractCounters,
+  type TransitionCounters,
+  type TransitionEvent,
+  type TransitionInput,
+  type TransitionResolution,
+  type TransitionRule,
+};
 
 export type WorkGraphMode = "off" | "shadow" | "strict";
 
@@ -838,14 +859,24 @@ export async function runDequeue(
       `задача ${key} не найдена в очереди`,
     );
   }
-  if (task.status === "done" || task.status === "cancelled") {
+  const resolution = resolveTransition({
+    route: task.route,
+    node: task.node,
+    status: task.status,
+    event: { type: "dequeue", isOwner: isOwnerCalling(deps.ctx), reason },
+    mode: task.confirmation_mode,
+    counters: extractCounters(task),
+  });
+  if (!resolution.allowed) {
     throw new OrchestratorError(
-      "invalid-status",
+      resolution.errorCode ?? "invalid-status",
       `задача ${key} уже завершена или отменена (status=${task.status})`,
     );
   }
 
-  await archiveAndCleanupTaskBranch(deps.cmd, deps.repoRoot, task.branch, key);
+  if (resolution.action?.archiveBranch) {
+    await archiveAndCleanupTaskBranch(deps.cmd, deps.repoRoot, task.branch, key);
+  }
 
   let payloadObj: Record<string, unknown> = {};
   try {
@@ -859,10 +890,10 @@ export async function runDequeue(
       taskKey: key,
       expectedNode: task.node,
       expectedStatus: task.status,
-      toNode: task.node,
-      toStatus: "cancelled",
+      toNode: resolution.toNode,
+      toStatus: resolution.toStatus,
       actor: "owner",
-      reason: reason ?? "dequeue",
+      reason: resolution.reason,
       now,
       updates: { payload: JSON.stringify(payloadObj) },
     },
@@ -910,16 +941,24 @@ export async function runDefer(
       `задача ${key} не найдена в очереди`,
     );
   }
-  if (task.status === "done" || task.status === "cancelled") {
+  const resolution = resolveTransition({
+    route: task.route,
+    node: task.node,
+    status: task.status,
+    event: { type: "owner_defer", isOwner: isOwnerCalling(deps.ctx), reason },
+    mode: task.confirmation_mode,
+    counters: extractCounters(task),
+  });
+  if (!resolution.allowed) {
+    if (task.status === "deferred") {
+      throw new OrchestratorError(
+        "invalid-status",
+        `задача ${key} уже отложена (status=deferred)`,
+      );
+    }
     throw new OrchestratorError(
-      "invalid-status",
+      resolution.errorCode ?? "invalid-status",
       `задача ${key} уже завершена или отменена (status=${task.status})`,
-    );
-  }
-  if (task.status === "deferred") {
-    throw new OrchestratorError(
-      "invalid-status",
-      `задача ${key} уже отложена (status=deferred)`,
     );
   }
 
@@ -935,10 +974,10 @@ export async function runDefer(
       taskKey: key,
       expectedNode: task.node,
       expectedStatus: task.status,
-      toNode: task.node,
-      toStatus: "deferred",
+      toNode: resolution.toNode,
+      toStatus: resolution.toStatus,
       actor: "owner",
-      reason,
+      reason: resolution.reason,
       now,
       updates: {
         deferred_by: "owner",
@@ -1003,105 +1042,59 @@ export async function runReject(
 
   if (task.node === "owner_gate") {
     assertOwnerOnly(deps.ctx);
-    if (task.route === "feature") {
-      const tgt = (target ?? "spec") as TaskNode;
-      if (tgt !== "spec" && tgt !== "design") {
-        throw new OrchestratorError(
-          "target-invalid",
-          `недопустимая цель ${target} для маршрута feature (разрешены: spec, design)`,
-        );
+    const tgt = target as TaskNode | undefined;
+    const resolution = resolveTransition({
+      route: task.route,
+      node: "owner_gate",
+      status: task.status,
+      event: { type: "owner_reject", isOwner: true, target: tgt, reason: reason! },
+      mode: task.confirmation_mode,
+      counters: extractCounters(task),
+    });
+
+    if (!resolution.allowed) {
+      if (resolution.errorCode === "target-invalid") {
+        throw new OrchestratorError("target-invalid", resolution.errorMessage!);
       }
-      const res = deps.store.transitionTask(
-        {
-          taskKey: key,
-          expectedNode: "owner_gate",
-          expectedStatus: task.status,
-          toNode: tgt,
-          toStatus: "running",
-          actor: "owner",
-          reason: reason ?? "rejected",
-          now,
-        },
-        now,
+      throw new OrchestratorError(
+        resolution.errorCode ?? "invalid-status",
+        resolution.errorMessage ?? "reject failed",
       );
-      if (!res.ok) {
-        throw new OrchestratorError(
-          "transition-failed",
-          `не удалось отклонить задачу ${key}: конфликт CAS`,
-        );
-      }
-      return { ok: true, task: res.task! };
     }
 
-    if (task.route === "docs") {
-      const tgt = (target ?? "spec") as TaskNode;
-      if (tgt !== "spec") {
-        throw new OrchestratorError(
-          "target-invalid",
-          `недопустимая цель ${target} для маршрута docs (разрешено только: spec)`,
-        );
-      }
-      const res = deps.store.transitionTask(
-        {
-          taskKey: key,
-          expectedNode: "owner_gate",
-          expectedStatus: task.status,
-          toNode: "spec",
-          toStatus: "running",
-          actor: "owner",
-          reason: reason ?? "rejected",
-          now,
-        },
-        now,
-      );
-      if (!res.ok) {
-        throw new OrchestratorError(
-          "transition-failed",
-          `не удалось отклонить задачу ${key}: конфликт CAS`,
-        );
-      }
-      return { ok: true, task: res.task! };
+    let rejectPayload: Record<string, unknown> = {};
+    try {
+      if (task.payload) rejectPayload = JSON.parse(task.payload);
+    } catch {}
+    delete rejectPayload.previous_status;
+
+    const updates: Partial<TaskQueueRow> = { payload: JSON.stringify(rejectPayload) };
+    if (resolution.toStatus === "deferred") {
+      updates.deferred_by = "owner";
+      updates.deferred_reason = reason ?? "rejected at owner_gate";
     }
 
-    if (task.route === "fix" || task.route === "simple") {
-      if (target !== undefined) {
-        throw new OrchestratorError(
-          "target-invalid",
-          "для маршрутов fix и simple цель --target не поддерживается",
-        );
-      }
-      let rejectPayload: Record<string, unknown> = {};
-      try {
-        if (task.payload) rejectPayload = JSON.parse(task.payload);
-      } catch {}
-      delete rejectPayload.previous_status;
-
-      const res = deps.store.transitionTask(
-        {
-          taskKey: key,
-          expectedNode: "owner_gate",
-          expectedStatus: task.status,
-          toNode: "owner_gate",
-          toStatus: "deferred",
-          actor: "owner",
-          reason: reason ?? "rejected",
-          now,
-          updates: {
-            deferred_by: "owner",
-            deferred_reason: reason ?? "rejected at owner_gate",
-            payload: JSON.stringify(rejectPayload),
-          },
-        },
+    const res = deps.store.transitionTask(
+      {
+        taskKey: key,
+        expectedNode: "owner_gate",
+        expectedStatus: task.status,
+        toNode: resolution.toNode,
+        toStatus: resolution.toStatus,
+        actor: "owner",
+        reason: reason ?? "rejected",
         now,
+        updates,
+      },
+      now,
+    );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось отклонить задачу ${key}: конфликт CAS`,
       );
-      if (!res.ok) {
-        throw new OrchestratorError(
-          "transition-failed",
-          `не удалось отклонить задачу ${key}: конфликт CAS`,
-        );
-      }
-      return { ok: true, task: res.task! };
     }
+    return { ok: true, task: res.task! };
   }
 
   if (task.node === "code") {
@@ -1117,13 +1110,22 @@ export async function runReject(
         `недопустимая цель ${target} для узла code`,
       );
     }
+    const resolution = resolveTransition({
+      route: task.route,
+      node: "code",
+      status: task.status,
+      event: { type: "code_reject", reason: reason!, isOwnerOrCoordinator: true },
+      mode: task.confirmation_mode,
+      counters: extractCounters(task),
+    });
+
     const res = deps.store.transitionTask(
       {
         taskKey: key,
         expectedNode: "code",
         expectedStatus: task.status,
-        toNode: "code",
-        toStatus: "running",
+        toNode: resolution.toNode,
+        toStatus: resolution.toStatus,
         actor: isOwner ? "owner" : "coordinator",
         reason: reason ?? "rejected",
         now,
@@ -1195,89 +1197,79 @@ export async function runResume(
 
     if (target !== undefined) {
       assertOwnerOnly(deps.ctx);
-      if (task.node === "release") {
-        if (["feature", "fix", "simple"].includes(task.route)) {
-          if (target !== "code") {
-            throw new OrchestratorError(
-              "target-invalid",
-              `недопустимая цель ${target} для возобновления из release/stalled`,
-            );
-          }
-          const res = deps.store.transitionTask(
-            {
-              taskKey: key,
-              expectedNode: "release",
-              expectedStatus: "stalled",
-              toNode: "code",
-              toStatus: "running",
-              actor: "owner",
-              reason: "resume-to-code",
-              now,
-              updates: {
-                code_attempts: 0,
-                check_attempts: 0,
-                code_review_rounds: 0,
-                design_check_rounds: 0,
-                release_attempts: 0,
-              },
-            },
-            now,
+      const resolution = resolveTransition({
+        route: task.route,
+        node: task.node,
+        status: "stalled",
+        event: {
+          type: "resume",
+          target: target as TaskNode,
+          isOwner: true,
+          prClosedReason: true,
+        },
+        mode: task.confirmation_mode,
+        counters: extractCounters(task),
+      });
+
+      if (!resolution.allowed) {
+        if (task.node !== "release") {
+          throw new OrchestratorError(
+            "target-invalid",
+            `цель --target не поддерживается для узла ${task.node} в статусе stalled`,
           );
-          if (!res.ok) {
-            throw new OrchestratorError(
-              "transition-failed",
-              `не удалось возобновить задачу ${key}: конфликт CAS`,
-            );
-          }
-          return { ok: true, task: res.task! };
         }
-        if (task.route === "docs") {
-          if (target !== "spec") {
-            throw new OrchestratorError(
-              "target-invalid",
-              `недопустимая цель ${target} для возобновления docs из release/stalled`,
-            );
-          }
-          const res = deps.store.transitionTask(
-            {
-              taskKey: key,
-              expectedNode: "release",
-              expectedStatus: "stalled",
-              toNode: "spec",
-              toStatus: "running",
-              actor: "owner",
-              reason: "resume-to-spec",
-              now,
-              updates: {
-                spec_attempts: 0,
-                spec_review_rounds: 0,
-                release_attempts: 0,
-              },
-            },
-            now,
-          );
-          if (!res.ok) {
-            throw new OrchestratorError(
-              "transition-failed",
-              `не удалось возобновить задачу ${key}: конфликт CAS`,
-            );
-          }
-          return { ok: true, task: res.task! };
-        }
+        throw new OrchestratorError(
+          "target-invalid",
+          task.route === "docs"
+            ? `недопустимая цель ${target} для возобновления docs из release/stalled`
+            : `недопустимая цель ${target} для возобновления из release/stalled`,
+        );
       }
-      throw new OrchestratorError(
-        "target-invalid",
-        `цель --target не поддерживается для узла ${task.node} в статусе stalled`,
+
+      const updates: Partial<TaskQueueRow> = {};
+      if (resolution.counterUpdates) {
+        Object.assign(updates, resolution.counterUpdates);
+      }
+
+      const res = deps.store.transitionTask(
+        {
+          taskKey: key,
+          expectedNode: task.node,
+          expectedStatus: "stalled",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
+          actor: "owner",
+          reason: `resume-to-${target}`,
+          now,
+          updates: Object.keys(updates).length > 0 ? updates : undefined,
+        },
+        now,
       );
+      if (!res.ok) {
+        throw new OrchestratorError(
+          "transition-failed",
+          `не удалось возобновить задачу ${key}: конфликт CAS`,
+        );
+      }
+      return { ok: true, task: res.task! };
     }
+
+    const resolution = resolveTransition({
+      route: task.route,
+      node: task.node,
+      status: "stalled",
+      event: { type: "resume" },
+      mode: task.confirmation_mode,
+      counters: extractCounters(task),
+    });
 
     const res = deps.store.transitionTask(
       {
         taskKey: key,
         expectedNode: task.node,
         expectedStatus: "stalled",
-        toNode: task.node,
-        toStatus: "running",
+        toNode: resolution.toNode,
+        toStatus: resolution.toStatus,
         actor: isOwner ? "owner" : "coordinator",
         reason: "resume",
         now,
@@ -1322,46 +1314,29 @@ export async function runResume(
       else tgt = (validTargetsByRoute[task.route]?.[0] as TaskNode) ?? "code";
     }
 
-    const allowed = validTargetsByRoute[task.route] ?? [];
-    if (!allowed.includes(tgt)) {
-      throw new OrchestratorError(
-        "target-invalid",
-        `цель ${tgt} недопустима для маршрута ${task.route}`,
-      );
-    }
+    const resolution = resolveTransition({
+      route: task.route,
+      node: task.node,
+      status: "blocked",
+      event: {
+        type: "resume",
+        target: tgt,
+        isOwner: true,
+      },
+      mode: task.confirmation_mode,
+      counters: extractCounters(task),
+    });
 
-    if (tgt === "release" && task.node !== "release") {
+    if (!resolution.allowed) {
       throw new OrchestratorError(
-        "target-invalid",
-        "cannot resume to release from unreviewed or unverified code",
+        resolution.errorCode ?? "target-invalid",
+        resolution.errorMessage ?? `цель ${tgt} недопустима для маршрута ${task.route}`,
       );
     }
 
     const updates: Partial<TaskQueueRow> = {};
-    if (tgt === "design") {
-      updates.design_check_rounds = 0;
-      updates.spec_attempts = 0;
-      updates.spec_review_rounds = 0;
-      updates.code_attempts = 0;
-      updates.check_attempts = 0;
-      updates.code_review_rounds = 0;
-      updates.release_attempts = 0;
-    } else if (tgt === "spec") {
-      updates.spec_attempts = 0;
-      updates.spec_review_rounds = 0;
-      updates.code_attempts = 0;
-      updates.check_attempts = 0;
-      updates.code_review_rounds = 0;
-      updates.design_check_rounds = 0;
-      updates.release_attempts = 0;
-    } else if (tgt === "code") {
-      updates.code_attempts = 0;
-      updates.check_attempts = 0;
-      updates.code_review_rounds = 0;
-      updates.design_check_rounds = 0;
-      updates.release_attempts = 0;
-    } else if (tgt === "release") {
-      updates.release_attempts = 0;
+    if (resolution.counterUpdates) {
+      Object.assign(updates, resolution.counterUpdates);
     }
 
     const res = deps.store.transitionTask(
@@ -1369,8 +1344,8 @@ export async function runResume(
         taskKey: key,
         expectedNode: task.node,
         expectedStatus: "blocked",
-        toNode: tgt,
-        toStatus: "running",
+        toNode: resolution.toNode,
+        toStatus: resolution.toStatus,
         actor: "owner",
         reason: "resume",
         now,
@@ -1401,19 +1376,22 @@ export async function runResume(
     } catch {}
     delete parsedPayload.previous_status;
 
-    let toStatus: TaskStatus = "running";
+    const resolution = resolveTransition({
+      route: task.route,
+      node: task.node,
+      status: "deferred",
+      event: { type: "resume", isOwner: true },
+      mode: task.confirmation_mode,
+      counters: extractCounters(task),
+    });
+
+    let toStatus: TaskStatus = resolution.toStatus;
     if (task.node === "start") {
       toStatus = "queued";
-    } else if (task.node === "owner_gate") {
-      toStatus = "waiting_approval";
     } else if (task.node === "release") {
       if (prevStatus === "waiting_release_note" || prevStatus === "pr_open") {
         toStatus = prevStatus as TaskStatus;
-      } else {
-        toStatus = "running";
       }
-    } else {
-      toStatus = "running";
     }
 
     const res = deps.store.transitionTask(
@@ -1421,7 +1399,7 @@ export async function runResume(
         taskKey: key,
         expectedNode: task.node,
         expectedStatus: "deferred",
-        toNode: task.node,
+        toNode: resolution.toNode,
         toStatus,
         actor: "owner",
         reason: "resume",
@@ -1476,22 +1454,33 @@ export async function runApprove(
     );
   }
 
-  if (task.node !== "owner_gate" || task.status !== "waiting_approval") {
+  const resolution = resolveTransition({
+    route: task.route,
+    node: task.node,
+    status: task.status,
+    event: { type: "owner_approve", isOwner: isOwnerCalling(deps.ctx), comment },
+    mode: task.confirmation_mode,
+    counters: extractCounters(task),
+  });
+
+  if (!resolution.allowed) {
+    if (resolution.errorCode === "permission-denied") {
+      throw new OrchestratorError("permission-denied", resolution.errorMessage ?? "owner-only");
+    }
     throw new OrchestratorError(
       "invalid-status",
       `task is not waiting for approval (current: node=${task.node}, status=${task.status})`,
     );
   }
 
-  const toNode: TaskNode = task.route === "docs" ? "release" : "code";
   const now = deps.now ? deps.now() : Date.now();
   const res = deps.store.transitionTask(
     {
       taskKey: key,
-      expectedNode: "owner_gate",
-      expectedStatus: "waiting_approval",
-      toNode,
-      toStatus: "running",
+      expectedNode: task.node,
+      expectedStatus: task.status,
+      toNode: resolution.toNode,
+      toStatus: resolution.toStatus,
       actor: "owner",
       reason: comment || "approved",
       now,
@@ -1534,17 +1523,26 @@ export async function runReleaseNote(
     );
   }
 
-  if (task.status !== "waiting_release_note") {
-    throw new OrchestratorError(
-      "invalid-status",
-      `task is not waiting for release note (current: node=${task.node}, status=${task.status})`,
-    );
-  }
-
   if (!note || note.trim().length === 0) {
     throw new OrchestratorError(
       "invalid-arguments",
       "заметка релиза не может быть пустой",
+    );
+  }
+
+  const resolution = resolveTransition({
+    route: task.route,
+    node: task.node,
+    status: task.status,
+    event: { type: "release_note_provided", note: note.trim() },
+    mode: task.confirmation_mode,
+    counters: extractCounters(task),
+  });
+
+  if (!resolution.allowed) {
+    throw new OrchestratorError(
+      "invalid-status",
+      `task is not waiting for release note (current: node=${task.node}, status=${task.status})`,
     );
   }
 
@@ -1555,10 +1553,10 @@ export async function runReleaseNote(
       taskKey: key,
       expectedNode: "release",
       expectedStatus: "waiting_release_note",
-      toNode: "release",
-      toStatus: "running",
+      toNode: resolution.toNode,
+      toStatus: resolution.toStatus,
       actor: isOwner ? "owner" : "coordinator",
-      reason: "release-note",
+      reason: resolution.reason,
       now,
       updates: { release_note: note.trim() },
     },
@@ -2070,14 +2068,22 @@ async function startQueuedTask(
           { cwd: repoRoot },
         );
         if (isAncestorRes.exitCode !== 0) {
+          const resolution = resolveTransition({
+            route: task.route,
+            node: "start",
+            status: "queued",
+            event: { type: "queue_take", branchExistsWithCommits: true },
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
           const tr = deps.store.transitionTask({
             taskKey: task.task_key,
             expectedNode: "start",
             expectedStatus: "queued",
-            toNode: "start",
-            toStatus: "stalled",
+            toNode: resolution.toNode,
+            toStatus: resolution.toStatus,
             actor: "run-queue",
-            reason: `stalled: branch-exists: ветка ${branch} уже существует и содержит коммиты; проверь состояние ветки или выполни dequeue`,
+            reason: resolution.reason,
             updates: { branch },
           });
           if (tr.ok) {
@@ -2102,25 +2108,21 @@ async function startQueuedTask(
     }
   }
 
-  let targetNode: TaskNode = "code";
-  let targetStatus: TaskStatus = "running";
-  let acceptanceSha: string | null = task.acceptance_sha;
+  const resolution = resolveTransition({
+    route: task.route,
+    node: "start",
+    status: "queued",
+    event: { type: "queue_take" },
+    mode: task.confirmation_mode,
+    counters: extractCounters(task),
+  });
 
-  if (task.route === "feature") {
-    targetNode = "design";
-    targetStatus = "running";
-  } else if (task.route === "docs") {
-    targetNode = "spec";
-    targetStatus = "running";
-    acceptanceSha = null;
-  } else if (task.route === "fix" || task.route === "simple") {
-    if (task.confirmation_mode === "manual") {
-      targetNode = "owner_gate";
-      targetStatus = "waiting_approval";
-    } else {
-      targetNode = "code";
-      targetStatus = "running";
-    }
+  if (!resolution.allowed) {
+    return false;
+  }
+
+  let acceptanceSha: string | null = task.acceptance_sha;
+  if (resolution.action?.commitAcceptance) {
     if (payload.acceptance_text && branch && deps.cmd) {
       try {
         acceptanceSha = await commitAcceptanceContract(
@@ -2136,19 +2138,18 @@ async function startQueuedTask(
     } else if (payload.acceptance_text && !acceptanceSha) {
       acceptanceSha = `sha-acc-${normKey.toLowerCase()}`;
     }
-  } else if (task.route === "research") {
-    targetNode = "research";
-    targetStatus = "running";
+  } else if (task.route === "docs") {
+    acceptanceSha = null;
   }
 
   const tr = deps.store.transitionTask({
     taskKey: task.task_key,
     expectedNode: "start",
     expectedStatus: "queued",
-    toNode: targetNode,
-    toStatus: targetStatus,
+    toNode: resolution.toNode,
+    toStatus: resolution.toStatus,
     actor: "run-queue",
-    reason: `task taken from queue -> ${targetNode} (${targetStatus})`,
+    reason: resolution.reason,
     updates: {
       branch,
       acceptance_sha: acceptanceSha,
@@ -2158,8 +2159,8 @@ async function startQueuedTask(
   if (tr.ok && tr.task) {
     const logged = deps.store.listTransitions(task.task_key).at(-1);
     if (logged) transitions.push(logged);
-    if (targetStatus === "running") {
-      await deps.dispatchNode?.(tr.task, targetNode);
+    if (resolution.toStatus === "running" && resolution.action?.dispatchNode) {
+      await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
     }
     return true;
   }
@@ -2183,14 +2184,49 @@ async function advanceActiveTask(
     latestDelegation &&
     (latestDelegation.status === "stalled" || latestDelegation.status === "failed")
   ) {
+    let failEvent: TransitionEvent;
+    switch (task.node) {
+      case "design":
+        failEvent = { type: "design_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+      case "spec":
+        failEvent = { type: "spec_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+      case "spec_review":
+        failEvent = { type: "spec_review_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+      case "code":
+        failEvent = { type: "code_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+      case "review":
+        failEvent = { type: "review_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+      case "design_check":
+        failEvent = { type: "design_check_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+      case "research":
+        failEvent = { type: "research_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+      default:
+        failEvent = { type: "design_failed", exhausted: true, reason: latestDelegation.status };
+        break;
+    }
+    const resolution = resolveTransition({
+      route: task.route,
+      node: task.node,
+      status: "running",
+      event: failEvent,
+      mode: task.confirmation_mode,
+      counters: extractCounters(task),
+    });
     const tr = deps.store.transitionTask({
       taskKey: task.task_key,
       expectedNode: task.node,
       expectedStatus: "running",
-      toNode: task.node,
-      toStatus: "stalled",
+      toNode: resolution.toNode,
+      toStatus: resolution.toStatus,
       actor: "run-queue",
-      reason: `delegation exhausted level chain: status=${latestDelegation.status}`,
+      reason: resolution.reason,
     });
     if (tr.ok) {
       const logged = deps.store.listTransitions(task.task_key).at(-1);
@@ -2209,6 +2245,16 @@ async function advanceActiveTask(
         contractText = `Acceptance contract for ${normKey}`;
       }
       if (contractText && (latestDelegation?.status === "done" || payload.design_done === true)) {
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "design",
+          status: "running",
+          event: { type: "design_delivered", acceptanceText: contractText },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
         let accSha = task.acceptance_sha || null;
         if (deps.cmd && task.branch) {
           try {
@@ -2231,10 +2277,10 @@ async function advanceActiveTask(
           taskKey: task.task_key,
           expectedNode: "design",
           expectedStatus: "running",
-          toNode: "spec",
-          toStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
           actor: "run-queue",
-          reason: "architect delivered acceptance contract -> spec",
+          reason: resolution.reason,
           updates: {
             acceptance_sha: accSha,
             payload: JSON.stringify({ ...payload, design_done: false }),
@@ -2243,7 +2289,9 @@ async function advanceActiveTask(
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
-          await deps.dispatchNode?.(tr.task, "spec");
+          if (resolution.action?.dispatchNode) {
+            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+          }
           return true;
         }
       }
@@ -2268,60 +2316,39 @@ async function advanceActiveTask(
               );
         }
 
-        if (tampered) {
-          const nextAttempts = task.spec_attempts + 1;
-          if (nextAttempts >= 3) {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "spec",
-              expectedStatus: "running",
-              toNode: "spec",
-              toStatus: "blocked",
-              actor: "run-queue",
-              reason:
-                "spec-refused: acceptance-contract-modified (attempts limit reached: 3/3)",
-              updates: { spec_attempts: nextAttempts },
-            });
-            if (tr.ok) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              return true;
-            }
-          } else {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "spec",
-              expectedStatus: "running",
-              toNode: "spec",
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `spec-refused: acceptance-contract-modified (attempt ${nextAttempts}/3)`,
-              updates: { spec_attempts: nextAttempts },
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              await deps.dispatchNode?.(tr.task, "spec");
-              return true;
-            }
-          }
-          return false;
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "spec",
+          status: "running",
+          event: { type: "spec_delivered", specSha, acceptanceTampered: tampered },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
+        const updates: Partial<TaskQueueRow> = {
+          spec_sha: specSha,
+        };
+        if (resolution.counterUpdates) {
+          Object.assign(updates, resolution.counterUpdates);
         }
 
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "spec",
           expectedStatus: "running",
-          toNode: "spec_review",
-          toStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
           actor: "run-queue",
-          reason: "spec commit delivered -> spec_review",
-          updates: { spec_sha: specSha },
+          reason: resolution.reason,
+          updates,
         });
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
-          await deps.dispatchNode?.(tr.task, "spec_review");
+          if (resolution.action?.dispatchNode) {
+            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+          }
           return true;
         }
       }
@@ -2339,79 +2366,38 @@ async function advanceActiveTask(
       }
 
       if (verdict) {
-        if (verdict === "OK" && blockers === 0) {
-          if (task.confirmation_mode === "manual") {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "spec_review",
-              expectedStatus: "running",
-              toNode: "owner_gate",
-              toStatus: "waiting_approval",
-              actor: "run-queue",
-              reason: "spec review passed OK -> owner_gate (manual mode)",
-            });
-            if (tr.ok) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              return true;
-            }
-          } else {
-            const nextNode: TaskNode =
-              task.route === "docs" ? "release" : "code";
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "spec_review",
-              expectedStatus: "running",
-              toNode: nextNode,
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `spec review passed OK -> ${nextNode} (auto mode)`,
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              if (nextNode === "code") {
-                await deps.dispatchNode?.(tr.task, "code");
-              }
-              return true;
-            }
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "spec_review",
+          status: "running",
+          event: { type: "spec_review_verdict", verdict, blockers },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
+        const updates: Partial<TaskQueueRow> = {};
+        if (resolution.counterUpdates) {
+          Object.assign(updates, resolution.counterUpdates);
+        }
+
+        const tr = deps.store.transitionTask({
+          taskKey: task.task_key,
+          expectedNode: "spec_review",
+          expectedStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
+          actor: "run-queue",
+          reason: resolution.reason,
+          updates: Object.keys(updates).length > 0 ? updates : undefined,
+        });
+        if (tr.ok && tr.task) {
+          const logged = deps.store.listTransitions(task.task_key).at(-1);
+          if (logged) transitions.push(logged);
+          if (resolution.action?.dispatchNode) {
+            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
           }
-        } else {
-          const nextRounds = task.spec_review_rounds + 1;
-          if (nextRounds >= 3) {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "spec_review",
-              expectedStatus: "running",
-              toNode: "spec_review",
-              toStatus: "blocked",
-              actor: "run-queue",
-              reason: `spec review requested changes (round limit reached: ${nextRounds}/3)`,
-              updates: { spec_review_rounds: nextRounds },
-            });
-            if (tr.ok) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              return true;
-            }
-          } else {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "spec_review",
-              expectedStatus: "running",
-              toNode: "spec",
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `spec review requested changes (round ${nextRounds}/3: return to spec)`,
-              updates: { spec_review_rounds: nextRounds },
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              await deps.dispatchNode?.(tr.task, "spec");
-              return true;
-            }
-          }
+          return true;
         }
       }
       return false;
@@ -2429,59 +2415,6 @@ async function advanceActiveTask(
             ? payload.result_commits
             : 1);
 
-        if (commits === 0 && !payload.no_code) {
-          const nextAttempts = task.code_attempts + 1;
-          if (nextAttempts >= 3) {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "code",
-              expectedStatus: "running",
-              toNode: "code",
-              toStatus: "blocked",
-              actor: "run-queue",
-              reason: "code-refused: no-commits (attempts limit reached: 3/3)",
-              updates: {
-                code_attempts: nextAttempts,
-                payload: JSON.stringify({
-                  ...payload,
-                  code_done: false,
-                  result_commits: null,
-                }),
-              },
-            });
-            if (tr.ok) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              return true;
-            }
-          } else {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "code",
-              expectedStatus: "running",
-              toNode: "code",
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `code-refused: no-commits (attempt ${nextAttempts}/3)`,
-              updates: {
-                code_attempts: nextAttempts,
-                payload: JSON.stringify({
-                  ...payload,
-                  code_done: false,
-                  result_commits: null,
-                }),
-              },
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              await deps.dispatchNode?.(tr.task, "code");
-              return true;
-            }
-          }
-          return false;
-        }
-
         const tampered = deps.checkAcceptanceTampered
           ? await deps.checkAcceptanceTampered(task, resultSha)
           : await checkAcceptanceTampered(
@@ -2490,77 +2423,51 @@ async function advanceActiveTask(
               resultSha,
             );
 
-        if (tampered) {
-          const nextAttempts = task.code_attempts + 1;
-          if (nextAttempts >= 3) {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "code",
-              expectedStatus: "running",
-              toNode: "code",
-              toStatus: "blocked",
-              actor: "run-queue",
-              reason:
-                "acceptance-contract-tampered (attempts limit reached: 3/3)",
-              updates: {
-                code_attempts: nextAttempts,
-                payload: JSON.stringify({
-                  ...payload,
-                  code_done: false,
-                  acceptance_tampered: false,
-                }),
-              },
-            });
-            if (tr.ok) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              return true;
-            }
-          } else {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "code",
-              expectedStatus: "running",
-              toNode: "code",
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `acceptance-contract-tampered (attempt ${nextAttempts}/3)`,
-              updates: {
-                code_attempts: nextAttempts,
-                payload: JSON.stringify({
-                  ...payload,
-                  code_done: false,
-                  acceptance_tampered: false,
-                }),
-              },
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              await deps.dispatchNode?.(tr.task, "code");
-              return true;
-            }
-          }
-          return false;
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "code",
+          status: "running",
+          event: {
+            type: "code_delivered",
+            resultSha,
+            commits,
+            noCode: Boolean(payload.no_code),
+            acceptanceTampered: tampered,
+          },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
+        const updates: Partial<TaskQueueRow> = {
+          result_sha: resultSha,
+          payload: JSON.stringify({
+            ...payload,
+            code_done: false,
+            result_commits: null,
+            acceptance_tampered: false,
+          }),
+        };
+        if (resolution.counterUpdates) {
+          Object.assign(updates, resolution.counterUpdates);
         }
 
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "code",
           expectedStatus: "running",
-          toNode: "checks",
-          toStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
           actor: "run-queue",
-          reason:
-            "code delivered (commits > 0, contract untampered) -> checks",
-          updates: {
-            result_sha: resultSha,
-            payload: JSON.stringify({ ...payload, code_done: false }),
-          },
+          reason: resolution.reason,
+          updates,
         });
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
+          if (resolution.action?.dispatchNode) {
+            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
+          }
           return true;
         }
       }
@@ -2572,90 +2479,49 @@ async function advanceActiveTask(
         ? await deps.runChecks(task)
         : await executeChecks({ cmd: deps.cmd, repoRoot }, task);
 
-      if (checkResult.notRun) {
-        const tr = deps.store.transitionTask({
-          taskKey: task.task_key,
-          expectedNode: "checks",
-          expectedStatus: "running",
-          toNode: "checks",
-          toStatus: "stalled",
-          actor: "run-queue",
-          reason:
-            checkResult.output ||
-            "checks stalled: not_run or forbidden command",
-        });
-        if (tr.ok) {
-          const logged = deps.store.listTransitions(task.task_key).at(-1);
-          if (logged) transitions.push(logged);
-          return true;
+      const resolution = resolveTransition({
+        route: task.route,
+        node: "checks",
+        status: "running",
+        event: {
+          type: "checks_result",
+          exitCode: checkResult.exitCode,
+          notRun: checkResult.notRun,
+          output: checkResult.output,
+        },
+        mode: task.confirmation_mode,
+        counters: extractCounters(task),
+      });
+      if (!resolution.allowed) return false;
+
+      const updates: Partial<TaskQueueRow> = {
+        payload: JSON.stringify({
+          ...payload,
+          code_done: false,
+          checks_fail: false,
+        }),
+      };
+      if (resolution.counterUpdates) {
+        Object.assign(updates, resolution.counterUpdates);
+      }
+
+      const tr = deps.store.transitionTask({
+        taskKey: task.task_key,
+        expectedNode: "checks",
+        expectedStatus: "running",
+        toNode: resolution.toNode,
+        toStatus: resolution.toStatus,
+        actor: "run-queue",
+        reason: resolution.reason,
+        updates,
+      });
+      if (tr.ok && tr.task) {
+        const logged = deps.store.listTransitions(task.task_key).at(-1);
+        if (logged) transitions.push(logged);
+        if (resolution.action?.dispatchNode) {
+          await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
         }
-      } else if (checkResult.exitCode !== 0) {
-        const nextAttempts = task.check_attempts + 1;
-        if (nextAttempts >= 3) {
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "checks",
-            expectedStatus: "running",
-            toNode: "checks",
-            toStatus: "blocked",
-            actor: "run-queue",
-            reason: `checks failed: exit ${checkResult.exitCode} (attempts limit reached: ${nextAttempts}/3)`,
-            updates: {
-              check_attempts: nextAttempts,
-              payload: JSON.stringify({
-                ...payload,
-                code_done: false,
-                checks_fail: false,
-              }),
-            },
-          });
-          if (tr.ok) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            return true;
-          }
-        } else {
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "checks",
-            expectedStatus: "running",
-            toNode: "code",
-            toStatus: "running",
-            actor: "run-queue",
-            reason: `checks failed: exit ${checkResult.exitCode} (attempt ${nextAttempts}/3, returning to code)`,
-            updates: {
-              check_attempts: nextAttempts,
-              payload: JSON.stringify({
-                ...payload,
-                code_done: false,
-                checks_fail: false,
-              }),
-            },
-          });
-          if (tr.ok && tr.task) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            await deps.dispatchNode?.(tr.task, "code");
-            return true;
-          }
-        }
-      } else {
-        const tr = deps.store.transitionTask({
-          taskKey: task.task_key,
-          expectedNode: "checks",
-          expectedStatus: "running",
-          toNode: "review",
-          toStatus: "running",
-          actor: "run-queue",
-          reason: "all checks passed (exit 0) -> review",
-          updates: { check_attempts: 0 },
-        });
-        if (tr.ok && tr.task) {
-          const logged = deps.store.listTransitions(task.task_key).at(-1);
-          if (logged) transitions.push(logged);
-          await deps.dispatchNode?.(tr.task, "review");
-          return true;
-        }
+        return true;
       }
       return false;
     }
@@ -2671,62 +2537,38 @@ async function advanceActiveTask(
       }
 
       if (verdict) {
-        if (verdict === "OK" && blockers === 0) {
-          const targetNode: TaskNode =
-            task.route === "feature" ? "design_check" : "release";
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "review",
-            expectedStatus: "running",
-            toNode: targetNode,
-            toStatus: "running",
-            actor: "run-queue",
-            reason: `code review passed OK -> ${targetNode}`,
-          });
-          if (tr.ok && tr.task) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            if (targetNode === "design_check") {
-              await deps.dispatchNode?.(tr.task, "design_check");
-            }
-            return true;
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "review",
+          status: "running",
+          event: { type: "review_verdict", verdict, blockers },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
+        const updates: Partial<TaskQueueRow> = {};
+        if (resolution.counterUpdates) {
+          Object.assign(updates, resolution.counterUpdates);
+        }
+
+        const tr = deps.store.transitionTask({
+          taskKey: task.task_key,
+          expectedNode: "review",
+          expectedStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
+          actor: "run-queue",
+          reason: resolution.reason,
+          updates: Object.keys(updates).length > 0 ? updates : undefined,
+        });
+        if (tr.ok && tr.task) {
+          const logged = deps.store.listTransitions(task.task_key).at(-1);
+          if (logged) transitions.push(logged);
+          if (resolution.action?.dispatchNode) {
+            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
           }
-        } else {
-          const nextRounds = task.code_review_rounds + 1;
-          if (nextRounds >= 3) {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "review",
-              expectedStatus: "running",
-              toNode: "review",
-              toStatus: "blocked",
-              actor: "run-queue",
-              reason: `code review requested changes (round limit reached: ${nextRounds}/3)`,
-              updates: { code_review_rounds: nextRounds },
-            });
-            if (tr.ok) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              return true;
-            }
-          } else {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "review",
-              expectedStatus: "running",
-              toNode: "code",
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `code review requested changes (round ${nextRounds}/3: return to code)`,
-              updates: { code_review_rounds: nextRounds },
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              await deps.dispatchNode?.(tr.task, "code");
-              return true;
-            }
-          }
+          return true;
         }
       }
       return false;
@@ -2744,81 +2586,38 @@ async function advanceActiveTask(
       }
 
       if (verdict) {
-        if (verdict === "OK") {
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "design_check",
-            expectedStatus: "running",
-            toNode: "release",
-            toStatus: "running",
-            actor: "run-queue",
-            reason: "design_check passed OK -> release",
-          });
-          if (tr.ok && tr.task) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            return true;
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "design_check",
+          status: "running",
+          event: { type: "design_check_verdict", verdict, blockers: 0, target },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
+        const updates: Partial<TaskQueueRow> = {};
+        if (resolution.counterUpdates) {
+          Object.assign(updates, resolution.counterUpdates);
+        }
+
+        const tr = deps.store.transitionTask({
+          taskKey: task.task_key,
+          expectedNode: "design_check",
+          expectedStatus: "running",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
+          actor: "run-queue",
+          reason: resolution.reason,
+          updates: Object.keys(updates).length > 0 ? updates : undefined,
+        });
+        if (tr.ok && tr.task) {
+          const logged = deps.store.listTransitions(task.task_key).at(-1);
+          if (logged) transitions.push(logged);
+          if (resolution.action?.dispatchNode) {
+            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
           }
-        } else {
-          const nextRounds = task.design_check_rounds + 1;
-          if (nextRounds >= 3) {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "design_check",
-              expectedStatus: "running",
-              toNode: "design_check",
-              toStatus: "blocked",
-              actor: "run-queue",
-              reason: `design_check rejected (round limit reached: ${nextRounds}/3)`,
-              updates: { design_check_rounds: nextRounds },
-            });
-            if (tr.ok) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              return true;
-            }
-          } else if (target === "design") {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "design_check",
-              expectedStatus: "running",
-              toNode: "design",
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `design_check requested redesign (round ${nextRounds}/3)`,
-              updates: {
-                design_check_rounds: nextRounds,
-                spec_attempts: 0,
-                spec_review_rounds: 0,
-                code_attempts: 0,
-                check_attempts: 0,
-                code_review_rounds: 0,
-              },
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              await deps.dispatchNode?.(tr.task, "design");
-              return true;
-            }
-          } else {
-            const tr = deps.store.transitionTask({
-              taskKey: task.task_key,
-              expectedNode: "design_check",
-              expectedStatus: "running",
-              toNode: "code",
-              toStatus: "running",
-              actor: "run-queue",
-              reason: `design_check requested code changes (round ${nextRounds}/3)`,
-              updates: { design_check_rounds: nextRounds },
-            });
-            if (tr.ok && tr.task) {
-              const logged = deps.store.listTransitions(task.task_key).at(-1);
-              if (logged) transitions.push(logged);
-              await deps.dispatchNode?.(tr.task, "code");
-              return true;
-            }
-          }
+          return true;
         }
       }
       return false;
@@ -2871,21 +2670,68 @@ async function advanceActiveTask(
         }
       }
 
-      if (relStatus === "published") {
+      if (relStatus) {
+        let event: TransitionEvent;
+        if (relStatus === "published") {
+          event = { type: "release_published", prMode: false };
+        } else if (relStatus === "pr_open") {
+          event = { type: "release_published", prMode: true };
+        } else if (relStatus === "failed") {
+          event = {
+            type: "release_failed_checks_conflict_reject",
+            reason: relError ?? "publish failed",
+          };
+        } else if (relStatus === "stalled") {
+          if (relError?.includes("uncommitted-kb")) {
+            event = { type: "release_refused_kb" };
+          } else if (relError?.includes("unmerged-ui")) {
+            event = { type: "release_refused_ui" };
+          } else {
+            event = { type: "release_failed_script", reason: relError };
+          }
+        } else {
+          event = { type: "release_waiting_note" };
+        }
+
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "release",
+          status: "running",
+          event,
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
+        const updates: Partial<TaskQueueRow> = {};
+        if (resolution.counterUpdates) {
+          Object.assign(updates, resolution.counterUpdates);
+        }
+        if (pubSha) {
+          updates.result_sha = pubSha;
+        }
+        if (relStatus === "failed") {
+          updates.payload = JSON.stringify({
+            ...payload,
+            code_done: false,
+            release_status: null,
+          });
+        }
+
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "release",
           expectedStatus: "running",
-          toNode: "release",
-          toStatus: "done",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
           actor: "run-queue",
-          reason: "release published successfully -> task done",
-          updates: { result_sha: pubSha ?? task.result_sha },
+          reason: resolution.reason,
+          updates: Object.keys(updates).length > 0 ? updates : undefined,
         });
         if (tr.ok) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
-          if (deps.bbCli) {
+          if (resolution.toStatus === "done" && deps.bbCli) {
             try {
               await deps.bbCli.run([
                 "tasks",
@@ -2896,103 +2742,9 @@ async function advanceActiveTask(
               ]);
             } catch {}
           }
-          return true;
-        }
-      } else if (relStatus === "pr_open") {
-        const tr = deps.store.transitionTask({
-          taskKey: task.task_key,
-          expectedNode: "release",
-          expectedStatus: "running",
-          toNode: "release",
-          toStatus: "pr_open",
-          actor: "run-queue",
-          reason: "PR opened for release",
-        });
-        if (tr.ok) {
-          const logged = deps.store.listTransitions(task.task_key).at(-1);
-          if (logged) transitions.push(logged);
-          return true;
-        }
-      } else if (relStatus === "failed") {
-        const nextAttempts = task.release_attempts + 1;
-        if (nextAttempts >= 3) {
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "release",
-            expectedStatus: "running",
-            toNode: "release",
-            toStatus: "blocked",
-            actor: "run-queue",
-            reason: `release failed: ${relError ?? "publish failed"} (attempts limit reached: ${nextAttempts}/3)`,
-            updates: {
-              release_attempts: nextAttempts,
-              payload: JSON.stringify({
-                ...payload,
-                code_done: false,
-                release_status: null,
-              }),
-            },
-          });
-          if (tr.ok) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            return true;
+          if (resolution.action?.dispatchNode && tr.task) {
+            await deps.dispatchNode?.(tr.task, resolution.action.dispatchNode);
           }
-        } else {
-          const retNode: TaskNode =
-            task.route === "docs" ? "spec" : "code";
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "release",
-            expectedStatus: "running",
-            toNode: retNode,
-            toStatus: "running",
-            actor: "run-queue",
-            reason: `release failed (attempt ${nextAttempts}/3: return to ${retNode})`,
-            updates: {
-              release_attempts: nextAttempts,
-              payload: JSON.stringify({
-                ...payload,
-                code_done: false,
-                release_status: null,
-              }),
-            },
-          });
-          if (tr.ok && tr.task) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            await deps.dispatchNode?.(tr.task, retNode);
-            return true;
-          }
-        }
-      } else if (relStatus === "stalled") {
-        const tr = deps.store.transitionTask({
-          taskKey: task.task_key,
-          expectedNode: "release",
-          expectedStatus: "running",
-          toNode: "release",
-          toStatus: "stalled",
-          actor: "run-queue",
-          reason: relError || "release stalled: uncommitted-kb or unmerged-ui",
-        });
-        if (tr.ok) {
-          const logged = deps.store.listTransitions(task.task_key).at(-1);
-          if (logged) transitions.push(logged);
-          return true;
-        }
-      } else if (relStatus === "waiting_release_note") {
-        const tr = deps.store.transitionTask({
-          taskKey: task.task_key,
-          expectedNode: "release",
-          expectedStatus: "running",
-          toNode: "release",
-          toStatus: "waiting_release_note",
-          actor: "run-queue",
-          reason: "release waiting for release note",
-        });
-        if (tr.ok) {
-          const logged = deps.store.listTransitions(task.task_key).at(-1);
-          if (logged) transitions.push(logged);
           return true;
         }
       }
@@ -3004,14 +2756,24 @@ async function advanceActiveTask(
         latestDelegation?.status === "done" ||
         payload.research_done === true
       ) {
+        const resolution = resolveTransition({
+          route: task.route,
+          node: "research",
+          status: "running",
+          event: { type: "research_delivered", report: "done" },
+          mode: task.confirmation_mode,
+          counters: extractCounters(task),
+        });
+        if (!resolution.allowed) return false;
+
         const tr = deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "research",
           expectedStatus: "running",
-          toNode: "research",
-          toStatus: "done",
+          toNode: resolution.toNode,
+          toStatus: resolution.toStatus,
           actor: "run-queue",
-          reason: "research report completed -> task done",
+          reason: resolution.reason,
         });
         if (tr.ok) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
