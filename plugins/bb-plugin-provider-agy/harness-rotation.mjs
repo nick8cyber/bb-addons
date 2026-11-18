@@ -1539,6 +1539,28 @@ await sleep(100);
       typeof m.params?.reason === "string" && m.params.reason.includes("disabled by Google")),
     `${statuses("t-turn-parked")} news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsH3)}`);
 
+  // H4 (E2E C6): a queued turn whose rotation finds every sibling parked
+  // fails on the turn/start reply alone — no provider.error delta repeats
+  // the same text in the thread.
+  const errsBeforeH4 = errorsFor("t-turn-parked").length;
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
+    m1: { ...parkedEntry }, m2: { ...parkedEntry },
+    m3: { ...parkedEntry }, m4: { ...parkedEntry },
+  } }, null, 1));
+  const dupTurnId = nextId++;
+  send({ jsonrpc: "2.0", id: dupTurnId, method: "turn/start",
+    params: { threadId: "t-turn-parked", providerThreadId: acpThreads.get("t-turn-parked"),
+      input: [{ type: "text", text: "every sibling is parked", mentions: [] }],
+      clientRequestId: creq(), options: { model: "fake-model", ...pol } } });
+  await waitFor(() => messages.some((m) => m.id === dupTurnId), 15_000, "t-turn-parked: parked turn reply");
+  await sleep(200);
+  const dupReply = messages.find((m) => m.id === dupTurnId);
+  check("models/turn-refusal-single-error",
+    typeof dupReply?.error?.message === "string" &&
+    dupReply.error.message.includes("disabled by Google") &&
+    errorsFor("t-turn-parked").length === errsBeforeH4,
+    `err=${dupReply?.error?.message ?? "none"} deltas=${errorsFor("t-turn-parked").length}`);
+
   const acpProbes = (label) =>
     acpTranscript().filter((l) => l.__models === true && l.home === label).length;
   const freshRecord = (ids) => ({

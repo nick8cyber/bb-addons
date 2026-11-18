@@ -1535,6 +1535,7 @@ function rewriteOptions(
 function maintenanceEnvAndArgs(): {
   env: Record<string, string>;
   args: string[];
+  home: string | null;
 } {
   const env: Record<string, string> = {};
   const args: string[] = [];
@@ -1549,7 +1550,7 @@ function maintenanceEnvAndArgs(): {
         env.HTTP_PROXY = account.proxy;
         env.http_proxy = account.proxy;
       }
-      return { env, args };
+      return { env, args, home: account.home };
     }
   }
   if (dataDir !== "") {
@@ -1560,7 +1561,7 @@ function maintenanceEnvAndArgs(): {
       env.GOOGLE_GEMINI_BASE_URL = relay.baseUrl;
     }
   }
-  return { env, args };
+  return { env, args, home: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,13 +1646,22 @@ function buildModelListResult(): {
 
 function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
   return new Promise((resolve) => {
-    const { env, args } = maintenanceEnvAndArgs();
+    // §2.3 п.1 (ревизия 13.2): `agy models` takes no --gemini-dir — the
+    // account is addressed through HOME, like the per-account probes.
+    const { env, home } = maintenanceEnvAndArgs();
     let child;
     try {
       child = spawn(
         resolveAgyCommand(process.env),
-        [...args, "models"],
-        { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] },
+        ["models"],
+        {
+          env: {
+            ...process.env,
+            ...env,
+            ...(home !== null ? { HOME: home } : {}),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
       );
     } catch {
       resolve([]);
@@ -1867,16 +1877,27 @@ function pumpModelProbes(): void {
   }
 }
 
+/** Strip token-looking runs from probe stderr before it hits the log. */
+function probeStderrTail(stderr: string): string {
+  return stderr
+    .slice(0, 200)
+    .replace(/[A-Za-z0-9_\-.+~]{24,}/gu, "<redacted>")
+    .trim();
+}
+
 function runModelProbe(account: AccountHome, done: () => void): void {
   modelProbeLastAtMs.set(account.label, Date.now());
   let child: ChildProcess;
   try {
+    // §2.3 п.1 (ревизия 13.2): --gemini-dir exists only on `agy acp`;
+    // `agy models` is addressed through the account's HOME (plus its proxy).
     child = spawn(
       resolveAgyCommand(process.env),
-      ["--gemini-dir", join(account.home, ".gemini"), "models"],
+      ["models"],
       {
         env: {
           ...process.env,
+          HOME: account.home,
           ...(account.proxy !== null
             ? {
                 HTTPS_PROXY: account.proxy,
@@ -1890,10 +1911,12 @@ function runModelProbe(account: AccountHome, done: () => void): void {
       },
     );
   } catch {
+    log(`models probe for ${account.label} failed: spawn error`);
     done();
     return;
   }
   let stdout = "";
+  let stderr = "";
   const timer = setTimeout(() => {
     killProcessTreeGracefully(child);
   }, 30_000);
@@ -1901,17 +1924,29 @@ function runModelProbe(account: AccountHome, done: () => void): void {
   child.stdout?.on("data", (chunk: string) => {
     stdout += chunk;
   });
-  child.on("error", () => {
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    if (stderr.length < 400) {
+      stderr += chunk;
+    }
+  });
+  child.on("error", (err: Error) => {
     clearTimeout(timer);
+    log(`models probe for ${account.label} failed: ${err.message}`);
     done();
   });
-  child.on("close", () => {
+  child.on("close", (code) => {
     clearTimeout(timer);
     const raw = parseAgyModelsOutput(stdout);
     // An empty or failed answer never overwrites a previous valid record.
     if (raw.length > 0) {
       saveAccountModelRecord(dataDir, account.label, raw);
       log(`models catalog for ${account.label}: ${raw.length} entries`);
+    } else {
+      log(
+        `models probe for ${account.label} failed: exit ${code ?? "signal"}` +
+          (stderr.trim() !== "" ? ` — ${probeStderrTail(stderr)}` : ""),
+      );
     }
     done();
   });
@@ -2505,20 +2540,29 @@ function failOut(
   options: { blockedUntilMs?: number } = {},
 ): void {
   resolveInteractions(session.threadId);
-  if (session.pendingConsume !== null) {
-    sendError(session.pendingConsume.requestId, -32000, message);
+  const pending = session.pendingConsume;
+  if (pending !== null) {
+    sendError(pending.requestId, -32000, message);
     session.pendingConsume = null;
   }
   const info =
     options.blockedUntilMs !== undefined
       ? { category: "rate-limit" as const, providerCode: null, httpStatusCode: 429 }
       : nativeErrorInfo(message);
-  emitDeltas(session.threadId, {
-    kind: "provider.error",
-    message,
-    ...(info === undefined ? {} : { errorInfo: info, category: info.category }),
-    settlesTurn: true,
-  });
+  // A refusal answered on the turn/start request already surfaces as
+  // "Command turn.submit failed" — a provider.error delta would print the
+  // same text a second time (E2E C6). Rate-limit refusals still emit it:
+  // provider-retry reads the errorInfo from the delta, not the reply.
+  const retrySignal =
+    options.blockedUntilMs !== undefined || info?.category === "rate-limit";
+  if (!(pending !== null && !session.daemonTurnOpen && !retrySignal)) {
+    emitDeltas(session.threadId, {
+      kind: "provider.error",
+      message,
+      ...(info === undefined ? {} : { errorInfo: info, category: info.category }),
+      settlesTurn: true,
+    });
+  }
   if (session.daemonTurnOpen) {
     emitDeltas(session.threadId, {
       kind: "turn.boundary",

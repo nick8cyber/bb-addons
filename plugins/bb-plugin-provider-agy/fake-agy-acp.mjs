@@ -36,7 +36,13 @@ import { basename, dirname, join } from "node:path";
 
 const argv = process.argv.slice(2);
 const geminiDir = argv.includes("--gemini-dir") ? argv[argv.indexOf("--gemini-dir") + 1] : null;
-const homeLabel = geminiDir ? basename(dirname(geminiDir)) : "direct";
+// `agy models` (no --gemini-dir) is addressed through HOME — the account
+// homes live under a directory named `accounts`, everything else is direct.
+const homeLabel = geminiDir
+  ? basename(dirname(geminiDir))
+  : basename(dirname(process.env.HOME ?? "")) === "accounts"
+    ? basename(process.env.HOME)
+    : "direct";
 const modesByLabel = JSON.parse(process.env.AGY_FAKE_MODE_BY_LABEL ?? "{}");
 const modeEnv = modesByLabel[homeLabel] ?? process.env.AGY_FAKE_ERROR_MODE ?? "ok";
 // Dynamic modes ride a control file (children keep their spawn env):
@@ -100,10 +106,25 @@ function modelRefused(label, value) {
   return !catalogFor(label).some((e) => e.id === value);
 }
 
-// `agy --gemini-dir <home>/.gemini models`: the account's catalog as TSV,
-// one "id\tdisplayName" line per entry.
+// `agy models`: the account's catalog as TSV, one "id\tdisplayName" line
+// per entry. Like real agy, --gemini-dir is only valid on `agy acp` —
+// `--gemini-dir … models` prints usage to stderr and exits 2.
 if (argv.includes("models")) {
+  if (geminiDir !== null) {
+    process.stderr.write(
+      "usage: agy [-p <prompt>]\n" +
+        "       agy models\n" +
+        "       agy acp [--gemini-dir <dir>]\n" +
+        "agy: --gemini-dir is only valid with the acp subcommand\n",
+    );
+    process.exit(2);
+  }
   record({ __models: true });
+  const fail = control().modelsFailByLabel ?? {};
+  if (fail[homeLabel] !== undefined) {
+    process.stderr.write(`agy models: ${fail[homeLabel]}\n`);
+    process.exit(3);
+  }
   for (const entry of catalogFor(homeLabel)) {
     process.stdout.write(`${entry.id}\t${entry.displayName}\n`);
   }

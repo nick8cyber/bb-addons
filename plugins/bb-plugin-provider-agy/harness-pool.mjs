@@ -343,6 +343,28 @@ acpCheck("models/far-cooldown-never-polled",
   acpProbes("m6") === 0,
   `probes m6=${acpProbes("m6")}`);
 
+// §2.3 п.1 (ревизия 13.2): a failed probe writes one log line naming the
+// account, the exit code and the first 200 stderr chars — tokens redacted.
+{
+  const cli = join(acpData, "accounts", "m7", ".gemini", "antigravity-cli");
+  mkdirSync(cli, { recursive: true });
+  writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+  const ctl = JSON.parse(readFileSync(process.env.AGY_FAKE_CONTROL, "utf8"));
+  ctl.modelsFailByLabel = { m7: "upstream refused ya29.dAbCdEfGhIjKlMnOpQrStUvWxYz0123456789" };
+  writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify(ctl));
+}
+await acpStart("t-probe-fail", "shared-model");
+const probeLogPath = join(acpData, "acp-wrapper.log");
+await waitFor(
+  () => readFileSync(probeLogPath, "utf8").includes("models probe for m7"),
+  10_000, "m7 probe log");
+const probeLog = readFileSync(probeLogPath, "utf8");
+acpCheck("models/probe-failure-logged",
+  probeLog.includes("models probe for m7 failed: exit 3") &&
+    probeLog.includes("upstream refused") &&
+    !probeLog.includes("ya29.dAbCdEf"),
+  probeLog.split("\n").filter((l) => l.includes("m7")).join("\n"));
+
 // Every pool account parked (any parkedReason): even a model-less start
 // fails honestly instead of silently dropping to direct mode (§2.3 п.7).
 writeAcpLedger({
@@ -352,13 +374,14 @@ writeAcpLedger({
   m4: { ...M5_PARKED, parkedReason: "tos-disabled" },
   m5: { ...M5_PARKED },
   m6: { ...M5_PARKED },
+  m7: { ...M5_PARKED },
 });
 const allParkedReply = await acpStart("t-all-parked", undefined);
 acpCheck("models/all-parked-fails-honestly",
   allParkedReply?.error !== undefined && /parked/iu.test(allParkedReply.error.message ?? ""),
   allParkedReply?.error?.message ?? "unexpected success");
 
-for (const tid of ["t-pro-early", "t-shared-1", "t-shared-2", "t-shared-3", "t-throttle-1", "t-throttle-2"]) {
+for (const tid of ["t-pro-early", "t-shared-1", "t-shared-2", "t-shared-3", "t-throttle-1", "t-throttle-2", "t-probe-fail"]) {
   sendAcp({ jsonrpc: "2.0", id: acpId++, method: "thread/stop", params: { threadId: tid, intent: "release", activeTurnId: null } });
 }
 
