@@ -1,0 +1,1627 @@
+/**
+ * Orchestrator r34 task work graph (§27, §28, §32 and ADR-0032).
+ * Slice 5a: task_queue, task_transitions, CAS transitions, workGraph modes,
+ * queue CLI commands (enqueue, dequeue, defer, reject, resume, approve,
+ * release-note, run-queue) and owner-only guards.
+ */
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { OrchestratorError } from "./errors.js";
+import type { CmdRunner } from "./cmd.js";
+import type { BbCli } from "./bb-cli.js";
+import type {
+  ConfirmationMode,
+  DelegationStore,
+  TaskLevel,
+  TaskNode,
+  TaskQueueRow,
+  TaskRoute,
+  TaskStatus,
+} from "./store.js";
+import { normalizeTaskKey } from "./store.js";
+import type { PluginCliContext } from "@get-bb/plugin-sdk";
+import type { T } from "./i18n/index.js";
+
+export type WorkGraphMode = "off" | "shadow" | "strict";
+
+/** Validates and normalizes workGraph mode setting. */
+export function normalizeWorkGraphMode(mode: string | undefined): WorkGraphMode {
+  const m = (mode ?? "off").toLowerCase().trim();
+  if (m === "shadow" || m === "strict") return m;
+  return "off";
+}
+
+/** §27.1: Computes deterministic branch name `bb/<KEY>-<slug>`. */
+export function computeTaskBranch(
+  taskKey: string,
+  route: TaskRoute,
+  title?: string,
+): string | null {
+  if (route === "research") return null;
+  const keyLower = normalizeTaskKey(taskKey).toLowerCase();
+  let slug = "";
+  if (title) {
+    slug = title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    if (slug.length > 30) {
+      slug = slug.slice(0, 30).replace(/-+$/, "");
+    }
+  }
+  if (!slug) {
+    slug = route;
+  }
+  return `bb/${keyLower}-${slug}`;
+}
+
+/** §29.3: Check if the caller is an owner (human), not an agent thread. */
+export function isOwnerCalling(
+  ctx?: PluginCliContext | { threadId?: string },
+): boolean {
+  if (ctx?.threadId && ctx.threadId.trim().length > 0) return false;
+  if (process.env.BB_THREAD_ID && process.env.BB_THREAD_ID.trim().length > 0) {
+    return false;
+  }
+  return true;
+}
+
+/** §29.3: Enforce owner-only execution. */
+export function assertOwnerOnly(
+  ctx?: PluginCliContext | { threadId?: string },
+  message = "owner-only",
+): void {
+  if (!isOwnerCalling(ctx)) {
+    throw new OrchestratorError("permission-denied", message);
+  }
+}
+
+/** §32 п.1: In strict mode, blocks direct delegate, merge, release. */
+export function assertGraphAllowsDirectAction(
+  store: DelegationStore,
+  taskKey: string,
+  mode: WorkGraphMode,
+): void {
+  if (mode !== "strict") return;
+  const key = normalizeTaskKey(taskKey);
+  const task = store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "graph-required",
+      `задача ${key} не зарегистрирована в очереди графа; поставь задачу через bb orchestrator enqueue ${key}`,
+    );
+  }
+  if (task.status === "done") {
+    throw new OrchestratorError(
+      "graph-managed",
+      `задача ${key} завершена (done); для повторной доработки выполни bb orchestrator enqueue ${key}`,
+    );
+  }
+  throw new OrchestratorError(
+    "graph-managed",
+    `задача ${key} управляется графом (текущее состояние: node=${task.node}, status=${task.status}). Прямой вызов запрещён; продвижение выполняется конвейером run-queue`,
+  );
+}
+
+/** §32 п.2: Checks branch clean / merged state, or archives on force reset. */
+export async function checkAndPrepareTaskBranch(
+  cmd: CmdRunner,
+  repoRoot: string,
+  branch: string,
+  taskKey: string,
+  mergeBaseBranch: string,
+  forceResetBranch: boolean,
+  prNumber?: number,
+): Promise<{ ok: boolean; action: string }> {
+  const normKey = normalizeTaskKey(taskKey).toUpperCase();
+  const localRes = await cmd.run(
+    "git",
+    ["rev-parse", "--verify", `refs/heads/${branch}`],
+    { cwd: repoRoot },
+  );
+  const localExists = localRes.exitCode === 0;
+  const localSha = localExists ? localRes.stdout.trim() : null;
+
+  const lsRemote = await cmd.run(
+    "git",
+    ["ls-remote", "--heads", "origin", `refs/heads/${branch}`],
+    { cwd: repoRoot },
+  );
+  if (lsRemote.exitCode !== 0) {
+    throw new OrchestratorError(
+      "git-failed",
+      `не удалось проверить удалённую ветку origin/${branch}: ${lsRemote.stderr}`,
+    );
+  }
+  const remoteExists = lsRemote.stdout.trim().length > 0;
+  let remoteSha: string | null = null;
+
+  if (!localExists && !remoteExists) {
+    return { ok: true, action: "clean" };
+  }
+
+  if (remoteExists) {
+    const fetchRes = await cmd.run(
+      "git",
+      ["fetch", "origin", `refs/heads/${branch}`],
+      { cwd: repoRoot },
+    );
+    if (fetchRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось выполнить fetch для ветки origin/${branch}: ${fetchRes.stderr}`,
+      );
+    }
+    const revRemote = await cmd.run(
+      "git",
+      ["rev-parse", "--verify", `refs/remotes/origin/${branch}`],
+      { cwd: repoRoot },
+    );
+    if (revRemote.exitCode === 0 && revRemote.stdout.trim()) {
+      remoteSha = revRemote.stdout.trim();
+    } else {
+      remoteSha = lsRemote.stdout.trim().split(/\s+/)[0] ?? null;
+    }
+    if (!remoteSha) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось определить sha удалённой ветки origin/${branch}`,
+      );
+    }
+  }
+
+  // Check if tips are ancestors of origin/<mergeBaseBranch> or confirmed via PR (§32 п.2)
+  const targetRef = `origin/${mergeBaseBranch}`;
+  const targetCheck = await cmd.run(
+    "git",
+    ["rev-parse", "--verify", targetRef],
+    { cwd: repoRoot },
+  );
+  if (targetCheck.exitCode !== 0) {
+    throw new OrchestratorError(
+      "git-failed",
+      `базовая ветка ${targetRef} не найдена в репозитории`,
+    );
+  }
+
+  const isShaMerged = async (sha: string): Promise<boolean> => {
+    // Condition a: sha is an ancestor of origin/<mergeBaseBranch>
+    const anc = await cmd.run(
+      "git",
+      ["merge-base", "--is-ancestor", sha, targetRef],
+      { cwd: repoRoot },
+    );
+    if (anc.exitCode === 0) {
+      return true;
+    }
+
+    // Condition b: found PR for this branch (by prNumber or head branch) with state === MERGED (§32 п.2)
+    let prData: { state?: string; mergedAt?: string | null; headRefOid?: string } | null = null;
+    if (prNumber) {
+      const prRes = await cmd.run(
+        "gh",
+        ["pr", "view", String(prNumber), "--json", "state,mergedAt,headRefOid"],
+        { cwd: repoRoot },
+      );
+      if (prRes.exitCode === 0) {
+        try {
+          prData = JSON.parse(prRes.stdout);
+        } catch {}
+      }
+    }
+    if (!prData) {
+      const listRes = await cmd.run(
+        "gh",
+        [
+          "pr",
+          "list",
+          "--head",
+          branch,
+          "--state",
+          "all",
+          "--limit",
+          "1",
+          "--json",
+          "state,mergedAt,headRefOid",
+        ],
+        { cwd: repoRoot },
+      );
+      if (listRes.exitCode === 0) {
+        try {
+          const arr = JSON.parse(listRes.stdout);
+          if (Array.isArray(arr) && arr.length > 0) {
+            prData = arr[0];
+          }
+        } catch {}
+      }
+    }
+
+    if (
+      prData &&
+      (prData.state?.toUpperCase() === "MERGED" || Boolean(prData.mergedAt))
+    ) {
+      const headOid = prData.headRefOid;
+      if (headOid) {
+        if (sha === headOid) return true;
+        const prAnc = await cmd.run(
+          "git",
+          ["merge-base", "--is-ancestor", sha, headOid],
+          { cwd: repoRoot },
+        );
+        if (prAnc.exitCode === 0) return true;
+      }
+    }
+
+    return false;
+  };
+
+  let localMerged = true;
+  if (localExists && localSha) {
+    localMerged = await isShaMerged(localSha);
+  }
+
+  let remoteMerged = true;
+  if (remoteExists && remoteSha) {
+    remoteMerged = await isShaMerged(remoteSha);
+  }
+
+  if (localMerged && remoteMerged) {
+    if (localExists) {
+      const del = await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+      if (del.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось удалить локальную ветку ${branch}: ${del.stderr}`,
+        );
+      }
+    }
+    if (remoteExists) {
+      const delRemote = await cmd.run(
+        "git",
+        ["push", "origin", "--delete", branch],
+        { cwd: repoRoot },
+      );
+      if (delRemote.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось удалить ветку в origin: ${delRemote.stderr}`,
+        );
+      }
+    }
+    return { ok: true, action: "deleted-merged" };
+  }
+
+  if (!forceResetBranch) {
+    throw new OrchestratorError(
+      "unmerged-branch-exists",
+      `прошлая ветка задачи ${branch} не влита в целевую ветку; укажи флаг --force-reset-branch для принудительного архивирования и пересоздания`,
+    );
+  }
+
+  const ts = Date.now();
+  if (localExists && localSha) {
+    const tagRes = await cmd.run(
+      "git",
+      ["tag", `archive/${normKey}-force-reset-${ts}`, localSha],
+      { cwd: repoRoot },
+    );
+    if (tagRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось создать архивный тег для ветки ${branch}: ${tagRes.stderr}`,
+      );
+    }
+    const delRes = await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+    if (delRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось удалить локальную ветку ${branch}: ${delRes.stderr}`,
+      );
+    }
+  }
+
+  if (remoteExists && remoteSha) {
+    const remoteDiffers =
+      !localSha ||
+      (
+        await cmd.run(
+          "git",
+          ["merge-base", "--is-ancestor", remoteSha, localSha],
+          { cwd: repoRoot },
+        )
+      ).exitCode !== 0;
+
+    if (remoteDiffers) {
+      const remTag = await cmd.run(
+        "git",
+        [
+          "tag",
+          `archive/${normKey}-remote-force-reset-${ts}`,
+          remoteSha,
+        ],
+        { cwd: repoRoot },
+      );
+      if (remTag.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось создать архивный тег для удалённой ветки ${branch}: ${remTag.stderr}`,
+        );
+      }
+    }
+    const pushDel = await cmd.run(
+      "git",
+      ["push", "origin", "--delete", branch],
+      { cwd: repoRoot },
+    );
+    if (pushDel.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось удалить удалённую ветку ${branch}: ${pushDel.stderr}`,
+      );
+    }
+  }
+
+  return { ok: true, action: "force-reset-archived" };
+}
+
+/** §28.1: Archives branch to tag and deletes it for dequeue. */
+export async function archiveAndCleanupTaskBranch(
+  cmd: CmdRunner,
+  repoRoot: string,
+  branch: string | null,
+  taskKey: string,
+): Promise<void> {
+  if (!branch) return;
+  const normKey = normalizeTaskKey(taskKey).toUpperCase();
+  const ts = Date.now();
+
+  const localRes = await cmd.run(
+    "git",
+    ["rev-parse", "--verify", `refs/heads/${branch}`],
+    { cwd: repoRoot },
+  );
+  if (localRes.exitCode === 0) {
+    const localSha = localRes.stdout.trim();
+    const tagRes = await cmd.run(
+      "git",
+      ["tag", `archive/${normKey}-cancelled-${ts}`, localSha],
+      { cwd: repoRoot },
+    );
+    if (tagRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось создать архивный тег для ветки ${branch}: ${tagRes.stderr}`,
+      );
+    }
+    const delRes = await cmd.run("git", ["branch", "-D", branch], { cwd: repoRoot });
+    if (delRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось удалить локальную ветку ${branch}: ${delRes.stderr}`,
+      );
+    }
+  }
+
+  const lsRemote = await cmd.run(
+    "git",
+    ["ls-remote", "--heads", "origin", `refs/heads/${branch}`],
+    { cwd: repoRoot },
+  );
+  if (lsRemote.exitCode !== 0) {
+    throw new OrchestratorError(
+      "git-failed",
+      `не удалось проверить удалённую ветку origin/${branch}: ${lsRemote.stderr}`,
+    );
+  }
+  if (lsRemote.stdout.trim().length > 0) {
+    const fetchRes = await cmd.run(
+      "git",
+      ["fetch", "origin", `refs/heads/${branch}`],
+      { cwd: repoRoot },
+    );
+    if (fetchRes.exitCode !== 0) {
+      throw new OrchestratorError(
+        "git-failed",
+        `не удалось выполнить fetch для ветки origin/${branch}: ${fetchRes.stderr}`,
+      );
+    }
+    const revRemote = await cmd.run(
+      "git",
+      ["rev-parse", "--verify", `refs/remotes/origin/${branch}`],
+      { cwd: repoRoot },
+    );
+    const remoteSha =
+      (revRemote.exitCode === 0 ? revRemote.stdout.trim() : null) ||
+      lsRemote.stdout.trim().split(/\s+/)[0];
+    if (remoteSha) {
+      const remTag = await cmd.run(
+        "git",
+        [
+          "tag",
+          `archive/${normKey}-remote-cancelled-${ts}`,
+          remoteSha,
+        ],
+        { cwd: repoRoot },
+      );
+      if (remTag.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось создать архивный тег для удалённой ветки ${branch}: ${remTag.stderr}`,
+        );
+      }
+      const pushDel = await cmd.run(
+        "git",
+        ["push", "origin", "--delete", branch],
+        { cwd: repoRoot },
+      );
+      if (pushDel.exitCode !== 0) {
+        throw new OrchestratorError(
+          "git-failed",
+          `не удалось удалить удалённую ветку ${branch}: ${pushDel.stderr}`,
+        );
+      }
+    }
+  }
+
+  await cmd
+    .run("git", ["worktree", "remove", "--force", `wt/release/${taskKey}`], {
+      cwd: repoRoot,
+    })
+    .catch(() => {});
+  await cmd
+    .run("git", ["worktree", "remove", "--force", `wt/sync/${taskKey}`], {
+      cwd: repoRoot,
+    })
+    .catch(() => {});
+}
+
+// ── Command Handlers ──────────────────────────────────────────────────
+
+export interface EnqueueCommandInput {
+  taskKey: string;
+  priority?: number;
+  mode?: string;
+  route?: string;
+  level?: string;
+  acceptance?: string;
+  releaseNote?: string;
+  dependsOn?: string;
+  forceResetBranch?: boolean;
+}
+
+export async function runEnqueue(
+  input: EnqueueCommandInput,
+  deps: {
+    store: DelegationStore;
+    cmd: CmdRunner;
+    bbCli?: BbCli;
+    ctx: PluginCliContext;
+    workGraphMode: WorkGraphMode;
+    repoRoot: string;
+    mergeBaseBranch: string;
+    now?: () => number;
+    hasChecksCommands?: boolean;
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow; reissued?: boolean }> {
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+
+  const isOwner = isOwnerCalling(deps.ctx);
+  const now = deps.now ? deps.now() : Date.now();
+  const taskKey = normalizeTaskKey(input.taskKey);
+  if (!taskKey) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      "укажи ключ задачи: bb orchestrator enqueue <KEY> ...",
+    );
+  }
+
+  // §29.2 п.1: flag --mode restricted to owner
+  if (!isOwner && input.mode !== undefined) {
+    throw new OrchestratorError(
+      "permission-denied",
+      "owner-only (--mode flag is restricted to owner)",
+    );
+  }
+
+  // §29.3: --acceptance restricted to owner
+  if (!isOwner && input.acceptance !== undefined) {
+    throw new OrchestratorError("permission-denied", "owner-only");
+  }
+
+  const validRoutes = ["feature", "fix", "docs", "simple", "research"];
+  const route = (input.route ?? "feature") as TaskRoute;
+  if (!validRoutes.includes(route)) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      `недопустимый маршрут: ${input.route} (разрешены: ${validRoutes.join(", ")})`,
+    );
+  }
+
+  // Priority validation
+  let priority = 100;
+  if (input.priority !== undefined) {
+    if (typeof input.priority !== "number" || isNaN(input.priority)) {
+      throw new OrchestratorError(
+        "invalid-arguments",
+        `некорректный приоритет: ${input.priority} (должно быть число)`,
+      );
+    }
+    priority = input.priority;
+  }
+
+  // Route & level validation (§27.2)
+  let level = input.level as TaskLevel | undefined;
+  if (!level) {
+    if (route === "docs") level = "spec";
+    else if (route === "research") level = "research";
+    else level = "complex";
+  }
+
+  const validLevels = [
+    "complex",
+    "medium",
+    "simple",
+    "spec",
+    "research",
+    "architect",
+  ];
+  if (!validLevels.includes(level)) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      `недопустимый уровень: ${input.level} (разрешены: ${validLevels.join(", ")})`,
+    );
+  }
+
+  if (["feature", "fix", "simple"].includes(route)) {
+    if (level === "spec" || level === "architect" || level === "research") {
+      throw new OrchestratorError(
+        "invalid-level",
+        "узел code требует уровня с инструментами написания кода (роль executor)",
+      );
+    }
+  }
+
+  if (
+    route === "docs" &&
+    (level === "complex" || level === "architect" || level === "research")
+  ) {
+    throw new OrchestratorError(
+      "invalid-level",
+      `маршрут docs не поддерживает уровень ${level}`,
+    );
+  }
+
+  if (route === "research" && level !== "research") {
+    throw new OrchestratorError(
+      "invalid-level",
+      "маршрут research поддерживает только уровень research",
+    );
+  }
+
+  // Confirmation mode
+  let confirmationMode: ConfirmationMode;
+  if (isOwner) {
+    if (input.mode === "auto" || input.mode === "manual") {
+      confirmationMode = input.mode;
+    } else {
+      confirmationMode = route === "feature" ? "manual" : "auto";
+    }
+  } else {
+    // Agent calling
+    if (["fix", "simple", "docs"].includes(route)) {
+      confirmationMode = "manual";
+    } else if (route === "feature") {
+      confirmationMode = "manual";
+    } else {
+      confirmationMode = "auto";
+    }
+  }
+
+  // Acceptance contract reading
+  let acceptanceText: string | null = null;
+  if (input.acceptance) {
+    const raw = input.acceptance.trim();
+    const looksLikePath =
+      !raw.includes("\n") &&
+      (raw.startsWith("./") ||
+        raw.startsWith("../") ||
+        raw.startsWith("/") ||
+        raw.startsWith("~/") ||
+        /\.(md|txt|markdown|rst)$/i.test(raw));
+
+    const candidatePath = path.resolve(deps.ctx?.cwd ?? process.cwd(), raw);
+    if (existsSync(candidatePath)) {
+      try {
+        acceptanceText = readFileSync(candidatePath, "utf8");
+      } catch (err) {
+        throw new OrchestratorError(
+          "acceptance-missing",
+          `не удалось прочитать файл договора приёмки ${raw}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else if (looksLikePath) {
+      throw new OrchestratorError(
+        "acceptance-missing",
+        `файл договора приёмки не найден: ${raw}`,
+      );
+    } else {
+      acceptanceText = input.acceptance;
+    }
+  }
+
+  const existing = deps.store.getTask(taskKey);
+  if (existing) {
+    if (existing.status !== "done" && existing.status !== "cancelled") {
+      // Check exception for owner updating acceptance at owner_gate (§31.5, §32 п.2)
+      if (
+        (existing.route === "fix" || existing.route === "simple") &&
+        existing.node === "owner_gate" &&
+        (existing.status === "waiting_approval" || existing.status === "deferred") &&
+        acceptanceText
+      ) {
+        let existingPayload: Record<string, unknown> = {};
+        try {
+          if (existing.payload) existingPayload = JSON.parse(existing.payload);
+        } catch {}
+        existingPayload.acceptance_text = acceptanceText;
+        delete existingPayload.previous_status;
+        const res = deps.store.transitionTask(
+          {
+            taskKey,
+            expectedNode: "owner_gate",
+            expectedStatus: existing.status,
+            toNode: "owner_gate",
+            toStatus: "waiting_approval",
+            actor: "owner",
+            reason: "update-acceptance",
+            updates: {
+              payload: JSON.stringify(existingPayload),
+              deferred_by: null,
+              deferred_reason: null,
+            },
+            now,
+          },
+          now,
+        );
+        if (!res.ok) {
+          throw new OrchestratorError(
+            "transition-failed",
+            "не удалось обновить договор приёмки",
+          );
+        }
+        return { ok: true, task: res.task! };
+      }
+
+      if (existing.route === "feature" && input.acceptance !== undefined) {
+        throw new OrchestratorError(
+          "acceptance-contract-immutable",
+          "для маршрута feature договор формируется и изменяется исключительно архитектором на узле design через reject --target design",
+        );
+      }
+
+      throw new OrchestratorError(
+        "task-already-enqueued",
+        `задача ${taskKey} уже находится в очереди (текущее состояние: node=${existing.node}, status=${existing.status}); повторная постановка допустима только после завершения (status=done) либо отмены (status=cancelled)`,
+      );
+    }
+  }
+
+  // §31: acceptance-missing check for fix/simple routes on both new and re-enqueued tasks
+  if (
+    ["fix", "simple"].includes(route) &&
+    !acceptanceText &&
+    !deps.hasChecksCommands
+  ) {
+    throw new OrchestratorError(
+      "acceptance-missing",
+      "укажи --acceptance или настрой checks.commands проекта",
+    );
+  }
+
+  // Branch calculation & git check
+  let branch: string | null = null;
+  if (route !== "research") {
+    if (existing?.branch) {
+      branch = existing.branch;
+    } else {
+      let taskTitle: string | undefined;
+      if (deps.bbCli) {
+        try {
+          const res = await deps.bbCli.run(["tasks", "show", taskKey, "--json"]);
+          if (res.exitCode === 0) {
+            const data = JSON.parse(res.stdout);
+            taskTitle = data.task?.title ?? data.title;
+          }
+        } catch {}
+      }
+      branch = computeTaskBranch(taskKey, route, taskTitle);
+    }
+
+    if (branch) {
+      let prNumber: number | undefined;
+      if (existing?.payload) {
+        try {
+          const p = JSON.parse(existing.payload);
+          if (typeof p.pr_number === "number") prNumber = p.pr_number;
+        } catch {}
+      }
+      await checkAndPrepareTaskBranch(
+        deps.cmd,
+        deps.repoRoot,
+        branch,
+        taskKey,
+        deps.mergeBaseBranch,
+        Boolean(input.forceResetBranch),
+        prNumber,
+      );
+    }
+  }
+
+  const dependsOn = input.dependsOn
+    ? input.dependsOn.split(",").map((s) => s.trim()).filter(Boolean)
+    : null;
+
+  const payload = acceptanceText ? JSON.stringify({ acceptance_text: acceptanceText }) : null;
+
+  if (existing) {
+    // Reissue / reset
+    const task = deps.store.resetTaskForEnqueue(
+      {
+        taskKey,
+        route,
+        level,
+        priority,
+        dependsOn,
+        confirmationMode,
+        branch,
+        releaseNote: input.releaseNote ?? null,
+        payload,
+        actor: isOwner ? "owner" : "coordinator",
+      },
+      now,
+    );
+    return { ok: true, task, reissued: true };
+  }
+
+  // New task insert
+  const task = deps.store.insertTask(
+    {
+      taskKey,
+      projectId: deps.ctx.projectId ?? "default",
+      coordinatorThreadId: deps.ctx.threadId ?? "",
+      route,
+      level,
+      priority,
+      dependsOn,
+      confirmationMode,
+      branch,
+      releaseNote: input.releaseNote ?? null,
+      payload,
+      actor: isOwner ? "owner" : "coordinator",
+    },
+    now,
+  );
+  return { ok: true, task };
+}
+
+export async function runDequeue(
+  taskKey: string,
+  reason: string | undefined,
+  deps: {
+    store: DelegationStore;
+    cmd: CmdRunner;
+    ctx: PluginCliContext;
+    workGraphMode: WorkGraphMode;
+    repoRoot: string;
+    now?: () => number;
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow }> {
+  assertOwnerOnly(deps.ctx);
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+
+  const key = normalizeTaskKey(taskKey);
+  const task = deps.store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "task-not-found",
+      `задача ${key} не найдена в очереди`,
+    );
+  }
+  if (task.status === "done" || task.status === "cancelled") {
+    throw new OrchestratorError(
+      "invalid-status",
+      `задача ${key} уже завершена или отменена (status=${task.status})`,
+    );
+  }
+
+  await archiveAndCleanupTaskBranch(deps.cmd, deps.repoRoot, task.branch, key);
+
+  let payloadObj: Record<string, unknown> = {};
+  try {
+    if (task.payload) payloadObj = JSON.parse(task.payload);
+  } catch {}
+  payloadObj.cancelled_reason = reason ?? "dequeue";
+
+  const now = deps.now ? deps.now() : Date.now();
+  const res = deps.store.transitionTask(
+    {
+      taskKey: key,
+      expectedNode: task.node,
+      expectedStatus: task.status,
+      toNode: task.node,
+      toStatus: "cancelled",
+      actor: "owner",
+      reason: reason ?? "dequeue",
+      now,
+      updates: { payload: JSON.stringify(payloadObj) },
+    },
+    now,
+  );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось отменить задачу ${key}: конфликт CAS`,
+    );
+  }
+
+  return { ok: true, task: res.task! };
+}
+
+export async function runDefer(
+  taskKey: string,
+  reason: string | undefined,
+  deps: {
+    store: DelegationStore;
+    ctx: PluginCliContext;
+    workGraphMode: WorkGraphMode;
+    now?: () => number;
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow }> {
+  assertOwnerOnly(deps.ctx);
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+  if (!reason || reason.trim().length === 0) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      "укажи причину: bb orchestrator defer <KEY> --reason <причина>",
+    );
+  }
+
+  const key = normalizeTaskKey(taskKey);
+  const task = deps.store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "task-not-found",
+      `задача ${key} не найдена в очереди`,
+    );
+  }
+  if (task.status === "done" || task.status === "cancelled") {
+    throw new OrchestratorError(
+      "invalid-status",
+      `задача ${key} уже завершена или отменена (status=${task.status})`,
+    );
+  }
+  if (task.status === "deferred") {
+    throw new OrchestratorError(
+      "invalid-status",
+      `задача ${key} уже отложена (status=deferred)`,
+    );
+  }
+
+  const now = deps.now ? deps.now() : Date.now();
+  let existingPayload: Record<string, unknown> = {};
+  try {
+    if (task.payload) existingPayload = JSON.parse(task.payload);
+  } catch {}
+  existingPayload.previous_status = task.status;
+
+  const res = deps.store.transitionTask(
+    {
+      taskKey: key,
+      expectedNode: task.node,
+      expectedStatus: task.status,
+      toNode: task.node,
+      toStatus: "deferred",
+      actor: "owner",
+      reason,
+      now,
+      updates: {
+        deferred_by: "owner",
+        deferred_reason: reason,
+        payload: JSON.stringify(existingPayload),
+      },
+    },
+    now,
+  );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось отложить задачу ${key}: конфликт CAS`,
+    );
+  }
+
+  return { ok: true, task: res.task! };
+}
+
+export async function runReject(
+  taskKey: string,
+  target: string | undefined,
+  reason: string | undefined,
+  deps: {
+    store: DelegationStore;
+    ctx: PluginCliContext;
+    workGraphMode: WorkGraphMode;
+    now?: () => number;
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow }> {
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+  if (!reason || reason.trim().length === 0) {
+    throw new OrchestratorError(
+      "missing-reason",
+      "укажи причину отклонения: bb orchestrator reject <KEY> --reason <причина>",
+    );
+  }
+
+  const key = normalizeTaskKey(taskKey);
+  const task = deps.store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "task-not-found",
+      `задача ${key} не найдена в очереди`,
+    );
+  }
+
+  if (task.status === "blocked" || task.status === "deferred") {
+    throw new OrchestratorError(
+      "invalid-status",
+      "при статусе blocked или deferred вызов reject строго запрещён: вывод из blocked разрешён исключительно владельцу через команду resume",
+    );
+  }
+
+  const now = deps.now ? deps.now() : Date.now();
+  const isOwner = isOwnerCalling(deps.ctx);
+
+  if (task.node === "owner_gate") {
+    assertOwnerOnly(deps.ctx);
+    if (task.route === "feature") {
+      const tgt = (target ?? "spec") as TaskNode;
+      if (tgt !== "spec" && tgt !== "design") {
+        throw new OrchestratorError(
+          "target-invalid",
+          `недопустимая цель ${target} для маршрута feature (разрешены: spec, design)`,
+        );
+      }
+      const res = deps.store.transitionTask(
+        {
+          taskKey: key,
+          expectedNode: "owner_gate",
+          expectedStatus: task.status,
+          toNode: tgt,
+          toStatus: "running",
+          actor: "owner",
+          reason: reason ?? "rejected",
+          now,
+        },
+        now,
+      );
+      if (!res.ok) {
+        throw new OrchestratorError(
+          "transition-failed",
+          `не удалось отклонить задачу ${key}: конфликт CAS`,
+        );
+      }
+      return { ok: true, task: res.task! };
+    }
+
+    if (task.route === "docs") {
+      const tgt = (target ?? "spec") as TaskNode;
+      if (tgt !== "spec") {
+        throw new OrchestratorError(
+          "target-invalid",
+          `недопустимая цель ${target} для маршрута docs (разрешено только: spec)`,
+        );
+      }
+      const res = deps.store.transitionTask(
+        {
+          taskKey: key,
+          expectedNode: "owner_gate",
+          expectedStatus: task.status,
+          toNode: "spec",
+          toStatus: "running",
+          actor: "owner",
+          reason: reason ?? "rejected",
+          now,
+        },
+        now,
+      );
+      if (!res.ok) {
+        throw new OrchestratorError(
+          "transition-failed",
+          `не удалось отклонить задачу ${key}: конфликт CAS`,
+        );
+      }
+      return { ok: true, task: res.task! };
+    }
+
+    if (task.route === "fix" || task.route === "simple") {
+      if (target !== undefined) {
+        throw new OrchestratorError(
+          "target-invalid",
+          "для маршрутов fix и simple цель --target не поддерживается",
+        );
+      }
+      let rejectPayload: Record<string, unknown> = {};
+      try {
+        if (task.payload) rejectPayload = JSON.parse(task.payload);
+      } catch {}
+      delete rejectPayload.previous_status;
+
+      const res = deps.store.transitionTask(
+        {
+          taskKey: key,
+          expectedNode: "owner_gate",
+          expectedStatus: task.status,
+          toNode: "owner_gate",
+          toStatus: "deferred",
+          actor: "owner",
+          reason: reason ?? "rejected",
+          now,
+          updates: {
+            deferred_by: "owner",
+            deferred_reason: reason ?? "rejected at owner_gate",
+            payload: JSON.stringify(rejectPayload),
+          },
+        },
+        now,
+      );
+      if (!res.ok) {
+        throw new OrchestratorError(
+          "transition-failed",
+          `не удалось отклонить задачу ${key}: конфликт CAS`,
+        );
+      }
+      return { ok: true, task: res.task! };
+    }
+  }
+
+  if (task.node === "code") {
+    if (task.status !== "running" && task.status !== "stalled") {
+      throw new OrchestratorError(
+        "invalid-status",
+        `возврат узла code возможен только в статусе running или stalled (current: ${task.status})`,
+      );
+    }
+    if (target && target !== "code") {
+      throw new OrchestratorError(
+        "target-invalid",
+        `недопустимая цель ${target} для узла code`,
+      );
+    }
+    const res = deps.store.transitionTask(
+      {
+        taskKey: key,
+        expectedNode: "code",
+        expectedStatus: task.status,
+        toNode: "code",
+        toStatus: "running",
+        actor: isOwner ? "owner" : "coordinator",
+        reason: reason ?? "rejected",
+        now,
+      },
+      now,
+    );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось отклонить задачу ${key}: конфликт CAS`,
+      );
+    }
+    return { ok: true, task: res.task! };
+  }
+
+  throw new OrchestratorError(
+    "invalid-status",
+    `команда reject недопустима для узла ${task.node} в статусе ${task.status}`,
+  );
+}
+
+export async function runResume(
+  taskKey: string,
+  target: string | undefined,
+  deps: {
+    store: DelegationStore;
+    ctx: PluginCliContext;
+    workGraphMode: WorkGraphMode;
+    now?: () => number;
+    reopen?: boolean;
+    cmd?: CmdRunner;
+    repoRoot?: string;
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow }> {
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+
+  const key = normalizeTaskKey(taskKey);
+  const task = deps.store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "task-not-found",
+      `задача ${key} не найдена в очереди`,
+    );
+  }
+
+  const now = deps.now ? deps.now() : Date.now();
+  const isOwner = isOwnerCalling(deps.ctx);
+
+  if (task.status === "stalled") {
+    if (deps.reopen && deps.cmd && deps.repoRoot) {
+      let prNum: number | undefined;
+      if (task.payload) {
+        try {
+          const p = JSON.parse(task.payload);
+          if (typeof p.pr_number === "number") prNum = p.pr_number;
+        } catch {}
+      }
+      if (prNum) {
+        await deps.cmd
+          .run("gh", ["pr", "reopen", String(prNum)], { cwd: deps.repoRoot })
+          .catch(() => {});
+      }
+    }
+
+    if (target !== undefined) {
+      assertOwnerOnly(deps.ctx);
+      if (task.node === "release") {
+        if (["feature", "fix", "simple"].includes(task.route)) {
+          if (target !== "code") {
+            throw new OrchestratorError(
+              "target-invalid",
+              `недопустимая цель ${target} для возобновления из release/stalled`,
+            );
+          }
+          const res = deps.store.transitionTask(
+            {
+              taskKey: key,
+              expectedNode: "release",
+              expectedStatus: "stalled",
+              toNode: "code",
+              toStatus: "running",
+              actor: "owner",
+              reason: "resume-to-code",
+              now,
+              updates: {
+                code_attempts: 0,
+                check_attempts: 0,
+                code_review_rounds: 0,
+                design_check_rounds: 0,
+                release_attempts: 0,
+              },
+            },
+            now,
+          );
+          if (!res.ok) {
+            throw new OrchestratorError(
+              "transition-failed",
+              `не удалось возобновить задачу ${key}: конфликт CAS`,
+            );
+          }
+          return { ok: true, task: res.task! };
+        }
+        if (task.route === "docs") {
+          if (target !== "spec") {
+            throw new OrchestratorError(
+              "target-invalid",
+              `недопустимая цель ${target} для возобновления docs из release/stalled`,
+            );
+          }
+          const res = deps.store.transitionTask(
+            {
+              taskKey: key,
+              expectedNode: "release",
+              expectedStatus: "stalled",
+              toNode: "spec",
+              toStatus: "running",
+              actor: "owner",
+              reason: "resume-to-spec",
+              now,
+              updates: {
+                spec_attempts: 0,
+                spec_review_rounds: 0,
+                release_attempts: 0,
+              },
+            },
+            now,
+          );
+          if (!res.ok) {
+            throw new OrchestratorError(
+              "transition-failed",
+              `не удалось возобновить задачу ${key}: конфликт CAS`,
+            );
+          }
+          return { ok: true, task: res.task! };
+        }
+      }
+      throw new OrchestratorError(
+        "target-invalid",
+        `цель --target не поддерживается для узла ${task.node} в статусе stalled`,
+      );
+    }
+
+    const res = deps.store.transitionTask(
+      {
+        taskKey: key,
+        expectedNode: task.node,
+        expectedStatus: "stalled",
+        toNode: task.node,
+        toStatus: "running",
+        actor: isOwner ? "owner" : "coordinator",
+        reason: "resume",
+        now,
+      },
+      now,
+    );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось возобновить задачу ${key}: конфликт CAS`,
+      );
+    }
+    return { ok: true, task: res.task! };
+  }
+
+  if (task.status === "blocked") {
+    assertOwnerOnly(deps.ctx);
+
+    const validTargetsByRoute: Record<string, string[]> = {
+      feature: ["code", "spec", "design", "release"],
+      fix: ["code", "release"],
+      simple: ["code", "release"],
+      docs: ["spec", "release"],
+      research: ["research"],
+    };
+
+    let tgt: TaskNode;
+    if (target) {
+      const allowed = validTargetsByRoute[task.route] ?? [];
+      if (!allowed.includes(target)) {
+        throw new OrchestratorError(
+          "target-invalid",
+          `цель ${target} недопустима для маршрута ${task.route}`,
+        );
+      }
+      tgt = target as TaskNode;
+    } else {
+      if (task.node === "checks" || task.node === "review" || task.node === "code") tgt = "code";
+      else if (task.node === "spec_review" || task.node === "spec") tgt = "spec";
+      else if (task.node === "design_check" || task.node === "design") tgt = "design";
+      else if (task.node === "release") tgt = "release";
+      else tgt = (validTargetsByRoute[task.route]?.[0] as TaskNode) ?? "code";
+    }
+
+    const allowed = validTargetsByRoute[task.route] ?? [];
+    if (!allowed.includes(tgt)) {
+      throw new OrchestratorError(
+        "target-invalid",
+        `цель ${tgt} недопустима для маршрута ${task.route}`,
+      );
+    }
+
+    if (tgt === "release" && task.node !== "release") {
+      throw new OrchestratorError(
+        "target-invalid",
+        "cannot resume to release from unreviewed or unverified code",
+      );
+    }
+
+    const updates: Partial<TaskQueueRow> = {};
+    if (tgt === "design") {
+      updates.design_check_rounds = 0;
+      updates.spec_attempts = 0;
+      updates.spec_review_rounds = 0;
+      updates.code_attempts = 0;
+      updates.check_attempts = 0;
+      updates.code_review_rounds = 0;
+      updates.release_attempts = 0;
+    } else if (tgt === "spec") {
+      updates.spec_attempts = 0;
+      updates.spec_review_rounds = 0;
+      updates.code_attempts = 0;
+      updates.check_attempts = 0;
+      updates.code_review_rounds = 0;
+      updates.design_check_rounds = 0;
+      updates.release_attempts = 0;
+    } else if (tgt === "code") {
+      updates.code_attempts = 0;
+      updates.check_attempts = 0;
+      updates.code_review_rounds = 0;
+      updates.design_check_rounds = 0;
+      updates.release_attempts = 0;
+    } else if (tgt === "release") {
+      updates.release_attempts = 0;
+    }
+
+    const res = deps.store.transitionTask(
+      {
+        taskKey: key,
+        expectedNode: task.node,
+        expectedStatus: "blocked",
+        toNode: tgt,
+        toStatus: "running",
+        actor: "owner",
+        reason: "resume",
+        now,
+        updates,
+      },
+      now,
+    );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось возобновить задачу ${key}: конфликт CAS`,
+      );
+    }
+    return { ok: true, task: res.task! };
+  }
+
+  if (task.status === "deferred") {
+    assertOwnerOnly(deps.ctx);
+    let parsedPayload: Record<string, unknown> = {};
+    let prevStatus = "";
+    try {
+      if (task.payload) {
+        parsedPayload = JSON.parse(task.payload);
+        if (typeof parsedPayload.previous_status === "string") {
+          prevStatus = parsedPayload.previous_status;
+        }
+      }
+    } catch {}
+    delete parsedPayload.previous_status;
+
+    let toStatus: TaskStatus = "running";
+    if (task.node === "start") {
+      toStatus = "queued";
+    } else if (task.node === "owner_gate") {
+      toStatus = "waiting_approval";
+    } else if (task.node === "release") {
+      if (prevStatus === "waiting_release_note" || prevStatus === "pr_open") {
+        toStatus = prevStatus as TaskStatus;
+      } else {
+        toStatus = "running";
+      }
+    } else {
+      toStatus = "running";
+    }
+
+    const res = deps.store.transitionTask(
+      {
+        taskKey: key,
+        expectedNode: task.node,
+        expectedStatus: "deferred",
+        toNode: task.node,
+        toStatus,
+        actor: "owner",
+        reason: "resume",
+        now,
+        updates: {
+          deferred_by: null,
+          deferred_reason: null,
+          payload: JSON.stringify(parsedPayload),
+        },
+      },
+      now,
+    );
+    if (!res.ok) {
+      throw new OrchestratorError(
+        "transition-failed",
+        `не удалось возобновить задачу ${key}: конфликт CAS`,
+      );
+    }
+    return { ok: true, task: res.task! };
+  }
+
+  throw new OrchestratorError(
+    "invalid-status",
+    `задача ${key} не находится в состоянии stalled, blocked или deferred (current: status=${task.status})`,
+  );
+}
+
+export async function runApprove(
+  taskKey: string,
+  comment: string | undefined,
+  deps: {
+    store: DelegationStore;
+    ctx: PluginCliContext;
+    workGraphMode: WorkGraphMode;
+    now?: () => number;
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow }> {
+  assertOwnerOnly(deps.ctx);
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+
+  const key = normalizeTaskKey(taskKey);
+  const task = deps.store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "task-not-found",
+      `задача ${key} не найдена в очереди`,
+    );
+  }
+
+  if (task.node !== "owner_gate" || task.status !== "waiting_approval") {
+    throw new OrchestratorError(
+      "invalid-status",
+      `task is not waiting for approval (current: node=${task.node}, status=${task.status})`,
+    );
+  }
+
+  const toNode: TaskNode = task.route === "docs" ? "release" : "code";
+  const now = deps.now ? deps.now() : Date.now();
+  const res = deps.store.transitionTask(
+    {
+      taskKey: key,
+      expectedNode: "owner_gate",
+      expectedStatus: "waiting_approval",
+      toNode,
+      toStatus: "running",
+      actor: "owner",
+      reason: comment || "approved",
+      now,
+    },
+    now,
+  );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось одобрить задачу ${key}: конфликт CAS`,
+    );
+  }
+
+  return { ok: true, task: res.task! };
+}
+
+export async function runReleaseNote(
+  taskKey: string,
+  note: string | undefined,
+  deps: {
+    store: DelegationStore;
+    ctx: PluginCliContext;
+    workGraphMode: WorkGraphMode;
+    now?: () => number;
+  },
+): Promise<{ ok: boolean; task: TaskQueueRow }> {
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+
+  const key = normalizeTaskKey(taskKey);
+  const task = deps.store.getTask(key);
+  if (!task) {
+    throw new OrchestratorError(
+      "task-not-found",
+      `задача ${key} не найдена в очереди`,
+    );
+  }
+
+  if (task.status !== "waiting_release_note") {
+    throw new OrchestratorError(
+      "invalid-status",
+      `task is not waiting for release note (current: node=${task.node}, status=${task.status})`,
+    );
+  }
+
+  if (!note || note.trim().length === 0) {
+    throw new OrchestratorError(
+      "invalid-arguments",
+      "заметка релиза не может быть пустой",
+    );
+  }
+
+  const now = deps.now ? deps.now() : Date.now();
+  const isOwner = isOwnerCalling(deps.ctx);
+  const res = deps.store.transitionTask(
+    {
+      taskKey: key,
+      expectedNode: "release",
+      expectedStatus: "waiting_release_note",
+      toNode: "release",
+      toStatus: "running",
+      actor: isOwner ? "owner" : "coordinator",
+      reason: "release-note",
+      now,
+      updates: { release_note: note.trim() },
+    },
+    now,
+  );
+  if (!res.ok) {
+    throw new OrchestratorError(
+      "transition-failed",
+      `не удалось сохранить release note для задачи ${key}: конфликт CAS`,
+    );
+  }
+
+  return { ok: true, task: res.task! };
+}
+
+export async function runRunQueue(
+  deps: {
+    store: DelegationStore;
+    workGraphMode: WorkGraphMode;
+  },
+): Promise<{
+  ok: boolean;
+  activeCount: number;
+  queuedCount: number;
+  tasks: TaskQueueRow[];
+  readyCount: number;
+}> {
+  if (deps.workGraphMode === "off") {
+    throw new OrchestratorError(
+      "graph-disabled",
+      "управление графом отключено (настройка workGraph: off); установи orchestrator.workGraph в shadow или strict",
+    );
+  }
+
+  const queued = deps.store.listQueuedTasks();
+  const active = deps.store.listActiveTasks();
+
+  let readyCount = 0;
+  for (const t of queued) {
+    let depsSatisfied = true;
+    if (t.depends_on) {
+      try {
+        const arr = JSON.parse(t.depends_on) as string[];
+        for (const depKey of arr) {
+          const depTask = deps.store.getTask(depKey);
+          if (!depTask || depTask.status !== "done") {
+            depsSatisfied = false;
+            break;
+          }
+        }
+      } catch {
+        depsSatisfied = false;
+      }
+    }
+    if (depsSatisfied) {
+      readyCount++;
+    }
+  }
+
+  return {
+    ok: true,
+    activeCount: active.length,
+    queuedCount: queued.length,
+    readyCount,
+    tasks: queued,
+  };
+}

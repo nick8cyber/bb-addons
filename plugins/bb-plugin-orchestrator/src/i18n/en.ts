@@ -1029,4 +1029,14 @@ export const EN: Record<string, string> = {
   "kb.syncConflict": "kb-refused: sync-conflict: conflict during knowledge base sync ({error})",
   "kb.syncFailed": "kb-refused: sync-failed: upstream sync failed ({error})",
   "kb.disabled": "kb-refused: kb-disabled: knowledge base is disabled in settings",
+
+  // ── workgraph.ts / §27–§32 (r34, ADR-0032) — task work graph CLI ────
+  "cli.helpEnqueueS": "Enqueue a task into the work graph",
+  "cli.helpDequeueS": "Dequeue a task from the work graph (owner-only)",
+  "cli.helpDeferS": "Defer a task (owner-only)",
+  "cli.helpRejectS": "Reject task node for rework",
+  "cli.helpResumeS": "Resume task from deferred/blocked/stalled",
+  "cli.helpApproveS": "Approve owner_gate transition in manual mode",
+  "cli.helpReleaseNoteS": "Provide release note when waiting_release_note",
+  "cli.helpRunQueueS": "Single evaluation tick of the task work graph queue",
 };
