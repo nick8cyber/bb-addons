@@ -2029,7 +2029,7 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
               errorText.slice(0, 300),
             );
             log(
-              `models probe: account ${label} parked (${parkedCause}) on session/new refusal`,
+              `models probe: account ${label} parked (${parkedCause}) on session/new refusal${parkedCause === "validation-required" ? "; owner verifies the account in a browser: https://support.google.com/accounts/answer/185833" : ""}`,
             );
           }
           resolve([]);
@@ -3956,6 +3956,11 @@ function resumeOnSibling(
       ) {
         markAccountModelUnsupported(dataDir, account.label, session.model);
         maybeProbeCatalog(account.label);
+        // §2.3 п.12 (ревизия 14): the no-carrier refusal is journaled —
+        // thread, model, reason.
+        log(
+          `thread ${session.threadId}: thread/resume refused (model ${session.model ?? "default"}): model ${session.model} is not offered by any pool account`,
+        );
         sendError(
           id,
           -32000,
@@ -3971,13 +3976,16 @@ function resumeOnSibling(
         coolSessionAccount(session, parkedCause, errorText.slice(0, 300));
         const { account: next } = freeSibling(session, account.label);
         if (next === null) {
-          sendError(
-            id,
-            -32000,
+          const honest =
             parkedCause === "validation-required"
               ? `account ${account.label} needs Google account verification`
-              : `account ${account.label} was disabled by Google (Terms of Service)`,
+              : `account ${account.label} was disabled by Google (Terms of Service)`;
+          // §2.3 п.12 (ревизия 14): journal the refusal — thread, model,
+          // reason.
+          log(
+            `thread ${session.threadId}: thread/resume refused (model ${session.model ?? "default"}): ${honest}`,
           );
+          sendError(id, -32000, honest);
           return;
         }
         resumeOnSibling(
@@ -3989,6 +3997,11 @@ function resumeOnSibling(
         );
         return;
       }
+      // §2.3 п.12 (ревизия 14): journal the refusal — thread, model,
+      // reason.
+      log(
+        `thread ${session.threadId}: thread/resume refused (model ${session.model ?? "default"}): agy could not start on the resume sibling: ${errorText.slice(0, 300)}`,
+      );
       sendError(
         id,
         -32000,
@@ -4053,7 +4066,7 @@ function retryDaemonSession(
     // §2.3 п.12 (ревизия 14): the no-carrier refusal is journaled —
     // thread, model, reason.
     log(
-      `thread ${session.threadId}: thread/start refused (model ${family ?? "default"}): model ${family ?? "?"} is not offered by any pool account`,
+      `thread ${session.threadId}: ${pending.kind === "resume" ? "thread/resume" : "thread/start"} refused (model ${family ?? "default"}): model ${family ?? "?"} is not offered by any pool account`,
     );
     sendError(
       id,
