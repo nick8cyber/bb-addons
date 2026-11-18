@@ -54,8 +54,9 @@ const SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || proce
 
 // PLUG-291: каталоги веб-вложений (исходящие uploads, входящие downloads) и
 // их чистка при старте — TTL 24ч и не более 20 файлов на каталог.
-const UPLOADS_DIR = join(STATE_DIR, "uploads");
-const DOWNLOADS_DIR = join(STATE_DIR, "downloads");
+export const UPLOADS_DIR = join(STATE_DIR, "uploads");
+export const DOWNLOADS_DIR = join(STATE_DIR, "downloads");
+export const writeSpillPackage = webTools.writeSpillPackage;
 const FILES_MAX_AGE_MS = 24 * 3600_000;
 const FILES_KEEP_COUNT = 20;
 const numEnv = (names, dflt) => {
@@ -502,7 +503,7 @@ export function parseResetTimeMs(msg, nowMs = Date.now()) {
 /* ---------- prompt-size guard (PLUG-281, §2.2/§4.1) ---------- */
 // Unset → 100000 (below the observed ~120KB insertText hang);
 // WEB_GEMINI_MAX_PROMPT_BYTES or ARGON_MAX_PROMPT_BYTES=N overrides; non-positive → no limit.
-function webGeminiMaxPromptBytes() {
+export function webGeminiMaxPromptBytes() {
   const raw = process.env.WEB_GEMINI_MAX_PROMPT_BYTES ?? process.env.ARGON_MAX_PROMPT_BYTES;
   if (raw == null || raw === "") return 100_000;
   const v = Number(raw);
@@ -1842,7 +1843,7 @@ export function dispatch(msg) {
       // PLUG-285: блоки с агентским контекстом bb (<system_instructions>…)
       // отбрасываются целиком, до склейки — до драйвера доходит только
       // текст пользователя. Ресурсы и не-text блоки не затрагиваются.
-      const text = p.prompt
+      let text = p.prompt
         .filter((b) => b && b.type === "text" && !isBbSystemInstructionsBlock(b))
         .map((b) => String(b.text ?? ""))
         .join("\n");
@@ -1850,12 +1851,27 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
         return;
       }
-      // PLUG-281: refuse oversized prompts synchronously — before the queue,
-      // account selection and any lease (§2.2).
+      // PLUG-281 / PLUG-303 (r22, §2.2 п.2): гард размера промпта и перелив текста в файл.
+      // При превышении лимита исходный текст атомарно переливается в uploads/pkg-<sessionId>-prompt-<ts>.md
+      // и уходит веб-вложением сверх лимитов пользовательских файлов, а текст заменяется на указатель.
+      // При ошибке записи файла возвращается прежний JSON-RPC -32000.
+      const extraUploadFiles = [];
       const tooLarge = promptTooLargeError(text);
       if (tooLarge) {
-        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
-        return;
+        try {
+          const { pkgName, pkgPath } = webTools.writeSpillPackage(
+            UPLOADS_DIR,
+            `${p.sessionId}-prompt`,
+            text,
+          );
+          extraUploadFiles.push(pkgPath);
+          text = `[Задача передана файлом-вложением «${pkgName}» — изучи его целиком и выполни.]`;
+          slog("prompt:spill-prompt", { sessionId: p.sessionId, pkgName, bytes: Buffer.byteLength(text, "utf8") });
+        } catch (err) {
+          slog("prompt:spill-error", { sessionId: p.sessionId, error: err?.message });
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: tooLarge.message } });
+          return;
+        }
       }
       // §5 + PLUG-291: приложенные ресурсы ACP (embeddedContext) —
       // встроенные текстовые ресурсы идут во вложения первого сообщения.
@@ -1874,7 +1890,7 @@ export function dispatch(msg) {
       }
       void runPrompt(msg.id, p.sessionId, text, {
         embeddedResources,
-        uploadFiles: upload.files,
+        uploadFiles: [...upload.files, ...extraUploadFiles],
       });
       return;
     }

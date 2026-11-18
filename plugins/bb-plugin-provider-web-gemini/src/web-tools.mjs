@@ -1309,18 +1309,25 @@ export const GIT_DIFF_DENY_PATHSPECS = [
 const SPILL_NAME_SAFE_RE = /[^\w.-]+/g;
 
 /**
- * PLUG-291: перелив тела материалов в .md-файл веб-вложения.
+ * PLUG-291 / PLUG-303: перелив тела материалов или промпта в .md-файл веб-вложения.
  * Пишется атомарно (tmp + rename) в spillDir/pkg-<id>-<ts>.md;
  * имя каталога не создаётся заранее — mkdir только при реальной записи.
  */
-function writeSpillPackage(spillDir, spillId, content) {
+export function writeSpillPackage(spillDir, spillId, content) {
   const safeId = String(spillId ?? "pkg").replace(SPILL_NAME_SAFE_RE, "_") || "pkg";
   const pkgName = `pkg-${safeId}-${Date.now()}.md`;
   const pkgPath = path.join(spillDir, pkgName);
   fs.mkdirSync(spillDir, { recursive: true });
   const tmp = `${pkgPath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, content, "utf8");
-  fs.renameSync(tmp, pkgPath);
+  try {
+    fs.writeFileSync(tmp, content, "utf8");
+    fs.renameSync(tmp, pkgPath);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
   return { pkgName, pkgPath };
 }
 
