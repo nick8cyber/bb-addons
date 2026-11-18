@@ -1164,6 +1164,56 @@ test("§2.3 --preset: held group of a same-provider+model route refuses it", asy
   );
 });
 
+test("§2.3 --preset: a legacy-spelled held group (review-argon) refuses a web-gemini one-off", async () => {
+  // A route_holds row written before the rename keeps the old spelling;
+  // the one-off's canonical groups must match it through
+  // canonicalQuotaGroup, not just raw names.
+  const policy = JSON.parse(POLICY_TEXT);
+  policy.routes["review-web-gemini"] = {
+    preset: "web-gemini-review",
+    provider: "acp-web-gemini",
+  };
+  const { deps } = makeDeps({
+    policyText: JSON.stringify(policy),
+    held: [["review-argon", Date.now() + 60_000]],
+    cli: (args) => {
+      const key = args.join(" ");
+      if (key.startsWith("tasks preset show"))
+        return ok(
+          JSON.stringify({
+            preset: { providerId: "acp-web-gemini", modelId: "m1" },
+          }),
+        );
+      if (key.startsWith("tasks preset list"))
+        return ok(
+          JSON.stringify({
+            presets: [
+              { name: "one-off", providerId: "acp-web-gemini", modelId: "m1" },
+              {
+                name: "web-gemini-review",
+                providerId: "acp-web-gemini",
+                modelId: "m1",
+              },
+            ],
+          }),
+        );
+      return ok();
+    },
+  });
+  await assert.rejects(
+    runDelegate(
+      {
+        taskKey: "PLUG-1",
+        level: "complex",
+        preset: "one-off",
+        caller: COORDINATOR,
+      },
+      deps,
+    ),
+    (e: unknown) => (e as OrchestratorError).code === "route-held",
+  );
+});
+
 test("§2.3 --preset: a same-provider route on ANOTHER model stays open", async () => {
   // Same scenario but the one-off runs model m9 — "complex" (m1) is a
   // different quota pool, so its hold does not block the dispatch.

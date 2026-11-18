@@ -12,6 +12,18 @@ const KNOWN_CANDIDATE_RPCIDS = ['jSf9Qc', 'kAb7Z'];
 
 const lastCaptureMap = new Map();
 
+function resolveDefaultStateDir() {
+  const geminiDir = path.join(os.homedir(), '.bb', 'plugins', 'provider-web-gemini');
+  const argonDir = path.join(os.homedir(), '.bb', 'plugins', 'provider-argon');
+  if (fs.existsSync(geminiDir)) return geminiDir;
+  if (fs.existsSync(argonDir)) return argonDir;
+  return geminiDir;
+}
+
+function debugEnabled() {
+  return Boolean(process.env.WEB_GEMINI_DEBUG || process.env.ARGON_DEBUG);
+}
+
 async function withUsageLock(lockFile, fn) {
   const deadline = Date.now() + 10_000;
   const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
@@ -264,8 +276,8 @@ async function captureUsageLimits(page, opts = {}) {
   }
 
   const accountId = opts.accountId || opts.account || opts.profile || 'default';
-  const stateDir = opts.stateDir || process.env.ARGON_STATE_DIR || path.join(os.homedir(), '.bb', 'plugins', 'provider-argon');
-  const refreshMs = Number(process.env.ARGON_USAGE_REFRESH_MS ?? 300_000);
+  const stateDir = opts.stateDir || process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || resolveDefaultStateDir();
+  const refreshMs = Number(process.env.WEB_GEMINI_USAGE_REFRESH_MS ?? process.env.ARGON_USAGE_REFRESH_MS ?? 300_000);
 
   if (!opts.force && refreshMs > 0) {
     const inMemLast = lastCaptureMap.get(accountId) || 0;
@@ -377,14 +389,14 @@ async function captureUsageLimits(page, opts = {}) {
       ),
     ]);
   } catch (err) {
-    if (process.env.ARGON_DEBUG) {
+    if (debugEnabled()) {
       console.warn('[argon] Runtime.evaluate failed during captureUsageLimits:', err.message);
     }
     return null;
   }
 
   if (!evalRes || evalRes.error) {
-    if (process.env.ARGON_DEBUG) {
+    if (debugEnabled()) {
       console.warn('[argon] captureUsageLimits evaluate error:', evalRes ? evalRes.error : 'empty response');
     }
     return null;
@@ -392,7 +404,7 @@ async function captureUsageLimits(page, opts = {}) {
 
   const parsed = parseUsageLimits(evalRes.text);
   if (!parsed || (!parsed.daily && !parsed.weekly)) {
-    if (process.env.ARGON_DEBUG) {
+    if (debugEnabled()) {
       console.warn('[argon] captureUsageLimits: no metric records found in batchexecute response');
     }
     return null;
@@ -411,7 +423,7 @@ async function captureUsageLimits(page, opts = {}) {
     lastCaptureMap.set(accountId, Date.now());
     return updated;
   } catch (err) {
-    if (process.env.ARGON_DEBUG) {
+    if (debugEnabled()) {
       console.warn('[argon] updateAccountUsage failed:', err.message);
     }
     return null;

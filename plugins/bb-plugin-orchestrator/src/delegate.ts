@@ -26,9 +26,16 @@ import {
 } from "./instructions.js";
 import {
   BUILTIN_UNAVAILABLE_PATTERNS,
+  PRESET_ALIASES,
+  ROUTE_ALIASES,
+  canonicalPresetName,
+  canonicalQuotaGroup,
+  canonicalRouteName,
+  findRoute,
   pickRoute,
   quotaGroupOf,
   quotaGroupsForOneOff,
+  resolvePolicyRoute,
   type Policy,
   type PolicyLoad,
   type PolicyRoute,
@@ -295,6 +302,8 @@ export interface DispatchStepsResult {
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+export { PRESET_ALIASES, canonicalPresetName };
+
 /** orchestrator-release §2 r10 п.4: the release-auditor thread is
  * parent-muted BY CONTRACT — `off` is its expected mode, `auto` every
  * other delegation's. */
@@ -430,11 +439,15 @@ export async function runDelegate(
   ) {
     const toollessHit = params.preset
       ? Object.entries(policy.routes).find(
-          ([, r]) => r.preset === params.preset && r.tools === false,
+          ([, r]) =>
+            (r.preset === params.preset ||
+              (PRESET_ALIASES[params.preset!] &&
+                r.preset === PRESET_ALIASES[params.preset!])) &&
+            r.tools === false,
         )
       : params.route !== undefined &&
-          policy.routes[params.route]?.tools === false
-        ? [params.route, policy.routes[params.route]] as const
+          findRoute(policy, params.route)?.tools === false
+        ? ([params.route, findRoute(policy, params.route)!] as const)
         : undefined;
     if (toollessHit) {
       throw new OrchestratorError(
@@ -525,7 +538,12 @@ export async function runDelegate(
       },
       presetModels,
     );
-    const blocked = groups.find((g) => held.has(g));
+    const canonHeld = new Set(
+      [...held].map((h) => canonicalQuotaGroup(h)),
+    );
+    const blocked = groups.find(
+      (g) => held.has(g) || canonHeld.has(canonicalQuotaGroup(g)),
+    );
     if (blocked) {
       throw new OrchestratorError(
         "route-held",
@@ -771,10 +789,18 @@ export function quotaGroupsOfRow(
   policy: Policy | null,
 ): Set<string> {
   if (!row.route.startsWith("preset:")) {
-    const route = policy?.routes[row.route];
-    return new Set([route ? quotaGroupOf(route, row.route) : row.route]);
+    const route = findRoute(policy, row.route);
+    return new Set([
+      canonicalQuotaGroup(route ? quotaGroupOf(route, row.route) : row.route),
+    ]);
   }
-  const groups = new Set([row.route]);
+  const canon = canonicalQuotaGroup(row.route);
+  const groups = new Set([canon]);
+  if (canon.startsWith("preset:")) {
+    const p = canon.slice("preset:".length);
+    const alias = PRESET_ALIASES[p];
+    if (alias) groups.add(`preset:${alias}`);
+  }
   if (policy) {
     for (const [name, route] of Object.entries(policy.routes)) {
       if (route.provider === row.provider) {
@@ -797,7 +823,7 @@ export async function dispatchToRoute(
   const role = roleForLevel(row.level, policy);
   const policyRoute = row.route.startsWith("preset:")
     ? undefined
-    : policy?.routes[row.route];
+    : findRoute(policy, row.route);
 
   // §20.1/§20.3 (r33): a `tools: false` route — or a `preset:` one-off
   // of an audit/research level naming such a route's preset — gets the
@@ -810,7 +836,11 @@ export async function dispatchToRoute(
     (row.route.startsWith("preset:") &&
       (role === "auditor" || role === "researcher") &&
       Object.values(policy?.routes ?? {}).some(
-        (r) => r.tools === false && r.preset === row.preset,
+        (r) =>
+          r.tools === false &&
+          (r.preset === row.preset ||
+            (PRESET_ALIASES[row.preset] !== undefined &&
+              r.preset === PRESET_ALIASES[row.preset])),
       ));
   if (toolless && role !== "auditor" && role !== "researcher") {
     await refuseDispatch(
@@ -834,8 +864,13 @@ export async function dispatchToRoute(
     const level = policy?.levels[row.level];
     if (!policy || !level) return null;
     const held = store.heldGroups(now());
+    const canonHeld = new Set([...held].map((h) => canonicalQuotaGroup(h)));
     const unavailable = deps.unavailableRoutes?.() ?? new Set<string>();
-    const idx = level.chain.indexOf(row.route);
+    const matchRoute = (a: string, b: string) =>
+      a === b ||
+      canonicalRouteName(a) === canonicalRouteName(b) ||
+      ROUTE_ALIASES[a] === b;
+    const idx = level.chain.findIndex((c) => matchRoute(c, row.route));
     // The route just burned and every route this dispatch already
     // skipped are out — an explicit --route/--preset inside the chain
     // continues from ITS position (`updateRoute` also drops
@@ -843,24 +878,40 @@ export async function dispatchToRoute(
     // restart recursed dispatchToRoute → advanceRoute forever).
     const skipped = new Set((opts._skipped ?? []).map((s) => s.route));
     skipped.add(row.route);
+    const isSkipped = (name: string) =>
+      skipped.has(name) ||
+      (ROUTE_ALIASES[name] !== undefined && skipped.has(ROUTE_ALIASES[name])) ||
+      skipped.has(canonicalRouteName(name));
+    const isUnavailable = (name: string) =>
+      unavailable.has(name) ||
+      (ROUTE_ALIASES[name] !== undefined && unavailable.has(ROUTE_ALIASES[name])) ||
+      unavailable.has(canonicalRouteName(name));
     const candidates =
       idx === -1 ? level.chain : level.chain.slice(idx + 1);
     for (const name of candidates) {
-      if (skipped.has(name)) continue;
-      const next = policy.routes[name];
+      if (isSkipped(name) || isUnavailable(name)) continue;
+      const next = findRoute(policy, name);
+      if (!next) continue;
+      const alias = ROUTE_ALIASES[name];
+      const canon = canonicalRouteName(name);
+      const qg = quotaGroupOf(next, name);
       if (
-        !next ||
-        unavailable.has(name) ||
         held.has(name) ||
-        held.has(quotaGroupOf(next, name))
+        (alias && held.has(alias)) ||
+        held.has(canon) ||
+        held.has(qg) ||
+        canonHeld.has(qg)
       ) {
         continue;
       }
+      const resolved = resolvePolicyRoute(policy, name);
+      const targetName = resolved?.name ?? name;
+      const targetRoute = resolved?.route ?? next;
       if (
         !store.updateRoute(row.id, {
-          route: name,
-          preset: next.preset,
-          provider: next.provider,
+          route: targetName,
+          preset: targetRoute.preset,
+          provider: targetRoute.provider,
         })
       ) {
         return null; // left `dispatching` meanwhile — another path owns it
@@ -914,13 +965,14 @@ export async function dispatchToRoute(
               ).length +
             store
               .listActiveHelpers()
-              .filter(
-                (h) =>
-                  h.route !== null &&
-                  (policy?.routes[h.route]
-                    ? quotaGroupOf(policy.routes[h.route]!, h.route)
-                    : h.route) === group,
-              ).length;
+              .filter((h) => {
+                if (h.route === null) return false;
+                const hr = findRoute(policy, h.route);
+                return (
+                  (hr ? quotaGroupOf(hr, h.route) : canonicalQuotaGroup(h.route)) ===
+                  group
+                );
+              }).length;
           if (busy >= routeCap) {
             if (row.queued_at == null) {
               store.setQueuedAt(row.id, now());
@@ -1526,7 +1578,7 @@ async function dispatchViaSpawn(
   if (opts.toolless) {
     const policyRoute = row.route.startsWith("preset:")
       ? undefined
-      : deps.policy?.()?.routes[row.route];
+      : findRoute(deps.policy?.(), row.route);
     prompt = (
       await wrapPromptWithPacket({
         role: opts.toolless,

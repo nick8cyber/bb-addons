@@ -18,7 +18,7 @@ date: 2026-11-16
 
 ## Решение
 
-Плагин `bb-plugin-provider-argon` (`acp-argon`):
+Создан плагин `bb-plugin-provider-web-gemini` (ранее `bb-plugin-provider-argon`, зарегистрированные id: `acp-web-gemini` и legacy-алиас `acp-argon`):
 
 - **Универсальная модель пула (`acp-server.mjs`)**:
   - Читает пул из `ARGON_POOL_FILE` (`pool.json`) с абстрактными аккаунтами: `{ id, email, profileDir, cdpPort, tier, priority }`.

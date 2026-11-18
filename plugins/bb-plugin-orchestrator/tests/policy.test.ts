@@ -2,10 +2,18 @@ import assert from "node:assert/strict";
 import { RU } from "../src/i18n/ru.js";
 import test from "node:test";
 import {
+  PRESET_ALIASES,
+  canonicalPresetName,
+  canonicalQuotaGroup,
+  canonicalRouteName,
+  findRoute,
+  resolvePolicyRoute,
   levelRole,
   parsePolicy,
   pickRoute,
+  quotaGroupOf,
   quotaGroupsForOneOff,
+  type Policy,
 } from "../src/policy.js";
 
 const VALID = JSON.stringify({
@@ -412,4 +420,199 @@ test("§2.3 quotaGroupsForOneOff: bracketed model variant shares the quota", () 
     ).sort(),
     ["a", "preset:x"],
   );
+});
+
+test("PLUG-298: quotaGroupOf unifies 'argon' and 'web-gemini' into 'web-gemini'", () => {
+  assert.equal(canonicalQuotaGroup("argon"), "web-gemini");
+  assert.equal(canonicalQuotaGroup("web-gemini"), "web-gemini");
+  assert.equal(canonicalQuotaGroup("review-argon"), "web-gemini");
+  assert.equal(canonicalQuotaGroup("review-web-gemini"), "web-gemini");
+  assert.equal(canonicalQuotaGroup("research-argon"), "web-gemini");
+  assert.equal(canonicalQuotaGroup("research-web-gemini"), "web-gemini");
+  assert.equal(canonicalQuotaGroup("custom"), "custom");
+
+  const rArgon = { preset: "p", provider: "acp-web-gemini", quotaGroup: "argon" };
+  const rGemini = { preset: "p", provider: "acp-web-gemini", quotaGroup: "web-gemini" };
+  const rNoGroup = { preset: "p", provider: "acp-web-gemini" };
+  assert.equal(quotaGroupOf(rArgon, "review-argon"), "web-gemini");
+  assert.equal(quotaGroupOf(rGemini, "review-web-gemini"), "web-gemini");
+  assert.equal(quotaGroupOf(rNoGroup, "review-argon"), "web-gemini");
+  assert.equal(quotaGroupOf(rNoGroup, "review-web-gemini"), "web-gemini");
+  assert.equal(quotaGroupOf(rNoGroup, "research-argon"), "web-gemini");
+  assert.equal(quotaGroupOf(rNoGroup, "research-web-gemini"), "web-gemini");
+});
+
+test("PLUG-298: pickRoute resolves aliases between review-argon and review-web-gemini", () => {
+  const policy: Policy = {
+    version: 1,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["review-web-gemini"],
+      },
+    },
+    routes: {
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+        tools: false,
+      },
+    },
+  };
+
+  // Normal lookup
+  const picked1 = pickRoute(policy, "review");
+  assert.equal(picked1.name, "review-web-gemini");
+  assert.ok(picked1.route);
+  assert.equal(picked1.route.preset, "web-gemini-review");
+
+  // Requested alias --route review-argon resolves to review-web-gemini
+  const picked2 = pickRoute(policy, "review", { requested: "review-argon" });
+  assert.equal(picked2.name, "review-web-gemini");
+  assert.ok(picked2.route);
+  assert.equal(picked2.route.preset, "web-gemini-review");
+
+  // Chain has legacy review-argon, routes has review-web-gemini: pickRoute returns route and canonical name
+  const policyChainLegacy: Policy = {
+    version: 1,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["review-argon"],
+      },
+    },
+    routes: {
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+        tools: false,
+      },
+    },
+  };
+  const pickedChain = pickRoute(policyChainLegacy, "review");
+  assert.equal(pickedChain.name, "review-web-gemini");
+  assert.ok(pickedChain.route);
+  assert.equal(pickedChain.route.preset, "web-gemini-review");
+
+  // When policy has review-argon, requesting review-web-gemini resolves to review-argon
+  const policyLegacy: Policy = {
+    version: 1,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["review-argon"],
+      },
+    },
+    routes: {
+      "review-argon": {
+        preset: "argon-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "argon",
+        tools: false,
+      },
+    },
+  };
+  const picked3 = pickRoute(policyLegacy, "review", { requested: "review-web-gemini" });
+  assert.equal(picked3.name, "review-argon");
+  assert.ok(picked3.route);
+  assert.equal(picked3.route.preset, "argon-review");
+
+  // Chain has review-web-gemini, routes has review-argon: pickRoute returns defined route
+  const policyChainNewRoutesOld: Policy = {
+    version: 1,
+    levels: {
+      review: {
+        role: "auditor",
+        chain: ["review-web-gemini"],
+      },
+    },
+    routes: {
+      "review-argon": {
+        preset: "argon-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "argon",
+        tools: false,
+      },
+    },
+  };
+  const picked4 = pickRoute(policyChainNewRoutesOld, "review");
+  assert.equal(picked4.name, "review-argon");
+  assert.ok(picked4.route);
+  assert.equal(picked4.route.preset, "argon-review");
+});
+
+test("PLUG-298: parsePolicy detects tools: false in executor level through alias", () => {
+  const parsed = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: {
+        exec: {
+          role: "executor",
+          chain: ["review-argon"],
+        },
+      },
+      routes: {
+        "review-web-gemini": {
+          preset: "web-gemini-review",
+          provider: "acp-web-gemini",
+          tools: false,
+        },
+      },
+    }),
+    new Set(["web-gemini-review"]),
+  );
+  assert.ok(
+    parsed.errors.some((e) => e.path === "routes.review-argon.tools"),
+    "Should error on tools: false in executor level when chain uses alias",
+  );
+});
+
+test("PLUG-298: canonicalPresetName and canonicalQuotaGroup handle preset: aliases", () => {
+  assert.equal(canonicalPresetName("argon-review"), "web-gemini-review");
+  assert.equal(canonicalPresetName("argon-research"), "web-gemini-research");
+  assert.equal(canonicalPresetName("web-gemini-review"), "web-gemini-review");
+  assert.equal(canonicalPresetName("other-preset"), "other-preset");
+
+  assert.equal(canonicalQuotaGroup("preset:argon-review"), "preset:web-gemini-review");
+  assert.equal(canonicalQuotaGroup("preset:argon-research"), "preset:web-gemini-research");
+  assert.equal(canonicalQuotaGroup("preset:web-gemini-review"), "preset:web-gemini-review");
+  assert.equal(canonicalQuotaGroup("preset:custom"), "preset:custom");
+});
+
+test("PLUG-298: quotaGroupsForOneOff produces canonical and alias groups for one-off preset", () => {
+  const policy: Policy = {
+    version: 1,
+    levels: {},
+    routes: {
+      "review-web-gemini": {
+        preset: "web-gemini-review",
+        provider: "acp-web-gemini",
+        quotaGroup: "web-gemini",
+      },
+    },
+  };
+  const models = new Map<string, string | null>([
+    ["argon-review", "gemini-flash"],
+    ["web-gemini-review", "gemini-flash"],
+  ]);
+
+  const groupsLegacy = quotaGroupsForOneOff(
+    policy,
+    { route: "preset:argon-review", provider: "acp-web-gemini", modelId: "gemini-flash" },
+    models,
+  );
+  assert.ok(groupsLegacy.includes("preset:web-gemini-review"));
+  assert.ok(groupsLegacy.includes("preset:argon-review"));
+  assert.ok(groupsLegacy.includes("web-gemini"));
+
+  const groupsNew = quotaGroupsForOneOff(
+    policy,
+    { route: "preset:web-gemini-review", provider: "acp-web-gemini", modelId: "gemini-flash" },
+    models,
+  );
+  assert.ok(groupsNew.includes("preset:web-gemini-review"));
+  assert.ok(groupsNew.includes("preset:argon-review"));
+  assert.ok(groupsNew.includes("web-gemini"));
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * acp-argon — ACP (JSON-RPC stdio) bridge to Google Gemini web client.
+ * acp-web-gemini (legacy alias acp-argon) — ACP (JSON-RPC stdio) bridge to Google Gemini web client.
  * Wraps the patched google-gemini-cli driver (CDP + headless Chromium).
  *
  * Conforms strictly to docs/specs/provider-argon.md and ADR 0027.
@@ -33,16 +33,24 @@ const require = createRequire(join(HERE, "package.json"));
 // Diagnostics must stay off stdout — it is the JSON-RPC channel.
 console.log = console.error;
 
-const FAKE = process.env.ARGON_FAKE === "1";
-const HEADLESS = process.env.ARGON_HEADLESS || process.env.GEMINI_HEADLESS || null;
+const FAKE = process.env.WEB_GEMINI_FAKE === "1" || process.env.ARGON_FAKE === "1";
+const HEADLESS = process.env.WEB_GEMINI_HEADLESS || process.env.ARGON_HEADLESS || process.env.GEMINI_HEADLESS || null;
 
-const STATE_DIR = process.env.ARGON_STATE_DIR || join(homedir(), ".bb", "plugins", "provider-argon");
-const POOL_FILE = process.env.ARGON_POOL_FILE || join(STATE_DIR, "pool.json");
+function resolveDefaultStateDir() {
+  const geminiDir = join(homedir(), ".bb", "plugins", "provider-web-gemini");
+  const argonDir = join(homedir(), ".bb", "plugins", "provider-argon");
+  if (existsSync(geminiDir)) return geminiDir;
+  if (existsSync(argonDir)) return argonDir;
+  return geminiDir;
+}
+
+const STATE_DIR = process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || resolveDefaultStateDir();
+const POOL_FILE = process.env.WEB_GEMINI_POOL_FILE || process.env.ARGON_POOL_FILE || join(STATE_DIR, "pool.json");
 const LEDGER_FILE = join(STATE_DIR, "accounts-state.json");
 const LOCK_FILE = join(STATE_DIR, "accounts-state.json.lock");
 const LOCK_STALE_MS = 5000;
 const LEASE_TTL_MS = 10 * 60_000;
-const SEND_DEADLINE_MS = Number(process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000;
+const SEND_DEADLINE_MS = Number(process.env.WEB_GEMINI_SEND_DEADLINE_MS || process.env.ARGON_SEND_DEADLINE_MS) || 1_200_000;
 
 // PLUG-291: каталоги веб-вложений (исходящие uploads, входящие downloads) и
 // их чистка при старте — TTL 24ч и не более 20 файлов на каталог.
@@ -50,12 +58,15 @@ const UPLOADS_DIR = join(STATE_DIR, "uploads");
 const DOWNLOADS_DIR = join(STATE_DIR, "downloads");
 const FILES_MAX_AGE_MS = 24 * 3600_000;
 const FILES_KEEP_COUNT = 20;
-const numEnv = (name, dflt) => {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) && v > 0 ? v : dflt;
+const numEnv = (names, dflt) => {
+  for (const name of [].concat(names)) {
+    const v = Number(process.env[name]);
+    if (Number.isFinite(v) && v > 0) return v;
+  }
+  return dflt;
 };
-const argonMaxUploadBytes = () => numEnv("ARGON_MAX_UPLOAD_BYTES", 25 * 1024 * 1024);
-const argonMaxUploadCount = () => Math.floor(numEnv("ARGON_MAX_UPLOAD_COUNT", 5));
+const argonMaxUploadBytes = () => numEnv(["WEB_GEMINI_MAX_UPLOAD_BYTES", "ARGON_MAX_UPLOAD_BYTES"], 25 * 1024 * 1024);
+const argonMaxUploadCount = () => Math.floor(numEnv(["WEB_GEMINI_MAX_UPLOAD_COUNT", "ARGON_MAX_UPLOAD_COUNT"], 5));
 
 /* ---------- account pool loading (§3.1) ---------- */
 export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
@@ -156,9 +167,10 @@ export function loadBackends(stateDir = STATE_DIR, poolFile = POOL_FILE) {
     } catch {}
   }
 
-  // 4. Env ARGON_BACKENDS
+  // 4. Env WEB_GEMINI_BACKENDS / ARGON_BACKENDS
   try {
-    const arr = JSON.parse(process.env.ARGON_BACKENDS || "");
+    const rawBackends = process.env.WEB_GEMINI_BACKENDS || process.env.ARGON_BACKENDS || "";
+    const arr = JSON.parse(rawBackends);
     if (Array.isArray(arr)) {
       for (const [i, b] of arr.entries()) {
         const id = b.id || `env-${i + 1}`;
@@ -489,9 +501,9 @@ export function parseResetTimeMs(msg, nowMs = Date.now()) {
 
 /* ---------- prompt-size guard (PLUG-281, §2.2/§4.1) ---------- */
 // Unset → 100000 (below the observed ~120KB insertText hang);
-// ARGON_MAX_PROMPT_BYTES=N overrides; non-positive → no limit.
-function argonMaxPromptBytes() {
-  const raw = process.env.ARGON_MAX_PROMPT_BYTES;
+// WEB_GEMINI_MAX_PROMPT_BYTES or ARGON_MAX_PROMPT_BYTES=N overrides; non-positive → no limit.
+function webGeminiMaxPromptBytes() {
+  const raw = process.env.WEB_GEMINI_MAX_PROMPT_BYTES ?? process.env.ARGON_MAX_PROMPT_BYTES;
   if (raw == null || raw === "") return 100_000;
   const v = Number(raw);
   // NaN/garbage → default; non-positive → explicit "no limit".
@@ -503,12 +515,12 @@ function argonMaxPromptBytes() {
 // before page work so internal sends (packed/tool-loop messages) are covered.
 export function promptTooLargeError(text) {
   const bytes = Buffer.byteLength(text || "", "utf8");
-  const limit = argonMaxPromptBytes();
+  const limit = webGeminiMaxPromptBytes();
   if (bytes <= limit) return null;
   const err = new Error(
-    `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (ARGON_MAX_PROMPT_BYTES). Shrink the request and retry.`
+    `prompt too large: ${bytes} bytes exceeds limit ${limit} bytes (WEB_GEMINI_MAX_PROMPT_BYTES). Shrink the request and retry.`
   );
-  err.code = "ARGON_PROMPT_TOO_LARGE";
+  err.code = "WEB_GEMINI_PROMPT_TOO_LARGE";
   return err;
 }
 
@@ -606,7 +618,7 @@ function dirRootsFrom(p) {
  * Собрать локальные файлы-вложения из блоков ACP-промпта. Берутся
  * resource_link с uri=file://… и блоки image/localFile/localImage с полем
  * path; URL и не-файловые ресурсы не загружаются. Каждый путь проверяется:
- * существует, обычный файл, ≤ ARGON_MAX_UPLOAD_BYTES, внутри корней сессии,
+ * существует, обычный файл, ≤ WEB_GEMINI_MAX_UPLOAD_BYTES, внутри корней сессии,
  * не в чёрном списке чувствительных файлов. Ошибка → { error } —
  * session/prompt отвечает JSON-RPC -32602.
  */
@@ -671,7 +683,7 @@ export function collectUploadFiles(promptBlocks, s) {
     // N блоков на один и тот же файл — это один файл.
     if (out.length >= maxCount) {
       return {
-        error: `too many upload files: exceeds limit ${maxCount} (ARGON_MAX_UPLOAD_COUNT)`,
+        error: `too many upload files: exceeds limit ${maxCount} (WEB_GEMINI_MAX_UPLOAD_COUNT)`,
       };
     }
     out.push(real);
@@ -709,10 +721,10 @@ export function classifyFailure(err, authHint = null) {
 
   // 2. transient (stream caps + driver/page faults, PLUG-286)
   if (
-    /generation still running after (?:540|900|\d+)s cap|stream_timeout|argon_stream_timeout|hung page|stalled generation/i.test(
+    /generation still running after (?:540|900|\d+)s cap|stream_timeout|argon_stream_timeout|web_gemini_stream_timeout|hung page|stalled generation/i.test(
       message
     ) ||
-    (err && (err.code === "ARGON_STREAM_TIMEOUT" || err.name === "TimeoutError")) ||
+    (err && (err.code === "WEB_GEMINI_STREAM_TIMEOUT" || err.code === "ARGON_STREAM_TIMEOUT" || err.name === "TimeoutError")) ||
     DRIVER_TRANSIENT_RE.test(message)
   ) {
     return {
@@ -772,7 +784,7 @@ export function classifyFailure(err, authHint = null) {
   // "недоступна" without model context (e.g. a nav-error page) is not proof
   // and falls through to default transient.
   if (
-    (err && err.code === "ARGON_MODEL_UNAVAILABLE") ||
+    (err && (err.code === "WEB_GEMINI_MODEL_UNAVAILABLE" || err.code === "ARGON_MODEL_UNAVAILABLE")) ||
     /(?:model|thinking)[- ]?unavailable|model is unavailable|not available for this account|модел\w*[^.\n]{0,40}недоступн|недоступн\w*[^.\n]{0,40}модел|недоступн\w* для (?:этого|вашего) аккаунта/i.test(
       message
     )
@@ -850,7 +862,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // exact stage (bindBackend wait, driver call, streaming) — postmortem 17.11.
 export const slog = (stage, extra) => {
   try {
-    const dir = process.env.ARGON_STATE_DIR || STATE_DIR;
+    const dir = process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || STATE_DIR;
     appendFileSync(
       join(dir, "acp-server.log"),
       `${new Date().toISOString()} pid=${process.pid} ${stage}${extra ? " " + JSON.stringify(extra) : ""}\n`
@@ -1231,6 +1243,12 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   };
 
   try {
+    // PLUG-281: >~100KB prompts hang execCommand('insertText') in the driver
+    // and used to surface as model-unavailable — fail fast BEFORE any
+    // lease/park, but inside try so the client gets a -32000, not a dead
+    // server (throw above try → void runPrompt() → unhandled rejection).
+    const earlyTooLarge = promptTooLargeError(text);
+    if (earlyTooLarge) throw earlyTooLarge;
     slog("prompt:enqueue", { sessionId, chars: text.length, model: s.model });
     const result = await enqueue(async () => {
       if (s.cancelled) return { cancelled: true };
@@ -1250,13 +1268,13 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           },
         };
         const fakeAttempt = (async () => {
-          const chunkText = "FAKE_ARGON_ECHO: " + text.slice(0, 80);
+          const chunkText = "FAKE_WEB_GEMINI_ECHO: " + text.slice(0, 80);
           upd({
             sessionUpdate: "agent_message_chunk",
             text: chunkText,
             content: { type: "text", text: chunkText },
           });
-          const delayMs = Number(process.env.ARGON_FAKE_DELAY_MS) || 0;
+          const delayMs = Number(process.env.WEB_GEMINI_FAKE_DELAY_MS || process.env.ARGON_FAKE_DELAY_MS) || 0;
           if (delayMs > 0) {
             const start = Date.now();
             while (Date.now() - start < delayMs) {
@@ -1301,8 +1319,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             spillDir: UPLOADS_DIR,
             spillId: sessionId,
           });
-      // Spill-пакет идёт сверх ARGON_MAX_UPLOAD_COUNT и без проверки
-      // ARGON_MAX_UPLOAD_BYTES: это наш сгенерированный .md с материалами
+      // Spill-пакет идёт сверх WEB_GEMINI_MAX_UPLOAD_COUNT и без проверки
+      // WEB_GEMINI_MAX_UPLOAD_BYTES: это наш сгенерированный .md с материалами
       // задачи, его доставка обязательна; лимиты выше — про пользовательские
       // пути на валидации collectUploadFiles.
       if (packed.spilledFile) uploadFiles.push(packed.spilledFile);
@@ -1528,7 +1546,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             error: err && err.message ? String(err.message).slice(0, 300) : String(err),
             code: err && err.code,
           });
-          if (err && err.code === "ARGON_CANCELLED") {
+          if (err && (err.code === "WEB_GEMINI_CANCELLED" || err.code === "ARGON_CANCELLED")) {
             await releaseLease(backend.id);
             activeBackendId = null;
             activeAbort = null;
@@ -1538,7 +1556,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           }
           // PLUG-281: oversized prompt is the caller's error, not the
           // account's — release the lease, never probe/rotate/cool down.
-          if (err && err.code === "ARGON_PROMPT_TOO_LARGE") {
+          if (err && (err.code === "WEB_GEMINI_PROMPT_TOO_LARGE" || err.code === "ARGON_PROMPT_TOO_LARGE")) {
             await releaseLease(backend.id);
             activeBackendId = null;
             activeAbort = null;
@@ -1598,7 +1616,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
     if (s.activeGen === gen) s.activeGen = null;
     if (!isExiting) {
       // PLUG-281: caller-side refusal — report verbatim, no driver framing.
-      if (err && err.code === "ARGON_PROMPT_TOO_LARGE") {
+      if (err && (err.code === "WEB_GEMINI_PROMPT_TOO_LARGE" || err.code === "ARGON_PROMPT_TOO_LARGE")) {
         out({ jsonrpc: "2.0", id, error: { code: -32000, message: err.message } });
       } else {
         const hint = FAKE ? null : (err.authHint ?? (s.backend ? await probeAuthHint(s.backend) : null));
@@ -1660,7 +1678,7 @@ export function dispatch(msg) {
         id: msg.id,
         result: {
           protocolVersion: p.protocolVersion ?? 1,
-          agentInfo: { name: "argon-gemini", version: "0.2.0" },
+          agentInfo: { name: "web-gemini", version: "0.2.0" },
           agentCapabilities: {
             loadSession: false,
             promptCapabilities: { image: false, audio: false, embeddedContext: true },
@@ -1672,7 +1690,8 @@ export function dispatch(msg) {
       return;
 
     case "session/new": {
-      const sessionId = `argon-${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
+      const uniq = `${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
+      const sessionId = `web-gemini-${uniq}`;
       const s = {
         id: sessionId,
         cwd: p.cwd || null,
@@ -1684,6 +1703,7 @@ export function dispatch(msg) {
         backend: null,
       };
       sessions.set(sessionId, s);
+      sessions.set(`argon-${uniq}`, s);
       out({
         jsonrpc: "2.0",
         id: msg.id,
@@ -1701,7 +1721,7 @@ export function dispatch(msg) {
     }
 
     case "session/load": {
-      const sessionId = p.sessionId || `argon-${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
+      const sessionId = p.sessionId || `web-gemini-${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
       let s = sessions.get(sessionId);
       if (!s) {
         s = {
@@ -1715,6 +1735,9 @@ export function dispatch(msg) {
           backend: null,
         };
         sessions.set(sessionId, s);
+        if (!p.sessionId) {
+          sessions.set(`argon-${sessionId.slice("web-gemini-".length)}`, s);
+        }
       }
       out({
         jsonrpc: "2.0",

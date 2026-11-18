@@ -18,7 +18,15 @@ if (!label || !port) {
   console.error("usage: node scripts/pool-add.mjs <label> <cdp-port> [priority] [email] [tier]");
   process.exit(2);
 }
-const STATE_DIR = process.env.ARGON_STATE_DIR || join(homedir(), ".bb", "plugins", "provider-argon");
+function resolveDefaultStateDir() {
+  const geminiDir = join(homedir(), ".bb", "plugins", "provider-web-gemini");
+  const argonDir = join(homedir(), ".bb", "plugins", "provider-argon");
+  if (fs.existsSync(geminiDir)) return geminiDir;
+  if (fs.existsSync(argonDir)) return argonDir;
+  return geminiDir;
+}
+
+const STATE_DIR = process.env.WEB_GEMINI_STATE_DIR || process.env.ARGON_STATE_DIR || resolveDefaultStateDir();
 const dir = join(STATE_DIR, "accounts", label);
 fs.mkdirSync(dir, { recursive: true });
 const backend = { profile: label, cdp: String(port) };
@@ -29,7 +37,7 @@ fs.writeFileSync(join(dir, "backend.json"), JSON.stringify(backend, null, 2) + "
 console.log(`pool entry: ${dir}/backend.json ->`, JSON.stringify(backend));
 
 // Also update pool.json for §3.1 compliance
-const POOL_FILE = process.env.ARGON_POOL_FILE || join(STATE_DIR, "pool.json");
+const POOL_FILE = process.env.WEB_GEMINI_POOL_FILE || process.env.ARGON_POOL_FILE || join(STATE_DIR, "pool.json");
 try {
   let pool = { accounts: [] };
   if (fs.existsSync(POOL_FILE)) {
