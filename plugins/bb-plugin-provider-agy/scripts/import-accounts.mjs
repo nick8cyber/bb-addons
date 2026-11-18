@@ -12,17 +12,38 @@
  *   --file <path> --label <label>    one token file (agy format, or any
  *                                    JSON with a refresh_token field)
  *
+ * Install binding (provider-agy-installs §4.3):
+ *   --install <name>                 bind every imported account to the
+ *                                    registry install <name> ("default"
+ *                                    or the registry's default name leave
+ *                                    no field — the main install)
+ *   --rebind --label <l> --install <n>
+ *                                    re-point an existing account at the
+ *                                    install <n>; affects future launches
+ *                                    only, never running sessions
+ *
  * Labels default to the account email (cliproxy/opencode) or the file stem.
  * An existing account home is left untouched unless --overwrite is given.
  * After importing, drop a `proxy` file into accounts/<label>/ (one proxy
  * URL) to give that account its own egress IP.
  *
  * Usage: node scripts/import-accounts.mjs [--opencode | --cliproxy [dir] |
- *         --file <path> --label <label>] [--overwrite] [--data-dir <dir>]
+ *         --file <path> --label <label>] [--install <name>] [--overwrite]
+ *         [--data-dir <dir>]
+ *        node scripts/import-accounts.mjs --rebind --label <l> --install <n>
+ *         [--data-dir <dir>]
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import {
+  accountsStatePath,
+  isSatellite,
+  readAccountsState,
+  readInstallsRegistry,
+  resolveInstallArg,
+  writeJsonAtomic,
+} from "./install-lib.mjs";
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(name);
@@ -35,6 +56,74 @@ const dataDir =
   value("--data-dir") ??
   join(homedir(), ".bb", "plugins", "provider-agy", "bridge-data");
 const overwrite = flag("--overwrite");
+const installArg = value("--install");
+const rebind = flag("--rebind");
+
+const fail = (message) => {
+  console.error(`import-accounts: ${message}`);
+  process.exit(1);
+};
+
+// §4.3: imports and rebinds touch the shared accounts-state.json — that is
+// owner-only; on a satellite the keeper sync would wipe the binding.
+if (isSatellite(dataDir)) {
+  fail(
+    `this host is a pool satellite (${join(dataDir, "pool-satellite")} exists); ` +
+      `run the import on the pool owner — a local binding would be wiped by the keeper sync`,
+  );
+}
+
+const registry = readInstallsRegistry(dataDir);
+if (registry.state === "broken") {
+  fail(`installs registry is invalid: ${registry.reason}`);
+}
+const binding = resolveInstallArg(registry, installArg);
+if (!binding.ok) {
+  fail(binding.reason);
+}
+
+const statePath = accountsStatePath(dataDir);
+const writeBinding = (label, field) => {
+  const state = readAccountsState(dataDir);
+  if (!Object.hasOwn(state.accounts, label)) {
+    state.accounts[label] = {};
+  }
+  if (field === null) {
+    delete state.accounts[label].install;
+  } else {
+    state.accounts[label].install = field;
+  }
+  writeJsonAtomic(statePath, state);
+};
+
+// §4.3 rebind: atomic temp+rename rewrite of the shared file; "default"
+// removes the property. New launches only — running sessions keep the
+// binary they started on.
+if (rebind) {
+  const label = value("--label");
+  if (typeof label !== "string" || label.length === 0) {
+    fail("--rebind requires --label <label>");
+  }
+  if (installArg === undefined) {
+    fail("--rebind requires --install <name>");
+  }
+  const state = readAccountsState(dataDir);
+  if (
+    !Object.hasOwn(state.accounts, label) &&
+    !existsSync(join(dataDir, "accounts", label))
+  ) {
+    fail(`label ${label} is not a pool account`);
+  }
+  writeBinding(label, binding.field);
+  const onDisk = readAccountsState(dataDir).accounts[label]?.install;
+  const recorded = onDisk ?? "default";
+  if ((onDisk ?? null) !== binding.field) {
+    fail(`rebind did not survive the write to accounts-state.json (read back ${JSON.stringify(onDisk)})`);
+  }
+  console.log(`OK   ${label} -> install ${installArg} (recorded: ${recorded})`);
+  console.log("running sessions keep their current binary; the next launch uses the new install");
+  process.exit(0);
+}
 
 function refreshTokenOf(record) {
   if (typeof record === "string") {
@@ -45,8 +134,9 @@ function refreshTokenOf(record) {
 }
 
 /** The agy credential shape; the access token is left stale on purpose —
- * agy refreshes it from the refresh token on first use. */
-function writeAccountHome(label, refreshToken) {
+ * agy refreshes it from the refresh token on first use. `home` is the
+ * staging dir when a binding must land before the account is visible. */
+function writeAccountHome(label, refreshToken, home = null) {
   if (
     !/^[A-Za-z0-9._@+-]+$/u.test(label) ||
     label === "." ||
@@ -54,7 +144,7 @@ function writeAccountHome(label, refreshToken) {
   ) {
     throw new Error(`unsafe account label: ${label}`);
   }
-  const cliDir = join(dataDir, "accounts", label, ".gemini", "antigravity-cli");
+  const cliDir = join(home ?? join(dataDir, "accounts", label), ".gemini", "antigravity-cli");
   mkdirSync(cliDir, { recursive: true });
   const token = {
     auth_method: "consumer",
@@ -104,6 +194,49 @@ if (flag("--opencode")) {
   process.exit(1);
 }
 
+/**
+ * §4.3 staged import for a bound account: token files land in a staging
+ * dir outside accounts/, the binding is written atomically, the rename
+ * makes the account visible, and the binding is re-verified from disk —
+ * rewritten up to 3 times when a concurrent save wipes it, then rolled
+ * back (a bound account left unbound would run the wrong binary).
+ */
+function importBoundAccount(label, refreshToken) {
+  const stagingDir = join(dataDir, `.import-${label}`);
+  const accountDir = join(dataDir, "accounts", label);
+  rmSync(stagingDir, { recursive: true, force: true });
+  try {
+    writeAccountHome(label, refreshToken, stagingDir);
+    writeBinding(label, binding.field);
+    if (readAccountsState(dataDir).accounts[label]?.install !== binding.field) {
+      rmSync(stagingDir, { recursive: true, force: true });
+      return "binding write did not survive (pre-rename)";
+    }
+    if (existsSync(accountDir)) {
+      rmSync(accountDir, { recursive: true, force: true });
+    }
+    renameSync(stagingDir, accountDir);
+    let bound = readAccountsState(dataDir).accounts[label]?.install === binding.field;
+    for (let attempt = 0; !bound && attempt < 3; attempt += 1) {
+      writeBinding(label, binding.field);
+      bound = readAccountsState(dataDir).accounts[label]?.install === binding.field;
+    }
+    if (!bound) {
+      rmSync(accountDir, { recursive: true, force: true });
+      const state = readAccountsState(dataDir);
+      delete state.accounts[label];
+      try {
+        writeJsonAtomic(statePath, state);
+      } catch {}
+      return "binding lost to concurrent accounts-state.json writes; account rolled back";
+    }
+    return null;
+  } catch (e) {
+    rmSync(stagingDir, { recursive: true, force: true });
+    return e.message;
+  }
+}
+
 let done = 0;
 for (const [label, refreshToken, proxy] of jobs) {
   if (!refreshToken) {
@@ -126,11 +259,19 @@ for (const [label, refreshToken, proxy] of jobs) {
       }
       continue;
     }
-    writeAccountHome(label, refreshToken);
+    if (binding.field !== null) {
+      const error = importBoundAccount(label, refreshToken);
+      if (error !== null) {
+        console.log(`FAIL ${label}: ${error}`);
+        continue;
+      }
+    } else {
+      writeAccountHome(label, refreshToken);
+    }
     if (proxy) {
       writeFileSync(join(dataDir, "accounts", label, "proxy"), `${proxy.trim()}\n`, { encoding: "utf8", mode: 0o600 });
     }
-    console.log(`OK   ${label} -> accounts/${label}`);
+    console.log(`OK   ${label} -> accounts/${label}${binding.field !== null ? ` (install=${binding.field})` : ""}`);
     done += 1;
   } catch (e) {
     console.log(`FAIL ${label}: ${e.message}`);

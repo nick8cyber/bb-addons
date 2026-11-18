@@ -107,12 +107,106 @@ import {
   type TokenBreakdown,
 } from "./recovery.js";
 import { parseAgyModelsOutput, resolveAgyCommand } from "./agy-cli.js";
+import {
+  INSTALL_NAME_RE,
+  installsRegistry,
+  registryLogLine,
+  resolveInstall,
+  type InstallResolution,
+} from "./installs.js";
 
 type JsonRpcId = string | number;
 interface ProviderBridgeContext {
   pluginId: string;
   dataDir: string;
   tempDir: string;
+}
+
+// ---------------------------------------------------------------------------
+// Parallel installs (provider-agy-installs): the registry at
+// <dataDir>/agy-installs.json binds each account's `install` field to a
+// binary — strictly, no substitution (§5).
+// ---------------------------------------------------------------------------
+
+/** One locally-unavailable warning per account per 5 minutes (§5 п.2). */
+const installUnavailableLoggedAt = new Map<string, number>();
+
+function noteInstallUnavailable(label: string, reason: string): void {
+  const now = Date.now();
+  if (now - (installUnavailableLoggedAt.get(label) ?? 0) < 5 * 60_000) {
+    return;
+  }
+  installUnavailableLoggedAt.set(label, now);
+  log(`account ${label} install unavailable on this host: ${reason}`);
+}
+
+/**
+ * The §5 п.2 availability gate for pickAccount and the catalog paths: an
+ * account whose install cannot run here is out, exactly like a parked one.
+ * With no registry and no bindings this predicate costs one stat and
+ * always passes — the no-registry path stays byte-identical.
+ */
+function locallyAvailable(ledger: AccountsLedger, label: string): boolean {
+  if (dataDir === "") {
+    return true;
+  }
+  const entry = Object.hasOwn(ledger.accounts, label)
+    ? ledger.accounts[label]
+    : undefined;
+  const resolution = resolveInstall(dataDir, entry?.install);
+  if (
+    resolution.kind === "unavailable" ||
+    resolution.kind === "broken"
+  ) {
+    noteInstallUnavailable(label, resolution.reason);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * The install a session's binary comes from. `undefined` install means the
+ * registry default (or the implicit resolveAgyCommand without a registry).
+ */
+function sessionInstall(session: WSession): InstallResolution {
+  if (dataDir === "") {
+    return { kind: "legacy" };
+  }
+  const install =
+    session.accountLabel !== null
+      ? (() => {
+          const accounts = loadLedger(dataDir).accounts;
+          return Object.hasOwn(accounts, session.accountLabel as string)
+            ? accounts[session.accountLabel as string]?.install
+            : undefined;
+        })()
+      : undefined;
+  return resolveInstall(dataDir, install);
+}
+
+/**
+ * The install name a journal line names (§9 п.2): the account's binding
+ * when it is a valid name, else the registry default — or null outside
+ * registry mode, where lines keep their old shape byte-for-byte.
+ */
+function installNameFor(label: string | null): string | null {
+  if (dataDir === "") {
+    return null;
+  }
+  const state = installsRegistry(dataDir);
+  if (state.kind !== "ok") {
+    return null;
+  }
+  if (label !== null) {
+    const accounts = loadLedger(dataDir).accounts;
+    const raw = Object.hasOwn(accounts, label)
+      ? accounts[label]?.install
+      : undefined;
+    if (typeof raw === "string" && INSTALL_NAME_RE.test(raw)) {
+      return raw;
+    }
+  }
+  return state.registry.default;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,8 +378,23 @@ function completeShimLaunchEnv(message: Record<string, unknown>): void {
   if (session !== undefined && Object.keys(session.launchEnv).length > 0) {
     rec.env = { ...env, ...session.launchEnv };
   } else {
+    // §6 п.2 (provider-agy-installs): the defensive fill answers the
+    // binary the thread's account is bound to — for a known account with
+    // an unavailable install that is "" (an honest launch failure), never
+    // a silent default substitution.
+    const realBin =
+      session === undefined || dataDir === ""
+        ? resolveAgyCommand(process.env)
+        : (() => {
+            const r = sessionInstall(session);
+            return r.kind === "bin"
+              ? r.bin
+              : r.kind === "legacy"
+                ? resolveAgyCommand(process.env)
+                : "";
+          })();
     const fill: Record<string, string> = {
-      AGY_SHIM_REAL_BIN: resolveAgyCommand(process.env),
+      AGY_SHIM_REAL_BIN: realBin,
       AGY_SHIM_EVENTS: dataDir !== "" ? eventsFilePath() : "",
       AGY_SHIM_CONTROL: "",
       AGY_SHIM_THREAD_ID:
@@ -1421,10 +1530,13 @@ function shimRuntimeEnv(): Record<string, string> {
   return process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {};
 }
 
-function shimEnvFor(session: WSession): Record<string, string> {
+function shimEnvFor(
+  session: WSession,
+  realBin: string,
+): Record<string, string> {
   return {
     ...shimRuntimeEnv(),
-    AGY_SHIM_REAL_BIN: resolveAgyCommand(process.env),
+    AGY_SHIM_REAL_BIN: realBin,
     AGY_SHIM_EVENTS: eventsFilePath(),
     AGY_SHIM_CONTROL: session.controlFile,
     AGY_SHIM_THREAD_ID: session.threadId,
@@ -1569,7 +1681,14 @@ function deepMergeSettings(
   return out;
 }
 
-function buildLaunch(session: WSession): void {
+/**
+ * Build this session's launch spec. Returns null on success; on a locally
+ * unavailable install (or a broken registry) returns the §5 п.2 reason
+ * instead of a spec — the caller answers honestly and no binary launches.
+ * The spawn still re-checks the file at exec time: a registry edit between
+ * pick and launch loses to the same strict check here.
+ */
+function buildLaunch(session: WSession): string | null {
   session.nonce = randomUUID().replaceAll("-", "").slice(0, 12);
   session.controlFile = join(
     shimDir(),
@@ -1581,7 +1700,24 @@ function buildLaunch(session: WSession): void {
   try {
     appendFileSync(session.controlFile, "");
   } catch {}
-  const env = shimEnvFor(session);
+  const resolution = sessionInstall(session);
+  if (
+    resolution.kind === "unavailable" ||
+    resolution.kind === "broken"
+  ) {
+    return resolution.reason;
+  }
+  const realBin =
+    resolution.kind === "bin"
+      ? resolution.bin
+      : resolveAgyCommand(process.env);
+  // §8: the install's env rides as the first layer — the account's proxy
+  // and the relay's api keys still override it below, and the schema
+  // forbids install env from carrying any of those keys anyway.
+  const env = {
+    ...(resolution.kind === "bin" ? resolution.env : {}),
+    ...shimEnvFor(session, realBin),
+  };
   const subagentsOn = subagentsEnabledFor(session);
   env.AGY_DISABLE_SUBAGENTS = subagentsOn ? "0" : "1";
   const memoryOn = memoryEnabledFor(session);
@@ -1646,6 +1782,7 @@ function buildLaunch(session: WSession): void {
       },
     },
   };
+  return null;
 }
 
 /** providerOptions payload the bridge sees for this session right now. */
@@ -1739,18 +1876,43 @@ function rewriteOptions(
   };
 }
 
-/** The launch env for `agy models` / cold ACP probes: first pooled account. */
+/**
+ * The launch env for `agy models` / cold ACP probes: first pooled account.
+ * `bin` is the picked account's install binary (null when the only usable
+ * resolution is blocked — §5 п.2), `blockReason` its log text.
+ */
 function maintenanceEnvAndArgs(): {
   env: Record<string, string>;
   args: string[];
   home: string | null;
+  bin: string | null;
+  blockReason: string | null;
 } {
   const env: Record<string, string> = {};
   const args: string[] = [];
   if (dataDir !== "" && accountsEnabled(process.env)) {
     const ledger = loadLedger(dataDir);
-    const account = pickAccount(ledger, listAccounts(dataDir));
+    const account = pickAccount(ledger, listAccounts(dataDir), null, {
+      locallyAvailable: (label) => locallyAvailable(ledger, label),
+    });
     if (account !== null) {
+      // The pick passed the §5 gate, so a non-bin resolution here is only
+      // the registry/bin racing the pick — still answered honestly.
+      const resolution = resolveInstall(
+        dataDir,
+        ledger.accounts[account.label]?.install,
+      );
+      if (
+        resolution.kind === "unavailable" ||
+        resolution.kind === "broken"
+      ) {
+        return { env, args, home: null, bin: null, blockReason: resolution.reason };
+      }
+      if (resolution.kind === "bin") {
+        for (const [key, value] of Object.entries(resolution.env)) {
+          env[key] = value;
+        }
+      }
       args.push("--gemini-dir", join(account.home, ".gemini"));
       if (account.proxy !== null) {
         env.HTTPS_PROXY = account.proxy;
@@ -1758,21 +1920,76 @@ function maintenanceEnvAndArgs(): {
         env.HTTP_PROXY = account.proxy;
         env.http_proxy = account.proxy;
       }
-      return { env, args, home: account.home };
+      return {
+        env,
+        args,
+        home: account.home,
+        bin:
+          resolution.kind === "bin"
+            ? resolution.bin
+            : resolveAgyCommand(process.env),
+        blockReason: null,
+      };
     }
   }
   if (dataDir !== "") {
     const relay = resolveCliproxyRelay(dataDir);
     if (relay !== null) {
+      const resolution = resolveInstall(dataDir, undefined);
+      if (
+        resolution.kind === "unavailable" ||
+        resolution.kind === "broken"
+      ) {
+        return { env, args, home: null, bin: null, blockReason: resolution.reason };
+      }
+      if (resolution.kind === "bin") {
+        for (const [key, value] of Object.entries(resolution.env)) {
+          env[key] = value;
+        }
+      }
       args.push("--gemini-dir", join(relay.home, ".gemini"));
       env.GEMINI_API_KEY = relay.apiKey;
       env.GOOGLE_GEMINI_BASE_URL = relay.baseUrl;
       // The relay home holds the Gemini-API settings flip — without it
       // `agy models` would run on the user's real Antigravity account.
-      return { env, args, home: relay.home };
+      return {
+        env,
+        args,
+        home: relay.home,
+        bin:
+          resolution.kind === "bin"
+            ? resolution.bin
+            : resolveAgyCommand(process.env),
+        blockReason: null,
+      };
+    }
+    const resolution = resolveInstall(dataDir, undefined);
+    if (
+      resolution.kind === "unavailable" ||
+      resolution.kind === "broken"
+    ) {
+      return { env, args, home: null, bin: null, blockReason: resolution.reason };
+    }
+    if (resolution.kind === "bin") {
+      for (const [key, value] of Object.entries(resolution.env)) {
+        env[key] = value;
+      }
+      return {
+        env,
+        args,
+        home: null,
+        bin: resolution.bin,
+        blockReason: null,
+      };
     }
   }
-  return { env, args, home: null };
+  return {
+    env,
+    args,
+    home: null,
+    bin: resolveAgyCommand(process.env),
+    blockReason: null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1859,11 +2076,16 @@ function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
   return new Promise((resolve) => {
     // §2.3 п.1 (ревизия 13.2): `agy models` takes no --gemini-dir — the
     // account is addressed through HOME, like the per-account probes.
-    const { env, home } = maintenanceEnvAndArgs();
+    const { env, home, bin, blockReason } = maintenanceEnvAndArgs();
+    if (bin === null) {
+      log(`models query skipped: ${blockReason ?? "install unavailable"}`);
+      resolve([]);
+      return;
+    }
     let child;
     try {
       child = spawn(
-        resolveAgyCommand(process.env),
+        bin,
         ["models"],
         {
           env: {
@@ -1918,7 +2140,12 @@ function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
  */
 function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]> {
   return new Promise((resolve) => {
-    const { env, args } = maintenanceEnvAndArgs();
+    const { env, args, bin, blockReason } = maintenanceEnvAndArgs();
+    if (bin === null) {
+      log(`acp models query skipped: ${blockReason ?? "install unavailable"}`);
+      resolve([]);
+      return;
+    }
     let child;
     try {
       child = spawn(process.execPath, [materializeShim(), "acp", ...args], {
@@ -1926,7 +2153,7 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
           ...process.env,
           ...env,
           ...shimRuntimeEnv(),
-          AGY_SHIM_REAL_BIN: resolveAgyCommand(process.env),
+          AGY_SHIM_REAL_BIN: bin,
           AGY_SHIM_EVENTS: eventsFilePath(),
           AGY_SHIM_CONTROL: join(shimDir(), "ctl-models.ndjson"),
           AGY_SHIM_THREAD_ID: "__models__",
@@ -2053,6 +2280,10 @@ function accountModelCatalog(): AccountModelCatalog {
     if (entry?.parkedReason !== undefined) {
       continue;
     }
+    // §5 п.3: an account whose install cannot run here is never probed.
+    if (!locallyAvailable(ledger, account.label)) {
+      continue;
+    }
     if ((entry?.cooldownUntilMs ?? 0) - now > ACCOUNT_MODELS_TTL_MS) {
       continue;
     }
@@ -2113,16 +2344,38 @@ function probeStderrTail(stderr: string): string {
 
 function runModelProbe(account: AccountHome, done: () => void): void {
   modelProbeLastAtMs.set(account.label, Date.now());
+  // §6 п.6: the probe runs the account's own install binary — never the
+  // default's — and an unavailable install does not spawn at all (§5 п.3).
+  const resolution =
+    dataDir !== ""
+      ? resolveInstall(
+          dataDir,
+          loadLedger(dataDir).accounts[account.label]?.install,
+        )
+      : ({ kind: "legacy" } as InstallResolution);
+  if (
+    resolution.kind === "unavailable" ||
+    resolution.kind === "broken"
+  ) {
+    noteInstallUnavailable(account.label, resolution.reason);
+    done();
+    return;
+  }
+  const bin =
+    resolution.kind === "bin"
+      ? resolution.bin
+      : resolveAgyCommand(process.env);
   let child: ChildProcess;
   try {
     // §2.3 п.1 (ревизия 13.2): --gemini-dir exists only on `agy acp`;
     // `agy models` is addressed through the account's HOME (plus its proxy).
     child = spawn(
-      resolveAgyCommand(process.env),
+      bin,
       ["models"],
       {
         env: {
           ...process.env,
+          ...(resolution.kind === "bin" ? resolution.env : {}),
           HOME: account.home,
           ...(account.proxy !== null
             ? {
@@ -2220,6 +2473,9 @@ function maybeProbeCatalog(label: string): void {
   if (ledger.accounts[label]?.parkedReason !== undefined) {
     return;
   }
+  if (!locallyAvailable(ledger, label)) {
+    return;
+  }
   const account = accountByLabel(listAccounts(dataDir), label);
   if (account !== null) {
     queueModelProbe(account);
@@ -2247,6 +2503,9 @@ function coldStartNeedsProbes(family: string): boolean {
       continue;
     }
     if (entry?.parkedReason !== undefined) {
+      continue;
+    }
+    if (!locallyAvailable(ledger, account.label)) {
       continue;
     }
     if ((entry?.cooldownUntilMs ?? 0) - now > ACCOUNT_MODELS_TTL_MS) {
@@ -2294,7 +2553,8 @@ async function mergedAccountCatalog(): Promise<
     .filter(
       (a) =>
         accountPriority(ledger.accounts[a.label]) > 0 &&
-        ledger.accounts[a.label]?.parkedReason === undefined,
+        ledger.accounts[a.label]?.parkedReason === undefined &&
+        locallyAvailable(ledger, a.label),
     )
     .sort((a, b) => a.label.localeCompare(b.label));
   const seen = new Set<string>();
@@ -2332,6 +2592,7 @@ function poolOffersModel(
     (a) =>
       accountPriority(ledger.accounts[a.label]) > 0 &&
       ledger.accounts[a.label]?.parkedReason === undefined &&
+      locallyAvailable(ledger, a.label) &&
       accountModelState(
         Object.hasOwn(catalog, a.label) ? catalog[a.label] : undefined,
         family,
@@ -2582,6 +2843,7 @@ function freeSibling(
   const candidate = pickAccount(ledger, accounts, exclude, {
     family: session.model ?? null,
     models: accountModelCatalog(),
+    locallyAvailable: (label) => locallyAvailable(ledger, label),
   });
   if (candidate === null) {
     return { account: null };
@@ -2744,7 +3006,8 @@ function nearestCooldownEnd(session: WSession): number | null {
     .filter(
       (a) =>
         accountPriority(ledger.accounts[a.label]) > 0 &&
-        ledger.accounts[a.label]?.parkedReason === undefined,
+        ledger.accounts[a.label]?.parkedReason === undefined &&
+        locallyAvailable(ledger, a.label),
     )
     .filter(
       (a) =>
@@ -2906,11 +3169,23 @@ function startRotation(
     markAccountUse(ledger, account.label);
     saveLedger(dataDir, ledger);
   }
-  buildLaunch(session);
+  const launchError = buildLaunch(session);
   // §2.3 п.12: every move is journaled — thread, from → to, reason.
+  const moveInstall = installNameFor(account.label);
   log(
-    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (${cause})`,
+    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (${cause}${moveInstall !== null ? `, install=${moveInstall}` : ""})`,
   );
+  if (launchError !== null) {
+    // The sibling's install went unavailable between pick and launch:
+    // §5 п.2 forbids the substitute binary — drop this sibling and let
+    // the automaton pick the next candidate (locallyAvailable already
+    // excludes it, so the retry cannot loop on the same account).
+    log(
+      `thread ${session.threadId}: sibling ${account.label} cannot launch: ${launchError}`,
+    );
+    startRotation(session, cause, message);
+    return;
+  }
   void synthThreadStart(session).then(({ ok, error }) => {
     if (ok) {
       // Only now is the generic bridge's session registered — inject the
@@ -3749,6 +4024,7 @@ function poolPickAccount(
   const picked = pickAccount(ledger, accounts, null, {
     family: session.model ?? null,
     models: catalog,
+    locallyAvailable: (label) => locallyAvailable(ledger, label),
   });
   session.accountLabel = picked?.label ?? null;
   if (picked === null) {
@@ -3779,8 +4055,9 @@ function poolPickAccount(
   }
   markAccountUse(ledger, picked.label);
   saveLedger(dataDir, ledger);
+  const pinnedInstall = installNameFor(picked.label);
   log(
-    `thread ${session.threadId}: pinned to account ${picked.label} (model ${session.model ?? "default"}, proxy ${picked.proxy !== null ? "yes" : "no"})`,
+    `thread ${session.threadId}: pinned to account ${picked.label} (model ${session.model ?? "default"}, proxy ${picked.proxy !== null ? "yes" : "no"}${pinnedInstall !== null ? `, install=${pinnedInstall}` : ""})`,
   );
   return "picked";
 }
@@ -3799,14 +4076,43 @@ function resumeOnSibling(
 ): void {
   session.needsHandoff = true;
   session.rotating = true; // hold daemon turns until the sibling is up
+  const siblingInstall = installNameFor(account.label);
   log(
-    `thread ${session.threadId}: move ${session.accountLabel ?? "none"} → ${account.label} (resume on sibling)`,
+    `thread ${session.threadId}: move ${session.accountLabel ?? "none"} → ${account.label} (resume on sibling${siblingInstall !== null ? `, install=${siblingInstall}` : ""})`,
   );
   session.accountLabel = account.label;
   const ledger = loadLedger(dataDir);
   markAccountUse(ledger, account.label);
   saveLedger(dataDir, ledger);
-  buildLaunch(session);
+  const launchError = buildLaunch(session);
+  if (launchError !== null) {
+    // §5 п.2: the sibling's install cannot run here — no substitution.
+    // Move on to the next free sibling; the failed one is out of
+    // locallyAvailable, so the search cannot loop back to it.
+    log(
+      `thread ${session.threadId}: resume sibling ${account.label} cannot launch: ${launchError}`,
+    );
+    const { account: next } = freeSibling(session, account.label);
+    if (next === null) {
+      session.rotating = false;
+      session.needsHandoff = false;
+      sendError(
+        id,
+        -32000,
+        `agy could not start on the resume sibling: ${launchError}`,
+      );
+      return;
+    }
+    resumeOnSibling(
+      session,
+      id,
+      providerThreadId,
+      next,
+      `resumed conversation ${providerThreadId} belongs to an account whose install is unavailable (${launchError}); ` +
+        `resumed on free sibling ${next.label} instead, so the conversation context does not carry over`,
+    );
+    return;
+  }
   const startParams = {
     ...session.baseParams,
     threadId: session.threadId,
@@ -3977,10 +4283,25 @@ function retryDaemonSession(
     const ledger = loadLedger(dataDir);
     markAccountUse(ledger, account.label);
     saveLedger(dataDir, ledger);
-    buildLaunch(session);
+    const launchError = buildLaunch(session);
+    const refusalInstall = installNameFor(account.label);
     log(
-      `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (model refusal)`,
+      `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (model refusal${refusalInstall !== null ? `, install=${refusalInstall}` : ""})`,
     );
+    if (launchError !== null) {
+      // §5 п.2: this sibling cannot launch — no substitute binary. The
+      // spent-move marker belongs to a move that never ran, so release it
+      // and let retry pick the next fresh supporter (the failed account
+      // is already out of locallyAvailable).
+      log(
+        `thread ${session.threadId}: sibling ${account.label} cannot launch: ${launchError}`,
+      );
+      if (family !== undefined) {
+        session.modelRefusalMoved.delete(family);
+      }
+      retry();
+      return;
+    }
     const params = {
       ...pending.params,
       options: rewriteOptions(session, { ...session.baseOptions }),
@@ -4032,7 +4353,7 @@ function retryDaemonSessionParked(
       ? `account ${owner ?? "?"} needs Google account verification`
       : `account ${owner ?? "?"} was disabled by Google (Terms of Service)`;
   coolSessionAccount(session, cause, honest);
-  const { account } = freeSibling(session, owner);
+  let { account } = freeSibling(session, owner);
   if (account === null) {
     sendError(id, -32000, honest);
     return;
@@ -4052,14 +4373,33 @@ function retryDaemonSessionParked(
     return;
   }
   const movedFrom = session.accountLabel;
-  session.accountLabel = account.label;
-  const ledger = loadLedger(dataDir);
-  markAccountUse(ledger, account.label);
-  saveLedger(dataDir, ledger);
-  buildLaunch(session);
-  log(
-    `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (${cause})`,
-  );
+  for (;;) {
+    session.accountLabel = account.label;
+    const ledger = loadLedger(dataDir);
+    markAccountUse(ledger, account.label);
+    saveLedger(dataDir, ledger);
+    const launchError = buildLaunch(session);
+    const parkedMoveInstall = installNameFor(account.label);
+    log(
+      `thread ${session.threadId}: move ${movedFrom ?? "none"} → ${account.label} (${cause}${parkedMoveInstall !== null ? `, install=${parkedMoveInstall}` : ""})`,
+    );
+    if (launchError === null) {
+      break;
+    }
+    // §5 п.2: no substitute binary — keep driving on the next free
+    // sibling; this one is already excluded by locallyAvailable, and
+    // re-parking it would write a false parkedReason, so the search here
+    // is inline rather than a recursion into the parking path.
+    log(
+      `thread ${session.threadId}: sibling ${account.label} cannot launch: ${launchError}`,
+    );
+    const { account: next } = freeSibling(session, account.label);
+    if (next === null) {
+      sendError(id, -32000, honest);
+      return;
+    }
+    account = next;
+  }
   const params = {
     ...pending.params,
     options: rewriteOptions(session, { ...session.baseOptions }),
@@ -4177,7 +4517,15 @@ function finishThreadStart(
       : "full";
   session.declaredMode = declared;
   session.agyMode = mapPermissionMode(declared).agy;
-  buildLaunch(session);
+  const launchError = buildLaunch(session);
+  if (launchError !== null) {
+    // §5 п.2: an install that cannot run answers honestly — never a
+    // silent substitute binary (a bound account, or a direct/relay
+    // session whose default install is missing).
+    sendError(id, -32000, `agy cannot launch: ${launchError}`);
+    discardSession(session);
+    return;
+  }
   params.options = rewriteOptions(session, { ...session.baseOptions });
   pendingDaemonSessions.set(id, { session, kind: "start", params });
   feedLine({ jsonrpc: "2.0", id, method: "thread/start", params });
@@ -4251,15 +4599,39 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     session.accountLabel !== null
       ? ledger.accounts[session.accountLabel]?.parkedReason
       : undefined;
+  // §5 п.2: an owner bound to an install this host cannot run is equally
+  // unfit — the sibling transform below, or an honest error naming the
+  // install and its binary path when no sibling is free.
+  const ownerInstallReason =
+    session.accountLabel !== null && dataDir !== ""
+      ? (() => {
+          const r = resolveInstall(
+            dataDir,
+            ledger.accounts[session.accountLabel as string]?.install,
+          );
+          return r.kind === "unavailable" || r.kind === "broken"
+            ? r.reason
+            : null;
+        })()
+      : null;
   if (
-    (!cooled && !ownerUnfit && ownerParkedReason === undefined) ||
+    (!cooled &&
+      !ownerUnfit &&
+      ownerParkedReason === undefined &&
+      ownerInstallReason === null) ||
     dataDir === "" ||
     !accountsEnabled(process.env)
   ) {
-    buildLaunch(session);
+    const launchError = buildLaunch(session);
+    if (launchError !== null) {
+      sendError(id, -32000, `agy cannot launch: ${launchError}`);
+      discardSession(session);
+      return;
+    }
     params.options = rewriteOptions(session, { ...session.baseOptions });
+    const resumeInstall = installNameFor(session.accountLabel);
     log(
-      `thread ${threadId}: resuming ${providerThreadId} on account ${session.accountLabel ?? "direct"}`,
+      `thread ${threadId}: resuming ${providerThreadId} on account ${session.accountLabel ?? "direct"}${resumeInstall !== null ? ` (install=${resumeInstall})` : ""}`,
     );
     pendingDaemonSessions.set(id, { session, kind: "resume", params });
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
@@ -4270,9 +4642,21 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
   // handoff prompt (spec §7 / §2.3).
   const { account } = freeSibling(session, session.accountLabel);
   log(
-    `thread ${threadId}: resume owner ${session.accountLabel} ${ownerParkedReason !== undefined ? `parked (${ownerParkedReason})` : ownerUnfit ? `does not offer ${session.model ?? "?"}` : `cools until ${new Date(untilMs).toISOString()}`}; sibling ${account?.label ?? "none"}`,
+    `thread ${threadId}: resume owner ${session.accountLabel} ${ownerParkedReason !== undefined ? `parked (${ownerParkedReason})` : ownerInstallReason !== null ? `install unavailable (${ownerInstallReason})` : ownerUnfit ? `does not offer ${session.model ?? "?"}` : `cools until ${new Date(untilMs).toISOString()}`}; sibling ${account?.label ?? "none"}`,
   );
   if (account === null) {
+    // §5 п.2: an install-bound owner with no free sibling fails with the
+    // install name and binary path — resuming it on another install's
+    // binary is the substitution the contract forbids.
+    if (ownerInstallReason !== null) {
+      sendError(
+        id,
+        -32000,
+        `account ${session.accountLabel} cannot run on this host: ${ownerInstallReason}`,
+      );
+      discardSession(session);
+      return;
+    }
     // §2.3 п.7: a parked owner is never touched — with no free sibling the
     // resume fails honestly instead of launching agy on the banned home.
     if (ownerParkedReason !== undefined) {
@@ -4292,7 +4676,12 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
       discardSession(session);
       return;
     }
-    buildLaunch(session);
+    const launchError = buildLaunch(session);
+    if (launchError !== null) {
+      sendError(id, -32000, `agy cannot launch: ${launchError}`);
+      discardSession(session);
+      return;
+    }
     params.options = rewriteOptions(session, { ...session.baseOptions });
     pendingDaemonSessions.set(id, { session, kind: "resume", params });
     feedLine({ jsonrpc: "2.0", id, method: "thread/resume", params });
@@ -4683,6 +5072,9 @@ export const experimental_providerBridge = {
     ensureStarted();
     loadModelDiskCache();
     log(`acp wrapper started (dataDir=${context.dataDir})`);
+    // §9 п.1 (provider-agy-installs): registry registration at startup —
+    // names and binary paths; version reporting waits on §13 п.1.
+    log(registryLogLine(dataDir));
     // Defense-in-depth sweep (spec §12.3): orphans of dead workers and stale
     // harness tmp roots. Best-effort — never lets a scan failure break start.
     reapOrphanShims();
