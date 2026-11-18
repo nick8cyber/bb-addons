@@ -15707,14 +15707,36 @@ function providerUsagePlugin(bb, options = {}) {
     return parked;
   };
 
+  // §6 п.4а (ревизия 3.2): ANY parkedReason means never poll — the account
+  // waits for a manual owner check, so even a force refresh stays off it.
+  const agyParkedReasons = (baseDir) => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const parked = new Map();
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(baseDir, "..", "accounts-state.json"), "utf8"));
+      for (const label of Object.keys(state.accounts ?? {})) {
+        const reason = state.accounts[label]?.parkedReason;
+        if (typeof reason === "string" && reason.length > 0) parked.set(label, reason);
+      }
+    } catch {}
+    return parked;
+  };
+
   const agyUnpolledUsage = (label) => ({
     status: "ok", accountEmail: label, planLabel: "Out of rotation", windows: []
   });
 
-  // The "Out of rotation" marker is stamped on every read, never on the
+  // The parked/rotation markers are stamped on every read, never on the
   // cached poll result: an account parked after polling still shows it.
-  const agyUsageFor = (label, parked) => {
+  const agyUsageFor = (label, parked, parkedReasons) => {
     const usage = agyAccountsCache.get(label)?.usage ?? null;
+    if (parkedReasons.has(label)) {
+      return {
+        ...(usage ?? agyUnpolledUsage(label)),
+        planLabel: `Parked: ${parkedReasons.get(label)}`
+      };
+    }
     if (!parked.has(label)) return usage;
     return { ...(usage ?? agyUnpolledUsage(label)), planLabel: "Out of rotation" };
   };
@@ -15727,9 +15749,10 @@ function providerUsagePlugin(bb, options = {}) {
       const baseDir = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
       const labels = agyAccountLabels(baseDir);
       const parked = agyOutOfRotation(baseDir);
+      const parkedReasons = agyParkedReasons(baseDir);
       return labels.map(label => ({
         label,
-        usage: agyUsageFor(label, parked)
+        usage: agyUsageFor(label, parked, parkedReasons)
       }));
     } catch {
       return [];
@@ -15872,14 +15895,16 @@ function providerUsagePlugin(bb, options = {}) {
       const statePath = path.join(home, ".bb", "plugins", "provider-agy", "bridge-data", "accounts-state.json");
       const labels = agyAccountLabels(baseDir);
       const parked = agyOutOfRotation(baseDir);
+      const parkedReasons = agyParkedReasons(baseDir);
 
       const ttl = Math.max(maxAgeMs || 0, 180000);
       const staleLabels = [];
       const missingLabels = [];
 
       for (const label of labels) {
-        // Accounts parked at priority 0 are only polled on explicit refresh.
-        if (parked.has(label)) continue;
+        // Accounts parked at priority 0 are only polled on explicit refresh;
+        // a parkedReason account is never polled at all (§6 п.4а).
+        if (parked.has(label) || parkedReasons.has(label)) continue;
         const cached = agyAccountsCache.get(label);
         if (!cached) {
           missingLabels.push(label);
@@ -15890,7 +15915,9 @@ function providerUsagePlugin(bb, options = {}) {
 
       if (force) {
         await Promise.all(
-          labels.map(label => runAgySingleAccount(baseDir, label, agyBin, statePath))
+          labels
+            .filter(label => !parkedReasons.has(label))
+            .map(label => runAgySingleAccount(baseDir, label, agyBin, statePath))
         );
       } else {
         if (missingLabels.length > 0) {
@@ -15907,7 +15934,7 @@ function providerUsagePlugin(bb, options = {}) {
 
       return labels.map(label => ({
         label,
-        usage: agyUsageFor(label, parked)
+        usage: agyUsageFor(label, parked, parkedReasons)
       }));
     } catch (e) {
       console.error("[usage-pro] agy fetch error:", e);

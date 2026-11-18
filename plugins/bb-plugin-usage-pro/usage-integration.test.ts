@@ -1404,6 +1404,76 @@ describe("PLUG-82 Usage Integration with real A and fake-host DI", () => {
     expect(h.mockSpawn).not.toHaveBeenCalled();
   });
 
+  // Spec §6 п.4а (ревизия 3.2): an account with any parkedReason is never
+  // polled — not in the background, not on stale cache, not on force. The
+  // tab shows "Parked: <reason>" with cached (or empty) windows.
+  it("Spec 6.4a: parkedReason account is never polled, even on force", async () => {
+    const baseDir = path.join(tmpUserHome, ".bb", "plugins", "provider-agy", "bridge-data", "accounts");
+    const statePath = path.join(baseDir, "..", "accounts-state.json");
+    const label = "needs-verify@example.com";
+    const parkedHome = path.join(baseDir, label);
+    for (const l of [label, "other@example.com"]) {
+      const dir = path.join(baseDir, l, ".gemini", "antigravity-cli");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "antigravity-oauth-token"), "mock-token");
+    }
+    fs.writeFileSync(statePath, JSON.stringify({ accounts: {
+      [label]: { priority: 5 },
+      "other@example.com": { priority: 1 },
+    } }));
+
+    const h = setupHarness({
+      hosts: [{ id: "host-primary", name: "Primary", status: "connected" }],
+      primaryHostId: "host-primary",
+      sources: [],
+      inventories: {},
+      providers: [{ id: "agy", displayName: "Antigravity", logoUrl: null }],
+    });
+
+    await providerUsagePlugin(h.bb, h.collectorOpts);
+    const snapPolled = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+    const polledCard = snapPolled.machines[0].providers
+      .find((p: any) => p.providerId === "agy" && p.accountLabel === label);
+    expect(polledCard.usage.planLabel).toBe("Direct");
+    expect(polledCard.usage.windows.length).toBeGreaterThan(0);
+
+    // Park the account: cached windows stay, label becomes "Parked: …",
+    // and no agy launch happens — not even on an explicit force refresh.
+    fs.writeFileSync(statePath, JSON.stringify({ accounts: {
+      [label]: { priority: 5, parkedReason: "validation-required" },
+      "other@example.com": { priority: 1 },
+    } }));
+    // Age every cached entry past the TTL: without the parkedReason skip
+    // the stale cache would respawn agy on the parked account here.
+    currentTime += 600_000;
+    h.mockSpawn.mockClear();
+    const snapParked = await h.registeredRpc.getUsage({
+      force: false, machineIds: null, providerId: null, maxAgeMs: 60000,
+    });
+    const parkedCard = snapParked.machines[0].providers
+      .find((p: any) => p.providerId === "agy" && p.accountLabel === label);
+    expect(parkedCard.usage.status).toBe("ok");
+    expect(parkedCard.usage.planLabel).toBe("Parked: validation-required");
+    expect(parkedCard.usage.windows.length).toBeGreaterThan(0);
+    expect(h.mockSpawn.mock.calls.filter(
+      (call: any) => call[2]?.env?.HOME === parkedHome)).toHaveLength(0);
+
+    h.mockSpawn.mockClear();
+    const snapForce = await h.registeredRpc.getUsage({
+      force: true, machineIds: null, providerId: null, maxAgeMs: 0,
+    });
+    expect(h.mockSpawn.mock.calls.filter(
+      (call: any) => call[2]?.env?.HOME === parkedHome)).toHaveLength(0);
+    // The rotating sibling is still refreshed on force.
+    expect(h.mockSpawn.mock.calls.some(
+      (call: any) => call[2]?.env?.HOME === path.join(baseDir, "other@example.com"))).toBe(true);
+    const parkedAfterForce = snapForce.machines[0].providers
+      .find((p: any) => p.providerId === "agy" && p.accountLabel === label);
+    expect(parkedAfterForce.usage.planLabel).toBe("Parked: validation-required");
+  });
+
   // Spec §6.4: a parked account is not spawned when its cache goes stale nor
   // when thread.idle resets every entry's loadedAt.
   it("Spec 6.4: parked account is not spawned on stale cache or thread.idle", async () => {
