@@ -98,9 +98,14 @@ function emitEvent(fields) {
   }
 }
 
+// Desktop bb runs this shim on its Electron binary with ELECTRON_RUN_AS_NODE=1
+// (spec §12.5); agy and its node children must not inherit that mode.
+const childEnv = { ...process.env };
+delete childEnv.ELECTRON_RUN_AS_NODE;
+
 const child = spawn(REAL_BIN, process.argv.slice(2), {
   stdio: ["pipe", "pipe", "inherit"],
-  env: process.env,
+  env: childEnv,
   // Own process group: shutdown kills the whole agy tree with kill(-pid)
   // instead of orphaning agy's node grandchildren on the init system
   // (incident 16.11: 432 shim orphans, 6.1 GB RSS — spec §12.2.2).

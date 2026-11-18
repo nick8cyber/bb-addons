@@ -669,8 +669,10 @@ function procComm(pid: number): string | null {
   return comm === null ? null : comm.trim();
 }
 
-/** argv[0] must be the node interpreter itself and argv[1] the shim — a
- * `vim`/`grep acp-shim.mjs` cmdline must never earn a kill (spec §12.3). */
+/** argv[0] must be the node interpreter itself (or the host's own runtime —
+ * desktop bb runs the shim on its Electron binary, spec §12.5) and argv[1]
+ * the shim — a `vim`/`grep acp-shim.mjs` cmdline must never earn a kill
+ * (spec §12.3). */
 function isAcpShimProcess(pid: number): boolean {
   let raw: Buffer;
   try {
@@ -685,7 +687,10 @@ function isAcpShimProcess(pid: number): boolean {
   if (argv.length < 2) {
     return false;
   }
-  if (!/^node(js)?$/.test(basename(argv[0]))) {
+  if (
+    !/^node(js)?$/.test(basename(argv[0])) &&
+    argv[0] !== process.execPath
+  ) {
     return false;
   }
   return basename(argv[1]) === "acp-shim.mjs";
@@ -1156,8 +1161,20 @@ function resolveModelSelection(
   return { modelId: model, reasoningLevel };
 }
 
+/**
+ * The shim is JS and runs on the host's own runtime (process.execPath). In
+ * desktop bb that is the Electron app binary, which acts as Node only with
+ * ELECTRON_RUN_AS_NODE=1 — and the SDK bridge strips that from the child env
+ * (withoutBridgeRuntimeEnv). Without it bb.app boots as the app and exits 0
+ * before ACP initialize (spec §12.5). Server bb runs on node: env unchanged.
+ */
+function shimRuntimeEnv(): Record<string, string> {
+  return process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {};
+}
+
 function shimEnvFor(session: WSession): Record<string, string> {
   return {
+    ...shimRuntimeEnv(),
     AGY_SHIM_REAL_BIN: resolveAgyCommand(process.env),
     AGY_SHIM_EVENTS: eventsFilePath(),
     AGY_SHIM_CONTROL: session.controlFile,
@@ -1631,6 +1648,7 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
         env: {
           ...process.env,
           ...env,
+          ...shimRuntimeEnv(),
           AGY_SHIM_REAL_BIN: resolveAgyCommand(process.env),
           AGY_SHIM_EVENTS: eventsFilePath(),
           AGY_SHIM_CONTROL: join(shimDir(), "ctl-models.ndjson"),
