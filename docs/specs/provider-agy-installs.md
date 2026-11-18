@@ -146,15 +146,15 @@ node scripts/import-accounts.mjs --rebind --label <label> --install <имя>
 
 | № | Файл | Функция / Место | Назначение точки запуска | Выбираемый бинарник |
 |---|------|-----------------|--------------------------|---------------------|
-| 1 | `src/acp-wrapper.ts` | `buildLaunch(session)` → `shimEnvFor` | Старт сессии ACP (`thread/start`), возобновление (`thread/resume`), пересборка сессии при ротации (§3) | Бинарник установки `session.account.install` (при отсутствии поля или сессии без аккаунта — `default`) |
-| 2 | `src/acp-wrapper.ts` | `restoreUnknownThreadSession` | Восстановление сессии для неизвестного треда при входящем `turn/start` / `turn/steer` | Бинарник установки аккаунта, извлеченного из `conversations-state.json` (иначе `default`) |
+| 1 | `src/acp-wrapper.ts` | `buildLaunch(session)` → `shimEnvFor` | Старт сессии ACP (`thread/start`), возобновление (`thread/resume`), пересборка сессии при ротации (§3) | Бинарник установки аккаунта `session.accountLabel` (при отсутствии поля или сессии без аккаунта — `default`) |
+| 2 | `src/acp-wrapper.ts` | `restoreUnknownSession` | Восстановление сессии для неизвестного треда при входящем `turn/start` / `turn/steer` (через `handleThreadResume`) | Бинарник установки аккаунта, извлеченного из `conversations-state.json` (иначе `default`) |
 | 3 | `src/acp-wrapper.ts` | `sanitizeLaunchSpec(rec, params)` | Защитная подстановка `AGY_SHIM_REAL_BIN` при искажении опций демоном (§12.6) | Бинарник из `session.launchEnv`, либо по аккаунту треда из локального состояния, либо `default` |
 | 4 | `src/acp-wrapper.ts` | Автомат ротации (§3) | Синтез нового `thread/start` на сиблинге при квоте / auth-dead / смене модели | Бинарник установки выбранного сиблинга (`sibling.install` или `default`) |
-| 5 | `src/acp-wrapper.ts` | Compaction fallback (§6) | Перезапуск сессии при сбое сжатия контекста | Бинарник установки текущего аккаунта сессии |
+| 5 | `src/acp-wrapper.ts` | `compactRestore` / `compactOnSummaryFail` | Перезапуск сессии при сбое сжатия контекста (Compaction fallback §6) | Бинарник установки текущего аккаунта сессии |
 | 6 | `src/acp-wrapper.ts` | `runModelProbe(account, done)` | Фоновый опрос каталога моделей конкретного аккаунта (`agy models` per §2.3) | Бинарник установки опрашиваемого аккаунта (`account.install` или `default`) |
 | 7 | `src/acp-wrapper.ts` | `queryAgyModels()` | Первичная сводная проба каталога провайдера через `maintenanceEnvAndArgs` | Бинарник установки аккаунта, выбранного `maintenanceEnvAndArgs`, либо `default` |
 | 8 | `src/acp-wrapper.ts` | `queryAcpSessionModels()` | Холодный опрос опций моделей через живой `agy acp` (`materializeShim`) | Бинарник установки аккаунта из `maintenanceEnvAndArgs`, либо `default` |
-| 9 | `src/provider-bridge.ts` | `spawnChildSession(session, args)` | Запуск дочернего процесса в legacy stream-json транспорте | Бинарник установки `session.account.install` (иначе `default`) |
+| 9 | `src/provider-bridge.ts` | `spawnChildSession(session, args)` | Запуск дочернего процесса в legacy stream-json транспорте | Бинарник установки аккаунта `session.accountLabel` (иначе `default`) |
 | 10 | `src/provider-bridge.ts` | `models()` | Опрос моделей в legacy stream-json транспорте | Бинарник выбранного аккаунта (иначе `default`) |
 | 11 | `src/provider-bridge.ts` | `start(context)` | Логирование параметров при инициализации моста | Опрос версий и путей всех зарегистрированных установок из реестра |
 | 12 | Без аккаунта | `direct-mode` / `cliproxy-relay` | Запуск сессий прямого режима без закрепленного пул-аккаунта | Строго бинарник основной установки (`default`) |
