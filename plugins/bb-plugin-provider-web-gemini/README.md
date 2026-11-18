@@ -68,7 +68,7 @@ ACP-провайдер «Gemini Web» (`acp-web-gemini`, обратная сов
 - `WEB_GEMINI_POOL_FILE` / `ARGON_POOL_FILE`: путь к файлу пула (по умолчанию `$STATE_DIR/pool.json`).
 - `WEB_GEMINI_BACKENDS` / `ARGON_BACKENDS`: JSON-массив описаний бэкендов в виде строки.
 - `WEB_GEMINI_SEND_DEADLINE_MS` / `ARGON_SEND_DEADLINE_MS`: таймаут генерации на ход (по умолчанию 1 200 000 мс — 20 минут).
-- `WEB_GEMINI_MAX_PROMPT_BYTES` / `ARGON_MAX_PROMPT_BYTES`: потолок размера исходящего промпта в байтах UTF-8 (по умолчанию `100000` — ниже порога ~120 КБ, на котором Chrome виснет на `insertText`; `0`/отрицательное — без лимита). Превышение — немедленный отказ `prompt too large: … exceeds limit …` до выбора аккаунта и аренды, без кулдауна.
+- `WEB_GEMINI_MAX_PROMPT_BYTES` / `ARGON_MAX_PROMPT_BYTES`: потолок размера исходящего промпта в байтах UTF-8 (по умолчанию `100000` — ниже порога ~120 КБ, на котором Chrome виснет на `insertText`; `0`/отрицательное — без лимита). При превышении текст задачи переливается в файл-вложение `pkg-<sessionId>-prompt-<ts>.md` (r22, PLUG-303); при ошибке записи файла — отказ `prompt too large: … exceeds limit …` до выбора аккаунта и аренды.
 - `WEB_GEMINI_MAX_TOOL_ROUNDS` / `ARGON_MAX_TOOL_ROUNDS`: потолок раундов инструментов чтения за ход (по умолчанию 8; spec `provider-web-gemini-tools`).
 - `WEB_GEMINI_MAX_MESSAGE_BYTES` / `ARGON_MAX_MESSAGE_BYTES`: потолок первого сообщения сессии с упакованными вложениями (по умолчанию 120 000 байт).
 - `WEB_GEMINI_TOOL_TIMEOUT_MS` / `ARGON_TOOL_TIMEOUT_MS`: таймаут одного вызова локального инструмента (по умолчанию 15 000 мс).

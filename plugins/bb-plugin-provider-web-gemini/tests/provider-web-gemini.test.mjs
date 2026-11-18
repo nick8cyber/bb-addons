@@ -1166,7 +1166,7 @@ test("7. Close stdin during active prompt with ARGON_FAKE_DELAY_MS=10000 release
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
-test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before any lease", async () => {
+test("8. PLUG-281/PLUG-303 prompt-size guard and spill (r22): driver boundary, prompt spill >limit, and -32000 on fs failure", async () => {
   // Driver boundary: sendPrompt must reject before ensureChrome/CDP —
   // every send to Gemini passes through it (incl. packed/tool-loop messages).
   const prevEnv = process.env.ARGON_MAX_PROMPT_BYTES;
@@ -1180,13 +1180,21 @@ test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before
       );
       return true;
     });
+
+    // UTF-8 is measured in bytes, not characters: 60 × 'й' = 120 bytes > 100.
+    await assert.rejects(driver.sendPrompt({ prompt: "й".repeat(60) }), (err) => {
+      assert.equal(err.code, "WEB_GEMINI_PROMPT_TOO_LARGE");
+      assert.match(err.message, /^prompt too large: 120 bytes exceeds limit 100 bytes/);
+      return true;
+    });
   } finally {
     if (prevEnv === undefined) delete process.env.ARGON_MAX_PROMPT_BYTES;
     else process.env.ARGON_MAX_PROMPT_BYTES = prevEnv;
   }
 
-  // Server boundary: synchronous refusal in dispatch — no queue, no account
-  // selection, no lease, no state file on disk.
+  // Server boundary: prompt > limit spills to uploads/pkg-<sessionId>-prompt-<ts>.md
+  // with short pointer message; fs write error falls back to immediate -32000;
+  // prompt <= limit passes without spill (§2.2 п.2).
   const tmpDir = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "argon-guard-test-")));
   const poolFile = path.join(tmpDir, "pool.json");
   fs.writeFileSync(
@@ -1207,7 +1215,7 @@ test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before
   const serverProc = spawnServer({
     ...process.env,
     ARGON_FAKE: "1",
-    ARGON_MAX_PROMPT_BYTES: "100",
+    ARGON_MAX_PROMPT_BYTES: "300",
     ARGON_STATE_DIR: tmpDir,
     ARGON_POOL_FILE: poolFile,
   });
@@ -1245,45 +1253,87 @@ test("8. PLUG-281 prompt-size guard: driver boundary and immediate -32000 before
   const r2 = await waitForResponse(2);
   const sessionId = r2.result.sessionId;
 
-  // 200 bytes > limit 100 → immediate error with exact contract message.
+  // 1) FS write error fallback: uploads dir is non-writable -> immediate -32000
+  const uploadsDir = path.join(tmpDir, "uploads");
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  fs.chmodSync(uploadsDir, 0o444);
+
   sendReq({
     jsonrpc: "2.0",
     id: 3,
     method: "session/prompt",
-    params: { sessionId, prompt: [{ type: "text", text: "x".repeat(200) }] },
+    params: { sessionId, prompt: [{ type: "text", text: "x".repeat(1000) }] },
   });
   const r3 = await waitForResponse(3);
   assert.equal(r3.error?.code, -32000);
   assert.equal(
     r3.error?.message,
-    "prompt too large: 200 bytes exceeds limit 100 bytes (WEB_GEMINI_MAX_PROMPT_BYTES). Shrink the request and retry."
+    "prompt too large: 1000 bytes exceeds limit 300 bytes (WEB_GEMINI_MAX_PROMPT_BYTES). Shrink the request and retry."
   );
 
-  // UTF-8 is measured in bytes, not characters: 60 × 'й' = 120 bytes > 100.
-  sendReq({
-    jsonrpc: "2.0",
-    id: 31,
-    method: "session/prompt",
-    params: { sessionId, prompt: [{ type: "text", text: "й".repeat(60) }] },
-  });
-  const r31 = await waitForResponse(31);
-  assert.equal(r31.error?.code, -32000);
-  assert.match(r31.error?.message, /^prompt too large: 120 bytes exceeds limit 100 bytes/);
-
-  // No lease taken, no account touched: the state file is only written by
-  // bindBackend/withStateLock, which the refusal never reaches.
+  // No lease taken, no account touched: state file is only written by bindBackend
   const statePath = path.join(tmpDir, "accounts-state.json");
-  assert.equal(fs.existsSync(statePath), false, "Oversized prompt must not create leases/state");
+  assert.equal(fs.existsSync(statePath), false, "FS write error refusal must not create leases/state");
 
-  // Under the limit passes through to the normal (FAKE) path.
+  // Restore uploads permissions
+  fs.chmodSync(uploadsDir, 0o777);
+
+  // 2) Prompt > limit 300: 1000 bytes spills to uploads/pkg-<sessionId>-prompt-<ts>.md,
+  // response has no error, upload file is created with full text, pointer is short.
   sendReq({
     jsonrpc: "2.0",
     id: 4,
     method: "session/prompt",
-    params: { sessionId, prompt: [{ type: "text", text: "short ok" }] },
+    params: { sessionId, prompt: [{ type: "text", text: "x".repeat(1000) }] },
   });
   const r4 = await waitForResponse(4);
+  assert.equal(r4.error, undefined, "oversized prompt must spill to file without error");
   assert.equal(r4.result?.stopReason, "end_turn");
+
+  const uploadEntries = fs.readdirSync(uploadsDir);
+  const promptSpill = uploadEntries.find((f) => /^pkg-.*-prompt-\d+\.md$/.test(f));
+  assert.ok(promptSpill, `expected pkg-*-prompt-*.md in uploads, got: ${JSON.stringify(uploadEntries)}`);
+  assert.equal(fs.readFileSync(path.join(uploadsDir, promptSpill), "utf8"), "x".repeat(1000));
+
+  // Pointer text was sent to FAKE generation and echoed (sliced to 80 chars in FAKE mode)
+  const chunk = lines.find(
+    (l) => l.method === "session/update" && l.params?.update?.sessionUpdate === "agent_message_chunk"
+  );
+  assert.ok(chunk, "must emit agent_message_chunk in FAKE mode");
+  const echo = String(chunk.params.update.text ?? chunk.params.update.content?.text ?? "");
+  assert.ok(
+    echo.includes("[Задача передана файлом-вложением «" + promptSpill.slice(0, 30)),
+    `expected pointer text in chunk, got: ${echo}`
+  );
+
+  // 3) UTF-8 prompt > limit (160 × 'й' = 320 bytes > 300) also spills without error
+  sendReq({
+    jsonrpc: "2.0",
+    id: 5,
+    method: "session/prompt",
+    params: { sessionId, prompt: [{ type: "text", text: "й".repeat(160) }] },
+  });
+  const r5 = await waitForResponse(5);
+  assert.equal(r5.error, undefined);
+  assert.equal(r5.result?.stopReason, "end_turn");
+  const uploadEntries2 = fs.readdirSync(uploadsDir);
+  assert.equal(uploadEntries2.filter((f) => f.includes("-prompt-")).length, 2);
+
+  // 4) Prompt <= limit passes through to normal path without spill
+  sendReq({
+    jsonrpc: "2.0",
+    id: 6,
+    method: "session/prompt",
+    params: { sessionId, prompt: [{ type: "text", text: "short ok" }] },
+  });
+  const r6 = await waitForResponse(6);
+  assert.equal(r6.result?.stopReason, "end_turn");
+  const uploadEntries3 = fs.readdirSync(uploadsDir);
+  assert.equal(
+    uploadEntries3.filter((f) => f.includes("-prompt-")).length,
+    2,
+    "prompt <= limit must not create spill file"
+  );
 
   serverProc.stdin.end();
   await new Promise((resolve) => serverProc.on("exit", resolve));
