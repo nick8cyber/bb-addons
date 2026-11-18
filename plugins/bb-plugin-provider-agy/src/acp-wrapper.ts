@@ -3525,11 +3525,35 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
   // The owner is cooling or cannot serve the model: the resume becomes a
   // fresh thread on a free sibling, and the first turn rides a handoff
   // prompt (spec §7 / §2.3).
+  const ledger = loadLedger(dataDir);
   const { account } = freeSibling(session, session.accountLabel);
   log(
     `thread ${threadId}: resume owner ${session.accountLabel} ${ownerUnfit ? `does not offer ${session.model ?? "?"}` : `cools until ${new Date(untilMs).toISOString()}`}; sibling ${account?.label ?? "none"}`,
   );
   if (account === null) {
+    // §2.3 п.7: a parked owner is never touched — with no free sibling the
+    // resume fails honestly instead of launching agy on the banned home.
+    const ownerEntry =
+      session.accountLabel !== null
+        ? ledger.accounts[session.accountLabel]
+        : undefined;
+    if (ownerEntry?.parkedReason !== undefined) {
+      const eligible = listAccounts(dataDir).filter(
+        (a) => accountPriority(ledger.accounts[a.label]) > 0,
+      );
+      sendError(
+        id,
+        -32000,
+        eligible.length > 0 &&
+          eligible.every(
+            (a) => ledger.accounts[a.label]?.parkedReason !== undefined,
+          )
+          ? "every pool account is parked; clear a parkedReason in accounts-state.json and retry"
+          : `account ${session.accountLabel} is parked (${ownerEntry.parkedReason}); unpark it in accounts-state.json and retry`,
+      );
+      discardSession(session);
+      return;
+    }
     buildLaunch(session);
     params.options = rewriteOptions(session, { ...session.baseOptions });
     pendingDaemonSessions.set(id, { session, kind: "resume", params });
@@ -3537,7 +3561,6 @@ function handleThreadResume(id: JsonRpcId, params: Record<string, unknown>): voi
     return;
   }
   const ownerLabel = session.accountLabel;
-  const ledger = loadLedger(dataDir);
   const ownerParkedReason =
     ownerLabel !== null ? ledger.accounts[ownerLabel]?.parkedReason : undefined;
   resumeOnSibling(

@@ -165,10 +165,13 @@ writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
   m5: { ...M5_PARKED },
 } }, null, 1));
 // Seed a catalog record for the parked account before the bridge starts —
-// its models must never reach the merged model/list (§2.3 п.2). Probe
-// saves merge by label, so coexisting with later m1/m2 records is safe.
+// its models must never reach the merged model/list (§2.3 п.2). The record
+// is deliberately STALE (older than the 6h TTL): only the parkedReason
+// guard keeps m5 out of the probe queue, so dropping the guard makes
+// models/parked-never-polled fail. Probe saves merge by label, so
+// coexisting with later m1/m2 records is safe.
 writeFileSync(join(acpData, "accounts-models.json"), JSON.stringify({ accounts: {
-  m5: { raw: [{ id: "parked-model", displayName: "Parked Model" }], families: ["parked-model"], unsupported: {}, atMs: Date.now() },
+  m5: { raw: [{ id: "parked-model", displayName: "Parked Model" }], families: ["parked-model"], unsupported: {}, atMs: Date.now() - 7 * 3_600_000 },
 } }, null, 1));
 writeFileSync(process.env.AGY_FAKE_CONTROL, JSON.stringify({ modelsByLabel: {
   m1: [["fake-model", "Fake Model"], ["shared-model", "Shared Model"]],
@@ -302,6 +305,29 @@ acpCheck("models/failed-probe-throttled",
   acpProbes("m4") === 1 && acpProbes("m5") === 0,
   `probes m4=${acpProbes("m4")} m5=${acpProbes("m5")}`);
 
+// §2.3 п.1: an account whose cooldown outlasts the record TTL is never
+// polled — the answer would go stale before the account comes back. m6 has
+// NO catalog record at all, so only the cooldown guard keeps it out of the
+// probe queue (a parkedReason guard would not apply — it has none).
+{
+  const cli = join(acpData, "accounts", "m6", ".gemini", "antigravity-cli");
+  mkdirSync(cli, { recursive: true });
+  writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
+}
+writeAcpLedger({
+  m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+  m2: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 5 },
+  m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
+  m4: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+  m5: { ...M5_PARKED },
+  m6: { cooldownUntilMs: Date.now() + 24 * 3_600_000, lastUsedMs: Date.now(), lastError: "eligibility park 24h", ineligibleAtMs: Date.now(), priority: 10 },
+});
+await acpStart("t-far-cooldown", "shared-model");
+await sleep(500);
+acpCheck("models/far-cooldown-never-polled",
+  acpProbes("m6") === 0,
+  `probes m6=${acpProbes("m6")}`);
+
 // Every pool account parked (any parkedReason): even a model-less start
 // fails honestly instead of silently dropping to direct mode (§2.3 п.7).
 writeAcpLedger({
@@ -310,6 +336,7 @@ writeAcpLedger({
   m3: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 0 },
   m4: { ...M5_PARKED, parkedReason: "tos-disabled" },
   m5: { ...M5_PARKED },
+  m6: { ...M5_PARKED },
 });
 const allParkedReply = await acpStart("t-all-parked", undefined);
 acpCheck("models/all-parked-fails-honestly",

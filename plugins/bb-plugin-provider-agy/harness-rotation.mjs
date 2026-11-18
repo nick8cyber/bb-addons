@@ -1459,6 +1459,39 @@ await sleep(100);
     (readAcpModels().m4?.unsupported?.["pro-model"] ?? 0) > 0,
     staleReply?.error?.message ?? `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsG)}`);
 
+  // H. thread/resume on a parked owner with no free sibling: §2.3 п.7 —
+  // the honest parked-pool error and not a single agy launch on the banned
+  // home. The ledger is written directly so the conversation pin (the
+  // resume's owner lookup) survives in conversations-state.json.
+  favor("m4");
+  const parkedOwnerStart = await startModel("t-parked-owner", "fake-model");
+  const parkedOwnerConv = parkedOwnerStart.result?.providerThreadId;
+  stop("t-parked-owner");
+  await sleep(100);
+  const newsH = newsSnapshot();
+  const loadsBeforeH = acpTranscript().filter((l) => l.method === "session/load").length;
+  writeFileSync(join(acpData, "accounts-state.json"), JSON.stringify({ accounts: {
+    m1: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
+    m2: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
+    m3: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
+    m4: { cooldownUntilMs: 8_640_000_000_000_000, lastUsedMs: 0, lastError: "tos", ineligibleAtMs: 1, parkedReason: "tos-disabled" },
+  } }, null, 1));
+  const parkedResumeId = nextId++;
+  send({ jsonrpc: "2.0", id: parkedResumeId, method: "thread/resume",
+    params: { threadId: "t-resume-parked", providerThreadId: parkedOwnerConv, cwd: workspace,
+      options: { model: "fake-model", ...pol }, instructionMode: "append" } });
+  await waitFor(() => messages.some((m) => m.id === parkedResumeId), 15_000, "t-resume-parked: resume");
+  const parkedResumeReply = messages.find((m) => m.id === parkedResumeId);
+  check("models/resume-parked-owner-fails-honestly",
+    parkedResumeReply?.error !== undefined && /parked/iu.test(parkedResumeReply.error.message ?? ""),
+    parkedResumeReply?.error?.message ?? "unexpected success");
+  check("models/resume-parked-owner-no-launch",
+    acpNews("m1") + acpNews("m2") + acpNews("m3") + acpNews("m4") ===
+      newsH.m1 + newsH.m2 + newsH.m3 + newsH.m4 &&
+    acpTranscript().filter((l) => l.method === "session/load").length === loadsBeforeH,
+    `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsH)} ` +
+      `loads=${acpTranscript().filter((l) => l.method === "session/load").length} before=${loadsBeforeH}`);
+
   // NOTE: never call activeBridge.onClose() here — the embedded generic
   // bridge's onClose ends with process.exit(0) and would skip the report.
   await sleep(100);
