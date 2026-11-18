@@ -3,7 +3,7 @@ title: provider-agy — миграция на ACP-транспорт
 status: draft
 owner: coordinator
 date: 2026-11-18
-revision: 10 (§12.5 — рантайм шима в настольном bb: ELECTRON_RUN_AS_NODE; ранее 9: §12.3(c) — same-uid EPERM/EACCES разрешается по session: чужая сессия пропускается, наша — блокирует; «мёртв» только ENOENT/ESRCH в любой ветке чтения; аудит #121: номер поля session; аудит #125: readlink fd — только ENOENT/ESRCH не-ссылка)
+revision: 10.1 (r10.1 — §12: имена плагина/теста обновлены по переименованию provider-argon → provider-web-gemini (PLUG-298); r10 — §12.5 рантайм шима в настольном bb: ELECTRON_RUN_AS_NODE; ранее 9: §12.3(c) — same-uid EPERM/EACCES разрешается по session: чужая сессия пропускается, наша — блокирует; «мёртв» только ENOENT/ESRCH в любой ветке чтения; аудит #121: номер поля session; аудит #125: readlink fd — только ENOENT/ESRCH не-ссылка)
 tags: [bb, plugins, provider-agy, acp]
 ---
 

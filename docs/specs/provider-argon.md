@@ -3,7 +3,7 @@ title: provider-web-gemini (ранее provider-argon) — ACP-провайде�
 status: approved
 owner: coordinator
 date: 2026-11-18
-revision: 20
+revision: 21 (r21 — переименование provider-argon → provider-web-gemini по конвенции: каталог bb-plugin-provider-web-gemini, provider id acp-web-gemini, dual env WEB_GEMINI_*/ARGON_*, PLUG-298)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 ---
 
@@ -38,7 +38,7 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 ### 2.1 Инициализация и сессии
 
-- **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "web-gemini", version: "0.2.0" }` (сборки до переименования PLUG-298 возвращали `name: "argon-gemini"`)`, agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }`.
+- **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "web-gemini", version: "0.2.0" }, agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }` (сборки до переименования PLUG-298 возвращали `name: "argon-gemini"` в `agentInfo`).
 - **`session/new` и `session/load`**:
   - `session/new` создаёт новую запись сессии `{ id, cwd, roots, model, thinking, convId, account, backend }`.
   - Рабочие корни сессии для файловых вложений (PLUG-291): параметры `additionalDirectories`/`roots` (строки путей или объекты `{ uri: "file://…" }`) сохраняются в `s.roots` и вместе с `s.cwd` задают каталоги, из которых разрешена отправка локальных файлов в Gemini (§2.2 п.3, §2.4).
