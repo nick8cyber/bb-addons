@@ -35,6 +35,25 @@ const REFUSAL =
   `be in /home/x/.gemini/antigravity-cli/brain/${conversationId}/`;
 
 const out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
+
+// `agy models`: like real agy, --gemini-dir is only valid on `agy acp` —
+// with `models` it prints usage to stderr and exits 2; the catalog itself
+// is keyed by the HOME basename.
+if (process.argv.includes("models")) {
+  if (process.argv.includes("--gemini-dir")) {
+    process.stderr.write(
+      "usage: agy [-p <prompt>]\n" +
+        "       agy models\n" +
+        "       agy acp [--gemini-dir <dir>]\n" +
+        "agy: --gemini-dir is only valid with the acp subcommand\n",
+    );
+    process.exit(2);
+  }
+  appendFileSync(transcript, `${JSON.stringify({ home: basename(process.env.HOME ?? ""), __models: true })}\n`);
+  process.stdout.write("fake-model\tFake Model\n");
+  process.exit(0);
+}
+
 out({
   event: "init",
   conversation_id: conversationId,

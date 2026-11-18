@@ -76,6 +76,17 @@ function modelsCatalog() {
   return [{ id: "fake-model", displayName: "Fake Model" }];
 }
 if (process.argv.includes("models")) {
+  // Like real agy, --gemini-dir is only valid on `agy acp` — with `models`
+  // it prints usage to stderr and exits 2.
+  if (geminiDirArg !== null) {
+    process.stderr.write(
+      "usage: agy [-p <prompt>]\n" +
+        "       agy models\n" +
+        "       agy acp [--gemini-dir <dir>]\n" +
+        "agy: --gemini-dir is only valid with the acp subcommand\n",
+    );
+    process.exit(2);
+  }
   if (transcript !== null) {
     appendFileSync(transcript, `${JSON.stringify({ home: homeLabel, __models: true })}\n`);
   }

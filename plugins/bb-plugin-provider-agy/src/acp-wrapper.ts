@@ -1559,6 +1559,9 @@ function maintenanceEnvAndArgs(): {
       args.push("--gemini-dir", join(relay.home, ".gemini"));
       env.GEMINI_API_KEY = relay.apiKey;
       env.GOOGLE_GEMINI_BASE_URL = relay.baseUrl;
+      // The relay home holds the Gemini-API settings flip — without it
+      // `agy models` would run on the user's real Antigravity account.
+      return { env, args, home: relay.home };
     }
   }
   return { env, args, home: null };
@@ -1668,6 +1671,7 @@ function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
       return;
     }
     let stdout = "";
+    let stderr = "";
     const timer = setTimeout(() => {
       killProcessTreeGracefully(child);
     }, 30_000);
@@ -1675,13 +1679,27 @@ function queryAgyModels(): Promise<{ id: string; displayName: string }[]> {
     child.stdout?.on("data", (chunk: string) => {
       stdout += chunk;
     });
-    child.on("error", () => {
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      if (stderr.length < 400) {
+        stderr += chunk;
+      }
+    });
+    child.on("error", (err: Error) => {
       clearTimeout(timer);
+      log(`models query failed: ${err.message}`);
       resolve([]);
     });
-    child.on("close", () => {
+    child.on("close", (code) => {
       clearTimeout(timer);
-      resolve(parseAgyModelsOutput(stdout));
+      const raw = parseAgyModelsOutput(stdout);
+      if (raw.length === 0) {
+        log(
+          `models query failed: exit ${code ?? "signal"}` +
+            (stderr.trim() !== "" ? ` — ${probeStderrTail(stderr)}` : ""),
+        );
+      }
+      resolve(raw);
     });
   });
 }

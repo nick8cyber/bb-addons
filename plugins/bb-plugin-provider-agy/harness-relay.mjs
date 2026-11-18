@@ -86,7 +86,49 @@ process.env.AGY_CLIPROXY = "0";
 const directTranscript = await runTurn("t-direct", "creq_zyxwvutsrb");
 const directEnv = readEnvs(directTranscript)[0];
 
+// ACP path, relay back on: queryAgyModels (the model/list fast path) must
+// run `agy models` with HOME = relay home — without it the probe would hit
+// the user's real Antigravity home (review blocker, заход 9).
+process.env.AGY_CLIPROXY = "1";
+delete process.env.AGY_TRANSPORT;
+const acpData = join(root, "acp-relay");
+mkdirSync(acpData, { recursive: true });
+const acpFake = new URL("./fake-agy-acp.mjs", import.meta.url).pathname;
+const acpShim = join(root, "agy-acp-shim");
+writeFileSync(acpShim, `#!/bin/sh\nexec /usr/bin/node ${acpFake} "$@"\n`);
+chmodSync(acpShim, 0o755);
+process.env.AGY_PATH = acpShim;
+const acpTranscriptFile = join(root, "acp-relay-stdin.ndjson");
+writeFileSync(acpTranscriptFile, "");
+process.env.AGY_FAKE_TRANSCRIPT = acpTranscriptFile;
+process.env.AGY_FAKE_CONTROL = join(root, "acp-control.json");
+writeFileSync(process.env.AGY_FAKE_CONTROL, "{}");
+
+const acpBridge = (await import(
+  new URL("./dist/host.js?relay-acp", import.meta.url).href
+)).experimental_providerBridge;
+acpBridge.start?.({ pluginId: "provider-agy", dataDir: acpData, tempDir: acpData });
+const sendAcp = (m) => acpBridge.handleLine(JSON.stringify(m));
+sendAcp({ jsonrpc: "2.0", id: 900, method: "model/list", params: {} });
+const probeLines = () =>
+  readFileSync(acpTranscriptFile, "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => { try { return JSON.parse(l); } catch { return {}; } })
+    .filter((o) => o.__models === true);
+{
+  const deadline = Date.now() + 15_000;
+  while (probeLines().length === 0 && Date.now() < deadline) await sleep(100);
+}
+const probeEnv = probeLines()[0]?.__env ?? {};
+
 const checks = [
+  ["relay-acp/models-home-is-relay-home",
+    probeEnv.HOME === join(acpData, "cliproxy-home"),
+    String(probeEnv.HOME ?? "")],
+  ["relay-acp/models-key-passed-to-child",
+    probeEnv.GEMINI_API_KEY === "relay-test-key",
+    String(probeEnv.GEMINI_API_KEY ?? "")],
   ["relay/home-is-relay-home", relayEnv?.HOME === join(root, "cliproxy-home"), String(relayEnv?.HOME ?? "")],
   ["relay/key-passed-to-child", relayEnv?.GEMINI_API_KEY === "relay-test-key", String(relayEnv?.GEMINI_API_KEY ?? "")],
   ["relay/base-url-passed-to-child", relayEnv?.GOOGLE_GEMINI_BASE_URL === "http://127.0.0.1:8317", String(relayEnv?.GOOGLE_GEMINI_BASE_URL ?? "")],
