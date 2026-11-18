@@ -23,9 +23,17 @@
  *
  * Every stdin line is echoed to `AGY_FAKE_TRANSCRIPT` (when set) so a harness
  * can prove WHAT the bridge sent and, just as important, WHEN.
+ *
+ * `agy models` prints a catalog TSV ("id\tdisplayName" lines): per-label
+ * entries come from `AGY_FAKE_MODELS_BY_LABEL` (JSON map keyed by the home
+ * basename or the --gemini-dir parent's basename), a single TSV from
+ * `AGY_FAKE_MODELS_OUT`, or the built-in default. `AGY_FAKE_MODE` set to
+ * "unknown-model" or "tos-disabled" makes every turn settle as an ERROR
+ * result with the matching refusal text.
  */
 import { createInterface } from "node:readline";
 import { appendFileSync, existsSync } from "node:fs";
+import { basename, dirname } from "node:path";
 
 const conversationId =
   process.argv.includes("--conversation")
@@ -41,6 +49,49 @@ const HOLD_TIMEOUT_MS = 30_000;
 
 const out = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// `agy models`: the per-account catalog as TSV, keyed by the account home
+// basename (the --gemini-dir parent when present, else HOME).
+const geminiDirArg = process.argv.includes("--gemini-dir")
+  ? process.argv[process.argv.indexOf("--gemini-dir") + 1]
+  : null;
+const homeLabel = geminiDirArg
+  ? basename(dirname(geminiDirArg))
+  : basename(process.env.HOME ?? "");
+function modelsCatalog() {
+  const byLabel = JSON.parse(process.env.AGY_FAKE_MODELS_BY_LABEL ?? "null");
+  if (typeof byLabel === "object" && byLabel !== null && Array.isArray(byLabel[homeLabel])) {
+    return byLabel[homeLabel].map((e) =>
+      Array.isArray(e)
+        ? { id: e[0], displayName: e[1] ?? e[0] }
+        : { id: e.id, displayName: e.displayName ?? e.id });
+  }
+  const tsv = process.env.AGY_FAKE_MODELS_OUT;
+  if (typeof tsv === "string" && tsv.length > 0) {
+    return tsv.split("\n").filter((l) => l.includes("\t")).map((l) => {
+      const [id, ...rest] = l.split("\t");
+      return { id, displayName: rest.join("\t") || id };
+    });
+  }
+  return [{ id: "fake-model", displayName: "Fake Model" }];
+}
+if (process.argv.includes("models")) {
+  if (transcript !== null) {
+    appendFileSync(transcript, `${JSON.stringify({ home: homeLabel, __models: true })}\n`);
+  }
+  for (const entry of modelsCatalog()) {
+    process.stdout.write(`${entry.id}\t${entry.displayName}\n`);
+  }
+  process.exit(0);
+}
+// AGY_FAKE_MODE refusal shapes: every turn settles as an ERROR result with
+// the fixture's text (spec §2.3 refusal classes).
+const fakeModeError =
+  process.env.AGY_FAKE_MODE === "unknown-model"
+    ? `Unknown model ID: "${model}"`
+    : process.env.AGY_FAKE_MODE === "tos-disabled"
+      ? "This service has been disabled in this account for violation of Terms of Service."
+      : null;
 
 out({
   event: "init",
@@ -73,6 +124,26 @@ async function runTurn(text) {
   turns += 1;
   const scope = { conversation_id: conversationId };
   out({ event: "step_update", step_update: { ...scope, step_index: step++, state: "DONE", step_type: "user_input" } });
+  if (fakeModeError !== null) {
+    out({
+      event: "result",
+      result: {
+        ...scope,
+        status: "ERROR",
+        response: "",
+        error: fakeModeError,
+        num_turns: turns,
+        usage: {
+          input_tokens: total,
+          output_tokens: 4 * turns,
+          thinking_tokens: 0,
+          cache_read_tokens: 0,
+          total_tokens: total + 4 * turns,
+        },
+      },
+    });
+    return;
+  }
   out({ event: "step_update", step_update: { ...scope, step_index: step++, state: "DONE", step_type: "checkpoint" } });
   const messageStep = step++;
   const hold = text.includes("[[hold]]");

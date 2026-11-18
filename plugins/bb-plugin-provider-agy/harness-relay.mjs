@@ -21,6 +21,7 @@ const shim = join(root, "agy-shim");
 const fake = new URL("./fake-agy-errors.mjs", import.meta.url).pathname;
 writeFileSync(shim, `#!/bin/sh\nexec /usr/bin/node ${fake} "$@"\n`);
 chmodSync(shim, 0o755);
+process.env.AGY_TRANSPORT ??= "stream-json";
 process.env.AGY_PATH = shim;
 process.env.AGY_FAKE_RECORD_ENV = "HOME,GEMINI_API_KEY,GOOGLE_GEMINI_BASE_URL";
 process.env.AGY_CLIPROXY_URL = "http://127.0.0.1:8317";
