@@ -1383,6 +1383,14 @@ test("9. Backward compatibility and web-gemini naming convention", async () => {
   const sessionId = r2.result.sessionId;
   assert.ok(sessionId.startsWith("web-gemini-"));
 
+  const legacySessionId = `argon-${sessionId.slice("web-gemini-".length)}`;
+  sendReq({ jsonrpc: "2.0", id: 3, method: "session/set_model", params: { sessionId: legacySessionId, modelId: "carbon" } });
+  const r3 = await waitForResponse(3);
+  assert.ok(!r3.error, `legacy sessionId must be accepted: ${r3.error?.message}`);
+  sendReq({ jsonrpc: "2.0", id: 4, method: "session/load", params: { sessionId } });
+  const r4 = await waitForResponse(4);
+  assert.equal(r4.result.models.currentModelId, "carbon");
+
   serverProc.stdin.end();
   await new Promise((resolve) => serverProc.on("exit", resolve));
   fs.rmSync(tmpDir, { recursive: true, force: true });
