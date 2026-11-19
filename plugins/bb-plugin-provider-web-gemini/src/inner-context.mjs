@@ -83,6 +83,12 @@ export function loadSettings(stateDir, projectId) {
         .replace(THREAD_TOKEN, "[скрыто: bb-thread-id]")
         .replace(TASK_TOKEN, (token) => tools.isTaskKeyToken(token) ? "[скрыто: task-key]" : token);
     },
+    maskResponse(text) {
+      let value = String(text);
+      for (const { type, re } of compiled) value = value.replace(re, () => "[скрыто: " + type + "]");
+      return tools.maskForWeb(value)
+        .replace(/(\b(?:https?|ftp):\/\/)[^\s/@]+(?=@)/gi, "$1[скрыто: credentials]");
+    },
   });
 }
 
@@ -145,7 +151,9 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
   const root = await repoRoot(cwd, signal);
   const pin = await pinReview(root, refs, thread.environment ?? {}, signal);
   const verdict = parseVerdict(text, system, pin);
-  const attachments = section(text, /^## Attachments[ \t]*$/)
+  const recentIndex = text.search(/^## Recent comments[ \t]*$/m);
+  const textBeforeRecent = recentIndex !== -1 ? text.slice(0, recentIndex) : text;
+  const attachments = section(textBeforeRecent, /^## Attachments[ \t]*$/, { last: true })
     .filter((line) => line.startsWith("- ")).map((line) => {
       const match = TRACKER_ATTACHMENT.exec(line);
       if (!match) throw new Error("malformed tracker attachment entry");
@@ -180,7 +188,7 @@ export function checkedAnswer(context, response) {
   }
   if (!source.trim() || tools.parseToolCalls(source).length || tools.parseToolCalls(page).length ||
       /<tool\b/i.test(source) || /<tool\b/i.test(page)) return { repair: "empty or unfinished tool response" };
-  if (context.settings.mask(source) !== source || context.settings.mask(page) !== page) {
+  if (context.settings.maskResponse(source) !== source || context.settings.maskResponse(page) !== page) {
     return { repair: "response contains material prohibited for publication" };
   }
   if (!context.verdict) return { text: page.trim() ? page : source };

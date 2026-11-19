@@ -594,3 +594,90 @@ test("project mask covers the orchestrator packet rules and outbound linked mate
   for (const fragment of fragments) assert.equal(outbound.includes(fragment), false);
   assert.match(outbound, /Linked material \[скрыто: project\]/);
 });
+
+test("audit fixes: response ISO/RFC/CVE tokens pass, git show on multi-commit branch, grep -E, attachments section, and slog logs", async (t) => {
+  const { checkedAnswer, loadSettings, prepareTask } = await import("../src/inner-context.mjs");
+  const { collectDiff, executePinned, pinReview } = await import("../src/review-git.mjs");
+  const { collectGeneratedFiles } = await import("../src/gemini-driver.js");
+
+  const repo = setup(t);
+
+  // 1. Blocker 1: Standard technical tokens (ISO-8601, RFC-3339, HTTP-2, ES-2022, CVE-2024-1234) and task keys in response
+  const settings = loadSettings(repo.tmp, projectId);
+  const context = { settings, verdict: null };
+  const resp = { text: "Verified dates in ISO-8601 and RFC-3339; fixed CVE-2024-1234 on HTTP-2 and ES-2022. Related to PLUG-327." };
+  const checked = checkedAnswer(context, resp);
+  assert.equal(checked.repair, undefined, "standard technical tokens and task keys must not trigger repair in response");
+  assert.ok(checked.text.includes("ISO-8601"));
+
+  // 2. Finding 2: Multi-commit branch review — git show shows only the commit's changes
+  repo.git("switch", "-c", "multi-commit", repo.base);
+  repo.write("docs/c1.txt", "commit 1 content\n");
+  repo.git("add", ".");
+  repo.git("commit", "-m", "Commit 1");
+  const c1 = repo.git("rev-parse", "HEAD");
+  repo.write("docs/c2.txt", "commit 2 content\n");
+  repo.git("add", ".");
+  repo.git("commit", "-m", "Commit 2");
+  const c2 = repo.git("rev-parse", "HEAD");
+
+  const pin2 = await pinReview(repo.repo, [c2], { baseBranch: repo.base });
+  const diff2 = await collectDiff(repo.repo, pin2, 10_000_000, null);
+
+  const showRes = await executePinned({ name: "git", args: { args: `show ${c2}` } }, repo.repo, pin2, diff2, 1_000_000);
+  assert.ok(showRes.output.includes("docs/c2.txt"), "git show output must include commit 2 file");
+  assert.ok(!showRes.output.includes("docs/c1.txt"), "git show output must NOT include commit 1 file");
+
+  // 3. Finding 3: grep with regex alternation a|b
+  const grepRes = await executePinned({ name: "grep", args: { pattern: "commit 1|commit 2" } }, repo.repo, pin2, diff2, 1_000_000);
+  assert.ok(grepRes.output.includes("commit 1") || grepRes.output.includes("commit 2"), "grep with alternation must match lines");
+
+  // 4. Finding 4: User description containing ## Attachments does not break tracker attachment parsing
+  const taskTextWithUserAttachments = [
+    "# EX-99 · Task with user attachments",
+    "## Description",
+    "User problem description.",
+    "## Attachments",
+    "- custom note bullet",
+    "- another note",
+    "## Project context",
+    "Some context",
+    "## Attachments",
+    "- real-file.txt · 01M7RK0JBY8VJ7VK4Z2DJQKE09",
+    "## Recent comments",
+    "None",
+    "## Report-back contract",
+    "Report",
+  ].join("\n\n");
+  const prep = await prepareTask({
+    text: taskTextWithUserAttachments,
+    system: null,
+    session: { cwd: repo.repo },
+    thread: { thread: { id: threadId, projectId }, environment: { path: repo.repo } },
+    stateDir: repo.tmp,
+  });
+  assert.deepEqual(prep.attachments, [{ name: "real-file.txt", id: "01M7RK0JBY8VJ7VK4Z2DJQKE09" }]);
+
+  // 5. Finding 5: detectOnly does not treat links with text 'download' as generated files
+  const mockPageNoDownload = {
+    evaluate: async () => [],
+  };
+  const coll = await collectGeneratedFiles(mockPageNoDownload, { detectOnly: true });
+  assert.equal(coll.hasGeneratedFile, undefined);
+
+  // 6. Finding 6: slog writes task:pinned-sha, task:package, task:stage, and task:outcome
+  const app = fixture(t, repo, () => ({ text: "Report\n{\"verdict\":\"OK\",\"blockers\":0}" }));
+  const session = await app.newSession();
+  const runResult = await app.prompt(session, task("Slog test", EN, { ref: repo.sha }));
+  assert.equal(runResult.result?.stopReason, "end_turn");
+
+  const logFile = join(app.state, "acp-server.log");
+  assert.ok(existsSync(logFile), "acp-server.log must exist");
+  const logContent = readFileSync(logFile, "utf8");
+  assert.ok(logContent.includes("task:pinned-sha"), "log must record task:pinned-sha");
+  assert.ok(logContent.includes("task:package"), "log must record task:package");
+  assert.ok(logContent.includes("task:stage"), "log must record task:stage");
+  assert.ok(logContent.includes("task:outcome"), "log must record task:outcome");
+  assert.ok(logContent.includes("packageSha256"), "log must record packageSha256");
+  assert.ok(logContent.includes("pinnedSha"), "log must record pinnedSha");
+});

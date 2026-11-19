@@ -2039,10 +2039,11 @@ async function collectGeneratedFiles(page, opts = {}) {
           if (!href || seen.has(href)) continue;
           if (!okHost(href)) continue;
           const hasDl = a.hasAttribute('download');
+          const isFileCard = Boolean(a.closest('.file-card, .file-chip, [data-file-id], [data-mime-type], [data-attachment-id], mat-card'));
+          if (detectOnly && !hasDl && !isFileCard) continue;
           const label = ((a.getAttribute('aria-label') || '') + ' ' + (a.innerText || '')).trim();
           const dlText = /download|скачать|export|экспорт/i.test(label);
-          if (detectOnly && !hasDl && !/download|скачать/i.test(label)) continue;
-          if (!hasDl && !dlText && !FILE_EXT_RE.test(href)) continue;
+          if (!hasDl && !dlText && !FILE_EXT_RE.test(href) && !isFileCard) continue;
           seen.add(href);
           const tag = `${tagAttr}-${seq++}`;
           a.setAttribute('data-argon-dl', tag);
@@ -2055,9 +2056,11 @@ async function collectGeneratedFiles(page, opts = {}) {
           });
         }
         for (const b of target.querySelectorAll('button, [role="button"], a:not([href])')) {
+          const hasDl = b.hasAttribute('download');
+          const isFileCard = Boolean(b.closest('.file-card, .file-chip, [data-file-id], [data-mime-type], [data-attachment-id], mat-card'));
+          if (detectOnly && !hasDl && !isFileCard) continue;
           const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).trim();
-          if (detectOnly && !/download|скачать/i.test(label)) continue;
-          if (!/download|скачать|export|экспорт/i.test(label)) continue;
+          if (!/download|скачать|export|экспорт/i.test(label) && !isFileCard) continue;
           const tag = `${tagAttr}-${seq++}`;
           b.setAttribute('data-argon-dl', tag);
           out.push({ kind: 'click', tag, name: label.slice(0, 120) });

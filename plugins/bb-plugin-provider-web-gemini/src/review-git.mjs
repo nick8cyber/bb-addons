@@ -29,7 +29,7 @@ async function git(cwd, args, { maxBytes = 25_000_000, allow = [], strict = fals
   let result;
   try {
     result = await runFile("git", ["--no-pager", "-c", "core.warnAmbiguousRefs=true", ...args], {
-      cwd, env, maxBuffer: maxBytes, timeout: TOOL_TIMEOUT_MS, encoding: "buffer", signal,
+      cwd, env, maxBuffer: maxBytes, timeout: TOOL_TIMEOUT_MS, encoding: "buffer", ...(signal ? { signal } : {}),
     });
   } catch (error) {
     signal?.throwIfAborted();
@@ -234,7 +234,7 @@ export async function worktreeStatus(root, maxBytes, signal) {
 
 export async function executePinned(call, root, pin, diff, maxBytes, signal) {
   const { sha } = pin;
-  const args = call.args;
+  const args = call.args ?? {};
   const rel = relPath(args.path || ".");
   if (call.name === "read_file") {
     const content = await readMaterial(root, pin, rel, maxBytes, signal);
@@ -256,7 +256,7 @@ export async function executePinned(call, root, pin, diff, maxBytes, signal) {
       const entry = await pinnedEntry(root, sha, rel, signal);
       if (entry.type !== "tree" && !normalFile(entry.mode)) throw new Error("expected a regular Git blob or tree");
     }
-    const data = await git(root, ["grep", "--no-recurse-submodules", "--no-textconv", "-z", "-n", "-I", "-e", args.pattern, sha,
+    const data = await git(root, ["grep", "-E", "--no-recurse-submodules", "--no-textconv", "-z", "-n", "-I", "-e", args.pattern, sha,
       "--", ...(rel === "." ? [] : [literal(rel)])], { allow: [1], maxBytes, signal, attributes: sha }) ?? "";
     const rows = [];
     let total = 0;
@@ -295,18 +295,38 @@ export async function executePinned(call, root, pin, diff, maxBytes, signal) {
     return { output: await git(root, ["log", count, "--format=%H %s", sha, "--"], { maxBytes, signal }) };
   }
   const range = opts.filter((opt) => opt !== "--stat");
-  const validRange = pinned(range) || (sub === "diff" && (
+  const validDiffRange = sub === "diff" && (
+    pinned(range) ||
     (range.length === 2 && range[0] === pin.base && pinned(range.slice(1))) ||
     (range.length === 1 && [`${pin.base}..${sha}`, `${pin.base}..HEAD`].includes(range[0]))
-  ));
-  if ((sub === "show" || sub === "diff") && validRange) {
+  );
+  if (sub === "diff" && validDiffRange) {
     const details = !files.length || files.includes(".")
       ? diff
       : await diffPart(root, [pin.base, sha], maxBytes, signal, sha, files);
     const output = opts.includes("--stat") ? details.stat : details.patch;
-    if (sub === "diff") return { output };
-    const summary = await git(root, ["show", "--no-patch", "--format=%H %s", sha, "--"], { maxBytes, signal });
-    return { output: summary + output };
+    return { output };
+  }
+  if (sub === "show" && pinned(range)) {
+    let targetFiles = files;
+    if (!targetFiles.length || targetFiles.includes(".")) {
+      const treeFiles = (await git(root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", sha], { maxBytes, signal })) ?? "";
+      targetFiles = treeFiles.split("\0").filter(Boolean);
+    }
+    const allowed = [];
+    for (const file of targetFiles) {
+      if (sensitive(file) || LOCK.test(file) || GENERATED.test(file)) continue;
+      allowed.push(file);
+    }
+    const showArgs = ["show", ...DIFF_OPTIONS];
+    if (opts.includes("--stat")) showArgs.push("--stat");
+    else showArgs.push("-U10");
+    showArgs.push(sha);
+    if (!targetFiles.length || !allowed.length) {
+      return { output: await git(root, ["show", "--no-patch", "--format=%H %s", sha, "--"], { maxBytes, signal }) };
+    }
+    showArgs.push("--", ...allowed.map(literal));
+    return { output: await git(root, showArgs, { maxBytes, signal, attributes: sha }) };
   }
   throw new Error("unsupported git arguments for a pinned review; use read_file, list_dir or grep for paths");
 }

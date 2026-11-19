@@ -1087,6 +1087,7 @@ class TaskTurnError extends Error {}
 const BB_PROGRESS_WINDOW_MS = 600;
 
 function turnError(id, outcome, reason, stage = "preflight") {
+  slog("task:error", { outcome, reason, stage });
   out({ jsonrpc: "2.0", id, error: {
     code: -32000, message: "[web-gemini:" + outcome + "] " + reason, data: { outcome, reason, stage },
   } });
@@ -1128,9 +1129,12 @@ function createTaskTurn(sessionId) {
   const turn = {
     get stage() { return stage; },
     deadline, signal: controller.signal, aborted, stop, ownedFiles: [],
+    pinnedSha: null,
+    packageSha256: null,
     ping(next) {
       if (closed || controller.signal.aborted) return;
       stage = next;
+      slog("task:stage", { sessionId, stage });
       progress("in_progress");
     },
     heartbeat(ms) {
@@ -1143,6 +1147,14 @@ function createTaskTurn(sessionId) {
       closed = true;
       clearInterval(interval);
       clearTimeout(timer);
+      slog("task:outcome", {
+        sessionId,
+        outcome,
+        reason: reason || null,
+        stage,
+        pinnedSha: turn.pinnedSha ?? null,
+        packageSha256: turn.packageSha256 ?? null,
+      });
       const result = "[web-gemini:" + outcome + "]" + (reason ? " " + reason : "");
       if (outcome === "failed" && controller.signal.reason === "cancelled") {
         progress("in_progress", result);
@@ -1429,6 +1441,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           };
           collected = await collectTask(context, attachments.blocks, packageOptions);
           packed = packTask(context, collected, packageOptions);
+          task.packageSha256 = packed.packageSha256;
+          slog("task:package", { sessionId, packageSha256: packed.packageSha256, totalBytes: packed.totalBytes });
         } catch (error) {
           if (task.signal.aborted) return { cancelled: true };
           const reason = error.code ? "could not read or stage mandatory task materials" : error.message;
@@ -1591,6 +1605,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 if (!delivered) {
                   try {
                     packed = packTask(context, collected, { ...packageOptions, limit: messageLimit });
+                    task.packageSha256 = packed.packageSha256;
+                    slog("task:package", { sessionId, packageSha256: packed.packageSha256, totalBytes: packed.totalBytes });
                   } catch {
                     throw new TaskTurnError("mandatory task context could not be delivered within the web textbox limit");
                   }
@@ -1911,6 +1927,10 @@ async function runBoundPrompt(msg, session) {
       text, system, session, thread, stateDir: STATE_DIR, signal: task.signal,
       onSettings: (settings) => task.heartbeat(settings.progressIntervalMs),
     });
+    task.pinnedSha = context.pin?.sha ?? null;
+    if (context.pin?.sha) {
+      slog("task:pinned-sha", { sessionId, sha: context.pin.sha, base: context.pin.base });
+    }
     if (Date.now() >= task.deadline) task.stop("deadline exceeded");
     task.signal.throwIfAborted();
     await runPrompt(msg.id, sessionId, text, { task, context, blocks });
