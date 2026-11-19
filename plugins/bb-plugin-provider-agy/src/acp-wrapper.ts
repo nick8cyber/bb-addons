@@ -59,6 +59,7 @@ import {
   hasVerificationRequest,
   ineligibleCooldownMs,
   isAccountIneligible,
+  isAgentQuotaMessage,
   isAgentValidationMessage,
   isAuthDead,
   isModelRefusal,
@@ -742,6 +743,8 @@ interface WSession {
   /** §2.3 п.11: a VALIDATION_REQUIRED answer surfaced as agent text — the
    * turn must not deliver it, its boundary becomes a parking+rotation. */
   validationRefusal: boolean;
+  /** §2.3 п.13: the swallowed "⚠ Individual quota reached…" text, or null. */
+  quotaRefusalText: string | null;
   /** §2.3 п.11 (ревизия 13.1): text of the CURRENT agent message — the
    * strict marker match runs only against this, never against the
    * cross-turn recentAssistantText tail. */
@@ -796,6 +799,7 @@ function newSession(threadId: string, cwd: string): WSession {
     autoRetryCount: 0,
     stopped: false,
     validationRefusal: false,
+    quotaRefusalText: null,
     agentMessageText: "",
     modelRefusalMoved: new Set<string>(),
   };
@@ -3810,6 +3814,22 @@ function onValidationRefusalBoundary(session: WSession): void {
   );
 }
 
+/**
+ * §2.3 п.13: the swallowed "⚠ Individual quota reached…" turn ends here —
+ * the account is cooled until the stated reset and the turn re-runs on a
+ * sibling (or waits / fails honestly), exactly like a quota provider.error.
+ */
+function onQuotaRefusalBoundary(session: WSession, text: string): void {
+  session.bridgeTurnBusy = false;
+  session.suppressOpenNext = false;
+  session.suppressAcceptedNext = false;
+  session.settledInternal = null;
+  log(
+    `thread ${session.threadId}: agent text carried a quota refusal on ${session.accountLabel ?? "?"}; cooling and rotating`,
+  );
+  handleClassifiedError(session, "quota", text);
+}
+
 function onProviderErrorDelta(
   session: WSession | undefined,
   delta: Record<string, unknown>,
@@ -3950,6 +3970,7 @@ function processDeltaLine(
       case "turn.open": {
         session.bridgeTurnBusy = true;
         session.agentMessageText = "";
+        session.quotaRefusalText = null;
         if (session.suppressOpenNext) {
           session.suppressOpenNext = false;
           continue;
@@ -3965,6 +3986,14 @@ function processDeltaLine(
           // classified error drives.
           session.validationRefusal = false;
           onValidationRefusalBoundary(session);
+          continue;
+        }
+        if (session.quotaRefusalText !== null) {
+          // §2.3 п.13: the "⚠ Individual quota reached…" turn never
+          // completes either — its boundary drives the quota rotation.
+          const refusal = session.quotaRefusalText.trim();
+          session.quotaRefusalText = null;
+          onQuotaRefusalBoundary(session, refusal);
           continue;
         }
         out.push(delta);
@@ -3991,10 +4020,23 @@ function processDeltaLine(
           if (session.validationRefusal) {
             continue;
           }
+          if (session.quotaRefusalText !== null) {
+            // The rest of the refusal line (its "Resets in …" tail) is
+            // kept for the cooldown clock, never shown.
+            session.quotaRefusalText += delta.text;
+            continue;
+          }
           session.agentMessageText += delta.text;
           if (isAgentValidationMessage(session.agentMessageText)) {
             session.validationRefusal = true;
             session.recentAssistantText = "";
+            continue;
+          }
+          // §2.3 п.13: the quota window reported as the whole agent
+          // message — swallowed like the verification marker. Earlier
+          // streamed prose stays in recentAssistantText for the handoff.
+          if (isAgentQuotaMessage(session.agentMessageText)) {
+            session.quotaRefusalText = session.agentMessageText;
             continue;
           }
           if (session.compact?.collecting) {

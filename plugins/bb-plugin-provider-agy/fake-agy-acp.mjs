@@ -210,6 +210,13 @@ async function runPrompt(id, text) {
     out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
     return;
   }
+  // §2.3 п.13: real agy reports an exhausted quota window the same way —
+  // one line of agent text with the reset countdown, turn closed cleanly.
+  if (text.includes("[[quota-text]]") || mode === "quota-text" || (mode === "quota-text-once" && once("qt"))) {
+    upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 127h43m16s.\n" } });
+    out({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", usage: usage() } });
+    return;
+  }
   // §2.3 п.11 (ревизия 13.1): the same refusal as a hard 403 — arrives as
   // a JSON-RPC error (session/prompt or session/new), not agent text.
   if (text.includes("[[validation-error]]") || mode === "validation-error" || (mode === "validation-error-once" && once("ve"))) {

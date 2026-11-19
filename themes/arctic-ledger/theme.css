@@ -268,6 +268,17 @@ diffs-container {
   --sidebar-accent: #7fa8d3;
 }
 
+/* Components that paint the dark --sidebar fill OUTSIDE the rail — e.g. the
+ * server-update banner renders its changelog preview as bg-sidebar — must
+ * keep light text tiers, or dark --muted-foreground lands on navy. */
+.bg-sidebar {
+  --foreground: #edf4ff;
+  --secondary-foreground: #edf4ff;
+  --muted-foreground: #c8d8ed;
+  --readback-foreground: #b7cae2;
+  --subtle-foreground: #9fb6d1;
+}
+
 /* Selected rows flip to dark ink on the cornflower fill. Every text tier must
  * follow, including --sidebar-foreground, which thread-title spans resolve. */
 [data-sidebar="panel"] [data-sidebar="sidebar"] .bg-sidebar-accent,
