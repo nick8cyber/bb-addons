@@ -574,6 +574,41 @@ test("§20.3 (r34.4): alias dictionaries validate shape and cycles", () => {
   assert.deepEqual(ok.policy?.quotaGroupAliases, { gOld: "g1" });
 });
 
+test("§20.3 (r34.4): routeAliases applies to level-chain validation", () => {
+  // A chain entry that exists only through an alias must not raise
+  // `route-undeclared` — §20.3 п.3 «Область применения».
+  const parsed = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: { review: { role: "auditor", chain: ["legacy-route"] } },
+      routes: {
+        "target-route": { preset: "p1", provider: "prov-x" },
+      },
+      routeAliases: { "legacy-route": "target-route" },
+    }),
+    new Set(["p1"]),
+  );
+  assert.deepEqual(parsed.errors, []);
+  assert.equal(parsed.policy?.levels.review?.chain[0], "legacy-route");
+
+  // An entry whose whole alias chain misses the routes table still
+  // fails the check.
+  const missing = parsePolicy(
+    JSON.stringify({
+      version: 1,
+      levels: { review: { role: "auditor", chain: ["ghost-route"] } },
+      routes: {
+        "target-route": { preset: "p1", provider: "prov-x" },
+      },
+      routeAliases: { "ghost-route": "nowhere" },
+    }),
+    new Set(["p1"]),
+  );
+  assert.ok(
+    missing.errors.some((e) => e.path === "levels.review.chain[0]"),
+  );
+});
+
 test("§20.3 (r34.4): canonicalPresetName/canonicalQuotaGroup follow preset aliases", () => {
   const policy: Policy = {
     version: 1,

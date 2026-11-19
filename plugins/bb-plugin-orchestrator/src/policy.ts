@@ -305,6 +305,39 @@ export function parsePolicy(
     }
   }
 
+  // §20.3 (r34.4): the alias dictionaries — `Record<alias, canonical>`,
+  // exact case, chains resolve to the terminal name; a cycle is a
+  // blocking `policy-error: alias-cycle`. Parsed before the levels:
+  // `routeAliases` applies to the chain-reference validation below.
+  const aliasesOf = (
+    key: "routeAliases" | "presetAliases" | "quotaGroupAliases",
+  ): Record<string, string> | undefined => {
+    const v = raw[key];
+    if (v === undefined) return undefined;
+    if (!isRecord(v)) {
+      err(key, t("pol.aliasObject"));
+      return undefined;
+    }
+    const out: Record<string, string> = {};
+    for (const [k, val] of Object.entries(v)) {
+      if (!isNonEmptyString(k) || !isNonEmptyString(val)) {
+        err(`${key}.${k || "?"}`, t("pol.aliasString"));
+        continue;
+      }
+      out[k] = val;
+    }
+    for (const k of Object.keys(out)) {
+      const chain = aliasChain(k, out);
+      if (chain.cycle) {
+        err(`${key}.${k}`, t("pol.aliasCycle", { chain: chain.names.join(" -> ") }));
+      }
+    }
+    return out;
+  };
+  const routeAliases = aliasesOf("routeAliases");
+  const presetAliases = aliasesOf("presetAliases");
+  const quotaGroupAliases = aliasesOf("quotaGroupAliases");
+
   // Levels + rule 2 (chain references).
   const levels: Record<string, PolicyLevel> = {};
   if (!isRecord(raw.levels)) {
@@ -343,7 +376,12 @@ export function parsePolicy(
         } else {
           chain = value.chain.map((r) => (r as string).trim());
           chain.forEach((routeName, i) => {
-            if (!routesRaw || !(routeName in routesRaw)) {
+            // §20.3 п.3: `routeAliases` applies here too — a chain entry
+            // is declared when any hop of its alias chain names a route.
+            const declared = routeNameChain(routeName, routeAliases).some(
+              (n) => routesRaw !== undefined && n in routesRaw,
+            );
+            if (!declared) {
               err(
                 `${path}.chain[${i}]`, t("pol.routeUndeclared", { route: routeName }));
             }
@@ -609,48 +647,19 @@ export function parsePolicy(
       const role = level.role ?? (levelName === "review" ? "auditor" : "executor");
       if (role !== "executor") continue;
       for (const routeName of level.chain) {
-        const route = findRoute(routes, routeName);
-        if (!route) continue;
+        const resolvedName = routeNameChain(routeName, routeAliases).find(
+          (n) => routes[n] !== undefined,
+        );
+        if (resolvedName === undefined) continue;
+        const route = routes[resolvedName]!;
         const detail = presetDetails.get(route.preset);
         if (detail && detail.environmentKind !== "new-worktree") {
           warn(
-            `routes.${routeName}.preset`, t("pol.presetNoWorktree", { preset: route.preset, kind: detail.environmentKind ?? "—", level: levelName }));
+            `routes.${resolvedName}.preset`, t("pol.presetNoWorktree", { preset: route.preset, kind: detail.environmentKind ?? "—", level: levelName }));
         }
       }
     }
   }
-
-  // §20.3 (r34.4): the alias dictionaries — `Record<alias, canonical>`,
-  // exact case, chains resolve to the terminal name; a cycle is a
-  // blocking `policy-error: alias-cycle`.
-  const aliasesOf = (
-    key: "routeAliases" | "presetAliases" | "quotaGroupAliases",
-  ): Record<string, string> | undefined => {
-    const v = raw[key];
-    if (v === undefined) return undefined;
-    if (!isRecord(v)) {
-      err(key, t("pol.aliasObject"));
-      return undefined;
-    }
-    const out: Record<string, string> = {};
-    for (const [k, val] of Object.entries(v)) {
-      if (!isNonEmptyString(k) || !isNonEmptyString(val)) {
-        err(`${key}.${k || "?"}`, t("pol.aliasString"));
-        continue;
-      }
-      out[k] = val;
-    }
-    for (const k of Object.keys(out)) {
-      const chain = aliasChain(k, out);
-      if (chain.cycle) {
-        err(`${key}.${k}`, t("pol.aliasCycle", { chain: chain.names.join(" -> ") }));
-      }
-    }
-    return out;
-  };
-  const routeAliases = aliasesOf("routeAliases");
-  const presetAliases = aliasesOf("presetAliases");
-  const quotaGroupAliases = aliasesOf("quotaGroupAliases");
 
   if (errors.length > 0) return done();
   return {

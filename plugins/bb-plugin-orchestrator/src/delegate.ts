@@ -924,12 +924,11 @@ export async function dispatchToRoute(
             if (now() - row.queued_at < waitMs) return "queued";
             return "busy-expired";
           }
-          // A free slot (or a first dispatch). The queue mark is NOT
-          // cleared here: a parked row that passed the gate keeps its
-          // claim while the spawn is in flight — `setThreadInfo` drops
-          // `queued_at` atomically with the thread_id write (r33
-          // ревью 2: clearing early left a window where the row held
-          // no slot at all).
+          // A free slot (or a first dispatch). The row keeps its
+          // `queued_at` claim through this gate; the spawn path below
+          // resets it right before spawning (`setQueuedAt(null)`) so a
+          // later `dispatch-unknown` lands in the §7 reconcile, not
+          // back in the queue-retry branch.
           return null;
         }
       : undefined;
