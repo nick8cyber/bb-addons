@@ -1010,7 +1010,8 @@ async function sendPrompt({
   backend = null,
   accountId = null,
   tier = null,
-  stateDir = null
+  stateDir = null,
+  verifyConversation = false
 }) {
   const isStrict = Boolean(strict || strictModel);
   throwIfPromptTooLarge(prompt);
@@ -1124,6 +1125,17 @@ async function sendPrompt({
     await upload();
 
     const initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled });
+
+    // §7.3: проверяемое восстановление — ненулевой convId сам по себе не
+    // доказывает, что разговор доступен: после навигации и стабилизации
+    // истории страница обязана остаться тем же разговором. Редирект Gemini
+    // на /app означает утраченный разговор — вызывающий передаёт сохранённый
+    // пакет целиком в новый чат, а не продолжает в пустом.
+    if (verifyConversation && convId && !page.url().includes(convId)) {
+      const lost = new Error('saved web conversation is not reachable');
+      lost.code = 'WEB_GEMINI_CONVERSATION_LOST';
+      throw lost;
+    }
 
     // SPA re-creates the editor node on re-renders (model menu, bootstrap) —
     // resolve it fresh each attempt and verify the text actually landed.

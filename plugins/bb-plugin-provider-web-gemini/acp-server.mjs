@@ -10,10 +10,12 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import * as webTools from "./src/web-tools.mjs";
-import { checkedAnswer, collectTask, formatTaskToolResult, packTask, prepareTask, taskThread, taskTool, verdictInstruction } from "./src/inner-context.mjs";
+import { checkedAnswer, collectTask, formatTaskToolResult, loadSettings, packTask, prepareTask, taskThread, taskTool, verdictInstruction } from "./src/inner-context.mjs";
+import { collectDiff } from "./src/review-git.mjs";
+import * as journal from "./src/turn-journal.mjs";
 import {
   existsSync,
   mkdirSync,
@@ -551,7 +553,7 @@ export function isBbSystemInstructionsBlock(block) {
 
 // Чистка каталогов uploads/downloads при старте: файлы старше maxAgeMs и
 // сверх keep последних по mtime удаляются.
-export function pruneDir(dir, { maxAgeMs = FILES_MAX_AGE_MS, keep = FILES_KEEP_COUNT } = {}) {
+export function pruneDir(dir, { maxAgeMs = FILES_MAX_AGE_MS, keep = FILES_KEEP_COUNT, protectedPaths = null } = {}) {
   let removed = 0;
   try {
     if (!existsSync(dir)) return { removed };
@@ -564,7 +566,7 @@ export function pruneDir(dir, { maxAgeMs = FILES_MAX_AGE_MS, keep = FILES_KEEP_C
           return null;
         }
       })
-      .filter((e) => e && e.st.isFile())
+      .filter((e) => e && e.st.isFile() && !(protectedPaths && protectedPaths.has(join(dir, e.n))))
       .sort((a, b) => a.st.mtimeMs - b.st.mtimeMs);
     let remaining = ents.length;
     for (const e of ents) {
@@ -1135,6 +1137,12 @@ function createTaskTurn(sessionId) {
       if (closed || controller.signal.aborted) return;
       stage = next;
       slog("task:stage", { sessionId, stage });
+      if (turn.journal && turn.journal.turn.stage !== next) {
+        turn.journal.turn.stage = next;
+        try {
+          journal.saveTurn(STATE_DIR, turn.journal.sessKey, turn.journal.turn);
+        } catch {}
+      }
       progress("in_progress");
     },
     heartbeat(ms) {
@@ -1142,7 +1150,7 @@ function createTaskTurn(sessionId) {
       interval = setInterval(() => turn.ping(stage), ms);
       interval.unref();
     },
-    async finish(outcome, reason = "") {
+    async finish(outcome, reason = "", answerText = null) {
       if (closed) return;
       closed = true;
       clearInterval(interval);
@@ -1165,6 +1173,14 @@ function createTaskTurn(sessionId) {
         progress("in_progress");
       }
       progress(outcome === "passed" ? "completed" : "failed", result);
+      // §7.2: терминальный исход хода фиксируется в постоянном журнале.
+      if (turn.journal) {
+        try {
+          journal.completeTurn(STATE_DIR, turn.journal.sessKey, turn.journal.turn, { outcome, reason: reason || null, answer: answerText });
+        } catch (error) {
+          slog("task:journal-error", { sessionId, error: String(error?.message || error) });
+        }
+      }
       for (const file of turn.ownedFiles) {
         try { unlinkSync(file); } catch {}
       }
@@ -1431,18 +1447,97 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       let packed;
       let messageLimit = webTools.effectiveMessageBytes();
       let packageOptions;
+
+      // §7.3: состояние продолжения хода. resumedConv — ход продолжается в
+      // прежнем разговоре (первая отправка — напоминание, не пакет);
+      // конвертация в повторную доставку одноразовая (resumeFallbackDone).
+      let resumedConv = Boolean(task?.resume?.convId);
+      let convVerify = resumedConv;
+      let resumeFallbackDone = false;
+      // Повторная доставка «продолжай»: сохранённый пакет целиком + обмены
+      // хода + поручение. При переполнении лимита пакет+обмены уходят
+      // spill-файлом, поручение обязано поместиться (§5.2).
+      const buildRedelivery = (instruction) => {
+        const stored = task.resume.pkg;
+        const prior = journal.readExchanges(STATE_DIR, task.journal.sessKey, task.resume.turn.turnNo)
+          .map((e) => e.text).filter(Boolean).join("\n");
+        const heading = "\n\n=== Продолжение прерванного хода / Resumed turn ===\n";
+        const tail = "=== Поручение / Instruction ===\n" + instruction;
+        let extraFiles = [];
+        let message = stored.message + heading + (prior ? prior + "\n\n" : "") + tail;
+        if (Buffer.byteLength(message) > messageLimit) {
+          const spill = webTools.writeSpillPackage(UPLOADS_DIR, randomUUID(), stored.message + heading + prior);
+          task.ownedFiles.push(spill.pkgPath);
+          extraFiles = [spill.pkgPath];
+          message = "Resume the interrupted task: the complete saved package and prior tool results are in the attached " +
+            spill.pkgName + ".\n\n" + tail;
+        }
+        if (Buffer.byteLength(message) > messageLimit) {
+          throw new TaskTurnError("recovery: saved instruction does not fit the web textbox limit");
+        }
+        const fileBytes = [...stored.files, ...extraFiles].reduce((total, path) => {
+          try { return total + statSync(path).size; } catch { return total; }
+        }, 0);
+        const totalBytes = Buffer.byteLength(message) + fileBytes;
+        if (totalBytes > context.settings.maxTotalBytes) {
+          throw new TaskTurnError("recovery: saved task context does not fit the delivery budget");
+        }
+        return { message, files: [...stored.files, ...extraFiles], packageSha256: stored.packageSha256, totalBytes };
+      };
+      // Точный повтор шлёт сохранённый пакет дословно (текст задачи уже в
+      // пакете); «продолжай» — пакет + обмены + поручение.
+      const redeliveryPackage = () =>
+        task.resume.exact ? task.resume.pkg : buildRedelivery(task.resume.instruction);
+      // Конвертация продолжения в повторную доставку: разговор недоступен —
+      // новый чат получает сохранённый пакет (§7.3), не пустой промпт.
+      const switchToRedelivery = (reason) => {
+        resumeFallbackDone = true;
+        resumedConv = false;
+        convVerify = false;
+        s.convId = null;
+        s.backend = null;
+        task.resume.convId = null;
+        if (task.journal) {
+          task.journal.turn.convId = null;
+          try {
+            journal.saveTurn(STATE_DIR, task.journal.sessKey, task.journal.turn);
+          } catch {}
+        }
+        packed = redeliveryPackage();
+        slog("task:resume-redeliver", { sessionId, turnNo: task.journal?.turn?.turnNo, reason });
+      };
+
       if (task) {
         task.ping("collect");
         try {
-          packageOptions = {
-            signal: task.signal, maxUploadBytes: argonMaxUploadBytes(), maxUploadCount: argonMaxUploadCount(),
-            validateUploads: (blocks) => collectUploadFiles(blocks, s), spillDir: UPLOADS_DIR, ownedFiles: task.ownedFiles,
-            limit: messageLimit,
-          };
-          collected = await collectTask(context, attachments.blocks, packageOptions);
-          packed = packTask(context, collected, packageOptions);
-          task.packageSha256 = packed.packageSha256;
-          slog("task:package", { sessionId, packageSha256: packed.packageSha256, totalBytes: packed.totalBytes });
+          if (task.resume) {
+            // §7.3: продолжение хода — пакет берётся из записи журнала
+            // (целостность проверена loadTurnPackage); diff для инструментов
+            // перечитывается по записанному в ходе закреплённому SHA.
+            collected = { reviewDiff: null };
+            if (context.pin) {
+              const diffs = await collectDiff(context.root, context.pin, context.settings.maxTotalBytes, task.signal);
+              collected.reviewDiff = diffs.length ? Object.freeze({ stat: diffs[0].stat, patch: diffs[0].patch }) : null;
+            }
+            packed = redeliveryPackage();
+            task.packageSha256 = packed.packageSha256;
+            slog("task:package-resume", { sessionId, packageSha256: packed.packageSha256, turnNo: task.journal.turn.turnNo });
+          } else {
+            packageOptions = {
+              signal: task.signal, maxUploadBytes: argonMaxUploadBytes(), maxUploadCount: argonMaxUploadCount(),
+              validateUploads: (blocks) => collectUploadFiles(blocks, s), spillDir: UPLOADS_DIR, ownedFiles: task.ownedFiles,
+              limit: messageLimit,
+            };
+            collected = await collectTask(context, attachments.blocks, packageOptions);
+            packed = packTask(context, collected, packageOptions);
+            task.packageSha256 = packed.packageSha256;
+            // §7.2: пакет сохраняется в журнал до доставки — повторная
+            // доставка после рестарта шлёт именно его, а не пустой промпт.
+            if (task.journal) {
+              journal.stageTurnPackage(STATE_DIR, task.journal.sessKey, task.journal.turn, packed);
+            }
+            slog("task:package", { sessionId, packageSha256: packed.packageSha256, totalBytes: packed.totalBytes });
+          }
         } catch (error) {
           if (task.signal.aborted) return { cancelled: true };
           const reason = error.code ? "could not read or stage mandatory task materials" : error.message;
@@ -1472,6 +1567,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         if (s.cancelled || task?.signal.aborted) return { cancelled: true };
         const bound = await bindBackend(s, sessionId);
         if (bound.error) {
+          if (task?.resume?.convId && s.convId && !resumeFallbackDone) {
+            // Прежний backend недоступен — повторная доставка в новый чат.
+            switchToRedelivery("backend-unavailable");
+            continue;
+          }
           slog("bind:error", { sessionId, error: bound.error });
           throw new Error(bound.error);
         }
@@ -1516,8 +1616,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             // PLUG-291: пользовательские файлы идут веб-вложениями первой
             // отправкой попытки (перед вставкой текста, без insertText);
             // при ротации на новый чат файлы прикладываются заново.
-            let filesPending = task ? [...packed.files] : uploadFiles.length ? uploadFiles.slice() : null;
-            let delivered = false;
+            let filesPending = task ? (resumedConv ? null : [...packed.files]) : uploadFiles.length ? uploadFiles.slice() : null;
+            let delivered = resumedConv;
             const toolLimit = Math.min(webTools.MAX_TOOL_RESULT_BYTES, webTools.effectiveMessageBytes());
             const contract = task ? verdictInstruction(context) : "";
             // §3 Tool Loop: все раунды — в том же convId на том же бэкенде,
@@ -1582,6 +1682,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 accountId: backend.id,
                 tier: backend.tier,
                 stateDir: STATE_DIR,
+                // §7.3: проверяемое восстановление — драйвер подтверждает,
+                // что страница осталась тем же разговором.
+                verifyConversation: convVerify,
                 onChunk: task ? null : (c) => {
                   if (c && !s.cancelled && s.activeGen === gen) {
                     streamedAny = true;
@@ -1596,6 +1699,16 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               try {
                 res = await sendWebPrompt(request);
               } catch (error) {
+                // §7.3: сохранённый разговор недоступен (редирект на новый
+                // чат) — одноразовая конвертация в повторную доставку
+                // сохранённого пакета с обменами хода.
+                if (task && resumedConv && error.code === "WEB_GEMINI_CONVERSATION_LOST" && !resumeFallbackDone) {
+                  switchToRedelivery("conversation-lost");
+                  delivered = false;
+                  filesPending = [...packed.files];
+                  task.ping("delivery");
+                  return sendOnce(packed.message, false);
+                }
                 if (!task || !canRepack || error.code !== "WEB_GEMINI_PROMPT_TOO_LARGE" ||
                     !Number.isSafeInteger(error.maxPromptBytes) || error.maxPromptBytes <= 0 ||
                     error.maxPromptBytes >= messageLimit) throw error;
@@ -1604,7 +1717,16 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 messageLimit = error.maxPromptBytes;
                 if (!delivered) {
                   try {
-                    packed = packTask(context, collected, { ...packageOptions, limit: messageLimit });
+                    if (task.resume) {
+                      // Повторная доставка собирается из сохранённого пакета —
+                      // перепаковывается под новый лимит только её обёртка.
+                      packed = redeliveryPackage();
+                    } else {
+                      packed = packTask(context, collected, { ...packageOptions, limit: messageLimit });
+                      if (task.journal) {
+                        journal.stageTurnPackage(STATE_DIR, task.journal.sessKey, task.journal.turn, packed);
+                      }
+                    }
                     task.packageSha256 = packed.packageSha256;
                     slog("task:package", { sessionId, packageSha256: packed.packageSha256, totalBytes: packed.totalBytes });
                   } catch {
@@ -1616,8 +1738,29 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               }
               filesPending = null;
               if (task) delivered = true;
+              convVerify = false;
               if (res && res.convId) {
                 s.convId = res.convId;
+              }
+              if (task?.journal && res) {
+                // §7.2: после доставки фиксируем разговор, backend и расход
+                // контекста; ответ модели — в обмены хода для повторной
+                // доставки после рестарта.
+                const tj = task.journal;
+                tj.turn.delivered = true;
+                if (res.convId) {
+                  tj.turn.convId = res.convId;
+                  tj.turn.backendId = backend.id;
+                }
+                tj.turn.budgets = tj.turn.budgets || {};
+                tj.turn.budgets.contextBytes = Math.max(0, context.settings.maxTotalBytes - Math.max(0, remainingContext));
+                try {
+                  journal.saveTurn(STATE_DIR, tj.sessKey, tj.turn);
+                  if (res.convId) journal.saveSessionRecord(STATE_DIR, tj.entry, { convId: res.convId, backendId: backend.id });
+                  if (res.text) journal.appendExchange(STATE_DIR, tj.sessKey, tj.turn, { kind: "reply", text: String(res.text).slice(0, 120_000) });
+                } catch (journalError) {
+                  slog("task:journal-error", { sessionId, error: String(journalError?.message || journalError) });
+                }
               }
               if (!task) emitGenerated(res);
               slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
@@ -1625,11 +1768,22 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             };
             let toolSeq = 0;
             const loop = await webTools.runToolLoop({
-              firstMessage: task ? packed.message : s.convId ? text : packed.message,
+              firstMessage: task ? (resumedConv ? text : packed.message) : s.convId ? text : packed.message,
               send: sendOnce,
               execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
               onToolRound: task ? () => task.ping("request_more") : null,
-              ...(task ? { formatResult: (call, result) => formatTaskToolResult(context, call, result) } : {}),
+              ...(task ? {
+                formatResult: (call, result) => {
+                  const formatted = formatTaskToolResult(context, call, result);
+                  if (task.journal) {
+                    try {
+                      journal.appendExchange(STATE_DIR, task.journal.sessKey, task.journal.turn,
+                        { kind: "tool-result", name: call.name, ok: result.ok !== false, text: formatted });
+                    } catch {}
+                  }
+                  return formatted;
+                },
+              } : {}),
               onToolStart: (call) => {
                 const toolCallId = task ? "gemini-read-" + randomUUID() : "argtool-" + (++toolSeq);
                 upd({
@@ -1672,8 +1826,14 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 if (final.denied) throw new TaskTurnError(final.denied);
                 if (repair >= context.settings.maxRepairRounds) throw new TaskTurnError(final.repair);
                 task.ping("request_more");
-                candidate = await sendOnce("Correct the previous reply. " + final.repair +
-                  ". Return the complete publishable final answer without tool calls or file envelopes.\n" + contract);
+                const repairMessage = "Correct the previous reply. " + final.repair +
+                  ". Return the complete publishable final answer without tool calls or file envelopes.\n" + contract;
+                if (task.journal) {
+                  try {
+                    journal.appendExchange(STATE_DIR, task.journal.sessKey, task.journal.turn, { kind: "repair", text: repairMessage });
+                  } catch {}
+                }
+                candidate = await sendOnce(repairMessage);
               }
             }
             // PLUG-291: текстовая строка-указатель на скачанные файлы —
@@ -1814,7 +1974,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         if (task.signal.reason === "deadline exceeded") throw new TaskTurnError("deadline exceeded");
         if (isCancelled || task.signal.aborted) await task.finish("failed", "cancelled");
         else {
-          await task.finish("passed");
+          await task.finish("passed", "", result.text);
           upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: result.text } });
         }
       }
@@ -1906,6 +2066,113 @@ async function sendSession(id, sessionId, session) {
   });
 }
 
+/* ---------- §7.2/§7.3: постоянный журнал хода и продолжение ---------- */
+
+const taskInputSha256 = (text) => createHash("sha256").update(String(text)).digest("hex");
+
+// Запись сессии просрочена по state.retentionMs её проекта (§9): продолжать
+// по ней нельзя — молчаливая выдача новой пустой сессии запрещена.
+function sessionRecordExpired(record) {
+  let retentionMs = 86_400_000;
+  try {
+    retentionMs = loadSettingsRetention(record?.projectId);
+  } catch {}
+  return Date.now() - (record?.updatedAt || 0) > retentionMs;
+}
+
+function loadSettingsRetention(projectId) {
+  try {
+    return loadSettings(STATE_DIR, projectId).stateRetentionMs;
+  } catch {
+    return 86_400_000;
+  }
+}
+
+// Разговор можно восстановить только на прежнем backend: запись должна
+// указывать живой аккаунт пула вне cooldown. Смена backend — повторная
+// доставка пакета в новый чат (§7.3), а не продолжение convId.
+function convBackendUsable(backendId) {
+  const b = BACKENDS.find((x) => x.id === backendId);
+  if (!b) return false;
+  try {
+    const state = loadState();
+    return (accEntry(state, b.id)?.cooldownUntilMs ?? 0) <= Date.now();
+  } catch {
+    return false;
+  }
+}
+
+// План хода до внешней работы: запись сессии, монотонный номер хода, точный
+// повтор/«продолжай» незавершённого хода либо новая запись. Возвращает
+// { kind: "fresh"|"resume" } либо { errorOutcome, reason }.
+async function planTaskTurn({ session, sessionId, context, text, signal }) {
+  let entry = session.journal;
+  if (!entry) {
+    entry = journal.findSessionRecord(STATE_DIR, sessionId);
+    if (!entry) {
+      entry = journal.createSessionRecord(STATE_DIR, {
+        sessionId,
+        threadId: session.thread?.thread?.id ?? null,
+        projectId: session.thread?.thread?.projectId ?? null,
+        fingerprint: await journal.worktreeFingerprint(context.cwd),
+        accessCeiling: "read-only",
+        roots: session.roots,
+        model: session.model,
+        thinking: session.thinking,
+        account: session.account,
+      });
+    }
+    session.journal = entry;
+  }
+  const sessKey = entry.key;
+  const inputSha256 = taskInputSha256(text);
+  const turns = journal.listTurns(STATE_DIR, sessKey);
+  const last = turns.at(-1);
+  if (last?.corrupt) {
+    return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt" };
+  }
+  const unfinished = last && !last.record.outcome ? last : null;
+  if (unfinished) {
+    const turn = unfinished.record;
+    const isResume = turn.taskSha256 === inputSha256 || journal.isContinueText(text);
+    if (!isResume) {
+      // Полная новая задача с другим отпечатком входа — прежний незавершённый
+      // ход закрывается, задача получает новый номер хода.
+      journal.completeTurn(STATE_DIR, sessKey, turn, { outcome: "failed", reason: "superseded by a new task input" });
+    } else {
+      // Продолжение: версия записи и целостность сохранённого пакета (§7.3).
+      journal.addAttempt(STATE_DIR, sessKey, turn, inputSha256);
+      const pkg = journal.loadTurnPackage(STATE_DIR, sessKey, turn);
+      if (!pkg.ok) {
+        journal.completeTurn(STATE_DIR, sessKey, turn, { outcome: "failed", reason: "recovery: " + pkg.reason });
+        return { errorOutcome: "failed", reason: "recovery: " + pkg.reason };
+      }
+      turn.stage = "restore";
+      journal.saveTurn(STATE_DIR, sessKey, turn);
+      // При восстановлении ветка из строки проверяемого итога заново не
+      // разрешается: закреплённый SHA и договор вердикта берутся из записи.
+      context.pin = turn.pin ?? context.pin;
+      const verdict = journal.deserializeVerdict(turn.verdict);
+      if (verdict) context.verdict = verdict;
+      // Точный повтор (тот же отпечаток входа) повторяет пакет дословно;
+      // «продолжай» добавляет к пакету обмены и само поручение.
+      return { kind: "resume", sessKey, turn, pkg, exact: turn.taskSha256 === inputSha256 };
+    }
+  }
+  if (!turns.length && journal.isContinueText(text)) {
+    return { errorOutcome: "not_started", reason: "a bare continue has no saved task package to resume" };
+  }
+  const turn = journal.createTurn(STATE_DIR, entry, {
+    inputSha256,
+    mode: "read-only",
+    head: await journal.headOf(context.root ?? context.cwd, signal),
+    pin: context.pin,
+    expected: context.verdict ? "verdict" : "text",
+    verdict: journal.serializeVerdict(context.verdict),
+  });
+  return { kind: "fresh", sessKey, turn };
+}
+
 async function runBoundPrompt(msg, session) {
   if (session.activeTask) {
     turnError(msg.id, "not_started", "session already has an active task turn");
@@ -1916,7 +2183,10 @@ async function runBoundPrompt(msg, session) {
   session.activeTask = task;
   try {
     task.signal.throwIfAborted();
-    const thread = session.thread;
+    let thread = session.thread;
+    if (!thread && BB_THREAD_ARG) {
+      thread = session.thread = await taskThread(BB_THREAD_ARG.slice("--bb-thread-id=".length)).catch(() => null);
+    }
     if (!thread) throw new TaskTurnError("could not verify trusted BB thread metadata");
     if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") throw new TaskTurnError("full grants read-only access");
     if (!Array.isArray(prompt)) throw new TaskTurnError("prompt must be an array of blocks");
@@ -1931,16 +2201,188 @@ async function runBoundPrompt(msg, session) {
     if (context.pin?.sha) {
       slog("task:pinned-sha", { sessionId, sha: context.pin.sha, base: context.pin.base });
     }
+    // §7.2: номер хода и запись журнала выделяются до внешней работы;
+    // точный повтор/«продолжай» незавершённого хода продолжает его по §7.3.
+    let plan;
+    try {
+      plan = await planTaskTurn({ session, sessionId, context, text, signal: task.signal });
+    } catch (journalError) {
+      throw new TaskTurnError(`task journal is unavailable: ${journalError?.code || journalError?.message || journalError}`);
+    }
+    if (plan.errorOutcome) {
+      const planError = new TaskTurnError(plan.reason);
+      planError.outcome = plan.errorOutcome;
+      throw planError;
+    }
+    task.journal = { sessKey: plan.sessKey, turn: plan.turn, entry: session.journal };
+    if (plan.kind === "resume") {
+      // convId восстанавливается только на прежнем backend вне cooldown;
+      // иначе ход получает повторную доставку сохранённого пакета в новый чат.
+      const useConv = Boolean(plan.turn.convId) && convBackendUsable(plan.turn.backendId);
+      task.resume = { convId: useConv ? plan.turn.convId : null, pkg: plan.pkg, instruction: text, turn: plan.turn, exact: plan.exact };
+      if (useConv) {
+        session.convId = plan.turn.convId;
+        session.backend = BACKENDS.find((b) => b.id === plan.turn.backendId) ?? session.backend;
+      }
+      slog("task:resume", { sessionId, turnNo: plan.turn.turnNo, attempt: plan.turn.attempts?.at(-1)?.n, convId: useConv ? plan.turn.convId : null });
+    }
     if (Date.now() >= task.deadline) task.stop("deadline exceeded");
     task.signal.throwIfAborted();
     await runPrompt(msg.id, sessionId, text, { task, context, blocks });
   } catch (error) {
+    const outcome = error.outcome ?? "not_started";
     const reason = task.signal.reason ?? (error.code ? "invalid task input or working directory" : error.message);
-    await task.finish("not_started", reason);
-    turnError(msg.id, "not_started", reason);
+    await task.finish(outcome, reason);
+    turnError(msg.id, outcome, reason);
   } finally {
     if (session.activeTask === task) session.activeTask = null;
   }
+}
+
+// Восстановление сессии из записи журнала в живую сессию (§7.2/§7.3).
+// Проверки: версия записи, владелец (BB thread), отпечаток каталога
+// (session cwd или roots), потолок прав, срок хранения. При отказе —
+// not_started с причиной; пустой чат никогда не создаётся.
+function restoreSessionFromRecord(requestedId, entry, cwd) {
+  const s = {
+    id: requestedId,
+    cwd: cwd || null,
+    roots: Array.isArray(entry.record.roots) ? entry.record.roots : [],
+    model: entry.record.model ?? "argon",
+    thinking: entry.record.thinking ?? "medium",
+    convId: entry.record.convId ?? null,
+    account: entry.record.account ?? "auto",
+    backend: BACKENDS.find((b) => b.id === entry.record.backendId) ?? null,
+    journal: entry,
+  };
+  sessions.set(requestedId, s);
+  sessions.set(entry.record.sessionId, s);
+  for (const alias of entry.record.aliases ?? []) sessions.set(alias, s);
+  journal.addSessionAlias(STATE_DIR, entry, requestedId);
+  return s;
+}
+
+// Проверка записи сессии против запроса session/load (§9): владелец, каталог,
+// потолок прав, срок хранения. null — запись пригодна; строка — причина отказа.
+async function validateSessionRecord(entry, cwd) {
+  const record = entry.record;
+  if (!record || record.version !== journal.JOURNAL_VERSION) {
+    return "saved session record is corrupt or has an unsupported version";
+  }
+  if (BB_THREAD_ARG) {
+    const threadId = BB_THREAD_ARG.slice("--bb-thread-id=".length);
+    if (record.threadId !== threadId) {
+      return "saved session belongs to a different owner thread";
+    }
+  }
+  if (cwd) {
+    const fp = await journal.worktreeFingerprint(cwd).catch(() => null);
+    if (!fp || !journal.fingerprintEqual(fp, record.fingerprint)) {
+      return "saved session belongs to a different working directory";
+    }
+  }
+  if (record.accessCeiling && record.accessCeiling !== "read-only") {
+    return `saved session requires ${record.accessCeiling}, not permitted by the read-only ceiling`;
+  }
+  if (sessionRecordExpired(record)) {
+    return "saved session record is expired";
+  }
+  return null;
+}
+
+// §7.2: профиль записи сессии (модель/thinking/аккаунт) персистится —
+// восстановление после рестарта продолжает с теми же параметрами.
+function persistSessionProfile(s) {
+  if (!s?.journal) return;
+  try {
+    journal.saveSessionRecord(STATE_DIR, s.journal, { model: s.model, thinking: s.thinking, account: s.account });
+  } catch {}
+}
+
+// §7.2: session/new — резервный путь восстановления. Если для этого
+// BB-треда и каталога уже есть ровно одна запись журнала, новая сессия
+// становится алиасом к ней, а не пустым чатом.
+async function handleSessionNew(msg, p) {
+  const uniq = `${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
+  const sessionId = `web-gemini-${uniq}`;
+  if (BB_THREAD_ARG) {
+    const threadId = BB_THREAD_ARG.slice("--bb-thread-id=".length);
+    const fp = p.cwd ? await journal.worktreeFingerprint(p.cwd).catch(() => null) : null;
+    const candidates = fp
+      ? journal.listSessionRecords(STATE_DIR).filter(
+          (e) => e.record && !e.corrupt && e.record.version === journal.JOURNAL_VERSION &&
+            e.record.threadId === threadId && journal.fingerprintEqual(e.record.fingerprint, fp))
+      : [];
+    if (candidates.length > 1) {
+      turnError(msg.id, "not_started", "ambiguous saved session records for this thread and directory");
+      return;
+    }
+    if (candidates.length === 1) {
+      const entry = candidates[0];
+      if (sessionRecordExpired(entry.record)) {
+        turnError(msg.id, "not_started", "saved session record is expired");
+        return;
+      }
+      const s = restoreSessionFromRecord(sessionId, entry, p.cwd);
+      sessions.set(`argon-${uniq}`, s);
+      slog("session:new-alias", { sessionId, restored: entry.record.sessionId });
+      void sendSession(msg.id, sessionId, s);
+      return;
+    }
+  }
+  const s = {
+    id: sessionId,
+    cwd: p.cwd || null,
+    roots: dirRootsFrom(p),
+    model: "argon",
+    thinking: "medium",
+    convId: null,
+    account: "auto",
+    backend: null,
+  };
+  sessions.set(sessionId, s);
+  sessions.set(`argon-${uniq}`, s);
+  void sendSession(msg.id, sessionId, s);
+}
+
+// §7.2/§9: session/load — восстановление по идентификатору сессии или алиасу.
+async function handleSessionLoad(msg, p) {
+  const sessionId = p.sessionId;
+  if (sessionId && sessions.has(sessionId)) {
+    void sendSession(msg.id, sessionId, sessions.get(sessionId));
+    return;
+  }
+  if (sessionId) {
+    const entry = journal.findSessionRecord(STATE_DIR, sessionId);
+    if (!entry) {
+      turnError(msg.id, "not_started", `unknown saved session "${sessionId}"`);
+      return;
+    }
+    const rejection = await validateSessionRecord(entry, p.cwd);
+    if (rejection) {
+      turnError(msg.id, "not_started", rejection);
+      return;
+    }
+    const s = restoreSessionFromRecord(sessionId, entry, p.cwd);
+    slog("session:load", { sessionId, restored: entry.record.sessionId, convId: s.convId });
+    void sendSession(msg.id, sessionId, s);
+    return;
+  }
+  // Без sessionId — как раньше: новая чат-сессия.
+  const newId = `web-gemini-${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
+  const s = {
+    id: newId,
+    cwd: p.cwd || null,
+    roots: dirRootsFrom(p),
+    model: "argon",
+    thinking: "medium",
+    convId: null,
+    account: "auto",
+    backend: null,
+  };
+  sessions.set(newId, s);
+  sessions.set(`argon-${newId.slice("web-gemini-".length)}`, s);
+  void sendSession(msg.id, newId, s);
 }
 
 export function dispatch(msg) {
@@ -1961,7 +2403,7 @@ export function dispatch(msg) {
           protocolVersion: p.protocolVersion ?? 1,
           agentInfo: { name: "web-gemini", version: "0.2.0" },
           agentCapabilities: {
-            loadSession: false,
+            loadSession: true,
             promptCapabilities: { image: false, audio: false, embeddedContext: true },
             sessionCapabilities: {},
           },
@@ -1971,44 +2413,12 @@ export function dispatch(msg) {
       return;
 
     case "session/new": {
-      const uniq = `${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
-      const sessionId = `web-gemini-${uniq}`;
-      const s = {
-        id: sessionId,
-        cwd: p.cwd || null,
-        roots: dirRootsFrom(p),
-        model: "argon",
-        thinking: "medium",
-        convId: null,
-        account: "auto",
-        backend: null,
-      };
-      sessions.set(sessionId, s);
-      sessions.set(`argon-${uniq}`, s);
-      void sendSession(msg.id, sessionId, s);
+      void handleSessionNew(msg, p);
       return;
     }
 
     case "session/load": {
-      const sessionId = p.sessionId || `web-gemini-${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
-      let s = sessions.get(sessionId);
-      if (!s) {
-        s = {
-          id: sessionId,
-          cwd: p.cwd || null,
-          roots: dirRootsFrom(p),
-          model: "argon",
-          thinking: "medium",
-          convId: null,
-          account: "auto",
-          backend: null,
-        };
-        sessions.set(sessionId, s);
-        if (!p.sessionId) {
-          sessions.set(`argon-${sessionId.slice("web-gemini-".length)}`, s);
-        }
-      }
-      void sendSession(msg.id, sessionId, s);
+      void handleSessionLoad(msg, p);
       return;
     }
 
@@ -2062,6 +2472,7 @@ export function dispatch(msg) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown config option "${cid}"` } });
         return;
       }
+      persistSessionProfile(s);
       out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS, loadState()) } });
       return;
     }
@@ -2085,6 +2496,7 @@ export function dispatch(msg) {
       s.model = val;
       if (!s.thinking) s.thinking = "medium";
       resetAccountForModel(s);
+      persistSessionProfile(s);
       out({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptionsFor(s, BACKENDS, loadState()) } });
       return;
     }
@@ -2180,8 +2592,32 @@ function dispatchPrompt(msg, sess) {
 export function startServer({ webDriver } = {}) {
   if (webDriver) driver = webDriver;
   reapOrphanAcpServers();
+  // §7.2/§9: чистка журнала (TTL/лимит записей) до чистки вложений — файлы,
+  // нужные восстановлению активных ходов, защищены от pruneDir.
+  try {
+    // §9: срок хранения и лимит записей — из inner-agent.json каждой записи;
+    // лимит для общей чистки — минимум по существующим записям (консервативно).
+    const settingsFor = (entry) => {
+      try {
+        return loadSettings(STATE_DIR, entry?.record?.projectId);
+      } catch {
+        return null;
+      }
+    };
+    let maxRecords = Infinity;
+    for (const entry of journal.listSessionRecords(STATE_DIR)) {
+      const limit = settingsFor(entry)?.stateMaxRecords;
+      if (Number.isFinite(limit)) maxRecords = Math.min(maxRecords, limit);
+    }
+    journal.pruneJournal(STATE_DIR, {
+      maxRecords: Number.isFinite(maxRecords) ? maxRecords : undefined,
+      retentionFor: (entry) => settingsFor(entry)?.stateRetentionMs,
+    });
+  } catch (error) {
+    slog("journal:prune-error", { error: String(error?.message || error) });
+  }
   // PLUG-291: чистка каталогов веб-вложений при старте (TTL 24ч, ≤20 файлов).
-  pruneDir(UPLOADS_DIR);
+  pruneDir(UPLOADS_DIR, { protectedPaths: journal.collectProtectedPaths(STATE_DIR) });
   pruneDir(DOWNLOADS_DIR);
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on("line", (line) => {
