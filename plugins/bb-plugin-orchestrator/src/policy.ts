@@ -91,6 +91,10 @@ export interface PolicyTiming {
   coordinatorMaxNudges?: number;
   /** §5.6 (r33.11): сторож координатора включён (default true). */
   coordinatorWatchdogEnabled?: boolean;
+  /** §5.6 (r34.1): предел неактивности координатора — тред без
+   * пользовательского хода или продуктивного действия старше этого
+   * возраста сторож не будит никогда (default 24 ч). */
+  coordinatorMaxThreadAgeHours?: number;
 }
 
 export interface PolicyIssue {
@@ -482,6 +486,7 @@ export function parsePolicy(
         bbNotifyWaitSeconds: [5, 3600],
         coordinatorIdleMinutes: [1, 1440],
         coordinatorMaxNudges: [1, 100],
+        coordinatorMaxThreadAgeHours: [1, 720],
       };
       for (const [key, [min, max]] of Object.entries(bounds) as [
         keyof PolicyTiming,

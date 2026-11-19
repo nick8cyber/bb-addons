@@ -10,7 +10,9 @@ export const RU: Record<string, string> = {
     "Полный порядок — навык `orchestrator-coordinator-ru`. " +
     "Отчёт исполнителя придёт сообщением — не жди его в форграунде.",
   "instr.ruleFooter":
-    "Не раздавай исполнителям вручную (`bb tasks dispatch`, `bb thread spawn`) — только delegate.",
+    "Не раздавай исполнителям вручную (`bb tasks dispatch`, `bb thread spawn`) — только delegate. " +
+    "Базу SQLite плагина не открывай и не меняй — только команды плагина " +
+    "(сверка внешне влитых задач: `bb orchestrator merge <KEY> --mark-merged` или закрытие задачи в трекере).",
   "instr.tagReleasePipeline": " (только конвейер release, не раздавать)",
   "instr.tagAuditor": " (проверка — только чтение)",
   "instr.reviewByLevel":
@@ -423,6 +425,13 @@ export const RU: Record<string, string> = {
   "rel.prNoOutput": "PR не открыт: {out}",
   "rel.prNoOutputWord": "нет вывода",
   "rel.published": "выложено {taskKey}: {sha7} в {branch}; задача done",
+  // §2 п.0.2 (r11.9): результат уже на origin/<target> — upstream-выкладка.
+  "rel.publishedUpstream":
+    "выложено {taskKey}: уже в {branch} ({sha7}); задача done",
+  "rel.upstreamCommitMissing":
+    "upstream-commit-missing: отмеченный коммит {sha7} не найден на origin/{target} — выкладка отклонена, задача не закрыта",
+  "rel.upstreamNoRepo":
+    "no-repo: локальный репозиторий проекта {project} не найден для upstream-выкладки",
   "rel.branchPublished":
     "ветка опубликована {taskKey}: {branch}; PR открой вручную",
   "rel.prCreated": "PR открыт {taskKey}: —; слежу до влития",
@@ -575,6 +584,8 @@ export const RU: Record<string, string> = {
     "release {taskKey}: аудит запущен (release #{id}, тред {thread}; " +
     "проект настройки {settings}, проект делегирования {delegation})",
   "cli.scanWarnings": "\nпредупреждения скана:\n{list}",
+  "cli.releaseDoneUpstream":
+    "release {taskKey}: уже в upstream — выкладка завершена (release #{id}); задача done\n",
   "cli.releaseReminder":
     "\nитог придёт сообщением [orchestrator] — закончи ход.\n",
   "cli.delegated":
@@ -838,7 +849,7 @@ export const RU: Record<string, string> = {
   "wd.dispatchNotConfirmed": "раздача не подтверждена: делегирование #{id} удалено (тред раздачи не найден)",
   "wd.attachVerify": "{task}: привязка исполнителя {thread} не подтверждена ({err}) — сверка повторяет",
   "wd.compactReminder": "[orchestrator] контекст был сжат — напоминание §3: раздача только через orchestrator_delegate; итоги исполнителей приходят сообщениями [orchestrator] — ждать в форграунде нельзя. Делегирования: {parts}. Хендофф: {handoff}",
-  "watchdog.coordinatorNudge": "Напоминание ({nudge}/{max}): координатор простаивает {idleMinutes} мин при незавершённых делах. Задачи, ожидающие действия: {taskList}. Продолжай работу (раздача, merge, release).",
+  "watchdog.coordinatorNudge": "Напоминание ({nudge}/{max}): координатор простаивает {idleMinutes} мин. Задачи, ожидающие внимания: {taskList}. Проверь состояние задач конвейера; если они уже закрыты или влиты внешним PR, ничего не делай — сверка снимет их сама (при squash/rebase: закрой задачу в трекере или выполни `bb orchestrator merge <KEY> --mark-merged`); если они требуют работы, продолжай конвейер.",
   "watchdog.coordinatorEscalation": "Внимание: координатор @thread:{thread} не отвечает после {max} напоминаний (простой {idleMinutes} мин). Задачи, требующие внимания: {taskList}.",
   "watchdog.escalationTitle": "координатор не отвечает",
   "wd.none": "нет",
@@ -849,6 +860,13 @@ export const RU: Record<string, string> = {
   "mg.alreadyMerged": "делегирование {id} уже влито в {into} ({sha})",
   "mg.fixDelegated": "по делегированию {id} уже раздан заход разбора конфликта",
   "mg.fixDelegatedHint": "дождитесь его done и влейте его итог: `bb orchestrator merge <id захода разбора>`",
+  "mg.noUpstreamSeam": "нет канала проверки upstream для --mark-merged",
+  "mg.noRepoPath": "локальный репозиторий проекта не найден для проверки upstream",
+  "mg.noReleaseConfig": "конфигурация выкладки проекта release.json не найдена",
+  "mg.settingsProjectUnknown": "проект настроек репозитория не определён (release-settings)",
+  "mg.shaNotOnUpstream": "коммит {sha} не найден в origin/{target}",
+  "mg.resultNotOnUpstream": "изменения коммита {sha} не найдены в origin/{target}",
+  "mg.unrelatedSha": "коммит {sha} не содержит изменений исполнителя ({result}); проверь правильность SHA",
   "mg.notDoneInflight": "делегирование {id} ещё {status}, итога нет",
   "mg.notDoneFinished": "заход {id} завершился {status}, итога нет",
   "mg.prevResultHint": "прошлый итог — `bb orchestrator merge {id}`",
@@ -917,6 +935,7 @@ export const RU: Record<string, string> = {
   "cli.clean": "чисто",
   "cli.merged": "влито {sha}",
   "cli.fixDelegated": "конфликт, раздан заход разбора #{id} (тред {thread})",
+  "cli.mergedUpstream": "отмечено влитым в upstream {into} ({sha})",
   "cli.conflictClean": "конфликт, копия чистая — разбор за координатором",
   "cli.gitTooOld": "git ≥ 2.39 required — обновите git на этой машине",
   "cli.squashSuspect": " — похоже, влито squash; проверьте и удалите вручную",

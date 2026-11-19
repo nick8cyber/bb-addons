@@ -1523,6 +1523,8 @@ export async function createPlugin(
             kept: [],
           }),
     kbConfig: () => currentKb.config,
+    markCoordinatorAction: (threadId: string | undefined | null) =>
+      watchdog.markCoordinatorAction(threadId),
     log: bb.log,
     t,
   };
@@ -1631,6 +1633,7 @@ export async function createPlugin(
     into?: string;
     noAutofix?: boolean;
     dryRun?: boolean;
+    markMerged?: boolean | string;
     callerThreadId: string;
   }) =>
     runMerge(input, {
@@ -1691,6 +1694,20 @@ export async function createPlugin(
       protectedBranches:
         janitorConfig().config?.protectedBranches ?? undefined,
       mergeAutofix: () => currentSettings.mergeAutofix === true,
+      // §14 `--mark-merged` (r34.1): the upstream seams.
+      upstream: {
+        projects: async () =>
+          (await bb.sdk.projects.list().catch(() => [])) as BbProjectListItem[],
+        localHostId,
+        releaseConfig: () => releaseConfig,
+        settingsProjectId: (repo, pid, config) =>
+          settingsProjectId(
+            { cmd, bbCli, localHostId },
+            repo,
+            pid ?? "",
+            config as never,
+          ),
+      },
       // §16.6 `threadIds`: off → merge commits drop the task key.
       // §6 (r8) п.7: the settings project is the repository's bb
       // project; a resolver error or ambiguity counts `threadIds:
@@ -1711,6 +1728,8 @@ export async function createPlugin(
           return false;
         }
       },
+      markCoordinatorAction: (threadId) =>
+        watchdog.markCoordinatorAction(threadId),
       log: bb.log,
       t,
     });
@@ -1743,6 +1762,26 @@ export async function createPlugin(
         return res.stdout;
       },
     },
+    // §5.6 (r34.1): upstream/tracker reconcile seams — bb projects for
+    // `projectRepoPath`, the host id, the release config, non-throwing
+    // git (cmd.run already returns {exitCode,stdout,stderr}).
+    upstream: {
+      projects: async () =>
+        (await bb.sdk.projects.list().catch(() => [])) as BbProjectListItem[],
+      localHostId,
+      releaseConfig: () => releaseConfig,
+      git: async (repo, args, opts) => {
+        const res = await cmd.run("git", ["-C", repo, ...args], {
+          timeoutMs: opts?.timeoutMs,
+        });
+        return {
+          exitCode: res.exitCode,
+          stdout: res.stdout,
+          stderr: res.stderr,
+        };
+      },
+    },
+    workGraphMode: getWorkGraphMode,
     enqueue,
     handoffPath,
     log: bb.log,
@@ -1838,6 +1877,10 @@ export async function createPlugin(
         await helperWatchdog.reconcile();
         await pumpRelease();
       });
+      // §5.6 п.9 (r34.1): the one-time historical upstream sweep at
+      // plugin start — outside `beat`/`enqueue`: git+network must not
+      // serialize against dispatch/finalize.
+      run(live(() => watchdog.reconcileHistory()));
       maybeCheckPresets();
       const reconcileTimer = setInterval(() => {
         beat(async () => {
@@ -1845,6 +1888,9 @@ export async function createPlugin(
           await helperWatchdog.reconcile();
           await pumpRelease();
         });
+        // §5.6 (r34.1): the 60 s tracker+git fact-check — OFF
+        // `enqueue`, single-flight inside the watchdog.
+        run(live(() => watchdog.reconcileUpstream()));
         maybeCheckPresets();
       }, 60_000);
       const timersTimer = setInterval(
@@ -2163,6 +2209,12 @@ export async function createPlugin(
         .boolean()
         .optional()
         .describe("Checks + merge-tree only; the worktree stays untouched"),
+      markMerged: z
+        .union([z.boolean(), z.string()])
+        .optional()
+        .describe(
+          "§14 (r34.1): mark the round merged in upstream WITHOUT touching the copy — for external PR/squash/rebase merges. `true` verifies result_sha on origin/<targetBranch> (ancestor or merge-tree equal); a string names the explicit upstream commit.",
+        ),
     }),
     async execute(params, ctx) {
       // §5.6 (r33.11): a productive call resets the idle nudge schedule.
@@ -2171,7 +2223,17 @@ export async function createPlugin(
         let taskKey = params.ref;
         if (/^\d+$/.test(taskKey)) {
           const row = store.get(Number(taskKey));
-          if (row) taskKey = row.task_key;
+          if (row) {
+            taskKey = row.task_key;
+            if (row.coordinator_thread_id) {
+              watchdog.markCoordinatorAction(row.coordinator_thread_id);
+            }
+          }
+        } else {
+          const row = store.latestDoneResultByTask(taskKey);
+          if (row?.coordinator_thread_id) {
+            watchdog.markCoordinatorAction(row.coordinator_thread_id);
+          }
         }
         assertGraphAllowsDirectAction(store, taskKey, getWorkGraphMode());
         return JSON.stringify(
@@ -2507,7 +2569,7 @@ export async function createPlugin(
         name: "merge",
         summary: t("cli.helpMergeS"),
         usage:
-          "bb orchestrator merge <KEY|delegationId> [--into <branch>] [--no-autofix] [--dry-run] [--json]",
+          "bb orchestrator merge <KEY|delegationId> [--into <branch>] [--no-autofix] [--dry-run] [--mark-merged [sha]] [--json]",
       },
       {
         name: "policy",
@@ -3034,7 +3096,30 @@ export async function createPlugin(
         }
 
         if (cmd === "merge") {
-          let ref = positional[1];
+          const hasMarkMerged = argv.includes("--mark-merged");
+          let markMergedVal: boolean | string | undefined = undefined;
+          let ref: string | undefined = undefined;
+
+          if (hasMarkMerged) {
+            const markIdx = argv.indexOf("--mark-merged");
+            const nextArg = argv[markIdx + 1];
+            const nonFlagArgs = positional.slice(1);
+            if (nextArg !== undefined && !nextArg.startsWith("--")) {
+              if (nonFlagArgs.length >= 2) {
+                markMergedVal = nextArg;
+                ref = nonFlagArgs.find((a) => a !== nextArg) ?? nonFlagArgs[0];
+              } else {
+                ref = nextArg;
+                markMergedVal = true;
+              }
+            } else {
+              ref = nonFlagArgs[0];
+              markMergedVal = true;
+            }
+          } else {
+            ref = positional[1];
+          }
+
           if (!ref) {
             throw new OrchestratorError(
               "invalid-arguments",
@@ -3043,7 +3128,17 @@ export async function createPlugin(
           }
           if (/^\d+$/.test(ref)) {
             const row = store.get(Number(ref));
-            if (row) ref = row.task_key;
+            if (row) {
+              ref = row.task_key;
+              if (row.coordinator_thread_id) {
+                watchdog.markCoordinatorAction(row.coordinator_thread_id);
+              }
+            }
+          } else {
+            const row = store.latestDoneResultByTask(ref);
+            if (row?.coordinator_thread_id) {
+              watchdog.markCoordinatorAction(row.coordinator_thread_id);
+            }
           }
           assertGraphAllowsDirectAction(store, ref, getWorkGraphMode());
           if (!ctx.threadId) {
@@ -3058,6 +3153,7 @@ export async function createPlugin(
             into: flag("--into"),
             noAutofix: argv.includes("--no-autofix"),
             dryRun: argv.includes("--dry-run"),
+            markMerged: markMergedVal,
             callerThreadId: ctx.threadId,
           });
           if (json) return jsonOk(res);
@@ -3089,6 +3185,11 @@ export async function createPlugin(
                 verdict:
                   res.mergeStatus === "merged"
                     ? t("cli.merged", { sha: res.mergedSha?.slice(0, 7) ?? "" })
+                    : res.mergeStatus === "merged-upstream"
+                      ? t("cli.mergedUpstream", {
+                          sha: res.mergedSha?.slice(0, 7) ?? "",
+                          into: res.into,
+                        })
                     : res.mergeStatus === "fix-delegated"
                       ? t("cli.fixDelegated", {
                           id: res.fixDelegationId,
@@ -3215,6 +3316,10 @@ export async function createPlugin(
             );
           }
           const caller = await callerFacts(ctx.threadId);
+          const latestDel = store.latestDoneResultByTask(key);
+          if (latestDel?.coordinator_thread_id) {
+            watchdog.markCoordinatorAction(latestDel.coordinator_thread_id);
+          }
           // §17.3 (С1): release runs OUTSIDE the delegate queue — only
           // the release-auditor dispatch inside it is enqueued. A queued
           // release that internally dispatches would deadlock waiting
@@ -3230,18 +3335,28 @@ export async function createPlugin(
             },
             releaseDeps,
           );
+          // §2 п.0.2 (r11.9): upstream-выкладка завершается сразу —
+          // аудита и «слежу» нет.
+          const started =
+            res.status === "published"
+              ? t("cli.releaseDoneUpstream", {
+                  taskKey: res.taskKey,
+                  id: res.releaseId,
+                })
+              : t("cli.releaseStarted", {
+                  taskKey: res.taskKey,
+                  id: res.releaseId,
+                  thread: res.auditThreadId ?? "—",
+                  settings: res.settingsProjectId,
+                  delegation: res.delegationProjectId,
+                }) +
+                t("cli.releaseReminder");
           return json
             ? jsonOk(res)
             : {
                 exitCode: 0,
                 stdout:
-                  t("cli.releaseStarted", {
-                    taskKey: res.taskKey,
-                    id: res.releaseId,
-                    thread: res.auditThreadId ?? "—",
-                    settings: res.settingsProjectId,
-                    delegation: res.delegationProjectId,
-                  }) +
+                  started +
                   (res.warnings.length
                     ? t("cli.scanWarnings", {
                         list: res.warnings
@@ -3252,8 +3367,7 @@ export async function createPlugin(
                           )
                           .join("\n"),
                       })
-                    : "") +
-                  t("cli.releaseReminder"),
+                    : ""),
               };
         }
 
@@ -3263,14 +3377,17 @@ export async function createPlugin(
 
         if (cmd === "reconcile") {
           const res = await watchdog.reconcile();
+          const upstreamRes = await watchdog.reconcileUpstream();
           return json
-            ? jsonOk({ ok: true, ...res })
+            ? jsonOk({ ok: true, ...res, upstream: upstreamRes })
             : {
                 exitCode: res.errors.length ? 1 : 0,
                 stdout:
                   `reconcile: scanned=${res.scanned} cancelled=${res.cancelled} ` +
                   `relinked=${res.relinked} removed=${res.removed} ` +
-                  `finalized=${res.finalized} retried=${res.retriedSteps}\n` +
+                  `finalized=${res.finalized} retried=${res.retriedSteps} ` +
+                  `upstream_tracker=${upstreamRes.trackerChecked} ` +
+                  `upstream_marked=${upstreamRes.upstreamMarked}\n` +
                   res.errors.map((e) => `error: ${e}\n`).join(""),
               };
         }

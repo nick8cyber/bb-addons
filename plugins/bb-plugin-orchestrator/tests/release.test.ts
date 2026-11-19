@@ -7806,3 +7806,102 @@ test("§24.2: recordStagedFeature — повторный заход без UI с
   assert.deepEqual(JSON.parse(row.ui_files!), ["src/app.tsx", "src/app.css"]);
   assert.equal(row.result_sha, "sha3");
 });
+
+// ── §2 п.0.2 (r34.1, PLUG-317): release on merge_status=merged-upstream ──
+
+test("§2 п.0.2 (r34.1): merged-upstream release — ancestor landing publishes merged_sha and closes the task", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, sent, calls, spawnCalls, exec } = makeDeps(repo);
+  const resultSha = gitR(repo, ["rev-parse", "HEAD"]);
+  // The result is already on origin/main (external merge).
+  gitR(repo, ["push", "origin", "feat-x:main"]);
+  assert.ok(
+    store.markMergedUpstream(exec.id, resultSha, "origin/main", resultSha),
+  );
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "published");
+  const row = store.getRelease(res.releaseId)!;
+  assert.equal(row.status, "published");
+  assert.equal(row.target_action, "push");
+  assert.equal(row.published_sha, resultSha);
+  assert.ok(
+    calls.some(
+      (c) => c.join(" ") === "tasks update PLUG-1 --status done",
+    ),
+    "the task is closed",
+  );
+  assert.equal(spawnCalls.length, 0, "no audit dispatch");
+  assert.ok(
+    sent.some((s) => s.includes("уже в main")),
+    "the «уже в <target>» outcome line went out",
+  );
+});
+
+test("§2 п.0.2 (r34.1): merged-upstream on a squash landing — published_sha is the squash commit", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, exec } = makeDeps(repo);
+  const resultSha = gitR(repo, ["rev-parse", "HEAD"]);
+  gitR(repo, ["switch", "-c", "sq", "origin/main"]);
+  gitR(repo, ["merge", "--squash", "feat-x"]);
+  gitR(repo, ["commit", "-m", "squashed feat-x"]);
+  const squashSha = gitR(repo, ["rev-parse", "HEAD"]);
+  gitR(repo, ["push", "origin", "sq:main"]);
+  gitR(repo, ["switch", "feat-x"]);
+  assert.ok(
+    store.markMergedUpstream(exec.id, resultSha, "origin/main", squashSha),
+  );
+  const res = await runRelease({ taskKey: "PLUG-1", caller: COORD }, deps);
+  assert.equal(res.status, "published");
+  const row = store.getRelease(res.releaseId)!;
+  assert.equal(row.published_sha, squashSha);
+  assert.equal(row.head_sha, resultSha);
+});
+
+test("§2 п.0.2 (r34.1): merged-upstream still requires the OK verdict on result_sha", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, calls, sent, exec } = makeDeps(repo, {
+    comments: [],
+    reviewThreadOutput: null,
+  });
+  const resultSha = gitR(repo, ["rev-parse", "HEAD"]);
+  gitR(repo, ["push", "origin", "feat-x:main"]);
+  assert.ok(
+    store.markMergedUpstream(exec.id, resultSha, "origin/main", resultSha),
+  );
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) => (e as OrchestratorError).code === "release-refused",
+  );
+  assert.equal(
+    calls.filter(
+      (c) => c.join(" ") === "tasks update PLUG-1 --status done",
+    ).length,
+    0,
+    "the task is NOT closed",
+  );
+  assert.equal(sent.length, 0);
+});
+
+test("§2 п.0.2 (r34.1): merged-upstream with the commit NOT on origin/<target> — release-refused, release row failed", async () => {
+  const { repo } = makeRepo();
+  const { deps, store, calls, exec } = makeDeps(repo);
+  const resultSha = gitR(repo, ["rev-parse", "HEAD"]);
+  // The mark claims a landing that never happened — no push.
+  assert.ok(
+    store.markMergedUpstream(exec.id, resultSha, "origin/main", resultSha),
+  );
+  await assert.rejects(
+    runRelease({ taskKey: "PLUG-1", caller: COORD }, deps),
+    (e: unknown) =>
+      (e as OrchestratorError).code === "release-refused" &&
+      /upstream-commit-missing/.test((e as Error).message),
+  );
+  const row = store.latestReleaseByTask("PLUG-1");
+  assert.equal(row?.status, "failed");
+  assert.equal(
+    calls.filter(
+      (c) => c.join(" ") === "tasks update PLUG-1 --status done",
+    ).length,
+    0,
+  );
+});

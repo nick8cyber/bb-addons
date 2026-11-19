@@ -54,6 +54,7 @@ function makeRow(overrides: Partial<DelegationRow> = {}): DelegationRow {
     verdict_event_at: null,
     queued_at: null,
     attach: null,
+    finished_at: null,
     created_at: 1000,
     updated_at: 1000,
     ...overrides,

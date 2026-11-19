@@ -13,7 +13,9 @@ export const EN: Record<string, string> = {
     "The full procedure — the `orchestrator-coordinator` skill. " +
     "The executor's report arrives as a message — do not wait for it in the foreground.",
   "instr.ruleFooter":
-    "Do not dispatch executors manually (`bb tasks dispatch`, `bb thread spawn`) — delegate only.",
+    "Do not dispatch executors manually (`bb tasks dispatch`, `bb thread spawn`) — delegate only. " +
+    "Do not open or modify the plugin's SQLite database — plugin commands only " +
+    "(to reconcile externally merged tasks: `bb orchestrator merge <KEY> --mark-merged`, or close the tracker task).",
   "instr.tagReleasePipeline": " (release pipeline only — do not delegate)",
   "instr.tagAuditor": " (review — read-only)",
   "instr.reviewByLevel":
@@ -419,6 +421,13 @@ export const EN: Record<string, string> = {
   "rel.prNoOutput": "PR not created: {out}",
   "rel.prNoOutputWord": "no output",
   "rel.published": "released {taskKey}: {sha7} into {branch}; task done",
+  // §2 п.0.2 (r11.9): the result is already on origin/<target> — upstream release.
+  "rel.publishedUpstream":
+    "released {taskKey}: already in {branch} ({sha7}); task done",
+  "rel.upstreamCommitMissing":
+    "upstream-commit-missing: marked commit {sha7} not found on origin/{target} — release refused, the task is not closed",
+  "rel.upstreamNoRepo":
+    "no-repo: local repository of project {project} not found for the upstream release",
   "rel.branchPublished":
     "branch published {taskKey}: {branch}; open the PR manually",
   "rel.prCreated": "PR opened {taskKey}: —; watching until merged",
@@ -571,6 +580,8 @@ export const EN: Record<string, string> = {
     "release {taskKey}: audit dispatched (release #{id}, thread " +
     "{thread}; settings project {settings}, delegation project {delegation})",
   "cli.scanWarnings": "\nscan warnings:\n{list}",
+  "cli.releaseDoneUpstream":
+    "release {taskKey}: already in upstream — release done (release #{id}); task done\n",
   "cli.releaseReminder":
     "\nthe outcome arrives as an [orchestrator] message — end your turn.\n",
   "cli.delegated":
@@ -822,7 +833,7 @@ export const EN: Record<string, string> = {
   "wd.dispatchNotConfirmed": "dispatch unconfirmed: delegation #{id} removed (the dispatch thread was not found)",
   "wd.attachVerify": "{task}: executor {thread} attachment unconfirmed ({err}) — the reconcile retries",
   "wd.compactReminder": "[orchestrator] the context was compacted — §3 reminder: dispatch only via orchestrator_delegate; executor results arrive as [orchestrator] messages — foreground waiting is not allowed. Delegations: {parts}. Handoff: {handoff}",
-  "watchdog.coordinatorNudge": "Reminder ({nudge}/{max}): the coordinator has been idle for {idleMinutes} min with unfinished work. Tasks waiting for action: {taskList}. Keep working (delegate, merge, release).",
+  "watchdog.coordinatorNudge": "Reminder ({nudge}/{max}): the coordinator has been idle for {idleMinutes} min. Tasks awaiting attention: {taskList}. Check the pipeline task states; if they are already closed or merged by an external PR, do nothing — reconciliation clears them itself (squash/rebase: close the tracker task or run `bb orchestrator merge <KEY> --mark-merged`); if they need work, continue the pipeline.",
   "watchdog.coordinatorEscalation": "Attention: coordinator @thread:{thread} is not responding after {max} reminders (idle {idleMinutes} min). Tasks needing attention: {taskList}.",
   "watchdog.escalationTitle": "coordinator is not responding",
   "wd.none": "none",
@@ -833,6 +844,13 @@ export const EN: Record<string, string> = {
   "mg.alreadyMerged": "delegation {id} is already merged into {into} ({sha})",
   "mg.fixDelegated": "delegation {id} already has a conflict-fix round delegated",
   "mg.fixDelegatedHint": "wait for its done and merge its result: `bb orchestrator merge <fix round id>`",
+  "mg.noUpstreamSeam": "no upstream-verification seam for --mark-merged",
+  "mg.noRepoPath": "the project's local repository was not found for the upstream check",
+  "mg.noReleaseConfig": "the project's release.json release config was not found",
+  "mg.settingsProjectUnknown": "the repository's settings project could not be resolved",
+  "mg.shaNotOnUpstream": "commit {sha} was not found on origin/{target}",
+  "mg.resultNotOnUpstream": "changes of commit {sha} were not found on origin/{target}",
+  "mg.unrelatedSha": "commit {sha} does not carry the executor's changes ({result}); check the SHA",
   "mg.notDoneInflight": "delegation {id} is still {status}, no result yet",
   "mg.notDoneFinished": "round {id} finished as {status}, no result",
   "mg.prevResultHint": "the previous result — `bb orchestrator merge {id}`",
@@ -901,6 +919,7 @@ export const EN: Record<string, string> = {
   "cli.clean": "clean",
   "cli.merged": "merged {sha}",
   "cli.fixDelegated": "conflict, a fix round #{id} was delegated (thread {thread})",
+  "cli.mergedUpstream": "marked merged in upstream {into} ({sha})",
   "cli.conflictClean": "conflict, the copy is clean — resolution is up to the coordinator",
   "cli.gitTooOld": "git ≥ 2.39 required — upgrade git on this machine",
   "cli.squashSuspect": " — looks squash-merged; check and remove manually",
