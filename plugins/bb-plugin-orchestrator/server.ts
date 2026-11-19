@@ -109,8 +109,6 @@ import {
   type ReleaseConfigLoad,
 } from "./src/release-config.js";
 import { createCmd } from "./src/cmd.js";
-import { maskLeakText } from "./src/scan.js";
-import { hostname as osHostname } from "node:os";
 import { createCommandRunner } from "./src/commands.js";
 import {
   effectiveHooks,
@@ -142,7 +140,6 @@ import {
   type Params,
   type T,
 } from "./src/i18n/index.js";
-import { resolveRepoPath } from "./src/packet.js";
 import { KbService, parseKbConfig, type KbConfig } from "./src/kb.js";
 import {
   assertGraphAllowsDirectAction,
@@ -1308,37 +1305,11 @@ export async function createPlugin(
   for (const e of helpersLoad.errors) {
     bb.log.warn(`orchestrator helpers: ${e.path}: ${e.message}`);
   }
-  /** §20.2 (r33): the release scanner as the packet's outbound mask —
-   * built-in rules plus the project's `leaks` (`allow` relaxes
-   * categories 3–4 inside its paths — `ctx.file` names the block's
-   * source), `threadIds` and `allowedEmails`. Shared by the delegate
-   * dispatch and the helper spawn on a `tools: false` route. */
-  const packetMask = (
-    text: string,
-    ctx: { projectId?: string | null; file?: string },
-  ) => {
-    let proj: ReturnType<typeof resolveProject> | null = null;
-    if (releaseConfig.config && ctx.projectId) {
-      try {
-        proj = resolveProject(releaseConfig.config, ctx.projectId);
-      } catch {
-        proj = null;
-      }
-    }
-    return maskLeakText(text, {
-      hostname: osHostname(),
-      threadIds: proj?.threadIds,
-      allowedEmails: proj?.allowedEmails,
-      allow: proj?.leaks.allow,
-      file: ctx.file,
-    });
-  };
   const helperDeps = {
     store,
     threads: helperThreads,
     enqueue,
     loadPolicy: () => loadPolicy(true),
-    packetMask,
     helpers: (): HelpersSettings => helpersLoad.config,
     callerFacts: helperCallerFacts,
     // §19.1: the route's preset resolves into the spawn's provider/model
@@ -1446,9 +1417,6 @@ export async function createPlugin(
         now: stepsDeps.now,
         policy: stepsDeps.policy,
         unavailableRoutes: stepsDeps.unavailableRoutes,
-        repoPath: stepsDeps.repoPath,
-        packetGit: stepsDeps.packetGit,
-        packetMask: stepsDeps.packetMask,
       });
     });
 
@@ -1551,27 +1519,8 @@ export async function createPlugin(
         effectiveGitInstructions(currentSettings.gitInstructions, t),
     policy: () => policyLoad.policy,
     t,
-    // §20.2 (r33): the tool-less packet seams — the clock, the
-    // unavailable-route set, the repo path (the checked env's copy),
-    // git itself, and the §4 leak scanner as the outbound mask.
     now: () => Date.now(),
     unavailableRoutes: () => new Set(policyLoad.unavailableRoutes),
-    repoPath: async (row: DelegationRow) =>
-      resolveRepoPath(row, {
-        store,
-        threads: bb.sdk.threads as unknown as {
-          get: (a: { threadId: string }) => Promise<{ environmentId?: string | null }>;
-        },
-        environmentFacts,
-      }),
-    packetGit: async (repo: string, args: string[]) => {
-      const res = await cmd.run("git", ["-C", repo, ...args]);
-      if (res.exitCode !== 0) {
-        throw new Error(res.stderr || res.stdout || `git ${args[0]} failed`);
-      }
-      return res.stdout;
-    },
-    packetMask,
   };
   const watchdogThreads: WatchdogThreads = {
     get: (a) => bb.sdk.threads.get(a),

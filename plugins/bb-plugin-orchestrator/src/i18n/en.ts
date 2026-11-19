@@ -188,20 +188,12 @@ export const EN: Record<string, string> = {
   "del.baseSkip.project-list": "bb project list unreadable",
   "del.baseSkip.no-local-path":
     "the project has no local_path source on the target host",
-  "del.presetNotAllowed":
-    "preset/route \"{preset}\" is a tool-less route and cannot be selected on level \"{level}\" (preset-not-allowed)",
+  // §20.1 п.5 (r34.4): route-level capacity — queued, then the chain
+  // moves on.
   "del.routeBusy": "route \"{route}\" is busy — the delegation is queued",
   "del.routeBusyExhausted":
     "route \"{route}\" stayed busy past the wait — the next route takes over",
   "del.routeSkipped": "route \"{route}\" skipped: {reason}",
-  "pkt.headerAudit":
-    "=== REVIEW MATERIAL ===\nYou have no tools and no access to the project's files — the whole material is below, in this very message. Do not ask for files; everything missing for the check goes under \"Not checked\". The last line of your reply must be the JSON verdict.{masked}",
-  "pkt.headerResearch":
-    "=== RESEARCH MATERIAL ===\nYou have no tools and no access to the project's files, but internet search is allowed and expected. The material is below, in this very message; do not ask for files. Whatever you cannot find goes under \"Not found\".{masked}",
-  "pkt.headerArchitect":
-    "=== ARCHITECTURAL MATERIAL ===\nYou have no tools to edit project code or files. The material is below in this message. Deliver architectural decisions and acceptance contract as text (design node) or verdict as a JSON line (design_check node).{masked}",
-  "pkt.masked": " Masked fragments: {n} ([скрыто: type]).",
-  "wd.toollessRoute": "a tool-less route does not continue",
 
   // ── release.ts ──────────────────────────────────────────────────────
   "rel.gitFailed": "git {cmd} failed (exit {code}): {out}",
@@ -630,8 +622,15 @@ export const EN: Record<string, string> = {
   "pol.isString": "must be a string",
   "pol.isBool": "must be a boolean",
   "pol.roleEnum": 'must be "auditor", "researcher", "architect" or "executor"',
-  "pol.toolsForbidden":
-    'tools:false is allowed only on auditor/researcher/architect levels, not "{level}"',
+  "pol.toolsDeprecated":
+    "route-tools-deprecated: the tools field is deprecated and removed " +
+    "in r34.4 (PLUG-316) — the route runs as a standard agent with tools",
+  "pol.packetFieldsDeprecated":
+    "route-packet-fields-deprecated: maxPromptBytes/splitPackets are " +
+    "deprecated and removed in r34.4 (PLUG-316)",
+  "pol.aliasObject": "must be an object of alias → canonical name",
+  "pol.aliasString": "alias and target must be non-empty strings",
+  "pol.aliasCycle": "alias cycle: {chain}",
   "pol.chainReq": "required non-empty array of route names",
   "pol.routeNameStr": "route name must be a non-empty string",
   "pol.routeUndeclared": 'route "{route}" is not declared in routes',
@@ -734,7 +733,7 @@ export const EN: Record<string, string> = {
     "Start the round without continuing the previous result " +
     "(§6 --fresh)",
   "tool.delAttach":
-    "Repo file paths — a tool-less route receives their contents (§20.2)",
+    "Repo file paths to list in the task instructions (§20.1 п.4)",
   "tool.status":
     "List this coordinator's delegations and counters (active vs " +
     "policy limits).",
