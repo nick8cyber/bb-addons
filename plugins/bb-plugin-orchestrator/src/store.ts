@@ -924,8 +924,8 @@ export class DelegationStore {
     attach?: string | null;
     /** Test helper: explicit creation timestamp */
     now?: number;
-  }, nowOverride?: number): DelegationRow {
-    const now = nowOverride ?? input.now ?? Date.now();
+  }): DelegationRow {
+    const now = input.now ?? Date.now();
     const info = this.db
       .prepare(
         `INSERT INTO delegations (
@@ -4095,7 +4095,7 @@ export class DelegationStore {
       }
 
       // §28.2 п. 5: Сброс alarm_count в payload при смене узла или повторном входе в running;
-      // фиксация node_entered_at при переходе на новый узел.
+      // фиксация/бэкфилл node_entered_at для стабильного якоря активного делегирования
       if (input.toNode !== existing.node) {
         let payloadObj: Record<string, unknown> = {};
         const sourcePayload =
@@ -4104,7 +4104,10 @@ export class DelegationStore {
             : existing.payload;
         if (sourcePayload) {
           try {
-            payloadObj = JSON.parse(sourcePayload);
+            const parsed = JSON.parse(sourcePayload);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              payloadObj = parsed;
+            }
           } catch {}
         }
         payloadObj.node_entered_at = now;
@@ -4121,11 +4124,24 @@ export class DelegationStore {
             : existing.payload;
         if (sourcePayload) {
           try {
-            payloadObj = JSON.parse(sourcePayload);
+            const parsed = JSON.parse(sourcePayload);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              payloadObj = parsed;
+            }
           } catch {}
         }
+        let changed = false;
         if (payloadObj.alarm_count !== undefined && payloadObj.alarm_count !== 0) {
           payloadObj.alarm_count = 0;
+          changed = true;
+        }
+        // Бэкфилл node_entered_at для legacy-задач при первом resume/переходе
+        if (typeof payloadObj.node_entered_at !== "number") {
+          const entryTime = this.getNodeEntryTime(key, input.toNode) ?? existing.entered_at;
+          payloadObj.node_entered_at = entryTime;
+          changed = true;
+        }
+        if (changed) {
           if (!input.updates) {
             input.updates = {};
           }
@@ -4233,6 +4249,18 @@ export class DelegationStore {
         `SELECT * FROM task_transitions WHERE task_key = ? ORDER BY created_at ASC, id ASC`,
       )
       .all(normalizeTaskKey(taskKey)) as TaskTransitionRow[];
+  }
+
+  /** §28.2 п. 5: Момент фактического входа в узел (по последнему переходу from_node != to_node). */
+  getNodeEntryTime(taskKey: string, node: TaskNode): number | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT created_at FROM task_transitions
+         WHERE task_key = ? AND to_node = ? AND from_node != ?
+         ORDER BY created_at DESC, id DESC LIMIT 1`,
+      )
+      .get(normalizeTaskKey(taskKey), node, node) as { created_at: number } | undefined;
+    return row?.created_at;
   }
 
   insertTransition(input: {

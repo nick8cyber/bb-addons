@@ -2319,7 +2319,7 @@ export async function runRunQueue(
       try {
         const payload = parsePayload(t.payload);
         const delegations = deps.store.delegationsByTask(t.task_key);
-        const latestDel = getActiveDelegationForTask(t, delegations);
+        const latestDel = getActiveDelegationForTask(t, delegations, deps.store);
         let wouldTrans:
           | { from_node: string; to_node: string; to_status: string; event: string }
           | undefined;
@@ -2781,6 +2781,7 @@ export async function extractReportFromDelegation(
 function getActiveDelegationForTask(
   task: TaskQueueRow,
   delegations: DelegationRow[],
+  store?: DelegationStore,
 ): DelegationRow | undefined {
   if (delegations.length === 0) return undefined;
   const payload = parsePayload(task.payload);
@@ -2793,13 +2794,17 @@ function getActiveDelegationForTask(
   if (consumed.includes(latest.id)) {
     return undefined;
   }
-  // If the latest delegation was created before the task entered the current node,
-  // it belongs to an earlier node/attempt and must not be used.
-  // Anchor check: node_entered_at tracks entry into task.node; falls back to task.entered_at.
-  const nodeEnteredAt =
-    typeof payload.node_entered_at === "number"
-      ? payload.node_entered_at
-      : task.entered_at;
+  // Anchor check: latest delegation must not predate when the task entered the current node.
+  // Priority: 1) payload.node_entered_at, 2) task_transitions to_node = task.node, 3) task.entered_at.
+  let nodeEnteredAt: number | undefined;
+  if (typeof payload.node_entered_at === "number" && payload.node_entered_at > 0) {
+    nodeEnteredAt = payload.node_entered_at;
+  } else if (store) {
+    nodeEnteredAt = store.getNodeEntryTime(task.task_key, task.node);
+  }
+  if (nodeEnteredAt === undefined || nodeEnteredAt <= 0) {
+    nodeEnteredAt = task.entered_at;
+  }
   if (nodeEnteredAt > 0 && latest.created_at < nodeEnteredAt - 50) {
     return undefined;
   }
@@ -2896,7 +2901,7 @@ async function advanceActiveTask(
   const normKey = normalizeTaskKey(task.task_key);
   const payload = parsePayload(task.payload);
   const delegations = deps.store.delegationsByTask(task.task_key);
-  const latestDelegation = getActiveDelegationForTask(task, delegations);
+  const latestDelegation = getActiveDelegationForTask(task, delegations, deps.store);
   const now = deps.now ? deps.now() : Date.now();
 
   // §28.2 п. 5: Сброс будильника узла при получении нового доказательства:
@@ -2981,7 +2986,6 @@ async function advanceActiveTask(
         if (
           th &&
           (th.status === "active" ||
-            th.status === "running" ||
             th.status === "starting" ||
             th.status === "pending")
         ) {

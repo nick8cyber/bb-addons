@@ -978,3 +978,111 @@ test("§28.2 п. 5: same-node resume from deferred resets alarm_count, entered_a
   assert.equal(task.entered_at, tRelResume);
   assert.equal(task.node_alarm_at, tRelResume + 3600 * 1000);
 });
+
+test("§28.2 п. 5: legacy task without node_entered_at anchors to task_transitions upon same-node resume", async () => {
+  const store = createTestStore();
+  const cli = fakeCli();
+  const t0 = 1_000_000;
+
+  // Insert task at start/queued at t0
+  store.insertTask({
+    taskKey: "LEGACY-RESUME-1",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, t0);
+
+  // Transition from start -> code at t0 (records task_transitions from_node: 'start', to_node: 'code' at t0)
+  store.transitionTask({
+    taskKey: "LEGACY-RESUME-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "code",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start-code",
+    timeoutSeconds: 3600,
+  }, t0);
+
+  // Strip node_entered_at from payload to simulate task created before the fix
+  store.updateTask("LEGACY-RESUME-1", {
+    payload: JSON.stringify({ some_old_key: 123 }),
+  });
+
+  // Delegation created at t0 + 10
+  const del = store.insert({
+    taskKey: "LEGACY-RESUME-1",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "opencode",
+    now: t0 + 10,
+  });
+  store.setThreadInfo(del.id, "thr_legacy_exec");
+
+  // Verify store.getNodeEntryTime returns t0 from task_transitions
+  const entryTime = store.getNodeEntryTime("LEGACY-RESUME-1", "code");
+  assert.equal(entryTime, t0);
+
+  // Task deferred at t0 + 2000s
+  const tDefer = t0 + 2000 * 1000;
+  store.transitionTask({
+    taskKey: "LEGACY-RESUME-1",
+    expectedNode: "code",
+    expectedStatus: "running",
+    toNode: "code",
+    toStatus: "deferred",
+    actor: "owner",
+    reason: "defer",
+  }, tDefer);
+
+  // Resume at tResume = t0 + 10000s (>2× timeout later)
+  const tResume = t0 + 10000 * 1000;
+  store.transitionTask({
+    taskKey: "LEGACY-RESUME-1",
+    expectedNode: "code",
+    expectedStatus: "deferred",
+    toNode: "code",
+    toStatus: "running",
+    actor: "owner",
+    reason: "resume",
+    timeoutSeconds: 7200,
+  }, tResume);
+
+  // Verify node_entered_at was backfilled
+  const taskAfterResume = store.getTask("LEGACY-RESUME-1")!;
+  assert.equal(JSON.parse(taskAfterResume.payload!).node_entered_at, t0);
+
+  // Trigger 1 at tResume + 7200s must ping thr_legacy_exec!
+  cli.calls.length = 0;
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    bbCli: cli.cli,
+    now: () => tResume + 7200 * 1000,
+    policy: POLICY_WITH_NODE_POLICY,
+  });
+
+  assert.equal(cli.calls.length, 1, "Must have pinged legacy executor on Trigger 1");
+  assert.ok(cli.calls[0].includes("thr_legacy_exec"));
+  assert.ok(cli.calls[0].includes("tell"));
+
+  // Trigger 2 at tResume + 2×7200s with active thread -> ping again, keep running!
+  cli.calls.length = 0;
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    bbCli: cli.cli,
+    getThread: async () => ({ status: "active" }),
+    now: () => tResume + 2 * 7200 * 1000,
+    policy: POLICY_WITH_NODE_POLICY,
+  });
+
+  const taskAtTr2 = store.getTask("LEGACY-RESUME-1")!;
+  assert.equal(taskAtTr2.status, "running", "Active legacy executor gets 3× grace");
+  assert.equal(cli.calls.length, 1);
+  assert.ok(cli.calls[0].includes("thr_legacy_exec"));
+});
