@@ -4036,7 +4036,12 @@ export class DelegationStore {
         now,
       };
 
-      if (input.toNode !== input.expectedNode) {
+      if (
+        input.updates?.entered_at === undefined &&
+        (input.toNode !== input.expectedNode ||
+          input.expectedStatus === "stalled" ||
+          input.expectedStatus === "blocked")
+      ) {
         setClauses.push("entered_at = :now");
       }
 
