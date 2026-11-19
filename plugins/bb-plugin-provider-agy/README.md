@@ -530,7 +530,7 @@ The failed turn re-runs on a free sibling after about one second. The daily elig
 
 | Environment variable | Default | Behaviour |
 | --- | ---: | --- |
-| `AGY_INELIGIBLE_COOLDOWN_MS` | `86400000` (24 hours) | Cooldown for `auth-dead` parking only — eligibility refusals no longer use it; `0` disables parking and rotation for that kind only. |
+| `AGY_INELIGIBLE_COOLDOWN_MS` | `86400000` (24 hours) | Cooldown for `auth-dead` parking only — eligibility refusals no longer use it; `0` shortens the mark's lifetime to zero but does not cancel `auth-dead` parking. |
 | `AGY_LOCATION_COOLDOWN_MS` | `7200000` (2 hours) | Cooldown for any eligibility refusal without a verification request/link (location or generic); `0` disables parking and rotation for this kind only. |
 | `AGY_INELIGIBLE_BREAKER_WINDOW_MS` | `600000` (10 minutes) | Positive time window for counting distinct accounts parked after either kind of eligibility refusal. |
 | `AGY_INELIGIBLE_BREAKER_MAX` | `3` | Positive integer threshold: after this many distinct accounts were parked within the window, the next refusal fails without parking or rotation. |
