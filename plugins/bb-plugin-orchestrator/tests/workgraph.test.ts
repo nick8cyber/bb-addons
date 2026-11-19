@@ -18,6 +18,7 @@ import {
   isOwnerCalling,
   normalizeWorkGraphMode,
   runRunQueue,
+  runResume,
 } from "../src/workgraph.js";
 
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
@@ -112,6 +113,10 @@ function fakeCli(respond?: (args: string[]) => BbCliResult | undefined): {
               },
             }),
           );
+        if (key.startsWith("thread output"))
+          return ok(JSON.stringify({ output: "" }));
+        if (key.startsWith("thread tell"))
+          return ok();
         return ok();
       },
     },
@@ -1394,8 +1399,7 @@ test("Round 2 Blocker 1: active delegation #2 prevents advancing on stale delega
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
-    enteredAt: now - 5000,
-  });
+  }, now - 5000);
   // Transition task to code
   store.transitionTask({
     taskKey: "STALE-1",
@@ -1416,21 +1420,20 @@ test("Round 2 Blocker 1: active delegation #2 prevents advancing on stale delega
     route: "simple",
     preset: "simple",
     provider: "opencode",
-    now: now - 3000,
   });
   store.setStatus(d1.id, "done");
-  host.bb.storage.database().prepare("UPDATE delegations SET result_sha = ?, result_commits = ? WHERE id = ?").run("sha-stale-1", 1, d1.id);
+  host.bb.storage.database().prepare("UPDATE delegations SET created_at = ?, result_sha = ?, result_commits = ? WHERE id = ?").run(now - 5000, "sha-stale-1", 1, d1.id);
 
   // Delegation 2 (currently active/dispatching)
-  store.insert({
+  const d2 = store.insert({
     taskKey: "STALE-1",
     coordinatorThreadId: "thr_coord",
     level: "simple",
     route: "simple",
     preset: "simple",
     provider: "opencode",
-    now: now - 1000,
   });
+  host.bb.storage.database().prepare("UPDATE delegations SET created_at = ? WHERE id = ?").run(now - 1000, d2.id);
 
   // Run run-queue: must NOT advance code using d1's stale sha
   await runRunQueue({ store, workGraphMode: "strict" });
@@ -1453,8 +1456,7 @@ test("Round 2 Blocker 2: review done without verdict does not auto-OK, code done
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
-    enteredAt: now,
-  });
+  }, now);
   store.transitionTask({
     taskKey: "NOSHA-1",
     expectedNode: "start",
@@ -1472,7 +1474,6 @@ test("Round 2 Blocker 2: review done without verdict does not auto-OK, code done
     route: "simple",
     preset: "simple",
     provider: "opencode",
-    now,
   });
   // Worker finished without committing any sha
   store.setStatus(dCode.id, "done");
@@ -1494,8 +1495,7 @@ test("Round 2 Blocker 2: review done without verdict does not auto-OK, code done
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
-    enteredAt: now,
-  });
+  }, now);
   store.transitionTask({
     taskKey: "NOVERD-1",
     expectedNode: "start",
@@ -1513,7 +1513,6 @@ test("Round 2 Blocker 2: review done without verdict does not auto-OK, code done
     route: "review",
     preset: "review",
     provider: "opencode",
-    now,
   });
   // Reviewer finished without JSON verdict line
   store.setStatus(dRev.id, "done");
@@ -1537,8 +1536,7 @@ test("Round 2 Blocker 3: stalled delegation on checks/release does not spam tran
     route: "simple",
     level: "simple",
     confirmationMode: "auto",
-    enteredAt: now,
-  });
+  }, now);
   store.transitionTask({
     taskKey: "NOFAIL-1",
     expectedNode: "start",
@@ -1557,7 +1555,6 @@ test("Round 2 Blocker 3: stalled delegation on checks/release does not spam tran
     route: "release",
     preset: "release",
     provider: "opencode",
-    now,
   });
   store.setStatus(d.id, "stalled");
 
@@ -1566,4 +1563,177 @@ test("Round 2 Blocker 3: stalled delegation on checks/release does not spam tran
   const countAfter = store.listTransitions("NOFAIL-1").length;
   // Should NOT write any dummy design_failed transition
   assert.equal(countAfter, countBefore);
+});
+
+test("Round 3 Blocker 2 & Non-blockers 6-7: fallback verdict parsing with thread output and JSON fields", async () => {
+  const customCli: BbCli = {
+    run: async (args: string[]) => {
+      const key = args.join(" ");
+      if (key.includes("tasks show")) {
+        // Return comments without verdict to trigger fallback to thread output
+        return ok(
+          JSON.stringify({
+            comments: [
+              {
+                kind: "agent",
+                threadId: "thr_rev_1",
+                body: "Running review checks in progress...",
+              },
+            ],
+          }),
+        );
+      }
+      if (key.includes("thread output thr_rev_1")) {
+        // Return JSON verdict in thread output with target: design and formatted JSON
+        return ok(
+          JSON.stringify({
+            output: 'Review finished with changes needed:\n{ "verdict": "CHANGES", "blockers": 2, "target": "design" }\nDone.',
+          }),
+        );
+      }
+      return ok();
+    },
+  };
+
+  const host = await hostWith({ workGraph: "strict" }, customCli);
+  const store = new DelegationStore(host.bb.storage.database());
+  const now = Date.now();
+
+  store.insertTask({
+    taskKey: "VERD-FALLBACK",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+    confirmationMode: "auto",
+  }, now);
+  store.transitionTask({
+    taskKey: "VERD-FALLBACK",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "design_check",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now,
+  }, now);
+
+  const d = store.insert({
+    taskKey: "VERD-FALLBACK",
+    coordinatorThreadId: "thr_coord",
+    level: "architect",
+    route: "feature",
+    preset: "architect",
+    provider: "opencode",
+  });
+  store.setStatus(d.id, "done");
+  host.bb.storage.database().prepare("UPDATE delegations SET thread_id = ? WHERE id = ?").run("thr_rev_1", d.id);
+
+  await runRunQueue({ store, workGraphMode: "strict", bbCli: customCli });
+  const t = store.getTask("VERD-FALLBACK")!;
+  // target: "design" routes CHANGES to design node
+  assert.equal(t.node, "design");
+  assert.equal(t.status, "running");
+});
+
+test("Round 3 Blocker 3 & 4: no-verdict and code no-sha transitions are nudged once and not spammed", async () => {
+  const host = await hostWith({ workGraph: "strict" });
+  const store = new DelegationStore(host.bb.storage.database());
+  const now = Date.now();
+
+  store.insertTask({
+    taskKey: "NUDGE-ONCE",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, now);
+  store.transitionTask({
+    taskKey: "NUDGE-ONCE",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "code",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now,
+  }, now);
+
+  const d = store.insert({
+    taskKey: "NUDGE-ONCE",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "opencode",
+  });
+  store.setStatus(d.id, "done");
+  host.bb.storage.database().prepare("UPDATE delegations SET result_sha = NULL, result_commits = 0 WHERE id = ?").run(d.id);
+
+  // Tick 1: should record 1 transition for code_question_or_no_report
+  await runRunQueue({ store, workGraphMode: "strict" });
+  const count1 = store.listTransitions("NUDGE-ONCE").length;
+  assert.ok(count1 > 1); // start transition + code_question transition
+
+  // Tick 2: delegation is already nudged, must NOT write duplicate self-transitions
+  await runRunQueue({ store, workGraphMode: "strict" });
+  const count2 = store.listTransitions("NUDGE-ONCE").length;
+  assert.equal(count2, count1, "Repeated tick must not spam self-transitions");
+});
+
+test("Round 3 Blocker 5: resume from stalled does not immediately re-stall on next tick", async () => {
+  const host = await hostWith({ workGraph: "strict" });
+  const store = new DelegationStore(host.bb.storage.database());
+  const now = Date.now();
+
+  store.insertTask({
+    taskKey: "RESUME-STALL",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+  }, now - 5000);
+  store.transitionTask({
+    taskKey: "RESUME-STALL",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "code",
+    toStatus: "running",
+    actor: "run-queue",
+    reason: "start",
+    now: now - 4000,
+  }, now - 4000);
+
+  // Delegation fails
+  const d = store.insert({
+    taskKey: "RESUME-STALL",
+    coordinatorThreadId: "thr_coord",
+    level: "simple",
+    route: "simple",
+    preset: "simple",
+    provider: "opencode",
+  });
+  store.setStatus(d.id, "stalled");
+
+  // Tick 1: task transitions to stalled because of failed delegation
+  await runRunQueue({ store, workGraphMode: "strict" });
+  let t = store.getTask("RESUME-STALL")!;
+  assert.equal(t.status, "stalled");
+
+  // User resumes the task back to running
+  await runResume("RESUME-STALL", undefined, {
+    store,
+    ctx: { cwd: "/tmp/fake-repo" } as any,
+    workGraphMode: "strict",
+    now: () => now,
+  });
+  t = store.getTask("RESUME-STALL")!;
+  assert.equal(t.status, "running");
+
+  // Tick 2: runRunQueue must NOT immediately re-stall from the old delegation!
+  await runRunQueue({ store, workGraphMode: "strict" });
+  t = store.getTask("RESUME-STALL")!;
+  assert.equal(t.status, "running", "Task should remain running after resume, not re-stall");
 });

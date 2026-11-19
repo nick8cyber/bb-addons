@@ -2236,13 +2236,58 @@ async function startQueuedTask(
   return false;
 }
 
+export function parseVerdictDetailsFromText(body: string): {
+  verdict: "OK" | "CHANGES";
+  blockers: number;
+  target?: "code" | "design";
+} | null {
+  let result: {
+    verdict: "OK" | "CHANGES";
+    blockers: number;
+    target?: "code" | "design";
+  } | null = null;
+
+  for (const raw of body.split("\n")) {
+    const line = raw.trim();
+    if (!line.startsWith("{") || !line.endsWith("}")) continue;
+    let parsed: { verdict?: unknown; blockers?: unknown; target?: unknown };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (parsed && (parsed.verdict === "OK" || parsed.verdict === "CHANGES")) {
+      const v = parsed.verdict as "OK" | "CHANGES";
+      // §16.7: the verdict line carries `blockers` — a missing field is not an OK.
+      const b =
+        typeof parsed.blockers === "number"
+          ? parsed.blockers
+          : 1;
+      let t: "code" | "design" | undefined;
+      if (parsed.target === "design" || parsed.target === "code") {
+        t = parsed.target;
+      }
+      result = { verdict: v, blockers: b, target: t };
+    }
+  }
+  return result;
+}
+
 function getActiveDelegationForTask(
   task: TaskQueueRow,
   delegations: DelegationRow[],
 ): DelegationRow | undefined {
   if (delegations.length === 0) return undefined;
+  const payload = parsePayload(task.payload);
+  const consumed = Array.isArray(payload.consumed_delegations)
+    ? (payload.consumed_delegations as number[])
+    : [];
   // delegationsByTask returns ORDER BY id DESC (newest first).
   const latest = delegations[0];
+  if (!latest) return undefined;
+  if (consumed.includes(latest.id)) {
+    return undefined;
+  }
   // If the latest delegation was created before the task entered the current node,
   // it belongs to an earlier node/attempt and must not be used.
   if (task.entered_at > 0 && latest.created_at < task.entered_at - 50) {
@@ -2256,7 +2301,9 @@ async function extractVerdictFromDelegation(
   delegation: DelegationRow,
   bbCli?: BbCli,
 ): Promise<{ verdict: "OK" | "CHANGES"; blockers: number; target?: "code" | "design" } | null> {
-  if (!bbCli) return null;
+  if (!bbCli || !delegation.thread_id) return null;
+
+  // 1. Check task comments (only agent comments from this delegation thread)
   try {
     const showRes = await bbCli.run(["tasks", "show", taskKey, "--json"]);
     if (showRes.exitCode === 0 && showRes.stdout) {
@@ -2269,42 +2316,36 @@ async function extractVerdictFromDelegation(
         }[];
       };
       const comments = (show.comments ?? [])
-        .filter((c) => !delegation.thread_id || c.threadId === delegation.thread_id)
+        .filter(
+          (c) =>
+            c.kind === "agent" &&
+            c.threadId === delegation.thread_id &&
+            typeof c.body === "string",
+        )
         .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
-      const last = comments.at(-1);
-      if (last?.body) {
-        const d = verdictDetailsInBody(last.body);
-        if (d) {
-          let target: "code" | "design" | undefined;
-          if (last.body.includes('"target":"design"') || last.body.includes("'target':'design'")) {
-            target = "design";
-          }
-          return { verdict: d.verdict, blockers: d.blockers ?? 0, target };
+      for (let i = comments.length - 1; i >= 0; i--) {
+        const body = comments[i]?.body;
+        if (body) {
+          const parsed = parseVerdictDetailsFromText(body);
+          if (parsed) return parsed;
         }
       }
     }
   } catch {}
 
-  if (delegation.thread_id) {
-    try {
-      const threadRes = await bbCli.run(["thread", "show", delegation.thread_id, "--json"]);
-      if (threadRes.exitCode === 0 && threadRes.stdout) {
-        const th = JSON.parse(threadRes.stdout) as {
-          messages?: { body?: string }[];
-        };
-        const messages = th.messages ?? [];
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const body = messages[i]?.body;
-          if (body) {
-            const d = verdictDetailsInBody(body);
-            if (d) {
-              return { verdict: d.verdict, blockers: d.blockers ?? 0 };
-            }
-          }
-        }
+  // 2. §17.3 fallback: reviewer thread's last output (`bb thread output <thread_id> --json`)
+  try {
+    const threadRes = await bbCli.run(["thread", "output", delegation.thread_id, "--json"]);
+    if (threadRes.exitCode === 0 && threadRes.stdout) {
+      const th = JSON.parse(threadRes.stdout) as {
+        output?: string | null;
+      };
+      if (th.output) {
+        const parsed = parseVerdictDetailsFromText(th.output);
+        if (parsed) return parsed;
       }
-    } catch {}
-  }
+    }
+  } catch {}
 
   return null;
 }
@@ -2367,6 +2408,13 @@ async function advanceActiveTask(
       return false;
     }
 
+    const consumed = Array.isArray(payload.consumed_delegations)
+      ? [...(payload.consumed_delegations as number[])]
+      : [];
+    if (!consumed.includes(latestDelegation.id)) {
+      consumed.push(latestDelegation.id);
+    }
+
     const tr = deps.store.transitionTask({
       taskKey: task.task_key,
       expectedNode: task.node,
@@ -2375,6 +2423,12 @@ async function advanceActiveTask(
       toStatus: resolution.toStatus,
       actor: "run-queue",
       reason: resolution.reason,
+      updates: {
+        payload: JSON.stringify({
+          ...payload,
+          consumed_delegations: consumed,
+        }),
+      },
     });
     if (tr.ok) {
       const logged = deps.store.listTransitions(task.task_key).at(-1);
@@ -2582,6 +2636,12 @@ async function advanceActiveTask(
         verdict = payload.spec_review_verdict === "CHANGES" ? "CHANGES" : "OK";
         blockers = Number(payload.spec_review_blockers) || 0;
       } else if (latestDelegation?.status === "done") {
+        const nudged = Array.isArray(payload.nudged_delegations)
+          ? (payload.nudged_delegations as number[])
+          : [];
+        if (nudged.includes(latestDelegation.id)) {
+          return false;
+        }
         const parsed = await extractVerdictFromDelegation(
           task.task_key,
           latestDelegation,
@@ -2599,6 +2659,38 @@ async function advanceActiveTask(
             mode: task.confirmation_mode,
             counters: extractCounters(task),
           });
+          if (resolution.allowed) {
+            if (latestDelegation.thread_id && deps.bbCli) {
+              await deps.bbCli
+                .run([
+                  "thread",
+                  "tell",
+                  latestDelegation.thread_id,
+                  'Заверши вердиктом: закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":<n>}',
+                ])
+                .catch(() => {});
+            }
+            const tr = deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "spec_review",
+              expectedStatus: "running",
+              toNode: resolution.toNode,
+              toStatus: resolution.toStatus,
+              actor: "run-queue",
+              reason: resolution.reason,
+              updates: {
+                payload: JSON.stringify({
+                  ...payload,
+                  nudged_delegations: [...nudged, latestDelegation.id],
+                  last_nudge_at: Date.now(),
+                }),
+              },
+            });
+            if (tr.ok) {
+              const logged = deps.store.listTransitions(task.task_key).at(-1);
+              if (logged) transitions.push(logged);
+            }
+          }
           return false;
         }
       }
@@ -2649,6 +2741,12 @@ async function advanceActiveTask(
           (payload.code_done ? `sha-code-${normKey.toLowerCase()}` : null);
 
         if (!resultSha) {
+          const nudged = Array.isArray(payload.nudged_delegations)
+            ? (payload.nudged_delegations as number[])
+            : [];
+          if (latestDelegation && nudged.includes(latestDelegation.id)) {
+            return false;
+          }
           const resolution = resolveTransition({
             route: task.route,
             node: "code",
@@ -2658,6 +2756,16 @@ async function advanceActiveTask(
             counters: extractCounters(task),
           });
           if (!resolution.allowed) return false;
+          if (latestDelegation?.thread_id && deps.bbCli) {
+            await deps.bbCli
+              .run([
+                "thread",
+                "tell",
+                latestDelegation.thread_id,
+                "Заверши сдачей артефакта с коммитом в ветку задачи.",
+              ])
+              .catch(() => {});
+          }
           const tr = deps.store.transitionTask({
             taskKey: task.task_key,
             expectedNode: "code",
@@ -2666,6 +2774,15 @@ async function advanceActiveTask(
             toStatus: resolution.toStatus,
             actor: "run-queue",
             reason: resolution.reason,
+            updates: {
+              payload: JSON.stringify({
+                ...payload,
+                nudged_delegations: latestDelegation
+                  ? [...nudged, latestDelegation.id]
+                  : nudged,
+                last_nudge_at: Date.now(),
+              }),
+            },
           });
           if (tr.ok) {
             const logged = deps.store.listTransitions(task.task_key).at(-1);
@@ -2798,6 +2915,12 @@ async function advanceActiveTask(
         verdict = payload.review_verdict === "CHANGES" ? "CHANGES" : "OK";
         blockers = Number(payload.review_blockers) || 0;
       } else if (latestDelegation?.status === "done") {
+        const nudged = Array.isArray(payload.nudged_delegations)
+          ? (payload.nudged_delegations as number[])
+          : [];
+        if (nudged.includes(latestDelegation.id)) {
+          return false;
+        }
         const parsed = await extractVerdictFromDelegation(
           task.task_key,
           latestDelegation,
@@ -2815,6 +2938,38 @@ async function advanceActiveTask(
             mode: task.confirmation_mode,
             counters: extractCounters(task),
           });
+          if (resolution.allowed) {
+            if (latestDelegation.thread_id && deps.bbCli) {
+              await deps.bbCli
+                .run([
+                  "thread",
+                  "tell",
+                  latestDelegation.thread_id,
+                  'Заверши вердиктом: закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":<n>}',
+                ])
+                .catch(() => {});
+            }
+            const tr = deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "review",
+              expectedStatus: "running",
+              toNode: resolution.toNode,
+              toStatus: resolution.toStatus,
+              actor: "run-queue",
+              reason: resolution.reason,
+              updates: {
+                payload: JSON.stringify({
+                  ...payload,
+                  nudged_delegations: [...nudged, latestDelegation.id],
+                  last_nudge_at: Date.now(),
+                }),
+              },
+            });
+            if (tr.ok) {
+              const logged = deps.store.listTransitions(task.task_key).at(-1);
+              if (logged) transitions.push(logged);
+            }
+          }
           return false;
         }
       }
@@ -2865,6 +3020,12 @@ async function advanceActiveTask(
           payload.design_check_verdict === "CHANGES" ? "CHANGES" : "OK";
         if (payload.design_check_target === "design") target = "design";
       } else if (latestDelegation?.status === "done") {
+        const nudged = Array.isArray(payload.nudged_delegations)
+          ? (payload.nudged_delegations as number[])
+          : [];
+        if (nudged.includes(latestDelegation.id)) {
+          return false;
+        }
         const parsed = await extractVerdictFromDelegation(
           task.task_key,
           latestDelegation,
@@ -2882,6 +3043,38 @@ async function advanceActiveTask(
             mode: task.confirmation_mode,
             counters: extractCounters(task),
           });
+          if (resolution.allowed) {
+            if (latestDelegation.thread_id && deps.bbCli) {
+              await deps.bbCli
+                .run([
+                  "thread",
+                  "tell",
+                  latestDelegation.thread_id,
+                  'Заверши вердиктом: закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":<n>}',
+                ])
+                .catch(() => {});
+            }
+            const tr = deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "design_check",
+              expectedStatus: "running",
+              toNode: resolution.toNode,
+              toStatus: resolution.toStatus,
+              actor: "run-queue",
+              reason: resolution.reason,
+              updates: {
+                payload: JSON.stringify({
+                  ...payload,
+                  nudged_delegations: [...nudged, latestDelegation.id],
+                  last_nudge_at: Date.now(),
+                }),
+              },
+            });
+            if (tr.ok) {
+              const logged = deps.store.listTransitions(task.task_key).at(-1);
+              if (logged) transitions.push(logged);
+            }
+          }
           return false;
         }
       }

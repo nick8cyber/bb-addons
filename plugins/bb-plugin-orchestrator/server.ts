@@ -1556,14 +1556,20 @@ export async function createPlugin(
       bb.log.warn(`orchestrator release pump: ${describeError(e)}`),
     );
 
+  let cachedPumpRepoRoot: string | null = null;
   const pumpRunQueue = async () => {
     const mode = getWorkGraphMode();
     if (mode === "off") return;
-    let repoRoot = process.cwd();
-    try {
-      const wt = await resolveWorktreeContext(undefined, undefined, process.cwd()).catch(() => null);
-      if (wt?.repoRoot) repoRoot = wt.repoRoot;
-    } catch {}
+    let repoRoot = cachedPumpRepoRoot ?? process.cwd();
+    if (!cachedPumpRepoRoot) {
+      try {
+        const wt = await resolveWorktreeContext(undefined, undefined, process.cwd()).catch(() => null);
+        if (wt?.repoRoot) {
+          cachedPumpRepoRoot = wt.repoRoot;
+          repoRoot = wt.repoRoot;
+        }
+      } catch {}
+    }
     return runRunQueue({
       store,
       workGraphMode: mode,
