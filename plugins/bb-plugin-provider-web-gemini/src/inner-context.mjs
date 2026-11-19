@@ -48,7 +48,7 @@ export function loadSettings(stateDir, projectId) {
   } catch (error) {
     if (error.code !== "ENOENT") throw new Error("invalid inner-agent.json");
   }
-  if (!record(input) || ["context", "apply", "innerAgent"].some((key) => input[key] !== undefined && !record(input[key]))) {
+  if (!record(input) || ["context", "apply", "innerAgent", "state"].some((key) => input[key] !== undefined && !record(input[key]))) {
     throw new Error("invalid inner-agent.json settings");
   }
   const setting = (value, fallback, min, name) => {
@@ -75,6 +75,8 @@ export function loadSettings(stateDir, projectId) {
     maxTotalBytes: setting(input.context?.maxTotalBytes, DEFAULT_TOTAL, 1, "context.maxTotalBytes"),
     maxRepairRounds: setting(input.apply?.maxRepairRounds, 2, 0, "apply.maxRepairRounds"),
     progressIntervalMs: setting(input.progressIntervalMs, 15_000, 1, "progressIntervalMs"),
+    stateRetentionMs: setting(input.state?.retentionMs, 86_400_000, 1, "state.retentionMs"),
+    stateMaxRecords: setting(input.state?.maxRecords, 200, 1, "state.maxRecords"),
     mask(text) {
       let value = String(text);
       for (const { type, re } of compiled) value = value.replace(re, () => "[скрыто: " + type + "]");
