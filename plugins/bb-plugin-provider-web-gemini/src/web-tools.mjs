@@ -69,7 +69,12 @@ const TASK_KEY_IN_TEXT_RE = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/g;
 const TASK_KEY_ALLOW = new Set([
   "UTF-8", "UTF-16", "UTF-32", "ISO-8859", "SHA-1", "SHA-256", "SHA-384",
   "SHA-512", "MD-5", "DES-3", "AES-128", "AES-192", "AES-256",
+  "ISO-8601", "RFC-3339", "HTTP-2", "HTTP-3", "ES-2022", "ES-2023", "ES-2024", "ES-2025",
 ]);
+export const isTaskKeyToken = (token) =>
+  TASK_KEY_RE.test(token) &&
+  !TASK_KEY_ALLOW.has(token) &&
+  !/^(?:ISO|RFC|HTTP|ES|CVE|IEEE|POSIX|TLS|SSL|ECMA|HTML|CSS|W3C|BASE|GZIP|BZIP|XZ|LZ4|ZSTD)-\d+$/i.test(token);
 
 /* ---------- §6: маскировка (правила сканера утечек, категории 1–4) ----------
  * Формат подстановки — `[скрыто: <тип>]` по спеке. Сами регулярки зеркалят
@@ -355,6 +360,16 @@ const lineNo = (v) => {
 const GIT_WHITELIST = new Set(["show", "diff", "log", "blame", "ls-files", "status"]);
 const GIT_DENIED_OPT_RE =
   /^--output\b|^--exec\b|^--ext-diff\b|^--contents\b|^--work-tree\b|^--git-dir\b|^-O\S*/;
+const TASK_GIT_FLAGS = {
+  show: ["--stat", "--name-only", "--name-status", "--oneline", "--summary", "--no-patch"],
+  diff: ["--stat", "--name-only", "--name-status", "--summary", "--cached", "--staged", "--check"],
+  log: ["--stat", "--name-only", "--name-status", "--oneline", "--no-patch", "--all"],
+  blame: ["--line-porcelain", "--porcelain"],
+  "ls-files": ["--cached", "--others", "--exclude-standard"],
+  status: ["-s", "--short", "--porcelain", "--porcelain=v1", "--branch", "-b"],
+};
+const taskPathDenied = (value) => /(?:^|[\\/:])\.git(?:[\\/]|$)/i.test(value) ||
+  String(value).split(/[\\/]/).some((part) => isSensitivePath(part) || /^id_/i.test(part));
 
 function splitArgs(s) {
   const out = [];
@@ -370,6 +385,7 @@ function toolReadFile(args, ctx) {
   if (isSensitivePath(relStr)) return err(SENSITIVE_DENIED);
   const r = resolveInCwd(ctx.cwd, relStr);
   if (r.error) return err(r.error);
+  if (ctx.rejectSensitive && (taskPathDenied(relStr) || taskPathDenied(path.relative(r.base, r.abs)))) return err(SENSITIVE_DENIED);
   if (isSensitivePath(path.relative(r.base, r.abs))) return err(SENSITIVE_DENIED);
   let st;
   try {
@@ -400,6 +416,7 @@ function toolListDir(args, ctx) {
   if (isSensitivePath(relStr)) return err(SENSITIVE_DENIED);
   const r = resolveInCwd(ctx.cwd, relStr);
   if (r.error) return err(r.error);
+  if (ctx.rejectSensitive && (taskPathDenied(relStr) || taskPathDenied(path.relative(r.base, r.abs)))) return err(SENSITIVE_DENIED);
   if (isSensitivePath(path.relative(r.base, r.abs))) return err(SENSITIVE_DENIED);
   let st;
   try {
@@ -424,6 +441,7 @@ function toolListDir(args, ctx) {
     for (const e of ents) {
       if (e.isDirectory() && e.name === ".git") continue;
       const full = path.join(dir, e.name);
+      if (ctx.rejectSensitive && taskPathDenied(path.relative(base, full))) continue;
       entries.push(path.relative(base, full) + (e.isDirectory() ? "/" : ""));
       if (entries.length >= MAX_LIST_ENTRIES) {
         capped = true;
@@ -467,7 +485,7 @@ function capLines(text, max) {
   return lines.slice(0, max).join("\n") + TRUNC_SUFFIX;
 }
 
-function filterGrepOutput(stdout) {
+function filterGrepOutput(stdout, deny = isSensitivePath) {
   const lines = String(stdout ?? "").replace(/\r\n/g, "\n").split("\n");
   const filtered = [];
   for (const line of lines) {
@@ -475,7 +493,7 @@ function filterGrepOutput(stdout) {
     const colonIdx = line.indexOf(":");
     if (colonIdx !== -1) {
       const file = line.slice(0, colonIdx).trim();
-      if (isSensitivePath(file)) continue;
+      if (deny(file)) continue;
     }
     filtered.push(line);
   }
@@ -489,11 +507,14 @@ function toolGrep(args, ctx) {
   if (isSensitivePath(relStr)) return err(SENSITIVE_DENIED);
   const r = resolveInCwd(ctx.cwd, relStr);
   if (r.error) return err(r.error);
+  const deny = ctx.rejectSensitive ? taskPathDenied : isSensitivePath;
+  if (ctx.rejectSensitive && (deny(relStr) || deny(path.relative(r.base, r.abs)))) return err(SENSITIVE_DENIED);
   if (isSensitivePath(path.relative(r.base, r.abs))) return err(SENSITIVE_DENIED);
   const res = runCmd("rg", [
     "--line-number", "--no-heading", "--color=never",
-    ...GREP_DENY_GLOBS, "--", pattern, r.abs,
-  ]);
+    ...(ctx.rejectSensitive ? ["--no-config", "-g", "!.git", "-g", "!**/.git/**"] : []),
+    ...GREP_DENY_GLOBS, "--", pattern, ctx.rejectSensitive ? path.relative(r.base, r.abs) || "." : r.abs,
+  ], ctx.rejectSensitive ? { cwd: r.base } : {});
   if (res.error === "command not found: rg") {
     const rel = path.relative(r.base, r.abs) || ".";
     const g = runCmd(
@@ -508,7 +529,7 @@ function toolGrep(args, ctx) {
       }
       return { output: "(no matches)" };
     }
-    const filtered = filterGrepOutput(g.stdout);
+    const filtered = filterGrepOutput(g.stdout, deny);
     if (!filtered) return { output: "(no matches)" };
     return { output: capLines(filtered, MAX_GREP_LINES) };
   }
@@ -517,7 +538,7 @@ function toolGrep(args, ctx) {
   if (res.status !== 0) {
     return err(`rg failed: ${String(res.stderr || "").split("\n")[0] || "exit " + res.status}`);
   }
-  const filtered = filterGrepOutput(res.stdout);
+  const filtered = filterGrepOutput(res.stdout, deny);
   if (!filtered) return { output: "(no matches)" };
   return { output: capLines(filtered, MAX_GREP_LINES) };
 }
@@ -1022,9 +1043,18 @@ function toolGit(args, ctx) {
   if (argv.some((a) => GIT_DENIED_OPT_RE.test(a))) {
     return err(`git option not allowed: ${argv.find((a) => GIT_DENIED_OPT_RE.test(a))}`);
   }
+  if (ctx.rejectSensitive) {
+    const pathStart = argv.indexOf("--");
+    for (const arg of argv.slice(1, pathStart < 0 ? undefined : pathStart)) {
+      if (!arg.startsWith("-") || TASK_GIT_FLAGS[sub].includes(arg)) continue;
+      if ((sub === "log" || sub === "show") && /^-[1-9]\d{0,2}$/.test(arg)) continue;
+      if ((sub === "show" || sub === "diff") && /^-U\d{1,3}$/.test(arg)) continue;
+      return err("git option not allowed in a BB task");
+    }
+  }
   const paths = extractGitPaths(argv);
   for (const p of paths) {
-    if (isSensitivePath(p)) return err(SENSITIVE_DENIED);
+    if (isSensitivePath(p) || (ctx.rejectSensitive && taskPathDenied(p))) return err(SENSITIVE_DENIED);
     if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(p)) {
       return err("access denied: path outside cwd");
     }
@@ -1054,7 +1084,13 @@ function toolGit(args, ctx) {
   }
   const r = resolveInCwd(ctx.cwd, ".");
   if (r.error) return err(r.error);
-  const res = runCmd("git", argv, { cwd: r.base });
+  if (ctx.rejectSensitive && ["show", "diff", "log", "blame"].includes(sub)) {
+    argv.splice(1, 0, "--no-textconv");
+    if (sub !== "blame") argv.splice(1, 0, "--no-ext-diff");
+  }
+  const res = runCmd("git", argv, { cwd: r.base, ...(ctx.rejectSensitive ? {
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" },
+  } : {}) });
   if (res.error) return err(res.error);
   if (res.status !== 0) {
     return err(`git ${sub} failed: ${String(res.stderr || "").split("\n")[0] || "exit " + res.status}`);
@@ -1078,43 +1114,34 @@ function extraArgs(args, allowed) {
   return Object.keys(args).filter((k) => !allowed.includes(k));
 }
 
-function toolThreadOutput(args) {
-  const extra = extraArgs(args, ["threadId"]);
-  if (extra.length) return err(`unexpected args: ${extra.join(", ")}`);
-  const id = String(args.threadId ?? "");
-  if (!THREAD_ID_RE.test(id)) return err(`invalid threadId: ${id || "(empty)"}`);
-  const res = runCmd(bbBin(), ["thread", "output", id]);
-  if (res.error) return err(res.error);
-  if (res.status !== 0) {
-    return err(`bb thread output failed: ${String(res.stderr || res.stdout).split("\n")[0] || "exit " + res.status}`);
+export function bbReadCommand({ name, args }) {
+  if (name === "bb_task_show") {
+    const extra = extraArgs(args, ["key"]);
+    if (extra.length) return err(`unexpected args: ${extra.join(", ")}`);
+    const key = String(args.key ?? "");
+    if (!TASK_KEY_RE.test(key)) return err(`invalid key: ${key || "(empty)"}`);
+    return { argv: ["tasks", "show", key] };
   }
-  return { output: res.stdout };
-}
-
-function toolThreadMessage(args) {
-  const extra = extraArgs(args, ["threadId", "msg"]);
+  if (name !== "bb_thread_output" && name !== "bb_thread_message") return null;
+  const hasMessage = name === "bb_thread_message";
+  const extra = extraArgs(args, hasMessage ? ["threadId", "msg"] : ["threadId"]);
   if (extra.length) return err(`unexpected args: ${extra.join(", ")}`);
   const id = String(args.threadId ?? "");
   if (!THREAD_ID_RE.test(id)) return err(`invalid threadId: ${id || "(empty)"}`);
+  if (!hasMessage) return { argv: ["thread", "output", id] };
   const msg = String(args.msg ?? "");
   if (!/^\d+$/.test(msg)) return err(`invalid msg: ${msg || "(empty)"}`);
-  const res = runCmd(bbBin(), ["thread", "log", id, "--message", msg]);
-  if (res.error) return err(res.error);
-  if (res.status !== 0) {
-    return err(`bb thread log failed: ${String(res.stderr || res.stdout).split("\n")[0] || "exit " + res.status}`);
-  }
-  return { output: res.stdout };
+  return { argv: ["thread", "log", id, "--message", msg] };
 }
 
-function toolTaskShow(args) {
-  const extra = extraArgs(args, ["key"]);
-  if (extra.length) return err(`unexpected args: ${extra.join(", ")}`);
-  const key = String(args.key ?? "");
-  if (!TASK_KEY_RE.test(key)) return err(`invalid key: ${key || "(empty)"}`);
-  const res = runCmd(bbBin(), ["tasks", "show", key]);
+function toolBb(call) {
+  const command = bbReadCommand(call);
+  if (command.error) return command;
+  const { argv } = command;
+  const res = runCmd(bbBin(), argv);
   if (res.error) return err(res.error);
   if (res.status !== 0) {
-    return err(`bb tasks show failed: ${String(res.stderr || res.stdout).split("\n")[0] || "exit " + res.status}`);
+    return err(`bb ${argv.slice(0, 2).join(" ")} failed: ${String(res.stderr || res.stdout).split("\n")[0] || "exit " + res.status}`);
   }
   return { output: res.stdout };
 }
@@ -1130,6 +1157,16 @@ export function truncResult(text) {
 }
 
 /** Обрезка UTF-8 строки по байтовому лимиту с сохранением валидности символов. */
+export function limitResult(text, maxBytes) {
+  const totalBytes = Buffer.byteLength(text);
+  if (totalBytes <= maxBytes) return { output: text };
+  const buf = Buffer.from(text);
+  let end = Math.max(0, maxBytes - Buffer.byteLength(TRUNC_SUFFIX));
+  while (end && (buf[end] & 0xc0) === 0x80) end--;
+  const suffix = Buffer.byteLength(TRUNC_SUFFIX) <= maxBytes ? TRUNC_SUFFIX : "";
+  return { output: buf.subarray(0, end).toString("utf8") + suffix, truncated: { includedBytes: end, totalBytes } };
+}
+
 export function truncateUtf8(str, maxBytes) {
   const buf = Buffer.from(String(str ?? ""), "utf8");
   if (buf.length <= maxBytes) return String(str ?? "");
@@ -1151,24 +1188,25 @@ export function executeTool(call, ctx = {}) {
     case "list_dir": out = toolListDir(call.args, ctx); break;
     case "grep": out = toolGrep(call.args, ctx); break;
     case "git": out = toolGit(call.args, ctx); break;
-    case "bb_thread_output": out = toolThreadOutput(call.args); break;
-    case "bb_thread_message": out = toolThreadMessage(call.args); break;
-    case "bb_task_show": out = toolTaskShow(call.args); break;
+    case "bb_thread_output":
+    case "bb_thread_message":
+    case "bb_task_show": out = toolBb(call); break;
     default: out = err(`unknown tool: ${call.name}`);
   }
   const text = out.error ? `error: ${out.error}` : String(out.output ?? "");
+  if (ctx.mask) return { ok: !out.error, ...limitResult(ctx.mask(text), ctx.maxResultBytes ?? MAX_TOOL_RESULT_BYTES) };
   return { ok: !out.error, output: truncResult(maskForWeb(text)) };
 }
 
 /* ---------- §2/§3: системная шапка и цикл раундов ---------- */
-export function toolSystemHeader(maxRounds = MAX_TOOL_ROUNDS) {
+export function toolSystemHeader(maxRounds = MAX_TOOL_ROUNDS, { pinned = false } = {}) {
   return [
     "[provider tools] В этой сессии доступны инструменты только чтения (рабочая копия сессии, пути относительные).",
     "Вызов — строго одна строка XML на инструмент:",
     '<tool name="read_file" path="src/index.js" from="1" to="80"/>',
     '<tool name="list_dir" path="plugins"/>',
     '<tool name="grep" pattern="pickBackend" path="plugins"/>',
-    '<tool name="git" args="diff --stat HEAD~1..HEAD"/>',
+    pinned ? '<tool name="git" args="diff --stat"/>' : '<tool name="git" args="diff --stat HEAD~1..HEAD"/>',
     `<tool name="bb_thread_output" threadId="${THR}xxxxxxxxxx"/>`,
     `<tool name="bb_thread_message" threadId="${THR}xxxxxxxxxx" msg="2"/>`,
     '<tool name="bb_task_show" key="PLUG-129"/>',
@@ -1200,6 +1238,8 @@ export async function runToolLoop({
   execute,
   onToolStart = null,
   onToolEnd = null,
+  onToolRound = null,
+  formatResult = (call, result) => formatToolResultBlock(call, result.output),
   maxRounds = MAX_TOOL_ROUNDS,
   isCancelled = () => false,
 }) {
@@ -1208,14 +1248,17 @@ export async function runToolLoop({
   let lastRes = null;
   const executed = [];
   for (;;) {
+    if (isCancelled()) return { cancelled: true, rounds: round, executed, lastRes };
     const res = await send(message);
     lastRes = res;
-    const text = String(res?.text ?? res ?? "");
+    const raw = typeof res?.rawText === "string" && res.rawText.trim() ? res.rawText : null;
+    const text = String(raw ?? res?.text ?? res ?? "");
     const calls = parseToolCalls(text);
     if (!calls.length) {
       return { cancelled: false, forcedFinal: false, finalText: text, rounds: round, executed, lastRes };
     }
     if (round >= maxRounds) {
+      onToolRound?.(round + 1);
       const res2 = await send(forceFinalMessage(maxRounds));
       return {
         cancelled: false,
@@ -1226,13 +1269,15 @@ export async function runToolLoop({
         lastRes: res2,
       };
     }
+    onToolRound?.(round + 1);
     const parts = [];
     for (const call of calls) {
+      if (isCancelled()) return { cancelled: true, rounds: round, executed, lastRes };
       const handle = onToolStart ? onToolStart(call) : null;
       const r = await execute(call);
       if (onToolEnd) onToolEnd(handle, call, r);
       executed.push({ name: call.name, ok: r.ok });
-      parts.push(formatToolResultBlock(call, r.output));
+      parts.push(formatResult(call, r));
     }
     message = parts.join("\n");
     round += 1;
@@ -1317,10 +1362,10 @@ export function writeSpillPackage(spillDir, spillId, content) {
   const safeId = String(spillId ?? "pkg").replace(SPILL_NAME_SAFE_RE, "_") || "pkg";
   const pkgName = `pkg-${safeId}-${Date.now()}.md`;
   const pkgPath = path.join(spillDir, pkgName);
-  fs.mkdirSync(spillDir, { recursive: true });
+  fs.mkdirSync(spillDir, { recursive: true, mode: 0o700 });
   const tmp = `${pkgPath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(tmp, content, "utf8");
+    fs.writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tmp, pkgPath);
   } catch (err) {
     try {
@@ -1349,8 +1394,19 @@ export function packFirstMessage({
   maxRounds = MAX_TOOL_ROUNDS,
   spillDir = null,
   spillId = null,
+  completePackage = null,
 }) {
   maxBytes = effectiveMessageBytes(maxBytes);
+  if (completePackage) {
+    const { header, render } = completePackage;
+    let payload = render("text");
+    let message = header + "\n\n" + payload;
+    if (Buffer.byteLength(message) <= maxBytes) return { message, payload };
+    payload = render("spill attachment");
+    const { pkgName, pkgPath } = writeSpillPackage(spillDir, spillId, payload);
+    message = header + "\n\nRead the entire task and its manifest in the attached " + pkgName + ".";
+    return { message, payload, spilledFile: pkgPath };
+  }
   const seen = new Set();
   const candidates = [];
 
