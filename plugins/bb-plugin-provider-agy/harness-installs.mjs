@@ -17,6 +17,9 @@
  *   9  install survives markAccountUse/markAccountCooldown/saveLedger and
  *      never leaks into accounts-overlay.json; concurrent disk labels ride
  *      through a foreign save
+ *   11 --rebind under a live pool: the running session is not restarted,
+ *      the next launch runs the new install (the operator-script side —
+ *      refusals, staging, retries — lives in harness-installs-commands)
  *
  * Usage: node harness-installs.mjs            (ACP wrapper suite)
  *        AGY_INSTALLS_TRANSPORT=stream-json node harness-installs.mjs
@@ -25,6 +28,7 @@
 import {
   chmodSync, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
@@ -284,11 +288,22 @@ const pinnedLabel = (tid) =>
 // Marks recorded since a transcript offset — proof of which binary ran.
 const marksSince = (offset) => binMarks().slice(offset);
 // The live-registry edit rewrites s2's expectation mid-run: marks before
-// `v2MarkOffset` use BINDINGS, marks at/after it bind s2 → "secondary-v2".
+// `v2MarkOffset` use BINDINGS, marks at/after it bind s2 → "secondary-v2",
+// and the live-pool rebind rewrites it once more — marks at/after
+// `s2RebindOffset` bind s2 → the registry default ("main").
 let v2MarkOffset = Number.POSITIVE_INFINITY;
+let s2RebindOffset = Number.POSITIVE_INFINITY;
+const expectedBin = (m, i) => {
+  if (m.home === "s2") {
+    if (i >= s2RebindOffset) return "main";
+    if (i >= v2MarkOffset) return "secondary-v2";
+    return "secondary";
+  }
+  return BINDINGS[m.home];
+};
 const allMarksConsistent = (marks) =>
   marks.every((m, i) => {
-    const bound = i < v2MarkOffset ? BINDINGS[m.home] : m.home === "s2" ? "secondary-v2" : BINDINGS[m.home];
+    const bound = expectedBin(m, i);
     return bound === m.__bin || !Object.hasOwn(BINDINGS, m.home);
   });
 // A `__models` transcript line is written by the fake child the launch
@@ -614,6 +629,42 @@ if (SUITE === "acp") {
   check(
     !marksSince(marksBeforeForbidden).length,
     "forbidden env key → no binary launched",
+  );
+
+  // -- §11 п.11: --rebind under a live pool — new launches only ---------
+  // The session resumed on s2 above is still running on secondary-v2;
+  // the operator script rewrites the shared file, and the Strict
+  // Execution Contract promises it touches future launches only.
+  writeRegistry();
+  const s2MarksBeforeRebind = binMarks().filter((m) => m.home === "s2").length;
+  const rebind = spawnSync(
+    "node",
+    [
+      new URL("./scripts/import-accounts.mjs", import.meta.url).pathname,
+      "--rebind", "--label", "s2", "--install", "main", "--data-dir", root,
+    ],
+    { encoding: "utf8" },
+  );
+  check(rebind.status === 0, "rebind s2 → main exits 0 under a live pool");
+  check(
+    readState().accounts.s2?.install === undefined,
+    "rebind to the default removed the install field",
+  );
+  await sleep(800);
+  check(
+    binMarks().filter((m) => m.home === "s2").length === s2MarksBeforeRebind,
+    "running s2 session was NOT restarted by the rebind",
+  );
+  s2RebindOffset = binMarks().length;
+  const rebindResumeId = rid();
+  send({
+    jsonrpc: "2.0", id: rebindResumeId, method: "thread/resume",
+    params: { threadId: "t-s2rr", cwd: workspace, providerThreadId: s2Ptid, options, instructionMode: "append" },
+  });
+  await waitFor(() => replies(rebindResumeId).length === 1, 20_000, "resume after rebind");
+  check(
+    marksSince(s2RebindOffset).some((m) => m.home === "s2" && m.__bin === "main"),
+    "post-rebind launch ran s2 on the registry default binary",
   );
 } else {
   // ======================= stream-json bridge suite ======================

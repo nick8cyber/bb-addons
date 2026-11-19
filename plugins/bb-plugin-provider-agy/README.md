@@ -111,6 +111,7 @@ provider is configured and not only here.
 | `harness-fake.mjs`, `harness-steer.mjs`, `harness-rebuild.mjs`, `harness-artifact.mjs` | the quota-free suites, driven by `fake-agy.mjs` / `fake-agy-artifact.mjs` |
 | `harness-shim-env.mjs` | regression suite for shim environment and unknown-session restore (reproduces steer without `AGY_SHIM_*` exiting code 2, proves option rewriting, fallback shim check, and `threads-state.json` restore on unknown threadId) |
 | `harness-errors.mjs`, `fake-agy-errors.mjs` | the error-surfacing suite: failed tool steps, stderr banners, turn-less rejects, the stale quota-residue replay, the immediate reject whose exit 1 must not add a raw banner, the native `provider/rateLimits/updated` blocked→allowed snapshot, and live named `tool` items with settle progress |
+| `harness-installs.mjs`, `harness-installs-commands.mjs` | the parallel-installs suites: strict per-install binary routing, live registry edits, `--rebind` under a running pool; the commands suite drives add-account/import staging, refusals and binding-write retries through `AGY_FAKE_CHECKPOINT_DIR` stop points |
 
 ## agy's stream-json dialect (confirmed against agy 1.1.19)
 
@@ -635,6 +636,97 @@ into the account's own home, nothing else touches the credential:
 Importing tokens from third-party tools (`scripts/import-accounts.mjs`)
 keeps working, but a native sign-in is the safer path: the credential is
 then only ever used by Google's own binary.
+
+#### Parallel installs: several agy binaries, one pool
+
+A pool can run more than one agy binary — separate installs in separate
+directories, so process load, self-updates and local CLI state do not
+share a single binary (spec `docs/specs/provider-agy-installs.md`,
+ADR-0033). The pool's own logic does not change: the same priority/LRU
+order picks the account, and the install only decides **which binary
+runs it**. Every account is bound to exactly one install, and its
+sessions, `agy models` probes and usage polls always spawn THAT
+install's binary — never a substitute.
+
+Two files carry the feature:
+
+- `<dataDir>/agy-installs.json` — the installs registry. It is
+  **instance-local**: binary paths differ per host, so the keeper never
+  syncs it, and every machine of the pool (satellites included) gets its
+  own registry with the same install names — on a satellite both names
+  may point at the same binary.
+
+  ```json
+  {
+    "installs": {
+      "main":      { "bin": "<install-dir>/bin/agy" },
+      "secondary": { "bin": "<alt-install-dir>/bin/agy",
+                     "env": { "XDG_CACHE_HOME": "<cache-dir>/agy-alt" } }
+    },
+    "default": "main"
+  }
+  ```
+
+  Install names match `^[a-z0-9-]{1,32}$`; `default` names the main
+  install. An optional `env` adds variables to that install's child
+  processes as the layer UNDER the plugin's own keys — `HOME`,
+  `ELECTRON_RUN_AS_NODE`, `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL`, the
+  proxy vars and the whole `AGY_*` prefix are managed by the plugin and
+  forbidden there; a single forbidden key makes the whole registry
+  invalid. The file is re-read on every mtime change, so edits apply
+  without a plugin reload. A registry that does not parse, fails the
+  schema or names a `default` absent from `installs` is a **loud error**:
+  no account is pickable and `thread/start`, `direct` and `relay` fail
+  with the cause — there is no silent fallback. With no registry at all
+  the plugin behaves exactly as before: one implicit binary resolved by
+  `AGY_PATH` → `~/.local/bin/agy` → `PATH`.
+
+- `accounts[label].install` in `accounts-state.json` — the binding.
+  Shared-owned like `priority`: written on the owner instance only,
+  synced to satellites, and never copied into `accounts-overlay.json`.
+  Absent means the `default` install. An account bound to a name the
+  local registry does not declare (or whose binary is missing or not
+  executable — checked on every pick, so a reappearing binary returns
+  the account to service) is **locally unavailable**: skipped by
+  `pickAccount`, by the model probes and by the merged `model/list`,
+  logged to `acp-wrapper.log` at most once per 5 minutes — and never run
+  on another install's binary.
+
+Operator commands (run them **on the owner instance** — each refuses
+when `<dataDir>/pool-satellite` exists, the marker an operator creates
+on every satellite, because a satellite's writes to the shared file are
+wiped by the keeper sync within ~30 s and the account would silently
+land back on the main install):
+
+```bash
+node scripts/add-account.mjs --label <label>                        # main install
+node scripts/add-account.mjs --label <label> --install secondary    # a named install
+node scripts/import-accounts.mjs --cliproxy [dir] --install secondary
+node scripts/import-accounts.mjs --rebind --label <label> --install secondary
+```
+
+`add-account.mjs` is the scripted form of "Adding an account" above and
+the recommended way once a registry exists: it stages the home OUTSIDE
+`accounts/` (`<dataDir>/.add-account-<label>`), runs the native `agy`
+sign-in there with the bound install's binary, writes `install`
+atomically while the pool still cannot see the account, and only then
+renames the home into `accounts/` — so the pool never sees an account
+whose binding is not yet on disk. It re-verifies the field from disk
+after the rename and rewrites it up to three times against a concurrent
+`saveLedger` before rolling the account back out. Without `--install`
+(and without a registry) it is exactly the manual flow, just atomic;
+`--bin` overrides the resolved binary and `--data-dir` the plugin data
+dir.
+
+`import-accounts.mjs --install` binds imported accounts the same way,
+and `--rebind --label <l> --install <n>` flips an existing account to
+another install atomically (temp + rename); naming `default` or the
+default install's own name clears the field. Rebinding affects the next
+launch only — a running session keeps the binary it was started with. A
+quota or auth rotation can still land a thread on a different install;
+the pool pick/move log lines just gain an `install=<name>` suffix in
+`acp-wrapper.log`, and the registry itself is announced at startup as
+`installs registry loaded: …` there and in `bridge.log`.
 
 Mode precedence, each level falling back to the next: **pool** (non-empty;
 `AGY_ACCOUNTS=0` skips) → **cliproxy relay** (below; `AGY_CLIPROXY=0`

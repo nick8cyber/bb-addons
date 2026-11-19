@@ -196,4 +196,25 @@ export function accountsStatePath(dataDir) {
   return join(dataDir, "accounts-state.json");
 }
 
+/**
+ * Harness stop point (spec §11 п.10в): when AGY_FAKE_CHECKPOINT_DIR names
+ * a directory the script drops a `cp-<name>` marker and, while a
+ * `cp-<name>.hold` file exists, waits — a deterministic pause inside the
+ * otherwise-microsecond "binding write → re-read" windows so the harness
+ * can land a concurrent accounts-state.json overwrite exactly there.
+ * Nothing is written and nothing waits when the variable is unset.
+ */
+const waitCell = new Int32Array(new SharedArrayBuffer(4));
+export function checkpoint(name) {
+  const dir = process.env.AGY_FAKE_CHECKPOINT_DIR;
+  if (dir === undefined || dir.length === 0) {
+    return;
+  }
+  const marker = join(dir, `cp-${name}`);
+  writeFileSync(marker, `${process.pid}\n`);
+  while (existsSync(`${marker}.hold`)) {
+    Atomics.wait(waitCell, 0, 0, 10);
+  }
+}
+
 export { mkdtempSync, tmpdir };

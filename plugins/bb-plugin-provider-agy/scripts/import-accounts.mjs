@@ -35,9 +35,10 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   accountsStatePath,
+  checkpoint,
   isSatellite,
   readAccountsState,
   readInstallsRegistry,
@@ -101,8 +102,13 @@ const writeBinding = (label, field) => {
 // binary they started on.
 if (rebind) {
   const label = value("--label");
-  if (typeof label !== "string" || label.length === 0) {
-    fail("--rebind requires --label <label>");
+  if (
+    typeof label !== "string" ||
+    !/^[A-Za-z0-9._@+-]+$/u.test(label) ||
+    label === "." ||
+    label === ".."
+  ) {
+    fail("--rebind requires --label <label> matching ^[A-Za-z0-9._@+-]+$");
   }
   if (installArg === undefined) {
     fail("--rebind requires --install <name>");
@@ -115,6 +121,7 @@ if (rebind) {
     fail(`label ${label} is not a pool account`);
   }
   writeBinding(label, binding.field);
+  checkpoint("rebound");
   const onDisk = readAccountsState(dataDir).accounts[label]?.install;
   const recorded = onDisk ?? "default";
   if ((onDisk ?? null) !== binding.field) {
@@ -204,35 +211,82 @@ if (flag("--opencode")) {
 function importBoundAccount(label, refreshToken) {
   const stagingDir = join(dataDir, `.import-${label}`);
   const accountDir = join(dataDir, "accounts", label);
+  const destToken = join(
+    accountDir,
+    ".gemini",
+    "antigravity-cli",
+    "antigravity-oauth-token",
+  );
+  // `keptHome` — accounts/<label> already existed: the import merges only
+  // the token file in, so rollback removes only that token and keeps the
+  // operator's files, exactly like the unbound path treats an existing
+  // home. A home the import itself created rolls back whole (§4.1 step 5).
+  let keptHome = false;
+  let visible = false;
+  const rollback = () => {
+    if (keptHome) {
+      rmSync(destToken, { force: true });
+    } else {
+      rmSync(accountDir, { recursive: true, force: true });
+    }
+    const state = readAccountsState(dataDir);
+    delete state.accounts[label];
+    try {
+      writeJsonAtomic(statePath, state);
+    } catch {}
+    checkpoint("rolled-back");
+  };
   rmSync(stagingDir, { recursive: true, force: true });
   try {
     writeAccountHome(label, refreshToken, stagingDir);
+    checkpoint("staged");
     writeBinding(label, binding.field);
+    checkpoint("bound");
     if (readAccountsState(dataDir).accounts[label]?.install !== binding.field) {
       rmSync(stagingDir, { recursive: true, force: true });
       return "binding write did not survive (pre-rename)";
     }
+    checkpoint("pre-rename");
     if (existsSync(accountDir)) {
-      rmSync(accountDir, { recursive: true, force: true });
+      // A home the operator started early (a `proxy` file, an overwrite
+      // target): keep it — dropping it would lose files the unbound
+      // import path preserves. The token file is what makes the account
+      // visible to listAccounts, and it lands atomically here, after
+      // the binding was already verified on disk.
+      keptHome = true;
+      mkdirSync(dirname(destToken), { recursive: true });
+      renameSync(
+        join(stagingDir, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+        destToken,
+      );
+      visible = true;
+      rmSync(stagingDir, { recursive: true, force: true });
+    } else {
+      renameSync(stagingDir, accountDir);
+      visible = true;
     }
-    renameSync(stagingDir, accountDir);
+    checkpoint("post-rename");
     let bound = readAccountsState(dataDir).accounts[label]?.install === binding.field;
     for (let attempt = 0; !bound && attempt < 3; attempt += 1) {
       writeBinding(label, binding.field);
+      checkpoint(`rewrite-${attempt + 1}`);
       bound = readAccountsState(dataDir).accounts[label]?.install === binding.field;
     }
     if (!bound) {
-      rmSync(accountDir, { recursive: true, force: true });
-      const state = readAccountsState(dataDir);
-      delete state.accounts[label];
-      try {
-        writeJsonAtomic(statePath, state);
-      } catch {}
+      rollback();
       return "binding lost to concurrent accounts-state.json writes; account rolled back";
     }
+    checkpoint("done");
     return null;
   } catch (e) {
     rmSync(stagingDir, { recursive: true, force: true });
+    if (visible) {
+      // §11 п.10в: the command's exit states are exactly "bound and
+      // verified" or "rolled back" — an io error mid-verification may not
+      // leave a visible account without its binding either.
+      rollback();
+      return `binding verification failed (${e.message}); account rolled back`;
+    }
     return e.message;
   }
 }

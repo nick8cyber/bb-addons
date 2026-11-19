@@ -18,12 +18,13 @@
  * Usage: node scripts/add-account.mjs --label <label> [--install <name>]
  *        [--bin <path>] [--data-dir <dir>]
  */
-import { existsSync, renameSync, rmSync } from "node:fs";
+import { accessSync, constants, existsSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   accountsStatePath,
+  checkpoint,
   defaultInstallBin,
   isSatellite,
   readAccountsState,
@@ -50,7 +51,12 @@ const fail = (message) => {
   process.exit(1);
 };
 
-if (typeof label !== "string" || !/^[A-Za-z0-9._@+-]+$/u.test(label)) {
+if (
+  typeof label !== "string" ||
+  !/^[A-Za-z0-9._@+-]+$/u.test(label) ||
+  label === "." ||
+  label === ".."
+) {
   fail("--label is required and must match ^[A-Za-z0-9._@+-]+$");
 }
 
@@ -82,12 +88,36 @@ if (!binding.ok) {
 }
 
 // Step 3: the login binary — the bound install's bin, else the registry
-// default's, else (no registry) today's resolution: $HOME/.local/bin/agy
-// or `agy` on PATH.
+// default's, else (no registry) today's resolution: the same order
+// resolveAgyCommand(process.env) applies — AGY_PATH, ~/.local/bin/agy,
+// then `agy` on PATH.
+const isExecutable = (path) => {
+  try {
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+};
 const resolveLegacyBin = () => {
-  const local = join(homedir(), ".local", "bin", "agy");
-  if (existsSync(local)) {
-    return local;
+  const pinned = process.env.AGY_PATH;
+  if (pinned !== undefined && pinned.length > 0) {
+    if (!isExecutable(pinned)) {
+      fail(`AGY_PATH=${pinned} is not executable`);
+    }
+    return pinned;
+  }
+  const home = process.env.HOME;
+  if (home !== undefined && home.length > 0) {
+    const local = join(home, ".local", "bin", "agy");
+    if (isExecutable(local)) {
+      return local;
+    }
+  }
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (dir.length > 0 && isExecutable(join(dir, "agy"))) {
+      return join(dir, "agy");
+    }
   }
   return "agy";
 };
@@ -136,6 +166,7 @@ if (!existsSync(tokenPath)) {
   cleanup();
   fail(`no credential at ${tokenPath} after sign-in; staging removed, nothing written`);
 }
+checkpoint("staged");
 
 // Steps 4–5: while the home is still staged, write the binding; after the
 // rename re-read the shared file and rewrite up to 3 times when a
@@ -152,12 +183,19 @@ const bindingOnDisk = () =>
   readAccountsState(dataDir).accounts[label]?.install === binding.field;
 
 if (binding.field !== null) {
-  writeBinding();
+  try {
+    writeBinding();
+  } catch (error) {
+    cleanup();
+    fail(`could not write the install binding: ${error.message}; staging removed, nothing written`);
+  }
+  checkpoint("bound");
   if (!bindingOnDisk()) {
     cleanup();
     fail(`install binding did not survive the write to accounts-state.json; staging removed`);
   }
 }
+checkpoint("pre-rename");
 
 try {
   renameSync(stagingDir, accountDir);
@@ -165,12 +203,22 @@ try {
   cleanup();
   fail(`could not move staging into accounts/: ${error.message}`);
 }
+checkpoint("post-rename");
 
 if (binding.field !== null) {
   let bound = bindingOnDisk();
-  for (let attempt = 0; !bound && attempt < 3; attempt += 1) {
-    writeBinding();
-    bound = bindingOnDisk();
+  let lost;
+  try {
+    for (let attempt = 0; !bound && attempt < 3; attempt += 1) {
+      writeBinding();
+      checkpoint(`rewrite-${attempt + 1}`);
+      bound = bindingOnDisk();
+    }
+  } catch (error) {
+    // §11 п.10в: the exit states are exactly "bound and verified" or
+    // "rolled back" — an io error mid-verification may not leave a
+    // visible account without its binding either.
+    lost = error;
   }
   if (!bound) {
     // Rollback (§4.1 step 5): an account left in accounts/ without its
@@ -182,13 +230,18 @@ if (binding.field !== null) {
     try {
       writeJsonAtomic(statePath, state);
     } catch {}
+    checkpoint("rolled-back");
     fail(
-      `install binding was lost to concurrent accounts-state.json writes 3 times; ` +
-        `the account directory was rolled back — retry add-account from scratch`,
+      lost !== undefined
+        ? `install binding could not be verified (${lost.message}); ` +
+            `the account directory was rolled back — retry add-account from scratch`
+        : `install binding was lost to concurrent accounts-state.json writes 3 times; ` +
+            `the account directory was rolled back — retry add-account from scratch`,
     );
   }
 }
 
+checkpoint("done");
 console.log(
   `OK   ${label} -> accounts/${label}` +
     (binding.field !== null ? ` (install=${binding.field})` : ""),
