@@ -22,7 +22,9 @@ import {
   DelegationStore,
   JanitorStore,
   MIGRATIONS,
+  normalizeTaskKey,
   type DelegationRow,
+  type TaskQueueRow,
 } from "./src/store.js";
 import {
   parseJanitorConfig,
@@ -189,6 +191,103 @@ export const rpcContract = defineRpcContract({
   setThreadRole: {
     input: z.object({ threadId: z.string(), role: z.string() }),
     output: z.object({ ok: z.literal(true) }),
+  },
+  // §29.2 (Б2, r34.2): проектная настройка approvalMode (тумблер координатора)
+  projectApprovalMode: {
+    input: z.object({ projectId: z.string().nullable().optional() }),
+    output: z.object({ mode: z.enum(["auto", "manual"]).nullable() }),
+  },
+  setProjectApprovalMode: {
+    input: z.object({
+      projectId: z.string().nullable().optional(),
+      mode: z.enum(["auto", "manual"]).nullable(),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  // §29.2 (Б2, r34.2): подтверждение задачи confirmation_mode (тумблер исполнителя)
+  taskConfirmationMode: {
+    input: z.object({
+      taskKey: z.string().optional(),
+      threadId: z.string().optional(),
+    }),
+    output: z.object({
+      taskKey: z.string().nullable(),
+      mode: z.enum(["auto", "manual"]).nullable(),
+    }),
+  },
+  setTaskConfirmationMode: {
+    input: z.object({
+      taskKey: z.string().optional(),
+      threadId: z.string().optional(),
+      mode: z.enum(["auto", "manual"]),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  // §29.2: кнопки действий владельца в UI (approve, reject, defer, resume, dequeue)
+  ownerApprove: {
+    input: z.object({
+      taskKey: z.string(),
+      comment: z.string().optional(),
+    }),
+    output: z.object({
+      ok: z.literal(true),
+      taskKey: z.string(),
+      node: z.string(),
+      status: z.string(),
+    }),
+  },
+  ownerReject: {
+    input: z.object({
+      taskKey: z.string(),
+      reason: z.string(),
+      target: z.string().optional(),
+    }),
+    output: z.object({
+      ok: z.literal(true),
+      taskKey: z.string(),
+      node: z.string(),
+      status: z.string(),
+    }),
+  },
+  ownerDefer: {
+    input: z.object({
+      taskKey: z.string(),
+      reason: z.string(),
+    }),
+    output: z.object({
+      ok: z.literal(true),
+      taskKey: z.string(),
+      status: z.string(),
+    }),
+  },
+  ownerResume: {
+    input: z.object({
+      taskKey: z.string(),
+      target: z.string().optional(),
+    }),
+    output: z.object({
+      ok: z.literal(true),
+      taskKey: z.string(),
+      node: z.string(),
+      status: z.string(),
+    }),
+  },
+  ownerDequeue: {
+    input: z.object({
+      taskKey: z.string(),
+      reason: z.string().optional(),
+    }),
+    output: z.object({
+      ok: z.literal(true),
+      taskKey: z.string(),
+      status: z.string(),
+    }),
+  },
+  taskDetails: {
+    input: z.object({ taskKey: z.string() }),
+    output: z.object({
+      task: z.any().nullable(),
+    }),
   },
 });
 
@@ -541,6 +640,14 @@ export async function createPlugin(
         "§28.2: Maximum concurrently running tasks in task_queue (default 1).",
       default: 1,
     },
+    // §29 (r34, ADR-0032): approvalMode for owner gate.
+    approvalMode: {
+      type: "string",
+      label: "Approval mode",
+      description:
+        "§29: Approval mode for owner gate: 'auto' | 'manual' | '' (default empty/null, auto-resolved per route).",
+      default: "",
+    },
   });
 
   let currentSettings = await settings.get();
@@ -548,6 +655,11 @@ export async function createPlugin(
     normalizeWorkGraphMode(currentSettings.workGraph);
   const getMaxActiveTasks = (): number =>
     Math.max(1, Number(currentSettings.maxActiveTasks) || 1);
+  const getApprovalMode = (): "auto" | "manual" | null => {
+    const raw = currentSettings.approvalMode;
+    if (raw === "auto" || raw === "manual") return raw;
+    return null;
+  };
   /** §18.1 (PLUG-247a): the selected language and its translator.
    * `t` is a STABLE forwarding wrapper — deps objects capture it once,
    * a `language` change only rebinds `currentT`, and every later call
@@ -1562,6 +1674,57 @@ export async function createPlugin(
       bb.log.warn(`orchestrator release pump: ${describeError(e)}`),
     );
 
+  const requestOwnerGateInteraction = async (
+    task: TaskQueueRow,
+    gateStage: "pre_code" | "pre_release",
+  ): Promise<string | void> => {
+    let threadId = task.coordinator_thread_id;
+    if (!threadId) {
+      const delegations = store.delegationsByTask(task.task_key);
+      const active = delegations.find((d) => d.thread_id);
+      if (active?.thread_id) {
+        threadId = active.thread_id;
+      }
+    }
+    if (!threadId) {
+      const activeCoordinators = store.listActive();
+      const found = activeCoordinators.find((d: DelegationRow) => d.coordinator_thread_id);
+      if (found?.coordinator_thread_id) {
+        threadId = found.coordinator_thread_id;
+      }
+    }
+    if (!threadId) return;
+
+    const title =
+      gateStage === "pre_code"
+        ? `[${task.task_key}] Согласование спецификации и договора`
+        : `[${task.task_key}] Согласование результатов перед выкладкой`;
+
+    const payload = {
+      taskKey: task.task_key,
+      gateStage,
+      route: task.route,
+      level: task.level,
+      branch: task.branch,
+      acceptanceSha: task.acceptance_sha,
+      specSha: task.spec_sha,
+      resultSha: task.result_sha,
+    };
+
+    try {
+      const reqPromise = bb.ui.requestInput({
+        threadId,
+        rendererId: "orchestrator-owner-gate",
+        title,
+        payload,
+      });
+      reqPromise.catch(() => {});
+      return `interaction-${task.task_key}-${gateStage}-${Date.now()}`;
+    } catch (err) {
+      bb.log.warn(`orchestrator: requestOwnerGateInteraction failed: ${describeError(err)}`);
+    }
+  };
+
   let cachedPumpRepoRoot: string | null = null;
   const pumpRunQueue = async () => {
     const mode = getWorkGraphMode();
@@ -1598,6 +1761,7 @@ export async function createPlugin(
       cmd,
       bbCli,
       t,
+      requestOwnerGateInteraction,
     }).catch((e) =>
       bb.log.warn(`orchestrator run-queue: ${describeError(e)}`),
     );
@@ -2088,6 +2252,128 @@ export async function createPlugin(
         bb.sdk.threads.updatePluginMetadata(a as never),
       log: bb.log,
     }),
+    async projectApprovalMode() {
+      return { mode: getApprovalMode() };
+    },
+    async setProjectApprovalMode(input) {
+      const modeVal = input.mode ?? "";
+      await settings.experimental_set({ approvalMode: modeVal || null });
+      currentSettings.approvalMode = modeVal;
+      return { ok: true as const };
+    },
+    async taskConfirmationMode(input) {
+      let key = input.taskKey ? normalizeTaskKey(input.taskKey) : undefined;
+      if (!key && input.threadId) {
+        const del = store.byThreadId(input.threadId);
+        if (del?.task_key) {
+          key = del.task_key;
+        } else {
+          const t = store
+            .listAllTasks()
+            .find((r: TaskQueueRow) => r.coordinator_thread_id === input.threadId);
+          if (t) key = t.task_key;
+        }
+      }
+      if (!key) return { taskKey: null, mode: null };
+      const mode = store.getTaskConfirmationMode(key);
+      return { taskKey: key, mode };
+    },
+    async setTaskConfirmationMode(input) {
+      let key = input.taskKey ? normalizeTaskKey(input.taskKey) : undefined;
+      if (!key && input.threadId) {
+        const del = store.byThreadId(input.threadId);
+        if (del?.task_key) {
+          key = del.task_key;
+        } else {
+          const t = store
+            .listAllTasks()
+            .find((r: TaskQueueRow) => r.coordinator_thread_id === input.threadId);
+          if (t) key = t.task_key;
+        }
+      }
+      if (!key) {
+        throw new OrchestratorError("task-not-found", "Task not found");
+      }
+      const ok = store.setTaskConfirmationMode(key, input.mode);
+      if (!ok) {
+        throw new OrchestratorError("task-not-found", `Task ${key} not found`);
+      }
+      return { ok: true as const };
+    },
+    async ownerApprove(input) {
+      const res = await runApprove(input.taskKey, input.comment, {
+        store,
+        ctx: {},
+        workGraphMode: getWorkGraphMode(),
+        now,
+      });
+      return {
+        ok: true as const,
+        taskKey: res.task.task_key,
+        node: res.task.node,
+        status: res.task.status,
+      };
+    },
+    async ownerReject(input) {
+      const res = await runReject(input.taskKey, input.target, input.reason, {
+        store,
+        ctx: {},
+        workGraphMode: getWorkGraphMode(),
+        now,
+      });
+      return {
+        ok: true as const,
+        taskKey: res.task.task_key,
+        node: res.task.node,
+        status: res.task.status,
+      };
+    },
+    async ownerDefer(input) {
+      const res = await runDefer(input.taskKey, input.reason, {
+        store,
+        ctx: {},
+        workGraphMode: getWorkGraphMode(),
+        now,
+      });
+      return {
+        ok: true as const,
+        taskKey: res.task.task_key,
+        status: res.task.status,
+      };
+    },
+    async ownerResume(input) {
+      const res = await runResume(input.taskKey, input.target, {
+        store,
+        ctx: {},
+        workGraphMode: getWorkGraphMode(),
+        now,
+      });
+      return {
+        ok: true as const,
+        taskKey: res.task.task_key,
+        node: res.task.node,
+        status: res.task.status,
+      };
+    },
+    async ownerDequeue(input) {
+      const res = await runDequeue(input.taskKey, input.reason, {
+        store,
+        cmd: cmdRunner,
+        ctx: {},
+        workGraphMode: getWorkGraphMode(),
+        repoRoot: process.cwd(),
+        now,
+      });
+      return {
+        ok: true as const,
+        taskKey: res.task.task_key,
+        status: res.task.status,
+      };
+    },
+    async taskDetails(input) {
+      const task = store.getTask(input.taskKey);
+      return { task: task ?? null };
+    },
   });
 
   // ── Agent tools (§6): coordinators only, via configure. ──────────────
@@ -3678,7 +3964,7 @@ abandoned: ${res.reported
           if (!isOwner && flag("--mode") !== undefined) {
             throw new OrchestratorError(
               "permission-denied",
-              "owner-only (--mode flag is restricted to owner)",
+              "owner-only: --mode flag is restricted to owner",
             );
           }
           if (!isOwner && flag("--acceptance") !== undefined) {
@@ -3728,6 +4014,7 @@ abandoned: ${res.reported
               mergeBaseBranch: wtCtx.mergeBaseBranch,
               now,
               hasChecksCommands: hasChecks,
+              approvalMode: getApprovalMode(),
             },
           );
           return json
@@ -3919,6 +4206,7 @@ abandoned: ${res.reported
             cmd: cmdRunner,
             bbCli,
             t,
+            requestOwnerGateInteraction,
           });
           return json
             ? jsonOk(res)

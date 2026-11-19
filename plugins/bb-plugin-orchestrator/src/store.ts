@@ -4095,8 +4095,11 @@ export class DelegationStore {
       }
 
       // §28.2 п. 5: Сброс alarm_count в payload при смене узла или повторном входе в running;
-      // фиксация/бэкфилл node_entered_at для стабильного якоря активного делегирования
+      // фиксация/бэкфилл node_entered_at для стабильного якоря активного делегирования; сброс interaction_id
       if (input.toNode !== existing.node) {
+        if (!input.updates || input.updates.interaction_id === undefined) {
+          setClauses.push("interaction_id = NULL");
+        }
         let payloadObj: Record<string, unknown> = {};
         const sourcePayload =
           input.updates?.payload !== undefined
@@ -4235,6 +4238,14 @@ export class DelegationStore {
       .all() as TaskQueueRow[];
   }
 
+  listWaitingApprovalTasks(): TaskQueueRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM task_queue WHERE status = 'waiting_approval' AND node = 'owner_gate' ORDER BY priority DESC, created_at ASC`,
+      )
+      .all() as TaskQueueRow[];
+  }
+
   listAllTasks(): TaskQueueRow[] {
     return this.db
       .prepare(
@@ -4261,6 +4272,29 @@ export class DelegationStore {
       )
       .get(normalizeTaskKey(taskKey), node, node) as { created_at: number } | undefined;
     return row?.created_at;
+  }
+
+  /** §29.2: Переключение confirmation_mode конкретной задачи (Б2, r34.2). */
+  setTaskConfirmationMode(
+    taskKey: string,
+    mode: ConfirmationMode,
+    now = Date.now(),
+  ): boolean {
+    const key = normalizeTaskKey(taskKey);
+    const res = this.db
+      .prepare(
+        `UPDATE task_queue SET confirmation_mode = ?, updated_at = ? WHERE task_key = ?`,
+      )
+      .run(mode, now, key);
+    return res.changes > 0;
+  }
+
+  getTaskConfirmationMode(taskKey: string): ConfirmationMode | null {
+    const key = normalizeTaskKey(taskKey);
+    const row = this.db
+      .prepare(`SELECT confirmation_mode FROM task_queue WHERE task_key = ?`)
+      .get(key) as { confirmation_mode: ConfirmationMode } | undefined;
+    return row ? row.confirmation_mode : null;
   }
 
   insertTransition(input: {

@@ -729,6 +729,7 @@ export async function runEnqueue(
     mergeBaseBranch: string;
     now?: () => number;
     hasChecksCommands?: boolean;
+    approvalMode?: "auto" | "manual" | null;
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow; reissued?: boolean }> {
   if (deps.workGraphMode === "off") {
@@ -748,15 +749,23 @@ export async function runEnqueue(
     );
   }
 
-  // §29.2 п.1: flag --mode restricted to owner
-  if (!isOwner && input.mode !== undefined) {
-    throw new OrchestratorError(
-      "permission-denied",
-      "owner-only (--mode flag is restricted to owner)",
-    );
+  // §29.2 п.1 + §29.4: flag --mode restricted to owner
+  if (input.mode !== undefined) {
+    if (input.mode !== "auto" && input.mode !== "manual") {
+      throw new OrchestratorError(
+        "invalid-arguments",
+        "флаг --mode принимает только auto или manual",
+      );
+    }
+    if (!isOwner) {
+      throw new OrchestratorError(
+        "permission-denied",
+        "owner-only: --mode flag is restricted to owner",
+      );
+    }
   }
 
-  // §29.3: --acceptance restricted to owner
+  // §29.3 + §29.4: --acceptance restricted to owner
   if (!isOwner && input.acceptance !== undefined) {
     throw new OrchestratorError("permission-denied", "owner-only");
   }
@@ -831,23 +840,19 @@ export async function runEnqueue(
     );
   }
 
-  // Confirmation mode
+  // §29.3: Confirmation mode resolution
+  // 1) Explicit flag --mode auto|manual passed by human (owner)
+  // 2) If orchestrator.approvalMode project setting is set (non-null 'auto' | 'manual'), apply to all tasks
+  // 3) Fallback when approvalMode is null:
+  //    - human without --mode: 'manual' for feature, 'auto' for fix/simple/docs/research
+  //    - agent (BB_THREAD_ID present): 'manual' for feature, 'auto' for fix/simple/docs/research
   let confirmationMode: ConfirmationMode;
-  if (isOwner) {
-    if (input.mode === "auto" || input.mode === "manual") {
-      confirmationMode = input.mode;
-    } else {
-      confirmationMode = route === "feature" ? "manual" : "auto";
-    }
+  if (isOwner && (input.mode === "auto" || input.mode === "manual")) {
+    confirmationMode = input.mode;
+  } else if (deps.approvalMode === "auto" || deps.approvalMode === "manual") {
+    confirmationMode = deps.approvalMode;
   } else {
-    // Agent calling
-    if (["fix", "simple", "docs"].includes(route)) {
-      confirmationMode = "manual";
-    } else if (route === "feature") {
-      confirmationMode = "manual";
-    } else {
-      confirmationMode = "auto";
-    }
+    confirmationMode = route === "feature" ? "manual" : "auto";
   }
 
   const repoRoot = deps.ctx?.cwd ?? process.cwd();
@@ -2207,6 +2212,10 @@ export interface RunQueueDeps {
   runChecks?: (
     task: TaskQueueRow,
   ) => Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean }>;
+  requestOwnerGateInteraction?: (
+    task: TaskQueueRow,
+    gateStage: "pre_code" | "pre_release",
+  ) => Promise<string | void>;
   runReleaseStep?: (
     task: TaskQueueRow,
   ) => Promise<{
@@ -2272,6 +2281,42 @@ export async function runRunQueue(
             advancedCount++;
           }
         } catch {}
+      }
+
+      // ── 1b. Request interaction for tasks waiting at owner_gate ─────────
+      if (deps.requestOwnerGateInteraction) {
+        const waitingTasks = deps.store.listWaitingApprovalTasks();
+        for (const task of waitingTasks) {
+          if (!task.interaction_id) {
+            try {
+              const payload = parsePayload(task.payload);
+              const stage =
+                (payload.gate_stage as "pre_code" | "pre_release") ||
+                "pre_code";
+              const interactionId = await deps.requestOwnerGateInteraction(
+                task,
+                stage,
+              );
+              if (interactionId) {
+                deps.store.transitionTask(
+                  {
+                    taskKey: task.task_key,
+                    expectedNode: "owner_gate",
+                    expectedStatus: "waiting_approval",
+                    toNode: "owner_gate",
+                    toStatus: "waiting_approval",
+                    actor: "run-queue",
+                    reason: "interaction_requested",
+                    updates: { interaction_id: interactionId },
+                  },
+                  deps.now ? deps.now() : Date.now(),
+                );
+                progressed = true;
+                advancedCount++;
+              }
+            } catch {}
+          }
+        }
       }
 
       // ── 2. Take queued tasks ──────────────────────────────────────────
@@ -4581,6 +4626,38 @@ async function advanceActiveTask(
         if (tr.ok) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    case "owner_gate": {
+      if (
+        task.status === "waiting_approval" &&
+        !task.interaction_id &&
+        deps.requestOwnerGateInteraction
+      ) {
+        const stage =
+          (payload.gate_stage as "pre_code" | "pre_release") || "pre_code";
+        const interactionId = await deps.requestOwnerGateInteraction(
+          task,
+          stage,
+        );
+        if (interactionId) {
+          deps.store.transitionTask(
+            {
+              taskKey: task.task_key,
+              expectedNode: "owner_gate",
+              expectedStatus: "waiting_approval",
+              toNode: "owner_gate",
+              toStatus: "waiting_approval",
+              actor: "run-queue",
+              reason: "interaction_requested",
+              updates: { interaction_id: interactionId },
+            },
+            now,
+          );
           return true;
         }
       }
