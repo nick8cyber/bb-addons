@@ -560,12 +560,20 @@ export function markAccountCooldown(
 export function markAccountIneligible(
   ledger: AccountsLedger,
   label: string,
-  options: { parkedReason?: AccountLedgerEntry["parkedReason"] } = {},
+  options: {
+    parkedReason?: AccountLedgerEntry["parkedReason"];
+    lastError?: string;
+  } = {},
 ): void {
   const entry = ledgerEntry(ledger, label);
   entry.ineligibleAtMs = Date.now();
+  if (options.lastError !== undefined) {
+    entry.lastError = options.lastError;
+  }
   if (options.parkedReason !== undefined) {
     entry.parkedReason = options.parkedReason;
+  }
+  if (options.parkedReason !== undefined || options.lastError !== undefined) {
     stampStrings(ledger, label);
   }
   markDirty(ledger, label);
@@ -710,6 +718,20 @@ export function accountByLabel(
 /** A network failure during the eligibility check alone is not an auth failure. */
 export function isAccountIneligible(message: string): boolean {
   return /not eligible for Antigravity|verify your account/iu.test(message);
+}
+
+/**
+ * An eligibility refusal that asks the owner to verify the account: a
+ * "verify your account" request (with or without "to continue") or an
+ * accounts.google.com link. Such a refusal needs a browser sign-in, so it
+ * parks permanently like validation-required — never on a cooldown clock
+ * (§2.3 п.11, решение владельца 19.11).
+ */
+const VERIFICATION_REQUEST_PATTERN =
+  /verify your account|https:\/\/accounts\.google\.com\//iu;
+
+export function hasVerificationRequest(message: string): boolean {
+  return VERIFICATION_REQUEST_PATTERN.test(message);
 }
 
 /**

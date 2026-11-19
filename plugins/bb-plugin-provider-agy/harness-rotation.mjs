@@ -373,12 +373,15 @@ let observed = spawns().slice(spawnOffset);
 let badAccount = readLedger().accounts.a1;
 check("ineligible/first-turn-recovers", !firstEligibility.error && statuses("t-ineligible-first") === "failed,completed", statuses("t-ineligible-first"));
 check("ineligible/sibling-fresh-conversation", observed.length === 2 && homeLabel(observed[0].__env.HOME) === "a1" && homeLabel(observed[1].__env.HOME) === "a2" && !observed[1].__argv.includes("--conversation"));
-check("ineligible/24h-cooldown", badAccount.cooldownUntilMs >= beforeIneligible + 86_400_000 && badAccount.cooldownUntilMs <= Date.now() + 86_400_000);
+// PLUG-332 (ревизия 15): a refusal carrying a verification URL parks
+// permanently as validation-required — parkedReason + ineligibleAtMs +
+// lastError, and NO cooldownUntilMs; the mark itself bars selection.
+check("ineligible/validation-required-park", badAccount.parkedReason === "validation-required" && badAccount.ineligibleAtMs >= beforeIneligible && (badAccount.cooldownUntilMs ?? 0) <= Date.now());
 check("ineligible/ledger-retains-full-url", badAccount.lastError.includes("not eligible for Antigravity") && badAccount.lastError.includes(VERIFY_URL));
 check("ineligible/original-prompt-without-context", userPrompts().slice(promptOffset).join("|") === "original first prompt" && replacedFor("t-ineligible-first").length === 0);
 check("ineligible/no-quota-budget-or-snapshot", bridgeLog().split("\n").some((l) => l.includes("ineligible on the session's account; rotating to account a2 in 1s") && l.includes("autoRetryCount=0")) && !messages.some((m) => m.method === "thread/delta" && m.params.threadId === "t-ineligible-first" && m.params.deltas.some((d) => d.kind === "provider.rateLimits")));
 check("ineligible/native-401", errorsFor("t-ineligible-first").some((e) => e.errorInfo?.category === "unauthorized" && e.errorInfo?.httpStatusCode === 401));
-check("ineligible/parking-and-url-log", bridgeLog().includes("account a1 is not eligible for Antigravity (verification required); parked for 24h, rotating to a2") && bridgeLog().split("\n").some((l) => l.endsWith(`[provider-agy] ${VERIFY_URL}`)));
+check("ineligible/parking-and-url-log", bridgeLog().includes("account a1 is not eligible for Antigravity (verification required); parked permanently (validation-required; manual unpark required), rotating to a2") && bridgeLog().split("\n").some((l) => l.endsWith(`[provider-agy] ${VERIFY_URL}`)));
 stop("t-ineligible-first");
 
 {
@@ -652,7 +655,7 @@ resetPool();
 process.env.AGY_FAKE_ERROR_MODE = "ineligible-result";
 await startThread("t-ineligible-result");
 await turn("t-ineligible-result", "result failure", 2);
-check("ineligible/result-verify-case-insensitive", statuses("t-ineligible-result") === "failed,completed" && readLedger().accounts.a1.cooldownUntilMs > Date.now() && errorsFor("t-ineligible-result").some((e) => e.message === "Please VERIFY YOUR ACCOUNT to continue." && e.errorInfo?.httpStatusCode === 401));
+check("ineligible/result-verify-case-insensitive", statuses("t-ineligible-result") === "failed,completed" && readLedger().accounts.a1.parkedReason === "validation-required" && errorsFor("t-ineligible-result").some((e) => e.message === "Please VERIFY YOUR ACCOUNT to continue." && e.errorInfo?.httpStatusCode === 401));
 stop("t-ineligible-result");
 
 resetPool();
@@ -685,15 +688,23 @@ renameSync(join(root, "accounts", "a2"), join(root, "held-a2"));
 renameSync(join(root, "accounts", "a3"), join(root, "held-a3"));
 const singleLogOffset = bridgeLog().length;
 await expectStartupFailure("t-ineligible-single", VERIFY_URL);
-check("ineligible/single-still-parked", readLedger().accounts.a1.cooldownUntilMs > Date.now() + 86_390_000);
-check("ineligible/no-free-sibling-logs-parking", bridgeLog().slice(singleLogOffset).includes("parked for 24h; no free sibling, failing"));
+check("ineligible/single-still-parked", readLedger().accounts.a1.parkedReason === "validation-required" && (readLedger().accounts.a1.cooldownUntilMs ?? 0) <= Date.now());
+check("ineligible/no-free-sibling-logs-parking", bridgeLog().slice(singleLogOffset).includes("parked permanently (validation-required; manual unpark required); no free sibling, failing"));
 renameSync(join(root, "held-a2"), join(root, "accounts", "a2"));
 renameSync(join(root, "held-a3"), join(root, "accounts", "a3"));
 
 resetPool();
+// PLUG-332: AGY_INELIGIBLE_COOLDOWN_MS no longer gates eligibility
+// refusals — a verify-link refusal still parks permanently even at 0 and
+// the turn rotates to a free sibling.
 process.env.AGY_INELIGIBLE_COOLDOWN_MS = "0";
-await expectStartupFailure("t-ineligible-disabled", VERIFY_URL);
-check("ineligible/disabled-does-not-park", readLedger().accounts.a1.cooldownUntilMs === 0);
+await startThread("t-ineligible-disabled", "verify park ignores the legacy env");
+await waitBoundaries("t-ineligible-disabled", 2);
+check("ineligible/verify-park-not-env-gated",
+  statuses("t-ineligible-disabled") === "failed,completed" &&
+  readLedger().accounts.a1.parkedReason === "validation-required" &&
+  (readLedger().accounts.a1.cooldownUntilMs ?? 0) <= Date.now());
+stop("t-ineligible-disabled");
 delete process.env.AGY_INELIGIBLE_COOLDOWN_MS;
 
 resetPool();
@@ -730,15 +741,6 @@ check("ineligible/no-pool-ledger-unchanged", Object.values(readLedger().accounts
 delete process.env.AGY_ACCOUNTS;
 process.env.FAKE_INELIGIBLE_LABEL = "a1";
 
-resetPool();
-process.env.AGY_INELIGIBLE_COOLDOWN_MS = "7200000";
-const customCooldownStart = Date.now();
-await startThread("t-ineligible-custom", "custom cooldown");
-await waitBoundaries("t-ineligible-custom", 2);
-check("ineligible/dynamic-custom-cooldown", readLedger().accounts.a1.cooldownUntilMs >= customCooldownStart + 7_200_000 && readLedger().accounts.a1.cooldownUntilMs <= Date.now() + 7_200_000);
-stop("t-ineligible-custom");
-delete process.env.AGY_INELIGIBLE_COOLDOWN_MS;
-
 // Review regressions ported from scratch/stale.mjs and scratch/cascade.mjs.
 resetPool();
 process.env.AGY_FAKE_MODE_BY_LABEL = JSON.stringify({ a1: "ineligible", a2: "network-eligibility", a3: "network-eligibility" });
@@ -747,7 +749,7 @@ const staleReply = await startThread("t-review-stale", "must retain the current 
 await sleep(200);
 const staleLedger = readLedger();
 check("stale/only-first-account-parked",
-  staleLedger.accounts.a1.cooldownUntilMs > Date.now() &&
+  staleLedger.accounts.a1.parkedReason === "validation-required" &&
   staleLedger.accounts.a2.cooldownUntilMs === 0 && staleLedger.accounts.a3.cooldownUntilMs === 0 &&
   staleLedger.accounts.a2.lastError === null && staleLedger.accounts.a3.lastError === null);
 check("stale/fails-on-socks-without-cascading",
@@ -767,12 +769,12 @@ const cascadeLedger = readLedger();
 check("cascade/quota-then-ineligible-then-success",
   statuses("t-review-cascade") === "failed,failed,completed" &&
   spawns().slice(spawnOffset).map((s) => homeLabel(s.__env.HOME)).join(",") === "a1,a2,a3");
-check("cascade/second-account-24h-not-quota",
-  cascadeLedger.accounts.a2.cooldownUntilMs > Date.now() + 86_390_000 &&
+check("cascade/second-account-validation-not-quota",
+  cascadeLedger.accounts.a2.parkedReason === "validation-required" &&
   cascadeLedger.accounts.a2.lastError.includes(VERIFY_URL) && !cascadeLedger.accounts.a2.lastError.includes("429") &&
   cascadeLedger.accounts.a1.ineligibleAtMs === undefined && cascadeLedger.accounts.a2.ineligibleAtMs > 0);
 check("cascade/parking-log-names-second-account",
-  bridgeLog().slice(cascadeLogOffset).includes("account a2 is not eligible for Antigravity (verification required); parked for 24h, rotating to a3"));
+  bridgeLog().slice(cascadeLogOffset).includes("account a2 is not eligible for Antigravity (verification required); parked permanently (validation-required; manual unpark required), rotating to a3"));
 stop("t-review-cascade");
 process.env.AGY_AUTO_RETRY_MAX_WAIT_MS = "1";
 delete process.env.AGY_FAKE_MODE_BY_LABEL;
@@ -787,7 +789,7 @@ check("stderr/isolated-eligibility-block",
   cleanBlock.endsWith(VERIFY_URL) && !cleanBlock.includes("429") && !cleanBlock.includes("cleaning up") &&
   cleanBlock.includes("Additional account eligibility details from the backend.") && cleanBlock.split("\n").length === 5);
 check("stderr/old-quota-does-not-reclassify-block",
-  readLedger().accounts.a1.cooldownUntilMs > Date.now() + 86_390_000 &&
+  readLedger().accounts.a1.parkedReason === "validation-required" &&
   errorsFor("t-review-clean-block").some((e) => e.message === cleanBlock && e.errorInfo?.category === "unauthorized"));
 stop("t-review-clean-block");
 
@@ -891,17 +893,17 @@ spawnOffset = spawns().length;
 const resumeLogOffset = bridgeLog().length;
 const failedResume = await resumeThread("t-resume-park", resumeConversation);
 check("resume/no-turn-still-parks-account",
-  failedResume.error?.message.includes(VERIFY_URL) && readLedger().accounts.a1.cooldownUntilMs > Date.now() + 86_390_000 &&
+  failedResume.error?.message.includes(VERIFY_URL) && readLedger().accounts.a1.parkedReason === "validation-required" &&
   readLedger().accounts.a1.ineligibleAtMs > 0 && readLedger().accounts.a1.lastError.includes(VERIFY_URL));
 check("resume/no-work-does-not-rotate-or-invent-turns",
   spawns().length === spawnOffset + 1 && boundaries("t-resume-park").length === 0 && replacedFor("t-resume-park").length === 0 &&
-  bridgeLog().slice(resumeLogOffset).includes("parked for 24h; no turn queued, failing"));
+  bridgeLog().slice(resumeLogOffset).includes("parked permanently (validation-required; manual unpark required); no turn queued, failing"));
 const nextResume = await resumeThread("t-resume-next", resumeConversation);
 check("resume/next-attempt-skips-parked-account",
   !nextResume.error && spawns().length === spawnOffset + 2 && homeLabel(spawns().at(-1).__env.HOME) !== "a1" &&
   !spawns().at(-1).__argv.includes("--conversation") && replacedFor("t-resume-next")[0]?.params.contextLost === true);
 check("resume/replacement-reason-names-eligibility",
-  replacedFor("t-resume-next")[0]?.params.reason.includes("a1 is parked after failing Google's Antigravity eligibility check") &&
+  replacedFor("t-resume-next")[0]?.params.reason.includes("a1 needs Google account verification") &&
   !replacedFor("t-resume-next")[0]?.params.reason.includes("quota cooldown"));
 stop("t-resume-next");
 
@@ -910,6 +912,9 @@ stop("t-resume-next");
   const ledger = readLedger();
   ledger.conversations[resumeConversation] = "a1";
   ledger.accounts.a1.cooldownUntilMs = 0;
+  // A verify-parked entry never counts toward the breaker — clear the
+  // leftover mark so this seed contributes like an ordinary mark.
+  delete ledger.accounts.a1.parkedReason;
   ledger.accounts.a1.ineligibleAtMs = Date.now();
   for (const label of ["a2", "a3"]) ledger.accounts[label].ineligibleAtMs = Date.now();
   writeLedger(ledger);
@@ -992,7 +997,7 @@ resetPool(); // exercise verification on a1, rather than the next LRU sibling
 process.env.AGY_FAKE_ERROR_MODE = "ineligible";
 await startThread("t-verify-location-disabled", "verification stays enabled");
 await waitBoundaries("t-verify-location-disabled", 2);
-check("location/switch-does-not-disable-verification", readLedger().accounts.a1.cooldownUntilMs > Date.now() + 86_390_000);
+check("location/switch-does-not-disable-verification", readLedger().accounts.a1.parkedReason === "validation-required");
 stop("t-verify-location-disabled");
 
 resetPool();
@@ -1016,7 +1021,10 @@ for (const label of ["a4", "a5"]) {
   writeFileSync(join(cli, "antigravity-oauth-token"), '{"auth_method":"consumer"}\n');
 }
 resetPool();
-process.env.AGY_FAKE_MODE_BY_LABEL = JSON.stringify({ a1: "ineligible", a2: "ineligible-location", a3: "ineligible", a4: "ineligible-location", a5: "succeed" });
+// PLUG-332: validation-required marks never count toward the breaker —
+// three counted refusals need three non-verify marks, so all five modes
+// here are location refusals.
+process.env.AGY_FAKE_MODE_BY_LABEL = JSON.stringify({ a1: "ineligible-location", a2: "ineligible-location", a3: "ineligible-location", a4: "ineligible-location", a5: "succeed" });
 spawnOffset = spawns().length;
 const breakerLogOffset = bridgeLog().length;
 const breakerReply = await startThread("t-breaker", "stop after three different accounts");
@@ -1029,13 +1037,47 @@ check("breaker/logs-open-with-original-diagnostic",
   bridgeLog().slice(breakerLogOffset).includes("ineligible breaker open — suspect egress/network, not parking a4"));
 stop("t-breaker");
 
+// PLUG-332: two fresh verify-parks contribute nothing — the next location
+// refusal still parks instead of hitting the breaker.
+resetPool();
+{
+  const ledger = readLedger();
+  for (const label of ["a1", "a2"]) {
+    ledger.accounts[label] = {
+      cooldownUntilMs: 0, lastUsedMs: 0, lastError: "old refusal",
+      ineligibleAtMs: Date.now(), parkedReason: "validation-required",
+    };
+  }
+  writeLedger(ledger);
+}
+process.env.AGY_FAKE_MODE_BY_LABEL = JSON.stringify({ a3: "ineligible-location", a4: "succeed", a5: "succeed" });
+await startThread("t-breaker-verify-not-counted", "verify marks are outside the breaker");
+await waitBoundaries("t-breaker-verify-not-counted", 2);
+check("breaker/validation-required-marks-not-counted",
+  statuses("t-breaker-verify-not-counted") === "failed,completed" &&
+  readLedger().accounts.a3.ineligibleAtMs > Date.now() - 10_000 &&
+  readLedger().accounts.a3.cooldownUntilMs > Date.now() + 7_190_000);
+stop("t-breaker-verify-not-counted");
+
 // Recreate the bridge module: persisted timestamps must still open the breaker.
 {
   const ledger = readLedger();
+  const nowMs = Date.now();
+  // a1/a2 still carry verify-marks from the previous test — clear
+  // parkedReason so their stamps count again, and push them behind a4's
+  // LRU slot so it stays the first pick.
+  for (const label of ["a1", "a2"]) {
+    delete ledger.accounts[label].parkedReason;
+    ledger.accounts[label].ineligibleAtMs = nowMs;
+    // Keep them off the pick list: counted by the breaker, yet a4 stays
+    // the first pick and they remain unpickable for the next scenario.
+    ledger.accounts[label].cooldownUntilMs = nowMs + 3_600_000;
+  }
   ledger.accounts.a4.lastUsedMs = 0;
   ledger.accounts.a5 = { cooldownUntilMs: 0, lastUsedMs: Date.now(), lastError: null };
   writeLedger(ledger);
 }
+process.env.AGY_FAKE_MODE_BY_LABEL = JSON.stringify({ a4: "ineligible-location" });
 bridge.onClose?.();
 activeBridge = (await import(new URL("./dist/host.js?breaker-restart", import.meta.url).href)).experimental_providerBridge;
 activeBridge.start?.({ pluginId: "provider-agy", dataDir: root, tempDir: root });
@@ -1054,6 +1096,7 @@ stop("t-breaker-restart");
   ledger.accounts.a5 = { cooldownUntilMs: 0, lastUsedMs: Date.now(), lastError: null };
   writeLedger(ledger);
 }
+process.env.AGY_FAKE_MODE_BY_LABEL = JSON.stringify({ a4: "ineligible-location", a5: "succeed" });
 const outsideWindowReply = await startThread("t-breaker-outside-window", "old events do not block");
 await waitBoundaries("t-breaker-outside-window", 2);
 check("breaker/events-outside-window-allow-rotation",
@@ -1083,6 +1126,7 @@ stop("t-breaker-custom-window");
   const ledger = readLedger();
   ledger.accounts.a1.cooldownUntilMs = 0;
   ledger.accounts.a1.lastUsedMs = 0;
+  delete ledger.accounts.a1.parkedReason;
   writeLedger(ledger);
 }
 const repeatedLabelReply = await startThread("t-breaker-repeated-label", "one account still counts once");
@@ -1094,6 +1138,7 @@ stop("t-breaker-repeated-label");
   const ledger = readLedger();
   ledger.accounts.a1.cooldownUntilMs = 0;
   ledger.accounts.a1.lastUsedMs = 0;
+  delete ledger.accounts.a1.parkedReason;
   ledger.accounts.a2.ineligibleAtMs = Date.now();
   writeLedger(ledger);
 }
@@ -2083,6 +2128,33 @@ await sleep(100);
     `reply=${JSON.stringify(sReply?.error ?? null)} ` +
       `parked m1=${sLedger.m1?.parkedReason} m2=${sLedger.m2?.parkedReason} ` +
       `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsS)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // R2. §2.3 п.11 (ревизия 15, PLUG-332): an eligibility refusal carrying
+  // a verify request/link — "Verify your account." plus an
+  // accounts.google.com URL, WITHOUT the strict validation markers —
+  // parks permanently as validation-required: parkedReason + ineligibleAtMs
+  // + lastError, and NO cooldownUntilMs. The turn rotates to a sibling.
+  acpControl.modeByLabel = { m1: "ineligible" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  await startModel("t-verify-link", "fake-model");
+  await turnModel("t-verify-link", "verify me via a link", "fake-model");
+  await sleep(400);
+  const r2Entry = readAcpLedger().accounts.m1 ?? {};
+  check("models/verify-link-is-validation-no-cooldown",
+    r2Entry.parkedReason === "validation-required" &&
+    (r2Entry.ineligibleAtMs ?? 0) > 0 &&
+    (r2Entry.cooldownUntilMs ?? 0) <= Date.now() &&
+    (r2Entry.lastError ?? "").includes("accounts.google.com") &&
+    statuses("t-verify-link") === "completed",
+    `entry=${JSON.stringify(r2Entry)} statuses=${statuses("t-verify-link")}`);
   acpControl.modeByLabel = {};
   writeAcpControl();
 

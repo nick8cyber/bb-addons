@@ -56,6 +56,7 @@ import {
   accountsEnabled,
   conversationAccount,
   checkIneligibleBreaker,
+  hasVerificationRequest,
   ineligibleCooldownMs,
   isAccountIneligible,
   isAgentValidationMessage,
@@ -2286,6 +2287,43 @@ function queryAcpSessionModels(): Promise<{ id: string; displayName: string }[]>
             log(
               `models probe: account ${label} parked (${parkedCause}) on session/new refusal${parkedCause === "validation-required" ? "; owner verifies the account in a browser: https://support.google.com/accounts/answer/185833" : ""}`,
             );
+          } else if (
+            dataDir !== "" &&
+            label !== null &&
+            isAccountIneligible(errorText)
+          ) {
+            // §2.3 п.11 (ревизия 15): the eligibility family splits the
+            // same way here — a verify request/link parks permanently as
+            // validation-required (no cooldownUntilMs), any other refusal
+            // cools for the 2h location window; the mass-park breaker is
+            // checked first.
+            const ledger = loadLedger(dataDir);
+            if (checkIneligibleBreaker(ledger, Date.now())) {
+              log(
+                `models probe: ineligible breaker open; not parking ${label}`,
+              );
+            } else if (hasVerificationRequest(errorText)) {
+              markAccountIneligible(ledger, label, {
+                parkedReason: "validation-required",
+                lastError: errorText.slice(0, 300),
+              });
+              saveLedger(dataDir, ledger);
+              log(
+                `models probe: account ${label} parked (validation-required) on session/new refusal; owner verifies the account in a browser: https://support.google.com/accounts/answer/185833`,
+              );
+            } else {
+              markAccountCooldown(
+                ledger,
+                label,
+                Date.now() + ineligibleCooldownMs(true),
+                errorText.slice(0, 300),
+              );
+              markAccountIneligible(ledger, label);
+              saveLedger(dataDir, ledger);
+              log(
+                `models probe: account ${label} cooled 2h (location) on session/new refusal`,
+              );
+            }
           }
           resolve([]);
           return;
@@ -2995,10 +3033,25 @@ function coolSessionAccount(
       );
       return "breaker";
     }
-    const location =
-      cause === "ineligible" &&
-      /not currently available in your location/iu.test(message) &&
-      !/verify your account|https:\/\/accounts\.google\.com\//iu.test(message);
+    // §2.3 п.11 (ревизия 15, решение владельца 19.11): a refusal asking the
+    // owner to verify the account — "verify your account" (with or without
+    // "to continue") or an accounts.google.com link — parks permanently as
+    // validation-required: parkedReason + ineligibleAtMs + lastError, with
+    // NO cooldownUntilMs — the parked mark alone keeps it out of selection.
+    if (cause === "ineligible" && hasVerificationRequest(message)) {
+      markAccountIneligible(ledger, session.accountLabel, {
+        parkedReason: "validation-required",
+        lastError: message.slice(0, 300),
+      });
+      saveLedger(dataDir, ledger);
+      log(
+        `thread ${session.threadId}: account ${session.accountLabel} parked (validation-required; manual unpark required); owner verifies the account in a browser: https://support.google.com/accounts/answer/185833`,
+      );
+      return "cooled";
+    }
+    // Every other eligibility refusal (region or generic, no verification
+    // request/link) takes the short 2h cooldown; auth-dead keeps 24h.
+    const location = cause === "ineligible";
     markAccountCooldown(
       ledger,
       session.accountLabel,
@@ -3010,7 +3063,7 @@ function coolSessionAccount(
     });
     saveLedger(dataDir, ledger);
     log(
-      `thread ${session.threadId}: account ${session.accountLabel} parked (${cause === "auth-dead" ? "auth-dead" : location ? "location" : "verification required"})`,
+      `thread ${session.threadId}: account ${session.accountLabel} parked (${cause === "auth-dead" ? "auth-dead" : "location"})`,
     );
     return "cooled";
   }
@@ -3305,8 +3358,9 @@ function startRotation(
     }
     // §2.3 п.11 (ревизия 13.1): a sibling answering the internal start
     // with VALIDATION_REQUIRED/ToS parks permanently — never the 60 s
-    // blind cooldown — and the rotation moves to the next free one.
-    const parkedCause = parkedCauseOf(errorText);
+    // blind cooldown — and the rotation moves to the next free one. The
+    // same split covers the eligibility family (ревизия 15).
+    const parkedCause = internalRefusalCauseOf(errorText);
     if (dataDir !== "" && parkedCause !== null) {
       coolSessionAccount(session, parkedCause, errorText.slice(0, 300));
       startRotation(session, cause, message);
@@ -3490,7 +3544,7 @@ function runCompactSeed(session: WSession): void {
       // compaction to a sibling; staying on the dead session is not an
       // option.
       const parkedCause =
-        dataDir !== "" ? parkedCauseOf(errorText) : null;
+        dataDir !== "" ? internalRefusalCauseOf(errorText) : null;
       if (parkedCause !== null) {
         compactParked(session, parkedCause, errorText);
         return;
@@ -3557,7 +3611,7 @@ function compactRestore(session: WSession): void {
       // continues on a sibling or fails honestly, never silently parked
       // on a dead session.
       const parkedCause =
-        dataDir !== "" ? parkedCauseOf(errorText) : null;
+        dataDir !== "" ? internalRefusalCauseOf(errorText) : null;
       if (parkedCause !== null) {
         compactParked(session, parkedCause, errorText);
         return;
@@ -3583,7 +3637,7 @@ function compactRestore(session: WSession): void {
  */
 function compactParked(
   session: WSession,
-  cause: "validation-required" | "tos-disabled",
+  cause: "validation-required" | "tos-disabled" | "ineligible",
   errorText: string,
 ): void {
   coolSessionAccount(session, cause, errorText.slice(0, 300));
@@ -3595,7 +3649,9 @@ function compactParked(
       session,
       cause === "validation-required"
         ? `account ${owner ?? "?"} needs Google account verification and no free pool account can take over the compaction fallback`
-        : `account ${owner ?? "?"} was disabled by Google (Terms of Service) and no free pool account can take over the compaction fallback`,
+        : cause === "tos-disabled"
+          ? `account ${owner ?? "?"} was disabled by Google (Terms of Service) and no free pool account can take over the compaction fallback`
+          : `account ${owner ?? "?"} failed Google's Antigravity eligibility check and no free pool account can take over the compaction fallback`,
     );
     return;
   }
@@ -4072,13 +4128,18 @@ function interceptOutbound(line: string): void {
       errorText !== null &&
       pending.session.accountLabel !== null &&
       dataDir !== ""
-        ? parkedCauseOf(errorText)
+        ? internalRefusalCauseOf(errorText)
         : null;
     if (parkedCause !== null) {
-      // §2.3 п.11: a parking refusal (VALIDATION_REQUIRED/ToS) at session
-      // build parks the account — the thread moves to a sibling or fails
-      // honestly.
-      retryDaemonSessionParked(msg.id as JsonRpcId, pending, parkedCause);
+      // §2.3 п.11 (ревизия 15): a parking refusal (VALIDATION_REQUIRED/ToS
+      // or the eligibility family) at session build parks the account —
+      // the thread moves to a sibling or fails honestly.
+      retryDaemonSessionParked(
+        msg.id as JsonRpcId,
+        pending,
+        parkedCause,
+        errorText ?? undefined,
+      );
       return;
     }
     if (sink !== undefined) {
@@ -4305,7 +4366,7 @@ function resumeOnSibling(
       // §2.3 п.11 (ревизия 13.1): the sibling itself refuses with
       // VALIDATION_REQUIRED/ToS — park it permanently and try the next
       // free account instead of a bare error.
-      const parkedCause = parkedCauseOf(errorText);
+      const parkedCause = internalRefusalCauseOf(errorText);
       if (dataDir !== "" && parkedCause !== null) {
         coolSessionAccount(session, parkedCause, errorText.slice(0, 300));
         const { account: next } = freeSibling(session, account.label);
@@ -4313,7 +4374,9 @@ function resumeOnSibling(
           const honest =
             parkedCause === "validation-required"
               ? `account ${account.label} needs Google account verification`
-              : `account ${account.label} was disabled by Google (Terms of Service)`;
+              : parkedCause === "tos-disabled"
+                ? `account ${account.label} was disabled by Google (Terms of Service)`
+                : `account ${account.label} failed Google's Antigravity eligibility check`;
           // §2.3 п.12 (ревизия 14): journal the refusal — thread, model,
           // reason.
           log(
@@ -4372,6 +4435,22 @@ function parkedCauseOf(
     : isTosDisabled(errorText)
       ? "tos-disabled"
       : null;
+}
+
+/**
+ * The refusal cause an internal start/resume error can carry (§2.3 п.11,
+ * ревизия 15): the strict parked causes, or the eligibility family — its
+ * verify-request/link variant parks permanently inside coolSessionAccount
+ * while the rest takes the 2h location cooldown, all under the same
+ * breaker, exactly like the daemon-facing path.
+ */
+function internalRefusalCauseOf(
+  errorText: string,
+): "validation-required" | "tos-disabled" | "ineligible" | null {
+  return (
+    parkedCauseOf(errorText) ??
+    (isAccountIneligible(errorText) ? "ineligible" : null)
+  );
 }
 
 /**
@@ -4494,12 +4573,13 @@ function retryDaemonSession(
           honestUnoffered();
           return;
         }
-        // §2.3 п.11 (ревизия 13.1): the sibling refuses the internal start
-        // with VALIDATION_REQUIRED/ToS — park it and keep driving on the
-        // next free account, exactly like the other internal-start paths.
-        const parkedCause = parkedCauseOf(errorText);
+        // §2.3 п.11 (ревизия 15): the sibling refuses the internal start
+        // with VALIDATION_REQUIRED/ToS or an eligibility refusal — park it
+        // and keep driving on the next free account, exactly like the
+        // other internal-start paths.
+        const parkedCause = internalRefusalCauseOf(errorText);
         if (dataDir !== "" && parkedCause !== null) {
-          retryDaemonSessionParked(id, pending, parkedCause);
+          retryDaemonSessionParked(id, pending, parkedCause, errorText);
           return;
         }
         sendError(id, -32000, errorText);
@@ -4518,15 +4598,23 @@ function retryDaemonSession(
 function retryDaemonSessionParked(
   id: JsonRpcId,
   pending: PendingDaemonSession,
-  cause: "validation-required" | "tos-disabled" = "validation-required",
+  cause:
+    | "validation-required"
+    | "tos-disabled"
+    | "ineligible" = "validation-required",
+  errorText?: string,
 ): void {
   const { session } = pending;
   const owner = session.accountLabel;
   const honest =
     cause === "validation-required"
       ? `account ${owner ?? "?"} needs Google account verification`
-      : `account ${owner ?? "?"} was disabled by Google (Terms of Service)`;
-  coolSessionAccount(session, cause, honest);
+      : cause === "tos-disabled"
+        ? `account ${owner ?? "?"} was disabled by Google (Terms of Service)`
+        : `account ${owner ?? "?"} failed Google's Antigravity eligibility check`;
+  // The ledger mark wants the refusal text (it feeds the verify-request
+  // split and lastError); the caller-facing answer stays honest-only.
+  coolSessionAccount(session, cause, (errorText ?? honest).slice(0, 300));
   let { account } = freeSibling(session, owner);
   if (account === null) {
     // §2.3 п.12 (ревизия 14): journal the refusal — thread, model, reason.
@@ -4588,13 +4676,13 @@ function retryDaemonSessionParked(
       sendResult(id, result);
       return;
     }
-    // §2.3 п.11 (ревизия 13.1): the sibling refuses the internal start
+    // §2.3 п.11 (ревизия 15): the sibling refuses the internal start
     // the same way — park it too and drive the request on the next free
     // account; only a non-parking error reaches the caller verbatim.
     const errorText = errorMessageOf(error);
-    const parkedCause = parkedCauseOf(errorText);
+    const parkedCause = internalRefusalCauseOf(errorText);
     if (dataDir !== "" && parkedCause !== null) {
-      retryDaemonSessionParked(id, pending, parkedCause);
+      retryDaemonSessionParked(id, pending, parkedCause, errorText);
       return;
     }
     sendError(id, -32000, errorText);

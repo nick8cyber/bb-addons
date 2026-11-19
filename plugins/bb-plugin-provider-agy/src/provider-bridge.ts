@@ -69,6 +69,7 @@ import {
   accountByLabel,
   accountsEnabled,
   checkIneligibleBreaker,
+  hasVerificationRequest,
   ineligibleCooldownMs,
   ineligibleStderrBlock,
   isAccountIneligible,
@@ -1304,11 +1305,19 @@ function scheduleAccountRetry(
       log(url);
     }
   }
-  const location = /not currently available in your location/iu.test(message) &&
-    !/verify your account|https:\/\/accounts\.google\.com\//iu.test(message);
-  const eligibilityReason = location ? "location" : "verification required";
+  // §2.3 п.11 (ревизия 15, PLUG-332): a verify request/link in the
+  // refusal — "verify your account" (with or without "to continue") or an
+  // accounts.google.com URL — parks permanently as validation-required;
+  // every other eligibility refusal (region or generic) cools for the 2h
+  // location window. The daily eligibility cooldown is gone.
+  const verificationRefusal =
+    reason === "ineligible" && hasVerificationRequest(message);
+  const location = reason === "ineligible" && !verificationRefusal;
+  const eligibilityReason = location
+    ? "location"
+    : "verification required";
   const cooldownMs = reason === "ineligible" ? ineligibleCooldownMs(location) : 0;
-  if (reason === "ineligible" && cooldownMs === 0) {
+  if (reason === "ineligible" && !verificationRefusal && cooldownMs === 0) {
     log(`account ${session.accountLabel ?? "none"} is not eligible for Antigravity (${eligibilityReason}); parking disabled, failing`);
     return false;
   }
@@ -1348,15 +1357,26 @@ function scheduleAccountRetry(
         return false;
       }
     }
-    markAccountCooldown(
-      ledger,
-      session.accountLabel,
-      resetAtMs + (reason === "quota" ? QUOTA_RETRY_JITTER_MS : 0),
-      message,
-    );
-    if (reason === "ineligible") {
-      markAccountIneligible(ledger, session.accountLabel);
+    if (verificationRefusal) {
+      // Permanent validation parking: parkedReason + ineligibleAtMs +
+      // lastError, NO cooldownUntilMs — the parked mark alone removes the
+      // account from selection and only a manual unpark brings it back.
+      markAccountIneligible(ledger, session.accountLabel, {
+        parkedReason: "validation-required",
+        lastError: message,
+      });
       parked = true;
+    } else {
+      markAccountCooldown(
+        ledger,
+        session.accountLabel,
+        resetAtMs + (reason === "quota" ? QUOTA_RETRY_JITTER_MS : 0),
+        message,
+      );
+      if (reason === "ineligible") {
+        markAccountIneligible(ledger, session.accountLabel);
+        parked = true;
+      }
     }
     const accounts = listAccounts(cliproxyRelayDataDir);
     const candidate = failedTurn === null
@@ -1392,7 +1412,9 @@ function scheduleAccountRetry(
     if (parked) {
       log(
         `account ${session.accountLabel} is not eligible for Antigravity (${eligibilityReason}); ` +
-          `parked for ${cooldownMs / 3_600_000}h` +
+          (verificationRefusal
+            ? "parked permanently (validation-required; manual unpark required)"
+            : `parked for ${cooldownMs / 3_600_000}h`) +
           (failedTurn === null
             ? "; no turn queued, failing"
             : switchTo === null ? "; no free sibling, failing" : `, rotating to ${switchTo.label}`),

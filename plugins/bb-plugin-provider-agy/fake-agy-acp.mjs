@@ -77,7 +77,7 @@ const summaryModeEnv = process.env.AGY_FAKE_SUMMARY_MODE ?? "ok";
 const quotaMsg =
   process.env.AGY_FAKE_QUOTA_MSG ??
   "Quota exhausted for this account; retry later. Resets in 0h0m4s.";
-const ineligibleMsg = "This account is not eligible for Antigravity. Verify your account.";
+const ineligibleMsg = "This account is not eligible for Antigravity. Verify your account. https://accounts.google.com/v3/signin/continue?fake=acp";
 
 const out = (v) => process.stdout.write(`${JSON.stringify(v)}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
