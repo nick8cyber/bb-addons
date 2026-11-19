@@ -7,7 +7,7 @@ const string = { type: "string" };
 const line = { type: "integer", minimum: 1 };
 const functions = {
   read_file: ["Read a text file or an inclusive range of lines", { path: string, from: line, to: line }, ["path"]],
-  list_dir: ["List paths relative to the repository", { path: string }, []],
+  list_dir: ["List paths relative to the session directory", { path: string }, []],
   grep: ["Search repository text with a regular expression", { pattern: string, path: string }, ["pattern"]],
   git: ["Read Git via show, diff, log, blame, ls-files or status", { args: string }, ["args"]],
 };
@@ -179,6 +179,12 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
     } catch {
       throw new Error("isolated repository snapshot unavailable");
     }
+    const historyRanges = (boundaries) => boundaries.map((sha) => ({ beforeCommit: mask(sha) }));
+    if (repository.shallow.length) {
+      omit("Git snapshot history", "older history omitted at the shallow clone boundary",
+        { missingRanges: historyRanges(repository.shallow) });
+    }
+    for (const { source, reason } of repository.omitted) omit(mask(source), mask(reason));
     const messages = [
       { role: "system", content: system },
       { role: "user", content: "Core inventory and available material (JSON):\n" +
@@ -210,6 +216,7 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
             if (result.range?.fromLine > result.range?.toLine) throw new Error("line range unavailable");
             const { output, truncated } = limitResult(mask(result.output), Math.min(remaining, MAX_TOOL_RESULT_BYTES), "\n[truncated]");
             const missing = missingRanges(result.range, truncated);
+            if (result.shallow) missing.push(...historyRanges(result.shallow));
             const label = mask(call.args.path ?? call.args.args ?? call.name);
             const source = "добавил быстрый агент: " + label;
             const extra = {
@@ -218,11 +225,12 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
               ...(truncated ? { truncated } : {}),
             };
             if (output || !truncated) {
-              supplements.push({ source, reason: reasons[call.name], ...extra, partial: Boolean(missing.length), text: output });
+              supplements.push({ source, reason: reasons[call.name], ...extra, partial: Boolean(result.partial || missing.length), text: output });
             }
             if (missing.length) {
-              omit(source, truncated ? "tool result exceeded its byte budget" : "tool returned a partial range",
-                { ...extra, missingRanges: missing });
+              const reason = truncated ? "tool result exceeded its byte budget"
+                : result.shallow ? "older history omitted at the shallow clone boundary" : "tool returned a partial range";
+              omit(source, reason, { ...extra, missingRanges: missing });
             }
             // A UTF-8 character or truncation marker may leave unusable bytes at the boundary.
             remaining = truncated && remaining <= MAX_TOOL_RESULT_BYTES ? 0 : remaining - bytes(output);

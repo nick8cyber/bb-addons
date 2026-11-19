@@ -344,6 +344,42 @@ test("fast agent reads a pinned snapshot through four tools and appends a masked
   assert.ok(updates.some((update) => update.content?.[0]?.content?.text?.includes("fast_agent_gateway")));
 });
 
+test("pinned tools return session-relative paths that can be passed back to read_file", async (t) => {
+  const repo = setup(t);
+  const cwd = join(repo.repo, "docs");
+  const mock = await gateway(t, (n) => {
+    if (n === 1) return toolReply(
+      toolCall("list", "list_dir", {}),
+      toolCall("grep", "grep", { pattern: "review value match" }),
+      toolCall("indexed", "git", { args: "ls-files" }),
+      toolCall("status", "git", { args: "status" }),
+      toolCall("show", "git", { args: "show HEAD -- notes.txt" }),
+      toolCall("diff", "git", { args: "diff -- notes.txt" }),
+    );
+    if (n === 2) {
+      const list = mock.requests[1].payload.messages.find((entry) => entry.tool_call_id === "list");
+      const file = list.content.split("\n").find((row) => row.endsWith("review-only.txt"));
+      return toolReply(toolCall("roundtrip", "read_file", { path: file }));
+    }
+    return agentDone;
+  });
+  const acp = fixture(t, { ...repo, repo: cwd }, readAnswer, {
+    settings: { innerAgent: { enabled: true, model: "fixture-fast", gateway: { baseUrl: mock.baseUrl } } },
+  });
+  assert.equal((await acp.prompt(await acp.newSession(), task("Find relevant review material.", EN, { ref: repo.sha })))
+    .result?.stopReason, "end_turn");
+  assert.equal(mock.requests.length, 3);
+  const tools = new Map(mock.requests[1].payload.messages.filter((entry) => entry.role === "tool")
+    .map((entry) => [entry.tool_call_id, entry.content]));
+  assert.match(tools.get("list"), /(?:^|\n)review-only\.txt(?:\n|$)/);
+  assert.match(tools.get("grep"), /^"review-only\.txt":1:review value match$/);
+  assert.match(tools.get("indexed"), /(?:^|\n)review-only\.txt(?:\n|$)/);
+  assert.match(tools.get("status"), /(?:^|\n) notes\.txt\s+\|/);
+  for (const name of ["diff", "show"]) assert.match(tools.get(name), /diff --git a\/notes\.txt b\/notes\.txt/);
+  assert.doesNotMatch([...tools.values()].join("\n"), /docs\/|different HEAD/);
+  assert.equal(delivered(acp.requests()[0]).materials.get("добавил быстрый агент: review-only.txt"), "review value match\n");
+});
+
 test("ordinary tasks read a local shallow clone without remotes, isolated from the working tree", async (t) => {
   const repo = setup(t);
   for (let n = 0; n < 51; n++) repo.git("commit", "--allow-empty", "-qm", "Local history " + n);
@@ -371,8 +407,14 @@ test("ordinary tasks read a local shallow clone without remotes, isolated from t
       toolCall("dirty", "read_file", { path: "notes.txt" }),
       toolCall("untracked", "read_file", { path: "new.txt" }),
       toolCall("grep", "grep", { pattern: "untracked text" }),
+      toolCall("list", "list_dir", {}),
+      toolCall("indexed", "git", { args: "ls-files" }),
       toolCall("staged", "git", { args: "diff --cached" }),
       toolCall("status", "git", { args: "status" }),
+      toolCall("log", "git", { args: "log -50" }),
+      toolCall("blame", "git", { args: "blame notes.txt" }),
+      toolCall("boundary", "git", { args: "show HEAD~49" }),
+      toolCall("beyond_boundary", "git", { args: "show HEAD~50" }),
       toolCall("no_escape", "read_file", { path: "escape.txt" }),
       toolCall("no_root", "git", { args: "show HEAD:../outside-cwd.txt" }),
     );
@@ -389,10 +431,92 @@ test("ordinary tasks read a local shallow clone without remotes, isolated from t
   const actual = delivered(acp.requests()[0]);
   assert.equal(actual.materials.get("добавил быстрый агент: notes.txt"), "working text\n");
   assert.equal(actual.materials.get("добавил быстрый агент: new.txt"), "untracked text\n");
-  assert.match(actual.materials.get("добавил быстрый агент: grep"), /docs\/new.txt.*untracked text/);
+  assert.match(actual.materials.get("добавил быстрый агент: grep"), /^"new\.txt":1:untracked text$/);
+  assert.match(actual.materials.get("добавил быстрый агент: list_dir"), /(?:^|\n)new\.txt(?:\n|$)/);
+  assert.match(actual.materials.get("добавил быстрый агент: ls-files"), /^notes\.txt$/m);
   assert.match(actual.materials.get("добавил быстрый агент: diff --cached"), /\+staged text/);
-  assert.match(actual.materials.get("добавил быстрый агент: status"), /MM .*docs\/notes.txt/);
+  assert.match(actual.materials.get("добавил быстрый агент: diff --cached"), /diff --git a\/notes\.txt b\/notes\.txt/);
+  assert.match(actual.materials.get("добавил быстрый агент: status"), /^MM "notes\.txt"$/m);
+  const missingRanges = [{ beforeCommit: git("rev-parse", "HEAD~49") }];
+  for (const args of ["log -50", "blame notes.txt", "show HEAD~49"]) {
+    const source = "добавил быстрый агент: " + args;
+    assert.equal(actual.manifest.supplements.find((item) => item.source === source)?.included, "partial");
+    assert.deepEqual(actual.manifest.omitted.find((item) => item.source === source)?.missingRanges, missingRanges);
+    assert.match(actual.materials.get(source), /History limited by the shallow snapshot/);
+  }
+  assert.doesNotMatch(actual.materials.get("добавил быстрый агент: show HEAD~49"), /diff --git/);
+  assert.deepEqual(actual.manifest.omitted.find((item) => item.source === "Git snapshot history")?.missingRanges, missingRanges);
+  const beyond = mock.requests[1].payload.messages.find((entry) => entry.tool_call_id === "beyond_boundary");
+  assert.match(beyond.content, /^error:/);
   assert.doesNotMatch(JSON.stringify(mock.requests) + actual.content, /ROOT-ONLY|LATE-MUTATION/);
+});
+
+test("working snapshot inventories skipped files and reports sensitive status as a count", async (t) => {
+  const repo = setup(t);
+  const cwd = join(repo.repo, "docs");
+  const maxTotalBytes = 24_000;
+  repo.write("docs/.env.clean-fixture", "HIDDEN-CLEAN-FIXTURE\n");
+  repo.write("docs/.env.changed-fixture", "HIDDEN-INITIAL-FIXTURE\n");
+  repo.write("docs/disappeared.txt", "deleted file fixture\n");
+  symlinkSync("notes.txt", join(cwd, "tracked-link.txt"));
+  repo.git("add", ".");
+  repo.git("commit", "-qm", "Files for the working snapshot");
+  repo.write("docs/.env.changed-fixture", "HIDDEN-CHANGED-FIXTURE\n");
+  repo.write("docs/.env.untracked-fixture", "HIDDEN-UNTRACKED-FIXTURE\n");
+  repo.write("docs/too-large.txt", "x".repeat(maxTotalBytes + 1));
+  repo.write("docs/at-limit.txt", "x".repeat(maxTotalBytes));
+  repo.write("docs/notes.txt", "visible worktree change\n");
+  rmSync(join(cwd, "disappeared.txt"));
+  symlinkSync("notes.txt", join(cwd, "ZX41-marker.txt"));
+
+  const sandboxParent = join(repo.tmp, "sandboxes");
+  mkdirSync(sandboxParent);
+  let snapshotFiles;
+  const mock = await gateway(t, (n) => {
+    if (n !== 1) return agentDone;
+    const [dir] = readdirSync(sandboxParent);
+    snapshotFiles = readdirSync(join(sandboxParent, dir, "repo", "docs"));
+    return toolReply(
+      toolCall("status", "git", { args: "status" }),
+      toolCall("worktree", "git", { args: "diff" }),
+      toolCall("list", "list_dir", {}),
+      toolCall("indexed", "git", { args: "ls-files" }),
+      toolCall("large", "read_file", { path: "too-large.txt" }),
+    );
+  });
+  const acp = fixture(t, { ...repo, repo: cwd }, readAnswer, {
+    settings: {
+      context: { maxTotalBytes, maskPatterns: { [projectId]: [{ type: "project", pattern: "ZX[0-9]+-marker" }] } },
+      innerAgent: { enabled: true, model: "fixture-fast", gateway: { baseUrl: mock.baseUrl } },
+    },
+    env: { TMPDIR: sandboxParent },
+  });
+  assert.equal((await acp.prompt(await acp.newSession(), task("Read current status.", EN))).result?.stopReason, "end_turn");
+  assert.deepEqual(snapshotFiles, ["at-limit.txt", "base-only.txt", "notes.txt"]);
+  const tools = new Map(mock.requests[1].payload.messages.filter((entry) => entry.role === "tool")
+    .map((entry) => [entry.tool_call_id, entry.content]));
+  assert.match(tools.get("status"), /^ M "notes\.txt"$/m);
+  assert.match(tools.get("status"), /\(2 sensitive paths hidden\)/);
+  assert.match(tools.get("status"), /\(4 paths omitted from the working snapshot\)/);
+  assert.match(tools.get("worktree"), /\+visible worktree change/);
+  assert.match(tools.get("worktree"), /\(4 paths omitted from the working snapshot\)/);
+  assert.match(tools.get("list"), /at-limit\.txt/);
+  assert.match(tools.get("large"), /^error:/);
+  for (const name of ["status", "worktree", "list", "indexed"]) {
+    assert.doesNotMatch(tools.get(name), /disappeared\.txt|tracked-link\.txt|too-large\.txt/);
+  }
+  const actual = delivered(acp.requests()[0]);
+  assert.equal(actual.materials.get("добавил быстрый агент: status"), tools.get("status"));
+  assert.equal(actual.manifest.supplements.find((item) => item.source === "добавил быстрый агент: diff").included, "partial");
+  for (const [source, reason] of [
+    ["too-large.txt", "file exceeds working snapshot byte limit"],
+    ["disappeared.txt", "path missing from working snapshot"],
+    ["tracked-link.txt", "not a regular file in working snapshot"],
+    ["[скрыто: project].txt", "not a regular file in working snapshot"],
+  ]) {
+    assert.ok(actual.manifest.omitted.some((entry) => entry.source === source && entry.reason === reason), source);
+  }
+  assert.doesNotMatch(JSON.stringify(mock.requests) + actual.content, /\.env\..*-fixture|HIDDEN-.*-FIXTURE|ZX41-marker/);
 });
 
 test("fast agent failure, redirect and timeout preserve core and verified reads", async (t) => {
