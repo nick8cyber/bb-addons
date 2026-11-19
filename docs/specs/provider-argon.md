@@ -3,7 +3,7 @@ title: provider-web-gemini (ранее provider-argon) — ACP-провайде�
 status: approved
 owner: coordinator
 date: 2026-11-18
-revision: 24 (r24 — PLUG-324 маппинг пикера моделей Neon/Carbon/Hydrogen, префикс «4 », каноническое имя argon покрывает UI-имя Neon, детект upsell_* в data-mode-id)
+revision: 25 (r25 — loadSession/journal по PLUG-333)
 tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 ---
 
@@ -38,12 +38,12 @@ tags: [bb, plugins, provider-web-gemini, provider-argon, acp, gemini]
 
 ### 2.1 Инициализация и сессии
 
-- **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "web-gemini", version: "0.2.0" }, agentCapabilities: { loadSession: false, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }` (сборки до переименования PLUG-298 возвращали `name: "argon-gemini"` в `agentInfo`).
+- **`initialize`** → возвращает `{ protocolVersion: params.protocolVersion ?? 1, agentInfo: { name: "web-gemini", version: "0.2.0" }, agentCapabilities: { loadSession: true, promptCapabilities: { image: false, audio: false, embeddedContext: true } } }`. Возможность `agentCapabilities.loadSession: true` объявляется для всех сессий, включая обычный чат. Сборки до переименования PLUG-298 возвращали `name: "argon-gemini"` в `agentInfo`.
 - **`session/new` и `session/load`**:
-  - `session/new` создаёт новую запись сессии `{ id, cwd, roots, model, thinking, convId, account, backend }`.
+  - `session/new` проверяет постоянный журнал по доверенному BB-треду и отпечатку рабочей копии. Если найдена единственная подходящая запись и она прошла проверку, новый `sessionId` становится алиасом исходной сессии. При отсутствии совпадений создаётся новая сессия `{ id, cwd, roots, model, thinking, convId, account, backend }`. Неоднозначный результат или отказ проверки найденной записи дают ошибку `not_started`.
   - Рабочие корни сессии для файловых вложений (PLUG-291): параметры `additionalDirectories`/`roots` (строки путей или объекты `{ uri: "file://…" }`) сохраняются в `s.roots` и вместе с `s.cwd` задают каталоги, из которых разрешена отправка локальных файлов в Gemini (§2.2 п.3, §2.4).
   - `sessionId` генерируется глобально уникальным в формате `web-gemini-<pid>-<base36-метка-времени>-<счётчик>` (PLUG-284): счётчик только в памяти процесса давал коллизии между параллельными процессами провайдера и после рестартов — bb отказывал в resume с HTTP 409. Сгенерированный id дублируется в `sessions` алиасом `argon-<pid>-<base36-метка-времени>-<счётчик>` для обратной совместимости. Формат строки свободный, внешние потребители его не парсят.
-  - `session/load` восстанавливает сессию только в пределах текущего запущенного процесса сервера (из памяти `sessions`); для неизвестного `sessionId` создаётся новая пустая сессия с `convId: null`.
+  - `session/load` возвращает живую сессию без журнальной записи из памяти процесса. Для остальных переданных `sessionId` сервер ищет исходный ID или алиас в постоянном журнале (`findSessionRecord`) и проверяет владельца, каталог, права и срок хранения. Неизвестный `sessionId` завершает вызов ошибкой `not_started` с сообщением `unknown saved session`. Порядок хранения и восстановления описан в [§7.2 «Постоянное состояние»](provider-web-gemini-inner-agent.md#72-постоянное-состояние) и [§7.3 «Продолжай» и повторная доставка](provider-web-gemini-inner-agent.md#73-продолжай-и-повторная-доставка).
   - Возвращают список моделей `models.availableModels` в виде объектов `{ modelId, name }` по схеме ACP:
     - `'argon'` — «Gemini 4 Argon» (Код и анализ, модель по умолчанию). В UI Gemini веб-интерфейса слот Argon переименован в «Neon» («4 Neon» / «Deeper analysis» / «Глубокий анализ»). В BB сохраняется каноническое имя `argon`, покрывающее UI-имя Neon;
     - `'carbon'` — «Gemini 4 Carbon» («4 Carbon» / «Code & complex work» / «Самые сложные задачи», тариф Ultra);
