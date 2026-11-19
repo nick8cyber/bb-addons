@@ -5,6 +5,7 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import * as tools from "./web-tools.mjs";
+import { agentSettings } from "./fast-agent.mjs";
 import { collectDiff, executePinned, pinReview, readMaterial, readTextFile, repoRoot, worktreeStatus } from "./review-git.mjs";
 import { deserializeVerdict } from "./turn-journal.mjs";
 
@@ -73,6 +74,7 @@ export function loadSettings(stateDir, projectId) {
     }
   });
   return Object.freeze({
+    innerAgent: agentSettings(input.innerAgent, setting),
     maxTotalBytes: setting(input.context?.maxTotalBytes, DEFAULT_TOTAL, 1, "context.maxTotalBytes"),
     maxRepairRounds: setting(input.apply?.maxRepairRounds, 2, 0, "apply.maxRepairRounds"),
     progressIntervalMs: setting(input.progressIntervalMs, 15_000, 1, "progressIntervalMs"),
@@ -455,7 +457,7 @@ export async function collectTask(context, blocks, materials, options) {
     files: Object.freeze(materialFiles), reviewDiff, fileBases });
 }
 
-export function packTask(context, collected, options) {
+function renderTaskPackage(context, collected, options, supplements, agentOmissions, compact = false) {
   const { limit, spillDir } = options;
   const pin = context.pin;
   const header = [
@@ -466,14 +468,24 @@ export function packTask(context, collected, options) {
   const tables = (delivery) => {
     let offset = 0;
     let body = "";
-    const included = collected.core.map(({ entry, text }) => {
+    const append = (entry, text) => {
       if (entry.delivery !== "package") return { ...entry, range: [0, entry.bytes] };
       const heading = "=== " + entry.source + (entry.name ? ": " + JSON.stringify(entry.name) : "") + " ===\n";
       const start = offset + bytes(heading);
       body += heading + text + "\n\n";
       offset = start + entry.bytes + 2;
       return { ...entry, delivery, range: [start, start + entry.bytes] };
-    });
+    };
+    const included = collected.core.map(({ entry, text }) => append(entry, text));
+    if (supplements.length) {
+      const heading = "=== Дополнения быстрого агента / Fast agent additions ===\n";
+      body += heading;
+      offset += bytes(heading);
+    }
+    const added = supplements.map(({ text, partial, ...item }) => append({
+      ...item, delivery: "package", required: false, included: partial ? "partial" : "full",
+      bytes: bytes(text), sha256: digest(text),
+    }, text));
     const manifest = {
       version: 1,
       revision: pin?.sha ?? "working copy",
@@ -484,20 +496,57 @@ export function packTask(context, collected, options) {
       taskSha256: included[0].sha256,
       coreSha256: digest(JSON.stringify(collected.core.map(({ entry: { delivery, ...item } }) => item))),
       rangeUnits: "half-open UTF-8 byte offsets from the start of the package body or attachment",
-      included, omitted: collected.omitted,
+      included, ...(added.length ? { supplements: added } : {}),
+      omitted: [...collected.omitted, ...agentOmissions],
     };
     const summary = "проверяемый коммит: " + (pin?.sha ?? "не указан, упакована рабочая копия");
-    return body + "=== Опись / Manifest ===\n" + summary + "\n" + JSON.stringify(manifest, null, 2) + "\n";
+    return body + "=== Опись / Manifest ===\n" + summary + "\n" + JSON.stringify(manifest, null, compact ? 0 : 2) + "\n";
   };
   const { message, payload, spilledFile } = tools.packFirstMessage({
     maxBytes: limit, spillDir, spillId: randomUUID(), completePackage: { header, render: tables },
   });
-  if (spilledFile) options.ownedFiles.push(spilledFile);
   const totalBytes = bytes(message) + (spilledFile ? bytes(payload) : 0) +
     collected.core.filter(({ entry }) => entry.delivery !== "package").reduce((total, { entry }) => total + entry.bytes, 0);
-  if (bytes(message) > limit || totalBytes > context.settings.maxTotalBytes) throw new Error("mandatory task and manifest exceed delivery budget");
-  return Object.freeze({ message, files: Object.freeze([...collected.files, ...(spilledFile ? [spilledFile] : [])]),
-    packageSha256: digest(payload), totalBytes });
+  if (bytes(message) > limit || totalBytes + (options.reserveBytes ?? 0) > context.settings.maxTotalBytes) {
+    if (spilledFile) rmSync(spilledFile, { force: true });
+    throw new Error("mandatory task and manifest exceed delivery budget");
+  }
+  if (spilledFile) options.ownedFiles.push(spilledFile);
+  return { message, files: Object.freeze([...collected.files, ...(spilledFile ? [spilledFile] : [])]),
+    packageSha256: digest(payload), totalBytes };
+}
+
+export function packTask(context, collected, options) {
+  const supplements = [...(collected.agent?.supplements ?? [])];
+  let omissions = collected.agent?.omitted ?? [];
+  let dropped = 0, compact = false, summarized = false;
+  while (true) {
+    const budgetNote = dropped ? [{
+      source: "Fast agent", revision: context.pin?.sha ?? "working copy",
+      reason: "delivery budget excluded " + dropped + " additional result(s)",
+    }] : [];
+    try {
+      return Object.freeze({
+        ...renderTaskPackage(context, collected, options, supplements, [...omissions, ...budgetNote], compact),
+        agentDeliveryLimited: dropped > 0 || compact,
+      });
+    } catch (error) {
+      if (supplements.length) {
+        supplements.pop();
+        dropped++;
+      } else if (!compact && (omissions.length || dropped)) {
+        compact = true;
+      } else if (!summarized && omissions.length > 1) {
+        omissions = [{ source: "Fast agent", reason: "additional context incomplete; omission details exceed delivery budget" }];
+        summarized = true;
+      } else if (omissions.length || dropped) {
+        // The mandatory package can exactly fill the remaining space.
+        return Object.freeze({ ...renderTaskPackage(context, collected, options, [], []), agentDeliveryLimited: true });
+      } else {
+        throw error;
+      }
+    }
+  }
 }
 
 export async function taskTool(context, collected, call, limit, signal) {

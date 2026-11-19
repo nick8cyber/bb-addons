@@ -14,6 +14,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import * as webTools from "./src/web-tools.mjs";
 import { checkedAnswer, collectTask, collectTaskAttachments, formatTaskToolResult, loadSettings, packTask, prepareTask, taskInstruction, taskThread, taskTool } from "./src/inner-context.mjs";
+import { gatherAgentContext } from "./src/fast-agent.mjs";
 import { collectDiff } from "./src/review-git.mjs";
 import * as journal from "./src/turn-journal.mjs";
 import fileEnvelope from "./src/file-envelope.cjs";
@@ -1571,12 +1572,33 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             task.packageSha256 = task.resume.pkg.packageSha256;
             slog("task:package-resume", { sessionId, packageSha256: task.packageSha256, turnNo: tj.turn.turnNo });
           } else {
-            packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit };
+            packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit, reserveBytes: write ? FILE_CAPTURE_MARKER_BYTES : 0 };
             const materials = attachments.materials ?? await collectTaskAttachments(context, attachments.blocks, packageOptions);
             tj.turn.taskSha256 = taskInputSha256(tj.turn.inputBlocksSha256, materials);
             tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
             collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
+            if (context.settings.innerAgent) {
+              const agent = await gatherAgentContext(context, collected.core, {
+                signal: task.signal,
+                maxExtraBytes: context.settings.maxTotalBytes - packed.totalBytes - packageOptions.reserveBytes,
+                onStage: (stage) => task.ping(stage),
+                onToolStart: (name) => {
+                  const toolCallId = "gemini-fast-" + randomUUID();
+                  upd({ sessionUpdate: "tool_call", toolCallId, title: "Fast agent · " + name,
+                    kind: webTools.toolKind(name), status: "in_progress" });
+                  return toolCallId;
+                },
+                onToolEnd: (toolCallId, ok) => {
+                  upd({ sessionUpdate: "tool_call_update", toolCallId, status: ok ? "completed" : "failed" });
+                },
+              });
+              if (agent.supplements.length || agent.omitted.length) {
+                collected = { ...collected, agent };
+                packed = packTask(context, collected, packageOptions);
+                if (packed.agentDeliveryLimited) task.ping("fast_agent_delivery_limit");
+              }
+            }
             task.packageSha256 = packed.packageSha256;
             // §7.2: пакет сохраняется в журнал до доставки — повторная
             // доставка после рестарта шлёт именно его, а не пустой промпт.
@@ -1795,6 +1817,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                       packed = redeliveryPackage();
                     } else {
                       packed = packTask(context, collected, { ...packageOptions, limit: messageLimit });
+                      if (packed.agentDeliveryLimited) task.ping("fast_agent_delivery_limit");
                       if (task.journal) {
                         journal.stageTurnPackage(STATE_DIR, task.journal.sessKey, task.journal.turn, packed);
                       }

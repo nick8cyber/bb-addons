@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
-import { constants } from "node:fs";
-import { open, realpath } from "node:fs/promises";
+import { constants, createWriteStream } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
-import { isSensitivePath, MAX_GREP_LINES, MAX_LIST_ENTRIES, TOOL_TIMEOUT_MS } from "./web-tools.mjs";
+import { executeTool, isSensitivePath, MAX_GREP_LINES, MAX_LIST_ENTRIES, TOOL_TIMEOUT_MS } from "./web-tools.mjs";
 
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const LOCK = /(?:\.lock|[-]lock\.(?:json|yaml)|(?:^|\/)(?:bun\.lockb|npm-shrinkwrap\.json|go\.sum))$/i;
@@ -21,8 +23,16 @@ function decodeText(bytes) {
   }
 }
 
-async function git(cwd, args, { maxBytes = 25_000_000, allow = [], strict = false, binary = false, signal, attributes } = {}) {
+async function git(cwd, args, { maxBytes = 25_000_000, allow = [], strict = false, binary = false, signal, attributes, isolated } = {}) {
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1", GIT_LITERAL_PATHSPECS: "0" };
+  if (isolated) {
+    for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
+    Object.assign(env, {
+      GIT_ALLOW_PROTOCOL: "file", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+      GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0",
+      GIT_ATTR_NOSYSTEM: "1",
+    });
+  }
   for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"]) delete env[key];
   if (attributes) env.GIT_ATTR_SOURCE = attributes;
   else delete env.GIT_ATTR_SOURCE;
@@ -42,8 +52,8 @@ async function git(cwd, args, { maxBytes = 25_000_000, allow = [], strict = fals
   return binary ? result.stdout : decoder.decode(result.stdout);
 }
 
-async function commit(cwd, ref, signal, allow = []) {
-  const output = await git(cwd, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], { strict: true, allow, signal });
+async function commit(cwd, ref, signal, allow = [], isolated) {
+  const output = await git(cwd, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], { strict: true, allow, signal, isolated });
   const value = output?.trim();
   if (value == null) return null;
   if (!SHA.test(value)) throw new Error("invalid commit object ID");
@@ -98,27 +108,27 @@ function sensitive(rel) {
 const literal = (rel) => `:(top,literal)${rel}`;
 const normalFile = (mode) => mode === "100644" || mode === "100755";
 
-async function tree(root, sha, signal, rel = ".", recursive = false) {
+async function tree(root, sha, signal, rel = ".", recursive = false, isolated) {
   const args = ["ls-tree", "-z", ...(recursive ? ["-r", "-t"] : []), sha];
   if (rel !== ".") args.push("--", literal(rel));
-  return (await git(root, args, { signal })).split("\0").filter(Boolean).map((row) => {
+  return (await git(root, args, { signal, isolated })).split("\0").filter(Boolean).map((row) => {
     const tab = row.indexOf("\t");
     const [mode, type] = row.slice(0, tab).split(" ");
     return { mode, type, path: row.slice(tab + 1) };
   });
 }
 
-async function pinnedEntry(root, sha, rel, signal) {
-  const entry = (await tree(root, sha, signal, rel)).find((item) => item.path === rel);
+async function pinnedEntry(root, sha, rel, signal, isolated) {
+  const entry = (await tree(root, sha, signal, rel, false, isolated)).find((item) => item.path === rel);
   if (!entry) throw new Error("path missing from pinned commit");
   return entry;
 }
 
-export async function readMaterial(root, pin, value, maxBytes, signal) {
+export async function readMaterial(root, pin, value, maxBytes, signal, isolated) {
   const rel = relPath(value);
   if (pin) {
-    if (!normalFile((await pinnedEntry(root, pin.sha, rel, signal)).mode)) throw new Error("expected a regular Git blob");
-    return decodeText(await git(root, ["show", `${pin.sha}:${rel}`], { binary: true, maxBytes, signal }));
+    if (!normalFile((await pinnedEntry(root, pin.sha, rel, signal, isolated)).mode)) throw new Error("expected a regular Git blob");
+    return decodeText(await git(root, ["show", `${pin.sha}:${rel}`], { binary: true, maxBytes, signal, isolated }));
   }
   const base = await realpath(root);
   const absolute = path.join(base, rel);
@@ -157,8 +167,8 @@ async function diffNames(root, revision, options, scope) {
   return names;
 }
 
-async function diffPart(root, revision, maxBytes, signal, attributes, scope = []) {
-  const options = { maxBytes, signal, attributes };
+async function diffPart(root, revision, maxBytes, signal, attributes, scope = [], isolated) {
+  const options = { maxBytes, signal, attributes, isolated };
   const excluded = [];
   const names = await diffNames(root, revision, options, scope);
   let privateCount = 0;
@@ -225,74 +235,80 @@ export async function collectDiff(root, pin, maxBytes, signal) {
   ];
 }
 
-export async function worktreeStatus(root, maxBytes, signal) {
-  const rows = await git(root, ["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { maxBytes, signal });
+export async function worktreeStatus(root, maxBytes, signal, isolated, scope = ".") {
+  const rows = await git(root, ["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all",
+    "--", ...gitScope([], scope).map(literal)], { maxBytes, signal, isolated });
   const entries = rows.split("\0").filter(Boolean);
   const visible = entries.filter((row) => !sensitive(row.slice(3)));
   return { text: visible.map((row) => row.slice(0, 3) + JSON.stringify(row.slice(3))).join("\n"), omitted: entries.length - visible.length };
 }
 
-export async function executePinned(call, root, pin, diff, maxBytes, signal) {
+export async function executePinned(call, root, pin, diff, maxBytes, signal, isolated = false, scope = ".") {
   const { sha } = pin;
   const args = call.args ?? {};
-  const rel = relPath(args.path || ".");
+  const scoped = (value) => path.posix.join(scope, relPath(value));
+  const rel = scoped(args.path || ".");
   if (call.name === "read_file") {
-    const content = await readMaterial(root, pin, rel, maxBytes, signal);
-    const lines = content.split("\n");
-    const first = /^[1-9]\d*$/.test(args.from) ? Number(args.from) : 1;
-    const last = /^[1-9]\d*$/.test(args.to) ? Math.min(Number(args.to), lines.length) : lines.length;
-    const output = first === 1 && last === lines.length ? content : lines.slice(first - 1, last).join("\n");
-    return { output, range: { fromLine: first, toLine: last, totalLines: lines.length } };
+    return readLines(await readMaterial(root, pin, rel, maxBytes, signal, isolated), args);
   }
   if (call.name === "list_dir") {
-    if (rel !== "." && (await pinnedEntry(root, sha, rel, signal)).type !== "tree") throw new Error("expected a Git tree");
-    const entries = (await tree(root, sha, signal, ".", true)).filter((item) =>
+    if (rel !== "." && (await pinnedEntry(root, sha, rel, signal, isolated)).type !== "tree") throw new Error("expected a Git tree");
+    const entries = (await tree(root, sha, signal, rel, true, isolated)).filter((item) =>
       (rel === "." || item.path.startsWith(rel + "/")) && !sensitive(item.path) && (item.type === "tree" || normalFile(item.mode)));
     return limited(entries.slice(0, MAX_LIST_ENTRIES).map((item) => item.path + (item.type === "tree" ? "/" : "")), entries.length, MAX_LIST_ENTRIES);
   }
   if (call.name === "grep") {
     if (!args.pattern) throw new Error("missing grep pattern");
     if (rel !== ".") {
-      const entry = await pinnedEntry(root, sha, rel, signal);
+      const entry = await pinnedEntry(root, sha, rel, signal, isolated);
       if (entry.type !== "tree" && !normalFile(entry.mode)) throw new Error("expected a regular Git blob or tree");
     }
-    const data = await git(root, ["grep", "-E", "--no-recurse-submodules", "--no-textconv", "-z", "-n", "-I", "-e", args.pattern, sha,
-      "--", ...(rel === "." ? [] : [literal(rel)])], { allow: [1], maxBytes, signal, attributes: sha }) ?? "";
-    const rows = [];
-    let total = 0;
-    const pattern = /([^\0]+)\0(\d+)\0([^\n]*)(?:\n|$)/gy;
-    for (const [, file, line, content] of data.matchAll(pattern)) {
-      const name = file.slice(sha.length + 1);
-      if (sensitive(name) || content.includes("\0")) continue;
-      total++;
-      if (rows.length < MAX_GREP_LINES) rows.push(`${JSON.stringify(name)}:${line}:${content}`);
-    }
-    return limited(rows.length ? rows : ["(no matches)"], total, MAX_GREP_LINES);
+    return grepTree(root, sha, args.pattern, rel, { maxBytes, signal, isolated });
   }
-  const argv = [...String(args.args ?? "").matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+  const argv = gitArgs(args.args);
   const [sub, ...rest] = argv;
   const sep = rest.indexOf("--");
   const opts = sep < 0 ? rest : rest.slice(0, sep);
-  const files = sep < 0 ? [] : rest.slice(sep + 1).map(relPath);
+  const files = sep < 0 ? [] : rest.slice(sep + 1).map(scoped);
   const pinned = (values) => values.every((opt) => opt === sha || opt === "HEAD");
+  const revision = async (values) => {
+    if (pinned(values)) return sha;
+    if (!isolated || values.length !== 1 || !/^(?:[0-9a-f]{7,64}|HEAD(?:[~^][1-9]\d*))$/.test(values[0])) {
+      throw new Error("expected a pinned revision or ancestor");
+    }
+    const ref = await commit(root, values[0], signal, [], true);
+    if (ref !== pin.base && await git(root, ["merge-base", "--is-ancestor", ref, sha], {
+      allow: [1], signal, isolated: true,
+    }) === null) throw new Error("revision is outside the pinned history");
+    return ref;
+  };
   if (sub === "show" && !files.length && opts.length === 1 && opts[0].includes(":")) {
     const colon = opts[0].indexOf(":");
-    if (!pinned([opts[0].slice(0, colon)])) throw new Error("git show requires the pinned review commit");
-    return { output: await readMaterial(root, pin, opts[0].slice(colon + 1), maxBytes, signal) };
+    const target = await revision([opts[0].slice(0, colon)]);
+    return { output: await readMaterial(root, { sha: target }, scoped(opts[0].slice(colon + 1)), maxBytes, signal, isolated),
+      revision: target };
   }
   if (sub === "status" && !files.length && opts.every((opt) => ["--short", "-s", "--porcelain"].includes(opt))) {
+    diff ??= await diffPart(root, [pin.base, sha], maxBytes, signal, sha, gitScope([], scope), isolated);
     return { output: `Pinned commit ${sha}\n${diff.stat}` };
   }
   if (sub === "ls-files" && !opts.length && !files.length) {
-    const entries = (await tree(root, sha, signal, ".", true)).filter((item) => normalFile(item.mode) && !sensitive(item.path));
+    const entries = (await tree(root, sha, signal, scope, true, isolated)).filter((item) => normalFile(item.mode) && !sensitive(item.path));
     return limited(entries.slice(0, MAX_LIST_ENTRIES).map((item) => item.path), entries.length, MAX_LIST_ENTRIES);
   }
-  if (sub === "blame" && files.length === 1 && pinned(opts) && normalFile((await pinnedEntry(root, sha, files[0], signal)).mode)) {
-    return { output: await git(root, ["blame", "--no-textconv", sha, "--", files[0]], { maxBytes, signal }) };
+  if (sub === "blame") {
+    const shorthand = isolated && sep === -1 && opts.length > 0 && opts.length <= 2 && !opts.at(-1).startsWith("-");
+    const file = shorthand ? scoped(opts.at(-1)) : files.length === 1 ? files[0] : null;
+    const target = await revision(shorthand ? opts.slice(0, -1) : opts);
+    if (!file || !normalFile((await pinnedEntry(root, target, file, signal, isolated)).mode)) throw new Error("expected a regular file for blame");
+    return { output: await git(root, ["blame", "--no-textconv", target, "--", file], { maxBytes, signal, isolated }), revision: target };
   }
-  if (sub === "log" && !files.length && opts.every((opt) => pinned([opt]) || opt === "--oneline" || /^-(?:[1-9]|[1-4][0-9]|50)$/.test(opt))) {
-    const count = opts.find((opt) => /^-\d+$/.test(opt)) ?? "-10";
-    return { output: await git(root, ["log", count, "--format=%H %s", sha, "--"], { maxBytes, signal }) };
+  if (sub === "log" && (isolated || !files.length)) {
+    const countFlag = /^-(?:[1-9]|[1-4][0-9]|50)$/;
+    const count = opts.find((opt) => countFlag.test(opt)) ?? "-10";
+    const target = await revision(opts.filter((opt) => opt !== "--oneline" && !countFlag.test(opt)));
+    return { output: await git(root, ["log", count, "--format=%H %s", target, "--", ...gitScope(files, scope).map(literal)],
+      { maxBytes, signal, isolated }), revision: target };
   }
   const range = opts.filter((opt) => opt !== "--stat");
   const validDiffRange = sub === "diff" && (
@@ -300,16 +316,32 @@ export async function executePinned(call, root, pin, diff, maxBytes, signal) {
     (range.length === 2 && range[0] === pin.base && pinned(range.slice(1))) ||
     (range.length === 1 && [`${pin.base}..${sha}`, `${pin.base}..HEAD`].includes(range[0]))
   );
-  if (sub === "diff" && validDiffRange) {
-    const details = !files.length || files.includes(".")
+  if (sub === "diff" && (isolated || validDiffRange)) {
+    const refs = range.length === 1 ? range[0].split("..") : range;
+    if (isolated && refs.length > 2) throw new Error("expected a range of two revisions");
+    const base = isolated && refs.length === 2 ? await revision([refs[0]]) : pin.base;
+    const target = isolated ? await revision(refs.slice(-1)) : sha;
+    const details = diff && base === pin.base && target === sha && (!files.length || files.includes("."))
       ? diff
-      : await diffPart(root, [pin.base, sha], maxBytes, signal, sha, files);
+      : await diffPart(root, [base, target], maxBytes, signal, target, gitScope(files, scope), isolated);
     const output = opts.includes("--stat") ? details.stat : details.patch;
-    return { output };
+    return { output, revision: target, revisionRange: [base, target] };
   }
-  if (sub === "show" && pinned(range)) {
+  if (sub === "show") {
+    const target = await revision(range);
     let targetFiles = files;
-    if (!targetFiles.length || targetFiles.includes(".")) {
+    if (isolated) {
+      const data = await git(root, ["diff-tree", "--no-commit-id", "--no-renames", "-r", "--root", "-m", "--raw", "-z", target,
+        "--", ...gitScope(files, scope).map(literal)], { maxBytes, signal, isolated });
+      const rows = data.split("\0");
+      const modes = new Map();
+      for (let i = 0; i + 1 < rows.length; i += 2) {
+        const [from, to] = rows[i].slice(1).split(" ");
+        const file = rows[i + 1];
+        modes.set(file, modes.get(file) !== false && [from, to].every((mode) => mode === "000000" || normalFile(mode)));
+      }
+      targetFiles = [...modes].filter(([, allowed]) => allowed).map(([file]) => file);
+    } else if (!targetFiles.length || targetFiles.includes(".")) {
       const treeFiles = (await git(root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "-m", "-z", sha], { maxBytes, signal })) ?? "";
       targetFiles = [...new Set(treeFiles.split("\0").filter(Boolean))];
     }
@@ -321,14 +353,47 @@ export async function executePinned(call, root, pin, diff, maxBytes, signal) {
     const showArgs = ["show", "--format=%H %s", ...DIFF_OPTIONS];
     if (opts.includes("--stat")) showArgs.push("--stat");
     else showArgs.push("-U10");
-    showArgs.push(sha);
+    showArgs.push(target);
     if (!targetFiles.length || !allowed.length) {
-      return { output: await git(root, ["show", "--no-patch", "--format=%H %s", sha, "--"], { maxBytes, signal }) };
+      return { output: await git(root, ["show", "--no-patch", "--format=%H %s", target, "--"], { maxBytes, signal, isolated }),
+        revision: target };
     }
     showArgs.push("--", ...allowed.map(literal));
-    return { output: await git(root, showArgs, { maxBytes, signal, attributes: sha }) };
+    return { output: await git(root, showArgs, { maxBytes, signal, attributes: target, isolated }), revision: target };
   }
   throw new Error("unsupported git arguments for a pinned review; use read_file, list_dir or grep for paths");
+}
+
+function gitArgs(value) {
+  return [...String(value ?? "").matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+}
+
+function gitScope(files, scope) {
+  return !files.length || files.includes(scope) ? (scope === "." ? [] : [scope]) : files;
+}
+
+async function grepTree(root, sha, query, rel, options) {
+  const data = await git(root, ["grep", "-E", "--no-recurse-submodules", "--no-textconv", "-z", "-n", "-I", "-e", query,
+    ...(sha ? [sha] : ["--untracked"]), "--", ...gitScope([], rel).map(literal)],
+  { ...options, allow: [1], attributes: sha }) ?? "";
+  const rows = [];
+  let total = 0;
+  const pattern = /([^\0]+)\0(\d+)\0([^\n]*)(?:\n|$)/gy;
+  for (const [, file, line, content] of data.matchAll(pattern)) {
+    const name = sha ? file.slice(sha.length + 1) : file;
+    if (sensitive(name) || content.includes("\0")) continue;
+    total++;
+    if (rows.length < MAX_GREP_LINES) rows.push(JSON.stringify(name) + ":" + line + ":" + content);
+  }
+  return limited(rows.length ? rows : ["(no matches)"], total, MAX_GREP_LINES);
+}
+
+function readLines(content, { from, to }) {
+  const lines = content.split("\n");
+  const first = /^[1-9]\d*$/.test(from) ? Number(from) : 1;
+  const last = /^[1-9]\d*$/.test(to) ? Math.min(Number(to), lines.length) : lines.length;
+  const output = first === 1 && last === lines.length ? content : lines.slice(first - 1, last).join("\n");
+  return { output, range: { fromLine: first, toLine: last, totalLines: lines.length } };
 }
 
 function limited(rows, total, limit) {
@@ -336,4 +401,116 @@ function limited(rows, total, limit) {
     output: rows.join("\n") + (total > limit ? `\n[showing ${limit} of ${total} results]` : ""),
     range: { included: Math.min(total, limit), total },
   };
+}
+
+// Objects are copied via the local Git transport. The snapshot has its own
+// config and object store, with no remote, alternates, hooks or checkout filters.
+export async function openAgentRepository(context, signal) {
+  const { root: source, cwd, pin, settings } = context;
+  if (!source) throw new Error("a Git repository is required for isolated reads");
+  const sourceRoot = await realpath(source);
+  const scope = relPath(path.relative(sourceRoot, cwd));
+  const maxBytes = settings.maxTotalBytes;
+  const isolated = { signal, isolated: true, maxBytes };
+  const scratch = await mkdtemp(path.join(tmpdir(), "web-gemini-read-"));
+  const root = path.join(scratch, "repo");
+  const close = () => rm(scratch, { recursive: true, force: true });
+  try {
+    const head = pin?.sha ?? await commit(sourceRoot, "HEAD", signal, [128], true);
+    const format = (await git(sourceRoot, ["rev-parse", "--show-object-format"], isolated)).trim();
+    await git(scratch, ["init", "--quiet", "--template=", "--object-format=" + format, root], isolated);
+    if (head) {
+      const refs = [...new Set([head, ...(pin ? [pin.base] : [])])];
+      await git(root, ["fetch", "--quiet", "--depth=50", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
+        "--", sourceRoot, ...refs], isolated);
+      await git(root, ["update-ref", "--no-deref", "HEAD", head], isolated);
+    }
+    if (!pin) await copyWorkingSnapshot(sourceRoot, root, scope, head, scratch, isolated);
+    return {
+      close,
+      async execute(call) {
+        signal.throwIfAborted();
+        if (pin) return executePinned(call, root, pin, null, maxBytes, signal, true, scope);
+        return executeWorkingSnapshot(call, root, scope, head, isolated);
+      },
+    };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+async function copyWorkingSnapshot(source, root, scope, head, scratch, options) {
+  const paths = gitScope([], scope).map(literal);
+  const patch = await git(source, ["diff", "--cached", "--binary", ...DIFF_OPTIONS, ...(head ? [head] : []), "--", ...paths],
+    { ...options, binary: true });
+  if (head) await git(root, ["read-tree", head], options);
+  if (patch.length) {
+    const file = path.join(scratch, "index.patch");
+    await writeFile(file, patch, { mode: 0o600, signal: options.signal });
+    await git(root, ["apply", "--cached", "--whitespace=nowarn", "--", file], options);
+    await rm(file);
+  }
+  const files = await git(source, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...paths], options);
+  await mkdir(path.join(root, scope), { recursive: true });
+  for (const file of new Set(files.split("\0").filter(Boolean))) {
+    options.signal.throwIfAborted();
+    if (sensitive(file)) continue;
+    const rel = relPath(file);
+    if (scope !== "." && !rel.startsWith(scope + "/")) continue;
+    const original = path.join(source, rel);
+    const entry = await lstat(original).catch((error) => {
+      if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw error;
+    });
+    if (!entry?.isFile() || await realpath(original) !== original) continue;
+    const handle = await open(original, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const opened = await handle.stat();
+      if (opened.ino !== entry.ino || opened.dev !== entry.dev || await realpath(original) !== original) continue;
+      const target = path.join(root, rel);
+      await mkdir(path.dirname(target), { recursive: true });
+      await pipeline(handle.createReadStream({ autoClose: false }), createWriteStream(target, { mode: entry.mode & 0o755 }),
+        { signal: options.signal });
+    } finally {
+      await handle.close();
+    }
+  }
+}
+
+async function executeWorkingSnapshot(call, root, scope, head, options) {
+  const { maxBytes, signal } = options;
+  if (call.name !== "git") {
+    const rel = relPath(call.args.path ?? ".");
+    const cwd = path.join(root, scope);
+    if (call.name === "read_file") return readLines(await readMaterial(cwd, null, rel, maxBytes, signal), call.args);
+    const absolute = path.join(cwd, rel);
+    if (await realpath(absolute) !== absolute) throw new Error("symlink paths are not allowed");
+    if (call.name === "grep") return grepTree(root, null, call.args.pattern, path.posix.join(scope, rel), options);
+    const result = executeTool({ ...call, args: { path: rel } }, {
+      cwd, rejectSensitive: true, mask: String, maxResultBytes: Infinity, includeRanges: true,
+    });
+    if (!result.ok) throw new Error("directory read failed");
+    return result;
+  }
+  const [sub, ...rest] = gitArgs(call.args.args);
+  const sep = rest.indexOf("--");
+  const opts = sep < 0 ? rest : rest.slice(0, sep);
+  const files = sep < 0 ? [] : rest.slice(sep + 1).map((file) => path.posix.join(scope, relPath(file)));
+  if (sub === "status" && !files.length && opts.every((arg) => ["--short", "-s", "--porcelain"].includes(arg))) {
+    return { output: (await worktreeStatus(root, maxBytes, signal, true, scope)).text };
+  }
+  if (sub === "ls-files" && !opts.length) {
+    const rows = await git(root, ["ls-files", "-z", "--", ...gitScope(files, scope).map(literal)], options);
+    const entries = [...new Set(rows.split("\0").filter((file) => file && !sensitive(file)))];
+    return limited(entries.slice(0, MAX_LIST_ENTRIES), entries.length, MAX_LIST_ENTRIES);
+  }
+  if (sub === "diff" && opts.every((arg) => ["--stat", "--cached", "--staged", "HEAD"].includes(arg))) {
+    const revision = opts.filter((arg) => arg !== "--stat");
+    const details = await diffPart(root, revision, maxBytes, signal, null, gitScope(files, scope), true);
+    return { output: opts.includes("--stat") ? details.stat : details.patch };
+  }
+  if (head && ["show", "log", "blame"].includes(sub)) {
+    return executePinned(call, root, { sha: head }, null, maxBytes, signal, true, scope);
+  }
+  throw new Error("unsupported Git arguments");
 }
