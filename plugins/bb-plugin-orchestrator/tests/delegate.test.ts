@@ -1654,6 +1654,51 @@ test("§4.1 r28: a delegate without the flag is an ordinary dispatch", async () 
   assert.doesNotMatch(String(spawnArgs[0]!.prompt), /задача без кода/);
 });
 
+test("PLUG-319: delegate --instructions >1500 chars is not silently dropped", async () => {
+  const { deps, store, spawnArgs } = makeDeps();
+  const longInstructions = "Important directive: " + "A".repeat(2500);
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "simple",
+      instructions: longInstructions,
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(store.get(res.delegationId)!.status, "running");
+  const prompt = String(spawnArgs[0]!.prompt);
+  assert.ok(
+    prompt.includes(longInstructions),
+    "prompt must include full instructions even when > 1500 chars",
+  );
+});
+
+test("PLUG-319: delegate preserves both long instructions (>1500 chars) and attachLine", async () => {
+  const { deps, store, spawnArgs } = makeDeps();
+  const longInstructions = "Direct instructions: " + "B".repeat(2000);
+  const res = await runDelegate(
+    {
+      taskKey: "PLUG-1",
+      level: "simple",
+      instructions: longInstructions,
+      attach: ["src/file1.ts", "src/file2.ts"],
+      caller: COORDINATOR,
+    },
+    deps,
+  );
+  assert.equal(store.get(res.delegationId)!.status, "running");
+  const prompt = String(spawnArgs[0]!.prompt);
+  assert.ok(
+    prompt.includes(longInstructions),
+    "prompt must include full instructions",
+  );
+  assert.ok(
+    prompt.includes("src/file1.ts, src/file2.ts"),
+    "prompt must include attach line",
+  );
+});
+
 test("§4.1 r28: a new delegate without the flag resets the mark", async () => {
   const { deps, store } = makeDeps();
   const first = await runDelegate(
