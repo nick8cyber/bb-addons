@@ -959,6 +959,10 @@ export async function runEnqueue(
               taskKey,
               acceptanceText,
             );
+            deps.store.updateTask(taskKey, {
+              acceptance_sha: accSha,
+              branch: existing.branch,
+            });
           } catch (e: any) {
             throw new OrchestratorError(
               "git-failed",
@@ -2076,12 +2080,8 @@ export function validateCheckCommand(
     "--run-command",
     "--script-shell",
     "--shell",
-    "--config",
-    "-c",
     "--toolchain",
     "--wrapper",
-    "-Z",
-    "-C",
   ];
   const parts = trimmed.split(/\s+/);
   for (const p of parts) {
@@ -2092,6 +2092,18 @@ export function validateCheckCommand(
           reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
         };
       }
+    }
+    // Specially check cargo dangerous config options (wrapper, runner)
+    if (
+      (p === "--config" || p.startsWith("--config=")) &&
+      (/rustc-wrapper/i.test(trimmed) ||
+        /wrapper/i.test(trimmed) ||
+        /target\..*\.runner/i.test(trimmed))
+    ) {
+      return {
+        valid: false,
+        reason: `checks-refused: forbidden-flag (${p} is not allowed in checks)`,
+      };
     }
   }
 
@@ -2162,6 +2174,7 @@ export async function executeChecks(
   task: TaskQueueRow,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
   checksConfig?: PolicyChecksConfig,
+  overrideCommands?: string[],
 ): Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean }> {
   let payloadObj: Record<string, unknown> = {};
   if (task.payload) {
@@ -2171,9 +2184,9 @@ export async function executeChecks(
   }
 
   let commands: string[] = [];
-  if (Array.isArray(payloadObj.tdd_commands) && payloadObj.tdd_commands.length > 0) {
-    commands = payloadObj.tdd_commands as string[];
-  } else if (Array.isArray(payloadObj.checks_commands)) {
+  if (Array.isArray(overrideCommands) && overrideCommands.length > 0) {
+    commands = overrideCommands;
+  } else if (Array.isArray(payloadObj.checks_commands) && payloadObj.checks_commands.length > 0) {
     commands = payloadObj.checks_commands as string[];
   } else if (typeof payloadObj.test_command === "string") {
     commands = [payloadObj.test_command];
@@ -2259,13 +2272,93 @@ export const BARE_CHECK_RUNNERS = new Set([
   "go test ./...",
 ]);
 
+export const TEST_FILTER_FLAGS = new Set([
+  "-k",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "-run",
+  "--run",
+  "--test",
+  "--filter",
+  "--testPathPattern",
+  "-g",
+  "--grep",
+]);
+
+export function isTargetedCheckCommand(
+  cmdStr: string,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+): boolean {
+  const trimmed = cmdStr.trim();
+  if (!trimmed || trimmed.startsWith("#")) return false;
+
+  // Lint is never an acceptance/TDD test runner
+  if (/^npm\s+run\s+lint\b/.test(trimmed)) return false;
+
+  let matchedPrefix = "";
+  for (const runner of allowedRunners) {
+    if (runner.endsWith("*")) {
+      const p = runner.slice(0, -1);
+      if (trimmed.startsWith(p)) {
+        const nextSpace = trimmed.indexOf(" ", p.length);
+        matchedPrefix = nextSpace === -1 ? trimmed : trimmed.slice(0, nextSpace);
+        break;
+      }
+    } else {
+      if (trimmed === runner || trimmed.startsWith(runner + " ")) {
+        matchedPrefix = runner;
+        break;
+      }
+    }
+  }
+
+  if (!matchedPrefix) {
+    const firstWord = trimmed.split(/\s+/)[0];
+    if (allowedRunners.includes(firstWord)) {
+      matchedPrefix = firstWord;
+    } else {
+      return false;
+    }
+  }
+
+  const remainder = trimmed.slice(matchedPrefix.length).trim();
+  if (!remainder) {
+    return false;
+  }
+
+  const tokens = remainder.split(/\s+/).filter(Boolean);
+  let hasFilter = false;
+  let hasPathOrTarget = false;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === "--") continue;
+
+    for (const flag of TEST_FILTER_FLAGS) {
+      if (tok === flag || tok.startsWith(flag + "=")) {
+        hasFilter = true;
+        break;
+      }
+    }
+    if (hasFilter) break;
+
+    if (!tok.startsWith("-")) {
+      hasPathOrTarget = true;
+      break;
+    }
+  }
+
+  return hasFilter || hasPathOrTarget;
+}
+
 export function extractAcceptanceCommands(
   markdownText: string,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
 ): string[] {
   const commands: string[] = [];
 
-  // 1. Check YAML frontmatter for tdd_commands / acceptance_commands
+  // 1. Check YAML frontmatter strictly for tdd_commands
   const frontmatterMatch = markdownText.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (frontmatterMatch) {
     const fm = frontmatterMatch[1];
@@ -2273,7 +2366,23 @@ export function extractAcceptanceCommands(
     let inTdd = false;
     for (const l of lines) {
       const trimmed = l.trim();
-      if (/^(?:tdd_commands|acceptance_commands):/.test(trimmed)) {
+      const inlineMatch = trimmed.match(/^tdd_commands:\s*\[(.*)\]\s*$/);
+      if (inlineMatch) {
+        const items = inlineMatch[1].split(",");
+        for (const item of items) {
+          const cmdCandidate = item.trim().replace(/^["']|["']$/g, "").trim();
+          if (cmdCandidate) {
+            const val = validateCheckCommand(cmdCandidate, allowedRunners);
+            if (val.valid && isTargetedCheckCommand(cmdCandidate, allowedRunners) && !commands.includes(cmdCandidate)) {
+              commands.push(cmdCandidate);
+            }
+          }
+        }
+        inTdd = false;
+        continue;
+      }
+
+      if (/^tdd_commands:/.test(trimmed)) {
         inTdd = true;
         continue;
       }
@@ -2286,7 +2395,7 @@ export function extractAcceptanceCommands(
           const cmdCandidate = trimmed.replace(/^-\s*/, "").replace(/^["']|["']$/g, "").trim();
           if (cmdCandidate) {
             const val = validateCheckCommand(cmdCandidate, allowedRunners);
-            if (val.valid && !BARE_CHECK_RUNNERS.has(cmdCandidate) && !commands.includes(cmdCandidate)) {
+            if (val.valid && isTargetedCheckCommand(cmdCandidate, allowedRunners) && !commands.includes(cmdCandidate)) {
               commands.push(cmdCandidate);
             }
           }
@@ -2295,7 +2404,7 @@ export function extractAcceptanceCommands(
     }
   }
 
-  // 2. Check dedicated sections or fenced code blocks labeled with acceptance-tests / tdd
+  // 2. Check dedicated sections with code blocks (bash / sh)
   const lines = markdownText.split("\n");
   let inDedicatedSection = false;
   let inCodeBlock = false;
@@ -2304,11 +2413,12 @@ export function extractAcceptanceCommands(
   for (const line of lines) {
     const trimmed = line.trim();
 
-    // Check heading for dedicated section
-    if (/^##+\s+(?:тест[ыа]\s+договора|acceptance\s+tests?|команд[ыа]\s+верификации|verification\s+commands?)/i.test(trimmed)) {
+    // Strictly: ## Тесты договора приёмки | ## Acceptance Tests | ## Команды верификации
+    if (/^##\s+(?:тест[ыа]\s+договора(?:\s+при[её]мки)?|acceptance\s+tests?|команд[ыа]\s+верификации)\s*$/i.test(trimmed)) {
       inDedicatedSection = true;
       continue;
-    } else if (/^##+\s+/.test(trimmed) && inDedicatedSection) {
+    } else if (/^#{1,2}\s+/.test(trimmed) && inDedicatedSection) {
+      // H1 or H2 closes the dedicated section; H3 (###) does NOT
       inDedicatedSection = false;
     }
 
@@ -2323,21 +2433,12 @@ export function extractAcceptanceCommands(
       continue;
     }
 
-    if (inCodeBlock) {
-      const isExplicitTddBlock =
-        codeBlockLang === "acceptance-tests" ||
-        codeBlockLang === "acceptance" ||
-        codeBlockLang === "tdd";
-      const isAllowedScriptBlock =
-        codeBlockLang === "bash" ||
-        codeBlockLang === "sh" ||
-        codeBlockLang === "shell" ||
-        codeBlockLang === "";
-
-      if (isExplicitTddBlock || (inDedicatedSection && isAllowedScriptBlock)) {
+    if (inCodeBlock && inDedicatedSection) {
+      const isAllowedScriptBlock = codeBlockLang === "bash" || codeBlockLang === "sh";
+      if (isAllowedScriptBlock) {
         if (trimmed && !trimmed.startsWith("#")) {
           const val = validateCheckCommand(trimmed, allowedRunners);
-          if (val.valid && !BARE_CHECK_RUNNERS.has(trimmed) && !commands.includes(trimmed)) {
+          if (val.valid && isTargetedCheckCommand(trimmed, allowedRunners) && !commands.includes(trimmed)) {
             commands.push(trimmed);
           }
         }
@@ -2470,27 +2571,63 @@ export async function runTddFailFirstVerification(
       };
     }
 
-    // Check if test files referenced in commands physically exist on acceptance_sha
+    // Classify commands into runnable (targeting existing tests) vs new test files
+    const runnableCommands: string[] = [];
+    const newTestFiles: string[] = [];
+
     for (const cmdStr of commands) {
       const parts = cmdStr.split(/\s+/);
+      const fileCandidates: string[] = [];
       for (const p of parts.slice(1)) {
+        if (p.startsWith("-") || p === "--") continue;
+        const cleanPath = p.split("::")[0];
         if (
-          !p.startsWith("-") &&
-          (p.includes("/") ||
-            /\.(?:test|spec)\.[a-z0-9]+$/i.test(p) ||
-            /^(?:test_|.+_test\.)/i.test(p))
+          cleanPath === "./..." ||
+          cleanPath === "..." ||
+          cleanPath === "." ||
+          cleanPath.endsWith("/...") ||
+          cleanPath.includes("*")
         ) {
-          const resolvedPath = path.resolve(tmpDir, p);
-          if (!fs.existsSync(resolvedPath)) {
-            return {
-              ok: false,
-              failedAsExpected: false,
-              notRun: true,
-              output: `checks-refused: test-file-not-found (${p} does not exist on acceptance_sha)`,
-            };
-          }
+          continue;
+        }
+        if (
+          cleanPath.includes("/") ||
+          /\.(?:test|spec)\.[a-z0-9]+$/i.test(cleanPath) ||
+          /^(?:test_|.+_test\.)/i.test(cleanPath) ||
+          /\.[a-z0-9]{1,5}$/i.test(cleanPath)
+        ) {
+          fileCandidates.push(cleanPath);
         }
       }
+
+      if (fileCandidates.length > 0) {
+        let allFilesNew = true;
+        for (const fc of fileCandidates) {
+          const resolvedPath = path.resolve(tmpDir, fc);
+          if (fs.existsSync(resolvedPath)) {
+            allFilesNew = false;
+          } else {
+            if (!newTestFiles.includes(fc)) {
+              newTestFiles.push(fc);
+            }
+          }
+        }
+        if (allFilesNew) {
+          // This command targets a new test file not yet created on acceptance_sha
+          continue;
+        }
+      }
+
+      runnableCommands.push(cmdStr);
+    }
+
+    // If all commands target new test files, skip verification with failedAsExpected: true
+    if (runnableCommands.length === 0) {
+      return {
+        ok: true,
+        failedAsExpected: true,
+        output: `tdd check skipped: new test file(s) to be created during code phase (${newTestFiles.join(", ")})`,
+      };
     }
 
     const nmRepo = path.join(deps.repoRoot, "node_modules");
@@ -2505,10 +2642,8 @@ export async function runTddFailFirstVerification(
       { cmd: deps.cmd, repoRoot: tmpDir },
       task,
       allowedRunners,
-      {
-        ...checksConfig,
-        commands,
-      },
+      checksConfig,
+      runnableCommands,
     );
     if (checkRes.notRun) {
       return {
@@ -3211,30 +3346,48 @@ async function startQueuedTask(
           { cwd: repoRoot },
         );
         if (isAncestorRes.exitCode !== 0) {
-          const resolution = resolveTransition({
-            route: task.route,
-            node: "start",
-            status: "queued",
-            event: { type: "queue_take", branchExistsWithCommits: true, branch },
-            mode: task.confirmation_mode,
-            counters: extractCounters(task),
-          });
-          const tr = deps.store.transitionTask({
-            taskKey: task.task_key,
-            expectedNode: "start",
-            expectedStatus: "queued",
-            toNode: resolution.toNode,
-            toStatus: resolution.toStatus,
-            actor: "run-queue",
-            reason: resolution.reason,
-            updates: { branch },
-          });
-          if (tr.ok) {
-            const logged = deps.store.listTransitions(task.task_key).at(-1);
-            if (logged) transitions.push(logged);
-            return true;
+          const branchHead = revBranch.stdout.trim();
+          let isOnlyAcceptanceCommit = false;
+          if (task.acceptance_sha && branchHead) {
+            if (branchHead === task.acceptance_sha) {
+              isOnlyAcceptanceCommit = true;
+            } else {
+              const diffRes = await deps.cmd.run(
+                "git",
+                ["diff", "--quiet", task.acceptance_sha, branchHead],
+                { cwd: repoRoot },
+              );
+              if (diffRes.exitCode === 0) {
+                isOnlyAcceptanceCommit = true;
+              }
+            }
           }
-          return false;
+          if (!isOnlyAcceptanceCommit) {
+            const resolution = resolveTransition({
+              route: task.route,
+              node: "start",
+              status: "queued",
+              event: { type: "queue_take", branchExistsWithCommits: true, branch },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
+            const tr = deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "start",
+              expectedStatus: "queued",
+              toNode: resolution.toNode,
+              toStatus: resolution.toStatus,
+              actor: "run-queue",
+              reason: resolution.reason,
+              updates: { branch },
+            });
+            if (tr.ok) {
+              const logged = deps.store.listTransitions(task.task_key).at(-1);
+              if (logged) transitions.push(logged);
+              return true;
+            }
+            return false;
+          }
         }
       } else {
         let baseRef = targetRef;

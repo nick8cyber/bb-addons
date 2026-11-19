@@ -26,6 +26,9 @@ import {
   runTddFailFirstVerification,
   extractAcceptanceCommands,
   formatDesignCheckPacket,
+  isTargetedCheckCommand,
+  validateCheckCommand,
+  executeChecks,
 } from "../src/workgraph.js";
 import { parsePolicy } from "../src/policy.js";
 
@@ -2429,4 +2432,226 @@ test("§34.3 (ADR-0037): buildChecksEnvironment and parsePolicy reject secret to
   assert.ok(parsed.warnings.some((w) => w.path === "checks.allowedEnvVars"));
   assert.ok(parsed.warnings.some((w) => w.path === "checks.extraEnvVars"));
 });
+
+test("§34.5 (ADR-0037 / Reviewer Б1-б): isTargetedCheckCommand filters bare runners via positive rule", () => {
+  // Bare runners without targets/filters must be rejected
+  assert.equal(isTargetedCheckCommand("npm test"), false);
+  assert.equal(isTargetedCheckCommand("npm run test"), false);
+  assert.equal(isTargetedCheckCommand("npm run test:unit"), false);
+  assert.equal(isTargetedCheckCommand("npm test --silent"), false);
+  assert.equal(isTargetedCheckCommand("pytest"), false);
+  assert.equal(isTargetedCheckCommand("pytest -q"), false);
+  assert.equal(isTargetedCheckCommand("cargo test"), false);
+  assert.equal(isTargetedCheckCommand("cargo test --release"), false);
+  assert.equal(isTargetedCheckCommand("go test"), false);
+  assert.equal(isTargetedCheckCommand("go test ./..."), false);
+  assert.equal(isTargetedCheckCommand("npm run lint"), false);
+  assert.equal(isTargetedCheckCommand("npm run lint src/foo.ts"), false);
+
+  // Targeted commands with file arguments or filter flags must be accepted
+  assert.equal(isTargetedCheckCommand("npm test tests/fix.test.ts"), true);
+  assert.equal(isTargetedCheckCommand("npm test -- tests/fix.test.ts"), true);
+  assert.equal(isTargetedCheckCommand("npm test --silent tests/fix.test.ts"), true);
+  assert.equal(isTargetedCheckCommand("pytest tests/test_bug.py::test_x"), true);
+  assert.equal(isTargetedCheckCommand("pytest -q tests/test_bug.py"), true);
+  assert.equal(isTargetedCheckCommand("pytest -k test_feature"), true);
+  assert.equal(isTargetedCheckCommand("cargo test test_feature"), true);
+  assert.equal(isTargetedCheckCommand("go test ./... -run TestBug"), true);
+});
+
+test("§34.5 (ADR-0037 / Reviewer Non-blocker 5): extractAcceptanceCommands parses inline array and nested subsections", () => {
+  // Inline frontmatter array
+  const mdInline = `---
+tdd_commands: ["npm test tests/a.test.ts", "pytest -k test_b"]
+---
+`;
+  assert.deepEqual(extractAcceptanceCommands(mdInline), [
+    "npm test tests/a.test.ts",
+    "pytest -k test_b",
+  ]);
+
+  // Section with ### subsection does not close the dedicated section
+  const mdSubSection = `
+## Тесты договора приёмки
+
+### Модульные тесты
+\`\`\`bash
+npm test tests/sub.test.ts
+\`\`\`
+
+### Интеграционные тесты
+\`\`\`bash
+npm test tests/integration.test.ts
+\`\`\`
+
+## Описание реализации
+\`\`\`bash
+npm test tests/ignored.test.ts
+\`\`\`
+`;
+  assert.deepEqual(extractAcceptanceCommands(mdSubSection), [
+    "npm test tests/sub.test.ts",
+    "npm test tests/integration.test.ts",
+  ]);
+});
+
+test("§31.3 & §34.5 (ADR-0037 / Reviewer Non-blocker 5): validateCheckCommand allows standard config but rejects wrapper", () => {
+  // Standard test runner configs are allowed
+  const okConfig = validateCheckCommand("npm test -- --config vitest.config.ts");
+  assert.equal(okConfig.valid, true);
+
+  const okCustomConfig = validateCheckCommand("npm test -c jest.config.js");
+  assert.equal(okCustomConfig.valid, true);
+
+  // Dangerous configs with rustc-wrapper or runner are rejected
+  const badConfig = validateCheckCommand("cargo test --config build.rustc-wrapper=evil");
+  assert.equal(badConfig.valid, false);
+  assert.ok(badConfig.reason?.includes("forbidden-flag"));
+
+  const badScriptShell = validateCheckCommand("npm test --script-shell=/bin/sh");
+  assert.equal(badScriptShell.valid, false);
+  assert.ok(badScriptShell.reason?.includes("forbidden-flag"));
+});
+
+test("§34.5 (ADR-0037 / Reviewer Non-blocker 2): executeChecks prioritizes overrideCommands and ignores payload.tdd_commands on post-code checks", async () => {
+  const executed: string[] = [];
+  const fakeCmd: CmdRunner = {
+    run: async (bin, args) => {
+      executed.push([bin, ...args].join(" "));
+      return { exitCode: 0, stdout: "pass", stderr: "" };
+    },
+  };
+
+  // 1. overrideCommands takes highest priority, ignoring payload.checks_commands
+  const taskWithChecks: any = {
+    task_key: "TEST-1",
+    payload: JSON.stringify({
+      checks_commands: ["npm run lint"],
+    }),
+  };
+  await executeChecks(
+    { cmd: fakeCmd, repoRoot: "/tmp" },
+    taskWithChecks,
+    ["npm test", "npm run lint"],
+    undefined,
+    ["npm test tests/override.test.ts"],
+  );
+  assert.equal(executed.length, 1);
+  assert.ok(executed[0].includes("tests/override.test.ts"));
+
+  // 2. Normal post-code checks does NOT use payload.tdd_commands
+  executed.length = 0;
+  const taskWithTdd: any = {
+    task_key: "TEST-2",
+    payload: JSON.stringify({
+      tdd_commands: ["npm test tests/tdd.test.ts"],
+      checks_commands: ["npm test tests/real-check.test.ts"],
+    }),
+  };
+  await executeChecks(
+    { cmd: fakeCmd, repoRoot: "/tmp" },
+    taskWithTdd,
+    ["npm test"],
+  );
+  assert.equal(executed.length, 1);
+  assert.ok(executed[0].includes("tests/real-check.test.ts"));
+});
+
+test("§34.5 (ADR-0037 / Reviewer Б1-а): runTddFailFirstVerification skips check when test file is new (does not exist on base commit)", async () => {
+  const tmpRepo = makeTempDir("bb-tdd-repo-");
+  const cmd = createCmd();
+  await cmd.run("git", ["init"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+  writeFileSync(path.join(tmpRepo, "README.md"), "# Repo\n");
+  await cmd.run("git", ["add", "README.md"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "initial commit"], { cwd: tmpRepo });
+
+  const normKey = "TDD-NEW";
+  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+  const fs = await import("node:fs");
+  fs.mkdirSync(accDir, { recursive: true });
+  writeFileSync(
+    path.join(accDir, `${normKey}.md`),
+    `# Contract
+## Тесты договора приёмки
+\`\`\`bash
+npm test tests/new-feature.test.js
+\`\`\`
+`,
+  );
+  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "acceptance contract"], { cwd: tmpRepo });
+  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+  const accSha = rev.stdout.trim();
+
+  // On accSha, tests/new-feature.test.js does NOT exist.
+  // Prior behavior was: notRun: true -> stalled!
+  // New behavior: failedAsExpected: true, output notes skipped new test file!
+  const res = await runTddFailFirstVerification(
+    { cmd, repoRoot: tmpRepo },
+    { task_key: normKey } as any,
+    accSha,
+  );
+  assert.equal(res.ok, true);
+  assert.equal(res.failedAsExpected, true);
+  assert.equal(res.notRun, undefined);
+  assert.ok(res.output?.includes("new test file(s) to be created during code phase"));
+  assert.ok(res.output?.includes("tests/new-feature.test.js"));
+});
+
+test("§34.5 (ADR-0037 / Reviewer Non-blocker 1): runTddFailFirstVerification strips pytest selectors and ignores go package globs", async () => {
+  const tmpRepo = makeTempDir("bb-tdd-repo-");
+  const cmd = createCmd();
+  await cmd.run("git", ["init"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.name", "Tester"], { cwd: tmpRepo });
+  await cmd.run("git", ["config", "user.email", "tester@bb.dev"], { cwd: tmpRepo });
+
+  const fs = await import("node:fs");
+  const testsDir = path.join(tmpRepo, "tests");
+  fs.mkdirSync(testsDir, { recursive: true });
+  writeFileSync(path.join(testsDir, "test_bug.py"), "def test_x(): pass\n");
+  await cmd.run("git", ["add", "tests/"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "existing test"], { cwd: tmpRepo });
+
+  const normKey = "TDD-SEL";
+  const accDir = path.join(tmpRepo, "docs", "specs", "acceptance");
+  fs.mkdirSync(accDir, { recursive: true });
+  writeFileSync(
+    path.join(accDir, `${normKey}.md`),
+    `# Contract
+## Тесты договора приёмки
+\`\`\`bash
+pytest tests/test_bug.py::test_x
+go test ./... -run TestBug
+\`\`\`
+`,
+  );
+  await cmd.run("git", ["add", "docs/"], { cwd: tmpRepo });
+  await cmd.run("git", ["commit", "-m", "contract with selectors"], { cwd: tmpRepo });
+  const rev = await cmd.run("git", ["rev-parse", "HEAD"], { cwd: tmpRepo });
+  const accSha = rev.stdout.trim();
+
+  // Mock runner that returns non-zero for checks so tdd verifies failedAsExpected
+  const mockCmd: CmdRunner = {
+    run: async (bin, args, opts) => {
+      if (bin === "git") {
+        return cmd.run(bin, args, opts);
+      }
+      return { exitCode: 1, stdout: "tests failed as expected", stderr: "" };
+    },
+  };
+
+  const res = await runTddFailFirstVerification(
+    { cmd: mockCmd, repoRoot: tmpRepo },
+    { task_key: normKey } as any,
+    accSha,
+    ["pytest", "go test ./..."],
+  );
+  assert.equal(res.ok, true);
+  assert.equal(res.failedAsExpected, true);
+  assert.equal(res.notRun, undefined);
+  assert.ok(res.output?.includes("tdd fail-first verified"));
+});
+
 
