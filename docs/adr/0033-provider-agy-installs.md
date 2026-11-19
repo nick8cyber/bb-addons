@@ -1,6 +1,6 @@
 ---
 title: provider-agy — параллельные установки agy и привязка аккаунтов
-status: proposed
+status: accepted
 date: 2026-11-18
 ---
 

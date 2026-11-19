@@ -11,7 +11,7 @@ import { experimental_createBridgeDeltaEventCollector } from "@get-bb/plugin-sdk
 import { installTeardown, trackedMkdtemp } from "./harness-teardown.mjs";
 installTeardown();
 
-const MODEL = process.argv[2] ?? "gemini-3.5-flash-low";
+const MODEL = process.argv[2] ?? "gemini-3.8-flash-low";
 const workspace = trackedMkdtemp(join(tmpdir(), "agy-conformance-"));
 
 // --- capture the bridge's stdout ------------------------------------------
