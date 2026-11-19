@@ -240,6 +240,7 @@ export type TransitionEvent =
       isOwner?: boolean;
       reopen?: boolean;
       prClosedReason?: boolean;
+      prevStatus?: string;
     }
   | {
       type: "dequeue";
@@ -2768,12 +2769,19 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
           ruleId: "rule-77-resume-deferred",
         };
       }
-      const targetStatus: TaskStatus =
-        input.node === "start"
-          ? "queued"
-          : input.node === "owner_gate"
-            ? "waiting_approval"
-            : "running";
+      let targetStatus: TaskStatus = "running";
+      if (input.node === "start") {
+        targetStatus = "queued";
+      } else if (input.node === "owner_gate") {
+        targetStatus = "waiting_approval";
+      } else if (input.node === "release") {
+        if (
+          input.event.prevStatus === "waiting_release_note" ||
+          input.event.prevStatus === "pr_open"
+        ) {
+          targetStatus = input.event.prevStatus as TaskStatus;
+        }
+      }
       return {
         allowed: true,
         toNode: input.node,

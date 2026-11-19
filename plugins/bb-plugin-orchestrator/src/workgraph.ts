@@ -1631,19 +1631,10 @@ export async function runResume(
       route: task.route,
       node: task.node,
       status: "deferred",
-      event: { type: "resume", isOwner: true },
+      event: { type: "resume", isOwner: true, prevStatus },
       mode: task.confirmation_mode,
       counters: extractCounters(task),
     });
-
-    let toStatus: TaskStatus = resolution.toStatus;
-    if (task.node === "start") {
-      toStatus = "queued";
-    } else if (task.node === "release") {
-      if (prevStatus === "waiting_release_note" || prevStatus === "pr_open") {
-        toStatus = prevStatus as TaskStatus;
-      }
-    }
 
     const res = deps.store.transitionTask(
       {
@@ -1651,7 +1642,7 @@ export async function runResume(
         expectedNode: task.node,
         expectedStatus: "deferred",
         toNode: resolution.toNode,
-        toStatus,
+        toStatus: resolution.toStatus,
         actor: "owner",
         reason: "resume",
         now,
@@ -2542,6 +2533,12 @@ async function startQueuedTask(
             mode: task.confirmation_mode,
             counters: extractCounters(task),
           });
+          if (!failTr.allowed) {
+            throw new OrchestratorError(
+              failTr.errorCode ?? "invalid-transition",
+              failTr.errorMessage ?? failTr.reason,
+            );
+          }
           deps.store.transitionTask({
             taskKey: task.task_key,
             expectedNode: "start",
@@ -2583,6 +2580,12 @@ async function startQueuedTask(
           mode: task.confirmation_mode,
           counters: extractCounters(task),
         });
+        if (!failTr.allowed) {
+          throw new OrchestratorError(
+            failTr.errorCode ?? "invalid-transition",
+            failTr.errorMessage ?? failTr.reason,
+          );
+        }
         deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "start",
@@ -2612,6 +2615,12 @@ async function startQueuedTask(
           mode: task.confirmation_mode,
           counters: extractCounters(task),
         });
+        if (!failTr.allowed) {
+          throw new OrchestratorError(
+            failTr.errorCode ?? "invalid-transition",
+            failTr.errorMessage ?? failTr.reason,
+          );
+        }
         deps.store.transitionTask({
           taskKey: task.task_key,
           expectedNode: "start",
@@ -2965,6 +2974,12 @@ async function advanceActiveTask(
               mode: task.confirmation_mode,
               counters: extractCounters(task),
             });
+            if (!failTr.allowed) {
+              throw new OrchestratorError(
+                failTr.errorCode ?? "invalid-transition",
+                failTr.errorMessage ?? failTr.reason,
+              );
+            }
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "design",
@@ -2994,6 +3009,12 @@ async function advanceActiveTask(
               mode: task.confirmation_mode,
               counters: extractCounters(task),
             });
+            if (!failTr.allowed) {
+              throw new OrchestratorError(
+                failTr.errorCode ?? "invalid-transition",
+                failTr.errorMessage ?? failTr.reason,
+              );
+            }
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "design",
@@ -3066,6 +3087,12 @@ async function advanceActiveTask(
             mode: task.confirmation_mode,
             counters: extractCounters(task),
           });
+          if (!tr.allowed) {
+            throw new OrchestratorError(
+              tr.errorCode ?? "invalid-transition",
+              tr.errorMessage ?? tr.reason,
+            );
+          }
           deps.store.transitionTask({
             taskKey: task.task_key,
             expectedNode: "design",
@@ -3153,6 +3180,12 @@ async function advanceActiveTask(
               mode: task.confirmation_mode,
               counters: extractCounters(task),
             });
+            if (!tr.allowed) {
+              throw new OrchestratorError(
+                tr.errorCode ?? "invalid-transition",
+                tr.errorMessage ?? tr.reason,
+              );
+            }
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "spec",
@@ -3343,6 +3376,12 @@ async function advanceActiveTask(
               mode: task.confirmation_mode,
               counters: extractCounters(task),
             });
+            if (!tr.allowed) {
+              throw new OrchestratorError(
+                tr.errorCode ?? "invalid-transition",
+                tr.errorMessage ?? tr.reason,
+              );
+            }
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "spec_review",
@@ -3484,6 +3523,12 @@ async function advanceActiveTask(
               mode: task.confirmation_mode,
               counters: extractCounters(task),
             });
+            if (!tr.allowed) {
+              throw new OrchestratorError(
+                tr.errorCode ?? "invalid-transition",
+                tr.errorMessage ?? tr.reason,
+              );
+            }
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "code",
@@ -3704,6 +3749,12 @@ async function advanceActiveTask(
               mode: task.confirmation_mode,
               counters: extractCounters(task),
             });
+            if (!tr.allowed) {
+              throw new OrchestratorError(
+                tr.errorCode ?? "invalid-transition",
+                tr.errorMessage ?? tr.reason,
+              );
+            }
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "review",
@@ -3857,6 +3908,12 @@ async function advanceActiveTask(
               mode: task.confirmation_mode,
               counters: extractCounters(task),
             });
+            if (!tr.allowed) {
+              throw new OrchestratorError(
+                tr.errorCode ?? "invalid-transition",
+                tr.errorMessage ?? tr.reason,
+              );
+            }
             deps.store.transitionTask({
               taskKey: task.task_key,
               expectedNode: "design_check",
