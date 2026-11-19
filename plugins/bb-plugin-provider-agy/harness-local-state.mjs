@@ -1412,7 +1412,8 @@ async function bridgeRun(transport) {
   check(
     `${transport}/ineligible-mark-in-overlay`,
     (overlay?.accounts?.[ownerLabel]?.ineligibleAtMs ?? 0) > 0 &&
-      (overlay?.accounts?.[ownerLabel]?.cooldownUntilMs ?? 0) > Date.now(),
+      overlay?.accounts?.[ownerLabel]?.parkedReason === "validation-required" &&
+      !((overlay?.accounts?.[ownerLabel]?.cooldownUntilMs ?? 0) > Date.now()),
     JSON.stringify(overlay?.accounts?.[ownerLabel] ?? null),
   );
   writeJson(join(root, "accounts-state.json"), { accounts: wipedAccounts });
