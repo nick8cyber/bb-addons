@@ -258,7 +258,7 @@ export interface TransitionRule {
   readonly route: TaskRoute | readonly TaskRoute[] | "*";
   readonly node: TaskNode | readonly TaskNode[] | "*";
   readonly status: TaskStatus | readonly TaskStatus[] | "*";
-  readonly eventType: string;
+  readonly eventType: string | readonly string[];
   readonly mode?: ConfirmationMode | "*";
   readonly description: string;
   readonly resolve: (input: TransitionInput) => TransitionResolution | null;
@@ -317,6 +317,14 @@ function matchesMode(
 ): boolean {
   if (!ruleMode || ruleMode === "*") return true;
   return ruleMode === mode;
+}
+
+function matchesEventType(
+  ruleEventType: string | readonly string[],
+  eventType: string,
+): boolean {
+  if (Array.isArray(ruleEventType)) return ruleEventType.includes(eventType);
+  return ruleEventType === eventType;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -641,20 +649,25 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
     route: ["feature", "docs"],
     node: "spec",
     status: "running",
-    eventType: "spec_delivered",
-    description: "коммит затрагивает файлы вне docs -> инкремент spec_attempts",
+    eventType: ["spec_delivered", "spec_question_or_no_report"],
+    description: "коммит затрагивает файлы вне docs или вопрос -> инкремент spec_attempts",
     resolve(input) {
-      if (input.event.type !== "spec_delivered" || !input.event.filesOutsideDocs)
-        return null;
+      const isQuestion = input.event.type === "spec_question_or_no_report";
+      const isFilesOutside =
+        input.event.type === "spec_delivered" && Boolean(input.event.filesOutsideDocs);
+      if (!isQuestion && !isFilesOutside) return null;
       const nextAttempts = input.counters.spec_attempts + 1;
       const blocked = nextAttempts >= 3;
+      const reasonCode = isQuestion
+        ? "spec-question-or-no-report"
+        : "files-outside-docs";
       return {
         allowed: true,
         toNode: "spec",
         toStatus: blocked ? "blocked" : "running",
         reason: blocked
-          ? "spec-refused: files-outside-docs (attempts limit reached: 3/3)"
-          : `spec-refused: files-outside-docs (attempt ${nextAttempts}/3)`,
+          ? `spec-refused: ${reasonCode} (attempts limit reached: 3/3)`
+          : `spec-refused: ${reasonCode} (attempt ${nextAttempts}/3)`,
         ruleId: "rule-14-spec-files-outside-docs",
         counterUpdates: { spec_attempts: nextAttempts },
         action: blocked
@@ -2415,7 +2428,7 @@ export function resolveTransition(input: TransitionInput): TransitionResolution 
     if (!matchesNode(rule.node, input.node)) continue;
     if (!matchesStatus(rule.status, input.status)) continue;
     if (!matchesMode(rule.mode, input.mode)) continue;
-    if (rule.eventType !== input.event.type) continue;
+    if (!matchesEventType(rule.eventType, input.event.type)) continue;
 
     const resolution = rule.resolve(input);
     if (resolution !== null) {

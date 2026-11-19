@@ -17,6 +17,7 @@ import {
   computeTaskBranch,
   isOwnerCalling,
   normalizeWorkGraphMode,
+  runRunQueue,
 } from "../src/workgraph.js";
 
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
@@ -141,6 +142,27 @@ function fakeCmd(
         if (key.includes("rev-parse --verify")) {
           // default: refs don't exist
           return { exitCode: 1, stdout: "", stderr: "fatal: Needed a single revision" };
+        }
+        if (file === "git" && args[0] === "hash-object") {
+          return ok("acc-blob-sha-1234567890");
+        }
+        if (file === "git" && args[0] === "read-tree") {
+          return ok();
+        }
+        if (file === "git" && args[0] === "update-index") {
+          return ok();
+        }
+        if (file === "git" && args[0] === "write-tree") {
+          return ok("acc-tree-sha-1234567890");
+        }
+        if (file === "git" && args[0] === "commit-tree") {
+          return ok("acc-commit-sha-1234567890");
+        }
+        if (file === "git" && args[0] === "update-ref") {
+          return ok();
+        }
+        if (file === "git" && args[0] === "rev-parse" && args[1]?.startsWith("refs/heads/")) {
+          return ok("acc-parent-sha-1234567890");
         }
         if (key.includes("ls-remote")) {
           return ok("");
@@ -1299,4 +1321,64 @@ test("reject requires --reason argument", async () => {
   const res = await host.harness.runCli(["reject", "REJ-NOREASON", "--json"]);
   assert.equal(res.exitCode, 1);
   assert.equal(JSON.parse(res.stdout).error.code, "missing-reason");
+});
+
+test("Blocker 1: commitAcceptanceContract failure stalls task without fake sha", async () => {
+  const host = await hostWith({ workGraph: "strict" });
+  const { cmd } = fakeCmd((file, args) => {
+    if (file === "git" && args[0] === "hash-object") {
+      return { exitCode: 1, stdout: "", stderr: "fatal: git error" };
+    }
+    return undefined;
+  });
+  const store = new DelegationStore(host.bb.storage.database());
+  store.insertTask({
+    taskKey: "FAIL-ACC",
+    projectId: "proj_test",
+    coordinatorThreadId: "thr_coord",
+    route: "simple",
+    level: "simple",
+    confirmationMode: "auto",
+    payload: JSON.stringify({ acceptance_text: "contract text" }),
+  });
+  await runRunQueue({ store, workGraphMode: "strict", cmd });
+  const t = store.getTask("FAIL-ACC")!;
+  assert.equal(t.status, "stalled");
+  const transitions = store.listTransitions("FAIL-ACC");
+  const lastTr = transitions[transitions.length - 1];
+  assert.match(lastTr.reason, /git-failed/);
+  assert.equal(t.acceptance_sha, null);
+});
+
+test("Blocker 2: resume --target from release/stalled requires pr_closed reason", async () => {
+  const host = await hostWith({ workGraph: "shadow" });
+  const store = new DelegationStore(host.bb.storage.database());
+  await host.harness.runCli(["enqueue", "RES-PR", "--json"]);
+
+  // Stalled with different reason (e.g. script failure)
+  store.transitionTask({
+    taskKey: "RES-PR",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "release",
+    toStatus: "stalled",
+    actor: "test",
+    reason: "release failed",
+    updates: { payload: JSON.stringify({ stalled_reason: "release_failed_script" }) },
+  });
+
+  const resOther = await host.harness.runCli(["resume", "RES-PR", "--target", "code", "--json"]);
+  assert.equal(resOther.exitCode, 1);
+  assert.equal(JSON.parse(resOther.stdout).error.code, "target-invalid");
+  assert.match(JSON.parse(resOther.stdout).error.message, /pr_closed/);
+
+  // Stalled with pr_closed
+  store.updateTask("RES-PR", {
+    payload: JSON.stringify({ stalled_reason: "pr_closed" }),
+  });
+  const resPr = await host.harness.runCli(["resume", "RES-PR", "--target", "code", "--json"]);
+  assert.equal(resPr.exitCode, 0);
+  const task = store.getTask("RES-PR")!;
+  assert.equal(task.node, "code");
+  assert.equal(task.status, "running");
 });

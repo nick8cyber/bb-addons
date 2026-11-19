@@ -73,6 +73,27 @@ function fakeCmd(
         if (key.includes("rev-parse --verify origin/main") || key.includes("rev-parse --verify refs/remotes/origin/main")) {
           return { exitCode: 0, stdout: "0000000000000000000000000000000000000001", stderr: "" };
         }
+        if (c === "git" && a[0] === "hash-object") {
+          return { exitCode: 0, stdout: "acc-blob-sha-12345", stderr: "" };
+        }
+        if (c === "git" && a[0] === "read-tree") {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (c === "git" && a[0] === "update-index") {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (c === "git" && a[0] === "write-tree") {
+          return { exitCode: 0, stdout: "acc-tree-sha-12345", stderr: "" };
+        }
+        if (c === "git" && a[0] === "commit-tree") {
+          return { exitCode: 0, stdout: "acc-commit-sha-12345", stderr: "" };
+        }
+        if (c === "git" && a[0] === "update-ref") {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (c === "git" && a[0] === "rev-parse" && a[1]?.startsWith("refs/heads/")) {
+          return { exitCode: 0, stdout: "acc-parent-sha-12345", stderr: "" };
+        }
         if (c === "git" && a[0] === "rev-parse" && a[1] === "--verify") {
           return { exitCode: 0, stdout: "base-sha-1234567890", stderr: "" };
         }
@@ -232,6 +253,7 @@ test("Sequential queue: maxActiveTasks=1 and depends_on blocks and unblocks next
   store.updateTask("TASK-1", {
     payload: JSON.stringify({
       code_done: true,
+      result_commits: 1,
       review_verdict: "OK",
     }),
   });

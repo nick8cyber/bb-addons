@@ -644,6 +644,8 @@ export async function runEnqueue(
     }
   }
 
+  const repoRoot = deps.ctx?.cwd ?? process.cwd();
+
   // Acceptance contract reading
   let acceptanceText: string | null = null;
   if (input.acceptance) {
@@ -656,7 +658,7 @@ export async function runEnqueue(
         raw.startsWith("~/") ||
         /\.(md|txt|markdown|rst)$/i.test(raw));
 
-    const candidatePath = path.resolve(deps.ctx?.cwd ?? process.cwd(), raw);
+    const candidatePath = path.resolve(repoRoot, raw);
     if (existsSync(candidatePath)) {
       try {
         acceptanceText = readFileSync(candidatePath, "utf8");
@@ -692,6 +694,25 @@ export async function runEnqueue(
         } catch {}
         existingPayload.acceptance_text = acceptanceText;
         delete existingPayload.previous_status;
+
+        let accSha = existing.acceptance_sha;
+        if (existing.branch && deps.cmd) {
+          try {
+            accSha = await commitAcceptanceContract(
+              deps.cmd,
+              repoRoot,
+              existing.branch,
+              taskKey,
+              acceptanceText,
+            );
+          } catch (e: any) {
+            throw new OrchestratorError(
+              "git-failed",
+              `не удалось закоммитить обновлённый договор приёмки: ${e?.message ?? e}`,
+            );
+          }
+        }
+
         const res = deps.store.transitionTask(
           {
             taskKey,
@@ -703,6 +724,7 @@ export async function runEnqueue(
             reason: "update-acceptance",
             updates: {
               payload: JSON.stringify(existingPayload),
+              acceptance_sha: accSha,
               deferred_by: null,
               deferred_reason: null,
             },
@@ -1197,6 +1219,13 @@ export async function runResume(
 
     if (target !== undefined) {
       assertOwnerOnly(deps.ctx);
+      let isPrClosed = false;
+      if (task.payload) {
+        try {
+          const p = JSON.parse(task.payload);
+          isPrClosed = p.stalled_reason === "pr_closed";
+        } catch {}
+      }
       const resolution = resolveTransition({
         route: task.route,
         node: task.node,
@@ -1205,7 +1234,7 @@ export async function runResume(
           type: "resume",
           target: target as TaskNode,
           isOwner: true,
-          prClosedReason: true,
+          prClosedReason: isPrClosed,
         },
         mode: task.confirmation_mode,
         counters: extractCounters(task),
@@ -1216,6 +1245,12 @@ export async function runResume(
           throw new OrchestratorError(
             "target-invalid",
             `цель --target не поддерживается для узла ${task.node} в статусе stalled`,
+          );
+        }
+        if (!isPrClosed) {
+          throw new OrchestratorError(
+            "target-invalid",
+            `цель --target в release/stalled допустима только при причине стола pr_closed (§28.1 строки 56-57)`,
           );
         }
         throw new OrchestratorError(
@@ -1629,7 +1664,7 @@ export function validateCheckCommand(
   }
 
   // §31.3: Forbidden flags: -exec, --import, -o, --pdb, --run-command
-  const forbiddenFlags = ["-exec", "--import", "--pdb", "--run-command"];
+  const forbiddenFlags = ["-exec", "--import", "-o", "--pdb", "--run-command"];
   const parts = trimmed.split(/\s+/);
   for (const p of parts) {
     if (forbiddenFlags.includes(p)) {
@@ -2123,7 +2158,19 @@ async function startQueuedTask(
 
   let acceptanceSha: string | null = task.acceptance_sha;
   if (resolution.action?.commitAcceptance) {
-    if (payload.acceptance_text && branch && deps.cmd) {
+    if (payload.acceptance_text && branch) {
+      if (!deps.cmd) {
+        deps.store.transitionTask({
+          taskKey: task.task_key,
+          expectedNode: "start",
+          expectedStatus: "queued",
+          toNode: "start",
+          toStatus: "stalled",
+          actor: "run-queue",
+          reason: "git-failed: missing cmd runner for acceptance commit",
+        });
+        return false;
+      }
       try {
         acceptanceSha = await commitAcceptanceContract(
           deps.cmd,
@@ -2132,11 +2179,18 @@ async function startQueuedTask(
           task.task_key,
           String(payload.acceptance_text),
         );
-      } catch {
-        acceptanceSha = `sha-acc-${normKey.toLowerCase()}`;
+      } catch (e: any) {
+        deps.store.transitionTask({
+          taskKey: task.task_key,
+          expectedNode: "start",
+          expectedStatus: "queued",
+          toNode: "start",
+          toStatus: "stalled",
+          actor: "run-queue",
+          reason: `git-failed: ${e?.message ?? e}`,
+        });
+        return false;
       }
-    } else if (payload.acceptance_text && !acceptanceSha) {
-      acceptanceSha = `sha-acc-${normKey.toLowerCase()}`;
     }
   } else if (task.route === "docs") {
     acceptanceSha = null;
@@ -2239,10 +2293,8 @@ async function advanceActiveTask(
   switch (task.node) {
     case "design": {
       let contractText: string | null = null;
-      if (typeof payload.acceptance_text === "string") {
+      if (typeof payload.acceptance_text === "string" && payload.acceptance_text.trim()) {
         contractText = payload.acceptance_text;
-      } else if (latestDelegation?.status === "done") {
-        contractText = `Acceptance contract for ${normKey}`;
       }
       if (contractText && (latestDelegation?.status === "done" || payload.design_done === true)) {
         const resolution = resolveTransition({
@@ -2256,7 +2308,19 @@ async function advanceActiveTask(
         if (!resolution.allowed) return false;
 
         let accSha = task.acceptance_sha || null;
-        if (deps.cmd && task.branch) {
+        if (task.branch) {
+          if (!deps.cmd) {
+            deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "design",
+              expectedStatus: "running",
+              toNode: "design",
+              toStatus: "stalled",
+              actor: "run-queue",
+              reason: "git-failed: missing cmd runner for acceptance commit",
+            });
+            return false;
+          }
           try {
             accSha = await commitAcceptanceContract(
               deps.cmd,
@@ -2265,12 +2329,18 @@ async function advanceActiveTask(
               task.task_key,
               contractText,
             );
-          } catch {
-            accSha = `sha-acc-${normKey.toLowerCase()}`;
+          } catch (e: any) {
+            deps.store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "design",
+              expectedStatus: "running",
+              toNode: "design",
+              toStatus: "stalled",
+              actor: "run-queue",
+              reason: `git-failed: ${e?.message ?? e}`,
+            });
+            return false;
           }
-        }
-        if (!accSha || !accSha.trim()) {
-          accSha = `sha-acc-${normKey.toLowerCase()}`;
         }
 
         const tr = deps.store.transitionTask({
@@ -2316,11 +2386,33 @@ async function advanceActiveTask(
               );
         }
 
+        let filesOutsideDocs = false;
+        if (deps.cmd && specSha && !specSha.startsWith("sha-")) {
+          try {
+            const diffRes = await deps.cmd.run(
+              "git",
+              ["diff", "--name-only", `${specSha}~1`, specSha],
+              { cwd: repoRoot },
+            );
+            if (diffRes.exitCode === 0) {
+              const files = diffRes.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+              filesOutsideDocs = files.some(
+                (f) => !f.startsWith("docs/") && !f.endsWith(".md"),
+              );
+            }
+          } catch {}
+        }
+
         const resolution = resolveTransition({
           route: task.route,
           node: "spec",
           status: "running",
-          event: { type: "spec_delivered", specSha, acceptanceTampered: tampered },
+          event: {
+            type: "spec_delivered",
+            specSha,
+            acceptanceTampered: tampered,
+            filesOutsideDocs,
+          },
           mode: task.confirmation_mode,
           counters: extractCounters(task),
         });
@@ -2413,7 +2505,7 @@ async function advanceActiveTask(
           latestDelegation?.result_commits ??
           (typeof payload.result_commits === "number"
             ? payload.result_commits
-            : 1);
+            : 0);
 
         const tampered = deps.checkAcceptanceTampered
           ? await deps.checkAcceptanceTampered(task, resultSha)
