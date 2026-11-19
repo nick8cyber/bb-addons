@@ -43,6 +43,7 @@ const {
   captureUsageLimits,
   sendPrompt,
   _setDriverHooks,
+  attachFile,
   menuItemHasLockIcon,
   upsellDialogConfirmsLock,
   markVisibleDialogs,
@@ -52,6 +53,71 @@ const {
   downloadUrlHost,
 } = driver;
 const { withUsageLock, KNOWN_CANDIDATE_RPCIDS } = usageLimitsModule;
+
+test("required attachment accepts a new visible chip when Send is enabled", async (t) => {
+  const tmp = trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "gemini-attachment-")));
+  const name = "pkg-17b6d6ea-71e7-4eff-ab61-020cc8ff8cf9-1795070189688.md";
+  const file = path.join(tmp, name);
+  fs.writeFileSync(file, "context");
+  const warn = t.mock.method(console, "warn", () => {});
+  const chip = ({ label, aria, visible = true, children = [], wrapsComposer = false } = {}) => ({
+    innerText: label,
+    contains: () => wrapsComposer,
+    getAttribute: (attr) => attr === "aria-label" ? aria : null,
+    getClientRects: () => visible ? [{}] : [],
+    querySelectorAll: () => children,
+  });
+  for (const [label, options] of [
+    ["full", { label: name }],
+    ["three dots", { label: "pkg-17b6d6...5070189688" }],
+    ["ellipsis", { label: "pkg-17b6d6…5070189688" }],
+    ["aria middle", { aria: "Remove " + name.slice(13, -13) }],
+    ["unknown name", { label: "Attachment", warn: true }],
+    ["stale chip only", { stale: true }],
+    ["hidden chip", { visible: false }],
+    ["disabled Send", { disabled: true }],
+  ]) await t.test(label, async () => {
+    warn.mock.resetCalls();
+    const previews = options.stale ? [chip({ label: name })] : [];
+    const input = { setInputFiles: async (selected) => {
+      assert.equal(selected, file);
+      if (!options.stale) previews.push(chip(options));
+    } };
+    const container = { querySelectorAll: () => [chip({ children: previews, wrapsComposer: true }), ...previews] };
+    const document = {
+      querySelector: (selector) => selector.includes("contenteditable")
+        ? { closest: () => container } : { disabled: options.disabled, getAttribute: () => null },
+    };
+    const evaluate = (fn, arg) => {
+      const previous = globalThis.document;
+      globalThis.document = document;
+      try {
+        return fn(arg);
+      } finally {
+        if (previous === undefined) delete globalThis.document;
+        else globalThis.document = previous;
+      }
+    };
+    const page = {
+      $: async () => ({ click: async () => {} }),
+      evaluate: async (fn, arg) => evaluate(fn, arg),
+      waitForSelector: async () => input,
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn, arg) => {
+        const result = evaluate(fn, arg);
+        if (!result) throw new Error("attachment visibility timed out");
+        return { jsonValue: async () => result, dispose: async () => {} };
+      },
+    };
+    const upload = attachFile(page, file, { required: true });
+    if (options.stale || options.visible === false || options.disabled) {
+      await assert.rejects(upload, /visibility timed out/);
+    } else {
+      await upload;
+    }
+    assert.equal(warn.mock.callCount(), options.warn ? 1 : 0);
+  });
+});
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 

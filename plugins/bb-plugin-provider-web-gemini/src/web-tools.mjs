@@ -362,7 +362,7 @@ const TASK_GIT_FLAGS = {
   diff: ["--stat", "--name-only", "--name-status", "--summary", "--cached", "--staged", "--check"],
   log: ["--stat", "--name-only", "--name-status", "--oneline", "--no-patch", "--all"],
   blame: ["--line-porcelain", "--porcelain"],
-  "ls-files": ["--cached", "--others", "--exclude-standard"],
+  "ls-files": ["--cached", "--others", "--exclude-standard", "--deleted"],
   status: ["-s", "--short", "--porcelain", "--porcelain=v1", "--branch", "-b"],
 };
 const taskPathDenied = (value) => /(?:^|[\\/:])\.git(?:[\\/]|$)/i.test(value) ||

@@ -314,6 +314,14 @@ test("fast agent reads a pinned snapshot through four tools and appends a masked
   assert.match(tools.get("list"), /docs\/review-only\.txt/);
   assert.match(tools.get("grep"), /\[скрыто: project\]/);
   assert.match(tools.get("git"), /docs\/notes.txt/);
+  const exclusions = JSON.parse(tools.get("git").split("\n", 1)[0]).excluded;
+  for (const entry of [
+    { source: "Git diff", reason: "sensitive paths (1)" },
+    { source: "package-lock.json", reason: "lock file" },
+    { source: "nested/dist/artifact.txt", reason: "generated/dependency tree" },
+    { source: "picture.bin", reason: "binary, stat only" },
+    { source: "forced.bin", reason: "binary, stat only" },
+  ]) assert.ok(exclusions.some((item) => item.source === entry.source && item.reason === entry.reason));
   assert.equal(tools.get("ancestor"), "base value\n");
   assert.match(tools.get("blame"), /review value/);
   assert.doesNotMatch(tools.get("symlink_diff"), /docs\/outward\.txt|outside\.txt|\/tmp/);
@@ -330,7 +338,10 @@ test("fast agent reads a pinned snapshot through four tools and appends a masked
   assert.equal(read.revision, sha);
   assert.deepEqual(read.sourceRange, { fromLine: 1, toLine: 2, totalLines: 3 });
   assert.equal(read.included, "partial");
-  assert.deepEqual(actual.manifest.supplements.find((entry) => entry.tool === "git").revisionRange, [repo.base, sha]);
+  const diff = actual.manifest.supplements.find((entry) => entry.tool === "git");
+  assert.deepEqual(diff.revisionRange, [repo.base, sha]);
+  assert.deepEqual(diff.excluded, exclusions);
+  assert.equal(diff.included, "partial");
   assert.equal(actual.manifest.supplements.find((entry) => entry.source.includes("HEAD~2")).revision, repo.base);
   assert.deepEqual(actual.manifest.omitted.find((entry) => entry.source === read.source).missingRanges, [{ fromLine: 3, toLine: 3 }]);
   assert.ok(actual.manifest.omitted.some((entry) => entry.reason.includes("read denied")));
@@ -352,6 +363,7 @@ test("pinned tools return session-relative paths that can be passed back to read
       toolCall("list", "list_dir", {}),
       toolCall("grep", "grep", { pattern: "review value match" }),
       toolCall("indexed", "git", { args: "ls-files" }),
+      toolCall("deleted", "git", { args: "ls-files --deleted" }),
       toolCall("status", "git", { args: "status" }),
       toolCall("show", "git", { args: "show HEAD -- notes.txt" }),
       toolCall("diff", "git", { args: "diff -- notes.txt" }),
@@ -374,10 +386,15 @@ test("pinned tools return session-relative paths that can be passed back to read
   assert.match(tools.get("list"), /(?:^|\n)review-only\.txt(?:\n|$)/);
   assert.match(tools.get("grep"), /^"review-only\.txt":1:review value match$/);
   assert.match(tools.get("indexed"), /(?:^|\n)review-only\.txt(?:\n|$)/);
+  assert.match(tools.get("deleted"), /^error:/);
   assert.match(tools.get("status"), /(?:^|\n) notes\.txt\s+\|/);
+  const statusExclusions = [{ source: "symlink.txt", reason: "symlink or submodule" }];
+  assert.deepEqual(JSON.parse(tools.get("status").split("\n", 1)[0]).excluded, statusExclusions);
   for (const name of ["diff", "show"]) assert.match(tools.get(name), /diff --git a\/notes\.txt b\/notes\.txt/);
   assert.doesNotMatch([...tools.values()].join("\n"), /docs\/|different HEAD/);
-  assert.equal(delivered(acp.requests()[0]).materials.get("добавил быстрый агент: review-only.txt"), "review value match\n");
+  const actual = delivered(acp.requests()[0]);
+  assert.equal(actual.materials.get("добавил быстрый агент: review-only.txt"), "review value match\n");
+  assert.deepEqual(actual.manifest.supplements.find((entry) => entry.source === "добавил быстрый агент: status").excluded, statusExclusions);
 });
 
 test("ordinary tasks read a local shallow clone without remotes, isolated from the working tree", async (t) => {
@@ -431,7 +448,8 @@ test("ordinary tasks read a local shallow clone without remotes, isolated from t
   const actual = delivered(acp.requests()[0]);
   assert.equal(actual.materials.get("добавил быстрый агент: notes.txt"), "working text\n");
   assert.equal(actual.materials.get("добавил быстрый агент: new.txt"), "untracked text\n");
-  assert.match(actual.materials.get("добавил быстрый агент: grep"), /^"new\.txt":1:untracked text$/);
+  assert.equal(actual.materials.get("добавил быстрый агент: grep"),
+    '"new.txt":1:untracked text\n(1 paths omitted from the working snapshot)');
   assert.match(actual.materials.get("добавил быстрый агент: list_dir"), /(?:^|\n)new\.txt(?:\n|$)/);
   assert.match(actual.materials.get("добавил быстрый агент: ls-files"), /^notes\.txt$/m);
   assert.match(actual.materials.get("добавил быстрый агент: diff --cached"), /\+staged text/);
@@ -457,7 +475,12 @@ test("working snapshot inventories skipped files and reports sensitive status as
   const maxTotalBytes = 24_000;
   repo.write("docs/.env.clean-fixture", "HIDDEN-CLEAN-FIXTURE\n");
   repo.write("docs/.env.changed-fixture", "HIDDEN-INITIAL-FIXTURE\n");
+  repo.write("docs/.env.deleted-fixture", "HIDDEN-DELETED-FIXTURE\n");
   repo.write("docs/disappeared.txt", "deleted file fixture\n");
+  repo.write("docs/gone/only.txt", "deleted nested fixture\n");
+  repo.write(".gitattributes", "docs/too-large.txt -diff\n");
+  repo.write("docs/too-large.txt", "small before modification\n");
+  repo.write("docs/intact/visible.txt", "visible intact fixture\n");
   symlinkSync("notes.txt", join(cwd, "tracked-link.txt"));
   repo.git("add", ".");
   repo.git("commit", "-qm", "Files for the working snapshot");
@@ -467,10 +490,14 @@ test("working snapshot inventories skipped files and reports sensitive status as
   repo.write("docs/at-limit.txt", "x".repeat(maxTotalBytes));
   repo.write("docs/notes.txt", "visible worktree change\n");
   rmSync(join(cwd, "disappeared.txt"));
+  rmSync(join(cwd, "gone", "only.txt"));
+  rmSync(join(cwd, ".env.deleted-fixture"));
   symlinkSync("notes.txt", join(cwd, "ZX41-marker.txt"));
 
   const sandboxParent = join(repo.tmp, "sandboxes");
   mkdirSync(sandboxParent);
+  const sandboxAlias = join(repo.tmp, "sandboxes-alias");
+  symlinkSync(sandboxParent, sandboxAlias);
   let snapshotFiles;
   const mock = await gateway(t, (n) => {
     if (n !== 1) return agentDone;
@@ -480,34 +507,54 @@ test("working snapshot inventories skipped files and reports sensitive status as
       toolCall("status", "git", { args: "status" }),
       toolCall("worktree", "git", { args: "diff" }),
       toolCall("list", "list_dir", {}),
+      toolCall("grep", "grep", { pattern: "visible" }),
+      toolCall("gone", "list_dir", { path: "gone" }),
+      toolCall("intact", "grep", { pattern: "visible", path: "intact" }),
       toolCall("indexed", "git", { args: "ls-files" }),
+      toolCall("deleted", "git", { args: "ls-files --deleted" }),
+      toolCall("deleted_scoped", "git", { args: "ls-files --deleted -- gone" }),
       toolCall("large", "read_file", { path: "too-large.txt" }),
     );
   });
-  const acp = fixture(t, { ...repo, repo: cwd }, readAnswer, {
+  const acp = fixture(t, { ...repo, repo: cwd }, (request) => request.count === 1
+    ? { text: '<tool name="git" args="ls-files --deleted"/>' } : { text: 'Reviewed\n{"verdict":"OK","blockers":0}' }, {
     settings: {
       context: { maxTotalBytes, maskPatterns: { [projectId]: [{ type: "project", pattern: "ZX[0-9]+-marker" }] } },
       innerAgent: { enabled: true, model: "fixture-fast", gateway: { baseUrl: mock.baseUrl } },
     },
-    env: { TMPDIR: sandboxParent },
+    env: { TMPDIR: sandboxAlias },
   });
-  assert.equal((await acp.prompt(await acp.newSession(), task("Read current status.", EN))).result?.stopReason, "end_turn");
-  assert.deepEqual(snapshotFiles, ["at-limit.txt", "base-only.txt", "notes.txt"]);
+  const response = await acp.prompt(await acp.newSession(), task("Read current status.", EN));
+  assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
+  assert.deepEqual(snapshotFiles, ["at-limit.txt", "base-only.txt", "intact", "notes.txt"]);
+  assert.deepEqual(readdirSync(sandboxParent), []);
   const tools = new Map(mock.requests[1].payload.messages.filter((entry) => entry.role === "tool")
     .map((entry) => [entry.tool_call_id, entry.content]));
   assert.match(tools.get("status"), /^ M "notes\.txt"$/m);
-  assert.match(tools.get("status"), /\(2 sensitive paths hidden\)/);
-  assert.match(tools.get("status"), /\(4 paths omitted from the working snapshot\)/);
+  assert.match(tools.get("status"), /\(3 sensitive paths hidden\)/);
+  assert.match(tools.get("status"), /\(5 paths omitted from the working snapshot\)/);
   assert.match(tools.get("worktree"), /\+visible worktree change/);
-  assert.match(tools.get("worktree"), /\(4 paths omitted from the working snapshot\)/);
+  assert.match(tools.get("worktree"), /\(5 paths omitted from the working snapshot\)/);
   assert.match(tools.get("list"), /at-limit\.txt/);
+  assert.match(tools.get("grep"), /"notes\.txt":1:visible worktree change/);
+  for (const name of ["list", "grep"]) assert.match(tools.get(name), /\(5 paths omitted from the working snapshot\)/);
+  assert.match(tools.get("gone"), /\(1 paths omitted from the working snapshot\)/);
+  assert.equal(tools.get("intact"), '"intact/visible.txt":1:visible intact fixture');
+  assert.equal(tools.get("deleted"), "disappeared.txt\ngone/only.txt");
+  assert.equal(tools.get("deleted_scoped"), "gone/only.txt");
   assert.match(tools.get("large"), /^error:/);
   for (const name of ["status", "worktree", "list", "indexed"]) {
     assert.doesNotMatch(tools.get(name), /disappeared\.txt|tracked-link\.txt|too-large\.txt/);
   }
-  const actual = delivered(acp.requests()[0]);
+  const [first, followUp] = acp.requests();
+  const actual = delivered(first);
+  const followUpText = followUp.files[0]?.text ?? followUp.prompt;
+  assert.match(followUpText, /^docs\/disappeared\.txt\ndocs\/gone\/only\.txt$/m);
+  assert.doesNotMatch(followUpText, /\.env\.deleted-fixture|too-large\.txt|tracked-link\.txt/);
   assert.equal(actual.materials.get("добавил быстрый агент: status"), tools.get("status"));
-  assert.equal(actual.manifest.supplements.find((item) => item.source === "добавил быстрый агент: diff").included, "partial");
+  for (const [source, included] of [["diff", "partial"], ["list_dir", "partial"], ["grep", "partial"], ["gone", "partial"], ["intact", "full"]]) {
+    assert.equal(actual.manifest.supplements.find((item) => item.source === "добавил быстрый агент: " + source)?.included, included);
+  }
   for (const [source, reason] of [
     ["too-large.txt", "file exceeds working snapshot byte limit"],
     ["disappeared.txt", "path missing from working snapshot"],
@@ -718,6 +765,7 @@ test("live RU/EN task templates pin branch or SHA, pack the complete review and 
         '<tool name="list_dir" path="docs"/>',
         '<tool name="grep" path="docs" pattern="review value"/>',
         '<tool name="git" args="diff --stat"/>',
+        '<tool name="git" args="status"/>',
         '<tool name="git" args="show HEAD:docs/notes.txt"/>',
         '<tool name="read_file" path="docs/symlink.txt"/>',
       ].join("\n") };
@@ -766,6 +814,13 @@ test("live RU/EN task templates pin branch or SHA, pack the complete review and 
     assert.match(results, /docs\/review-only\.txt/);
     assert.match(results, /"docs\/notes.txt":1:review value/);
     assert.match(results, /picture\.bin/);
+    const diffResults = [...results.matchAll(/^=== tool: git ===\n(\{.*\})$/gm)].map(([, json]) => JSON.parse(json));
+    for (const source of ["diff --stat", "status"]) {
+      const result = diffResults.find((entry) => entry.source === `args="${source}"`);
+      assert.equal(result?.partial, true);
+      assert.ok(result.excluded.some((entry) => entry.source === "picture.bin" && entry.reason === "binary, stat only"));
+      assert.ok(result.excluded.some((entry) => entry.source === "Git diff" && entry.reason === "sensitive paths (1)"));
+    }
     assert.match(results, /show HEAD:docs\/notes\.txt/);
     assert.match(results, /request denied or unavailable/);
     assert.doesNotMatch(results, /different HEAD|base-only|ZX12-marker/);

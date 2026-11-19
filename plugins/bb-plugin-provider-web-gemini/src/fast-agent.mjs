@@ -214,7 +214,12 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
             const result = await repository.execute(call);
             local.throwIfAborted();
             if (result.range?.fromLine > result.range?.toLine) throw new Error("line range unavailable");
-            const { output, truncated } = limitResult(mask(result.output), Math.min(remaining, MAX_TOOL_RESULT_BYTES), "\n[truncated]");
+            const excluded = result.excluded?.map(({ source, reason }) => ({ source: mask(source), reason: mask(reason) }));
+            const metadata = excluded ? JSON.stringify({ excluded }) + "\n" : "";
+            const budget = Math.min(remaining, MAX_TOOL_RESULT_BYTES);
+            const outputBudget = budget - bytes(metadata);
+            if (outputBudget < 0) throw new Error("Git diff exclusions exceed the tool byte budget");
+            const { output, truncated } = limitResult(mask(result.output), outputBudget, "\n[truncated]");
             const missing = missingRanges(result.range, truncated);
             if (result.shallow) missing.push(...historyRanges(result.shallow));
             const label = mask(call.args.path ?? call.args.args ?? call.name);
@@ -224,8 +229,9 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
               ...(result.revisionRange ? { revisionRange: result.revisionRange } : {}),
               ...(truncated ? { truncated } : {}),
             };
-            if (output || !truncated) {
-              supplements.push({ source, reason: reasons[call.name], ...extra, partial: Boolean(result.partial || missing.length), text: output });
+            if (output || !truncated || excluded) {
+              supplements.push({ source, reason: reasons[call.name], ...extra, ...(excluded ? { excluded } : {}),
+                partial: Boolean(result.partial || missing.length), text: output });
             }
             if (missing.length) {
               const reason = truncated ? "tool result exceeded its byte budget"
@@ -233,8 +239,9 @@ export async function gatherAgentContext(context, core, { signal, maxExtraBytes,
               omit(source, reason, { ...extra, missingRanges: missing });
             }
             // A UTF-8 character or truncation marker may leave unusable bytes at the boundary.
-            remaining = truncated && remaining <= MAX_TOOL_RESULT_BYTES ? 0 : remaining - bytes(output);
-            reply = { ok: true, content: output };
+            const content = metadata + output;
+            remaining = truncated && remaining <= MAX_TOOL_RESULT_BYTES ? 0 : remaining - bytes(content);
+            reply = { ok: true, content };
           } else {
             reply = { ok: false, content: mask("error: invalid tool arguments") };
           }

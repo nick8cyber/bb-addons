@@ -1937,6 +1937,39 @@ async function getUploadToolsButton(page) {
   );
 }
 
+function attachmentPreviewState({ name, before }) {
+  const composer = document.querySelector('div[contenteditable="true"][role="textbox"]');
+  const scope = composer?.closest('input-container, .input-area, form') || document;
+  const selector = 'uploader-file-preview, file-preview, mat-chip, [data-test-id*="attachment"], [class*="file-preview"]';
+  const visible = [...scope.querySelectorAll(selector)].filter((preview) =>
+    preview.getClientRects().length && !preview.contains(composer));
+  // Count individual chips even if a container also matches the selector.
+  const count = visible.filter((preview) => ![...preview.querySelectorAll(selector)]
+    .some((child) => child.getClientRects().length)).length;
+  if (before === undefined) return count;
+
+  const send = document.querySelector('button[aria-label*="Send message" i], button[aria-label*="Отправить" i], button.send-button');
+  if (count <= before || !send || send.disabled || send.getAttribute('aria-disabled') === 'true') return false;
+
+  const edge = Math.floor(name.length / 4);
+  const middle = name.slice(edge, name.length - edge);
+  const stem = name.replace(/\.[^.]+$/, '');
+  const matches = (label) => {
+    const value = label?.trim();
+    if (value === name) return true;
+    const parts = value?.split(/…|\.{3}/);
+    return parts?.length === 2 && parts[0] && parts[1] && [name, stem].some((candidate) =>
+      candidate.startsWith(parts[0]) && candidate.endsWith(parts[1]) && parts[0].length + parts[1].length < candidate.length);
+  };
+  const named = visible.some((preview) => preview.innerText?.split('\n').some(matches) ||
+    [preview, ...preview.querySelectorAll('[title], [aria-label]')].some((element) => {
+      const aria = element.getAttribute('aria-label');
+      return matches(element.getAttribute('title')) || matches(aria) || aria?.includes(name) ||
+        (middle.length >= 8 && aria?.includes(middle));
+    }));
+  return { named };
+}
+
 async function attachFile(page, filePath, { required = false } = {}) {
   const fs = require('fs');
   const path = require('path');
@@ -1944,6 +1977,7 @@ async function attachFile(page, filePath, { required = false } = {}) {
   if (!fs.existsSync(resolvedPath)) {
     throw new Error(`File to attach not found: ${filePath}`);
   }
+  const before = required ? await safeEval(page, attachmentPreviewState, {}) : null;
 
   const btn = await getUploadToolsButton(page);
   if (!btn) {
@@ -1981,18 +2015,15 @@ async function attachFile(page, filePath, { required = false } = {}) {
   await page.waitForTimeout(1000);
 
   if (required) {
-    await page.waitForFunction((name) => {
-      const composer = document.querySelector('div[contenteditable="true"][role="textbox"]');
-      const scope = composer?.closest('input-container, .input-area, form') || document;
-      const previews = scope.querySelectorAll('file-preview, mat-chip, [data-test-id*="attachment"], [class*="file-preview"]');
-      const uploaded = [...previews].some((preview) => preview.getClientRects().length && (
-        preview.innerText?.split('\n').some((line) => line.trim() === name) ||
-        [...preview.querySelectorAll('[title], [aria-label]'), preview].some((element) =>
-          element.getAttribute('title') === name || element.getAttribute('aria-label') === name)
-      ));
-      const send = document.querySelector('button[aria-label*="Send message" i], button[aria-label*="Отправить" i], button.send-button');
-      return uploaded && send && !send.disabled && send.getAttribute('aria-disabled') !== 'true';
-    }, path.basename(resolvedPath), { timeout: 15000 });
+    const confirmation = await page.waitForFunction(attachmentPreviewState,
+      { name: path.basename(resolvedPath), before }, { timeout: 15000 });
+    try {
+      if (!(await confirmation.jsonValue()).named) {
+        console.warn('[gemini] Attachment preview appeared, but its filename could not be verified.');
+      }
+    } finally {
+      await confirmation.dispose().catch(() => {});
+    }
     return;
   }
 

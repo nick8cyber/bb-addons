@@ -448,7 +448,7 @@ export async function collectTask(context, blocks, materials, options) {
       add(diff.source + " --stat", diff.stat);
       add(diff.source + " -U10", diff.patch);
       for (const entry of diff.excluded) omit(entry.source, entry.reason);
-      if (pin) reviewDiff = Object.freeze({ stat: diff.stat, patch: diff.patch });
+      if (pin) reviewDiff = Object.freeze({ stat: diff.stat, patch: diff.patch, excluded: diff.excluded });
     }
   } else {
     omit("Git status and diff", "working directory is not a Git worktree");
@@ -560,8 +560,11 @@ export async function taskTool(context, collected, call, limit, signal) {
     return base ? { ...result, base } : result;
   }
   try {
-    const { output, range } = await executePinned(call, context.root, context.pin, collected.reviewDiff, context.settings.maxTotalBytes, signal);
-    return { ok: true, range, ...tools.limitResult(mask(output), limit) };
+    const { output, range, partial, excluded } = await executePinned(call, context.root, context.pin, collected.reviewDiff, context.settings.maxTotalBytes, signal);
+    return { ok: true, range, ...tools.limitResult(mask(output), limit),
+      ...(partial ? { partial } : {}),
+      ...(excluded ? { excluded: excluded.map(({ source, reason }) => ({ source: mask(source), reason: mask(reason) })) } : {}),
+    };
   } catch {
     return { ok: false, output: "error: request denied or unavailable in the pinned review tree" };
   }
@@ -586,6 +589,8 @@ export function formatTaskToolResult(context, call, result) {
     truncated: result.truncated ?? null,
     bytes: bytes(result.output),
     sha256: digest(result.output),
+    ...(result.partial ? { partial: true } : {}),
+    ...(result.excluded ? { excluded: result.excluded } : {}),
     ...(result.base ? { fileBase: result.base } : {}),
   };
   return ["=== tool: " + context.settings.mask(call.name) + " ===", JSON.stringify(manifest), result.output].join("\n");
