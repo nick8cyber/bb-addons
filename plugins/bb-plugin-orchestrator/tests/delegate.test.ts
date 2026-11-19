@@ -2574,3 +2574,80 @@ test("§22.1 (ревью): раздача обновляет снимок leaks 
   );
   assert.deepEqual(seen, [{ repo, projectId: "proj_bb" }]);
 });
+
+test("§34.6 (ADR-0037): architect level enforces noCode: true and records no_code: 1", async () => {
+  const policyWithArchitect = JSON.stringify({
+    version: 1,
+    levels: {
+      architect: { role: "architect", chain: ["arch-route"] },
+      simple: { chain: ["simple"] },
+    },
+    routes: {
+      "arch-route": { preset: "simple", provider: "acp-opencode" },
+      simple: { preset: "simple", provider: "acp-opencode" },
+    },
+  });
+  const { deps, store } = makeDeps({
+    policyText: policyWithArchitect,
+  });
+  const res = await runDelegate(
+    { taskKey: "PLUG-1", level: "architect", caller: COORDINATOR, noCode: false },
+    deps,
+  );
+  assert.equal(res.ok, true);
+  const row = store.get(res.delegationId)!;
+  assert.equal(row.no_code, 1);
+});
+
+test("§34.6 (ADR-0037): design_check appends design_check_packet and applies isReview", async () => {
+  const policy = JSON.stringify({
+    version: 1,
+    levels: {
+      architect: { role: "architect", chain: ["r1", "r2"] },
+    },
+    routes: {
+      r1: { preset: "simple", provider: "p1", model: "m1" },
+      r2: { preset: "simple", provider: "p2", model: "m2" },
+    },
+  });
+  const { deps, store, spawnArgs } = makeDeps({
+    policyText: policy,
+  });
+  store.insertTask({
+    taskKey: "ARCH-1",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "architect",
+  });
+  store.transitionTask({
+    taskKey: "ARCH-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "design_check",
+    toStatus: "running",
+    actor: "coordinator",
+    reason: "testing design_check",
+    updates: {
+      payload: JSON.stringify({
+        last_executor_route: "r1",
+        last_executor_provider: "p1",
+        last_executor_model: "m1",
+        design_check_packet: "### PACKET CONTENT ###",
+      }),
+    },
+  });
+
+  const res = await runDelegate(
+    { taskKey: "ARCH-1", level: "architect", caller: COORDINATOR, instructions: "Original instructions" },
+    deps,
+  );
+  assert.equal(res.ok, true);
+  // Reviewer ≠ executor -> r2 picked instead of r1
+  assert.equal(res.route, "r2");
+  const row = store.get(res.delegationId)!;
+  assert.equal(row.no_code, 1);
+  const prompt = spawnArgs[0]?.prompt as string;
+  assert.ok(prompt?.includes("### PACKET CONTENT ###"));
+  assert.ok(prompt?.includes("Original instructions"));
+});

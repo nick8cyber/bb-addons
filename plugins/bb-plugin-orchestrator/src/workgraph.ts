@@ -737,7 +737,7 @@ export async function runEnqueue(
     runTddCheck?: (
       task: TaskQueueRow,
       acceptanceSha: string | null,
-    ) => Promise<{ ok: boolean; failedAsExpected: boolean; output?: string }>;
+    ) => Promise<{ ok: boolean; failedAsExpected: boolean; notRun?: boolean; output?: string }>;
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow; reissued?: boolean }> {
   if (deps.workGraphMode === "off") {
@@ -968,61 +968,72 @@ export async function runEnqueue(
         }
 
         // §34.5 (ADR-0037): TDD fail-first verification on owner_gate upon enqueue --acceptance
-        const tdd = deps.runTddCheck
-          ? await deps.runTddCheck(existing, accSha)
-          : await runTddFailFirstVerification(
-              { cmd: deps.cmd, repoRoot },
-              { ...existing, acceptance_sha: accSha, payload: JSON.stringify(existingPayload) },
-              accSha,
-              DEFAULT_ALLOWED_RUNNERS,
-              deps.policy?.checks,
-            );
-
-        if (!tdd.failedAsExpected) {
-          const vacuousTr = resolveTransition({
-            route: existing.route,
-            node: "owner_gate",
-            status: existing.status,
-            event: {
-              type: "acceptance_vacuous",
-              reason:
-                "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
-            },
-            mode: existing.confirmation_mode,
-            counters: extractCounters(existing),
-          });
-          if (vacuousTr.allowed) {
-            const updates: Partial<TaskQueueRow> = {
-              acceptance_sha: accSha,
-              payload: JSON.stringify({
-                ...existingPayload,
-                ...(vacuousTr.action?.setPayload ?? {}),
-              }),
-            };
-            if (vacuousTr.counterUpdates) {
-              Object.assign(updates, vacuousTr.counterUpdates);
-            }
-            const res = deps.store.transitionTask(
-              {
-                taskKey,
-                expectedNode: "owner_gate",
-                expectedStatus: existing.status,
-                toNode: vacuousTr.toNode,
-                toStatus: vacuousTr.toStatus,
-                actor: "machine:checks",
-                reason: vacuousTr.reason,
-                updates,
-                now,
-              },
-              now,
-            );
-            if (!res.ok) {
-              throw new OrchestratorError(
-                "transition-failed",
-                "не удалось обновить договор приёмки",
+        if (accSha) {
+          const tdd = deps.runTddCheck
+            ? await deps.runTddCheck(existing, accSha)
+            : await runTddFailFirstVerification(
+                { cmd: deps.cmd, repoRoot },
+                { ...existing, acceptance_sha: accSha, payload: JSON.stringify(existingPayload) },
+                accSha,
+                DEFAULT_ALLOWED_RUNNERS,
+                deps.policy?.checks,
               );
+
+          if (tdd.notRun) {
+            throw new OrchestratorError(
+              "tdd-check-not-run",
+              `проверка договора не смогла запуститься: ${tdd.output}`,
+            );
+          }
+
+          if (!tdd.failedAsExpected) {
+            const vacuousTr = resolveTransition({
+              route: existing.route,
+              node: "owner_gate",
+              status: existing.status,
+              event: {
+                type: "acceptance_vacuous",
+                reason:
+                  "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+              },
+              mode: existing.confirmation_mode,
+              counters: extractCounters(existing),
+            });
+            if (vacuousTr.allowed) {
+              delete (existingPayload as any).queued_stalled;
+              delete (existingPayload as any).queued_stalled_alarm_at;
+              const updates: Partial<TaskQueueRow> = {
+                acceptance_sha: accSha,
+                payload: JSON.stringify({
+                  ...existingPayload,
+                  ...(vacuousTr.action?.setPayload ?? {}),
+                }),
+              };
+              if (vacuousTr.counterUpdates) {
+                Object.assign(updates, vacuousTr.counterUpdates);
+              }
+              const res = deps.store.transitionTask(
+                {
+                  taskKey,
+                  expectedNode: "owner_gate",
+                  expectedStatus: existing.status,
+                  toNode: vacuousTr.toNode,
+                  toStatus: vacuousTr.toStatus,
+                  actor: "machine:checks",
+                  reason: vacuousTr.reason,
+                  updates,
+                  now,
+                },
+                now,
+              );
+              if (!res.ok) {
+                throw new OrchestratorError(
+                  "transition-failed",
+                  "не удалось обновить договор приёмки",
+                );
+              }
+              return { ok: true, task: res.task! };
             }
-            return { ok: true, task: res.task! };
           }
         }
 
@@ -2110,11 +2121,11 @@ export function buildChecksEnvironment(
   allowedEnvVars: readonly string[] = DEFAULT_ALLOWED_ENV_VARS,
   sourceEnv: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  for (const k of extraEnvVars) {
+  for (const k of [...allowedEnvVars, ...extraEnvVars]) {
     if (FORBIDDEN_EXTRA_ENV_PATTERN.test(k)) {
       throw new OrchestratorError(
         "checks-invalid-env",
-        `checks.extraEnvVars: forbidden variable name containing secret keyword: "${k}"`,
+        `checks environment variable contains forbidden secret keyword: "${k}"`,
       );
     }
   }
@@ -2217,13 +2228,74 @@ export async function executeChecks(
   return { ok: true, exitCode: 0, output: "checks passed" };
 }
 
+export function extractAcceptanceCommands(
+  markdownText: string,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+): string[] {
+  const commands: string[] = [];
+  const lines = markdownText.split("\n");
+  let inCodeBlock = false;
+  let codeBlockLang = "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      if (inCodeBlock) {
+        inCodeBlock = false;
+        codeBlockLang = "";
+      } else {
+        inCodeBlock = true;
+        codeBlockLang = trimmed.slice(3).trim().toLowerCase();
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      if (
+        codeBlockLang === "bash" ||
+        codeBlockLang === "sh" ||
+        codeBlockLang === "shell" ||
+        codeBlockLang === ""
+      ) {
+        if (trimmed && !trimmed.startsWith("#")) {
+          const val = validateCheckCommand(trimmed, allowedRunners);
+          if (val.valid && !commands.includes(trimmed)) {
+            commands.push(trimmed);
+          }
+        }
+      }
+      continue;
+    }
+
+    const backtickMatches = line.matchAll(/`([^`]+)`/g);
+    for (const match of backtickMatches) {
+      const candidate = match[1].trim();
+      const val = validateCheckCommand(candidate, allowedRunners);
+      if (val.valid && !commands.includes(candidate)) {
+        commands.push(candidate);
+      }
+    }
+  }
+
+  return commands;
+}
+
 export async function runTddFailFirstVerification(
   deps: { cmd?: CmdRunner; repoRoot?: string },
   task: TaskQueueRow,
   acceptanceSha: string | null,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
   checksConfig?: PolicyChecksConfig,
-): Promise<{ ok: boolean; failedAsExpected: boolean; output?: string }> {
+): Promise<{ ok: boolean; failedAsExpected: boolean; notRun?: boolean; output?: string }> {
+  // §34.5 / Reviewer Б2: without acceptance_sha, no verification
+  if (!acceptanceSha) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      output: "tdd check skipped: no acceptance sha",
+    };
+  }
+
   let payloadObj: Record<string, unknown> = {};
   if (task.payload) {
     try {
@@ -2253,99 +2325,132 @@ export async function runTddFailFirstVerification(
     };
   }
 
-  const commands =
+  let commands: string[] | undefined =
+    (Array.isArray(payloadObj.tdd_commands)
+      ? (payloadObj.tdd_commands as string[])
+      : undefined) ??
     (Array.isArray(payloadObj.checks_commands)
       ? (payloadObj.checks_commands as string[])
       : undefined) ??
     (typeof payloadObj.test_command === "string"
       ? [payloadObj.test_command]
-      : undefined) ??
-    checksConfig?.commands;
+      : undefined);
 
-  if (
-    !payloadObj.tdd_verify &&
-    (!commands || commands.length === 0)
-  ) {
+  if (!commands && deps.cmd && deps.repoRoot) {
+    try {
+      const normKey = normalizeTaskKey(task.task_key).toUpperCase();
+      const showRes = await deps.cmd.run("git", [
+        "-C",
+        deps.repoRoot,
+        "show",
+        `${acceptanceSha}:docs/specs/acceptance/${normKey}.md`,
+      ]);
+      if (showRes.exitCode === 0 && showRes.stdout) {
+        const extracted = extractAcceptanceCommands(showRes.stdout, allowedRunners);
+        if (extracted.length > 0) {
+          commands = extracted;
+        }
+      }
+    } catch {}
+  }
+
+  // §34.5 / Reviewer Б1: if contract has no executable test items, skip check.
+  // Never run entire project checksConfig.commands on base code!
+  if (!commands || commands.length === 0) {
     return {
       ok: true,
       failedAsExpected: true,
-      output: "tdd check skipped: no explicit test commands configured",
+      output: "tdd check skipped: no executable test items found in acceptance contract",
+    };
+  }
+
+  if (!deps.cmd || !deps.repoRoot) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      output: "tdd check skipped: no cmd runner",
     };
   }
 
   // §34.5 (ADR-0037): Run checks in an isolated worktree at acceptanceSha
-  if (deps.cmd && deps.repoRoot && acceptanceSha) {
-    let tmpDir: string | null = null;
-    try {
-      tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), `bb-tdd-${task.task_key}-`),
-      );
-      const addRes = await deps.cmd.run("git", [
-        "-C",
-        deps.repoRoot,
-        "worktree",
-        "add",
-        "--detach",
-        tmpDir,
-        acceptanceSha,
-      ]);
-      if (addRes.exitCode === 0) {
-        const checkRes = await executeChecks(
-          { cmd: deps.cmd, repoRoot: tmpDir },
-          task,
-          allowedRunners,
-          checksConfig,
-        );
-        if (checkRes.ok && !checkRes.notRun && checkRes.exitCode === 0) {
-          return {
-            ok: true,
-            failedAsExpected: false,
-            output:
-              "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
-          };
-        }
-        return {
-          ok: true,
-          failedAsExpected: true,
-          output: `tdd fail-first verified: tests failed on base commit as expected (exitCode: ${checkRes.exitCode})`,
-        };
-      }
-    } catch {
-      // Fallback below
-    } finally {
-      if (tmpDir) {
-        try {
-          await deps.cmd.run("git", [
-            "-C",
-            deps.repoRoot,
-            "worktree",
-            "remove",
-            "--force",
-            tmpDir,
-          ]);
-        } catch {}
-        try {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {}
-      }
+  let tmpDir: string | null = null;
+  try {
+    tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), `bb-tdd-${task.task_key}-`),
+    );
+    const addRes = await deps.cmd.run("git", [
+      "-C",
+      deps.repoRoot,
+      "worktree",
+      "add",
+      "--detach",
+      tmpDir,
+      acceptanceSha,
+    ]);
+    if (addRes.exitCode !== 0) {
+      return {
+        ok: false,
+        failedAsExpected: false,
+        notRun: true,
+        output: `git worktree add failed: ${addRes.stderr}`,
+      };
     }
-  }
 
-  // Fallback (e.g. mock test environment)
-  const checkRes = await executeChecks(deps, task, allowedRunners, checksConfig);
-  if (checkRes.ok && !checkRes.notRun && checkRes.exitCode === 0) {
+    const nmRepo = path.join(deps.repoRoot, "node_modules");
+    const nmTmp = path.join(tmpDir, "node_modules");
+    if (fs.existsSync(nmRepo) && !fs.existsSync(nmTmp)) {
+      try {
+        fs.symlinkSync(nmRepo, nmTmp, "junction");
+      } catch {}
+    }
+
+    const checkRes = await executeChecks(
+      { cmd: deps.cmd, repoRoot: tmpDir },
+      task,
+      allowedRunners,
+      {
+        ...checksConfig,
+        commands,
+      },
+    );
+    if (checkRes.notRun) {
+      return {
+        ok: false,
+        failedAsExpected: false,
+        notRun: true,
+        output: `tdd check not run: ${checkRes.output}`,
+      };
+    }
+    if (checkRes.ok && checkRes.exitCode === 0) {
+      return {
+        ok: true,
+        failedAsExpected: false,
+        output:
+          "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+      };
+    }
     return {
       ok: true,
-      failedAsExpected: false,
-      output:
-        "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+      failedAsExpected: true,
+      output: `tdd fail-first verified: tests failed on base commit as expected (exitCode: ${checkRes.exitCode})`,
     };
+  } finally {
+    if (tmpDir) {
+      try {
+        await deps.cmd.run("git", [
+          "-C",
+          deps.repoRoot,
+          "worktree",
+          "remove",
+          "--force",
+          tmpDir,
+        ]);
+      } catch {}
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    }
   }
-  return {
-    ok: true,
-    failedAsExpected: true,
-    output: "tdd fail-first verified: tests failed on base commit as expected",
-  };
 }
 
 export function formatDesignCheckPacket(params: {
@@ -2563,7 +2668,8 @@ export interface RunQueueDeps {
   runTddCheck?: (
     task: TaskQueueRow,
     acceptanceSha: string | null,
-  ) => Promise<{ ok: boolean; failedAsExpected: boolean; output?: string }>;
+  ) => Promise<{ ok: boolean; failedAsExpected: boolean; notRun?: boolean; output?: string }>;
+  log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
   requestOwnerGateInteraction?: (
     task: TaskQueueRow,
     gateStage: "pre_code" | "pre_release",
@@ -3159,7 +3265,7 @@ async function startQueuedTask(
   }
 
   // §34.5 (ADR-0037): TDD Fail-First Verification for fix/simple routes (both auto and manual)
-  if (task.route === "fix" || task.route === "simple") {
+  if ((task.route === "fix" || task.route === "simple") && acceptanceSha) {
     const tdd = deps.runTddCheck
       ? await deps.runTddCheck(task, acceptanceSha)
       : await runTddFailFirstVerification(
@@ -3169,6 +3275,38 @@ async function startQueuedTask(
           DEFAULT_ALLOWED_RUNNERS,
           deps.policy?.checks,
         );
+    if (tdd.notRun) {
+      deps.log?.warn?.(
+        `[orchestrator] tdd fail-first check not run for ${task.task_key}: ${tdd.output}`,
+      );
+      const failTr = resolveTransition({
+        route: task.route,
+        node: "start",
+        status: "queued",
+        event: {
+          type: "git_failure",
+          reason: `tdd-check-not-run: ${tdd.output}`,
+        },
+        mode: task.confirmation_mode,
+        counters: extractCounters(task),
+      });
+      if (failTr.allowed) {
+        deps.store.transitionTask(
+          {
+            taskKey: task.task_key,
+            expectedNode: "start",
+            expectedStatus: "queued",
+            toNode: failTr.toNode,
+            toStatus: failTr.toStatus,
+            actor: "machine:checks",
+            reason: failTr.reason,
+            now,
+          },
+          now,
+        );
+      }
+      return false;
+    }
     if (!tdd.failedAsExpected) {
       const vacuousTr = resolveTransition({
         route: task.route,
@@ -3183,6 +3321,8 @@ async function startQueuedTask(
         counters: extractCounters(task),
       });
       if (vacuousTr.allowed) {
+        delete (payload as any).queued_stalled;
+        delete (payload as any).queued_stalled_alarm_at;
         const updates: Partial<TaskQueueRow> = {
           branch,
           acceptance_sha: acceptanceSha,
@@ -4352,7 +4492,7 @@ async function advanceActiveTask(
         }
 
         // §34.5 (ADR-0037): TDD Fail-First Verification for feature route
-        if (verdict === "OK") {
+        if (verdict === "OK" && task.acceptance_sha) {
           const tdd = deps.runTddCheck
             ? await deps.runTddCheck(task, task.acceptance_sha)
             : await runTddFailFirstVerification(
@@ -4362,6 +4502,39 @@ async function advanceActiveTask(
                 DEFAULT_ALLOWED_RUNNERS,
                 deps.policy?.checks,
               );
+          if (tdd.notRun) {
+            deps.log?.warn?.(
+              `[orchestrator] tdd fail-first check not run for ${task.task_key}: ${tdd.output}`,
+            );
+            const failTr = resolveTransition({
+              route: task.route,
+              node: "spec_review",
+              status: "running",
+              event: {
+                type: "spec_review_failed",
+                exhausted: true,
+                reason: `tdd-check-not-run: ${tdd.output}`,
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
+            if (failTr.allowed) {
+              deps.store.transitionTask(
+                {
+                  taskKey: task.task_key,
+                  expectedNode: "spec_review",
+                  expectedStatus: "running",
+                  toNode: failTr.toNode,
+                  toStatus: failTr.toStatus,
+                  actor: "machine:checks",
+                  reason: failTr.reason,
+                  now,
+                },
+                now,
+              );
+              return false;
+            }
+          }
           if (!tdd.failedAsExpected) {
             const vacuousTr = resolveTransition({
               route: task.route,

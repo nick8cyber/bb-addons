@@ -654,7 +654,14 @@ export function parsePolicy(
           Array.isArray(raw.checks.allowedEnvVars) &&
           raw.checks.allowedEnvVars.every((s: unknown) => typeof s === "string")
         ) {
-          checks.allowedEnvVars = raw.checks.allowedEnvVars;
+          const bad = (raw.checks.allowedEnvVars as string[]).find((s) =>
+            /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(s),
+          );
+          if (bad) {
+            warn("checks.allowedEnvVars", `allowedEnvVars contains forbidden secret keyword: "${bad}"`);
+          } else {
+            checks.allowedEnvVars = raw.checks.allowedEnvVars;
+          }
         } else {
           warn("checks.allowedEnvVars", "allowedEnvVars must be an array of strings");
         }
@@ -664,7 +671,14 @@ export function parsePolicy(
           Array.isArray(raw.checks.extraEnvVars) &&
           raw.checks.extraEnvVars.every((s: unknown) => typeof s === "string")
         ) {
-          checks.extraEnvVars = raw.checks.extraEnvVars;
+          const bad = (raw.checks.extraEnvVars as string[]).find((s) =>
+            /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(s),
+          );
+          if (bad) {
+            warn("checks.extraEnvVars", `extraEnvVars contains forbidden secret keyword: "${bad}"`);
+          } else {
+            checks.extraEnvVars = raw.checks.extraEnvVars;
+          }
         } else {
           warn("checks.extraEnvVars", "extraEnvVars must be an array of strings");
         }

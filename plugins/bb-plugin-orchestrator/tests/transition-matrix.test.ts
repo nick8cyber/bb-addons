@@ -1285,6 +1285,25 @@ test("Row 81 & 82: acceptance_vacuous -> design / owner_gate", () => {
     vacuous_contract: true,
   });
 
+  // Row 82 from owner_gate node with deferred status
+  const res82def = resolveTransition({
+    route: "fix",
+    node: "owner_gate",
+    status: "deferred",
+    event: { type: "acceptance_vacuous" },
+    mode: "manual",
+    counters: defaultCounters(),
+  });
+  assert.equal(res82def.allowed, true);
+  assert.equal(res82def.toNode, "owner_gate");
+  assert.equal(res82def.toStatus, "waiting_approval");
+  assert.equal(res82def.ruleId, "rule-82-acceptance-vacuous-fix-simple");
+  assert.equal(res82def.counterUpdates?.check_attempts, 1);
+  assert.deepEqual(res82def.action?.setPayload, {
+    gate_stage: "pre_code",
+    vacuous_contract: true,
+  });
+
   // Row 82 from start node with running status
   const res82running = resolveTransition({
     route: "simple",

@@ -651,11 +651,11 @@ export async function runDelegate(
       )) ?? null);
 
   // §34.6 (ADR-0037): Read-only environment on design and design_check for architect
-  const effectiveNoCode =
-    params.noCode ??
-    (role === "architect" ||
-      taskRow?.node === "design" ||
-      taskRow?.node === "design_check");
+  const isArchitectNode =
+    role === "architect" ||
+    taskRow?.node === "design" ||
+    taskRow?.node === "design_check";
+  const effectiveNoCode = isArchitectNode ? true : (params.noCode ?? false);
 
   // Step 2 — the unique index makes this atomic across processes.
   let row;

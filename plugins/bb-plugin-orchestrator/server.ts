@@ -3414,7 +3414,7 @@ export async function createPlugin(
             instructions: flag("--instructions"),
             from: flag("--from"),
             fresh: argv.includes("--fresh"),
-            noCode: argv.includes("--no-code"),
+            noCode: argv.includes("--no-code") ? true : undefined,
             ...(attach.length ? { attach } : {}),
             threadId: ctx.threadId,
           });

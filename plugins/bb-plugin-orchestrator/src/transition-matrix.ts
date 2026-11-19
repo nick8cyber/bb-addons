@@ -2933,7 +2933,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
     rowNumber: 82,
     route: ["fix", "simple"],
     node: ["start", "owner_gate"],
-    status: ["queued", "running", "waiting_approval"],
+    status: ["queued", "running", "waiting_approval", "deferred"],
     eventType: "acceptance_vacuous",
     description: "договор приёмки на fix/simple уже полностью зелёный -> owner_gate waiting_approval / blocked при >=3",
     resolve(input) {
