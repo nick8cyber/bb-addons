@@ -8,14 +8,16 @@
 import { createInterface } from "node:readline";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import * as webTools from "./src/web-tools.mjs";
-import { checkedAnswer, collectTask, collectTaskAttachments, formatTaskToolResult, loadSettings, packTask, prepareTask, taskThread, taskTool, verdictInstruction } from "./src/inner-context.mjs";
+import { checkedAnswer, collectTask, collectTaskAttachments, formatTaskToolResult, loadSettings, packTask, prepareTask, taskInstruction, taskThread, taskTool } from "./src/inner-context.mjs";
 import { collectDiff } from "./src/review-git.mjs";
 import * as journal from "./src/turn-journal.mjs";
+import fileEnvelope from "./src/file-envelope.cjs";
+import { resultPaths, WorktreeWriter } from "./src/worktree-writer.mjs";
 import {
   existsSync,
   mkdirSync,
@@ -42,6 +44,9 @@ const FAKE = process.env.WEB_GEMINI_FAKE === "1" || process.env.ARGON_FAKE === "
 const BB_THREAD_ARG = process.argv.find((arg) => arg.startsWith("--bb-thread-id="));
 const BB_THREAD_ID = BB_THREAD_ARG?.slice("--bb-thread-id=".length);
 const SESSION_ACCESS = process.argv.find((arg) => arg.startsWith("--session-access="))?.split("=")[1];
+const WRITE_LAUNCH = SESSION_ACCESS === "write" && Boolean(BB_THREAD_ID);
+const FILE_CAPTURE_MARKER_BYTES = 64;
+const WRITE_REFUSED = "full grants read-only access; use accept-edits and a dedicated managed BB worktree for file output";
 const HEADLESS = process.env.WEB_GEMINI_HEADLESS || process.env.ARGON_HEADLESS || process.env.GEMINI_HEADLESS || null;
 
 function resolveDefaultStateDir() {
@@ -1078,10 +1083,20 @@ export function configOptionsFor(s, backends = BACKENDS, state = null) {
   return opts;
 }
 
-const modes = {
-  availableModes: [{ id: "read-only", name: "Read only" }],
-  currentModeId: "read-only",
-};
+function canWrite(session) {
+  const owner = session.thread?.thread;
+  const worktree = session.thread?.environment;
+  if (!WRITE_LAUNCH || owner?.id !== BB_THREAD_ID || worktree?.managed !== true ||
+      worktree.isWorktree !== true || worktree.isGitRepo !== true || !worktree.branchName ||
+      (owner.environmentId && worktree.id !== owner.environmentId) ||
+      (worktree.projectId && worktree.projectId !== owner.projectId) || !isAbsolute(session.cwd ?? "")) return false;
+  try { return realpathSync(session.cwd) === realpathSync(worktree.path); }
+  catch { return false; }
+}
+
+function sessionMode(session) {
+  return canWrite(session) && (session.mode ?? "write") === "write" ? "write" : "read-only";
+}
 
 /* ---------- global prompt queue ---------- */
 let queue = Promise.resolve();
@@ -1365,6 +1380,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   const maxContextBytes = budgets?.maxTotalBytes ?? context?.settings.maxTotalBytes;
   const maxToolRounds = budgets?.maxToolRounds ?? webTools.MAX_TOOL_ROUNDS;
   const maxRepairRounds = budgets?.maxRepairRounds ?? context?.settings.maxRepairRounds;
+  const write = context?.write;
+  const writer = context?.writer;
 
   const persistJournal = (write = () => journal.saveTurn(STATE_DIR, tj.sessKey, tj.turn)) => {
     try {
@@ -1480,7 +1497,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       // треды, задачи). У существующего разговора (s.convId) текст идёт как есть.
       let collected;
       let packed;
-      let messageLimit = webTools.effectiveMessageBytes();
+      let messageLimit = webTools.effectiveMessageBytes() - (write ? FILE_CAPTURE_MARKER_BYTES : 0);
       let packageOptions;
 
       // §7.3: состояние продолжения хода. resumedConv — ход продолжается в
@@ -1648,7 +1665,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             let filesPending = task ? (resumedConv ? null : [...packed.files]) : uploadFiles.length ? uploadFiles.slice() : null;
             let delivered = resumedConv;
             const toolLimit = Math.min(webTools.MAX_TOOL_RESULT_BYTES, webTools.effectiveMessageBytes());
-            const contract = task ? verdictInstruction(context) : "";
+            const contract = task ? taskInstruction(context) : "";
             // §3 Tool Loop: все раунды — в том же convId на том же бэкенде,
             // лиз удерживается до конца хода.
             const sendOnce = async (message, canRepack = true) => {
@@ -1681,6 +1698,17 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               // упакованное сообщение, блоки результатов инструментов,
               // принудительный финал) проверяется до отправки — это ошибка
               // вызывающего, драйвер повторяет проверку последним рубежом.
+              let fileCapture;
+              if (write) {
+                const marker = "BBG_DELIVERY_" + randomBytes(16).toString("hex");
+                const prefix = marker + "\n\n";
+                if (outboundBytes + Buffer.byteLength(prefix) > maxContextBytes - budgets.contextBytes) {
+                  throw new TaskTurnError("outgoing file response instructions exceed the context budget");
+                }
+                outboundBytes += Buffer.byteLength(prefix);
+                message = prefix + message;
+                fileCapture = { nonce: write.nonce, marker };
+              }
               const tooLargeMsg = promptTooLargeError(message);
               if (tooLargeMsg) throw tooLargeMsg;
               if (task) {
@@ -1723,6 +1751,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 // §7.3: проверяемое восстановление — драйвер подтверждает,
                 // что страница осталась тем же разговором.
                 verifyConversation: convVerify,
+                ...(fileCapture ? { fileCapture } : {}),
                 onChunk: task ? null : (c) => {
                   if (c && !s.cancelled && s.activeGen === gen) {
                     streamedAny = true;
@@ -1753,10 +1782,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   budgets.contextBytes -= outboundBytes;
                   persistJournal();
                 }
+                const smallerLimit = error?.maxPromptBytes - (write ? FILE_CAPTURE_MARKER_BYTES : 0);
                 if (!task || !canRepack || error.code !== "WEB_GEMINI_PROMPT_TOO_LARGE" ||
-                    !Number.isSafeInteger(error.maxPromptBytes) || error.maxPromptBytes <= 0 ||
-                    error.maxPromptBytes >= messageLimit) throw error;
-                messageLimit = error.maxPromptBytes;
+                    !Number.isSafeInteger(smallerLimit) || smallerLimit <= 0 ||
+                    smallerLimit >= messageLimit) throw error;
+                messageLimit = smallerLimit;
                 if (!delivered) {
                   try {
                     if (task.resume) {
@@ -1787,7 +1817,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               }
               if (tj && res) {
                 const reply = res.rawText?.trim() ? res.rawText : res.text;
-                if (reply) recordExchange({ kind: "reply", text: context.settings.mask(reply) });
+                if (reply && (!write || fileEnvelope.isFileToolReply(reply))) {
+                  recordExchange({ kind: "reply", text: context.settings.mask(reply) });
+                }
                 tj.turn.delivered = true;
                 if (res.convId) {
                   tj.turn.convId = res.convId;
@@ -1802,7 +1834,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             };
             let toolSeq = 0;
             const loop = await webTools.runToolLoop({
-              firstMessage: task ? (resumedConv ? task.resume.instruction : packed.message) : s.convId ? text : packed.message,
+              firstMessage: task ? (resumedConv ? [task.resume.instruction, write ? contract : ""].filter(Boolean).join("\n\n") : packed.message)
+                : s.convId ? text : packed.message,
               send: sendOnce,
               execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
               onToolRound: task ? (_round, forcedFinal) => {
@@ -1819,6 +1852,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   return formatted;
                 },
               } : {}),
+              ...(write ? { toolText: (text) => fileEnvelope.isFileToolReply(text) ? text : "" } : {}),
               onToolStart: (call) => {
                 const toolCallId = task ? "gemini-read-" + randomUUID() : "argtool-" + (++toolSeq);
                 upd({
@@ -1856,13 +1890,36 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               let candidate = loop.lastRes;
               for (;;) {
                 task.ping("verify");
-                const final = checkedAnswer(context, candidate);
+                let final;
+                if (write) {
+                  const capture = candidate?.fileResponse;
+                  const checked = fileEnvelope.verifyFileResponse(capture, write.nonce);
+                  if (checked.plan) {
+                    try {
+                      const { files, commitMessage } = checked.plan;
+                      if ([commitMessage, ...files.flatMap(({ path, content }) => [path, content ?? ""])]
+                        .some((value) => context.settings.maskResponse(value) !== value)) {
+                        throw new Error("file response contains material prohibited for publication");
+                      }
+                      await writer.plan(context.writeHead, checked.plan, write.allowedPaths, new Map(write.bases));
+                    } catch (error) {
+                      checked.repair = error.code ? "file plan could not be verified" : context.settings.mask(error.message);
+                    }
+                    if (!checked.repair) {
+                      task.signal.throwIfAborted();
+                      persistJournal(() => journal.stageFileResponse(STATE_DIR, tj.sessKey, tj.turn, capture, checked.plan));
+                      return { envelope: checked.plan };
+                    }
+                  }
+                  final = { repair: checked.repair ?? checked.recapture, plan: checked.plan };
+                } else final = checkedAnswer(context, candidate);
                 if (final.text !== undefined) return { text: final.text };
                 if (final.denied) throw new TaskTurnError(final.denied);
                 if ((budgets.repairRounds ?? 0) >= maxRepairRounds) throw new TaskTurnError(final.repair);
                 task.ping("request_more");
-                const repairMessage = "Correct the previous reply. " + final.repair +
-                  ". Return the complete publishable final answer without tool calls or file envelopes.\n" + contract;
+                const repairMessage = "Correct the previous reply. " + final.repair + ". " +
+                  (write ? fileRepairInstruction(context, candidate, final.plan)
+                    : "Return the complete publishable final answer without tool calls or file envelopes.\n") + contract;
                 budgets.repairRounds = (budgets.repairRounds ?? 0) + 1;
                 persistJournal();
                 recordExchange({ kind: "repair", text: repairMessage });
@@ -1997,7 +2054,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       }
       throw lastErr;
     });
-    const result = task
+    let result = task
       ? await Promise.race([queued, task.aborted.then((value) => inQueue ? value : queued)])
       : await queued;
 
@@ -2007,6 +2064,31 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         if (task.signal.reason === "deadline exceeded") throw new TaskTurnError("deadline exceeded");
         if (isCancelled || task.signal.aborted) await task.finish("failed", "cancelled");
         else {
+          if (result.envelope) {
+            try {
+              task.applying = writer.apply({
+                head: context.writeHead, envelope: result.envelope, allowedPaths: write.allowedPaths,
+                issuedBases: new Map(write.bases), owner: { sessKey: tj.sessKey, turnNo: tj.turn.turnNo },
+                signal: task.signal, progress: (stage) => task.ping(stage),
+                checkpoint: (owner, receipt) => {
+                  journal.checkpointWrite(STATE_DIR, owner, receipt);
+                  if (receipt) tj.turn.commit = receipt;
+                  else delete tj.turn.commit;
+                },
+              });
+              const sha = await task.applying;
+              result = { text: writeResult(context.writeHead.branch, sha) };
+            } catch (error) {
+              if (task.signal.reason === "cancelled" && !error.message?.startsWith("recovery_required:")) {
+                await task.finish("failed", "cancelled");
+                out({ jsonrpc: "2.0", id, result: { stopReason: "cancelled" } });
+                return;
+              }
+              throw new TaskTurnError(context.settings.mask(error.code ? "file transaction failed" : error.message ?? String(error)));
+            } finally {
+              task.applying = null;
+            }
+          }
           await task.finish("passed", "", result.text);
           upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: result.text } });
         }
@@ -2015,7 +2097,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         jsonrpc: "2.0",
         id,
         result: {
-          stopReason: isCancelled || task?.signal.aborted ? "cancelled" : "end_turn",
+          stopReason: isCancelled || (task?.signal.aborted && !tj?.turn.commit) ? "cancelled" : "end_turn",
           ...(turnFiles.length
             ? {
                 attachments: turnFiles.map((f) => ({
@@ -2035,8 +2117,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
     if (!isExiting) {
       // PLUG-281: caller-side refusal — report verbatim, no driver framing.
       if (task) {
-        const reason = task.signal.reason === "deadline exceeded" ? "deadline exceeded" :
+        const reason = task.signal.reason === "deadline exceeded" && !err.message?.startsWith("recovery_required:") ? "deadline exceeded" :
           err instanceof TaskTurnError ? err.message : "web model request failed at " + task.stage;
+        if (tj && reason.startsWith("recovery_required:")) tj.turn.recoveryRequired = true;
         await task.finish("failed", reason);
         turnError(id, "failed", reason, task.stage);
       } else if (err && (err.code === "WEB_GEMINI_PROMPT_TOO_LARGE" || err.code === "ARGON_PROMPT_TOO_LARGE")) {
@@ -2059,12 +2142,15 @@ async function cleanShutdown() {
   isExiting = true;
   clearInterval(ppidWatch);
   try {
+    const tasks = [...new Set([...sessions.values()].map((session) => session.activeTask).filter(Boolean))];
+    for (const task of tasks) task.stop("cancelled");
     if (activeAbort) {
       activeAbort.abort();
     }
-    if (activeAttempt) {
+    const pending = [activeAttempt, ...tasks.map((task) => task.applying)].filter(Boolean);
+    if (pending.length) {
       await Promise.race([
-        activeAttempt.catch(() => {}),
+        Promise.allSettled(pending),
         sleep(12_000),
       ]);
     }
@@ -2094,7 +2180,13 @@ async function sendSession(id, sessionId, session) {
         currentModelId: session.model,
       },
       configOptions: configOptionsFor(session, BACKENDS, loadState()),
-      modes,
+      modes: {
+        availableModes: [
+          { id: "read-only", name: "Read only" },
+          ...(canWrite(session) ? [{ id: "write", name: "Write files and commit" }] : []),
+        ],
+        currentModeId: sessionMode(session),
+      },
     },
   });
 }
@@ -2129,7 +2221,15 @@ function taskAttachmentOptions(session, task) {
 // Запись сессии просрочена по state.retentionMs её проекта (§9): продолжать
 // по ней нельзя — молчаливая выдача новой пустой сессии запрещена.
 function sessionRecordExpired(record) {
-  return Date.now() - (record?.updatedAt || 0) > loadSettingsRetention(record?.projectId);
+  return Date.now() - (record?.updatedAt || 0) > loadSettingsRetention(record?.projectId) &&
+    !journal.unfinishedTurns(STATE_DIR, journal.sessionKey(record.sessionId)).some((turn) => turn.record?.write);
+}
+
+function taskSessionsForWorktree(fingerprint) {
+  if (!fingerprint) return [];
+  return journal.listSessionRecords(STATE_DIR).filter((entry) =>
+    entry.record?.version === journal.JOURNAL_VERSION &&
+    entry.record.threadId === BB_THREAD_ID && journal.fingerprintEqual(entry.record.fingerprint, fingerprint));
 }
 
 function loadSettingsRetention(projectId) {
@@ -2157,6 +2257,18 @@ function convBackendUsable(backendId) {
 // План хода до внешней работы: запись сессии, монотонный номер хода, точный
 // повтор/«продолжай» незавершённого хода либо новая запись. Возвращает
 // { kind: "fresh"|"resume" } либо { errorOutcome, reason }.
+const writeResult = (branch, sha) => "Branch: " + branch + "\nCommit: " + sha;
+
+function fileRepairInstruction(context, candidate, plan) {
+  const capture = candidate?.fileResponse;
+  const channels = [capture?.rpc, capture?.dom].map((channel) =>
+    typeof channel?.text === "string" ? Buffer.byteLength(channel.text) + " bytes" : "unavailable");
+  const files = plan?.files.map(({ path, operation, baseSha256 }) => ({ path, operation, baseSha256 }));
+  const summary = context.settings.mask(JSON.stringify({ history: channels[0], dom: channels[1], ...(files ? { files } : {}) }));
+  return "Return the entire file envelope. In JSON strings escape line breaks, tabs, quotation marks and backslashes. " +
+    "Previous response summary " + summary + "\n";
+}
+
 async function planTaskTurn({ session, sessionId, blocks, text, prepare, task }) {
   const inputSha256 = sha256(JSON.stringify(normalizeInput(blocks)));
   const isContinue = blocks.every((block) => block.type === "text") && journal.isContinueText(text);
@@ -2165,13 +2277,16 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
   if (last?.corrupt || (last && last.record.version !== journal.JOURNAL_VERSION)) {
     return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt or has an unsupported version" };
   }
-  const unfinished = last && !last.record.outcome ? last.record : null;
+  const committed = last?.record.commit ? last.record : null;
+  const unfinished = last && !last.record.outcome && !committed ? last.record : null;
   const retryable = unfinished ?? (last?.record.outcome === "failed" && last.record.packageSha256 ? last.record : null);
-  if (isContinue && !retryable) {
+  if (isContinue && !retryable && !committed) {
     return { errorOutcome: "not_started", reason: "a bare continue has no saved task package to resume" };
   }
-  const sameBlocks = unfinished?.inputBlocksSha256 === inputSha256;
-  const candidate = isContinue ? retryable : sameBlocks ? unfinished : null;
+  const exactCandidate = retryable?.mode === "write" ? retryable : unfinished;
+  const sameBlocks = exactCandidate?.inputBlocksSha256 === inputSha256;
+  const replay = committed && (isContinue || committed.inputBlocksSha256 === inputSha256) ? committed : null;
+  const candidate = replay ?? (isContinue ? retryable : sameBlocks ? exactCandidate : null);
   let context = await prepare(candidate);
   let materials;
   if (candidate) {
@@ -2183,6 +2298,10 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
       exact = fingerprint === candidate.taskSha256;
     }
     if (isContinue || exact || !candidate.taskSha256) {
+      if (replay) return { kind: "committed", sessKey: saved.key, turn: replay, context };
+      if (candidate.mode === "write" && task.mode !== "write") {
+        return { errorOutcome: "not_started", reason: "accept-edits is required to resume the saved file task" };
+      }
       const pkg = journal.loadTurnPackage(STATE_DIR, saved.key, candidate);
       if (!pkg.ok) {
         journal.completeTurn(STATE_DIR, saved.key, candidate, { outcome: "failed", reason: "recovery: " + pkg.reason });
@@ -2210,7 +2329,8 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
       threadId: session.thread.thread.id,
       projectId: session.thread.thread.projectId,
       fingerprint: await journal.worktreeFingerprint(context.cwd),
-      accessCeiling: "read-only",
+      accessCeiling: canWrite(session) ? "write" : "read-only",
+      accessMode: task.mode,
       roots: session.roots,
       model: session.model,
       thinking: session.thinking,
@@ -2218,12 +2338,12 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
     });
   }
   session.journal = entry;
-  const head = await journal.headOf(context.root ?? context.cwd, task.signal);
+  const head = context.writeHead ?? await journal.headOf(context.root ?? context.cwd, task.signal);
   task.signal.throwIfAborted();
   const turn = journal.createTurn(STATE_DIR, entry, {
     inputSha256,
     previousTurnNo: last?.turnNo,
-    mode: "read-only",
+    mode: task.mode,
     profile: { model: session.model, thinking: session.thinking, account: session.account },
     deadlineAt: task.deadline,
     budgetLimits: {
@@ -2233,8 +2353,9 @@ async function planTaskTurn({ session, sessionId, blocks, text, prepare, task })
     },
     head,
     pin: context.pin,
-    expected: context.verdict ? "verdict" : "text",
+    expected: context.write ? "files" : context.verdict ? "verdict" : "text",
     verdict: journal.serializeVerdict(context.verdict),
+    write: context.write,
   });
   return { kind: "fresh", sessKey: entry.key, turn, context, materials };
 }
@@ -2247,6 +2368,7 @@ async function runBoundPrompt(msg, session) {
   const { sessionId, prompt } = msg.params;
   const task = createTaskTurn(sessionId);
   session.activeTask = task;
+  let writer;
   try {
     task.signal.throwIfAborted();
     let thread = session.thread;
@@ -2254,15 +2376,56 @@ async function runBoundPrompt(msg, session) {
       thread = session.thread = await taskThread(BB_THREAD_ID, task.signal).catch(() => null);
     }
     if (!thread) throw new TaskTurnError("could not verify trusted BB thread metadata");
-    if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") throw new TaskTurnError("full grants read-only access");
+    if (WRITE_LAUNCH && !canWrite(session)) throw new TaskTurnError(WRITE_REFUSED);
+    task.mode = sessionMode(session);
     if (!Array.isArray(prompt)) throw new TaskTurnError("prompt must be an array of blocks");
     const system = isBbSystemInstructionsBlock(prompt[0]) ? prompt[0].text : null;
     const blocks = prompt.filter((block) => block && !isBbSystemInstructionsBlock(block));
     const text = blocks.filter((block) => block.type === "text").map((block) => String(block.text ?? "")).join("\n");
-    const prepare = (savedTurn) => prepareTask({
-      text, system, session, thread, stateDir: STATE_DIR, signal: task.signal,
-      onSettings: (settings) => task.heartbeat(settings.progressIntervalMs), savedTurn,
-    });
+    if (task.mode === "write" || session.journal?.record.accessCeiling === "write") {
+      writer = new WorktreeWriter(realpathSync(session.cwd), STATE_DIR, thread.environment);
+      await writer.lock(task.signal);
+      // A transport may have opened before the previous writer created its
+      // session record. Resolve the same owner again while holding the lock.
+      const matches = taskSessionsForWorktree(writer.fingerprint);
+      if (matches.length > 1) throw new TaskTurnError("ambiguous saved session records for this thread and directory");
+      if (matches.length === 1) {
+        const [entry] = matches;
+        if (entry.record.projectId !== thread.thread.projectId || sessionRecordExpired(entry.record)) {
+          throw new TaskTurnError("saved worktree session is expired or belongs to a different project");
+        }
+        journal.addSessionAlias(STATE_DIR, entry, sessionId);
+        if (!session.journal && !session.mode && entry.record.accessMode !== "write") {
+          task.mode = session.mode = "read-only";
+        }
+        session.journal = entry;
+      }
+      task.ping("restore");
+      try {
+        await writer.recover((owner, receipt) => journal.checkpointWrite(STATE_DIR, owner, receipt));
+      } catch (cause) {
+        const error = new TaskTurnError(cause.message);
+        error.outcome = "failed";
+        throw error;
+      }
+      task.ping("preflight");
+    }
+    const prepare = async (savedTurn) => {
+      const context = await prepareTask({
+        text, system, session, thread, stateDir: STATE_DIR, signal: task.signal,
+        onSettings: (settings) => task.heartbeat(settings.progressIntervalMs), savedTurn,
+      });
+      if ((savedTurn?.mode ?? task.mode) !== "write" || savedTurn?.commit || task.mode !== "write") return context;
+      const writeHead = await writer.prepare();
+      if (savedTurn && (savedTurn.head?.sha !== writeHead.sha || savedTurn.head?.branch !== writeHead.branch)) {
+        throw new TaskTurnError("saved file task has a different base commit");
+      }
+      const write = savedTurn?.write ?? { nonce: randomBytes(16).toString("hex"), allowedPaths: resultPaths(text), bases: [] };
+      if (write.allowedPaths?.some((path) => context.settings.mask(path) !== path)) {
+        throw new TaskTurnError("result files section contains a protected path");
+      }
+      return { ...context, verdict: null, write, writeHead, writer };
+    };
     // §7.2: номер хода и запись журнала выделяются до внешней работы;
     // точный повтор/«продолжай» незавершённого хода продолжает его по §7.3.
     const plan = await planTaskTurn({ session, sessionId, blocks, text, prepare, task });
@@ -2273,6 +2436,27 @@ async function runBoundPrompt(msg, session) {
     }
     task.journal = { sessKey: plan.sessKey, turn: plan.turn, entry: session.journal };
     const { context, turn } = plan;
+    task.mode = context.write ? "write" : "read-only";
+    if (plan.kind === "committed") {
+      task.ping("verify");
+      try {
+        if (!writer) throw new Error("saved worktree identity is unavailable");
+        await writer.verifyCommit(turn.commit, turn.commit.sha);
+      } catch (error) {
+        task.journal = null;
+        const failure = new TaskTurnError("recovery_required: " + error.message);
+        failure.outcome = "failed";
+        throw failure;
+      }
+      const answer = writeResult(turn.commit.head.branch, turn.commit.sha);
+      await task.finish("passed", "", answer);
+      out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: {
+        sessionUpdate: "agent_message_chunk", content: { type: "text", text: answer },
+      } } });
+      out({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      return;
+    }
+    if (!context.write) writer?.close();
     task.pinnedSha = context.pin?.sha ?? null;
     if (context.pin) slog("task:pinned-sha", { sessionId, sha: context.pin.sha, base: context.pin.base });
     if (plan.kind === "resume") {
@@ -2299,6 +2483,7 @@ async function runBoundPrompt(msg, session) {
     await task.finish(outcome, reason);
     turnError(msg.id, outcome, reason);
   } finally {
+    writer?.close();
     if (session.activeTask === task) session.activeTask = null;
   }
 }
@@ -2318,6 +2503,7 @@ function restoreSessionFromRecord(requestedId, entry, cwd) {
     account: entry.record.account ?? "auto",
     backend: BACKENDS.find((b) => b.id === entry.record.backendId) ?? null,
     journal: entry,
+    mode: WRITE_LAUNCH && entry.record.accessMode === "write" ? "write" : "read-only",
   };
   journal.addSessionAlias(STATE_DIR, s.journal ?? entry, requestedId);
   sessions.set(requestedId, s);
@@ -2347,12 +2533,7 @@ async function validateSessionRecord(entry, cwd) {
   if (!journal.fingerprintEqual(fp, record.fingerprint)) {
     return "saved session belongs to a different working directory";
   }
-  if (record.accessCeiling !== "read-only") {
-    return `saved session requires ${record.accessCeiling}, not permitted by the read-only ceiling`;
-  }
-  if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") {
-    return "session restoration requires a read-only launch";
-  }
+  if (!["read-only", "write"].includes(record.accessCeiling)) return "invalid saved session access for the read-only ceiling or accept-edits launch";
   if (sessionRecordExpired(record)) {
     return "saved session record is expired";
   }
@@ -2376,11 +2557,7 @@ async function handleSessionNew(msg, p) {
   const sessionId = `web-gemini-${uniq}`;
   if (BB_THREAD_ID) {
     const fp = p.cwd ? await journal.worktreeFingerprint(p.cwd).catch(() => null) : null;
-    const candidates = fp
-      ? journal.listSessionRecords(STATE_DIR).filter(
-          (e) => e.record && !e.corrupt && e.record.version === journal.JOURNAL_VERSION &&
-            e.record.threadId === BB_THREAD_ID && journal.fingerprintEqual(e.record.fingerprint, fp))
-      : [];
+    const candidates = taskSessionsForWorktree(fp);
     if (candidates.length > 1) {
       turnError(msg.id, "not_started", "ambiguous saved session records for this thread and directory");
       return;
@@ -2492,12 +2669,22 @@ export function dispatch(msg) {
       return;
     }
 
-    case "session/set_mode":
-      if (!sessions.has(p.sessionId)) turnError(msg.id, "not_started", "unknown session");
-      else if (p.modeId !== "read-only") {
-        turnError(msg.id, "not_started", "full grants read-only access; a write-enabled preset and dedicated worktree are required for file output");
-      } else out({ jsonrpc: "2.0", id: msg.id, result: {} });
+    case "session/set_mode": {
+      const s = sessions.get(p.sessionId);
+      if (!s) turnError(msg.id, "not_started", "unknown session");
+      else if (p.modeId !== "read-only" && (p.modeId !== "write" || !canWrite(s))) {
+        turnError(msg.id, "not_started", WRITE_REFUSED);
+      } else {
+        if (p.modeId === "read-only" && s.activeTask?.mode === "write") cancelSession(p.sessionId);
+        s.mode = p.modeId;
+        if (s.journal) journal.saveSessionRecord(STATE_DIR, s.journal, {
+          accessMode: s.mode,
+          ...(s.mode === "write" ? { accessCeiling: "write" } : {}),
+        });
+        out({ jsonrpc: "2.0", id: msg.id, result: {} });
+      }
       return;
+    }
 
     case "session/set_config_option": {
       const s = sessions.get(p.sessionId);
@@ -2578,8 +2765,8 @@ export function dispatch(msg) {
         else out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown session "${p.sessionId}"` } });
         return;
       }
-      if (BB_THREAD_ARG && (sess.journal || !sess.thread || sess.thread.thread.originPluginId)) void runBoundPrompt(msg, sess);
-      else if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") turnError(msg.id, "not_started", "full grants read-only access");
+      if (BB_THREAD_ARG && (WRITE_LAUNCH || sess.journal || !sess.thread || sess.thread.thread.originPluginId)) void runBoundPrompt(msg, sess);
+      else if (SESSION_ACCESS === "write") turnError(msg.id, "not_started", WRITE_REFUSED);
       else dispatchPrompt(msg, sess);
       return;
     }

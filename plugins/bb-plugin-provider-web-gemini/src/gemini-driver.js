@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const profileManager = require('./profile-manager');
 const usageLimits = require('./usage-limits');
+const { isFileToolReply, verifyFileResponse } = require('./file-envelope.cjs');
 
 let driverHooks = null;
 function _setDriverHooks(hooks) {
@@ -983,6 +984,78 @@ async function waitForHistoryStabilization(
   return (await safeQueryAll(page, 'model-response')).length;
 }
 
+function fileResponseDom(marker) {
+  const queries = [...document.querySelectorAll('user-query')];
+  const matches = queries.filter((query) => query.textContent.includes(marker));
+  if (!matches.length) return null;
+  if (matches.length !== 1) return { invalid: 'multiple matching user messages' };
+  const query = matches[0];
+  const next = queries[queries.indexOf(query) + 1];
+  const follows = (a, b) => Boolean(a.compareDocumentPosition(b) & 4);
+  const responses = [...document.querySelectorAll('model-response')].filter((node) =>
+    follows(query, node) && (!next || follows(node, next)));
+  if (!responses.length) return null;
+  const messages = responses.flatMap((node) => [...node.querySelectorAll('message-content')]);
+  if (responses.length !== 1 || messages.length > 1) return { invalid: 'multiple model messages for the file response' };
+  if (!messages.length) return null;
+  const message = messages[0];
+  const id = /^message-content-id-(r_[a-z0-9]+)$/i.exec(message.id)?.[1];
+  if (!id) return null;
+  const blocks = [...message.querySelectorAll('pre code, code-block code, pre')]
+    .filter((node) => !node.matches('pre') || !node.querySelector('code'));
+  if (blocks.length > 1) return { invalid: 'multiple code blocks in the file response' };
+  if (blocks.length === 1) {
+    const outside = message.cloneNode(true);
+    for (const block of outside.querySelectorAll('code-block, pre')) block.remove();
+    if (outside.textContent.trim()) return { invalid: 'text outside the file response code block' };
+  }
+  return { id, text: blocks[0]?.textContent };
+}
+
+function fileResponseHistory(body, convId, marker) {
+  const frames = usageLimits.extractWrbFrames(body).filter((frame) => frame[1] === 'hNvQHb');
+  if (frames.length !== 1) return null;
+  const [turns] = JSON.parse(frames[0][2]);
+  const matches = turns.filter(([[conversationId], , query]) =>
+    conversationId === 'c_' + convId && query?.[0]?.[0]?.includes(marker));
+  if (!matches.length) return null;
+  if (matches.length !== 1) return { invalid: 'multiple saved messages for the file response' };
+  const [[, id], , , [candidates, , , selected]] = matches[0];
+  const chosen = candidates.filter(([candidateId]) => candidateId === selected);
+  if (chosen.length > 1) return { invalid: 'multiple selected history answers' };
+  const parts = chosen[0]?.[1];
+  if (parts?.length > 1) return { invalid: 'multiple parts in the saved file response' };
+  return { id, text: parts?.[0] };
+}
+
+async function captureFileChannels(page, convId, marker, throwIfCancelled) {
+  const dom = await safeEval(page, fileResponseDom, marker).catch(() => null);
+  if (dom?.invalid || !/^[a-f0-9]+$/i.test(convId ?? '')) return { dom };
+  let rpc;
+  try {
+    const [response] = await Promise.all([
+      page.waitForResponse((candidate) => {
+        const url = new URL(candidate.url());
+        return url.origin === 'https://gemini.google.com' &&
+          url.pathname === '/_/BardChatUi/data/batchexecute' && url.searchParams.get('rpcids') === 'hNvQHb';
+      }, { timeout: 10_000 }),
+      page.goto('https://gemini.google.com/app/' + convId, { waitUntil: 'domcontentloaded', timeout: 10_000 }),
+    ]);
+    if (response.ok()) rpc = fileResponseHistory(await response.text(), convId, marker);
+  } catch {}
+  await throwIfCancelled();
+  return { rpc, dom };
+}
+
+async function captureFileResponse(page, convId, { nonce, marker }, throwIfCancelled) {
+  const captured = await captureFileChannels(page, convId, marker, throwIfCancelled);
+  if (!verifyFileResponse(captured, nonce).recapture) return captured;
+  // The history navigation above may have just made the DOM available.
+  await page.locator('model-response message-content').last().waitFor({ timeout: 5_000 }).catch(() => {});
+  await throwIfCancelled();
+  return captureFileChannels(page, convId, marker, throwIfCancelled);
+}
+
 async function sendPrompt({
   prompt,
   model,
@@ -1011,7 +1084,8 @@ async function sendPrompt({
   accountId = null,
   tier = null,
   stateDir = null,
-  verifyConversation = false
+  verifyConversation = false,
+  fileCapture = null,
 }) {
   const isStrict = Boolean(strict || strictModel);
   throwIfPromptTooLarge(prompt);
@@ -1051,6 +1125,7 @@ async function sendPrompt({
 
     let lastText = '';
     let rawText = null;
+    let fileResponse;
     let downloadedPath = null;
     let generatedFiles = [];
     let hasGeneratedFile = false;
@@ -1182,9 +1257,21 @@ async function sendPrompt({
 
         typed = await safeEval(page,
           ({ sel, want, full }) => {
-            const text = ((document.querySelector(sel) || {}).innerText) || '';
-            if (full !== null) return text.replace(/\r\n/g, '\n') === full;
-            const t = text.replace(/\s+/g, ' ').trim();
+            const editor = document.querySelector(sel);
+            const rendered = editor?.innerText ?? '';
+            if (full !== null) {
+              // Quill renders each plain-text line as a paragraph. innerText
+              // inserts visual paragraph spacing, which is not part of the input.
+              const quill = editor?.__quill ?? editor?.parentElement?.__quill;
+              const saved = typeof quill?.getText === 'function' ? quill.getText() : null;
+              if (saved === full + '\n') return true; // Quill's document terminator.
+              const paragraphs = editor?.classList?.contains('ql-editor') && [...editor.children];
+              const plain = paragraphs?.length && paragraphs.length === editor.childNodes.length &&
+                paragraphs.every((node) => node.tagName === 'P');
+              const text = plain ? paragraphs.map((node) => node.textContent).join('\n') : rendered;
+              return text.replace(/\r\n/g, '\n') === full;
+            }
+            const t = rendered.replace(/\s+/g, ' ').trim();
             return want === '' ? t.length > 0 : t.startsWith(want);
           },
           { sel: textboxSelector, want: wantStart, full: requireFullDelivery ? prompt.replace(/\r\n/g, '\n') : null }
@@ -1422,6 +1509,10 @@ async function sendPrompt({
       hasGeneratedFile = Boolean(coll.hasGeneratedFile);
     }
 
+    if (fileCapture && !isFileToolReply(rawText || lastText)) {
+      fileResponse = await captureFileResponse(page, returnedConvId, fileCapture, throwIfCancelled);
+    }
+
     if (ephemeral) {
       try {
         const url = page.url();
@@ -1443,6 +1534,7 @@ async function sendPrompt({
     resObj = new String(lastText);
     resObj.text = lastText;
     if (typeof rawText === 'string') resObj.rawText = rawText;
+    if (fileResponse) resObj.fileResponse = fileResponse;
     resObj.thinking = null;
     resObj.meta = {};
     resObj.convId = returnedConvId;
@@ -2407,6 +2499,8 @@ module.exports = {
   checkTurnStatus,
   isTurnComplete,
   waitForHistoryStabilization,
+  fileResponseHistory,
+  captureFileResponse,
   getGeminiPage,
   checkRobotVerification,
   dismissOverlays,

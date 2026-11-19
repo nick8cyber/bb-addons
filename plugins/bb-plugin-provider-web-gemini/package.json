@@ -12,7 +12,7 @@
   },
   "bb": {
     "name": "Gemini (Web)",
-    "description": "Google Gemini Web over ACP with a read-only path for BB tasks.",
+    "description": "Google Gemini Web over ACP with read-only and accept-edits modes for BB tasks.",
     "branding": { "icon": "Sparkles" },
     "server": "index.mjs",
     "host": "host.mjs"

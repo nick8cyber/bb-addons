@@ -1,9 +1,12 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   readdirSync,
@@ -12,7 +15,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 // §7.2: постоянный журнал внутреннего агента в state-каталоге провайдера
@@ -35,12 +38,14 @@ export const journalPaths = (stateDir) => ({
 
 export const sessionKey = (sessionId) => digest(String(sessionId)).slice(0, 32);
 
-function writeAtomic(file, data) {
+function writeAtomic(file, data, durable = false) {
   mkdirSync(join(file, ".."), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
     writeFileSync(tmp, data, { mode: 0o600 });
+    if (durable) syncPath(tmp);
     renameSync(tmp, file);
+    if (durable) syncPath(dirname(file));
   } catch (error) {
     try {
       rmSync(tmp, { force: true });
@@ -49,8 +54,14 @@ function writeAtomic(file, data) {
   }
 }
 
-function writeJsonAtomic(file, value) {
-  writeAtomic(file, JSON.stringify(value, null, 2) + "\n");
+function syncPath(path) {
+  const fd = openSync(path, "r");
+  try { fsyncSync(fd); }
+  finally { closeSync(fd); }
+}
+
+function writeJsonAtomic(file, value, durable) {
+  writeAtomic(file, JSON.stringify(value, null, 2) + "\n", durable);
 }
 
 /* ---------- Отпечаток рабочей копии и HEAD (§7.2) ---------- */
@@ -105,6 +116,7 @@ export function createSessionRecord(stateDir, fields) {
     projectId: fields.projectId ?? null,
     fingerprint: fields.fingerprint ?? null,
     accessCeiling: fields.accessCeiling ?? "read-only",
+    accessMode: fields.accessMode ?? "read-only",
     roots: Array.isArray(fields.roots) ? fields.roots : [],
     model: fields.model ?? "argon",
     thinking: fields.thinking ?? "medium",
@@ -200,9 +212,9 @@ export function listTurns(stateDir, sessKey) {
   return out.sort((a, b) => a.turnNo - b.turnNo);
 }
 
-export function saveTurn(stateDir, sessKey, turn) {
+export function saveTurn(stateDir, sessKey, turn, durable = false) {
   turn.updatedAt = Date.now();
-  writeJsonAtomic(join(turnDir(stateDir, sessKey, turn.turnNo), "record.json"), turn);
+  writeJsonAtomic(join(turnDir(stateDir, sessKey, turn.turnNo), "record.json"), turn, durable);
   return turn;
 }
 
@@ -229,6 +241,7 @@ export function createTurn(stateDir, entry, fields) {
     pin: fields.pin ?? null,
     expected: fields.expected ?? "text",
     verdict: fields.verdict ?? null,
+    ...(fields.write ? { write: fields.write } : {}),
     packageSha256: null,
     messageSha256: null,
     packageBytes: null,
@@ -364,8 +377,35 @@ export function completeTurn(stateDir, sessKey, turn, { outcome, reason = null, 
   saveTurn(stateDir, sessKey, turn);
 }
 
+export function checkpointWrite(stateDir, { sessKey, turnNo }, commit) {
+  if (!/^[a-f0-9]{32}$/.test(sessKey) || !Number.isSafeInteger(turnNo) || turnNo < 1) {
+    throw new Error("invalid write journal identity");
+  }
+  const dir = turnDir(stateDir, sessKey, turnNo);
+  const turn = readTurnRecord(dir);
+  if (!turn?.write || turn.turnNo !== turnNo) throw new Error("write turn journal is unavailable");
+  if (commit) turn.commit = commit;
+  else delete turn.commit;
+  delete turn.recoveryRequired;
+  saveTurn(stateDir, sessKey, turn, true);
+}
+
+export function stageFileResponse(stateDir, sessKey, turn, capture, envelope) {
+  const dir = join(turnDir(stateDir, sessKey, turn.turnNo), "file-response");
+  writeAtomic(join(dir, "history.md.txt"), capture.rpc.text, true);
+  writeAtomic(join(dir, "dom.json.txt"), capture.dom.text, true);
+  for (const [i, file] of envelope.files.entries()) {
+    if (file.operation !== "delete") writeAtomic(join(dir, "content-" + i), file.content, true);
+  }
+  writeJsonAtomic(join(dir, "manifest.json"), {
+    messageId: capture.rpc.id, nonce: turn.write.nonce, commitMessage: envelope.commitMessage,
+    files: envelope.files.map(({ path, operation, baseSha256, sha256 }) => ({ path, operation, baseSha256, sha256 })),
+  }, true);
+  syncPath(dirname(dir));
+}
+
 export function unfinishedTurns(stateDir, sessKey) {
-  return listTurns(stateDir, sessKey).filter((entry) => entry.corrupt || !entry.record.outcome);
+  return listTurns(stateDir, sessKey).filter((entry) => entry.corrupt || !entry.record.outcome || entry.record.recoveryRequired);
 }
 
 /* ---------- Чистка журнала и защита ссылок активных ходов (§7.2) ---------- */
