@@ -459,6 +459,34 @@ test("§29.1, §29.2: owner_gate interaction request in run-queue", async () => 
   });
   assert.equal(interactionRequestedWith, null);
 
+  // Card times out / cancelled -> transition owner_gate_timeout resets interaction_id
+  store.transitionTask({
+    taskKey: "PLUG-130",
+    expectedNode: "owner_gate",
+    expectedStatus: "waiting_approval",
+    toNode: "owner_gate",
+    toStatus: "waiting_approval",
+    actor: "orchestrator",
+    reason: "gate-timeout: card cancelled (timeout)",
+    updates: { interaction_id: null },
+  });
+  task = store.getTask("PLUG-130");
+  assert.equal(task?.interaction_id, null);
+
+  // Next run-queue tick re-requests interaction since interaction_id was reset
+  interactionRequestedWith = null;
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    autoAdvance: true,
+    maxActiveTasks: 1,
+    repoRoot: "/tmp",
+    requestOwnerGateInteraction,
+  });
+  assert.deepEqual(interactionRequestedWith, { taskKey: "PLUG-130", gateStage: "pre_code" });
+  task = store.getTask("PLUG-130");
+  assert.equal(task?.interaction_id, "interact_req_999");
+
   // Owner approves via runApprove: advances to code, interaction_id is reset to null
   const approved = await runApprove("PLUG-130", "LGTM", {
     store,

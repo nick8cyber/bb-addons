@@ -685,6 +685,24 @@ export async function createPlugin(
   const db = bb.storage.database();
   bb.storage.migrate(db, [...MIGRATIONS]);
   const store = new DelegationStore(db);
+  // Clear stale interaction_id from previous server runs (recovery / restart)
+  try {
+    const waitingAtStartup = store.listWaitingApprovalTasks();
+    for (const t of waitingAtStartup) {
+      if (t.interaction_id) {
+        store.transitionTask({
+          taskKey: t.task_key,
+          expectedNode: "owner_gate",
+          expectedStatus: "waiting_approval",
+          toNode: "owner_gate",
+          toStatus: "waiting_approval",
+          actor: "orchestrator",
+          reason: "gate-timeout: server restart / stale interaction cleared",
+          updates: { interaction_id: null },
+        });
+      }
+    }
+  } catch {}
   const janitorStore = new JanitorStore(db);
   const enqueue = createDelegateQueue();
   const positiveInt = (v: string | undefined, dflt: number): number => {
@@ -1681,24 +1699,21 @@ export async function createPlugin(
     let threadId = task.coordinator_thread_id;
     if (!threadId) {
       const delegations = store.delegationsByTask(task.task_key);
-      const active = delegations.find((d) => d.thread_id);
+      const active = delegations.find((d) => d.thread_id || d.coordinator_thread_id);
       if (active?.thread_id) {
         threadId = active.thread_id;
-      }
-    }
-    if (!threadId) {
-      const activeCoordinators = store.listActive();
-      const found = activeCoordinators.find((d: DelegationRow) => d.coordinator_thread_id);
-      if (found?.coordinator_thread_id) {
-        threadId = found.coordinator_thread_id;
+      } else if (active?.coordinator_thread_id) {
+        threadId = active.coordinator_thread_id;
       }
     }
     if (!threadId) return;
 
     const title =
       gateStage === "pre_code"
-        ? `[${task.task_key}] Согласование спецификации и договора`
-        : `[${task.task_key}] Согласование результатов перед выкладкой`;
+        ? `[${task.task_key}] ${t("app.gatePreCode")}`
+        : `[${task.task_key}] ${t("app.gatePreRelease")}`;
+
+    const interactionId = `interaction-${task.task_key}-${gateStage}-${Date.now()}`;
 
     const payload = {
       taskKey: task.task_key,
@@ -1709,6 +1724,7 @@ export async function createPlugin(
       acceptanceSha: task.acceptance_sha,
       specSha: task.spec_sha,
       resultSha: task.result_sha,
+      interactionId,
     };
 
     try {
@@ -1717,9 +1733,53 @@ export async function createPlugin(
         rendererId: "orchestrator-owner-gate",
         title,
         payload,
+        timeoutMs: 3_600_000,
       });
-      reqPromise.catch(() => {});
-      return `interaction-${task.task_key}-${gateStage}-${Date.now()}`;
+
+      reqPromise
+        .then((result) => {
+          const current = store.getTask(task.task_key);
+          if (
+            current &&
+            current.node === "owner_gate" &&
+            current.status === "waiting_approval" &&
+            current.interaction_id === interactionId
+          ) {
+            store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "owner_gate",
+              expectedStatus: "waiting_approval",
+              toNode: "owner_gate",
+              toStatus: "waiting_approval",
+              actor: "orchestrator",
+              reason: `gate-timeout: card ${result.outcome}${result.outcome === "cancelled" ? ` (${result.reason})` : ""}`,
+              updates: { interaction_id: null },
+            });
+          }
+        })
+        .catch((err) => {
+          bb.log.warn(`orchestrator: owner gate interaction error: ${describeError(err)}`);
+          const current = store.getTask(task.task_key);
+          if (
+            current &&
+            current.node === "owner_gate" &&
+            current.status === "waiting_approval" &&
+            current.interaction_id === interactionId
+          ) {
+            store.transitionTask({
+              taskKey: task.task_key,
+              expectedNode: "owner_gate",
+              expectedStatus: "waiting_approval",
+              toNode: "owner_gate",
+              toStatus: "waiting_approval",
+              actor: "orchestrator",
+              reason: `gate-error: card failed (${describeError(err)})`,
+              updates: { interaction_id: null },
+            });
+          }
+        });
+
+      return interactionId;
     } catch (err) {
       bb.log.warn(`orchestrator: requestOwnerGateInteraction failed: ${describeError(err)}`);
     }
@@ -2297,6 +2357,24 @@ export async function createPlugin(
       const ok = store.setTaskConfirmationMode(key, input.mode);
       if (!ok) {
         throw new OrchestratorError("task-not-found", `Task ${key} not found`);
+      }
+      if (input.mode === "auto") {
+        const current = store.getTask(key);
+        if (
+          current &&
+          current.node === "owner_gate" &&
+          current.status === "waiting_approval"
+        ) {
+          try {
+            await runApprove(key, undefined, {
+              store,
+              ctx: {},
+              workGraphMode: getWorkGraphMode(),
+            });
+          } catch (e) {
+            bb.log.warn(`orchestrator: auto-approve on switch to auto failed: ${describeError(e)}`);
+          }
+        }
       }
       return { ok: true as const };
     },
@@ -3961,11 +4039,24 @@ abandoned: ${res.reported
             );
           }
           const isOwner = !ctx.threadId && !process.env.BB_THREAD_ID;
-          if (!isOwner && flag("--mode") !== undefined) {
-            throw new OrchestratorError(
-              "permission-denied",
-              "owner-only: --mode flag is restricted to owner",
-            );
+          if (argv.includes("--mode")) {
+            if (!isOwner) {
+              throw new OrchestratorError(
+                "permission-denied",
+                "owner-only: --mode flag is restricted to owner",
+              );
+            }
+            const modeVal = flag("--mode");
+            if (
+              !modeVal ||
+              modeVal.startsWith("--") ||
+              (modeVal !== "auto" && modeVal !== "manual")
+            ) {
+              throw new OrchestratorError(
+                "invalid-arguments",
+                "флаг --mode принимает только auto или manual",
+              );
+            }
           }
           if (!isOwner && flag("--acceptance") !== undefined) {
             throw new OrchestratorError("permission-denied", "owner-only");
@@ -4229,6 +4320,23 @@ abandoned: ${res.reported
 
   bb.onDispose(() => {
     bb.log.info("bb-plugin-orchestrator disposed");
+    try {
+      const waiting = store.listWaitingApprovalTasks();
+      for (const t of waiting) {
+        if (t.interaction_id) {
+          store.transitionTask({
+            taskKey: t.task_key,
+            expectedNode: "owner_gate",
+            expectedStatus: "waiting_approval",
+            toNode: "owner_gate",
+            toStatus: "waiting_approval",
+            actor: "orchestrator",
+            reason: "gate-timeout: plugin-disposed",
+            updates: { interaction_id: null },
+          });
+        }
+      }
+    } catch {}
   });
 }
 

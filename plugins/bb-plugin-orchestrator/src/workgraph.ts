@@ -4633,34 +4633,6 @@ async function advanceActiveTask(
     }
 
     case "owner_gate": {
-      if (
-        task.status === "waiting_approval" &&
-        !task.interaction_id &&
-        deps.requestOwnerGateInteraction
-      ) {
-        const stage =
-          (payload.gate_stage as "pre_code" | "pre_release") || "pre_code";
-        const interactionId = await deps.requestOwnerGateInteraction(
-          task,
-          stage,
-        );
-        if (interactionId) {
-          deps.store.transitionTask(
-            {
-              taskKey: task.task_key,
-              expectedNode: "owner_gate",
-              expectedStatus: "waiting_approval",
-              toNode: "owner_gate",
-              toStatus: "waiting_approval",
-              actor: "run-queue",
-              reason: "interaction_requested",
-              updates: { interaction_id: interactionId },
-            },
-            now,
-          );
-          return true;
-        }
-      }
       return false;
     }
 

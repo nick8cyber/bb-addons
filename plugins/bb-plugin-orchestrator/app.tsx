@@ -190,7 +190,7 @@ function ApprovalModeToggle(props?: Partial<PluginThreadHeaderActionProps>) {
             .call("projectApprovalMode", { projectId })
             .catch(() => null);
           if (!alive) return;
-          setMode(pMode?.mode ?? "manual");
+          setMode(pMode?.mode ?? null);
           setLoading(false);
         } else if (role === "executor") {
           const tMode = await rpc
@@ -225,7 +225,7 @@ function ApprovalModeToggle(props?: Partial<PluginThreadHeaderActionProps>) {
   }
 
   const currentMode =
-    mode ?? (threadRole === "orchestrator" ? "manual" : "auto");
+    threadRole === "orchestrator" ? mode : (mode ?? "auto");
 
   const switchMode = (nextMode: "auto" | "manual") => {
     if (nextMode === currentMode) return;
@@ -325,9 +325,13 @@ function OwnerGateCard(props: PluginPendingInteractionProps) {
   const [rejectMode, setRejectMode] = useState<boolean>(false);
   const [deferMode, setDeferMode] = useState<boolean>(false);
   const [reason, setReason] = useState<string>("");
-  const [target, setTarget] = useState<string>(
-    route === "feature" ? "spec" : "code",
-  );
+  const defaultTarget =
+    route === "docs"
+      ? "spec"
+      : gateStage === "pre_code"
+        ? (route === "feature" ? "spec" : undefined)
+        : "code";
+  const [target, setTarget] = useState<string | undefined>(defaultTarget);
 
   const onApprove = async () => {
     setActionInProgress("approve");
@@ -346,11 +350,7 @@ function OwnerGateCard(props: PluginPendingInteractionProps) {
       await rpc.call("ownerReject", {
         taskKey,
         reason: reason.trim(),
-        target:
-          gateStage === "pre_code" &&
-          (route === "fix" || route === "simple")
-            ? undefined
-            : target,
+        target,
       });
       await submit({ action: "rejected" });
     } catch {
@@ -496,26 +496,95 @@ function OwnerGateCard(props: PluginPendingInteractionProps) {
           <div style={{ fontWeight: 600, marginBottom: 4 }}>
             ↩️ {t("app.reject")}:
           </div>
-          {gateStage === "pre_release" && (
-            <div style={{ marginBottom: 6 }}>
-              <label style={{ marginRight: 6 }}>{t("app.target")}:</label>
-              <select
-                value={target}
-                onChange={(e) => setTarget(e.target.value)}
-                style={{
-                  background: "transparent",
-                  color: "inherit",
-                  border: "1px solid rgba(128,128,128,.4)",
-                  borderRadius: 4,
-                  padding: "2px 4px",
-                }}
-              >
-                <option value="code">code</option>
-                {route === "feature" && <option value="spec">spec</option>}
-                {route === "feature" && <option value="design">design</option>}
-              </select>
-            </div>
-          )}
+          {(() => {
+            if (gateStage === "pre_code") {
+              if (route === "feature") {
+                return (
+                  <div style={{ marginBottom: 6 }}>
+                    <label style={{ marginRight: 6 }}>{t("app.target")}:</label>
+                    <select
+                      value={target ?? "spec"}
+                      onChange={(e) => setTarget(e.target.value)}
+                      style={{
+                        background: "transparent",
+                        color: "inherit",
+                        border: "1px solid rgba(128,128,128,.4)",
+                        borderRadius: 4,
+                        padding: "2px 4px",
+                      }}
+                    >
+                      <option value="spec">spec</option>
+                      <option value="design">design</option>
+                    </select>
+                  </div>
+                );
+              }
+              return null;
+            }
+
+            if (route === "docs") {
+              return (
+                <div style={{ marginBottom: 6 }}>
+                  <label style={{ marginRight: 6 }}>{t("app.target")}:</label>
+                  <select
+                    value={target ?? "spec"}
+                    onChange={(e) => setTarget(e.target.value)}
+                    style={{
+                      background: "transparent",
+                      color: "inherit",
+                      border: "1px solid rgba(128,128,128,.4)",
+                      borderRadius: 4,
+                      padding: "2px 4px",
+                    }}
+                  >
+                    <option value="spec">spec</option>
+                  </select>
+                </div>
+              );
+            }
+
+            if (route === "feature") {
+              return (
+                <div style={{ marginBottom: 6 }}>
+                  <label style={{ marginRight: 6 }}>{t("app.target")}:</label>
+                  <select
+                    value={target ?? "code"}
+                    onChange={(e) => setTarget(e.target.value)}
+                    style={{
+                      background: "transparent",
+                      color: "inherit",
+                      border: "1px solid rgba(128,128,128,.4)",
+                      borderRadius: 4,
+                      padding: "2px 4px",
+                    }}
+                  >
+                    <option value="code">code</option>
+                    <option value="spec">spec</option>
+                    <option value="design">design</option>
+                  </select>
+                </div>
+              );
+            }
+
+            return (
+              <div style={{ marginBottom: 6 }}>
+                <label style={{ marginRight: 6 }}>{t("app.target")}:</label>
+                <select
+                  value={target ?? "code"}
+                  onChange={(e) => setTarget(e.target.value)}
+                  style={{
+                    background: "transparent",
+                    color: "inherit",
+                    border: "1px solid rgba(128,128,128,.4)",
+                    borderRadius: 4,
+                    padding: "2px 4px",
+                  }}
+                >
+                  <option value="code">code</option>
+                </select>
+              </div>
+            );
+          })()}
           <input
             type="text"
             placeholder={t("app.reason")}
