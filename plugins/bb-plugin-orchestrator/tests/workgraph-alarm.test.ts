@@ -775,6 +775,7 @@ test("§28.2 п. 5: design_check_verdict resets alarm and checks node does not p
     route: "simple",
     preset: "simple",
     provider: "opencode",
+    now: t0 + 10,
   });
   store.setThreadInfo(del.id, "thr_old_code");
 
@@ -831,6 +832,7 @@ test("§28.2 п. 5: same-node resume from deferred resets alarm_count, entered_a
     route: "simple",
     preset: "simple",
     provider: "opencode",
+    now: t0 + 10,
   });
   store.setThreadInfo(del.id, "thr_code_exec");
 
@@ -919,6 +921,22 @@ test("§28.2 п. 5: same-node resume from deferred resets alarm_count, entered_a
   assert.equal(JSON.parse(task.payload!).alarm_count, 1);
   assert.equal(cli.calls.length, 1, "Must have pinged executor on first alarm after resume");
   assert.ok(cli.calls[0].includes("tell"));
+
+  // 4b. Second alarm after resume at tResume + 2×7200s with active thread -> ping again, stay running!
+  cli.calls.length = 0;
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    bbCli: cli.cli,
+    getThread: async () => ({ status: "active" }),
+    now: () => tResume + 2 * 7200 * 1000,
+    policy: POLICY_WITH_NODE_POLICY,
+  });
+
+  task = store.getTask("SAME-RESUME-1")!;
+  assert.equal(task.status, "running", "Active thread must get 3× grace after resume");
+  assert.equal(JSON.parse(task.payload!).alarm_count, 2);
+  assert.equal(cli.calls.length, 1, "Must have pinged active executor on second alarm");
 
   // 5. Test waiting_release_note -> release/running same-node resume
   store.insertTask({

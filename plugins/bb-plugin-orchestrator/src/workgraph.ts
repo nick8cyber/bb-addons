@@ -2795,7 +2795,12 @@ function getActiveDelegationForTask(
   }
   // If the latest delegation was created before the task entered the current node,
   // it belongs to an earlier node/attempt and must not be used.
-  if (task.entered_at > 0 && latest.created_at < task.entered_at - 50) {
+  // Anchor check: node_entered_at tracks entry into task.node; falls back to task.entered_at.
+  const nodeEnteredAt =
+    typeof payload.node_entered_at === "number"
+      ? payload.node_entered_at
+      : task.entered_at;
+  if (nodeEnteredAt > 0 && latest.created_at < nodeEnteredAt - 50) {
     return undefined;
   }
   return latest;

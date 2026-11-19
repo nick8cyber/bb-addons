@@ -922,8 +922,10 @@ export class DelegationStore {
     noCode?: boolean;
     /** §20.2 (r33): the packet spec JSON — `{"paths","from"}`. */
     attach?: string | null;
-  }): DelegationRow {
-    const now = Date.now();
+    /** Test helper: explicit creation timestamp */
+    now?: number;
+  }, nowOverride?: number): DelegationRow {
+    const now = nowOverride ?? input.now ?? Date.now();
     const info = this.db
       .prepare(
         `INSERT INTO delegations (
@@ -4083,9 +4085,7 @@ export class DelegationStore {
 
       const isReEnteringRunning =
         input.toStatus === "running" &&
-        (input.toNode !== existing.node ||
-          existing.status !== "running" ||
-          PASSIVE_ALARM_STATUSES.has(existing.status));
+        (input.toNode !== existing.node || existing.status !== "running");
 
       if (
         input.updates?.entered_at === undefined &&
@@ -4094,8 +4094,26 @@ export class DelegationStore {
         setClauses.push("entered_at = :now");
       }
 
-      // §28.2 п. 5: Сброс alarm_count в payload при смене узла или повторном входе в running из пассивного статуса
-      if (input.toNode !== existing.node || isReEnteringRunning) {
+      // §28.2 п. 5: Сброс alarm_count в payload при смене узла или повторном входе в running;
+      // фиксация node_entered_at при переходе на новый узел.
+      if (input.toNode !== existing.node) {
+        let payloadObj: Record<string, unknown> = {};
+        const sourcePayload =
+          input.updates?.payload !== undefined
+            ? input.updates.payload
+            : existing.payload;
+        if (sourcePayload) {
+          try {
+            payloadObj = JSON.parse(sourcePayload);
+          } catch {}
+        }
+        payloadObj.node_entered_at = now;
+        payloadObj.alarm_count = 0;
+        if (!input.updates) {
+          input.updates = {};
+        }
+        input.updates.payload = JSON.stringify(payloadObj);
+      } else if (isReEnteringRunning) {
         let payloadObj: Record<string, unknown> = {};
         const sourcePayload =
           input.updates?.payload !== undefined
