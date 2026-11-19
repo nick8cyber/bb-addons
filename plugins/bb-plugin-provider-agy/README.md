@@ -894,7 +894,7 @@ settled turn refused with the typed `staleTurn` hint.
 End to end in bb itself:
 
 ```
-bb thread spawn --project <id> --provider agy --model gemini-3.5-flash-low \
+bb thread spawn --project <id> --provider agy --model gemini-3.8-flash-low \
   --permission-mode full --prompt "count from 1 to 20, one number per line"
 bb thread output <thread>
 ```
