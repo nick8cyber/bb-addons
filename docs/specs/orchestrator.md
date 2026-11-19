@@ -380,7 +380,7 @@ bb orchestrator instructions                                     # правил�
 bb orchestrator reconcile                                        # принудительная сверка §7: незавершённые шаги, сторож, сверка с трекером (done/canceled) и git (автопроставление merged-upstream для влитых result_sha)
 bb orchestrator merge <KEY|delegationId> [--into <ветка>] [--no-autofix] [--dry-run] [--mark-merged [sha]] [--json]   # вливание итога захода, §14
 bb orchestrator janitor [run|report] [--dry-run] [--json]       # уборщик, §15
-bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research] [--acceptance <файл|текст>] [--release-note "<текст>"] [--depends-on "<k1,k2>"] [--force-reset-branch] [--json] # постановка в очередь графа, §27, §32
+bb orchestrator enqueue <KEY> [--priority N] [--mode auto|manual] [--route feature|fix|docs|simple|research] [--level complex|medium|simple|spec|research] [--privacy <normal|strict>] [--acceptance <файл|текст>] [--release-note "<текст>"] [--depends-on "<k1,k2>"] [--force-reset-branch] [--json] # постановка в очередь графа, §27, §32, §33
 bb orchestrator release-note <KEY> "<заметка>" [--json]         # передать заметку релиза при статусе waiting_release_note, §28.1
 bb orchestrator defer <KEY> --reason "<причина>" [--json]       # отложить задачу (только владелец, статус deferred), §27.1, §29
 bb orchestrator dequeue <KEY> [--reason "<причина>"] [--json]         # снять задачу с очереди графа (только владелец, статус cancelled), §27.1, §28.1
