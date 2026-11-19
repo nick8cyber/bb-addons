@@ -6387,14 +6387,18 @@ test("release §2 п.2: taskCleanup держит копию с живым про
 test("§34.2 (ADR-0037): isServiceWorktreePath and evaluateServiceWorktreePrunable identify and prune service worktrees", async () => {
   // Pattern matching
   assert.equal(isServiceWorktreePath("/repo/wt/release").isService, true);
-  assert.equal(isServiceWorktreePath("/repo/wt/release").isReleaseOrSync, true);
+  assert.equal(isServiceWorktreePath("/repo/wt/release/PLUG-123").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/wt/release/PLUG-123").taskKey, "PLUG-123");
+  assert.equal(isServiceWorktreePath("/repo/wt/sync/PLUG-123").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/wt/sync/PLUG-123").taskKey, "PLUG-123");
   assert.equal(isServiceWorktreePath("/repo/wt/sync").isService, true);
   assert.equal(isServiceWorktreePath("/repo/wt/PLUG-123-1").isService, true);
   assert.equal(isServiceWorktreePath("/repo/wt/PLUG-123-1").taskKey, "PLUG-123");
-  assert.equal(isServiceWorktreePath("/repo/worktrees/release-20261119").isService, true);
-  assert.equal(isServiceWorktreePath("/repo/worktrees/sync-main").isService, true);
-  assert.equal(isServiceWorktreePath("/repo/worktrees/PLUG-456-round-1").isService, true);
-  assert.equal(isServiceWorktreePath("/repo/worktrees/PLUG-456-round-1").taskKey, "PLUG-456");
+  assert.equal(isServiceWorktreePath("/repo/worktrees/release-PLUG-123").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/worktrees/sync-PLUG-123").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/worktrees/PLUG-456-1").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/worktrees/PLUG-456-1").taskKey, "PLUG-456");
+  assert.equal(isServiceWorktreePath("/repo/worktrees/PLUG-315-fix").isService, false);
   assert.equal(isServiceWorktreePath("/repo/worktrees/normal-user-copy").isService, false);
   assert.equal(isServiceWorktreePath("/repo/src").isService, false);
 
@@ -6421,7 +6425,7 @@ test("§34.2 (ADR-0037): isServiceWorktreePath and evaluateServiceWorktreePrunab
   assert.equal(resFinished.prunable, true);
   assert.equal(resFinished.reason, "task-finished:done");
 
-  // Active task PLUG-200
+  // Active task PLUG-200 with finished delegations keeps copy
   store.insertTask({
     taskKey: "PLUG-200",
     projectId: "proj_main",
@@ -6430,6 +6434,18 @@ test("§34.2 (ADR-0037): isServiceWorktreePath and evaluateServiceWorktreePrunab
     level: "complex",
   });
   store.updateTask("PLUG-200", { status: "running" });
+  store.insert({
+    taskKey: "PLUG-200",
+    coordinatorThreadId: "thr_coord",
+    projectId: "proj_main",
+    level: "complex",
+    route: "route1",
+    preset: "preset1",
+    provider: "p1",
+  });
+  const del = store.delegationsByTask("PLUG-200")[0]!;
+  store.setStatus(del.id, "done");
+
   mkdirSync(join(tempDir, "wt/PLUG-200-1"), { recursive: true });
   const resActive = await evaluateServiceWorktreePrunable(
     join(tempDir, "wt/PLUG-200-1"),
@@ -6437,5 +6453,6 @@ test("§34.2 (ADR-0037): isServiceWorktreePath and evaluateServiceWorktreePrunab
     2 * 3600_000,
   );
   assert.equal(resActive.prunable, false);
+  assert.equal(resActive.reason, "task-active");
 });
 

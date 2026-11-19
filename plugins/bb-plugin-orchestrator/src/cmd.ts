@@ -81,6 +81,7 @@ export function createCmd(): CmdRunner {
                     ? { ...process.env, ...opts.env }
                     : undefined,
             timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            killSignal: "SIGKILL",
             maxBuffer: MAX_BUFFER,
           },
           (error, stdout, stderr) => {

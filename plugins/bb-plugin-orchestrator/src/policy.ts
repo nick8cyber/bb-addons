@@ -80,6 +80,8 @@ export interface Policy {
   quotaGroupAliases?: Record<string, string>;
   levels: Record<string, PolicyLevel>;
   routes: Record<string, PolicyRoute>;
+  /** §31 / §34.3: Configuration for checks node. */
+  checks?: PolicyChecksConfig;
 }
 
 /** §28.2 п. 3: Конфигурация узлов (node_policy): таймаут, попытки, уровень. */
@@ -112,6 +114,15 @@ export interface PolicyTiming {
    * пользовательского хода или продуктивного действия старше этого
    * возраста сторож не будит никогда (default 24 ч). */
   coordinatorMaxThreadAgeHours?: number;
+  /** §34.4 (ADR-0037): будильник очереди для задач в queued (default 30 мин). */
+  queueStallMinutes?: number;
+}
+
+export interface PolicyChecksConfig {
+  timeout_seconds?: number;
+  allowedEnvVars?: readonly string[];
+  extraEnvVars?: string[];
+  commands?: string[];
 }
 
 export interface PolicyIssue {
@@ -599,6 +610,7 @@ export function parsePolicy(
         coordinatorIdleMinutes: [1, 1440],
         coordinatorMaxNudges: [1, 100],
         coordinatorMaxThreadAgeHours: [1, 720],
+        queueStallMinutes: [1, 1440],
       };
       for (const [key, [min, max]] of Object.entries(bounds) as [
         keyof PolicyTiming,
@@ -618,6 +630,53 @@ export function parsePolicy(
           timing.coordinatorWatchdogEnabled = enabled;
         } else {
           warn("timing.coordinatorWatchdogEnabled", t("pol.isBool"));
+        }
+      }
+    }
+  }
+
+  let checks: PolicyChecksConfig | undefined;
+  if (raw.checks !== undefined) {
+    if (!isRecord(raw.checks)) {
+      warn("checks", "checks configuration must be an object");
+    } else {
+      checks = {};
+      if (raw.checks.timeout_seconds !== undefined) {
+        const v = raw.checks.timeout_seconds;
+        if (typeof v !== "number" || v < 30 || v > 3600) {
+          warn("checks.timeout_seconds", "timeout_seconds must be between 30 and 3600");
+        } else {
+          checks.timeout_seconds = v;
+        }
+      }
+      if (raw.checks.allowedEnvVars !== undefined) {
+        if (
+          Array.isArray(raw.checks.allowedEnvVars) &&
+          raw.checks.allowedEnvVars.every((s: unknown) => typeof s === "string")
+        ) {
+          checks.allowedEnvVars = raw.checks.allowedEnvVars;
+        } else {
+          warn("checks.allowedEnvVars", "allowedEnvVars must be an array of strings");
+        }
+      }
+      if (raw.checks.extraEnvVars !== undefined) {
+        if (
+          Array.isArray(raw.checks.extraEnvVars) &&
+          raw.checks.extraEnvVars.every((s: unknown) => typeof s === "string")
+        ) {
+          checks.extraEnvVars = raw.checks.extraEnvVars;
+        } else {
+          warn("checks.extraEnvVars", "extraEnvVars must be an array of strings");
+        }
+      }
+      if (raw.checks.commands !== undefined) {
+        if (
+          Array.isArray(raw.checks.commands) &&
+          raw.checks.commands.every((s: unknown) => typeof s === "string")
+        ) {
+          checks.commands = raw.checks.commands;
+        } else {
+          warn("checks.commands", "commands must be an array of strings");
         }
       }
     }
@@ -688,6 +747,7 @@ export function parsePolicy(
       ...(quotaGroupAliases && Object.keys(quotaGroupAliases).length > 0
         ? { quotaGroupAliases }
         : {}),
+      ...(checks && Object.keys(checks).length > 0 ? { checks } : {}),
       levels,
       routes,
     },

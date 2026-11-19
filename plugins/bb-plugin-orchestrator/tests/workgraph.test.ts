@@ -20,11 +20,13 @@ import {
   runRunQueue,
   runResume,
   runEnqueue,
+  runApprove,
   DEFAULT_ALLOWED_ENV_VARS,
   buildChecksEnvironment,
   runTddFailFirstVerification,
   formatDesignCheckPacket,
 } from "../src/workgraph.js";
+import { parsePolicy } from "../src/policy.js";
 
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
 delete process.env.BB_THREAD_ID;
@@ -2138,3 +2140,220 @@ test("§34.6 (ADR-0037): formatDesignCheckPacket creates structured markdown", (
   assert.ok(packet.includes("## 4. Отчёт код-ревью"));
   assert.ok(packet.includes('{"verdict":"OK"|"CHANGES"'));
 });
+
+test("§34.5 (ADR-0037): Rule 81 end-to-end via runRunQueue on spec_review with vacuous contract", async () => {
+  const host = createFakePluginHost();
+  const db = host.bb.storage.database();
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  await runEnqueue(
+    { taskKey: "FEAT-VAC-1", route: "feature" },
+    { store, ctx: { projectId: "p1" }, workGraphMode: "strict" },
+  );
+  store.transitionTask({
+    taskKey: "FEAT-VAC-1",
+    expectedNode: "start",
+    expectedStatus: "queued",
+    toNode: "spec_review",
+    toStatus: "running",
+    actor: "test",
+    reason: "test jump to spec_review",
+    updates: { acceptance_sha: "acc-sha-123" },
+  });
+
+  const del = store.insert({
+    taskKey: "FEAT-VAC-1",
+    projectId: "p1",
+    coordinatorThreadId: "coord-1",
+    level: "review",
+    route: "review-route",
+    preset: "p-review",
+    provider: "test-prov",
+    round: 1,
+  });
+  store.setStatus(del.id, "done");
+  store.updateTask("FEAT-VAC-1", {
+    payload: JSON.stringify({
+      spec_review_verdict: "OK",
+      spec_review_blockers: 0,
+    }),
+  });
+
+  let tddCalls = 0;
+  // 1st time: TDD verification detects vacuous contract -> Rule 81 returns to design
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    runTddCheck: async () => {
+      tddCalls++;
+      return { ok: true, failedAsExpected: false, output: "acceptance-contract-vacuous" };
+    },
+  });
+
+  assert.equal(tddCalls, 1);
+  const taskAfterRule81 = store.getTask("FEAT-VAC-1")!;
+  assert.equal(taskAfterRule81.node, "design");
+  assert.equal(taskAfterRule81.status, "running");
+  assert.equal(taskAfterRule81.design_check_rounds, 1);
+
+  // Advance design -> spec -> spec_review again with design_check_rounds: 2
+  store.updateTask("FEAT-VAC-1", {
+    design_check_rounds: 2,
+    payload: JSON.stringify({
+      spec_review_verdict: "OK",
+      spec_review_blockers: 0,
+    }),
+  });
+  store.transitionTask({
+    taskKey: "FEAT-VAC-1",
+    expectedNode: "design",
+    expectedStatus: "running",
+    toNode: "spec_review",
+    toStatus: "running",
+    actor: "test",
+    reason: "fast forward to spec_review round 3",
+  });
+
+  // 2nd time: reaches ceiling design_check_rounds = 3 -> transitions to blocked
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    runTddCheck: async () => ({ ok: true, failedAsExpected: false, output: "acceptance-contract-vacuous" }),
+  });
+
+  const taskBlocked = store.getTask("FEAT-VAC-1")!;
+  assert.equal(taskBlocked.status, "blocked");
+  assert.equal(taskBlocked.design_check_rounds, 3);
+});
+
+test("§34.5 (ADR-0037): Rule 82 end-to-end via runRunQueue on fix route and owner_gate handling", async () => {
+  const host = createFakePluginHost();
+  const db = host.bb.storage.database();
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // 1. Enqueue in manual mode with a mock cmd that simulates branch creation
+  const mockCmd = {
+    run: async (cmd: string, args: string[]) => ({
+      exitCode: 0,
+      stdout: "1234567\n",
+      stderr: "",
+    }),
+  } as any;
+
+  await runEnqueue(
+    { taskKey: "FIX-VAC-1", route: "fix", mode: "manual", acceptance: "- initial vacuous acceptance" },
+    {
+      store,
+      ctx: { projectId: "p1" },
+      workGraphMode: "strict",
+      cmd: mockCmd,
+      repoRoot: "/fake/repo",
+    },
+  );
+
+  const initialTask = store.getTask("FIX-VAC-1")!;
+  assert.equal(initialTask.status, "queued");
+
+  // 2. runRunQueue takes task, runs TDD check, detects vacuous contract -> triggers Rule 82
+  await runRunQueue({
+    store,
+    workGraphMode: "strict",
+    cmd: mockCmd,
+    repoRoot: "/fake/repo",
+    runTddCheck: async () => ({ ok: true, failedAsExpected: false, output: "acceptance-contract-vacuous" }),
+  });
+
+  const taskAfterRule82 = store.getTask("FIX-VAC-1")!;
+  assert.equal(taskAfterRule82.node, "owner_gate");
+  assert.equal(taskAfterRule82.status, "waiting_approval");
+  assert.equal(taskAfterRule82.check_attempts, 1);
+  const p1 = JSON.parse(taskAfterRule82.payload!);
+  assert.equal(p1.vacuous_contract, true);
+  assert.equal(p1.gate_stage, "pre_code");
+
+  // 3. runApprove while vacuous_contract is true must throw
+  await assert.rejects(
+    async () => runApprove("FIX-VAC-1", "approve anyway", { store, ctx: { projectId: "p1" }, workGraphMode: "strict" }),
+    (e: any) => e.code === "acceptance-contract-vacuous",
+  );
+
+  // 4. Update acceptance via runEnqueue: still vacuous -> triggers Rule 82 on owner_gate, attempts = 2
+  await runEnqueue(
+    { taskKey: "FIX-VAC-1", acceptance: "- second try still vacuous" },
+    {
+      store,
+      ctx: { projectId: "p1" },
+      workGraphMode: "strict",
+      cmd: mockCmd,
+      repoRoot: "/fake/repo",
+      runTddCheck: async () => ({ ok: true, failedAsExpected: false }),
+    },
+  );
+  const taskSecondVac = store.getTask("FIX-VAC-1")!;
+  assert.equal(taskSecondVac.node, "owner_gate");
+  assert.equal(taskSecondVac.status, "waiting_approval");
+  assert.equal(taskSecondVac.check_attempts, 2);
+  const p2 = JSON.parse(taskSecondVac.payload!);
+  assert.equal(p2.vacuous_contract, true);
+
+  // 5. Update acceptance with failing tests (failedAsExpected: true) -> clears vacuous_contract
+  await runEnqueue(
+    { taskKey: "FIX-VAC-1", acceptance: "- proper failing tests" },
+    {
+      store,
+      ctx: { projectId: "p1" },
+      workGraphMode: "strict",
+      cmd: mockCmd,
+      repoRoot: "/fake/repo",
+      runTddCheck: async () => ({ ok: true, failedAsExpected: true, output: "tests failed as expected" }),
+    },
+  );
+  const taskFixed = store.getTask("FIX-VAC-1")!;
+  assert.equal(taskFixed.node, "owner_gate");
+  assert.equal(taskFixed.status, "waiting_approval");
+  const p3 = JSON.parse(taskFixed.payload!);
+  assert.equal(p3.vacuous_contract, undefined);
+
+  // 6. Now runApprove succeeds and moves to code
+  const approved = await runApprove("FIX-VAC-1", "approved", {
+    store,
+    ctx: { projectId: "p1" },
+    workGraphMode: "strict",
+  });
+  assert.equal(approved.ok, true);
+  assert.equal(approved.task.node, "code");
+  assert.equal(approved.task.status, "running");
+});
+
+test("§34.3 & §34.4 (ADR-0037): parsePolicy parses checks config and queueStallMinutes bounds", () => {
+  const pValid = parsePolicy(JSON.stringify({
+    version: 1,
+    timing: { queueStallMinutes: 120 },
+    checks: {
+      timeout_seconds: 900,
+      allowedEnvVars: ["PATH", "HOME", "CUSTOM_VAR"],
+      extraEnvVars: ["LOCAL_ENV"],
+      commands: ["npm test", "npm run lint"],
+    },
+    levels: { dev: { role: "executor", chain: ["r1"] } },
+    routes: { r1: { preset: "p1", provider: "agy" } },
+  }));
+  assert.equal(pValid.errors.length, 0);
+  assert.equal(pValid.warnings.length, 0);
+  assert.equal(pValid.policy?.timing?.queueStallMinutes, 120);
+  assert.equal(pValid.policy?.checks?.timeout_seconds, 900);
+  assert.deepEqual(pValid.policy?.checks?.commands, ["npm test", "npm run lint"]);
+
+  const pOutOfBounds = parsePolicy(JSON.stringify({
+    version: 1,
+    timing: { queueStallMinutes: 0 },
+    checks: { timeout_seconds: 10 },
+    levels: { dev: { role: "executor", chain: ["r1"] } },
+    routes: { r1: { preset: "p1", provider: "agy" } },
+  }));
+  assert.ok(pOutOfBounds.warnings.some((i) => i.path === "timing.queueStallMinutes"));
+  assert.ok(pOutOfBounds.warnings.some((i) => i.path === "checks.timeout_seconds"));
+});
+

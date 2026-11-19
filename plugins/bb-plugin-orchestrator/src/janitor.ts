@@ -464,10 +464,21 @@ export function isServiceWorktreePath(worktreePath: string): {
   isReleaseOrSync?: boolean;
 } {
   const norm = worktreePath.replace(/\\/g, "/");
-  if (/(?:^|\/)(?:wt\/(?:release|sync)|worktrees\/(?:release|sync)[^\/]*)$/.test(norm)) {
-    return { isService: true, isReleaseOrSync: true };
+  // 1. Release or sync service worktrees:
+  // wt/(release|sync)/<KEY>, wt/release, wt/sync, worktrees/(release|sync)-<KEY>
+  const relSyncMatch =
+    /(?:^|\/)(?:wt\/(?:release|sync)(?:\/([A-Za-z]+-\d+))?|worktrees\/(?:release|sync)(?:-([A-Za-z]+-\d+))?)$/.exec(
+      norm,
+    );
+  if (relSyncMatch) {
+    const key = (relSyncMatch[1] ?? relSyncMatch[2])?.toUpperCase();
+    return { isService: true, isReleaseOrSync: true, taskKey: key };
   }
-  const taskMatch = /(?:^|\/)(?:wt\/([A-Za-z]+-\d+)(?:-\d+)?|worktrees\/([A-Za-z]+-\d+)[^\/]*)$/.exec(norm);
+  // 2. Task round worktree: wt/<KEY>-<round>, wt/<KEY>, or worktrees/<KEY>-<round> (strictly digits for <round>)
+  const taskMatch =
+    /(?:^|\/)(?:wt\/([A-Za-z]+-\d+)(?:-\d+)?|worktrees\/([A-Za-z]+-\d+)-\d+)$/.exec(
+      norm,
+    );
   if (taskMatch) {
     const key = (taskMatch[1] ?? taskMatch[2])?.toUpperCase();
     return { isService: true, taskKey: key };
@@ -493,26 +504,24 @@ export async function evaluateServiceWorktreePrunable(
   }
   const now = deps.now ? deps.now() : Date.now();
 
-  // Condition 1: Associated task finished (done or cancelled)
+  // If associated task exists in store:
   if (check.taskKey && deps.store) {
     const task = deps.store.getTask(check.taskKey);
-    if (task && (task.status === "done" || task.status === "cancelled")) {
-      return {
-        prunable: true,
-        reason: `task-finished:${task.status}`,
-        taskKey: check.taskKey,
-      };
-    }
-    const delegations = deps.store.delegationsByTask(check.taskKey);
-    if (
-      delegations.length > 0 &&
-      delegations.every((d) => d.status === "done" || d.status === "cancelled")
-    ) {
-      return {
-        prunable: true,
-        reason: "all-delegations-finished",
-        taskKey: check.taskKey,
-      };
+    if (task) {
+      if (task.status === "done" || task.status === "cancelled") {
+        return {
+          prunable: true,
+          reason: `task-finished:${task.status}`,
+          taskKey: check.taskKey,
+        };
+      }
+      if (
+        task.status === "running" ||
+        task.status === "queued" ||
+        task.status === "waiting_approval"
+      ) {
+        return { prunable: false, reason: "task-active", taskKey: check.taskKey };
+      }
     }
   }
 
@@ -530,7 +539,7 @@ export async function evaluateServiceWorktreePrunable(
             task.status === "queued" ||
             task.status === "waiting_approval")
         ) {
-          return { prunable: false, reason: "task-active" };
+          return { prunable: false, reason: "task-active", taskKey: check.taskKey };
         }
         const activeDelegations = deps.store
           .delegationsByTask(check.taskKey)
@@ -538,7 +547,7 @@ export async function evaluateServiceWorktreePrunable(
             (d) => d.status === "running" || d.status === "dispatching",
           );
         if (activeDelegations.length > 0) {
-          return { prunable: false, reason: "delegation-active" };
+          return { prunable: false, reason: "delegation-active", taskKey: check.taskKey };
         }
       }
       return {
@@ -551,7 +560,7 @@ export async function evaluateServiceWorktreePrunable(
     return { prunable: true, reason: "missing-worktree-dir", taskKey: check.taskKey };
   }
 
-  return { prunable: false, reason: "active-or-fresh" };
+  return { prunable: false, reason: "active-or-fresh", taskKey: check.taskKey };
 }
 
 export function createJanitor(deps: JanitorDeps) {
@@ -3419,6 +3428,34 @@ export function createJanitor(deps: JanitorDeps) {
         );
 
         if (evalRes.prunable) {
+          // Check excluded projects
+          if (evalRes.taskKey && deps.store) {
+            const task = deps.store.getTask(evalRes.taskKey);
+            if (task?.project_id && cfg.excludeProjects.includes(task.project_id)) {
+              keep(summary, "excluded-project");
+              continue;
+            }
+          }
+
+          // Check live environments
+          const isLiveEnv = allEnvs.some((e) => e.path === wtPath);
+          if (isLiveEnv) {
+            keep(summary, "live-environment");
+            continue;
+          }
+
+          // Check uncommitted changes: never remove dirty worktrees
+          const statusText = await gitOut(deps.cmd, wtPath, [
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+          ]);
+          if (statusText === null || statusText.trim().length > 0) {
+            keep(summary, "service-worktree-dirty");
+            continue;
+          }
+
           const envId = `service-wt:${wtPath}`;
           if (apply) {
             log.info?.(

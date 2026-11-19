@@ -865,7 +865,7 @@ BB сам ставит повтор упавшего хода в очередь 
 - `orchestrator.maxActiveTasks`: целое положительное число (по умолчанию 1) — лимит одновременно выполняющихся активных задач в статусе `running` (§28.2);
 - `orchestrator.checks.commands`: массив команд проверок проекта по умолчанию, запускаемых на узле `checks` (§31.3);
 - `orchestrator.checks.allowedRunners`: массив разрешённых команд/префиксов раннеров (по умолчанию `["npm test", "npm run test", "npm run test:*", "npm run lint", "pytest", "cargo test", "go test ./..."]`, §31.3);
-- `orchestrator.checks.timeout_seconds`: целое число секунд (по умолчанию 300) — таймаут выполнения машинного узла `checks` (§31.3);
+- `orchestrator.checks.timeout_seconds`: целое число секунд (по умолчанию 600, диапазон 30…3600) — таймаут выполнения машинного узла `checks` (§31.3, §34.3);
 - `orchestrator.node_policy`: сопоставление узлов графа с тайм-аутами и лимитами повторов: `{ [nodeName]: { timeout_seconds: number, max_retries: number, level?: string } }` (§28.2);
 - `orchestrator.routeLimits`: объект ограничений объёма и защищённых путей для машинного контроля маршрутов `fix` и `simple` (r34.2, §31.7; диалект glob-шаблонов §18.5: `*` без `/`, `**` для произвольного числа каталогов):
   * `orchestrator.routeLimits.maxFiles`: целое положительное число (по умолчанию 3) — максимальное число изменённых файлов (тестовые файлы исключаются из подсчёта);

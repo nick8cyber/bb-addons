@@ -234,6 +234,7 @@ export interface DelegateDeps {
   unavailableRoutes?: () => ReadonlySet<string>;
   /** §18.1: human-facing texts — the language catalog. */
   t?: T;
+  log?: { warn?: (msg: string) => void; info?: (msg: string) => void };
 }
 
 /**
@@ -466,6 +467,8 @@ export async function runDelegate(
   }
 
   const held = store.heldGroups(Date.now());
+  const role = roleForLevel(level, policy);
+  const taskRow = store.getTask?.(taskKey);
   let routeName: string;
   let route: PolicyRoute;
   let reviewerWarning: string | undefined;
@@ -530,7 +533,10 @@ export async function runDelegate(
     }
     route = { preset: params.preset, provider };
   } else {
-    const isReview = roleForLevel(level, policy) === "auditor";
+    // §34.1 / §34.6: reviewer ≠ executor applies to auditors and architects on design_check
+    const isReview =
+      role === "auditor" ||
+      (role === "architect" && taskRow?.node === "design_check");
     let lastExecRoute: string | undefined;
     let lastExecProvider: string | undefined;
     let lastExecModel: string | undefined;
@@ -544,14 +550,24 @@ export async function runDelegate(
       if (pastExec) {
         lastExecRoute = pastExec.route;
         lastExecProvider = pastExec.provider;
+        lastExecModel = policy.routes[pastExec.route]?.model;
       }
-      const taskRow = store.getTask?.(taskKey);
       if (taskRow?.payload) {
         try {
           const p = JSON.parse(taskRow.payload);
-          if (p.last_executor_route) lastExecRoute = p.last_executor_route;
-          if (p.last_executor_provider) lastExecProvider = p.last_executor_provider;
-          if (p.last_executor_model) lastExecModel = p.last_executor_model;
+          if (taskRow.node === "spec_review") {
+            // For spec_review, take into account both the spec executor and the design architect
+            lastExecRoute = p.last_executor_route ?? p.design_architect_route ?? lastExecRoute;
+            lastExecProvider = p.last_executor_provider ?? p.design_architect_provider ?? lastExecProvider;
+            lastExecModel = p.last_executor_model ?? p.design_architect_model ?? lastExecModel;
+          } else {
+            if (p.last_executor_route) lastExecRoute = p.last_executor_route;
+            if (p.last_executor_provider) lastExecProvider = p.last_executor_provider;
+            if (p.last_executor_model) lastExecModel = p.last_executor_model;
+          }
+          if (lastExecRoute && !lastExecModel && policy.routes[lastExecRoute]?.model) {
+            lastExecModel = policy.routes[lastExecRoute]?.model;
+          }
         } catch {}
       }
     }
@@ -568,7 +584,11 @@ export async function runDelegate(
     route = picked.route;
     reviewerWarning = picked.warning;
     if (picked.warning) {
-      console.warn(`[orchestrator] ${picked.warning}`);
+      if (deps.log?.warn) {
+        deps.log.warn(`[orchestrator] ${picked.warning}`);
+      } else {
+        console.warn(`[orchestrator] ${picked.warning}`);
+      }
     }
   }
 
@@ -630,6 +650,13 @@ export async function runDelegate(
           : undefined,
       )) ?? null);
 
+  // §34.6 (ADR-0037): Read-only environment on design and design_check for architect
+  const effectiveNoCode =
+    params.noCode ??
+    (role === "architect" ||
+      taskRow?.node === "design" ||
+      taskRow?.node === "design_check");
+
   // Step 2 — the unique index makes this atomic across processes.
   let row;
   try {
@@ -644,7 +671,7 @@ export async function runDelegate(
       round,
       continueFrom,
       explicitRoute: params.route !== undefined || params.preset !== undefined,
-      noCode: params.noCode,
+      noCode: effectiveNoCode,
       // §20.1 п.4: the attach spec survives onto the row — a reissue
       // lists the same `--attach` paths in the seed prompt.
       attach:
@@ -669,6 +696,23 @@ export async function runDelegate(
     throw e;
   }
 
+  let instructions = reviewerWarning
+    ? (params.instructions
+        ? `${reviewerWarning}\n\n${params.instructions}`
+        : reviewerWarning)
+    : params.instructions;
+  // §34.6: Attach standardized design_check packet if present in task payload
+  if (taskRow?.node === "design_check" && taskRow?.payload) {
+    try {
+      const pl = JSON.parse(taskRow.payload);
+      if (typeof pl.design_check_packet === "string" && pl.design_check_packet) {
+        instructions = instructions
+          ? `${instructions}\n\n${pl.design_check_packet}`
+          : pl.design_check_packet;
+      }
+    } catch {}
+  }
+
   // Steps 3–7 — shared with the watchdog's reissue (§5.4): the same
   // function dispatches, attaches, finalizes and reports.
   let res: DispatchStepsResult;
@@ -676,11 +720,7 @@ export async function runDelegate(
     res = await dispatchToRoute(
       row,
       {
-        instructions: reviewerWarning
-          ? (params.instructions
-              ? `${reviewerWarning}\n\n${params.instructions}`
-              : reviewerWarning)
-          : params.instructions,
+        instructions,
         levelNote,
         // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
         commentOnRefusal: true,

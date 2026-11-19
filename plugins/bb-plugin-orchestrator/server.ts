@@ -1417,6 +1417,7 @@ export async function createPlugin(
         now: stepsDeps.now,
         policy: stepsDeps.policy,
         unavailableRoutes: stepsDeps.unavailableRoutes,
+        log: bb.log,
       });
     });
 
@@ -4099,6 +4100,7 @@ abandoned: ${res.reported
               now,
               hasChecksCommands: hasChecks,
               approvalMode: getApprovalMode(),
+              policy: policyLoad.policy ?? undefined,
             },
           );
           return json
