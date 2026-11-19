@@ -450,7 +450,7 @@ function toolListDir(args, ctx) {
   }
   let out = entries.join("\n");
   if (capped) out += `\n[... показаны первые ${MAX_LIST_ENTRIES} записей]`;
-  return { output: out };
+  return { output: out, range: { included: entries.length, total: capped ? null : entries.length } };
 }
 
 const GREP_DENY_GLOBS = [
@@ -1154,13 +1154,13 @@ export function truncResult(text) {
 }
 
 /** Обрезка UTF-8 строки по байтовому лимиту с сохранением валидности символов. */
-export function limitResult(text, maxBytes) {
+export function limitResult(text, maxBytes, marker = TRUNC_SUFFIX) {
   const totalBytes = Buffer.byteLength(text);
   if (totalBytes <= maxBytes) return { output: text };
   const buf = Buffer.from(text);
-  let end = Math.max(0, maxBytes - Buffer.byteLength(TRUNC_SUFFIX));
+  const suffix = Buffer.byteLength(marker) <= maxBytes ? marker : "";
+  let end = Math.max(0, maxBytes - Buffer.byteLength(suffix));
   while (end && (buf[end] & 0xc0) === 0x80) end--;
-  const suffix = Buffer.byteLength(TRUNC_SUFFIX) <= maxBytes ? TRUNC_SUFFIX : "";
   return { output: buf.subarray(0, end).toString("utf8") + suffix, truncated: { includedBytes: end, totalBytes } };
 }
 
@@ -1191,7 +1191,8 @@ export function executeTool(call, ctx = {}) {
     default: out = err(`unknown tool: ${call.name}`);
   }
   const text = out.error ? `error: ${out.error}` : String(out.output ?? "");
-  if (ctx.mask) return { ok: !out.error, ...limitResult(ctx.mask(text), ctx.maxResultBytes ?? MAX_TOOL_RESULT_BYTES) };
+  if (ctx.mask) return { ok: !out.error, ...limitResult(ctx.mask(text), ctx.maxResultBytes ?? MAX_TOOL_RESULT_BYTES),
+    ...(ctx.includeRanges && out.range ? { range: out.range } : {}) };
   return { ok: !out.error, output: truncResult(maskForWeb(text)) };
 }
 

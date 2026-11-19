@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer as httpServer } from "node:http";
+import { createServer as httpsServer } from "node:https";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -23,6 +25,41 @@ const blockText = (text) => ({ type: "text", text });
 const replyText = (messages) => messages.map((message) => message.params?.update)
   .filter((update) => update?.sessionUpdate === "agent_message_chunk")
   .map((update) => update.content.text).join("");
+
+const readAnswer = () => ({ text: "Fixture review\n{\"verdict\":\"OK\",\"blockers\":0}" });
+const toolCall = (id, name, args) => ({
+  id, type: "function", function: { name, arguments: JSON.stringify(args) },
+});
+const toolReply = (...tool_calls) => ({ choices: [{ message: { role: "assistant", content: null, tool_calls } }] });
+const agentDone = { choices: [{ message: { role: "assistant", content: "AGENT-FREE-FORM" } }] };
+
+async function gateway(t, respond, tls) {
+  const requests = [];
+  const handle = async (req, res) => {
+    try {
+      const body = [];
+      for await (const chunk of req) body.push(chunk);
+      const payload = JSON.parse(Buffer.concat(body).toString());
+      requests.push({ url: req.url, method: req.method, headers: req.headers, payload });
+      const result = respond(requests.length, req);
+      if (result === undefined) return;
+      res.writeHead(result.status ?? 200, { "Content-Type": "application/json", ...result.headers });
+      res.end(result.raw ?? JSON.stringify(result));
+    } catch (error) {
+      res.writeHead(500);
+      res.end();
+      requests.push({ error });
+    }
+  };
+  const listener = tls ? httpsServer(tls, handle) : httpServer(handle);
+  listener.listen(0, "127.0.0.1");
+  await once(listener, "listening");
+  t.after(() => new Promise((resolve) => {
+    listener.close(resolve);
+    listener.closeAllConnections();
+  }));
+  return { requests, baseUrl: (tls ? "https" : "http") + "://127.0.0.1:" + listener.address().port + "/compat/v1/" };
+}
 
 function setup(t) {
   const tmp = mkdtempSync(join(tmpdir(), "web-gemini-read-"));
@@ -200,7 +237,7 @@ function delivered(request) {
   const manifest = JSON.parse(json.join("\n"));
   const body = Buffer.from(content.slice(content.indexOf("=== Task text ===\n"), at));
   const materials = new Map();
-  for (const item of manifest.included) {
+  for (const item of [...manifest.included, ...(manifest.supplements ?? [])]) {
     const file = request.files.find((file) => file.path.endsWith("/" + item.delivery));
     const data = (file ? Buffer.from(file.data, "base64") : body).subarray(...item.range);
     assert.equal(data.length, item.bytes, item.source);
@@ -211,6 +248,228 @@ function delivered(request) {
   assert.equal(manifest.included[0].sha256, manifest.taskSha256);
   return { manifest, summary, materials, content };
 }
+
+test("fast agent reads a pinned snapshot through four tools and appends a masked, signed supplement", async (t) => {
+  const repo = setup(t);
+  const outside = join(repo.tmp, "outside.txt");
+  writeFileSync(outside, "OUTSIDE-SNAPSHOT");
+  repo.git("switch", "review");
+  symlinkSync(outside, join(repo.repo, "docs", "outward.txt"));
+  repo.git("add", "docs/outward.txt");
+  repo.git("commit", "-m", "Add outward symlink fixture");
+  const sha = repo.git("rev-parse", "HEAD");
+  repo.git("switch", "main");
+  const prompt = task("Review this revision. Task marker ZX67-marker.", EN, { ref: sha });
+  const commonSettings = { context: { maskPatterns: { [projectId]: [{ type: "project", pattern: "ZX[0-9]+-marker" }] } } };
+  const off = fixture(t, repo, readAnswer, { settings: commonSettings });
+  assert.equal((await off.prompt(await off.newSession(), prompt)).result?.stopReason, "end_turn");
+  const baseline = delivered(off.requests()[0]);
+  assert.equal(baseline.manifest.supplements, undefined);
+
+  const certFile = join(repo.tmp, "cert.pem");
+  const keyFile = join(repo.tmp, "key.pem");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
+    "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", keyFile, "-out", certFile], { stdio: "ignore" });
+  const mock = await gateway(t, (n) => {
+    if (n !== 1) return agentDone;
+    repo.git("update-ref", "refs/heads/review", repo.head);
+    return toolReply(
+      toolCall("read", "read_file", { path: "docs/notes.txt", from: 1, to: 2 }),
+      toolCall("list", "list_dir", { path: "docs" }),
+      toolCall("grep", "grep", { pattern: "ZX12-marker" }),
+      toolCall("git", "git", { args: "diff --stat" }),
+      toolCall("ancestor", "git", { args: "show HEAD~2:docs/notes.txt" }),
+      toolCall("unrelated", "git", { args: "show " + repo.head + ":docs/notes.txt" }),
+      toolCall("blame", "git", { args: "blame docs/notes.txt" }),
+      toolCall("symlink_diff", "git", { args: "show HEAD -- docs/outward.txt" }),
+      toolCall("outside", "read_file", { path: "../outside.txt" }),
+      toolCall("absolute", "read_file", { path: outside }),
+      toolCall("symlink", "read_file", { path: "docs/outward.txt" }),
+      toolCall("private", "read_file", { path: "private/.env.review" }),
+      toolCall("git_dir", "list_dir", { path: ".git" }),
+      toolCall("git_write", "git", { args: "config --list" }),
+      toolCall("extra_arg", "read_file", { path: "docs/notes.txt", shell: true }),
+    );
+  }, { cert: readFileSync(certFile), key: readFileSync(keyFile) });
+  const auth = "fixture-gateway-credential";
+  const on = fixture(t, repo, readAnswer, {
+    settings: { ...commonSettings, innerAgent: { enabled: true, gateway: { model: "fixture-fast", baseUrl: mock.baseUrl, tokenEnv: "FIXTURE_AGENT_TOKEN" } } },
+    env: { NODE_EXTRA_CA_CERTS: certFile, FIXTURE_AGENT_TOKEN: auth },
+  });
+  assert.equal((await on.prompt(await on.newSession(), prompt)).result?.stopReason, "end_turn");
+  assert.equal(mock.requests.length, 2);
+  const [{ payload, url, method, headers }, second] = mock.requests;
+  assert.equal(url, "/compat/v1/chat/completions");
+  assert.equal(method, "POST");
+  assert.equal(headers.authorization, "Bearer " + auth);
+  assert.equal(payload.stream, false);
+  assert.equal(payload.model, "fixture-fast");
+  assert.deepEqual(payload.tools.map((entry) => entry.function.name), ["read_file", "list_dir", "grep", "git"]);
+  assert.ok(payload.tools.every((entry) => entry.function.parameters.additionalProperties === false));
+  assert.deepEqual(payload.tools[0].function.parameters.properties.from, { type: "integer", minimum: 1 });
+  assert.match(payload.messages[1].content, /Core inventory.*review value/s);
+  const tools = new Map(second.payload.messages.filter((entry) => entry.role === "tool").map((entry) => [entry.tool_call_id, entry.content]));
+  assert.equal(tools.size, 15);
+  assert.match(tools.get("read"), /review value\n\[скрыто: project\]/);
+  assert.match(tools.get("list"), /docs\/review-only\.txt/);
+  assert.match(tools.get("grep"), /\[скрыто: project\]/);
+  assert.match(tools.get("git"), /docs\/notes.txt/);
+  assert.equal(tools.get("ancestor"), "base value\n");
+  assert.match(tools.get("blame"), /review value/);
+  assert.doesNotMatch(tools.get("symlink_diff"), /docs\/outward\.txt|outside\.txt|\/tmp/);
+  for (const id of ["outside", "absolute", "symlink", "private", "git_dir", "git_write", "extra_arg", "unrelated"]) {
+    assert.match(tools.get(id), /^error:/);
+  }
+  const actual = delivered(on.requests()[0]);
+  assert.equal(actual.manifest.coreSha256, baseline.manifest.coreSha256);
+  assert.deepEqual(actual.manifest.included, baseline.manifest.included);
+  assert.ok(actual.content.includes("=== Дополнения быстрого агента / Fast agent additions ==="));
+  const [read] = actual.manifest.supplements;
+  assert.equal(read.source, "добавил быстрый агент: docs/notes.txt");
+  assert.match(read.reason, /requested file text/);
+  assert.equal(read.revision, sha);
+  assert.deepEqual(read.sourceRange, { fromLine: 1, toLine: 2, totalLines: 3 });
+  assert.equal(read.included, "partial");
+  assert.deepEqual(actual.manifest.supplements.find((entry) => entry.tool === "git").revisionRange, [repo.base, sha]);
+  assert.equal(actual.manifest.supplements.find((entry) => entry.source.includes("HEAD~2")).revision, repo.base);
+  assert.deepEqual(actual.manifest.omitted.find((entry) => entry.source === read.source).missingRanges, [{ fromLine: 3, toLine: 3 }]);
+  assert.ok(actual.manifest.omitted.some((entry) => entry.reason.includes("read denied")));
+  assert.doesNotMatch(JSON.stringify([payload, second.payload]) + actual.content,
+    /ZX(?:12|67)-marker|different HEAD|OUTSIDE-SNAPSHOT|HIDDEN PATH CONTENT|AGENT-FREE-FORM|fixture-gateway-credential/);
+  const updates = on.messages.map((message) => message.params?.update).filter(Boolean);
+  const fast = updates.filter((update) => update.sessionUpdate === "tool_call" && update.title.startsWith("Fast agent"));
+  assert.equal(fast.length, 15);
+  for (const call of fast) assert.ok(updates.some((update) => update.sessionUpdate === "tool_call_update" &&
+    update.toolCallId === call.toolCallId && ["completed", "failed"].includes(update.status)));
+  assert.ok(updates.some((update) => update.content?.[0]?.content?.text?.includes("fast_agent_gateway")));
+});
+
+test("ordinary tasks read a local shallow clone without remotes, isolated from the working tree", async (t) => {
+  const repo = setup(t);
+  for (let n = 0; n < 51; n++) repo.git("commit", "--allow-empty", "-qm", "Local history " + n);
+  const checkout = join(repo.tmp, "worktree");
+  repo.git("worktree", "add", "--detach", checkout);
+  const cwd = join(checkout, "docs");
+  const git = (...args) => execFileSync("git", args, { cwd: checkout, encoding: "utf8" }).trim();
+  const sandboxParent = join(repo.tmp, "sandboxes");
+  mkdirSync(sandboxParent);
+  writeFileSync(join(cwd, "notes.txt"), "staged text\n");
+  git("add", "docs/notes.txt");
+  writeFileSync(join(cwd, "notes.txt"), "working text\n");
+  writeFileSync(join(cwd, "new.txt"), "untracked text\n");
+  writeFileSync(join(checkout, "outside-cwd.txt"), "ROOT-ONLY");
+  symlinkSync("../outside-cwd.txt", join(cwd, "escape.txt"));
+  let snapshot;
+  const mock = await gateway(t, (n) => {
+    if (n !== 1) return agentDone;
+    const [dir] = readdirSync(sandboxParent);
+    const snapshotRoot = join(sandboxParent, dir, "repo");
+    const snapshotGit = (...args) => execFileSync("git", args, { cwd: snapshotRoot, encoding: "utf8" }).trim();
+    snapshot = [statSync(join(snapshotRoot, ".git")).isDirectory(), snapshotGit("rev-parse", "--is-shallow-repository"), snapshotGit("remote")];
+    writeFileSync(join(cwd, "notes.txt"), "LATE-MUTATION");
+    return toolReply(
+      toolCall("dirty", "read_file", { path: "notes.txt" }),
+      toolCall("untracked", "read_file", { path: "new.txt" }),
+      toolCall("grep", "grep", { pattern: "untracked text" }),
+      toolCall("staged", "git", { args: "diff --cached" }),
+      toolCall("status", "git", { args: "status" }),
+      toolCall("no_escape", "read_file", { path: "escape.txt" }),
+      toolCall("no_root", "git", { args: "show HEAD:../outside-cwd.txt" }),
+    );
+  });
+  const acp = fixture(t, { ...repo, repo: cwd }, readAnswer, {
+    settings: { innerAgent: { enabled: true, model: "fixture-fast", gateway: { baseUrl: mock.baseUrl } } },
+    env: { TMPDIR: sandboxParent },
+  });
+  const response = await acp.prompt(await acp.newSession(), task("Read the current working context.", EN));
+  assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response));
+  assert.deepEqual(snapshot, [true, "true", ""]);
+  assert.deepEqual(readdirSync(sandboxParent), []);
+  assert.match(git("status", "--short"), /MM docs\/notes.txt/);
+  const actual = delivered(acp.requests()[0]);
+  assert.equal(actual.materials.get("добавил быстрый агент: notes.txt"), "working text\n");
+  assert.equal(actual.materials.get("добавил быстрый агент: new.txt"), "untracked text\n");
+  assert.match(actual.materials.get("добавил быстрый агент: grep"), /docs\/new.txt.*untracked text/);
+  assert.match(actual.materials.get("добавил быстрый агент: diff --cached"), /\+staged text/);
+  assert.match(actual.materials.get("добавил быстрый агент: status"), /MM .*docs\/notes.txt/);
+  assert.doesNotMatch(JSON.stringify(mock.requests) + actual.content, /ROOT-ONLY|LATE-MUTATION/);
+});
+
+test("fast agent failure, redirect and timeout preserve core and verified reads", async (t) => {
+  for (const [name, reply, reason] of [
+    ["malformed", { raw: "invalid JSON" }, /invalid gateway response/],
+    ["duplicate", toolReply(toolCall("read", "list_dir", {})), /invalid or duplicate gateway tool call/],
+    ["redirect", { status: 307, headers: { Location: "/untrusted" } }, /HTTP 307/],
+    ["timeout", undefined, /fast agent timed out/],
+  ]) await t.test(name, async (t) => {
+    const repo = setup(t);
+    const mock = await gateway(t, (n) => n === 1 ? toolReply(toolCall("read", "read_file", { path: "docs/review-only.txt" })) : reply);
+    const acp = fixture(t, repo, readAnswer, { settings: { innerAgent: {
+      enabled: true, timeoutMs: 1200, gateway: { baseUrl: mock.baseUrl, model: "fixture-fast" },
+    } } });
+    assert.equal((await acp.prompt(await acp.newSession(), task("Read failure case.", EN, { ref: repo.sha }))).result?.stopReason, "end_turn");
+    assert.equal(mock.requests.length, 2);
+    const actual = delivered(acp.requests()[0]);
+    assert.equal(actual.materials.get("добавил быстрый агент: docs/review-only.txt"), "review value match\n");
+    assert.ok(actual.manifest.omitted.some((entry) => reason.test(entry.reason)));
+  });
+});
+
+test("fast agent stops at call, round and byte limits and preserves core during delivery overflow", async (t) => {
+  const repo = setup(t);
+  const prompt = task("Read with limited enrichment.", EN, { ref: repo.sha });
+  const baseline = fixture(t, repo, readAnswer);
+  assert.equal((await baseline.prompt(await baseline.newSession(), prompt)).result?.stopReason, "end_turn");
+  const request = baseline.requests()[0];
+  const bytes = Buffer.byteLength(request.prompt) + request.files.reduce((sum, file) => sum + Buffer.from(file.data, "base64").length, 0);
+  const core = delivered(request).manifest.coreSha256;
+  for (const [name, limits, reason] of [
+    ["calls", { maxCalls: 1 }, /tool call limit reached/],
+    ["rounds", { maxRounds: 1 }, /round limit reached/],
+    ["bytes", { maxBytes: 64 }, /additional byte limit reached/],
+    ["delivery", {}, /delivery budget excluded/],
+    ["full-core", {}, /no delivery budget/],
+  ]) await t.test(name, async (t) => {
+    const long = ["bytes", "delivery"].includes(name);
+    const mock = await gateway(t, () => toolReply(
+      toolCall("read", "read_file", { path: long ? "docs/long.txt" : "docs/review-only.txt" }),
+      toolCall("list", "list_dir", {}),
+    ));
+    const acp = fixture(t, repo, readAnswer, { settings: {
+      innerAgent: { enabled: true, gateway: { baseUrl: mock.baseUrl, model: "fixture-fast" }, ...limits },
+      ...(name === "delivery" ? { context: { maxTotalBytes: bytes + 540 } } : {}),
+      ...(name === "full-core" ? { context: { maxTotalBytes: bytes } } : {}),
+    } });
+    assert.equal((await acp.prompt(await acp.newSession(), prompt)).result?.stopReason, "end_turn");
+    assert.equal(mock.requests.length, name === "full-core" ? 0 : 1);
+    const actual = delivered(acp.requests()[0]);
+    assert.equal(actual.manifest.coreSha256, core);
+    assert.ok(actual.manifest.omitted.some((entry) => reason.test(entry.reason)), JSON.stringify(actual.manifest.omitted));
+    if (name === "calls") assert.equal(actual.manifest.supplements.length, 1);
+    if (name === "rounds") assert.equal(actual.manifest.supplements.length, 2);
+    if (name === "bytes") {
+      const [item] = actual.manifest.supplements;
+      assert.equal(item.included, "partial");
+      assert.ok(item.bytes <= 64 && item.truncated.totalBytes > item.bytes);
+    }
+    if (["delivery", "full-core"].includes(name)) assert.equal(actual.manifest.supplements, undefined);
+  });
+});
+
+test("invalid fast-agent transport settings fail before gateway or web delivery", async (t) => {
+  const repo = setup(t);
+  const credentialUrl = ["https://user:secret", "example.invalid/v1"].join("@");
+  for (const baseUrl of ["http://example.invalid/v1", "http://127.1/v1", credentialUrl]) {
+    const acp = fixture(t, repo, readAnswer, {
+      settings: { innerAgent: { enabled: true, gateway: { baseUrl, model: "fixture-fast" } } },
+    });
+    const response = await acp.prompt(await acp.newSession(), task("Read transport check.", EN));
+    assert.equal(response.error?.data?.outcome, "not_started");
+    assert.match(response.error.message, /gateway/);
+    assert.doesNotMatch(response.error.message, /secret/);
+    assert.deepEqual(acp.requests(), []);
+  }
+});
 
 test("real BB generic ACP bridge retains tool progress before any assistant text", async (t) => {
   const sdk = dirname(fileURLToPath(import.meta.resolve("@get-bb/plugin-sdk/provider-bridge/acp")));
