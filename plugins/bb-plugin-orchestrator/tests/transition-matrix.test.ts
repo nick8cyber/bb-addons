@@ -21,7 +21,13 @@ function defaultCounters(): TransitionCounters {
 }
 
 test("TRANSITION_TABLE contains exactly 82 rules matching §28.1 matrix", () => {
-  const specPath = new URL("../../../docs/specs/orchestrator.md", import.meta.url).pathname;
+  const graphSpecPath = new URL(
+    "../../../docs/specs/orchestrator-graph.md",
+    import.meta.url,
+  ).pathname;
+  const specPath = fs.existsSync(graphSpecPath)
+    ? graphSpecPath
+    : new URL("../../../docs/specs/orchestrator.md", import.meta.url).pathname;
   const specContent = fs.readFileSync(specPath, "utf-8");
   const startIdx = specContent.indexOf("### 28.1 Полная матрица переходов");
   const endIdx = specContent.indexOf("### 28.2", startIdx);

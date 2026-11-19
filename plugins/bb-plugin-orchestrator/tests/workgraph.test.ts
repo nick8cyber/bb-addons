@@ -19,6 +19,11 @@ import {
   normalizeWorkGraphMode,
   runRunQueue,
   runResume,
+  runEnqueue,
+  DEFAULT_ALLOWED_ENV_VARS,
+  buildChecksEnvironment,
+  runTddFailFirstVerification,
+  formatDesignCheckPacket,
 } from "../src/workgraph.js";
 
 const ORIGINAL_BB_THREAD_ID = process.env.BB_THREAD_ID;
@@ -2031,4 +2036,105 @@ test("Round 5 Blocker 1: design_check preserves blockers count and prevents OK w
   t = store.getTask("DC-BLOCKERS")!;
   assert.equal(t.node, "release");
   assert.equal(t.status, "running");
+});
+
+test("§34.3 (ADR-0037): buildChecksEnvironment allows only whitelisted env vars and rejects secret keys in extraEnvVars", () => {
+  const fakeEnv = {
+    PATH: "/usr/bin",
+    HOME: "/home/user",
+    USER: "alice",
+    SECRET_TOKEN: "super-secret-123",
+    AWS_SECRET_KEY: "secret-key",
+    CI: "true",
+  };
+
+  const clean = buildChecksEnvironment(["APP_PORT", "DATABASE_URL"], DEFAULT_ALLOWED_ENV_VARS, fakeEnv as any);
+  assert.equal(clean.PATH, "/usr/bin");
+  assert.equal(clean.HOME, "/home/user");
+  assert.equal(clean.CI, "true");
+  assert.equal(clean.SECRET_TOKEN, undefined);
+  assert.equal(clean.AWS_SECRET_KEY, undefined);
+
+  // Forbidden extra env vars
+  assert.throws(
+    () => buildChecksEnvironment(["GITHUB_TOKEN"], DEFAULT_ALLOWED_ENV_VARS, fakeEnv as any),
+    (e: any) => e.code === "checks-invalid-env" && e.message.includes("TOKEN"),
+  );
+  assert.throws(
+    () => buildChecksEnvironment(["AWS_KEY"], DEFAULT_ALLOWED_ENV_VARS, fakeEnv as any),
+    (e: any) => e.code === "checks-invalid-env" && e.message.includes("KEY"),
+  );
+  assert.throws(
+    () => buildChecksEnvironment(["DB_PASSWORD"], DEFAULT_ALLOWED_ENV_VARS, fakeEnv as any),
+    (e: any) => e.code === "checks-invalid-env" && e.message.includes("PASSWORD"),
+  );
+  assert.throws(
+    () => buildChecksEnvironment(["APP_SECRET"], DEFAULT_ALLOWED_ENV_VARS, fakeEnv as any),
+    (e: any) => e.code === "checks-invalid-env" && e.message.includes("SECRET"),
+  );
+  assert.throws(
+    () => buildChecksEnvironment(["USER_CREDENTIAL"], DEFAULT_ALLOWED_ENV_VARS, fakeEnv as any),
+    (e: any) => e.code === "checks-invalid-env" && e.message.includes("CREDENTIAL"),
+  );
+});
+
+test("§34.4 (ADR-0037): Queue stall alarm sets node_alarm_at on enqueue and triggers alarm in run-queue", async () => {
+  const host = createFakePluginHost();
+  const db = host.bb.storage.database();
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  const t0 = 1000000;
+  const enq = await runEnqueue(
+    { taskKey: "STALL-1", route: "research", level: "research", dependsOn: "BLOCKER-1" },
+    { store, ctx: { projectId: "p1" }, workGraphMode: "strict", now: () => t0 },
+  );
+  assert.equal(enq.ok, true);
+  const t = store.getTask("STALL-1")!;
+  assert.equal(t.status, "queued");
+  assert.equal(t.node_alarm_at, t0 + 30 * 60_000);
+
+  // Fast-forward time past alarm
+  const t1 = t0 + 31 * 60_000;
+  await runRunQueue({ store, workGraphMode: "strict", now: () => t1, maxActiveTasks: 0 }); // 0 slots so it stays queued
+  const updated = store.getTask("STALL-1")!;
+  assert.equal(updated.status, "queued");
+  const p = JSON.parse(updated.payload!);
+  assert.equal(p.queued_stalled, true);
+
+  const events = store.listEvents("task.alarm_triggered");
+  assert.ok(events.some((e) => e.payload?.includes("queued-stalled") && e.payload?.includes("STALL-1")));
+});
+
+test("§34.5 (ADR-0037): TDD Fail-First Verification detects vacuous contracts", async () => {
+  const taskVacuous: any = {
+    task_key: "VAC-1",
+    payload: JSON.stringify({ mock_acceptance_vacuous: true }),
+  };
+  const resVac = await runTddFailFirstVerification({}, taskVacuous, "sha1");
+  assert.equal(resVac.failedAsExpected, false);
+  assert.ok(resVac.output?.includes("acceptance-contract-vacuous"));
+
+  const taskRed: any = {
+    task_key: "RED-1",
+    payload: JSON.stringify({ mock_acceptance_red: true }),
+  };
+  const resRed = await runTddFailFirstVerification({}, taskRed, "sha1");
+  assert.equal(resRed.failedAsExpected, true);
+});
+
+test("§34.6 (ADR-0037): formatDesignCheckPacket creates structured markdown", () => {
+  const packet = formatDesignCheckPacket({
+    taskKey: "ARCH-1",
+    acceptanceText: "- Test 1\n- Test 2",
+    netDiff: "+ line added",
+    checksRunJson: '{"exitCode":0}',
+    reviewVerdict: "OK",
+  });
+  assert.ok(packet.includes("ARCH-1"));
+  assert.ok(packet.includes("## 1. Договор приёмки"));
+  assert.ok(packet.includes("## 2. Нетто-дифф реализации"));
+  assert.ok(packet.includes("## 3. Протокол машинных проверок"));
+  assert.ok(packet.includes("## 4. Отчёт код-ревью"));
+  assert.ok(packet.includes('{"verdict":"OK"|"CHANGES"'));
 });

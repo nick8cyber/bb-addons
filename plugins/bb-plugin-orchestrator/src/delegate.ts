@@ -468,6 +468,7 @@ export async function runDelegate(
   const held = store.heldGroups(Date.now());
   let routeName: string;
   let route: PolicyRoute;
+  let reviewerWarning: string | undefined;
   if (params.preset) {
     // §17.3 (мелко 3): even outside the policy routes the LEVEL still
     // comes from the policy — an undeclared level is a refusal, as
@@ -529,13 +530,46 @@ export async function runDelegate(
     }
     route = { preset: params.preset, provider };
   } else {
+    const isReview = roleForLevel(level, policy) === "auditor";
+    let lastExecRoute: string | undefined;
+    let lastExecProvider: string | undefined;
+    let lastExecModel: string | undefined;
+    if (isReview) {
+      const pastExec = store
+        .delegationsByTask(taskKey)
+        .filter(
+          (r) => roleForLevel(r.level, policy) === "executor" && r.status === "done",
+        )
+        .at(-1);
+      if (pastExec) {
+        lastExecRoute = pastExec.route;
+        lastExecProvider = pastExec.provider;
+      }
+      const taskRow = store.getTask?.(taskKey);
+      if (taskRow?.payload) {
+        try {
+          const p = JSON.parse(taskRow.payload);
+          if (p.last_executor_route) lastExecRoute = p.last_executor_route;
+          if (p.last_executor_provider) lastExecProvider = p.last_executor_provider;
+          if (p.last_executor_model) lastExecModel = p.last_executor_model;
+        } catch {}
+      }
+    }
     const picked = pickRoute(policy, level, {
       requested: params.route,
       unavailableRoutes: new Set(load.unavailableRoutes),
       heldGroups: held,
+      skipSameModelAsExecutor: isReview,
+      lastExecutorRoute: lastExecRoute,
+      lastExecutorProvider: lastExecProvider,
+      lastExecutorModel: lastExecModel,
     });
     routeName = picked.name;
     route = picked.route;
+    reviewerWarning = picked.warning;
+    if (picked.warning) {
+      console.warn(`[orchestrator] ${picked.warning}`);
+    }
   }
 
   // Limits (§4 step 1) — over the limit is a refusal, not a queue (§10).
@@ -642,7 +676,11 @@ export async function runDelegate(
     res = await dispatchToRoute(
       row,
       {
-        instructions: params.instructions,
+        instructions: reviewerWarning
+          ? (params.instructions
+              ? `${reviewerWarning}\n\n${params.instructions}`
+              : reviewerWarning)
+          : params.instructions,
         levelNote,
         // §17.2 (PLUG-211 С4): a manual delegate owns the refusal comment.
         commentOnRefusal: true,

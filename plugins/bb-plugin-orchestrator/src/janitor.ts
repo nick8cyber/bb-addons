@@ -454,6 +454,106 @@ function parseWorktreeList(
   return { worktrees };
 }
 
+/**
+ * §34.2 (r34.5, ADR-0037): Check whether a worktree path matches service worktree patterns:
+ * wt/release, wt/sync, wt/<KEY>-<round>, worktrees/release-*, worktrees/sync-*, worktrees/<KEY>-*
+ */
+export function isServiceWorktreePath(worktreePath: string): {
+  isService: boolean;
+  taskKey?: string;
+  isReleaseOrSync?: boolean;
+} {
+  const norm = worktreePath.replace(/\\/g, "/");
+  if (/(?:^|\/)(?:wt\/(?:release|sync)|worktrees\/(?:release|sync)[^\/]*)$/.test(norm)) {
+    return { isService: true, isReleaseOrSync: true };
+  }
+  const taskMatch = /(?:^|\/)(?:wt\/([A-Za-z]+-\d+)(?:-\d+)?|worktrees\/([A-Za-z]+-\d+)[^\/]*)$/.exec(norm);
+  if (taskMatch) {
+    const key = (taskMatch[1] ?? taskMatch[2])?.toUpperCase();
+    return { isService: true, taskKey: key };
+  }
+  return { isService: false };
+}
+
+/**
+ * §34.2 (r34.5, ADR-0037): Determine whether a service worktree is prunable.
+ */
+export async function evaluateServiceWorktreePrunable(
+  wtPath: string,
+  deps: {
+    store?: DelegationStore;
+    cmd: CmdRunner;
+    now?: () => number;
+  },
+  timeoutMs: number = 2 * 3600_000,
+): Promise<{ prunable: boolean; reason: string; taskKey?: string }> {
+  const check = isServiceWorktreePath(wtPath);
+  if (!check.isService) {
+    return { prunable: false, reason: "not-service-worktree" };
+  }
+  const now = deps.now ? deps.now() : Date.now();
+
+  // Condition 1: Associated task finished (done or cancelled)
+  if (check.taskKey && deps.store) {
+    const task = deps.store.getTask(check.taskKey);
+    if (task && (task.status === "done" || task.status === "cancelled")) {
+      return {
+        prunable: true,
+        reason: `task-finished:${task.status}`,
+        taskKey: check.taskKey,
+      };
+    }
+    const delegations = deps.store.delegationsByTask(check.taskKey);
+    if (
+      delegations.length > 0 &&
+      delegations.every((d) => d.status === "done" || d.status === "cancelled")
+    ) {
+      return {
+        prunable: true,
+        reason: "all-delegations-finished",
+        taskKey: check.taskKey,
+      };
+    }
+  }
+
+  // Condition 2: Release/sync completed, or Condition 3: Inactivity timeout
+  try {
+    const stat = statSync(wtPath);
+    const mtime = stat.mtimeMs;
+    const idleMs = now - mtime;
+    if (idleMs > timeoutMs) {
+      if (check.taskKey && deps.store) {
+        const task = deps.store.getTask(check.taskKey);
+        if (
+          task &&
+          (task.status === "running" ||
+            task.status === "queued" ||
+            task.status === "waiting_approval")
+        ) {
+          return { prunable: false, reason: "task-active" };
+        }
+        const activeDelegations = deps.store
+          .delegationsByTask(check.taskKey)
+          .filter(
+            (d) => d.status === "running" || d.status === "dispatching",
+          );
+        if (activeDelegations.length > 0) {
+          return { prunable: false, reason: "delegation-active" };
+        }
+      }
+      return {
+        prunable: true,
+        reason: `idle-timeout:${Math.round(idleMs / 1000)}s`,
+        taskKey: check.taskKey,
+      };
+    }
+  } catch {
+    return { prunable: true, reason: "missing-worktree-dir", taskKey: check.taskKey };
+  }
+
+  return { prunable: false, reason: "active-or-fresh" };
+}
+
 export function createJanitor(deps: JanitorDeps) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? {};
@@ -1532,6 +1632,7 @@ export function createJanitor(deps: JanitorDeps) {
       mode: "report",
       afterMergeMs: 10 * 3_600_000,
       abandonedAfterMs: 10 * 86_400_000,
+      serviceWorktreeTimeoutMs: 2 * 3_600_000,
       intervalMinutes: 60,
       excludeProjects: [],
       protectedBranches: ["main", "master", "dev"],
@@ -3295,6 +3396,100 @@ export function createJanitor(deps: JanitorDeps) {
             { state: "removed", reason: "removed" },
             at,
           );
+        }
+      }
+    }
+
+    // §15 / §34.2 (r34.5, ADR-0037): Cleanup service worktrees (wt/release, wt/sync, wt/<KEY>-*, worktrees/*)
+    for (const repo of repoInfos) {
+      if (repo.worktreeListFailed) continue;
+      for (const wtPath of repo.worktreePaths) {
+        if (wtPath === repo.root) continue;
+        const check = isServiceWorktreePath(wtPath);
+        if (!check.isService) continue;
+
+        const evalRes = await evaluateServiceWorktreePrunable(
+          wtPath,
+          {
+            store: deps.store,
+            cmd: deps.cmd,
+            now: () => at,
+          },
+          cfg.serviceWorktreeTimeoutMs,
+        );
+
+        if (evalRes.prunable) {
+          const envId = `service-wt:${wtPath}`;
+          if (apply) {
+            log.info?.(
+              `orchestrator janitor: removing service worktree ${wtPath} (${evalRes.reason})`,
+            );
+            const rmRes = await gitOut(deps.cmd, repo.root, [
+              "worktree",
+              "remove",
+              "--force",
+              wtPath,
+            ]);
+            if (rmRes !== null) {
+              summary.removedCopies += 1;
+              log.info?.(`orchestrator janitor: removed service worktree ${wtPath}`);
+              summary.removedItems.push({
+                envId,
+                branch: null,
+                repo: repo.commonDir,
+                tipSha: null,
+                headSha: null,
+              });
+              if (ledger) {
+                deps.janitor.upsertItem(
+                  envId,
+                  {
+                    path: wtPath,
+                    state: "removed",
+                    reason: "janitor: service-worktree-pruned",
+                    removedAt: at,
+                  },
+                  at,
+                );
+              }
+              if (evalRes.taskKey && deps.store) {
+                deps.store.recordTaskEvent(
+                  "task.janitor_pruned",
+                  {
+                    task: evalRes.taskKey,
+                    taskKey: evalRes.taskKey,
+                    path: wtPath,
+                    reason: "janitor: service-worktree-pruned",
+                  },
+                  at,
+                );
+              }
+            } else {
+              keep(summary, "service-worktree-remove-failed");
+            }
+          } else {
+            summary.ready += 1;
+            summary.readyItems.push({
+              envId,
+              projectId: null,
+              path: wtPath,
+              branch: null,
+              reason: "service-worktree-prunable",
+              threadId: null,
+              isNew: true,
+            });
+            if (ledger) {
+              deps.janitor.upsertItem(
+                envId,
+                {
+                  path: wtPath,
+                  state: "reported",
+                  reason: "service-worktree-prunable",
+                },
+                at,
+              );
+            }
+          }
         }
       }
     }

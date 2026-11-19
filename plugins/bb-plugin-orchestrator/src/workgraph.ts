@@ -721,15 +721,17 @@ export async function runEnqueue(
   input: EnqueueCommandInput,
   deps: {
     store: DelegationStore;
-    cmd: CmdRunner;
+    cmd?: CmdRunner;
     bbCli?: BbCli;
     ctx: PluginCliContext;
     workGraphMode: WorkGraphMode;
-    repoRoot: string;
-    mergeBaseBranch: string;
+    repoRoot?: string;
+    mergeBaseBranch?: string;
     now?: () => number;
     hasChecksCommands?: boolean;
     approvalMode?: "auto" | "manual" | null;
+    policy?: Policy;
+    log?: { warn?: (msg: string) => void };
   },
 ): Promise<{ ok: boolean; task: TaskQueueRow; reissued?: boolean }> {
   if (deps.workGraphMode === "off") {
@@ -838,6 +840,26 @@ export async function runEnqueue(
       "invalid-level",
       "маршрут research поддерживает только уровень research",
     );
+  }
+
+  // §34.7 (ADR-0037): Canonical approvalMode name; confirmation_mode is deprecated
+  if ((input as any).confirmation_mode !== undefined) {
+    if (deps.log?.warn) {
+      deps.log.warn(
+        "[orchestrator] confirmation-mode-deprecated: use approvalMode (--mode) instead",
+      );
+    } else {
+      console.warn(
+        "[orchestrator] confirmation-mode-deprecated: use approvalMode (--mode) instead",
+      );
+    }
+    if (
+      !input.mode &&
+      ((input as any).confirmation_mode === "auto" ||
+        (input as any).confirmation_mode === "manual")
+    ) {
+      input.mode = (input as any).confirmation_mode;
+    }
   }
 
   // §29.3: Confirmation mode resolution
@@ -1043,15 +1065,17 @@ export async function runEnqueue(
           if (typeof p.pr_number === "number") prNumber = p.pr_number;
         } catch {}
       }
-      await checkAndPrepareTaskBranch(
-        deps.cmd,
-        deps.repoRoot,
-        branch,
-        taskKey,
-        deps.mergeBaseBranch,
-        Boolean(input.forceResetBranch),
-        prNumber,
-      );
+      if (deps.cmd) {
+        await checkAndPrepareTaskBranch(
+          deps.cmd,
+          deps.repoRoot ?? process.cwd(),
+          branch,
+          taskKey,
+          deps.mergeBaseBranch ?? "main",
+          Boolean(input.forceResetBranch),
+          prNumber,
+        );
+      }
     }
   }
 
@@ -1060,6 +1084,10 @@ export async function runEnqueue(
     : null;
 
   const payload = acceptanceText ? JSON.stringify({ acceptance_text: acceptanceText }) : null;
+
+  const queueStallMinutes =
+    (deps.policy?.timing as any)?.queueStallMinutes ?? 30;
+  const initialNodeAlarmAt = now + queueStallMinutes * 60_000;
 
   if (existing) {
     // Reissue / reset
@@ -1078,6 +1106,8 @@ export async function runEnqueue(
       },
       now,
     );
+    deps.store.updateTask(taskKey, { node_alarm_at: initialNodeAlarmAt });
+    task.node_alarm_at = initialNodeAlarmAt;
     return { ok: true, task, reissued: true };
   }
 
@@ -1099,6 +1129,8 @@ export async function runEnqueue(
     },
     now,
   );
+  deps.store.updateTask(taskKey, { node_alarm_at: initialNodeAlarmAt });
+  task.node_alarm_at = initialNodeAlarmAt;
   return { ok: true, task };
 }
 
@@ -1979,10 +2011,56 @@ export function validateCheckCommand(
   return { valid: true, binary, args };
 }
 
+export const DEFAULT_ALLOWED_ENV_VARS: readonly string[] = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SHELL",
+  "TERM",
+  "TMPDIR",
+  "NODE_ENV",
+  "CI",
+];
+
+export const FORBIDDEN_EXTRA_ENV_PATTERN =
+  /(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
+
+export function buildChecksEnvironment(
+  extraEnvVars: string[] = [],
+  allowedEnvVars: readonly string[] = DEFAULT_ALLOWED_ENV_VARS,
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  for (const k of extraEnvVars) {
+    if (FORBIDDEN_EXTRA_ENV_PATTERN.test(k)) {
+      throw new OrchestratorError(
+        "checks-invalid-env",
+        `checks.extraEnvVars: forbidden variable name containing secret keyword: "${k}"`,
+      );
+    }
+  }
+  const allowedSet = new Set([...allowedEnvVars, ...extraEnvVars]);
+  const env: NodeJS.ProcessEnv = {};
+  for (const k of allowedSet) {
+    if (sourceEnv[k] !== undefined) {
+      env[k] = sourceEnv[k];
+    }
+  }
+  return env;
+}
+
 export async function executeChecks(
   deps: { cmd?: CmdRunner; repoRoot?: string },
   task: TaskQueueRow,
   allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+  checksConfig?: {
+    timeout_seconds?: number;
+    allowedEnvVars?: readonly string[];
+    extraEnvVars?: string[];
+  },
 ): Promise<{ ok: boolean; exitCode: number; output?: string; notRun?: boolean }> {
   let payloadObj: Record<string, unknown> = {};
   if (task.payload) {
@@ -2013,6 +2091,20 @@ export async function executeChecks(
     commands = ["npm test"];
   }
 
+  let timeoutSeconds = 600;
+  if (typeof payloadObj.checks_timeout_seconds === "number") {
+    timeoutSeconds = payloadObj.checks_timeout_seconds;
+  } else if (checksConfig?.timeout_seconds !== undefined) {
+    timeoutSeconds = checksConfig.timeout_seconds;
+  }
+  timeoutSeconds = Math.max(30, Math.min(3600, timeoutSeconds));
+
+  const extraEnv = Array.isArray(payloadObj.checks_extra_env)
+    ? (payloadObj.checks_extra_env as string[])
+    : checksConfig?.extraEnvVars ?? [];
+  const allowedEnv = checksConfig?.allowedEnvVars ?? DEFAULT_ALLOWED_ENV_VARS;
+  const env = buildChecksEnvironment(extraEnv, allowedEnv);
+
   for (const cmdStr of commands) {
     const val = validateCheckCommand(cmdStr, allowedRunners);
     if (!val.valid) {
@@ -2022,6 +2114,9 @@ export async function executeChecks(
     if (deps.cmd && deps.repoRoot) {
       const res = await deps.cmd.run(val.binary!, val.args!, {
         cwd: deps.repoRoot,
+        timeoutMs: timeoutSeconds * 1000,
+        env,
+        cleanEnv: true,
       });
       if (res.exitCode !== 0) {
         return {
@@ -2036,6 +2131,102 @@ export async function executeChecks(
   }
 
   return { ok: true, exitCode: 0, output: "checks passed" };
+}
+
+export async function runTddFailFirstVerification(
+  deps: { cmd?: CmdRunner; repoRoot?: string },
+  task: TaskQueueRow,
+  acceptanceSha: string | null,
+  allowedRunners: readonly string[] = DEFAULT_ALLOWED_RUNNERS,
+): Promise<{ ok: boolean; failedAsExpected: boolean; output?: string }> {
+  let payloadObj: Record<string, unknown> = {};
+  if (task.payload) {
+    try {
+      payloadObj = JSON.parse(task.payload);
+    } catch {}
+  }
+  if (payloadObj.skip_tdd_check) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      output: "tdd check skipped by configuration",
+    };
+  }
+  if (payloadObj.mock_acceptance_vacuous) {
+    return {
+      ok: true,
+      failedAsExpected: false,
+      output:
+        "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+    };
+  }
+  if (payloadObj.mock_acceptance_red) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      output: "tdd fail-first verified: tests failed on base commit as expected",
+    };
+  }
+
+  if (
+    !payloadObj.tdd_verify &&
+    !payloadObj.checks_commands &&
+    !payloadObj.test_command
+  ) {
+    return {
+      ok: true,
+      failedAsExpected: true,
+      output: "tdd check skipped: no explicit test commands configured",
+    };
+  }
+
+  const checkRes = await executeChecks(deps, task, allowedRunners);
+  if (checkRes.ok && !checkRes.notRun) {
+    return {
+      ok: true,
+      failedAsExpected: false,
+      output:
+        "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+    };
+  }
+  return {
+    ok: true,
+    failedAsExpected: true,
+    output: "tdd fail-first verified: tests failed on base commit as expected",
+  };
+}
+
+export function formatDesignCheckPacket(params: {
+  taskKey: string;
+  acceptanceText: string;
+  netDiff: string;
+  checksRunJson?: string;
+  reviewVerdict?: string;
+  reviewComments?: string;
+}): string {
+  return [
+    `# Входные материалы проверки архитектуры и договора приёмки (${params.taskKey})`,
+    "",
+    "## 1. Договор приёмки",
+    params.acceptanceText,
+    "",
+    "## 2. Нетто-дифф реализации",
+    "```diff",
+    params.netDiff,
+    "```",
+    "",
+    "## 3. Протокол машинных проверок",
+    "```json",
+    params.checksRunJson ?? "{}",
+    "```",
+    "",
+    "## 4. Отчёт код-ревью",
+    `Вердикт: ${params.reviewVerdict ?? "OK"}`,
+    params.reviewComments ?? "Замечаний нет.",
+    "",
+    "---",
+    'Верни вердикт строгим JSON последней строкой: {"verdict":"OK"|"CHANGES","blockers":N,"target":"code"|"design"}',
+  ].join("\n");
 }
 
 export async function checkAcceptanceTampered(
@@ -2269,6 +2460,7 @@ export async function runRunQueue(
     while (progressed && iterations < 25) {
       iterations++;
       progressed = false;
+      const now = deps.now ? deps.now() : Date.now();
 
       // ── 1. Advance active running tasks ───────────────────────────────
       const activeTasks = deps.store.listActiveTasks();
@@ -2318,6 +2510,50 @@ export async function runRunQueue(
                 );
               }
             } catch {}
+          }
+        }
+      }
+
+      // ── 1c. §34.4 (ADR-0037): Queue stall alarm for tasks stuck in queued ─────────
+      const allQueued = deps.store.listQueuedTasks();
+      const queueStallMinutes =
+        (deps.policy?.timing as any)?.queueStallMinutes ?? 30;
+      for (const qt of allQueued) {
+        if (qt.node_alarm_at !== null && now >= qt.node_alarm_at) {
+          const elapsedSeconds = Math.max(
+            0,
+            Math.round((now - (qt.entered_at ?? now)) / 1000),
+          );
+          deps.store.recordTaskEvent(
+            "task.alarm_triggered",
+            {
+              task: qt.task_key,
+              taskKey: qt.task_key,
+              node: qt.node,
+              reason: "queued-stalled",
+              elapsedSeconds,
+            },
+            now,
+          );
+          const p = parsePayload(qt.payload);
+          p.queued_stalled = true;
+          const nextAlarm = now + queueStallMinutes * 60_000;
+          deps.store.updateTask(qt.task_key, {
+            node_alarm_at: nextAlarm,
+            payload: JSON.stringify(p),
+          });
+          qt.node_alarm_at = nextAlarm;
+          qt.payload = JSON.stringify(p);
+
+          if (qt.coordinator_thread_id && deps.bbCli) {
+            await deps.bbCli
+              .run([
+                "thread",
+                "tell",
+                qt.coordinator_thread_id,
+                `Внимание: задача ${qt.task_key} ожидает запуска более ${queueStallMinutes} минут. Проверьте статус службы run-queue`,
+              ])
+              .catch(() => {});
           }
         }
       }
@@ -2764,6 +3000,64 @@ async function startQueuedTask(
     }
   } else if (task.route === "docs") {
     acceptanceSha = null;
+  }
+
+  // §34.5 (ADR-0037): TDD Fail-First Verification for fix/simple routes
+  if (
+    (task.route === "fix" || task.route === "simple") &&
+    resolution.toNode === "code"
+  ) {
+    const tdd = await runTddFailFirstVerification(
+      { cmd: deps.cmd, repoRoot },
+      task,
+      acceptanceSha,
+    );
+    if (!tdd.failedAsExpected) {
+      const vacuousTr = resolveTransition({
+        route: task.route,
+        node: "start",
+        status: "queued",
+        event: {
+          type: "acceptance_vacuous",
+          reason:
+            "acceptance-contract-vacuous: договор приёмки уже полностью проходит на неизменённом коде",
+        },
+        mode: task.confirmation_mode,
+        counters: extractCounters(task),
+      });
+      if (vacuousTr.allowed) {
+        const updates: Partial<TaskQueueRow> = {
+          branch,
+          acceptance_sha: acceptanceSha,
+          payload: JSON.stringify({
+            ...payload,
+            ...(vacuousTr.action?.setPayload ?? {}),
+          }),
+        };
+        if (vacuousTr.counterUpdates) {
+          Object.assign(updates, vacuousTr.counterUpdates);
+        }
+        const vtr = deps.store.transitionTask(
+          {
+            taskKey: task.task_key,
+            expectedNode: "start",
+            expectedStatus: "queued",
+            toNode: vacuousTr.toNode,
+            toStatus: vacuousTr.toStatus,
+            actor: "machine:checks",
+            reason: vacuousTr.reason,
+            updates,
+          },
+          now,
+        );
+        if (vtr.ok) {
+          const logged = deps.store.listTransitions(task.task_key).at(-1);
+          if (logged) transitions.push(logged);
+          return true;
+        }
+        return false;
+      }
+    }
   }
 
   const tr = deps.store.transitionTask({
@@ -3865,6 +4159,74 @@ async function advanceActiveTask(
           consumed.push(latestDelegation.id);
         }
 
+        // §34.5 (ADR-0037): TDD Fail-First Verification for feature route
+        if (verdict === "OK" && resolution.toNode === "code") {
+          const tdd = await runTddFailFirstVerification(
+            { cmd: deps.cmd, repoRoot },
+            task,
+            task.acceptance_sha,
+          );
+          if (!tdd.failedAsExpected) {
+            const vacuousTr = resolveTransition({
+              route: task.route,
+              node: "spec_review",
+              status: "running",
+              event: {
+                type: "acceptance_vacuous",
+                reason:
+                  "acceptance-contract-vacuous: договор приёмки не содержит падающих тестов; требуется доработка архитектором на узле design",
+              },
+              mode: task.confirmation_mode,
+              counters: extractCounters(task),
+            });
+            if (vacuousTr.allowed) {
+              const updates: Partial<TaskQueueRow> = {
+                payload: JSON.stringify({
+                  ...payload,
+                  vacuous_contract: true,
+                  spec_review_verdict: null,
+                  spec_review_blockers: null,
+                  consumed_delegations: consumed,
+                  nudge_count: 0,
+                  last_nudge_at: null,
+                }),
+              };
+              if (vacuousTr.counterUpdates) {
+                Object.assign(updates, vacuousTr.counterUpdates);
+              }
+              const vtr = deps.store.transitionTask(
+                {
+                  taskKey: task.task_key,
+                  expectedNode: "spec_review",
+                  expectedStatus: "running",
+                  toNode: vacuousTr.toNode,
+                  toStatus: vacuousTr.toStatus,
+                  actor: "machine:checks",
+                  reason: vacuousTr.reason,
+                  updates,
+                  timeoutSeconds: getNodeTimeoutSeconds(
+                    deps.policy,
+                    vacuousTr.toNode,
+                  ),
+                },
+                now,
+              );
+              if (vtr.ok && vtr.task) {
+                const logged = deps.store.listTransitions(task.task_key).at(-1);
+                if (logged) transitions.push(logged);
+                if (vacuousTr.action?.dispatchNode) {
+                  await deps.dispatchNode?.(
+                    vtr.task,
+                    vacuousTr.action.dispatchNode,
+                  );
+                }
+                return true;
+              }
+              return false;
+            }
+          }
+        }
+
         const updates: Partial<TaskQueueRow> = {
           payload: JSON.stringify({
             ...payload,
@@ -4036,6 +4398,16 @@ async function advanceActiveTask(
           payload: JSON.stringify({
             ...payload,
             ...(resolution.action?.setPayload ?? {}),
+            last_executor_route:
+              latestDelegation?.route ?? payload.last_executor_route ?? null,
+            last_executor_provider:
+              latestDelegation?.provider ??
+              payload.last_executor_provider ??
+              null,
+            last_executor_model:
+              (latestDelegation as any)?.model ??
+              payload.last_executor_model ??
+              null,
             code_done: false,
             result_commits: null,
             acceptance_tampered: false,

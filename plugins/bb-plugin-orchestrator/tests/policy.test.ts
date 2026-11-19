@@ -770,3 +770,47 @@ test("§30.1: policy supports role 'architect' and level 'spec'", () => {
   assert.equal(levelRole(load.policy, "custom_arch"), "architect");
   assert.equal(levelRole(load.policy, "spec"), "executor");
 });
+
+test("§34.1 (ADR-0037): pickRoute with skipSameModelAsExecutor skips matching reviewer and warns on fallback", () => {
+  const pol = JSON.stringify({
+    version: 1,
+    levels: {
+      review: { role: "auditor", chain: ["rev-claude", "rev-gemini"] },
+      "review-single": { role: "auditor", chain: ["rev-claude"] },
+    },
+    routes: {
+      "rev-claude": { preset: "p-claude", provider: "claude-code" },
+      "rev-gemini": { preset: "p-gemini", provider: "agy" },
+    },
+  });
+  const pr = new Set(["p-claude", "p-gemini"]);
+  const load = parsePolicy(pol, pr);
+  assert.equal(load.errors.length, 0);
+
+  // 1. Skips first candidate matching executor provider in favor of next
+  const picked1 = pickRoute(load.policy!, "review", {
+    skipSameModelAsExecutor: true,
+    lastExecutorProvider: "claude-code",
+  });
+  assert.equal(picked1.name, "rev-gemini");
+  assert.equal(picked1.warning, undefined);
+
+  // 2. Only single route matching executor in chain -> falls back with warning
+  const picked2 = pickRoute(load.policy!, "review-single", {
+    skipSameModelAsExecutor: true,
+    lastExecutorProvider: "claude-code",
+  });
+  assert.equal(picked2.name, "rev-claude");
+  assert.ok(picked2.warning?.includes("reviewer-same-model"));
+  assert.ok(picked2.warning?.includes("claude-code"));
+
+  // 3. Explicit requested route matching executor -> returns requested with warning
+  const picked3 = pickRoute(load.policy!, "review", {
+    requested: "rev-claude",
+    skipSameModelAsExecutor: true,
+    lastExecutorProvider: "claude-code",
+  });
+  assert.equal(picked3.name, "rev-claude");
+  assert.ok(picked3.warning?.includes("reviewer-same-model"));
+});
+

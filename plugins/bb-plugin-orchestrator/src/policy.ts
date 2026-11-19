@@ -34,6 +34,8 @@ export interface PolicyRoute {
   /** §20.1 п.5: how long a queued dispatch waits for a busy route before
    * the next chain route is tried (default 1200). */
   routeBusyWaitSeconds?: number;
+  /** §34.1 (ADR-0037): explicit model name for route matching / reviewer ≠ executor. */
+  model?: string;
 }
 
 /** §2.3: what a level's delegation does — executes, only checks, or
@@ -300,6 +302,7 @@ export function parsePolicy(
           ...(routeBusyWait !== undefined
             ? { routeBusyWaitSeconds: routeBusyWait }
             : {}),
+          ...(isNonEmptyString(value.model) ? { model: value.model } : {}),
         };
       }
     }
@@ -919,8 +922,12 @@ export function pickRoute(
     requested?: string;
     unavailableRoutes?: ReadonlySet<string>;
     heldGroups?: ReadonlySet<string>;
+    skipSameModelAsExecutor?: boolean;
+    lastExecutorRoute?: string;
+    lastExecutorProvider?: string;
+    lastExecutorModel?: string;
   } = {},
-): { name: string; route: PolicyRoute } {
+): { name: string; route: PolicyRoute; warning?: string } {
   const level = policy.levels[levelName];
   if (!level) {
     throw new OrchestratorError(
@@ -952,6 +959,35 @@ export function pickRoute(
       !canonHeld.has(qg)
     );
   };
+
+  const matchesExecutor = (name: string): boolean => {
+    const resolved = resolvePolicyRoute(policy, name);
+    const r = resolved?.route;
+    if (!r) return false;
+    if (
+      opts.lastExecutorProvider &&
+      r.provider &&
+      r.provider === opts.lastExecutorProvider
+    ) {
+      return true;
+    }
+    if (
+      opts.lastExecutorModel &&
+      r.model &&
+      r.model === opts.lastExecutorModel
+    ) {
+      return true;
+    }
+    if (opts.lastExecutorRoute) {
+      const names = new Set([
+        ...routeNameChain(name, policy.routeAliases),
+        resolved.name,
+      ]);
+      if (names.has(opts.lastExecutorRoute)) return true;
+    }
+    return false;
+  };
+
   if (opts.requested !== undefined) {
     const resolved = resolvePolicyRoute(policy, opts.requested);
     // §2.3: `--route` names any route of the policy, not only the level's
@@ -969,9 +1005,35 @@ export function pickRoute(
         `route "${opts.requested}" is unavailable (missing preset or route/quota hold)`,
       );
     }
-    return resolved;
+    let warning: string | undefined;
+    if (opts.skipSameModelAsExecutor && matchesExecutor(resolved.name)) {
+      const provider =
+        opts.lastExecutorProvider ?? resolved.route.provider ?? "same";
+      warning = `warning: reviewer-same-model: ревьюер и исполнитель используют одного провайдера/модель (${provider}); рекомендуется добавить альтернативный маршрут в цепочку уровня`;
+    }
+    return { ...resolved, ...(warning ? { warning } : {}) };
   }
-  const name = level.chain.find(usable);
+
+  let name: string | undefined;
+  let reviewerSameModelWarning: string | undefined;
+
+  if (opts.skipSameModelAsExecutor) {
+    name = level.chain.find((n) => usable(n) && !matchesExecutor(n));
+    if (!name) {
+      name = level.chain.find(usable);
+      if (name) {
+        const resolvedFallback = resolvePolicyRoute(policy, name);
+        const provider =
+          opts.lastExecutorProvider ??
+          resolvedFallback?.route.provider ??
+          "same";
+        reviewerSameModelWarning = `warning: reviewer-same-model: ревьюер и исполнитель используют одного провайдера/модель (${provider}); рекомендуется добавить альтернативный маршрут в цепочку уровня`;
+      }
+    }
+  } else {
+    name = level.chain.find(usable);
+  }
+
   if (!name) {
     throw new OrchestratorError(
       "route-unavailable",
@@ -987,7 +1049,10 @@ export function pickRoute(
       `routes: ${Object.keys(policy.routes).join(", ")}`,
     );
   }
-  return resolved;
+  return {
+    ...resolved,
+    ...(reviewerSameModelWarning ? { warning: reviewerSameModelWarning } : {}),
+  };
 }
 
 /**

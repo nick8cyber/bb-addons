@@ -19,6 +19,8 @@ import { parseJanitorConfig } from "../src/janitor-config.js";
 import {
   createJanitor,
   defaultHasProcessIn,
+  isServiceWorktreePath,
+  evaluateServiceWorktreePrunable,
   type JanitorDeps,
 } from "../src/janitor.js";
 import type { BbCli, BbCliResult } from "../src/bb-cli.js";
@@ -6381,3 +6383,59 @@ test("release §2 п.2: taskCleanup держит копию с живым про
   assert.ok(existsSync(env.path));
   assert.deepEqual(w.cleanedUp, []);
 });
+
+test("§34.2 (ADR-0037): isServiceWorktreePath and evaluateServiceWorktreePrunable identify and prune service worktrees", async () => {
+  // Pattern matching
+  assert.equal(isServiceWorktreePath("/repo/wt/release").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/wt/release").isReleaseOrSync, true);
+  assert.equal(isServiceWorktreePath("/repo/wt/sync").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/wt/PLUG-123-1").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/wt/PLUG-123-1").taskKey, "PLUG-123");
+  assert.equal(isServiceWorktreePath("/repo/worktrees/release-20261119").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/worktrees/sync-main").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/worktrees/PLUG-456-round-1").isService, true);
+  assert.equal(isServiceWorktreePath("/repo/worktrees/PLUG-456-round-1").taskKey, "PLUG-456");
+  assert.equal(isServiceWorktreePath("/repo/worktrees/normal-user-copy").isService, false);
+  assert.equal(isServiceWorktreePath("/repo/src").isService, false);
+
+  // Prunability logic
+  const db = new Database(":memory:");
+  for (const m of MIGRATIONS) db.exec(m);
+  const store = new DelegationStore(db);
+
+  // Insert a finished task PLUG-100
+  store.insertTask({
+    taskKey: "PLUG-100",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+  });
+  store.updateTask("PLUG-100", { status: "done" });
+
+  const tempDir = makeTempDir("svc-wt");
+  const resFinished = await evaluateServiceWorktreePrunable(
+    join(tempDir, "wt/PLUG-100-1"),
+    { store, cmd: createCmd() },
+  );
+  assert.equal(resFinished.prunable, true);
+  assert.equal(resFinished.reason, "task-finished:done");
+
+  // Active task PLUG-200
+  store.insertTask({
+    taskKey: "PLUG-200",
+    projectId: "proj_main",
+    coordinatorThreadId: "thr_coord",
+    route: "feature",
+    level: "complex",
+  });
+  store.updateTask("PLUG-200", { status: "running" });
+  mkdirSync(join(tempDir, "wt/PLUG-200-1"), { recursive: true });
+  const resActive = await evaluateServiceWorktreePrunable(
+    join(tempDir, "wt/PLUG-200-1"),
+    { store, cmd: createCmd(), now: () => Date.now() },
+    2 * 3600_000,
+  );
+  assert.equal(resActive.prunable, false);
+});
+
