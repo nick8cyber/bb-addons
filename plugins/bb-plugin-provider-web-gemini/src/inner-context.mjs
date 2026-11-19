@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import * as tools from "./web-tools.mjs";
 import { collectDiff, executePinned, pinReview, readMaterial, readTextFile, repoRoot, worktreeStatus } from "./review-git.mjs";
+import { deserializeVerdict } from "./turn-journal.mjs";
 
 const runFile = promisify(execFile);
 const DEFAULT_TOTAL = 25_000_000;
@@ -76,7 +77,6 @@ export function loadSettings(stateDir, projectId) {
     maxRepairRounds: setting(input.apply?.maxRepairRounds, 2, 0, "apply.maxRepairRounds"),
     progressIntervalMs: setting(input.progressIntervalMs, 15_000, 1, "progressIntervalMs"),
     stateRetentionMs: setting(input.state?.retentionMs, 86_400_000, 1, "state.retentionMs"),
-    stateMaxRecords: setting(input.state?.maxRecords, 200, 1, "state.maxRecords"),
     mask(text) {
       let value = String(text);
       for (const { type, re } of compiled) value = value.replace(re, () => "[скрыто: " + type + "]");
@@ -124,7 +124,7 @@ function parseVerdict(text, system, pin) {
   return fields;
 }
 
-export async function prepareTask({ text, system, session, thread, stateDir, signal, onSettings }) {
+export async function prepareTask({ text, system, session, thread, stateDir, signal, onSettings, savedTurn }) {
   if (!text.trim()) throw new Error("task text is empty");
   if (!session.cwd || !isAbsolute(session.cwd)) throw new Error("task requires an absolute session working directory");
   let cwd;
@@ -151,8 +151,8 @@ export async function prepareTask({ text, system, session, thread, stateDir, sig
     if (listed) repoFiles.push(...listed.split(", ").map((item) => item.replace(/^\x60|\x60$/g, "")));
   }
   const root = await repoRoot(cwd, signal);
-  const pin = await pinReview(root, refs, thread.environment ?? {}, signal);
-  const verdict = parseVerdict(text, system, pin);
+  const pin = savedTurn ? savedTurn.pin : await pinReview(root, refs, thread.environment ?? {}, signal);
+  const verdict = savedTurn ? deserializeVerdict(savedTurn.verdict) : parseVerdict(text, system, pin);
   const pairMatches = [...text.matchAll(/(?:^|\n)## Attachments[ \t]*\r?\n((?:(?!##[ \t])[^\n]*\r?\n)*?)(?=## Recent comments[ \t]*(?:\r?\n|$))/g)];
   const attachmentRows = pairMatches.length
     ? pairMatches.at(-1)[1].split(/\r?\n/)
@@ -273,8 +273,89 @@ function linkCall(link) {
   return key ? { name: "bb_task_show", args: { key } } : null;
 }
 
-export async function collectTask(context, blocks, options) {
+export async function collectTaskAttachments(context, blocks, options) {
   const { signal, maxUploadBytes, maxUploadCount, validateUploads, spillDir } = options;
+  const { root, pin, settings } = context;
+  const maxBytes = settings.maxTotalBytes;
+  const materials = [];
+  let uploadCount = 0;
+  let materialBytes = 0;
+  const add = (source, text, { name, at, upload = false }) => {
+    const size = bytes(settings.mask(text));
+    if (upload && (++uploadCount > maxUploadCount || bytes(text) > maxUploadBytes || size > maxUploadBytes)) {
+      throw new Error("mandatory attachment exceeds upload count or size limit");
+    }
+    materialBytes += size;
+    if (materialBytes > maxBytes) throw new Error("mandatory task context exceeds byte budget");
+    materials.push({ source, text, name, at, upload });
+  };
+  for (const block of blocks) {
+    signal.throwIfAborted();
+    if (block.type === "resource") {
+      const uri = String(block.resource?.uri ?? "embedded resource");
+      const name = uri.startsWith("file:") ? basename(uri) : uri;
+      if (typeof block.resource?.text !== "string" || /^(?:image|audio|video)\//i.test(block.resource?.mimeType ?? "")) {
+        throw new Error("mandatory embedded resource is not text");
+      }
+      add("Embedded resource", block.resource.text, { name, at: "ACP input" });
+    }
+  }
+  for (const file of new Set(context.repoFiles)) {
+    try {
+      add("Repository attachment", await readMaterial(root ?? context.cwd, pin, file, maxBytes, signal), { name: file });
+    } catch {
+      throw new Error("mandatory repository attachment could not be collected");
+    }
+  }
+
+  const externalBlocks = [];
+  const seenPaths = new Set();
+  for (const block of blocks) {
+    const file = blockFile(block);
+    if (["image", "audio", "localImage"].includes(block.type) || /^(?:image|audio|video)\//i.test(block.mimeType ?? "")) {
+      throw new Error("mandatory attachment is binary");
+    }
+    if (!file) continue;
+    const abs = resolve(context.cwd, file);
+    const repoFile = root && inside(root, abs);
+    if (seenPaths.has(abs)) continue;
+    seenPaths.add(abs);
+    if (pin && repoFile) {
+      add("Repository attachment", await readMaterial(root, pin, repoFile, maxUploadBytes, signal), {
+        name: repoFile, at: pin.sha, upload: true,
+      });
+    } else {
+      externalBlocks.push(block);
+    }
+  }
+  if (externalBlocks.length) {
+    const result = validateUploads(externalBlocks);
+    if (result.error) throw new Error("mandatory ACP attachment is inaccessible or exceeds upload limits");
+    for (const file of result.files) {
+      add("ACP attachment", await readTextFile(file, maxUploadBytes, signal), {
+        name: basename(file), at: "ACP input", upload: true,
+      });
+    }
+  }
+  if (context.attachments.length) {
+    if (uploadCount + new Set(context.attachments.map((item) => item.id)).size > maxUploadCount) {
+      throw new Error("mandatory attachments exceed upload count");
+    }
+    mkdirSync(spillDir, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(spillDir, "tracker-"));
+    try {
+      for (const file of await trackerFiles(context, scratch, maxUploadBytes, signal)) {
+        add("Tracker attachment", file.text, { name: file.name, at: "BB Tasks input", upload: true });
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+  return materials;
+}
+
+export async function collectTask(context, blocks, materials, options) {
+  const { signal, spillDir } = options;
   const { root, pin, settings } = context;
   const maxBytes = settings.maxTotalBytes;
   const revision = pin?.sha ?? "working copy";
@@ -290,80 +371,20 @@ export async function collectTask(context, blocks, options) {
     core.push(Object.freeze({ entry: Object.freeze(entry), text }));
   };
   const omit = (source, reason) => omitted.push({ source: mask(source), reason, revision });
-  const upload = (name, text, source, at) => {
-    if (materialFiles.length >= maxUploadCount || bytes(text) > maxUploadBytes || bytes(mask(text)) > maxUploadBytes) {
-      throw new Error("mandatory attachment exceeds upload count or size limit");
-    }
-    const { pkgName, pkgPath } = tools.writeSpillPackage(spillDir, randomUUID(), mask(text));
-    options.ownedFiles.push(pkgPath);
-    materialFiles.push(pkgPath);
-    add(source, text, { name, at, delivery: pkgName });
-  };
 
   add("Task text", context.text);
-  for (const block of blocks) {
-    signal.throwIfAborted();
-    if (block.type === "resource") {
-      const uri = String(block.resource?.uri ?? "embedded resource");
-      const name = uri.startsWith("file:") ? basename(uri) : uri;
-      if (typeof block.resource?.text !== "string" || /^(?:image|audio|video)\//i.test(block.resource?.mimeType ?? "")) {
-        omit("Embedded resource", "binary or unavailable");
-        throw new Error("mandatory embedded resource is not text");
-      }
-      add("Embedded resource", block.resource.text, { name, at: "ACP input" });
+  for (const { source, text, name, at, upload } of materials) {
+    let delivery = "package";
+    if (upload) {
+      const { pkgName, pkgPath } = tools.writeSpillPackage(spillDir, randomUUID(), mask(text));
+      options.ownedFiles.push(pkgPath);
+      materialFiles.push(pkgPath);
+      delivery = pkgName;
     }
+    add(source, text, { name, at, delivery });
   }
-  for (const file of new Set(context.repoFiles)) {
-    try {
-      add("Repository attachment", await readMaterial(root ?? context.cwd, pin, file, maxBytes, signal), { name: file });
-    } catch {
-      omit("Repository attachment", "unavailable, sensitive, non-text or above context budget");
-      throw new Error("mandatory repository attachment could not be collected");
-    }
-  }
-
-  const externalBlocks = [];
-  const seenPaths = new Set();
-  for (const block of blocks) {
-    const file = blockFile(block);
-    if (["image", "audio", "localImage"].includes(block.type) || /^(?:image|audio|video)\//i.test(block.mimeType ?? "")) {
-      omit("ACP attachment", "binary");
-      throw new Error("mandatory attachment is binary");
-    }
-    if (!file) continue;
-    const abs = resolve(context.cwd, file);
-    const repoFile = root && inside(root, abs);
-    if (seenPaths.has(abs)) continue;
-    seenPaths.add(abs);
-    if (pin && repoFile) {
-      upload(repoFile, await readMaterial(root, pin, repoFile, maxUploadBytes, signal), "Repository attachment", pin.sha);
-    } else {
-      externalBlocks.push(block);
-    }
-  }
-  if (externalBlocks.length) {
-    const result = validateUploads(externalBlocks);
-    if (result.error) throw new Error("mandatory ACP attachment is inaccessible or exceeds upload limits");
-    for (const file of result.files) upload(basename(file), await readTextFile(file, maxUploadBytes, signal), "ACP attachment", "ACP input");
-  }
-  if (context.attachmentOmissions?.length) {
-    for (const item of context.attachmentOmissions) {
-      omit("Tracker attachment: " + item.line, item.reason);
-    }
-  }
-  if (context.attachments.length) {
-    if (materialFiles.length + new Set(context.attachments.map((item) => item.id)).size > maxUploadCount) {
-      throw new Error("mandatory attachments exceed upload count");
-    }
-    mkdirSync(spillDir, { recursive: true, mode: 0o700 });
-    const scratch = mkdtempSync(join(spillDir, "tracker-"));
-    try {
-      for (const file of await trackerFiles(context, scratch, maxUploadBytes, signal)) {
-        upload(file.name, file.text, "Tracker attachment", "BB Tasks input");
-      }
-    } finally {
-      rmSync(scratch, { recursive: true, force: true });
-    }
+  for (const item of context.attachmentOmissions) {
+    omit("Tracker attachment: " + item.line, item.reason);
   }
 
   for (const link of explicitLinks(context, blocks)) {

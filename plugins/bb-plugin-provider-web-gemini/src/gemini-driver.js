@@ -954,7 +954,7 @@ function isTurnComplete(status, { stableMs = 0, stableDurationMs = 500, fallback
 async function waitForHistoryStabilization(
   page,
   convId,
-  { intervalMs = 350, ceilingMs = 10000, throwIfCancelled = null } = {}
+  { intervalMs = 350, ceilingMs = 10000, throwIfCancelled = null, requireHistory = false } = {}
 ) {
   if (!convId) {
     return (await safeQueryAll(page, 'model-response')).length;
@@ -972,7 +972,7 @@ async function waitForHistoryStabilization(
     const current = (await safeQueryAll(page, 'model-response')).length;
     if (current === prevCount) {
       stableMeasurements++;
-      if (stableMeasurements >= 2) {
+      if (stableMeasurements >= 2 && (!requireHistory || current > 0)) {
         return current;
       }
     } else {
@@ -1085,7 +1085,13 @@ async function sendPrompt({
       generatedFiles = turnRes.files || [];
       skippedDownloads = turnRes.skippedDownloads || [];
     } else {
-    if (page.url() === 'about:blank' || (convId && !page.url().includes(convId))) {
+    const atSavedConversation = () => new URL(page.url()).pathname === '/app/' + convId;
+    const lostConversation = () => {
+      const error = new Error('saved web conversation is not reachable');
+      error.code = 'WEB_GEMINI_CONVERSATION_LOST';
+      return error;
+    };
+    if (page.url() === 'about:blank' || (convId && !atSavedConversation())) {
       const targetUrl = convId ? `https://gemini.google.com/app/${convId}` : GEMINI_APP_URL;
       await page.goto(targetUrl, { timeout: 15000, waitUntil: 'domcontentloaded' });
     } else if (isNewChat) {
@@ -1096,6 +1102,7 @@ async function sendPrompt({
 
     await dismissOverlays(page);
     await throwIfCancelled();
+    if (verifyConversation && convId && !atSavedConversation()) throw lostConversation();
 
     const textboxSelector = 'div[contenteditable="true"][role="textbox"]';
     try {
@@ -1124,18 +1131,14 @@ async function sendPrompt({
 
     await upload();
 
-    const initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled });
+    const initialCount = await waitForHistoryStabilization(page, convId, { throwIfCancelled, requireHistory: verifyConversation });
 
     // §7.3: проверяемое восстановление — ненулевой convId сам по себе не
     // доказывает, что разговор доступен: после навигации и стабилизации
     // истории страница обязана остаться тем же разговором. Редирект Gemini
     // на /app означает утраченный разговор — вызывающий передаёт сохранённый
     // пакет целиком в новый чат, а не продолжает в пустом.
-    if (verifyConversation && convId && !page.url().includes(convId)) {
-      const lost = new Error('saved web conversation is not reachable');
-      lost.code = 'WEB_GEMINI_CONVERSATION_LOST';
-      throw lost;
-    }
+    if (verifyConversation && convId && (!atSavedConversation() || initialCount === 0)) throw lostConversation();
 
     // SPA re-creates the editor node on re-renders (model menu, bootstrap) —
     // resolve it fresh each attempt and verify the text actually landed.

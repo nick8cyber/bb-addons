@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  appendFileSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -36,11 +35,11 @@ export const journalPaths = (stateDir) => ({
 
 export const sessionKey = (sessionId) => digest(String(sessionId)).slice(0, 32);
 
-function writeJsonAtomic(file, value) {
+function writeAtomic(file, data) {
   mkdirSync(join(file, ".."), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+    writeFileSync(tmp, data, { mode: 0o600 });
     renameSync(tmp, file);
   } catch (error) {
     try {
@@ -48,6 +47,10 @@ function writeJsonAtomic(file, value) {
     } catch {}
     throw error;
   }
+}
+
+function writeJsonAtomic(file, value) {
+  writeAtomic(file, JSON.stringify(value, null, 2) + "\n");
 }
 
 /* ---------- Отпечаток рабочей копии и HEAD (§7.2) ---------- */
@@ -206,7 +209,7 @@ export function saveTurn(stateDir, sessKey, turn) {
 // Ключ хода — исходный ID сессии + монотонный номер хода, выделенный до
 // внешней работы. SHA-256 нормализованного входа распознаёт точный повтор.
 export function createTurn(stateDir, entry, fields) {
-  const turnNo = (entry.record.lastTurnNo || 0) + 1;
+  const turnNo = Math.max(entry.record.lastTurnNo || 0, fields.previousTurnNo || 0) + 1;
   const now = Date.now();
   const turn = {
     version: JOURNAL_VERSION,
@@ -217,7 +220,10 @@ export function createTurn(stateDir, entry, fields) {
     completedAt: null,
     stage: "preflight",
     mode: fields.mode ?? "read-only",
-    taskSha256: fields.inputSha256,
+    profile: { model: entry.record.model, thinking: entry.record.thinking, account: entry.record.account, ...fields.profile },
+    deadlineAt: fields.deadlineAt ?? null,
+    inputBlocksSha256: fields.inputSha256,
+    taskSha256: null,
     attempts: [{ n: 1, inputSha256: fields.inputSha256, at: now }],
     head: fields.head ?? null,
     pin: fields.pin ?? null,
@@ -230,8 +236,7 @@ export function createTurn(stateDir, entry, fields) {
     delivered: false,
     convId: null,
     backendId: null,
-    exchanges: 0,
-    budgets: { contextBytes: 0 },
+    budgets: { contextBytes: 0, toolRounds: 0, repairRounds: 0, ...fields.budgetLimits },
     outcome: null,
     reason: null,
   };
@@ -242,6 +247,10 @@ export function createTurn(stateDir, entry, fields) {
 
 export function addAttempt(stateDir, sessKey, turn, inputSha256) {
   turn.attempts.push({ n: turn.attempts.length + 1, inputSha256, at: Date.now() });
+  turn.completedAt = null;
+  turn.outcome = null;
+  turn.reason = null;
+  turn.stage = "restore";
   saveTurn(stateDir, sessKey, turn);
 }
 
@@ -253,9 +262,7 @@ export function stageTurnPackage(stateDir, sessKey, turn, packed) {
   rmSync(filesDir, { recursive: true, force: true });
   mkdirSync(filesDir, { recursive: true, mode: 0o700 });
   const messagePath = join(dir, "package.md");
-  const tmp = `${messagePath}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, packed.message, { mode: 0o600 });
-  renameSync(tmp, messagePath);
+  writeAtomic(messagePath, packed.message);
   const seen = new Set();
   const files = [];
   for (const source of packed.files || []) {
@@ -281,6 +288,9 @@ export function loadTurnPackage(stateDir, sessKey, turn) {
   if (!turn || turn.version !== JOURNAL_VERSION) {
     return { ok: false, reason: "unsupported journal schema version" };
   }
+  if (!turn.packageSha256 || !turn.messageSha256 || !Array.isArray(turn.files)) {
+    return { ok: false, reason: "saved turn package is missing or was not fully staged" };
+  }
   const dir = turnDir(stateDir, sessKey, turn.turnNo);
   let message;
   try {
@@ -288,11 +298,14 @@ export function loadTurnPackage(stateDir, sessKey, turn) {
   } catch {
     return { ok: false, reason: "saved turn package is missing" };
   }
-  if (turn.messageSha256 && digest(message) !== turn.messageSha256) {
+  if (digest(message) !== turn.messageSha256) {
     return { ok: false, reason: "saved turn package is corrupt" };
   }
   const files = [];
-  for (const file of turn.files || []) {
+  for (const file of turn.files) {
+    if (typeof file?.name !== "string" || !file.name || basename(file.name) !== file.name || [".", ".."].includes(file.name)) {
+      return { ok: false, reason: "saved package attachment record is invalid" };
+    }
     const path = join(dir, "files", file.name);
     let data;
     try {
@@ -300,7 +313,7 @@ export function loadTurnPackage(stateDir, sessKey, turn) {
     } catch {
       return { ok: false, reason: `saved package attachment ${file.name} is missing` };
     }
-    if (digest(data) !== file.sha256) {
+    if (data.length !== file.bytes || digest(data) !== file.sha256) {
       return { ok: false, reason: `saved package attachment ${file.name} is corrupt` };
     }
     files.push(path);
@@ -315,28 +328,29 @@ export function loadTurnPackage(stateDir, sessKey, turn) {
 }
 
 export function appendExchange(stateDir, sessKey, turn, entry) {
-  const dir = turnDir(stateDir, sessKey, turn.turnNo);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  appendFileSync(join(dir, "exchanges.jsonl"), JSON.stringify({ at: Date.now(), ...entry }) + "\n", { mode: 0o600 });
-  turn.exchanges = (turn.exchanges || 0) + 1;
+  const file = join(turnDir(stateDir, sessKey, turn.turnNo), "exchanges.jsonl");
+  const previous = readExchangeLog(file);
+  writeAtomic(file, previous + JSON.stringify({ at: Date.now(), ...entry }) + "\n");
+}
+
+function readExchangeLog(file) {
+  try {
+    const contents = readFileSync(file, "utf8");
+    if (contents && !contents.endsWith("\n")) throw new Error("saved exchange log is incomplete");
+    return contents;
+  } catch (error) {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  }
 }
 
 export function readExchanges(stateDir, sessKey, turnNo) {
-  try {
-    return readFileSync(join(turnDir(stateDir, sessKey, turnNo), "exchanges.jsonl"), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => {
-        try {
-          return JSON.parse(line);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
+  const file = join(turnDir(stateDir, sessKey, turnNo), "exchanges.jsonl");
+  return readExchangeLog(file).split("\n").filter(Boolean).map((line) => {
+    const entry = JSON.parse(line);
+    if (typeof entry?.text !== "string") throw new Error("saved exchange log is invalid");
+    return entry;
+  });
 }
 
 export function completeTurn(stateDir, sessKey, turn, { outcome, reason = null, answer = null }) {
@@ -345,7 +359,7 @@ export function completeTurn(stateDir, sessKey, turn, { outcome, reason = null, 
   turn.completedAt = Date.now();
   if (typeof answer === "string" && answer) {
     const file = join(turnDir(stateDir, sessKey, turn.turnNo), "answer.txt");
-    writeFileSync(file, answer, { mode: 0o600 });
+    writeAtomic(file, answer);
   }
   saveTurn(stateDir, sessKey, turn);
 }
@@ -418,15 +432,16 @@ export function pruneJournal(stateDir, { retentionMs = DEFAULT_RETENTION_MS, max
 
 /* ---------- Распознавание продолжения (§7.3) ---------- */
 
-const TASK_HEADER = /^#\s+[A-Z][A-Z0-9]{1,9}-\d+\s+·/m;
-const CONTINUE_HINT = /продолж|continue|resume|прерван|оборвал|interrupt/i;
+const BARE_CONTINUE = /^(?:продолжай(?: задачу)?|продолжи(?: задачу)?|continue(?: the task)?|resume(?: the task)?)[.!]?$/i;
+// Stock watchdog messages from the orchestrator, including its transport prefix.
+const INTERRUPTED = /^(?:ход прерван \([\s\S]{1,300}\), продолжай задачу|turn interrupted \([\s\S]{1,300}\), continue the task|ход оборвался ошибкой: [\s\S]{1,300}\. Продолжай задачу|the turn died on an error: [\s\S]{1,300}\. Continue the task)$/i;
+const VERDICT_NUDGE = /^(?:заверши вердиктом: дождись проверок в этом же ходе \(не фоном\) и закончи строкой JSON|finish with a verdict: wait for the checks in this same turn \(not in the background\) and end with the JSON line) \{"verdict":(?:"OK"\|"CHANGES","blockers":N|"APPROVE"\|"REJECT","findings":\[…\])\}$/i;
 
-// Одиночное «продолжай» или напоминание BB о прерванном ходе: короткий текст
-// без заголовка задачи. Полная задача так не распознаётся никогда.
 export function isContinueText(text) {
   const value = String(text ?? "").trim();
-  if (!value || value.length > 20_000 || TASK_HEADER.test(value)) return false;
-  return CONTINUE_HINT.test(value);
+  if (BARE_CONTINUE.test(value)) return true;
+  const reminder = value.replace(/^\[orchestrator\]\s+/i, "");
+  return INTERRUPTED.test(reminder) || VERDICT_NUDGE.test(reminder);
 }
 
 export const serializeVerdict = (verdict) =>

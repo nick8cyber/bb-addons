@@ -1255,7 +1255,7 @@ export async function runToolLoop({
       return { cancelled: false, forcedFinal: false, finalText: text, rounds: round, executed, lastRes };
     }
     if (round >= maxRounds) {
-      onToolRound?.(round + 1);
+      onToolRound?.(round + 1, true);
       const res2 = await send(forceFinalMessage(maxRounds));
       return {
         cancelled: false,

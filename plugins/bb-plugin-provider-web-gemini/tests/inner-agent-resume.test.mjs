@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import * as journal from "../src/turn-journal.mjs";
@@ -104,7 +105,10 @@ function fixture(t, repo, model, options = {}) {
   const cli = join(dir, "bb-fixture.mjs");
   const state = options.stateDir ?? join(dir, "state");
   const requests = join(dir, "requests.jsonl");
+  const pool = join(dir, "pool.json");
   mkdirSync(state, { recursive: true });
+  const defaultBackend = { id: "web-fixture", cdp: 19223, profileDir: dir, tier: "pro" };
+  writeFileSync(pool, JSON.stringify({ accounts: options.backends ?? [defaultBackend] }));
   if (options.settings) writeFileSync(join(state, "inner-agent.json"), JSON.stringify(options.settings));
   const quoted = JSON.stringify;
   writeFileSync(cli, "#!/usr/bin/env node\n" + String.raw`
@@ -126,22 +130,38 @@ import { startServer } from ${quoted(server)};
 let count = 0;
 startServer({ webDriver: { async sendPrompt(options) {
   const files = (options.files ?? []).map((path) => ({ path, text: readFileSync(path, "utf8"), data: readFileSync(path).toString("base64") }));
-  const request = { prompt: options.prompt, files, convId: options.convId, strict: options.requireFullDelivery, verify: options.verifyConversation, count: ++count };
+  const request = { prompt: options.prompt, files, convId: options.convId, strict: options.requireFullDelivery, verify: options.verifyConversation,
+    model: options.model, thinking: options.thinking, account: options.accountId, count: ++count };
   appendFileSync(${quoted(requests)}, JSON.stringify(request) + "\\n");
   options.onSubmitted?.();
   const response = await (${model})(request, options, ${quoted({ cwd: repo.repo, head: repo.head })});
   return { convId: options.convId || "fixture-conversation-" + count, ...response };
 } } });
 `);
-  const { child, messages, send, notify } = rpcProcess(t, [entry, "--session-access=read-only", "--bb-thread-id=" + threadId], {
-    ...process.env,
+  const args = [entry, "--session-access=read-only"];
+  if (options.owner !== false) args.push("--bb-thread-id=" + (options.owner ?? threadId));
+  const env = {
     BB_CLI: cli, WEB_GEMINI_FAKE: "0", ARGON_FAKE: "0",
-    WEB_GEMINI_STATE_DIR: state, WEB_GEMINI_POOL_FILE: join(dir, "absent"),
-    WEB_GEMINI_BACKENDS: JSON.stringify([{ id: "web-fixture", cdp: 19223, profileDir: dir, tier: "pro" }]),
+    WEB_GEMINI_STATE_DIR: state, WEB_GEMINI_POOL_FILE: pool, WEB_GEMINI_BACKENDS: "[]",
     ...options.env,
-  });
+  };
+  const launch = { displayName: "Fixture", command: process.execPath, args, env };
+  const bridgeOptions = {
+    permissionMode: "full", permissionScope: "full", approvalReviewer: null, permissionEscalation: null,
+    providerOptions: { acpDialect: "generic", acpLaunchSpec: launch },
+  };
+  let rpc;
+  if (options.bridge) {
+    const sdk = dirname(fileURLToPath(import.meta.resolve("@get-bb/plugin-sdk/provider-bridge/acp")));
+    const worker = join(sdk, "provider-bridge-worker-entry.mjs");
+    const host = fileURLToPath(new URL("../host.mjs", import.meta.url));
+    rpc = rpcProcess(t, [worker, host, "provider-fixture", dir], process.env);
+  } else {
+    rpc = rpcProcess(t, args, { ...process.env, ...env });
+  }
+  const { child, messages, send, notify } = rpc;
   return {
-    child, messages, send, notify, state,
+    child, messages, send, notify, state, bridgeOptions,
     kill: () => child.kill("SIGKILL"),
     requests: () => existsSync(requests) ? readFileSync(requests, "utf8").trimEnd().split("\n").map(JSON.parse) : [],
     newSession: async (cwd = repo.repo) => {
@@ -151,7 +171,7 @@ startServer({ webDriver: { async sendPrompt(options) {
     loadSession: (sessionId, cwd = repo.repo) => send("session/load", { sessionId, cwd }),
     prompt: (sessionId, text, extra = []) => send("session/prompt", { sessionId, prompt: [...extra, blockText(text)] }),
     // Запрос с id, но без ожидания ответа — для хода, который оборвём SIGKILL.
-    notifyPrompt: (sessionId, text) => notify("session/prompt", { sessionId, prompt: [blockText(text)] }, 999),
+    notifyPrompt: (sessionId, text, extra = []) => notify("session/prompt", { sessionId, prompt: [...extra, blockText(text)] }, 999),
   };
 }
 
@@ -185,6 +205,8 @@ test("fresh task turn writes session record, package, exchanges and outcome into
   assert.ok(turn.record.convId);
   assert.equal(turn.record.pin.sha, repo.sha);
   assert.equal(turn.record.expected, "verdict");
+  assert.deepEqual(turn.record.profile, { model: "argon", thinking: "medium", account: "auto" });
+  assert.ok(turn.record.deadlineAt > turn.record.createdAt);
   const dir = journalTurnsDir(app.state, recs[0].key, 1);
   const pkg = readFileSync(join(dir, "package.md"), "utf8");
   assert.match(pkg, /=== Опись \/ Manifest ===/);
@@ -201,6 +223,9 @@ test("session/load restores an unfinished turn and continues it in the same conv
     ? { text: '<tool name="read_file" path="docs/notes.txt"/>' }
     : new Promise(() => {}));
   const sessionId = await first.newSession();
+  await first.send("session/set_model", { sessionId, modelId: "pro" });
+  await first.send("session/set_config_option", { sessionId, configId: "thinking", value: "high" });
+  await first.send("session/set_config_option", { sessionId, configId: "account", value: "web-fixture" });
   // Вторая отправка висит навсегда — имитация аварийного завершения mid-turn.
   const text = task("Review the change", { ref: "review" });
   first.notifyPrompt(sessionId, text);
@@ -214,33 +239,45 @@ test("session/load restores an unfinished turn and continues it in the same conv
   assert.equal(turn.delivered, true);
   assert.equal(turn.convId, "fixture-conversation-1");
 
-  const app = fixture(t, repo, `(request) => {
-    if (request.convId !== "fixture-conversation-1" || request.verify !== true) throw new Error("resume binding lost");
-    return { text: ${JSON.stringify(FINAL)} };
-  }`, { stateDir: first.state });
+  const app = fixture(t, repo, `() => ({ text: ${JSON.stringify(FINAL)} })`, { stateDir: first.state });
   const loaded = await app.loadSession(sessionId);
   assert.ok(loaded.result, JSON.stringify(loaded.error));
   assert.equal(loaded.result.sessionId, sessionId);
+  await app.send("session/set_model", { sessionId, modelId: "argon" });
+  await app.send("session/set_config_option", { sessionId, configId: "thinking", value: "low" });
+  await app.send("session/set_config_option", { sessionId, configId: "account", value: "auto" });
 
   const response = await app.prompt(sessionId, "продолжай");
   assert.equal(response.result?.stopReason, "end_turn", JSON.stringify(response.error));
   const [req] = app.requests();
   assert.equal(req.prompt, "продолжай");
+  assert.equal(req.convId, "fixture-conversation-1");
+  assert.equal(req.verify, true);
+  assert.equal(req.model, "pro");
+  assert.equal(req.thinking, "high");
+  assert.equal(req.account, "web-fixture");
 
   const done = turns(first.state, recs[0].key)[0].record;
   assert.equal(done.outcome, "passed");
   assert.equal(done.attempts.length, 2);
+  assert.equal(done.deadlineAt, turn.deadlineAt);
+  assert.equal(done.budgets.contextBytes, turn.budgets.contextBytes + Buffer.byteLength(req.prompt));
+  assert.equal(done.budgets.toolRounds, 1);
   assert.equal(done.packageSha256, turn.packageSha256);
   assert.equal(readFileSync(join(journalTurnsDir(first.state, recs[0].key, 1), "answer.txt"), "utf8"), FINAL);
 });
 
 test("session/load resumes by redelivering the saved package when the conversation is gone", async (t) => {
   const repo = setup(t);
-  const first = fixture(t, repo, () => new Promise(() => {}));
+  repo.write("appendix.txt", "saved attachment bytes\n");
+  const link = { type: "resource_link", uri: pathToFileURL(join(repo.repo, "appendix.txt")).href, name: "appendix" };
+  const first = fixture(t, repo, (request) => request.count === 1
+    ? { text: '<tool name="read_file" path="docs/notes.txt"/>' }
+    : new Promise(() => {}));
   const sessionId = await first.newSession();
-  const text = task("Review the change", { ref: "review" });
-  first.notifyPrompt(sessionId, text);
-  await waitFor(() => first.requests().length >= 1);
+  const text = task("Read the change and the supplied appendix");
+  first.notifyPrompt(sessionId, text, [link]);
+  await waitFor(() => first.requests().length >= 2);
   const packageSha = turns(first.state, records(first.state)[0].key)[0].record.packageSha256;
   first.kill();
   await waitFor(() => first.child.exitCode !== null || first.child.signalCode !== null);
@@ -265,10 +302,73 @@ test("session/load resumes by redelivering the saved package when the conversati
   assert.equal(turn.outcome, "passed");
   assert.equal(turn.packageSha256, packageSha);
   // Повторная доставка идёт новым чатом с полным сохранённым пакетом.
-  const redelivery = app.requests().find((request) => !request.convId);
+  const [verify, redelivery] = app.requests();
+  assert.equal(verify.convId, "fixture-conversation-1");
+  assert.equal(verify.verify, true);
   assert.ok(redelivery, "expected a fresh-chat redelivery request");
+  assert.equal(redelivery.convId, null);
   assert.match(redelivery.prompt, /=== Опись \/ Manifest ===/);
+  assert.match(redelivery.prompt, /=== tool: read_file/);
+  assert.equal(redelivery.files[0].text, "saved attachment bytes\n");
   assert.match(redelivery.prompt, /продолжай/);
+});
+
+test("a backend change redelivers the original pinned review and attachments", async (t) => {
+  const repo = setup(t);
+  const resource = { type: "resource_link", uri: pathToFileURL(join(repo.repo, "docs/notes.txt")).href, name: "notes" };
+  const first = fixture(t, repo, (request) => request.count === 1
+    ? { text: '<tool name="read_file" path="docs/notes.txt"/>' }
+    : new Promise(() => {}));
+  const sessionId = await first.newSession();
+  first.notifyPrompt(sessionId, task("Review the change", { ref: "review" }), [resource]);
+  await waitFor(() => first.requests().length === 2);
+  first.kill();
+  await once(first.child, "exit");
+  repo.git("branch", "-f", "review", "HEAD");
+
+  const app = fixture(t, repo, `() => ({ text: ${JSON.stringify(FINAL)} })`, {
+    stateDir: first.state,
+    backends: [{ id: "alternate-fixture", cdp: 19224, profileDir: repo.tmp, tier: "pro" }],
+  });
+  assert.ok((await app.loadSession(sessionId)).result);
+  const reply = await app.prompt(sessionId, "[orchestrator] turn interrupted (provider restarted), continue the task");
+  assert.equal(reply.result?.stopReason, "end_turn", JSON.stringify(reply.error));
+  const [request] = app.requests();
+  assert.equal(request.convId, null);
+  assert.equal(request.account, "alternate-fixture");
+  assert.ok(request.prompt.includes(repo.sha));
+  assert.match(request.prompt, /=== tool: read_file/);
+  assert.equal(request.files[0].text, "review value\nZX12-marker\n");
+});
+
+test("the BB ACP bridge restores the original session and review after the provider restarts", async (t) => {
+  const repo = setup(t);
+  const first = fixture(t, repo, () => new Promise(() => {}));
+  const sessionId = await first.newSession();
+  first.notifyPrompt(sessionId, task("Review the original commit", { ref: "review" }));
+  await waitFor(() => first.requests().length === 1);
+  first.kill();
+  await once(first.child, "exit");
+  repo.git("branch", "-f", "review", "HEAD");
+
+  const app = fixture(t, repo, `() => ({ text: ${JSON.stringify(FINAL)} })`, { stateDir: first.state, bridge: true });
+  const restored = await app.send("thread/resume", {
+    threadId, providerThreadId: sessionId, cwd: repo.repo, instructionMode: "replace", options: app.bridgeOptions,
+  });
+  assert.equal(restored.result?.providerThreadId, sessionId, JSON.stringify(restored.error));
+  assert.equal(restored.result.sessionRestorable, true);
+  const started = await app.send("turn/start", {
+    threadId, providerThreadId: sessionId, clientRequestId: "creq_23456789ab",
+    input: [blockText("[orchestrator] turn interrupted (provider restarted), continue the task")],
+    options: app.bridgeOptions,
+  });
+  assert.ok(started.result, JSON.stringify(started.error));
+  await waitFor(() => app.messages.flatMap((message) => message.params?.deltas ?? []).find((item) => item.kind === "item.textDelta"));
+  const [request] = app.requests();
+  assert.equal(request.convId, null);
+  assert.match(request.prompt, /Review the original commit/);
+  assert.ok(request.prompt.includes(repo.sha));
+  assert.equal(turns(first.state, records(first.state)[0].key)[0].record.outcome, "passed");
 });
 
 test("session/load rejects foreign, mismatched, expired, unsupported and corrupt records", async (t) => {
@@ -304,7 +404,145 @@ test("session/load rejects foreign, mismatched, expired, unsupported and corrupt
     assert.match(response.error.message, pattern, id);
   }
   assert.equal(app.requests().length, 0, "rejected loads never reach the driver");
+  const unbound = fixture(t, repo, () => ({ text: "unreachable" }), { stateDir: state, owner: false });
+  const denied = await unbound.loadSession(wrongDir.record.sessionId, other);
+  assert.equal(denied.error?.data?.outcome, "not_started");
+  assert.match(denied.error.message, /owner thread could not be verified/);
+  assert.equal(unbound.requests().length, 0);
   void foreign; void wrongDir; void ceiling;
+});
+
+test("an exact retry requires the same ACP blocks and the same validated attachment bytes", async (t) => {
+  for (const kind of ["same", "embedded changed", "file contents changed", "file link changed"]) {
+    await t.test(kind, async (t) => {
+      const repo = setup(t);
+      repo.write("appendix.txt", "original appendix\n");
+      repo.write("alternative.txt", "alternative appendix\n");
+      const resource = { uri: "memory:appendix", mimeType: "text/plain", text: "original embedded material" };
+      const link = (name) => ({ type: "resource_link", uri: pathToFileURL(join(repo.repo, name)).href, name });
+      const original = [{ type: "resource", resource }, link("appendix.txt")];
+      const text = "Review the supplied sources and continue the migration";
+      const first = fixture(t, repo, () => new Promise(() => {}));
+      const sessionId = await first.newSession();
+      first.notifyPrompt(sessionId, text, original);
+      await waitFor(() => first.requests().length === 1);
+      first.kill();
+      await once(first.child, "exit");
+
+      const app = fixture(t, repo, () => ({ text: "Complete result" }), { stateDir: first.state });
+      assert.ok((await app.loadSession(sessionId)).result);
+      if (kind === "file contents changed") repo.write("appendix.txt", "replacement appendix\n");
+      const next = [
+        { resource: { text: kind === "embedded changed" ? "modified embedded material" : resource.text, mimeType: resource.mimeType, uri: resource.uri }, type: "resource" },
+        link(kind === "file link changed" ? "alternative.txt" : "appendix.txt"),
+      ];
+      const reply = await app.prompt(sessionId, text, next);
+      assert.equal(reply.result?.stopReason, "end_turn", JSON.stringify(reply.error));
+      const saved = turns(app.state, records(app.state)[0].key);
+      const [request] = app.requests();
+      if (kind === "same") {
+        assert.equal(saved.length, 1);
+        assert.equal(saved[0].record.attempts.length, 2);
+        assert.equal(request.prompt, first.requests()[0].prompt);
+      } else {
+        assert.equal(saved.length, 2);
+        assert.equal(saved[0].record.reason, "superseded by a new task input");
+        assert.notEqual(saved[0].record.taskSha256, saved[1].record.taskSha256);
+        assert.match(request.prompt, kind === "embedded changed" ? /modified embedded material/ : /original embedded material/);
+        assert.equal(request.files[0].text, kind === "file contents changed" ? "replacement appendix\n"
+          : kind === "file link changed" ? "alternative appendix\n" : "original appendix\n");
+      }
+    });
+  }
+});
+
+test("restart carries forward the absolute deadline and outgoing context budget", async (t) => {
+  for (const limit of ["deadline", "context bytes"]) {
+    await t.test(limit, async (t) => {
+      const repo = setup(t);
+      const first = fixture(t, repo, () => new Promise(() => {}), { settings: { context: { maxTotalBytes: 14_000 } } });
+      const sessionId = await first.newSession();
+      first.notifyPrompt(sessionId, "Read the supplied material.\n" + "x".repeat(8500));
+      await waitFor(() => first.requests().length === 1);
+      first.kill();
+      await once(first.child, "exit");
+
+      const sessKey = records(first.state)[0].key;
+      const stored = turns(first.state, sessKey)[0].record;
+      const used = Buffer.byteLength(first.requests()[0].prompt);
+      assert.equal(stored.budgets.contextBytes, used);
+      assert.ok(used > 14_000 / 2);
+      if (limit === "deadline") {
+        stored.deadlineAt = Date.now() - 1;
+        journal.saveTurn(first.state, sessKey, stored);
+      }
+      const app = fixture(t, repo, () => ({ text: "unreachable" }), {
+        stateDir: first.state,
+        settings: { context: { maxTotalBytes: 100_000 } },
+        env: { WEB_GEMINI_SEND_DEADLINE_MS: "3000000" },
+      });
+      assert.ok((await app.loadSession(sessionId)).result);
+      const reply = await app.prompt(sessionId, "Continue");
+      assert.equal(reply.error?.data?.outcome, "failed");
+      assert.match(reply.error.message, limit === "deadline" ? /deadline exceeded/ : /remaining byte budget/);
+      assert.deepEqual(app.requests(), []);
+      const done = turns(first.state, sessKey)[0].record;
+      assert.equal(done.deadlineAt, stored.deadlineAt);
+      assert.equal(done.budgets.contextBytes, used);
+      assert.equal(done.budgets.maxTotalBytes, 14_000);
+    });
+  }
+});
+
+test("a repair requested before restart still consumes the saved round limit", async (t) => {
+  const repo = setup(t);
+  const first = fixture(t, repo, (request) => request.count === 1
+    ? { text: "Incomplete review without a verdict" }
+    : new Promise(() => {}), { settings: { apply: { maxRepairRounds: 1 } } });
+  const sessionId = await first.newSession();
+  first.notifyPrompt(sessionId, task("Review the change", { ref: "review" }));
+  await waitFor(() => first.requests().length === 2);
+  assert.match(first.requests()[1].prompt, /Correct the previous reply/);
+  first.kill();
+  await once(first.child, "exit");
+
+  const app = fixture(t, repo, () => ({ text: "Still missing a verdict" }), { stateDir: first.state });
+  assert.ok((await app.loadSession(sessionId)).result);
+  const reply = await app.prompt(sessionId, "Continue");
+  assert.equal(reply.error?.data?.outcome, "failed");
+  assert.match(reply.error.message, /verdict/i);
+  assert.equal(app.requests().length, 1);
+  assert.equal(turns(app.state, records(app.state)[0].key)[0].record.budgets.repairRounds, 1);
+});
+
+test("each exchange atomically replaces the history file and damaged entries are visible", (t) => {
+  const state = mkdtempSync(join(tmpdir(), "web-gemini-exchange-"));
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+  const session = journal.createSessionRecord(state, { sessionId: "fixture" });
+  const turn = journal.createTurn(state, session, {});
+  const history = join(journalTurnsDir(state, session.key, turn.turnNo), "exchanges.jsonl");
+  journal.appendExchange(state, session.key, turn, { kind: "reply", text: "first" });
+  const inode = statSync(history).ino;
+  journal.appendExchange(state, session.key, turn, { kind: "tool-result", text: "second" });
+  assert.notEqual(statSync(history).ino, inode);
+  assert.deepEqual(journal.readExchanges(state, session.key, turn.turnNo).map(({ text }) => text), ["first", "second"]);
+  writeFileSync(history, "{");
+  assert.throws(() => journal.readExchanges(state, session.key, turn.turnNo), /incomplete/);
+});
+
+test("continuation detection recognizes stock watchdog messages and preserves new instructions", () => {
+  for (const text of [
+    "продолжай",
+    "Continue the task.",
+    "[orchestrator] ход прерван (внешняя отмена), продолжай задачу",
+    "[orchestrator] the turn died on an error: provider unavailable. Continue the task",
+    '[orchestrator] заверши вердиктом: дождись проверок в этом же ходе (не фоном) и закончи строкой JSON {"verdict":"OK"|"CHANGES","blockers":N}',
+  ]) assert.equal(journal.isContinueText(text), true, text);
+  for (const text of [
+    "Continue the migration by reading docs/notes.txt",
+    "Проверь, почему был прерван экспорт",
+    "Implement automatic resume on interrupt",
+  ]) assert.equal(journal.isContinueText(text), false, text);
 });
 
 test("a bare continue without a saved turn is rejected instead of starting an empty task", async (t) => {

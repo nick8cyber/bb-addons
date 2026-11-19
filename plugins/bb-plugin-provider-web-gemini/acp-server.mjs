@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import * as webTools from "./src/web-tools.mjs";
-import { checkedAnswer, collectTask, formatTaskToolResult, loadSettings, packTask, prepareTask, taskThread, taskTool, verdictInstruction } from "./src/inner-context.mjs";
+import { checkedAnswer, collectTask, collectTaskAttachments, formatTaskToolResult, loadSettings, packTask, prepareTask, taskThread, taskTool, verdictInstruction } from "./src/inner-context.mjs";
 import { collectDiff } from "./src/review-git.mjs";
 import * as journal from "./src/turn-journal.mjs";
 import {
@@ -40,6 +40,7 @@ console.log = console.error;
 
 const FAKE = process.env.WEB_GEMINI_FAKE === "1" || process.env.ARGON_FAKE === "1";
 const BB_THREAD_ARG = process.argv.find((arg) => arg.startsWith("--bb-thread-id="));
+const BB_THREAD_ID = BB_THREAD_ARG?.slice("--bb-thread-id=".length);
 const SESSION_ACCESS = process.argv.find((arg) => arg.startsWith("--session-access="))?.split("=")[1];
 const HEADLESS = process.env.WEB_GEMINI_HEADLESS || process.env.ARGON_HEADLESS || process.env.GEMINI_HEADLESS || null;
 
@@ -286,6 +287,13 @@ function loadState() {
   for (const [id, lease] of Object.entries(state.leases)) {
     if (!lease || now - (lease.acquiredMs || 0) >= LEASE_TTL_MS || !isPidAlive(lease.pid)) {
       delete state.leases[id];
+      // The lease and account reservation are written together. A crashed
+      // provider leaves both behind, including before the first convId exists.
+      const account = state.accounts[id];
+      if (lease && account?.owner?.startsWith(`${lease.pid}:`)) {
+        account.inUseUntilMs = 0;
+        account.owner = null;
+      }
     }
   }
 
@@ -1098,7 +1106,7 @@ function turnError(id, outcome, reason, stage = "preflight") {
 function createTaskTurn(sessionId) {
   const controller = new AbortController();
   const started = Date.now();
-  const deadline = started + SEND_DEADLINE_MS;
+  let deadline = started + SEND_DEADLINE_MS;
   const toolCallId = "gemini-turn-" + randomUUID();
   const update = (fields) => out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId, ...fields } } });
   let stage = "preflight";
@@ -1113,8 +1121,18 @@ function createTaskTurn(sessionId) {
     controller.abort(reason);
     wake({ cancelled: true });
   };
-  const timer = setTimeout(() => stop("deadline exceeded"), SEND_DEADLINE_MS);
-  timer.unref();
+  let timer;
+  const setDeadline = (value) => {
+    deadline = value;
+    clearTimeout(timer);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) stop("deadline exceeded");
+    else {
+      timer = setTimeout(() => stop("deadline exceeded"), remaining);
+      timer.unref();
+    }
+  };
+  setDeadline(deadline);
   const progress = (status, message) => {
     if (status === "in_progress") {
       lastUpdateAt = Date.now();
@@ -1130,7 +1148,8 @@ function createTaskTurn(sessionId) {
   progress("in_progress");
   const turn = {
     get stage() { return stage; },
-    deadline, signal: controller.signal, aborted, stop, ownedFiles: [],
+    get deadline() { return deadline; },
+    setDeadline, signal: controller.signal, aborted, stop, ownedFiles: [],
     pinnedSha: null,
     packageSha256: null,
     ping(next) {
@@ -1152,6 +1171,14 @@ function createTaskTurn(sessionId) {
     },
     async finish(outcome, reason = "", answerText = null) {
       if (closed) return;
+      if (turn.journal) {
+        try {
+          journal.completeTurn(STATE_DIR, turn.journal.sessKey, turn.journal.turn, { outcome, reason: reason || null, answer: answerText });
+        } catch (error) {
+          slog("task:journal-error", { sessionId, code: error?.code });
+          if (outcome === "passed") throw new TaskTurnError("could not save the final task result");
+        }
+      }
       closed = true;
       clearInterval(interval);
       clearTimeout(timer);
@@ -1173,14 +1200,6 @@ function createTaskTurn(sessionId) {
         progress("in_progress");
       }
       progress(outcome === "passed" ? "completed" : "failed", result);
-      // §7.2: терминальный исход хода фиксируется в постоянном журнале.
-      if (turn.journal) {
-        try {
-          journal.completeTurn(STATE_DIR, turn.journal.sessKey, turn.journal.turn, { outcome, reason: reason || null, answer: answerText });
-        } catch (error) {
-          slog("task:journal-error", { sessionId, error: String(error?.message || error) });
-        }
-      }
       for (const file of turn.ownedFiles) {
         try { unlinkSync(file); } catch {}
       }
@@ -1232,14 +1251,14 @@ async function probeAuthHint(backend) {
 }
 
 /* ---------- backend binding ---------- */
-async function bindBackend(s, sessionId) {
+async function bindBackend(s, sessionId, profile = s) {
   const owner = `${process.pid}:${sessionId}`;
-  const reqModel = s.model ? s.model.toLowerCase() : null;
+  const reqModel = profile.model ? profile.model.toLowerCase() : null;
 
-  if (s.account && s.account !== "auto") {
-    const b = BACKENDS.find((x) => x.id === s.account);
+  if (profile.account && profile.account !== "auto") {
+    const b = BACKENDS.find((x) => x.id === profile.account);
     if (!b) {
-      return { error: `unknown account "${s.account}" — pool has: ${BACKENDS.map((x) => x.id).join(", ")}` };
+      return { error: `unknown account "${profile.account}" — pool has: ${BACKENDS.map((x) => x.id).join(", ")}` };
     }
     const st = withStateLock((state) => {
       const now = Date.now();
@@ -1340,6 +1359,22 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
   const upd = (update) =>
     out({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
   const { task, context } = attachments;
+  const tj = task?.journal;
+  const profile = tj?.turn.profile ?? s;
+  const budgets = tj?.turn.budgets;
+  const maxContextBytes = budgets?.maxTotalBytes ?? context?.settings.maxTotalBytes;
+  const maxToolRounds = budgets?.maxToolRounds ?? webTools.MAX_TOOL_ROUNDS;
+  const maxRepairRounds = budgets?.maxRepairRounds ?? context?.settings.maxRepairRounds;
+
+  const persistJournal = (write = () => journal.saveTurn(STATE_DIR, tj.sessKey, tj.turn)) => {
+    try {
+      write();
+    } catch (error) {
+      slog("task:journal-error", { sessionId, code: error?.code });
+      throw new TaskTurnError("could not update task journal");
+    }
+  };
+  const recordExchange = (entry) => persistJournal(() => journal.appendExchange(STATE_DIR, tj.sessKey, tj.turn, entry));
 
   const gen = (s.gen || 0) + 1;
   s.gen = gen;
@@ -1459,8 +1494,14 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       // spill-файлом, поручение обязано поместиться (§5.2).
       const buildRedelivery = (instruction) => {
         const stored = task.resume.pkg;
-        const prior = journal.readExchanges(STATE_DIR, task.journal.sessKey, task.resume.turn.turnNo)
-          .map((e) => e.text).filter(Boolean).join("\n");
+        let prior;
+        try {
+          prior = journal.readExchanges(STATE_DIR, tj.sessKey, tj.turn.turnNo)
+            .map((entry) => context.settings.mask(entry.text)).filter(Boolean).join("\n");
+        } catch {
+          throw new TaskTurnError("recovery: saved exchange log is missing or corrupt");
+        }
+        if (task.resume.exact && !prior && Buffer.byteLength(stored.message) <= messageLimit) return stored;
         const heading = "\n\n=== Продолжение прерванного хода / Resumed turn ===\n";
         const tail = "=== Поручение / Instruction ===\n" + instruction;
         let extraFiles = [];
@@ -1479,15 +1520,9 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           try { return total + statSync(path).size; } catch { return total; }
         }, 0);
         const totalBytes = Buffer.byteLength(message) + fileBytes;
-        if (totalBytes > context.settings.maxTotalBytes) {
-          throw new TaskTurnError("recovery: saved task context does not fit the delivery budget");
-        }
         return { message, files: [...stored.files, ...extraFiles], packageSha256: stored.packageSha256, totalBytes };
       };
-      // Точный повтор шлёт сохранённый пакет дословно (текст задачи уже в
-      // пакете); «продолжай» — пакет + обмены + поручение.
-      const redeliveryPackage = () =>
-        task.resume.exact ? task.resume.pkg : buildRedelivery(task.resume.instruction);
+      const redeliveryPackage = () => buildRedelivery(task.resume.instruction);
       // Конвертация продолжения в повторную доставку: разговор недоступен —
       // новый чат получает сохранённый пакет (§7.3), не пустой промпт.
       const switchToRedelivery = (reason) => {
@@ -1497,12 +1532,8 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         s.convId = null;
         s.backend = null;
         task.resume.convId = null;
-        if (task.journal) {
-          task.journal.turn.convId = null;
-          try {
-            journal.saveTurn(STATE_DIR, task.journal.sessKey, task.journal.turn);
-          } catch {}
-        }
+        tj.turn.convId = null;
+        persistJournal();
         packed = redeliveryPackage();
         slog("task:resume-redeliver", { sessionId, turnNo: task.journal?.turn?.turnNo, reason });
       };
@@ -1519,16 +1550,15 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               const diffs = await collectDiff(context.root, context.pin, context.settings.maxTotalBytes, task.signal);
               collected.reviewDiff = diffs.length ? Object.freeze({ stat: diffs[0].stat, patch: diffs[0].patch }) : null;
             }
-            packed = redeliveryPackage();
-            task.packageSha256 = packed.packageSha256;
-            slog("task:package-resume", { sessionId, packageSha256: packed.packageSha256, turnNo: task.journal.turn.turnNo });
+            if (!resumedConv) packed = redeliveryPackage();
+            task.packageSha256 = task.resume.pkg.packageSha256;
+            slog("task:package-resume", { sessionId, packageSha256: task.packageSha256, turnNo: tj.turn.turnNo });
           } else {
-            packageOptions = {
-              signal: task.signal, maxUploadBytes: argonMaxUploadBytes(), maxUploadCount: argonMaxUploadCount(),
-              validateUploads: (blocks) => collectUploadFiles(blocks, s), spillDir: UPLOADS_DIR, ownedFiles: task.ownedFiles,
-              limit: messageLimit,
-            };
-            collected = await collectTask(context, attachments.blocks, packageOptions);
+            packageOptions = { ...taskAttachmentOptions(s, task), limit: messageLimit };
+            const materials = attachments.materials ?? await collectTaskAttachments(context, attachments.blocks, packageOptions);
+            tj.turn.taskSha256 = taskInputSha256(tj.turn.inputBlocksSha256, materials);
+            tj.turn.attempts[0].inputSha256 = tj.turn.taskSha256;
+            collected = await collectTask(context, attachments.blocks, materials, packageOptions);
             packed = packTask(context, collected, packageOptions);
             task.packageSha256 = packed.packageSha256;
             // §7.2: пакет сохраняется в журнал до доставки — повторная
@@ -1560,12 +1590,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
       // WEB_GEMINI_MAX_UPLOAD_BYTES: это наш сгенерированный .md с материалами
       // задачи, его доставка обязательна; лимиты выше — про пользовательские
       // пути на валидации collectUploadFiles.
-      if (packed.spilledFile) uploadFiles.push(packed.spilledFile);
+      if (packed?.spilledFile) uploadFiles.push(packed.spilledFile);
 
-      let remainingContext = task ? context.settings.maxTotalBytes : Infinity;
       while (true) {
         if (s.cancelled || task?.signal.aborted) return { cancelled: true };
-        const bound = await bindBackend(s, sessionId);
+        const bound = await bindBackend(s, sessionId, profile);
         if (bound.error) {
           if (task?.resume?.convId && s.convId && !resumeFallbackDone) {
             // Прежний backend недоступен — повторная доставка в новый чат.
@@ -1609,7 +1638,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
         }, 60_000);
         renew.unref?.();
 
-        const mappedThinking = normalizeThinking(s.thinking);
+        const mappedThinking = normalizeThinking(profile.thinking);
         const attempt = (async () => {
           try {
             const sendWebPrompt = task && FAKE ? fakeTaskReply : getDriver().sendPrompt;
@@ -1630,7 +1659,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 if (delivered && !s.convId) throw new TaskTurnError("web conversation identity is missing for the follow-up");
                 outboundBytes = delivered ? Buffer.byteLength(message) : packed.totalBytes;
                 if (delivered && Buffer.byteLength(message) > messageLimit) {
-                  if (outboundBytes > remainingContext) throw new TaskTurnError("tool follow-up exceeds remaining context budget");
+                  if (outboundBytes > maxContextBytes - budgets.contextBytes) throw new TaskTurnError("tool follow-up exceeds remaining context budget");
                   let spill;
                   try {
                     spill = webTools.writeSpillPackage(UPLOADS_DIR, randomUUID(), message);
@@ -1642,9 +1671,11 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   message = "Read the complete tool results and instructions in " + spill.pkgName + ".";
                   outboundBytes += Buffer.byteLength(message);
                 }
-                remainingContext -= outboundBytes;
-                if (remainingContext < 0) throw new TaskTurnError("outgoing task context exceeds byte budget");
-                task.ping("delivery");
+                if (outboundBytes > maxContextBytes - budgets.contextBytes) {
+                  throw new TaskTurnError(task.resume
+                    ? "recovery: saved task context exceeds remaining byte budget"
+                    : "outgoing task context exceeds byte budget");
+                }
               }
               // PLUG-281/§4.1: каждый уходящий в Gemini текст (первое
               // упакованное сообщение, блоки результатов инструментов,
@@ -1652,17 +1683,24 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               // вызывающего, драйвер повторяет проверку последним рубежом.
               const tooLargeMsg = promptTooLargeError(message);
               if (tooLargeMsg) throw tooLargeMsg;
+              if (task) {
+                // Charge before the driver can submit. A crash during generation
+                // must not let the next attempt spend the same budget again.
+                budgets.contextBytes += outboundBytes;
+                persistJournal();
+                task.ping("delivery");
+              }
               slog("driver:send", {
                 sessionId,
                 account: backend.id,
-                model: s.model,
+                model: profile.model,
                 thinking: mappedThinking,
                 chars: message.length,
                 convId: s.convId || null,
               });
               const request = {
                 prompt: message,
-                model: s.model,
+                model: profile.model,
                 thinking: mappedThinking,
                 convId: s.convId,
                 isNewChat: !s.convId,
@@ -1703,17 +1741,21 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                 // чат) — одноразовая конвертация в повторную доставку
                 // сохранённого пакета с обменами хода.
                 if (task && resumedConv && error.code === "WEB_GEMINI_CONVERSATION_LOST" && !resumeFallbackDone) {
+                  budgets.contextBytes -= outboundBytes;
                   switchToRedelivery("conversation-lost");
                   delivered = false;
                   filesPending = [...packed.files];
                   task.ping("delivery");
                   return sendOnce(packed.message, false);
                 }
+                if (task && error.code === "WEB_GEMINI_PROMPT_TOO_LARGE") {
+                  // The driver reports maxlength before uploading anything.
+                  budgets.contextBytes -= outboundBytes;
+                  persistJournal();
+                }
                 if (!task || !canRepack || error.code !== "WEB_GEMINI_PROMPT_TOO_LARGE" ||
                     !Number.isSafeInteger(error.maxPromptBytes) || error.maxPromptBytes <= 0 ||
                     error.maxPromptBytes >= messageLimit) throw error;
-                // The driver reports maxlength before uploading anything.
-                remainingContext += outboundBytes;
                 messageLimit = error.maxPromptBytes;
                 if (!delivered) {
                   try {
@@ -1741,26 +1783,18 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
               convVerify = false;
               if (res && res.convId) {
                 s.convId = res.convId;
+                s.backend = backend;
               }
-              if (task?.journal && res) {
-                // §7.2: после доставки фиксируем разговор, backend и расход
-                // контекста; ответ модели — в обмены хода для повторной
-                // доставки после рестарта.
-                const tj = task.journal;
+              if (tj && res) {
+                const reply = res.rawText?.trim() ? res.rawText : res.text;
+                if (reply) recordExchange({ kind: "reply", text: context.settings.mask(reply) });
                 tj.turn.delivered = true;
                 if (res.convId) {
                   tj.turn.convId = res.convId;
                   tj.turn.backendId = backend.id;
                 }
-                tj.turn.budgets = tj.turn.budgets || {};
-                tj.turn.budgets.contextBytes = Math.max(0, context.settings.maxTotalBytes - Math.max(0, remainingContext));
-                try {
-                  journal.saveTurn(STATE_DIR, tj.sessKey, tj.turn);
-                  if (res.convId) journal.saveSessionRecord(STATE_DIR, tj.entry, { convId: res.convId, backendId: backend.id });
-                  if (res.text) journal.appendExchange(STATE_DIR, tj.sessKey, tj.turn, { kind: "reply", text: String(res.text).slice(0, 120_000) });
-                } catch (journalError) {
-                  slog("task:journal-error", { sessionId, error: String(journalError?.message || journalError) });
-                }
+                persistJournal();
+                if (res.convId) persistJournal(() => journal.saveSessionRecord(STATE_DIR, tj.entry, { convId: res.convId, backendId: backend.id }));
               }
               if (!task) emitGenerated(res);
               slog("driver:done", { sessionId, convId: s.convId || null, streamedAny });
@@ -1768,19 +1802,20 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             };
             let toolSeq = 0;
             const loop = await webTools.runToolLoop({
-              firstMessage: task ? (resumedConv ? text : packed.message) : s.convId ? text : packed.message,
+              firstMessage: task ? (resumedConv ? task.resume.instruction : packed.message) : s.convId ? text : packed.message,
               send: sendOnce,
               execute: (call) => task ? taskTool(context, collected, call, toolLimit, task.signal) : webTools.executeTool(call, { cwd: s.cwd }),
-              onToolRound: task ? () => task.ping("request_more") : null,
+              onToolRound: task ? (_round, forcedFinal) => {
+                if (!forcedFinal) {
+                  budgets.toolRounds = (budgets.toolRounds ?? 0) + 1;
+                  persistJournal();
+                }
+                task.ping("request_more");
+              } : null,
               ...(task ? {
                 formatResult: (call, result) => {
                   const formatted = formatTaskToolResult(context, call, result);
-                  if (task.journal) {
-                    try {
-                      journal.appendExchange(STATE_DIR, task.journal.sessKey, task.journal.turn,
-                        { kind: "tool-result", name: call.name, ok: result.ok !== false, text: formatted });
-                    } catch {}
-                  }
+                  recordExchange({ kind: "tool-result", name: call.name, ok: result.ok !== false, text: formatted });
                   return formatted;
                 },
               } : {}),
@@ -1809,7 +1844,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
                   ],
                 });
               },
-              maxRounds: webTools.MAX_TOOL_ROUNDS,
+              maxRounds: Math.max(0, maxToolRounds - (budgets?.toolRounds ?? 0)),
               isCancelled: () => s.cancelled || abortCtrl.signal.aborted || task?.signal.aborted,
             });
             if (loop.cancelled) {
@@ -1819,20 +1854,18 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
             }
             if (task) {
               let candidate = loop.lastRes;
-              for (let repair = 0; ; repair++) {
+              for (;;) {
                 task.ping("verify");
                 const final = checkedAnswer(context, candidate);
                 if (final.text !== undefined) return { text: final.text };
                 if (final.denied) throw new TaskTurnError(final.denied);
-                if (repair >= context.settings.maxRepairRounds) throw new TaskTurnError(final.repair);
+                if ((budgets.repairRounds ?? 0) >= maxRepairRounds) throw new TaskTurnError(final.repair);
                 task.ping("request_more");
                 const repairMessage = "Correct the previous reply. " + final.repair +
                   ". Return the complete publishable final answer without tool calls or file envelopes.\n" + contract;
-                if (task.journal) {
-                  try {
-                    journal.appendExchange(STATE_DIR, task.journal.sessKey, task.journal.turn, { kind: "repair", text: repairMessage });
-                  } catch {}
-                }
+                budgets.repairRounds = (budgets.repairRounds ?? 0) + 1;
+                persistJournal();
+                recordExchange({ kind: "repair", text: repairMessage });
                 candidate = await sendOnce(repairMessage);
               }
             }
@@ -1948,7 +1981,7 @@ async function runPrompt(id, sessionId, text, attachments = {}) {
           attempts += 1;
 
           const canRotate =
-            s.account === "auto" &&
+            profile.account === "auto" &&
             attempts < maxAttempts &&
             cls.rotatable &&
             !s.convId &&
@@ -2049,7 +2082,7 @@ process.on("SIGINT", () => { void cleanShutdown(); });
 /* ---------- JSON-RPC request dispatcher ---------- */
 async function sendSession(id, sessionId, session) {
   if (BB_THREAD_ARG) {
-    session.thread = await taskThread(BB_THREAD_ARG.slice("--bb-thread-id=".length)).catch(() => null);
+    session.thread ??= await taskThread(BB_THREAD_ID).catch(() => null);
   }
   out({
     jsonrpc: "2.0",
@@ -2068,16 +2101,35 @@ async function sendSession(id, sessionId, session) {
 
 /* ---------- §7.2/§7.3: постоянный журнал хода и продолжение ---------- */
 
-const taskInputSha256 = (text) => createHash("sha256").update(String(text)).digest("hex");
+const sha256 = (text) => createHash("sha256").update(text).digest("hex");
+
+function normalizeInput(value) {
+  if (Array.isArray(value)) return value.map(normalizeInput);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalizeInput(value[key])]));
+  }
+  return value;
+}
+
+const taskInputSha256 = (inputBlocksSha256, materials) => sha256(JSON.stringify([
+  inputBlocksSha256, materials.map(({ text, ...material }) => ({ ...material, sha256: sha256(text) })),
+]));
+
+function taskAttachmentOptions(session, task) {
+  return {
+    signal: task.signal,
+    maxUploadBytes: argonMaxUploadBytes(),
+    maxUploadCount: argonMaxUploadCount(),
+    validateUploads: (blocks) => collectUploadFiles(blocks, session),
+    spillDir: UPLOADS_DIR,
+    ownedFiles: task.ownedFiles,
+  };
+}
 
 // Запись сессии просрочена по state.retentionMs её проекта (§9): продолжать
 // по ней нельзя — молчаливая выдача новой пустой сессии запрещена.
 function sessionRecordExpired(record) {
-  let retentionMs = 86_400_000;
-  try {
-    retentionMs = loadSettingsRetention(record?.projectId);
-  } catch {}
-  return Date.now() - (record?.updatedAt || 0) > retentionMs;
+  return Date.now() - (record?.updatedAt || 0) > loadSettingsRetention(record?.projectId);
 }
 
 function loadSettingsRetention(projectId) {
@@ -2105,72 +2157,86 @@ function convBackendUsable(backendId) {
 // План хода до внешней работы: запись сессии, монотонный номер хода, точный
 // повтор/«продолжай» незавершённого хода либо новая запись. Возвращает
 // { kind: "fresh"|"resume" } либо { errorOutcome, reason }.
-async function planTaskTurn({ session, sessionId, context, text, signal }) {
-  let entry = session.journal;
-  if (!entry) {
-    entry = journal.findSessionRecord(STATE_DIR, sessionId);
-    if (!entry) {
-      entry = journal.createSessionRecord(STATE_DIR, {
-        sessionId,
-        threadId: session.thread?.thread?.id ?? null,
-        projectId: session.thread?.thread?.projectId ?? null,
-        fingerprint: await journal.worktreeFingerprint(context.cwd),
-        accessCeiling: "read-only",
-        roots: session.roots,
-        model: session.model,
-        thinking: session.thinking,
-        account: session.account,
-      });
-    }
-    session.journal = entry;
+async function planTaskTurn({ session, sessionId, blocks, text, prepare, task }) {
+  const inputSha256 = sha256(JSON.stringify(normalizeInput(blocks)));
+  const isContinue = blocks.every((block) => block.type === "text") && journal.isContinueText(text);
+  const saved = session.journal ?? journal.findSessionRecord(STATE_DIR, sessionId);
+  const last = saved ? journal.listTurns(STATE_DIR, saved.key).at(-1) : null;
+  if (last?.corrupt || (last && last.record.version !== journal.JOURNAL_VERSION)) {
+    return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt or has an unsupported version" };
   }
-  const sessKey = entry.key;
-  const inputSha256 = taskInputSha256(text);
-  const turns = journal.listTurns(STATE_DIR, sessKey);
-  const last = turns.at(-1);
-  if (last?.corrupt) {
-    return { errorOutcome: "failed", reason: "recovery: saved turn journal is corrupt" };
-  }
-  const unfinished = last && !last.record.outcome ? last : null;
-  if (unfinished) {
-    const turn = unfinished.record;
-    const isResume = turn.taskSha256 === inputSha256 || journal.isContinueText(text);
-    if (!isResume) {
-      // Полная новая задача с другим отпечатком входа — прежний незавершённый
-      // ход закрывается, задача получает новый номер хода.
-      journal.completeTurn(STATE_DIR, sessKey, turn, { outcome: "failed", reason: "superseded by a new task input" });
-    } else {
-      // Продолжение: версия записи и целостность сохранённого пакета (§7.3).
-      journal.addAttempt(STATE_DIR, sessKey, turn, inputSha256);
-      const pkg = journal.loadTurnPackage(STATE_DIR, sessKey, turn);
-      if (!pkg.ok) {
-        journal.completeTurn(STATE_DIR, sessKey, turn, { outcome: "failed", reason: "recovery: " + pkg.reason });
-        return { errorOutcome: "failed", reason: "recovery: " + pkg.reason };
-      }
-      turn.stage = "restore";
-      journal.saveTurn(STATE_DIR, sessKey, turn);
-      // При восстановлении ветка из строки проверяемого итога заново не
-      // разрешается: закреплённый SHA и договор вердикта берутся из записи.
-      context.pin = turn.pin ?? context.pin;
-      const verdict = journal.deserializeVerdict(turn.verdict);
-      if (verdict) context.verdict = verdict;
-      // Точный повтор (тот же отпечаток входа) повторяет пакет дословно;
-      // «продолжай» добавляет к пакету обмены и само поручение.
-      return { kind: "resume", sessKey, turn, pkg, exact: turn.taskSha256 === inputSha256 };
-    }
-  }
-  if (!turns.length && journal.isContinueText(text)) {
+  const unfinished = last && !last.record.outcome ? last.record : null;
+  const retryable = unfinished ?? (last?.record.outcome === "failed" && last.record.packageSha256 ? last.record : null);
+  if (isContinue && !retryable) {
     return { errorOutcome: "not_started", reason: "a bare continue has no saved task package to resume" };
   }
+  const sameBlocks = unfinished?.inputBlocksSha256 === inputSha256;
+  const candidate = isContinue ? retryable : sameBlocks ? unfinished : null;
+  let context = await prepare(candidate);
+  let materials;
+  if (candidate) {
+    let fingerprint = inputSha256;
+    let exact = false;
+    if (!isContinue && candidate.taskSha256) {
+      materials = await collectTaskAttachments(context, blocks, taskAttachmentOptions(session, task));
+      fingerprint = taskInputSha256(inputSha256, materials);
+      exact = fingerprint === candidate.taskSha256;
+    }
+    if (isContinue || exact || !candidate.taskSha256) {
+      const pkg = journal.loadTurnPackage(STATE_DIR, saved.key, candidate);
+      if (!pkg.ok) {
+        journal.completeTurn(STATE_DIR, saved.key, candidate, { outcome: "failed", reason: "recovery: " + pkg.reason });
+        return { errorOutcome: "failed", reason: "recovery: " + pkg.reason };
+      }
+      journal.addAttempt(STATE_DIR, saved.key, candidate, fingerprint);
+      session.journal = saved;
+      return { kind: "resume", sessKey: saved.key, turn: candidate, pkg, exact, context };
+    }
+    context = await prepare();
+    if (context.pin?.sha !== candidate.pin?.sha) materials = undefined;
+  }
+  if (unfinished && !unfinished.inputBlocksSha256 && unfinished.taskSha256 === sha256(text)) {
+    return { errorOutcome: "not_started", reason: "recovery: legacy task input fingerprint is incomplete; send a bare continue to resume" };
+  }
+  if (unfinished) {
+    journal.completeTurn(STATE_DIR, saved.key, unfinished, { outcome: "failed", reason: "superseded by a new task input" });
+    session.convId = null;
+    session.backend = null;
+  }
+  let entry = saved;
+  if (!entry) {
+    entry = journal.createSessionRecord(STATE_DIR, {
+      sessionId,
+      threadId: session.thread.thread.id,
+      projectId: session.thread.thread.projectId,
+      fingerprint: await journal.worktreeFingerprint(context.cwd),
+      accessCeiling: "read-only",
+      roots: session.roots,
+      model: session.model,
+      thinking: session.thinking,
+      account: session.account,
+    });
+  }
+  session.journal = entry;
+  const head = await journal.headOf(context.root ?? context.cwd, task.signal);
+  task.signal.throwIfAborted();
   const turn = journal.createTurn(STATE_DIR, entry, {
     inputSha256,
+    previousTurnNo: last?.turnNo,
     mode: "read-only",
-    head: await journal.headOf(context.root ?? context.cwd, signal),
+    profile: { model: session.model, thinking: session.thinking, account: session.account },
+    deadlineAt: task.deadline,
+    budgetLimits: {
+      maxTotalBytes: context.settings.maxTotalBytes,
+      maxToolRounds: webTools.MAX_TOOL_ROUNDS,
+      maxRepairRounds: context.settings.maxRepairRounds,
+    },
+    head,
     pin: context.pin,
     expected: context.verdict ? "verdict" : "text",
     verdict: journal.serializeVerdict(context.verdict),
   });
-  return { kind: "fresh", sessKey, turn };
+  return { kind: "fresh", sessKey: entry.key, turn, context, materials };
 }
 
 async function runBoundPrompt(msg, session) {
@@ -2185,7 +2251,7 @@ async function runBoundPrompt(msg, session) {
     task.signal.throwIfAborted();
     let thread = session.thread;
     if (!thread && BB_THREAD_ARG) {
-      thread = session.thread = await taskThread(BB_THREAD_ARG.slice("--bb-thread-id=".length)).catch(() => null);
+      thread = session.thread = await taskThread(BB_THREAD_ID, task.signal).catch(() => null);
     }
     if (!thread) throw new TaskTurnError("could not verify trusted BB thread metadata");
     if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") throw new TaskTurnError("full grants read-only access");
@@ -2193,44 +2259,42 @@ async function runBoundPrompt(msg, session) {
     const system = isBbSystemInstructionsBlock(prompt[0]) ? prompt[0].text : null;
     const blocks = prompt.filter((block) => block && !isBbSystemInstructionsBlock(block));
     const text = blocks.filter((block) => block.type === "text").map((block) => String(block.text ?? "")).join("\n");
-    const context = await prepareTask({
+    const prepare = (savedTurn) => prepareTask({
       text, system, session, thread, stateDir: STATE_DIR, signal: task.signal,
-      onSettings: (settings) => task.heartbeat(settings.progressIntervalMs),
+      onSettings: (settings) => task.heartbeat(settings.progressIntervalMs), savedTurn,
     });
-    task.pinnedSha = context.pin?.sha ?? null;
-    if (context.pin?.sha) {
-      slog("task:pinned-sha", { sessionId, sha: context.pin.sha, base: context.pin.base });
-    }
     // §7.2: номер хода и запись журнала выделяются до внешней работы;
     // точный повтор/«продолжай» незавершённого хода продолжает его по §7.3.
-    let plan;
-    try {
-      plan = await planTaskTurn({ session, sessionId, context, text, signal: task.signal });
-    } catch (journalError) {
-      throw new TaskTurnError(`task journal is unavailable: ${journalError?.code || journalError?.message || journalError}`);
-    }
+    const plan = await planTaskTurn({ session, sessionId, blocks, text, prepare, task });
     if (plan.errorOutcome) {
       const planError = new TaskTurnError(plan.reason);
       planError.outcome = plan.errorOutcome;
       throw planError;
     }
     task.journal = { sessKey: plan.sessKey, turn: plan.turn, entry: session.journal };
+    const { context, turn } = plan;
+    task.pinnedSha = context.pin?.sha ?? null;
+    if (context.pin) slog("task:pinned-sha", { sessionId, sha: context.pin.sha, base: context.pin.base });
     if (plan.kind === "resume") {
+      // Earlier journal records have the starting timestamp and bytes spent,
+      // before deadline and limit snapshots were added.
+      task.setDeadline(turn.deadlineAt ?? turn.createdAt + SEND_DEADLINE_MS);
       // convId восстанавливается только на прежнем backend вне cooldown;
       // иначе ход получает повторную доставку сохранённого пакета в новый чат.
       const useConv = Boolean(plan.turn.convId) && convBackendUsable(plan.turn.backendId);
-      task.resume = { convId: useConv ? plan.turn.convId : null, pkg: plan.pkg, instruction: text, turn: plan.turn, exact: plan.exact };
-      if (useConv) {
-        session.convId = plan.turn.convId;
-        session.backend = BACKENDS.find((b) => b.id === plan.turn.backendId) ?? session.backend;
-      }
+      task.resume = {
+        convId: useConv ? turn.convId : null, pkg: plan.pkg, exact: plan.exact,
+        instruction: plan.exact ? "Continue the original task from the saved package." : context.settings.mask(text),
+      };
+      session.convId = task.resume.convId;
+      session.backend = useConv ? BACKENDS.find((b) => b.id === turn.backendId) : null;
       slog("task:resume", { sessionId, turnNo: plan.turn.turnNo, attempt: plan.turn.attempts?.at(-1)?.n, convId: useConv ? plan.turn.convId : null });
     }
     if (Date.now() >= task.deadline) task.stop("deadline exceeded");
     task.signal.throwIfAborted();
-    await runPrompt(msg.id, sessionId, text, { task, context, blocks });
+    await runPrompt(msg.id, sessionId, text, { task, context, blocks, materials: plan.materials });
   } catch (error) {
-    const outcome = error.outcome ?? "not_started";
+    const outcome = error.outcome ?? (task.journal ? "failed" : "not_started");
     const reason = task.signal.reason ?? (error.code ? "invalid task input or working directory" : error.message);
     await task.finish(outcome, reason);
     turnError(msg.id, outcome, reason);
@@ -2244,7 +2308,7 @@ async function runBoundPrompt(msg, session) {
 // (session cwd или roots), потолок прав, срок хранения. При отказе —
 // not_started с причиной; пустой чат никогда не создаётся.
 function restoreSessionFromRecord(requestedId, entry, cwd) {
-  const s = {
+  const s = sessions.get(entry.record.sessionId) ?? {
     id: requestedId,
     cwd: cwd || null,
     roots: Array.isArray(entry.record.roots) ? entry.record.roots : [],
@@ -2255,10 +2319,10 @@ function restoreSessionFromRecord(requestedId, entry, cwd) {
     backend: BACKENDS.find((b) => b.id === entry.record.backendId) ?? null,
     journal: entry,
   };
+  journal.addSessionAlias(STATE_DIR, s.journal ?? entry, requestedId);
   sessions.set(requestedId, s);
   sessions.set(entry.record.sessionId, s);
   for (const alias of entry.record.aliases ?? []) sessions.set(alias, s);
-  journal.addSessionAlias(STATE_DIR, entry, requestedId);
   return s;
 }
 
@@ -2269,20 +2333,25 @@ async function validateSessionRecord(entry, cwd) {
   if (!record || record.version !== journal.JOURNAL_VERSION) {
     return "saved session record is corrupt or has an unsupported version";
   }
-  if (BB_THREAD_ARG) {
-    const threadId = BB_THREAD_ARG.slice("--bb-thread-id=".length);
-    if (record.threadId !== threadId) {
-      return "saved session belongs to a different owner thread";
-    }
+  if (!BB_THREAD_ID || !record.threadId) {
+    return "saved session owner thread could not be verified";
   }
-  if (cwd) {
-    const fp = await journal.worktreeFingerprint(cwd).catch(() => null);
-    if (!fp || !journal.fingerprintEqual(fp, record.fingerprint)) {
-      return "saved session belongs to a different working directory";
-    }
+  if (record.threadId !== BB_THREAD_ID) {
+    return "saved session belongs to a different owner thread";
   }
-  if (record.accessCeiling && record.accessCeiling !== "read-only") {
+  const thread = await taskThread(BB_THREAD_ID).catch(() => null);
+  if (!thread || (record.projectId && thread.thread.projectId !== record.projectId)) {
+    return "saved session owner thread could not be verified";
+  }
+  const fp = cwd ? await journal.worktreeFingerprint(cwd).catch(() => null) : null;
+  if (!journal.fingerprintEqual(fp, record.fingerprint)) {
+    return "saved session belongs to a different working directory";
+  }
+  if (record.accessCeiling !== "read-only") {
     return `saved session requires ${record.accessCeiling}, not permitted by the read-only ceiling`;
+  }
+  if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") {
+    return "session restoration requires a read-only launch";
   }
   if (sessionRecordExpired(record)) {
     return "saved session record is expired";
@@ -2305,13 +2374,12 @@ function persistSessionProfile(s) {
 async function handleSessionNew(msg, p) {
   const uniq = `${process.pid}-${Date.now().toString(36)}-${++sessionCounter}`;
   const sessionId = `web-gemini-${uniq}`;
-  if (BB_THREAD_ARG) {
-    const threadId = BB_THREAD_ARG.slice("--bb-thread-id=".length);
+  if (BB_THREAD_ID) {
     const fp = p.cwd ? await journal.worktreeFingerprint(p.cwd).catch(() => null) : null;
     const candidates = fp
       ? journal.listSessionRecords(STATE_DIR).filter(
           (e) => e.record && !e.corrupt && e.record.version === journal.JOURNAL_VERSION &&
-            e.record.threadId === threadId && journal.fingerprintEqual(e.record.fingerprint, fp))
+            e.record.threadId === BB_THREAD_ID && journal.fingerprintEqual(e.record.fingerprint, fp))
       : [];
     if (candidates.length > 1) {
       turnError(msg.id, "not_started", "ambiguous saved session records for this thread and directory");
@@ -2319,8 +2387,9 @@ async function handleSessionNew(msg, p) {
     }
     if (candidates.length === 1) {
       const entry = candidates[0];
-      if (sessionRecordExpired(entry.record)) {
-        turnError(msg.id, "not_started", "saved session record is expired");
+      const rejection = await validateSessionRecord(entry, p.cwd);
+      if (rejection) {
+        turnError(msg.id, "not_started", rejection);
         return;
       }
       const s = restoreSessionFromRecord(sessionId, entry, p.cwd);
@@ -2348,8 +2417,9 @@ async function handleSessionNew(msg, p) {
 // §7.2/§9: session/load — восстановление по идентификатору сессии или алиасу.
 async function handleSessionLoad(msg, p) {
   const sessionId = p.sessionId;
-  if (sessionId && sessions.has(sessionId)) {
-    void sendSession(msg.id, sessionId, sessions.get(sessionId));
+  const live = sessions.get(sessionId);
+  if (live && !live.journal) {
+    void sendSession(msg.id, sessionId, live);
     return;
   }
   if (sessionId) {
@@ -2363,7 +2433,7 @@ async function handleSessionLoad(msg, p) {
       turnError(msg.id, "not_started", rejection);
       return;
     }
-    const s = restoreSessionFromRecord(sessionId, entry, p.cwd);
+    const s = live ?? restoreSessionFromRecord(sessionId, entry, p.cwd);
     slog("session:load", { sessionId, restored: entry.record.sessionId, convId: s.convId });
     void sendSession(msg.id, sessionId, s);
     return;
@@ -2508,7 +2578,7 @@ export function dispatch(msg) {
         else out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown session "${p.sessionId}"` } });
         return;
       }
-      if (BB_THREAD_ARG && (!sess.thread || sess.thread.thread.originPluginId)) void runBoundPrompt(msg, sess);
+      if (BB_THREAD_ARG && (sess.journal || !sess.thread || sess.thread.thread.originPluginId)) void runBoundPrompt(msg, sess);
       else if (SESSION_ACCESS && SESSION_ACCESS !== "read-only") turnError(msg.id, "not_started", "full grants read-only access");
       else dispatchPrompt(msg, sess);
       return;
@@ -2595,23 +2665,8 @@ export function startServer({ webDriver } = {}) {
   // §7.2/§9: чистка журнала (TTL/лимит записей) до чистки вложений — файлы,
   // нужные восстановлению активных ходов, защищены от pruneDir.
   try {
-    // §9: срок хранения и лимит записей — из inner-agent.json каждой записи;
-    // лимит для общей чистки — минимум по существующим записям (консервативно).
-    const settingsFor = (entry) => {
-      try {
-        return loadSettings(STATE_DIR, entry?.record?.projectId);
-      } catch {
-        return null;
-      }
-    };
-    let maxRecords = Infinity;
-    for (const entry of journal.listSessionRecords(STATE_DIR)) {
-      const limit = settingsFor(entry)?.stateMaxRecords;
-      if (Number.isFinite(limit)) maxRecords = Math.min(maxRecords, limit);
-    }
     journal.pruneJournal(STATE_DIR, {
-      maxRecords: Number.isFinite(maxRecords) ? maxRecords : undefined,
-      retentionFor: (entry) => settingsFor(entry)?.stateRetentionMs,
+      retentionFor: (entry) => loadSettingsRetention(entry.record?.projectId),
     });
   } catch (error) {
     slog("journal:prune-error", { error: String(error?.message || error) });
