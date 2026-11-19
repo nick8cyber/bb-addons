@@ -58,11 +58,12 @@
 3. **Sandbox Preflight Probe и запуск в Bubblewrap:**
    - **Боевая Preflight-проверка:** при старте плагина оркестратора и перед раздачей на маршрут `trust: "public"` оркестратор проверяет работоспособность пространств имён ядра боевым набором параметров:
      ```bash
-     bwrap --unshare-all --unshare-net --die-with-parent --ro-bind /usr /usr --proc /proc --dev /dev -- true
+     bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --proc /proc --dev /dev -- true
      ```
-     Команда комплексно верифицирует создание User namespace (запись в `uid_map` / `gid_map`) и сетевого пространства имён (`--unshare-net`).
+     Флаг `--unshare-all` включает изоляцию всех пространств имён (включая User и Network namespaces). Команда верифицирует создание User namespace (запись в `uid_map` / `gid_map`) и сетевую изоляцию (loopback `lo`).
      Если на хосте ограничены непривилегированные пользовательские пространства имён (например, `kernel.apparmor_restrict_unprivileged_userns = 1` в Ubuntu 24.04+) **И** бинарник `bwrap` не имеет установленного `setuid`-бита (`chmod u+s /usr/bin/bwrap`), либо нарушена сетевая изоляция (`Failed RTM_NEWADDR`):
-     - Маршрут помечается как `sandbox-unavailable`. Запись о блокировке регистрируется в таблице `route_holds` через `store.hold(routeKey, Date.now() + 86400000, "sandbox-unavailable: unprivileged userns or network namespace restricted")` в единой модели с `unavailablePatterns` / hold (§2 / `policy.ts`). Маркер хранится в БД и снимается при перезапуске плагина с повторным успешным выполнением `probeSandbox()` либо по истечении тайм-аута удержания.
+     - Маршрут помечается как `sandbox-unavailable`. Запись о блокировке регистрируется в таблице `route_holds` через `store.hold(routeKey, Date.now() + 86400000, "sandbox-unavailable: unprivileged userns or network namespace restricted")` в единой модели с `unavailablePatterns` / hold (§2 / `policy.ts`).
+     - Для снятия удержания интерфейс хранилища расширяется методом `store.unhold(routeKey: string): void` (`DELETE FROM route_holds WHERE quota_group = ?`). При перезапуске плагина оркестратор повторно выполняет `probeSandbox()`; при успехе вызывается `store.unhold(routeKey)`, немедленно разблокируя маршрут до истечения суточного TTL.
      - Ошибки вида `"bwrap: setting up uid map: Permission denied"` и `"loopback: Failed RTM_NEWADDR"` входят в состав системных `BUILTIN_UNAVAILABLE_PATTERNS`.
      - Задачи исполнителя на этом маршруте не стартуют на голом хосте, а немедленно переводятся в `blocked` (Fail-Closed).
    - **Запрет подмены `--unshare-all`:** использование полного флага `--unshare-all` является строгим требованием безопасности. Подмена его набором выборочных флагов (например, только `--unshare-net` и `--unshare-pid`) **категорически запрещена**: User namespace изолирует UID/GID и гарантирует свежий локальный счётчик ucounts для `prlimit --nproc=64`. Исключение флага User namespace приводит к падению с ошибкой `EAGAIN` при старте из-за фоновых процессов хоста.
@@ -83,7 +84,6 @@
        --tmpfs /var/tmp \
        --bind "$SANDBOX_DIR" /workspace \
        --chdir /workspace \
-       --unshare-net \
        --setenv HOME /tmp \
        --setenv PATH /usr/local/bin:/usr/bin:/bin \
        --setenv BB_SANDBOX "1" \
@@ -91,32 +91,41 @@
        -- prlimit --nproc=64 --as=4294967296 --cpu=1200 -- <команда_агента>
      ```
    - **Лимиты ресурсов внутри песочницы:** утилита `prlimit --nproc=64 --as=4294967296 --cpu=1200` (4 GiB виртуальной памяти, 64 процесса, 1200 секунд CPU) накладывается **СТРОГО ВНУТРИ** песочницы на команду агента. Это исключает падение с ошибкой `EAGAIN` при старте, возникающее, если накладывать лимит снаружи на процесс `bwrap` при большом числе фоновых процессов пользователя хоста.
-   - **Подготовка mountpoint:** для путей из `confidentialPaths` оркестратор перед запуском bwrap гарантирует существование целевого файла (`mkdir -p $(dirname ...) && touch ...`) или директории (`mkdir -p ...`), после чего применяет точки монтирования:
+   - **Подготовка mountpoint:** для путей из `confidentialPaths` оркестратор перед запуском bwrap гарантирует существование целевого файла (`mkdir -p $(dirname ...) && touch ...`) или директории (`mkdir -p ...`), сохраняя список фактически созданных временных плейсхолдеров в массиве `CREATED_PLACEHOLDERS`:
      - если путь в репозитории — файл: `--ro-bind /dev/null /workspace/<confidentialPath>`
      - если путь в репозитории — каталог: `--tmpfs /workspace/<confidentialPath>`
-   - Замечание: файл `/etc/resolv.conf` **НЕ пробрасывается**, так как сеть отключена (`--unshare-net`), а его содержимое раскрывает IP-адреса локальных DNS-серверов хоста.
+   - Замечание: файл `/etc/resolv.conf` **НЕ пробрасывается**, так как сеть отключена (`--unshare-all`), а его содержимое раскрывает IP-адреса локальных DNS-серверов хоста.
 
 4. **Извлечение, очистка и применение результата:**
-   - По завершении хода оркестратор выполняет санитарную очистку артефактов и плейсхолдеров, регистрирует новые untracked-файлы и снимает дифф:
+   - По завершении хода оркестратор выполняет безопасную очистку артефактов и плейсхолдеров, регистрирует новые untracked-файлы и снимает дифф:
      ```bash
-     # 1. Санитарная очистка артефактов сборки и кэшей, созданных агентом
-     rm -rf "$SANDBOX_DIR"/{node_modules,.venv,__pycache__,dist,build,.turbo,target,.pytest_cache,.mypy_cache,.cache}
+     # 1. Безопасная очистка только игнорируемых артефактов сборки и кэшей
+     # Флаг -X гарантирует удаление ТОЛЬКО файлов и директорий, подпадающих под .gitignore
+     # (node_modules, .venv, __pycache__, кэши тестов). Закоммиченные файлы (например dist/bundle.js)
+     # и созданные агентом новые исходные файлы не затрагиваются!
+     git -C "$SANDBOX_DIR" clean -fdX
 
-     # 2. Удаление временных плейсхолдеров confidentialPaths перед фиксацией
-     for p in "${CONFIDENTIAL_PATHS[@]}"; do
-       rm -rf "$SANDBOX_DIR/$p"
+     # 2. Удаление сохранённых плейсхолдеров confidentialPaths перед фиксацией
+     for placeholder in "${CREATED_PLACEHOLDERS[@]}"; do
+       rm -rf "$placeholder"
      done
 
-     # 3. Регистрация untracked-файлов без принудительного флага -f
+     # 3. Формирование массива pathspec-исключений для confidentialPaths
+     EXCLUDE_CONFIDENTIAL_ARGS=()
+     for p in "${CONFIDENTIAL_PATHS[@]}"; do
+       EXCLUDE_CONFIDENTIAL_ARGS+=(":(exclude)$p")
+     done
+
+     # 4. Регистрация untracked-файлов без принудительного флага -f
      # Флаг -f исключён: он втаскивал бы игнорируемые деревья и кэши в патч.
-     # Регистрация уважает .gitignore и явно исключает confidentialPaths.
+     # Регистрация уважает .gitignore и исключает confidentialPaths.
      git -C "$SANDBOX_DIR" add -AN -- . "${EXCLUDE_CONFIDENTIAL_ARGS[@]}"
 
-     # 4. Снятие диффа с явным исключением confidentialPaths
+     # 5. Снятие диффа с явным исключением confidentialPaths
      git -C "$SANDBOX_DIR" diff HEAD -- . "${EXCLUDE_CONFIDENTIAL_ARGS[@]}" > "$SANDBOX_DIR/patch.diff"
      ```
-   - **Исключение флага `-f`:** стандартная команда `git add -AN` уважает правила `.gitignore`. Новые исходные файлы агента (например, `src/utils/new-helper.ts`) регистрируются как intent-to-add и попадают в дифф, в то время как сборочные зависимости и кэши, попавшие под `.gitignore`, отсекаются и не загрязняют репозиторий.
-   - **Удаление плейсхолдеров и pathspec exclusion:** удаление созданных touch/mkdir заглушек `confidentialPaths` и использование pathspec `':(exclude)<path>'` гарантируют, что пути из `confidentialPaths` не попадут в `patch.diff` в виде `new file mode 100644`. Это предотвращает ошибку `git apply --check: already exists in working directory` на доверенном рабочем дереве и исключает утечку имён секретных файлов в заголовок патча.
+   - **Исключение флага `-f` и правило размещения артефактов:** стандартная команда `git add -AN` уважает правила `.gitignore`. Новые исходные файлы агента (например, `src/utils/new-helper.ts`) регистрируются как intent-to-add и попадают в дифф, в то время как сборочные зависимости и кэши отсекаются `git clean -fdX` и `.gitignore`. Исполнитель на публичном маршруте обязан сохранять целевые артефакты вне путей, включённых в `.gitignore`; если агент создаёт файл под шаблоном `.gitignore` (например `report.log` при `*.log`), такой файл трактуется как сборочный мусор и не входит в патч.
+   - **Удаление плейсхолдеров и pathspec exclusion:** удаление сохранённых плейсхолдеров `CREATED_PLACEHOLDERS` и явное pathspec-исключение `"${EXCLUDE_CONFIDENTIAL_ARGS[@]}"` гарантируют, что пути из `confidentialPaths` не попадут в `patch.diff` в виде `new file mode 100644`. Это предотвращает ошибку `git apply --check: already exists in working directory` на доверенном рабочем дереве и исключает утечку имён секретных файлов в заголовок патча.
    - Дифф валидируется через DLP Redaction Engine (§4.2) и проходит верификацию символических ссылок (§4.3).
    - Валидированный патч применяется к рабочему дереву задачи в доверенном контуре:
      `git apply --check "$SANDBOX_DIR/patch.diff" && git apply "$SANDBOX_DIR/patch.diff"`
@@ -196,7 +205,7 @@
    `symlink-violation: absolute symlink target '<target>' is prohibited`.
 2. **Запрет выхода за пределы репозитория:** если относительный путь симлинка с учётом переходов `../` выходит за пределы корня репозитория (`path.resolve(repoRoot, linkDir, target)` лежит вне `repoRoot`), патч отклоняется:
    `symlink-violation: symlink target '<target>' escapes repository root`.
-3. **Проверка при применении:** при исполнении `git apply` контролируется реальный путь (`realpath`) целевых файлов — применение изменений поверх существующих симлинков на хосте запрещено.
+3. **Проверка путей перед применением:** до вызова `git apply` оркестратор проверяет каждый затрагиваемый в `patch.diff` путь в рабочем дереве: если целевой файл на хосте уже является существующей символической ссылкой, наложение патча отклоняется (`symlink-violation: cannot patch through existing symlink on host`), защищая хост от побега через предсуществующие симлинки.
 
 ---
 
@@ -266,18 +275,23 @@ export interface PolicyRoute {
    - Запуск агента на публичном маршруте.
    - Проверка истории: `git log --all`, `git reflog`, `git rev-list --objects` возвращают ровно один коммит `sandbox root snapshot`.
    - Проверка ENV: вызов `env` внутри песочницы подтверждает отсутствие `BB_THREAD_ID`, `BB_SERVER_URL` и токенов провайдеров.
-2. **Тест Б2 (Физическое исключение `confidentialPaths`, отсутствие плейсхолдеров и фильтрация .gitignore):**
-   - В репозитории есть `src/auth/secret.ts` (файл) и `secrets/keys/` (каталог) из `confidentialPaths`.
+2. **Тест Б2 (Физическое исключение `confidentialPaths`, сохранность отслеживаемых файлов и фильтрация .gitignore):**
+   - В репозитории есть `src/auth/secret.ts` (файл) и `secrets/keys/` (каталог) из `confidentialPaths`, а также закоммиченный файл сборки `dist/bundle.js`.
    - Чтение файла возвращает пустой вывод (`/dev/null`), чтение каталога — пустую директорию `tmpfs`.
-   - Создание нового файла `src/utils/new-helper.ts` (untracked, не в `.gitignore`): команда `git add -AN && git diff HEAD` включает новый файл в `patch.diff` без потерь.
-   - Создание временных файлов в игнорируемых каталогах (например, `node_modules/pkg/index.js` или `test.log` при `*.log` в `.gitignore`): благодаря исключению флага `-f` и предварительной санитарной очистке артефакты НЕ попадают в `patch.diff`, предотвращая загрязнение доверенного дерева.
-   - Плейсхолдеры mountpoint `confidentialPaths` удаляются до `git add`: в `patch.diff` отсутствуют записи для `src/auth/secret.ts`, а `git apply --check` на доверенном дереве завершается успешно без ошибки `already exists in working directory`.
+   - В процессе работы агент создаёт:
+     - новый файл `src/utils/new-helper.ts` (untracked, не в `.gitignore`);
+     - временные сборочные файлы в `node_modules/pkg/index.js` и `test.log` (подпадают под `.gitignore`).
+   - После `git clean -fdX` и удаления сохранённых плейсхолдеров `CREATED_PLACEHOLDERS`:
+     1) закоммиченный `dist/bundle.js` остаётся нетронутым и НЕ попадает в дифф как `deleted`;
+     2) сборочный мусор (`node_modules/`, `test.log`) удаляется и НЕ попадает в `patch.diff`;
+     3) новый исходный файл `src/utils/new-helper.ts` корректно регистрируется и попадает в `patch.diff` как `new file`;
+     4) плейсхолдеры `confidentialPaths` удалены, pathspec `':(exclude)'` исключает конфиденциальные пути, а `git apply --check` на доверенном дереве завершается успешно без ошибки `already exists in working directory`.
 3. **Тест Б3 (Защита от Unmasking Oracle):**
    - Агент возвращает unified diff, где в добавленной строке `'+'` находится токен `__BB_REDACTED_SECRET_001__`.
    - Оркестратор бракует сдачу с ошибкой `dlp-violation`. Секрет не запекается в репозиторий.
    - Агент возвращает удаление строки с секретом (строка `'-'`): анмаскинг в удаляемой строке проходит успешно, `git apply` накладывается без ошибок.
 4. **Тест Б4 (Изоляция Bubblewrap, Preflight и Prlimit):**
-   - Боевой Sandbox Preflight Probe (`bwrap --unshare-all --unshare-net --die-with-parent --ro-bind /usr /usr --proc /proc --dev /dev -- true`) запускается при старте. Если unprivileged userns заблокированы ядром И отсутствует setuid-бит на bwrap, публичный маршрут исполнителя получает статус `sandbox-unavailable` с регистрацией в `route_holds`.
+   - Боевой Sandbox Preflight Probe (`bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --proc /proc --dev /dev -- true`) запускается при старте. Если unprivileged userns заблокированы ядром И отсутствует setuid-бит на bwrap, публичный маршрут исполнителя получает статус `sandbox-unavailable` с регистрацией в `route_holds` (снятие через `store.unhold(routeKey)`).
    - При активной песочнице агент вызывает `curl https://google.com` или пытается прочитать `/etc/shadow`.
    - Результат: отказ сети `Network is unreachable`, отказ доступа к файлам хоста. Внутренний лимит `prlimit --nproc=64 --as=4294967296 --cpu=1200` защищает от fork-бомбы и исчерпания памяти/CPU.
 5. **Тест Б5 (Fail-Closed):**
