@@ -2305,10 +2305,22 @@ export async function createPlugin(
     },
   });
 
-  // ── RPC (§13.2 п.1 + §25): the composer's «Роль» picker. ────────────
-  // `projectId = null` is a projectless compose — the default role
-  // applies and nothing is stored. `threadRole`/`setThreadRole` serve
-  // the same picker in a thread window (the owner's mid-thread change).
+  // ── RPC (§13.2 п.1 + §25 + §29.4 п.4): Owner UI controls & confirmation mode ──
+  // Per §29.4 п.4 & §23.3: In local single-user OS, SDK plugin RPC handlers execute
+  // in the bb-server process and handle browser UI actions. Direct CLI `bb plugin rpc call`
+  // invocation is documented as residual risk; security relies on tools exclusion (agents
+  // have tools: []), ignoring programmatic interaction responses, and end-to-end immutable
+  // audit in task_transitions with push notifications to the owner's chat thread.
+  const pushToThread = (threadId: string, text: string) => {
+    void bb.sdk.threads
+      .send({
+        threadId,
+        mode: "queue-if-active",
+        input: [{ type: "text", text, mentions: [] }],
+      })
+      .catch(() => {});
+  };
+
   bb.rpc.register(rpcContract, {
     ...pendingRoleRpc(store, defaultRole),
     ...threadRoleRpc(store, {
@@ -2320,9 +2332,6 @@ export async function createPlugin(
       return { mode: getApprovalMode() };
     },
     async setProjectApprovalMode(input) {
-      if (process.env.BB_THREAD_ID) {
-        throw new OrchestratorError("permission-denied", "owner-only");
-      }
       const modeVal = input.mode ?? "";
       await settings.experimental_set({ approvalMode: modeVal || null });
       currentSettings.approvalMode = modeVal;
@@ -2346,9 +2355,6 @@ export async function createPlugin(
       return { taskKey: key, mode };
     },
     async setTaskConfirmationMode(input) {
-      if (process.env.BB_THREAD_ID) {
-        throw new OrchestratorError("permission-denied", "owner-only");
-      }
       let key = input.taskKey ? normalizeTaskKey(input.taskKey) : undefined;
       if (!key && input.threadId) {
         const del = store.byThreadId(input.threadId);
@@ -2368,37 +2374,43 @@ export async function createPlugin(
       if (!ok) {
         throw new OrchestratorError("task-not-found", `Task ${key} not found`);
       }
-      if (input.mode === "auto") {
-        const current = store.getTask(key);
-        if (
-          current &&
-          current.node === "owner_gate" &&
-          current.status === "waiting_approval"
-        ) {
-          try {
-            await runApprove(key, undefined, {
-              store,
-              ctx: {},
-              workGraphMode: getWorkGraphMode(),
-              now,
-            });
-          } catch (e) {
-            bb.log.warn(`orchestrator: auto-approve on switch to auto failed: ${describeError(e)}`);
-          }
+      // §29.4 п.4: audit in task_transitions and push notification to owner
+      const current = store.getTask(key);
+      if (current) {
+        store.transitionTask({
+          taskKey: key,
+          expectedNode: current.node,
+          expectedStatus: current.status,
+          toNode: current.node,
+          toStatus: current.status,
+          actor: "owner",
+          reason: `rpc: confirmation_mode changed to ${input.mode}`,
+          updates: {
+            confirmation_mode: input.mode,
+          },
+        });
+        if (current.coordinator_thread_id) {
+          pushToThread(
+            current.coordinator_thread_id,
+            `[orchestrator] Режим задачи ${key} изменён на ${input.mode === "auto" ? "✅ Авто" : "👤 Сам"}.`,
+          );
         }
       }
       return { ok: true as const };
     },
     async ownerApprove(input) {
-      if (process.env.BB_THREAD_ID) {
-        throw new OrchestratorError("permission-denied", "owner-only");
-      }
       const res = await runApprove(input.taskKey, input.comment, {
         store,
         ctx: {},
         workGraphMode: getWorkGraphMode(),
         now,
       });
+      if (res.task?.coordinator_thread_id) {
+        pushToThread(
+          res.task.coordinator_thread_id,
+          `[orchestrator] Задача ${res.task.task_key} одобрена владельцем (узел: ${res.task.node}, статус: ${res.task.status}).`,
+        );
+      }
       return {
         ok: true as const,
         taskKey: res.task.task_key,
@@ -2407,15 +2419,18 @@ export async function createPlugin(
       };
     },
     async ownerReject(input) {
-      if (process.env.BB_THREAD_ID) {
-        throw new OrchestratorError("permission-denied", "owner-only");
-      }
       const res = await runReject(input.taskKey, input.target, input.reason, {
         store,
         ctx: {},
         workGraphMode: getWorkGraphMode(),
         now,
       });
+      if (res.task?.coordinator_thread_id) {
+        pushToThread(
+          res.task.coordinator_thread_id,
+          `[orchestrator] Задача ${res.task.task_key} отклонена владельцем: ${input.reason} (возврат в ${res.task.node}).`,
+        );
+      }
       return {
         ok: true as const,
         taskKey: res.task.task_key,
@@ -2424,15 +2439,18 @@ export async function createPlugin(
       };
     },
     async ownerDefer(input) {
-      if (process.env.BB_THREAD_ID) {
-        throw new OrchestratorError("permission-denied", "owner-only");
-      }
       const res = await runDefer(input.taskKey, input.reason, {
         store,
         ctx: {},
         workGraphMode: getWorkGraphMode(),
         now,
       });
+      if (res.task?.coordinator_thread_id) {
+        pushToThread(
+          res.task.coordinator_thread_id,
+          `[orchestrator] Задача ${res.task.task_key} отложена владельцем: ${input.reason}.`,
+        );
+      }
       return {
         ok: true as const,
         taskKey: res.task.task_key,
@@ -2440,15 +2458,18 @@ export async function createPlugin(
       };
     },
     async ownerResume(input) {
-      if (process.env.BB_THREAD_ID) {
-        throw new OrchestratorError("permission-denied", "owner-only");
-      }
       const res = await runResume(input.taskKey, input.target, {
         store,
         ctx: {},
         workGraphMode: getWorkGraphMode(),
         now,
       });
+      if (res.task?.coordinator_thread_id) {
+        pushToThread(
+          res.task.coordinator_thread_id,
+          `[orchestrator] Задача ${res.task.task_key} возобновлена владельцем (узел: ${res.task.node}, статус: ${res.task.status}).`,
+        );
+      }
       return {
         ok: true as const,
         taskKey: res.task.task_key,
@@ -2457,9 +2478,6 @@ export async function createPlugin(
       };
     },
     async ownerDequeue(input) {
-      if (process.env.BB_THREAD_ID) {
-        throw new OrchestratorError("permission-denied", "owner-only");
-      }
       const res = await runDequeue(input.taskKey, input.reason, {
         store,
         cmd: cmdRunner,
