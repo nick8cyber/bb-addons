@@ -2056,6 +2056,101 @@ await sleep(100);
     `entry=${JSON.stringify(proseEntry)} saw=${proseSaw} ` +
       `statuses=${statuses("t-validation-prose")}`);
 
+  // O2. §2.3 п.13: the quota window reported as ordinary agent text —
+  // swallowed, the account cooled until the stated reset (~127h, far past
+  // the wait cap), the turn re-run on a sibling.
+  const quotaSaw = (id) => messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === id &&
+    JSON.stringify(m.params?.deltas ?? []).includes("Individual quota reached"));
+  const freshFour = () => ({
+    m1: freshRecord(["fake-model"]),
+    m2: freshRecord(["fake-model"]),
+    m3: freshRecord(["fake-model"]),
+    m4: freshRecord(["fake-model"]),
+  });
+  writeAcpModels(freshFour());
+  acpControl.modeByLabel = { m1: "quota-text" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  const newsO2 = newsSnapshot();
+  const o2LogOffset = readFileSync(join(acpData, "acp-wrapper.log"), "utf8").length;
+  await startModel("t-quota-text", "fake-model");
+  await turnModel("t-quota-text", "burn the window", "fake-model");
+  await sleep(400);
+  const qtEntry = readAcpLedger().accounts.m1 ?? {};
+  const qtCoolH = ((qtEntry.cooldownUntilMs ?? 0) - Date.now()) / 3_600_000;
+  check("models/quota-text-cools-and-moves",
+    qtEntry.parkedReason === undefined &&
+    qtCoolH > 127 && qtCoolH < 128 &&
+    String(qtEntry.lastError ?? "").includes("Individual quota reached") &&
+    !quotaSaw("t-quota-text") &&
+    statuses("t-quota-text") === "completed" &&
+    acpNews("m1") === newsO2.m1 + 1 &&
+    acpNews("m2") + acpNews("m3") + acpNews("m4") ===
+      newsO2.m2 + newsO2.m3 + newsO2.m4 + 1,
+    `entry=${JSON.stringify(qtEntry)} coolH=${qtCoolH} saw=${quotaSaw("t-quota-text")} ` +
+      `statuses=${statuses("t-quota-text")} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsO2)}`);
+  check("models/quota-text-journal-lines",
+    /move m1 → m[234] \(quota\)/u.test(
+      readFileSync(join(acpData, "acp-wrapper.log"), "utf8").slice(o2LogOffset)),
+    "acp-wrapper.log lacks the quota move line");
+
+  // No free sibling → the honest rate-limit failure (errorInfo 429 for
+  // provider-retry), still no ⚠ text shown as the model's answer item.
+  acpControl.modeByLabel = { m1: "quota-text" };
+  writeAcpControl();
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { ...parkedEntry }, m3: { ...parkedEntry }, m4: { ...parkedEntry },
+  } });
+  const newsO3 = newsSnapshot();
+  await startModel("t-quota-text-fail", "fake-model");
+  await turnModel("t-quota-text-fail", "burn it again", "fake-model");
+  await sleep(400);
+  const qtFailErr = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-quota-text-fail" &&
+    (m.params?.deltas ?? []).some((d) => d.kind === "provider.error" &&
+      d.errorInfo?.category === "rate-limit" && d.errorInfo?.httpStatusCode === 429));
+  const qtFailText = messages.some((m) => m.method === "thread/delta" &&
+    m.params?.threadId === "t-quota-text-fail" &&
+    (m.params?.deltas ?? []).some((d) =>
+      typeof d.text === "string" && d.text.includes("Individual quota reached")));
+  check("models/quota-text-no-sibling-fails",
+    qtFailErr && !qtFailText &&
+    boundaries("t-quota-text-fail").at(-1)?.status === "failed" &&
+    acpNews("m2") + acpNews("m3") + acpNews("m4") ===
+      newsO3.m2 + newsO3.m3 + newsO3.m4,
+    `err=${qtFailErr} text=${qtFailText} boundaries=${statuses("t-quota-text-fail")} ` +
+      `news=${JSON.stringify(newsSnapshot())} before=${JSON.stringify(newsO3)}`);
+  acpControl.modeByLabel = {};
+  writeAcpControl();
+
+  // Ordinary prose that mentions the marker mid-message never cools.
+  writeAcpModels(freshFour());
+  writeAcpLedger({ accounts: {
+    m1: { cooldownUntilMs: 0, lastUsedMs: 0, lastError: null, priority: 10 },
+    m2: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m3: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+    m4: { cooldownUntilMs: 0, lastUsedMs: 1_700_000_000_000, lastError: null, priority: 10 },
+  } });
+  await startModel("t-quota-prose", "fake-model");
+  await turnModel("t-quota-prose", "the log showed ⚠ Individual quota reached. Resets in 5h1m1s. what now", "fake-model");
+  await turnModel("t-quota-prose", "and one ordinary follow-up", "fake-model", 2);
+  await sleep(300);
+  const qpEntry = readAcpLedger().accounts.m1 ?? {};
+  check("models/quota-prose-not-cooled",
+    (qpEntry.cooldownUntilMs ?? 0) <= Date.now() &&
+    statuses("t-quota-prose") === "completed,completed" &&
+    quotaSaw("t-quota-prose"),
+    `entry=${JSON.stringify(qpEntry)} saw=${quotaSaw("t-quota-prose")} ` +
+      `statuses=${statuses("t-quota-prose")}`);
+
   // Q. §2.3 п.11 (ревизия 13.1): VALIDATION_REQUIRED on the INTERNAL
   // thread/start of a rotation sibling parks it permanently — not the
   // generic 60-second "session start failed" cooldown.

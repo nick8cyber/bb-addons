@@ -898,6 +898,22 @@ export function isAgentValidationMessage(text: string): boolean {
 }
 
 /**
+ * §2.3 п.13: agy also reports an exhausted quota window as ordinary agent
+ * text — the whole message is one line, "⚠ Individual quota reached. Please
+ * upgrade your subscription to increase your limits. Resets in 127h43m16s."
+ * — and closes the turn cleanly, so no provider.error ever reaches the
+ * rotation. Only that exact shape of the CURRENT message counts: it starts
+ * with the marker and stays a single short line. Prose that merely mentions
+ * the words must reach the user.
+ */
+const AGENT_QUOTA_MESSAGE_PATTERN =
+  /^⚠\s*Individual quota reached\b[^\n]{0,300}$/iu;
+
+export function isAgentQuotaMessage(text: string): boolean {
+  return AGENT_QUOTA_MESSAGE_PATTERN.test(text.trim());
+}
+
+/**
  * The far-future stamp a tos-disabled parking puts on cooldownUntilMs:
  * effectively permanent, but still readable by every "is this account in
  * cooldown" check that predates the mark.

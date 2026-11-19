@@ -3,7 +3,7 @@ title: provider-agy — восстановление после сбоев и с
 status: approved
 owner: coordinator
 date: 2026-11-18
-revision: 4 (решение владельца 19.11, PLUG-332: отказ eligibility с просьбой/ссылкой проверки — бессрочная парковка validation-required без cooldownUntilMs; отказ без ссылки — 2 ч; суточный eligibility-кулдаун снят, 24 ч остаётся только у auth-dead; ранее 3: синхронизация со спекой ACP рев. 14, PLUG-313; 2: §2 — выбор по тирам priority, PLUG-253)
+revision: 5 (квота текстом ответа `⚠ Individual quota reached…` — та же строка «Квота аккаунта», provider-agy-acp §2.3 п. 13; инцидент 19.11); 4 (решение владельца 19.11, PLUG-332: отказ eligibility с просьбой/ссылкой проверки — бессрочная парковка validation-required без cooldownUntilMs; отказ без ссылки — 2 ч; суточный eligibility-кулдаун снят, 24 ч остаётся только у auth-dead; ранее 3: синхронизация со спекой ACP рев. 14, PLUG-313; 2: §2 — выбор по тирам priority, PLUG-253)
 tags: [bb, plugins, provider-agy, recovery, compaction]
 ---
 
@@ -21,7 +21,7 @@ tags: [bb, plugins, provider-agy, recovery, compaction]
 
 | Сбой | Что делает мост |
 |---|---|
-| Квота аккаунта | Аккаунт откладывается до сброса (без срока — 30 мин); ход сразу на свободный аккаунт, новый разговор + короткая сводка; нет свободного — ожидание окна (до 55 мин, до 2 раз) |
+| Квота аккаунта — ошибкой или текстом ответа `⚠ Individual quota reached… Resets in …` (текст пользователю не показывается, см. [provider-agy-acp.md](provider-agy-acp.md) §2.3 п. 13) | Аккаунт откладывается до сброса (без срока — 30 мин); ход сразу на свободный аккаунт, новый разговор + короткая сводка; нет свободного — ожидание окна (до 55 мин, до 2 раз) |
 | Нужна проверка Google: `VALIDATION_REQUIRED` / «Verify your account to continue» / агентский маркер `⚠ Verification Required` | Бессрочная парковка `validation-required` (`parkedReason: "validation-required"`, `cooldownUntilMs` в далёком будущем), без автоповторов, вне предохранителя массовой парковки; ссылка проверки пишется в лог без токенов; ход переигрывается на свободном подходящем сиблинге или честный фейл; снятие только вручную оператором после проверки в браузере (см. [provider-agy-acp.md](provider-agy-acp.md) §2.3 п. 11) |
 | Бан Google за Terms of Service: «This service has been disabled in this account for violation of Terms of Service» | Бессрочная парковка `tos-disabled` (`parkedReason: "tos-disabled"`, `cooldownUntilMs` в далёком будущем), без автоповторов, вне предохранителя массовой парковки; ход переигрывается на свободном подходящем сиблинге или честный фейл; снятие только вручную оператором ([provider-agy-acp.md](provider-agy-acp.md) §2.3 п. 7) |
 | «not eligible», отказ с просьбой или ссылкой проверки аккаунта (`verify your account` — в т.ч. без «to continue» — или URL `accounts.google.com`) | Бессрочная парковка `validation-required` (`parkedReason: "validation-required"` + `ineligibleAtMs` + `lastError`, **без `cooldownUntilMs`**), без автоповторов; ссылка проверки пишется в лог без токенов; предохранитель проверяется до парковки; ход на свободный подходящий аккаунт или честный фейл; снятие только вручную после проверки в браузере (решение владельца 19.11, [provider-agy-acp.md](provider-agy-acp.md) §2.3 п. 11) |
