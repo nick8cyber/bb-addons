@@ -261,6 +261,10 @@ export type TransitionEvent =
       exhausted?: boolean;
       nudgeCount?: number;
       reason?: string;
+    }
+  | {
+      type: "acceptance_vacuous";
+      reason?: string;
     };
 
 export interface TransitionInput {
@@ -2884,6 +2888,72 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
         reason: "question without report: stay in research, nudge",
         ruleId: "rule-80-research-question",
         action: { nudgeThread: true },
+      };
+    },
+  },
+
+  // ── Row 81: feature | spec_review | acceptance_vacuous -> design running / blocked
+  {
+    id: "rule-81-acceptance-vacuous-feature",
+    rowNumber: 81,
+    route: "feature",
+    node: "spec_review",
+    status: "running",
+    eventType: "acceptance_vacuous",
+    description: "договор приёмки тривиален / без падающих тестов (TDD Fail-First) -> возврат архитектору на design / blocked при >=3",
+    resolve(input) {
+      if (input.event.type !== "acceptance_vacuous") return null;
+      const nextRounds = input.counters.design_check_rounds + 1;
+      if (nextRounds >= 3) {
+        return {
+          allowed: true,
+          toNode: "spec_review",
+          toStatus: "blocked",
+          reason: "blocked: acceptance-contract-vacuous ceiling 3 rounds reached",
+          ruleId: "rule-81-acceptance-vacuous-feature",
+          counters: { ...input.counters, design_check_rounds: nextRounds },
+        };
+      }
+      return {
+        allowed: true,
+        toNode: "design",
+        toStatus: "running",
+        reason: "acceptance-contract-vacuous: договор приёмки не содержит падающих тестов; возврат архитектору на design",
+        ruleId: "rule-81-acceptance-vacuous-feature",
+        counters: { ...input.counters, design_check_rounds: nextRounds },
+      };
+    },
+  },
+
+  // ── Row 82: fix/simple | start, owner_gate | acceptance_vacuous -> owner_gate waiting_approval / blocked
+  {
+    id: "rule-82-acceptance-vacuous-fix-simple",
+    rowNumber: 82,
+    route: ["fix", "simple"],
+    node: ["start", "owner_gate"],
+    status: ["queued", "waiting_approval"],
+    eventType: "acceptance_vacuous",
+    description: "договор приёмки на fix/simple уже полностью зелёный -> owner_gate waiting_approval / blocked при >=3",
+    resolve(input) {
+      if (input.event.type !== "acceptance_vacuous") return null;
+      const nextAttempts = input.counters.check_attempts + 1;
+      if (nextAttempts >= 3) {
+        return {
+          allowed: true,
+          toNode: input.node,
+          toStatus: "blocked",
+          reason: "blocked: acceptance-contract-vacuous ceiling 3 attempts reached on fix/simple",
+          ruleId: "rule-82-acceptance-vacuous-fix-simple",
+          counters: { ...input.counters, check_attempts: nextAttempts },
+        };
+      }
+      return {
+        allowed: true,
+        toNode: "owner_gate",
+        toStatus: "waiting_approval",
+        reason: "acceptance-contract-vacuous: договор приёмки уже полностью проходит на базовом коммите; ожидание владельца",
+        ruleId: "rule-82-acceptance-vacuous-fix-simple",
+        counters: { ...input.counters, check_attempts: nextAttempts },
       };
     },
   },

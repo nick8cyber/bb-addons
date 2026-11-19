@@ -20,7 +20,7 @@ function defaultCounters(): TransitionCounters {
   };
 }
 
-test("TRANSITION_TABLE contains exactly 80 rules matching §28.1 matrix", () => {
+test("TRANSITION_TABLE contains exactly 82 rules matching §28.1 matrix", () => {
   const specPath = new URL("../../../docs/specs/orchestrator.md", import.meta.url).pathname;
   const specContent = fs.readFileSync(specPath, "utf-8");
   const startIdx = specContent.indexOf("### 28.1 Полная матрица переходов");
@@ -32,13 +32,13 @@ test("TRANSITION_TABLE contains exactly 80 rules matching §28.1 matrix", () => 
     .filter((l) => l.startsWith("|") && !l.startsWith("| Маршрут") && !l.startsWith("|:---") && !l.startsWith("|---"));
 
   assert.equal(TRANSITION_TABLE.length, tableLines.length);
-  assert.equal(TRANSITION_TABLE.length, 80);
+  assert.equal(TRANSITION_TABLE.length, 82);
 
   const ids = new Set<string>();
   const rowNumbers = new Set<number>();
   for (const rule of TRANSITION_TABLE) {
     assert.ok(rule.id, "rule must have an id");
-    assert.ok(rule.rowNumber >= 1 && rule.rowNumber <= 80, `valid rowNumber: ${rule.rowNumber}`);
+    assert.ok(rule.rowNumber >= 1 && rule.rowNumber <= 82, `valid rowNumber: ${rule.rowNumber}`);
     assert.ok(!ids.has(rule.id), `duplicate id: ${rule.id}`);
     assert.ok(!rowNumbers.has(rule.rowNumber), `duplicate rowNumber: ${rule.rowNumber}`);
     ids.add(rule.id);
@@ -1195,12 +1195,85 @@ test("Row 78, 79, 80: research delivered, failed, question", () => {
   assert.equal(resQ.ruleId, "rule-80-research-question");
 });
 
-test("Coverage: all 80 rules in TRANSITION_TABLE are exercised and verified", () => {
+test("Row 81 & 82: acceptance_vacuous -> design / owner_gate", () => {
+  // Row 81: feature | spec_review | acceptance_vacuous -> design running
+  const res81 = resolveTransition({
+    route: "feature",
+    node: "spec_review",
+    status: "running",
+    event: { type: "acceptance_vacuous" },
+    mode: "auto",
+    counters: defaultCounters(),
+  });
+  assert.equal(res81.allowed, true);
+  assert.equal(res81.toNode, "design");
+  assert.equal(res81.toStatus, "running");
+  assert.equal(res81.ruleId, "rule-81-acceptance-vacuous-feature");
+  assert.equal(res81.counters?.design_check_rounds, 1);
+
+  // Row 81: feature ceiling -> blocked
+  const res81b = resolveTransition({
+    route: "feature",
+    node: "spec_review",
+    status: "running",
+    event: { type: "acceptance_vacuous" },
+    mode: "auto",
+    counters: { ...defaultCounters(), design_check_rounds: 2 },
+  });
+  assert.equal(res81b.allowed, true);
+  assert.equal(res81b.toNode, "spec_review");
+  assert.equal(res81b.toStatus, "blocked");
+
+  // Row 82: fix | start | acceptance_vacuous -> owner_gate waiting_approval
+  const res82 = resolveTransition({
+    route: "fix",
+    node: "start",
+    status: "queued",
+    event: { type: "acceptance_vacuous" },
+    mode: "auto",
+    counters: defaultCounters(),
+  });
+  assert.equal(res82.allowed, true);
+  assert.equal(res82.toNode, "owner_gate");
+  assert.equal(res82.toStatus, "waiting_approval");
+  assert.equal(res82.ruleId, "rule-82-acceptance-vacuous-fix-simple");
+  assert.equal(res82.counters?.check_attempts, 1);
+
+  // Row 82: simple ceiling -> blocked
+  const res82b = resolveTransition({
+    route: "simple",
+    node: "start",
+    status: "queued",
+    event: { type: "acceptance_vacuous" },
+    mode: "auto",
+    counters: { ...defaultCounters(), check_attempts: 2 },
+  });
+  assert.equal(res82b.allowed, true);
+  assert.equal(res82b.toNode, "start");
+  assert.equal(res82b.toStatus, "blocked");
+
+  // Row 82 from owner_gate node: fix | owner_gate | acceptance_vacuous -> owner_gate waiting_approval
+  const res82og = resolveTransition({
+    route: "fix",
+    node: "owner_gate",
+    status: "waiting_approval",
+    event: { type: "acceptance_vacuous" },
+    mode: "manual",
+    counters: defaultCounters(),
+  });
+  assert.equal(res82og.allowed, true);
+  assert.equal(res82og.toNode, "owner_gate");
+  assert.equal(res82og.toStatus, "waiting_approval");
+  assert.equal(res82og.ruleId, "rule-82-acceptance-vacuous-fix-simple");
+  assert.equal(res82og.counters?.check_attempts, 1);
+});
+
+test("Coverage: all 82 rules in TRANSITION_TABLE are exercised and verified", () => {
   const allRuleIds = new Set<string>();
   for (const rule of TRANSITION_TABLE) {
     allRuleIds.add(rule.id);
   }
-  assert.equal(allRuleIds.size, 80);
+  assert.equal(allRuleIds.size, 82);
 
   // Execute every rule explicitly and verify ruleId matches
   const exercisedRuleIds = new Set<string>();
@@ -1371,8 +1444,12 @@ test("Coverage: all 80 rules in TRANSITION_TABLE are exercised and verified", ()
   check(resolveTransition({ route: "research", node: "research", status: "running", event: { type: "research_failed", exhausted: true }, mode: "manual", counters: defaultCounters() }), "rule-79-research-failed");
   // Row 80
   check(resolveTransition({ route: "research", node: "research", status: "running", event: { type: "research_question_or_no_report" }, mode: "manual", counters: defaultCounters() }), "rule-80-research-question");
+  // Row 81
+  check(resolveTransition({ route: "feature", node: "spec_review", status: "running", event: { type: "acceptance_vacuous" }, mode: "auto", counters: defaultCounters() }), "rule-81-acceptance-vacuous-feature");
+  // Row 82
+  check(resolveTransition({ route: "fix", node: "start", status: "queued", event: { type: "acceptance_vacuous" }, mode: "auto", counters: defaultCounters() }), "rule-82-acceptance-vacuous-fix-simple");
 
-  assert.equal(exercisedRuleIds.size, 80, `all 80 rules must be exercised, exercised count: ${exercisedRuleIds.size}`);
+  assert.equal(exercisedRuleIds.size, 82, `all 82 rules must be exercised, exercised count: ${exercisedRuleIds.size}`);
   for (const id of allRuleIds) {
     assert.ok(exercisedRuleIds.has(id), `rule ${id} must be exercised`);
   }
