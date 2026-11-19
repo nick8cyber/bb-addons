@@ -780,6 +780,31 @@ export type TaskStatus =
   | "cancelled";
 export type ConfirmationMode = "auto" | "manual";
 
+/** §28.2 п. 5: Будильник узла взводится ТОЛЬКО на активных рабочих узлах. */
+export const ACTIVE_ALARM_NODES = new Set<TaskNode>([
+  "design",
+  "spec",
+  "spec_review",
+  "code",
+  "checks",
+  "review",
+  "design_check",
+  "release",
+  "research",
+]);
+
+/** §28.2 п. 5: Пассивные состояния ожидания будильник НЕ взводят (node_alarm_at = NULL). */
+export const PASSIVE_ALARM_STATUSES = new Set<TaskStatus>([
+  "waiting_approval",
+  "waiting_release_note",
+  "pr_open",
+  "deferred",
+  "blocked",
+  "done",
+  "stalled",
+  "cancelled",
+]);
+
 export interface TaskQueueRow {
   task_key: string;
   project_id: string;
@@ -838,6 +863,8 @@ export interface TransitionTaskInput {
   now?: number;
   updates?: Partial<Omit<TaskQueueRow, "task_key" | "created_at">>;
   transitionPayload?: string | null;
+  /** §28.2 п. 3: таймаут узла в секундах для взвода будильника node_alarm_at */
+  timeoutSeconds?: number;
 }
 
 export interface TransitionTaskResult {
@@ -3340,6 +3367,17 @@ export class DelegationStore {
    * сопоставляется: добавленный/переименованный после события хук по
    * нему не запускается. */
 
+  /**
+   * §18.5 / §28.2: Запись событий задач и графа (task.alarm_triggered, task.blocked, etc.)
+   */
+  recordTaskEvent(
+    kind: string,
+    fields: Record<string, unknown>,
+    at: number = Date.now(),
+  ): number {
+    return this.emitEvent(kind, fields, at);
+  }
+
   private emitEvent(
     kind: string,
     fields: Record<string, unknown>,
@@ -4043,6 +4081,22 @@ export class DelegationStore {
           input.expectedStatus === "blocked")
       ) {
         setClauses.push("entered_at = :now");
+      }
+
+      // §28.2 п. 5: Будильник узла (node_alarm_at)
+      if (input.updates?.node_alarm_at === undefined) {
+        if (ACTIVE_ALARM_NODES.has(input.toNode) && input.toStatus === "running") {
+          if (input.toNode !== existing.node || existing.status !== "running") {
+            const timeoutSec = input.timeoutSeconds ?? 3600;
+            setClauses.push("node_alarm_at = :auto_node_alarm_at");
+            params.auto_node_alarm_at = now + timeoutSec * 1000;
+          }
+        } else if (
+          !ACTIVE_ALARM_NODES.has(input.toNode) ||
+          PASSIVE_ALARM_STATUSES.has(input.toStatus)
+        ) {
+          setClauses.push("node_alarm_at = NULL");
+        }
       }
 
       if (input.updates) {

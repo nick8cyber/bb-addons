@@ -13,6 +13,8 @@ import {
   pickRoute,
   quotaGroupOf,
   quotaGroupsForOneOff,
+  getNodeTimeoutSeconds,
+  getNodeMaxRetries,
   type Policy,
 } from "../src/policy.js";
 
@@ -615,4 +617,80 @@ test("PLUG-298: quotaGroupsForOneOff produces canonical and alias groups for one
   assert.ok(groupsNew.includes("preset:web-gemini-review"));
   assert.ok(groupsNew.includes("preset:argon-review"));
   assert.ok(groupsNew.includes("web-gemini"));
+});
+
+test("§28.2 п. 3: node_policy parses correctly and helpers return configured and default values", () => {
+  const policyJson = JSON.stringify({
+    version: 1,
+    levels: {
+      complex: { chain: ["complex"] },
+      simple: { chain: ["simple"] },
+    },
+    routes: {
+      complex: { preset: "complex", provider: "acp-devin" },
+      simple: { preset: "simple", provider: "acp-opencode" },
+    },
+    node_policy: {
+      design: { timeout_seconds: 1800, max_retries: 2, level: "complex" },
+      code: { timeout_seconds: 7200, max_retries: 4 },
+      checks: { timeout_seconds: 900 },
+    },
+  });
+
+  const load = parsePolicy(policyJson, presets);
+  assert.equal(load.errors.length, 0);
+  assert.ok(load.policy);
+  assert.deepEqual(load.policy.node_policy, {
+    design: { timeout_seconds: 1800, max_retries: 2, level: "complex" },
+    code: { timeout_seconds: 7200, max_retries: 4 },
+    checks: { timeout_seconds: 900 },
+  });
+
+  // Helper tests
+  assert.equal(getNodeTimeoutSeconds(load.policy, "design"), 1800);
+  assert.equal(getNodeTimeoutSeconds(load.policy, "code"), 7200);
+  assert.equal(getNodeTimeoutSeconds(load.policy, "checks"), 900);
+  assert.equal(getNodeTimeoutSeconds(load.policy, "review"), 3600); // default
+  assert.equal(getNodeTimeoutSeconds(null, "code"), 3600); // default
+
+  assert.equal(getNodeMaxRetries(load.policy, "design"), 2);
+  assert.equal(getNodeMaxRetries(load.policy, "code"), 4);
+  assert.equal(getNodeMaxRetries(load.policy, "checks"), 3); // default
+  assert.equal(getNodeMaxRetries(null, "code"), 3); // default
+});
+
+test("§28.2 п. 3: node_policy validation catches errors", () => {
+  const base = {
+    version: 1,
+    levels: {
+      complex: { chain: ["complex"] },
+    },
+    routes: {
+      complex: { preset: "complex", provider: "acp-devin" },
+    },
+  };
+
+  // Not an object
+  const err1 = parsePolicy(JSON.stringify({ ...base, node_policy: "bad" }), presets);
+  assert.ok(err1.errors.some((e) => e.path === "node_policy"));
+
+  // Node config not an object
+  const err2 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: 123 } }), presets);
+  assert.ok(err2.errors.some((e) => e.path === "node_policy.code"));
+
+  // Negative timeout_seconds
+  const err3 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { timeout_seconds: -10 } } }), presets);
+  assert.ok(err3.errors.some((e) => e.path === "node_policy.code.timeout_seconds"));
+
+  // Zero timeout_seconds (must be positive >= 1)
+  const err4 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { timeout_seconds: 0 } } }), presets);
+  assert.ok(err4.errors.some((e) => e.path === "node_policy.code.timeout_seconds"));
+
+  // Negative max_retries
+  const err5 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { max_retries: -1 } } }), presets);
+  assert.ok(err5.errors.some((e) => e.path === "node_policy.code.max_retries"));
+
+  // Undeclared level
+  const err6 = parsePolicy(JSON.stringify({ ...base, node_policy: { code: { level: "nonexistent" } } }), presets);
+  assert.ok(err6.errors.some((e) => e.path === "node_policy.code.level"));
 });

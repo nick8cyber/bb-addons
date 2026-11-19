@@ -40,6 +40,14 @@ export const EVENT_KINDS = [
   "release.failed",
   "pr.merged",
   "pr.closed",
+  "task.transitioned",
+  "task.enqueued",
+  "task.approved",
+  "task.rejected",
+  "task.deferred",
+  "task.checks_run",
+  "task.alarm_triggered",
+  "task.blocked",
 ] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];

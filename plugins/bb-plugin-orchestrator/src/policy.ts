@@ -70,9 +70,20 @@ export interface Policy {
   timing?: PolicyTiming;
   /** §2.3: executor level → the auditor level that reviews its work. */
   reviewByLevel?: Record<string, string>;
+  /** §28.2 п. 3: per-node timeout, retry limits, and level assignment. */
+  node_policy?: PolicyNodePolicy;
   levels: Record<string, PolicyLevel>;
   routes: Record<string, PolicyRoute>;
 }
+
+/** §28.2 п. 3: Конфигурация узлов (node_policy): таймаут, попытки, уровень. */
+export interface PolicyNodeConfig {
+  timeout_seconds?: number;
+  max_retries?: number;
+  level?: string;
+}
+
+export type PolicyNodePolicy = Record<string, PolicyNodeConfig>;
 
 /** §18.5: настраиваемые таймауты сторожа (policy.timing). */
 export interface PolicyTiming {
@@ -401,6 +412,61 @@ export function parsePolicy(
     }
   }
 
+  // §28.2 п. 3: node_policy — конфигурация узлов (timeout_seconds, max_retries, level).
+  let node_policy: PolicyNodePolicy | undefined;
+  if (raw.node_policy !== undefined) {
+    if (!isRecord(raw.node_policy)) {
+      err("node_policy", t("pol.isObject"));
+    } else {
+      node_policy = {};
+      for (const [nodeName, nodeCfg] of Object.entries(raw.node_policy)) {
+        const path = `node_policy.${nodeName}`;
+        if (!isRecord(nodeCfg)) {
+          err(path, t("pol.isObject"));
+          continue;
+        }
+        let timeout_seconds: number | undefined;
+        if (nodeCfg.timeout_seconds !== undefined) {
+          if (!isPositiveInt(nodeCfg.timeout_seconds)) {
+            err(`${path}.timeout_seconds`, t("pol.intGe1"));
+          } else {
+            timeout_seconds = nodeCfg.timeout_seconds;
+          }
+        }
+        let max_retries: number | undefined;
+        if (nodeCfg.max_retries !== undefined) {
+          if (
+            typeof nodeCfg.max_retries !== "number" ||
+            !Number.isInteger(nodeCfg.max_retries) ||
+            nodeCfg.max_retries < 0
+          ) {
+            err(`${path}.max_retries`, t("pol.intGe1"));
+          } else {
+            max_retries = nodeCfg.max_retries;
+          }
+        }
+        let level: string | undefined;
+        if (nodeCfg.level !== undefined) {
+          if (!isNonEmptyString(nodeCfg.level)) {
+            err(`${path}.level`, t("pol.isString"));
+          } else if (!levels[nodeCfg.level]) {
+            err(
+              `${path}.level`,
+              t("pol.levelUndeclared", { level: nodeCfg.level }),
+            );
+          } else {
+            level = nodeCfg.level;
+          }
+        }
+        node_policy[nodeName] = {
+          ...(timeout_seconds !== undefined ? { timeout_seconds } : {}),
+          ...(max_retries !== undefined ? { max_retries } : {}),
+          ...(level !== undefined ? { level } : {}),
+        };
+      }
+    }
+  }
+
   // Rule 3.
   let limits: PolicyLimits | undefined;
   if (raw.limits !== undefined) {
@@ -582,6 +648,9 @@ export function parsePolicy(
         : {}),
       ...(maxRunSeconds !== undefined ? { maxRunSeconds } : {}),
       ...(Object.keys(timing).length > 0 ? { timing } : {}),
+      ...(node_policy && Object.keys(node_policy).length > 0
+        ? { node_policy }
+        : {}),
       levels,
       routes,
     },
@@ -842,3 +911,26 @@ export function pickRoute(
   }
   return resolved;
 }
+
+/**
+ * §28.2 п. 3: Таймаут узла в секундах из node_policy, по умолчанию 3600 с.
+ */
+export function getNodeTimeoutSeconds(
+  policy: Policy | null | undefined,
+  node: string,
+): number {
+  const timeout = policy?.node_policy?.[node]?.timeout_seconds;
+  return typeof timeout === "number" && timeout > 0 ? timeout : 3600;
+}
+
+/**
+ * §28.2 п. 3: Лимит попыток узла из node_policy, по умолчанию 3.
+ */
+export function getNodeMaxRetries(
+  policy: Policy | null | undefined,
+  node: string,
+): number {
+  const retries = policy?.node_policy?.[node]?.max_retries;
+  return typeof retries === "number" && retries >= 0 ? retries : 3;
+}
+

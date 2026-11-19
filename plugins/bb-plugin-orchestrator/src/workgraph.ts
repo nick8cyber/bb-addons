@@ -20,11 +20,19 @@ import type {
   TaskStatus,
   TaskTransitionRow,
 } from "./store.js";
-import { normalizeTaskKey } from "./store.js";
+import {
+  ACTIVE_ALARM_NODES,
+  PASSIVE_ALARM_STATUSES,
+  normalizeTaskKey,
+} from "./store.js";
 import { verdictDetailsInBody } from "./release.js";
 import type { PluginCliContext } from "@get-bb/plugin-sdk";
 import type { T } from "./i18n/index.js";
-import type { Policy } from "./policy.js";
+import {
+  getNodeTimeoutSeconds,
+  getNodeMaxRetries,
+  type Policy,
+} from "./policy.js";
 import {
   TRANSITION_TABLE,
   resolveTransition,
@@ -2120,6 +2128,10 @@ export interface RunQueueDeps {
   cmd?: CmdRunner;
   bbCli?: BbCli;
   t?: T;
+  now?: () => number;
+  policy?: Policy | null;
+  getThread?: (threadId: string) => Promise<{ status?: string } | null>;
+  stopThread?: (threadId: string) => Promise<void>;
   dispatchNode?: (
     task: TaskQueueRow,
     node: TaskNode,
@@ -2457,6 +2469,7 @@ async function startQueuedTask(
 ): Promise<boolean> {
   const normKey = normalizeTaskKey(task.task_key);
   const payload = parsePayload(task.payload);
+  const now = deps.now ? deps.now() : Date.now();
 
   let branch = task.branch;
   if (task.route !== "research") {
@@ -2649,7 +2662,8 @@ async function startQueuedTask(
       branch,
       acceptance_sha: acceptanceSha,
     },
-  });
+    timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+  }, now);
 
   if (tr.ok && tr.task) {
     const logged = deps.store.listTransitions(task.task_key).at(-1);
@@ -2841,6 +2855,32 @@ async function extractVerdictFromDelegation(
   return null;
 }
 
+/** §28.2: Отображение сбоя / таймаута узла в событие матрицы переходов. */
+export function getFailEventForNode(node: TaskNode, reason: string): TransitionEvent | null {
+  switch (node) {
+    case "design":
+      return { type: "design_failed", exhausted: true, reason };
+    case "spec":
+      return { type: "spec_failed", exhausted: true, reason };
+    case "spec_review":
+      return { type: "spec_review_failed", exhausted: true, reason };
+    case "code":
+      return { type: "code_failed", exhausted: true, reason };
+    case "checks":
+      return { type: "checks_result", notRun: true, exitCode: 1, output: reason };
+    case "review":
+      return { type: "review_failed", exhausted: true, reason };
+    case "design_check":
+      return { type: "design_check_failed", exhausted: true, reason };
+    case "release":
+      return { type: "release_failed_script", reason };
+    case "research":
+      return { type: "research_failed", exhausted: true, reason };
+    default:
+      return null;
+  }
+}
+
 async function advanceActiveTask(
   task: TaskQueueRow,
   deps: RunQueueDeps,
@@ -2852,6 +2892,225 @@ async function advanceActiveTask(
   const payload = parsePayload(task.payload);
   const delegations = deps.store.delegationsByTask(task.task_key);
   const latestDelegation = getActiveDelegationForTask(task, delegations);
+  const now = deps.now ? deps.now() : Date.now();
+
+  // §28.2 п. 5: Сброс будильника узла при получении нового доказательства:
+  // 1) Новый коммит в ветке задачи task.branch
+  if (task.status === "running" && ACTIVE_ALARM_NODES.has(task.node) && task.branch && deps.cmd) {
+    try {
+      const rev = await deps.cmd.run("git", ["rev-parse", `refs/heads/${task.branch}`], { cwd: repoRoot });
+      if (rev.exitCode === 0) {
+        const currentSha = rev.stdout.trim();
+        const lastSha = typeof payload.last_alarm_branch_sha === "string" ? payload.last_alarm_branch_sha : null;
+        if (lastSha === null) {
+          payload.last_alarm_branch_sha = currentSha;
+          deps.store.updateTask(task.task_key, {
+            payload: JSON.stringify(payload),
+          });
+          task.payload = JSON.stringify(payload);
+        } else if (currentSha !== lastSha) {
+          payload.last_alarm_branch_sha = currentSha;
+          payload.alarm_count = 0;
+          const timeoutSeconds = getNodeTimeoutSeconds(deps.policy, task.node);
+          const nextAlarm = now + timeoutSeconds * 1000;
+          deps.store.updateTask(task.task_key, {
+            node_alarm_at: nextAlarm,
+            payload: JSON.stringify(payload),
+          });
+          task.node_alarm_at = nextAlarm;
+          task.payload = JSON.stringify(payload);
+        }
+      }
+    } catch {}
+  }
+
+  // 2) Запись вердикта ревью для коммита этой задачи
+  if (task.status === "running" && (task.node === "review" || task.node === "spec_review")) {
+    const currentVerdict = typeof payload.review_verdict === "string"
+      ? payload.review_verdict
+      : typeof payload.spec_review_verdict === "string"
+      ? payload.spec_review_verdict
+      : null;
+    if (currentVerdict) {
+      const lastVerdict = typeof payload.last_alarm_verdict === "string" ? payload.last_alarm_verdict : null;
+      if (lastVerdict !== currentVerdict) {
+        payload.last_alarm_verdict = currentVerdict;
+        payload.alarm_count = 0;
+        const timeoutSeconds = getNodeTimeoutSeconds(deps.policy, task.node);
+        const nextAlarm = now + timeoutSeconds * 1000;
+        deps.store.updateTask(task.task_key, {
+          node_alarm_at: nextAlarm,
+          payload: JSON.stringify(payload),
+        });
+        task.node_alarm_at = nextAlarm;
+        task.payload = JSON.stringify(payload);
+      }
+    }
+  }
+
+  // §28.2 п. 5: Срабатывание будильника узла (node_alarm_at)
+  if (
+    task.node_alarm_at !== null &&
+    now >= task.node_alarm_at &&
+    task.status === "running" &&
+    ACTIVE_ALARM_NODES.has(task.node)
+  ) {
+    const timeoutSeconds = getNodeTimeoutSeconds(deps.policy, task.node);
+    const alarmCount = typeof payload.alarm_count === "number" ? payload.alarm_count : 0;
+    const elapsedSeconds = Math.max(0, Math.round((now - (task.entered_at ?? now)) / 1000));
+
+    let isThreadRunning = false;
+    if (latestDelegation?.thread_id) {
+      if (deps.getThread) {
+        try {
+          const th = await deps.getThread(latestDelegation.thread_id);
+          if (th && (th.status === "running" || th.status === "active")) {
+            isThreadRunning = true;
+          }
+        } catch {}
+      }
+    }
+
+    if (isThreadRunning && elapsedSeconds < 3 * timeoutSeconds) {
+      // Исполнитель в активном выполнении хода: даём до 3× timeout_seconds
+      if (alarmCount === 0) {
+        if (latestDelegation?.thread_id && deps.bbCli) {
+          await deps.bbCli
+            .run([
+              "thread",
+              "tell",
+              latestDelegation.thread_id,
+              `Напоминание будильника: превышено расчетное время на узле ${task.node} (${timeoutSeconds}с). Заверши ход или сдай результат.`,
+            ])
+            .catch(() => {});
+        }
+        deps.store.recordTaskEvent(
+          "task.alarm_triggered",
+          {
+            task: task.task_key,
+            node: task.node,
+            elapsedSeconds,
+            alarmCount: 1,
+            threadRunning: true,
+          },
+          now,
+        );
+        payload.alarm_count = 1;
+        const nextAlarm = now + timeoutSeconds * 1000;
+        deps.store.updateTask(task.task_key, {
+          node_alarm_at: nextAlarm,
+          payload: JSON.stringify(payload),
+        });
+        task.node_alarm_at = nextAlarm;
+        task.payload = JSON.stringify(payload);
+        return true;
+      }
+    } else {
+      // Тред не запущен, либо running превысил 3× timeout, либо 2-е срабатывание
+      if (alarmCount === 0) {
+        // 1-е срабатывание: повторный пинг исполнителя узла
+        if (latestDelegation?.thread_id && deps.bbCli) {
+          await deps.bbCli
+            .run([
+              "thread",
+              "tell",
+              latestDelegation.thread_id,
+              `Напоминание будильника: превышено время ожидания на узле ${task.node} (${timeoutSeconds}с). Сдай результат.`,
+            ])
+            .catch(() => {});
+        }
+        deps.store.recordTaskEvent(
+          "task.alarm_triggered",
+          {
+            task: task.task_key,
+            node: task.node,
+            elapsedSeconds,
+            alarmCount: 1,
+            threadRunning: false,
+          },
+          now,
+        );
+        payload.alarm_count = 1;
+        const nextAlarm = now + timeoutSeconds * 1000;
+        deps.store.updateTask(task.task_key, {
+          node_alarm_at: nextAlarm,
+          payload: JSON.stringify(payload),
+        });
+        task.node_alarm_at = nextAlarm;
+        task.payload = JSON.stringify(payload);
+        return true;
+      } else {
+        // 2-е срабатывание (2× timeout): остановка треда и перевод в stalled
+        if (latestDelegation?.thread_id) {
+          if (deps.stopThread) {
+            await deps.stopThread(latestDelegation.thread_id).catch(() => {});
+          } else if (deps.bbCli) {
+            await deps.bbCli.run(["thread", "stop", latestDelegation.thread_id]).catch(() => {});
+          }
+        }
+        deps.store.recordTaskEvent(
+          "task.alarm_triggered",
+          {
+            task: task.task_key,
+            node: task.node,
+            elapsedSeconds,
+            alarmCount: alarmCount + 1,
+            outcome: "stalled",
+          },
+          now,
+        );
+
+        const failReason = `node-alarm-timeout: узел ${task.node} превысил предельное время ожидания (${timeoutSeconds * 2}с)`;
+        const failEvent = getFailEventForNode(task.node, failReason);
+        if (failEvent) {
+          const resolution = resolveTransition({
+            route: task.route,
+            node: task.node,
+            status: "running",
+            event: failEvent,
+            mode: task.confirmation_mode,
+            counters: extractCounters(task),
+          });
+          if (!resolution.allowed) {
+            throw new OrchestratorError(
+              resolution.errorCode ?? "invalid-transition",
+              resolution.errorMessage ?? resolution.reason,
+            );
+          }
+
+          const consumed = Array.isArray(payload.consumed_delegations)
+            ? [...(payload.consumed_delegations as number[])]
+            : [];
+          if (latestDelegation && !consumed.includes(latestDelegation.id)) {
+            consumed.push(latestDelegation.id);
+          }
+
+          const tr = deps.store.transitionTask({
+            taskKey: task.task_key,
+            expectedNode: task.node,
+            expectedStatus: "running",
+            toNode: resolution.toNode,
+            toStatus: resolution.toStatus,
+            actor: "run-queue",
+            reason: resolution.reason,
+            updates: {
+              node_alarm_at: null,
+              payload: JSON.stringify({
+                ...payload,
+                alarm_count: 0,
+                consumed_delegations: consumed,
+              }),
+            },
+          }, now);
+          if (tr.ok) {
+            const logged = deps.store.listTransitions(task.task_key).at(-1);
+            if (logged) transitions.push(logged);
+            return true;
+          }
+        }
+      }
+    }
+  }
 
   if (
     latestDelegation &&
@@ -3054,7 +3313,8 @@ async function advanceActiveTask(
               last_nudge_at: null,
             }),
           },
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
@@ -3324,7 +3584,8 @@ async function advanceActiveTask(
           actor: "run-queue",
           reason: resolution.reason,
           updates,
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
@@ -3479,7 +3740,8 @@ async function advanceActiveTask(
           actor: "run-queue",
           reason: resolution.reason,
           updates: Object.keys(updates).length > 0 ? updates : undefined,
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
@@ -3645,7 +3907,8 @@ async function advanceActiveTask(
           actor: "run-queue",
           reason: resolution.reason,
           updates,
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
@@ -3698,7 +3961,8 @@ async function advanceActiveTask(
         actor: "run-queue",
         reason: resolution.reason,
         updates,
-      });
+        timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+      }, now);
       if (tr.ok && tr.task) {
         const logged = deps.store.listTransitions(task.task_key).at(-1);
         if (logged) transitions.push(logged);
@@ -3852,7 +4116,8 @@ async function advanceActiveTask(
           actor: "run-queue",
           reason: resolution.reason,
           updates: Object.keys(updates).length > 0 ? updates : undefined,
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
@@ -4012,7 +4277,8 @@ async function advanceActiveTask(
           actor: "run-queue",
           reason: resolution.reason,
           updates: Object.keys(updates).length > 0 ? updates : undefined,
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok && tr.task) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
@@ -4129,7 +4395,8 @@ async function advanceActiveTask(
           actor: "run-queue",
           reason: resolution.reason,
           updates: Object.keys(updates).length > 0 ? updates : undefined,
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
@@ -4204,7 +4471,8 @@ async function advanceActiveTask(
           actor: "run-queue",
           reason: resolution.reason,
           updates,
-        });
+          timeoutSeconds: getNodeTimeoutSeconds(deps.policy, resolution.toNode),
+        }, now);
         if (tr.ok) {
           const logged = deps.store.listTransitions(task.task_key).at(-1);
           if (logged) transitions.push(logged);
